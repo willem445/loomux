@@ -6,9 +6,29 @@ A sleek terminal multiplexer for AI agent management.
 the fabric is woven — here, the frame holding a matrix of terminal panes,
 each one carrying an agent (or just a shell).
 
+[![CI](https://github.com/willem445/loomux/actions/workflows/ci.yml/badge.svg)](https://github.com/willem445/loomux/actions/workflows/ci.yml)
+
 Windows Terminal–class smoothness with the multiplexing features it lacks:
 instant matrix splits, nameable panes, and a native session browser that
 restores Claude Code and GitHub Copilot CLI sessions straight into a pane.
+
+## Install
+
+**Windows**
+
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/willem445/loomux/main/install.ps1 | iex"
+```
+
+**macOS / Linux**
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/willem445/loomux/main/install.sh | sh
+```
+
+Or grab an installer from the [latest release](https://github.com/willem445/loomux/releases/latest).
+Builds are unsigned for now — on macOS, if the app is reported as damaged,
+run `xattr -cr /Applications/Loomux.app` (the install script does this for you).
 
 ## Stack
 
