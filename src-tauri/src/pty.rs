@@ -41,6 +41,13 @@ struct ExitPayload {
     exit_code: Option<u32>,
 }
 
+#[derive(Clone, Serialize)]
+struct OutputPayload {
+    id: u32,
+    /// Base64-encoded raw bytes so the transport is lossless.
+    data: String,
+}
+
 /// Pick the user's default interactive shell.
 fn default_shell() -> (String, Vec<String>) {
     #[cfg(target_os = "windows")]
@@ -118,8 +125,8 @@ pub fn spawn_pty(
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(PtySize {
-            rows,
-            cols,
+            rows: rows.max(2),
+            cols: cols.max(2),
             pixel_width: 0,
             pixel_height: 0,
         })
@@ -143,8 +150,9 @@ pub fn spawn_pty(
         },
     );
 
-    // Reader thread: stream raw bytes to the frontend as base64 so the
-    // transport is lossless (xterm.js decodes back to Uint8Array).
+    // Reader thread: stream output on a single shared channel keyed by id.
+    // The frontend router buffers payloads for panes that haven't attached
+    // their handler yet, so no output can be lost at startup.
     let out_app = app.clone();
     std::thread::spawn(move || {
         let mut buf = [0u8; 8192];
@@ -152,7 +160,13 @@ pub fn spawn_pty(
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    let _ = out_app.emit(&format!("pty-output-{id}"), B64.encode(&buf[..n]));
+                    let _ = out_app.emit(
+                        "pty-output",
+                        OutputPayload {
+                            id,
+                            data: B64.encode(&buf[..n]),
+                        },
+                    );
                 }
             }
         }

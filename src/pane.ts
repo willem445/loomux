@@ -6,7 +6,15 @@ import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { Unicode11Addon } from "@xterm/addon-unicode11";
-import { spawnPty, writePty, resizePty, killPty, onPtyOutput } from "./pty";
+import {
+  spawnPty,
+  writePty,
+  resizePty,
+  killPty,
+  ensureOutputRouter,
+  attachOutput,
+  detachOutput,
+} from "./pty";
 import { isAppShortcut } from "./shortcuts";
 
 export interface PaneOptions {
@@ -16,10 +24,10 @@ export interface PaneOptions {
 }
 
 const TERM_THEME = {
-  background: "#0e0e12",
+  background: "#0b0b10",
   foreground: "#c9d1e3",
   cursor: "#7aa2f7",
-  cursorAccent: "#0e0e12",
+  cursorAccent: "#0b0b10",
   selectionBackground: "#2d3450",
   black: "#15161e",
   red: "#f7768e",
@@ -54,9 +62,10 @@ export class Pane {
   private titleEl: HTMLElement;
   private termEl: HTMLElement;
   private fit = new FitAddon();
-  private unlisten: (() => void) | null = null;
   private resizeObs: ResizeObserver;
   private disposed = false;
+  /** Keystrokes typed before the PTY is ready; flushed once it is. */
+  private inputQueue: string[] = [];
 
   constructor(private events: PaneEvents) {
     this.el = document.createElement("div");
@@ -94,6 +103,7 @@ export class Pane {
     this.term = new Terminal({
       allowProposedApi: true,
       cursorBlink: true,
+      cursorStyle: "bar",
       fontFamily: '"Cascadia Code", "Cascadia Mono", Consolas, "Courier New", monospace',
       fontSize: 14,
       lineHeight: 1.1,
@@ -139,24 +149,37 @@ export class Pane {
     this.tryWebgl();
     this.fit.fit();
 
-    const ptyId = await spawnPty({
-      cols: this.term.cols,
-      rows: this.term.rows,
-      cwd: opts.cwd,
-      command: opts.command,
-    });
-    if (this.disposed) {
-      killPty(ptyId).catch(() => {});
-      return;
-    }
-    this.ptyId = ptyId;
-
-    this.unlisten = await onPtyOutput(ptyId, (bytes) => this.term.write(bytes));
+    // Everything is wired before the process exists: input queues until
+    // the PTY is ready, and the output router buffers until we attach.
     this.term.onData((data) => {
       if (this.ptyId !== null) writePty(this.ptyId, data).catch(() => {});
+      else this.inputQueue.push(data);
     });
     this.resizeObs.observe(this.termEl);
     this.focus();
+
+    try {
+      await ensureOutputRouter();
+      const ptyId = await spawnPty({
+        cols: Number.isFinite(this.term.cols) && this.term.cols > 1 ? this.term.cols : 80,
+        rows: Number.isFinite(this.term.rows) && this.term.rows > 1 ? this.term.rows : 24,
+        cwd: opts.cwd,
+        command: opts.command,
+      });
+      if (this.disposed) {
+        killPty(ptyId).catch(() => {});
+        return;
+      }
+      this.ptyId = ptyId;
+      attachOutput(ptyId, (bytes) => this.term.write(bytes));
+      for (const data of this.inputQueue.splice(0)) {
+        writePty(ptyId, data).catch(() => {});
+      }
+    } catch (err) {
+      // Never leave a dead black pane: surface the failure in-terminal.
+      this.term.writeln(`\x1b[91mweft: failed to start shell\x1b[0m`);
+      this.term.writeln(`\x1b[90m${String(err)}\x1b[0m`);
+    }
   }
 
   private tryWebgl(): void {
@@ -222,8 +245,10 @@ export class Pane {
     this.disposed = true;
     this.resizeObs.disconnect();
     clearTimeout(this.fitTimer);
-    this.unlisten?.();
-    if (killBackend && this.ptyId !== null) killPty(this.ptyId).catch(() => {});
+    if (this.ptyId !== null) {
+      detachOutput(this.ptyId);
+      if (killBackend) killPty(this.ptyId).catch(() => {});
+    }
     this.term.dispose();
     this.el.remove();
   }

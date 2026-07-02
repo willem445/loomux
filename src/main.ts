@@ -2,7 +2,7 @@ import "./styles.css";
 import { Grid } from "./grid";
 import type { Pane, PaneEvents } from "./pane";
 import { SessionBrowser } from "./sessions";
-import { onPtyExit, type SessionInfo } from "./pty";
+import { ensureOutputRouter, onPtyExit, type SessionInfo } from "./pty";
 import { matchShortcut } from "./shortcuts";
 
 const gridRoot = document.getElementById("grid-root")!;
@@ -19,8 +19,19 @@ const paneEvents: PaneEvents = {
   onSplit: (pane, dir) => void openShell(dir, pane),
 };
 
-function openShell(dir: "row" | "column" = "row", relativeTo?: Pane): Promise<Pane> {
-  return grid.openPane({}, paneEvents, dir, relativeTo);
+// PTYs whose exit event arrived before their pane finished starting.
+const earlyExits = new Set<number>();
+
+async function openShell(dir: "row" | "column" = "row", relativeTo?: Pane): Promise<Pane> {
+  const pane = await grid.openPane({}, paneEvents, dir, relativeTo);
+  reapIfExited(pane);
+  return pane;
+}
+
+function reapIfExited(pane: Pane): void {
+  if (pane.ptyId !== null && earlyExits.delete(pane.ptyId)) {
+    grid.closePane(pane, false);
+  }
 }
 
 const sessions = new SessionBrowser(sessionsEl, (s: SessionInfo) => {
@@ -31,17 +42,19 @@ async function restoreSession(s: SessionInfo): Promise<void> {
   const name =
     (s.source === "claude" ? "claude · " : "copilot · ") +
     (s.title.length > 34 ? s.title.slice(0, 34) + "…" : s.title);
-  await grid.openPane(
+  const pane = await grid.openPane(
     { name, cwd: s.cwd || undefined, command: s.resume_command },
     paneEvents,
     grid.paneCount >= 2 ? "column" : "row"
   );
+  reapIfExited(pane);
 }
 
 // When a process exits on its own, retire its pane.
 void onPtyExit(({ id }) => {
   const pane = grid.findByPtyId(id);
   if (pane) grid.closePane(pane, false);
+  else earlyExits.add(id);
 });
 
 // Global shortcuts (terminals decline these in their key handlers).
@@ -96,4 +109,11 @@ window.addEventListener("contextmenu", (e) => {
   if ((e.target as HTMLElement).closest(".pane-term")) e.preventDefault();
 });
 
-void openShell();
+// WebView2 can come up without keyboard focus; make sure the active
+// terminal reclaims it whenever the window is (re)focused.
+window.addEventListener("focus", () => grid.activePane?.focus());
+
+void (async () => {
+  await ensureOutputRouter();
+  await openShell();
+})();

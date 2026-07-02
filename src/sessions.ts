@@ -43,7 +43,12 @@ export class SessionBrowser {
     this.listEl = document.createElement("div");
     this.listEl.className = "sessions-list";
 
-    this.el.append(head, this.searchEl, this.listEl);
+    // Fixed-width inner column so content doesn't squash while the
+    // sidebar's width animates open/closed.
+    const inner = document.createElement("div");
+    inner.className = "sessions-inner";
+    inner.append(head, this.searchEl, this.listEl);
+    this.el.appendChild(inner);
   }
 
   get visible(): boolean {
