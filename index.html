@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Weft</title>
+  </head>
+  <body>
+    <div id="app">
+      <header id="topbar">
+        <div id="brand" title="Weft — terminal multiplexer for AI agents">
+          <span class="brand-mark">▤</span> weft
+        </div>
+        <div id="actions">
+          <button id="btn-sessions" class="bar-btn" title="Session browser (Ctrl+Shift+P)">⟲ sessions</button>
+          <button id="btn-split-right" class="bar-btn" title="Split right (Ctrl+Shift+E)">◫</button>
+          <button id="btn-split-down" class="bar-btn" title="Split down (Ctrl+Shift+O)">⬓</button>
+        </div>
+      </header>
+      <div id="workspace">
+        <aside id="sessions" class="hidden"></aside>
+        <main id="grid-root"></main>
+      </div>
+      <footer id="hintbar">
+        <span><b>Ctrl+Shift+E</b> split right</span>
+        <span><b>Ctrl+Shift+O</b> split down</span>
+        <span><b>Ctrl+Shift+W</b> close pane</span>
+        <span><b>Ctrl+Shift+P</b> sessions</span>
+        <span><b>F2</b> rename</span>
+        <span><b>Alt+←↑↓→</b> focus</span>
+      </footer>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
