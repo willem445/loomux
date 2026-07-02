@@ -1,10 +1,10 @@
-# Weft
+# Loomux
 
 A sleek terminal multiplexer for AI agent management.
 
-In weaving, the *weft* is the thread drawn through the fixed warp to make
-the fabric — here, terminal panes woven into a matrix, each one carrying an
-agent (or just a shell).
+*Loom* + *mux*: a loom is the frame that holds every thread in place while
+the fabric is woven — here, the frame holding a matrix of terminal panes,
+each one carrying an agent (or just a shell).
 
 Windows Terminal–class smoothness with the multiplexing features it lacks:
 instant matrix splits, nameable panes, and a native session browser that

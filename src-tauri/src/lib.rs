@@ -21,5 +21,5 @@ pub fn run() {
             }
         })
         .run(tauri::generate_context!())
-        .expect("error while running weft");
+        .expect("error while running loomux");
 }

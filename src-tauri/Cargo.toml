@@ -1,11 +1,11 @@
 [package]
-name = "weft"
+name = "loomux"
 version = "0.1.0"
 description = "A sleek terminal multiplexer for AI agent management"
 edition = "2021"
 
 [lib]
-name = "weft_lib"
+name = "loomux_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
