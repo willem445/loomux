@@ -208,6 +208,46 @@ pub fn spawn_pty(
     Ok(id)
 }
 
+/// What kind of ConPTY the PTY layer will bind to, so the frontend can tune
+/// xterm.js accordingly (`windowsPty` option). portable-pty prefers a
+/// sideloaded `conpty.dll` + `OpenConsole.exe` next to the executable over
+/// the inbox Windows conhost; the inbox one (Windows 10) repaints the whole
+/// screen on every resize, which floods scrollback with duplicate frames.
+#[derive(Serialize)]
+pub struct PtyBackendInfo {
+    /// True when a modern conpty.dll sits next to the executable.
+    sideloaded_conpty: bool,
+    /// Effective conhost build for xterm's `windowsPty.buildNumber`
+    /// (>= 21376 means xterm may keep its own reflow enabled). 0 on
+    /// non-Windows platforms, where the option must not be set at all.
+    conpty_build: u32,
+}
+
+#[tauri::command]
+pub fn pty_backend_info() -> PtyBackendInfo {
+    #[cfg(target_os = "windows")]
+    {
+        let sideloaded = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("conpty.dll").is_file()))
+            .unwrap_or(false);
+        PtyBackendInfo {
+            sideloaded_conpty: sideloaded,
+            // The sideloaded conhost tracks the Windows Terminal releases
+            // (modern resize handling); the inbox Win10 conhost is stuck on
+            // the 19041 console codebase regardless of patch level.
+            conpty_build: if sideloaded { 22621 } else { 19045 },
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        PtyBackendInfo {
+            sideloaded_conpty: false,
+            conpty_build: 0,
+        }
+    }
+}
+
 #[tauri::command]
 pub fn write_pty(state: State<PtyManager>, id: u32, data: String) -> Result<(), String> {
     let mut ptys = state.ptys.lock().unwrap();

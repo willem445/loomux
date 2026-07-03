@@ -49,6 +49,20 @@ export const resizePty = (id: number, cols: number, rows: number): Promise<void>
 
 export const killPty = (id: number): Promise<void> => invoke("kill_pty", { id });
 
+export interface PtyBackendInfo {
+  /** True when a modern conpty.dll is sideloaded next to the executable. */
+  sideloaded_conpty: boolean;
+  /** Effective conhost build for xterm's windowsPty option; 0 off Windows. */
+  conpty_build: number;
+}
+
+/** Which ConPTY the backend binds to (cached — it can't change at runtime). */
+export function ptyBackendInfo(): Promise<PtyBackendInfo> {
+  backendInfo ??= invoke<PtyBackendInfo>("pty_backend_info");
+  return backendInfo;
+}
+let backendInfo: Promise<PtyBackendInfo> | null = null;
+
 /** Resolve display name + git branch for a directory the shell reported. */
 export const dirInfo = (path: string): Promise<DirInfo> => invoke("dir_info", { path });
 

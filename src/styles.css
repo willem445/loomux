@@ -88,6 +88,7 @@ html, body {
 }
 .pane {
   display: flex; flex-direction: column;
+  position: relative; /* anchors the floating git overlay */
   min-width: 60px; min-height: 60px;
   background: var(--bg-term);
   border: 1px solid var(--border-soft);
@@ -163,8 +164,18 @@ html, body {
 .pane-btn:hover { background: var(--panel-2); color: var(--text); }
 .pane-btn.close:hover { color: var(--danger); }
 
-.pane-term { flex: 1; min-height: 0; padding: 6px 2px 4px 10px; }
-.pane-term .xterm { height: 100%; }
+/* The terminal's breathing room must live on .xterm itself, not on
+   .pane-term: the fit addon subtracts the terminal element's own padding,
+   but treats the container's computed height (border-box under our global
+   box-sizing) as fully usable. Padding on the container makes fit
+   overestimate by that amount and grant an extra row/column, which then
+   renders clipped at the pane edge. */
+.pane-term {
+  flex: 1; min-height: 0;
+  /* Cursor-follow under the git overlay (see Pane.updateTermShift). */
+  transition: transform 0.18s var(--ease);
+}
+.pane-term .xterm { height: 100%; padding: 6px 2px 4px 10px; }
 
 .xterm-viewport::-webkit-scrollbar { width: 10px; }
 .xterm-viewport::-webkit-scrollbar-track { background: transparent; }
@@ -307,6 +318,83 @@ html, body {
 }
 .metric.metric-na .metric-val { color: var(--text-dim); font-style: italic; }
 
+/* ---------- agent mode + launcher dialog ---------- */
+#btn-agent-mode.on {
+  color: var(--accent); border-color: var(--accent-dim);
+  background: rgba(122, 162, 247, 0.12);
+  box-shadow: 0 0 12px var(--accent-glow);
+}
+
+.launcher-overlay {
+  position: fixed; inset: 0; z-index: 60;
+  display: none; align-items: center; justify-content: center;
+  background: rgba(9, 9, 14, 0.6);
+}
+.launcher-overlay.visible { display: flex; }
+
+@keyframes dlg-in {
+  from { opacity: 0; transform: translateY(6px) scale(0.985); }
+  to   { opacity: 1; transform: none; }
+}
+.agent-dialog {
+  width: 440px; max-width: calc(100vw - 48px);
+  background: var(--panel);
+  border: 1px solid var(--border); border-radius: 12px;
+  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.5);
+  padding: 16px 18px 14px;
+  display: flex; flex-direction: column; gap: 11px;
+  animation: dlg-in 0.16s var(--ease);
+}
+.agent-dialog h2 {
+  margin: 0 0 2px; font-size: 11.5px; font-weight: 600;
+  letter-spacing: 1.5px; text-transform: uppercase; color: var(--text-dim);
+}
+.dlg-field { display: flex; flex-direction: column; gap: 4px; }
+.dlg-field[hidden] { display: none; }
+.dlg-label {
+  font-size: 10px; letter-spacing: 1px; font-weight: 600;
+  text-transform: uppercase; color: var(--text-dim);
+}
+.dlg-label .opt {
+  text-transform: none; letter-spacing: 0.2px; font-weight: 400; color: #565c6d;
+}
+.dlg-row { display: flex; gap: 6px; }
+.dlg-row > input { flex: 1; min-width: 0; }
+.dlg-input, .dlg-select {
+  background: var(--bg-app); color: var(--text);
+  border: 1px solid var(--border); border-radius: 7px;
+  padding: 6px 10px; font: inherit; font-size: 12.5px; outline: none;
+  transition: border-color 0.15s var(--ease), box-shadow 0.15s var(--ease);
+}
+.dlg-input::placeholder { color: #565c6d; }
+.dlg-input:focus, .dlg-select:focus {
+  border-color: var(--accent-dim);
+  box-shadow: 0 0 0 3px rgba(122, 162, 247, 0.08);
+}
+.dlg-error {
+  display: none;
+  background: #2a1a20; color: #f7a2b2;
+  border: 1px solid #55303a; border-radius: 7px;
+  padding: 6px 10px; font-size: 11.5px; line-height: 1.4;
+  user-select: text;
+}
+.dlg-error.visible { display: block; }
+.dlg-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 2px; }
+.dlg-btn {
+  background: var(--panel-2); color: var(--text-dim);
+  border: 1px solid var(--border); border-radius: 7px;
+  padding: 5px 14px; font: inherit; font-size: 12px; cursor: pointer;
+  transition: color 0.15s var(--ease), border-color 0.15s var(--ease),
+              background 0.15s var(--ease);
+}
+.dlg-btn:hover:not(:disabled) { color: var(--text); border-color: var(--accent-dim); }
+.dlg-btn.primary {
+  background: var(--accent-dim); color: #dbe4fb;
+  border-color: transparent; font-weight: 600;
+}
+.dlg-btn.primary:hover:not(:disabled) { background: var(--accent); color: #10131f; }
+.dlg-btn:disabled { opacity: 0.5; cursor: default; }
+
 /* ---------- fatal error banner ---------- */
 #app-error {
   position: fixed; left: 50%; bottom: 38px; transform: translateX(-50%);
@@ -320,6 +408,17 @@ html, body {
 #app-error.visible { display: block; }
 
 /* ---------- git view ---------- */
+/* The git view floats over the top of the terminal rather than shrinking
+   it: the terminal's grid/PTY size must not change on toggle (a PTY resize
+   makes ConPTY and TUIs repaint, duplicating frames into scrollback). */
+.git-overlay {
+  position: absolute; top: var(--pane-header-h); left: 0; right: 0;
+  z-index: 15;
+  display: flex; flex-direction: column; min-height: 0;
+  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.45);
+}
+.git-overlay[hidden] { display: none; }
+
 .pane-git {
   flex: 1; min-height: 0; position: relative;
   display: grid;

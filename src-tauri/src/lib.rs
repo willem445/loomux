@@ -17,6 +17,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             pty::spawn_pty,
+            pty::pty_backend_info,
             pty::write_pty,
             pty::resize_pty,
             pty::kill_pty,
@@ -33,6 +34,7 @@ pub fn run() {
             git::git_commit,
             git::git_checkout,
             git::git_discard,
+            git::git_worktree_add,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {

@@ -17,6 +17,7 @@ import {
   ensureOutputRouter,
   attachOutput,
   detachOutput,
+  ptyBackendInfo,
 } from "./pty";
 import { isAppShortcut } from "./shortcuts";
 import { GitView } from "./gitview";
@@ -117,6 +118,12 @@ export class Pane {
   /** Lazily created git view; null until the first toggle. */
   private gitView: GitView | null = null;
   private gitDivider: HTMLElement | null = null;
+  /** Floating container for the git view + divider. It overlays the top of
+   *  the terminal instead of shrinking it: resizing the PTY makes ConPTY and
+   *  full-screen TUIs repaint from scratch, flooding scrollback with
+   *  duplicate frames. */
+  private gitOverlay: HTMLElement | null = null;
+  private shiftTimer: number | undefined;
   private fit = new FitAddon();
   private resizeObs: ResizeObserver;
   private disposed = false;
@@ -233,6 +240,9 @@ export class Pane {
 
     this.el.addEventListener("mousedown", () => this.events.onFocus(this));
 
+    // Keep the cursor row visible under the git overlay as output arrives.
+    this.term.onCursorMove(() => this.scheduleShift());
+
     this.resizeObs = new ResizeObserver(() => this.applyFit());
     this.setName("shell");
   }
@@ -246,6 +256,23 @@ export class Pane {
     if (opts.cwd) {
       this.cwdRaw = opts.cwd;
       void this.refreshDir(opts.cwd);
+    }
+    // Tell xterm which ConPTY it is talking to. This drives its resize
+    // heuristics: against a modern conhost (sideloaded, honors the
+    // resize-quirk flag and emits nothing on resize) xterm keeps its own
+    // buffer reflow; against the inbox Win10 conhost (full repaint on every
+    // resize) xterm disables reflow so the two don't fight and duplicate
+    // content into scrollback.
+    try {
+      const backend = await ptyBackendInfo();
+      if (backend.conpty_build > 0) {
+        this.term.options.windowsPty = {
+          backend: "conpty",
+          buildNumber: backend.conpty_build,
+        };
+      }
+    } catch {
+      // Backend info is a tuning hint only — never block the terminal on it.
     }
     this.term.open(this.termEl);
     this.term.textarea?.addEventListener("focus", () => this.events.onFocus(this));
@@ -263,17 +290,18 @@ export class Pane {
 
     try {
       await ensureOutputRouter();
-      const ptyId = await spawnPty({
-        cols: Number.isFinite(this.term.cols) && this.term.cols > 1 ? this.term.cols : 80,
-        rows: Number.isFinite(this.term.rows) && this.term.rows > 1 ? this.term.rows : 24,
-        cwd: opts.cwd,
-        command: opts.command,
-      });
+      const cols = Number.isFinite(this.term.cols) && this.term.cols > 1 ? this.term.cols : 80;
+      const rows = Number.isFinite(this.term.rows) && this.term.rows > 1 ? this.term.rows : 24;
+      const ptyId = await spawnPty({ cols, rows, cwd: opts.cwd, command: opts.command });
       if (this.disposed) {
         killPty(ptyId).catch(() => {});
         return;
       }
       this.ptyId = ptyId;
+      this.sentSize = `${cols}x${rows}`;
+      // Reconcile: if the pane was resized while the spawn was in flight,
+      // the debounced fit will notice the size drifted and resend once.
+      this.applyFit();
       attachOutput(ptyId, (bytes) => this.term.write(bytes));
       for (const data of this.inputQueue.splice(0)) {
         writePty(ptyId, data).catch(() => {});
@@ -296,15 +324,27 @@ export class Pane {
   }
 
   private fitTimer: number | undefined;
+  /** Last grid size sent to the PTY, as `cols x rows`. Resizing ConPTY is
+   *  never free (the inbox Win10 conhost repaints the whole screen, which
+   *  TUIs then duplicate into scrollback), so same-size calls are skipped. */
+  private sentSize = "";
   private applyFit(): void {
     // Debounce: divider drags fire many resize events per frame.
     clearTimeout(this.fitTimer);
     this.fitTimer = window.setTimeout(() => {
       if (this.disposed || !this.termEl.isConnected) return;
-      if (this.termEl.clientWidth === 0) return; // hidden behind git view
+      if (this.termEl.clientWidth === 0) return; // not laid out yet
       this.fit.fit();
-      if (this.ptyId !== null) {
+      const size = `${this.term.cols}x${this.term.rows}`;
+      if (this.ptyId !== null && size !== this.sentSize) {
+        this.sentSize = size;
         resizePty(this.ptyId, this.term.cols, this.term.rows).catch(() => {});
+      }
+      // The pane itself changed size: keep the overlay within bounds and
+      // re-anchor the visible strip on the cursor.
+      if (this.gitOverlay && !this.gitOverlay.hidden) {
+        this.gitOverlay.style.height = `${this.overlayClamp(this.gitOverlay.offsetHeight)}px`;
+        this.updateTermShift();
       }
     }, 16);
   }
@@ -328,8 +368,11 @@ export class Pane {
     void this.refreshDir(path);
   }
 
-  /** Toggle the git view. It stacks ABOVE the terminal — the shell stays
-   *  visible and usable, with a draggable divider between the two. */
+  /** Toggle the git view. It FLOATS over the top of the terminal — the
+   *  terminal keeps its full size and PTY dimensions, so toggling never
+   *  triggers a resize repaint (which would push duplicate TUI frames into
+   *  scrollback). The bottom strip of the terminal stays visible and usable,
+   *  with a draggable divider on the overlay's lower edge. */
   toggleGitView(): void {
     if (!this.gitView) {
       this.gitView = new GitView({
@@ -340,50 +383,57 @@ export class Pane {
         },
       });
       this.gitDivider = this.makeGitDivider();
-      // Order: header, git view, divider, terminal.
-      this.termEl.before(this.gitView.el, this.gitDivider);
+      this.gitOverlay = document.createElement("div");
+      this.gitOverlay.className = "git-overlay";
+      this.gitOverlay.hidden = true;
+      this.gitOverlay.append(this.gitView.el, this.gitDivider);
+      this.el.appendChild(this.gitOverlay);
     }
     try {
       if (this.gitView.visible) {
         this.gitView.hide();
-        this.gitDivider!.hidden = true;
-        this.termEl.style.flex = "";
-        this.termEl.style.height = "";
+        this.gitOverlay!.hidden = true;
+        this.updateTermShift();
         this.focus();
       } else {
-        // Terminal keeps a fixed share at the bottom; the git view takes the
-        // rest. The ResizeObserver re-fits the terminal automatically.
-        const share = Math.max(140, Math.round(this.el.clientHeight * 0.35));
-        this.termEl.style.flex = "0 0 auto";
-        this.termEl.style.height = `${share}px`;
-        this.gitDivider!.hidden = false;
+        // Terminal keeps a fixed visible share at the bottom; the overlay
+        // covers the rest.
+        const strip = Math.max(140, Math.round(this.el.clientHeight * 0.35));
+        this.gitOverlay!.style.height = `${this.overlayClamp(this.termEl.clientHeight - strip)}px`;
+        this.gitOverlay!.hidden = false;
         this.gitView.show();
+        this.updateTermShift();
       }
     } catch (err) {
-      // Never leave the pane half-toggled: give the terminal back its
-      // space, then let the error surface (global handler shows a banner).
+      // Never leave the pane half-toggled: retract the overlay fully, then
+      // let the error surface (global handler shows a banner).
       this.gitView?.hide();
-      if (this.gitDivider) this.gitDivider.hidden = true;
-      this.termEl.style.flex = "";
-      this.termEl.style.height = "";
+      if (this.gitOverlay) this.gitOverlay.hidden = true;
+      this.termEl.style.transform = "";
       throw err;
     }
   }
 
-  /** Horizontal drag handle between the git view and the terminal. */
+  /** Keep the overlay tall enough to be usable but always leave a terminal
+   *  strip visible at the bottom. */
+  private overlayClamp(h: number): number {
+    const max = Math.max(160, this.termEl.clientHeight - 100);
+    return Math.max(160, Math.min(max, h));
+  }
+
+  /** Horizontal drag handle on the overlay's bottom edge. */
   private makeGitDivider(): HTMLElement {
     const div = document.createElement("div");
     div.className = "git-divider";
-    div.hidden = true;
     div.addEventListener("mousedown", (e) => {
       e.preventDefault();
       const startY = e.clientY;
-      const startH = this.termEl.offsetHeight;
+      const startH = this.gitOverlay!.offsetHeight;
       div.classList.add("dragging");
       const move = (ev: MouseEvent) => {
-        const max = this.el.clientHeight - 160; // keep the git view usable
-        const h = Math.max(100, Math.min(max, startH + (startY - ev.clientY)));
-        this.termEl.style.height = `${h}px`;
+        const h = this.overlayClamp(startH + (ev.clientY - startY));
+        this.gitOverlay!.style.height = `${h}px`;
+        this.updateTermShift();
       };
       const up = () => {
         div.classList.remove("dragging");
@@ -394,6 +444,38 @@ export class Pane {
       window.addEventListener("mouseup", up);
     });
     return div;
+  }
+
+  /** Debounced cursor-follow for the overlay: TUIs sweep the cursor around
+   *  while repainting, so settle before measuring. */
+  private scheduleShift(): void {
+    if (!this.gitOverlay || this.gitOverlay.hidden) return;
+    clearTimeout(this.shiftTimer);
+    this.shiftTimer = window.setTimeout(() => this.updateTermShift(), 80);
+  }
+
+  /** With the git overlay covering the top of the terminal, shift the
+   *  terminal down (visually only — the grid/PTY size is untouched) just
+   *  enough to keep the cursor's row inside the visible bottom strip.
+   *  Full-screen TUIs write at the bottom and need no shift; a fresh shell
+   *  writes at the top, which the overlay would otherwise hide. */
+  private updateTermShift(): void {
+    if (this.disposed) return;
+    if (!this.gitOverlay || this.gitOverlay.hidden) {
+      this.termEl.style.transform = "";
+      return;
+    }
+    const screen = this.termEl.querySelector<HTMLElement>(".xterm-screen");
+    const xtermEl = this.termEl.querySelector<HTMLElement>(".xterm");
+    if (!screen || !xtermEl || !this.term.rows) return;
+    const cell = screen.offsetHeight / this.term.rows;
+    if (!cell) return;
+    const covered = this.gitOverlay.offsetHeight;
+    const padTop = parseFloat(getComputedStyle(xtermEl).paddingTop) || 0;
+    const cursorTop = padTop + this.term.buffer.active.cursorY * cell;
+    // One extra row of context above the cursor when shifted.
+    const shift = Math.max(0, Math.min(covered, Math.round(covered - cursorTop + cell)));
+    this.termEl.style.transform = shift > 0 ? `translateY(${shift}px)` : "";
   }
 
   private async refreshDir(path: string): Promise<void> {
@@ -472,6 +554,7 @@ export class Pane {
     this.disposed = true;
     this.resizeObs.disconnect();
     clearTimeout(this.fitTimer);
+    clearTimeout(this.shiftTimer);
     this.gitView?.dispose();
     if (this.ptyId !== null) {
       detachOutput(this.ptyId);
