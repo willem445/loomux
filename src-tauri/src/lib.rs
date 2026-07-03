@@ -1,3 +1,4 @@
+mod git;
 mod pty;
 mod sessions;
 
@@ -16,6 +17,16 @@ pub fn run() {
             pty::dir_info,
             pty::change_dir,
             sessions::list_sessions,
+            git::git_repo_root,
+            git::git_log,
+            git::git_status,
+            git::git_diff,
+            git::git_commit_files,
+            git::git_stage,
+            git::git_unstage,
+            git::git_commit,
+            git::git_checkout,
+            git::git_discard,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {

@@ -4,6 +4,15 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Loomux</title>
+    <style>
+      /* Critical pre-bundle styles: the real stylesheet arrives with the JS
+         module, so without these the static markup flashes unstyled (white
+         background, raw text) at startup. Paint dark immediately and keep
+         the UI skeleton hidden; styles.css sets `#app { display: flex }`,
+         which overrides the hide once it loads. */
+      html, body { margin: 0; height: 100%; background: #131318; }
+      #app { display: none; }
+    </style>
   </head>
   <body>
     <div id="app">
@@ -26,6 +35,7 @@
         <span><kbd>Ctrl+Shift+O</kbd> split down</span>
         <span><kbd>Ctrl+Shift+W</kbd> close pane</span>
         <span><kbd>Ctrl+Shift+P</kbd> sessions</span>
+        <span><kbd>Alt+G</kbd> git</span>
         <span><kbd>F2</kbd> rename</span>
         <span><kbd>Alt+←↑↓→</kbd> focus</span>
       </footer>

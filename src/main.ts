@@ -5,6 +5,24 @@ import { SessionBrowser } from "./sessions";
 import { ensureOutputRouter, onPtyExit, type SessionInfo } from "./pty";
 import { matchShortcut } from "./shortcuts";
 
+// Surface unexpected errors as a visible banner instead of a silently
+// broken UI — a user-facing "crash" should always come with a message.
+function showFatal(msg: string): void {
+  let el = document.getElementById("app-error");
+  if (!el) {
+    el = document.createElement("div");
+    el.id = "app-error";
+    el.addEventListener("click", () => el!.classList.remove("visible"));
+    document.body.appendChild(el);
+  }
+  el.textContent = msg;
+  el.classList.add("visible");
+}
+window.addEventListener("error", (e) => showFatal(`error: ${e.message}`));
+window.addEventListener("unhandledrejection", (e) =>
+  showFatal(`unhandled: ${String(e.reason)}`)
+);
+
 const gridRoot = document.getElementById("grid-root")!;
 const sessionsEl = document.getElementById("sessions")!;
 
@@ -77,6 +95,9 @@ document.addEventListener(
         break;
       case "toggle-sessions":
         sessions.toggle();
+        break;
+      case "toggle-git":
+        grid.activePane?.toggleGitView();
         break;
       case "rename-pane":
         grid.activePane?.startRename();

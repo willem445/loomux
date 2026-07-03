@@ -7,6 +7,7 @@ export type ShortcutAction =
   | "split-down"
   | "close-pane"
   | "toggle-sessions"
+  | "toggle-git"
   | "rename-pane"
   | "focus-left"
   | "focus-right"
@@ -28,6 +29,9 @@ export function matchShortcut(e: KeyboardEvent): ShortcutAction | null {
       case "ArrowRight": return "focus-right";
       case "ArrowUp": return "focus-up";
       case "ArrowDown": return "focus-down";
+      // Alt+G, not Ctrl+Shift+G: WebView2 consumes that as its
+      // find-previous accelerator before the page ever sees it.
+      case "KeyG": return "toggle-git";
     }
   }
   if (e.code === "F2" && !e.ctrlKey && !e.altKey && !e.shiftKey) return "rename-pane";

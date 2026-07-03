@@ -19,11 +19,13 @@ import {
   detachOutput,
 } from "./pty";
 import { isAppShortcut } from "./shortcuts";
+import { GitView } from "./gitview";
 
 // Inline icons so the toolbar renders identically regardless of installed
 // fonts; they inherit color via `currentColor`.
 const FOLDER_ICON = `<svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"><path d="M1.9 4.3c0-.6.5-1.1 1.1-1.1h3l1.4 1.5h5.6c.6 0 1.1.5 1.1 1.1v5.4c0 .6-.5 1.1-1.1 1.1H3c-.6 0-1.1-.5-1.1-1.1z"/></svg>`;
 const BRANCH_ICON = `<svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><circle cx="4.5" cy="3.6" r="1.7"/><circle cx="4.5" cy="12.4" r="1.7"/><circle cx="11.5" cy="5.4" r="1.7"/><path d="M4.5 5.3v5.4M11.5 7.1c0 2.4-1.9 3.1-4 3.6"/></svg>`;
+const GIT_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><circle cx="8" cy="2.8" r="1.6"/><circle cx="4" cy="13.2" r="1.6"/><circle cx="12" cy="13.2" r="1.6"/><path d="M8 4.4v2.2M8 6.6c0 2.6-4 2.4-4 5M8 6.6c0 2.6 4 2.4 4 5"/></svg>`;
 
 /** Extract a filesystem path from an OSC 7 payload, which may be a raw path
  *  or a `file://host/path` URL. Returns "" if nothing usable. */
@@ -112,6 +114,9 @@ export class Pane {
   private branchTextEl: HTMLElement;
   /** Latest un-abbreviated directory the shell reported, for the picker. */
   private cwdRaw: string | null = null;
+  /** Lazily created git view; null until the first toggle. */
+  private gitView: GitView | null = null;
+  private gitDivider: HTMLElement | null = null;
   private fit = new FitAddon();
   private resizeObs: ResizeObserver;
   private disposed = false;
@@ -131,7 +136,8 @@ export class Pane {
     header.appendChild(this.titleEl);
 
     // Live metadata: current folder + git branch, reported by the shell.
-    // The folder chip is a button — click it to pick a folder to cd into.
+    // The folder chip picks a folder to cd into; the branch chip opens the
+    // git view.
     const meta = document.createElement("div");
     meta.className = "pane-meta";
     [this.cwdEl, this.cwdTextEl] = makeMetaItem("pane-cwd", FOLDER_ICON);
@@ -142,8 +148,24 @@ export class Pane {
       e.stopPropagation();
       void this.pickFolder();
     });
+    this.branchEl.setAttribute("role", "button");
+    this.branchEl.tabIndex = 0;
+    this.branchEl.addEventListener("click", (e) => {
+      e.stopPropagation();
+      this.toggleGitView();
+    });
     meta.append(this.cwdEl, this.branchEl);
     header.appendChild(meta);
+
+    const gitBtn = document.createElement("button");
+    gitBtn.className = "pane-btn";
+    gitBtn.innerHTML = GIT_ICON;
+    gitBtn.title = "Git view (Alt+G)";
+    gitBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      this.toggleGitView();
+    });
+    header.appendChild(gitBtn);
 
     for (const [glyph, cls, tip, fn] of [
       ["◫", "", "Split right", () => this.events.onSplit(this, "row")],
@@ -279,6 +301,7 @@ export class Pane {
     clearTimeout(this.fitTimer);
     this.fitTimer = window.setTimeout(() => {
       if (this.disposed || !this.termEl.isConnected) return;
+      if (this.termEl.clientWidth === 0) return; // hidden behind git view
       this.fit.fit();
       if (this.ptyId !== null) {
         resizePty(this.ptyId, this.term.cols, this.term.rows).catch(() => {});
@@ -294,10 +317,83 @@ export class Pane {
   /** Handle an OSC 7 working-directory report from the shell. Payloads are
    *  usually a raw path, but tolerate a `file://host/path` URL too. */
   private onCwdReported(payload: string): void {
+    // Every prompt is a "something may have happened" signal for the git
+    // view, even when the directory itself didn't change.
+    this.gitView?.notifyPrompt();
     const path = normalizeOscPath(payload);
-    if (!path || path === this.cwdRaw) return; // unchanged → nothing to do
+    if (!path) return;
     this.cwdRaw = path;
+    // Refresh even when the path is unchanged: the *branch* can change
+    // without a cd (git checkout), and dir_info is cheap.
     void this.refreshDir(path);
+  }
+
+  /** Toggle the git view. It stacks ABOVE the terminal — the shell stays
+   *  visible and usable, with a draggable divider between the two. */
+  toggleGitView(): void {
+    if (!this.gitView) {
+      this.gitView = new GitView({
+        getCwd: () => this.cwdRaw,
+        onClose: () => this.toggleGitView(),
+        onRepoAction: () => {
+          if (this.cwdRaw) void this.refreshDir(this.cwdRaw);
+        },
+      });
+      this.gitDivider = this.makeGitDivider();
+      // Order: header, git view, divider, terminal.
+      this.termEl.before(this.gitView.el, this.gitDivider);
+    }
+    try {
+      if (this.gitView.visible) {
+        this.gitView.hide();
+        this.gitDivider!.hidden = true;
+        this.termEl.style.flex = "";
+        this.termEl.style.height = "";
+        this.focus();
+      } else {
+        // Terminal keeps a fixed share at the bottom; the git view takes the
+        // rest. The ResizeObserver re-fits the terminal automatically.
+        const share = Math.max(140, Math.round(this.el.clientHeight * 0.35));
+        this.termEl.style.flex = "0 0 auto";
+        this.termEl.style.height = `${share}px`;
+        this.gitDivider!.hidden = false;
+        this.gitView.show();
+      }
+    } catch (err) {
+      // Never leave the pane half-toggled: give the terminal back its
+      // space, then let the error surface (global handler shows a banner).
+      this.gitView?.hide();
+      if (this.gitDivider) this.gitDivider.hidden = true;
+      this.termEl.style.flex = "";
+      this.termEl.style.height = "";
+      throw err;
+    }
+  }
+
+  /** Horizontal drag handle between the git view and the terminal. */
+  private makeGitDivider(): HTMLElement {
+    const div = document.createElement("div");
+    div.className = "git-divider";
+    div.hidden = true;
+    div.addEventListener("mousedown", (e) => {
+      e.preventDefault();
+      const startY = e.clientY;
+      const startH = this.termEl.offsetHeight;
+      div.classList.add("dragging");
+      const move = (ev: MouseEvent) => {
+        const max = this.el.clientHeight - 160; // keep the git view usable
+        const h = Math.max(100, Math.min(max, startH + (startY - ev.clientY)));
+        this.termEl.style.height = `${h}px`;
+      };
+      const up = () => {
+        div.classList.remove("dragging");
+        window.removeEventListener("mousemove", move);
+        window.removeEventListener("mouseup", up);
+      };
+      window.addEventListener("mousemove", move);
+      window.addEventListener("mouseup", up);
+    });
+    return div;
   }
 
   private async refreshDir(path: string): Promise<void> {
@@ -376,6 +472,7 @@ export class Pane {
     this.disposed = true;
     this.resizeObs.disconnect();
     clearTimeout(this.fitTimer);
+    this.gitView?.dispose();
     if (this.ptyId !== null) {
       detachOutput(this.ptyId);
       if (killBackend) killPty(this.ptyId).catch(() => {});
