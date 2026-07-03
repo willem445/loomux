@@ -259,6 +259,54 @@ pub fn git_discard(repo: String, path: String, untracked: bool) -> Result<(), St
     }
 }
 
+/// Names must be usable both as a branch name and as a relative directory:
+/// letters, digits, `. _ - /`, no leading `-` or `/`, no `..`, no trailing `/`.
+fn valid_worktree_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('-')
+        && !name.starts_with('/')
+        && !name.ends_with('/')
+        && !name.contains("..")
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'))
+}
+
+/// Create a worktree for an agent session at
+/// `<repo-parent>/<repo-name>-worktrees/<name>`, checked out on a branch
+/// named `name` — a new branch off HEAD, or the existing branch of that name.
+/// Returns the worktree's absolute path.
+#[tauri::command]
+pub fn git_worktree_add(repo: String, name: String) -> Result<String, String> {
+    if !valid_worktree_name(&name) {
+        return Err(format!(
+            "invalid worktree name {name:?} — use letters, digits, and . _ - /"
+        ));
+    }
+    let root = run_git(&repo, &["rev-parse", "--show-toplevel"])?;
+    let root = PathBuf::from(root.trim().replace('/', std::path::MAIN_SEPARATOR_STR));
+    let repo_name = root
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .ok_or("cannot resolve repository name")?;
+    let parent = root.parent().ok_or("repository has no parent directory")?;
+    let dest = parent.join(format!("{repo_name}-worktrees")).join(&name);
+    if dest.exists() {
+        return Err(format!("worktree path already exists: {}", dest.display()));
+    }
+    let dest_str = dest.to_string_lossy().into_owned();
+    if let Err(e) = run_git(&repo, &["worktree", "add", "-b", &name, &dest_str]) {
+        // `-b` refuses when the branch already exists; check that branch out
+        // into the new worktree instead.
+        if e.contains("already exists") {
+            run_git(&repo, &["worktree", "add", &dest_str, &name])?;
+        } else {
+            return Err(e);
+        }
+    }
+    Ok(dest_str)
+}
+
 // ---------- parsers ----------
 
 fn parse_log(out: &str) -> Vec<CommitInfo> {
@@ -519,6 +567,16 @@ mod tests {
         assert!(commits[1].parents.is_empty()); // root commit
         assert_eq!(commits[1].refs[0].kind, "tag");
         assert_eq!(commits[1].refs[0].name, "v1");
+    }
+
+    #[test]
+    fn worktree_name_validation() {
+        for ok in ["fix-auth", "feature/api-v2", "wt_1.2"] {
+            assert!(valid_worktree_name(ok), "{ok} should be valid");
+        }
+        for bad in ["", "-x", "/abs", "a/", "a..b", "has space", "back\\slash"] {
+            assert!(!valid_worktree_name(bad), "{bad:?} should be invalid");
+        }
     }
 
     #[test]

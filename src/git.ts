@@ -72,3 +72,8 @@ export const gitCheckout = (repo: string, refname: string, track: boolean): Prom
 
 export const gitDiscard = (repo: string, path: string, untracked: boolean): Promise<void> =>
   invoke("git_discard", { repo, path, untracked });
+
+/** Create a worktree named `name` beside the repo (branch of the same name,
+ *  created if needed). Resolves to the worktree's absolute path. */
+export const gitWorktreeAdd = (repo: string, name: string): Promise<string> =>
+  invoke("git_worktree_add", { repo, name });

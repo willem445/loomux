@@ -7,6 +7,7 @@ export type ShortcutAction =
   | "split-down"
   | "close-pane"
   | "toggle-sessions"
+  | "toggle-agent-mode"
   | "toggle-git"
   | "rename-pane"
   | "focus-left"
@@ -21,6 +22,7 @@ export function matchShortcut(e: KeyboardEvent): ShortcutAction | null {
       case "KeyO": return "split-down";
       case "KeyW": return "close-pane";
       case "KeyP": return "toggle-sessions";
+      case "KeyA": return "toggle-agent-mode";
     }
   }
   if (e.altKey && !e.ctrlKey && !e.shiftKey) {
