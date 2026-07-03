@@ -65,10 +65,20 @@ function makeMetaItem(cls: string, icon: string): [HTMLElement, HTMLElement] {
   return [wrap, text];
 }
 
+/** Role/group chip shown before the pane title (orchestration panes). */
+export interface PaneBadge {
+  /** Short uppercase label, e.g. "ORCH", "W", "REV". */
+  label: string;
+  /** Group accent color; also tints the pane header. */
+  color: string;
+  title?: string;
+}
+
 export interface PaneOptions {
   name?: string;
   cwd?: string;
   command?: string;
+  badge?: PaneBadge;
 }
 
 const TERM_THEME = {
@@ -250,6 +260,7 @@ export class Pane {
   /** Open the terminal in the DOM and spawn its PTY. Call after `el` is attached. */
   async start(opts: PaneOptions = {}): Promise<void> {
     this.setName(opts.name ?? "shell");
+    if (opts.badge) this.setBadge(opts.badge);
     // Seed the toolbar from the startup directory. Interactive shells refine
     // this via OSC 7; command panes (agents) keep this initial value since
     // they have no prompt to report from.
@@ -352,6 +363,18 @@ export class Pane {
   setName(name: string): void {
     this.name = name;
     this.titleEl.textContent = name;
+  }
+
+  /** Mark this pane as part of an orchestration group: role chip before the
+   *  title plus a group-colored accent on the header. */
+  setBadge(badge: PaneBadge): void {
+    const chip = document.createElement("span");
+    chip.className = "pane-badge";
+    chip.textContent = badge.label;
+    if (badge.title) chip.title = badge.title;
+    this.el.style.setProperty("--group-color", badge.color);
+    this.el.classList.add("grouped");
+    this.titleEl.before(chip);
   }
 
   /** Handle an OSC 7 working-directory report from the shell. Payloads are

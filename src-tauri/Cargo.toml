@@ -18,6 +18,12 @@ serde_json = "1"
 portable-pty = "0.9"
 base64 = "0.22"
 dirs = "6"
+# Orchestration backend: local MCP server (thread-per-request HTTP).
+# NOTE: keep getrandom-based crates (uuid v4, rand) out of this tree — they
+# import bcryptprimitives.dll!ProcessPrng, which this project's Windows 10
+# baseline doesn't export, and the binary then fails to load (0xc0000139).
+# Agent tokens use std's OS-seeded RandomState instead.
+tiny_http = "0.12"
 tauri-plugin-dialog = "2"
 sysinfo = "0.33"
 
@@ -31,6 +37,11 @@ windows = { version = "0.57", features = [
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
 ] }
+
+[dev-dependencies]
+# default-features = false drops tempfile's getrandom feature — see the
+# ProcessPrng note above; with it enabled the test binary fails to load.
+tempfile = { version = "3", default-features = false }
 
 [profile.release]
 lto = true

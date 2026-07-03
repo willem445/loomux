@@ -6,17 +6,23 @@ use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
+
+/// Cap on the per-pty output ring used by orchestration's `get_output` —
+/// enough for a few screens of TUI history without unbounded growth.
+const OUTPUT_RING_CAP: usize = 256 * 1024;
 
 pub struct PtyHandle {
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     killer: Box<dyn ChildKiller + Send + Sync>,
+    /// Rolling tail of raw output, teed off the reader thread.
+    output: Arc<Mutex<VecDeque<u8>>>,
 }
 
 #[derive(Default)]
@@ -31,6 +37,29 @@ impl PtyManager {
     pub fn kill_all(&self) {
         let handles: Vec<_> = self.ptys.lock().unwrap().drain().collect();
         for (_, mut h) in handles {
+            let _ = h.killer.kill();
+        }
+    }
+
+    /// Raw write into a pty's stdin; used by orchestration to type prompts
+    /// into agent CLIs so the human sees them verbatim.
+    pub fn write_bytes(&self, id: u32, bytes: &[u8]) -> Result<(), String> {
+        let mut ptys = self.ptys.lock().unwrap();
+        let pty = ptys.get_mut(&id).ok_or("pty not found")?;
+        pty.writer.write_all(bytes).map_err(|e| e.to_string())
+    }
+
+    /// Snapshot of the rolling output tail (raw bytes, ANSI included).
+    pub fn output_tail(&self, id: u32) -> Option<Vec<u8>> {
+        let ptys = self.ptys.lock().unwrap();
+        let ring = ptys.get(&id)?.output.lock().unwrap();
+        Some(ring.iter().copied().collect())
+    }
+
+    /// Kill one child; the waiter thread reaps it and emits `pty-exit`.
+    pub fn kill(&self, id: u32) {
+        let handle = self.ptys.lock().unwrap().remove(&id);
+        if let Some(mut h) = handle {
             let _ = h.killer.kill();
         }
     }
@@ -165,18 +194,21 @@ pub fn spawn_pty(
     let mut reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
 
     let id = state.next_id.fetch_add(1, Ordering::SeqCst) + 1;
+    let output = Arc::new(Mutex::new(VecDeque::new()));
     state.ptys.lock().unwrap().insert(
         id,
         PtyHandle {
             master: pair.master,
             writer,
             killer,
+            output: output.clone(),
         },
     );
 
     // Reader thread: stream output on a single shared channel keyed by id.
     // The frontend router buffers payloads for panes that haven't attached
-    // their handler yet, so no output can be lost at startup.
+    // their handler yet, so no output can be lost at startup. A rolling tail
+    // is teed into the ring for orchestration's `get_output`.
     let out_app = app.clone();
     std::thread::spawn(move || {
         let mut buf = [0u8; 8192];
@@ -184,6 +216,14 @@ pub fn spawn_pty(
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
+                    {
+                        let mut ring = output.lock().unwrap();
+                        ring.extend(&buf[..n]);
+                        let overflow = ring.len().saturating_sub(OUTPUT_RING_CAP);
+                        if overflow > 0 {
+                            ring.drain(..overflow);
+                        }
+                    }
                     let _ = out_app.emit(
                         "pty-output",
                         OutputPayload {
@@ -196,12 +236,17 @@ pub fn spawn_pty(
         }
     });
 
-    // Waiter thread: reap the child, then tear down and notify.
+    // Waiter thread: reap the child, then tear down and notify. Orchestration
+    // learns about agent deaths here (authoritative, even if the frontend
+    // never noticed the pane).
     let ptys = state.ptys.clone();
     std::thread::spawn(move || {
         let status = child.wait();
         ptys.lock().unwrap().remove(&id);
         let exit_code = status.ok().map(|s| s.exit_code());
+        if let Some(reg) = app.try_state::<Arc<crate::orchestration::OrchRegistry>>() {
+            reg.on_pty_exit(id, exit_code);
+        }
         let _ = app.emit("pty-exit", ExitPayload { id, exit_code });
     });
 
@@ -387,10 +432,7 @@ fn parse_head(head: &str) -> Option<String> {
 pub fn kill_pty(state: State<PtyManager>, id: u32) -> Result<(), String> {
     // Remove first so the handle (and its master side) drops; then signal
     // the child. The waiter thread emits pty-exit once it reaps.
-    let handle = state.ptys.lock().unwrap().remove(&id);
-    if let Some(mut h) = handle {
-        let _ = h.killer.kill();
-    }
+    state.kill(id);
     Ok(())
 }
 

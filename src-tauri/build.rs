@@ -1,6 +1,25 @@
 fn main() {
     copy_sideloaded_conhost();
+    embed_test_manifest();
     tauri_build::build()
+}
+
+/// Test executables link the same UI stack as the app (comctl32 v6 imports
+/// like TaskDialogIndirect) but don't get tauri-build's manifest, so they
+/// fail to load with STATUS_ENTRYPOINT_NOT_FOUND. Embed a minimal
+/// common-controls-v6 manifest for test targets only.
+fn embed_test_manifest() {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
+    let manifest = std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
+        .join("test.manifest");
+    println!("cargo:rerun-if-changed={}", manifest.display());
+    // `-tests` scoping requires at least one integration-test target to
+    // exist (tests/smoke.rs). Applying it unscoped breaks the main binary:
+    // tauri-build embeds its own manifest there and the two collide (LNK1123).
+    println!("cargo:rustc-link-arg-tests=/MANIFEST:EMBED");
+    println!("cargo:rustc-link-arg-tests=/MANIFESTINPUT:{}", manifest.display());
 }
 
 /// Place `resources/conhost/{conpty.dll, OpenConsole.exe}` next to the built

@@ -1,8 +1,10 @@
 mod git;
 mod metrics;
+pub mod orchestration; // pub: integration smoke test links through it
 mod pty;
 mod sessions;
 
+use std::sync::Arc;
 use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -10,9 +12,16 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(pty::PtyManager::default())
+        .manage(Arc::new(orchestration::OrchRegistry::new(
+            orchestration::OrchRegistry::default_root(),
+        )))
         .setup(|app| {
             // Start streaming CPU/mem/GPU snapshots to the status bar.
             metrics::start(app.handle().clone());
+            // Orchestration MCP server: agents connect with per-pane tokens.
+            let reg = app.state::<Arc<orchestration::OrchRegistry>>().inner().clone();
+            reg.set_app(app.handle().clone());
+            std::thread::spawn(move || orchestration::mcp::serve(reg));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -35,6 +44,8 @@ pub fn run() {
             git::git_checkout,
             git::git_discard,
             git::git_worktree_add,
+            orchestration::create_orchestration,
+            orchestration::bind_agent,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {

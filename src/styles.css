@@ -122,6 +122,20 @@ html, body {
   cursor: default; letter-spacing: 0.2px;
 }
 
+/* ---------- orchestration group badges ---------- */
+/* Panes in an orchestration group carry a role chip (ORCH / W / REV) and a
+   shared accent color so the orchestrator and its workers read as one set. */
+.pane-badge {
+  flex: none;
+  font-size: 8.5px; font-weight: 700; letter-spacing: 0.8px;
+  border-radius: 4px; padding: 1.5px 6px;
+  color: #10131f;
+  background: var(--group-color, var(--accent));
+}
+.pane.grouped .pane-header {
+  box-shadow: inset 3px 0 0 var(--group-color, var(--accent));
+}
+
 /* ---------- pane metadata (folder · branch) ---------- */
 .pane-meta {
   flex: 1 1 auto; min-width: 0;
@@ -360,6 +374,8 @@ html, body {
 }
 .dlg-row { display: flex; gap: 6px; }
 .dlg-row > input { flex: 1; min-width: 0; }
+.dlg-row > .dlg-field { flex: 1; min-width: 0; }
+.dlg-num { width: 100%; }
 .dlg-input, .dlg-select {
   background: var(--bg-app); color: var(--text);
   border: 1px solid var(--border); border-radius: 7px;

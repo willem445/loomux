@@ -7,6 +7,7 @@ import { matchShortcut } from "./shortcuts";
 import { initStatusBar } from "./statusbar";
 import { AgentLauncher } from "./launcher";
 import { getAgentMode, setAgentMode } from "./agents";
+import { initOrchestration, launchOrchestrator } from "./orchestration";
 
 // Surface unexpected errors as a visible banner instead of a silently
 // broken UI — a user-facing "crash" should always come with a message.
@@ -75,25 +76,37 @@ renderAgentMode();
 
 /** Open a new pane honoring the current mode: agent mode routes through the
  *  launcher dialog; cancelling only falls back to a shell when the grid
- *  would otherwise be empty. */
+ *  would otherwise be empty. The launcher can resolve to one pane, a fleet
+ *  of N panes, or an orchestrator group (which opens its own panes). */
 async function openPane(dir: "row" | "column" = "row", relativeTo?: Pane): Promise<void> {
   if (!agentMode) {
     await openShell(dir, relativeTo);
     return;
   }
-  const spec = await launcher.show();
-  if (spec) {
+  const result = await launcher.show();
+  if (!result) {
+    if (grid.paneCount === 0) await openShell(dir);
+    else grid.activePane?.focus();
+    return;
+  }
+  if (result.kind === "orchestrator") {
+    await launchOrchestrator(grid, paneEvents, result.config);
+    return;
+  }
+  // Alternate split direction pane-to-pane so a fleet lays out as a grid
+  // instead of ever-thinner slivers.
+  let prev = relativeTo;
+  let d = dir;
+  for (const spec of result.specs) {
     const pane = await grid.openPane(
       { name: spec.name, cwd: spec.cwd, command: spec.command },
       paneEvents,
-      dir,
-      relativeTo
+      d,
+      prev
     );
     reapIfExited(pane);
-  } else if (grid.paneCount === 0) {
-    await openShell(dir);
-  } else {
-    grid.activePane?.focus();
+    prev = pane;
+    d = d === "row" ? "column" : "row";
   }
 }
 
@@ -193,6 +206,9 @@ window.addEventListener("focus", () => grid.activePane?.focus());
 
 // Start streaming CPU/mem/GPU/VRAM into the bottom status bar.
 initStatusBar();
+
+// Orchestration: open badged panes when the backend spawns agents.
+initOrchestration(grid, paneEvents);
 
 void (async () => {
   await ensureOutputRouter();

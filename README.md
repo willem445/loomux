@@ -78,20 +78,66 @@ Scans the local machine for resumable agent sessions:
 Clicking a session opens a new pane in the session's original working
 directory and resumes it there. The pane is auto-named from the session.
 
+## Agent orchestration
+
+Loomux natively supports an **orchestrator / worker** pattern: a long-lived
+planning agent that manages a small fleet of worker agents, each in its own
+visible pane, with a reviewer agent per PR — and you only gatekeep the final
+review and merge.
+
+**Launch:** turn on *✦ agents* mode, open a new pane, and pick
+**Orchestrator + workers** in the launcher. Choose the repository, how many
+idle workers to start with, and the guardrails: max live agents, worker /
+reviewer / orchestrator models, and worker permission mode. The launcher's
+**Multiple panes** mode also spawns N independent agent panes at once (a
+worktree name fans out to `name-1 … name-N`).
+
+**How it works:** loomux hosts a local MCP server; every agent pane in a
+group connects with its own identity token (`--strict-mcp-config`, so
+workers see nothing else). The orchestrator plans work as GitHub issues
+(labeled `agent-managed`), decides worktree-vs-branch per task by
+mergeability, and delegates via tools that *type prompts into the worker's
+CLI* — you see every instruction verbatim in the pane, can steer any agent
+by typing yourself, and everything lands in an audit log. Workers follow the
+standard flow (branch → implement → tests that test intent → docs → PR) and
+report back; reviewers post `gh pr review`s. **No agent ever merges** — you
+do, after your own review.
+
+Panes are badged by role (`ORCH` / `W` / `REV`) and tinted with a per-group
+accent color; unrelated panes are fully isolated from the group's tools.
+
+**Guardrails** are enforced by loomux, not the model: a hard cap on live
+agents (≤12), models pinned per role at launch, and worker permissions fixed
+at `--permission-mode acceptEdits` unless you explicitly pick full auto.
+
+**Persistence:** each group keeps durable state under
+`<data dir>/loomux/orchestration/<group>/` — `state.json` (the
+orchestrator's queue/plan memory, written via a tool after every change),
+`audit.jsonl` (every tool call, prompt, spawn, and exit, one JSON line
+each), and the rendered role instructions. The group id is derived from the
+repo path, so relaunching an orchestrator on the same repo resumes its
+state; GitHub issues remain the source of truth for the work queue.
+
+Requirements: `claude` CLI on PATH; `gh` CLI authenticated for the
+issue/PR/review workflow.
+
 ## Architecture
 
 ```
 src-tauri/src/
-  pty.rs        PTY lifecycle (spawn/write/resize/kill) + output streaming
-  sessions.rs   agent session discovery (one scan_* fn per agent source)
-  lib.rs        Tauri wiring
+  pty.rs            PTY lifecycle (spawn/write/resize/kill) + output streaming
+  sessions.rs       agent session discovery (one scan_* fn per agent source)
+  orchestration/    agent groups: registry, guardrails, MCP server, audit
+  lib.rs            Tauri wiring
 src/
-  pty.ts        typed bridge to the backend (invoke + event bus)
-  pane.ts       one terminal pane: xterm instance + header UI
-  grid.ts       split-tree layout, dividers, focus navigation
-  sessions.ts   session browser sidebar
-  shortcuts.ts  app-level keybindings (single source of truth)
-  main.ts       composition root
+  pty.ts            typed bridge to the backend (invoke + event bus)
+  pane.ts           one terminal pane: xterm instance + header UI
+  grid.ts           split-tree layout, dividers, focus navigation
+  sessions.ts       session browser sidebar
+  launcher.ts       new-agent-pane dialog (single / multi / orchestrator)
+  orchestration.ts  frontend half of agent groups (panes, badges, focus)
+  shortcuts.ts      app-level keybindings (single source of truth)
+  main.ts           composition root
 ```
 
 The seams for future AI features (ccmux-style agent status, notifications,
