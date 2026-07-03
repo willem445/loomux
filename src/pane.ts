@@ -21,11 +21,13 @@ import {
 } from "./pty";
 import { isAppShortcut } from "./shortcuts";
 import { GitView } from "./gitview";
+import { TasksView } from "./tasksview";
 
 // Inline icons so the toolbar renders identically regardless of installed
 // fonts; they inherit color via `currentColor`.
 const FOLDER_ICON = `<svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"><path d="M1.9 4.3c0-.6.5-1.1 1.1-1.1h3l1.4 1.5h5.6c.6 0 1.1.5 1.1 1.1v5.4c0 .6-.5 1.1-1.1 1.1H3c-.6 0-1.1-.5-1.1-1.1z"/></svg>`;
 const BRANCH_ICON = `<svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><circle cx="4.5" cy="3.6" r="1.7"/><circle cx="4.5" cy="12.4" r="1.7"/><circle cx="11.5" cy="5.4" r="1.7"/><path d="M4.5 5.3v5.4M11.5 7.1c0 2.4-1.9 3.1-4 3.6"/></svg>`;
+const TASKS_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><path d="M5.5 4h8M5.5 8h8M5.5 12h8"/><circle cx="2.3" cy="4" r="0.9" fill="currentColor" stroke="none"/><circle cx="2.3" cy="8" r="0.9" fill="currentColor" stroke="none"/><circle cx="2.3" cy="12" r="0.9" fill="currentColor" stroke="none"/></svg>`;
 const GIT_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><circle cx="8" cy="2.8" r="1.6"/><circle cx="4" cy="13.2" r="1.6"/><circle cx="12" cy="13.2" r="1.6"/><path d="M8 4.4v2.2M8 6.6c0 2.6-4 2.4-4 5M8 6.6c0 2.6 4 2.4 4 5"/></svg>`;
 
 /** Extract a filesystem path from an OSC 7 payload, which may be a raw path
@@ -79,6 +81,10 @@ export interface PaneOptions {
   cwd?: string;
   command?: string;
   badge?: PaneBadge;
+  /** Orchestration group this pane belongs to (enables the task board). */
+  orchGroup?: string;
+  /** "orchestrator" | "worker" | "reviewer". */
+  orchRole?: string;
 }
 
 const TERM_THEME = {
@@ -133,6 +139,11 @@ export class Pane {
    *  full-screen TUIs repaint from scratch, flooding scrollback with
    *  duplicate frames. */
   private gitOverlay: HTMLElement | null = null;
+  /** Task board (orchestrator panes only), same overlay mechanics. */
+  private tasksView: TasksView | null = null;
+  private tasksOverlay: HTMLElement | null = null;
+  private tasksBtn: HTMLButtonElement;
+  private orchGroup: string | null = null;
   private shiftTimer: number | undefined;
   private fit = new FitAddon();
   private resizeObs: ResizeObserver;
@@ -173,6 +184,17 @@ export class Pane {
     });
     meta.append(this.cwdEl, this.branchEl);
     header.appendChild(meta);
+
+    this.tasksBtn = document.createElement("button");
+    this.tasksBtn.className = "pane-btn";
+    this.tasksBtn.innerHTML = TASKS_ICON;
+    this.tasksBtn.title = "Task board (Alt+T)";
+    this.tasksBtn.hidden = true; // shown for orchestrator panes in start()
+    this.tasksBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      this.toggleTasksView();
+    });
+    header.appendChild(this.tasksBtn);
 
     const gitBtn = document.createElement("button");
     gitBtn.className = "pane-btn";
@@ -261,6 +283,11 @@ export class Pane {
   async start(opts: PaneOptions = {}): Promise<void> {
     this.setName(opts.name ?? "shell");
     if (opts.badge) this.setBadge(opts.badge);
+    if (opts.orchGroup) {
+      this.orchGroup = opts.orchGroup;
+      // The board lives on the orchestrator's pane; workers report there.
+      this.tasksBtn.hidden = opts.orchRole !== "orchestrator";
+    }
     // Seed the toolbar from the startup directory. Interactive shells refine
     // this via OSC 7; command panes (agents) keep this initial value since
     // they have no prompt to report from.
@@ -353,8 +380,9 @@ export class Pane {
       }
       // The pane itself changed size: keep the overlay within bounds and
       // re-anchor the visible strip on the cursor.
-      if (this.gitOverlay && !this.gitOverlay.hidden) {
-        this.gitOverlay.style.height = `${this.overlayClamp(this.gitOverlay.offsetHeight)}px`;
+      const overlay = this.activeOverlay();
+      if (overlay) {
+        overlay.style.height = `${this.overlayClamp(overlay.offsetHeight)}px`;
         this.updateTermShift();
       }
     }, 16);
@@ -405,7 +433,7 @@ export class Pane {
           if (this.cwdRaw) void this.refreshDir(this.cwdRaw);
         },
       });
-      this.gitDivider = this.makeGitDivider();
+      this.gitDivider = this.makeOverlayDivider(() => this.gitOverlay!);
       this.gitOverlay = document.createElement("div");
       this.gitOverlay.className = "git-overlay";
       this.gitOverlay.hidden = true;
@@ -419,6 +447,7 @@ export class Pane {
         this.updateTermShift();
         this.focus();
       } else {
+        if (this.tasksOverlay && !this.tasksOverlay.hidden) this.toggleTasksView();
         // Terminal keeps a fixed visible share at the bottom; the overlay
         // covers the rest.
         const strip = Math.max(140, Math.round(this.el.clientHeight * 0.35));
@@ -444,18 +473,18 @@ export class Pane {
     return Math.max(160, Math.min(max, h));
   }
 
-  /** Horizontal drag handle on the overlay's bottom edge. */
-  private makeGitDivider(): HTMLElement {
+  /** Horizontal drag handle on an overlay's bottom edge. */
+  private makeOverlayDivider(overlay: () => HTMLElement): HTMLElement {
     const div = document.createElement("div");
     div.className = "git-divider";
     div.addEventListener("mousedown", (e) => {
       e.preventDefault();
       const startY = e.clientY;
-      const startH = this.gitOverlay!.offsetHeight;
+      const startH = overlay().offsetHeight;
       div.classList.add("dragging");
       const move = (ev: MouseEvent) => {
         const h = this.overlayClamp(startH + (ev.clientY - startY));
-        this.gitOverlay!.style.height = `${h}px`;
+        overlay().style.height = `${h}px`;
         this.updateTermShift();
       };
       const up = () => {
@@ -469,10 +498,43 @@ export class Pane {
     return div;
   }
 
+  /** Toggle the task board overlay (orchestrator panes). Same no-resize
+   *  overlay mechanics as the git view; only one overlay is open at a time. */
+  toggleTasksView(): void {
+    if (!this.orchGroup || this.tasksBtn.hidden) return;
+    if (!this.tasksView) {
+      this.tasksView = new TasksView(this.orchGroup, { onClose: () => this.toggleTasksView() });
+      this.tasksOverlay = document.createElement("div");
+      this.tasksOverlay.className = "git-overlay";
+      this.tasksOverlay.hidden = true;
+      this.tasksOverlay.append(this.tasksView.el, this.makeOverlayDivider(() => this.tasksOverlay!));
+      this.el.appendChild(this.tasksOverlay);
+    }
+    if (!this.tasksOverlay!.hidden) {
+      this.tasksOverlay!.hidden = true;
+      this.updateTermShift();
+      this.focus();
+    } else {
+      if (this.gitView?.visible) this.toggleGitView();
+      const strip = Math.max(140, Math.round(this.el.clientHeight * 0.35));
+      this.tasksOverlay!.style.height = `${this.overlayClamp(this.termEl.clientHeight - strip)}px`;
+      this.tasksOverlay!.hidden = false;
+      this.tasksView.show();
+      this.updateTermShift();
+    }
+  }
+
+  /** Whichever overlay (git / tasks) is currently covering the terminal. */
+  private activeOverlay(): HTMLElement | null {
+    if (this.gitOverlay && !this.gitOverlay.hidden) return this.gitOverlay;
+    if (this.tasksOverlay && !this.tasksOverlay.hidden) return this.tasksOverlay;
+    return null;
+  }
+
   /** Debounced cursor-follow for the overlay: TUIs sweep the cursor around
    *  while repainting, so settle before measuring. */
   private scheduleShift(): void {
-    if (!this.gitOverlay || this.gitOverlay.hidden) return;
+    if (!this.activeOverlay()) return;
     clearTimeout(this.shiftTimer);
     this.shiftTimer = window.setTimeout(() => this.updateTermShift(), 80);
   }
@@ -484,7 +546,8 @@ export class Pane {
    *  writes at the top, which the overlay would otherwise hide. */
   private updateTermShift(): void {
     if (this.disposed) return;
-    if (!this.gitOverlay || this.gitOverlay.hidden) {
+    const overlay = this.activeOverlay();
+    if (!overlay) {
       this.termEl.style.transform = "";
       return;
     }
@@ -493,7 +556,7 @@ export class Pane {
     if (!screen || !xtermEl || !this.term.rows) return;
     const cell = screen.offsetHeight / this.term.rows;
     if (!cell) return;
-    const covered = this.gitOverlay.offsetHeight;
+    const covered = overlay.offsetHeight;
     const padTop = parseFloat(getComputedStyle(xtermEl).paddingTop) || 0;
     const cursorTop = padTop + this.term.buffer.active.cursorY * cell;
     // One extra row of context above the cursor when shifted.
@@ -579,6 +642,7 @@ export class Pane {
     clearTimeout(this.fitTimer);
     clearTimeout(this.shiftTimer);
     this.gitView?.dispose();
+    this.tasksView?.dispose();
     if (this.ptyId !== null) {
       detachOutput(this.ptyId);
       if (killBackend) killPty(this.ptyId).catch(() => {});

@@ -48,6 +48,14 @@ When the orchestrator forwards reviewer findings, address every item: fix it or 
 (in the PR thread via `gh pr comment` and in your report) why it's not a defect. Push
 fixes to the same branch and report when ready for re-review.
 
+## Session scope — one task only
+
+Your session belongs to exactly one work item. If the orchestrator or the human sends
+you a *different* task after yours is done, decline via
+`message_orchestrator("my session is scoped to <task>; spawn a fresh worker")` — mixed
+tasks pollute your context and ruin this session's value for follow-up resumes.
+Follow-ups and review fixes for YOUR OWN task are yours to handle.
+
 ## If idle
 
 If you have no task yet: read these instructions, confirm with

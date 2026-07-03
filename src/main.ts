@@ -169,6 +169,9 @@ document.addEventListener(
       case "toggle-git":
         grid.activePane?.toggleGitView();
         break;
+      case "toggle-tasks":
+        grid.activePane?.toggleTasksView();
+        break;
       case "rename-pane":
         grid.activePane?.startRename();
         break;

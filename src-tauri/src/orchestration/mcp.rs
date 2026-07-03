@@ -165,17 +165,22 @@ fn tool_defs(role: Role) -> Vec<Value> {
             json!({}), &[]),
         tool("get_state", "Read the group's durable orchestration state (JSON string). Survives sessions.",
             json!({}), &[]),
+        tool("list_tasks",
+            "Read the group's task board (JSON array, order = priority). The human sees and edits this same board.",
+            json!({}), &[]),
     ];
     if role == Role::Orchestrator {
         tools.extend([
             tool("spawn_agent",
-                "Open a new worker or reviewer agent pane in this group. Guardrails apply: live-agent cap and per-role pinned model. Set worktree=true for parallel work that must not collide; give branch a meaningful name either way. Empty task spawns an idle agent awaiting prompts.",
+                "Open a new worker or reviewer agent pane in this group. Guardrails apply: live-agent cap and per-role pinned model. Set worktree=true for parallel work that must not collide; give branch a meaningful name either way. Empty task spawns an idle agent awaiting prompts. For a FOLLOW-UP on a finished task, pass resume_session (from list_agents/the task board) plus cwd (where that work happened) — the pane reopens that conversation with its context instead of cold-starting.",
                 json!({
                     "name": { "type": "string", "description": "Short display name for the pane" },
                     "kind": { "type": "string", "enum": ["worker", "reviewer"], "description": "Agent role (default worker)" },
-                    "task": { "type": "string", "description": "Full task brief; empty = idle" },
+                    "task": { "type": "string", "description": "Full task brief; empty = idle. With resume_session, this is the follow-up prompt." },
                     "worktree": { "type": "boolean", "description": "Create a dedicated git worktree + branch" },
                     "branch": { "type": "string", "description": "Branch name (default agent/<id>)" },
+                    "resume_session": { "type": "string", "description": "Session id to resume instead of starting fresh" },
+                    "cwd": { "type": "string", "description": "Existing directory to run in (required with resume_session; use the original workspace)" },
                 }),
                 &["task"]),
             tool("send_prompt",
@@ -198,6 +203,21 @@ fn tool_defs(role: Role) -> Vec<Value> {
             tool("set_state",
                 "Persist the group's orchestration state (must be a valid JSON string). Call after every queue/plan change; this is your memory across sessions.",
                 json!({ "state": { "type": "string" } }), &["state"]),
+            tool("upsert_task",
+                "Create (omit id, title required) or update a task on the shared board. status: queued | in-progress | review | pr | human-testing | done | blocked. Keep the board current — it is the human's window into your queue. note appends a timestamped note.",
+                json!({
+                    "id": { "type": "string", "description": "Existing task id; omit to create" },
+                    "title": { "type": "string" },
+                    "status": { "type": "string", "enum": ["queued", "in-progress", "review", "pr", "human-testing", "done", "blocked"] },
+                    "issue": { "type": "string", "description": "GitHub issue ref, e.g. #12" },
+                    "pr": { "type": "string", "description": "PR ref or URL" },
+                    "assignee": { "type": "string", "description": "Agent id working on it" },
+                    "session": { "type": "string", "description": "Worker session id for this task (enables follow-up resume)" },
+                    "note": { "type": "string", "description": "Note to append" },
+                }),
+                &[]),
+            tool("remove_task", "Delete a task from the shared board.",
+                json!({ "id": { "type": "string" } }), &["id"]),
         ]);
     } else {
         tools.extend([
@@ -241,6 +261,32 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
     match name {
         "list_agents" => Ok(reg.list_agents(&caller.group).to_string()),
         "get_state" => Ok(reg.get_state(&caller.group)),
+        "list_tasks" => Ok(serde_json::to_string(&reg.tasks(&caller.group)).unwrap_or_default()),
+
+        "upsert_task" => {
+            require_orchestrator(caller)?;
+            let task = reg.upsert_task(
+                &caller.group,
+                &caller.agent_id,
+                arg_str(args, "id"),
+                super::TaskPatch {
+                    title: arg_str(args, "title").map(str::to_string),
+                    status: arg_str(args, "status").map(str::to_string),
+                    issue: arg_str(args, "issue").map(str::to_string),
+                    pr: arg_str(args, "pr").map(str::to_string),
+                    assignee: arg_str(args, "assignee").map(str::to_string),
+                    session: arg_str(args, "session").map(str::to_string),
+                    note: arg_str(args, "note").map(str::to_string),
+                },
+            )?;
+            Ok(format!("{} \"{}\" — {}", task.id, task.title, task.status))
+        }
+        "remove_task" => {
+            require_orchestrator(caller)?;
+            let id = arg_str(args, "id").ok_or("id required")?;
+            reg.delete_task(&caller.group, &caller.agent_id, id)?;
+            Ok(format!("removed {id}"))
+        }
 
         "spawn_agent" => {
             require_orchestrator(caller)?;
@@ -252,10 +298,17 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             let name = arg_str(args, "name").unwrap_or("");
             let worktree = args.get("worktree").and_then(Value::as_bool).unwrap_or(false);
             let branch = arg_str(args, "branch").map(str::to_string);
-            let a = reg.spawn_agent(&caller.group, kind, name, task, worktree, branch)?;
+            let resume = arg_str(args, "resume_session").map(str::to_string);
+            let cwd = arg_str(args, "cwd").map(str::to_string);
+            let resumed = resume.is_some();
+            let a = reg.spawn_agent_ex(&caller.group, kind, name, task, worktree, branch, resume, cwd)?;
             Ok(format!(
-                "spawned {} (\"{}\", {:?}). Kickoff prompt delivered to its pane; it will report when ready.",
-                a.id, a.name, a.role
+                "spawned {} (\"{}\", {:?}){}. Session {}. It will report when ready.",
+                a.id,
+                a.name,
+                a.role,
+                if resumed { " resuming its previous session" } else { "" },
+                a.session_id.as_deref().unwrap_or("untracked"),
             ))
         }
         "send_prompt" => {

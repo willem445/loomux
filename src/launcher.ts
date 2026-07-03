@@ -34,7 +34,26 @@ export type LaunchResult =
 
 type Mode = "single" | "multi" | "orchestrator";
 
-const MODELS = ["sonnet", "opus", "haiku"];
+/** Agent CLIs the orchestration backend has adapters for, with the model
+ *  suggestions each CLI accepts. Free text is allowed — the lists are
+ *  datalist suggestions, and the backend sanitizes whatever arrives. */
+interface OrchCli {
+  id: string;
+  models: string[];
+  defaults: { worker: string; reviewer: string; orchestrator: string };
+}
+const ORCH_CLIS: OrchCli[] = [
+  {
+    id: "claude",
+    models: ["sonnet", "opus", "haiku", "fable"],
+    defaults: { worker: "sonnet", reviewer: "sonnet", orchestrator: "opus" },
+  },
+  {
+    id: "copilot",
+    models: ["auto", "claude-sonnet-4.6", "claude-haiku-4.5", "gpt-5.2", "gpt-5.3-codex"],
+    defaults: { worker: "auto", reviewer: "auto", orchestrator: "auto" },
+  },
+];
 
 const basename = (p: string): string => p.split(/[\\/]/).filter(Boolean).pop() ?? "";
 
@@ -102,9 +121,10 @@ export class AgentLauncher {
   private orchFields: HTMLElement;
   private workersInput: HTMLInputElement;
   private maxAgentsInput: HTMLInputElement;
-  private workerModelSel: HTMLSelectElement;
-  private reviewerModelSel: HTMLSelectElement;
-  private orchModelSel: HTMLSelectElement;
+  private workerModelInput: HTMLInputElement;
+  private reviewerModelInput: HTMLInputElement;
+  private orchModelInput: HTMLInputElement;
+  private modelList: HTMLDataListElement;
   private permsSel: HTMLSelectElement;
 
   private errorEl: HTMLElement;
@@ -141,6 +161,7 @@ export class AgentLauncher {
     }
     this.agentSel.addEventListener("change", () => {
       this.customField.hidden = this.agentSel.value !== "custom" || this.mode === "orchestrator";
+      this.applyOrchCli();
       this.updateName();
     });
     this.agentField = field("Agent", this.agentSel);
@@ -185,15 +206,25 @@ export class AgentLauncher {
     this.nameField = field("Pane name", this.nameInput);
 
     // Orchestrator guardrails: enforced by the backend; the dialog only
-    // collects them. Models are pinned per role at group creation.
+    // collects them. Models are pinned per role at group creation; the
+    // suggestion list follows the selected agent CLI.
     this.workersInput = numberInput(2, 0, 6);
     this.maxAgentsInput = numberInput(4, 1, 12);
-    this.workerModelSel = select(MODELS.map((m) => [m, m]), "sonnet");
-    this.reviewerModelSel = select(MODELS.map((m) => [m, m]), "sonnet");
-    this.orchModelSel = select(MODELS.map((m) => [m, m]), "opus");
+    this.modelList = document.createElement("datalist");
+    this.modelList.id = "launcher-orch-models";
+    const modelInput = (): HTMLInputElement => {
+      const input = document.createElement("input");
+      input.className = "dlg-input";
+      input.spellcheck = false;
+      input.setAttribute("list", this.modelList.id);
+      return input;
+    };
+    this.workerModelInput = modelInput();
+    this.reviewerModelInput = modelInput();
+    this.orchModelInput = modelInput();
     this.permsSel = select([
-      ["accept-edits", "Accept edits (recommended)"],
-      ["full-auto", "Full auto — skip all permission prompts"],
+      ["auto", "Auto — pre-approve git/gh + agent tools (recommended)"],
+      ["edits", "Accept edits only — you approve git/gh yourself"],
     ]);
     const guardRow1 = document.createElement("div");
     guardRow1.className = "dlg-row";
@@ -204,13 +235,18 @@ export class AgentLauncher {
     const guardRow2 = document.createElement("div");
     guardRow2.className = "dlg-row";
     guardRow2.append(
-      field("Orchestrator model", this.orchModelSel),
-      field("Worker model", this.workerModelSel),
-      field("Reviewer model", this.reviewerModelSel)
+      field("Orchestrator model", this.orchModelInput),
+      field("Worker model", this.workerModelInput),
+      field("Reviewer model", this.reviewerModelInput)
     );
     this.orchFields = document.createElement("div");
     this.orchFields.className = "dlg-field";
-    this.orchFields.append(guardRow1, guardRow2, field("Worker permissions", this.permsSel));
+    this.orchFields.append(
+      guardRow1,
+      guardRow2,
+      field("Permissions", this.permsSel),
+      this.modelList
+    );
 
     this.errorEl = document.createElement("div");
     this.errorEl.className = "dlg-error";
@@ -303,13 +339,41 @@ export class AgentLauncher {
   /** Show/hide fields for the selected mode. */
   private applyMode(): void {
     const m = this.mode;
-    this.agentField.hidden = m === "orchestrator"; // orchestrator is always claude
     this.customField.hidden = m === "orchestrator" || this.agentSel.value !== "custom";
     this.countField.hidden = m !== "multi";
     this.worktreeField.hidden = m === "orchestrator"; // workers get worktrees on demand
     this.orchFields.hidden = m !== "orchestrator";
     this.nameField.hidden = m === "orchestrator";
+    this.applyOrchCli();
     this.updateName();
+  }
+
+  private orchCliFor(id: string): OrchCli {
+    return ORCH_CLIS.find((c) => c.id === id) ?? ORCH_CLIS[0];
+  }
+
+  /** In orchestrator mode the agent list is restricted to CLIs the backend
+   *  has orchestration adapters for, and the model suggestions + defaults
+   *  follow the selected CLI. */
+  private applyOrchCli(): void {
+    const supported = new Set(ORCH_CLIS.map((c) => c.id));
+    const restricted = this.mode === "orchestrator";
+    for (const opt of Array.from(this.agentSel.options)) {
+      opt.disabled = restricted && !supported.has(opt.value);
+    }
+    if (!restricted) return;
+    if (!supported.has(this.agentSel.value)) this.agentSel.value = ORCH_CLIS[0].id;
+    const cli = this.orchCliFor(this.agentSel.value);
+    this.modelList.replaceChildren(
+      ...cli.models.map((m) => {
+        const o = document.createElement("option");
+        o.value = m;
+        return o;
+      })
+    );
+    this.orchModelInput.value = cli.defaults.orchestrator;
+    this.workerModelInput.value = cli.defaults.worker;
+    this.reviewerModelInput.value = cli.defaults.reviewer;
   }
 
   /** Auto-fill the pane name (`agent · worktree-or-repo`) until hand-edited. */
@@ -344,16 +408,19 @@ export class AgentLauncher {
         return;
       }
       addRecentRepo(repo);
+      const cli = this.orchCliFor(this.agentSel.value);
+      setDefaultAgent(cli.id);
       this.close({
         kind: "orchestrator",
         config: {
           repo,
+          agentCli: cli.id,
           initialWorkers: intVal(this.workersInput, 2),
           maxAgents: intVal(this.maxAgentsInput, 4),
-          workerModel: this.workerModelSel.value,
-          reviewerModel: this.reviewerModelSel.value,
-          orchestratorModel: this.orchModelSel.value,
-          fullAuto: this.permsSel.value === "full-auto",
+          workerModel: this.workerModelInput.value.trim() || cli.defaults.worker,
+          reviewerModel: this.reviewerModelInput.value.trim() || cli.defaults.reviewer,
+          orchestratorModel: this.orchModelInput.value.trim() || cli.defaults.orchestrator,
+          autoOps: this.permsSel.value === "auto",
         },
       });
       return;

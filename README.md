@@ -86,9 +86,13 @@ visible pane, with a reviewer agent per PR — and you only gatekeep the final
 review and merge.
 
 **Launch:** turn on *✦ agents* mode, open a new pane, and pick
-**Orchestrator + workers** in the launcher. Choose the repository, how many
-idle workers to start with, and the guardrails: max live agents, worker /
-reviewer / orchestrator models, and worker permission mode. The launcher's
+**Orchestrator + workers** in the launcher. Choose the agent CLI (Claude
+Code or Copilot CLI — model suggestions follow the selection, e.g.
+sonnet/opus/haiku/fable for Claude), the repository, how many idle workers
+to start with, and the guardrails: max live agents, per-role models, and
+permissions. Permissions are either *Auto* (accept edits + pre-approved
+`git`/`gh` and loomux agent tools — recommended) or *Accept edits only*;
+loomux never uses `--dangerously-skip-permissions`. The launcher's
 **Multiple panes** mode also spawns N independent agent panes at once (a
 worktree name fans out to `name-1 … name-N`).
 
@@ -103,8 +107,23 @@ standard flow (branch → implement → tests that test intent → docs → PR) 
 report back; reviewers post `gh pr review`s. **No agent ever merges** — you
 do, after your own review.
 
-Panes are badged by role (`ORCH` / `W` / `REV`) and tinted with a per-group
-accent color; unrelated panes are fully isolated from the group's tools.
+Panes are badged by role and group number (`ORCH 1` / `W 1` vs `ORCH 2` /
+`W 2`) with a per-group accent color, so parallel orchestrations — even on
+the same repository — pair up at a glance. Unrelated panes are fully
+isolated from a group's tools.
+
+**Task board:** the orchestrator pane has a board toggle (`Alt+T` or the
+list icon) showing the group's work queue — status per item (`queued`,
+`in-progress`, `review`, `pr`, `human-testing`, `done`, `blocked`), issue/PR
+links, notes, and priority order. You can add, edit, annotate, reorder, and
+delete tasks; the orchestrator is notified of your edits and maintains the
+same board through its tools.
+
+**Per-task sessions:** each worker is scoped to exactly one work item, and
+loomux pre-assigns Claude session ids at spawn, recording them on the
+roster and task board. Follow-ups on a finished task *resume* that worker's
+session (same context, same workspace) instead of cold-starting a new agent
+or disturbing a busy one.
 
 **Guardrails** are enforced by loomux, not the model: a hard cap on live
 agents (≤12), models pinned per role at launch, and worker permissions fixed

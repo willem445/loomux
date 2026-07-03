@@ -7,7 +7,9 @@
 //! applies to integration-test targets.
 
 use loomux_lib::orchestration::mcp::dispatch;
-use loomux_lib::orchestration::{bracketed_paste, strip_ansi, Caller, Guardrails, OrchRegistry, Role};
+use loomux_lib::orchestration::{
+    bracketed_paste, strip_ansi, Caller, Guardrails, OrchRegistry, Role, TaskPatch,
+};
 use serde_json::{json, Value};
 use std::fs;
 use std::path::Path;
@@ -15,10 +17,11 @@ use std::path::Path;
 fn rails() -> Guardrails {
     Guardrails {
         max_agents: 2,
+        agent_cli: "claude".into(),
         worker_model: "sonnet".into(),
         reviewer_model: "sonnet".into(),
         orchestrator_model: "opus".into(),
-        full_auto: false,
+        auto_ops: false,
     }
 }
 
@@ -49,15 +52,29 @@ fn guardrail_caps_live_agents() {
 fn guardrail_clamps_and_sanitizes() {
     let g = Guardrails {
         max_agents: 99,
+        agent_cli: "definitely-not-a-cli".into(),
         worker_model: "sonnet; rm -rf /".into(),
         reviewer_model: "".into(),
         orchestrator_model: "opus".into(),
-        full_auto: true,
+        auto_ops: true,
     }
     .clamped();
     assert_eq!(g.max_agents, 12, "cap must clamp to the hard ceiling");
+    assert_eq!(g.agent_cli, "claude", "unknown CLIs fall back to claude explicitly");
     assert_eq!(g.worker_model, "sonnetrm-rf", "shell metacharacters must be stripped");
     assert_eq!(g.reviewer_model, "sonnet", "empty model falls back to default");
+    // Copilot's fallback model is "auto" (it picks the best itself).
+    let g = Guardrails {
+        max_agents: 4,
+        agent_cli: "copilot".into(),
+        worker_model: "".into(),
+        reviewer_model: "".into(),
+        orchestrator_model: "".into(),
+        auto_ops: false,
+    }
+    .clamped();
+    assert_eq!(g.worker_model, "auto");
+    assert_eq!(g.orchestrator_model, "auto");
 }
 
 #[test]
@@ -167,14 +184,76 @@ fn strip_ansi_removes_csi_osc_and_controls() {
 }
 
 #[test]
-fn command_line_carries_guardrail_model_and_permissions() {
+fn claude_command_minimizes_init_approvals_without_bypass() {
     let (reg, _d) = test_registry();
-    let cmd = reg.build_claude_command("sonnet", false, Path::new("C:/x/cfg.json"));
+    let cfg = Path::new("C:/x/cfg.json");
+    let gdir = Path::new("C:/data/group");
+    let cmd = reg.build_agent_command("claude", "sonnet", false, cfg, gdir, None, false);
     assert!(cmd.contains("--model sonnet"));
     assert!(cmd.contains("--permission-mode acceptEdits"));
     assert!(cmd.contains("--strict-mcp-config"), "workers must not see the user's other MCP servers");
-    let cmd = reg.build_claude_command("sonnet", true, Path::new("C:/x/cfg.json"));
-    assert!(cmd.contains("--dangerously-skip-permissions"));
+    assert!(cmd.contains("--add-dir \"C:/data/group\""),
+        "instructions dir must be a workspace so reading it never prompts");
+    assert!(cmd.contains("--allowedTools mcp__loomux"),
+        "loomux tools must be pre-approved so report/list never prompt");
+    assert!(!cmd.contains("Bash(git:*)"), "git is not pre-approved unless auto_ops");
+    let cmd = reg.build_agent_command("claude", "sonnet", true, cfg, gdir, None, false);
+    assert!(cmd.contains("\"Bash(git:*)\"") && cmd.contains("\"Bash(gh:*)\""));
+    assert!(
+        !cmd.contains("--dangerously-skip-permissions"),
+        "bypass mode must never be used: its confirm dialog defaults to exit and kills the pane"
+    );
+}
+
+#[test]
+fn copilot_command_uses_copilot_adapter_flags() {
+    let (reg, _d) = test_registry();
+    let cfg = Path::new("C:/x/cfg.json");
+    let gdir = Path::new("C:/data/group");
+    let cmd = reg.build_agent_command("copilot", "auto", true, cfg, gdir, None, false);
+    assert!(cmd.starts_with("copilot "), "selected CLI must actually be launched, not claude");
+    assert!(cmd.contains("--additional-mcp-config @\"C:/x/cfg.json\""));
+    assert!(cmd.contains("--model auto"));
+    assert!(cmd.contains("--allow-tool loomux"));
+    assert!(cmd.contains("--allow-tool \"shell(git:*)\"") && cmd.contains("--allow-tool \"shell(gh:*)\""));
+    assert!(cmd.contains("--add-dir \"C:/data/group\""));
+}
+
+#[test]
+fn copilot_mcp_config_includes_tools_allowlist() {
+    let (reg, _d) = test_registry();
+    let mut rails = rails();
+    rails.agent_cli = "copilot".into();
+    let g = reg.create_group("C:/tmp/copilot-repo", rails).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let cfg = fs::read_to_string(
+        reg.state_root().join(&g.id).join("configs").join(format!("{}.json", w.id)),
+    )
+    .unwrap();
+    assert!(cfg.contains("\"tools\""), "copilot expects a tools allowlist in the server entry");
+    assert!(cfg.contains(&w.token));
+}
+
+#[test]
+fn concurrent_groups_on_one_repo_stay_separate_but_resume_when_free() {
+    let (reg, _d) = test_registry();
+    // First orchestration on the repo.
+    let g1 = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    reg.spawn_agent(&g1.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    reg.set_state(&g1.id, r#"{"queue":[1]}"#).unwrap();
+    // Second concurrent orchestration on the SAME repo must get its own
+    // group (otherwise its orchestrator would receive g1's worker reports)
+    // and must not inherit g1's state.
+    let g2 = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    assert_ne!(g1.id, g2.id);
+    assert_eq!(reg.get_state(&g2.id), "{}");
+    // Once g1 has no live agents, a new launch resumes g1's id and state.
+    for a in reg.list_agents(&g1.id).as_array().unwrap() {
+        reg.mark_dead(a["id"].as_str().unwrap(), Some(0));
+    }
+    let g3 = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    assert_eq!(g3.id, g1.id, "freed base group id must be reused for resume");
+    assert_eq!(reg.get_state(&g3.id), r#"{"queue":[1]}"#);
 }
 
 #[test]
@@ -201,6 +280,146 @@ fn instruction_files_rendered_with_group_facts() {
     assert!(!orch.contains("{{"), "no unrendered placeholders");
     let worker = fs::read_to_string(dir.join("worker.md")).unwrap();
     assert!(worker.contains("Never merge"), "merge gatekeeping must be in worker instructions");
+}
+
+// ---------- task board ----------
+
+fn patch(title: Option<&str>, status: Option<&str>, note: Option<&str>) -> TaskPatch {
+    TaskPatch {
+        title: title.map(String::from),
+        status: status.map(String::from),
+        note: note.map(String::from),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn task_lifecycle_create_edit_note_delete() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let t = reg.upsert_task(&g.id, "orch-1", None, patch(Some("Add retry logic"), None, None)).unwrap();
+    assert_eq!(t.status, "queued", "new tasks start queued");
+    assert_eq!(t.id, "t-1");
+    // Edit status + append a note; note carries author and timestamp.
+    let t = reg
+        .upsert_task(&g.id, "human", Some(&t.id), patch(None, Some("in-progress"), Some("looks good")))
+        .unwrap();
+    assert_eq!(t.status, "in-progress");
+    assert_eq!(t.notes.len(), 1);
+    assert_eq!(t.notes[0].author, "human");
+    assert!(t.notes[0].ts_ms > 0);
+    // Invalid status rejected; unknown id rejected; title required for new.
+    assert!(reg.upsert_task(&g.id, "x", Some(&t.id), patch(None, Some("nope"), None)).is_err());
+    assert!(reg.upsert_task(&g.id, "x", Some("t-999"), patch(None, Some("done"), None)).is_err());
+    assert!(reg.upsert_task(&g.id, "x", None, patch(None, None, None)).is_err());
+    // Delete.
+    reg.delete_task(&g.id, "human", &t.id).unwrap();
+    assert!(reg.tasks(&g.id).is_empty());
+    assert!(reg.delete_task(&g.id, "human", &t.id).is_err());
+}
+
+#[test]
+fn task_board_persists_and_reorders() {
+    let dir = tempfile::tempdir().unwrap();
+    let gid;
+    {
+        let reg = OrchRegistry::new(dir.path().to_path_buf());
+        reg.set_port(45999);
+        let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+        gid = g.id.clone();
+        for title in ["a", "b", "c"] {
+            reg.upsert_task(&g.id, "orch-1", None, patch(Some(title), None, None)).unwrap();
+        }
+        // Move c first; unmentioned ids keep relative order behind it.
+        reg.reorder_tasks(&g.id, "human", &["t-3".into()]).unwrap();
+    }
+    let reg = OrchRegistry::new(dir.path().to_path_buf());
+    reg.set_port(45999);
+    let titles: Vec<String> = reg.tasks(&gid).iter().map(|t| t.title.clone()).collect();
+    assert_eq!(titles, ["c", "a", "b"], "order must survive an app restart");
+}
+
+#[test]
+fn task_tools_are_role_gated_but_listing_is_shared() {
+    let (reg, _d, co, cw) = setup_mcp();
+    let denied = dispatch(&reg, &cw, "tools/call",
+        &json!({ "name": "upsert_task", "arguments": { "title": "sneaky" } })).unwrap();
+    assert_eq!(denied["isError"], true, "workers must not edit the board");
+    let ok = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "upsert_task", "arguments": { "title": "Fix parser", "status": "in-progress", "issue": "#7" } }))
+        .unwrap();
+    assert_eq!(ok["isError"], false);
+    let listed = dispatch(&reg, &cw, "tools/call",
+        &json!({ "name": "list_tasks", "arguments": {} })).unwrap();
+    let text = listed["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("Fix parser") && text.contains("#7"),
+        "workers must be able to read the board");
+}
+
+// ---------- per-task sessions & resume ----------
+
+#[test]
+fn claude_agents_get_preassigned_resumable_sessions() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let sid = w.session_id.expect("claude agents must get a session id at spawn");
+    // Valid UUID shape (claude --session-id requires it).
+    assert_eq!(sid.len(), 36);
+    assert_eq!(sid.split('-').map(str::len).collect::<Vec<_>>(), [8, 4, 4, 4, 12]);
+    // The roster exposes session + cwd so the orchestrator can record them.
+    let roster = reg.list_agents(&g.id).to_string();
+    assert!(roster.contains(&sid) && roster.contains("cwd"));
+    // The launch command pins the id.
+    let cfg = Path::new("C:/x/cfg.json");
+    let gdir = Path::new("C:/x/g");
+    let cmd = reg.build_agent_command("claude", "sonnet", false, cfg, gdir, Some(&sid), false);
+    assert!(cmd.contains(&format!("--session-id {sid}")));
+    // Resume uses --resume instead.
+    let cmd = reg.build_agent_command("claude", "sonnet", false, cfg, gdir, Some(&sid), true);
+    assert!(cmd.contains(&format!("--resume {sid}")) && !cmd.contains("--session-id"));
+}
+
+#[test]
+fn resume_spawn_requires_valid_session_and_existing_cwd() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let bad_session = reg.spawn_agent_ex(
+        &g.id, Role::Worker, "w", "follow-up", false, None,
+        Some("; rm -rf /".into()), None,
+    );
+    assert!(bad_session.is_err(), "shell-metachar session ids must be rejected");
+    let bad_cwd = reg.spawn_agent_ex(
+        &g.id, Role::Worker, "w", "follow-up", false, None,
+        Some("abc-123".into()), Some("C:/definitely/not/a/dir".into()),
+    );
+    assert!(bad_cwd.unwrap_err().contains("cwd"), "resume cwd must exist");
+    // Valid resume records the reused session on the agent.
+    let dir = tempfile::tempdir().unwrap();
+    let ok = reg
+        .spawn_agent_ex(
+            &g.id, Role::Worker, "w", "follow-up", false, None,
+            Some("abc-123".into()), Some(dir.path().to_string_lossy().into_owned()),
+        )
+        .unwrap();
+    assert_eq!(ok.session_id.as_deref(), Some("abc-123"));
+    assert_eq!(ok.cwd, dir.path().to_string_lossy());
+}
+
+#[test]
+fn task_board_tracks_sessions_for_followups() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let t = reg.upsert_task(&g.id, "orch-1", None, patch(Some("Add retries"), None, None)).unwrap();
+    let mut p = patch(None, Some("in-progress"), None);
+    p.session = Some("11112222-3333-4444-8555-666677778888".into());
+    p.assignee = Some("w-1".into());
+    let t = reg.upsert_task(&g.id, "orch-1", Some(&t.id), p).unwrap();
+    assert_eq!(t.session.as_deref(), Some("11112222-3333-4444-8555-666677778888"));
+    // Survives the round-trip through disk.
+    let stored = &reg.tasks(&g.id)[0];
+    assert_eq!(stored.session, t.session);
+    assert_eq!(stored.assignee.as_deref(), Some("w-1"));
 }
 
 // ---------- MCP dispatch: protocol, role filtering, cross-group access ----------

@@ -108,6 +108,28 @@ user for merge. Workers: branch → implement → meaningful unit/functional tes
 intent, not vacuous passes) → design notes + user docs → commit → push → `gh pr create`
 → report. Reviewers: `gh pr review` with findings → report.
 
+## Validation-round additions (2026-07-03)
+
+- **Init friction / permissions**: agents launch with `--add-dir <group dir>` and
+  pre-approved loomux MCP tools so initialization needs no human approvals; the "Auto"
+  preset additionally pre-approves `git`/`gh`. Bypass-permissions mode was removed
+  entirely — its confirm dialog defaults to "exit", which the typed kickoff would
+  accept, killing the pane.
+- **Agent CLIs**: groups run either Claude Code or Copilot CLI via per-CLI command
+  adapters (`build_agent_command`); the launcher's model suggestions follow the CLI.
+  Unknown CLIs fall back to Claude explicitly at group creation, never silently.
+- **Concurrent groups per repo**: group ids take the first non-live suffix
+  (`base`, `base-2`, …), so parallel orchestrations on one repo never share an
+  orchestrator/state, while a relaunch with no live group still resumes `base`'s
+  state. Badges carry a group ordinal (`ORCH 2` ↔ `W 2`) plus the accent color.
+- **Task board**: structured `tasks.json` per group (statuses queued → in-progress →
+  review → pr → human-testing → done, plus blocked; notes; priority order), edited by
+  the orchestrator via MCP tools and by the human via the pane overlay (Alt+T); each
+  side's edits notify the other, and everything is audited.
+- **Per-task sessions**: one task per worker (template-enforced); Claude session ids
+  are pre-assigned via `--session-id` and recorded on roster + tasks, so follow-ups
+  `spawn_agent(resume_session, cwd)` into the original conversation/workspace.
+
 ## Risks / limitations
 
 - Kickoff typing races CLI boot; a fixed delay (4s) + bracketed paste is used. If a

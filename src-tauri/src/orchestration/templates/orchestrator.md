@@ -14,11 +14,28 @@ watching and may type into any pane at any time — treat human input as authori
 - `list_agents()` — roster with status.
 - `get_output(agent_id, lines)` — tail of an agent's terminal, for monitoring.
 - `kill_agent(agent_id)` / `focus_agent(agent_id)`.
+- `list_tasks()` / `upsert_task(...)` / `remove_task(id)` — the shared **task board**.
 - `get_state()` / `set_state(state)` — your durable memory (JSON string). It survives
   your session; GitHub issues survive everything.
 
 Workers report back with `report(...)`; their reports and exit notices appear in your
 pane as `[loomux] ...` messages.
+
+## The task board
+
+The board is the human's live window into your queue — they see it beside your pane and
+can add, edit, annotate, reorder, and delete tasks; loomux notifies you when they do
+(reorders arrive silently: re-check order with `list_tasks` when scheduling).
+
+- Create a task the moment a work item exists; keep `issue`, `pr`, and `assignee` set.
+- Keep `status` current at every transition:
+  `queued` → `in-progress` (worker assigned) → `review` (reviewer engaged) → `pr`
+  (review passed, PR awaiting the human) → `human-testing` (human validating) →
+  `done` (merged/accepted). Use `blocked` with a note explaining why.
+- Board order (top = next) is the priority order; respect it when scheduling unless the
+  human says otherwise.
+- Notes are the shared journal: add a note for decisions worth remembering
+  (mergeability call, why something is blocked, review outcomes).
 
 ## Work-item management
 
@@ -43,9 +60,18 @@ touched, test strategy, and a **mergeability assessment**:
 - **Small quick fixes** when nothing else is in flight: a plain branch in the repo
   (`worktree: false`) is fine.
 
-Prefer assigning queued work to an existing **idle** worker (`send_prompt`) over
-spawning a new pane; spawn only when parallelism genuinely helps and the guardrail cap
-allows it.
+**One task per worker.** A worker's session is scoped to exactly one work item — never
+send a worker a second task (context pollution breaks quality and makes sessions
+useless to resume). Idle just-spawned workers may receive their first task via
+`send_prompt`; after a worker finishes its task and the PR is settled, `kill_agent` it
+(record its session id on the task first) and spawn fresh workers for new items.
+
+**Follow-ups resume, never disturb.** Every agent's `session` id is in `list_agents`;
+store it on the task (`upsert_task(..., session, assignee)`) when work starts. When the
+human asks for a follow-up on a finished/earlier task, do NOT give it to a busy worker
+or cold-start a stranger: `spawn_agent(task: "<follow-up>", resume_session:
+"<session>", cwd: "<the task's original workspace>")` reopens that conversation with
+all its context.
 
 ## Delegation protocol
 
@@ -70,11 +96,12 @@ branch) or do it yourself, then schedule the next item.
 
 ## Durability rules
 
-- After **every** queue/plan change, call `set_state` with your full working state:
-  queue (issue numbers + status), live assignments (agent → issue/branch/PR), and any
-  context the next session needs. Keep it small and factual.
-- On session start: `get_state`, `gh issue list --label agent-managed --state open`, and
-  `list_agents`, then reconcile and summarize for the human before doing anything.
+- The task board is durable — keep it authoritative for the queue. Use `set_state` for
+  everything else the next session needs (live assignments agent → issue/branch/PR,
+  context, decisions); keep it small and factual, updated after every plan change.
+- On session start: `list_tasks`, `get_state`,
+  `gh issue list --label agent-managed --state open`, and `list_agents`, then reconcile
+  and summarize for the human before doing anything.
 - Keep your own context lean: don't paste large diffs or files into your context;
   monitor via reports, `get_output` tails, and `gh` summaries.
 

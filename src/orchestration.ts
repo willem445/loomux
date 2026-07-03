@@ -26,26 +26,36 @@ export interface OrchSpawnRequest {
 /** Launcher-collected group settings; guardrails are enforced backend-side. */
 export interface OrchestratorConfig {
   repo: string;
+  /** "claude" | "copilot" — which agent CLI the whole group runs. */
+  agentCli: string;
   initialWorkers: number;
   maxAgents: number;
   workerModel: string;
   reviewerModel: string;
   orchestratorModel: string;
-  fullAuto: boolean;
+  autoOps: boolean;
 }
 
-// Stable per-group accent colors so all panes of one orchestration read as
-// a set. Groups are few; collisions after the palette wraps are fine.
+// Per-group identity: a stable accent color AND a short ordinal tag shown in
+// every badge, so with several orchestrations open you can pair each worker
+// to its orchestrator at a glance ("ORCH 2" ↔ "W 2") without relying on
+// color perception alone. Groups are few; palette wrap collisions are fine
+// because the tag still disambiguates.
 const GROUP_COLORS = ["#7aa2f7", "#9ece6a", "#e0af68", "#bb9af7", "#7dcfff", "#f7768e"];
-const groupColors = new Map<string, string>();
+interface GroupMeta {
+  color: string;
+  tag: number;
+}
+const groupMeta = new Map<string, GroupMeta>();
 
-export function colorForGroup(groupId: string): string {
-  let c = groupColors.get(groupId);
-  if (!c) {
-    c = GROUP_COLORS[groupColors.size % GROUP_COLORS.length];
-    groupColors.set(groupId, c);
+export function metaForGroup(groupId: string): GroupMeta {
+  let m = groupMeta.get(groupId);
+  if (!m) {
+    const tag = groupMeta.size + 1;
+    m = { tag, color: GROUP_COLORS[(tag - 1) % GROUP_COLORS.length] };
+    groupMeta.set(groupId, m);
   }
-  return c;
+  return m;
 }
 
 const ROLE_LABELS: Record<OrchRole, string> = {
@@ -55,9 +65,10 @@ const ROLE_LABELS: Record<OrchRole, string> = {
 };
 
 export function badgeFor(req: OrchSpawnRequest): PaneBadge {
+  const meta = metaForGroup(req.group_id);
   return {
-    label: ROLE_LABELS[req.role] ?? "AGENT",
-    color: colorForGroup(req.group_id),
+    label: `${ROLE_LABELS[req.role] ?? "AGENT"} ${meta.tag}`,
+    color: meta.color,
     title: `${req.role} · ${req.agent_id} · group ${req.group_id}`,
   };
 }
@@ -73,6 +84,8 @@ async function openAgentPane(
       cwd: req.cwd,
       command: req.command,
       badge: badgeFor(req),
+      orchGroup: req.group_id,
+      orchRole: req.role,
     },
     paneEvents,
     grid.paneCount >= 2 ? "column" : "row"
@@ -110,12 +123,13 @@ export async function launchOrchestrator(
 ): Promise<void> {
   const spec = await invoke<OrchSpawnRequest>("create_orchestration", {
     repo: config.repo,
+    agentCli: config.agentCli,
     initialWorkers: config.initialWorkers,
     maxAgents: config.maxAgents,
     workerModel: config.workerModel,
     reviewerModel: config.reviewerModel,
     orchestratorModel: config.orchestratorModel,
-    fullAuto: config.fullAuto,
+    autoOps: config.autoOps,
   });
   await openAgentPane(grid, paneEvents, spec);
 }
