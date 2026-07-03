@@ -1,3 +1,4 @@
+mod cliprobe;
 mod git;
 mod metrics;
 pub mod orchestration; // pub: integration smoke test links through it
@@ -50,6 +51,7 @@ pub fn run() {
             orchestration::orch_upsert_task,
             orchestration::orch_delete_task,
             orchestration::orch_reorder_tasks,
+            cliprobe::probe_agent_cli,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {

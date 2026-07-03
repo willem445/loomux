@@ -87,12 +87,16 @@ review and merge.
 
 **Launch:** turn on *✦ agents* mode, open a new pane, and pick
 **Orchestrator + workers** in the launcher. Choose the agent CLI (Claude
-Code or Copilot CLI — model suggestions follow the selection, e.g.
-sonnet/opus/haiku/fable for Claude), the repository, how many idle workers
+Code or Copilot CLI — the model dropdowns are populated by querying the
+selected CLI's own help, so new models like `fable` appear automatically,
+with a custom-entry escape hatch), the repository, how many idle workers
 to start with, and the guardrails: max live agents, per-role models, and
-permissions. Permissions are either *Auto* (accept edits + pre-approved
-`git`/`gh` and loomux agent tools — recommended) or *Accept edits only*;
-loomux never uses `--dangerously-skip-permissions`. The launcher's
+permissions. Permissions are either *Auto* (Claude Code's native auto
+permission mode plus pre-approved `git`/`gh` and loomux agent tools —
+recommended) or *Accept edits only*; loomux never uses
+`--dangerously-skip-permissions`. The launcher warns inline when the
+selected agent CLI isn't installed, and an agent pane that dies with an
+error stays open so you can read what happened. The launcher's
 **Multiple panes** mode also spawns N independent agent panes at once (a
 worktree name fans out to `name-1 … name-N`).
 
@@ -126,8 +130,8 @@ session (same context, same workspace) instead of cold-starting a new agent
 or disturbing a busy one.
 
 **Guardrails** are enforced by loomux, not the model: a hard cap on live
-agents (≤12), models pinned per role at launch, and worker permissions fixed
-at `--permission-mode acceptEdits` unless you explicitly pick full auto.
+agents (≤12), models pinned per role at launch, and the permission mode
+fixed at group creation (native auto mode or acceptEdits — never bypass).
 
 **Persistence:** each group keeps durable state under
 `<data dir>/loomux/orchestration/<group>/` — `state.json` (the

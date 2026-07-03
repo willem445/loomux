@@ -810,14 +810,19 @@ impl OrchRegistry {
                     (Some(s), false) => format!("--session-id {s} "),
                     (None, _) => String::new(),
                 };
+                // "Auto" preset = Claude Code's native auto permission mode
+                // (what the human uses interactively); "edits" = acceptEdits.
+                let perm = if auto_ops { "auto" } else { "acceptEdits" };
                 let mut cmd = format!(
                     "claude {session_flag}--mcp-config \"{}\" --strict-mcp-config --model {model} \
-                     --permission-mode acceptEdits --add-dir \"{}\" --allowedTools mcp__loomux",
+                     --permission-mode {perm} --add-dir \"{}\" --allowedTools mcp__loomux",
                     cfg.display(),
                     group_dir.display()
                 );
                 if auto_ops {
-                    cmd.push_str(" \"Bash(git:*)\" \"Bash(gh:*)\"");
+                    // Both rule spellings: docs use `Bash(git:*)`, the CLI
+                    // help shows `Bash(git *)`; unmatched patterns are inert.
+                    cmd.push_str(" \"Bash(git:*)\" \"Bash(git *)\" \"Bash(gh:*)\" \"Bash(gh *)\"");
                 }
                 cmd
             }

@@ -144,6 +144,8 @@ export class Pane {
   private tasksOverlay: HTMLElement | null = null;
   private tasksBtn: HTMLButtonElement;
   private orchGroup: string | null = null;
+  /** True for agent/command panes (vs plain shells). */
+  private launchedCommand = false;
   private shiftTimer: number | undefined;
   private fit = new FitAddon();
   private resizeObs: ResizeObserver;
@@ -282,6 +284,7 @@ export class Pane {
   /** Open the terminal in the DOM and spawn its PTY. Call after `el` is attached. */
   async start(opts: PaneOptions = {}): Promise<void> {
     this.setName(opts.name ?? "shell");
+    this.launchedCommand = !!opts.command?.trim();
     if (opts.badge) this.setBadge(opts.badge);
     if (opts.orchGroup) {
       this.orchGroup = opts.orchGroup;
@@ -624,6 +627,23 @@ export class Pane {
       if (e.key === "Escape") commit(false);
     });
     input.addEventListener("blur", () => commit(true));
+  }
+
+  /** Command panes that die unexpectedly stay open so the human can read
+   *  the error (a crashing CLI's output would otherwise vanish with the
+   *  pane). Clean exits and loomux-initiated kills close as usual. */
+  keepOpenOnExit(exit: { exit_code: number | null; expected: boolean }): boolean {
+    return this.launchedCommand && !exit.expected && exit.exit_code !== 0;
+  }
+
+  /** Announce a kept-open pane's exit inside its terminal. */
+  notifyExited(code: number | null): void {
+    const codeTxt = code === null ? "" : ` (code ${code})`;
+    this.term.writeln(
+      `
+[91mprocess exited${codeTxt}[0m [90m— pane kept open so you can read the output; close it with Ctrl+Shift+W[0m`
+    );
+    this.setName(`${this.name} · exited`);
   }
 
   setActive(active: boolean): void {

@@ -376,6 +376,8 @@ html, body {
 .dlg-row > input { flex: 1; min-width: 0; }
 .dlg-row > .dlg-field { flex: 1; min-width: 0; }
 .dlg-num { width: 100%; }
+.model-picker { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.model-picker select, .model-picker input { width: 100%; }
 .dlg-input, .dlg-select {
   background: var(--bg-app); color: var(--text);
   border: 1px solid var(--border); border-radius: 7px;

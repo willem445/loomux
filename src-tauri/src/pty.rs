@@ -6,7 +6,7 @@ use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use serde::Serialize;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -29,6 +29,10 @@ pub struct PtyHandle {
 pub struct PtyManager {
     ptys: Arc<Mutex<HashMap<u32, PtyHandle>>>,
     next_id: AtomicU32,
+    /// Ptys we killed on purpose (pane close, kill_agent): their exit is
+    /// "expected", so the frontend closes the pane instead of keeping it
+    /// open to display an error.
+    expected_exits: Arc<Mutex<HashSet<u32>>>,
 }
 
 impl PtyManager {
@@ -58,6 +62,7 @@ impl PtyManager {
 
     /// Kill one child; the waiter thread reaps it and emits `pty-exit`.
     pub fn kill(&self, id: u32) {
+        self.expected_exits.lock().unwrap().insert(id);
         let handle = self.ptys.lock().unwrap().remove(&id);
         if let Some(mut h) = handle {
             let _ = h.killer.kill();
@@ -69,6 +74,8 @@ impl PtyManager {
 struct ExitPayload {
     id: u32,
     exit_code: Option<u32>,
+    /// True when loomux itself killed the process (pane close, kill_agent).
+    expected: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -240,14 +247,16 @@ pub fn spawn_pty(
     // learns about agent deaths here (authoritative, even if the frontend
     // never noticed the pane).
     let ptys = state.ptys.clone();
+    let expected_exits = state.expected_exits.clone();
     std::thread::spawn(move || {
         let status = child.wait();
         ptys.lock().unwrap().remove(&id);
+        let expected = expected_exits.lock().unwrap().remove(&id);
         let exit_code = status.ok().map(|s| s.exit_code());
         if let Some(reg) = app.try_state::<Arc<crate::orchestration::OrchRegistry>>() {
             reg.on_pty_exit(id, exit_code);
         }
-        let _ = app.emit("pty-exit", ExitPayload { id, exit_code });
+        let _ = app.emit("pty-exit", ExitPayload { id, exit_code, expected });
     });
 
     Ok(id)

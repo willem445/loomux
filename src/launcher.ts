@@ -9,6 +9,7 @@
 // user can fix the name and retry instead of losing their input.
 
 import { open } from "@tauri-apps/plugin-dialog";
+import { invoke } from "@tauri-apps/api/core";
 import { gitWorktreeAdd } from "./git";
 import type { OrchestratorConfig } from "./orchestration";
 import {
@@ -102,6 +103,72 @@ const intVal = (el: HTMLInputElement, fallback: number): number => {
   return Number.isFinite(n) ? n : fallback;
 };
 
+/** Result of probing an agent CLI on this machine (backend, cached). */
+interface CliProbe {
+  available: boolean;
+  models: string[];
+  error: string | null;
+}
+
+/** Model dropdown with a "custom…" escape hatch. A plain datalist doesn't
+ *  work here: browsers filter its suggestions by the input's current text,
+ *  so a pre-filled default hides every other option. */
+class ModelPicker {
+  readonly root: HTMLElement;
+  private sel: HTMLSelectElement;
+  private custom: HTMLInputElement;
+  private static CUSTOM = "__custom";
+
+  constructor() {
+    this.root = document.createElement("div");
+    this.root.className = "model-picker";
+    this.sel = document.createElement("select");
+    this.sel.className = "dlg-select";
+    this.custom = document.createElement("input");
+    this.custom.className = "dlg-input";
+    this.custom.placeholder = "model id…";
+    this.custom.spellcheck = false;
+    this.custom.hidden = true;
+    this.sel.addEventListener("change", () => {
+      this.custom.hidden = this.sel.value !== ModelPicker.CUSTOM;
+      if (!this.custom.hidden) this.custom.focus();
+    });
+    this.root.append(this.sel, this.custom);
+  }
+
+  /** Rebuild the options, keeping the current choice when still valid. */
+  setOptions(models: string[], fallback: string): void {
+    const current = this.value || fallback;
+    this.sel.replaceChildren(
+      ...models.map((m) => {
+        const o = document.createElement("option");
+        o.value = m;
+        o.textContent = m;
+        return o;
+      })
+    );
+    const custom = document.createElement("option");
+    custom.value = ModelPicker.CUSTOM;
+    custom.textContent = "custom…";
+    this.sel.appendChild(custom);
+    if (models.includes(current)) {
+      this.sel.value = current;
+      this.custom.hidden = true;
+    } else if (current) {
+      this.sel.value = ModelPicker.CUSTOM;
+      this.custom.value = current;
+      this.custom.hidden = false;
+    } else {
+      this.sel.value = models[0] ?? ModelPicker.CUSTOM;
+    }
+  }
+
+  get value(): string {
+    if (!this.sel.options.length) return "";
+    return this.sel.value === ModelPicker.CUSTOM ? this.custom.value.trim() : this.sel.value;
+  }
+}
+
 export class AgentLauncher {
   private overlay: HTMLElement;
   private modeSel: HTMLSelectElement;
@@ -121,11 +188,13 @@ export class AgentLauncher {
   private orchFields: HTMLElement;
   private workersInput: HTMLInputElement;
   private maxAgentsInput: HTMLInputElement;
-  private workerModelInput: HTMLInputElement;
-  private reviewerModelInput: HTMLInputElement;
-  private orchModelInput: HTMLInputElement;
-  private modelList: HTMLDataListElement;
+  private workerModel: ModelPicker;
+  private reviewerModel: ModelPicker;
+  private orchModel: ModelPicker;
   private permsSel: HTMLSelectElement;
+  private agentWarn: HTMLElement;
+  /** One probe per program per app run; backend caches too. */
+  private probes = new Map<string, Promise<CliProbe>>();
 
   private errorEl: HTMLElement;
   private launchBtn: HTMLButtonElement;
@@ -165,11 +234,15 @@ export class AgentLauncher {
       this.updateName();
     });
     this.agentField = field("Agent", this.agentSel);
+    this.agentWarn = document.createElement("div");
+    this.agentWarn.className = "dlg-error";
+    this.agentField.appendChild(this.agentWarn);
 
     this.customInput = document.createElement("input");
     this.customInput.className = "dlg-input";
     this.customInput.placeholder = "e.g. aider --model sonnet";
     this.customInput.spellcheck = false;
+    this.customInput.addEventListener("input", () => this.updateAgentWarning());
     this.customField = field("Command", this.customInput);
 
     this.countInput = numberInput(3, 2, 8);
@@ -210,18 +283,9 @@ export class AgentLauncher {
     // suggestion list follows the selected agent CLI.
     this.workersInput = numberInput(2, 0, 6);
     this.maxAgentsInput = numberInput(4, 1, 12);
-    this.modelList = document.createElement("datalist");
-    this.modelList.id = "launcher-orch-models";
-    const modelInput = (): HTMLInputElement => {
-      const input = document.createElement("input");
-      input.className = "dlg-input";
-      input.spellcheck = false;
-      input.setAttribute("list", this.modelList.id);
-      return input;
-    };
-    this.workerModelInput = modelInput();
-    this.reviewerModelInput = modelInput();
-    this.orchModelInput = modelInput();
+    this.workerModel = new ModelPicker();
+    this.reviewerModel = new ModelPicker();
+    this.orchModel = new ModelPicker();
     this.permsSel = select([
       ["auto", "Auto — pre-approve git/gh + agent tools (recommended)"],
       ["edits", "Accept edits only — you approve git/gh yourself"],
@@ -235,18 +299,13 @@ export class AgentLauncher {
     const guardRow2 = document.createElement("div");
     guardRow2.className = "dlg-row";
     guardRow2.append(
-      field("Orchestrator model", this.orchModelInput),
-      field("Worker model", this.workerModelInput),
-      field("Reviewer model", this.reviewerModelInput)
+      field("Orchestrator model", this.orchModel.root),
+      field("Worker model", this.workerModel.root),
+      field("Reviewer model", this.reviewerModel.root)
     );
     this.orchFields = document.createElement("div");
     this.orchFields.className = "dlg-field";
-    this.orchFields.append(
-      guardRow1,
-      guardRow2,
-      field("Permissions", this.permsSel),
-      this.modelList
-    );
+    this.orchFields.append(guardRow1, guardRow2, field("Permissions", this.permsSel));
 
     this.errorEl = document.createElement("div");
     this.errorEl.className = "dlg-error";
@@ -353,27 +412,72 @@ export class AgentLauncher {
   }
 
   /** In orchestrator mode the agent list is restricted to CLIs the backend
-   *  has orchestration adapters for, and the model suggestions + defaults
-   *  follow the selected CLI. */
+   *  has orchestration adapters for, and the model options + defaults
+   *  follow the selected CLI: curated list immediately, then merged with
+   *  whatever the CLI's own help reports once the probe returns. */
   private applyOrchCli(): void {
     const supported = new Set(ORCH_CLIS.map((c) => c.id));
     const restricted = this.mode === "orchestrator";
     for (const opt of Array.from(this.agentSel.options)) {
       opt.disabled = restricted && !supported.has(opt.value);
     }
+    this.updateAgentWarning();
     if (!restricted) return;
     if (!supported.has(this.agentSel.value)) this.agentSel.value = ORCH_CLIS[0].id;
     const cli = this.orchCliFor(this.agentSel.value);
-    this.modelList.replaceChildren(
-      ...cli.models.map((m) => {
-        const o = document.createElement("option");
-        o.value = m;
-        return o;
-      })
-    );
-    this.orchModelInput.value = cli.defaults.orchestrator;
-    this.workerModelInput.value = cli.defaults.worker;
-    this.reviewerModelInput.value = cli.defaults.reviewer;
+    this.setModelOptions(cli, cli.models);
+    void this.probe(cli.id).then((p) => {
+      if (this.mode !== "orchestrator" || this.agentSel.value !== cli.id) return;
+      if (p.models.length) {
+        // CLI-reported models first, curated suggestions appended.
+        const merged = [...p.models, ...cli.models.filter((m) => !p.models.includes(m))];
+        this.setModelOptions(cli, merged);
+      }
+    });
+  }
+
+  private setModelOptions(cli: OrchCli, models: string[]): void {
+    this.orchModel.setOptions(models, cli.defaults.orchestrator);
+    this.workerModel.setOptions(models, cli.defaults.worker);
+    this.reviewerModel.setOptions(models, cli.defaults.reviewer);
+  }
+
+  /** Probe an agent program (availability + models), memoized. */
+  private probe(program: string): Promise<CliProbe> {
+    let p = this.probes.get(program);
+    if (!p) {
+      p = invoke<CliProbe>("probe_agent_cli", { program }).catch(
+        (e): CliProbe => ({ available: false, models: [], error: String(e) })
+      );
+      this.probes.set(program, p);
+    }
+    return p;
+  }
+
+  /** The program a given launch would execute (first token of the command). */
+  private currentProgram(): string | null {
+    if (this.mode === "orchestrator") return this.orchCliFor(this.agentSel.value).id;
+    const agent = AGENTS.find((a) => a.id === this.agentSel.value) ?? AGENTS[0];
+    const command = agent.id === "custom" ? this.customInput.value.trim() : agent.command;
+    return command.split(/\s+/)[0]?.toLowerCase() || null;
+  }
+
+  /** Inline warning when the selected agent's CLI isn't on PATH. */
+  private updateAgentWarning(): void {
+    const program = this.currentProgram();
+    if (!program) {
+      this.agentWarn.classList.remove("visible");
+      return;
+    }
+    void this.probe(program).then((p) => {
+      if (this.currentProgram() !== program) return; // selection moved on
+      if (p.available) {
+        this.agentWarn.classList.remove("visible");
+      } else {
+        this.agentWarn.textContent = `⚠ ${p.error ?? `'${program}' was not found on PATH`}`;
+        this.agentWarn.classList.add("visible");
+      }
+    });
   }
 
   /** Auto-fill the pane name (`agent · worktree-or-repo`) until hand-edited. */
@@ -401,6 +505,17 @@ export class AgentLauncher {
     if (this.busy) return;
     const repo = this.repoInput.value.trim();
 
+    // Fail fast (and legibly) when the agent's CLI isn't installed —
+    // otherwise the pane just flashes the shell's error and dies.
+    const program = this.currentProgram();
+    if (program) {
+      const p = await this.probe(program);
+      if (!p.available) {
+        this.showError(p.error ?? `'${program}' was not found on PATH.`);
+        return;
+      }
+    }
+
     if (this.mode === "orchestrator") {
       if (!repo) {
         this.showError("The orchestrator needs a repository — pick one first.");
@@ -417,9 +532,9 @@ export class AgentLauncher {
           agentCli: cli.id,
           initialWorkers: intVal(this.workersInput, 2),
           maxAgents: intVal(this.maxAgentsInput, 4),
-          workerModel: this.workerModelInput.value.trim() || cli.defaults.worker,
-          reviewerModel: this.reviewerModelInput.value.trim() || cli.defaults.reviewer,
-          orchestratorModel: this.orchModelInput.value.trim() || cli.defaults.orchestrator,
+          workerModel: this.workerModel.value || cli.defaults.worker,
+          reviewerModel: this.reviewerModel.value || cli.defaults.reviewer,
+          orchestratorModel: this.orchModel.value || cli.defaults.orchestrator,
           autoOps: this.permsSel.value === "auto",
         },
       });

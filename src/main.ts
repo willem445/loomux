@@ -2,7 +2,7 @@ import "./styles.css";
 import { Grid } from "./grid";
 import type { Pane, PaneEvents } from "./pane";
 import { SessionBrowser } from "./sessions";
-import { ensureOutputRouter, onPtyExit, type SessionInfo } from "./pty";
+import { ensureOutputRouter, onPtyExit, type PtyExit, type SessionInfo } from "./pty";
 import { matchShortcut } from "./shortcuts";
 import { initStatusBar } from "./statusbar";
 import { AgentLauncher } from "./launcher";
@@ -42,7 +42,7 @@ const paneEvents: PaneEvents = {
 };
 
 // PTYs whose exit event arrived before their pane finished starting.
-const earlyExits = new Set<number>();
+const earlyExits = new Map<number, PtyExit>();
 
 async function openShell(dir: "row" | "column" = "row", relativeTo?: Pane): Promise<Pane> {
   const pane = await grid.openPane({}, paneEvents, dir, relativeTo);
@@ -111,9 +111,12 @@ async function openPane(dir: "row" | "column" = "row", relativeTo?: Pane): Promi
 }
 
 function reapIfExited(pane: Pane): void {
-  if (pane.ptyId !== null && earlyExits.delete(pane.ptyId)) {
-    grid.closePane(pane, false);
-  }
+  if (pane.ptyId === null) return;
+  const exit = earlyExits.get(pane.ptyId);
+  if (!exit) return;
+  earlyExits.delete(pane.ptyId);
+  if (pane.keepOpenOnExit(exit)) pane.notifyExited(exit.exit_code);
+  else grid.closePane(pane, false);
 }
 
 const sessions = new SessionBrowser(sessionsEl, (s: SessionInfo) => {
@@ -132,11 +135,16 @@ async function restoreSession(s: SessionInfo): Promise<void> {
   reapIfExited(pane);
 }
 
-// When a process exits on its own, retire its pane.
-void onPtyExit(({ id }) => {
-  const pane = grid.findByPtyId(id);
-  if (pane) grid.closePane(pane, false);
-  else earlyExits.add(id);
+// When a process exits on its own, retire its pane — unless it was a
+// command pane dying with an error, which stays open to show the output.
+void onPtyExit((exit) => {
+  const pane = grid.findByPtyId(exit.id);
+  if (!pane) {
+    earlyExits.set(exit.id, exit);
+    return;
+  }
+  if (pane.keepOpenOnExit(exit)) pane.notifyExited(exit.exit_code);
+  else grid.closePane(pane, false);
 });
 
 // Global shortcuts (terminals decline these in their key handlers).

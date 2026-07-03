@@ -29,6 +29,8 @@ export interface SessionInfo {
 export interface PtyExit {
   id: number;
   exit_code: number | null;
+  /** True when loomux killed the process itself (pane close, kill_agent). */
+  expected: boolean;
 }
 
 export interface DirInfo {

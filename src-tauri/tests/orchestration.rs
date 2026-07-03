@@ -198,7 +198,10 @@ fn claude_command_minimizes_init_approvals_without_bypass() {
         "loomux tools must be pre-approved so report/list never prompt");
     assert!(!cmd.contains("Bash(git:*)"), "git is not pre-approved unless auto_ops");
     let cmd = reg.build_agent_command("claude", "sonnet", true, cfg, gdir, None, false);
+    assert!(cmd.contains("--permission-mode auto"),
+        "the Auto preset must use Claude Code's native auto permission mode");
     assert!(cmd.contains("\"Bash(git:*)\"") && cmd.contains("\"Bash(gh:*)\""));
+    assert!(cmd.contains("\"Bash(git *)\""), "both allowlist rule spellings must be present");
     assert!(
         !cmd.contains("--dangerously-skip-permissions"),
         "bypass mode must never be used: its confirm dialog defaults to exit and kills the pane"
