@@ -6,16 +6,61 @@ import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { Unicode11Addon } from "@xterm/addon-unicode11";
+import { open } from "@tauri-apps/plugin-dialog";
 import {
   spawnPty,
   writePty,
   resizePty,
   killPty,
+  dirInfo,
+  changeDir,
   ensureOutputRouter,
   attachOutput,
   detachOutput,
 } from "./pty";
 import { isAppShortcut } from "./shortcuts";
+
+// Inline icons so the toolbar renders identically regardless of installed
+// fonts; they inherit color via `currentColor`.
+const FOLDER_ICON = `<svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"><path d="M1.9 4.3c0-.6.5-1.1 1.1-1.1h3l1.4 1.5h5.6c.6 0 1.1.5 1.1 1.1v5.4c0 .6-.5 1.1-1.1 1.1H3c-.6 0-1.1-.5-1.1-1.1z"/></svg>`;
+const BRANCH_ICON = `<svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><circle cx="4.5" cy="3.6" r="1.7"/><circle cx="4.5" cy="12.4" r="1.7"/><circle cx="11.5" cy="5.4" r="1.7"/><path d="M4.5 5.3v5.4M11.5 7.1c0 2.4-1.9 3.1-4 3.6"/></svg>`;
+
+/** Extract a filesystem path from an OSC 7 payload, which may be a raw path
+ *  or a `file://host/path` URL. Returns "" if nothing usable. */
+function normalizeOscPath(payload: string): string {
+  const raw = payload.trim();
+  if (!raw.startsWith("file://")) return raw;
+  try {
+    // Strip scheme + host, then percent-decode. On Windows a URL path looks
+    // like `/C:/Users/...`; drop the leading slash before a drive letter.
+    let p = decodeURIComponent(new URL(raw).pathname);
+    if (/^\/[A-Za-z]:/.test(p)) p = p.slice(1);
+    return p;
+  } catch {
+    return "";
+  }
+}
+
+/** Trim a path to its last two segments for a compact toolbar label. */
+function shortCwd(path: string): string {
+  const parts = path.split(/[\\/]/).filter(Boolean);
+  if (parts.length <= 2) return path;
+  return "…/" + parts.slice(-2).join("/");
+}
+
+/** A hidden-by-default toolbar chip: an icon plus a text span. */
+function makeMetaItem(cls: string, icon: string): [HTMLElement, HTMLElement] {
+  const wrap = document.createElement("span");
+  wrap.className = `pane-meta-item ${cls}`;
+  wrap.hidden = true;
+  const iconEl = document.createElement("span");
+  iconEl.className = "pane-meta-icon";
+  iconEl.innerHTML = icon;
+  const text = document.createElement("span");
+  text.className = "pane-meta-text";
+  wrap.append(iconEl, text);
+  return [wrap, text];
+}
 
 export interface PaneOptions {
   name?: string;
@@ -61,6 +106,12 @@ export class Pane {
 
   private titleEl: HTMLElement;
   private termEl: HTMLElement;
+  private cwdEl: HTMLElement;
+  private cwdTextEl: HTMLElement;
+  private branchEl: HTMLElement;
+  private branchTextEl: HTMLElement;
+  /** Latest un-abbreviated directory the shell reported, for the picker. */
+  private cwdRaw: string | null = null;
   private fit = new FitAddon();
   private resizeObs: ResizeObserver;
   private disposed = false;
@@ -78,6 +129,21 @@ export class Pane {
     this.titleEl.title = "Double-click to rename (F2)";
     this.titleEl.addEventListener("dblclick", () => this.startRename());
     header.appendChild(this.titleEl);
+
+    // Live metadata: current folder + git branch, reported by the shell.
+    // The folder chip is a button — click it to pick a folder to cd into.
+    const meta = document.createElement("div");
+    meta.className = "pane-meta";
+    [this.cwdEl, this.cwdTextEl] = makeMetaItem("pane-cwd", FOLDER_ICON);
+    [this.branchEl, this.branchTextEl] = makeMetaItem("pane-branch", BRANCH_ICON);
+    this.cwdEl.setAttribute("role", "button");
+    this.cwdEl.tabIndex = 0;
+    this.cwdEl.addEventListener("click", (e) => {
+      e.stopPropagation();
+      void this.pickFolder();
+    });
+    meta.append(this.cwdEl, this.branchEl);
+    header.appendChild(meta);
 
     for (const [glyph, cls, tip, fn] of [
       ["◫", "", "Split right", () => this.events.onSplit(this, "row")],
@@ -115,6 +181,14 @@ export class Pane {
     this.term.loadAddon(new Unicode11Addon());
     this.term.unicode.activeVersion = "11";
 
+    // Shell integration: the shell emits OSC 7 with its working directory on
+    // every prompt (see PWSH_CWD_HOOK / PROMPT_COMMAND in the backend). The
+    // payload is the raw path; consume it and refresh the toolbar.
+    this.term.parser.registerOscHandler(7, (payload) => {
+      this.onCwdReported(payload);
+      return true;
+    });
+
     // Let app-level shortcuts pass through xterm untouched; handle
     // clipboard combos here (Windows Terminal conventions).
     this.term.attachCustomKeyEventHandler((e) => {
@@ -144,6 +218,13 @@ export class Pane {
   /** Open the terminal in the DOM and spawn its PTY. Call after `el` is attached. */
   async start(opts: PaneOptions = {}): Promise<void> {
     this.setName(opts.name ?? "shell");
+    // Seed the toolbar from the startup directory. Interactive shells refine
+    // this via OSC 7; command panes (agents) keep this initial value since
+    // they have no prompt to report from.
+    if (opts.cwd) {
+      this.cwdRaw = opts.cwd;
+      void this.refreshDir(opts.cwd);
+    }
     this.term.open(this.termEl);
     this.term.textarea?.addEventListener("focus", () => this.events.onFocus(this));
     this.tryWebgl();
@@ -208,6 +289,56 @@ export class Pane {
   setName(name: string): void {
     this.name = name;
     this.titleEl.textContent = name;
+  }
+
+  /** Handle an OSC 7 working-directory report from the shell. Payloads are
+   *  usually a raw path, but tolerate a `file://host/path` URL too. */
+  private onCwdReported(payload: string): void {
+    const path = normalizeOscPath(payload);
+    if (!path || path === this.cwdRaw) return; // unchanged → nothing to do
+    this.cwdRaw = path;
+    void this.refreshDir(path);
+  }
+
+  private async refreshDir(path: string): Promise<void> {
+    let info;
+    try {
+      info = await dirInfo(path);
+    } catch {
+      return;
+    }
+    if (this.disposed || this.cwdRaw !== path) return; // superseded
+    this.setMeta(this.cwdEl, this.cwdTextEl, shortCwd(info.cwd), info.cwd);
+    this.setMeta(this.branchEl, this.branchTextEl, info.branch, info.branch);
+  }
+
+  /** Open a native folder picker and cd the shell into the chosen directory. */
+  private async pickFolder(): Promise<void> {
+    if (this.ptyId === null) return;
+    const picked = await open({
+      directory: true,
+      title: "Change folder",
+      defaultPath: this.cwdRaw ?? undefined,
+    });
+    if (typeof picked === "string" && this.ptyId !== null) {
+      await changeDir(this.ptyId, picked);
+      this.focus(); // return focus to the terminal after the dialog
+    }
+  }
+
+  private setMeta(
+    wrap: HTMLElement,
+    text: HTMLElement,
+    label: string | null | undefined,
+    tip: string | null
+  ): void {
+    if (label) {
+      text.textContent = label;
+      wrap.title = tip ?? label;
+      wrap.hidden = false;
+    } else {
+      wrap.hidden = true;
+    }
   }
 
   startRename(): void {

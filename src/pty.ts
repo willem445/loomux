@@ -31,6 +31,13 @@ export interface PtyExit {
   exit_code: number | null;
 }
 
+export interface DirInfo {
+  /** Directory, home-abbreviated to `~` for display. */
+  cwd: string;
+  /** Git branch (or short hash when detached); null when not in a repo. */
+  branch: string | null;
+}
+
 export const spawnPty = (opts: SpawnOptions): Promise<number> =>
   invoke<number>("spawn_pty", { ...opts });
 
@@ -41,6 +48,13 @@ export const resizePty = (id: number, cols: number, rows: number): Promise<void>
   invoke("resize_pty", { id, cols, rows });
 
 export const killPty = (id: number): Promise<void> => invoke("kill_pty", { id });
+
+/** Resolve display name + git branch for a directory the shell reported. */
+export const dirInfo = (path: string): Promise<DirInfo> => invoke("dir_info", { path });
+
+/** Drive a pane's shell to `cd` into `path`. */
+export const changeDir = (id: number, path: string): Promise<void> =>
+  invoke("change_dir", { id, path });
 
 export const listSessions = (): Promise<SessionInfo[]> => invoke("list_sessions");
 

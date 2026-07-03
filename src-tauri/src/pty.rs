@@ -8,6 +8,7 @@ use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, Pt
 use serde::Serialize;
 use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, State};
@@ -48,22 +49,32 @@ struct OutputPayload {
     data: String,
 }
 
+/// PowerShell prompt hook that reports the working directory to the terminal
+/// via an OSC 7 sequence on every prompt. This is how we track `cd`s:
+/// PowerShell keeps its own logical location and never moves the OS process
+/// cwd, so polling the process is useless — the shell has to tell us.
+/// Written with single quotes only so it needs no shell-quote escaping.
+const PWSH_CWD_HOOK: &str = "$global:__loomuxInner=$function:prompt; \
+function global:prompt { \
+if ($PWD.Provider.Name -eq 'FileSystem') { \
+[Console]::Write([char]27+']7;'+$PWD.ProviderPath+[char]7) }; \
+& $global:__loomuxInner }";
+
 /// Pick the user's default interactive shell.
-fn default_shell() -> (String, Vec<String>) {
+fn default_shell() -> String {
     #[cfg(target_os = "windows")]
     {
         // Prefer PowerShell 7 when available, fall back to Windows PowerShell.
         for candidate in ["pwsh.exe", "powershell.exe"] {
             if which(candidate) {
-                return (candidate.to_string(), vec!["-NoLogo".to_string()]);
+                return candidate.to_string();
             }
         }
-        ("cmd.exe".to_string(), vec![])
+        "cmd.exe".to_string()
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
-        (shell, vec!["-l".to_string()])
+        std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string())
     }
 }
 
@@ -75,9 +86,10 @@ fn which(name: &str) -> bool {
 
 /// Build the argv for a pane. When `command` is given it is run *through*
 /// the default shell so PATH shims (.cmd/.ps1 wrappers like `claude`)
-/// resolve the same way they do in a normal terminal.
+/// resolve the same way they do in a normal terminal. A plain interactive
+/// shell additionally gets cwd-reporting shell integration wired in.
 fn build_command(command: Option<String>, cwd: Option<String>) -> CommandBuilder {
-    let (shell, shell_args) = default_shell();
+    let shell = default_shell();
     let mut cmd = CommandBuilder::new(&shell);
 
     match command {
@@ -96,8 +108,20 @@ fn build_command(command: Option<String>, cwd: Option<String>) -> CommandBuilder
             }
         }
         _ => {
-            for a in &shell_args {
-                cmd.arg(a);
+            #[cfg(target_os = "windows")]
+            {
+                if shell.contains("cmd.exe") {
+                    // cmd's PROMPT understands $E (ESC), $P (path), $G (>).
+                    cmd.args(["/K", "prompt $E]7;$P$E\\$P$G"]);
+                } else {
+                    cmd.args(["-NoLogo", "-NoExit", "-Command", PWSH_CWD_HOOK]);
+                }
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                cmd.arg("-l");
+                // bash emits OSC 7 before each prompt. (zsh ignores this.)
+                cmd.env("PROMPT_COMMAND", "printf '\\033]7;%s\\007' \"$PWD\"");
             }
         }
     }
@@ -207,6 +231,118 @@ pub fn resize_pty(state: State<PtyManager>, id: u32, cols: u16, rows: u16) -> Re
         .map_err(|e| e.to_string())
 }
 
+/// Display metadata for a directory the shell just reported via OSC 7.
+#[derive(Serialize)]
+pub struct DirInfo {
+    /// The directory, home-abbreviated to `~` for compact display.
+    cwd: String,
+    /// Checked-out branch, or a short commit hash when detached; None if the
+    /// directory isn't inside a git repository.
+    branch: Option<String>,
+}
+
+/// Resolve display name + git branch for a shell-reported directory. Called
+/// from the frontend each time a pane emits its working directory.
+#[tauri::command]
+pub fn dir_info(path: String) -> DirInfo {
+    let dir = Path::new(&path);
+    DirInfo {
+        cwd: abbreviate_home(dir),
+        branch: git_branch(dir),
+    }
+}
+
+/// Send a `cd` into a pane's shell, so the folder picker can drive it. The
+/// command is formatted for the platform's default shell.
+#[tauri::command]
+pub fn change_dir(state: State<PtyManager>, id: u32, path: String) -> Result<(), String> {
+    let line = cd_command_line(&path);
+    let mut ptys = state.ptys.lock().unwrap();
+    let pty = ptys.get_mut(&id).ok_or("pty not found")?;
+    pty.writer
+        .write_all(line.as_bytes())
+        .map_err(|e| e.to_string())
+}
+
+/// Build a shell-appropriate `cd` command line (Enter-terminated) that
+/// tolerates spaces and quotes in `path`.
+fn cd_command_line(path: &str) -> String {
+    #[cfg(target_os = "windows")]
+    {
+        if default_shell().contains("cmd.exe") {
+            format!("cd /d \"{path}\"\r")
+        } else {
+            // PowerShell: single-quote and double any embedded quotes.
+            format!("Set-Location -LiteralPath '{}'\r", path.replace('\'', "''"))
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        // POSIX single-quote escaping: ' -> '\''
+        format!("cd '{}'\r", path.replace('\'', "'\\''"))
+    }
+}
+
+/// Replace a leading home-directory component with `~` for compact display.
+fn abbreviate_home(dir: &Path) -> String {
+    if let Some(home) = dirs::home_dir() {
+        if let Ok(rest) = dir.strip_prefix(&home) {
+            if rest.as_os_str().is_empty() {
+                return "~".to_string();
+            }
+            return format!("~/{}", rest.to_string_lossy().replace('\\', "/"));
+        }
+    }
+    dir.to_string_lossy().into_owned()
+}
+
+/// Resolve the current git branch by walking up from `dir` to the repository
+/// root and parsing `.git/HEAD` — no `git` subprocess required. Supports the
+/// `.git`-as-a-file form used by worktrees and submodules.
+fn git_branch(dir: &Path) -> Option<String> {
+    let mut cur = Some(dir);
+    while let Some(d) = cur {
+        let dot_git = d.join(".git");
+        if let Some(head) = read_head(&dot_git) {
+            return parse_head(&head);
+        }
+        cur = d.parent();
+    }
+    None
+}
+
+/// Load the HEAD contents for a `.git` entry, which may be a directory or a
+/// `gitdir: <path>` pointer file.
+fn read_head(dot_git: &Path) -> Option<String> {
+    let meta = std::fs::metadata(dot_git).ok()?;
+    let git_dir = if meta.is_dir() {
+        dot_git.to_path_buf()
+    } else {
+        let pointer = std::fs::read_to_string(dot_git).ok()?;
+        let rel = pointer.trim().strip_prefix("gitdir:")?.trim();
+        let path = Path::new(rel);
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            dot_git.parent()?.join(path)
+        }
+    };
+    std::fs::read_to_string(git_dir.join("HEAD")).ok()
+}
+
+/// Branch name from `ref: refs/heads/<name>`, else a short detached-HEAD hash.
+fn parse_head(head: &str) -> Option<String> {
+    let head = head.trim();
+    if let Some(reference) = head.strip_prefix("ref:") {
+        let name = reference.trim().rsplit('/').next()?.trim();
+        (!name.is_empty()).then(|| name.to_string())
+    } else if head.len() >= 7 {
+        Some(head[..7].to_string())
+    } else {
+        None
+    }
+}
+
 #[tauri::command]
 pub fn kill_pty(state: State<PtyManager>, id: u32) -> Result<(), String> {
     // Remove first so the handle (and its master side) drops; then signal
@@ -216,4 +352,34 @@ pub fn kill_pty(state: State<PtyManager>, id: u32) -> Result<(), String> {
         let _ = h.killer.kill();
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_head_branch() {
+        assert_eq!(parse_head("ref: refs/heads/main\n").as_deref(), Some("main"));
+        assert_eq!(
+            parse_head("ref: refs/heads/feature/api-v2").as_deref(),
+            Some("api-v2")
+        );
+    }
+
+    #[test]
+    fn parse_head_detached() {
+        assert_eq!(
+            parse_head("a1b2c3d4e5f6\n").as_deref(),
+            Some("a1b2c3d")
+        );
+    }
+
+    #[test]
+    fn git_branch_walks_up_to_repo_root() {
+        // The crate lives inside the loomux repo but has no `.git` of its own,
+        // so this exercises the parent walk.
+        let here = std::env::current_dir().unwrap();
+        assert!(git_branch(&here).is_some());
+    }
 }

@@ -116,9 +116,34 @@ html, body {
 }
 
 .pane-title {
-  flex: 1; min-width: 0;
+  flex: 0 1 auto; min-width: 0; max-width: 50%;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   cursor: default; letter-spacing: 0.2px;
+}
+
+/* ---------- pane metadata (folder · branch) ---------- */
+.pane-meta {
+  flex: 1 1 auto; min-width: 0;
+  display: flex; align-items: center; gap: 13px; overflow: hidden;
+  color: var(--text-dim); font-size: 11px;
+}
+.pane.active .pane-meta { color: #99a1b4; }
+.pane-meta-item {
+  display: inline-flex; align-items: center; gap: 4px;
+  min-width: 0; letter-spacing: 0.2px;
+}
+.pane-meta-item[hidden] { display: none; }
+.pane-cwd {
+  flex: 0 1 auto; cursor: pointer;
+  border-radius: 5px; padding: 1px 5px; margin: 0 -3px;
+  transition: background 0.15s var(--ease), color 0.15s var(--ease);
+}
+.pane-cwd:hover { background: var(--panel-2); color: var(--text); }
+.pane-cwd:focus-visible { outline: 1px solid var(--accent-dim); }
+.pane-branch { flex: none; }
+.pane-meta-icon { flex: none; display: inline-flex; opacity: 0.7; }
+.pane-meta-text {
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .pane-title-input {
   flex: 1; min-width: 0;
