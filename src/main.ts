@@ -4,6 +4,7 @@ import type { Pane, PaneEvents } from "./pane";
 import { SessionBrowser } from "./sessions";
 import { ensureOutputRouter, onPtyExit, type SessionInfo } from "./pty";
 import { matchShortcut } from "./shortcuts";
+import { initStatusBar } from "./statusbar";
 
 // Surface unexpected errors as a visible banner instead of a silently
 // broken UI — a user-facing "crash" should always come with a message.
@@ -133,6 +134,9 @@ window.addEventListener("contextmenu", (e) => {
 // WebView2 can come up without keyboard focus; make sure the active
 // terminal reclaims it whenever the window is (re)focused.
 window.addEventListener("focus", () => grid.activePane?.focus());
+
+// Start streaming CPU/mem/GPU/VRAM into the bottom status bar.
+initStatusBar();
 
 void (async () => {
   await ensureOutputRouter();

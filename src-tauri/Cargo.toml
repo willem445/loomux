@@ -19,6 +19,18 @@ portable-pty = "0.9"
 base64 = "0.22"
 dirs = "6"
 tauri-plugin-dialog = "2"
+sysinfo = "0.33"
+
+# Vendor-neutral GPU metrics on Windows: PDH performance counters give
+# per-engine utilization + dedicated VRAM usage for any WDDM adapter (AMD,
+# Intel, NVIDIA); DXGI reports total VRAM and the adapter name.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.57", features = [
+    "Win32_Foundation",
+    "Win32_System_Performance",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+] }
 
 [profile.release]
 lto = true

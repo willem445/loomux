@@ -275,6 +275,38 @@ html, body {
   margin-right: 2px;
 }
 
+/* ---------- system status bar ---------- */
+#statusbar {
+  display: flex; align-items: center; gap: 22px;
+  height: 26px; flex: none;
+  padding: 0 14px;
+  background: linear-gradient(180deg, var(--panel), #121218);
+  border-top: 1px solid var(--border);
+  white-space: nowrap; overflow: hidden;
+}
+.metric { display: flex; align-items: center; gap: 7px; }
+.metric-label {
+  font-size: 9.5px; letter-spacing: 1px; font-weight: 600;
+  color: var(--text-dim);
+}
+.metric-bar {
+  width: 64px; height: 5px; border-radius: 3px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  overflow: hidden; flex: none;
+}
+.metric-fill {
+  height: 100%; width: 0;
+  border-radius: 3px;
+  transition: width 0.5s var(--ease), background 0.5s var(--ease);
+}
+.metric-val {
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 10.5px; color: var(--text);
+  min-width: 34px;
+}
+.metric.metric-na .metric-val { color: var(--text-dim); font-style: italic; }
+
 /* ---------- fatal error banner ---------- */
 #app-error {
   position: fixed; left: 50%; bottom: 38px; transform: translateX(-50%);

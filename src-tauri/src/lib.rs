@@ -1,4 +1,5 @@
 mod git;
+mod metrics;
 mod pty;
 mod sessions;
 
@@ -9,6 +10,11 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(pty::PtyManager::default())
+        .setup(|app| {
+            // Start streaming CPU/mem/GPU snapshots to the status bar.
+            metrics::start(app.handle().clone());
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             pty::spawn_pty,
             pty::write_pty,
