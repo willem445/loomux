@@ -272,7 +272,7 @@ export class Pane {
     editorBtn.addEventListener("contextmenu", (e) => {
       e.preventDefault();
       e.stopPropagation();
-      void editorConfigDialog();
+      void editorConfigDialog().then(() => this.focus());
     });
     header.appendChild(editorBtn);
 

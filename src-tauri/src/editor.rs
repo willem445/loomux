@@ -21,7 +21,7 @@ const DEFAULT_PATHEXT: &str = ".COM;.EXE;.BAT;.CMD";
 fn validate<'a>(editor: &'a str, dir: &'a str) -> Result<(&'a str, &'a str), String> {
     let editor = editor.trim();
     if editor.is_empty() {
-        return Err("No editor configured — set one with the ⧉ button.".into());
+        return Err("No editor configured — right-click the </> button to set one.".into());
     }
     let dir = dir.trim();
     if dir.is_empty() {
@@ -160,9 +160,11 @@ mod tests {
     }
 
     #[test]
-    fn dir_is_a_single_arg_never_shell_interpolated() {
+    fn dir_is_a_single_argv_element() {
         // A directory full of shell metacharacters must remain exactly one
-        // argv element — this is the whole injection-safety guarantee.
+        // argv element — this is the whole injection-safety guarantee. (The
+        // end-to-end cmd.exe escaping for .cmd shims is a std guarantee,
+        // covered by rustc, not exercised here.)
         let evil = r#"C:\repo & calc.exe | echo "pwned" `whoami`"#;
         let args = editor_args(evil);
         assert_eq!(args, vec![evil.to_string()]);
