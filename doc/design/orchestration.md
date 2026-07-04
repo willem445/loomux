@@ -69,6 +69,7 @@ only gatekeeps final review + merge.
 | `kill_agent(agent_id)` / `focus_agent(agent_id)` | ✓ | ✗ |
 | `get_state()` | ✓ | ✓ |
 | `set_state(state)` | ✓ | ✗ |
+| `group_usage()` | ✓ | ✗ |
 
 Guardrails enforced by `spawn_agent`: live-agent cap (`max_agents`), model pinned per
 kind (`worker_model` / `reviewer_model`), permission mode fixed at group creation
@@ -168,6 +169,41 @@ intent, not vacuous passes) → design notes + user docs → commit → push →
   orchestrator session relaunches group + MCP identity + task board via
   `resume_orch_session`, resuming the conversation; workers/reviewers rejoin live
   groups the same way.
+
+## Cost containment (#7)
+
+Orchestration multiplies *unattended* spend: `max_agents` caps width, not duration, so a
+group can quietly burn money for hours. Four guardrails, all in the platform (judgment stays
+in the prompt), contain that. The two configurable ones live in `Guardrails`
+(`idle_kill_minutes`, `max_spawns_per_hour`), are collected by the launcher (0 = off),
+persisted in `group.json`, and clamped in `clamped()`.
+
+- **Per-group pause / resume.** A human-only action (`orch_pause_group` / `orch_resume_group`
+  Tauri commands; frontend `pauseGroup`/`resumeGroup`/`groupPaused`). While paused,
+  `deliver_prompt` short-circuits *before* touching the pty — every kickoff, orchestrator
+  prompt, and worker report is suppressed and audited (`prompt-suppressed-paused`), so agents
+  finish their current turn and idle out rather than being killed. Nothing is queued or
+  replayed: agents re-sync from the board/state on the next prompt after resume, which is the
+  point. The flag is mirrored to a `paused` marker file so a pause survives an app restart
+  (re-seeded in `create_group`).
+- **Idle-worker auto-kill.** Each worker/reviewer carries `idle_since_ms`, stamped when it is
+  spawned without a task or reports `done`/`blocked`, and cleared when the orchestrator sends
+  it a prompt (`send_prompt`). A background reaper (`start_idle_reaper`, 30s tick) kills any
+  whose idle time crosses the group's `idle_kill_minutes` and notifies the orchestrator so it
+  can respawn on demand. The threshold logic is the pure `idle_should_kill`; the orchestrator
+  is never a candidate. Off by default (0) — the human opts in, since auto-killing is
+  destructive-ish.
+- **Per-group cost aggregation.** `group_usage` sums each live pane's session cost into one
+  summary (total + per-agent). Cost is parsed best-effort from the pane's in-pane statusline
+  (`parse_session_cost` scans the ANSI-stripped tail bottom-up for the freshest `$` figure);
+  panes without a visible cost contribute `null` and are excluded from the total. Surfaced
+  both to the orchestrator (MCP tool, for status summaries) and the UI (`orch_group_usage`).
+- **Spawn-rate limit.** `max_spawns_per_hour` is a runaway-orchestrator backstop: worker/
+  reviewer spawns are counted over a rolling hour (`spawn_rate_exceeded`, checked+recorded
+  under one lock in `check_and_record_spawn`) and refused past the cap. Only spawns that pass
+  the gate are recorded — a refused spawn is not counted, so the cap can't lock a group out;
+  a spawn admitted past the gate but later aborted (worktree/bind failure) still counts. The
+  orchestrator pane itself (human-launched) is exempt. Off by default (0 = unlimited).
 
 ## Risks / limitations
 

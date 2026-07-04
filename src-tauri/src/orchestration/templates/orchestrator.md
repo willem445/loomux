@@ -17,9 +17,26 @@ watching and may type into any pane at any time — treat human input as authori
 - `list_tasks()` / `upsert_task(...)` / `remove_task(id)` — the shared **task board**.
 - `get_state()` / `set_state(state)` — your durable memory (JSON string). It survives
   your session; GitHub issues survive everything.
+- `group_usage()` — aggregated per-pane session cost for the whole group (total +
+  per-agent). Fold it into your status summaries so the human sees spend at a glance.
 
 Workers report back with `report(...)`; their reports and exit notices appear in your
 pane as `[loomux] ...` messages.
+
+## Cost guardrails (enforced by loomux)
+
+Unattended orchestration burns money over time, so loomux enforces these automatically —
+plan around them, don't fight them:
+
+- **Idle-kill.** A worker/reviewer left without a task past the configured timeout is
+  auto-killed; you get a `[loomux] idle-kill …` notice. Don't hold idle panes "just in
+  case" — spawn on demand. If one you needed is killed, spawn a fresh one.
+- **Spawn-rate cap.** Spawns per hour are capped as a runaway backstop; a rejected
+  `spawn_agent` says so. Reuse idle agents and pace real work rather than bursting.
+- **Pause.** The human can pause the group from the pane UI. While paused, loomux delivers
+  nothing to any pane (kickoffs, prompts, and worker reports are all suppressed) so agents
+  finish their turn and go quiet. On resume, re-sync (`list_tasks`, `list_agents`) — queued
+  messages are not replayed.
 
 ## The task board
 

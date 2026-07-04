@@ -8,9 +8,10 @@
 
 use loomux_lib::orchestration::mcp::dispatch;
 use loomux_lib::orchestration::{
-    add_trusted_folder, bracketed_paste, cli_ready, create_orchestration_group,
-    normalize_remote_web_base, parse_audit_lines, resolve_ref_url, rotate_audit_if_needed,
-    strip_ansi, Caller, Guardrails, OrchRegistry, Role, TaskPatch,
+    add_trusted_folder, bracketed_paste, cli_ready, create_orchestration_group, idle_should_kill,
+    normalize_remote_web_base, parse_audit_lines, parse_session_cost, resolve_ref_url,
+    rotate_audit_if_needed, spawn_rate_exceeded, strip_ansi, Caller, Guardrails, OrchRegistry,
+    Role, TaskPatch,
 };
 use serde_json::{json, Value};
 use std::fs;
@@ -40,6 +41,8 @@ fn rails() -> Guardrails {
         reviewer_model: "sonnet".into(),
         orchestrator_model: "opus".into(),
         auto_ops: false,
+        idle_kill_minutes: 0,
+        max_spawns_per_hour: 0,
     }
 }
 
@@ -75,9 +78,13 @@ fn guardrail_clamps_and_sanitizes() {
         reviewer_model: "".into(),
         orchestrator_model: "opus".into(),
         auto_ops: true,
+        idle_kill_minutes: 99999,
+        max_spawns_per_hour: 9999,
     }
     .clamped();
     assert_eq!(g.max_agents, 12, "cap must clamp to the hard ceiling");
+    assert_eq!(g.idle_kill_minutes, 1440, "idle-kill timeout clamps to 24h");
+    assert_eq!(g.max_spawns_per_hour, 240, "spawn-rate cap clamps to the ceiling");
     assert_eq!(g.agent_cli, "claude", "unknown CLIs fall back to claude explicitly");
     assert_eq!(g.worker_model, "sonnetrm-rf", "shell metacharacters must be stripped");
     assert_eq!(g.reviewer_model, "sonnet", "empty model falls back to default");
@@ -89,6 +96,8 @@ fn guardrail_clamps_and_sanitizes() {
         reviewer_model: "".into(),
         orchestrator_model: "".into(),
         auto_ops: false,
+        idle_kill_minutes: 0,
+        max_spawns_per_hour: 0,
     }
     .clamped();
     assert_eq!(g.worker_model, "auto");
@@ -966,4 +975,241 @@ fn every_tool_call_is_audited() {
         .expect("tool-call audit entry");
     assert_eq!(call["actor"], co.agent_id.as_str());
     assert!(lines.iter().any(|e| e["action"] == "tool-result" && e["detail"]["tool"] == "list_agents"));
+}
+
+// ---------- cost containment (#7): pause, idle-kill, spawn-rate, usage ----------
+
+/// Guardrails with the two cost knobs set; other fields mirror `rails()`
+/// but with a roomier agent cap so the spawn-rate guardrail can be exercised
+/// without tripping the live-agent cap first.
+fn costed_rails(idle_kill_minutes: u32, max_spawns_per_hour: u32) -> Guardrails {
+    Guardrails {
+        max_agents: 6,
+        agent_cli: "claude".into(),
+        worker_model: "sonnet".into(),
+        reviewer_model: "sonnet".into(),
+        orchestrator_model: "opus".into(),
+        auto_ops: false,
+        idle_kill_minutes,
+        max_spawns_per_hour,
+    }
+}
+
+#[test]
+fn idle_should_kill_respects_threshold_and_disable() {
+    let min = 60_000u64;
+    // Disabled (0) never kills, no matter how long idle.
+    assert!(!idle_should_kill(Some(0), 100 * min, 0));
+    // An agent with work (None) is never idle-killed.
+    assert!(!idle_should_kill(None, 100 * min, 5));
+    // Under the threshold: safe. At/over: kill.
+    assert!(!idle_should_kill(Some(0), 4 * min, 5));
+    assert!(!idle_should_kill(Some(min), 5 * min, 5)); // exactly 4 min idle < 5
+    assert!(idle_should_kill(Some(0), 5 * min, 5)); // exactly at threshold
+    assert!(idle_should_kill(Some(0), 10 * min, 5));
+}
+
+#[test]
+fn spawn_rate_exceeded_counts_only_the_trailing_window() {
+    let window = 60 * 60 * 1000u64;
+    let now = 10 * window; // 10h in
+    // Unlimited (0) never trips.
+    assert!(!spawn_rate_exceeded(&[now, now, now, now], now, 0, window));
+    // Three within the last hour, limit 3 → next is refused.
+    let recent = [now - 1000, now - 2000, now - 3000];
+    assert!(spawn_rate_exceeded(&recent, now, 3, window));
+    // The same three but limit 4 → still room.
+    assert!(!spawn_rate_exceeded(&recent, now, 4, window));
+    // Old spawns (outside the window) don't count toward the cap.
+    let stale = [now - window - 1, now - 2 * window, now - 500];
+    assert!(!spawn_rate_exceeded(&stale, now, 2, window));
+}
+
+#[test]
+fn parse_session_cost_reads_the_lowest_statusline_dollar() {
+    // Typical Claude statusline at the bottom of the pane.
+    let pane = "some agent output\n$ ran a command\nmodel: sonnet · $0.42 · 12k tokens";
+    assert_eq!(parse_session_cost(pane), Some(0.42));
+    // Thousands separators tolerated; bottom-most render wins.
+    assert_eq!(parse_session_cost("cost $1.00\ntotal $1,234.56 session"), Some(1234.56));
+    // A bare "$" or "$." with no digits is not a cost.
+    assert_eq!(parse_session_cost("price: $ TBD\nsee $.foo"), None);
+    // No dollar figure at all.
+    assert_eq!(parse_session_cost("just some\noutput lines"), None);
+    // Whole-dollar amount.
+    assert_eq!(parse_session_cost("session cost $3"), Some(3.0));
+}
+
+#[test]
+fn pause_suppresses_delivery_and_persists_across_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let gid;
+    {
+        let reg = OrchRegistry::new(dir.path().to_path_buf());
+        reg.set_port(45999);
+        let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+        gid = g.id.clone();
+        let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+        // Not paused: delivery proceeds past the pause gate and only fails
+        // because test mode has no real terminal.
+        let err = reg.deliver_prompt(&w.id, "hello", "loomux", false).unwrap_err();
+        assert!(err.contains("terminal"), "unpaused delivery must reach the pty step, got: {err}");
+        // Paused: delivery is suppressed (Ok, no error) and audited.
+        reg.pause_group(&g.id).unwrap();
+        assert!(reg.is_paused(&g.id));
+        reg.deliver_prompt(&w.id, "hello again", "loomux", false).unwrap();
+        let log = fs::read_to_string(reg.state_root().join(&g.id).join("audit.jsonl")).unwrap();
+        assert!(log.contains("prompt-suppressed-paused"), "suppression must be audited");
+        assert!(reg.state_root().join(&g.id).join("paused").is_file(), "pause marker must be written");
+    }
+    // Restart: the pause survives (marker re-seeds the in-memory flag).
+    let reg = OrchRegistry::new(dir.path().to_path_buf());
+    reg.set_port(45999);
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    assert_eq!(g.id, gid);
+    assert!(reg.is_paused(&g.id), "a paused group must stay paused across restarts");
+    // Resume clears the flag and the marker.
+    reg.resume_group(&g.id).unwrap();
+    assert!(!reg.is_paused(&g.id));
+    assert!(!reg.state_root().join(&g.id).join("paused").is_file(), "resume must remove the marker");
+}
+
+#[test]
+fn idle_workers_are_reap_candidates_but_busy_ones_and_orchestrator_are_not() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", costed_rails(5, 0)).unwrap();
+    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let idle = reg.spawn_agent(&g.id, Role::Worker, "idle", "", false, None).unwrap();
+    let busy = reg.spawn_agent(&g.id, Role::Worker, "busy", "do work", false, None).unwrap();
+    // Read the idle worker's stamped idle-since so the test is time-relative.
+    let roster = reg.list_agents(&g.id);
+    let idle_since = roster
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["id"] == idle.id.as_str())
+        .and_then(|a| a["idle_since_ms"].as_u64())
+        .expect("an idle-spawned worker must carry idle_since_ms");
+    // The busy worker (spawned with a task) has no idle clock.
+    let busy_idle = roster
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["id"] == busy.id.as_str())
+        .unwrap()["idle_since_ms"]
+        .clone();
+    assert!(busy_idle.is_null(), "a worker given a task must not start the idle clock");
+    let threshold_ms = 5 * 60_000u64;
+    // Just before the threshold: nobody is reaped.
+    let before = reg.idle_reap_candidates(idle_since + threshold_ms - 1);
+    assert!(before.is_empty(), "must not reap before the timeout, got: {before:?}");
+    // At/after the threshold: only the idle worker (never the orchestrator or
+    // the busy worker).
+    let after = reg.idle_reap_candidates(idle_since + threshold_ms);
+    assert_eq!(after, vec![idle.id.clone()], "only the idle worker crosses the timeout");
+}
+
+#[test]
+fn idle_kill_disabled_reaps_nothing() {
+    let (reg, _d) = test_registry();
+    // idle_kill_minutes = 0 → the guardrail is off.
+    let g = reg.create_group("C:/tmp/repo", costed_rails(0, 0)).unwrap();
+    reg.spawn_agent(&g.id, Role::Worker, "idle", "", false, None).unwrap();
+    // Even absurdly far in the future, nothing is a candidate.
+    assert!(reg.idle_reap_candidates(u64::MAX / 2).is_empty());
+}
+
+#[test]
+fn reaper_spares_a_worker_reactivated_before_the_kill() {
+    // Selection and kill happen under separate locks; a worker prompted in
+    // that window (idle clock cleared) must not be reaped. reap_idle_agents
+    // re-checks idle_should_kill immediately before killing.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", costed_rails(5, 0)).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let idle = reg.spawn_agent(&g.id, Role::Worker, "idle", "", false, None).unwrap();
+    let co = reg.resolve_token(&orch.token).unwrap();
+    let far_future = u64::MAX / 2;
+    // The idle worker is a genuine candidate at that time.
+    assert_eq!(reg.idle_reap_candidates(far_future), vec![idle.id.clone()]);
+    // The orchestrator hands it work — send_prompt clears its idle clock
+    // (delivery then fails in test mode with no pane, which is fine).
+    let _ = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "send_prompt", "arguments": { "agent_id": idle.id, "text": "here is a task" } }));
+    // Now it is no longer idle, so the reaper kills nothing.
+    assert!(reg.reap_idle_agents(far_future).is_empty(),
+        "a re-activated worker must not be reaped");
+    // And it is still alive in the roster.
+    let roster = reg.list_agents(&g.id).to_string();
+    assert!(roster.contains(&idle.id));
+}
+
+#[test]
+fn spawn_rate_guardrail_backstops_a_burst() {
+    let (reg, _d) = test_registry();
+    // Cap 2 spawns/hour, roomy agent cap so the rate limit is what bites.
+    let g = reg.create_group("C:/tmp/repo", costed_rails(0, 2)).unwrap();
+    reg.spawn_agent(&g.id, Role::Worker, "w1", "t", false, None).unwrap();
+    reg.spawn_agent(&g.id, Role::Worker, "w2", "t", false, None).unwrap();
+    let err = reg.spawn_agent(&g.id, Role::Worker, "w3", "t", false, None).unwrap_err();
+    assert!(err.contains("spawn-rate"), "third spawn within the hour must be refused, got: {err}");
+    // The orchestrator is exempt from the spawn-rate backstop.
+    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+}
+
+#[test]
+fn report_completion_reidles_worker_and_send_prompt_reactivates() {
+    let (reg, _d, co, cw) = setup_mcp();
+    // The worker from setup_mcp was spawned with a task → not idle.
+    let idle_of = |id: &str| -> Value {
+        reg.list_agents(&cw.group)
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["id"] == id)
+            .unwrap()["idle_since_ms"]
+            .clone()
+    };
+    assert!(idle_of(&cw.agent_id).is_null(), "a tasked worker is not idle");
+    // Reporting done re-idles it (delivery to the orchestrator fails in test
+    // mode with no pane, but the idle transition happens first).
+    let _ = dispatch(&reg, &cw, "tools/call",
+        &json!({ "name": "report", "arguments": { "status": "done", "summary": "PR up" } }));
+    assert!(!idle_of(&cw.agent_id).is_null(), "a worker that reported done becomes idle again");
+    // The orchestrator sending it a fresh prompt clears the idle clock.
+    let _ = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "send_prompt", "arguments": { "agent_id": cw.agent_id, "text": "next" } }));
+    assert!(idle_of(&cw.agent_id).is_null(), "send_prompt must re-activate an idle worker");
+}
+
+#[test]
+fn group_usage_summarizes_agents_with_null_cost_without_panes() {
+    let (reg, _d, _co, _cw) = setup_mcp();
+    let usage = reg.group_usage(&_co.group);
+    // No live panes in test mode → every cost is null and there is no total.
+    assert!(usage["total_cost_usd"].is_null());
+    let agents = usage["agents"].as_array().unwrap();
+    assert!(agents.iter().any(|a| a["id"] == "orch-1"), "orchestrator must appear");
+    assert!(agents.iter().all(|a| a["cost_usd"].is_null()));
+    // Exposed to the orchestrator over MCP too.
+    let via_mcp = dispatch(&reg, &_co, "tools/call",
+        &json!({ "name": "group_usage", "arguments": {} })).unwrap();
+    assert_eq!(via_mcp["isError"], false);
+    assert!(via_mcp["content"][0]["text"].as_str().unwrap().contains("total_cost_usd"));
+    // Workers cannot pull the group-wide usage summary.
+    let denied = dispatch(&reg, &_cw, "tools/call",
+        &json!({ "name": "group_usage", "arguments": {} })).unwrap();
+    assert_eq!(denied["isError"], true, "usage aggregation is orchestrator-only");
+}
+
+#[test]
+fn group_json_records_cost_guardrails() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", costed_rails(15, 30)).unwrap();
+    let gj: Value = serde_json::from_str(
+        &fs::read_to_string(reg.state_root().join(&g.id).join("group.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(gj["guardrails"]["idle_kill_minutes"], 15);
+    assert_eq!(gj["guardrails"]["max_spawns_per_hour"], 30);
 }

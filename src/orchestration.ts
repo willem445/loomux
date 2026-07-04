@@ -34,6 +34,12 @@ export interface OrchestratorConfig {
   reviewerModel: string;
   orchestratorModel: string;
   autoOps: boolean;
+  /** Cost guardrail: auto-kill an idle worker/reviewer after this many
+   *  minutes without a task (0 = disabled). */
+  idleKillMinutes: number;
+  /** Cost guardrail: cap on worker/reviewer spawns per rolling hour
+   *  (0 = unlimited). */
+  maxSpawnsPerHour: number;
 }
 
 // Per-group identity: a stable accent color AND a short ordinal tag shown in
@@ -160,6 +166,45 @@ export async function launchOrchestrator(
     reviewerModel: config.reviewerModel,
     orchestratorModel: config.orchestratorModel,
     autoOps: config.autoOps,
+    idleKillMinutes: config.idleKillMinutes,
+    maxSpawnsPerHour: config.maxSpawnsPerHour,
   });
   await openAgentPane(grid, paneEvents, spec);
 }
+
+// ---------- cost containment: pause/resume + per-group usage ----------
+
+/** One agent's parsed session cost within a group usage summary. */
+export interface AgentUsage {
+  id: string;
+  name: string;
+  role: string;
+  /** Dollars parsed from the pane statusline, or null if none was visible. */
+  cost_usd: number | null;
+}
+
+/** Aggregated per-group cost/usage (backend `orch_group_usage`). */
+export interface GroupUsage {
+  group: string;
+  /** Sum across agents with a visible cost, or null if none had one. */
+  total_cost_usd: number | null;
+  agents: AgentUsage[];
+  note: string;
+}
+
+/** Pause a group: loomux stops delivering prompts/kickoffs so its agents
+ *  idle out, containing unattended spend. Reversible with `resumeGroup`. */
+export const pauseGroup = (groupId: string): Promise<void> =>
+  invoke("orch_pause_group", { groupId });
+
+/** Resume a paused group so prompt/kickoff delivery flows again. */
+export const resumeGroup = (groupId: string): Promise<void> =>
+  invoke("orch_resume_group", { groupId });
+
+/** Whether a group is currently paused (for the pause/resume button state). */
+export const groupPaused = (groupId: string): Promise<boolean> =>
+  invoke<boolean>("orch_group_paused", { groupId });
+
+/** Aggregate per-pane session cost into one group summary. */
+export const groupUsage = (groupId: string): Promise<GroupUsage> =>
+  invoke<GroupUsage>("orch_group_usage", { groupId });

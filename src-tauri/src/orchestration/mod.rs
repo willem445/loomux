@@ -17,7 +17,7 @@ pub mod mcp;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -32,6 +32,14 @@ const REVIEWER_TPL: &str = include_str!("templates/reviewer.md");
 
 /// Hard ceiling on `max_agents` regardless of what the launcher asks for.
 const MAX_AGENTS_CEILING: u32 = 12;
+/// Upper bound on the idle-worker auto-kill timeout (24h); 0 disables it.
+const MAX_IDLE_KILL_MINUTES: u32 = 1440;
+/// Upper bound on the spawn-rate guardrail; 0 = unlimited.
+const MAX_SPAWNS_PER_HOUR: u32 = 240;
+/// Sliding window the spawn-rate guardrail counts spawns over.
+const SPAWN_RATE_WINDOW_MS: u64 = 60 * 60 * 1000;
+/// How often the idle reaper wakes to look for workers to auto-kill.
+const IDLE_REAP_INTERVAL: Duration = Duration::from_secs(30);
 /// How long the frontend gets to open a pane and report its pty id.
 const BIND_TIMEOUT: Duration = Duration::from_secs(20);
 /// Gap between the bracketed paste and the Enter that submits it.
@@ -139,6 +147,13 @@ pub struct Guardrails {
     /// shows a confirm dialog whose default answer is "exit", which the
     /// kickoff typing would accept, killing the pane.
     pub auto_ops: bool,
+    /// Cost guardrail: auto-kill a worker/reviewer that has sat without a
+    /// task for this many minutes (the orchestrator is notified so it can
+    /// respawn on demand). 0 disables it. See `idle_should_kill`.
+    pub idle_kill_minutes: u32,
+    /// Cost guardrail: cap on worker/reviewer spawns per rolling hour, a
+    /// runaway-orchestrator backstop. 0 = unlimited. See `spawn_rate_exceeded`.
+    pub max_spawns_per_hour: u32,
 }
 
 impl Guardrails {
@@ -157,8 +172,75 @@ impl Guardrails {
         self.worker_model = sanitize_model(&self.worker_model, worker_fb);
         self.reviewer_model = sanitize_model(&self.reviewer_model, worker_fb);
         self.orchestrator_model = sanitize_model(&self.orchestrator_model, orch_fb);
+        self.idle_kill_minutes = self.idle_kill_minutes.min(MAX_IDLE_KILL_MINUTES);
+        self.max_spawns_per_hour = self.max_spawns_per_hour.min(MAX_SPAWNS_PER_HOUR);
         self
     }
+}
+
+/// Whether an idle agent has sat long enough to auto-kill. Pure so the
+/// threshold logic is testable without threads or wall-clock; the reaper
+/// loop lives in `start_idle_reaper`. `idle_since_ms` is `None` for an agent
+/// that currently has work (never idle-killed); a `threshold_min` of 0
+/// disables the guardrail entirely.
+pub fn idle_should_kill(idle_since_ms: Option<u64>, now_ms: u64, threshold_min: u32) -> bool {
+    match (threshold_min, idle_since_ms) {
+        (0, _) | (_, None) => false,
+        (m, Some(t)) => now_ms.saturating_sub(t) >= (m as u64) * 60_000,
+    }
+}
+
+/// Whether the spawn-rate guardrail should reject the next spawn: true when
+/// at least `limit` spawns already fall inside the trailing `window_ms`.
+/// Pure so the sliding-window arithmetic is testable; `limit` 0 = unlimited.
+pub fn spawn_rate_exceeded(times: &[u64], now: u64, limit: u32, window_ms: u64) -> bool {
+    if limit == 0 {
+        return false;
+    }
+    let recent = times.iter().filter(|&&t| now.saturating_sub(t) < window_ms).count();
+    recent as u32 >= limit
+}
+
+/// Best-effort extraction of a session's dollar cost from a pane's
+/// ANSI-stripped terminal tail. Claude Code renders running cost in its
+/// in-pane statusline (bottom of the screen), so scan lines bottom-up and
+/// return the dollar amount from the lowest line that carries one — that is
+/// the freshest statusline render. Thousands separators are tolerated.
+/// Returns `None` when no `$<amount>` token is present.
+pub fn parse_session_cost(text: &str) -> Option<f64> {
+    for line in text.lines().rev() {
+        if let Some(cost) = line
+            .match_indices('$')
+            .find_map(|(i, _)| parse_dollar_amount(&line[i + 1..]))
+        {
+            return Some(cost);
+        }
+    }
+    None
+}
+
+/// Parse a leading `1,234.56`-style number (optionally after the `$` already
+/// consumed by the caller), returning `None` if the text does not start with
+/// a digit. Commas are dropped; a single decimal point is honored.
+fn parse_dollar_amount(after_dollar: &str) -> Option<f64> {
+    let mut digits = String::new();
+    let mut seen_dot = false;
+    for c in after_dollar.chars() {
+        match c {
+            '0'..='9' => digits.push(c),
+            ',' if !seen_dot => {} // thousands separator
+            '.' if !seen_dot => {
+                seen_dot = true;
+                digits.push('.');
+            }
+            _ => break,
+        }
+    }
+    // Reject a bare "." or empty (a lone `$` or `$.`); require a real digit.
+    if digits.is_empty() || digits == "." {
+        return None;
+    }
+    digits.parse::<f64>().ok()
 }
 
 /// Models are interpolated into a shell command line; restrict them to
@@ -199,6 +281,10 @@ pub struct AgentEntry {
     /// Working directory the pane runs in; resume must reuse it so the
     /// resumed session's file operations land where the work happened.
     pub cwd: String,
+    /// Unix-ms this worker/reviewer became idle (spawned without a task, or
+    /// reported done/blocked); `None` while it has work or for the
+    /// orchestrator. The idle reaper (`idle_kill_minutes`) reads this.
+    pub idle_since_ms: Option<u64>,
 }
 
 /// Work-item statuses shown on the task board. Kept as strings (not an
@@ -331,6 +417,13 @@ pub struct OrchRegistry {
     /// orchestrator is registered — without this, two concurrent launches
     /// on one repo would share an id.
     creation: Mutex<()>,
+    /// Groups the human has paused: loomux stops delivering prompts/kickoffs
+    /// to them so their agents idle out (see `deliver_prompt`). Mirrored to a
+    /// `paused` marker file per group so it survives restarts.
+    paused: Mutex<HashSet<String>>,
+    /// Per-group spawn timestamps (Unix-ms) for the spawn-rate guardrail;
+    /// pruned to the trailing hour on each check.
+    spawn_times: Mutex<HashMap<String, Vec<u64>>>,
 }
 
 fn now_ms() -> u64 {
@@ -623,6 +716,8 @@ impl OrchRegistry {
             delivery: Mutex::new(HashMap::new()),
             tasks_lock: Mutex::new(()),
             creation: Mutex::new(()),
+            paused: Mutex::new(HashSet::new()),
+            spawn_times: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1071,6 +1166,8 @@ impl OrchRegistry {
                 reviewer_model: s("reviewer_model", ""),
                 orchestrator_model: s("orchestrator_model", ""),
                 auto_ops: g["auto_ops"].as_bool().unwrap_or(true),
+                idle_kill_minutes: g["idle_kill_minutes"].as_u64().unwrap_or(0) as u32,
+                max_spawns_per_hour: g["max_spawns_per_hour"].as_u64().unwrap_or(0) as u32,
             },
         ))
     }
@@ -1108,12 +1205,19 @@ impl OrchRegistry {
                     "reviewer_model": info.guardrails.reviewer_model,
                     "orchestrator_model": info.guardrails.orchestrator_model,
                     "auto_ops": info.guardrails.auto_ops,
+                    "idle_kill_minutes": info.guardrails.idle_kill_minutes,
+                    "max_spawns_per_hour": info.guardrails.max_spawns_per_hour,
                 },
             }))
             .unwrap(),
         )
         .map_err(|e| e.to_string())?;
         self.write_instruction_files(&info)?;
+        // A pause is a durable human safety action: re-seed it from the
+        // marker file so a resumed group stays paused across restarts.
+        if dir.join("paused").is_file() {
+            self.paused.lock().unwrap().insert(id.clone());
+        }
         self.groups.lock().unwrap().insert(id.clone(), info.clone());
         self.audit(&id, "loomux", if resumed { "group-resume" } else { "group-create" },
             json!({ "repo": repo, "max_agents": info.guardrails.max_agents,
@@ -1132,6 +1236,166 @@ impl OrchRegistry {
             .unwrap()
             .values()
             .any(|a| a.group == id && a.status != AgentStatus::Dead)
+    }
+
+    // ---------- cost containment: pause, idle-kill, spawn-rate, usage ----------
+
+    /// Whether a group is currently paused (prompts/kickoffs suppressed).
+    pub fn is_paused(&self, group: &str) -> bool {
+        self.paused.lock().unwrap().contains(group)
+    }
+
+    /// Pause a group: loomux stops delivering prompts and kickoffs to its
+    /// agents, so they finish their current turn and idle out (containing
+    /// unattended spend) without being killed. Durable via a marker file.
+    pub fn pause_group(&self, group: &str) -> Result<(), String> {
+        let newly = self.paused.lock().unwrap().insert(group.to_string());
+        if newly {
+            let dir = self.group_dir(group);
+            fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+            let _ = fs::write(dir.join("paused"), b"");
+            self.audit(group, "human", "group-pause", json!({}));
+        }
+        Ok(())
+    }
+
+    /// Resume a paused group: prompt/kickoff delivery flows again. Queued
+    /// prompts are not replayed — agents resync from the board/state on the
+    /// next prompt, which is the point of idling out.
+    pub fn resume_group(&self, group: &str) -> Result<(), String> {
+        let was = self.paused.lock().unwrap().remove(group);
+        if was {
+            let _ = fs::remove_file(self.group_dir(group).join("paused"));
+            self.audit(group, "human", "group-resume", json!({}));
+        }
+        Ok(())
+    }
+
+    /// Flip a worker/reviewer between idle (awaiting/finished a task) and
+    /// active. `idle` true stamps `idle_since_ms = now`; false clears it.
+    /// No-op for the orchestrator, which is never idle-reaped.
+    fn set_agent_idle(&self, agent_id: &str, idle: bool) {
+        let mut agents = self.agents.lock().unwrap();
+        if let Some(a) = agents.get_mut(agent_id) {
+            if a.role == Role::Orchestrator {
+                return;
+            }
+            a.idle_since_ms = idle.then(now_ms);
+        }
+    }
+
+    /// Ids of workers/reviewers whose idle time has crossed their group's
+    /// `idle_kill_minutes`. Pure selection (no killing) so the reaper policy
+    /// is testable at a chosen `now`.
+    pub fn idle_reap_candidates(&self, now: u64) -> Vec<String> {
+        let thresholds: HashMap<String, u32> = self
+            .groups
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, g)| (id.clone(), g.guardrails.idle_kill_minutes))
+            .collect();
+        self.agents
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|a| a.role != Role::Orchestrator && a.status == AgentStatus::Running)
+            .filter(|a| {
+                let t = thresholds.get(&a.group).copied().unwrap_or(0);
+                idle_should_kill(a.idle_since_ms, now, t)
+            })
+            .map(|a| a.id.clone())
+            .collect()
+    }
+
+    /// Kill every idle worker/reviewer past its group's timeout, notifying
+    /// each group's orchestrator so it can respawn on demand. Returns the
+    /// killed agent ids. Called on a timer by `start_idle_reaper`.
+    pub fn reap_idle_agents(&self, now: u64) -> Vec<String> {
+        let mut killed = Vec::new();
+        for id in self.idle_reap_candidates(now) {
+            let Some(a) = self.agent(&id) else { continue };
+            let mins = self
+                .group(&a.group)
+                .map(|g| g.guardrails.idle_kill_minutes)
+                .unwrap_or(0);
+            // Re-check against the agent's *current* idle state: selection and
+            // kill happen under separate locks, so a worker prompted in that
+            // window (idle clock cleared) must not be killed.
+            if !idle_should_kill(a.idle_since_ms, now, mins) {
+                continue;
+            }
+            self.audit(&a.group, "loomux", "idle-kill",
+                json!({ "agent": id, "name": a.name, "idle_minutes": mins }));
+            let _ = self.deliver_to_orchestrator(
+                &a.group,
+                &format!(
+                    "[loomux] idle-kill guardrail: agent {} ({}) sat without a task for {mins}+ min and was terminated to contain cost. Respawn a worker when you have work for it.",
+                    a.name, a.id
+                ),
+                "loomux",
+            );
+            let _ = self.kill_agent(&id);
+            killed.push(id);
+        }
+        killed
+    }
+
+    /// Record a spawn against the group's rolling-hour window and report
+    /// whether the spawn-rate guardrail is now exceeded. Checks and records
+    /// under one lock so concurrent spawns can't both slip past the cap.
+    fn check_and_record_spawn(&self, group: &str, limit: u32) -> Result<(), String> {
+        let now = now_ms();
+        let mut all = self.spawn_times.lock().unwrap();
+        let times = all.entry(group.to_string()).or_default();
+        times.retain(|&t| now.saturating_sub(t) < SPAWN_RATE_WINDOW_MS);
+        if spawn_rate_exceeded(times, now, limit, SPAWN_RATE_WINDOW_MS) {
+            return Err(format!(
+                "guardrail: spawn-rate limit reached ({limit} spawns/hour). Wait, or reuse an idle agent instead of spawning a new one."
+            ));
+        }
+        times.push(now);
+        Ok(())
+    }
+
+    /// Aggregate the group's per-pane session cost into one summary. Cost is
+    /// parsed best-effort from each live agent's in-pane statusline (see
+    /// `parse_session_cost`); an agent whose statusline shows no dollar
+    /// figure contributes `null` and is excluded from the total.
+    pub fn group_usage(&self, group: &str) -> Value {
+        let app = self.app.lock().unwrap().clone();
+        let agents: Vec<AgentEntry> = self
+            .agents
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|a| a.group == group && a.status != AgentStatus::Dead)
+            .cloned()
+            .collect();
+        let mut total = 0.0f64;
+        let mut any = false;
+        let mut list: Vec<Value> = agents
+            .iter()
+            .map(|a| {
+                let cost = app.as_ref().zip(a.pty_id).and_then(|(app, pty)| {
+                    let ptys = app.state::<crate::pty::PtyManager>();
+                    let raw = ptys.output_tail(pty)?;
+                    parse_session_cost(&strip_ansi(&raw))
+                });
+                if let Some(c) = cost {
+                    total += c;
+                    any = true;
+                }
+                json!({ "id": a.id, "name": a.name, "role": a.role, "cost_usd": cost })
+            })
+            .collect();
+        list.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+        json!({
+            "group": group,
+            "total_cost_usd": any.then_some(total),
+            "agents": list,
+            "note": "best-effort, parsed from each pane's statusline; agents without a visible cost are excluded from the total",
+        })
     }
 
     /// Render the role instruction docs into the group dir so kickoff
@@ -1328,6 +1592,12 @@ impl OrchRegistry {
                     group.guardrails.max_agents
                 ));
             }
+            // Guardrail: spawn-rate backstop against a runaway orchestrator.
+            // Checked (and the timestamp recorded only when the check passes)
+            // before any pane/worktree work so a burst fast-fails. A refused
+            // spawn is not counted; one admitted here but later aborted
+            // (worktree/bind failure) still counts toward the hour.
+            self.check_and_record_spawn(group_id, group.guardrails.max_spawns_per_hour)?;
         }
 
         // Guardrail: the model is pinned per role at group creation.
@@ -1408,6 +1678,9 @@ impl OrchRegistry {
             task: task.to_string(),
             session_id: session_id.clone(),
             cwd: cwd.clone(),
+            // An agent spawned without a task starts the idle clock; one
+            // given work does not (the orchestrator is exempt regardless).
+            idle_since_ms: (role != Role::Orchestrator && task.trim().is_empty()).then(now_ms),
         };
         {
             // Re-check the cap under the same lock as the insert: the early
@@ -1540,6 +1813,14 @@ impl OrchRegistry {
         let a = self.agent(agent_id).ok_or("unknown agent")?;
         if a.status == AgentStatus::Dead {
             return Err(format!("agent {agent_id} is dead"));
+        }
+        // Pause guardrail: while a group is paused, loomux delivers nothing
+        // to its panes so agents finish their turn and idle out. The attempt
+        // is audited (nothing is silently lost from the record) and reported
+        // as success so callers don't error or retry.
+        if self.is_paused(&a.group) {
+            self.audit(&a.group, from, "prompt-suppressed-paused", json!({ "to": agent_id, "text": text }));
+            return Ok(());
         }
         let pty_id = a.pty_id.ok_or("agent has no terminal yet")?;
         let app = self.app.lock().unwrap().clone().ok_or("no app handle")?;
@@ -1697,6 +1978,7 @@ impl OrchRegistry {
                 "id": a.id, "name": a.name, "role": a.role,
                 "status": a.status, "task": a.task,
                 "session": a.session_id, "cwd": a.cwd,
+                "idle_since_ms": a.idle_since_ms,
             }))
             .collect();
         list.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
@@ -1797,12 +2079,24 @@ impl OrchRegistry {
     }
 }
 
+/// Background loop that enforces the idle-worker auto-kill guardrail: every
+/// `IDLE_REAP_INTERVAL` it kills any worker/reviewer whose idle time has
+/// crossed its group's `idle_kill_minutes` (groups with the guardrail off
+/// are skipped inside `reap_idle_agents`). Started once at app setup.
+pub fn start_idle_reaper(reg: Arc<OrchRegistry>) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(IDLE_REAP_INTERVAL);
+        reg.reap_idle_agents(now_ms());
+    });
+}
+
 // ---------- tauri commands ----------
 
 /// Create (or reattach to) an orchestration group and register its
 /// orchestrator. Returns the pane spec the frontend opens directly; initial
 /// idle workers are spawned in the background once the orchestrator binds.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // launcher-collected guardrails, one field each
 pub fn create_orchestration(
     reg: tauri::State<Arc<OrchRegistry>>,
     repo: String,
@@ -1813,6 +2107,8 @@ pub fn create_orchestration(
     reviewer_model: String,
     orchestrator_model: String,
     auto_ops: bool,
+    idle_kill_minutes: u32,
+    max_spawns_per_hour: u32,
 ) -> Result<SpawnRequest, String> {
     create_orchestration_group(
         reg.inner(),
@@ -1824,11 +2120,38 @@ pub fn create_orchestration(
             reviewer_model,
             orchestrator_model,
             auto_ops,
+            idle_kill_minutes,
+            max_spawns_per_hour,
         },
         None,
         None,
         initial_workers,
     )
+}
+
+/// Pause a group: loomux stops delivering prompts/kickoffs so its agents
+/// idle out (cost containment). Human action from the pane UI.
+#[tauri::command]
+pub fn orch_pause_group(reg: tauri::State<Arc<OrchRegistry>>, group_id: String) -> Result<(), String> {
+    reg.pause_group(&group_id)
+}
+
+/// Resume a paused group: prompt/kickoff delivery flows again.
+#[tauri::command]
+pub fn orch_resume_group(reg: tauri::State<Arc<OrchRegistry>>, group_id: String) -> Result<(), String> {
+    reg.resume_group(&group_id)
+}
+
+/// Whether a group is currently paused (drives the pause/resume button state).
+#[tauri::command]
+pub fn orch_group_paused(reg: tauri::State<Arc<OrchRegistry>>, group_id: String) -> bool {
+    reg.is_paused(&group_id)
+}
+
+/// Aggregate per-pane session cost/usage into one group summary for the UI.
+#[tauri::command]
+pub fn orch_group_usage(reg: tauri::State<Arc<OrchRegistry>>, group_id: String) -> Value {
+    reg.group_usage(&group_id)
 }
 
 /// Create (or reattach to) a group and register its orchestrator, under the
@@ -1910,6 +2233,7 @@ fn register_orchestrator_pane(
         task: String::new(),
         session_id,
         cwd: group.repo.clone(),
+        idle_since_ms: None, // the orchestrator is never idle-reaped
     };
     reg.agents.lock().unwrap().insert(agent_id.clone(), entry.clone());
     reg.by_token.lock().unwrap().insert(token, agent_id.clone());
