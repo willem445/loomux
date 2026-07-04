@@ -148,6 +148,9 @@ export class AuditView {
   /** Signature of the last render's data, to skip no-op follow re-renders
    *  (which would otherwise fight the human's scroll/expand). */
   private lastSig = "";
+  /** Signature of the entry set the filter dropdowns were last built from, so
+   *  a no-op follow poll doesn't rebuild (and disrupt) an open dropdown. */
+  private lastOptionsSig = "";
 
   constructor(
     private groupId: string,
@@ -289,16 +292,30 @@ export class AuditView {
   }
 
   private entryKey(e: AuditEntry): string {
-    return `${e.ts_ms}|${e.actor}|${e.action}`;
+    // ts_ms|actor|action alone collides when the same actor logs the same
+    // action within one millisecond (e.g. two prompt deliveries) — expanding
+    // one row would toggle both. Mix in a hash of the detail to disambiguate.
+    let h = 5381;
+    const detail = JSON.stringify(e.detail ?? "");
+    for (let i = 0; i < detail.length; i++) h = ((h << 5) + h + detail.charCodeAt(i)) | 0;
+    return `${e.ts_ms}|${e.actor}|${e.action}|${h >>> 0}`;
   }
 
   private render(): void {
     if (this.disposed) return;
 
-    // Refresh filter option lists from the full entry set.
-    this.syncSelect(this.actorSel, this.entries.map((e) => e.actor), this.filters.actor);
-    this.syncSelect(this.actionSel, this.entries.map((e) => e.action), this.filters.action);
-    this.syncSelect(this.agentSel, this.entries.flatMap(entryAgents), this.filters.agent);
+    // Refresh filter option lists, but only when the entry set actually
+    // changed. The audit is append-only, so distinct actors/actions/agents can
+    // only appear alongside new entries — length + newest ts is a sufficient
+    // signature. Gating this keeps a 1.5s follow poll from rebuilding (and
+    // collapsing) a dropdown the human has open.
+    const optionsSig = `${this.entries.length}|${this.entries.at(-1)?.ts_ms ?? 0}`;
+    if (optionsSig !== this.lastOptionsSig) {
+      this.lastOptionsSig = optionsSig;
+      this.syncSelect(this.actorSel, this.entries.map((e) => e.actor), this.filters.actor);
+      this.syncSelect(this.actionSel, this.entries.map((e) => e.action), this.filters.action);
+      this.syncSelect(this.agentSel, this.entries.flatMap(entryAgents), this.filters.agent);
+    }
 
     const filtered = this.entries.filter((e) => this.passes(e));
 
