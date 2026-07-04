@@ -234,8 +234,13 @@ export class TasksView {
     this.tasks.forEach((t, i) => this.listEl.appendChild(this.renderTask(t, i)));
   }
 
+  /** Statuses where only the human can move the item forward — highlighted on
+   *  the board so what is waiting on you stands out (attention routing #6). */
+  private static AWAITING_HUMAN = new Set(["pr", "human-testing", "blocked"]);
+
   private renderTask(t: OrchTask, index: number): HTMLElement {
     const row = el("div", "task-row");
+    if (TasksView.AWAITING_HUMAN.has(t.status)) row.classList.add("awaiting-human");
 
     // Reorder: board order is the priority order the orchestrator follows.
     const order = el("div", "task-order");

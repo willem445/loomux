@@ -381,6 +381,9 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             // A worker that finished (done) or stalled (blocked) is idle
             // again — restart its idle-kill clock; progress keeps it active.
             reg.set_agent_idle(&caller.agent_id, matches!(status, "done" | "blocked"));
+            // Attention routing: a done/blocked report badges the pane (and can
+            // toast) so the human sees which one needs them; progress clears it.
+            reg.note_report_attention(&caller.agent_id, status);
             reg.deliver_to_orchestrator(
                 &caller.group,
                 &format!("[loomux] {} reports {status}: {summary}", caller.agent_id),

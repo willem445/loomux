@@ -12,8 +12,10 @@ import {
   groupPaused,
   groupSummary,
   groupUsage,
+  notifyEnabled,
   pauseGroup,
   resumeGroup,
+  setNotify,
   type GroupSummary,
   type GroupUsage,
 } from "./orchestration";
@@ -54,6 +56,7 @@ export class GroupView {
   private summaryEl: HTMLElement;
   private listEl: HTMLElement;
   private pauseBtn: HTMLButtonElement;
+  private notifyBtn: HTMLButtonElement;
   private endBtn: HTMLButtonElement;
   private cleanupChk: HTMLInputElement;
   private toastEl: HTMLElement;
@@ -62,6 +65,7 @@ export class GroupView {
   private summary: GroupSummary | null = null;
   private usage: GroupUsage | null = null;
   private paused = false;
+  private notify = false;
   private pollTimer: number | undefined;
   private disposed = false;
   /** True once End is clicked once: the second click within the window
@@ -95,6 +99,11 @@ export class GroupView {
     this.pauseBtn = el("button", "group-btn", "Pause") as HTMLButtonElement;
     this.pauseBtn.addEventListener("click", () => void this.togglePause());
 
+    // Desktop-notification opt-in: OS toasts for report/blocked/attention
+    // events in this group (idle-with-prompt, worker reports). Per-group.
+    this.notifyBtn = el("button", "group-btn", "🔔 Notify") as HTMLButtonElement;
+    this.notifyBtn.addEventListener("click", () => void this.toggleNotify());
+
     const endWrap = el("div", "group-end-wrap");
     const cleanupLbl = el("label", "group-cleanup") as HTMLLabelElement;
     this.cleanupChk = document.createElement("input");
@@ -107,7 +116,7 @@ export class GroupView {
     this.endBtn.addEventListener("click", () => void this.onEndClick());
     endWrap.append(cleanupLbl, this.endBtn);
 
-    foot.append(this.pauseBtn, endWrap);
+    foot.append(this.pauseBtn, this.notifyBtn, endWrap);
 
     this.toastEl = el("div", "git-toast");
     this.toastEl.hidden = true;
@@ -139,10 +148,11 @@ export class GroupView {
   private async load(): Promise<void> {
     if (this.disposed) return;
     try {
-      [this.summary, this.usage, this.paused] = await Promise.all([
+      [this.summary, this.usage, this.paused, this.notify] = await Promise.all([
         groupSummary(this.groupId),
         groupUsage(this.groupId),
         groupPaused(this.groupId),
+        notifyEnabled(this.groupId),
       ]);
     } catch (err) {
       this.toast(String(err));
@@ -155,6 +165,15 @@ export class GroupView {
     try {
       if (this.paused) await resumeGroup(this.groupId);
       else await pauseGroup(this.groupId);
+    } catch (err) {
+      this.toast(String(err));
+    }
+    await this.load();
+  }
+
+  private async toggleNotify(): Promise<void> {
+    try {
+      await setNotify(this.groupId, !this.notify);
     } catch (err) {
       this.toast(String(err));
     }
@@ -253,5 +272,12 @@ export class GroupView {
     this.pauseBtn.title = s.paused
       ? "Resume delivery so the agents pick work back up"
       : "Stop delivering prompts so the agents finish their turn and idle out";
+
+    // Reflect desktop-notification state on its toggle.
+    this.notifyBtn.textContent = this.notify ? "🔔 Notifying" : "🔔 Notify";
+    this.notifyBtn.classList.toggle("on", this.notify);
+    this.notifyBtn.title = this.notify
+      ? "Desktop toasts are on for this group — click to turn off"
+      : "Turn on OS toasts for reports and idle-with-prompt panes in this group";
   }
 }

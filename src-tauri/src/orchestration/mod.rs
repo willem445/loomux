@@ -44,6 +44,18 @@ const IDLE_REAP_INTERVAL: Duration = Duration::from_secs(30);
 const WATCHDOG_INTERVAL: Duration = Duration::from_secs(30);
 /// Upper bound on the watchdog stall timeout (24h); 0 disables it.
 const MAX_WATCHDOG_STALL_MINUTES: u32 = 1440;
+/// How often the attention scan recomputes which panes need the human
+/// (idle-with-prompt detection; report/gate signals are event-driven and
+/// picked up on the next tick).
+const ATTENTION_INTERVAL: Duration = Duration::from_secs(3);
+/// A pane's terminal output must be stable (unchanged) at least this long
+/// before an idle-with-prompt is asserted — the CLI has stopped painting and
+/// is genuinely parked on a prompt, not mid-render. Measured across ticks, so
+/// it also debounces (needs a couple of consecutive quiet scans).
+const ATTENTION_QUIET_MS: u64 = 4000;
+/// If the human typed into a pane within this window it does not "need
+/// attention" — they are already at the keyboard on it.
+const ATTENTION_RECENT_INPUT_MS: u64 = 6000;
 /// How long the frontend gets to open a pane and report its pty id.
 const BIND_TIMEOUT: Duration = Duration::from_secs(20);
 /// Gap between the bracketed paste and the Enter that submits it.
@@ -238,6 +250,56 @@ pub fn watchdog_should_notify(
     now_ms.saturating_sub(silent_since_ms) >= (threshold_min as u64) * 60_000
 }
 
+/// Attention routing (#6): does a pane's ANSI-stripped output tail look like a
+/// CLI parked on a prompt only the human can answer — a permission dialog, a
+/// yes/no confirmation, or a numbered selection menu? This is the "last output"
+/// half of idle-with-prompt detection; the caller pairs it with an
+/// output-quiet check (this alone can't tell a live prompt from the same words
+/// scrolled past). So it errs toward recognizable interactive-prompt structure
+/// (the selection pointer both Claude Code and Copilot render, explicit y/n
+/// tokens, the stock permission phrasings) rather than any mention of a
+/// question. Case-insensitive; only the final handful of lines are considered,
+/// because a prompt the CLI is waiting on is the last thing it painted.
+pub fn prompt_wait_detected(tail: &str) -> bool {
+    let lines: Vec<String> = tail
+        .lines()
+        .map(|l| l.trim().to_lowercase())
+        .filter(|l| !l.is_empty())
+        .collect();
+    if lines.is_empty() {
+        return false;
+    }
+    let recent = &lines[lines.len().saturating_sub(12)..];
+    let joined = recent.join("\n");
+
+    // Selection pointer on an option line: how both CLIs render the highlighted
+    // choice of a permission menu (`❯ 1. Yes`, `› Yes`, `→ Allow`).
+    let has_pointer_option = recent
+        .iter()
+        .any(|l| l.starts_with('❯') || l.starts_with('›') || l.starts_with('→'));
+    // A numbered yes/no menu even without the pointer glyph.
+    let has_numbered_menu = joined.contains("1. yes") || joined.contains("❯ 1.");
+    // Explicit yes/no confirmation tokens.
+    let has_yes_no = joined.contains("(y/n)")
+        || joined.contains("[y/n]")
+        || joined.contains("y/n)")
+        || joined.contains("[y/n]?")
+        || joined.contains("yes/no");
+    // Stock permission / trust / continue phrasings from Claude Code & Copilot.
+    let has_permission_phrase = joined.contains("do you want to proceed")
+        || joined.contains("do you want to make this edit")
+        || joined.contains("do you want to create")
+        || joined.contains("do you want to run")
+        || joined.contains("do you trust")
+        || joined.contains("trust the files")
+        || joined.contains("allow this")
+        || joined.contains("allow command")
+        || joined.contains("grant access")
+        || joined.contains("press enter to continue")
+        || joined.contains("waiting for your");
+    has_pointer_option || has_numbered_menu || has_yes_no || has_permission_phrase
+}
+
 /// Distinct agent working directories to remove when a group is torn down
 /// with worktree cleanup: dedup (case/separator-insensitively), and never the
 /// repo root itself — the orchestrator and any repo-mode workers run there, so
@@ -363,6 +425,25 @@ pub struct AgentEntry {
     /// Watchdog anti-nag latch: set once a stall notice has been delivered for
     /// the current stall, cleared when the agent produces output/reports again.
     pub watchdog_notified: bool,
+}
+
+/// One pane that needs the human, pushed to the frontend as an `orch-attention`
+/// event (the full current set each scan; the frontend badges panes by
+/// `pty_id`). `reason`, most- to least-urgent:
+/// - `blocked` — a worker reported it is blocked
+/// - `waiting` — the pane is parked on a prompt (idle-with-prompt)
+/// - `report`  — a worker reported done (awaiting the human's review/merge)
+/// - `gate`    — this agent's task sits at a human merge gate on the board
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct AttentionItem {
+    pub agent_id: String,
+    pub group: String,
+    pub name: String,
+    pub role: Role,
+    pub pty_id: Option<u32>,
+    pub reason: &'static str,
+    /// Short human phrase for the badge tooltip and the toast body.
+    pub detail: String,
 }
 
 /// Work-item statuses shown on the task board. Kept as strings (not an
@@ -507,6 +588,20 @@ pub struct OrchRegistry {
     /// the copilot session watcher). `Weak` avoids a self-referential `Arc`
     /// cycle that would leak the registry.
     self_arc: Mutex<Weak<OrchRegistry>>,
+    /// Attention routing (#6): latched worker reports awaiting the human's
+    /// eyes — agent id → "done" | "blocked". Set by the report tool, cleared on
+    /// ack (the human focused the pane) or reassignment.
+    attn_reports: Mutex<HashMap<String, &'static str>>,
+    /// Attention routing: per-agent output-quiet tracking, agent id → (last pty
+    /// output total, Unix-ms that total last changed). Kept separate from the
+    /// watchdog's counter so the two features never clobber each other's clocks.
+    attn_quiet: Mutex<HashMap<String, (u64, u64)>>,
+    /// Attention routing: the agent → reason set last emitted, so a scan fires a
+    /// desktop toast only once per attention onset (the event itself is
+    /// re-emitted every tick and the frontend badges idempotently).
+    attn_emitted: Mutex<HashMap<String, String>>,
+    /// Groups with desktop notifications enabled (durable `notify` marker file).
+    notify_groups: Mutex<HashSet<String>>,
 }
 
 fn now_ms() -> u64 {
@@ -802,6 +897,10 @@ impl OrchRegistry {
             paused: Mutex::new(HashSet::new()),
             spawn_times: Mutex::new(HashMap::new()),
             self_arc: Mutex::new(Weak::new()),
+            attn_reports: Mutex::new(HashMap::new()),
+            attn_quiet: Mutex::new(HashMap::new()),
+            attn_emitted: Mutex::new(HashMap::new()),
+            notify_groups: Mutex::new(HashSet::new()),
         }
     }
 
@@ -1408,6 +1507,10 @@ impl OrchRegistry {
         if dir.join("paused").is_file() {
             self.paused.lock().unwrap().insert(id.clone());
         }
+        // Desktop-notification opt-in is likewise a durable per-group choice.
+        if dir.join("notify").is_file() {
+            self.notify_groups.lock().unwrap().insert(id.clone());
+        }
         self.groups.lock().unwrap().insert(id.clone(), info.clone());
         self.audit(&id, "loomux", if resumed { "group-resume" } else { "group-create" },
             json!({ "repo": repo, "max_agents": info.guardrails.max_agents,
@@ -1476,6 +1579,9 @@ impl OrchRegistry {
                 // clear its anti-nag latch so the fresh stall gets a nudge.
                 a.last_progress_ms = now_ms();
                 a.watchdog_notified = false;
+                // New work supersedes a prior done/blocked report — drop its
+                // attention latch so a stale badge doesn't linger.
+                self.attn_reports.lock().unwrap().remove(agent_id);
             }
         }
     }
@@ -1653,6 +1759,212 @@ impl OrchRegistry {
     pub fn run_watchdog(&self, now: u64) -> Vec<String> {
         let outputs = self.agent_output_totals();
         self.watchdog_tick(now, &outputs)
+    }
+
+    // ---------- attention routing: surface which pane needs the human ----------
+
+    /// Latch (or clear) a worker's report as an attention signal. `done` and
+    /// `blocked` badge the pane and can fire a toast until the human acks or the
+    /// agent is reassigned; `progress` (the agent is working again) clears it.
+    /// No-op for the orchestrator, which never reports.
+    pub fn note_report_attention(&self, agent_id: &str, status: &str) {
+        let mut m = self.attn_reports.lock().unwrap();
+        match status {
+            "done" => {
+                m.insert(agent_id.to_string(), "done");
+            }
+            "blocked" => {
+                m.insert(agent_id.to_string(), "blocked");
+            }
+            _ => {
+                m.remove(agent_id);
+            }
+        }
+    }
+
+    /// The human focused/handled a pane: drop any latched report so its badge
+    /// clears. Live reasons (waiting/gate) are recomputed each scan and reappear
+    /// only if still true, so they need no explicit clear.
+    pub fn ack_attention(&self, agent_id: &str) {
+        self.attn_reports.lock().unwrap().remove(agent_id);
+    }
+
+    /// Whether desktop notifications are enabled for a group.
+    pub fn notify_enabled(&self, group: &str) -> bool {
+        self.notify_groups.lock().unwrap().contains(group)
+    }
+
+    /// Enable/disable desktop notifications for a group, durably (a `notify`
+    /// marker file, mirroring the pause marker) so the choice survives restarts.
+    pub fn set_notify(&self, group: &str, on: bool) -> Result<(), String> {
+        let dir = self.group_dir(group);
+        let mut set = self.notify_groups.lock().unwrap();
+        if on {
+            if set.insert(group.to_string()) {
+                fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+                let _ = fs::write(dir.join("notify"), b"");
+                self.audit(group, "human", "notify-on", json!({}));
+            }
+        } else if set.remove(group) {
+            let _ = fs::remove_file(dir.join("notify"));
+            self.audit(group, "human", "notify-off", json!({}));
+        }
+        Ok(())
+    }
+
+    /// Read every agent pane's output counter, last-lines tail, and last human
+    /// keystroke time — the raw inputs `attention_tick` needs. Empty without an
+    /// app handle (unit tests drive `attention_tick` with synthetic maps).
+    fn attention_inputs(&self) -> (HashMap<String, u64>, HashMap<String, String>, HashMap<String, u64>) {
+        let mut outs = HashMap::new();
+        let mut tails = HashMap::new();
+        let mut ins = HashMap::new();
+        let Some(app) = self.app.lock().unwrap().clone() else {
+            return (outs, tails, ins);
+        };
+        let ptys = app.state::<crate::pty::PtyManager>();
+        for a in self.agents.lock().unwrap().values() {
+            let Some(pid) = a.pty_id else { continue };
+            if let Some(t) = ptys.output_total(pid) {
+                outs.insert(a.id.clone(), t);
+            }
+            if let Some(raw) = ptys.output_tail(pid) {
+                // A prompt is at the very end; strip only the last few KB so
+                // the scan stays cheap against a saturated 256 KB ring.
+                let start = raw.len().saturating_sub(4096);
+                tails.insert(a.id.clone(), strip_ansi(&raw[start..]));
+            }
+            if let Some(u) = ptys.last_user_input_ms(pid) {
+                ins.insert(a.id.clone(), u);
+            }
+        }
+        (outs, tails, ins)
+    }
+
+    /// One attention pass: compute the current set of panes that need the human
+    /// from live agent state plus the supplied pty snapshots. Reasons, in
+    /// priority order, are `blocked` (reported), `waiting` (parked on a prompt:
+    /// output quiet past `ATTENTION_QUIET_MS`, a prompt-shaped tail, and no
+    /// recent human keystroke), `report` (reported done), and `gate` (this
+    /// agent's board task sits at a `pr`/`human-testing`/`blocked` merge gate).
+    /// Pure w.r.t. the OS/pty — the pty reads live in `attention_inputs` — so
+    /// the whole policy is testable with synthetic maps and no real CLI.
+    pub fn attention_tick(
+        &self,
+        now: u64,
+        outputs: &HashMap<String, u64>,
+        tails: &HashMap<String, String>,
+        last_inputs: &HashMap<String, u64>,
+    ) -> Vec<AttentionItem> {
+        // Board-derived gate map: agent id → gate status, across every live
+        // group. Read once per group (a small fs read) rather than per agent.
+        let groups: HashSet<String> =
+            self.agents.lock().unwrap().values().map(|a| a.group.clone()).collect();
+        let mut gate_of: HashMap<String, String> = HashMap::new();
+        for g in &groups {
+            for t in self.tasks(g) {
+                let is_gate = MERGE_GATE_STATUSES.contains(&t.status.as_str()) || t.status == "blocked";
+                if is_gate {
+                    if let Some(assignee) = t.assignee.filter(|s| !s.trim().is_empty()) {
+                        gate_of.insert(assignee, t.status);
+                    }
+                }
+            }
+        }
+
+        let reports = self.attn_reports.lock().unwrap().clone();
+        let mut quiet = self.attn_quiet.lock().unwrap();
+        let agents = self.agents.lock().unwrap();
+        let mut out = Vec::new();
+        for a in agents.values() {
+            if a.status != AgentStatus::Running {
+                quiet.remove(&a.id);
+                continue;
+            }
+            // Track how long the pane's output has been stable.
+            let cur = outputs.get(&a.id).copied().unwrap_or(0);
+            let entry = quiet.entry(a.id.clone()).or_insert((cur, now));
+            if cur != entry.0 {
+                *entry = (cur, now);
+            }
+            let quiet_for = now.saturating_sub(entry.1);
+            let recently_typed = last_inputs
+                .get(&a.id)
+                .map(|&t| t != 0 && now.saturating_sub(t) < ATTENTION_RECENT_INPUT_MS)
+                .unwrap_or(false);
+            let waiting = !recently_typed
+                && quiet_for >= ATTENTION_QUIET_MS
+                && tails.get(&a.id).map(|t| prompt_wait_detected(t)).unwrap_or(false);
+
+            let report = reports.get(a.id.as_str()).copied();
+            let (reason, detail): (&'static str, String) = if report == Some("blocked") {
+                ("blocked", format!("{} reported blocked — it needs you", a.name))
+            } else if waiting {
+                ("waiting", format!("{} is waiting on a prompt", a.name))
+            } else if report == Some("done") {
+                ("report", format!("{} reported done — review & merge", a.name))
+            } else if let Some(st) = gate_of.get(a.id.as_str()) {
+                ("gate", format!("task is {st} — awaiting your call"))
+            } else {
+                continue;
+            };
+            out.push(AttentionItem {
+                agent_id: a.id.clone(),
+                group: a.group.clone(),
+                name: a.name.clone(),
+                role: a.role,
+                pty_id: a.pty_id,
+                reason,
+                detail,
+            });
+        }
+        out.sort_by(|x, y| x.agent_id.cmp(&y.agent_id));
+        out
+    }
+
+    /// Decide which current attention items warrant a fresh desktop toast:
+    /// their group opted in, the reason is an event (not the persistent `gate`
+    /// board state, which the board highlight already surfaces), and this
+    /// (agent, reason) hasn't been toasted yet. Records only what actually
+    /// fires — so enabling notifications surfaces already-pending attention —
+    /// and prunes cleared/changed entries so a fresh onset toasts again.
+    /// Returns the agent ids to toast; pure w.r.t. the OS, so the policy is
+    /// testable without firing a real notification.
+    pub fn attention_toast_targets(&self, items: &[AttentionItem]) -> Vec<String> {
+        let notify = self.notify_groups.lock().unwrap().clone();
+        let mut toasted = self.attn_emitted.lock().unwrap();
+        let mut fire = Vec::new();
+        for i in items {
+            let already = toasted.get(&i.agent_id).map(|p| p == i.reason).unwrap_or(false);
+            if !already && i.reason != "gate" && notify.contains(&i.group) {
+                fire.push(i.agent_id.clone());
+                toasted.insert(i.agent_id.clone(), i.reason.to_string());
+            }
+        }
+        // Drop ledger entries whose attention cleared or whose reason changed,
+        // so the same pane can toast again on a genuinely new onset.
+        let current: HashMap<&str, &str> =
+            items.iter().map(|i| (i.agent_id.as_str(), i.reason)).collect();
+        toasted.retain(|id, reason| current.get(id.as_str()) == Some(&reason.as_str()));
+        fire
+    }
+
+    /// One full attention cycle: read pty snapshots, compute the attention set,
+    /// fire toasts for newly-attention panes in opted-in groups, and push the
+    /// whole set to the frontend. Called on a timer by `start_attention`.
+    pub fn run_attention(&self, now: u64) {
+        let (outputs, tails, last_inputs) = self.attention_inputs();
+        let items = self.attention_tick(now, &outputs, &tails, &last_inputs);
+        for id in self.attention_toast_targets(&items) {
+            if let Some(i) = items.iter().find(|i| i.agent_id == id) {
+                self.audit(&i.group, "loomux", "attention-toast",
+                    json!({ "agent": i.agent_id, "reason": i.reason }));
+                notify_desktop(&format!("loomux · {}", i.name), &i.detail);
+            }
+        }
+        if let Some(app) = self.app.lock().unwrap().clone() {
+            let _ = app.emit("orch-attention", &items);
+        }
     }
 
     /// Record a spawn against the group's rolling-hour window and report
@@ -2510,6 +2822,10 @@ impl OrchRegistry {
             self.by_pty.lock().unwrap().remove(&p);
             self.delivery.lock().unwrap().remove(&p);
         }
+        // Attention bookkeeping is per-live-agent; drop this one's entries.
+        self.attn_reports.lock().unwrap().remove(agent_id);
+        self.attn_quiet.lock().unwrap().remove(agent_id);
+        self.attn_emitted.lock().unwrap().remove(agent_id);
         let _ = fs::remove_file(
             self.group_dir(&snapshot.group).join("configs").join(format!("{agent_id}.json")),
         );
@@ -2579,6 +2895,18 @@ pub fn start_watchdog(reg: Arc<OrchRegistry>) {
     });
 }
 
+/// Background loop for attention routing (#6): every `ATTENTION_INTERVAL` it
+/// recomputes which panes need the human (idle-with-prompt, worker reports,
+/// human merge gates), pushes the set to the frontend for pane badges, and
+/// toasts newly-attention panes in notification-enabled groups. Started once at
+/// app setup.
+pub fn start_attention(reg: Arc<OrchRegistry>) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(ATTENTION_INTERVAL);
+        reg.run_attention(now_ms());
+    });
+}
+
 // ---------- tauri commands ----------
 
 /// Create (or reattach to) an orchestration group and register its
@@ -2637,6 +2965,31 @@ pub fn orch_resume_group(reg: tauri::State<Arc<OrchRegistry>>, group_id: String)
 #[tauri::command]
 pub fn orch_group_paused(reg: tauri::State<Arc<OrchRegistry>>, group_id: String) -> bool {
     reg.is_paused(&group_id)
+}
+
+// ---------- attention routing (human side) ----------
+
+/// The human focused/handled an attention-badged pane: drop its latched report
+/// so the badge clears. Live reasons (waiting/gate) are recomputed each scan.
+#[tauri::command]
+pub fn orch_ack_attention(reg: tauri::State<Arc<OrchRegistry>>, agent_id: String) {
+    reg.ack_attention(&agent_id);
+}
+
+/// Whether desktop notifications are enabled for a group (toggle button state).
+#[tauri::command]
+pub fn orch_notify_enabled(reg: tauri::State<Arc<OrchRegistry>>, group_id: String) -> bool {
+    reg.notify_enabled(&group_id)
+}
+
+/// Enable/disable desktop notifications for a group (durable, per-group).
+#[tauri::command]
+pub fn orch_set_notify(
+    reg: tauri::State<Arc<OrchRegistry>>,
+    group_id: String,
+    enabled: bool,
+) -> Result<(), String> {
+    reg.set_notify(&group_id, enabled)
 }
 
 /// Aggregate per-pane session cost/usage into one group summary for the UI.
@@ -3037,6 +3390,48 @@ pub fn resolve_ref_url(base: Option<&str>, kind: &str, value: &str) -> Option<St
     let seg = if kind == "issue" { "issues" } else { "pull" };
     Some(format!("{}/{seg}/{num}", base?.trim_end_matches('/')))
 }
+
+/// WinRT toast script (see `notify_desktop`). Title/body come in via
+/// environment variables — never interpolated into the script — so agent/board
+/// text can't inject PowerShell. XML-escaped before templating. The AppUserModel
+/// id is the stock PowerShell shortcut, which lets an unpackaged process raise a
+/// toast on Windows 10; it renders attributed to PowerShell, which is fine for
+/// an optional signal.
+#[cfg(target_os = "windows")]
+const TOAST_PS1: &str = r#"
+$ErrorActionPreference='SilentlyContinue'
+[void][Windows.UI.Notifications.ToastNotificationManager,Windows.UI.Notifications,ContentType=WindowsRuntime]
+[void][Windows.Data.Xml.Dom.XmlDocument,Windows.Data.Xml.Dom,ContentType=WindowsRuntime]
+$t=[System.Security.SecurityElement]::Escape($env:LOOMUX_TOAST_TITLE)
+$b=[System.Security.SecurityElement]::Escape($env:LOOMUX_TOAST_BODY)
+$xml="<toast><visual><binding template='ToastGeneric'><text>$t</text><text>$b</text></binding></visual></toast>"
+$doc=New-Object Windows.Data.Xml.Dom.XmlDocument
+$doc.LoadXml($xml)
+$toast=New-Object Windows.UI.Notifications.ToastNotification $doc
+$app='{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe'
+[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($app).Show($toast)
+"#;
+
+/// Best-effort OS desktop notification (attention routing #6). On Windows this
+/// spawns a hidden PowerShell that raises a WinRT toast, passing the title/body
+/// as environment variables (injection-proof — see `TOAST_PS1`). Deliberately
+/// no notification crate: those pull getrandom, which this project's Windows 10
+/// baseline can't load (0xc0000139 — see the Cargo.toml note). Silently a no-op
+/// on failure and on non-Windows; the pane badges and board highlight are the
+/// primary signal regardless.
+#[cfg(target_os = "windows")]
+fn notify_desktop(title: &str, body: &str) {
+    use std::os::windows::process::CommandExt;
+    let _ = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", TOAST_PS1])
+        .env("LOOMUX_TOAST_TITLE", title)
+        .env("LOOMUX_TOAST_BODY", body)
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+        .spawn();
+}
+
+#[cfg(not(target_os = "windows"))]
+fn notify_desktop(_title: &str, _body: &str) {}
 
 /// Open an http(s) URL in the user's default browser. The URL is passed to
 /// the OS handler as a single process argument (never a shell line), and is
