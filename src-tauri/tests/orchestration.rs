@@ -231,7 +231,10 @@ fn copilot_command_uses_copilot_adapter_flags() {
     let gdir = Path::new("C:/data/group");
     let cmd = reg.build_agent_command("copilot", "auto", true, cfg, gdir, None, false);
     assert!(cmd.starts_with("copilot "), "selected CLI must actually be launched, not claude");
-    assert!(cmd.contains("--additional-mcp-config @\"C:/x/cfg.json\""));
+    assert!(
+        cmd.contains("--additional-mcp-config \"@C:/x/cfg.json\""),
+        "the @ file marker must be inside the quotes — a bare @\" opens a PowerShell here-string, got: {cmd}"
+    );
     assert!(cmd.contains("--model auto"));
     assert!(cmd.contains("--allow-tool loomux"));
     assert!(cmd.contains("--allow-tool \"shell(git:*)\"") && cmd.contains("--allow-tool \"shell(gh:*)\""));

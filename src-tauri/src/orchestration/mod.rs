@@ -975,8 +975,12 @@ impl OrchRegistry {
                     (Some(s), true) => format!("--resume {s} "),
                     _ => String::new(),
                 };
+                // NOTE: the @ (copilot's file-path marker) must sit INSIDE
+                // the quotes — the pane shell is PowerShell, where a bare
+                // `@"` opens a here-string and the whole line dies with a
+                // ParserError before copilot ever runs.
                 let mut cmd = format!(
-                    "copilot {resume_flag}--additional-mcp-config @\"{}\" --model {model} \
+                    "copilot {resume_flag}--additional-mcp-config \"@{}\" --model {model} \
                      --add-dir \"{}\" --allow-tool loomux",
                     cfg.display(),
                     group_dir.display()
