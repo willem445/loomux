@@ -141,6 +141,33 @@ html, body {
   box-shadow: inset 3px 0 0 var(--group-color, var(--accent));
 }
 
+/* ---------- attention routing: "needs attention" badge (#6) ---------- */
+/* A pane the backend attention scan flagged (idle-with-prompt, a worker report,
+   or a task at a human merge gate). The chip names the reason; the header edge
+   pulses amber so a pane needing you stands out across a wall of terminals. */
+.pane-attn {
+  flex: none; cursor: pointer;
+  font-size: 9px; font-weight: 700; letter-spacing: 0.4px;
+  border: 1px solid #6a5230; border-radius: 4px; padding: 1.5px 6px;
+  color: #f2c66a; background: rgba(224, 175, 104, 0.16);
+  animation: attn-pulse 1.6s ease-in-out infinite;
+}
+.pane-attn:hover { background: rgba(224, 175, 104, 0.28); color: #ffd886; }
+/* Blocked is the most urgent — tint it red rather than amber. */
+.pane-attn[data-reason="blocked"] {
+  color: #ff9db0; background: rgba(247, 118, 142, 0.16); border-color: rgba(247, 118, 142, 0.4);
+}
+.pane.needs-attention .pane-header {
+  box-shadow: inset 3px 0 0 var(--group-color, var(--accent)), inset 0 -2px 0 #e0af68;
+}
+@keyframes attn-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(224, 175, 104, 0); }
+  50% { box-shadow: 0 0 8px 1px rgba(224, 175, 104, 0.5); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .pane-attn { animation: none; }
+}
+
 /* ---------- pane metadata (folder · branch) ---------- */
 .pane-meta {
   flex: 1 1 auto; min-width: 0;
@@ -517,6 +544,13 @@ html, body {
   padding: 4px 4px 4px 2px; border-radius: 7px;
 }
 .task-row:hover { background: var(--panel); }
+/* Items only the human can advance (pr / human-testing / blocked): a left
+   accent + faint wash so what is waiting on you stands out (#6). */
+.task-row.awaiting-human {
+  box-shadow: inset 3px 0 0 #e0af68;
+  background: rgba(224, 175, 104, 0.07);
+}
+.task-row.awaiting-human:hover { background: rgba(224, 175, 104, 0.12); }
 .task-order { display: flex; flex-direction: column; flex: none; }
 .task-btn {
   background: none; border: none; border-radius: 4px;

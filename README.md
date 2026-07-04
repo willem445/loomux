@@ -146,6 +146,22 @@ them on the board, and sends them to the orchestrator to route back to a
 worker. Both land as a message in the orchestrator pane, exactly as if you'd
 written it.
 
+**Attention routing:** the human is the scheduler's bottleneck, so loomux
+surfaces *which* pane needs you instead of making you scan them. A pane earns a
+pulsing **needs-attention** chip when an agent is parked on a prompt only you
+can answer (a permission dialog or question — detected from the pane going
+output-quiet on a prompt-shaped last screen, the same output heuristics the
+stalled-agent watchdog uses, and suppressed while you're typing into it), when a
+worker **reports** done or blocked, or when its task reaches a **human merge
+gate**. Turning to the pane (or clicking the chip) clears a report badge; live
+signals clear themselves when the condition passes. On the task board, items
+that only you can advance (`pr`, `human-testing`, `blocked`) are highlighted so
+what's waiting on you stands out. Each group also has an optional **desktop
+notification** toggle (🔔 in the group lifecycle panel) that raises an OS toast
+for those report/blocked/idle-with-prompt events — off by default, durable
+per-group. Badges and highlights are header/board overlays; nothing ever
+resizes the PTY.
+
 **Audit viewer:** every orchestration pane has an audit toggle (`Alt+A` or
 the history icon) opening the group's `audit.jsonl` as a filterable timeline
 — every prompt, spawn, task edit, delivery outcome, and state write, one row
@@ -225,6 +241,8 @@ orchestration) are deliberate:
 - **New agent sources**: add a `scan_*` function in `sessions.rs`.
 - **New backend capabilities**: add a `#[tauri::command]` and a typed
   wrapper in `pty.ts` — the frontend never touches IPC directly elsewhere.
-- **Pane awareness** (e.g. "agent is waiting for input" badges): the raw
-  output stream already flows through `Pane`; hook it there or observe it
-  backend-side in `pty.rs`'s reader thread.
+- **Pane awareness** ("agent is waiting for input" badges): realized as
+  attention routing (see above). The backend's `run_attention` scan reads each
+  pane's pty output counter + tail + last-keystroke time (observed in `pty.rs`'s
+  reader thread) and emits an `orch-attention` event the frontend badges panes
+  from; add a new attention source in `attention_tick`.

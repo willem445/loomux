@@ -19,6 +19,7 @@ import {
   detachOutput,
   ptyBackendInfo,
 } from "./pty";
+import { invoke } from "@tauri-apps/api/core";
 import { isAppShortcut } from "./shortcuts";
 import { GitView } from "./gitview";
 import { TasksView } from "./tasksview";
@@ -90,6 +91,8 @@ export interface PaneOptions {
   orchGroup?: string;
   /** "orchestrator" | "worker" | "reviewer". */
   orchRole?: string;
+  /** Agent id, for attention acks (clearing a "needs attention" badge). */
+  orchAgent?: string;
 }
 
 const TERM_THEME = {
@@ -157,6 +160,11 @@ export class Pane {
   private groupOverlay: HTMLElement | null = null;
   private groupBtn: HTMLButtonElement;
   private orchGroup: string | null = null;
+  private orchAgent: string | null = null;
+  /** "needs attention" chip in the header (attention routing #6); hidden until
+   *  the backend flags this pane. */
+  private attnChip: HTMLButtonElement;
+  private attentionReason: string | null = null;
   /** True for agent/command panes (vs plain shells). */
   private launchedCommand = false;
   private shiftTimer: number | undefined;
@@ -177,6 +185,19 @@ export class Pane {
     this.titleEl.title = "Double-click to rename (F2)";
     this.titleEl.addEventListener("dblclick", () => this.startRename());
     header.appendChild(this.titleEl);
+
+    // "Needs attention" chip: clicking it focuses the pane and acknowledges
+    // the signal (clears a latched report backend-side). Hidden until flagged.
+    this.attnChip = document.createElement("button");
+    this.attnChip.className = "pane-attn";
+    this.attnChip.hidden = true;
+    this.attnChip.addEventListener("click", (e) => {
+      e.stopPropagation();
+      this.events.onFocus(this);
+      this.focus();
+      this.acknowledgeAttention();
+    });
+    header.appendChild(this.attnChip);
 
     // Live metadata: current folder + git branch, reported by the shell.
     // The folder chip picks a folder to cd into; the branch chip opens the
@@ -307,7 +328,11 @@ export class Pane {
       return true;
     });
 
-    this.el.addEventListener("mousedown", () => this.events.onFocus(this));
+    this.el.addEventListener("mousedown", () => {
+      this.events.onFocus(this);
+      // Turning to a flagged pane acknowledges it (clears a latched report).
+      this.acknowledgeAttention();
+    });
 
     // Keep the cursor row visible under the git overlay as output arrives.
     this.term.onCursorMove(() => this.scheduleShift());
@@ -321,6 +346,7 @@ export class Pane {
     this.setName(opts.name ?? "shell");
     this.launchedCommand = !!opts.command?.trim();
     if (opts.badge) this.setBadge(opts.badge);
+    if (opts.orchAgent) this.orchAgent = opts.orchAgent;
     if (opts.orchGroup) {
       this.orchGroup = opts.orchGroup;
       // The board lives on the orchestrator's pane; workers report there.
@@ -447,6 +473,41 @@ export class Pane {
     this.el.style.setProperty("--group-color", badge.color);
     this.el.classList.add("grouped");
     this.titleEl.before(chip);
+  }
+
+  /** Short label per attention reason (see the backend `AttentionItem`). */
+  private static ATTN_LABEL: Record<string, string> = {
+    blocked: "⚠ blocked",
+    waiting: "⚠ waiting",
+    report: "✓ reported",
+    gate: "⚑ your call",
+  };
+
+  /** Flag (or clear) this pane as needing the human — driven by the backend
+   *  attention scan. Idempotent: a same-reason repeat is a no-op, so the 3-second
+   *  re-emits don't thrash the DOM. `null` clears the badge. */
+  setAttention(reason: string | null, detail?: string): void {
+    if (reason === this.attentionReason) return;
+    this.attentionReason = reason;
+    if (!reason) {
+      this.attnChip.hidden = true;
+      this.el.classList.remove("needs-attention");
+      delete this.attnChip.dataset.reason;
+      return;
+    }
+    this.attnChip.textContent = Pane.ATTN_LABEL[reason] ?? "⚠ attention";
+    this.attnChip.title = detail ?? "This pane needs you";
+    this.attnChip.dataset.reason = reason;
+    this.attnChip.hidden = false;
+    this.el.classList.add("needs-attention");
+  }
+
+  /** The human is now on this pane: clear a latched report backend-side so its
+   *  badge drops. Live reasons (waiting/gate) are recomputed and reappear only
+   *  if still true. */
+  private acknowledgeAttention(): void {
+    if (!this.attentionReason || !this.orchAgent) return;
+    invoke("orch_ack_attention", { agentId: this.orchAgent }).catch(() => {});
   }
 
   /** Handle an OSC 7 working-directory report from the shell. Payloads are

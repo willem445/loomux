@@ -82,6 +82,31 @@ export function badgeFor(req: OrchSpawnRequest): PaneBadge {
   };
 }
 
+/** One pane that needs the human, from the backend attention scan. `reason`
+ *  is (most→least urgent) "blocked" | "waiting" | "report" | "gate". */
+export interface AttentionItem {
+  agent_id: string;
+  group: string;
+  name: string;
+  role: OrchRole;
+  pty_id: number | null;
+  reason: string;
+  detail: string;
+}
+
+/** The human focused/handled an attention-badged pane: clear its latched
+ *  report backend-side so the badge drops. */
+export const ackAttention = (agentId: string): Promise<void> =>
+  invoke("orch_ack_attention", { agentId });
+
+/** Whether desktop notifications are enabled for a group. */
+export const notifyEnabled = (groupId: string): Promise<boolean> =>
+  invoke<boolean>("orch_notify_enabled", { groupId });
+
+/** Enable/disable desktop notifications for a group (durable, per-group). */
+export const setNotify = (groupId: string, enabled: boolean): Promise<void> =>
+  invoke("orch_set_notify", { groupId, enabled });
+
 async function openAgentPane(
   grid: Grid,
   paneEvents: PaneEvents,
@@ -95,6 +120,7 @@ async function openAgentPane(
       badge: badgeFor(req),
       orchGroup: req.group_id,
       orchRole: req.role,
+      orchAgent: req.agent_id,
     },
     paneEvents,
     grid.paneCount >= 2 ? "column" : "row"
@@ -118,6 +144,18 @@ export function initOrchestration(grid: Grid, paneEvents: PaneEvents): void {
     if (pane) {
       grid.setActive(pane);
       pane.focus();
+    }
+  });
+  // Attention routing: the backend pushes the full current set of panes that
+  // need the human every scan; badge each group pane by its pty (absent =
+  // clear). Idempotent per pane, so re-emits every few seconds are cheap.
+  void listen<AttentionItem[]>("orch-attention", ({ payload }) => {
+    const byPty = new Map<number, AttentionItem>();
+    for (const it of payload) if (it.pty_id !== null) byPty.set(it.pty_id, it);
+    for (const pane of grid.panes()) {
+      if (!pane.orchGroupId || pane.ptyId === null) continue;
+      const it = byPty.get(pane.ptyId);
+      pane.setAttention(it ? it.reason : null, it?.detail);
     }
   });
   // End-orchestration: the backend has already killed the group's agents, so

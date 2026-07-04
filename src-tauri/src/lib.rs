@@ -28,6 +28,7 @@ pub fn run() {
             reg.set_self_arc();
             orchestration::start_idle_reaper(reg.clone());
             orchestration::start_watchdog(reg.clone());
+            orchestration::start_attention(reg.clone());
             std::thread::spawn(move || orchestration::mcp::serve(reg));
             Ok(())
         })
@@ -66,6 +67,9 @@ pub fn run() {
             orchestration::orch_pause_group,
             orchestration::orch_resume_group,
             orchestration::orch_group_paused,
+            orchestration::orch_ack_attention,
+            orchestration::orch_notify_enabled,
+            orchestration::orch_set_notify,
             orchestration::orch_group_usage,
             orchestration::orch_group_summary,
             orchestration::orch_end_group,

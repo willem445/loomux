@@ -9,9 +9,10 @@
 use loomux_lib::orchestration::mcp::dispatch;
 use loomux_lib::orchestration::{
     add_trusted_folder, bracketed_paste, cli_ready, create_orchestration_group, idle_should_kill,
-    normalize_remote_web_base, parse_audit_lines, parse_session_cost, resolve_ref_url,
-    rotate_audit_if_needed, spawn_rate_exceeded, strip_ansi, watchdog_should_notify,
-    worktree_cleanup_targets, Caller, Guardrails, OrchRegistry, Role, TaskPatch,
+    normalize_remote_web_base, parse_audit_lines, parse_session_cost, prompt_wait_detected,
+    resolve_ref_url, rotate_audit_if_needed, spawn_rate_exceeded, strip_ansi,
+    watchdog_should_notify, worktree_cleanup_targets, AttentionItem, Caller, Guardrails,
+    OrchRegistry, Role, TaskPatch,
 };
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -1441,6 +1442,232 @@ fn watchdog_stall_resets_when_the_agent_reports_or_messages() {
         &json!({ "name": "message_orchestrator", "arguments": { "text": "checking in" } }));
     assert_eq!(reg.watchdog_tick(FAR + 120_000, &HashMap::new()), vec![w.id.clone()],
         "a message must also reset the stall, then a later silence re-notifies");
+}
+
+// ---------- attention routing: surface which pane needs the human (#6) ----------
+
+/// Group with an orchestrator and one working (tasked) worker; the watchdog is
+/// off (irrelevant here). Returns (reg, tempdir, group, worker id).
+fn attention_setup() -> (OrchRegistry, tempfile::TempDir, String, String) {
+    let (reg, dir) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", watchdog_rails(0)).unwrap();
+    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "do work", false, None).unwrap();
+    (reg, dir, g.id, w.id)
+}
+
+fn no_tails() -> HashMap<String, String> {
+    HashMap::new()
+}
+
+#[test]
+fn prompt_wait_detected_spots_prompts_not_chatter() {
+    // Claude Code permission menu.
+    assert!(prompt_wait_detected(
+        "Do you want to make this edit to lib.rs?\n❯ 1. Yes\n  2. No, tell Claude what to do"
+    ));
+    // Copilot-style allow prompt with a selection pointer.
+    assert!(prompt_wait_detected("? Allow command? ›\n❯ Yes\n  No"));
+    // A bare yes/no confirmation.
+    assert!(prompt_wait_detected("Overwrite the file? (y/n)"));
+    // Folder-trust dialog.
+    assert!(prompt_wait_detected("Do you trust the files in this folder?"));
+    // Normal streaming output is not a prompt.
+    assert!(!prompt_wait_detected(
+        "Running cargo test...\n   Compiling loomux v0.2.0\ntest result: ok. 42 passed"
+    ));
+    // A question merely mentioned mid-explanation is not enough on its own.
+    assert!(!prompt_wait_detected(
+        "I weighed whether to proceed with the refactor and decided it was fine."
+    ));
+    assert!(!prompt_wait_detected(""));
+}
+
+#[test]
+fn attention_flags_idle_with_prompt_only_when_quiet_and_unattended() {
+    let (reg, _d, _g, wid) = attention_setup();
+    let now = 1_000_000_000_000u64;
+    let out: HashMap<String, u64> = [(wid.clone(), 100u64)].into_iter().collect();
+    let prompt: HashMap<String, String> =
+        [(wid.clone(), "Do you want to proceed?\n❯ 1. Yes\n  2. No".to_string())]
+            .into_iter()
+            .collect();
+    let no_input = HashMap::new();
+
+    // First sighting starts the quiet clock — not yet flagged even though the
+    // tail is prompt-shaped (could be a prompt that just appeared, still painting).
+    let first = reg.attention_tick(now, &out, &prompt, &no_input);
+    assert!(first.iter().all(|i| i.reason != "waiting"), "must debounce the first quiet tick");
+
+    // Output stable past the quiet window → idle-with-prompt.
+    let waited = reg.attention_tick(now + 5000, &out, &prompt, &no_input);
+    assert_eq!(
+        waited.iter().filter(|i| i.agent_id == wid && i.reason == "waiting").count(),
+        1,
+        "a quiet pane parked on a prompt needs the human"
+    );
+
+    // The human typing into the pane means they are already on it — suppressed.
+    let typed: HashMap<String, u64> = [(wid.clone(), now + 5000)].into_iter().collect();
+    let while_typing = reg.attention_tick(now + 5000, &out, &prompt, &typed);
+    assert!(
+        while_typing.iter().all(|i| i.reason != "waiting"),
+        "a recent human keystroke suppresses the idle-with-prompt badge"
+    );
+
+    // Fresh output (the CLI is painting again) resets the quiet clock.
+    let grew: HashMap<String, u64> = [(wid.clone(), 200u64)].into_iter().collect();
+    let painting = reg.attention_tick(now + 6000, &grew, &prompt, &no_input);
+    assert!(
+        painting.iter().all(|i| i.reason != "waiting"),
+        "new output is activity, not an idle prompt"
+    );
+}
+
+#[test]
+fn attention_does_not_flag_a_quiet_pane_without_a_prompt() {
+    let (reg, _d, _g, wid) = attention_setup();
+    let now = 1_000_000_000_000u64;
+    let out: HashMap<String, u64> = [(wid.clone(), 100u64)].into_iter().collect();
+    let busy_tail: HashMap<String, String> =
+        [(wid.clone(), "   Compiling loomux\ntest result: ok".to_string())].into_iter().collect();
+    let no_input = HashMap::new();
+    reg.attention_tick(now, &out, &busy_tail, &no_input);
+    let later = reg.attention_tick(now + 60_000, &out, &busy_tail, &no_input);
+    assert!(
+        later.is_empty(),
+        "a quiet pane whose tail is not a prompt must not be flagged, got: {later:?}"
+    );
+}
+
+#[test]
+fn attention_latches_worker_reports_until_ack_or_progress() {
+    let (reg, _d, _g, wid) = attention_setup();
+    let w = reg.agent(&wid).unwrap();
+    let cw = reg.resolve_token(&w.token).unwrap();
+    let now = 1_000_000_000_000u64;
+    let empty = HashMap::new();
+
+    // A blocked report badges the pane "blocked".
+    let _ = dispatch(&reg, &cw, "tools/call",
+        &json!({ "name": "report", "arguments": { "status": "blocked", "summary": "stuck" } }));
+    let flagged = reg.attention_tick(now, &empty, &no_tails(), &empty);
+    assert_eq!(
+        flagged.iter().filter(|i| i.agent_id == wid && i.reason == "blocked").count(),
+        1,
+        "a blocked report must badge the reporting pane"
+    );
+
+    // The human acks (focuses the pane): the latch clears.
+    reg.ack_attention(&wid);
+    assert!(
+        reg.attention_tick(now, &empty, &no_tails(), &empty).iter().all(|i| i.agent_id != wid),
+        "ack must clear the report badge"
+    );
+
+    // A done report badges "report"; a later progress report (worker resumed)
+    // clears it.
+    let _ = dispatch(&reg, &cw, "tools/call",
+        &json!({ "name": "report", "arguments": { "status": "done", "summary": "pr up" } }));
+    assert_eq!(
+        reg.attention_tick(now, &empty, &no_tails(), &empty)
+            .iter()
+            .filter(|i| i.agent_id == wid && i.reason == "report")
+            .count(),
+        1,
+        "a done report awaits the human's review"
+    );
+    let _ = dispatch(&reg, &cw, "tools/call",
+        &json!({ "name": "report", "arguments": { "status": "progress", "summary": "back at it" } }));
+    assert!(
+        reg.attention_tick(now, &empty, &no_tails(), &empty).iter().all(|i| i.agent_id != wid),
+        "a progress report means the worker is active again — no badge"
+    );
+}
+
+#[test]
+fn attention_flags_a_worker_whose_task_is_at_a_human_gate() {
+    let (reg, _d, gid, wid) = attention_setup();
+    let now = 1_000_000_000_000u64;
+    let empty = HashMap::new();
+
+    // A board task assigned to the worker, sitting at the PR merge gate.
+    reg.upsert_task(&gid, "orch", None, TaskPatch {
+        title: Some("ship it".into()),
+        status: Some("pr".into()),
+        assignee: Some(wid.clone()),
+        ..Default::default()
+    })
+    .unwrap();
+    let flagged = reg.attention_tick(now, &empty, &no_tails(), &empty);
+    assert_eq!(
+        flagged.iter().filter(|i| i.agent_id == wid && i.reason == "gate").count(),
+        1,
+        "an assigned task at a human gate must flag its worker's pane"
+    );
+
+    // Approving it (status → done) drops the gate.
+    let tid = reg.tasks(&gid)[0].id.clone();
+    reg.upsert_task(&gid, "orch", Some(&tid),
+        TaskPatch { status: Some("done".into()), ..Default::default() }).unwrap();
+    assert!(
+        reg.attention_tick(now, &empty, &no_tails(), &empty).iter().all(|i| i.agent_id != wid),
+        "an off-gate task no longer flags its worker"
+    );
+}
+
+#[test]
+fn attention_toasts_once_per_onset_only_for_optin_groups() {
+    let (reg, _d, gid, wid) = attention_setup();
+    let blocked = vec![AttentionItem {
+        agent_id: wid.clone(),
+        group: gid.clone(),
+        name: "w".into(),
+        role: Role::Worker,
+        pty_id: None,
+        reason: "blocked",
+        detail: "stuck".into(),
+    }];
+
+    // Notifications off by default → nothing toasts.
+    assert!(reg.attention_toast_targets(&blocked).is_empty(), "no toasts until opted in");
+
+    // Opt in → the blocked event toasts once, then dedups for the same stall.
+    reg.set_notify(&gid, true).unwrap();
+    assert_eq!(reg.attention_toast_targets(&blocked), vec![wid.clone()]);
+    assert!(
+        reg.attention_toast_targets(&blocked).is_empty(),
+        "the same reason must not re-toast every scan"
+    );
+
+    // A persistent gate state never toasts — the board highlight covers it.
+    let gate = vec![AttentionItem { reason: "gate", ..blocked[0].clone() }];
+    assert!(reg.attention_toast_targets(&gate).is_empty(), "gate is not a toastable event");
+}
+
+#[test]
+fn notify_optin_is_durable_across_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let gid;
+    {
+        let reg = OrchRegistry::new(dir.path().to_path_buf());
+        reg.set_port(45999);
+        let g = reg.create_group("C:/tmp/repo", watchdog_rails(0)).unwrap();
+        gid = g.id.clone();
+        assert!(!reg.notify_enabled(&gid), "off by default");
+        reg.set_notify(&gid, true).unwrap();
+        assert!(reg.notify_enabled(&gid));
+    }
+    // A fresh registry over the same root re-seeds the opt-in from the marker.
+    let reg2 = OrchRegistry::new(dir.path().to_path_buf());
+    reg2.set_port(45999);
+    let g2 = reg2.create_group("C:/tmp/repo", watchdog_rails(0)).unwrap();
+    assert_eq!(g2.id, gid);
+    assert!(reg2.notify_enabled(&gid), "notification opt-in must survive a restart");
+
+    // Turning it off removes the marker.
+    reg2.set_notify(&gid, false).unwrap();
+    assert!(!reg2.notify_enabled(&gid));
 }
 
 #[test]
