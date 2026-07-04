@@ -19,14 +19,16 @@ restores Claude Code and GitHub Copilot CLI sessions straight into a pane.
 **npm (any platform)** — if you already have Node 18+:
 
 ```sh
-npx loomux              # download + launch in one shot
-npm install -g loomux   # then run `loomux` anytime
+npx loomux-desktop            # download + launch in one shot
+npm install -g loomux-desktop # then run `loomux` anytime
 ```
 
-The `loomux` npm package is a tiny, dependency-free launcher: it fetches the
-matching release asset for your platform (Windows installer, macOS `.dmg`, or
-Linux `AppImage`), installs/caches it, and launches it. Pass `--reinstall` to
-force a fresh download.
+The `loomux-desktop` npm package is a tiny, dependency-free launcher: it
+fetches the matching release asset for your platform (Windows installer, macOS
+`.dmg`, or Linux `AppImage`), installs/caches it, and launches it. Pass
+`--reinstall` to force a fresh download. (The package is named `loomux-desktop`
+because the bare `loomux` name on npm belongs to an unrelated tmux tool; the
+command it installs is still `loomux`.)
 
 **Windows**
 
