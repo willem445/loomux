@@ -31,6 +31,10 @@ sysinfo = "0.33"
 # per-engine utilization + dedicated VRAM usage for any WDDM adapter (AMD,
 # Intel, NVIDIA); DXGI reports total VRAM and the adapter name.
 [target.'cfg(windows)'.dependencies]
+# Fresh PATH resolution from the registry, so CLIs installed while loomux
+# (or its parent terminal) is already running are still found by new panes
+# and probes. Pure windows-sys underneath — no getrandom (see note above).
+winreg = "0.55"
 windows = { version = "0.57", features = [
     "Win32_Foundation",
     "Win32_System_Performance",

@@ -170,6 +170,11 @@ fn build_command(command: Option<String>, cwd: Option<String>) -> CommandBuilder
     }
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
+    // Fresh PATH from the registry: CLIs installed after loomux (or its
+    // parent terminal) started must still be findable in new panes.
+    if let Some(path) = crate::winpath::fresh_path() {
+        cmd.env("PATH", path);
+    }
     cmd
 }
 

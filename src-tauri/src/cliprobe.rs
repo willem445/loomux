@@ -107,6 +107,11 @@ fn run_help(program: &str) -> Result<String, String> {
         c.args(["-lc", &format!("{program} --help")]);
         c
     };
+    // Fresh PATH: a CLI installed after loomux started must still probe as
+    // available (its dir is already in the registry PATH).
+    if let Some(path) = crate::winpath::fresh_path() {
+        cmd.env("PATH", path);
+    }
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -114,12 +119,19 @@ fn run_help(program: &str) -> Result<String, String> {
         .spawn()
         .map_err(|e| e.to_string())?;
 
-    // Drain stdout on a thread (help can exceed the pipe buffer) while we
-    // poll for exit with a deadline.
+    // Drain both pipes on threads (help can exceed the pipe buffer) while
+    // we poll for exit with a deadline. Stderr matters for diagnosis: the
+    // shell's "not recognized" complaint lands there.
     let mut stdout = child.stdout.take().unwrap();
     let reader = std::thread::spawn(move || {
         let mut buf = String::new();
         let _ = stdout.read_to_string(&mut buf);
+        buf
+    });
+    let mut stderr = child.stderr.take().unwrap();
+    let err_reader = std::thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = stderr.read_to_string(&mut buf);
         buf
     });
     let deadline = Instant::now() + HELP_TIMEOUT;
@@ -128,7 +140,16 @@ fn run_help(program: &str) -> Result<String, String> {
             Ok(Some(status)) => {
                 let out = reader.join().unwrap_or_default();
                 if out.trim().is_empty() && !status.success() {
-                    return Err(format!("`{program} --help` failed (exit {:?})", status.code()));
+                    let err = err_reader.join().unwrap_or_default();
+                    let first = err.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+                    if first.contains("not recognized") || first.contains("not found") {
+                        return Err(format!("'{program}' was not found on PATH"));
+                    }
+                    return Err(format!(
+                        "`{program} --help` failed (exit {:?}){}",
+                        status.code(),
+                        if first.is_empty() { String::new() } else { format!(": {first}") }
+                    ));
                 }
                 return Ok(out);
             }

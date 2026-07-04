@@ -1,5 +1,6 @@
 mod cliprobe;
 mod git;
+mod winpath;
 mod metrics;
 pub mod orchestration; // pub: integration smoke test links through it
 mod pty;

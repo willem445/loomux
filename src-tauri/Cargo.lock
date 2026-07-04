@@ -1772,6 +1772,7 @@ dependencies = [
  "tempfile",
  "tiny_http",
  "windows 0.57.0",
+ "winreg 0.55.0",
 ]
 
 [[package]]
