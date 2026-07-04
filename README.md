@@ -135,7 +135,16 @@ list icon) showing the group's work queue — status per item (`queued`,
 `in-progress`, `review`, `pr`, `human-testing`, `done`, `blocked`), issue/PR
 links, notes, and priority order. You can add, edit, annotate, reorder, and
 delete tasks; the orchestrator is notified of your edits and maintains the
-same board through its tools.
+same board through its tools. Issue and PR chips are **clickable** — they open
+in your browser.
+
+**Merge gate:** when an item reaches `pr` or `human-testing` — the point where
+only you can decide — the board shows two buttons instead of making you type
+into the orchestrator. **✓ Approve** marks the item done and tells the
+orchestrator to merge. **✎ Changes** opens a box for your findings, records
+them on the board, and sends them to the orchestrator to route back to a
+worker. Both land as a message in the orchestrator pane, exactly as if you'd
+written it.
 
 **Audit viewer:** every orchestration pane has an audit toggle (`Alt+A` or
 the history icon) opening the group's `audit.jsonl` as a filterable timeline

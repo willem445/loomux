@@ -213,6 +213,10 @@ pub const TASK_STATUSES: [&str; 7] = [
     "blocked",
 ];
 
+/// Statuses where the human's merge-gate actions (approve / request changes)
+/// apply: the PR is open and awaiting the human's decision.
+pub const MERGE_GATE_STATUSES: [&str; 2] = ["pr", "human-testing"];
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TaskNote {
     pub ts_ms: u64,
@@ -834,6 +838,83 @@ impl OrchRegistry {
         self.write_tasks(group, &ordered)?;
         self.audit(group, actor, "task-reorder", json!({ "order": ids }));
         Ok(())
+    }
+
+    /// Guard the merge-gate actions to items actually at the gate. The UI only
+    /// shows the buttons on `pr`/`human-testing` items, but the command surface
+    /// is callable directly, so enforce it backend-side too — approving a
+    /// `queued` item or requesting changes on a `done` one is meaningless.
+    fn ensure_at_merge_gate(&self, group: &str, id: &str) -> Result<(), String> {
+        let status = self
+            .tasks(group)
+            .into_iter()
+            .find(|t| t.id == id)
+            .ok_or_else(|| format!("unknown task: {id}"))?
+            .status;
+        if MERGE_GATE_STATUSES.contains(&status.as_str()) {
+            Ok(())
+        } else {
+            Err(format!(
+                "task {id} is {status:?}, not at the merge gate — this action only applies to {}",
+                MERGE_GATE_STATUSES.join(" | ")
+            ))
+        }
+    }
+
+    /// Merge-gate approve: mark the item done and tell the orchestrator to
+    /// merge. The status change is the human's direct sign-off, applied here;
+    /// the notice is best-effort (the board is the source of truth).
+    pub fn approve_task(&self, group: &str, id: &str) -> Result<Task, String> {
+        self.ensure_at_merge_gate(group, id)?;
+        let task = self.upsert_task(
+            group,
+            "human",
+            Some(id),
+            TaskPatch {
+                status: Some("done".into()),
+                note: Some("Approved at the merge gate.".into()),
+                ..Default::default()
+            },
+        )?;
+        let pr = task.pr.as_deref().unwrap_or("(no PR ref)");
+        let _ = self.deliver_to_orchestrator(
+            group,
+            &format!(
+                "[loomux] the human APPROVED {} \"{}\" ({}) at the merge gate and marked it done. \
+                 Merge the PR and close out the work item.",
+                task.id, task.title, pr
+            ),
+            "human",
+        );
+        Ok(task)
+    }
+
+    /// Merge-gate request-changes: record the findings as a note and deliver
+    /// them to the orchestrator to route back to a worker. Status is left for
+    /// the orchestrator to manage as it re-dispatches.
+    pub fn request_changes(&self, group: &str, id: &str, findings: &str) -> Result<Task, String> {
+        let findings = findings.trim();
+        if findings.is_empty() {
+            return Err("request changes needs a note describing what to fix".into());
+        }
+        self.ensure_at_merge_gate(group, id)?;
+        let task = self.upsert_task(
+            group,
+            "human",
+            Some(id),
+            TaskPatch { note: Some(format!("Requested changes: {findings}")), ..Default::default() },
+        )?;
+        let pr = task.pr.as_deref().unwrap_or("(no PR ref)");
+        let _ = self.deliver_to_orchestrator(
+            group,
+            &format!(
+                "[loomux] the human REQUESTED CHANGES on {} \"{}\" ({}) at the merge gate. \
+                 Findings: {findings}. Route it back to a worker to address, then re-request review.",
+                task.id, task.title, pr
+            ),
+            "human",
+        );
+        Ok(task)
     }
 
     /// Tell the orchestrator the human touched the board (best-effort; the
@@ -2007,6 +2088,136 @@ pub fn resume_orch_session(
     resume_recorded_session(reg.inner(), &session_id, hint)
 }
 
+// ---------- merge-gate link resolution ----------
+// The board stores issue/PR references as the orchestrator typed them
+// (`#12`, a bare number, or a full URL). To make the chips clickable we
+// resolve those to a web URL against the repo's `origin` remote.
+
+/// Normalize a git remote URL (`git@`, `ssh://`, `https://`, with or without
+/// a trailing `.git`) into its browsable web base, e.g.
+/// `https://github.com/owner/repo`. None for anything that doesn't look like
+/// a host/path we can turn into a link.
+#[doc(hidden)] // pub for integration tests
+pub fn normalize_remote_web_base(url: &str) -> Option<String> {
+    let u = url.trim();
+    if u.is_empty() {
+        return None;
+    }
+    // Split into host and path, covering the three shapes git emits.
+    let (host, path) = if let Some(rest) = u
+        .strip_prefix("https://")
+        .or_else(|| u.strip_prefix("http://"))
+        .or_else(|| u.strip_prefix("ssh://"))
+    {
+        // scheme://[user@]host[:port]/owner/repo
+        let rest = rest.split_once('@').map(|(_, r)| r).unwrap_or(rest);
+        let (host, path) = rest.split_once('/')?;
+        // Drop any :port from the host part (ssh URLs may carry one).
+        let host = host.split(':').next().unwrap_or(host);
+        (host.to_string(), path.to_string())
+    } else if let Some(rest) = u.strip_prefix("git@") {
+        // scp-like: git@host:owner/repo.git
+        let (host, path) = rest.split_once(':')?;
+        (host.to_string(), path.to_string())
+    } else {
+        return None;
+    };
+    let host = host.trim().trim_end_matches('/');
+    let path = path.trim().trim_start_matches('/').trim_end_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    if host.is_empty() || path.is_empty() || !host.contains('.') {
+        return None;
+    }
+    Some(format!("https://{host}/{path}"))
+}
+
+/// Web base for a repo's `origin` remote (falling back to any remote), or
+/// None when the repo has no usable remote.
+fn git_remote_web_base(repo: &str) -> Option<String> {
+    if !Path::new(repo).is_dir() {
+        return None;
+    }
+    let run = |args: &[&str]| -> Option<String> {
+        let mut cmd = std::process::Command::new("git");
+        cmd.current_dir(repo).args(args).env("GIT_TERMINAL_PROMPT", "0");
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        }
+        let out = cmd.output().ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    let url = run(&["remote", "get-url", "origin"]).or_else(|| {
+        // No `origin` — take the first remote git lists, if any.
+        let name = run(&["remote"])?.lines().next()?.trim().to_string();
+        (!name.is_empty()).then_some(name).and_then(|n| run(&["remote", "get-url", &n]))
+    })?;
+    normalize_remote_web_base(&url)
+}
+
+/// Resolve a stored issue/PR reference to a URL. `value` may already be a
+/// full URL (used verbatim); otherwise it's a `#N`/`N` reference resolved
+/// against `base`. `kind` is `"issue"` or `"pr"`. None when there's nothing
+/// clickable (no number, or a bare number with no known remote).
+#[doc(hidden)] // pub for integration tests
+pub fn resolve_ref_url(base: Option<&str>, kind: &str, value: &str) -> Option<String> {
+    let v = value.trim();
+    if v.starts_with("https://") || v.starts_with("http://") {
+        return Some(v.to_string());
+    }
+    // Pull the first run of digits out of `#12`, `12`, `GH-12`, etc.
+    let num: String = v
+        .chars()
+        .skip_while(|c| !c.is_ascii_digit())
+        .take_while(char::is_ascii_digit)
+        .collect();
+    if num.is_empty() {
+        return None;
+    }
+    // GitHub redirects /issues/N <-> /pull/N, so a kind mismatch still lands.
+    let seg = if kind == "issue" { "issues" } else { "pull" };
+    Some(format!("{}/{seg}/{num}", base?.trim_end_matches('/')))
+}
+
+/// Open an http(s) URL in the user's default browser. The URL is passed to
+/// the OS handler as a single process argument (never a shell line), and is
+/// validated first so a crafted board reference can't smuggle anything.
+fn open_external_url(url: &str) -> Result<(), String> {
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return Err("refusing to open a non-http(s) URL".into());
+    }
+    if url.len() > 2048 || url.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err("unsafe URL".into());
+    }
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        // rundll32 takes the URL as one argument, sidestepping cmd.exe's
+        // `start` metacharacter handling.
+        let mut c = std::process::Command::new("rundll32");
+        c.args(["url.dll,FileProtocolHandler", url]);
+        use std::os::windows::process::CommandExt;
+        c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        c
+    };
+    #[cfg(target_os = "macos")]
+    let mut cmd = {
+        let mut c = std::process::Command::new("open");
+        c.arg(url);
+        c
+    };
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    let mut cmd = {
+        let mut c = std::process::Command::new("xdg-open");
+        c.arg(url);
+        c
+    };
+    cmd.spawn().map(|_| ()).map_err(|e| format!("could not open browser: {e}"))
+}
+
 // ---------- task board (human side) ----------
 // The pane overlay edits the same tasks.json the orchestrator manages via
 // MCP. Human edits are audited as actor "human" and (except reorders, which
@@ -2064,4 +2275,54 @@ pub fn orch_reorder_tasks(
     // No typed notice: reorders come in bursts; board order is read via
     // list_tasks whenever the orchestrator plans.
     reg.reorder_tasks(&group_id, "human", &ids)
+}
+
+// ---------- merge-gate actions (human side) ----------
+// The human's gatekeeping touchpoints on `pr` / `human-testing` items. Each
+// records on the board (audited, actor "human") and delivers a purpose-built
+// typed notice into the orchestrator's CLI so it can act on the decision.
+
+/// Open a task's issue or PR reference in the default browser. `kind` is
+/// `"issue"` or `"pr"`; `value` is the stored reference (`#12`, `12`, or a
+/// full URL).
+#[tauri::command]
+pub fn orch_open_ref(
+    reg: tauri::State<Arc<OrchRegistry>>,
+    group_id: String,
+    kind: String,
+    value: String,
+) -> Result<(), String> {
+    let repo = reg
+        .group(&group_id)
+        .map(|g| g.repo)
+        .or_else(|| reg.load_group_file(&group_id).map(|(repo, _)| repo))
+        .ok_or("unknown group")?;
+    let base = git_remote_web_base(&repo);
+    let url = resolve_ref_url(base.as_deref(), &kind, &value)
+        .ok_or("no URL for this reference — the repo may have no GitHub remote")?;
+    reg.audit(&group_id, "human", "open-ref", json!({ "kind": kind, "url": url }));
+    open_external_url(&url)
+}
+
+/// Approve a merge-gate item: mark it done and notify the orchestrator to
+/// merge. The human's direct sign-off, so the status change is applied here.
+#[tauri::command]
+pub fn orch_approve_task(
+    reg: tauri::State<Arc<OrchRegistry>>,
+    group_id: String,
+    id: String,
+) -> Result<Task, String> {
+    reg.approve_task(&group_id, &id)
+}
+
+/// Request changes on a merge-gate item: record the findings and deliver them
+/// to the orchestrator to route back to a worker.
+#[tauri::command]
+pub fn orch_request_changes(
+    reg: tauri::State<Arc<OrchRegistry>>,
+    group_id: String,
+    id: String,
+    findings: String,
+) -> Result<Task, String> {
+    reg.request_changes(&group_id, &id, &findings)
 }

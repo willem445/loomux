@@ -556,6 +556,39 @@ html, body {
   max-width: 130px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .task-chip.session { font-family: "Cascadia Mono", Consolas, monospace; }
+/* Clickable issue/PR refs (open in browser). */
+.task-chip.link {
+  border: none; font: inherit; font-size: 9.5px; cursor: pointer;
+  color: var(--accent); background: var(--accent-dim);
+}
+.task-chip.link:hover { color: #cdd8f5; text-decoration: underline; }
+
+/* Merge-gate action buttons (approve / request changes). */
+.task-btn.approve, .task-btn.changes {
+  flex: none; height: 18px; font-size: 10px; padding: 0 7px;
+  border: 1px solid transparent; white-space: nowrap;
+}
+.task-btn.approve { color: #b4e878; }
+.task-btn.approve:hover { background: rgba(158, 206, 106, 0.16); border-color: #3d5a2c; }
+.task-btn.changes { color: #e0af68; }
+.task-btn.changes:hover { background: rgba(224, 175, 104, 0.16); border-color: #55452c; }
+
+/* Request-changes modal, scoped inside the task-board overlay. */
+.tasks-dialog {
+  position: absolute; inset: 0; z-index: 5;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(8, 10, 16, 0.55);
+}
+.tasks-dialog-box {
+  width: min(92%, 420px);
+  display: flex; flex-direction: column; gap: 10px;
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: 10px; padding: 14px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+  animation: dlg-in 0.16s var(--ease);
+}
+.tasks-dialog-title { font-weight: 600; font-size: 12px; }
+.tasks-dialog-text { resize: vertical; min-height: 66px; line-height: 1.4; }
 
 .task-notes { padding: 3px 4px 5px 26px; }
 .task-note { display: flex; gap: 8px; padding: 2px 0; font-size: 11px; }

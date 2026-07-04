@@ -144,6 +144,18 @@ intent, not vacuous passes) → design notes + user docs → commit → push →
   review → pr → human-testing → done, plus blocked; notes; priority order), edited by
   the orchestrator via MCP tools and by the human via the pane overlay (Alt+T); each
   side's edits notify the other, and everything is audited.
+- **Merge-gate actions**: on `pr`/`human-testing` items — the exact point where the
+  human gatekeeps — the board overlay exposes the three touchpoints that otherwise
+  meant typing into the orchestrator by hand. Issue/PR chips are clickable and open in
+  the browser (`orch_open_ref` resolves `#N`/`N`/URL against the repo's `origin` remote:
+  `normalize_remote_web_base` + `resolve_ref_url`, both pure/tested; the URL is opened
+  via the OS handler as a single argument, never a shell line). **Approve**
+  (`orch_approve_task`) marks the item done and types an approval notice into the
+  orchestrator to merge; **Request changes** (`orch_request_changes`) collects findings
+  in a modal, records them as a board note, and types them to the orchestrator to route
+  back to a worker (status stays at the gate). Both go through `upsert_task` (audited,
+  actor `human`) and deliver a purpose-built typed notice, staying inside the overlay
+  pattern — no PTY resize.
 - **Per-task sessions**: one task per worker (template-enforced); Claude session ids
   are pre-assigned via `--session-id` and recorded on roster + tasks, so follow-ups
   `spawn_agent(resume_session, cwd)` into the original conversation/workspace.
