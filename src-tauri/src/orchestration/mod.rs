@@ -322,6 +322,11 @@ pub struct OrchRegistry {
     /// Serializes task-board read-modify-write cycles (MCP threads and the
     /// human UI mutate the same tasks.json).
     tasks_lock: Mutex<()>,
+    /// Serializes group creation + orchestrator registration: the group id
+    /// is chosen by liveness, and a group only becomes live once its
+    /// orchestrator is registered — without this, two concurrent launches
+    /// on one repo would share an id.
+    creation: Mutex<()>,
 }
 
 fn now_ms() -> u64 {
@@ -451,12 +456,27 @@ pub(crate) fn group_id_for_repo(repo: &str) -> String {
     format!("{slug}-{:08x}", (h >> 32) as u32 ^ h as u32)
 }
 
+/// Size cap after which the audit log rolls over to `audit.1.jsonl` (one
+/// generation kept). Full prompt texts land in the audit, so it grows fast.
+const AUDIT_ROTATE_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Roll `audit.jsonl` over to `audit.1.jsonl` once it exceeds `cap`.
+/// Factored out so the threshold behavior is testable with a tiny cap.
+#[doc(hidden)] // pub for integration tests
+pub fn rotate_audit_if_needed(dir: &Path, cap: u64) {
+    let path = dir.join("audit.jsonl");
+    if fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > cap {
+        let _ = fs::rename(&path, dir.join("audit.1.jsonl")); // replaces the old generation
+    }
+}
+
 /// Audit-log writer usable from background threads (delivery outcomes)
 /// without holding a registry reference.
 fn append_audit(root: &Path, group: &str, actor: &str, action: &str, detail: Value) {
     let dir = root.join(group);
     let line = json!({ "ts_ms": now_ms(), "actor": actor, "action": action, "detail": detail });
     let _ = fs::create_dir_all(&dir);
+    rotate_audit_if_needed(&dir, AUDIT_ROTATE_BYTES);
     if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(dir.join("audit.jsonl")) {
         let _ = writeln!(f, "{line}");
     }
@@ -561,6 +581,7 @@ impl OrchRegistry {
             seq: AtomicU32::new(0),
             delivery: Mutex::new(HashMap::new()),
             tasks_lock: Mutex::new(()),
+            creation: Mutex::new(()),
         }
     }
 
@@ -790,7 +811,10 @@ impl OrchRegistry {
             status: status.to_string(),
             updated_ms: now_ms(),
         };
-        match list.iter_mut().find(|r| r.id == record.id) {
+        // Match by (id, session): agent ids restart at 1 every app run, so
+        // a bare-id match would overwrite a previous run's record and lose
+        // that session's identity.
+        match list.iter_mut().find(|r| r.id == record.id && r.session == record.session) {
             Some(r) => *r = record,
             None => list.push(record),
         }
@@ -809,9 +833,14 @@ impl OrchRegistry {
     /// groups created before agents.json existed — their session-to-role
     /// mapping lives only in the audit log.
     fn records_from_audit(&self, group: &str) -> Vec<AgentRecord> {
-        let Ok(text) = fs::read_to_string(self.group_dir(group).join("audit.jsonl")) else {
-            return vec![];
-        };
+        // Oldest first so newer spawns win the (id, session) upsert; the
+        // rotated generation holds the older entries.
+        let mut text = String::new();
+        for name in ["audit.1.jsonl", "audit.jsonl"] {
+            if let Ok(t) = fs::read_to_string(self.group_dir(group).join(name)) {
+                text.push_str(&t);
+            }
+        }
         let mut out: Vec<AgentRecord> = Vec::new();
         for line in text.lines() {
             let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
@@ -834,7 +863,7 @@ impl OrchRegistry {
                 status: "unknown".into(),
                 updated_ms: v["ts_ms"].as_u64().unwrap_or(0),
             };
-            match out.iter_mut().find(|r| r.id == record.id) {
+            match out.iter_mut().find(|r| r.id == record.id && r.session == record.session) {
                 Some(r) => *r = record,
                 None => out.push(record),
             }
@@ -842,11 +871,16 @@ impl OrchRegistry {
         out
     }
 
-    /// Roster + audit backfill, deduped by agent id (roster wins).
+    /// Roster + audit backfill, deduped by session (roster wins). Sessions
+    /// are the stable key; agent ids recycle across app runs.
     fn merged_records(&self, group: &str) -> Vec<AgentRecord> {
         let mut records = self.group_records(group);
         for r in self.records_from_audit(group) {
-            if !records.iter().any(|x| x.id == r.id) {
+            let dup = records.iter().any(|x| match (&x.session, &r.session) {
+                (Some(a), Some(b)) => a == b,
+                _ => x.id == r.id,
+            });
+            if !dup {
                 records.push(r);
             }
         }
@@ -1475,9 +1509,17 @@ impl OrchRegistry {
                     }
                 }
             }
+            let submit_sent_ms = now_ms();
             let _ = ptys.write_bytes(pty_id, b"\r");
             for delay in SUBMIT_RETRY_DELAYS {
                 std::thread::sleep(delay);
+                // A human typing in this pane means the box may hold THEIR
+                // half-written text — a blind Enter would submit it.
+                if ptys.last_user_input_ms(pty_id).unwrap_or(0) > submit_sent_ms {
+                    append_audit(&root, &group, "loomux", "submit-retries-skipped",
+                        json!({ "to": agent, "reason": "human typing in pane" }));
+                    break;
+                }
                 if ptys.write_bytes(pty_id, b"\r").is_err() {
                     break;
                 }
@@ -1567,6 +1609,7 @@ impl OrchRegistry {
         self.by_token.lock().unwrap().remove(&snapshot.token);
         if let Some(p) = snapshot.pty_id {
             self.by_pty.lock().unwrap().remove(&p);
+            self.delivery.lock().unwrap().remove(&p);
         }
         let _ = fs::remove_file(
             self.group_dir(&snapshot.group).join("configs").join(format!("{agent_id}.json")),
@@ -1631,19 +1674,56 @@ pub fn create_orchestration(
     orchestrator_model: String,
     auto_ops: bool,
 ) -> Result<SpawnRequest, String> {
-    if !Path::new(&repo).is_dir() {
+    create_orchestration_group(
+        reg.inner(),
+        &repo,
+        Guardrails {
+            max_agents,
+            agent_cli,
+            worker_model,
+            reviewer_model,
+            orchestrator_model,
+            auto_ops,
+        },
+        None,
+        None,
+        initial_workers,
+    )
+}
+
+/// Create (or reattach to) a group and register its orchestrator, under the
+/// creation lock: the group id is picked by liveness, and a group only
+/// becomes live once its orchestrator is registered, so id selection and
+/// registration must be atomic against concurrent launches.
+/// `expect_group` pins restores to their recorded group id.
+pub fn create_orchestration_group(
+    reg: &Arc<OrchRegistry>,
+    repo: &str,
+    guardrails: Guardrails,
+    resume_session: Option<String>,
+    expect_group: Option<&str>,
+    initial_workers: u32,
+) -> Result<SpawnRequest, String> {
+    // Paths are interpolated into a quoted shell line; a quote inside one
+    // would escape it. (Windows filesystems forbid `"` in names; this
+    // guards the Unix builds and hand-typed paths.)
+    if repo.contains('"') {
+        return Err("repository path must not contain a quote character".into());
+    }
+    if !Path::new(repo).is_dir() {
         return Err(format!("repository path does not exist: {repo}"));
     }
-    let group = reg.create_group(&repo, Guardrails {
-        max_agents,
-        agent_cli,
-        worker_model,
-        reviewer_model,
-        orchestrator_model,
-        auto_ops,
-    })?;
-
-    register_orchestrator_pane(reg.inner(), &group, None, initial_workers)
+    let _creation = reg.creation.lock().unwrap();
+    let group = reg.create_group(repo, guardrails)?;
+    if let Some(want) = expect_group {
+        if group.id != want {
+            return Err(format!(
+                "group id mismatch (recorded {want}, resolved {}) — another orchestration is live on this repo",
+                group.id
+            ));
+        }
+    }
+    register_orchestrator_pane(reg, &group, resume_session, initial_workers)
 }
 
 /// Register a group's orchestrator and hand back the pane spec the frontend
@@ -1799,18 +1879,15 @@ pub fn resume_recorded_session(
         let (repo, guardrails) = reg
             .load_group_file(&record.group_id)
             .ok_or("group.json is missing for this orchestration")?;
-        if !Path::new(&repo).is_dir() {
-            return Err(format!("the group repository no longer exists: {repo}"));
-        }
-        let group = reg.create_group(&repo, guardrails)?;
-        if group.id != record.group_id {
-            return Err(format!(
-                "group id mismatch (recorded {}, resolved {}) — another orchestration is live on this repo",
-                record.group_id, group.id
-            ));
-        }
-        return register_orchestrator_pane(reg, &group, Some(session_id.to_string()), 0)
-            .map(Some);
+        return create_orchestration_group(
+            reg,
+            &repo,
+            guardrails,
+            Some(session_id.to_string()),
+            Some(&record.group_id),
+            0,
+        )
+        .map(Some);
     }
 
     // Worker / reviewer: only meaningful inside a live group.

@@ -23,6 +23,10 @@ pub struct PtyHandle {
     killer: Box<dyn ChildKiller + Send + Sync>,
     /// Rolling tail of raw output, teed off the reader thread.
     output: Arc<Mutex<OutputBuf>>,
+    /// Unix-ms of the last HUMAN keystroke (write_pty from the frontend);
+    /// orchestration's write_bytes does not touch it. Lets prompt delivery
+    /// avoid blind-submitting text a human is mid-typing.
+    user_input_ms: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Ring of recent output plus a monotonic byte counter. The counter lets
@@ -67,6 +71,12 @@ impl PtyManager {
         let ptys = self.ptys.lock().unwrap();
         let buf = ptys.get(&id)?.output.lock().unwrap();
         Some(buf.ring.iter().copied().collect())
+    }
+
+    /// Unix-ms of the last human keystroke into this pty (0 = never).
+    pub fn last_user_input_ms(&self, id: u32) -> Option<u64> {
+        let ptys = self.ptys.lock().unwrap();
+        Some(ptys.get(&id)?.user_input_ms.load(Ordering::Relaxed))
     }
 
     /// Monotonic count of bytes this pty has ever produced.
@@ -230,6 +240,7 @@ pub fn spawn_pty(
             writer,
             killer,
             output: output.clone(),
+            user_input_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         },
     );
 
@@ -328,6 +339,13 @@ pub fn pty_backend_info() -> PtyBackendInfo {
 pub fn write_pty(state: State<PtyManager>, id: u32, data: String) -> Result<(), String> {
     let mut ptys = state.ptys.lock().unwrap();
     let pty = ptys.get_mut(&id).ok_or("pty not found")?;
+    pty.user_input_ms.store(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0),
+        Ordering::Relaxed,
+    );
     pty.writer
         .write_all(data.as_bytes())
         .map_err(|e| e.to_string())

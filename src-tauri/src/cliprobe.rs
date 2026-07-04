@@ -184,7 +184,10 @@ fn probe_uncached(program: &str) -> CliProbe {
     }
 }
 
-/// Probe an agent CLI (availability + model list), cached per app run.
+/// Probe an agent CLI (availability + model list). Successful probes are
+/// cached for the app run; failures are NOT — a CLI installed while loomux
+/// is running must become launchable on the next probe (spawns already see
+/// it via fresh-PATH resolution).
 #[tauri::command]
 pub fn probe_agent_cli(program: String) -> CliProbe {
     let program = program.trim().to_lowercase();
@@ -192,7 +195,9 @@ pub fn probe_agent_cli(program: String) -> CliProbe {
         return hit.clone();
     }
     let probe = probe_uncached(&program);
-    cache().lock().unwrap().insert(program, probe.clone());
+    if probe.available {
+        cache().lock().unwrap().insert(program, probe.clone());
+    }
     probe
 }
 

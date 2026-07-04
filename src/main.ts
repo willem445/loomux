@@ -160,6 +160,8 @@ void onPtyExit((exit) => {
   const pane = grid.findByPtyId(exit.id);
   if (!pane) {
     earlyExits.set(exit.id, exit);
+    // A pane that never finishes starting would leak its entry forever.
+    window.setTimeout(() => earlyExits.delete(exit.id), 5 * 60_000);
     return;
   }
   if (pane.keepOpenOnExit(exit)) pane.notifyExited(exit.exit_code);

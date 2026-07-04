@@ -48,6 +48,8 @@ export class TasksView {
   private tasks: OrchTask[] = [];
   /** Task ids with their notes section expanded (survives re-renders). */
   private expanded = new Set<string>();
+  /** A refresh arrived while the human was mid-edit; run it on blur. */
+  private pendingRefresh = false;
   private unlisten: UnlistenFn | null = null;
   private disposed = false;
 
@@ -84,6 +86,13 @@ export class TasksView {
     this.toastEl.hidden = true;
 
     this.el.append(head, this.listEl, foot, this.toastEl);
+
+    // Deferred refreshes (see refresh()) run once the editor loses focus.
+    this.listEl.addEventListener("focusout", () => {
+      window.setTimeout(() => {
+        if (this.pendingRefresh && !this.isEditing()) void this.refresh();
+      }, 0);
+    });
 
     void listen<{ group_id: string }>("orch-tasks-changed", ({ payload }) => {
       if (payload.group_id === this.groupId) void this.refresh();
@@ -122,8 +131,22 @@ export class TasksView {
     }
   }
 
+  /** True while the human is typing in an inline editor inside the list
+   *  (title rename, note input) — re-rendering would destroy their edit. */
+  private isEditing(): boolean {
+    const a = document.activeElement;
+    return !!a && this.listEl.contains(a) && (a.tagName === "INPUT" || a.tagName === "TEXTAREA");
+  }
+
   private async refresh(): Promise<void> {
     if (this.disposed) return;
+    if (this.isEditing()) {
+      // Orchestrator updates mustn't clobber a human's half-typed edit;
+      // the focusout handler re-runs this once they're done.
+      this.pendingRefresh = true;
+      return;
+    }
+    this.pendingRefresh = false;
     try {
       this.tasks = await invoke<OrchTask[]>("orch_tasks", { groupId: this.groupId });
     } catch (err) {

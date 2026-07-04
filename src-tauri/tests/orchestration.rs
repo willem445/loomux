@@ -8,8 +8,8 @@
 
 use loomux_lib::orchestration::mcp::dispatch;
 use loomux_lib::orchestration::{
-    add_trusted_folder, bracketed_paste, cli_ready, strip_ansi, Caller, Guardrails, OrchRegistry,
-    Role, TaskPatch,
+    add_trusted_folder, bracketed_paste, cli_ready, create_orchestration_group,
+    rotate_audit_if_needed, strip_ansi, Caller, Guardrails, OrchRegistry, Role, TaskPatch,
 };
 use serde_json::{json, Value};
 use std::fs;
@@ -474,6 +474,86 @@ fn task_board_tracks_sessions_for_followups() {
     let stored = &reg.tasks(&g.id)[0];
     assert_eq!(stored.session, t.session);
     assert_eq!(stored.assignee.as_deref(), Some("w-1"));
+}
+
+// ---------- review-round regression tests ----------
+
+#[test]
+fn concurrent_same_repo_launches_get_distinct_groups() {
+    use std::sync::Arc;
+    let dir = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    let repo_path = repo.path().to_string_lossy().into_owned();
+    let reg = Arc::new(OrchRegistry::new(dir.path().to_path_buf()));
+    reg.set_port(45999);
+    // The id is chosen by liveness, but the orchestrator that makes a group
+    // live registers after the choice — without the creation lock, two
+    // simultaneous launches share an id and cross-deliver reports.
+    let mut handles = vec![];
+    for _ in 0..2 {
+        let reg = reg.clone();
+        let repo = repo_path.clone();
+        handles.push(std::thread::spawn(move || {
+            create_orchestration_group(&reg, &repo, rails(), None, None, 0).map(|r| r.group_id)
+        }));
+    }
+    let ids: Vec<String> = handles.into_iter().map(|h| h.join().unwrap().unwrap()).collect();
+    assert_ne!(ids[0], ids[1], "concurrent launches on one repo must not share a group");
+}
+
+#[test]
+fn repo_paths_with_quotes_are_rejected() {
+    use std::sync::Arc;
+    let dir = tempfile::tempdir().unwrap();
+    let reg = Arc::new(OrchRegistry::new(dir.path().to_path_buf()));
+    reg.set_port(45999);
+    let err = create_orchestration_group(&reg, "/tmp/evil\" ; rm -rf /", rails(), None, None, 0)
+        .unwrap_err();
+    assert!(err.contains("quote"), "the quote check must fire before anything else, got: {err}");
+}
+
+#[test]
+fn roster_survives_agent_id_recycling_across_restarts() {
+    let dir = tempfile::tempdir().unwrap();
+    let (s1, s2);
+    {
+        let reg = OrchRegistry::new(dir.path().to_path_buf());
+        reg.set_port(45999);
+        let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+        s1 = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap().session_id.unwrap();
+    }
+    {
+        // "Restart": agent ids start over at w-1, colliding with run 1.
+        let reg = OrchRegistry::new(dir.path().to_path_buf());
+        reg.set_port(45999);
+        let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+        s2 = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap().session_id.unwrap();
+    }
+    let reg = OrchRegistry::new(dir.path().to_path_buf());
+    let sessions: Vec<String> = reg.session_roles().into_iter().map(|r| r.session_id).collect();
+    assert!(sessions.contains(&s1), "run 1's session must survive id recycling");
+    assert!(sessions.contains(&s2));
+}
+
+#[test]
+fn audit_rotates_at_cap_and_backfill_reads_both_generations() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = OrchRegistry::new(dir.path().to_path_buf());
+    reg.set_port(45999);
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let gdir = reg.state_root().join(&g.id);
+    // Force a rotation with a tiny cap: the spawn entry moves to audit.1.
+    rotate_audit_if_needed(&gdir, 1);
+    assert!(gdir.join("audit.1.jsonl").is_file(), "rotation must produce the old generation");
+    reg.audit(&g.id, "loomux", "post-rotate", serde_json::json!({}));
+    assert!(gdir.join("audit.jsonl").is_file());
+    // Session mapping still resolves from the rotated generation.
+    let sessions: Vec<String> = reg.session_roles().into_iter().map(|r| r.session_id).collect();
+    assert!(
+        sessions.contains(&w.session_id.unwrap()),
+        "backfill must read rotated audit generations"
+    );
 }
 
 // ---------- durable roster & orchestration restore ----------
