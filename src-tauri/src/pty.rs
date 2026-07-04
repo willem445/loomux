@@ -6,23 +6,46 @@ use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
+
+/// Cap on the per-pty output ring used by orchestration's `get_output` —
+/// enough for a few screens of TUI history without unbounded growth.
+const OUTPUT_RING_CAP: usize = 256 * 1024;
 
 pub struct PtyHandle {
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     killer: Box<dyn ChildKiller + Send + Sync>,
+    /// Rolling tail of raw output, teed off the reader thread.
+    output: Arc<Mutex<OutputBuf>>,
+    /// Unix-ms of the last HUMAN keystroke (write_pty from the frontend);
+    /// orchestration's write_bytes does not touch it. Lets prompt delivery
+    /// avoid blind-submitting text a human is mid-typing.
+    user_input_ms: Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// Ring of recent output plus a monotonic byte counter. The counter lets
+/// orchestration detect "did the CLI echo anything since X?" even when the
+/// ring is saturated at its cap (where lengths stop changing).
+#[derive(Default)]
+pub struct OutputBuf {
+    ring: VecDeque<u8>,
+    total: u64,
 }
 
 #[derive(Default)]
 pub struct PtyManager {
     ptys: Arc<Mutex<HashMap<u32, PtyHandle>>>,
     next_id: AtomicU32,
+    /// Ptys we killed on purpose (pane close, kill_agent): their exit is
+    /// "expected", so the frontend closes the pane instead of keeping it
+    /// open to display an error.
+    expected_exits: Arc<Mutex<HashSet<u32>>>,
 }
 
 impl PtyManager {
@@ -34,12 +57,51 @@ impl PtyManager {
             let _ = h.killer.kill();
         }
     }
+
+    /// Raw write into a pty's stdin; used by orchestration to type prompts
+    /// into agent CLIs so the human sees them verbatim.
+    pub fn write_bytes(&self, id: u32, bytes: &[u8]) -> Result<(), String> {
+        let mut ptys = self.ptys.lock().unwrap();
+        let pty = ptys.get_mut(&id).ok_or("pty not found")?;
+        pty.writer.write_all(bytes).map_err(|e| e.to_string())
+    }
+
+    /// Snapshot of the rolling output tail (raw bytes, ANSI included).
+    pub fn output_tail(&self, id: u32) -> Option<Vec<u8>> {
+        let ptys = self.ptys.lock().unwrap();
+        let buf = ptys.get(&id)?.output.lock().unwrap();
+        Some(buf.ring.iter().copied().collect())
+    }
+
+    /// Unix-ms of the last human keystroke into this pty (0 = never).
+    pub fn last_user_input_ms(&self, id: u32) -> Option<u64> {
+        let ptys = self.ptys.lock().unwrap();
+        Some(ptys.get(&id)?.user_input_ms.load(Ordering::Relaxed))
+    }
+
+    /// Monotonic count of bytes this pty has ever produced.
+    pub fn output_total(&self, id: u32) -> Option<u64> {
+        let ptys = self.ptys.lock().unwrap();
+        let total = ptys.get(&id)?.output.lock().unwrap().total;
+        Some(total)
+    }
+
+    /// Kill one child; the waiter thread reaps it and emits `pty-exit`.
+    pub fn kill(&self, id: u32) {
+        self.expected_exits.lock().unwrap().insert(id);
+        let handle = self.ptys.lock().unwrap().remove(&id);
+        if let Some(mut h) = handle {
+            let _ = h.killer.kill();
+        }
+    }
 }
 
 #[derive(Clone, Serialize)]
 struct ExitPayload {
     id: u32,
     exit_code: Option<u32>,
+    /// True when loomux itself killed the process (pane close, kill_agent).
+    expected: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -134,6 +196,11 @@ fn build_command(command: Option<String>, cwd: Option<String>) -> CommandBuilder
     }
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
+    // Fresh PATH from the registry: CLIs installed after loomux (or its
+    // parent terminal) started must still be findable in new panes.
+    if let Some(path) = crate::winpath::fresh_path() {
+        cmd.env("PATH", path);
+    }
     cmd
 }
 
@@ -165,18 +232,22 @@ pub fn spawn_pty(
     let mut reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
 
     let id = state.next_id.fetch_add(1, Ordering::SeqCst) + 1;
+    let output = Arc::new(Mutex::new(OutputBuf::default()));
     state.ptys.lock().unwrap().insert(
         id,
         PtyHandle {
             master: pair.master,
             writer,
             killer,
+            output: output.clone(),
+            user_input_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         },
     );
 
     // Reader thread: stream output on a single shared channel keyed by id.
     // The frontend router buffers payloads for panes that haven't attached
-    // their handler yet, so no output can be lost at startup.
+    // their handler yet, so no output can be lost at startup. A rolling tail
+    // is teed into the ring for orchestration's `get_output`.
     let out_app = app.clone();
     std::thread::spawn(move || {
         let mut buf = [0u8; 8192];
@@ -184,6 +255,15 @@ pub fn spawn_pty(
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
+                    {
+                        let mut out = output.lock().unwrap();
+                        out.total += n as u64;
+                        out.ring.extend(&buf[..n]);
+                        let overflow = out.ring.len().saturating_sub(OUTPUT_RING_CAP);
+                        if overflow > 0 {
+                            out.ring.drain(..overflow);
+                        }
+                    }
                     let _ = out_app.emit(
                         "pty-output",
                         OutputPayload {
@@ -196,13 +276,20 @@ pub fn spawn_pty(
         }
     });
 
-    // Waiter thread: reap the child, then tear down and notify.
+    // Waiter thread: reap the child, then tear down and notify. Orchestration
+    // learns about agent deaths here (authoritative, even if the frontend
+    // never noticed the pane).
     let ptys = state.ptys.clone();
+    let expected_exits = state.expected_exits.clone();
     std::thread::spawn(move || {
         let status = child.wait();
         ptys.lock().unwrap().remove(&id);
+        let expected = expected_exits.lock().unwrap().remove(&id);
         let exit_code = status.ok().map(|s| s.exit_code());
-        let _ = app.emit("pty-exit", ExitPayload { id, exit_code });
+        if let Some(reg) = app.try_state::<Arc<crate::orchestration::OrchRegistry>>() {
+            reg.on_pty_exit(id, exit_code);
+        }
+        let _ = app.emit("pty-exit", ExitPayload { id, exit_code, expected });
     });
 
     Ok(id)
@@ -252,6 +339,13 @@ pub fn pty_backend_info() -> PtyBackendInfo {
 pub fn write_pty(state: State<PtyManager>, id: u32, data: String) -> Result<(), String> {
     let mut ptys = state.ptys.lock().unwrap();
     let pty = ptys.get_mut(&id).ok_or("pty not found")?;
+    pty.user_input_ms.store(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0),
+        Ordering::Relaxed,
+    );
     pty.writer
         .write_all(data.as_bytes())
         .map_err(|e| e.to_string())
@@ -387,10 +481,7 @@ fn parse_head(head: &str) -> Option<String> {
 pub fn kill_pty(state: State<PtyManager>, id: u32) -> Result<(), String> {
     // Remove first so the handle (and its master side) drops; then signal
     // the child. The waiter thread emits pty-exit once it reaps.
-    let handle = state.ptys.lock().unwrap().remove(&id);
-    if let Some(mut h) = handle {
-        let _ = h.killer.kill();
-    }
+    state.kill(id);
     Ok(())
 }
 

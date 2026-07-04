@@ -2,11 +2,12 @@ import "./styles.css";
 import { Grid } from "./grid";
 import type { Pane, PaneEvents } from "./pane";
 import { SessionBrowser } from "./sessions";
-import { ensureOutputRouter, onPtyExit, type SessionInfo } from "./pty";
+import { ensureOutputRouter, onPtyExit, type PtyExit, type SessionInfo } from "./pty";
 import { matchShortcut } from "./shortcuts";
 import { initStatusBar } from "./statusbar";
 import { AgentLauncher } from "./launcher";
 import { getAgentMode, setAgentMode } from "./agents";
+import { initOrchestration, launchOrchestrator, orchSessionRoles, resumeOrchSession } from "./orchestration";
 
 // Surface unexpected errors as a visible banner instead of a silently
 // broken UI — a user-facing "crash" should always come with a message.
@@ -41,7 +42,7 @@ const paneEvents: PaneEvents = {
 };
 
 // PTYs whose exit event arrived before their pane finished starting.
-const earlyExits = new Set<number>();
+const earlyExits = new Map<number, PtyExit>();
 
 async function openShell(dir: "row" | "column" = "row", relativeTo?: Pane): Promise<Pane> {
   const pane = await grid.openPane({}, paneEvents, dir, relativeTo);
@@ -75,39 +76,73 @@ renderAgentMode();
 
 /** Open a new pane honoring the current mode: agent mode routes through the
  *  launcher dialog; cancelling only falls back to a shell when the grid
- *  would otherwise be empty. */
+ *  would otherwise be empty. The launcher can resolve to one pane, a fleet
+ *  of N panes, or an orchestrator group (which opens its own panes). */
 async function openPane(dir: "row" | "column" = "row", relativeTo?: Pane): Promise<void> {
   if (!agentMode) {
     await openShell(dir, relativeTo);
     return;
   }
-  const spec = await launcher.show();
-  if (spec) {
+  const result = await launcher.show();
+  if (!result) {
+    if (grid.paneCount === 0) await openShell(dir);
+    else grid.activePane?.focus();
+    return;
+  }
+  if (result.kind === "orchestrator") {
+    await launchOrchestrator(grid, paneEvents, result.config);
+    return;
+  }
+  // Alternate split direction pane-to-pane so a fleet lays out as a grid
+  // instead of ever-thinner slivers.
+  let prev = relativeTo;
+  let d = dir;
+  for (const spec of result.specs) {
     const pane = await grid.openPane(
       { name: spec.name, cwd: spec.cwd, command: spec.command },
       paneEvents,
-      dir,
-      relativeTo
+      d,
+      prev
     );
     reapIfExited(pane);
-  } else if (grid.paneCount === 0) {
-    await openShell(dir);
-  } else {
-    grid.activePane?.focus();
+    prev = pane;
+    d = d === "row" ? "column" : "row";
   }
 }
 
 function reapIfExited(pane: Pane): void {
-  if (pane.ptyId !== null && earlyExits.delete(pane.ptyId)) {
-    grid.closePane(pane, false);
-  }
+  if (pane.ptyId === null) return;
+  const exit = earlyExits.get(pane.ptyId);
+  if (!exit) return;
+  earlyExits.delete(pane.ptyId);
+  if (pane.keepOpenOnExit(exit)) pane.notifyExited(exit.exit_code);
+  else grid.closePane(pane, false);
 }
 
-const sessions = new SessionBrowser(sessionsEl, (s: SessionInfo) => {
-  void restoreSession(s);
-});
+const sessions = new SessionBrowser(
+  sessionsEl,
+  (s: SessionInfo) => {
+    void restoreSession(s);
+  },
+  orchSessionRoles
+);
 
 async function restoreSession(s: SessionInfo): Promise<void> {
+  // Recorded orchestration sessions restore into their group — MCP
+  // identity, badges, and task board included — instead of a powerless
+  // plain `--resume`.
+  const orchRole = s.source === "claude" ? sessions.roleFor(s) : undefined;
+  if (orchRole) {
+    try {
+      await resumeOrchSession(grid, paneEvents, s.id, {
+        group: orchRole.group_id,
+        role: orchRole.role,
+      });
+    } catch (err) {
+      showFatal(String(err));
+    }
+    return;
+  }
   const name =
     (s.source === "claude" ? "claude · " : "copilot · ") +
     (s.title.length > 34 ? s.title.slice(0, 34) + "…" : s.title);
@@ -119,11 +154,18 @@ async function restoreSession(s: SessionInfo): Promise<void> {
   reapIfExited(pane);
 }
 
-// When a process exits on its own, retire its pane.
-void onPtyExit(({ id }) => {
-  const pane = grid.findByPtyId(id);
-  if (pane) grid.closePane(pane, false);
-  else earlyExits.add(id);
+// When a process exits on its own, retire its pane — unless it was a
+// command pane dying with an error, which stays open to show the output.
+void onPtyExit((exit) => {
+  const pane = grid.findByPtyId(exit.id);
+  if (!pane) {
+    earlyExits.set(exit.id, exit);
+    // A pane that never finishes starting would leak its entry forever.
+    window.setTimeout(() => earlyExits.delete(exit.id), 5 * 60_000);
+    return;
+  }
+  if (pane.keepOpenOnExit(exit)) pane.notifyExited(exit.exit_code);
+  else grid.closePane(pane, false);
 });
 
 // Global shortcuts (terminals decline these in their key handlers).
@@ -155,6 +197,9 @@ document.addEventListener(
         break;
       case "toggle-git":
         grid.activePane?.toggleGitView();
+        break;
+      case "toggle-tasks":
+        grid.activePane?.toggleTasksView();
         break;
       case "rename-pane":
         grid.activePane?.startRename();
@@ -193,6 +238,9 @@ window.addEventListener("focus", () => grid.activePane?.focus());
 
 // Start streaming CPU/mem/GPU/VRAM into the bottom status bar.
 initStatusBar();
+
+// Orchestration: open badged panes when the backend spawns agents.
+initOrchestration(grid, paneEvents);
 
 void (async () => {
   await ensureOutputRouter();

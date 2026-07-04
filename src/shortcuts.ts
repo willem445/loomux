@@ -9,6 +9,7 @@ export type ShortcutAction =
   | "toggle-sessions"
   | "toggle-agent-mode"
   | "toggle-git"
+  | "toggle-tasks"
   | "rename-pane"
   | "focus-left"
   | "focus-right"
@@ -34,6 +35,7 @@ export function matchShortcut(e: KeyboardEvent): ShortcutAction | null {
       // Alt+G, not Ctrl+Shift+G: WebView2 consumes that as its
       // find-previous accelerator before the page ever sees it.
       case "KeyG": return "toggle-git";
+      case "KeyT": return "toggle-tasks";
     }
   }
   if (e.code === "F2" && !e.ctrlKey && !e.altKey && !e.shiftKey) return "rename-pane";

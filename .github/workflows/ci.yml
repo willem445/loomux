@@ -41,3 +41,7 @@ jobs:
       - name: Check backend
         run: cargo check --locked
         working-directory: src-tauri
+
+      - name: Test backend
+        run: cargo test --locked
+        working-directory: src-tauri

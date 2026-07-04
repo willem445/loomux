@@ -122,6 +122,20 @@ html, body {
   cursor: default; letter-spacing: 0.2px;
 }
 
+/* ---------- orchestration group badges ---------- */
+/* Panes in an orchestration group carry a role chip (ORCH / W / REV) and a
+   shared accent color so the orchestrator and its workers read as one set. */
+.pane-badge {
+  flex: none;
+  font-size: 8.5px; font-weight: 700; letter-spacing: 0.8px;
+  border-radius: 4px; padding: 1.5px 6px;
+  color: #10131f;
+  background: var(--group-color, var(--accent));
+}
+.pane.grouped .pane-header {
+  box-shadow: inset 3px 0 0 var(--group-color, var(--accent));
+}
+
 /* ---------- pane metadata (folder · branch) ---------- */
 .pane-meta {
   flex: 1 1 auto; min-width: 0;
@@ -250,6 +264,9 @@ html, body {
 }
 .session-badge.claude { background: #382d20; color: #e8a865; }
 .session-badge.copilot { background: #20303c; color: #6cb6ff; }
+.session-badge.orch-role.orchestrator { background: #2a2440; color: #c7a9ff; }
+.session-badge.orch-role.worker { background: #1e2a3c; color: #8db0ff; }
+.session-badge.orch-role.reviewer { background: #203527; color: #b4e878; }
 .session-title {
   flex: 1; min-width: 0; font-size: 12.5px;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
@@ -360,6 +377,10 @@ html, body {
 }
 .dlg-row { display: flex; gap: 6px; }
 .dlg-row > input { flex: 1; min-width: 0; }
+.dlg-row > .dlg-field { flex: 1; min-width: 0; }
+.dlg-num { width: 100%; }
+.model-picker { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.model-picker select, .model-picker input { width: 100%; }
 .dlg-input, .dlg-select {
   background: var(--bg-app); color: var(--text);
   border: 1px solid var(--border); border-radius: 7px;
@@ -455,6 +476,88 @@ html, body {
   padding: 6px 14px; font-size: 11.5px;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
+
+/* ---------- task board overlay ---------- */
+.tasks-view {
+  flex: 1; min-height: 0; position: relative;
+  display: flex; flex-direction: column;
+  background: var(--bg-app); font-size: 12px;
+}
+.tasks-head {
+  display: flex; align-items: center; gap: 9px; flex: none;
+  height: 30px; padding: 0 6px 0 12px;
+  border-bottom: 1px solid var(--border-soft);
+}
+.tasks-head .pane-btn { opacity: 1; }
+.tasks-title { font-weight: 600; font-size: 12px; }
+.tasks-group {
+  flex: 1; min-width: 0; color: var(--text-dim); font-size: 10.5px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.tasks-list { flex: 1; overflow-y: auto; padding: 4px 6px 8px; }
+.tasks-list::-webkit-scrollbar { width: 9px; }
+.tasks-list::-webkit-scrollbar-thumb {
+  background: #262634; border-radius: 5px;
+  border: 2px solid var(--bg-app); background-clip: padding-box;
+}
+.tasks-empty { padding: 22px 16px; color: var(--text-dim); line-height: 1.5; }
+.tasks-add {
+  display: flex; gap: 6px; flex: none;
+  padding: 8px 10px; border-top: 1px solid var(--border-soft);
+}
+.tasks-add input { flex: 1; min-width: 0; }
+
+.task-row {
+  display: flex; gap: 6px; align-items: flex-start;
+  padding: 4px 4px 4px 2px; border-radius: 7px;
+}
+.task-row:hover { background: var(--panel); }
+.task-order { display: flex; flex-direction: column; flex: none; }
+.task-btn {
+  background: none; border: none; border-radius: 4px;
+  color: var(--text-dim); font-size: 9px; line-height: 1;
+  min-width: 20px; height: 15px; cursor: pointer; padding: 0 3px;
+}
+.task-btn:hover:not(:disabled) { background: var(--panel-2); color: var(--text); }
+.task-btn:disabled { opacity: 0.25; cursor: default; }
+.task-btn.notes { font-size: 10px; height: 18px; }
+.task-btn.danger:hover { color: var(--danger); }
+.task-main { flex: 1; min-width: 0; }
+.task-top { display: flex; align-items: center; gap: 7px; min-height: 22px; }
+.task-id {
+  flex: none; font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 10px; color: var(--text-dim);
+}
+.task-title {
+  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; color: var(--text); cursor: default;
+}
+.task-title-input { flex: 1; min-width: 0; padding: 2px 7px; font-size: 12px; }
+.task-status {
+  flex: none; font: inherit; font-size: 10px; font-weight: 600;
+  border-radius: 5px; padding: 1.5px 4px; border: 1px solid transparent;
+  background: var(--panel-2); color: var(--text-dim); cursor: pointer;
+}
+.task-status.st-queued { color: var(--text-dim); }
+.task-status.st-in-progress { background: rgba(122, 162, 247, 0.16); color: #a7bff8; }
+.task-status.st-review { background: rgba(187, 154, 247, 0.16); color: #c7a9ff; }
+.task-status.st-pr { background: rgba(224, 175, 104, 0.16); color: #e0af68; }
+.task-status.st-human-testing { background: rgba(125, 207, 255, 0.16); color: #7dcfff; }
+.task-status.st-done { background: rgba(158, 206, 106, 0.16); color: #b4e878; }
+.task-status.st-blocked { background: rgba(247, 118, 142, 0.16); color: #f7899d; }
+.task-chip {
+  flex: none; font-size: 9.5px; border-radius: 4px; padding: 1px 6px;
+  background: var(--panel-2); color: var(--text-dim);
+  max-width: 130px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.task-chip.session { font-family: "Cascadia Mono", Consolas, monospace; }
+
+.task-notes { padding: 3px 4px 5px 26px; }
+.task-note { display: flex; gap: 8px; padding: 2px 0; font-size: 11px; }
+.task-note-meta { flex: none; color: var(--text-dim); font-size: 10px; padding-top: 1px; }
+.task-note-text { min-width: 0; color: var(--text); user-select: text; }
+.task-note-add { display: flex; gap: 6px; margin-top: 5px; }
+.task-note-add input { flex: 1; min-width: 0; padding: 3px 8px; font-size: 11px; }
 
 /* -- graph column -- */
 .git-graph {
