@@ -98,6 +98,24 @@ change, keeping issues (label `agent-managed`) the durable source of truth.
 
 `audit.jsonl`, one JSON object per line: every tool call (actor, tool, args, result),
 prompt delivery (full text), spawn/bind/exit, state writes. Append-only, human-readable.
+Rolls over to `audit.1.jsonl` past 8 MB (one generation kept); full prompt texts land
+here, so it grows fast.
+
+**In-app viewer** (`auditview.ts`, `orch_audit` command): every orchestration pane (not
+just the orchestrator — the log is per-group and read-only) has an `Alt+A` overlay that
+renders the log as a timeline, filterable by actor / action / agent with free-text search
+over the detail, and rows expand to show the verbatim prompt/task text. The backend read
+(`OrchRegistry::audit_log`) concatenates the rotated generation before the current one so
+rotation is invisible to the viewer, parses with a pure, per-line-fault-tolerant
+`parse_audit_lines` (a malformed line never sinks the view), and caps to the most recent
+`AUDIT_VIEW_LIMIT` (5000) entries to bound the payload against a near-8 MB pair. Live-follow
+is frontend polling (`orch_audit` every 1.5 s, sticks to the bottom when the human is
+already there) rather than backend event emission: auditing is best-effort and written from
+several call sites (including background delivery threads via the free `append_audit`), so a
+uniform poll that also absorbs rotation is simpler and more robust than threading an
+`AppHandle` through every writer. The overlay reuses the git/task-board floating mechanics
+(`.git-overlay`) so it never resizes the PTY — a ConPTY resize repaints and duplicates TUI
+frames into scrollback.
 
 ## SW-dev process (encoded in templates, not code)
 

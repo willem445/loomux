@@ -482,6 +482,43 @@ fn append_audit(root: &Path, group: &str, actor: &str, action: &str, detail: Val
     }
 }
 
+/// One parsed audit-log line, for the in-app timeline viewer. Mirrors the
+/// shape written by `append_audit`; `detail` stays an opaque JSON value so the
+/// frontend can render per-action without the backend knowing every schema.
+#[derive(Clone, Debug, Serialize)]
+pub struct AuditEntry {
+    pub ts_ms: u64,
+    pub actor: String,
+    pub action: String,
+    pub detail: Value,
+}
+
+/// Parse audit JSONL text into entries, in file order (oldest first), skipping
+/// malformed lines. Pure so ordering/robustness is testable without touching
+/// the filesystem or a registry.
+#[doc(hidden)] // pub for integration tests
+pub fn parse_audit_lines(text: &str) -> Vec<AuditEntry> {
+    text.lines()
+        .filter_map(|line| {
+            if line.trim().is_empty() {
+                return None;
+            }
+            let v: Value = serde_json::from_str(line).ok()?;
+            Some(AuditEntry {
+                ts_ms: v["ts_ms"].as_u64().unwrap_or(0),
+                actor: v["actor"].as_str().unwrap_or("").to_string(),
+                action: v["action"].as_str().unwrap_or("").to_string(),
+                detail: v.get("detail").cloned().unwrap_or(Value::Null),
+            })
+        })
+        .collect()
+}
+
+/// Upper bound on entries returned to the viewer: the audit grows fast (full
+/// prompt texts) and only the most recent slice is worth rendering. Keeps the
+/// payload bounded even against a rotated + current pair near the 8 MB cap.
+const AUDIT_VIEW_LIMIT: usize = 5000;
+
 fn render_template(tpl: &str, vars: &[(&str, &str)]) -> String {
     let mut out = tpl.to_string();
     for (k, v) in vars {
@@ -615,6 +652,28 @@ impl OrchRegistry {
     /// must never take the orchestration down.
     pub fn audit(&self, group: &str, actor: &str, action: &str, detail: Value) {
         append_audit(&self.root, group, actor, action, detail);
+    }
+
+    /// Read a group's audit timeline for the in-app viewer, oldest first.
+    /// Reads the rotated generation (`audit.1.jsonl`) before the current one
+    /// so a rotation doesn't drop history mid-session, then keeps only the
+    /// most recent `AUDIT_VIEW_LIMIT` entries. Missing files read as empty.
+    pub fn audit_log(&self, group: &str) -> Vec<AuditEntry> {
+        let dir = self.group_dir(group);
+        let mut text = String::new();
+        for name in ["audit.1.jsonl", "audit.jsonl"] {
+            if let Ok(t) = fs::read_to_string(dir.join(name)) {
+                text.push_str(&t);
+                if !text.ends_with('\n') {
+                    text.push('\n'); // guard against a rotated file with no trailing newline
+                }
+            }
+        }
+        let mut entries = parse_audit_lines(&text);
+        if entries.len() > AUDIT_VIEW_LIMIT {
+            entries.drain(0..entries.len() - AUDIT_VIEW_LIMIT);
+        }
+        entries
     }
 
     // ---------- durable state ----------
@@ -1956,6 +2015,14 @@ pub fn resume_orch_session(
 #[tauri::command]
 pub fn orch_tasks(reg: tauri::State<Arc<OrchRegistry>>, group_id: String) -> Vec<Task> {
     reg.tasks(&group_id)
+}
+
+/// Audit-log timeline for the pane's audit-viewer overlay (read-only). Oldest
+/// first; the frontend filters, expands prompt texts, and — in follow mode —
+/// re-polls this command.
+#[tauri::command]
+pub fn orch_audit(reg: tauri::State<Arc<OrchRegistry>>, group_id: String) -> Vec<AuditEntry> {
+    reg.audit_log(&group_id)
 }
 
 #[tauri::command]

@@ -137,6 +137,16 @@ links, notes, and priority order. You can add, edit, annotate, reorder, and
 delete tasks; the orchestrator is notified of your edits and maintains the
 same board through its tools.
 
+**Audit viewer:** every orchestration pane has an audit toggle (`Alt+A` or
+the history icon) opening the group's `audit.jsonl` as a filterable timeline
+— every prompt, spawn, task edit, delivery outcome, and state write, one row
+each. Filter by actor, action, or agent; free-text search the details;
+expand any row to read the full prompt/task text verbatim (the field that
+made this log worth grepping). A **follow** button live-tails new lines, and
+rotation is transparent (the rotated `audit.1.jsonl` generation is read
+alongside the current one). The overlay floats over the terminal like the
+git and task-board views — it never resizes the PTY.
+
 **Per-task sessions:** each worker is scoped to exactly one work item, and
 loomux pre-assigns Claude session ids at spawn, recording them on the
 roster and task board. Follow-ups on a finished task *resume* that worker's
