@@ -35,7 +35,19 @@ const MAX_AGENTS_CEILING: u32 = 12;
 /// How long the frontend gets to open a pane and report its pty id.
 const BIND_TIMEOUT: Duration = Duration::from_secs(20);
 /// Gap between the bracketed paste and the Enter that submits it.
-const PASTE_SUBMIT_DELAY: Duration = Duration::from_millis(300);
+const PASTE_SUBMIT_DELAY: Duration = Duration::from_millis(500);
+
+// Submission discipline: copilot ignores Enter while its agent is running
+// (the pasted text just sits in the input box — observed live with a worker
+// report landing mid-turn), so before pressing Enter the pane must be quiet
+// (turn finished). Enter on an empty box is a no-op in both CLIs, so a
+// couple of spaced blind retries are safe and cover late busy-locks.
+/// Output must be idle this long before Enter is pressed.
+const SUBMIT_QUIET: Duration = Duration::from_millis(1000);
+/// Max time to wait for quiet before pressing Enter anyway.
+const SUBMIT_MAX_WAIT: Duration = Duration::from_secs(45);
+/// Spaced blind Enter retries after the first (no-ops once submitted).
+const SUBMIT_RETRY_DELAYS: [Duration; 2] = [Duration::from_millis(2500), Duration::from_millis(4500)];
 
 // Kickoff readiness: a fixed boot delay loses the race on a loaded machine
 // (a CLI that boots slower than the delay flushes the pasted prompt along
@@ -303,8 +315,10 @@ pub struct OrchRegistry {
     pending_binds: Mutex<HashMap<String, mpsc::Sender<u32>>>,
     port: AtomicU16,
     seq: AtomicU32,
-    /// Serializes typed deliveries so two prompts can't interleave keystrokes.
-    delivery: Arc<Mutex<()>>,
+    /// Per-pane delivery locks so two prompts to the SAME pane can't
+    /// interleave keystrokes, while a slow delivery (waiting out a busy
+    /// CLI) doesn't block deliveries to other panes.
+    delivery: Mutex<HashMap<u32, Arc<Mutex<()>>>>,
     /// Serializes task-board read-modify-write cycles (MCP threads and the
     /// human UI mutate the same tasks.json).
     tasks_lock: Mutex<()>,
@@ -490,7 +504,7 @@ impl OrchRegistry {
             pending_binds: Mutex::new(HashMap::new()),
             port: AtomicU16::new(0),
             seq: AtomicU32::new(0),
-            delivery: Arc::new(Mutex::new(())),
+            delivery: Mutex::new(HashMap::new()),
             tasks_lock: Mutex::new(()),
         }
     }
@@ -970,6 +984,7 @@ impl OrchRegistry {
     /// `report` etc. never prompt). `auto_ops` additionally pre-approves
     /// git/gh commands so the branch→commit→PR flow runs unattended;
     /// everything else still asks the human.
+    #[allow(clippy::too_many_arguments)]
     #[doc(hidden)] // pub for integration tests
     pub fn build_agent_command(
         &self,
@@ -978,6 +993,7 @@ impl OrchRegistry {
         auto_ops: bool,
         cfg: &Path,
         group_dir: &Path,
+        workdir: &Path,
         session: Option<&str>,
         resume: bool,
     ) -> String {
@@ -995,13 +1011,20 @@ impl OrchRegistry {
                 // ParserError before copilot ever runs.
                 // --no-auto-update: a mid-boot self-update restarts the
                 // CLI and flushes anything typed into the first instance.
+                // --add-dir <workdir>: pre-trusts the agent's workspace so
+                // panes don't stall on a folder-trust prompt.
                 let mut cmd = format!(
                     "copilot {resume_flag}--additional-mcp-config \"@{}\" --model {model} \
-                     --add-dir \"{}\" --allow-tool loomux --no-auto-update",
+                     --add-dir \"{}\" --add-dir \"{}\" --allow-tool loomux --no-auto-update",
                     cfg.display(),
-                    group_dir.display()
+                    group_dir.display(),
+                    workdir.display()
                 );
                 if auto_ops {
+                    // Copilot's own unattended mode: autopilot + all tools
+                    // + no path-verification prompts.
+                    cmd.push_str(" --autopilot --allow-all-tools --allow-all-paths");
+                } else {
                     cmd.push_str(" --allow-tool \"shell(git:*)\" --allow-tool \"shell(gh:*)\"");
                 }
                 cmd
@@ -1137,6 +1160,7 @@ impl OrchRegistry {
             group.guardrails.auto_ops,
             &cfg,
             &self.group_dir(group_id),
+            Path::new(&cwd),
             session_id.as_deref(),
             resume,
         );
@@ -1290,7 +1314,13 @@ impl OrchRegistry {
         self.audit(&a.group, from, "prompt", json!({ "to": agent_id, "text": text }));
 
         let paste = bracketed_paste(text);
-        let lock = self.delivery.clone();
+        let lock = self
+            .delivery
+            .lock()
+            .unwrap()
+            .entry(pty_id)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
         let (root, group, agent) = (self.root.clone(), a.group.clone(), a.id.clone());
         std::thread::spawn(move || {
             let _guard = lock.lock().unwrap();
@@ -1361,12 +1391,45 @@ impl OrchRegistry {
                 std::thread::sleep(ECHO_RETRY_DELAY);
             }
             std::thread::sleep(PASTE_SUBMIT_DELAY);
+
+            // Wait for the pane to go quiet before Enter: a busy CLI
+            // (mid-turn) ignores the submit and the prompt would sit in
+            // the input box until a human presses Enter.
+            let submit_start = std::time::Instant::now();
+            let mut last_total = ptys.output_total(pty_id).unwrap_or(0);
+            let mut last_change = std::time::Instant::now();
+            while submit_start.elapsed() < SUBMIT_MAX_WAIT {
+                std::thread::sleep(Duration::from_millis(200));
+                match ptys.output_total(pty_id) {
+                    Some(t) if t != last_total => {
+                        last_total = t;
+                        last_change = std::time::Instant::now();
+                    }
+                    Some(_) => {
+                        if last_change.elapsed() >= SUBMIT_QUIET {
+                            break;
+                        }
+                    }
+                    None => {
+                        append_audit(&root, &group, "loomux", "prompt-failed",
+                            json!({ "to": agent, "reason": "terminal closed before submit" }));
+                        return;
+                    }
+                }
+            }
             let _ = ptys.write_bytes(pty_id, b"\r");
+            for delay in SUBMIT_RETRY_DELAYS {
+                std::thread::sleep(delay);
+                if ptys.write_bytes(pty_id, b"\r").is_err() {
+                    break;
+                }
+            }
             append_audit(&root, &group, "loomux", "prompt-typed", json!({
                 "to": agent,
                 "waited_ms": start.elapsed().as_millis() as u64,
                 "attempts": attempts,
                 "echoed": echoed,
+                "submit_waited_ms": submit_start.elapsed().as_millis() as u64,
             }));
         });
         Ok(())
@@ -1551,6 +1614,7 @@ fn register_orchestrator_pane(
         group.guardrails.auto_ops,
         &cfg,
         &reg.group_dir(&group.id),
+        Path::new(&group.repo),
         session_id.as_deref(),
         resume,
     );
