@@ -27,6 +27,7 @@ pub fn run() {
             // spawn background work (e.g. the copilot session watcher).
             reg.set_self_arc();
             orchestration::start_idle_reaper(reg.clone());
+            orchestration::start_watchdog(reg.clone());
             std::thread::spawn(move || orchestration::mcp::serve(reg));
             Ok(())
         })

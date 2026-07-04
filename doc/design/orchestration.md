@@ -269,10 +269,55 @@ alongside the task board and #7's cost figures.
   doesn't block a kill), and it clears the group's `paused` flag and marker file, so a
   later relaunch on the same repo id starts clean instead of silently resuming paused.
 
+## Stalled-agent watchdog (#10)
+
+Silent-agent recovery used to live only in the orchestrator's prompt ("if a spawned agent
+stays quiet, `get_output` and re-send"). That is best-effort: a busy or distracted
+orchestrator can leave a wedged worker — one whose kickoff was eaten by the boot race, or
+that is blocked on an input prompt — burning a pane indefinitely. Loomux already has the
+primitives to automate the nudge, so the watchdog does, while leaving the *judgment* (what
+to actually do) with the orchestrator.
+
+- **What counts as stalled.** A *working* agent (running worker/reviewer with a task
+  assigned, i.e. `idle_since_ms` clear) that has produced **no terminal output and sent no
+  report** for the group's `watchdog_stall_minutes`. Output is read from the pty's monotonic
+  byte counter (`PtyManager::output_total`, the same counter kickoff-readiness uses), which
+  keeps growing even when the output ring saturates — so "did the CLI emit anything since
+  last tick?" is a cheap integer compare. Silence is measured from `AgentEntry.last_progress_ms`,
+  stamped at spawn and on every activity.
+- **Reuses #7's plumbing.** A background loop (`start_watchdog`, 30s tick, mirrors
+  `start_idle_reaper`) calls `run_watchdog`, which reads every pane's `output_total`
+  (`agent_output_totals`) and hands the snapshot to `watchdog_tick`. Splitting the pty read
+  from the decision keeps the stall / anti-nag / pause logic pure and fixture-testable with
+  synthetic counters (no threads, no real pane) — the same shape as `reap_idle_agents`.
+  The threshold arithmetic is the pure `watchdog_should_notify`; the config knob rides the
+  existing `Guardrails` path (collected by the launcher, 0 = off, clamped in `clamped()`,
+  persisted in `group.json`). Default **on** (10 min) — unlike idle-kill it is non-destructive.
+- **The action.** One typed, audited (`watchdog-stall`) `[loomux]` notice is delivered to the
+  orchestrator (`deliver_to_orchestrator`, actor `loomux`) naming the agent and suggesting
+  `get_output` + re-send of the kickoff. It is advice, not an action: loomux never touches the
+  wedged pane itself.
+- **Anti-nag: one notice per stall.** `AgentEntry.watchdog_notified` latches when a notice
+  fires and is *cleared* on any fresh sign of life — output growth (seen in `watchdog_tick`),
+  a `report` (via `set_agent_idle(false)`'s re-arm), or a `message_orchestrator`
+  (`note_agent_activity`). So a genuinely stuck agent is nudged once; one that moves again and
+  re-stalls earns a new nudge. Output growth also resets `last_progress_ms`, so the clock only
+  ever measures *uninterrupted* silence.
+- **Interactions.** A **paused** group (#7) is skipped wholesale: delivery is suppressed there
+  anyway, and — the subtle part — we must not spend the one-notice budget while paused, so the
+  latch is left untouched and the outstanding stall still earns its first notice on resume
+  (regression-tested). **Dead/reaped** agents (idle-kill or exit) are `Dead`/idle and thus
+  outside the working-agent filter by construction, so a terminated pane is never flagged. The
+  orchestrator is never watchdogged (it is the recipient).
+
 ## Risks / limitations
 
 - Kickoff typing races CLI boot; a fixed delay (4s) + bracketed paste is used. If a
   kickoff is lost the orchestrator can re-`send_prompt` (both are visible in the pane).
+- Watchdog silence is measured from pty *output*, so an agent that sits in a tight
+  redraw/spinner loop (emitting bytes) without making real progress reads as "alive". The
+  watchdog catches wholly-silent stalls (lost kickoff, blocked-on-input), not livelocks;
+  those remain the orchestrator's / human's call via `get_output`.
 - `gh` CLI must be installed/authed for the issue/PR workflow; templates degrade to
   local-only work when it's missing.
 - Registry is in-memory: closing loomux orphans no processes (kill_all) but live agents

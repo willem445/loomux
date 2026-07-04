@@ -40,6 +40,9 @@ export interface OrchestratorConfig {
   /** Cost guardrail: cap on worker/reviewer spawns per rolling hour
    *  (0 = unlimited). */
   maxSpawnsPerHour: number;
+  /** Recovery guardrail: nudge the orchestrator when a working agent goes
+   *  silent (no output, no report) this many minutes (0 = disabled). */
+  watchdogStallMinutes: number;
 }
 
 // Per-group identity: a stable accent color AND a short ordinal tag shown in
@@ -176,6 +179,7 @@ export async function launchOrchestrator(
     autoOps: config.autoOps,
     idleKillMinutes: config.idleKillMinutes,
     maxSpawnsPerHour: config.maxSpawnsPerHour,
+    watchdogStallMinutes: config.watchdogStallMinutes,
   });
   await openAgentPane(grid, paneEvents, spec);
 }

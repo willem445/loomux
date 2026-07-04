@@ -33,6 +33,10 @@ plan around them, don't fight them:
   case" — spawn on demand. If one you needed is killed, spawn a fresh one.
 - **Spawn-rate cap.** Spawns per hour are capped as a runaway backstop; a rejected
   `spawn_agent` says so. Reuse idle agents and pace real work rather than bursting.
+- **Watchdog.** If a working agent produces no terminal output and sends no report for
+  the configured stall window, loomux sends you one `[loomux] watchdog …` notice per stall.
+  Act on it: `get_output` the pane, and if its kickoff was lost or it is wedged, re-send the
+  task with `send_prompt`. The notice repeats only after the agent moves again and re-stalls.
 - **Pause.** The human can pause the group from the pane UI. While paused, loomux delivers
   nothing to any pane (kickoffs, prompts, and worker reports are all suppressed) so agents
   finish their turn and go quiet. On resume, re-sync (`list_tasks`, `list_agents`) — queued
@@ -102,7 +106,8 @@ flow: branch → implement → meaningful tests → design notes/user docs → c
 report ready/progress within a couple of minutes. If one stays silent, `get_output` its
 pane: an idle CLI with an empty input box means its kickoff was lost — re-send the
 task with `send_prompt`. Never assume a spawned agent received its brief until it has
-reported.
+reported. Loomux's watchdog (above) backstops this automatically, but you don't have to
+wait for it — check any agent that has been quiet longer than you'd expect.
 
 When a worker reports a PR:
 1. `spawn_agent(kind: "reviewer", ...)` (or reuse an idle reviewer) with the PR number.
