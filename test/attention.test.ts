@@ -1,0 +1,25 @@
+// Unit tests for the pure attention-routing presentation mapping shared by the
+// pane header chip and the minimize-dock chip. Run with `npm test`.
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { attentionPresentation } from "../src/attention.ts";
+
+test("each known reason maps to its label", () => {
+  assert.equal(attentionPresentation("blocked").label, "⚠ blocked");
+  assert.equal(attentionPresentation("waiting").label, "⚠ waiting");
+  assert.equal(attentionPresentation("report").label, "✓ reported");
+  assert.equal(attentionPresentation("gate").label, "⚑ your call");
+});
+
+test("only 'blocked' is urgent", () => {
+  assert.equal(attentionPresentation("blocked").urgent, true);
+  for (const reason of ["waiting", "report", "gate"]) {
+    assert.equal(attentionPresentation(reason).urgent, false, `${reason} not urgent`);
+  }
+});
+
+test("an unknown reason falls back to a generic, non-urgent badge", () => {
+  const p = attentionPresentation("some-future-reason");
+  assert.equal(p.label, "⚠ attention");
+  assert.equal(p.urgent, false);
+});

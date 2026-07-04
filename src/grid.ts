@@ -67,6 +67,12 @@ export class Grid {
     return [...this.leaves.keys()];
   }
 
+  /** Every pane the grid owns, visible and minimized — used by group-wide
+   *  scans (e.g. attention routing) that must reach docked panes too. */
+  allPanes(): Pane[] {
+    return [...this.leaves.keys(), ...this.minimizedPanes];
+  }
+
   findByPtyId(ptyId: number): Pane | undefined {
     return (
       this.panes().find((p) => p.ptyId === ptyId) ??
@@ -146,6 +152,7 @@ export class Grid {
     const minIdx = this.minimizedPanes.indexOf(pane);
     if (minIdx >= 0) {
       this.minimizedPanes.splice(minIdx, 1);
+      pane.setAttentionListener(null);
       pane.dispose(killBackend);
       this.renderDock();
       return;
@@ -313,6 +320,9 @@ export class Grid {
     this.leaves.delete(pane);
     this.removeFromTree(leaf);
     this.minimizedPanes.push(pane);
+    // While docked the pane's header is out of the DOM, so mirror any
+    // attention change onto its dock chip (attention routing #6).
+    pane.setAttentionListener(() => this.renderDock());
     if (this.active === pane) {
       this.active = null;
       const next = this.panes()[0];
@@ -329,6 +339,11 @@ export class Grid {
     if (idx < 0) return;
     if (this.maximized) this.exitMaximize();
     this.minimizedPanes.splice(idx, 1);
+    pane.setAttentionListener(null);
+    // Restoring a docked pane is "turning to it" — clear a latched attention
+    // report the same way clicking a pane does; live reasons re-badge its
+    // header on the next scan.
+    pane.acknowledgeAttention();
     const leaf: LeafNode = { kind: "leaf", pane, parent: null };
     this.leaves.set(pane, leaf);
     pane.el.style.flex = "1 1 0";
@@ -361,11 +376,21 @@ export class Grid {
     for (const pane of this.minimizedPanes) {
       const chip = document.createElement("button");
       chip.className = "dock-chip";
-      chip.title = `Restore ${pane.name}`;
       const accent = pane.accentColor;
       if (accent) chip.style.setProperty("--dock-accent", accent);
       else chip.classList.add("plain");
       chip.addEventListener("click", () => this.restore(pane));
+
+      // Surface attention routing (#6) on the chip: a docked worker that needs
+      // the human pulses (red when urgent), so minimizing never hides the ask.
+      const attn = pane.attention;
+      if (attn) {
+        chip.classList.add("needs-attention");
+        chip.classList.toggle("urgent", attn.urgent);
+        chip.title = `${attn.label} — ${attn.detail ?? "needs you"} · restore ${pane.name}`;
+      } else {
+        chip.title = `Restore ${pane.name}`;
+      }
 
       const name = document.createElement("span");
       name.className = "dock-chip-name";

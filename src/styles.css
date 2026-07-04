@@ -167,6 +167,30 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 }
 .dock-chip-close:hover { background: var(--panel); color: var(--danger); }
 
+/* Attention routing (#6) on a docked pane: a leading dot (always visible, so
+   reduced-motion users still get the signal) plus a pulse. Amber by default,
+   red when urgent (blocked) — mirrors the header chip's palette. */
+.dock-chip.needs-attention {
+  --attn-glow: rgba(224, 175, 104, 0.5);
+  border-color: #6a5230; color: #f2c66a;
+  animation: dock-attn-pulse 1.6s ease-in-out infinite;
+}
+.dock-chip.needs-attention.urgent {
+  --attn-glow: rgba(247, 118, 142, 0.55);
+  border-color: rgba(247, 118, 142, 0.5); color: #ff9db0;
+}
+.dock-chip.needs-attention .dock-chip-name::before {
+  content: "●"; margin-right: 6px; font-size: 8px; vertical-align: 1px;
+  color: currentColor;
+}
+@keyframes dock-attn-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 transparent; }
+  50% { box-shadow: 0 0 9px 1px var(--attn-glow); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .dock-chip.needs-attention { animation: none; }
+}
+
 .hint-tip { color: var(--text-dim); font-style: italic; }
 
 /* ---------- split tree ---------- */

@@ -21,6 +21,7 @@ import {
 } from "./pty";
 import { invoke } from "@tauri-apps/api/core";
 import { isAppShortcut } from "./shortcuts";
+import { attentionPresentation } from "./attention";
 import { openInEditor, editorConfigDialog } from "./editor";
 import { GitView } from "./gitview";
 import { TasksView } from "./tasksview";
@@ -175,6 +176,10 @@ export class Pane {
    *  the backend flags this pane. */
   private attnChip: HTMLButtonElement;
   private attentionReason: string | null = null;
+  private attentionDetail: string | null = null;
+  /** Notified when attention state changes; the grid uses it to keep a
+   *  minimized pane's dock chip in sync. */
+  private attentionListener: (() => void) | null = null;
   /** True for agent/command panes (vs plain shells). */
   private launchedCommand = false;
   private shiftTimer: number | undefined;
@@ -526,37 +531,50 @@ export class Pane {
     this.titleEl.before(chip);
   }
 
-  /** Short label per attention reason (see the backend `AttentionItem`). */
-  private static ATTN_LABEL: Record<string, string> = {
-    blocked: "⚠ blocked",
-    waiting: "⚠ waiting",
-    report: "✓ reported",
-    gate: "⚑ your call",
-  };
-
   /** Flag (or clear) this pane as needing the human — driven by the backend
    *  attention scan. Idempotent: a same-reason repeat is a no-op, so the 3-second
    *  re-emits don't thrash the DOM. `null` clears the badge. */
   setAttention(reason: string | null, detail?: string): void {
     if (reason === this.attentionReason) return;
     this.attentionReason = reason;
+    this.attentionDetail = reason ? detail ?? null : null;
     if (!reason) {
       this.attnChip.hidden = true;
       this.el.classList.remove("needs-attention");
       delete this.attnChip.dataset.reason;
-      return;
+    } else {
+      const { label } = attentionPresentation(reason);
+      this.attnChip.textContent = label;
+      this.attnChip.title = detail ?? "This pane needs you";
+      this.attnChip.dataset.reason = reason;
+      this.attnChip.hidden = false;
+      this.el.classList.add("needs-attention");
     }
-    this.attnChip.textContent = Pane.ATTN_LABEL[reason] ?? "⚠ attention";
-    this.attnChip.title = detail ?? "This pane needs you";
-    this.attnChip.dataset.reason = reason;
-    this.attnChip.hidden = false;
-    this.el.classList.add("needs-attention");
+    // A minimized pane's element is detached, so its header chip is invisible;
+    // the listener lets the grid mirror this state onto the dock chip.
+    this.attentionListener?.();
+  }
+
+  /** Current needs-attention state, or null. Lets the grid render an equivalent
+   *  badge on the dock chip while this pane is minimized (its header is out of
+   *  the DOM). */
+  get attention(): { reason: string; label: string; urgent: boolean; detail: string | null } | null {
+    if (!this.attentionReason) return null;
+    const { label, urgent } = attentionPresentation(this.attentionReason);
+    return { reason: this.attentionReason, label, urgent, detail: this.attentionDetail };
+  }
+
+  /** Register a callback fired whenever the attention state changes — used by
+   *  the grid to refresh the dock chip of a minimized pane. */
+  setAttentionListener(fn: (() => void) | null): void {
+    this.attentionListener = fn;
   }
 
   /** The human is now on this pane: clear a latched report backend-side so its
    *  badge drops. Live reasons (waiting/gate) are recomputed and reappear only
-   *  if still true. */
-  private acknowledgeAttention(): void {
+   *  if still true. Public so restoring a docked pane clears it the same way
+   *  turning to a pane does. */
+  acknowledgeAttention(): void {
     if (!this.attentionReason || !this.orchAgent) return;
     invoke("orch_ack_attention", { agentId: this.orchAgent }).catch(() => {});
   }

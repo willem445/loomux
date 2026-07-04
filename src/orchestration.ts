@@ -152,7 +152,9 @@ export function initOrchestration(grid: Grid, paneEvents: PaneEvents): void {
   void listen<AttentionItem[]>("orch-attention", ({ payload }) => {
     const byPty = new Map<number, AttentionItem>();
     for (const it of payload) if (it.pty_id !== null) byPty.set(it.pty_id, it);
-    for (const pane of grid.panes()) {
+    // allPanes(), not panes(): a minimized worker still needs the human, and
+    // its dock chip mirrors the state (see Grid.renderDock / #6).
+    for (const pane of grid.allPanes()) {
       if (!pane.orchGroupId || pane.ptyId === null) continue;
       const it = byPty.get(pane.ptyId);
       pane.setAttention(it ? it.reason : null, it?.detail);
