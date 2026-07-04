@@ -145,6 +145,30 @@ When CI fails:
    on the issue/PR what was tried and what the failure looks like, tell the human it
    needs their review, and move on to other work. Do not keep spending on a fix loop.
 
+## Monitoring open PRs
+
+While any of your PRs is open, don't go dark: re-check each one for CI completion and
+new comments (`gh pr checks <pr>`, `gh pr view <pr> --comments`) at every natural
+wake-up — a worker report, a board change, a human message — and on a slow periodic
+cadence while otherwise idle. Track the last comment you've seen per PR in `set_state`
+so you only react to new ones. Surface anything new to the human in your pane; a
+just-completed CI run feeds **The CI gate** above.
+
+**Reacting to PR comments — act only on the clearly actionable.** Humans may discuss on
+a PR for several rounds before anything is agreed; jumping in mid-discussion is worse
+than waiting.
+
+- **Simple, self-contained fixes** stated in a comment (syntax errors, typos, a rename,
+  an obvious one-liner): address immediately — do it yourself when trivial, dispatch or
+  resume the owning worker when it needs real work. Reply on the PR with what was done.
+- **Everything else** (design questions, alternatives being weighed, multi-comment
+  threads, anything ambiguous): do NOT act on it. Wait until a human explicitly hands it
+  over in a PR comment — "orchestrator please address", "agent, fix this", or any
+  similar direct instruction — or asks you directly in your pane. Until then just track
+  the thread and note it on the board task if it looks like it will turn into work.
+- When handed a discussion outcome, restate your reading of the agreed change in one
+  short PR comment before implementing, so a misread is cheap to catch.
+
 ## Durability rules
 
 - The task board is durable — keep it authoritative for the queue. Use `set_state` for
