@@ -34,11 +34,24 @@ const REVIEWER_TPL: &str = include_str!("templates/reviewer.md");
 const MAX_AGENTS_CEILING: u32 = 12;
 /// How long the frontend gets to open a pane and report its pty id.
 const BIND_TIMEOUT: Duration = Duration::from_secs(20);
-/// Delay before typing a kickoff prompt into a freshly spawned CLI, so the
-/// agent's input box exists by the time the paste arrives.
-const KICKOFF_BOOT_DELAY: Duration = Duration::from_millis(4000);
 /// Gap between the bracketed paste and the Enter that submits it.
 const PASTE_SUBMIT_DELAY: Duration = Duration::from_millis(300);
+
+// Kickoff readiness: a fixed boot delay loses the race on a loaded machine
+// (a CLI that boots slower than the delay flushes the pasted prompt along
+// with its startup stdin buffer — observed live with a reviewer spawned
+// while a worker ran cargo test). Instead, watch the pane's output ring and
+// paste only once the CLI has painted its UI and gone quiet.
+/// Minimum wait before even checking (lets the process start writing).
+const READY_MIN_WAIT: Duration = Duration::from_millis(1500);
+/// Output must be idle this long (UI finished painting) to count as ready.
+const READY_QUIET: Duration = Duration::from_millis(1200);
+/// Minimum bytes of output before a CLI can be considered painted.
+const READY_MIN_OUTPUT: usize = 512;
+/// Give up waiting and paste anyway after this long.
+const READY_MAX_WAIT: Duration = Duration::from_secs(25);
+/// Poll interval for the readiness check.
+const READY_POLL: Duration = Duration::from_millis(250);
 /// Upper bound for `set_state` payloads.
 const MAX_STATE_BYTES: usize = 512 * 1024;
 
@@ -330,6 +343,17 @@ fn group_id_for_repo(repo: &str) -> String {
     format!("{slug}-{:08x}", (h >> 32) as u32 ^ h as u32)
 }
 
+/// Audit-log writer usable from background threads (delivery outcomes)
+/// without holding a registry reference.
+fn append_audit(root: &Path, group: &str, actor: &str, action: &str, detail: Value) {
+    let dir = root.join(group);
+    let line = json!({ "ts_ms": now_ms(), "actor": actor, "action": action, "detail": detail });
+    let _ = fs::create_dir_all(&dir);
+    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(dir.join("audit.jsonl")) {
+        let _ = writeln!(f, "{line}");
+    }
+}
+
 fn render_template(tpl: &str, vars: &[(&str, &str)]) -> String {
     let mut out = tpl.to_string();
     for (k, v) in vars {
@@ -396,6 +420,13 @@ pub fn strip_ansi(bytes: &[u8]) -> String {
     out
 }
 
+/// Decide whether a freshly spawned CLI is ready to receive typed input,
+/// from its output volume and how long that output has been stable. Pure so
+/// the thresholds are testable; the polling loop lives in `deliver_prompt`.
+pub fn cli_ready(output_len: usize, quiet_for: Duration, elapsed: Duration) -> bool {
+    elapsed >= READY_MIN_WAIT && output_len >= READY_MIN_OUTPUT && quiet_for >= READY_QUIET
+}
+
 /// Wrap prompt text in a bracketed paste so multi-line prompts land in the
 /// CLI's input box instead of submitting at the first newline. The Enter is
 /// sent separately after `PASTE_SUBMIT_DELAY`.
@@ -454,12 +485,7 @@ impl OrchRegistry {
     /// Append one JSON line to the group's audit log. Best-effort: auditing
     /// must never take the orchestration down.
     pub fn audit(&self, group: &str, actor: &str, action: &str, detail: Value) {
-        let line = json!({ "ts_ms": now_ms(), "actor": actor, "action": action, "detail": detail });
-        let path = self.group_dir(group).join("audit.jsonl");
-        let _ = fs::create_dir_all(self.group_dir(group));
-        if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(path) {
-            let _ = writeln!(f, "{line}");
-        }
+        append_audit(&self.root, group, actor, action, detail);
     }
 
     // ---------- durable state ----------
@@ -916,6 +942,8 @@ impl OrchRegistry {
             ))
         } else if role == Role::Orchestrator {
             (group.repo.clone(), String::new())
+        } else if role == Role::Reviewer {
+            (group.repo.clone(), "You review; you do not create branches or push. Inspect PRs via gh (checking out the PR branch locally is fine).".to_string())
         } else {
             (group.repo.clone(), format!(
                 "Work in the repo itself; create branch '{branch_name}' off the default branch before changing anything. Never commit to the default branch."
@@ -1013,12 +1041,12 @@ impl OrchRegistry {
                     // deliver only the follow-up (if any) instead of the
                     // full kickoff.
                     if !task.trim().is_empty() {
-                        self.deliver_prompt(&agent_id, task, "loomux", KICKOFF_BOOT_DELAY)?;
+                        self.deliver_prompt(&agent_id, task, "loomux", true)?;
                     }
                 } else {
                     let kickoff =
                         self.kickoff_prompt(&self.agent(&agent_id).unwrap(), &group, &branch_note);
-                    self.deliver_prompt(&agent_id, &kickoff, "loomux", KICKOFF_BOOT_DELAY)?;
+                    self.deliver_prompt(&agent_id, &kickoff, "loomux", true)?;
                 }
                 Ok(self.agent(&agent_id).unwrap())
             }
@@ -1062,12 +1090,15 @@ impl OrchRegistry {
 
     /// Type `text` into an agent's CLI: audit, then bracketed paste + Enter
     /// on a background thread (serialized so deliveries never interleave).
+    /// `wait_ready` is for freshly spawned CLIs: the paste is held until the
+    /// pane's output shows the CLI has painted its UI and gone quiet —
+    /// input typed before a CLI's reader attaches is flushed and lost.
     pub fn deliver_prompt(
         &self,
         agent_id: &str,
         text: &str,
         from: &str,
-        boot_delay: Duration,
+        wait_ready: bool,
     ) -> Result<(), String> {
         let a = self.agent(agent_id).ok_or("unknown agent")?;
         if a.status == AgentStatus::Dead {
@@ -1079,15 +1110,46 @@ impl OrchRegistry {
 
         let paste = bracketed_paste(text);
         let lock = self.delivery.clone();
+        let (root, group, agent) = (self.root.clone(), a.group.clone(), a.id.clone());
         std::thread::spawn(move || {
             let _guard = lock.lock().unwrap();
-            std::thread::sleep(boot_delay);
             let ptys = app.state::<crate::pty::PtyManager>();
+
+            let start = std::time::Instant::now();
+            if wait_ready {
+                let mut last_len = 0usize;
+                let mut last_change = std::time::Instant::now();
+                loop {
+                    std::thread::sleep(READY_POLL);
+                    let Some(out) = ptys.output_tail(pty_id) else {
+                        append_audit(&root, &group, "loomux", "prompt-failed",
+                            json!({ "to": agent, "reason": "terminal closed while waiting for CLI to become ready" }));
+                        return;
+                    };
+                    if out.len() != last_len {
+                        last_len = out.len();
+                        last_change = std::time::Instant::now();
+                    }
+                    if cli_ready(last_len, last_change.elapsed(), start.elapsed()) {
+                        break;
+                    }
+                    if start.elapsed() >= READY_MAX_WAIT {
+                        // Paste anyway — better a visible prompt the human
+                        // can re-submit than one silently withheld.
+                        break;
+                    }
+                }
+            }
+
             if ptys.write_bytes(pty_id, &paste).is_err() {
-                return; // pane died between audit and delivery
+                append_audit(&root, &group, "loomux", "prompt-failed",
+                    json!({ "to": agent, "reason": "terminal closed before delivery" }));
+                return;
             }
             std::thread::sleep(PASTE_SUBMIT_DELAY);
             let _ = ptys.write_bytes(pty_id, b"\r");
+            append_audit(&root, &group, "loomux", "prompt-typed",
+                json!({ "to": agent, "waited_ms": start.elapsed().as_millis() as u64 }));
         });
         Ok(())
     }
@@ -1102,7 +1164,7 @@ impl OrchRegistry {
             .find(|a| a.group == group && a.role == Role::Orchestrator && a.status != AgentStatus::Dead)
             .map(|a| a.id.clone())
             .ok_or("no live orchestrator in this group")?;
-        self.deliver_prompt(&orch, text, from, Duration::ZERO)
+        self.deliver_prompt(&orch, text, from, false)
     }
 
     pub fn list_agents(&self, group: &str) -> Value {
@@ -1306,7 +1368,7 @@ pub fn create_orchestration(
         reg2.by_pty.lock().unwrap().insert(pty_id, agent_id.clone());
         reg2.audit(&group2.id, "loomux", "agent-bind", json!({ "agent": agent_id, "pty": pty_id }));
         let kickoff = reg2.kickoff_prompt(&reg2.agent(&agent_id).unwrap(), &group2, "");
-        let _ = reg2.deliver_prompt(&agent_id, &kickoff, "loomux", KICKOFF_BOOT_DELAY);
+        let _ = reg2.deliver_prompt(&agent_id, &kickoff, "loomux", true);
         for i in 0..initial_workers.min(group2.guardrails.max_agents) {
             if let Err(e) = reg2.spawn_agent(&group2.id, Role::Worker, &format!("worker {}", i + 1), "", false, None)
             {

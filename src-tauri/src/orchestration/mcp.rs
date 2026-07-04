@@ -13,7 +13,6 @@ use super::{OrchRegistry, Caller, Role};
 use serde_json::{json, Value};
 use std::io::Read as _;
 use std::sync::Arc;
-use std::time::Duration;
 
 const MAX_BODY: usize = 1024 * 1024;
 
@@ -319,7 +318,7 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             if a.id == caller.agent_id {
                 return Err("cannot send a prompt to yourself".into());
             }
-            reg.deliver_prompt(&a.id, text, &caller.agent_id, Duration::ZERO)?;
+            reg.deliver_prompt(&a.id, text, &caller.agent_id, false)?;
             Ok(format!("prompt delivered to {}", a.id))
         }
         "get_output" => {

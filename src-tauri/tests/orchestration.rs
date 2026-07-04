@@ -8,11 +8,27 @@
 
 use loomux_lib::orchestration::mcp::dispatch;
 use loomux_lib::orchestration::{
-    bracketed_paste, strip_ansi, Caller, Guardrails, OrchRegistry, Role, TaskPatch,
+    bracketed_paste, cli_ready, strip_ansi, Caller, Guardrails, OrchRegistry, Role, TaskPatch,
 };
 use serde_json::{json, Value};
 use std::fs;
 use std::path::Path;
+use std::time::Duration;
+
+#[test]
+fn kickoff_readiness_waits_for_painted_and_quiet_cli() {
+    let s = Duration::from_secs;
+    let ms = Duration::from_millis;
+    // A slow-booting CLI (no output yet) is not ready no matter the elapsed
+    // time inside the window — this is the race that ate a reviewer kickoff.
+    assert!(!cli_ready(0, s(5), s(5)));
+    // Output present but still actively painting (not quiet) → not ready.
+    assert!(!cli_ready(4096, ms(100), s(5)));
+    // Too early to judge, even if output looks settled.
+    assert!(!cli_ready(4096, s(1), ms(800)));
+    // Painted + quiet + past the minimum wait → ready.
+    assert!(cli_ready(4096, s(2), s(3)));
+}
 
 fn rails() -> Guardrails {
     Guardrails {

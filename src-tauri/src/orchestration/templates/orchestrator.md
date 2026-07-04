@@ -81,6 +81,12 @@ in flight), and the definition of done (tests + docs + PR). Workers follow the s
 flow: branch → implement → meaningful tests → design notes/user docs → commit → push →
 `gh pr create` → `report`.
 
+**Silent-agent recovery.** A freshly spawned agent should read its instructions and
+report ready/progress within a couple of minutes. If one stays silent, `get_output` its
+pane: an idle CLI with an empty input box means its kickoff was lost — re-send the
+task with `send_prompt`. Never assume a spawned agent received its brief until it has
+reported.
+
 When a worker reports a PR:
 1. `spawn_agent(kind: "reviewer", ...)` (or reuse an idle reviewer) with the PR number.
 2. When the reviewer reports findings, send them to the worker to address; loop until
