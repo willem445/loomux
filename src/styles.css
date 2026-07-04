@@ -432,6 +432,8 @@ html, body {
   user-select: text;
 }
 .dlg-error.visible { display: block; }
+.dlg-hint { font-size: 11px; line-height: 1.5; color: var(--text-dim); }
+.editor-dialog { width: 400px; }
 .dlg-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 2px; }
 .dlg-btn {
   background: var(--panel-2); color: var(--text-dim);
@@ -459,6 +461,19 @@ html, body {
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 #app-error.visible { display: block; }
+
+/* ---------- transient app toast (non-fatal notices) ---------- */
+.app-toast {
+  position: fixed; left: 50%; bottom: 38px; transform: translateX(-50%);
+  z-index: 100; max-width: 84%;
+  display: none;
+  background: #2a1a20; color: #f7a2b2;
+  border: 1px solid #55303a; border-radius: 8px;
+  padding: 8px 16px; font-size: 12px; cursor: pointer;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.app-toast.info { background: #16202e; color: #a9c6f0; border-color: #2c3e57; }
+.app-toast.visible { display: block; }
 
 /* ---------- git view ---------- */
 /* The git view floats over the top of the terminal rather than shrinking

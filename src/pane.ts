@@ -21,6 +21,7 @@ import {
 } from "./pty";
 import { invoke } from "@tauri-apps/api/core";
 import { isAppShortcut } from "./shortcuts";
+import { openInEditor, editorConfigDialog } from "./editor";
 import { GitView } from "./gitview";
 import { TasksView } from "./tasksview";
 import { AuditView } from "./auditview";
@@ -35,6 +36,9 @@ const GIT_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" st
 // Audit viewer: a clock/history glyph for the group's audit-log timeline.
 const AUDIT_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M2.2 8a5.8 5.8 0 1 1 1.7 4.1"/><path d="M2.2 12.2V8.6H5.8"/><path d="M8 5.2V8l2 1.4"/></svg>`;
 const GROUP_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="3.4" r="1.7"/><circle cx="3.4" cy="11" r="1.7"/><circle cx="12.6" cy="11" r="1.7"/><path d="M8 5.1v3M6.7 9.6 4.5 9.9M9.3 9.6l2.2.3"/></svg>`;
+// "Open in editor": code-brackets glyph. Opens the pane's workspace folder in
+// the user's configured external editor (VS Code, Zed, …).
+const EDITOR_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M6 4.5 2.5 8 6 11.5M10 4.5 13.5 8 10 11.5"/></svg>`;
 
 /** Extract a filesystem path from an OSC 7 payload, which may be a raw path
  *  or a `file://host/path` URL. Returns "" if nothing usable. */
@@ -253,6 +257,24 @@ export class Pane {
       this.toggleGroupView();
     });
     header.appendChild(this.groupBtn);
+
+    // Open the pane's workspace folder in the configured external editor.
+    // Left-click opens (prompting for the editor on first use); right-click
+    // reconfigures the editor command.
+    const editorBtn = document.createElement("button");
+    editorBtn.className = "pane-btn";
+    editorBtn.innerHTML = EDITOR_ICON;
+    editorBtn.title = "Open in editor (Alt+E) · right-click to configure";
+    editorBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      void this.openInEditor();
+    });
+    editorBtn.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      void editorConfigDialog().then(() => this.focus());
+    });
+    header.appendChild(editorBtn);
 
     const gitBtn = document.createElement("button");
     gitBtn.className = "pane-btn";
@@ -688,6 +710,14 @@ export class Pane {
       this.groupView.show();
       this.updateTermShift();
     }
+  }
+
+  /** Open this pane's workspace folder in the configured external editor.
+   *  Prompts for the editor command on first use; errors surface as a toast.
+   *  Uses the shell-reported cwd, falling back to the startup directory. */
+  async openInEditor(): Promise<void> {
+    await openInEditor(this.cwdRaw);
+    this.focus(); // return focus to the terminal after any dialog
   }
 
   /** The orchestration group this pane belongs to, if any (for group-wide

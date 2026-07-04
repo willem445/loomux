@@ -1,4 +1,5 @@
 mod cliprobe;
+mod editor;
 mod git;
 mod winpath;
 mod metrics;
@@ -74,6 +75,7 @@ pub fn run() {
             orchestration::orch_group_summary,
             orchestration::orch_end_group,
             cliprobe::probe_agent_cli,
+            editor::open_in_editor,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {
