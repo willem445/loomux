@@ -52,6 +52,20 @@ const READY_MIN_OUTPUT: usize = 512;
 const READY_MAX_WAIT: Duration = Duration::from_secs(25);
 /// Poll interval for the readiness check.
 const READY_POLL: Duration = Duration::from_millis(250);
+
+// Echo verification: a paste that landed makes the TUI redraw its input box
+// (observable as output bytes). A paste that produced no output within the
+// window was flushed by a CLI whose stdin reader wasn't attached yet
+// (observed live with copilot, whose input attaches well after its UI
+// paints) — wait and retype.
+/// How long a paste has to produce echo output before it counts as eaten.
+const ECHO_WINDOW: Duration = Duration::from_millis(2000);
+/// Minimum output growth that counts as the input box echoing the paste.
+const ECHO_MIN_BYTES: u64 = 8;
+/// Pause before retyping after an eaten paste (input attach may be close).
+const ECHO_RETRY_DELAY: Duration = Duration::from_millis(1500);
+/// Total attempts before typing blind and letting the human see the result.
+const ECHO_ATTEMPTS: u32 = 3;
 /// Upper bound for `set_state` payloads.
 const MAX_STATE_BYTES: usize = 512 * 1024;
 
@@ -979,9 +993,11 @@ impl OrchRegistry {
                 // the quotes — the pane shell is PowerShell, where a bare
                 // `@"` opens a here-string and the whole line dies with a
                 // ParserError before copilot ever runs.
+                // --no-auto-update: a mid-boot self-update restarts the
+                // CLI and flushes anything typed into the first instance.
                 let mut cmd = format!(
                     "copilot {resume_flag}--additional-mcp-config \"@{}\" --model {model} \
-                     --add-dir \"{}\" --allow-tool loomux",
+                     --add-dir \"{}\" --allow-tool loomux --no-auto-update",
                     cfg.display(),
                     group_dir.display()
                 );
@@ -1306,15 +1322,52 @@ impl OrchRegistry {
                 }
             }
 
-            if ptys.write_bytes(pty_id, &paste).is_err() {
-                append_audit(&root, &group, "loomux", "prompt-failed",
-                    json!({ "to": agent, "reason": "terminal closed before delivery" }));
-                return;
+            // Echo-verified typing: paste, then require the TUI to emit
+            // output (its input box redrawing). No echo means the CLI
+            // flushed the paste with its startup stdin buffer — retype.
+            let mut echoed = false;
+            let mut attempts = 0u32;
+            while attempts < ECHO_ATTEMPTS {
+                attempts += 1;
+                let Some(before) = ptys.output_total(pty_id) else {
+                    append_audit(&root, &group, "loomux", "prompt-failed",
+                        json!({ "to": agent, "reason": "terminal closed before delivery" }));
+                    return;
+                };
+                if ptys.write_bytes(pty_id, &paste).is_err() {
+                    append_audit(&root, &group, "loomux", "prompt-failed",
+                        json!({ "to": agent, "reason": "terminal closed before delivery" }));
+                    return;
+                }
+                let echo_deadline = std::time::Instant::now() + ECHO_WINDOW;
+                while std::time::Instant::now() < echo_deadline {
+                    std::thread::sleep(Duration::from_millis(150));
+                    match ptys.output_total(pty_id) {
+                        Some(now_total) if now_total >= before + ECHO_MIN_BYTES => {
+                            echoed = true;
+                            break;
+                        }
+                        Some(_) => {}
+                        None => {
+                            append_audit(&root, &group, "loomux", "prompt-failed",
+                                json!({ "to": agent, "reason": "terminal closed during delivery" }));
+                            return;
+                        }
+                    }
+                }
+                if echoed {
+                    break;
+                }
+                std::thread::sleep(ECHO_RETRY_DELAY);
             }
             std::thread::sleep(PASTE_SUBMIT_DELAY);
             let _ = ptys.write_bytes(pty_id, b"\r");
-            append_audit(&root, &group, "loomux", "prompt-typed",
-                json!({ "to": agent, "waited_ms": start.elapsed().as_millis() as u64 }));
+            append_audit(&root, &group, "loomux", "prompt-typed", json!({
+                "to": agent,
+                "waited_ms": start.elapsed().as_millis() as u64,
+                "attempts": attempts,
+                "echoed": echoed,
+            }));
         });
         Ok(())
     }

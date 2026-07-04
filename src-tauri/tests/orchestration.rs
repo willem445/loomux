@@ -239,6 +239,10 @@ fn copilot_command_uses_copilot_adapter_flags() {
     assert!(cmd.contains("--allow-tool loomux"));
     assert!(cmd.contains("--allow-tool \"shell(git:*)\"") && cmd.contains("--allow-tool \"shell(gh:*)\""));
     assert!(cmd.contains("--add-dir \"C:/data/group\""));
+    assert!(
+        cmd.contains("--no-auto-update"),
+        "a mid-boot self-update restarts copilot and eats the kickoff"
+    );
 }
 
 #[test]

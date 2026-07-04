@@ -22,7 +22,16 @@ pub struct PtyHandle {
     writer: Box<dyn Write + Send>,
     killer: Box<dyn ChildKiller + Send + Sync>,
     /// Rolling tail of raw output, teed off the reader thread.
-    output: Arc<Mutex<VecDeque<u8>>>,
+    output: Arc<Mutex<OutputBuf>>,
+}
+
+/// Ring of recent output plus a monotonic byte counter. The counter lets
+/// orchestration detect "did the CLI echo anything since X?" even when the
+/// ring is saturated at its cap (where lengths stop changing).
+#[derive(Default)]
+pub struct OutputBuf {
+    ring: VecDeque<u8>,
+    total: u64,
 }
 
 #[derive(Default)]
@@ -56,8 +65,15 @@ impl PtyManager {
     /// Snapshot of the rolling output tail (raw bytes, ANSI included).
     pub fn output_tail(&self, id: u32) -> Option<Vec<u8>> {
         let ptys = self.ptys.lock().unwrap();
-        let ring = ptys.get(&id)?.output.lock().unwrap();
-        Some(ring.iter().copied().collect())
+        let buf = ptys.get(&id)?.output.lock().unwrap();
+        Some(buf.ring.iter().copied().collect())
+    }
+
+    /// Monotonic count of bytes this pty has ever produced.
+    pub fn output_total(&self, id: u32) -> Option<u64> {
+        let ptys = self.ptys.lock().unwrap();
+        let total = ptys.get(&id)?.output.lock().unwrap().total;
+        Some(total)
     }
 
     /// Kill one child; the waiter thread reaps it and emits `pty-exit`.
@@ -206,7 +222,7 @@ pub fn spawn_pty(
     let mut reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
 
     let id = state.next_id.fetch_add(1, Ordering::SeqCst) + 1;
-    let output = Arc::new(Mutex::new(VecDeque::new()));
+    let output = Arc::new(Mutex::new(OutputBuf::default()));
     state.ptys.lock().unwrap().insert(
         id,
         PtyHandle {
@@ -229,11 +245,12 @@ pub fn spawn_pty(
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     {
-                        let mut ring = output.lock().unwrap();
-                        ring.extend(&buf[..n]);
-                        let overflow = ring.len().saturating_sub(OUTPUT_RING_CAP);
+                        let mut out = output.lock().unwrap();
+                        out.total += n as u64;
+                        out.ring.extend(&buf[..n]);
+                        let overflow = out.ring.len().saturating_sub(OUTPUT_RING_CAP);
                         if overflow > 0 {
-                            ring.drain(..overflow);
+                            out.ring.drain(..overflow);
                         }
                     }
                     let _ = out_app.emit(
