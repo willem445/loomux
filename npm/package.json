@@ -1,0 +1,38 @@
+{
+  "name": "loomux",
+  "version": "0.2.0",
+  "description": "Installer/launcher for Loomux — a sleek terminal multiplexer for AI agent management.",
+  "bin": {
+    "loomux": "bin/loomux.js"
+  },
+  "files": [
+    "bin/"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ],
+  "keywords": [
+    "terminal",
+    "multiplexer",
+    "tmux",
+    "tauri",
+    "ai",
+    "agents",
+    "claude",
+    "copilot"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/willem445/loomux.git"
+  },
+  "homepage": "https://github.com/willem445/loomux#readme",
+  "bugs": {
+    "url": "https://github.com/willem445/loomux/issues"
+  },
+  "author": "willem445"
+}

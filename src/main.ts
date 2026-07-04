@@ -1,4 +1,5 @@
 import "./styles.css";
+import { getVersion } from "@tauri-apps/api/app";
 import { Grid } from "./grid";
 import type { Pane, PaneEvents } from "./pane";
 import { SessionBrowser } from "./sessions";
@@ -235,6 +236,18 @@ window.addEventListener("contextmenu", (e) => {
 // WebView2 can come up without keyboard focus; make sure the active
 // terminal reclaims it whenever the window is (re)focused.
 window.addEventListener("focus", () => grid.activePane?.focus());
+
+// Stamp the running app version into the brand badge (single source of
+// truth: tauri.conf.json). Non-fatal — the badge just stays blank if the
+// backend can't answer.
+void (async () => {
+  try {
+    const el = document.getElementById("app-version");
+    if (el) el.textContent = `v${await getVersion()}`;
+  } catch {
+    /* version is cosmetic; ignore */
+  }
+})();
 
 // Start streaming CPU/mem/GPU/VRAM into the bottom status bar.
 initStatusBar();
