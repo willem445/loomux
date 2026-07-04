@@ -188,6 +188,8 @@ export class AgentLauncher {
   private orchFields: HTMLElement;
   private workersInput: HTMLInputElement;
   private maxAgentsInput: HTMLInputElement;
+  private idleKillInput: HTMLInputElement;
+  private spawnRateInput: HTMLInputElement;
   private workerModel: ModelPicker;
   private reviewerModel: ModelPicker;
   private orchModel: ModelPicker;
@@ -283,6 +285,10 @@ export class AgentLauncher {
     // suggestion list follows the selected agent CLI.
     this.workersInput = numberInput(2, 0, 6);
     this.maxAgentsInput = numberInput(4, 1, 12);
+    // Cost guardrails (0 = off): idle-worker auto-kill timeout and a
+    // spawns-per-hour backstop against a runaway orchestrator.
+    this.idleKillInput = numberInput(0, 0, 1440);
+    this.spawnRateInput = numberInput(0, 0, 240);
     this.workerModel = new ModelPicker();
     this.reviewerModel = new ModelPicker();
     this.orchModel = new ModelPicker();
@@ -303,9 +309,15 @@ export class AgentLauncher {
       field("Worker model", this.workerModel.root),
       field("Reviewer model", this.reviewerModel.root)
     );
+    const guardRow3 = document.createElement("div");
+    guardRow3.className = "dlg-row";
+    guardRow3.append(
+      field("Idle-kill (min, 0=off)", this.idleKillInput),
+      field("Max spawns/hour (0=∞)", this.spawnRateInput)
+    );
     this.orchFields = document.createElement("div");
     this.orchFields.className = "dlg-field";
-    this.orchFields.append(guardRow1, guardRow2, field("Permissions", this.permsSel));
+    this.orchFields.append(guardRow1, guardRow2, guardRow3, field("Permissions", this.permsSel));
 
     this.errorEl = document.createElement("div");
     this.errorEl.className = "dlg-error";
@@ -536,6 +548,8 @@ export class AgentLauncher {
           reviewerModel: this.reviewerModel.value || cli.defaults.reviewer,
           orchestratorModel: this.orchModel.value || cli.defaults.orchestrator,
           autoOps: this.permsSel.value === "auto",
+          idleKillMinutes: intVal(this.idleKillInput, 0),
+          maxSpawnsPerHour: intVal(this.spawnRateInput, 0),
         },
       });
       return;

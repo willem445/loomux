@@ -23,6 +23,7 @@ pub fn run() {
             // Orchestration MCP server: agents connect with per-pane tokens.
             let reg = app.state::<Arc<orchestration::OrchRegistry>>().inner().clone();
             reg.set_app(app.handle().clone());
+            orchestration::start_idle_reaper(reg.clone());
             std::thread::spawn(move || orchestration::mcp::serve(reg));
             Ok(())
         })
@@ -58,6 +59,10 @@ pub fn run() {
             orchestration::orch_open_ref,
             orchestration::orch_approve_task,
             orchestration::orch_request_changes,
+            orchestration::orch_pause_group,
+            orchestration::orch_resume_group,
+            orchestration::orch_group_paused,
+            orchestration::orch_group_usage,
             cliprobe::probe_agent_cli,
         ])
         .on_window_event(|window, event| {
