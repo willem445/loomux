@@ -75,6 +75,7 @@ npm run tauri build  # produce a distributable app / installer
 | Move focus | `Alt+←/→/↑/↓` (or click) |
 | Resize panes | drag the divider between them |
 | Session browser | `Ctrl+Shift+P` (or the *sessions* button) |
+| Open in editor | `Alt+E` (or the `</>` button in a pane header) |
 | Copy / paste | `Ctrl+Shift+C` / `Ctrl+Shift+V` (`Ctrl+V` also works) |
 
 Splitting in the same direction adds a sibling column/row — repeated splits
@@ -91,6 +92,22 @@ Scans the local machine for resumable agent sessions:
 
 Clicking a session opens a new pane in the session's original working
 directory and resumes it there. The pane is auto-named from the session.
+
+### Open in editor
+
+Loomux is a terminal, not an editor — so when you need to open files in a real
+editor, the `</>` button in a pane header (or `Alt+E`) launches your editor on
+that pane's current folder. The first time, you're asked for the editor
+command; it's remembered after that.
+
+- Set it to `code` (VS Code), `zed`, `subl`, or any command on your `PATH`, or
+  to a full path to the editor executable.
+- The workspace folder is passed as the editor's sole argument, spawned
+  detached — the editor keeps running independently of loomux.
+- Right-click the `</>` button any time to change the editor command.
+
+If nothing is configured, or the editor can't be found/launched, loomux shows a
+short toast explaining what went wrong.
 
 ## Agent orchestration
 
