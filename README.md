@@ -62,6 +62,7 @@ run `xattr -cr /Applications/Loomux.app` (the install script does this for you).
 npm install        # once
 npm run tauri dev  # develop (hot-reloads the UI)
 npm run tauri build  # produce a distributable app / installer
+npm test           # unit tests (Node's built-in runner; no extra deps)
 ```
 
 ## Use
@@ -74,12 +75,35 @@ npm run tauri build  # produce a distributable app / installer
 | Rename pane | `F2`, or double-click its title |
 | Move focus | `Alt+←/→/↑/↓` (or click) |
 | Resize panes | drag the divider between them |
+| Reorder / move panes | drag a pane by its header (see below) |
+| Maximize pane | `Ctrl+Shift+M` (or ⤢); same keys restore |
+| Minimize pane | `Alt+M` (or —); restore from the dock |
 | Session browser | `Ctrl+Shift+P` (or the *sessions* button) |
 | Open in editor | `Alt+E` (or the `</>` button in a pane header) |
 | Copy / paste | `Ctrl+Shift+C` / `Ctrl+Shift+V` (`Ctrl+V` also works) |
 
 Splitting in the same direction adds a sibling column/row — repeated splits
 form an even matrix instead of a lopsided staircase.
+
+### Rearranging panes
+
+Panes get cramped fast once the orchestrator opens one per agent, so the grid
+can be rearranged without splitting from scratch:
+
+- **Drag to reorder or move** — grab a pane by its header and drag it over
+  another pane. A snap preview shows where it will land:
+  - drop on the **middle** to *swap* the two panes in place, or
+  - drop on an **edge** (left/right/top/bottom half) to move the pane to that
+    side, re-splitting the target.
+  Release to drop, or press `Esc` to cancel. Swapping two equally-sized slots
+  never resizes their terminals, so no scrollback is disturbed.
+- **Maximize** (`Ctrl+Shift+M` or the ⤢ button) blows one pane up to fill the
+  grid; the same shortcut (or the ⤡ restore button) puts it back. The other
+  panes are hidden rather than shrunk, so they don't repaint.
+- **Minimize** (`Alt+M` or the — button) parks a pane in the **dock** strip at
+  the bottom of the grid — it keeps running. Click its chip to bring it back,
+  or the chip's ✕ to close it for good. (This is loomux's take on the issue's
+  "minimize to tray": an in-app restore dock rather than the OS tray.)
 
 ### Session browser
 
@@ -274,7 +298,8 @@ src-tauri/src/
 src/
   pty.ts            typed bridge to the backend (invoke + event bus)
   pane.ts           one terminal pane: xterm instance + header UI
-  grid.ts           split-tree layout, dividers, focus navigation
+  grid.ts           split-tree layout, dividers, focus, drag/maximize/minimize
+  layout.ts         pure drag-reorder geometry (unit-tested, DOM-free)
   sessions.ts       session browser sidebar
   launcher.ts       new-agent-pane dialog (single / multi / orchestrator)
   orchestration.ts  frontend half of agent groups (panes, badges, focus)

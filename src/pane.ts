@@ -21,6 +21,7 @@ import {
 } from "./pty";
 import { invoke } from "@tauri-apps/api/core";
 import { isAppShortcut } from "./shortcuts";
+import { attentionPresentation } from "./attention";
 import { openInEditor, editorConfigDialog } from "./editor";
 import { GitView } from "./gitview";
 import { TasksView } from "./tasksview";
@@ -127,6 +128,10 @@ export interface PaneEvents {
   onFocus: (pane: Pane) => void;
   onCloseRequest: (pane: Pane) => void;
   onSplit: (pane: Pane, dir: "row" | "column") => void;
+  /** Park this pane in the dock (out of the grid, still running). */
+  onMinimize: (pane: Pane) => void;
+  /** Toggle this pane to/from fullscreen over the grid. */
+  onMaximize: (pane: Pane) => void;
 }
 
 export class Pane {
@@ -163,12 +168,18 @@ export class Pane {
   private groupView: GroupView | null = null;
   private groupOverlay: HTMLElement | null = null;
   private groupBtn: HTMLButtonElement;
+  /** Fullscreen toggle; its glyph flips to a restore affordance when active. */
+  private maximizeBtn: HTMLButtonElement;
   private orchGroup: string | null = null;
   private orchAgent: string | null = null;
   /** "needs attention" chip in the header (attention routing #6); hidden until
    *  the backend flags this pane. */
   private attnChip: HTMLButtonElement;
   private attentionReason: string | null = null;
+  private attentionDetail: string | null = null;
+  /** Notified when attention state changes; the grid uses it to keep a
+   *  minimized pane's dock chip in sync. */
+  private attentionListener: (() => void) | null = null;
   /** True for agent/command panes (vs plain shells). */
   private launchedCommand = false;
   private shiftTimer: number | undefined;
@@ -286,10 +297,22 @@ export class Pane {
     });
     header.appendChild(gitBtn);
 
+    // Minimize / maximize live next to close: the same window-control cluster
+    // users expect. Maximize keeps a stored ref so its glyph can flip to a
+    // "restore" affordance while fullscreen.
+    this.maximizeBtn = document.createElement("button");
+    this.maximizeBtn.className = "pane-btn";
+    this.maximizeBtn.textContent = "⤢";
+    this.maximizeBtn.title = "Maximize (Ctrl+Shift+M)";
+    this.maximizeBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      this.events.onMaximize(this);
+    });
+
     for (const [glyph, cls, tip, fn] of [
       ["◫", "", "Split right", () => this.events.onSplit(this, "row")],
       ["⬓", "", "Split down", () => this.events.onSplit(this, "column")],
-      ["✕", "close", "Close pane", () => this.events.onCloseRequest(this)],
+      ["—", "", "Minimize to dock (Alt+M)", () => this.events.onMinimize(this)],
     ] as const) {
       const btn = document.createElement("button");
       btn.className = `pane-btn ${cls}`;
@@ -301,6 +324,17 @@ export class Pane {
       });
       header.appendChild(btn);
     }
+    header.appendChild(this.maximizeBtn);
+
+    const closeBtn = document.createElement("button");
+    closeBtn.className = "pane-btn close";
+    closeBtn.textContent = "✕";
+    closeBtn.title = "Close pane";
+    closeBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      this.events.onCloseRequest(this);
+    });
+    header.appendChild(closeBtn);
     this.el.appendChild(header);
 
     this.termEl = document.createElement("div");
@@ -497,37 +531,50 @@ export class Pane {
     this.titleEl.before(chip);
   }
 
-  /** Short label per attention reason (see the backend `AttentionItem`). */
-  private static ATTN_LABEL: Record<string, string> = {
-    blocked: "⚠ blocked",
-    waiting: "⚠ waiting",
-    report: "✓ reported",
-    gate: "⚑ your call",
-  };
-
   /** Flag (or clear) this pane as needing the human — driven by the backend
    *  attention scan. Idempotent: a same-reason repeat is a no-op, so the 3-second
    *  re-emits don't thrash the DOM. `null` clears the badge. */
   setAttention(reason: string | null, detail?: string): void {
     if (reason === this.attentionReason) return;
     this.attentionReason = reason;
+    this.attentionDetail = reason ? detail ?? null : null;
     if (!reason) {
       this.attnChip.hidden = true;
       this.el.classList.remove("needs-attention");
       delete this.attnChip.dataset.reason;
-      return;
+    } else {
+      const { label } = attentionPresentation(reason);
+      this.attnChip.textContent = label;
+      this.attnChip.title = detail ?? "This pane needs you";
+      this.attnChip.dataset.reason = reason;
+      this.attnChip.hidden = false;
+      this.el.classList.add("needs-attention");
     }
-    this.attnChip.textContent = Pane.ATTN_LABEL[reason] ?? "⚠ attention";
-    this.attnChip.title = detail ?? "This pane needs you";
-    this.attnChip.dataset.reason = reason;
-    this.attnChip.hidden = false;
-    this.el.classList.add("needs-attention");
+    // A minimized pane's element is detached, so its header chip is invisible;
+    // the listener lets the grid mirror this state onto the dock chip.
+    this.attentionListener?.();
+  }
+
+  /** Current needs-attention state, or null. Lets the grid render an equivalent
+   *  badge on the dock chip while this pane is minimized (its header is out of
+   *  the DOM). */
+  get attention(): { reason: string; label: string; urgent: boolean; detail: string | null } | null {
+    if (!this.attentionReason) return null;
+    const { label, urgent } = attentionPresentation(this.attentionReason);
+    return { reason: this.attentionReason, label, urgent, detail: this.attentionDetail };
+  }
+
+  /** Register a callback fired whenever the attention state changes — used by
+   *  the grid to refresh the dock chip of a minimized pane. */
+  setAttentionListener(fn: (() => void) | null): void {
+    this.attentionListener = fn;
   }
 
   /** The human is now on this pane: clear a latched report backend-side so its
    *  badge drops. Live reasons (waiting/gate) are recomputed and reappear only
-   *  if still true. */
-  private acknowledgeAttention(): void {
+   *  if still true. Public so restoring a docked pane clears it the same way
+   *  turning to a pane does. */
+  acknowledgeAttention(): void {
     if (!this.attentionReason || !this.orchAgent) return;
     invoke("orch_ack_attention", { agentId: this.orchAgent }).catch(() => {});
   }
@@ -850,6 +897,22 @@ export class Pane {
 
   setActive(active: boolean): void {
     this.el.classList.toggle("active", active);
+  }
+
+  /** Reflect fullscreen state: the `.maximized` class drives the CSS overlay
+   *  (no PTY resize is forced — the pane genuinely changes size, so its own
+   *  ResizeObserver issues at most one debounced fit) and the button glyph
+   *  flips between maximize and restore. */
+  setMaximized(on: boolean): void {
+    this.el.classList.toggle("maximized", on);
+    this.maximizeBtn.textContent = on ? "⤡" : "⤢";
+    this.maximizeBtn.title = on ? "Restore (Ctrl+Shift+M)" : "Maximize (Ctrl+Shift+M)";
+  }
+
+  /** Group accent color, if this pane carries an orchestration badge — used to
+   *  tint its chip in the minimize dock. */
+  get accentColor(): string | null {
+    return this.el.style.getPropertyValue("--group-color").trim() || null;
   }
 
   focus(): void {

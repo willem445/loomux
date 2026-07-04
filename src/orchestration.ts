@@ -10,6 +10,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { Grid } from "./grid";
 import type { PaneEvents, PaneBadge } from "./pane";
+import { panesInGroup } from "./group";
 
 export type OrchRole = "orchestrator" | "worker" | "reviewer";
 
@@ -152,7 +153,9 @@ export function initOrchestration(grid: Grid, paneEvents: PaneEvents): void {
   void listen<AttentionItem[]>("orch-attention", ({ payload }) => {
     const byPty = new Map<number, AttentionItem>();
     for (const it of payload) if (it.pty_id !== null) byPty.set(it.pty_id, it);
-    for (const pane of grid.panes()) {
+    // allPanes(), not panes(): a minimized worker still needs the human, and
+    // its dock chip mirrors the state (see Grid.renderDock / #6).
+    for (const pane of grid.allPanes()) {
       if (!pane.orchGroupId || pane.ptyId === null) continue;
       const it = byPty.get(pane.ptyId);
       pane.setAttention(it ? it.reason : null, it?.detail);
@@ -162,8 +165,10 @@ export function initOrchestration(grid: Grid, paneEvents: PaneEvents): void {
   // close their (now-dead) panes rather than leaving a screen of dead
   // terminals — the pane-by-pane ✕-clicking this action exists to replace.
   void listen<{ group_id: string }>("orch-group-ended", ({ payload }) => {
-    for (const pane of grid.panes()) {
-      if (pane.orchGroupId === payload.group_id) grid.closePane(pane, false);
+    // allPanes(), not panes(): a minimized group pane must be closed too, or
+    // it would linger in the dock (with a live agent) after its group ends.
+    for (const pane of panesInGroup(grid.allPanes(), payload.group_id)) {
+      grid.closePane(pane, false);
     }
   });
 }
