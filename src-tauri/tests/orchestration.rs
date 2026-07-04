@@ -10,8 +10,8 @@ use loomux_lib::orchestration::mcp::dispatch;
 use loomux_lib::orchestration::{
     add_trusted_folder, bracketed_paste, cli_ready, create_orchestration_group, idle_should_kill,
     normalize_remote_web_base, parse_audit_lines, parse_session_cost, resolve_ref_url,
-    rotate_audit_if_needed, spawn_rate_exceeded, strip_ansi, Caller, Guardrails, OrchRegistry,
-    Role, TaskPatch,
+    rotate_audit_if_needed, spawn_rate_exceeded, strip_ansi, worktree_cleanup_targets, Caller,
+    Guardrails, OrchRegistry, Role, TaskPatch,
 };
 use serde_json::{json, Value};
 use std::fs;
@@ -1345,4 +1345,157 @@ fn group_json_records_cost_guardrails() {
     .unwrap();
     assert_eq!(gj["guardrails"]["idle_kill_minutes"], 15);
     assert_eq!(gj["guardrails"]["max_spawns_per_hour"], 30);
+}
+
+// ---------- group lifecycle: summary & end-orchestration (#8) ----------
+
+#[test]
+fn worktree_cleanup_targets_dedupes_and_spares_the_repo_root() {
+    let repo = "C:/Projects/loomux";
+    let cwds = vec![
+        // The orchestrator's cwd == the repo root, in a different spelling —
+        // must never be a removal target (it's the user's real checkout).
+        r"C:\Projects\loomux".to_string(),
+        // Two workers sharing one worktree (resume reuses cwd) → one target.
+        "C:/Projects/loomux-worktrees/a".to_string(),
+        "C:/Projects/loomux-worktrees/a/".to_string(),
+        "C:/Projects/loomux-worktrees/b".to_string(),
+        "".to_string(), // an unbound agent with no cwd is skipped
+    ];
+    let targets = worktree_cleanup_targets(repo, &cwds);
+    assert_eq!(
+        targets,
+        vec![
+            "C:/Projects/loomux-worktrees/a".to_string(),
+            "C:/Projects/loomux-worktrees/b".to_string(),
+        ],
+        "repo root excluded, case/separator/trailing-slash duplicates collapsed"
+    );
+}
+
+#[test]
+fn group_summary_counts_live_agents_roles_and_uptime() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    reg.spawn_agent(&g.id, Role::Worker, "w1", "do a thing", false, None).unwrap();
+    let dead = reg.spawn_agent(&g.id, Role::Worker, "w2", "", false, None).unwrap();
+    // A dead agent must drop out of the live count and role breakdown.
+    reg.mark_dead(&dead.id, Some(0));
+
+    let s = reg.group_summary(&g.id);
+    assert_eq!(s["live_agents"], 2);
+    assert_eq!(s["roles"]["orchestrator"], 1);
+    assert_eq!(s["roles"]["worker"], 1);
+    assert_eq!(s["roles"]["reviewer"], 0);
+    assert_eq!(s["paused"], false);
+    // Uptime is present (measured from the earliest live agent) and every live
+    // agent carries its own uptime; the dead one is gone.
+    assert!(s["uptime_ms"].as_u64().is_some(), "group uptime must be reported");
+    let agents = s["agents"].as_array().unwrap();
+    assert_eq!(agents.len(), 2);
+    assert!(agents.iter().all(|a| a["uptime_ms"].as_u64().is_some()));
+    assert!(!agents.iter().any(|a| a["id"] == dead.id.as_str()));
+    // Pausing the group is reflected so the panel can compose the two actions.
+    reg.pause_group(&g.id).unwrap();
+    assert_eq!(reg.group_summary(&g.id)["paused"], true);
+}
+
+#[test]
+fn end_group_kills_everyone_including_the_orchestrator() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    reg.spawn_agent(&g.id, Role::Worker, "w1", "t", false, None).unwrap();
+    // kill_agent refuses the orchestrator; end_group must not.
+    let result = reg.end_group(&g.id, false).unwrap();
+    assert_eq!(result["killed"].as_array().unwrap().len(), 2);
+    // Every agent is now dead — the group reads as fully torn down.
+    for a in reg.list_agents(&g.id).as_array().unwrap() {
+        assert_eq!(a["status"], "dead", "end must kill every role");
+    }
+    assert_eq!(reg.group_summary(&g.id)["live_agents"], 0);
+    // The teardown is audited as a human action.
+    let log = fs::read_to_string(reg.state_root().join(&g.id).join("audit.jsonl")).unwrap();
+    let end = log
+        .lines()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .find(|e| e["action"] == "group-end")
+        .expect("end must be audited");
+    assert_eq!(end["actor"], "human");
+    // Unknown group: an error, not a silent success.
+    assert!(reg.end_group("ghost-group", false).is_err());
+}
+
+#[test]
+fn end_group_clears_pause_so_relaunch_starts_clean() {
+    let dir = tempfile::tempdir().unwrap();
+    let gid;
+    {
+        let reg = OrchRegistry::new(dir.path().to_path_buf());
+        reg.set_port(45999);
+        let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+        gid = g.id.clone();
+        reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+        // A paused group that gets ended: the pause marker must not outlive it,
+        // or a relaunch on the same repo id would silently resume paused.
+        reg.pause_group(&g.id).unwrap();
+        assert!(reg.state_root().join(&g.id).join("paused").is_file());
+        reg.end_group(&g.id, false).unwrap();
+        assert!(!reg.is_paused(&g.id), "ending must drop the in-memory pause");
+        assert!(
+            !reg.state_root().join(&g.id).join("paused").is_file(),
+            "ending must remove the pause marker"
+        );
+    }
+    // Relaunch on the same repo → same id, not paused.
+    let reg = OrchRegistry::new(dir.path().to_path_buf());
+    reg.set_port(45999);
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    assert_eq!(g.id, gid);
+    assert!(!reg.is_paused(&g.id), "a relaunched group must not inherit the old pause");
+}
+
+#[test]
+fn end_group_removes_worktrees_of_dead_and_live_agents() {
+    // A real git repo with two worktrees; end_group(cleanup=true) must reclaim
+    // both — including the one whose worker already exited — while leaving the
+    // main checkout intact.
+    let repo = tempfile::tempdir().unwrap();
+    let repo_path = repo.path().to_string_lossy().replace('\\', "/");
+    let git = |args: &[&str]| {
+        let ok = std::process::Command::new("git")
+            .current_dir(&repo_path)
+            .args(args)
+            .output()
+            .expect("git must be installed for this test");
+        assert!(ok.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&ok.stderr));
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "t@t"]);
+    git(&["config", "user.name", "t"]);
+    fs::write(repo.path().join("f.txt"), "hi").unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "init"]);
+
+    let (reg, _d) = test_registry();
+    let g = reg.create_group(&repo_path, rails()).unwrap();
+    // Two worktree-backed workers (spawn creates the worktree via git).
+    let live = reg
+        .spawn_agent(&g.id, Role::Worker, "live", "t", true, Some("wt-live".into()))
+        .unwrap();
+    let dead = reg
+        .spawn_agent(&g.id, Role::Worker, "dead", "t", true, Some("wt-dead".into()))
+        .unwrap();
+    assert!(Path::new(&live.cwd).is_dir() && Path::new(&dead.cwd).is_dir());
+    // One worker has already exited — its worktree must still be reclaimed.
+    reg.mark_dead(&dead.id, Some(0));
+
+    let result = reg.end_group(&g.id, true).unwrap();
+    assert!(result["worktree_errors"].as_array().unwrap().is_empty(), "got: {result}");
+    assert_eq!(result["worktrees_removed"].as_array().unwrap().len(), 2);
+    assert!(!Path::new(&live.cwd).exists(), "live agent's worktree must be gone");
+    assert!(!Path::new(&dead.cwd).exists(), "exited agent's worktree must be gone");
+    // The main checkout is untouched.
+    assert!(repo.path().join("f.txt").is_file(), "the repo root must survive teardown");
 }

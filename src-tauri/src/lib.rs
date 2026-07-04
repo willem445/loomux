@@ -66,6 +66,8 @@ pub fn run() {
             orchestration::orch_resume_group,
             orchestration::orch_group_paused,
             orchestration::orch_group_usage,
+            orchestration::orch_group_summary,
+            orchestration::orch_end_group,
             cliprobe::probe_agent_cli,
         ])
         .on_window_event(|window, event| {

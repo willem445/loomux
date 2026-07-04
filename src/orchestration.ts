@@ -117,6 +117,14 @@ export function initOrchestration(grid: Grid, paneEvents: PaneEvents): void {
       pane.focus();
     }
   });
+  // End-orchestration: the backend has already killed the group's agents, so
+  // close their (now-dead) panes rather than leaving a screen of dead
+  // terminals — the pane-by-pane ✕-clicking this action exists to replace.
+  void listen<{ group_id: string }>("orch-group-ended", ({ payload }) => {
+    for (const pane of grid.panes()) {
+      if (pane.orchGroupId === payload.group_id) grid.closePane(pane, false);
+    }
+  });
 }
 
 /** A recorded session's orchestration identity (backend roster). */
@@ -208,3 +216,47 @@ export const groupPaused = (groupId: string): Promise<boolean> =>
 /** Aggregate per-pane session cost into one group summary. */
 export const groupUsage = (groupId: string): Promise<GroupUsage> =>
   invoke<GroupUsage>("orch_group_usage", { groupId });
+
+// ---------- group lifecycle: summary + end-orchestration (#8) ----------
+
+/** One live agent in a group lifecycle summary. */
+export interface AgentSummary {
+  id: string;
+  name: string;
+  role: OrchRole;
+  /** Empty for an idle/ready agent. */
+  task: string;
+  /** Unix-ms this agent last went idle, or null while it has work. */
+  idle_since_ms: number | null;
+  /** Milliseconds since the agent was spawned. */
+  uptime_ms: number;
+}
+
+/** At-a-glance lifecycle summary for a group (backend `orch_group_summary`). */
+export interface GroupSummary {
+  group: string;
+  live_agents: number;
+  paused: boolean;
+  /** Group uptime (from the earliest live agent), or null if none are live. */
+  uptime_ms: number | null;
+  roles: { orchestrator: number; worker: number; reviewer: number };
+  agents: AgentSummary[];
+}
+
+/** Result of ending a group (killed agent ids + worktree cleanup outcome). */
+export interface EndGroupResult {
+  group: string;
+  killed: string[];
+  worktrees_removed: string[];
+  worktree_errors: { path: string; error: string }[];
+}
+
+/** Live-agent count, role breakdown, and uptime for the lifecycle panel. */
+export const groupSummary = (groupId: string): Promise<GroupSummary> =>
+  invoke<GroupSummary>("orch_group_summary", { groupId });
+
+/** End a whole orchestration: kill all its agents and (optionally) remove
+ *  their worktrees. Destructive and human-initiated — the caller confirms
+ *  first. The backend emits `orch-group-ended` so the panes close. */
+export const endGroup = (groupId: string, cleanupWorktrees: boolean): Promise<EndGroupResult> =>
+  invoke<EndGroupResult>("orch_end_group", { groupId, cleanupWorktrees });
