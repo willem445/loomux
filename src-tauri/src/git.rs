@@ -246,6 +246,9 @@ pub fn git_commit(repo: String, message: String) -> Result<(), String> {
 /// branch explicitly (dwim misfires when several remotes share the name).
 #[tauri::command]
 pub fn git_checkout(repo: String, refname: String, track: bool) -> Result<(), String> {
+    // `--` can't guard this the way it does elsewhere — for checkout it's the
+    // pathspec separator — so reject a leading-`-` name outright (see check_name).
+    check_name(&refname, "ref")?;
     if track {
         run_git(&repo, &["checkout", "--track", &refname]).map(|_| ())
     } else {
@@ -964,6 +967,18 @@ mod tests {
         assert!(err.contains("would be overwritten") || err.contains("overwritten by checkout"));
         // Still on main with the dirty content intact.
         assert_eq!(read(d, "f.txt"), "dirty\n");
+    }
+
+    #[test]
+    fn checkout_rejects_option_like_refname() {
+        let repo = new_repo();
+        let d = repo.path();
+        commit(d, "f.txt", "a\n", "A");
+        // A leading-`-` name is blocked before ever reaching git, so it can't
+        // be parsed as an option (checkout can't use `--` to guard it).
+        let err = git_checkout(p(d), "-f".into(), false).unwrap_err();
+        assert!(err.contains("must not start with '-'"), "got: {err}");
+        assert!(git_checkout(p(d), "--track".into(), true).is_err());
     }
 
     #[test]
