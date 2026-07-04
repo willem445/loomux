@@ -163,6 +163,14 @@ and leaves your working tree exactly as it was, reporting the conflict — it
 never leaves you in a half-finished, conflicted state to untangle. Resolve
 those in a terminal.
 
+The view (and the pane's header branch chip) also react to changes made
+**outside** the pane's shell — a `git checkout`, commit, or stage run from VS
+Code or another terminal shows up within a couple of seconds, without you
+having to press Enter in the pane. A lightweight backend watch samples the
+repo's `.git` metadata (HEAD, index, refs) once a second while a pane has it
+open, and feeds the same throttled refresh a shell prompt would; it stops when
+the pane closes.
+
 ## Agent orchestration
 
 Loomux natively supports an **orchestrator / worker** pattern: a long-lived

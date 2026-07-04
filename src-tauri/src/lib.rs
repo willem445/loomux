@@ -1,6 +1,7 @@
 mod cliprobe;
 mod editor;
 mod git;
+mod gitwatch;
 mod winpath;
 mod metrics;
 pub mod orchestration; // pub: integration smoke test links through it
@@ -15,12 +16,16 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(pty::PtyManager::default())
+        .manage(Arc::new(gitwatch::GitWatcher::new()))
         .manage(Arc::new(orchestration::OrchRegistry::new(
             orchestration::OrchRegistry::default_root(),
         )))
         .setup(|app| {
             // Start streaming CPU/mem/GPU snapshots to the status bar.
             metrics::start(app.handle().clone());
+            // Poll open panes' repos for external checkout/commit/stage (#36).
+            let watcher = app.state::<Arc<gitwatch::GitWatcher>>().inner().clone();
+            gitwatch::start(app.handle().clone(), watcher);
             // Orchestration MCP server: agents connect with per-pane tokens.
             let reg = app.state::<Arc<orchestration::OrchRegistry>>().inner().clone();
             reg.set_app(app.handle().clone());
@@ -63,6 +68,8 @@ pub fn run() {
             git::git_merge,
             git::git_rebase,
             git::git_branches,
+            gitwatch::git_watch,
+            gitwatch::git_unwatch,
             orchestration::create_orchestration,
             orchestration::bind_agent,
             orchestration::orch_session_roles,

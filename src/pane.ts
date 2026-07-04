@@ -17,6 +17,9 @@ import {
   ensureOutputRouter,
   attachOutput,
   detachOutput,
+  attachGitWatch,
+  setGitWatch,
+  detachGitWatch,
   ptyBackendInfo,
 } from "./pty";
 import { invoke } from "@tauri-apps/api/core";
@@ -148,6 +151,9 @@ export class Pane {
   private branchTextEl: HTMLElement;
   /** Latest un-abbreviated directory the shell reported, for the picker. */
   private cwdRaw: string | null = null;
+  /** Directory the external-change git watch is currently pointed at (#36),
+   *  so we only re-issue the backend call when the pane actually changes dir. */
+  private watchedPath: string | null = null;
   /** Lazily created git view; null until the first toggle. */
   private gitView: GitView | null = null;
   private gitDivider: HTMLElement | null = null;
@@ -467,6 +473,13 @@ export class Pane {
       // the debounced fit will notice the size drifted and resend once.
       this.applyFit();
       attachOutput(ptyId, (bytes) => this.term.write(bytes));
+      // React to repo changes made outside this pane's shell (#36): the
+      // backend watch is pointed at the repo on each cwd report below.
+      attachGitWatch(ptyId, () => this.onExternalGitChange());
+      if (this.cwdRaw) {
+        this.watchedPath = this.cwdRaw;
+        setGitWatch(ptyId, this.cwdRaw);
+      }
       for (const data of this.inputQueue.splice(0)) {
         writePty(ptyId, data).catch(() => {});
       }
@@ -588,9 +601,23 @@ export class Pane {
     const path = normalizeOscPath(payload);
     if (!path) return;
     this.cwdRaw = path;
+    // Repoint the external-change watch when the directory changes (#36); the
+    // backend dedupes same-repo calls so cd-within-a-repo is a no-op there.
+    if (path !== this.watchedPath && this.ptyId !== null) {
+      this.watchedPath = path;
+      setGitWatch(this.ptyId, path);
+    }
     // Refresh even when the path is unchanged: the *branch* can change
     // without a cd (git checkout), and dir_info is cheap.
     void this.refreshDir(path);
+  }
+
+  /** The backend saw this pane's repo change on disk (an external checkout /
+   *  commit / stage). Drive the same refresh a shell prompt would: the git
+   *  view (throttled) and the header branch chip. */
+  private onExternalGitChange(): void {
+    this.gitView?.notifyPrompt();
+    if (this.cwdRaw) void this.refreshDir(this.cwdRaw);
   }
 
   /** Toggle the git view. It FLOATS over the top of the terminal — the
@@ -932,6 +959,7 @@ export class Pane {
     this.groupView?.dispose();
     if (this.ptyId !== null) {
       detachOutput(this.ptyId);
+      detachGitWatch(this.ptyId);
       if (killBackend) killPty(this.ptyId).catch(() => {});
     }
     this.term.dispose();
