@@ -8,8 +8,9 @@
 
 use loomux_lib::orchestration::mcp::dispatch;
 use loomux_lib::orchestration::{
-    add_trusted_folder, bracketed_paste, cli_ready, create_orchestration_group, parse_audit_lines,
-    rotate_audit_if_needed, strip_ansi, Caller, Guardrails, OrchRegistry, Role, TaskPatch,
+    add_trusted_folder, bracketed_paste, cli_ready, create_orchestration_group,
+    normalize_remote_web_base, parse_audit_lines, resolve_ref_url, rotate_audit_if_needed,
+    strip_ansi, Caller, Guardrails, OrchRegistry, Role, TaskPatch,
 };
 use serde_json::{json, Value};
 use std::fs;
@@ -474,6 +475,76 @@ fn task_board_tracks_sessions_for_followups() {
     let stored = &reg.tasks(&g.id)[0];
     assert_eq!(stored.session, t.session);
     assert_eq!(stored.assignee.as_deref(), Some("w-1"));
+}
+
+// ---------- merge-gate actions (#9) ----------
+
+#[test]
+fn remote_web_base_normalizes_every_git_url_shape() {
+    // scp-like, https (with/without .git), ssh with a port, trailing slash.
+    let cases = [
+        ("git@github.com:willem445/loomux.git", "https://github.com/willem445/loomux"),
+        ("https://github.com/willem445/loomux.git", "https://github.com/willem445/loomux"),
+        ("https://github.com/willem445/loomux", "https://github.com/willem445/loomux"),
+        ("ssh://git@github.com:22/willem445/loomux.git", "https://github.com/willem445/loomux"),
+        ("https://token@github.com/o/r/", "https://github.com/o/r"),
+        // Self-hosted host survives (GitHub path scheme is assumed downstream).
+        ("git@git.example.com:team/app.git", "https://git.example.com/team/app"),
+    ];
+    for (url, want) in cases {
+        assert_eq!(normalize_remote_web_base(url).as_deref(), Some(want), "for {url}");
+    }
+    // Junk that can't be turned into a link.
+    for bad in ["", "not-a-url", "https://", "git@github.com", "file:///tmp/x"] {
+        assert!(normalize_remote_web_base(bad).is_none(), "{bad:?} must not resolve");
+    }
+}
+
+#[test]
+fn resolve_ref_url_handles_numbers_and_passthrough() {
+    let base = Some("https://github.com/o/r");
+    // Bare number and #-prefixed both resolve; issue vs pr picks the segment.
+    assert_eq!(resolve_ref_url(base, "issue", "#9").as_deref(), Some("https://github.com/o/r/issues/9"));
+    assert_eq!(resolve_ref_url(base, "pr", "42").as_deref(), Some("https://github.com/o/r/pull/42"));
+    // A full URL is used verbatim — even with no remote base available.
+    let url = "https://github.com/o/r/pull/7";
+    assert_eq!(resolve_ref_url(None, "pr", url).as_deref(), Some(url));
+    // A bare number with no remote can't be resolved.
+    assert!(resolve_ref_url(None, "issue", "9").is_none());
+    // Non-numeric junk resolves to nothing.
+    assert!(resolve_ref_url(base, "issue", "later").is_none());
+}
+
+#[test]
+fn approve_marks_done_and_records_signoff() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let t = reg.upsert_task(&g.id, "orch-1", None, patch(Some("Ship the parser"), None, None)).unwrap();
+    // Move it to the merge gate first (as the orchestrator would).
+    let mut p = patch(None, Some("pr"), None);
+    p.pr = Some("#12".into());
+    reg.upsert_task(&g.id, "orch-1", Some(&t.id), p).unwrap();
+    // Approving is the human's sign-off: status → done, note recorded, actor human.
+    let done = reg.approve_task(&g.id, &t.id).unwrap();
+    assert_eq!(done.status, "done");
+    let note = done.notes.last().unwrap();
+    assert_eq!(note.author, "human");
+    assert!(note.text.contains("Approved"), "sign-off must be auditable on the board");
+}
+
+#[test]
+fn request_changes_records_findings_but_not_done() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let t = reg.upsert_task(&g.id, "orch-1", None, patch(Some("Ship the parser"), Some("pr"), None)).unwrap();
+    // Empty findings are rejected — the notice would be useless.
+    assert!(reg.request_changes(&g.id, &t.id, "   ").is_err());
+    let after = reg.request_changes(&g.id, &t.id, "retries still leak a handle").unwrap();
+    // Status stays at the gate (orchestrator re-dispatches); findings recorded.
+    assert_eq!(after.status, "pr", "request-changes must not silently complete the item");
+    assert!(after.notes.last().unwrap().text.contains("retries still leak a handle"));
+    // Unknown task id is an error, not a silent no-op.
+    assert!(reg.request_changes(&g.id, "t-999", "x").is_err());
 }
 
 // ---------- review-round regression tests ----------

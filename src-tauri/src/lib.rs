@@ -55,6 +55,9 @@ pub fn run() {
             orchestration::orch_upsert_task,
             orchestration::orch_delete_task,
             orchestration::orch_reorder_tasks,
+            orchestration::orch_open_ref,
+            orchestration::orch_approve_task,
+            orchestration::orch_request_changes,
             cliprobe::probe_agent_cli,
         ])
         .on_window_event(|window, event| {
