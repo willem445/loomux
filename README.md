@@ -135,13 +135,62 @@ list icon) showing the group's work queue — status per item (`queued`,
 `in-progress`, `review`, `pr`, `human-testing`, `done`, `blocked`), issue/PR
 links, notes, and priority order. You can add, edit, annotate, reorder, and
 delete tasks; the orchestrator is notified of your edits and maintains the
-same board through its tools.
+same board through its tools. Issue and PR chips are **clickable** — they open
+in your browser.
+
+**Merge gate:** when an item reaches `pr` or `human-testing` — the point where
+only you can decide — the board shows two buttons instead of making you type
+into the orchestrator. **✓ Approve** marks the item done and tells the
+orchestrator to merge. **✎ Changes** opens a box for your findings, records
+them on the board, and sends them to the orchestrator to route back to a
+worker. Both land as a message in the orchestrator pane, exactly as if you'd
+written it.
+
+**Attention routing:** the human is the scheduler's bottleneck, so loomux
+surfaces *which* pane needs you instead of making you scan them. A pane earns a
+pulsing **needs-attention** chip when an agent is parked on a prompt only you
+can answer (a permission dialog or question — detected from the pane going
+output-quiet on a prompt-shaped last screen, the same output heuristics the
+stalled-agent watchdog uses, and suppressed while you're typing into it), when a
+worker **reports** done or blocked, or when its task reaches a **human merge
+gate**. Turning to the pane (or clicking the chip) clears a report badge; live
+signals clear themselves when the condition passes. On the task board, items
+that only you can advance (`pr`, `human-testing`, `blocked`) are highlighted so
+what's waiting on you stands out. Each group also has an optional **desktop
+notification** toggle (🔔 in the group lifecycle panel) that raises an OS toast
+for those report/blocked/idle-with-prompt events — off by default, durable
+per-group. Badges and highlights are header/board overlays; nothing ever
+resizes the PTY.
+
+**Audit viewer:** every orchestration pane has an audit toggle (`Alt+A` or
+the history icon) opening the group's `audit.jsonl` as a filterable timeline
+— every prompt, spawn, task edit, delivery outcome, and state write, one row
+each. Filter by actor, action, or agent; free-text search the details;
+expand any row to read the full prompt/task text verbatim (the field that
+made this log worth grepping). A **follow** button live-tails new lines, and
+rotation is transparent (the rotated `audit.1.jsonl` generation is read
+alongside the current one). The overlay floats over the terminal like the
+git and task-board views — it never resizes the PTY.
+
+**Group lifecycle:** the orchestrator pane has a lifecycle toggle (`Alt+O` or
+the group icon) with a one-glance summary — how many agents are live, the role
+breakdown, uptime (per agent and for the whole group), each agent's state, and
+running session cost with a group total. From here you can **pause** the group
+(loomux stops delivering prompts so its agents finish their turn and idle out —
+reversible with resume) or **End orchestration**, which kills *every* agent in
+the group at once instead of ✕-clicking panes one by one. Ending is destructive,
+so it takes a second confirming click; an optional **remove worktrees** checkbox
+also deletes each agent's git worktree (uncommitted changes are lost, but the
+branches — where the PRs live — are always kept). The teardown is audited, closes
+the group's panes for you, and clears any pause so a later relaunch starts clean.
 
 **Per-task sessions:** each worker is scoped to exactly one work item, and
-loomux pre-assigns Claude session ids at spawn, recording them on the
-roster and task board. Follow-ups on a finished task *resume* that worker's
-session (same context, same workspace) instead of cold-starting a new agent
-or disturbing a busy one.
+loomux records its session id on the roster and task board. Claude ids are
+pre-assigned at spawn; Copilot mints its own id on boot, so loomux watches
+`~/.copilot/session-state` and binds the pane's new session a few seconds
+after it starts. Either way, follow-ups on a finished task *resume* that
+worker's session (same context, same workspace) instead of cold-starting a
+new agent or disturbing a busy one — for Claude and Copilot groups alike.
 
 **Guardrails** are enforced by loomux, not the model: a hard cap on live
 agents (≤12), models pinned per role at launch, and the permission mode
@@ -192,6 +241,8 @@ orchestration) are deliberate:
 - **New agent sources**: add a `scan_*` function in `sessions.rs`.
 - **New backend capabilities**: add a `#[tauri::command]` and a typed
   wrapper in `pty.ts` — the frontend never touches IPC directly elsewhere.
-- **Pane awareness** (e.g. "agent is waiting for input" badges): the raw
-  output stream already flows through `Pane`; hook it there or observe it
-  backend-side in `pty.rs`'s reader thread.
+- **Pane awareness** ("agent is waiting for input" badges): realized as
+  attention routing (see above). The backend's `run_attention` scan reads each
+  pane's pty output counter + tail + last-keystroke time (observed in `pty.rs`'s
+  reader thread) and emits an `orch-attention` event the frontend badges panes
+  from; add a new attention source in `attention_tick`.

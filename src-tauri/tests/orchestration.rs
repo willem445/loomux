@@ -8,10 +8,14 @@
 
 use loomux_lib::orchestration::mcp::dispatch;
 use loomux_lib::orchestration::{
-    add_trusted_folder, bracketed_paste, cli_ready, create_orchestration_group,
-    rotate_audit_if_needed, strip_ansi, Caller, Guardrails, OrchRegistry, Role, TaskPatch,
+    add_trusted_folder, bracketed_paste, cli_ready, create_orchestration_group, idle_should_kill,
+    normalize_remote_web_base, parse_audit_lines, parse_session_cost, prompt_wait_detected,
+    resolve_ref_url, rotate_audit_if_needed, spawn_rate_exceeded, strip_ansi,
+    watchdog_should_notify, worktree_cleanup_targets, AttentionItem, Caller, Guardrails,
+    OrchRegistry, Role, TaskPatch,
 };
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::time::Duration;
@@ -39,6 +43,9 @@ fn rails() -> Guardrails {
         reviewer_model: "sonnet".into(),
         orchestrator_model: "opus".into(),
         auto_ops: false,
+        idle_kill_minutes: 0,
+        max_spawns_per_hour: 0,
+        watchdog_stall_minutes: 0,
     }
 }
 
@@ -74,9 +81,15 @@ fn guardrail_clamps_and_sanitizes() {
         reviewer_model: "".into(),
         orchestrator_model: "opus".into(),
         auto_ops: true,
+        idle_kill_minutes: 99999,
+        max_spawns_per_hour: 9999,
+        watchdog_stall_minutes: 99999,
     }
     .clamped();
     assert_eq!(g.max_agents, 12, "cap must clamp to the hard ceiling");
+    assert_eq!(g.idle_kill_minutes, 1440, "idle-kill timeout clamps to 24h");
+    assert_eq!(g.max_spawns_per_hour, 240, "spawn-rate cap clamps to the ceiling");
+    assert_eq!(g.watchdog_stall_minutes, 1440, "watchdog stall timeout clamps to 24h");
     assert_eq!(g.agent_cli, "claude", "unknown CLIs fall back to claude explicitly");
     assert_eq!(g.worker_model, "sonnetrm-rf", "shell metacharacters must be stripped");
     assert_eq!(g.reviewer_model, "sonnet", "empty model falls back to default");
@@ -88,6 +101,9 @@ fn guardrail_clamps_and_sanitizes() {
         reviewer_model: "".into(),
         orchestrator_model: "".into(),
         auto_ops: false,
+        idle_kill_minutes: 0,
+        max_spawns_per_hour: 0,
+        watchdog_stall_minutes: 0,
     }
     .clamped();
     assert_eq!(g.worker_model, "auto");
@@ -253,6 +269,14 @@ fn copilot_command_uses_copilot_adapter_flags() {
     let cmd = reg.build_agent_command("copilot", "auto", false, cfg, gdir, Path::new("C:/repo"), None, false);
     assert!(!cmd.contains("--autopilot") && !cmd.contains("--allow-all-tools"));
     assert!(cmd.contains("--allow-tool \"shell(git:*)\"") && cmd.contains("--allow-tool \"shell(gh:*)\""));
+    // Resume reopens a tracked session via --resume; copilot has no
+    // pre-assignable id, so a session without resume adds no session flag.
+    let sid = "aabbccdd-1122-4334-8556-77889900aabb";
+    let cmd = reg.build_agent_command("copilot", "auto", true, cfg, gdir, Path::new("C:/repo"), Some(sid), true);
+    assert!(cmd.contains(&format!("--resume {sid}")), "copilot resume must pass --resume, got: {cmd}");
+    let cmd = reg.build_agent_command("copilot", "auto", true, cfg, gdir, Path::new("C:/repo"), Some(sid), false);
+    assert!(!cmd.contains("--resume") && !cmd.contains("--session-id"),
+        "a fresh copilot spawn cannot pin a session id");
 }
 
 #[test]
@@ -268,6 +292,131 @@ fn copilot_mcp_config_includes_tools_allowlist() {
     .unwrap();
     assert!(cfg.contains("\"tools\""), "copilot expects a tools allowlist in the server entry");
     assert!(cfg.contains(&w.token));
+}
+
+fn copilot_rails() -> Guardrails {
+    let mut r = rails();
+    r.agent_cli = "copilot".into();
+    r
+}
+
+#[test]
+fn copilot_agents_spawn_without_a_preassigned_session() {
+    // Copilot has no `--session-id`; a fresh copilot pane starts untracked
+    // and is associated later once its session-state appears on disk.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/copilot-repo", copilot_rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    assert!(w.session_id.is_none(), "copilot cannot pre-assign a session id");
+}
+
+#[test]
+fn associating_a_copilot_session_records_it_on_roster_and_task_board() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/copilot-repo", copilot_rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "builder", "do the thing", false, None).unwrap();
+    // The orchestrator has put a task on the board assigned to this worker.
+    let t = reg.upsert_task(&g.id, "orch-1", None, patch(Some("build feature"), None, None)).unwrap();
+    reg.upsert_task(
+        &g.id,
+        "orch-1",
+        Some(&t.id),
+        TaskPatch { assignee: Some(w.id.clone()), ..Default::default() },
+    )
+    .unwrap();
+
+    // The watcher discovered copilot's session id and binds it to the pane.
+    let sid = "0f9e8d7c-1234-4abc-8def-0011223344ff";
+    reg.associate_copilot_session(&g.id, &w.id, sid);
+
+    // Agent map now carries the id (so list_agents/resume can use it).
+    let agents = reg.list_agents(&g.id);
+    let entry = agents.as_array().unwrap().iter().find(|a| a["id"] == w.id.as_str()).unwrap();
+    assert_eq!(entry["session"], sid);
+
+    // Durable roster records exactly one session row for this pane — the
+    // placeholder was upgraded, not duplicated — and the session browser
+    // surfaces it as a worker chip in this group.
+    let roles: Vec<_> = reg.session_roles().into_iter().filter(|r| r.session_id == sid).collect();
+    assert_eq!(roles.len(), 1, "one roster/session-browser entry per pane, got {}", roles.len());
+    assert_eq!(roles[0].role, "worker");
+    assert_eq!(roles[0].group_id, g.id);
+
+    // Task board mirrors the session so the orchestrator can resume the task.
+    let task = reg.tasks(&g.id).into_iter().find(|x| x.id == t.id).unwrap();
+    assert_eq!(task.session.as_deref(), Some(sid));
+
+    // Idempotent: a second (late) discovery must not clobber the bound id.
+    reg.associate_copilot_session(&g.id, &w.id, "ffffffff-0000-4000-8000-000000000000");
+    let agents = reg.list_agents(&g.id);
+    let entry = agents.as_array().unwrap().iter().find(|a| a["id"] == w.id.as_str()).unwrap();
+    assert_eq!(entry["session"], sid, "an already-tracked pane keeps its first session id");
+}
+
+#[test]
+fn copilot_orchestration_session_gets_a_chip_and_restores() {
+    use loomux_lib::orchestration::resume_recorded_session;
+    use std::sync::Arc;
+    let dir = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap(); // must exist for restore
+    let repo_path = repo.path().to_string_lossy().into_owned();
+    let sid = "0a1b2c3d-4e5f-4a6b-8c7d-8e9f00112233";
+    let gid;
+    {
+        let reg = OrchRegistry::new(dir.path().to_path_buf());
+        reg.set_port(45999);
+        let g = reg.create_group(&repo_path, copilot_rails()).unwrap();
+        gid = g.id.clone();
+        // A copilot orchestrator spawns untracked, then its session is bound
+        // once it appears on disk (here, driven directly).
+        let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+        assert!(orch.session_id.is_none());
+        reg.associate_copilot_session(&g.id, &orch.id, sid);
+        // Session browser now has an ORCH chip for this copilot session.
+        let roles: Vec<_> = reg.session_roles().into_iter().filter(|r| r.session_id == sid).collect();
+        assert_eq!(roles.len(), 1);
+        assert_eq!(roles[0].role, "orchestrator");
+    }
+    // "App restart": a new registry restores the whole copilot orchestration
+    // from the recorded session, resuming its conversation via `copilot
+    // --resume`.
+    let reg = Arc::new(OrchRegistry::new(dir.path().to_path_buf()));
+    reg.set_port(45999);
+    let req = resume_recorded_session(&reg, sid, None).unwrap().expect("orchestrator pane spec");
+    assert_eq!(req.group_id, gid);
+    assert!(req.command.starts_with("copilot "), "must relaunch copilot, got: {}", req.command);
+    assert!(req.command.contains(&format!("--resume {sid}")), "must resume the recorded session");
+}
+
+#[test]
+fn copilot_group_resumes_a_recorded_session() {
+    // Resume parity: a copilot group accepts resume_session (its ids are
+    // hex+dashes, so they pass sanitization) and reuses it on the pane.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/copilot-repo", copilot_rails()).unwrap();
+    let dir = tempfile::tempdir().unwrap(); // an existing cwd for the resume
+    let sid = "aabbccdd-1122-4334-8556-77889900aabb".to_string();
+    let w = reg
+        .spawn_agent_ex(
+            &g.id,
+            Role::Worker,
+            "resumed",
+            "follow-up",
+            false,
+            None,
+            Some(sid.clone()),
+            Some(dir.path().to_string_lossy().into_owned()),
+        )
+        .unwrap();
+    assert_eq!(w.session_id.as_deref(), Some(sid.as_str()));
+    // A mangled id is rejected rather than silently resuming the wrong one.
+    assert!(reg
+        .spawn_agent_ex(
+            &g.id, Role::Worker, "bad", "", false, None,
+            Some("../../etc/passwd".into()),
+            Some(dir.path().to_string_lossy().into_owned()),
+        )
+        .is_err());
 }
 
 #[test]
@@ -476,6 +625,101 @@ fn task_board_tracks_sessions_for_followups() {
     assert_eq!(stored.assignee.as_deref(), Some("w-1"));
 }
 
+// ---------- merge-gate actions (#9) ----------
+
+#[test]
+fn remote_web_base_normalizes_every_git_url_shape() {
+    // scp-like, https (with/without .git), ssh with a port, trailing slash.
+    let cases = [
+        ("git@github.com:willem445/loomux.git", "https://github.com/willem445/loomux"),
+        ("https://github.com/willem445/loomux.git", "https://github.com/willem445/loomux"),
+        ("https://github.com/willem445/loomux", "https://github.com/willem445/loomux"),
+        ("ssh://git@github.com:22/willem445/loomux.git", "https://github.com/willem445/loomux"),
+        ("https://token@github.com/o/r/", "https://github.com/o/r"),
+        // Self-hosted host survives (GitHub path scheme is assumed downstream).
+        ("git@git.example.com:team/app.git", "https://git.example.com/team/app"),
+    ];
+    for (url, want) in cases {
+        assert_eq!(normalize_remote_web_base(url).as_deref(), Some(want), "for {url}");
+    }
+    // Junk that can't be turned into a link.
+    for bad in ["", "not-a-url", "https://", "git@github.com", "file:///tmp/x"] {
+        assert!(normalize_remote_web_base(bad).is_none(), "{bad:?} must not resolve");
+    }
+}
+
+#[test]
+fn resolve_ref_url_handles_numbers_and_passthrough() {
+    let base = Some("https://github.com/o/r");
+    // Bare number and #-prefixed both resolve; issue vs pr picks the segment.
+    assert_eq!(resolve_ref_url(base, "issue", "#9").as_deref(), Some("https://github.com/o/r/issues/9"));
+    assert_eq!(resolve_ref_url(base, "pr", "42").as_deref(), Some("https://github.com/o/r/pull/42"));
+    // A `GH-12`-style prefix resolves to its digit run (comment ↔ behavior).
+    assert_eq!(resolve_ref_url(base, "issue", "GH-12").as_deref(), Some("https://github.com/o/r/issues/12"));
+    // A full URL is used verbatim — even with no remote base available.
+    let url = "https://github.com/o/r/pull/7";
+    assert_eq!(resolve_ref_url(None, "pr", url).as_deref(), Some(url));
+    // A bare number with no remote can't be resolved.
+    assert!(resolve_ref_url(None, "issue", "9").is_none());
+    // Non-numeric junk resolves to nothing.
+    assert!(resolve_ref_url(base, "issue", "later").is_none());
+}
+
+#[test]
+fn approve_marks_done_and_records_signoff() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let t = reg.upsert_task(&g.id, "orch-1", None, patch(Some("Ship the parser"), None, None)).unwrap();
+    // Move it to the merge gate first (as the orchestrator would).
+    let mut p = patch(None, Some("pr"), None);
+    p.pr = Some("#12".into());
+    reg.upsert_task(&g.id, "orch-1", Some(&t.id), p).unwrap();
+    // Approving is the human's sign-off: status → done, note recorded, actor human.
+    let done = reg.approve_task(&g.id, &t.id).unwrap();
+    assert_eq!(done.status, "done");
+    let note = done.notes.last().unwrap();
+    assert_eq!(note.author, "human");
+    assert!(note.text.contains("Approved"), "sign-off must be auditable on the board");
+}
+
+#[test]
+fn request_changes_records_findings_but_not_done() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let t = reg.upsert_task(&g.id, "orch-1", None, patch(Some("Ship the parser"), Some("pr"), None)).unwrap();
+    // Empty findings are rejected — the notice would be useless.
+    assert!(reg.request_changes(&g.id, &t.id, "   ").is_err());
+    let after = reg.request_changes(&g.id, &t.id, "retries still leak a handle").unwrap();
+    // Status stays at the gate (orchestrator re-dispatches); findings recorded.
+    assert_eq!(after.status, "pr", "request-changes must not silently complete the item");
+    assert!(after.notes.last().unwrap().text.contains("retries still leak a handle"));
+    // Unknown task id is an error, not a silent no-op.
+    assert!(reg.request_changes(&g.id, "t-999", "x").is_err());
+}
+
+#[test]
+fn merge_gate_actions_are_guarded_to_gate_statuses() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    // A queued item is not at the merge gate — both actions must refuse, and
+    // refuse without mutating (status unchanged, no note added).
+    let t = reg.upsert_task(&g.id, "orch-1", None, patch(Some("Ship it"), None, None)).unwrap();
+    assert!(reg.approve_task(&g.id, &t.id).is_err(), "cannot approve a queued item");
+    assert!(reg.request_changes(&g.id, &t.id, "nope").is_err(), "cannot request changes off-gate");
+    let stored = &reg.tasks(&g.id)[0];
+    assert_eq!(stored.status, "queued", "a refused action must not change status");
+    assert!(stored.notes.is_empty(), "a refused action must not leave a note");
+    // Both gate statuses are allowed.
+    for gate in ["pr", "human-testing"] {
+        reg.upsert_task(&g.id, "orch-1", Some(&t.id), patch(None, Some(gate), None)).unwrap();
+        assert!(reg.request_changes(&g.id, &t.id, "one more thing").is_ok(), "{gate} is a gate status");
+    }
+    // And once approved (→ done) it's off the gate again.
+    reg.upsert_task(&g.id, "orch-1", Some(&t.id), patch(None, Some("pr"), None)).unwrap();
+    reg.approve_task(&g.id, &t.id).unwrap();
+    assert!(reg.approve_task(&g.id, &t.id).is_err(), "a done item is past the gate");
+}
+
 // ---------- review-round regression tests ----------
 
 #[test]
@@ -554,6 +798,54 @@ fn audit_rotates_at_cap_and_backfill_reads_both_generations() {
         sessions.contains(&w.session_id.unwrap()),
         "backfill must read rotated audit generations"
     );
+}
+
+#[test]
+fn parse_audit_lines_is_ordered_and_skips_malformed() {
+    let text = "\
+{\"ts_ms\":1,\"actor\":\"loomux\",\"action\":\"group-create\",\"detail\":{\"repo\":\"r\"}}
+not json at all
+{\"ts_ms\":2,\"actor\":\"human\",\"action\":\"prompt\",\"detail\":{\"to\":\"w-1\",\"text\":\"hi\\nthere\"}}
+
+{\"ts_ms\":3,\"actor\":\"loomux\",\"action\":\"agent-spawn\"}";
+    let entries = parse_audit_lines(text);
+    // Malformed line and the blank line are skipped; the three valid ones
+    // survive in file order.
+    assert_eq!(entries.len(), 3, "malformed and blank lines must be skipped");
+    assert_eq!(entries[0].action, "group-create");
+    assert_eq!(entries[1].actor, "human");
+    assert_eq!(entries[2].ts_ms, 3);
+    // A line missing `detail` still parses (detail becomes null), not dropped.
+    assert!(entries[2].detail.is_null());
+    // Full prompt text is preserved for in-app expansion.
+    assert_eq!(entries[1].detail["text"], "hi\nthere");
+}
+
+#[test]
+fn audit_log_reads_both_generations_oldest_first() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let gdir = reg.state_root().join(&g.id);
+    // Seed a group-create in the current log, then rotate it into audit.1 so
+    // the two-generation read path is exercised.
+    rotate_audit_if_needed(&gdir, 1);
+    assert!(gdir.join("audit.1.jsonl").is_file());
+    // Append a fresh entry to the new current log.
+    reg.audit(&g.id, "human", "prompt", serde_json::json!({ "to": "w-1", "text": "hello" }));
+
+    let entries = reg.audit_log(&g.id);
+    let actions: Vec<&str> = entries.iter().map(|e| e.action.as_str()).collect();
+    // Rotated (older) generation first, then the current one.
+    assert!(actions.contains(&"group-create"), "rotated generation must be included");
+    assert_eq!(actions.last(), Some(&"prompt"), "current generation appends after the rotated one");
+    let prompt = entries.iter().find(|e| e.action == "prompt").unwrap();
+    assert_eq!(prompt.detail["text"], "hello");
+}
+
+#[test]
+fn audit_log_of_unknown_group_is_empty() {
+    let (reg, _d) = test_registry();
+    assert!(reg.audit_log("no-such-group").is_empty());
 }
 
 // ---------- durable roster & orchestration restore ----------
@@ -822,4 +1114,746 @@ fn every_tool_call_is_audited() {
         .expect("tool-call audit entry");
     assert_eq!(call["actor"], co.agent_id.as_str());
     assert!(lines.iter().any(|e| e["action"] == "tool-result" && e["detail"]["tool"] == "list_agents"));
+}
+
+// ---------- cost containment (#7): pause, idle-kill, spawn-rate, usage ----------
+
+/// Guardrails with the two cost knobs set; other fields mirror `rails()`
+/// but with a roomier agent cap so the spawn-rate guardrail can be exercised
+/// without tripping the live-agent cap first.
+fn costed_rails(idle_kill_minutes: u32, max_spawns_per_hour: u32) -> Guardrails {
+    Guardrails {
+        max_agents: 6,
+        agent_cli: "claude".into(),
+        worker_model: "sonnet".into(),
+        reviewer_model: "sonnet".into(),
+        orchestrator_model: "opus".into(),
+        auto_ops: false,
+        idle_kill_minutes,
+        max_spawns_per_hour,
+        watchdog_stall_minutes: 0,
+    }
+}
+
+/// Guardrails with a watchdog stall window set (other fields mirror
+/// `costed_rails`); a roomy agent cap so several workers can be watched.
+fn watchdog_rails(watchdog_stall_minutes: u32) -> Guardrails {
+    Guardrails { watchdog_stall_minutes, ..costed_rails(0, 0) }
+}
+
+#[test]
+fn idle_should_kill_respects_threshold_and_disable() {
+    let min = 60_000u64;
+    // Disabled (0) never kills, no matter how long idle.
+    assert!(!idle_should_kill(Some(0), 100 * min, 0));
+    // An agent with work (None) is never idle-killed.
+    assert!(!idle_should_kill(None, 100 * min, 5));
+    // Under the threshold: safe. At/over: kill.
+    assert!(!idle_should_kill(Some(0), 4 * min, 5));
+    assert!(!idle_should_kill(Some(min), 5 * min, 5)); // exactly 4 min idle < 5
+    assert!(idle_should_kill(Some(0), 5 * min, 5)); // exactly at threshold
+    assert!(idle_should_kill(Some(0), 10 * min, 5));
+}
+
+#[test]
+fn spawn_rate_exceeded_counts_only_the_trailing_window() {
+    let window = 60 * 60 * 1000u64;
+    let now = 10 * window; // 10h in
+    // Unlimited (0) never trips.
+    assert!(!spawn_rate_exceeded(&[now, now, now, now], now, 0, window));
+    // Three within the last hour, limit 3 → next is refused.
+    let recent = [now - 1000, now - 2000, now - 3000];
+    assert!(spawn_rate_exceeded(&recent, now, 3, window));
+    // The same three but limit 4 → still room.
+    assert!(!spawn_rate_exceeded(&recent, now, 4, window));
+    // Old spawns (outside the window) don't count toward the cap.
+    let stale = [now - window - 1, now - 2 * window, now - 500];
+    assert!(!spawn_rate_exceeded(&stale, now, 2, window));
+}
+
+#[test]
+fn parse_session_cost_reads_the_lowest_statusline_dollar() {
+    // Typical Claude statusline at the bottom of the pane.
+    let pane = "some agent output\n$ ran a command\nmodel: sonnet · $0.42 · 12k tokens";
+    assert_eq!(parse_session_cost(pane), Some(0.42));
+    // Thousands separators tolerated; bottom-most render wins.
+    assert_eq!(parse_session_cost("cost $1.00\ntotal $1,234.56 session"), Some(1234.56));
+    // A bare "$" or "$." with no digits is not a cost.
+    assert_eq!(parse_session_cost("price: $ TBD\nsee $.foo"), None);
+    // No dollar figure at all.
+    assert_eq!(parse_session_cost("just some\noutput lines"), None);
+    // Whole-dollar amount.
+    assert_eq!(parse_session_cost("session cost $3"), Some(3.0));
+}
+
+#[test]
+fn pause_suppresses_delivery_and_persists_across_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let gid;
+    {
+        let reg = OrchRegistry::new(dir.path().to_path_buf());
+        reg.set_port(45999);
+        let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+        gid = g.id.clone();
+        let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+        // Not paused: delivery proceeds past the pause gate and only fails
+        // because test mode has no real terminal.
+        let err = reg.deliver_prompt(&w.id, "hello", "loomux", false).unwrap_err();
+        assert!(err.contains("terminal"), "unpaused delivery must reach the pty step, got: {err}");
+        // Paused: delivery is suppressed (Ok, no error) and audited.
+        reg.pause_group(&g.id).unwrap();
+        assert!(reg.is_paused(&g.id));
+        reg.deliver_prompt(&w.id, "hello again", "loomux", false).unwrap();
+        let log = fs::read_to_string(reg.state_root().join(&g.id).join("audit.jsonl")).unwrap();
+        assert!(log.contains("prompt-suppressed-paused"), "suppression must be audited");
+        assert!(reg.state_root().join(&g.id).join("paused").is_file(), "pause marker must be written");
+    }
+    // Restart: the pause survives (marker re-seeds the in-memory flag).
+    let reg = OrchRegistry::new(dir.path().to_path_buf());
+    reg.set_port(45999);
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    assert_eq!(g.id, gid);
+    assert!(reg.is_paused(&g.id), "a paused group must stay paused across restarts");
+    // Resume clears the flag and the marker.
+    reg.resume_group(&g.id).unwrap();
+    assert!(!reg.is_paused(&g.id));
+    assert!(!reg.state_root().join(&g.id).join("paused").is_file(), "resume must remove the marker");
+}
+
+#[test]
+fn idle_workers_are_reap_candidates_but_busy_ones_and_orchestrator_are_not() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", costed_rails(5, 0)).unwrap();
+    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let idle = reg.spawn_agent(&g.id, Role::Worker, "idle", "", false, None).unwrap();
+    let busy = reg.spawn_agent(&g.id, Role::Worker, "busy", "do work", false, None).unwrap();
+    // Read the idle worker's stamped idle-since so the test is time-relative.
+    let roster = reg.list_agents(&g.id);
+    let idle_since = roster
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["id"] == idle.id.as_str())
+        .and_then(|a| a["idle_since_ms"].as_u64())
+        .expect("an idle-spawned worker must carry idle_since_ms");
+    // The busy worker (spawned with a task) has no idle clock.
+    let busy_idle = roster
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["id"] == busy.id.as_str())
+        .unwrap()["idle_since_ms"]
+        .clone();
+    assert!(busy_idle.is_null(), "a worker given a task must not start the idle clock");
+    let threshold_ms = 5 * 60_000u64;
+    // Just before the threshold: nobody is reaped.
+    let before = reg.idle_reap_candidates(idle_since + threshold_ms - 1);
+    assert!(before.is_empty(), "must not reap before the timeout, got: {before:?}");
+    // At/after the threshold: only the idle worker (never the orchestrator or
+    // the busy worker).
+    let after = reg.idle_reap_candidates(idle_since + threshold_ms);
+    assert_eq!(after, vec![idle.id.clone()], "only the idle worker crosses the timeout");
+}
+
+#[test]
+fn idle_kill_disabled_reaps_nothing() {
+    let (reg, _d) = test_registry();
+    // idle_kill_minutes = 0 → the guardrail is off.
+    let g = reg.create_group("C:/tmp/repo", costed_rails(0, 0)).unwrap();
+    reg.spawn_agent(&g.id, Role::Worker, "idle", "", false, None).unwrap();
+    // Even absurdly far in the future, nothing is a candidate.
+    assert!(reg.idle_reap_candidates(u64::MAX / 2).is_empty());
+}
+
+#[test]
+fn reaper_spares_a_worker_reactivated_before_the_kill() {
+    // Selection and kill happen under separate locks; a worker prompted in
+    // that window (idle clock cleared) must not be reaped. reap_idle_agents
+    // re-checks idle_should_kill immediately before killing.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", costed_rails(5, 0)).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let idle = reg.spawn_agent(&g.id, Role::Worker, "idle", "", false, None).unwrap();
+    let co = reg.resolve_token(&orch.token).unwrap();
+    let far_future = u64::MAX / 2;
+    // The idle worker is a genuine candidate at that time.
+    assert_eq!(reg.idle_reap_candidates(far_future), vec![idle.id.clone()]);
+    // The orchestrator hands it work — send_prompt clears its idle clock
+    // (delivery then fails in test mode with no pane, which is fine).
+    let _ = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "send_prompt", "arguments": { "agent_id": idle.id, "text": "here is a task" } }));
+    // Now it is no longer idle, so the reaper kills nothing.
+    assert!(reg.reap_idle_agents(far_future).is_empty(),
+        "a re-activated worker must not be reaped");
+    // And it is still alive in the roster.
+    let roster = reg.list_agents(&g.id).to_string();
+    assert!(roster.contains(&idle.id));
+}
+
+#[test]
+fn spawn_rate_guardrail_backstops_a_burst() {
+    let (reg, _d) = test_registry();
+    // Cap 2 spawns/hour, roomy agent cap so the rate limit is what bites.
+    let g = reg.create_group("C:/tmp/repo", costed_rails(0, 2)).unwrap();
+    reg.spawn_agent(&g.id, Role::Worker, "w1", "t", false, None).unwrap();
+    reg.spawn_agent(&g.id, Role::Worker, "w2", "t", false, None).unwrap();
+    let err = reg.spawn_agent(&g.id, Role::Worker, "w3", "t", false, None).unwrap_err();
+    assert!(err.contains("spawn-rate"), "third spawn within the hour must be refused, got: {err}");
+    // The orchestrator is exempt from the spawn-rate backstop.
+    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+}
+
+#[test]
+fn report_completion_reidles_worker_and_send_prompt_reactivates() {
+    let (reg, _d, co, cw) = setup_mcp();
+    // The worker from setup_mcp was spawned with a task → not idle.
+    let idle_of = |id: &str| -> Value {
+        reg.list_agents(&cw.group)
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["id"] == id)
+            .unwrap()["idle_since_ms"]
+            .clone()
+    };
+    assert!(idle_of(&cw.agent_id).is_null(), "a tasked worker is not idle");
+    // Reporting done re-idles it (delivery to the orchestrator fails in test
+    // mode with no pane, but the idle transition happens first).
+    let _ = dispatch(&reg, &cw, "tools/call",
+        &json!({ "name": "report", "arguments": { "status": "done", "summary": "PR up" } }));
+    assert!(!idle_of(&cw.agent_id).is_null(), "a worker that reported done becomes idle again");
+    // The orchestrator sending it a fresh prompt clears the idle clock.
+    let _ = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "send_prompt", "arguments": { "agent_id": cw.agent_id, "text": "next" } }));
+    assert!(idle_of(&cw.agent_id).is_null(), "send_prompt must re-activate an idle worker");
+}
+
+// ---------- watchdog: stalled-agent detection (#10) ----------
+
+/// A time far past any real `now_ms()` (year ~33658), so a `watchdog_tick` at
+/// this instant is unambiguously past the stall window for an agent whose
+/// clock was stamped at spawn/report with the real wall clock.
+const FAR: u64 = 1_000_000_000_000_000;
+
+/// Group with an orchestrator and one working (tasked) worker under a watchdog
+/// with the given stall window (minutes). Returns (reg, tempdir, group, worker).
+fn watchdog_setup(stall_min: u32) -> (OrchRegistry, tempfile::TempDir, String, String) {
+    let (reg, dir) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", watchdog_rails(stall_min)).unwrap();
+    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "do work", false, None).unwrap();
+    (reg, dir, g.id, w.id)
+}
+
+#[test]
+fn watchdog_should_notify_respects_threshold_anti_nag_and_disable() {
+    let min = 60_000u64;
+    // A 0 window disables the guardrail entirely.
+    assert!(!watchdog_should_notify(0, 100 * min, 0, false));
+    // Inside the window: not yet.
+    assert!(!watchdog_should_notify(0, 4 * min, 5, false));
+    // At and past the window: notify.
+    assert!(watchdog_should_notify(0, 5 * min, 5, false), "exactly at the window notifies");
+    assert!(watchdog_should_notify(0, 10 * min, 5, false));
+    // Past the window but already notified: the anti-nag latch suppresses it.
+    assert!(!watchdog_should_notify(0, 10 * min, 5, true), "one notice per stall");
+}
+
+#[test]
+fn watchdog_flags_a_silent_worker_once_per_stall() {
+    let (reg, _d, gid, wid) = watchdog_setup(5);
+    let no_output = HashMap::new();
+    // Long past the stall window with no output and no report → one notice.
+    assert_eq!(reg.watchdog_tick(FAR, &no_output), vec![wid.clone()],
+        "a silent working agent must be flagged");
+    let log = fs::read_to_string(reg.state_root().join(&gid).join("audit.jsonl")).unwrap();
+    assert!(log.contains("watchdog-stall"), "the stall must be audited, got: {log}");
+    // Anti-nag: still silent, but already notified for this same stall.
+    assert!(reg.watchdog_tick(FAR + 60_000, &no_output).is_empty(),
+        "must not nag twice for one uninterrupted stall");
+}
+
+#[test]
+fn watchdog_stall_resets_when_the_agent_produces_output() {
+    let (reg, _d, _gid, wid) = watchdog_setup(5);
+    let empty = HashMap::new();
+    assert_eq!(reg.watchdog_tick(FAR, &empty), vec![wid.clone()]);
+    // The CLI emits output: a grown pty counter is activity — clock and latch
+    // both reset, and this very tick must not also flag a stall.
+    let grew: HashMap<String, u64> = [(wid.clone(), 1024u64)].into_iter().collect();
+    assert!(reg.watchdog_tick(FAR, &grew).is_empty(), "output growth is activity, not a stall");
+    // No further growth; a whole fresh window elapses → a brand-new notice.
+    let later = FAR + 5 * 60_000 + 1;
+    assert_eq!(reg.watchdog_tick(later, &grew), vec![wid.clone()],
+        "a new stall after activity earns a new notice");
+}
+
+#[test]
+fn watchdog_ignores_idle_dead_and_disabled_agents() {
+    // A 0 stall window disables the watchdog for the whole group.
+    let (off, _d0, _g0, _w0) = watchdog_setup(0);
+    assert!(off.watchdog_tick(FAR, &HashMap::new()).is_empty(),
+        "stall window 0 disables the watchdog");
+    // With the guardrail on, idle and dead agents are still out of scope: idle
+    // is the reaper's concern, and a dead/reaped pane must never be nudged.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo2", watchdog_rails(5)).unwrap();
+    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    reg.spawn_agent(&g.id, Role::Worker, "idle", "", false, None).unwrap();
+    let dead = reg.spawn_agent(&g.id, Role::Worker, "dead", "work", false, None).unwrap();
+    reg.mark_dead(&dead.id, Some(1));
+    let flagged = reg.watchdog_tick(FAR, &HashMap::new());
+    assert!(flagged.is_empty(),
+        "neither an idle nor a dead agent may be watchdog-flagged, got: {flagged:?}");
+}
+
+#[test]
+fn watchdog_stays_quiet_for_a_paused_group() {
+    let (reg, _d, gid, wid) = watchdog_setup(5);
+    reg.pause_group(&gid).unwrap();
+    assert!(reg.watchdog_tick(FAR, &HashMap::new()).is_empty(),
+        "a paused group's agents idle out on purpose — no watchdog notices");
+    // Crucially, the one-notice budget must be intact: pausing must not have
+    // burned the latch, so on resume the outstanding stall still earns its
+    // first notice.
+    reg.resume_group(&gid).unwrap();
+    assert_eq!(reg.watchdog_tick(FAR, &HashMap::new()), vec![wid.clone()],
+        "resuming an unattended stall must still earn its first notice");
+}
+
+#[test]
+fn watchdog_stall_resets_when_the_agent_reports_or_messages() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", watchdog_rails(5)).unwrap();
+    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "work", false, None).unwrap();
+    let cw = reg.resolve_token(&w.token).unwrap();
+    // Stalled and flagged (anti-nag latch now set).
+    assert_eq!(reg.watchdog_tick(FAR, &HashMap::new()), vec![w.id.clone()]);
+    // A progress report is a sign of life: it clears the latch (via re-idle
+    // bookkeeping), so a later silence re-notifies. If the latch had NOT been
+    // cleared this tick would be empty — that's the discriminator.
+    let _ = dispatch(&reg, &cw, "tools/call",
+        &json!({ "name": "report", "arguments": { "status": "progress", "summary": "still going" } }));
+    assert_eq!(reg.watchdog_tick(FAR + 60_000, &HashMap::new()), vec![w.id.clone()],
+        "a report must reset the stall, then a later silence re-notifies");
+    // A free-form message likewise counts as activity and clears the latch.
+    let _ = dispatch(&reg, &cw, "tools/call",
+        &json!({ "name": "message_orchestrator", "arguments": { "text": "checking in" } }));
+    assert_eq!(reg.watchdog_tick(FAR + 120_000, &HashMap::new()), vec![w.id.clone()],
+        "a message must also reset the stall, then a later silence re-notifies");
+}
+
+// ---------- attention routing: surface which pane needs the human (#6) ----------
+
+/// Group with an orchestrator and one working (tasked) worker; the watchdog is
+/// off (irrelevant here). Returns (reg, tempdir, group, worker id).
+fn attention_setup() -> (OrchRegistry, tempfile::TempDir, String, String) {
+    let (reg, dir) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", watchdog_rails(0)).unwrap();
+    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "do work", false, None).unwrap();
+    (reg, dir, g.id, w.id)
+}
+
+fn no_tails() -> HashMap<String, String> {
+    HashMap::new()
+}
+
+#[test]
+fn prompt_wait_detected_spots_prompts_not_chatter() {
+    // Claude Code permission menu.
+    assert!(prompt_wait_detected(
+        "Do you want to make this edit to lib.rs?\n❯ 1. Yes\n  2. No, tell Claude what to do"
+    ));
+    // Copilot-style allow prompt with a selection pointer.
+    assert!(prompt_wait_detected("? Allow command? ›\n❯ Yes\n  No"));
+    // A bare yes/no confirmation.
+    assert!(prompt_wait_detected("Overwrite the file? (y/n)"));
+    // Folder-trust dialog.
+    assert!(prompt_wait_detected("Do you trust the files in this folder?"));
+    // Normal streaming output is not a prompt.
+    assert!(!prompt_wait_detected(
+        "Running cargo test...\n   Compiling loomux v0.2.0\ntest result: ok. 42 passed"
+    ));
+    // A question merely mentioned mid-explanation is not enough on its own.
+    assert!(!prompt_wait_detected(
+        "I weighed whether to proceed with the refactor and decided it was fine."
+    ));
+    assert!(!prompt_wait_detected(""));
+}
+
+#[test]
+fn attention_flags_idle_with_prompt_only_when_quiet_and_unattended() {
+    let (reg, _d, _g, wid) = attention_setup();
+    let now = 1_000_000_000_000u64;
+    let out: HashMap<String, u64> = [(wid.clone(), 100u64)].into_iter().collect();
+    let prompt: HashMap<String, String> =
+        [(wid.clone(), "Do you want to proceed?\n❯ 1. Yes\n  2. No".to_string())]
+            .into_iter()
+            .collect();
+    let no_input = HashMap::new();
+
+    // First sighting starts the quiet clock — not yet flagged even though the
+    // tail is prompt-shaped (could be a prompt that just appeared, still painting).
+    let first = reg.attention_tick(now, &out, &prompt, &no_input);
+    assert!(first.iter().all(|i| i.reason != "waiting"), "must debounce the first quiet tick");
+
+    // Output stable past the quiet window → idle-with-prompt.
+    let waited = reg.attention_tick(now + 5000, &out, &prompt, &no_input);
+    assert_eq!(
+        waited.iter().filter(|i| i.agent_id == wid && i.reason == "waiting").count(),
+        1,
+        "a quiet pane parked on a prompt needs the human"
+    );
+
+    // The human typing into the pane means they are already on it — suppressed.
+    let typed: HashMap<String, u64> = [(wid.clone(), now + 5000)].into_iter().collect();
+    let while_typing = reg.attention_tick(now + 5000, &out, &prompt, &typed);
+    assert!(
+        while_typing.iter().all(|i| i.reason != "waiting"),
+        "a recent human keystroke suppresses the idle-with-prompt badge"
+    );
+
+    // Fresh output (the CLI is painting again) resets the quiet clock.
+    let grew: HashMap<String, u64> = [(wid.clone(), 200u64)].into_iter().collect();
+    let painting = reg.attention_tick(now + 6000, &grew, &prompt, &no_input);
+    assert!(
+        painting.iter().all(|i| i.reason != "waiting"),
+        "new output is activity, not an idle prompt"
+    );
+}
+
+#[test]
+fn attention_does_not_flag_a_quiet_pane_without_a_prompt() {
+    let (reg, _d, _g, wid) = attention_setup();
+    let now = 1_000_000_000_000u64;
+    let out: HashMap<String, u64> = [(wid.clone(), 100u64)].into_iter().collect();
+    let busy_tail: HashMap<String, String> =
+        [(wid.clone(), "   Compiling loomux\ntest result: ok".to_string())].into_iter().collect();
+    let no_input = HashMap::new();
+    reg.attention_tick(now, &out, &busy_tail, &no_input);
+    let later = reg.attention_tick(now + 60_000, &out, &busy_tail, &no_input);
+    assert!(
+        later.is_empty(),
+        "a quiet pane whose tail is not a prompt must not be flagged, got: {later:?}"
+    );
+}
+
+#[test]
+fn attention_latches_worker_reports_until_ack_or_progress() {
+    let (reg, _d, _g, wid) = attention_setup();
+    let w = reg.agent(&wid).unwrap();
+    let cw = reg.resolve_token(&w.token).unwrap();
+    let now = 1_000_000_000_000u64;
+    let empty = HashMap::new();
+
+    // A blocked report badges the pane "blocked".
+    let _ = dispatch(&reg, &cw, "tools/call",
+        &json!({ "name": "report", "arguments": { "status": "blocked", "summary": "stuck" } }));
+    let flagged = reg.attention_tick(now, &empty, &no_tails(), &empty);
+    assert_eq!(
+        flagged.iter().filter(|i| i.agent_id == wid && i.reason == "blocked").count(),
+        1,
+        "a blocked report must badge the reporting pane"
+    );
+
+    // The human acks (focuses the pane): the latch clears.
+    reg.ack_attention(&wid);
+    assert!(
+        reg.attention_tick(now, &empty, &no_tails(), &empty).iter().all(|i| i.agent_id != wid),
+        "ack must clear the report badge"
+    );
+
+    // A done report badges "report"; a later progress report (worker resumed)
+    // clears it.
+    let _ = dispatch(&reg, &cw, "tools/call",
+        &json!({ "name": "report", "arguments": { "status": "done", "summary": "pr up" } }));
+    assert_eq!(
+        reg.attention_tick(now, &empty, &no_tails(), &empty)
+            .iter()
+            .filter(|i| i.agent_id == wid && i.reason == "report")
+            .count(),
+        1,
+        "a done report awaits the human's review"
+    );
+    let _ = dispatch(&reg, &cw, "tools/call",
+        &json!({ "name": "report", "arguments": { "status": "progress", "summary": "back at it" } }));
+    assert!(
+        reg.attention_tick(now, &empty, &no_tails(), &empty).iter().all(|i| i.agent_id != wid),
+        "a progress report means the worker is active again — no badge"
+    );
+}
+
+#[test]
+fn attention_flags_a_worker_whose_task_is_at_a_human_gate() {
+    let (reg, _d, gid, wid) = attention_setup();
+    let now = 1_000_000_000_000u64;
+    let empty = HashMap::new();
+
+    // A board task assigned to the worker, sitting at the PR merge gate.
+    reg.upsert_task(&gid, "orch", None, TaskPatch {
+        title: Some("ship it".into()),
+        status: Some("pr".into()),
+        assignee: Some(wid.clone()),
+        ..Default::default()
+    })
+    .unwrap();
+    let flagged = reg.attention_tick(now, &empty, &no_tails(), &empty);
+    assert_eq!(
+        flagged.iter().filter(|i| i.agent_id == wid && i.reason == "gate").count(),
+        1,
+        "an assigned task at a human gate must flag its worker's pane"
+    );
+
+    // Approving it (status → done) drops the gate.
+    let tid = reg.tasks(&gid)[0].id.clone();
+    reg.upsert_task(&gid, "orch", Some(&tid),
+        TaskPatch { status: Some("done".into()), ..Default::default() }).unwrap();
+    assert!(
+        reg.attention_tick(now, &empty, &no_tails(), &empty).iter().all(|i| i.agent_id != wid),
+        "an off-gate task no longer flags its worker"
+    );
+}
+
+#[test]
+fn attention_toasts_once_per_onset_only_for_optin_groups() {
+    let (reg, _d, gid, wid) = attention_setup();
+    let blocked = vec![AttentionItem {
+        agent_id: wid.clone(),
+        group: gid.clone(),
+        name: "w".into(),
+        role: Role::Worker,
+        pty_id: None,
+        reason: "blocked",
+        detail: "stuck".into(),
+    }];
+
+    // Notifications off by default → nothing toasts.
+    assert!(reg.attention_toast_targets(&blocked).is_empty(), "no toasts until opted in");
+
+    // Opt in → the blocked event toasts once, then dedups for the same stall.
+    reg.set_notify(&gid, true).unwrap();
+    assert_eq!(reg.attention_toast_targets(&blocked), vec![wid.clone()]);
+    assert!(
+        reg.attention_toast_targets(&blocked).is_empty(),
+        "the same reason must not re-toast every scan"
+    );
+
+    // A persistent gate state never toasts — the board highlight covers it.
+    let gate = vec![AttentionItem { reason: "gate", ..blocked[0].clone() }];
+    assert!(reg.attention_toast_targets(&gate).is_empty(), "gate is not a toastable event");
+}
+
+#[test]
+fn notify_optin_is_durable_across_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let gid;
+    {
+        let reg = OrchRegistry::new(dir.path().to_path_buf());
+        reg.set_port(45999);
+        let g = reg.create_group("C:/tmp/repo", watchdog_rails(0)).unwrap();
+        gid = g.id.clone();
+        assert!(!reg.notify_enabled(&gid), "off by default");
+        reg.set_notify(&gid, true).unwrap();
+        assert!(reg.notify_enabled(&gid));
+    }
+    // A fresh registry over the same root re-seeds the opt-in from the marker.
+    let reg2 = OrchRegistry::new(dir.path().to_path_buf());
+    reg2.set_port(45999);
+    let g2 = reg2.create_group("C:/tmp/repo", watchdog_rails(0)).unwrap();
+    assert_eq!(g2.id, gid);
+    assert!(reg2.notify_enabled(&gid), "notification opt-in must survive a restart");
+
+    // Turning it off removes the marker.
+    reg2.set_notify(&gid, false).unwrap();
+    assert!(!reg2.notify_enabled(&gid));
+}
+
+#[test]
+fn group_usage_summarizes_agents_with_null_cost_without_panes() {
+    let (reg, _d, _co, _cw) = setup_mcp();
+    let usage = reg.group_usage(&_co.group);
+    // No live panes in test mode → every cost is null and there is no total.
+    assert!(usage["total_cost_usd"].is_null());
+    let agents = usage["agents"].as_array().unwrap();
+    assert!(agents.iter().any(|a| a["id"] == "orch-1"), "orchestrator must appear");
+    assert!(agents.iter().all(|a| a["cost_usd"].is_null()));
+    // Exposed to the orchestrator over MCP too.
+    let via_mcp = dispatch(&reg, &_co, "tools/call",
+        &json!({ "name": "group_usage", "arguments": {} })).unwrap();
+    assert_eq!(via_mcp["isError"], false);
+    assert!(via_mcp["content"][0]["text"].as_str().unwrap().contains("total_cost_usd"));
+    // Workers cannot pull the group-wide usage summary.
+    let denied = dispatch(&reg, &_cw, "tools/call",
+        &json!({ "name": "group_usage", "arguments": {} })).unwrap();
+    assert_eq!(denied["isError"], true, "usage aggregation is orchestrator-only");
+}
+
+#[test]
+fn group_json_records_cost_guardrails() {
+    let (reg, _d) = test_registry();
+    let mut rails = costed_rails(15, 30);
+    rails.watchdog_stall_minutes = 12;
+    let g = reg.create_group("C:/tmp/repo", rails).unwrap();
+    let gj: Value = serde_json::from_str(
+        &fs::read_to_string(reg.state_root().join(&g.id).join("group.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(gj["guardrails"]["idle_kill_minutes"], 15);
+    assert_eq!(gj["guardrails"]["max_spawns_per_hour"], 30);
+    assert_eq!(gj["guardrails"]["watchdog_stall_minutes"], 12);
+}
+
+// ---------- group lifecycle: summary & end-orchestration (#8) ----------
+
+#[test]
+fn worktree_cleanup_targets_dedupes_and_spares_the_repo_root() {
+    let repo = "C:/Projects/loomux";
+    let cwds = vec![
+        // The orchestrator's cwd == the repo root, in a different spelling —
+        // must never be a removal target (it's the user's real checkout).
+        r"C:\Projects\loomux".to_string(),
+        // Two workers sharing one worktree (resume reuses cwd) → one target.
+        "C:/Projects/loomux-worktrees/a".to_string(),
+        "C:/Projects/loomux-worktrees/a/".to_string(),
+        "C:/Projects/loomux-worktrees/b".to_string(),
+        "".to_string(), // an unbound agent with no cwd is skipped
+    ];
+    let targets = worktree_cleanup_targets(repo, &cwds);
+    assert_eq!(
+        targets,
+        vec![
+            "C:/Projects/loomux-worktrees/a".to_string(),
+            "C:/Projects/loomux-worktrees/b".to_string(),
+        ],
+        "repo root excluded, case/separator/trailing-slash duplicates collapsed"
+    );
+}
+
+#[test]
+fn group_summary_counts_live_agents_roles_and_uptime() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    reg.spawn_agent(&g.id, Role::Worker, "w1", "do a thing", false, None).unwrap();
+    let dead = reg.spawn_agent(&g.id, Role::Worker, "w2", "", false, None).unwrap();
+    // A dead agent must drop out of the live count and role breakdown.
+    reg.mark_dead(&dead.id, Some(0));
+
+    let s = reg.group_summary(&g.id);
+    assert_eq!(s["live_agents"], 2);
+    assert_eq!(s["roles"]["orchestrator"], 1);
+    assert_eq!(s["roles"]["worker"], 1);
+    assert_eq!(s["roles"]["reviewer"], 0);
+    assert_eq!(s["paused"], false);
+    // Uptime is present (measured from the earliest live agent) and every live
+    // agent carries its own uptime; the dead one is gone.
+    assert!(s["uptime_ms"].as_u64().is_some(), "group uptime must be reported");
+    let agents = s["agents"].as_array().unwrap();
+    assert_eq!(agents.len(), 2);
+    assert!(agents.iter().all(|a| a["uptime_ms"].as_u64().is_some()));
+    assert!(!agents.iter().any(|a| a["id"] == dead.id.as_str()));
+    // Pausing the group is reflected so the panel can compose the two actions.
+    reg.pause_group(&g.id).unwrap();
+    assert_eq!(reg.group_summary(&g.id)["paused"], true);
+}
+
+#[test]
+fn end_group_kills_everyone_including_the_orchestrator() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    reg.spawn_agent(&g.id, Role::Worker, "w1", "t", false, None).unwrap();
+    // kill_agent refuses the orchestrator; end_group must not.
+    let result = reg.end_group(&g.id, false).unwrap();
+    assert_eq!(result["killed"].as_array().unwrap().len(), 2);
+    // Every agent is now dead — the group reads as fully torn down.
+    for a in reg.list_agents(&g.id).as_array().unwrap() {
+        assert_eq!(a["status"], "dead", "end must kill every role");
+    }
+    assert_eq!(reg.group_summary(&g.id)["live_agents"], 0);
+    // The teardown is audited as a human action.
+    let log = fs::read_to_string(reg.state_root().join(&g.id).join("audit.jsonl")).unwrap();
+    let end = log
+        .lines()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .find(|e| e["action"] == "group-end")
+        .expect("end must be audited");
+    assert_eq!(end["actor"], "human");
+    // Unknown group: an error, not a silent success.
+    assert!(reg.end_group("ghost-group", false).is_err());
+}
+
+#[test]
+fn end_group_clears_pause_so_relaunch_starts_clean() {
+    let dir = tempfile::tempdir().unwrap();
+    let gid;
+    {
+        let reg = OrchRegistry::new(dir.path().to_path_buf());
+        reg.set_port(45999);
+        let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+        gid = g.id.clone();
+        reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+        // A paused group that gets ended: the pause marker must not outlive it,
+        // or a relaunch on the same repo id would silently resume paused.
+        reg.pause_group(&g.id).unwrap();
+        assert!(reg.state_root().join(&g.id).join("paused").is_file());
+        reg.end_group(&g.id, false).unwrap();
+        assert!(!reg.is_paused(&g.id), "ending must drop the in-memory pause");
+        assert!(
+            !reg.state_root().join(&g.id).join("paused").is_file(),
+            "ending must remove the pause marker"
+        );
+    }
+    // Relaunch on the same repo → same id, not paused.
+    let reg = OrchRegistry::new(dir.path().to_path_buf());
+    reg.set_port(45999);
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    assert_eq!(g.id, gid);
+    assert!(!reg.is_paused(&g.id), "a relaunched group must not inherit the old pause");
+}
+
+#[test]
+fn end_group_removes_worktrees_of_dead_and_live_agents() {
+    // A real git repo with two worktrees; end_group(cleanup=true) must reclaim
+    // both — including the one whose worker already exited — while leaving the
+    // main checkout intact.
+    let repo = tempfile::tempdir().unwrap();
+    let repo_path = repo.path().to_string_lossy().replace('\\', "/");
+    let git = |args: &[&str]| {
+        let ok = std::process::Command::new("git")
+            .current_dir(&repo_path)
+            .args(args)
+            .output()
+            .expect("git must be installed for this test");
+        assert!(ok.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&ok.stderr));
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "t@t"]);
+    git(&["config", "user.name", "t"]);
+    fs::write(repo.path().join("f.txt"), "hi").unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "init"]);
+
+    let (reg, _d) = test_registry();
+    let g = reg.create_group(&repo_path, rails()).unwrap();
+    // Two worktree-backed workers (spawn creates the worktree via git).
+    let live = reg
+        .spawn_agent(&g.id, Role::Worker, "live", "t", true, Some("wt-live".into()))
+        .unwrap();
+    let dead = reg
+        .spawn_agent(&g.id, Role::Worker, "dead", "t", true, Some("wt-dead".into()))
+        .unwrap();
+    assert!(Path::new(&live.cwd).is_dir() && Path::new(&dead.cwd).is_dir());
+    // One worker has already exited — its worktree must still be reclaimed.
+    reg.mark_dead(&dead.id, Some(0));
+
+    let result = reg.end_group(&g.id, true).unwrap();
+    assert!(result["worktree_errors"].as_array().unwrap().is_empty(), "got: {result}");
+    assert_eq!(result["worktrees_removed"].as_array().unwrap().len(), 2);
+    assert!(!Path::new(&live.cwd).exists(), "live agent's worktree must be gone");
+    assert!(!Path::new(&dead.cwd).exists(), "exited agent's worktree must be gone");
+    // The main checkout is untouched.
+    assert!(repo.path().join("f.txt").is_file(), "the repo root must survive teardown");
 }

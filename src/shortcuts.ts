@@ -10,6 +10,8 @@ export type ShortcutAction =
   | "toggle-agent-mode"
   | "toggle-git"
   | "toggle-tasks"
+  | "toggle-audit"
+  | "toggle-group"
   | "rename-pane"
   | "focus-left"
   | "focus-right"
@@ -36,6 +38,8 @@ export function matchShortcut(e: KeyboardEvent): ShortcutAction | null {
       // find-previous accelerator before the page ever sees it.
       case "KeyG": return "toggle-git";
       case "KeyT": return "toggle-tasks";
+      case "KeyA": return "toggle-audit";
+      case "KeyO": return "toggle-group";
     }
   }
   if (e.code === "F2" && !e.ctrlKey && !e.altKey && !e.shiftKey) return "rename-pane";

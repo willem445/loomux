@@ -34,6 +34,15 @@ export interface OrchestratorConfig {
   reviewerModel: string;
   orchestratorModel: string;
   autoOps: boolean;
+  /** Cost guardrail: auto-kill an idle worker/reviewer after this many
+   *  minutes without a task (0 = disabled). */
+  idleKillMinutes: number;
+  /** Cost guardrail: cap on worker/reviewer spawns per rolling hour
+   *  (0 = unlimited). */
+  maxSpawnsPerHour: number;
+  /** Recovery guardrail: nudge the orchestrator when a working agent goes
+   *  silent (no output, no report) this many minutes (0 = disabled). */
+  watchdogStallMinutes: number;
 }
 
 // Per-group identity: a stable accent color AND a short ordinal tag shown in
@@ -73,6 +82,31 @@ export function badgeFor(req: OrchSpawnRequest): PaneBadge {
   };
 }
 
+/** One pane that needs the human, from the backend attention scan. `reason`
+ *  is (most→least urgent) "blocked" | "waiting" | "report" | "gate". */
+export interface AttentionItem {
+  agent_id: string;
+  group: string;
+  name: string;
+  role: OrchRole;
+  pty_id: number | null;
+  reason: string;
+  detail: string;
+}
+
+/** The human focused/handled an attention-badged pane: clear its latched
+ *  report backend-side so the badge drops. */
+export const ackAttention = (agentId: string): Promise<void> =>
+  invoke("orch_ack_attention", { agentId });
+
+/** Whether desktop notifications are enabled for a group. */
+export const notifyEnabled = (groupId: string): Promise<boolean> =>
+  invoke<boolean>("orch_notify_enabled", { groupId });
+
+/** Enable/disable desktop notifications for a group (durable, per-group). */
+export const setNotify = (groupId: string, enabled: boolean): Promise<void> =>
+  invoke("orch_set_notify", { groupId, enabled });
+
 async function openAgentPane(
   grid: Grid,
   paneEvents: PaneEvents,
@@ -86,6 +120,7 @@ async function openAgentPane(
       badge: badgeFor(req),
       orchGroup: req.group_id,
       orchRole: req.role,
+      orchAgent: req.agent_id,
     },
     paneEvents,
     grid.paneCount >= 2 ? "column" : "row"
@@ -109,6 +144,26 @@ export function initOrchestration(grid: Grid, paneEvents: PaneEvents): void {
     if (pane) {
       grid.setActive(pane);
       pane.focus();
+    }
+  });
+  // Attention routing: the backend pushes the full current set of panes that
+  // need the human every scan; badge each group pane by its pty (absent =
+  // clear). Idempotent per pane, so re-emits every few seconds are cheap.
+  void listen<AttentionItem[]>("orch-attention", ({ payload }) => {
+    const byPty = new Map<number, AttentionItem>();
+    for (const it of payload) if (it.pty_id !== null) byPty.set(it.pty_id, it);
+    for (const pane of grid.panes()) {
+      if (!pane.orchGroupId || pane.ptyId === null) continue;
+      const it = byPty.get(pane.ptyId);
+      pane.setAttention(it ? it.reason : null, it?.detail);
+    }
+  });
+  // End-orchestration: the backend has already killed the group's agents, so
+  // close their (now-dead) panes rather than leaving a screen of dead
+  // terminals — the pane-by-pane ✕-clicking this action exists to replace.
+  void listen<{ group_id: string }>("orch-group-ended", ({ payload }) => {
+    for (const pane of grid.panes()) {
+      if (pane.orchGroupId === payload.group_id) grid.closePane(pane, false);
     }
   });
 }
@@ -160,6 +215,90 @@ export async function launchOrchestrator(
     reviewerModel: config.reviewerModel,
     orchestratorModel: config.orchestratorModel,
     autoOps: config.autoOps,
+    idleKillMinutes: config.idleKillMinutes,
+    maxSpawnsPerHour: config.maxSpawnsPerHour,
+    watchdogStallMinutes: config.watchdogStallMinutes,
   });
   await openAgentPane(grid, paneEvents, spec);
 }
+
+// ---------- cost containment: pause/resume + per-group usage ----------
+
+/** One agent's parsed session cost within a group usage summary. */
+export interface AgentUsage {
+  id: string;
+  name: string;
+  role: string;
+  /** Dollars parsed from the pane statusline, or null if none was visible. */
+  cost_usd: number | null;
+}
+
+/** Aggregated per-group cost/usage (backend `orch_group_usage`). */
+export interface GroupUsage {
+  group: string;
+  /** Sum across agents with a visible cost, or null if none had one. */
+  total_cost_usd: number | null;
+  agents: AgentUsage[];
+  note: string;
+}
+
+/** Pause a group: loomux stops delivering prompts/kickoffs so its agents
+ *  idle out, containing unattended spend. Reversible with `resumeGroup`. */
+export const pauseGroup = (groupId: string): Promise<void> =>
+  invoke("orch_pause_group", { groupId });
+
+/** Resume a paused group so prompt/kickoff delivery flows again. */
+export const resumeGroup = (groupId: string): Promise<void> =>
+  invoke("orch_resume_group", { groupId });
+
+/** Whether a group is currently paused (for the pause/resume button state). */
+export const groupPaused = (groupId: string): Promise<boolean> =>
+  invoke<boolean>("orch_group_paused", { groupId });
+
+/** Aggregate per-pane session cost into one group summary. */
+export const groupUsage = (groupId: string): Promise<GroupUsage> =>
+  invoke<GroupUsage>("orch_group_usage", { groupId });
+
+// ---------- group lifecycle: summary + end-orchestration (#8) ----------
+
+/** One live agent in a group lifecycle summary. */
+export interface AgentSummary {
+  id: string;
+  name: string;
+  role: OrchRole;
+  /** Empty for an idle/ready agent. */
+  task: string;
+  /** Unix-ms this agent last went idle, or null while it has work. */
+  idle_since_ms: number | null;
+  /** Milliseconds since the agent was spawned. */
+  uptime_ms: number;
+}
+
+/** At-a-glance lifecycle summary for a group (backend `orch_group_summary`). */
+export interface GroupSummary {
+  group: string;
+  live_agents: number;
+  paused: boolean;
+  /** Group uptime (from the earliest live agent), or null if none are live. */
+  uptime_ms: number | null;
+  roles: { orchestrator: number; worker: number; reviewer: number };
+  agents: AgentSummary[];
+}
+
+/** Result of ending a group (killed agent ids + worktree cleanup outcome). */
+export interface EndGroupResult {
+  group: string;
+  killed: string[];
+  worktrees_removed: string[];
+  worktree_errors: { path: string; error: string }[];
+}
+
+/** Live-agent count, role breakdown, and uptime for the lifecycle panel. */
+export const groupSummary = (groupId: string): Promise<GroupSummary> =>
+  invoke<GroupSummary>("orch_group_summary", { groupId });
+
+/** End a whole orchestration: kill all its agents and (optionally) remove
+ *  their worktrees. Destructive and human-initiated — the caller confirms
+ *  first. The backend emits `orch-group-ended` so the panes close. */
+export const endGroup = (groupId: string, cleanupWorktrees: boolean): Promise<EndGroupResult> =>
+  invoke<EndGroupResult>("orch_end_group", { groupId, cleanupWorktrees });

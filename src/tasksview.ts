@@ -50,6 +50,8 @@ export class TasksView {
   private expanded = new Set<string>();
   /** A refresh arrived while the human was mid-edit; run it on blur. */
   private pendingRefresh = false;
+  /** The open request-changes modal, if any (kept to one at a time). */
+  private dialogEl: HTMLElement | null = null;
   private unlisten: UnlistenFn | null = null;
   private disposed = false;
 
@@ -163,6 +165,66 @@ export class TasksView {
     await this.mutate(invoke("orch_upsert_task", { groupId: this.groupId, title }));
   }
 
+  /** Open a task's issue/PR reference in the default browser. */
+  private openRef(kind: "issue" | "pr", value: string): void {
+    invoke("orch_open_ref", { groupId: this.groupId, kind, value }).catch((err) =>
+      this.toast(String(err))
+    );
+  }
+
+  /** Merge-gate "request changes": collect findings in a modal, then hand
+   *  them to the orchestrator (which routes them back to a worker). */
+  private requestChanges(t: OrchTask): void {
+    if (this.dialogEl) return; // one at a time
+    const overlay = el("div", "tasks-dialog");
+    const box = el("div", "tasks-dialog-box");
+    box.append(el("div", "tasks-dialog-title", `Request changes on ${t.id}`));
+
+    const ta = document.createElement("textarea");
+    ta.className = "dlg-input tasks-dialog-text";
+    ta.placeholder = "What needs to change? These findings go to the orchestrator.";
+    ta.spellcheck = false;
+    ta.rows = 4;
+
+    const actions = el("div", "dlg-actions");
+    const cancel = el("button", "dlg-btn", "Cancel") as HTMLButtonElement;
+    const send = el("button", "dlg-btn primary", "Send") as HTMLButtonElement;
+    actions.append(cancel, send);
+    box.append(ta, actions);
+    overlay.append(box);
+
+    const close = () => {
+      overlay.remove();
+      this.dialogEl = null;
+    };
+    const submit = () => {
+      const findings = ta.value.trim();
+      if (!findings) {
+        ta.focus();
+        return;
+      }
+      close();
+      void this.mutate(
+        invoke("orch_request_changes", { groupId: this.groupId, id: t.id, findings })
+      );
+    };
+    cancel.addEventListener("click", close);
+    send.addEventListener("click", submit);
+    // Keep keystrokes off the underlying terminal; Esc cancels, Ctrl/⌘+Enter sends.
+    ta.addEventListener("keydown", (e) => {
+      e.stopPropagation();
+      if (e.key === "Escape") close();
+      if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) submit();
+    });
+    overlay.addEventListener("mousedown", (e) => {
+      if (e.target === overlay) close();
+    });
+
+    this.dialogEl = overlay;
+    this.el.appendChild(overlay);
+    ta.focus();
+  }
+
   private render(): void {
     this.listEl.replaceChildren();
     if (this.tasks.length === 0) {
@@ -172,8 +234,13 @@ export class TasksView {
     this.tasks.forEach((t, i) => this.listEl.appendChild(this.renderTask(t, i)));
   }
 
+  /** Statuses where only the human can move the item forward — highlighted on
+   *  the board so what is waiting on you stands out (attention routing #6). */
+  private static AWAITING_HUMAN = new Set(["pr", "human-testing", "blocked"]);
+
   private renderTask(t: OrchTask, index: number): HTMLElement {
     const row = el("div", "task-row");
+    if (TasksView.AWAITING_HUMAN.has(t.status)) row.classList.add("awaiting-human");
 
     // Reorder: board order is the priority order the orchestrator follows.
     const order = el("div", "task-order");
@@ -237,15 +304,22 @@ export class TasksView {
     });
     top.appendChild(title);
 
-    // Meta chips: issue / PR / assignee / resumable session.
-    for (const [cls, label, tip] of [
-      ["issue", t.issue, "GitHub issue"],
-      ["pr", t.pr, "Pull request"],
-      ["agent", t.assignee, "Assigned agent"],
+    // Meta chips: issue / PR / assignee / resumable session. Issue and PR
+    // refs are clickable — they open in the browser (see openRef).
+    for (const [cls, label, kind] of [
+      ["issue", t.issue, "issue"],
+      ["pr", t.pr, "pr"],
+      ["agent", t.assignee, null],
     ] as const) {
-      if (label) {
+      if (!label) continue;
+      if (kind) {
+        const chip = el("button", `task-chip ${cls} link`, label) as HTMLButtonElement;
+        chip.title = `Open ${kind === "issue" ? "issue" : "PR"} ${label} in browser`;
+        chip.addEventListener("click", () => this.openRef(kind, label));
+        top.appendChild(chip);
+      } else {
         const chip = el("span", `task-chip ${cls}`, label);
-        chip.title = tip;
+        chip.title = "Assigned agent";
         top.appendChild(chip);
       }
     }
@@ -253,6 +327,20 @@ export class TasksView {
       const chip = el("span", "task-chip session", `⟲ ${t.session.slice(0, 8)}`);
       chip.title = `Resumable session ${t.session} — the orchestrator can reopen this task's agent for follow-ups`;
       top.appendChild(chip);
+    }
+
+    // Merge-gate actions: the human's approve / request-changes touchpoints,
+    // shown only where they belong — on items awaiting the merge decision.
+    if (t.status === "pr" || t.status === "human-testing") {
+      const approve = el("button", "task-btn approve", "✓ Approve") as HTMLButtonElement;
+      approve.title = "Mark done and tell the orchestrator to merge";
+      approve.addEventListener("click", () =>
+        void this.mutate(invoke("orch_approve_task", { groupId: this.groupId, id: t.id }))
+      );
+      const changes = el("button", "task-btn changes", "✎ Changes") as HTMLButtonElement;
+      changes.title = "Request changes — send findings back to the orchestrator";
+      changes.addEventListener("click", () => this.requestChanges(t));
+      top.append(approve, changes);
     }
 
     const notesBtn = el("button", "task-btn notes", `🗨 ${t.notes.length}`) as HTMLButtonElement;

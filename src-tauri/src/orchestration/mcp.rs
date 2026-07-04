@@ -217,6 +217,9 @@ fn tool_defs(role: Role) -> Vec<Value> {
                 &[]),
             tool("remove_task", "Delete a task from the shared board.",
                 json!({ "id": { "type": "string" } }), &["id"]),
+            tool("group_usage",
+                "Aggregate the group's per-pane session cost into one summary (total plus per-agent, parsed best-effort from each pane's statusline). Fold it into your status updates so the human sees spend at a glance.",
+                json!({}), &[]),
         ]);
     } else {
         tools.extend([
@@ -286,6 +289,10 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             reg.delete_task(&caller.group, &caller.agent_id, id)?;
             Ok(format!("removed {id}"))
         }
+        "group_usage" => {
+            require_orchestrator(caller)?;
+            Ok(reg.group_usage(&caller.group).to_string())
+        }
 
         "spawn_agent" => {
             require_orchestrator(caller)?;
@@ -301,13 +308,21 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             let cwd = arg_str(args, "cwd").map(str::to_string);
             let resumed = resume.is_some();
             let a = reg.spawn_agent_ex(&caller.group, kind, name, task, worktree, branch, resume, cwd)?;
+            // Copilot mints its session id a few seconds into boot; loomux
+            // binds it to the pane once it appears (visible then in
+            // list_agents / the task board).
+            let session = a
+                .session_id
+                .as_deref()
+                .map(|s| format!("Session {s}."))
+                .unwrap_or_else(|| "Session id will appear in list_agents once Copilot initializes.".into());
             Ok(format!(
-                "spawned {} (\"{}\", {:?}){}. Session {}. It will report when ready.",
+                "spawned {} (\"{}\", {:?}){}. {} It will report when ready.",
                 a.id,
                 a.name,
                 a.role,
                 if resumed { " resuming its previous session" } else { "" },
-                a.session_id.as_deref().unwrap_or("untracked"),
+                session,
             ))
         }
         "send_prompt" => {
@@ -318,6 +333,11 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             if a.id == caller.agent_id {
                 return Err("cannot send a prompt to yourself".into());
             }
+            // The target is being given work/direction — it is no longer
+            // idle, so the idle-kill guardrail's clock stops for it. Marked
+            // before delivery (which is async in the running app) so the
+            // intent to assign counts regardless of delivery timing.
+            reg.set_agent_idle(&a.id, false);
             reg.deliver_prompt(&a.id, text, &caller.agent_id, false)?;
             Ok(format!("prompt delivered to {}", a.id))
         }
@@ -358,6 +378,12 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                 return Err("status must be progress | done | blocked".into());
             }
             let summary = arg_str(args, "summary").ok_or("summary required")?;
+            // A worker that finished (done) or stalled (blocked) is idle
+            // again — restart its idle-kill clock; progress keeps it active.
+            reg.set_agent_idle(&caller.agent_id, matches!(status, "done" | "blocked"));
+            // Attention routing: a done/blocked report badges the pane (and can
+            // toast) so the human sees which one needs them; progress clears it.
+            reg.note_report_attention(&caller.agent_id, status);
             reg.deliver_to_orchestrator(
                 &caller.group,
                 &format!("[loomux] {} reports {status}: {summary}", caller.agent_id),
@@ -370,6 +396,9 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                 return Err("you are the orchestrator".into());
             }
             let text = arg_str(args, "text").ok_or("text required")?;
+            // A message is a sign of life: reset the watchdog's silence clock
+            // (report already does this via set_agent_idle).
+            reg.note_agent_activity(&caller.agent_id);
             reg.deliver_to_orchestrator(
                 &caller.group,
                 &format!("[loomux] message from {}: {text}", caller.agent_id),

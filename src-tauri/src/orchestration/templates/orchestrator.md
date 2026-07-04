@@ -17,9 +17,30 @@ watching and may type into any pane at any time — treat human input as authori
 - `list_tasks()` / `upsert_task(...)` / `remove_task(id)` — the shared **task board**.
 - `get_state()` / `set_state(state)` — your durable memory (JSON string). It survives
   your session; GitHub issues survive everything.
+- `group_usage()` — aggregated per-pane session cost for the whole group (total +
+  per-agent). Fold it into your status summaries so the human sees spend at a glance.
 
 Workers report back with `report(...)`; their reports and exit notices appear in your
 pane as `[loomux] ...` messages.
+
+## Cost guardrails (enforced by loomux)
+
+Unattended orchestration burns money over time, so loomux enforces these automatically —
+plan around them, don't fight them:
+
+- **Idle-kill.** A worker/reviewer left without a task past the configured timeout is
+  auto-killed; you get a `[loomux] idle-kill …` notice. Don't hold idle panes "just in
+  case" — spawn on demand. If one you needed is killed, spawn a fresh one.
+- **Spawn-rate cap.** Spawns per hour are capped as a runaway backstop; a rejected
+  `spawn_agent` says so. Reuse idle agents and pace real work rather than bursting.
+- **Watchdog.** If a working agent produces no terminal output and sends no report for
+  the configured stall window, loomux sends you one `[loomux] watchdog …` notice per stall.
+  Act on it: `get_output` the pane, and if its kickoff was lost or it is wedged, re-send the
+  task with `send_prompt`. The notice repeats only after the agent moves again and re-stalls.
+- **Pause.** The human can pause the group from the pane UI. While paused, loomux delivers
+  nothing to any pane (kickoffs, prompts, and worker reports are all suppressed) so agents
+  finish their turn and go quiet. On resume, re-sync (`list_tasks`, `list_agents`) — queued
+  messages are not replayed.
 
 ## The task board
 
@@ -85,7 +106,8 @@ flow: branch → implement → meaningful tests → design notes/user docs → c
 report ready/progress within a couple of minutes. If one stays silent, `get_output` its
 pane: an idle CLI with an empty input box means its kickoff was lost — re-send the
 task with `send_prompt`. Never assume a spawned agent received its brief until it has
-reported.
+reported. Loomux's watchdog (above) backstops this automatically, but you don't have to
+wait for it — check any agent that has been quiet longer than you'd expect.
 
 When a worker reports a PR:
 1. `spawn_agent(kind: "reviewer", ...)` (or reuse an idle reviewer) with the PR number.

@@ -141,6 +141,33 @@ html, body {
   box-shadow: inset 3px 0 0 var(--group-color, var(--accent));
 }
 
+/* ---------- attention routing: "needs attention" badge (#6) ---------- */
+/* A pane the backend attention scan flagged (idle-with-prompt, a worker report,
+   or a task at a human merge gate). The chip names the reason; the header edge
+   pulses amber so a pane needing you stands out across a wall of terminals. */
+.pane-attn {
+  flex: none; cursor: pointer;
+  font-size: 9px; font-weight: 700; letter-spacing: 0.4px;
+  border: 1px solid #6a5230; border-radius: 4px; padding: 1.5px 6px;
+  color: #f2c66a; background: rgba(224, 175, 104, 0.16);
+  animation: attn-pulse 1.6s ease-in-out infinite;
+}
+.pane-attn:hover { background: rgba(224, 175, 104, 0.28); color: #ffd886; }
+/* Blocked is the most urgent — tint it red rather than amber. */
+.pane-attn[data-reason="blocked"] {
+  color: #ff9db0; background: rgba(247, 118, 142, 0.16); border-color: rgba(247, 118, 142, 0.4);
+}
+.pane.needs-attention .pane-header {
+  box-shadow: inset 3px 0 0 var(--group-color, var(--accent)), inset 0 -2px 0 #e0af68;
+}
+@keyframes attn-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(224, 175, 104, 0); }
+  50% { box-shadow: 0 0 8px 1px rgba(224, 175, 104, 0.5); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .pane-attn { animation: none; }
+}
+
 /* ---------- pane metadata (folder · branch) ---------- */
 .pane-meta {
   flex: 1 1 auto; min-width: 0;
@@ -517,6 +544,13 @@ html, body {
   padding: 4px 4px 4px 2px; border-radius: 7px;
 }
 .task-row:hover { background: var(--panel); }
+/* Items only the human can advance (pr / human-testing / blocked): a left
+   accent + faint wash so what is waiting on you stands out (#6). */
+.task-row.awaiting-human {
+  box-shadow: inset 3px 0 0 #e0af68;
+  background: rgba(224, 175, 104, 0.07);
+}
+.task-row.awaiting-human:hover { background: rgba(224, 175, 104, 0.12); }
 .task-order { display: flex; flex-direction: column; flex: none; }
 .task-btn {
   background: none; border: none; border-radius: 4px;
@@ -556,6 +590,39 @@ html, body {
   max-width: 130px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .task-chip.session { font-family: "Cascadia Mono", Consolas, monospace; }
+/* Clickable issue/PR refs (open in browser). */
+.task-chip.link {
+  border: none; font: inherit; font-size: 9.5px; cursor: pointer;
+  color: var(--accent); background: var(--accent-dim);
+}
+.task-chip.link:hover { color: #cdd8f5; text-decoration: underline; }
+
+/* Merge-gate action buttons (approve / request changes). */
+.task-btn.approve, .task-btn.changes {
+  flex: none; height: 18px; font-size: 10px; padding: 0 7px;
+  border: 1px solid transparent; white-space: nowrap;
+}
+.task-btn.approve { color: #b4e878; }
+.task-btn.approve:hover { background: rgba(158, 206, 106, 0.16); border-color: #3d5a2c; }
+.task-btn.changes { color: #e0af68; }
+.task-btn.changes:hover { background: rgba(224, 175, 104, 0.16); border-color: #55452c; }
+
+/* Request-changes modal, scoped inside the task-board overlay. */
+.tasks-dialog {
+  position: absolute; inset: 0; z-index: 5;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(8, 10, 16, 0.55);
+}
+.tasks-dialog-box {
+  width: min(92%, 420px);
+  display: flex; flex-direction: column; gap: 10px;
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: 10px; padding: 14px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+  animation: dlg-in 0.16s var(--ease);
+}
+.tasks-dialog-title { font-weight: 600; font-size: 12px; }
+.tasks-dialog-text { resize: vertical; min-height: 66px; line-height: 1.4; }
 
 .task-notes { padding: 3px 4px 5px 26px; }
 .task-note { display: flex; gap: 8px; padding: 2px 0; font-size: 11px; }
@@ -563,6 +630,167 @@ html, body {
 .task-note-text { min-width: 0; color: var(--text); user-select: text; }
 .task-note-add { display: flex; gap: 6px; margin-top: 5px; }
 .task-note-add input { flex: 1; min-width: 0; padding: 3px 8px; font-size: 11px; }
+
+/* ---------- audit log overlay ---------- */
+.audit-view {
+  flex: 1; min-height: 0; position: relative;
+  display: flex; flex-direction: column;
+  background: var(--bg-app); font-size: 12px;
+}
+.audit-head {
+  display: flex; align-items: center; gap: 9px; flex: none;
+  height: 30px; padding: 0 6px 0 12px;
+  border-bottom: 1px solid var(--border-soft);
+}
+.audit-head .pane-btn { opacity: 1; }
+.audit-title { font-weight: 600; font-size: 12px; flex: none; }
+.audit-group {
+  flex: 1; min-width: 0; color: var(--text-dim); font-size: 10.5px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.audit-count { flex: none; color: var(--text-dim); font-size: 10px; }
+.audit-follow {
+  flex: none; font: inherit; font-size: 10.5px; cursor: pointer;
+  background: var(--panel-2); color: var(--text-dim);
+  border: 1px solid var(--border-soft); border-radius: 5px; padding: 2px 8px;
+}
+.audit-follow:hover { color: var(--text); }
+.audit-follow.on { background: rgba(158, 206, 106, 0.16); color: #b4e878; border-color: #3f5a2e; }
+
+.audit-filters {
+  display: flex; gap: 6px; flex: none; align-items: center;
+  padding: 6px 10px; border-bottom: 1px solid var(--border-soft);
+}
+.audit-select {
+  flex: none; font: inherit; font-size: 10.5px;
+  background: var(--panel-2); color: var(--text);
+  border: 1px solid var(--border-soft); border-radius: 5px; padding: 2px 5px;
+  max-width: 150px;
+}
+.audit-search { flex: 1; min-width: 60px; padding: 3px 8px; font-size: 11px; }
+
+.audit-list { flex: 1; overflow-y: auto; padding: 2px 0 8px; }
+.audit-list::-webkit-scrollbar { width: 9px; }
+.audit-list::-webkit-scrollbar-thumb {
+  background: #262634; border-radius: 5px;
+  border: 2px solid var(--bg-app); background-clip: padding-box;
+}
+.audit-empty { padding: 22px 16px; color: var(--text-dim); line-height: 1.5; }
+
+.audit-row { padding: 1px 10px; border-bottom: 1px solid rgba(255, 255, 255, 0.03); }
+.audit-top {
+  display: flex; align-items: baseline; gap: 8px; min-height: 22px;
+  padding: 2px 0;
+}
+.audit-top.expandable { cursor: pointer; }
+.audit-top.expandable:hover { background: var(--panel); }
+.audit-caret, .audit-caret-spacer {
+  flex: none; width: 10px; color: var(--text-dim); font-size: 9px;
+}
+.audit-time {
+  flex: none; font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 10px; color: var(--text-dim);
+}
+.audit-actor {
+  flex: none; font-size: 9.5px; font-weight: 600; border-radius: 4px;
+  padding: 1px 6px; background: var(--panel-2); color: var(--text-dim);
+  max-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.audit-actor.actor-loomux { background: rgba(122, 162, 247, 0.14); color: #a7bff8; }
+.audit-actor.actor-human { background: rgba(158, 206, 106, 0.16); color: #b4e878; }
+.audit-action {
+  flex: none; font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 10px; color: var(--accent); white-space: nowrap;
+}
+.audit-action.act-prompt-failed, .audit-action.act-submit-retries-skipped { color: var(--danger); }
+.audit-summary {
+  flex: 1; min-width: 0; color: var(--text);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.audit-detail {
+  margin: 2px 0 6px 28px; padding: 8px 10px;
+  background: var(--panel); border-radius: 6px;
+  font-family: "Cascadia Mono", Consolas, monospace; font-size: 11px;
+  line-height: 1.45; color: var(--text);
+  white-space: pre-wrap; word-break: break-word; user-select: text;
+  max-height: 320px; overflow: auto;
+}
+
+/* -- group lifecycle panel -- */
+.group-view {
+  flex: 1; min-height: 0; position: relative;
+  display: flex; flex-direction: column;
+  background: var(--bg-app); font-size: 12px;
+}
+.group-head {
+  display: flex; align-items: center; gap: 9px; flex: none;
+  height: 30px; padding: 0 6px 0 12px;
+  border-bottom: 1px solid var(--border-soft);
+}
+.group-head .pane-btn { opacity: 1; }
+.group-title { font-weight: 600; font-size: 12px; flex: none; }
+.group-group {
+  flex: 1; min-width: 0; color: var(--text-dim); font-size: 10.5px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.group-summary {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap; flex: none;
+  padding: 8px 12px; border-bottom: 1px solid var(--border-soft);
+}
+.group-line { color: var(--text); font-weight: 500; }
+.group-cost { color: var(--text-dim); font-size: 11px; }
+.group-paused-badge {
+  font-size: 9.5px; font-weight: 600; border-radius: 4px; padding: 1px 7px;
+  background: rgba(224, 175, 104, 0.16); color: #e0af68;
+}
+.group-list { flex: 1; overflow-y: auto; padding: 4px 0 8px; }
+.group-list::-webkit-scrollbar { width: 9px; }
+.group-list::-webkit-scrollbar-thumb {
+  background: #262634; border-radius: 5px;
+  border: 2px solid var(--bg-app); background-clip: padding-box;
+}
+.group-empty { padding: 22px 16px; color: var(--text-dim); line-height: 1.5; }
+.group-row {
+  display: flex; align-items: baseline; gap: 9px; min-height: 24px;
+  padding: 3px 12px; border-bottom: 1px solid rgba(255, 255, 255, 0.03);
+}
+.group-role {
+  flex: none; width: 34px; text-align: center;
+  font-size: 9px; font-weight: 700; border-radius: 4px; padding: 1px 0;
+  background: var(--panel-2); color: var(--text-dim);
+}
+.group-role.role-orchestrator { background: rgba(122, 162, 247, 0.16); color: #a7bff8; }
+.group-role.role-worker { background: rgba(158, 206, 106, 0.16); color: #b4e878; }
+.group-role.role-reviewer { background: rgba(187, 154, 247, 0.16); color: #cbb2fb; }
+.group-name {
+  flex: 1; min-width: 0; color: var(--text);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.group-state { flex: none; color: var(--text-dim); font-size: 10.5px; }
+.group-uptime, .group-agent-cost {
+  flex: none; font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 10px; color: var(--text-dim); min-width: 42px; text-align: right;
+}
+.group-actions {
+  display: flex; align-items: center; gap: 10px; flex: none;
+  padding: 8px 12px; border-top: 1px solid var(--border-soft);
+}
+.group-end-wrap { margin-left: auto; display: flex; align-items: center; gap: 8px; }
+.group-cleanup {
+  display: flex; align-items: center; gap: 4px;
+  color: var(--text-dim); font-size: 10.5px; cursor: pointer; user-select: none;
+}
+.group-btn {
+  font: inherit; font-size: 11px; cursor: pointer;
+  background: var(--panel-2); color: var(--text);
+  border: 1px solid var(--border-soft); border-radius: 5px; padding: 4px 12px;
+}
+.group-btn:hover { border-color: var(--accent); }
+.group-btn.on { background: rgba(224, 175, 104, 0.16); color: #e0af68; border-color: #6a5230; }
+.group-btn.danger { color: var(--danger); border-color: rgba(247, 118, 142, 0.35); }
+.group-btn.danger:hover { border-color: var(--danger); }
+.group-btn.danger.armed { background: var(--danger); color: #1a1a22; border-color: var(--danger); }
+.group-btn:disabled { opacity: 0.5; cursor: default; }
 
 /* -- graph column -- */
 .git-graph {

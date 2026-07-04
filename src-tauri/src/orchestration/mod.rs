@@ -17,12 +17,12 @@ pub mod mcp;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -32,6 +32,30 @@ const REVIEWER_TPL: &str = include_str!("templates/reviewer.md");
 
 /// Hard ceiling on `max_agents` regardless of what the launcher asks for.
 const MAX_AGENTS_CEILING: u32 = 12;
+/// Upper bound on the idle-worker auto-kill timeout (24h); 0 disables it.
+const MAX_IDLE_KILL_MINUTES: u32 = 1440;
+/// Upper bound on the spawn-rate guardrail; 0 = unlimited.
+const MAX_SPAWNS_PER_HOUR: u32 = 240;
+/// Sliding window the spawn-rate guardrail counts spawns over.
+const SPAWN_RATE_WINDOW_MS: u64 = 60 * 60 * 1000;
+/// How often the idle reaper wakes to look for workers to auto-kill.
+const IDLE_REAP_INTERVAL: Duration = Duration::from_secs(30);
+/// How often the watchdog wakes to look for stalled working agents.
+const WATCHDOG_INTERVAL: Duration = Duration::from_secs(30);
+/// Upper bound on the watchdog stall timeout (24h); 0 disables it.
+const MAX_WATCHDOG_STALL_MINUTES: u32 = 1440;
+/// How often the attention scan recomputes which panes need the human
+/// (idle-with-prompt detection; report/gate signals are event-driven and
+/// picked up on the next tick).
+const ATTENTION_INTERVAL: Duration = Duration::from_secs(3);
+/// A pane's terminal output must be stable (unchanged) at least this long
+/// before an idle-with-prompt is asserted — the CLI has stopped painting and
+/// is genuinely parked on a prompt, not mid-render. Measured across ticks, so
+/// it also debounces (needs a couple of consecutive quiet scans).
+const ATTENTION_QUIET_MS: u64 = 4000;
+/// If the human typed into a pane within this window it does not "need
+/// attention" — they are already at the keyboard on it.
+const ATTENTION_RECENT_INPUT_MS: u64 = 6000;
 /// How long the frontend gets to open a pane and report its pty id.
 const BIND_TIMEOUT: Duration = Duration::from_secs(20);
 /// Gap between the bracketed paste and the Enter that submits it.
@@ -80,6 +104,15 @@ const ECHO_RETRY_DELAY: Duration = Duration::from_millis(1500);
 const ECHO_ATTEMPTS: u32 = 3;
 /// Upper bound for `set_state` payloads.
 const MAX_STATE_BYTES: usize = 512 * 1024;
+
+// Copilot session tracking: unlike Claude, copilot can't be handed a session
+// id up front — it mints one and writes `~/.copilot/session-state/<id>/` a
+// few seconds into boot. After spawning a copilot pane we poll for the new
+// session directory and bind its id to the pane's roster record.
+/// How often to poll `session-state` for the pane's new session.
+const COPILOT_SESSION_POLL: Duration = Duration::from_millis(1000);
+/// Give up watching after this long (copilot never initialized, or crashed).
+const COPILOT_SESSION_TIMEOUT: Duration = Duration::from_secs(90);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -139,6 +172,18 @@ pub struct Guardrails {
     /// shows a confirm dialog whose default answer is "exit", which the
     /// kickoff typing would accept, killing the pane.
     pub auto_ops: bool,
+    /// Cost guardrail: auto-kill a worker/reviewer that has sat without a
+    /// task for this many minutes (the orchestrator is notified so it can
+    /// respawn on demand). 0 disables it. See `idle_should_kill`.
+    pub idle_kill_minutes: u32,
+    /// Cost guardrail: cap on worker/reviewer spawns per rolling hour, a
+    /// runaway-orchestrator backstop. 0 = unlimited. See `spawn_rate_exceeded`.
+    pub max_spawns_per_hour: u32,
+    /// Recovery guardrail: nudge the orchestrator once when a working agent
+    /// produces no terminal output and sends no report for this many minutes
+    /// (likely stalled or waiting on input). 0 disables it. See
+    /// `watchdog_should_notify`.
+    pub watchdog_stall_minutes: u32,
 }
 
 impl Guardrails {
@@ -157,8 +202,170 @@ impl Guardrails {
         self.worker_model = sanitize_model(&self.worker_model, worker_fb);
         self.reviewer_model = sanitize_model(&self.reviewer_model, worker_fb);
         self.orchestrator_model = sanitize_model(&self.orchestrator_model, orch_fb);
+        self.idle_kill_minutes = self.idle_kill_minutes.min(MAX_IDLE_KILL_MINUTES);
+        self.max_spawns_per_hour = self.max_spawns_per_hour.min(MAX_SPAWNS_PER_HOUR);
+        self.watchdog_stall_minutes = self.watchdog_stall_minutes.min(MAX_WATCHDOG_STALL_MINUTES);
         self
     }
+}
+
+/// Whether an idle agent has sat long enough to auto-kill. Pure so the
+/// threshold logic is testable without threads or wall-clock; the reaper
+/// loop lives in `start_idle_reaper`. `idle_since_ms` is `None` for an agent
+/// that currently has work (never idle-killed); a `threshold_min` of 0
+/// disables the guardrail entirely.
+pub fn idle_should_kill(idle_since_ms: Option<u64>, now_ms: u64, threshold_min: u32) -> bool {
+    match (threshold_min, idle_since_ms) {
+        (0, _) | (_, None) => false,
+        (m, Some(t)) => now_ms.saturating_sub(t) >= (m as u64) * 60_000,
+    }
+}
+
+/// Whether the spawn-rate guardrail should reject the next spawn: true when
+/// at least `limit` spawns already fall inside the trailing `window_ms`.
+/// Pure so the sliding-window arithmetic is testable; `limit` 0 = unlimited.
+pub fn spawn_rate_exceeded(times: &[u64], now: u64, limit: u32, window_ms: u64) -> bool {
+    if limit == 0 {
+        return false;
+    }
+    let recent = times.iter().filter(|&&t| now.saturating_sub(t) < window_ms).count();
+    recent as u32 >= limit
+}
+
+/// Whether a working agent has been silent (no terminal output, no report)
+/// long enough to warrant one watchdog nudge to the orchestrator. Pure so the
+/// stall arithmetic and the anti-nag rule are testable without threads or a
+/// real pty; the scan loop lives in `start_watchdog`. `threshold_min` 0
+/// disables the guardrail; `already_notified` enforces at-most-one-notice per
+/// stall (the caller clears it when the agent produces output/reports again).
+pub fn watchdog_should_notify(
+    silent_since_ms: u64,
+    now_ms: u64,
+    threshold_min: u32,
+    already_notified: bool,
+) -> bool {
+    if threshold_min == 0 || already_notified {
+        return false;
+    }
+    now_ms.saturating_sub(silent_since_ms) >= (threshold_min as u64) * 60_000
+}
+
+/// Attention routing (#6): does a pane's ANSI-stripped output tail look like a
+/// CLI parked on a prompt only the human can answer — a permission dialog, a
+/// yes/no confirmation, or a numbered selection menu? This is the "last output"
+/// half of idle-with-prompt detection; the caller pairs it with an
+/// output-quiet check (this alone can't tell a live prompt from the same words
+/// scrolled past). So it errs toward recognizable interactive-prompt structure
+/// (the selection pointer both Claude Code and Copilot render, explicit y/n
+/// tokens, the stock permission phrasings) rather than any mention of a
+/// question. Case-insensitive; only the final handful of lines are considered,
+/// because a prompt the CLI is waiting on is the last thing it painted.
+pub fn prompt_wait_detected(tail: &str) -> bool {
+    let lines: Vec<String> = tail
+        .lines()
+        .map(|l| l.trim().to_lowercase())
+        .filter(|l| !l.is_empty())
+        .collect();
+    if lines.is_empty() {
+        return false;
+    }
+    let recent = &lines[lines.len().saturating_sub(12)..];
+    let joined = recent.join("\n");
+
+    // Selection pointer on an option line: how both CLIs render the highlighted
+    // choice of a permission menu (`❯ 1. Yes`, `› Yes`, `→ Allow`).
+    let has_pointer_option = recent
+        .iter()
+        .any(|l| l.starts_with('❯') || l.starts_with('›') || l.starts_with('→'));
+    // A numbered yes/no menu even without the pointer glyph.
+    let has_numbered_menu = joined.contains("1. yes") || joined.contains("❯ 1.");
+    // Explicit yes/no confirmation tokens.
+    let has_yes_no = joined.contains("(y/n)")
+        || joined.contains("[y/n]")
+        || joined.contains("y/n)")
+        || joined.contains("[y/n]?")
+        || joined.contains("yes/no");
+    // Stock permission / trust / continue phrasings from Claude Code & Copilot.
+    let has_permission_phrase = joined.contains("do you want to proceed")
+        || joined.contains("do you want to make this edit")
+        || joined.contains("do you want to create")
+        || joined.contains("do you want to run")
+        || joined.contains("do you trust")
+        || joined.contains("trust the files")
+        || joined.contains("allow this")
+        || joined.contains("allow command")
+        || joined.contains("grant access")
+        || joined.contains("press enter to continue")
+        || joined.contains("waiting for your");
+    has_pointer_option || has_numbered_menu || has_yes_no || has_permission_phrase
+}
+
+/// Distinct agent working directories to remove when a group is torn down
+/// with worktree cleanup: dedup (case/separator-insensitively), and never the
+/// repo root itself — the orchestrator and any repo-mode workers run there, so
+/// removing it would delete the user's own checkout. Pure so the path
+/// filtering is testable without a real git tree; the actual removal is
+/// `git::git_worktree_remove`, which git refuses on a non-worktree anyway.
+pub fn worktree_cleanup_targets(repo: &str, cwds: &[String]) -> Vec<String> {
+    let norm = |s: &str| s.replace('\\', "/").trim_end_matches('/').to_lowercase();
+    let repo_n = norm(repo);
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for c in cwds {
+        if c.trim().is_empty() {
+            continue;
+        }
+        let cn = norm(c);
+        if cn == repo_n {
+            continue; // repo root — the orchestrator's cwd, never a worktree
+        }
+        if seen.insert(cn) {
+            out.push(c.clone());
+        }
+    }
+    out
+}
+
+/// Best-effort extraction of a session's dollar cost from a pane's
+/// ANSI-stripped terminal tail. Claude Code renders running cost in its
+/// in-pane statusline (bottom of the screen), so scan lines bottom-up and
+/// return the dollar amount from the lowest line that carries one — that is
+/// the freshest statusline render. Thousands separators are tolerated.
+/// Returns `None` when no `$<amount>` token is present.
+pub fn parse_session_cost(text: &str) -> Option<f64> {
+    for line in text.lines().rev() {
+        if let Some(cost) = line
+            .match_indices('$')
+            .find_map(|(i, _)| parse_dollar_amount(&line[i + 1..]))
+        {
+            return Some(cost);
+        }
+    }
+    None
+}
+
+/// Parse a leading `1,234.56`-style number (optionally after the `$` already
+/// consumed by the caller), returning `None` if the text does not start with
+/// a digit. Commas are dropped; a single decimal point is honored.
+fn parse_dollar_amount(after_dollar: &str) -> Option<f64> {
+    let mut digits = String::new();
+    let mut seen_dot = false;
+    for c in after_dollar.chars() {
+        match c {
+            '0'..='9' => digits.push(c),
+            ',' if !seen_dot => {} // thousands separator
+            '.' if !seen_dot => {
+                seen_dot = true;
+                digits.push('.');
+            }
+            _ => break,
+        }
+    }
+    // Reject a bare "." or empty (a lone `$` or `$.`); require a real digit.
+    if digits.is_empty() || digits == "." {
+        return None;
+    }
+    digits.parse::<f64>().ok()
 }
 
 /// Models are interpolated into a shell command line; restrict them to
@@ -199,6 +406,44 @@ pub struct AgentEntry {
     /// Working directory the pane runs in; resume must reuse it so the
     /// resumed session's file operations land where the work happened.
     pub cwd: String,
+    /// Unix-ms this worker/reviewer became idle (spawned without a task, or
+    /// reported done/blocked); `None` while it has work or for the
+    /// orchestrator. The idle reaper (`idle_kill_minutes`) reads this.
+    pub idle_since_ms: Option<u64>,
+    /// Unix-ms this agent was registered (spawn time). Drives the per-agent
+    /// and group uptime shown in the lifecycle summary; unaffected by idle.
+    pub started_ms: u64,
+    /// Watchdog: Unix-ms of this agent's last observed activity — terminal
+    /// output growth or a report/message. Silence is measured from here.
+    /// Seeded at spawn and whenever work is (re)assigned. See
+    /// `watchdog_should_notify`.
+    pub last_progress_ms: u64,
+    /// Watchdog: last observed value of the pane's monotonic pty output
+    /// counter, so a tick can tell whether the CLI has emitted anything since
+    /// the previous one even when the output ring is saturated.
+    pub last_output_total: u64,
+    /// Watchdog anti-nag latch: set once a stall notice has been delivered for
+    /// the current stall, cleared when the agent produces output/reports again.
+    pub watchdog_notified: bool,
+}
+
+/// One pane that needs the human, pushed to the frontend as an `orch-attention`
+/// event (the full current set each scan; the frontend badges panes by
+/// `pty_id`). `reason`, most- to least-urgent:
+/// - `blocked` — a worker reported it is blocked
+/// - `waiting` — the pane is parked on a prompt (idle-with-prompt)
+/// - `report`  — a worker reported done (awaiting the human's review/merge)
+/// - `gate`    — this agent's task sits at a human merge gate on the board
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct AttentionItem {
+    pub agent_id: String,
+    pub group: String,
+    pub name: String,
+    pub role: Role,
+    pub pty_id: Option<u32>,
+    pub reason: &'static str,
+    /// Short human phrase for the badge tooltip and the toast body.
+    pub detail: String,
 }
 
 /// Work-item statuses shown on the task board. Kept as strings (not an
@@ -212,6 +457,10 @@ pub const TASK_STATUSES: [&str; 7] = [
     "done",          // merged / accepted by the human
     "blocked",
 ];
+
+/// Statuses where the human's merge-gate actions (approve / request changes)
+/// apply: the PR is open and awaiting the human's decision.
+pub const MERGE_GATE_STATUSES: [&str; 2] = ["pr", "human-testing"];
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TaskNote {
@@ -327,6 +576,32 @@ pub struct OrchRegistry {
     /// orchestrator is registered — without this, two concurrent launches
     /// on one repo would share an id.
     creation: Mutex<()>,
+    /// Groups the human has paused: loomux stops delivering prompts/kickoffs
+    /// to them so their agents idle out (see `deliver_prompt`). Mirrored to a
+    /// `paused` marker file per group so it survives restarts.
+    paused: Mutex<HashSet<String>>,
+    /// Per-group spawn timestamps (Unix-ms) for the spawn-rate guardrail;
+    /// pruned to the trailing hour on each check.
+    spawn_times: Mutex<HashMap<String, Vec<u64>>>,
+    /// Weak handle to our own `Arc`, set once at startup (`set_self_arc`), so
+    /// `&self` methods can hand an owned registry to background threads (e.g.
+    /// the copilot session watcher). `Weak` avoids a self-referential `Arc`
+    /// cycle that would leak the registry.
+    self_arc: Mutex<Weak<OrchRegistry>>,
+    /// Attention routing (#6): latched worker reports awaiting the human's
+    /// eyes — agent id → "done" | "blocked". Set by the report tool, cleared on
+    /// ack (the human focused the pane) or reassignment.
+    attn_reports: Mutex<HashMap<String, &'static str>>,
+    /// Attention routing: per-agent output-quiet tracking, agent id → (last pty
+    /// output total, Unix-ms that total last changed). Kept separate from the
+    /// watchdog's counter so the two features never clobber each other's clocks.
+    attn_quiet: Mutex<HashMap<String, (u64, u64)>>,
+    /// Attention routing: the agent → reason set last emitted, so a scan fires a
+    /// desktop toast only once per attention onset (the event itself is
+    /// re-emitted every tick and the frontend badges idempotently).
+    attn_emitted: Mutex<HashMap<String, String>>,
+    /// Groups with desktop notifications enabled (durable `notify` marker file).
+    notify_groups: Mutex<HashSet<String>>,
 }
 
 fn now_ms() -> u64 {
@@ -482,6 +757,43 @@ fn append_audit(root: &Path, group: &str, actor: &str, action: &str, detail: Val
     }
 }
 
+/// One parsed audit-log line, for the in-app timeline viewer. Mirrors the
+/// shape written by `append_audit`; `detail` stays an opaque JSON value so the
+/// frontend can render per-action without the backend knowing every schema.
+#[derive(Clone, Debug, Serialize)]
+pub struct AuditEntry {
+    pub ts_ms: u64,
+    pub actor: String,
+    pub action: String,
+    pub detail: Value,
+}
+
+/// Parse audit JSONL text into entries, in file order (oldest first), skipping
+/// malformed lines. Pure so ordering/robustness is testable without touching
+/// the filesystem or a registry.
+#[doc(hidden)] // pub for integration tests
+pub fn parse_audit_lines(text: &str) -> Vec<AuditEntry> {
+    text.lines()
+        .filter_map(|line| {
+            if line.trim().is_empty() {
+                return None;
+            }
+            let v: Value = serde_json::from_str(line).ok()?;
+            Some(AuditEntry {
+                ts_ms: v["ts_ms"].as_u64().unwrap_or(0),
+                actor: v["actor"].as_str().unwrap_or("").to_string(),
+                action: v["action"].as_str().unwrap_or("").to_string(),
+                detail: v.get("detail").cloned().unwrap_or(Value::Null),
+            })
+        })
+        .collect()
+}
+
+/// Upper bound on entries returned to the viewer: the audit grows fast (full
+/// prompt texts) and only the most recent slice is worth rendering. Keeps the
+/// payload bounded even against a rotated + current pair near the 8 MB cap.
+const AUDIT_VIEW_LIMIT: usize = 5000;
+
 fn render_template(tpl: &str, vars: &[(&str, &str)]) -> String {
     let mut out = tpl.to_string();
     for (k, v) in vars {
@@ -582,7 +894,28 @@ impl OrchRegistry {
             delivery: Mutex::new(HashMap::new()),
             tasks_lock: Mutex::new(()),
             creation: Mutex::new(()),
+            paused: Mutex::new(HashSet::new()),
+            spawn_times: Mutex::new(HashMap::new()),
+            self_arc: Mutex::new(Weak::new()),
+            attn_reports: Mutex::new(HashMap::new()),
+            attn_quiet: Mutex::new(HashMap::new()),
+            attn_emitted: Mutex::new(HashMap::new()),
+            notify_groups: Mutex::new(HashSet::new()),
         }
+    }
+
+    /// Record the `Arc` the registry is stored behind so `&self` methods can
+    /// spawn background work that outlives the current call. Call once, right
+    /// after wrapping the registry in an `Arc`.
+    pub fn set_self_arc(self: &Arc<Self>) {
+        *self.self_arc.lock().unwrap() = Arc::downgrade(self);
+    }
+
+    /// Upgrade the stored weak self-handle. `None` in unit tests that build a
+    /// bare registry without calling `set_self_arc` — background helpers then
+    /// simply don't run.
+    fn arc(&self) -> Option<Arc<Self>> {
+        self.self_arc.lock().unwrap().upgrade()
     }
 
     /// Default persistent root: `<user data dir>/loomux/orchestration`.
@@ -615,6 +948,28 @@ impl OrchRegistry {
     /// must never take the orchestration down.
     pub fn audit(&self, group: &str, actor: &str, action: &str, detail: Value) {
         append_audit(&self.root, group, actor, action, detail);
+    }
+
+    /// Read a group's audit timeline for the in-app viewer, oldest first.
+    /// Reads the rotated generation (`audit.1.jsonl`) before the current one
+    /// so a rotation doesn't drop history mid-session, then keeps only the
+    /// most recent `AUDIT_VIEW_LIMIT` entries. Missing files read as empty.
+    pub fn audit_log(&self, group: &str) -> Vec<AuditEntry> {
+        let dir = self.group_dir(group);
+        let mut text = String::new();
+        for name in ["audit.1.jsonl", "audit.jsonl"] {
+            if let Ok(t) = fs::read_to_string(dir.join(name)) {
+                text.push_str(&t);
+                if !text.ends_with('\n') {
+                    text.push('\n'); // guard against a rotated file with no trailing newline
+                }
+            }
+        }
+        let mut entries = parse_audit_lines(&text);
+        if entries.len() > AUDIT_VIEW_LIMIT {
+            entries.drain(0..entries.len() - AUDIT_VIEW_LIMIT);
+        }
+        entries
     }
 
     // ---------- durable state ----------
@@ -777,6 +1132,83 @@ impl OrchRegistry {
         Ok(())
     }
 
+    /// Guard the merge-gate actions to items actually at the gate. The UI only
+    /// shows the buttons on `pr`/`human-testing` items, but the command surface
+    /// is callable directly, so enforce it backend-side too — approving a
+    /// `queued` item or requesting changes on a `done` one is meaningless.
+    fn ensure_at_merge_gate(&self, group: &str, id: &str) -> Result<(), String> {
+        let status = self
+            .tasks(group)
+            .into_iter()
+            .find(|t| t.id == id)
+            .ok_or_else(|| format!("unknown task: {id}"))?
+            .status;
+        if MERGE_GATE_STATUSES.contains(&status.as_str()) {
+            Ok(())
+        } else {
+            Err(format!(
+                "task {id} is {status:?}, not at the merge gate — this action only applies to {}",
+                MERGE_GATE_STATUSES.join(" | ")
+            ))
+        }
+    }
+
+    /// Merge-gate approve: mark the item done and tell the orchestrator to
+    /// merge. The status change is the human's direct sign-off, applied here;
+    /// the notice is best-effort (the board is the source of truth).
+    pub fn approve_task(&self, group: &str, id: &str) -> Result<Task, String> {
+        self.ensure_at_merge_gate(group, id)?;
+        let task = self.upsert_task(
+            group,
+            "human",
+            Some(id),
+            TaskPatch {
+                status: Some("done".into()),
+                note: Some("Approved at the merge gate.".into()),
+                ..Default::default()
+            },
+        )?;
+        let pr = task.pr.as_deref().unwrap_or("(no PR ref)");
+        let _ = self.deliver_to_orchestrator(
+            group,
+            &format!(
+                "[loomux] the human APPROVED {} \"{}\" ({}) at the merge gate and marked it done. \
+                 Merge the PR and close out the work item.",
+                task.id, task.title, pr
+            ),
+            "human",
+        );
+        Ok(task)
+    }
+
+    /// Merge-gate request-changes: record the findings as a note and deliver
+    /// them to the orchestrator to route back to a worker. Status is left for
+    /// the orchestrator to manage as it re-dispatches.
+    pub fn request_changes(&self, group: &str, id: &str, findings: &str) -> Result<Task, String> {
+        let findings = findings.trim();
+        if findings.is_empty() {
+            return Err("request changes needs a note describing what to fix".into());
+        }
+        self.ensure_at_merge_gate(group, id)?;
+        let task = self.upsert_task(
+            group,
+            "human",
+            Some(id),
+            TaskPatch { note: Some(format!("Requested changes: {findings}")), ..Default::default() },
+        )?;
+        let pr = task.pr.as_deref().unwrap_or("(no PR ref)");
+        let _ = self.deliver_to_orchestrator(
+            group,
+            &format!(
+                "[loomux] the human REQUESTED CHANGES on {} \"{}\" ({}) at the merge gate. \
+                 Findings: {findings}. Route it back to a worker to address, then re-request review.",
+                task.id, task.title, pr
+            ),
+            "human",
+        );
+        Ok(task)
+    }
+
     /// Tell the orchestrator the human touched the board (best-effort; the
     /// board itself is the source of truth via list_tasks).
     fn notify_board_edit(&self, group: &str, summary: &str) {
@@ -813,8 +1245,13 @@ impl OrchRegistry {
         };
         // Match by (id, session): agent ids restart at 1 every app run, so
         // a bare-id match would overwrite a previous run's record and lose
-        // that session's identity.
-        match list.iter_mut().find(|r| r.id == record.id && r.session == record.session) {
+        // that session's identity. A session-bearing record also supersedes
+        // this run's placeholder for the same id — copilot writes an entry
+        // with no session at spawn, then upgrades it once its session id is
+        // discovered (only placeholders have session == None).
+        match list.iter_mut().find(|r| {
+            r.id == record.id && (r.session == record.session || r.session.is_none())
+        }) {
             Some(r) => *r = record,
             None => list.push(record),
         }
@@ -827,6 +1264,91 @@ impl OrchRegistry {
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default()
+    }
+
+    /// Poll `~/.copilot/session-state` for the session the just-spawned
+    /// copilot pane created (the one absent from `baseline`) and bind its id
+    /// to the pane. Runs on its own thread — copilot writes the session a few
+    /// seconds into boot. Gives up after `COPILOT_SESSION_TIMEOUT`.
+    fn spawn_copilot_session_watcher(
+        self: Arc<Self>,
+        agent_id: String,
+        group_id: String,
+        cwd: String,
+        baseline: HashSet<String>,
+    ) {
+        let Some(root) = crate::sessions::copilot_session_state_root() else {
+            return;
+        };
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + COPILOT_SESSION_TIMEOUT;
+            loop {
+                std::thread::sleep(COPILOT_SESSION_POLL);
+                // Stop if the pane died or was already associated (a resume
+                // re-spawn, or a manual edit) — nothing left to track.
+                match self.agent(&agent_id) {
+                    Some(a) if a.status == AgentStatus::Dead => return,
+                    Some(a) if a.session_id.is_some() => return,
+                    Some(_) => {}
+                    None => return,
+                }
+                if let Some(sid) =
+                    crate::sessions::newest_new_copilot_session(&root, &baseline, &cwd)
+                {
+                    self.associate_copilot_session(&group_id, &agent_id, &sid);
+                    return;
+                }
+                if std::time::Instant::now() >= deadline {
+                    self.audit(&group_id, "loomux", "copilot-session-untracked",
+                        json!({ "agent": agent_id, "reason": "no new session-state appeared before timeout" }));
+                    return;
+                }
+            }
+        });
+    }
+
+    /// Bind a discovered copilot session id to a live pane: update the agent
+    /// map, the durable roster (`agents.json`), and any task board item this
+    /// agent owns — the same session trail Claude gets at spawn. Best-effort.
+    /// Public for the session watcher and its tests; a no-op if the pane is
+    /// gone or already carries a session id.
+    pub fn associate_copilot_session(&self, group_id: &str, agent_id: &str, session_id: &str) {
+        let entry = {
+            let mut agents = self.agents.lock().unwrap();
+            let Some(a) = agents.get_mut(agent_id) else { return };
+            // Don't clobber an id set in the meantime (e.g. a resume).
+            if a.session_id.is_some() {
+                return;
+            }
+            a.session_id = Some(session_id.to_string());
+            a.clone()
+        };
+        let status = match entry.status {
+            AgentStatus::Dead => "dead",
+            _ => "running",
+        };
+        self.persist_agent_record(&entry, status);
+        // Mirror onto the task board: any item this agent owns (by id or
+        // display name) that lacks a session gets it, so the orchestrator can
+        // resume the task later without hunting the id out of list_agents.
+        {
+            let _guard = self.tasks_lock.lock().unwrap();
+            let mut tasks = self.tasks(group_id);
+            let mut changed = false;
+            for t in tasks.iter_mut() {
+                let owner = t.assignee.as_deref().unwrap_or("");
+                if t.session.is_none() && (owner == entry.id || owner == entry.name) {
+                    t.session = Some(session_id.to_string());
+                    t.updated_ms = now_ms();
+                    changed = true;
+                }
+            }
+            if changed {
+                let _ = self.write_tasks(group_id, &tasks);
+            }
+        }
+        self.audit(group_id, "loomux", "copilot-session",
+            json!({ "agent": agent_id, "session": session_id }));
     }
 
     /// Roster entries derived from `agent-spawn` audit lines. Backfill for
@@ -931,6 +1453,9 @@ impl OrchRegistry {
                 reviewer_model: s("reviewer_model", ""),
                 orchestrator_model: s("orchestrator_model", ""),
                 auto_ops: g["auto_ops"].as_bool().unwrap_or(true),
+                idle_kill_minutes: g["idle_kill_minutes"].as_u64().unwrap_or(0) as u32,
+                max_spawns_per_hour: g["max_spawns_per_hour"].as_u64().unwrap_or(0) as u32,
+                watchdog_stall_minutes: g["watchdog_stall_minutes"].as_u64().unwrap_or(0) as u32,
             },
         ))
     }
@@ -968,12 +1493,24 @@ impl OrchRegistry {
                     "reviewer_model": info.guardrails.reviewer_model,
                     "orchestrator_model": info.guardrails.orchestrator_model,
                     "auto_ops": info.guardrails.auto_ops,
+                    "idle_kill_minutes": info.guardrails.idle_kill_minutes,
+                    "max_spawns_per_hour": info.guardrails.max_spawns_per_hour,
+                    "watchdog_stall_minutes": info.guardrails.watchdog_stall_minutes,
                 },
             }))
             .unwrap(),
         )
         .map_err(|e| e.to_string())?;
         self.write_instruction_files(&info)?;
+        // A pause is a durable human safety action: re-seed it from the
+        // marker file so a resumed group stays paused across restarts.
+        if dir.join("paused").is_file() {
+            self.paused.lock().unwrap().insert(id.clone());
+        }
+        // Desktop-notification opt-in is likewise a durable per-group choice.
+        if dir.join("notify").is_file() {
+            self.notify_groups.lock().unwrap().insert(id.clone());
+        }
         self.groups.lock().unwrap().insert(id.clone(), info.clone());
         self.audit(&id, "loomux", if resumed { "group-resume" } else { "group-create" },
             json!({ "repo": repo, "max_agents": info.guardrails.max_agents,
@@ -992,6 +1529,633 @@ impl OrchRegistry {
             .unwrap()
             .values()
             .any(|a| a.group == id && a.status != AgentStatus::Dead)
+    }
+
+    // ---------- cost containment: pause, idle-kill, spawn-rate, usage ----------
+
+    /// Whether a group is currently paused (prompts/kickoffs suppressed).
+    pub fn is_paused(&self, group: &str) -> bool {
+        self.paused.lock().unwrap().contains(group)
+    }
+
+    /// Pause a group: loomux stops delivering prompts and kickoffs to its
+    /// agents, so they finish their current turn and idle out (containing
+    /// unattended spend) without being killed. Durable via a marker file.
+    pub fn pause_group(&self, group: &str) -> Result<(), String> {
+        let newly = self.paused.lock().unwrap().insert(group.to_string());
+        if newly {
+            let dir = self.group_dir(group);
+            fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+            let _ = fs::write(dir.join("paused"), b"");
+            self.audit(group, "human", "group-pause", json!({}));
+        }
+        Ok(())
+    }
+
+    /// Resume a paused group: prompt/kickoff delivery flows again. Queued
+    /// prompts are not replayed — agents resync from the board/state on the
+    /// next prompt, which is the point of idling out.
+    pub fn resume_group(&self, group: &str) -> Result<(), String> {
+        let was = self.paused.lock().unwrap().remove(group);
+        if was {
+            let _ = fs::remove_file(self.group_dir(group).join("paused"));
+            self.audit(group, "human", "group-resume", json!({}));
+        }
+        Ok(())
+    }
+
+    /// Flip a worker/reviewer between idle (awaiting/finished a task) and
+    /// active. `idle` true stamps `idle_since_ms = now`; false clears it.
+    /// No-op for the orchestrator, which is never idle-reaped.
+    fn set_agent_idle(&self, agent_id: &str, idle: bool) {
+        let mut agents = self.agents.lock().unwrap();
+        if let Some(a) = agents.get_mut(agent_id) {
+            if a.role == Role::Orchestrator {
+                return;
+            }
+            a.idle_since_ms = idle.then(now_ms);
+            if !idle {
+                // (Re)assigned work: restart the watchdog's silence clock and
+                // clear its anti-nag latch so the fresh stall gets a nudge.
+                a.last_progress_ms = now_ms();
+                a.watchdog_notified = false;
+                // New work supersedes a prior done/blocked report — drop its
+                // attention latch so a stale badge doesn't linger.
+                self.attn_reports.lock().unwrap().remove(agent_id);
+            }
+        }
+    }
+
+    /// Ids of workers/reviewers whose idle time has crossed their group's
+    /// `idle_kill_minutes`. Pure selection (no killing) so the reaper policy
+    /// is testable at a chosen `now`.
+    pub fn idle_reap_candidates(&self, now: u64) -> Vec<String> {
+        let thresholds: HashMap<String, u32> = self
+            .groups
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, g)| (id.clone(), g.guardrails.idle_kill_minutes))
+            .collect();
+        self.agents
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|a| a.role != Role::Orchestrator && a.status == AgentStatus::Running)
+            .filter(|a| {
+                let t = thresholds.get(&a.group).copied().unwrap_or(0);
+                idle_should_kill(a.idle_since_ms, now, t)
+            })
+            .map(|a| a.id.clone())
+            .collect()
+    }
+
+    /// Kill every idle worker/reviewer past its group's timeout, notifying
+    /// each group's orchestrator so it can respawn on demand. Returns the
+    /// killed agent ids. Called on a timer by `start_idle_reaper`.
+    pub fn reap_idle_agents(&self, now: u64) -> Vec<String> {
+        let mut killed = Vec::new();
+        for id in self.idle_reap_candidates(now) {
+            let Some(a) = self.agent(&id) else { continue };
+            let mins = self
+                .group(&a.group)
+                .map(|g| g.guardrails.idle_kill_minutes)
+                .unwrap_or(0);
+            // Re-check against the agent's *current* idle state: selection and
+            // kill happen under separate locks, so a worker prompted in that
+            // window (idle clock cleared) must not be killed.
+            if !idle_should_kill(a.idle_since_ms, now, mins) {
+                continue;
+            }
+            self.audit(&a.group, "loomux", "idle-kill",
+                json!({ "agent": id, "name": a.name, "idle_minutes": mins }));
+            let _ = self.deliver_to_orchestrator(
+                &a.group,
+                &format!(
+                    "[loomux] idle-kill guardrail: agent {} ({}) sat without a task for {mins}+ min and was terminated to contain cost. Respawn a worker when you have work for it.",
+                    a.name, a.id
+                ),
+                "loomux",
+            );
+            let _ = self.kill_agent(&id);
+            killed.push(id);
+        }
+        killed
+    }
+
+    // ---------- watchdog: stalled-agent detection ----------
+
+    /// Record that an agent just did something loomux can see (reported,
+    /// messaged the orchestrator): reset its watchdog silence clock and clear
+    /// the anti-nag latch so a *later* stall still earns a fresh nudge. No-op
+    /// for the orchestrator (never watchdogged). Output-driven activity is
+    /// handled separately in `watchdog_tick` via the pty counter.
+    pub fn note_agent_activity(&self, agent_id: &str) {
+        let mut agents = self.agents.lock().unwrap();
+        if let Some(a) = agents.get_mut(agent_id) {
+            if a.role == Role::Orchestrator {
+                return;
+            }
+            a.last_progress_ms = now_ms();
+            a.watchdog_notified = false;
+        }
+    }
+
+    /// Snapshot every agent's monotonic pty output counter. Needs the app's
+    /// `PtyManager`, so it yields an empty map without an app handle (unit
+    /// tests drive `watchdog_tick` with synthetic counters instead).
+    fn agent_output_totals(&self) -> HashMap<String, u64> {
+        let Some(app) = self.app.lock().unwrap().clone() else {
+            return HashMap::new();
+        };
+        let ptys = app.state::<crate::pty::PtyManager>();
+        self.agents
+            .lock()
+            .unwrap()
+            .values()
+            .filter_map(|a| Some((a.id.clone(), ptys.output_total(a.pty_id?)?)))
+            .collect()
+    }
+
+    /// One watchdog pass. For each *working* agent (running worker/reviewer
+    /// with a task assigned — idle clock clear), fold in the latest pty output
+    /// counter from `outputs`: any growth is activity that resets the silence
+    /// clock and the anti-nag latch. An agent silent (no output, no report)
+    /// past its group's `watchdog_stall_minutes` earns exactly one audited
+    /// `[loomux]` nudge to the orchestrator suggesting get_output + re-send.
+    /// Paused groups are skipped entirely — delivery is suppressed there
+    /// anyway, so we must not spend the one-notice budget while paused.
+    /// Returns the notified agent ids. Split from the pty read
+    /// (`agent_output_totals`) so the stall / anti-nag / pause logic is
+    /// testable with synthetic counters and no threads.
+    pub fn watchdog_tick(&self, now: u64, outputs: &HashMap<String, u64>) -> Vec<String> {
+        let thresholds: HashMap<String, u32> = self
+            .groups
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, g)| (id.clone(), g.guardrails.watchdog_stall_minutes))
+            .collect();
+        let paused = self.paused.lock().unwrap().clone();
+
+        // First pass under the agents lock: refresh counters and pick who to
+        // nudge. Delivery (which types into a pane and can block) happens after
+        // the lock is released.
+        let mut to_notify: Vec<(String, String, String, u32)> = Vec::new();
+        {
+            let mut agents = self.agents.lock().unwrap();
+            for a in agents.values_mut() {
+                // Only agents actively working: running, not the orchestrator,
+                // and currently assigned (idle_since_ms clear). This excludes
+                // idle, done/blocked, dead, and reaped agents by construction.
+                if a.role == Role::Orchestrator
+                    || a.status != AgentStatus::Running
+                    || a.idle_since_ms.is_some()
+                {
+                    continue;
+                }
+                // Output growth = activity: reset the clock and the latch, and
+                // this tick can't also flag the agent as stalled.
+                if let Some(&cur) = outputs.get(&a.id) {
+                    if cur > a.last_output_total {
+                        a.last_output_total = cur;
+                        a.last_progress_ms = now;
+                        a.watchdog_notified = false;
+                        continue;
+                    }
+                }
+                // A paused group's agents idle out on purpose; never nudge and
+                // never burn their one-notice budget while paused.
+                if paused.contains(&a.group) {
+                    continue;
+                }
+                let threshold = thresholds.get(&a.group).copied().unwrap_or(0);
+                if watchdog_should_notify(a.last_progress_ms, now, threshold, a.watchdog_notified) {
+                    a.watchdog_notified = true;
+                    let minutes = (now.saturating_sub(a.last_progress_ms) / 60_000) as u32;
+                    to_notify.push((a.id.clone(), a.group.clone(), a.name.clone(), minutes));
+                }
+            }
+        }
+
+        let mut notified = Vec::new();
+        for (id, group, name, minutes) in to_notify {
+            self.audit(&group, "loomux", "watchdog-stall",
+                json!({ "agent": id, "name": name, "silent_minutes": minutes }));
+            let _ = self.deliver_to_orchestrator(
+                &group,
+                &format!(
+                    "[loomux] watchdog: agent {name} ({id}) has produced no terminal output and sent no report for {minutes}+ min — it may be stalled or waiting on input. Inspect it with get_output(\"{id}\"); if its kickoff was lost or it is stuck, re-send the task with send_prompt. You will get this notice at most once per stall."
+                ),
+                "loomux",
+            );
+            notified.push(id);
+        }
+        notified
+    }
+
+    /// One full watchdog cycle: read pty counters, then tick. Called on a
+    /// timer by `start_watchdog`.
+    pub fn run_watchdog(&self, now: u64) -> Vec<String> {
+        let outputs = self.agent_output_totals();
+        self.watchdog_tick(now, &outputs)
+    }
+
+    // ---------- attention routing: surface which pane needs the human ----------
+
+    /// Latch (or clear) a worker's report as an attention signal. `done` and
+    /// `blocked` badge the pane and can fire a toast until the human acks or the
+    /// agent is reassigned; `progress` (the agent is working again) clears it.
+    /// No-op for the orchestrator, which never reports.
+    pub fn note_report_attention(&self, agent_id: &str, status: &str) {
+        let mut m = self.attn_reports.lock().unwrap();
+        match status {
+            "done" => {
+                m.insert(agent_id.to_string(), "done");
+            }
+            "blocked" => {
+                m.insert(agent_id.to_string(), "blocked");
+            }
+            _ => {
+                m.remove(agent_id);
+            }
+        }
+    }
+
+    /// The human focused/handled a pane: drop any latched report so its badge
+    /// clears. Live reasons (waiting/gate) are recomputed each scan and reappear
+    /// only if still true, so they need no explicit clear.
+    pub fn ack_attention(&self, agent_id: &str) {
+        self.attn_reports.lock().unwrap().remove(agent_id);
+    }
+
+    /// Whether desktop notifications are enabled for a group.
+    pub fn notify_enabled(&self, group: &str) -> bool {
+        self.notify_groups.lock().unwrap().contains(group)
+    }
+
+    /// Enable/disable desktop notifications for a group, durably (a `notify`
+    /// marker file, mirroring the pause marker) so the choice survives restarts.
+    pub fn set_notify(&self, group: &str, on: bool) -> Result<(), String> {
+        let dir = self.group_dir(group);
+        let mut set = self.notify_groups.lock().unwrap();
+        if on {
+            if set.insert(group.to_string()) {
+                fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+                let _ = fs::write(dir.join("notify"), b"");
+                self.audit(group, "human", "notify-on", json!({}));
+            }
+        } else if set.remove(group) {
+            let _ = fs::remove_file(dir.join("notify"));
+            self.audit(group, "human", "notify-off", json!({}));
+        }
+        Ok(())
+    }
+
+    /// Read every agent pane's output counter, last-lines tail, and last human
+    /// keystroke time — the raw inputs `attention_tick` needs. Empty without an
+    /// app handle (unit tests drive `attention_tick` with synthetic maps).
+    fn attention_inputs(&self) -> (HashMap<String, u64>, HashMap<String, String>, HashMap<String, u64>) {
+        let mut outs = HashMap::new();
+        let mut tails = HashMap::new();
+        let mut ins = HashMap::new();
+        let Some(app) = self.app.lock().unwrap().clone() else {
+            return (outs, tails, ins);
+        };
+        let ptys = app.state::<crate::pty::PtyManager>();
+        for a in self.agents.lock().unwrap().values() {
+            let Some(pid) = a.pty_id else { continue };
+            if let Some(t) = ptys.output_total(pid) {
+                outs.insert(a.id.clone(), t);
+            }
+            if let Some(raw) = ptys.output_tail(pid) {
+                // A prompt is at the very end; strip only the last few KB so
+                // the scan stays cheap against a saturated 256 KB ring.
+                let start = raw.len().saturating_sub(4096);
+                tails.insert(a.id.clone(), strip_ansi(&raw[start..]));
+            }
+            if let Some(u) = ptys.last_user_input_ms(pid) {
+                ins.insert(a.id.clone(), u);
+            }
+        }
+        (outs, tails, ins)
+    }
+
+    /// One attention pass: compute the current set of panes that need the human
+    /// from live agent state plus the supplied pty snapshots. Reasons, in
+    /// priority order, are `blocked` (reported), `waiting` (parked on a prompt:
+    /// output quiet past `ATTENTION_QUIET_MS`, a prompt-shaped tail, and no
+    /// recent human keystroke), `report` (reported done), and `gate` (this
+    /// agent's board task sits at a `pr`/`human-testing`/`blocked` merge gate).
+    /// Pure w.r.t. the OS/pty — the pty reads live in `attention_inputs` — so
+    /// the whole policy is testable with synthetic maps and no real CLI.
+    pub fn attention_tick(
+        &self,
+        now: u64,
+        outputs: &HashMap<String, u64>,
+        tails: &HashMap<String, String>,
+        last_inputs: &HashMap<String, u64>,
+    ) -> Vec<AttentionItem> {
+        // Board-derived gate map: agent id → gate status, across every live
+        // group. Read once per group (a small fs read) rather than per agent.
+        let groups: HashSet<String> =
+            self.agents.lock().unwrap().values().map(|a| a.group.clone()).collect();
+        let mut gate_of: HashMap<String, String> = HashMap::new();
+        for g in &groups {
+            for t in self.tasks(g) {
+                let is_gate = MERGE_GATE_STATUSES.contains(&t.status.as_str()) || t.status == "blocked";
+                if is_gate {
+                    if let Some(assignee) = t.assignee.filter(|s| !s.trim().is_empty()) {
+                        gate_of.insert(assignee, t.status);
+                    }
+                }
+            }
+        }
+
+        let reports = self.attn_reports.lock().unwrap().clone();
+        let mut quiet = self.attn_quiet.lock().unwrap();
+        let agents = self.agents.lock().unwrap();
+        let mut out = Vec::new();
+        for a in agents.values() {
+            if a.status != AgentStatus::Running {
+                quiet.remove(&a.id);
+                continue;
+            }
+            // Track how long the pane's output has been stable.
+            let cur = outputs.get(&a.id).copied().unwrap_or(0);
+            let entry = quiet.entry(a.id.clone()).or_insert((cur, now));
+            if cur != entry.0 {
+                *entry = (cur, now);
+            }
+            let quiet_for = now.saturating_sub(entry.1);
+            let recently_typed = last_inputs
+                .get(&a.id)
+                .map(|&t| t != 0 && now.saturating_sub(t) < ATTENTION_RECENT_INPUT_MS)
+                .unwrap_or(false);
+            let waiting = !recently_typed
+                && quiet_for >= ATTENTION_QUIET_MS
+                && tails.get(&a.id).map(|t| prompt_wait_detected(t)).unwrap_or(false);
+
+            let report = reports.get(a.id.as_str()).copied();
+            let (reason, detail): (&'static str, String) = if report == Some("blocked") {
+                ("blocked", format!("{} reported blocked — it needs you", a.name))
+            } else if waiting {
+                ("waiting", format!("{} is waiting on a prompt", a.name))
+            } else if report == Some("done") {
+                ("report", format!("{} reported done — review & merge", a.name))
+            } else if let Some(st) = gate_of.get(a.id.as_str()) {
+                ("gate", format!("task is {st} — awaiting your call"))
+            } else {
+                continue;
+            };
+            out.push(AttentionItem {
+                agent_id: a.id.clone(),
+                group: a.group.clone(),
+                name: a.name.clone(),
+                role: a.role,
+                pty_id: a.pty_id,
+                reason,
+                detail,
+            });
+        }
+        out.sort_by(|x, y| x.agent_id.cmp(&y.agent_id));
+        out
+    }
+
+    /// Decide which current attention items warrant a fresh desktop toast:
+    /// their group opted in, the reason is an event (not the persistent `gate`
+    /// board state, which the board highlight already surfaces), and this
+    /// (agent, reason) hasn't been toasted yet. Records only what actually
+    /// fires — so enabling notifications surfaces already-pending attention —
+    /// and prunes cleared/changed entries so a fresh onset toasts again.
+    /// Returns the agent ids to toast; pure w.r.t. the OS, so the policy is
+    /// testable without firing a real notification.
+    pub fn attention_toast_targets(&self, items: &[AttentionItem]) -> Vec<String> {
+        let notify = self.notify_groups.lock().unwrap().clone();
+        let mut toasted = self.attn_emitted.lock().unwrap();
+        let mut fire = Vec::new();
+        for i in items {
+            let already = toasted.get(&i.agent_id).map(|p| p == i.reason).unwrap_or(false);
+            if !already && i.reason != "gate" && notify.contains(&i.group) {
+                fire.push(i.agent_id.clone());
+                toasted.insert(i.agent_id.clone(), i.reason.to_string());
+            }
+        }
+        // Drop ledger entries whose attention cleared or whose reason changed,
+        // so the same pane can toast again on a genuinely new onset.
+        let current: HashMap<&str, &str> =
+            items.iter().map(|i| (i.agent_id.as_str(), i.reason)).collect();
+        toasted.retain(|id, reason| current.get(id.as_str()) == Some(&reason.as_str()));
+        fire
+    }
+
+    /// One full attention cycle: read pty snapshots, compute the attention set,
+    /// fire toasts for newly-attention panes in opted-in groups, and push the
+    /// whole set to the frontend. Called on a timer by `start_attention`.
+    pub fn run_attention(&self, now: u64) {
+        let (outputs, tails, last_inputs) = self.attention_inputs();
+        let items = self.attention_tick(now, &outputs, &tails, &last_inputs);
+        for id in self.attention_toast_targets(&items) {
+            if let Some(i) = items.iter().find(|i| i.agent_id == id) {
+                self.audit(&i.group, "loomux", "attention-toast",
+                    json!({ "agent": i.agent_id, "reason": i.reason }));
+                notify_desktop(&format!("loomux · {}", i.name), &i.detail);
+            }
+        }
+        if let Some(app) = self.app.lock().unwrap().clone() {
+            let _ = app.emit("orch-attention", &items);
+        }
+    }
+
+    /// Record a spawn against the group's rolling-hour window and report
+    /// whether the spawn-rate guardrail is now exceeded. Checks and records
+    /// under one lock so concurrent spawns can't both slip past the cap.
+    fn check_and_record_spawn(&self, group: &str, limit: u32) -> Result<(), String> {
+        let now = now_ms();
+        let mut all = self.spawn_times.lock().unwrap();
+        let times = all.entry(group.to_string()).or_default();
+        times.retain(|&t| now.saturating_sub(t) < SPAWN_RATE_WINDOW_MS);
+        if spawn_rate_exceeded(times, now, limit, SPAWN_RATE_WINDOW_MS) {
+            return Err(format!(
+                "guardrail: spawn-rate limit reached ({limit} spawns/hour). Wait, or reuse an idle agent instead of spawning a new one."
+            ));
+        }
+        times.push(now);
+        Ok(())
+    }
+
+    /// Aggregate the group's per-pane session cost into one summary. Cost is
+    /// parsed best-effort from each live agent's in-pane statusline (see
+    /// `parse_session_cost`); an agent whose statusline shows no dollar
+    /// figure contributes `null` and is excluded from the total.
+    pub fn group_usage(&self, group: &str) -> Value {
+        let app = self.app.lock().unwrap().clone();
+        let agents: Vec<AgentEntry> = self
+            .agents
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|a| a.group == group && a.status != AgentStatus::Dead)
+            .cloned()
+            .collect();
+        let mut total = 0.0f64;
+        let mut any = false;
+        let mut list: Vec<Value> = agents
+            .iter()
+            .map(|a| {
+                let cost = app.as_ref().zip(a.pty_id).and_then(|(app, pty)| {
+                    let ptys = app.state::<crate::pty::PtyManager>();
+                    let raw = ptys.output_tail(pty)?;
+                    parse_session_cost(&strip_ansi(&raw))
+                });
+                if let Some(c) = cost {
+                    total += c;
+                    any = true;
+                }
+                json!({ "id": a.id, "name": a.name, "role": a.role, "cost_usd": cost })
+            })
+            .collect();
+        list.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+        json!({
+            "group": group,
+            "total_cost_usd": any.then_some(total),
+            "agents": list,
+            "note": "best-effort, parsed from each pane's statusline; agents without a visible cost are excluded from the total",
+        })
+    }
+
+    // ---------- lifecycle: group summary & end-orchestration ----------
+
+    /// A one-glance summary of a group's live agents for the lifecycle panel:
+    /// how many are up, the role breakdown, and uptime (per agent and for the
+    /// group as a whole, measured from the earliest-started live agent — the
+    /// orchestrator in practice). Also reports the paused flag so the panel can
+    /// compose pause and end-orchestration sanely.
+    pub fn group_summary(&self, group: &str) -> Value {
+        let now = now_ms();
+        let live: Vec<AgentEntry> = self
+            .agents
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|a| a.group == group && a.status != AgentStatus::Dead)
+            .cloned()
+            .collect();
+        let (mut orch, mut worker, mut reviewer) = (0u32, 0u32, 0u32);
+        let mut earliest: Option<u64> = None;
+        let mut list: Vec<Value> = live
+            .iter()
+            .map(|a| {
+                match a.role {
+                    Role::Orchestrator => orch += 1,
+                    Role::Worker => worker += 1,
+                    Role::Reviewer => reviewer += 1,
+                }
+                earliest = Some(earliest.map_or(a.started_ms, |e| e.min(a.started_ms)));
+                json!({
+                    "id": a.id, "name": a.name, "role": a.role,
+                    "task": a.task, "idle_since_ms": a.idle_since_ms,
+                    "uptime_ms": now.saturating_sub(a.started_ms),
+                })
+            })
+            .collect();
+        list.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+        json!({
+            "group": group,
+            "live_agents": live.len(),
+            "paused": self.is_paused(group),
+            "uptime_ms": earliest.map(|e| now.saturating_sub(e)),
+            "roles": { "orchestrator": orch, "worker": worker, "reviewer": reviewer },
+            "agents": list,
+        })
+    }
+
+    /// End a whole orchestration: kill every one of the group's agents (the
+    /// orchestrator included — unlike `kill_agent`, which protects it), and,
+    /// when asked, remove the agents' worktrees. Human-initiated and
+    /// destructive: it is a Tauri command only (never an MCP tool an agent
+    /// could call on itself), audited as actor `human`, and the frontend
+    /// confirms before invoking. Composes with a paused group: killing works
+    /// regardless of pause, and the pause marker is cleared so the teardown is
+    /// total — a later relaunch on the same repo won't inherit a stale pause.
+    pub fn end_group(&self, group: &str, cleanup_worktrees: bool) -> Result<Value, String> {
+        // Snapshot every member (all statuses): already-dead workers may still
+        // have a worktree on disk that cleanup should reclaim.
+        let members: Vec<AgentEntry> = self
+            .agents
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|a| a.group == group)
+            .cloned()
+            .collect();
+        if members.is_empty() {
+            return Err("no such group (no agents ever registered here)".into());
+        }
+        let app = self.app.lock().unwrap().clone();
+
+        // Kill the live ones. Kill the pty (best-effort) then mark the entry
+        // dead directly — mark_dead is idempotent against the async pty-exit,
+        // and going straight through it avoids the orchestrator-notification
+        // path in on_pty_exit (there is no orchestrator left to tell).
+        let mut killed = Vec::new();
+        for a in &members {
+            if a.status == AgentStatus::Dead {
+                continue;
+            }
+            if let (Some(app), Some(pty)) = (app.as_ref(), a.pty_id) {
+                app.state::<crate::pty::PtyManager>().kill(pty);
+            }
+            self.mark_dead(&a.id, None);
+            killed.push(a.id.clone());
+        }
+
+        // Optionally reclaim the worktrees. Resolve the repo (from memory or
+        // group.json) so `git worktree remove` runs from the main checkout.
+        let mut worktrees_removed = Vec::new();
+        let mut worktree_errors = Vec::new();
+        if cleanup_worktrees {
+            let repo = self
+                .group(group)
+                .map(|g| g.repo)
+                .or_else(|| self.load_group_file(group).map(|(r, _)| r));
+            if let Some(repo) = repo {
+                let cwds: Vec<String> = members.iter().map(|a| a.cwd.clone()).collect();
+                for path in worktree_cleanup_targets(&repo, &cwds) {
+                    match crate::git::git_worktree_remove(&repo, &path) {
+                        Ok(()) => worktrees_removed.push(path),
+                        Err(e) => worktree_errors.push(json!({ "path": path, "error": e })),
+                    }
+                }
+            }
+        }
+
+        // Total teardown: drop any pause (in-memory + marker) so a future
+        // relaunch on this repo starts clean rather than silently paused.
+        if self.paused.lock().unwrap().remove(group) {
+            let _ = fs::remove_file(self.group_dir(group).join("paused"));
+        }
+
+        self.audit(group, "human", "group-end", json!({
+            "killed": killed,
+            "cleanup_worktrees": cleanup_worktrees,
+            "worktrees_removed": worktrees_removed,
+            "worktree_errors": worktree_errors,
+        }));
+
+        // Tell the frontend to close the group's (now-dead) panes so the human
+        // isn't left ✕-clicking a screen of dead terminals — the very chore
+        // this action exists to remove.
+        if let Some(app) = app.as_ref() {
+            let _ = app.emit("orch-group-ended", json!({ "group_id": group }));
+        }
+
+        Ok(json!({
+            "group": group,
+            "killed": killed,
+            "worktrees_removed": worktrees_removed,
+            "worktree_errors": worktree_errors,
+        }))
     }
 
     /// Render the role instruction docs into the group dir so kickoff
@@ -1188,6 +2352,12 @@ impl OrchRegistry {
                     group.guardrails.max_agents
                 ));
             }
+            // Guardrail: spawn-rate backstop against a runaway orchestrator.
+            // Checked (and the timestamp recorded only when the check passes)
+            // before any pane/worktree work so a burst fast-fails. A refused
+            // spawn is not counted; one admitted here but later aborted
+            // (worktree/bind failure) still counts toward the hour.
+            self.check_and_record_spawn(group_id, group.guardrails.max_spawns_per_hour)?;
         }
 
         // Guardrail: the model is pinned per role at group creation.
@@ -1216,6 +2386,16 @@ impl OrchRegistry {
             Some(s) => Some(sanitize_session(&s).ok_or("invalid resume session id")?),
             None => (group.guardrails.agent_cli == "claude").then(new_session_uuid),
         };
+
+        // Copilot mints its own session id after boot (no `--session-id`), so
+        // snapshot the sessions that already exist now, before this pane's
+        // copilot starts — the watcher then identifies the newly appeared one.
+        let copilot_baseline = (!resume && group.guardrails.agent_cli == "copilot")
+            .then(|| {
+                crate::sessions::copilot_session_state_root()
+                    .map(|root| crate::sessions::copilot_session_ids(&root))
+                    .unwrap_or_default()
+            });
 
         let branch_name = branch
             .map(|b| b.trim().to_string())
@@ -1268,6 +2448,13 @@ impl OrchRegistry {
             task: task.to_string(),
             session_id: session_id.clone(),
             cwd: cwd.clone(),
+            // An agent spawned without a task starts the idle clock; one
+            // given work does not (the orchestrator is exempt regardless).
+            idle_since_ms: (role != Role::Orchestrator && task.trim().is_empty()).then(now_ms),
+            started_ms: now_ms(),
+            last_progress_ms: now_ms(),
+            last_output_total: 0,
+            watchdog_notified: false,
         };
         {
             // Re-check the cap under the same lock as the insert: the early
@@ -1345,6 +2532,21 @@ impl OrchRegistry {
                         self.kickoff_prompt(&self.agent(&agent_id).unwrap(), &group, &branch_note);
                     self.deliver_prompt(&agent_id, &kickoff, "loomux", true)?;
                 }
+                // Copilot minted a session as it booted; watch for it and bind
+                // its id to this pane's roster record so the session becomes
+                // resumable and shows in the session browser. Needs an owned
+                // registry (background thread) — a no-op in unit tests, which
+                // don't set the self-arc.
+                if let Some(baseline) = copilot_baseline {
+                    if let Some(reg) = self.arc() {
+                        reg.spawn_copilot_session_watcher(
+                            agent_id.clone(),
+                            group_id.to_string(),
+                            cwd.clone(),
+                            baseline,
+                        );
+                    }
+                }
                 Ok(self.agent(&agent_id).unwrap())
             }
             Err(_) => {
@@ -1400,6 +2602,14 @@ impl OrchRegistry {
         let a = self.agent(agent_id).ok_or("unknown agent")?;
         if a.status == AgentStatus::Dead {
             return Err(format!("agent {agent_id} is dead"));
+        }
+        // Pause guardrail: while a group is paused, loomux delivers nothing
+        // to its panes so agents finish their turn and idle out. The attempt
+        // is audited (nothing is silently lost from the record) and reported
+        // as success so callers don't error or retry.
+        if self.is_paused(&a.group) {
+            self.audit(&a.group, from, "prompt-suppressed-paused", json!({ "to": agent_id, "text": text }));
+            return Ok(());
         }
         let pty_id = a.pty_id.ok_or("agent has no terminal yet")?;
         let app = self.app.lock().unwrap().clone().ok_or("no app handle")?;
@@ -1557,6 +2767,7 @@ impl OrchRegistry {
                 "id": a.id, "name": a.name, "role": a.role,
                 "status": a.status, "task": a.task,
                 "session": a.session_id, "cwd": a.cwd,
+                "idle_since_ms": a.idle_since_ms,
             }))
             .collect();
         list.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
@@ -1611,6 +2822,10 @@ impl OrchRegistry {
             self.by_pty.lock().unwrap().remove(&p);
             self.delivery.lock().unwrap().remove(&p);
         }
+        // Attention bookkeeping is per-live-agent; drop this one's entries.
+        self.attn_reports.lock().unwrap().remove(agent_id);
+        self.attn_quiet.lock().unwrap().remove(agent_id);
+        self.attn_emitted.lock().unwrap().remove(agent_id);
         let _ = fs::remove_file(
             self.group_dir(&snapshot.group).join("configs").join(format!("{agent_id}.json")),
         );
@@ -1657,12 +2872,48 @@ impl OrchRegistry {
     }
 }
 
+/// Background loop that enforces the idle-worker auto-kill guardrail: every
+/// `IDLE_REAP_INTERVAL` it kills any worker/reviewer whose idle time has
+/// crossed its group's `idle_kill_minutes` (groups with the guardrail off
+/// are skipped inside `reap_idle_agents`). Started once at app setup.
+pub fn start_idle_reaper(reg: Arc<OrchRegistry>) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(IDLE_REAP_INTERVAL);
+        reg.reap_idle_agents(now_ms());
+    });
+}
+
+/// Background loop for the stalled-agent watchdog: every `WATCHDOG_INTERVAL`
+/// it nudges the orchestrator (once per stall) about any working agent that
+/// has gone silent — no terminal output, no report — past its group's
+/// `watchdog_stall_minutes`. Groups with the guardrail off and paused groups
+/// are skipped inside `run_watchdog`. Started once at app setup.
+pub fn start_watchdog(reg: Arc<OrchRegistry>) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(WATCHDOG_INTERVAL);
+        reg.run_watchdog(now_ms());
+    });
+}
+
+/// Background loop for attention routing (#6): every `ATTENTION_INTERVAL` it
+/// recomputes which panes need the human (idle-with-prompt, worker reports,
+/// human merge gates), pushes the set to the frontend for pane badges, and
+/// toasts newly-attention panes in notification-enabled groups. Started once at
+/// app setup.
+pub fn start_attention(reg: Arc<OrchRegistry>) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(ATTENTION_INTERVAL);
+        reg.run_attention(now_ms());
+    });
+}
+
 // ---------- tauri commands ----------
 
 /// Create (or reattach to) an orchestration group and register its
 /// orchestrator. Returns the pane spec the frontend opens directly; initial
 /// idle workers are spawned in the background once the orchestrator binds.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // launcher-collected guardrails, one field each
 pub fn create_orchestration(
     reg: tauri::State<Arc<OrchRegistry>>,
     repo: String,
@@ -1673,6 +2924,9 @@ pub fn create_orchestration(
     reviewer_model: String,
     orchestrator_model: String,
     auto_ops: bool,
+    idle_kill_minutes: u32,
+    max_spawns_per_hour: u32,
+    watchdog_stall_minutes: u32,
 ) -> Result<SpawnRequest, String> {
     create_orchestration_group(
         reg.inner(),
@@ -1684,11 +2938,82 @@ pub fn create_orchestration(
             reviewer_model,
             orchestrator_model,
             auto_ops,
+            idle_kill_minutes,
+            max_spawns_per_hour,
+            watchdog_stall_minutes,
         },
         None,
         None,
         initial_workers,
     )
+}
+
+/// Pause a group: loomux stops delivering prompts/kickoffs so its agents
+/// idle out (cost containment). Human action from the pane UI.
+#[tauri::command]
+pub fn orch_pause_group(reg: tauri::State<Arc<OrchRegistry>>, group_id: String) -> Result<(), String> {
+    reg.pause_group(&group_id)
+}
+
+/// Resume a paused group: prompt/kickoff delivery flows again.
+#[tauri::command]
+pub fn orch_resume_group(reg: tauri::State<Arc<OrchRegistry>>, group_id: String) -> Result<(), String> {
+    reg.resume_group(&group_id)
+}
+
+/// Whether a group is currently paused (drives the pause/resume button state).
+#[tauri::command]
+pub fn orch_group_paused(reg: tauri::State<Arc<OrchRegistry>>, group_id: String) -> bool {
+    reg.is_paused(&group_id)
+}
+
+// ---------- attention routing (human side) ----------
+
+/// The human focused/handled an attention-badged pane: drop its latched report
+/// so the badge clears. Live reasons (waiting/gate) are recomputed each scan.
+#[tauri::command]
+pub fn orch_ack_attention(reg: tauri::State<Arc<OrchRegistry>>, agent_id: String) {
+    reg.ack_attention(&agent_id);
+}
+
+/// Whether desktop notifications are enabled for a group (toggle button state).
+#[tauri::command]
+pub fn orch_notify_enabled(reg: tauri::State<Arc<OrchRegistry>>, group_id: String) -> bool {
+    reg.notify_enabled(&group_id)
+}
+
+/// Enable/disable desktop notifications for a group (durable, per-group).
+#[tauri::command]
+pub fn orch_set_notify(
+    reg: tauri::State<Arc<OrchRegistry>>,
+    group_id: String,
+    enabled: bool,
+) -> Result<(), String> {
+    reg.set_notify(&group_id, enabled)
+}
+
+/// Aggregate per-pane session cost/usage into one group summary for the UI.
+#[tauri::command]
+pub fn orch_group_usage(reg: tauri::State<Arc<OrchRegistry>>, group_id: String) -> Value {
+    reg.group_usage(&group_id)
+}
+
+/// Live-agent count, role breakdown, and uptime for the lifecycle panel.
+#[tauri::command]
+pub fn orch_group_summary(reg: tauri::State<Arc<OrchRegistry>>, group_id: String) -> Value {
+    reg.group_summary(&group_id)
+}
+
+/// End a whole orchestration: kill all its agents and (optionally) remove
+/// their worktrees. Human-initiated, destructive, audited — the frontend
+/// confirms before calling this.
+#[tauri::command]
+pub fn orch_end_group(
+    reg: tauri::State<Arc<OrchRegistry>>,
+    group_id: String,
+    cleanup_worktrees: bool,
+) -> Result<Value, String> {
+    reg.end_group(&group_id, cleanup_worktrees)
 }
 
 /// Create (or reattach to) a group and register its orchestrator, under the
@@ -1749,6 +3074,15 @@ fn register_orchestrator_pane(
         Some(s) => Some(sanitize_session(&s).ok_or("invalid resume session id")?),
         None => (group.guardrails.agent_cli == "claude").then(new_session_uuid),
     };
+    // Copilot mints its own id on boot; snapshot existing sessions now so the
+    // orchestrator's newly created one can be tracked (this is what gives a
+    // copilot orchestration its ORCH chip and restore).
+    let copilot_baseline = (!resume && group.guardrails.agent_cli == "copilot")
+        .then(|| {
+            crate::sessions::copilot_session_state_root()
+                .map(|root| crate::sessions::copilot_session_ids(&root))
+                .unwrap_or_default()
+        });
     let command = reg.build_agent_command(
         &group.guardrails.agent_cli,
         &model,
@@ -1770,6 +3104,11 @@ fn register_orchestrator_pane(
         task: String::new(),
         session_id,
         cwd: group.repo.clone(),
+        idle_since_ms: None, // the orchestrator is never idle-reaped
+        started_ms: now_ms(),
+        last_progress_ms: now_ms(), // unused: the orchestrator is never watchdogged
+        last_output_total: 0,
+        watchdog_notified: false,
     };
     reg.agents.lock().unwrap().insert(agent_id.clone(), entry.clone());
     reg.by_token.lock().unwrap().insert(token, agent_id.clone());
@@ -1820,6 +3159,15 @@ fn register_orchestrator_pane(
             reg2.kickoff_prompt(&reg2.agent(&agent_id).unwrap(), &group2, "")
         };
         let _ = reg2.deliver_prompt(&agent_id, &kickoff, "loomux", true);
+        // Track the copilot session this orchestrator just minted.
+        if let Some(baseline) = copilot_baseline {
+            reg2.clone().spawn_copilot_session_watcher(
+                agent_id.clone(),
+                group2.id.clone(),
+                group2.repo.clone(),
+                baseline,
+            );
+        }
         for i in 0..initial_workers.min(group2.guardrails.max_agents) {
             if let Err(e) = reg2.spawn_agent(&group2.id, Role::Worker, &format!("worker {}", i + 1), "", false, None)
             {
@@ -1948,6 +3296,178 @@ pub fn resume_orch_session(
     resume_recorded_session(reg.inner(), &session_id, hint)
 }
 
+// ---------- merge-gate link resolution ----------
+// The board stores issue/PR references as the orchestrator typed them
+// (`#12`, a bare number, or a full URL). To make the chips clickable we
+// resolve those to a web URL against the repo's `origin` remote.
+
+/// Normalize a git remote URL (`git@`, `ssh://`, `https://`, with or without
+/// a trailing `.git`) into its browsable web base, e.g.
+/// `https://github.com/owner/repo`. None for anything that doesn't look like
+/// a host/path we can turn into a link.
+#[doc(hidden)] // pub for integration tests
+pub fn normalize_remote_web_base(url: &str) -> Option<String> {
+    let u = url.trim();
+    if u.is_empty() {
+        return None;
+    }
+    // Split into host and path, covering the three shapes git emits.
+    let (host, path) = if let Some(rest) = u
+        .strip_prefix("https://")
+        .or_else(|| u.strip_prefix("http://"))
+        .or_else(|| u.strip_prefix("ssh://"))
+    {
+        // scheme://[user@]host[:port]/owner/repo
+        let rest = rest.split_once('@').map(|(_, r)| r).unwrap_or(rest);
+        let (host, path) = rest.split_once('/')?;
+        // Drop any :port from the host part (ssh URLs may carry one).
+        let host = host.split(':').next().unwrap_or(host);
+        (host.to_string(), path.to_string())
+    } else if let Some(rest) = u.strip_prefix("git@") {
+        // scp-like: git@host:owner/repo.git
+        let (host, path) = rest.split_once(':')?;
+        (host.to_string(), path.to_string())
+    } else {
+        return None;
+    };
+    let host = host.trim().trim_end_matches('/');
+    let path = path.trim().trim_start_matches('/').trim_end_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    if host.is_empty() || path.is_empty() || !host.contains('.') {
+        return None;
+    }
+    Some(format!("https://{host}/{path}"))
+}
+
+/// Web base for a repo's `origin` remote (falling back to any remote), or
+/// None when the repo has no usable remote.
+fn git_remote_web_base(repo: &str) -> Option<String> {
+    if !Path::new(repo).is_dir() {
+        return None;
+    }
+    let run = |args: &[&str]| -> Option<String> {
+        let mut cmd = std::process::Command::new("git");
+        cmd.current_dir(repo).args(args).env("GIT_TERMINAL_PROMPT", "0");
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        }
+        let out = cmd.output().ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    let url = run(&["remote", "get-url", "origin"]).or_else(|| {
+        // No `origin` — take the first remote git lists, if any.
+        let name = run(&["remote"])?.lines().next()?.trim().to_string();
+        (!name.is_empty()).then_some(name).and_then(|n| run(&["remote", "get-url", &n]))
+    })?;
+    normalize_remote_web_base(&url)
+}
+
+/// Resolve a stored issue/PR reference to a URL. `value` may already be a
+/// full URL (used verbatim); otherwise it's a `#N`/`N` reference resolved
+/// against `base`. `kind` is `"issue"` or `"pr"`. None when there's nothing
+/// clickable (no number, or a bare number with no known remote).
+#[doc(hidden)] // pub for integration tests
+pub fn resolve_ref_url(base: Option<&str>, kind: &str, value: &str) -> Option<String> {
+    let v = value.trim();
+    if v.starts_with("https://") || v.starts_with("http://") {
+        return Some(v.to_string());
+    }
+    // Pull the first run of digits out of `#12`, `12`, `GH-12`, etc.
+    let num: String = v
+        .chars()
+        .skip_while(|c| !c.is_ascii_digit())
+        .take_while(char::is_ascii_digit)
+        .collect();
+    if num.is_empty() {
+        return None;
+    }
+    // GitHub redirects /issues/N <-> /pull/N, so a kind mismatch still lands.
+    let seg = if kind == "issue" { "issues" } else { "pull" };
+    Some(format!("{}/{seg}/{num}", base?.trim_end_matches('/')))
+}
+
+/// WinRT toast script (see `notify_desktop`). Title/body come in via
+/// environment variables — never interpolated into the script — so agent/board
+/// text can't inject PowerShell. XML-escaped before templating. The AppUserModel
+/// id is the stock PowerShell shortcut, which lets an unpackaged process raise a
+/// toast on Windows 10; it renders attributed to PowerShell, which is fine for
+/// an optional signal.
+#[cfg(target_os = "windows")]
+const TOAST_PS1: &str = r#"
+$ErrorActionPreference='SilentlyContinue'
+[void][Windows.UI.Notifications.ToastNotificationManager,Windows.UI.Notifications,ContentType=WindowsRuntime]
+[void][Windows.Data.Xml.Dom.XmlDocument,Windows.Data.Xml.Dom,ContentType=WindowsRuntime]
+$t=[System.Security.SecurityElement]::Escape($env:LOOMUX_TOAST_TITLE)
+$b=[System.Security.SecurityElement]::Escape($env:LOOMUX_TOAST_BODY)
+$xml="<toast><visual><binding template='ToastGeneric'><text>$t</text><text>$b</text></binding></visual></toast>"
+$doc=New-Object Windows.Data.Xml.Dom.XmlDocument
+$doc.LoadXml($xml)
+$toast=New-Object Windows.UI.Notifications.ToastNotification $doc
+$app='{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe'
+[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($app).Show($toast)
+"#;
+
+/// Best-effort OS desktop notification (attention routing #6). On Windows this
+/// spawns a hidden PowerShell that raises a WinRT toast, passing the title/body
+/// as environment variables (injection-proof — see `TOAST_PS1`). Deliberately
+/// no notification crate: those pull getrandom, which this project's Windows 10
+/// baseline can't load (0xc0000139 — see the Cargo.toml note). Silently a no-op
+/// on failure and on non-Windows; the pane badges and board highlight are the
+/// primary signal regardless.
+#[cfg(target_os = "windows")]
+fn notify_desktop(title: &str, body: &str) {
+    use std::os::windows::process::CommandExt;
+    let _ = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", TOAST_PS1])
+        .env("LOOMUX_TOAST_TITLE", title)
+        .env("LOOMUX_TOAST_BODY", body)
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+        .spawn();
+}
+
+#[cfg(not(target_os = "windows"))]
+fn notify_desktop(_title: &str, _body: &str) {}
+
+/// Open an http(s) URL in the user's default browser. The URL is passed to
+/// the OS handler as a single process argument (never a shell line), and is
+/// validated first so a crafted board reference can't smuggle anything.
+fn open_external_url(url: &str) -> Result<(), String> {
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return Err("refusing to open a non-http(s) URL".into());
+    }
+    if url.len() > 2048 || url.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err("unsafe URL".into());
+    }
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        // rundll32 takes the URL as one argument, sidestepping cmd.exe's
+        // `start` metacharacter handling.
+        let mut c = std::process::Command::new("rundll32");
+        c.args(["url.dll,FileProtocolHandler", url]);
+        use std::os::windows::process::CommandExt;
+        c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        c
+    };
+    #[cfg(target_os = "macos")]
+    let mut cmd = {
+        let mut c = std::process::Command::new("open");
+        c.arg(url);
+        c
+    };
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    let mut cmd = {
+        let mut c = std::process::Command::new("xdg-open");
+        c.arg(url);
+        c
+    };
+    cmd.spawn().map(|_| ()).map_err(|e| format!("could not open browser: {e}"))
+}
+
 // ---------- task board (human side) ----------
 // The pane overlay edits the same tasks.json the orchestrator manages via
 // MCP. Human edits are audited as actor "human" and (except reorders, which
@@ -1956,6 +3476,14 @@ pub fn resume_orch_session(
 #[tauri::command]
 pub fn orch_tasks(reg: tauri::State<Arc<OrchRegistry>>, group_id: String) -> Vec<Task> {
     reg.tasks(&group_id)
+}
+
+/// Audit-log timeline for the pane's audit-viewer overlay (read-only). Oldest
+/// first; the frontend filters, expands prompt texts, and — in follow mode —
+/// re-polls this command.
+#[tauri::command]
+pub fn orch_audit(reg: tauri::State<Arc<OrchRegistry>>, group_id: String) -> Vec<AuditEntry> {
+    reg.audit_log(&group_id)
 }
 
 #[tauri::command]
@@ -1997,4 +3525,54 @@ pub fn orch_reorder_tasks(
     // No typed notice: reorders come in bursts; board order is read via
     // list_tasks whenever the orchestrator plans.
     reg.reorder_tasks(&group_id, "human", &ids)
+}
+
+// ---------- merge-gate actions (human side) ----------
+// The human's gatekeeping touchpoints on `pr` / `human-testing` items. Each
+// records on the board (audited, actor "human") and delivers a purpose-built
+// typed notice into the orchestrator's CLI so it can act on the decision.
+
+/// Open a task's issue or PR reference in the default browser. `kind` is
+/// `"issue"` or `"pr"`; `value` is the stored reference (`#12`, `12`, or a
+/// full URL).
+#[tauri::command]
+pub fn orch_open_ref(
+    reg: tauri::State<Arc<OrchRegistry>>,
+    group_id: String,
+    kind: String,
+    value: String,
+) -> Result<(), String> {
+    let repo = reg
+        .group(&group_id)
+        .map(|g| g.repo)
+        .or_else(|| reg.load_group_file(&group_id).map(|(repo, _)| repo))
+        .ok_or("unknown group")?;
+    let base = git_remote_web_base(&repo);
+    let url = resolve_ref_url(base.as_deref(), &kind, &value)
+        .ok_or("no URL for this reference — the repo may have no GitHub remote")?;
+    reg.audit(&group_id, "human", "open-ref", json!({ "kind": kind, "url": url }));
+    open_external_url(&url)
+}
+
+/// Approve a merge-gate item: mark it done and notify the orchestrator to
+/// merge. The human's direct sign-off, so the status change is applied here.
+#[tauri::command]
+pub fn orch_approve_task(
+    reg: tauri::State<Arc<OrchRegistry>>,
+    group_id: String,
+    id: String,
+) -> Result<Task, String> {
+    reg.approve_task(&group_id, &id)
+}
+
+/// Request changes on a merge-gate item: record the findings and deliver them
+/// to the orchestrator to route back to a worker.
+#[tauri::command]
+pub fn orch_request_changes(
+    reg: tauri::State<Arc<OrchRegistry>>,
+    group_id: String,
+    id: String,
+    findings: String,
+) -> Result<Task, String> {
+    reg.request_changes(&group_id, &id, &findings)
 }
