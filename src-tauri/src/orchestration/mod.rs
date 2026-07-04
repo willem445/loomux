@@ -1063,6 +1063,35 @@ impl OrchRegistry {
             .count() as u32
     }
 
+    /// Servers from the repo's standard `.mcp.json` (workdir's checkout
+    /// first, then the group repo). Claude agents need these merged into
+    /// their per-agent config: `--strict-mcp-config` (required for group
+    /// isolation) suppresses Claude's native `.mcp.json` loading. Copilot
+    /// reads the file natively and needs no help. A malformed file is
+    /// audited and skipped rather than blocking spawns.
+    fn repo_mcp_servers(
+        &self,
+        group: &str,
+        workdir: &str,
+        repo: &str,
+    ) -> Option<serde_json::Map<String, Value>> {
+        let path = [workdir, repo]
+            .iter()
+            .map(|d| Path::new(d).join(".mcp.json"))
+            .find(|p| p.is_file())?;
+        let parsed = fs::read_to_string(&path)
+            .ok()
+            .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+            .and_then(|v| v.get("mcpServers").and_then(Value::as_object).cloned());
+        if parsed.is_none() {
+            self.audit(group, "loomux", "warning", json!({
+                "what": ".mcp.json unreadable — repo MCP servers skipped",
+                "path": path.display().to_string(),
+            }));
+        }
+        parsed
+    }
+
     /// Write the per-agent MCP config the agent CLI connects with. Claude
     /// and Copilot share the same core schema; Copilot additionally expects
     /// a `tools` allowlist inside the server entry.
@@ -1350,26 +1379,10 @@ impl OrchRegistry {
             }
             None => None,
         };
-        let extra_servers: Option<serde_json::Map<String, Value>> = match
-            profile.as_ref().and_then(|p| p.mcp.as_deref())
-        {
-            Some(rel) => {
-                // Declared tools that can't load are an error, not a silent
-                // downgrade — the profile exists because of those tools.
-                let path = profiles::mcp_path(&group.repo, rel);
-                let text = fs::read_to_string(&path)
-                    .map_err(|e| format!("profile MCP config unreadable ({}): {e}", path.display()))?;
-                let v: Value = serde_json::from_str(&text)
-                    .map_err(|e| format!("profile MCP config invalid ({}): {e}", path.display()))?;
-                let map = v
-                    .get("mcpServers")
-                    .and_then(Value::as_object)
-                    .cloned()
-                    .or_else(|| v.as_object().cloned())
-                    .ok_or_else(|| format!("profile MCP config has no servers ({})", path.display()))?;
-                Some(map)
-            }
-            None => None,
+        let extra_servers = if group.guardrails.agent_cli == "claude" {
+            self.repo_mcp_servers(group_id, &cwd, &group.repo)
+        } else {
+            None
         };
 
         let cfg = self.write_mcp_config(
@@ -1900,7 +1913,18 @@ fn register_orchestrator_pane(
     if group.guardrails.agent_cli == "copilot" {
         pre_trust_copilot_folder(&group.repo);
     }
-    let cfg = reg.write_mcp_config(&group.id, &agent_id, &token, &group.guardrails.agent_cli, None)?;
+    let repo_servers = if group.guardrails.agent_cli == "claude" {
+        reg.repo_mcp_servers(&group.id, &group.repo, &group.repo)
+    } else {
+        None
+    };
+    let cfg = reg.write_mcp_config(
+        &group.id,
+        &agent_id,
+        &token,
+        &group.guardrails.agent_cli,
+        repo_servers.as_ref(),
+    )?;
     let resume = resume_session.is_some();
     let session_id = match resume_session {
         Some(s) => Some(sanitize_session(&s).ok_or("invalid resume session id")?),

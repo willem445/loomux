@@ -1,28 +1,30 @@
-//! Custom agent profiles: repo-defined worker/reviewer personas.
-//!
-//! A profile is a markdown file at `<repo>/.loomux/agents/<name>.md` with a
-//! small frontmatter block and role instructions as the body:
+//! Custom agent profiles: repo-defined worker/reviewer personas, read from
+//! the **standard** `.github/agents/<name>.agent.md` files (the same ones
+//! Copilot CLI uses natively), so personas live with the workspace instead
+//! of a loomux-specific config.
 //!
 //! ```markdown
 //! ---
-//! description: Embedded developer with hardware tools
-//! model: opus                      # optional, overrides the role default
+//! name: sempkg
+//! description: >
+//!   Version-accurate code research agent ...
+//! tools: [agent, search, read, sempkg/*]   # copilot-specific, ignored here
+//! # optional loomux extensions:
+//! model: opus                      # overrides the role default
 //! kind: worker                     # worker (default) | reviewer
-//! mcp: .loomux/mcp/embedded.json   # optional extra MCP servers (repo-relative)
-//! allow: Bash(make:*), mcp__probe  # optional extra pre-approved tools
-//! copilot-agent: embedded          # optional: copilot --agent mapping
+//! allow: Bash(make:*), mcp__probe  # extra pre-approved tools
 //! ---
-//! You are the embedded developer for this project. ...
+//! <persona instructions>
 //! ```
 //!
-//! Profiles are re-read from disk on every spawn so edits apply to the next
-//! agent without relaunching the group. The instructions body is injected
-//! as the agent's system prompt on Claude (`--append-system-prompt-file`);
-//! Copilot uses its native custom agent when `copilot-agent` is set, and
-//! the kickoff references the rendered brief either way.
+//! MCP tool servers come from the repo's standard `.mcp.json` (see
+//! `repo_mcp_servers` in mod.rs) rather than per-profile config. On Copilot
+//! the profile maps to its native `--agent <name>`; on Claude the
+//! instructions body is injected as the agent's system prompt. Profiles are
+//! re-read from disk on every spawn so edits apply to the next agent.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 #[derive(Clone, Debug, Default)]
 pub struct AgentProfile {
@@ -33,11 +35,10 @@ pub struct AgentProfile {
     pub model: Option<String>,
     /// "worker" | "reviewer".
     pub kind: String,
-    /// Repo-relative (or absolute) path to an extra MCP servers JSON file.
-    pub mcp: Option<String>,
     /// Extra pre-approved tool patterns (Claude allowedTools / copilot --allow-tool).
     pub allow: Vec<String>,
-    /// Copilot custom agent name (`--agent <name>`).
+    /// Copilot custom agent name (`--agent <name>`); defaults to `name`,
+    /// which copilot resolves against the same .github/agents files.
     pub copilot_agent: Option<String>,
 }
 
@@ -61,47 +62,85 @@ fn sanitize_name(s: &str) -> Option<String> {
     (!cleaned.is_empty()).then_some(cleaned)
 }
 
-/// Parse a profile file. `stem` (the file name without extension) is the
-/// default profile name. Returns None for files without a frontmatter block
-/// — they're not profiles.
+/// Minimal YAML-ish frontmatter reader: `key: value` lines, where indented
+/// continuation lines (folded scalars like `description: >`) append to the
+/// previous key. Returns (key, folded value) pairs in order.
+fn parse_frontmatter(front: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for raw in front.lines() {
+        let line = raw.trim_end();
+        if line.trim().is_empty() {
+            continue;
+        }
+        let indented = line.starts_with(' ') || line.starts_with('\t');
+        if !indented {
+            if let Some((key, value)) = line.split_once(':') {
+                out.push((key.trim().to_lowercase(), value.trim().to_string()));
+                continue;
+            }
+        }
+        // Continuation of the previous key's value.
+        if let Some(last) = out.last_mut() {
+            if !last.1.is_empty() {
+                last.1.push(' ');
+            }
+            last.1.push_str(line.trim());
+        }
+    }
+    // Fold-scalar markers themselves aren't content.
+    for (_, v) in &mut out {
+        if let Some(rest) = v.strip_prefix('>').or_else(|| v.strip_prefix('|')) {
+            *v = rest.trim().to_string();
+        }
+        *v = v.trim().trim_matches('"').trim_matches('\'').to_string();
+    }
+    out
+}
+
+/// Parse a profile file. `stem` (file name without `.md`, with any trailing
+/// `.agent` dropped) is the default profile name. Returns None for files
+/// without a frontmatter block — they're not agent definitions.
 pub fn parse_profile(stem: &str, text: &str) -> Option<AgentProfile> {
     let text = text.trim_start_matches('\u{feff}');
     let rest = text.strip_prefix("---")?;
     let (front, body) = rest.split_once("\n---")?;
+    let default_name = stem.strip_suffix(".agent").unwrap_or(stem);
     let mut p = AgentProfile {
-        name: sanitize_name(stem)?,
+        name: sanitize_name(default_name)?,
         kind: "worker".into(),
         instructions: body.trim_start_matches(['-']).trim().to_string(),
         ..Default::default()
     };
-    for line in front.lines() {
-        let Some((key, value)) = line.split_once(':') else { continue };
-        let value = value.trim().trim_matches('"').trim_matches('\'');
-        match key.trim().to_lowercase().as_str() {
+    for (key, value) in parse_frontmatter(front) {
+        match key.as_str() {
             "name" => {
-                if let Some(n) = sanitize_name(value) {
+                if let Some(n) = sanitize_name(&value) {
                     p.name = n;
                 }
             }
-            "description" => p.description = value.to_string(),
-            "model" => p.model = (!value.is_empty()).then(|| value.to_string()),
+            "description" => p.description = value,
+            "model" => p.model = (!value.is_empty()).then_some(value),
             "kind" => {
                 if value == "reviewer" {
                     p.kind = "reviewer".into();
                 }
             }
-            "mcp" => p.mcp = (!value.is_empty()).then(|| value.to_string()),
             "allow" => p.allow = value.split(',').filter_map(sanitize_allow).collect(),
-            "copilot-agent" | "copilot_agent" => p.copilot_agent = sanitize_name(value),
+            "copilot-agent" | "copilot_agent" => p.copilot_agent = sanitize_name(&value),
+            // tools / agents / etc. are copilot-native; copilot reads them
+            // itself via --agent.
             _ => {}
         }
+    }
+    if p.copilot_agent.is_none() {
+        p.copilot_agent = Some(p.name.clone());
     }
     (!p.instructions.is_empty()).then_some(p)
 }
 
-/// All profiles defined in a repo, sorted by name.
+/// All agent definitions in a repo (`.github/agents/*.md`), sorted by name.
 pub fn discover_profiles(repo: &str) -> Vec<AgentProfile> {
-    let dir = Path::new(repo).join(".loomux").join("agents");
+    let dir = Path::new(repo).join(".github").join("agents");
     let Ok(entries) = fs::read_dir(&dir) else {
         return vec![];
     };
@@ -120,42 +159,40 @@ pub fn discover_profiles(repo: &str) -> Vec<AgentProfile> {
     out
 }
 
-/// Resolve a profile's extra MCP servers file against the repo.
-pub fn mcp_path(repo: &str, mcp: &str) -> PathBuf {
-    let p = Path::new(mcp);
-    if p.is_absolute() {
-        p.to_path_buf()
-    } else {
-        Path::new(repo).join(p)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const SAMPLE: &str = "---\ndescription: Embedded developer\nmodel: opus\nmcp: .loomux/mcp/embedded.json\nallow: Bash(make:*), mcp__probe, bad\"quote\nkind: worker\ncopilot-agent: embedded\n---\nYou are the embedded developer. Use the HW tools.\n";
+    /// Mirrors the real-world copilot agent file shape (folded description,
+    /// copilot-specific keys) that discovery must digest.
+    const COPILOT_STYLE: &str = "---\nname: sempkg\ndescription: >\n  Version-accurate code research agent.\n  Use when: exploring an unfamiliar dependency; looking up API symbols.\ntools: [agent, search, todo, read, execute, web, edit, sempkg/*]\nagents: [\"*\"]\n---\n\n# sempkg Research Agent\n\nYou are a precision code research assistant.\n\n---\n\n## Workflow\nmore body\n";
 
     #[test]
-    fn parses_frontmatter_and_body() {
-        let p = parse_profile("embedded-dev", SAMPLE).unwrap();
-        assert_eq!(p.name, "embedded-dev");
-        assert_eq!(p.description, "Embedded developer");
-        assert_eq!(p.model.as_deref(), Some("opus"));
+    fn parses_copilot_agent_md_with_folded_description() {
+        let p = parse_profile("sempkg.agent", COPILOT_STYLE).unwrap();
+        assert_eq!(p.name, "sempkg");
+        assert!(
+            p.description.starts_with("Version-accurate code research agent."),
+            "folded (>) descriptions must join their continuation lines, got: {}",
+            p.description
+        );
+        assert!(p.description.contains("Use when: exploring"),
+            "continuation lines containing colons are description text, not keys");
+        assert!(p.instructions.contains("## Workflow"), "body --- separators must not truncate instructions");
+        assert_eq!(p.copilot_agent.as_deref(), Some("sempkg"),
+            "copilot --agent defaults to the profile name (same .github/agents source)");
         assert_eq!(p.kind, "worker");
-        assert_eq!(p.mcp.as_deref(), Some(".loomux/mcp/embedded.json"));
-        assert_eq!(p.copilot_agent.as_deref(), Some("embedded"));
-        assert!(p.instructions.starts_with("You are the embedded developer"));
-        // Allow entries are shell-quoted later: quote characters must not survive.
-        assert_eq!(p.allow, vec!["Bash(make:*)", "mcp__probe", "badquote"]);
+        assert!(p.model.is_none(), "copilot-specific keys must not bleed into loomux fields");
     }
 
     #[test]
-    fn reviewer_kind_and_name_override() {
-        let text = "---\nname: Test Dev!!\nkind: reviewer\n---\nReview firmware tests.";
-        let p = parse_profile("test-dev", text).unwrap();
+    fn stem_fallback_strips_agent_suffix_and_loomux_extensions_apply() {
+        let text = "---\ndescription: Embedded developer\nmodel: opus\nkind: reviewer\nallow: Bash(make:*), bad\"quote\n---\nYou are the embedded developer.";
+        let p = parse_profile("embedded-dev.agent", text).unwrap();
+        assert_eq!(p.name, "embedded-dev");
+        assert_eq!(p.model.as_deref(), Some("opus"));
         assert_eq!(p.kind, "reviewer");
-        assert_eq!(p.name, "TestDev", "names are sanitized for ids/paths");
+        assert_eq!(p.allow, vec!["Bash(make:*)", "badquote"]);
     }
 
     #[test]
@@ -165,17 +202,17 @@ mod tests {
     }
 
     #[test]
-    fn discovery_reads_only_md_with_frontmatter() {
+    fn discovery_reads_github_agents_dir() {
         let dir = tempfile::tempdir().unwrap();
-        let agents = dir.path().join(".loomux").join("agents");
+        let agents = dir.path().join(".github").join("agents");
         fs::create_dir_all(&agents).unwrap();
-        fs::write(agents.join("po.md"), "---\ndescription: Product owner\n---\nOwn the requirements.").unwrap();
+        fs::write(agents.join("po.agent.md"), "---\ndescription: Product owner\n---\nOwn the requirements.").unwrap();
+        fs::write(agents.join("plain.md"), "---\ndescription: also valid\n---\nBody.").unwrap();
         fs::write(agents.join("notes.txt"), "not a profile").unwrap();
-        fs::write(agents.join("plain.md"), "no frontmatter here").unwrap();
+        fs::write(agents.join("no-front.md"), "no frontmatter here").unwrap();
         let repo = dir.path().to_string_lossy().into_owned();
-        let profiles = discover_profiles(&repo);
-        assert_eq!(profiles.len(), 1);
-        assert_eq!(profiles[0].name, "po");
+        let names: Vec<String> = discover_profiles(&repo).into_iter().map(|p| p.name).collect();
+        assert_eq!(names, vec!["plain", "po"]);
         assert!(discover_profiles("C:/definitely/not/a/repo").is_empty());
     }
 }

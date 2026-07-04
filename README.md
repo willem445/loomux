@@ -135,17 +135,21 @@ links, notes, and priority order. You can add, edit, annotate, reorder, and
 delete tasks; the orchestrator is notified of your edits and maintains the
 same board through its tools.
 
-**Custom agent profiles:** define specialized personas per repo in
-`.loomux/agents/<name>.md` — frontmatter for `description`, `model`, `kind`
-(worker/reviewer), `mcp` (a JSON file of extra MCP servers, e.g. your
-hardware or test tools), `allow` (extra pre-approved commands), and
-`copilot-agent` (maps to a Copilot custom agent); the body is the persona's
-instructions. The orchestrator sees the available profiles in its kickoff
-and spawns them with `spawn_agent(profile: "embedded-dev", ...)`. On Claude
-the instructions are injected as the agent's system prompt; custom MCP
-servers ride in the same per-agent config as the loomux tools (the loomux
-identity entry can't be overridden). Profiles are re-read on every spawn,
-so edits apply to the next agent immediately.
+**Custom agent profiles:** loomux reuses the workspace's *standard* agent
+and tool definitions — no loomux-specific config. Personas come from
+`.github/agents/<name>.agent.md` (the same files Copilot CLI uses:
+frontmatter `name`/`description`, instructions body; optional loomux
+extensions `model`, `kind: reviewer`, `allow` for extra pre-approved
+commands). MCP tool servers come from the repo's standard `.mcp.json` and
+are available to **every** agent in the group: Copilot loads the file
+natively, and for Claude loomux merges it into each agent's config (Claude
+runs with `--strict-mcp-config` for group isolation, which would otherwise
+skip it; the loomux identity entry can't be shadowed). The orchestrator
+sees available profiles in its kickoff and spawns them with
+`spawn_agent(profile: "embedded-dev", ...)` — on Claude the persona is
+injected as the agent's system prompt, on Copilot via its native
+`--agent <name>`. Profiles are re-read on every spawn, so edits apply to
+the next agent immediately.
 
 **Per-task sessions:** each worker is scoped to exactly one work item, and
 loomux pre-assigns Claude session ids at spawn, recording them on the

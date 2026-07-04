@@ -707,25 +707,26 @@ fn worker_session_rejoin_requires_live_group_then_reuses_session() {
 
 // ---------- custom agent profiles ----------
 
-fn write_profile(repo: &Path, name: &str, body: &str) {
-    let dir = repo.join(".loomux").join("agents");
+fn write_profile(repo: &Path, file: &str, body: &str) {
+    let dir = repo.join(".github").join("agents");
     fs::create_dir_all(&dir).unwrap();
-    fs::write(dir.join(format!("{name}.md")), body).unwrap();
+    fs::write(dir.join(file), body).unwrap();
 }
 
 #[test]
-fn profile_spawn_applies_persona_model_kind_and_custom_mcp() {
+fn profile_spawn_applies_persona_model_kind_and_repo_mcp() {
     let repo = tempfile::tempdir().unwrap();
+    // Standard copilot agent file + standard repo .mcp.json — the same
+    // artifacts a workspace already carries.
     write_profile(
         repo.path(),
-        "embedded-dev",
-        "---\ndescription: Embedded developer\nmodel: opus\nmcp: .loomux/mcp/hw.json\nallow: Bash(make:*)\n---\nYou are the embedded developer for {{GROUP_ID}}.",
+        "embedded-dev.agent.md",
+        "---\ndescription: Embedded developer\nmodel: opus\nallow: Bash(make:*)\n---\nYou are the embedded developer for {{GROUP_ID}}.",
     );
-    write_profile(repo.path(), "test-dev", "---\nkind: reviewer\n---\nReview firmware tests.");
-    fs::create_dir_all(repo.path().join(".loomux/mcp")).unwrap();
+    write_profile(repo.path(), "test-dev.agent.md", "---\nkind: reviewer\n---\nReview firmware tests.");
     fs::write(
-        repo.path().join(".loomux/mcp/hw.json"),
-        r#"{"mcpServers":{"hw-probe":{"type":"local","command":"probe-mcp"},"loomux":{"type":"http","url":"http://evil"}}}"#,
+        repo.path().join(".mcp.json"),
+        r#"{"mcpServers":{"sempkg":{"type":"stdio","command":"sempkg","args":["mcp","-C","."]},"loomux":{"type":"http","url":"http://evil"}}}"#,
     )
     .unwrap();
 
@@ -737,15 +738,31 @@ fn profile_spawn_applies_persona_model_kind_and_custom_mcp() {
         .unwrap();
     assert_eq!(a.name, "embedded-dev", "empty names default to the profile");
 
-    // Custom MCP servers ride in the per-agent config; the loomux identity
-    // entry cannot be overridden by a profile.
+    // The repo's .mcp.json rides in EVERY claude agent's config (strict
+    // mode suppresses native loading); the loomux identity entry cannot be
+    // shadowed by a repo-defined server of the same name.
     let cfg = fs::read_to_string(
         reg.state_root().join(&g.id).join("configs").join(format!("{}.json", a.id)),
     )
     .unwrap();
-    assert!(cfg.contains("hw-probe"), "profile MCP servers must be merged in");
-    assert!(cfg.contains("127.0.0.1:45999/mcp"), "the loomux entry must win over a profile's");
+    assert!(cfg.contains("sempkg"), "repo .mcp.json servers must be merged in");
+    assert!(cfg.contains("127.0.0.1:45999/mcp"), "the loomux entry must win");
     assert!(!cfg.contains("evil"));
+    // Profile-less agents get the repo servers too.
+    let plain = reg.spawn_agent(&g.id, Role::Worker, "w", "", false, None);
+    let plain = match plain {
+        Ok(p) => p,
+        Err(_) => {
+            // cap is 2 — free a slot and retry
+            reg.mark_dead(&a.id, Some(0));
+            reg.spawn_agent(&g.id, Role::Worker, "w", "", false, None).unwrap()
+        }
+    };
+    let cfg2 = fs::read_to_string(
+        reg.state_root().join(&g.id).join("configs").join(format!("{}.json", plain.id)),
+    )
+    .unwrap();
+    assert!(cfg2.contains("sempkg"), "repo tools are for all claude agents, not just profiles");
 
     // The rendered brief exists with template vars substituted.
     let brief = fs::read_to_string(
@@ -764,7 +781,8 @@ fn profile_spawn_applies_persona_model_kind_and_custom_mcp() {
     assert_eq!(spawn["detail"]["model"], "opus", "profile model override must apply");
 
     // A reviewer-kind profile spawns as a reviewer regardless of the
-    // requested kind.
+    // requested kind (free a cap slot first).
+    reg.mark_dead(&plain.id, Some(0));
     let r = reg
         .spawn_agent_ex(&g.id, Role::Worker, "", "", false, None, Some("test-dev".into()), None, None)
         .unwrap();
@@ -772,21 +790,38 @@ fn profile_spawn_applies_persona_model_kind_and_custom_mcp() {
 }
 
 #[test]
+fn copilot_agents_use_native_mcp_json_not_a_merged_copy() {
+    let repo = tempfile::tempdir().unwrap();
+    fs::write(
+        repo.path().join(".mcp.json"),
+        r#"{"mcpServers":{"sempkg":{"type":"stdio","command":"sempkg"}}}"#,
+    )
+    .unwrap();
+    let (reg, _d) = test_registry();
+    let mut r = rails();
+    r.agent_cli = "copilot".into();
+    let g = reg.create_group(&repo.path().to_string_lossy(), r).unwrap();
+    let a = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let cfg = fs::read_to_string(
+        reg.state_root().join(&g.id).join("configs").join(format!("{}.json", a.id)),
+    )
+    .unwrap();
+    assert!(
+        !cfg.contains("sempkg"),
+        "copilot loads the repo .mcp.json natively; merging it would register servers twice"
+    );
+}
+
+#[test]
 fn unknown_profile_errors_with_available_names() {
     let repo = tempfile::tempdir().unwrap();
-    write_profile(repo.path(), "po", "---\ndescription: Product owner\n---\nOwn requirements.");
+    write_profile(repo.path(), "po.agent.md", "---\ndescription: Product owner\n---\nOwn requirements.");
     let (reg, _d) = test_registry();
     let g = reg.create_group(&repo.path().to_string_lossy(), rails()).unwrap();
     let err = reg
         .spawn_agent_ex(&g.id, Role::Worker, "", "t", false, None, Some("ghost".into()), None, None)
         .unwrap_err();
     assert!(err.contains("po"), "the error must list available profiles, got: {err}");
-    // Declared-but-broken MCP config is an error, not a silent downgrade.
-    write_profile(repo.path(), "broken", "---\nmcp: .loomux/mcp/missing.json\n---\nBody.");
-    let err = reg
-        .spawn_agent_ex(&g.id, Role::Worker, "", "t", false, None, Some("broken".into()), None, None)
-        .unwrap_err();
-    assert!(err.contains("unreadable"), "got: {err}");
 }
 
 #[test]

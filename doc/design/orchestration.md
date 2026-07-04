@@ -139,12 +139,13 @@ intent, not vacuous passes) → design notes + user docs → commit → push →
   `resume_orch_session`, resuming the conversation; workers/reviewers rejoin live
   groups the same way.
 
-- **Custom agent profiles (third validation round)**: `.loomux/agents/<name>.md`
-  (frontmatter + instructions) defines repo-local personas with model overrides,
-  extra MCP servers (merged into the per-agent config; the loomux identity entry is
-  reserved), extra allowlist entries, and Copilot custom-agent mapping. Claude gets
-  the instructions via `--append-system-prompt-file`; kickoffs reference the rendered
-  brief; the orchestrator's kickoff lists available profiles. Re-read per spawn.
+- **Custom agent profiles (third validation round)**: personas come from the
+  workspace's standard `.github/agents/<name>.agent.md` (Copilot's own format,
+  incl. folded YAML descriptions; optional loomux extensions: model, kind: reviewer,
+  allow). Repo `.mcp.json` servers ride with every agent — merged into Claude's
+  per-agent config (strict mode suppresses native loading; the loomux identity entry
+  is reserved), native on Copilot. Claude personas via --append-system-prompt-file,
+  Copilot via native --agent. Re-read per spawn; orchestrator kickoff lists them.
 
 ## Risks / limitations
 
