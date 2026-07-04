@@ -308,13 +308,21 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             let cwd = arg_str(args, "cwd").map(str::to_string);
             let resumed = resume.is_some();
             let a = reg.spawn_agent_ex(&caller.group, kind, name, task, worktree, branch, resume, cwd)?;
+            // Copilot mints its session id a few seconds into boot; loomux
+            // binds it to the pane once it appears (visible then in
+            // list_agents / the task board).
+            let session = a
+                .session_id
+                .as_deref()
+                .map(|s| format!("Session {s}."))
+                .unwrap_or_else(|| "Session id will appear in list_agents once Copilot initializes.".into());
             Ok(format!(
-                "spawned {} (\"{}\", {:?}){}. Session {}. It will report when ready.",
+                "spawned {} (\"{}\", {:?}){}. {} It will report when ready.",
                 a.id,
                 a.name,
                 a.role,
                 if resumed { " resuming its previous session" } else { "" },
-                a.session_id.as_deref().unwrap_or("untracked"),
+                session,
             ))
         }
         "send_prompt" => {

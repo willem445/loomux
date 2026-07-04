@@ -22,7 +22,7 @@ use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -88,6 +88,15 @@ const ECHO_RETRY_DELAY: Duration = Duration::from_millis(1500);
 const ECHO_ATTEMPTS: u32 = 3;
 /// Upper bound for `set_state` payloads.
 const MAX_STATE_BYTES: usize = 512 * 1024;
+
+// Copilot session tracking: unlike Claude, copilot can't be handed a session
+// id up front — it mints one and writes `~/.copilot/session-state/<id>/` a
+// few seconds into boot. After spawning a copilot pane we poll for the new
+// session directory and bind its id to the pane's roster record.
+/// How often to poll `session-state` for the pane's new session.
+const COPILOT_SESSION_POLL: Duration = Duration::from_millis(1000);
+/// Give up watching after this long (copilot never initialized, or crashed).
+const COPILOT_SESSION_TIMEOUT: Duration = Duration::from_secs(90);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -424,6 +433,11 @@ pub struct OrchRegistry {
     /// Per-group spawn timestamps (Unix-ms) for the spawn-rate guardrail;
     /// pruned to the trailing hour on each check.
     spawn_times: Mutex<HashMap<String, Vec<u64>>>,
+    /// Weak handle to our own `Arc`, set once at startup (`set_self_arc`), so
+    /// `&self` methods can hand an owned registry to background threads (e.g.
+    /// the copilot session watcher). `Weak` avoids a self-referential `Arc`
+    /// cycle that would leak the registry.
+    self_arc: Mutex<Weak<OrchRegistry>>,
 }
 
 fn now_ms() -> u64 {
@@ -718,7 +732,22 @@ impl OrchRegistry {
             creation: Mutex::new(()),
             paused: Mutex::new(HashSet::new()),
             spawn_times: Mutex::new(HashMap::new()),
+            self_arc: Mutex::new(Weak::new()),
         }
+    }
+
+    /// Record the `Arc` the registry is stored behind so `&self` methods can
+    /// spawn background work that outlives the current call. Call once, right
+    /// after wrapping the registry in an `Arc`.
+    pub fn set_self_arc(self: &Arc<Self>) {
+        *self.self_arc.lock().unwrap() = Arc::downgrade(self);
+    }
+
+    /// Upgrade the stored weak self-handle. `None` in unit tests that build a
+    /// bare registry without calling `set_self_arc` — background helpers then
+    /// simply don't run.
+    fn arc(&self) -> Option<Arc<Self>> {
+        self.self_arc.lock().unwrap().upgrade()
     }
 
     /// Default persistent root: `<user data dir>/loomux/orchestration`.
@@ -1048,8 +1077,13 @@ impl OrchRegistry {
         };
         // Match by (id, session): agent ids restart at 1 every app run, so
         // a bare-id match would overwrite a previous run's record and lose
-        // that session's identity.
-        match list.iter_mut().find(|r| r.id == record.id && r.session == record.session) {
+        // that session's identity. A session-bearing record also supersedes
+        // this run's placeholder for the same id — copilot writes an entry
+        // with no session at spawn, then upgrades it once its session id is
+        // discovered (only placeholders have session == None).
+        match list.iter_mut().find(|r| {
+            r.id == record.id && (r.session == record.session || r.session.is_none())
+        }) {
             Some(r) => *r = record,
             None => list.push(record),
         }
@@ -1062,6 +1096,91 @@ impl OrchRegistry {
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default()
+    }
+
+    /// Poll `~/.copilot/session-state` for the session the just-spawned
+    /// copilot pane created (the one absent from `baseline`) and bind its id
+    /// to the pane. Runs on its own thread — copilot writes the session a few
+    /// seconds into boot. Gives up after `COPILOT_SESSION_TIMEOUT`.
+    fn spawn_copilot_session_watcher(
+        self: Arc<Self>,
+        agent_id: String,
+        group_id: String,
+        cwd: String,
+        baseline: HashSet<String>,
+    ) {
+        let Some(root) = crate::sessions::copilot_session_state_root() else {
+            return;
+        };
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + COPILOT_SESSION_TIMEOUT;
+            loop {
+                std::thread::sleep(COPILOT_SESSION_POLL);
+                // Stop if the pane died or was already associated (a resume
+                // re-spawn, or a manual edit) — nothing left to track.
+                match self.agent(&agent_id) {
+                    Some(a) if a.status == AgentStatus::Dead => return,
+                    Some(a) if a.session_id.is_some() => return,
+                    Some(_) => {}
+                    None => return,
+                }
+                if let Some(sid) =
+                    crate::sessions::newest_new_copilot_session(&root, &baseline, &cwd)
+                {
+                    self.associate_copilot_session(&group_id, &agent_id, &sid);
+                    return;
+                }
+                if std::time::Instant::now() >= deadline {
+                    self.audit(&group_id, "loomux", "copilot-session-untracked",
+                        json!({ "agent": agent_id, "reason": "no new session-state appeared before timeout" }));
+                    return;
+                }
+            }
+        });
+    }
+
+    /// Bind a discovered copilot session id to a live pane: update the agent
+    /// map, the durable roster (`agents.json`), and any task board item this
+    /// agent owns — the same session trail Claude gets at spawn. Best-effort.
+    /// Public for the session watcher and its tests; a no-op if the pane is
+    /// gone or already carries a session id.
+    pub fn associate_copilot_session(&self, group_id: &str, agent_id: &str, session_id: &str) {
+        let entry = {
+            let mut agents = self.agents.lock().unwrap();
+            let Some(a) = agents.get_mut(agent_id) else { return };
+            // Don't clobber an id set in the meantime (e.g. a resume).
+            if a.session_id.is_some() {
+                return;
+            }
+            a.session_id = Some(session_id.to_string());
+            a.clone()
+        };
+        let status = match entry.status {
+            AgentStatus::Dead => "dead",
+            _ => "running",
+        };
+        self.persist_agent_record(&entry, status);
+        // Mirror onto the task board: any item this agent owns (by id or
+        // display name) that lacks a session gets it, so the orchestrator can
+        // resume the task later without hunting the id out of list_agents.
+        {
+            let _guard = self.tasks_lock.lock().unwrap();
+            let mut tasks = self.tasks(group_id);
+            let mut changed = false;
+            for t in tasks.iter_mut() {
+                let owner = t.assignee.as_deref().unwrap_or("");
+                if t.session.is_none() && (owner == entry.id || owner == entry.name) {
+                    t.session = Some(session_id.to_string());
+                    t.updated_ms = now_ms();
+                    changed = true;
+                }
+            }
+            if changed {
+                let _ = self.write_tasks(group_id, &tasks);
+            }
+        }
+        self.audit(group_id, "loomux", "copilot-session",
+            json!({ "agent": agent_id, "session": session_id }));
     }
 
     /// Roster entries derived from `agent-spawn` audit lines. Backfill for
@@ -1627,6 +1746,16 @@ impl OrchRegistry {
             None => (group.guardrails.agent_cli == "claude").then(new_session_uuid),
         };
 
+        // Copilot mints its own session id after boot (no `--session-id`), so
+        // snapshot the sessions that already exist now, before this pane's
+        // copilot starts — the watcher then identifies the newly appeared one.
+        let copilot_baseline = (!resume && group.guardrails.agent_cli == "copilot")
+            .then(|| {
+                crate::sessions::copilot_session_state_root()
+                    .map(|root| crate::sessions::copilot_session_ids(&root))
+                    .unwrap_or_default()
+            });
+
         let branch_name = branch
             .map(|b| b.trim().to_string())
             .filter(|b| !b.is_empty())
@@ -1757,6 +1886,21 @@ impl OrchRegistry {
                     let kickoff =
                         self.kickoff_prompt(&self.agent(&agent_id).unwrap(), &group, &branch_note);
                     self.deliver_prompt(&agent_id, &kickoff, "loomux", true)?;
+                }
+                // Copilot minted a session as it booted; watch for it and bind
+                // its id to this pane's roster record so the session becomes
+                // resumable and shows in the session browser. Needs an owned
+                // registry (background thread) — a no-op in unit tests, which
+                // don't set the self-arc.
+                if let Some(baseline) = copilot_baseline {
+                    if let Some(reg) = self.arc() {
+                        reg.spawn_copilot_session_watcher(
+                            agent_id.clone(),
+                            group_id.to_string(),
+                            cwd.clone(),
+                            baseline,
+                        );
+                    }
                 }
                 Ok(self.agent(&agent_id).unwrap())
             }
@@ -2212,6 +2356,15 @@ fn register_orchestrator_pane(
         Some(s) => Some(sanitize_session(&s).ok_or("invalid resume session id")?),
         None => (group.guardrails.agent_cli == "claude").then(new_session_uuid),
     };
+    // Copilot mints its own id on boot; snapshot existing sessions now so the
+    // orchestrator's newly created one can be tracked (this is what gives a
+    // copilot orchestration its ORCH chip and restore).
+    let copilot_baseline = (!resume && group.guardrails.agent_cli == "copilot")
+        .then(|| {
+            crate::sessions::copilot_session_state_root()
+                .map(|root| crate::sessions::copilot_session_ids(&root))
+                .unwrap_or_default()
+        });
     let command = reg.build_agent_command(
         &group.guardrails.agent_cli,
         &model,
@@ -2284,6 +2437,15 @@ fn register_orchestrator_pane(
             reg2.kickoff_prompt(&reg2.agent(&agent_id).unwrap(), &group2, "")
         };
         let _ = reg2.deliver_prompt(&agent_id, &kickoff, "loomux", true);
+        // Track the copilot session this orchestrator just minted.
+        if let Some(baseline) = copilot_baseline {
+            reg2.clone().spawn_copilot_session_watcher(
+                agent_id.clone(),
+                group2.id.clone(),
+                group2.repo.clone(),
+                baseline,
+            );
+        }
         for i in 0..initial_workers.min(group2.guardrails.max_agents) {
             if let Err(e) = reg2.spawn_agent(&group2.id, Role::Worker, &format!("worker {}", i + 1), "", false, None)
             {

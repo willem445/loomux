@@ -10,9 +10,10 @@
 
 use serde::Serialize;
 use serde_json::Value;
+use std::collections::HashSet;
 use std::fs;
 use std::io::{BufRead, BufReader};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 #[derive(Serialize)]
@@ -222,32 +223,110 @@ fn yaml_field(text: &str, key: &str) -> Option<String> {
     })
 }
 
+/// Root of copilot's per-session state, honoring `COPILOT_HOME` so tests and
+/// the orchestration spawn/trust paths agree on where copilot keeps its
+/// files. `COPILOT_HOME` names the `.copilot` directory itself (matching
+/// `pre_trust_copilot_folder`), under which sessions live in `session-state`.
+pub(crate) fn copilot_session_state_root() -> Option<PathBuf> {
+    std::env::var("COPILOT_HOME")
+        .map(PathBuf::from)
+        .ok()
+        .or_else(|| dirs::home_dir().map(|h| h.join(".copilot")))
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.join("session-state"))
+}
+
+/// One copilot session read from its `session-state/<dir>/workspace.yaml`.
+struct CopilotSession {
+    id: String,
+    title: String,
+    cwd: String,
+    modified_ms: u64,
+}
+
+/// Parse a single session directory. `None` when `workspace.yaml` is missing
+/// (session not yet written) or carries no `id`.
+fn read_copilot_session(dir: &Path) -> Option<CopilotSession> {
+    let ws = dir.join("workspace.yaml");
+    let text = fs::read_to_string(&ws).ok()?;
+    let id = yaml_field(&text, "id")?;
+    let title = yaml_field(&text, "name")
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| "Copilot session".to_string());
+    let cwd = yaml_field(&text, "cwd").unwrap_or_default();
+    Some(CopilotSession { id, title, cwd, modified_ms: mtime_ms(&ws) })
+}
+
+/// Path comparison for copilot cwds: Windows is case- and slash-insensitive,
+/// and a trailing separator must not matter.
+fn norm_path(s: &str) -> String {
+    s.replace('/', "\\").trim_end_matches('\\').to_lowercase()
+}
+
+/// Session ids currently present under `root` — the baseline snapshot taken
+/// before spawning a copilot agent, so the session it later creates can be
+/// told apart from pre-existing ones.
+pub(crate) fn copilot_session_ids(root: &Path) -> HashSet<String> {
+    let mut ids = HashSet::new();
+    let Ok(entries) = fs::read_dir(root) else {
+        return ids;
+    };
+    for entry in entries.flatten() {
+        if let Some(s) = read_copilot_session(&entry.path()) {
+            ids.insert(s.id);
+        }
+    }
+    ids
+}
+
+/// The copilot session most likely created by a just-spawned pane: one absent
+/// from `baseline`, preferring a session whose recorded cwd matches `cwd`
+/// (disambiguating agents spawned concurrently in different worktrees),
+/// newest by mtime. `None` until copilot has written a new session's
+/// `workspace.yaml` — the caller polls.
+pub(crate) fn newest_new_copilot_session(
+    root: &Path,
+    baseline: &HashSet<String>,
+    cwd: &str,
+) -> Option<String> {
+    let Ok(entries) = fs::read_dir(root) else {
+        return None;
+    };
+    let fresh: Vec<CopilotSession> = entries
+        .flatten()
+        .filter_map(|e| read_copilot_session(&e.path()))
+        .filter(|s| !baseline.contains(&s.id))
+        .collect();
+    let want = norm_path(cwd);
+    let cwd_matches = |s: &&CopilotSession| !want.is_empty() && norm_path(&s.cwd) == want;
+    // Prefer a cwd match; fall back to the newest fresh session when copilot
+    // hasn't recorded a matching cwd yet.
+    fresh
+        .iter()
+        .filter(cwd_matches)
+        .max_by_key(|s| s.modified_ms)
+        .or_else(|| fresh.iter().max_by_key(|s| s.modified_ms))
+        .map(|s| s.id.clone())
+}
+
 fn scan_copilot(out: &mut Vec<SessionInfo>) {
-    let Some(root) = dirs::home_dir().map(|h| h.join(".copilot").join("session-state")) else {
+    let Some(root) = copilot_session_state_root() else {
         return;
     };
     let Ok(entries) = fs::read_dir(&root) else {
         return;
     };
     for entry in entries.flatten() {
-        let ws = entry.path().join("workspace.yaml");
-        let Ok(text) = fs::read_to_string(&ws) else {
+        let Some(s) = read_copilot_session(&entry.path()) else {
             continue;
         };
-        let Some(id) = yaml_field(&text, "id") else {
-            continue;
-        };
-        let title = yaml_field(&text, "name")
-            .filter(|n| !n.is_empty())
-            .unwrap_or_else(|| "Copilot session".to_string());
-        let cwd = yaml_field(&text, "cwd").unwrap_or_default();
         out.push(SessionInfo {
-            resume_command: format!("copilot --resume {id}"),
-            id,
+            resume_command: format!("copilot --resume {}", s.id),
+            id: s.id,
             source: "copilot".to_string(),
-            title: tidy_title(&title, 90),
-            cwd,
-            modified_ms: mtime_ms(&ws),
+            title: tidy_title(&s.title, 90),
+            cwd: s.cwd,
+            modified_ms: s.modified_ms,
             orch_role: None,
             orch_group: None,
         });
@@ -304,5 +383,96 @@ mod orch_signature_tests {
             detect_orch_signature("the word loomux alone should not match").is_none(),
             "prose mentioning loomux must not mark a session"
         );
+    }
+}
+
+#[cfg(test)]
+mod copilot_session_tests {
+    use super::{copilot_session_ids, newest_new_copilot_session};
+    use std::collections::HashSet;
+    use std::fs;
+    use std::path::Path;
+
+    /// Create `session-state/<id>/workspace.yaml` with the given fields. The
+    /// mtime bump makes "newest" deterministic without a real clock.
+    fn write_session(root: &Path, id: &str, cwd: &str) {
+        let dir = root.join(id);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("workspace.yaml"),
+            format!("id: {id}\nname: work on {id}\ncwd: {cwd}\n"),
+        )
+        .unwrap();
+    }
+
+    /// Force `b`'s workspace.yaml to be strictly newer than `a`'s, so mtime
+    /// ordering is stable regardless of filesystem timestamp granularity.
+    fn make_newer(root: &Path, older: &str, newer: &str) {
+        use std::time::{Duration, SystemTime};
+        let base = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let set = |id: &str, t: SystemTime| {
+            let f = fs::File::options()
+                .write(true)
+                .open(root.join(id).join("workspace.yaml"))
+                .unwrap();
+            f.set_modified(t).unwrap();
+        };
+        set(older, base);
+        set(newer, base + Duration::from_secs(10));
+    }
+
+    #[test]
+    fn baseline_snapshots_existing_ids() {
+        let d = tempfile::tempdir().unwrap();
+        write_session(d.path(), "aaaa", "C:/work/a");
+        write_session(d.path(), "bbbb", "C:/work/b");
+        // A stray dir without workspace.yaml is ignored, not counted.
+        fs::create_dir_all(d.path().join("cccc")).unwrap();
+        let ids = copilot_session_ids(d.path());
+        assert_eq!(ids, HashSet::from(["aaaa".to_string(), "bbbb".to_string()]));
+    }
+
+    #[test]
+    fn newest_new_session_ignores_baseline() {
+        let d = tempfile::tempdir().unwrap();
+        write_session(d.path(), "old1", "C:/work/x");
+        let baseline = copilot_session_ids(d.path());
+        // Nothing new yet.
+        assert_eq!(newest_new_copilot_session(d.path(), &baseline, "C:/work/x"), None);
+        // A fresh session appears; it — not the pre-existing one — is picked.
+        write_session(d.path(), "new1", "C:/work/x");
+        assert_eq!(
+            newest_new_copilot_session(d.path(), &baseline, "C:/work/x").as_deref(),
+            Some("new1")
+        );
+    }
+
+    #[test]
+    fn cwd_match_wins_over_a_newer_unrelated_session() {
+        let d = tempfile::tempdir().unwrap();
+        let baseline = HashSet::new();
+        // Two fresh sessions; the newer one ran in a different workspace.
+        write_session(d.path(), "mine", "C:/work/mine");
+        write_session(d.path(), "other", "C:/work/other");
+        make_newer(d.path(), "mine", "other");
+        // Ask for the pane whose cwd is C:/work/mine (case/slash-insensitive).
+        assert_eq!(
+            newest_new_copilot_session(d.path(), &baseline, "c:\\work\\mine").as_deref(),
+            Some("mine"),
+            "a cwd match must beat a newer session from another workspace"
+        );
+        // With no cwd hint, the newest fresh session wins instead.
+        assert_eq!(
+            newest_new_copilot_session(d.path(), &baseline, "").as_deref(),
+            Some("other")
+        );
+    }
+
+    #[test]
+    fn missing_root_is_empty_not_a_panic() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().join("does-not-exist");
+        assert!(copilot_session_ids(&root).is_empty());
+        assert_eq!(newest_new_copilot_session(&root, &HashSet::new(), "C:/x"), None);
     }
 }

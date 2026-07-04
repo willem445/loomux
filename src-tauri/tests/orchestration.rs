@@ -263,6 +263,14 @@ fn copilot_command_uses_copilot_adapter_flags() {
     let cmd = reg.build_agent_command("copilot", "auto", false, cfg, gdir, Path::new("C:/repo"), None, false);
     assert!(!cmd.contains("--autopilot") && !cmd.contains("--allow-all-tools"));
     assert!(cmd.contains("--allow-tool \"shell(git:*)\"") && cmd.contains("--allow-tool \"shell(gh:*)\""));
+    // Resume reopens a tracked session via --resume; copilot has no
+    // pre-assignable id, so a session without resume adds no session flag.
+    let sid = "aabbccdd-1122-4334-8556-77889900aabb";
+    let cmd = reg.build_agent_command("copilot", "auto", true, cfg, gdir, Path::new("C:/repo"), Some(sid), true);
+    assert!(cmd.contains(&format!("--resume {sid}")), "copilot resume must pass --resume, got: {cmd}");
+    let cmd = reg.build_agent_command("copilot", "auto", true, cfg, gdir, Path::new("C:/repo"), Some(sid), false);
+    assert!(!cmd.contains("--resume") && !cmd.contains("--session-id"),
+        "a fresh copilot spawn cannot pin a session id");
 }
 
 #[test]
@@ -278,6 +286,131 @@ fn copilot_mcp_config_includes_tools_allowlist() {
     .unwrap();
     assert!(cfg.contains("\"tools\""), "copilot expects a tools allowlist in the server entry");
     assert!(cfg.contains(&w.token));
+}
+
+fn copilot_rails() -> Guardrails {
+    let mut r = rails();
+    r.agent_cli = "copilot".into();
+    r
+}
+
+#[test]
+fn copilot_agents_spawn_without_a_preassigned_session() {
+    // Copilot has no `--session-id`; a fresh copilot pane starts untracked
+    // and is associated later once its session-state appears on disk.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/copilot-repo", copilot_rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    assert!(w.session_id.is_none(), "copilot cannot pre-assign a session id");
+}
+
+#[test]
+fn associating_a_copilot_session_records_it_on_roster_and_task_board() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/copilot-repo", copilot_rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "builder", "do the thing", false, None).unwrap();
+    // The orchestrator has put a task on the board assigned to this worker.
+    let t = reg.upsert_task(&g.id, "orch-1", None, patch(Some("build feature"), None, None)).unwrap();
+    reg.upsert_task(
+        &g.id,
+        "orch-1",
+        Some(&t.id),
+        TaskPatch { assignee: Some(w.id.clone()), ..Default::default() },
+    )
+    .unwrap();
+
+    // The watcher discovered copilot's session id and binds it to the pane.
+    let sid = "0f9e8d7c-1234-4abc-8def-0011223344ff";
+    reg.associate_copilot_session(&g.id, &w.id, sid);
+
+    // Agent map now carries the id (so list_agents/resume can use it).
+    let agents = reg.list_agents(&g.id);
+    let entry = agents.as_array().unwrap().iter().find(|a| a["id"] == w.id.as_str()).unwrap();
+    assert_eq!(entry["session"], sid);
+
+    // Durable roster records exactly one session row for this pane — the
+    // placeholder was upgraded, not duplicated — and the session browser
+    // surfaces it as a worker chip in this group.
+    let roles: Vec<_> = reg.session_roles().into_iter().filter(|r| r.session_id == sid).collect();
+    assert_eq!(roles.len(), 1, "one roster/session-browser entry per pane, got {}", roles.len());
+    assert_eq!(roles[0].role, "worker");
+    assert_eq!(roles[0].group_id, g.id);
+
+    // Task board mirrors the session so the orchestrator can resume the task.
+    let task = reg.tasks(&g.id).into_iter().find(|x| x.id == t.id).unwrap();
+    assert_eq!(task.session.as_deref(), Some(sid));
+
+    // Idempotent: a second (late) discovery must not clobber the bound id.
+    reg.associate_copilot_session(&g.id, &w.id, "ffffffff-0000-4000-8000-000000000000");
+    let agents = reg.list_agents(&g.id);
+    let entry = agents.as_array().unwrap().iter().find(|a| a["id"] == w.id.as_str()).unwrap();
+    assert_eq!(entry["session"], sid, "an already-tracked pane keeps its first session id");
+}
+
+#[test]
+fn copilot_orchestration_session_gets_a_chip_and_restores() {
+    use loomux_lib::orchestration::resume_recorded_session;
+    use std::sync::Arc;
+    let dir = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap(); // must exist for restore
+    let repo_path = repo.path().to_string_lossy().into_owned();
+    let sid = "0a1b2c3d-4e5f-4a6b-8c7d-8e9f00112233";
+    let gid;
+    {
+        let reg = OrchRegistry::new(dir.path().to_path_buf());
+        reg.set_port(45999);
+        let g = reg.create_group(&repo_path, copilot_rails()).unwrap();
+        gid = g.id.clone();
+        // A copilot orchestrator spawns untracked, then its session is bound
+        // once it appears on disk (here, driven directly).
+        let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+        assert!(orch.session_id.is_none());
+        reg.associate_copilot_session(&g.id, &orch.id, sid);
+        // Session browser now has an ORCH chip for this copilot session.
+        let roles: Vec<_> = reg.session_roles().into_iter().filter(|r| r.session_id == sid).collect();
+        assert_eq!(roles.len(), 1);
+        assert_eq!(roles[0].role, "orchestrator");
+    }
+    // "App restart": a new registry restores the whole copilot orchestration
+    // from the recorded session, resuming its conversation via `copilot
+    // --resume`.
+    let reg = Arc::new(OrchRegistry::new(dir.path().to_path_buf()));
+    reg.set_port(45999);
+    let req = resume_recorded_session(&reg, sid, None).unwrap().expect("orchestrator pane spec");
+    assert_eq!(req.group_id, gid);
+    assert!(req.command.starts_with("copilot "), "must relaunch copilot, got: {}", req.command);
+    assert!(req.command.contains(&format!("--resume {sid}")), "must resume the recorded session");
+}
+
+#[test]
+fn copilot_group_resumes_a_recorded_session() {
+    // Resume parity: a copilot group accepts resume_session (its ids are
+    // hex+dashes, so they pass sanitization) and reuses it on the pane.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/copilot-repo", copilot_rails()).unwrap();
+    let dir = tempfile::tempdir().unwrap(); // an existing cwd for the resume
+    let sid = "aabbccdd-1122-4334-8556-77889900aabb".to_string();
+    let w = reg
+        .spawn_agent_ex(
+            &g.id,
+            Role::Worker,
+            "resumed",
+            "follow-up",
+            false,
+            None,
+            Some(sid.clone()),
+            Some(dir.path().to_string_lossy().into_owned()),
+        )
+        .unwrap();
+    assert_eq!(w.session_id.as_deref(), Some(sid.as_str()));
+    // A mangled id is rejected rather than silently resuming the wrong one.
+    assert!(reg
+        .spawn_agent_ex(
+            &g.id, Role::Worker, "bad", "", false, None,
+            Some("../../etc/passwd".into()),
+            Some(dir.path().to_string_lossy().into_owned()),
+        )
+        .is_err());
 }
 
 #[test]
