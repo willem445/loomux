@@ -132,9 +132,14 @@ export const orchSessionRoles = (): Promise<SessionRoleInfo[]> =>
 export async function resumeOrchSession(
   grid: Grid,
   paneEvents: PaneEvents,
-  sessionId: string
+  sessionId: string,
+  hint?: { group: string; role: string }
 ): Promise<void> {
-  const spec = await invoke<OrchSpawnRequest | null>("resume_orch_session", { sessionId });
+  const spec = await invoke<OrchSpawnRequest | null>("resume_orch_session", {
+    sessionId,
+    groupHint: hint?.group ?? null,
+    roleHint: hint?.role ?? null,
+  });
   if (spec) await openAgentPane(grid, paneEvents, spec);
 }
 

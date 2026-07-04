@@ -131,9 +131,13 @@ async function restoreSession(s: SessionInfo): Promise<void> {
   // Recorded orchestration sessions restore into their group — MCP
   // identity, badges, and task board included — instead of a powerless
   // plain `--resume`.
-  if (s.source === "claude" && sessions.roleFor(s.id)) {
+  const orchRole = s.source === "claude" ? sessions.roleFor(s) : undefined;
+  if (orchRole) {
     try {
-      await resumeOrchSession(grid, paneEvents, s.id);
+      await resumeOrchSession(grid, paneEvents, s.id, {
+        group: orchRole.group_id,
+        role: orchRole.role,
+      });
     } catch (err) {
       showFatal(String(err));
     }

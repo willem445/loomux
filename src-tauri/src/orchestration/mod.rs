@@ -347,7 +347,7 @@ fn sanitize_session(s: &str) -> Option<String> {
 
 /// Stable, filesystem-safe group id for a repo path, so relaunching an
 /// orchestrator on the same repo reattaches to the same state directory.
-fn group_id_for_repo(repo: &str) -> String {
+pub(crate) fn group_id_for_repo(repo: &str) -> String {
     let norm = repo.replace('\\', "/").to_lowercase();
     let norm = norm.trim_end_matches('/');
     // FNV-1a 64
@@ -722,6 +722,54 @@ impl OrchRegistry {
             .unwrap_or_default()
     }
 
+    /// Roster entries derived from `agent-spawn` audit lines. Backfill for
+    /// groups created before agents.json existed — their session-to-role
+    /// mapping lives only in the audit log.
+    fn records_from_audit(&self, group: &str) -> Vec<AgentRecord> {
+        let Ok(text) = fs::read_to_string(self.group_dir(group).join("audit.jsonl")) else {
+            return vec![];
+        };
+        let mut out: Vec<AgentRecord> = Vec::new();
+        for line in text.lines() {
+            let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+            if v["action"] != "agent-spawn" {
+                continue;
+            }
+            let d = &v["detail"];
+            let Some(session) = d["session"].as_str() else { continue };
+            let role = d["role"].as_str().unwrap_or("worker").to_string();
+            let record = AgentRecord {
+                id: d["agent"].as_str().unwrap_or("").to_string(),
+                name: d["name"]
+                    .as_str()
+                    .unwrap_or(if role == "orchestrator" { "orchestrator" } else { "agent" })
+                    .to_string(),
+                role,
+                session: Some(session.to_string()),
+                cwd: d["cwd"].as_str().unwrap_or("").to_string(),
+                // The audit alone can't tell liveness; group_live covers it.
+                status: "unknown".into(),
+                updated_ms: v["ts_ms"].as_u64().unwrap_or(0),
+            };
+            match out.iter_mut().find(|r| r.id == record.id) {
+                Some(r) => *r = record,
+                None => out.push(record),
+            }
+        }
+        out
+    }
+
+    /// Roster + audit backfill, deduped by agent id (roster wins).
+    fn merged_records(&self, group: &str) -> Vec<AgentRecord> {
+        let mut records = self.group_records(group);
+        for r in self.records_from_audit(group) {
+            if !records.iter().any(|x| x.id == r.id) {
+                records.push(r);
+            }
+        }
+        records
+    }
+
     /// Every recorded session across all groups on disk, with role identity
     /// — drives the session browser's ORCH/W/REV badges and restore flow.
     pub fn session_roles(&self) -> Vec<SessionRole> {
@@ -735,7 +783,7 @@ impl OrchRegistry {
                 continue;
             }
             let live = self.group_is_live(&group_id);
-            for r in self.group_records(&group_id) {
+            for r in self.merged_records(&group_id) {
                 if let Some(session) = r.session {
                     out.push(SessionRole {
                         session_id: session,
@@ -1533,12 +1581,30 @@ fn register_orchestrator_pane(
 pub fn resume_recorded_session(
     reg: &Arc<OrchRegistry>,
     session_id: &str,
+    hint: Option<(String, String)>, // (group_id, role) from transcript signatures
 ) -> Result<Option<SpawnRequest>, String> {
     let record = reg
         .session_roles()
         .into_iter()
         .filter(|r| r.session_id == session_id)
         .last()
+        .or_else(|| {
+            // Sessions from before the roster (and before session-id
+            // tracking) are identified by loomux signatures in their own
+            // transcript; trust the hint if that group exists on disk.
+            let (group_id, role) = hint?;
+            if !reg.group_dir(&group_id).join("group.json").is_file() {
+                return None;
+            }
+            let group_live = reg.group_is_live(&group_id);
+            Some(SessionRole {
+                session_id: session_id.to_string(),
+                agent_name: if role == "orchestrator" { "orchestrator".into() } else { "agent".into() },
+                group_id,
+                role,
+                group_live,
+            })
+        })
         .ok_or("this session is not part of a recorded orchestration")?;
 
     if record.role == "orchestrator" {
@@ -1574,7 +1640,7 @@ pub fn resume_recorded_session(
     }
     let role = if record.role == "reviewer" { Role::Reviewer } else { Role::Worker };
     let cwd = reg
-        .group_records(&record.group_id)
+        .merged_records(&record.group_id)
         .into_iter()
         .find(|r| r.session.as_deref() == Some(session_id))
         .map(|r| r.cwd)
@@ -1616,8 +1682,11 @@ pub fn orch_session_roles(reg: tauri::State<Arc<OrchRegistry>>) -> Vec<SessionRo
 pub fn resume_orch_session(
     reg: tauri::State<Arc<OrchRegistry>>,
     session_id: String,
+    group_hint: Option<String>,
+    role_hint: Option<String>,
 ) -> Result<Option<SpawnRequest>, String> {
-    resume_recorded_session(reg.inner(), &session_id)
+    let hint = group_hint.zip(role_hint);
+    resume_recorded_session(reg.inner(), &session_id, hint)
 }
 
 // ---------- task board (human side) ----------

@@ -468,6 +468,52 @@ fn roster_records_sessions_roles_and_liveness() {
 }
 
 #[test]
+fn sessions_backfill_from_audit_when_roster_predates_it() {
+    // Groups created before agents.json existed still have every spawn in
+    // the audit log — their sessions must be markable and restorable too.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let sid = orch.session_id.unwrap();
+    // Simulate the pre-roster era: the roster file never existed.
+    fs::remove_file(reg.state_root().join(&g.id).join("agents.json")).unwrap();
+    let roles = reg.session_roles();
+    let o = roles
+        .iter()
+        .find(|r| r.session_id == sid)
+        .expect("session must be discoverable via audit backfill");
+    assert_eq!(o.role, "orchestrator");
+}
+
+#[test]
+fn hint_restores_sessions_unknown_to_roster_and_audit() {
+    // Pre-session-tracking orchestrators left no session id anywhere on
+    // disk; the session browser identifies them from transcript signatures
+    // and passes (group, role) hints. Restore must honor them — but only
+    // for groups that actually exist.
+    use loomux_lib::orchestration::resume_recorded_session;
+    use std::sync::Arc;
+    let dir = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    let repo_path = repo.path().to_string_lossy().into_owned();
+    let reg = Arc::new(OrchRegistry::new(dir.path().to_path_buf()));
+    reg.set_port(45999);
+    let g = reg.create_group(&repo_path, rails()).unwrap();
+    let gid = g.id.clone();
+    drop(g);
+    let sid = "11112222-3333-4444-8555-666677778888";
+    let hint = Some((gid.clone(), "orchestrator".to_string()));
+    let req = resume_recorded_session(&reg, sid, hint).unwrap().expect("pane spec");
+    assert_eq!(req.group_id, gid);
+    assert!(req.command.contains(&format!("--resume {sid}")));
+    // A hint pointing at a nonexistent group is rejected, not trusted.
+    let reg2 = Arc::new(OrchRegistry::new(tempfile::tempdir().unwrap().path().to_path_buf()));
+    reg2.set_port(45999);
+    let bad = resume_recorded_session(&reg2, sid, Some(("ghost-1".into(), "orchestrator".into())));
+    assert!(bad.is_err());
+}
+
+#[test]
 fn orchestrator_session_restores_full_group_with_fresh_mcp_identity() {
     use loomux_lib::orchestration::resume_recorded_session;
     use std::sync::Arc;
@@ -486,7 +532,7 @@ fn orchestrator_session_restores_full_group_with_fresh_mcp_identity() {
     // "App restart": new registry, nothing live.
     let reg = Arc::new(OrchRegistry::new(dir.path().to_path_buf()));
     reg.set_port(45999);
-    let req = resume_recorded_session(&reg, &orch_sid).unwrap().expect("orchestrator returns a pane spec");
+    let req = resume_recorded_session(&reg, &orch_sid, None).unwrap().expect("orchestrator returns a pane spec");
     assert_eq!(req.group_id, gid, "restore must reattach to the recorded group (state/tasks/audit)");
     assert!(req.command.contains(&format!("--resume {orch_sid}")),
         "the orchestrator's conversation must be resumed, not cold-started");
@@ -495,7 +541,7 @@ fn orchestrator_session_restores_full_group_with_fresh_mcp_identity() {
     let g = reg.group(&gid).expect("group re-registered in memory");
     assert_eq!(g.guardrails.worker_model, "sonnet", "guardrails must be restored from group.json");
     // A second restore while live is refused.
-    let err = resume_recorded_session(&reg, &orch_sid).unwrap_err();
+    let err = resume_recorded_session(&reg, &orch_sid, None).unwrap_err();
     assert!(err.contains("already"), "got: {err}");
 }
 
@@ -511,11 +557,11 @@ fn worker_session_rejoin_requires_live_group_then_reuses_session() {
     let sid = w.session_id.clone().unwrap();
     reg.mark_dead(&w.id, Some(0));
     // Group has no live agents → rejoin refused with guidance.
-    let err = resume_recorded_session(&reg, &sid).unwrap_err();
+    let err = resume_recorded_session(&reg, &sid, None).unwrap_err();
     assert!(err.contains("orchestrator"), "must point at restarting the orchestrator, got: {err}");
     // With a live orchestrator, the rejoin spawns (background) reusing the session.
     reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
-    assert!(resume_recorded_session(&reg, &sid).unwrap().is_none(),
+    assert!(resume_recorded_session(&reg, &sid, None).unwrap().is_none(),
         "worker rejoin panes arrive via the spawn event, not the return value");
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     loop {
@@ -529,7 +575,7 @@ fn worker_session_rejoin_requires_live_group_then_reuses_session() {
         assert!(std::time::Instant::now() < deadline, "rejoin did not complete: {roster}");
         std::thread::sleep(Duration::from_millis(50));
     }
-    assert!(resume_recorded_session(&reg, "0000-not-recorded").is_err());
+    assert!(resume_recorded_session(&reg, "0000-not-recorded", None).is_err());
 }
 
 // ---------- MCP dispatch: protocol, role filtering, cross-group access ----------

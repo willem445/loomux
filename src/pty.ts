@@ -24,6 +24,10 @@ export interface SessionInfo {
   cwd: string;
   modified_ms: number;
   resume_command: string;
+  /** Orchestration identity detected from the transcript's loomux
+   *  signatures — fallback for sessions predating the durable roster. */
+  orch_role?: string | null;
+  orch_group?: string | null;
 }
 
 export interface PtyExit {

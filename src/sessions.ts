@@ -76,9 +76,21 @@ export class SessionBrowser {
     this.el.classList.add("hidden");
   }
 
-  /** Orchestration identity for a session id, if loomux recorded one. */
-  roleFor(sessionId: string): SessionRoleInfo | undefined {
-    return this.roles.get(sessionId);
+  /** Orchestration identity for a session, merging the durable roster with
+   *  the transcript-signature fallback detected by the scanner. */
+  roleFor(session: SessionInfo): SessionRoleInfo | undefined {
+    const recorded = this.roles.get(session.id);
+    if (recorded) return recorded;
+    if (session.orch_role && session.orch_group) {
+      return {
+        session_id: session.id,
+        group_id: session.orch_group,
+        role: session.orch_role,
+        agent_name: "",
+        group_live: false,
+      };
+    }
+    return undefined;
   }
 
   async refresh(): Promise<void> {
@@ -130,7 +142,7 @@ export class SessionBrowser {
       // Orchestration identity: mark recorded orchestrator/worker/reviewer
       // sessions; clicking one restores it INTO its group (MCP + task
       // board) instead of a powerless plain resume.
-      const role = this.roles.get(s.id);
+      const role = this.roleFor(s);
       if (role) {
         const chip = document.createElement("span");
         chip.className = `session-badge orch-role ${role.role}`;
