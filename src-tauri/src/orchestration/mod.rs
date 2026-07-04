@@ -210,6 +210,32 @@ pub fn spawn_rate_exceeded(times: &[u64], now: u64, limit: u32, window_ms: u64) 
     recent as u32 >= limit
 }
 
+/// Distinct agent working directories to remove when a group is torn down
+/// with worktree cleanup: dedup (case/separator-insensitively), and never the
+/// repo root itself — the orchestrator and any repo-mode workers run there, so
+/// removing it would delete the user's own checkout. Pure so the path
+/// filtering is testable without a real git tree; the actual removal is
+/// `git::git_worktree_remove`, which git refuses on a non-worktree anyway.
+pub fn worktree_cleanup_targets(repo: &str, cwds: &[String]) -> Vec<String> {
+    let norm = |s: &str| s.replace('\\', "/").trim_end_matches('/').to_lowercase();
+    let repo_n = norm(repo);
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for c in cwds {
+        if c.trim().is_empty() {
+            continue;
+        }
+        let cn = norm(c);
+        if cn == repo_n {
+            continue; // repo root — the orchestrator's cwd, never a worktree
+        }
+        if seen.insert(cn) {
+            out.push(c.clone());
+        }
+    }
+    out
+}
+
 /// Best-effort extraction of a session's dollar cost from a pane's
 /// ANSI-stripped terminal tail. Claude Code renders running cost in its
 /// in-pane statusline (bottom of the screen), so scan lines bottom-up and
@@ -294,6 +320,9 @@ pub struct AgentEntry {
     /// reported done/blocked); `None` while it has work or for the
     /// orchestrator. The idle reaper (`idle_kill_minutes`) reads this.
     pub idle_since_ms: Option<u64>,
+    /// Unix-ms this agent was registered (spawn time). Drives the per-agent
+    /// and group uptime shown in the lifecycle summary; unaffected by idle.
+    pub started_ms: u64,
 }
 
 /// Work-item statuses shown on the task board. Kept as strings (not an
@@ -1517,6 +1546,140 @@ impl OrchRegistry {
         })
     }
 
+    // ---------- lifecycle: group summary & end-orchestration ----------
+
+    /// A one-glance summary of a group's live agents for the lifecycle panel:
+    /// how many are up, the role breakdown, and uptime (per agent and for the
+    /// group as a whole, measured from the earliest-started live agent — the
+    /// orchestrator in practice). Also reports the paused flag so the panel can
+    /// compose pause and end-orchestration sanely.
+    pub fn group_summary(&self, group: &str) -> Value {
+        let now = now_ms();
+        let live: Vec<AgentEntry> = self
+            .agents
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|a| a.group == group && a.status != AgentStatus::Dead)
+            .cloned()
+            .collect();
+        let (mut orch, mut worker, mut reviewer) = (0u32, 0u32, 0u32);
+        let mut earliest: Option<u64> = None;
+        let mut list: Vec<Value> = live
+            .iter()
+            .map(|a| {
+                match a.role {
+                    Role::Orchestrator => orch += 1,
+                    Role::Worker => worker += 1,
+                    Role::Reviewer => reviewer += 1,
+                }
+                earliest = Some(earliest.map_or(a.started_ms, |e| e.min(a.started_ms)));
+                json!({
+                    "id": a.id, "name": a.name, "role": a.role,
+                    "task": a.task, "idle_since_ms": a.idle_since_ms,
+                    "uptime_ms": now.saturating_sub(a.started_ms),
+                })
+            })
+            .collect();
+        list.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+        json!({
+            "group": group,
+            "live_agents": live.len(),
+            "paused": self.is_paused(group),
+            "uptime_ms": earliest.map(|e| now.saturating_sub(e)),
+            "roles": { "orchestrator": orch, "worker": worker, "reviewer": reviewer },
+            "agents": list,
+        })
+    }
+
+    /// End a whole orchestration: kill every one of the group's agents (the
+    /// orchestrator included — unlike `kill_agent`, which protects it), and,
+    /// when asked, remove the agents' worktrees. Human-initiated and
+    /// destructive: it is a Tauri command only (never an MCP tool an agent
+    /// could call on itself), audited as actor `human`, and the frontend
+    /// confirms before invoking. Composes with a paused group: killing works
+    /// regardless of pause, and the pause marker is cleared so the teardown is
+    /// total — a later relaunch on the same repo won't inherit a stale pause.
+    pub fn end_group(&self, group: &str, cleanup_worktrees: bool) -> Result<Value, String> {
+        // Snapshot every member (all statuses): already-dead workers may still
+        // have a worktree on disk that cleanup should reclaim.
+        let members: Vec<AgentEntry> = self
+            .agents
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|a| a.group == group)
+            .cloned()
+            .collect();
+        if members.is_empty() {
+            return Err("no such group (no agents ever registered here)".into());
+        }
+        let app = self.app.lock().unwrap().clone();
+
+        // Kill the live ones. Kill the pty (best-effort) then mark the entry
+        // dead directly — mark_dead is idempotent against the async pty-exit,
+        // and going straight through it avoids the orchestrator-notification
+        // path in on_pty_exit (there is no orchestrator left to tell).
+        let mut killed = Vec::new();
+        for a in &members {
+            if a.status == AgentStatus::Dead {
+                continue;
+            }
+            if let (Some(app), Some(pty)) = (app.as_ref(), a.pty_id) {
+                app.state::<crate::pty::PtyManager>().kill(pty);
+            }
+            self.mark_dead(&a.id, None);
+            killed.push(a.id.clone());
+        }
+
+        // Optionally reclaim the worktrees. Resolve the repo (from memory or
+        // group.json) so `git worktree remove` runs from the main checkout.
+        let mut worktrees_removed = Vec::new();
+        let mut worktree_errors = Vec::new();
+        if cleanup_worktrees {
+            let repo = self
+                .group(group)
+                .map(|g| g.repo)
+                .or_else(|| self.load_group_file(group).map(|(r, _)| r));
+            if let Some(repo) = repo {
+                let cwds: Vec<String> = members.iter().map(|a| a.cwd.clone()).collect();
+                for path in worktree_cleanup_targets(&repo, &cwds) {
+                    match crate::git::git_worktree_remove(&repo, &path) {
+                        Ok(()) => worktrees_removed.push(path),
+                        Err(e) => worktree_errors.push(json!({ "path": path, "error": e })),
+                    }
+                }
+            }
+        }
+
+        // Total teardown: drop any pause (in-memory + marker) so a future
+        // relaunch on this repo starts clean rather than silently paused.
+        if self.paused.lock().unwrap().remove(group) {
+            let _ = fs::remove_file(self.group_dir(group).join("paused"));
+        }
+
+        self.audit(group, "human", "group-end", json!({
+            "killed": killed,
+            "cleanup_worktrees": cleanup_worktrees,
+            "worktrees_removed": worktrees_removed,
+            "worktree_errors": worktree_errors,
+        }));
+
+        // Tell the frontend to close the group's (now-dead) panes so the human
+        // isn't left ✕-clicking a screen of dead terminals — the very chore
+        // this action exists to remove.
+        if let Some(app) = app.as_ref() {
+            let _ = app.emit("orch-group-ended", json!({ "group_id": group }));
+        }
+
+        Ok(json!({
+            "group": group,
+            "killed": killed,
+            "worktrees_removed": worktrees_removed,
+            "worktree_errors": worktree_errors,
+        }))
+    }
+
     /// Render the role instruction docs into the group dir so kickoff
     /// prompts can reference them by path instead of pasting pages of text.
     fn write_instruction_files(&self, g: &GroupInfo) -> Result<(), String> {
@@ -1810,6 +1973,7 @@ impl OrchRegistry {
             // An agent spawned without a task starts the idle clock; one
             // given work does not (the orchestrator is exempt regardless).
             idle_since_ms: (role != Role::Orchestrator && task.trim().is_empty()).then(now_ms),
+            started_ms: now_ms(),
         };
         {
             // Re-check the cap under the same lock as the insert: the early
@@ -2298,6 +2462,24 @@ pub fn orch_group_usage(reg: tauri::State<Arc<OrchRegistry>>, group_id: String) 
     reg.group_usage(&group_id)
 }
 
+/// Live-agent count, role breakdown, and uptime for the lifecycle panel.
+#[tauri::command]
+pub fn orch_group_summary(reg: tauri::State<Arc<OrchRegistry>>, group_id: String) -> Value {
+    reg.group_summary(&group_id)
+}
+
+/// End a whole orchestration: kill all its agents and (optionally) remove
+/// their worktrees. Human-initiated, destructive, audited — the frontend
+/// confirms before calling this.
+#[tauri::command]
+pub fn orch_end_group(
+    reg: tauri::State<Arc<OrchRegistry>>,
+    group_id: String,
+    cleanup_worktrees: bool,
+) -> Result<Value, String> {
+    reg.end_group(&group_id, cleanup_worktrees)
+}
+
 /// Create (or reattach to) a group and register its orchestrator, under the
 /// creation lock: the group id is picked by liveness, and a group only
 /// becomes live once its orchestrator is registered, so id selection and
@@ -2387,6 +2569,7 @@ fn register_orchestrator_pane(
         session_id,
         cwd: group.repo.clone(),
         idle_since_ms: None, // the orchestrator is never idle-reaped
+        started_ms: now_ms(),
     };
     reg.agents.lock().unwrap().insert(agent_id.clone(), entry.clone());
     reg.by_token.lock().unwrap().insert(token, agent_id.clone());

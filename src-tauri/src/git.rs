@@ -307,6 +307,19 @@ pub fn git_worktree_add(repo: String, name: String) -> Result<String, String> {
     Ok(dest_str)
 }
 
+/// Remove an agent's worktree during group teardown. `--force` because the
+/// worktree may hold uncommitted changes and ending an orchestration is an
+/// explicit, human-confirmed destructive action; the checked-out branch is
+/// left intact (the work / PR lives on it, only the working copy goes). Not a
+/// Tauri command — teardown is driven backend-side by `end_group`, which
+/// gathers the paths from its own roster rather than trusting a caller.
+pub fn git_worktree_remove(repo: &str, path: &str) -> Result<(), String> {
+    if path.trim().is_empty() {
+        return Err("empty worktree path".to_string());
+    }
+    run_git(repo, &["worktree", "remove", "--force", path]).map(|_| ())
+}
+
 // ---------- parsers ----------
 
 fn parse_log(out: &str) -> Vec<CommitInfo> {

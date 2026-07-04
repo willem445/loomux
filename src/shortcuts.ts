@@ -11,6 +11,7 @@ export type ShortcutAction =
   | "toggle-git"
   | "toggle-tasks"
   | "toggle-audit"
+  | "toggle-group"
   | "rename-pane"
   | "focus-left"
   | "focus-right"
@@ -38,6 +39,7 @@ export function matchShortcut(e: KeyboardEvent): ShortcutAction | null {
       case "KeyG": return "toggle-git";
       case "KeyT": return "toggle-tasks";
       case "KeyA": return "toggle-audit";
+      case "KeyO": return "toggle-group";
     }
   }
   if (e.code === "F2" && !e.ctrlKey && !e.altKey && !e.shiftKey) return "rename-pane";

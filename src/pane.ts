@@ -23,6 +23,7 @@ import { isAppShortcut } from "./shortcuts";
 import { GitView } from "./gitview";
 import { TasksView } from "./tasksview";
 import { AuditView } from "./auditview";
+import { GroupView } from "./groupview";
 
 // Inline icons so the toolbar renders identically regardless of installed
 // fonts; they inherit color via `currentColor`.
@@ -32,6 +33,7 @@ const TASKS_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" 
 const GIT_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><circle cx="8" cy="2.8" r="1.6"/><circle cx="4" cy="13.2" r="1.6"/><circle cx="12" cy="13.2" r="1.6"/><path d="M8 4.4v2.2M8 6.6c0 2.6-4 2.4-4 5M8 6.6c0 2.6 4 2.4 4 5"/></svg>`;
 // Audit viewer: a clock/history glyph for the group's audit-log timeline.
 const AUDIT_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M2.2 8a5.8 5.8 0 1 1 1.7 4.1"/><path d="M2.2 12.2V8.6H5.8"/><path d="M8 5.2V8l2 1.4"/></svg>`;
+const GROUP_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="3.4" r="1.7"/><circle cx="3.4" cy="11" r="1.7"/><circle cx="12.6" cy="11" r="1.7"/><path d="M8 5.1v3M6.7 9.6 4.5 9.9M9.3 9.6l2.2.3"/></svg>`;
 
 /** Extract a filesystem path from an OSC 7 payload, which may be a raw path
  *  or a `file://host/path` URL. Returns "" if nothing usable. */
@@ -150,6 +152,10 @@ export class Pane {
   private auditView: AuditView | null = null;
   private auditOverlay: HTMLElement | null = null;
   private auditBtn: HTMLButtonElement;
+  /** Group lifecycle panel (orchestrator panes only), same mechanics. */
+  private groupView: GroupView | null = null;
+  private groupOverlay: HTMLElement | null = null;
+  private groupBtn: HTMLButtonElement;
   private orchGroup: string | null = null;
   /** True for agent/command panes (vs plain shells). */
   private launchedCommand = false;
@@ -215,6 +221,17 @@ export class Pane {
       this.toggleAuditView();
     });
     header.appendChild(this.auditBtn);
+
+    this.groupBtn = document.createElement("button");
+    this.groupBtn.className = "pane-btn";
+    this.groupBtn.innerHTML = GROUP_ICON;
+    this.groupBtn.title = "Group lifecycle (Alt+O)";
+    this.groupBtn.hidden = true; // shown for orchestrator panes in start()
+    this.groupBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      this.toggleGroupView();
+    });
+    header.appendChild(this.groupBtn);
 
     const gitBtn = document.createElement("button");
     gitBtn.className = "pane-btn";
@@ -311,6 +328,9 @@ export class Pane {
       // The audit log is per-group and read-only, so it's useful from any
       // agent pane in the group, not just the orchestrator's.
       this.auditBtn.hidden = false;
+      // Group lifecycle controls (pause / end orchestration) live on the
+      // orchestrator's pane, alongside the task board.
+      this.groupBtn.hidden = opts.orchRole !== "orchestrator";
     }
     // Seed the toolbar from the startup directory. Interactive shells refine
     // this via OSC 7; command panes (agents) keep this initial value since
@@ -473,6 +493,7 @@ export class Pane {
       } else {
         if (this.tasksOverlay && !this.tasksOverlay.hidden) this.toggleTasksView();
         if (this.auditOverlay && !this.auditOverlay.hidden) this.toggleAuditView();
+        if (this.groupOverlay && !this.groupOverlay.hidden) this.toggleGroupView();
         // Terminal keeps a fixed visible share at the bottom; the overlay
         // covers the rest.
         const strip = Math.max(140, Math.round(this.el.clientHeight * 0.35));
@@ -542,6 +563,7 @@ export class Pane {
     } else {
       if (this.gitView?.visible) this.toggleGitView();
       if (this.auditOverlay && !this.auditOverlay.hidden) this.toggleAuditView();
+      if (this.groupOverlay && !this.groupOverlay.hidden) this.toggleGroupView();
       const strip = Math.max(140, Math.round(this.el.clientHeight * 0.35));
       this.tasksOverlay!.style.height = `${this.overlayClamp(this.termEl.clientHeight - strip)}px`;
       this.tasksOverlay!.hidden = false;
@@ -570,6 +592,7 @@ export class Pane {
     } else {
       if (this.gitView?.visible) this.toggleGitView();
       if (this.tasksOverlay && !this.tasksOverlay.hidden) this.toggleTasksView();
+      if (this.groupOverlay && !this.groupOverlay.hidden) this.toggleGroupView();
       const strip = Math.max(140, Math.round(this.el.clientHeight * 0.35));
       this.auditOverlay!.style.height = `${this.overlayClamp(this.termEl.clientHeight - strip)}px`;
       this.auditOverlay!.hidden = false;
@@ -578,12 +601,47 @@ export class Pane {
     }
   }
 
-  /** Whichever overlay (git / tasks / audit) is currently covering the
-   *  terminal. */
+  /** Toggle the group lifecycle panel overlay (orchestrator panes). Same
+   *  no-resize overlay mechanics as the other views; only one is open. */
+  toggleGroupView(): void {
+    if (!this.orchGroup || this.groupBtn.hidden) return;
+    if (!this.groupView) {
+      this.groupView = new GroupView(this.orchGroup, { onClose: () => this.toggleGroupView() });
+      this.groupOverlay = document.createElement("div");
+      this.groupOverlay.className = "git-overlay";
+      this.groupOverlay.hidden = true;
+      this.groupOverlay.append(this.groupView.el, this.makeOverlayDivider(() => this.groupOverlay!));
+      this.el.appendChild(this.groupOverlay);
+    }
+    if (!this.groupOverlay!.hidden) {
+      this.groupOverlay!.hidden = true;
+      this.updateTermShift();
+      this.focus();
+    } else {
+      if (this.gitView?.visible) this.toggleGitView();
+      if (this.tasksOverlay && !this.tasksOverlay.hidden) this.toggleTasksView();
+      if (this.auditOverlay && !this.auditOverlay.hidden) this.toggleAuditView();
+      const strip = Math.max(140, Math.round(this.el.clientHeight * 0.35));
+      this.groupOverlay!.style.height = `${this.overlayClamp(this.termEl.clientHeight - strip)}px`;
+      this.groupOverlay!.hidden = false;
+      this.groupView.show();
+      this.updateTermShift();
+    }
+  }
+
+  /** The orchestration group this pane belongs to, if any (for group-wide
+   *  actions like end-orchestration closing every pane in the group). */
+  get orchGroupId(): string | null {
+    return this.orchGroup;
+  }
+
+  /** Whichever overlay (git / tasks / audit / group) is currently covering
+   *  the terminal. */
   private activeOverlay(): HTMLElement | null {
     if (this.gitOverlay && !this.gitOverlay.hidden) return this.gitOverlay;
     if (this.tasksOverlay && !this.tasksOverlay.hidden) return this.tasksOverlay;
     if (this.auditOverlay && !this.auditOverlay.hidden) return this.auditOverlay;
+    if (this.groupOverlay && !this.groupOverlay.hidden) return this.groupOverlay;
     return null;
   }
 
@@ -717,6 +775,7 @@ export class Pane {
     this.gitView?.dispose();
     this.tasksView?.dispose();
     this.auditView?.dispose();
+    this.groupView?.dispose();
     if (this.ptyId !== null) {
       detachOutput(this.ptyId);
       if (killBackend) killPty(this.ptyId).catch(() => {});

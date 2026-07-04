@@ -156,6 +156,18 @@ rotation is transparent (the rotated `audit.1.jsonl` generation is read
 alongside the current one). The overlay floats over the terminal like the
 git and task-board views — it never resizes the PTY.
 
+**Group lifecycle:** the orchestrator pane has a lifecycle toggle (`Alt+O` or
+the group icon) with a one-glance summary — how many agents are live, the role
+breakdown, uptime (per agent and for the whole group), each agent's state, and
+running session cost with a group total. From here you can **pause** the group
+(loomux stops delivering prompts so its agents finish their turn and idle out —
+reversible with resume) or **End orchestration**, which kills *every* agent in
+the group at once instead of ✕-clicking panes one by one. Ending is destructive,
+so it takes a second confirming click; an optional **remove worktrees** checkbox
+also deletes each agent's git worktree (uncommitted changes are lost, but the
+branches — where the PRs live — are always kept). The teardown is audited, closes
+the group's panes for you, and clears any pause so a later relaunch starts clean.
+
 **Per-task sessions:** each worker is scoped to exactly one work item, and
 loomux records its session id on the roster and task board. Claude ids are
 pre-assigned at spawn; Copilot mints its own id on boot, so loomux watches

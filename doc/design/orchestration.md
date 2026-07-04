@@ -238,6 +238,37 @@ norm for parallel work) avoid this. A Copilot CLI that never writes session-stat
 left untracked (audited), and can still be resumed manually from the session browser once it
 does appear.
 
+## Group lifecycle (#8)
+
+Teardown used to mean ✕-clicking panes one at a time. A **group lifecycle panel**
+(orchestrator pane header, Alt+O, `GroupView`) collects the whole-group controls in one
+overlay — same no-resize overlay mechanics as the git / task / audit views — and sits
+alongside the task board and #7's cost figures.
+
+- **Group summary line.** `group_summary` / `orch_group_summary` reports the live-agent
+  count, the role breakdown (orch / worker / reviewer), and uptime — per agent and for the
+  group as a whole (measured from the earliest-started live agent, i.e. the orchestrator).
+  Uptime needs a spawn timestamp, so `AgentEntry` carries `started_ms` (distinct from
+  `idle_since_ms`, which is about idleness, not age). The panel polls it every 2s and shows
+  each agent's role, name, state (working / ready / idle-for), uptime, and — joined from
+  #7's `group_usage` — its session cost, with the group total on the summary line.
+- **End orchestration.** `end_group` / `orch_end_group` kills *every* agent in the group,
+  the orchestrator included (unlike `kill_agent`, which protects it). It is deliberately a
+  Tauri command only — **never** an MCP tool — so it is always human-initiated; the panel
+  arms a two-click confirm before firing (destructive, irreversible). The teardown is
+  audited as actor `human` (`group-end`, with the killed ids and worktree outcome). An
+  optional **remove-worktrees** checkbox additionally reclaims each agent's worktree via
+  `git worktree remove --force` (`worktree_cleanup_targets` picks the paths: deduped, and
+  never the repo root — removing the user's own checkout would be catastrophic; the branch
+  is always kept, only the working copy goes). Already-exited agents' worktrees are
+  reclaimed too, since their roster entries still carry the path.
+- **Closing the panes.** Killing a pty leaves a dead terminal pane open (agent panes are
+  kept-on-error). So after the kill `end_group` emits `orch-group-ended`, which the
+  frontend uses to close every pane in the group — the whole point of the action.
+- **Composes with pause (#7).** Ending works regardless of pause (delivery suppression
+  doesn't block a kill), and it clears the group's `paused` flag and marker file, so a
+  later relaunch on the same repo id starts clean instead of silently resuming paused.
+
 ## Risks / limitations
 
 - Kickoff typing races CLI boot; a fixed delay (4s) + bracketed paste is used. If a
