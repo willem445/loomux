@@ -8,7 +8,7 @@
 
 use loomux_lib::orchestration::mcp::dispatch;
 use loomux_lib::orchestration::{
-    add_trusted_folder, bracketed_paste, cli_ready, create_orchestration_group,
+    add_trusted_folder, bracketed_paste, cli_ready, create_orchestration_group, parse_audit_lines,
     rotate_audit_if_needed, strip_ansi, Caller, Guardrails, OrchRegistry, Role, TaskPatch,
 };
 use serde_json::{json, Value};
@@ -554,6 +554,54 @@ fn audit_rotates_at_cap_and_backfill_reads_both_generations() {
         sessions.contains(&w.session_id.unwrap()),
         "backfill must read rotated audit generations"
     );
+}
+
+#[test]
+fn parse_audit_lines_is_ordered_and_skips_malformed() {
+    let text = "\
+{\"ts_ms\":1,\"actor\":\"loomux\",\"action\":\"group-create\",\"detail\":{\"repo\":\"r\"}}
+not json at all
+{\"ts_ms\":2,\"actor\":\"human\",\"action\":\"prompt\",\"detail\":{\"to\":\"w-1\",\"text\":\"hi\\nthere\"}}
+
+{\"ts_ms\":3,\"actor\":\"loomux\",\"action\":\"agent-spawn\"}";
+    let entries = parse_audit_lines(text);
+    // Malformed line and the blank line are skipped; the three valid ones
+    // survive in file order.
+    assert_eq!(entries.len(), 3, "malformed and blank lines must be skipped");
+    assert_eq!(entries[0].action, "group-create");
+    assert_eq!(entries[1].actor, "human");
+    assert_eq!(entries[2].ts_ms, 3);
+    // A line missing `detail` still parses (detail becomes null), not dropped.
+    assert!(entries[2].detail.is_null());
+    // Full prompt text is preserved for in-app expansion.
+    assert_eq!(entries[1].detail["text"], "hi\nthere");
+}
+
+#[test]
+fn audit_log_reads_both_generations_oldest_first() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let gdir = reg.state_root().join(&g.id);
+    // Seed a group-create in the current log, then rotate it into audit.1 so
+    // the two-generation read path is exercised.
+    rotate_audit_if_needed(&gdir, 1);
+    assert!(gdir.join("audit.1.jsonl").is_file());
+    // Append a fresh entry to the new current log.
+    reg.audit(&g.id, "human", "prompt", serde_json::json!({ "to": "w-1", "text": "hello" }));
+
+    let entries = reg.audit_log(&g.id);
+    let actions: Vec<&str> = entries.iter().map(|e| e.action.as_str()).collect();
+    // Rotated (older) generation first, then the current one.
+    assert!(actions.contains(&"group-create"), "rotated generation must be included");
+    assert_eq!(actions.last(), Some(&"prompt"), "current generation appends after the rotated one");
+    let prompt = entries.iter().find(|e| e.action == "prompt").unwrap();
+    assert_eq!(prompt.detail["text"], "hello");
+}
+
+#[test]
+fn audit_log_of_unknown_group_is_empty() {
+    let (reg, _d) = test_registry();
+    assert!(reg.audit_log("no-such-group").is_empty());
 }
 
 // ---------- durable roster & orchestration restore ----------

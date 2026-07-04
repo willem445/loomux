@@ -51,6 +51,7 @@ pub fn run() {
             orchestration::orch_session_roles,
             orchestration::resume_orch_session,
             orchestration::orch_tasks,
+            orchestration::orch_audit,
             orchestration::orch_upsert_task,
             orchestration::orch_delete_task,
             orchestration::orch_reorder_tasks,

@@ -202,6 +202,9 @@ document.addEventListener(
       case "toggle-tasks":
         grid.activePane?.toggleTasksView();
         break;
+      case "toggle-audit":
+        grid.activePane?.toggleAuditView();
+        break;
       case "rename-pane":
         grid.activePane?.startRename();
         break;
