@@ -264,6 +264,9 @@ html, body {
 }
 .session-badge.claude { background: #382d20; color: #e8a865; }
 .session-badge.copilot { background: #20303c; color: #6cb6ff; }
+.session-badge.orch-role.orchestrator { background: #2a2440; color: #c7a9ff; }
+.session-badge.orch-role.worker { background: #1e2a3c; color: #8db0ff; }
+.session-badge.orch-role.reviewer { background: #203527; color: #b4e878; }
 .session-title {
   flex: 1; min-width: 0; font-size: 12.5px;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;

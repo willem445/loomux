@@ -113,6 +113,31 @@ export function initOrchestration(grid: Grid, paneEvents: PaneEvents): void {
   });
 }
 
+/** A recorded session's orchestration identity (backend roster). */
+export interface SessionRoleInfo {
+  session_id: string;
+  group_id: string;
+  role: string;
+  agent_name: string;
+  group_live: boolean;
+}
+
+export const orchSessionRoles = (): Promise<SessionRoleInfo[]> =>
+  invoke<SessionRoleInfo[]>("orch_session_roles");
+
+/** Restore a recorded orchestration session from the session browser.
+ *  Orchestrator sessions relaunch the whole group (MCP identity, task
+ *  board) and return a pane spec to open; worker/reviewer rejoins arrive
+ *  via the normal orch-spawn-request event. */
+export async function resumeOrchSession(
+  grid: Grid,
+  paneEvents: PaneEvents,
+  sessionId: string
+): Promise<void> {
+  const spec = await invoke<OrchSpawnRequest | null>("resume_orch_session", { sessionId });
+  if (spec) await openAgentPane(grid, paneEvents, spec);
+}
+
 /** Create/resume the group for `config.repo` and open its orchestrator
  *  pane. The backend spawns the initial idle workers (as spawn-request
  *  events) once the orchestrator binds. */

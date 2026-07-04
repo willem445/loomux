@@ -3,6 +3,13 @@
 // new pane.
 
 import { listSessions, type SessionInfo } from "./pty";
+import type { SessionRoleInfo } from "./orchestration";
+
+const ROLE_CHIPS: Record<string, string> = {
+  orchestrator: "ORCH",
+  worker: "W",
+  reviewer: "REV",
+};
 
 function timeAgo(ms: number): string {
   const s = Math.max(0, (Date.now() - ms) / 1000);
@@ -19,10 +26,12 @@ export class SessionBrowser {
   private listEl: HTMLElement;
   private searchEl: HTMLInputElement;
   private sessions: SessionInfo[] = [];
+  private roles = new Map<string, SessionRoleInfo>();
 
   constructor(
     private el: HTMLElement,
-    private onRestore: (session: SessionInfo) => void
+    private onRestore: (session: SessionInfo) => void,
+    private loadRoles?: () => Promise<SessionRoleInfo[]>
   ) {
     const head = document.createElement("div");
     head.className = "sessions-head";
@@ -67,8 +76,18 @@ export class SessionBrowser {
     this.el.classList.add("hidden");
   }
 
+  /** Orchestration identity for a session id, if loomux recorded one. */
+  roleFor(sessionId: string): SessionRoleInfo | undefined {
+    return this.roles.get(sessionId);
+  }
+
   async refresh(): Promise<void> {
-    this.sessions = await listSessions();
+    const [sessions, roles] = await Promise.all([
+      listSessions(),
+      this.loadRoles?.().catch(() => []) ?? Promise.resolve([]),
+    ]);
+    this.sessions = sessions;
+    this.roles = new Map(roles.map((r) => [r.session_id, r]));
     this.render();
   }
 
@@ -107,6 +126,21 @@ export class SessionBrowser {
       title.className = "session-title";
       title.textContent = s.title;
       top.append(badge, title);
+
+      // Orchestration identity: mark recorded orchestrator/worker/reviewer
+      // sessions; clicking one restores it INTO its group (MCP + task
+      // board) instead of a powerless plain resume.
+      const role = this.roles.get(s.id);
+      if (role) {
+        const chip = document.createElement("span");
+        chip.className = `session-badge orch-role ${role.role}`;
+        chip.textContent = ROLE_CHIPS[role.role] ?? role.role.toUpperCase();
+        chip.title =
+          role.role === "orchestrator"
+            ? `Orchestrator of group ${role.group_id}${role.group_live ? " (running)" : " — click to restore the whole orchestration"}`
+            : `${role.role} "${role.agent_name}" of group ${role.group_id}${role.group_live ? " — click to rejoin its group" : " (group not running)"}`;
+        top.insertBefore(chip, title);
+      }
 
       const meta = document.createElement("div");
       meta.className = "session-meta";

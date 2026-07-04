@@ -47,6 +47,8 @@ pub fn run() {
             git::git_worktree_add,
             orchestration::create_orchestration,
             orchestration::bind_agent,
+            orchestration::orch_session_roles,
+            orchestration::resume_orch_session,
             orchestration::orch_tasks,
             orchestration::orch_upsert_task,
             orchestration::orch_delete_task,

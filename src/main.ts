@@ -7,7 +7,7 @@ import { matchShortcut } from "./shortcuts";
 import { initStatusBar } from "./statusbar";
 import { AgentLauncher } from "./launcher";
 import { getAgentMode, setAgentMode } from "./agents";
-import { initOrchestration, launchOrchestrator } from "./orchestration";
+import { initOrchestration, launchOrchestrator, orchSessionRoles, resumeOrchSession } from "./orchestration";
 
 // Surface unexpected errors as a visible banner instead of a silently
 // broken UI — a user-facing "crash" should always come with a message.
@@ -119,11 +119,26 @@ function reapIfExited(pane: Pane): void {
   else grid.closePane(pane, false);
 }
 
-const sessions = new SessionBrowser(sessionsEl, (s: SessionInfo) => {
-  void restoreSession(s);
-});
+const sessions = new SessionBrowser(
+  sessionsEl,
+  (s: SessionInfo) => {
+    void restoreSession(s);
+  },
+  orchSessionRoles
+);
 
 async function restoreSession(s: SessionInfo): Promise<void> {
+  // Recorded orchestration sessions restore into their group — MCP
+  // identity, badges, and task board included — instead of a powerless
+  // plain `--resume`.
+  if (s.source === "claude" && sessions.roleFor(s.id)) {
+    try {
+      await resumeOrchSession(grid, paneEvents, s.id);
+    } catch (err) {
+      showFatal(String(err));
+    }
+    return;
+  }
   const name =
     (s.source === "claude" ? "claude · " : "copilot · ") +
     (s.title.length > 34 ? s.title.slice(0, 34) + "…" : s.title);

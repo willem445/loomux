@@ -130,6 +130,15 @@ intent, not vacuous passes) → design notes + user docs → commit → push →
   are pre-assigned via `--session-id` and recorded on roster + tasks, so follow-ups
   `spawn_agent(resume_session, cwd)` into the original conversation/workspace.
 
+- **Kickoff readiness + restore (second validation round)**: kickoffs wait for the
+  CLI to paint and go quiet instead of a fixed delay (a loaded machine lost a
+  reviewer's kickoff to the startup stdin flush); delivery outcomes are audited.
+  A durable per-group roster (`agents.json`) maps session ids to roles, marking
+  sessions in the browser and enabling full orchestration restore: a dead group's
+  orchestrator session relaunches group + MCP identity + task board via
+  `resume_orch_session`, resuming the conversation; workers/reviewers rejoin live
+  groups the same way.
+
 ## Risks / limitations
 
 - Kickoff typing races CLI boot; a fixed delay (4s) + bracketed paste is used. If a

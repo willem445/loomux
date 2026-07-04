@@ -232,6 +232,31 @@ pub struct TaskPatch {
     pub note: Option<String>,
 }
 
+/// Durable roster entry (`agents.json` per group): which sessions belonged
+/// to which role. This is what lets the session browser mark orchestrator/
+/// worker sessions and restore a whole orchestration after loomux restarts.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentRecord {
+    pub id: String,
+    pub role: String,
+    pub name: String,
+    pub session: Option<String>,
+    pub cwd: String,
+    pub status: String,
+    pub updated_ms: u64,
+}
+
+/// A recorded session's orchestration identity, for the session browser.
+#[derive(Clone, Serialize)]
+pub struct SessionRole {
+    pub session_id: String,
+    pub group_id: String,
+    pub role: String,
+    pub agent_name: String,
+    /// Whether that group currently has live agents in this app instance.
+    pub group_live: bool,
+}
+
 /// Identity resolved from an MCP request's token header.
 #[derive(Clone, Debug)]
 pub struct Caller {
@@ -242,7 +267,7 @@ pub struct Caller {
 
 /// Payload asking the frontend to open a pane for an agent. Also the return
 /// value of `create_orchestration` (the orchestrator's own pane).
-#[derive(Clone, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct SpawnRequest {
     pub group_id: String,
     pub agent_id: String,
@@ -658,6 +683,93 @@ impl OrchRegistry {
         );
     }
 
+    // ---------- durable roster (session ↔ role mapping, resume) ----------
+
+    /// Upsert an agent into the group's `agents.json`. Best-effort like the
+    /// audit log; shares the file lock with the task board.
+    fn persist_agent_record(&self, entry: &AgentEntry, status: &str) {
+        let _guard = self.tasks_lock.lock().unwrap();
+        let path = self.group_dir(&entry.group).join("agents.json");
+        let mut list: Vec<AgentRecord> = fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        let record = AgentRecord {
+            id: entry.id.clone(),
+            role: match entry.role {
+                Role::Orchestrator => "orchestrator".into(),
+                Role::Worker => "worker".into(),
+                Role::Reviewer => "reviewer".into(),
+            },
+            name: entry.name.clone(),
+            session: entry.session_id.clone(),
+            cwd: entry.cwd.clone(),
+            status: status.to_string(),
+            updated_ms: now_ms(),
+        };
+        match list.iter_mut().find(|r| r.id == record.id) {
+            Some(r) => *r = record,
+            None => list.push(record),
+        }
+        let _ = fs::create_dir_all(self.group_dir(&entry.group));
+        let _ = fs::write(&path, serde_json::to_string_pretty(&list).unwrap());
+    }
+
+    fn group_records(&self, group: &str) -> Vec<AgentRecord> {
+        fs::read_to_string(self.group_dir(group).join("agents.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    /// Every recorded session across all groups on disk, with role identity
+    /// — drives the session browser's ORCH/W/REV badges and restore flow.
+    pub fn session_roles(&self) -> Vec<SessionRole> {
+        let mut out = Vec::new();
+        let Ok(entries) = fs::read_dir(&self.root) else {
+            return out;
+        };
+        for e in entries.flatten() {
+            let group_id = e.file_name().to_string_lossy().into_owned();
+            if !e.path().join("group.json").is_file() {
+                continue;
+            }
+            let live = self.group_is_live(&group_id);
+            for r in self.group_records(&group_id) {
+                if let Some(session) = r.session {
+                    out.push(SessionRole {
+                        session_id: session,
+                        group_id: group_id.clone(),
+                        role: r.role,
+                        agent_name: r.name,
+                        group_live: live,
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    /// Load a group's persisted identity (repo + guardrails) from group.json.
+    fn load_group_file(&self, group: &str) -> Option<(String, Guardrails)> {
+        let v: Value =
+            serde_json::from_str(&fs::read_to_string(self.group_dir(group).join("group.json")).ok()?).ok()?;
+        let repo = v["repo"].as_str()?.to_string();
+        let g = &v["guardrails"];
+        let s = |k: &str, fb: &str| g[k].as_str().unwrap_or(fb).to_string();
+        Some((
+            repo,
+            Guardrails {
+                max_agents: g["max_agents"].as_u64().unwrap_or(4) as u32,
+                agent_cli: s("agent_cli", "claude"),
+                worker_model: s("worker_model", ""),
+                reviewer_model: s("reviewer_model", ""),
+                orchestrator_model: s("orchestrator_model", ""),
+                auto_ops: g["auto_ops"].as_bool().unwrap_or(true),
+            },
+        ))
+    }
+
     // ---------- groups & agents ----------
 
     /// Create (or reattach to) the group for `repo`. State and audit history
@@ -998,6 +1110,7 @@ impl OrchRegistry {
             agents.insert(agent_id.clone(), entry.clone());
         }
         self.by_token.lock().unwrap().insert(token, agent_id.clone());
+        self.persist_agent_record(&entry, "running");
         self.audit(group_id, "loomux", "agent-spawn", json!({
             "agent": agent_id, "role": role, "name": display, "cwd": cwd,
             "model": model, "worktree": use_worktree, "branch": branch_name, "task": task,
@@ -1234,6 +1347,7 @@ impl OrchRegistry {
         );
         self.audit(&snapshot.group, "loomux", "agent-exit",
             json!({ "agent": agent_id, "exit_code": exit_code }));
+        self.persist_agent_record(&snapshot, "dead");
         Some(snapshot)
     }
 
@@ -1303,22 +1417,37 @@ pub fn create_orchestration(
         auto_ops,
     })?;
 
-    // Register the orchestrator without the spawn round-trip: the frontend
-    // is the caller here and opens the pane from the returned spec.
+    register_orchestrator_pane(reg.inner(), &group, None, initial_workers)
+}
+
+/// Register a group's orchestrator and hand back the pane spec the frontend
+/// opens. `resume_session` reopens a prior orchestrator conversation (with
+/// fresh MCP wiring) instead of starting cold. A background thread waits
+/// for the pane bind, types the kickoff/re-sync prompt, and brings up any
+/// initial idle workers.
+fn register_orchestrator_pane(
+    reg: &Arc<OrchRegistry>,
+    group: &GroupInfo,
+    resume_session: Option<String>,
+    initial_workers: u32,
+) -> Result<SpawnRequest, String> {
     let model = group.guardrails.orchestrator_model.clone();
-    let seq_reg = reg.inner().clone();
     let token = new_token();
-    let agent_id = format!("orch-{}", seq_reg.seq.fetch_add(1, Ordering::SeqCst) + 1);
-    let cfg = seq_reg.write_mcp_config(&group.id, &agent_id, &token, &group.guardrails.agent_cli)?;
-    let session_id = (group.guardrails.agent_cli == "claude").then(new_session_uuid);
-    let command = seq_reg.build_agent_command(
+    let agent_id = format!("orch-{}", reg.seq.fetch_add(1, Ordering::SeqCst) + 1);
+    let cfg = reg.write_mcp_config(&group.id, &agent_id, &token, &group.guardrails.agent_cli)?;
+    let resume = resume_session.is_some();
+    let session_id = match resume_session {
+        Some(s) => Some(sanitize_session(&s).ok_or("invalid resume session id")?),
+        None => (group.guardrails.agent_cli == "claude").then(new_session_uuid),
+    };
+    let command = reg.build_agent_command(
         &group.guardrails.agent_cli,
         &model,
         group.guardrails.auto_ops,
         &cfg,
-        &seq_reg.group_dir(&group.id),
+        &reg.group_dir(&group.id),
         session_id.as_deref(),
-        false,
+        resume,
     );
     let entry = AgentEntry {
         id: agent_id.clone(),
@@ -1332,10 +1461,12 @@ pub fn create_orchestration(
         session_id,
         cwd: group.repo.clone(),
     };
-    seq_reg.agents.lock().unwrap().insert(agent_id.clone(), entry);
-    seq_reg.by_token.lock().unwrap().insert(token, agent_id.clone());
-    seq_reg.audit(&group.id, "loomux", "agent-spawn",
-        json!({ "agent": agent_id, "role": "orchestrator", "model": model }));
+    reg.agents.lock().unwrap().insert(agent_id.clone(), entry.clone());
+    reg.by_token.lock().unwrap().insert(token, agent_id.clone());
+    reg.persist_agent_record(&entry, "running");
+    reg.audit(&group.id, "loomux", "agent-spawn",
+        json!({ "agent": agent_id, "role": "orchestrator", "model": model,
+                "session": entry.session_id, "resume": resume }));
 
     let request = SpawnRequest {
         group_id: group.id.clone(),
@@ -1346,11 +1477,17 @@ pub fn create_orchestration(
         command,
     };
 
+    if reg.app.lock().unwrap().is_none() {
+        // Test mode: no frontend; mark running without a pane.
+        reg.agents.lock().unwrap().get_mut(&agent_id).unwrap().status = AgentStatus::Running;
+        return Ok(request);
+    }
+
     // Background: wait for the orchestrator pane to bind, type its kickoff,
     // then bring up the initial idle workers one by one.
     let (tx, rx) = mpsc::channel::<u32>();
-    seq_reg.pending_binds.lock().unwrap().insert(agent_id.clone(), tx);
-    let reg2 = seq_reg.clone();
+    reg.pending_binds.lock().unwrap().insert(agent_id.clone(), tx);
+    let reg2 = reg.clone();
     let group2 = group.clone();
     std::thread::spawn(move || {
         let Ok(pty_id) = rx.recv_timeout(BIND_TIMEOUT) else {
@@ -1367,7 +1504,11 @@ pub fn create_orchestration(
         }
         reg2.by_pty.lock().unwrap().insert(pty_id, agent_id.clone());
         reg2.audit(&group2.id, "loomux", "agent-bind", json!({ "agent": agent_id, "pty": pty_id }));
-        let kickoff = reg2.kickoff_prompt(&reg2.agent(&agent_id).unwrap(), &group2, "");
+        let kickoff = if resume {
+            "[loomux] Orchestration restored: your MCP tools, the task board, and the audit log are live again in this session. Re-sync now: list_tasks, list_agents, get_state. Your previous worker panes are gone; resume a task session with spawn_agent(resume_session, cwd) when follow-ups need it. Then give the human a short status summary.".to_string()
+        } else {
+            reg2.kickoff_prompt(&reg2.agent(&agent_id).unwrap(), &group2, "")
+        };
         let _ = reg2.deliver_prompt(&agent_id, &kickoff, "loomux", true);
         for i in 0..initial_workers.min(group2.guardrails.max_agents) {
             if let Err(e) = reg2.spawn_agent(&group2.id, Role::Worker, &format!("worker {}", i + 1), "", false, None)
@@ -1382,9 +1523,101 @@ pub fn create_orchestration(
     Ok(request)
 }
 
+/// Restore orchestration for a recorded session id (from the session
+/// browser). An orchestrator session of a dead group relaunches the whole
+/// control plane — group, MCP identity, task board — resuming that
+/// conversation, and returns the pane spec for the frontend to open. A
+/// worker/reviewer session rejoins its live group; its pane arrives via the
+/// normal orch-spawn-request event (the spawn must not block this IPC
+/// thread, which also serves the bind), so `None` is returned.
+pub fn resume_recorded_session(
+    reg: &Arc<OrchRegistry>,
+    session_id: &str,
+) -> Result<Option<SpawnRequest>, String> {
+    let record = reg
+        .session_roles()
+        .into_iter()
+        .filter(|r| r.session_id == session_id)
+        .last()
+        .ok_or("this session is not part of a recorded orchestration")?;
+
+    if record.role == "orchestrator" {
+        if record.group_live {
+            return Err(format!(
+                "group {} already has a live orchestrator — focus its pane instead",
+                record.group_id
+            ));
+        }
+        let (repo, guardrails) = reg
+            .load_group_file(&record.group_id)
+            .ok_or("group.json is missing for this orchestration")?;
+        if !Path::new(&repo).is_dir() {
+            return Err(format!("the group repository no longer exists: {repo}"));
+        }
+        let group = reg.create_group(&repo, guardrails)?;
+        if group.id != record.group_id {
+            return Err(format!(
+                "group id mismatch (recorded {}, resolved {}) — another orchestration is live on this repo",
+                record.group_id, group.id
+            ));
+        }
+        return register_orchestrator_pane(reg, &group, Some(session_id.to_string()), 0)
+            .map(Some);
+    }
+
+    // Worker / reviewer: only meaningful inside a live group.
+    if !record.group_live {
+        return Err(
+            "this agent's group is not running — restart its orchestrator session (marked ORCH) first"
+                .into(),
+        );
+    }
+    let role = if record.role == "reviewer" { Role::Reviewer } else { Role::Worker };
+    let cwd = reg
+        .group_records(&record.group_id)
+        .into_iter()
+        .find(|r| r.session.as_deref() == Some(session_id))
+        .map(|r| r.cwd)
+        .filter(|c| Path::new(c).is_dir());
+    let reg2 = reg.clone();
+    let sid = session_id.to_string();
+    let (group_id, name) = (record.group_id.clone(), record.agent_name.clone());
+    std::thread::spawn(move || {
+        if let Err(e) =
+            reg2.spawn_agent_ex(&group_id, role, &name, "", false, None, Some(sid.clone()), cwd)
+        {
+            reg2.audit(&group_id, "loomux", "error",
+                json!({ "what": "session rejoin failed", "session": sid, "err": e.clone() }));
+            let _ = reg2.deliver_to_orchestrator(
+                &group_id,
+                &format!("[loomux] failed to resume session {sid} into this group: {e}"),
+                "loomux",
+            );
+        }
+    });
+    Ok(None)
+}
+
 #[tauri::command]
 pub fn bind_agent(reg: tauri::State<Arc<OrchRegistry>>, agent_id: String, pty_id: u32) -> Result<(), String> {
     reg.bind(&agent_id, pty_id)
+}
+
+/// Session ↔ orchestration-role mapping for the session browser badges.
+#[tauri::command]
+pub fn orch_session_roles(reg: tauri::State<Arc<OrchRegistry>>) -> Vec<SessionRole> {
+    reg.session_roles()
+}
+
+/// Restore a recorded orchestration session (see `resume_recorded_session`).
+/// Returns the orchestrator pane spec, or null when the pane will arrive
+/// via `orch-spawn-request` (worker/reviewer rejoin).
+#[tauri::command]
+pub fn resume_orch_session(
+    reg: tauri::State<Arc<OrchRegistry>>,
+    session_id: String,
+) -> Result<Option<SpawnRequest>, String> {
+    resume_recorded_session(reg.inner(), &session_id)
 }
 
 // ---------- task board (human side) ----------

@@ -133,11 +133,20 @@ or disturbing a busy one.
 agents (≤12), models pinned per role at launch, and the permission mode
 fixed at group creation (native auto mode or acceptEdits — never bypass).
 
+**Restart after loomux closes:** orchestration sessions are marked in the
+session browser (`ORCH` / `W` / `REV` chips). Clicking a dead group's
+orchestrator session restores the *whole* orchestration — same group id,
+state, task board, and audit history, with fresh MCP identity wired into
+the resumed conversation. Worker/reviewer sessions rejoin their group when
+it's running. A plain `claude --resume` would come back powerless (no MCP
+tools, no task board); this path never does.
+
 **Persistence:** each group keeps durable state under
 `<data dir>/loomux/orchestration/<group>/` — `state.json` (the
 orchestrator's queue/plan memory, written via a tool after every change),
 `audit.jsonl` (every tool call, prompt, spawn, and exit, one JSON line
-each), and the rendered role instructions. The group id is derived from the
+each), `agents.json` (the roster: which sessions belonged to which role),
+and the rendered role instructions. The group id is derived from the
 repo path, so relaunching an orchestrator on the same repo resumes its
 state; GitHub issues remain the source of truth for the work queue.
 
