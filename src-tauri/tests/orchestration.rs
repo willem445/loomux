@@ -506,6 +506,8 @@ fn resolve_ref_url_handles_numbers_and_passthrough() {
     // Bare number and #-prefixed both resolve; issue vs pr picks the segment.
     assert_eq!(resolve_ref_url(base, "issue", "#9").as_deref(), Some("https://github.com/o/r/issues/9"));
     assert_eq!(resolve_ref_url(base, "pr", "42").as_deref(), Some("https://github.com/o/r/pull/42"));
+    // A `GH-12`-style prefix resolves to its digit run (comment ↔ behavior).
+    assert_eq!(resolve_ref_url(base, "issue", "GH-12").as_deref(), Some("https://github.com/o/r/issues/12"));
     // A full URL is used verbatim — even with no remote base available.
     let url = "https://github.com/o/r/pull/7";
     assert_eq!(resolve_ref_url(None, "pr", url).as_deref(), Some(url));
@@ -545,6 +547,29 @@ fn request_changes_records_findings_but_not_done() {
     assert!(after.notes.last().unwrap().text.contains("retries still leak a handle"));
     // Unknown task id is an error, not a silent no-op.
     assert!(reg.request_changes(&g.id, "t-999", "x").is_err());
+}
+
+#[test]
+fn merge_gate_actions_are_guarded_to_gate_statuses() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    // A queued item is not at the merge gate — both actions must refuse, and
+    // refuse without mutating (status unchanged, no note added).
+    let t = reg.upsert_task(&g.id, "orch-1", None, patch(Some("Ship it"), None, None)).unwrap();
+    assert!(reg.approve_task(&g.id, &t.id).is_err(), "cannot approve a queued item");
+    assert!(reg.request_changes(&g.id, &t.id, "nope").is_err(), "cannot request changes off-gate");
+    let stored = &reg.tasks(&g.id)[0];
+    assert_eq!(stored.status, "queued", "a refused action must not change status");
+    assert!(stored.notes.is_empty(), "a refused action must not leave a note");
+    // Both gate statuses are allowed.
+    for gate in ["pr", "human-testing"] {
+        reg.upsert_task(&g.id, "orch-1", Some(&t.id), patch(None, Some(gate), None)).unwrap();
+        assert!(reg.request_changes(&g.id, &t.id, "one more thing").is_ok(), "{gate} is a gate status");
+    }
+    // And once approved (→ done) it's off the gate again.
+    reg.upsert_task(&g.id, "orch-1", Some(&t.id), patch(None, Some("pr"), None)).unwrap();
+    reg.approve_task(&g.id, &t.id).unwrap();
+    assert!(reg.approve_task(&g.id, &t.id).is_err(), "a done item is past the gate");
 }
 
 // ---------- review-round regression tests ----------

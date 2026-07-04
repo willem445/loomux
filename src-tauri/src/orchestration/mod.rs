@@ -213,6 +213,10 @@ pub const TASK_STATUSES: [&str; 7] = [
     "blocked",
 ];
 
+/// Statuses where the human's merge-gate actions (approve / request changes)
+/// apply: the PR is open and awaiting the human's decision.
+pub const MERGE_GATE_STATUSES: [&str; 2] = ["pr", "human-testing"];
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TaskNote {
     pub ts_ms: u64,
@@ -836,10 +840,32 @@ impl OrchRegistry {
         Ok(())
     }
 
+    /// Guard the merge-gate actions to items actually at the gate. The UI only
+    /// shows the buttons on `pr`/`human-testing` items, but the command surface
+    /// is callable directly, so enforce it backend-side too — approving a
+    /// `queued` item or requesting changes on a `done` one is meaningless.
+    fn ensure_at_merge_gate(&self, group: &str, id: &str) -> Result<(), String> {
+        let status = self
+            .tasks(group)
+            .into_iter()
+            .find(|t| t.id == id)
+            .ok_or_else(|| format!("unknown task: {id}"))?
+            .status;
+        if MERGE_GATE_STATUSES.contains(&status.as_str()) {
+            Ok(())
+        } else {
+            Err(format!(
+                "task {id} is {status:?}, not at the merge gate — this action only applies to {}",
+                MERGE_GATE_STATUSES.join(" | ")
+            ))
+        }
+    }
+
     /// Merge-gate approve: mark the item done and tell the orchestrator to
     /// merge. The status change is the human's direct sign-off, applied here;
     /// the notice is best-effort (the board is the source of truth).
     pub fn approve_task(&self, group: &str, id: &str) -> Result<Task, String> {
+        self.ensure_at_merge_gate(group, id)?;
         let task = self.upsert_task(
             group,
             "human",
@@ -871,6 +897,7 @@ impl OrchRegistry {
         if findings.is_empty() {
             return Err("request changes needs a note describing what to fix".into());
         }
+        self.ensure_at_merge_gate(group, id)?;
         let task = self.upsert_task(
             group,
             "human",
@@ -2142,8 +2169,12 @@ pub fn resolve_ref_url(base: Option<&str>, kind: &str, value: &str) -> Option<St
     if v.starts_with("https://") || v.starts_with("http://") {
         return Some(v.to_string());
     }
-    // Pull the leading number out of `#12`, `12`, `GH-12`, etc.
-    let num: String = v.trim_start_matches('#').chars().take_while(char::is_ascii_digit).collect();
+    // Pull the first run of digits out of `#12`, `12`, `GH-12`, etc.
+    let num: String = v
+        .chars()
+        .skip_while(|c| !c.is_ascii_digit())
+        .take_while(char::is_ascii_digit)
+        .collect();
     if num.is_empty() {
         return None;
     }
