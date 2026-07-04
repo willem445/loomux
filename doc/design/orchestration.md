@@ -157,9 +157,10 @@ intent, not vacuous passes) → design notes + user docs → commit → push →
   back to a worker (status stays at the gate). Both go through `upsert_task` (audited,
   actor `human`) and deliver a purpose-built typed notice, staying inside the overlay
   pattern — no PTY resize.
-- **Per-task sessions**: one task per worker (template-enforced); Claude session ids
-  are pre-assigned via `--session-id` and recorded on roster + tasks, so follow-ups
-  `spawn_agent(resume_session, cwd)` into the original conversation/workspace.
+- **Per-task sessions**: one task per worker (template-enforced). Claude session ids are
+  pre-assigned via `--session-id`; Copilot mints its own and is tracked post-spawn (see
+  "Copilot session tracking" below). Either way the id is recorded on roster + tasks, so
+  follow-ups `spawn_agent(resume_session, cwd)` into the original conversation/workspace.
 
 - **Kickoff readiness + restore (second validation round)**: kickoffs wait for the
   CLI to paint and go quiet instead of a fixed delay (a loaded machine lost a
@@ -204,6 +205,38 @@ persisted in `group.json`, and clamped in `clamped()`.
   the gate are recorded — a refused spawn is not counted, so the cap can't lock a group out;
   a spawn admitted past the gate but later aborted (worktree/bind failure) still counts. The
   orchestrator pane itself (human-launched) is exempt. Off by default (0 = unlimited).
+
+## Copilot session tracking & resume parity (#12)
+
+Claude accepts a pre-assigned `--session-id`, so its per-task session is known and recorded
+at spawn. Copilot has `--resume <id>` but **no** way to pin an id up front — it mints one and
+writes `~/.copilot/session-state/<id>/workspace.yaml` a few seconds into boot. That gap left
+Copilot groups without resumable per-task sessions, session-browser chips, or full restore.
+The fix closes it without ever pre-assigning:
+
+- **Baseline + watch.** Just before a Copilot pane's CLI starts, `spawn_agent_ex` snapshots the
+  session ids already on disk (`copilot_session_ids`). After the pane binds, a background
+  watcher (`spawn_copilot_session_watcher`, 1s poll, 90s budget) looks for a session absent
+  from that baseline (`newest_new_copilot_session`). It prefers a session whose recorded `cwd`
+  matches the pane's — disambiguating agents spawned concurrently in different worktrees — and
+  falls back to the newest fresh session. The `&self` method reaches a background thread via a
+  stored `Weak<OrchRegistry>` self-handle (`set_self_arc`), avoiding a self-referential `Arc`.
+- **Association.** On discovery, `associate_copilot_session` binds the id to the live pane: the
+  agent map (so `list_agents`/resume see it), the durable roster (`agents.json`, which drives
+  the session browser and restore), and any task-board item the agent owns. The roster write
+  upgrades the pane's spawn-time placeholder (session `None`) in place rather than duplicating
+  it. Audited as `copilot-session` (or `copilot-session-untracked` on timeout). The whole path
+  honors `COPILOT_HOME`, matching the folder-trust writer, so it is fixture-testable.
+- **Parity for free.** Once the id lands on the roster, everything Claude already had works for
+  Copilot unchanged: `spawn_agent(resume_session, cwd)` (`--resume <id>`; ids are hex+dashes so
+  they pass `sanitize_session`), session-browser restore (`resume_recorded_session`), and the
+  ORCH/W/REV chips (derived from `session_roles()`).
+
+Limitation: two Copilot agents started in the *same* cwd at the same instant can't be told
+apart by cwd; the newest-session fallback may then bind the wrong one. Distinct worktrees (the
+norm for parallel work) avoid this. A Copilot CLI that never writes session-state within 90s is
+left untracked (audited), and can still be resumed manually from the session browser once it
+does appear.
 
 ## Risks / limitations
 

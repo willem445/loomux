@@ -157,10 +157,12 @@ alongside the current one). The overlay floats over the terminal like the
 git and task-board views — it never resizes the PTY.
 
 **Per-task sessions:** each worker is scoped to exactly one work item, and
-loomux pre-assigns Claude session ids at spawn, recording them on the
-roster and task board. Follow-ups on a finished task *resume* that worker's
-session (same context, same workspace) instead of cold-starting a new agent
-or disturbing a busy one.
+loomux records its session id on the roster and task board. Claude ids are
+pre-assigned at spawn; Copilot mints its own id on boot, so loomux watches
+`~/.copilot/session-state` and binds the pane's new session a few seconds
+after it starts. Either way, follow-ups on a finished task *resume* that
+worker's session (same context, same workspace) instead of cold-starting a
+new agent or disturbing a busy one — for Claude and Copilot groups alike.
 
 **Guardrails** are enforced by loomux, not the model: a hard cap on live
 agents (≤12), models pinned per role at launch, and the permission mode
