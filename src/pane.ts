@@ -127,6 +127,10 @@ export interface PaneEvents {
   onFocus: (pane: Pane) => void;
   onCloseRequest: (pane: Pane) => void;
   onSplit: (pane: Pane, dir: "row" | "column") => void;
+  /** Park this pane in the dock (out of the grid, still running). */
+  onMinimize: (pane: Pane) => void;
+  /** Toggle this pane to/from fullscreen over the grid. */
+  onMaximize: (pane: Pane) => void;
 }
 
 export class Pane {
@@ -163,6 +167,8 @@ export class Pane {
   private groupView: GroupView | null = null;
   private groupOverlay: HTMLElement | null = null;
   private groupBtn: HTMLButtonElement;
+  /** Fullscreen toggle; its glyph flips to a restore affordance when active. */
+  private maximizeBtn: HTMLButtonElement;
   private orchGroup: string | null = null;
   private orchAgent: string | null = null;
   /** "needs attention" chip in the header (attention routing #6); hidden until
@@ -286,10 +292,22 @@ export class Pane {
     });
     header.appendChild(gitBtn);
 
+    // Minimize / maximize live next to close: the same window-control cluster
+    // users expect. Maximize keeps a stored ref so its glyph can flip to a
+    // "restore" affordance while fullscreen.
+    this.maximizeBtn = document.createElement("button");
+    this.maximizeBtn.className = "pane-btn";
+    this.maximizeBtn.textContent = "⤢";
+    this.maximizeBtn.title = "Maximize (Ctrl+Shift+M)";
+    this.maximizeBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      this.events.onMaximize(this);
+    });
+
     for (const [glyph, cls, tip, fn] of [
       ["◫", "", "Split right", () => this.events.onSplit(this, "row")],
       ["⬓", "", "Split down", () => this.events.onSplit(this, "column")],
-      ["✕", "close", "Close pane", () => this.events.onCloseRequest(this)],
+      ["—", "", "Minimize to dock (Alt+M)", () => this.events.onMinimize(this)],
     ] as const) {
       const btn = document.createElement("button");
       btn.className = `pane-btn ${cls}`;
@@ -301,6 +319,17 @@ export class Pane {
       });
       header.appendChild(btn);
     }
+    header.appendChild(this.maximizeBtn);
+
+    const closeBtn = document.createElement("button");
+    closeBtn.className = "pane-btn close";
+    closeBtn.textContent = "✕";
+    closeBtn.title = "Close pane";
+    closeBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      this.events.onCloseRequest(this);
+    });
+    header.appendChild(closeBtn);
     this.el.appendChild(header);
 
     this.termEl = document.createElement("div");
@@ -850,6 +879,22 @@ export class Pane {
 
   setActive(active: boolean): void {
     this.el.classList.toggle("active", active);
+  }
+
+  /** Reflect fullscreen state: the `.maximized` class drives the CSS overlay
+   *  (no PTY resize is forced — the pane genuinely changes size, so its own
+   *  ResizeObserver issues at most one debounced fit) and the button glyph
+   *  flips between maximize and restore. */
+  setMaximized(on: boolean): void {
+    this.el.classList.toggle("maximized", on);
+    this.maximizeBtn.textContent = on ? "⤡" : "⤢";
+    this.maximizeBtn.title = on ? "Restore (Ctrl+Shift+M)" : "Maximize (Ctrl+Shift+M)";
+  }
+
+  /** Group accent color, if this pane carries an orchestration badge — used to
+   *  tint its chip in the minimize dock. */
+  get accentColor(): string | null {
+    return this.el.style.getPropertyValue("--group-color").trim() || null;
   }
 
   focus(): void {

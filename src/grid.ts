@@ -2,8 +2,15 @@
 // columns with draggable dividers. Splitting in the same direction as the
 // parent inserts a sibling (so repeated splits form an even matrix rather
 // than a lopsided staircase); splitting across creates a nested split.
+//
+// On top of splitting, panes can be dragged by their header to reorder
+// (swap two slots) or re-dock to another pane's edge, maximized to cover the
+// grid, and minimized out of the tree into a restorable dock. The drag
+// decision logic (which zone the pointer is over → what happens) lives in the
+// pure, unit-tested `layout.ts`; this file owns the DOM/tree mutation.
 
 import { Pane, type PaneEvents, type PaneOptions } from "./pane";
+import { dropZoneFor, indicatorFor, zoneToPlacement, type DropZone } from "./layout";
 
 type Dir = "row" | "column";
 
@@ -24,6 +31,9 @@ interface SplitNode {
 type TreeNode = LeafNode | SplitNode;
 
 const MIN_PANE_PX = 80;
+/** Pixels the pointer must travel from the header press before a click turns
+ *  into a drag — keeps taps (focus, dblclick-rename) from starting a drag. */
+const DRAG_THRESHOLD_PX = 6;
 
 const nodeEl = (n: TreeNode): HTMLElement => (n.kind === "leaf" ? n.pane.el : n.el);
 
@@ -31,11 +41,19 @@ export class Grid {
   private root: TreeNode | null = null;
   private active: Pane | null = null;
   private leaves = new Map<Pane, LeafNode>();
+  /** The one fullscreen pane, if any (CSS overlay; still in the tree). */
+  private maximized: Pane | null = null;
+  /** Panes parked out of the tree, oldest first — rendered as dock chips. */
+  private minimizedPanes: Pane[] = [];
 
   constructor(
     private rootEl: HTMLElement,
+    private dockEl: HTMLElement,
     private onEmpty: () => void
-  ) {}
+  ) {
+    this.rootEl.addEventListener("pointerdown", (e) => this.onPointerDown(e));
+    this.renderDock();
+  }
 
   get activePane(): Pane | null {
     return this.active;
@@ -50,7 +68,10 @@ export class Grid {
   }
 
   findByPtyId(ptyId: number): Pane | undefined {
-    return this.panes().find((p) => p.ptyId === ptyId);
+    return (
+      this.panes().find((p) => p.ptyId === ptyId) ??
+      this.minimizedPanes.find((p) => p.ptyId === ptyId)
+    );
   }
 
   /** Create a pane and place it: first pane fills the grid, later panes
@@ -61,6 +82,7 @@ export class Grid {
     dir: Dir = "row",
     relativeTo?: Pane
   ): Promise<Pane> {
+    if (this.maximized) this.exitMaximize(); // a layout change exits fullscreen
     const pane = new Pane(events);
     const leaf: LeafNode = { kind: "leaf", pane, parent: null };
     this.leaves.set(pane, leaf);
@@ -79,13 +101,13 @@ export class Grid {
     return pane;
   }
 
-  private insertBeside(at: LeafNode, leaf: LeafNode, dir: Dir): void {
+  private insertBeside(at: LeafNode, leaf: LeafNode, dir: Dir, before = false): void {
     const parent = at.parent;
     if (parent && parent.dir === dir) {
-      // Same-direction split: add a sibling right after the target,
-      // giving it an equal share of the row/column.
+      // Same-direction split: add a sibling next to the target, giving it an
+      // equal share of the row/column.
       const idx = parent.children.indexOf(at);
-      parent.children.splice(idx + 1, 0, leaf);
+      parent.children.splice(before ? idx : idx + 1, 0, leaf);
       leaf.parent = parent;
       const share = 1 / (parent.children.length - 1);
       for (const c of parent.children) nodeEl(c).style.flex ||= "1 1 0";
@@ -97,7 +119,7 @@ export class Grid {
         kind: "split",
         dir,
         el: document.createElement("div"),
-        children: [at, leaf],
+        children: before ? [leaf, at] : [at, leaf],
         parent,
       };
       split.el.className = `split ${dir}`;
@@ -120,30 +142,50 @@ export class Grid {
   /** Remove a pane from the tree. `killBackend=false` when the process
    *  already exited on its own. */
   closePane(pane: Pane, killBackend = true): void {
+    // Minimized panes live outside the tree — just drop the dock chip.
+    const minIdx = this.minimizedPanes.indexOf(pane);
+    if (minIdx >= 0) {
+      this.minimizedPanes.splice(minIdx, 1);
+      pane.dispose(killBackend);
+      this.renderDock();
+      return;
+    }
+
     const leaf = this.leaves.get(pane);
     if (!leaf) return;
+    if (this.maximized) this.exitMaximize(); // re-seat any lifted pane first
     this.leaves.delete(pane);
-
-    const parent = leaf.parent;
+    this.removeFromTree(leaf);
     pane.dispose(killBackend);
-
-    if (!parent) {
-      this.root = null;
-    } else {
-      parent.children.splice(parent.children.indexOf(leaf), 1);
-      if (parent.children.length === 1) {
-        this.collapse(parent);
-      } else {
-        this.renderSplit(parent);
-      }
-    }
 
     if (this.active === pane) {
       this.active = null;
       const next = this.panes()[0];
       if (next) this.setActive(next);
     }
-    if (!this.root) this.onEmpty();
+    if (!this.root) {
+      // Prefer bringing a parked pane back over spawning a fresh shell, so
+      // minimized work isn't stranded behind a brand-new pane.
+      const parked = this.minimizedPanes[this.minimizedPanes.length - 1];
+      if (parked) this.restore(parked);
+      else this.onEmpty();
+    }
+  }
+
+  /** Detach a leaf's element and unlink it from the tree, collapsing a
+   *  now-single-child split. Does NOT dispose the pane — used by close (which
+   *  disposes after), minimize, and move. */
+  private removeFromTree(leaf: LeafNode): void {
+    const parent = leaf.parent;
+    leaf.pane.el.remove();
+    if (!parent) {
+      this.root = null;
+    } else {
+      parent.children.splice(parent.children.indexOf(leaf), 1);
+      if (parent.children.length === 1) this.collapse(parent);
+      else this.renderSplit(parent);
+    }
+    leaf.parent = null;
   }
 
   /** Replace a single-child split with its child. */
@@ -213,6 +255,296 @@ export class Grid {
     this.active?.setActive(false);
     this.active = pane;
     pane.setActive(true);
+  }
+
+  // ---------- maximize ----------
+
+  /** Toggle a pane to/from fullscreen.
+   *
+   *  The pane's element is lifted to a top layer directly under the grid and
+   *  the rest of the tree is hidden with `display:none`. That's deliberate: a
+   *  hidden pane's terminal reports a zero width, which its own `applyFit`
+   *  skips — so the *other* panes never resize their PTYs (no scrollback
+   *  pollution), and on restore they return to an identical size that the
+   *  same-size guard also skips. Only the maximized pane genuinely changes
+   *  size, so it alone issues one debounced fit. The split tree model is left
+   *  intact; restoring just re-seats the element in its slot. */
+  toggleMaximize(pane: Pane): void {
+    if (!this.leaves.has(pane)) return; // parked/unknown panes can't maximize
+    if (this.maximized === pane) {
+      this.exitMaximize();
+    } else {
+      if (this.maximized) this.exitMaximize();
+      this.rootEl.classList.add("has-maximized");
+      this.rootEl.appendChild(pane.el); // lift out of the tree into the top layer
+      pane.setMaximized(true);
+      this.maximized = pane;
+      this.setActive(pane);
+      pane.focus();
+    }
+  }
+
+  /** Drop the current fullscreen pane back into its slot. A no-op if nothing
+   *  is maximized. Structural mutations call this first so they never have to
+   *  reason about the lifted element. */
+  private exitMaximize(): void {
+    const pane = this.maximized;
+    if (!pane) return;
+    this.maximized = null;
+    pane.setMaximized(false);
+    this.rootEl.classList.remove("has-maximized");
+    const leaf = this.leaves.get(pane);
+    if (!leaf) return; // pane was closed while maximized — nothing to re-seat
+    if (leaf.parent) this.renderSplit(leaf.parent);
+    else this.rootEl.replaceChildren(pane.el);
+    pane.focus();
+  }
+
+  // ---------- minimize / dock ----------
+
+  /** Park a pane in the dock: pull it out of the tree (its PTY keeps running)
+   *  and render a restore chip. Refuses to minimize the last visible pane so
+   *  the grid is never left empty. */
+  minimize(pane: Pane): void {
+    const leaf = this.leaves.get(pane);
+    if (!leaf) return;
+    if (this.leaves.size <= 1) return;
+    if (this.maximized) this.exitMaximize();
+    this.leaves.delete(pane);
+    this.removeFromTree(leaf);
+    this.minimizedPanes.push(pane);
+    if (this.active === pane) {
+      this.active = null;
+      const next = this.panes()[0];
+      if (next) this.setActive(next);
+    }
+    this.renderDock();
+  }
+
+  /** Bring a parked pane back into the grid, beside the active pane (or as the
+   *  root if the grid is empty). Reuses the live Pane — its terminal buffer and
+   *  PTY are intact; re-attaching triggers a single genuine fit. */
+  restore(pane: Pane): void {
+    const idx = this.minimizedPanes.indexOf(pane);
+    if (idx < 0) return;
+    if (this.maximized) this.exitMaximize();
+    this.minimizedPanes.splice(idx, 1);
+    const leaf: LeafNode = { kind: "leaf", pane, parent: null };
+    this.leaves.set(pane, leaf);
+    pane.el.style.flex = "1 1 0";
+
+    const target = this.active;
+    const targetLeaf = target ? this.leaves.get(target) : undefined;
+    if (!this.root || !targetLeaf) {
+      this.root = leaf;
+      this.rootEl.replaceChildren(pane.el);
+    } else {
+      this.insertBeside(targetLeaf, leaf, "row");
+    }
+    this.setActive(pane);
+    pane.focus();
+    this.renderDock();
+  }
+
+  private renderDock(): void {
+    this.dockEl.replaceChildren();
+    if (this.minimizedPanes.length === 0) {
+      this.dockEl.hidden = true;
+      return;
+    }
+    this.dockEl.hidden = false;
+    const label = document.createElement("span");
+    label.className = "dock-label";
+    label.textContent = "Minimized";
+    this.dockEl.appendChild(label);
+
+    for (const pane of this.minimizedPanes) {
+      const chip = document.createElement("button");
+      chip.className = "dock-chip";
+      chip.title = `Restore ${pane.name}`;
+      const accent = pane.accentColor;
+      if (accent) chip.style.setProperty("--dock-accent", accent);
+      else chip.classList.add("plain");
+      chip.addEventListener("click", () => this.restore(pane));
+
+      const name = document.createElement("span");
+      name.className = "dock-chip-name";
+      name.textContent = pane.name;
+
+      const close = document.createElement("span");
+      close.className = "dock-chip-close";
+      close.textContent = "✕";
+      close.title = `Close ${pane.name}`;
+      close.addEventListener("click", (e) => {
+        e.stopPropagation();
+        this.closePane(pane);
+      });
+
+      chip.append(name, close);
+      this.dockEl.appendChild(chip);
+    }
+  }
+
+  // ---------- drag to reorder / re-dock ----------
+
+  private onPointerDown(e: PointerEvent): void {
+    if (e.button !== 0 || this.maximized) return;
+    const el = e.target as HTMLElement;
+    const header = el.closest(".pane-header");
+    if (!header) return;
+    // Header controls (buttons, rename input, folder/branch chips) keep their
+    // own behavior — never start a drag from them.
+    if (el.closest("button, input, .pane-meta-item")) return;
+    if (this.leaves.size < 2) return; // nothing to reorder into
+    const pane = this.paneForEl(header);
+    if (pane) this.beginDrag(pane, e);
+  }
+
+  private paneForEl(el: Element): Pane | null {
+    for (const pane of this.leaves.keys()) {
+      if (pane.el.contains(el)) return pane;
+    }
+    return null;
+  }
+
+  /** Which target pane (and zone within it) a viewport point lands on, ignoring
+   *  the pane being dragged. */
+  private hitTest(x: number, y: number, source: Pane): { pane: Pane; zone: DropZone } | null {
+    for (const pane of this.leaves.keys()) {
+      if (pane === source) continue;
+      const r = pane.el.getBoundingClientRect();
+      if (x < r.left || x > r.right || y < r.top || y > r.bottom) continue;
+      return { pane, zone: dropZoneFor(r.width, r.height, x - r.left, y - r.top) };
+    }
+    return null;
+  }
+
+  private beginDrag(source: Pane, down: PointerEvent): void {
+    const startX = down.clientX;
+    const startY = down.clientY;
+    let started = false;
+    let hover: { pane: Pane; zone: DropZone } | null = null;
+    let indicator: HTMLElement | null = null;
+    let ghost: HTMLElement | null = null;
+
+    const start = () => {
+      started = true;
+      this.setActive(source);
+      source.el.classList.add("drag-source");
+      document.body.classList.add("dragging-pane");
+      indicator = document.createElement("div");
+      indicator.className = "drop-indicator";
+      indicator.hidden = true;
+      document.body.appendChild(indicator);
+      ghost = document.createElement("div");
+      ghost.className = "drag-ghost";
+      ghost.textContent = source.name;
+      document.body.appendChild(ghost);
+    };
+
+    const move = (ev: PointerEvent) => {
+      if (!started) {
+        if (Math.hypot(ev.clientX - startX, ev.clientY - startY) < DRAG_THRESHOLD_PX) return;
+        start();
+      }
+      if (ghost) {
+        ghost.style.left = `${ev.clientX}px`;
+        ghost.style.top = `${ev.clientY}px`;
+      }
+      hover = this.hitTest(ev.clientX, ev.clientY, source);
+      if (indicator) {
+        if (hover) {
+          this.positionIndicator(indicator, hover.pane, hover.zone);
+          indicator.hidden = false;
+        } else {
+          indicator.hidden = true;
+        }
+      }
+    };
+
+    const finish = (commit: boolean) => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+      window.removeEventListener("keydown", onKey, true);
+      source.el.classList.remove("drag-source");
+      document.body.classList.remove("dragging-pane");
+      indicator?.remove();
+      ghost?.remove();
+      if (commit && started && hover && hover.pane !== source) {
+        if (hover.zone === "center") {
+          this.swap(source, hover.pane);
+        } else {
+          const placement = zoneToPlacement(hover.zone);
+          if (placement) this.moveToEdge(source, hover.pane, placement.dir, placement.before);
+        }
+      }
+      if (started) source.focus();
+    };
+    const up = () => finish(true);
+    const onKey = (ev: KeyboardEvent) => {
+      if (ev.key === "Escape") {
+        ev.preventDefault();
+        ev.stopPropagation();
+        hover = null;
+        finish(false);
+      }
+    };
+
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+    window.addEventListener("keydown", onKey, true);
+  }
+
+  /** Size and place the snap indicator (a fixed-position overlay) over the
+   *  region the drop would occupy. */
+  private positionIndicator(indicator: HTMLElement, pane: Pane, zone: DropZone): void {
+    const r = pane.el.getBoundingClientRect();
+    const frac = indicatorFor(zone);
+    indicator.style.left = `${r.left + frac.left * r.width}px`;
+    indicator.style.top = `${r.top + frac.top * r.height}px`;
+    indicator.style.width = `${frac.width * r.width}px`;
+    indicator.style.height = `${frac.height * r.height}px`;
+    indicator.dataset.zone = zone;
+  }
+
+  /** Swap two panes between their slots, preserving each slot's flex so equal
+   *  slots keep identical pixel sizes — and therefore never resize a PTY
+   *  (applyFit skips same-size fits). The split structure is untouched. */
+  swap(a: Pane, b: Pane): void {
+    if (a === b || this.maximized) return;
+    const la = this.leaves.get(a);
+    const lb = this.leaves.get(b);
+    if (!la || !lb) return;
+
+    const fa = a.el.style.flex;
+    const fb = b.el.style.flex;
+    a.el.style.flex = fb;
+    b.el.style.flex = fa;
+
+    const marker = document.createComment("swap");
+    a.el.replaceWith(marker);
+    b.el.replaceWith(a.el);
+    marker.replaceWith(b.el);
+
+    la.pane = b;
+    lb.pane = a;
+    this.leaves.set(a, lb);
+    this.leaves.set(b, la);
+  }
+
+  /** Move a pane out of its current slot and re-dock it to an edge of the
+   *  target, forming (or joining) a split in that direction. This is a genuine
+   *  restructure, so affected panes may resize once. */
+  moveToEdge(source: Pane, target: Pane, dir: Dir, before: boolean): void {
+    if (source === target || this.maximized) return;
+    const leaf = this.leaves.get(source);
+    const targetLeaf = this.leaves.get(target);
+    if (!leaf || !targetLeaf) return;
+    this.removeFromTree(leaf);
+    source.el.style.flex = "1 1 0";
+    this.insertBeside(targetLeaf, leaf, dir, before);
+    this.setActive(source);
+    source.focus();
   }
 
   /** Move focus to the geometrically nearest pane in a direction. */

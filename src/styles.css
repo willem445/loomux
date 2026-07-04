@@ -70,7 +70,104 @@ html, body {
 
 /* ---------- workspace ---------- */
 #workspace { display: flex; flex: 1; min-height: 0; }
-#grid-root { flex: 1; min-width: 0; display: flex; padding: 8px; }
+/* The grid and its minimize dock stack vertically; the grid takes all the
+   room and the dock is a thin strip that only appears when non-empty. */
+#grid-area { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+/* position: relative anchors a maximized pane's absolute overlay to the grid
+   content area (inside the 8px padding). */
+#grid-root { flex: 1; min-width: 0; min-height: 0; display: flex; padding: 8px; position: relative; }
+
+/* ---------- maximize ---------- */
+/* The maximized pane is lifted to a top layer directly under #grid-root and
+   covers the content area; the rest of the split tree is hidden so its panes
+   report zero size and skip their PTY fits (see Grid.toggleMaximize). */
+#grid-root.has-maximized > :not(.maximized) { display: none; }
+.pane.maximized {
+  position: absolute;
+  inset: 0;
+  z-index: 30;
+  animation: none;
+}
+
+/* ---------- pane drag to reorder / re-dock ---------- */
+/* The pane lifted out; dim it so the snap indicator reads as the destination. */
+.pane.drag-source { opacity: 0.4; }
+body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
+.pane-header { cursor: grab; }
+
+/* Snap target preview: a translucent accent wash over the half (edge) or whole
+   (swap) of the pane the drop would land on. Fixed-positioned in viewport
+   coords, set by Grid.positionIndicator; never intercepts the pointer. */
+.drop-indicator {
+  position: fixed;
+  z-index: 60;
+  pointer-events: none;
+  border-radius: 8px;
+  background: var(--accent-glow);
+  border: 2px solid var(--accent);
+  box-shadow: 0 0 0 1px rgba(122, 162, 247, 0.25), 0 0 22px var(--accent-glow);
+  transition: left 0.08s var(--ease), top 0.08s var(--ease),
+              width 0.08s var(--ease), height 0.08s var(--ease);
+}
+.drop-indicator[data-zone="center"] { border-style: dashed; }
+
+/* A small label that follows the cursor during a drag. */
+.drag-ghost {
+  position: fixed;
+  z-index: 61;
+  pointer-events: none;
+  transform: translate(12px, 12px);
+  max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  padding: 3px 9px; font-size: 11.5px; letter-spacing: 0.2px;
+  color: var(--text);
+  background: var(--panel-2);
+  border: 1px solid var(--accent-dim); border-radius: 6px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+}
+
+/* ---------- minimize dock ---------- */
+#pane-dock {
+  flex: none;
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 10px;
+  background: linear-gradient(180deg, var(--panel), #14141c);
+  border-top: 1px solid var(--border);
+  overflow-x: auto;
+}
+#pane-dock[hidden] { display: none; }
+.dock-label {
+  flex: none; font-size: 10px; text-transform: uppercase; letter-spacing: 1px;
+  color: var(--text-dim); margin-right: 2px;
+}
+.dock-chip {
+  flex: none; display: inline-flex; align-items: center; gap: 8px;
+  max-width: 220px;
+  padding: 4px 6px 4px 10px;
+  font: inherit; font-size: 12px; cursor: pointer;
+  color: var(--text);
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--dock-accent, var(--accent));
+  border-radius: 7px;
+  transition: border-color 0.15s var(--ease), background 0.15s var(--ease),
+              box-shadow 0.15s var(--ease);
+}
+.dock-chip.plain { border-left-color: var(--accent-dim); }
+.dock-chip:hover {
+  background: #232330;
+  box-shadow: 0 0 12px var(--accent-glow);
+}
+.dock-chip-name {
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.dock-chip-close {
+  flex: none; display: inline-flex; align-items: center; justify-content: center;
+  width: 16px; height: 16px; border-radius: 4px;
+  color: var(--text-dim); font-size: 10px;
+}
+.dock-chip-close:hover { background: var(--panel); color: var(--danger); }
+
+.hint-tip { color: var(--text-dim); font-style: italic; }
 
 /* ---------- split tree ---------- */
 .split { display: flex; flex: 1; min-width: 0; min-height: 0; }

@@ -29,9 +29,10 @@ window.addEventListener("unhandledrejection", (e) =>
 );
 
 const gridRoot = document.getElementById("grid-root")!;
+const paneDock = document.getElementById("pane-dock")!;
 const sessionsEl = document.getElementById("sessions")!;
 
-const grid = new Grid(gridRoot, () => {
+const grid = new Grid(gridRoot, paneDock, () => {
   // Last pane closed → always keep one pane alive.
   void openPane();
 });
@@ -40,6 +41,8 @@ const paneEvents: PaneEvents = {
   onFocus: (pane) => grid.setActive(pane),
   onCloseRequest: (pane) => grid.closePane(pane),
   onSplit: (pane, dir) => void openPane(dir, pane),
+  onMinimize: (pane) => grid.minimize(pane),
+  onMaximize: (pane) => grid.toggleMaximize(pane),
 };
 
 // PTYs whose exit event arrived before their pane finished starting.
@@ -210,6 +213,12 @@ document.addEventListener(
         break;
       case "toggle-group":
         grid.activePane?.toggleGroupView();
+        break;
+      case "maximize-pane":
+        if (grid.activePane) grid.toggleMaximize(grid.activePane);
+        break;
+      case "minimize-pane":
+        if (grid.activePane) grid.minimize(grid.activePane);
         break;
       case "rename-pane":
         grid.activePane?.startRename();

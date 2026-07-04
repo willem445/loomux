@@ -13,6 +13,8 @@ export type ShortcutAction =
   | "toggle-tasks"
   | "toggle-audit"
   | "toggle-group"
+  | "maximize-pane"
+  | "minimize-pane"
   | "rename-pane"
   | "focus-left"
   | "focus-right"
@@ -27,10 +29,12 @@ export function matchShortcut(e: KeyboardEvent): ShortcutAction | null {
       case "KeyW": return "close-pane";
       case "KeyP": return "toggle-sessions";
       case "KeyA": return "toggle-agent-mode";
+      case "KeyM": return "maximize-pane";
     }
   }
   if (e.altKey && !e.ctrlKey && !e.shiftKey) {
     switch (e.code) {
+      case "KeyM": return "minimize-pane";
       case "ArrowLeft": return "focus-left";
       case "ArrowRight": return "focus-right";
       case "ArrowUp": return "focus-up";

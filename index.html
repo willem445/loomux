@@ -30,7 +30,10 @@
       </header>
       <div id="workspace">
         <aside id="sessions" class="hidden"></aside>
-        <main id="grid-root"></main>
+        <div id="grid-area">
+          <main id="grid-root"></main>
+          <div id="pane-dock" hidden aria-label="Minimized panes"></div>
+        </div>
       </div>
       <footer id="hintbar">
         <span><kbd>Ctrl+Shift+E</kbd> split right</span>
@@ -38,9 +41,12 @@
         <span><kbd>Ctrl+Shift+W</kbd> close pane</span>
         <span><kbd>Ctrl+Shift+P</kbd> sessions</span>
         <span><kbd>Ctrl+Shift+A</kbd> agent mode</span>
+        <span><kbd>Ctrl+Shift+M</kbd> maximize</span>
+        <span><kbd>Alt+M</kbd> minimize</span>
         <span><kbd>Alt+G</kbd> git</span>
         <span><kbd>F2</kbd> rename</span>
         <span><kbd>Alt+←↑↓→</kbd> focus</span>
+        <span class="hint-tip">drag a pane header to reorder</span>
       </footer>
       <footer id="statusbar" title="Live system resources">
         <div class="metric" id="m-cpu" title="CPU utilization">
