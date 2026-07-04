@@ -135,6 +135,18 @@ links, notes, and priority order. You can add, edit, annotate, reorder, and
 delete tasks; the orchestrator is notified of your edits and maintains the
 same board through its tools.
 
+**Custom agent profiles:** define specialized personas per repo in
+`.loomux/agents/<name>.md` — frontmatter for `description`, `model`, `kind`
+(worker/reviewer), `mcp` (a JSON file of extra MCP servers, e.g. your
+hardware or test tools), `allow` (extra pre-approved commands), and
+`copilot-agent` (maps to a Copilot custom agent); the body is the persona's
+instructions. The orchestrator sees the available profiles in its kickoff
+and spawns them with `spawn_agent(profile: "embedded-dev", ...)`. On Claude
+the instructions are injected as the agent's system prompt; custom MCP
+servers ride in the same per-agent config as the loomux tools (the loomux
+identity entry can't be overridden). Profiles are re-read on every spawn,
+so edits apply to the next agent immediately.
+
 **Per-task sessions:** each worker is scoped to exactly one work item, and
 loomux pre-assigns Claude session ids at spawn, recording them on the
 roster and task board. Follow-ups on a finished task *resume* that worker's

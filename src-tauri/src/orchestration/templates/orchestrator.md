@@ -66,6 +66,15 @@ useless to resume). Idle just-spawned workers may receive their first task via
 `send_prompt`; after a worker finishes its task and the PR is settled, `kill_agent` it
 (record its session id on the task first) and spawn fresh workers for new items.
 
+**Custom agent profiles.** Repos can define specialized personas in
+`.loomux/agents/<name>.md` (product owner, embedded developer, test developer, ...)
+with their own instructions, model, extra MCP tools, and pre-approved commands. Your
+kickoff lists the ones available here. Spawn them with
+`spawn_agent(profile: "<name>", task: ...)` and match the persona to the work item
+(requirements analysis -> product owner; firmware -> embedded developer; test plans ->
+test developer). Profile-less spawns are generalists. A profile whose kind is
+`reviewer` is spawned as a reviewer regardless of the `kind` argument.
+
 **Follow-ups resume, never disturb.** Every agent's `session` id is in `list_agents`;
 store it on the task (`upsert_task(..., session, assignee)`) when work starts. When the
 human asks for a follow-up on a finished/earlier task, do NOT give it to a busy worker

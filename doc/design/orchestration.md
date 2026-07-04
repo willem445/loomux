@@ -139,6 +139,13 @@ intent, not vacuous passes) → design notes + user docs → commit → push →
   `resume_orch_session`, resuming the conversation; workers/reviewers rejoin live
   groups the same way.
 
+- **Custom agent profiles (third validation round)**: `.loomux/agents/<name>.md`
+  (frontmatter + instructions) defines repo-local personas with model overrides,
+  extra MCP servers (merged into the per-agent config; the loomux identity entry is
+  reserved), extra allowlist entries, and Copilot custom-agent mapping. Claude gets
+  the instructions via `--append-system-prompt-file`; kickoffs reference the rendered
+  brief; the orchestrator's kickoff lists available profiles. Re-read per spawn.
+
 ## Risks / limitations
 
 - Kickoff typing races CLI boot; a fixed delay (4s) + bracketed paste is used. If a

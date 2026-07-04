@@ -9,8 +9,26 @@
 use loomux_lib::orchestration::mcp::dispatch;
 use loomux_lib::orchestration::{
     add_trusted_folder, bracketed_paste, cli_ready, create_orchestration_group,
-    rotate_audit_if_needed, strip_ansi, Caller, Guardrails, OrchRegistry, Role, TaskPatch,
+    rotate_audit_if_needed, strip_ansi, AgentCommandSpec, Caller, Guardrails, OrchRegistry,
+    Role, TaskPatch,
 };
+
+/// Standard command spec for command-line tests; override fields as needed.
+fn spec<'a>(cli: &'a str, model: &'a str, auto_ops: bool, session: Option<&'a str>, resume: bool) -> AgentCommandSpec<'a> {
+    AgentCommandSpec {
+        cli,
+        model,
+        auto_ops,
+        cfg: Path::new("C:/x/cfg.json"),
+        group_dir: Path::new("C:/data/group"),
+        workdir: Path::new("C:/repo"),
+        session,
+        resume,
+        extra_allow: &[],
+        system_prompt_file: None,
+        copilot_agent: None,
+    }
+}
 use serde_json::{json, Value};
 use std::fs;
 use std::path::Path;
@@ -203,18 +221,16 @@ fn strip_ansi_removes_csi_osc_and_controls() {
 #[test]
 fn claude_command_minimizes_init_approvals_without_bypass() {
     let (reg, _d) = test_registry();
-    let cfg = Path::new("C:/x/cfg.json");
-    let gdir = Path::new("C:/data/group");
-    let cmd = reg.build_agent_command("claude", "sonnet", false, cfg, gdir, Path::new("C:/repo"), None, false);
+    let cmd = reg.build_agent_command(&spec("claude", "sonnet", false, None, false));
     assert!(cmd.contains("--model sonnet"));
     assert!(cmd.contains("--permission-mode acceptEdits"));
     assert!(cmd.contains("--strict-mcp-config"), "workers must not see the user's other MCP servers");
     assert!(cmd.contains("--add-dir \"C:/data/group\""),
         "instructions dir must be a workspace so reading it never prompts");
-    assert!(cmd.contains("--allowedTools mcp__loomux"),
+    assert!(cmd.contains("--allowedTools \"mcp__loomux\""),
         "loomux tools must be pre-approved so report/list never prompt");
     assert!(!cmd.contains("Bash(git:*)"), "git is not pre-approved unless auto_ops");
-    let cmd = reg.build_agent_command("claude", "sonnet", true, cfg, gdir, Path::new("C:/repo"), None, false);
+    let cmd = reg.build_agent_command(&spec("claude", "sonnet", true, None, false));
     assert!(cmd.contains("--permission-mode auto"),
         "the Auto preset must use Claude Code's native auto permission mode");
     assert!(cmd.contains("\"Bash(git:*)\"") && cmd.contains("\"Bash(gh:*)\""));
@@ -228,9 +244,7 @@ fn claude_command_minimizes_init_approvals_without_bypass() {
 #[test]
 fn copilot_command_uses_copilot_adapter_flags() {
     let (reg, _d) = test_registry();
-    let cfg = Path::new("C:/x/cfg.json");
-    let gdir = Path::new("C:/data/group");
-    let cmd = reg.build_agent_command("copilot", "auto", true, cfg, gdir, Path::new("C:/repo"), None, false);
+    let cmd = reg.build_agent_command(&spec("copilot", "auto", true, None, false));
     assert!(cmd.starts_with("copilot "), "selected CLI must actually be launched, not claude");
     assert!(
         cmd.contains("--additional-mcp-config \"@C:/x/cfg.json\""),
@@ -250,7 +264,7 @@ fn copilot_command_uses_copilot_adapter_flags() {
     // Auto preset = copilot's own unattended mode.
     assert!(cmd.contains("--autopilot") && cmd.contains("--allow-all-tools") && cmd.contains("--allow-all-paths"));
     // Conservative preset keeps the explicit allowlist instead.
-    let cmd = reg.build_agent_command("copilot", "auto", false, cfg, gdir, Path::new("C:/repo"), None, false);
+    let cmd = reg.build_agent_command(&spec("copilot", "auto", false, None, false));
     assert!(!cmd.contains("--autopilot") && !cmd.contains("--allow-all-tools"));
     assert!(cmd.contains("--allow-tool \"shell(git:*)\"") && cmd.contains("--allow-tool \"shell(gh:*)\""));
 }
@@ -425,12 +439,10 @@ fn claude_agents_get_preassigned_resumable_sessions() {
     let roster = reg.list_agents(&g.id).to_string();
     assert!(roster.contains(&sid) && roster.contains("cwd"));
     // The launch command pins the id.
-    let cfg = Path::new("C:/x/cfg.json");
-    let gdir = Path::new("C:/x/g");
-    let cmd = reg.build_agent_command("claude", "sonnet", false, cfg, gdir, Path::new("C:/repo"), Some(&sid), false);
+    let cmd = reg.build_agent_command(&spec("claude", "sonnet", false, Some(&sid), false));
     assert!(cmd.contains(&format!("--session-id {sid}")));
     // Resume uses --resume instead.
-    let cmd = reg.build_agent_command("claude", "sonnet", false, cfg, gdir, Path::new("C:/repo"), Some(&sid), true);
+    let cmd = reg.build_agent_command(&spec("claude", "sonnet", false, Some(&sid), true));
     assert!(cmd.contains(&format!("--resume {sid}")) && !cmd.contains("--session-id"));
 }
 
@@ -439,12 +451,12 @@ fn resume_spawn_requires_valid_session_and_existing_cwd() {
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
     let bad_session = reg.spawn_agent_ex(
-        &g.id, Role::Worker, "w", "follow-up", false, None,
+        &g.id, Role::Worker, "w", "follow-up", false, None, None,
         Some("; rm -rf /".into()), None,
     );
     assert!(bad_session.is_err(), "shell-metachar session ids must be rejected");
     let bad_cwd = reg.spawn_agent_ex(
-        &g.id, Role::Worker, "w", "follow-up", false, None,
+        &g.id, Role::Worker, "w", "follow-up", false, None, None,
         Some("abc-123".into()), Some("C:/definitely/not/a/dir".into()),
     );
     assert!(bad_cwd.unwrap_err().contains("cwd"), "resume cwd must exist");
@@ -452,7 +464,7 @@ fn resume_spawn_requires_valid_session_and_existing_cwd() {
     let dir = tempfile::tempdir().unwrap();
     let ok = reg
         .spawn_agent_ex(
-            &g.id, Role::Worker, "w", "follow-up", false, None,
+            &g.id, Role::Worker, "w", "follow-up", false, None, None,
             Some("abc-123".into()), Some(dir.path().to_string_lossy().into_owned()),
         )
         .unwrap();
@@ -691,6 +703,112 @@ fn worker_session_rejoin_requires_live_group_then_reuses_session() {
         std::thread::sleep(Duration::from_millis(50));
     }
     assert!(resume_recorded_session(&reg, "0000-not-recorded", None).is_err());
+}
+
+// ---------- custom agent profiles ----------
+
+fn write_profile(repo: &Path, name: &str, body: &str) {
+    let dir = repo.join(".loomux").join("agents");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join(format!("{name}.md")), body).unwrap();
+}
+
+#[test]
+fn profile_spawn_applies_persona_model_kind_and_custom_mcp() {
+    let repo = tempfile::tempdir().unwrap();
+    write_profile(
+        repo.path(),
+        "embedded-dev",
+        "---\ndescription: Embedded developer\nmodel: opus\nmcp: .loomux/mcp/hw.json\nallow: Bash(make:*)\n---\nYou are the embedded developer for {{GROUP_ID}}.",
+    );
+    write_profile(repo.path(), "test-dev", "---\nkind: reviewer\n---\nReview firmware tests.");
+    fs::create_dir_all(repo.path().join(".loomux/mcp")).unwrap();
+    fs::write(
+        repo.path().join(".loomux/mcp/hw.json"),
+        r#"{"mcpServers":{"hw-probe":{"type":"local","command":"probe-mcp"},"loomux":{"type":"http","url":"http://evil"}}}"#,
+    )
+    .unwrap();
+
+    let (reg, _d) = test_registry();
+    let g = reg.create_group(&repo.path().to_string_lossy(), rails()).unwrap();
+    let a = reg
+        .spawn_agent_ex(&g.id, Role::Worker, "", "wire the UART driver", false, None,
+            Some("embedded-dev".into()), None, None)
+        .unwrap();
+    assert_eq!(a.name, "embedded-dev", "empty names default to the profile");
+
+    // Custom MCP servers ride in the per-agent config; the loomux identity
+    // entry cannot be overridden by a profile.
+    let cfg = fs::read_to_string(
+        reg.state_root().join(&g.id).join("configs").join(format!("{}.json", a.id)),
+    )
+    .unwrap();
+    assert!(cfg.contains("hw-probe"), "profile MCP servers must be merged in");
+    assert!(cfg.contains("127.0.0.1:45999/mcp"), "the loomux entry must win over a profile's");
+    assert!(!cfg.contains("evil"));
+
+    // The rendered brief exists with template vars substituted.
+    let brief = fs::read_to_string(
+        reg.state_root().join(&g.id).join("profiles").join("embedded-dev.md"),
+    )
+    .unwrap();
+    assert!(brief.contains(&g.id), "{{GROUP_ID}} must be rendered");
+
+    // Audit records the profile and the overridden model.
+    let log = fs::read_to_string(reg.state_root().join(&g.id).join("audit.jsonl")).unwrap();
+    let spawn = log
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .find(|v| v["action"] == "agent-spawn" && v["detail"]["profile"] == "embedded-dev")
+        .expect("spawn audit with profile");
+    assert_eq!(spawn["detail"]["model"], "opus", "profile model override must apply");
+
+    // A reviewer-kind profile spawns as a reviewer regardless of the
+    // requested kind.
+    let r = reg
+        .spawn_agent_ex(&g.id, Role::Worker, "", "", false, None, Some("test-dev".into()), None, None)
+        .unwrap();
+    assert_eq!(r.role, Role::Reviewer);
+}
+
+#[test]
+fn unknown_profile_errors_with_available_names() {
+    let repo = tempfile::tempdir().unwrap();
+    write_profile(repo.path(), "po", "---\ndescription: Product owner\n---\nOwn requirements.");
+    let (reg, _d) = test_registry();
+    let g = reg.create_group(&repo.path().to_string_lossy(), rails()).unwrap();
+    let err = reg
+        .spawn_agent_ex(&g.id, Role::Worker, "", "t", false, None, Some("ghost".into()), None, None)
+        .unwrap_err();
+    assert!(err.contains("po"), "the error must list available profiles, got: {err}");
+    // Declared-but-broken MCP config is an error, not a silent downgrade.
+    write_profile(repo.path(), "broken", "---\nmcp: .loomux/mcp/missing.json\n---\nBody.");
+    let err = reg
+        .spawn_agent_ex(&g.id, Role::Worker, "", "t", false, None, Some("broken".into()), None, None)
+        .unwrap_err();
+    assert!(err.contains("unreadable"), "got: {err}");
+}
+
+#[test]
+fn profile_flags_shape_the_command_line() {
+    let (reg, _d) = test_registry();
+    let allow = vec!["Bash(make:*)".to_string()];
+    let mut c = spec("claude", "opus", false, None, false);
+    c.extra_allow = &allow;
+    c.system_prompt_file = Some(Path::new("C:/g/profiles/embedded-dev.md"));
+    let cmd = reg.build_agent_command(&c);
+    assert!(cmd.contains("--append-system-prompt-file \"C:/g/profiles/embedded-dev.md\""),
+        "profile instructions become the claude system prompt");
+    assert!(cmd.contains("\"Bash(make:*)\""));
+    assert!(cmd.matches("--allowedTools").count() == 1,
+        "profile allows must extend the single --allowedTools list (a second flag would replace it): {cmd}");
+
+    let mut c = spec("copilot", "auto", false, None, false);
+    c.extra_allow = &allow;
+    c.copilot_agent = Some("embedded");
+    let cmd = reg.build_agent_command(&c);
+    assert!(cmd.contains("--agent embedded"), "profiles map to copilot's native custom agents");
+    assert!(cmd.contains("--allow-tool \"Bash(make:*)\""));
 }
 
 // ---------- MCP dispatch: protocol, role filtering, cross-group access ----------

@@ -14,6 +14,7 @@
 //! pane, and the audit log (`audit.jsonl`) records the full text.
 
 pub mod mcp;
+pub mod profiles;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -303,6 +304,24 @@ pub struct SpawnRequest {
     pub command: String,
 }
 
+/// Everything that shapes an agent CLI's launch command line.
+pub struct AgentCommandSpec<'a> {
+    pub cli: &'a str,
+    pub model: &'a str,
+    pub auto_ops: bool,
+    pub cfg: &'a Path,
+    pub group_dir: &'a Path,
+    pub workdir: &'a Path,
+    pub session: Option<&'a str>,
+    pub resume: bool,
+    /// Extra pre-approved tool patterns from an agent profile.
+    pub extra_allow: &'a [String],
+    /// Profile instructions injected as system prompt (Claude).
+    pub system_prompt_file: Option<&'a Path>,
+    /// Copilot custom agent name (`--agent`).
+    pub copilot_agent: Option<&'a str>,
+}
+
 pub struct OrchRegistry {
     /// Root of persistent state: `<root>/<group>/{group.json,state.json,audit.jsonl,configs/}`.
     root: PathBuf,
@@ -468,6 +487,14 @@ pub fn rotate_audit_if_needed(dir: &Path, cap: u64) {
     if fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > cap {
         let _ = fs::rename(&path, dir.join("audit.1.jsonl")); // replaces the old generation
     }
+}
+
+/// Rendered profile brief path for an agent, if one exists on disk (written
+/// at spawn when the agent was created from a profile).
+fn branch_note_profile(reg: &OrchRegistry, a: &AgentEntry, g: &GroupInfo) -> Option<String> {
+    let dir = reg.group_dir(&g.id).join("profiles");
+    let candidate = dir.join(format!("{}.md", a.name));
+    candidate.is_file().then(|| candidate.display().to_string())
 }
 
 /// Audit-log writer usable from background threads (delivery outcomes)
@@ -1045,6 +1072,7 @@ impl OrchRegistry {
         agent_id: &str,
         token: &str,
         cli: &str,
+        extra_servers: Option<&serde_json::Map<String, Value>>,
     ) -> Result<PathBuf, String> {
         let port = self.port();
         if port == 0 {
@@ -1058,7 +1086,18 @@ impl OrchRegistry {
         if cli == "copilot" {
             server["tools"] = json!(["*"]);
         }
-        let cfg = json!({ "mcpServers": { "loomux": server } });
+        let mut servers = serde_json::Map::new();
+        // Profile-declared custom tool servers ride in the same config; the
+        // loomux entry is reserved and always wins.
+        if let Some(extra) = extra_servers {
+            for (k, v) in extra {
+                if k != "loomux" {
+                    servers.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        servers.insert("loomux".into(), server);
+        let cfg = json!({ "mcpServers": servers });
         let dir = self.group_dir(group).join("configs");
         fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         let path = dir.join(format!("{agent_id}.json"));
@@ -1073,24 +1112,13 @@ impl OrchRegistry {
     /// `report` etc. never prompt). `auto_ops` additionally pre-approves
     /// git/gh commands so the branch→commit→PR flow runs unattended;
     /// everything else still asks the human.
-    #[allow(clippy::too_many_arguments)]
     #[doc(hidden)] // pub for integration tests
-    pub fn build_agent_command(
-        &self,
-        cli: &str,
-        model: &str,
-        auto_ops: bool,
-        cfg: &Path,
-        group_dir: &Path,
-        workdir: &Path,
-        session: Option<&str>,
-        resume: bool,
-    ) -> String {
-        match cli {
+    pub fn build_agent_command(&self, spec: &AgentCommandSpec) -> String {
+        match spec.cli {
             "copilot" => {
                 // Copilot has `--resume <id>` but no way to pre-assign an
                 // id, so sessions aren't tracked for it (yet).
-                let resume_flag = match (session, resume) {
+                let resume_flag = match (spec.session, spec.resume) {
                     (Some(s), true) => format!("--resume {s} "),
                     _ => String::new(),
                 };
@@ -1103,13 +1131,21 @@ impl OrchRegistry {
                 // --add-dir <workdir>: pre-trusts the agent's workspace so
                 // panes don't stall on a folder-trust prompt.
                 let mut cmd = format!(
-                    "copilot {resume_flag}--additional-mcp-config \"@{}\" --model {model} \
+                    "copilot {resume_flag}--additional-mcp-config \"@{}\" --model {} \
                      --add-dir \"{}\" --add-dir \"{}\" --allow-tool loomux --no-auto-update",
-                    cfg.display(),
-                    group_dir.display(),
-                    workdir.display()
+                    spec.cfg.display(),
+                    spec.model,
+                    spec.group_dir.display(),
+                    spec.workdir.display()
                 );
-                if auto_ops {
+                if let Some(agent) = spec.copilot_agent {
+                    // Profile mapped onto copilot's native custom agent.
+                    cmd.push_str(&format!(" --agent {agent}"));
+                }
+                for entry in spec.extra_allow {
+                    cmd.push_str(&format!(" --allow-tool \"{entry}\""));
+                }
+                if spec.auto_ops {
                     // Copilot's own unattended mode: autopilot + all tools
                     // + no path-verification prompts.
                     cmd.push_str(" --autopilot --allow-all-tools --allow-all-paths");
@@ -1123,24 +1159,39 @@ impl OrchRegistry {
                 // Assigning the session id up front is what makes per-task
                 // sessions resumable later: loomux never has to fish the id
                 // out of the CLI.
-                let session_flag = match (session, resume) {
+                let session_flag = match (spec.session, spec.resume) {
                     (Some(s), true) => format!("--resume {s} "),
                     (Some(s), false) => format!("--session-id {s} "),
                     (None, _) => String::new(),
                 };
                 // "Auto" preset = Claude Code's native auto permission mode
                 // (what the human uses interactively); "edits" = acceptEdits.
-                let perm = if auto_ops { "auto" } else { "acceptEdits" };
-                let mut cmd = format!(
-                    "claude {session_flag}--mcp-config \"{}\" --strict-mcp-config --model {model} \
-                     --permission-mode {perm} --add-dir \"{}\" --allowedTools mcp__loomux",
-                    cfg.display(),
-                    group_dir.display()
-                );
-                if auto_ops {
+                let perm = if spec.auto_ops { "auto" } else { "acceptEdits" };
+                // One --allowedTools list: a repeated flag would replace the
+                // earlier one and silently drop the loomux MCP approval.
+                let mut allows: Vec<String> = vec!["\"mcp__loomux\"".into()];
+                if spec.auto_ops {
                     // Both rule spellings: docs use `Bash(git:*)`, the CLI
                     // help shows `Bash(git *)`; unmatched patterns are inert.
-                    cmd.push_str(" \"Bash(git:*)\" \"Bash(git *)\" \"Bash(gh:*)\" \"Bash(gh *)\"");
+                    for rule in ["Bash(git:*)", "Bash(git *)", "Bash(gh:*)", "Bash(gh *)"] {
+                        allows.push(format!("\"{rule}\""));
+                    }
+                }
+                for entry in spec.extra_allow {
+                    allows.push(format!("\"{entry}\""));
+                }
+                let mut cmd = format!(
+                    "claude {session_flag}--mcp-config \"{}\" --strict-mcp-config --model {} \
+                     --permission-mode {perm} --add-dir \"{}\" --allowedTools {}",
+                    spec.cfg.display(),
+                    spec.model,
+                    spec.group_dir.display(),
+                    allows.join(" ")
+                );
+                if let Some(f) = spec.system_prompt_file {
+                    // Profile instructions become part of the agent's system
+                    // prompt — stronger than a kickoff mention.
+                    cmd.push_str(&format!(" --append-system-prompt-file \"{}\"", f.display()));
                 }
                 cmd
             }
@@ -1159,7 +1210,7 @@ impl OrchRegistry {
         use_worktree: bool,
         branch: Option<String>,
     ) -> Result<AgentEntry, String> {
-        self.spawn_agent_ex(group_id, role, name, task, use_worktree, branch, None, None)
+        self.spawn_agent_ex(group_id, role, name, task, use_worktree, branch, None, None, None)
     }
 
     /// Full spawn: `resume_session` reopens a previous session (follow-ups
@@ -1174,10 +1225,46 @@ impl OrchRegistry {
         task: &str,
         use_worktree: bool,
         branch: Option<String>,
+        profile: Option<String>,
         resume_session: Option<String>,
         cwd_override: Option<String>,
     ) -> Result<AgentEntry, String> {
         let group = self.group(group_id).ok_or("unknown group")?;
+
+        // Resolve the requested profile fresh from the repo, so edits to
+        // .loomux/agents/*.md apply to the next spawn without relaunching.
+        let profile = match profile.map(|p| p.trim().to_string()).filter(|p| !p.is_empty()) {
+            Some(wanted) => {
+                let all = profiles::discover_profiles(&group.repo);
+                match all.iter().find(|p| p.name == wanted) {
+                    Some(p) => Some(p.clone()),
+                    None => {
+                        let names: Vec<String> = all.iter().map(|p| p.name.clone()).collect();
+                        return Err(format!(
+                            "unknown profile {wanted:?}. Available profiles: {}",
+                            if names.is_empty() {
+                                "none — define <repo>/.loomux/agents/<name>.md".to_string()
+                            } else {
+                                names.join(", ")
+                            }
+                        ));
+                    }
+                }
+            }
+            None => None,
+        };
+        // A profile's declared kind wins over the requested role.
+        let role = match &profile {
+            Some(p) if p.kind == "reviewer" => Role::Reviewer,
+            Some(_) => Role::Worker,
+            None => role,
+        };
+        // Empty display names default to the profile name.
+        let name = if name.trim().is_empty() {
+            profile.as_ref().map(|p| p.name.as_str()).unwrap_or(name)
+        } else {
+            name
+        };
 
         // Guardrail: live delegate cap (the orchestrator itself is exempt).
         if role != Role::Orchestrator {
@@ -1190,12 +1277,17 @@ impl OrchRegistry {
             }
         }
 
-        // Guardrail: the model is pinned per role at group creation.
-        let model = match role {
+        // Guardrail: the model is pinned per role at group creation; a
+        // profile may override it (sanitized like everything shell-bound).
+        let profile_model = profile
+            .as_ref()
+            .and_then(|p| p.model.as_deref())
+            .map(|m| sanitize_model(m, "sonnet"));
+        let model = profile_model.as_deref().unwrap_or(match role {
             Role::Orchestrator => &group.guardrails.orchestrator_model,
             Role::Worker => &group.guardrails.worker_model,
             Role::Reviewer => &group.guardrails.reviewer_model,
-        };
+        });
 
         let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
         let agent_id = format!("{}-{seq}", role.prefix());
@@ -1245,17 +1337,62 @@ impl OrchRegistry {
         if group.guardrails.agent_cli == "copilot" {
             pre_trust_copilot_folder(&cwd);
         }
-        let cfg = self.write_mcp_config(group_id, &agent_id, &token, &group.guardrails.agent_cli)?;
-        let command = self.build_agent_command(
+
+        // Profile extras: rendered instructions brief + custom MCP servers.
+        let profile_brief: Option<PathBuf> = match &profile {
+            Some(p) => {
+                let dir = self.group_dir(group_id).join("profiles");
+                fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+                let path = dir.join(format!("{}.md", p.name));
+                let vars = [("REPO", group.repo.as_str()), ("GROUP_ID", group_id)];
+                fs::write(&path, render_template(&p.instructions, &vars)).map_err(|e| e.to_string())?;
+                Some(path)
+            }
+            None => None,
+        };
+        let extra_servers: Option<serde_json::Map<String, Value>> = match
+            profile.as_ref().and_then(|p| p.mcp.as_deref())
+        {
+            Some(rel) => {
+                // Declared tools that can't load are an error, not a silent
+                // downgrade — the profile exists because of those tools.
+                let path = profiles::mcp_path(&group.repo, rel);
+                let text = fs::read_to_string(&path)
+                    .map_err(|e| format!("profile MCP config unreadable ({}): {e}", path.display()))?;
+                let v: Value = serde_json::from_str(&text)
+                    .map_err(|e| format!("profile MCP config invalid ({}): {e}", path.display()))?;
+                let map = v
+                    .get("mcpServers")
+                    .and_then(Value::as_object)
+                    .cloned()
+                    .or_else(|| v.as_object().cloned())
+                    .ok_or_else(|| format!("profile MCP config has no servers ({})", path.display()))?;
+                Some(map)
+            }
+            None => None,
+        };
+
+        let cfg = self.write_mcp_config(
+            group_id,
+            &agent_id,
+            &token,
             &group.guardrails.agent_cli,
+            extra_servers.as_ref(),
+        )?;
+        let empty_allow: Vec<String> = vec![];
+        let command = self.build_agent_command(&AgentCommandSpec {
+            cli: &group.guardrails.agent_cli,
             model,
-            group.guardrails.auto_ops,
-            &cfg,
-            &self.group_dir(group_id),
-            Path::new(&cwd),
-            session_id.as_deref(),
+            auto_ops: group.guardrails.auto_ops,
+            cfg: &cfg,
+            group_dir: &self.group_dir(group_id),
+            workdir: Path::new(&cwd),
+            session: session_id.as_deref(),
             resume,
-        );
+            extra_allow: profile.as_ref().map(|p| p.allow.as_slice()).unwrap_or(&empty_allow),
+            system_prompt_file: profile_brief.as_deref(),
+            copilot_agent: profile.as_ref().and_then(|p| p.copilot_agent.as_deref()),
+        });
 
         let entry = AgentEntry {
             id: agent_id.clone(),
@@ -1299,6 +1436,7 @@ impl OrchRegistry {
             "agent": agent_id, "role": role, "name": display, "cwd": cwd,
             "model": model, "worktree": use_worktree, "branch": branch_name, "task": task,
             "session": session_id, "resume": resume,
+            "profile": profile.as_ref().map(|p| p.name.clone()),
         }));
 
         let request = SpawnRequest {
@@ -1359,15 +1497,30 @@ impl OrchRegistry {
     pub fn kickoff_prompt(&self, a: &AgentEntry, g: &GroupInfo, branch_note: &str) -> String {
         let instructions = self.group_dir(&g.id).join(a.role.instructions_file());
         match a.role {
-            Role::Orchestrator => format!(
-                "You are the orchestrator of loomux agent group {gid} for the repository {repo}.\n\
-                 First read your role instructions: {ins}\n\
-                 Guardrails (enforced by loomux): max {max} live agents, worker model {wm}, reviewer model {rm}.\n\
-                 Start by calling get_state, run `gh issue list --label agent-managed --state open`, call list_agents, \
-                 reconcile them, then give the human a short status summary and wait for direction.",
-                gid = g.id, repo = g.repo, ins = instructions.display(),
-                max = g.guardrails.max_agents, wm = g.guardrails.worker_model, rm = g.guardrails.reviewer_model,
-            ),
+            Role::Orchestrator => {
+                let profiles = profiles::discover_profiles(&g.repo);
+                let profile_note = if profiles.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "\nCustom agent profiles defined in this repo (spawn with spawn_agent(profile: \"<name>\")): {}.",
+                        profiles
+                            .iter()
+                            .map(|p| format!("{} — {}", p.name, if p.description.is_empty() { &p.kind } else { &p.description }))
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    )
+                };
+                format!(
+                    "You are the orchestrator of loomux agent group {gid} for the repository {repo}.\n\
+                     First read your role instructions: {ins}\n\
+                     Guardrails (enforced by loomux): max {max} live agents, worker model {wm}, reviewer model {rm}.{profile_note}\n\
+                     Start by calling get_state, run `gh issue list --label agent-managed --state open`, call list_agents, \
+                     reconcile them, then give the human a short status summary and wait for direction.",
+                    gid = g.id, repo = g.repo, ins = instructions.display(),
+                    max = g.guardrails.max_agents, wm = g.guardrails.worker_model, rm = g.guardrails.reviewer_model,
+                )
+            }
             Role::Worker | Role::Reviewer => {
                 let head = format!(
                     "You are \"{name}\" ({id}), a {role} agent in loomux group {gid} for repository {repo}.\n\
@@ -1376,6 +1529,10 @@ impl OrchRegistry {
                     role = if a.role == Role::Worker { "worker" } else { "reviewer" },
                     gid = g.id, repo = g.repo, ins = instructions.display(), note = branch_note,
                 );
+                let head = match &branch_note_profile(self, a, g) {
+                    Some(brief) => format!("{head}\nYour persona/profile brief: {brief} (Claude agents also receive it as system prompt.)"),
+                    None => head,
+                };
                 if a.task.trim().is_empty() {
                     format!("{head}\nNo task is assigned yet. After reading the instructions, call report(\"progress\", \"ready\") and wait for prompts.")
                 } else {
@@ -1743,22 +1900,25 @@ fn register_orchestrator_pane(
     if group.guardrails.agent_cli == "copilot" {
         pre_trust_copilot_folder(&group.repo);
     }
-    let cfg = reg.write_mcp_config(&group.id, &agent_id, &token, &group.guardrails.agent_cli)?;
+    let cfg = reg.write_mcp_config(&group.id, &agent_id, &token, &group.guardrails.agent_cli, None)?;
     let resume = resume_session.is_some();
     let session_id = match resume_session {
         Some(s) => Some(sanitize_session(&s).ok_or("invalid resume session id")?),
         None => (group.guardrails.agent_cli == "claude").then(new_session_uuid),
     };
-    let command = reg.build_agent_command(
-        &group.guardrails.agent_cli,
-        &model,
-        group.guardrails.auto_ops,
-        &cfg,
-        &reg.group_dir(&group.id),
-        Path::new(&group.repo),
-        session_id.as_deref(),
+    let command = reg.build_agent_command(&AgentCommandSpec {
+        cli: &group.guardrails.agent_cli,
+        model: &model,
+        auto_ops: group.guardrails.auto_ops,
+        cfg: &cfg,
+        group_dir: &reg.group_dir(&group.id),
+        workdir: Path::new(&group.repo),
+        session: session_id.as_deref(),
         resume,
-    );
+        extra_allow: &[],
+        system_prompt_file: None,
+        copilot_agent: None,
+    });
     let entry = AgentEntry {
         id: agent_id.clone(),
         group: group.id.clone(),
@@ -1909,7 +2069,7 @@ pub fn resume_recorded_session(
     let (group_id, name) = (record.group_id.clone(), record.agent_name.clone());
     std::thread::spawn(move || {
         if let Err(e) =
-            reg2.spawn_agent_ex(&group_id, role, &name, "", false, None, Some(sid.clone()), cwd)
+            reg2.spawn_agent_ex(&group_id, role, &name, "", false, None, None, Some(sid.clone()), cwd)
         {
             reg2.audit(&group_id, "loomux", "error",
                 json!({ "what": "session rejoin failed", "session": sid, "err": e.clone() }));
