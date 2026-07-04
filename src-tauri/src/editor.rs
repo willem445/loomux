@@ -174,13 +174,27 @@ mod tests {
     #[test]
     fn resolve_finds_bare_command_via_pathext() {
         let tmp = tempfile::tempdir().unwrap();
-        // A fake editor discoverable only by appending an extension.
+        // A fake editor discoverable only by appending an extension. The
+        // extension casing matches the file so the lookup also succeeds on
+        // case-sensitive filesystems (CI runs this on Linux).
+        let exe = tmp.path().join("myeditor.exe");
+        fs::write(&exe, b"binary").unwrap();
+        let found =
+            resolve_program("myeditor", tmp.path().to_str().unwrap(), ".exe;.CMD").unwrap();
+        assert_eq!(found, exe);
+    }
+
+    /// PATHEXT entries are conventionally uppercase (".EXE") while files on
+    /// disk are lowercase; Windows' case-insensitive filesystem bridges the
+    /// two. That OS behavior only exists on Windows, so it is pinned here.
+    #[cfg(windows)]
+    #[test]
+    fn resolve_pathext_casing_is_insensitive_on_windows() {
+        let tmp = tempfile::tempdir().unwrap();
         let exe = tmp.path().join("myeditor.exe");
         fs::write(&exe, b"binary").unwrap();
         let found =
             resolve_program("myeditor", tmp.path().to_str().unwrap(), ".EXE;.CMD").unwrap();
-        // The resolved path may carry PATHEXT's casing (".EXE"); Windows'
-        // case-insensitive filesystem still opens it. Compare accordingly.
         assert!(
             found.to_string_lossy().eq_ignore_ascii_case(&exe.to_string_lossy()),
             "resolved {found:?}, expected {exe:?}"
