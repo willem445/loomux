@@ -373,6 +373,61 @@ fn sanitize_session(s: &str) -> Option<String> {
         .then(|| t.to_string())
 }
 
+/// Add a folder to copilot's `trustedFolders` config, returning the new
+/// file content — or None when nothing should be written (already trusted,
+/// or the existing config is unparseable and must not be clobbered). The
+/// file is JSONC-ish: leading `//` comment lines before a JSON object;
+/// comments and unknown fields are preserved.
+pub fn add_trusted_folder(config_text: &str, folder: &str) -> Option<String> {
+    let mut comment_len = 0;
+    for line in config_text.split_inclusive('\n') {
+        let t = line.trim();
+        if t.starts_with("//") || t.is_empty() {
+            comment_len += line.len();
+        } else {
+            break;
+        }
+    }
+    let (comments, body) = config_text.split_at(comment_len);
+    let mut v: Value = if body.trim().is_empty() {
+        json!({})
+    } else {
+        serde_json::from_str(body).ok()?
+    };
+    let arr = v
+        .as_object_mut()?
+        .entry("trustedFolders")
+        .or_insert_with(|| json!([]))
+        .as_array_mut()?;
+    let norm = |s: &str| s.replace('/', "\\").trim_end_matches('\\').to_lowercase();
+    if arr.iter().any(|e| e.as_str().is_some_and(|s| norm(s) == norm(folder))) {
+        return None;
+    }
+    arr.push(json!(folder));
+    Some(format!("{comments}{}\n", serde_json::to_string_pretty(&v).ok()?))
+}
+
+/// Pre-trust an agent's workspace in copilot's config so its pane doesn't
+/// boot into a folder-trust dialog — which eats the kickoff paste and gets
+/// blind-answered by the submit retries. Best-effort: on any failure the
+/// dialog simply appears as before.
+fn pre_trust_copilot_folder(folder: &str) {
+    let home = std::env::var("COPILOT_HOME")
+        .map(PathBuf::from)
+        .ok()
+        .or_else(|| dirs::home_dir().map(|h| h.join(".copilot")))
+        .unwrap_or_default();
+    if home.as_os_str().is_empty() {
+        return;
+    }
+    let path = home.join("config.json");
+    let text = fs::read_to_string(&path).unwrap_or_default();
+    if let Some(updated) = add_trusted_folder(&text, folder) {
+        let _ = fs::create_dir_all(&home);
+        let _ = fs::write(&path, updated);
+    }
+}
+
 /// Stable, filesystem-safe group id for a repo path, so relaunching an
 /// orchestrator on the same repo reattaches to the same state directory.
 pub(crate) fn group_id_for_repo(repo: &str) -> String {
@@ -1153,6 +1208,9 @@ impl OrchRegistry {
             ))
         };
 
+        if group.guardrails.agent_cli == "copilot" {
+            pre_trust_copilot_folder(&cwd);
+        }
         let cfg = self.write_mcp_config(group_id, &agent_id, &token, &group.guardrails.agent_cli)?;
         let command = self.build_agent_command(
             &group.guardrails.agent_cli,
@@ -1602,6 +1660,9 @@ fn register_orchestrator_pane(
     let model = group.guardrails.orchestrator_model.clone();
     let token = new_token();
     let agent_id = format!("orch-{}", reg.seq.fetch_add(1, Ordering::SeqCst) + 1);
+    if group.guardrails.agent_cli == "copilot" {
+        pre_trust_copilot_folder(&group.repo);
+    }
     let cfg = reg.write_mcp_config(&group.id, &agent_id, &token, &group.guardrails.agent_cli)?;
     let resume = resume_session.is_some();
     let session_id = match resume_session {

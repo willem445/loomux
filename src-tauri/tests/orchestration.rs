@@ -8,7 +8,8 @@
 
 use loomux_lib::orchestration::mcp::dispatch;
 use loomux_lib::orchestration::{
-    bracketed_paste, cli_ready, strip_ansi, Caller, Guardrails, OrchRegistry, Role, TaskPatch,
+    add_trusted_folder, bracketed_paste, cli_ready, strip_ansi, Caller, Guardrails, OrchRegistry,
+    Role, TaskPatch,
 };
 use serde_json::{json, Value};
 use std::fs;
@@ -389,6 +390,24 @@ fn task_tools_are_role_gated_but_listing_is_shared() {
     let text = listed["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("Fix parser") && text.contains("#7"),
         "workers must be able to read the board");
+}
+
+#[test]
+fn copilot_trust_config_edit_preserves_content_and_dedupes() {
+    let existing = "// User settings belong in settings.json.\n// This file is managed automatically.\n{\n  \"firstLaunchAt\": \"2026-07-04\",\n  \"trustedFolders\": [\n    \"C:\\\\Projects\\\\cattle-worker\"\n  ]\n}\n";
+    // New folder: appended, comments and existing fields intact.
+    let updated = add_trusted_folder(existing, r"C:\Projects\other").unwrap();
+    assert!(updated.starts_with("// User settings"), "comment header must survive");
+    assert!(updated.contains("firstLaunchAt"), "unknown fields must survive");
+    assert!(updated.contains(r"C:\\Projects\\cattle-worker") || updated.contains("cattle-worker"));
+    assert!(updated.contains("other"));
+    // Already trusted (case/separator variants): no rewrite at all.
+    assert!(add_trusted_folder(existing, r"c:/projects/cattle-worker").is_none());
+    // Empty/missing config: created from scratch.
+    let fresh = add_trusted_folder("", r"C:\Projects\x").unwrap();
+    assert!(fresh.contains("trustedFolders"));
+    // Corrupt config must NOT be clobbered.
+    assert!(add_trusted_folder("// c\n{ not json", r"C:\x").is_none());
 }
 
 // ---------- per-task sessions & resume ----------
