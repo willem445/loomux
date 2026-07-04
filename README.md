@@ -109,6 +109,36 @@ command; it's remembered after that.
 If nothing is configured, or the editor can't be found/launched, loomux shows a
 short toast explaining what went wrong.
 
+### Git view
+
+`Alt+G` (or the ⑂ icon in a pane header) overlays a git panel on the pane,
+scoped to the repository the shell is currently in — a commit graph, a diff
+preview, and the working-tree changes with staging and commit. It never
+resizes the terminal underneath. Press `Esc` (or ✕) to return.
+
+Toolbar (top-right of the graph):
+
+| Button | Does |
+| --- | --- |
+| ↓ | **Pull** the current branch — fast-forward only, so it never creates a surprise merge; a diverged branch reports the conflict instead. |
+| ↑ | **Push** the current branch. If it has no upstream yet, you're offered to publish it to the remote and set tracking. |
+| ↻ | **Fetch** from all remotes (with prune) and refresh the view. |
+
+Click the **branch name** in the header to switch branches — the menu lists
+every local branch plus remote-tracking branches (checking a remote one out
+creates a local tracking branch).
+
+**Right-click a commit** for its actions: checkout (detached), create a branch
+or tag here, cherry-pick / revert / merge / rebase onto the current branch, or
+copy the commit hash or subject. **Right-click a branch/tag chip** to check it
+out directly (double-click still works too).
+
+History-changing operations (cherry-pick, revert, merge, rebase) ask for
+confirmation first. If any of them hit a conflict, loomux aborts the operation
+and leaves your working tree exactly as it was, reporting the conflict — it
+never leaves you in a half-finished, conflicted state to untangle. Resolve
+those in a terminal.
+
 ## Agent orchestration
 
 Loomux natively supports an **orchestrator / worker** pattern: a long-lived

@@ -14,6 +14,17 @@ import {
   gitCommit,
   gitCheckout,
   gitDiscard,
+  gitFetch,
+  gitPush,
+  gitPull,
+  gitTag,
+  gitBranchCreate,
+  gitCherryPick,
+  gitRevert,
+  gitMerge,
+  gitRebase,
+  gitBranches,
+  type BranchInfo,
   type CommitInfo,
   type FileEntry,
   type GitStatus,
@@ -74,6 +85,92 @@ function el<K extends keyof HTMLElementTagNameMap>(
   return e;
 }
 
+interface MenuItem {
+  /** "-" renders a separator. */
+  label: string;
+  danger?: boolean;
+  disabled?: boolean;
+  onClick?: () => void;
+}
+
+let activeMenu: HTMLElement | null = null;
+
+function closeMenu(): void {
+  if (!activeMenu) return;
+  activeMenu.remove();
+  activeMenu = null;
+  window.removeEventListener("pointerdown", onMenuPointer, true);
+  window.removeEventListener("keydown", onMenuKey, true);
+  window.removeEventListener("resize", closeMenu);
+}
+
+function onMenuPointer(e: PointerEvent): void {
+  if (activeMenu && !activeMenu.contains(e.target as Node)) closeMenu();
+}
+
+function onMenuKey(e: KeyboardEvent): void {
+  if (e.key === "Escape") {
+    e.stopPropagation();
+    closeMenu();
+  }
+}
+
+/** Floating context menu at viewport coordinates (x, y). */
+function showMenu(x: number, y: number, items: MenuItem[]): void {
+  closeMenu();
+  const menu = el("div", "git-menu");
+  for (const it of items) {
+    if (it.label === "-") {
+      menu.appendChild(el("div", "git-menu-sep"));
+      continue;
+    }
+    const row = el("button", `git-menu-item${it.danger ? " danger" : ""}`, it.label);
+    (row as HTMLButtonElement).disabled = !!it.disabled;
+    if (!it.disabled && it.onClick) {
+      row.addEventListener("click", () => {
+        closeMenu();
+        it.onClick!();
+      });
+    }
+    menu.appendChild(row);
+  }
+  menu.style.visibility = "hidden";
+  document.body.appendChild(menu);
+  const r = menu.getBoundingClientRect();
+  menu.style.left = `${Math.max(4, Math.min(x, window.innerWidth - r.width - 6))}px`;
+  menu.style.top = `${Math.max(4, Math.min(y, window.innerHeight - r.height - 6))}px`;
+  menu.style.visibility = "visible";
+  activeMenu = menu;
+  // Defer so the opening click doesn't immediately dismiss it.
+  setTimeout(() => {
+    if (!activeMenu) return;
+    window.addEventListener("pointerdown", onMenuPointer, true);
+    window.addEventListener("keydown", onMenuKey, true);
+    window.addEventListener("resize", closeMenu);
+  }, 0);
+}
+
+/** Copy to clipboard, with a legacy fallback for locked-down webviews. */
+async function copyText(text: string): Promise<void> {
+  try {
+    await navigator.clipboard.writeText(text);
+    return;
+  } catch {
+    /* fall through */
+  }
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.style.position = "fixed";
+  ta.style.opacity = "0";
+  document.body.appendChild(ta);
+  ta.select();
+  try {
+    document.execCommand("copy");
+  } finally {
+    ta.remove();
+  }
+}
+
 export class GitView {
   readonly el: HTMLElement;
 
@@ -116,14 +213,27 @@ export class GitView {
     const graph = el("div", "git-graph");
     const head = el("div", "git-graph-head");
     this.headTitleEl = el("span", "git-head-title");
-    this.headBranchEl = el("span", "git-head-branch");
-    const refreshBtn = el("button", "pane-btn", "↻");
-    refreshBtn.title = "Refresh";
-    refreshBtn.addEventListener("click", () => void this.refresh());
+    this.headBranchEl = el("span", "git-head-branch clickable");
+    this.headBranchEl.title = "Switch branch";
+    this.headBranchEl.addEventListener("click", () => void this.openBranchMenu());
+
+    const pullBtn = el("button", "pane-btn", "↓") as HTMLButtonElement;
+    pullBtn.title = "Pull (fast-forward only)";
+    pullBtn.addEventListener("click", () =>
+      void this.runOp(pullBtn, () => gitPull(this.repoRoot!), "Pulled")
+    );
+    const pushBtn = el("button", "pane-btn", "↑") as HTMLButtonElement;
+    pushBtn.title = "Push current branch";
+    pushBtn.addEventListener("click", () => void this.push(pushBtn));
+    const fetchBtn = el("button", "pane-btn", "↻") as HTMLButtonElement;
+    fetchBtn.title = "Fetch from remotes & refresh";
+    fetchBtn.addEventListener("click", () =>
+      void this.runOp(fetchBtn, () => gitFetch(this.repoRoot!), "Fetched")
+    );
     const closeBtn = el("button", "pane-btn close", "✕");
     closeBtn.title = "Back to terminal (Esc)";
     closeBtn.addEventListener("click", () => this.host.onClose());
-    head.append(this.headTitleEl, this.headBranchEl, refreshBtn, closeBtn);
+    head.append(this.headTitleEl, this.headBranchEl, pullBtn, pushBtn, fetchBtn, closeBtn);
     this.graphListEl = el("div", "git-graph-list");
     graph.append(head, this.graphListEl);
 
@@ -156,6 +266,7 @@ export class GitView {
   }
 
   hide(): void {
+    closeMenu();
     this.el.hidden = true;
   }
 
@@ -175,6 +286,7 @@ export class GitView {
 
   dispose(): void {
     this.disposed = true;
+    closeMenu();
     clearTimeout(this.throttleTimer);
     clearTimeout(this.toastTimer);
     this.el.remove();
@@ -285,11 +397,267 @@ export class GitView {
     }
   }
 
-  private toast(message: string): void {
+  private toast(message: string, kind: "err" | "ok" = "err"): void {
     this.toastEl.textContent = message;
+    this.toastEl.className = `git-toast ${kind}`;
     this.toastEl.hidden = false;
     clearTimeout(this.toastTimer);
-    this.toastTimer = window.setTimeout(() => (this.toastEl.hidden = true), 6000);
+    this.toastTimer = window.setTimeout(
+      () => (this.toastEl.hidden = true),
+      kind === "ok" ? 2500 : 6000
+    );
+  }
+
+  private setBusy(btn: HTMLButtonElement, on: boolean): void {
+    btn.disabled = on;
+    btn.classList.toggle("busy", on);
+  }
+
+  /** Run a remote op with button feedback (spin + disable), a result toast,
+   *  and a refresh. */
+  private async runOp(
+    btn: HTMLButtonElement,
+    fn: () => Promise<void>,
+    okMsg: string
+  ): Promise<void> {
+    if (!this.repoRoot) return;
+    this.setBusy(btn, true);
+    try {
+      await fn();
+      this.toast(okMsg, "ok");
+    } catch (err) {
+      this.toast(String(err));
+    } finally {
+      this.setBusy(btn, false);
+      await this.refresh();
+      this.host.onRepoAction?.();
+    }
+  }
+
+  /** Push; if the branch has no upstream, offer to publish it. */
+  private async push(btn: HTMLButtonElement): Promise<void> {
+    if (!this.repoRoot) return;
+    this.setBusy(btn, true);
+    try {
+      try {
+        await gitPush(this.repoRoot, false);
+        this.toast("Pushed", "ok");
+      } catch (err) {
+        const msg = String(err);
+        if (!/upstream/i.test(msg)) {
+          this.toast(msg);
+          return;
+        }
+        this.setBusy(btn, false);
+        const ok = await this.confirm(
+          "Publish branch",
+          "This branch has no upstream yet. Publish it to the remote and set tracking?",
+          "Publish"
+        );
+        if (!ok) return;
+        this.setBusy(btn, true);
+        await gitPush(this.repoRoot, true);
+        this.toast("Published", "ok");
+      }
+    } catch (err) {
+      this.toast(String(err));
+    } finally {
+      this.setBusy(btn, false);
+      await this.refresh();
+      this.host.onRepoAction?.();
+    }
+  }
+
+  private async openBranchMenu(): Promise<void> {
+    if (!this.repoRoot) return;
+    let branches: BranchInfo[];
+    try {
+      branches = await gitBranches(this.repoRoot);
+    } catch (err) {
+      this.toast(String(err));
+      return;
+    }
+    const items: MenuItem[] = [];
+    const locals = branches.filter((b) => b.kind === "local");
+    const remotes = branches.filter((b) => b.kind === "remote");
+    if (locals.length === 0 && remotes.length === 0) {
+      items.push({ label: "No branches", disabled: true });
+    }
+    for (const b of locals) {
+      items.push({
+        label: `${b.current ? "● " : " "}${b.name}`,
+        disabled: b.current,
+        onClick: () => void this.checkout(b.name, false),
+      });
+    }
+    if (remotes.length > 0) {
+      items.push({ label: "-" });
+      for (const b of remotes) {
+        items.push({
+          label: b.name,
+          onClick: () => void this.checkout(b.name, true),
+        });
+      }
+    }
+    const r = this.headBranchEl.getBoundingClientRect();
+    showMenu(r.left, r.bottom + 3, items);
+  }
+
+  /** Right-click actions for a commit. */
+  private commitMenu(x: number, y: number, c: CommitInfo): void {
+    if (!this.repoRoot) return;
+    const short = c.hash.slice(0, 7);
+    const branch = this.status?.branch ?? "HEAD";
+    showMenu(x, y, [
+      {
+        label: `Checkout ${short} (detached)`,
+        onClick: () => void this.checkout(c.hash, false),
+      },
+      { label: "Create branch here…", onClick: () => void this.createBranch(c.hash) },
+      { label: "Create tag here…", onClick: () => void this.createTag(c.hash) },
+      { label: "-" },
+      {
+        label: `Cherry-pick onto ${branch}`,
+        onClick: () =>
+          void this.confirmOp(
+            "Cherry-pick",
+            `Apply commit ${short} onto ${branch}?`,
+            "Cherry-pick",
+            () => gitCherryPick(this.repoRoot!, c.hash)
+          ),
+      },
+      {
+        label: `Revert ${short}`,
+        danger: true,
+        onClick: () =>
+          void this.confirmOp(
+            "Revert commit",
+            `Create a commit on ${branch} that undoes ${short}?`,
+            "Revert",
+            () => gitRevert(this.repoRoot!, c.hash)
+          ),
+      },
+      {
+        label: `Merge ${short} into ${branch}`,
+        danger: true,
+        onClick: () =>
+          void this.confirmOp(
+            "Merge",
+            `Merge commit ${short} into ${branch}?`,
+            "Merge",
+            () => gitMerge(this.repoRoot!, c.hash)
+          ),
+      },
+      {
+        label: `Rebase ${branch} onto ${short}`,
+        danger: true,
+        onClick: () =>
+          void this.confirmOp(
+            "Rebase",
+            `Rebase ${branch} onto ${short}? This rewrites history on ${branch}.`,
+            "Rebase",
+            () => gitRebase(this.repoRoot!, c.hash)
+          ),
+      },
+      { label: "-" },
+      { label: "Copy commit hash", onClick: () => void copyText(c.hash) },
+      { label: "Copy subject", onClick: () => void copyText(c.subject) },
+    ]);
+  }
+
+  private async createBranch(hash: string): Promise<void> {
+    const name = await this.promptName("Create branch", "branch name");
+    if (!name) return;
+    await this.act(() => gitBranchCreate(this.repoRoot!, name, hash, true));
+  }
+
+  private async createTag(hash: string): Promise<void> {
+    const name = await this.promptName("Create tag", "tag name");
+    if (!name) return;
+    await this.act(() => gitTag(this.repoRoot!, name, hash));
+  }
+
+  private async confirmOp(
+    title: string,
+    detail: string,
+    label: string,
+    fn: () => Promise<void>
+  ): Promise<void> {
+    if (await this.confirm(title, detail, label)) await this.act(fn);
+  }
+
+  // ---------- modals ----------
+
+  /** A two-button confirm overlay scoped to the git view. Resolves true on OK. */
+  private confirm(title: string, detail: string, confirmLabel: string): Promise<boolean> {
+    return new Promise((resolve) => {
+      const backdrop = el("div", "git-modal-backdrop");
+      const box = el("div", "git-modal");
+      box.append(el("div", "git-modal-title", title), el("div", "git-modal-detail", detail));
+      const actions = el("div", "git-modal-actions");
+      const cancel = el("button", "git-modal-btn", "Cancel");
+      const ok = el("button", "git-modal-btn primary", confirmLabel);
+      actions.append(cancel, ok);
+      box.appendChild(actions);
+      backdrop.appendChild(box);
+      const onKey = (e: KeyboardEvent) => {
+        e.stopPropagation();
+        if (e.key === "Escape") done(false);
+        else if (e.key === "Enter") done(true);
+      };
+      const done = (v: boolean) => {
+        backdrop.remove();
+        window.removeEventListener("keydown", onKey, true);
+        resolve(v);
+      };
+      cancel.addEventListener("click", () => done(false));
+      ok.addEventListener("click", () => done(true));
+      backdrop.addEventListener("pointerdown", (e) => {
+        if (e.target === backdrop) done(false);
+      });
+      window.addEventListener("keydown", onKey, true);
+      this.el.appendChild(backdrop);
+      ok.focus();
+    });
+  }
+
+  /** A single-line text prompt overlay. Resolves the trimmed value, or null. */
+  private promptName(title: string, placeholder: string): Promise<string | null> {
+    return new Promise((resolve) => {
+      const backdrop = el("div", "git-modal-backdrop");
+      const box = el("div", "git-modal");
+      box.appendChild(el("div", "git-modal-title", title));
+      const input = document.createElement("input");
+      input.className = "git-modal-input";
+      input.placeholder = placeholder;
+      box.appendChild(input);
+      const actions = el("div", "git-modal-actions");
+      const cancel = el("button", "git-modal-btn", "Cancel");
+      const ok = el("button", "git-modal-btn primary", "OK");
+      actions.append(cancel, ok);
+      box.appendChild(actions);
+      backdrop.appendChild(box);
+      const done = (v: string | null) => {
+        backdrop.remove();
+        resolve(v);
+      };
+      const submit = () => {
+        const v = input.value.trim();
+        done(v.length > 0 ? v : null);
+      };
+      input.addEventListener("keydown", (e) => {
+        e.stopPropagation();
+        if (e.key === "Enter") submit();
+        else if (e.key === "Escape") done(null);
+      });
+      cancel.addEventListener("click", () => done(null));
+      ok.addEventListener("click", submit);
+      backdrop.addEventListener("pointerdown", (e) => {
+        if (e.target === backdrop) done(null);
+      });
+      this.el.appendChild(backdrop);
+      input.focus();
+    });
   }
 
   private renderHead(): void {
@@ -345,11 +713,19 @@ export class GitView {
         for (const r of c.refs) {
           if (r.kind === "head" && c.refs.some((o) => o.kind === "branch")) continue;
           const chip = el("span", `git-chip ${r.kind}`, r.name);
-          if (r.kind === "branch" || r.kind === "remote") {
-            chip.title = `Double-click to checkout ${r.name}`;
+          if (r.kind === "branch" || r.kind === "remote" || r.kind === "tag") {
+            const remote = r.kind === "remote";
+            chip.title = `Right-click for actions · double-click to checkout ${r.name}`;
             chip.addEventListener("dblclick", (e) => {
               e.stopPropagation();
-              void this.checkout(r.name, r.kind === "remote");
+              void this.checkout(r.name, remote);
+            });
+            chip.addEventListener("contextmenu", (e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              showMenu(e.clientX, e.clientY, [
+                { label: `Checkout ${r.name}`, onClick: () => void this.checkout(r.name, remote) },
+              ]);
             });
           }
           refs.appendChild(chip);
@@ -363,6 +739,11 @@ export class GitView {
       when.title = new Date(c.timestamp * 1000).toLocaleString();
       row.append(subject, when);
       row.addEventListener("click", () => this.select({ kind: "commit", hash: c.hash }));
+      row.addEventListener("contextmenu", (e) => {
+        e.preventDefault();
+        this.select({ kind: "commit", hash: c.hash });
+        this.commitMenu(e.clientX, e.clientY, c);
+      });
       this.graphListEl.appendChild(row);
     });
 
