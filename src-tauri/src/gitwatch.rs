@@ -93,14 +93,41 @@ impl GitWatcher {
 
     /// Recompute every watch's signature and return the pane ids whose repo
     /// metadata moved since the last poll, updating the stored signatures.
+    ///
+    /// The filesystem I/O runs *outside* the lock: we snapshot the watch set,
+    /// stat unlocked, then re-acquire only to compare and store. A hung stat
+    /// (an unplugged or unresponsive network drive) therefore stalls that one
+    /// poll but never blocks `git_watch`/`git_unwatch` or the other watches.
     pub fn poll_changed(&self) -> Vec<u32> {
+        // Snapshot (id, dirs) under the lock, then release it for the I/O.
+        let snapshot: Vec<(u32, PathBuf, PathBuf)> = {
+            let map = self.watches.lock().unwrap();
+            map.iter()
+                .map(|(id, w)| (*id, w.git_dir.clone(), w.common_dir.clone()))
+                .collect()
+        };
+
+        // Stat unlocked. Carry the git_dir so we can detect a repoint below.
+        let sigs: Vec<(u32, PathBuf, u64)> = snapshot
+            .into_iter()
+            .map(|(id, git_dir, common_dir)| {
+                let sig = repo_signature(&git_dir, &common_dir);
+                (id, git_dir, sig)
+            })
+            .collect();
+
+        // Re-acquire only to compare/store. Skip watches that were dropped or
+        // repointed to a different repo while we were stat-ing: an unregistered
+        // one is simply gone, and a repointed one already has a fresh baseline
+        // signature from `watch()`, so the stale sig we computed is discarded.
         let mut changed = Vec::new();
         let mut map = self.watches.lock().unwrap();
-        for (id, w) in map.iter_mut() {
-            let sig = repo_signature(&w.git_dir, &w.common_dir);
-            if sig != w.last_sig {
-                w.last_sig = sig;
-                changed.push(*id);
+        for (id, git_dir, sig) in sigs {
+            if let Some(w) = map.get_mut(&id) {
+                if w.git_dir == git_dir && sig != w.last_sig {
+                    w.last_sig = sig;
+                    changed.push(id);
+                }
             }
         }
         changed
@@ -359,10 +386,22 @@ mod tests {
         let s1 = repo_signature(&git, &git);
         assert_ne!(s0, s1, "index change must be detected");
 
-        // A commit moves the branch ref (loose ref content/length changes).
-        fs::write(git.join("refs").join("heads").join("main"), "b".repeat(41)).unwrap();
+        // A commit moves the branch ref to a new 40-char sha — the *same
+        // length* as before, so this can only be caught via the stat/mtime
+        // path (loose refs are stat-ed, not content-hashed). Pin a distinct
+        // mtime afterwards so the assertion holds even where a fast rewrite
+        // lands in the same filesystem clock tick.
+        let ref_path = git.join("refs").join("heads").join("main");
+        let t0 = fs::metadata(&ref_path).unwrap().modified().unwrap();
+        fs::write(&ref_path, "b".repeat(40)).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&ref_path)
+            .unwrap()
+            .set_modified(t0 - std::time::Duration::from_secs(86_400))
+            .unwrap();
         let s2 = repo_signature(&git, &git);
-        assert_ne!(s1, s2, "loose-ref change must be detected");
+        assert_ne!(s1, s2, "constant-length ref update must be caught via mtime");
 
         // Packing refs creates packed-refs where there was none.
         fs::write(git.join("packed-refs"), "# pack-refs with: peeled\n").unwrap();
