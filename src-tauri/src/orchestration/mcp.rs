@@ -393,6 +393,9 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                 return Err("you are the orchestrator".into());
             }
             let text = arg_str(args, "text").ok_or("text required")?;
+            // A message is a sign of life: reset the watchdog's silence clock
+            // (report already does this via set_agent_idle).
+            reg.note_agent_activity(&caller.agent_id);
             reg.deliver_to_orchestrator(
                 &caller.group,
                 &format!("[loomux] message from {}: {text}", caller.agent_id),

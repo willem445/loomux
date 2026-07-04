@@ -40,6 +40,10 @@ const MAX_SPAWNS_PER_HOUR: u32 = 240;
 const SPAWN_RATE_WINDOW_MS: u64 = 60 * 60 * 1000;
 /// How often the idle reaper wakes to look for workers to auto-kill.
 const IDLE_REAP_INTERVAL: Duration = Duration::from_secs(30);
+/// How often the watchdog wakes to look for stalled working agents.
+const WATCHDOG_INTERVAL: Duration = Duration::from_secs(30);
+/// Upper bound on the watchdog stall timeout (24h); 0 disables it.
+const MAX_WATCHDOG_STALL_MINUTES: u32 = 1440;
 /// How long the frontend gets to open a pane and report its pty id.
 const BIND_TIMEOUT: Duration = Duration::from_secs(20);
 /// Gap between the bracketed paste and the Enter that submits it.
@@ -163,6 +167,11 @@ pub struct Guardrails {
     /// Cost guardrail: cap on worker/reviewer spawns per rolling hour, a
     /// runaway-orchestrator backstop. 0 = unlimited. See `spawn_rate_exceeded`.
     pub max_spawns_per_hour: u32,
+    /// Recovery guardrail: nudge the orchestrator once when a working agent
+    /// produces no terminal output and sends no report for this many minutes
+    /// (likely stalled or waiting on input). 0 disables it. See
+    /// `watchdog_should_notify`.
+    pub watchdog_stall_minutes: u32,
 }
 
 impl Guardrails {
@@ -183,6 +192,7 @@ impl Guardrails {
         self.orchestrator_model = sanitize_model(&self.orchestrator_model, orch_fb);
         self.idle_kill_minutes = self.idle_kill_minutes.min(MAX_IDLE_KILL_MINUTES);
         self.max_spawns_per_hour = self.max_spawns_per_hour.min(MAX_SPAWNS_PER_HOUR);
+        self.watchdog_stall_minutes = self.watchdog_stall_minutes.min(MAX_WATCHDOG_STALL_MINUTES);
         self
     }
 }
@@ -208,6 +218,24 @@ pub fn spawn_rate_exceeded(times: &[u64], now: u64, limit: u32, window_ms: u64) 
     }
     let recent = times.iter().filter(|&&t| now.saturating_sub(t) < window_ms).count();
     recent as u32 >= limit
+}
+
+/// Whether a working agent has been silent (no terminal output, no report)
+/// long enough to warrant one watchdog nudge to the orchestrator. Pure so the
+/// stall arithmetic and the anti-nag rule are testable without threads or a
+/// real pty; the scan loop lives in `start_watchdog`. `threshold_min` 0
+/// disables the guardrail; `already_notified` enforces at-most-one-notice per
+/// stall (the caller clears it when the agent produces output/reports again).
+pub fn watchdog_should_notify(
+    silent_since_ms: u64,
+    now_ms: u64,
+    threshold_min: u32,
+    already_notified: bool,
+) -> bool {
+    if threshold_min == 0 || already_notified {
+        return false;
+    }
+    now_ms.saturating_sub(silent_since_ms) >= (threshold_min as u64) * 60_000
 }
 
 /// Distinct agent working directories to remove when a group is torn down
@@ -323,6 +351,18 @@ pub struct AgentEntry {
     /// Unix-ms this agent was registered (spawn time). Drives the per-agent
     /// and group uptime shown in the lifecycle summary; unaffected by idle.
     pub started_ms: u64,
+    /// Watchdog: Unix-ms of this agent's last observed activity — terminal
+    /// output growth or a report/message. Silence is measured from here.
+    /// Seeded at spawn and whenever work is (re)assigned. See
+    /// `watchdog_should_notify`.
+    pub last_progress_ms: u64,
+    /// Watchdog: last observed value of the pane's monotonic pty output
+    /// counter, so a tick can tell whether the CLI has emitted anything since
+    /// the previous one even when the output ring is saturated.
+    pub last_output_total: u64,
+    /// Watchdog anti-nag latch: set once a stall notice has been delivered for
+    /// the current stall, cleared when the agent produces output/reports again.
+    pub watchdog_notified: bool,
 }
 
 /// Work-item statuses shown on the task board. Kept as strings (not an
@@ -1316,6 +1356,7 @@ impl OrchRegistry {
                 auto_ops: g["auto_ops"].as_bool().unwrap_or(true),
                 idle_kill_minutes: g["idle_kill_minutes"].as_u64().unwrap_or(0) as u32,
                 max_spawns_per_hour: g["max_spawns_per_hour"].as_u64().unwrap_or(0) as u32,
+                watchdog_stall_minutes: g["watchdog_stall_minutes"].as_u64().unwrap_or(0) as u32,
             },
         ))
     }
@@ -1355,6 +1396,7 @@ impl OrchRegistry {
                     "auto_ops": info.guardrails.auto_ops,
                     "idle_kill_minutes": info.guardrails.idle_kill_minutes,
                     "max_spawns_per_hour": info.guardrails.max_spawns_per_hour,
+                    "watchdog_stall_minutes": info.guardrails.watchdog_stall_minutes,
                 },
             }))
             .unwrap(),
@@ -1429,6 +1471,12 @@ impl OrchRegistry {
                 return;
             }
             a.idle_since_ms = idle.then(now_ms);
+            if !idle {
+                // (Re)assigned work: restart the watchdog's silence clock and
+                // clear its anti-nag latch so the fresh stall gets a nudge.
+                a.last_progress_ms = now_ms();
+                a.watchdog_notified = false;
+            }
         }
     }
 
@@ -1487,6 +1535,124 @@ impl OrchRegistry {
             killed.push(id);
         }
         killed
+    }
+
+    // ---------- watchdog: stalled-agent detection ----------
+
+    /// Record that an agent just did something loomux can see (reported,
+    /// messaged the orchestrator): reset its watchdog silence clock and clear
+    /// the anti-nag latch so a *later* stall still earns a fresh nudge. No-op
+    /// for the orchestrator (never watchdogged). Output-driven activity is
+    /// handled separately in `watchdog_tick` via the pty counter.
+    pub fn note_agent_activity(&self, agent_id: &str) {
+        let mut agents = self.agents.lock().unwrap();
+        if let Some(a) = agents.get_mut(agent_id) {
+            if a.role == Role::Orchestrator {
+                return;
+            }
+            a.last_progress_ms = now_ms();
+            a.watchdog_notified = false;
+        }
+    }
+
+    /// Snapshot every agent's monotonic pty output counter. Needs the app's
+    /// `PtyManager`, so it yields an empty map without an app handle (unit
+    /// tests drive `watchdog_tick` with synthetic counters instead).
+    fn agent_output_totals(&self) -> HashMap<String, u64> {
+        let Some(app) = self.app.lock().unwrap().clone() else {
+            return HashMap::new();
+        };
+        let ptys = app.state::<crate::pty::PtyManager>();
+        self.agents
+            .lock()
+            .unwrap()
+            .values()
+            .filter_map(|a| Some((a.id.clone(), ptys.output_total(a.pty_id?)?)))
+            .collect()
+    }
+
+    /// One watchdog pass. For each *working* agent (running worker/reviewer
+    /// with a task assigned — idle clock clear), fold in the latest pty output
+    /// counter from `outputs`: any growth is activity that resets the silence
+    /// clock and the anti-nag latch. An agent silent (no output, no report)
+    /// past its group's `watchdog_stall_minutes` earns exactly one audited
+    /// `[loomux]` nudge to the orchestrator suggesting get_output + re-send.
+    /// Paused groups are skipped entirely — delivery is suppressed there
+    /// anyway, so we must not spend the one-notice budget while paused.
+    /// Returns the notified agent ids. Split from the pty read
+    /// (`agent_output_totals`) so the stall / anti-nag / pause logic is
+    /// testable with synthetic counters and no threads.
+    pub fn watchdog_tick(&self, now: u64, outputs: &HashMap<String, u64>) -> Vec<String> {
+        let thresholds: HashMap<String, u32> = self
+            .groups
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, g)| (id.clone(), g.guardrails.watchdog_stall_minutes))
+            .collect();
+        let paused = self.paused.lock().unwrap().clone();
+
+        // First pass under the agents lock: refresh counters and pick who to
+        // nudge. Delivery (which types into a pane and can block) happens after
+        // the lock is released.
+        let mut to_notify: Vec<(String, String, String, u32)> = Vec::new();
+        {
+            let mut agents = self.agents.lock().unwrap();
+            for a in agents.values_mut() {
+                // Only agents actively working: running, not the orchestrator,
+                // and currently assigned (idle_since_ms clear). This excludes
+                // idle, done/blocked, dead, and reaped agents by construction.
+                if a.role == Role::Orchestrator
+                    || a.status != AgentStatus::Running
+                    || a.idle_since_ms.is_some()
+                {
+                    continue;
+                }
+                // Output growth = activity: reset the clock and the latch, and
+                // this tick can't also flag the agent as stalled.
+                if let Some(&cur) = outputs.get(&a.id) {
+                    if cur > a.last_output_total {
+                        a.last_output_total = cur;
+                        a.last_progress_ms = now;
+                        a.watchdog_notified = false;
+                        continue;
+                    }
+                }
+                // A paused group's agents idle out on purpose; never nudge and
+                // never burn their one-notice budget while paused.
+                if paused.contains(&a.group) {
+                    continue;
+                }
+                let threshold = thresholds.get(&a.group).copied().unwrap_or(0);
+                if watchdog_should_notify(a.last_progress_ms, now, threshold, a.watchdog_notified) {
+                    a.watchdog_notified = true;
+                    let minutes = (now.saturating_sub(a.last_progress_ms) / 60_000) as u32;
+                    to_notify.push((a.id.clone(), a.group.clone(), a.name.clone(), minutes));
+                }
+            }
+        }
+
+        let mut notified = Vec::new();
+        for (id, group, name, minutes) in to_notify {
+            self.audit(&group, "loomux", "watchdog-stall",
+                json!({ "agent": id, "name": name, "silent_minutes": minutes }));
+            let _ = self.deliver_to_orchestrator(
+                &group,
+                &format!(
+                    "[loomux] watchdog: agent {name} ({id}) has produced no terminal output and sent no report for {minutes}+ min — it may be stalled or waiting on input. Inspect it with get_output(\"{id}\"); if its kickoff was lost or it is stuck, re-send the task with send_prompt. You will get this notice at most once per stall."
+                ),
+                "loomux",
+            );
+            notified.push(id);
+        }
+        notified
+    }
+
+    /// One full watchdog cycle: read pty counters, then tick. Called on a
+    /// timer by `start_watchdog`.
+    pub fn run_watchdog(&self, now: u64) -> Vec<String> {
+        let outputs = self.agent_output_totals();
+        self.watchdog_tick(now, &outputs)
     }
 
     /// Record a spawn against the group's rolling-hour window and report
@@ -1974,6 +2140,9 @@ impl OrchRegistry {
             // given work does not (the orchestrator is exempt regardless).
             idle_since_ms: (role != Role::Orchestrator && task.trim().is_empty()).then(now_ms),
             started_ms: now_ms(),
+            last_progress_ms: now_ms(),
+            last_output_total: 0,
+            watchdog_notified: false,
         };
         {
             // Re-check the cap under the same lock as the insert: the early
@@ -2398,6 +2567,18 @@ pub fn start_idle_reaper(reg: Arc<OrchRegistry>) {
     });
 }
 
+/// Background loop for the stalled-agent watchdog: every `WATCHDOG_INTERVAL`
+/// it nudges the orchestrator (once per stall) about any working agent that
+/// has gone silent — no terminal output, no report — past its group's
+/// `watchdog_stall_minutes`. Groups with the guardrail off and paused groups
+/// are skipped inside `run_watchdog`. Started once at app setup.
+pub fn start_watchdog(reg: Arc<OrchRegistry>) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(WATCHDOG_INTERVAL);
+        reg.run_watchdog(now_ms());
+    });
+}
+
 // ---------- tauri commands ----------
 
 /// Create (or reattach to) an orchestration group and register its
@@ -2417,6 +2598,7 @@ pub fn create_orchestration(
     auto_ops: bool,
     idle_kill_minutes: u32,
     max_spawns_per_hour: u32,
+    watchdog_stall_minutes: u32,
 ) -> Result<SpawnRequest, String> {
     create_orchestration_group(
         reg.inner(),
@@ -2430,6 +2612,7 @@ pub fn create_orchestration(
             auto_ops,
             idle_kill_minutes,
             max_spawns_per_hour,
+            watchdog_stall_minutes,
         },
         None,
         None,
@@ -2570,6 +2753,9 @@ fn register_orchestrator_pane(
         cwd: group.repo.clone(),
         idle_since_ms: None, // the orchestrator is never idle-reaped
         started_ms: now_ms(),
+        last_progress_ms: now_ms(), // unused: the orchestrator is never watchdogged
+        last_output_total: 0,
+        watchdog_notified: false,
     };
     reg.agents.lock().unwrap().insert(agent_id.clone(), entry.clone());
     reg.by_token.lock().unwrap().insert(token, agent_id.clone());

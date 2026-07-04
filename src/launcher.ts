@@ -190,6 +190,7 @@ export class AgentLauncher {
   private maxAgentsInput: HTMLInputElement;
   private idleKillInput: HTMLInputElement;
   private spawnRateInput: HTMLInputElement;
+  private watchdogInput: HTMLInputElement;
   private workerModel: ModelPicker;
   private reviewerModel: ModelPicker;
   private orchModel: ModelPicker;
@@ -289,6 +290,10 @@ export class AgentLauncher {
     // spawns-per-hour backstop against a runaway orchestrator.
     this.idleKillInput = numberInput(0, 0, 1440);
     this.spawnRateInput = numberInput(0, 0, 240);
+    // Recovery guardrail: nudge the orchestrator once when a working agent
+    // goes silent (no output, no report) for this long. Default on — it's a
+    // non-destructive safety net, not a cost driver.
+    this.watchdogInput = numberInput(10, 0, 1440);
     this.workerModel = new ModelPicker();
     this.reviewerModel = new ModelPicker();
     this.orchModel = new ModelPicker();
@@ -313,7 +318,8 @@ export class AgentLauncher {
     guardRow3.className = "dlg-row";
     guardRow3.append(
       field("Idle-kill (min, 0=off)", this.idleKillInput),
-      field("Max spawns/hour (0=∞)", this.spawnRateInput)
+      field("Max spawns/hour (0=∞)", this.spawnRateInput),
+      field("Watchdog stall (min, 0=off)", this.watchdogInput)
     );
     this.orchFields = document.createElement("div");
     this.orchFields.className = "dlg-field";
@@ -549,6 +555,7 @@ export class AgentLauncher {
           orchestratorModel: this.orchModel.value || cli.defaults.orchestrator,
           autoOps: this.permsSel.value === "auto",
           idleKillMinutes: intVal(this.idleKillInput, 0),
+          watchdogStallMinutes: intVal(this.watchdogInput, 10),
           maxSpawnsPerHour: intVal(this.spawnRateInput, 0),
         },
       });

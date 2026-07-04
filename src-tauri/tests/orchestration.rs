@@ -10,10 +10,11 @@ use loomux_lib::orchestration::mcp::dispatch;
 use loomux_lib::orchestration::{
     add_trusted_folder, bracketed_paste, cli_ready, create_orchestration_group, idle_should_kill,
     normalize_remote_web_base, parse_audit_lines, parse_session_cost, resolve_ref_url,
-    rotate_audit_if_needed, spawn_rate_exceeded, strip_ansi, worktree_cleanup_targets, Caller,
-    Guardrails, OrchRegistry, Role, TaskPatch,
+    rotate_audit_if_needed, spawn_rate_exceeded, strip_ansi, watchdog_should_notify,
+    worktree_cleanup_targets, Caller, Guardrails, OrchRegistry, Role, TaskPatch,
 };
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::time::Duration;
@@ -43,6 +44,7 @@ fn rails() -> Guardrails {
         auto_ops: false,
         idle_kill_minutes: 0,
         max_spawns_per_hour: 0,
+        watchdog_stall_minutes: 0,
     }
 }
 
@@ -80,11 +82,13 @@ fn guardrail_clamps_and_sanitizes() {
         auto_ops: true,
         idle_kill_minutes: 99999,
         max_spawns_per_hour: 9999,
+        watchdog_stall_minutes: 99999,
     }
     .clamped();
     assert_eq!(g.max_agents, 12, "cap must clamp to the hard ceiling");
     assert_eq!(g.idle_kill_minutes, 1440, "idle-kill timeout clamps to 24h");
     assert_eq!(g.max_spawns_per_hour, 240, "spawn-rate cap clamps to the ceiling");
+    assert_eq!(g.watchdog_stall_minutes, 1440, "watchdog stall timeout clamps to 24h");
     assert_eq!(g.agent_cli, "claude", "unknown CLIs fall back to claude explicitly");
     assert_eq!(g.worker_model, "sonnetrm-rf", "shell metacharacters must be stripped");
     assert_eq!(g.reviewer_model, "sonnet", "empty model falls back to default");
@@ -98,6 +102,7 @@ fn guardrail_clamps_and_sanitizes() {
         auto_ops: false,
         idle_kill_minutes: 0,
         max_spawns_per_hour: 0,
+        watchdog_stall_minutes: 0,
     }
     .clamped();
     assert_eq!(g.worker_model, "auto");
@@ -1125,7 +1130,14 @@ fn costed_rails(idle_kill_minutes: u32, max_spawns_per_hour: u32) -> Guardrails 
         auto_ops: false,
         idle_kill_minutes,
         max_spawns_per_hour,
+        watchdog_stall_minutes: 0,
     }
+}
+
+/// Guardrails with a watchdog stall window set (other fields mirror
+/// `costed_rails`); a roomy agent cap so several workers can be watched.
+fn watchdog_rails(watchdog_stall_minutes: u32) -> Guardrails {
+    Guardrails { watchdog_stall_minutes, ..costed_rails(0, 0) }
 }
 
 #[test]
@@ -1315,6 +1327,122 @@ fn report_completion_reidles_worker_and_send_prompt_reactivates() {
     assert!(idle_of(&cw.agent_id).is_null(), "send_prompt must re-activate an idle worker");
 }
 
+// ---------- watchdog: stalled-agent detection (#10) ----------
+
+/// A time far past any real `now_ms()` (year ~33658), so a `watchdog_tick` at
+/// this instant is unambiguously past the stall window for an agent whose
+/// clock was stamped at spawn/report with the real wall clock.
+const FAR: u64 = 1_000_000_000_000_000;
+
+/// Group with an orchestrator and one working (tasked) worker under a watchdog
+/// with the given stall window (minutes). Returns (reg, tempdir, group, worker).
+fn watchdog_setup(stall_min: u32) -> (OrchRegistry, tempfile::TempDir, String, String) {
+    let (reg, dir) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", watchdog_rails(stall_min)).unwrap();
+    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "do work", false, None).unwrap();
+    (reg, dir, g.id, w.id)
+}
+
+#[test]
+fn watchdog_should_notify_respects_threshold_anti_nag_and_disable() {
+    let min = 60_000u64;
+    // A 0 window disables the guardrail entirely.
+    assert!(!watchdog_should_notify(0, 100 * min, 0, false));
+    // Inside the window: not yet.
+    assert!(!watchdog_should_notify(0, 4 * min, 5, false));
+    // At and past the window: notify.
+    assert!(watchdog_should_notify(0, 5 * min, 5, false), "exactly at the window notifies");
+    assert!(watchdog_should_notify(0, 10 * min, 5, false));
+    // Past the window but already notified: the anti-nag latch suppresses it.
+    assert!(!watchdog_should_notify(0, 10 * min, 5, true), "one notice per stall");
+}
+
+#[test]
+fn watchdog_flags_a_silent_worker_once_per_stall() {
+    let (reg, _d, gid, wid) = watchdog_setup(5);
+    let no_output = HashMap::new();
+    // Long past the stall window with no output and no report → one notice.
+    assert_eq!(reg.watchdog_tick(FAR, &no_output), vec![wid.clone()],
+        "a silent working agent must be flagged");
+    let log = fs::read_to_string(reg.state_root().join(&gid).join("audit.jsonl")).unwrap();
+    assert!(log.contains("watchdog-stall"), "the stall must be audited, got: {log}");
+    // Anti-nag: still silent, but already notified for this same stall.
+    assert!(reg.watchdog_tick(FAR + 60_000, &no_output).is_empty(),
+        "must not nag twice for one uninterrupted stall");
+}
+
+#[test]
+fn watchdog_stall_resets_when_the_agent_produces_output() {
+    let (reg, _d, _gid, wid) = watchdog_setup(5);
+    let empty = HashMap::new();
+    assert_eq!(reg.watchdog_tick(FAR, &empty), vec![wid.clone()]);
+    // The CLI emits output: a grown pty counter is activity — clock and latch
+    // both reset, and this very tick must not also flag a stall.
+    let grew: HashMap<String, u64> = [(wid.clone(), 1024u64)].into_iter().collect();
+    assert!(reg.watchdog_tick(FAR, &grew).is_empty(), "output growth is activity, not a stall");
+    // No further growth; a whole fresh window elapses → a brand-new notice.
+    let later = FAR + 5 * 60_000 + 1;
+    assert_eq!(reg.watchdog_tick(later, &grew), vec![wid.clone()],
+        "a new stall after activity earns a new notice");
+}
+
+#[test]
+fn watchdog_ignores_idle_dead_and_disabled_agents() {
+    // A 0 stall window disables the watchdog for the whole group.
+    let (off, _d0, _g0, _w0) = watchdog_setup(0);
+    assert!(off.watchdog_tick(FAR, &HashMap::new()).is_empty(),
+        "stall window 0 disables the watchdog");
+    // With the guardrail on, idle and dead agents are still out of scope: idle
+    // is the reaper's concern, and a dead/reaped pane must never be nudged.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo2", watchdog_rails(5)).unwrap();
+    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    reg.spawn_agent(&g.id, Role::Worker, "idle", "", false, None).unwrap();
+    let dead = reg.spawn_agent(&g.id, Role::Worker, "dead", "work", false, None).unwrap();
+    reg.mark_dead(&dead.id, Some(1));
+    let flagged = reg.watchdog_tick(FAR, &HashMap::new());
+    assert!(flagged.is_empty(),
+        "neither an idle nor a dead agent may be watchdog-flagged, got: {flagged:?}");
+}
+
+#[test]
+fn watchdog_stays_quiet_for_a_paused_group() {
+    let (reg, _d, gid, wid) = watchdog_setup(5);
+    reg.pause_group(&gid).unwrap();
+    assert!(reg.watchdog_tick(FAR, &HashMap::new()).is_empty(),
+        "a paused group's agents idle out on purpose — no watchdog notices");
+    // Crucially, the one-notice budget must be intact: pausing must not have
+    // burned the latch, so on resume the outstanding stall still earns its
+    // first notice.
+    reg.resume_group(&gid).unwrap();
+    assert_eq!(reg.watchdog_tick(FAR, &HashMap::new()), vec![wid.clone()],
+        "resuming an unattended stall must still earn its first notice");
+}
+
+#[test]
+fn watchdog_stall_resets_when_the_agent_reports_or_messages() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", watchdog_rails(5)).unwrap();
+    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "work", false, None).unwrap();
+    let cw = reg.resolve_token(&w.token).unwrap();
+    // Stalled and flagged (anti-nag latch now set).
+    assert_eq!(reg.watchdog_tick(FAR, &HashMap::new()), vec![w.id.clone()]);
+    // A progress report is a sign of life: it clears the latch (via re-idle
+    // bookkeeping), so a later silence re-notifies. If the latch had NOT been
+    // cleared this tick would be empty — that's the discriminator.
+    let _ = dispatch(&reg, &cw, "tools/call",
+        &json!({ "name": "report", "arguments": { "status": "progress", "summary": "still going" } }));
+    assert_eq!(reg.watchdog_tick(FAR + 60_000, &HashMap::new()), vec![w.id.clone()],
+        "a report must reset the stall, then a later silence re-notifies");
+    // A free-form message likewise counts as activity and clears the latch.
+    let _ = dispatch(&reg, &cw, "tools/call",
+        &json!({ "name": "message_orchestrator", "arguments": { "text": "checking in" } }));
+    assert_eq!(reg.watchdog_tick(FAR + 120_000, &HashMap::new()), vec![w.id.clone()],
+        "a message must also reset the stall, then a later silence re-notifies");
+}
+
 #[test]
 fn group_usage_summarizes_agents_with_null_cost_without_panes() {
     let (reg, _d, _co, _cw) = setup_mcp();
@@ -1338,13 +1466,16 @@ fn group_usage_summarizes_agents_with_null_cost_without_panes() {
 #[test]
 fn group_json_records_cost_guardrails() {
     let (reg, _d) = test_registry();
-    let g = reg.create_group("C:/tmp/repo", costed_rails(15, 30)).unwrap();
+    let mut rails = costed_rails(15, 30);
+    rails.watchdog_stall_minutes = 12;
+    let g = reg.create_group("C:/tmp/repo", rails).unwrap();
     let gj: Value = serde_json::from_str(
         &fs::read_to_string(reg.state_root().join(&g.id).join("group.json")).unwrap(),
     )
     .unwrap();
     assert_eq!(gj["guardrails"]["idle_kill_minutes"], 15);
     assert_eq!(gj["guardrails"]["max_spawns_per_hour"], 30);
+    assert_eq!(gj["guardrails"]["watchdog_stall_minutes"], 12);
 }
 
 // ---------- group lifecycle: summary & end-orchestration (#8) ----------
