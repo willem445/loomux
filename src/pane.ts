@@ -23,6 +23,8 @@ import {
   ptyBackendInfo,
 } from "./pty";
 import { invoke } from "@tauri-apps/api/core";
+import { parseOsc52, writeClipboard } from "./clipboard";
+import { createOrderedWriter } from "./ptywrite";
 import { isAppShortcut } from "./shortcuts";
 import { attentionPresentation } from "./attention";
 import { openInEditor, editorConfigDialog } from "./editor";
@@ -198,8 +200,11 @@ export class Pane {
   private fit = new FitAddon();
   private resizeObs: ResizeObserver;
   private disposed = false;
-  /** Keystrokes typed before the PTY is ready; flushed once it is. */
-  private inputQueue: string[] = [];
+  /** Ordered input pipe to the PTY: serializes every keystroke/paste so the
+   *  async IPC writes can't reorder (a bracketed-paste terminator overtaking
+   *  its body wedges the target app — #65). Buffers input produced before the
+   *  PTY exists and flushes it in order once ready. */
+  private writer = createOrderedWriter();
 
   constructor(private events: PaneEvents) {
     this.el = document.createElement("div");
@@ -376,6 +381,17 @@ export class Pane {
       return true;
     });
 
+    // Clipboard integration: a CLI (e.g. claude code) copies by emitting
+    // OSC 52. xterm.js doesn't implement it, so without this handler the
+    // sequence is dropped — the CLI says "copied" but the system clipboard
+    // stays empty (#65). Decode the base64 payload and write it out; ignore
+    // read requests (`?`) so we never leak the clipboard back to the process.
+    this.term.parser.registerOscHandler(52, (payload) => {
+      const text = parseOsc52(payload);
+      if (text !== null) void writeClipboard(text);
+      return true;
+    });
+
     // Let app-level shortcuts pass through xterm untouched; handle
     // clipboard combos here (Windows Terminal conventions).
     this.term.attachCustomKeyEventHandler((e) => {
@@ -383,7 +399,7 @@ export class Pane {
       if (isAppShortcut(e)) return false;
       if (e.ctrlKey && e.shiftKey && e.code === "KeyC") {
         const sel = this.term.getSelection();
-        if (sel) navigator.clipboard.writeText(sel).catch(() => {});
+        if (sel) void writeClipboard(sel);
         return false;
       }
       if (e.ctrlKey && e.shiftKey && e.code === "KeyV") {
@@ -459,12 +475,10 @@ export class Pane {
     this.tryWebgl();
     this.fit.fit();
 
-    // Everything is wired before the process exists: input queues until
-    // the PTY is ready, and the output router buffers until we attach.
-    this.term.onData((data) => {
-      if (this.ptyId !== null) writePty(this.ptyId, data).catch(() => {});
-      else this.inputQueue.push(data);
-    });
+    // Everything is wired before the process exists: input queues in the
+    // ordered writer until the PTY is ready, and the output router buffers
+    // until we attach.
+    this.term.onData((data) => this.writer.write(data));
     this.resizeObs.observe(this.termEl);
     this.focus();
 
@@ -490,9 +504,9 @@ export class Pane {
         this.watchedPath = this.cwdRaw;
         setGitWatch(ptyId, this.cwdRaw);
       }
-      for (const data of this.inputQueue.splice(0)) {
-        writePty(ptyId, data).catch(() => {});
-      }
+      // Bind the ordered writer to this PTY and flush anything typed/pasted
+      // while it was starting, in arrival order.
+      this.writer.ready((data) => writePty(ptyId, data));
     } catch (err) {
       // Never leave a dead black pane: surface the failure in-terminal.
       this.term.writeln(`\x1b[91mloomux: failed to start shell\x1b[0m`);
