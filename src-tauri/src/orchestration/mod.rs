@@ -73,6 +73,18 @@ const SUBMIT_MAX_WAIT: Duration = Duration::from_secs(45);
 /// Spaced blind Enter retries after the first (no-ops once submitted).
 const SUBMIT_RETRY_DELAYS: [Duration; 2] = [Duration::from_millis(2500), Duration::from_millis(4500)];
 
+// Human-typing backstop (#43, option A): even with the loomux compose strip,
+// a human can still type directly into the terminal. Before the paste AND
+// before the first Enter, hold delivery while the pane has seen recent
+// keystrokes so a report can't land in — or submit — the human's half-typed
+// line. Capped so a long compose session can't starve reports forever.
+/// Treat the human as "still typing" if they hit a key within this window.
+const USER_QUIET_HOLD: Duration = Duration::from_secs(4);
+/// Deliver anyway once a single hold has waited this long (never starve).
+const USER_QUIET_MAX_HOLD: Duration = Duration::from_secs(90);
+/// Poll interval while holding for the human to go quiet.
+const USER_QUIET_POLL: Duration = Duration::from_millis(250);
+
 // Kickoff readiness: a fixed boot delay loses the race on a loaded machine
 // (a CLI that boots slower than the delay flushes the pasted prompt along
 // with its startup stdin buffer — observed live with a reviewer spawned
@@ -700,6 +712,52 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Should prompt delivery keep holding for the human to stop typing? (#43,
+/// option A). Returns true to keep waiting, false to proceed. Pure so the
+/// hold/deadline decision is unit-testable without a live PTY.
+///
+/// - `last_input_ms` is the pane's last-keystroke time (0 = none recorded).
+/// - `held` is how long THIS hold has already waited; once it reaches
+///   `max_hold` we deliver anyway so a long compose session can't starve the
+///   report queue.
+fn should_hold_for_user(
+    last_input_ms: u64,
+    now_ms: u64,
+    held: Duration,
+    quiet_window: Duration,
+    max_hold: Duration,
+) -> bool {
+    if held >= max_hold {
+        return false; // cap reached — deliver anyway
+    }
+    if last_input_ms == 0 {
+        return false; // nobody has typed in this pane
+    }
+    let since = now_ms.saturating_sub(last_input_ms);
+    since < quiet_window.as_millis() as u64
+}
+
+/// Block the delivery thread while the human is actively typing in `pty_id`,
+/// polling until they've been quiet for `USER_QUIET_HOLD` or the hold hits
+/// `USER_QUIET_MAX_HOLD`. Returns `Some(held_ms)` when it actually waited
+/// (so the caller can audit the held duration), `None` when the pane was
+/// already quiet.
+fn wait_for_user_quiet(ptys: &crate::pty::PtyManager, pty_id: u32) -> Option<u64> {
+    let start = std::time::Instant::now();
+    let mut held = false;
+    while should_hold_for_user(
+        ptys.last_user_input_ms(pty_id).unwrap_or(0),
+        now_ms(),
+        start.elapsed(),
+        USER_QUIET_HOLD,
+        USER_QUIET_MAX_HOLD,
+    ) {
+        held = true;
+        std::thread::sleep(USER_QUIET_POLL);
+    }
+    held.then(|| start.elapsed().as_millis() as u64)
 }
 
 /// 128-bit hex token from std's OS-seeded `RandomState` (each instance draws
@@ -3156,6 +3214,17 @@ impl OrchRegistry {
                 }
             }
 
+            // Human-typing backstop (#43, option A): if a human is typing
+            // directly in this pane, hold the paste until they go quiet so a
+            // report can't land inside their half-typed line. Capped so a long
+            // compose session can't starve the queue.
+            if let Some(held_ms) = wait_for_user_quiet(&ptys, pty_id) {
+                append_audit(&root, &group, "loomux", "delivery-held-for-user", json!({
+                    "to": agent, "stage": "pre-paste", "held_ms": held_ms,
+                    "capped": held_ms >= USER_QUIET_MAX_HOLD.as_millis() as u64,
+                }));
+            }
+
             // Echo-verified typing: paste, then require the TUI to emit
             // output (its input box redrawing). No echo means the CLI
             // flushed the paste with its startup stdin buffer — retype.
@@ -3220,6 +3289,15 @@ impl OrchRegistry {
                         return;
                     }
                 }
+            }
+            // Re-check right before the first Enter: the human may have
+            // started typing during the quiet-wait above, and a blind Enter
+            // would submit their line. Hold again until they're quiet (#43).
+            if let Some(held_ms) = wait_for_user_quiet(&ptys, pty_id) {
+                append_audit(&root, &group, "loomux", "delivery-held-for-user", json!({
+                    "to": agent, "stage": "pre-enter", "held_ms": held_ms,
+                    "capped": held_ms >= USER_QUIET_MAX_HOLD.as_millis() as u64,
+                }));
             }
             let submit_sent_ms = now_ms();
             let _ = ptys.write_bytes(pty_id, b"\r");
@@ -4006,6 +4084,22 @@ pub fn orch_audit(reg: tauri::State<Arc<OrchRegistry>>, group_id: String) -> Vec
     reg.audit_log(&group_id)
 }
 
+/// Human steering from the loomux compose strip (#43, option C): enqueue
+/// `text` to the group's orchestrator through the SAME per-pane serialized
+/// delivery path worker reports use, so loomux is the single writer to the
+/// pane's stdin and messages land whole, in arrival order.
+#[tauri::command]
+pub fn orch_steer(
+    reg: tauri::State<Arc<OrchRegistry>>,
+    group_id: String,
+    text: String,
+) -> Result<(), String> {
+    if text.trim().is_empty() {
+        return Err("empty steering message".into());
+    }
+    reg.deliver_to_orchestrator(&group_id, &text, "human")
+}
+
 #[tauri::command]
 pub fn orch_upsert_task(
     reg: tauri::State<Arc<OrchRegistry>>,
@@ -4095,4 +4189,52 @@ pub fn orch_request_changes(
     findings: String,
 ) -> Result<Task, String> {
     reg.request_changes(&group_id, &id, &findings)
+}
+
+#[cfg(test)]
+mod hold_tests {
+    use super::*;
+
+    const WINDOW: Duration = Duration::from_secs(4);
+    const CAP: Duration = Duration::from_secs(90);
+
+    #[test]
+    fn holds_while_human_typed_recently() {
+        // Typed 1s ago (< 4s window), well under the cap: keep holding.
+        assert!(should_hold_for_user(9_000, 10_000, Duration::from_secs(5), WINDOW, CAP));
+    }
+
+    #[test]
+    fn proceeds_once_human_is_quiet() {
+        // Last keystroke was 5s ago (> 4s window): deliver.
+        assert!(!should_hold_for_user(5_000, 10_000, Duration::from_secs(2), WINDOW, CAP));
+    }
+
+    #[test]
+    fn proceeds_when_nobody_typed() {
+        // 0 == no keystroke ever recorded for this pane.
+        assert!(!should_hold_for_user(0, 10_000, Duration::ZERO, WINDOW, CAP));
+    }
+
+    #[test]
+    fn cap_forces_delivery_even_if_still_typing() {
+        // Human is still typing (0ms ago) but the hold hit the 90s cap:
+        // deliver anyway so reports aren't starved forever.
+        assert!(!should_hold_for_user(10_000, 10_000, CAP, WINDOW, CAP));
+        // One tick over the cap also delivers.
+        assert!(!should_hold_for_user(10_000, 10_000, CAP + Duration::from_millis(1), WINDOW, CAP));
+    }
+
+    #[test]
+    fn boundary_at_exactly_the_window_proceeds() {
+        // `since == window` is not "< window", so it proceeds (quiet enough).
+        assert!(!should_hold_for_user(6_000, 10_000, Duration::from_secs(1), WINDOW, CAP));
+    }
+
+    #[test]
+    fn future_timestamp_does_not_underflow() {
+        // A clock skew where last_input is "after" now must not panic or wrap;
+        // saturating_sub yields 0 → within window → hold.
+        assert!(should_hold_for_user(11_000, 10_000, Duration::from_secs(1), WINDOW, CAP));
+    }
 }

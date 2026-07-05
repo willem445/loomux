@@ -346,6 +346,20 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 }
 .pane-term .xterm { height: 100%; padding: 6px 2px 4px 10px; }
 
+/* ---------- orchestrator steering strip (#43, option C) ---------- */
+/* Docked under the ORCHESTRATOR pane's terminal. Styled like the task board's
+   "Add a task" field; the group accent on the top edge ties it to the pane.
+   A fixed chrome element (present from pane start), so the terminal fits to
+   the reduced height once — no toggling, no resize repaint into scrollback. */
+.orch-compose {
+  display: flex; gap: 6px; flex: none;
+  padding: 6px 8px;
+  border-top: 1px solid var(--group-color, var(--border-soft));
+  background: linear-gradient(180deg, #121219, #0e0e14);
+}
+.orch-compose-input { flex: 1; min-width: 0; font-size: 12px; }
+.orch-compose-send { flex: none; }
+
 .xterm-viewport::-webkit-scrollbar { width: 10px; }
 .xterm-viewport::-webkit-scrollbar-track { background: transparent; }
 .xterm-viewport::-webkit-scrollbar-thumb {
