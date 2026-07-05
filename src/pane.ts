@@ -977,7 +977,10 @@ export class Pane {
     input.spellcheck = false;
     input.autocomplete = "off";
     input.addEventListener("keydown", (e) => {
-      // Stop app shortcuts / the terminal from also acting on these keys.
+      // Keep this keydown from bubbling to pane/ancestor handlers. (App
+      // shortcuts are dispatched capture-phase on `document` and still fire
+      // while the strip is focused — but Enter/Esc/plain typing aren't app
+      // shortcuts, so the strip handles them normally regardless.)
       e.stopPropagation();
       // Ignore Enter/Escape while an IME composition is active (e.g. picking a
       // candidate) — `isComposing`/keyCode 229 mean the key belongs to the IME,
@@ -1000,9 +1003,11 @@ export class Pane {
     });
     row.append(input, send);
 
+    // Fixed-height slot (see .orch-compose-status): always in layout, so
+    // showing/hiding a rejected-send message never changes the strip's height
+    // and never resizes .pane-term / the PTY.
     const status = document.createElement("div");
     status.className = "orch-compose-status";
-    status.hidden = true;
 
     strip.append(row, status);
     this.composeInput = input;
@@ -1023,9 +1028,10 @@ export class Pane {
     const status = this.composeStatus;
     if (!status) return;
     status.textContent = msg;
-    status.hidden = false;
+    status.title = msg; // full text if the one-line slot ellipsises it
+    status.classList.add("show");
     clearTimeout(this.composeStatusTimer);
-    this.composeStatusTimer = window.setTimeout(() => (status.hidden = true), 6000);
+    this.composeStatusTimer = window.setTimeout(() => status.classList.remove("show"), 6000);
   }
 
   /** Enqueue the strip's text to the orchestrator through loomux's serialized
@@ -1040,7 +1046,7 @@ export class Pane {
     const text = input.value.trim();
     if (!text) return;
     input.value = "";
-    if (this.composeStatus) this.composeStatus.hidden = true;
+    this.composeStatus?.classList.remove("show");
     try {
       await invoke("orch_steer", { groupId: this.orchGroup, text });
     } catch (err) {

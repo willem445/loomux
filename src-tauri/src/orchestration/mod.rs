@@ -4121,9 +4121,10 @@ pub fn orch_audit(reg: tauri::State<Arc<OrchRegistry>>, group_id: String) -> Vec
 /// Human steering from the loomux compose strip (#43, option C): enqueue
 /// `text` to the group's orchestrator through the SAME per-pane serialized
 /// delivery path worker reports use, so loomux is the single writer to the
-/// pane's stdin and messages land whole, in arrival order. Empty text, a
-/// paused group, and a dead orchestrator all surface as errors the strip
-/// shows the human.
+/// pane's stdin and messages land whole (never interleaved; relative order of
+/// near-simultaneous sends is best-effort — the per-pty delivery mutex is not
+/// FIFO). Empty text, a paused group, and a dead orchestrator all surface as
+/// errors the strip shows the human.
 #[tauri::command]
 pub fn orch_steer(
     reg: tauri::State<Arc<OrchRegistry>>,

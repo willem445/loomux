@@ -360,12 +360,18 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .orch-compose-row { display: flex; gap: 6px; }
 .orch-compose-input { flex: 1; min-width: 0; font-size: 12px; }
 .orch-compose-send { flex: none; }
-/* Transient feedback for a rejected send (paused group, dead orchestrator). */
+/* Transient feedback for a rejected send (paused group, dead orchestrator).
+   Fixed-height slot present from build time, toggled via `visibility` (not
+   `display`): showing/hiding it must never change `.orch-compose` height, or it
+   would shrink `.pane-term` and trigger a ConPTY resize-repaint. One line,
+   ellipsised; the full message lives in the element's `title`. */
 .orch-compose-status {
-  font-size: 11px; line-height: 1.4; color: #f7a2b2;
+  height: 15px; line-height: 15px; font-size: 11px; color: #f7a2b2;
   padding: 0 2px; user-select: text;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  visibility: hidden;
 }
-.orch-compose-status[hidden] { display: none; }
+.orch-compose-status.show { visibility: visible; }
 
 .xterm-viewport::-webkit-scrollbar { width: 10px; }
 .xterm-viewport::-webkit-scrollbar-track { background: transparent; }

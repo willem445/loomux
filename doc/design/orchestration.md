@@ -414,9 +414,20 @@ the frontend calls `orch_steer`, which enqueues the text to the group's orchestr
 the **same** per-pane serialized delivery path (`deliver_to_orchestrator` → `deliver_prompt`,
 guarded by the per-pty `delivery` mutex) that worker reports already use. The PTY's stdin
 then has **exactly one writer — loomux** — and every message (yours or a worker's) is
-pasted+submitted atomically in queue order. The CLI's own input box stops being shared, so
-by construction your prompt can't be contaminated and can't contaminate a report. Everything
-lands in the audit log (`prompt`, `from: human`), queue order = arrival order.
+pasted+submitted **atomically** (whole, never interleaved). The CLI's own input box stops
+being shared, so by construction your prompt can't be contaminated and can't contaminate a
+report. Everything lands in the audit log (`prompt`, `from: human`).
+
+- *Ordering is best-effort, not a strict FIFO guarantee.* The correctness property is
+  atomicity — each message lands whole. Order is **not** guaranteed under rapid concurrent
+  sends: `deliver_prompt` spawns a thread per delivery that contends for the per-pty `delivery`
+  `std::sync::Mutex`, which is not fair/FIFO (SRWLOCK on Windows), so two sub-second sends — or a
+  steer racing a report — can acquire the lock out of submission order. Nothing is lost or
+  corrupted (mutual exclusion still holds); only the relative order of near-simultaneous
+  messages may flip. A strict arrival sequence would mean threading a monotonic seq/queue
+  through the shared `deliver_prompt` hot path (used by *every* delivery source — kickoffs,
+  reports, watchdog nudges, steer); not worth it for a low-impact reorder window the human can
+  avoid by letting one message land (visible in the pane) before sending a dependent correction.
 
 - *Keyboard routing.* The strip is a plain DOM input, **not** part of xterm, so it never
   steals the terminal's keys — keystrokes only reach it while it holds focus. `Alt+P`
@@ -426,14 +437,18 @@ lands in the audit log (`prompt`, `from: human`), queue order = arrival order.
 - *No PTY resize.* The strip is fixed chrome built *before* `term.open`/`fit`, so the terminal
   sizes to the reduced height **once** — it is not a toggled overlay, so it never triggers the
   ConPTY resize-repaint that pollutes scrollback (the invariant the git/task/audit overlays
-  also respect).
+  also respect). The inline error-status line holds this invariant too: its row is a
+  **fixed-height slot present from build time** and shown/hidden via `visibility` (not
+  `display`), so a rejected-send message never changes `.orch-compose` height — and thus never
+  shrinks `.pane-term` into a `resizePty` on the error path.
 - *Feedback, never silent loss.* `steer_orchestrator` rejects empty text and — critically — a
   **paused** group up front (a paused group's delivery is silently suppressed, so without this
   the steered message would vanish with no trace), and a dead/absent orchestrator surfaces as
   the "no live orchestrator" delivery error. All three are shown inline under the strip; the
   typed text is restored on failure (unless the human has already started a newer draft) so a
-  rejected message isn't lost. Each Enter enqueues one message — rapid sends queue in arrival
-  order backend-side, so the input stays live rather than locking while a send is in flight.
+  rejected message isn't lost. Each Enter enqueues one message and the input stays live rather
+  than locking while a send is in flight (rapid sends are delivered independently — order
+  best-effort per the note above).
 
 **A — typing-aware hold (backstop for direct terminal typing).** Direct typing into the CLI
 box remains possible and remains racy, so `deliver_prompt` now holds delivery **before the
