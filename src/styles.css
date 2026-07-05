@@ -1,6 +1,8 @@
 @import "@xterm/xterm/css/xterm.css";
 
 :root {
+  /* Dark-only app: keeps native widgets (select popups, scrollbars) dark too. */
+  color-scheme: dark;
   --bg-app: #131318;
   --bg-term: #0b0b10;
   --panel: #17171f;
@@ -788,6 +790,9 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .task-status.st-human-testing { background: rgba(125, 207, 255, 0.16); color: #7dcfff; }
 .task-status.st-done { background: rgba(158, 206, 106, 0.16); color: #b4e878; }
 .task-status.st-blocked { background: rgba(247, 118, 142, 0.16); color: #f7899d; }
+/* The popup list is native; the pale status tints above are meant for the
+   closed control on its dark chip — give options a solid dark base instead. */
+.task-status option { background: var(--panel-2); color: var(--text); }
 .task-chip {
   flex: none; font-size: 9.5px; border-radius: 4px; padding: 1px 6px;
   background: var(--panel-2); color: var(--text-dim);
