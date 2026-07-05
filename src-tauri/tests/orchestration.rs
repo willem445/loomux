@@ -168,14 +168,14 @@ fn lowering_max_agents_kills_nobody() {
 }
 
 #[test]
-fn max_agents_change_survives_restart() {
+fn max_agents_change_survives_launcher_relaunch() {
     let dir = tempfile::tempdir().unwrap();
     let gid;
     let path;
     {
         let reg = OrchRegistry::new(dir.path().to_path_buf());
         reg.set_port(45999);
-        let g = reg.create_group("C:/tmp/repo", rails()).unwrap(); // cap 2
+        let g = reg.create_group("C:/tmp/repo", rails()).unwrap(); // launcher cap 2
         gid = g.id.clone();
         path = reg.state_root().join(&g.id).join("group.json");
         reg.set_max_agents(&g.id, 9, "human").unwrap();
@@ -186,15 +186,30 @@ fn max_agents_change_survives_restart() {
     assert_eq!(v["guardrails"]["max_agents"].as_u64().unwrap(), 9);
     assert!(v["created_ms"].as_u64().is_some(), "created_ms must survive the patch");
     assert_eq!(v["guardrails"]["worker_model"], json!("sonnet"), "other guardrails must survive the patch");
-    // A restart re-attaches from group.json (the restore path reads it and
-    // round-trips it through create_group): the enforced cap is the adjusted
-    // 9, not rails()'s creation-time 2.
+    // A fresh registry (app restart) + a real launcher relaunch on the same
+    // repo: this drives create_group's actual resume path, not a hand-fed
+    // group.json. The launcher hardcodes its default cap (rails() = 2), but the
+    // persisted adjustment (9) must win — otherwise the relaunch silently
+    // reverts 9→2. Other guardrails still come from the launch.
     let reg = OrchRegistry::new(dir.path().to_path_buf());
     reg.set_port(45999);
-    let restored = Guardrails { max_agents: v["guardrails"]["max_agents"].as_u64().unwrap() as u32, ..rails() };
-    let g = reg.create_group("C:/tmp/repo", restored).unwrap();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
     assert_eq!(g.id, gid, "restart resumes the same group");
-    assert_eq!(g.guardrails.max_agents, 9, "the persisted cap is what the group runs with");
+    assert_eq!(g.guardrails.max_agents, 9, "the persisted cap wins over the launcher default on resume");
+    // ...and it's the value the resumed group actually holds + re-persists.
+    assert_eq!(reg.group(&gid).unwrap().guardrails.max_agents, 9);
+    let v: Value =
+        serde_json::from_str(&fs::read_to_string(reg.state_root().join(&gid).join("group.json")).unwrap()).unwrap();
+    assert_eq!(v["guardrails"]["max_agents"].as_u64().unwrap(), 9, "resume re-persists the honored cap");
+}
+
+#[test]
+fn new_group_still_honors_the_launcher_cap() {
+    // The resume-prefers-persisted rule must not leak into genuinely new
+    // groups: a first launch on a repo uses the caller's cap verbatim.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/fresh-repo", Guardrails { max_agents: 5, ..rails() }).unwrap();
+    assert_eq!(g.guardrails.max_agents, 5, "a new group takes the launcher's cap");
 }
 
 #[test]
@@ -230,6 +245,17 @@ fn setting_same_max_agents_is_a_noop() {
     assert_eq!(reg.set_max_agents(&g.id, 2, "human").unwrap(), 2);
     let log = fs::read_to_string(reg.state_root().join(&g.id).join("audit.jsonl")).unwrap();
     assert!(!log.contains("max-agents-set"), "a no-op change must not audit or notify");
+}
+
+#[test]
+fn set_max_agents_fails_soft_on_corrupt_group_file() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    // A valid-JSON but non-object root (e.g. from corruption) must error rather
+    // than panic on the in-place field assignment.
+    fs::write(reg.state_root().join(&g.id).join("group.json"), "null").unwrap();
+    let err = reg.set_max_agents(&g.id, 5, "human").unwrap_err();
+    assert!(err.contains("not a JSON object"), "non-object root must fail soft, got: {err}");
 }
 
 #[test]

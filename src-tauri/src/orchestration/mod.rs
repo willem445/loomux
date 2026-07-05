@@ -1649,7 +1649,7 @@ impl OrchRegistry {
     /// persist under the repo-derived group id; guardrails are refreshed from
     /// the new launch.
     pub fn create_group(&self, repo: &str, guardrails: Guardrails) -> Result<GroupInfo, String> {
-        let guardrails = guardrails.clamped();
+        let mut guardrails = guardrails.clamped();
         // Base id is repo-derived so a relaunch resumes the same state dir —
         // but a repo can host several *concurrent* orchestrations, and those
         // must never share a group (their orchestrators would receive each
@@ -1662,6 +1662,19 @@ impl OrchRegistry {
         let dir = self.group_dir(&id);
         fs::create_dir_all(dir.join("configs")).map_err(|e| e.to_string())?;
         let resumed = dir.join("group.json").is_file();
+        // The live-agent cap is adjustable mid-session (`set_max_agents`) and
+        // persisted, so it's a durable human choice — like the pause/notify
+        // markers re-seeded below. On resume, prefer the persisted cap over the
+        // caller's param: the launcher hardcodes its default (4) and can't
+        // pre-fill from group.json, so without this a relaunch would silently
+        // revert an on-the-fly adjustment. Other guardrails still refresh from
+        // the launch (only the cap is live-adjustable). Read before the write
+        // below overwrites the file.
+        if resumed {
+            if let Some((_, persisted)) = self.load_group_file(&id) {
+                guardrails.max_agents = persisted.max_agents.clamp(1, MAX_AGENTS_CEILING);
+            }
+        }
         let info = GroupInfo { id: id.clone(), repo: repo.to_string(), guardrails };
         fs::write(
             dir.join("group.json"),
@@ -2044,12 +2057,35 @@ impl OrchRegistry {
     /// later feature adds). Patching the parsed JSON in place — rather than
     /// reserializing a full GroupInfo — keeps this additive and rebase-clean.
     fn persist_max_agents(&self, group: &str, n: u32) -> Result<(), String> {
-        let path = self.group_dir(group).join("group.json");
+        let dir = self.group_dir(group);
+        let path = dir.join("group.json");
         let mut v: Value = serde_json::from_str(&fs::read_to_string(&path).map_err(|e| e.to_string())?)
             .map_err(|e| e.to_string())?;
-        v["guardrails"]["max_agents"] = json!(n);
-        fs::write(&path, serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?)
-            .map_err(|e| e.to_string())
+        // Guard the indexing so a corrupt-but-valid-JSON file (e.g. a `null`
+        // root) fails soft instead of panicking on assignment.
+        let obj = v.as_object_mut().ok_or("group.json root is not a JSON object")?;
+        match obj.get_mut("guardrails").and_then(Value::as_object_mut) {
+            Some(guard) => {
+                guard.insert("max_agents".into(), json!(n));
+            }
+            None => {
+                obj.insert("guardrails".into(), json!({ "max_agents": n }));
+            }
+        }
+        // Crash-safe write: serialize to a temp file, then atomically rename
+        // over group.json (same pattern as usage.json). group.json is
+        // identity-critical — a half-written file breaks the rejoin path
+        // ("group.json is missing") — so never expose a truncated version.
+        let body = serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?;
+        let tmp = dir.join("group.json.tmp");
+        fs::write(&tmp, &body).map_err(|e| e.to_string())?;
+        if fs::rename(&tmp, &path).is_err() {
+            // Rename can fail if the destination exists on some platforms; fall
+            // back to a direct write so the update isn't lost.
+            fs::write(&path, &body).map_err(|e| e.to_string())?;
+            let _ = fs::remove_file(&tmp);
+        }
+        Ok(())
     }
 
     /// Read every agent pane's output counter, last-lines tail, and last human
