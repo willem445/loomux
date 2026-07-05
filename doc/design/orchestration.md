@@ -394,6 +394,82 @@ header chip and, via a listener, mirrors the state onto a minimized pane's **doc
   the top with 3+ options below it is missed until the user arrows down (the pointer re-enters
   the window); real menus ship footers, so this is a safe-direction miss we accept.
 
+## Prompt-collision mutual exclusion: compose strip + typing hold (#43)
+
+**Problem.** Worker reports and orchestrator kickoffs are delivered by bracketed-pasting
+into the orchestrator pane's PTY stdin, then pressing Enter (`deliver_prompt`). The CLI's
+own input box is a *shared resource*: if the human is mid-sentence in it when a report
+arrives, the paste lands inside their half-typed line and the Enter submits the merged
+text. A partial guard already existed — `PtyManager::last_user_input_ms` let the *retry*
+Enters skip when the human typed after the first submit — but nothing guarded the initial
+paste or the first Enter, which is exactly where the corruption happens.
+
+The fix ships two of the reviewed options together: **C** (the structural destination) with
+**A** (a cheap backstop). B (focus-aware deferral) and D/E were rejected — see below.
+
+**C — loomux-owned compose strip (structural mutual exclusion).** The orchestrator pane
+gets a thin loomux input strip docked under its terminal (frontend `Pane.buildComposeStrip`,
+shown only for the `orchestrator` roster role). The human types steering there; on submit,
+the frontend calls `orch_steer`, which enqueues the text to the group's orchestrator through
+the **same** per-pane serialized delivery path (`deliver_to_orchestrator` → `deliver_prompt`,
+guarded by the per-pty `delivery` mutex) that worker reports already use. The PTY's stdin
+then has **exactly one writer — loomux** — and every message (yours or a worker's) is
+pasted+submitted atomically in queue order. The CLI's own input box stops being shared, so
+by construction your prompt can't be contaminated and can't contaminate a report. Everything
+lands in the audit log (`prompt`, `from: human`), queue order = arrival order.
+
+- *Keyboard routing.* The strip is a plain DOM input, **not** part of xterm, so it never
+  steals the terminal's keys — keystrokes only reach it while it holds focus. `Alt+P`
+  (`focus-compose` in `shortcuts.ts`) or a click focuses it; **Enter** submits; **Esc** hands
+  focus back to the terminal. Enter/Esc are ignored while an IME composition is active
+  (`isComposing`/keyCode 229) so candidate selection doesn't submit mid-word.
+- *No PTY resize.* The strip is fixed chrome built *before* `term.open`/`fit`, so the terminal
+  sizes to the reduced height **once** — it is not a toggled overlay, so it never triggers the
+  ConPTY resize-repaint that pollutes scrollback (the invariant the git/task/audit overlays
+  also respect).
+- *Feedback, never silent loss.* `steer_orchestrator` rejects empty text and — critically — a
+  **paused** group up front (a paused group's delivery is silently suppressed, so without this
+  the steered message would vanish with no trace), and a dead/absent orchestrator surfaces as
+  the "no live orchestrator" delivery error. All three are shown inline under the strip; the
+  typed text is restored on failure (unless the human has already started a newer draft) so a
+  rejected message isn't lost. Each Enter enqueues one message — rapid sends queue in arrival
+  order backend-side, so the input stays live rather than locking while a send is in flight.
+
+**A — typing-aware hold (backstop for direct terminal typing).** Direct typing into the CLI
+box remains possible and remains racy, so `deliver_prompt` now holds delivery **before the
+paste** and **re-checks right before the first Enter** while the pane has seen a keystroke
+within `USER_QUIET_HOLD` (4s), polling until human-quiet, capped at `USER_QUIET_MAX_HOLD`
+(90s) so a long compose session can't starve the report queue. The held duration is audited
+(`delivery-held-for-user`, with `stage` = `pre-paste`/`pre-enter` and a `capped` flag). This
+composes with the pre-existing submit-retry guard, extending it back to cover the two points
+that actually corrupt input.
+
+- *Pure decision + exercised loop.* The hold/deadline choice is the pure
+  `should_hold_for_user(last_input_ms, now_ms, held, quiet_window, max_hold)` (unit-tested for
+  recent-typing, quiet, never-typed, the cap override, the window boundary, and clock-skew
+  no-underflow). Per the #40 twice-bitten lesson (a pure fn tested in isolation isn't enough —
+  the *wiring* must be exercised), the poll loop that calls it, `hold_until_quiet`, is generic
+  over the keystroke source and timings and is integration-tested directly: proceeds-when-quiet,
+  caps-so-reports-aren't-starved, and releases-once-the-human-goes-quiet. `wait_for_user_quiet`
+  is the thin production wrapper binding it to `PtyManager::last_user_input_ms` and the shipped
+  timings.
+
+**Why not B (focus-aware deferral)?** B holds reports while the orchestrator pane is *focused*.
+Once C exists, the human's keystrokes go to a loomux widget, not the CLI box, so the shared
+resource is gone regardless of focus — B would only add latency (reports delayed while you
+merely watch a focused pane) to solve a collision C has already made structurally impossible.
+A covers the residual "typed straight into the CLI" case more precisely (on actual keystroke
+recency, not focus). **D** (MCP inbox) can't wake an idle CLI turn — a typed prompt is what
+does that — and **E** (stash/restore the human's partial input) has no portable primitive and
+is destructive/TUI-fragile. So C+A is the whole fix; B is unnecessary for this option.
+
+**Tests.** `steer_*` integration tests cover the guards (empty, paused-feedback, no-live-
+orchestrator, unknown group), that a healthy steer reaches delivery, and that steering
+resolves to the **orchestrator** (not a same-group worker), is attributed to `human`, and is
+audited only under its own group (isolation). Hold-guard tests cover the loop wiring as above.
+The live paste/Enter behavior against a real CLI is validated by hand (no real PTY in test
+mode), consistent with the rest of `deliver_prompt`.
+
 ## Risks / limitations
 
 - Kickoff typing races CLI boot; a fixed delay (4s) + bracketed paste is used. If a
@@ -406,3 +482,9 @@ header chip and, via a listener, mirrors the state onto a minimized pane's **doc
   local-only work when it's missing.
 - Registry is in-memory: closing loomux orphans no processes (kill_all) but live agents
   don't survive; durable state does. Resuming respawns fresh sessions on the old state.
+- The compose strip (#43) makes steering collision-proof, but **direct** typing into the CLI
+  box is only protected by the heuristic hold (A): a keystroke landing in the millisecond
+  between the quiet-check and the paste, or a human who pauses mid-sentence past the 4s window,
+  can still collide. Typing in the strip has no such window. The 90s starvation cap also means
+  a marathon uninterrupted typing session eventually gets a report delivered on top of it —
+  the cap trades a rare late collision for never starving reports.

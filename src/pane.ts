@@ -182,6 +182,8 @@ export class Pane {
    *  human types here and loomux enqueues it through the same serialized
    *  delivery path as worker reports, so the pane's stdin has one writer. */
   private composeInput: HTMLInputElement | null = null;
+  private composeStatus: HTMLElement | null = null;
+  private composeStatusTimer: number | undefined;
   /** "needs attention" chip in the header (attention routing #6); hidden until
    *  the backend flags this pane. */
   private attnChip: HTMLButtonElement;
@@ -966,13 +968,21 @@ export class Pane {
   private buildComposeStrip(): void {
     const strip = document.createElement("div");
     strip.className = "orch-compose";
+
+    const row = document.createElement("div");
+    row.className = "orch-compose-row";
     const input = document.createElement("input");
     input.className = "dlg-input orch-compose-input";
     input.placeholder = "Steer the orchestrator — Alt+P to focus · Enter to send · Esc to terminal";
     input.spellcheck = false;
+    input.autocomplete = "off";
     input.addEventListener("keydown", (e) => {
       // Stop app shortcuts / the terminal from also acting on these keys.
       e.stopPropagation();
+      // Ignore Enter/Escape while an IME composition is active (e.g. picking a
+      // candidate) — `isComposing`/keyCode 229 mean the key belongs to the IME,
+      // not us, so we must not submit or bail mid-word.
+      if (e.isComposing || e.keyCode === 229) return;
       if (e.key === "Enter") {
         e.preventDefault();
         void this.submitCompose();
@@ -988,8 +998,15 @@ export class Pane {
       e.stopPropagation();
       void this.submitCompose();
     });
-    strip.append(input, send);
+    row.append(input, send);
+
+    const status = document.createElement("div");
+    status.className = "orch-compose-status";
+    status.hidden = true;
+
+    strip.append(row, status);
     this.composeInput = input;
+    this.composeStatus = status;
     this.el.appendChild(strip);
   }
 
@@ -1000,20 +1017,35 @@ export class Pane {
     this.composeInput.select();
   }
 
+  /** Show a transient status line under the strip (errors only — a successful
+   *  send is confirmed by the message landing in the terminal above). */
+  private showComposeStatus(msg: string): void {
+    const status = this.composeStatus;
+    if (!status) return;
+    status.textContent = msg;
+    status.hidden = false;
+    clearTimeout(this.composeStatusTimer);
+    this.composeStatusTimer = window.setTimeout(() => (status.hidden = true), 6000);
+  }
+
   /** Enqueue the strip's text to the orchestrator through loomux's serialized
-   *  delivery path. Clears optimistically; restores the text on failure so a
-   *  dropped message isn't lost. */
+   *  delivery path. Each Enter enqueues one message (rapid sends queue in
+   *  arrival order backend-side), so the input stays live rather than locking
+   *  while a send is in flight. Clears optimistically; on failure the text is
+   *  restored — unless the human has already started a newer draft — so a
+   *  rejected message (paused group, dead orchestrator) isn't lost. */
   private async submitCompose(): Promise<void> {
     const input = this.composeInput;
     if (!input || !this.orchGroup) return;
     const text = input.value.trim();
     if (!text) return;
     input.value = "";
+    if (this.composeStatus) this.composeStatus.hidden = true;
     try {
       await invoke("orch_steer", { groupId: this.orchGroup, text });
     } catch (err) {
-      input.value = text;
-      input.placeholder = `send failed: ${String(err)}`;
+      if (input.value === "") input.value = text; // don't clobber a newer draft
+      this.showComposeStatus(`Not sent: ${String(err)}`);
     }
   }
 
@@ -1024,6 +1056,7 @@ export class Pane {
     this.resizeObs.disconnect();
     clearTimeout(this.fitTimer);
     clearTimeout(this.shiftTimer);
+    clearTimeout(this.composeStatusTimer);
     this.gitView?.dispose();
     this.tasksView?.dispose();
     this.auditView?.dispose();

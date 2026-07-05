@@ -739,25 +739,41 @@ fn should_hold_for_user(
     since < quiet_window.as_millis() as u64
 }
 
-/// Block the delivery thread while the human is actively typing in `pty_id`,
-/// polling until they've been quiet for `USER_QUIET_HOLD` or the hold hits
-/// `USER_QUIET_MAX_HOLD`. Returns `Some(held_ms)` when it actually waited
-/// (so the caller can audit the held duration), `None` when the pane was
-/// already quiet.
-fn wait_for_user_quiet(ptys: &crate::pty::PtyManager, pty_id: u32) -> Option<u64> {
+/// Poll-and-hold loop that drives `should_hold_for_user`: block while
+/// `last_input_ms()` reports recent keystrokes, until quiet or the hold hits
+/// `max_hold`. Returns `Some(held_ms)` when it actually waited (so the caller
+/// can audit the held duration), `None` when it was already quiet on entry.
+///
+/// Generic over the keystroke source and timings so the wiring — that the
+/// loop consults the decision every `poll` and honours the starvation cap —
+/// is integration-testable without a live PTY (see the #40 twice-bitten
+/// lesson: the pure decision alone isn't enough; the loop that calls it must
+/// be exercised too).
+#[doc(hidden)] // pub for integration tests
+pub fn hold_until_quiet<F: Fn() -> u64>(
+    last_input_ms: F,
+    quiet_window: Duration,
+    max_hold: Duration,
+    poll: Duration,
+) -> Option<u64> {
     let start = std::time::Instant::now();
     let mut held = false;
-    while should_hold_for_user(
-        ptys.last_user_input_ms(pty_id).unwrap_or(0),
-        now_ms(),
-        start.elapsed(),
-        USER_QUIET_HOLD,
-        USER_QUIET_MAX_HOLD,
-    ) {
+    while should_hold_for_user(last_input_ms(), now_ms(), start.elapsed(), quiet_window, max_hold) {
         held = true;
-        std::thread::sleep(USER_QUIET_POLL);
+        std::thread::sleep(poll);
     }
     held.then(|| start.elapsed().as_millis() as u64)
+}
+
+/// Production wrapper: hold delivery to `pty_id` while its human is typing,
+/// using the shipped window/cap/poll timings.
+fn wait_for_user_quiet(ptys: &crate::pty::PtyManager, pty_id: u32) -> Option<u64> {
+    hold_until_quiet(
+        || ptys.last_user_input_ms(pty_id).unwrap_or(0),
+        USER_QUIET_HOLD,
+        USER_QUIET_MAX_HOLD,
+        USER_QUIET_POLL,
+    )
 }
 
 /// 128-bit hex token from std's OS-seeded `RandomState` (each instance draws
@@ -3325,6 +3341,24 @@ impl OrchRegistry {
         Ok(())
     }
 
+    /// Human steering from the loomux compose strip (#43, option C): enqueue
+    /// `text` to the group's orchestrator through the SAME per-pane serialized
+    /// delivery path worker reports use. Rejects empty text and a paused group
+    /// up front so the strip can tell the human why nothing was sent — a paused
+    /// group's delivery is silently suppressed, so without this guard a steered
+    /// message would vanish with no feedback. A dead/absent orchestrator
+    /// surfaces as the "no live orchestrator" error from delivery.
+    #[doc(hidden)] // pub for integration tests
+    pub fn steer_orchestrator(&self, group: &str, text: &str) -> Result<(), String> {
+        if text.trim().is_empty() {
+            return Err("empty steering message".into());
+        }
+        if self.is_paused(group) {
+            return Err("group is paused — resume it before steering".into());
+        }
+        self.deliver_to_orchestrator(group, text, "human")
+    }
+
     /// Deliver to the group's orchestrator (worker reports, exit notices).
     pub fn deliver_to_orchestrator(&self, group: &str, text: &str, from: &str) -> Result<(), String> {
         let orch = self
@@ -4087,17 +4121,16 @@ pub fn orch_audit(reg: tauri::State<Arc<OrchRegistry>>, group_id: String) -> Vec
 /// Human steering from the loomux compose strip (#43, option C): enqueue
 /// `text` to the group's orchestrator through the SAME per-pane serialized
 /// delivery path worker reports use, so loomux is the single writer to the
-/// pane's stdin and messages land whole, in arrival order.
+/// pane's stdin and messages land whole, in arrival order. Empty text, a
+/// paused group, and a dead orchestrator all surface as errors the strip
+/// shows the human.
 #[tauri::command]
 pub fn orch_steer(
     reg: tauri::State<Arc<OrchRegistry>>,
     group_id: String,
     text: String,
 ) -> Result<(), String> {
-    if text.trim().is_empty() {
-        return Err("empty steering message".into());
-    }
-    reg.deliver_to_orchestrator(&group_id, &text, "human")
+    reg.steer_orchestrator(&group_id, &text)
 }
 
 #[tauri::command]

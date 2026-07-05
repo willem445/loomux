@@ -352,13 +352,20 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
    A fixed chrome element (present from pane start), so the terminal fits to
    the reduced height once — no toggling, no resize repaint into scrollback. */
 .orch-compose {
-  display: flex; gap: 6px; flex: none;
+  display: flex; flex-direction: column; gap: 4px; flex: none;
   padding: 6px 8px;
   border-top: 1px solid var(--group-color, var(--border-soft));
   background: linear-gradient(180deg, #121219, #0e0e14);
 }
+.orch-compose-row { display: flex; gap: 6px; }
 .orch-compose-input { flex: 1; min-width: 0; font-size: 12px; }
 .orch-compose-send { flex: none; }
+/* Transient feedback for a rejected send (paused group, dead orchestrator). */
+.orch-compose-status {
+  font-size: 11px; line-height: 1.4; color: #f7a2b2;
+  padding: 0 2px; user-select: text;
+}
+.orch-compose-status[hidden] { display: none; }
 
 .xterm-viewport::-webkit-scrollbar { width: 10px; }
 .xterm-viewport::-webkit-scrollbar-track { background: transparent; }
