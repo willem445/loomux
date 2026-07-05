@@ -1912,20 +1912,17 @@ impl OrchRegistry {
         (outs, tails, ins)
     }
 
-    /// Pty snapshots for *every* live pane, keyed by pty id, plus the set of
-    /// ptys that belong to registered agents. Feeds `plain_pane_attention` so
-    /// the scan reaches plain shells the human opened by hand (#40). Empty
-    /// without an app handle (unit tests drive `plain_pane_attention` directly).
+    /// Pty snapshots for every live pane that is NOT a registered agent, keyed
+    /// by pty id, plus the agent-pty set. Feeds `plain_pane_attention` so the
+    /// scan reaches plain shells the human opened by hand (#40). Empty without an
+    /// app handle (unit tests drive the pure core `pane_attention_inputs_from`).
     #[allow(clippy::type_complexity)]
     fn pane_attention_inputs(
         &self,
     ) -> (HashMap<u32, u64>, HashMap<u32, String>, HashMap<u32, u64>, HashSet<u32>) {
-        let mut outs = HashMap::new();
-        let mut tails = HashMap::new();
-        let mut ins = HashMap::new();
         let mut agent_ptys = HashSet::new();
         let Some(app) = self.app.lock().unwrap().clone() else {
-            return (outs, tails, ins, agent_ptys);
+            return (HashMap::new(), HashMap::new(), HashMap::new(), agent_ptys);
         };
         for a in self.agents.lock().unwrap().values() {
             if let Some(pid) = a.pty_id {
@@ -1933,19 +1930,49 @@ impl OrchRegistry {
             }
         }
         let ptys = app.state::<crate::pty::PtyManager>();
+        let mut live = Vec::new();
         for pid in ptys.live_ids() {
-            if let Some(t) = ptys.output_total(pid) {
-                outs.insert(pid, t);
+            // Skip agent ptys *before* touching the ring: `attention_tick`
+            // already covers them, and `attention_inputs` already cloned their
+            // (up-to-256 KB) output ring this tick — cloning it a second time
+            // here would be pure waste (#40 review).
+            if agent_ptys.contains(&pid) {
+                continue;
             }
-            if let Some(raw) = ptys.output_tail(pid) {
-                let start = raw.len().saturating_sub(4096);
-                tails.insert(pid, strip_ansi(&raw[start..]));
-            }
-            if let Some(u) = ptys.last_user_input_ms(pid) {
-                ins.insert(pid, u);
-            }
+            let Some(total) = ptys.output_total(pid) else { continue };
+            let raw = ptys.output_tail(pid).unwrap_or_default();
+            let input = ptys.last_user_input_ms(pid).unwrap_or(0);
+            live.push((pid, total, raw, input));
         }
+        let (outs, tails, ins) = self.pane_attention_inputs_from(&live, &agent_ptys);
         (outs, tails, ins, agent_ptys)
+    }
+
+    /// Pure core of `pane_attention_inputs`: build the pty-keyed snapshot maps
+    /// `plain_pane_attention` consumes from a list of live pane snapshots
+    /// `(pty_id, output_total, raw_tail, last_input_ms)`, ANSI-stripping only the
+    /// trailing few KB of each tail (a prompt is at the end). Agent ptys are
+    /// skipped. Pure w.r.t. the pty, so run_attention's gather wiring is testable
+    /// with a fake live-ids source (#40 review).
+    #[allow(clippy::type_complexity)]
+    pub fn pane_attention_inputs_from(
+        &self,
+        live: &[(u32, u64, Vec<u8>, u64)],
+        agent_ptys: &HashSet<u32>,
+    ) -> (HashMap<u32, u64>, HashMap<u32, String>, HashMap<u32, u64>) {
+        let mut outs = HashMap::new();
+        let mut tails = HashMap::new();
+        let mut ins = HashMap::new();
+        for (pid, total, raw, input) in live {
+            if agent_ptys.contains(pid) {
+                continue;
+            }
+            outs.insert(*pid, *total);
+            let start = raw.len().saturating_sub(4096);
+            tails.insert(*pid, strip_ansi(&raw[start..]));
+            ins.insert(*pid, *input);
+        }
+        (outs, tails, ins)
     }
 
     /// One attention pass: compute the current set of panes that need the human
@@ -2126,12 +2153,35 @@ impl OrchRegistry {
     /// One full attention cycle: read pty snapshots, compute the attention set,
     /// fire toasts for newly-attention panes in opted-in groups, and push the
     /// whole set to the frontend. Called on a timer by `start_attention`.
+    /// The full attention set: the roster scan (`attention_tick`, all reasons)
+    /// merged with the plain-pane scan (`plain_pane_attention`, `waiting` only).
+    /// This is run_attention's core, factored out so the merge wiring — plain
+    /// panes surface, an agent's pty is never double-covered — is testable
+    /// without a real PtyManager (#40 review).
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_scan(
+        &self,
+        now: u64,
+        agent_outputs: &HashMap<String, u64>,
+        agent_tails: &HashMap<String, String>,
+        agent_inputs: &HashMap<String, u64>,
+        pane_outputs: &HashMap<u32, u64>,
+        pane_tails: &HashMap<u32, String>,
+        pane_inputs: &HashMap<u32, u64>,
+        agent_ptys: &HashSet<u32>,
+    ) -> Vec<AttentionItem> {
+        let mut items = self.attention_tick(now, agent_outputs, agent_tails, agent_inputs);
+        items.extend(self.plain_pane_attention(now, pane_outputs, pane_tails, pane_inputs, agent_ptys));
+        items
+    }
+
     pub fn run_attention(&self, now: u64) {
         let (outputs, tails, last_inputs) = self.attention_inputs();
-        let mut items = self.attention_tick(now, &outputs, &tails, &last_inputs);
         // Also scan plain (non-agent) panes for an interactive prompt (#40).
         let (p_out, p_tails, p_ins, agent_ptys) = self.pane_attention_inputs();
-        items.extend(self.plain_pane_attention(now, &p_out, &p_tails, &p_ins, &agent_ptys));
+        let items = self.attention_scan(
+            now, &outputs, &tails, &last_inputs, &p_out, &p_tails, &p_ins, &agent_ptys,
+        );
         for id in self.attention_toast_targets(&items) {
             if let Some(i) = items.iter().find(|i| i.agent_id == id) {
                 self.audit(&i.group, "loomux", "attention-toast",

@@ -1733,6 +1733,92 @@ fn plain_pane_waiting_ack_by_pty_sticks_until_output_changes() {
 }
 
 #[test]
+fn attention_scan_surfaces_plain_panes_without_double_covering_agents() {
+    // #40 review: exercise run_attention's merge wiring (the layer where the
+    // scope bug lived) — attention_scan combines the roster scan with the
+    // plain-pane scan. A plain pty parked on a menu must surface (keyed only by
+    // pty), and an agent-owned pty must NOT be double-covered by the plain pass.
+    let (reg, _d, _g, _w) = attention_setup();
+    let now = 1_000_000_000_000u64;
+    let no_agent_in: HashMap<String, u64> = HashMap::new();
+    let no_agent_tail: HashMap<String, String> = HashMap::new();
+    // pty 7 = a plain hand-opened pane; pty 5 stands in for an agent's pty.
+    let p_out: HashMap<u32, u64> = [(7u32, 10u64), (5u32, 10u64)].into_iter().collect();
+    let p_tails: HashMap<u32, String> = [
+        (7u32, strip_ansi(FIX_CLAUDE_ASK.as_bytes())),
+        (5u32, strip_ansi(FIX_CLAUDE_ASK.as_bytes())),
+    ]
+    .into_iter()
+    .collect();
+    let p_ins = HashMap::new();
+    let agent_ptys: HashSet<u32> = [5u32].into_iter().collect();
+
+    let scan = |t: u64| {
+        reg.attention_scan(
+            t, &no_agent_in, &no_agent_tail, &HashMap::new(), &p_out, &p_tails, &p_ins, &agent_ptys,
+        )
+    };
+    scan(now); // establish the quiet clock
+    let items = scan(now + 5000);
+    assert!(
+        items.iter().any(|i| i.pty_id == Some(7) && i.reason == "waiting" && i.agent_id.is_empty()),
+        "a plain pane parked on a question must surface through run_attention's merge"
+    );
+    assert!(
+        items.iter().all(|i| i.pty_id != Some(5)),
+        "an agent's pty must not be double-covered by the plain pass"
+    );
+}
+
+#[test]
+fn pane_attention_inputs_from_strips_ansi_and_skips_agent_ptys() {
+    // #40 review: drive the gather wiring with a fake live-ids source. Raw bytes
+    // carry ANSI + box drawing; the built tail must be stripped, agent ptys must
+    // be skipped (not gathered), and the stripped tail must still detect a prompt.
+    let (reg, _d, _g, _w) = attention_setup();
+    let raw_menu = FIX_COPILOT_ASK.as_bytes().to_vec();
+    let live = vec![
+        (7u32, 42u64, raw_menu.clone(), 0u64),   // a plain pane
+        (5u32, 99u64, raw_menu.clone(), 123u64), // an agent's pty — must be skipped
+    ];
+    let agent_ptys: HashSet<u32> = [5u32].into_iter().collect();
+    let (outs, tails, ins) = reg.pane_attention_inputs_from(&live, &agent_ptys);
+
+    assert!(!outs.contains_key(&5) && !tails.contains_key(&5), "agent pty must be skipped");
+    assert_eq!(outs.get(&7), Some(&42u64));
+    assert_eq!(ins.get(&7), Some(&0u64));
+    let tail7 = tails.get(&7).expect("plain pty tail present");
+    assert!(!tail7.contains('\u{1b}'), "ANSI escapes must be stripped from the gathered tail");
+    assert!(prompt_wait_detected(tail7), "the stripped tail still detects the menu");
+}
+
+#[test]
+fn attention_scan_flags_a_plain_pane_with_no_orchestration_group_at_all() {
+    // #40 review: the human's repro had NO orchestration group — plain panes only.
+    // A fresh registry (no group, no agents) must still flag a plain pane parked
+    // on a question, confirming the scan doesn't depend on any group existing.
+    let (reg, _d) = test_registry();
+    let now = 1_000_000_000_000u64;
+    let empty_in: HashMap<String, u64> = HashMap::new();
+    let empty_tail: HashMap<String, String> = HashMap::new();
+    let p_out: HashMap<u32, u64> = [(3u32, 10u64)].into_iter().collect();
+    let p_tails: HashMap<u32, String> =
+        [(3u32, strip_ansi(FIX_CLAUDE_ASK.as_bytes()))].into_iter().collect();
+    let no_agents = HashSet::new();
+
+    let scan = |t: u64| {
+        reg.attention_scan(
+            t, &empty_in, &empty_tail, &HashMap::new(), &p_out, &p_tails, &HashMap::new(), &no_agents,
+        )
+    };
+    scan(now);
+    assert!(
+        scan(now + 5000).iter().any(|i| i.pty_id == Some(3) && i.reason == "waiting"),
+        "attention must fire for a plain pane even with no orchestration group present"
+    );
+}
+
+#[test]
 fn attention_waiting_ack_sticks_until_the_prompt_changes() {
     // #40 review: focusing/acking a pane parked on a live menu must make the ack
     // *stick* — the next scan must not re-light `waiting` on the pane the human is
