@@ -346,6 +346,33 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 }
 .pane-term .xterm { height: 100%; padding: 6px 2px 4px 10px; }
 
+/* ---------- orchestrator steering strip (#43, option C) ---------- */
+/* Docked under the ORCHESTRATOR pane's terminal. Styled like the task board's
+   "Add a task" field; the group accent on the top edge ties it to the pane.
+   A fixed chrome element (present from pane start), so the terminal fits to
+   the reduced height once — no toggling, no resize repaint into scrollback. */
+.orch-compose {
+  display: flex; flex-direction: column; gap: 4px; flex: none;
+  padding: 6px 8px;
+  border-top: 1px solid var(--group-color, var(--border-soft));
+  background: linear-gradient(180deg, #121219, #0e0e14);
+}
+.orch-compose-row { display: flex; gap: 6px; }
+.orch-compose-input { flex: 1; min-width: 0; font-size: 12px; }
+.orch-compose-send { flex: none; }
+/* Transient feedback for a rejected send (paused group, dead orchestrator).
+   Fixed-height slot present from build time, toggled via `visibility` (not
+   `display`): showing/hiding it must never change `.orch-compose` height, or it
+   would shrink `.pane-term` and trigger a ConPTY resize-repaint. One line,
+   ellipsised; the full message lives in the element's `title`. */
+.orch-compose-status {
+  height: 15px; line-height: 15px; font-size: 11px; color: #f7a2b2;
+  padding: 0 2px; user-select: text;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  visibility: hidden;
+}
+.orch-compose-status.show { visibility: visible; }
+
 .xterm-viewport::-webkit-scrollbar { width: 10px; }
 .xterm-viewport::-webkit-scrollbar-track { background: transparent; }
 .xterm-viewport::-webkit-scrollbar-thumb {

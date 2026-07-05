@@ -8,7 +8,8 @@
 
 use loomux_lib::orchestration::mcp::dispatch;
 use loomux_lib::orchestration::{
-    add_trusted_folder, bracketed_paste, cli_ready, create_orchestration_group, idle_should_kill,
+    add_trusted_folder, bracketed_paste, cli_ready, create_orchestration_group, hold_until_quiet,
+    idle_should_kill,
     normalize_remote_web_base, parse_audit_lines, parse_session_cost, prompt_wait_detected,
     resolve_ref_url, rotate_audit_if_needed, spawn_rate_exceeded, strip_ansi,
     watchdog_should_notify, worktree_cleanup_targets, AttentionItem, Caller, Guardrails,
@@ -2399,4 +2400,126 @@ fn end_group_removes_worktrees_of_dead_and_live_agents() {
     assert!(!Path::new(&dead.cwd).exists(), "exited agent's worktree must be gone");
     // The main checkout is untouched.
     assert!(repo.path().join("f.txt").is_file(), "the repo root must survive teardown");
+}
+
+// ---------- #43: compose-strip steering + human-typing hold backstop ----------
+
+#[test]
+fn steer_rejects_empty_text() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    // Whitespace-only is also empty — the strip must not enqueue a blank line.
+    let err = reg.steer_orchestrator(&g.id, "   ").unwrap_err();
+    assert!(err.contains("empty"), "got: {err}");
+}
+
+#[test]
+fn steer_rejects_paused_group_so_the_human_gets_feedback() {
+    // A paused group suppresses delivery silently; steering must surface that
+    // as an error the strip shows, not vanish (the whole point of the strip is
+    // that the human's message is never silently lost).
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    reg.pause_group(&g.id).unwrap();
+    let err = reg.steer_orchestrator(&g.id, "do the thing").unwrap_err();
+    assert!(err.contains("paused"), "got: {err}");
+}
+
+#[test]
+fn steer_without_a_live_orchestrator_errors() {
+    // A group with only workers (no orchestrator) must NOT fall through to a
+    // worker — steering targets the orchestrator or nothing.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let err = reg.steer_orchestrator(&g.id, "steer me").unwrap_err();
+    assert!(err.contains("no live orchestrator"), "got: {err}");
+    // An unknown group is likewise not steerable.
+    let err = reg.steer_orchestrator("no-such-group", "steer me").unwrap_err();
+    assert!(err.contains("no live orchestrator"), "got: {err}");
+}
+
+#[test]
+fn steer_of_a_healthy_group_reaches_delivery() {
+    // Empty/paused/no-orch guards all pass → steering delegates to the
+    // serialized delivery path, which in test mode (no real PTY) fails at the
+    // terminal step. That error proves the guards let a healthy steer through.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let err = reg.steer_orchestrator(&g.id, "steer me").unwrap_err();
+    assert!(err.contains("terminal"), "steer must reach the pty step, got: {err}");
+}
+
+#[test]
+fn steering_targets_the_orchestrator_and_is_audited_under_its_group() {
+    // Resolution + isolation + audit attribution in one: a paused group makes
+    // delivery record a suppression audit (reachable without a real PTY) whose
+    // `to` names the resolved target. It must be the ORCHESTRATOR (not the
+    // worker in the same group), attributed to `human`, and written only under
+    // this group's log.
+    let (reg, _d) = test_registry();
+    let a = reg.create_group("C:/tmp/repo-a", rails()).unwrap();
+    let orch = reg.spawn_agent(&a.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    reg.spawn_agent(&a.id, Role::Worker, "w", "t", false, None).unwrap();
+    let b = reg.create_group("C:/tmp/repo-b", rails()).unwrap();
+    reg.spawn_agent(&b.id, Role::Orchestrator, "orch-b", "", false, None).unwrap();
+
+    reg.pause_group(&a.id).unwrap();
+    // Go through deliver_to_orchestrator directly (steer_orchestrator's own
+    // paused-guard would short-circuit before delivery) to observe resolution.
+    reg.deliver_to_orchestrator(&a.id, "hello orchestrator", "human").unwrap();
+
+    let entries = reg.audit_log(&a.id);
+    let sup = entries
+        .iter()
+        .find(|e| e.action == "prompt-suppressed-paused")
+        .expect("suppressed steer must be audited");
+    assert_eq!(sup.actor, "human", "steer must be attributed to the human");
+    assert_eq!(sup.detail["to"], orch.id, "steer must resolve to the orchestrator, not the worker");
+    assert_eq!(sup.detail["text"], "hello orchestrator");
+    // Group isolation: nothing landed in group B's log.
+    assert!(
+        reg.audit_log(&b.id).iter().all(|e| e.action != "prompt-suppressed-paused"),
+        "a steer to group A must not touch group B"
+    );
+}
+
+#[test]
+fn hold_guard_proceeds_immediately_when_quiet() {
+    // No keystrokes recorded (0) → the loop never holds and never reports.
+    let quiet = Duration::from_millis(50);
+    let cap = Duration::from_secs(5);
+    let poll = Duration::from_millis(5);
+    assert_eq!(hold_until_quiet(|| 0, quiet, cap, poll), None);
+}
+
+#[test]
+fn hold_guard_caps_so_reports_are_not_starved() {
+    // u64::MAX = "typed in the future" → always inside the quiet window, so the
+    // ONLY way the loop can exit is the max-hold cap. That it returns at all
+    // proves the starvation backstop fires; the value proves it held ~the cap.
+    let cap = Duration::from_millis(40);
+    let held = hold_until_quiet(|| u64::MAX, Duration::from_millis(50), cap, Duration::from_millis(5))
+        .expect("a capped hold must report its held duration");
+    assert!(held >= 30, "must have held near the cap before delivering, got {held}ms");
+    assert!(held < 2000, "cap must bound the hold, got {held}ms");
+}
+
+#[test]
+fn hold_guard_releases_once_the_human_goes_quiet() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    // "Typing" (future stamp) for the first few polls, then an ancient stamp
+    // (quiet). The loop must hold while typing, then release well before the
+    // cap — exercising the poll loop that consults should_hold_for_user, not
+    // just the pure decision (the #40 wiring lesson).
+    let calls = AtomicU64::new(0);
+    let source = move || {
+        if calls.fetch_add(1, Ordering::Relaxed) < 3 { u64::MAX } else { 1 }
+    };
+    let held = hold_until_quiet(source, Duration::from_millis(50), Duration::from_secs(5), Duration::from_millis(5))
+        .expect("it must report having held while the human was typing");
+    assert!(held < 4000, "must release on quiet, not ride the cap, got {held}ms");
 }

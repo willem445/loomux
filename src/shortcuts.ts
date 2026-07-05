@@ -13,6 +13,7 @@ export type ShortcutAction =
   | "toggle-tasks"
   | "toggle-audit"
   | "toggle-group"
+  | "focus-compose"
   | "maximize-pane"
   | "minimize-pane"
   | "rename-pane"
@@ -46,6 +47,7 @@ export function matchShortcut(e: KeyboardEvent): ShortcutAction | null {
       case "KeyT": return "toggle-tasks";
       case "KeyA": return "toggle-audit";
       case "KeyO": return "toggle-group";
+      case "KeyP": return "focus-compose";
     }
   }
   if (e.code === "F2" && !e.ctrlKey && !e.altKey && !e.shiftKey) return "rename-pane";

@@ -80,6 +80,7 @@ npm test           # unit tests (Node's built-in runner; no extra deps)
 | Minimize pane | `Alt+M` (or —); restore from the dock |
 | Session browser | `Ctrl+Shift+P` (or the *sessions* button) |
 | Open in editor | `Alt+E` (or the `</>` button in a pane header) |
+| Steer orchestrator | `Alt+P` (focus the compose strip under an orchestrator pane); `Esc` returns to the terminal |
 | Copy / paste | `Ctrl+Shift+C` / `Ctrl+Shift+V` (`Ctrl+V` also works) |
 
 Splitting in the same direction adds a sibling column/row — repeated splits
@@ -224,6 +225,20 @@ orchestrator to merge. **✎ Changes** opens a box for your findings, records
 them on the board, and sends them to the orchestrator to route back to a
 worker. Both land as a message in the orchestrator pane, exactly as if you'd
 written it.
+
+**Steering strip:** the orchestrator pane has a thin compose field docked
+under its terminal (styled like the board's *Add a task* field). Type steering
+there and press **Enter** — loomux enqueues it to the orchestrator through the
+*same* serialized delivery path worker reports use, so your message and an
+incoming report can never land in each other's text: the pane's input has
+exactly one writer. Focus the strip with **Alt+P** (or click it); **Esc** hands
+focus back to the terminal. Because it's a loomux field and not the CLI's own
+input box, it never steals the terminal's keys — type freely in the terminal
+and the strip stays out of the way. Steering a paused group or a pane with no
+live orchestrator is reported inline rather than silently dropped. You can
+still type directly into the CLI if you prefer; loomux holds an incoming report
+for a few seconds while it sees you typing there (see the design note), but the
+strip is the collision-proof path.
 
 **Attention routing:** the human is the scheduler's bottleneck, so loomux
 surfaces *which* pane needs you instead of making you scan them. A pane earns a

@@ -215,6 +215,9 @@ document.addEventListener(
       case "toggle-group":
         grid.activePane?.toggleGroupView();
         break;
+      case "focus-compose":
+        grid.activePane?.focusCompose();
+        break;
       case "maximize-pane":
         if (grid.activePane) grid.toggleMaximize(grid.activePane);
         break;
