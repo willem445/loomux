@@ -311,6 +311,11 @@ so it takes a second confirming click; an optional **remove worktrees** checkbox
 also deletes each agent's git worktree (uncommitted changes are lost, but the
 branches — where the PRs live — are always kept). The teardown is audited, closes
 the group's panes for you, and clears any pause so a later relaunch starts clean.
+The panel also carries a **max live agents** stepper (1–12): adjust the cap on
+the fly and loomux persists it, audits the change, and drops a one-line notice
+into the orchestrator pane so it re-plans against the new ceiling. Lowering the
+cap below the current live count never kills anyone — it just blocks new spawns
+until agents finish and attrition brings the count back under the cap.
 The panel also carries a **Fold panes** button — the same group-wide
 minimize/restore toggle as the orchestrator header — for reclaiming screen space
 when a group grows large (see [Rearranging panes](#rearranging-panes)).
@@ -323,9 +328,10 @@ after it starts. Either way, follow-ups on a finished task *resume* that
 worker's session (same context, same workspace) instead of cold-starting a
 new agent or disturbing a busy one — for Claude and Copilot groups alike.
 
-**Guardrails** are enforced by loomux, not the model: a hard cap on live
-agents (≤12), models pinned per role at launch, and the permission mode
-fixed at group creation (native auto mode or acceptEdits — never bypass).
+**Guardrails** are enforced by loomux, not the model: a cap on live agents
+(≤12, set at launch and adjustable live from the lifecycle panel), models
+pinned per role at launch, and the permission mode fixed at group creation
+(native auto mode or acceptEdits — never bypass).
 
 **Restart after loomux closes:** orchestration sessions are marked in the
 session browser (`ORCH` / `W` / `REV` chips). Clicking a dead group's

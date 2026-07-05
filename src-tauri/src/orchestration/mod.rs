@@ -34,6 +34,13 @@ const REVIEWER_TPL: &str = include_str!("templates/reviewer.md");
 
 /// Hard ceiling on `max_agents` regardless of what the launcher asks for.
 const MAX_AGENTS_CEILING: u32 = 12;
+
+/// One-line notice delivered to the orchestrator when the live-agent cap
+/// changes mid-session, so it re-plans against the new ceiling (its kickoff
+/// prompt still carries the old, already-rendered {{MAX_AGENTS}}).
+pub fn max_agents_notice(from: u32, to: u32) -> String {
+    format!("[loomux] max live agents changed {from}→{to} — re-plan accordingly")
+}
 /// Upper bound on the idle-worker auto-kill timeout (24h); 0 disables it.
 const MAX_IDLE_KILL_MINUTES: u32 = 1440;
 /// Upper bound on the spawn-rate guardrail; 0 = unlimited.
@@ -1696,7 +1703,7 @@ impl OrchRegistry {
     /// persist under the repo-derived group id; guardrails are refreshed from
     /// the new launch.
     pub fn create_group(&self, repo: &str, guardrails: Guardrails) -> Result<GroupInfo, String> {
-        let guardrails = guardrails.clamped();
+        let mut guardrails = guardrails.clamped();
         // Base id is repo-derived so a relaunch resumes the same state dir —
         // but a repo can host several *concurrent* orchestrations, and those
         // must never share a group (their orchestrators would receive each
@@ -1709,6 +1716,19 @@ impl OrchRegistry {
         let dir = self.group_dir(&id);
         fs::create_dir_all(dir.join("configs")).map_err(|e| e.to_string())?;
         let resumed = dir.join("group.json").is_file();
+        // The live-agent cap is adjustable mid-session (`set_max_agents`) and
+        // persisted, so it's a durable human choice — like the pause/notify
+        // markers re-seeded below. On resume, prefer the persisted cap over the
+        // caller's param: the launcher hardcodes its default (4) and can't
+        // pre-fill from group.json, so without this a relaunch would silently
+        // revert an on-the-fly adjustment. Other guardrails still refresh from
+        // the launch (only the cap is live-adjustable). Read before the write
+        // below overwrites the file.
+        if resumed {
+            if let Some((_, persisted)) = self.load_group_file(&id) {
+                guardrails.max_agents = persisted.max_agents.clamp(1, MAX_AGENTS_CEILING);
+            }
+        }
         let info = GroupInfo { id: id.clone(), repo: repo.to_string(), guardrails };
         fs::write(
             dir.join("group.json"),
@@ -2047,6 +2067,77 @@ impl OrchRegistry {
         } else if set.remove(group) {
             let _ = fs::remove_file(dir.join("notify"));
             self.audit(group, "human", "notify-off", json!({}));
+        }
+        Ok(())
+    }
+
+    /// Adjust a live group's max live-agent cap on the fly. Bounds are the
+    /// launcher's `1..=MAX_AGENTS_CEILING`. The new value is written to the
+    /// in-memory guardrail (which `spawn_agent` reads fresh on every spawn, so
+    /// it takes effect immediately — nothing caches the creation-time number)
+    /// and persisted to group.json so a restart keeps it, then the change is
+    /// audited and announced to the orchestrator pane. Lowering the cap below
+    /// the current live count kills nobody: new spawns are simply refused until
+    /// attrition brings the count back under the cap. Returns the new value.
+    /// A no-op change (`n` already the current cap) short-circuits without a
+    /// second write, audit, or notice. `actor` records who made the change.
+    pub fn set_max_agents(&self, group: &str, n: u32, actor: &str) -> Result<u32, String> {
+        if !(1..=MAX_AGENTS_CEILING).contains(&n) {
+            return Err(format!("max agents must be between 1 and {MAX_AGENTS_CEILING}"));
+        }
+        let old = self.group(group).ok_or("unknown group")?.guardrails.max_agents;
+        if n == old {
+            return Ok(n);
+        }
+        // Persist first: a failed disk write must leave the in-memory cap (the
+        // value enforcement reads) unchanged, so the two never disagree.
+        self.persist_max_agents(group, n)?;
+        self.groups
+            .lock_safe()
+            .get_mut(group)
+            .ok_or("unknown group")?
+            .guardrails
+            .max_agents = n;
+        self.audit(group, actor, "max-agents-set", json!({ "from": old, "to": n }));
+        // The orchestrator's kickoff prompt already rendered the old
+        // {{MAX_AGENTS}} into static text; announce the new ceiling so it
+        // re-plans (best-effort — a dead/paused orchestrator just misses it).
+        let _ = self.deliver_to_orchestrator(group, &max_agents_notice(old, n), "loomux");
+        Ok(n)
+    }
+
+    /// Rewrite only `guardrails.max_agents` in group.json, preserving every
+    /// other stored field (created_ms, the other guardrails, and anything a
+    /// later feature adds). Patching the parsed JSON in place — rather than
+    /// reserializing a full GroupInfo — keeps this additive and rebase-clean.
+    fn persist_max_agents(&self, group: &str, n: u32) -> Result<(), String> {
+        let dir = self.group_dir(group);
+        let path = dir.join("group.json");
+        let mut v: Value = serde_json::from_str(&fs::read_to_string(&path).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+        // Guard the indexing so a corrupt-but-valid-JSON file (e.g. a `null`
+        // root) fails soft instead of panicking on assignment.
+        let obj = v.as_object_mut().ok_or("group.json root is not a JSON object")?;
+        match obj.get_mut("guardrails").and_then(Value::as_object_mut) {
+            Some(guard) => {
+                guard.insert("max_agents".into(), json!(n));
+            }
+            None => {
+                obj.insert("guardrails".into(), json!({ "max_agents": n }));
+            }
+        }
+        // Crash-safe write: serialize to a temp file, then atomically rename
+        // over group.json (same pattern as usage.json). group.json is
+        // identity-critical — a half-written file breaks the rejoin path
+        // ("group.json is missing") — so never expose a truncated version.
+        let body = serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?;
+        let tmp = dir.join("group.json.tmp");
+        fs::write(&tmp, &body).map_err(|e| e.to_string())?;
+        if fs::rename(&tmp, &path).is_err() {
+            // Rename can fail if the destination exists on some platforms; fall
+            // back to a direct write so the update isn't lost.
+            fs::write(&path, &body).map_err(|e| e.to_string())?;
+            let _ = fs::remove_file(&tmp);
         }
         Ok(())
     }
@@ -2687,6 +2778,11 @@ impl OrchRegistry {
         json!({
             "group": group,
             "live_agents": live.len(),
+            // The current adjustable cap and how many delegates count against
+            // it, so the UI can show the stepper's value and warn when a lower
+            // cap would (harmlessly) block spawns until attrition.
+            "max_agents": self.group(group).map(|g| g.guardrails.max_agents),
+            "live_delegates": worker + reviewer,
             "paused": self.is_paused(group),
             "uptime_ms": earliest.map(|e| now.saturating_sub(e)),
             "roles": { "orchestrator": orch, "worker": worker, "reviewer": reviewer },
@@ -3692,6 +3788,19 @@ pub fn orch_set_notify(
     enabled: bool,
 ) -> Result<(), String> {
     reg.set_notify(&group_id, enabled)
+}
+
+/// Change a live group's max live-agent cap (durable, bounds-checked, audited).
+/// Takes effect on the next spawn; lowering it below the current live count
+/// blocks new spawns until attrition rather than killing anyone. Returns the
+/// applied value. Human action from the GroupView overlay.
+#[tauri::command]
+pub fn orch_set_max_agents(
+    reg: tauri::State<Arc<OrchRegistry>>,
+    group_id: String,
+    max_agents: u32,
+) -> Result<u32, String> {
+    reg.set_max_agents(&group_id, max_agents, "human")
 }
 
 /// Aggregate per-pane session cost/usage into one group summary for the UI.

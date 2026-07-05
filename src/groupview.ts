@@ -3,9 +3,11 @@
 // and running cost — plus the group-level controls that would otherwise mean
 // ✕-clicking panes one by one: pause/resume (from #18's cost containment) and
 // a destructive, confirmed "End orchestration" that kills every agent and can
-// reclaim their worktrees. Read-through-poll like the audit viewer; the only
-// writes are the explicit button actions. Same overlay mechanics as the git /
-// tasks / audit views (never resizes the PTY).
+// reclaim their worktrees, plus a live **max agents** stepper that adjusts the
+// group's live-agent guardrail on the fly (backend persists + audits + tells the
+// orchestrator to re-plan; lowering it never kills anyone). Read-through-poll
+// like the audit viewer; the only writes are the explicit control actions. Same
+// overlay mechanics as the git / tasks / audit views (never resizes the PTY).
 
 import {
   endGroup,
@@ -15,10 +17,17 @@ import {
   notifyEnabled,
   pauseGroup,
   resumeGroup,
+  setMaxAgents,
   setNotify,
   type GroupSummary,
   type GroupUsage,
 } from "./orchestration";
+
+/** Hard bounds on the live-agent cap, mirroring the launcher's input range and
+ *  the backend's `MAX_AGENTS_CEILING`. The backend re-validates; these only
+ *  gate the stepper so an out-of-range click never round-trips. */
+const MIN_MAX_AGENTS = 1;
+const MAX_MAX_AGENTS = 12;
 
 /** How often the panel re-polls the backend while open (uptime ticks, cost
  *  and roster drift). Matches the audit viewer's follow cadence. */
@@ -74,6 +83,11 @@ const ROLE_LABEL: Record<string, string> = {
 export class GroupView {
   readonly el: HTMLElement;
   private summaryEl: HTMLElement;
+  private maxDecBtn: HTMLButtonElement;
+  private maxIncBtn: HTMLButtonElement;
+  private maxInput: HTMLInputElement;
+  private maxNoteEl: HTMLElement;
+  private maxErrEl: HTMLElement;
   private listEl: HTMLElement;
   private pauseBtn: HTMLButtonElement;
   private notifyBtn: HTMLButtonElement;
@@ -113,6 +127,37 @@ export class GroupView {
     head.append(close);
 
     this.summaryEl = el("div", "group-summary");
+
+    // Max live-agent cap: adjustable on the fly. Stepper + direct input, wired
+    // to the guardrail command; the backend persists, audits, and tells the
+    // orchestrator to re-plan. Lowering below the live count kills no one — new
+    // spawns just wait for attrition (see the note line + control tooltip).
+    const maxRow = el("div", "group-maxrow");
+    const maxCtl = el("div", "group-max");
+    maxCtl.title =
+      "Max live workers + reviewers (the orchestrator is exempt). Lowering it below " +
+      "the current live count never kills anyone — new spawns are blocked until agents finish.";
+    maxCtl.append(el("span", "group-max-label", "Max live agents"));
+    this.maxDecBtn = el("button", "group-max-step", "−") as HTMLButtonElement;
+    this.maxDecBtn.title = "Lower the cap";
+    this.maxDecBtn.addEventListener("click", () => void this.nudgeMax(-1));
+    this.maxInput = document.createElement("input");
+    this.maxInput.className = "group-max-input";
+    this.maxInput.type = "number";
+    this.maxInput.min = String(MIN_MAX_AGENTS);
+    this.maxInput.max = String(MAX_MAX_AGENTS);
+    this.maxInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") void this.applyMax(parseInt(this.maxInput.value, 10));
+    });
+    this.maxInput.addEventListener("blur", () => void this.applyMax(parseInt(this.maxInput.value, 10)));
+    this.maxIncBtn = el("button", "group-max-step", "+") as HTMLButtonElement;
+    this.maxIncBtn.title = "Raise the cap";
+    this.maxIncBtn.addEventListener("click", () => void this.nudgeMax(1));
+    maxCtl.append(this.maxDecBtn, this.maxInput, this.maxIncBtn);
+    this.maxNoteEl = el("span", "group-max-note");
+    this.maxErrEl = el("span", "group-max-err");
+    maxRow.append(maxCtl, this.maxNoteEl, this.maxErrEl);
+
     this.listEl = el("div", "group-list");
 
     // Footer: pause/resume + destructive end-orchestration.
@@ -153,7 +198,7 @@ export class GroupView {
     this.toastEl = el("div", "git-toast");
     this.toastEl.hidden = true;
 
-    this.el.append(head, this.summaryEl, this.listEl, foot, this.toastEl);
+    this.el.append(head, this.summaryEl, maxRow, this.listEl, foot, this.toastEl);
   }
 
   /** Called by the pane whenever the overlay is (re)opened. */
@@ -199,6 +244,33 @@ export class GroupView {
       else await pauseGroup(this.groupId);
     } catch (err) {
       this.toast(String(err));
+    }
+    await this.load();
+  }
+
+  /** Step the cap by ±1 from the current backend value. */
+  private nudgeMax(delta: number): void {
+    const cur = this.summary?.max_agents;
+    if (cur == null) return;
+    void this.applyMax(cur + delta);
+  }
+
+  /** Commit a new cap. The backend bounds-checks, persists, audits, and tells
+   *  the orchestrator to re-plan; on rejection we surface the reason inline and
+   *  the poll restores the input to the real value. */
+  private async applyMax(n: number): Promise<void> {
+    this.maxErrEl.textContent = "";
+    if (!Number.isFinite(n)) {
+      await this.load(); // restore the input from a non-numeric entry
+      return;
+    }
+    // Skip a no-op (the backend treats it as one too, but this avoids a
+    // needless round-trip on every input blur).
+    if (n === this.summary?.max_agents) return;
+    try {
+      await setMaxAgents(this.groupId, n);
+    } catch (err) {
+      this.maxErrEl.textContent = String(err);
     }
     await this.load();
   }
@@ -290,6 +362,8 @@ export class GroupView {
 
     if (s.paused) this.summaryEl.append(el("span", "group-paused-badge", "paused"));
 
+    this.renderMax(s);
+
     // Per-agent rows: role chip, name, uptime, state, cost.
     this.listEl.replaceChildren();
     if (s.agents.length === 0) {
@@ -344,5 +418,28 @@ export class GroupView {
     this.notifyBtn.title = this.notify
       ? "Desktop toasts are on for this group — click to turn off"
       : "Turn on OS toasts for reports and idle-with-prompt panes in this group";
+  }
+
+  /** Sync the max-agents stepper to the backend value and reflect whether the
+   *  current cap is below the live count (spawns blocked until attrition). */
+  private renderMax(s: GroupSummary): void {
+    const max = s.max_agents;
+    const known = max != null;
+    this.maxDecBtn.disabled = !known || max <= MIN_MAX_AGENTS;
+    this.maxIncBtn.disabled = !known || max >= MAX_MAX_AGENTS;
+    this.maxInput.disabled = !known;
+    // Don't clobber the value while the human is editing it; the blur/Enter
+    // commit (or its failure) refreshes it.
+    if (document.activeElement !== this.maxInput) {
+      this.maxInput.value = known ? String(max) : "";
+    }
+    // Copy that reassures: lowering the cap never kills a live agent.
+    if (known && max < s.live_delegates) {
+      this.maxNoteEl.textContent = `cap below ${s.live_delegates} live — no one is killed; new spawns wait for attrition`;
+      this.maxNoteEl.classList.add("warn");
+    } else {
+      this.maxNoteEl.textContent = "workers + reviewers cap; the orchestrator is exempt";
+      this.maxNoteEl.classList.remove("warn");
+    }
   }
 }
