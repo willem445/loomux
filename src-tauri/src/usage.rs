@@ -30,7 +30,7 @@ use serde_json::Value;
 use std::collections::HashSet;
 use std::fs;
 use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Exact token counts for a session, split by kind so the UI can show tokens
 /// even when no dollar figure is available.
@@ -81,6 +81,10 @@ pub struct ModelPrice {
 /// the transcript's model id, so `claude-opus-4-8`, `claude-opus-4-7`, … all
 /// resolve to the Opus row. Unknown models return `None` and fall back to
 /// token-only display. To update: change the numbers here and the date above.
+///
+/// Note: these are standard rates. Sonnet 5 has a lower introductory rate
+/// ($2/$10 per 1M) through 2026-08-31; we use the standard $3/$15 so the
+/// estimate never *under*-reports spend. Revisit if the intro rate outlives it.
 pub fn price_for(model: &str) -> Option<ModelPrice> {
     let m = model.to_ascii_lowercase();
     // Order matters only in that each family is a distinct substring.
@@ -195,26 +199,20 @@ pub fn parse_claude_transcript(text: &str) -> SessionUsage {
 // Transcript location
 // ---------------------------------------------------------------------------
 
-/// Root under which Claude Code keeps per-project transcript folders.
-/// `LOOMUX_CLAUDE_PROJECTS_DIR` overrides it so tests (and unusual installs)
-/// can point at a fixture tree without a real `~/.claude`.
-fn claude_projects_root() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("LOOMUX_CLAUDE_PROJECTS_DIR") {
-        if !p.is_empty() {
-            return Some(PathBuf::from(p));
-        }
-    }
+/// Default root under which Claude Code keeps per-project transcript folders.
+/// Callers can override it (see `claude_session_usage_in`) so tests point at a
+/// fixture tree without a real `~/.claude` and without touching global state.
+pub fn default_claude_projects_root() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".claude").join("projects"))
 }
 
-/// Locate a session's transcript file by scanning the project folders for
-/// `<session-id>.jsonl`. Claude encodes the cwd into the folder name, so the
-/// file could be under any of them; a direct scan avoids re-deriving that
-/// encoding. `None` if no transcript exists yet.
-fn claude_transcript_path(session_id: &str) -> Option<PathBuf> {
-    let root = claude_projects_root()?;
+/// Locate a session's transcript file under `root` by scanning the project
+/// folders for `<session-id>.jsonl`. Claude encodes the cwd into the folder
+/// name, so the file could be under any of them; a direct scan avoids
+/// re-deriving that encoding. `None` if no transcript exists yet.
+fn claude_transcript_path(root: &Path, session_id: &str) -> Option<PathBuf> {
     let name = format!("{session_id}.jsonl");
-    let projects = fs::read_dir(&root).ok()?;
+    let projects = fs::read_dir(root).ok()?;
     for project in projects.flatten() {
         let candidate = project.path().join(&name);
         if candidate.is_file() {
@@ -224,10 +222,19 @@ fn claude_transcript_path(session_id: &str) -> Option<PathBuf> {
     None
 }
 
-/// Read and sum a Claude session's usage from its transcript. `None` when the
-/// transcript can't be found or opened (session not started, wrong CLI, etc.).
+/// Read and sum a Claude session's usage from a transcript under the default
+/// `~/.claude/projects` root. `None` when the root can't be resolved or the
+/// transcript can't be found/opened.
 pub fn claude_session_usage(session_id: &str) -> Option<SessionUsage> {
-    let path = claude_transcript_path(session_id)?;
+    let root = default_claude_projects_root()?;
+    claude_session_usage_in(&root, session_id)
+}
+
+/// Read and sum a Claude session's usage from a transcript under an explicit
+/// projects `root`. Lets the orchestration layer (and its tests) point at any
+/// tree. `None` when the transcript can't be found or opened.
+pub fn claude_session_usage_in(root: &Path, session_id: &str) -> Option<SessionUsage> {
+    let path = claude_transcript_path(root, session_id)?;
     let file = fs::File::open(&path).ok()?;
     // Read the whole file line by line rather than into one big string: these
     // transcripts can be large, and we only keep running totals.

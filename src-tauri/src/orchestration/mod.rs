@@ -632,6 +632,11 @@ pub struct OrchRegistry {
     attn_emitted: Mutex<HashMap<String, String>>,
     /// Groups with desktop notifications enabled (durable `notify` marker file).
     notify_groups: Mutex<HashSet<String>>,
+    /// Test-only override of the Claude transcript root (`~/.claude/projects`).
+    /// `None` in production. Set via `set_claude_projects_dir` so the usage
+    /// reader can be pointed at a fixture tree without touching global env —
+    /// safe under parallel test execution.
+    claude_projects_dir: Mutex<Option<PathBuf>>,
 }
 
 fn now_ms() -> u64 {
@@ -931,7 +936,15 @@ impl OrchRegistry {
             attn_quiet: Mutex::new(HashMap::new()),
             attn_emitted: Mutex::new(HashMap::new()),
             notify_groups: Mutex::new(HashSet::new()),
+            claude_projects_dir: Mutex::new(None),
         }
+    }
+
+    /// Point the usage reader at a specific Claude transcript root, instead of
+    /// `~/.claude/projects`. Test-only seam (see `claude_projects_dir`).
+    #[doc(hidden)]
+    pub fn set_claude_projects_dir(&self, dir: PathBuf) {
+        *self.claude_projects_dir.lock().unwrap() = Some(dir);
     }
 
     /// Record the `Arc` the registry is stored behind so `&self` methods can
@@ -2050,7 +2063,17 @@ impl OrchRegistry {
         // `usage` module's design note), so it falls through to the statusline.
         if cli == "claude" {
             if let Some(sid) = entry.session_id.as_deref() {
-                if let Some(u) = crate::usage::claude_session_usage(sid) {
+                // Use the test override when set, else the default ~/.claude root.
+                let root = self
+                    .claude_projects_dir
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .or_else(crate::usage::default_claude_projects_root);
+                if let Some(u) = root
+                    .as_deref()
+                    .and_then(|r| crate::usage::claude_session_usage_in(r, sid))
+                {
                     if u.tokens.total() > 0 {
                         snap.source = "transcript".to_string();
                         snap.input_tokens = u.tokens.input_tokens;
@@ -2084,10 +2107,24 @@ impl OrchRegistry {
     }
 
     fn load_usage_snapshots(&self, group: &str) -> Vec<UsageSnapshot> {
-        fs::read_to_string(self.group_dir(group).join("usage.json"))
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+        let path = self.group_dir(group).join("usage.json");
+        let Ok(text) = fs::read_to_string(&path) else {
+            return Vec::new(); // absent is normal (no usage yet)
+        };
+        match serde_json::from_str(&text) {
+            Ok(list) => list,
+            Err(e) => {
+                // The file exists but is corrupt (interrupted write, manual
+                // edit). Silently treating it as empty would wipe all
+                // killed-agent history, so preserve it for inspection and
+                // start fresh rather than overwrite it on the next upsert.
+                let bad = path.with_extension("json.bad");
+                let _ = fs::rename(&path, &bad);
+                self.audit(group, "loomux", "usage-corrupt",
+                    json!({ "error": e.to_string(), "preserved": bad.to_string_lossy() }));
+                Vec::new()
+            }
+        }
     }
 
     /// Upsert one agent's snapshot into the group's durable `usage.json`,
@@ -2129,11 +2166,22 @@ impl OrchRegistry {
             }
             None => list.push(snap),
         }
-        let _ = fs::create_dir_all(self.group_dir(group));
-        let _ = fs::write(
-            self.group_dir(group).join("usage.json"),
-            serde_json::to_string_pretty(&list).unwrap(),
-        );
+        let dir = self.group_dir(group);
+        let _ = fs::create_dir_all(&dir);
+        // Crash-safe write: serialize to a temp file, then atomically rename
+        // over usage.json. A crash mid-write leaves the old (valid) file or
+        // the temp file behind, never a half-written usage.json.
+        let path = dir.join("usage.json");
+        let tmp = dir.join("usage.json.tmp");
+        let body = serde_json::to_string_pretty(&list).unwrap();
+        if fs::write(&tmp, &body).is_ok() {
+            if fs::rename(&tmp, &path).is_err() {
+                // Rename can fail if the destination exists on some platforms;
+                // fall back to a direct write so we don't lose the update.
+                let _ = fs::write(&path, &body);
+                let _ = fs::remove_file(&tmp);
+            }
+        }
     }
 
     /// Aggregate the group's usage into one summary with a **live vs lifetime**
@@ -2172,7 +2220,10 @@ impl OrchRegistry {
         let (mut live_cost, mut lifetime_cost) = (0.0f64, 0.0f64);
         let (mut live_cost_known, mut lifetime_cost_known) = (false, false);
         let (mut live_tokens, mut lifetime_tokens) = (0u64, 0u64);
-        let mut estimated_any = false;
+        // Track whether each total mixes token-estimated and CLI-reported
+        // dollars, so we never blend them under one honest label.
+        let (mut live_est, mut live_rep) = (false, false);
+        let (mut lifetime_est, mut lifetime_rep) = (false, false);
         let mut rows: Vec<Value> = Vec::new();
 
         for s in &snaps {
@@ -2186,7 +2237,9 @@ impl OrchRegistry {
                 lifetime_cost += c;
                 lifetime_cost_known = true;
                 if s.estimated {
-                    estimated_any = true;
+                    lifetime_est = true;
+                } else {
+                    lifetime_rep = true;
                 }
             }
             if live {
@@ -2194,6 +2247,11 @@ impl OrchRegistry {
                 if let Some(c) = s.cost_usd {
                     live_cost += c;
                     live_cost_known = true;
+                    if s.estimated {
+                        live_est = true;
+                    } else {
+                        live_rep = true;
+                    }
                 }
             }
             rows.push(json!({
@@ -2216,14 +2274,26 @@ impl OrchRegistry {
         }
         rows.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
 
+        // How to label each dollar total: all token-estimated, all
+        // CLI-reported, or a mix. `null` when there is no cost figure.
+        let basis = |est: bool, rep: bool| -> Option<&'static str> {
+            match (est, rep) {
+                (true, true) => Some("mixed"),
+                (true, false) => Some("estimated"),
+                (false, true) => Some("reported"),
+                (false, false) => None,
+            }
+        };
+
         json!({
             "group": group,
             "cli": cli,
             "live_cost_usd": live_cost_known.then_some(live_cost),
             "lifetime_cost_usd": lifetime_cost_known.then_some(lifetime_cost),
+            "live_cost_basis": basis(live_est, live_rep),
+            "lifetime_cost_basis": basis(lifetime_est, lifetime_rep),
             "live_tokens": live_tokens,
             "lifetime_tokens": lifetime_tokens,
-            "estimated": estimated_any,
             "agents": rows,
             "note": "Tokens come from each agent's session transcript and are exact; dollar figures are estimated from a dated model price table. Subscription/Max accounts have no marginal dollar cost (the CLI statusline shows $0.00), so tokens are the reliable metric. Killed/recycled agents stay in the lifetime total; statusline-parsed dollars are a last-resort fallback.",
         })

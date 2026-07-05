@@ -53,6 +53,18 @@ function fmtTokens(n: number): string {
   return `${(n / 1_000_000).toFixed(2)}M`;
 }
 
+/** Format a dollar total with its basis label. Estimated/mixed totals get a
+ *  `~` (they include price-table estimates); a purely CLI-`reported` total does
+ *  not. `mixed` means the total blends estimated and reported figures. */
+function costWithBasis(
+  n: number,
+  basis: "estimated" | "reported" | "mixed" | null
+): string {
+  const approx = basis === "reported" ? "" : "~";
+  const label = basis ? ` ${basis === "estimated" ? "est" : basis}` : "";
+  return `${approx}${fmtCost(n)}${label}`;
+}
+
 const ROLE_LABEL: Record<string, string> = {
   orchestrator: "ORCH",
   worker: "W",
@@ -249,19 +261,18 @@ export class GroupView {
     // Lifetime includes killed/recycled agents; live is the current burn.
     const u = this.usage;
     const lifetimeCost = u?.lifetime_cost_usd ?? null;
-    const est = u?.estimated ? " est" : "";
     const parts: string[] = [`${fmtTokens(u?.lifetime_tokens ?? 0)} tok`];
-    if (lifetimeCost != null) parts.unshift(`~${fmtCost(lifetimeCost)}${est}`);
+    if (lifetimeCost != null) parts.unshift(costWithBasis(lifetimeCost, u?.lifetime_cost_basis ?? null));
     const cost = el("div", "group-cost", `group lifetime cost — ${parts.join(" · ")}`);
     cost.title =
-      "Tokens come from each agent's session transcript and are exact. Dollars are estimated from a dated model price table — subscription/Max accounts show $0.00 in the CLI regardless of usage, so tokens are the reliable metric. Lifetime includes killed/recycled agents.";
+      "Tokens come from each agent's session transcript and are exact. Dollars are estimated from a dated model price table — subscription/Max accounts show $0.00 in the CLI regardless of usage, so tokens are the reliable metric. 'reported' = the CLI's own figure; 'mixed' = a blend of both. Lifetime includes killed/recycled agents.";
     this.summaryEl.append(cost);
 
     // Live burn (current agents only), shown when it differs from lifetime.
     const liveCost = u?.live_cost_usd ?? null;
     const liveTok = u?.live_tokens ?? 0;
     const liveParts: string[] = [`${fmtTokens(liveTok)} tok`];
-    if (liveCost != null) liveParts.unshift(`~${fmtCost(liveCost)}${est}`);
+    if (liveCost != null) liveParts.unshift(costWithBasis(liveCost, u?.live_cost_basis ?? null));
     const live = el("div", "group-cost-live", `live — ${liveParts.join(" · ")}`);
     this.summaryEl.append(live);
 

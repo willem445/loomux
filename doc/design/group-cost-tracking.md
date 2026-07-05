@@ -47,8 +47,10 @@ non-assistant lines and non-billable `<synthetic>` models.
 **Limits.** The transcript records tokens, not dollars — so dollar cost is
 always our own estimate (see the price table). Tokens are exact regardless of
 plan. Locating the file is a scan of the project folders for `<session>.jsonl`
-(the cwd→folder encoding is not re-derived). `LOOMUX_CLAUDE_PROJECTS_DIR`
-overrides the root for tests.
+(the cwd→folder encoding is not re-derived). The projects root is
+`~/.claude/projects` by default; the registry exposes a per-instance override
+(`set_claude_projects_dir`) so tests point at a fixture tree without touching
+global state (safe under parallel execution).
 
 ### Copilot CLI — no readable token record today (fallback only)
 
@@ -93,12 +95,20 @@ is cumulative.
   read that comes back empty (transient failure, or a Copilot pane that never
   wrote a token record) must not zero a session's captured spend; the merge
   keeps the richer data and just refreshes identity.
+- **Crash-safe persistence.** Writes go to `usage.json.tmp` and are atomically
+  renamed over `usage.json`, so a crash mid-write never leaves a half-written
+  file. On load, a parse failure (corruption, manual edit) preserves the file
+  as `usage.json.bad` and audits it, rather than silently treating it as empty
+  and overwriting all killed-agent history on the next upsert.
 
-`group_usage` returns `{ live_cost_usd, lifetime_cost_usd, live_tokens,
-lifetime_tokens, estimated, agents:[…] }`. Lifetime sums all snapshots; live
-sums only currently-live agents. Each agent row carries its token breakdown,
-`source` (`transcript`/`statusline`/`none`), `model`, `cost_usd`, and an
-`estimated` flag.
+`group_usage` returns `{ live_cost_usd, lifetime_cost_usd, live_cost_basis,
+lifetime_cost_basis, live_tokens, lifetime_tokens, agents:[…] }`. Lifetime sums
+all snapshots; live sums only currently-live agents. Each total's `*_cost_basis`
+is `estimated` (all token-derived), `reported` (all CLI statusline), `mixed`, or
+`null` — so a total that blends estimated and reported dollars is never hidden
+under one label. Each agent row carries its token breakdown, `source`
+(`transcript`/`statusline`/`none`), `model`, `cost_usd`, and an `estimated`
+flag.
 
 ## UI (GroupView)
 
@@ -114,6 +124,9 @@ tooltip giving the source, model, and full token breakdown.
   pricing, message-id dedup, skipping non-assistant/synthetic/malformed lines,
   unknown-model → token-only, empty transcript.
 - Integration tests (`tests/orchestration.rs`): a killed agent stays in the
-  lifetime total but drops out of live (with the no-downgrade merge), and
-  `mark_dead` captures usage from a fixture transcript with no prior
-  `group_usage` call. No test ever spawns a real agent CLI.
+  lifetime total but drops out of live (with the no-downgrade merge);
+  `mark_dead` captures usage from a fixture transcript (via the registry
+  override) with no prior `group_usage` call; the durable write is atomic and
+  leaves no temp file; a corrupt `usage.json` is preserved as `.bad` rather than
+  wiped; and a total blending estimated and reported dollars is labelled
+  `mixed`. No test ever spawns a real agent CLI.

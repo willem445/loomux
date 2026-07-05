@@ -267,10 +267,13 @@ export interface GroupUsage {
   live_cost_usd: number | null;
   /** Cost across all agents ever in this group (survives kills), or null. */
   lifetime_cost_usd: number | null;
+  /** How to read the live total: token-`estimated`, CLI-`reported`, or a
+   *  `mixed` blend of both; null when there is no figure. */
+  live_cost_basis: "estimated" | "reported" | "mixed" | null;
+  /** Same, for the lifetime total. */
+  lifetime_cost_basis: "estimated" | "reported" | "mixed" | null;
   live_tokens: number;
   lifetime_tokens: number;
-  /** True when any dollar figure is a price-table estimate (vs CLI-reported). */
-  estimated: boolean;
   agents: AgentUsage[];
   note: string;
 }

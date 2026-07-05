@@ -1748,11 +1748,11 @@ fn killed_agent_stays_in_lifetime_total_but_not_live() {
 
 #[test]
 fn mark_dead_captures_usage_from_transcript() {
-    // Point the usage reader at a fixture transcript tree instead of ~/.claude.
+    // Point the usage reader at a fixture transcript tree instead of ~/.claude,
+    // via a per-registry override (no global env — safe under parallel runs).
     let proj = tempfile::tempdir().unwrap();
-    std::env::set_var("LOOMUX_CLAUDE_PROJECTS_DIR", proj.path());
-
     let (reg, _d) = test_registry();
+    reg.set_claude_projects_dir(proj.path().to_path_buf());
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
     let w = reg.spawn_agent(&g.id, Role::Worker, "w", "task", false, None).unwrap();
     let sid = w.session_id.clone().unwrap();
@@ -1783,8 +1783,67 @@ fn mark_dead_captures_usage_from_transcript() {
     // Opus: (1000*5 + 500*25) / 1e6 = 0.0175
     let expect = (1000.0 * 5.0 + 500.0 * 25.0) / 1_000_000.0;
     assert!((usage["lifetime_cost_usd"].as_f64().unwrap() - expect).abs() < 1e-9);
+    // Token-derived → labelled estimated, not reported.
+    assert_eq!(usage["lifetime_cost_basis"], "estimated");
+}
 
-    std::env::remove_var("LOOMUX_CLAUDE_PROJECTS_DIR");
+#[test]
+fn usage_json_write_is_atomic_and_leaves_no_temp() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    reg.upsert_usage_snapshot(&g.id, usage_snap("sess-a", "w-1", 0.50, 100, 200));
+
+    let gdir = reg.state_root().join(&g.id);
+    let path = gdir.join("usage.json");
+    assert!(path.is_file(), "usage.json must exist after upsert");
+    assert!(!gdir.join("usage.json.tmp").is_file(), "temp file must be cleaned up");
+    // Round-trips as valid JSON with the snapshot.
+    let list: Vec<UsageSnapshot> =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].key, "sess-a");
+}
+
+#[test]
+fn corrupt_usage_json_is_preserved_not_silently_wiped() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let gdir = reg.state_root().join(&g.id);
+    fs::create_dir_all(&gdir).unwrap();
+    let path = gdir.join("usage.json");
+    // Simulate a half-written / hand-mangled file.
+    fs::write(&path, "{ this is not valid json ").unwrap();
+
+    // The next upsert must not treat corruption as "empty and overwrite" — it
+    // preserves the bad file so no killed-agent history is silently lost.
+    reg.upsert_usage_snapshot(&g.id, usage_snap("sess-b", "w-2", 1.25, 300, 400));
+
+    let bad = gdir.join("usage.json.bad");
+    assert!(bad.is_file(), "corrupt file must be preserved as usage.json.bad");
+    assert_eq!(fs::read_to_string(&bad).unwrap(), "{ this is not valid json ");
+    // usage.json is now valid and holds the new snapshot.
+    let list: Vec<UsageSnapshot> =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].key, "sess-b");
+}
+
+#[test]
+fn mixed_estimated_and_reported_totals_are_labelled_mixed() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    // One transcript-estimated snapshot and one statusline-reported one.
+    reg.upsert_usage_snapshot(&g.id, usage_snap("sess-est", "w-1", 1.00, 100, 100));
+    let mut reported = usage_snap("sess-rep", "w-2", 2.00, 0, 0);
+    reported.source = "statusline".to_string();
+    reported.estimated = false;
+    reg.upsert_usage_snapshot(&g.id, reported);
+
+    let usage = reg.group_usage(&g.id);
+    // Neither agent is live (no panes), so this exercises the lifetime total.
+    assert!((usage["lifetime_cost_usd"].as_f64().unwrap() - 3.00).abs() < 1e-9);
+    assert_eq!(usage["lifetime_cost_basis"], "mixed",
+        "estimated + reported dollars must not hide under one label");
 }
 
 #[test]
