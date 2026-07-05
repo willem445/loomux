@@ -21,7 +21,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU16, AtomicU32, Ordering};
 use std::sync::{mpsc, Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
@@ -72,6 +72,22 @@ const SUBMIT_QUIET: Duration = Duration::from_millis(1000);
 const SUBMIT_MAX_WAIT: Duration = Duration::from_secs(45);
 /// Spaced blind Enter retries after the first (no-ops once submitted).
 const SUBMIT_RETRY_DELAYS: [Duration; 2] = [Duration::from_millis(2500), Duration::from_millis(4500)];
+
+// Deferral-based prompt protection (#43): before pasting a delivery into a pane
+// the human may be typing in, HOLD it so a worker report never merges into
+// their half-written prompt and Enter never submits the mix. Combined policy —
+// typing-aware (A): a recent keystroke defers delivery; focus-aware (B): while
+// the pane is focused, the human may type at any moment, so require a longer
+// keyboard-quiet gap. See `hold_decision` for the pure policy.
+/// Focused pane: deliver only once the human has been keyboard-quiet this long.
+const HOLD_FOCUSED_QUIET_MS: u64 = 10_000;
+/// Unfocused pane: a keystroke this recent still holds delivery (Option A guard).
+const HOLD_TYPING_GUARD_MS: u64 = 4_000;
+/// Hard cap on total hold: past this, deliver anyway (with an audit entry) so a
+/// long compose session can't starve reports forever.
+const HOLD_MAX_MS: u64 = 120_000;
+/// Poll interval while a delivery is held waiting for the human.
+const HOLD_POLL: Duration = Duration::from_millis(250);
 
 // Kickoff readiness: a fixed boot delay loses the race on a loaded machine
 // (a CLI that boots slower than the delay flushes the pasted prompt along
@@ -693,6 +709,16 @@ pub struct OrchRegistry {
     /// reader can be pointed at a fixture tree without touching global env —
     /// safe under parallel test execution.
     claude_projects_dir: Mutex<Option<PathBuf>>,
+    /// Focus-aware deferral (#43): pty id of the pane the human currently has
+    /// focused, or -1 for none. Set by `orch_set_focused_pane` from the
+    /// frontend; read by held deliveries so a report waits while the human
+    /// might type into the focused pane. `Arc` so it can move into the
+    /// (self-less) delivery thread.
+    focused_pty: Arc<AtomicI64>,
+    /// Deferral (#43): per-pty count of deliveries currently held waiting for
+    /// the human to go quiet / click away. Drives the "N waiting" header chip
+    /// via the `orch-waiting` event. `Arc` so the delivery thread can update it.
+    waiting: Arc<Mutex<HashMap<u32, u32>>>,
 }
 
 fn now_ms() -> u64 {
@@ -951,6 +977,102 @@ pub fn strip_ansi(bytes: &[u8]) -> String {
     out
 }
 
+/// Snapshot the deferral policy needs to decide one held delivery (#43). Pure
+/// data so the policy is unit-testable without a live pane or clock.
+pub struct HoldInputs {
+    /// Current time, Unix-ms.
+    pub now_ms: u64,
+    /// Whether this pane is the one the human currently has focused.
+    pub focused: bool,
+    /// Unix-ms of the last human keystroke into this pane (0 = never typed).
+    pub last_input_ms: u64,
+    /// Unix-ms this delivery first began waiting (drives the hard cap).
+    pub first_held_ms: u64,
+}
+
+/// What to do with a held delivery at one poll.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HoldDecision {
+    /// Safe to paste now.
+    Deliver,
+    /// Held past the hard cap — deliver anyway; the caller writes an audit entry.
+    DeliverCapped,
+    /// Keep holding; the human may still be typing.
+    Hold,
+}
+
+/// Combined typing-aware (A) + focus-aware (B) deferral policy for delivering a
+/// prompt to a pane the human may be typing in (#43).
+///
+/// Deliver when the pane is UNFOCUSED and the human has been keyboard-quiet
+/// past the typing guard, OR when it is FOCUSED but quiet past the longer
+/// focused threshold (they're watching the pane and may type any moment). Hold
+/// otherwise — until a hard cap, past which we deliver regardless so a long
+/// compose session can't starve reports. Pure: no clock, no I/O.
+pub fn hold_decision(i: &HoldInputs) -> HoldDecision {
+    if i.now_ms.saturating_sub(i.first_held_ms) >= HOLD_MAX_MS {
+        return HoldDecision::DeliverCapped;
+    }
+    let quiet_ms = i.now_ms.saturating_sub(i.last_input_ms);
+    let threshold = if i.focused { HOLD_FOCUSED_QUIET_MS } else { HOLD_TYPING_GUARD_MS };
+    if quiet_ms >= threshold {
+        HoldDecision::Deliver
+    } else {
+        HoldDecision::Hold
+    }
+}
+
+/// Adjust the held-delivery count for a pane and push the new total to the
+/// frontend so it can show / clear the "N waiting" header chip (#43). Runs on
+/// the delivery thread (no `&self`), so it takes the shared state directly.
+fn adjust_waiting(app: &AppHandle, waiting: &Mutex<HashMap<u32, u32>>, pty_id: u32, delta: i32) {
+    let count = {
+        let mut w = waiting.lock().unwrap();
+        let n = w.entry(pty_id).or_insert(0);
+        *n = (*n as i32 + delta).max(0) as u32;
+        let c = *n;
+        if c == 0 {
+            w.remove(&pty_id);
+        }
+        c
+    };
+    let _ = app.emit("orch-waiting", json!({ "pty_id": pty_id, "count": count }));
+}
+
+/// Block the delivery thread until the deferral policy (`hold_decision`) says
+/// this delivery may proceed, showing the "N waiting" chip on the pane while it
+/// holds (#43). Returns true if released by the hard cap (caller audits).
+#[allow(clippy::too_many_arguments)]
+fn hold_for_human(
+    app: &AppHandle,
+    ptys: &crate::pty::PtyManager,
+    focused_pty: &AtomicI64,
+    waiting: &Mutex<HashMap<u32, u32>>,
+    pty_id: u32,
+    first_held_ms: u64,
+) -> bool {
+    let mut counted = false;
+    let capped = loop {
+        let focused = focused_pty.load(Ordering::Relaxed) == pty_id as i64;
+        let last_input_ms = ptys.last_user_input_ms(pty_id).unwrap_or(0);
+        match hold_decision(&HoldInputs { now_ms: now_ms(), focused, last_input_ms, first_held_ms }) {
+            HoldDecision::Deliver => break false,
+            HoldDecision::DeliverCapped => break true,
+            HoldDecision::Hold => {
+                if !counted {
+                    counted = true;
+                    adjust_waiting(app, waiting, pty_id, 1);
+                }
+                std::thread::sleep(HOLD_POLL);
+            }
+        }
+    };
+    if counted {
+        adjust_waiting(app, waiting, pty_id, -1);
+    }
+    capped
+}
+
 /// Decide whether a freshly spawned CLI is ready to receive typed input,
 /// from its output volume and how long that output has been stable. Pure so
 /// the thresholds are testable; the polling loop lives in `deliver_prompt`.
@@ -994,7 +1116,17 @@ impl OrchRegistry {
             attn_emitted: Mutex::new(HashMap::new()),
             notify_groups: Mutex::new(HashSet::new()),
             claude_projects_dir: Mutex::new(None),
+            focused_pty: Arc::new(AtomicI64::new(-1)),
+            waiting: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Focus-aware deferral (#43): record which pane the human currently has
+    /// focused (or `None`), so held deliveries to that pane keep waiting while
+    /// the human might type into it. Called from `orch_set_focused_pane`.
+    pub fn set_focused_pane(&self, pty_id: Option<u32>) {
+        self.focused_pty
+            .store(pty_id.map(|p| p as i64).unwrap_or(-1), Ordering::Relaxed);
     }
 
     /// Point the usage reader at a specific Claude transcript root, instead of
@@ -3126,9 +3258,23 @@ impl OrchRegistry {
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone();
         let (root, group, agent) = (self.root.clone(), a.group.clone(), a.id.clone());
+        let focused_pty = self.focused_pty.clone();
+        let waiting = self.waiting.clone();
         std::thread::spawn(move || {
             let _guard = lock.lock().unwrap();
             let ptys = app.state::<crate::pty::PtyManager>();
+
+            // Deferral gate (#43): hold the whole delivery while the human may
+            // be typing into this pane. The cap is measured from here, so the
+            // pre-paste and pre-Enter re-checks below share this instant.
+            let first_held_ms = now_ms();
+            let hold = |ptys: &crate::pty::PtyManager| {
+                if hold_for_human(&app, ptys, &focused_pty, &waiting, pty_id, first_held_ms) {
+                    append_audit(&root, &group, "loomux", "prompt-hold-capped",
+                        json!({ "to": agent, "reason": "held past max hold; delivered anyway" }));
+                }
+            };
+            hold(&ptys);
 
             let start = std::time::Instant::now();
             if wait_ready {
@@ -3155,6 +3301,10 @@ impl OrchRegistry {
                     }
                 }
             }
+
+            // Re-check the deferral gate immediately before the paste: the
+            // human may have started typing during the readiness wait (#43).
+            hold(&ptys);
 
             // Echo-verified typing: paste, then require the TUI to emit
             // output (its input box redrawing). No echo means the CLI
@@ -3221,6 +3371,11 @@ impl OrchRegistry {
                     }
                 }
             }
+            // Final deferral re-check before the first Enter: the paste is now
+            // in the box, and a blind Enter while the human is typing would
+            // submit their text merged with ours (#43). The retry Enters below
+            // are already guarded by `last_user_input_ms`.
+            hold(&ptys);
             let submit_sent_ms = now_ms();
             let _ = ptys.write_bytes(pty_id, b"\r");
             for delay in SUBMIT_RETRY_DELAYS {
@@ -3478,6 +3633,14 @@ pub fn orch_resume_group(reg: tauri::State<Arc<OrchRegistry>>, group_id: String)
 #[tauri::command]
 pub fn orch_group_paused(reg: tauri::State<Arc<OrchRegistry>>, group_id: String) -> bool {
     reg.is_paused(&group_id)
+}
+
+/// The human focused a different pane (or none): record its pty so held
+/// deliveries keep waiting while the human might type into the focused pane
+/// (#43). `None` clears focus (e.g. the last pane closed).
+#[tauri::command]
+pub fn orch_set_focused_pane(reg: tauri::State<Arc<OrchRegistry>>, pty_id: Option<u32>) {
+    reg.set_focused_pane(pty_id);
 }
 
 // ---------- attention routing (human side) ----------

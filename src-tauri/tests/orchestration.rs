@@ -8,11 +8,11 @@
 
 use loomux_lib::orchestration::mcp::dispatch;
 use loomux_lib::orchestration::{
-    add_trusted_folder, bracketed_paste, cli_ready, create_orchestration_group, idle_should_kill,
-    normalize_remote_web_base, parse_audit_lines, parse_session_cost, prompt_wait_detected,
-    resolve_ref_url, rotate_audit_if_needed, spawn_rate_exceeded, strip_ansi,
+    add_trusted_folder, bracketed_paste, cli_ready, create_orchestration_group, hold_decision,
+    idle_should_kill, normalize_remote_web_base, parse_audit_lines, parse_session_cost,
+    prompt_wait_detected, resolve_ref_url, rotate_audit_if_needed, spawn_rate_exceeded, strip_ansi,
     watchdog_should_notify, worktree_cleanup_targets, AttentionItem, Caller, Guardrails,
-    OrchRegistry, Role, TaskPatch, UsageSnapshot,
+    HoldDecision, HoldInputs, OrchRegistry, Role, TaskPatch, UsageSnapshot,
 };
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -33,6 +33,42 @@ fn kickoff_readiness_waits_for_painted_and_quiet_cli() {
     assert!(!cli_ready(4096, s(1), ms(800)));
     // Painted + quiet + past the minimum wait → ready.
     assert!(cli_ready(4096, s(2), s(3)));
+}
+
+#[test]
+fn hold_policy_defers_delivery_while_the_human_may_type() {
+    // Deferral policy (#43). `now` is a fixed clock; `last_input`/`first_held`
+    // are offsets back from it. The delivery just started (no cap pressure).
+    let now = 1_000_000u64;
+    let d = |focused: bool, quiet_ms: u64| {
+        hold_decision(&HoldInputs {
+            now_ms: now,
+            focused,
+            last_input_ms: now - quiet_ms,
+            first_held_ms: now, // 0ms held → cap not in play
+        })
+    };
+
+    // Unfocused pane: a keystroke within the ~4s typing guard still holds (A);
+    // once quiet past it, deliver.
+    assert_eq!(d(false, 1_000), HoldDecision::Hold);
+    assert_eq!(d(false, 5_000), HoldDecision::Deliver);
+
+    // Focused pane: the human may type any moment, so hold until a longer
+    // (~10s) keyboard-quiet gap — a 5s pause that would release an unfocused
+    // pane still holds a focused one (B).
+    assert_eq!(d(true, 5_000), HoldDecision::Hold);
+    assert_eq!(d(true, 11_000), HoldDecision::Deliver);
+
+    // Hard cap: held past the max, deliver anyway even while actively typing
+    // into the focused pane — a long compose session can't starve reports.
+    let capped = hold_decision(&HoldInputs {
+        now_ms: now,
+        focused: true,
+        last_input_ms: now, // typing right now
+        first_held_ms: now - 121_000, // held > 120s
+    });
+    assert_eq!(capped, HoldDecision::DeliverCapped);
 }
 
 fn rails() -> Guardrails {

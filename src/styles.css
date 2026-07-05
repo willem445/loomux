@@ -291,6 +291,17 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   .pane-attn { animation: none; }
 }
 
+/* ---------- deferral "N waiting" chip (#43) ---------- */
+/* Report deliveries the backend is holding while the human may be typing in
+   this pane. Informational (not a button) and deliberately calmer than the
+   attention chip — no pulse — so it reads as "pending", not "act now". */
+.pane-waiting {
+  flex: none;
+  font-size: 9px; font-weight: 700; letter-spacing: 0.4px;
+  border: 1px solid #3a4a63; border-radius: 4px; padding: 1.5px 6px;
+  color: #9db4d6; background: rgba(122, 162, 224, 0.14);
+}
+
 /* ---------- pane metadata (folder · branch) ---------- */
 .pane-meta {
   flex: 1 1 auto; min-width: 0;

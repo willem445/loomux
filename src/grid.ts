@@ -12,6 +12,7 @@
 import { Pane, type PaneEvents, type PaneOptions } from "./pane";
 import { dropZoneFor, indicatorFor, zoneToPlacement, type DropZone } from "./layout";
 import { dockChipAttention } from "./attention";
+import { invoke } from "@tauri-apps/api/core";
 
 type Dir = "row" | "column";
 
@@ -263,6 +264,9 @@ export class Grid {
     this.active?.setActive(false);
     this.active = pane;
     pane.setActive(true);
+    // Focus-aware deferral (#43): tell the backend which pane is focused so it
+    // holds worker-report deliveries to a pane the human may be typing in.
+    invoke("orch_set_focused_pane", { ptyId: pane.ptyId }).catch(() => {});
   }
 
   // ---------- maximize ----------

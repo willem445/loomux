@@ -166,6 +166,13 @@ export function initOrchestration(grid: Grid, paneEvents: PaneEvents): void {
       pane.setAttention(it ? it.reason : null, it?.detail);
     }
   });
+  // Deferral "N waiting" chip (#43): the backend holds report deliveries to a
+  // pane the human may be typing in and pushes the current held-count per pty.
+  // Show it on that pane's header so the human knows to click away to release.
+  void listen<{ pty_id: number; count: number }>("orch-waiting", ({ payload }) => {
+    const pane = grid.findByPtyId(payload.pty_id);
+    pane?.setWaiting(payload.count);
+  });
   // End-orchestration: the backend has already killed the group's agents, so
   // close their (now-dead) panes rather than leaving a screen of dead
   // terminals — the pane-by-pane ✕-clicking this action exists to replace.

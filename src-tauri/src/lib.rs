@@ -86,6 +86,7 @@ pub fn run() {
             orchestration::orch_pause_group,
             orchestration::orch_resume_group,
             orchestration::orch_group_paused,
+            orchestration::orch_set_focused_pane,
             orchestration::orch_ack_attention,
             orchestration::orch_ack_attention_pty,
             orchestration::orch_notify_enabled,

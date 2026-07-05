@@ -181,6 +181,10 @@ export class Pane {
   /** "needs attention" chip in the header (attention routing #6); hidden until
    *  the backend flags this pane. */
   private attnChip: HTMLButtonElement;
+  /** "N waiting" chip: worker-report deliveries the backend is holding because
+   *  the human may be typing in this pane (#43). Hidden until the count is > 0;
+   *  the human clicks away to release the held reports. */
+  private waitingChip: HTMLSpanElement;
   private attentionReason: string | null = null;
   private attentionDetail: string | null = null;
   /** Notified when attention state changes; the grid uses it to keep a
@@ -219,6 +223,14 @@ export class Pane {
       this.acknowledgeAttention();
     });
     header.appendChild(this.attnChip);
+
+    // "N waiting" chip (#43): held report deliveries pending for this pane.
+    // Non-interactive — a signal that the human can click away to release them.
+    this.waitingChip = document.createElement("span");
+    this.waitingChip.className = "pane-waiting";
+    this.waitingChip.hidden = true;
+    this.waitingChip.title = "Report deliveries held while you may be typing — click away to release";
+    header.appendChild(this.waitingChip);
 
     // Live metadata: current folder + git branch, reported by the shell.
     // The folder chip picks a folder to cd into; the branch chip opens the
@@ -566,6 +578,17 @@ export class Pane {
     // A minimized pane's element is detached, so its header chip is invisible;
     // the listener lets the grid mirror this state onto the dock chip.
     this.attentionListener?.();
+  }
+
+  /** Update the "N waiting" chip from the backend deferral count (#43). A count
+   *  of 0 hides it; the chip is purely informational. */
+  setWaiting(count: number): void {
+    if (count > 0) {
+      this.waitingChip.textContent = `${count} waiting`;
+      this.waitingChip.hidden = false;
+    } else {
+      this.waitingChip.hidden = true;
+    }
   }
 
   /** Current needs-attention state, or null. Lets the grid render an equivalent
