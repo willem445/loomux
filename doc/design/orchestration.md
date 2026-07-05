@@ -310,6 +310,90 @@ to actually do) with the orchestrator.
   outside the working-agent filter by construction, so a terminated pane is never flagged. The
   orchestrator is never watchdogged (it is the recipient).
 
+## Attention routing (#6) & interactive-question detection (#40)
+
+The human is the scheduler's bottleneck; attention routing surfaces *which* pane needs
+them so they don't scan panes. A background loop (`start_attention`, 3s tick) reads a pty
+snapshot and hands it to the pure `attention_tick`, which emits an `AttentionItem` per pane
+that needs the human, with a reason in priority order: `blocked` (reported) > `waiting`
+(parked on a prompt) > `report` (reported done) > `gate` (the pane's board task sits at a
+merge gate). Keeping the policy pure w.r.t. the pty (the pty reads live in
+`attention_inputs`) makes the whole thing fixture-testable with synthetic maps — no real
+CLI. The frontend routes each item by `pty_id` to `Pane.setAttention`, which paints the
+header chip and, via a listener, mirrors the state onto a minimized pane's **dock chip**
+(`Grid.renderDock` → `dockChipAttention`) so docking never hides an ask.
+
+- **Scope: every pane, not just agents (#40).** The `waiting` reason applies to *any* live
+  pane, including a plain shell the human opened by hand to run a CLI — those have no
+  orchestration group/roster identity, so the original agent-only scan never saw them (the
+  human's repro: two hand-opened panes running Claude Code / Copilot, both parked on a
+  question, no indicator anywhere). `run_attention` now makes two passes: `attention_tick`
+  over the roster (all four reasons), then `plain_pane_attention` over every *non-agent* live
+  pty (`PtyManager::live_ids`), which raises only `waiting`. Plain-pane items carry just
+  `pty_id` (empty `agent_id`/`group`, `role: None`) and are keyed in the shared
+  `attn_quiet`/`attn_waiting_ack` maps by a synthetic `pty:<id>` id. The frontend badges **any**
+  pane by `pty_id` (the old `orchGroupId` gate is gone); a plain pane acks by pty id
+  (`orch_ack_attention_pty`) since it has no agent id. Agent-only surfaces — board-row
+  highlight, desktop toasts — stay group-scoped by construction (a plain pane's empty group
+  is in no opted-in set), which is the intended split: any blocked CLI lights the pane chip
+  and dock dot, while the richer group features remain orchestration-only.
+
+- **The `waiting` heuristic.** A pane is `waiting` when its output has been quiet past
+  `ATTENTION_QUIET_MS` (4s), there's been no recent human keystroke, *and* its ANSI-stripped
+  tail looks like a live interactive prompt (`prompt_wait_detected`). The quiet + no-keystroke
+  gate is what separates a *live* prompt the human must answer from the same words scrolled
+  past or a prompt the human is already typing into.
+- **#40 — questions weren't detected.** `prompt_wait_detected` originally only fired on a
+  selection glyph that *starts* an option line (`starts_with('❯')`), a `1. yes` numbered menu,
+  explicit `y/n` tokens, or a fixed list of permission phrasings. Two real interactive-question
+  styles slipped through, so the pane chip **and** the dock dot both stayed dark:
+  - **Claude Code `AskUserQuestion`** highlights the active option with *reverse-video* (an
+    ANSI attribute stripped before detection sees it), leaving numbered options with arbitrary
+    labels and no glyph — nothing in the old list matched. Fix: recognize the interactive
+    selection-menu **footer** (`enter to select`, `enter to confirm`, `use arrow keys`,
+    `↑↓`/`↑/↓`), which survives stripping.
+  - **Copilot CLI** draws its `❯` pointer indented inside a bordered box (`│ ❯ Yes`), so the
+    option line never *starts* with the pointer after trimming. Fix: strip a line's leading box
+    frame / bullet before checking that a `❯`/`›`/`→` pointer *leads* it.
+- **Two signal tiers, to avoid a false-positive storm.** The tricky part (#40 review): the two
+  new signals are *prose-like* — agents routinely write about keyboard UIs ("use arrow keys…"),
+  paste shell prompts (`demo ❯ npm run dev`), and echo `a › b` breadcrumbs, and a *finished*
+  agent stays output-quiet with that text in its tail indefinitely, so the quiet gate alone
+  does not save them. So the signals are split by how prose-safe each is:
+  - *Structured* signals (numbered `y/n` menu, `y/n` tokens, stock permission phrasings) don't
+    occur in ordinary prose → honored across the last ~12 lines.
+  - *Prose-like* signals — the selection pointer and the plain-English footer — are both read
+    **only from the last ~3 non-empty lines** ("the last thing painted"), and the pointer must
+    additionally *lead* a de-framed line. A live menu paints its pointer/footer last; a finished
+    turn is followed by the CLI's redrawn idle input box, which pushes any pointer/phrase earlier
+    in the tail out of range. This is what rules out both a *mid*-line glyph (`demo ❯ npm run
+    dev`, a `Home › Prefs` breadcrumb) **and** a *leading* one in finished prose (a `❯ npm run
+    dev` repro line, a fenced `❯` command block) above the idle box. The Copilot positive still
+    passes on its footer (its boxed pointer sits above the last-3 window); the Claude positive on
+    its footer; and a bare inquirer `❯` prompt passes on the pointer when it *is* the last line.
+  - Covered by fixtures under `src-tauri/tests/fixtures/attention/`: three positive question
+    styles (Claude footer, Copilot footer, bare-pointer-last-line) and **seven** negatives — a
+    numbered summary stream, an idle input box, and the five finished-turn-prose repros from the
+    review (keyboard-nav prose, mid-line `❯` shell prompt, `›` breadcrumb, leading-`❯` repro
+    steps, fenced-`❯` block) — all run through the real `strip_ansi` → `prompt_wait_detected` →
+    `attention_tick` path.
+- **`waiting` ack is sticky (`attn_waiting_ack`).** `blocked`/`report` latch until acked;
+  `waiting` is recomputed live each scan, so without care, focusing a pane whose menu is still
+  on screen would clear the chip only to have the next 3s scan re-light it. So acking a pane
+  (`ack_attention`, fired when the human turns to it) records it in `attn_waiting_ack`, which
+  suppresses `waiting` for that pane **until its output next changes** — i.e. the menu was
+  answered or the CLI repainted, at which point it re-arms and a genuinely new prompt flags
+  again. This makes "turn to a pane → it stops nagging" hold for `waiting` the same way ack
+  clears `blocked`/`report`, while still catching a fresh question later.
+- **Known limits.** The footer match is per-line, so a footer wrapped across rows in a very
+  narrow pane, or a **localized / reworded** footer, won't match — acceptable for now (the
+  pointer and structured signals still cover most such cases). The quiet gate is load-bearing:
+  a menu that keeps emitting bytes (blinking cursor, live countdown) never goes quiet and so
+  never flags; today's targets (static AskUserQuestion / Copilot menus) do go quiet. Anchoring
+  the pointer to the last 3 non-empty lines also means a **footer-less** menu whose ❯ sits at
+  the top with 3+ options below it is missed until the user arrows down (the pointer re-enters
+  the window); real menus ship footers, so this is a safe-direction miss we accept.
+
 ## Risks / limitations
 
 - Kickoff typing races CLI boot; a fixed delay (4s) + bracketed paste is used. If a

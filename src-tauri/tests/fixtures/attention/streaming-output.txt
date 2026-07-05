@@ -1,0 +1,10 @@
+[2mRunning cargo test...[0m
+   Compiling loomux v0.3.0
+test result: ok. 42 passed; 0 failed
+
+Here is what I changed:
+  1. Refactored the auth module
+  2. Added retry logic on transient failures
+  3. Updated the integration tests
+
+All done — ready for your review.

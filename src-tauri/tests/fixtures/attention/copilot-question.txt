@@ -1,0 +1,9 @@
+[36m●[0m Allow Copilot to run the following command?
+
+  [2m$ npm test[0m
+
+│ [36m❯[0m Yes
+│   Yes, and don't ask again this session
+│   No, and tell Copilot what to do differently
+
+[2mUse arrow keys · Enter to confirm · Esc to cancel[0m

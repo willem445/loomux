@@ -1,0 +1,11 @@
+Here is how to run it locally:
+
+  [32mdemo[0m ❯ npm run dev
+  [32mdemo[0m ❯ npm test
+
+That serves the app on port 5173.
+
+╭──────────╮
+│ > [2mTry "run the tests"[0m                      │
+╰──────────╯
+  [2m? for shortcuts[0m

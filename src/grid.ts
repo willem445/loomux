@@ -11,6 +11,7 @@
 
 import { Pane, type PaneEvents, type PaneOptions } from "./pane";
 import { dropZoneFor, indicatorFor, zoneToPlacement, type DropZone } from "./layout";
+import { dockChipAttention } from "./attention";
 
 type Dir = "row" | "column";
 
@@ -383,14 +384,10 @@ export class Grid {
 
       // Surface attention routing (#6) on the chip: a docked worker that needs
       // the human pulses (red when urgent), so minimizing never hides the ask.
-      const attn = pane.attention;
-      if (attn) {
-        chip.classList.add("needs-attention");
-        chip.classList.toggle("urgent", attn.urgent);
-        chip.title = `${attn.label} — ${attn.detail ?? "needs you"} · restore ${pane.name}`;
-      } else {
-        chip.title = `Restore ${pane.name}`;
-      }
+      const attn = dockChipAttention(pane.name, pane.attention);
+      chip.classList.toggle("needs-attention", attn.needsAttention);
+      chip.classList.toggle("urgent", attn.urgent);
+      chip.title = attn.title;
 
       const name = document.createElement("span");
       name.className = "dock-chip-name";

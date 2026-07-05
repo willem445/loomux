@@ -252,14 +252,24 @@ pub fn watchdog_should_notify(
 
 /// Attention routing (#6): does a pane's ANSI-stripped output tail look like a
 /// CLI parked on a prompt only the human can answer — a permission dialog, a
-/// yes/no confirmation, or a numbered selection menu? This is the "last output"
+/// yes/no confirmation, or a numbered/selection menu? This is the "last output"
 /// half of idle-with-prompt detection; the caller pairs it with an
 /// output-quiet check (this alone can't tell a live prompt from the same words
 /// scrolled past). So it errs toward recognizable interactive-prompt structure
-/// (the selection pointer both Claude Code and Copilot render, explicit y/n
-/// tokens, the stock permission phrasings) rather than any mention of a
-/// question. Case-insensitive; only the final handful of lines are considered,
-/// because a prompt the CLI is waiting on is the last thing it painted.
+/// rather than any mention of a question. Case-insensitive.
+///
+/// Two tiers of signal, by how prose-safe each is (#40 review):
+/// - *Structured* signals (numbered y/n menu, explicit y/n tokens, stock
+///   permission phrasings) don't occur in ordinary prose, so they're honored
+///   across the last ~12 lines.
+/// - *Prose-like* signals — a bare selection pointer and the plain-English menu
+///   footer ("use arrow keys", "enter to select") — DO appear in finished-turn
+///   agent output (agents describe keyboard UIs, paste shell prompts, echo
+///   `a › b` breadcrumbs). A *live* menu paints these as the last thing on
+///   screen, with its pointer *leading* an option line (after any box frame);
+///   prose does neither. So the pointer must lead a de-framed line, and the
+///   footer is only read from the last few non-empty lines — once the CLI
+///   redraws its idle input box below the prose, the phrase falls out of range.
 pub fn prompt_wait_detected(tail: &str) -> bool {
     let lines: Vec<String> = tail
         .lines()
@@ -272,11 +282,33 @@ pub fn prompt_wait_detected(tail: &str) -> bool {
     let recent = &lines[lines.len().saturating_sub(12)..];
     let joined = recent.join("\n");
 
-    // Selection pointer on an option line: how both CLIs render the highlighted
-    // choice of a permission menu (`❯ 1. Yes`, `› Yes`, `→ Allow`).
-    let has_pointer_option = recent
-        .iter()
-        .any(|l| l.starts_with('❯') || l.starts_with('›') || l.starts_with('→'));
+    // Strip a line's leading box border / bullet / indent so a menu pointer
+    // inside a bordered dialog (`│ ❯ Yes`) is seen to *lead* its content.
+    fn deframe(l: &str) -> &str {
+        l.trim_start_matches(|c: char| {
+            c == '│' || c == '┃' || c == '|' || c == '*' || c == '●' || c == '•' || c == '◆'
+                || c.is_whitespace()
+        })
+    }
+
+    // The last few non-empty lines — "the last thing the CLI painted". Both
+    // prose-like signals (pointer, footer) are read only from here (#40 review):
+    // a live menu paints its pointer/footer last, whereas finished-turn prose
+    // that happens to lead a line with `❯`/`›`/`→` (a `❯ npm run dev` shell
+    // example, a fenced repro block) is followed by the CLI's redrawn idle input
+    // box, which pushes it out of this window.
+    let last_painted = &recent[recent.len().saturating_sub(3)..];
+
+    // Selection pointer marking the highlighted choice. A `❯`/`›`/`→` that
+    // *leads* a line's content (after any box frame) is menu-shaped; the same
+    // glyph mid-line is pervasive in ordinary output — pasted shell prompts
+    // (`demo ❯ npm run dev`), UI breadcrumbs (`Home › Prefs`), diff/log arrows.
+    // Requiring it to lead rules those out; requiring it in the last painted
+    // lines also rules out a *leading* glyph in finished prose above the idle box.
+    let has_pointer_option = last_painted.iter().any(|l| {
+        let d = deframe(l);
+        d.starts_with('❯') || d.starts_with('›') || d.starts_with('→')
+    });
     // A numbered yes/no menu even without the pointer glyph.
     let has_numbered_menu = joined.contains("1. yes") || joined.contains("❯ 1.");
     // Explicit yes/no confirmation tokens.
@@ -297,7 +329,21 @@ pub fn prompt_wait_detected(tail: &str) -> bool {
         || joined.contains("grant access")
         || joined.contains("press enter to continue")
         || joined.contains("waiting for your");
-    has_pointer_option || has_numbered_menu || has_yes_no || has_permission_phrase
+    // Interactive selection-menu footer (AskUserQuestion / Copilot / inquirer).
+    // Claude Code's AskUserQuestion highlights the active option with reverse
+    // video (an ANSI attribute stripped before we see it), so no glyph survives
+    // and this footer is the only durable signal (#40). Like the pointer it's
+    // read only from the last painted lines. NOTE: matched on single lines, so a
+    // footer wrapped across rows in a very narrow pane, or a localized / reworded
+    // footer, won't match — a known gap (see design doc).
+    let footer = last_painted.join("\n");
+    let has_menu_footer = footer.contains("enter to select")
+        || footer.contains("enter to confirm")
+        || footer.contains("use arrow")
+        || footer.contains("arrow keys")
+        || footer.contains("↑↓")
+        || footer.contains("↑/↓");
+    has_pointer_option || has_numbered_menu || has_yes_no || has_permission_phrase || has_menu_footer
 }
 
 /// Distinct agent working directories to remove when a group is torn down
@@ -436,10 +482,13 @@ pub struct AgentEntry {
 /// - `gate`    — this agent's task sits at a human merge gate on the board
 #[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct AttentionItem {
+    /// Empty for a plain (non-orchestration) pane, which is keyed only by
+    /// `pty_id` — the human's hand-opened shells have no agent identity (#40).
     pub agent_id: String,
     pub group: String,
     pub name: String,
-    pub role: Role,
+    /// `None` for a plain pane (no orchestration role).
+    pub role: Option<Role>,
     pub pty_id: Option<u32>,
     pub reason: &'static str,
     /// Short human phrase for the badge tooltip and the toast body.
@@ -596,6 +645,13 @@ pub struct OrchRegistry {
     /// output total, Unix-ms that total last changed). Kept separate from the
     /// watchdog's counter so the two features never clobber each other's clocks.
     attn_quiet: Mutex<HashMap<String, (u64, u64)>>,
+    /// Attention routing: agents whose live `waiting` badge the human has acked
+    /// (focused the pane) while the prompt is still on screen. Unlike
+    /// `blocked`/`report`, `waiting` is recomputed every scan, so without this it
+    /// would re-light ~3s after focus. Cleared when the pane's output next
+    /// changes (the menu was answered / the CLI repainted) so a genuinely new
+    /// prompt flags again. See `attention_tick`.
+    attn_waiting_ack: Mutex<HashSet<String>>,
     /// Attention routing: the agent → reason set last emitted, so a scan fires a
     /// desktop toast only once per attention onset (the event itself is
     /// re-emitted every tick and the frontend badges idempotently).
@@ -899,6 +955,7 @@ impl OrchRegistry {
             self_arc: Mutex::new(Weak::new()),
             attn_reports: Mutex::new(HashMap::new()),
             attn_quiet: Mutex::new(HashMap::new()),
+            attn_waiting_ack: Mutex::new(HashSet::new()),
             attn_emitted: Mutex::new(HashMap::new()),
             notify_groups: Mutex::new(HashSet::new()),
         }
@@ -1783,10 +1840,24 @@ impl OrchRegistry {
     }
 
     /// The human focused/handled a pane: drop any latched report so its badge
-    /// clears. Live reasons (waiting/gate) are recomputed each scan and reappear
-    /// only if still true, so they need no explicit clear.
+    /// clears, and suppress the live `waiting` badge so focusing a pane whose
+    /// menu is still on screen makes the ack *stick* — otherwise the next 3s scan
+    /// re-emits `waiting` and re-lights the pane the human is already on (#40
+    /// review). The suppression self-clears once the pane's output changes (the
+    /// menu was answered / the CLI repainted), so a genuinely new prompt on the
+    /// same pane flags again. The `gate` reason is board state, cleared by moving
+    /// the task, so it needs no ack.
     pub fn ack_attention(&self, agent_id: &str) {
         self.attn_reports.lock().unwrap().remove(agent_id);
+        self.attn_waiting_ack.lock().unwrap().insert(agent_id.to_string());
+    }
+
+    /// The human turned to a *plain* pane (#40): make its `waiting` ack stick the
+    /// same way `ack_attention` does for agents, keyed by the pane's pty id. The
+    /// suppression lifts when the pane's output next changes (see
+    /// `plain_pane_attention`).
+    pub fn ack_attention_pty(&self, pty_id: u32) {
+        self.attn_waiting_ack.lock().unwrap().insert(format!("pty:{pty_id}"));
     }
 
     /// Whether desktop notifications are enabled for a group.
@@ -1841,6 +1912,69 @@ impl OrchRegistry {
         (outs, tails, ins)
     }
 
+    /// Pty snapshots for every live pane that is NOT a registered agent, keyed
+    /// by pty id, plus the agent-pty set. Feeds `plain_pane_attention` so the
+    /// scan reaches plain shells the human opened by hand (#40). Empty without an
+    /// app handle (unit tests drive the pure core `pane_attention_inputs_from`).
+    #[allow(clippy::type_complexity)]
+    fn pane_attention_inputs(
+        &self,
+    ) -> (HashMap<u32, u64>, HashMap<u32, String>, HashMap<u32, u64>, HashSet<u32>) {
+        let mut agent_ptys = HashSet::new();
+        let Some(app) = self.app.lock().unwrap().clone() else {
+            return (HashMap::new(), HashMap::new(), HashMap::new(), agent_ptys);
+        };
+        for a in self.agents.lock().unwrap().values() {
+            if let Some(pid) = a.pty_id {
+                agent_ptys.insert(pid);
+            }
+        }
+        let ptys = app.state::<crate::pty::PtyManager>();
+        let mut live = Vec::new();
+        for pid in ptys.live_ids() {
+            // Skip agent ptys *before* touching the ring: `attention_tick`
+            // already covers them, and `attention_inputs` already cloned their
+            // (up-to-256 KB) output ring this tick — cloning it a second time
+            // here would be pure waste (#40 review).
+            if agent_ptys.contains(&pid) {
+                continue;
+            }
+            let Some(total) = ptys.output_total(pid) else { continue };
+            let raw = ptys.output_tail(pid).unwrap_or_default();
+            let input = ptys.last_user_input_ms(pid).unwrap_or(0);
+            live.push((pid, total, raw, input));
+        }
+        let (outs, tails, ins) = self.pane_attention_inputs_from(&live, &agent_ptys);
+        (outs, tails, ins, agent_ptys)
+    }
+
+    /// Pure core of `pane_attention_inputs`: build the pty-keyed snapshot maps
+    /// `plain_pane_attention` consumes from a list of live pane snapshots
+    /// `(pty_id, output_total, raw_tail, last_input_ms)`, ANSI-stripping only the
+    /// trailing few KB of each tail (a prompt is at the end). Agent ptys are
+    /// skipped. Pure w.r.t. the pty, so run_attention's gather wiring is testable
+    /// with a fake live-ids source (#40 review).
+    #[allow(clippy::type_complexity)]
+    pub fn pane_attention_inputs_from(
+        &self,
+        live: &[(u32, u64, Vec<u8>, u64)],
+        agent_ptys: &HashSet<u32>,
+    ) -> (HashMap<u32, u64>, HashMap<u32, String>, HashMap<u32, u64>) {
+        let mut outs = HashMap::new();
+        let mut tails = HashMap::new();
+        let mut ins = HashMap::new();
+        for (pid, total, raw, input) in live {
+            if agent_ptys.contains(pid) {
+                continue;
+            }
+            outs.insert(*pid, *total);
+            let start = raw.len().saturating_sub(4096);
+            tails.insert(*pid, strip_ansi(&raw[start..]));
+            ins.insert(*pid, *input);
+        }
+        (outs, tails, ins)
+    }
+
     /// One attention pass: compute the current set of panes that need the human
     /// from live agent state plus the supplied pty snapshots. Reasons, in
     /// priority order, are `blocked` (reported), `waiting` (parked on a prompt:
@@ -1874,18 +2008,24 @@ impl OrchRegistry {
 
         let reports = self.attn_reports.lock().unwrap().clone();
         let mut quiet = self.attn_quiet.lock().unwrap();
+        let mut waiting_ack = self.attn_waiting_ack.lock().unwrap();
         let agents = self.agents.lock().unwrap();
         let mut out = Vec::new();
         for a in agents.values() {
             if a.status != AgentStatus::Running {
                 quiet.remove(&a.id);
+                waiting_ack.remove(&a.id);
                 continue;
             }
             // Track how long the pane's output has been stable.
             let cur = outputs.get(&a.id).copied().unwrap_or(0);
             let entry = quiet.entry(a.id.clone()).or_insert((cur, now));
-            if cur != entry.0 {
+            let output_changed = cur != entry.0;
+            if output_changed {
                 *entry = (cur, now);
+                // The pane repainted — the acked menu was answered or replaced,
+                // so re-arm: a fresh prompt on this pane flags again.
+                waiting_ack.remove(&a.id);
             }
             let quiet_for = now.saturating_sub(entry.1);
             let recently_typed = last_inputs
@@ -1893,6 +2033,7 @@ impl OrchRegistry {
                 .map(|&t| t != 0 && now.saturating_sub(t) < ATTENTION_RECENT_INPUT_MS)
                 .unwrap_or(false);
             let waiting = !recently_typed
+                && !waiting_ack.contains(&a.id)
                 && quiet_for >= ATTENTION_QUIET_MS
                 && tails.get(&a.id).map(|t| prompt_wait_detected(t)).unwrap_or(false);
 
@@ -1912,13 +2053,73 @@ impl OrchRegistry {
                 agent_id: a.id.clone(),
                 group: a.group.clone(),
                 name: a.name.clone(),
-                role: a.role,
+                role: Some(a.role),
                 pty_id: a.pty_id,
                 reason,
                 detail,
             });
         }
         out.sort_by(|x, y| x.agent_id.cmp(&y.agent_id));
+        out
+    }
+
+    /// Attention scan for *plain* panes (#40): any pane with a live pty that is
+    /// **not** a registered agent — the shells the human opens by hand to run a
+    /// CLI. It only ever raises `waiting` (parked on an interactive prompt): the
+    /// agent-only reasons (`blocked`/`report`/`gate`) require a roster identity a
+    /// plain pane doesn't have. Same quiet + no-keystroke + prompt-tail gate and
+    /// the same sticky-ack semantics as the agent path, keyed by a synthetic
+    /// `pty:<id>` id in the shared `attn_quiet`/`attn_waiting_ack` maps (agent
+    /// ids never collide — they're group-scoped uuids). Pure w.r.t. the pty (the
+    /// pty reads live in `pane_attention_inputs`), so it's fixture-testable.
+    /// `agent_ptys` are the ptys already handled by `attention_tick`, skipped here.
+    pub fn plain_pane_attention(
+        &self,
+        now: u64,
+        outputs: &HashMap<u32, u64>,
+        tails: &HashMap<u32, String>,
+        last_inputs: &HashMap<u32, u64>,
+        agent_ptys: &HashSet<u32>,
+    ) -> Vec<AttentionItem> {
+        let mut quiet = self.attn_quiet.lock().unwrap();
+        let mut waiting_ack = self.attn_waiting_ack.lock().unwrap();
+        let mut out = Vec::new();
+        for (&pty, &cur) in outputs {
+            if agent_ptys.contains(&pty) {
+                continue;
+            }
+            let key = format!("pty:{pty}");
+            let entry = quiet.entry(key.clone()).or_insert((cur, now));
+            if cur != entry.0 {
+                *entry = (cur, now);
+                waiting_ack.remove(&key); // repainted → re-arm (menu answered)
+            }
+            let quiet_for = now.saturating_sub(entry.1);
+            let recently_typed = last_inputs
+                .get(&pty)
+                .map(|&t| t != 0 && now.saturating_sub(t) < ATTENTION_RECENT_INPUT_MS)
+                .unwrap_or(false);
+            let waiting = !recently_typed
+                && !waiting_ack.contains(&key)
+                && quiet_for >= ATTENTION_QUIET_MS
+                && tails.get(&pty).map(|t| prompt_wait_detected(t)).unwrap_or(false);
+            if waiting {
+                out.push(AttentionItem {
+                    agent_id: String::new(),
+                    group: String::new(),
+                    name: String::new(),
+                    role: None,
+                    pty_id: Some(pty),
+                    reason: "waiting",
+                    detail: "This pane is waiting on your input".to_string(),
+                });
+            }
+        }
+        // Prune bookkeeping for ptys that have gone away (pane closed), so the
+        // shared maps don't grow unbounded with `pty:` keys.
+        quiet.retain(|k, _| !k.starts_with("pty:") || k[4..].parse::<u32>().map(|p| outputs.contains_key(&p)).unwrap_or(false));
+        waiting_ack.retain(|k| !k.starts_with("pty:") || k[4..].parse::<u32>().map(|p| outputs.contains_key(&p)).unwrap_or(false));
+        out.sort_by_key(|i| i.pty_id);
         out
     }
 
@@ -1952,9 +2153,35 @@ impl OrchRegistry {
     /// One full attention cycle: read pty snapshots, compute the attention set,
     /// fire toasts for newly-attention panes in opted-in groups, and push the
     /// whole set to the frontend. Called on a timer by `start_attention`.
+    /// The full attention set: the roster scan (`attention_tick`, all reasons)
+    /// merged with the plain-pane scan (`plain_pane_attention`, `waiting` only).
+    /// This is run_attention's core, factored out so the merge wiring — plain
+    /// panes surface, an agent's pty is never double-covered — is testable
+    /// without a real PtyManager (#40 review).
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_scan(
+        &self,
+        now: u64,
+        agent_outputs: &HashMap<String, u64>,
+        agent_tails: &HashMap<String, String>,
+        agent_inputs: &HashMap<String, u64>,
+        pane_outputs: &HashMap<u32, u64>,
+        pane_tails: &HashMap<u32, String>,
+        pane_inputs: &HashMap<u32, u64>,
+        agent_ptys: &HashSet<u32>,
+    ) -> Vec<AttentionItem> {
+        let mut items = self.attention_tick(now, agent_outputs, agent_tails, agent_inputs);
+        items.extend(self.plain_pane_attention(now, pane_outputs, pane_tails, pane_inputs, agent_ptys));
+        items
+    }
+
     pub fn run_attention(&self, now: u64) {
         let (outputs, tails, last_inputs) = self.attention_inputs();
-        let items = self.attention_tick(now, &outputs, &tails, &last_inputs);
+        // Also scan plain (non-agent) panes for an interactive prompt (#40).
+        let (p_out, p_tails, p_ins, agent_ptys) = self.pane_attention_inputs();
+        let items = self.attention_scan(
+            now, &outputs, &tails, &last_inputs, &p_out, &p_tails, &p_ins, &agent_ptys,
+        );
         for id in self.attention_toast_targets(&items) {
             if let Some(i) = items.iter().find(|i| i.agent_id == id) {
                 self.audit(&i.group, "loomux", "attention-toast",
@@ -2825,6 +3052,7 @@ impl OrchRegistry {
         // Attention bookkeeping is per-live-agent; drop this one's entries.
         self.attn_reports.lock().unwrap().remove(agent_id);
         self.attn_quiet.lock().unwrap().remove(agent_id);
+        self.attn_waiting_ack.lock().unwrap().remove(agent_id);
         self.attn_emitted.lock().unwrap().remove(agent_id);
         let _ = fs::remove_file(
             self.group_dir(&snapshot.group).join("configs").join(format!("{agent_id}.json")),
@@ -2974,6 +3202,13 @@ pub fn orch_group_paused(reg: tauri::State<Arc<OrchRegistry>>, group_id: String)
 #[tauri::command]
 pub fn orch_ack_attention(reg: tauri::State<Arc<OrchRegistry>>, agent_id: String) {
     reg.ack_attention(&agent_id);
+}
+
+/// The human turned to a plain (non-agent) pane flagged `waiting` (#40): ack it
+/// by pty id, since it has no agent identity to key on.
+#[tauri::command]
+pub fn orch_ack_attention_pty(reg: tauri::State<Arc<OrchRegistry>>, pty_id: u32) {
+    reg.ack_attention_pty(pty_id);
 }
 
 /// Whether desktop notifications are enabled for a group (toggle button state).

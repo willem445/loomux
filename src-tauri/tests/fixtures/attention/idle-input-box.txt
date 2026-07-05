@@ -1,0 +1,4 @@
+╭──────────╮
+│ > [2mTry "fix the build"[0m                       │
+╰──────────╯
+  [2m? for shortcuts[0m
