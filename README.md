@@ -83,6 +83,9 @@ npm test           # unit tests (Node's built-in runner; no extra deps)
 | Steer orchestrator | `Alt+P` (focus the compose strip under an orchestrator pane); `Esc` returns to the terminal |
 | Copy / paste | `Ctrl+Shift+C` / `Ctrl+Shift+V` (`Ctrl+V` also works) |
 
+A CLI running in a pane (e.g. an agent that says "copied to clipboard") copies
+straight to your system clipboard too, via OSC 52 — no manual re-select needed.
+
 Splitting in the same direction adds a sibling column/row — repeated splits
 form an even matrix instead of a lopsided staircase.
 
