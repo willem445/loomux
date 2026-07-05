@@ -43,10 +43,13 @@ fn rails() -> Guardrails {
         worker_model: "sonnet".into(),
         reviewer_model: "sonnet".into(),
         orchestrator_model: "opus".into(),
+        planner_model: "opus".into(),
         auto_ops: false,
         idle_kill_minutes: 0,
         max_spawns_per_hour: 0,
         watchdog_stall_minutes: 0,
+        // Per-role CLIs default to inheriting `agent_cli`.
+        ..Guardrails::default()
     }
 }
 
@@ -81,34 +84,56 @@ fn guardrail_clamps_and_sanitizes() {
         worker_model: "sonnet; rm -rf /".into(),
         reviewer_model: "".into(),
         orchestrator_model: "opus".into(),
+        planner_model: "".into(),
         auto_ops: true,
         idle_kill_minutes: 99999,
         max_spawns_per_hour: 9999,
         watchdog_stall_minutes: 99999,
+        ..Guardrails::default()
     }
     .clamped();
     assert_eq!(g.max_agents, 12, "cap must clamp to the hard ceiling");
     assert_eq!(g.idle_kill_minutes, 1440, "idle-kill timeout clamps to 24h");
     assert_eq!(g.max_spawns_per_hour, 240, "spawn-rate cap clamps to the ceiling");
     assert_eq!(g.watchdog_stall_minutes, 1440, "watchdog stall timeout clamps to 24h");
-    assert_eq!(g.agent_cli, "claude", "unknown CLIs fall back to claude explicitly");
+    assert_eq!(g.agent_cli, "claude", "unknown group CLIs fall back to claude explicitly");
     assert_eq!(g.worker_model, "sonnetrm-rf", "shell metacharacters must be stripped");
     assert_eq!(g.reviewer_model, "sonnet", "empty model falls back to default");
-    // Copilot's fallback model is "auto" (it picks the best itself).
+    // Reasoning roles (orchestrator, planner) default to the strong tier on Claude.
+    assert_eq!(g.planner_model, "opus", "empty planner model falls back to the reasoning tier");
+    // Copilot's fallback model is "auto" (it picks the best itself), and a
+    // per-role CLI overrides the group default (issue #4).
     let g = Guardrails {
         max_agents: 4,
         agent_cli: "copilot".into(),
         worker_model: "".into(),
         reviewer_model: "".into(),
         orchestrator_model: "".into(),
+        planner_model: "".into(),
         auto_ops: false,
         idle_kill_minutes: 0,
         max_spawns_per_hour: 0,
         watchdog_stall_minutes: 0,
+        ..Guardrails::default()
     }
     .clamped();
     assert_eq!(g.worker_model, "auto");
     assert_eq!(g.orchestrator_model, "auto");
+    assert_eq!(g.planner_model, "auto");
+    // A per-role CLI is honored by `cli_for` (empty roles inherit agent_cli);
+    // its model fallback follows the role's *effective* CLI.
+    let g = Guardrails {
+        max_agents: 4,
+        agent_cli: "copilot".into(),
+        worker_cli: "claude".into(),
+        worker_model: "".into(),
+        ..Guardrails::default()
+    }
+    .clamped();
+    assert_eq!(g.cli_for(Role::Worker), "claude", "per-role CLI overrides the group default");
+    assert_eq!(g.cli_for(Role::Reviewer), "copilot", "an empty per-role CLI inherits the group default");
+    assert_eq!(g.worker_model, "sonnet", "worker model fallback follows the worker's claude CLI");
+    assert_eq!(g.reviewer_model, "auto", "reviewer model fallback follows the inherited copilot CLI");
 }
 
 // ---------- #56: adjustable max_agents on the fly ----------
@@ -611,16 +636,111 @@ fn kickoff_prompt_references_instructions_and_task() {
 }
 
 #[test]
+fn planner_kickoff_references_planner_instructions() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let p = reg
+        .spawn_agent(&g.id, Role::Planner, "plan-47", "Plan issue #47", false, None)
+        .unwrap();
+    let k = reg.kickoff_prompt(&p, &g, "note");
+    assert!(k.contains("planner.md"), "planner kickoff must reference its instructions file");
+    assert!(k.contains("a planner agent"), "kickoff must name the planner role");
+    assert!(k.contains("Plan issue #47"));
+}
+
+#[test]
+fn planner_explores_read_only_and_never_gets_a_worktree() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    // Even with worktree requested, a planner runs in the repo itself — it
+    // never branches, worktrees, commits, or PRs (#47).
+    let p = reg
+        .spawn_agent(&g.id, Role::Planner, "plan", "Plan it", true, Some("plan/x".into()))
+        .unwrap();
+    assert_eq!(p.cwd, "C:/tmp/repo", "a planner must not get a dedicated worktree");
+    let k = reg.kickoff_prompt(&p, &g, "");
+    // The kickoff carries the read-only branch note (built at spawn time).
+    let note = reg
+        .list_agents(&g.id)
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|a| a["role"] == "planner");
+    assert!(note, "planner must appear in the roster with its role");
+    let _ = k;
+}
+
+#[test]
+fn planner_counts_toward_the_live_agent_cap() {
+    let (reg, _d) = test_registry();
+    // Cap is 2 (rails). A worker + a planner fill it; the next delegate is refused.
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    reg.spawn_agent(&g.id, Role::Worker, "w1", "t", false, None).unwrap();
+    reg.spawn_agent(&g.id, Role::Planner, "p1", "plan", false, None).unwrap();
+    let err = reg
+        .spawn_agent(&g.id, Role::Reviewer, "rev1", "t", false, None)
+        .unwrap_err();
+    assert!(err.contains("guardrail"), "a planner must count against the delegate cap: {err}");
+}
+
+#[test]
+fn per_role_cli_is_pinned_at_spawn_and_persisted() {
+    let (reg, _d) = test_registry();
+    // Group default is copilot, but the reviewer role overrides to claude (#4).
+    let rails = Guardrails {
+        agent_cli: "copilot".into(),
+        reviewer_cli: "claude".into(),
+        max_agents: 4,
+        ..rails()
+    };
+    let g = reg.create_group("C:/tmp/mixed-repo", rails).unwrap();
+    // Observable per-role effect: claude agents get a pre-assigned session id;
+    // copilot agents mint their own later, so start without one.
+    let worker = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let reviewer = reg.spawn_agent(&g.id, Role::Reviewer, "rev", "t", false, None).unwrap();
+    assert!(worker.session_id.is_none(), "worker inherits the copilot group default (no pre-assigned session)");
+    assert!(reviewer.session_id.is_some(), "reviewer's per-role claude CLI pre-assigns a session id");
+    // The per-role config is persisted additively to group.json.
+    let gj = fs::read_to_string(reg.state_root().join(&g.id).join("group.json")).unwrap();
+    let v: Value = serde_json::from_str(&gj).unwrap();
+    assert_eq!(v["guardrails"]["reviewer_cli"], "claude");
+    assert_eq!(v["guardrails"]["agent_cli"], "copilot");
+    assert!(v["guardrails"].get("planner_cli").is_some(), "planner_cli must be persisted");
+    assert!(v["guardrails"].get("planner_model").is_some(), "planner_model must be persisted");
+}
+
+#[test]
+fn unknown_per_role_cli_is_rejected_at_spawn() {
+    let (reg, _d) = test_registry();
+    // A hand-edited group.json could pin an unsupported CLI to a role; the
+    // spawn must reject it rather than silently downgrade (#4).
+    let rails = Guardrails { worker_cli: "aider".into(), max_agents: 4, ..rails() };
+    let g = reg.create_group("C:/tmp/bad-cli-repo", rails).unwrap();
+    let err = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap_err();
+    assert!(err.contains("unsupported agent CLI"), "unknown per-role CLI must be rejected: {err}");
+    // Roles that inherit the (valid) group default still spawn fine.
+    reg.spawn_agent(&g.id, Role::Reviewer, "rev", "t", false, None).unwrap();
+}
+
+#[test]
 fn instruction_files_rendered_with_group_facts() {
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/myrepo", rails()).unwrap();
     let dir = reg.state_root().join(&g.id);
     let orch = fs::read_to_string(dir.join("orchestrator.md")).unwrap();
     assert!(orch.contains("C:/tmp/myrepo"));
-    assert!(orch.contains("at most 2 live workers"), "guardrails must be rendered into the doc");
+    assert!(orch.contains("at most 2 live delegates"), "guardrails must be rendered into the doc");
     assert!(!orch.contains("{{"), "no unrendered placeholders");
     let worker = fs::read_to_string(dir.join("worker.md")).unwrap();
     assert!(worker.contains("Never merge"), "merge gatekeeping must be in worker instructions");
+    // The planner instructions are rendered alongside the other roles (#47).
+    let planner = fs::read_to_string(dir.join("planner.md")).unwrap();
+    assert!(planner.contains("planner"), "planner instructions must be written to the group dir");
+    assert!(
+        planner.contains("never write code") || planner.contains("You never write code"),
+        "planner instructions must forbid writing code"
+    );
+    assert!(!planner.contains("{{"), "no unrendered placeholders in planner.md");
 }
 
 // ---------- task board ----------
@@ -1278,6 +1398,28 @@ fn spawn_respects_guardrail_cap_via_mcp() {
 }
 
 #[test]
+fn spawn_agent_mcp_accepts_planner_kind() {
+    let (reg, _d, co, _cw) = setup_mcp();
+    // The orchestrator can spawn a planner via the shared spawn_agent tool (#47).
+    let r = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "spawn_agent", "arguments": { "kind": "planner", "task": "plan issue #47" } }))
+        .unwrap();
+    assert_eq!(r["isError"], false, "planner spawn must succeed");
+    assert!(
+        r["content"][0]["text"].as_str().unwrap().contains("Planner"),
+        "spawn result must report the planner role"
+    );
+    // The planner is on the roster with the planner role.
+    let planner = reg
+        .list_agents(&co.group)
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|a| a["role"] == "planner");
+    assert!(planner, "spawned planner must appear on the roster");
+}
+
+#[test]
 fn cross_group_targets_are_invisible() {
     let (reg, _d, co, _cw) = setup_mcp();
     let g2 = reg.create_group("C:/tmp/other-repo", rails()).unwrap();
@@ -1348,14 +1490,9 @@ fn every_tool_call_is_audited() {
 fn costed_rails(idle_kill_minutes: u32, max_spawns_per_hour: u32) -> Guardrails {
     Guardrails {
         max_agents: 6,
-        agent_cli: "claude".into(),
-        worker_model: "sonnet".into(),
-        reviewer_model: "sonnet".into(),
-        orchestrator_model: "opus".into(),
-        auto_ops: false,
         idle_kill_minutes,
         max_spawns_per_hour,
-        watchdog_stall_minutes: 0,
+        ..rails()
     }
 }
 

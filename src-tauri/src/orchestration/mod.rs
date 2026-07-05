@@ -31,6 +31,7 @@ use crate::obs::LockExt;
 const ORCHESTRATOR_TPL: &str = include_str!("templates/orchestrator.md");
 const WORKER_TPL: &str = include_str!("templates/worker.md");
 const REVIEWER_TPL: &str = include_str!("templates/reviewer.md");
+const PLANNER_TPL: &str = include_str!("templates/planner.md");
 
 /// Hard ceiling on `max_agents` regardless of what the launcher asks for.
 const MAX_AGENTS_CEILING: u32 = 12;
@@ -141,6 +142,11 @@ pub enum Role {
     Orchestrator,
     Worker,
     Reviewer,
+    /// Read-only explorer: investigates the codebase and writes a structured
+    /// implementation plan (as a GitHub issue comment), then reports and
+    /// exits. A planner NEVER writes code, branches, or PRs. It counts as a
+    /// delegate against the live-agent cap, like a worker/reviewer.
+    Planner,
 }
 
 impl Role {
@@ -149,6 +155,7 @@ impl Role {
             Role::Orchestrator => "orch",
             Role::Worker => "w",
             Role::Reviewer => "rev",
+            Role::Planner => "plan",
         }
     }
     fn template(self) -> &'static str {
@@ -156,6 +163,7 @@ impl Role {
             Role::Orchestrator => ORCHESTRATOR_TPL,
             Role::Worker => WORKER_TPL,
             Role::Reviewer => REVIEWER_TPL,
+            Role::Planner => PLANNER_TPL,
         }
     }
     fn instructions_file(self) -> &'static str {
@@ -163,6 +171,16 @@ impl Role {
             Role::Orchestrator => "orchestrator.md",
             Role::Worker => "worker.md",
             Role::Reviewer => "reviewer.md",
+            Role::Planner => "planner.md",
+        }
+    }
+    /// Lowercase wire/label name (matches the `Serialize` rename).
+    fn as_str(self) -> &'static str {
+        match self {
+            Role::Orchestrator => "orchestrator",
+            Role::Worker => "worker",
+            Role::Reviewer => "reviewer",
+            Role::Planner => "planner",
         }
     }
 }
@@ -180,14 +198,25 @@ pub enum AgentStatus {
 /// to Claude (explicitly, in `clamped`, never silently at spawn time).
 pub const SUPPORTED_CLIS: [&str; 2] = ["claude", "copilot"];
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Guardrails {
     pub max_agents: u32,
-    /// "claude" | "copilot" — see `SUPPORTED_CLIS`.
+    /// Group-default agent CLI ("claude" | "copilot", see `SUPPORTED_CLIS`).
+    /// A per-role CLI below overrides it; an empty per-role CLI inherits this.
+    /// Kept as the group default so old group.json (pre per-role CLI) and the
+    /// launcher's single-CLI path both keep working (issue #4).
     pub agent_cli: String,
+    /// Per-role agent CLI overrides (issue #4, mixed agent types). Empty =
+    /// inherit `agent_cli`. Resolved through `cli_for`; validated at spawn.
+    pub orchestrator_cli: String,
+    pub worker_cli: String,
+    pub reviewer_cli: String,
+    pub planner_cli: String,
     pub worker_model: String,
     pub reviewer_model: String,
     pub orchestrator_model: String,
+    /// Model for the planner role (issue #47). Sanitized like the others.
+    pub planner_model: String,
     /// Additionally pre-approve `git`/`gh` shell commands for the group's
     /// agents. Never maps to `--dangerously-skip-permissions`: bypass mode
     /// shows a confirm dialog whose default answer is "exit", which the
@@ -211,22 +240,67 @@ impl Guardrails {
     #[doc(hidden)] // pub for integration tests (unit tests can't load the UI stack; see tests/smoke.rs)
     pub fn clamped(mut self) -> Self {
         self.max_agents = self.max_agents.clamp(1, MAX_AGENTS_CEILING);
+        // The group default CLI is coerced to a supported value (legacy /
+        // single-CLI path). Per-role CLIs are validated at spawn instead of
+        // coerced here, so a genuinely unknown per-role type is rejected
+        // rather than silently downgraded (issue #4).
         if !SUPPORTED_CLIS.contains(&self.agent_cli.as_str()) {
             self.agent_cli = "claude".into();
         }
-        // Copilot picks its own best model with "auto"; Claude needs a tier.
-        let (worker_fb, orch_fb) = if self.agent_cli == "copilot" {
-            ("auto", "auto")
-        } else {
-            ("sonnet", "opus")
-        };
-        self.worker_model = sanitize_model(&self.worker_model, worker_fb);
-        self.reviewer_model = sanitize_model(&self.reviewer_model, worker_fb);
-        self.orchestrator_model = sanitize_model(&self.orchestrator_model, orch_fb);
+        // Model fallbacks depend on the role's *effective* CLI: Copilot picks
+        // its own best model with "auto"; Claude needs a tier.
+        self.orchestrator_model =
+            sanitize_model(&self.orchestrator_model, default_model(self.cli_for(Role::Orchestrator), Role::Orchestrator));
+        self.worker_model =
+            sanitize_model(&self.worker_model, default_model(self.cli_for(Role::Worker), Role::Worker));
+        self.reviewer_model =
+            sanitize_model(&self.reviewer_model, default_model(self.cli_for(Role::Reviewer), Role::Reviewer));
+        self.planner_model =
+            sanitize_model(&self.planner_model, default_model(self.cli_for(Role::Planner), Role::Planner));
         self.idle_kill_minutes = self.idle_kill_minutes.min(MAX_IDLE_KILL_MINUTES);
         self.max_spawns_per_hour = self.max_spawns_per_hour.min(MAX_SPAWNS_PER_HOUR);
         self.watchdog_stall_minutes = self.watchdog_stall_minutes.min(MAX_WATCHDOG_STALL_MINUTES);
         self
+    }
+
+    /// The agent CLI a role runs: its per-role override when set, else the
+    /// group default `agent_cli`. May return an unsupported value (a per-role
+    /// CLI is not coerced in `clamped`); `spawn_agent` validates it.
+    pub fn cli_for(&self, role: Role) -> &str {
+        let per_role = match role {
+            Role::Orchestrator => &self.orchestrator_cli,
+            Role::Worker => &self.worker_cli,
+            Role::Reviewer => &self.reviewer_cli,
+            Role::Planner => &self.planner_cli,
+        };
+        if per_role.trim().is_empty() {
+            &self.agent_cli
+        } else {
+            per_role
+        }
+    }
+
+    /// The pinned model for a role.
+    pub fn model_for(&self, role: Role) -> &str {
+        match role {
+            Role::Orchestrator => &self.orchestrator_model,
+            Role::Worker => &self.worker_model,
+            Role::Reviewer => &self.reviewer_model,
+            Role::Planner => &self.planner_model,
+        }
+    }
+}
+
+/// Default model for a role on a given CLI. Copilot picks its own best model
+/// ("auto"); on Claude the reasoning-heavy roles (orchestrator, planner) get
+/// the strong tier and the executing roles (worker, reviewer) the mid tier.
+fn default_model(cli: &str, role: Role) -> &'static str {
+    if cli == "copilot" {
+        return "auto";
+    }
+    match role {
+        Role::Orchestrator | Role::Planner => "opus",
+        Role::Worker | Role::Reviewer => "sonnet",
     }
 }
 
@@ -1469,11 +1543,7 @@ impl OrchRegistry {
             .unwrap_or_default();
         let record = AgentRecord {
             id: entry.id.clone(),
-            role: match entry.role {
-                Role::Orchestrator => "orchestrator".into(),
-                Role::Worker => "worker".into(),
-                Role::Reviewer => "reviewer".into(),
-            },
+            role: entry.role.as_str().into(),
             name: entry.name.clone(),
             session: entry.session_id.clone(),
             cwd: entry.cwd.clone(),
@@ -1686,9 +1756,16 @@ impl OrchRegistry {
             Guardrails {
                 max_agents: g["max_agents"].as_u64().unwrap_or(4) as u32,
                 agent_cli: s("agent_cli", "claude"),
+                // Per-role CLIs are additive (issue #4): absent in older
+                // group.json → empty → inherit `agent_cli`.
+                orchestrator_cli: s("orchestrator_cli", ""),
+                worker_cli: s("worker_cli", ""),
+                reviewer_cli: s("reviewer_cli", ""),
+                planner_cli: s("planner_cli", ""),
                 worker_model: s("worker_model", ""),
                 reviewer_model: s("reviewer_model", ""),
                 orchestrator_model: s("orchestrator_model", ""),
+                planner_model: s("planner_model", ""),
                 auto_ops: g["auto_ops"].as_bool().unwrap_or(true),
                 idle_kill_minutes: g["idle_kill_minutes"].as_u64().unwrap_or(0) as u32,
                 max_spawns_per_hour: g["max_spawns_per_hour"].as_u64().unwrap_or(0) as u32,
@@ -1739,9 +1816,14 @@ impl OrchRegistry {
                 "guardrails": {
                     "max_agents": info.guardrails.max_agents,
                     "agent_cli": info.guardrails.agent_cli,
+                    "orchestrator_cli": info.guardrails.orchestrator_cli,
+                    "worker_cli": info.guardrails.worker_cli,
+                    "reviewer_cli": info.guardrails.reviewer_cli,
+                    "planner_cli": info.guardrails.planner_cli,
                     "worker_model": info.guardrails.worker_model,
                     "reviewer_model": info.guardrails.reviewer_model,
                     "orchestrator_model": info.guardrails.orchestrator_model,
+                    "planner_model": info.guardrails.planner_model,
                     "auto_ops": info.guardrails.auto_ops,
                     "idle_kill_minutes": info.guardrails.idle_kill_minutes,
                     "max_spawns_per_hour": info.guardrails.max_spawns_per_hour,
@@ -2480,11 +2562,7 @@ impl OrchRegistry {
             .session_id
             .clone()
             .unwrap_or_else(|| format!("agent:{}", entry.id));
-        let role = match entry.role {
-            Role::Orchestrator => "orchestrator",
-            Role::Worker => "worker",
-            Role::Reviewer => "reviewer",
-        };
+        let role = entry.role.as_str();
         let mut snap = UsageSnapshot {
             key,
             agent_id: entry.id.clone(),
@@ -2639,15 +2717,20 @@ impl OrchRegistry {
             .filter(|a| a.group == group && a.status != AgentStatus::Dead)
             .cloned()
             .collect();
-        let cli = self
-            .group(group)
-            .map(|g| g.guardrails.agent_cli)
+        // Each agent's CLI is per-role (issue #4), so resolve it per agent.
+        // The group-level `cli` in the summary is the group default (workers/
+        // reviewers/planners may each run a different one).
+        let rails = self.group(group).map(|g| g.guardrails);
+        let cli = rails
+            .as_ref()
+            .map(|g| g.agent_cli.clone())
             .unwrap_or_else(|| "claude".to_string());
 
         // Refresh each live agent's durable snapshot from its current usage.
         let mut live_keys: HashSet<String> = HashSet::new();
         for a in &live_agents {
-            let snap = self.compute_usage_snapshot(a, &cli);
+            let cli = rails.as_ref().map(|g| g.cli_for(a.role)).unwrap_or("claude");
+            let snap = self.compute_usage_snapshot(a, cli);
             live_keys.insert(snap.key.clone());
             self.upsert_usage_snapshot(group, snap);
         }
@@ -2756,7 +2839,7 @@ impl OrchRegistry {
             .filter(|a| a.group == group && a.status != AgentStatus::Dead)
             .cloned()
             .collect();
-        let (mut orch, mut worker, mut reviewer) = (0u32, 0u32, 0u32);
+        let (mut orch, mut worker, mut reviewer, mut planner) = (0u32, 0u32, 0u32, 0u32);
         let mut earliest: Option<u64> = None;
         let mut list: Vec<Value> = live
             .iter()
@@ -2765,6 +2848,7 @@ impl OrchRegistry {
                     Role::Orchestrator => orch += 1,
                     Role::Worker => worker += 1,
                     Role::Reviewer => reviewer += 1,
+                    Role::Planner => planner += 1,
                 }
                 earliest = Some(earliest.map_or(a.started_ms, |e| e.min(a.started_ms)));
                 json!({
@@ -2785,7 +2869,7 @@ impl OrchRegistry {
             "live_delegates": worker + reviewer,
             "paused": self.is_paused(group),
             "uptime_ms": earliest.map(|e| now.saturating_sub(e)),
-            "roles": { "orchestrator": orch, "worker": worker, "reviewer": reviewer },
+            "roles": { "orchestrator": orch, "worker": worker, "reviewer": reviewer, "planner": planner },
             "agents": list,
         })
     }
@@ -2886,10 +2970,11 @@ impl OrchRegistry {
             ("MAX_AGENTS", &g.guardrails.max_agents.to_string()),
             ("WORKER_MODEL", g.guardrails.worker_model.as_str()),
             ("REVIEWER_MODEL", g.guardrails.reviewer_model.as_str()),
+            ("PLANNER_MODEL", g.guardrails.planner_model.as_str()),
         ];
         let vars: Vec<(&str, &str)> = vars.iter().map(|(k, v)| (*k, *v)).collect();
         let dir = self.group_dir(&g.id);
-        for role in [Role::Orchestrator, Role::Worker, Role::Reviewer] {
+        for role in [Role::Orchestrator, Role::Worker, Role::Reviewer, Role::Planner] {
             fs::write(dir.join(role.instructions_file()), render_template(role.template(), &vars))
                 .map_err(|e| e.to_string())?;
         }
@@ -3078,12 +3163,19 @@ impl OrchRegistry {
             self.check_and_record_spawn(group_id, group.guardrails.max_spawns_per_hour)?;
         }
 
-        // Guardrail: the model is pinned per role at group creation.
-        let model = match role {
-            Role::Orchestrator => &group.guardrails.orchestrator_model,
-            Role::Worker => &group.guardrails.worker_model,
-            Role::Reviewer => &group.guardrails.reviewer_model,
-        };
+        // Guardrail: the CLI and model are pinned per role at group creation
+        // (issue #4). Reject an unknown per-role CLI at spawn rather than
+        // silently downgrading it — the launcher only offers supported CLIs,
+        // so an unsupported one here means a hand-edited group.json.
+        let cli = group.guardrails.cli_for(role);
+        if !SUPPORTED_CLIS.contains(&cli) {
+            return Err(format!(
+                "guardrail: unsupported agent CLI {cli:?} for role {} — supported: {}",
+                role.as_str(), SUPPORTED_CLIS.join(", ")
+            ));
+        }
+        let cli = cli.to_string();
+        let model = group.guardrails.model_for(role);
 
         let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
         let agent_id = format!("{}-{seq}", role.prefix());
@@ -3102,13 +3194,13 @@ impl OrchRegistry {
         let resume = resume_session.is_some();
         let session_id = match resume_session {
             Some(s) => Some(sanitize_session(&s).ok_or("invalid resume session id")?),
-            None => (group.guardrails.agent_cli == "claude").then(new_session_uuid),
+            None => (cli == "claude").then(new_session_uuid),
         };
 
         // Copilot mints its own session id after boot (no `--session-id`), so
         // snapshot the sessions that already exist now, before this pane's
         // copilot starts — the watcher then identifies the newly appeared one.
-        let copilot_baseline = (!resume && group.guardrails.agent_cli == "copilot")
+        let copilot_baseline = (!resume && cli == "copilot")
             .then(|| {
                 crate::sessions::copilot_session_state_root()
                     .map(|root| crate::sessions::copilot_session_ids(&root))
@@ -3125,7 +3217,7 @@ impl OrchRegistry {
                 return Err(format!("cwd does not exist: {c}"));
             }
             (c, String::new())
-        } else if use_worktree && role != Role::Orchestrator {
+        } else if use_worktree && role != Role::Orchestrator && role != Role::Planner {
             let wt = crate::git::git_worktree_add(group.repo.clone(), branch_name.clone())?;
             (wt.clone(), format!(
                 "Your working directory is a dedicated git worktree at {wt} already checked out on branch '{branch_name}'."
@@ -3134,18 +3226,23 @@ impl OrchRegistry {
             (group.repo.clone(), String::new())
         } else if role == Role::Reviewer {
             (group.repo.clone(), "You review; you do not create branches or push. Inspect PRs via gh (checking out the PR branch locally is fine).".to_string())
+        } else if role == Role::Planner {
+            // Planners explore read-only in the repo itself and never branch,
+            // worktree, commit, or PR — so a worktree is never created for
+            // them even if `use_worktree` was set.
+            (group.repo.clone(), "You explore the codebase read-only to produce an implementation plan. You never create branches, worktrees, commits, or PRs — your deliverable is a plan written as a GitHub issue comment.".to_string())
         } else {
             (group.repo.clone(), format!(
                 "Work in the repo itself; create branch '{branch_name}' off the default branch before changing anything. Never commit to the default branch."
             ))
         };
 
-        if group.guardrails.agent_cli == "copilot" {
+        if cli == "copilot" {
             pre_trust_copilot_folder(&cwd);
         }
-        let cfg = self.write_mcp_config(group_id, &agent_id, &token, &group.guardrails.agent_cli)?;
+        let cfg = self.write_mcp_config(group_id, &agent_id, &token, &cli)?;
         let command = self.build_agent_command(
-            &group.guardrails.agent_cli,
+            &cli,
             model,
             group.guardrails.auto_ops,
             &cfg,
@@ -3202,7 +3299,7 @@ impl OrchRegistry {
         self.persist_agent_record(&entry, "running");
         self.audit(group_id, "loomux", "agent-spawn", json!({
             "agent": agent_id, "role": role, "name": display, "cwd": cwd,
-            "model": model, "worktree": use_worktree, "branch": branch_name, "task": task,
+            "cli": cli, "model": model, "worktree": use_worktree, "branch": branch_name, "task": task,
             "session": session_id, "resume": resume,
         }));
         // Breadcrumb (no prompt/task text): ids + role only.
@@ -3297,18 +3394,18 @@ impl OrchRegistry {
             Role::Orchestrator => format!(
                 "You are the orchestrator of loomux agent group {gid} for the repository {repo}.\n\
                  First read your role instructions: {ins}\n\
-                 Guardrails (enforced by loomux): max {max} live agents, worker model {wm}, reviewer model {rm}.\n\
+                 Guardrails (enforced by loomux): max {max} live agents, worker model {wm}, reviewer model {rm}, planner model {pm}.\n\
                  Start by calling get_state, run `gh issue list --label agent-managed --state open`, call list_agents, \
                  reconcile them, then give the human a short status summary and wait for direction.",
                 gid = g.id, repo = g.repo, ins = instructions.display(),
-                max = g.guardrails.max_agents, wm = g.guardrails.worker_model, rm = g.guardrails.reviewer_model,
+                max = g.guardrails.max_agents, wm = g.guardrails.worker_model,
+                rm = g.guardrails.reviewer_model, pm = g.guardrails.planner_model,
             ),
-            Role::Worker | Role::Reviewer => {
+            Role::Worker | Role::Reviewer | Role::Planner => {
                 let head = format!(
                     "You are \"{name}\" ({id}), a {role} agent in loomux group {gid} for repository {repo}.\n\
                      First read your role instructions: {ins}\n{note}",
-                    name = a.name, id = a.id,
-                    role = if a.role == Role::Worker { "worker" } else { "reviewer" },
+                    name = a.name, id = a.id, role = a.role.as_str(),
                     gid = g.id, repo = g.repo, ins = instructions.display(), note = branch_note,
                 );
                 if a.task.trim().is_empty() {
@@ -3620,7 +3717,7 @@ impl OrchRegistry {
         // statusline does not, but token usage is the source we rely on.
         let cli = self
             .group(&snapshot.group)
-            .map(|g| g.guardrails.agent_cli)
+            .map(|g| g.guardrails.cli_for(snapshot.role).to_string())
             .unwrap_or_else(|| "claude".to_string());
         let usage = self.compute_usage_snapshot(&snapshot, &cli);
         self.upsert_usage_snapshot(&snapshot.group, usage);
@@ -3711,9 +3808,16 @@ pub fn create_orchestration(
     initial_workers: u32,
     max_agents: u32,
     agent_cli: String,
+    // Per-role CLI overrides (issue #4). Empty inherits `agent_cli`; the
+    // launcher sends the picked CLI for each role.
+    orchestrator_cli: String,
+    worker_cli: String,
+    reviewer_cli: String,
+    planner_cli: String,
     worker_model: String,
     reviewer_model: String,
     orchestrator_model: String,
+    planner_model: String,
     auto_ops: bool,
     idle_kill_minutes: u32,
     max_spawns_per_hour: u32,
@@ -3725,9 +3829,14 @@ pub fn create_orchestration(
         Guardrails {
             max_agents,
             agent_cli,
+            orchestrator_cli,
+            worker_cli,
+            reviewer_cli,
+            planner_cli,
             worker_model,
             reviewer_model,
             orchestrator_model,
+            planner_model,
             auto_ops,
             idle_kill_minutes,
             max_spawns_per_hour,
@@ -3874,28 +3983,39 @@ fn register_orchestrator_pane(
     initial_workers: u32,
 ) -> Result<SpawnRequest, String> {
     let model = group.guardrails.orchestrator_model.clone();
+    // The orchestrator's CLI is per-role too (issue #4). It must be a supported
+    // CLI; the launcher only offers supported ones, so an unknown value here
+    // is a hand-edited group.json.
+    let cli = group.guardrails.cli_for(Role::Orchestrator);
+    if !SUPPORTED_CLIS.contains(&cli) {
+        return Err(format!(
+            "unsupported orchestrator CLI {cli:?} — supported: {}",
+            SUPPORTED_CLIS.join(", ")
+        ));
+    }
+    let cli = cli.to_string();
     let token = new_token();
     let agent_id = format!("orch-{}", reg.seq.fetch_add(1, Ordering::SeqCst) + 1);
-    if group.guardrails.agent_cli == "copilot" {
+    if cli == "copilot" {
         pre_trust_copilot_folder(&group.repo);
     }
-    let cfg = reg.write_mcp_config(&group.id, &agent_id, &token, &group.guardrails.agent_cli)?;
+    let cfg = reg.write_mcp_config(&group.id, &agent_id, &token, &cli)?;
     let resume = resume_session.is_some();
     let session_id = match resume_session {
         Some(s) => Some(sanitize_session(&s).ok_or("invalid resume session id")?),
-        None => (group.guardrails.agent_cli == "claude").then(new_session_uuid),
+        None => (cli == "claude").then(new_session_uuid),
     };
     // Copilot mints its own id on boot; snapshot existing sessions now so the
     // orchestrator's newly created one can be tracked (this is what gives a
     // copilot orchestration its ORCH chip and restore).
-    let copilot_baseline = (!resume && group.guardrails.agent_cli == "copilot")
+    let copilot_baseline = (!resume && cli == "copilot")
         .then(|| {
             crate::sessions::copilot_session_state_root()
                 .map(|root| crate::sessions::copilot_session_ids(&root))
                 .unwrap_or_default()
         });
     let command = reg.build_agent_command(
-        &group.guardrails.agent_cli,
+        &cli,
         &model,
         group.guardrails.auto_ops,
         &cfg,
@@ -4068,7 +4188,11 @@ pub fn resume_recorded_session(
                 .into(),
         );
     }
-    let role = if record.role == "reviewer" { Role::Reviewer } else { Role::Worker };
+    let role = match record.role.as_str() {
+        "reviewer" => Role::Reviewer,
+        "planner" => Role::Planner,
+        _ => Role::Worker,
+    };
     let cwd = reg
         .merged_records(&record.group_id)
         .into_iter()

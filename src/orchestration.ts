@@ -27,13 +27,22 @@ export interface OrchSpawnRequest {
 /** Launcher-collected group settings; guardrails are enforced backend-side. */
 export interface OrchestratorConfig {
   repo: string;
-  /** "claude" | "copilot" — which agent CLI the whole group runs. */
+  /** "claude" | "copilot" — the group's default agent CLI, used as the
+   *  fallback for any role whose per-role CLI is left blank. */
   agentCli: string;
+  /** Per-role agent CLI (issue #4, mixed agent types). Each is a supported
+   *  CLI id; the backend inherits `agentCli` when one is empty. */
+  orchestratorCli: string;
+  workerCli: string;
+  reviewerCli: string;
+  plannerCli: string;
   initialWorkers: number;
   maxAgents: number;
   workerModel: string;
   reviewerModel: string;
   orchestratorModel: string;
+  /** Model for the planner role (issue #47). */
+  plannerModel: string;
   autoOps: boolean;
   /** Cost guardrail: auto-kill an idle worker/reviewer after this many
    *  minutes without a task (0 = disabled). */
@@ -226,11 +235,16 @@ export async function launchOrchestrator(
   const spec = await invoke<OrchSpawnRequest>("create_orchestration", {
     repo: config.repo,
     agentCli: config.agentCli,
+    orchestratorCli: config.orchestratorCli,
+    workerCli: config.workerCli,
+    reviewerCli: config.reviewerCli,
+    plannerCli: config.plannerCli,
     initialWorkers: config.initialWorkers,
     maxAgents: config.maxAgents,
     workerModel: config.workerModel,
     reviewerModel: config.reviewerModel,
     orchestratorModel: config.orchestratorModel,
+    plannerModel: config.plannerModel,
     autoOps: config.autoOps,
     idleKillMinutes: config.idleKillMinutes,
     maxSpawnsPerHour: config.maxSpawnsPerHour,
