@@ -13,6 +13,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager, State};
 
+use crate::obs::LockExt;
+
 /// Cap on the per-pty output ring used by orchestration's `get_output` —
 /// enough for a few screens of TUI history without unbounded growth.
 const OUTPUT_RING_CAP: usize = 256 * 1024;
@@ -52,7 +54,7 @@ impl PtyManager {
     /// Kill every child process; used on app shutdown so shells (and any
     /// agents running in them) don't outlive the window.
     pub fn kill_all(&self) {
-        let handles: Vec<_> = self.ptys.lock().unwrap().drain().collect();
+        let handles: Vec<_> = self.ptys.lock_safe().drain().collect();
         for (_, mut h) in handles {
             let _ = h.killer.kill();
         }
@@ -61,28 +63,28 @@ impl PtyManager {
     /// Raw write into a pty's stdin; used by orchestration to type prompts
     /// into agent CLIs so the human sees them verbatim.
     pub fn write_bytes(&self, id: u32, bytes: &[u8]) -> Result<(), String> {
-        let mut ptys = self.ptys.lock().unwrap();
+        let mut ptys = self.ptys.lock_safe();
         let pty = ptys.get_mut(&id).ok_or("pty not found")?;
         pty.writer.write_all(bytes).map_err(|e| e.to_string())
     }
 
     /// Snapshot of the rolling output tail (raw bytes, ANSI included).
     pub fn output_tail(&self, id: u32) -> Option<Vec<u8>> {
-        let ptys = self.ptys.lock().unwrap();
-        let buf = ptys.get(&id)?.output.lock().unwrap();
+        let ptys = self.ptys.lock_safe();
+        let buf = ptys.get(&id)?.output.lock_safe();
         Some(buf.ring.iter().copied().collect())
     }
 
     /// Unix-ms of the last human keystroke into this pty (0 = never).
     pub fn last_user_input_ms(&self, id: u32) -> Option<u64> {
-        let ptys = self.ptys.lock().unwrap();
+        let ptys = self.ptys.lock_safe();
         Some(ptys.get(&id)?.user_input_ms.load(Ordering::Relaxed))
     }
 
     /// Monotonic count of bytes this pty has ever produced.
     pub fn output_total(&self, id: u32) -> Option<u64> {
-        let ptys = self.ptys.lock().unwrap();
-        let total = ptys.get(&id)?.output.lock().unwrap().total;
+        let ptys = self.ptys.lock_safe();
+        let total = ptys.get(&id)?.output.lock_safe().total;
         Some(total)
     }
 
@@ -90,13 +92,13 @@ impl PtyManager {
     /// including plain shells the human opened by hand, which have no
     /// orchestration identity — not just registered agents.
     pub fn live_ids(&self) -> Vec<u32> {
-        self.ptys.lock().unwrap().keys().copied().collect()
+        self.ptys.lock_safe().keys().copied().collect()
     }
 
     /// Kill one child; the waiter thread reaps it and emits `pty-exit`.
     pub fn kill(&self, id: u32) {
-        self.expected_exits.lock().unwrap().insert(id);
-        let handle = self.ptys.lock().unwrap().remove(&id);
+        self.expected_exits.lock_safe().insert(id);
+        let handle = self.ptys.lock_safe().remove(&id);
         if let Some(mut h) = handle {
             let _ = h.killer.kill();
         }
@@ -240,7 +242,7 @@ pub fn spawn_pty(
 
     let id = state.next_id.fetch_add(1, Ordering::SeqCst) + 1;
     let output = Arc::new(Mutex::new(OutputBuf::default()));
-    state.ptys.lock().unwrap().insert(
+    state.ptys.lock_safe().insert(
         id,
         PtyHandle {
             master: pair.master,
@@ -250,6 +252,8 @@ pub fn spawn_pty(
             user_input_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         },
     );
+
+    crate::obs::breadcrumb("pty-open", &format!("id={id} cols={cols} rows={rows}"));
 
     // Reader thread: stream output on a single shared channel keyed by id.
     // The frontend router buffers payloads for panes that haven't attached
@@ -263,7 +267,7 @@ pub fn spawn_pty(
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     {
-                        let mut out = output.lock().unwrap();
+                        let mut out = output.lock_safe();
                         out.total += n as u64;
                         out.ring.extend(&buf[..n]);
                         let overflow = out.ring.len().saturating_sub(OUTPUT_RING_CAP);
@@ -290,9 +294,13 @@ pub fn spawn_pty(
     let expected_exits = state.expected_exits.clone();
     std::thread::spawn(move || {
         let status = child.wait();
-        ptys.lock().unwrap().remove(&id);
-        let expected = expected_exits.lock().unwrap().remove(&id);
+        ptys.lock_safe().remove(&id);
+        let expected = expected_exits.lock_safe().remove(&id);
         let exit_code = status.ok().map(|s| s.exit_code());
+        crate::obs::breadcrumb(
+            "pty-exit",
+            &format!("id={id} code={exit_code:?} expected={expected}"),
+        );
         if let Some(reg) = app.try_state::<Arc<crate::orchestration::OrchRegistry>>() {
             reg.on_pty_exit(id, exit_code);
         }
@@ -344,7 +352,7 @@ pub fn pty_backend_info() -> PtyBackendInfo {
 
 #[tauri::command]
 pub fn write_pty(state: State<PtyManager>, id: u32, data: String) -> Result<(), String> {
-    let mut ptys = state.ptys.lock().unwrap();
+    let mut ptys = state.ptys.lock_safe();
     let pty = ptys.get_mut(&id).ok_or("pty not found")?;
     pty.user_input_ms.store(
         std::time::SystemTime::now()
@@ -360,7 +368,7 @@ pub fn write_pty(state: State<PtyManager>, id: u32, data: String) -> Result<(), 
 
 #[tauri::command]
 pub fn resize_pty(state: State<PtyManager>, id: u32, cols: u16, rows: u16) -> Result<(), String> {
-    let ptys = state.ptys.lock().unwrap();
+    let ptys = state.ptys.lock_safe();
     let pty = ptys.get(&id).ok_or("pty not found")?;
     pty.master
         .resize(PtySize {
@@ -369,7 +377,15 @@ pub fn resize_pty(state: State<PtyManager>, id: u32, cols: u16, rows: u16) -> Re
             pixel_width: 0,
             pixel_height: 0,
         })
-        .map_err(|e| e.to_string())
+        .map_err(|e| {
+            // Resize *failures* are breadcrumbed (a ConPTY resize is one of the
+            // heavier operations and interesting near a crash); routine
+            // successes are not — a ResizeObserver can fire them in bursts and
+            // the spam would bury signal and rotate real crumbs away.
+            let e = e.to_string();
+            crate::obs::breadcrumb("pty-resize-fail", &format!("id={id} cols={cols} rows={rows} err={e}"));
+            e
+        })
 }
 
 /// Display metadata for a directory the shell just reported via OSC 7.
@@ -398,7 +414,7 @@ pub fn dir_info(path: String) -> DirInfo {
 #[tauri::command]
 pub fn change_dir(state: State<PtyManager>, id: u32, path: String) -> Result<(), String> {
     let line = cd_command_line(&path);
-    let mut ptys = state.ptys.lock().unwrap();
+    let mut ptys = state.ptys.lock_safe();
     let pty = ptys.get_mut(&id).ok_or("pty not found")?;
     pty.writer
         .write_all(line.as_bytes())

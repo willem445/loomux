@@ -1,5 +1,7 @@
 import "./styles.css";
 import { getVersion } from "@tauri-apps/api/app";
+import { invoke } from "@tauri-apps/api/core";
+import { showToast } from "./toast";
 import { Grid } from "./grid";
 import type { Pane, PaneEvents } from "./pane";
 import { SessionBrowser } from "./sessions";
@@ -268,6 +270,18 @@ void (async () => {
     if (el) el.textContent = `v${await getVersion()}`;
   } catch {
     /* version is cosmetic; ignore */
+  }
+})();
+
+// Crash observability (issue #53): if the previous run died without a clean
+// exit, the backend armed a notice naming the newest crash log. Drain it once
+// and surface it as an info toast so the user knows there's something to read.
+void (async () => {
+  try {
+    const notice = await invoke<string | null>("take_startup_notice");
+    if (notice) showToast(notice, "info");
+  } catch {
+    /* observability is best-effort; never block startup on it */
   }
 })();
 

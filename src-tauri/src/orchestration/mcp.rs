@@ -93,6 +93,12 @@ fn handle(reg: Arc<OrchRegistry>, mut req: tiny_http::Request) {
     let caller = match token.as_deref().and_then(|t| reg.resolve_token(t)) {
         Some(c) => c,
         None => {
+            // Breadcrumb the rejection (method + whether a token was present),
+            // never the token value or body.
+            crate::obs::breadcrumb(
+                "mcp-auth-fail",
+                &format!("method={method} token_present={}", token.is_some()),
+            );
             respond(req, 200, rpc_error(&id, -32000,
                 "unknown or missing X-Loomux-Agent token — this MCP server only serves loomux-managed agents"));
             return;
@@ -138,6 +144,13 @@ pub fn dispatch(
                 Ok(t) => (t, false),
                 Err(t) => (t, true),
             };
+            if is_error {
+                // Failure only, and only the tool name + caller — no args/output.
+                crate::obs::breadcrumb(
+                    "mcp-tool-fail",
+                    &format!("group={} agent={} tool={name}", caller.group, caller.agent_id),
+                );
+            }
             reg.audit(&caller.group, &caller.agent_id, "tool-result", json!({
                 "tool": name, "ok": !is_error,
                 "text": text.chars().take(500).collect::<String>(),

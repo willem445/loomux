@@ -50,4 +50,14 @@ tempfile = { version = "3", default-features = false }
 [profile.release]
 lto = true
 codegen-units = 1
-strip = true
+# Named backtrace frames in the panic hook's crash logs (issue #53). `debug` —
+# NOT `strip` — is what puts loomux's OWN functions in the debug info: without
+# it (release defaults to debug=false) the MSVC PDB carries only public symbols
+# and dbghelp resolves our frames as `__ImageBase`, even with the PDB adjacent.
+# `line-tables-only` adds function names + line numbers at a modest size cost;
+# `strip = "debuginfo"` then keeps the *exe* slim (debug info lives in the
+# standalone PDB / split debug, not the shipped binary). Net: build-tree and CI
+# backtraces are genuinely symbolicated; installed bundles stay address-only
+# until the PDB is shipped — see doc/design/crash-observability.md.
+debug = "line-tables-only"
+strip = "debuginfo"

@@ -307,6 +307,13 @@ and the rendered role instructions. The group id is derived from the
 repo path, so relaunching an orchestrator on the same repo resumes its
 state; GitHub issues remain the source of truth for the work queue.
 
+**Crash logs:** loomux writes forensics under `<data dir>/loomux/logs/` — a
+Rust panic hook drops `crash-<timestamp>.log` (message, thread, backtrace),
+and a rotating `breadcrumbs.log` records lifecycle events (pane/PTY
+open/close, agent spawn/exit, delivery outcomes) with no prompt content. If a
+run exits uncleanly, the next launch surfaces a toast naming the newest crash
+log. See `doc/design/crash-observability.md`.
+
 Requirements: `claude` CLI on PATH; `gh` CLI authenticated for the
 issue/PR/review workflow.
 
@@ -317,6 +324,7 @@ src-tauri/src/
   pty.rs            PTY lifecycle (spawn/write/resize/kill) + output streaming
   sessions.rs       agent session discovery (one scan_* fn per agent source)
   orchestration/    agent groups: registry, guardrails, MCP server, audit
+  obs.rs            crash observability: panic hook, breadcrumb log, unclean-exit notice
   lib.rs            Tauri wiring
 src/
   pty.ts            typed bridge to the backend (invoke + event bus)

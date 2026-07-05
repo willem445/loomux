@@ -4,6 +4,7 @@ mod git;
 mod gitwatch;
 mod winpath;
 mod metrics;
+mod obs;
 pub mod orchestration; // pub: integration smoke test links through it
 mod pty;
 mod sessions;
@@ -14,8 +15,24 @@ use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Crash observability (issue #53): install the panic hook before anything
+    // else so even a crash during setup leaves a log, then detect whether the
+    // previous run exited uncleanly and arm this run's sentinel.
+    obs::install_panic_hook();
+    let startup = obs::check_and_arm();
+    obs::breadcrumb(
+        "startup",
+        &format!(
+            "v{} unclean_prev={}",
+            env!("CARGO_PKG_VERSION"),
+            startup.unclean
+        ),
+    );
+    let startup_notice = obs::StartupNotice(std::sync::Mutex::new(startup.notice()));
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .manage(startup_notice)
         .manage(pty::PtyManager::default())
         .manage(Arc::new(gitwatch::GitWatcher::new()))
         .manage(Arc::new(orchestration::OrchRegistry::new(
@@ -96,11 +113,16 @@ pub fn run() {
             orchestration::orch_end_group,
             cliprobe::probe_agent_cli,
             editor::open_in_editor,
+            obs::take_startup_notice,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {
+                obs::breadcrumb("shutdown", "window destroyed");
                 let state: tauri::State<pty::PtyManager> = window.app_handle().state();
                 state.kill_all();
+                // Record a clean exit last, so a crash during teardown still
+                // leaves the sentinel for the next launch to report.
+                obs::mark_clean_exit();
             }
         })
         .run(tauri::generate_context!())

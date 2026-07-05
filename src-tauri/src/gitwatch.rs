@@ -29,6 +29,8 @@ use std::time::Duration;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
 
+use crate::obs::LockExt;
+
 /// How often the `.git` metadata of watched repos is sampled. One second keeps
 /// the worst-case latency (poll interval + the frontend's 500 ms throttle)
 /// comfortably under the ~2 s target while a stat sweep stays negligible.
@@ -64,7 +66,7 @@ impl GitWatcher {
     /// the next poll.
     pub fn watch(&self, id: u32, cwd: &str) {
         let resolved = resolve_git_dirs(Path::new(cwd));
-        let mut map = self.watches.lock().unwrap();
+        let mut map = self.watches.lock_safe();
         match resolved {
             Some((git_dir, common_dir)) => {
                 let same = map.get(&id).is_some_and(|w| w.git_dir == git_dir);
@@ -88,7 +90,7 @@ impl GitWatcher {
 
     /// Stop watching pane `id` (called when its pane is disposed).
     pub fn unwatch(&self, id: u32) {
-        self.watches.lock().unwrap().remove(&id);
+        self.watches.lock_safe().remove(&id);
     }
 
     /// Recompute every watch's signature and return the pane ids whose repo
@@ -101,7 +103,7 @@ impl GitWatcher {
     pub fn poll_changed(&self) -> Vec<u32> {
         // Snapshot (id, dirs) under the lock, then release it for the I/O.
         let snapshot: Vec<(u32, PathBuf, PathBuf)> = {
-            let map = self.watches.lock().unwrap();
+            let map = self.watches.lock_safe();
             map.iter()
                 .map(|(id, w)| (*id, w.git_dir.clone(), w.common_dir.clone()))
                 .collect()
@@ -121,7 +123,7 @@ impl GitWatcher {
         // one is simply gone, and a repointed one already has a fresh baseline
         // signature from `watch()`, so the stale sig we computed is discarded.
         let mut changed = Vec::new();
-        let mut map = self.watches.lock().unwrap();
+        let mut map = self.watches.lock_safe();
         for (id, git_dir, sig) in sigs {
             if let Some(w) = map.get_mut(&id) {
                 if w.git_dir == git_dir && sig != w.last_sig {
@@ -136,7 +138,7 @@ impl GitWatcher {
     /// Number of active watches (test/introspection helper).
     #[cfg(test)]
     fn len(&self) -> usize {
-        self.watches.lock().unwrap().len()
+        self.watches.lock_safe().len()
     }
 }
 
