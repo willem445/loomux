@@ -937,6 +937,7 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 }
 .group-line { color: var(--text); font-weight: 500; }
 .group-cost { color: var(--text-dim); font-size: 11px; }
+.group-cost-live { color: var(--text-dim); font-size: 10px; opacity: 0.75; }
 .group-paused-badge {
   font-size: 9.5px; font-weight: 600; border-radius: 4px; padding: 1px 7px;
   background: rgba(224, 175, 104, 0.16); color: #e0af68;
@@ -969,6 +970,7 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   flex: none; font-family: "Cascadia Mono", Consolas, monospace;
   font-size: 10px; color: var(--text-dim); min-width: 42px; text-align: right;
 }
+.group-agent-cost { min-width: 96px; }
 .group-actions {
   display: flex; align-items: center; gap: 10px; flex: none;
   padding: 8px 12px; border-top: 1px solid var(--border-soft);
