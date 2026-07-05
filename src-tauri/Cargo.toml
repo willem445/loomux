@@ -51,7 +51,10 @@ tempfile = { version = "3", default-features = false }
 lto = true
 codegen-units = 1
 # Keep the symbol table (drop only debuginfo) so the panic hook's backtraces
-# (issue #53) name functions instead of bare addresses. Line numbers still go —
-# that needs full debuginfo — but function names make a crash log actionable at
-# a small binary-size cost. `strip = true` would blank the frames entirely.
+# (issue #53) name functions instead of bare addresses. This helps on
+# Linux/macOS, where frame names come from the in-binary symbol table. On
+# Windows/MSVC names come from a PDB (dbghelp), which release doesn't emit and
+# the bundle doesn't ship — so shipped Windows backtraces stay address-only; see
+# doc/design/crash-observability.md. `strip = true` would blank frames on every
+# platform.
 strip = "debuginfo"

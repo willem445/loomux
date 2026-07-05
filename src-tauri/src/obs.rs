@@ -229,7 +229,7 @@ impl StartupCheck {
                 p.display()
             ),
             None => "loomux exited unexpectedly last run — no crash log was written \
-                     (an abrupt abort); see breadcrumbs.log"
+                     (a hard abort, not an unwinding panic); see breadcrumbs.log"
                 .to_string(),
         })
     }
@@ -250,7 +250,16 @@ fn check_and_arm_in(dir: &Path) -> StartupCheck {
     let _ = fs::create_dir_all(dir);
     let lock = running_lock(dir);
     let unclean = lock.exists();
-    let crash_log = if unclean { newest_crash_log(dir) } else { None };
+    // The sentinel's own mtime marks when the previous (crashed) run *started*.
+    // Only a crash log written at or after that instant can belong to that run;
+    // a hard abort writes no crash log, so without this guard we'd mis-name an
+    // older log from an earlier run and point the user at the wrong crash.
+    let since = if unclean {
+        fs::metadata(&lock).and_then(|m| m.modified()).ok()
+    } else {
+        None
+    };
+    let crash_log = if unclean { newest_crash_log_since(dir, since) } else { None };
     let _ = fs::write(&lock, stamp(now_ms()));
     StartupCheck { unclean, crash_log }
 }
@@ -262,17 +271,29 @@ pub fn mark_clean_exit() {
     let _ = fs::remove_file(running_lock(&logs_dir()));
 }
 
-/// Newest `crash-*.log` in `dir` by filename. Stamps sort lexically, so the max
-/// name is the most recent. `None` when there are none.
-fn newest_crash_log(dir: &Path) -> Option<PathBuf> {
-    fs::read_dir(dir)
-        .ok()?
+fn is_crash_log(p: &Path) -> bool {
+    p.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.starts_with("crash-") && n.ends_with(".log"))
+}
+
+/// Newest `crash-*.log` in `dir` (by filename — stamps sort lexically) whose
+/// mtime is at or after `since`. The mtime gate is what keeps a hard abort (no
+/// crash log written) from mis-attributing an older log to this crash; pass
+/// `since = None` to disable it (best effort when the sentinel mtime is
+/// unreadable). `None` when nothing qualifies.
+fn newest_crash_log_since(dir: &Path, since: Option<SystemTime>) -> Option<PathBuf> {
+    let entries = fs::read_dir(dir).ok()?;
+    entries
         .flatten()
         .map(|e| e.path())
-        .filter(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("crash-") && n.ends_with(".log"))
+        .filter(|p| is_crash_log(p))
+        .filter(|p| match since {
+            Some(t) => fs::metadata(p)
+                .and_then(|m| m.modified())
+                .map(|m| m >= t)
+                .unwrap_or(false),
+            None => true,
         })
         .max()
 }
@@ -396,17 +417,68 @@ mod tests {
         assert!(!check_and_arm_in(tmp.path()).unclean);
     }
 
+    /// Pin a file's mtime so the mtime-gate assertions don't depend on wall
+    /// clock. `set_modified` is stable std; no external crate (cf. gitwatch).
+    fn set_mtime(path: &Path, t: std::time::SystemTime) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(t)
+            .unwrap();
+    }
+
     #[test]
-    fn notice_names_newest_crash_log() {
+    fn notice_names_only_a_crash_log_from_the_crashed_run() {
+        use std::time::Duration;
         let tmp = tempfile::tempdir().unwrap();
-        // Two crash logs with different stamps; the newer name must win.
-        fs::write(tmp.path().join("crash-20260101-000000.log"), "old").unwrap();
-        fs::write(tmp.path().join("crash-20260705-120000.log"), "new").unwrap();
-        // Arm + crash so the next check reports unclean and finds the log.
+
+        // Run 1 starts: arm the sentinel. Its mtime is the run's start instant.
         check_and_arm_in(tmp.path());
-        let check = check_and_arm_in(tmp.path());
-        let notice = check.notice().unwrap();
-        assert!(notice.contains("crash-20260705-120000.log"), "names the newest: {notice}");
+        let start = fs::metadata(running_lock(tmp.path())).unwrap().modified().unwrap();
+
+        // A stale crash log from an EARLIER run (before this sentinel).
+        let old = tmp.path().join("crash-20200101-000000.log");
+        fs::write(&old, "old").unwrap();
+        set_mtime(&old, start - Duration::from_secs(3600));
+
+        // Case A — hard abort: the run wrote no new crash log. Unclean, but the
+        // stale older log must NOT be named (that was the mis-attribution bug).
+        let abort = check_and_arm_in(tmp.path());
+        assert!(abort.unclean);
+        assert!(abort.crash_log.is_none(), "must not name a pre-sentinel log");
+        assert!(abort.notice().unwrap().contains("no crash log was written"));
+
+        // Case B — a real panic during this run drops a crash log newer than the
+        // sentinel it re-armed above; that one IS named.
+        let start2 = fs::metadata(running_lock(tmp.path())).unwrap().modified().unwrap();
+        let fresh = tmp.path().join("crash-20260705-120000.log");
+        fs::write(&fresh, "boom").unwrap();
+        set_mtime(&fresh, start2 + Duration::from_secs(5));
+
+        let crash = check_and_arm_in(tmp.path());
+        assert!(crash.unclean);
+        assert_eq!(crash.crash_log.as_deref(), Some(fresh.as_path()));
+        assert!(crash.notice().unwrap().contains("crash-20260705-120000.log"));
+    }
+
+    #[test]
+    fn lock_safe_recovers_a_poisoned_mutex() {
+        let m = std::sync::Arc::new(Mutex::new(vec![1, 2, 3]));
+        let m2 = m.clone();
+        // Poison the mutex: mutate then panic while still holding the guard.
+        let _ = std::thread::spawn(move || {
+            let mut g = m2.lock().unwrap();
+            g.push(4);
+            panic!("poison the mutex on purpose");
+        })
+        .join();
+        assert!(m.lock().is_err(), "mutex must be poisoned by the panic");
+
+        // The load-bearing fix: lock_safe serves the recovered data instead of
+        // propagating the poison as a panic.
+        let g = m.lock_safe();
+        assert_eq!(&*g, &[1, 2, 3, 4], "recovered guard sees the mutation");
     }
 
     #[test]

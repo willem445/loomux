@@ -49,12 +49,31 @@ and the watchers — not just the main thread. The hook body is wrapped in
 `catch_unwind` and every I/O step is best-effort, so the hook can never panic
 and mask the original crash.
 
-**Backtrace symbol quality.** The release profile was `strip = true`, which
-blanks the symbol table and would leave backtrace frames as bare addresses. It
-is now `strip = "debuginfo"`: the symbol table is kept (frames name their
-functions) while debuginfo — and thus line numbers — is still dropped, for a
-small binary-size cost. Fully symbolicated backtraces with line numbers would
-require shipping debuginfo, which we deliberately don't.
+**Backtrace symbol quality (platform-dependent).** The release profile was
+`strip = true`, which blanks symbols and leaves backtrace frames as bare
+addresses everywhere. It is now `strip = "debuginfo"` — but what that buys
+depends on the platform:
+
+- **Linux / macOS:** frame names come from the binary's own symbol table, which
+  `strip = "debuginfo"` keeps (only debuginfo, and thus line numbers, is
+  dropped). Crash-log backtraces name their functions. Real win, small size
+  cost.
+- **Windows / MSVC (the shipping target):** the exe has no symbol table — names
+  come from a **PDB** resolved at runtime by dbghelp. The release profile emits
+  **no PDB** (`debug` defaults to `false`), and even if it did, the Tauri bundle
+  (`tauri.conf.json` → `bundle.targets: "all"` → NSIS/MSI) ships only
+  `loomux.exe` and its installer, **not** a `.pdb`. So a shipped Windows crash
+  log's backtrace is **addresses only**. The addresses are still useful (offset
+  into the module), and the panic *message*, *location* (`file:line:col`, from
+  `#[track_caller]`/panic metadata, independent of the PDB), and *thread name*
+  are always present and are usually enough to localize the fault.
+
+We deliberately do **not** ship a PDB: it bloats the installer and exposes full
+symbols. To get named Windows frames when reproducing locally, build with a PDB
+(`RUSTFLAGS=-Cdebuginfo=1` or set `debug = "line-tables-only"` in the release
+profile) and keep `loomux.pdb` beside `loomux.exe` at runtime — dbghelp picks it
+up automatically. Shipping symbolication (uploading a PDB to a symbol server
+keyed by the crash log's addresses) is a possible follow-up, out of scope here.
 
 ### 2. Breadcrumb log
 
@@ -90,8 +109,12 @@ compile flood) is untouched; only open/exit are breadcrumbed.
 startup and removed on a clean shutdown (the window `Destroyed` path, *after*
 `kill_all`). Finding the sentinel already present at startup means the previous
 run died without unwinding to a clean exit. When that happens we locate the
-newest `crash-*.log` (stamps sort lexically, so it's a string max) and stash a
-notice string in Tauri-managed `StartupNotice` state. The frontend drains it
+newest `crash-*.log` **whose mtime is at or after the sentinel's own mtime**
+(the crashed run's start instant) and stash a notice string in Tauri-managed
+`StartupNotice` state. The mtime gate matters: a *hard abort* writes no crash
+log, so naming the plain newest log would mis-attribute an older crash from an
+earlier run. When nothing qualifies, the notice says so ("no crash log was
+written (a hard abort …)") and points at `breadcrumbs.log` instead. The frontend drains it
 once via the `take_startup_notice` command and shows an info toast:
 
 > loomux exited unexpectedly last run — crash log at &lt;path&gt;
@@ -175,7 +198,12 @@ need global state serialize on a test mutex and restore the panic hook):
 - **unclean-exit detection**: first launch clean + arms sentinel; a launch with
   a leftover sentinel reports unclean and yields the notice; a clean exit clears
   it;
-- the notice **names the newest** crash log;
+- the notice **names only a crash log from the crashed run** (mtime ≥ sentinel):
+  a stale pre-sentinel log is *not* named on a hard abort, and a fresh
+  post-sentinel log *is* named;
+- **`lock_safe` recovers a poisoned mutex**: a thread poisons a `Mutex` by
+  panicking under its guard, and `lock_safe()` still serves the recovered data
+  without propagating the panic (a direct test of the load-bearing cascade fix);
 - **breadcrumb rotation** at the cap (retains one generation) and content
   (event + detail only, single line);
 - timestamp formatting is sortable UTC.
