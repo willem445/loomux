@@ -25,6 +25,8 @@ export function initHintBar(): void {
   bar.addEventListener(
     "wheel",
     (e: WheelEvent) => {
+      // Ctrl+wheel is zoom, not scroll — never hijack it.
+      if (e.ctrlKey) return;
       // Nothing to scroll to (bar fits the window) → leave the event alone.
       if (bar.scrollWidth <= bar.clientWidth) return;
       const delta = wheelToScrollDelta(e.deltaX, e.deltaY);
