@@ -40,6 +40,19 @@ Read requests (`ESC]52;c;?BEL`) are **ignored on purpose**: servicing one would
 leak the clipboard to any process that asks and require writing a reply back
 into the PTY. We only ever *write*.
 
+Two hardening guards (review of #68):
+
+- **Size cap before decode.** `parseOsc52` rejects a payload longer than
+  `OSC52_MAX_B64_LEN` (1 MiB of base64) *before* calling `atob`, so a hostile or
+  buggy CLI can't make us balloon a giant string on the main thread. An oversize
+  payload is distinguished from a benign ignore (`{ok:false, reason:"oversize"}`)
+  so the pane can toast it.
+- **No silent copy failure.** `writeClipboard` returns whether the write
+  actually succeeded; the pane toasts ("Copy failed — click the pane and try
+  again") when both the async API *and* the `execCommand` fallback fail. Without
+  this a locked-down webview would silently no-op and reintroduce the exact
+  "said copied, clipboard empty" symptom with no signal.
+
 Why not the Tauri clipboard plugin? It pulls in `arboard`, which drags a
 `getrandom` dependency (banned on this project's Windows 10 baseline — it
 imports `ProcessPrng`, failing to load with `0xc0000139`) plus a large

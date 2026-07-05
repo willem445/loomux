@@ -25,6 +25,7 @@ import {
 import { invoke } from "@tauri-apps/api/core";
 import { parseOsc52, writeClipboard } from "./clipboard";
 import { createOrderedWriter } from "./ptywrite";
+import { showToast } from "./toast";
 import { isAppShortcut } from "./shortcuts";
 import { attentionPresentation } from "./attention";
 import { openInEditor, editorConfigDialog } from "./editor";
@@ -385,10 +386,15 @@ export class Pane {
     // OSC 52. xterm.js doesn't implement it, so without this handler the
     // sequence is dropped — the CLI says "copied" but the system clipboard
     // stays empty (#65). Decode the base64 payload and write it out; ignore
-    // read requests (`?`) so we never leak the clipboard back to the process.
+    // read requests (`?`) so we never leak the clipboard back to the process,
+    // and refuse an oversized payload rather than balloon memory decoding it.
     this.term.parser.registerOscHandler(52, (payload) => {
-      const text = parseOsc52(payload);
-      if (text !== null) void writeClipboard(text);
+      const parsed = parseOsc52(payload);
+      if (parsed.ok) {
+        void this.copyToClipboard(parsed.text);
+      } else if (parsed.reason === "oversize") {
+        showToast("Ignored an oversized copy request from the terminal.");
+      }
       return true;
     });
 
@@ -399,7 +405,7 @@ export class Pane {
       if (isAppShortcut(e)) return false;
       if (e.ctrlKey && e.shiftKey && e.code === "KeyC") {
         const sel = this.term.getSelection();
-        if (sel) void writeClipboard(sel);
+        if (sel) void this.copyToClipboard(sel);
         return false;
       }
       if (e.ctrlKey && e.shiftKey && e.code === "KeyV") {
@@ -973,6 +979,15 @@ export class Pane {
 
   focus(): void {
     this.term.focus();
+  }
+
+  /** Copy `text` to the system clipboard, surfacing a toast if the write fails
+   *  outright (locked-down webview) — otherwise a failed OSC 52 copy would
+   *  silently no-op and reintroduce the "said copied, clipboard empty" symptom
+   *  from #65 with no signal to the user. */
+  private async copyToClipboard(text: string): Promise<void> {
+    const ok = await writeClipboard(text);
+    if (!ok) showToast("Copy failed — click the pane and try again.");
   }
 
   /** Build the loomux steering strip and dock it under the terminal (#43,
