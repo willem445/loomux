@@ -12,7 +12,7 @@ import type { Grid } from "./grid";
 import type { PaneEvents, PaneBadge } from "./pane";
 import { panesInGroup } from "./group";
 
-export type OrchRole = "orchestrator" | "worker" | "reviewer";
+export type OrchRole = "orchestrator" | "worker" | "reviewer" | "planner";
 
 /** Backend request to open (or spec to open) an agent pane. */
 export interface OrchSpawnRequest {
@@ -27,13 +27,22 @@ export interface OrchSpawnRequest {
 /** Launcher-collected group settings; guardrails are enforced backend-side. */
 export interface OrchestratorConfig {
   repo: string;
-  /** "claude" | "copilot" — which agent CLI the whole group runs. */
+  /** "claude" | "copilot" — the group's default agent CLI, used as the
+   *  fallback for any role whose per-role CLI is left blank. */
   agentCli: string;
+  /** Per-role agent CLI (issue #4, mixed agent types). Each is a supported
+   *  CLI id; the backend inherits `agentCli` when one is empty. */
+  orchestratorCli: string;
+  workerCli: string;
+  reviewerCli: string;
+  plannerCli: string;
   initialWorkers: number;
   maxAgents: number;
   workerModel: string;
   reviewerModel: string;
   orchestratorModel: string;
+  /** Model for the planner role (issue #47). */
+  plannerModel: string;
   autoOps: boolean;
   /** Cost guardrail: auto-kill an idle worker/reviewer after this many
    *  minutes without a task (0 = disabled). */
@@ -72,6 +81,7 @@ const ROLE_LABELS: Record<OrchRole, string> = {
   orchestrator: "ORCH",
   worker: "W",
   reviewer: "REV",
+  planner: "PLAN",
 };
 
 export function badgeFor(req: OrchSpawnRequest): PaneBadge {
@@ -226,11 +236,16 @@ export async function launchOrchestrator(
   const spec = await invoke<OrchSpawnRequest>("create_orchestration", {
     repo: config.repo,
     agentCli: config.agentCli,
+    orchestratorCli: config.orchestratorCli,
+    workerCli: config.workerCli,
+    reviewerCli: config.reviewerCli,
+    plannerCli: config.plannerCli,
     initialWorkers: config.initialWorkers,
     maxAgents: config.maxAgents,
     workerModel: config.workerModel,
     reviewerModel: config.reviewerModel,
     orchestratorModel: config.orchestratorModel,
+    plannerModel: config.plannerModel,
     autoOps: config.autoOps,
     idleKillMinutes: config.idleKillMinutes,
     maxSpawnsPerHour: config.maxSpawnsPerHour,
@@ -329,13 +344,14 @@ export interface GroupSummary {
   /** Current adjustable live-agent cap (guardrail), or null if the group is
    *  unknown to the registry. Drives the GroupView stepper. */
   max_agents: number | null;
-  /** Live workers + reviewers (what counts against `max_agents`; the
-   *  orchestrator is exempt). Lowering the cap below this blocks new spawns. */
+  /** Live delegates — workers + reviewers + planners (what counts against
+   *  `max_agents`; the orchestrator is exempt). Lowering the cap below this
+   *  blocks new spawns. */
   live_delegates: number;
   paused: boolean;
   /** Group uptime (from the earliest live agent), or null if none are live. */
   uptime_ms: number | null;
-  roles: { orchestrator: number; worker: number; reviewer: number };
+  roles: { orchestrator: number; worker: number; reviewer: number; planner: number };
   agents: AgentSummary[];
 }
 

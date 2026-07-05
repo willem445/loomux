@@ -330,6 +330,7 @@ export class GroupView {
       s.roles.orchestrator ? `${s.roles.orchestrator} orch` : "",
       s.roles.worker ? `${s.roles.worker} worker${s.roles.worker > 1 ? "s" : ""}` : "",
       s.roles.reviewer ? `${s.roles.reviewer} reviewer${s.roles.reviewer > 1 ? "s" : ""}` : "",
+      s.roles.planner ? `${s.roles.planner} planner${s.roles.planner > 1 ? "s" : ""}` : "",
     ].filter(Boolean);
     const line = el(
       "div",

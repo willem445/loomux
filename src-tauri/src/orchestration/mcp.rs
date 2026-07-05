@@ -184,10 +184,10 @@ fn tool_defs(role: Role) -> Vec<Value> {
     if role == Role::Orchestrator {
         tools.extend([
             tool("spawn_agent",
-                "Open a new worker or reviewer agent pane in this group. Guardrails apply: live-agent cap and per-role pinned model. Set worktree=true for parallel work that must not collide; give branch a meaningful name either way. Empty task spawns an idle agent awaiting prompts. For a FOLLOW-UP on a finished task, pass resume_session (from list_agents/the task board) plus cwd (where that work happened) — the pane reopens that conversation with its context instead of cold-starting.",
+                "Open a new worker, reviewer, or planner agent pane in this group. Guardrails apply: live-agent cap and per-role pinned CLI + model. Set worktree=true for parallel work that must not collide; give branch a meaningful name either way. Empty task spawns an idle agent awaiting prompts. A planner explores the codebase read-only and writes an implementation plan as a GitHub issue comment, then reports and exits. Its read-only contract is enforced structurally where the CLI allows it — it never gets a worktree, and its file-editing tools plus git commit/push are denied at the CLI level — so it cannot edit files or push code; not opening PRs is asked of it in its instructions (gh stays available so it can post the plan comment). For a FOLLOW-UP on a finished task, pass resume_session (from list_agents/the task board) plus cwd (where that work happened) — the pane reopens that conversation with its context instead of cold-starting.",
                 json!({
                     "name": { "type": "string", "description": "Short display name for the pane" },
-                    "kind": { "type": "string", "enum": ["worker", "reviewer"], "description": "Agent role (default worker)" },
+                    "kind": { "type": "string", "enum": ["worker", "reviewer", "planner"], "description": "Agent role (default worker)" },
                     "task": { "type": "string", "description": "Full task brief; empty = idle. With resume_session, this is the follow-up prompt." },
                     "worktree": { "type": "boolean", "description": "Create a dedicated git worktree + branch" },
                     "branch": { "type": "string", "description": "Branch name (default agent/<id>)" },
@@ -311,6 +311,7 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             require_orchestrator(caller)?;
             let kind = match arg_str(args, "kind").unwrap_or("worker") {
                 "reviewer" => Role::Reviewer,
+                "planner" => Role::Planner,
                 _ => Role::Worker,
             };
             let task = arg_str(args, "task").unwrap_or("");

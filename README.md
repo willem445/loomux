@@ -194,23 +194,26 @@ the pane closes.
 
 Loomux natively supports an **orchestrator / worker** pattern: a long-lived
 planning agent that manages a small fleet of worker agents, each in its own
-visible pane, with a reviewer agent per PR — and you only gatekeep the final
-review and merge.
+visible pane, with a reviewer agent per PR and an optional **planner** agent
+that scopes bigger work first — and you only gatekeep the final review and merge.
 
 **Launch:** turn on *✦ agents* mode, open a new pane, and pick
-**Orchestrator + workers** in the launcher. Choose the agent CLI (Claude
-Code or Copilot CLI — the model dropdowns are populated by querying the
-selected CLI's own help, so new models like `fable` appear automatically,
-with a custom-entry escape hatch), the repository, how many idle workers
-to start with, and the guardrails: max live agents, per-role models, and
-permissions. Permissions are either *Auto* (Claude Code's native auto
-permission mode plus pre-approved `git`/`gh` and loomux agent tools —
-recommended) or *Accept edits only*; loomux never uses
-`--dangerously-skip-permissions`. The launcher warns inline when the
-selected agent CLI isn't installed, and an agent pane that dies with an
-error stays open so you can read what happened. The launcher's
-**Multiple panes** mode also spawns N independent agent panes at once (a
-worktree name fans out to `name-1 … name-N`).
+**Orchestrator + workers** in the launcher. Choose the agent CLI and model
+**per role** — orchestrator, worker, reviewer, and planner each get their own
+CLI (Claude Code or Copilot CLI) and model, so you can mix agent types in one
+group (e.g. a Claude orchestrator driving Copilot workers). The top *Agent*
+select is the group default that seeds every role; override any role you like.
+Model dropdowns are populated by querying the selected CLI's own help, so new
+models like `fable` appear automatically, with a custom-entry escape hatch.
+Then set the repository, how many idle workers to start with, and the
+guardrails: max live agents and permissions. Permissions are either *Auto*
+(Claude Code's native auto permission mode plus pre-approved `git`/`gh` and
+loomux agent tools — recommended) or *Accept edits only*; loomux never uses
+`--dangerously-skip-permissions`. The launcher warns inline when any selected
+role's CLI isn't installed, and an agent pane that dies with an error stays
+open so you can read what happened. The launcher's **Multiple panes** mode
+also spawns N independent agent panes at once (a worktree name fans out to
+`name-1 … name-N`).
 
 **How it works:** loomux hosts a local MCP server; every agent pane in a
 group connects with its own identity token (`--strict-mcp-config`, so
@@ -220,18 +223,27 @@ mergeability, and delegates via tools that *type prompts into the worker's
 CLI* — you see every instruction verbatim in the pane, can steer any agent
 by typing yourself, and everything lands in an audit log. Workers follow the
 standard flow (branch → implement → tests that test intent → docs → PR) and
-report back; reviewers post `gh pr review`s. **No agent ever merges** — you
-do, after your own review.
+report back; reviewers post `gh pr review`s. For bigger or sprawling work the
+orchestrator can spawn a **planner** first — a read-only agent that explores the
+codebase and posts a structured implementation plan (scope, files, test
+strategy, risks, and a suggested worker split) as an issue comment, then exits;
+the orchestrator turns that plan into worker briefs. A planner's read-only
+contract is enforced at the CLI level where possible — it never gets a worktree,
+and its file-editing tools plus `git commit`/`git push` are denied — so it
+can't edit files or push code; the rest (not opening PRs) rides on its
+instructions, since `gh` stays available for the plan comment. **No agent ever
+merges** — you do, after your own review.
 
 **Go-signal labels:** you can hand the orchestrator work without typing in its
 pane. Label a groomed issue **`agent-ready`** and it gets picked up and driven to
-a PR through the normal flow; label one **`agent-investigate`** and an agent
-researches options/feasibility and posts its findings as an issue comment (no
-code) for you to act on. The orchestrator polls for newly labeled issues and
-pulls them onto the board automatically.
+a PR through the normal flow; label one **`agent-investigate`** and a planner
+(or the orchestrator itself, for small questions) researches options/feasibility
+and posts its findings or a plan as an issue comment (no code) for you to act on.
+The orchestrator polls for newly labeled issues and pulls them onto the board
+automatically.
 
-Panes are badged by role and group number (`ORCH 1` / `W 1` vs `ORCH 2` /
-`W 2`) with a per-group accent color, so parallel orchestrations — even on
+Panes are badged by role and group number (`ORCH 1` / `W 1` / `REV 1` / `PLAN 1`
+vs `ORCH 2` / `W 2`) with a per-group accent color, so parallel orchestrations — even on
 the same repository — pair up at a glance. Unrelated panes are fully
 isolated from a group's tools.
 
