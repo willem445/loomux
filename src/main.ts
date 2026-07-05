@@ -6,6 +6,7 @@ import { SessionBrowser } from "./sessions";
 import { ensureOutputRouter, onPtyExit, type PtyExit, type SessionInfo } from "./pty";
 import { matchShortcut } from "./shortcuts";
 import { initStatusBar } from "./statusbar";
+import { initHintBar } from "./hintbar";
 import { AgentLauncher } from "./launcher";
 import { getAgentMode, setAgentMode } from "./agents";
 import { initOrchestration, launchOrchestrator, orchSessionRoles, resumeOrchSession } from "./orchestration";
@@ -269,6 +270,10 @@ void (async () => {
 
 // Start streaming CPU/mem/GPU/VRAM into the bottom status bar.
 initStatusBar();
+
+// Let the shortcut hint bar scroll horizontally on a vertical wheel when it
+// overflows a narrow window.
+initHintBar();
 
 // Orchestration: open badged panes when the backend spawns agents.
 initOrchestration(grid, paneEvents);
