@@ -443,8 +443,14 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   background: var(--panel);
   border-top: 1px solid var(--border);
   font-size: 10.5px; color: var(--text-dim);
-  overflow: hidden; white-space: nowrap;
+  /* Scroll horizontally when the shortcuts overflow a narrow window; a
+     vertical wheel is translated to horizontal scroll in hintbar.ts. The
+     scrollbar is hidden (no layout jump, no reserved gutter) across engines. */
+  overflow-x: auto; overflow-y: hidden; white-space: nowrap;
+  scrollbar-width: none; /* Firefox */
 }
+#hintbar::-webkit-scrollbar { display: none; } /* WebKit / Blink (WebView2) */
+#hintbar > * { flex: none; } /* keep each hint at its natural width */
 #hintbar kbd {
   font-family: "Cascadia Mono", Consolas, monospace;
   font-size: 9.5px; color: var(--text);
