@@ -32,6 +32,19 @@ import {
 } from "./git";
 import { computeLanes, renderRowSvg } from "./gitgraph";
 import { renderDiff } from "./diffrender";
+import {
+  GRAPH_MIN,
+  DIFF_MIN,
+  CHANGES_MIN,
+  TOP_MIN,
+  DIVIDER_PX,
+  DEFAULT_GRAPH_W,
+  DEFAULT_CHANGES_H,
+  KEY_GRAPH_W,
+  KEY_CHANGES_H,
+  clampPaneSize,
+  parseStoredSize,
+} from "./gitlayout";
 
 export interface GitViewHost {
   /** The pane's live working directory (from shell integration). */
@@ -150,6 +163,25 @@ function showMenu(x: number, y: number, items: MenuItem[]): void {
   }, 0);
 }
 
+/** Read a persisted divider size, tolerating a webview with no/blocked
+ *  localStorage (returns null, so the caller falls back to a default). */
+function readSize(key: string): string | null {
+  try {
+    return localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+/** Persist a divider size (rounded to whole px), ignoring storage failures. */
+function writeSize(key: string, value: number): void {
+  try {
+    localStorage.setItem(key, String(Math.round(value)));
+  } catch {
+    /* ignore — resizing still works this session, just won't persist */
+  }
+}
+
 /** Copy to clipboard, with a legacy fallback for locked-down webviews. */
 async function copyText(text: string): Promise<void> {
   try {
@@ -198,6 +230,15 @@ export class GitView {
   private blankEl: HTMLElement;
   private toastEl: HTMLElement;
 
+  // Resizable sub-panes. `topEl` is the graph|diff row; `graphEl` is the left
+  // column whose width the vertical divider drives; `changesEl` height is what
+  // the horizontal divider drives. Sizes persist per-divider in localStorage
+  // and are re-clamped to the container on every layout (the overlay's outer
+  // bounds — and thus the PTY — never change; only this inner distribution).
+  private topEl: HTMLElement;
+  private graphEl: HTMLElement;
+  private resizeObs: ResizeObserver;
+
   constructor(private host: GitViewHost) {
     this.el = el("div", "pane-git");
     this.el.hidden = true;
@@ -211,6 +252,7 @@ export class GitView {
 
     // -- graph column --
     const graph = el("div", "git-graph");
+    this.graphEl = graph;
     const head = el("div", "git-graph-head");
     this.headTitleEl = el("span", "git-head-title");
     this.headBranchEl = el("span", "git-head-branch clickable");
@@ -252,7 +294,36 @@ export class GitView {
     this.toastEl = el("div", "git-toast");
     this.toastEl.hidden = true;
 
-    this.el.append(graph, diff, this.changesEl, this.blankEl, this.toastEl);
+    // -- layout: [ graph | vdiv | diff ] / hdiv / changes --
+    // A flex column (top row + bottom strip) with two draggable dividers. The
+    // vertical divider moves the graph|diff boundary; the horizontal one moves
+    // the top|changes boundary. Same drag mechanics as the overlay divider in
+    // pane.ts (mousedown + window move/up + a `dragging` class), but this only
+    // redistributes space *inside* .pane-git — its outer box keeps its size,
+    // so the terminal's PTY is never resized.
+    this.topEl = el("div", "git-top");
+    const vDiv = this.makeDivider(
+      "vertical",
+      () => this.graphEl.offsetWidth,
+      (start, delta) => this.applyGraphWidth(start + delta, true)
+    );
+    this.topEl.append(graph, vDiv, diff);
+    const hDiv = this.makeDivider(
+      "horizontal",
+      () => this.changesEl.offsetHeight,
+      // The divider sits above the changes strip: dragging down (delta > 0)
+      // grows the top row and shrinks changes.
+      (start, delta) => this.applyChangesHeight(start - delta, true)
+    );
+
+    this.el.append(this.topEl, hDiv, this.changesEl, this.blankEl, this.toastEl);
+
+    // Seed initial sizes from storage (container not yet measurable here, so no
+    // clamp); relayout() re-clamps once the overlay is shown and on any resize.
+    this.graphEl.style.flex = `0 0 ${parseStoredSize(readSize(KEY_GRAPH_W)) ?? DEFAULT_GRAPH_W}px`;
+    this.changesEl.style.flex = `0 0 ${parseStoredSize(readSize(KEY_CHANGES_H)) ?? DEFAULT_CHANGES_H}px`;
+    this.resizeObs = new ResizeObserver(() => this.relayout());
+    this.resizeObs.observe(this.el);
   }
 
   get visible(): boolean {
@@ -261,6 +332,8 @@ export class GitView {
 
   show(): void {
     this.el.hidden = false;
+    // Now measurable: clamp the (possibly stale) stored sizes to the container.
+    this.relayout();
     // No focus steal: the terminal below stays the primary input target.
     void this.refresh();
   }
@@ -268,6 +341,71 @@ export class GitView {
   hide(): void {
     closeMenu();
     this.el.hidden = true;
+  }
+
+  // ---------- resizable sub-panes ----------
+
+  /** Build a draggable divider. `orientation` picks the axis (vertical = a
+   *  column splitter dragged along X; horizontal = a row splitter dragged along
+   *  Y). `measure()` returns the neighbored pane's size at drag start; `onDrag`
+   *  receives that start size plus the signed pixel delta on every move and on
+   *  release. Mirrors makeOverlayDivider in pane.ts, but never touches the
+   *  overlay's outer size — only the inner flex distribution. */
+  private makeDivider(
+    orientation: "vertical" | "horizontal",
+    measure: () => number,
+    onDrag: (start: number, delta: number) => void
+  ): HTMLElement {
+    const div = el("div", `git-divider ${orientation}`);
+    div.addEventListener("mousedown", (e) => {
+      e.preventDefault();
+      const origin = orientation === "vertical" ? e.clientX : e.clientY;
+      const start = measure();
+      div.classList.add("dragging");
+      const move = (ev: MouseEvent) => {
+        const cur = orientation === "vertical" ? ev.clientX : ev.clientY;
+        onDrag(start, cur - origin);
+      };
+      const up = () => {
+        div.classList.remove("dragging");
+        window.removeEventListener("mousemove", move);
+        window.removeEventListener("mouseup", up);
+      };
+      window.addEventListener("mousemove", move);
+      window.addEventListener("mouseup", up);
+    });
+    return div;
+  }
+
+  /** Set the graph column's width (px), clamped so neither it nor the diff drops
+   *  below its minimum; optionally persist. No-op until the pane is measurable. */
+  private applyGraphWidth(proposed: number, persist: boolean): void {
+    const total = this.topEl.clientWidth - DIVIDER_PX;
+    if (total <= 0) return;
+    const w = clampPaneSize(proposed, { total, min: GRAPH_MIN, otherMin: DIFF_MIN });
+    this.graphEl.style.flex = `0 0 ${w}px`;
+    if (persist) writeSize(KEY_GRAPH_W, w);
+  }
+
+  /** Set the changes strip's height (px), clamped so neither it nor the top row
+   *  drops below its minimum; optionally persist. No-op until measurable. */
+  private applyChangesHeight(proposed: number, persist: boolean): void {
+    const total = this.el.clientHeight - DIVIDER_PX;
+    if (total <= 0) return;
+    const h = clampPaneSize(proposed, { total, min: CHANGES_MIN, otherMin: TOP_MIN });
+    this.changesEl.style.flex = `0 0 ${h}px`;
+    if (persist) writeSize(KEY_CHANGES_H, h);
+  }
+
+  /** Re-apply the stored (or default) sizes, clamped to the current container.
+   *  Called on show and whenever the overlay is resized (its outer bounds may
+   *  shrink around the panes), so a pane grows back toward its stored preference
+   *  when room returns and never collapses below its minimum when room is scarce.
+   *  Preference-preserving because it derives from storage, not the live size. */
+  private relayout(): void {
+    if (this.disposed) return;
+    this.applyGraphWidth(parseStoredSize(readSize(KEY_GRAPH_W)) ?? DEFAULT_GRAPH_W, false);
+    this.applyChangesHeight(parseStoredSize(readSize(KEY_CHANGES_H)) ?? DEFAULT_CHANGES_H, false);
   }
 
   /** Called on every shell prompt; refreshes at most twice a second. */
@@ -287,6 +425,7 @@ export class GitView {
   dispose(): void {
     this.disposed = true;
     closeMenu();
+    this.resizeObs.disconnect();
     clearTimeout(this.throttleTimer);
     clearTimeout(this.toastTimer);
     this.el.remove();

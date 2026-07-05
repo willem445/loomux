@@ -644,21 +644,33 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .git-overlay[hidden] { display: none; }
 
 .pane-git {
-  flex: 1; min-height: 0; position: relative;
-  display: grid;
-  grid-template:
-    "graph diff" minmax(0, 1fr)
-    "changes changes" minmax(120px, 172px) / minmax(240px, 324px) minmax(0, 1fr);
+  flex: 1; min-height: 0; min-width: 0; position: relative;
+  display: flex; flex-direction: column;
   background: var(--bg-app);
   font-size: 12px;
   outline: none;
 }
 .pane-git[hidden] { display: none; }
 
+/* Top row: graph column | draggable divider | diff panel. The graph's width
+   and the changes strip's height (below) are set inline from stored sizes; the
+   diff and this row flex to fill. Only this inner distribution changes on
+   drag — .pane-git's own box never resizes, so the PTY is untouched. */
+.git-top {
+  flex: 1 1 0; min-height: 0; min-width: 0;
+  display: flex; flex-direction: row;
+}
+
 .git-divider {
   flex: none; height: 5px; cursor: row-resize;
   background: var(--border-soft);
   transition: background 0.15s var(--ease);
+}
+/* Column splitter inside .git-top: a full-height 5px vertical grip. (The base
+   rule's row-resize/height serves the horizontal splitter and pane.ts's
+   overlay divider.) */
+.git-divider.vertical {
+  height: auto; width: 5px; cursor: col-resize; align-self: stretch;
 }
 .git-divider:hover, .git-divider.dragging { background: var(--accent-dim); }
 .git-divider[hidden] { display: none; }
@@ -1032,9 +1044,9 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 
 /* -- graph column -- */
 .git-graph {
-  grid-area: graph; min-height: 0;
+  /* flex-basis (width) is set inline from the stored/clamped divider size. */
+  flex: 0 0 auto; min-height: 0; min-width: 0;
   display: flex; flex-direction: column;
-  border-right: 1px solid var(--border-soft);
 }
 .git-graph-head {
   display: flex; align-items: center; gap: 7px; flex: none;
@@ -1099,7 +1111,7 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 
 /* -- diff panel -- */
 .git-diff {
-  grid-area: diff; min-height: 0; min-width: 0;
+  flex: 1 1 0; min-height: 0; min-width: 0;
   display: flex; flex-direction: column;
 }
 .git-diff-head {
@@ -1164,9 +1176,10 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 
 /* -- changes strip -- */
 .git-changes {
-  grid-area: changes; min-height: 0;
+  /* flex-basis (height) is set inline from the stored/clamped divider size;
+     the horizontal divider above provides the visual separation. */
+  flex: 0 0 auto; min-height: 0; min-width: 0;
   display: flex; gap: 0;
-  border-top: 1px solid var(--border);
   background: var(--panel);
 }
 .git-files-col {
