@@ -1385,6 +1385,60 @@ impl OrchRegistry {
         Ok(task)
     }
 
+    /// Guard the start action to items that are actually queued. The UI only
+    /// shows the button on `queued` items, but the command surface is callable
+    /// directly, so enforce it backend-side too — starting an in-progress or
+    /// done item is meaningless.
+    fn ensure_queued(&self, group: &str, id: &str) -> Result<(), String> {
+        let status = self
+            .tasks(group)
+            .into_iter()
+            .find(|t| t.id == id)
+            .ok_or_else(|| format!("unknown task: {id}"))?
+            .status;
+        if status == "queued" {
+            Ok(())
+        } else {
+            Err(format!("task {id} is {status:?}, not queued — only a queued task can be started"))
+        }
+    }
+
+    /// Start a queued item: record a human-attributed note and tell the
+    /// orchestrator to begin work on it now. Deliberately does NOT flip the
+    /// status — the orchestrator moves it to `in-progress` when it actually
+    /// assigns a worker, so the board reflects real assignment rather than
+    /// intent. The notice is best-effort (the board is the source of truth).
+    ///
+    /// A paused group is rejected up front (mirroring `steer_orchestrator`):
+    /// its delivery is silently suppressed and queued prompts aren't replayed
+    /// on resume, so without this guard the nudge would vanish — with a note
+    /// left behind implying it landed. Reject before any mutation so no note is
+    /// appended, and let the human resume first.
+    pub fn start_task(&self, group: &str, id: &str) -> Result<Task, String> {
+        self.ensure_queued(group, id)?;
+        if self.is_paused(group) {
+            return Err("group is paused — resume before starting tasks".into());
+        }
+        let task = self.upsert_task(
+            group,
+            "human",
+            Some(id),
+            TaskPatch {
+                note: Some("Started by the human — asked the orchestrator to begin work.".into()),
+                ..Default::default()
+            },
+        )?;
+        let _ = self.deliver_to_orchestrator(
+            group,
+            &format!(
+                "[loomux] the human started task {} (\"{}\") — begin work on it now.",
+                task.id, task.title
+            ),
+            "human",
+        );
+        Ok(task)
+    }
+
     /// Tell the orchestrator the human touched the board (best-effort; the
     /// board itself is the source of truth via list_tasks).
     fn notify_board_edit(&self, group: &str, summary: &str) {
@@ -4251,6 +4305,18 @@ pub fn orch_request_changes(
     findings: String,
 ) -> Result<Task, String> {
     reg.request_changes(&group_id, &id, &findings)
+}
+
+/// Start a queued item: record a human-attributed note and tell the
+/// orchestrator to begin work. Does not flip the status — the orchestrator
+/// moves it to `in-progress` when it actually assigns a worker.
+#[tauri::command]
+pub fn orch_start_task(
+    reg: tauri::State<Arc<OrchRegistry>>,
+    group_id: String,
+    id: String,
+) -> Result<Task, String> {
+    reg.start_task(&group_id, &id)
 }
 
 #[cfg(test)]

@@ -329,6 +329,25 @@ export class TasksView {
       top.appendChild(chip);
     }
 
+    // Start: the human's nudge to begin a queued item now. Delivers a prompt
+    // to the orchestrator (which assigns a worker and flips the status then);
+    // shown only on queued items, where starting is meaningful.
+    if (t.status === "queued") {
+      const start = el("button", "task-btn start", "▶ Start") as HTMLButtonElement;
+      start.title = "Tell the orchestrator to begin work on this task now";
+      start.addEventListener("click", () => {
+        // Start doesn't flip the status, so — unlike Approve — the button
+        // isn't removed by the mutation, and mutate() doesn't re-render on
+        // success. Disable on click so an accidental double-click can't fire
+        // two nudges (two prompts + two identical notes) for one intent; it
+        // stays disabled until the board refresh (triggered by the note write,
+        // or by mutate's resync on error) rebuilds this row.
+        start.disabled = true;
+        void this.mutate(invoke("orch_start_task", { groupId: this.groupId, id: t.id }));
+      });
+      top.appendChild(start);
+    }
+
     // Merge-gate actions: the human's approve / request-changes touchpoints,
     // shown only where they belong — on items awaiting the merge decision.
     if (t.status === "pr" || t.status === "human-testing") {
