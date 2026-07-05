@@ -108,6 +108,14 @@ can be rearranged without splitting from scratch:
   the bottom of the grid — it keeps running. Click its chip to bring it back,
   or the chip's ✕ to close it for good. (This is loomux's take on the issue's
   "minimize to tray": an in-app restore dock rather than the OS tray.)
+- **Fold a whole group** — an orchestrator pane has a fold toggle (the stacked
+  panes icon in its header, mirrored in the group lifecycle panel) that
+  minimizes *every* worker/reviewer pane in its group to the dock at once,
+  leaving just the orchestrator. Click it again to restore them all. Handy once
+  a big group has opened a pane per agent and you want the screen back without
+  ✕-clicking or minimizing them one by one. Folded panes behave like any other
+  docked pane — they keep running, still pulse for attention on their dock chip,
+  and can be restored individually.
 
 ### Session browser
 
@@ -303,6 +311,9 @@ so it takes a second confirming click; an optional **remove worktrees** checkbox
 also deletes each agent's git worktree (uncommitted changes are lost, but the
 branches — where the PRs live — are always kept). The teardown is audited, closes
 the group's panes for you, and clears any pause so a later relaunch starts clean.
+The panel also carries a **Fold panes** button — the same group-wide
+minimize/restore toggle as the orchestrator header — for reclaiming screen space
+when a group grows large (see [Rearranging panes](#rearranging-panes)).
 
 **Per-task sessions:** each worker is scoped to exactly one work item, and
 loomux records its session id on the roster and task board. Claude ids are

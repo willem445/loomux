@@ -46,6 +46,10 @@ const paneEvents: PaneEvents = {
   onSplit: (pane, dir) => void openPane(dir, pane),
   onMinimize: (pane) => grid.minimize(pane),
   onMaximize: (pane) => grid.toggleMaximize(pane),
+  onToggleGroupMinimize: (pane) => {
+    const groupId = pane.orchGroupId;
+    if (groupId) grid.toggleGroupMinimize(groupId);
+  },
 };
 
 // PTYs whose exit event arrived before their pane finished starting.

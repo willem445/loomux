@@ -43,6 +43,9 @@ const GIT_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" st
 // Audit viewer: a clock/history glyph for the group's audit-log timeline.
 const AUDIT_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M2.2 8a5.8 5.8 0 1 1 1.7 4.1"/><path d="M2.2 12.2V8.6H5.8"/><path d="M8 5.2V8l2 1.4"/></svg>`;
 const GROUP_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="3.4" r="1.7"/><circle cx="3.4" cy="11" r="1.7"/><circle cx="12.6" cy="11" r="1.7"/><path d="M8 5.1v3M6.7 9.6 4.5 9.9M9.3 9.6l2.2.3"/></svg>`;
+// Fold-group toggle (#46): stacked panes collapsing toward a baseline —
+// signals "minimize every worker/reviewer pane to the dock at once".
+const GROUP_MIN_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="2.4" width="10" height="3.2" rx="0.8"/><rect x="4.6" y="7" width="6.8" height="2.6" rx="0.7"/><path d="M4.2 13h7.6"/></svg>`;
 // "Open in editor": code-brackets glyph. Opens the pane's workspace folder in
 // the user's configured external editor (VS Code, Zed, …).
 const EDITOR_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M6 4.5 2.5 8 6 11.5M10 4.5 13.5 8 10 11.5"/></svg>`;
@@ -138,6 +141,9 @@ export interface PaneEvents {
   onMinimize: (pane: Pane) => void;
   /** Toggle this pane to/from fullscreen over the grid. */
   onMaximize: (pane: Pane) => void;
+  /** Minimize (or restore) this pane's whole orchestration group's
+   *  worker/reviewer panes at once (#46). No-op off an orchestrator pane. */
+  onToggleGroupMinimize: (pane: Pane) => void;
 }
 
 export class Pane {
@@ -177,9 +183,13 @@ export class Pane {
   private groupView: GroupView | null = null;
   private groupOverlay: HTMLElement | null = null;
   private groupBtn: HTMLButtonElement;
+  /** Fold-group toggle (orchestrator panes only, #46): minimizes every
+   *  worker/reviewer pane in the group to the dock, or restores them all. */
+  private groupMinBtn: HTMLButtonElement;
   /** Fullscreen toggle; its glyph flips to a restore affordance when active. */
   private maximizeBtn: HTMLButtonElement;
   private orchGroup: string | null = null;
+  private orchRoleName: string | null = null;
   private orchAgent: string | null = null;
   /** Loomux-owned steering strip docked under orchestrator panes (#43): the
    *  human types here and loomux enqueues it through the same serialized
@@ -286,6 +296,20 @@ export class Pane {
       this.toggleGroupView();
     });
     header.appendChild(this.groupBtn);
+
+    // Fold the whole group's worker/reviewer panes to the dock in one click
+    // (or restore them). Orchestrator panes only; the group's real-estate
+    // control when it grows large (#46).
+    this.groupMinBtn = document.createElement("button");
+    this.groupMinBtn.className = "pane-btn";
+    this.groupMinBtn.innerHTML = GROUP_MIN_ICON;
+    this.groupMinBtn.title = "Minimize / restore all group panes";
+    this.groupMinBtn.hidden = true; // shown for orchestrator panes in start()
+    this.groupMinBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      this.events.onToggleGroupMinimize(this);
+    });
+    header.appendChild(this.groupMinBtn);
 
     // Open the pane's workspace folder in the configured external editor.
     // Left-click opens (prompting for the editor on first use); right-click
@@ -439,6 +463,7 @@ export class Pane {
     if (opts.orchAgent) this.orchAgent = opts.orchAgent;
     if (opts.orchGroup) {
       this.orchGroup = opts.orchGroup;
+      this.orchRoleName = opts.orchRole ?? null;
       // The board lives on the orchestrator's pane; workers report there.
       this.tasksBtn.hidden = opts.orchRole !== "orchestrator";
       // The audit log is per-group and read-only, so it's useful from any
@@ -447,6 +472,9 @@ export class Pane {
       // Group lifecycle controls (pause / end orchestration) live on the
       // orchestrator's pane, alongside the task board.
       this.groupBtn.hidden = opts.orchRole !== "orchestrator";
+      // Same for the fold-group toggle (#46): it acts on the orchestrator's
+      // own worker/reviewer panes.
+      this.groupMinBtn.hidden = opts.orchRole !== "orchestrator";
       // Steering strip (#43): only the orchestrator pane gets one. Build it
       // BEFORE term.open/fit below so the terminal sizes to the reduced
       // height once, avoiding a later resize repaint into scrollback.
@@ -798,7 +826,11 @@ export class Pane {
   toggleGroupView(): void {
     if (!this.orchGroup || this.groupBtn.hidden) return;
     if (!this.groupView) {
-      this.groupView = new GroupView(this.orchGroup, { onClose: () => this.toggleGroupView() });
+      this.groupView = new GroupView(this.orchGroup, {
+        onClose: () => this.toggleGroupView(),
+        // Mirror the header's fold-group toggle inside the lifecycle panel (#46).
+        onToggleMinimize: () => this.events.onToggleGroupMinimize(this),
+      });
       this.groupOverlay = document.createElement("div");
       this.groupOverlay.className = "git-overlay";
       this.groupOverlay.hidden = true;
@@ -833,6 +865,13 @@ export class Pane {
    *  actions like end-orchestration closing every pane in the group). */
   get orchGroupId(): string | null {
     return this.orchGroup;
+  }
+
+  /** This pane's orchestration role ("orchestrator" | "worker" | "reviewer"),
+   *  or null for a non-orchestration pane. Lets group-wide actions (#46) tell
+   *  the orchestrator's own pane apart from its workers/reviewers. */
+  get orchRole(): string | null {
+    return this.orchRoleName;
   }
 
   /** Whichever overlay (git / tasks / audit / group) is currently covering

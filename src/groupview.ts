@@ -77,6 +77,7 @@ export class GroupView {
   private listEl: HTMLElement;
   private pauseBtn: HTMLButtonElement;
   private notifyBtn: HTMLButtonElement;
+  private foldBtn: HTMLButtonElement | null = null;
   private endBtn: HTMLButtonElement;
   private cleanupChk: HTMLInputElement;
   private toastEl: HTMLElement;
@@ -95,7 +96,7 @@ export class GroupView {
 
   constructor(
     private groupId: string,
-    opts: { onClose: () => void }
+    opts: { onClose: () => void; onToggleMinimize?: () => void }
   ) {
     this.el = el("div", "group-view");
 
@@ -124,6 +125,15 @@ export class GroupView {
     this.notifyBtn = el("button", "group-btn", "🔔 Notify") as HTMLButtonElement;
     this.notifyBtn.addEventListener("click", () => void this.toggleNotify());
 
+    // Fold-group toggle (#46), mirroring the orchestrator header button:
+    // minimize every worker/reviewer pane to the dock at once, or restore them.
+    if (opts.onToggleMinimize) {
+      this.foldBtn = el("button", "group-btn", "Fold panes") as HTMLButtonElement;
+      this.foldBtn.title =
+        "Minimize all worker/reviewer panes to the dock (or restore them if already minimized)";
+      this.foldBtn.addEventListener("click", () => opts.onToggleMinimize!());
+    }
+
     const endWrap = el("div", "group-end-wrap");
     const cleanupLbl = el("label", "group-cleanup") as HTMLLabelElement;
     this.cleanupChk = document.createElement("input");
@@ -136,7 +146,9 @@ export class GroupView {
     this.endBtn.addEventListener("click", () => void this.onEndClick());
     endWrap.append(cleanupLbl, this.endBtn);
 
-    foot.append(this.pauseBtn, this.notifyBtn, endWrap);
+    foot.append(this.pauseBtn, this.notifyBtn);
+    if (this.foldBtn) foot.append(this.foldBtn);
+    foot.append(endWrap);
 
     this.toastEl = el("div", "git-toast");
     this.toastEl.hidden = true;
