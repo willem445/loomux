@@ -11,7 +11,7 @@ use loomux_lib::orchestration::{
     add_trusted_folder, bracketed_paste, cli_ready, create_orchestration_group, hold_until_quiet,
     idle_should_kill, max_agents_notice,
     normalize_remote_web_base, parse_audit_lines, parse_session_cost, prompt_wait_detected,
-    resolve_ref_url, rotate_audit_if_needed, spawn_rate_exceeded, strip_ansi,
+    resolve_ref_url, rotate_audit_if_needed, spawn_rate_exceeded, strip_ansi, PLANNER_READONLY_NOTE,
     watchdog_should_notify, worktree_cleanup_targets, AttentionItem, Caller, Guardrails,
     OrchRegistry, Role, TaskPatch, UsageSnapshot,
 };
@@ -402,7 +402,7 @@ fn claude_command_minimizes_init_approvals_without_bypass() {
     let (reg, _d) = test_registry();
     let cfg = Path::new("C:/x/cfg.json");
     let gdir = Path::new("C:/data/group");
-    let cmd = reg.build_agent_command("claude", "sonnet", false, cfg, gdir, Path::new("C:/repo"), None, false);
+    let cmd = reg.build_agent_command("claude", "sonnet", false, cfg, gdir, Path::new("C:/repo"), None, false, false);
     assert!(cmd.contains("--model sonnet"));
     assert!(cmd.contains("--permission-mode acceptEdits"));
     assert!(cmd.contains("--strict-mcp-config"), "workers must not see the user's other MCP servers");
@@ -411,7 +411,7 @@ fn claude_command_minimizes_init_approvals_without_bypass() {
     assert!(cmd.contains("--allowedTools mcp__loomux"),
         "loomux tools must be pre-approved so report/list never prompt");
     assert!(!cmd.contains("Bash(git:*)"), "git is not pre-approved unless auto_ops");
-    let cmd = reg.build_agent_command("claude", "sonnet", true, cfg, gdir, Path::new("C:/repo"), None, false);
+    let cmd = reg.build_agent_command("claude", "sonnet", true, cfg, gdir, Path::new("C:/repo"), None, false, false);
     assert!(cmd.contains("--permission-mode auto"),
         "the Auto preset must use Claude Code's native auto permission mode");
     assert!(cmd.contains("\"Bash(git:*)\"") && cmd.contains("\"Bash(gh:*)\""));
@@ -420,6 +420,20 @@ fn claude_command_minimizes_init_approvals_without_bypass() {
         !cmd.contains("--dangerously-skip-permissions"),
         "bypass mode must never be used: its confirm dialog defaults to exit and kills the pane"
     );
+    // A worker (read_only=false) has no write/commit denials.
+    assert!(!cmd.contains("--disallowedTools"), "non-planner agents get no tool denials");
+    // A planner (read_only=true) is denied file writes + git commit/push at
+    // the CLI level, even under Auto perms — but keeps gh for the plan comment.
+    let plan = reg.build_agent_command("claude", "opus", true, cfg, gdir, Path::new("C:/repo"), None, false, true);
+    assert!(plan.contains("--disallowedTools"), "planner must deny tools structurally");
+    for denied in ["Edit", "Write", "MultiEdit", "NotebookEdit"] {
+        assert!(plan.contains(denied), "planner must deny the {denied} tool");
+    }
+    assert!(plan.contains("\"Bash(git commit:*)\"") && plan.contains("\"Bash(git push:*)\""),
+        "planner must deny git commit/push");
+    assert!(plan.contains("\"Bash(gh:*)\""), "gh stays allowed so the planner can post its plan comment");
+    assert!(!plan.contains("\"Bash(git checkout:*)\""),
+        "read-only git usage (checkout/log/diff) must not be denied");
 }
 
 #[test]
@@ -427,7 +441,7 @@ fn copilot_command_uses_copilot_adapter_flags() {
     let (reg, _d) = test_registry();
     let cfg = Path::new("C:/x/cfg.json");
     let gdir = Path::new("C:/data/group");
-    let cmd = reg.build_agent_command("copilot", "auto", true, cfg, gdir, Path::new("C:/repo"), None, false);
+    let cmd = reg.build_agent_command("copilot", "auto", true, cfg, gdir, Path::new("C:/repo"), None, false, false);
     assert!(cmd.starts_with("copilot "), "selected CLI must actually be launched, not claude");
     assert!(
         cmd.contains("--additional-mcp-config \"@C:/x/cfg.json\""),
@@ -447,17 +461,27 @@ fn copilot_command_uses_copilot_adapter_flags() {
     // Auto preset = copilot's own unattended mode.
     assert!(cmd.contains("--autopilot") && cmd.contains("--allow-all-tools") && cmd.contains("--allow-all-paths"));
     // Conservative preset keeps the explicit allowlist instead.
-    let cmd = reg.build_agent_command("copilot", "auto", false, cfg, gdir, Path::new("C:/repo"), None, false);
+    let cmd = reg.build_agent_command("copilot", "auto", false, cfg, gdir, Path::new("C:/repo"), None, false, false);
     assert!(!cmd.contains("--autopilot") && !cmd.contains("--allow-all-tools"));
     assert!(cmd.contains("--allow-tool \"shell(git:*)\"") && cmd.contains("--allow-tool \"shell(gh:*)\""));
     // Resume reopens a tracked session via --resume; copilot has no
     // pre-assignable id, so a session without resume adds no session flag.
     let sid = "aabbccdd-1122-4334-8556-77889900aabb";
-    let cmd = reg.build_agent_command("copilot", "auto", true, cfg, gdir, Path::new("C:/repo"), Some(sid), true);
+    let cmd = reg.build_agent_command("copilot", "auto", true, cfg, gdir, Path::new("C:/repo"), Some(sid), true, false);
     assert!(cmd.contains(&format!("--resume {sid}")), "copilot resume must pass --resume, got: {cmd}");
-    let cmd = reg.build_agent_command("copilot", "auto", true, cfg, gdir, Path::new("C:/repo"), Some(sid), false);
+    let cmd = reg.build_agent_command("copilot", "auto", true, cfg, gdir, Path::new("C:/repo"), Some(sid), false, false);
     assert!(!cmd.contains("--resume") && !cmd.contains("--session-id"),
         "a fresh copilot spawn cannot pin a session id");
+    // A non-planner copilot agent gets no deny-tool flags.
+    assert!(!cmd.contains("--deny-tool"), "non-planner copilot agents get no tool denials");
+    // A planner (read_only=true) denies writes + git commit/push even under
+    // --allow-all-tools (deny wins in Copilot); gh stays reachable.
+    let plan = reg.build_agent_command("copilot", "auto", true, cfg, gdir, Path::new("C:/repo"), None, false, true);
+    assert!(plan.contains("--deny-tool \"write\"") && plan.contains("--deny-tool \"edit\""),
+        "planner must deny copilot's write/edit tools, got: {plan}");
+    assert!(plan.contains("--deny-tool \"shell(git commit)\"") && plan.contains("--deny-tool \"shell(git push)\""),
+        "planner must deny git commit/push");
+    assert!(!plan.contains("--deny-tool \"shell(gh"), "gh stays allowed for the plan comment");
 }
 
 #[test]
@@ -658,16 +682,21 @@ fn planner_explores_read_only_and_never_gets_a_worktree() {
         .spawn_agent(&g.id, Role::Planner, "plan", "Plan it", true, Some("plan/x".into()))
         .unwrap();
     assert_eq!(p.cwd, "C:/tmp/repo", "a planner must not get a dedicated worktree");
-    let k = reg.kickoff_prompt(&p, &g, "");
-    // The kickoff carries the read-only branch note (built at spawn time).
-    let note = reg
-        .list_agents(&g.id)
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|a| a["role"] == "planner");
-    assert!(note, "planner must appear in the roster with its role");
-    let _ = k;
+    assert!(
+        reg.list_agents(&g.id).as_array().unwrap().iter().any(|a| a["role"] == "planner"),
+        "planner must appear in the roster with its role"
+    );
+    // The planner's spawn-time read-only note (PLANNER_READONLY_NOTE) is threaded
+    // verbatim into its kickoff, communicating the no-code/branches/PRs contract.
+    let k = reg.kickoff_prompt(&p, &g, PLANNER_READONLY_NOTE);
+    assert!(
+        k.contains("never create branches, worktrees, commits, or PRs"),
+        "planner kickoff must carry the read-only containment note, got: {k}"
+    );
+    assert!(
+        PLANNER_READONLY_NOTE.contains("read-only") && PLANNER_READONLY_NOTE.contains("issue comment"),
+        "the containment note must state the read-only contract and the issue-comment deliverable"
+    );
 }
 
 #[test]
@@ -852,10 +881,10 @@ fn claude_agents_get_preassigned_resumable_sessions() {
     // The launch command pins the id.
     let cfg = Path::new("C:/x/cfg.json");
     let gdir = Path::new("C:/x/g");
-    let cmd = reg.build_agent_command("claude", "sonnet", false, cfg, gdir, Path::new("C:/repo"), Some(&sid), false);
+    let cmd = reg.build_agent_command("claude", "sonnet", false, cfg, gdir, Path::new("C:/repo"), Some(&sid), false, false);
     assert!(cmd.contains(&format!("--session-id {sid}")));
     // Resume uses --resume instead.
-    let cmd = reg.build_agent_command("claude", "sonnet", false, cfg, gdir, Path::new("C:/repo"), Some(&sid), true);
+    let cmd = reg.build_agent_command("claude", "sonnet", false, cfg, gdir, Path::new("C:/repo"), Some(&sid), true, false);
     assert!(cmd.contains(&format!("--resume {sid}")) && !cmd.contains("--session-id"));
 }
 

@@ -33,6 +33,14 @@ const WORKER_TPL: &str = include_str!("templates/worker.md");
 const REVIEWER_TPL: &str = include_str!("templates/reviewer.md");
 const PLANNER_TPL: &str = include_str!("templates/planner.md");
 
+/// Read-only containment note handed to a planner at spawn time as its kickoff
+/// "branch note". The worktree denial (spawn cwd logic) and the CLI-level
+/// write/commit denials (`build_agent_command`, `read_only`) enforce most of
+/// this structurally; the note communicates the whole contract to the agent.
+/// Exposed (doc-hidden) so tests can pin the exact text.
+#[doc(hidden)]
+pub const PLANNER_READONLY_NOTE: &str = "You explore the codebase read-only to produce an implementation plan. You never create branches, worktrees, commits, or PRs — your deliverable is a plan written as a GitHub issue comment.";
+
 /// Hard ceiling on `max_agents` regardless of what the launcher asks for.
 const MAX_AGENTS_CEILING: u32 = 12;
 
@@ -3040,6 +3048,17 @@ impl OrchRegistry {
     /// `report` etc. never prompt). `auto_ops` additionally pre-approves
     /// git/gh commands so the branch→commit→PR flow runs unattended;
     /// everything else still asks the human.
+    ///
+    /// `read_only` hardens the planner contract at the CLI level (#47): where
+    /// the CLI supports tool denial, the file-editing tools and the git
+    /// mutation subcommands (`commit`/`push`) are denied outright, so a planner
+    /// cannot write code or create branches/commits/pushes even under Auto
+    /// perms — while `gh` stays available so it can still post its plan as an
+    /// issue comment. Deny rules take precedence over the allow list on both
+    /// CLIs. NOTE: this is a real, structural denial for the write/commit/push
+    /// surface; it is deliberately NOT a full sandbox (e.g. `gh pr create` is
+    /// left reachable so the plan comment works), so the *complete* read-only
+    /// contract still rests partly on the planner's instructions.
     #[allow(clippy::too_many_arguments)]
     #[doc(hidden)] // pub for integration tests
     pub fn build_agent_command(
@@ -3052,6 +3071,7 @@ impl OrchRegistry {
         workdir: &Path,
         session: Option<&str>,
         resume: bool,
+        read_only: bool,
     ) -> String {
         match cli {
             "copilot" => {
@@ -3083,6 +3103,16 @@ impl OrchRegistry {
                 } else {
                     cmd.push_str(" --allow-tool \"shell(git:*)\" --allow-tool \"shell(gh:*)\"");
                 }
+                if read_only {
+                    // Deny file writes and git mutations even under
+                    // --allow-all-tools (deny takes precedence in Copilot).
+                    // `write`/`edit` are Copilot's file-modification tools;
+                    // `gh` is left allowed so the plan comment can be posted.
+                    cmd.push_str(
+                        " --deny-tool \"write\" --deny-tool \"edit\" \
+                         --deny-tool \"shell(git commit)\" --deny-tool \"shell(git push)\"",
+                    );
+                }
                 cmd
             }
             // "claude" and the explicit fallback for anything unrecognized.
@@ -3108,6 +3138,19 @@ impl OrchRegistry {
                     // Both rule spellings: docs use `Bash(git:*)`, the CLI
                     // help shows `Bash(git *)`; unmatched patterns are inert.
                     cmd.push_str(" \"Bash(git:*)\" \"Bash(git *)\" \"Bash(gh:*)\" \"Bash(gh *)\"");
+                }
+                if read_only {
+                    // Deny the file-editing tools and the git mutation
+                    // subcommands outright (--disallowedTools overrides the
+                    // permission mode AND the allow list in Claude Code), so a
+                    // planner can't write code or commit/push. `gh` (incl.
+                    // `gh issue comment`) stays reachable for the plan comment.
+                    // Both git spellings, matching the allow list above.
+                    cmd.push_str(
+                        " --disallowedTools Edit Write MultiEdit NotebookEdit \
+                         \"Bash(git commit:*)\" \"Bash(git commit *)\" \
+                         \"Bash(git push:*)\" \"Bash(git push *)\"",
+                    );
                 }
                 cmd
             }
@@ -3229,8 +3272,9 @@ impl OrchRegistry {
         } else if role == Role::Planner {
             // Planners explore read-only in the repo itself and never branch,
             // worktree, commit, or PR — so a worktree is never created for
-            // them even if `use_worktree` was set.
-            (group.repo.clone(), "You explore the codebase read-only to produce an implementation plan. You never create branches, worktrees, commits, or PRs — your deliverable is a plan written as a GitHub issue comment.".to_string())
+            // them even if `use_worktree` was set (the CLI-level write/commit
+            // denials in `build_agent_command` back this note structurally).
+            (group.repo.clone(), PLANNER_READONLY_NOTE.to_string())
         } else {
             (group.repo.clone(), format!(
                 "Work in the repo itself; create branch '{branch_name}' off the default branch before changing anything. Never commit to the default branch."
@@ -3250,6 +3294,7 @@ impl OrchRegistry {
             Path::new(&cwd),
             session_id.as_deref(),
             resume,
+            role == Role::Planner, // read_only: deny writes/commits at the CLI level
         );
 
         let entry = AgentEntry {
@@ -4023,6 +4068,7 @@ fn register_orchestrator_pane(
         Path::new(&group.repo),
         session_id.as_deref(),
         resume,
+        false, // the orchestrator is never read-only
     );
     let entry = AgentEntry {
         id: agent_id.clone(),

@@ -344,13 +344,14 @@ export interface GroupSummary {
   /** Current adjustable live-agent cap (guardrail), or null if the group is
    *  unknown to the registry. Drives the GroupView stepper. */
   max_agents: number | null;
-  /** Live workers + reviewers (what counts against `max_agents`; the
-   *  orchestrator is exempt). Lowering the cap below this blocks new spawns. */
+  /** Live delegates — workers + reviewers + planners (what counts against
+   *  `max_agents`; the orchestrator is exempt). Lowering the cap below this
+   *  blocks new spawns. */
   live_delegates: number;
   paused: boolean;
   /** Group uptime (from the earliest live agent), or null if none are live. */
   uptime_ms: number | null;
-  roles: { orchestrator: number; worker: number; reviewer: number };
+  roles: { orchestrator: number; worker: number; reviewer: number; planner: number };
   agents: AgentSummary[];
 }
 

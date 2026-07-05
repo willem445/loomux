@@ -504,15 +504,30 @@ Two related additions: a **planner** role, and **per-role** agent CLI + model.
   same `max_agents` delegate cap. Its template (`templates/planner.md`) scopes it to
   read-only exploration: it investigates the codebase and posts a structured plan
   (scope, files, approach, test strategy, risks/mergeability, suggested worker split) as
-  a **GitHub issue comment**, `report`s a one-paragraph summary, and exits. It is denied a
-  worktree/branch structurally — the spawn cwd logic never creates a worktree for a
-  planner even when `worktree: true` is passed, and its kickoff branch-note tells it it
-  writes no code. It uses the shared non-orchestrator tool surface (`report` /
-  `message_orchestrator`); the plan comment is its only durable output, so a planner
-  session stays cheap and its plan trustworthy. The orchestrator template encodes the
-  *when*: simple/contained work → straight to workers; complex/sprawling/multi-worker
-  work, an uncertain split, or a human-requested plan (incl. the `agent-investigate`
-  label) → planner first, and the plan feeds the worker briefs.
+  a **GitHub issue comment**, `report`s a one-paragraph summary, and exits. It uses the
+  shared non-orchestrator tool surface (`report` / `message_orchestrator` + read-only
+  `list_agents`/`get_state`/`list_tasks`), so it cannot spawn or steer; the plan comment
+  is its only intended durable output, so a planner session stays cheap and its plan
+  trustworthy. The orchestrator template encodes the *when*: simple/contained work →
+  straight to workers; complex/sprawling/multi-worker work, an uncertain split, or a
+  human-requested plan (incl. the `agent-investigate` label) → planner first, and the plan
+  feeds the worker briefs.
+
+  **What the read-only contract enforces — structural vs instruction-backed** (the
+  distinction matters; earlier drafts overclaimed it as fully structural):
+  - *Structural* (mechanical, verified by tests): a planner never gets a **worktree** —
+    the spawn cwd logic runs it in `group.repo` even when `worktree: true` is passed; and
+    its CLI is launched **read-only** (`build_agent_command(read_only=true)`): on Claude
+    `--disallowedTools Edit Write MultiEdit NotebookEdit` plus `Bash(git commit:*)` /
+    `Bash(git push:*)`, on Copilot `--deny-tool write|edit` plus `shell(git commit|push)`
+    — deny rules override the allow list / Auto perms on both CLIs. So a planner **cannot
+    edit files, commit, or push**, i.e. cannot produce code changes or push a branch.
+  - *Instruction-backed* (the template + kickoff `PLANNER_READONLY_NOTE`, not a sandbox):
+    `gh` stays allowed (a planner needs `gh issue comment` for its deliverable), so a
+    planner *could* technically run `gh pr create` or create an inert local branch — it is
+    told not to, and with commit/push denied such a branch carries nothing. This is a
+    deliberate trade (plan-comment-as-deliverable over a full jail), now stated honestly
+    rather than presented as an absolute guarantee.
 
 - **Per-role CLI + model.** `Guardrails` gains a per-role CLI (`orchestrator_cli`,
   `worker_cli`, `reviewer_cli`, `planner_cli`) and `planner_model`, alongside the existing

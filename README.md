@@ -227,8 +227,12 @@ report back; reviewers post `gh pr review`s. For bigger or sprawling work the
 orchestrator can spawn a **planner** first — a read-only agent that explores the
 codebase and posts a structured implementation plan (scope, files, test
 strategy, risks, and a suggested worker split) as an issue comment, then exits;
-the orchestrator turns that plan into worker briefs. A planner never writes
-code. **No agent ever merges** — you do, after your own review.
+the orchestrator turns that plan into worker briefs. A planner's read-only
+contract is enforced at the CLI level where possible — it never gets a worktree,
+and its file-editing tools plus `git commit`/`git push` are denied — so it
+can't edit files or push code; the rest (not opening PRs) rides on its
+instructions, since `gh` stays available for the plan comment. **No agent ever
+merges** — you do, after your own review.
 
 **Go-signal labels:** you can hand the orchestrator work without typing in its
 pane. Label a groomed issue **`agent-ready`** and it gets picked up and driven to
