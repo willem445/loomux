@@ -50,4 +50,8 @@ tempfile = { version = "3", default-features = false }
 [profile.release]
 lto = true
 codegen-units = 1
-strip = true
+# Keep the symbol table (drop only debuginfo) so the panic hook's backtraces
+# (issue #53) name functions instead of bare addresses. Line numbers still go —
+# that needs full debuginfo — but function names make a crash log actionable at
+# a small binary-size cost. `strip = true` would blank the frames entirely.
+strip = "debuginfo"

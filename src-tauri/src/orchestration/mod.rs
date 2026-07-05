@@ -26,6 +26,8 @@ use std::sync::{mpsc, Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
 
+use crate::obs::LockExt;
+
 const ORCHESTRATOR_TPL: &str = include_str!("templates/orchestrator.md");
 const WORKER_TPL: &str = include_str!("templates/worker.md");
 const REVIEWER_TPL: &str = include_str!("templates/reviewer.md");
@@ -1075,21 +1077,21 @@ impl OrchRegistry {
     /// `~/.claude/projects`. Test-only seam (see `claude_projects_dir`).
     #[doc(hidden)]
     pub fn set_claude_projects_dir(&self, dir: PathBuf) {
-        *self.claude_projects_dir.lock().unwrap() = Some(dir);
+        *self.claude_projects_dir.lock_safe() = Some(dir);
     }
 
     /// Record the `Arc` the registry is stored behind so `&self` methods can
     /// spawn background work that outlives the current call. Call once, right
     /// after wrapping the registry in an `Arc`.
     pub fn set_self_arc(self: &Arc<Self>) {
-        *self.self_arc.lock().unwrap() = Arc::downgrade(self);
+        *self.self_arc.lock_safe() = Arc::downgrade(self);
     }
 
     /// Upgrade the stored weak self-handle. `None` in unit tests that build a
     /// bare registry without calling `set_self_arc` — background helpers then
     /// simply don't run.
     fn arc(&self) -> Option<Arc<Self>> {
-        self.self_arc.lock().unwrap().upgrade()
+        self.self_arc.lock_safe().upgrade()
     }
 
     /// Default persistent root: `<user data dir>/loomux/orchestration`.
@@ -1101,7 +1103,7 @@ impl OrchRegistry {
     }
 
     pub fn set_app(&self, app: AppHandle) {
-        *self.app.lock().unwrap() = Some(app);
+        *self.app.lock_safe() = Some(app);
     }
 
     pub fn set_port(&self, port: u16) {
@@ -1184,7 +1186,7 @@ impl OrchRegistry {
     }
 
     fn emit_tasks_changed(&self, group: &str) {
-        if let Some(app) = self.app.lock().unwrap().clone() {
+        if let Some(app) = self.app.lock_safe().clone() {
             let _ = app.emit("orch-tasks-changed", json!({ "group_id": group }));
         }
     }
@@ -1203,7 +1205,7 @@ impl OrchRegistry {
                 return Err(format!("invalid status {s:?} — use one of {}", TASK_STATUSES.join(" | ")));
             }
         }
-        let _guard = self.tasks_lock.lock().unwrap();
+        let _guard = self.tasks_lock.lock_safe();
         let mut tasks = self.tasks(group);
         let idx = match id {
             Some(id) => Some(
@@ -1277,7 +1279,7 @@ impl OrchRegistry {
     }
 
     pub fn delete_task(&self, group: &str, actor: &str, id: &str) -> Result<(), String> {
-        let _guard = self.tasks_lock.lock().unwrap();
+        let _guard = self.tasks_lock.lock_safe();
         let mut tasks = self.tasks(group);
         let before = tasks.len();
         tasks.retain(|t| t.id != id);
@@ -1292,7 +1294,7 @@ impl OrchRegistry {
     /// Reorder by explicit id list (board order = priority). Ids not
     /// mentioned keep their relative order after the mentioned ones.
     pub fn reorder_tasks(&self, group: &str, actor: &str, ids: &[String]) -> Result<(), String> {
-        let _guard = self.tasks_lock.lock().unwrap();
+        let _guard = self.tasks_lock.lock_safe();
         let mut tasks = self.tasks(group);
         let mut ordered: Vec<Task> = Vec::with_capacity(tasks.len());
         for id in ids {
@@ -1398,7 +1400,7 @@ impl OrchRegistry {
     /// Upsert an agent into the group's `agents.json`. Best-effort like the
     /// audit log; shares the file lock with the task board.
     fn persist_agent_record(&self, entry: &AgentEntry, status: &str) {
-        let _guard = self.tasks_lock.lock().unwrap();
+        let _guard = self.tasks_lock.lock_safe();
         let path = self.group_dir(&entry.group).join("agents.json");
         let mut list: Vec<AgentRecord> = fs::read_to_string(&path)
             .ok()
@@ -1488,7 +1490,7 @@ impl OrchRegistry {
     /// gone or already carries a session id.
     pub fn associate_copilot_session(&self, group_id: &str, agent_id: &str, session_id: &str) {
         let entry = {
-            let mut agents = self.agents.lock().unwrap();
+            let mut agents = self.agents.lock_safe();
             let Some(a) = agents.get_mut(agent_id) else { return };
             // Don't clobber an id set in the meantime (e.g. a resume).
             if a.session_id.is_some() {
@@ -1506,7 +1508,7 @@ impl OrchRegistry {
         // display name) that lacks a session gets it, so the orchestrator can
         // resume the task later without hunting the id out of list_agents.
         {
-            let _guard = self.tasks_lock.lock().unwrap();
+            let _guard = self.tasks_lock.lock_safe();
             let mut tasks = self.tasks(group_id);
             let mut changed = false;
             for t in tasks.iter_mut() {
@@ -1679,13 +1681,13 @@ impl OrchRegistry {
         // A pause is a durable human safety action: re-seed it from the
         // marker file so a resumed group stays paused across restarts.
         if dir.join("paused").is_file() {
-            self.paused.lock().unwrap().insert(id.clone());
+            self.paused.lock_safe().insert(id.clone());
         }
         // Desktop-notification opt-in is likewise a durable per-group choice.
         if dir.join("notify").is_file() {
-            self.notify_groups.lock().unwrap().insert(id.clone());
+            self.notify_groups.lock_safe().insert(id.clone());
         }
-        self.groups.lock().unwrap().insert(id.clone(), info.clone());
+        self.groups.lock_safe().insert(id.clone(), info.clone());
         self.audit(&id, "loomux", if resumed { "group-resume" } else { "group-create" },
             json!({ "repo": repo, "max_agents": info.guardrails.max_agents,
                     "worker_model": info.guardrails.worker_model }));
@@ -1693,14 +1695,13 @@ impl OrchRegistry {
     }
 
     pub fn group(&self, id: &str) -> Option<GroupInfo> {
-        self.groups.lock().unwrap().get(id).cloned()
+        self.groups.lock_safe().get(id).cloned()
     }
 
     /// A group is live while any of its agents is not dead.
     fn group_is_live(&self, id: &str) -> bool {
         self.agents
-            .lock()
-            .unwrap()
+            .lock_safe()
             .values()
             .any(|a| a.group == id && a.status != AgentStatus::Dead)
     }
@@ -1709,14 +1710,14 @@ impl OrchRegistry {
 
     /// Whether a group is currently paused (prompts/kickoffs suppressed).
     pub fn is_paused(&self, group: &str) -> bool {
-        self.paused.lock().unwrap().contains(group)
+        self.paused.lock_safe().contains(group)
     }
 
     /// Pause a group: loomux stops delivering prompts and kickoffs to its
     /// agents, so they finish their current turn and idle out (containing
     /// unattended spend) without being killed. Durable via a marker file.
     pub fn pause_group(&self, group: &str) -> Result<(), String> {
-        let newly = self.paused.lock().unwrap().insert(group.to_string());
+        let newly = self.paused.lock_safe().insert(group.to_string());
         if newly {
             let dir = self.group_dir(group);
             fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -1730,7 +1731,7 @@ impl OrchRegistry {
     /// prompts are not replayed — agents resync from the board/state on the
     /// next prompt, which is the point of idling out.
     pub fn resume_group(&self, group: &str) -> Result<(), String> {
-        let was = self.paused.lock().unwrap().remove(group);
+        let was = self.paused.lock_safe().remove(group);
         if was {
             let _ = fs::remove_file(self.group_dir(group).join("paused"));
             self.audit(group, "human", "group-resume", json!({}));
@@ -1742,7 +1743,7 @@ impl OrchRegistry {
     /// active. `idle` true stamps `idle_since_ms = now`; false clears it.
     /// No-op for the orchestrator, which is never idle-reaped.
     fn set_agent_idle(&self, agent_id: &str, idle: bool) {
-        let mut agents = self.agents.lock().unwrap();
+        let mut agents = self.agents.lock_safe();
         if let Some(a) = agents.get_mut(agent_id) {
             if a.role == Role::Orchestrator {
                 return;
@@ -1755,7 +1756,7 @@ impl OrchRegistry {
                 a.watchdog_notified = false;
                 // New work supersedes a prior done/blocked report — drop its
                 // attention latch so a stale badge doesn't linger.
-                self.attn_reports.lock().unwrap().remove(agent_id);
+                self.attn_reports.lock_safe().remove(agent_id);
             }
         }
     }
@@ -1766,14 +1767,12 @@ impl OrchRegistry {
     pub fn idle_reap_candidates(&self, now: u64) -> Vec<String> {
         let thresholds: HashMap<String, u32> = self
             .groups
-            .lock()
-            .unwrap()
+            .lock_safe()
             .iter()
             .map(|(id, g)| (id.clone(), g.guardrails.idle_kill_minutes))
             .collect();
         self.agents
-            .lock()
-            .unwrap()
+            .lock_safe()
             .values()
             .filter(|a| a.role != Role::Orchestrator && a.status == AgentStatus::Running)
             .filter(|a| {
@@ -1825,7 +1824,7 @@ impl OrchRegistry {
     /// for the orchestrator (never watchdogged). Output-driven activity is
     /// handled separately in `watchdog_tick` via the pty counter.
     pub fn note_agent_activity(&self, agent_id: &str) {
-        let mut agents = self.agents.lock().unwrap();
+        let mut agents = self.agents.lock_safe();
         if let Some(a) = agents.get_mut(agent_id) {
             if a.role == Role::Orchestrator {
                 return;
@@ -1839,13 +1838,12 @@ impl OrchRegistry {
     /// `PtyManager`, so it yields an empty map without an app handle (unit
     /// tests drive `watchdog_tick` with synthetic counters instead).
     fn agent_output_totals(&self) -> HashMap<String, u64> {
-        let Some(app) = self.app.lock().unwrap().clone() else {
+        let Some(app) = self.app.lock_safe().clone() else {
             return HashMap::new();
         };
         let ptys = app.state::<crate::pty::PtyManager>();
         self.agents
-            .lock()
-            .unwrap()
+            .lock_safe()
             .values()
             .filter_map(|a| Some((a.id.clone(), ptys.output_total(a.pty_id?)?)))
             .collect()
@@ -1865,19 +1863,18 @@ impl OrchRegistry {
     pub fn watchdog_tick(&self, now: u64, outputs: &HashMap<String, u64>) -> Vec<String> {
         let thresholds: HashMap<String, u32> = self
             .groups
-            .lock()
-            .unwrap()
+            .lock_safe()
             .iter()
             .map(|(id, g)| (id.clone(), g.guardrails.watchdog_stall_minutes))
             .collect();
-        let paused = self.paused.lock().unwrap().clone();
+        let paused = self.paused.lock_safe().clone();
 
         // First pass under the agents lock: refresh counters and pick who to
         // nudge. Delivery (which types into a pane and can block) happens after
         // the lock is released.
         let mut to_notify: Vec<(String, String, String, u32)> = Vec::new();
         {
-            let mut agents = self.agents.lock().unwrap();
+            let mut agents = self.agents.lock_safe();
             for a in agents.values_mut() {
                 // Only agents actively working: running, not the orchestrator,
                 // and currently assigned (idle_since_ms clear). This excludes
@@ -1942,7 +1939,7 @@ impl OrchRegistry {
     /// agent is reassigned; `progress` (the agent is working again) clears it.
     /// No-op for the orchestrator, which never reports.
     pub fn note_report_attention(&self, agent_id: &str, status: &str) {
-        let mut m = self.attn_reports.lock().unwrap();
+        let mut m = self.attn_reports.lock_safe();
         match status {
             "done" => {
                 m.insert(agent_id.to_string(), "done");
@@ -1965,8 +1962,8 @@ impl OrchRegistry {
     /// same pane flags again. The `gate` reason is board state, cleared by moving
     /// the task, so it needs no ack.
     pub fn ack_attention(&self, agent_id: &str) {
-        self.attn_reports.lock().unwrap().remove(agent_id);
-        self.attn_waiting_ack.lock().unwrap().insert(agent_id.to_string());
+        self.attn_reports.lock_safe().remove(agent_id);
+        self.attn_waiting_ack.lock_safe().insert(agent_id.to_string());
     }
 
     /// The human turned to a *plain* pane (#40): make its `waiting` ack stick the
@@ -1974,19 +1971,19 @@ impl OrchRegistry {
     /// suppression lifts when the pane's output next changes (see
     /// `plain_pane_attention`).
     pub fn ack_attention_pty(&self, pty_id: u32) {
-        self.attn_waiting_ack.lock().unwrap().insert(format!("pty:{pty_id}"));
+        self.attn_waiting_ack.lock_safe().insert(format!("pty:{pty_id}"));
     }
 
     /// Whether desktop notifications are enabled for a group.
     pub fn notify_enabled(&self, group: &str) -> bool {
-        self.notify_groups.lock().unwrap().contains(group)
+        self.notify_groups.lock_safe().contains(group)
     }
 
     /// Enable/disable desktop notifications for a group, durably (a `notify`
     /// marker file, mirroring the pause marker) so the choice survives restarts.
     pub fn set_notify(&self, group: &str, on: bool) -> Result<(), String> {
         let dir = self.group_dir(group);
-        let mut set = self.notify_groups.lock().unwrap();
+        let mut set = self.notify_groups.lock_safe();
         if on {
             if set.insert(group.to_string()) {
                 fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -2007,11 +2004,11 @@ impl OrchRegistry {
         let mut outs = HashMap::new();
         let mut tails = HashMap::new();
         let mut ins = HashMap::new();
-        let Some(app) = self.app.lock().unwrap().clone() else {
+        let Some(app) = self.app.lock_safe().clone() else {
             return (outs, tails, ins);
         };
         let ptys = app.state::<crate::pty::PtyManager>();
-        for a in self.agents.lock().unwrap().values() {
+        for a in self.agents.lock_safe().values() {
             let Some(pid) = a.pty_id else { continue };
             if let Some(t) = ptys.output_total(pid) {
                 outs.insert(a.id.clone(), t);
@@ -2038,10 +2035,10 @@ impl OrchRegistry {
         &self,
     ) -> (HashMap<u32, u64>, HashMap<u32, String>, HashMap<u32, u64>, HashSet<u32>) {
         let mut agent_ptys = HashSet::new();
-        let Some(app) = self.app.lock().unwrap().clone() else {
+        let Some(app) = self.app.lock_safe().clone() else {
             return (HashMap::new(), HashMap::new(), HashMap::new(), agent_ptys);
         };
-        for a in self.agents.lock().unwrap().values() {
+        for a in self.agents.lock_safe().values() {
             if let Some(pid) = a.pty_id {
                 agent_ptys.insert(pid);
             }
@@ -2110,7 +2107,7 @@ impl OrchRegistry {
         // Board-derived gate map: agent id → gate status, across every live
         // group. Read once per group (a small fs read) rather than per agent.
         let groups: HashSet<String> =
-            self.agents.lock().unwrap().values().map(|a| a.group.clone()).collect();
+            self.agents.lock_safe().values().map(|a| a.group.clone()).collect();
         let mut gate_of: HashMap<String, String> = HashMap::new();
         for g in &groups {
             for t in self.tasks(g) {
@@ -2123,10 +2120,10 @@ impl OrchRegistry {
             }
         }
 
-        let reports = self.attn_reports.lock().unwrap().clone();
-        let mut quiet = self.attn_quiet.lock().unwrap();
-        let mut waiting_ack = self.attn_waiting_ack.lock().unwrap();
-        let agents = self.agents.lock().unwrap();
+        let reports = self.attn_reports.lock_safe().clone();
+        let mut quiet = self.attn_quiet.lock_safe();
+        let mut waiting_ack = self.attn_waiting_ack.lock_safe();
+        let agents = self.agents.lock_safe();
         let mut out = Vec::new();
         for a in agents.values() {
             if a.status != AgentStatus::Running {
@@ -2198,8 +2195,8 @@ impl OrchRegistry {
         last_inputs: &HashMap<u32, u64>,
         agent_ptys: &HashSet<u32>,
     ) -> Vec<AttentionItem> {
-        let mut quiet = self.attn_quiet.lock().unwrap();
-        let mut waiting_ack = self.attn_waiting_ack.lock().unwrap();
+        let mut quiet = self.attn_quiet.lock_safe();
+        let mut waiting_ack = self.attn_waiting_ack.lock_safe();
         let mut out = Vec::new();
         for (&pty, &cur) in outputs {
             if agent_ptys.contains(&pty) {
@@ -2249,8 +2246,8 @@ impl OrchRegistry {
     /// Returns the agent ids to toast; pure w.r.t. the OS, so the policy is
     /// testable without firing a real notification.
     pub fn attention_toast_targets(&self, items: &[AttentionItem]) -> Vec<String> {
-        let notify = self.notify_groups.lock().unwrap().clone();
-        let mut toasted = self.attn_emitted.lock().unwrap();
+        let notify = self.notify_groups.lock_safe().clone();
+        let mut toasted = self.attn_emitted.lock_safe();
         let mut fire = Vec::new();
         for i in items {
             let already = toasted.get(&i.agent_id).map(|p| p == i.reason).unwrap_or(false);
@@ -2306,7 +2303,7 @@ impl OrchRegistry {
                 notify_desktop(&format!("loomux · {}", i.name), &i.detail);
             }
         }
-        if let Some(app) = self.app.lock().unwrap().clone() {
+        if let Some(app) = self.app.lock_safe().clone() {
             let _ = app.emit("orch-attention", &items);
         }
     }
@@ -2316,7 +2313,7 @@ impl OrchRegistry {
     /// under one lock so concurrent spawns can't both slip past the cap.
     fn check_and_record_spawn(&self, group: &str, limit: u32) -> Result<(), String> {
         let now = now_ms();
-        let mut all = self.spawn_times.lock().unwrap();
+        let mut all = self.spawn_times.lock_safe();
         let times = all.entry(group.to_string()).or_default();
         times.retain(|&t| now.saturating_sub(t) < SPAWN_RATE_WINDOW_MS);
         if spawn_rate_exceeded(times, now, limit, SPAWN_RATE_WINDOW_MS) {
@@ -2367,8 +2364,7 @@ impl OrchRegistry {
                 // Use the test override when set, else the default ~/.claude root.
                 let root = self
                     .claude_projects_dir
-                    .lock()
-                    .unwrap()
+                    .lock_safe()
                     .clone()
                     .or_else(crate::usage::default_claude_projects_root);
                 if let Some(u) = root
@@ -2393,7 +2389,7 @@ impl OrchRegistry {
         // Last resort: the dollar figure the CLI renders in its own statusline.
         // Unreliable (empty on subscription/Max accounts; gone once the pane is
         // killed), so it only runs when no transcript usage was found.
-        if let Some(app) = self.app.lock().unwrap().clone() {
+        if let Some(app) = self.app.lock_safe().clone() {
             if let Some(pty) = entry.pty_id {
                 let ptys = app.state::<crate::pty::PtyManager>();
                 if let Some(raw) = ptys.output_tail(pty) {
@@ -2433,7 +2429,7 @@ impl OrchRegistry {
     /// kill-snapshot accumulation test.
     #[doc(hidden)]
     pub fn upsert_usage_snapshot(&self, group: &str, snap: UsageSnapshot) {
-        let _guard = self.tasks_lock.lock().unwrap();
+        let _guard = self.tasks_lock.lock_safe();
         let mut list = self.load_usage_snapshots(group);
         match list.iter_mut().find(|s| s.key == snap.key) {
             Some(existing) => {
@@ -2493,8 +2489,7 @@ impl OrchRegistry {
     pub fn group_usage(&self, group: &str) -> Value {
         let live_agents: Vec<AgentEntry> = self
             .agents
-            .lock()
-            .unwrap()
+            .lock_safe()
             .values()
             .filter(|a| a.group == group && a.status != AgentStatus::Dead)
             .cloned()
@@ -2514,7 +2509,7 @@ impl OrchRegistry {
 
         // The store now holds live + historical (killed) snapshots.
         let snaps = {
-            let _guard = self.tasks_lock.lock().unwrap();
+            let _guard = self.tasks_lock.lock_safe();
             self.load_usage_snapshots(group)
         };
 
@@ -2611,8 +2606,7 @@ impl OrchRegistry {
         let now = now_ms();
         let live: Vec<AgentEntry> = self
             .agents
-            .lock()
-            .unwrap()
+            .lock_safe()
             .values()
             .filter(|a| a.group == group && a.status != AgentStatus::Dead)
             .cloned()
@@ -2659,8 +2653,7 @@ impl OrchRegistry {
         // have a worktree on disk that cleanup should reclaim.
         let members: Vec<AgentEntry> = self
             .agents
-            .lock()
-            .unwrap()
+            .lock_safe()
             .values()
             .filter(|a| a.group == group)
             .cloned()
@@ -2668,7 +2661,7 @@ impl OrchRegistry {
         if members.is_empty() {
             return Err("no such group (no agents ever registered here)".into());
         }
-        let app = self.app.lock().unwrap().clone();
+        let app = self.app.lock_safe().clone();
 
         // Kill the live ones. Kill the pty (best-effort) then mark the entry
         // dead directly — mark_dead is idempotent against the async pty-exit,
@@ -2708,7 +2701,7 @@ impl OrchRegistry {
 
         // Total teardown: drop any pause (in-memory + marker) so a future
         // relaunch on this repo starts clean rather than silently paused.
-        if self.paused.lock().unwrap().remove(group) {
+        if self.paused.lock_safe().remove(group) {
             let _ = fs::remove_file(self.group_dir(group).join("paused"));
         }
 
@@ -2754,8 +2747,8 @@ impl OrchRegistry {
     }
 
     pub fn resolve_token(&self, token: &str) -> Option<Caller> {
-        let id = self.by_token.lock().unwrap().get(token).cloned()?;
-        let agents = self.agents.lock().unwrap();
+        let id = self.by_token.lock_safe().get(token).cloned()?;
+        let agents = self.agents.lock_safe();
         let a = agents.get(&id)?;
         if a.status == AgentStatus::Dead {
             return None;
@@ -2764,13 +2757,12 @@ impl OrchRegistry {
     }
 
     pub fn agent(&self, id: &str) -> Option<AgentEntry> {
-        self.agents.lock().unwrap().get(id).cloned()
+        self.agents.lock_safe().get(id).cloned()
     }
 
     fn live_delegate_count(&self, group: &str) -> u32 {
         self.agents
-            .lock()
-            .unwrap()
+            .lock_safe()
             .values()
             .filter(|a| a.group == group && a.role != Role::Orchestrator && a.status != AgentStatus::Dead)
             .count() as u32
@@ -3036,7 +3028,7 @@ impl OrchRegistry {
             // Re-check the cap under the same lock as the insert: the early
             // check above fast-fails before worktree creation, but only this
             // one is race-free against concurrent spawns.
-            let mut agents = self.agents.lock().unwrap();
+            let mut agents = self.agents.lock_safe();
             if role != Role::Orchestrator {
                 let live = agents
                     .values()
@@ -3056,13 +3048,18 @@ impl OrchRegistry {
             }
             agents.insert(agent_id.clone(), entry.clone());
         }
-        self.by_token.lock().unwrap().insert(token, agent_id.clone());
+        self.by_token.lock_safe().insert(token, agent_id.clone());
         self.persist_agent_record(&entry, "running");
         self.audit(group_id, "loomux", "agent-spawn", json!({
             "agent": agent_id, "role": role, "name": display, "cwd": cwd,
             "model": model, "worktree": use_worktree, "branch": branch_name, "task": task,
             "session": session_id, "resume": resume,
         }));
+        // Breadcrumb (no prompt/task text): ids + role only.
+        crate::obs::breadcrumb(
+            "agent-spawn",
+            &format!("group={group_id} agent={agent_id} role={role:?} worktree={use_worktree}"),
+        );
 
         let request = SpawnRequest {
             group_id: group_id.to_string(),
@@ -3073,29 +3070,36 @@ impl OrchRegistry {
             command,
         };
 
-        let app = self.app.lock().unwrap().clone();
+        let app = self.app.lock_safe().clone();
         let Some(app) = app else {
             // Test mode: no frontend. Mark running so guardrail/authz logic
-            // can be exercised without panes.
-            self.agents.lock().unwrap().get_mut(&agent_id).unwrap().status = AgentStatus::Running;
-            return Ok(self.agent(&agent_id).unwrap());
+            // can be exercised without panes. Handle a vanished entry (a
+            // concurrent reap between insert and here) instead of unwrapping —
+            // a panic here would fire while holding the agents lock.
+            if let Some(a) = self.agents.lock_safe().get_mut(&agent_id) {
+                a.status = AgentStatus::Running;
+            }
+            return self
+                .agent(&agent_id)
+                .ok_or_else(|| "agent vanished during spawn".to_string());
         };
 
         let (tx, rx) = mpsc::channel::<u32>();
-        self.pending_binds.lock().unwrap().insert(agent_id.clone(), tx);
+        self.pending_binds.lock_safe().insert(agent_id.clone(), tx);
         app.emit("orch-spawn-request", &request).map_err(|e| e.to_string())?;
 
         match rx.recv_timeout(BIND_TIMEOUT) {
             Ok(pty_id) => {
                 {
-                    let mut agents = self.agents.lock().unwrap();
+                    let mut agents = self.agents.lock_safe();
                     if let Some(a) = agents.get_mut(&agent_id) {
                         a.status = AgentStatus::Running;
                         a.pty_id = Some(pty_id);
                     }
                 }
-                self.by_pty.lock().unwrap().insert(pty_id, agent_id.clone());
+                self.by_pty.lock_safe().insert(pty_id, agent_id.clone());
                 self.audit(group_id, "loomux", "agent-bind", json!({ "agent": agent_id, "pty": pty_id }));
+                crate::obs::breadcrumb("agent-bind", &format!("agent={agent_id} pty={pty_id}"));
                 if resume {
                     // Resumed sessions already have their role and history;
                     // deliver only the follow-up (if any) instead of the
@@ -3104,8 +3108,10 @@ impl OrchRegistry {
                         self.deliver_prompt(&agent_id, task, "loomux", true)?;
                     }
                 } else {
-                    let kickoff =
-                        self.kickoff_prompt(&self.agent(&agent_id).unwrap(), &group, &branch_note);
+                    let a = self
+                        .agent(&agent_id)
+                        .ok_or("agent vanished during spawn")?;
+                    let kickoff = self.kickoff_prompt(&a, &group, &branch_note);
                     self.deliver_prompt(&agent_id, &kickoff, "loomux", true)?;
                 }
                 // Copilot minted a session as it booted; watch for it and bind
@@ -3123,10 +3129,11 @@ impl OrchRegistry {
                         );
                     }
                 }
-                Ok(self.agent(&agent_id).unwrap())
+                self.agent(&agent_id)
+                    .ok_or_else(|| "agent vanished during spawn".into())
             }
             Err(_) => {
-                self.pending_binds.lock().unwrap().remove(&agent_id);
+                self.pending_binds.lock_safe().remove(&agent_id);
                 self.mark_dead(&agent_id, None);
                 Err("frontend did not open the agent pane in time".into())
             }
@@ -3188,20 +3195,19 @@ impl OrchRegistry {
             return Ok(());
         }
         let pty_id = a.pty_id.ok_or("agent has no terminal yet")?;
-        let app = self.app.lock().unwrap().clone().ok_or("no app handle")?;
+        let app = self.app.lock_safe().clone().ok_or("no app handle")?;
         self.audit(&a.group, from, "prompt", json!({ "to": agent_id, "text": text }));
 
         let paste = bracketed_paste(text);
         let lock = self
             .delivery
-            .lock()
-            .unwrap()
+            .lock_safe()
             .entry(pty_id)
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone();
         let (root, group, agent) = (self.root.clone(), a.group.clone(), a.id.clone());
         std::thread::spawn(move || {
-            let _guard = lock.lock().unwrap();
+            let _guard = lock.lock_safe();
             let ptys = app.state::<crate::pty::PtyManager>();
 
             let start = std::time::Instant::now();
@@ -3337,6 +3343,14 @@ impl OrchRegistry {
                 "echoed": echoed,
                 "submit_waited_ms": submit_start.elapsed().as_millis() as u64,
             }));
+            // Delivery outcome breadcrumb — timing + flags only, never the text.
+            crate::obs::breadcrumb(
+                "delivery",
+                &format!(
+                    "agent={agent} pty={pty_id} outcome=typed echoed={echoed} attempts={attempts} waited_ms={}",
+                    start.elapsed().as_millis() as u64
+                ),
+            );
         });
         Ok(())
     }
@@ -3363,8 +3377,7 @@ impl OrchRegistry {
     pub fn deliver_to_orchestrator(&self, group: &str, text: &str, from: &str) -> Result<(), String> {
         let orch = self
             .agents
-            .lock()
-            .unwrap()
+            .lock_safe()
             .values()
             .find(|a| a.group == group && a.role == Role::Orchestrator && a.status != AgentStatus::Dead)
             .map(|a| a.id.clone())
@@ -3373,7 +3386,7 @@ impl OrchRegistry {
     }
 
     pub fn list_agents(&self, group: &str) -> Value {
-        let agents = self.agents.lock().unwrap();
+        let agents = self.agents.lock_safe();
         let mut list: Vec<Value> = agents
             .values()
             .filter(|a| a.group == group)
@@ -3391,7 +3404,7 @@ impl OrchRegistry {
     pub fn agent_output_tail(&self, agent_id: &str, lines: usize) -> Result<String, String> {
         let a = self.agent(agent_id).ok_or("unknown agent")?;
         let pty_id = a.pty_id.ok_or("agent has no terminal")?;
-        let app = self.app.lock().unwrap().clone().ok_or("no app handle")?;
+        let app = self.app.lock_safe().clone().ok_or("no app handle")?;
         let ptys = app.state::<crate::pty::PtyManager>();
         let raw = ptys.output_tail(pty_id).ok_or("terminal already closed")?;
         let text = strip_ansi(&raw);
@@ -3406,7 +3419,7 @@ impl OrchRegistry {
         if a.role == Role::Orchestrator {
             return Err("refusing to kill the orchestrator; close its pane instead".into());
         }
-        let app = self.app.lock().unwrap().clone().ok_or("no app handle")?;
+        let app = self.app.lock_safe().clone().ok_or("no app handle")?;
         if let Some(pty) = a.pty_id {
             app.state::<crate::pty::PtyManager>().kill(pty);
         }
@@ -3416,14 +3429,14 @@ impl OrchRegistry {
 
     pub fn focus_agent(&self, agent_id: &str) -> Result<(), String> {
         let a = self.agent(agent_id).ok_or("unknown agent")?;
-        let app = self.app.lock().unwrap().clone().ok_or("no app handle")?;
+        let app = self.app.lock_safe().clone().ok_or("no app handle")?;
         app.emit("orch-focus", json!({ "agent_id": agent_id, "pty_id": a.pty_id }))
             .map_err(|e| e.to_string())
     }
 
     #[doc(hidden)] // pub for integration tests
     pub fn mark_dead(&self, agent_id: &str, exit_code: Option<u32>) -> Option<AgentEntry> {
-        let mut agents = self.agents.lock().unwrap();
+        let mut agents = self.agents.lock_safe();
         let a = agents.get_mut(agent_id)?;
         if a.status == AgentStatus::Dead {
             return None;
@@ -3431,21 +3444,25 @@ impl OrchRegistry {
         a.status = AgentStatus::Dead;
         let snapshot = a.clone();
         drop(agents);
-        self.by_token.lock().unwrap().remove(&snapshot.token);
+        self.by_token.lock_safe().remove(&snapshot.token);
         if let Some(p) = snapshot.pty_id {
-            self.by_pty.lock().unwrap().remove(&p);
-            self.delivery.lock().unwrap().remove(&p);
+            self.by_pty.lock_safe().remove(&p);
+            self.delivery.lock_safe().remove(&p);
         }
         // Attention bookkeeping is per-live-agent; drop this one's entries.
-        self.attn_reports.lock().unwrap().remove(agent_id);
-        self.attn_quiet.lock().unwrap().remove(agent_id);
-        self.attn_waiting_ack.lock().unwrap().remove(agent_id);
-        self.attn_emitted.lock().unwrap().remove(agent_id);
+        self.attn_reports.lock_safe().remove(agent_id);
+        self.attn_quiet.lock_safe().remove(agent_id);
+        self.attn_waiting_ack.lock_safe().remove(agent_id);
+        self.attn_emitted.lock_safe().remove(agent_id);
         let _ = fs::remove_file(
             self.group_dir(&snapshot.group).join("configs").join(format!("{agent_id}.json")),
         );
         self.audit(&snapshot.group, "loomux", "agent-exit",
             json!({ "agent": agent_id, "exit_code": exit_code }));
+        crate::obs::breadcrumb(
+            "agent-dead",
+            &format!("agent={agent_id} pty={:?} code={exit_code:?}", snapshot.pty_id),
+        );
         self.persist_agent_record(&snapshot, "dead");
         // Durably capture final usage before the pane is fully torn down, so a
         // recycled/killed agent still counts toward the group's lifetime total
@@ -3463,7 +3480,7 @@ impl OrchRegistry {
     /// Called from the pty waiter thread when any pty exits. No-op for ptys
     /// that aren't orchestration agents.
     pub fn on_pty_exit(&self, pty_id: u32, exit_code: Option<u32>) {
-        let agent_id = match self.by_pty.lock().unwrap().get(&pty_id).cloned() {
+        let agent_id = match self.by_pty.lock_safe().get(&pty_id).cloned() {
             Some(id) => id,
             None => return,
         };
@@ -3489,8 +3506,7 @@ impl OrchRegistry {
     pub fn bind(&self, agent_id: &str, pty_id: u32) -> Result<(), String> {
         let tx = self
             .pending_binds
-            .lock()
-            .unwrap()
+            .lock_safe()
             .remove(agent_id)
             .ok_or_else(|| format!("no pending bind for agent {agent_id}"))?;
         tx.send(pty_id).map_err(|_| "spawner is gone (bind timed out)".to_string())
@@ -3670,7 +3686,7 @@ pub fn create_orchestration_group(
     if !Path::new(repo).is_dir() {
         return Err(format!("repository path does not exist: {repo}"));
     }
-    let _creation = reg.creation.lock().unwrap();
+    let _creation = reg.creation.lock_safe();
     let group = reg.create_group(repo, guardrails)?;
     if let Some(want) = expect_group {
         if group.id != want {
@@ -3742,8 +3758,8 @@ fn register_orchestrator_pane(
         last_output_total: 0,
         watchdog_notified: false,
     };
-    reg.agents.lock().unwrap().insert(agent_id.clone(), entry.clone());
-    reg.by_token.lock().unwrap().insert(token, agent_id.clone());
+    reg.agents.lock_safe().insert(agent_id.clone(), entry.clone());
+    reg.by_token.lock_safe().insert(token, agent_id.clone());
     reg.persist_agent_record(&entry, "running");
     reg.audit(&group.id, "loomux", "agent-spawn",
         json!({ "agent": agent_id, "role": "orchestrator", "model": model,
@@ -3758,37 +3774,49 @@ fn register_orchestrator_pane(
         command,
     };
 
-    if reg.app.lock().unwrap().is_none() {
-        // Test mode: no frontend; mark running without a pane.
-        reg.agents.lock().unwrap().get_mut(&agent_id).unwrap().status = AgentStatus::Running;
+    crate::obs::breadcrumb(
+        "agent-spawn",
+        &format!("group={} agent={agent_id} role=Orchestrator resume={resume}", group.id),
+    );
+
+    if reg.app.lock_safe().is_none() {
+        // Test mode: no frontend; mark running without a pane. Tolerate a
+        // vanished entry rather than unwrapping under the agents lock.
+        if let Some(a) = reg.agents.lock_safe().get_mut(&agent_id) {
+            a.status = AgentStatus::Running;
+        }
         return Ok(request);
     }
 
     // Background: wait for the orchestrator pane to bind, type its kickoff,
     // then bring up the initial idle workers one by one.
     let (tx, rx) = mpsc::channel::<u32>();
-    reg.pending_binds.lock().unwrap().insert(agent_id.clone(), tx);
+    reg.pending_binds.lock_safe().insert(agent_id.clone(), tx);
     let reg2 = reg.clone();
     let group2 = group.clone();
     std::thread::spawn(move || {
         let Ok(pty_id) = rx.recv_timeout(BIND_TIMEOUT) else {
-            reg2.pending_binds.lock().unwrap().remove(&agent_id);
+            reg2.pending_binds.lock_safe().remove(&agent_id);
             reg2.mark_dead(&agent_id, None);
             return;
         };
         {
-            let mut agents = reg2.agents.lock().unwrap();
+            let mut agents = reg2.agents.lock_safe();
             if let Some(a) = agents.get_mut(&agent_id) {
                 a.status = AgentStatus::Running;
                 a.pty_id = Some(pty_id);
             }
         }
-        reg2.by_pty.lock().unwrap().insert(pty_id, agent_id.clone());
+        reg2.by_pty.lock_safe().insert(pty_id, agent_id.clone());
         reg2.audit(&group2.id, "loomux", "agent-bind", json!({ "agent": agent_id, "pty": pty_id }));
+        crate::obs::breadcrumb("agent-bind", &format!("agent={agent_id} pty={pty_id} role=Orchestrator"));
         let kickoff = if resume {
             "[loomux] Orchestration restored: your MCP tools, the task board, and the audit log are live again in this session. Re-sync now: list_tasks, list_agents, get_state. Your previous worker panes are gone; resume a task session with spawn_agent(resume_session, cwd) when follow-ups need it. Then give the human a short status summary.".to_string()
         } else {
-            reg2.kickoff_prompt(&reg2.agent(&agent_id).unwrap(), &group2, "")
+            match reg2.agent(&agent_id) {
+                Some(a) => reg2.kickoff_prompt(&a, &group2, ""),
+                None => return, // agent reaped before bind; nothing to kick off
+            }
         };
         let _ = reg2.deliver_prompt(&agent_id, &kickoff, "loomux", true);
         // Track the copilot session this orchestrator just minted.
