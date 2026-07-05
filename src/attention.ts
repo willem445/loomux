@@ -29,3 +29,39 @@ export function attentionPresentation(reason: string): AttentionPresentation {
     urgent: reason === "blocked",
   };
 }
+
+/** A pane's current attention state, as exposed by `Pane.attention`. */
+export interface PaneAttention {
+  label: string;
+  urgent: boolean;
+  detail: string | null;
+}
+
+/** How a minimized pane's dock chip reflects its attention state. */
+export interface DockChipAttention {
+  /** Whether the chip shows the "needs attention" dot/pulse. */
+  needsAttention: boolean;
+  /** Red (urgent) vs amber pulse. */
+  urgent: boolean;
+  /** Chip tooltip. */
+  title: string;
+}
+
+/** Decide how a minimized pane's dock chip mirrors the pane's attention state
+ *  (#6 detection surfaced on the #26/#31 dock chip): the dot mirrors the header
+ *  chip so minimizing a pane never hides an ask — e.g. an agent parked on an
+ *  interactive question (#40) shows the dot even while docked. Pure so the
+ *  dock-dot path is testable without a DOM. */
+export function dockChipAttention(
+  paneName: string,
+  attn: PaneAttention | null,
+): DockChipAttention {
+  if (!attn) {
+    return { needsAttention: false, urgent: false, title: `Restore ${paneName}` };
+  }
+  return {
+    needsAttention: true,
+    urgent: attn.urgent,
+    title: `${attn.label} — ${attn.detail ?? "needs you"} · restore ${paneName}`,
+  };
+}

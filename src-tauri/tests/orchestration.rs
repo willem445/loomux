@@ -1483,6 +1483,99 @@ fn prompt_wait_detected_spots_prompts_not_chatter() {
     assert!(!prompt_wait_detected(""));
 }
 
+// Captured/synthetic terminal output (with real ANSI + box drawing) for the
+// interactive-question repro from issue #40. Fed through `strip_ansi` exactly as
+// the live attention scan does, so the fixtures exercise the whole detection
+// pipeline, not a pre-cleaned string.
+const FIX_CLAUDE_ASK: &str = include_str!("fixtures/attention/claude-askuserquestion.txt");
+const FIX_COPILOT_ASK: &str = include_str!("fixtures/attention/copilot-question.txt");
+const FIX_STREAMING: &str = include_str!("fixtures/attention/streaming-output.txt");
+const FIX_IDLE_BOX: &str = include_str!("fixtures/attention/idle-input-box.txt");
+
+#[test]
+fn prompt_wait_detected_fires_on_interactive_question_fixtures() {
+    // #40: a Claude Code AskUserQuestion menu highlights the active option with
+    // reverse-video SGR (stripped away), leaving numbered options with arbitrary
+    // labels and an "Enter to select" footer — no selection glyph survives.
+    assert!(
+        prompt_wait_detected(&strip_ansi(FIX_CLAUDE_ASK.as_bytes())),
+        "AskUserQuestion menu must be recognized as needing the human"
+    );
+    // #40: a Copilot CLI question draws its `❯` pointer indented inside a box, so
+    // the option line never *starts* with the pointer after trimming.
+    assert!(
+        prompt_wait_detected(&strip_ansi(FIX_COPILOT_ASK.as_bytes())),
+        "Copilot boxed selection prompt must be recognized as needing the human"
+    );
+}
+
+#[test]
+fn prompt_wait_detected_ignores_quiet_non_prompts() {
+    // Ordinary streaming output — even when it ends on a numbered summary list —
+    // is not a selection menu, or we'd get a false-positive storm.
+    assert!(
+        !prompt_wait_detected(&strip_ansi(FIX_STREAMING.as_bytes())),
+        "a quiet numbered summary must not be mistaken for a selection menu"
+    );
+    // A CLI idling at its empty input box (turn finished, no question asked) must
+    // not be flagged — otherwise every parked pane lights up.
+    assert!(
+        !prompt_wait_detected(&strip_ansi(FIX_IDLE_BOX.as_bytes())),
+        "an idle input box is not an interactive question"
+    );
+}
+
+#[test]
+fn attention_flags_a_pane_parked_on_a_question_fixture() {
+    // End-to-end through attention_tick with a real captured Copilot question:
+    // once the pane's output is quiet past the window and unattended, it must
+    // surface as `waiting` — and carry the pty_id the pane header indicator and
+    // the #26/#31 dock-tab dot both key off.
+    let (reg, _d, _g, wid) = attention_setup();
+    let now = 1_000_000_000_000u64;
+    let out: HashMap<String, u64> = [(wid.clone(), 512u64)].into_iter().collect();
+    let tail: HashMap<String, String> =
+        [(wid.clone(), strip_ansi(FIX_COPILOT_ASK.as_bytes()))].into_iter().collect();
+    let no_input = HashMap::new();
+
+    // Debounced on first sighting (the menu may still be painting).
+    let first = reg.attention_tick(now, &out, &tail, &no_input);
+    assert!(first.iter().all(|i| i.reason != "waiting"), "first quiet tick is debounced");
+
+    // Stable past the quiet window → the pane needs the human.
+    let waited = reg.attention_tick(now + 5000, &out, &tail, &no_input);
+    let item = waited
+        .iter()
+        .find(|i| i.agent_id == wid && i.reason == "waiting")
+        .expect("a quiet pane parked on a question must be flagged");
+    assert_eq!(
+        item.pty_id,
+        reg.agent(&wid).unwrap().pty_id,
+        "the attention item must carry the pane's pty_id for the header + dock-tab dot"
+    );
+}
+
+#[test]
+fn attention_does_not_flag_streaming_or_idle_fixtures() {
+    // The two negatives, driven all the way through attention_tick: neither a
+    // quiet stream of ordinary output nor an idle input box may raise `waiting`,
+    // even long after they've gone quiet.
+    let (reg, _d, _g, wid) = attention_setup();
+    let now = 1_000_000_000_000u64;
+    let out: HashMap<String, u64> = [(wid.clone(), 256u64)].into_iter().collect();
+    let no_input = HashMap::new();
+    for fixture in [FIX_STREAMING, FIX_IDLE_BOX] {
+        let tail: HashMap<String, String> =
+            [(wid.clone(), strip_ansi(fixture.as_bytes()))].into_iter().collect();
+        reg.attention_tick(now, &out, &tail, &no_input);
+        let later = reg.attention_tick(now + 60_000, &out, &tail, &no_input);
+        assert!(
+            later.iter().all(|i| i.reason != "waiting"),
+            "ordinary/idle output must not raise attention, got: {later:?}"
+        );
+    }
+}
+
 #[test]
 fn attention_flags_idle_with_prompt_only_when_quiet_and_unattended() {
     let (reg, _d, _g, wid) = attention_setup();

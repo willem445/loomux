@@ -310,6 +310,44 @@ to actually do) with the orchestrator.
   outside the working-agent filter by construction, so a terminated pane is never flagged. The
   orchestrator is never watchdogged (it is the recipient).
 
+## Attention routing (#6) & interactive-question detection (#40)
+
+The human is the scheduler's bottleneck; attention routing surfaces *which* pane needs
+them so they don't scan panes. A background loop (`start_attention`, 3s tick) reads a pty
+snapshot and hands it to the pure `attention_tick`, which emits an `AttentionItem` per pane
+that needs the human, with a reason in priority order: `blocked` (reported) > `waiting`
+(parked on a prompt) > `report` (reported done) > `gate` (the pane's board task sits at a
+merge gate). Keeping the policy pure w.r.t. the pty (the pty reads live in
+`attention_inputs`) makes the whole thing fixture-testable with synthetic maps — no real
+CLI. The frontend routes each item by `pty_id` to `Pane.setAttention`, which paints the
+header chip and, via a listener, mirrors the state onto a minimized pane's **dock chip**
+(`Grid.renderDock` → `dockChipAttention`) so docking never hides an ask. Turning to / acking
+a pane clears it.
+
+- **The `waiting` heuristic.** A pane is `waiting` when its output has been quiet past
+  `ATTENTION_QUIET_MS` (4s), there's been no recent human keystroke, *and* its ANSI-stripped
+  tail looks like a live interactive prompt (`prompt_wait_detected`). The quiet + no-keystroke
+  gate is what separates a *live* prompt the human must answer from the same words scrolled
+  past or a prompt the human is already typing into.
+- **#40 — questions weren't detected.** `prompt_wait_detected` originally only fired on a
+  selection glyph that *starts* an option line (`starts_with('❯')`), a `1. yes` numbered menu,
+  explicit `y/n` tokens, or a fixed list of permission phrasings. Two real interactive-question
+  styles slipped through, so the pane chip **and** the dock dot both stayed dark:
+  - **Claude Code `AskUserQuestion`** highlights the active option with *reverse-video* (an
+    ANSI attribute stripped before detection sees it), leaving numbered options with arbitrary
+    labels and no glyph — nothing in the old list matched. Fix: recognize the interactive
+    selection-menu **footer** (`enter to select`, `enter to confirm`, `use arrow keys`,
+    `↑↓`/`↑/↓`), which survives stripping and is near-exclusive to live selection prompts.
+  - **Copilot CLI** draws its `❯` pointer indented inside a bordered box (`│ ❯ Yes`), so the
+    option line never *starts* with the pointer after trimming. Fix: match the menu-exclusive
+    `❯`/`›` glyphs **anywhere** in the tail, not just at line start. (`→` stays start-only —
+    it's common in diffs/logs/prose.)
+- **No false-positive storm.** The added signals are menu-exclusive footers and glyphs, so
+  ordinary streaming output — even a quiet numbered *summary* list — and a CLI idling at its
+  empty input box do **not** flag. Covered by captured/synthetic fixtures under
+  `src-tauri/tests/fixtures/attention/` (two positive question styles, two negatives), run
+  through the real `strip_ansi` → `prompt_wait_detected` → `attention_tick` path.
+
 ## Risks / limitations
 
 - Kickoff typing races CLI boot; a fixed delay (4s) + bracketed paste is used. If a

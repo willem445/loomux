@@ -272,11 +272,16 @@ pub fn prompt_wait_detected(tail: &str) -> bool {
     let recent = &lines[lines.len().saturating_sub(12)..];
     let joined = recent.join("\n");
 
-    // Selection pointer on an option line: how both CLIs render the highlighted
-    // choice of a permission menu (`❯ 1. Yes`, `› Yes`, `→ Allow`).
+    // Selection pointer marking the highlighted choice of a menu. `❯`/`›` are
+    // used almost exclusively by interactive CLI selection menus (Claude Code,
+    // Copilot, inquirer), so a bare appearance *anywhere* in the tail is a
+    // strong signal — crucially including a bordered dialog whose option line
+    // reads `│ ❯ Yes`, where the pointer no longer *starts* the line (#40).
+    // `→` is common in ordinary output (diffs, logs, arrows in prose), so keep
+    // it strict: it must lead the option line.
     let has_pointer_option = recent
         .iter()
-        .any(|l| l.starts_with('❯') || l.starts_with('›') || l.starts_with('→'));
+        .any(|l| l.contains('❯') || l.contains('›') || l.starts_with('→'));
     // A numbered yes/no menu even without the pointer glyph.
     let has_numbered_menu = joined.contains("1. yes") || joined.contains("❯ 1.");
     // Explicit yes/no confirmation tokens.
@@ -285,7 +290,13 @@ pub fn prompt_wait_detected(tail: &str) -> bool {
         || joined.contains("y/n)")
         || joined.contains("[y/n]?")
         || joined.contains("yes/no");
-    // Stock permission / trust / continue phrasings from Claude Code & Copilot.
+    // Stock permission / trust / continue phrasings from Claude Code & Copilot,
+    // plus the footer an interactive selection menu paints while parked on a
+    // choice. Claude Code's AskUserQuestion highlights the active option with
+    // reverse-video (an ANSI attribute stripped before we see it), so no glyph
+    // survives and the footer ("enter to select", "↑↓ to navigate") is the only
+    // durable signal (#40). These footer strings are near-exclusive to live
+    // selection prompts, so they don't storm on ordinary streaming output.
     let has_permission_phrase = joined.contains("do you want to proceed")
         || joined.contains("do you want to make this edit")
         || joined.contains("do you want to create")
@@ -296,7 +307,14 @@ pub fn prompt_wait_detected(tail: &str) -> bool {
         || joined.contains("allow command")
         || joined.contains("grant access")
         || joined.contains("press enter to continue")
-        || joined.contains("waiting for your");
+        || joined.contains("waiting for your")
+        // interactive selection-menu footers (AskUserQuestion / Copilot / inquirer):
+        || joined.contains("enter to select")
+        || joined.contains("enter to confirm")
+        || joined.contains("use arrow")
+        || joined.contains("arrow keys")
+        || joined.contains("↑↓")
+        || joined.contains("↑/↓");
     has_pointer_option || has_numbered_menu || has_yes_no || has_permission_phrase
 }
 
