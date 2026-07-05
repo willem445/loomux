@@ -95,24 +95,35 @@ function cacheDir() {
 
 // ---------- platform installers ----------
 
-async function runLinux(release) {
+// The installed app can be older than this launcher (updating the npm package
+// replaces only the launcher, never the app it installed earlier). Each
+// platform reads the version of whatever is actually installed; a mismatch
+// triggers a reinstall. `null` (version undetectable) launches as-is so a
+// broken probe can't cause a download-on-every-launch loop.
+function shouldLaunchExisting(installed) {
+  if (installed === null || installed === PKG_VERSION) return true;
+  say(`installed app is v${installed}, launcher is v${PKG_VERSION} — upgrading`);
+  return false;
+}
+
+async function runLinux(getRelease) {
   const arch = process.arch;
-  const re =
-    arch === "arm64"
-      ? /_aarch64\.AppImage$/
-      : arch === "x64"
-      ? /_amd64\.AppImage$/
-      : null;
-  if (!re) die(`unsupported Linux architecture: ${arch}`);
+  const suffix = arch === "arm64" ? "aarch64" : arch === "x64" ? "amd64" : null;
+  if (!suffix) die(`unsupported Linux architecture: ${arch}`);
 
-  const asset = pickAsset(release, re);
-  if (!asset) die(`no Linux (${arch}) AppImage in release ${release.tag_name}`);
-
-  const dest = path.join(cacheDir(), `${asset.name}`);
+  // AppImages are cached under their release asset name, so the version is
+  // part of the filename — a cache hit is by construction the right version.
+  let dest = path.join(cacheDir(), `Loomux_${PKG_VERSION}_${suffix}.AppImage`);
   if (!fs.existsSync(dest) || REINSTALL) {
-    say(`downloading ${asset.name}`);
-    await download(asset.browser_download_url, dest);
-    fs.chmodSync(dest, 0o755);
+    const release = await getRelease();
+    const asset = pickAsset(release, new RegExp(`_${suffix}\\.AppImage$`));
+    if (!asset) die(`no Linux (${arch}) AppImage in release ${release.tag_name}`);
+    dest = path.join(cacheDir(), asset.name);
+    if (!fs.existsSync(dest) || REINSTALL) {
+      say(`downloading ${asset.name}`);
+      await download(asset.browser_download_url, dest);
+      fs.chmodSync(dest, 0o755);
+    }
   }
   say(`launching ${path.basename(dest)}`);
   // Detach so the GUI outlives this short-lived launcher process.
@@ -120,14 +131,25 @@ async function runLinux(release) {
   child.unref();
 }
 
-async function runMac(release) {
+function installedMacVersion() {
+  const out = spawnSync(
+    "defaults",
+    ["read", "/Applications/Loomux.app/Contents/Info", "CFBundleShortVersionString"],
+    { encoding: "utf8" }
+  );
+  if (out.status !== 0 || !out.stdout) return null;
+  return out.stdout.trim() || null;
+}
+
+async function runMac(getRelease) {
   const appPath = "/Applications/Loomux.app";
-  if (fs.existsSync(appPath) && !REINSTALL) {
+  if (fs.existsSync(appPath) && !REINSTALL && shouldLaunchExisting(installedMacVersion())) {
     say("launching installed Loomux.app");
     spawnSync("open", ["-a", "Loomux"], { stdio: "ignore" });
     return;
   }
 
+  const release = await getRelease();
   const re = process.arch === "arm64" ? /_aarch64\.dmg$/ : /_x64\.dmg$/;
   const asset = pickAsset(release, re);
   if (!asset) die(`no macOS (${process.arch}) build in release ${release.tag_name}`);
@@ -171,14 +193,32 @@ function findWindowsExe() {
   return candidates.find((p) => p && fs.existsSync(p)) || null;
 }
 
-async function runWindows(release) {
+// Tauri's NSIS installer records the version it installed (per-user, HKCU).
+function installedWindowsVersion() {
+  const out = spawnSync(
+    "reg",
+    [
+      "query",
+      "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Loomux",
+      "/v",
+      "DisplayVersion",
+    ],
+    { encoding: "utf8" }
+  );
+  if (out.status !== 0 || !out.stdout) return null;
+  const m = out.stdout.match(/DisplayVersion\s+REG_SZ\s+(\S+)/);
+  return m ? m[1] : null;
+}
+
+async function runWindows(getRelease) {
   const existing = findWindowsExe();
-  if (existing && !REINSTALL) {
+  if (existing && !REINSTALL && shouldLaunchExisting(installedWindowsVersion())) {
     say("launching installed Loomux");
     spawn(existing, [], { detached: true, stdio: "ignore" }).unref();
     return;
   }
 
+  const release = await getRelease();
   const asset = pickAsset(release, /-setup\.exe$/);
   if (!asset) die(`no Windows installer in release ${release.tag_name}`);
 
@@ -206,15 +246,22 @@ async function main() {
   if (typeof fetch !== "function") {
     die("Node 18+ is required (global fetch is unavailable in this runtime)");
   }
-  say("fetching release info");
-  const release = await resolveRelease();
+  // Fetched lazily: launching an up-to-date install never touches the network.
+  let releasePromise = null;
+  const getRelease = () => {
+    if (!releasePromise) {
+      say("fetching release info");
+      releasePromise = resolveRelease();
+    }
+    return releasePromise;
+  };
   switch (process.platform) {
     case "linux":
-      return runLinux(release);
+      return runLinux(getRelease);
     case "darwin":
-      return runMac(release);
+      return runMac(getRelease);
     case "win32":
-      return runWindows(release);
+      return runWindows(getRelease);
     default:
       die(`unsupported platform: ${process.platform}`);
   }
