@@ -329,6 +329,18 @@ export class TasksView {
       top.appendChild(chip);
     }
 
+    // Start: the human's nudge to begin a queued item now. Delivers a prompt
+    // to the orchestrator (which assigns a worker and flips the status then);
+    // shown only on queued items, where starting is meaningful.
+    if (t.status === "queued") {
+      const start = el("button", "task-btn start", "▶ Start") as HTMLButtonElement;
+      start.title = "Tell the orchestrator to begin work on this task now";
+      start.addEventListener("click", () =>
+        void this.mutate(invoke("orch_start_task", { groupId: this.groupId, id: t.id }))
+      );
+      top.appendChild(start);
+    }
+
     // Merge-gate actions: the human's approve / request-changes touchpoints,
     // shown only where they belong — on items awaiting the merge decision.
     if (t.status === "pr" || t.status === "human-testing") {

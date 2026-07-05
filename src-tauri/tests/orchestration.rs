@@ -721,6 +721,68 @@ fn merge_gate_actions_are_guarded_to_gate_statuses() {
     assert!(reg.approve_task(&g.id, &t.id).is_err(), "a done item is past the gate");
 }
 
+#[test]
+fn start_records_note_and_leaves_status_queued() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let t = reg.upsert_task(&g.id, "orch-1", None, patch(Some("Ship the parser"), None, None)).unwrap();
+    // Starting is the human's nudge: a human-attributed note is recorded, but
+    // the status deliberately stays queued — the orchestrator flips it to
+    // in-progress when it actually assigns a worker.
+    let after = reg.start_task(&g.id, &t.id).unwrap();
+    assert_eq!(after.status, "queued", "start must not flip the status itself");
+    let note = after.notes.last().unwrap();
+    assert_eq!(note.author, "human");
+    assert!(note.text.contains("Started"), "the nudge must be auditable on the board");
+}
+
+#[test]
+fn start_is_guarded_to_queued_items() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let t = reg.upsert_task(&g.id, "orch-1", None, patch(Some("Ship it"), None, None)).unwrap();
+    // An unknown id is an error, not a silent no-op.
+    assert!(reg.start_task(&g.id, "t-999").is_err());
+    // Every non-queued status must refuse, and refuse without mutating.
+    for status in ["in-progress", "review", "pr", "human-testing", "done", "blocked"] {
+        reg.upsert_task(&g.id, "orch-1", Some(&t.id), patch(None, Some(status), None)).unwrap();
+        let before = reg.tasks(&g.id)[0].notes.len();
+        assert!(reg.start_task(&g.id, &t.id).is_err(), "cannot start a {status} item");
+        assert_eq!(reg.tasks(&g.id)[0].notes.len(), before, "a refused start must not leave a note");
+    }
+    // Back to queued, it's allowed again.
+    reg.upsert_task(&g.id, "orch-1", Some(&t.id), patch(None, Some("queued"), None)).unwrap();
+    assert!(reg.start_task(&g.id, &t.id).is_ok(), "queued is startable");
+}
+
+#[test]
+fn start_delivers_to_the_orchestrator() {
+    // Mirrors the steering resolution/audit test: a paused group makes delivery
+    // record a suppression audit (reachable without a real PTY) whose `to` names
+    // the resolved target. Starting a queued item must deliver to the
+    // ORCHESTRATOR (not the worker), attributed to `human`, with the id/title in
+    // the prompt.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let t = reg.upsert_task(&g.id, "orch-1", None, patch(Some("Ship the parser"), None, None)).unwrap();
+
+    reg.pause_group(&g.id).unwrap();
+    reg.start_task(&g.id, &t.id).unwrap();
+
+    let entries = reg.audit_log(&g.id);
+    let sup = entries
+        .iter()
+        .find(|e| e.action == "prompt-suppressed-paused")
+        .expect("the start nudge must reach delivery");
+    assert_eq!(sup.actor, "human", "start must be attributed to the human");
+    assert_eq!(sup.detail["to"], orch.id, "start must resolve to the orchestrator, not the worker");
+    let text = sup.detail["text"].as_str().unwrap();
+    assert!(text.contains(&t.id) && text.contains("Ship the parser"), "prompt must name the task");
+    assert!(text.contains("started"), "prompt must tell the orchestrator to begin work");
+}
+
 // ---------- review-round regression tests ----------
 
 #[test]

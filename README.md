@@ -225,6 +225,13 @@ delete tasks; the orchestrator is notified of your edits and maintains the
 same board through its tools. Issue and PR chips are **clickable** — they open
 in your browser.
 
+**Start:** a `queued` item shows a **▶ Start** button — your nudge to have the
+orchestrator begin work on it now. Clicking it records a human note on the task
+and delivers a *begin work* prompt to the orchestrator pane (same delivery path
+as the merge-gate buttons). It deliberately leaves the status at `queued`: the
+orchestrator flips it to `in-progress` when it actually assigns a worker, so the
+board reflects real assignment rather than intent.
+
 **Merge gate:** when an item reaches `pr` or `human-testing` — the point where
 only you can decide — the board shows two buttons instead of making you type
 into the orchestrator. **✓ Approve** marks the item done and tells the
