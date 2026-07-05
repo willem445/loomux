@@ -110,6 +110,13 @@ export const notifyEnabled = (groupId: string): Promise<boolean> =>
 export const setNotify = (groupId: string, enabled: boolean): Promise<void> =>
   invoke("orch_set_notify", { groupId, enabled });
 
+/** Change a group's max live-agent cap on the fly (bounds-checked backend-side,
+ *  durable, audited). Resolves to the applied value; rejects with the backend
+ *  error string on an out-of-range value or unknown group. Lowering below the
+ *  current live count blocks new spawns until attrition — it kills no one. */
+export const setMaxAgents = (groupId: string, maxAgents: number): Promise<number> =>
+  invoke<number>("orch_set_max_agents", { groupId, maxAgents });
+
 async function openAgentPane(
   grid: Grid,
   paneEvents: PaneEvents,
@@ -319,6 +326,12 @@ export interface AgentSummary {
 export interface GroupSummary {
   group: string;
   live_agents: number;
+  /** Current adjustable live-agent cap (guardrail), or null if the group is
+   *  unknown to the registry. Drives the GroupView stepper. */
+  max_agents: number | null;
+  /** Live workers + reviewers (what counts against `max_agents`; the
+   *  orchestrator is exempt). Lowering the cap below this blocks new spawns. */
+  live_delegates: number;
   paused: boolean;
   /** Group uptime (from the earliest live agent), or null if none are live. */
   uptime_ms: number | null;

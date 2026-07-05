@@ -986,6 +986,32 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   padding: 8px 12px; border-bottom: 1px solid var(--border-soft);
 }
 .group-line { color: var(--text); font-weight: 500; }
+
+/* -- max live-agent cap stepper -- */
+.group-maxrow {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap; flex: none;
+  padding: 6px 12px; border-bottom: 1px solid var(--border-soft);
+}
+.group-max { display: inline-flex; align-items: center; gap: 6px; }
+.group-max-label { color: var(--text-dim); font-size: 11px; }
+.group-max-step {
+  font: inherit; font-size: 13px; line-height: 1; cursor: pointer;
+  background: var(--panel-2); color: var(--text);
+  border: 1px solid var(--border-soft); border-radius: 5px;
+  width: 22px; height: 22px; display: inline-flex; align-items: center; justify-content: center;
+}
+.group-max-step:hover { border-color: var(--accent); }
+.group-max-step:disabled { opacity: 0.4; cursor: default; border-color: var(--border-soft); }
+.group-max-input {
+  font: inherit; font-size: 12px; text-align: center; width: 40px;
+  background: var(--panel-2); color: var(--text);
+  border: 1px solid var(--border-soft); border-radius: 5px; padding: 2px 4px;
+}
+.group-max-input:focus { outline: none; border-color: var(--accent); }
+.group-max-input:disabled { opacity: 0.5; }
+.group-max-note { color: var(--text-dim); font-size: 10px; }
+.group-max-note.warn { color: #e0af68; }
+.group-max-err { color: var(--danger); font-size: 10px; }
 .group-cost { color: var(--text-dim); font-size: 11px; }
 .group-cost-live { color: var(--text-dim); font-size: 10px; opacity: 0.75; }
 .group-paused-badge {

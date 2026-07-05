@@ -34,6 +34,13 @@ const REVIEWER_TPL: &str = include_str!("templates/reviewer.md");
 
 /// Hard ceiling on `max_agents` regardless of what the launcher asks for.
 const MAX_AGENTS_CEILING: u32 = 12;
+
+/// One-line notice delivered to the orchestrator when the live-agent cap
+/// changes mid-session, so it re-plans against the new ceiling (its kickoff
+/// prompt still carries the old, already-rendered {{MAX_AGENTS}}).
+pub fn max_agents_notice(from: u32, to: u32) -> String {
+    format!("[loomux] max live agents changed {from}→{to} — re-plan accordingly")
+}
 /// Upper bound on the idle-worker auto-kill timeout (24h); 0 disables it.
 const MAX_IDLE_KILL_MINUTES: u32 = 1440;
 /// Upper bound on the spawn-rate guardrail; 0 = unlimited.
@@ -1997,6 +2004,54 @@ impl OrchRegistry {
         Ok(())
     }
 
+    /// Adjust a live group's max live-agent cap on the fly. Bounds are the
+    /// launcher's `1..=MAX_AGENTS_CEILING`. The new value is written to the
+    /// in-memory guardrail (which `spawn_agent` reads fresh on every spawn, so
+    /// it takes effect immediately — nothing caches the creation-time number)
+    /// and persisted to group.json so a restart keeps it, then the change is
+    /// audited and announced to the orchestrator pane. Lowering the cap below
+    /// the current live count kills nobody: new spawns are simply refused until
+    /// attrition brings the count back under the cap. Returns the new value.
+    /// A no-op change (`n` already the current cap) short-circuits without a
+    /// second write, audit, or notice. `actor` records who made the change.
+    pub fn set_max_agents(&self, group: &str, n: u32, actor: &str) -> Result<u32, String> {
+        if !(1..=MAX_AGENTS_CEILING).contains(&n) {
+            return Err(format!("max agents must be between 1 and {MAX_AGENTS_CEILING}"));
+        }
+        let old = self.group(group).ok_or("unknown group")?.guardrails.max_agents;
+        if n == old {
+            return Ok(n);
+        }
+        // Persist first: a failed disk write must leave the in-memory cap (the
+        // value enforcement reads) unchanged, so the two never disagree.
+        self.persist_max_agents(group, n)?;
+        self.groups
+            .lock_safe()
+            .get_mut(group)
+            .ok_or("unknown group")?
+            .guardrails
+            .max_agents = n;
+        self.audit(group, actor, "max-agents-set", json!({ "from": old, "to": n }));
+        // The orchestrator's kickoff prompt already rendered the old
+        // {{MAX_AGENTS}} into static text; announce the new ceiling so it
+        // re-plans (best-effort — a dead/paused orchestrator just misses it).
+        let _ = self.deliver_to_orchestrator(group, &max_agents_notice(old, n), "loomux");
+        Ok(n)
+    }
+
+    /// Rewrite only `guardrails.max_agents` in group.json, preserving every
+    /// other stored field (created_ms, the other guardrails, and anything a
+    /// later feature adds). Patching the parsed JSON in place — rather than
+    /// reserializing a full GroupInfo — keeps this additive and rebase-clean.
+    fn persist_max_agents(&self, group: &str, n: u32) -> Result<(), String> {
+        let path = self.group_dir(group).join("group.json");
+        let mut v: Value = serde_json::from_str(&fs::read_to_string(&path).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+        v["guardrails"]["max_agents"] = json!(n);
+        fs::write(&path, serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())
+    }
+
     /// Read every agent pane's output counter, last-lines tail, and last human
     /// keystroke time — the raw inputs `attention_tick` needs. Empty without an
     /// app handle (unit tests drive `attention_tick` with synthetic maps).
@@ -2633,6 +2688,11 @@ impl OrchRegistry {
         json!({
             "group": group,
             "live_agents": live.len(),
+            // The current adjustable cap and how many delegates count against
+            // it, so the UI can show the stepper's value and warn when a lower
+            // cap would (harmlessly) block spawns until attrition.
+            "max_agents": self.group(group).map(|g| g.guardrails.max_agents),
+            "live_delegates": worker + reviewer,
             "paused": self.is_paused(group),
             "uptime_ms": earliest.map(|e| now.saturating_sub(e)),
             "roles": { "orchestrator": orch, "worker": worker, "reviewer": reviewer },
@@ -3638,6 +3698,19 @@ pub fn orch_set_notify(
     enabled: bool,
 ) -> Result<(), String> {
     reg.set_notify(&group_id, enabled)
+}
+
+/// Change a live group's max live-agent cap (durable, bounds-checked, audited).
+/// Takes effect on the next spawn; lowering it below the current live count
+/// blocks new spawns until attrition rather than killing anyone. Returns the
+/// applied value. Human action from the GroupView overlay.
+#[tauri::command]
+pub fn orch_set_max_agents(
+    reg: tauri::State<Arc<OrchRegistry>>,
+    group_id: String,
+    max_agents: u32,
+) -> Result<u32, String> {
+    reg.set_max_agents(&group_id, max_agents, "human")
 }
 
 /// Aggregate per-pane session cost/usage into one group summary for the UI.

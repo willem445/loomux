@@ -9,7 +9,7 @@
 use loomux_lib::orchestration::mcp::dispatch;
 use loomux_lib::orchestration::{
     add_trusted_folder, bracketed_paste, cli_ready, create_orchestration_group, hold_until_quiet,
-    idle_should_kill,
+    idle_should_kill, max_agents_notice,
     normalize_remote_web_base, parse_audit_lines, parse_session_cost, prompt_wait_detected,
     resolve_ref_url, rotate_audit_if_needed, spawn_rate_exceeded, strip_ansi,
     watchdog_should_notify, worktree_cleanup_targets, AttentionItem, Caller, Guardrails,
@@ -109,6 +109,135 @@ fn guardrail_clamps_and_sanitizes() {
     .clamped();
     assert_eq!(g.worker_model, "auto");
     assert_eq!(g.orchestrator_model, "auto");
+}
+
+// ---------- #56: adjustable max_agents on the fly ----------
+
+#[test]
+fn set_max_agents_validates_bounds() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    // Below the floor and above the ceiling are refused; the cap is unchanged.
+    assert!(reg.set_max_agents(&g.id, 0, "human").is_err());
+    assert!(reg.set_max_agents(&g.id, 13, "human").is_err());
+    assert_eq!(reg.group(&g.id).unwrap().guardrails.max_agents, 2, "a rejected change must not mutate the cap");
+    // The inclusive bounds 1..=12 are accepted.
+    assert_eq!(reg.set_max_agents(&g.id, 1, "human").unwrap(), 1);
+    assert_eq!(reg.set_max_agents(&g.id, 12, "human").unwrap(), 12);
+    // An unknown group is an error, not a panic.
+    assert!(reg.set_max_agents("no-such-group", 3, "human").is_err());
+}
+
+#[test]
+fn set_max_agents_enforcement_reads_live_value() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap(); // cap 2
+    reg.spawn_agent(&g.id, Role::Worker, "w1", "t", false, None).unwrap();
+    reg.spawn_agent(&g.id, Role::Worker, "w2", "t", false, None).unwrap();
+    // At the cap: a third is refused.
+    assert!(reg.spawn_agent(&g.id, Role::Worker, "w3", "t", false, None).is_err());
+    // Raise the cap live → spawn_agent reads the new value, so the next spawn
+    // succeeds (nothing cached the creation-time number).
+    assert_eq!(reg.set_max_agents(&g.id, 3, "human").unwrap(), 3);
+    reg.spawn_agent(&g.id, Role::Worker, "w3", "t", false, None).unwrap();
+    // Lower it below the live count → new spawns blocked again immediately.
+    assert_eq!(reg.set_max_agents(&g.id, 1, "human").unwrap(), 1);
+    let err = reg.spawn_agent(&g.id, Role::Worker, "w4", "t", false, None).unwrap_err();
+    assert!(err.contains("guardrail"), "a lowered cap must block new spawns, got: {err}");
+}
+
+#[test]
+fn lowering_max_agents_kills_nobody() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap(); // cap 2
+    let w1 = reg.spawn_agent(&g.id, Role::Worker, "w1", "t", false, None).unwrap();
+    let w2 = reg.spawn_agent(&g.id, Role::Worker, "w2", "t", false, None).unwrap();
+    // Drop the cap under the live count: attrition-only, no kills.
+    reg.set_max_agents(&g.id, 1, "human").unwrap();
+    let sum = reg.group_summary(&g.id);
+    assert_eq!(sum["live_agents"].as_u64().unwrap(), 2, "both live workers survive a lowered cap");
+    assert_eq!(sum["max_agents"].as_u64().unwrap(), 1, "summary reflects the new cap");
+    assert_eq!(sum["live_delegates"].as_u64().unwrap(), 2, "summary exposes the count that would block spawns");
+    // Still present and not dead in the roster.
+    for w in [&w1, &w2] {
+        let alive = reg.list_agents(&g.id).as_array().unwrap().iter().any(|a| {
+            a["id"] == json!(w.id) && a["status"] != json!("dead")
+        });
+        assert!(alive, "worker {} must stay alive", w.id);
+    }
+}
+
+#[test]
+fn max_agents_change_survives_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let gid;
+    let path;
+    {
+        let reg = OrchRegistry::new(dir.path().to_path_buf());
+        reg.set_port(45999);
+        let g = reg.create_group("C:/tmp/repo", rails()).unwrap(); // cap 2
+        gid = g.id.clone();
+        path = reg.state_root().join(&g.id).join("group.json");
+        reg.set_max_agents(&g.id, 9, "human").unwrap();
+    }
+    // group.json carries the new cap; unrelated fields are preserved (the
+    // update patches the field in place rather than rewriting the file).
+    let v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(v["guardrails"]["max_agents"].as_u64().unwrap(), 9);
+    assert!(v["created_ms"].as_u64().is_some(), "created_ms must survive the patch");
+    assert_eq!(v["guardrails"]["worker_model"], json!("sonnet"), "other guardrails must survive the patch");
+    // A restart re-attaches from group.json (the restore path reads it and
+    // round-trips it through create_group): the enforced cap is the adjusted
+    // 9, not rails()'s creation-time 2.
+    let reg = OrchRegistry::new(dir.path().to_path_buf());
+    reg.set_port(45999);
+    let restored = Guardrails { max_agents: v["guardrails"]["max_agents"].as_u64().unwrap() as u32, ..rails() };
+    let g = reg.create_group("C:/tmp/repo", restored).unwrap();
+    assert_eq!(g.id, gid, "restart resumes the same group");
+    assert_eq!(g.guardrails.max_agents, 9, "the persisted cap is what the group runs with");
+}
+
+#[test]
+fn max_agents_change_audits_and_notifies_orchestrator() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap(); // cap 2
+    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    // Pause so the notice delivery is suppressed-but-audited (test mode has no
+    // pane to type into) — this lets us observe the exact notice text.
+    reg.pause_group(&g.id).unwrap();
+    reg.set_max_agents(&g.id, 4, "human").unwrap();
+    let log = fs::read_to_string(reg.state_root().join(&g.id).join("audit.jsonl")).unwrap();
+    let events: Vec<Value> = log.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    assert!(
+        events.iter().any(|e|
+            e["action"] == json!("max-agents-set")
+            && e["detail"]["from"] == json!(2) && e["detail"]["to"] == json!(4)
+            && e["actor"] == json!("human")),
+        "the cap change must be audited with from/to and the actor"
+    );
+    assert!(
+        events.iter().any(|e|
+            e["action"] == json!("prompt-suppressed-paused")
+            && e["detail"]["text"].as_str().unwrap_or("").contains("max live agents changed 2→4")),
+        "the orchestrator must receive the cap-change re-plan notice"
+    );
+}
+
+#[test]
+fn setting_same_max_agents_is_a_noop() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap(); // cap 2
+    assert_eq!(reg.set_max_agents(&g.id, 2, "human").unwrap(), 2);
+    let log = fs::read_to_string(reg.state_root().join(&g.id).join("audit.jsonl")).unwrap();
+    assert!(!log.contains("max-agents-set"), "a no-op change must not audit or notify");
+}
+
+#[test]
+fn max_agents_notice_reads_naturally() {
+    assert_eq!(
+        max_agents_notice(4, 2),
+        "[loomux] max live agents changed 4→2 — re-plan accordingly"
+    );
 }
 
 #[test]

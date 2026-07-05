@@ -108,6 +108,7 @@ pub fn run() {
             orchestration::orch_ack_attention_pty,
             orchestration::orch_notify_enabled,
             orchestration::orch_set_notify,
+            orchestration::orch_set_max_agents,
             orchestration::orch_group_usage,
             orchestration::orch_group_summary,
             orchestration::orch_end_group,
