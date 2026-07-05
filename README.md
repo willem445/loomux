@@ -141,6 +141,13 @@ scoped to the repository the shell is currently in — a commit graph, a diff
 preview, and the working-tree changes with staging and commit. It never
 resizes the terminal underneath. Press `Esc` (or ✕) to return.
 
+Drag the divider **between the graph and diff** (or **above the changes
+strip**) to resize those sub-panes — handy for inspecting wide diffs or busy
+branch graphs. Each divider remembers its position across sessions, and neither
+side can be collapsed below a usable minimum. As with the overlay's bottom
+edge, these dividers only redistribute space *inside* the panel; its outer size
+never changes, so the terminal's PTY is never resized.
+
 Toolbar (top-right of the graph):
 
 | Button | Does |
