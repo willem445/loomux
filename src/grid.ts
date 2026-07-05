@@ -12,6 +12,7 @@
 import { Pane, type PaneEvents, type PaneOptions } from "./pane";
 import { dropZoneFor, indicatorFor, zoneToPlacement, type DropZone } from "./layout";
 import { dockChipAttention } from "./attention";
+import { planGroupMinimize } from "./group";
 
 type Dir = "row" | "column";
 
@@ -360,6 +361,89 @@ export class Grid {
     this.setActive(pane);
     pane.focus();
     this.renderDock();
+  }
+
+  // ---------- batch minimize / restore (group fold, #46) ----------
+
+  /** Minimize several panes as one batch: all the tree surgery happens in this
+   *  synchronous pass, so the survivors' ResizeObservers coalesce into a single
+   *  debounced fit each (one relayout, not one per pane) — a 6-pane fold never
+   *  triggers a ConPTY resize storm. Skips unknown/already-docked panes and,
+   *  like `minimize`, never empties the grid. Dock + active pane are refreshed
+   *  once at the end. */
+  minimizeMany(panes: Pane[]): void {
+    if (this.maximized) this.exitMaximize();
+    let changed = false;
+    for (const pane of panes) {
+      const leaf = this.leaves.get(pane);
+      if (!leaf) continue; // not visible (already docked) or unknown
+      if (this.leaves.size <= 1) break; // keep at least one pane in the grid
+      this.leaves.delete(pane);
+      this.removeFromTree(leaf);
+      this.minimizedPanes.push(pane);
+      // Docked panes mirror attention onto their dock chip (see `minimize`).
+      pane.setAttentionListener(() => this.renderDock());
+      if (this.active === pane) this.active = null;
+      changed = true;
+    }
+    if (!changed) return;
+    if (this.active === null) {
+      const next = this.panes()[0];
+      if (next) this.setActive(next);
+    }
+    this.renderDock();
+  }
+
+  /** Restore several docked panes as one batch — the mirror of `minimizeMany`.
+   *  Each lands beside the previously restored one (or the active pane) so the
+   *  group comes back as a coherent cluster; the single synchronous pass keeps
+   *  the fits coalesced. Focus + dock settle once at the end. */
+  restoreMany(panes: Pane[]): void {
+    if (this.maximized) this.exitMaximize();
+    let last: Pane | null = null;
+    for (const pane of panes) {
+      const idx = this.minimizedPanes.indexOf(pane);
+      if (idx < 0) continue; // not docked / unknown
+      this.minimizedPanes.splice(idx, 1);
+      pane.setAttentionListener(null);
+      // Restoring is "turning to" the pane — clear a latched attention report,
+      // same as `restore`.
+      pane.acknowledgeAttention();
+      const leaf: LeafNode = { kind: "leaf", pane, parent: null };
+      this.leaves.set(pane, leaf);
+      pane.el.style.flex = "1 1 0";
+
+      const targetLeaf = this.active ? this.leaves.get(this.active) : undefined;
+      if (!this.root || !targetLeaf) {
+        this.root = leaf;
+        this.rootEl.replaceChildren(pane.el);
+      } else {
+        this.insertBeside(targetLeaf, leaf, "row");
+      }
+      // Seat the next restore beside this one, not back at the orchestrator.
+      this.setActive(pane);
+      last = pane;
+    }
+    if (last) last.focus();
+    this.renderDock();
+  }
+
+  /** The group-fold toggle (#46): fold a whole orchestration group's
+   *  worker/reviewer panes into the dock, or restore them if already folded.
+   *  The orchestrator's own pane is never touched. The visible/docked decision
+   *  and target selection live in the pure `planGroupMinimize`. */
+  toggleGroupMinimize(groupId: string): void {
+    const states = this.allPanes().map((pane) => ({
+      pane,
+      orchGroupId: pane.orchGroupId,
+      orchRole: pane.orchRole,
+      minimized: this.minimizedPanes.includes(pane),
+    }));
+    const plan = planGroupMinimize(states, groupId);
+    if (!plan) return;
+    const targets = plan.targets.map((t) => t.pane);
+    if (plan.action === "minimize") this.minimizeMany(targets);
+    else this.restoreMany(targets);
   }
 
   private renderDock(): void {

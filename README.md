@@ -83,6 +83,9 @@ npm test           # unit tests (Node's built-in runner; no extra deps)
 | Steer orchestrator | `Alt+P` (focus the compose strip under an orchestrator pane); `Esc` returns to the terminal |
 | Copy / paste | `Ctrl+Shift+C` / `Ctrl+Shift+V` (`Ctrl+V` also works) |
 
+A CLI running in a pane (e.g. an agent that says "copied to clipboard") copies
+straight to your system clipboard too, via OSC 52 — no manual re-select needed.
+
 Splitting in the same direction adds a sibling column/row — repeated splits
 form an even matrix instead of a lopsided staircase.
 
@@ -105,6 +108,14 @@ can be rearranged without splitting from scratch:
   the bottom of the grid — it keeps running. Click its chip to bring it back,
   or the chip's ✕ to close it for good. (This is loomux's take on the issue's
   "minimize to tray": an in-app restore dock rather than the OS tray.)
+- **Fold a whole group** — an orchestrator pane has a fold toggle (the stacked
+  panes icon in its header, mirrored in the group lifecycle panel) that
+  minimizes *every* worker/reviewer pane in its group to the dock at once,
+  leaving just the orchestrator. Click it again to restore them all. Handy once
+  a big group has opened a pane per agent and you want the screen back without
+  ✕-clicking or minimizing them one by one. Folded panes behave like any other
+  docked pane — they keep running, still pulse for attention on their dock chip,
+  and can be restored individually.
 
 ### Session browser
 
@@ -232,6 +243,15 @@ delete tasks; the orchestrator is notified of your edits and maintains the
 same board through its tools. Issue and PR chips are **clickable** — they open
 in your browser.
 
+**Start:** a `queued` item shows a **▶ Start** button — your nudge to have the
+orchestrator begin work on it now. Clicking it records a human note on the task
+and delivers a *begin work* prompt to the orchestrator pane (same delivery path
+as the merge-gate buttons). It deliberately leaves the status at `queued`: the
+orchestrator flips it to `in-progress` when it actually assigns a worker, so the
+board reflects real assignment rather than intent. If the group is **paused**,
+Start is refused up front with a toast (resume first) — a paused group's
+delivery is suppressed, so the nudge would otherwise be silently lost.
+
 **Merge gate:** when an item reaches `pr` or `human-testing` — the point where
 only you can decide — the board shows two buttons instead of making you type
 into the orchestrator. **✓ Approve** marks the item done and tells the
@@ -296,6 +316,9 @@ the fly and loomux persists it, audits the change, and drops a one-line notice
 into the orchestrator pane so it re-plans against the new ceiling. Lowering the
 cap below the current live count never kills anyone — it just blocks new spawns
 until agents finish and attrition brings the count back under the cap.
+The panel also carries a **Fold panes** button — the same group-wide
+minimize/restore toggle as the orchestrator header — for reclaiming screen space
+when a group grows large (see [Rearranging panes](#rearranging-panes)).
 
 **Per-task sessions:** each worker is scoped to exactly one work item, and
 loomux records its session id on the roster and task board. Claude ids are

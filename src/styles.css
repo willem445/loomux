@@ -845,8 +845,9 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 }
 .task-chip.link:hover { color: #cdd8f5; text-decoration: underline; }
 
-/* Merge-gate action buttons (approve / request changes). */
-.task-btn.approve, .task-btn.changes {
+/* Merge-gate action buttons (approve / request changes) and the queued-task
+   start button share the same compact pill shape. */
+.task-btn.approve, .task-btn.changes, .task-btn.start {
   flex: none; height: 18px; font-size: 10px; padding: 0 7px;
   border: 1px solid transparent; white-space: nowrap;
 }
@@ -854,6 +855,8 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .task-btn.approve:hover { background: rgba(158, 206, 106, 0.16); border-color: #3d5a2c; }
 .task-btn.changes { color: #e0af68; }
 .task-btn.changes:hover { background: rgba(224, 175, 104, 0.16); border-color: #55452c; }
+.task-btn.start { color: #7dcfff; }
+.task-btn.start:hover { background: rgba(125, 207, 255, 0.16); border-color: #2c485a; }
 
 /* Request-changes modal, scoped inside the task-board overlay. */
 .tasks-dialog {
