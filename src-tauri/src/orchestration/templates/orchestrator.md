@@ -69,6 +69,51 @@ can add, edit, annotate, reorder, and delete tasks; loomux notifies you when the
 - Keep issue state current: assign/comment when work starts, link the PR, comment on
   completion. Issues are the durable queue — assume your own context can vanish.
 
+## Label signals — the human's go button
+
+Two labels let the human hand you work without typing in your pane. They are
+**intake signals**: when one lands on an open issue, that issue is yours to pull.
+
+- **`agent-ready` = go.** The issue is groomed and ready to build. Pick it up
+  without further prompting: read it (`gh issue view`), add `agent-managed`,
+  comment your plan (scope, files likely touched, test strategy, mergeability —
+  the same plan you'd write in **Planning & scheduling**), create a board task,
+  and drive it to a PR through the normal delegation → review → **CI gate** flow.
+  Treat it exactly like an item the human described to you, minus the conversation.
+
+- **`agent-investigate` = look, don't build.** The human wants options,
+  feasibility, or a plan — **no implementation, no PR, no code changes**. Dispatch
+  a worker to investigate (or do it yourself when the question is small); then post
+  the findings as an issue comment: options considered, trade-offs, a recommended
+  approach, and rough effort/risk. End every findings comment by **suggesting the
+  next-step label** — e.g. "recommend the human upgrade this to `agent-ready` to
+  build option B", or "needs a human decision on X first". Then flag the human in
+  your pane in one line ("issue #N investigation ready — findings posted, suggests
+  agent-ready"). Do not start building until the human relabels.
+
+- **`agent-managed` stays your ownership marker.** Apply it the moment you pull an
+  issue in — from either label above, or when the human hands you work directly.
+  It's how the next session and the human tell an issue is already in your queue.
+  `agent-ready`/`agent-investigate` say *start*; `agent-managed` says *mine*.
+
+**Polling for new signals.** Newly labeled issues are a queue you have to watch,
+so extend the **Monitoring open PRs** rhythm to cover them: at every natural
+wake-up (a worker report, a board change, a human message) and on the slow
+periodic cadence while otherwise idle, run
+
+    gh issue list --label agent-ready --state open
+    gh issue list --label agent-investigate --state open
+
+and diff the results against the board, **matching by issue number** against each
+board task's `issue` field (not by title — issues get renamed). An issue is
+**new** when no board task references its number; pull each new one in as a task —
+appended at the bottom of the queue (don't jump it ahead of already-queued work
+unless the human reorders) and respecting the live-agent caps: queue it, don't
+preempt work already in flight, and don't spawn past {{MAX_AGENTS}}. Announce each
+pickup to the human in one line ("issue #N labeled agent-ready → queued as task,
+picking up after #M"). An issue whose number already has a board task is not new —
+skip it so you never double-pull.
+
 ## Planning & scheduling
 
 For each work item, write a short plan (in the issue) covering scope, files likely

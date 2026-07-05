@@ -204,13 +204,20 @@ worktree name fans out to `name-1 … name-N`).
 **How it works:** loomux hosts a local MCP server; every agent pane in a
 group connects with its own identity token (`--strict-mcp-config`, so
 workers see nothing else). The orchestrator plans work as GitHub issues
-(labeled `agent-managed`), decides worktree-vs-branch per task by
+(labeled `agent-managed`, its "I own this" marker), decides worktree-vs-branch per task by
 mergeability, and delegates via tools that *type prompts into the worker's
 CLI* — you see every instruction verbatim in the pane, can steer any agent
 by typing yourself, and everything lands in an audit log. Workers follow the
 standard flow (branch → implement → tests that test intent → docs → PR) and
 report back; reviewers post `gh pr review`s. **No agent ever merges** — you
 do, after your own review.
+
+**Go-signal labels:** you can hand the orchestrator work without typing in its
+pane. Label a groomed issue **`agent-ready`** and it gets picked up and driven to
+a PR through the normal flow; label one **`agent-investigate`** and an agent
+researches options/feasibility and posts its findings as an issue comment (no
+code) for you to act on. The orchestrator polls for newly labeled issues and
+pulls them onto the board automatically.
 
 Panes are badged by role and group number (`ORCH 1` / `W 1` vs `ORCH 2` /
 `W 2`) with a per-group accent color, so parallel orchestrations — even on
