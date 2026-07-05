@@ -10,6 +10,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { Grid } from "./grid";
 import type { PaneEvents, PaneBadge } from "./pane";
+import { panesInGroup } from "./group";
 
 export type OrchRole = "orchestrator" | "worker" | "reviewer";
 
@@ -85,10 +86,12 @@ export function badgeFor(req: OrchSpawnRequest): PaneBadge {
 /** One pane that needs the human, from the backend attention scan. `reason`
  *  is (most→least urgent) "blocked" | "waiting" | "report" | "gate". */
 export interface AttentionItem {
+  /** Empty for a plain (non-orchestration) pane, which is keyed only by pty_id. */
   agent_id: string;
   group: string;
   name: string;
-  role: OrchRole;
+  /** null for a plain pane (no orchestration role). */
+  role: OrchRole | null;
   pty_id: number | null;
   reason: string;
   detail: string;
@@ -147,13 +150,18 @@ export function initOrchestration(grid: Grid, paneEvents: PaneEvents): void {
     }
   });
   // Attention routing: the backend pushes the full current set of panes that
-  // need the human every scan; badge each group pane by its pty (absent =
-  // clear). Idempotent per pane, so re-emits every few seconds are cheap.
+  // need the human every scan; badge each pane by its pty (absent = clear).
+  // Idempotent per pane, so re-emits every few seconds are cheap. Applies to
+  // ALL panes with a pty, not just orchestration agents — a plain shell the
+  // human opened to run a CLI that's now blocked on a prompt must light up too
+  // (#40); the backend emits `waiting` items for those, keyed only by pty_id.
   void listen<AttentionItem[]>("orch-attention", ({ payload }) => {
     const byPty = new Map<number, AttentionItem>();
     for (const it of payload) if (it.pty_id !== null) byPty.set(it.pty_id, it);
-    for (const pane of grid.panes()) {
-      if (!pane.orchGroupId || pane.ptyId === null) continue;
+    // allPanes(), not panes(): a minimized pane still needs the human, and its
+    // dock chip mirrors the state (see Grid.renderDock / #6).
+    for (const pane of grid.allPanes()) {
+      if (pane.ptyId === null) continue;
       const it = byPty.get(pane.ptyId);
       pane.setAttention(it ? it.reason : null, it?.detail);
     }
@@ -162,8 +170,10 @@ export function initOrchestration(grid: Grid, paneEvents: PaneEvents): void {
   // close their (now-dead) panes rather than leaving a screen of dead
   // terminals — the pane-by-pane ✕-clicking this action exists to replace.
   void listen<{ group_id: string }>("orch-group-ended", ({ payload }) => {
-    for (const pane of grid.panes()) {
-      if (pane.orchGroupId === payload.group_id) grid.closePane(pane, false);
+    // allPanes(), not panes(): a minimized group pane must be closed too, or
+    // it would linger in the dock (with a live agent) after its group ends.
+    for (const pane of panesInGroup(grid.allPanes(), payload.group_id)) {
+      grid.closePane(pane, false);
     }
   });
 }
@@ -224,20 +234,51 @@ export async function launchOrchestrator(
 
 // ---------- cost containment: pause/resume + per-group usage ----------
 
-/** One agent's parsed session cost within a group usage summary. */
+/** Token counts for one agent (exact, from its session transcript). */
+export interface UsageTokens {
+  input: number;
+  output: number;
+  cache_creation: number;
+  cache_read: number;
+  total: number;
+}
+
+/** One agent's usage within a group summary. */
 export interface AgentUsage {
   id: string;
   name: string;
   role: string;
-  /** Dollars parsed from the pane statusline, or null if none was visible. */
+  /** Whether this agent is currently live (vs a recycled/killed one that still
+   *  counts toward the lifetime total). */
+  live: boolean;
+  /** `transcript` (token-derived), `statusline` (last-resort CLI parse), or
+   *  `none` (nothing available yet). */
+  source: "transcript" | "statusline" | "none";
+  /** Model the cost was priced against, or null. */
+  model: string | null;
+  /** Dollar cost, or null when only tokens are known (unknown model / no data). */
   cost_usd: number | null;
+  /** true = dollars estimated from the price table; false = reported by the CLI. */
+  estimated: boolean;
+  tokens: UsageTokens;
 }
 
-/** Aggregated per-group cost/usage (backend `orch_group_usage`). */
+/** Aggregated per-group cost/usage (backend `orch_group_usage`), with a live
+ *  vs lifetime split so killed panes still count. */
 export interface GroupUsage {
   group: string;
-  /** Sum across agents with a visible cost, or null if none had one. */
-  total_cost_usd: number | null;
+  cli: string;
+  /** Cost across currently-live agents, or null if none has a figure. */
+  live_cost_usd: number | null;
+  /** Cost across all agents ever in this group (survives kills), or null. */
+  lifetime_cost_usd: number | null;
+  /** How to read the live total: token-`estimated`, CLI-`reported`, or a
+   *  `mixed` blend of both; null when there is no figure. */
+  live_cost_basis: "estimated" | "reported" | "mixed" | null;
+  /** Same, for the lifetime total. */
+  lifetime_cost_basis: "estimated" | "reported" | "mixed" | null;
+  live_tokens: number;
+  lifetime_tokens: number;
   agents: AgentUsage[];
   note: string;
 }

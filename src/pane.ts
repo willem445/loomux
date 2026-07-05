@@ -17,10 +17,15 @@ import {
   ensureOutputRouter,
   attachOutput,
   detachOutput,
+  attachGitWatch,
+  setGitWatch,
+  detachGitWatch,
   ptyBackendInfo,
 } from "./pty";
 import { invoke } from "@tauri-apps/api/core";
 import { isAppShortcut } from "./shortcuts";
+import { attentionPresentation } from "./attention";
+import { openInEditor, editorConfigDialog } from "./editor";
 import { GitView } from "./gitview";
 import { TasksView } from "./tasksview";
 import { AuditView } from "./auditview";
@@ -35,6 +40,9 @@ const GIT_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" st
 // Audit viewer: a clock/history glyph for the group's audit-log timeline.
 const AUDIT_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M2.2 8a5.8 5.8 0 1 1 1.7 4.1"/><path d="M2.2 12.2V8.6H5.8"/><path d="M8 5.2V8l2 1.4"/></svg>`;
 const GROUP_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="3.4" r="1.7"/><circle cx="3.4" cy="11" r="1.7"/><circle cx="12.6" cy="11" r="1.7"/><path d="M8 5.1v3M6.7 9.6 4.5 9.9M9.3 9.6l2.2.3"/></svg>`;
+// "Open in editor": code-brackets glyph. Opens the pane's workspace folder in
+// the user's configured external editor (VS Code, Zed, …).
+const EDITOR_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M6 4.5 2.5 8 6 11.5M10 4.5 13.5 8 10 11.5"/></svg>`;
 
 /** Extract a filesystem path from an OSC 7 payload, which may be a raw path
  *  or a `file://host/path` URL. Returns "" if nothing usable. */
@@ -123,6 +131,10 @@ export interface PaneEvents {
   onFocus: (pane: Pane) => void;
   onCloseRequest: (pane: Pane) => void;
   onSplit: (pane: Pane, dir: "row" | "column") => void;
+  /** Park this pane in the dock (out of the grid, still running). */
+  onMinimize: (pane: Pane) => void;
+  /** Toggle this pane to/from fullscreen over the grid. */
+  onMaximize: (pane: Pane) => void;
 }
 
 export class Pane {
@@ -139,6 +151,9 @@ export class Pane {
   private branchTextEl: HTMLElement;
   /** Latest un-abbreviated directory the shell reported, for the picker. */
   private cwdRaw: string | null = null;
+  /** Directory the external-change git watch is currently pointed at (#36),
+   *  so we only re-issue the backend call when the pane actually changes dir. */
+  private watchedPath: string | null = null;
   /** Lazily created git view; null until the first toggle. */
   private gitView: GitView | null = null;
   private gitDivider: HTMLElement | null = null;
@@ -159,12 +174,18 @@ export class Pane {
   private groupView: GroupView | null = null;
   private groupOverlay: HTMLElement | null = null;
   private groupBtn: HTMLButtonElement;
+  /** Fullscreen toggle; its glyph flips to a restore affordance when active. */
+  private maximizeBtn: HTMLButtonElement;
   private orchGroup: string | null = null;
   private orchAgent: string | null = null;
   /** "needs attention" chip in the header (attention routing #6); hidden until
    *  the backend flags this pane. */
   private attnChip: HTMLButtonElement;
   private attentionReason: string | null = null;
+  private attentionDetail: string | null = null;
+  /** Notified when attention state changes; the grid uses it to keep a
+   *  minimized pane's dock chip in sync. */
+  private attentionListener: (() => void) | null = null;
   /** True for agent/command panes (vs plain shells). */
   private launchedCommand = false;
   private shiftTimer: number | undefined;
@@ -254,6 +275,24 @@ export class Pane {
     });
     header.appendChild(this.groupBtn);
 
+    // Open the pane's workspace folder in the configured external editor.
+    // Left-click opens (prompting for the editor on first use); right-click
+    // reconfigures the editor command.
+    const editorBtn = document.createElement("button");
+    editorBtn.className = "pane-btn";
+    editorBtn.innerHTML = EDITOR_ICON;
+    editorBtn.title = "Open in editor (Alt+E) · right-click to configure";
+    editorBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      void this.openInEditor();
+    });
+    editorBtn.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      void editorConfigDialog().then(() => this.focus());
+    });
+    header.appendChild(editorBtn);
+
     const gitBtn = document.createElement("button");
     gitBtn.className = "pane-btn";
     gitBtn.innerHTML = GIT_ICON;
@@ -264,10 +303,22 @@ export class Pane {
     });
     header.appendChild(gitBtn);
 
+    // Minimize / maximize live next to close: the same window-control cluster
+    // users expect. Maximize keeps a stored ref so its glyph can flip to a
+    // "restore" affordance while fullscreen.
+    this.maximizeBtn = document.createElement("button");
+    this.maximizeBtn.className = "pane-btn";
+    this.maximizeBtn.textContent = "⤢";
+    this.maximizeBtn.title = "Maximize (Ctrl+Shift+M)";
+    this.maximizeBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      this.events.onMaximize(this);
+    });
+
     for (const [glyph, cls, tip, fn] of [
       ["◫", "", "Split right", () => this.events.onSplit(this, "row")],
       ["⬓", "", "Split down", () => this.events.onSplit(this, "column")],
-      ["✕", "close", "Close pane", () => this.events.onCloseRequest(this)],
+      ["—", "", "Minimize to dock (Alt+M)", () => this.events.onMinimize(this)],
     ] as const) {
       const btn = document.createElement("button");
       btn.className = `pane-btn ${cls}`;
@@ -279,6 +330,17 @@ export class Pane {
       });
       header.appendChild(btn);
     }
+    header.appendChild(this.maximizeBtn);
+
+    const closeBtn = document.createElement("button");
+    closeBtn.className = "pane-btn close";
+    closeBtn.textContent = "✕";
+    closeBtn.title = "Close pane";
+    closeBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      this.events.onCloseRequest(this);
+    });
+    header.appendChild(closeBtn);
     this.el.appendChild(header);
 
     this.termEl = document.createElement("div");
@@ -411,6 +473,13 @@ export class Pane {
       // the debounced fit will notice the size drifted and resend once.
       this.applyFit();
       attachOutput(ptyId, (bytes) => this.term.write(bytes));
+      // React to repo changes made outside this pane's shell (#36): the
+      // backend watch is pointed at the repo on each cwd report below.
+      attachGitWatch(ptyId, () => this.onExternalGitChange());
+      if (this.cwdRaw) {
+        this.watchedPath = this.cwdRaw;
+        setGitWatch(ptyId, this.cwdRaw);
+      }
       for (const data of this.inputQueue.splice(0)) {
         writePty(ptyId, data).catch(() => {});
       }
@@ -475,39 +544,57 @@ export class Pane {
     this.titleEl.before(chip);
   }
 
-  /** Short label per attention reason (see the backend `AttentionItem`). */
-  private static ATTN_LABEL: Record<string, string> = {
-    blocked: "⚠ blocked",
-    waiting: "⚠ waiting",
-    report: "✓ reported",
-    gate: "⚑ your call",
-  };
-
   /** Flag (or clear) this pane as needing the human — driven by the backend
    *  attention scan. Idempotent: a same-reason repeat is a no-op, so the 3-second
    *  re-emits don't thrash the DOM. `null` clears the badge. */
   setAttention(reason: string | null, detail?: string): void {
     if (reason === this.attentionReason) return;
     this.attentionReason = reason;
+    this.attentionDetail = reason ? detail ?? null : null;
     if (!reason) {
       this.attnChip.hidden = true;
       this.el.classList.remove("needs-attention");
       delete this.attnChip.dataset.reason;
-      return;
+    } else {
+      const { label } = attentionPresentation(reason);
+      this.attnChip.textContent = label;
+      this.attnChip.title = detail ?? "This pane needs you";
+      this.attnChip.dataset.reason = reason;
+      this.attnChip.hidden = false;
+      this.el.classList.add("needs-attention");
     }
-    this.attnChip.textContent = Pane.ATTN_LABEL[reason] ?? "⚠ attention";
-    this.attnChip.title = detail ?? "This pane needs you";
-    this.attnChip.dataset.reason = reason;
-    this.attnChip.hidden = false;
-    this.el.classList.add("needs-attention");
+    // A minimized pane's element is detached, so its header chip is invisible;
+    // the listener lets the grid mirror this state onto the dock chip.
+    this.attentionListener?.();
   }
 
-  /** The human is now on this pane: clear a latched report backend-side so its
-   *  badge drops. Live reasons (waiting/gate) are recomputed and reappear only
-   *  if still true. */
-  private acknowledgeAttention(): void {
-    if (!this.attentionReason || !this.orchAgent) return;
-    invoke("orch_ack_attention", { agentId: this.orchAgent }).catch(() => {});
+  /** Current needs-attention state, or null. Lets the grid render an equivalent
+   *  badge on the dock chip while this pane is minimized (its header is out of
+   *  the DOM). */
+  get attention(): { reason: string; label: string; urgent: boolean; detail: string | null } | null {
+    if (!this.attentionReason) return null;
+    const { label, urgent } = attentionPresentation(this.attentionReason);
+    return { reason: this.attentionReason, label, urgent, detail: this.attentionDetail };
+  }
+
+  /** Register a callback fired whenever the attention state changes — used by
+   *  the grid to refresh the dock chip of a minimized pane. */
+  setAttentionListener(fn: (() => void) | null): void {
+    this.attentionListener = fn;
+  }
+
+  /** The human is now on this pane: acknowledge its attention backend-side so
+   *  the badge drops and (for `waiting`) stays down until the prompt changes.
+   *  Agent panes ack by agent id; a plain pane (no agent identity) acks by its
+   *  pty id (#40). Public so restoring a docked pane clears it the same way
+   *  turning to a pane does. */
+  acknowledgeAttention(): void {
+    if (!this.attentionReason) return;
+    if (this.orchAgent) {
+      invoke("orch_ack_attention", { agentId: this.orchAgent }).catch(() => {});
+    } else if (this.ptyId !== null) {
+      invoke("orch_ack_attention_pty", { ptyId: this.ptyId }).catch(() => {});
+    }
   }
 
   /** Handle an OSC 7 working-directory report from the shell. Payloads are
@@ -519,9 +606,23 @@ export class Pane {
     const path = normalizeOscPath(payload);
     if (!path) return;
     this.cwdRaw = path;
+    // Repoint the external-change watch when the directory changes (#36); the
+    // backend dedupes same-repo calls so cd-within-a-repo is a no-op there.
+    if (path !== this.watchedPath && this.ptyId !== null) {
+      this.watchedPath = path;
+      setGitWatch(this.ptyId, path);
+    }
     // Refresh even when the path is unchanged: the *branch* can change
     // without a cd (git checkout), and dir_info is cheap.
     void this.refreshDir(path);
+  }
+
+  /** The backend saw this pane's repo change on disk (an external checkout /
+   *  commit / stage). Drive the same refresh a shell prompt would: the git
+   *  view (throttled) and the header branch chip. */
+  private onExternalGitChange(): void {
+    this.gitView?.notifyPrompt();
+    if (this.cwdRaw) void this.refreshDir(this.cwdRaw);
   }
 
   /** Toggle the git view. It FLOATS over the top of the terminal — the
@@ -690,6 +791,14 @@ export class Pane {
     }
   }
 
+  /** Open this pane's workspace folder in the configured external editor.
+   *  Prompts for the editor command on first use; errors surface as a toast.
+   *  Uses the shell-reported cwd, falling back to the startup directory. */
+  async openInEditor(): Promise<void> {
+    await openInEditor(this.cwdRaw);
+    this.focus(); // return focus to the terminal after any dialog
+  }
+
   /** The orchestration group this pane belongs to, if any (for group-wide
    *  actions like end-orchestration closing every pane in the group). */
   get orchGroupId(): string | null {
@@ -822,6 +931,22 @@ export class Pane {
     this.el.classList.toggle("active", active);
   }
 
+  /** Reflect fullscreen state: the `.maximized` class drives the CSS overlay
+   *  (no PTY resize is forced — the pane genuinely changes size, so its own
+   *  ResizeObserver issues at most one debounced fit) and the button glyph
+   *  flips between maximize and restore. */
+  setMaximized(on: boolean): void {
+    this.el.classList.toggle("maximized", on);
+    this.maximizeBtn.textContent = on ? "⤡" : "⤢";
+    this.maximizeBtn.title = on ? "Restore (Ctrl+Shift+M)" : "Maximize (Ctrl+Shift+M)";
+  }
+
+  /** Group accent color, if this pane carries an orchestration badge — used to
+   *  tint its chip in the minimize dock. */
+  get accentColor(): string | null {
+    return this.el.style.getPropertyValue("--group-color").trim() || null;
+  }
+
   focus(): void {
     this.term.focus();
   }
@@ -839,6 +964,7 @@ export class Pane {
     this.groupView?.dispose();
     if (this.ptyId !== null) {
       detachOutput(this.ptyId);
+      detachGitWatch(this.ptyId);
       if (killBackend) killPty(this.ptyId).catch(() => {});
     }
     this.term.dispose();

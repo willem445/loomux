@@ -127,3 +127,43 @@ export function detachOutput(id: number): void {
 
 export const onPtyExit = (handler: (exit: PtyExit) => void): Promise<UnlistenFn> =>
   listen<PtyExit>("pty-exit", (event) => handler(event.payload));
+
+// ---------- git external-change watcher (#36) ----------
+//
+// The backend polls the `.git` metadata of every repo with an open pane and
+// emits "git-changed" with the pane's pty id when HEAD/index/refs move — i.e.
+// a checkout/commit/stage run outside the pane's shell (VS Code, another
+// terminal). One shared listener demultiplexes to per-pane handlers, mirroring
+// the output router above.
+
+type GitChangeHandler = () => void;
+
+const gitChangeHandlers = new Map<number, GitChangeHandler>();
+let gitWatchRouter: Promise<void> | null = null;
+
+function ensureGitWatchRouter(): Promise<void> {
+  gitWatchRouter ??= listen<{ id: number }>("git-changed", (event) => {
+    gitChangeHandlers.get(event.payload.id)?.();
+  }).then(() => undefined);
+  return gitWatchRouter;
+}
+
+/** Register `handler` to fire when pane `id`'s repository changes on disk. Call
+ *  once per pane; use setGitWatch to (re)point it at the current cwd. */
+export function attachGitWatch(id: number, handler: GitChangeHandler): void {
+  gitChangeHandlers.set(id, handler);
+  void ensureGitWatchRouter();
+}
+
+/** Start (or repoint) pane `id`'s backend watch at the repo containing `cwd`.
+ *  Idempotent and cheap; the backend dedupes same-repo calls, so it's safe to
+ *  call on every prompt. A cwd outside any repo drops the watch. */
+export function setGitWatch(id: number, cwd: string): void {
+  invoke("git_watch", { id, cwd }).catch(() => {});
+}
+
+/** Stop watching pane `id` and drop its handler (called on pane dispose). */
+export function detachGitWatch(id: number): void {
+  gitChangeHandlers.delete(id);
+  invoke("git_unwatch", { id }).catch(() => {});
+}

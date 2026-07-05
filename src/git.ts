@@ -19,6 +19,13 @@ export interface CommitInfo {
   refs: RefInfo[];
 }
 
+export interface BranchInfo {
+  name: string;
+  kind: "local" | "remote";
+  /** True for the currently checked-out branch. */
+  current: boolean;
+}
+
 export interface FileEntry {
   path: string;
   /** Original path for renames/copies. */
@@ -77,3 +84,43 @@ export const gitDiscard = (repo: string, path: string, untracked: boolean): Prom
  *  created if needed). Resolves to the worktree's absolute path. */
 export const gitWorktreeAdd = (repo: string, name: string): Promise<string> =>
   invoke("git_worktree_add", { repo, name });
+
+// -- remote & history ops --
+
+/** Fetch + prune from remotes (no-op on a repo with no remote configured). */
+export const gitFetch = (repo: string, remote?: string): Promise<void> =>
+  invoke("git_fetch", { repo, remote: remote ?? null });
+
+/** Push the current branch. `setUpstream` publishes it to the first remote and
+ *  sets tracking; otherwise a plain push (needs an upstream already set). */
+export const gitPush = (repo: string, setUpstream: boolean): Promise<void> =>
+  invoke("git_push", { repo, setUpstream });
+
+/** Fast-forward-only pull — fails (never merges) when the branch has diverged. */
+export const gitPull = (repo: string): Promise<void> => invoke("git_pull", { repo });
+
+export const gitTag = (repo: string, name: string, hash: string): Promise<void> =>
+  invoke("git_tag", { repo, name, hash });
+
+export const gitBranchCreate = (
+  repo: string,
+  name: string,
+  hash: string,
+  checkout: boolean
+): Promise<void> => invoke("git_branch_create", { repo, name, hash, checkout });
+
+export const gitCherryPick = (repo: string, hash: string): Promise<void> =>
+  invoke("git_cherry_pick", { repo, hash });
+
+export const gitRevert = (repo: string, hash: string): Promise<void> =>
+  invoke("git_revert", { repo, hash });
+
+export const gitMerge = (repo: string, refname: string): Promise<void> =>
+  invoke("git_merge", { repo, refname });
+
+export const gitRebase = (repo: string, upstream: string): Promise<void> =>
+  invoke("git_rebase", { repo, upstream });
+
+/** All local and remote-tracking branches (for the checkout menu). */
+export const gitBranches = (repo: string): Promise<BranchInfo[]> =>
+  invoke("git_branches", { repo });

@@ -1,0 +1,8 @@
+The file picker is fully keyboard-driven: Use arrow keys to move
+between entries, and Press Enter to select the highlighted file.
+It mirrors how fzf and most TUIs behave.
+
+╭──────────╮
+│ > [2mTry "run the tests"[0m                      │
+╰──────────╯
+  [2m? for shortcuts[0m

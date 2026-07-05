@@ -12,10 +12,10 @@ use loomux_lib::orchestration::{
     normalize_remote_web_base, parse_audit_lines, parse_session_cost, prompt_wait_detected,
     resolve_ref_url, rotate_audit_if_needed, spawn_rate_exceeded, strip_ansi,
     watchdog_should_notify, worktree_cleanup_targets, AttentionItem, Caller, Guardrails,
-    OrchRegistry, Role, TaskPatch,
+    OrchRegistry, Role, TaskPatch, UsageSnapshot,
 };
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::time::Duration;
@@ -1483,6 +1483,393 @@ fn prompt_wait_detected_spots_prompts_not_chatter() {
     assert!(!prompt_wait_detected(""));
 }
 
+// Captured/synthetic terminal output (with real ANSI + box drawing) for the
+// interactive-question repro from issue #40. Fed through `strip_ansi` exactly as
+// the live attention scan does, so the fixtures exercise the whole detection
+// pipeline, not a pre-cleaned string.
+const FIX_CLAUDE_ASK: &str = include_str!("fixtures/attention/claude-askuserquestion.txt");
+const FIX_COPILOT_ASK: &str = include_str!("fixtures/attention/copilot-question.txt");
+const FIX_STREAMING: &str = include_str!("fixtures/attention/streaming-output.txt");
+const FIX_IDLE_BOX: &str = include_str!("fixtures/attention/idle-input-box.txt");
+// Finished-turn agent output that *mentions* interactive-UI cues but is not a
+// live prompt (#40 review false-positive repro): keyboard-nav prose, a pasted
+// shell prompt whose glyph is `❯`, and a `›` UI breadcrumb — each followed by
+// the CLI's redrawn idle input box.
+const FIX_FP_PROSE: &str = include_str!("fixtures/attention/fp-prose-arrow-keys.txt");
+const FIX_FP_SHELL: &str = include_str!("fixtures/attention/fp-shell-prompt-glyph.txt");
+const FIX_FP_BREADCRUMB: &str = include_str!("fixtures/attention/fp-breadcrumb-separator.txt");
+// A leading ❯/›/→ in finished-turn prose above the idle box: repro steps that
+// lead with a shell `❯` glyph, and a fenced ❯ command block. The pointer leads
+// the line but is not in the last painted lines, so it must NOT flag (#40 review
+// residual). Contrast with pos-pointer-last-line, where the pointer *is* the
+// last thing painted — a genuine prompt-wait positive.
+const FIX_FP_LEADING_PTR: &str = include_str!("fixtures/attention/fp-leading-pointer-prose.txt");
+const FIX_FP_FENCED_PTR: &str = include_str!("fixtures/attention/fp-fenced-pointer-block.txt");
+const FIX_POS_PTR_LAST: &str = include_str!("fixtures/attention/pos-pointer-last-line.txt");
+
+#[test]
+fn prompt_wait_detected_fires_on_interactive_question_fixtures() {
+    // #40: a Claude Code AskUserQuestion menu highlights the active option with
+    // reverse-video SGR (stripped away), leaving numbered options with arbitrary
+    // labels and an "Enter to select" footer — no selection glyph survives.
+    assert!(
+        prompt_wait_detected(&strip_ansi(FIX_CLAUDE_ASK.as_bytes())),
+        "AskUserQuestion menu must be recognized as needing the human"
+    );
+    // #40: a Copilot CLI question draws its `❯` pointer indented inside a box, so
+    // the option line never *starts* with the pointer after trimming.
+    assert!(
+        prompt_wait_detected(&strip_ansi(FIX_COPILOT_ASK.as_bytes())),
+        "Copilot boxed selection prompt must be recognized as needing the human"
+    );
+    // #40 review: a plain inquirer confirm whose `❯` pointer IS the last thing
+    // painted (no footer / no y-n token) must still flag — proving the anchored
+    // pointer signal fires when the menu really is on screen.
+    assert!(
+        prompt_wait_detected(&strip_ansi(FIX_POS_PTR_LAST.as_bytes())),
+        "a pointer as the last painted line is a genuine prompt-wait"
+    );
+}
+
+#[test]
+fn prompt_wait_detected_ignores_quiet_non_prompts() {
+    // Ordinary streaming output — even when it ends on a numbered summary list —
+    // is not a selection menu, or we'd get a false-positive storm.
+    assert!(
+        !prompt_wait_detected(&strip_ansi(FIX_STREAMING.as_bytes())),
+        "a quiet numbered summary must not be mistaken for a selection menu"
+    );
+    // A CLI idling at its empty input box (turn finished, no question asked) must
+    // not be flagged — otherwise every parked pane lights up.
+    assert!(
+        !prompt_wait_detected(&strip_ansi(FIX_IDLE_BOX.as_bytes())),
+        "an idle input box is not an interactive question"
+    );
+}
+
+#[test]
+fn prompt_wait_detected_ignores_finished_turn_prose_about_ui() {
+    // #40 review: finished-turn agent output that *describes* keyboard UIs, pastes
+    // a `❯` shell prompt, or echoes a `›` breadcrumb must NOT flag once the CLI's
+    // idle input box has redrawn below it. These flagged before the fix — the new
+    // signals are anchored (pointer must lead a line; footer read from the last
+    // few lines only), so the phrases/glyphs now fall out of range.
+    for (name, fixture) in [
+        ("keyboard-nav prose", FIX_FP_PROSE),
+        ("pasted ❯ shell prompt", FIX_FP_SHELL),
+        ("› UI breadcrumb", FIX_FP_BREADCRUMB),
+        ("leading ❯ repro steps", FIX_FP_LEADING_PTR),
+        ("fenced ❯ command block", FIX_FP_FENCED_PTR),
+    ] {
+        assert!(
+            !prompt_wait_detected(&strip_ansi(fixture.as_bytes())),
+            "{name}: finished-turn prose must not be mistaken for a live prompt"
+        );
+    }
+}
+
+#[test]
+fn attention_flags_a_pane_parked_on_a_question_fixture() {
+    // End-to-end through attention_tick with a real captured Copilot question:
+    // once the pane's output is quiet past the window and unattended, it must
+    // surface as `waiting` — and carry the pty_id the pane header indicator and
+    // the #26/#31 dock-tab dot both key off.
+    let (reg, _d, _g, wid) = attention_setup();
+    let now = 1_000_000_000_000u64;
+    let out: HashMap<String, u64> = [(wid.clone(), 512u64)].into_iter().collect();
+    let tail: HashMap<String, String> =
+        [(wid.clone(), strip_ansi(FIX_COPILOT_ASK.as_bytes()))].into_iter().collect();
+    let no_input = HashMap::new();
+
+    // Debounced on first sighting (the menu may still be painting).
+    let first = reg.attention_tick(now, &out, &tail, &no_input);
+    assert!(first.iter().all(|i| i.reason != "waiting"), "first quiet tick is debounced");
+
+    // Stable past the quiet window → the pane needs the human.
+    let waited = reg.attention_tick(now + 5000, &out, &tail, &no_input);
+    let item = waited
+        .iter()
+        .find(|i| i.agent_id == wid && i.reason == "waiting")
+        .expect("a quiet pane parked on a question must be flagged");
+    assert_eq!(
+        item.pty_id,
+        reg.agent(&wid).unwrap().pty_id,
+        "the attention item must carry the pane's pty_id for the header + dock-tab dot"
+    );
+}
+
+#[test]
+fn attention_does_not_flag_streaming_or_idle_fixtures() {
+    // The two negatives, driven all the way through attention_tick: neither a
+    // quiet stream of ordinary output nor an idle input box may raise `waiting`,
+    // even long after they've gone quiet.
+    let (reg, _d, _g, wid) = attention_setup();
+    let now = 1_000_000_000_000u64;
+    let out: HashMap<String, u64> = [(wid.clone(), 256u64)].into_iter().collect();
+    let no_input = HashMap::new();
+    for fixture in [
+        FIX_STREAMING,
+        FIX_IDLE_BOX,
+        FIX_FP_PROSE,
+        FIX_FP_SHELL,
+        FIX_FP_BREADCRUMB,
+        FIX_FP_LEADING_PTR,
+        FIX_FP_FENCED_PTR,
+    ] {
+        let tail: HashMap<String, String> =
+            [(wid.clone(), strip_ansi(fixture.as_bytes()))].into_iter().collect();
+        reg.attention_tick(now, &out, &tail, &no_input);
+        let later = reg.attention_tick(now + 60_000, &out, &tail, &no_input);
+        assert!(
+            later.iter().all(|i| i.reason != "waiting"),
+            "ordinary/idle/prose output must not raise attention, got: {later:?}"
+        );
+    }
+}
+
+#[test]
+fn plain_pane_parked_on_a_question_flags_waiting_by_pty() {
+    // #40 (human repro): a plain pane the human opened by hand — no orchestration
+    // agent/group — running a CLI that's now parked on a question must flag
+    // `waiting`, keyed only by its pty id (empty agent_id, no role).
+    let (reg, _d, _g, _w) = attention_setup();
+    let now = 1_000_000_000_000u64;
+    let pty = 77u32;
+    let out: HashMap<u32, u64> = [(pty, 512u64)].into_iter().collect();
+    let tail: HashMap<u32, String> =
+        [(pty, strip_ansi(FIX_CLAUDE_ASK.as_bytes()))].into_iter().collect();
+    let no_input = HashMap::new();
+    let no_agents = HashSet::new();
+
+    // Debounced on first sighting, then flags once quiet past the window.
+    let first = reg.plain_pane_attention(now, &out, &tail, &no_input, &no_agents);
+    assert!(first.iter().all(|i| i.reason != "waiting"), "first quiet tick is debounced");
+    let waited = reg.plain_pane_attention(now + 5000, &out, &tail, &no_input, &no_agents);
+    let item = waited
+        .iter()
+        .find(|i| i.pty_id == Some(pty) && i.reason == "waiting")
+        .expect("a plain pane parked on a question must be flagged");
+    assert!(item.agent_id.is_empty(), "a plain pane has no agent identity");
+    assert!(item.role.is_none(), "a plain pane has no orchestration role");
+}
+
+#[test]
+fn plain_pane_scan_skips_agent_ptys_and_quiet_non_prompts() {
+    // A pty that belongs to a registered agent is handled by attention_tick, so
+    // the plain scan must skip it (no double-flag). And ordinary/idle/prose
+    // output on a plain pane must not flag.
+    let (reg, _d, _g, _w) = attention_setup();
+    let now = 1_000_000_000_000u64;
+    let agent_pty = 5u32;
+    let out: HashMap<u32, u64> = [(agent_pty, 100u64)].into_iter().collect();
+    let tail: HashMap<u32, String> =
+        [(agent_pty, strip_ansi(FIX_CLAUDE_ASK.as_bytes()))].into_iter().collect();
+    let agents: HashSet<u32> = [agent_pty].into_iter().collect();
+    reg.plain_pane_attention(now, &out, &tail, &HashMap::new(), &agents);
+    assert!(
+        reg.plain_pane_attention(now + 60_000, &out, &tail, &HashMap::new(), &agents)
+            .is_empty(),
+        "an agent's pty must not be double-flagged by the plain scan"
+    );
+
+    let no_agents = HashSet::new();
+    for fixture in [FIX_STREAMING, FIX_IDLE_BOX, FIX_FP_PROSE] {
+        let pty = 9u32;
+        let out: HashMap<u32, u64> = [(pty, 100u64)].into_iter().collect();
+        let tail: HashMap<u32, String> =
+            [(pty, strip_ansi(fixture.as_bytes()))].into_iter().collect();
+        reg.plain_pane_attention(now, &out, &tail, &HashMap::new(), &no_agents);
+        assert!(
+            reg.plain_pane_attention(now + 60_000, &out, &tail, &HashMap::new(), &no_agents)
+                .iter()
+                .all(|i| i.reason != "waiting"),
+            "ordinary/idle/prose on a plain pane must not flag"
+        );
+    }
+}
+
+#[test]
+fn plain_pane_waiting_ack_by_pty_sticks_until_output_changes() {
+    // Turning to a plain pane (ack by pty) must make the ack stick until the pane
+    // repaints, mirroring the agent path.
+    let (reg, _d, _g, _w) = attention_setup();
+    let now = 1_000_000_000_000u64;
+    let pty = 12u32;
+    let out: HashMap<u32, u64> = [(pty, 100u64)].into_iter().collect();
+    let tail: HashMap<u32, String> =
+        [(pty, strip_ansi(FIX_CLAUDE_ASK.as_bytes()))].into_iter().collect();
+    let no_input = HashMap::new();
+    let no_agents = HashSet::new();
+
+    reg.plain_pane_attention(now, &out, &tail, &no_input, &no_agents);
+    assert_eq!(
+        reg.plain_pane_attention(now + 5000, &out, &tail, &no_input, &no_agents)
+            .iter()
+            .filter(|i| i.pty_id == Some(pty) && i.reason == "waiting")
+            .count(),
+        1,
+        "a quiet plain pane on a menu flags waiting"
+    );
+
+    reg.ack_attention_pty(pty);
+    assert!(
+        reg.plain_pane_attention(now + 8000, &out, &tail, &no_input, &no_agents)
+            .iter()
+            .all(|i| i.reason != "waiting"),
+        "ack by pty must stick while the same menu is on screen"
+    );
+
+    // Repaint (menu answered / new prompt) re-arms.
+    let grew: HashMap<u32, u64> = [(pty, 200u64)].into_iter().collect();
+    reg.plain_pane_attention(now + 9000, &grew, &tail, &no_input, &no_agents);
+    assert_eq!(
+        reg.plain_pane_attention(now + 14_000, &grew, &tail, &no_input, &no_agents)
+            .iter()
+            .filter(|i| i.pty_id == Some(pty) && i.reason == "waiting")
+            .count(),
+        1,
+        "a fresh prompt after the plain pane repainted flags again"
+    );
+}
+
+#[test]
+fn attention_scan_surfaces_plain_panes_without_double_covering_agents() {
+    // #40 review: exercise run_attention's merge wiring (the layer where the
+    // scope bug lived) — attention_scan combines the roster scan with the
+    // plain-pane scan. A plain pty parked on a menu must surface (keyed only by
+    // pty), and an agent-owned pty must NOT be double-covered by the plain pass.
+    let (reg, _d, _g, _w) = attention_setup();
+    let now = 1_000_000_000_000u64;
+    let no_agent_in: HashMap<String, u64> = HashMap::new();
+    let no_agent_tail: HashMap<String, String> = HashMap::new();
+    // pty 7 = a plain hand-opened pane; pty 5 stands in for an agent's pty.
+    let p_out: HashMap<u32, u64> = [(7u32, 10u64), (5u32, 10u64)].into_iter().collect();
+    let p_tails: HashMap<u32, String> = [
+        (7u32, strip_ansi(FIX_CLAUDE_ASK.as_bytes())),
+        (5u32, strip_ansi(FIX_CLAUDE_ASK.as_bytes())),
+    ]
+    .into_iter()
+    .collect();
+    let p_ins = HashMap::new();
+    let agent_ptys: HashSet<u32> = [5u32].into_iter().collect();
+
+    let scan = |t: u64| {
+        reg.attention_scan(
+            t, &no_agent_in, &no_agent_tail, &HashMap::new(), &p_out, &p_tails, &p_ins, &agent_ptys,
+        )
+    };
+    scan(now); // establish the quiet clock
+    let items = scan(now + 5000);
+    assert!(
+        items.iter().any(|i| i.pty_id == Some(7) && i.reason == "waiting" && i.agent_id.is_empty()),
+        "a plain pane parked on a question must surface through run_attention's merge"
+    );
+    assert!(
+        items.iter().all(|i| i.pty_id != Some(5)),
+        "an agent's pty must not be double-covered by the plain pass"
+    );
+}
+
+#[test]
+fn pane_attention_inputs_from_strips_ansi_and_skips_agent_ptys() {
+    // #40 review: drive the gather wiring with a fake live-ids source. Raw bytes
+    // carry ANSI + box drawing; the built tail must be stripped, agent ptys must
+    // be skipped (not gathered), and the stripped tail must still detect a prompt.
+    let (reg, _d, _g, _w) = attention_setup();
+    let raw_menu = FIX_COPILOT_ASK.as_bytes().to_vec();
+    let live = vec![
+        (7u32, 42u64, raw_menu.clone(), 0u64),   // a plain pane
+        (5u32, 99u64, raw_menu.clone(), 123u64), // an agent's pty — must be skipped
+    ];
+    let agent_ptys: HashSet<u32> = [5u32].into_iter().collect();
+    let (outs, tails, ins) = reg.pane_attention_inputs_from(&live, &agent_ptys);
+
+    assert!(!outs.contains_key(&5) && !tails.contains_key(&5), "agent pty must be skipped");
+    assert_eq!(outs.get(&7), Some(&42u64));
+    assert_eq!(ins.get(&7), Some(&0u64));
+    let tail7 = tails.get(&7).expect("plain pty tail present");
+    assert!(!tail7.contains('\u{1b}'), "ANSI escapes must be stripped from the gathered tail");
+    assert!(prompt_wait_detected(tail7), "the stripped tail still detects the menu");
+}
+
+#[test]
+fn attention_scan_flags_a_plain_pane_with_no_orchestration_group_at_all() {
+    // #40 review: the human's repro had NO orchestration group — plain panes only.
+    // A fresh registry (no group, no agents) must still flag a plain pane parked
+    // on a question, confirming the scan doesn't depend on any group existing.
+    let (reg, _d) = test_registry();
+    let now = 1_000_000_000_000u64;
+    let empty_in: HashMap<String, u64> = HashMap::new();
+    let empty_tail: HashMap<String, String> = HashMap::new();
+    let p_out: HashMap<u32, u64> = [(3u32, 10u64)].into_iter().collect();
+    let p_tails: HashMap<u32, String> =
+        [(3u32, strip_ansi(FIX_CLAUDE_ASK.as_bytes()))].into_iter().collect();
+    let no_agents = HashSet::new();
+
+    let scan = |t: u64| {
+        reg.attention_scan(
+            t, &empty_in, &empty_tail, &HashMap::new(), &p_out, &p_tails, &HashMap::new(), &no_agents,
+        )
+    };
+    scan(now);
+    assert!(
+        scan(now + 5000).iter().any(|i| i.pty_id == Some(3) && i.reason == "waiting"),
+        "attention must fire for a plain pane even with no orchestration group present"
+    );
+}
+
+#[test]
+fn attention_waiting_ack_sticks_until_the_prompt_changes() {
+    // #40 review: focusing/acking a pane parked on a live menu must make the ack
+    // *stick* — the next scan must not re-light `waiting` on the pane the human is
+    // already on. The suppression lifts only when the pane's output changes.
+    let (reg, _d, _g, wid) = attention_setup();
+    let now = 1_000_000_000_000u64;
+    let out: HashMap<String, u64> = [(wid.clone(), 100u64)].into_iter().collect();
+    let tail: HashMap<String, String> =
+        [(wid.clone(), strip_ansi(FIX_COPILOT_ASK.as_bytes()))].into_iter().collect();
+    let no_input = HashMap::new();
+
+    // Establish the quiet clock, then flag `waiting`.
+    reg.attention_tick(now, &out, &tail, &no_input);
+    assert_eq!(
+        reg.attention_tick(now + 5000, &out, &tail, &no_input)
+            .iter()
+            .filter(|i| i.agent_id == wid && i.reason == "waiting")
+            .count(),
+        1,
+        "a quiet pane parked on a menu must flag waiting"
+    );
+
+    // The human focuses the pane (auto-ack). Even with the menu still on screen
+    // (output unchanged), the next scan must not re-raise waiting.
+    reg.ack_attention(&wid);
+    assert!(
+        reg.attention_tick(now + 8000, &out, &tail, &no_input)
+            .iter()
+            .all(|i| !(i.agent_id == wid && i.reason == "waiting")),
+        "ack must stick while the same menu is on screen"
+    );
+    assert!(
+        reg.attention_tick(now + 11_000, &out, &tail, &no_input)
+            .iter()
+            .all(|i| !(i.agent_id == wid && i.reason == "waiting")),
+        "ack stays sticky across further quiet scans"
+    );
+
+    // The pane repaints (menu answered → a *new* prompt appears): re-arm and flag.
+    let grew: HashMap<String, u64> = [(wid.clone(), 200u64)].into_iter().collect();
+    reg.attention_tick(now + 12_000, &grew, &tail, &no_input); // observe the change, reset quiet clock
+    assert_eq!(
+        reg.attention_tick(now + 17_000, &grew, &tail, &no_input)
+            .iter()
+            .filter(|i| i.agent_id == wid && i.reason == "waiting")
+            .count(),
+        1,
+        "a fresh prompt after the pane repainted flags again"
+    );
+}
+
 #[test]
 fn attention_flags_idle_with_prompt_only_when_quiet_and_unattended() {
     let (reg, _d, _g, wid) = attention_setup();
@@ -1623,7 +2010,7 @@ fn attention_toasts_once_per_onset_only_for_optin_groups() {
         agent_id: wid.clone(),
         group: gid.clone(),
         name: "w".into(),
-        role: Role::Worker,
+        role: Some(Role::Worker),
         pty_id: None,
         reason: "blocked",
         detail: "stuck".into(),
@@ -1674,8 +2061,10 @@ fn notify_optin_is_durable_across_restart() {
 fn group_usage_summarizes_agents_with_null_cost_without_panes() {
     let (reg, _d, _co, _cw) = setup_mcp();
     let usage = reg.group_usage(&_co.group);
-    // No live panes in test mode → every cost is null and there is no total.
-    assert!(usage["total_cost_usd"].is_null());
+    // No live panes and no transcripts in test mode → no dollar figures.
+    assert!(usage["live_cost_usd"].is_null());
+    assert!(usage["lifetime_cost_usd"].is_null());
+    assert_eq!(usage["live_tokens"].as_u64(), Some(0));
     let agents = usage["agents"].as_array().unwrap();
     assert!(agents.iter().any(|a| a["id"] == "orch-1"), "orchestrator must appear");
     assert!(agents.iter().all(|a| a["cost_usd"].is_null()));
@@ -1683,11 +2072,165 @@ fn group_usage_summarizes_agents_with_null_cost_without_panes() {
     let via_mcp = dispatch(&reg, &_co, "tools/call",
         &json!({ "name": "group_usage", "arguments": {} })).unwrap();
     assert_eq!(via_mcp["isError"], false);
-    assert!(via_mcp["content"][0]["text"].as_str().unwrap().contains("total_cost_usd"));
+    assert!(via_mcp["content"][0]["text"].as_str().unwrap().contains("lifetime_cost_usd"));
     // Workers cannot pull the group-wide usage summary.
     let denied = dispatch(&reg, &_cw, "tools/call",
         &json!({ "name": "group_usage", "arguments": {} })).unwrap();
     assert_eq!(denied["isError"], true, "usage aggregation is orchestrator-only");
+}
+
+/// Build a durable usage snapshot for a session, as a fresh transcript read
+/// would produce.
+fn usage_snap(key: &str, agent_id: &str, cost: f64, input: u64, output: u64) -> UsageSnapshot {
+    UsageSnapshot {
+        key: key.to_string(),
+        agent_id: agent_id.to_string(),
+        name: agent_id.to_string(),
+        role: "worker".to_string(),
+        source: "transcript".to_string(),
+        input_tokens: input,
+        output_tokens: output,
+        cache_creation_tokens: 0,
+        cache_read_tokens: 0,
+        cost_usd: Some(cost),
+        estimated: true,
+        model: Some("claude-opus-4-8".to_string()),
+        updated_ms: 0,
+    }
+}
+
+#[test]
+fn killed_agent_stays_in_lifetime_total_but_not_live() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "task", false, None).unwrap();
+    let sid = w.session_id.clone().expect("claude worker gets a session id");
+
+    // Simulate a transcript read having captured this session's spend.
+    reg.upsert_usage_snapshot(&g.id, usage_snap(&sid, &w.id, 1.50, 1000, 2000));
+
+    let before = reg.group_usage(&g.id);
+    let row = before["agents"].as_array().unwrap().iter()
+        .find(|a| a["id"] == w.id.as_str()).expect("worker row present");
+    assert_eq!(row["live"], true);
+    assert_eq!(row["tokens"]["total"].as_u64(), Some(3000));
+    assert!((before["live_cost_usd"].as_f64().unwrap() - 1.50).abs() < 1e-9);
+    assert!((before["lifetime_cost_usd"].as_f64().unwrap() - 1.50).abs() < 1e-9);
+
+    // Kill the worker. mark_dead re-reads usage (no transcript in test mode →
+    // empty), but the merge must keep the captured spend rather than zero it.
+    reg.mark_dead(&w.id, Some(0));
+
+    let after = reg.group_usage(&g.id);
+    let row = after["agents"].as_array().unwrap().iter()
+        .find(|a| a["id"] == w.id.as_str()).expect("dead worker still listed");
+    assert_eq!(row["live"], false, "killed agent is no longer live");
+    // Lifetime keeps the spend; live no longer counts the dead worker.
+    assert!((after["lifetime_cost_usd"].as_f64().unwrap() - 1.50).abs() < 1e-9,
+        "lifetime total must survive the kill");
+    assert!(after["live_cost_usd"].is_null(), "no live agents contribute cost now");
+    assert_eq!(after["lifetime_tokens"].as_u64(), Some(3000));
+    assert_eq!(after["live_tokens"].as_u64(), Some(0));
+}
+
+#[test]
+fn mark_dead_captures_usage_from_transcript() {
+    // Point the usage reader at a fixture transcript tree instead of ~/.claude,
+    // via a per-registry override (no global env — safe under parallel runs).
+    let proj = tempfile::tempdir().unwrap();
+    let (reg, _d) = test_registry();
+    reg.set_claude_projects_dir(proj.path().to_path_buf());
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "task", false, None).unwrap();
+    let sid = w.session_id.clone().unwrap();
+
+    // Write a synthetic Claude transcript for this session under an
+    // encoded-cwd folder (any name — the reader scans all of them).
+    let encoded = proj.path().join("C--tmp-repo");
+    fs::create_dir_all(&encoded).unwrap();
+    let transcript = format!(
+        "{}\n{}\n",
+        json!({"type":"user","message":{"content":"hi"}}),
+        json!({"type":"assistant","message":{"id":"m1","model":"claude-opus-4-8",
+            "usage":{"input_tokens":1000,"output_tokens":500,
+                     "cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}),
+    );
+    fs::write(encoded.join(format!("{sid}.jsonl")), transcript).unwrap();
+
+    // Kill without ever calling group_usage first: mark_dead must snapshot it.
+    reg.mark_dead(&w.id, Some(0));
+
+    let usage = reg.group_usage(&g.id);
+    let row = usage["agents"].as_array().unwrap().iter()
+        .find(|a| a["id"] == w.id.as_str()).expect("dead worker captured");
+    assert_eq!(row["live"], false);
+    assert_eq!(row["source"], "transcript");
+    assert_eq!(row["estimated"], true);
+    assert_eq!(row["tokens"]["total"].as_u64(), Some(1500));
+    // Opus: (1000*5 + 500*25) / 1e6 = 0.0175
+    let expect = (1000.0 * 5.0 + 500.0 * 25.0) / 1_000_000.0;
+    assert!((usage["lifetime_cost_usd"].as_f64().unwrap() - expect).abs() < 1e-9);
+    // Token-derived → labelled estimated, not reported.
+    assert_eq!(usage["lifetime_cost_basis"], "estimated");
+}
+
+#[test]
+fn usage_json_write_is_atomic_and_leaves_no_temp() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    reg.upsert_usage_snapshot(&g.id, usage_snap("sess-a", "w-1", 0.50, 100, 200));
+
+    let gdir = reg.state_root().join(&g.id);
+    let path = gdir.join("usage.json");
+    assert!(path.is_file(), "usage.json must exist after upsert");
+    assert!(!gdir.join("usage.json.tmp").is_file(), "temp file must be cleaned up");
+    // Round-trips as valid JSON with the snapshot.
+    let list: Vec<UsageSnapshot> =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].key, "sess-a");
+}
+
+#[test]
+fn corrupt_usage_json_is_preserved_not_silently_wiped() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let gdir = reg.state_root().join(&g.id);
+    fs::create_dir_all(&gdir).unwrap();
+    let path = gdir.join("usage.json");
+    // Simulate a half-written / hand-mangled file.
+    fs::write(&path, "{ this is not valid json ").unwrap();
+
+    // The next upsert must not treat corruption as "empty and overwrite" — it
+    // preserves the bad file so no killed-agent history is silently lost.
+    reg.upsert_usage_snapshot(&g.id, usage_snap("sess-b", "w-2", 1.25, 300, 400));
+
+    let bad = gdir.join("usage.json.bad");
+    assert!(bad.is_file(), "corrupt file must be preserved as usage.json.bad");
+    assert_eq!(fs::read_to_string(&bad).unwrap(), "{ this is not valid json ");
+    // usage.json is now valid and holds the new snapshot.
+    let list: Vec<UsageSnapshot> =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].key, "sess-b");
+}
+
+#[test]
+fn mixed_estimated_and_reported_totals_are_labelled_mixed() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    // One transcript-estimated snapshot and one statusline-reported one.
+    reg.upsert_usage_snapshot(&g.id, usage_snap("sess-est", "w-1", 1.00, 100, 100));
+    let mut reported = usage_snap("sess-rep", "w-2", 2.00, 0, 0);
+    reported.source = "statusline".to_string();
+    reported.estimated = false;
+    reg.upsert_usage_snapshot(&g.id, reported);
+
+    let usage = reg.group_usage(&g.id);
+    // Neither agent is live (no panes), so this exercises the lifetime total.
+    assert!((usage["lifetime_cost_usd"].as_f64().unwrap() - 3.00).abs() < 1e-9);
+    assert_eq!(usage["lifetime_cost_basis"], "mixed",
+        "estimated + reported dollars must not hide under one label");
 }
 
 #[test]

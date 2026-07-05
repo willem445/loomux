@@ -218,7 +218,7 @@ fn tool_defs(role: Role) -> Vec<Value> {
             tool("remove_task", "Delete a task from the shared board.",
                 json!({ "id": { "type": "string" } }), &["id"]),
             tool("group_usage",
-                "Aggregate the group's per-pane session cost into one summary (total plus per-agent, parsed best-effort from each pane's statusline). Fold it into your status updates so the human sees spend at a glance.",
+                "Aggregate the group's token usage and estimated dollar cost into one summary, split live vs lifetime (killed/recycled agents still count). Tokens come from each agent's session transcript and are exact; dollars are estimated from a model price table (subscription/Max accounts show $0 in the CLI, so cite tokens). Fold it into your status updates so the human sees spend at a glance.",
                 json!({}), &[]),
         ]);
     } else {

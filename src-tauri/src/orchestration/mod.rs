@@ -252,14 +252,24 @@ pub fn watchdog_should_notify(
 
 /// Attention routing (#6): does a pane's ANSI-stripped output tail look like a
 /// CLI parked on a prompt only the human can answer — a permission dialog, a
-/// yes/no confirmation, or a numbered selection menu? This is the "last output"
+/// yes/no confirmation, or a numbered/selection menu? This is the "last output"
 /// half of idle-with-prompt detection; the caller pairs it with an
 /// output-quiet check (this alone can't tell a live prompt from the same words
 /// scrolled past). So it errs toward recognizable interactive-prompt structure
-/// (the selection pointer both Claude Code and Copilot render, explicit y/n
-/// tokens, the stock permission phrasings) rather than any mention of a
-/// question. Case-insensitive; only the final handful of lines are considered,
-/// because a prompt the CLI is waiting on is the last thing it painted.
+/// rather than any mention of a question. Case-insensitive.
+///
+/// Two tiers of signal, by how prose-safe each is (#40 review):
+/// - *Structured* signals (numbered y/n menu, explicit y/n tokens, stock
+///   permission phrasings) don't occur in ordinary prose, so they're honored
+///   across the last ~12 lines.
+/// - *Prose-like* signals — a bare selection pointer and the plain-English menu
+///   footer ("use arrow keys", "enter to select") — DO appear in finished-turn
+///   agent output (agents describe keyboard UIs, paste shell prompts, echo
+///   `a › b` breadcrumbs). A *live* menu paints these as the last thing on
+///   screen, with its pointer *leading* an option line (after any box frame);
+///   prose does neither. So the pointer must lead a de-framed line, and the
+///   footer is only read from the last few non-empty lines — once the CLI
+///   redraws its idle input box below the prose, the phrase falls out of range.
 pub fn prompt_wait_detected(tail: &str) -> bool {
     let lines: Vec<String> = tail
         .lines()
@@ -272,11 +282,33 @@ pub fn prompt_wait_detected(tail: &str) -> bool {
     let recent = &lines[lines.len().saturating_sub(12)..];
     let joined = recent.join("\n");
 
-    // Selection pointer on an option line: how both CLIs render the highlighted
-    // choice of a permission menu (`❯ 1. Yes`, `› Yes`, `→ Allow`).
-    let has_pointer_option = recent
-        .iter()
-        .any(|l| l.starts_with('❯') || l.starts_with('›') || l.starts_with('→'));
+    // Strip a line's leading box border / bullet / indent so a menu pointer
+    // inside a bordered dialog (`│ ❯ Yes`) is seen to *lead* its content.
+    fn deframe(l: &str) -> &str {
+        l.trim_start_matches(|c: char| {
+            c == '│' || c == '┃' || c == '|' || c == '*' || c == '●' || c == '•' || c == '◆'
+                || c.is_whitespace()
+        })
+    }
+
+    // The last few non-empty lines — "the last thing the CLI painted". Both
+    // prose-like signals (pointer, footer) are read only from here (#40 review):
+    // a live menu paints its pointer/footer last, whereas finished-turn prose
+    // that happens to lead a line with `❯`/`›`/`→` (a `❯ npm run dev` shell
+    // example, a fenced repro block) is followed by the CLI's redrawn idle input
+    // box, which pushes it out of this window.
+    let last_painted = &recent[recent.len().saturating_sub(3)..];
+
+    // Selection pointer marking the highlighted choice. A `❯`/`›`/`→` that
+    // *leads* a line's content (after any box frame) is menu-shaped; the same
+    // glyph mid-line is pervasive in ordinary output — pasted shell prompts
+    // (`demo ❯ npm run dev`), UI breadcrumbs (`Home › Prefs`), diff/log arrows.
+    // Requiring it to lead rules those out; requiring it in the last painted
+    // lines also rules out a *leading* glyph in finished prose above the idle box.
+    let has_pointer_option = last_painted.iter().any(|l| {
+        let d = deframe(l);
+        d.starts_with('❯') || d.starts_with('›') || d.starts_with('→')
+    });
     // A numbered yes/no menu even without the pointer glyph.
     let has_numbered_menu = joined.contains("1. yes") || joined.contains("❯ 1.");
     // Explicit yes/no confirmation tokens.
@@ -297,7 +329,21 @@ pub fn prompt_wait_detected(tail: &str) -> bool {
         || joined.contains("grant access")
         || joined.contains("press enter to continue")
         || joined.contains("waiting for your");
-    has_pointer_option || has_numbered_menu || has_yes_no || has_permission_phrase
+    // Interactive selection-menu footer (AskUserQuestion / Copilot / inquirer).
+    // Claude Code's AskUserQuestion highlights the active option with reverse
+    // video (an ANSI attribute stripped before we see it), so no glyph survives
+    // and this footer is the only durable signal (#40). Like the pointer it's
+    // read only from the last painted lines. NOTE: matched on single lines, so a
+    // footer wrapped across rows in a very narrow pane, or a localized / reworded
+    // footer, won't match — a known gap (see design doc).
+    let footer = last_painted.join("\n");
+    let has_menu_footer = footer.contains("enter to select")
+        || footer.contains("enter to confirm")
+        || footer.contains("use arrow")
+        || footer.contains("arrow keys")
+        || footer.contains("↑↓")
+        || footer.contains("↑/↓");
+    has_pointer_option || has_numbered_menu || has_yes_no || has_permission_phrase || has_menu_footer
 }
 
 /// Distinct agent working directories to remove when a group is torn down
@@ -436,10 +482,13 @@ pub struct AgentEntry {
 /// - `gate`    — this agent's task sits at a human merge gate on the board
 #[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct AttentionItem {
+    /// Empty for a plain (non-orchestration) pane, which is keyed only by
+    /// `pty_id` — the human's hand-opened shells have no agent identity (#40).
     pub agent_id: String,
     pub group: String,
     pub name: String,
-    pub role: Role,
+    /// `None` for a plain pane (no orchestration role).
+    pub role: Option<Role>,
     pub pty_id: Option<u32>,
     pub reason: &'static str,
     /// Short human phrase for the badge tooltip and the toast body.
@@ -521,6 +570,36 @@ pub struct AgentRecord {
     pub updated_ms: u64,
 }
 
+/// Durable per-agent usage snapshot (`usage.json` per group). Keyed by the CLI
+/// session id when known (so a resumed session updates one row instead of
+/// double-counting), else `agent:<id>`. Snapshots survive `kill_agent`/exit —
+/// captured in `mark_dead` — so a group's lifetime cost keeps counting
+/// recycled panes (issue #42).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UsageSnapshot {
+    /// Stable identity: the CLI session id, or `agent:<id>` when there is none.
+    pub key: String,
+    pub agent_id: String,
+    pub name: String,
+    pub role: String,
+    /// Where the figures came from: `transcript` (token-derived, exact tokens),
+    /// `statusline` (last-resort parse of the CLI's own dollar figure), or
+    /// `none` (nothing available yet).
+    pub source: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub cache_read_tokens: u64,
+    /// Dollar cost, or `None` when only tokens are known (unknown model, or a
+    /// transcript-less agent whose statusline shows nothing).
+    pub cost_usd: Option<f64>,
+    /// true = dollars estimated from the price table; false = reported by the
+    /// CLI's statusline (which reads $0.00 on subscription/Max accounts).
+    pub estimated: bool,
+    pub model: Option<String>,
+    pub updated_ms: u64,
+}
+
 /// A recorded session's orchestration identity, for the session browser.
 #[derive(Clone, Serialize)]
 pub struct SessionRole {
@@ -596,12 +675,24 @@ pub struct OrchRegistry {
     /// output total, Unix-ms that total last changed). Kept separate from the
     /// watchdog's counter so the two features never clobber each other's clocks.
     attn_quiet: Mutex<HashMap<String, (u64, u64)>>,
+    /// Attention routing: agents whose live `waiting` badge the human has acked
+    /// (focused the pane) while the prompt is still on screen. Unlike
+    /// `blocked`/`report`, `waiting` is recomputed every scan, so without this it
+    /// would re-light ~3s after focus. Cleared when the pane's output next
+    /// changes (the menu was answered / the CLI repainted) so a genuinely new
+    /// prompt flags again. See `attention_tick`.
+    attn_waiting_ack: Mutex<HashSet<String>>,
     /// Attention routing: the agent → reason set last emitted, so a scan fires a
     /// desktop toast only once per attention onset (the event itself is
     /// re-emitted every tick and the frontend badges idempotently).
     attn_emitted: Mutex<HashMap<String, String>>,
     /// Groups with desktop notifications enabled (durable `notify` marker file).
     notify_groups: Mutex<HashSet<String>>,
+    /// Test-only override of the Claude transcript root (`~/.claude/projects`).
+    /// `None` in production. Set via `set_claude_projects_dir` so the usage
+    /// reader can be pointed at a fixture tree without touching global env —
+    /// safe under parallel test execution.
+    claude_projects_dir: Mutex<Option<PathBuf>>,
 }
 
 fn now_ms() -> u64 {
@@ -899,9 +990,18 @@ impl OrchRegistry {
             self_arc: Mutex::new(Weak::new()),
             attn_reports: Mutex::new(HashMap::new()),
             attn_quiet: Mutex::new(HashMap::new()),
+            attn_waiting_ack: Mutex::new(HashSet::new()),
             attn_emitted: Mutex::new(HashMap::new()),
             notify_groups: Mutex::new(HashSet::new()),
+            claude_projects_dir: Mutex::new(None),
         }
+    }
+
+    /// Point the usage reader at a specific Claude transcript root, instead of
+    /// `~/.claude/projects`. Test-only seam (see `claude_projects_dir`).
+    #[doc(hidden)]
+    pub fn set_claude_projects_dir(&self, dir: PathBuf) {
+        *self.claude_projects_dir.lock().unwrap() = Some(dir);
     }
 
     /// Record the `Arc` the registry is stored behind so `&self` methods can
@@ -1783,10 +1883,24 @@ impl OrchRegistry {
     }
 
     /// The human focused/handled a pane: drop any latched report so its badge
-    /// clears. Live reasons (waiting/gate) are recomputed each scan and reappear
-    /// only if still true, so they need no explicit clear.
+    /// clears, and suppress the live `waiting` badge so focusing a pane whose
+    /// menu is still on screen makes the ack *stick* — otherwise the next 3s scan
+    /// re-emits `waiting` and re-lights the pane the human is already on (#40
+    /// review). The suppression self-clears once the pane's output changes (the
+    /// menu was answered / the CLI repainted), so a genuinely new prompt on the
+    /// same pane flags again. The `gate` reason is board state, cleared by moving
+    /// the task, so it needs no ack.
     pub fn ack_attention(&self, agent_id: &str) {
         self.attn_reports.lock().unwrap().remove(agent_id);
+        self.attn_waiting_ack.lock().unwrap().insert(agent_id.to_string());
+    }
+
+    /// The human turned to a *plain* pane (#40): make its `waiting` ack stick the
+    /// same way `ack_attention` does for agents, keyed by the pane's pty id. The
+    /// suppression lifts when the pane's output next changes (see
+    /// `plain_pane_attention`).
+    pub fn ack_attention_pty(&self, pty_id: u32) {
+        self.attn_waiting_ack.lock().unwrap().insert(format!("pty:{pty_id}"));
     }
 
     /// Whether desktop notifications are enabled for a group.
@@ -1841,6 +1955,69 @@ impl OrchRegistry {
         (outs, tails, ins)
     }
 
+    /// Pty snapshots for every live pane that is NOT a registered agent, keyed
+    /// by pty id, plus the agent-pty set. Feeds `plain_pane_attention` so the
+    /// scan reaches plain shells the human opened by hand (#40). Empty without an
+    /// app handle (unit tests drive the pure core `pane_attention_inputs_from`).
+    #[allow(clippy::type_complexity)]
+    fn pane_attention_inputs(
+        &self,
+    ) -> (HashMap<u32, u64>, HashMap<u32, String>, HashMap<u32, u64>, HashSet<u32>) {
+        let mut agent_ptys = HashSet::new();
+        let Some(app) = self.app.lock().unwrap().clone() else {
+            return (HashMap::new(), HashMap::new(), HashMap::new(), agent_ptys);
+        };
+        for a in self.agents.lock().unwrap().values() {
+            if let Some(pid) = a.pty_id {
+                agent_ptys.insert(pid);
+            }
+        }
+        let ptys = app.state::<crate::pty::PtyManager>();
+        let mut live = Vec::new();
+        for pid in ptys.live_ids() {
+            // Skip agent ptys *before* touching the ring: `attention_tick`
+            // already covers them, and `attention_inputs` already cloned their
+            // (up-to-256 KB) output ring this tick — cloning it a second time
+            // here would be pure waste (#40 review).
+            if agent_ptys.contains(&pid) {
+                continue;
+            }
+            let Some(total) = ptys.output_total(pid) else { continue };
+            let raw = ptys.output_tail(pid).unwrap_or_default();
+            let input = ptys.last_user_input_ms(pid).unwrap_or(0);
+            live.push((pid, total, raw, input));
+        }
+        let (outs, tails, ins) = self.pane_attention_inputs_from(&live, &agent_ptys);
+        (outs, tails, ins, agent_ptys)
+    }
+
+    /// Pure core of `pane_attention_inputs`: build the pty-keyed snapshot maps
+    /// `plain_pane_attention` consumes from a list of live pane snapshots
+    /// `(pty_id, output_total, raw_tail, last_input_ms)`, ANSI-stripping only the
+    /// trailing few KB of each tail (a prompt is at the end). Agent ptys are
+    /// skipped. Pure w.r.t. the pty, so run_attention's gather wiring is testable
+    /// with a fake live-ids source (#40 review).
+    #[allow(clippy::type_complexity)]
+    pub fn pane_attention_inputs_from(
+        &self,
+        live: &[(u32, u64, Vec<u8>, u64)],
+        agent_ptys: &HashSet<u32>,
+    ) -> (HashMap<u32, u64>, HashMap<u32, String>, HashMap<u32, u64>) {
+        let mut outs = HashMap::new();
+        let mut tails = HashMap::new();
+        let mut ins = HashMap::new();
+        for (pid, total, raw, input) in live {
+            if agent_ptys.contains(pid) {
+                continue;
+            }
+            outs.insert(*pid, *total);
+            let start = raw.len().saturating_sub(4096);
+            tails.insert(*pid, strip_ansi(&raw[start..]));
+            ins.insert(*pid, *input);
+        }
+        (outs, tails, ins)
+    }
+
     /// One attention pass: compute the current set of panes that need the human
     /// from live agent state plus the supplied pty snapshots. Reasons, in
     /// priority order, are `blocked` (reported), `waiting` (parked on a prompt:
@@ -1874,18 +2051,24 @@ impl OrchRegistry {
 
         let reports = self.attn_reports.lock().unwrap().clone();
         let mut quiet = self.attn_quiet.lock().unwrap();
+        let mut waiting_ack = self.attn_waiting_ack.lock().unwrap();
         let agents = self.agents.lock().unwrap();
         let mut out = Vec::new();
         for a in agents.values() {
             if a.status != AgentStatus::Running {
                 quiet.remove(&a.id);
+                waiting_ack.remove(&a.id);
                 continue;
             }
             // Track how long the pane's output has been stable.
             let cur = outputs.get(&a.id).copied().unwrap_or(0);
             let entry = quiet.entry(a.id.clone()).or_insert((cur, now));
-            if cur != entry.0 {
+            let output_changed = cur != entry.0;
+            if output_changed {
                 *entry = (cur, now);
+                // The pane repainted — the acked menu was answered or replaced,
+                // so re-arm: a fresh prompt on this pane flags again.
+                waiting_ack.remove(&a.id);
             }
             let quiet_for = now.saturating_sub(entry.1);
             let recently_typed = last_inputs
@@ -1893,6 +2076,7 @@ impl OrchRegistry {
                 .map(|&t| t != 0 && now.saturating_sub(t) < ATTENTION_RECENT_INPUT_MS)
                 .unwrap_or(false);
             let waiting = !recently_typed
+                && !waiting_ack.contains(&a.id)
                 && quiet_for >= ATTENTION_QUIET_MS
                 && tails.get(&a.id).map(|t| prompt_wait_detected(t)).unwrap_or(false);
 
@@ -1912,13 +2096,73 @@ impl OrchRegistry {
                 agent_id: a.id.clone(),
                 group: a.group.clone(),
                 name: a.name.clone(),
-                role: a.role,
+                role: Some(a.role),
                 pty_id: a.pty_id,
                 reason,
                 detail,
             });
         }
         out.sort_by(|x, y| x.agent_id.cmp(&y.agent_id));
+        out
+    }
+
+    /// Attention scan for *plain* panes (#40): any pane with a live pty that is
+    /// **not** a registered agent — the shells the human opens by hand to run a
+    /// CLI. It only ever raises `waiting` (parked on an interactive prompt): the
+    /// agent-only reasons (`blocked`/`report`/`gate`) require a roster identity a
+    /// plain pane doesn't have. Same quiet + no-keystroke + prompt-tail gate and
+    /// the same sticky-ack semantics as the agent path, keyed by a synthetic
+    /// `pty:<id>` id in the shared `attn_quiet`/`attn_waiting_ack` maps (agent
+    /// ids never collide — they're group-scoped uuids). Pure w.r.t. the pty (the
+    /// pty reads live in `pane_attention_inputs`), so it's fixture-testable.
+    /// `agent_ptys` are the ptys already handled by `attention_tick`, skipped here.
+    pub fn plain_pane_attention(
+        &self,
+        now: u64,
+        outputs: &HashMap<u32, u64>,
+        tails: &HashMap<u32, String>,
+        last_inputs: &HashMap<u32, u64>,
+        agent_ptys: &HashSet<u32>,
+    ) -> Vec<AttentionItem> {
+        let mut quiet = self.attn_quiet.lock().unwrap();
+        let mut waiting_ack = self.attn_waiting_ack.lock().unwrap();
+        let mut out = Vec::new();
+        for (&pty, &cur) in outputs {
+            if agent_ptys.contains(&pty) {
+                continue;
+            }
+            let key = format!("pty:{pty}");
+            let entry = quiet.entry(key.clone()).or_insert((cur, now));
+            if cur != entry.0 {
+                *entry = (cur, now);
+                waiting_ack.remove(&key); // repainted → re-arm (menu answered)
+            }
+            let quiet_for = now.saturating_sub(entry.1);
+            let recently_typed = last_inputs
+                .get(&pty)
+                .map(|&t| t != 0 && now.saturating_sub(t) < ATTENTION_RECENT_INPUT_MS)
+                .unwrap_or(false);
+            let waiting = !recently_typed
+                && !waiting_ack.contains(&key)
+                && quiet_for >= ATTENTION_QUIET_MS
+                && tails.get(&pty).map(|t| prompt_wait_detected(t)).unwrap_or(false);
+            if waiting {
+                out.push(AttentionItem {
+                    agent_id: String::new(),
+                    group: String::new(),
+                    name: String::new(),
+                    role: None,
+                    pty_id: Some(pty),
+                    reason: "waiting",
+                    detail: "This pane is waiting on your input".to_string(),
+                });
+            }
+        }
+        // Prune bookkeeping for ptys that have gone away (pane closed), so the
+        // shared maps don't grow unbounded with `pty:` keys.
+        quiet.retain(|k, _| !k.starts_with("pty:") || k[4..].parse::<u32>().map(|p| outputs.contains_key(&p)).unwrap_or(false));
+        waiting_ack.retain(|k| !k.starts_with("pty:") || k[4..].parse::<u32>().map(|p| outputs.contains_key(&p)).unwrap_or(false));
+        out.sort_by_key(|i| i.pty_id);
         out
     }
 
@@ -1952,9 +2196,35 @@ impl OrchRegistry {
     /// One full attention cycle: read pty snapshots, compute the attention set,
     /// fire toasts for newly-attention panes in opted-in groups, and push the
     /// whole set to the frontend. Called on a timer by `start_attention`.
+    /// The full attention set: the roster scan (`attention_tick`, all reasons)
+    /// merged with the plain-pane scan (`plain_pane_attention`, `waiting` only).
+    /// This is run_attention's core, factored out so the merge wiring — plain
+    /// panes surface, an agent's pty is never double-covered — is testable
+    /// without a real PtyManager (#40 review).
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_scan(
+        &self,
+        now: u64,
+        agent_outputs: &HashMap<String, u64>,
+        agent_tails: &HashMap<String, String>,
+        agent_inputs: &HashMap<String, u64>,
+        pane_outputs: &HashMap<u32, u64>,
+        pane_tails: &HashMap<u32, String>,
+        pane_inputs: &HashMap<u32, u64>,
+        agent_ptys: &HashSet<u32>,
+    ) -> Vec<AttentionItem> {
+        let mut items = self.attention_tick(now, agent_outputs, agent_tails, agent_inputs);
+        items.extend(self.plain_pane_attention(now, pane_outputs, pane_tails, pane_inputs, agent_ptys));
+        items
+    }
+
     pub fn run_attention(&self, now: u64) {
         let (outputs, tails, last_inputs) = self.attention_inputs();
-        let items = self.attention_tick(now, &outputs, &tails, &last_inputs);
+        // Also scan plain (non-agent) panes for an interactive prompt (#40).
+        let (p_out, p_tails, p_ins, agent_ptys) = self.pane_attention_inputs();
+        let items = self.attention_scan(
+            now, &outputs, &tails, &last_inputs, &p_out, &p_tails, &p_ins, &agent_ptys,
+        );
         for id in self.attention_toast_targets(&items) {
             if let Some(i) = items.iter().find(|i| i.agent_id == id) {
                 self.audit(&i.group, "loomux", "attention-toast",
@@ -1984,13 +2254,170 @@ impl OrchRegistry {
         Ok(())
     }
 
-    /// Aggregate the group's per-pane session cost into one summary. Cost is
-    /// parsed best-effort from each live agent's in-pane statusline (see
-    /// `parse_session_cost`); an agent whose statusline shows no dollar
-    /// figure contributes `null` and is excluded from the total.
+    /// Compute an agent's current usage from the best available source, in
+    /// preference order: the CLI's own session transcript (token records —
+    /// exact, and readable even after the pane is gone) → a last-resort parse
+    /// of the dollar figure the CLI prints in its statusline. Returns a
+    /// snapshot keyed for durable accumulation (issue #42).
+    fn compute_usage_snapshot(&self, entry: &AgentEntry, cli: &str) -> UsageSnapshot {
+        let key = entry
+            .session_id
+            .clone()
+            .unwrap_or_else(|| format!("agent:{}", entry.id));
+        let role = match entry.role {
+            Role::Orchestrator => "orchestrator",
+            Role::Worker => "worker",
+            Role::Reviewer => "reviewer",
+        };
+        let mut snap = UsageSnapshot {
+            key,
+            agent_id: entry.id.clone(),
+            name: entry.name.clone(),
+            role: role.to_string(),
+            source: "none".to_string(),
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            cost_usd: None,
+            estimated: false,
+            model: None,
+            updated_ms: now_ms(),
+        };
+
+        // Primary source: per-session token usage from the transcript. Claude
+        // Code writes it; Copilot has no readable token record today (see the
+        // `usage` module's design note), so it falls through to the statusline.
+        if cli == "claude" {
+            if let Some(sid) = entry.session_id.as_deref() {
+                // Use the test override when set, else the default ~/.claude root.
+                let root = self
+                    .claude_projects_dir
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .or_else(crate::usage::default_claude_projects_root);
+                if let Some(u) = root
+                    .as_deref()
+                    .and_then(|r| crate::usage::claude_session_usage_in(r, sid))
+                {
+                    if u.tokens.total() > 0 {
+                        snap.source = "transcript".to_string();
+                        snap.input_tokens = u.tokens.input_tokens;
+                        snap.output_tokens = u.tokens.output_tokens;
+                        snap.cache_creation_tokens = u.tokens.cache_creation_tokens;
+                        snap.cache_read_tokens = u.tokens.cache_read_tokens;
+                        snap.cost_usd = u.cost_usd;
+                        snap.estimated = true; // token-derived dollar estimate
+                        snap.model = u.model;
+                        return snap;
+                    }
+                }
+            }
+        }
+
+        // Last resort: the dollar figure the CLI renders in its own statusline.
+        // Unreliable (empty on subscription/Max accounts; gone once the pane is
+        // killed), so it only runs when no transcript usage was found.
+        if let Some(app) = self.app.lock().unwrap().clone() {
+            if let Some(pty) = entry.pty_id {
+                let ptys = app.state::<crate::pty::PtyManager>();
+                if let Some(raw) = ptys.output_tail(pty) {
+                    if let Some(c) = parse_session_cost(&strip_ansi(&raw)) {
+                        snap.source = "statusline".to_string();
+                        snap.cost_usd = Some(c); // reported by the CLI, not estimated
+                    }
+                }
+            }
+        }
+        snap
+    }
+
+    fn load_usage_snapshots(&self, group: &str) -> Vec<UsageSnapshot> {
+        let path = self.group_dir(group).join("usage.json");
+        let Ok(text) = fs::read_to_string(&path) else {
+            return Vec::new(); // absent is normal (no usage yet)
+        };
+        match serde_json::from_str(&text) {
+            Ok(list) => list,
+            Err(e) => {
+                // The file exists but is corrupt (interrupted write, manual
+                // edit). Silently treating it as empty would wipe all
+                // killed-agent history, so preserve it for inspection and
+                // start fresh rather than overwrite it on the next upsert.
+                let bad = path.with_extension("json.bad");
+                let _ = fs::rename(&path, &bad);
+                self.audit(group, "loomux", "usage-corrupt",
+                    json!({ "error": e.to_string(), "preserved": bad.to_string_lossy() }));
+                Vec::new()
+            }
+        }
+    }
+
+    /// Upsert one agent's snapshot into the group's durable `usage.json`,
+    /// matched by `key`. Shares the task-board file lock. Public for the
+    /// kill-snapshot accumulation test.
+    #[doc(hidden)]
+    pub fn upsert_usage_snapshot(&self, group: &str, snap: UsageSnapshot) {
+        let _guard = self.tasks_lock.lock().unwrap();
+        let mut list = self.load_usage_snapshots(group);
+        match list.iter_mut().find(|s| s.key == snap.key) {
+            Some(existing) => {
+                // A transcript only ever grows, so a read that comes back empty
+                // (e.g. transient failure, or the pane died before Copilot wrote
+                // a token record) must not clobber usage we already captured —
+                // otherwise a kill could zero a session's spend. Refresh the
+                // identity fields but keep the richer usage.
+                let new_empty = snap.source == "none"
+                    && snap.cost_usd.is_none()
+                    && snap.input_tokens
+                        + snap.output_tokens
+                        + snap.cache_creation_tokens
+                        + snap.cache_read_tokens
+                        == 0;
+                let old_has_data = existing.source != "none"
+                    || existing.cost_usd.is_some()
+                    || existing.input_tokens
+                        + existing.output_tokens
+                        + existing.cache_creation_tokens
+                        + existing.cache_read_tokens
+                        > 0;
+                if new_empty && old_has_data {
+                    existing.agent_id = snap.agent_id;
+                    existing.name = snap.name;
+                    existing.role = snap.role;
+                    existing.updated_ms = snap.updated_ms;
+                } else {
+                    *existing = snap;
+                }
+            }
+            None => list.push(snap),
+        }
+        let dir = self.group_dir(group);
+        let _ = fs::create_dir_all(&dir);
+        // Crash-safe write: serialize to a temp file, then atomically rename
+        // over usage.json. A crash mid-write leaves the old (valid) file or
+        // the temp file behind, never a half-written usage.json.
+        let path = dir.join("usage.json");
+        let tmp = dir.join("usage.json.tmp");
+        let body = serde_json::to_string_pretty(&list).unwrap();
+        if fs::write(&tmp, &body).is_ok() {
+            if fs::rename(&tmp, &path).is_err() {
+                // Rename can fail if the destination exists on some platforms;
+                // fall back to a direct write so we don't lose the update.
+                let _ = fs::write(&path, &body);
+                let _ = fs::remove_file(&tmp);
+            }
+        }
+    }
+
+    /// Aggregate the group's usage into one summary with a **live vs lifetime**
+    /// split. Live agents' snapshots are refreshed from their transcripts on
+    /// each call; killed/recycled agents keep the snapshot captured when they
+    /// exited, so the lifetime total never forgets historical spend. Tokens are
+    /// exact; dollar figures are estimates (labelled per agent).
     pub fn group_usage(&self, group: &str) -> Value {
-        let app = self.app.lock().unwrap().clone();
-        let agents: Vec<AgentEntry> = self
+        let live_agents: Vec<AgentEntry> = self
             .agents
             .lock()
             .unwrap()
@@ -1998,29 +2425,104 @@ impl OrchRegistry {
             .filter(|a| a.group == group && a.status != AgentStatus::Dead)
             .cloned()
             .collect();
-        let mut total = 0.0f64;
-        let mut any = false;
-        let mut list: Vec<Value> = agents
-            .iter()
-            .map(|a| {
-                let cost = app.as_ref().zip(a.pty_id).and_then(|(app, pty)| {
-                    let ptys = app.state::<crate::pty::PtyManager>();
-                    let raw = ptys.output_tail(pty)?;
-                    parse_session_cost(&strip_ansi(&raw))
-                });
-                if let Some(c) = cost {
-                    total += c;
-                    any = true;
+        let cli = self
+            .group(group)
+            .map(|g| g.guardrails.agent_cli)
+            .unwrap_or_else(|| "claude".to_string());
+
+        // Refresh each live agent's durable snapshot from its current usage.
+        let mut live_keys: HashSet<String> = HashSet::new();
+        for a in &live_agents {
+            let snap = self.compute_usage_snapshot(a, &cli);
+            live_keys.insert(snap.key.clone());
+            self.upsert_usage_snapshot(group, snap);
+        }
+
+        // The store now holds live + historical (killed) snapshots.
+        let snaps = {
+            let _guard = self.tasks_lock.lock().unwrap();
+            self.load_usage_snapshots(group)
+        };
+
+        let (mut live_cost, mut lifetime_cost) = (0.0f64, 0.0f64);
+        let (mut live_cost_known, mut lifetime_cost_known) = (false, false);
+        let (mut live_tokens, mut lifetime_tokens) = (0u64, 0u64);
+        // Track whether each total mixes token-estimated and CLI-reported
+        // dollars, so we never blend them under one honest label.
+        let (mut live_est, mut live_rep) = (false, false);
+        let (mut lifetime_est, mut lifetime_rep) = (false, false);
+        let mut rows: Vec<Value> = Vec::new();
+
+        for s in &snaps {
+            let tokens = s.input_tokens
+                + s.output_tokens
+                + s.cache_creation_tokens
+                + s.cache_read_tokens;
+            let live = live_keys.contains(&s.key);
+            lifetime_tokens += tokens;
+            if let Some(c) = s.cost_usd {
+                lifetime_cost += c;
+                lifetime_cost_known = true;
+                if s.estimated {
+                    lifetime_est = true;
+                } else {
+                    lifetime_rep = true;
                 }
-                json!({ "id": a.id, "name": a.name, "role": a.role, "cost_usd": cost })
-            })
-            .collect();
-        list.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+            }
+            if live {
+                live_tokens += tokens;
+                if let Some(c) = s.cost_usd {
+                    live_cost += c;
+                    live_cost_known = true;
+                    if s.estimated {
+                        live_est = true;
+                    } else {
+                        live_rep = true;
+                    }
+                }
+            }
+            rows.push(json!({
+                "id": s.agent_id,
+                "name": s.name,
+                "role": s.role,
+                "live": live,
+                "source": s.source,
+                "model": s.model,
+                "cost_usd": s.cost_usd,
+                "estimated": s.estimated,
+                "tokens": {
+                    "input": s.input_tokens,
+                    "output": s.output_tokens,
+                    "cache_creation": s.cache_creation_tokens,
+                    "cache_read": s.cache_read_tokens,
+                    "total": tokens,
+                },
+            }));
+        }
+        rows.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+
+        // How to label each dollar total: all token-estimated, all
+        // CLI-reported, or a mix. `null` when there is no cost figure.
+        let basis = |est: bool, rep: bool| -> Option<&'static str> {
+            match (est, rep) {
+                (true, true) => Some("mixed"),
+                (true, false) => Some("estimated"),
+                (false, true) => Some("reported"),
+                (false, false) => None,
+            }
+        };
+
         json!({
             "group": group,
-            "total_cost_usd": any.then_some(total),
-            "agents": list,
-            "note": "best-effort, parsed from each pane's statusline; agents without a visible cost are excluded from the total",
+            "cli": cli,
+            "live_cost_usd": live_cost_known.then_some(live_cost),
+            "lifetime_cost_usd": lifetime_cost_known.then_some(lifetime_cost),
+            "live_cost_basis": basis(live_est, live_rep),
+            "lifetime_cost_basis": basis(lifetime_est, lifetime_rep),
+            "live_tokens": live_tokens,
+            "lifetime_tokens": lifetime_tokens,
+            "agents": rows,
+            "note": "Tokens come from each agent's session transcript and are exact; dollar figures are estimated from a dated model price table. Subscription/Max accounts have no marginal dollar cost (the CLI statusline shows $0.00), so tokens are the reliable metric. Killed/recycled agents stay in the lifetime total; statusline-parsed dollars are a last-resort fallback.",
         })
     }
 
@@ -2825,6 +3327,7 @@ impl OrchRegistry {
         // Attention bookkeeping is per-live-agent; drop this one's entries.
         self.attn_reports.lock().unwrap().remove(agent_id);
         self.attn_quiet.lock().unwrap().remove(agent_id);
+        self.attn_waiting_ack.lock().unwrap().remove(agent_id);
         self.attn_emitted.lock().unwrap().remove(agent_id);
         let _ = fs::remove_file(
             self.group_dir(&snapshot.group).join("configs").join(format!("{agent_id}.json")),
@@ -2832,6 +3335,16 @@ impl OrchRegistry {
         self.audit(&snapshot.group, "loomux", "agent-exit",
             json!({ "agent": agent_id, "exit_code": exit_code }));
         self.persist_agent_record(&snapshot, "dead");
+        // Durably capture final usage before the pane is fully torn down, so a
+        // recycled/killed agent still counts toward the group's lifetime total
+        // (issue #42). The transcript remains readable after exit; the
+        // statusline does not, but token usage is the source we rely on.
+        let cli = self
+            .group(&snapshot.group)
+            .map(|g| g.guardrails.agent_cli)
+            .unwrap_or_else(|| "claude".to_string());
+        let usage = self.compute_usage_snapshot(&snapshot, &cli);
+        self.upsert_usage_snapshot(&snapshot.group, usage);
         Some(snapshot)
     }
 
@@ -2974,6 +3487,13 @@ pub fn orch_group_paused(reg: tauri::State<Arc<OrchRegistry>>, group_id: String)
 #[tauri::command]
 pub fn orch_ack_attention(reg: tauri::State<Arc<OrchRegistry>>, agent_id: String) {
     reg.ack_attention(&agent_id);
+}
+
+/// The human turned to a plain (non-agent) pane flagged `waiting` (#40): ack it
+/// by pty id, since it has no agent identity to key on.
+#[tauri::command]
+pub fn orch_ack_attention_pty(reg: tauri::State<Arc<OrchRegistry>>, pty_id: u32) {
+    reg.ack_attention_pty(pty_id);
 }
 
 /// Whether desktop notifications are enabled for a group (toggle button state).

@@ -70,7 +70,128 @@ html, body {
 
 /* ---------- workspace ---------- */
 #workspace { display: flex; flex: 1; min-height: 0; }
-#grid-root { flex: 1; min-width: 0; display: flex; padding: 8px; }
+/* The grid and its minimize dock stack vertically; the grid takes all the
+   room and the dock is a thin strip that only appears when non-empty. */
+#grid-area { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+/* position: relative anchors a maximized pane's absolute overlay to the grid
+   content area (inside the 8px padding). */
+#grid-root { flex: 1; min-width: 0; min-height: 0; display: flex; padding: 8px; position: relative; }
+
+/* ---------- maximize ---------- */
+/* The maximized pane is lifted to a top layer directly under #grid-root and
+   covers the content area; the rest of the split tree is hidden so its panes
+   report zero size and skip their PTY fits (see Grid.toggleMaximize). */
+#grid-root.has-maximized > :not(.maximized) { display: none; }
+.pane.maximized {
+  position: absolute;
+  inset: 0;
+  z-index: 30;
+  animation: none;
+}
+
+/* ---------- pane drag to reorder / re-dock ---------- */
+/* The pane lifted out; dim it so the snap indicator reads as the destination. */
+.pane.drag-source { opacity: 0.4; }
+body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
+.pane-header { cursor: grab; }
+
+/* Snap target preview: a translucent accent wash over the half (edge) or whole
+   (swap) of the pane the drop would land on. Fixed-positioned in viewport
+   coords, set by Grid.positionIndicator; never intercepts the pointer. */
+.drop-indicator {
+  position: fixed;
+  z-index: 60;
+  pointer-events: none;
+  border-radius: 8px;
+  background: var(--accent-glow);
+  border: 2px solid var(--accent);
+  box-shadow: 0 0 0 1px rgba(122, 162, 247, 0.25), 0 0 22px var(--accent-glow);
+  transition: left 0.08s var(--ease), top 0.08s var(--ease),
+              width 0.08s var(--ease), height 0.08s var(--ease);
+}
+.drop-indicator[data-zone="center"] { border-style: dashed; }
+
+/* A small label that follows the cursor during a drag. */
+.drag-ghost {
+  position: fixed;
+  z-index: 61;
+  pointer-events: none;
+  transform: translate(12px, 12px);
+  max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  padding: 3px 9px; font-size: 11.5px; letter-spacing: 0.2px;
+  color: var(--text);
+  background: var(--panel-2);
+  border: 1px solid var(--accent-dim); border-radius: 6px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+}
+
+/* ---------- minimize dock ---------- */
+#pane-dock {
+  flex: none;
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 10px;
+  background: linear-gradient(180deg, var(--panel), #14141c);
+  border-top: 1px solid var(--border);
+  overflow-x: auto;
+}
+#pane-dock[hidden] { display: none; }
+.dock-label {
+  flex: none; font-size: 10px; text-transform: uppercase; letter-spacing: 1px;
+  color: var(--text-dim); margin-right: 2px;
+}
+.dock-chip {
+  flex: none; display: inline-flex; align-items: center; gap: 8px;
+  max-width: 220px;
+  padding: 4px 6px 4px 10px;
+  font: inherit; font-size: 12px; cursor: pointer;
+  color: var(--text);
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--dock-accent, var(--accent));
+  border-radius: 7px;
+  transition: border-color 0.15s var(--ease), background 0.15s var(--ease),
+              box-shadow 0.15s var(--ease);
+}
+.dock-chip.plain { border-left-color: var(--accent-dim); }
+.dock-chip:hover {
+  background: #232330;
+  box-shadow: 0 0 12px var(--accent-glow);
+}
+.dock-chip-name {
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.dock-chip-close {
+  flex: none; display: inline-flex; align-items: center; justify-content: center;
+  width: 16px; height: 16px; border-radius: 4px;
+  color: var(--text-dim); font-size: 10px;
+}
+.dock-chip-close:hover { background: var(--panel); color: var(--danger); }
+
+/* Attention routing (#6) on a docked pane: a leading dot (always visible, so
+   reduced-motion users still get the signal) plus a pulse. Amber by default,
+   red when urgent (blocked) — mirrors the header chip's palette. */
+.dock-chip.needs-attention {
+  --attn-glow: rgba(224, 175, 104, 0.5);
+  border-color: #6a5230; color: #f2c66a;
+  animation: dock-attn-pulse 1.6s ease-in-out infinite;
+}
+.dock-chip.needs-attention.urgent {
+  --attn-glow: rgba(247, 118, 142, 0.55);
+  border-color: rgba(247, 118, 142, 0.5); color: #ff9db0;
+}
+.dock-chip.needs-attention .dock-chip-name::before {
+  content: "●"; margin-right: 6px; font-size: 8px; vertical-align: 1px;
+  color: currentColor;
+}
+@keyframes dock-attn-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 transparent; }
+  50% { box-shadow: 0 0 9px 1px var(--attn-glow); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .dock-chip.needs-attention { animation: none; }
+}
+
+.hint-tip { color: var(--text-dim); font-style: italic; }
 
 /* ---------- split tree ---------- */
 .split { display: flex; flex: 1; min-width: 0; min-height: 0; }
@@ -322,8 +443,14 @@ html, body {
   background: var(--panel);
   border-top: 1px solid var(--border);
   font-size: 10.5px; color: var(--text-dim);
-  overflow: hidden; white-space: nowrap;
+  /* Scroll horizontally when the shortcuts overflow a narrow window; a
+     vertical wheel is translated to horizontal scroll in hintbar.ts. The
+     scrollbar is hidden (no layout jump, no reserved gutter) across engines. */
+  overflow-x: auto; overflow-y: hidden; white-space: nowrap;
+  scrollbar-width: none; /* Firefox */
 }
+#hintbar::-webkit-scrollbar { display: none; } /* WebKit / Blink (WebView2) */
+#hintbar > * { flex: none; } /* keep each hint at its natural width */
 #hintbar kbd {
   font-family: "Cascadia Mono", Consolas, monospace;
   font-size: 9.5px; color: var(--text);
@@ -432,6 +559,8 @@ html, body {
   user-select: text;
 }
 .dlg-error.visible { display: block; }
+.dlg-hint { font-size: 11px; line-height: 1.5; color: var(--text-dim); }
+.editor-dialog { width: 400px; }
 .dlg-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 2px; }
 .dlg-btn {
   background: var(--panel-2); color: var(--text-dim);
@@ -459,6 +588,19 @@ html, body {
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 #app-error.visible { display: block; }
+
+/* ---------- transient app toast (non-fatal notices) ---------- */
+.app-toast {
+  position: fixed; left: 50%; bottom: 38px; transform: translateX(-50%);
+  z-index: 100; max-width: 84%;
+  display: none;
+  background: #2a1a20; color: #f7a2b2;
+  border: 1px solid #55303a; border-radius: 8px;
+  padding: 8px 16px; font-size: 12px; cursor: pointer;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.app-toast.info { background: #16202e; color: #a9c6f0; border-color: #2c3e57; }
+.app-toast.visible { display: block; }
 
 /* ---------- git view ---------- */
 /* The git view floats over the top of the terminal rather than shrinking
@@ -502,12 +644,74 @@ html, body {
 }
 .git-toast {
   position: absolute; top: 8px; left: 50%; transform: translateX(-50%);
-  z-index: 4; max-width: 80%;
+  z-index: 6; max-width: 80%;
   background: #2a1a20; color: #f7a2b2;
   border: 1px solid #55303a; border-radius: 7px;
   padding: 6px 14px; font-size: 11.5px;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
+.git-toast.ok {
+  background: #17251a; color: #a6e08a; border-color: #2f4a30;
+}
+
+/* -- context menu (commits, ref chips, branch switcher) -- */
+.git-menu {
+  position: fixed; z-index: 40; min-width: 180px;
+  background: var(--panel-2); border: 1px solid var(--border);
+  border-radius: 8px; padding: 4px;
+  box-shadow: 0 8px 26px rgba(0, 0, 0, 0.5);
+  font-size: 12px;
+}
+.git-menu-item {
+  display: block; width: 100%; text-align: left;
+  background: none; border: none; border-radius: 5px;
+  color: var(--text); font: inherit; padding: 5px 10px; cursor: pointer;
+  white-space: nowrap;
+}
+.git-menu-item:hover:not(:disabled) { background: var(--accent-dim); color: #eaf0ff; }
+.git-menu-item:disabled { color: var(--text-dim); cursor: default; }
+.git-menu-item.danger:hover:not(:disabled) { background: #3a2029; color: #f7a2b2; }
+.git-menu-sep { height: 1px; margin: 4px 6px; background: var(--border-soft); }
+
+/* -- confirm / prompt modal -- */
+.git-modal-backdrop {
+  position: absolute; inset: 0; z-index: 8;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(6, 8, 14, 0.55);
+}
+.git-modal {
+  min-width: 260px; max-width: 82%;
+  background: var(--panel-2); border: 1px solid var(--border);
+  border-radius: 10px; padding: 16px 18px;
+  box-shadow: 0 12px 34px rgba(0, 0, 0, 0.55);
+}
+.git-modal-title { font-weight: 600; font-size: 13px; margin-bottom: 8px; }
+.git-modal-detail {
+  color: var(--text-dim); font-size: 12px; line-height: 1.5; margin-bottom: 14px;
+}
+.git-modal-input {
+  width: 100%; box-sizing: border-box; margin-bottom: 14px;
+  background: var(--bg-app); border: 1px solid var(--border); border-radius: 6px;
+  color: var(--text); font: inherit; font-size: 12.5px; padding: 6px 9px;
+}
+.git-modal-input:focus { outline: none; border-color: var(--accent); }
+.git-modal-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.git-modal-btn {
+  background: var(--panel); border: 1px solid var(--border); border-radius: 6px;
+  color: var(--text); font: inherit; font-size: 12px;
+  padding: 5px 14px; cursor: pointer;
+}
+.git-modal-btn:hover { background: var(--bg-app); }
+.git-modal-btn.primary {
+  background: var(--accent); border-color: var(--accent); color: #10131f; font-weight: 600;
+}
+.git-modal-btn.primary:hover { filter: brightness(1.08); }
+
+/* Busy state for pull/push/fetch toolbar buttons. */
+.pane-btn.busy { opacity: 0.6; animation: git-spin 0.9s linear infinite; }
+@keyframes git-spin { to { transform: rotate(360deg); } }
+.git-head-branch.clickable { cursor: pointer; }
+.git-head-branch.clickable:hover { text-decoration: underline; }
 
 /* ---------- task board overlay ---------- */
 .tasks-view {
@@ -739,6 +943,7 @@ html, body {
 }
 .group-line { color: var(--text); font-weight: 500; }
 .group-cost { color: var(--text-dim); font-size: 11px; }
+.group-cost-live { color: var(--text-dim); font-size: 10px; opacity: 0.75; }
 .group-paused-badge {
   font-size: 9.5px; font-weight: 600; border-radius: 4px; padding: 1px 7px;
   background: rgba(224, 175, 104, 0.16); color: #e0af68;
@@ -771,6 +976,7 @@ html, body {
   flex: none; font-family: "Cascadia Mono", Consolas, monospace;
   font-size: 10px; color: var(--text-dim); min-width: 42px; text-align: right;
 }
+.group-agent-cost { min-width: 96px; }
 .group-actions {
   display: flex; align-items: center; gap: 10px; flex: none;
   padding: 8px 12px; border-top: 1px solid var(--border-soft);

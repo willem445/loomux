@@ -6,6 +6,7 @@ import { SessionBrowser } from "./sessions";
 import { ensureOutputRouter, onPtyExit, type PtyExit, type SessionInfo } from "./pty";
 import { matchShortcut } from "./shortcuts";
 import { initStatusBar } from "./statusbar";
+import { initHintBar } from "./hintbar";
 import { AgentLauncher } from "./launcher";
 import { getAgentMode, setAgentMode } from "./agents";
 import { initOrchestration, launchOrchestrator, orchSessionRoles, resumeOrchSession } from "./orchestration";
@@ -29,9 +30,10 @@ window.addEventListener("unhandledrejection", (e) =>
 );
 
 const gridRoot = document.getElementById("grid-root")!;
+const paneDock = document.getElementById("pane-dock")!;
 const sessionsEl = document.getElementById("sessions")!;
 
-const grid = new Grid(gridRoot, () => {
+const grid = new Grid(gridRoot, paneDock, () => {
   // Last pane closed → always keep one pane alive.
   void openPane();
 });
@@ -40,6 +42,8 @@ const paneEvents: PaneEvents = {
   onFocus: (pane) => grid.setActive(pane),
   onCloseRequest: (pane) => grid.closePane(pane),
   onSplit: (pane, dir) => void openPane(dir, pane),
+  onMinimize: (pane) => grid.minimize(pane),
+  onMaximize: (pane) => grid.toggleMaximize(pane),
 };
 
 // PTYs whose exit event arrived before their pane finished starting.
@@ -199,6 +203,9 @@ document.addEventListener(
       case "toggle-git":
         grid.activePane?.toggleGitView();
         break;
+      case "open-editor":
+        void grid.activePane?.openInEditor();
+        break;
       case "toggle-tasks":
         grid.activePane?.toggleTasksView();
         break;
@@ -207,6 +214,12 @@ document.addEventListener(
         break;
       case "toggle-group":
         grid.activePane?.toggleGroupView();
+        break;
+      case "maximize-pane":
+        if (grid.activePane) grid.toggleMaximize(grid.activePane);
+        break;
+      case "minimize-pane":
+        if (grid.activePane) grid.minimize(grid.activePane);
         break;
       case "rename-pane":
         grid.activePane?.startRename();
@@ -257,6 +270,10 @@ void (async () => {
 
 // Start streaming CPU/mem/GPU/VRAM into the bottom status bar.
 initStatusBar();
+
+// Let the shortcut hint bar scroll horizontally on a vertical wheel when it
+// overflows a narrow window.
+initHintBar();
 
 // Orchestration: open badged panes when the backend spawns agents.
 initOrchestration(grid, paneEvents);

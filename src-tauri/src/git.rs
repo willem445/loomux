@@ -61,6 +61,15 @@ pub struct CommitInfo {
 }
 
 #[derive(Serialize)]
+pub struct BranchInfo {
+    pub name: String,
+    /// "local" | "remote"
+    pub kind: String,
+    /// True for the currently checked-out branch.
+    pub current: bool,
+}
+
+#[derive(Serialize)]
 pub struct FileEntry {
     pub path: String,
     /// Original path for renames/copies.
@@ -237,11 +246,204 @@ pub fn git_commit(repo: String, message: String) -> Result<(), String> {
 /// branch explicitly (dwim misfires when several remotes share the name).
 #[tauri::command]
 pub fn git_checkout(repo: String, refname: String, track: bool) -> Result<(), String> {
+    // `--` can't guard this the way it does elsewhere — for checkout it's the
+    // pathspec separator — so reject a leading-`-` name outright (see check_name).
+    check_name(&refname, "ref")?;
     if track {
         run_git(&repo, &["checkout", "--track", &refname]).map(|_| ())
     } else {
         run_git(&repo, &["checkout", &refname]).map(|_| ())
     }
+}
+
+// ---------- remote & history ops ----------
+//
+// All of these take user-chosen ref / branch / tag / remote names. Spawns are
+// arg-vectors so shell injection is impossible; `check_name` additionally
+// blocks a leading `-` so a crafted name can't be parsed as a git option.
+// Ops that can stop on a conflict (cherry-pick / revert / merge / rebase) are
+// run through `run_sequencer`, which aborts on failure so the working tree is
+// left clean — conflicts are surfaced as errors, never auto-resolved.
+
+/// Reject empty names and names that could be read as an option flag.
+fn check_name(name: &str, what: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err(format!("empty {what}"));
+    }
+    if name.starts_with('-') {
+        return Err(format!("invalid {what} {name:?}: must not start with '-'"));
+    }
+    Ok(())
+}
+
+/// Run a sequencer command; on failure abort it (restoring a clean tree, since
+/// this view has no conflict-resolution surface) and return a clear error.
+fn run_sequencer(repo: &str, args: &[&str], abort: &[&str], label: &str) -> Result<(), String> {
+    match run_git(repo, args) {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            // Best-effort: abort no-ops (and errors, ignored) when nothing was
+            // started, and unwinds a real conflict otherwise.
+            let _ = run_git(repo, abort);
+            Err(format!(
+                "{label} failed — working tree left unchanged:\n{e}"
+            ))
+        }
+    }
+}
+
+/// Fetch from remotes and prune deleted remote branches. A repo with no remote
+/// configured is a no-op success, so the refresh button never errors locally.
+#[tauri::command]
+pub fn git_fetch(repo: String, remote: Option<String>) -> Result<(), String> {
+    if let Some(r) = &remote {
+        check_name(r, "remote")?;
+        return run_git(&repo, &["fetch", "--prune", r]).map(|_| ());
+    }
+    if run_git(&repo, &["remote"])?.trim().is_empty() {
+        return Ok(());
+    }
+    run_git(&repo, &["fetch", "--all", "--prune"]).map(|_| ())
+}
+
+/// Push the current branch. With `set_upstream`, publish it to the first
+/// configured remote and set tracking (`push -u <remote> <branch>`); otherwise
+/// a plain `git push`, which needs an upstream already set. Auth / network
+/// failures surface verbatim.
+#[tauri::command]
+pub fn git_push(repo: String, set_upstream: bool) -> Result<(), String> {
+    if !set_upstream {
+        return run_git(&repo, &["push"]).map(|_| ());
+    }
+    let branch = run_git(&repo, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+    let branch = branch.trim();
+    if branch.is_empty() || branch == "HEAD" {
+        return Err("detached HEAD — check out a branch before publishing".to_string());
+    }
+    let remotes = run_git(&repo, &["remote"])?;
+    let remote = remotes
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .ok_or("no remote configured to publish to")?;
+    run_git(&repo, &["push", "-u", remote, branch]).map(|_| ())
+}
+
+/// Pull fast-forward-only — never creates an implicit merge or rebase. A
+/// diverged branch fails with git's "not possible to fast-forward" message,
+/// surfaced so the user resolves it deliberately.
+#[tauri::command]
+pub fn git_pull(repo: String) -> Result<(), String> {
+    run_git(&repo, &["pull", "--ff-only"]).map(|_| ())
+}
+
+/// Create a lightweight tag `name` at `hash`.
+#[tauri::command]
+pub fn git_tag(repo: String, name: String, hash: String) -> Result<(), String> {
+    check_name(&name, "tag name")?;
+    check_name(&hash, "commit")?;
+    run_git(&repo, &["tag", &name, &hash]).map(|_| ())
+}
+
+/// Create branch `name` at `hash`, optionally checking it out.
+#[tauri::command]
+pub fn git_branch_create(
+    repo: String,
+    name: String,
+    hash: String,
+    checkout: bool,
+) -> Result<(), String> {
+    check_name(&name, "branch name")?;
+    check_name(&hash, "commit")?;
+    if checkout {
+        run_git(&repo, &["checkout", "-b", &name, &hash]).map(|_| ())
+    } else {
+        run_git(&repo, &["branch", &name, &hash]).map(|_| ())
+    }
+}
+
+/// Cherry-pick `hash` onto the current branch. Conflicts abort (see module note).
+#[tauri::command]
+pub fn git_cherry_pick(repo: String, hash: String) -> Result<(), String> {
+    check_name(&hash, "commit")?;
+    run_sequencer(
+        &repo,
+        &["cherry-pick", &hash],
+        &["cherry-pick", "--abort"],
+        "cherry-pick",
+    )
+}
+
+/// Revert `hash` on the current branch (creates an inverse commit). Conflicts abort.
+#[tauri::command]
+pub fn git_revert(repo: String, hash: String) -> Result<(), String> {
+    check_name(&hash, "commit")?;
+    run_sequencer(
+        &repo,
+        &["revert", "--no-edit", &hash],
+        &["revert", "--abort"],
+        "revert",
+    )
+}
+
+/// Merge `refname` into the current branch. Conflicts abort.
+#[tauri::command]
+pub fn git_merge(repo: String, refname: String) -> Result<(), String> {
+    check_name(&refname, "ref")?;
+    run_sequencer(
+        &repo,
+        &["merge", "--no-edit", &refname],
+        &["merge", "--abort"],
+        "merge",
+    )
+}
+
+/// Rebase the current branch onto `upstream`. Conflicts abort.
+#[tauri::command]
+pub fn git_rebase(repo: String, upstream: String) -> Result<(), String> {
+    check_name(&upstream, "ref")?;
+    run_sequencer(
+        &repo,
+        &["rebase", &upstream],
+        &["rebase", "--abort"],
+        "rebase",
+    )
+}
+
+/// All local and remote-tracking branches, for the checkout menu. (`for-each-ref`
+/// has its own format language that does NOT expand `%x1f` like `git log`, so
+/// each ref is one line — ref names never contain whitespace — and the current
+/// branch is resolved separately.)
+#[tauri::command]
+pub fn git_branches(repo: String) -> Result<Vec<BranchInfo>, String> {
+    let current = run_git(&repo, &["rev-parse", "--abbrev-ref", "HEAD"])
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    let out = run_git(
+        &repo,
+        &["for-each-ref", "--format=%(refname)", "refs/heads", "refs/remotes"],
+    )?;
+    let mut branches = Vec::new();
+    for full in out.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        // Skip the symbolic <remote>/HEAD pointer.
+        if full.ends_with("/HEAD") {
+            continue;
+        }
+        if let Some(name) = full.strip_prefix("refs/heads/") {
+            branches.push(BranchInfo {
+                name: name.to_string(),
+                kind: "local".to_string(),
+                current: name == current,
+            });
+        } else if let Some(name) = full.strip_prefix("refs/remotes/") {
+            branches.push(BranchInfo {
+                name: name.to_string(),
+                kind: "remote".to_string(),
+                current: false,
+            });
+        }
+    }
+    Ok(branches)
 }
 
 /// Throw away changes to one file: restore tracked files, delete untracked.
@@ -666,5 +868,248 @@ mod tests {
         let diff = synth_untracked_diff(&dir, "t.txt").unwrap();
         assert!(diff.contains("@@ -0,0 +1,2 @@"));
         assert!(diff.contains("+one\n+two\n"));
+    }
+
+    // ---------- git-op integration tests (spawn the real git CLI) ----------
+    //
+    // Each exercises one command's success path plus the failure paths called
+    // out in the issue: dirty-tree checkout, conflicting cherry-pick, and
+    // push/pull against a local bare repo.
+
+    use std::process::Command as StdCommand;
+
+    /// Path as a git-friendly string (forward slashes).
+    fn p(dir: &Path) -> String {
+        dir.to_string_lossy().replace('\\', "/")
+    }
+
+    /// Run git in `dir` for test setup; panics on failure.
+    fn setup_git(dir: &Path, args: &[&str]) {
+        let out = StdCommand::new("git")
+            .current_dir(dir)
+            .args(args)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_CONFIG_GLOBAL", "") // ignore the developer's global config
+            .env("GIT_CONFIG_SYSTEM", "")
+            .output()
+            .expect("spawn git");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// Fresh work repo on branch `main` with a deterministic identity and no
+    /// line-ending rewriting (so content round-trips byte-for-byte on Windows).
+    fn new_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        setup_git(d, &["init", "-q"]);
+        // Point the unborn HEAD at `main` regardless of git version / config.
+        setup_git(d, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        setup_git(d, &["config", "user.name", "Test"]);
+        setup_git(d, &["config", "user.email", "test@example.com"]);
+        setup_git(d, &["config", "commit.gpgsign", "false"]);
+        setup_git(d, &["config", "core.autocrlf", "false"]);
+        dir
+    }
+
+    /// Write `file`, commit it, and return the new HEAD hash.
+    fn commit(dir: &Path, file: &str, content: &str, msg: &str) -> String {
+        std::fs::write(dir.join(file), content).unwrap();
+        setup_git(dir, &["add", file]);
+        setup_git(dir, &["commit", "-q", "-m", msg]);
+        run_git(&p(dir), &["rev-parse", "HEAD"]).unwrap().trim().to_string()
+    }
+
+    fn read(dir: &Path, file: &str) -> String {
+        std::fs::read_to_string(dir.join(file)).unwrap()
+    }
+
+    fn is_clean(dir: &Path) -> bool {
+        run_git(&p(dir), &["status", "--porcelain"]).unwrap().trim().is_empty()
+    }
+
+    #[test]
+    fn tag_and_branch_create_and_list() {
+        let repo = new_repo();
+        let d = repo.path();
+        let a = commit(d, "f.txt", "a\n", "A");
+
+        git_tag(p(d), "v1".into(), a.clone()).unwrap();
+        assert!(run_git(&p(d), &["tag"]).unwrap().contains("v1"));
+        // A name that looks like an option is rejected before spawning git.
+        assert!(git_tag(p(d), "-x".into(), a.clone()).is_err());
+
+        git_branch_create(p(d), "topic".into(), a.clone(), false).unwrap();
+        let names: Vec<String> = git_branches(p(d)).unwrap().into_iter().map(|b| b.name).collect();
+        assert!(names.contains(&"main".to_string()) && names.contains(&"topic".to_string()));
+        let current: Vec<String> =
+            git_branches(p(d)).unwrap().into_iter().filter(|b| b.current).map(|b| b.name).collect();
+        assert_eq!(current, vec!["main"]);
+    }
+
+    #[test]
+    fn checkout_switches_and_refuses_dirty_overwrite() {
+        let repo = new_repo();
+        let d = repo.path();
+        commit(d, "f.txt", "one\n", "A");
+        git_branch_create(p(d), "feat".into(), "HEAD".into(), true).unwrap();
+        commit(d, "f.txt", "two\n", "B on feat");
+
+        git_checkout(p(d), "main".into(), false).unwrap();
+        assert_eq!(read(d, "f.txt"), "one\n");
+
+        // An uncommitted change that checkout would clobber must be refused.
+        std::fs::write(d.join("f.txt"), "dirty\n").unwrap();
+        let err = git_checkout(p(d), "feat".into(), false).unwrap_err();
+        assert!(err.contains("would be overwritten") || err.contains("overwritten by checkout"));
+        // Still on main with the dirty content intact.
+        assert_eq!(read(d, "f.txt"), "dirty\n");
+    }
+
+    #[test]
+    fn checkout_rejects_option_like_refname() {
+        let repo = new_repo();
+        let d = repo.path();
+        commit(d, "f.txt", "a\n", "A");
+        // A leading-`-` name is blocked before ever reaching git, so it can't
+        // be parsed as an option (checkout can't use `--` to guard it).
+        let err = git_checkout(p(d), "-f".into(), false).unwrap_err();
+        assert!(err.contains("must not start with '-'"), "got: {err}");
+        assert!(git_checkout(p(d), "--track".into(), true).is_err());
+    }
+
+    #[test]
+    fn cherry_pick_applies_then_aborts_on_conflict() {
+        // Clean apply: pick a commit that touches a different region.
+        let repo = new_repo();
+        let d = repo.path();
+        commit(d, "f.txt", "L1\n", "A");
+        git_branch_create(p(d), "feature".into(), "HEAD".into(), true).unwrap();
+        let b = commit(d, "f.txt", "L1\nL2\n", "add L2");
+        git_checkout(p(d), "main".into(), false).unwrap();
+        git_cherry_pick(p(d), b).unwrap();
+        assert!(read(d, "f.txt").contains("L2"));
+
+        // Conflicting apply: same line changed two ways → abort, tree clean.
+        let repo2 = new_repo();
+        let d2 = repo2.path();
+        commit(d2, "f.txt", "base\n", "A");
+        git_branch_create(p(d2), "feature".into(), "HEAD".into(), true).unwrap();
+        let fb = commit(d2, "f.txt", "feature\n", "feature edit");
+        git_checkout(p(d2), "main".into(), false).unwrap();
+        commit(d2, "f.txt", "mainline\n", "main edit");
+        let err = git_cherry_pick(p(d2), fb).unwrap_err();
+        assert!(err.contains("cherry-pick failed"));
+        assert!(is_clean(d2), "conflict must be aborted to a clean tree");
+        assert_eq!(read(d2, "f.txt"), "mainline\n");
+    }
+
+    #[test]
+    fn revert_creates_inverse_commit() {
+        let repo = new_repo();
+        let d = repo.path();
+        commit(d, "f.txt", "a\n", "A");
+        let b = commit(d, "f.txt", "a\nb\n", "B adds b");
+        git_revert(p(d), b).unwrap();
+        assert_eq!(read(d, "f.txt"), "a\n");
+        // A revert is a new commit, so the tree is clean afterwards.
+        assert!(is_clean(d));
+    }
+
+    #[test]
+    fn merge_joins_branch_then_aborts_on_conflict() {
+        // Clean merge of a branch that adds a new file.
+        let repo = new_repo();
+        let d = repo.path();
+        commit(d, "f.txt", "base\n", "A");
+        git_branch_create(p(d), "feature".into(), "HEAD".into(), true).unwrap();
+        commit(d, "g.txt", "new\n", "add g");
+        git_checkout(p(d), "main".into(), false).unwrap();
+        git_merge(p(d), "feature".into()).unwrap();
+        assert!(d.join("g.txt").exists());
+
+        // Conflicting merge → abort, tree clean.
+        let repo2 = new_repo();
+        let d2 = repo2.path();
+        commit(d2, "f.txt", "base\n", "A");
+        git_branch_create(p(d2), "feature".into(), "HEAD".into(), true).unwrap();
+        commit(d2, "f.txt", "feature\n", "feature edit");
+        git_checkout(p(d2), "main".into(), false).unwrap();
+        commit(d2, "f.txt", "mainline\n", "main edit");
+        let err = git_merge(p(d2), "feature".into()).unwrap_err();
+        assert!(err.contains("merge failed"));
+        assert!(is_clean(d2), "conflicted merge must be aborted");
+    }
+
+    #[test]
+    fn rebase_replays_onto_upstream() {
+        let repo = new_repo();
+        let d = repo.path();
+        commit(d, "f.txt", "base\n", "A");
+        git_branch_create(p(d), "feature".into(), "HEAD".into(), true).unwrap();
+        commit(d, "feat.txt", "feature work\n", "feature commit");
+        git_checkout(p(d), "main".into(), false).unwrap();
+        commit(d, "main.txt", "main work\n", "main commit");
+        git_checkout(p(d), "feature".into(), false).unwrap();
+        git_rebase(p(d), "main".into()).unwrap();
+        // After rebasing onto main, the feature branch sees main's file too.
+        assert!(d.join("main.txt").exists());
+        assert!(d.join("feat.txt").exists());
+    }
+
+    #[test]
+    fn fetch_push_pull_against_bare_remote() {
+        let bare = tempfile::tempdir().unwrap();
+        setup_git(bare.path(), &["init", "-q", "--bare"]);
+        // So a later clone checks out `main` (tracking origin/main) instead of
+        // landing on the bare's default unborn `master`.
+        setup_git(bare.path(), &["symbolic-ref", "HEAD", "refs/heads/main"]);
+
+        // Repo 1 publishes main to the bare remote.
+        let repo1 = new_repo();
+        let d1 = repo1.path();
+        commit(d1, "f.txt", "one\n", "A");
+        setup_git(d1, &["remote", "add", "origin", &p(bare.path())]);
+        git_push(p(d1), true).unwrap(); // set upstream + push
+        // A plain push now works because the upstream is set.
+        commit(d1, "f.txt", "one\ntwo\n", "B");
+        git_push(p(d1), false).unwrap();
+
+        // Repo 2 clones, adds a commit, pushes it.
+        let clone_dir = tempfile::tempdir().unwrap();
+        setup_git(clone_dir.path(), &["clone", "-q", &p(bare.path()), "wc"]);
+        let d2 = clone_dir.path().join("wc");
+        setup_git(&d2, &["config", "user.name", "Two"]);
+        setup_git(&d2, &["config", "user.email", "two@example.com"]);
+        setup_git(&d2, &["config", "core.autocrlf", "false"]);
+        commit(&d2, "f.txt", "one\ntwo\nthree\n", "C from clone");
+        git_push(p(&d2), false).unwrap();
+
+        // Repo 1 fetches and fast-forwards to C.
+        git_fetch(p(d1), None).unwrap();
+        git_pull(p(d1)).unwrap();
+        assert_eq!(read(d1, "f.txt"), "one\ntwo\nthree\n");
+
+        // Divergence makes a fast-forward pull fail (never an implicit merge).
+        commit(d1, "f.txt", "one\ntwo\nthree\nlocal\n", "D local only");
+        commit(&d2, "f.txt", "one\ntwo\nthree\nremote\n", "E remote only");
+        git_push(p(&d2), false).unwrap();
+        git_fetch(p(d1), None).unwrap();
+        let err = git_pull(p(d1)).unwrap_err();
+        assert!(
+            err.contains("fast-forward") || err.contains("Not possible") || err.contains("diverging"),
+            "diverged pull should refuse: {err}"
+        );
+    }
+
+    #[test]
+    fn fetch_is_noop_without_remote() {
+        let repo = new_repo();
+        commit(repo.path(), "f.txt", "a\n", "A");
+        // No remote configured — fetch must succeed quietly, not error.
+        git_fetch(p(repo.path()), None).unwrap();
     }
 }

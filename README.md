@@ -62,6 +62,7 @@ run `xattr -cr /Applications/Loomux.app` (the install script does this for you).
 npm install        # once
 npm run tauri dev  # develop (hot-reloads the UI)
 npm run tauri build  # produce a distributable app / installer
+npm test           # unit tests (Node's built-in runner; no extra deps)
 ```
 
 ## Use
@@ -74,11 +75,35 @@ npm run tauri build  # produce a distributable app / installer
 | Rename pane | `F2`, or double-click its title |
 | Move focus | `Alt+←/→/↑/↓` (or click) |
 | Resize panes | drag the divider between them |
+| Reorder / move panes | drag a pane by its header (see below) |
+| Maximize pane | `Ctrl+Shift+M` (or ⤢); same keys restore |
+| Minimize pane | `Alt+M` (or —); restore from the dock |
 | Session browser | `Ctrl+Shift+P` (or the *sessions* button) |
+| Open in editor | `Alt+E` (or the `</>` button in a pane header) |
 | Copy / paste | `Ctrl+Shift+C` / `Ctrl+Shift+V` (`Ctrl+V` also works) |
 
 Splitting in the same direction adds a sibling column/row — repeated splits
 form an even matrix instead of a lopsided staircase.
+
+### Rearranging panes
+
+Panes get cramped fast once the orchestrator opens one per agent, so the grid
+can be rearranged without splitting from scratch:
+
+- **Drag to reorder or move** — grab a pane by its header and drag it over
+  another pane. A snap preview shows where it will land:
+  - drop on the **middle** to *swap* the two panes in place, or
+  - drop on an **edge** (left/right/top/bottom half) to move the pane to that
+    side, re-splitting the target.
+  Release to drop, or press `Esc` to cancel. Swapping two equally-sized slots
+  never resizes their terminals, so no scrollback is disturbed.
+- **Maximize** (`Ctrl+Shift+M` or the ⤢ button) blows one pane up to fill the
+  grid; the same shortcut (or the ⤡ restore button) puts it back. The other
+  panes are hidden rather than shrunk, so they don't repaint.
+- **Minimize** (`Alt+M` or the — button) parks a pane in the **dock** strip at
+  the bottom of the grid — it keeps running. Click its chip to bring it back,
+  or the chip's ✕ to close it for good. (This is loomux's take on the issue's
+  "minimize to tray": an in-app restore dock rather than the OS tray.)
 
 ### Session browser
 
@@ -91,6 +116,60 @@ Scans the local machine for resumable agent sessions:
 
 Clicking a session opens a new pane in the session's original working
 directory and resumes it there. The pane is auto-named from the session.
+
+### Open in editor
+
+Loomux is a terminal, not an editor — so when you need to open files in a real
+editor, the `</>` button in a pane header (or `Alt+E`) launches your editor on
+that pane's current folder. The first time, you're asked for the editor
+command; it's remembered after that.
+
+- Set it to `code` (VS Code), `zed`, `subl`, or any command on your `PATH`, or
+  to a full path to the editor executable.
+- The workspace folder is passed as the editor's sole argument, spawned
+  detached — the editor keeps running independently of loomux.
+- Right-click the `</>` button any time to change the editor command.
+
+If nothing is configured, or the editor can't be found/launched, loomux shows a
+short toast explaining what went wrong.
+
+### Git view
+
+`Alt+G` (or the ⑂ icon in a pane header) overlays a git panel on the pane,
+scoped to the repository the shell is currently in — a commit graph, a diff
+preview, and the working-tree changes with staging and commit. It never
+resizes the terminal underneath. Press `Esc` (or ✕) to return.
+
+Toolbar (top-right of the graph):
+
+| Button | Does |
+| --- | --- |
+| ↓ | **Pull** the current branch — fast-forward only, so it never creates a surprise merge; a diverged branch reports the conflict instead. |
+| ↑ | **Push** the current branch. If it has no upstream yet, you're offered to publish it to the remote and set tracking. |
+| ↻ | **Fetch** from all remotes (with prune) and refresh the view. |
+
+Click the **branch name** in the header to switch branches — the menu lists
+every local branch plus remote-tracking branches (checking a remote one out
+creates a local tracking branch).
+
+**Right-click a commit** for its actions: checkout (detached), create a branch
+or tag here, cherry-pick / revert / merge / rebase onto the current branch, or
+copy the commit hash or subject. **Right-click a branch/tag chip** to check it
+out directly (double-click still works too).
+
+History-changing operations (cherry-pick, revert, merge, rebase) ask for
+confirmation first. If any of them hit a conflict, loomux aborts the operation
+and leaves your working tree exactly as it was, reporting the conflict — it
+never leaves you in a half-finished, conflicted state to untangle. Resolve
+those in a terminal.
+
+The view (and the pane's header branch chip) also react to changes made
+**outside** the pane's shell — a `git checkout`, commit, or stage run from VS
+Code or another terminal shows up within a couple of seconds, without you
+having to press Enter in the pane. A lightweight backend watch samples the
+repo's `.git` metadata (HEAD, index, refs) once a second while a pane has it
+open, and feeds the same throttled refresh a shell prompt would; it stops when
+the pane closes.
 
 ## Agent orchestration
 
@@ -227,7 +306,8 @@ src-tauri/src/
 src/
   pty.ts            typed bridge to the backend (invoke + event bus)
   pane.ts           one terminal pane: xterm instance + header UI
-  grid.ts           split-tree layout, dividers, focus navigation
+  grid.ts           split-tree layout, dividers, focus, drag/maximize/minimize
+  layout.ts         pure drag-reorder geometry (unit-tested, DOM-free)
   sessions.ts       session browser sidebar
   launcher.ts       new-agent-pane dialog (single / multi / orchestrator)
   orchestration.ts  frontend half of agent groups (panes, badges, focus)

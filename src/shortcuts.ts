@@ -9,9 +9,12 @@ export type ShortcutAction =
   | "toggle-sessions"
   | "toggle-agent-mode"
   | "toggle-git"
+  | "open-editor"
   | "toggle-tasks"
   | "toggle-audit"
   | "toggle-group"
+  | "maximize-pane"
+  | "minimize-pane"
   | "rename-pane"
   | "focus-left"
   | "focus-right"
@@ -26,10 +29,12 @@ export function matchShortcut(e: KeyboardEvent): ShortcutAction | null {
       case "KeyW": return "close-pane";
       case "KeyP": return "toggle-sessions";
       case "KeyA": return "toggle-agent-mode";
+      case "KeyM": return "maximize-pane";
     }
   }
   if (e.altKey && !e.ctrlKey && !e.shiftKey) {
     switch (e.code) {
+      case "KeyM": return "minimize-pane";
       case "ArrowLeft": return "focus-left";
       case "ArrowRight": return "focus-right";
       case "ArrowUp": return "focus-up";
@@ -37,6 +42,7 @@ export function matchShortcut(e: KeyboardEvent): ShortcutAction | null {
       // Alt+G, not Ctrl+Shift+G: WebView2 consumes that as its
       // find-previous accelerator before the page ever sees it.
       case "KeyG": return "toggle-git";
+      case "KeyE": return "open-editor";
       case "KeyT": return "toggle-tasks";
       case "KeyA": return "toggle-audit";
       case "KeyO": return "toggle-group";
