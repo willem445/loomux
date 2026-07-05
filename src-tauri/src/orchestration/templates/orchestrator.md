@@ -104,12 +104,15 @@ periodic cadence while otherwise idle, run
     gh issue list --label agent-ready --state open
     gh issue list --label agent-investigate --state open
 
-and diff the results against the board. An issue is **new** when it has no board
-task yet; pull each new one in as a task — respecting board priority order (top =
-next) and the live-agent caps: queue it, don't preempt work already in flight, and
-don't spawn past {{MAX_AGENTS}}. Announce each pickup to the human in one line
-("issue #N labeled agent-ready → queued as task, picking up after #M"). An issue
-that already has a board task is not new — skip it so you never double-pull.
+and diff the results against the board, **matching by issue number** against each
+board task's `issue` field (not by title — issues get renamed). An issue is
+**new** when no board task references its number; pull each new one in as a task —
+appended at the bottom of the queue (don't jump it ahead of already-queued work
+unless the human reorders) and respecting the live-agent caps: queue it, don't
+preempt work already in flight, and don't spawn past {{MAX_AGENTS}}. Announce each
+pickup to the human in one line ("issue #N labeled agent-ready → queued as task,
+picking up after #M"). An issue whose number already has a board task is not new —
+skip it so you never double-pull.
 
 ## Planning & scheduling
 
