@@ -45,6 +45,26 @@ function fmtUptime(ms: number | null | undefined): string {
 
 const fmtCost = (n: number | null): string => (n == null ? "—" : `$${n.toFixed(2)}`);
 
+/** Compact token count: "845", "12K", "1.20M". Tokens are the reliable metric
+ *  (subscription/Max accounts show $0.00 in the CLI regardless of usage). */
+function fmtTokens(n: number): string {
+  if (n < 1000) return `${n}`;
+  if (n < 1_000_000) return `${(n / 1000).toFixed(n < 10_000 ? 1 : 0)}K`;
+  return `${(n / 1_000_000).toFixed(2)}M`;
+}
+
+/** Format a dollar total with its basis label. Estimated/mixed totals get a
+ *  `~` (they include price-table estimates); a purely CLI-`reported` total does
+ *  not. `mixed` means the total blends estimated and reported figures. */
+function costWithBasis(
+  n: number,
+  basis: "estimated" | "reported" | "mixed" | null
+): string {
+  const approx = basis === "reported" ? "" : "~";
+  const label = basis ? ` ${basis === "estimated" ? "est" : basis}` : "";
+  return `${approx}${fmtCost(n)}${label}`;
+}
+
 const ROLE_LABEL: Record<string, string> = {
   orchestrator: "ORCH",
   worker: "W",
@@ -235,10 +255,27 @@ export class GroupView {
         ` · up ${fmtUptime(s.uptime_ms)}`
     );
     this.summaryEl.append(line);
-    const total = this.usage?.total_cost_usd ?? null;
-    const cost = el("div", "group-cost", `group cost ${fmtCost(total)}`);
-    if (total == null) cost.title = "No pane is showing a $ figure yet — cost is unknown, not zero.";
+
+    // Cost line: tokens are the honest metric (exact, and non-zero even on
+    // Max plans where the CLI reports $0.00); dollars are a labelled estimate.
+    // Lifetime includes killed/recycled agents; live is the current burn.
+    const u = this.usage;
+    const lifetimeCost = u?.lifetime_cost_usd ?? null;
+    const parts: string[] = [`${fmtTokens(u?.lifetime_tokens ?? 0)} tok`];
+    if (lifetimeCost != null) parts.unshift(costWithBasis(lifetimeCost, u?.lifetime_cost_basis ?? null));
+    const cost = el("div", "group-cost", `group lifetime cost — ${parts.join(" · ")}`);
+    cost.title =
+      "Tokens come from each agent's session transcript and are exact. Dollars are estimated from a dated model price table — subscription/Max accounts show $0.00 in the CLI regardless of usage, so tokens are the reliable metric. 'reported' = the CLI's own figure; 'mixed' = a blend of both. Lifetime includes killed/recycled agents.";
     this.summaryEl.append(cost);
+
+    // Live burn (current agents only), shown when it differs from lifetime.
+    const liveCost = u?.live_cost_usd ?? null;
+    const liveTok = u?.live_tokens ?? 0;
+    const liveParts: string[] = [`${fmtTokens(liveTok)} tok`];
+    if (liveCost != null) liveParts.unshift(costWithBasis(liveCost, u?.live_cost_basis ?? null));
+    const live = el("div", "group-cost-live", `live — ${liveParts.join(" · ")}`);
+    this.summaryEl.append(live);
+
     if (s.paused) this.summaryEl.append(el("span", "group-paused-badge", "paused"));
 
     // Per-agent rows: role chip, name, uptime, state, cost.
@@ -246,7 +283,7 @@ export class GroupView {
     if (s.agents.length === 0) {
       this.listEl.append(el("div", "group-empty", "No live agents in this group."));
     } else {
-      const costOf = new Map(this.usage?.agents.map((a) => [a.id, a.cost_usd] as const));
+      const usageOf = new Map(this.usage?.agents.map((a) => [a.id, a] as const));
       for (const a of s.agents) {
         const row = el("div", "group-row");
         const chip = el("span", `group-role role-${a.role}`, ROLE_LABEL[a.role] ?? "AGENT");
@@ -259,7 +296,23 @@ export class GroupView {
         );
         if (a.task) state.title = a.task;
         const up = el("span", "group-uptime", fmtUptime(a.uptime_ms));
-        const c = el("span", "group-agent-cost", fmtCost(costOf.get(a.id) ?? null));
+
+        // Tokens first (always trustworthy), then the dollar figure with a
+        // reported/estimated marker so a $0.00 Max-plan figure isn't mistaken
+        // for "no usage".
+        const usage = usageOf.get(a.id);
+        const tok = usage ? `${fmtTokens(usage.tokens.total)} tok` : "";
+        const c = el("span", "group-agent-cost");
+        if (usage && usage.cost_usd != null) {
+          const mark = usage.estimated ? "~" : "";
+          const label = usage.estimated ? "est" : "reported";
+          c.textContent = `${mark}${fmtCost(usage.cost_usd)} ${label}${tok ? ` · ${tok}` : ""}`;
+        } else {
+          c.textContent = tok || "—";
+        }
+        if (usage) {
+          c.title = `source: ${usage.source}${usage.model ? ` · ${usage.model}` : ""} · ${usage.tokens.total} tokens (in ${usage.tokens.input}, out ${usage.tokens.output}, cache +${usage.tokens.cache_creation}/${usage.tokens.cache_read})`;
+        }
         row.append(chip, name, state, up, c);
         this.listEl.append(row);
       }

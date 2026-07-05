@@ -570,6 +570,36 @@ pub struct AgentRecord {
     pub updated_ms: u64,
 }
 
+/// Durable per-agent usage snapshot (`usage.json` per group). Keyed by the CLI
+/// session id when known (so a resumed session updates one row instead of
+/// double-counting), else `agent:<id>`. Snapshots survive `kill_agent`/exit —
+/// captured in `mark_dead` — so a group's lifetime cost keeps counting
+/// recycled panes (issue #42).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UsageSnapshot {
+    /// Stable identity: the CLI session id, or `agent:<id>` when there is none.
+    pub key: String,
+    pub agent_id: String,
+    pub name: String,
+    pub role: String,
+    /// Where the figures came from: `transcript` (token-derived, exact tokens),
+    /// `statusline` (last-resort parse of the CLI's own dollar figure), or
+    /// `none` (nothing available yet).
+    pub source: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub cache_read_tokens: u64,
+    /// Dollar cost, or `None` when only tokens are known (unknown model, or a
+    /// transcript-less agent whose statusline shows nothing).
+    pub cost_usd: Option<f64>,
+    /// true = dollars estimated from the price table; false = reported by the
+    /// CLI's statusline (which reads $0.00 on subscription/Max accounts).
+    pub estimated: bool,
+    pub model: Option<String>,
+    pub updated_ms: u64,
+}
+
 /// A recorded session's orchestration identity, for the session browser.
 #[derive(Clone, Serialize)]
 pub struct SessionRole {
@@ -658,6 +688,11 @@ pub struct OrchRegistry {
     attn_emitted: Mutex<HashMap<String, String>>,
     /// Groups with desktop notifications enabled (durable `notify` marker file).
     notify_groups: Mutex<HashSet<String>>,
+    /// Test-only override of the Claude transcript root (`~/.claude/projects`).
+    /// `None` in production. Set via `set_claude_projects_dir` so the usage
+    /// reader can be pointed at a fixture tree without touching global env —
+    /// safe under parallel test execution.
+    claude_projects_dir: Mutex<Option<PathBuf>>,
 }
 
 fn now_ms() -> u64 {
@@ -958,7 +993,15 @@ impl OrchRegistry {
             attn_waiting_ack: Mutex::new(HashSet::new()),
             attn_emitted: Mutex::new(HashMap::new()),
             notify_groups: Mutex::new(HashSet::new()),
+            claude_projects_dir: Mutex::new(None),
         }
+    }
+
+    /// Point the usage reader at a specific Claude transcript root, instead of
+    /// `~/.claude/projects`. Test-only seam (see `claude_projects_dir`).
+    #[doc(hidden)]
+    pub fn set_claude_projects_dir(&self, dir: PathBuf) {
+        *self.claude_projects_dir.lock().unwrap() = Some(dir);
     }
 
     /// Record the `Arc` the registry is stored behind so `&self` methods can
@@ -2211,13 +2254,170 @@ impl OrchRegistry {
         Ok(())
     }
 
-    /// Aggregate the group's per-pane session cost into one summary. Cost is
-    /// parsed best-effort from each live agent's in-pane statusline (see
-    /// `parse_session_cost`); an agent whose statusline shows no dollar
-    /// figure contributes `null` and is excluded from the total.
+    /// Compute an agent's current usage from the best available source, in
+    /// preference order: the CLI's own session transcript (token records —
+    /// exact, and readable even after the pane is gone) → a last-resort parse
+    /// of the dollar figure the CLI prints in its statusline. Returns a
+    /// snapshot keyed for durable accumulation (issue #42).
+    fn compute_usage_snapshot(&self, entry: &AgentEntry, cli: &str) -> UsageSnapshot {
+        let key = entry
+            .session_id
+            .clone()
+            .unwrap_or_else(|| format!("agent:{}", entry.id));
+        let role = match entry.role {
+            Role::Orchestrator => "orchestrator",
+            Role::Worker => "worker",
+            Role::Reviewer => "reviewer",
+        };
+        let mut snap = UsageSnapshot {
+            key,
+            agent_id: entry.id.clone(),
+            name: entry.name.clone(),
+            role: role.to_string(),
+            source: "none".to_string(),
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            cost_usd: None,
+            estimated: false,
+            model: None,
+            updated_ms: now_ms(),
+        };
+
+        // Primary source: per-session token usage from the transcript. Claude
+        // Code writes it; Copilot has no readable token record today (see the
+        // `usage` module's design note), so it falls through to the statusline.
+        if cli == "claude" {
+            if let Some(sid) = entry.session_id.as_deref() {
+                // Use the test override when set, else the default ~/.claude root.
+                let root = self
+                    .claude_projects_dir
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .or_else(crate::usage::default_claude_projects_root);
+                if let Some(u) = root
+                    .as_deref()
+                    .and_then(|r| crate::usage::claude_session_usage_in(r, sid))
+                {
+                    if u.tokens.total() > 0 {
+                        snap.source = "transcript".to_string();
+                        snap.input_tokens = u.tokens.input_tokens;
+                        snap.output_tokens = u.tokens.output_tokens;
+                        snap.cache_creation_tokens = u.tokens.cache_creation_tokens;
+                        snap.cache_read_tokens = u.tokens.cache_read_tokens;
+                        snap.cost_usd = u.cost_usd;
+                        snap.estimated = true; // token-derived dollar estimate
+                        snap.model = u.model;
+                        return snap;
+                    }
+                }
+            }
+        }
+
+        // Last resort: the dollar figure the CLI renders in its own statusline.
+        // Unreliable (empty on subscription/Max accounts; gone once the pane is
+        // killed), so it only runs when no transcript usage was found.
+        if let Some(app) = self.app.lock().unwrap().clone() {
+            if let Some(pty) = entry.pty_id {
+                let ptys = app.state::<crate::pty::PtyManager>();
+                if let Some(raw) = ptys.output_tail(pty) {
+                    if let Some(c) = parse_session_cost(&strip_ansi(&raw)) {
+                        snap.source = "statusline".to_string();
+                        snap.cost_usd = Some(c); // reported by the CLI, not estimated
+                    }
+                }
+            }
+        }
+        snap
+    }
+
+    fn load_usage_snapshots(&self, group: &str) -> Vec<UsageSnapshot> {
+        let path = self.group_dir(group).join("usage.json");
+        let Ok(text) = fs::read_to_string(&path) else {
+            return Vec::new(); // absent is normal (no usage yet)
+        };
+        match serde_json::from_str(&text) {
+            Ok(list) => list,
+            Err(e) => {
+                // The file exists but is corrupt (interrupted write, manual
+                // edit). Silently treating it as empty would wipe all
+                // killed-agent history, so preserve it for inspection and
+                // start fresh rather than overwrite it on the next upsert.
+                let bad = path.with_extension("json.bad");
+                let _ = fs::rename(&path, &bad);
+                self.audit(group, "loomux", "usage-corrupt",
+                    json!({ "error": e.to_string(), "preserved": bad.to_string_lossy() }));
+                Vec::new()
+            }
+        }
+    }
+
+    /// Upsert one agent's snapshot into the group's durable `usage.json`,
+    /// matched by `key`. Shares the task-board file lock. Public for the
+    /// kill-snapshot accumulation test.
+    #[doc(hidden)]
+    pub fn upsert_usage_snapshot(&self, group: &str, snap: UsageSnapshot) {
+        let _guard = self.tasks_lock.lock().unwrap();
+        let mut list = self.load_usage_snapshots(group);
+        match list.iter_mut().find(|s| s.key == snap.key) {
+            Some(existing) => {
+                // A transcript only ever grows, so a read that comes back empty
+                // (e.g. transient failure, or the pane died before Copilot wrote
+                // a token record) must not clobber usage we already captured —
+                // otherwise a kill could zero a session's spend. Refresh the
+                // identity fields but keep the richer usage.
+                let new_empty = snap.source == "none"
+                    && snap.cost_usd.is_none()
+                    && snap.input_tokens
+                        + snap.output_tokens
+                        + snap.cache_creation_tokens
+                        + snap.cache_read_tokens
+                        == 0;
+                let old_has_data = existing.source != "none"
+                    || existing.cost_usd.is_some()
+                    || existing.input_tokens
+                        + existing.output_tokens
+                        + existing.cache_creation_tokens
+                        + existing.cache_read_tokens
+                        > 0;
+                if new_empty && old_has_data {
+                    existing.agent_id = snap.agent_id;
+                    existing.name = snap.name;
+                    existing.role = snap.role;
+                    existing.updated_ms = snap.updated_ms;
+                } else {
+                    *existing = snap;
+                }
+            }
+            None => list.push(snap),
+        }
+        let dir = self.group_dir(group);
+        let _ = fs::create_dir_all(&dir);
+        // Crash-safe write: serialize to a temp file, then atomically rename
+        // over usage.json. A crash mid-write leaves the old (valid) file or
+        // the temp file behind, never a half-written usage.json.
+        let path = dir.join("usage.json");
+        let tmp = dir.join("usage.json.tmp");
+        let body = serde_json::to_string_pretty(&list).unwrap();
+        if fs::write(&tmp, &body).is_ok() {
+            if fs::rename(&tmp, &path).is_err() {
+                // Rename can fail if the destination exists on some platforms;
+                // fall back to a direct write so we don't lose the update.
+                let _ = fs::write(&path, &body);
+                let _ = fs::remove_file(&tmp);
+            }
+        }
+    }
+
+    /// Aggregate the group's usage into one summary with a **live vs lifetime**
+    /// split. Live agents' snapshots are refreshed from their transcripts on
+    /// each call; killed/recycled agents keep the snapshot captured when they
+    /// exited, so the lifetime total never forgets historical spend. Tokens are
+    /// exact; dollar figures are estimates (labelled per agent).
     pub fn group_usage(&self, group: &str) -> Value {
-        let app = self.app.lock().unwrap().clone();
-        let agents: Vec<AgentEntry> = self
+        let live_agents: Vec<AgentEntry> = self
             .agents
             .lock()
             .unwrap()
@@ -2225,29 +2425,104 @@ impl OrchRegistry {
             .filter(|a| a.group == group && a.status != AgentStatus::Dead)
             .cloned()
             .collect();
-        let mut total = 0.0f64;
-        let mut any = false;
-        let mut list: Vec<Value> = agents
-            .iter()
-            .map(|a| {
-                let cost = app.as_ref().zip(a.pty_id).and_then(|(app, pty)| {
-                    let ptys = app.state::<crate::pty::PtyManager>();
-                    let raw = ptys.output_tail(pty)?;
-                    parse_session_cost(&strip_ansi(&raw))
-                });
-                if let Some(c) = cost {
-                    total += c;
-                    any = true;
+        let cli = self
+            .group(group)
+            .map(|g| g.guardrails.agent_cli)
+            .unwrap_or_else(|| "claude".to_string());
+
+        // Refresh each live agent's durable snapshot from its current usage.
+        let mut live_keys: HashSet<String> = HashSet::new();
+        for a in &live_agents {
+            let snap = self.compute_usage_snapshot(a, &cli);
+            live_keys.insert(snap.key.clone());
+            self.upsert_usage_snapshot(group, snap);
+        }
+
+        // The store now holds live + historical (killed) snapshots.
+        let snaps = {
+            let _guard = self.tasks_lock.lock().unwrap();
+            self.load_usage_snapshots(group)
+        };
+
+        let (mut live_cost, mut lifetime_cost) = (0.0f64, 0.0f64);
+        let (mut live_cost_known, mut lifetime_cost_known) = (false, false);
+        let (mut live_tokens, mut lifetime_tokens) = (0u64, 0u64);
+        // Track whether each total mixes token-estimated and CLI-reported
+        // dollars, so we never blend them under one honest label.
+        let (mut live_est, mut live_rep) = (false, false);
+        let (mut lifetime_est, mut lifetime_rep) = (false, false);
+        let mut rows: Vec<Value> = Vec::new();
+
+        for s in &snaps {
+            let tokens = s.input_tokens
+                + s.output_tokens
+                + s.cache_creation_tokens
+                + s.cache_read_tokens;
+            let live = live_keys.contains(&s.key);
+            lifetime_tokens += tokens;
+            if let Some(c) = s.cost_usd {
+                lifetime_cost += c;
+                lifetime_cost_known = true;
+                if s.estimated {
+                    lifetime_est = true;
+                } else {
+                    lifetime_rep = true;
                 }
-                json!({ "id": a.id, "name": a.name, "role": a.role, "cost_usd": cost })
-            })
-            .collect();
-        list.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+            }
+            if live {
+                live_tokens += tokens;
+                if let Some(c) = s.cost_usd {
+                    live_cost += c;
+                    live_cost_known = true;
+                    if s.estimated {
+                        live_est = true;
+                    } else {
+                        live_rep = true;
+                    }
+                }
+            }
+            rows.push(json!({
+                "id": s.agent_id,
+                "name": s.name,
+                "role": s.role,
+                "live": live,
+                "source": s.source,
+                "model": s.model,
+                "cost_usd": s.cost_usd,
+                "estimated": s.estimated,
+                "tokens": {
+                    "input": s.input_tokens,
+                    "output": s.output_tokens,
+                    "cache_creation": s.cache_creation_tokens,
+                    "cache_read": s.cache_read_tokens,
+                    "total": tokens,
+                },
+            }));
+        }
+        rows.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+
+        // How to label each dollar total: all token-estimated, all
+        // CLI-reported, or a mix. `null` when there is no cost figure.
+        let basis = |est: bool, rep: bool| -> Option<&'static str> {
+            match (est, rep) {
+                (true, true) => Some("mixed"),
+                (true, false) => Some("estimated"),
+                (false, true) => Some("reported"),
+                (false, false) => None,
+            }
+        };
+
         json!({
             "group": group,
-            "total_cost_usd": any.then_some(total),
-            "agents": list,
-            "note": "best-effort, parsed from each pane's statusline; agents without a visible cost are excluded from the total",
+            "cli": cli,
+            "live_cost_usd": live_cost_known.then_some(live_cost),
+            "lifetime_cost_usd": lifetime_cost_known.then_some(lifetime_cost),
+            "live_cost_basis": basis(live_est, live_rep),
+            "lifetime_cost_basis": basis(lifetime_est, lifetime_rep),
+            "live_tokens": live_tokens,
+            "lifetime_tokens": lifetime_tokens,
+            "agents": rows,
+            "note": "Tokens come from each agent's session transcript and are exact; dollar figures are estimated from a dated model price table. Subscription/Max accounts have no marginal dollar cost (the CLI statusline shows $0.00), so tokens are the reliable metric. Killed/recycled agents stay in the lifetime total; statusline-parsed dollars are a last-resort fallback.",
         })
     }
 
@@ -3060,6 +3335,16 @@ impl OrchRegistry {
         self.audit(&snapshot.group, "loomux", "agent-exit",
             json!({ "agent": agent_id, "exit_code": exit_code }));
         self.persist_agent_record(&snapshot, "dead");
+        // Durably capture final usage before the pane is fully torn down, so a
+        // recycled/killed agent still counts toward the group's lifetime total
+        // (issue #42). The transcript remains readable after exit; the
+        // statusline does not, but token usage is the source we rely on.
+        let cli = self
+            .group(&snapshot.group)
+            .map(|g| g.guardrails.agent_cli)
+            .unwrap_or_else(|| "claude".to_string());
+        let usage = self.compute_usage_snapshot(&snapshot, &cli);
+        self.upsert_usage_snapshot(&snapshot.group, usage);
         Some(snapshot)
     }
 

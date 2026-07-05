@@ -12,7 +12,7 @@ use loomux_lib::orchestration::{
     normalize_remote_web_base, parse_audit_lines, parse_session_cost, prompt_wait_detected,
     resolve_ref_url, rotate_audit_if_needed, spawn_rate_exceeded, strip_ansi,
     watchdog_should_notify, worktree_cleanup_targets, AttentionItem, Caller, Guardrails,
-    OrchRegistry, Role, TaskPatch,
+    OrchRegistry, Role, TaskPatch, UsageSnapshot,
 };
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -2061,8 +2061,10 @@ fn notify_optin_is_durable_across_restart() {
 fn group_usage_summarizes_agents_with_null_cost_without_panes() {
     let (reg, _d, _co, _cw) = setup_mcp();
     let usage = reg.group_usage(&_co.group);
-    // No live panes in test mode → every cost is null and there is no total.
-    assert!(usage["total_cost_usd"].is_null());
+    // No live panes and no transcripts in test mode → no dollar figures.
+    assert!(usage["live_cost_usd"].is_null());
+    assert!(usage["lifetime_cost_usd"].is_null());
+    assert_eq!(usage["live_tokens"].as_u64(), Some(0));
     let agents = usage["agents"].as_array().unwrap();
     assert!(agents.iter().any(|a| a["id"] == "orch-1"), "orchestrator must appear");
     assert!(agents.iter().all(|a| a["cost_usd"].is_null()));
@@ -2070,11 +2072,165 @@ fn group_usage_summarizes_agents_with_null_cost_without_panes() {
     let via_mcp = dispatch(&reg, &_co, "tools/call",
         &json!({ "name": "group_usage", "arguments": {} })).unwrap();
     assert_eq!(via_mcp["isError"], false);
-    assert!(via_mcp["content"][0]["text"].as_str().unwrap().contains("total_cost_usd"));
+    assert!(via_mcp["content"][0]["text"].as_str().unwrap().contains("lifetime_cost_usd"));
     // Workers cannot pull the group-wide usage summary.
     let denied = dispatch(&reg, &_cw, "tools/call",
         &json!({ "name": "group_usage", "arguments": {} })).unwrap();
     assert_eq!(denied["isError"], true, "usage aggregation is orchestrator-only");
+}
+
+/// Build a durable usage snapshot for a session, as a fresh transcript read
+/// would produce.
+fn usage_snap(key: &str, agent_id: &str, cost: f64, input: u64, output: u64) -> UsageSnapshot {
+    UsageSnapshot {
+        key: key.to_string(),
+        agent_id: agent_id.to_string(),
+        name: agent_id.to_string(),
+        role: "worker".to_string(),
+        source: "transcript".to_string(),
+        input_tokens: input,
+        output_tokens: output,
+        cache_creation_tokens: 0,
+        cache_read_tokens: 0,
+        cost_usd: Some(cost),
+        estimated: true,
+        model: Some("claude-opus-4-8".to_string()),
+        updated_ms: 0,
+    }
+}
+
+#[test]
+fn killed_agent_stays_in_lifetime_total_but_not_live() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "task", false, None).unwrap();
+    let sid = w.session_id.clone().expect("claude worker gets a session id");
+
+    // Simulate a transcript read having captured this session's spend.
+    reg.upsert_usage_snapshot(&g.id, usage_snap(&sid, &w.id, 1.50, 1000, 2000));
+
+    let before = reg.group_usage(&g.id);
+    let row = before["agents"].as_array().unwrap().iter()
+        .find(|a| a["id"] == w.id.as_str()).expect("worker row present");
+    assert_eq!(row["live"], true);
+    assert_eq!(row["tokens"]["total"].as_u64(), Some(3000));
+    assert!((before["live_cost_usd"].as_f64().unwrap() - 1.50).abs() < 1e-9);
+    assert!((before["lifetime_cost_usd"].as_f64().unwrap() - 1.50).abs() < 1e-9);
+
+    // Kill the worker. mark_dead re-reads usage (no transcript in test mode →
+    // empty), but the merge must keep the captured spend rather than zero it.
+    reg.mark_dead(&w.id, Some(0));
+
+    let after = reg.group_usage(&g.id);
+    let row = after["agents"].as_array().unwrap().iter()
+        .find(|a| a["id"] == w.id.as_str()).expect("dead worker still listed");
+    assert_eq!(row["live"], false, "killed agent is no longer live");
+    // Lifetime keeps the spend; live no longer counts the dead worker.
+    assert!((after["lifetime_cost_usd"].as_f64().unwrap() - 1.50).abs() < 1e-9,
+        "lifetime total must survive the kill");
+    assert!(after["live_cost_usd"].is_null(), "no live agents contribute cost now");
+    assert_eq!(after["lifetime_tokens"].as_u64(), Some(3000));
+    assert_eq!(after["live_tokens"].as_u64(), Some(0));
+}
+
+#[test]
+fn mark_dead_captures_usage_from_transcript() {
+    // Point the usage reader at a fixture transcript tree instead of ~/.claude,
+    // via a per-registry override (no global env — safe under parallel runs).
+    let proj = tempfile::tempdir().unwrap();
+    let (reg, _d) = test_registry();
+    reg.set_claude_projects_dir(proj.path().to_path_buf());
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "task", false, None).unwrap();
+    let sid = w.session_id.clone().unwrap();
+
+    // Write a synthetic Claude transcript for this session under an
+    // encoded-cwd folder (any name — the reader scans all of them).
+    let encoded = proj.path().join("C--tmp-repo");
+    fs::create_dir_all(&encoded).unwrap();
+    let transcript = format!(
+        "{}\n{}\n",
+        json!({"type":"user","message":{"content":"hi"}}),
+        json!({"type":"assistant","message":{"id":"m1","model":"claude-opus-4-8",
+            "usage":{"input_tokens":1000,"output_tokens":500,
+                     "cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}),
+    );
+    fs::write(encoded.join(format!("{sid}.jsonl")), transcript).unwrap();
+
+    // Kill without ever calling group_usage first: mark_dead must snapshot it.
+    reg.mark_dead(&w.id, Some(0));
+
+    let usage = reg.group_usage(&g.id);
+    let row = usage["agents"].as_array().unwrap().iter()
+        .find(|a| a["id"] == w.id.as_str()).expect("dead worker captured");
+    assert_eq!(row["live"], false);
+    assert_eq!(row["source"], "transcript");
+    assert_eq!(row["estimated"], true);
+    assert_eq!(row["tokens"]["total"].as_u64(), Some(1500));
+    // Opus: (1000*5 + 500*25) / 1e6 = 0.0175
+    let expect = (1000.0 * 5.0 + 500.0 * 25.0) / 1_000_000.0;
+    assert!((usage["lifetime_cost_usd"].as_f64().unwrap() - expect).abs() < 1e-9);
+    // Token-derived → labelled estimated, not reported.
+    assert_eq!(usage["lifetime_cost_basis"], "estimated");
+}
+
+#[test]
+fn usage_json_write_is_atomic_and_leaves_no_temp() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    reg.upsert_usage_snapshot(&g.id, usage_snap("sess-a", "w-1", 0.50, 100, 200));
+
+    let gdir = reg.state_root().join(&g.id);
+    let path = gdir.join("usage.json");
+    assert!(path.is_file(), "usage.json must exist after upsert");
+    assert!(!gdir.join("usage.json.tmp").is_file(), "temp file must be cleaned up");
+    // Round-trips as valid JSON with the snapshot.
+    let list: Vec<UsageSnapshot> =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].key, "sess-a");
+}
+
+#[test]
+fn corrupt_usage_json_is_preserved_not_silently_wiped() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let gdir = reg.state_root().join(&g.id);
+    fs::create_dir_all(&gdir).unwrap();
+    let path = gdir.join("usage.json");
+    // Simulate a half-written / hand-mangled file.
+    fs::write(&path, "{ this is not valid json ").unwrap();
+
+    // The next upsert must not treat corruption as "empty and overwrite" — it
+    // preserves the bad file so no killed-agent history is silently lost.
+    reg.upsert_usage_snapshot(&g.id, usage_snap("sess-b", "w-2", 1.25, 300, 400));
+
+    let bad = gdir.join("usage.json.bad");
+    assert!(bad.is_file(), "corrupt file must be preserved as usage.json.bad");
+    assert_eq!(fs::read_to_string(&bad).unwrap(), "{ this is not valid json ");
+    // usage.json is now valid and holds the new snapshot.
+    let list: Vec<UsageSnapshot> =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].key, "sess-b");
+}
+
+#[test]
+fn mixed_estimated_and_reported_totals_are_labelled_mixed() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    // One transcript-estimated snapshot and one statusline-reported one.
+    reg.upsert_usage_snapshot(&g.id, usage_snap("sess-est", "w-1", 1.00, 100, 100));
+    let mut reported = usage_snap("sess-rep", "w-2", 2.00, 0, 0);
+    reported.source = "statusline".to_string();
+    reported.estimated = false;
+    reg.upsert_usage_snapshot(&g.id, reported);
+
+    let usage = reg.group_usage(&g.id);
+    // Neither agent is live (no panes), so this exercises the lifetime total.
+    assert!((usage["lifetime_cost_usd"].as_f64().unwrap() - 3.00).abs() < 1e-9);
+    assert_eq!(usage["lifetime_cost_basis"], "mixed",
+        "estimated + reported dollars must not hide under one label");
 }
 
 #[test]

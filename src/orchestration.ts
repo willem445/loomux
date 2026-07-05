@@ -234,20 +234,51 @@ export async function launchOrchestrator(
 
 // ---------- cost containment: pause/resume + per-group usage ----------
 
-/** One agent's parsed session cost within a group usage summary. */
+/** Token counts for one agent (exact, from its session transcript). */
+export interface UsageTokens {
+  input: number;
+  output: number;
+  cache_creation: number;
+  cache_read: number;
+  total: number;
+}
+
+/** One agent's usage within a group summary. */
 export interface AgentUsage {
   id: string;
   name: string;
   role: string;
-  /** Dollars parsed from the pane statusline, or null if none was visible. */
+  /** Whether this agent is currently live (vs a recycled/killed one that still
+   *  counts toward the lifetime total). */
+  live: boolean;
+  /** `transcript` (token-derived), `statusline` (last-resort CLI parse), or
+   *  `none` (nothing available yet). */
+  source: "transcript" | "statusline" | "none";
+  /** Model the cost was priced against, or null. */
+  model: string | null;
+  /** Dollar cost, or null when only tokens are known (unknown model / no data). */
   cost_usd: number | null;
+  /** true = dollars estimated from the price table; false = reported by the CLI. */
+  estimated: boolean;
+  tokens: UsageTokens;
 }
 
-/** Aggregated per-group cost/usage (backend `orch_group_usage`). */
+/** Aggregated per-group cost/usage (backend `orch_group_usage`), with a live
+ *  vs lifetime split so killed panes still count. */
 export interface GroupUsage {
   group: string;
-  /** Sum across agents with a visible cost, or null if none had one. */
-  total_cost_usd: number | null;
+  cli: string;
+  /** Cost across currently-live agents, or null if none has a figure. */
+  live_cost_usd: number | null;
+  /** Cost across all agents ever in this group (survives kills), or null. */
+  lifetime_cost_usd: number | null;
+  /** How to read the live total: token-`estimated`, CLI-`reported`, or a
+   *  `mixed` blend of both; null when there is no figure. */
+  live_cost_basis: "estimated" | "reported" | "mixed" | null;
+  /** Same, for the lifetime total. */
+  lifetime_cost_basis: "estimated" | "reported" | "mixed" | null;
+  live_tokens: number;
+  lifetime_tokens: number;
   agents: AgentUsage[];
   note: string;
 }

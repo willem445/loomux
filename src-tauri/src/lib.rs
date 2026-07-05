@@ -7,6 +7,7 @@ mod metrics;
 pub mod orchestration; // pub: integration smoke test links through it
 mod pty;
 mod sessions;
+pub mod usage; // pub: exercised by orchestration integration tests
 
 use std::sync::Arc;
 use tauri::Manager;
