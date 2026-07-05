@@ -1498,6 +1498,14 @@ const FIX_IDLE_BOX: &str = include_str!("fixtures/attention/idle-input-box.txt")
 const FIX_FP_PROSE: &str = include_str!("fixtures/attention/fp-prose-arrow-keys.txt");
 const FIX_FP_SHELL: &str = include_str!("fixtures/attention/fp-shell-prompt-glyph.txt");
 const FIX_FP_BREADCRUMB: &str = include_str!("fixtures/attention/fp-breadcrumb-separator.txt");
+// A leading ❯/›/→ in finished-turn prose above the idle box: repro steps that
+// lead with a shell `❯` glyph, and a fenced ❯ command block. The pointer leads
+// the line but is not in the last painted lines, so it must NOT flag (#40 review
+// residual). Contrast with pos-pointer-last-line, where the pointer *is* the
+// last thing painted — a genuine prompt-wait positive.
+const FIX_FP_LEADING_PTR: &str = include_str!("fixtures/attention/fp-leading-pointer-prose.txt");
+const FIX_FP_FENCED_PTR: &str = include_str!("fixtures/attention/fp-fenced-pointer-block.txt");
+const FIX_POS_PTR_LAST: &str = include_str!("fixtures/attention/pos-pointer-last-line.txt");
 
 #[test]
 fn prompt_wait_detected_fires_on_interactive_question_fixtures() {
@@ -1513,6 +1521,13 @@ fn prompt_wait_detected_fires_on_interactive_question_fixtures() {
     assert!(
         prompt_wait_detected(&strip_ansi(FIX_COPILOT_ASK.as_bytes())),
         "Copilot boxed selection prompt must be recognized as needing the human"
+    );
+    // #40 review: a plain inquirer confirm whose `❯` pointer IS the last thing
+    // painted (no footer / no y-n token) must still flag — proving the anchored
+    // pointer signal fires when the menu really is on screen.
+    assert!(
+        prompt_wait_detected(&strip_ansi(FIX_POS_PTR_LAST.as_bytes())),
+        "a pointer as the last painted line is a genuine prompt-wait"
     );
 }
 
@@ -1543,6 +1558,8 @@ fn prompt_wait_detected_ignores_finished_turn_prose_about_ui() {
         ("keyboard-nav prose", FIX_FP_PROSE),
         ("pasted ❯ shell prompt", FIX_FP_SHELL),
         ("› UI breadcrumb", FIX_FP_BREADCRUMB),
+        ("leading ❯ repro steps", FIX_FP_LEADING_PTR),
+        ("fenced ❯ command block", FIX_FP_FENCED_PTR),
     ] {
         assert!(
             !prompt_wait_detected(&strip_ansi(fixture.as_bytes())),
@@ -1590,7 +1607,15 @@ fn attention_does_not_flag_streaming_or_idle_fixtures() {
     let now = 1_000_000_000_000u64;
     let out: HashMap<String, u64> = [(wid.clone(), 256u64)].into_iter().collect();
     let no_input = HashMap::new();
-    for fixture in [FIX_STREAMING, FIX_IDLE_BOX, FIX_FP_PROSE, FIX_FP_SHELL, FIX_FP_BREADCRUMB] {
+    for fixture in [
+        FIX_STREAMING,
+        FIX_IDLE_BOX,
+        FIX_FP_PROSE,
+        FIX_FP_SHELL,
+        FIX_FP_BREADCRUMB,
+        FIX_FP_LEADING_PTR,
+        FIX_FP_FENCED_PTR,
+    ] {
         let tail: HashMap<String, String> =
             [(wid.clone(), strip_ansi(fixture.as_bytes()))].into_iter().collect();
         reg.attention_tick(now, &out, &tail, &no_input);

@@ -291,12 +291,21 @@ pub fn prompt_wait_detected(tail: &str) -> bool {
         })
     }
 
+    // The last few non-empty lines — "the last thing the CLI painted". Both
+    // prose-like signals (pointer, footer) are read only from here (#40 review):
+    // a live menu paints its pointer/footer last, whereas finished-turn prose
+    // that happens to lead a line with `❯`/`›`/`→` (a `❯ npm run dev` shell
+    // example, a fenced repro block) is followed by the CLI's redrawn idle input
+    // box, which pushes it out of this window.
+    let last_painted = &recent[recent.len().saturating_sub(3)..];
+
     // Selection pointer marking the highlighted choice. A `❯`/`›`/`→` that
     // *leads* a line's content (after any box frame) is menu-shaped; the same
     // glyph mid-line is pervasive in ordinary output — pasted shell prompts
-    // (`demo ❯ npm run dev`), UI breadcrumbs (`Home › Prefs`), diff/log arrows —
-    // and must NOT count (#40 review). So require it to lead, not merely appear.
-    let has_pointer_option = recent.iter().any(|l| {
+    // (`demo ❯ npm run dev`), UI breadcrumbs (`Home › Prefs`), diff/log arrows.
+    // Requiring it to lead rules those out; requiring it in the last painted
+    // lines also rules out a *leading* glyph in finished prose above the idle box.
+    let has_pointer_option = last_painted.iter().any(|l| {
         let d = deframe(l);
         d.starts_with('❯') || d.starts_with('›') || d.starts_with('→')
     });
@@ -323,14 +332,11 @@ pub fn prompt_wait_detected(tail: &str) -> bool {
     // Interactive selection-menu footer (AskUserQuestion / Copilot / inquirer).
     // Claude Code's AskUserQuestion highlights the active option with reverse
     // video (an ANSI attribute stripped before we see it), so no glyph survives
-    // and this footer is the only durable signal (#40). But it's plain English,
-    // so — unlike the structured signals — read it ONLY from the last few
-    // non-empty lines: a live menu paints its footer last, whereas prose that
-    // mentions arrow keys is followed by the CLI's redrawn idle input box, which
-    // pushes it out of this window (#40 review). NOTE: matched on single lines,
-    // so a footer wrapped across rows in a very narrow pane, or a localized /
-    // reworded footer, won't match — a known gap (see design doc).
-    let footer = recent[recent.len().saturating_sub(3)..].join("\n");
+    // and this footer is the only durable signal (#40). Like the pointer it's
+    // read only from the last painted lines. NOTE: matched on single lines, so a
+    // footer wrapped across rows in a very narrow pane, or a localized / reworded
+    // footer, won't match — a known gap (see design doc).
+    let footer = last_painted.join("\n");
     let has_menu_footer = footer.contains("enter to select")
         || footer.contains("enter to confirm")
         || footer.contains("use arrow")

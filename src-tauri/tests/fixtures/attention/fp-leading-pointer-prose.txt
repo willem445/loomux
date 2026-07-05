@@ -1,0 +1,9 @@
+To reproduce locally, run these in order:
+❯ npm install
+❯ npm run dev
+Then open http://localhost:5173 in your browser.
+
+╭──────────╮
+│ > [2mTry "run the tests"[0m                      │
+╰──────────╯
+  [2m? for shortcuts[0m

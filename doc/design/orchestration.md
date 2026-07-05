@@ -347,16 +347,21 @@ header chip and, via a listener, mirrors the state onto a minimized pane's **doc
   does not save them. So the signals are split by how prose-safe each is:
   - *Structured* signals (numbered `y/n` menu, `y/n` tokens, stock permission phrasings) don't
     occur in ordinary prose → honored across the last ~12 lines.
-  - *Prose-like* signals are **anchored to "the last thing painted"**: a selection pointer must
-    *lead* a de-framed line (a mid-line `❯`/`›` in pasted output does not count), and the
-    plain-English footer is read **only from the last ~3 non-empty lines**. A live menu paints
-    its footer last; prose that mentions arrow keys is followed by the CLI's redrawn idle input
-    box, which pushes the phrase out of range. Both shipped positive fixtures keep their footer
-    within the last two non-empty lines, so they still pass.
-  - Covered by fixtures under `src-tauri/tests/fixtures/attention/`: two positive question
-    styles and **five** negatives — a numbered summary stream, an idle input box, and the three
-    finished-turn-prose repros from the review — all run through the real `strip_ansi` →
-    `prompt_wait_detected` → `attention_tick` path.
+  - *Prose-like* signals — the selection pointer and the plain-English footer — are both read
+    **only from the last ~3 non-empty lines** ("the last thing painted"), and the pointer must
+    additionally *lead* a de-framed line. A live menu paints its pointer/footer last; a finished
+    turn is followed by the CLI's redrawn idle input box, which pushes any pointer/phrase earlier
+    in the tail out of range. This is what rules out both a *mid*-line glyph (`demo ❯ npm run
+    dev`, a `Home › Prefs` breadcrumb) **and** a *leading* one in finished prose (a `❯ npm run
+    dev` repro line, a fenced `❯` command block) above the idle box. The Copilot positive still
+    passes on its footer (its boxed pointer sits above the last-3 window); the Claude positive on
+    its footer; and a bare inquirer `❯` prompt passes on the pointer when it *is* the last line.
+  - Covered by fixtures under `src-tauri/tests/fixtures/attention/`: three positive question
+    styles (Claude footer, Copilot footer, bare-pointer-last-line) and **seven** negatives — a
+    numbered summary stream, an idle input box, and the five finished-turn-prose repros from the
+    review (keyboard-nav prose, mid-line `❯` shell prompt, `›` breadcrumb, leading-`❯` repro
+    steps, fenced-`❯` block) — all run through the real `strip_ansi` → `prompt_wait_detected` →
+    `attention_tick` path.
 - **`waiting` ack is sticky (`attn_waiting_ack`).** `blocked`/`report` latch until acked;
   `waiting` is recomputed live each scan, so without care, focusing a pane whose menu is still
   on screen would clear the chip only to have the next 3s scan re-light it. So acking a pane
