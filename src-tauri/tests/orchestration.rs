@@ -15,7 +15,7 @@ use loomux_lib::orchestration::{
     OrchRegistry, Role, TaskPatch,
 };
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::time::Duration;
@@ -1628,6 +1628,111 @@ fn attention_does_not_flag_streaming_or_idle_fixtures() {
 }
 
 #[test]
+fn plain_pane_parked_on_a_question_flags_waiting_by_pty() {
+    // #40 (human repro): a plain pane the human opened by hand — no orchestration
+    // agent/group — running a CLI that's now parked on a question must flag
+    // `waiting`, keyed only by its pty id (empty agent_id, no role).
+    let (reg, _d, _g, _w) = attention_setup();
+    let now = 1_000_000_000_000u64;
+    let pty = 77u32;
+    let out: HashMap<u32, u64> = [(pty, 512u64)].into_iter().collect();
+    let tail: HashMap<u32, String> =
+        [(pty, strip_ansi(FIX_CLAUDE_ASK.as_bytes()))].into_iter().collect();
+    let no_input = HashMap::new();
+    let no_agents = HashSet::new();
+
+    // Debounced on first sighting, then flags once quiet past the window.
+    let first = reg.plain_pane_attention(now, &out, &tail, &no_input, &no_agents);
+    assert!(first.iter().all(|i| i.reason != "waiting"), "first quiet tick is debounced");
+    let waited = reg.plain_pane_attention(now + 5000, &out, &tail, &no_input, &no_agents);
+    let item = waited
+        .iter()
+        .find(|i| i.pty_id == Some(pty) && i.reason == "waiting")
+        .expect("a plain pane parked on a question must be flagged");
+    assert!(item.agent_id.is_empty(), "a plain pane has no agent identity");
+    assert!(item.role.is_none(), "a plain pane has no orchestration role");
+}
+
+#[test]
+fn plain_pane_scan_skips_agent_ptys_and_quiet_non_prompts() {
+    // A pty that belongs to a registered agent is handled by attention_tick, so
+    // the plain scan must skip it (no double-flag). And ordinary/idle/prose
+    // output on a plain pane must not flag.
+    let (reg, _d, _g, _w) = attention_setup();
+    let now = 1_000_000_000_000u64;
+    let agent_pty = 5u32;
+    let out: HashMap<u32, u64> = [(agent_pty, 100u64)].into_iter().collect();
+    let tail: HashMap<u32, String> =
+        [(agent_pty, strip_ansi(FIX_CLAUDE_ASK.as_bytes()))].into_iter().collect();
+    let agents: HashSet<u32> = [agent_pty].into_iter().collect();
+    reg.plain_pane_attention(now, &out, &tail, &HashMap::new(), &agents);
+    assert!(
+        reg.plain_pane_attention(now + 60_000, &out, &tail, &HashMap::new(), &agents)
+            .is_empty(),
+        "an agent's pty must not be double-flagged by the plain scan"
+    );
+
+    let no_agents = HashSet::new();
+    for fixture in [FIX_STREAMING, FIX_IDLE_BOX, FIX_FP_PROSE] {
+        let pty = 9u32;
+        let out: HashMap<u32, u64> = [(pty, 100u64)].into_iter().collect();
+        let tail: HashMap<u32, String> =
+            [(pty, strip_ansi(fixture.as_bytes()))].into_iter().collect();
+        reg.plain_pane_attention(now, &out, &tail, &HashMap::new(), &no_agents);
+        assert!(
+            reg.plain_pane_attention(now + 60_000, &out, &tail, &HashMap::new(), &no_agents)
+                .iter()
+                .all(|i| i.reason != "waiting"),
+            "ordinary/idle/prose on a plain pane must not flag"
+        );
+    }
+}
+
+#[test]
+fn plain_pane_waiting_ack_by_pty_sticks_until_output_changes() {
+    // Turning to a plain pane (ack by pty) must make the ack stick until the pane
+    // repaints, mirroring the agent path.
+    let (reg, _d, _g, _w) = attention_setup();
+    let now = 1_000_000_000_000u64;
+    let pty = 12u32;
+    let out: HashMap<u32, u64> = [(pty, 100u64)].into_iter().collect();
+    let tail: HashMap<u32, String> =
+        [(pty, strip_ansi(FIX_CLAUDE_ASK.as_bytes()))].into_iter().collect();
+    let no_input = HashMap::new();
+    let no_agents = HashSet::new();
+
+    reg.plain_pane_attention(now, &out, &tail, &no_input, &no_agents);
+    assert_eq!(
+        reg.plain_pane_attention(now + 5000, &out, &tail, &no_input, &no_agents)
+            .iter()
+            .filter(|i| i.pty_id == Some(pty) && i.reason == "waiting")
+            .count(),
+        1,
+        "a quiet plain pane on a menu flags waiting"
+    );
+
+    reg.ack_attention_pty(pty);
+    assert!(
+        reg.plain_pane_attention(now + 8000, &out, &tail, &no_input, &no_agents)
+            .iter()
+            .all(|i| i.reason != "waiting"),
+        "ack by pty must stick while the same menu is on screen"
+    );
+
+    // Repaint (menu answered / new prompt) re-arms.
+    let grew: HashMap<u32, u64> = [(pty, 200u64)].into_iter().collect();
+    reg.plain_pane_attention(now + 9000, &grew, &tail, &no_input, &no_agents);
+    assert_eq!(
+        reg.plain_pane_attention(now + 14_000, &grew, &tail, &no_input, &no_agents)
+            .iter()
+            .filter(|i| i.pty_id == Some(pty) && i.reason == "waiting")
+            .count(),
+        1,
+        "a fresh prompt after the plain pane repainted flags again"
+    );
+}
+
+#[test]
 fn attention_waiting_ack_sticks_until_the_prompt_changes() {
     // #40 review: focusing/acking a pane parked on a live menu must make the ack
     // *stick* — the next scan must not re-light `waiting` on the pane the human is
@@ -1819,7 +1924,7 @@ fn attention_toasts_once_per_onset_only_for_optin_groups() {
         agent_id: wid.clone(),
         group: gid.clone(),
         name: "w".into(),
-        role: Role::Worker,
+        role: Some(Role::Worker),
         pty_id: None,
         reason: "blocked",
         detail: "stuck".into(),

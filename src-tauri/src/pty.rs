@@ -86,6 +86,13 @@ impl PtyManager {
         Some(total)
     }
 
+    /// Ids of every live pty. Lets the attention scan (#40) cover *all* panes —
+    /// including plain shells the human opened by hand, which have no
+    /// orchestration identity — not just registered agents.
+    pub fn live_ids(&self) -> Vec<u32> {
+        self.ptys.lock().unwrap().keys().copied().collect()
+    }
+
     /// Kill one child; the waiter thread reaps it and emits `pty-exit`.
     pub fn kill(&self, id: u32) {
         self.expected_exits.lock().unwrap().insert(id);

@@ -323,6 +323,21 @@ CLI. The frontend routes each item by `pty_id` to `Pane.setAttention`, which pai
 header chip and, via a listener, mirrors the state onto a minimized pane's **dock chip**
 (`Grid.renderDock` → `dockChipAttention`) so docking never hides an ask.
 
+- **Scope: every pane, not just agents (#40).** The `waiting` reason applies to *any* live
+  pane, including a plain shell the human opened by hand to run a CLI — those have no
+  orchestration group/roster identity, so the original agent-only scan never saw them (the
+  human's repro: two hand-opened panes running Claude Code / Copilot, both parked on a
+  question, no indicator anywhere). `run_attention` now makes two passes: `attention_tick`
+  over the roster (all four reasons), then `plain_pane_attention` over every *non-agent* live
+  pty (`PtyManager::live_ids`), which raises only `waiting`. Plain-pane items carry just
+  `pty_id` (empty `agent_id`/`group`, `role: None`) and are keyed in the shared
+  `attn_quiet`/`attn_waiting_ack` maps by a synthetic `pty:<id>` id. The frontend badges **any**
+  pane by `pty_id` (the old `orchGroupId` gate is gone); a plain pane acks by pty id
+  (`orch_ack_attention_pty`) since it has no agent id. Agent-only surfaces — board-row
+  highlight, desktop toasts — stay group-scoped by construction (a plain pane's empty group
+  is in no opted-in set), which is the intended split: any blocked CLI lights the pane chip
+  and dock dot, while the richer group features remain orchestration-only.
+
 - **The `waiting` heuristic.** A pane is `waiting` when its output has been quiet past
   `ATTENTION_QUIET_MS` (4s), there's been no recent human keystroke, *and* its ANSI-stripped
   tail looks like a live interactive prompt (`prompt_wait_detected`). The quiet + no-keystroke

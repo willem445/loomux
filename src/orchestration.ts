@@ -86,10 +86,12 @@ export function badgeFor(req: OrchSpawnRequest): PaneBadge {
 /** One pane that needs the human, from the backend attention scan. `reason`
  *  is (most→least urgent) "blocked" | "waiting" | "report" | "gate". */
 export interface AttentionItem {
+  /** Empty for a plain (non-orchestration) pane, which is keyed only by pty_id. */
   agent_id: string;
   group: string;
   name: string;
-  role: OrchRole;
+  /** null for a plain pane (no orchestration role). */
+  role: OrchRole | null;
   pty_id: number | null;
   reason: string;
   detail: string;
@@ -148,15 +150,18 @@ export function initOrchestration(grid: Grid, paneEvents: PaneEvents): void {
     }
   });
   // Attention routing: the backend pushes the full current set of panes that
-  // need the human every scan; badge each group pane by its pty (absent =
-  // clear). Idempotent per pane, so re-emits every few seconds are cheap.
+  // need the human every scan; badge each pane by its pty (absent = clear).
+  // Idempotent per pane, so re-emits every few seconds are cheap. Applies to
+  // ALL panes with a pty, not just orchestration agents — a plain shell the
+  // human opened to run a CLI that's now blocked on a prompt must light up too
+  // (#40); the backend emits `waiting` items for those, keyed only by pty_id.
   void listen<AttentionItem[]>("orch-attention", ({ payload }) => {
     const byPty = new Map<number, AttentionItem>();
     for (const it of payload) if (it.pty_id !== null) byPty.set(it.pty_id, it);
-    // allPanes(), not panes(): a minimized worker still needs the human, and
-    // its dock chip mirrors the state (see Grid.renderDock / #6).
+    // allPanes(), not panes(): a minimized pane still needs the human, and its
+    // dock chip mirrors the state (see Grid.renderDock / #6).
     for (const pane of grid.allPanes()) {
-      if (!pane.orchGroupId || pane.ptyId === null) continue;
+      if (pane.ptyId === null) continue;
       const it = byPty.get(pane.ptyId);
       pane.setAttention(it ? it.reason : null, it?.detail);
     }

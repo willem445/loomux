@@ -570,13 +570,18 @@ export class Pane {
     this.attentionListener = fn;
   }
 
-  /** The human is now on this pane: clear a latched report backend-side so its
-   *  badge drops. Live reasons (waiting/gate) are recomputed and reappear only
-   *  if still true. Public so restoring a docked pane clears it the same way
+  /** The human is now on this pane: acknowledge its attention backend-side so
+   *  the badge drops and (for `waiting`) stays down until the prompt changes.
+   *  Agent panes ack by agent id; a plain pane (no agent identity) acks by its
+   *  pty id (#40). Public so restoring a docked pane clears it the same way
    *  turning to a pane does. */
   acknowledgeAttention(): void {
-    if (!this.attentionReason || !this.orchAgent) return;
-    invoke("orch_ack_attention", { agentId: this.orchAgent }).catch(() => {});
+    if (!this.attentionReason) return;
+    if (this.orchAgent) {
+      invoke("orch_ack_attention", { agentId: this.orchAgent }).catch(() => {});
+    } else if (this.ptyId !== null) {
+      invoke("orch_ack_attention_pty", { ptyId: this.ptyId }).catch(() => {});
+    }
   }
 
   /** Handle an OSC 7 working-directory report from the shell. Payloads are
