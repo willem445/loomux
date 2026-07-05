@@ -49,38 +49,59 @@ and the watchers — not just the main thread. The hook body is wrapped in
 `catch_unwind` and every I/O step is best-effort, so the hook can never panic
 and mask the original crash.
 
-**Backtrace symbol quality (platform-dependent).** The release profile was
-`strip = true`, which blanks symbols and leaves backtrace frames as bare
-addresses everywhere. It is now `strip = "debuginfo"` — but what that buys
-depends on the platform:
+**Backtrace symbol quality.** Two profile settings interact, and the one that
+actually matters for naming loomux's own frames is **`debug`, not `strip`**:
 
-- **Linux / macOS:** frame names come from the binary's own symbol table, which
-  `strip = "debuginfo"` keeps (only debuginfo, and thus line numbers, is
-  dropped). Crash-log backtraces name their functions. Real win, small size
-  cost.
-- **Windows / MSVC (the shipping target):** the exe has no in-binary symbol
-  table — names come from a **PDB** resolved at runtime by dbghelp. A release
-  build *does* emit `loomux.pdb` beside `loomux.exe` (verified:
-  `cargo build --release` produces `target/release/loomux.pdb`; `strip =
-  "debuginfo"` strips the exe's embedded debug but leaves the standalone PDB).
-  So when the exe is run **from the build tree** — local dev and CI — dbghelp
-  finds the adjacent PDB and backtraces **are** named. The gap is the shipped
-  **bundle**: `tauri.conf.json` → `bundle.targets: "all"` (NSIS/MSI) copies only
-  `loomux.exe`, the conhost resources, and icons into the installer — **not**
-  `loomux.pdb`. So on an **end-user's installed** loomux the PDB is absent and
-  crash-log backtraces are **addresses only**. The addresses are still useful
-  (module + offset), and the panic *message*, *location* (`file:line:col`, from
-  panic metadata, independent of the PDB), and *thread name* are always present
-  and usually enough to localize the fault.
+- `debug = "line-tables-only"` makes rustc emit debug info covering loomux's
+  own functions (names + line numbers). **This is the setting that symbolicates
+  our frames.** Without it — a `[profile.release]` with no `debug` key defaults
+  to `debug = false` — the emitted MSVC `loomux.pdb` carries only public/linker
+  symbols, so dbghelp resolves our internal functions as `__ImageBase` **even
+  with the PDB sitting right next to the exe**. (Only *std* frames get named in
+  that case, because the Rust toolchain ships std's debuginfo separately — which
+  is exactly what makes a `debug=false` backtrace *look* symbolicated while every
+  loomux frame is really `__ImageBase`.)
+- `strip = "debuginfo"` keeps the *exe* slim by not embedding that debug info in
+  the binary — it lives in the standalone PDB (Windows) / split debug (Linux) /
+  dSYM (macOS). It is orthogonal to naming: with `debug = false`, no `strip`
+  value produces named loomux frames; with `debug = "line-tables-only"`, frames
+  are named regardless of `strip`.
 
-We deliberately do **not** ship the PDB in the installer: it roughly doubles the
-payload and exposes full symbols. Two honest follow-ups (out of scope here):
-bundle `loomux.pdb` next to the exe (a `bundle.resources` entry pointing at the
-build artifact, or a post-build copy step) so installed builds get named frames
-too; or set up server-side symbolication — upload the PDB to a symbol server
-keyed by the module + address in the crash log. Until then, a developer
-reproducing a shipped crash can drop the matching `loomux.pdb` beside the
-installed `loomux.exe` and dbghelp will symbolicate.
+Verified empirically on this toolchain (`rustc 1.96.0`, `x86_64-pc-windows-msvc`,
+`lto = true, codegen-units = 1`, `Backtrace::force_capture()`, an
+`#[inline(never)]` marker fn, PDB kept adjacent): `debug = false` → own frame is
+`__ImageBase`; `debug = "line-tables-only"` → own frame is named **with line
+numbers**. So the profile now sets **both** `debug = "line-tables-only"` and
+`strip = "debuginfo"`.
+
+With that, **build-tree and CI** backtraces are genuinely symbolicated (own
+frames + line numbers) because `loomux.pdb` sits beside the exe in
+`target/release/`. The remaining gap is the shipped **bundle**:
+`tauri.conf.json` → `bundle.targets: "all"` (NSIS/MSI) copies only `loomux.exe`,
+the conhost resources, and icons into the installer — **not** `loomux.pdb`. So an
+**end-user's installed** loomux still produces **address-only** backtraces. Even
+there the panic *message*, *location* (`file:line:col`, from panic metadata —
+independent of the PDB), and *thread name* are always captured and usually
+enough to localize the fault.
+
+**Size cost (measured on the release build).** Enabling `debug =
+"line-tables-only"` leaves the shipped **exe essentially unchanged** —
+9,822,208 → 9,819,136 bytes (−3 KB) — because `strip = "debuginfo"` keeps the
+line-tables out of the binary. The cost lands entirely in the standalone
+**PDB**: 2,387,968 → 26,660,864 bytes (**+~23 MB**), which is the line-tables
+debuginfo for loomux's own (LTO'd) code — and itself confirms the setting took
+effect on loomux's binary, not just std. Since the bundle doesn't ship the PDB,
+the **installer payload is unaffected**; the cost is only the build-tree/CI PDB
+and any future decision to ship it.
+
+We deliberately do **not** ship the PDB in the installer: it exposes symbols and
+would add ~23 MB. Two honest follow-ups (out of scope here): bundle `loomux.pdb`
+next to the exe (a `bundle.resources` entry pointing at the build artifact, or a
+post-build copy step) so installed builds get named frames too; or set up
+server-side symbolication — upload the PDB to a symbol server keyed by module +
+address. With `debug = "line-tables-only"` now in place, the "drop the matching
+`loomux.pdb` beside the installed `loomux.exe`" workaround *does* symbolicate
+loomux frames (it would not have with the old `debug=false` PDB).
 
 ### 2. Breadcrumb log
 
