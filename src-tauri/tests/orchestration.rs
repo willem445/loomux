@@ -756,31 +756,37 @@ fn start_is_guarded_to_queued_items() {
 }
 
 #[test]
-fn start_delivers_to_the_orchestrator() {
-    // Mirrors the steering resolution/audit test: a paused group makes delivery
-    // record a suppression audit (reachable without a real PTY) whose `to` names
-    // the resolved target. Starting a queued item must deliver to the
-    // ORCHESTRATOR (not the worker), attributed to `human`, with the id/title in
-    // the prompt.
+fn start_is_rejected_up_front_when_the_group_is_paused() {
+    // A paused group suppresses delivery silently (deliver_prompt returns Ok
+    // after auditing prompt-suppressed-paused), and unlike approve — which
+    // leaves a durable `done` flip — a Start nudge leaves only a note and the
+    // "begin work" signal is lost on resume. So Start rejects up front, like the
+    // steering strip (#43): a clear error, NO note appended, and — the point —
+    // it never reaches delivery, so no suppression audit is recorded.
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
-    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
-    reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    // An orchestrator is present: if the guard were missing, start would reach
+    // delivery and record a prompt-suppressed-paused audit — so asserting its
+    // absence proves the guard fires *before* delivery, not that there was
+    // simply no target.
+    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
     let t = reg.upsert_task(&g.id, "orch-1", None, patch(Some("Ship the parser"), None, None)).unwrap();
 
     reg.pause_group(&g.id).unwrap();
-    reg.start_task(&g.id, &t.id).unwrap();
+    let err = reg.start_task(&g.id, &t.id).unwrap_err();
+    assert!(err.contains("paused"), "paused rejection must say so: {err}");
 
-    let entries = reg.audit_log(&g.id);
-    let sup = entries
-        .iter()
-        .find(|e| e.action == "prompt-suppressed-paused")
-        .expect("the start nudge must reach delivery");
-    assert_eq!(sup.actor, "human", "start must be attributed to the human");
-    assert_eq!(sup.detail["to"], orch.id, "start must resolve to the orchestrator, not the worker");
-    let text = sup.detail["text"].as_str().unwrap();
-    assert!(text.contains(&t.id) && text.contains("Ship the parser"), "prompt must name the task");
-    assert!(text.contains("started"), "prompt must tell the orchestrator to begin work");
+    assert!(reg.tasks(&g.id)[0].notes.is_empty(), "a rejected start must not leave a note");
+    assert!(
+        reg.audit_log(&g.id).iter().all(|e| e.action != "prompt-suppressed-paused"),
+        "start must reject before delivery — no suppressed-prompt audit"
+    );
+
+    // Resuming lets it through again.
+    reg.resume_group(&g.id).unwrap();
+    let after = reg.start_task(&g.id, &t.id).unwrap();
+    assert_eq!(after.status, "queued");
+    assert!(after.notes.last().unwrap().text.contains("Started"), "resumed start records the nudge");
 }
 
 // ---------- review-round regression tests ----------

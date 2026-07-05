@@ -1408,8 +1408,17 @@ impl OrchRegistry {
     /// status — the orchestrator moves it to `in-progress` when it actually
     /// assigns a worker, so the board reflects real assignment rather than
     /// intent. The notice is best-effort (the board is the source of truth).
+    ///
+    /// A paused group is rejected up front (mirroring `steer_orchestrator`):
+    /// its delivery is silently suppressed and queued prompts aren't replayed
+    /// on resume, so without this guard the nudge would vanish — with a note
+    /// left behind implying it landed. Reject before any mutation so no note is
+    /// appended, and let the human resume first.
     pub fn start_task(&self, group: &str, id: &str) -> Result<Task, String> {
         self.ensure_queued(group, id)?;
+        if self.is_paused(group) {
+            return Err("group is paused — resume before starting tasks".into());
+        }
         let task = self.upsert_task(
             group,
             "human",

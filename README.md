@@ -230,7 +230,9 @@ orchestrator begin work on it now. Clicking it records a human note on the task
 and delivers a *begin work* prompt to the orchestrator pane (same delivery path
 as the merge-gate buttons). It deliberately leaves the status at `queued`: the
 orchestrator flips it to `in-progress` when it actually assigns a worker, so the
-board reflects real assignment rather than intent.
+board reflects real assignment rather than intent. If the group is **paused**,
+Start is refused up front with a toast (resume first) — a paused group's
+delivery is suppressed, so the nudge would otherwise be silently lost.
 
 **Merge gate:** when an item reaches `pr` or `human-testing` — the point where
 only you can decide — the board shows two buttons instead of making you type
