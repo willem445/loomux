@@ -98,9 +98,9 @@ all its context.
 
 Task briefs you send to workers must include: the issue number, the goal and acceptance
 criteria, the branch name to use, constraints (files to avoid touching if other work is
-in flight), and the definition of done (tests + docs + PR). Workers follow the standard
-flow: branch → implement → meaningful tests → design notes/user docs → commit → push →
-`gh pr create` → `report`.
+in flight), and the definition of done (tests + docs + PR + green CI). Workers follow the
+standard flow: branch → implement → meaningful tests → design notes/user docs → commit →
+push → `gh pr create` → `report`.
 
 **Silent-agent recovery.** A freshly spawned agent should read its instructions and
 report ready/progress within a couple of minutes. If one stays silent, `get_output` its
@@ -116,11 +116,58 @@ When a worker reports a PR:
 3. Do your own **high-level** completion check: does the PR actually satisfy the issue's
    acceptance criteria? Spot-check the diff (`gh pr diff`) — you are not the line-by-line
    reviewer.
-4. Report to the human in your pane: issue, PR link, review outcome, anything they
-   should look at. **Never merge.** The human performs final review and merge.
+4. Confirm the PR's CI is green (see **The CI gate** below) — review approval alone is
+   not completion.
+5. Report to the human in your pane: issue, PR link, review outcome, CI status, anything
+   they should look at. **Never merge.** The human performs final review and merge.
 
 After a PR merges (check with `gh pr view`), have the worker clean up (delete worktree/
 branch) or do it yourself, then schedule the next item.
+
+## The CI gate
+
+No job is done while its CI is red. Every PR — sub-PRs between agent branches and the
+final PR the human reviews — must have green checks (`gh pr checks <pr>`; a just-pushed
+PR may need a minute before checks appear) before you call the task complete, merge a
+sub-PR, or hand a PR to the human. Include CI status in every completion report.
+
+When CI fails:
+
+1. Diagnose from the actual logs (`gh run view <run-id> --log-failed`) — never guess
+   from the check name alone, and remember a platform-specific job can fail while the
+   others pass.
+2. Route the fix to the worker that owns the change (resume its session if it was
+   killed). Have it reproduce locally where possible, fix, push, and watch the checks
+   rerun.
+3. **Bounded attempts — never loop forever.** A failed attempt = a pushed fix (or a
+   rerun of a suspected-flaky run) after which CI is still red. After **3 failed
+   attempts on the same PR**, stop: mark the board task `blocked` with a note, comment
+   on the issue/PR what was tried and what the failure looks like, tell the human it
+   needs their review, and move on to other work. Do not keep spending on a fix loop.
+
+## Monitoring open PRs
+
+While any of your PRs is open, don't go dark: re-check each one for CI completion and
+new comments (`gh pr checks <pr>`, `gh pr view <pr> --comments`) at every natural
+wake-up — a worker report, a board change, a human message — and on a slow periodic
+cadence while otherwise idle. Track the last comment you've seen per PR in `set_state`
+so you only react to new ones. Surface anything new to the human in your pane; a
+just-completed CI run feeds **The CI gate** above.
+
+**Reacting to PR comments — act only on the clearly actionable.** Humans may discuss on
+a PR for several rounds before anything is agreed; jumping in mid-discussion is worse
+than waiting.
+
+- **Simple, self-contained fixes** stated in a comment (syntax errors, typos, a rename,
+  an obvious one-liner): address immediately — do it yourself when trivial, dispatch or
+  resume the owning worker when it needs real work. Reply on the PR with what was done.
+- **Everything else** (design questions, alternatives being weighed, multi-comment
+  threads, anything ambiguous): do NOT act on it. Wait until a human explicitly hands it
+  over in a PR comment — "orchestrator please address", "agent, fix this", or any
+  similar direct instruction — or asks you directly in your pane. Until then just track
+  the thread and note it on the board task if it looks like it will turn into work.
+- When handed a discussion outcome, restate your reading of the agreed change in one
+  short PR comment before implementing, so a misread is cheap to catch.
 
 ## Durability rules
 
