@@ -58,22 +58,29 @@ depends on the platform:
   `strip = "debuginfo"` keeps (only debuginfo, and thus line numbers, is
   dropped). Crash-log backtraces name their functions. Real win, small size
   cost.
-- **Windows / MSVC (the shipping target):** the exe has no symbol table — names
-  come from a **PDB** resolved at runtime by dbghelp. The release profile emits
-  **no PDB** (`debug` defaults to `false`), and even if it did, the Tauri bundle
-  (`tauri.conf.json` → `bundle.targets: "all"` → NSIS/MSI) ships only
-  `loomux.exe` and its installer, **not** a `.pdb`. So a shipped Windows crash
-  log's backtrace is **addresses only**. The addresses are still useful (offset
-  into the module), and the panic *message*, *location* (`file:line:col`, from
-  `#[track_caller]`/panic metadata, independent of the PDB), and *thread name*
-  are always present and are usually enough to localize the fault.
+- **Windows / MSVC (the shipping target):** the exe has no in-binary symbol
+  table — names come from a **PDB** resolved at runtime by dbghelp. A release
+  build *does* emit `loomux.pdb` beside `loomux.exe` (verified:
+  `cargo build --release` produces `target/release/loomux.pdb`; `strip =
+  "debuginfo"` strips the exe's embedded debug but leaves the standalone PDB).
+  So when the exe is run **from the build tree** — local dev and CI — dbghelp
+  finds the adjacent PDB and backtraces **are** named. The gap is the shipped
+  **bundle**: `tauri.conf.json` → `bundle.targets: "all"` (NSIS/MSI) copies only
+  `loomux.exe`, the conhost resources, and icons into the installer — **not**
+  `loomux.pdb`. So on an **end-user's installed** loomux the PDB is absent and
+  crash-log backtraces are **addresses only**. The addresses are still useful
+  (module + offset), and the panic *message*, *location* (`file:line:col`, from
+  panic metadata, independent of the PDB), and *thread name* are always present
+  and usually enough to localize the fault.
 
-We deliberately do **not** ship a PDB: it bloats the installer and exposes full
-symbols. To get named Windows frames when reproducing locally, build with a PDB
-(`RUSTFLAGS=-Cdebuginfo=1` or set `debug = "line-tables-only"` in the release
-profile) and keep `loomux.pdb` beside `loomux.exe` at runtime — dbghelp picks it
-up automatically. Shipping symbolication (uploading a PDB to a symbol server
-keyed by the crash log's addresses) is a possible follow-up, out of scope here.
+We deliberately do **not** ship the PDB in the installer: it roughly doubles the
+payload and exposes full symbols. Two honest follow-ups (out of scope here):
+bundle `loomux.pdb` next to the exe (a `bundle.resources` entry pointing at the
+build artifact, or a post-build copy step) so installed builds get named frames
+too; or set up server-side symbolication — upload the PDB to a symbol server
+keyed by the module + address in the crash log. Until then, a developer
+reproducing a shipped crash can drop the matching `loomux.pdb` beside the
+installed `loomux.exe` and dbghelp will symbolicate.
 
 ### 2. Breadcrumb log
 

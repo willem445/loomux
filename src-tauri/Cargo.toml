@@ -51,10 +51,10 @@ tempfile = { version = "3", default-features = false }
 lto = true
 codegen-units = 1
 # Keep the symbol table (drop only debuginfo) so the panic hook's backtraces
-# (issue #53) name functions instead of bare addresses. This helps on
-# Linux/macOS, where frame names come from the in-binary symbol table. On
-# Windows/MSVC names come from a PDB (dbghelp), which release doesn't emit and
-# the bundle doesn't ship — so shipped Windows backtraces stay address-only; see
-# doc/design/crash-observability.md. `strip = true` would blank frames on every
-# platform.
+# (issue #53) name functions instead of bare addresses. On Linux/macOS names
+# come from the in-binary symbol table this keeps. On Windows/MSVC names come
+# from the standalone loomux.pdb (still emitted beside the exe), so build-tree
+# and CI runs are symbolicated — but the Tauri bundle doesn't ship the .pdb, so
+# an installed build's backtraces stay address-only; see
+# doc/design/crash-observability.md. `strip = true` would blank frames everywhere.
 strip = "debuginfo"
