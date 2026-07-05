@@ -12,7 +12,7 @@ import type { Grid } from "./grid";
 import type { PaneEvents, PaneBadge } from "./pane";
 import { panesInGroup } from "./group";
 
-export type OrchRole = "orchestrator" | "worker" | "reviewer";
+export type OrchRole = "orchestrator" | "worker" | "reviewer" | "planner";
 
 /** Backend request to open (or spec to open) an agent pane. */
 export interface OrchSpawnRequest {
@@ -81,6 +81,7 @@ const ROLE_LABELS: Record<OrchRole, string> = {
   orchestrator: "ORCH",
   worker: "W",
   reviewer: "REV",
+  planner: "PLAN",
 };
 
 export function badgeFor(req: OrchSpawnRequest): PaneBadge {
