@@ -374,7 +374,10 @@ header chip and, via a listener, mirrors the state onto a minimized pane's **doc
   narrow pane, or a **localized / reworded** footer, won't match — acceptable for now (the
   pointer and structured signals still cover most such cases). The quiet gate is load-bearing:
   a menu that keeps emitting bytes (blinking cursor, live countdown) never goes quiet and so
-  never flags; today's targets (static AskUserQuestion / Copilot menus) do go quiet.
+  never flags; today's targets (static AskUserQuestion / Copilot menus) do go quiet. Anchoring
+  the pointer to the last 3 non-empty lines also means a **footer-less** menu whose ❯ sits at
+  the top with 3+ options below it is missed until the user arrows down (the pointer re-enters
+  the window); real menus ship footers, so this is a safe-direction miss we accept.
 
 ## Risks / limitations
 
