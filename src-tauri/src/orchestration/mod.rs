@@ -252,14 +252,24 @@ pub fn watchdog_should_notify(
 
 /// Attention routing (#6): does a pane's ANSI-stripped output tail look like a
 /// CLI parked on a prompt only the human can answer — a permission dialog, a
-/// yes/no confirmation, or a numbered selection menu? This is the "last output"
+/// yes/no confirmation, or a numbered/selection menu? This is the "last output"
 /// half of idle-with-prompt detection; the caller pairs it with an
 /// output-quiet check (this alone can't tell a live prompt from the same words
 /// scrolled past). So it errs toward recognizable interactive-prompt structure
-/// (the selection pointer both Claude Code and Copilot render, explicit y/n
-/// tokens, the stock permission phrasings) rather than any mention of a
-/// question. Case-insensitive; only the final handful of lines are considered,
-/// because a prompt the CLI is waiting on is the last thing it painted.
+/// rather than any mention of a question. Case-insensitive.
+///
+/// Two tiers of signal, by how prose-safe each is (#40 review):
+/// - *Structured* signals (numbered y/n menu, explicit y/n tokens, stock
+///   permission phrasings) don't occur in ordinary prose, so they're honored
+///   across the last ~12 lines.
+/// - *Prose-like* signals — a bare selection pointer and the plain-English menu
+///   footer ("use arrow keys", "enter to select") — DO appear in finished-turn
+///   agent output (agents describe keyboard UIs, paste shell prompts, echo
+///   `a › b` breadcrumbs). A *live* menu paints these as the last thing on
+///   screen, with its pointer *leading* an option line (after any box frame);
+///   prose does neither. So the pointer must lead a de-framed line, and the
+///   footer is only read from the last few non-empty lines — once the CLI
+///   redraws its idle input box below the prose, the phrase falls out of range.
 pub fn prompt_wait_detected(tail: &str) -> bool {
     let lines: Vec<String> = tail
         .lines()
@@ -272,16 +282,24 @@ pub fn prompt_wait_detected(tail: &str) -> bool {
     let recent = &lines[lines.len().saturating_sub(12)..];
     let joined = recent.join("\n");
 
-    // Selection pointer marking the highlighted choice of a menu. `❯`/`›` are
-    // used almost exclusively by interactive CLI selection menus (Claude Code,
-    // Copilot, inquirer), so a bare appearance *anywhere* in the tail is a
-    // strong signal — crucially including a bordered dialog whose option line
-    // reads `│ ❯ Yes`, where the pointer no longer *starts* the line (#40).
-    // `→` is common in ordinary output (diffs, logs, arrows in prose), so keep
-    // it strict: it must lead the option line.
-    let has_pointer_option = recent
-        .iter()
-        .any(|l| l.contains('❯') || l.contains('›') || l.starts_with('→'));
+    // Strip a line's leading box border / bullet / indent so a menu pointer
+    // inside a bordered dialog (`│ ❯ Yes`) is seen to *lead* its content.
+    fn deframe(l: &str) -> &str {
+        l.trim_start_matches(|c: char| {
+            c == '│' || c == '┃' || c == '|' || c == '*' || c == '●' || c == '•' || c == '◆'
+                || c.is_whitespace()
+        })
+    }
+
+    // Selection pointer marking the highlighted choice. A `❯`/`›`/`→` that
+    // *leads* a line's content (after any box frame) is menu-shaped; the same
+    // glyph mid-line is pervasive in ordinary output — pasted shell prompts
+    // (`demo ❯ npm run dev`), UI breadcrumbs (`Home › Prefs`), diff/log arrows —
+    // and must NOT count (#40 review). So require it to lead, not merely appear.
+    let has_pointer_option = recent.iter().any(|l| {
+        let d = deframe(l);
+        d.starts_with('❯') || d.starts_with('›') || d.starts_with('→')
+    });
     // A numbered yes/no menu even without the pointer glyph.
     let has_numbered_menu = joined.contains("1. yes") || joined.contains("❯ 1.");
     // Explicit yes/no confirmation tokens.
@@ -290,13 +308,7 @@ pub fn prompt_wait_detected(tail: &str) -> bool {
         || joined.contains("y/n)")
         || joined.contains("[y/n]?")
         || joined.contains("yes/no");
-    // Stock permission / trust / continue phrasings from Claude Code & Copilot,
-    // plus the footer an interactive selection menu paints while parked on a
-    // choice. Claude Code's AskUserQuestion highlights the active option with
-    // reverse-video (an ANSI attribute stripped before we see it), so no glyph
-    // survives and the footer ("enter to select", "↑↓ to navigate") is the only
-    // durable signal (#40). These footer strings are near-exclusive to live
-    // selection prompts, so they don't storm on ordinary streaming output.
+    // Stock permission / trust / continue phrasings from Claude Code & Copilot.
     let has_permission_phrase = joined.contains("do you want to proceed")
         || joined.contains("do you want to make this edit")
         || joined.contains("do you want to create")
@@ -307,15 +319,25 @@ pub fn prompt_wait_detected(tail: &str) -> bool {
         || joined.contains("allow command")
         || joined.contains("grant access")
         || joined.contains("press enter to continue")
-        || joined.contains("waiting for your")
-        // interactive selection-menu footers (AskUserQuestion / Copilot / inquirer):
-        || joined.contains("enter to select")
-        || joined.contains("enter to confirm")
-        || joined.contains("use arrow")
-        || joined.contains("arrow keys")
-        || joined.contains("↑↓")
-        || joined.contains("↑/↓");
-    has_pointer_option || has_numbered_menu || has_yes_no || has_permission_phrase
+        || joined.contains("waiting for your");
+    // Interactive selection-menu footer (AskUserQuestion / Copilot / inquirer).
+    // Claude Code's AskUserQuestion highlights the active option with reverse
+    // video (an ANSI attribute stripped before we see it), so no glyph survives
+    // and this footer is the only durable signal (#40). But it's plain English,
+    // so — unlike the structured signals — read it ONLY from the last few
+    // non-empty lines: a live menu paints its footer last, whereas prose that
+    // mentions arrow keys is followed by the CLI's redrawn idle input box, which
+    // pushes it out of this window (#40 review). NOTE: matched on single lines,
+    // so a footer wrapped across rows in a very narrow pane, or a localized /
+    // reworded footer, won't match — a known gap (see design doc).
+    let footer = recent[recent.len().saturating_sub(3)..].join("\n");
+    let has_menu_footer = footer.contains("enter to select")
+        || footer.contains("enter to confirm")
+        || footer.contains("use arrow")
+        || footer.contains("arrow keys")
+        || footer.contains("↑↓")
+        || footer.contains("↑/↓");
+    has_pointer_option || has_numbered_menu || has_yes_no || has_permission_phrase || has_menu_footer
 }
 
 /// Distinct agent working directories to remove when a group is torn down
@@ -614,6 +636,13 @@ pub struct OrchRegistry {
     /// output total, Unix-ms that total last changed). Kept separate from the
     /// watchdog's counter so the two features never clobber each other's clocks.
     attn_quiet: Mutex<HashMap<String, (u64, u64)>>,
+    /// Attention routing: agents whose live `waiting` badge the human has acked
+    /// (focused the pane) while the prompt is still on screen. Unlike
+    /// `blocked`/`report`, `waiting` is recomputed every scan, so without this it
+    /// would re-light ~3s after focus. Cleared when the pane's output next
+    /// changes (the menu was answered / the CLI repainted) so a genuinely new
+    /// prompt flags again. See `attention_tick`.
+    attn_waiting_ack: Mutex<HashSet<String>>,
     /// Attention routing: the agent → reason set last emitted, so a scan fires a
     /// desktop toast only once per attention onset (the event itself is
     /// re-emitted every tick and the frontend badges idempotently).
@@ -917,6 +946,7 @@ impl OrchRegistry {
             self_arc: Mutex::new(Weak::new()),
             attn_reports: Mutex::new(HashMap::new()),
             attn_quiet: Mutex::new(HashMap::new()),
+            attn_waiting_ack: Mutex::new(HashSet::new()),
             attn_emitted: Mutex::new(HashMap::new()),
             notify_groups: Mutex::new(HashSet::new()),
         }
@@ -1801,10 +1831,16 @@ impl OrchRegistry {
     }
 
     /// The human focused/handled a pane: drop any latched report so its badge
-    /// clears. Live reasons (waiting/gate) are recomputed each scan and reappear
-    /// only if still true, so they need no explicit clear.
+    /// clears, and suppress the live `waiting` badge so focusing a pane whose
+    /// menu is still on screen makes the ack *stick* — otherwise the next 3s scan
+    /// re-emits `waiting` and re-lights the pane the human is already on (#40
+    /// review). The suppression self-clears once the pane's output changes (the
+    /// menu was answered / the CLI repainted), so a genuinely new prompt on the
+    /// same pane flags again. The `gate` reason is board state, cleared by moving
+    /// the task, so it needs no ack.
     pub fn ack_attention(&self, agent_id: &str) {
         self.attn_reports.lock().unwrap().remove(agent_id);
+        self.attn_waiting_ack.lock().unwrap().insert(agent_id.to_string());
     }
 
     /// Whether desktop notifications are enabled for a group.
@@ -1892,18 +1928,24 @@ impl OrchRegistry {
 
         let reports = self.attn_reports.lock().unwrap().clone();
         let mut quiet = self.attn_quiet.lock().unwrap();
+        let mut waiting_ack = self.attn_waiting_ack.lock().unwrap();
         let agents = self.agents.lock().unwrap();
         let mut out = Vec::new();
         for a in agents.values() {
             if a.status != AgentStatus::Running {
                 quiet.remove(&a.id);
+                waiting_ack.remove(&a.id);
                 continue;
             }
             // Track how long the pane's output has been stable.
             let cur = outputs.get(&a.id).copied().unwrap_or(0);
             let entry = quiet.entry(a.id.clone()).or_insert((cur, now));
-            if cur != entry.0 {
+            let output_changed = cur != entry.0;
+            if output_changed {
                 *entry = (cur, now);
+                // The pane repainted — the acked menu was answered or replaced,
+                // so re-arm: a fresh prompt on this pane flags again.
+                waiting_ack.remove(&a.id);
             }
             let quiet_for = now.saturating_sub(entry.1);
             let recently_typed = last_inputs
@@ -1911,6 +1953,7 @@ impl OrchRegistry {
                 .map(|&t| t != 0 && now.saturating_sub(t) < ATTENTION_RECENT_INPUT_MS)
                 .unwrap_or(false);
             let waiting = !recently_typed
+                && !waiting_ack.contains(&a.id)
                 && quiet_for >= ATTENTION_QUIET_MS
                 && tails.get(&a.id).map(|t| prompt_wait_detected(t)).unwrap_or(false);
 
@@ -2843,6 +2886,7 @@ impl OrchRegistry {
         // Attention bookkeeping is per-live-agent; drop this one's entries.
         self.attn_reports.lock().unwrap().remove(agent_id);
         self.attn_quiet.lock().unwrap().remove(agent_id);
+        self.attn_waiting_ack.lock().unwrap().remove(agent_id);
         self.attn_emitted.lock().unwrap().remove(agent_id);
         let _ = fs::remove_file(
             self.group_dir(&snapshot.group).join("configs").join(format!("{agent_id}.json")),

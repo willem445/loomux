@@ -1491,6 +1491,13 @@ const FIX_CLAUDE_ASK: &str = include_str!("fixtures/attention/claude-askuserques
 const FIX_COPILOT_ASK: &str = include_str!("fixtures/attention/copilot-question.txt");
 const FIX_STREAMING: &str = include_str!("fixtures/attention/streaming-output.txt");
 const FIX_IDLE_BOX: &str = include_str!("fixtures/attention/idle-input-box.txt");
+// Finished-turn agent output that *mentions* interactive-UI cues but is not a
+// live prompt (#40 review false-positive repro): keyboard-nav prose, a pasted
+// shell prompt whose glyph is `❯`, and a `›` UI breadcrumb — each followed by
+// the CLI's redrawn idle input box.
+const FIX_FP_PROSE: &str = include_str!("fixtures/attention/fp-prose-arrow-keys.txt");
+const FIX_FP_SHELL: &str = include_str!("fixtures/attention/fp-shell-prompt-glyph.txt");
+const FIX_FP_BREADCRUMB: &str = include_str!("fixtures/attention/fp-breadcrumb-separator.txt");
 
 #[test]
 fn prompt_wait_detected_fires_on_interactive_question_fixtures() {
@@ -1523,6 +1530,25 @@ fn prompt_wait_detected_ignores_quiet_non_prompts() {
         !prompt_wait_detected(&strip_ansi(FIX_IDLE_BOX.as_bytes())),
         "an idle input box is not an interactive question"
     );
+}
+
+#[test]
+fn prompt_wait_detected_ignores_finished_turn_prose_about_ui() {
+    // #40 review: finished-turn agent output that *describes* keyboard UIs, pastes
+    // a `❯` shell prompt, or echoes a `›` breadcrumb must NOT flag once the CLI's
+    // idle input box has redrawn below it. These flagged before the fix — the new
+    // signals are anchored (pointer must lead a line; footer read from the last
+    // few lines only), so the phrases/glyphs now fall out of range.
+    for (name, fixture) in [
+        ("keyboard-nav prose", FIX_FP_PROSE),
+        ("pasted ❯ shell prompt", FIX_FP_SHELL),
+        ("› UI breadcrumb", FIX_FP_BREADCRUMB),
+    ] {
+        assert!(
+            !prompt_wait_detected(&strip_ansi(fixture.as_bytes())),
+            "{name}: finished-turn prose must not be mistaken for a live prompt"
+        );
+    }
 }
 
 #[test]
@@ -1564,16 +1590,68 @@ fn attention_does_not_flag_streaming_or_idle_fixtures() {
     let now = 1_000_000_000_000u64;
     let out: HashMap<String, u64> = [(wid.clone(), 256u64)].into_iter().collect();
     let no_input = HashMap::new();
-    for fixture in [FIX_STREAMING, FIX_IDLE_BOX] {
+    for fixture in [FIX_STREAMING, FIX_IDLE_BOX, FIX_FP_PROSE, FIX_FP_SHELL, FIX_FP_BREADCRUMB] {
         let tail: HashMap<String, String> =
             [(wid.clone(), strip_ansi(fixture.as_bytes()))].into_iter().collect();
         reg.attention_tick(now, &out, &tail, &no_input);
         let later = reg.attention_tick(now + 60_000, &out, &tail, &no_input);
         assert!(
             later.iter().all(|i| i.reason != "waiting"),
-            "ordinary/idle output must not raise attention, got: {later:?}"
+            "ordinary/idle/prose output must not raise attention, got: {later:?}"
         );
     }
+}
+
+#[test]
+fn attention_waiting_ack_sticks_until_the_prompt_changes() {
+    // #40 review: focusing/acking a pane parked on a live menu must make the ack
+    // *stick* — the next scan must not re-light `waiting` on the pane the human is
+    // already on. The suppression lifts only when the pane's output changes.
+    let (reg, _d, _g, wid) = attention_setup();
+    let now = 1_000_000_000_000u64;
+    let out: HashMap<String, u64> = [(wid.clone(), 100u64)].into_iter().collect();
+    let tail: HashMap<String, String> =
+        [(wid.clone(), strip_ansi(FIX_COPILOT_ASK.as_bytes()))].into_iter().collect();
+    let no_input = HashMap::new();
+
+    // Establish the quiet clock, then flag `waiting`.
+    reg.attention_tick(now, &out, &tail, &no_input);
+    assert_eq!(
+        reg.attention_tick(now + 5000, &out, &tail, &no_input)
+            .iter()
+            .filter(|i| i.agent_id == wid && i.reason == "waiting")
+            .count(),
+        1,
+        "a quiet pane parked on a menu must flag waiting"
+    );
+
+    // The human focuses the pane (auto-ack). Even with the menu still on screen
+    // (output unchanged), the next scan must not re-raise waiting.
+    reg.ack_attention(&wid);
+    assert!(
+        reg.attention_tick(now + 8000, &out, &tail, &no_input)
+            .iter()
+            .all(|i| !(i.agent_id == wid && i.reason == "waiting")),
+        "ack must stick while the same menu is on screen"
+    );
+    assert!(
+        reg.attention_tick(now + 11_000, &out, &tail, &no_input)
+            .iter()
+            .all(|i| !(i.agent_id == wid && i.reason == "waiting")),
+        "ack stays sticky across further quiet scans"
+    );
+
+    // The pane repaints (menu answered → a *new* prompt appears): re-arm and flag.
+    let grew: HashMap<String, u64> = [(wid.clone(), 200u64)].into_iter().collect();
+    reg.attention_tick(now + 12_000, &grew, &tail, &no_input); // observe the change, reset quiet clock
+    assert_eq!(
+        reg.attention_tick(now + 17_000, &grew, &tail, &no_input)
+            .iter()
+            .filter(|i| i.agent_id == wid && i.reason == "waiting")
+            .count(),
+        1,
+        "a fresh prompt after the pane repainted flags again"
+    );
 }
 
 #[test]

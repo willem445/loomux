@@ -1,0 +1,8 @@
+To switch themes, open the menu at:
+  Home › Preferences › Appearance
+and choose a color scheme.
+
+╭──────────╮
+│ > [2mTry "run the tests"[0m                      │
+╰──────────╯
+  [2m? for shortcuts[0m
