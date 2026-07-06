@@ -9,7 +9,7 @@
 //! every tool is scoped to the caller's group — panes without a token can't
 //! reach this server's state at all, and group A can never see group B.
 
-use super::{OrchRegistry, Caller, NameSource, Role};
+use super::{Caller, Delivery, NameSource, OrchRegistry, Role};
 use serde_json::{json, Value};
 use std::io::Read as _;
 use std::sync::Arc;
@@ -359,7 +359,7 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             // before delivery (which is async in the running app) so the
             // intent to assign counts regardless of delivery timing.
             reg.set_agent_idle(&a.id, false);
-            reg.deliver_prompt(&a.id, text, &caller.agent_id, false)?;
+            reg.deliver_prompt(&a.id, text, &caller.agent_id, Delivery::MidSession)?;
             Ok(format!("prompt delivered to {}", a.id))
         }
         "get_output" => {

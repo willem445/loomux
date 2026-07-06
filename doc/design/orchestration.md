@@ -689,6 +689,10 @@ Two related additions: a **planner** role, and **per-role** agent CLI + model.
       `AUTOPILOT_DIALOG_WAIT` (Copilot changed the flow, or consent was pre-recorded), the
       confirm is a no-op and delivery proceeds. The human's group-level auto-ops choice is the
       consent — loomux is answering a dialog on behalf of an operator who already opted in.
+      The confirm is gated to a **fresh boot** (the `Delivery::FreshKickoff` classification →
+      `should_confirm_copilot_autopilot`): a **resume** restores allow-all/autopilot from
+      Copilot's session event log so no dialog reappears, and mid-session follow-ups/steers are
+      long past boot — both skip the watch rather than eat its fail-soft wait on every delivery.
     Previously a planner in a **non-auto_ops** group got the interactive preset (`acceptEdits`
     with no git/gh allowlist on Claude; plain interactive mode with no allow-all on Copilot),
     so its very first `gh`/explore call would have prompted into the void — a latent deadlock

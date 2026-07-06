@@ -715,6 +715,47 @@ pub fn copilot_autopilot_prompt_detected(tail: &str) -> bool {
     t.contains("enable autopilot mode") && t.contains("enable all permissions")
 }
 
+/// How a `deliver_prompt` call relates to the pane's lifecycle. Governs the boot
+/// readiness wait AND the one-time copilot autopilot-consent confirm (#101).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Delivery {
+    /// First prompt to a freshly *booted* pane (a fresh spawn's kickoff): wait
+    /// for the CLI to paint, and — for an autopilot copilot agent — answer the
+    /// "Enable autopilot mode" consent dialog before pasting.
+    FreshKickoff,
+    /// First prompt to a *resumed* pane: still wait for the CLI to paint, but a
+    /// resume restores allow-all/autopilot from the session event log, so the
+    /// consent dialog does not reappear — skip the confirm (and its fail-soft
+    /// wait) rather than watch for a dialog that will never show.
+    ResumeKickoff,
+    /// A mid-session delivery to an already-running pane (a follow-up / steer):
+    /// no readiness wait, no dialog.
+    MidSession,
+}
+
+impl Delivery {
+    /// Whether to hold the paste until the CLI has painted its UI — true for
+    /// either kickoff (the CLI has just been launched), false mid-session.
+    fn wait_ready(self) -> bool {
+        matches!(self, Delivery::FreshKickoff | Delivery::ResumeKickoff)
+    }
+    /// Whether this delivery follows a fresh CLI boot (the only time copilot
+    /// shows its autopilot consent dialog).
+    fn is_fresh_boot(self) -> bool {
+        matches!(self, Delivery::FreshKickoff)
+    }
+}
+
+/// Whether a delivery should attempt the copilot autopilot-consent confirm.
+/// Only a *fresh boot* of an *unattended copilot* agent shows the "Enable
+/// autopilot mode" dialog — resume restores the consent from the session log,
+/// and mid-session deliveries are long past boot — so both of those skip the
+/// (fail-soft, up to `AUTOPILOT_DIALOG_WAIT`) watch. Pure so the gate is
+/// unit-testable without a live pty.
+pub fn should_confirm_copilot_autopilot(cli: &str, unattended: bool, fresh_boot: bool) -> bool {
+    fresh_boot && unattended && cli == "copilot"
+}
+
 /// Distinct agent working directories to remove when a group is torn down
 /// with worktree cleanup: dedup (case/separator-insensitively), and never the
 /// repo root itself — the orchestrator and any repo-mode workers run there, so
@@ -3968,16 +4009,17 @@ impl OrchRegistry {
                 if resume {
                     // Resumed sessions already have their role and history;
                     // deliver only the follow-up (if any) instead of the
-                    // full kickoff.
+                    // full kickoff. ResumeKickoff waits for boot but skips the
+                    // autopilot confirm — the consent is restored, no dialog.
                     if !task.trim().is_empty() {
-                        self.deliver_prompt(&agent_id, task, "loomux", true)?;
+                        self.deliver_prompt(&agent_id, task, "loomux", Delivery::ResumeKickoff)?;
                     }
                 } else {
                     let a = self
                         .agent(&agent_id)
                         .ok_or("agent vanished during spawn")?;
                     let kickoff = self.kickoff_prompt(&a, &group, &branch_note);
-                    self.deliver_prompt(&agent_id, &kickoff, "loomux", true)?;
+                    self.deliver_prompt(&agent_id, &kickoff, "loomux", Delivery::FreshKickoff)?;
                 }
                 // Copilot minted a session as it booted; watch for it and bind
                 // its id to this pane's roster record so the session becomes
@@ -4037,15 +4079,17 @@ impl OrchRegistry {
 
     /// Type `text` into an agent's CLI: audit, then bracketed paste + Enter
     /// on a background thread (serialized so deliveries never interleave).
-    /// `wait_ready` is for freshly spawned CLIs: the paste is held until the
-    /// pane's output shows the CLI has painted its UI and gone quiet —
-    /// input typed before a CLI's reader attaches is flushed and lost.
+    /// `delivery` classifies the call (see [`Delivery`]): a kickoff to a just-
+    /// booted CLI holds the paste until the pane has painted its UI and gone
+    /// quiet (input typed before the CLI's reader attaches is flushed and lost),
+    /// and a *fresh* boot additionally answers copilot's autopilot consent
+    /// dialog first; mid-session deliveries do neither.
     pub fn deliver_prompt(
         &self,
         agent_id: &str,
         text: &str,
         from: &str,
-        wait_ready: bool,
+        delivery: Delivery,
     ) -> Result<(), String> {
         let a = self.agent(agent_id).ok_or("unknown agent")?;
         if a.status == AgentStatus::Dead {
@@ -4063,19 +4107,23 @@ impl OrchRegistry {
         let app = self.app.lock_safe().clone().ok_or("no app handle")?;
         self.audit(&a.group, from, "prompt", json!({ "to": agent_id, "text": text }));
 
-        // A freshly spawned group copilot agent (wait_ready) is launched with
-        // `--autopilot`, so it boots into the "Enable autopilot mode" consent
-        // dialog; the worker thread answers it before pasting the brief. Gate on
-        // an *unattended copilot* agent — only those pass --autopilot — so we
-        // don't add the watch to panes that show no dialog (fail-soft covers the
-        // rare absent case anyway).
-        let confirm_autopilot = wait_ready && {
+        // A freshly *booted* group copilot agent is launched with `--autopilot`,
+        // so it opens the "Enable autopilot mode" consent dialog; the worker
+        // thread answers it before pasting the brief. Only a fresh boot shows it
+        // (resume restores the consent from the session log; mid-session is past
+        // boot), and only an unattended copilot agent passes --autopilot — so
+        // the confirm (and its fail-soft wait) is gated to exactly that case.
+        let confirm_autopilot = {
             let groups = self.groups.lock_safe();
             groups.get(&a.group).is_some_and(|g| {
-                g.guardrails.cli_for(a.role) == "copilot"
-                    && (g.guardrails.auto_ops || a.role == Role::Planner)
+                should_confirm_copilot_autopilot(
+                    g.guardrails.cli_for(a.role),
+                    g.guardrails.auto_ops || a.role == Role::Planner,
+                    delivery.is_fresh_boot(),
+                )
             })
         };
+        let wait_ready = delivery.wait_ready();
 
         let paste = bracketed_paste(text);
         // The Enter that submits the paste is chosen per CLI: Copilot ignores a
@@ -4338,7 +4386,7 @@ impl OrchRegistry {
             .find(|a| a.group == group && a.role == Role::Orchestrator && a.status != AgentStatus::Dead)
             .map(|a| a.id.clone())
             .ok_or("no live orchestrator in this group")?;
-        self.deliver_prompt(&orch, text, from, false)
+        self.deliver_prompt(&orch, text, from, Delivery::MidSession)
     }
 
     pub fn list_agents(&self, group: &str) -> Value {
@@ -4880,7 +4928,8 @@ fn register_orchestrator_pane(
                 None => return, // agent reaped before bind; nothing to kick off
             }
         };
-        let _ = reg2.deliver_prompt(&agent_id, &kickoff, "loomux", true);
+        let delivery = if resume { Delivery::ResumeKickoff } else { Delivery::FreshKickoff };
+        let _ = reg2.deliver_prompt(&agent_id, &kickoff, "loomux", delivery);
         // Track the copilot session this orchestrator just minted.
         if let Some(baseline) = copilot_baseline {
             reg2.clone().spawn_copilot_session_watcher(

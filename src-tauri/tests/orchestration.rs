@@ -12,12 +12,12 @@ use loomux_lib::orchestration::{
     copilot_autopilot_prompt_detected, create_orchestration_group, hold_until_quiet,
     idle_should_kill, max_agents_notice,
     normalize_remote_web_base, parse_audit_lines, parse_session_cost, prompt_wait_detected,
-    resolve_ref_url, rotate_audit_if_needed, sanitize_attachment_ext, should_flush_before_paste,
-    single_pane_autopilot_flags, spawn_rate_exceeded, strip_ansi, submit_confirmed, submit_sequence,
-    watchdog_should_notify, worktree_cleanup_targets, AttentionItem, Caller, Guardrails, NameSource,
-    OrchRegistry, Role, TaskPatch, UsageSnapshot, CLAUDE_UNATTENDED_ALLOW,
-    COPILOT_AUTOPILOT_CONFIRM_KEYS, COPILOT_GROUP_AUTOPILOT_FLAGS, COPILOT_UNATTENDED_FLAGS,
-    MAX_ATTACHMENT_BYTES, PLANNER_READONLY_NOTE,
+    resolve_ref_url, rotate_audit_if_needed, sanitize_attachment_ext, should_confirm_copilot_autopilot,
+    should_flush_before_paste, single_pane_autopilot_flags, spawn_rate_exceeded, strip_ansi,
+    submit_confirmed, submit_sequence, watchdog_should_notify, worktree_cleanup_targets, AttentionItem,
+    Caller, Delivery, Guardrails, NameSource, OrchRegistry, Role, TaskPatch, UsageSnapshot,
+    CLAUDE_UNATTENDED_ALLOW, COPILOT_AUTOPILOT_CONFIRM_KEYS, COPILOT_GROUP_AUTOPILOT_FLAGS,
+    COPILOT_UNATTENDED_FLAGS, MAX_ATTACHMENT_BYTES, PLANNER_READONLY_NOTE,
 };
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -850,6 +850,49 @@ fn copilot_autopilot_prompt_is_detected_only_on_the_real_dialog() {
     assert!(!copilot_autopilot_prompt_detected(
         "run /allow-all to enable all permissions"),
         "the option phrase alone must not match without the dialog title");
+
+    // A DIFFERENT boot-time dialog must not be mistaken for the autopilot one
+    // (rev-41): Copilot's folder-trust dialog is also a boxed menu shown at
+    // startup and it even mentions "permissions", but neither anchor phrase
+    // appears — so the two-anchor detector must reject it (verbatim strings from
+    // the 1.0.68 bundle's "Confirm folder trust" dialog).
+    let folder_trust = "\
+        ┌ Confirm folder trust ───────────────────────────────────────────────┐\n\
+        │ C:\\Projects\\loomux                                                   │\n\
+        │ Copilot can read files in this folder and, with your permission, edit │\n\
+        │ them or run code and shell commands. It will remember your            │\n\
+        │ permissions for the rest of this session.                             │\n\
+        │ Do you trust the files in this folder?                                │\n\
+        │ ❯ 1. Yes                                                              │\n\
+        │   2. Yes, and remember this folder                                    │\n\
+        │   3. No, exit (Esc)                                                    │\n\
+        └───────────────────────────────────────────────────────────────────────┘";
+    assert!(!copilot_autopilot_prompt_detected(folder_trust),
+        "the folder-trust boot dialog must never be read as the autopilot consent dialog");
+    // A login/auth prompt is likewise not the autopilot dialog.
+    assert!(!copilot_autopilot_prompt_detected(
+        "Your GitHub token may be invalid, expired, or lacking the required permissions — sign in again."),
+        "an auth prompt must not match");
+}
+
+#[test]
+fn autopilot_confirm_gates_to_a_fresh_copilot_boot() {
+    // rev-41: the confirm (and its up-to-12s fail-soft watch) must run ONLY on a
+    // fresh boot of an unattended copilot agent — the one time the "Enable
+    // autopilot mode" dialog appears. Resume restores the consent from the
+    // session log (no dialog) and mid-session deliveries are past boot, so both
+    // must skip it or they'd burn the fail-soft wait on every follow-up.
+    // Fresh + unattended + copilot → confirm.
+    assert!(should_confirm_copilot_autopilot("copilot", true, true));
+    // Resume / mid-session (fresh_boot=false) → never, even for copilot.
+    assert!(!should_confirm_copilot_autopilot("copilot", true, false),
+        "resume/mid-session must skip the confirm — the dialog is fresh-boot-only");
+    // Attended copilot (no --autopilot passed) shows no dialog → never.
+    assert!(!should_confirm_copilot_autopilot("copilot", false, true),
+        "an attended copilot agent has no --autopilot, so no dialog to confirm");
+    // Claude never shows this dialog → never, regardless of the other flags.
+    assert!(!should_confirm_copilot_autopilot("claude", true, true),
+        "only copilot has the autopilot consent dialog");
 }
 
 #[test]
@@ -2250,12 +2293,12 @@ fn pause_suppresses_delivery_and_persists_across_restart() {
         let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
         // Not paused: delivery proceeds past the pause gate and only fails
         // because test mode has no real terminal.
-        let err = reg.deliver_prompt(&w.id, "hello", "loomux", false).unwrap_err();
+        let err = reg.deliver_prompt(&w.id, "hello", "loomux", Delivery::MidSession).unwrap_err();
         assert!(err.contains("terminal"), "unpaused delivery must reach the pty step, got: {err}");
         // Paused: delivery is suppressed (Ok, no error) and audited.
         reg.pause_group(&g.id).unwrap();
         assert!(reg.is_paused(&g.id));
-        reg.deliver_prompt(&w.id, "hello again", "loomux", false).unwrap();
+        reg.deliver_prompt(&w.id, "hello again", "loomux", Delivery::MidSession).unwrap();
         let log = fs::read_to_string(reg.state_root().join(&g.id).join("audit.jsonl")).unwrap();
         assert!(log.contains("prompt-suppressed-paused"), "suppression must be audited");
         assert!(reg.state_root().join(&g.id).join("paused").is_file(), "pause marker must be written");
