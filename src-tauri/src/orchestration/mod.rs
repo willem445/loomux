@@ -2630,6 +2630,67 @@ impl OrchRegistry {
         items
     }
 
+    /// Scrape and aggregate Claude usage-limit readings (session/weekly %) from
+    /// the per-agent statusline tails already gathered this attention scan — the
+    /// only place the limit surfaces locally (see the `usage` design note). Only
+    /// Claude panes carry a readable limit; Copilot has no local allowance
+    /// source, so it never contributes. App-wide, not per-group: every live
+    /// Claude pane shares the one signed-in account.
+    ///
+    /// Agent identity is cloned out under the lock, then rails/parsing run
+    /// lock-free — the pure parse/aggregate live in `crate::usage` and are unit
+    /// tested there; this method is just the wiring.
+    fn claude_usage_limits(&self, tails: &HashMap<String, String>) -> crate::usage::ClaudeLimits {
+        // (agent_id, group, role) for every live agent that produced a tail.
+        let agent_info: Vec<(String, String, Role)> = {
+            let agents = self.agents.lock_safe();
+            tails
+                .keys()
+                .filter_map(|id| {
+                    agents
+                        .get(id)
+                        .filter(|a| a.status != AgentStatus::Dead)
+                        .map(|a| (id.clone(), a.group.clone(), a.role))
+                })
+                .collect()
+        };
+        let mut rails_cache: HashMap<String, Option<Guardrails>> = HashMap::new();
+        let mut per_pane: Vec<Vec<crate::usage::LimitReading>> = Vec::new();
+        for (id, group, role) in agent_info {
+            let rails = rails_cache
+                .entry(group.clone())
+                .or_insert_with(|| self.group(&group).map(|g| g.guardrails));
+            let cli = rails.as_ref().map(|g| g.cli_for(role)).unwrap_or("claude");
+            if cli != "claude" {
+                continue;
+            }
+            if let Some(tail) = tails.get(&id) {
+                per_pane.push(crate::usage::parse_claude_limits(tail));
+            }
+        }
+        crate::usage::aggregate_claude_limits(&per_pane)
+    }
+
+    /// The `orch-usage-limits` event payload for the bottom toolbar's usage
+    /// chips. Pure given the aggregated limits so the honesty labelling is
+    /// testable without an app handle.
+    fn usage_limits_payload(limits: &crate::usage::ClaudeLimits) -> Value {
+        json!({
+            // `null` when no live Claude pane exposed a limit readout at all —
+            // the frontend then shows an "n/a" chip explaining why.
+            "claude": (!limits.is_empty()).then(|| json!({
+                "session_pct": limits.session_pct,
+                "weekly_pct": limits.weekly_pct,
+                // Reported by the CLI's own statusline, not estimated by us.
+                "source": "statusline",
+            })),
+            // Copilot exposes no local premium-request allowance, only
+            // consumption counts — nothing honest to show (see usage.rs note).
+            "copilot": Value::Null,
+            "note": "Claude limits are scraped from each live pane's statusline (the only place the figure surfaces locally) and aggregated to the most-constrained pane; refreshed each attention scan. Reported by the CLI, not estimated. Copilot exposes no local allowance, so nothing is shown for it.",
+        })
+    }
+
     pub fn run_attention(&self, now: u64) {
         let (outputs, tails, last_inputs) = self.attention_inputs();
         // Also scan plain (non-agent) panes for an interactive prompt (#40).
@@ -2644,8 +2705,12 @@ impl OrchRegistry {
                 notify_desktop(&format!("loomux · {}", i.name), &i.detail);
             }
         }
+        // Reuse the same statusline tails to surface per-CLI usage limits (#80):
+        // no extra pty reads, no new poll loop.
+        let limits = self.claude_usage_limits(&tails);
         if let Some(app) = self.app.lock_safe().clone() {
             let _ = app.emit("orch-attention", &items);
+            let _ = app.emit("orch-usage-limits", &Self::usage_limits_payload(&limits));
         }
     }
 
@@ -4863,5 +4928,39 @@ mod max_notice_tests {
         assert_eq!(take_due_max_notices(&mut p, 4_000), vec![("a".to_string(), 4, 2)]);
         assert!(p.contains_key("b"), "b keeps waiting out its own window");
         assert_eq!(take_due_max_notices(&mut p, 6_000), vec![("b".to_string(), 5, 6)]);
+    }
+}
+
+#[cfg(test)]
+mod usage_limits_payload_tests {
+    use super::*;
+    use crate::usage::ClaudeLimits;
+
+    #[test]
+    fn empty_limits_report_claude_null() {
+        // No live pane exposed a readout: `claude` is null so the chip shows n/a.
+        let p = OrchRegistry::usage_limits_payload(&ClaudeLimits::default());
+        assert!(p["claude"].is_null());
+        assert!(p["copilot"].is_null(), "copilot always null: no local allowance");
+    }
+
+    #[test]
+    fn present_limits_are_labelled_statusline_and_never_estimated() {
+        let limits = ClaudeLimits { session_pct: Some(34), weekly_pct: Some(12) };
+        let p = OrchRegistry::usage_limits_payload(&limits);
+        assert_eq!(p["claude"]["session_pct"], 34);
+        assert_eq!(p["claude"]["weekly_pct"], 12);
+        // Honesty per #42: this figure is CLI-reported, not our estimate.
+        assert_eq!(p["claude"]["source"], "statusline");
+        assert!(p["copilot"].is_null());
+    }
+
+    #[test]
+    fn one_scope_present_still_shows_claude() {
+        let limits = ClaudeLimits { session_pct: None, weekly_pct: Some(7) };
+        let p = OrchRegistry::usage_limits_payload(&limits);
+        assert!(!p["claude"].is_null());
+        assert!(p["claude"]["session_pct"].is_null());
+        assert_eq!(p["claude"]["weekly_pct"], 7);
     }
 }

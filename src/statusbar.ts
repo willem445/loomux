@@ -5,7 +5,13 @@
 // The DOM skeleton lives in index.html; this module just wires up the stream
 // and updates widths, colours, and text in place.
 
-import { onSystemMetrics, type SystemMetrics } from "./metrics";
+import {
+  onSystemMetrics,
+  onUsageLimits,
+  type SystemMetrics,
+  type UsageLimits,
+} from "./metrics";
+import { usageChipView } from "./usagechip";
 
 interface Meter {
   root: HTMLElement;
@@ -39,12 +45,21 @@ function update(m: Meter, pct: number, text: string): void {
   m.val.textContent = text;
 }
 
+/** Apply the pure usage-chip view (see `usagechip.ts`) to the DOM. */
+function updateUsageChip(chip: Meter, u: UsageLimits): void {
+  const v = usageChipView(u);
+  chip.root.classList.toggle("metric-na", v.na);
+  update(chip, v.pct, v.text);
+  chip.root.title = v.title;
+}
+
 /** Subscribe to the metrics stream and keep the bar in sync. */
 export function initStatusBar(): void {
   const cpu = meter("m-cpu");
   const mem = meter("m-mem");
   const gpu = meter("m-gpu");
   const vram = meter("m-vram");
+  const usageCc = meter("m-usage-cc");
 
   void onSystemMetrics((s: SystemMetrics) => {
     update(cpu, s.cpu, `${Math.round(s.cpu)}%`);
@@ -74,4 +89,8 @@ export function initStatusBar(): void {
       update(vram, 0, "n/a");
     }
   });
+
+  // Agent usage limits ride the orchestration attention scan (issue #80): the
+  // event only fires while a group is live, so the chip stays n/a otherwise.
+  void onUsageLimits((u: UsageLimits) => updateUsageChip(usageCc, u));
 }

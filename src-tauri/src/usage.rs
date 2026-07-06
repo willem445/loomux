@@ -196,6 +196,183 @@ pub fn parse_claude_transcript(text: &str) -> SessionUsage {
 }
 
 // ---------------------------------------------------------------------------
+// Usage limits (statusline-scraped)
+// ---------------------------------------------------------------------------
+//
+// Unlike token usage, the *limit* a session is consuming is not written to any
+// local file we can read. We verified `~/.claude` (settings.json,
+// stats-cache.json, session transcripts): none carry a session or weekly limit
+// percentage — token counts and a $0 subscription cost are all that is there.
+// The only place the figure surfaces is what the CLI renders in its own
+// statusline (Claude Code's built-in limit widget, or a third-party one such as
+// ccstatusline). So we scrape it best-effort from the ANSI-stripped pane tail —
+// the same last-resort channel `parse_session_cost` uses for the dollar figure.
+//
+// **Copilot** deliberately contributes nothing here. Its local state
+// (`~/.copilot/session-state/<id>/`) records per-session premium-request
+// *counts* (`totalPremiumRequests`, only flushed in the shutdown event) and an
+// opaque per-request `creditsUsed`, but nowhere is the account's premium-request
+// *allowance* — the denominator a "% of limit" needs. That number is server-side
+// only. Showing a raw consumption count with no ceiling would be the kind of
+// fabricated figure the #42 cost work is careful to avoid, so we show nothing
+// for Copilot until a local allowance source exists.
+
+/// The limit window a percentage refers to. Claude enforces a rolling ~5-hour
+/// "session" allowance and a longer "weekly" one; either (or both) can appear in
+/// a statusline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LimitScope {
+    Session,
+    Weekly,
+}
+
+/// One "N% consumed" reading scraped from a statusline, tagged with its window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct LimitReading {
+    pub scope: LimitScope,
+    /// Consumed percentage, 0..=100.
+    pub percent: u8,
+}
+
+/// Every `NN%` token on a line, as `(byte-offset-of-first-digit, percent)`.
+/// A run of digits immediately followed by `%` and no greater than 100 counts;
+/// anything else (a bare number, `120%`) is skipped so we never treat a random
+/// figure as a usage bar. ASCII-only by construction (digits and `%`), so byte
+/// offsets are safe on UTF-8 statusline text.
+fn percents_on_line(line: &str) -> Vec<(usize, u8)> {
+    let bytes = line.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_digit() {
+            let start = i;
+            let mut val: u32 = 0;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                val = val.saturating_mul(10).saturating_add(u32::from(bytes[i] - b'0'));
+                i += 1;
+            }
+            if i < bytes.len() && bytes[i] == b'%' && val <= 100 {
+                out.push((start, val as u8));
+            }
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Byte offsets of every occurrence of `needle` in `hay` (both already
+/// lowercased by the caller). Non-overlapping, left to right.
+fn find_all(hay: &str, needle: &str) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut base = 0;
+    while let Some(rel) = hay[base..].find(needle) {
+        out.push(base + rel);
+        base += rel + needle.len();
+    }
+    out
+}
+
+/// Scrape session/weekly limit percentages from a pane's ANSI-stripped
+/// statusline text. Scans bottom-up (the freshest render is the lowest line)
+/// and returns at most one reading per scope — the first, i.e. freshest, seen.
+///
+/// Each percentage is bound to the *nearest* scope keyword on its own line, so a
+/// combined `Session 34% · Week 12%` statusline parses both correctly and a
+/// bare `Context: 45%` (no scope keyword) is ignored rather than mistaken for a
+/// limit. Keywords are conservative — only `session` and `week`/`weekly` — to
+/// avoid grabbing an unrelated percentage (CPU, context, a progress bar).
+pub fn parse_claude_limits(text: &str) -> Vec<LimitReading> {
+    let mut session: Option<u8> = None;
+    let mut weekly: Option<u8> = None;
+
+    for line in text.lines().rev() {
+        if session.is_some() && weekly.is_some() {
+            break;
+        }
+        let lower = line.to_ascii_lowercase();
+        let percents = percents_on_line(&lower);
+        if percents.is_empty() {
+            continue;
+        }
+        // Percentage nearest (by offset) to any of the given scope keywords.
+        let nearest = |keywords: &[&str]| -> Option<u8> {
+            let mut best: Option<(usize, u8)> = None;
+            for kw in keywords {
+                for kpos in find_all(&lower, kw) {
+                    for &(ppos, pct) in &percents {
+                        let dist = kpos.abs_diff(ppos);
+                        if best.is_none_or(|(bd, _)| dist < bd) {
+                            best = Some((dist, pct));
+                        }
+                    }
+                }
+            }
+            best.map(|(_, pct)| pct)
+        };
+        if session.is_none() {
+            session = nearest(&["session"]);
+        }
+        if weekly.is_none() {
+            weekly = nearest(&["week"]);
+        }
+    }
+
+    let mut out = Vec::new();
+    if let Some(p) = session {
+        out.push(LimitReading { scope: LimitScope::Session, percent: p });
+    }
+    if let Some(p) = weekly {
+        out.push(LimitReading { scope: LimitScope::Weekly, percent: p });
+    }
+    out
+}
+
+/// Aggregated Claude usage-limit figure for the app: the most-constrained value
+/// across every live Claude pane, per scope. `None` fields mean no live pane's
+/// statusline exposed that window.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct ClaudeLimits {
+    pub session_pct: Option<u8>,
+    pub weekly_pct: Option<u8>,
+}
+
+impl ClaudeLimits {
+    /// True when neither scope has a reading (nothing to show).
+    pub fn is_empty(&self) -> bool {
+        self.session_pct.is_none() && self.weekly_pct.is_none()
+    }
+
+    /// The most-constrained (highest consumed) percentage across scopes — the
+    /// single number a compact chip shows.
+    pub fn most_constrained(&self) -> Option<u8> {
+        match (self.session_pct, self.weekly_pct) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        }
+    }
+}
+
+/// Fold per-pane readings into one figure by taking the highest consumed
+/// percentage per scope. Every live pane shares the one signed-in account, so
+/// the max is the honest "closest to a cutoff" value and tolerates a pane whose
+/// statusline has not refreshed yet (a stale, lower reading never wins).
+pub fn aggregate_claude_limits(per_pane: &[Vec<LimitReading>]) -> ClaudeLimits {
+    let mut out = ClaudeLimits::default();
+    for readings in per_pane {
+        for r in readings {
+            let slot = match r.scope {
+                LimitScope::Session => &mut out.session_pct,
+                LimitScope::Weekly => &mut out.weekly_pct,
+            };
+            *slot = Some(slot.map_or(r.percent, |cur| cur.max(r.percent)));
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Transcript location
 // ---------------------------------------------------------------------------
 
@@ -345,5 +522,90 @@ mod tests {
         assert!(price_for("claude-haiku-4-5").is_some());
         assert!(price_for("claude-fable-5").is_some());
         assert!(price_for("gpt-4o").is_none());
+    }
+
+    // ---- usage-limit statusline parsing ------------------------------------
+
+    fn reading(scope: LimitScope, percent: u8) -> LimitReading {
+        LimitReading { scope, percent }
+    }
+
+    #[test]
+    fn parses_a_session_percentage() {
+        let u = parse_claude_limits("some banner\nSession: 34%  ·  $1.20\n");
+        assert_eq!(u, vec![reading(LimitScope::Session, 34)]);
+    }
+
+    #[test]
+    fn parses_both_scopes_on_one_line_by_nearest_keyword() {
+        // Combined statusline: each % must bind to the keyword next to it.
+        let u = parse_claude_limits("Session 34% · Week 12%");
+        assert_eq!(
+            u,
+            vec![reading(LimitScope::Session, 34), reading(LimitScope::Weekly, 12)]
+        );
+    }
+
+    #[test]
+    fn weekly_keyword_variants_and_percent_before_label() {
+        // "Weekly" contains "week"; the % can also sit before its label.
+        let u = parse_claude_limits("12% weekly limit");
+        assert_eq!(u, vec![reading(LimitScope::Weekly, 12)]);
+    }
+
+    #[test]
+    fn ignores_percentages_without_a_scope_keyword() {
+        // Context/CPU-style bars must not be mistaken for a usage limit.
+        let u = parse_claude_limits("CPU 80%  Context: 45%  MEM 30%");
+        assert!(u.is_empty(), "no scope keyword => no reading, got {u:?}");
+    }
+
+    #[test]
+    fn takes_the_freshest_render_when_a_scope_repeats() {
+        // Statusline re-rendered; the lowest (freshest) line wins.
+        let text = "Session: 10%\nSession: 42%\n";
+        let u = parse_claude_limits(text);
+        assert_eq!(u, vec![reading(LimitScope::Session, 42)]);
+    }
+
+    #[test]
+    fn rejects_out_of_range_and_bare_numbers() {
+        // 120% is not a usage bar; a plain "5" (no %) is not a percentage.
+        assert!(percents_on_line("session 120% 5 things").is_empty());
+        assert_eq!(percents_on_line("session 7%"), vec![(8, 7)]);
+    }
+
+    #[test]
+    fn empty_or_unrelated_text_yields_no_readings() {
+        assert!(parse_claude_limits("").is_empty());
+        assert!(parse_claude_limits("just a normal prompt line $ ").is_empty());
+    }
+
+    #[test]
+    fn aggregates_to_the_most_constrained_per_scope() {
+        // Three panes, one account: keep the highest consumed % per scope.
+        let panes = vec![
+            vec![reading(LimitScope::Session, 20), reading(LimitScope::Weekly, 8)],
+            vec![reading(LimitScope::Session, 55)], // stale on weekly, hottest on session
+            vec![reading(LimitScope::Weekly, 15)],
+        ];
+        let agg = aggregate_claude_limits(&panes);
+        assert_eq!(agg.session_pct, Some(55));
+        assert_eq!(agg.weekly_pct, Some(15));
+        assert_eq!(agg.most_constrained(), Some(55));
+        assert!(!agg.is_empty());
+    }
+
+    #[test]
+    fn aggregate_of_nothing_is_empty() {
+        let agg = aggregate_claude_limits(&[]);
+        assert!(agg.is_empty());
+        assert_eq!(agg.most_constrained(), None);
+    }
+
+    #[test]
+    fn most_constrained_prefers_the_single_present_scope() {
+        let only_weekly = ClaudeLimits { session_pct: None, weekly_pct: Some(9) };
+        assert_eq!(only_weekly.most_constrained(), Some(9));
     }
 }

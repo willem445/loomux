@@ -48,7 +48,7 @@
         <span><kbd>Alt+←↑↓→</kbd> focus</span>
         <span class="hint-tip">drag a pane header to reorder</span>
       </footer>
-      <footer id="statusbar" title="Live system resources">
+      <footer id="statusbar" title="Live system resources & agent usage limits">
         <div class="metric" id="m-cpu" title="CPU utilization">
           <span class="metric-label">CPU</span>
           <div class="metric-bar"><div class="metric-fill"></div></div>
@@ -66,6 +66,11 @@
         </div>
         <div class="metric" id="m-vram" title="GPU VRAM in use">
           <span class="metric-label">VRAM</span>
+          <div class="metric-bar"><div class="metric-fill"></div></div>
+          <span class="metric-val">–</span>
+        </div>
+        <div class="metric metric-na" id="m-usage-cc" title="Claude Code usage limit">
+          <span class="metric-label">CC</span>
           <div class="metric-bar"><div class="metric-fill"></div></div>
           <span class="metric-val">–</span>
         </div>
