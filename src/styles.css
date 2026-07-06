@@ -1129,7 +1129,18 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis;
   color: var(--text);
 }
-.git-when { flex: none; color: var(--text-dim); font-size: 10.5px; }
+/* Trailing metadata columns: committer · short rev · date+time. All dim and
+   non-shrinking so the subject (flex:1) yields first; committer ellipsizes. */
+.git-committer {
+  flex: none; min-width: 0; max-width: 96px;
+  overflow: hidden; text-overflow: ellipsis;
+  color: var(--text-dim); font-size: 10.5px;
+}
+.git-rev {
+  flex: none; color: var(--text-dim); font-size: 10.5px;
+  font-family: "Cascadia Mono", Consolas, monospace;
+}
+.git-when { flex: none; color: var(--text-dim); font-size: 10.5px; font-variant-numeric: tabular-nums; }
 .git-more {
   display: block; margin: 6px auto;
   background: none; border: 1px solid var(--border); border-radius: 6px;

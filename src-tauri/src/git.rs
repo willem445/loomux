@@ -54,6 +54,9 @@ pub struct CommitInfo {
     pub hash: String,
     pub parents: Vec<String>,
     pub author: String,
+    /// Committer name — differs from `author` for rebased / cherry-picked /
+    /// applied-patch commits, so the row can label who actually committed.
+    pub committer: String,
     /// Author time, unix seconds.
     pub timestamp: i64,
     pub subject: String,
@@ -119,7 +122,7 @@ pub fn git_log(repo: String, limit: u32) -> Result<Vec<CommitInfo>, String> {
             &n,
             // %x1f field / %x1e record separators; %s last since a subject
             // could contain 0x1f (ref names and the rest cannot).
-            "--format=%H%x1f%P%x1f%an%x1f%at%x1f%D%x1f%s%x1e",
+            "--format=%H%x1f%P%x1f%an%x1f%cn%x1f%at%x1f%D%x1f%s%x1e",
         ],
     );
     match out {
@@ -531,7 +534,7 @@ fn parse_log(out: &str) -> Vec<CommitInfo> {
             if rec.is_empty() {
                 return None;
             }
-            let mut f = rec.splitn(6, '\x1f');
+            let mut f = rec.splitn(7, '\x1f');
             let hash = f.next()?.to_string();
             let parents = f
                 .next()?
@@ -539,6 +542,7 @@ fn parse_log(out: &str) -> Vec<CommitInfo> {
                 .map(str::to_string)
                 .collect();
             let author = f.next()?.to_string();
+            let committer = f.next()?.to_string();
             let timestamp = f.next()?.parse::<i64>().ok()?;
             let refs = parse_decorations(f.next()?);
             let subject = f.next()?.to_string();
@@ -546,6 +550,7 @@ fn parse_log(out: &str) -> Vec<CommitInfo> {
                 hash,
                 parents,
                 author,
+                committer,
                 timestamp,
                 subject,
                 refs,
@@ -765,12 +770,18 @@ mod tests {
 
     #[test]
     fn parse_log_basic_merge_and_root() {
-        let out = "aaa\x1fbbb ccc\x1fAlice\x1f1700000000\x1fHEAD -> refs/heads/main, refs/remotes/origin/main\x1ffix: a, b\x1e\
-                   bbb\x1f\x1fBob\x1f1690000000\x1ftag: refs/tags/v1\x1finit\x1e";
+        let out = "aaa\x1fbbb ccc\x1fAlice\x1fAlice C\x1f1700000000\x1fHEAD -> refs/heads/main, refs/remotes/origin/main\x1ffix: a, b\x1e\
+                   bbb\x1f\x1fBob\x1fCarol\x1f1690000000\x1ftag: refs/tags/v1\x1finit\x1e";
         let commits = parse_log(out);
         assert_eq!(commits.len(), 2);
         assert_eq!(commits[0].parents, vec!["bbb", "ccc"]); // merge
+        assert_eq!(commits[0].author, "Alice");
+        assert_eq!(commits[0].committer, "Alice C");
+        assert_eq!(commits[0].timestamp, 1700000000);
         assert_eq!(commits[0].subject, "fix: a, b");
+        // Author and committer are parsed independently (rebase / cherry-pick).
+        assert_eq!(commits[1].author, "Bob");
+        assert_eq!(commits[1].committer, "Carol");
         assert_eq!(
             commits[0]
                 .refs

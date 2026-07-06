@@ -31,6 +31,7 @@ import {
   type DiffMode,
 } from "./git";
 import { computeLanes, renderRowSvg } from "./gitgraph";
+import { shortRev, fmtWhen, fmtWhenFull, authorLine } from "./gitformat";
 import { renderDiff } from "./diffrender";
 import {
   GRAPH_MIN,
@@ -69,15 +70,6 @@ const ROW_H = 26;
 const LANE_W = 12;
 const MAX_LANES = 12;
 const LOG_STEP = 300;
-
-function relTime(unixSec: number): string {
-  const s = Math.max(0, Date.now() / 1000 - unixSec);
-  if (s < 60) return "now";
-  if (s < 3600) return `${Math.floor(s / 60)}m`;
-  if (s < 86400) return `${Math.floor(s / 3600)}h`;
-  if (s < 604800) return `${Math.floor(s / 86400)}d`;
-  return new Date(unixSec * 1000).toLocaleDateString();
-}
 
 /** Display letter for a working-tree entry ("?" untracked → U like VS Code,
  *  backend conflict U → !). */
@@ -873,10 +865,17 @@ export class GitView {
       }
 
       const subject = el("span", "git-subject", c.subject);
-      subject.title = `${c.subject}\n${c.author} · ${new Date(c.timestamp * 1000).toLocaleString()}\n${c.hash}`;
-      const when = el("span", "git-when", relTime(c.timestamp));
-      when.title = new Date(c.timestamp * 1000).toLocaleString();
-      row.append(subject, when);
+      subject.title = `${c.subject}\n${authorLine(c.author, c.committer, c.timestamp)}\n${c.hash}`;
+
+      // Committer · short rev · date+time, all ellipsizing/dim so a row stays
+      // scannable at the default graph width; full values live in tooltips.
+      const committer = el("span", "git-committer", c.committer);
+      committer.title = c.committer;
+      const rev = el("span", "git-rev", shortRev(c.hash));
+      rev.title = c.hash;
+      const when = el("span", "git-when", fmtWhen(c.timestamp));
+      when.title = fmtWhenFull(c.timestamp);
+      row.append(subject, committer, rev, when);
       row.addEventListener("click", () => this.select({ kind: "commit", hash: c.hash }));
       row.addEventListener("contextmenu", (e) => {
         e.preventDefault();
@@ -1086,13 +1085,11 @@ export class GitView {
       const meta = el("div", "git-commit-meta");
       meta.appendChild(el("div", "git-meta-subject", commit.subject));
       meta.appendChild(
-        el(
-          "div",
-          "git-meta-line",
-          `${commit.author} · ${new Date(commit.timestamp * 1000).toLocaleString()}`
-        )
+        el("div", "git-meta-line", authorLine(commit.author, commit.committer, commit.timestamp))
       );
-      meta.appendChild(el("div", "git-meta-line hash", commit.hash));
+      const hashLine = el("div", "git-meta-line hash", commit.hash);
+      hashLine.title = commit.hash;
+      meta.appendChild(hashLine);
       this.changesEl.appendChild(meta);
     }
   }

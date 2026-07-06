@@ -13,6 +13,9 @@ export interface CommitInfo {
   hash: string;
   parents: string[];
   author: string;
+  /** Committer name — differs from `author` for rebased / cherry-picked
+   *  commits, so the row can label who actually committed. */
+  committer: string;
   /** Author time, unix seconds. */
   timestamp: number;
   subject: string;
