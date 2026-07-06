@@ -154,7 +154,7 @@ export class Grid {
     const minIdx = this.minimizedPanes.indexOf(pane);
     if (minIdx >= 0) {
       this.minimizedPanes.splice(minIdx, 1);
-      pane.setAttentionListener(null);
+      pane.setDockSyncListener(null);
       pane.dispose(killBackend);
       this.renderDock();
       return;
@@ -322,9 +322,9 @@ export class Grid {
     this.leaves.delete(pane);
     this.removeFromTree(leaf);
     this.minimizedPanes.push(pane);
-    // While docked the pane's header is out of the DOM, so mirror any
-    // attention change onto its dock chip (attention routing #6).
-    pane.setAttentionListener(() => this.renderDock());
+    // While docked the pane's header is out of the DOM, so mirror any change
+    // the chip shows — attention (#6) or a rename (#95r) — onto its dock chip.
+    pane.setDockSyncListener(() => this.renderDock());
     if (this.active === pane) {
       this.active = null;
       const next = this.panes()[0];
@@ -341,7 +341,7 @@ export class Grid {
     if (idx < 0) return;
     if (this.maximized) this.exitMaximize();
     this.minimizedPanes.splice(idx, 1);
-    pane.setAttentionListener(null);
+    pane.setDockSyncListener(null);
     // Restoring a docked pane is "turning to it" — clear a latched attention
     // report the same way clicking a pane does; live reasons re-badge its
     // header on the next scan.
@@ -382,7 +382,7 @@ export class Grid {
       this.removeFromTree(leaf);
       this.minimizedPanes.push(pane);
       // Docked panes mirror attention onto their dock chip (see `minimize`).
-      pane.setAttentionListener(() => this.renderDock());
+      pane.setDockSyncListener(() => this.renderDock());
       if (this.active === pane) this.active = null;
       changed = true;
     }
@@ -405,7 +405,7 @@ export class Grid {
       const idx = this.minimizedPanes.indexOf(pane);
       if (idx < 0) continue; // not docked / unknown
       this.minimizedPanes.splice(idx, 1);
-      pane.setAttentionListener(null);
+      pane.setDockSyncListener(null);
       // Restoring is "turning to" the pane — clear a latched attention report,
       // same as `restore`.
       pane.acknowledgeAttention();

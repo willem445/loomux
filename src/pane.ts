@@ -24,10 +24,17 @@ import {
 } from "./pty";
 import { invoke } from "@tauri-apps/api/core";
 import { parseOsc52, writeClipboard } from "./clipboard";
+import {
+  checkAttachment,
+  attachRejectMessage,
+  composeSteerText,
+  bytesToBase64,
+} from "./steer";
 import { createOrderedWriter } from "./ptywrite";
 import { showToast } from "./toast";
 import { isAppShortcut } from "./shortcuts";
 import { attentionPresentation } from "./attention";
+import { makeRenameCommit } from "./panerename";
 import { openInEditor, editorConfigDialog } from "./editor";
 import { GitView } from "./gitview";
 import { TasksView } from "./tasksview";
@@ -49,6 +56,22 @@ const GROUP_MIN_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" fill="no
 // "Open in editor": code-brackets glyph. Opens the pane's workspace folder in
 // the user's configured external editor (VS Code, Zed, …).
 const EDITOR_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M6 4.5 2.5 8 6 11.5M10 4.5 13.5 8 10 11.5"/></svg>`;
+// Attach affordance on the steering strip (#72): a paperclip.
+const PAPERCLIP_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M12.5 6.6 7.1 12a2.4 2.4 0 0 1-3.4-3.4l5.6-5.6a1.5 1.5 0 0 1 2.1 2.1l-5.4 5.4a.6.6 0 0 1-.9-.9l4.9-4.9"/></svg>`;
+
+/** Pull image files out of a paste/drag `DataTransfer`. Returns only entries
+ *  the browser tags as images, so a text or mixed paste yields []. */
+function imagesFromDataTransfer(dt: DataTransfer | null): File[] {
+  if (!dt) return [];
+  const out: File[] = [];
+  for (const item of Array.from(dt.items)) {
+    if (item.kind === "file" && item.type.startsWith("image/")) {
+      const f = item.getAsFile();
+      if (f) out.push(f);
+    }
+  }
+  return out;
+}
 
 /** Extract a filesystem path from an OSC 7 payload, which may be a raw path
  *  or a `file://host/path` URL. Returns "" if nothing usable. */
@@ -197,14 +220,26 @@ export class Pane {
   private composeInput: HTMLInputElement | null = null;
   private composeStatus: HTMLElement | null = null;
   private composeStatusTimer: number | undefined;
+  /** Thumbnail-chip row for images pasted/attached into the strip (#72); hidden
+   *  until the first image is queued. */
+  private composeChips: HTMLElement | null = null;
+  /** Images queued for the next steer, in send order. `path` is the on-disk
+   *  scratch file (from `orch_save_attachment`); `url` is a blob: object URL for
+   *  the chip thumbnail and must be revoked when the chip goes away. */
+  private attachments: { path: string; url: string; name: string }[] = [];
+  /** The orchestrator's CLI, learned from the save-attachment response; decides
+   *  how image paths are referenced in the steer text (#72). Defaults to the
+   *  Claude form until a save reports otherwise. */
+  private orchCli = "claude";
   /** "needs attention" chip in the header (attention routing #6); hidden until
    *  the backend flags this pane. */
   private attnChip: HTMLButtonElement;
   private attentionReason: string | null = null;
   private attentionDetail: string | null = null;
-  /** Notified when attention state changes; the grid uses it to keep a
-   *  minimized pane's dock chip in sync. */
-  private attentionListener: (() => void) | null = null;
+  /** Notified when something the dock chip shows changes (attention state or
+   *  the pane name); the grid uses it to keep a minimized pane's chip in sync,
+   *  since a docked pane's header is out of the DOM (#6, #95r). */
+  private dockSyncListener: (() => void) | null = null;
   /** True for agent/command panes (vs plain shells). */
   private launchedCommand = false;
   private shiftTimer: number | undefined;
@@ -588,6 +623,9 @@ export class Pane {
   setName(name: string): void {
     this.name = name;
     this.titleEl.textContent = name;
+    // A docked pane's header is detached, so refresh its dock chip too — else an
+    // orchestrator/human rename leaves the chip showing the stale name (#95r).
+    this.dockSyncListener?.();
   }
 
   /** Mark this pane as part of an orchestration group: role chip before the
@@ -623,7 +661,7 @@ export class Pane {
     }
     // A minimized pane's element is detached, so its header chip is invisible;
     // the listener lets the grid mirror this state onto the dock chip.
-    this.attentionListener?.();
+    this.dockSyncListener?.();
   }
 
   /** Current needs-attention state, or null. Lets the grid render an equivalent
@@ -635,10 +673,11 @@ export class Pane {
     return { reason: this.attentionReason, label, urgent, detail: this.attentionDetail };
   }
 
-  /** Register a callback fired whenever the attention state changes — used by
-   *  the grid to refresh the dock chip of a minimized pane. */
-  setAttentionListener(fn: (() => void) | null): void {
-    this.attentionListener = fn;
+  /** Register a callback fired whenever the dock chip's content changes
+   *  (attention state or name) — used by the grid to refresh the chip of a
+   *  minimized pane, whose header is out of the DOM. */
+  setDockSyncListener(fn: (() => void) | null): void {
+    this.dockSyncListener = fn;
   }
 
   /** The human is now on this pane: acknowledge its attention backend-side so
@@ -965,12 +1004,29 @@ export class Pane {
     this.titleEl.replaceWith(input);
     input.focus();
     input.select();
-    const commit = (save: boolean) => {
-      if (save && input.value.trim()) this.name = input.value.trim();
-      input.replaceWith(this.titleEl);
-      this.titleEl.textContent = this.name;
-      this.focus();
-    };
+    // Enter/Escape commit AND blur commits; the first commit detaches the
+    // focused input, which itself fires blur → a second commit. makeRenameCommit
+    // is idempotent so that redundant call is a no-op (and Escape wins over the
+    // trailing blur-save) — otherwise replaceWith runs on a detached node and
+    // throws NotFoundError into the app-wide error banner (#75, twin of #77).
+    const commit = makeRenameCommit({
+      value: () => input.value,
+      save: (name) => {
+        this.name = name;
+        // Sync a human rename to the backend so the roster name matches the
+        // pane title and the human's choice takes precedence over any later
+        // orchestrator rename_agent (#95r). Best-effort: the title is already
+        // updated locally, so a backend hiccup is non-fatal.
+        if (this.orchAgent) {
+          invoke("orch_agent_renamed", { agentId: this.orchAgent, name }).catch(() => {});
+        }
+      },
+      restore: () => {
+        input.replaceWith(this.titleEl);
+        this.titleEl.textContent = this.name;
+        this.focus();
+      },
+    });
     input.addEventListener("keydown", (e) => {
       e.stopPropagation();
       if (e.key === "Enter") commit(true);
@@ -1062,6 +1118,39 @@ export class Pane {
         this.focus();
       }
     });
+    // Ctrl+V of a screenshot: pull image blobs out of the clipboard and queue
+    // them as attachments (#72). Text pastes fall through to the input's default
+    // handling untouched — we only preventDefault when we actually took images.
+    input.addEventListener("paste", (e) => {
+      const files = imagesFromDataTransfer(e.clipboardData);
+      if (files.length === 0) return;
+      e.preventDefault();
+      for (const f of files) void this.addAttachment(f, f.name);
+    });
+
+    // Attach affordance: a paperclip that opens a native file picker. A hidden
+    // <input type=file> keeps the styling ours while reusing the OS dialog.
+    const attach = document.createElement("button");
+    attach.className = "dlg-btn orch-compose-attach";
+    attach.type = "button";
+    attach.title = "Attach image(s) — or paste a screenshot with Ctrl+V";
+    attach.setAttribute("aria-label", "Attach images");
+    attach.innerHTML = PAPERCLIP_ICON;
+    const filePicker = document.createElement("input");
+    filePicker.type = "file";
+    filePicker.accept = "image/*";
+    filePicker.multiple = true;
+    filePicker.style.display = "none";
+    attach.addEventListener("click", (e) => {
+      e.stopPropagation();
+      filePicker.click();
+    });
+    filePicker.addEventListener("change", () => {
+      const files = filePicker.files ? Array.from(filePicker.files) : [];
+      for (const f of files) void this.addAttachment(f, f.name);
+      filePicker.value = ""; // allow re-picking the same file next time
+    });
+
     const send = document.createElement("button");
     send.className = "dlg-btn primary orch-compose-send";
     send.textContent = "Send";
@@ -1069,7 +1158,12 @@ export class Pane {
       e.stopPropagation();
       void this.submitCompose();
     });
-    row.append(input, send);
+    row.append(input, attach, filePicker, send);
+
+    // Thumbnail-chip row for queued images (#72). Hidden (via .orch-compose-chips
+    // being empty + CSS) until something is queued; kept above the status slot.
+    const chips = document.createElement("div");
+    chips.className = "orch-compose-chips";
 
     // Fixed-height slot (see .orch-compose-status): always in layout, so
     // showing/hiding a rejected-send message never changes the strip's height
@@ -1077,10 +1171,85 @@ export class Pane {
     const status = document.createElement("div");
     status.className = "orch-compose-status";
 
-    strip.append(row, status);
+    strip.append(row, chips, status);
     this.composeInput = input;
     this.composeStatus = status;
+    this.composeChips = chips;
     this.el.appendChild(strip);
+  }
+
+  /** Queue one image for the next steer: vet it, base64 it to the backend
+   *  scratch dir, and add a thumbnail chip. Refusals (wrong type, oversize, too
+   *  many) surface as a toast and are dropped. */
+  private async addAttachment(blob: Blob, name: string): Promise<void> {
+    if (!this.orchGroup || !this.composeChips) return;
+    const check = checkAttachment(blob.type, blob.size, this.attachments.length);
+    if (!check.ok) {
+      showToast(attachRejectMessage(check.reason, name));
+      return;
+    }
+    try {
+      const bytes = new Uint8Array(await blob.arrayBuffer());
+      const saved = await invoke<{ path: string; cli: string }>("orch_save_attachment", {
+        groupId: this.orchGroup,
+        ext: check.ext,
+        dataB64: bytesToBase64(bytes),
+      });
+      this.orchCli = saved.cli; // format references the way this orchestrator's CLI reads them
+      // Only mint the thumbnail URL once the file is safely on disk.
+      const url = URL.createObjectURL(blob);
+      this.attachments.push({ path: saved.path, url, name: name || `image.${check.ext}` });
+      this.renderChips();
+    } catch (err) {
+      showToast(`Attach failed: ${String(err)}`);
+    }
+  }
+
+  /** Remove a queued attachment by its on-disk path, revoking its thumbnail URL.
+   *  The scratch file itself is left for the group-end sweep (the cheap cleanup
+   *  policy — no per-image delete round-trip). */
+  private removeAttachment(path: string): void {
+    const idx = this.attachments.findIndex((a) => a.path === path);
+    if (idx < 0) return;
+    URL.revokeObjectURL(this.attachments[idx].url);
+    this.attachments.splice(idx, 1);
+    this.renderChips();
+  }
+
+  /** Rebuild the thumbnail-chip row from `this.attachments`. */
+  private renderChips(): void {
+    const chips = this.composeChips;
+    if (!chips) return;
+    chips.replaceChildren();
+    for (const a of this.attachments) {
+      const chip = document.createElement("span");
+      chip.className = "orch-compose-chip";
+      chip.title = a.name;
+      const thumb = document.createElement("img");
+      thumb.className = "orch-compose-chip-thumb";
+      thumb.src = a.url;
+      thumb.alt = a.name;
+      const rm = document.createElement("button");
+      rm.className = "orch-compose-chip-x";
+      rm.type = "button";
+      rm.textContent = "✕";
+      rm.title = `Remove ${a.name}`;
+      rm.setAttribute("aria-label", `Remove ${a.name}`);
+      rm.addEventListener("click", (e) => {
+        e.stopPropagation();
+        this.removeAttachment(a.path);
+      });
+      chip.append(thumb, rm);
+      chips.appendChild(chip);
+    }
+  }
+
+  /** Drop every queued attachment, revoking thumbnail URLs. Used after a
+   *  successful send and on dispose. */
+  private clearAttachments(): void {
+    for (const a of this.attachments) URL.revokeObjectURL(a.url);
+    this.attachments = [];
+    this.renderChips();
   }
 
   /** Focus the steering strip (Alt+P). No-op on non-orchestrator panes. */
@@ -1111,14 +1280,33 @@ export class Pane {
   private async submitCompose(): Promise<void> {
     const input = this.composeInput;
     if (!input || !this.orchGroup) return;
-    const text = input.value.trim();
+    const draft = input.value;
+    // Queued images each become an "Attached image: <path>" line (#72); a
+    // message may be images-only (no typed text), so gate on either being
+    // present rather than on the text alone.
+    const queued = this.attachments;
+    const text = composeSteerText(draft, queued.map((a) => a.path), this.orchCli);
     if (!text) return;
     input.value = "";
+    this.attachments = [];
+    this.renderChips();
     this.composeStatus?.classList.remove("show");
     try {
       await invoke("orch_steer", { groupId: this.orchGroup, text });
+      // Sent: the scratch files have served their purpose (the agent reads them
+      // by path); drop only the thumbnail URLs. The files are swept on group end.
+      for (const a of queued) URL.revokeObjectURL(a.url);
     } catch (err) {
-      if (input.value === "") input.value = text; // don't clobber a newer draft
+      // Restore the draft and re-queue the images so a rejected send (paused
+      // group, dead orchestrator) isn't lost — unless the human already started
+      // a newer draft, which we must not clobber.
+      if (input.value === "") input.value = draft;
+      if (this.attachments.length === 0) {
+        this.attachments = queued;
+        this.renderChips();
+      } else {
+        for (const a of queued) URL.revokeObjectURL(a.url); // superseded; free them
+      }
       this.showComposeStatus(`Not sent: ${String(err)}`);
     }
   }
@@ -1131,6 +1319,7 @@ export class Pane {
     clearTimeout(this.fitTimer);
     clearTimeout(this.shiftTimer);
     clearTimeout(this.composeStatusTimer);
+    this.clearAttachments(); // revoke any lingering thumbnail object URLs
     this.gitView?.dispose();
     this.tasksView?.dispose();
     this.auditView?.dispose();

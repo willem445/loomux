@@ -206,6 +206,23 @@ const ECHO_ATTEMPTS: u32 = 3;
 /// Upper bound for `set_state` payloads.
 const MAX_STATE_BYTES: usize = 512 * 1024;
 
+/// Cap on a single steered image attachment (#72), in decoded bytes. Sized to
+/// comfortably hold a full-screen PNG screenshot while bounding the per-group
+/// `attachments/` scratch dir. The steering strip enforces the same limit and
+/// toasts on overflow; this is the backstop against a hostile/oversize IPC.
+pub const MAX_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
+
+/// Cap on the base64 payload the save-attachment command will decode. Rejecting
+/// oversize *before* decode keeps a giant string from ballooning memory — same
+/// discipline as the OSC 52 clipboard path. base64 is 4 bytes per 3 input, plus
+/// slack for padding/whitespace.
+pub const MAX_ATTACHMENT_B64_LEN: usize = MAX_ATTACHMENT_BYTES / 3 * 4 + 16;
+
+/// Monotonic tiebreaker so two images pasted inside the same millisecond get
+/// distinct filenames without pulling in a randomness/uuid crate (the Windows
+/// `getrandom` backends are banned here — see the build notes).
+static ATTACH_SEQ: AtomicU32 = AtomicU32::new(0);
+
 // Copilot session tracking: unlike Claude, copilot can't be handed a session
 // id up front — it mints one and writes `~/.copilot/session-state/<id>/` a
 // few seconds into boot. After spawning a copilot pane we poll for the new
@@ -270,6 +287,51 @@ pub enum AgentStatus {
     Starting,
     Running,
     Dead,
+}
+
+/// Who last set an agent's display name — the precedence ladder for the pane
+/// title / roster name (#95r). A rename applies only when its source ranks at
+/// least as high as whoever set the current name: `Human` > `Orchestrator` >
+/// `Default`. So the human's manual rename is never clobbered by the
+/// orchestrator's `rename_agent` or the id-derived default, while the
+/// orchestrator can still relabel an id-default (or its own earlier name).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NameSource {
+    /// Minted from the agent id at spawn ("worker 2" for `w-2`).
+    Default,
+    /// Chosen by the orchestrator (a `spawn_agent` name, or `rename_agent`).
+    Orchestrator,
+    /// Typed by the human into the pane title (F2 / double-click).
+    Human,
+}
+
+impl Default for NameSource {
+    /// Legacy roster rows (written before the tier was persisted, #95r) carry a
+    /// name but no source. Treat them as orchestrator-chosen: their non-empty
+    /// name was picked deliberately, so a later `rename_agent` may still relabel
+    /// it, and it never sits *below* an id-default. (Pre-95r human renames were
+    /// frontend-only and never reached the roster, so none are being demoted.)
+    fn default() -> Self {
+        NameSource::Orchestrator
+    }
+}
+
+impl NameSource {
+    fn rank(self) -> u8 {
+        match self {
+            NameSource::Default => 0,
+            NameSource::Orchestrator => 1,
+            NameSource::Human => 2,
+        }
+    }
+    fn as_str(self) -> &'static str {
+        match self {
+            NameSource::Default => "default",
+            NameSource::Orchestrator => "orchestrator",
+            NameSource::Human => "human",
+        }
+    }
 }
 
 /// Which agent CLI a group runs. Each needs an adapter in
@@ -614,6 +676,9 @@ pub struct AgentEntry {
     pub id: String,
     pub group: String,
     pub name: String,
+    /// Who set `name` — the precedence tier for renames (#95r). See
+    /// [`NameSource`] and [`OrchRegistry::rename_agent`].
+    pub name_source: NameSource,
     pub role: Role,
     pub token: String,
     pub status: AgentStatus,
@@ -738,6 +803,11 @@ pub struct AgentRecord {
     pub id: String,
     pub role: String,
     pub name: String,
+    /// Precedence tier of `name` (#95r). Persisted so a session rejoin restores
+    /// the human's rename AND its "human beats orchestrator" tier, not just the
+    /// text. Additive: legacy rows without it deserialize to `Default::default`.
+    #[serde(default)]
+    pub name_source: NameSource,
     pub session: Option<String>,
     pub cwd: String,
     pub status: String,
@@ -882,6 +952,23 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Map a caller-supplied image extension to a vetted one, rejecting anything
+/// outside the allowlist (#72). A pasted image's extension is attacker-influenced
+/// (it rides in from the browser clipboard), so we never echo it into a filename
+/// verbatim: only these known raster/image types are accepted, which both blocks
+/// path-traversal / executable extensions and matches what the agent CLIs open.
+/// Pure and `pub` so the mapping is unit-testable.
+pub fn sanitize_attachment_ext(ext: &str) -> Option<&'static str> {
+    match ext.trim().trim_start_matches('.').to_ascii_lowercase().as_str() {
+        "png" => Some("png"),
+        "jpg" | "jpeg" => Some("jpg"),
+        "gif" => Some("gif"),
+        "webp" => Some("webp"),
+        "bmp" => Some("bmp"),
+        _ => None,
+    }
+}
+
 /// Should prompt delivery keep holding for the human to stop typing? (#43,
 /// option A). Returns true to keep waiting, false to proceed. Pure so the
 /// hold/deadline decision is unit-testable without a live PTY.
@@ -984,6 +1071,15 @@ fn sanitize_session(s: &str) -> Option<String> {
     let t = s.trim();
     (!t.is_empty() && t.len() <= 64 && t.chars().all(|c| c.is_ascii_hexdigit() || c == '-'))
         .then(|| t.to_string())
+}
+
+/// Normalize a caller-supplied pane name (#95r): trim, drop control characters
+/// (so a pasted name can't smuggle newlines/escape codes into the pane title or
+/// the roster JSON), and cap the length. Not a security boundary — the title is
+/// rendered via `textContent`, never HTML — just hygiene. May return empty (an
+/// all-control/whitespace name); callers decide what an empty result means.
+fn sanitize_agent_name(name: &str) -> String {
+    name.trim().chars().filter(|c| !c.is_control()).take(40).collect()
 }
 
 /// Add a folder to copilot's `trustedFolders` config, returning the new
@@ -1283,6 +1379,64 @@ impl OrchRegistry {
 
     fn group_dir(&self, group: &str) -> PathBuf {
         self.root.join(group)
+    }
+
+    /// Scratch dir holding images pasted/attached into the steering strip (#72).
+    /// A subdir of the group state dir, so it's naturally per-group and swept
+    /// on group end alongside the worktrees.
+    fn attachments_dir(&self, group: &str) -> PathBuf {
+        self.group_dir(group).join("attachments")
+    }
+
+    /// The CLI the group's orchestrator runs (`claude`/`copilot`/…), resolving
+    /// per-role overrides through `cli_for`. Used to format image references the
+    /// way that CLI consumes them (#72). Falls back to the default `claude`
+    /// wording if the group isn't loaded (a save always follows a live steer, so
+    /// this is just a safety net).
+    pub fn orchestrator_cli(&self, group: &str) -> String {
+        self.group(group)
+            .map(|g| g.guardrails.cli_for(Role::Orchestrator).to_string())
+            .unwrap_or_else(|| "claude".into())
+    }
+
+    /// Persist a steered image to the group's `attachments/` scratch dir and
+    /// return its absolute path (#72). The steering strip can't hand binary to
+    /// a CLI prompt, but Claude Code and Copilot both *read image files from
+    /// paths* — so a pasted screenshot is written here and the steer text gains
+    /// an "Attached image: <path>" line pointing at it. Bytes are written
+    /// verbatim: the image arrives as a browser Blob and we never decode it
+    /// (no image crate, no `getrandom` deps) — only size and extension are
+    /// validated. Files are reclaimed when the group ends (see `end_group`).
+    pub fn save_attachment(&self, group: &str, ext: &str, bytes: &[u8]) -> Result<PathBuf, String> {
+        // Membership guard: only ever write under a real, known group id (#72
+        // review). The dir is `root.join(group)`, so without this a caller could
+        // steer `group` to a traversal component; requiring the group to exist
+        // pins it to a generated group token. Cheap hardening on top of the
+        // pre-existing trusted-webview model (see the orch-command notes).
+        if self.group(group).is_none() {
+            return Err("unknown group".into());
+        }
+        if bytes.is_empty() {
+            return Err("empty attachment".into());
+        }
+        if bytes.len() > MAX_ATTACHMENT_BYTES {
+            return Err(format!(
+                "attachment too large ({} bytes, max {MAX_ATTACHMENT_BYTES})",
+                bytes.len()
+            ));
+        }
+        let ext = sanitize_attachment_ext(ext)
+            .ok_or_else(|| format!("unsupported attachment type: {ext:?}"))?;
+        let dir = self.attachments_dir(group);
+        fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        // `<ms>-<seq>.<ext>`: wall-clock time keeps names sortable/legible while
+        // the process-local sequence disambiguates a same-millisecond burst.
+        let name = format!("{}-{}.{ext}", now_ms(), ATTACH_SEQ.fetch_add(1, Ordering::Relaxed));
+        let path = dir.join(name);
+        fs::write(&path, bytes).map_err(|e| e.to_string())?;
+        self.audit(group, "human", "attachment-save",
+            json!({ "path": path.display().to_string(), "bytes": bytes.len() }));
+        Ok(path)
     }
 
     // ---------- audit ----------
@@ -1631,6 +1785,7 @@ impl OrchRegistry {
             id: entry.id.clone(),
             role: entry.role.as_str().into(),
             name: entry.name.clone(),
+            name_source: entry.name_source,
             session: entry.session_id.clone(),
             cwd: entry.cwd.clone(),
             status: status.to_string(),
@@ -1771,6 +1926,9 @@ impl OrchRegistry {
                     .as_str()
                     .unwrap_or(if role == "orchestrator" { "orchestrator" } else { "agent" })
                     .to_string(),
+                // The spawn audit predates the name-tier field; backfilled
+                // sessions restore at the default tier (#95r).
+                name_source: NameSource::default(),
                 role,
                 session: Some(session.to_string()),
                 cwd: d["cwd"].as_str().unwrap_or("").to_string(),
@@ -3049,6 +3207,14 @@ impl OrchRegistry {
             }
         }
 
+        // Sweep the steering-strip image attachments (#72): they're only useful
+        // while the group's agents are live, so teardown reclaims the scratch
+        // dir alongside the worktrees. Best-effort — a leftover screenshot must
+        // never block a group from ending. This includes any that were queued
+        // but never sent (removed chips / abandoned drafts), so the cheap
+        // policy is simply "cleaned up on group end", no per-image bookkeeping.
+        let _ = fs::remove_dir_all(self.attachments_dir(group));
+
         // Total teardown: drop any pause (in-memory + marker) so a future
         // relaunch on this repo starts clean rather than silently paused.
         if self.paused.lock_safe().remove(group) {
@@ -3307,7 +3473,7 @@ impl OrchRegistry {
         use_worktree: bool,
         branch: Option<String>,
     ) -> Result<AgentEntry, String> {
-        self.spawn_agent_ex(group_id, role, name, task, use_worktree, branch, None, None)
+        self.spawn_agent_ex(group_id, role, name, task, use_worktree, branch, None, None, None)
     }
 
     /// Full spawn: `resume_session` reopens a previous session (follow-ups
@@ -3324,6 +3490,7 @@ impl OrchRegistry {
         branch: Option<String>,
         resume_session: Option<String>,
         cwd_override: Option<String>,
+        restore_name_source: Option<NameSource>,
     ) -> Result<AgentEntry, String> {
         let group = self.group(group_id).ok_or("unknown group")?;
 
@@ -3361,11 +3528,24 @@ impl OrchRegistry {
         let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
         let agent_id = format!("{}-{seq}", role.prefix());
         let token = new_token();
-        let display = {
-            let n = name.trim();
-            let n = if n.is_empty() { agent_id.as_str() } else { n };
-            n.chars().take(40).collect::<String>()
+        // Name precedence (#95r): a caller-supplied name is the orchestrator's
+        // choice; an empty one means "no meaningful name", so we derive the
+        // default from the minted id — "worker 2" for `w-2` — which agrees with
+        // the pane's "W 2" badge (#75) and the roster id instead of the old
+        // per-launch "worker N" counter that drifted from the seq.
+        let (display, derived_source) = {
+            let cleaned = sanitize_agent_name(name);
+            if cleaned.is_empty() {
+                (format!("{} {seq}", role.as_str()), NameSource::Default)
+            } else {
+                (cleaned, NameSource::Orchestrator)
+            }
         };
+        // A session rejoin re-spawns with the roster name (non-empty, so the
+        // derived tier would be `Orchestrator`); `restore_name_source` carries
+        // the persisted tier instead, so a human-renamed pane comes back at the
+        // `Human` tier and a later `rename_agent` still cannot clobber it.
+        let name_source = restore_name_source.unwrap_or(derived_source);
 
         // Workspace: dedicated worktree (branch of the same name) or the repo
         // itself, where the worker is instructed to branch before touching
@@ -3439,6 +3619,7 @@ impl OrchRegistry {
             id: agent_id.clone(),
             group: group_id.to_string(),
             name: display.clone(),
+            name_source,
             role,
             token: token.clone(),
             status: AgentStatus::Starting,
@@ -3864,6 +4045,50 @@ impl OrchRegistry {
             .map_err(|e| e.to_string())
     }
 
+    /// Rename an agent's pane title and durable roster entry, respecting the
+    /// name-source precedence ladder (#95r): the rename applies only when
+    /// `source` ranks at least as high as whoever set the current name, so a
+    /// human rename (highest) is never overwritten by the orchestrator's
+    /// `rename_agent` (middle) or the id-derived default (lowest); the
+    /// orchestrator can still relabel an id-default or its own earlier name.
+    /// Rejects a dead/unknown target. On success the pane title follows via an
+    /// `orch-rename` event, the roster is updated, the change is audited, and
+    /// the applied (trimmed/truncated) name is returned. Caller scopes the
+    /// target to its group (see the MCP `rename_agent` tool).
+    pub fn rename_agent(&self, agent_id: &str, name: &str, source: NameSource) -> Result<String, String> {
+        let name = sanitize_agent_name(name);
+        if name.is_empty() {
+            return Err("name must not be empty".into());
+        }
+        let entry = {
+            let mut agents = self.agents.lock_safe();
+            let a = agents.get_mut(agent_id).ok_or("unknown agent")?;
+            if a.status == AgentStatus::Dead {
+                return Err("agent is not alive".into());
+            }
+            if source.rank() < a.name_source.rank() {
+                // Only the orchestrator-vs-human case reaches here in practice.
+                return Err(format!(
+                    "not overriding {agent_id}: its name \"{}\" was set by the human and takes precedence",
+                    a.name
+                ));
+            }
+            a.name = name.clone();
+            a.name_source = source;
+            a.clone()
+        };
+        self.persist_agent_record(&entry, "running");
+        if let Some(app) = self.app.lock_safe().clone() {
+            let _ = app.emit(
+                "orch-rename",
+                json!({ "agent_id": entry.id, "pty_id": entry.pty_id, "name": name }),
+            );
+        }
+        self.audit(&entry.group, "loomux", "agent-rename",
+            json!({ "agent": agent_id, "name": name, "source": source.as_str() }));
+        Ok(name)
+    }
+
     #[doc(hidden)] // pub for integration tests
     pub fn mark_dead(&self, agent_id: &str, exit_code: Option<u32>) -> Option<AgentEntry> {
         let mut agents = self.agents.lock_safe();
@@ -4224,6 +4449,10 @@ fn register_orchestrator_pane(
         id: agent_id.clone(),
         group: group.id.clone(),
         name: "orchestrator".into(),
+        // A stable, meaningful single-orchestrator label — treated as the
+        // id-default tier so it never blocks anything (the rename tool targets
+        // worker/reviewer panes, not the orchestrator).
+        name_source: NameSource::Default,
         role: Role::Orchestrator,
         token: token.clone(),
         status: AgentStatus::Starting,
@@ -4307,8 +4536,11 @@ fn register_orchestrator_pane(
                 baseline,
             );
         }
-        for i in 0..initial_workers.min(group2.guardrails.max_agents) {
-            if let Err(e) = reg2.spawn_agent(&group2.id, Role::Worker, &format!("worker {}", i + 1), "", false, None)
+        for _ in 0..initial_workers.min(group2.guardrails.max_agents) {
+            // Empty name → derived from the minted id ("worker 2" for `w-2`),
+            // so the pane title agrees with its "W 2" badge instead of the old
+            // per-launch counter that drifted from the seq (#95r).
+            if let Err(e) = reg2.spawn_agent(&group2.id, Role::Worker, "", "", false, None)
             {
                 reg2.audit(&group2.id, "loomux", "error",
                     json!({ "what": "initial worker spawn failed", "err": e }));
@@ -4389,19 +4621,24 @@ pub fn resume_recorded_session(
         "planner" => Role::Planner,
         _ => Role::Worker,
     };
-    let cwd = reg
+    // Pull the durable roster row for this session: its cwd (where the work
+    // happened) and its name tier — so a human-renamed pane rejoins at the
+    // `Human` tier and stays un-clobberable, not silently demoted to
+    // orchestrator (#95r). Absent (hint-restored, pre-roster) → `None`, and
+    // spawn derives the tier from the name as usual.
+    let matched = reg
         .merged_records(&record.group_id)
         .into_iter()
-        .find(|r| r.session.as_deref() == Some(session_id))
-        .map(|r| r.cwd)
-        .filter(|c| Path::new(c).is_dir());
+        .find(|r| r.session.as_deref() == Some(session_id));
+    let cwd = matched.as_ref().map(|r| r.cwd.clone()).filter(|c| Path::new(c).is_dir());
+    let restore_source = matched.as_ref().map(|r| r.name_source);
     let reg2 = reg.clone();
     let sid = session_id.to_string();
     let (group_id, name) = (record.group_id.clone(), record.agent_name.clone());
     std::thread::spawn(move || {
-        if let Err(e) =
-            reg2.spawn_agent_ex(&group_id, role, &name, "", false, None, Some(sid.clone()), cwd)
-        {
+        if let Err(e) = reg2.spawn_agent_ex(
+            &group_id, role, &name, "", false, None, Some(sid.clone()), cwd, restore_source,
+        ) {
             reg2.audit(&group_id, "loomux", "error",
                 json!({ "what": "session rejoin failed", "session": sid, "err": e.clone() }));
             let _ = reg2.deliver_to_orchestrator(
@@ -4417,6 +4654,20 @@ pub fn resume_recorded_session(
 #[tauri::command]
 pub fn bind_agent(reg: tauri::State<Arc<OrchRegistry>>, agent_id: String, pty_id: u32) -> Result<(), String> {
     reg.bind(&agent_id, pty_id)
+}
+
+/// The human renamed an agent pane in-place (F2 / double-click). Sync the
+/// backend so the roster name matches the pane title AND the rename is
+/// recorded at the highest precedence tier — an orchestrator `rename_agent`
+/// afterwards will not override it (#95r). Best-effort: the pane already shows
+/// the new name locally, so a stale/unknown id just fails silently here.
+#[tauri::command]
+pub fn orch_agent_renamed(
+    reg: tauri::State<Arc<OrchRegistry>>,
+    agent_id: String,
+    name: String,
+) -> Result<(), String> {
+    reg.rename_agent(&agent_id, &name, NameSource::Human).map(|_| ())
 }
 
 /// Session ↔ orchestration-role mapping for the session browser badges.
@@ -4643,6 +4894,46 @@ pub fn orch_steer(
     text: String,
 ) -> Result<(), String> {
     reg.steer_orchestrator(&group_id, &text)
+}
+
+/// Result of saving a steering-strip attachment: the absolute file path plus
+/// the resolved orchestrator CLI, so the frontend can format the in-prompt
+/// reference the way that CLI consumes it (Claude reads a plain path; Copilot
+/// documents an `@<path>` mention — #72 review note 3).
+#[derive(serde::Serialize)]
+pub struct SavedAttachment {
+    pub path: String,
+    pub cli: String,
+}
+
+/// Save an image pasted/attached into the steering strip (#72). The image rides
+/// over IPC as base64 (`data_b64`) — same wire form as the OSC 52 clipboard
+/// bridge — so it survives any webview that won't hand raw bytes through
+/// `invoke`. Returns the saved path and the group's orchestrator CLI; the
+/// frontend turns those into the per-CLI "Attached image" reference line before
+/// sending through `orch_steer`.
+#[tauri::command]
+pub fn orch_save_attachment(
+    reg: tauri::State<Arc<OrchRegistry>>,
+    group_id: String,
+    ext: String,
+    data_b64: String,
+) -> Result<SavedAttachment, String> {
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+    // Reject an oversize payload before decoding — see MAX_ATTACHMENT_B64_LEN.
+    if data_b64.len() > MAX_ATTACHMENT_B64_LEN {
+        return Err(format!(
+            "attachment too large (max {MAX_ATTACHMENT_BYTES} bytes)"
+        ));
+    }
+    let bytes = B64
+        .decode(data_b64.as_bytes())
+        .map_err(|e| format!("invalid attachment encoding: {e}"))?;
+    let path = reg.save_attachment(&group_id, &ext, &bytes)?;
+    Ok(SavedAttachment {
+        path: path.to_string_lossy().to_string(),
+        cli: reg.orchestrator_cli(&group_id),
+    })
 }
 
 #[tauri::command]

@@ -360,6 +360,32 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .orch-compose-row { display: flex; gap: 6px; }
 .orch-compose-input { flex: 1; min-width: 0; font-size: 12px; }
 .orch-compose-send { flex: none; }
+/* Attach (paperclip) button: icon-only, sized to sit flush with Send. */
+.orch-compose-attach {
+  flex: none; display: inline-flex; align-items: center; justify-content: center;
+  padding: 0 8px;
+}
+/* Thumbnail-chip row for queued image attachments (#72). Empty → collapses to
+   nothing (no queued images), so the strip keeps its baseline height until an
+   image is added and the terminal only refits on a genuine change. */
+.orch-compose-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.orch-compose-chips:empty { display: none; }
+.orch-compose-chip {
+  position: relative; display: inline-flex; flex: none;
+  border: 1px solid var(--border-soft); border-radius: 4px;
+  overflow: hidden; background: #0e0e14;
+}
+.orch-compose-chip-thumb {
+  display: block; width: 40px; height: 40px; object-fit: cover;
+}
+.orch-compose-chip-x {
+  position: absolute; top: 0; right: 0;
+  width: 15px; height: 15px; line-height: 13px; padding: 0;
+  border: none; border-bottom-left-radius: 4px;
+  background: rgba(0, 0, 0, 0.65); color: #fff;
+  font-size: 10px; cursor: pointer;
+}
+.orch-compose-chip-x:hover { background: #d64560; }
 /* Transient feedback for a rejected send (paused group, dead orchestrator).
    Fixed-height slot present from build time, toggled via `visibility` (not
    `display`): showing/hiding it must never change `.orch-compose` height, or it

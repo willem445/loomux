@@ -80,7 +80,7 @@ npm test           # unit tests (Node's built-in runner; no extra deps)
 | Minimize pane | `Alt+M` (or —); restore from the dock |
 | Session browser | `Ctrl+Shift+P` (or the *sessions* button) |
 | Open in editor | `Alt+E` (or the `</>` button in a pane header) |
-| Steer orchestrator | `Alt+P` (focus the compose strip under an orchestrator pane); `Esc` returns to the terminal |
+| Steer orchestrator | `Alt+P` (focus the compose strip under an orchestrator pane); `Esc` returns to the terminal; `Ctrl+V` in the strip attaches a pasted screenshot |
 | Copy / paste | `Ctrl+Shift+C` / `Ctrl+Shift+V` (`Ctrl+V` also works) |
 
 A CLI running in a pane (e.g. an agent that says "copied to clipboard") copies
@@ -285,6 +285,15 @@ live orchestrator is reported inline rather than silently dropped. You can
 still type directly into the CLI if you prefer; loomux holds an incoming report
 for a few seconds while it sees you typing there (see the design note), but the
 strip is the collision-proof path.
+
+*Attach a screenshot:* paste an image with **Ctrl+V** (or click the paperclip
+to pick files) and it joins the message as a thumbnail chip — remove one with
+its **✕**, or queue several. On send, loomux saves each image to the group's
+scratch dir and adds an `Attached image:` reference line to the message —
+formatted the way the orchestrator's CLI reads it (a plain path for Claude
+Code, an `@<path>` mention for Copilot) — so the agent opens the screenshot.
+PNG, JPEG, GIF, WebP, and BMP are accepted, up to 10 MB each and 8 per message;
+the saved files are cleaned up when the group ends.
 
 **Attention routing:** the human is the scheduler's bottleneck, so loomux
 surfaces *which* pane needs you instead of making you scan them. A pane earns a
