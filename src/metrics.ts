@@ -30,3 +30,32 @@ export const onSystemMetrics = (
   handler: (m: SystemMetrics) => void
 ): Promise<UnlistenFn> =>
   listen<SystemMetrics>("system-metrics", (e) => handler(e.payload));
+
+/** Per-CLI agent usage-limit consumption, emitted on each orchestration
+ *  attention scan (see issue #80). Reported by the CLI's own statusline, not
+ *  estimated by loomux. */
+export interface ClaudeUsageLimits {
+  /** Rolling ~5-hour session allowance consumed, 0–100, or null if the live
+   *  panes' statuslines don't show it. */
+  session_pct: number | null;
+  /** Weekly allowance consumed, 0–100, or null. */
+  weekly_pct: number | null;
+  /** Provenance of the figure (currently always "statusline"). */
+  source: string;
+}
+
+export interface UsageLimits {
+  /** Aggregated across live Claude panes (most-constrained), or null when no
+   *  pane exposed a limit readout. */
+  claude: ClaudeUsageLimits | null;
+  /** Always null: Copilot exposes no local premium-request allowance, so
+   *  loomux shows nothing rather than a count with no ceiling. */
+  copilot: null;
+  /** Human-readable provenance/freshness note (tooltip source). */
+  note: string;
+}
+
+export const onUsageLimits = (
+  handler: (u: UsageLimits) => void
+): Promise<UnlistenFn> =>
+  listen<UsageLimits>("orch-usage-limits", (e) => handler(e.payload));
