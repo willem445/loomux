@@ -26,10 +26,19 @@ function showFatal(msg: string): void {
   el.textContent = msg;
   el.classList.add("visible");
 }
-window.addEventListener("error", (e) => showFatal(`error: ${e.message}`));
-window.addEventListener("unhandledrejection", (e) =>
-  showFatal(`unhandled: ${String(e.reason)}`)
-);
+window.addEventListener("error", (e) => {
+  // The banner only shows e.message, which for a cross-module DOM error hides
+  // the throwing frame. Log the underlying Error's stack so the next live
+  // occurrence of the intermittent pane-rename NotFoundError (#113) — whose
+  // exact reentrant trigger we could not pin from static reading — is captured
+  // with its call site instead of just the opaque message.
+  console.error("uncaught error:", e.error ?? e.message, "\n", e.error?.stack ?? "(no stack)");
+  showFatal(`error: ${e.message}`);
+});
+window.addEventListener("unhandledrejection", (e) => {
+  console.error("unhandled rejection:", e.reason);
+  showFatal(`unhandled: ${String(e.reason)}`);
+});
 
 const gridRoot = document.getElementById("grid-root")!;
 const paneDock = document.getElementById("pane-dock")!;

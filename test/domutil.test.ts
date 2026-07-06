@@ -8,7 +8,12 @@
 // throws. swapIfConnected() makes commit() idempotent.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { swapIfConnected, type Swappable } from "../src/domutil.ts";
+import {
+  swapIfConnected,
+  swapEditor,
+  type Swappable,
+  type Reparentable,
+} from "../src/domutil.ts";
 
 /** Minimal stand-in for a DOM element mirroring the browser's own semantics:
  *  replaceWith on a node that is no longer attached throws NotFoundError. */
@@ -76,4 +81,92 @@ test("a background re-render that already removed the editor is a safe no-op", (
   };
   assert.doesNotThrow(() => commit(true));
   assert.equal(saves, 0);
+});
+
+// ---- swapEditor: the pane-rename detach/reparent hardening (#113) ----
+//
+// A pane reuses its element; the grid moves its whole subtree with
+// replaceWith/replaceChildren on spawn/kill/reorder. That detaches the focused
+// rename input mid-edit and fires blur. Model a header whose child is the input,
+// mirroring the browser: replaceWith is a no-op when the node is unparented (so
+// it never throws) and otherwise swaps the label into the input's slot.
+class FakeHeader {
+  children: FakeInput[] = [];
+}
+class FakeInput implements Reparentable {
+  isConnected = true;
+  parentNode: FakeHeader | null;
+  constructor(header: FakeHeader) {
+    this.parentNode = header;
+    header.children.push(this);
+  }
+  /** Detach this input from the document (grid moved the subtree off-screen)
+   *  while it stays parented to its (now off-document) header. */
+  detachFromDocument(): void {
+    this.isConnected = false;
+  }
+  /** Fully remove this input from its header (nothing left to swap). */
+  orphan(): void {
+    this.isConnected = false;
+    if (this.parentNode) this.parentNode.children = [];
+    this.parentNode = null;
+  }
+  replaceWith(to: unknown): void {
+    // WHATWG DOM: replaceWith on a parentless node returns early (no throw).
+    if (this.parentNode == null) return;
+    const idx = this.parentNode.children.indexOf(this);
+    this.parentNode.children[idx] = to as FakeInput;
+    this.parentNode = null;
+  }
+}
+
+test("connected input: swaps the label in and reports live (refocus)", () => {
+  const header = new FakeHeader();
+  const input = new FakeInput(header);
+  const label = { label: true } as unknown as FakeInput;
+  const r = swapEditor(input, label);
+  assert.deepEqual(r, { swapped: true, live: true });
+  assert.deepEqual(header.children, [label], "label sits where the input was");
+});
+
+test("detached-but-parented input (grid moved the subtree): swaps, but NOT live", () => {
+  const header = new FakeHeader();
+  const input = new FakeInput(header);
+  input.detachFromDocument(); // grid.ts swap/renderSplit moved the pane off-document
+  const label = { label: true } as unknown as FakeInput;
+  let refocused = false;
+  const r = swapEditor(input, label);
+  if (r.live) refocused = true; // the pane.ts caller only focuses on live
+  assert.deepEqual(r, { swapped: true, live: false });
+  assert.equal(refocused, false, "must not steal focus mid-restructure (#113 crash)");
+  assert.deepEqual(
+    header.children,
+    [label],
+    "header left consistent: label restored, no orphaned input"
+  );
+});
+
+test("detached and unparented input (already gone): no-op, no throw", () => {
+  const header = new FakeHeader();
+  const input = new FakeInput(header);
+  input.orphan(); // the editor was fully removed before the commit ran
+  const r = swapEditor(input, { label: true });
+  assert.deepEqual(r, { swapped: false, live: false });
+});
+
+test("swapEditor never throws across the full mid-edit-move commit sequence", () => {
+  const header = new FakeHeader();
+  const input = new FakeInput(header);
+  const label = { label: true } as unknown as FakeInput;
+  // blur from the grid move commits first while detached-but-parented...
+  input.detachFromDocument();
+  assert.doesNotThrow(() => {
+    const first = swapEditor(input, label);
+    assert.equal(first.swapped, true);
+    // ...and any trailing blur/keydown that also reaches restore is now a no-op
+    // (input is unparented after the swap) and still never throws.
+    const second = swapEditor(input, label);
+    assert.equal(second.swapped, false);
+  });
+  assert.deepEqual(header.children, [label]);
 });

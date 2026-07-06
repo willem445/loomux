@@ -35,6 +35,7 @@ import { showToast } from "./toast";
 import { isAppShortcut } from "./shortcuts";
 import { attentionPresentation } from "./attention";
 import { makeRenameCommit } from "./panerename";
+import { swapEditor } from "./domutil";
 import { openInEditor, editorConfigDialog } from "./editor";
 import { GitView } from "./gitview";
 import { TasksView } from "./tasksview";
@@ -1019,27 +1020,36 @@ export class Pane {
     this.titleEl.replaceWith(input);
     input.focus();
     input.select();
-    // Enter/Escape commit AND blur commits; the first commit detaches the
-    // focused input, which itself fires blur → a second commit. makeRenameCommit
-    // is idempotent so that redundant call is a no-op (and Escape wins over the
-    // trailing blur-save) — otherwise replaceWith runs on a detached node and
-    // throws NotFoundError into the app-wide error banner (#75, twin of #77).
+    // Enter/Escape commit AND blur commits; the first commit swaps the input
+    // back, and detaching the focused input itself fires blur → a second commit.
+    // makeRenameCommit is idempotent so that redundant call is a no-op, Escape
+    // (save=false) beats the trailing blur-save, and — for #113 — a blur caused
+    // by an orchestrator-driven grid/dock move (input no longer connected) is
+    // treated as a cancel rather than saving a half-typed name (see isConnected).
     const commit = makeRenameCommit({
       value: () => input.value,
+      isConnected: () => input.isConnected,
       save: (name) => {
+        const changed = name !== this.name;
         this.name = name;
         // Sync a human rename to the backend so the roster name matches the
         // pane title and the human's choice takes precedence over any later
         // orchestrator rename_agent (#95r). Best-effort: the title is already
-        // updated locally, so a backend hiccup is non-fatal.
-        if (this.orchAgent) {
+        // updated locally, so a backend hiccup is non-fatal. Skip the round-trip
+        // when nothing changed so a no-op Enter/blur doesn't re-broadcast a rename.
+        if (this.orchAgent && changed) {
           invoke("orch_agent_renamed", { agentId: this.orchAgent, name }).catch(() => {});
         }
       },
       restore: () => {
-        input.replaceWith(this.titleEl);
+        // Put the label back showing the current name (the pre-edit name on a
+        // cancel, the saved name on a commit), then swap the input out. swapEditor
+        // tolerates the input having been detached OR moved mid-edit by a grid/dock
+        // restructure: it leaves the header consistent (label back, no orphaned
+        // input) and only reports `live` — safe to refocus — when the input was
+        // still on the document, i.e. the ordinary Enter/click-away path.
         this.titleEl.textContent = this.name;
-        this.focus();
+        if (swapEditor(input, this.titleEl).live) this.focus();
       },
     });
     input.addEventListener("keydown", (e) => {
