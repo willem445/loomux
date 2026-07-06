@@ -1077,6 +1077,127 @@ fn build_agent_command_full_line_snapshots() {
     );
 }
 
+/// Split a shell command line into argv, honoring double quotes (the only
+/// quoting `build_agent_command` emits). `--add-dir "C:/a b"` → two tokens;
+/// `@"C:/x"` → `@C:/x`; `"Bash(git *)"` → one token with its inner space.
+fn shell_tokenize(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_quote = false;
+    let mut started = false; // distinguishes "" (empty token) from whitespace
+    for c in line.chars() {
+        match c {
+            '"' => {
+                in_quote = !in_quote;
+                started = true;
+            }
+            ' ' | '\t' if !in_quote => {
+                if started {
+                    out.push(std::mem::take(&mut cur));
+                    started = false;
+                }
+            }
+            _ => {
+                cur.push(c);
+                started = true;
+            }
+        }
+    }
+    if started {
+        out.push(cur);
+    }
+    out
+}
+
+#[test]
+fn build_agent_argv_snapshots() {
+    // The structured (direct-spawn) form, pinned per CLI (issue #78, #102-style).
+    // A native-exe agent pane spawns exactly program=argv[0] with these literal
+    // args — no shell, no quoting. Fixed paths keep it deterministic.
+    let (reg, _d) = test_registry();
+    let cfg = Path::new("C:/x/cfg.json");
+    let gdir = Path::new("C:/data/group");
+    let wd = Path::new("C:/repo");
+    let argv =
+        |cli, model, auto_ops, read_only| reg.build_agent_argv(cli, model, auto_ops, cfg, gdir, wd, None, false, read_only);
+
+    // Claude worker, auto_ops ON. Note the quote-free literal tool tokens.
+    assert_eq!(
+        argv("claude", "sonnet", true, false),
+        vec![
+            "claude", "--mcp-config", "C:/x/cfg.json", "--strict-mcp-config", "--model", "sonnet",
+            "--permission-mode", "auto", "--add-dir", "C:/data/group", "--allowedTools",
+            "mcp__loomux", "Bash(git *)", "Bash(gh *)",
+        ]
+    );
+
+    // Copilot planner (read_only): group autopilot + deny rules; @ rides the cfg.
+    assert_eq!(
+        argv("copilot", "auto", false, true),
+        vec![
+            "copilot", "--additional-mcp-config", "@C:/x/cfg.json", "--model", "auto", "--add-dir",
+            "C:/data/group", "--add-dir", "C:/repo", "--allow-tool", "loomux", "--no-auto-update",
+            "--autopilot", "--allow-all-tools", "--allow-all-paths", "--deny-tool", "write",
+            "--deny-tool", "edit", "--deny-tool", "shell(git commit)", "--deny-tool",
+            "shell(git push)",
+        ]
+    );
+
+    // The program is always argv[0] — what the pane spawns directly.
+    assert_eq!(argv("claude", "sonnet", false, false)[0], "claude");
+    assert_eq!(argv("copilot", "auto", false, false)[0], "copilot");
+    // Unknown CLI → claude adapter, structurally too.
+    assert_eq!(argv("totally-unknown-cli", "sonnet", true, false)[0], "claude");
+}
+
+#[test]
+fn build_agent_argv_matches_command_line() {
+    // Drift guard: the structured argv must be exactly the tokenization of the
+    // shell command line across the full matrix, session/resume included. This
+    // is what lets both forms coexist (direct spawn + shell fallback) without
+    // ever describing a different invocation.
+    let (reg, _d) = test_registry();
+    let cfg = Path::new("C:/x/cfg.json");
+    let gdir = Path::new("C:/data/group");
+    let wd = Path::new("C:/repo");
+    let sid = "11111111-2222-3333-4444-555555555555";
+    let sessions: [(Option<&str>, bool); 3] =
+        [(None, false), (Some(sid), false), (Some(sid), true)];
+    for cli in ["claude", "copilot", "totally-unknown-cli"] {
+        for auto_ops in [false, true] {
+            for read_only in [false, true] {
+                for (session, resume) in sessions {
+                    let line = reg.build_agent_command(
+                        cli, "m", auto_ops, cfg, gdir, wd, session, resume, read_only,
+                    );
+                    let argv = reg.build_agent_argv(
+                        cli, "m", auto_ops, cfg, gdir, wd, session, resume, read_only,
+                    );
+                    assert_eq!(
+                        shell_tokenize(&line),
+                        argv,
+                        "argv must equal the tokenized command line for \
+                         cli={cli} auto_ops={auto_ops} read_only={read_only} \
+                         session={session:?} resume={resume}\n  line: {line}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn shell_tokenize_handles_quotes_and_at_marker() {
+    assert_eq!(
+        shell_tokenize(r#"claude --add-dir "C:/a b" --allowedTools "Bash(git *)""#),
+        vec!["claude", "--add-dir", "C:/a b", "--allowedTools", "Bash(git *)"]
+    );
+    assert_eq!(
+        shell_tokenize(r#"copilot --additional-mcp-config "@C:/x/cfg.json""#),
+        vec!["copilot", "--additional-mcp-config", "@C:/x/cfg.json"]
+    );
+}
+
 #[test]
 fn copilot_mcp_config_includes_tools_allowlist() {
     let (reg, _d) = test_registry();

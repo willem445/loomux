@@ -7,6 +7,15 @@
 //! an agent manager whose users install agent CLIs mid-session, that's not
 //! acceptable: every spawned process gets a PATH rebuilt from the current
 //! registry values (machine + user), merged with the inherited one.
+//!
+//! This module also owns the `which`-style program resolver (PATH + PATHEXT)
+//! shared by "open in editor" and the direct-CLI pane spawn (issue #78): both
+//! need to turn a bare command name (`code`, `claude`) into the concrete
+//! executable on disk, and to know whether that executable is a native `.exe`
+//! (safe to `CreateProcess` directly) or a `.cmd`/`.bat`/`.ps1` shim (which
+//! needs a shell interpreter).
+
+use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "windows")]
 pub fn fresh_path() -> Option<String> {
@@ -87,9 +96,93 @@ pub fn expand_env(s: &str) -> String {
     out
 }
 
+// ── Program resolution (PATH + PATHEXT), shared by editor + pane spawn ───────
+
+/// Default Windows executable extensions, used when `PATHEXT` is unset. This is
+/// what lets a bare `code` resolve to `code.cmd` and `claude` to `claude.exe`.
+#[cfg(windows)]
+pub const DEFAULT_PATHEXT: &str = ".COM;.EXE;.BAT;.CMD";
+
+/// The PATH a spawned program should be resolved and launched with. Prefers the
+/// freshly-rebuilt registry PATH on Windows (a CLI installed while loomux is
+/// running is still found) and falls back to the inherited value.
+pub fn launch_path() -> String {
+    fresh_path().unwrap_or_else(|| std::env::var("PATH").unwrap_or_default())
+}
+
+/// The extension list to try when resolving a bare command name. Empty off
+/// Windows, where a program name is used verbatim.
+pub fn launch_pathext() -> String {
+    #[cfg(windows)]
+    {
+        std::env::var("PATHEXT").unwrap_or_else(|_| DEFAULT_PATHEXT.to_string())
+    }
+    #[cfg(not(windows))]
+    {
+        String::new()
+    }
+}
+
+/// Resolve a command to a concrete executable path.
+///
+/// An explicit path (one containing a path separator) is used verbatim when it
+/// names an existing file. A bare command is looked up on `path_env`, trying the
+/// name as-is first and then with each `pathext` extension appended — so `code`
+/// resolves to `code.cmd`, `claude` to `claude.exe`, and an already-qualified
+/// `git.exe` matches directly. Returns `None` when nothing matches.
+pub fn resolve_program(program: &str, path_env: &str, pathext: &str) -> Option<PathBuf> {
+    if program.contains('/') || program.contains('\\') {
+        let p = PathBuf::from(program);
+        return p.is_file().then_some(p);
+    }
+    // "" tries the name verbatim (covers a bare name that already carries its
+    // extension, and every non-Windows case where PATHEXT is empty).
+    let exts = std::iter::once("").chain(pathext.split(';').filter(|e| !e.is_empty()));
+    let sep = if cfg!(windows) { ';' } else { ':' };
+    for ext in exts {
+        for dir in path_env.split(sep) {
+            let dir = dir.trim();
+            if dir.is_empty() {
+                continue;
+            }
+            let cand = Path::new(dir).join(format!("{program}{ext}"));
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+    }
+    None
+}
+
+/// Whether `path` can be handed straight to `CreateProcess` (portable-pty's
+/// `CommandBuilder`) as the pty child, versus needing a shell interpreter.
+///
+/// On Windows only true native images (`.exe`/`.com`) qualify: a `.cmd`/`.bat`
+/// batch file or a `.ps1` script is not a PE and `CreateProcess` cannot launch
+/// it — those must run through the shell wrapper. This is the safety boundary
+/// for direct-CLI pane spawn (issue #78): claude/copilot are native `.exe`, so
+/// they spawn directly; a shim CLI (some npm `gemini`/`opencode` installs ship a
+/// `.cmd`) is correctly kept on the shell path. Off Windows any resolved file is
+/// directly executable.
+pub fn is_native_executable(path: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        match path.extension().and_then(|e| e.to_str()) {
+            Some(ext) => ext.eq_ignore_ascii_case("exe") || ext.eq_ignore_ascii_case("com"),
+            None => false,
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn merge_keeps_inherited_priority_and_appends_new_registry_dirs() {
@@ -125,5 +218,66 @@ mod tests {
         assert_eq!(expand_env("%NOPE_NOT_SET%\\bin"), "%NOPE_NOT_SET%\\bin");
         assert_eq!(expand_env("plain"), "plain");
         assert_eq!(expand_env("50%"), "50%");
+    }
+
+    #[test]
+    fn resolve_finds_bare_command_via_pathext() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A fake CLI discoverable only by appending an extension. The extension
+        // casing matches the file so the lookup also succeeds on case-sensitive
+        // filesystems (CI runs this on Linux).
+        let exe = tmp.path().join("myagent.exe");
+        fs::write(&exe, b"binary").unwrap();
+        let found = resolve_program("myagent", tmp.path().to_str().unwrap(), ".exe;.CMD").unwrap();
+        assert_eq!(found, exe);
+    }
+
+    #[test]
+    fn resolve_matches_name_that_already_has_extension() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cmd = tmp.path().join("shim.cmd");
+        fs::write(&cmd, b"@echo off").unwrap();
+        // Even though PATHEXT lists .EXE first, the verbatim name wins.
+        let found = resolve_program("shim.cmd", tmp.path().to_str().unwrap(), ".EXE").unwrap();
+        assert_eq!(found, cmd);
+    }
+
+    #[test]
+    fn resolve_uses_explicit_path_verbatim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exe = tmp.path().join("claude.bin");
+        fs::write(&exe, b"x").unwrap();
+        let p = exe.to_str().unwrap();
+        assert_eq!(resolve_program(p, "", "").unwrap(), exe);
+    }
+
+    #[test]
+    fn resolve_missing_bare_command_is_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(resolve_program("no_such_cli_xyz", tmp.path().to_str().unwrap(), ".EXE").is_none());
+    }
+
+    #[test]
+    fn resolve_missing_explicit_path_is_none() {
+        assert!(resolve_program("/nope/ghost/agent.exe", "", "").is_none());
+    }
+
+    /// The direct-spawn safety boundary (issue #78): only native images may be
+    /// handed to CreateProcess as the pty child; shims must keep the shell.
+    #[cfg(windows)]
+    #[test]
+    fn native_executable_classification_windows() {
+        assert!(is_native_executable(Path::new(r"C:\a\claude.exe")));
+        assert!(is_native_executable(Path::new(r"C:\a\tool.COM")));
+        assert!(!is_native_executable(Path::new(r"C:\a\gemini.cmd")));
+        assert!(!is_native_executable(Path::new(r"C:\a\opencode.bat")));
+        assert!(!is_native_executable(Path::new(r"C:\a\wrap.ps1")));
+        assert!(!is_native_executable(Path::new(r"C:\a\noext")));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn native_executable_is_always_true_off_windows() {
+        assert!(is_native_executable(Path::new("/usr/bin/claude")));
     }
 }

@@ -1058,6 +1058,8 @@ pub struct SpawnRequest {
     pub role: Role,
     pub name: String,
     pub cwd: String,
+    /// Shell command line (the historical form). Still emitted as the fallback
+    /// the pane runs through a shell when the direct spawn can't apply.
     pub command: String,
     /// Wall-clock Unix-ms after which a still-queued request must be dropped
     /// unserviced (#106) — set to the deadline of the backend's own `bind`
@@ -1065,6 +1067,10 @@ pub struct SpawnRequest {
     /// this point drops the request instead of opening a zombie pane against
     /// state the bind-timeout has already torn down. See `spawn_request_expired`.
     pub deadline_ms: u64,
+    /// Structured invocation (program + literal args) for direct-CLI spawn
+    /// (issue #78): when its program resolves to a native executable the pane
+    /// spawns it as the ConPTY child with no wrapper shell. Mirrors `command`.
+    pub argv: Vec<String>,
 }
 
 pub struct OrchRegistry {
@@ -3774,6 +3780,123 @@ impl OrchRegistry {
         }
     }
 
+    /// The **structured** form of [`build_agent_command`] — the same invocation
+    /// as a program + literal-argument vector instead of a shell command line
+    /// (issue #78). Direct-CLI pane spawn hands this to `spawn_pty` so the agent
+    /// executable becomes the ConPTY child with no pwsh/sh wrapper; the string
+    /// form is still emitted alongside it as the shell fallback (shim CLIs,
+    /// unresolved programs, or the `LOOMUX_NO_DIRECT_SPAWN` escape hatch).
+    ///
+    /// Each element is a literal argv token: no surrounding shell quotes, spaces
+    /// inside a token preserved (`Bash(git *)` is ONE element). Built from the
+    /// same flag atoms as `build_agent_command`; a consistency test
+    /// (`build_agent_argv_matches_command_line`) tokenizes the string form and
+    /// asserts it equals this vector across the full matrix, so the two can't
+    /// drift.
+    #[allow(clippy::too_many_arguments)]
+    #[doc(hidden)] // pub for integration tests
+    pub fn build_agent_argv(
+        &self,
+        cli: &str,
+        model: &str,
+        auto_ops: bool,
+        cfg: &Path,
+        group_dir: &Path,
+        workdir: &Path,
+        session: Option<&str>,
+        resume: bool,
+        read_only: bool,
+    ) -> Vec<String> {
+        let unattended = auto_ops || read_only;
+        let mut a: Vec<String> = Vec::new();
+        let push = |a: &mut Vec<String>, s: &str| a.push(s.to_string());
+        match cli {
+            "copilot" => {
+                push(&mut a, "copilot");
+                if let (Some(s), true) = (session, resume) {
+                    push(&mut a, "--resume");
+                    push(&mut a, s);
+                }
+                push(&mut a, "--additional-mcp-config");
+                // The @ marker rides on the path as a single argv element (no
+                // shell here-string hazard once it's not a shell string at all).
+                a.push(format!("@{}", cfg.display()));
+                push(&mut a, "--model");
+                push(&mut a, model);
+                push(&mut a, "--add-dir");
+                a.push(group_dir.display().to_string());
+                push(&mut a, "--add-dir");
+                a.push(workdir.display().to_string());
+                push(&mut a, "--allow-tool");
+                push(&mut a, "loomux");
+                push(&mut a, "--no-auto-update");
+                if unattended {
+                    // Reuse the atom directly: no quotes/embedded spaces, so the
+                    // whitespace split yields exactly the argv tokens.
+                    for t in COPILOT_GROUP_AUTOPILOT_FLAGS.split_whitespace() {
+                        push(&mut a, t);
+                    }
+                } else {
+                    push(&mut a, "--allow-tool");
+                    push(&mut a, "shell(git:*)");
+                    push(&mut a, "--allow-tool");
+                    push(&mut a, "shell(gh:*)");
+                }
+                if read_only {
+                    push(&mut a, "--deny-tool");
+                    push(&mut a, "write");
+                    push(&mut a, "--deny-tool");
+                    push(&mut a, "edit");
+                    push(&mut a, "--deny-tool");
+                    push(&mut a, "shell(git commit)");
+                    push(&mut a, "--deny-tool");
+                    push(&mut a, "shell(git push)");
+                }
+            }
+            // "claude" and the explicit fallback for anything unrecognized.
+            _ => {
+                push(&mut a, "claude");
+                match (session, resume) {
+                    (Some(s), true) => {
+                        push(&mut a, "--resume");
+                        push(&mut a, s);
+                    }
+                    (Some(s), false) => {
+                        push(&mut a, "--session-id");
+                        push(&mut a, s);
+                    }
+                    (None, _) => {}
+                }
+                push(&mut a, "--mcp-config");
+                a.push(cfg.display().to_string());
+                push(&mut a, "--strict-mcp-config");
+                push(&mut a, "--model");
+                push(&mut a, model);
+                push(&mut a, "--permission-mode");
+                push(&mut a, claude_permission_mode(unattended));
+                push(&mut a, "--add-dir");
+                a.push(group_dir.display().to_string());
+                push(&mut a, "--allowedTools");
+                push(&mut a, "mcp__loomux");
+                if unattended {
+                    // == CLAUDE_UNATTENDED_ALLOW, as literal (unquoted) tokens.
+                    push(&mut a, "Bash(git *)");
+                    push(&mut a, "Bash(gh *)");
+                }
+                if read_only {
+                    push(&mut a, "--disallowedTools");
+                    push(&mut a, "Edit");
+                    push(&mut a, "Write");
+                    push(&mut a, "MultiEdit");
+                    push(&mut a, "NotebookEdit");
+                    push(&mut a, "Bash(git commit *)");
+                    push(&mut a, "Bash(git push *)");
+                }
+            }
+        }
+        a
+    }
+
     /// Register an agent, emit the pane spawn request, wait for the frontend
     /// bind, then type the kickoff prompt. Enforces the group guardrails.
     /// `task` empty = idle agent awaiting assignment.
@@ -3927,6 +4050,17 @@ impl OrchRegistry {
             resume,
             role == Role::Planner, // read_only: deny writes/commits at the CLI level
         );
+        let argv = self.build_agent_argv(
+            &cli,
+            model,
+            group.guardrails.auto_ops,
+            &cfg,
+            &self.group_dir(group_id),
+            Path::new(&cwd),
+            session_id.as_deref(),
+            resume,
+            role == Role::Planner,
+        );
 
         let entry = AgentEntry {
             id: agent_id.clone(),
@@ -3994,6 +4128,7 @@ impl OrchRegistry {
             command,
             // Expire the request when our own bind wait would (#106).
             deadline_ms: now_ms() + BIND_TIMEOUT.as_millis() as u64,
+            argv,
         };
 
         let app = self.app.lock_safe().clone();
@@ -4906,6 +5041,17 @@ fn register_orchestrator_pane(
         resume,
         false, // the orchestrator is never read-only
     );
+    let argv = reg.build_agent_argv(
+        &cli,
+        &model,
+        group.guardrails.auto_ops,
+        &cfg,
+        &reg.group_dir(&group.id),
+        Path::new(&group.repo),
+        session_id.as_deref(),
+        resume,
+        false,
+    );
     let entry = AgentEntry {
         id: agent_id.clone(),
         group: group.id.clone(),
@@ -4943,6 +5089,7 @@ fn register_orchestrator_pane(
         command,
         // Expire the request when the background bind wait below would (#106).
         deadline_ms: now_ms() + BIND_TIMEOUT.as_millis() as u64,
+        argv,
     };
 
     crate::obs::breadcrumb(

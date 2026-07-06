@@ -8,13 +8,8 @@
 //! no character in the directory path, is ever handed to a shell for
 //! re-parsing, so there is no command-injection surface.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
-
-/// Default Windows executable extensions, used when `PATHEXT` is unset. This
-/// is what lets a bare `code` resolve to `code.cmd` and `zed` to `zed.exe`.
-#[cfg(windows)]
-const DEFAULT_PATHEXT: &str = ".COM;.EXE;.BAT;.CMD";
 
 /// Validate the two inputs. Returns the trimmed editor + directory on success,
 /// or a user-facing message (surfaced as a toast) describing what is wrong.
@@ -42,65 +37,14 @@ fn editor_args(dir: &str) -> Vec<String> {
     vec![dir.to_string()]
 }
 
-/// Resolve an editor command to a concrete executable path.
-///
-/// An explicit path (one containing a path separator) is used verbatim when it
-/// names an existing file. A bare command is looked up on `path_env`, trying
-/// the name as-is first and then with each `pathext` extension appended — so
-/// `code` resolves to `code.cmd`, `zed` to `zed.exe`, and an already-qualified
-/// `git.exe` matches directly. Returns `None` when nothing matches; the caller
-/// turns that into a "not found" toast.
-fn resolve_program(editor: &str, path_env: &str, pathext: &str) -> Option<PathBuf> {
-    if editor.contains('/') || editor.contains('\\') {
-        let p = PathBuf::from(editor);
-        return p.is_file().then_some(p);
-    }
-    // "" tries the name verbatim (covers a bare name that already carries its
-    // extension, and every non-Windows case where PATHEXT is empty).
-    let exts = std::iter::once("").chain(pathext.split(';').filter(|e| !e.is_empty()));
-    let sep = if cfg!(windows) { ';' } else { ':' };
-    for ext in exts {
-        for dir in path_env.split(sep) {
-            let dir = dir.trim();
-            if dir.is_empty() {
-                continue;
-            }
-            let cand = Path::new(dir).join(format!("{editor}{ext}"));
-            if cand.is_file() {
-                return Some(cand);
-            }
-        }
-    }
-    None
-}
-
-/// PATH the editor should be looked up and launched with. Prefers the freshly
-/// resolved registry PATH on Windows (an editor installed while loomux is
-/// running is still found) and falls back to the inherited value.
-fn launch_path() -> String {
-    crate::winpath::fresh_path().unwrap_or_else(|| std::env::var("PATH").unwrap_or_default())
-}
-
-/// The extension list to try when resolving a bare command name.
-fn launch_pathext() -> String {
-    #[cfg(windows)]
-    {
-        std::env::var("PATHEXT").unwrap_or_else(|_| DEFAULT_PATHEXT.to_string())
-    }
-    #[cfg(not(windows))]
-    {
-        String::new()
-    }
-}
-
 /// Open `dir` in the configured `editor`, spawned detached. Returns a
 /// user-facing error string on any failure (unconfigured, missing folder,
 /// editor not found, or spawn failure) so the frontend can toast it.
 #[tauri::command]
 pub fn open_in_editor(editor: String, dir: String) -> Result<(), String> {
     let (editor, dir) = validate(&editor, &dir)?;
-    let path_env = launch_path();
-    let program = resolve_program(editor, &path_env, &launch_pathext())
+    let path_env = crate::winpath::launch_path();
+    let program = crate::winpath::resolve_program(editor, &path_env, &crate::winpath::launch_pathext())
         .ok_or_else(|| format!("Editor not found on PATH: {editor}"))?;
 
     let mut cmd = Command::new(&program);
@@ -131,7 +75,6 @@ pub fn open_in_editor(editor: String, dir: String) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
 
     #[test]
     fn validate_rejects_empty_editor() {
@@ -171,65 +114,7 @@ mod tests {
         assert_eq!(args.len(), 1, "the dir must never be split into shell tokens");
     }
 
-    #[test]
-    fn resolve_finds_bare_command_via_pathext() {
-        let tmp = tempfile::tempdir().unwrap();
-        // A fake editor discoverable only by appending an extension. The
-        // extension casing matches the file so the lookup also succeeds on
-        // case-sensitive filesystems (CI runs this on Linux).
-        let exe = tmp.path().join("myeditor.exe");
-        fs::write(&exe, b"binary").unwrap();
-        let found =
-            resolve_program("myeditor", tmp.path().to_str().unwrap(), ".exe;.CMD").unwrap();
-        assert_eq!(found, exe);
-    }
-
-    /// PATHEXT entries are conventionally uppercase (".EXE") while files on
-    /// disk are lowercase; Windows' case-insensitive filesystem bridges the
-    /// two. That OS behavior only exists on Windows, so it is pinned here.
-    #[cfg(windows)]
-    #[test]
-    fn resolve_pathext_casing_is_insensitive_on_windows() {
-        let tmp = tempfile::tempdir().unwrap();
-        let exe = tmp.path().join("myeditor.exe");
-        fs::write(&exe, b"binary").unwrap();
-        let found =
-            resolve_program("myeditor", tmp.path().to_str().unwrap(), ".EXE;.CMD").unwrap();
-        assert!(
-            found.to_string_lossy().eq_ignore_ascii_case(&exe.to_string_lossy()),
-            "resolved {found:?}, expected {exe:?}"
-        );
-    }
-
-    #[test]
-    fn resolve_matches_name_that_already_has_extension() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cmd = tmp.path().join("ed.cmd");
-        fs::write(&cmd, b"@echo off").unwrap();
-        // Even though PATHEXT lists .EXE first, the verbatim name wins.
-        let found = resolve_program("ed.cmd", tmp.path().to_str().unwrap(), ".EXE").unwrap();
-        assert_eq!(found, cmd);
-    }
-
-    #[test]
-    fn resolve_uses_explicit_path_verbatim() {
-        let tmp = tempfile::tempdir().unwrap();
-        let exe = tmp.path().join("zed.bin");
-        fs::write(&exe, b"x").unwrap();
-        let p = exe.to_str().unwrap();
-        assert_eq!(resolve_program(p, "", "").unwrap(), exe);
-    }
-
-    #[test]
-    fn resolve_missing_bare_command_is_none() {
-        let tmp = tempfile::tempdir().unwrap();
-        assert!(
-            resolve_program("no_such_editor_xyz", tmp.path().to_str().unwrap(), ".EXE").is_none()
-        );
-    }
-
-    #[test]
-    fn resolve_missing_explicit_path_is_none() {
-        assert!(resolve_program("/nope/ghost/editor.exe", "", "").is_none());
-    }
+    // Program resolution (PATH + PATHEXT) is shared with pane spawn and unit-
+    // tested in `winpath` — see the `resolve_*` / `native_executable_*` tests
+    // there.
 }

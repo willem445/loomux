@@ -254,11 +254,94 @@ fn which(name: &str) -> bool {
     std::env::split_paths(&path).any(|dir| dir.join(name).is_file())
 }
 
-/// Build the argv for a pane. When `command` is given it is run *through*
-/// the default shell so PATH shims (.cmd/.ps1 wrappers like `claude`)
-/// resolve the same way they do in a normal terminal. A plain interactive
-/// shell additionally gets cwd-reporting shell integration wired in.
-fn build_command(command: Option<String>, cwd: Option<String>) -> CommandBuilder {
+/// Whether the direct-CLI spawn path (issue #78) is disabled by the escape
+/// hatch. Set `LOOMUX_NO_DIRECT_SPAWN` to any value other than empty/`0`/`false`
+/// to force every agent pane back through the shell wrapper (the pre-#78
+/// behavior) — a one-env-var rollback if a direct spawn ever misbehaves.
+fn direct_spawn_disabled() -> bool {
+    match std::env::var("LOOMUX_NO_DIRECT_SPAWN") {
+        Ok(v) => {
+            let v = v.trim();
+            !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+        Err(_) => false,
+    }
+}
+
+/// Try to build a *direct* pane child from a structured `argv` — the resolved
+/// agent executable spawned as the ConPTY child with no pwsh/sh wrapper in
+/// between (issue #78). Returns `None` (caller falls back to the shell path)
+/// when the escape hatch is set, `argv` is empty, the program can't be resolved
+/// on PATH, or it resolves to a `.cmd`/`.bat`/`.ps1` shim that `CreateProcess`
+/// can't launch directly. Every fallback is breadcrumbed so a lost win is
+/// diagnosable.
+fn try_direct_command(argv: &[String]) -> Option<CommandBuilder> {
+    if direct_spawn_disabled() {
+        return None;
+    }
+    let program = argv.first().map(|p| p.trim()).filter(|p| !p.is_empty())?;
+    let path_env = crate::winpath::launch_path();
+    let resolved = match crate::winpath::resolve_program(
+        program,
+        &path_env,
+        &crate::winpath::launch_pathext(),
+    ) {
+        Some(p) => p,
+        None => {
+            crate::obs::breadcrumb("pty-direct-fallback", &format!("unresolved program={program}"));
+            return None;
+        }
+    };
+    if !crate::winpath::is_native_executable(&resolved) {
+        // A shim (.cmd/.ps1) needs a shell interpreter — keep the wrapper.
+        crate::obs::breadcrumb("pty-direct-fallback", &format!("shim program={program}"));
+        return None;
+    }
+    let mut cmd = CommandBuilder::new(resolved.as_os_str());
+    cmd.args(&argv[1..]);
+    crate::obs::breadcrumb("pty-direct", &format!("program={}", resolved.display()));
+    Some(cmd)
+}
+
+/// Apply the shared per-pane cwd + environment (cwd, TERM/COLORTERM, fresh
+/// PATH) to a `CommandBuilder` regardless of whether it is a direct spawn or a
+/// shell wrapper.
+fn apply_pane_env(mut cmd: CommandBuilder, cwd: Option<String>) -> CommandBuilder {
+    let dir = cwd
+        .filter(|d| std::path::Path::new(d).is_dir())
+        .or_else(|| dirs::home_dir().map(|h| h.to_string_lossy().into_owned()));
+    if let Some(dir) = dir {
+        cmd.cwd(dir);
+    }
+    cmd.env("TERM", "xterm-256color");
+    cmd.env("COLORTERM", "truecolor");
+    // Fresh PATH from the registry: CLIs installed after loomux (or its
+    // parent terminal) started must still be findable in new panes.
+    if let Some(path) = crate::winpath::fresh_path() {
+        cmd.env("PATH", path);
+    }
+    cmd
+}
+
+/// Build the child command for a pane.
+///
+/// When `argv` names a resolvable native agent executable, it is spawned
+/// **directly** as the ConPTY child — no wrapper shell (issue #78). Otherwise
+/// (plain shell panes, custom commands, shim CLIs, or a failed resolution) the
+/// `command` string is run *through* the default shell so PATH shims resolve
+/// the same way they do in a normal terminal; a plain interactive shell also
+/// gets cwd-reporting (OSC 7) shell integration wired in. Direct-spawned agent
+/// panes don't need that hook — they never show a shell prompt, and their cwd
+/// chip is seeded statically from the spawn directory.
+fn build_command(
+    command: Option<String>,
+    argv: Option<Vec<String>>,
+    cwd: Option<String>,
+) -> CommandBuilder {
+    if let Some(direct) = argv.as_deref().and_then(try_direct_command) {
+        return apply_pane_env(direct, cwd);
+    }
+
     let shell = default_shell();
     let mut cmd = CommandBuilder::new(&shell);
 
@@ -296,20 +379,7 @@ fn build_command(command: Option<String>, cwd: Option<String>) -> CommandBuilder
         }
     }
 
-    let dir = cwd
-        .filter(|d| std::path::Path::new(d).is_dir())
-        .or_else(|| dirs::home_dir().map(|h| h.to_string_lossy().into_owned()));
-    if let Some(dir) = dir {
-        cmd.cwd(dir);
-    }
-    cmd.env("TERM", "xterm-256color");
-    cmd.env("COLORTERM", "truecolor");
-    // Fresh PATH from the registry: CLIs installed after loomux (or its
-    // parent terminal) started must still be findable in new panes.
-    if let Some(path) = crate::winpath::fresh_path() {
-        cmd.env("PATH", path);
-    }
-    cmd
+    apply_pane_env(cmd, cwd)
 }
 
 #[tauri::command]
@@ -320,6 +390,10 @@ pub fn spawn_pty(
     rows: u16,
     cwd: Option<String>,
     command: Option<String>,
+    // Structured agent invocation (program + args). When present and its
+    // program resolves to a native executable, the pane spawns it directly as
+    // the ConPTY child instead of wrapping `command` in a shell (issue #78).
+    argv: Option<Vec<String>>,
 ) -> Result<u32, String> {
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -331,7 +405,7 @@ pub fn spawn_pty(
         })
         .map_err(|e| e.to_string())?;
 
-    let cmd = build_command(command, cwd);
+    let cmd = build_command(command, argv, cwd);
     let mut child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
     drop(pair.slave);
 
@@ -646,6 +720,98 @@ mod tests {
             parse_head("a1b2c3d4e5f6\n").as_deref(),
             Some("a1b2c3d")
         );
+    }
+
+    /// Program stored as argv[0] of a `CommandBuilder`, for assertions.
+    fn prog(cmd: &CommandBuilder) -> String {
+        cmd.get_argv()[0].to_string_lossy().into_owned()
+    }
+
+    /// Serializes the two tests that mutate the process-global
+    /// `LOOMUX_NO_DIRECT_SPAWN` so they can't race each other's reads.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// The whole direct-vs-shell decision (issue #78), sequenced in one test so
+    /// the escape-hatch env mutation can't race sibling cases run in parallel.
+    #[test]
+    fn direct_spawn_selection() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let exe = tmp.path().join(if cfg!(windows) { "agent.exe" } else { "agent" });
+        std::fs::write(&exe, b"x").unwrap();
+        let exe_str = exe.to_string_lossy().into_owned();
+
+        // Native executable + structured argv → spawned DIRECTLY: the child is
+        // the agent, not a shell, and its flags are passed verbatim as argv.
+        let direct = build_command(
+            Some("agent --model opus".into()),
+            Some(vec![exe_str.clone(), "--model".into(), "opus".into()]),
+            None,
+        );
+        assert_eq!(prog(&direct), exe_str, "argv[0] must be the resolved agent exe");
+        let av = direct.get_argv();
+        assert_eq!(av[1], "--model");
+        assert_eq!(av[2], "opus");
+        assert!(
+            !prog(&direct).contains("pwsh") && !prog(&direct).contains("sh"),
+            "a direct spawn must not go through a shell"
+        );
+
+        // No argv → shell wrapper runs the command string (plain/custom panes).
+        let wrapped = build_command(Some("claude --x".into()), None, None);
+        assert!(
+            wrapped.get_argv().iter().any(|a| a == "claude --x"),
+            "the command string must be handed to the shell, got {:?}",
+            wrapped.get_argv()
+        );
+
+        // Escape hatch: LOOMUX_NO_DIRECT_SPAWN forces the wrapper back on even
+        // for a resolvable native exe — the one-env-var rollback.
+        std::env::set_var("LOOMUX_NO_DIRECT_SPAWN", "1");
+        let hatched = build_command(
+            Some("agent --model opus".into()),
+            Some(vec![exe_str.clone(), "--model".into(), "opus".into()]),
+            None,
+        );
+        std::env::remove_var("LOOMUX_NO_DIRECT_SPAWN");
+        assert!(
+            hatched.get_argv().iter().any(|a| a == "agent --model opus"),
+            "escape hatch must fall back to the shell string, got {:?}",
+            hatched.get_argv()
+        );
+
+        // A .cmd/.ps1 shim can't be CreateProcess'd directly → shell fallback.
+        #[cfg(windows)]
+        {
+            let shim = tmp.path().join("agent.cmd");
+            std::fs::write(&shim, b"@echo off").unwrap();
+            let fell_back = build_command(
+                Some("shimline --x".into()),
+                Some(vec![shim.to_string_lossy().into_owned(), "--x".into()]),
+                None,
+            );
+            assert!(
+                fell_back.get_argv().iter().any(|a| a == "shimline --x"),
+                "a shim must keep the shell wrapper, got {:?}",
+                fell_back.get_argv()
+            );
+        }
+    }
+
+    #[test]
+    fn escape_hatch_parsing() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("LOOMUX_NO_DIRECT_SPAWN");
+        assert!(!direct_spawn_disabled(), "unset → direct spawn enabled");
+        for on in ["1", "true", "TRUE", "yes", "on"] {
+            std::env::set_var("LOOMUX_NO_DIRECT_SPAWN", on);
+            assert!(direct_spawn_disabled(), "{on:?} must disable direct spawn");
+        }
+        for off in ["", "0", "false", "False"] {
+            std::env::set_var("LOOMUX_NO_DIRECT_SPAWN", off);
+            assert!(!direct_spawn_disabled(), "{off:?} must leave direct spawn on");
+        }
+        std::env::remove_var("LOOMUX_NO_DIRECT_SPAWN");
     }
 
     #[test]

@@ -72,8 +72,10 @@ job is never allowed to fail a spawn.
   has had time to fork, so its subtree is captured — but a grandchild born in
   the microscopic window between spawn and assignment would escape. This is
   best-effort by construction and no worse than today. Phase **W2** (direct-CLI
-  spawn) removes the intermediate wrapper shell, making the agent itself the
-  enrolled child so *its* children are captured from birth.
+  spawn, now landed — see the "Pane process model" section of
+  [orchestration.md](orchestration.md)) removed the intermediate wrapper shell,
+  so for agent panes the enrolled child is the agent itself and *its* children
+  are captured from birth.
 - **loomux inside a job (Windows Terminal, CI).** Windows 8+ allows a process to
   belong to multiple (nested) jobs, so creating a per-pane job for a child of a
   loomux that is itself in a job just nests — no breakaway needed. The Win10

@@ -15,6 +15,10 @@ export interface SpawnOptions {
   cwd?: string;
   /** Command line run through the default shell; omit for a plain shell. */
   command?: string;
+  /** Structured agent invocation (program + args). When present and its program
+   *  resolves to a native executable, the backend spawns it directly as the pty
+   *  child — no wrapper shell (issue #78) — falling back to `command` otherwise. */
+  argv?: string[];
 }
 
 export interface SessionInfo {
