@@ -11,9 +11,10 @@ use loomux_lib::orchestration::{
     add_trusted_folder, bracketed_paste, cli_ready, create_orchestration_group, hold_until_quiet,
     idle_should_kill, max_agents_notice,
     normalize_remote_web_base, parse_audit_lines, parse_session_cost, prompt_wait_detected,
-    resolve_ref_url, rotate_audit_if_needed, spawn_rate_exceeded, strip_ansi, PLANNER_READONLY_NOTE,
-    watchdog_should_notify, worktree_cleanup_targets, AttentionItem, Caller, Guardrails,
-    OrchRegistry, Role, TaskPatch, UsageSnapshot,
+    resolve_ref_url, rotate_audit_if_needed, sanitize_attachment_ext, spawn_rate_exceeded,
+    strip_ansi, watchdog_should_notify, worktree_cleanup_targets, AttentionItem, Caller,
+    Guardrails, OrchRegistry, Role, TaskPatch, UsageSnapshot, MAX_ATTACHMENT_BYTES,
+    PLANNER_READONLY_NOTE,
 };
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -3019,6 +3020,97 @@ fn steering_targets_the_orchestrator_and_is_audited_under_its_group() {
     assert!(
         reg.audit_log(&b.id).iter().all(|e| e.action != "prompt-suppressed-paused"),
         "a steer to group A must not touch group B"
+    );
+}
+
+// ---------- #72: steering-strip image attachments ----------
+
+#[test]
+fn sanitize_attachment_ext_allows_only_vetted_image_types() {
+    // Case- and dot-insensitive; jpeg folds to jpg; everything else is refused.
+    assert_eq!(sanitize_attachment_ext("png"), Some("png"));
+    assert_eq!(sanitize_attachment_ext(".PNG"), Some("png"));
+    assert_eq!(sanitize_attachment_ext("JPEG"), Some("jpg"));
+    assert_eq!(sanitize_attachment_ext("jpg"), Some("jpg"));
+    assert_eq!(sanitize_attachment_ext("webp"), Some("webp"));
+    assert_eq!(sanitize_attachment_ext("gif"), Some("gif"));
+    assert_eq!(sanitize_attachment_ext("bmp"), Some("bmp"));
+    // Path-traversal / executable / script extensions are rejected outright.
+    assert_eq!(sanitize_attachment_ext("exe"), None);
+    assert_eq!(sanitize_attachment_ext("svg"), None);
+    assert_eq!(sanitize_attachment_ext("../etc/passwd"), None);
+    assert_eq!(sanitize_attachment_ext(""), None);
+}
+
+#[test]
+fn save_attachment_writes_bytes_verbatim_under_the_group_dir() {
+    let (reg, dir) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    // A tiny "PNG" — bytes are written as-is, never decoded, so any payload works.
+    let bytes = [0x89u8, b'P', b'N', b'G', 1, 2, 3, 0, 255];
+    let path = reg.save_attachment(&g.id, "png", &bytes).unwrap();
+    let p = Path::new(&path);
+    assert!(p.is_file(), "the attachment file must exist");
+    assert_eq!(fs::read(p).unwrap(), bytes, "bytes must be stored verbatim");
+    // It lives under <root>/<group>/attachments/ and carries the .png extension.
+    assert_eq!(p.extension().and_then(|e| e.to_str()), Some("png"));
+    let attach_dir = dir.path().join(&g.id).join("attachments");
+    assert!(p.starts_with(&attach_dir), "path {p:?} must be under {attach_dir:?}");
+    // The save is audited so there's a human-attributed trail of what was sent.
+    assert!(
+        reg.audit_log(&g.id).iter().any(|e| e.action == "attachment-save" && e.actor == "human"),
+        "the save must be audited under the human actor",
+    );
+}
+
+#[test]
+fn save_attachment_rejects_bad_type_empty_and_oversize() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    // Unsupported extension.
+    assert!(reg.save_attachment(&g.id, "exe", &[1, 2, 3]).unwrap_err().contains("unsupported"));
+    // Empty payload.
+    assert!(reg.save_attachment(&g.id, "png", &[]).unwrap_err().contains("empty"));
+    // One byte past the cap is refused (and nothing is written).
+    let huge = vec![0u8; MAX_ATTACHMENT_BYTES + 1];
+    assert!(reg.save_attachment(&g.id, "png", &huge).unwrap_err().contains("too large"));
+    // Exactly at the cap is accepted.
+    let at_cap = vec![0u8; MAX_ATTACHMENT_BYTES];
+    assert!(reg.save_attachment(&g.id, "png", &at_cap).is_ok());
+}
+
+#[test]
+fn save_attachment_gives_each_image_a_distinct_path_in_a_burst() {
+    // A multi-image paste saves several files back-to-back (possibly within one
+    // millisecond); the per-process sequence must keep their names unique so one
+    // image never clobbers another.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let mut paths = std::collections::HashSet::new();
+    for _ in 0..20 {
+        let p = reg.save_attachment(&g.id, "png", &[7u8]).unwrap();
+        assert!(paths.insert(p.clone()), "duplicate attachment path: {p:?}");
+    }
+    assert_eq!(paths.len(), 20);
+}
+
+#[test]
+fn end_group_sweeps_the_attachments_scratch_dir() {
+    let (reg, dir) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    // A durable file (state) and an attachment: teardown reclaims the scratch
+    // dir but leaves the rest of the group state alone.
+    reg.set_state(&g.id, "{\"k\":1}").unwrap();
+    let att = reg.save_attachment(&g.id, "png", &[1, 2, 3]).unwrap();
+    let attach_dir = dir.path().join(&g.id).join("attachments");
+    assert!(Path::new(&att).is_file() && attach_dir.is_dir());
+
+    reg.end_group(&g.id, false).unwrap();
+    assert!(!attach_dir.exists(), "attachments dir must be swept on group end");
+    assert!(
+        dir.path().join(&g.id).join("state.json").is_file(),
+        "non-attachment group state must survive teardown",
     );
 }
 

@@ -495,6 +495,65 @@ audited only under its own group (isolation). Hold-guard tests cover the loop wi
 The live paste/Enter behavior against a real CLI is validated by hand (no real PTY in test
 mode), consistent with the rest of `deliver_prompt`.
 
+## Image attachments in the steering strip (#72)
+
+The human often wants to hand the orchestrator a screenshot ("this button is misaligned",
+"here's the stack trace"). A CLI can't take binary on a typed prompt, but the agent CLIs we
+drive — **Claude Code** and **GitHub Copilot CLI** — both read image **files from paths** given
+in the prompt text. So the strip turns a pasted/attached image into a file-on-disk plus a text
+reference, and the existing steer path carries it the rest of the way unchanged.
+
+*Copilot's equivalent (verified).* Claude Code reads an absolute image path mentioned in the
+prompt via its file tools. GitHub Copilot CLI documents the same capability with a native
+`@<path>` mention (["Using GitHub Copilot CLI"](https://docs.github.com/en/copilot/how-tos/copilot-cli/use-copilot-cli/overview);
+direct clipboard paste is still only a feature request — github/copilot-cli#363, #1276), and
+its agent likewise opens a clearly-labelled absolute path with its read tools. We therefore emit
+a plain, unambiguous `Attached image: <absolute path>` line that both agents act on, rather than
+branching the wire format per CLI; the path is what does the work in either case, and the
+save-to-file + reference approach is CLI-agnostic and degrades gracefully (worst case the human
+sees the path text).
+
+- *Save, don't decode.* `Ctrl+V` of a screenshot (or the paperclip → native file picker) hands
+  the frontend a browser `Blob`. `pane.ts` base64-encodes the raw bytes and calls the
+  `orch_save_attachment` command, which decodes and writes them **verbatim** to
+  `<group state dir>/attachments/<ms>-<seq>.<ext>` via `OrchRegistry::save_attachment` —
+  returning the absolute path. We never decode the image (no image crate, and deliberately no
+  `getrandom`-pulling uuid crate — banned on Windows per the build notes); the `<ms>-<seq>`
+  name is wall-clock ms plus a process-local `AtomicU32` so a same-millisecond multi-paste
+  burst can't collide. base64 over IPC mirrors the OSC 52 clipboard bridge and survives any
+  webview that won't pass raw bytes through `invoke`.
+- *Reference the agent will read.* On submit, `composeSteerText(draft, paths)` appends one
+  `Attached image: <absolute path>` line per queued image after the human's typed text, and the
+  whole thing goes through `orch_steer` exactly like any other steer. A message may be
+  images-only (no typed text). The path form is what prompts the agent to open the file.
+- *Chips with remove, before send.* Each queued image shows a thumbnail chip (a `blob:` object
+  URL) with an `✕` in the strip; removing one revokes its object URL. Object URLs are also
+  revoked on successful send and on pane dispose, so the webview never leaks them. The chip row
+  collapses to zero height when empty (`:empty { display: none }`), so the strip keeps its
+  baseline height — attaching an image is a deliberate, human-initiated growth, not the toggled
+  overlay resize the strip is otherwise careful to avoid.
+- *Limits + feedback.* A single image is capped at `MAX_ATTACHMENT_BYTES` (10 MiB) and a
+  message at `MAX_ATTACHMENTS` (8); the extension is restricted to a vetted image allowlist
+  (`sanitize_attachment_ext`: png/jpg/jpeg→jpg/gif/webp/bmp) so an attacker-influenced clipboard
+  can't steer the saved filename (path traversal, executable extensions). Both limits and the
+  type check are enforced **frontend** (immediate toast via `checkAttachment`) *and* **backend**
+  (the real backstop, rejecting oversize *before* the base64 decode balloons memory — same
+  discipline as the clipboard cap). The save is audited (`attachment-save`, actor `human`).
+- *Cleanup policy.* Attachments are a per-group **scratch** dir with a deliberately cheap
+  policy: nothing is deleted per-image (a removed chip or an abandoned draft just leaves its
+  file), and the whole `attachments/` subdir is swept in `end_group` alongside the worktree
+  teardown. Group state (`state.json`, audit log) lives beside it and survives. This keeps the
+  hot path allocation-free and needs no reference counting; the cost is bounded by the size cap
+  × a session's paste count, reclaimed the moment the group ends.
+
+**Tests.** `save_attachment_*` integration tests cover verbatim write + path placement + audit,
+the type/empty/oversize rejections (including exactly-at-cap), same-millisecond name uniqueness,
+and that `end_group` sweeps the scratch dir while leaving durable state. `sanitize_attachment_ext`
+has its own allowlist test. Frontend `steer.test.ts` covers the pure strip logic —
+`checkAttachment` (type/size/count precedence), `composeSteerText` (path lines, images-only,
+empty no-op, trimming), reject messages, and `bytesToBase64` round-trips across the chunk
+boundary. The live paste-and-open against a real CLI is validated by hand.
+
 ## Plan agent + mixed agent types (#47, #4)
 
 Two related additions: a **planner** role, and **per-role** agent CLI + model.

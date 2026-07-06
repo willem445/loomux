@@ -206,6 +206,23 @@ const ECHO_ATTEMPTS: u32 = 3;
 /// Upper bound for `set_state` payloads.
 const MAX_STATE_BYTES: usize = 512 * 1024;
 
+/// Cap on a single steered image attachment (#72), in decoded bytes. Sized to
+/// comfortably hold a full-screen PNG screenshot while bounding the per-group
+/// `attachments/` scratch dir. The steering strip enforces the same limit and
+/// toasts on overflow; this is the backstop against a hostile/oversize IPC.
+pub const MAX_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
+
+/// Cap on the base64 payload the save-attachment command will decode. Rejecting
+/// oversize *before* decode keeps a giant string from ballooning memory — same
+/// discipline as the OSC 52 clipboard path. base64 is 4 bytes per 3 input, plus
+/// slack for padding/whitespace.
+pub const MAX_ATTACHMENT_B64_LEN: usize = MAX_ATTACHMENT_BYTES / 3 * 4 + 16;
+
+/// Monotonic tiebreaker so two images pasted inside the same millisecond get
+/// distinct filenames without pulling in a randomness/uuid crate (the Windows
+/// `getrandom` backends are banned here — see the build notes).
+static ATTACH_SEQ: AtomicU32 = AtomicU32::new(0);
+
 // Copilot session tracking: unlike Claude, copilot can't be handed a session
 // id up front — it mints one and writes `~/.copilot/session-state/<id>/` a
 // few seconds into boot. After spawning a copilot pane we poll for the new
@@ -882,6 +899,23 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Map a caller-supplied image extension to a vetted one, rejecting anything
+/// outside the allowlist (#72). A pasted image's extension is attacker-influenced
+/// (it rides in from the browser clipboard), so we never echo it into a filename
+/// verbatim: only these known raster/image types are accepted, which both blocks
+/// path-traversal / executable extensions and matches what the agent CLIs open.
+/// Pure and `pub` so the mapping is unit-testable.
+pub fn sanitize_attachment_ext(ext: &str) -> Option<&'static str> {
+    match ext.trim().trim_start_matches('.').to_ascii_lowercase().as_str() {
+        "png" => Some("png"),
+        "jpg" | "jpeg" => Some("jpg"),
+        "gif" => Some("gif"),
+        "webp" => Some("webp"),
+        "bmp" => Some("bmp"),
+        _ => None,
+    }
+}
+
 /// Should prompt delivery keep holding for the human to stop typing? (#43,
 /// option A). Returns true to keep waiting, false to proceed. Pure so the
 /// hold/deadline decision is unit-testable without a live PTY.
@@ -1283,6 +1317,45 @@ impl OrchRegistry {
 
     fn group_dir(&self, group: &str) -> PathBuf {
         self.root.join(group)
+    }
+
+    /// Scratch dir holding images pasted/attached into the steering strip (#72).
+    /// A subdir of the group state dir, so it's naturally per-group and swept
+    /// on group end alongside the worktrees.
+    fn attachments_dir(&self, group: &str) -> PathBuf {
+        self.group_dir(group).join("attachments")
+    }
+
+    /// Persist a steered image to the group's `attachments/` scratch dir and
+    /// return its absolute path (#72). The steering strip can't hand binary to
+    /// a CLI prompt, but Claude Code and Copilot both *read image files from
+    /// paths* — so a pasted screenshot is written here and the steer text gains
+    /// an "Attached image: <path>" line pointing at it. Bytes are written
+    /// verbatim: the image arrives as a browser Blob and we never decode it
+    /// (no image crate, no `getrandom` deps) — only size and extension are
+    /// validated. Files are reclaimed when the group ends (see `end_group`).
+    pub fn save_attachment(&self, group: &str, ext: &str, bytes: &[u8]) -> Result<PathBuf, String> {
+        if bytes.is_empty() {
+            return Err("empty attachment".into());
+        }
+        if bytes.len() > MAX_ATTACHMENT_BYTES {
+            return Err(format!(
+                "attachment too large ({} bytes, max {MAX_ATTACHMENT_BYTES})",
+                bytes.len()
+            ));
+        }
+        let ext = sanitize_attachment_ext(ext)
+            .ok_or_else(|| format!("unsupported attachment type: {ext:?}"))?;
+        let dir = self.attachments_dir(group);
+        fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        // `<ms>-<seq>.<ext>`: wall-clock time keeps names sortable/legible while
+        // the process-local sequence disambiguates a same-millisecond burst.
+        let name = format!("{}-{}.{ext}", now_ms(), ATTACH_SEQ.fetch_add(1, Ordering::Relaxed));
+        let path = dir.join(name);
+        fs::write(&path, bytes).map_err(|e| e.to_string())?;
+        self.audit(group, "human", "attachment-save",
+            json!({ "path": path.display().to_string(), "bytes": bytes.len() }));
+        Ok(path)
     }
 
     // ---------- audit ----------
@@ -3049,6 +3122,14 @@ impl OrchRegistry {
             }
         }
 
+        // Sweep the steering-strip image attachments (#72): they're only useful
+        // while the group's agents are live, so teardown reclaims the scratch
+        // dir alongside the worktrees. Best-effort — a leftover screenshot must
+        // never block a group from ending. This includes any that were queued
+        // but never sent (removed chips / abandoned drafts), so the cheap
+        // policy is simply "cleaned up on group end", no per-image bookkeeping.
+        let _ = fs::remove_dir_all(self.attachments_dir(group));
+
         // Total teardown: drop any pause (in-memory + marker) so a future
         // relaunch on this repo starts clean rather than silently paused.
         if self.paused.lock_safe().remove(group) {
@@ -4643,6 +4724,32 @@ pub fn orch_steer(
     text: String,
 ) -> Result<(), String> {
     reg.steer_orchestrator(&group_id, &text)
+}
+
+/// Save an image pasted/attached into the steering strip and return its
+/// absolute path (#72). The image rides over IPC as base64 (`data_b64`) — same
+/// wire form as the OSC 52 clipboard bridge — so it survives any webview that
+/// won't hand raw bytes through `invoke`. The path is written into the steer
+/// text as an "Attached image: <path>" line by the frontend before sending.
+#[tauri::command]
+pub fn orch_save_attachment(
+    reg: tauri::State<Arc<OrchRegistry>>,
+    group_id: String,
+    ext: String,
+    data_b64: String,
+) -> Result<String, String> {
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+    // Reject an oversize payload before decoding — see MAX_ATTACHMENT_B64_LEN.
+    if data_b64.len() > MAX_ATTACHMENT_B64_LEN {
+        return Err(format!(
+            "attachment too large (max {MAX_ATTACHMENT_BYTES} bytes)"
+        ));
+    }
+    let bytes = B64
+        .decode(data_b64.as_bytes())
+        .map_err(|e| format!("invalid attachment encoding: {e}"))?;
+    let path = reg.save_attachment(&group_id, &ext, &bytes)?;
+    Ok(path.to_string_lossy().to_string())
 }
 
 #[tauri::command]
