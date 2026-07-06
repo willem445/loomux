@@ -135,7 +135,7 @@ export class GroupView {
     const maxRow = el("div", "group-maxrow");
     const maxCtl = el("div", "group-max");
     maxCtl.title =
-      "Max live workers + reviewers (the orchestrator is exempt). Lowering it below " +
+      "Max live workers + reviewers + planners (the orchestrator is exempt). Lowering it below " +
       "the current live count never kills anyone — new spawns are blocked until agents finish.";
     maxCtl.append(el("span", "group-max-label", "Max live agents"));
     this.maxDecBtn = el("button", "group-max-step", "−") as HTMLButtonElement;
@@ -255,9 +255,11 @@ export class GroupView {
     void this.applyMax(cur + delta);
   }
 
-  /** Commit a new cap. The backend bounds-checks, persists, audits, and tells
-   *  the orchestrator to re-plan; on rejection we surface the reason inline and
-   *  the poll restores the input to the real value. */
+  /** Commit a new cap. The backend bounds-checks, persists, and audits each
+   *  click immediately, then debounces a single re-plan notice to the
+   *  orchestrator so rapid stepping is one prompt, not many (#79); on rejection
+   *  we surface the reason inline and the poll restores the input to the real
+   *  value. */
   private async applyMax(n: number): Promise<void> {
     this.maxErrEl.textContent = "";
     if (!Number.isFinite(n)) {
@@ -439,7 +441,7 @@ export class GroupView {
       this.maxNoteEl.textContent = `cap below ${s.live_delegates} live — no one is killed; new spawns wait for attrition`;
       this.maxNoteEl.classList.add("warn");
     } else {
-      this.maxNoteEl.textContent = "workers + reviewers cap; the orchestrator is exempt";
+      this.maxNoteEl.textContent = "workers + reviewers + planners cap; the orchestrator is exempt";
       this.maxNoteEl.classList.remove("warn");
     }
   }

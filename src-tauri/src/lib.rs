@@ -53,6 +53,7 @@ pub fn run() {
             orchestration::start_idle_reaper(reg.clone());
             orchestration::start_watchdog(reg.clone());
             orchestration::start_attention(reg.clone());
+            orchestration::start_max_notice_flusher(reg.clone());
             std::thread::spawn(move || orchestration::mcp::serve(reg));
             Ok(())
         })
