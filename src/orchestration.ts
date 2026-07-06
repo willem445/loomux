@@ -130,6 +130,18 @@ export function initOrchestration(grid: Grid, paneEvents: PaneEvents): void {
       pane.focus();
     }
   });
+  // The orchestrator (or a human rename echoed back) renamed an agent pane
+  // (#95r): retitle it. The backend only emits renames it accepted under the
+  // precedence ladder, so a human-owned title never arrives back as an
+  // orchestrator override — no frontend guard needed. setName is idempotent.
+  void listen<{ agent_id: string; pty_id: number | null; name: string }>(
+    "orch-rename",
+    ({ payload }) => {
+      if (payload.pty_id === null) return;
+      const pane = grid.findByPtyId(payload.pty_id);
+      if (pane) pane.setName(payload.name);
+    }
+  );
   // Attention routing: the backend pushes the full current set of panes that
   // need the human every scan; badge each pane by its pty (absent = clear).
   // Idempotent per pane, so re-emits every few seconds are cheap. Applies to

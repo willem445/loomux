@@ -67,6 +67,7 @@ only gatekeeps final review + merge.
 | `list_agents()` | ✓ | ✓ |
 | `get_output(agent_id, lines)` | ✓ | ✗ |
 | `kill_agent(agent_id)` / `focus_agent(agent_id)` | ✓ | ✗ |
+| `rename_agent(agent_id, name)` | ✓ | ✗ |
 | `get_state()` | ✓ | ✓ |
 | `set_state(state)` | ✓ | ✗ |
 | `group_usage()` | ✓ | ✗ |
@@ -80,6 +81,26 @@ reviewers + planners), CLI + model pinned per role (`{role}_cli` / `{role}_model
 `kind` is `worker` (default), `reviewer`, or `planner`. A **planner** explores the
 codebase read-only and writes a structured implementation plan as a GitHub issue comment,
 then reports and exits; it never writes code, branches, worktrees, or PRs.
+
+### Pane naming & rename precedence (#95r)
+
+A pane's name should say what the agent is *doing*; failing that, it must at least agree
+with the pane's `W <seq>` badge (issue #75), never disagree with it. Two rules:
+
+- **Default name = the minted id.** A spawn with no meaningful name (initial workers, or
+  any `spawn_agent` with a blank `name`) derives its title from the id `spawn_agent_ex`
+  mints — `w-2` → `worker 2` — so title, roster row, and badge all read the same seq. (The
+  old per-launch `worker N` counter drifted from the global seq, producing the reported
+  "worker 1" pane wearing a "W 2" badge.)
+- **`rename_agent(agent_id, name)`** (orchestrator-only, group-scoped, alive-only, audited)
+  lets the orchestrator retitle a pane to its task. Names carry a **source tier** —
+  `human` > `orchestrator` > `default` (`NameSource`) — and a rename applies only from an
+  equal-or-higher tier. So the orchestrator can relabel an id-default (or its own earlier
+  name), but a human's in-pane rename (F2/double-click, synced to the backend via the
+  `orch_agent_renamed` command at the `human` tier) is never clobbered by a later
+  `rename_agent`. Every accepted rename updates the roster and emits `orch-rename` so the
+  open pane's title follows; the backend only emits renames it accepted, so the frontend
+  needs no precedence guard of its own.
 
 ## Launcher UX
 

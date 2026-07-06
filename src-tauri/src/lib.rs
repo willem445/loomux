@@ -91,6 +91,7 @@ pub fn run() {
             gitwatch::git_unwatch,
             orchestration::create_orchestration,
             orchestration::bind_agent,
+            orchestration::orch_agent_renamed,
             orchestration::orch_session_roles,
             orchestration::resume_orch_session,
             orchestration::orch_tasks,
