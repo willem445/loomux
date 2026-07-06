@@ -717,8 +717,17 @@ Two related additions: a **planner** role, and **per-role** agent CLI + model.
   those remain the orchestrator's / human's call via `get_output`.
 - `gh` CLI must be installed/authed for the issue/PR workflow; templates degrade to
   local-only work when it's missing.
-- Registry is in-memory: closing loomux orphans no processes (kill_all) but live agents
-  don't survive; durable state does. Resuming respawns fresh sessions on the old state.
+- Registry is in-memory: closing loomux tears down agent processes (kill_all) but live
+  agents don't survive; durable state does. Resuming respawns fresh sessions on the old
+  state. On **Windows**, "tears down" is a hard guarantee only because each pane child is
+  enrolled in a kill-on-close **Job Object** — killing the pane closes the job and the
+  kernel reaps the whole descendant tree. Without it, `TerminateProcess` hits only the
+  direct child and descendants (wrapper→agent→bash/node) leak; the investigation for #78
+  found exactly that (orphaned wrappers with live agents, a squatting vite). See
+  [job-object-teardown.md](job-object-teardown.md). Unix needs no equivalent: the child
+  is a session leader owning the pty as its controlling terminal, so dropping the master
+  hangs up the terminal and the kernel delivers SIGHUP to the whole foreground process
+  group.
 - The compose strip (#43) makes steering collision-proof, but **direct** typing into the CLI
   box is only protected by the heuristic hold (A): a keystroke landing in the millisecond
   between the quiet-check and the paste, or a human who pauses mid-sentence past the 4s window,

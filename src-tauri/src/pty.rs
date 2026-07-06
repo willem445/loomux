@@ -19,6 +19,99 @@ use crate::obs::LockExt;
 /// enough for a few screens of TUI history without unbounded growth.
 const OUTPUT_RING_CAP: usize = 256 * 1024;
 
+/// Windows Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` (issue #78).
+///
+/// On Windows, terminating a process does NOT terminate its descendants, and
+/// ConPTY teardown only *best-effort* cascades — the investigation found dead
+/// panes leaving live agents + a squatting vite (issue #78 §5). Enrolling the
+/// spawned pane child in a kill-on-close job flips that to a guarantee: when
+/// the last handle to the job closes, the kernel terminates every process
+/// still in it — the pane's whole descendant tree.
+///
+/// `PtyHandle` owns exactly one of these, so dropping the handle (pane kill,
+/// `end_group`, `kill_all`, or a natural exit that removes it from the map)
+/// closes the job and reaps the subtree. Intentionally-surviving spawns —
+/// notably open-in-editor, which uses its own DETACHED `std::process` spawn and
+/// never goes through the pty — hold no job handle and are unaffected.
+#[cfg(target_os = "windows")]
+pub struct JobHandle(windows::Win32::Foundation::HANDLE);
+
+// The wrapped value is a plain owned kernel handle; the struct lives in the
+// PtyManager map behind a Mutex, so it must cross threads. Nothing aliases the
+// handle, so moving/sharing it is sound.
+#[cfg(target_os = "windows")]
+unsafe impl Send for JobHandle {}
+#[cfg(target_os = "windows")]
+unsafe impl Sync for JobHandle {}
+
+#[cfg(target_os = "windows")]
+impl Drop for JobHandle {
+    fn drop(&mut self) {
+        // Closing the last open handle to the job is what fires
+        // KILL_ON_JOB_CLOSE and tears the subtree down.
+        unsafe {
+            let _ = windows::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
+/// Create a kill-on-close Job Object and enroll process `pid` in it, returning
+/// the owning handle. Fail-soft: any failure returns `None` (the caller
+/// breadcrumbs and keeps today's behavior — never fail the spawn).
+///
+/// Note the assignment race: only children a process spawns *after* it joins a
+/// job inherit the job. We enroll the freshly-spawned pane child synchronously,
+/// before it has had time to fork, so its subtree is captured; a grandchild
+/// born in the microscopic window before assignment would escape. Direct-CLI
+/// spawn (issue #78 W2) removes the intermediate wrapper shell, making the
+/// agent itself the enrolled child. If loomux itself runs inside a job
+/// (Windows Terminal, CI), nested jobs handle this — allowed on Win8+, which
+/// the Win10 baseline satisfies.
+#[cfg(target_os = "windows")]
+pub fn assign_kill_on_close_job(pid: u32) -> Option<JobHandle> {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE};
+
+    unsafe {
+        // Anonymous job, default (null) security attributes.
+        let job = CreateJobObjectW(None, PCWSTR::null()).ok()?;
+
+        let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &info as *const _ as *const core::ffi::c_void,
+            core::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+        .is_err()
+        {
+            let _ = CloseHandle(job);
+            return None;
+        }
+
+        // Just enough rights to enroll the child. It's held alive by the
+        // caller's child/killer, so its PID can't recycle before this runs.
+        let Ok(proc) = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, false, pid) else {
+            let _ = CloseHandle(job);
+            return None;
+        };
+        let assigned = AssignProcessToJobObject(job, proc);
+        let _ = CloseHandle(proc);
+        if assigned.is_err() {
+            let _ = CloseHandle(job);
+            return None;
+        }
+        Some(JobHandle(job))
+    }
+}
+
 pub struct PtyHandle {
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
@@ -29,6 +122,12 @@ pub struct PtyHandle {
     /// orchestration's write_bytes does not touch it. Lets prompt delivery
     /// avoid blind-submitting text a human is mid-typing.
     user_input_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// Windows-only kill-on-close Job Object owning this pane's process
+    /// subtree (issue #78). Dropped when the handle leaves the map (kill,
+    /// exit, `kill_all`), which closes the job and reaps every descendant.
+    /// `None` when job creation failed (fail-soft) — pre-#78 behavior.
+    #[cfg(target_os = "windows")]
+    _job: Option<JobHandle>,
 }
 
 /// Ring of recent output plus a monotonic byte counter. The counter lets
@@ -236,6 +335,24 @@ pub fn spawn_pty(
     let mut child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
     drop(pair.slave);
 
+    // Windows: enroll the child in a kill-on-close Job Object so killing this
+    // pane reaps its whole descendant tree (issue #78). Fail-soft — a failure
+    // is breadcrumbed and the spawn proceeds with pre-#78 teardown behavior.
+    #[cfg(target_os = "windows")]
+    let job = match child.process_id() {
+        Some(pid) => {
+            let job = assign_kill_on_close_job(pid);
+            if job.is_none() {
+                crate::obs::breadcrumb("pty-job-fail", &format!("pid={pid}"));
+            }
+            job
+        }
+        None => {
+            crate::obs::breadcrumb("pty-job-fail", "no-pid");
+            None
+        }
+    };
+
     let killer = child.clone_killer();
     let writer = pair.master.take_writer().map_err(|e| e.to_string())?;
     let mut reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
@@ -250,6 +367,8 @@ pub fn spawn_pty(
             killer,
             output: output.clone(),
             user_input_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(target_os = "windows")]
+            _job: job,
         },
     );
 
