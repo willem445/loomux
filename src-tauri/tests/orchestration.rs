@@ -13,8 +13,9 @@ use loomux_lib::orchestration::{
     idle_should_kill, max_agents_notice,
     normalize_remote_web_base, parse_audit_lines, parse_session_cost, prompt_wait_detected,
     resolve_ref_url, rotate_audit_if_needed, sanitize_attachment_ext, should_confirm_copilot_autopilot,
-    should_flush_before_paste, single_pane_autopilot_flags, spawn_rate_exceeded, spawn_request_expired,
-    strip_ansi, submit_confirmed, submit_sequence, watchdog_should_notify, worktree_cleanup_targets,
+    should_flush_before_paste, should_notify_unconfirmed, single_pane_autopilot_flags,
+    spawn_rate_exceeded, spawn_request_expired, strip_ansi, submit_confirmed, submit_sequence,
+    unconfirmed_delivery_notice, watchdog_should_notify, worktree_cleanup_targets,
     AttentionItem, Caller, Delivery, Guardrails, NameSource, OrchRegistry, Role, TaskPatch,
     UsageSnapshot, CLAUDE_UNATTENDED_ALLOW, COPILOT_AUTOPILOT_CONFIRM_KEYS,
     COPILOT_GROUP_AUTOPILOT_FLAGS, COPILOT_UNATTENDED_FLAGS, MAX_ATTACHMENT_BYTES,
@@ -640,6 +641,31 @@ fn submit_never_confirmed_when_quiet_was_not_reached() {
     assert!(!submit_confirmed(false, 1000, 100_000));
     assert!(!submit_confirmed(false, 1000, 1024));
     assert!(!submit_confirmed(false, 1000, 1000));
+}
+
+#[test]
+fn unconfirmed_notice_fires_only_for_a_stranded_worker_delivery() {
+    // The one case that notifies: a delivery to a non-orchestrator agent whose
+    // submit went unconfirmed — the prompt may be sitting unsubmitted in the box.
+    assert!(should_notify_unconfirmed(false, false));
+    // Confirmed submit: the prompt landed, nothing to chase.
+    assert!(!should_notify_unconfirmed(false, true));
+    // Target IS the orchestrator: a notice to it would itself be a delivery to
+    // the orchestrator — an endless loop. Never notify, confirmed or not; those
+    // rely on #99's stranded-text flush on the next delivery instead.
+    assert!(!should_notify_unconfirmed(true, false));
+    assert!(!should_notify_unconfirmed(true, true));
+}
+
+#[test]
+fn unconfirmed_notice_text_names_the_agent_and_the_recovery_move() {
+    let msg = unconfirmed_delivery_notice("w-3");
+    assert!(msg.starts_with("[loomux] "), "notice is a loomux system message: {msg}");
+    assert!(msg.contains("w-3"), "notice must name the stranded agent: {msg}");
+    assert!(msg.contains("unconfirmed"), "notice must state the condition: {msg}");
+    // Points the orchestrator at the recovery move from the template.
+    assert!(msg.contains("get_output"), "notice must point at reading the pane: {msg}");
+    assert!(msg.contains("re-send"), "notice must point at re-sending: {msg}");
 }
 
 #[test]
@@ -1480,6 +1506,12 @@ fn instruction_files_rendered_with_group_facts() {
         "orchestrator instructions must document rename_agent");
     assert!(orch.contains("Name the pane for its work"),
         "orchestrator instructions must guide renaming a worker to its task");
+    // The unconfirmed-delivery recovery guidance is rendered (#103): read the
+    // pane back, re-send once, and flag the human on a repeat.
+    assert!(orch.contains("delivery to <id> unconfirmed"),
+        "orchestrator instructions must explain the unconfirmed-delivery notice");
+    assert!(orch.contains("flag the human"),
+        "unconfirmed-delivery guidance must escalate a repeat to the human");
     assert!(!orch.contains("{{"), "no unrendered placeholders");
     let worker = fs::read_to_string(dir.join("worker.md")).unwrap();
     assert!(worker.contains("Never merge"), "merge gatekeeping must be in worker instructions");
@@ -3794,6 +3826,60 @@ fn steering_targets_the_orchestrator_and_is_audited_under_its_group() {
     assert!(
         reg.audit_log(&b.id).iter().all(|e| e.action != "prompt-suppressed-paused"),
         "a steer to group A must not touch group B"
+    );
+}
+
+#[test]
+fn unconfirmed_delivery_notifies_the_orchestrator_and_suppresses_the_exceptions() {
+    // #103: the emission/suppression gate, driven directly (the live emission
+    // point sits in the delivery thread, which test mode never reaches without a
+    // real PTY). One notice per call — the thread invokes this exactly once per
+    // delivery, past all the submit retries, so retries never multiply it.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+
+    let notices = |reg: &OrchRegistry| {
+        reg.audit_log(&g.id)
+            .into_iter()
+            .filter(|e| e.action == "delivery-unconfirmed-notice")
+            .collect::<Vec<_>>()
+    };
+
+    // Confirmed delivery to the worker: the prompt landed, nothing to chase.
+    reg.notify_unconfirmed_delivery(&g.id, &w.id, false, true);
+    assert!(notices(&reg).is_empty(), "a confirmed delivery must not notify");
+
+    // Unconfirmed delivery TO the orchestrator: a notice about it would itself be
+    // a delivery to the orchestrator — an endless loop. Suppressed.
+    reg.notify_unconfirmed_delivery(&g.id, &orch.id, true, false);
+    assert!(notices(&reg).is_empty(), "an unconfirmed delivery to the orchestrator must not notify");
+
+    // The real case: an unconfirmed delivery to the worker → exactly one notice,
+    // audited to loomux, naming the stranded agent.
+    reg.notify_unconfirmed_delivery(&g.id, &w.id, false, false);
+    let after = notices(&reg);
+    assert_eq!(after.len(), 1, "an unconfirmed worker delivery notifies exactly once");
+    assert_eq!(after[0].actor, "loomux", "the notice is a loomux system message");
+    assert_eq!(after[0].detail["to"], w.id, "the notice names the stranded worker");
+}
+
+#[test]
+fn unconfirmed_notice_is_suppressed_while_the_group_is_paused() {
+    // Paused groups suppress all pane delivery; the unconfirmed notice follows
+    // the same semantics as the watchdog nudge and must not spend the notice
+    // budget while paused.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    reg.pause_group(&g.id).unwrap();
+
+    reg.notify_unconfirmed_delivery(&g.id, &w.id, false, false);
+    assert!(
+        reg.audit_log(&g.id).iter().all(|e| e.action != "delivery-unconfirmed-notice"),
+        "a paused group must not raise the unconfirmed notice"
     );
 }
 
