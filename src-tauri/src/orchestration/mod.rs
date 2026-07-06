@@ -289,6 +289,40 @@ pub enum AgentStatus {
     Dead,
 }
 
+/// Who last set an agent's display name — the precedence ladder for the pane
+/// title / roster name (#95r). A rename applies only when its source ranks at
+/// least as high as whoever set the current name: `Human` > `Orchestrator` >
+/// `Default`. So the human's manual rename is never clobbered by the
+/// orchestrator's `rename_agent` or the id-derived default, while the
+/// orchestrator can still relabel an id-default (or its own earlier name).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NameSource {
+    /// Minted from the agent id at spawn ("worker 2" for `w-2`).
+    Default,
+    /// Chosen by the orchestrator (a `spawn_agent` name, or `rename_agent`).
+    Orchestrator,
+    /// Typed by the human into the pane title (F2 / double-click).
+    Human,
+}
+
+impl NameSource {
+    fn rank(self) -> u8 {
+        match self {
+            NameSource::Default => 0,
+            NameSource::Orchestrator => 1,
+            NameSource::Human => 2,
+        }
+    }
+    fn as_str(self) -> &'static str {
+        match self {
+            NameSource::Default => "default",
+            NameSource::Orchestrator => "orchestrator",
+            NameSource::Human => "human",
+        }
+    }
+}
+
 /// Which agent CLI a group runs. Each needs an adapter in
 /// `build_agent_command` + `write_mcp_config`; anything unknown falls back
 /// to Claude (explicitly, in `clamped`, never silently at spawn time).
@@ -631,6 +665,9 @@ pub struct AgentEntry {
     pub id: String,
     pub group: String,
     pub name: String,
+    /// Who set `name` — the precedence tier for renames (#95r). See
+    /// [`NameSource`] and [`OrchRegistry::rename_agent`].
+    pub name_source: NameSource,
     pub role: Role,
     pub token: String,
     pub status: AgentStatus,
@@ -3526,10 +3563,18 @@ impl OrchRegistry {
         let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
         let agent_id = format!("{}-{seq}", role.prefix());
         let token = new_token();
-        let display = {
+        // Name precedence (#95r): a caller-supplied name is the orchestrator's
+        // choice; an empty one means "no meaningful name", so we derive the
+        // default from the minted id — "worker 2" for `w-2` — which agrees with
+        // the pane's "W 2" badge (#75) and the roster id instead of the old
+        // per-launch "worker N" counter that drifted from the seq.
+        let (display, name_source) = {
             let n = name.trim();
-            let n = if n.is_empty() { agent_id.as_str() } else { n };
-            n.chars().take(40).collect::<String>()
+            if n.is_empty() {
+                (format!("{} {seq}", role.as_str()), NameSource::Default)
+            } else {
+                (n.chars().take(40).collect::<String>(), NameSource::Orchestrator)
+            }
         };
 
         // Workspace: dedicated worktree (branch of the same name) or the repo
@@ -3604,6 +3649,7 @@ impl OrchRegistry {
             id: agent_id.clone(),
             group: group_id.to_string(),
             name: display.clone(),
+            name_source,
             role,
             token: token.clone(),
             status: AgentStatus::Starting,
@@ -4029,6 +4075,50 @@ impl OrchRegistry {
             .map_err(|e| e.to_string())
     }
 
+    /// Rename an agent's pane title and durable roster entry, respecting the
+    /// name-source precedence ladder (#95r): the rename applies only when
+    /// `source` ranks at least as high as whoever set the current name, so a
+    /// human rename (highest) is never overwritten by the orchestrator's
+    /// `rename_agent` (middle) or the id-derived default (lowest); the
+    /// orchestrator can still relabel an id-default or its own earlier name.
+    /// Rejects a dead/unknown target. On success the pane title follows via an
+    /// `orch-rename` event, the roster is updated, the change is audited, and
+    /// the applied (trimmed/truncated) name is returned. Caller scopes the
+    /// target to its group (see the MCP `rename_agent` tool).
+    pub fn rename_agent(&self, agent_id: &str, name: &str, source: NameSource) -> Result<String, String> {
+        let name: String = name.trim().chars().take(40).collect();
+        if name.is_empty() {
+            return Err("name must not be empty".into());
+        }
+        let entry = {
+            let mut agents = self.agents.lock_safe();
+            let a = agents.get_mut(agent_id).ok_or("unknown agent")?;
+            if a.status == AgentStatus::Dead {
+                return Err("agent is not alive".into());
+            }
+            if source.rank() < a.name_source.rank() {
+                // Only the orchestrator-vs-human case reaches here in practice.
+                return Err(format!(
+                    "not overriding {agent_id}: its name \"{}\" was set by the human and takes precedence",
+                    a.name
+                ));
+            }
+            a.name = name.clone();
+            a.name_source = source;
+            a.clone()
+        };
+        self.persist_agent_record(&entry, "running");
+        if let Some(app) = self.app.lock_safe().clone() {
+            let _ = app.emit(
+                "orch-rename",
+                json!({ "agent_id": entry.id, "pty_id": entry.pty_id, "name": name }),
+            );
+        }
+        self.audit(&entry.group, "loomux", "agent-rename",
+            json!({ "agent": agent_id, "name": name, "source": source.as_str() }));
+        Ok(name)
+    }
+
     #[doc(hidden)] // pub for integration tests
     pub fn mark_dead(&self, agent_id: &str, exit_code: Option<u32>) -> Option<AgentEntry> {
         let mut agents = self.agents.lock_safe();
@@ -4389,6 +4479,10 @@ fn register_orchestrator_pane(
         id: agent_id.clone(),
         group: group.id.clone(),
         name: "orchestrator".into(),
+        // A stable, meaningful single-orchestrator label — treated as the
+        // id-default tier so it never blocks anything (the rename tool targets
+        // worker/reviewer panes, not the orchestrator).
+        name_source: NameSource::Default,
         role: Role::Orchestrator,
         token: token.clone(),
         status: AgentStatus::Starting,
@@ -4472,8 +4566,11 @@ fn register_orchestrator_pane(
                 baseline,
             );
         }
-        for i in 0..initial_workers.min(group2.guardrails.max_agents) {
-            if let Err(e) = reg2.spawn_agent(&group2.id, Role::Worker, &format!("worker {}", i + 1), "", false, None)
+        for _ in 0..initial_workers.min(group2.guardrails.max_agents) {
+            // Empty name → derived from the minted id ("worker 2" for `w-2`),
+            // so the pane title agrees with its "W 2" badge instead of the old
+            // per-launch counter that drifted from the seq (#95r).
+            if let Err(e) = reg2.spawn_agent(&group2.id, Role::Worker, "", "", false, None)
             {
                 reg2.audit(&group2.id, "loomux", "error",
                     json!({ "what": "initial worker spawn failed", "err": e }));
@@ -4582,6 +4679,20 @@ pub fn resume_recorded_session(
 #[tauri::command]
 pub fn bind_agent(reg: tauri::State<Arc<OrchRegistry>>, agent_id: String, pty_id: u32) -> Result<(), String> {
     reg.bind(&agent_id, pty_id)
+}
+
+/// The human renamed an agent pane in-place (F2 / double-click). Sync the
+/// backend so the roster name matches the pane title AND the rename is
+/// recorded at the highest precedence tier — an orchestrator `rename_agent`
+/// afterwards will not override it (#95r). Best-effort: the pane already shows
+/// the new name locally, so a stale/unknown id just fails silently here.
+#[tauri::command]
+pub fn orch_agent_renamed(
+    reg: tauri::State<Arc<OrchRegistry>>,
+    agent_id: String,
+    name: String,
+) -> Result<(), String> {
+    reg.rename_agent(&agent_id, &name, NameSource::Human).map(|_| ())
 }
 
 /// Session ↔ orchestration-role mapping for the session browser badges.

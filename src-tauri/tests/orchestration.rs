@@ -13,7 +13,7 @@ use loomux_lib::orchestration::{
     normalize_remote_web_base, parse_audit_lines, parse_session_cost, prompt_wait_detected,
     resolve_ref_url, rotate_audit_if_needed, sanitize_attachment_ext, spawn_rate_exceeded,
     strip_ansi, watchdog_should_notify, worktree_cleanup_targets, AttentionItem, Caller,
-    Guardrails, OrchRegistry, Role, TaskPatch, UsageSnapshot, MAX_ATTACHMENT_BYTES,
+    Guardrails, NameSource, OrchRegistry, Role, TaskPatch, UsageSnapshot, MAX_ATTACHMENT_BYTES,
     PLANNER_READONLY_NOTE,
 };
 use serde_json::{json, Value};
@@ -906,6 +906,11 @@ fn instruction_files_rendered_with_group_facts() {
     let orch = fs::read_to_string(dir.join("orchestrator.md")).unwrap();
     assert!(orch.contains("C:/tmp/myrepo"));
     assert!(orch.contains("at most 2 live delegates"), "guardrails must be rendered into the doc");
+    // The rename_agent tool and its delegation guidance are rendered (#95r).
+    assert!(orch.contains("rename_agent(agent_id, name)"),
+        "orchestrator instructions must document rename_agent");
+    assert!(orch.contains("Name the pane for its work"),
+        "orchestrator instructions must guide renaming a worker to its task");
     assert!(!orch.contains("{{"), "no unrendered placeholders");
     let worker = fs::read_to_string(dir.join("worker.md")).unwrap();
     assert!(worker.contains("Never merge"), "merge gatekeeping must be in worker instructions");
@@ -1540,6 +1545,8 @@ fn tool_listing_is_role_filtered() {
     let work = names(&cw);
     assert!(orch.contains(&"spawn_agent".to_string()));
     assert!(orch.contains(&"set_state".to_string()));
+    assert!(orch.contains(&"rename_agent".to_string()), "orchestrator must see rename_agent");
+    assert!(!work.contains(&"rename_agent".to_string()), "workers must not see rename_agent");
     assert!(!work.contains(&"spawn_agent".to_string()), "workers must not see spawn");
     assert!(!work.contains(&"set_state".to_string()), "workers must not see state writes");
     assert!(work.contains(&"report".to_string()));
@@ -1548,9 +1555,9 @@ fn tool_listing_is_role_filtered() {
 #[test]
 fn workers_cannot_use_privileged_tools_even_if_they_try() {
     let (reg, _d, _co, cw) = setup_mcp();
-    for tool in ["spawn_agent", "send_prompt", "kill_agent", "set_state", "get_output"] {
+    for tool in ["spawn_agent", "send_prompt", "kill_agent", "rename_agent", "set_state", "get_output"] {
         let r = dispatch(&reg, &cw, "tools/call",
-            &json!({ "name": tool, "arguments": { "task": "x", "agent_id": "w-1", "text": "x", "state": "{}" } }))
+            &json!({ "name": tool, "arguments": { "task": "x", "agent_id": "w-1", "text": "x", "name": "x", "state": "{}" } }))
             .unwrap();
         assert_eq!(r["isError"], true, "{tool} must be denied for workers");
         assert!(
@@ -1656,6 +1663,129 @@ fn every_tool_call_is_audited() {
         .expect("tool-call audit entry");
     assert_eq!(call["actor"], co.agent_id.as_str());
     assert!(lines.iter().any(|e| e["action"] == "tool-result" && e["detail"]["tool"] == "list_agents"));
+}
+
+// ---------- pane naming & rename precedence (#95r) ----------
+
+#[test]
+fn default_pane_name_derives_from_minted_id() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    // The orchestrator takes seq 1 (orch-1); the worker mints the next seq.
+    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    // No meaningful name → the title is derived from the minted id, so it
+    // carries the SAME seq the "W <seq>" badge (#75) and the roster id show,
+    // never the old per-launch "worker N" counter that drifted from the seq
+    // (the "worker 1" pane wearing a "W 2" badge in the #95 screenshot).
+    let w = reg.spawn_agent(&g.id, Role::Worker, "", "", false, None).unwrap();
+    let seq = w.id.rsplit('-').next().unwrap();
+    assert_eq!(w.id, format!("w-{seq}"));
+    assert_eq!(
+        w.name,
+        format!("worker {seq}"),
+        "default name must carry the id/badge seq, got id={} name={}",
+        w.id, w.name
+    );
+}
+
+#[test]
+fn explicit_spawn_name_is_kept_verbatim() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    // A meaningful name the orchestrator chose is not derived away.
+    let w = reg.spawn_agent(&g.id, Role::Worker, "gitwatch fix", "t", false, None).unwrap();
+    assert_eq!(w.name, "gitwatch fix");
+}
+
+#[test]
+fn rename_agent_updates_roster_and_audits() {
+    let (reg, _d, co, cw) = setup_mcp();
+    let ok = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "rename_agent", "arguments": { "agent_id": cw.agent_id, "name": "w-2: gitwatch fix" } }))
+        .unwrap();
+    assert_eq!(ok["isError"], false, "orchestrator rename must succeed: {ok}");
+    assert!(ok["content"][0]["text"].as_str().unwrap().contains("gitwatch fix"));
+    // The durable roster reflects the new name (title ↔ roster agree, #95r).
+    let roster = reg.list_agents(&co.group);
+    let row = roster.as_array().unwrap().iter().find(|a| a["id"] == cw.agent_id.as_str()).unwrap();
+    assert_eq!(row["name"], "w-2: gitwatch fix", "roster name must follow the rename");
+    // And it is audited.
+    let log = fs::read_to_string(reg.state_root().join(&co.group).join("audit.jsonl")).unwrap();
+    assert!(log.contains("agent-rename"), "rename must be audited");
+}
+
+#[test]
+fn rename_agent_is_orchestrator_only() {
+    let (reg, _d, _co, cw) = setup_mcp();
+    let denied = dispatch(&reg, &cw, "tools/call",
+        &json!({ "name": "rename_agent", "arguments": { "agent_id": cw.agent_id, "name": "x" } }))
+        .unwrap();
+    assert_eq!(denied["isError"], true, "workers must not rename");
+    assert!(denied["content"][0]["text"].as_str().unwrap().contains("orchestrator-only"));
+}
+
+#[test]
+fn rename_agent_cannot_target_another_group() {
+    let (reg, _d, co, _cw) = setup_mcp();
+    let g2 = reg.create_group("C:/tmp/other-repo", rails()).unwrap();
+    let foreign = reg.spawn_agent(&g2.id, Role::Worker, "fw", "t", false, None).unwrap();
+    let r = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "rename_agent", "arguments": { "agent_id": foreign.id, "name": "x" } }))
+        .unwrap();
+    assert_eq!(r["isError"], true);
+    // Cross-group is indistinguishable from a nonexistent agent (no id leak).
+    assert!(r["content"][0]["text"].as_str().unwrap().contains("unknown agent"));
+    assert_eq!(reg.agent(&foreign.id).unwrap().name, "fw", "foreign agent keeps its name");
+}
+
+#[test]
+fn rename_agent_rejects_dead_target() {
+    let (reg, _d, co, cw) = setup_mcp();
+    reg.mark_dead(&cw.agent_id, None);
+    let r = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "rename_agent", "arguments": { "agent_id": cw.agent_id, "name": "x" } }))
+        .unwrap();
+    assert_eq!(r["isError"], true, "a dead agent cannot be renamed");
+    assert!(r["content"][0]["text"].as_str().unwrap().contains("not alive"));
+}
+
+#[test]
+fn rename_agent_rejects_empty_name() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "", "t", false, None).unwrap();
+    assert!(reg.rename_agent(&w.id, "   ", NameSource::Orchestrator).is_err());
+}
+
+#[test]
+fn rename_precedence_human_beats_orchestrator_beats_default() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "", "t", false, None).unwrap();
+    // Starts at the id-derived default.
+    let seq = w.id.rsplit('-').next().unwrap().to_string();
+    assert_eq!(w.name, format!("worker {seq}"));
+
+    // Orchestrator outranks the default → applies.
+    reg.rename_agent(&w.id, "w: parser", NameSource::Orchestrator).unwrap();
+    assert_eq!(reg.agent(&w.id).unwrap().name, "w: parser");
+
+    // Human outranks the orchestrator → applies and locks.
+    reg.rename_agent(&w.id, "my parser work", NameSource::Human).unwrap();
+    assert_eq!(reg.agent(&w.id).unwrap().name, "my parser work");
+
+    // A later orchestrator rename must NOT override the human's title.
+    let err = reg.rename_agent(&w.id, "w: something else", NameSource::Orchestrator).unwrap_err();
+    assert!(err.contains("human"), "rejection must explain the precedence: {err}");
+    assert_eq!(
+        reg.agent(&w.id).unwrap().name,
+        "my parser work",
+        "human rename must survive a later orchestrator rename"
+    );
+
+    // The human can still re-rename their own pane (human ≥ human).
+    reg.rename_agent(&w.id, "parser v2", NameSource::Human).unwrap();
+    assert_eq!(reg.agent(&w.id).unwrap().name, "parser v2");
 }
 
 // ---------- cost containment (#7): pause, idle-kill, spawn-rate, usage ----------

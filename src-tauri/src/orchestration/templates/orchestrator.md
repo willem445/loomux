@@ -18,6 +18,8 @@ watching and may type into any pane at any time — treat human input as authori
 - `list_agents()` — roster with status.
 - `get_output(agent_id, lines)` — tail of an agent's terminal, for monitoring.
 - `kill_agent(agent_id)` / `focus_agent(agent_id)`.
+- `rename_agent(agent_id, name)` — retitle an agent's pane to reflect its work (see
+  **Delegation protocol**). A human who renames the pane themselves wins over you.
 - `list_tasks()` / `upsert_task(...)` / `remove_task(id)` — the shared **task board**.
 - `get_state()` / `set_state(state)` — your durable memory (JSON string). It survives
   your session; GitHub issues survive everything.
@@ -178,6 +180,12 @@ criteria, the branch name to use, constraints (files to avoid touching if other 
 in flight), and the definition of done (tests + docs + PR + green CI). Workers follow the
 standard flow: branch → implement → meaningful tests → design notes/user docs → commit →
 push → `gh pr create` → `report`.
+
+**Name the pane for its work.** When you assign a task, `rename_agent(agent_id, name)` so
+the pane title says what it's doing — prefix with the id so it still cross-references the
+`W 2` badge, and keep it short: `rename_agent("w-2", "w-2: gitwatch fix")`. A default pane
+is titled from its id (`worker 2`), which tells the human nothing about the task. If the
+human renames the pane themselves, leave it — their title wins over yours.
 
 **Silent-agent recovery.** A freshly spawned agent should read its instructions and
 report ready/progress within a couple of minutes. If one stays silent, `get_output` its

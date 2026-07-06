@@ -1008,6 +1008,13 @@ export class Pane {
       value: () => input.value,
       save: (name) => {
         this.name = name;
+        // Sync a human rename to the backend so the roster name matches the
+        // pane title and the human's choice takes precedence over any later
+        // orchestrator rename_agent (#95r). Best-effort: the title is already
+        // updated locally, so a backend hiccup is non-fatal.
+        if (this.orchAgent) {
+          invoke("orch_agent_renamed", { agentId: this.orchAgent, name }).catch(() => {});
+        }
       },
       restore: () => {
         input.replaceWith(this.titleEl);

@@ -9,7 +9,7 @@
 //! every tool is scoped to the caller's group — panes without a token can't
 //! reach this server's state at all, and group A can never see group B.
 
-use super::{OrchRegistry, Caller, Role};
+use super::{OrchRegistry, Caller, NameSource, Role};
 use serde_json::{json, Value};
 use std::io::Read as _;
 use std::sync::Arc;
@@ -212,6 +212,13 @@ fn tool_defs(role: Role) -> Vec<Value> {
                 json!({ "agent_id": { "type": "string" } }), &["agent_id"]),
             tool("focus_agent", "Bring an agent's pane into focus for the human.",
                 json!({ "agent_id": { "type": "string" } }), &["agent_id"]),
+            tool("rename_agent",
+                "Rename an agent's pane title (and roster entry) to reflect the work it is doing — e.g. rename w-2 to \"w-2: gitwatch fix\" when you assign it that task. Keep it short. A human who later renames the pane themselves takes precedence: your rename will not override theirs.",
+                json!({
+                    "agent_id": { "type": "string" },
+                    "name": { "type": "string", "description": "New short display name for the pane" },
+                }),
+                &["agent_id", "name"]),
             tool("set_state",
                 "Persist the group's orchestration state (must be a valid JSON string). Call after every queue/plan change; this is your memory across sessions.",
                 json!({ "state": { "type": "string" } }), &["state"]),
@@ -375,6 +382,16 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             let a = require_in_group(reg, caller, target)?;
             reg.focus_agent(&a.id)?;
             Ok(format!("focused {}", a.id))
+        }
+        "rename_agent" => {
+            require_orchestrator(caller)?;
+            let target = arg_str(args, "agent_id").ok_or("agent_id required")?;
+            let name = arg_str(args, "name").ok_or("name required")?;
+            // Scope to the caller's group; rename_agent enforces alive + the
+            // human > orchestrator precedence and returns the applied name.
+            let a = require_in_group(reg, caller, target)?;
+            let applied = reg.rename_agent(&a.id, name, NameSource::Orchestrator)?;
+            Ok(format!("renamed {} to \"{applied}\"", a.id))
         }
         "set_state" => {
             require_orchestrator(caller)?;
