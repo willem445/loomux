@@ -209,33 +209,36 @@ Then set the repository, how many idle workers to start with, and the
 guardrails: max live agents and permissions. Permissions are either *Auto*
 (Claude Code's native auto permission mode plus pre-approved `git`/`gh` and
 loomux agent tools — recommended) or *Accept edits only*; loomux never uses
-`--dangerously-skip-permissions`. The launcher warns inline when any selected
-role's CLI isn't installed, and an agent pane that dies with an error stays
-open so you can read what happened. The launcher's **Multiple panes** mode
-also spawns N independent agent panes at once (a worktree name fans out to
-`name-1 … name-N`).
+`--dangerously-skip-permissions`. Under *Auto*, **group Copilot** agents run in
+Copilot's true **autopilot mode** (`--autopilot`) — an unattended worker should
+persist autonomously rather than pause to ask — and loomux answers the resulting
+"Enable autopilot mode" consent dialog for them automatically at spawn (your
+group-level *Auto* choice is the consent). That's the one place loomux opts an
+agent into autopilot mode; a lone single pane, where you're present to answer,
+does not (see the launcher's autopilot toggle above). The launcher warns inline
+when any selected role's CLI isn't installed, and an agent pane that dies with an
+error stays open so you can read what happened. The launcher's **Multiple
+panes** mode also spawns N independent agent panes at once (a worktree name fans
+out to `name-1 … name-N`).
 
 **Autopilot toggle (single & multiple panes):** a plain agent pane would
 otherwise boot in the CLI's default interactive permission mode and prompt on
 everything. The **Single pane** and **Multiple panes** modes carry an
 *Autopilot — pre-approve all tools (allow all)* checkbox, **on by default**,
-that launches the agent with the *same* unattended permission flags a group
-worker gets — Claude Code's native Auto mode plus pre-approved `git`/`gh`,
-Copilot's `--allow-all-tools --allow-all-paths` (its documented non-interactive
-posture; loomux deliberately avoids `--autopilot`, which pops a blocking
-"Enable autopilot mode" confirmation an unattended pane can't answer). The flags come from
-the backend (the same source the orchestration path uses, so the two can't
-drift); the toggle only shows for CLIs that have an unattended mode
+that launches the agent with pre-approved tools — Claude Code's native Auto mode
+plus pre-approved `git`/`gh`, Copilot's `--allow-all-tools --allow-all-paths`.
+The flags come from the backend (the same source the orchestration path uses, so
+the two can't drift); the toggle only shows for CLIs that have an unattended mode
 (Claude/Copilot), and never for a custom command. Uncheck it to launch in the
 CLI's normal interactive mode. Your last choice is remembered as the default
 next time (in `localStorage`, like the other launcher prefs).
 
-The toggle means **tools pre-approved** — the pane stops prompting you to
-approve each edit/command. It is *not* Copilot's experimental "autopilot mode":
-with a human at a single pane, Copilot still runs in its interactive framing (it
-keeps its `ask_user` tool and may pause to ask a question), which is what you
-want when you're there to answer. See the orchestration design note for why
-loomux doesn't opt agents into native autopilot mode.
+For a **single pane** the toggle means **tools pre-approved** — the pane stops
+prompting you to approve each edit/command. It deliberately does *not* enter
+Copilot's "autopilot mode": with a human at the keyboard, Copilot's interactive
+framing is correct (it keeps its `ask_user` tool and may pause to ask), and an
+unbidden "Enable autopilot mode" startup dialog would just be in your way.
+**Group** (orchestrator) Copilot workers are different — see below.
 
 **How it works:** loomux hosts a local MCP server; every agent pane in a
 group connects with its own identity token (`--strict-mcp-config`, so
