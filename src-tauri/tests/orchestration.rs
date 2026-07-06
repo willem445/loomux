@@ -12,7 +12,7 @@ use loomux_lib::orchestration::{
     idle_should_kill, max_agents_notice,
     normalize_remote_web_base, parse_audit_lines, parse_session_cost, prompt_wait_detected,
     resolve_ref_url, rotate_audit_if_needed, sanitize_attachment_ext, spawn_rate_exceeded,
-    strip_ansi, watchdog_should_notify, worktree_cleanup_targets, AttentionItem, Caller,
+    strip_ansi, submit_sequence, watchdog_should_notify, worktree_cleanup_targets, AttentionItem, Caller,
     Guardrails, NameSource, OrchRegistry, Role, TaskPatch, UsageSnapshot, MAX_ATTACHMENT_BYTES,
     PLANNER_READONLY_NOTE,
 };
@@ -478,6 +478,37 @@ fn bracketed_paste_frames_text_and_normalizes_crlf() {
         s.contains("line1\nline2") && !s.contains('\r'),
         "CR must not leak inside a paste — it would submit early"
     );
+}
+
+#[test]
+fn submit_sequence_claude_is_a_bare_cr() {
+    // Claude's submit must stay byte-identical: a single carriage return, no
+    // focus prefix, no CRLF. Any drift here would regress the tuned TUI path.
+    assert_eq!(submit_sequence("claude"), b"\r");
+}
+
+#[test]
+fn submit_sequence_unknown_cli_falls_back_to_bare_cr() {
+    // An unrecognized / future CLI gets the safe default (bare CR), never the
+    // Copilot-specific focus prefix.
+    assert_eq!(submit_sequence("aider"), b"\r");
+    assert_eq!(submit_sequence(""), b"\r");
+}
+
+#[test]
+fn submit_sequence_copilot_prefixes_focus_in_before_enter() {
+    // #98: Copilot drops non-paste keystrokes on an unfocused pane, so a bare
+    // CR after the paste never submits. The fix prefixes a focus-in report
+    // (CSI I) that flips Copilot's focus flag true, so the CR that follows is
+    // accepted. Order matters: focus-in MUST come before the CR.
+    let seq = submit_sequence("copilot");
+    assert_eq!(seq, b"\x1b[I\r");
+    assert!(seq.starts_with(b"\x1b[I"), "focus-in must precede the Enter");
+    assert!(seq.ends_with(b"\r"), "the Enter itself is still a bare CR");
+    // The focus report is exactly CSI I (no params/intermediates) — that is
+    // what Copilot's CSI parser maps to a focus event; a stray param would
+    // parse as something else and not flip the flag.
+    assert_eq!(&seq[..seq.len() - 1], b"\x1b[I");
 }
 
 #[test]

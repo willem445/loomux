@@ -1307,6 +1307,32 @@ pub fn bracketed_paste(text: &str) -> Vec<u8> {
     v
 }
 
+/// The byte sequence loomux writes to submit a delivered prompt, chosen per
+/// CLI. Kept pure and `&'static` so the exact bytes are unit-assertable.
+///
+/// Claude Code submits on a bare CR (`\r`).
+///
+/// GitHub Copilot's TUI (#98) gates *keyboard* input on terminal focus: it
+/// enables DEC mode 1004 focus reporting (`ESC[?1004h`) and, in its editor's
+/// key handler, drops every non-paste keystroke while its focus flag is false
+/// (`if (!focused && !key.paste && code != backspace/delete) return`). A
+/// *paste* bypasses that guard — which is why a delivered prompt's text lands
+/// in the input box — but the Enter that follows is a plain key, so on a pane
+/// that isn't the focused one (the normal case when an agent delivers to
+/// another agent's pane) it is ignored and the prompt just sits there until a
+/// human clicks in (whereupon the terminal emits focus-in and their Enter
+/// works). Prefixing the CR with a focus-in report (`ESC[I`, which Copilot
+/// parses to a focus event that flips its flag true) makes the very next key —
+/// our Enter — accepted, so the prompt submits without a human. Copilot leaves
+/// its flag true afterward, so the spaced retry Enters need no re-prefix, but
+/// they carry it too so each retry is self-sufficient if a stray blur arrives.
+pub fn submit_sequence(cli: &str) -> &'static [u8] {
+    match cli {
+        "copilot" => b"\x1b[I\r",
+        _ => b"\r",
+    }
+}
+
 impl OrchRegistry {
     pub fn new(root: PathBuf) -> Self {
         let _ = fs::create_dir_all(&root);
@@ -3810,6 +3836,15 @@ impl OrchRegistry {
         self.audit(&a.group, from, "prompt", json!({ "to": agent_id, "text": text }));
 
         let paste = bracketed_paste(text);
+        // The Enter that submits the paste is chosen per CLI: Copilot ignores a
+        // bare CR on an unfocused pane, so its sequence prefixes a focus-in
+        // report (#98). Resolved here — through the same per-role `cli_for` the
+        // registry already uses — so the delivery thread carries the right bytes.
+        let cli = self
+            .group(&a.group)
+            .map(|g| g.guardrails.cli_for(a.role).to_string())
+            .unwrap_or_else(|| "claude".to_string());
+        let submit = submit_sequence(&cli);
         let lock = self
             .delivery
             .lock_safe()
@@ -3933,7 +3968,7 @@ impl OrchRegistry {
                 }));
             }
             let submit_sent_ms = now_ms();
-            let _ = ptys.write_bytes(pty_id, b"\r");
+            let _ = ptys.write_bytes(pty_id, submit);
             for delay in SUBMIT_RETRY_DELAYS {
                 std::thread::sleep(delay);
                 // A human typing in this pane means the box may hold THEIR
@@ -3943,12 +3978,13 @@ impl OrchRegistry {
                         json!({ "to": agent, "reason": "human typing in pane" }));
                     break;
                 }
-                if ptys.write_bytes(pty_id, b"\r").is_err() {
+                if ptys.write_bytes(pty_id, submit).is_err() {
                     break;
                 }
             }
             append_audit(&root, &group, "loomux", "prompt-typed", json!({
                 "to": agent,
+                "cli": cli,
                 "waited_ms": start.elapsed().as_millis() as u64,
                 "attempts": attempts,
                 "echoed": echoed,
