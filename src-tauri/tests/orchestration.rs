@@ -9,9 +9,9 @@
 use loomux_lib::orchestration::mcp::dispatch;
 use loomux_lib::orchestration::{
     add_trusted_folder, bracketed_paste, cli_ready, create_orchestration_group, hold_until_quiet,
-    idle_should_kill,
+    idle_should_kill, max_agents_notice,
     normalize_remote_web_base, parse_audit_lines, parse_session_cost, prompt_wait_detected,
-    resolve_ref_url, rotate_audit_if_needed, spawn_rate_exceeded, strip_ansi,
+    resolve_ref_url, rotate_audit_if_needed, spawn_rate_exceeded, strip_ansi, PLANNER_READONLY_NOTE,
     watchdog_should_notify, worktree_cleanup_targets, AttentionItem, Caller, Guardrails,
     OrchRegistry, Role, TaskPatch, UsageSnapshot,
 };
@@ -19,7 +19,14 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// Wall-clock Unix-ms, mirroring the crate-private `now_ms` — the debounce
+/// tests inject `now_ms() + window` into `flush_due_max_notices` to fire a
+/// pending notice deterministically without sleeping out the real 3s window.
+fn now_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
 
 #[test]
 fn kickoff_readiness_waits_for_painted_and_quiet_cli() {
@@ -43,10 +50,13 @@ fn rails() -> Guardrails {
         worker_model: "sonnet".into(),
         reviewer_model: "sonnet".into(),
         orchestrator_model: "opus".into(),
+        planner_model: "opus".into(),
         auto_ops: false,
         idle_kill_minutes: 0,
         max_spawns_per_hour: 0,
         watchdog_stall_minutes: 0,
+        // Per-role CLIs default to inheriting `agent_cli`.
+        ..Guardrails::default()
     }
 }
 
@@ -81,34 +91,292 @@ fn guardrail_clamps_and_sanitizes() {
         worker_model: "sonnet; rm -rf /".into(),
         reviewer_model: "".into(),
         orchestrator_model: "opus".into(),
+        planner_model: "".into(),
         auto_ops: true,
         idle_kill_minutes: 99999,
         max_spawns_per_hour: 9999,
         watchdog_stall_minutes: 99999,
+        ..Guardrails::default()
     }
     .clamped();
     assert_eq!(g.max_agents, 12, "cap must clamp to the hard ceiling");
     assert_eq!(g.idle_kill_minutes, 1440, "idle-kill timeout clamps to 24h");
     assert_eq!(g.max_spawns_per_hour, 240, "spawn-rate cap clamps to the ceiling");
     assert_eq!(g.watchdog_stall_minutes, 1440, "watchdog stall timeout clamps to 24h");
-    assert_eq!(g.agent_cli, "claude", "unknown CLIs fall back to claude explicitly");
+    assert_eq!(g.agent_cli, "claude", "unknown group CLIs fall back to claude explicitly");
     assert_eq!(g.worker_model, "sonnetrm-rf", "shell metacharacters must be stripped");
     assert_eq!(g.reviewer_model, "sonnet", "empty model falls back to default");
-    // Copilot's fallback model is "auto" (it picks the best itself).
+    // Reasoning roles (orchestrator, planner) default to the strong tier on Claude.
+    assert_eq!(g.planner_model, "opus", "empty planner model falls back to the reasoning tier");
+    // Copilot's fallback model is "auto" (it picks the best itself), and a
+    // per-role CLI overrides the group default (issue #4).
     let g = Guardrails {
         max_agents: 4,
         agent_cli: "copilot".into(),
         worker_model: "".into(),
         reviewer_model: "".into(),
         orchestrator_model: "".into(),
+        planner_model: "".into(),
         auto_ops: false,
         idle_kill_minutes: 0,
         max_spawns_per_hour: 0,
         watchdog_stall_minutes: 0,
+        ..Guardrails::default()
     }
     .clamped();
     assert_eq!(g.worker_model, "auto");
     assert_eq!(g.orchestrator_model, "auto");
+    assert_eq!(g.planner_model, "auto");
+    // A per-role CLI is honored by `cli_for` (empty roles inherit agent_cli);
+    // its model fallback follows the role's *effective* CLI.
+    let g = Guardrails {
+        max_agents: 4,
+        agent_cli: "copilot".into(),
+        worker_cli: "claude".into(),
+        worker_model: "".into(),
+        ..Guardrails::default()
+    }
+    .clamped();
+    assert_eq!(g.cli_for(Role::Worker), "claude", "per-role CLI overrides the group default");
+    assert_eq!(g.cli_for(Role::Reviewer), "copilot", "an empty per-role CLI inherits the group default");
+    assert_eq!(g.worker_model, "sonnet", "worker model fallback follows the worker's claude CLI");
+    assert_eq!(g.reviewer_model, "auto", "reviewer model fallback follows the inherited copilot CLI");
+}
+
+// ---------- #56: adjustable max_agents on the fly ----------
+
+#[test]
+fn set_max_agents_validates_bounds() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    // Below the floor and above the ceiling are refused; the cap is unchanged.
+    assert!(reg.set_max_agents(&g.id, 0, "human").is_err());
+    assert!(reg.set_max_agents(&g.id, 13, "human").is_err());
+    assert_eq!(reg.group(&g.id).unwrap().guardrails.max_agents, 2, "a rejected change must not mutate the cap");
+    // The inclusive bounds 1..=12 are accepted.
+    assert_eq!(reg.set_max_agents(&g.id, 1, "human").unwrap(), 1);
+    assert_eq!(reg.set_max_agents(&g.id, 12, "human").unwrap(), 12);
+    // An unknown group is an error, not a panic.
+    assert!(reg.set_max_agents("no-such-group", 3, "human").is_err());
+}
+
+#[test]
+fn set_max_agents_enforcement_reads_live_value() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap(); // cap 2
+    reg.spawn_agent(&g.id, Role::Worker, "w1", "t", false, None).unwrap();
+    reg.spawn_agent(&g.id, Role::Worker, "w2", "t", false, None).unwrap();
+    // At the cap: a third is refused.
+    assert!(reg.spawn_agent(&g.id, Role::Worker, "w3", "t", false, None).is_err());
+    // Raise the cap live → spawn_agent reads the new value, so the next spawn
+    // succeeds (nothing cached the creation-time number).
+    assert_eq!(reg.set_max_agents(&g.id, 3, "human").unwrap(), 3);
+    reg.spawn_agent(&g.id, Role::Worker, "w3", "t", false, None).unwrap();
+    // Lower it below the live count → new spawns blocked again immediately.
+    assert_eq!(reg.set_max_agents(&g.id, 1, "human").unwrap(), 1);
+    let err = reg.spawn_agent(&g.id, Role::Worker, "w4", "t", false, None).unwrap_err();
+    assert!(err.contains("guardrail"), "a lowered cap must block new spawns, got: {err}");
+}
+
+#[test]
+fn lowering_max_agents_kills_nobody() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap(); // cap 2
+    let w1 = reg.spawn_agent(&g.id, Role::Worker, "w1", "t", false, None).unwrap();
+    let w2 = reg.spawn_agent(&g.id, Role::Worker, "w2", "t", false, None).unwrap();
+    // Drop the cap under the live count: attrition-only, no kills.
+    reg.set_max_agents(&g.id, 1, "human").unwrap();
+    let sum = reg.group_summary(&g.id);
+    assert_eq!(sum["live_agents"].as_u64().unwrap(), 2, "both live workers survive a lowered cap");
+    assert_eq!(sum["max_agents"].as_u64().unwrap(), 1, "summary reflects the new cap");
+    assert_eq!(sum["live_delegates"].as_u64().unwrap(), 2, "summary exposes the count that would block spawns");
+    // Still present and not dead in the roster.
+    for w in [&w1, &w2] {
+        let alive = reg.list_agents(&g.id).as_array().unwrap().iter().any(|a| {
+            a["id"] == json!(w.id) && a["status"] != json!("dead")
+        });
+        assert!(alive, "worker {} must stay alive", w.id);
+    }
+}
+
+#[test]
+fn max_agents_change_survives_launcher_relaunch() {
+    let dir = tempfile::tempdir().unwrap();
+    let gid;
+    let path;
+    {
+        let reg = OrchRegistry::new(dir.path().to_path_buf());
+        reg.set_port(45999);
+        let g = reg.create_group("C:/tmp/repo", rails()).unwrap(); // launcher cap 2
+        gid = g.id.clone();
+        path = reg.state_root().join(&g.id).join("group.json");
+        reg.set_max_agents(&g.id, 9, "human").unwrap();
+    }
+    // group.json carries the new cap; unrelated fields are preserved (the
+    // update patches the field in place rather than rewriting the file).
+    let v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(v["guardrails"]["max_agents"].as_u64().unwrap(), 9);
+    assert!(v["created_ms"].as_u64().is_some(), "created_ms must survive the patch");
+    assert_eq!(v["guardrails"]["worker_model"], json!("sonnet"), "other guardrails must survive the patch");
+    // A fresh registry (app restart) + a real launcher relaunch on the same
+    // repo: this drives create_group's actual resume path, not a hand-fed
+    // group.json. The launcher hardcodes its default cap (rails() = 2), but the
+    // persisted adjustment (9) must win — otherwise the relaunch silently
+    // reverts 9→2. Other guardrails still come from the launch.
+    let reg = OrchRegistry::new(dir.path().to_path_buf());
+    reg.set_port(45999);
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    assert_eq!(g.id, gid, "restart resumes the same group");
+    assert_eq!(g.guardrails.max_agents, 9, "the persisted cap wins over the launcher default on resume");
+    // ...and it's the value the resumed group actually holds + re-persists.
+    assert_eq!(reg.group(&gid).unwrap().guardrails.max_agents, 9);
+    let v: Value =
+        serde_json::from_str(&fs::read_to_string(reg.state_root().join(&gid).join("group.json")).unwrap()).unwrap();
+    assert_eq!(v["guardrails"]["max_agents"].as_u64().unwrap(), 9, "resume re-persists the honored cap");
+}
+
+#[test]
+fn new_group_still_honors_the_launcher_cap() {
+    // The resume-prefers-persisted rule must not leak into genuinely new
+    // groups: a first launch on a repo uses the caller's cap verbatim.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/fresh-repo", Guardrails { max_agents: 5, ..rails() }).unwrap();
+    assert_eq!(g.guardrails.max_agents, 5, "a new group takes the launcher's cap");
+}
+
+#[test]
+fn max_agents_change_audits_and_notifies_orchestrator() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap(); // cap 2
+    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    // Pause so the notice delivery is suppressed-but-audited (test mode has no
+    // pane to type into) — this lets us observe the exact notice text.
+    reg.pause_group(&g.id).unwrap();
+    reg.set_max_agents(&g.id, 4, "human").unwrap();
+    // The audit is immediate (per-click); the notice is debounced (#79), so it
+    // is delivered only when its window has elapsed — drive the flush past the
+    // 3s debounce deterministically (no sleep) to observe the notice text.
+    reg.flush_due_max_notices(now_ms() + 4_000);
+    let log = fs::read_to_string(reg.state_root().join(&g.id).join("audit.jsonl")).unwrap();
+    let events: Vec<Value> = log.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    assert!(
+        events.iter().any(|e|
+            e["action"] == json!("max-agents-set")
+            && e["detail"]["from"] == json!(2) && e["detail"]["to"] == json!(4)
+            && e["actor"] == json!("human")),
+        "the cap change must be audited with from/to and the actor"
+    );
+    assert!(
+        events.iter().any(|e|
+            e["action"] == json!("prompt-suppressed-paused")
+            && e["detail"]["text"].as_str().unwrap_or("").contains("max live agents changed 2→4")),
+        "the orchestrator must receive the cap-change re-plan notice"
+    );
+}
+
+// Helper: read the audit log and count the coalesced re-plan notices (visible
+// as `prompt-suppressed-paused` entries because the group is paused in tests).
+fn replan_notices(reg: &OrchRegistry, group: &str) -> Vec<String> {
+    let log = fs::read_to_string(reg.state_root().join(group).join("audit.jsonl")).unwrap();
+    log.lines()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .filter(|e| e["action"] == json!("prompt-suppressed-paused"))
+        .filter_map(|e| e["detail"]["text"].as_str().map(str::to_string))
+        .filter(|t| t.contains("max live agents changed"))
+        .collect()
+}
+
+#[test]
+fn rapid_max_agents_clicks_coalesce_to_one_notice() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap(); // cap 2
+    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    reg.pause_group(&g.id).unwrap();
+    // A burst of stepper clicks 2→4→6→3, all within the debounce window (test
+    // calls land in the same few ms). Each persists + enforces + audits per
+    // click, but the notice is held.
+    reg.set_max_agents(&g.id, 4, "human").unwrap();
+    reg.set_max_agents(&g.id, 6, "human").unwrap();
+    reg.set_max_agents(&g.id, 3, "human").unwrap();
+    // Before the window elapses, nothing has been delivered.
+    reg.flush_due_max_notices(now_ms());
+    assert!(replan_notices(&reg, &g.id).is_empty(), "no notice fires mid-burst");
+    // Every click is audited (enforcement/persist stay per-click).
+    let sets = fs::read_to_string(reg.state_root().join(&g.id).join("audit.jsonl"))
+        .unwrap()
+        .lines()
+        .filter(|l| l.contains("max-agents-set"))
+        .count();
+    assert_eq!(sets, 3, "each click is audited immediately");
+    // Once the window passes: exactly ONE notice, spanning the whole burst
+    // (2→3), never the intermediate 2→4 / 4→6 values.
+    reg.flush_due_max_notices(now_ms() + 4_000);
+    let notices = replan_notices(&reg, &g.id);
+    assert_eq!(notices.len(), 1, "a burst yields one coalesced notice, got: {notices:?}");
+    assert!(notices[0].contains("2→3"), "notice spans the whole burst, got: {}", notices[0]);
+}
+
+#[test]
+fn spaced_max_agents_changes_notify_separately() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap(); // cap 2
+    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    reg.pause_group(&g.id).unwrap();
+    // First change flushes fully before the second is recorded → two notices.
+    reg.set_max_agents(&g.id, 5, "human").unwrap();
+    reg.flush_due_max_notices(now_ms() + 4_000);
+    reg.set_max_agents(&g.id, 2, "human").unwrap();
+    reg.flush_due_max_notices(now_ms() + 8_000);
+    let notices = replan_notices(&reg, &g.id);
+    assert_eq!(notices.len(), 2, "spaced changes stay separate, got: {notices:?}");
+    assert!(notices[0].contains("2→5"), "first notice: {}", notices[0]);
+    assert!(notices[1].contains("5→2"), "second notice: {}", notices[1]);
+}
+
+#[test]
+fn planners_count_toward_live_delegates_summary() {
+    // #47 makes planners count against the cap (live_delegate_count includes
+    // them); the summary's live_delegates must agree so the UI's "cap below N
+    // live" warning stays honest.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", Guardrails { max_agents: 5, ..rails() }).unwrap();
+    reg.spawn_agent(&g.id, Role::Worker, "w1", "t", false, None).unwrap();
+    reg.spawn_agent(&g.id, Role::Reviewer, "r1", "t", false, None).unwrap();
+    reg.spawn_agent(&g.id, Role::Planner, "p1", "t", false, None).unwrap();
+    let sum = reg.group_summary(&g.id);
+    assert_eq!(
+        sum["live_delegates"].as_u64().unwrap(),
+        3,
+        "worker + reviewer + planner all count against the cap"
+    );
+}
+
+#[test]
+fn setting_same_max_agents_is_a_noop() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap(); // cap 2
+    assert_eq!(reg.set_max_agents(&g.id, 2, "human").unwrap(), 2);
+    let log = fs::read_to_string(reg.state_root().join(&g.id).join("audit.jsonl")).unwrap();
+    assert!(!log.contains("max-agents-set"), "a no-op change must not audit or notify");
+}
+
+#[test]
+fn set_max_agents_fails_soft_on_corrupt_group_file() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    // A valid-JSON but non-object root (e.g. from corruption) must error rather
+    // than panic on the in-place field assignment.
+    fs::write(reg.state_root().join(&g.id).join("group.json"), "null").unwrap();
+    let err = reg.set_max_agents(&g.id, 5, "human").unwrap_err();
+    assert!(err.contains("not a JSON object"), "non-object root must fail soft, got: {err}");
+}
+
+#[test]
+fn max_agents_notice_reads_naturally() {
+    assert_eq!(
+        max_agents_notice(4, 2),
+        "[loomux] max live agents changed 4→2 — re-plan accordingly"
+    );
 }
 
 #[test]
@@ -222,7 +490,7 @@ fn claude_command_minimizes_init_approvals_without_bypass() {
     let (reg, _d) = test_registry();
     let cfg = Path::new("C:/x/cfg.json");
     let gdir = Path::new("C:/data/group");
-    let cmd = reg.build_agent_command("claude", "sonnet", false, cfg, gdir, Path::new("C:/repo"), None, false);
+    let cmd = reg.build_agent_command("claude", "sonnet", false, cfg, gdir, Path::new("C:/repo"), None, false, false);
     assert!(cmd.contains("--model sonnet"));
     assert!(cmd.contains("--permission-mode acceptEdits"));
     assert!(cmd.contains("--strict-mcp-config"), "workers must not see the user's other MCP servers");
@@ -230,16 +498,63 @@ fn claude_command_minimizes_init_approvals_without_bypass() {
         "instructions dir must be a workspace so reading it never prompts");
     assert!(cmd.contains("--allowedTools mcp__loomux"),
         "loomux tools must be pre-approved so report/list never prompt");
-    assert!(!cmd.contains("Bash(git:*)"), "git is not pre-approved unless auto_ops");
-    let cmd = reg.build_agent_command("claude", "sonnet", true, cfg, gdir, Path::new("C:/repo"), None, false);
+    assert!(!cmd.contains("Bash(git"), "git is not pre-approved for a non-auto_ops worker");
+    let cmd = reg.build_agent_command("claude", "sonnet", true, cfg, gdir, Path::new("C:/repo"), None, false, false);
     assert!(cmd.contains("--permission-mode auto"),
         "the Auto preset must use Claude Code's native auto permission mode");
-    assert!(cmd.contains("\"Bash(git:*)\"") && cmd.contains("\"Bash(gh:*)\""));
-    assert!(cmd.contains("\"Bash(git *)\""), "both allowlist rule spellings must be present");
+    assert!(cmd.contains("\"Bash(git *)\"") && cmd.contains("\"Bash(gh *)\""),
+        "auto_ops pre-approves git + gh so the branch→commit→PR flow runs unattended");
     assert!(
         !cmd.contains("--dangerously-skip-permissions"),
         "bypass mode must never be used: its confirm dialog defaults to exit and kills the pane"
     );
+    // A worker (read_only=false) has no write/commit denials.
+    assert!(!cmd.contains("--disallowedTools"), "non-planner agents get no tool denials");
+    // A planner (read_only=true) is denied file writes + git commit/push at
+    // the CLI level, even under Auto perms — but keeps gh for the plan comment.
+    let plan = reg.build_agent_command("claude", "opus", true, cfg, gdir, Path::new("C:/repo"), None, false, true);
+    assert!(plan.contains("--disallowedTools"), "planner must deny tools structurally");
+    for denied in ["Edit", "Write", "MultiEdit", "NotebookEdit"] {
+        assert!(plan.contains(denied), "planner must deny the {denied} tool");
+    }
+    assert!(plan.contains("\"Bash(git commit *)\"") && plan.contains("\"Bash(git push *)\""),
+        "planner must deny git commit/push using the canonical (space-form) rule spelling");
+    assert!(plan.contains("\"Bash(gh *)\""), "gh stays allowed so the planner can post its plan comment");
+    assert!(!plan.contains("\"Bash(git checkout"),
+        "read-only git usage (checkout/log/diff) must not be denied");
+    // The colon-mid wildcard is malformed: Claude Code ignores the rule AND
+    // prints a startup warning (the "auto deny rule" flash on planner boot).
+    // No rule may use it — that regression is what this pins down.
+    assert!(!plan.contains("commit:*") && !plan.contains("push:*"),
+        "no colon-mid wildcard rule (`Bash(git commit:*)`) — it is malformed and triggers the startup warning flash");
+}
+
+#[test]
+fn planner_runs_unattended_regardless_of_auto_ops() {
+    // A planner has no human in its pane, so it must reach gh + the loomux MCP
+    // and explore read-only WITHOUT prompting — even when the group is NOT in
+    // auto_ops. Otherwise it deadlocks on the first approval no one can give,
+    // which is exactly why claude's `plan` permission mode can't be used here.
+    let (reg, _d) = test_registry();
+    let cfg = Path::new("C:/x/cfg.json");
+    let gdir = Path::new("C:/data/group");
+    // auto_ops = FALSE, read_only = TRUE (a planner in a manual-ops group).
+    let plan = reg.build_agent_command("claude", "opus", false, cfg, gdir, Path::new("C:/repo"), None, false, true);
+    assert!(plan.contains("--permission-mode auto"),
+        "a planner runs unattended (Auto perms) even when the group is not auto_ops — else it deadlocks");
+    assert!(plan.contains("\"Bash(gh *)\""),
+        "a non-auto_ops planner must still have gh pre-approved so `gh issue comment` (its plan) never prompts");
+    assert!(plan.contains("\"Bash(git *)\""),
+        "a non-auto_ops planner must still have read-only git pre-approved for exploration");
+    assert!(plan.contains("--disallowedTools") && plan.contains("Write"),
+        "writes/commit/push stay denied structurally — Auto perms don't loosen the read-only contract");
+    // By contrast a non-auto_ops WORKER (read_only=false) is unchanged: it
+    // stays in acceptEdits with no pre-approved git/gh (the human gates ops).
+    let worker = reg.build_agent_command("claude", "sonnet", false, cfg, gdir, Path::new("C:/repo"), None, false, false);
+    assert!(worker.contains("--permission-mode acceptEdits"),
+        "a non-auto_ops worker is unaffected: it still gates ops through acceptEdits");
+    assert!(!worker.contains("\"Bash(gh *)\""),
+        "a non-auto_ops worker gets no pre-approved gh — only planners run unattended");
 }
 
 #[test]
@@ -247,7 +562,7 @@ fn copilot_command_uses_copilot_adapter_flags() {
     let (reg, _d) = test_registry();
     let cfg = Path::new("C:/x/cfg.json");
     let gdir = Path::new("C:/data/group");
-    let cmd = reg.build_agent_command("copilot", "auto", true, cfg, gdir, Path::new("C:/repo"), None, false);
+    let cmd = reg.build_agent_command("copilot", "auto", true, cfg, gdir, Path::new("C:/repo"), None, false, false);
     assert!(cmd.starts_with("copilot "), "selected CLI must actually be launched, not claude");
     assert!(
         cmd.contains("--additional-mcp-config \"@C:/x/cfg.json\""),
@@ -267,17 +582,52 @@ fn copilot_command_uses_copilot_adapter_flags() {
     // Auto preset = copilot's own unattended mode.
     assert!(cmd.contains("--autopilot") && cmd.contains("--allow-all-tools") && cmd.contains("--allow-all-paths"));
     // Conservative preset keeps the explicit allowlist instead.
-    let cmd = reg.build_agent_command("copilot", "auto", false, cfg, gdir, Path::new("C:/repo"), None, false);
+    let cmd = reg.build_agent_command("copilot", "auto", false, cfg, gdir, Path::new("C:/repo"), None, false, false);
     assert!(!cmd.contains("--autopilot") && !cmd.contains("--allow-all-tools"));
     assert!(cmd.contains("--allow-tool \"shell(git:*)\"") && cmd.contains("--allow-tool \"shell(gh:*)\""));
     // Resume reopens a tracked session via --resume; copilot has no
     // pre-assignable id, so a session without resume adds no session flag.
     let sid = "aabbccdd-1122-4334-8556-77889900aabb";
-    let cmd = reg.build_agent_command("copilot", "auto", true, cfg, gdir, Path::new("C:/repo"), Some(sid), true);
+    let cmd = reg.build_agent_command("copilot", "auto", true, cfg, gdir, Path::new("C:/repo"), Some(sid), true, false);
     assert!(cmd.contains(&format!("--resume {sid}")), "copilot resume must pass --resume, got: {cmd}");
-    let cmd = reg.build_agent_command("copilot", "auto", true, cfg, gdir, Path::new("C:/repo"), Some(sid), false);
+    let cmd = reg.build_agent_command("copilot", "auto", true, cfg, gdir, Path::new("C:/repo"), Some(sid), false, false);
     assert!(!cmd.contains("--resume") && !cmd.contains("--session-id"),
         "a fresh copilot spawn cannot pin a session id");
+    // A non-planner copilot agent gets no deny-tool flags.
+    assert!(!cmd.contains("--deny-tool"), "non-planner copilot agents get no tool denials");
+    // A planner (read_only=true) denies writes + git commit/push even under
+    // --allow-all-tools (deny wins in Copilot); gh stays reachable.
+    let plan = reg.build_agent_command("copilot", "auto", true, cfg, gdir, Path::new("C:/repo"), None, false, true);
+    assert!(plan.contains("--deny-tool \"write\"") && plan.contains("--deny-tool \"edit\""),
+        "planner must deny copilot's write/edit tools, got: {plan}");
+    assert!(plan.contains("--deny-tool \"shell(git commit)\"") && plan.contains("--deny-tool \"shell(git push)\""),
+        "planner must deny git commit/push");
+    assert!(!plan.contains("--deny-tool \"shell(gh"), "gh stays allowed for the plan comment");
+}
+
+#[test]
+fn copilot_planner_runs_unattended_regardless_of_auto_ops() {
+    // Mirror of the claude fix on the copilot adapter: a planner has no human
+    // in its pane, so a NON-auto_ops copilot planner must still take copilot's
+    // unattended (autopilot) preset — the conservative interactive preset
+    // would stall it on approvals no one can give. Deny rules keep it
+    // read-only (deny wins over --allow-all-tools in Copilot).
+    let (reg, _d) = test_registry();
+    let cfg = Path::new("C:/x/cfg.json");
+    let gdir = Path::new("C:/data/group");
+    // auto_ops = FALSE, read_only = TRUE (a planner in a manual-ops group).
+    let plan = reg.build_agent_command("copilot", "auto", false, cfg, gdir, Path::new("C:/repo"), None, false, true);
+    assert!(plan.contains("--autopilot") && plan.contains("--allow-all-tools") && plan.contains("--allow-all-paths"),
+        "a non-auto_ops copilot planner must run unattended (autopilot), else it deadlocks: {plan}");
+    assert!(plan.contains("--deny-tool \"write\"") && plan.contains("--deny-tool \"shell(git commit)\""),
+        "writes/commit stay denied — the autopilot preset doesn't loosen the read-only contract");
+    assert!(!plan.contains("--deny-tool \"shell(gh"),
+        "gh stays allowed so the copilot planner can post its plan comment unattended");
+    // A non-auto_ops copilot WORKER (read_only=false) is unchanged: it keeps
+    // the conservative interactive preset, not autopilot.
+    let worker = reg.build_agent_command("copilot", "auto", false, cfg, gdir, Path::new("C:/repo"), None, false, false);
+    assert!(!worker.contains("--autopilot") && !worker.contains("--allow-all-tools"),
+        "a non-auto_ops copilot worker stays interactive — only planners run unattended");
 }
 
 #[test]
@@ -456,16 +806,116 @@ fn kickoff_prompt_references_instructions_and_task() {
 }
 
 #[test]
+fn planner_kickoff_references_planner_instructions() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let p = reg
+        .spawn_agent(&g.id, Role::Planner, "plan-47", "Plan issue #47", false, None)
+        .unwrap();
+    let k = reg.kickoff_prompt(&p, &g, "note");
+    assert!(k.contains("planner.md"), "planner kickoff must reference its instructions file");
+    assert!(k.contains("a planner agent"), "kickoff must name the planner role");
+    assert!(k.contains("Plan issue #47"));
+}
+
+#[test]
+fn planner_explores_read_only_and_never_gets_a_worktree() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    // Even with worktree requested, a planner runs in the repo itself — it
+    // never branches, worktrees, commits, or PRs (#47).
+    let p = reg
+        .spawn_agent(&g.id, Role::Planner, "plan", "Plan it", true, Some("plan/x".into()))
+        .unwrap();
+    assert_eq!(p.cwd, "C:/tmp/repo", "a planner must not get a dedicated worktree");
+    assert!(
+        reg.list_agents(&g.id).as_array().unwrap().iter().any(|a| a["role"] == "planner"),
+        "planner must appear in the roster with its role"
+    );
+    // The planner's spawn-time read-only note (PLANNER_READONLY_NOTE) is threaded
+    // verbatim into its kickoff, communicating the no-code/branches/PRs contract.
+    let k = reg.kickoff_prompt(&p, &g, PLANNER_READONLY_NOTE);
+    assert!(
+        k.contains("never create branches, worktrees, commits, or PRs"),
+        "planner kickoff must carry the read-only containment note, got: {k}"
+    );
+    assert!(
+        PLANNER_READONLY_NOTE.contains("read-only") && PLANNER_READONLY_NOTE.contains("issue comment"),
+        "the containment note must state the read-only contract and the issue-comment deliverable"
+    );
+}
+
+#[test]
+fn planner_counts_toward_the_live_agent_cap() {
+    let (reg, _d) = test_registry();
+    // Cap is 2 (rails). A worker + a planner fill it; the next delegate is refused.
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    reg.spawn_agent(&g.id, Role::Worker, "w1", "t", false, None).unwrap();
+    reg.spawn_agent(&g.id, Role::Planner, "p1", "plan", false, None).unwrap();
+    let err = reg
+        .spawn_agent(&g.id, Role::Reviewer, "rev1", "t", false, None)
+        .unwrap_err();
+    assert!(err.contains("guardrail"), "a planner must count against the delegate cap: {err}");
+}
+
+#[test]
+fn per_role_cli_is_pinned_at_spawn_and_persisted() {
+    let (reg, _d) = test_registry();
+    // Group default is copilot, but the reviewer role overrides to claude (#4).
+    let rails = Guardrails {
+        agent_cli: "copilot".into(),
+        reviewer_cli: "claude".into(),
+        max_agents: 4,
+        ..rails()
+    };
+    let g = reg.create_group("C:/tmp/mixed-repo", rails).unwrap();
+    // Observable per-role effect: claude agents get a pre-assigned session id;
+    // copilot agents mint their own later, so start without one.
+    let worker = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let reviewer = reg.spawn_agent(&g.id, Role::Reviewer, "rev", "t", false, None).unwrap();
+    assert!(worker.session_id.is_none(), "worker inherits the copilot group default (no pre-assigned session)");
+    assert!(reviewer.session_id.is_some(), "reviewer's per-role claude CLI pre-assigns a session id");
+    // The per-role config is persisted additively to group.json.
+    let gj = fs::read_to_string(reg.state_root().join(&g.id).join("group.json")).unwrap();
+    let v: Value = serde_json::from_str(&gj).unwrap();
+    assert_eq!(v["guardrails"]["reviewer_cli"], "claude");
+    assert_eq!(v["guardrails"]["agent_cli"], "copilot");
+    assert!(v["guardrails"].get("planner_cli").is_some(), "planner_cli must be persisted");
+    assert!(v["guardrails"].get("planner_model").is_some(), "planner_model must be persisted");
+}
+
+#[test]
+fn unknown_per_role_cli_is_rejected_at_spawn() {
+    let (reg, _d) = test_registry();
+    // A hand-edited group.json could pin an unsupported CLI to a role; the
+    // spawn must reject it rather than silently downgrade (#4).
+    let rails = Guardrails { worker_cli: "aider".into(), max_agents: 4, ..rails() };
+    let g = reg.create_group("C:/tmp/bad-cli-repo", rails).unwrap();
+    let err = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap_err();
+    assert!(err.contains("unsupported agent CLI"), "unknown per-role CLI must be rejected: {err}");
+    // Roles that inherit the (valid) group default still spawn fine.
+    reg.spawn_agent(&g.id, Role::Reviewer, "rev", "t", false, None).unwrap();
+}
+
+#[test]
 fn instruction_files_rendered_with_group_facts() {
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/myrepo", rails()).unwrap();
     let dir = reg.state_root().join(&g.id);
     let orch = fs::read_to_string(dir.join("orchestrator.md")).unwrap();
     assert!(orch.contains("C:/tmp/myrepo"));
-    assert!(orch.contains("at most 2 live workers"), "guardrails must be rendered into the doc");
+    assert!(orch.contains("at most 2 live delegates"), "guardrails must be rendered into the doc");
     assert!(!orch.contains("{{"), "no unrendered placeholders");
     let worker = fs::read_to_string(dir.join("worker.md")).unwrap();
     assert!(worker.contains("Never merge"), "merge gatekeeping must be in worker instructions");
+    // The planner instructions are rendered alongside the other roles (#47).
+    let planner = fs::read_to_string(dir.join("planner.md")).unwrap();
+    assert!(planner.contains("planner"), "planner instructions must be written to the group dir");
+    assert!(
+        planner.contains("never write code") || planner.contains("You never write code"),
+        "planner instructions must forbid writing code"
+    );
+    assert!(!planner.contains("{{"), "no unrendered placeholders in planner.md");
 }
 
 // ---------- task board ----------
@@ -577,10 +1027,10 @@ fn claude_agents_get_preassigned_resumable_sessions() {
     // The launch command pins the id.
     let cfg = Path::new("C:/x/cfg.json");
     let gdir = Path::new("C:/x/g");
-    let cmd = reg.build_agent_command("claude", "sonnet", false, cfg, gdir, Path::new("C:/repo"), Some(&sid), false);
+    let cmd = reg.build_agent_command("claude", "sonnet", false, cfg, gdir, Path::new("C:/repo"), Some(&sid), false, false);
     assert!(cmd.contains(&format!("--session-id {sid}")));
     // Resume uses --resume instead.
-    let cmd = reg.build_agent_command("claude", "sonnet", false, cfg, gdir, Path::new("C:/repo"), Some(&sid), true);
+    let cmd = reg.build_agent_command("claude", "sonnet", false, cfg, gdir, Path::new("C:/repo"), Some(&sid), true, false);
     assert!(cmd.contains(&format!("--resume {sid}")) && !cmd.contains("--session-id"));
 }
 
@@ -719,6 +1169,74 @@ fn merge_gate_actions_are_guarded_to_gate_statuses() {
     reg.upsert_task(&g.id, "orch-1", Some(&t.id), patch(None, Some("pr"), None)).unwrap();
     reg.approve_task(&g.id, &t.id).unwrap();
     assert!(reg.approve_task(&g.id, &t.id).is_err(), "a done item is past the gate");
+}
+
+#[test]
+fn start_records_note_and_leaves_status_queued() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let t = reg.upsert_task(&g.id, "orch-1", None, patch(Some("Ship the parser"), None, None)).unwrap();
+    // Starting is the human's nudge: a human-attributed note is recorded, but
+    // the status deliberately stays queued — the orchestrator flips it to
+    // in-progress when it actually assigns a worker.
+    let after = reg.start_task(&g.id, &t.id).unwrap();
+    assert_eq!(after.status, "queued", "start must not flip the status itself");
+    let note = after.notes.last().unwrap();
+    assert_eq!(note.author, "human");
+    assert!(note.text.contains("Started"), "the nudge must be auditable on the board");
+}
+
+#[test]
+fn start_is_guarded_to_queued_items() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let t = reg.upsert_task(&g.id, "orch-1", None, patch(Some("Ship it"), None, None)).unwrap();
+    // An unknown id is an error, not a silent no-op.
+    assert!(reg.start_task(&g.id, "t-999").is_err());
+    // Every non-queued status must refuse, and refuse without mutating.
+    for status in ["in-progress", "review", "pr", "human-testing", "done", "blocked"] {
+        reg.upsert_task(&g.id, "orch-1", Some(&t.id), patch(None, Some(status), None)).unwrap();
+        let before = reg.tasks(&g.id)[0].notes.len();
+        assert!(reg.start_task(&g.id, &t.id).is_err(), "cannot start a {status} item");
+        assert_eq!(reg.tasks(&g.id)[0].notes.len(), before, "a refused start must not leave a note");
+    }
+    // Back to queued, it's allowed again.
+    reg.upsert_task(&g.id, "orch-1", Some(&t.id), patch(None, Some("queued"), None)).unwrap();
+    assert!(reg.start_task(&g.id, &t.id).is_ok(), "queued is startable");
+}
+
+#[test]
+fn start_is_rejected_up_front_when_the_group_is_paused() {
+    // A paused group suppresses delivery silently (deliver_prompt returns Ok
+    // after auditing prompt-suppressed-paused), and unlike approve — which
+    // leaves a durable `done` flip — a Start nudge leaves only a note and the
+    // "begin work" signal is lost on resume. So Start rejects up front, like the
+    // steering strip (#43): a clear error, NO note appended, and — the point —
+    // it never reaches delivery, so no suppression audit is recorded.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    // An orchestrator is present: if the guard were missing, start would reach
+    // delivery and record a prompt-suppressed-paused audit — so asserting its
+    // absence proves the guard fires *before* delivery, not that there was
+    // simply no target.
+    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let t = reg.upsert_task(&g.id, "orch-1", None, patch(Some("Ship the parser"), None, None)).unwrap();
+
+    reg.pause_group(&g.id).unwrap();
+    let err = reg.start_task(&g.id, &t.id).unwrap_err();
+    assert!(err.contains("paused"), "paused rejection must say so: {err}");
+
+    assert!(reg.tasks(&g.id)[0].notes.is_empty(), "a rejected start must not leave a note");
+    assert!(
+        reg.audit_log(&g.id).iter().all(|e| e.action != "prompt-suppressed-paused"),
+        "start must reject before delivery — no suppressed-prompt audit"
+    );
+
+    // Resuming lets it through again.
+    reg.resume_group(&g.id).unwrap();
+    let after = reg.start_task(&g.id, &t.id).unwrap();
+    assert_eq!(after.status, "queued");
+    assert!(after.notes.last().unwrap().text.contains("Started"), "resumed start records the nudge");
 }
 
 // ---------- review-round regression tests ----------
@@ -1055,6 +1573,28 @@ fn spawn_respects_guardrail_cap_via_mcp() {
 }
 
 #[test]
+fn spawn_agent_mcp_accepts_planner_kind() {
+    let (reg, _d, co, _cw) = setup_mcp();
+    // The orchestrator can spawn a planner via the shared spawn_agent tool (#47).
+    let r = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "spawn_agent", "arguments": { "kind": "planner", "task": "plan issue #47" } }))
+        .unwrap();
+    assert_eq!(r["isError"], false, "planner spawn must succeed");
+    assert!(
+        r["content"][0]["text"].as_str().unwrap().contains("Planner"),
+        "spawn result must report the planner role"
+    );
+    // The planner is on the roster with the planner role.
+    let planner = reg
+        .list_agents(&co.group)
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|a| a["role"] == "planner");
+    assert!(planner, "spawned planner must appear on the roster");
+}
+
+#[test]
 fn cross_group_targets_are_invisible() {
     let (reg, _d, co, _cw) = setup_mcp();
     let g2 = reg.create_group("C:/tmp/other-repo", rails()).unwrap();
@@ -1125,14 +1665,9 @@ fn every_tool_call_is_audited() {
 fn costed_rails(idle_kill_minutes: u32, max_spawns_per_hour: u32) -> Guardrails {
     Guardrails {
         max_agents: 6,
-        agent_cli: "claude".into(),
-        worker_model: "sonnet".into(),
-        reviewer_model: "sonnet".into(),
-        orchestrator_model: "opus".into(),
-        auto_ops: false,
         idle_kill_minutes,
         max_spawns_per_hour,
-        watchdog_stall_minutes: 0,
+        ..rails()
     }
 }
 

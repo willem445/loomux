@@ -59,7 +59,7 @@ only gatekeeps final review + merge.
 
 ## Tool surface (MCP)
 
-| tool | orchestrator | worker/reviewer |
+| tool | orchestrator | worker/reviewer/planner |
 | --- | --- | --- |
 | `spawn_agent(name, kind, task, worktree?, branch?)` | ✓ (guardrailed) | ✗ |
 | `send_prompt(agent_id, text)` | ✓ | ✗ |
@@ -71,9 +71,15 @@ only gatekeeps final review + merge.
 | `set_state(state)` | ✓ | ✗ |
 | `group_usage()` | ✓ | ✗ |
 
-Guardrails enforced by `spawn_agent`: live-agent cap (`max_agents`), model pinned per
-kind (`worker_model` / `reviewer_model`), permission mode fixed at group creation
-(`acceptEdits` default; full-auto opt-in). Worktree creation reuses `git_worktree_add`.
+Guardrails enforced by `spawn_agent`: live-agent cap (`max_agents`, counting workers +
+reviewers + planners), CLI + model pinned per role (`{role}_cli` / `{role}_model`, see
+**Plan agent + mixed agent types** below), permission mode fixed at group creation
+(`acceptEdits` default; full-auto opt-in). Worktree creation reuses `git_worktree_add`
+(never for a planner — it is read-only).
+
+`kind` is `worker` (default), `reviewer`, or `planner`. A **planner** explores the
+codebase read-only and writes a structured implementation plan as a GitHub issue comment,
+then reports and exits; it never writes code, branches, worktrees, or PRs.
 
 ## Launcher UX
 
@@ -83,9 +89,13 @@ kind (`worker_model` / `reviewer_model`), permission mode fixed at group creatio
 - **Multiple panes (N)** — spawns N identical agent panes; a worktree name becomes
   `name-1 … name-N` so each agent gets an isolated worktree. (Secondary request.)
 - **Orchestrator + workers** — requires a repository; fields: initial workers (0–6),
-  max live agents (1–12), worker model, reviewer model, permissions. Spawns one
+  max live agents (1–12), a **per-role CLI + model** row for each of orchestrator /
+  worker / reviewer / planner (the top *Agent* select is the group default that seeds
+  every role; each role can override it — issue #4), and permissions. Spawns one
   orchestrator pane (badged `ORCH`) plus N idle workers (badged `W`), all sharing a
-  group color shown as a header dot + pane accent. Reviewers get `REV`.
+  group color shown as a header dot + pane accent. Reviewers get `REV`, planners `PLAN`.
+  Changing a role's CLI re-populates its model suggestions; every distinct role CLI is
+  PATH-checked before launch so a missing CLI fails fast and legibly.
 
 ## Persistence & resume
 
@@ -246,7 +256,7 @@ overlay — same no-resize overlay mechanics as the git / task / audit views —
 alongside the task board and #7's cost figures.
 
 - **Group summary line.** `group_summary` / `orch_group_summary` reports the live-agent
-  count, the role breakdown (orch / worker / reviewer), and uptime — per agent and for the
+  count, the role breakdown (orch / worker / reviewer / planner), and uptime — per agent and for the
   group as a whole (measured from the earliest-started live agent, i.e. the orchestrator).
   Uptime needs a spawn timestamp, so `AgentEntry` carries `started_ms` (distinct from
   `idle_since_ms`, which is about idleness, not age). The panel polls it every 2s and shows
@@ -484,6 +494,127 @@ resolves to the **orchestrator** (not a same-group worker), is attributed to `hu
 audited only under its own group (isolation). Hold-guard tests cover the loop wiring as above.
 The live paste/Enter behavior against a real CLI is validated by hand (no real PTY in test
 mode), consistent with the rest of `deliver_prompt`.
+
+## Plan agent + mixed agent types (#47, #4)
+
+Two related additions: a **planner** role, and **per-role** agent CLI + model.
+
+- **Planner role.** A fourth `Role::Planner` alongside orchestrator/worker/reviewer,
+  spawned through the same `spawn_agent` (`kind: "planner"`) and counting against the
+  same `max_agents` delegate cap. Its template (`templates/planner.md`) scopes it to
+  read-only exploration: it investigates the codebase and posts a structured plan
+  (scope, files, approach, test strategy, risks/mergeability, suggested worker split) as
+  a **GitHub issue comment**, `report`s a one-paragraph summary, and exits. It uses the
+  shared non-orchestrator tool surface (`report` / `message_orchestrator` + read-only
+  `list_agents`/`get_state`/`list_tasks`), so it cannot spawn or steer; the plan comment
+  is its only intended durable output, so a planner session stays cheap and its plan
+  trustworthy. The orchestrator template encodes the *when*: simple/contained work →
+  straight to workers; complex/sprawling/multi-worker work, an uncertain split, or a
+  human-requested plan (incl. the `agent-investigate` label) → planner first, and the plan
+  feeds the worker briefs.
+
+  **What the read-only contract enforces — structural vs instruction-backed** (the
+  distinction matters; earlier drafts overclaimed it as fully structural):
+  - *Structural* (mechanical, verified by tests): a planner never gets a **worktree** —
+    the spawn cwd logic runs it in `group.repo` even when `worktree: true` is passed; and
+    its CLI is launched **read-only** (`build_agent_command(read_only=true)`): on Claude
+    `--disallowedTools Edit Write MultiEdit NotebookEdit` plus `Bash(git commit *)` /
+    `Bash(git push *)`, on Copilot `--deny-tool write|edit` plus `shell(git commit|push)`
+    — deny rules override the allow list / Auto perms on both CLIs. So a planner **cannot
+    edit files, commit, or push**, i.e. cannot produce code changes or push a branch.
+    (Rule-spelling note: on Claude the `:*` wildcard is valid *only* as a trailing suffix.
+    An earlier draft also passed the colon-mid forms `Bash(git commit:*)` / `Bash(git push:*)`
+    as redundant spellings; those are **malformed** — Claude Code ignores them *and* prints a
+    startup warning, which was the "auto deny rule" flash seen on planner boot. The canonical
+    space form is the only spelling now emitted; see the plan-mode decision below.)
+  - *Instruction-backed* (the template + kickoff `PLANNER_READONLY_NOTE`, not a sandbox):
+    `gh` stays allowed (a planner needs `gh issue comment` for its deliverable), so a
+    planner *could* technically run `gh pr create` or create an inert local branch — it is
+    told not to, and with commit/push denied such a branch carries nothing. This is a
+    deliberate trade (plan-comment-as-deliverable over a full jail), now stated honestly
+    rather than presented as an absolute guarantee.
+
+  **Why not the CLI's `plan` permission mode? (the "auto deny rule" flash, #79)** A human
+  reviewing the planner's first boot caught a message about an "auto deny rule" and asked
+  the obvious question: should the planner spawn in claude's `--permission-mode plan`
+  instead of Auto + deny rules, and would plan mode still let it talk to the orchestrator
+  over MCP and post its plan via `gh`? Both were investigated against the CLI docs (no live
+  agent was spawned — reasoning is from `claude --help` and
+  [permission-modes](https://code.claude.com/docs/en/permission-modes.md) /
+  [permissions](https://code.claude.com/docs/en/permissions.md)):
+  - **Plan mode would deadlock this planner.** Plan mode is read-only *and* built around an
+    **interactive** hand-off: Claude researches, presents a plan, and then *asks the human*
+    how to proceed (approve→auto, approve→acceptEdits, keep planning, …). There is **no
+    documented non-interactive / auto-approve** path. Our planner pane has **no human** —
+    so it would sit forever at the approval prompt. Worse, the two things the planner exists
+    to *emit* — the loomux **MCP `report`** and the **`gh issue comment`** plan — are exactly
+    the calls plan mode stops to prompt on before running them: in plan mode "permission
+    prompts still apply as they do in Manual mode", and a mutating shell like `gh issue
+    comment` is not a read, so each raises a **real-time approval prompt** — which, in a
+    human-less pane, is simply never answered. So plan mode does not just add a prompt; it
+    blocks the deliverable. **Copilot's `--plan` / `--mode plan` is the same shape** (an
+    initial mode a human reviews before switching to interactive/autopilot), so switching
+    CLIs doesn't buy a headless plan mode either.
+  - **So the planner keeps Auto + structural deny rules** — which is the *autonomous*
+    equivalent of plan mode's intent: read-only research, but free to emit its plan and
+    report and then exit without waiting on anyone. To make that hold with **no human in the
+    pane**, a `read_only` planner is now launched **unattended regardless of the group's
+    `auto_ops`** (`unattended = auto_ops || read_only` in `build_agent_command`, applied to
+    **both** CLIs): on Claude, Auto perms + a pre-approved `Bash(git *)` / `Bash(gh *)`
+    allowlist; on Copilot, `--autopilot --allow-all-tools --allow-all-paths` — so
+    exploration, `gh issue view`, and the `gh issue comment` plan never prompt, with edits +
+    `git commit`/`git push` denied on both (deny takes precedence over Auto / `--allow-all-tools`).
+    Previously a planner in a **non-auto_ops** group got the interactive preset (`acceptEdits`
+    with no git/gh allowlist on Claude; plain interactive mode with no autopilot on Copilot),
+    so its very first `gh`/explore call would have prompted into the void — a latent deadlock
+    this fixes **on both CLIs**. Workers/reviewers are untouched: without `auto_ops` they
+    still gate ops through the interactive preset.
+  - **The flash itself was ours, not alarming.** It was Claude Code's own startup warning
+    for a **malformed** deny rule: we passed both `Bash(git commit:*)` and `Bash(git commit *)`,
+    on the mistaken belief that an unmatched spelling is silently inert. It isn't — `:*` is a
+    valid wildcard only as a *trailing* suffix (`Bash(gh:*)` is fine); a colon in the *middle*
+    of the command is not, so `Bash(git commit:*)` is discarded as malformed and warns at
+    startup. The enforcing denial rests on the **space form** `Bash(git commit *)`, which is
+    the canonical spelling and actually blocks commit/push; dropping the redundant colon-mid
+    spelling removes the warning at its source (it never contributed to enforcement) rather
+    than papering over it. **Direct answers to the human's two questions:**
+    (a) No — the planner should *not* use plan mode; it would deadlock a human-less pane and
+    block the plan/report. (b) In plan mode it could *not* reliably use the loomux MCP or post
+    via `gh` unattended — each raises a real-time approval prompt no one is there to answer —
+    which is the second reason we keep Auto + deny.
+
+- **Per-role CLI + model.** `Guardrails` gains a per-role CLI (`orchestrator_cli`,
+  `worker_cli`, `reviewer_cli`, `planner_cli`) and `planner_model`, alongside the existing
+  per-role models. `agent_cli` stays as the **group default**: a per-role CLI that is
+  empty inherits it, so old `group.json` (and the single-CLI launcher path) keep working
+  unchanged. Resolution is centralized in `Guardrails::cli_for(role)` / `model_for(role)`,
+  which every spawn site now calls instead of reading `agent_cli` directly — so the
+  claude-vs-copilot decisions (session-id pre-assignment, copilot baseline/session watch,
+  folder pre-trust, MCP-config shape, command adapter) are made **per agent** rather than
+  per group. Model fallbacks follow the role's *effective* CLI (`default_model`: copilot →
+  `auto`; on Claude the reasoning roles orchestrator/planner → the strong tier, worker/
+  reviewer → the mid tier). All new fields persist additively in `group.json` (coexisting
+  with #56's live `max_agents` patch, which only touches that one key), and are read back
+  with empty-string defaults so a resume is forward/backward compatible.
+
+- **Enforcement.** The group-default `agent_cli` is still coerced to a supported CLI in
+  `clamped()` (legacy path), but per-role CLIs are **validated at spawn** rather than
+  coerced: an unsupported per-role CLI (only reachable via a hand-edited `group.json` —
+  the launcher offers only supported CLIs) makes `spawn_agent` return an error naming the
+  supported set, instead of silently downgrading the role to Claude.
+
+- **Launcher.** "Orchestrator + workers" mode renders a CLI select + model picker per
+  role, seeded from the group-default *Agent* select and independently overridable; a
+  role's model list follows its own CLI's suggestions (curated list, merged with the CLI's
+  own reported models once the availability probe returns). Every distinct role CLI is
+  PATH-checked before launch.
+
+- **Prior art.** Pre-existing PR #5 (`feat/agent-profiles`) explored the adjacent idea of
+  configurable, per-agent personas loaded from workspace files. This work is implemented
+  fresh on the current base (which post-dates #5 by months) and takes a narrower,
+  role-based shape — a fixed planner role plus per-role CLI/model — rather than #5's
+  free-form profile files; the only thing carried over is the general direction of
+  differentiating agents per role. #5's disposition (close vs adapt) is the human's call.
 
 ## Risks / limitations
 

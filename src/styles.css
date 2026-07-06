@@ -644,21 +644,33 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .git-overlay[hidden] { display: none; }
 
 .pane-git {
-  flex: 1; min-height: 0; position: relative;
-  display: grid;
-  grid-template:
-    "graph diff" minmax(0, 1fr)
-    "changes changes" minmax(120px, 172px) / minmax(240px, 324px) minmax(0, 1fr);
+  flex: 1; min-height: 0; min-width: 0; position: relative;
+  display: flex; flex-direction: column;
   background: var(--bg-app);
   font-size: 12px;
   outline: none;
 }
 .pane-git[hidden] { display: none; }
 
+/* Top row: graph column | draggable divider | diff panel. The graph's width
+   and the changes strip's height (below) are set inline from stored sizes; the
+   diff and this row flex to fill. Only this inner distribution changes on
+   drag — .pane-git's own box never resizes, so the PTY is untouched. */
+.git-top {
+  flex: 1 1 0; min-height: 0; min-width: 0;
+  display: flex; flex-direction: row;
+}
+
 .git-divider {
   flex: none; height: 5px; cursor: row-resize;
   background: var(--border-soft);
   transition: background 0.15s var(--ease);
+}
+/* Column splitter inside .git-top: a full-height 5px vertical grip. (The base
+   rule's row-resize/height serves the horizontal splitter and pane.ts's
+   overlay divider.) */
+.git-divider.vertical {
+  height: auto; width: 5px; cursor: col-resize; align-self: stretch;
 }
 .git-divider:hover, .git-divider.dragging { background: var(--accent-dim); }
 .git-divider[hidden] { display: none; }
@@ -833,8 +845,9 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 }
 .task-chip.link:hover { color: #cdd8f5; text-decoration: underline; }
 
-/* Merge-gate action buttons (approve / request changes). */
-.task-btn.approve, .task-btn.changes {
+/* Merge-gate action buttons (approve / request changes) and the queued-task
+   start button share the same compact pill shape. */
+.task-btn.approve, .task-btn.changes, .task-btn.start {
   flex: none; height: 18px; font-size: 10px; padding: 0 7px;
   border: 1px solid transparent; white-space: nowrap;
 }
@@ -842,6 +855,8 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .task-btn.approve:hover { background: rgba(158, 206, 106, 0.16); border-color: #3d5a2c; }
 .task-btn.changes { color: #e0af68; }
 .task-btn.changes:hover { background: rgba(224, 175, 104, 0.16); border-color: #55452c; }
+.task-btn.start { color: #7dcfff; }
+.task-btn.start:hover { background: rgba(125, 207, 255, 0.16); border-color: #2c485a; }
 
 /* Request-changes modal, scoped inside the task-board overlay. */
 .tasks-dialog {
@@ -974,6 +989,32 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   padding: 8px 12px; border-bottom: 1px solid var(--border-soft);
 }
 .group-line { color: var(--text); font-weight: 500; }
+
+/* -- max live-agent cap stepper -- */
+.group-maxrow {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap; flex: none;
+  padding: 6px 12px; border-bottom: 1px solid var(--border-soft);
+}
+.group-max { display: inline-flex; align-items: center; gap: 6px; }
+.group-max-label { color: var(--text-dim); font-size: 11px; }
+.group-max-step {
+  font: inherit; font-size: 13px; line-height: 1; cursor: pointer;
+  background: var(--panel-2); color: var(--text);
+  border: 1px solid var(--border-soft); border-radius: 5px;
+  width: 22px; height: 22px; display: inline-flex; align-items: center; justify-content: center;
+}
+.group-max-step:hover { border-color: var(--accent); }
+.group-max-step:disabled { opacity: 0.4; cursor: default; border-color: var(--border-soft); }
+.group-max-input {
+  font: inherit; font-size: 12px; text-align: center; width: 40px;
+  background: var(--panel-2); color: var(--text);
+  border: 1px solid var(--border-soft); border-radius: 5px; padding: 2px 4px;
+}
+.group-max-input:focus { outline: none; border-color: var(--accent); }
+.group-max-input:disabled { opacity: 0.5; }
+.group-max-note { color: var(--text-dim); font-size: 10px; }
+.group-max-note.warn { color: #e0af68; }
+.group-max-err { color: var(--danger); font-size: 10px; }
 .group-cost { color: var(--text-dim); font-size: 11px; }
 .group-cost-live { color: var(--text-dim); font-size: 10px; opacity: 0.75; }
 .group-paused-badge {
@@ -1032,9 +1073,9 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 
 /* -- graph column -- */
 .git-graph {
-  grid-area: graph; min-height: 0;
+  /* flex-basis (width) is set inline from the stored/clamped divider size. */
+  flex: 0 0 auto; min-height: 0; min-width: 0;
   display: flex; flex-direction: column;
-  border-right: 1px solid var(--border-soft);
 }
 .git-graph-head {
   display: flex; align-items: center; gap: 7px; flex: none;
@@ -1088,7 +1129,18 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis;
   color: var(--text);
 }
-.git-when { flex: none; color: var(--text-dim); font-size: 10.5px; }
+/* Trailing metadata columns: committer · short rev · date+time. All dim and
+   non-shrinking so the subject (flex:1) yields first; committer ellipsizes. */
+.git-committer {
+  flex: none; min-width: 0; max-width: 96px;
+  overflow: hidden; text-overflow: ellipsis;
+  color: var(--text-dim); font-size: 10.5px;
+}
+.git-rev {
+  flex: none; color: var(--text-dim); font-size: 10.5px;
+  font-family: "Cascadia Mono", Consolas, monospace;
+}
+.git-when { flex: none; color: var(--text-dim); font-size: 10.5px; font-variant-numeric: tabular-nums; }
 .git-more {
   display: block; margin: 6px auto;
   background: none; border: 1px solid var(--border); border-radius: 6px;
@@ -1099,7 +1151,7 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 
 /* -- diff panel -- */
 .git-diff {
-  grid-area: diff; min-height: 0; min-width: 0;
+  flex: 1 1 0; min-height: 0; min-width: 0;
   display: flex; flex-direction: column;
 }
 .git-diff-head {
@@ -1164,9 +1216,10 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 
 /* -- changes strip -- */
 .git-changes {
-  grid-area: changes; min-height: 0;
+  /* flex-basis (height) is set inline from the stored/clamped divider size;
+     the horizontal divider above provides the visual separation. */
+  flex: 0 0 auto; min-height: 0; min-width: 0;
   display: flex; gap: 0;
-  border-top: 1px solid var(--border);
   background: var(--panel);
 }
 .git-files-col {

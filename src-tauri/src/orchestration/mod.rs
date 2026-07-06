@@ -31,9 +31,96 @@ use crate::obs::LockExt;
 const ORCHESTRATOR_TPL: &str = include_str!("templates/orchestrator.md");
 const WORKER_TPL: &str = include_str!("templates/worker.md");
 const REVIEWER_TPL: &str = include_str!("templates/reviewer.md");
+const PLANNER_TPL: &str = include_str!("templates/planner.md");
+
+/// Read-only containment note handed to a planner at spawn time as its kickoff
+/// "branch note". The worktree denial (spawn cwd logic) and the CLI-level
+/// write/commit denials (`build_agent_command`, `read_only`) enforce most of
+/// this structurally; the note communicates the whole contract to the agent.
+/// Exposed (doc-hidden) so tests can pin the exact text.
+#[doc(hidden)]
+pub const PLANNER_READONLY_NOTE: &str = "You explore the codebase read-only to produce an implementation plan. You never create branches, worktrees, commits, or PRs — your deliverable is a plan written as a GitHub issue comment.";
 
 /// Hard ceiling on `max_agents` regardless of what the launcher asks for.
 const MAX_AGENTS_CEILING: u32 = 12;
+
+/// One-line notice delivered to the orchestrator when the live-agent cap
+/// changes mid-session, so it re-plans against the new ceiling (its kickoff
+/// prompt still carries the old, already-rendered {{MAX_AGENTS}}).
+pub fn max_agents_notice(from: u32, to: u32) -> String {
+    format!("[loomux] max live agents changed {from}→{to} — re-plan accordingly")
+}
+
+/// Quiet window a group's cap must fall silent for before its coalesced
+/// cap-change notice is delivered. Rapid stepper clicks (#79) each persist,
+/// enforce, and audit immediately, but the token-costing orchestrator notice
+/// waits out this window and then spans the whole burst (first change's `from`
+/// → last change's `to`), so a flurry of clicks is one prompt, not many.
+const MAX_NOTICE_DEBOUNCE: Duration = Duration::from_secs(3);
+/// How often the flusher loop checks for a debounced cap-change notice whose
+/// window has elapsed. Well under `MAX_NOTICE_DEBOUNCE` so the delivered notice
+/// lags the last click by at most a tick beyond the debounce.
+const MAX_NOTICE_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
+
+/// A cap-change notice awaiting its debounce window (#79). `from` is the cap
+/// before the burst began — preserved across coalesced changes so the notice
+/// reads end-to-end; `to` is the latest cap; `due_ms` is the Unix-ms at which,
+/// absent any further change, the notice fires.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PendingMaxNotice {
+    from: u32,
+    to: u32,
+    due_ms: u64,
+}
+
+/// Fold one cap change into the per-group debounce map (#79). A change that
+/// lands while a notice is still pending keeps the original `from` (so the
+/// coalesced notice spans the whole burst) and only advances `to` and pushes
+/// the deadline out; the first change of a burst seeds a fresh entry. Pure, so
+/// the coalescing is unit-testable without a clock or a live registry.
+fn record_max_notice(
+    pending: &mut HashMap<String, PendingMaxNotice>,
+    group: &str,
+    from: u32,
+    to: u32,
+    now: u64,
+    debounce: Duration,
+) {
+    let due_ms = now.saturating_add(debounce.as_millis() as u64);
+    pending
+        .entry(group.to_string())
+        .and_modify(|p| {
+            p.to = to;
+            p.due_ms = due_ms;
+        })
+        .or_insert(PendingMaxNotice { from, to, due_ms });
+}
+
+/// Drain the notices whose debounce window has elapsed (`due_ms <= now`),
+/// returning `(group, from, to)` for each that is a real net change. A burst
+/// that nets back to where it started (e.g. 4→3→4) is dropped without a notice
+/// — no orchestrator tokens spent announcing a no-op. Pure, so the flush
+/// decision is unit-testable without sleeping out the debounce.
+fn take_due_max_notices(
+    pending: &mut HashMap<String, PendingMaxNotice>,
+    now: u64,
+) -> Vec<(String, u32, u32)> {
+    let due: Vec<String> = pending
+        .iter()
+        .filter(|(_, p)| p.due_ms <= now)
+        .map(|(g, _)| g.clone())
+        .collect();
+    let mut out = Vec::new();
+    for g in due {
+        if let Some(p) = pending.remove(&g) {
+            if p.from != p.to {
+                out.push((g, p.from, p.to));
+            }
+        }
+    }
+    out
+}
+
 /// Upper bound on the idle-worker auto-kill timeout (24h); 0 disables it.
 const MAX_IDLE_KILL_MINUTES: u32 = 1440;
 /// Upper bound on the spawn-rate guardrail; 0 = unlimited.
@@ -134,6 +221,11 @@ pub enum Role {
     Orchestrator,
     Worker,
     Reviewer,
+    /// Read-only explorer: investigates the codebase and writes a structured
+    /// implementation plan (as a GitHub issue comment), then reports and
+    /// exits. A planner NEVER writes code, branches, or PRs. It counts as a
+    /// delegate against the live-agent cap, like a worker/reviewer.
+    Planner,
 }
 
 impl Role {
@@ -142,6 +234,7 @@ impl Role {
             Role::Orchestrator => "orch",
             Role::Worker => "w",
             Role::Reviewer => "rev",
+            Role::Planner => "plan",
         }
     }
     fn template(self) -> &'static str {
@@ -149,6 +242,7 @@ impl Role {
             Role::Orchestrator => ORCHESTRATOR_TPL,
             Role::Worker => WORKER_TPL,
             Role::Reviewer => REVIEWER_TPL,
+            Role::Planner => PLANNER_TPL,
         }
     }
     fn instructions_file(self) -> &'static str {
@@ -156,6 +250,16 @@ impl Role {
             Role::Orchestrator => "orchestrator.md",
             Role::Worker => "worker.md",
             Role::Reviewer => "reviewer.md",
+            Role::Planner => "planner.md",
+        }
+    }
+    /// Lowercase wire/label name (matches the `Serialize` rename).
+    fn as_str(self) -> &'static str {
+        match self {
+            Role::Orchestrator => "orchestrator",
+            Role::Worker => "worker",
+            Role::Reviewer => "reviewer",
+            Role::Planner => "planner",
         }
     }
 }
@@ -173,14 +277,25 @@ pub enum AgentStatus {
 /// to Claude (explicitly, in `clamped`, never silently at spawn time).
 pub const SUPPORTED_CLIS: [&str; 2] = ["claude", "copilot"];
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Guardrails {
     pub max_agents: u32,
-    /// "claude" | "copilot" — see `SUPPORTED_CLIS`.
+    /// Group-default agent CLI ("claude" | "copilot", see `SUPPORTED_CLIS`).
+    /// A per-role CLI below overrides it; an empty per-role CLI inherits this.
+    /// Kept as the group default so old group.json (pre per-role CLI) and the
+    /// launcher's single-CLI path both keep working (issue #4).
     pub agent_cli: String,
+    /// Per-role agent CLI overrides (issue #4, mixed agent types). Empty =
+    /// inherit `agent_cli`. Resolved through `cli_for`; validated at spawn.
+    pub orchestrator_cli: String,
+    pub worker_cli: String,
+    pub reviewer_cli: String,
+    pub planner_cli: String,
     pub worker_model: String,
     pub reviewer_model: String,
     pub orchestrator_model: String,
+    /// Model for the planner role (issue #47). Sanitized like the others.
+    pub planner_model: String,
     /// Additionally pre-approve `git`/`gh` shell commands for the group's
     /// agents. Never maps to `--dangerously-skip-permissions`: bypass mode
     /// shows a confirm dialog whose default answer is "exit", which the
@@ -204,22 +319,67 @@ impl Guardrails {
     #[doc(hidden)] // pub for integration tests (unit tests can't load the UI stack; see tests/smoke.rs)
     pub fn clamped(mut self) -> Self {
         self.max_agents = self.max_agents.clamp(1, MAX_AGENTS_CEILING);
+        // The group default CLI is coerced to a supported value (legacy /
+        // single-CLI path). Per-role CLIs are validated at spawn instead of
+        // coerced here, so a genuinely unknown per-role type is rejected
+        // rather than silently downgraded (issue #4).
         if !SUPPORTED_CLIS.contains(&self.agent_cli.as_str()) {
             self.agent_cli = "claude".into();
         }
-        // Copilot picks its own best model with "auto"; Claude needs a tier.
-        let (worker_fb, orch_fb) = if self.agent_cli == "copilot" {
-            ("auto", "auto")
-        } else {
-            ("sonnet", "opus")
-        };
-        self.worker_model = sanitize_model(&self.worker_model, worker_fb);
-        self.reviewer_model = sanitize_model(&self.reviewer_model, worker_fb);
-        self.orchestrator_model = sanitize_model(&self.orchestrator_model, orch_fb);
+        // Model fallbacks depend on the role's *effective* CLI: Copilot picks
+        // its own best model with "auto"; Claude needs a tier.
+        self.orchestrator_model =
+            sanitize_model(&self.orchestrator_model, default_model(self.cli_for(Role::Orchestrator), Role::Orchestrator));
+        self.worker_model =
+            sanitize_model(&self.worker_model, default_model(self.cli_for(Role::Worker), Role::Worker));
+        self.reviewer_model =
+            sanitize_model(&self.reviewer_model, default_model(self.cli_for(Role::Reviewer), Role::Reviewer));
+        self.planner_model =
+            sanitize_model(&self.planner_model, default_model(self.cli_for(Role::Planner), Role::Planner));
         self.idle_kill_minutes = self.idle_kill_minutes.min(MAX_IDLE_KILL_MINUTES);
         self.max_spawns_per_hour = self.max_spawns_per_hour.min(MAX_SPAWNS_PER_HOUR);
         self.watchdog_stall_minutes = self.watchdog_stall_minutes.min(MAX_WATCHDOG_STALL_MINUTES);
         self
+    }
+
+    /// The agent CLI a role runs: its per-role override when set, else the
+    /// group default `agent_cli`. May return an unsupported value (a per-role
+    /// CLI is not coerced in `clamped`); `spawn_agent` validates it.
+    pub fn cli_for(&self, role: Role) -> &str {
+        let per_role = match role {
+            Role::Orchestrator => &self.orchestrator_cli,
+            Role::Worker => &self.worker_cli,
+            Role::Reviewer => &self.reviewer_cli,
+            Role::Planner => &self.planner_cli,
+        };
+        if per_role.trim().is_empty() {
+            &self.agent_cli
+        } else {
+            per_role
+        }
+    }
+
+    /// The pinned model for a role.
+    pub fn model_for(&self, role: Role) -> &str {
+        match role {
+            Role::Orchestrator => &self.orchestrator_model,
+            Role::Worker => &self.worker_model,
+            Role::Reviewer => &self.reviewer_model,
+            Role::Planner => &self.planner_model,
+        }
+    }
+}
+
+/// Default model for a role on a given CLI. Copilot picks its own best model
+/// ("auto"); on Claude the reasoning-heavy roles (orchestrator, planner) get
+/// the strong tier and the executing roles (worker, reviewer) the mid tier.
+fn default_model(cli: &str, role: Role) -> &'static str {
+    if cli == "copilot" {
+        return "auto";
+    }
+    match role {
+        Role::Orchestrator | Role::Planner => "opus",
+        Role::Worker | Role::Reviewer => "sonnet",
     }
 }
 
@@ -702,6 +862,12 @@ pub struct OrchRegistry {
     attn_emitted: Mutex<HashMap<String, String>>,
     /// Groups with desktop notifications enabled (durable `notify` marker file).
     notify_groups: Mutex<HashSet<String>>,
+    /// Debounced cap-change notices (#79): group → its pending, not-yet-
+    /// delivered `PendingMaxNotice`. `set_max_agents` folds rapid stepper
+    /// clicks in here (persist/enforce/audit stay per-click); the
+    /// `start_max_notice_flusher` loop delivers one coalesced notice per burst
+    /// once the group falls quiet.
+    pending_max_notice: Mutex<HashMap<String, PendingMaxNotice>>,
     /// Test-only override of the Claude transcript root (`~/.claude/projects`).
     /// `None` in production. Set via `set_claude_projects_dir` so the usage
     /// reader can be pointed at a fixture tree without touching global env —
@@ -1069,6 +1235,7 @@ impl OrchRegistry {
             attn_waiting_ack: Mutex::new(HashSet::new()),
             attn_emitted: Mutex::new(HashMap::new()),
             notify_groups: Mutex::new(HashSet::new()),
+            pending_max_notice: Mutex::new(HashMap::new()),
             claude_projects_dir: Mutex::new(None),
         }
     }
@@ -1385,6 +1552,60 @@ impl OrchRegistry {
         Ok(task)
     }
 
+    /// Guard the start action to items that are actually queued. The UI only
+    /// shows the button on `queued` items, but the command surface is callable
+    /// directly, so enforce it backend-side too — starting an in-progress or
+    /// done item is meaningless.
+    fn ensure_queued(&self, group: &str, id: &str) -> Result<(), String> {
+        let status = self
+            .tasks(group)
+            .into_iter()
+            .find(|t| t.id == id)
+            .ok_or_else(|| format!("unknown task: {id}"))?
+            .status;
+        if status == "queued" {
+            Ok(())
+        } else {
+            Err(format!("task {id} is {status:?}, not queued — only a queued task can be started"))
+        }
+    }
+
+    /// Start a queued item: record a human-attributed note and tell the
+    /// orchestrator to begin work on it now. Deliberately does NOT flip the
+    /// status — the orchestrator moves it to `in-progress` when it actually
+    /// assigns a worker, so the board reflects real assignment rather than
+    /// intent. The notice is best-effort (the board is the source of truth).
+    ///
+    /// A paused group is rejected up front (mirroring `steer_orchestrator`):
+    /// its delivery is silently suppressed and queued prompts aren't replayed
+    /// on resume, so without this guard the nudge would vanish — with a note
+    /// left behind implying it landed. Reject before any mutation so no note is
+    /// appended, and let the human resume first.
+    pub fn start_task(&self, group: &str, id: &str) -> Result<Task, String> {
+        self.ensure_queued(group, id)?;
+        if self.is_paused(group) {
+            return Err("group is paused — resume before starting tasks".into());
+        }
+        let task = self.upsert_task(
+            group,
+            "human",
+            Some(id),
+            TaskPatch {
+                note: Some("Started by the human — asked the orchestrator to begin work.".into()),
+                ..Default::default()
+            },
+        )?;
+        let _ = self.deliver_to_orchestrator(
+            group,
+            &format!(
+                "[loomux] the human started task {} (\"{}\") — begin work on it now.",
+                task.id, task.title
+            ),
+            "human",
+        );
+        Ok(task)
+    }
+
     /// Tell the orchestrator the human touched the board (best-effort; the
     /// board itself is the source of truth via list_tasks).
     fn notify_board_edit(&self, group: &str, summary: &str) {
@@ -1408,11 +1629,7 @@ impl OrchRegistry {
             .unwrap_or_default();
         let record = AgentRecord {
             id: entry.id.clone(),
-            role: match entry.role {
-                Role::Orchestrator => "orchestrator".into(),
-                Role::Worker => "worker".into(),
-                Role::Reviewer => "reviewer".into(),
-            },
+            role: entry.role.as_str().into(),
             name: entry.name.clone(),
             session: entry.session_id.clone(),
             cwd: entry.cwd.clone(),
@@ -1625,9 +1842,16 @@ impl OrchRegistry {
             Guardrails {
                 max_agents: g["max_agents"].as_u64().unwrap_or(4) as u32,
                 agent_cli: s("agent_cli", "claude"),
+                // Per-role CLIs are additive (issue #4): absent in older
+                // group.json → empty → inherit `agent_cli`.
+                orchestrator_cli: s("orchestrator_cli", ""),
+                worker_cli: s("worker_cli", ""),
+                reviewer_cli: s("reviewer_cli", ""),
+                planner_cli: s("planner_cli", ""),
                 worker_model: s("worker_model", ""),
                 reviewer_model: s("reviewer_model", ""),
                 orchestrator_model: s("orchestrator_model", ""),
+                planner_model: s("planner_model", ""),
                 auto_ops: g["auto_ops"].as_bool().unwrap_or(true),
                 idle_kill_minutes: g["idle_kill_minutes"].as_u64().unwrap_or(0) as u32,
                 max_spawns_per_hour: g["max_spawns_per_hour"].as_u64().unwrap_or(0) as u32,
@@ -1642,7 +1866,7 @@ impl OrchRegistry {
     /// persist under the repo-derived group id; guardrails are refreshed from
     /// the new launch.
     pub fn create_group(&self, repo: &str, guardrails: Guardrails) -> Result<GroupInfo, String> {
-        let guardrails = guardrails.clamped();
+        let mut guardrails = guardrails.clamped();
         // Base id is repo-derived so a relaunch resumes the same state dir —
         // but a repo can host several *concurrent* orchestrations, and those
         // must never share a group (their orchestrators would receive each
@@ -1655,6 +1879,19 @@ impl OrchRegistry {
         let dir = self.group_dir(&id);
         fs::create_dir_all(dir.join("configs")).map_err(|e| e.to_string())?;
         let resumed = dir.join("group.json").is_file();
+        // The live-agent cap is adjustable mid-session (`set_max_agents`) and
+        // persisted, so it's a durable human choice — like the pause/notify
+        // markers re-seeded below. On resume, prefer the persisted cap over the
+        // caller's param: the launcher hardcodes its default (4) and can't
+        // pre-fill from group.json, so without this a relaunch would silently
+        // revert an on-the-fly adjustment. Other guardrails still refresh from
+        // the launch (only the cap is live-adjustable). Read before the write
+        // below overwrites the file.
+        if resumed {
+            if let Some((_, persisted)) = self.load_group_file(&id) {
+                guardrails.max_agents = persisted.max_agents.clamp(1, MAX_AGENTS_CEILING);
+            }
+        }
         let info = GroupInfo { id: id.clone(), repo: repo.to_string(), guardrails };
         fs::write(
             dir.join("group.json"),
@@ -1665,9 +1902,14 @@ impl OrchRegistry {
                 "guardrails": {
                     "max_agents": info.guardrails.max_agents,
                     "agent_cli": info.guardrails.agent_cli,
+                    "orchestrator_cli": info.guardrails.orchestrator_cli,
+                    "worker_cli": info.guardrails.worker_cli,
+                    "reviewer_cli": info.guardrails.reviewer_cli,
+                    "planner_cli": info.guardrails.planner_cli,
                     "worker_model": info.guardrails.worker_model,
                     "reviewer_model": info.guardrails.reviewer_model,
                     "orchestrator_model": info.guardrails.orchestrator_model,
+                    "planner_model": info.guardrails.planner_model,
                     "auto_ops": info.guardrails.auto_ops,
                     "idle_kill_minutes": info.guardrails.idle_kill_minutes,
                     "max_spawns_per_hour": info.guardrails.max_spawns_per_hour,
@@ -1995,6 +2237,105 @@ impl OrchRegistry {
             self.audit(group, "human", "notify-off", json!({}));
         }
         Ok(())
+    }
+
+    /// Adjust a live group's max live-agent cap on the fly. Bounds are the
+    /// launcher's `1..=MAX_AGENTS_CEILING`. The new value is written to the
+    /// in-memory guardrail (which `spawn_agent` reads fresh on every spawn, so
+    /// it takes effect immediately — nothing caches the creation-time number)
+    /// and persisted to group.json so a restart keeps it, then the change is
+    /// audited (per-click) and the orchestrator notice is *debounced* — a burst
+    /// of stepper clicks coalesces into one re-plan prompt (#79). Lowering the cap below
+    /// the current live count kills nobody: new spawns are simply refused until
+    /// attrition brings the count back under the cap. Returns the new value.
+    /// A no-op change (`n` already the current cap) short-circuits without a
+    /// second write, audit, or notice. `actor` records who made the change.
+    pub fn set_max_agents(&self, group: &str, n: u32, actor: &str) -> Result<u32, String> {
+        if !(1..=MAX_AGENTS_CEILING).contains(&n) {
+            return Err(format!("max agents must be between 1 and {MAX_AGENTS_CEILING}"));
+        }
+        let old = self.group(group).ok_or("unknown group")?.guardrails.max_agents;
+        if n == old {
+            return Ok(n);
+        }
+        // Persist first: a failed disk write must leave the in-memory cap (the
+        // value enforcement reads) unchanged, so the two never disagree.
+        self.persist_max_agents(group, n)?;
+        self.groups
+            .lock_safe()
+            .get_mut(group)
+            .ok_or("unknown group")?
+            .guardrails
+            .max_agents = n;
+        self.audit(group, actor, "max-agents-set", json!({ "from": old, "to": n }));
+        // The orchestrator's kickoff prompt already rendered the old
+        // {{MAX_AGENTS}} into static text; it needs the new ceiling to re-plan.
+        // But rapid-clicking the stepper (4→3→2) would otherwise fire a notice
+        // per click, each a real prompt that burns orchestrator tokens/time
+        // (#79). So debounce: record the change here (carrying the burst's
+        // original `from`) and let `flush_due_max_notices` deliver ONE notice —
+        // 4→2, not 4→3 then 3→2 — once the clicks stop. Enforcement/persist
+        // above and the audit are per-click and immediate; only the notice waits.
+        record_max_notice(
+            &mut self.pending_max_notice.lock_safe(),
+            group,
+            old,
+            n,
+            now_ms(),
+            MAX_NOTICE_DEBOUNCE,
+        );
+        Ok(n)
+    }
+
+    /// Rewrite only `guardrails.max_agents` in group.json, preserving every
+    /// other stored field (created_ms, the other guardrails, and anything a
+    /// later feature adds). Patching the parsed JSON in place — rather than
+    /// reserializing a full GroupInfo — keeps this additive and rebase-clean.
+    fn persist_max_agents(&self, group: &str, n: u32) -> Result<(), String> {
+        let dir = self.group_dir(group);
+        let path = dir.join("group.json");
+        let mut v: Value = serde_json::from_str(&fs::read_to_string(&path).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+        // Guard the indexing so a corrupt-but-valid-JSON file (e.g. a `null`
+        // root) fails soft instead of panicking on assignment.
+        let obj = v.as_object_mut().ok_or("group.json root is not a JSON object")?;
+        match obj.get_mut("guardrails").and_then(Value::as_object_mut) {
+            Some(guard) => {
+                guard.insert("max_agents".into(), json!(n));
+            }
+            None => {
+                obj.insert("guardrails".into(), json!({ "max_agents": n }));
+            }
+        }
+        // Crash-safe write: serialize to a temp file, then atomically rename
+        // over group.json (same pattern as usage.json). group.json is
+        // identity-critical — a half-written file breaks the rejoin path
+        // ("group.json is missing") — so never expose a truncated version.
+        let body = serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?;
+        let tmp = dir.join("group.json.tmp");
+        fs::write(&tmp, &body).map_err(|e| e.to_string())?;
+        if fs::rename(&tmp, &path).is_err() {
+            // Rename can fail if the destination exists on some platforms; fall
+            // back to a direct write so the update isn't lost.
+            fs::write(&path, &body).map_err(|e| e.to_string())?;
+            let _ = fs::remove_file(&tmp);
+        }
+        Ok(())
+    }
+
+    /// Deliver any debounced cap-change notice whose quiet window has elapsed
+    /// (#79). Called on a timer by `start_max_notice_flusher`; `now` is injected
+    /// so tests drive the coalescing deterministically without sleeping out the
+    /// debounce. A burst that netted to a no-op is dropped inside
+    /// `take_due_max_notices` and never reaches the orchestrator.
+    #[doc(hidden)] // pub for integration tests
+    pub fn flush_due_max_notices(&self, now: u64) {
+        let due = take_due_max_notices(&mut self.pending_max_notice.lock_safe(), now);
+        for (group, from, to) in due {
+            // Best-effort, like the exit notice: a dead/paused orchestrator
+            // just misses it. Delivery is intentionally outside the lock.
+            let _ = self.deliver_to_orchestrator(&group, &max_agents_notice(from, to), "loomux");
+        }
     }
 
     /// Read every agent pane's output counter, last-lines tail, and last human
@@ -2335,11 +2676,7 @@ impl OrchRegistry {
             .session_id
             .clone()
             .unwrap_or_else(|| format!("agent:{}", entry.id));
-        let role = match entry.role {
-            Role::Orchestrator => "orchestrator",
-            Role::Worker => "worker",
-            Role::Reviewer => "reviewer",
-        };
+        let role = entry.role.as_str();
         let mut snap = UsageSnapshot {
             key,
             agent_id: entry.id.clone(),
@@ -2494,15 +2831,20 @@ impl OrchRegistry {
             .filter(|a| a.group == group && a.status != AgentStatus::Dead)
             .cloned()
             .collect();
-        let cli = self
-            .group(group)
-            .map(|g| g.guardrails.agent_cli)
+        // Each agent's CLI is per-role (issue #4), so resolve it per agent.
+        // The group-level `cli` in the summary is the group default (workers/
+        // reviewers/planners may each run a different one).
+        let rails = self.group(group).map(|g| g.guardrails);
+        let cli = rails
+            .as_ref()
+            .map(|g| g.agent_cli.clone())
             .unwrap_or_else(|| "claude".to_string());
 
         // Refresh each live agent's durable snapshot from its current usage.
         let mut live_keys: HashSet<String> = HashSet::new();
         for a in &live_agents {
-            let snap = self.compute_usage_snapshot(a, &cli);
+            let cli = rails.as_ref().map(|g| g.cli_for(a.role)).unwrap_or("claude");
+            let snap = self.compute_usage_snapshot(a, cli);
             live_keys.insert(snap.key.clone());
             self.upsert_usage_snapshot(group, snap);
         }
@@ -2611,7 +2953,7 @@ impl OrchRegistry {
             .filter(|a| a.group == group && a.status != AgentStatus::Dead)
             .cloned()
             .collect();
-        let (mut orch, mut worker, mut reviewer) = (0u32, 0u32, 0u32);
+        let (mut orch, mut worker, mut reviewer, mut planner) = (0u32, 0u32, 0u32, 0u32);
         let mut earliest: Option<u64> = None;
         let mut list: Vec<Value> = live
             .iter()
@@ -2620,6 +2962,7 @@ impl OrchRegistry {
                     Role::Orchestrator => orch += 1,
                     Role::Worker => worker += 1,
                     Role::Reviewer => reviewer += 1,
+                    Role::Planner => planner += 1,
                 }
                 earliest = Some(earliest.map_or(a.started_ms, |e| e.min(a.started_ms)));
                 json!({
@@ -2633,9 +2976,16 @@ impl OrchRegistry {
         json!({
             "group": group,
             "live_agents": live.len(),
+            // The current adjustable cap and how many delegates count against
+            // it, so the UI can show the stepper's value and warn when a lower
+            // cap would (harmlessly) block spawns until attrition. Must match
+            // `live_delegate_count` (the value enforcement actually reads):
+            // planners count too (#47), so a cap-below-live warning stays honest.
+            "max_agents": self.group(group).map(|g| g.guardrails.max_agents),
+            "live_delegates": worker + reviewer + planner,
             "paused": self.is_paused(group),
             "uptime_ms": earliest.map(|e| now.saturating_sub(e)),
-            "roles": { "orchestrator": orch, "worker": worker, "reviewer": reviewer },
+            "roles": { "orchestrator": orch, "worker": worker, "reviewer": reviewer, "planner": planner },
             "agents": list,
         })
     }
@@ -2736,10 +3086,11 @@ impl OrchRegistry {
             ("MAX_AGENTS", &g.guardrails.max_agents.to_string()),
             ("WORKER_MODEL", g.guardrails.worker_model.as_str()),
             ("REVIEWER_MODEL", g.guardrails.reviewer_model.as_str()),
+            ("PLANNER_MODEL", g.guardrails.planner_model.as_str()),
         ];
         let vars: Vec<(&str, &str)> = vars.iter().map(|(k, v)| (*k, *v)).collect();
         let dir = self.group_dir(&g.id);
-        for role in [Role::Orchestrator, Role::Worker, Role::Reviewer] {
+        for role in [Role::Orchestrator, Role::Worker, Role::Reviewer, Role::Planner] {
             fs::write(dir.join(role.instructions_file()), render_template(role.template(), &vars))
                 .map_err(|e| e.to_string())?;
         }
@@ -2804,7 +3155,21 @@ impl OrchRegistry {
     /// file never prompts) and the loomux MCP tools are pre-approved (so
     /// `report` etc. never prompt). `auto_ops` additionally pre-approves
     /// git/gh commands so the branch→commit→PR flow runs unattended;
-    /// everything else still asks the human.
+    /// everything else still asks the human. A `read_only` planner is
+    /// *always* treated as unattended (Auto perms + git/gh allowlist)
+    /// regardless of `auto_ops`: it never mutates and has no human in its
+    /// pane, so gating it would only deadlock it (see below).
+    ///
+    /// `read_only` hardens the planner contract at the CLI level (#47): where
+    /// the CLI supports tool denial, the file-editing tools and the git
+    /// mutation subcommands (`commit`/`push`) are denied outright, so a planner
+    /// cannot write code or create branches/commits/pushes even under Auto
+    /// perms — while `gh` stays available so it can still post its plan as an
+    /// issue comment. Deny rules take precedence over the allow list on both
+    /// CLIs. NOTE: this is a real, structural denial for the write/commit/push
+    /// surface; it is deliberately NOT a full sandbox (e.g. `gh pr create` is
+    /// left reachable so the plan comment works), so the *complete* read-only
+    /// contract still rests partly on the planner's instructions.
     #[allow(clippy::too_many_arguments)]
     #[doc(hidden)] // pub for integration tests
     pub fn build_agent_command(
@@ -2817,7 +3182,17 @@ impl OrchRegistry {
         workdir: &Path,
         session: Option<&str>,
         resume: bool,
+        read_only: bool,
     ) -> String {
+        // A planner never mutates and has no human in its pane, so there is
+        // nothing for `auto_ops` to gate: it must explore, post its plan
+        // comment, and report with zero prompts, or it would stall waiting on
+        // an approval no one is there to give. So a planner (`read_only`)
+        // always runs unattended on BOTH CLIs; workers/reviewers follow the
+        // group's `auto_ops`. (This is also why claude's `plan` permission
+        // mode / copilot's `--plan` can't be used here — both hold the plan
+        // for interactive human sign-off.)
+        let unattended = auto_ops || read_only;
         match cli {
             "copilot" => {
                 // Copilot has `--resume <id>` but no way to pre-assign an
@@ -2841,12 +3216,26 @@ impl OrchRegistry {
                     group_dir.display(),
                     workdir.display()
                 );
-                if auto_ops {
+                if unattended {
                     // Copilot's own unattended mode: autopilot + all tools
-                    // + no path-verification prompts.
+                    // + no path-verification prompts. A planner (read_only)
+                    // always takes this path even in a non-auto_ops group —
+                    // interactive mode would stall it on a human that isn't
+                    // there; the deny rules below keep it read-only, and deny
+                    // takes precedence over --allow-all-tools in Copilot.
                     cmd.push_str(" --autopilot --allow-all-tools --allow-all-paths");
                 } else {
                     cmd.push_str(" --allow-tool \"shell(git:*)\" --allow-tool \"shell(gh:*)\"");
+                }
+                if read_only {
+                    // Deny file writes and git mutations even under
+                    // --allow-all-tools (deny takes precedence in Copilot).
+                    // `write`/`edit` are Copilot's file-modification tools;
+                    // `gh` is left allowed so the plan comment can be posted.
+                    cmd.push_str(
+                        " --deny-tool \"write\" --deny-tool \"edit\" \
+                         --deny-tool \"shell(git commit)\" --deny-tool \"shell(git push)\"",
+                    );
                 }
                 cmd
             }
@@ -2861,18 +3250,45 @@ impl OrchRegistry {
                     (None, _) => String::new(),
                 };
                 // "Auto" preset = Claude Code's native auto permission mode
-                // (what the human uses interactively); "edits" = acceptEdits.
-                let perm = if auto_ops { "auto" } else { "acceptEdits" };
+                // (what the human uses interactively); otherwise acceptEdits.
+                // A planner (`read_only`) is always `unattended` (see above),
+                // so it runs under Auto perms even in a non-auto_ops group.
+                let perm = if unattended { "auto" } else { "acceptEdits" };
                 let mut cmd = format!(
                     "claude {session_flag}--mcp-config \"{}\" --strict-mcp-config --model {model} \
                      --permission-mode {perm} --add-dir \"{}\" --allowedTools mcp__loomux",
                     cfg.display(),
                     group_dir.display()
                 );
-                if auto_ops {
-                    // Both rule spellings: docs use `Bash(git:*)`, the CLI
-                    // help shows `Bash(git *)`; unmatched patterns are inert.
-                    cmd.push_str(" \"Bash(git:*)\" \"Bash(git *)\" \"Bash(gh:*)\" \"Bash(gh *)\"");
+                if unattended {
+                    // Pre-approve git + gh so the unattended flow runs without
+                    // prompts (workers: branch→commit→PR; planners: read-only
+                    // explore + `gh issue comment` for the plan). `Bash(git *)`
+                    // matches every git subcommand; a planner's denials below
+                    // carve commit/push back out.
+                    cmd.push_str(" \"Bash(git *)\" \"Bash(gh *)\"");
+                }
+                if read_only {
+                    // Deny the file-editing tools and the git mutation
+                    // subcommands outright (--disallowedTools overrides the
+                    // permission mode AND the allow list in Claude Code), so a
+                    // planner can't write code or commit/push. `gh` (incl.
+                    // `gh issue comment`) stays reachable for the plan comment.
+                    //
+                    // Spelling matters. `:*` is a valid wildcard only as a
+                    // TRAILING suffix (`Bash(gh:*)` is fine); a colon in the
+                    // MIDDLE of the command (`Bash(git commit:*)`) is not —
+                    // Claude Code discards that rule as malformed AND prints a
+                    // startup warning, the "auto deny rule" flash a human
+                    // caught on planner boot. So the enforcing denial rests on
+                    // the space form `Bash(git commit *)`: it is the canonical
+                    // spelling and actually blocks commit/push, with no
+                    // warning. (An earlier draft passed both spellings; the
+                    // colon-mid one added nothing but the warning.)
+                    cmd.push_str(
+                        " --disallowedTools Edit Write MultiEdit NotebookEdit \
+                         \"Bash(git commit *)\" \"Bash(git push *)\"",
+                    );
                 }
                 cmd
             }
@@ -2928,12 +3344,19 @@ impl OrchRegistry {
             self.check_and_record_spawn(group_id, group.guardrails.max_spawns_per_hour)?;
         }
 
-        // Guardrail: the model is pinned per role at group creation.
-        let model = match role {
-            Role::Orchestrator => &group.guardrails.orchestrator_model,
-            Role::Worker => &group.guardrails.worker_model,
-            Role::Reviewer => &group.guardrails.reviewer_model,
-        };
+        // Guardrail: the CLI and model are pinned per role at group creation
+        // (issue #4). Reject an unknown per-role CLI at spawn rather than
+        // silently downgrading it — the launcher only offers supported CLIs,
+        // so an unsupported one here means a hand-edited group.json.
+        let cli = group.guardrails.cli_for(role);
+        if !SUPPORTED_CLIS.contains(&cli) {
+            return Err(format!(
+                "guardrail: unsupported agent CLI {cli:?} for role {} — supported: {}",
+                role.as_str(), SUPPORTED_CLIS.join(", ")
+            ));
+        }
+        let cli = cli.to_string();
+        let model = group.guardrails.model_for(role);
 
         let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
         let agent_id = format!("{}-{seq}", role.prefix());
@@ -2952,13 +3375,13 @@ impl OrchRegistry {
         let resume = resume_session.is_some();
         let session_id = match resume_session {
             Some(s) => Some(sanitize_session(&s).ok_or("invalid resume session id")?),
-            None => (group.guardrails.agent_cli == "claude").then(new_session_uuid),
+            None => (cli == "claude").then(new_session_uuid),
         };
 
         // Copilot mints its own session id after boot (no `--session-id`), so
         // snapshot the sessions that already exist now, before this pane's
         // copilot starts — the watcher then identifies the newly appeared one.
-        let copilot_baseline = (!resume && group.guardrails.agent_cli == "copilot")
+        let copilot_baseline = (!resume && cli == "copilot")
             .then(|| {
                 crate::sessions::copilot_session_state_root()
                     .map(|root| crate::sessions::copilot_session_ids(&root))
@@ -2975,7 +3398,7 @@ impl OrchRegistry {
                 return Err(format!("cwd does not exist: {c}"));
             }
             (c, String::new())
-        } else if use_worktree && role != Role::Orchestrator {
+        } else if use_worktree && role != Role::Orchestrator && role != Role::Planner {
             let wt = crate::git::git_worktree_add(group.repo.clone(), branch_name.clone())?;
             (wt.clone(), format!(
                 "Your working directory is a dedicated git worktree at {wt} already checked out on branch '{branch_name}'."
@@ -2984,18 +3407,24 @@ impl OrchRegistry {
             (group.repo.clone(), String::new())
         } else if role == Role::Reviewer {
             (group.repo.clone(), "You review; you do not create branches or push. Inspect PRs via gh (checking out the PR branch locally is fine).".to_string())
+        } else if role == Role::Planner {
+            // Planners explore read-only in the repo itself and never branch,
+            // worktree, commit, or PR — so a worktree is never created for
+            // them even if `use_worktree` was set (the CLI-level write/commit
+            // denials in `build_agent_command` back this note structurally).
+            (group.repo.clone(), PLANNER_READONLY_NOTE.to_string())
         } else {
             (group.repo.clone(), format!(
                 "Work in the repo itself; create branch '{branch_name}' off the default branch before changing anything. Never commit to the default branch."
             ))
         };
 
-        if group.guardrails.agent_cli == "copilot" {
+        if cli == "copilot" {
             pre_trust_copilot_folder(&cwd);
         }
-        let cfg = self.write_mcp_config(group_id, &agent_id, &token, &group.guardrails.agent_cli)?;
+        let cfg = self.write_mcp_config(group_id, &agent_id, &token, &cli)?;
         let command = self.build_agent_command(
-            &group.guardrails.agent_cli,
+            &cli,
             model,
             group.guardrails.auto_ops,
             &cfg,
@@ -3003,6 +3432,7 @@ impl OrchRegistry {
             Path::new(&cwd),
             session_id.as_deref(),
             resume,
+            role == Role::Planner, // read_only: deny writes/commits at the CLI level
         );
 
         let entry = AgentEntry {
@@ -3052,7 +3482,7 @@ impl OrchRegistry {
         self.persist_agent_record(&entry, "running");
         self.audit(group_id, "loomux", "agent-spawn", json!({
             "agent": agent_id, "role": role, "name": display, "cwd": cwd,
-            "model": model, "worktree": use_worktree, "branch": branch_name, "task": task,
+            "cli": cli, "model": model, "worktree": use_worktree, "branch": branch_name, "task": task,
             "session": session_id, "resume": resume,
         }));
         // Breadcrumb (no prompt/task text): ids + role only.
@@ -3147,18 +3577,18 @@ impl OrchRegistry {
             Role::Orchestrator => format!(
                 "You are the orchestrator of loomux agent group {gid} for the repository {repo}.\n\
                  First read your role instructions: {ins}\n\
-                 Guardrails (enforced by loomux): max {max} live agents, worker model {wm}, reviewer model {rm}.\n\
+                 Guardrails (enforced by loomux): max {max} live agents, worker model {wm}, reviewer model {rm}, planner model {pm}.\n\
                  Start by calling get_state, run `gh issue list --label agent-managed --state open`, call list_agents, \
                  reconcile them, then give the human a short status summary and wait for direction.",
                 gid = g.id, repo = g.repo, ins = instructions.display(),
-                max = g.guardrails.max_agents, wm = g.guardrails.worker_model, rm = g.guardrails.reviewer_model,
+                max = g.guardrails.max_agents, wm = g.guardrails.worker_model,
+                rm = g.guardrails.reviewer_model, pm = g.guardrails.planner_model,
             ),
-            Role::Worker | Role::Reviewer => {
+            Role::Worker | Role::Reviewer | Role::Planner => {
                 let head = format!(
                     "You are \"{name}\" ({id}), a {role} agent in loomux group {gid} for repository {repo}.\n\
                      First read your role instructions: {ins}\n{note}",
-                    name = a.name, id = a.id,
-                    role = if a.role == Role::Worker { "worker" } else { "reviewer" },
+                    name = a.name, id = a.id, role = a.role.as_str(),
                     gid = g.id, repo = g.repo, ins = instructions.display(), note = branch_note,
                 );
                 if a.task.trim().is_empty() {
@@ -3470,7 +3900,7 @@ impl OrchRegistry {
         // statusline does not, but token usage is the source we rely on.
         let cli = self
             .group(&snapshot.group)
-            .map(|g| g.guardrails.agent_cli)
+            .map(|g| g.guardrails.cli_for(snapshot.role).to_string())
             .unwrap_or_else(|| "claude".to_string());
         let usage = self.compute_usage_snapshot(&snapshot, &cli);
         self.upsert_usage_snapshot(&snapshot.group, usage);
@@ -3536,6 +3966,18 @@ pub fn start_watchdog(reg: Arc<OrchRegistry>) {
     });
 }
 
+/// Background loop for the debounced cap-change notice (#79): every
+/// `MAX_NOTICE_FLUSH_INTERVAL` it delivers any coalesced max-agents notice
+/// whose quiet window has elapsed, so a burst of stepper clicks reaches the
+/// orchestrator as one re-plan prompt instead of one per click. Started once
+/// at app setup.
+pub fn start_max_notice_flusher(reg: Arc<OrchRegistry>) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(MAX_NOTICE_FLUSH_INTERVAL);
+        reg.flush_due_max_notices(now_ms());
+    });
+}
+
 /// Background loop for attention routing (#6): every `ATTENTION_INTERVAL` it
 /// recomputes which panes need the human (idle-with-prompt, worker reports,
 /// human merge gates), pushes the set to the frontend for pane badges, and
@@ -3561,9 +4003,16 @@ pub fn create_orchestration(
     initial_workers: u32,
     max_agents: u32,
     agent_cli: String,
+    // Per-role CLI overrides (issue #4). Empty inherits `agent_cli`; the
+    // launcher sends the picked CLI for each role.
+    orchestrator_cli: String,
+    worker_cli: String,
+    reviewer_cli: String,
+    planner_cli: String,
     worker_model: String,
     reviewer_model: String,
     orchestrator_model: String,
+    planner_model: String,
     auto_ops: bool,
     idle_kill_minutes: u32,
     max_spawns_per_hour: u32,
@@ -3575,9 +4024,14 @@ pub fn create_orchestration(
         Guardrails {
             max_agents,
             agent_cli,
+            orchestrator_cli,
+            worker_cli,
+            reviewer_cli,
+            planner_cli,
             worker_model,
             reviewer_model,
             orchestrator_model,
+            planner_model,
             auto_ops,
             idle_kill_minutes,
             max_spawns_per_hour,
@@ -3638,6 +4092,19 @@ pub fn orch_set_notify(
     enabled: bool,
 ) -> Result<(), String> {
     reg.set_notify(&group_id, enabled)
+}
+
+/// Change a live group's max live-agent cap (durable, bounds-checked, audited).
+/// Takes effect on the next spawn; lowering it below the current live count
+/// blocks new spawns until attrition rather than killing anyone. Returns the
+/// applied value. Human action from the GroupView overlay.
+#[tauri::command]
+pub fn orch_set_max_agents(
+    reg: tauri::State<Arc<OrchRegistry>>,
+    group_id: String,
+    max_agents: u32,
+) -> Result<u32, String> {
+    reg.set_max_agents(&group_id, max_agents, "human")
 }
 
 /// Aggregate per-pane session cost/usage into one group summary for the UI.
@@ -3711,28 +4178,39 @@ fn register_orchestrator_pane(
     initial_workers: u32,
 ) -> Result<SpawnRequest, String> {
     let model = group.guardrails.orchestrator_model.clone();
+    // The orchestrator's CLI is per-role too (issue #4). It must be a supported
+    // CLI; the launcher only offers supported ones, so an unknown value here
+    // is a hand-edited group.json.
+    let cli = group.guardrails.cli_for(Role::Orchestrator);
+    if !SUPPORTED_CLIS.contains(&cli) {
+        return Err(format!(
+            "unsupported orchestrator CLI {cli:?} — supported: {}",
+            SUPPORTED_CLIS.join(", ")
+        ));
+    }
+    let cli = cli.to_string();
     let token = new_token();
     let agent_id = format!("orch-{}", reg.seq.fetch_add(1, Ordering::SeqCst) + 1);
-    if group.guardrails.agent_cli == "copilot" {
+    if cli == "copilot" {
         pre_trust_copilot_folder(&group.repo);
     }
-    let cfg = reg.write_mcp_config(&group.id, &agent_id, &token, &group.guardrails.agent_cli)?;
+    let cfg = reg.write_mcp_config(&group.id, &agent_id, &token, &cli)?;
     let resume = resume_session.is_some();
     let session_id = match resume_session {
         Some(s) => Some(sanitize_session(&s).ok_or("invalid resume session id")?),
-        None => (group.guardrails.agent_cli == "claude").then(new_session_uuid),
+        None => (cli == "claude").then(new_session_uuid),
     };
     // Copilot mints its own id on boot; snapshot existing sessions now so the
     // orchestrator's newly created one can be tracked (this is what gives a
     // copilot orchestration its ORCH chip and restore).
-    let copilot_baseline = (!resume && group.guardrails.agent_cli == "copilot")
+    let copilot_baseline = (!resume && cli == "copilot")
         .then(|| {
             crate::sessions::copilot_session_state_root()
                 .map(|root| crate::sessions::copilot_session_ids(&root))
                 .unwrap_or_default()
         });
     let command = reg.build_agent_command(
-        &group.guardrails.agent_cli,
+        &cli,
         &model,
         group.guardrails.auto_ops,
         &cfg,
@@ -3740,6 +4218,7 @@ fn register_orchestrator_pane(
         Path::new(&group.repo),
         session_id.as_deref(),
         resume,
+        false, // the orchestrator is never read-only
     );
     let entry = AgentEntry {
         id: agent_id.clone(),
@@ -3905,7 +4384,11 @@ pub fn resume_recorded_session(
                 .into(),
         );
     }
-    let role = if record.role == "reviewer" { Role::Reviewer } else { Role::Worker };
+    let role = match record.role.as_str() {
+        "reviewer" => Role::Reviewer,
+        "planner" => Role::Planner,
+        _ => Role::Worker,
+    };
     let cwd = reg
         .merged_records(&record.group_id)
         .into_iter()
@@ -4253,6 +4736,18 @@ pub fn orch_request_changes(
     reg.request_changes(&group_id, &id, &findings)
 }
 
+/// Start a queued item: record a human-attributed note and tell the
+/// orchestrator to begin work. Does not flip the status — the orchestrator
+/// moves it to `in-progress` when it actually assigns a worker.
+#[tauri::command]
+pub fn orch_start_task(
+    reg: tauri::State<Arc<OrchRegistry>>,
+    group_id: String,
+    id: String,
+) -> Result<Task, String> {
+    reg.start_task(&group_id, &id)
+}
+
 #[cfg(test)]
 mod hold_tests {
     use super::*;
@@ -4298,5 +4793,75 @@ mod hold_tests {
         // A clock skew where last_input is "after" now must not panic or wrap;
         // saturating_sub yields 0 → within window → hold.
         assert!(should_hold_for_user(11_000, 10_000, Duration::from_secs(1), WINDOW, CAP));
+    }
+}
+
+#[cfg(test)]
+mod max_notice_tests {
+    use super::*;
+
+    const DEB: Duration = Duration::from_secs(3);
+
+    #[test]
+    fn burst_coalesces_to_one_span() {
+        // Three rapid clicks 4→3, 3→2, 2→1 inside the window: one pending entry
+        // spanning the whole burst, its deadline riding the LAST click.
+        let mut p = HashMap::new();
+        record_max_notice(&mut p, "g", 4, 3, 1_000, DEB);
+        record_max_notice(&mut p, "g", 3, 2, 1_500, DEB);
+        record_max_notice(&mut p, "g", 2, 1, 2_000, DEB);
+        assert_eq!(p.len(), 1, "a burst stays one pending notice");
+        // Not yet due (last click at 2_000 → due 5_000): nothing flushes.
+        assert!(take_due_max_notices(&mut p, 4_999).is_empty());
+        // Past the window: exactly one notice, from the burst's first value to
+        // its last — 4→1, never the intermediate 4→3 / 3→2.
+        assert_eq!(take_due_max_notices(&mut p, 5_000), vec![("g".to_string(), 4, 1)]);
+        assert!(p.is_empty(), "delivered notices are drained");
+    }
+
+    #[test]
+    fn each_click_pushes_the_deadline_out() {
+        // A click landing before the prior one's window elapses must reset the
+        // deadline, or a long slow drag would fire mid-burst.
+        let mut p = HashMap::new();
+        record_max_notice(&mut p, "g", 4, 3, 1_000, DEB); // due 4_000
+        record_max_notice(&mut p, "g", 3, 2, 3_900, DEB); // due 6_900
+        // At 4_000 the first click's deadline has passed, but the second reset
+        // it — so nothing is due yet.
+        assert!(take_due_max_notices(&mut p, 4_000).is_empty());
+        assert_eq!(take_due_max_notices(&mut p, 6_900), vec![("g".to_string(), 4, 2)]);
+    }
+
+    #[test]
+    fn spaced_changes_deliver_separately() {
+        // Two changes far enough apart that the first flushes before the second
+        // arrives: two distinct notices, each its own span.
+        let mut p = HashMap::new();
+        record_max_notice(&mut p, "g", 4, 3, 1_000, DEB);
+        assert_eq!(take_due_max_notices(&mut p, 4_000), vec![("g".to_string(), 4, 3)]);
+        record_max_notice(&mut p, "g", 3, 2, 10_000, DEB);
+        assert_eq!(take_due_max_notices(&mut p, 13_000), vec![("g".to_string(), 3, 2)]);
+    }
+
+    #[test]
+    fn net_noop_burst_delivers_nothing() {
+        // 4→3→4 nets to no change: no orchestrator tokens spent on a no-op.
+        let mut p = HashMap::new();
+        record_max_notice(&mut p, "g", 4, 3, 1_000, DEB);
+        record_max_notice(&mut p, "g", 3, 4, 1_500, DEB);
+        assert!(take_due_max_notices(&mut p, 5_000).is_empty());
+        assert!(p.is_empty(), "the netted-out entry is still drained, not left pending");
+    }
+
+    #[test]
+    fn groups_debounce_independently() {
+        // Two groups clicking at once don't share a deadline or a span.
+        let mut p = HashMap::new();
+        record_max_notice(&mut p, "a", 4, 2, 1_000, DEB); // due 4_000
+        record_max_notice(&mut p, "b", 5, 6, 3_000, DEB); // due 6_000
+        // Only group a is due at 4_000.
+        assert_eq!(take_due_max_notices(&mut p, 4_000), vec![("a".to_string(), 4, 2)]);
+        assert!(p.contains_key("b"), "b keeps waiting out its own window");
+        assert_eq!(take_due_max_notices(&mut p, 6_000), vec![("b".to_string(), 5, 6)]);
     }
 }

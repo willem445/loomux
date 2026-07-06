@@ -53,6 +53,7 @@ pub fn run() {
             orchestration::start_idle_reaper(reg.clone());
             orchestration::start_watchdog(reg.clone());
             orchestration::start_attention(reg.clone());
+            orchestration::start_max_notice_flusher(reg.clone());
             std::thread::spawn(move || orchestration::mcp::serve(reg));
             Ok(())
         })
@@ -101,6 +102,7 @@ pub fn run() {
             orchestration::orch_open_ref,
             orchestration::orch_approve_task,
             orchestration::orch_request_changes,
+            orchestration::orch_start_task,
             orchestration::orch_pause_group,
             orchestration::orch_resume_group,
             orchestration::orch_group_paused,
@@ -108,6 +110,7 @@ pub fn run() {
             orchestration::orch_ack_attention_pty,
             orchestration::orch_notify_enabled,
             orchestration::orch_set_notify,
+            orchestration::orch_set_max_agents,
             orchestration::orch_group_usage,
             orchestration::orch_group_summary,
             orchestration::orch_end_group,

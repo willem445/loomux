@@ -83,6 +83,9 @@ npm test           # unit tests (Node's built-in runner; no extra deps)
 | Steer orchestrator | `Alt+P` (focus the compose strip under an orchestrator pane); `Esc` returns to the terminal |
 | Copy / paste | `Ctrl+Shift+C` / `Ctrl+Shift+V` (`Ctrl+V` also works) |
 
+A CLI running in a pane (e.g. an agent that says "copied to clipboard") copies
+straight to your system clipboard too, via OSC 52 — no manual re-select needed.
+
 Splitting in the same direction adds a sibling column/row — repeated splits
 form an even matrix instead of a lopsided staircase.
 
@@ -105,6 +108,14 @@ can be rearranged without splitting from scratch:
   the bottom of the grid — it keeps running. Click its chip to bring it back,
   or the chip's ✕ to close it for good. (This is loomux's take on the issue's
   "minimize to tray": an in-app restore dock rather than the OS tray.)
+- **Fold a whole group** — an orchestrator pane has a fold toggle (the stacked
+  panes icon in its header, mirrored in the group lifecycle panel) that
+  minimizes *every* worker/reviewer pane in its group to the dock at once,
+  leaving just the orchestrator. Click it again to restore them all. Handy once
+  a big group has opened a pane per agent and you want the screen back without
+  ✕-clicking or minimizing them one by one. Folded panes behave like any other
+  docked pane — they keep running, still pulse for attention on their dock chip,
+  and can be restored individually.
 
 ### Session browser
 
@@ -141,6 +152,13 @@ scoped to the repository the shell is currently in — a commit graph, a diff
 preview, and the working-tree changes with staging and commit. It never
 resizes the terminal underneath. Press `Esc` (or ✕) to return.
 
+Drag the divider **between the graph and diff** (or **above the changes
+strip**) to resize those sub-panes — handy for inspecting wide diffs or busy
+branch graphs. Each divider remembers its position across sessions, and neither
+side can be collapsed below a usable minimum. As with the overlay's bottom
+edge, these dividers only redistribute space *inside* the panel; its outer size
+never changes, so the terminal's PTY is never resized.
+
 Toolbar (top-right of the graph):
 
 | Button | Does |
@@ -176,37 +194,56 @@ the pane closes.
 
 Loomux natively supports an **orchestrator / worker** pattern: a long-lived
 planning agent that manages a small fleet of worker agents, each in its own
-visible pane, with a reviewer agent per PR — and you only gatekeep the final
-review and merge.
+visible pane, with a reviewer agent per PR and an optional **planner** agent
+that scopes bigger work first — and you only gatekeep the final review and merge.
 
 **Launch:** turn on *✦ agents* mode, open a new pane, and pick
-**Orchestrator + workers** in the launcher. Choose the agent CLI (Claude
-Code or Copilot CLI — the model dropdowns are populated by querying the
-selected CLI's own help, so new models like `fable` appear automatically,
-with a custom-entry escape hatch), the repository, how many idle workers
-to start with, and the guardrails: max live agents, per-role models, and
-permissions. Permissions are either *Auto* (Claude Code's native auto
-permission mode plus pre-approved `git`/`gh` and loomux agent tools —
-recommended) or *Accept edits only*; loomux never uses
-`--dangerously-skip-permissions`. The launcher warns inline when the
-selected agent CLI isn't installed, and an agent pane that dies with an
-error stays open so you can read what happened. The launcher's
-**Multiple panes** mode also spawns N independent agent panes at once (a
-worktree name fans out to `name-1 … name-N`).
+**Orchestrator + workers** in the launcher. Choose the agent CLI and model
+**per role** — orchestrator, worker, reviewer, and planner each get their own
+CLI (Claude Code or Copilot CLI) and model, so you can mix agent types in one
+group (e.g. a Claude orchestrator driving Copilot workers). The top *Agent*
+select is the group default that seeds every role; override any role you like.
+Model dropdowns are populated by querying the selected CLI's own help, so new
+models like `fable` appear automatically, with a custom-entry escape hatch.
+Then set the repository, how many idle workers to start with, and the
+guardrails: max live agents and permissions. Permissions are either *Auto*
+(Claude Code's native auto permission mode plus pre-approved `git`/`gh` and
+loomux agent tools — recommended) or *Accept edits only*; loomux never uses
+`--dangerously-skip-permissions`. The launcher warns inline when any selected
+role's CLI isn't installed, and an agent pane that dies with an error stays
+open so you can read what happened. The launcher's **Multiple panes** mode
+also spawns N independent agent panes at once (a worktree name fans out to
+`name-1 … name-N`).
 
 **How it works:** loomux hosts a local MCP server; every agent pane in a
 group connects with its own identity token (`--strict-mcp-config`, so
 workers see nothing else). The orchestrator plans work as GitHub issues
-(labeled `agent-managed`), decides worktree-vs-branch per task by
+(labeled `agent-managed`, its "I own this" marker), decides worktree-vs-branch per task by
 mergeability, and delegates via tools that *type prompts into the worker's
 CLI* — you see every instruction verbatim in the pane, can steer any agent
 by typing yourself, and everything lands in an audit log. Workers follow the
 standard flow (branch → implement → tests that test intent → docs → PR) and
-report back; reviewers post `gh pr review`s. **No agent ever merges** — you
-do, after your own review.
+report back; reviewers post `gh pr review`s. For bigger or sprawling work the
+orchestrator can spawn a **planner** first — a read-only agent that explores the
+codebase and posts a structured implementation plan (scope, files, test
+strategy, risks, and a suggested worker split) as an issue comment, then exits;
+the orchestrator turns that plan into worker briefs. A planner's read-only
+contract is enforced at the CLI level where possible — it never gets a worktree,
+and its file-editing tools plus `git commit`/`git push` are denied — so it
+can't edit files or push code; the rest (not opening PRs) rides on its
+instructions, since `gh` stays available for the plan comment. **No agent ever
+merges** — you do, after your own review.
 
-Panes are badged by role and group number (`ORCH 1` / `W 1` vs `ORCH 2` /
-`W 2`) with a per-group accent color, so parallel orchestrations — even on
+**Go-signal labels:** you can hand the orchestrator work without typing in its
+pane. Label a groomed issue **`agent-ready`** and it gets picked up and driven to
+a PR through the normal flow; label one **`agent-investigate`** and a planner
+(or the orchestrator itself, for small questions) researches options/feasibility
+and posts its findings or a plan as an issue comment (no code) for you to act on.
+The orchestrator polls for newly labeled issues and pulls them onto the board
+automatically.
+
+Panes are badged by role and group number (`ORCH 1` / `W 1` / `REV 1` / `PLAN 1`
+vs `ORCH 2` / `W 2`) with a per-group accent color, so parallel orchestrations — even on
 the same repository — pair up at a glance. Unrelated panes are fully
 isolated from a group's tools.
 
@@ -217,6 +254,15 @@ links, notes, and priority order. You can add, edit, annotate, reorder, and
 delete tasks; the orchestrator is notified of your edits and maintains the
 same board through its tools. Issue and PR chips are **clickable** — they open
 in your browser.
+
+**Start:** a `queued` item shows a **▶ Start** button — your nudge to have the
+orchestrator begin work on it now. Clicking it records a human note on the task
+and delivers a *begin work* prompt to the orchestrator pane (same delivery path
+as the merge-gate buttons). It deliberately leaves the status at `queued`: the
+orchestrator flips it to `in-progress` when it actually assigns a worker, so the
+board reflects real assignment rather than intent. If the group is **paused**,
+Start is refused up front with a toast (resume first) — a paused group's
+delivery is suppressed, so the nudge would otherwise be silently lost.
 
 **Merge gate:** when an item reaches `pr` or `human-testing` — the point where
 only you can decide — the board shows two buttons instead of making you type
@@ -277,6 +323,14 @@ so it takes a second confirming click; an optional **remove worktrees** checkbox
 also deletes each agent's git worktree (uncommitted changes are lost, but the
 branches — where the PRs live — are always kept). The teardown is audited, closes
 the group's panes for you, and clears any pause so a later relaunch starts clean.
+The panel also carries a **max live agents** stepper (1–12): adjust the cap on
+the fly and loomux persists it, audits the change, and drops a one-line notice
+into the orchestrator pane so it re-plans against the new ceiling. Lowering the
+cap below the current live count never kills anyone — it just blocks new spawns
+until agents finish and attrition brings the count back under the cap.
+The panel also carries a **Fold panes** button — the same group-wide
+minimize/restore toggle as the orchestrator header — for reclaiming screen space
+when a group grows large (see [Rearranging panes](#rearranging-panes)).
 
 **Per-task sessions:** each worker is scoped to exactly one work item, and
 loomux records its session id on the roster and task board. Claude ids are
@@ -286,9 +340,10 @@ after it starts. Either way, follow-ups on a finished task *resume* that
 worker's session (same context, same workspace) instead of cold-starting a
 new agent or disturbing a busy one — for Claude and Copilot groups alike.
 
-**Guardrails** are enforced by loomux, not the model: a hard cap on live
-agents (≤12), models pinned per role at launch, and the permission mode
-fixed at group creation (native auto mode or acceptEdits — never bypass).
+**Guardrails** are enforced by loomux, not the model: a cap on live agents
+(≤12, set at launch and adjustable live from the lifecycle panel), models
+pinned per role at launch, and the permission mode fixed at group creation
+(native auto mode or acceptEdits — never bypass).
 
 **Restart after loomux closes:** orchestration sessions are marked in the
 session browser (`ORCH` / `W` / `REV` chips). Clicking a dead group's

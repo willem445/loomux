@@ -38,21 +38,33 @@ type Mode = "single" | "multi" | "orchestrator";
 /** Agent CLIs the orchestration backend has adapters for, with the model
  *  suggestions each CLI accepts. Free text is allowed — the lists are
  *  datalist suggestions, and the backend sanitizes whatever arrives. */
+/** Orchestration roles the launcher configures a CLI + model for. Mirrors the
+ *  backend `Role` variants that can be spawned in a group (issue #4/#47). */
+type OrchRole = "orchestrator" | "worker" | "reviewer" | "planner";
+const ORCH_ROLES: { key: OrchRole; label: string }[] = [
+  { key: "orchestrator", label: "Orchestrator" },
+  { key: "worker", label: "Worker" },
+  { key: "reviewer", label: "Reviewer" },
+  { key: "planner", label: "Planner" },
+];
+
 interface OrchCli {
   id: string;
   models: string[];
-  defaults: { worker: string; reviewer: string; orchestrator: string };
+  defaults: Record<OrchRole, string>;
 }
 const ORCH_CLIS: OrchCli[] = [
   {
     id: "claude",
     models: ["sonnet", "opus", "haiku", "fable"],
-    defaults: { worker: "sonnet", reviewer: "sonnet", orchestrator: "opus" },
+    // Reasoning-heavy roles (orchestrator, planner) default to the strong
+    // tier; executing roles (worker, reviewer) to the mid tier.
+    defaults: { orchestrator: "opus", worker: "sonnet", reviewer: "sonnet", planner: "opus" },
   },
   {
     id: "copilot",
     models: ["auto", "claude-sonnet-4.6", "claude-haiku-4.5", "gpt-5.2", "gpt-5.3-codex"],
-    defaults: { worker: "auto", reviewer: "auto", orchestrator: "auto" },
+    defaults: { orchestrator: "auto", worker: "auto", reviewer: "auto", planner: "auto" },
   },
 ];
 
@@ -191,9 +203,14 @@ export class AgentLauncher {
   private idleKillInput: HTMLInputElement;
   private spawnRateInput: HTMLInputElement;
   private watchdogInput: HTMLInputElement;
-  private workerModel: ModelPicker;
-  private reviewerModel: ModelPicker;
-  private orchModel: ModelPicker;
+  /** Per-role CLI + model controls (issue #4, mixed agent types). Built once
+   *  in the constructor; the group's default CLI (the top Agent field) seeds
+   *  every role and can be overridden per role. */
+  private roleControls: {
+    key: OrchRole;
+    cli: HTMLSelectElement;
+    model: ModelPicker;
+  }[];
   private permsSel: HTMLSelectElement;
   private agentWarn: HTMLElement;
   /** One probe per program per app run; backend caches too. */
@@ -294,9 +311,18 @@ export class AgentLauncher {
     // goes silent (no output, no report) for this long. Default on — it's a
     // non-destructive safety net, not a cost driver.
     this.watchdogInput = numberInput(10, 0, 1440);
-    this.workerModel = new ModelPicker();
-    this.reviewerModel = new ModelPicker();
-    this.orchModel = new ModelPicker();
+    // Per-role CLI + model. Each role picks its own agent CLI (claude /
+    // copilot / …) and model; changing a role's CLI re-populates its model
+    // list from that CLI's suggestions (issue #4).
+    this.roleControls = ORCH_ROLES.map(({ key }) => {
+      const cli = select(ORCH_CLIS.map((c) => [c.id, c.id]));
+      const model = new ModelPicker();
+      cli.addEventListener("change", () => {
+        this.applyRoleModels(key);
+        this.updateAgentWarning();
+      });
+      return { key, cli, model };
+    });
     this.permsSel = select([
       ["auto", "Auto — pre-approve git/gh + agent tools (recommended)"],
       ["edits", "Accept edits only — you approve git/gh yourself"],
@@ -307,13 +333,19 @@ export class AgentLauncher {
       field("Initial workers", this.workersInput),
       field("Max live agents", this.maxAgentsInput)
     );
+    // One row per role: [role label] CLI select + model picker.
+    const roleField = (label: string, cli: HTMLSelectElement, model: ModelPicker): HTMLElement => {
+      const pair = document.createElement("div");
+      pair.className = "dlg-row";
+      pair.append(cli, model.root);
+      return field(label, pair);
+    };
     const guardRow2 = document.createElement("div");
-    guardRow2.className = "dlg-row";
-    guardRow2.append(
-      field("Orchestrator model", this.orchModel.root),
-      field("Worker model", this.workerModel.root),
-      field("Reviewer model", this.reviewerModel.root)
-    );
+    guardRow2.className = "dlg-field";
+    for (const rc of this.roleControls) {
+      const label = ORCH_ROLES.find((r) => r.key === rc.key)!.label;
+      guardRow2.append(roleField(`${label} — CLI + model`, rc.cli, rc.model));
+    }
     const guardRow3 = document.createElement("div");
     guardRow3.className = "dlg-row";
     guardRow3.append(
@@ -442,22 +474,29 @@ export class AgentLauncher {
     this.updateAgentWarning();
     if (!restricted) return;
     if (!supported.has(this.agentSel.value)) this.agentSel.value = ORCH_CLIS[0].id;
-    const cli = this.orchCliFor(this.agentSel.value);
-    this.setModelOptions(cli, cli.models);
+    // The top Agent field is the group *default* CLI: seed every role's CLI
+    // from it (the common case is one CLI for the whole group), then populate
+    // each role's model list. Per-role selects override it afterward.
+    for (const rc of this.roleControls) {
+      rc.cli.value = this.agentSel.value;
+      this.applyRoleModels(rc.key);
+    }
+  }
+
+  /** Populate a role's model picker from its selected CLI: curated suggestions
+   *  first, merged with the CLI's own reported models once the probe returns. */
+  private applyRoleModels(role: OrchRole): void {
+    const rc = this.roleControls.find((r) => r.key === role)!;
+    const cli = this.orchCliFor(rc.cli.value);
+    rc.model.setOptions(cli.models, cli.defaults[role]);
     void this.probe(cli.id).then((p) => {
-      if (this.mode !== "orchestrator" || this.agentSel.value !== cli.id) return;
+      if (this.mode !== "orchestrator" || rc.cli.value !== cli.id) return;
       if (p.models.length) {
         // CLI-reported models first, curated suggestions appended.
         const merged = [...p.models, ...cli.models.filter((m) => !p.models.includes(m))];
-        this.setModelOptions(cli, merged);
+        rc.model.setOptions(merged, cli.defaults[role]);
       }
     });
-  }
-
-  private setModelOptions(cli: OrchCli, models: string[]): void {
-    this.orchModel.setOptions(models, cli.defaults.orchestrator);
-    this.workerModel.setOptions(models, cli.defaults.worker);
-    this.reviewerModel.setOptions(models, cli.defaults.reviewer);
   }
 
   /** Probe an agent program (availability + models), memoized. */
@@ -480,8 +519,31 @@ export class AgentLauncher {
     return command.split(/\s+/)[0]?.toLowerCase() || null;
   }
 
-  /** Inline warning when the selected agent's CLI isn't on PATH. */
+  /** Distinct agent CLIs an orchestrator launch would spawn across all roles —
+   *  each must be on PATH (issue #4: roles can run different CLIs). */
+  private orchProgramsToCheck(): string[] {
+    const ids = new Set<string>([this.orchCliFor(this.agentSel.value).id]);
+    for (const rc of this.roleControls) ids.add(this.orchCliFor(rc.cli.value).id);
+    return [...ids];
+  }
+
+  /** Inline warning when a selected agent's CLI isn't on PATH. In orchestrator
+   *  mode every role's CLI is checked; the first missing one is surfaced. */
   private updateAgentWarning(): void {
+    if (this.mode === "orchestrator") {
+      const ids = this.orchProgramsToCheck();
+      void Promise.all(ids.map((id) => this.probe(id).then((p) => ({ id, p })))).then((results) => {
+        if (this.mode !== "orchestrator") return; // mode changed under us
+        const missing = results.find(({ p }) => !p.available);
+        if (!missing) {
+          this.agentWarn.classList.remove("visible");
+        } else {
+          this.agentWarn.textContent = `⚠ ${missing.p.error ?? `'${missing.id}' was not found on PATH`}`;
+          this.agentWarn.classList.add("visible");
+        }
+      });
+      return;
+    }
     const program = this.currentProgram();
     if (!program) {
       this.agentWarn.classList.remove("visible");
@@ -523,14 +585,25 @@ export class AgentLauncher {
     if (this.busy) return;
     const repo = this.repoInput.value.trim();
 
-    // Fail fast (and legibly) when the agent's CLI isn't installed —
-    // otherwise the pane just flashes the shell's error and dies.
-    const program = this.currentProgram();
-    if (program) {
-      const p = await this.probe(program);
-      if (!p.available) {
-        this.showError(p.error ?? `'${program}' was not found on PATH.`);
-        return;
+    // Fail fast (and legibly) when a selected CLI isn't installed — otherwise
+    // the pane just flashes the shell's error and dies. In orchestrator mode
+    // every role can run a different CLI, so check each distinct one.
+    if (this.mode === "orchestrator") {
+      for (const id of this.orchProgramsToCheck()) {
+        const p = await this.probe(id);
+        if (!p.available) {
+          this.showError(p.error ?? `'${id}' was not found on PATH.`);
+          return;
+        }
+      }
+    } else {
+      const program = this.currentProgram();
+      if (program) {
+        const p = await this.probe(program);
+        if (!p.available) {
+          this.showError(p.error ?? `'${program}' was not found on PATH.`);
+          return;
+        }
       }
     }
 
@@ -541,18 +614,32 @@ export class AgentLauncher {
         return;
       }
       addRecentRepo(repo);
-      const cli = this.orchCliFor(this.agentSel.value);
-      setDefaultAgent(cli.id);
+      const groupCli = this.orchCliFor(this.agentSel.value);
+      setDefaultAgent(groupCli.id);
+      const role = (key: OrchRole): { cli: string; model: string } => {
+        const rc = this.roleControls.find((r) => r.key === key)!;
+        const c = this.orchCliFor(rc.cli.value);
+        return { cli: c.id, model: rc.model.value || c.defaults[key] };
+      };
+      const orch = role("orchestrator");
+      const worker = role("worker");
+      const reviewer = role("reviewer");
+      const planner = role("planner");
       this.close({
         kind: "orchestrator",
         config: {
           repo,
-          agentCli: cli.id,
+          agentCli: groupCli.id,
+          orchestratorCli: orch.cli,
+          workerCli: worker.cli,
+          reviewerCli: reviewer.cli,
+          plannerCli: planner.cli,
           initialWorkers: intVal(this.workersInput, 2),
           maxAgents: intVal(this.maxAgentsInput, 4),
-          workerModel: this.workerModel.value || cli.defaults.worker,
-          reviewerModel: this.reviewerModel.value || cli.defaults.reviewer,
-          orchestratorModel: this.orchModel.value || cli.defaults.orchestrator,
+          workerModel: worker.model,
+          reviewerModel: reviewer.model,
+          orchestratorModel: orch.model,
+          plannerModel: planner.model,
           autoOps: this.permsSel.value === "auto",
           idleKillMinutes: intVal(this.idleKillInput, 0),
           watchdogStallMinutes: intVal(this.watchdogInput, 10),
