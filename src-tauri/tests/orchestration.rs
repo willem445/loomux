@@ -782,6 +782,84 @@ fn claude_permission_mode_maps_unattended() {
 }
 
 #[test]
+fn build_agent_command_full_line_snapshots() {
+    // Snapshot the ENTIRE command line for a representative matrix (rev-33
+    // note). The other build_agent_command tests inspect the refactor with
+    // `.contains()`, which can't catch a stray space, a dropped flag, or a
+    // reordered fragment; asserting the full string pins the exact output so
+    // any future drift in the shared flag atoms fails loudly here. Fixed paths
+    // (no session/resume) keep the strings deterministic.
+    let (reg, _d) = test_registry();
+    let cfg = Path::new("C:/x/cfg.json");
+    let gdir = Path::new("C:/data/group");
+    let wd = Path::new("C:/repo");
+    // signature: (cli, model, auto_ops, cfg, group_dir, workdir, session, resume, read_only)
+    let cmd = |cli, model, auto_ops, read_only| {
+        reg.build_agent_command(cli, model, auto_ops, cfg, gdir, wd, None, false, read_only)
+    };
+
+    // Claude worker, auto_ops ON → native Auto mode + git/gh pre-approval.
+    assert_eq!(
+        cmd("claude", "sonnet", true, false),
+        "claude --mcp-config \"C:/x/cfg.json\" --strict-mcp-config --model sonnet \
+         --permission-mode auto --add-dir \"C:/data/group\" --allowedTools mcp__loomux \
+         \"Bash(git *)\" \"Bash(gh *)\""
+    );
+
+    // Claude worker, auto_ops OFF → acceptEdits, no git/gh, no denials.
+    assert_eq!(
+        cmd("claude", "sonnet", false, false),
+        "claude --mcp-config \"C:/x/cfg.json\" --strict-mcp-config --model sonnet \
+         --permission-mode acceptEdits --add-dir \"C:/data/group\" --allowedTools mcp__loomux"
+    );
+
+    // Copilot worker, auto_ops ON → copilot's unattended trio.
+    assert_eq!(
+        cmd("copilot", "auto", true, false),
+        "copilot --additional-mcp-config \"@C:/x/cfg.json\" --model auto \
+         --add-dir \"C:/data/group\" --add-dir \"C:/repo\" --allow-tool loomux --no-auto-update \
+         --autopilot --allow-all-tools --allow-all-paths"
+    );
+
+    // Copilot worker, auto_ops OFF → the conservative git/gh allowlist branch.
+    assert_eq!(
+        cmd("copilot", "auto", false, false),
+        "copilot --additional-mcp-config \"@C:/x/cfg.json\" --model auto \
+         --add-dir \"C:/data/group\" --add-dir \"C:/repo\" --allow-tool loomux --no-auto-update \
+         --allow-tool \"shell(git:*)\" --allow-tool \"shell(gh:*)\""
+    );
+
+    // Claude planner (read_only) in a NON-auto_ops group → unattended anyway,
+    // plus the write/commit/push denials, gh still reachable.
+    assert_eq!(
+        cmd("claude", "opus", false, true),
+        "claude --mcp-config \"C:/x/cfg.json\" --strict-mcp-config --model opus \
+         --permission-mode auto --add-dir \"C:/data/group\" --allowedTools mcp__loomux \
+         \"Bash(git *)\" \"Bash(gh *)\" --disallowedTools Edit Write MultiEdit NotebookEdit \
+         \"Bash(git commit *)\" \"Bash(git push *)\""
+    );
+
+    // Copilot planner (read_only) in a NON-auto_ops group → autopilot + deny
+    // rules; gh not denied.
+    assert_eq!(
+        cmd("copilot", "auto", false, true),
+        "copilot --additional-mcp-config \"@C:/x/cfg.json\" --model auto \
+         --add-dir \"C:/data/group\" --add-dir \"C:/repo\" --allow-tool loomux --no-auto-update \
+         --autopilot --allow-all-tools --allow-all-paths \
+         --deny-tool \"write\" --deny-tool \"edit\" \
+         --deny-tool \"shell(git commit)\" --deny-tool \"shell(git push)\""
+    );
+
+    // Unknown CLI falls back to the claude adapter byte-for-byte (never a
+    // silent half-built command) — same string as the claude worker case.
+    assert_eq!(
+        cmd("totally-unknown-cli", "sonnet", true, false),
+        cmd("claude", "sonnet", true, false),
+        "an unrecognized CLI must build the exact claude fallback command"
+    );
+}
+
+#[test]
 fn copilot_mcp_config_includes_tools_allowlist() {
     let (reg, _d) = test_registry();
     let mut rails = rails();
