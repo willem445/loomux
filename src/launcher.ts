@@ -15,9 +15,11 @@ import type { OrchestratorConfig } from "./orchestration";
 import {
   AGENTS,
   addRecentRepo,
+  getAutopilot,
   getCustomCommand,
   getDefaultAgent,
   getRecentRepos,
+  setAutopilot,
   setCustomCommand,
   setDefaultAgent,
 } from "./agents";
@@ -196,6 +198,10 @@ export class AgentLauncher {
   private worktreeInput: HTMLInputElement;
   private nameField: HTMLElement;
   private nameInput: HTMLInputElement;
+  // Autopilot toggle (single + multi modes): launch with the CLI's unattended
+  // "allow all" flags. Default ON, persisted (#101).
+  private autopilotField: HTMLElement;
+  private autopilotInput: HTMLInputElement;
   // Orchestrator guardrails.
   private orchFields: HTMLElement;
   private workersInput: HTMLInputElement;
@@ -215,6 +221,9 @@ export class AgentLauncher {
   private agentWarn: HTMLElement;
   /** One probe per program per app run; backend caches too. */
   private probes = new Map<string, Promise<CliProbe>>();
+  /** Autopilot flags per program, memoized. Empty string = the CLI has no
+   *  unattended flag surface, so the toggle is hidden/inert for it (#101). */
+  private autopilotFlags = new Map<string, Promise<string>>();
 
   private errorEl: HTMLElement;
   private launchBtn: HTMLButtonElement;
@@ -251,6 +260,7 @@ export class AgentLauncher {
     this.agentSel.addEventListener("change", () => {
       this.customField.hidden = this.agentSel.value !== "custom" || this.mode === "orchestrator";
       this.applyOrchCli();
+      this.applyAutopilot();
       this.updateName();
     });
     this.agentField = field("Agent", this.agentSel);
@@ -297,6 +307,24 @@ export class AgentLauncher {
     this.nameInput.spellcheck = false;
     this.nameInput.addEventListener("input", () => (this.nameDirty = true));
     this.nameField = field("Pane name", this.nameInput);
+
+    // Autopilot toggle (#101): launch the agent with the same unattended
+    // permission flags a group worker gets (claude's Auto mode + git/gh
+    // pre-approval, copilot's --allow-all-tools/--allow-all-paths), so a single
+    // pane doesn't start in the CLI's interactive prompt-on-everything mode. The
+    // flags come from the backend (`agent_autopilot_flags`) — the same source
+    // the orchestration path uses, so the two can't drift. Default ON.
+    this.autopilotInput = document.createElement("input");
+    this.autopilotInput.type = "checkbox";
+    this.autopilotInput.className = "dlg-check";
+    const autopilotLabel = document.createElement("label");
+    autopilotLabel.className = "dlg-toggle";
+    const autopilotText = document.createElement("span");
+    autopilotText.textContent = "Autopilot — pre-approve all tools (allow all)";
+    autopilotLabel.append(this.autopilotInput, autopilotText);
+    this.autopilotField = document.createElement("div");
+    this.autopilotField.className = "dlg-field";
+    this.autopilotField.appendChild(autopilotLabel);
 
     // Orchestrator guardrails: enforced by the backend; the dialog only
     // collects them. Models are pinned per role at group creation; the
@@ -382,6 +410,7 @@ export class AgentLauncher {
       this.countField,
       field("Repository", repoRow),
       this.worktreeField,
+      this.autopilotField,
       this.orchFields,
       this.nameField,
       this.errorEl,
@@ -439,6 +468,7 @@ export class AgentLauncher {
       })
     );
     this.worktreeInput.value = "";
+    this.autopilotInput.checked = getAutopilot();
     this.nameDirty = false;
     this.applyMode();
     this.setBusy(false);
@@ -454,7 +484,42 @@ export class AgentLauncher {
     this.orchFields.hidden = m !== "orchestrator";
     this.nameField.hidden = m === "orchestrator";
     this.applyOrchCli();
+    this.applyAutopilot();
     this.updateName();
+  }
+
+  /** Show the autopilot toggle only where it applies — single/multi mode, a
+   *  non-custom agent whose CLI actually has unattended flags. Orchestrator
+   *  mode has its own permission control; custom commands the user fully owns
+   *  (appending flags could collide with ones they typed). */
+  private applyAutopilot(): void {
+    const applies = this.mode !== "orchestrator" && this.agentSel.value !== "custom";
+    if (!applies) {
+      this.autopilotField.hidden = true;
+      return;
+    }
+    const program = this.currentProgram();
+    if (!program) {
+      this.autopilotField.hidden = true;
+      return;
+    }
+    void this.autopilotFlagsFor(program).then((flags) => {
+      // Bail if the selection moved while the (memoized) lookup resolved.
+      if (this.mode === "orchestrator" || this.agentSel.value === "custom") return;
+      if (this.currentProgram() !== program) return;
+      this.autopilotField.hidden = !flags;
+    });
+  }
+
+  /** The unattended launch flags for a program, memoized. Empty when the CLI
+   *  has no autopilot surface (backend returns ""), or on any lookup error. */
+  private autopilotFlagsFor(program: string): Promise<string> {
+    let p = this.autopilotFlags.get(program);
+    if (!p) {
+      p = invoke<string>("agent_autopilot_flags", { program }).catch((): string => "");
+      this.autopilotFlags.set(program, p);
+    }
+    return p;
   }
 
   private orchCliFor(id: string): OrchCli {
@@ -650,7 +715,7 @@ export class AgentLauncher {
     }
 
     const agent = AGENTS.find((a) => a.id === this.agentSel.value) ?? AGENTS[0];
-    const command = agent.id === "custom" ? this.customInput.value.trim() : agent.command;
+    let command = agent.id === "custom" ? this.customInput.value.trim() : agent.command;
     if (!command) {
       this.showError("Enter the command line for the custom agent.");
       this.customInput.focus();
@@ -664,10 +729,22 @@ export class AgentLauncher {
     }
     const count = this.mode === "multi" ? Math.min(8, Math.max(2, intVal(this.countInput, 3))) : 1;
 
+    // Autopilot (#101): append the CLI's unattended flags so every launched
+    // pane (single, or each of the N in multi mode) skips the interactive
+    // permission prompts. Persisted regardless of whether it applied this time.
+    // Skipped for custom commands (the user owns those) and CLIs with no
+    // unattended surface (backend returns ""). OFF → command is untouched.
+    setAutopilot(this.autopilotInput.checked);
+    const bareCommand = command; // pre-flags, for the pane-name fallback
+    if (agent.id !== "custom" && this.autopilotInput.checked) {
+      const flags = await this.autopilotFlagsFor(command.split(/\s+/)[0]?.toLowerCase() ?? "");
+      if (flags) command = `${command} ${flags}`;
+    }
+
     this.setBusy(true);
     this.hideError();
     try {
-      const baseName = this.nameInput.value.trim() || command;
+      const baseName = this.nameInput.value.trim() || bareCommand;
       const specs: AgentLaunchSpec[] = [];
       for (let i = 1; i <= count; i++) {
         let cwd = repo || undefined;

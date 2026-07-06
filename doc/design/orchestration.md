@@ -655,8 +655,46 @@ Two related additions: a **planner** role, and **per-role** agent CLI + model.
     allowlist; on Copilot, `--autopilot --allow-all-tools --allow-all-paths` — so
     exploration, `gh issue view`, and the `gh issue comment` plan never prompt, with edits +
     `git commit`/`git push` denied on both (deny takes precedence over Auto / `--allow-all-tools`).
+
+    - **Copilot autopilot mode, and why groups DO enter it (#101 delta).** Reading the
+      installed Copilot bundle (v1.0.68, `app.js` + the `runtime.node` prompt strings) settled
+      what autopilot *mode* changes beyond the idle auto-continue loop: it injects an extra
+      **system-prompt** block, gated on `p.autopilotActive` (`_e = p.autopilotActive ?
+      promptsCliAutopilotInstructions(...) : ""`), reading *"Autopilot mode is currently
+      active … persist autonomously to complete the user's task … continue executing without
+      waiting for user input … The user may not even be present."* Without it the agent keeps
+      the `ask_user` tool (gated by the `ask-user` feature flag, **not** by mode) and its
+      interactive framing — it will describe itself as interactive and may pause to ask. For an
+      unattended, loomux-driven worker that autonomy directive is exactly what we want, so the
+      **group** copilot posture is `--autopilot --allow-all-tools --allow-all-paths`
+      (`COPILOT_GROUP_AUTOPILOT_FLAGS`). The **single-pane** posture stays
+      `--allow-all-tools --allow-all-paths` (`COPILOT_UNATTENDED_FLAGS`, no `--autopilot`): a
+      human is at that pane, interactive framing is correct, and no one wants an unbidden
+      startup dialog. The two atoms are pinned to differ only by `--autopilot` (a test asserts
+      `GROUP == "--autopilot " + single`).
+
+    - **Answering the consent dialog deterministically.** `--autopilot` makes Copilot open its
+      "Enable autopilot mode" dialog at startup (menu: *Enable all permissions (recommended)* /
+      *Continue with limited* / *Cancel*; the recommended item is default-highlighted at
+      `initialIndex` 0 and Enter selects it). Group workers *already* reached autopilot mode
+      historically — but only because the kickoff's own Enter happened to land on this dialog,
+      a collision that also intermittently **swallowed the kickoff** (the lost-prompt incidents
+      #99's echo-retry was papering over). We now do it on purpose: for a freshly spawned
+      unattended copilot agent, `deliver_prompt` runs `confirm_copilot_autopilot_dialog` after
+      the readiness wait and **before** any paste — it watches the pane tail for the dialog
+      (`copilot_autopilot_prompt_detected`, anchored on the title *and* the enable option so
+      prose can't trip it) and sends one `Enter` (`COPILOT_AUTOPILOT_CONFIRM_KEYS`) to accept
+      the default, then lets the TUI repaint. The brief is pasted only afterward, so it can
+      never collide with the dialog. Fail-soft: if the dialog never appears within
+      `AUTOPILOT_DIALOG_WAIT` (Copilot changed the flow, or consent was pre-recorded), the
+      confirm is a no-op and delivery proceeds. The human's group-level auto-ops choice is the
+      consent — loomux is answering a dialog on behalf of an operator who already opted in.
+      The confirm is gated to a **fresh boot** (the `Delivery::FreshKickoff` classification →
+      `should_confirm_copilot_autopilot`): a **resume** restores allow-all/autopilot from
+      Copilot's session event log so no dialog reappears, and mid-session follow-ups/steers are
+      long past boot — both skip the watch rather than eat its fail-soft wait on every delivery.
     Previously a planner in a **non-auto_ops** group got the interactive preset (`acceptEdits`
-    with no git/gh allowlist on Claude; plain interactive mode with no autopilot on Copilot),
+    with no git/gh allowlist on Claude; plain interactive mode with no allow-all on Copilot),
     so its very first `gh`/explore call would have prompted into the void — a latent deadlock
     this fixes **on both CLIs**. Workers/reviewers are untouched: without `auto_ops` they
     still gate ops through the interactive preset.

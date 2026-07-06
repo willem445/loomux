@@ -8,14 +8,16 @@
 
 use loomux_lib::orchestration::mcp::dispatch;
 use loomux_lib::orchestration::{
-    add_trusted_folder, bracketed_paste, cli_ready, create_orchestration_group, hold_until_quiet,
+    add_trusted_folder, bracketed_paste, claude_permission_mode, cli_ready,
+    copilot_autopilot_prompt_detected, create_orchestration_group, hold_until_quiet,
     idle_should_kill, max_agents_notice,
     normalize_remote_web_base, parse_audit_lines, parse_session_cost, prompt_wait_detected,
-    resolve_ref_url, rotate_audit_if_needed, sanitize_attachment_ext, should_flush_before_paste,
-    spawn_rate_exceeded, strip_ansi, submit_confirmed, submit_sequence, watchdog_should_notify,
-    worktree_cleanup_targets, AttentionItem, Caller,
-    Guardrails, NameSource, OrchRegistry, Role, TaskPatch, UsageSnapshot, MAX_ATTACHMENT_BYTES,
-    PLANNER_READONLY_NOTE,
+    resolve_ref_url, rotate_audit_if_needed, sanitize_attachment_ext, should_confirm_copilot_autopilot,
+    should_flush_before_paste, single_pane_autopilot_flags, spawn_rate_exceeded, strip_ansi,
+    submit_confirmed, submit_sequence, watchdog_should_notify, worktree_cleanup_targets, AttentionItem,
+    Caller, Delivery, Guardrails, NameSource, OrchRegistry, Role, TaskPatch, UsageSnapshot,
+    CLAUDE_UNATTENDED_ALLOW, COPILOT_AUTOPILOT_CONFIRM_KEYS, COPILOT_GROUP_AUTOPILOT_FLAGS,
+    COPILOT_UNATTENDED_FLAGS, MAX_ATTACHMENT_BYTES, PLANNER_READONLY_NOTE,
 };
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -663,11 +665,15 @@ fn copilot_command_uses_copilot_adapter_flags() {
         cmd.contains("--no-auto-update"),
         "a mid-boot self-update restarts copilot and eats the kickoff"
     );
-    // Auto preset = copilot's own unattended mode.
-    assert!(cmd.contains("--autopilot") && cmd.contains("--allow-all-tools") && cmd.contains("--allow-all-paths"));
+    // Auto preset = copilot's group autopilot posture: all tools + all paths +
+    // --autopilot (true autopilot mode). The startup "Enable autopilot mode"
+    // dialog is answered by the kickoff path before the brief is pasted (#101).
+    assert!(cmd.contains("--allow-all-tools") && cmd.contains("--allow-all-paths"));
+    assert!(cmd.contains("--autopilot"),
+        "group copilot workers run in true autopilot mode; the kickoff confirms the consent dialog");
     // Conservative preset keeps the explicit allowlist instead.
     let cmd = reg.build_agent_command("copilot", "auto", false, cfg, gdir, Path::new("C:/repo"), None, false, false);
-    assert!(!cmd.contains("--autopilot") && !cmd.contains("--allow-all-tools"));
+    assert!(!cmd.contains("--allow-all-tools") && !cmd.contains("--autopilot"));
     assert!(cmd.contains("--allow-tool \"shell(git:*)\"") && cmd.contains("--allow-tool \"shell(gh:*)\""));
     // Resume reopens a tracked session via --resume; copilot has no
     // pre-assignable id, so a session without resume adds no session flag.
@@ -693,25 +699,305 @@ fn copilot_command_uses_copilot_adapter_flags() {
 fn copilot_planner_runs_unattended_regardless_of_auto_ops() {
     // Mirror of the claude fix on the copilot adapter: a planner has no human
     // in its pane, so a NON-auto_ops copilot planner must still take copilot's
-    // unattended (autopilot) preset — the conservative interactive preset
-    // would stall it on approvals no one can give. Deny rules keep it
-    // read-only (deny wins over --allow-all-tools in Copilot).
+    // group autopilot preset (all tools/paths + --autopilot) — the conservative
+    // interactive preset would stall it on approvals no one can give. Deny
+    // rules keep it read-only (deny wins over --allow-all-tools in Copilot).
     let (reg, _d) = test_registry();
     let cfg = Path::new("C:/x/cfg.json");
     let gdir = Path::new("C:/data/group");
     // auto_ops = FALSE, read_only = TRUE (a planner in a manual-ops group).
     let plan = reg.build_agent_command("copilot", "auto", false, cfg, gdir, Path::new("C:/repo"), None, false, true);
-    assert!(plan.contains("--autopilot") && plan.contains("--allow-all-tools") && plan.contains("--allow-all-paths"),
-        "a non-auto_ops copilot planner must run unattended (autopilot), else it deadlocks: {plan}");
+    assert!(plan.contains("--allow-all-tools") && plan.contains("--allow-all-paths"),
+        "a non-auto_ops copilot planner must run unattended (all tools/paths), else it deadlocks: {plan}");
+    assert!(plan.contains("--autopilot"),
+        "a group planner runs in true autopilot mode; the kickoff answers the consent dialog for it");
     assert!(plan.contains("--deny-tool \"write\"") && plan.contains("--deny-tool \"shell(git commit)\""),
-        "writes/commit stay denied — the autopilot preset doesn't loosen the read-only contract");
+        "writes/commit stay denied — the unattended preset doesn't loosen the read-only contract");
     assert!(!plan.contains("--deny-tool \"shell(gh"),
         "gh stays allowed so the copilot planner can post its plan comment unattended");
     // A non-auto_ops copilot WORKER (read_only=false) is unchanged: it keeps
-    // the conservative interactive preset, not autopilot.
+    // the conservative interactive preset (no allow-all).
     let worker = reg.build_agent_command("copilot", "auto", false, cfg, gdir, Path::new("C:/repo"), None, false, false);
-    assert!(!worker.contains("--autopilot") && !worker.contains("--allow-all-tools"),
+    assert!(!worker.contains("--allow-all-tools") && !worker.contains("--autopilot"),
         "a non-auto_ops copilot worker stays interactive — only planners run unattended");
+}
+
+// ── Single-pane autopilot flags (#101) ─────────────────────────────────────
+
+#[test]
+fn single_pane_autopilot_flags_per_cli() {
+    // Claude: native Auto permission mode + the git/gh pre-approval, so a
+    // standalone pane skips the interactive prompt-on-everything default.
+    let claude = single_pane_autopilot_flags("claude");
+    assert!(claude.contains("--permission-mode auto"),
+        "claude autopilot must use the native Auto mode, got: {claude}");
+    assert!(claude.contains("--allowedTools"), "claude autopilot must pre-approve tools");
+    assert!(claude.contains("\"Bash(git *)\"") && claude.contains("\"Bash(gh *)\""),
+        "claude autopilot must pre-approve git + gh, got: {claude}");
+    assert!(!claude.contains("--dangerously-skip-permissions"),
+        "autopilot must never use bypass mode");
+
+    // Copilot: all tools + all paths pre-approved, but NOT --autopilot (which
+    // opens a blocking startup confirm dialog — #101 human report).
+    let copilot = single_pane_autopilot_flags("copilot");
+    assert!(copilot.contains("--allow-all-tools") && copilot.contains("--allow-all-paths"),
+        "copilot autopilot must pass its unattended flags, got: {copilot}");
+    assert!(!copilot.contains("--autopilot"),
+        "copilot autopilot must NOT use --autopilot (interactive confirm on startup): {copilot}");
+
+    // Case-insensitive on the program name.
+    assert_eq!(single_pane_autopilot_flags("Claude"), claude);
+    assert_eq!(single_pane_autopilot_flags("COPILOT"), copilot);
+
+    // CLIs with no known unattended surface get no flags (the toggle is inert),
+    // rather than inventing flags that may not exist.
+    for other in ["codex", "opencode", "gemini", "aider", ""] {
+        assert_eq!(single_pane_autopilot_flags(other), "",
+            "{other:?} has no unattended flag surface — must return empty");
+    }
+}
+
+#[test]
+fn single_pane_flags_reuse_the_group_path_atoms() {
+    // The whole point of #101: the single-pane flags are built from the SAME
+    // per-CLI atoms as build_agent_command, so the two paths can't drift. If
+    // build_agent_command's unattended flags change, these must change with it.
+    let (reg, _d) = test_registry();
+    let cfg = Path::new("C:/x/cfg.json");
+    let gdir = Path::new("C:/data/group");
+
+    // Claude: permission mode + the shared git/gh allowlist constant.
+    let group_claude =
+        reg.build_agent_command("claude", "sonnet", true, cfg, gdir, Path::new("C:/repo"), None, false, false);
+    let single_claude = single_pane_autopilot_flags("claude");
+    assert!(single_claude.contains(&format!("--permission-mode {}", claude_permission_mode(true))));
+    assert!(group_claude.contains(&format!("--permission-mode {}", claude_permission_mode(true))));
+    assert!(single_claude.contains(CLAUDE_UNATTENDED_ALLOW) && group_claude.contains(CLAUDE_UNATTENDED_ALLOW),
+        "both paths must use the shared CLAUDE_UNATTENDED_ALLOW constant");
+
+    // Copilot: single-pane uses the allow-all atom; the group path uses the
+    // group-autopilot atom, which is that same allow-all atom PLUS --autopilot.
+    let group_copilot =
+        reg.build_agent_command("copilot", "auto", true, cfg, gdir, Path::new("C:/repo"), None, false, false);
+    let single_copilot = single_pane_autopilot_flags("copilot");
+    assert_eq!(single_copilot, COPILOT_UNATTENDED_FLAGS);
+    assert!(group_copilot.contains(COPILOT_GROUP_AUTOPILOT_FLAGS),
+        "the group path must use the shared COPILOT_GROUP_AUTOPILOT_FLAGS constant");
+    // The two posture atoms can't drift: group == "--autopilot " + single.
+    assert_eq!(COPILOT_GROUP_AUTOPILOT_FLAGS, format!("--autopilot {COPILOT_UNATTENDED_FLAGS}"),
+        "the group autopilot atom must be the single-pane allow-all atom plus --autopilot");
+}
+
+#[test]
+fn claude_permission_mode_maps_unattended() {
+    assert_eq!(claude_permission_mode(true), "auto");
+    assert_eq!(claude_permission_mode(false), "acceptEdits");
+}
+
+#[test]
+fn copilot_autopilot_posture_splits_group_from_single_pane() {
+    // The #101 split: group copilot agents run in TRUE autopilot mode
+    // (--autopilot, for the autonomy system-prompt framing) because a
+    // loomux-managed worker is unattended and the kickoff path answers the
+    // resulting "Enable autopilot mode" dialog for it. A single-pane copilot
+    // agent has a human at the keyboard, so it stays dialog-free (allow-all,
+    // no --autopilot). Both give full tool pre-approval.
+    assert!(COPILOT_GROUP_AUTOPILOT_FLAGS.contains("--autopilot"),
+        "group posture enters autopilot mode");
+    assert!(!COPILOT_UNATTENDED_FLAGS.contains("--autopilot"),
+        "single-pane posture stays dialog-free — a human is present");
+    assert!(COPILOT_UNATTENDED_FLAGS.contains("--allow-all-tools")
+        && COPILOT_GROUP_AUTOPILOT_FLAGS.contains("--allow-all-tools"),
+        "both postures pre-approve all tools");
+
+    // Single-pane path: no --autopilot.
+    assert!(!single_pane_autopilot_flags("copilot").contains("--autopilot"),
+        "single-pane copilot must not pass --autopilot (no dialog with a human present)");
+
+    // Group spawn path: unattended worker + planner both get --autopilot.
+    let (reg, _d) = test_registry();
+    let cfg = Path::new("C:/x/cfg.json");
+    let gdir = Path::new("C:/data/group");
+    let worker = reg.build_agent_command("copilot", "auto", true, cfg, gdir, Path::new("C:/repo"), None, false, false);
+    let planner = reg.build_agent_command("copilot", "auto", false, cfg, gdir, Path::new("C:/repo"), None, false, true);
+    assert!(worker.contains("--autopilot") && planner.contains("--autopilot"),
+        "group-mode unattended copilot spawns enter true autopilot mode");
+}
+
+#[test]
+fn copilot_autopilot_prompt_is_detected_only_on_the_real_dialog() {
+    // Positive: the exact strings the 1.0.68 TUI paints (title + enable option),
+    // ANSI stripped, possibly with a box frame / numbering around them.
+    let dialog = "\
+        ┌ Enable autopilot mode ─────────────────────────────┐\n\
+        │ Autopilot mode works best with all permissions.     │\n\
+        │ ❯ 1. Enable all permissions (recommended)           │\n\
+        │   2. Continue with limited permissions              │\n\
+        │   3. Cancel (Esc)                                    │\n\
+        └─────────────────────────────────────────────────────┘";
+    assert!(copilot_autopilot_prompt_detected(dialog),
+        "the real consent dialog must be recognized");
+    // Case-insensitivity (the recognizer lowercases).
+    assert!(copilot_autopilot_prompt_detected("ENABLE AUTOPILOT MODE ... Enable All Permissions"));
+
+    // Absent: ordinary agent output must NOT trip it (no stray Enter into a
+    // working pane). Each half-phrase alone is insufficient.
+    assert!(!copilot_autopilot_prompt_detected(""));
+    assert!(!copilot_autopilot_prompt_detected("copilot ready; waiting for your task"));
+    assert!(!copilot_autopilot_prompt_detected(
+        "I could enable autopilot mode later if you want — say the word."),
+        "the title phrase alone (prose) must not match without the enable option");
+    assert!(!copilot_autopilot_prompt_detected(
+        "run /allow-all to enable all permissions"),
+        "the option phrase alone must not match without the dialog title");
+
+    // A DIFFERENT boot-time dialog must not be mistaken for the autopilot one
+    // (rev-41): Copilot's folder-trust dialog is also a boxed menu shown at
+    // startup and it even mentions "permissions", but neither anchor phrase
+    // appears — so the two-anchor detector must reject it (verbatim strings from
+    // the 1.0.68 bundle's "Confirm folder trust" dialog).
+    let folder_trust = "\
+        ┌ Confirm folder trust ───────────────────────────────────────────────┐\n\
+        │ C:\\Projects\\loomux                                                   │\n\
+        │ Copilot can read files in this folder and, with your permission, edit │\n\
+        │ them or run code and shell commands. It will remember your            │\n\
+        │ permissions for the rest of this session.                             │\n\
+        │ Do you trust the files in this folder?                                │\n\
+        │ ❯ 1. Yes                                                              │\n\
+        │   2. Yes, and remember this folder                                    │\n\
+        │   3. No, exit (Esc)                                                    │\n\
+        └───────────────────────────────────────────────────────────────────────┘";
+    assert!(!copilot_autopilot_prompt_detected(folder_trust),
+        "the folder-trust boot dialog must never be read as the autopilot consent dialog");
+    // A login/auth prompt is likewise not the autopilot dialog.
+    assert!(!copilot_autopilot_prompt_detected(
+        "Your GitHub token may be invalid, expired, or lacking the required permissions — sign in again."),
+        "an auth prompt must not match");
+}
+
+#[test]
+fn autopilot_confirm_gates_to_a_fresh_copilot_boot() {
+    // rev-41: the confirm (and its up-to-12s fail-soft watch) must run ONLY on a
+    // fresh boot of an unattended copilot agent — the one time the "Enable
+    // autopilot mode" dialog appears. Resume restores the consent from the
+    // session log (no dialog) and mid-session deliveries are past boot, so both
+    // must skip it or they'd burn the fail-soft wait on every follow-up.
+    // Fresh + unattended + copilot → confirm.
+    assert!(should_confirm_copilot_autopilot("copilot", true, true));
+    // Resume / mid-session (fresh_boot=false) → never, even for copilot.
+    assert!(!should_confirm_copilot_autopilot("copilot", true, false),
+        "resume/mid-session must skip the confirm — the dialog is fresh-boot-only");
+    // Attended copilot (no --autopilot passed) shows no dialog → never.
+    assert!(!should_confirm_copilot_autopilot("copilot", false, true),
+        "an attended copilot agent has no --autopilot, so no dialog to confirm");
+    // Claude never shows this dialog → never, regardless of the other flags.
+    assert!(!should_confirm_copilot_autopilot("claude", true, true),
+        "only copilot has the autopilot consent dialog");
+}
+
+#[test]
+fn autopilot_confirm_and_stranded_flush_never_both_fire_on_a_fresh_boot() {
+    // #99-rebase interaction: `deliver_prompt` runs the autopilot confirm
+    // (Enter on the consent dialog) BEFORE #99's stranded-text flush (an Enter
+    // to clear a previous prompt still in the box). They must never both press
+    // Enter on the same fresh boot, or the flush Enter could land on the dialog
+    // out of order. They can't: the confirm runs only on a *fresh boot*, and a
+    // freshly booted pane has no prior delivery, so the flush's own guard
+    // (`should_flush_before_paste(None, _)`) is false. This pins that composition
+    // — if either guard's contract changes, this fails.
+    // Fresh boot ⇒ confirm may run …
+    assert!(should_confirm_copilot_autopilot("copilot", true, true));
+    // … but the flush cannot: no previous delivery to key off (prev = None).
+    assert!(!should_flush_before_paste(None, false),
+        "a fresh-boot pane has no prior delivery, so the flush never fires alongside the confirm");
+    assert!(!should_flush_before_paste(None, true));
+}
+
+#[test]
+fn copilot_autopilot_confirm_key_is_a_single_enter() {
+    // The dialog's default-highlighted item is "Enable all permissions" (menu
+    // initialIndex 0), and Enter (`code==="return"`) selects it — so a single
+    // carriage return enables all permissions + enters autopilot mode, no arrow
+    // keys. If copilot ever reorders the menu this pins what we must revisit.
+    assert_eq!(COPILOT_AUTOPILOT_CONFIRM_KEYS, b"\r");
+}
+
+#[test]
+fn build_agent_command_full_line_snapshots() {
+    // Snapshot the ENTIRE command line for a representative matrix (rev-33
+    // note). The other build_agent_command tests inspect the refactor with
+    // `.contains()`, which can't catch a stray space, a dropped flag, or a
+    // reordered fragment; asserting the full string pins the exact output so
+    // any future drift in the shared flag atoms fails loudly here. Fixed paths
+    // (no session/resume) keep the strings deterministic.
+    let (reg, _d) = test_registry();
+    let cfg = Path::new("C:/x/cfg.json");
+    let gdir = Path::new("C:/data/group");
+    let wd = Path::new("C:/repo");
+    // signature: (cli, model, auto_ops, cfg, group_dir, workdir, session, resume, read_only)
+    let cmd = |cli, model, auto_ops, read_only| {
+        reg.build_agent_command(cli, model, auto_ops, cfg, gdir, wd, None, false, read_only)
+    };
+
+    // Claude worker, auto_ops ON → native Auto mode + git/gh pre-approval.
+    assert_eq!(
+        cmd("claude", "sonnet", true, false),
+        "claude --mcp-config \"C:/x/cfg.json\" --strict-mcp-config --model sonnet \
+         --permission-mode auto --add-dir \"C:/data/group\" --allowedTools mcp__loomux \
+         \"Bash(git *)\" \"Bash(gh *)\""
+    );
+
+    // Claude worker, auto_ops OFF → acceptEdits, no git/gh, no denials.
+    assert_eq!(
+        cmd("claude", "sonnet", false, false),
+        "claude --mcp-config \"C:/x/cfg.json\" --strict-mcp-config --model sonnet \
+         --permission-mode acceptEdits --add-dir \"C:/data/group\" --allowedTools mcp__loomux"
+    );
+
+    // Copilot worker, auto_ops ON → group autopilot: --autopilot + all tools/paths.
+    assert_eq!(
+        cmd("copilot", "auto", true, false),
+        "copilot --additional-mcp-config \"@C:/x/cfg.json\" --model auto \
+         --add-dir \"C:/data/group\" --add-dir \"C:/repo\" --allow-tool loomux --no-auto-update \
+         --autopilot --allow-all-tools --allow-all-paths"
+    );
+
+    // Copilot worker, auto_ops OFF → the conservative git/gh allowlist branch.
+    assert_eq!(
+        cmd("copilot", "auto", false, false),
+        "copilot --additional-mcp-config \"@C:/x/cfg.json\" --model auto \
+         --add-dir \"C:/data/group\" --add-dir \"C:/repo\" --allow-tool loomux --no-auto-update \
+         --allow-tool \"shell(git:*)\" --allow-tool \"shell(gh:*)\""
+    );
+
+    // Claude planner (read_only) in a NON-auto_ops group → unattended anyway,
+    // plus the write/commit/push denials, gh still reachable.
+    assert_eq!(
+        cmd("claude", "opus", false, true),
+        "claude --mcp-config \"C:/x/cfg.json\" --strict-mcp-config --model opus \
+         --permission-mode auto --add-dir \"C:/data/group\" --allowedTools mcp__loomux \
+         \"Bash(git *)\" \"Bash(gh *)\" --disallowedTools Edit Write MultiEdit NotebookEdit \
+         \"Bash(git commit *)\" \"Bash(git push *)\""
+    );
+
+    // Copilot planner (read_only) in a NON-auto_ops group → group autopilot
+    // (--autopilot + all tools/paths) + deny rules; gh not denied.
+    assert_eq!(
+        cmd("copilot", "auto", false, true),
+        "copilot --additional-mcp-config \"@C:/x/cfg.json\" --model auto \
+         --add-dir \"C:/data/group\" --add-dir \"C:/repo\" --allow-tool loomux --no-auto-update \
+         --autopilot --allow-all-tools --allow-all-paths \
+         --deny-tool \"write\" --deny-tool \"edit\" \
+         --deny-tool \"shell(git commit)\" --deny-tool \"shell(git push)\""
+    );
+
+    // Unknown CLI falls back to the claude adapter byte-for-byte (never a
+    // silent half-built command) — same string as the claude worker case.
+    assert_eq!(
+        cmd("totally-unknown-cli", "sonnet", true, false),
+        cmd("claude", "sonnet", true, false),
+        "an unrecognized CLI must build the exact claude fallback command"
+    );
 }
 
 #[test]
@@ -2025,12 +2311,12 @@ fn pause_suppresses_delivery_and_persists_across_restart() {
         let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
         // Not paused: delivery proceeds past the pause gate and only fails
         // because test mode has no real terminal.
-        let err = reg.deliver_prompt(&w.id, "hello", "loomux", false).unwrap_err();
+        let err = reg.deliver_prompt(&w.id, "hello", "loomux", Delivery::MidSession).unwrap_err();
         assert!(err.contains("terminal"), "unpaused delivery must reach the pty step, got: {err}");
         // Paused: delivery is suppressed (Ok, no error) and audited.
         reg.pause_group(&g.id).unwrap();
         assert!(reg.is_paused(&g.id));
-        reg.deliver_prompt(&w.id, "hello again", "loomux", false).unwrap();
+        reg.deliver_prompt(&w.id, "hello again", "loomux", Delivery::MidSession).unwrap();
         let log = fs::read_to_string(reg.state_root().join(&g.id).join("audit.jsonl")).unwrap();
         assert!(log.contains("prompt-suppressed-paused"), "suppression must be audited");
         assert!(reg.state_root().join(&g.id).join("paused").is_file(), "pause marker must be written");
