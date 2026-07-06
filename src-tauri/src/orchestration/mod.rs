@@ -470,8 +470,20 @@ fn default_model(cli: &str, role: Role) -> &'static str {
 // launcher (`single_pane_autopilot_flags`, exposed as the `agent_autopilot_flags`
 // Tauri command) build from these atoms, so the two paths can't drift (#101).
 
-/// Copilot's unattended-mode flags: autopilot + all tools + no path prompts.
-pub const COPILOT_UNATTENDED_FLAGS: &str = "--autopilot --allow-all-tools --allow-all-paths";
+/// Copilot's unattended-mode flags: pre-approve all tools and all paths so the
+/// agent runs without per-tool / path-verification confirmation.
+///
+/// Deliberately NOT `--autopilot` (#101 human report). That flag boots Copilot
+/// into its experimental *autopilot mode*, which opens a blocking interactive
+/// "Enable autopilot mode" dialog on startup (Enable all permissions / Continue
+/// with limited / Cancel — verified in the CLI bundle's `showAutopilotConfirmation`
+/// path). In an unattended pane no one answers it, and the kickoff typing would
+/// blind-answer the highlighted default — fatal to startup. `--allow-all-tools`
+/// is Copilot's *documented* non-interactive enabler ("Allow all tools to run
+/// automatically without confirmation; required for non-interactive mode") and
+/// carries no such dialog; loomux drives follow-ups by typing prompts, so it
+/// never needed autopilot's autonomous-continuation loop in the first place.
+pub const COPILOT_UNATTENDED_FLAGS: &str = "--allow-all-tools --allow-all-paths";
 
 /// git + gh pre-approval appended to Claude's `--allowedTools` for an unattended
 /// agent, so the branch→commit→PR flow runs without prompts. `Bash(git *)`
@@ -3521,12 +3533,14 @@ impl OrchRegistry {
                     workdir.display()
                 );
                 if unattended {
-                    // Copilot's own unattended mode: autopilot + all tools
-                    // + no path-verification prompts. A planner (read_only)
-                    // always takes this path even in a non-auto_ops group —
-                    // interactive mode would stall it on a human that isn't
-                    // there; the deny rules below keep it read-only, and deny
-                    // takes precedence over --allow-all-tools in Copilot.
+                    // Copilot's documented non-interactive posture: all tools +
+                    // all paths pre-approved (NOT --autopilot, which prompts a
+                    // blocking startup confirmation — see COPILOT_UNATTENDED_FLAGS).
+                    // A planner (read_only) always takes this path even in a
+                    // non-auto_ops group — interactive mode would stall it on a
+                    // human that isn't there; the deny rules below keep it
+                    // read-only, and deny takes precedence over --allow-all-tools
+                    // in Copilot.
                     cmd.push(' ');
                     cmd.push_str(COPILOT_UNATTENDED_FLAGS);
                 } else {

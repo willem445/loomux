@@ -221,7 +221,9 @@ everything. The **Single pane** and **Multiple panes** modes carry an
 *Autopilot — pre-approve all tools (allow all)* checkbox, **on by default**,
 that launches the agent with the *same* unattended permission flags a group
 worker gets — Claude Code's native Auto mode plus pre-approved `git`/`gh`,
-Copilot's `--autopilot --allow-all-tools --allow-all-paths`. The flags come from
+Copilot's `--allow-all-tools --allow-all-paths` (its documented non-interactive
+posture; loomux deliberately avoids `--autopilot`, which pops a blocking
+"Enable autopilot mode" confirmation an unattended pane can't answer). The flags come from
 the backend (the same source the orchestration path uses, so the two can't
 drift); the toggle only shows for CLIs that have an unattended mode
 (Claude/Copilot), and never for a custom command. Uncheck it to launch in the

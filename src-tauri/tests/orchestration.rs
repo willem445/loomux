@@ -663,11 +663,15 @@ fn copilot_command_uses_copilot_adapter_flags() {
         cmd.contains("--no-auto-update"),
         "a mid-boot self-update restarts copilot and eats the kickoff"
     );
-    // Auto preset = copilot's own unattended mode.
-    assert!(cmd.contains("--autopilot") && cmd.contains("--allow-all-tools") && cmd.contains("--allow-all-paths"));
+    // Auto preset = copilot's documented non-interactive posture: all tools +
+    // all paths. Never --autopilot, which prompts a blocking startup confirm
+    // dialog that a headless pane can't answer (#101 human report).
+    assert!(cmd.contains("--allow-all-tools") && cmd.contains("--allow-all-paths"));
+    assert!(!cmd.contains("--autopilot"),
+        "must not boot copilot into autopilot mode — it opens an interactive confirmation");
     // Conservative preset keeps the explicit allowlist instead.
     let cmd = reg.build_agent_command("copilot", "auto", false, cfg, gdir, Path::new("C:/repo"), None, false, false);
-    assert!(!cmd.contains("--autopilot") && !cmd.contains("--allow-all-tools"));
+    assert!(!cmd.contains("--allow-all-tools") && !cmd.contains("--autopilot"));
     assert!(cmd.contains("--allow-tool \"shell(git:*)\"") && cmd.contains("--allow-tool \"shell(gh:*)\""));
     // Resume reopens a tracked session via --resume; copilot has no
     // pre-assignable id, so a session without resume adds no session flag.
@@ -693,24 +697,26 @@ fn copilot_command_uses_copilot_adapter_flags() {
 fn copilot_planner_runs_unattended_regardless_of_auto_ops() {
     // Mirror of the claude fix on the copilot adapter: a planner has no human
     // in its pane, so a NON-auto_ops copilot planner must still take copilot's
-    // unattended (autopilot) preset — the conservative interactive preset
-    // would stall it on approvals no one can give. Deny rules keep it
-    // read-only (deny wins over --allow-all-tools in Copilot).
+    // unattended preset (all tools/paths pre-approved) — the conservative
+    // interactive preset would stall it on approvals no one can give. Deny
+    // rules keep it read-only (deny wins over --allow-all-tools in Copilot).
     let (reg, _d) = test_registry();
     let cfg = Path::new("C:/x/cfg.json");
     let gdir = Path::new("C:/data/group");
     // auto_ops = FALSE, read_only = TRUE (a planner in a manual-ops group).
     let plan = reg.build_agent_command("copilot", "auto", false, cfg, gdir, Path::new("C:/repo"), None, false, true);
-    assert!(plan.contains("--autopilot") && plan.contains("--allow-all-tools") && plan.contains("--allow-all-paths"),
-        "a non-auto_ops copilot planner must run unattended (autopilot), else it deadlocks: {plan}");
+    assert!(plan.contains("--allow-all-tools") && plan.contains("--allow-all-paths"),
+        "a non-auto_ops copilot planner must run unattended (all tools/paths), else it deadlocks: {plan}");
+    assert!(!plan.contains("--autopilot"),
+        "unattended must not mean autopilot mode — that would prompt a startup confirm the planner can't answer");
     assert!(plan.contains("--deny-tool \"write\"") && plan.contains("--deny-tool \"shell(git commit)\""),
-        "writes/commit stay denied — the autopilot preset doesn't loosen the read-only contract");
+        "writes/commit stay denied — the unattended preset doesn't loosen the read-only contract");
     assert!(!plan.contains("--deny-tool \"shell(gh"),
         "gh stays allowed so the copilot planner can post its plan comment unattended");
     // A non-auto_ops copilot WORKER (read_only=false) is unchanged: it keeps
-    // the conservative interactive preset, not autopilot.
+    // the conservative interactive preset (no allow-all).
     let worker = reg.build_agent_command("copilot", "auto", false, cfg, gdir, Path::new("C:/repo"), None, false, false);
-    assert!(!worker.contains("--autopilot") && !worker.contains("--allow-all-tools"),
+    assert!(!worker.contains("--allow-all-tools") && !worker.contains("--autopilot"),
         "a non-auto_ops copilot worker stays interactive — only planners run unattended");
 }
 
@@ -729,12 +735,13 @@ fn single_pane_autopilot_flags_per_cli() {
     assert!(!claude.contains("--dangerously-skip-permissions"),
         "autopilot must never use bypass mode");
 
-    // Copilot: its own unattended trio.
+    // Copilot: all tools + all paths pre-approved, but NOT --autopilot (which
+    // opens a blocking startup confirm dialog — #101 human report).
     let copilot = single_pane_autopilot_flags("copilot");
-    assert!(copilot.contains("--autopilot")
-        && copilot.contains("--allow-all-tools")
-        && copilot.contains("--allow-all-paths"),
+    assert!(copilot.contains("--allow-all-tools") && copilot.contains("--allow-all-paths"),
         "copilot autopilot must pass its unattended flags, got: {copilot}");
+    assert!(!copilot.contains("--autopilot"),
+        "copilot autopilot must NOT use --autopilot (interactive confirm on startup): {copilot}");
 
     // Case-insensitive on the program name.
     assert_eq!(single_pane_autopilot_flags("Claude"), claude);
@@ -782,6 +789,38 @@ fn claude_permission_mode_maps_unattended() {
 }
 
 #[test]
+fn copilot_unattended_flags_avoid_the_autopilot_confirmation_dialog() {
+    // #101 human report: launching copilot with `--autopilot` boots it into
+    // autopilot mode, which opens a BLOCKING interactive "Enable autopilot mode"
+    // confirmation dialog on startup (verified in the copilot CLI bundle's
+    // `showAutopilotConfirmation` path). An unattended pane has no one to answer
+    // it, so startup hangs / the kickoff typing blind-answers it. The unattended
+    // flags must use copilot's documented non-interactive enabler
+    // (`--allow-all-tools`, "run automatically without confirmation; required
+    // for non-interactive mode") and must NOT pass `--autopilot` — on EITHER
+    // path (the shared COPILOT_UNATTENDED_FLAGS drives both).
+    assert!(!COPILOT_UNATTENDED_FLAGS.contains("--autopilot"),
+        "must not start copilot in autopilot mode — it prompts an interactive confirm on boot");
+    assert!(COPILOT_UNATTENDED_FLAGS.contains("--allow-all-tools"),
+        "--allow-all-tools is copilot's documented non-interactive enabler");
+
+    // Single-pane path.
+    assert!(!single_pane_autopilot_flags("copilot").contains("--autopilot"),
+        "single-pane copilot autopilot must not pass --autopilot");
+
+    // Group spawn path (unattended worker + planner).
+    let (reg, _d) = test_registry();
+    let cfg = Path::new("C:/x/cfg.json");
+    let gdir = Path::new("C:/data/group");
+    let worker = reg.build_agent_command("copilot", "auto", true, cfg, gdir, Path::new("C:/repo"), None, false, false);
+    let planner = reg.build_agent_command("copilot", "auto", false, cfg, gdir, Path::new("C:/repo"), None, false, true);
+    assert!(!worker.contains("--autopilot") && !planner.contains("--autopilot"),
+        "group-mode copilot spawns must not pass --autopilot either (shared path)");
+    assert!(worker.contains("--allow-all-tools") && planner.contains("--allow-all-tools"),
+        "unattended copilot agents still get full tool pre-approval, just without autopilot mode");
+}
+
+#[test]
 fn build_agent_command_full_line_snapshots() {
     // Snapshot the ENTIRE command line for a representative matrix (rev-33
     // note). The other build_agent_command tests inspect the refactor with
@@ -813,12 +852,12 @@ fn build_agent_command_full_line_snapshots() {
          --permission-mode acceptEdits --add-dir \"C:/data/group\" --allowedTools mcp__loomux"
     );
 
-    // Copilot worker, auto_ops ON → copilot's unattended trio.
+    // Copilot worker, auto_ops ON → all tools + all paths (NOT --autopilot).
     assert_eq!(
         cmd("copilot", "auto", true, false),
         "copilot --additional-mcp-config \"@C:/x/cfg.json\" --model auto \
          --add-dir \"C:/data/group\" --add-dir \"C:/repo\" --allow-tool loomux --no-auto-update \
-         --autopilot --allow-all-tools --allow-all-paths"
+         --allow-all-tools --allow-all-paths"
     );
 
     // Copilot worker, auto_ops OFF → the conservative git/gh allowlist branch.
@@ -839,13 +878,13 @@ fn build_agent_command_full_line_snapshots() {
          \"Bash(git commit *)\" \"Bash(git push *)\""
     );
 
-    // Copilot planner (read_only) in a NON-auto_ops group → autopilot + deny
-    // rules; gh not denied.
+    // Copilot planner (read_only) in a NON-auto_ops group → all tools/paths +
+    // deny rules (NOT --autopilot); gh not denied.
     assert_eq!(
         cmd("copilot", "auto", false, true),
         "copilot --additional-mcp-config \"@C:/x/cfg.json\" --model auto \
          --add-dir \"C:/data/group\" --add-dir \"C:/repo\" --allow-tool loomux --no-auto-update \
-         --autopilot --allow-all-tools --allow-all-paths \
+         --allow-all-tools --allow-all-paths \
          --deny-tool \"write\" --deny-tool \"edit\" \
          --deny-tool \"shell(git commit)\" --deny-tool \"shell(git push)\""
     );

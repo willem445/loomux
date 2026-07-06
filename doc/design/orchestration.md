@@ -652,11 +652,15 @@ Two related additions: a **planner** role, and **per-role** agent CLI + model.
     pane**, a `read_only` planner is now launched **unattended regardless of the group's
     `auto_ops`** (`unattended = auto_ops || read_only` in `build_agent_command`, applied to
     **both** CLIs): on Claude, Auto perms + a pre-approved `Bash(git *)` / `Bash(gh *)`
-    allowlist; on Copilot, `--autopilot --allow-all-tools --allow-all-paths` — so
+    allowlist; on Copilot, `--allow-all-tools --allow-all-paths` — so
     exploration, `gh issue view`, and the `gh issue comment` plan never prompt, with edits +
     `git commit`/`git push` denied on both (deny takes precedence over Auto / `--allow-all-tools`).
+    (Copilot's unattended posture deliberately omits `--autopilot`: that flag boots into
+    autopilot mode, which opens a blocking "Enable autopilot mode" confirmation dialog on
+    startup that a headless pane can't answer — #101. `--allow-all-tools` is Copilot's
+    documented non-interactive enabler and needs no autopilot mode.)
     Previously a planner in a **non-auto_ops** group got the interactive preset (`acceptEdits`
-    with no git/gh allowlist on Claude; plain interactive mode with no autopilot on Copilot),
+    with no git/gh allowlist on Claude; plain interactive mode with no allow-all on Copilot),
     so its very first `gh`/explore call would have prompted into the void — a latent deadlock
     this fixes **on both CLIs**. Workers/reviewers are untouched: without `auto_ops` they
     still gate ops through the interactive preset.

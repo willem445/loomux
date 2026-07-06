@@ -310,8 +310,8 @@ export class AgentLauncher {
 
     // Autopilot toggle (#101): launch the agent with the same unattended
     // permission flags a group worker gets (claude's Auto mode + git/gh
-    // pre-approval, copilot's --autopilot/--allow-all-*), so a single pane
-    // doesn't start in the CLI's interactive prompt-on-everything mode. The
+    // pre-approval, copilot's --allow-all-tools/--allow-all-paths), so a single
+    // pane doesn't start in the CLI's interactive prompt-on-everything mode. The
     // flags come from the backend (`agent_autopilot_flags`) — the same source
     // the orchestration path uses, so the two can't drift. Default ON.
     this.autopilotInput = document.createElement("input");
