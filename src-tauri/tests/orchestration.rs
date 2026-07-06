@@ -11,8 +11,9 @@ use loomux_lib::orchestration::{
     add_trusted_folder, bracketed_paste, cli_ready, create_orchestration_group, hold_until_quiet,
     idle_should_kill, max_agents_notice,
     normalize_remote_web_base, parse_audit_lines, parse_session_cost, prompt_wait_detected,
-    resolve_ref_url, rotate_audit_if_needed, sanitize_attachment_ext, spawn_rate_exceeded,
-    strip_ansi, watchdog_should_notify, worktree_cleanup_targets, AttentionItem, Caller,
+    resolve_ref_url, rotate_audit_if_needed, sanitize_attachment_ext, should_flush_before_paste,
+    spawn_rate_exceeded, strip_ansi, submit_confirmed, submit_sequence, watchdog_should_notify,
+    worktree_cleanup_targets, AttentionItem, Caller,
     Guardrails, NameSource, OrchRegistry, Role, TaskPatch, UsageSnapshot, MAX_ATTACHMENT_BYTES,
     PLANNER_READONLY_NOTE,
 };
@@ -478,6 +479,88 @@ fn bracketed_paste_frames_text_and_normalizes_crlf() {
         s.contains("line1\nline2") && !s.contains('\r'),
         "CR must not leak inside a paste — it would submit early"
     );
+}
+
+#[test]
+fn submit_sequence_claude_is_a_bare_cr() {
+    // Claude's submit must stay byte-identical: a single carriage return, no
+    // focus prefix, no CRLF. Any drift here would regress the tuned TUI path.
+    assert_eq!(submit_sequence("claude"), b"\r");
+}
+
+#[test]
+fn submit_sequence_unknown_cli_falls_back_to_bare_cr() {
+    // An unrecognized / future CLI gets the safe default (bare CR), never the
+    // Copilot-specific focus prefix.
+    assert_eq!(submit_sequence("aider"), b"\r");
+    assert_eq!(submit_sequence(""), b"\r");
+}
+
+#[test]
+fn submit_sequence_copilot_prefixes_focus_in_before_enter() {
+    // #98: Copilot drops non-paste keystrokes on an unfocused pane, so a bare
+    // CR after the paste never submits. The fix prefixes a focus-in report
+    // (CSI I) that flips Copilot's focus flag true, so the CR that follows is
+    // accepted. Order matters: focus-in MUST come before the CR.
+    let seq = submit_sequence("copilot");
+    assert_eq!(seq, b"\x1b[I\r");
+    assert!(seq.starts_with(b"\x1b[I"), "focus-in must precede the Enter");
+    assert!(seq.ends_with(b"\r"), "the Enter itself is still a bare CR");
+    // The focus report is exactly CSI I (no params/intermediates) — that is
+    // what Copilot's CSI parser maps to a focus event; a stray param would
+    // parse as something else and not flip the flag.
+    assert_eq!(&seq[..seq.len() - 1], b"\x1b[I");
+}
+
+#[test]
+fn flush_reuses_the_per_cli_submit_sequence() {
+    // The stranded-text flush presses submit once — it must use the SAME
+    // per-CLI sequence as a normal submit, so Copilot's flush also carries the
+    // focus-in prefix (a bare CR would be ignored on an unfocused pane, and the
+    // stranded text would never clear).
+    assert_eq!(submit_sequence("copilot"), b"\x1b[I\r");
+    assert_eq!(submit_sequence("claude"), b"\r");
+}
+
+#[test]
+fn should_flush_only_on_the_stranded_text_signature() {
+    // First delivery to a pane (no prior outcome): never flush.
+    assert!(!should_flush_before_paste(None, false));
+    assert!(!should_flush_before_paste(None, true));
+    // Previous delivery confirmed as submitted: box is empty, never flush.
+    assert!(!should_flush_before_paste(Some(true), false));
+    assert!(!should_flush_before_paste(Some(true), true));
+    // Previous delivery unconfirmed BUT a human has typed since: their line may
+    // be in the box — never blind-submit it.
+    assert!(!should_flush_before_paste(Some(false), true));
+    // The one case that flushes: previous unconfirmed, no human input since.
+    assert!(should_flush_before_paste(Some(false), false));
+}
+
+#[test]
+fn submit_confirmed_needs_a_real_output_burst() {
+    // Pane reached quiet before Enter (reached_quiet = true):
+    // No / trivial growth after Enter -> not confirmed (an ignored key, or idle
+    // cursor-blink noise, must not read as a landed submit).
+    assert!(!submit_confirmed(true, 1000, 1000));
+    assert!(!submit_confirmed(true, 1000, 1010));
+    // A burst clearing the threshold -> confirmed.
+    assert!(submit_confirmed(true, 1000, 1024));
+    assert!(submit_confirmed(true, 1000, 100_000));
+    // Totals never go backwards, but a wrapped/garbage reading must not panic
+    // or false-confirm.
+    assert!(!submit_confirmed(true, 1000, 500));
+}
+
+#[test]
+fn submit_never_confirmed_when_quiet_was_not_reached() {
+    // rev-32: on a busy pane the submit-wait hits SUBMIT_MAX_WAIT without ever
+    // reaching quiet, so the Enter lands mid-stream. Even a large burst is that
+    // ongoing stream, not the submit — it must NOT confirm, else the prompt is
+    // stranded but recorded confirmed and the next delivery skips the flush.
+    assert!(!submit_confirmed(false, 1000, 100_000));
+    assert!(!submit_confirmed(false, 1000, 1024));
+    assert!(!submit_confirmed(false, 1000, 1000));
 }
 
 #[test]

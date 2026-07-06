@@ -162,6 +162,24 @@ const SUBMIT_MAX_WAIT: Duration = Duration::from_secs(45);
 /// Spaced blind Enter retries after the first (no-ops once submitted).
 const SUBMIT_RETRY_DELAYS: [Duration; 2] = [Duration::from_millis(2500), Duration::from_millis(4500)];
 
+// Submit confirmation + stranded-text flush (#81/#84). A submit that landed
+// clears the input box and the CLI repaints / starts its turn — a burst of
+// output. An Enter that was ignored (focus-gated pre-#99, still busy, or an
+// empty box) produces effectively none. We watch for that burst in a short
+// window after the first Enter and record the outcome, so the NEXT delivery to
+// the same pane can tell whether the previous prompt is still stranded in the
+// box (and would otherwise merge with the new paste).
+/// How long after the first Enter to watch for the submit's output burst.
+const SUBMIT_CONFIRM_WINDOW: Duration = Duration::from_millis(600);
+/// Output growth (bytes) within the window that counts as a landed submit.
+/// Set well above idle cursor-blink noise so confirmation biases against false
+/// positives: a false "unconfirmed" only costs a harmless no-op flush next
+/// time, whereas a false "confirmed" would let stranded text merge.
+const SUBMIT_CONFIRM_MIN_BYTES: u64 = 24;
+/// After flushing a previous delivery's stranded text, let the CLI settle
+/// (box clears, turn starts) before the new paste lands.
+const FLUSH_SETTLE: Duration = Duration::from_millis(400);
+
 // Human-typing backstop (#43, option A): even with the loomux compose strip,
 // a human can still type directly into the terminal. Before the paste AND
 // before the first Enter, hold delivery while the pane has seen recent
@@ -891,6 +909,11 @@ pub struct OrchRegistry {
     /// interleave keystrokes, while a slow delivery (waiting out a busy
     /// CLI) doesn't block deliveries to other panes.
     delivery: Mutex<HashMap<u32, Arc<Mutex<()>>>>,
+    /// Outcome of the most recent delivery to each pane (keyed by pty id), so a
+    /// delivery can flush a previous prompt still stranded in the input box
+    /// before pasting (#81/#84). An `Arc` so a delivery thread can record its
+    /// outcome without holding `&self`.
+    last_delivery: Arc<Mutex<HashMap<u32, DeliveryOutcome>>>,
     /// Serializes task-board read-modify-write cycles (MCP threads and the
     /// human UI mutate the same tasks.json).
     tasks_lock: Mutex<()>,
@@ -1307,6 +1330,75 @@ pub fn bracketed_paste(text: &str) -> Vec<u8> {
     v
 }
 
+/// The byte sequence loomux writes to submit a delivered prompt, chosen per
+/// CLI. Kept pure and `&'static` so the exact bytes are unit-assertable.
+///
+/// Claude Code submits on a bare CR (`\r`).
+///
+/// GitHub Copilot's TUI (#98) gates *keyboard* input on terminal focus: it
+/// enables DEC mode 1004 focus reporting (`ESC[?1004h`) and, in its editor's
+/// key handler, drops every non-paste keystroke while its focus flag is false
+/// (`if (!focused && !key.paste && code != backspace/delete) return`). A
+/// *paste* bypasses that guard — which is why a delivered prompt's text lands
+/// in the input box — but the Enter that follows is a plain key, so on a pane
+/// that isn't the focused one (the normal case when an agent delivers to
+/// another agent's pane) it is ignored and the prompt just sits there until a
+/// human clicks in (whereupon the terminal emits focus-in and their Enter
+/// works). Prefixing the CR with a focus-in report (`ESC[I`, which Copilot
+/// parses to a focus event that flips its flag true) makes the very next key —
+/// our Enter — accepted, so the prompt submits without a human. Copilot leaves
+/// its flag true afterward, so the spaced retry Enters need no re-prefix, but
+/// they carry it too so each retry is self-sufficient if a stray blur arrives.
+pub fn submit_sequence(cli: &str) -> &'static [u8] {
+    match cli {
+        "copilot" => b"\x1b[I\r",
+        _ => b"\r",
+    }
+}
+
+/// The outcome of the most recent delivery to a pane, kept in-memory per pty so
+/// the next delivery can detect a previous prompt still stranded in the input
+/// box (#81/#84).
+#[derive(Clone, Copy, Debug)]
+struct DeliveryOutcome {
+    /// Whether that delivery's Enter was observed to submit (box cleared / turn
+    /// started). `false` means the text may still be sitting unsubmitted.
+    confirmed: bool,
+    /// Unix-ms the final Enter was sent — the reference point for deciding
+    /// whether a human has since typed into the pane.
+    submit_sent_ms: u64,
+}
+
+/// Whether output growth after the submit Enter counts as the submit landing.
+/// A successful submit clears the box and the CLI repaints / starts a turn (a
+/// burst of output); an ignored Enter produces effectively none.
+///
+/// Only trustworthy when the pane reached quiet *before* the Enter. If the
+/// submit-wait hit `SUBMIT_MAX_WAIT` while output was still streaming
+/// (`reached_quiet == false`), the Enter landed mid-stream and the window's
+/// growth is that stream, not the submit's — which would false-confirm and
+/// strand a prompt recorded as confirmed (rev-32). So a cap-hit-without-quiet
+/// is never confirmed; a false "unconfirmed" is just a harmless flush next
+/// time. Pure so the rule is testable; the polling loop lives in
+/// `deliver_prompt`.
+pub fn submit_confirmed(reached_quiet: bool, baseline_total: u64, observed_total: u64) -> bool {
+    reached_quiet && observed_total.saturating_sub(baseline_total) >= SUBMIT_CONFIRM_MIN_BYTES
+}
+
+/// Whether to flush a previous delivery's stranded text (a single submit press)
+/// before pasting the next prompt (#81/#84).
+///
+/// Flush only on the exact stranded-text signature: the previous delivery to
+/// this pane was NOT confirmed as submitted, AND no human has typed into the
+/// pane since (so the box holds the earlier *agent* prompt, not a person's
+/// half-written line — which must never be blind-submitted). Never flushes on
+/// the first delivery to a pane (`prev_confirmed == None`) or after a confirmed
+/// one. A false "unconfirmed" here is safe: the flush Enter lands on an already
+/// empty box and is a no-op.
+pub fn should_flush_before_paste(prev_confirmed: Option<bool>, human_typed_since: bool) -> bool {
+    matches!(prev_confirmed, Some(false)) && !human_typed_since
+}
+
 impl OrchRegistry {
     pub fn new(root: PathBuf) -> Self {
         let _ = fs::create_dir_all(&root);
@@ -1321,6 +1413,7 @@ impl OrchRegistry {
             port: AtomicU16::new(0),
             seq: AtomicU32::new(0),
             delivery: Mutex::new(HashMap::new()),
+            last_delivery: Arc::new(Mutex::new(HashMap::new())),
             tasks_lock: Mutex::new(()),
             creation: Mutex::new(()),
             paused: Mutex::new(HashSet::new()),
@@ -3810,6 +3903,15 @@ impl OrchRegistry {
         self.audit(&a.group, from, "prompt", json!({ "to": agent_id, "text": text }));
 
         let paste = bracketed_paste(text);
+        // The Enter that submits the paste is chosen per CLI: Copilot ignores a
+        // bare CR on an unfocused pane, so its sequence prefixes a focus-in
+        // report (#98). Resolved here — through the same per-role `cli_for` the
+        // registry already uses — so the delivery thread carries the right bytes.
+        let cli = self
+            .group(&a.group)
+            .map(|g| g.guardrails.cli_for(a.role).to_string())
+            .unwrap_or_else(|| "claude".to_string());
+        let submit = submit_sequence(&cli);
         let lock = self
             .delivery
             .lock_safe()
@@ -3817,6 +3919,7 @@ impl OrchRegistry {
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone();
         let (root, group, agent) = (self.root.clone(), a.group.clone(), a.id.clone());
+        let last_delivery = self.last_delivery.clone();
         std::thread::spawn(move || {
             let _guard = lock.lock_safe();
             let ptys = app.state::<crate::pty::PtyManager>();
@@ -3856,6 +3959,25 @@ impl OrchRegistry {
                     "to": agent, "stage": "pre-paste", "held_ms": held_ms,
                     "capped": held_ms >= USER_QUIET_MAX_HOLD.as_millis() as u64,
                 }));
+            }
+
+            // Stranded-text flush (#81/#84): if the PREVIOUS delivery to this
+            // pane was never confirmed as submitted, its text may still be
+            // sitting in the input box — pasting now would append to it and the
+            // two prompts would merge. Press submit once to clear it first, but
+            // only if no human has typed since that delivery (else the box may
+            // hold a person's line, which must never be blind-submitted — the
+            // pre-paste hold above already waited for them to go quiet).
+            let prev = last_delivery.lock_safe().get(&pty_id).copied();
+            let human_typed_since = prev
+                .map(|o| ptys.last_user_input_ms(pty_id).unwrap_or(0) > o.submit_sent_ms)
+                .unwrap_or(false);
+            if should_flush_before_paste(prev.map(|o| o.confirmed), human_typed_since)
+                && ptys.write_bytes(pty_id, submit).is_ok()
+            {
+                append_audit(&root, &group, "loomux", "delivery-flush",
+                    json!({ "to": agent, "reason": "previous delivery unconfirmed" }));
+                std::thread::sleep(FLUSH_SETTLE);
             }
 
             // Echo-verified typing: paste, then require the TUI to emit
@@ -3904,6 +4026,10 @@ impl OrchRegistry {
             let submit_start = std::time::Instant::now();
             let mut last_total = ptys.output_total(pty_id).unwrap_or(0);
             let mut last_change = std::time::Instant::now();
+            // Whether the pane went quiet before we press Enter. If it never
+            // does (busy CLI, hit SUBMIT_MAX_WAIT), the Enter lands mid-stream
+            // and submit confirmation can't be trusted off that stream (rev-32).
+            let mut reached_quiet = false;
             while submit_start.elapsed() < SUBMIT_MAX_WAIT {
                 std::thread::sleep(Duration::from_millis(200));
                 match ptys.output_total(pty_id) {
@@ -3913,6 +4039,7 @@ impl OrchRegistry {
                     }
                     Some(_) => {
                         if last_change.elapsed() >= SUBMIT_QUIET {
+                            reached_quiet = true;
                             break;
                         }
                     }
@@ -3933,7 +4060,34 @@ impl OrchRegistry {
                 }));
             }
             let submit_sent_ms = now_ms();
-            let _ = ptys.write_bytes(pty_id, b"\r");
+            // Baseline just before the first Enter, so the confirmation window
+            // below measures only the burst that Enter produces.
+            let submit_baseline = ptys.output_total(pty_id).unwrap_or(last_total);
+            let _ = ptys.write_bytes(pty_id, submit);
+
+            // Confirm the submit landed: watch for the output burst of the box
+            // clearing / the turn starting (#81/#84). Measured off the first
+            // Enter, before the spaced retries, so the signal is that Enter's
+            // effect and not a retry's. Only trusted when the pane reached quiet
+            // first — on a busy pane that never did, the Enter landed mid-stream
+            // and that stream would false-confirm (rev-32), so we skip the
+            // window and leave it unconfirmed. A miss here is safe: the next
+            // delivery's flush just no-ops on an empty box.
+            let confirm_deadline = std::time::Instant::now() + SUBMIT_CONFIRM_WINDOW;
+            let mut confirmed = false;
+            while reached_quiet && std::time::Instant::now() < confirm_deadline {
+                std::thread::sleep(Duration::from_millis(100));
+                match ptys.output_total(pty_id) {
+                    Some(t) => {
+                        if submit_confirmed(reached_quiet, submit_baseline, t) {
+                            confirmed = true;
+                            break;
+                        }
+                    }
+                    None => break,
+                }
+            }
+
             for delay in SUBMIT_RETRY_DELAYS {
                 std::thread::sleep(delay);
                 // A human typing in this pane means the box may hold THEIR
@@ -3943,22 +4097,29 @@ impl OrchRegistry {
                         json!({ "to": agent, "reason": "human typing in pane" }));
                     break;
                 }
-                if ptys.write_bytes(pty_id, b"\r").is_err() {
+                if ptys.write_bytes(pty_id, submit).is_err() {
                     break;
                 }
             }
+            // Record the outcome so the next delivery to this pane can flush a
+            // prompt still stranded in the box (#81/#84).
+            last_delivery
+                .lock_safe()
+                .insert(pty_id, DeliveryOutcome { confirmed, submit_sent_ms });
             append_audit(&root, &group, "loomux", "prompt-typed", json!({
                 "to": agent,
+                "cli": cli,
                 "waited_ms": start.elapsed().as_millis() as u64,
                 "attempts": attempts,
                 "echoed": echoed,
                 "submit_waited_ms": submit_start.elapsed().as_millis() as u64,
+                "submit_confirmed": confirmed,
             }));
             // Delivery outcome breadcrumb — timing + flags only, never the text.
             crate::obs::breadcrumb(
                 "delivery",
                 &format!(
-                    "agent={agent} pty={pty_id} outcome=typed echoed={echoed} attempts={attempts} waited_ms={}",
+                    "agent={agent} pty={pty_id} outcome=typed echoed={echoed} confirmed={confirmed} attempts={attempts} waited_ms={}",
                     start.elapsed().as_millis() as u64
                 ),
             );
