@@ -274,20 +274,81 @@ fn find_all(hay: &str, needle: &str) -> Vec<usize> {
     out
 }
 
-/// Scrape session/weekly limit percentages from a pane's ANSI-stripped
-/// statusline text. Scans bottom-up (the freshest render is the lowest line)
-/// and returns at most one reading per scope — the first, i.e. freshest, seen.
+/// How many trailing non-empty lines of the pane tail count as the statusline
+/// region. The statusline renders at the very bottom, but Claude Code's input
+/// box border rows can sit a few lines below it, so we look a little deeper than
+/// the literal last line — while still refusing to scan prose higher up in the
+/// scrollback, which (with the adjacency rule below) is the false-match class
+/// this bound guards against.
+const STATUSLINE_TAIL_LINES: usize = 6;
+
+/// Longest separator run tolerated between a scope label and its percentage. A
+/// real statusline segment uses a short punctuation/space gap ("Session: 34%");
+/// a longer or word-bearing gap is not a label→value pair.
+const LIMIT_ADJACENCY_GAP: usize = 8;
+
+/// The percentage a scope is *directly labelling* on a line: one of `labels`
+/// must be immediately followed — separator characters only, at most
+/// `LIMIT_ADJACENCY_GAP` of them — by an `NN%` token. This adjacency anchor is
+/// what tells a real statusline segment ("Session: 34%", "Week 12%") from prose
+/// that merely mentions the word near a number: "the session is now 90% faster"
+/// has words between label and %, and "dropped 12% week over week" puts the %
+/// *before* the label — both rejected. Percent-before-label is deliberately not
+/// accepted; statuslines render the label first, while "12% week" is
+/// overwhelmingly prose.
 ///
-/// Each percentage is bound to the *nearest* scope keyword on its own line, so a
-/// combined `Session 34% · Week 12%` statusline parses both correctly and a
-/// bare `Context: 45%` (no scope keyword) is ignored rather than mistaken for a
-/// limit. Keywords are conservative — only `session` and `week`/`weekly` — to
-/// avoid grabbing an unrelated percentage (CPU, context, a progress bar).
+/// `labels` lists the spellings of one scope, longest first ("weekly" before
+/// "week"), so the plural form is checked before its own prefix — otherwise
+/// "week" would match inside "Weekly:" and leave "ly" wedged between label and
+/// %, failing adjacency. Across every spelling and occurrence, the nearest valid
+/// % wins.
+fn labelled_percent(lower: &str, labels: &[&str], percents: &[(usize, u8)]) -> Option<u8> {
+    let mut best: Option<(usize, u8)> = None;
+    for label in labels {
+        for kpos in find_all(lower, label) {
+            let kend = kpos + label.len();
+            for &(ppos, pct) in percents {
+                if ppos < kend {
+                    continue; // label-first only: the % must follow the label
+                }
+                let gap = &lower[kend..ppos];
+                if gap.chars().count() > LIMIT_ADJACENCY_GAP
+                    || !gap.chars().all(|c| !c.is_alphanumeric())
+                {
+                    continue; // not adjacent: words or other digits intervene
+                }
+                let dist = ppos - kend;
+                if best.is_none_or(|(bd, _)| dist < bd) {
+                    best = Some((dist, pct));
+                }
+            }
+        }
+    }
+    best.map(|(_, pct)| pct)
+}
+
+/// Scrape session/weekly limit percentages from a pane's ANSI-stripped
+/// statusline text. Scans the trailing statusline region bottom-up (the freshest
+/// render is the lowest line) and returns at most one reading per scope — the
+/// first, i.e. freshest, seen.
+///
+/// Two anchors keep this from fabricating a figure out of ordinary terminal
+/// prose (the same false-match discipline the #40/#44 rounds applied to the
+/// attention scan): only the last few non-empty lines are considered (not the
+/// whole 4 KB scrollback), and each percentage must be *directly labelled* by
+/// its scope keyword — `label: NN%` adjacency, not merely "near". Keywords are
+/// conservative — only `session` and `week`/`weekly` — so an unrelated bar (CPU,
+/// context, a progress percentage) is never mistaken for a limit.
 pub fn parse_claude_limits(text: &str) -> Vec<LimitReading> {
     let mut session: Option<u8> = None;
     let mut weekly: Option<u8> = None;
 
-    for line in text.lines().rev() {
+    for line in text
+        .lines()
+        .rev()
+        .filter(|l| !l.trim().is_empty())
+        .take(STATUSLINE_TAIL_LINES)
+    {
         if session.is_some() && weekly.is_some() {
             break;
         }
@@ -296,26 +357,12 @@ pub fn parse_claude_limits(text: &str) -> Vec<LimitReading> {
         if percents.is_empty() {
             continue;
         }
-        // Percentage nearest (by offset) to any of the given scope keywords.
-        let nearest = |keywords: &[&str]| -> Option<u8> {
-            let mut best: Option<(usize, u8)> = None;
-            for kw in keywords {
-                for kpos in find_all(&lower, kw) {
-                    for &(ppos, pct) in &percents {
-                        let dist = kpos.abs_diff(ppos);
-                        if best.is_none_or(|(bd, _)| dist < bd) {
-                            best = Some((dist, pct));
-                        }
-                    }
-                }
-            }
-            best.map(|(_, pct)| pct)
-        };
         if session.is_none() {
-            session = nearest(&["session"]);
+            session = labelled_percent(&lower, &["session"], &percents);
         }
         if weekly.is_none() {
-            weekly = nearest(&["week"]);
+            // Longest first: "weekly" before its own "week" prefix.
+            weekly = labelled_percent(&lower, &["weekly", "week"], &percents);
         }
     }
 
@@ -356,8 +403,16 @@ impl ClaudeLimits {
 
 /// Fold per-pane readings into one figure by taking the highest consumed
 /// percentage per scope. Every live pane shares the one signed-in account, so
-/// the max is the honest "closest to a cutoff" value and tolerates a pane whose
-/// statusline has not refreshed yet (a stale, lower reading never wins).
+/// the max is the "closest to a cutoff" value and tolerates a pane whose
+/// statusline lags *upward* (a stale, lower reading never wins).
+///
+/// The one caveat is the opposite skew: right after a limit resets, a live but
+/// idle pane whose statusline has not re-rendered can pin a stale-*high* max for
+/// a scan or two until it refreshes. We accept that (and label the figure as a
+/// pane-statusline scrape, not a guarantee) rather than drop panes by an
+/// output-freshness heuristic — statuslines self-refresh on their own timer even
+/// while the agent is idle, so "no recent agent output" is not the same as "the
+/// reading is stale", and filtering on it would discard valid current readings.
 pub fn aggregate_claude_limits(per_pane: &[Vec<LimitReading>]) -> ClaudeLimits {
     let mut out = ClaudeLimits::default();
     for readings in per_pane {
@@ -538,7 +593,7 @@ mod tests {
 
     #[test]
     fn parses_both_scopes_on_one_line_by_nearest_keyword() {
-        // Combined statusline: each % must bind to the keyword next to it.
+        // Combined statusline: each % binds to the label immediately before it.
         let u = parse_claude_limits("Session 34% · Week 12%");
         assert_eq!(
             u,
@@ -547,10 +602,40 @@ mod tests {
     }
 
     #[test]
-    fn weekly_keyword_variants_and_percent_before_label() {
-        // "Weekly" contains "week"; the % can also sit before its label.
-        let u = parse_claude_limits("12% weekly limit");
+    fn parses_a_realistic_multi_segment_statusline() {
+        // A representative ccstatusline-style row: model, branch, both limits,
+        // and the cost — the positive the adjacency rule must still accept.
+        let line = " main | Opus 4.8 | Session: 34% | Weekly: 12% | $1.20 ";
+        let u = parse_claude_limits(line);
+        assert_eq!(
+            u,
+            vec![reading(LimitScope::Session, 34), reading(LimitScope::Weekly, 12)]
+        );
+    }
+
+    #[test]
+    fn weekly_label_variant_is_matched() {
+        // "Weekly" contains "week"; label-first adjacency still binds it.
+        let u = parse_claude_limits("Weekly: 12%");
         assert_eq!(u, vec![reading(LimitScope::Weekly, 12)]);
+    }
+
+    #[test]
+    fn prose_mentioning_a_scope_word_near_a_percent_is_not_a_reading() {
+        // rev-18's concrete false-match examples: a scope word sits near a %,
+        // but it is prose, not a labelled statusline value. Fabricating a
+        // CLI-reported figure from these is exactly the bug to avoid.
+        assert!(
+            parse_claude_limits("the login session is now 90% faster").is_empty(),
+            "words between label and % => not a label→value pair"
+        );
+        assert!(
+            parse_claude_limits("revenue dropped 12% week over week").is_empty(),
+            "% before the label => prose, not a statusline segment"
+        );
+        // A couple more of the same class for good measure.
+        assert!(parse_claude_limits("we cut context use 45% this week").is_empty());
+        assert!(parse_claude_limits("session start took 5% longer today").is_empty());
     }
 
     #[test]
@@ -558,6 +643,19 @@ mod tests {
         // Context/CPU-style bars must not be mistaken for a usage limit.
         let u = parse_claude_limits("CPU 80%  Context: 45%  MEM 30%");
         assert!(u.is_empty(), "no scope keyword => no reading, got {u:?}");
+    }
+
+    #[test]
+    fn only_the_statusline_region_is_scanned_not_deep_scrollback() {
+        // A prose line far above the statusline region must not be reached; the
+        // real statusline at the bottom is. Padding lines exceed the tail bound.
+        let mut lines = vec!["Session: 77% off all items this week!".to_string()];
+        for i in 0..STATUSLINE_TAIL_LINES {
+            lines.push(format!("output line {i}"));
+        }
+        lines.push("Session: 34%".to_string());
+        let u = parse_claude_limits(&lines.join("\n"));
+        assert_eq!(u, vec![reading(LimitScope::Session, 34)], "bottom wins, prose unreached");
     }
 
     #[test]

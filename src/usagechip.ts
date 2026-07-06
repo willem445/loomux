@@ -40,8 +40,8 @@ export function usageChipView(u: UsageLimits): UsageChipView {
   if (w !== null) parts.push(`weekly ${Math.round(w)}%`);
   const title =
     `Claude Code usage limit — ${parts.join(", ")} (most-constrained shown). ` +
-    "Source: live pane statusline, refreshed each scan; reported by the CLI, " +
+    "Source: live pane statusline, re-scraped each scan; reported by the CLI, " +
     "not estimated. Aggregated across all live Claude panes (they share one " +
-    "account).";
+    "account); an idle pane can briefly lag a limit reset until it re-renders.";
   return { na: false, pct, text: `${Math.round(pct)}%`, title };
 }

@@ -2687,7 +2687,7 @@ impl OrchRegistry {
             // Copilot exposes no local premium-request allowance, only
             // consumption counts — nothing honest to show (see usage.rs note).
             "copilot": Value::Null,
-            "note": "Claude limits are scraped from each live pane's statusline (the only place the figure surfaces locally) and aggregated to the most-constrained pane; refreshed each attention scan. Reported by the CLI, not estimated. Copilot exposes no local allowance, so nothing is shown for it.",
+            "note": "Claude limits are scraped from each live pane's statusline (the only place the figure surfaces locally) and aggregated to the most-constrained pane; re-scraped each attention scan. The value reflects whatever the panes currently render, so an idle pane whose statusline has not re-rendered can briefly lag a limit reset. Reported by the CLI, not estimated. Copilot exposes no local allowance, so nothing is shown for it.",
         })
     }
 
