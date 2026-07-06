@@ -7,6 +7,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { swapIfConnected } from "./domutil";
 
 export interface OrchTaskNote {
   ts_ms: number;
@@ -289,7 +290,11 @@ export class TasksView {
       input.focus();
       input.select();
       const commit = (save: boolean) => {
-        input.replaceWith(title);
+        // Enter/Escape/click all commit, and detaching the focused input fires
+        // blur → a second commit; swapIfConnected keeps that redundant call (or
+        // a background re-render having already removed the row) from throwing
+        // NotFoundError out into the app-wide error banner.
+        if (!swapIfConnected(input, title)) return;
         const v = input.value.trim();
         if (save && v && v !== t.title) {
           void this.mutate(invoke("orch_upsert_task", { groupId: this.groupId, id: t.id, title: v }));
