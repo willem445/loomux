@@ -197,16 +197,9 @@ const USER_QUIET_POLL: Duration = Duration::from_millis(250);
 // typed and then LEFT sitting in the box (a half-written `/model`, say). Pasting
 // there and pressing Enter merge-submits the human's line with the prompt (the
 // live `Unknown command: /modelRun ...` collision). So before pasting, if the
-// box still holds a human's unsubmitted line, hold for them to submit/clear it,
-// and if it never clears, abort rather than blind-merge.
-/// Output growth since the human's last keystroke that means their line was
-/// already submitted/consumed (a real burst, not input-box echo) — so the box
-/// is empty and delivery may proceed. Same floor the submit-confirm burst uses.
-const HUMAN_INPUT_BURST_MIN_BYTES: u64 = SUBMIT_CONFIRM_MIN_BYTES;
-/// Treat the human as "still composing" if they hit a key within this window;
-/// while composing we keep holding regardless of the cap (never paste onto a
-/// live line — we abort at the cap instead).
-const HUMAN_INPUT_QUIET: Duration = Duration::from_secs(4);
+// box still holds a human's unsubmitted line (tracked per keystroke as
+// `input_pending`), hold for them to submit/clear it, and if it never clears,
+// abort rather than blind-merge.
 /// Bounded wait for the box to clear before aborting the delivery.
 const HUMAN_INPUT_HOLD_MAX: Duration = Duration::from_secs(60);
 /// Poll interval while holding for the box to clear.
@@ -1638,39 +1631,98 @@ pub fn should_flush_before_paste(prev_confirmed: Option<bool>, human_typed_since
     matches!(prev_confirmed, Some(false)) && !human_typed_since
 }
 
-/// Whether a human's unsubmitted line is currently sitting in this pane's input
-/// box (#111). The signal is the pane's last human keystroke paired with the
-/// output total captured at that keystroke (`pty.last_user_input`):
-///
-/// - `last_input_ms == 0`: nobody has ever typed here → box is loomux's to use.
-/// - Output has since grown by a real burst (`>= burst_min_bytes`): the human's
-///   line was submitted/consumed and the box cleared → safe to paste.
-/// - Otherwise (little/no output since their keystroke): their line is still
-///   sitting there unsubmitted → a paste would merge-submit it. Hold/abort.
-///
-/// The burst floor is set above input-box echo so a still-sitting line (whose
-/// only output is its own redraw) reads as "human input", biasing toward the
-/// safe hold; a genuine submit (turn/command output) clears the floor easily.
-/// Pure so the rule is testable; the polling loop lives in `hold_for_human_input`.
-pub fn box_holds_human_input(
-    last_input_ms: u64,
-    output_total_at_input: u64,
-    output_total: u64,
-    burst_min_bytes: u64,
-) -> bool {
-    last_input_ms != 0 && output_total.saturating_sub(output_total_at_input) < burst_min_bytes
+/// How a single human write into a pane's input changes box occupancy (#111).
+/// Classified from the keystroke's *content*, which is what tells a line still
+/// sitting in the box from one already submitted — an output-byte heuristic
+/// can't (one keystroke's input-line redraw, or ambient agent streaming, can
+/// exceed any fixed burst floor, and a sub-floor submit never clears it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HumanInput {
+    /// Printable text was entered — a line now sits unsubmitted in the box.
+    Content,
+    /// The line was submitted (Enter) or explicitly cleared — the box is empty.
+    Submit,
+    /// Navigation/editing that neither adds visible text nor submits (arrows,
+    /// backspace, bare escape sequences) — box occupancy is unchanged.
+    Neutral,
 }
 
-/// One tick of the pre-paste human-input hold (#111): given the observed state,
-/// decide whether to paste now, keep holding, or abort the delivery. Pure so the
-/// hold/abort rule is testable without a live PTY; `hold_for_human_input` drives
-/// it. Mirrors the shape of `should_flush_before_paste` — a small, total gate.
+/// Classify one human write for the delivery paste guard (#111). Pure so the
+/// rule is testable; `write_pty` calls it to maintain the per-pane
+/// `input_pending` flag.
 ///
-/// - `human_present`: does the box still hold a human's unsubmitted line?
-/// - `human_typing_now`: has the human hit a key within the compose window?
-/// - `box_cleared`: an output burst since holding began — their line submitted.
-/// - `held` / `max_hold`: the bounded wait; at the cap we abort (never paste
-///   onto a line the human left, and never paste onto one they're still typing).
+/// - A carriage return / newline submits the current line, UNLESS printable text
+///   follows the last newline (then that trailing text is a fresh unsubmitted
+///   line → `Content`).
+/// - Ctrl-U (kill-line) / Ctrl-C (interrupt) empty the box → `Submit`.
+/// - Any remaining printable/graphic character (after skipping escape sequences)
+///   → `Content`.
+/// - Otherwise (arrows, backspace, lone escape sequences) → `Neutral`.
+///
+/// Erring toward `Content`/`Neutral` on ambiguous input keeps the guard biased
+/// to the safe hold: a real sitting line is never misread as empty. The residual
+/// gap — an editor where Enter inserts a soft newline instead of submitting, or a
+/// backspace that empties the box without a clear key — needs true box-occupancy
+/// detection, which is issue #112.
+pub fn classify_human_input(data: &str) -> HumanInput {
+    if let Some(pos) = data.rfind(['\r', '\n']) {
+        // `\r`/`\n` are single-byte, so `pos + 1` is a valid char boundary.
+        let after = &data[pos + 1..];
+        return if input_has_printable(after) { HumanInput::Content } else { HumanInput::Submit };
+    }
+    // Line-clear controls empty the box even without a newline.
+    const KILL_LINE: char = '\u{15}'; // Ctrl-U
+    const INTERRUPT: char = '\u{03}'; // Ctrl-C
+    if !data.is_empty() && data.chars().all(|c| c == KILL_LINE || c == INTERRUPT) {
+        return HumanInput::Submit;
+    }
+    if input_has_printable(data) {
+        HumanInput::Content
+    } else {
+        HumanInput::Neutral
+    }
+}
+
+/// Whether `s` contains a graphic character once terminal escape sequences are
+/// skipped — the test for "this write put visible text in the box". Skips CSI
+/// (`ESC [ … final`, e.g. arrow keys, bracketed-paste markers) and other short
+/// `ESC`-led sequences so their printable final bytes (`C`, `~`, digits) don't
+/// read as typed content.
+fn input_has_printable(s: &str) -> bool {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == 0x1b {
+            i += 1;
+            if i < b.len() && b[i] == b'[' {
+                i += 1;
+                while i < b.len() && !(0x40..=0x7e).contains(&b[i]) {
+                    i += 1;
+                }
+                i += 1; // consume the CSI final byte
+            } else {
+                i += 1; // 2-byte / lone ESC sequence
+            }
+            continue;
+        }
+        // Printable ASCII (space..~) or any UTF-8 multibyte lead/continuation.
+        if (0x20..0x7f).contains(&b[i]) || b[i] >= 0x80 {
+            return true;
+        }
+        i += 1; // C0 control (tab, backspace/DEL handled below, etc.)
+    }
+    false
+}
+
+/// One tick of the pre-paste human-input hold (#111): given whether a human's
+/// line is still sitting in the box, decide whether to paste, keep holding, or
+/// abort. Pure so the hold/abort rule is testable without a live PTY;
+/// `hold_for_human_input` drives it. Mirrors `should_flush_before_paste` — a
+/// small, total gate.
+///
+/// - `box_pending`: does the box still hold a human's unsubmitted line?
+/// - `held` / `max_hold`: the bounded wait; at the cap we abort rather than
+///   paste onto a line the human never cleared.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PasteGate {
     /// Box is clear (or was never dirty) — paste the prompt.
@@ -1681,21 +1733,12 @@ pub enum PasteGate {
     Abort,
 }
 
-pub fn resolve_paste_gate(
-    human_present: bool,
-    human_typing_now: bool,
-    box_cleared: bool,
-    held: Duration,
-    max_hold: Duration,
-) -> PasteGate {
-    if !human_present {
-        return PasteGate::Paste; // box was never dirty — normal path
-    }
-    if box_cleared && !human_typing_now {
-        return PasteGate::Paste; // they submitted/cleared their line and stopped
+pub fn resolve_paste_gate(box_pending: bool, held: Duration, max_hold: Duration) -> PasteGate {
+    if !box_pending {
+        return PasteGate::Paste; // box is empty — paste the prompt
     }
     if held >= max_hold {
-        return PasteGate::Abort; // bounded wait elapsed and the box never cleared
+        return PasteGate::Abort; // bounded wait elapsed and the line never cleared
     }
     PasteGate::Hold
 }
@@ -1709,67 +1752,41 @@ pub enum PasteDecision {
     Abort { held_ms: u64 },
 }
 
-/// Poll-and-hold loop that drives `box_holds_human_input` + `resolve_paste_gate`:
-/// if a human's line is sitting in the box, block until they submit/clear it (an
-/// output burst after their last keystroke) or the bounded wait elapses, then
-/// return `Paste`/`Abort`. Returns `Paste { held_ms: 0 }` immediately when the
-/// box was never dirty.
+/// Poll-and-hold loop that drives `resolve_paste_gate`: if a human's line is
+/// sitting in the box (`box_pending`), block until they submit/clear it (the
+/// flag flips false) or the bounded wait elapses, then return `Paste`/`Abort`.
+/// Returns `Paste { held_ms: 0 }` immediately when the box is already clear.
 ///
-/// Generic over the keystroke/output sources and timings so the wiring — that
-/// the loop re-reads the signals each poll, re-baselines the burst window on a
-/// fresh keystroke, and honours the abort cap — is integration-testable without
-/// a live PTY (the #40 lesson: exercise the loop, not just the pure decision).
-/// `last_user_input` yields `(last_keystroke_ms, output_total_at_that_keystroke)`
-/// and `output_total` the pane's current byte count.
+/// Generic over the occupancy source and timings so the wiring — that the loop
+/// re-reads the flag each poll and honours the abort cap — is integration-
+/// testable without a live PTY (the #40 lesson: exercise the loop, not just the
+/// pure decision).
 #[doc(hidden)] // pub for integration tests
-pub fn hold_for_human_input<I, O>(
-    last_user_input: I,
-    output_total: O,
-    now_ms: impl Fn() -> u64,
-    burst_min_bytes: u64,
-    quiet_window: Duration,
+pub fn hold_for_human_input<P: Fn() -> bool>(
+    box_pending: P,
     max_hold: Duration,
     poll: Duration,
-) -> PasteDecision
-where
-    I: Fn() -> (u64, u64),
-    O: Fn() -> u64,
-{
-    let (input_ms0, out_at_input0) = last_user_input();
-    if !box_holds_human_input(input_ms0, out_at_input0, output_total(), burst_min_bytes) {
+) -> PasteDecision {
+    if !box_pending() {
         return PasteDecision::Paste { held_ms: 0 };
     }
     let start = std::time::Instant::now();
-    // Burst baseline: the output as of the human's most recent keystroke. A
-    // burst past this means they submitted; re-baseline whenever they type again
-    // so continued composing (each keystroke's echo) can't read as a submit.
-    let mut last_input_ms = input_ms0;
-    let mut burst_baseline = out_at_input0;
     loop {
-        let (input_ms, out_at_input) = last_user_input();
-        if input_ms != last_input_ms {
-            last_input_ms = input_ms;
-            burst_baseline = out_at_input;
-        }
-        let typing_now = input_ms != 0 && now_ms().saturating_sub(input_ms) < quiet_window.as_millis() as u64;
-        let box_cleared = output_total().saturating_sub(burst_baseline) >= burst_min_bytes;
-        match resolve_paste_gate(true, typing_now, box_cleared, start.elapsed(), max_hold) {
-            PasteGate::Paste => return PasteDecision::Paste { held_ms: start.elapsed().as_millis() as u64 },
-            PasteGate::Abort => return PasteDecision::Abort { held_ms: start.elapsed().as_millis() as u64 },
+        let held = start.elapsed();
+        match resolve_paste_gate(box_pending(), held, max_hold) {
+            PasteGate::Paste => return PasteDecision::Paste { held_ms: held.as_millis() as u64 },
+            PasteGate::Abort => return PasteDecision::Abort { held_ms: held.as_millis() as u64 },
             PasteGate::Hold => std::thread::sleep(poll),
         }
     }
 }
 
 /// Production wrapper: hold prompt delivery to `pty_id` while a human's line is
-/// sitting in its input box, using the shipped burst floor / window / cap / poll.
+/// sitting in its input box, using the shipped cap / poll. A closed pty reads as
+/// "not pending" so a dead pane never blocks the thread.
 fn wait_for_box_clear(ptys: &crate::pty::PtyManager, pty_id: u32) -> PasteDecision {
     hold_for_human_input(
-        || ptys.last_user_input(pty_id).unwrap_or((0, 0)),
-        || ptys.output_total(pty_id).unwrap_or(0),
-        now_ms,
-        HUMAN_INPUT_BURST_MIN_BYTES,
-        HUMAN_INPUT_QUIET,
+        || ptys.input_pending(pty_id).unwrap_or(false),
         HUMAN_INPUT_HOLD_MAX,
         HUMAN_INPUT_POLL,
     )

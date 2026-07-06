@@ -8,7 +8,7 @@
 
 use loomux_lib::orchestration::mcp::dispatch;
 use loomux_lib::orchestration::{
-    add_trusted_folder, box_holds_human_input, bracketed_paste, claude_permission_mode, cli_ready,
+    add_trusted_folder, bracketed_paste, classify_human_input, claude_permission_mode, cli_ready,
     copilot_autopilot_prompt_detected, create_orchestration_group, hold_for_human_input,
     hold_until_quiet, idle_should_kill, max_agents_notice,
     normalize_remote_web_base, parse_audit_lines, parse_session_cost, paste_held_notice,
@@ -17,8 +17,8 @@ use loomux_lib::orchestration::{
     should_notify_paste_held, should_notify_unconfirmed, single_pane_autopilot_flags,
     spawn_rate_exceeded, spawn_request_expired, strip_ansi, submit_confirmed, submit_sequence,
     unconfirmed_delivery_notice, watchdog_should_notify, worktree_cleanup_targets,
-    AttentionItem, Caller, Delivery, Guardrails, NameSource, OrchRegistry, PasteDecision, PasteGate,
-    Role, TaskPatch, UsageSnapshot, CLAUDE_UNATTENDED_ALLOW, COPILOT_AUTOPILOT_CONFIRM_KEYS,
+    AttentionItem, Caller, Delivery, Guardrails, HumanInput, NameSource, OrchRegistry, PasteDecision,
+    PasteGate, Role, TaskPatch, UsageSnapshot, CLAUDE_UNATTENDED_ALLOW, COPILOT_AUTOPILOT_CONFIRM_KEYS,
     COPILOT_GROUP_AUTOPILOT_FLAGS, COPILOT_UNATTENDED_FLAGS, MAX_ATTACHMENT_BYTES,
     PLANNER_READONLY_NOTE,
 };
@@ -670,40 +670,48 @@ fn unconfirmed_notice_text_names_the_agent_and_the_recovery_move() {
 }
 
 #[test]
-fn box_holds_human_input_only_when_a_line_is_still_sitting() {
-    const BURST: u64 = 24;
-    // Nobody ever typed here (0) — regardless of output totals, box is loomux's.
-    assert!(!box_holds_human_input(0, 0, 0, BURST));
-    assert!(!box_holds_human_input(0, 1000, 100_000, BURST));
-    // Human typed and little/no output since (their line's own echo only) — it's
-    // still sitting in the box: a paste here would merge-submit it.
-    assert!(box_holds_human_input(5_000, 1000, 1000, BURST));
-    assert!(box_holds_human_input(5_000, 1000, 1023, BURST));
-    // A real burst since their keystroke (they submitted / the CLI consumed the
-    // line): the box cleared, safe to paste.
-    assert!(!box_holds_human_input(5_000, 1000, 1024, BURST));
-    assert!(!box_holds_human_input(5_000, 1000, 100_000, BURST));
-    // A garbage/wrapped reading below the baseline must not panic or under-flow
-    // into "cleared" — saturating_sub keeps the diff 0 → still holds.
-    assert!(box_holds_human_input(5_000, 1000, 500, BURST));
+fn classify_human_input_reads_box_occupancy_from_keystroke_content() {
+    // Printable text → a line now sits in the box.
+    assert_eq!(classify_human_input("a"), HumanInput::Content);
+    assert_eq!(classify_human_input("/model"), HumanInput::Content);
+    assert_eq!(classify_human_input("dfgdsfg"), HumanInput::Content);
+    // Enter (any newline form) submits — the box clears. This is the fix's crux:
+    // a sub-"burst" submit (empty Enter, short command) is still positively a
+    // submit, so the pending flag can't get stuck (finding #2).
+    assert_eq!(classify_human_input("\r"), HumanInput::Submit);
+    assert_eq!(classify_human_input("\n"), HumanInput::Submit);
+    assert_eq!(classify_human_input("\r\n"), HumanInput::Submit);
+    assert_eq!(classify_human_input("ls\r"), HumanInput::Submit); // typed + submitted in one write
+    // Text AFTER the last newline is a fresh unsubmitted line → still Content.
+    assert_eq!(classify_human_input("done\rmore"), HumanInput::Content);
+    // Explicit line-clear controls empty the box.
+    assert_eq!(classify_human_input("\u{15}"), HumanInput::Submit); // Ctrl-U
+    assert_eq!(classify_human_input("\u{03}"), HumanInput::Submit); // Ctrl-C
+    // Navigation / editing that adds no visible text leaves occupancy unchanged —
+    // a stray arrow or backspace must NOT mark an empty box as pending (else a
+    // delivery to an idle pane would wedge).
+    assert_eq!(classify_human_input("\u{1b}[C"), HumanInput::Neutral); // right arrow
+    assert_eq!(classify_human_input("\u{1b}[A"), HumanInput::Neutral); // up arrow
+    assert_eq!(classify_human_input("\u{7f}"), HumanInput::Neutral); // backspace/DEL
+    assert_eq!(classify_human_input(""), HumanInput::Neutral);
+    // A bracketed paste of text is Content — its ESC[200~ / ESC[201~ markers and
+    // their printable finals (`~`, digits) are skipped, the payload is not.
+    assert_eq!(classify_human_input("\u{1b}[200~hello\u{1b}[201~"), HumanInput::Content);
+    // A bracketed paste of only control noise adds nothing visible → Neutral.
+    assert_eq!(classify_human_input("\u{1b}[200~\u{1b}[201~"), HumanInput::Neutral);
 }
 
 #[test]
-fn paste_gate_holds_aborts_and_proceeds_on_the_right_signals() {
+fn paste_gate_holds_until_clear_then_pastes_or_aborts_at_the_cap() {
     let cap = Duration::from_secs(60);
-    // No human line in the box → paste immediately (the normal delivery path).
-    assert_eq!(resolve_paste_gate(false, false, false, Duration::ZERO, cap), PasteGate::Paste);
-    // Human's line present, not cleared, still within the bound → keep holding.
-    assert_eq!(resolve_paste_gate(true, false, false, Duration::from_secs(1), cap), PasteGate::Hold);
-    // Human is actively typing → hold even if a burst was seen (they've started a
-    // fresh line; never paste onto a live one).
-    assert_eq!(resolve_paste_gate(true, true, true, Duration::from_secs(1), cap), PasteGate::Hold);
-    // They submitted/cleared (burst) and went quiet → paste the prompt.
-    assert_eq!(resolve_paste_gate(true, false, true, Duration::from_secs(1), cap), PasteGate::Paste);
-    // Bound elapsed and the box never cleared → abort (never blind-merge).
-    assert_eq!(resolve_paste_gate(true, false, false, cap, cap), PasteGate::Abort);
-    // At the cap while STILL typing: abort rather than paste onto their line.
-    assert_eq!(resolve_paste_gate(true, true, false, cap, cap), PasteGate::Abort);
+    // Box empty → paste immediately (the normal delivery path).
+    assert_eq!(resolve_paste_gate(false, Duration::ZERO, cap), PasteGate::Paste);
+    assert_eq!(resolve_paste_gate(false, cap, cap), PasteGate::Paste);
+    // Human's line still sitting, within the bound → keep holding.
+    assert_eq!(resolve_paste_gate(true, Duration::from_secs(1), cap), PasteGate::Hold);
+    // Bound elapsed and the line never cleared → abort (never blind-merge).
+    assert_eq!(resolve_paste_gate(true, cap, cap), PasteGate::Abort);
+    assert_eq!(resolve_paste_gate(true, cap + Duration::from_millis(1), cap), PasteGate::Abort);
 }
 
 #[test]
@@ -4134,56 +4142,23 @@ fn hold_guard_releases_once_the_human_goes_quiet() {
 
 // --- #111 pre-paste human-input hold: the loop that drives the pure gate ---
 
-const HB_BURST: u64 = 24;
-const HB_QUIET: Duration = Duration::from_millis(50);
 const HB_POLL: Duration = Duration::from_millis(5);
 
 #[test]
 fn paste_hold_proceeds_immediately_when_box_is_empty() {
-    // No human keystroke ever (0) → the box was never dirty; paste at once.
-    let out = hold_for_human_input(
-        || (0, 0),
-        || 5000,
-        || 10_000,
-        HB_BURST,
-        HB_QUIET,
-        Duration::from_secs(5),
-        HB_POLL,
-    );
-    assert_eq!(out, PasteDecision::Paste { held_ms: 0 });
-}
-
-#[test]
-fn paste_hold_proceeds_when_the_human_already_submitted() {
-    // Human typed at output-total 1000, but the pane is now at 100_000: a burst
-    // since their keystroke means their line was submitted and the box cleared.
-    let out = hold_for_human_input(
-        || (5_000, 1000),
-        || 100_000,
-        || 10_000,
-        HB_BURST,
-        HB_QUIET,
-        Duration::from_secs(5),
-        HB_POLL,
-    );
+    // Not pending → the box is empty; paste at once with no hold.
+    let out = hold_for_human_input(|| false, Duration::from_secs(5), HB_POLL);
     assert_eq!(out, PasteDecision::Paste { held_ms: 0 });
 }
 
 #[test]
 fn paste_hold_aborts_when_the_line_never_clears() {
-    // Human typed (ms 1) with no output since (out_at_input == current total),
-    // and they never touch it again: the box holds their line for the whole
-    // bounded wait → abort rather than merge-submit. A small cap keeps it fast.
+    // A human line sits and they never submit/clear it: the box stays pending for
+    // the whole bounded wait → abort rather than merge-submit. A small cap keeps
+    // the test fast. Importantly, the decision is independent of any output the
+    // pane streams meanwhile (finding #1: ambient output can't false-clear it).
     let cap = Duration::from_millis(40);
-    let out = hold_for_human_input(
-        || (1, 1000),
-        || 1000,        // no growth ever → never clears
-        || u64::MAX,    // "now" is huge → not currently typing (stale keystroke)
-        HB_BURST,
-        HB_QUIET,
-        cap,
-        HB_POLL,
-    );
+    let out = hold_for_human_input(|| true, cap, HB_POLL);
     match out {
         PasteDecision::Abort { held_ms } => {
             assert!(held_ms >= 30, "must have held near the cap before aborting, got {held_ms}ms");
@@ -4196,55 +4171,48 @@ fn paste_hold_aborts_when_the_line_never_clears() {
 #[test]
 fn paste_hold_releases_once_the_human_submits() {
     use std::sync::atomic::{AtomicU64, Ordering};
-    // The line is sitting (little output) for the first few polls, then the
-    // human submits and the pane bursts past the floor: the loop must release
-    // with Paste — exercising the poll loop, not just the pure gate (#40 lesson).
+    // The line sits for the first few polls, then the human presses Enter and the
+    // pending flag flips false: the loop must release with Paste — exercising the
+    // poll loop, not just the pure gate (#40 lesson).
     let polls = AtomicU64::new(0);
-    let output = move || {
-        // Baseline 1000; jump well past the burst floor after a few polls.
-        if polls.fetch_add(1, Ordering::Relaxed) < 3 { 1000 } else { 1000 + HB_BURST + 50 }
-    };
-    let out = hold_for_human_input(
-        || (5_000, 1000), // typed long ago (stale) → not "typing now"
-        output,
-        || 10_000,        // now: keystroke at 5_000 is 5s old → past the quiet window
-        HB_BURST,
-        HB_QUIET,
-        Duration::from_secs(5),
-        HB_POLL,
-    );
+    let pending = move || polls.fetch_add(1, Ordering::Relaxed) < 3;
+    let out = hold_for_human_input(pending, Duration::from_secs(5), HB_POLL);
     match out {
         PasteDecision::Paste { held_ms } => {
             assert!(held_ms < 4000, "must release on submit, not ride the cap, got {held_ms}ms");
         }
-        other => panic!("expected Paste after the submit burst, got {other:?}"),
+        other => panic!("expected Paste after the submit, got {other:?}"),
     }
 }
 
 #[test]
-fn paste_hold_re_baselines_the_burst_window_on_a_fresh_keystroke() {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::Arc;
-    // The human keeps typing: each keystroke's echo grows the total, but the
-    // snapshot at that keystroke rises with it, so the growth SINCE the latest
-    // keystroke always stays under the burst floor. Because the loop re-baselines
-    // on every fresh keystroke, that accumulated echo must never read as a submit
-    // — the only exit under continuous typing is the cap → Abort. (A broken loop
-    // that kept the first baseline would see the total climb past floor and wrongly
-    // Paste.)
-    let typed = Arc::new(AtomicU64::new(0));
-    let ti = typed.clone();
-    let input = move || {
-        let n = ti.fetch_add(1, Ordering::Relaxed) + 1; // a fresh keystroke each poll
-        (10_000 + n, 1000 + n * 8) // out_at_input climbs with the echo
-    };
-    let to = typed.clone();
-    // Current total sits just 4 bytes past the latest snapshot — under the 24 floor.
-    let output = move || 1000 + to.load(Ordering::Relaxed) * 8 + 4;
+fn paste_hold_never_false_clears_from_ambient_output_while_a_line_sits() {
+    // Finding #1 (adversarial ordering): the guard used to read a pane's output
+    // growth as "the human submitted", so a keystroke's redraw or the agent's own
+    // mid-turn streaming could clear the guard and let a paste merge-submit a
+    // still-sitting line. Occupancy is now a keystroke-content flag, wholly
+    // independent of output — so however much the pane streams, a line that is
+    // still pending holds the delivery to the cap and aborts. (`pending` here
+    // stays true no matter what the pane "prints".)
     let cap = Duration::from_millis(40);
-    let out = hold_for_human_input(input, output, || u64::MAX, HB_BURST, HB_QUIET, cap, HB_POLL);
+    let out = hold_for_human_input(|| true, cap, HB_POLL);
     assert!(
         matches!(out, PasteDecision::Abort { .. }),
-        "continuous typing must never false-clear off accumulated echo: {out:?}",
+        "ambient output must not clear a sitting human line: {out:?}",
     );
+}
+
+#[test]
+fn sub_floor_submit_does_not_wedge_future_deliveries() {
+    // Finding #2 (adversarial ordering): a human submit whose output burst is tiny
+    // (empty Enter, short command) must not leave the box "pending" forever and
+    // wedge every later delivery in a 60s hold→abort loop. With keystroke-content
+    // tracking, the Enter positively clears occupancy: classify a sub-floor submit
+    // as Submit, and a delivery consulting the resulting (false) flag pastes at
+    // once with no hold.
+    assert_eq!(classify_human_input("\r"), HumanInput::Submit); // empty Enter
+    assert_eq!(classify_human_input("q\r"), HumanInput::Submit); // one-char command + Enter
+    // The flag those submits leave (false) drives an immediate paste — no wedge.
+    let out = hold_for_human_input(|| false, Duration::from_secs(60), HB_POLL);
+    assert_eq!(out, PasteDecision::Paste { held_ms: 0 });
 }

@@ -128,13 +128,14 @@ pub struct PtyHandle {
     /// `None` when job creation failed (fail-soft) — pre-#78 behavior.
     #[cfg(target_os = "windows")]
     _job: Option<JobHandle>,
-    /// The pane's `output.total` captured at that last human keystroke (#111).
-    /// Pairing "when they last typed" with "how much output had streamed by
-    /// then" lets delivery tell text still *sitting* in the box (little output
-    /// since) from text the human already *submitted* (a burst since) — so a
-    /// paste never merge-submits a human's half-typed line, but an already-sent
-    /// line doesn't wrongly hold the delivery either.
-    output_total_at_input: Arc<std::sync::atomic::AtomicU64>,
+    /// Whether a human's typed line is currently sitting UNSUBMITTED in this
+    /// pane's input box (#111). Tracked from the *content* of each human write,
+    /// not from output bytes: printable input sets it (the box now holds a line),
+    /// an Enter / line-clear resets it (the line was submitted or cleared). This
+    /// positive submit/clear signal is what lets prompt delivery hold a paste off
+    /// a human's half-written line without wedging on an already-submitted one —
+    /// output-byte heuristics can't tell a keystroke's echo from a submit burst.
+    input_pending: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Ring of recent output plus a monotonic byte counter. The counter lets
@@ -187,17 +188,12 @@ impl PtyManager {
         Some(ptys.get(&id)?.user_input_ms.load(Ordering::Relaxed))
     }
 
-    /// The last human keystroke as `(unix_ms, output_total_at_that_keystroke)`
-    /// (#111). The delivery guard compares the second value against the pane's
-    /// current output total: little growth since means their line is still
-    /// sitting unsubmitted in the box; a burst means it was already submitted.
-    pub fn last_user_input(&self, id: u32) -> Option<(u64, u64)> {
+    /// Whether a human's line is currently sitting unsubmitted in this pane's
+    /// input box (#111). `None` if the pty is gone. Prompt delivery consults this
+    /// before pasting so it never merge-submits a human's half-written line.
+    pub fn input_pending(&self, id: u32) -> Option<bool> {
         let ptys = self.ptys.lock_safe();
-        let pty = ptys.get(&id)?;
-        Some((
-            pty.user_input_ms.load(Ordering::Relaxed),
-            pty.output_total_at_input.load(Ordering::Relaxed),
-        ))
+        Some(ptys.get(&id)?.input_pending.load(Ordering::Relaxed))
     }
 
     /// Monotonic count of bytes this pty has ever produced.
@@ -509,7 +505,7 @@ pub fn spawn_pty(
             user_input_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(target_os = "windows")]
             _job: job,
-            output_total_at_input: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            input_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         },
     );
 
@@ -621,11 +617,14 @@ pub fn write_pty(state: State<PtyManager>, id: u32, data: String) -> Result<(), 
             .unwrap_or(0),
         Ordering::Relaxed,
     );
-    // Snapshot how much output had streamed as of this keystroke (#111), so the
-    // delivery guard can later tell a still-sitting line (no burst since) from
-    // one the human already submitted (a burst since).
-    pty.output_total_at_input
-        .store(pty.output.lock_safe().total, Ordering::Relaxed);
+    // Track box occupancy from the keystroke's CONTENT (#111): printable input
+    // leaves a line sitting in the box; an Enter / line-clear empties it. Neutral
+    // edits (arrows, backspace, bare escape sequences) leave occupancy unchanged.
+    match crate::orchestration::classify_human_input(&data) {
+        crate::orchestration::HumanInput::Content => pty.input_pending.store(true, Ordering::Relaxed),
+        crate::orchestration::HumanInput::Submit => pty.input_pending.store(false, Ordering::Relaxed),
+        crate::orchestration::HumanInput::Neutral => {}
+    }
     pty.writer
         .write_all(data.as_bytes())
         .map_err(|e| e.to_string())
