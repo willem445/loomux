@@ -22,11 +22,24 @@ const KEY_MODE = "loomux.agentMode";
 const KEY_DEFAULT = "loomux.defaultAgent";
 const KEY_CUSTOM = "loomux.customAgentCommand";
 const KEY_REPOS = "loomux.recentRepos";
+const KEY_AUTOPILOT = "loomux.singlePaneAutopilot";
 const MAX_RECENT_REPOS = 8;
 
 export const getAgentMode = (): boolean => localStorage.getItem(KEY_MODE) === "1";
 export const setAgentMode = (on: boolean): void =>
   localStorage.setItem(KEY_MODE, on ? "1" : "0");
+
+/** Interpret a persisted autopilot value. Default ON (#101): only an explicit
+ *  "0" is off, so an absent or unrecognized value stays on. Pure so the
+ *  default-ON semantics are unit-testable without a localStorage shim. */
+export const autopilotFromStored = (v: string | null): boolean => v !== "0";
+
+/** Single-pane / multi-pane "autopilot — allow all" launch toggle (#101).
+ *  Defaults ON: an absent key means the user has never opted out. Persisted so
+ *  the last choice is the default next time, like the other launcher prefs. */
+export const getAutopilot = (): boolean => autopilotFromStored(localStorage.getItem(KEY_AUTOPILOT));
+export const setAutopilot = (on: boolean): void =>
+  localStorage.setItem(KEY_AUTOPILOT, on ? "1" : "0");
 
 /** The agent preselected in the launcher; updated on every launch. */
 export function getDefaultAgent(): AgentDef {
