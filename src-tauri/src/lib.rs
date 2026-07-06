@@ -89,6 +89,7 @@ pub fn run() {
             git::git_branches,
             gitwatch::git_watch,
             gitwatch::git_unwatch,
+            orchestration::agent_autopilot_flags,
             orchestration::create_orchestration,
             orchestration::bind_agent,
             orchestration::orch_agent_renamed,

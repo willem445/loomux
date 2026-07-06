@@ -8,14 +8,14 @@
 
 use loomux_lib::orchestration::mcp::dispatch;
 use loomux_lib::orchestration::{
-    add_trusted_folder, bracketed_paste, cli_ready, create_orchestration_group, hold_until_quiet,
-    idle_should_kill, max_agents_notice,
+    add_trusted_folder, bracketed_paste, claude_permission_mode, cli_ready,
+    create_orchestration_group, hold_until_quiet, idle_should_kill, max_agents_notice,
     normalize_remote_web_base, parse_audit_lines, parse_session_cost, prompt_wait_detected,
     resolve_ref_url, rotate_audit_if_needed, sanitize_attachment_ext, should_flush_before_paste,
-    spawn_rate_exceeded, strip_ansi, submit_confirmed, submit_sequence, watchdog_should_notify,
-    worktree_cleanup_targets, AttentionItem, Caller,
-    Guardrails, NameSource, OrchRegistry, Role, TaskPatch, UsageSnapshot, MAX_ATTACHMENT_BYTES,
-    PLANNER_READONLY_NOTE,
+    single_pane_autopilot_flags, spawn_rate_exceeded, strip_ansi, submit_confirmed, submit_sequence,
+    watchdog_should_notify, worktree_cleanup_targets, AttentionItem, Caller, Guardrails, NameSource,
+    OrchRegistry, Role, TaskPatch, UsageSnapshot, CLAUDE_UNATTENDED_ALLOW, COPILOT_UNATTENDED_FLAGS,
+    MAX_ATTACHMENT_BYTES, PLANNER_READONLY_NOTE,
 };
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -712,6 +712,73 @@ fn copilot_planner_runs_unattended_regardless_of_auto_ops() {
     let worker = reg.build_agent_command("copilot", "auto", false, cfg, gdir, Path::new("C:/repo"), None, false, false);
     assert!(!worker.contains("--autopilot") && !worker.contains("--allow-all-tools"),
         "a non-auto_ops copilot worker stays interactive — only planners run unattended");
+}
+
+// ── Single-pane autopilot flags (#101) ─────────────────────────────────────
+
+#[test]
+fn single_pane_autopilot_flags_per_cli() {
+    // Claude: native Auto permission mode + the git/gh pre-approval, so a
+    // standalone pane skips the interactive prompt-on-everything default.
+    let claude = single_pane_autopilot_flags("claude");
+    assert!(claude.contains("--permission-mode auto"),
+        "claude autopilot must use the native Auto mode, got: {claude}");
+    assert!(claude.contains("--allowedTools"), "claude autopilot must pre-approve tools");
+    assert!(claude.contains("\"Bash(git *)\"") && claude.contains("\"Bash(gh *)\""),
+        "claude autopilot must pre-approve git + gh, got: {claude}");
+    assert!(!claude.contains("--dangerously-skip-permissions"),
+        "autopilot must never use bypass mode");
+
+    // Copilot: its own unattended trio.
+    let copilot = single_pane_autopilot_flags("copilot");
+    assert!(copilot.contains("--autopilot")
+        && copilot.contains("--allow-all-tools")
+        && copilot.contains("--allow-all-paths"),
+        "copilot autopilot must pass its unattended flags, got: {copilot}");
+
+    // Case-insensitive on the program name.
+    assert_eq!(single_pane_autopilot_flags("Claude"), claude);
+    assert_eq!(single_pane_autopilot_flags("COPILOT"), copilot);
+
+    // CLIs with no known unattended surface get no flags (the toggle is inert),
+    // rather than inventing flags that may not exist.
+    for other in ["codex", "opencode", "gemini", "aider", ""] {
+        assert_eq!(single_pane_autopilot_flags(other), "",
+            "{other:?} has no unattended flag surface — must return empty");
+    }
+}
+
+#[test]
+fn single_pane_flags_reuse_the_group_path_atoms() {
+    // The whole point of #101: the single-pane flags are built from the SAME
+    // per-CLI atoms as build_agent_command, so the two paths can't drift. If
+    // build_agent_command's unattended flags change, these must change with it.
+    let (reg, _d) = test_registry();
+    let cfg = Path::new("C:/x/cfg.json");
+    let gdir = Path::new("C:/data/group");
+
+    // Claude: permission mode + the shared git/gh allowlist constant.
+    let group_claude =
+        reg.build_agent_command("claude", "sonnet", true, cfg, gdir, Path::new("C:/repo"), None, false, false);
+    let single_claude = single_pane_autopilot_flags("claude");
+    assert!(single_claude.contains(&format!("--permission-mode {}", claude_permission_mode(true))));
+    assert!(group_claude.contains(&format!("--permission-mode {}", claude_permission_mode(true))));
+    assert!(single_claude.contains(CLAUDE_UNATTENDED_ALLOW) && group_claude.contains(CLAUDE_UNATTENDED_ALLOW),
+        "both paths must use the shared CLAUDE_UNATTENDED_ALLOW constant");
+
+    // Copilot: the shared unattended-flags constant.
+    let group_copilot =
+        reg.build_agent_command("copilot", "auto", true, cfg, gdir, Path::new("C:/repo"), None, false, false);
+    let single_copilot = single_pane_autopilot_flags("copilot");
+    assert_eq!(single_copilot, COPILOT_UNATTENDED_FLAGS);
+    assert!(group_copilot.contains(COPILOT_UNATTENDED_FLAGS),
+        "the group path must use the shared COPILOT_UNATTENDED_FLAGS constant");
+}
+
+#[test]
+fn claude_permission_mode_maps_unattended() {
+    assert_eq!(claude_permission_mode(true), "auto");
+    assert_eq!(claude_permission_mode(false), "acceptEdits");
 }
 
 #[test]

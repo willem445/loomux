@@ -463,6 +463,51 @@ fn default_model(cli: &str, role: Role) -> &'static str {
     }
 }
 
+// ── Per-CLI unattended ("autopilot / allow all") permission flags ───────────
+//
+// The single source of truth for what "unattended" means on each agent CLI.
+// Both the orchestration spawn path (`build_agent_command`) and the single-pane
+// launcher (`single_pane_autopilot_flags`, exposed as the `agent_autopilot_flags`
+// Tauri command) build from these atoms, so the two paths can't drift (#101).
+
+/// Copilot's unattended-mode flags: autopilot + all tools + no path prompts.
+pub const COPILOT_UNATTENDED_FLAGS: &str = "--autopilot --allow-all-tools --allow-all-paths";
+
+/// git + gh pre-approval appended to Claude's `--allowedTools` for an unattended
+/// agent, so the branch→commit→PR flow runs without prompts. `Bash(git *)`
+/// matches every git subcommand; a planner's denials carve commit/push back out.
+pub const CLAUDE_UNATTENDED_ALLOW: &str = "\"Bash(git *)\" \"Bash(gh *)\"";
+
+/// Claude Code's permission mode for an (un)attended agent: its native `auto`
+/// preset when unattended (what a human uses interactively), else `acceptEdits`.
+pub fn claude_permission_mode(unattended: bool) -> &'static str {
+    if unattended {
+        "auto"
+    } else {
+        "acceptEdits"
+    }
+}
+
+/// Per-CLI flags that put a *standalone* single-pane agent into the same
+/// unattended "autopilot / allow all" posture group workers get — minus the
+/// MCP/session/workspace wiring only a managed agent needs. Built from the SAME
+/// atoms as `build_agent_command` (#101) so the launcher and the orchestration
+/// path can't drift.
+///
+/// Returns an empty string for CLIs with no known unattended flag surface
+/// (codex/opencode/gemini/custom): the toggle is a no-op there rather than
+/// inventing flags that may not exist.
+pub fn single_pane_autopilot_flags(program: &str) -> String {
+    match program.trim().to_lowercase().as_str() {
+        "claude" => format!(
+            "--permission-mode {} --allowedTools {CLAUDE_UNATTENDED_ALLOW}",
+            claude_permission_mode(true)
+        ),
+        "copilot" => COPILOT_UNATTENDED_FLAGS.to_string(),
+        _ => String::new(),
+    }
+}
+
 /// Whether an idle agent has sat long enough to auto-kill. Pure so the
 /// threshold logic is testable without threads or wall-clock; the reaper
 /// loop lives in `start_idle_reaper`. `idle_since_ms` is `None` for an agent
@@ -3482,7 +3527,8 @@ impl OrchRegistry {
                     // interactive mode would stall it on a human that isn't
                     // there; the deny rules below keep it read-only, and deny
                     // takes precedence over --allow-all-tools in Copilot.
-                    cmd.push_str(" --autopilot --allow-all-tools --allow-all-paths");
+                    cmd.push(' ');
+                    cmd.push_str(COPILOT_UNATTENDED_FLAGS);
                 } else {
                     cmd.push_str(" --allow-tool \"shell(git:*)\" --allow-tool \"shell(gh:*)\"");
                 }
@@ -3512,7 +3558,7 @@ impl OrchRegistry {
                 // (what the human uses interactively); otherwise acceptEdits.
                 // A planner (`read_only`) is always `unattended` (see above),
                 // so it runs under Auto perms even in a non-auto_ops group.
-                let perm = if unattended { "auto" } else { "acceptEdits" };
+                let perm = claude_permission_mode(unattended);
                 let mut cmd = format!(
                     "claude {session_flag}--mcp-config \"{}\" --strict-mcp-config --model {model} \
                      --permission-mode {perm} --add-dir \"{}\" --allowedTools mcp__loomux",
@@ -3525,7 +3571,8 @@ impl OrchRegistry {
                     // explore + `gh issue comment` for the plan). `Bash(git *)`
                     // matches every git subcommand; a planner's denials below
                     // carve commit/push back out.
-                    cmd.push_str(" \"Bash(git *)\" \"Bash(gh *)\"");
+                    cmd.push(' ');
+                    cmd.push_str(CLAUDE_UNATTENDED_ALLOW);
                 }
                 if read_only {
                     // Deny the file-editing tools and the git mutation
@@ -4377,6 +4424,15 @@ pub fn start_attention(reg: Arc<OrchRegistry>) {
 }
 
 // ---------- tauri commands ----------
+
+/// The flags the single-pane launcher appends to a `program` command when its
+/// "autopilot / allow all" toggle is on (#101). Empty for CLIs with no known
+/// unattended surface. Shares `single_pane_autopilot_flags` with the group
+/// spawn path so the two can't drift. Stateless (no registry needed).
+#[tauri::command]
+pub fn agent_autopilot_flags(program: String) -> String {
+    single_pane_autopilot_flags(&program)
+}
 
 /// Create (or reattach to) an orchestration group and register its
 /// orchestrator. Returns the pane spec the frontend opens directly; initial

@@ -215,6 +215,19 @@ open so you can read what happened. The launcher's **Multiple panes** mode
 also spawns N independent agent panes at once (a worktree name fans out to
 `name-1 … name-N`).
 
+**Autopilot toggle (single & multiple panes):** a plain agent pane would
+otherwise boot in the CLI's default interactive permission mode and prompt on
+everything. The **Single pane** and **Multiple panes** modes carry an
+*Autopilot — pre-approve all tools (allow all)* checkbox, **on by default**,
+that launches the agent with the *same* unattended permission flags a group
+worker gets — Claude Code's native Auto mode plus pre-approved `git`/`gh`,
+Copilot's `--autopilot --allow-all-tools --allow-all-paths`. The flags come from
+the backend (the same source the orchestration path uses, so the two can't
+drift); the toggle only shows for CLIs that have an unattended mode
+(Claude/Copilot), and never for a custom command. Uncheck it to launch in the
+CLI's normal interactive mode. Your last choice is remembered as the default
+next time (in `localStorage`, like the other launcher prefs).
+
 **How it works:** loomux hosts a local MCP server; every agent pane in a
 group connects with its own identity token (`--strict-mcp-config`, so
 workers see nothing else). The orchestrator plans work as GitHub issues
