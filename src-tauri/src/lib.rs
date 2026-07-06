@@ -96,6 +96,7 @@ pub fn run() {
             orchestration::orch_tasks,
             orchestration::orch_audit,
             orchestration::orch_steer,
+            orchestration::orch_save_attachment,
             orchestration::orch_upsert_task,
             orchestration::orch_delete_task,
             orchestration::orch_reorder_tasks,
