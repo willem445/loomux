@@ -4176,8 +4176,14 @@ impl OrchRegistry {
             // Copilot autopilot consent (#101): the UI has painted, so if this
             // is a fresh autopilot copilot spawn its "Enable autopilot mode"
             // dialog is on screen. Answer it (Enter → "Enable all permissions")
-            // now, before any paste, so the brief can't collide with the dialog.
-            // Fail-soft: no-op if the dialog never shows.
+            // now — before the stranded-text flush (#99) below AND before any
+            // paste — so neither our brief nor a flush Enter can hit the dialog
+            // out of order. In practice the flush can't fire here anyway: the
+            // confirm only runs on a FreshKickoff (`is_fresh_boot`), whose pane
+            // has no prior `last_delivery` entry, so `should_flush_before_paste`
+            // sees `None` and returns false. Ordering the confirm first keeps
+            // that safe even if a pty id were ever recycled. Fail-soft: no-op if
+            // the dialog never shows.
             if confirm_autopilot {
                 confirm_copilot_autopilot_dialog(&ptys, pty_id, &root, &group, &agent);
             }

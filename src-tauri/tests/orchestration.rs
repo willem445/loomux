@@ -896,6 +896,24 @@ fn autopilot_confirm_gates_to_a_fresh_copilot_boot() {
 }
 
 #[test]
+fn autopilot_confirm_and_stranded_flush_never_both_fire_on_a_fresh_boot() {
+    // #99-rebase interaction: `deliver_prompt` runs the autopilot confirm
+    // (Enter on the consent dialog) BEFORE #99's stranded-text flush (an Enter
+    // to clear a previous prompt still in the box). They must never both press
+    // Enter on the same fresh boot, or the flush Enter could land on the dialog
+    // out of order. They can't: the confirm runs only on a *fresh boot*, and a
+    // freshly booted pane has no prior delivery, so the flush's own guard
+    // (`should_flush_before_paste(None, _)`) is false. This pins that composition
+    // — if either guard's contract changes, this fails.
+    // Fresh boot ⇒ confirm may run …
+    assert!(should_confirm_copilot_autopilot("copilot", true, true));
+    // … but the flush cannot: no previous delivery to key off (prev = None).
+    assert!(!should_flush_before_paste(None, false),
+        "a fresh-boot pane has no prior delivery, so the flush never fires alongside the confirm");
+    assert!(!should_flush_before_paste(None, true));
+}
+
+#[test]
 fn copilot_autopilot_confirm_key_is_a_single_enter() {
     // The dialog's default-highlighted item is "Enable all permissions" (menu
     // initialIndex 0), and Enter (`code==="return"`) selects it — so a single
