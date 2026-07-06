@@ -19,7 +19,14 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// Wall-clock Unix-ms, mirroring the crate-private `now_ms` — the debounce
+/// tests inject `now_ms() + window` into `flush_due_max_notices` to fire a
+/// pending notice deterministically without sleeping out the real 3s window.
+fn now_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
 
 #[test]
 fn kickoff_readiness_waits_for_painted_and_quiet_cli() {
@@ -246,6 +253,10 @@ fn max_agents_change_audits_and_notifies_orchestrator() {
     // pane to type into) — this lets us observe the exact notice text.
     reg.pause_group(&g.id).unwrap();
     reg.set_max_agents(&g.id, 4, "human").unwrap();
+    // The audit is immediate (per-click); the notice is debounced (#79), so it
+    // is delivered only when its window has elapsed — drive the flush past the
+    // 3s debounce deterministically (no sleep) to observe the notice text.
+    reg.flush_due_max_notices(now_ms() + 4_000);
     let log = fs::read_to_string(reg.state_root().join(&g.id).join("audit.jsonl")).unwrap();
     let events: Vec<Value> = log.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
     assert!(
@@ -260,6 +271,83 @@ fn max_agents_change_audits_and_notifies_orchestrator() {
             e["action"] == json!("prompt-suppressed-paused")
             && e["detail"]["text"].as_str().unwrap_or("").contains("max live agents changed 2→4")),
         "the orchestrator must receive the cap-change re-plan notice"
+    );
+}
+
+// Helper: read the audit log and count the coalesced re-plan notices (visible
+// as `prompt-suppressed-paused` entries because the group is paused in tests).
+fn replan_notices(reg: &OrchRegistry, group: &str) -> Vec<String> {
+    let log = fs::read_to_string(reg.state_root().join(group).join("audit.jsonl")).unwrap();
+    log.lines()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .filter(|e| e["action"] == json!("prompt-suppressed-paused"))
+        .filter_map(|e| e["detail"]["text"].as_str().map(str::to_string))
+        .filter(|t| t.contains("max live agents changed"))
+        .collect()
+}
+
+#[test]
+fn rapid_max_agents_clicks_coalesce_to_one_notice() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap(); // cap 2
+    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    reg.pause_group(&g.id).unwrap();
+    // A burst of stepper clicks 2→4→6→3, all within the debounce window (test
+    // calls land in the same few ms). Each persists + enforces + audits per
+    // click, but the notice is held.
+    reg.set_max_agents(&g.id, 4, "human").unwrap();
+    reg.set_max_agents(&g.id, 6, "human").unwrap();
+    reg.set_max_agents(&g.id, 3, "human").unwrap();
+    // Before the window elapses, nothing has been delivered.
+    reg.flush_due_max_notices(now_ms());
+    assert!(replan_notices(&reg, &g.id).is_empty(), "no notice fires mid-burst");
+    // Every click is audited (enforcement/persist stay per-click).
+    let sets = fs::read_to_string(reg.state_root().join(&g.id).join("audit.jsonl"))
+        .unwrap()
+        .lines()
+        .filter(|l| l.contains("max-agents-set"))
+        .count();
+    assert_eq!(sets, 3, "each click is audited immediately");
+    // Once the window passes: exactly ONE notice, spanning the whole burst
+    // (2→3), never the intermediate 2→4 / 4→6 values.
+    reg.flush_due_max_notices(now_ms() + 4_000);
+    let notices = replan_notices(&reg, &g.id);
+    assert_eq!(notices.len(), 1, "a burst yields one coalesced notice, got: {notices:?}");
+    assert!(notices[0].contains("2→3"), "notice spans the whole burst, got: {}", notices[0]);
+}
+
+#[test]
+fn spaced_max_agents_changes_notify_separately() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap(); // cap 2
+    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    reg.pause_group(&g.id).unwrap();
+    // First change flushes fully before the second is recorded → two notices.
+    reg.set_max_agents(&g.id, 5, "human").unwrap();
+    reg.flush_due_max_notices(now_ms() + 4_000);
+    reg.set_max_agents(&g.id, 2, "human").unwrap();
+    reg.flush_due_max_notices(now_ms() + 8_000);
+    let notices = replan_notices(&reg, &g.id);
+    assert_eq!(notices.len(), 2, "spaced changes stay separate, got: {notices:?}");
+    assert!(notices[0].contains("2→5"), "first notice: {}", notices[0]);
+    assert!(notices[1].contains("5→2"), "second notice: {}", notices[1]);
+}
+
+#[test]
+fn planners_count_toward_live_delegates_summary() {
+    // #47 makes planners count against the cap (live_delegate_count includes
+    // them); the summary's live_delegates must agree so the UI's "cap below N
+    // live" warning stays honest.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", Guardrails { max_agents: 5, ..rails() }).unwrap();
+    reg.spawn_agent(&g.id, Role::Worker, "w1", "t", false, None).unwrap();
+    reg.spawn_agent(&g.id, Role::Reviewer, "r1", "t", false, None).unwrap();
+    reg.spawn_agent(&g.id, Role::Planner, "p1", "t", false, None).unwrap();
+    let sum = reg.group_summary(&g.id);
+    assert_eq!(
+        sum["live_delegates"].as_u64().unwrap(),
+        3,
+        "worker + reviewer + planner all count against the cap"
     );
 }
 

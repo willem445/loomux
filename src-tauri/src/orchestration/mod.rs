@@ -50,6 +50,77 @@ const MAX_AGENTS_CEILING: u32 = 12;
 pub fn max_agents_notice(from: u32, to: u32) -> String {
     format!("[loomux] max live agents changed {from}→{to} — re-plan accordingly")
 }
+
+/// Quiet window a group's cap must fall silent for before its coalesced
+/// cap-change notice is delivered. Rapid stepper clicks (#79) each persist,
+/// enforce, and audit immediately, but the token-costing orchestrator notice
+/// waits out this window and then spans the whole burst (first change's `from`
+/// → last change's `to`), so a flurry of clicks is one prompt, not many.
+const MAX_NOTICE_DEBOUNCE: Duration = Duration::from_secs(3);
+/// How often the flusher loop checks for a debounced cap-change notice whose
+/// window has elapsed. Well under `MAX_NOTICE_DEBOUNCE` so the delivered notice
+/// lags the last click by at most a tick beyond the debounce.
+const MAX_NOTICE_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
+
+/// A cap-change notice awaiting its debounce window (#79). `from` is the cap
+/// before the burst began — preserved across coalesced changes so the notice
+/// reads end-to-end; `to` is the latest cap; `due_ms` is the Unix-ms at which,
+/// absent any further change, the notice fires.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PendingMaxNotice {
+    from: u32,
+    to: u32,
+    due_ms: u64,
+}
+
+/// Fold one cap change into the per-group debounce map (#79). A change that
+/// lands while a notice is still pending keeps the original `from` (so the
+/// coalesced notice spans the whole burst) and only advances `to` and pushes
+/// the deadline out; the first change of a burst seeds a fresh entry. Pure, so
+/// the coalescing is unit-testable without a clock or a live registry.
+fn record_max_notice(
+    pending: &mut HashMap<String, PendingMaxNotice>,
+    group: &str,
+    from: u32,
+    to: u32,
+    now: u64,
+    debounce: Duration,
+) {
+    let due_ms = now.saturating_add(debounce.as_millis() as u64);
+    pending
+        .entry(group.to_string())
+        .and_modify(|p| {
+            p.to = to;
+            p.due_ms = due_ms;
+        })
+        .or_insert(PendingMaxNotice { from, to, due_ms });
+}
+
+/// Drain the notices whose debounce window has elapsed (`due_ms <= now`),
+/// returning `(group, from, to)` for each that is a real net change. A burst
+/// that nets back to where it started (e.g. 4→3→4) is dropped without a notice
+/// — no orchestrator tokens spent announcing a no-op. Pure, so the flush
+/// decision is unit-testable without sleeping out the debounce.
+fn take_due_max_notices(
+    pending: &mut HashMap<String, PendingMaxNotice>,
+    now: u64,
+) -> Vec<(String, u32, u32)> {
+    let due: Vec<String> = pending
+        .iter()
+        .filter(|(_, p)| p.due_ms <= now)
+        .map(|(g, _)| g.clone())
+        .collect();
+    let mut out = Vec::new();
+    for g in due {
+        if let Some(p) = pending.remove(&g) {
+            if p.from != p.to {
+                out.push((g, p.from, p.to));
+            }
+        }
+    }
+    out
+}
+
 /// Upper bound on the idle-worker auto-kill timeout (24h); 0 disables it.
 const MAX_IDLE_KILL_MINUTES: u32 = 1440;
 /// Upper bound on the spawn-rate guardrail; 0 = unlimited.
@@ -791,6 +862,12 @@ pub struct OrchRegistry {
     attn_emitted: Mutex<HashMap<String, String>>,
     /// Groups with desktop notifications enabled (durable `notify` marker file).
     notify_groups: Mutex<HashSet<String>>,
+    /// Debounced cap-change notices (#79): group → its pending, not-yet-
+    /// delivered `PendingMaxNotice`. `set_max_agents` folds rapid stepper
+    /// clicks in here (persist/enforce/audit stay per-click); the
+    /// `start_max_notice_flusher` loop delivers one coalesced notice per burst
+    /// once the group falls quiet.
+    pending_max_notice: Mutex<HashMap<String, PendingMaxNotice>>,
     /// Test-only override of the Claude transcript root (`~/.claude/projects`).
     /// `None` in production. Set via `set_claude_projects_dir` so the usage
     /// reader can be pointed at a fixture tree without touching global env —
@@ -1158,6 +1235,7 @@ impl OrchRegistry {
             attn_waiting_ack: Mutex::new(HashSet::new()),
             attn_emitted: Mutex::new(HashMap::new()),
             notify_groups: Mutex::new(HashSet::new()),
+            pending_max_notice: Mutex::new(HashMap::new()),
             claude_projects_dir: Mutex::new(None),
         }
     }
@@ -2166,7 +2244,8 @@ impl OrchRegistry {
     /// in-memory guardrail (which `spawn_agent` reads fresh on every spawn, so
     /// it takes effect immediately — nothing caches the creation-time number)
     /// and persisted to group.json so a restart keeps it, then the change is
-    /// audited and announced to the orchestrator pane. Lowering the cap below
+    /// audited (per-click) and the orchestrator notice is *debounced* — a burst
+    /// of stepper clicks coalesces into one re-plan prompt (#79). Lowering the cap below
     /// the current live count kills nobody: new spawns are simply refused until
     /// attrition brings the count back under the cap. Returns the new value.
     /// A no-op change (`n` already the current cap) short-circuits without a
@@ -2190,9 +2269,21 @@ impl OrchRegistry {
             .max_agents = n;
         self.audit(group, actor, "max-agents-set", json!({ "from": old, "to": n }));
         // The orchestrator's kickoff prompt already rendered the old
-        // {{MAX_AGENTS}} into static text; announce the new ceiling so it
-        // re-plans (best-effort — a dead/paused orchestrator just misses it).
-        let _ = self.deliver_to_orchestrator(group, &max_agents_notice(old, n), "loomux");
+        // {{MAX_AGENTS}} into static text; it needs the new ceiling to re-plan.
+        // But rapid-clicking the stepper (4→3→2) would otherwise fire a notice
+        // per click, each a real prompt that burns orchestrator tokens/time
+        // (#79). So debounce: record the change here (carrying the burst's
+        // original `from`) and let `flush_due_max_notices` deliver ONE notice —
+        // 4→2, not 4→3 then 3→2 — once the clicks stop. Enforcement/persist
+        // above and the audit are per-click and immediate; only the notice waits.
+        record_max_notice(
+            &mut self.pending_max_notice.lock_safe(),
+            group,
+            old,
+            n,
+            now_ms(),
+            MAX_NOTICE_DEBOUNCE,
+        );
         Ok(n)
     }
 
@@ -2230,6 +2321,21 @@ impl OrchRegistry {
             let _ = fs::remove_file(&tmp);
         }
         Ok(())
+    }
+
+    /// Deliver any debounced cap-change notice whose quiet window has elapsed
+    /// (#79). Called on a timer by `start_max_notice_flusher`; `now` is injected
+    /// so tests drive the coalescing deterministically without sleeping out the
+    /// debounce. A burst that netted to a no-op is dropped inside
+    /// `take_due_max_notices` and never reaches the orchestrator.
+    #[doc(hidden)] // pub for integration tests
+    pub fn flush_due_max_notices(&self, now: u64) {
+        let due = take_due_max_notices(&mut self.pending_max_notice.lock_safe(), now);
+        for (group, from, to) in due {
+            // Best-effort, like the exit notice: a dead/paused orchestrator
+            // just misses it. Delivery is intentionally outside the lock.
+            let _ = self.deliver_to_orchestrator(&group, &max_agents_notice(from, to), "loomux");
+        }
     }
 
     /// Read every agent pane's output counter, last-lines tail, and last human
@@ -2872,9 +2978,11 @@ impl OrchRegistry {
             "live_agents": live.len(),
             // The current adjustable cap and how many delegates count against
             // it, so the UI can show the stepper's value and warn when a lower
-            // cap would (harmlessly) block spawns until attrition.
+            // cap would (harmlessly) block spawns until attrition. Must match
+            // `live_delegate_count` (the value enforcement actually reads):
+            // planners count too (#47), so a cap-below-live warning stays honest.
             "max_agents": self.group(group).map(|g| g.guardrails.max_agents),
-            "live_delegates": worker + reviewer,
+            "live_delegates": worker + reviewer + planner,
             "paused": self.is_paused(group),
             "uptime_ms": earliest.map(|e| now.saturating_sub(e)),
             "roles": { "orchestrator": orch, "worker": worker, "reviewer": reviewer, "planner": planner },
@@ -3828,6 +3936,18 @@ pub fn start_watchdog(reg: Arc<OrchRegistry>) {
     });
 }
 
+/// Background loop for the debounced cap-change notice (#79): every
+/// `MAX_NOTICE_FLUSH_INTERVAL` it delivers any coalesced max-agents notice
+/// whose quiet window has elapsed, so a burst of stepper clicks reaches the
+/// orchestrator as one re-plan prompt instead of one per click. Started once
+/// at app setup.
+pub fn start_max_notice_flusher(reg: Arc<OrchRegistry>) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(MAX_NOTICE_FLUSH_INTERVAL);
+        reg.flush_due_max_notices(now_ms());
+    });
+}
+
 /// Background loop for attention routing (#6): every `ATTENTION_INTERVAL` it
 /// recomputes which panes need the human (idle-with-prompt, worker reports,
 /// human merge gates), pushes the set to the frontend for pane badges, and
@@ -4643,5 +4763,75 @@ mod hold_tests {
         // A clock skew where last_input is "after" now must not panic or wrap;
         // saturating_sub yields 0 → within window → hold.
         assert!(should_hold_for_user(11_000, 10_000, Duration::from_secs(1), WINDOW, CAP));
+    }
+}
+
+#[cfg(test)]
+mod max_notice_tests {
+    use super::*;
+
+    const DEB: Duration = Duration::from_secs(3);
+
+    #[test]
+    fn burst_coalesces_to_one_span() {
+        // Three rapid clicks 4→3, 3→2, 2→1 inside the window: one pending entry
+        // spanning the whole burst, its deadline riding the LAST click.
+        let mut p = HashMap::new();
+        record_max_notice(&mut p, "g", 4, 3, 1_000, DEB);
+        record_max_notice(&mut p, "g", 3, 2, 1_500, DEB);
+        record_max_notice(&mut p, "g", 2, 1, 2_000, DEB);
+        assert_eq!(p.len(), 1, "a burst stays one pending notice");
+        // Not yet due (last click at 2_000 → due 5_000): nothing flushes.
+        assert!(take_due_max_notices(&mut p, 4_999).is_empty());
+        // Past the window: exactly one notice, from the burst's first value to
+        // its last — 4→1, never the intermediate 4→3 / 3→2.
+        assert_eq!(take_due_max_notices(&mut p, 5_000), vec![("g".to_string(), 4, 1)]);
+        assert!(p.is_empty(), "delivered notices are drained");
+    }
+
+    #[test]
+    fn each_click_pushes_the_deadline_out() {
+        // A click landing before the prior one's window elapses must reset the
+        // deadline, or a long slow drag would fire mid-burst.
+        let mut p = HashMap::new();
+        record_max_notice(&mut p, "g", 4, 3, 1_000, DEB); // due 4_000
+        record_max_notice(&mut p, "g", 3, 2, 3_900, DEB); // due 6_900
+        // At 4_000 the first click's deadline has passed, but the second reset
+        // it — so nothing is due yet.
+        assert!(take_due_max_notices(&mut p, 4_000).is_empty());
+        assert_eq!(take_due_max_notices(&mut p, 6_900), vec![("g".to_string(), 4, 2)]);
+    }
+
+    #[test]
+    fn spaced_changes_deliver_separately() {
+        // Two changes far enough apart that the first flushes before the second
+        // arrives: two distinct notices, each its own span.
+        let mut p = HashMap::new();
+        record_max_notice(&mut p, "g", 4, 3, 1_000, DEB);
+        assert_eq!(take_due_max_notices(&mut p, 4_000), vec![("g".to_string(), 4, 3)]);
+        record_max_notice(&mut p, "g", 3, 2, 10_000, DEB);
+        assert_eq!(take_due_max_notices(&mut p, 13_000), vec![("g".to_string(), 3, 2)]);
+    }
+
+    #[test]
+    fn net_noop_burst_delivers_nothing() {
+        // 4→3→4 nets to no change: no orchestrator tokens spent on a no-op.
+        let mut p = HashMap::new();
+        record_max_notice(&mut p, "g", 4, 3, 1_000, DEB);
+        record_max_notice(&mut p, "g", 3, 4, 1_500, DEB);
+        assert!(take_due_max_notices(&mut p, 5_000).is_empty());
+        assert!(p.is_empty(), "the netted-out entry is still drained, not left pending");
+    }
+
+    #[test]
+    fn groups_debounce_independently() {
+        // Two groups clicking at once don't share a deadline or a span.
+        let mut p = HashMap::new();
+        record_max_notice(&mut p, "a", 4, 2, 1_000, DEB); // due 4_000
+        record_max_notice(&mut p, "b", 5, 6, 3_000, DEB); // due 6_000
+        // Only group a is due at 4_000.
+        assert_eq!(take_due_max_notices(&mut p, 4_000), vec![("a".to_string(), 4, 2)]);
+        assert!(p.contains_key("b"), "b keeps waiting out its own window");
+        assert_eq!(take_due_max_notices(&mut p, 6_000), vec![("b".to_string(), 5, 6)]);
     }
 }
