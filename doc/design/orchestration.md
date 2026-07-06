@@ -97,9 +97,11 @@ the two can't drift). `spawn_pty` resolves `argv[0]` on PATH+PATHEXT (the shared
 `winpath::resolve_program`, reused from "open in editor") and, when it is a **native**
 executable (`winpath::is_native_executable`: `.exe`/`.com`, not a `.cmd`/`.ps1` shim),
 `CommandBuilder`s it directly as the ConPTY child. It falls back to wrapping `command` in the
-shell — the exact pre-#78 behavior — when resolution fails, the target is a shim, or the escape
-hatch `LOOMUX_NO_DIRECT_SPAWN` is set (any value but empty/`0`/`false`). Every fallback is
-breadcrumbed (`pty-direct` / `pty-direct-fallback`).
+shell — the exact pre-#78 behavior — when resolution fails, the target is a shim, the escape
+hatch `LOOMUX_NO_DIRECT_SPAWN` is set (any value but empty/`0`/`false`), **or the resolved native
+exe fails to actually spawn** (corrupt/truncated PE, AV/ACL block, arch mismatch — caught in
+`spawn_pane_child` so a bad exe degrades to the wrapper instead of dying at the #106 bind
+timeout). Every fallback is breadcrumbed (`pty-direct` / `pty-direct-fallback`).
 
 Steady-state process count for a typical group (1 orchestrator + 3 workers + 1 reviewer):
 

@@ -306,9 +306,10 @@ fn try_direct_command(argv: &[String]) -> Option<CommandBuilder> {
 /// Apply the shared per-pane cwd + environment (cwd, TERM/COLORTERM, fresh
 /// PATH) to a `CommandBuilder` regardless of whether it is a direct spawn or a
 /// shell wrapper.
-fn apply_pane_env(mut cmd: CommandBuilder, cwd: Option<String>) -> CommandBuilder {
+fn apply_pane_env(mut cmd: CommandBuilder, cwd: Option<&str>) -> CommandBuilder {
     let dir = cwd
         .filter(|d| std::path::Path::new(d).is_dir())
+        .map(|d| d.to_string())
         .or_else(|| dirs::home_dir().map(|h| h.to_string_lossy().into_owned()));
     if let Some(dir) = dir {
         cmd.cwd(dir);
@@ -323,25 +324,11 @@ fn apply_pane_env(mut cmd: CommandBuilder, cwd: Option<String>) -> CommandBuilde
     cmd
 }
 
-/// Build the child command for a pane.
-///
-/// When `argv` names a resolvable native agent executable, it is spawned
-/// **directly** as the ConPTY child — no wrapper shell (issue #78). Otherwise
-/// (plain shell panes, custom commands, shim CLIs, or a failed resolution) the
-/// `command` string is run *through* the default shell so PATH shims resolve
-/// the same way they do in a normal terminal; a plain interactive shell also
-/// gets cwd-reporting (OSC 7) shell integration wired in. Direct-spawned agent
-/// panes don't need that hook — they never show a shell prompt, and their cwd
-/// chip is seeded statically from the spawn directory.
-fn build_command(
-    command: Option<String>,
-    argv: Option<Vec<String>>,
-    cwd: Option<String>,
-) -> CommandBuilder {
-    if let Some(direct) = argv.as_deref().and_then(try_direct_command) {
-        return apply_pane_env(direct, cwd);
-    }
-
+/// Build the shell-wrapper child command — the pre-#78 path and the universal
+/// fallback. The `command` string is run *through* the default shell so PATH
+/// shims resolve the same way they do in a normal terminal; a plain interactive
+/// shell (no command) also gets cwd-reporting (OSC 7) shell integration wired in.
+fn build_shell_command(command: Option<&str>, cwd: Option<&str>) -> CommandBuilder {
     let shell = default_shell();
     let mut cmd = CommandBuilder::new(&shell);
 
@@ -350,14 +337,14 @@ fn build_command(
             #[cfg(target_os = "windows")]
             {
                 if shell.contains("cmd.exe") {
-                    cmd.args(["/C", &line]);
+                    cmd.args(["/C", line]);
                 } else {
-                    cmd.args(["-NoLogo", "-Command", &line]);
+                    cmd.args(["-NoLogo", "-Command", line]);
                 }
             }
             #[cfg(not(target_os = "windows"))]
             {
-                cmd.args(["-lc", &line]);
+                cmd.args(["-lc", line]);
             }
         }
         _ => {
@@ -380,6 +367,59 @@ fn build_command(
     }
 
     apply_pane_env(cmd, cwd)
+}
+
+/// Build the child command for a pane — the direct-CLI executable when `argv`
+/// resolves to a native image (issue #78), otherwise the shell wrapper. This is
+/// the *decision* only (used by tests); the runtime spawn path lives in
+/// [`spawn_pane_child`], which additionally retries the shell if the resolved
+/// native exe fails to actually spawn.
+#[cfg(test)]
+fn build_command(
+    command: Option<String>,
+    argv: Option<Vec<String>>,
+    cwd: Option<String>,
+) -> CommandBuilder {
+    if let Some(direct) = argv.as_deref().and_then(try_direct_command) {
+        return apply_pane_env(direct, cwd.as_deref());
+    }
+    build_shell_command(command.as_deref(), cwd.as_deref())
+}
+
+/// Spawn the pane's child on `slave`, applying the direct-CLI-spawn path with a
+/// **complete** fall-through to the shell wrapper (issue #78). Returns the child
+/// plus whether the DIRECT path was actually used.
+///
+/// Every failure mode lands on the exact pre-#78 shell behavior: escape hatch,
+/// empty argv, unresolved program, or a `.cmd`/`.ps1` shim (all via
+/// `try_direct_command` returning `None`) — AND a program that resolves to a
+/// native `.exe`/`.com` but then *fails to spawn* (corrupt/truncated PE, an
+/// AV/ACL block, an architecture mismatch). That last case is caught here and
+/// retried through the shell, so a bad exe can never leave the agent to die at
+/// the #106 bind timeout; it degrades to the wrapper that would have run before.
+pub fn spawn_pane_child(
+    slave: &(dyn portable_pty::SlavePty + Send),
+    command: Option<&str>,
+    argv: Option<&[String]>,
+    cwd: Option<&str>,
+) -> Result<(Box<dyn portable_pty::Child + Send + Sync>, bool), String> {
+    if let Some(direct) = argv.and_then(try_direct_command) {
+        let direct = apply_pane_env(direct, cwd);
+        match slave.spawn_command(direct) {
+            Ok(child) => return Ok((child, true)),
+            Err(e) => {
+                // Resolved native exe, but the spawn itself failed. Breadcrumb
+                // and drop to the shell wrapper — the same fallback the
+                // resolution/shim cases take — rather than failing the pane.
+                crate::obs::breadcrumb("pty-direct-fallback", &format!("spawn-failed err={e}"));
+            }
+        }
+    }
+    let shell = build_shell_command(command, cwd);
+    slave
+        .spawn_command(shell)
+        .map(|c| (c, false))
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -405,8 +445,14 @@ pub fn spawn_pty(
         })
         .map_err(|e| e.to_string())?;
 
-    let cmd = build_command(command, argv, cwd);
-    let mut child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
+    // Direct-spawn the agent exe when argv resolves to a native image, with a
+    // full retry through the shell wrapper on any failure (issue #78).
+    let (mut child, _direct) = spawn_pane_child(
+        &*pair.slave,
+        command.as_deref(),
+        argv.as_deref(),
+        cwd.as_deref(),
+    )?;
     drop(pair.slave);
 
     // Windows: enroll the child in a kill-on-close Job Object so killing this
