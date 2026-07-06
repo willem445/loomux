@@ -573,6 +573,18 @@ pub fn idle_should_kill(idle_since_ms: Option<u64>, now_ms: u64, threshold_min: 
     }
 }
 
+/// Whether a queued `orch-spawn-request` has expired and must be dropped
+/// unserviced (#106). The backend stamps each request with the wall-clock
+/// deadline of its own `bind` wait (`now + BIND_TIMEOUT`); a frontend that was
+/// stalled past that point would otherwise open a zombie pane against
+/// already-torn-down backend state (the config is cleaned and the pending bind
+/// is gone). A `deadline_ms` of 0 means "unstamped" (legacy payloads) and never
+/// expires. Pure and `pub` so both the stamping backend and the frontend can be
+/// tested against one agreed rule, and so this rule lives in exactly one place.
+pub fn spawn_request_expired(deadline_ms: u64, now_ms: u64) -> bool {
+    deadline_ms != 0 && now_ms > deadline_ms
+}
+
 /// Whether the spawn-rate guardrail should reject the next spawn: true when
 /// at least `limit` spawns already fall inside the trailing `window_ms`.
 /// Pure so the sliding-window arithmetic is testable; `limit` 0 = unlimited.
@@ -1047,6 +1059,12 @@ pub struct SpawnRequest {
     pub name: String,
     pub cwd: String,
     pub command: String,
+    /// Wall-clock Unix-ms after which a still-queued request must be dropped
+    /// unserviced (#106) — set to the deadline of the backend's own `bind`
+    /// wait (`now + BIND_TIMEOUT`). A frontend that recovers from a stall past
+    /// this point drops the request instead of opening a zombie pane against
+    /// state the bind-timeout has already torn down. See `spawn_request_expired`.
+    pub deadline_ms: u64,
 }
 
 pub struct OrchRegistry {
@@ -3974,6 +3992,8 @@ impl OrchRegistry {
             name: display,
             cwd: cwd.clone(),
             command,
+            // Expire the request when our own bind wait would (#106).
+            deadline_ms: now_ms() + BIND_TIMEOUT.as_millis() as u64,
         };
 
         let app = self.app.lock_safe().clone();
@@ -4042,6 +4062,9 @@ impl OrchRegistry {
             Err(_) => {
                 self.pending_binds.lock_safe().remove(&agent_id);
                 self.mark_dead(&agent_id, None);
+                // Cancel the still-queued request frontend-side so a recovered
+                // frontend doesn't service it as a zombie pane (#106).
+                self.emit_spawn_cancelled(group_id, &agent_id);
                 Err("frontend did not open the agent pane in time".into())
             }
         }
@@ -4400,12 +4423,24 @@ impl OrchRegistry {
         let mut list: Vec<Value> = agents
             .values()
             .filter(|a| a.group == group)
-            .map(|a| json!({
-                "id": a.id, "name": a.name, "role": a.role,
-                "status": a.status, "task": a.task,
-                "session": a.session_id, "cwd": a.cwd,
-                "idle_since_ms": a.idle_since_ms,
-            }))
+            .map(|a| {
+                // Registry hygiene (#106): a dead agent keeps its identity
+                // (id/name/role/session/status/cwd) so the orchestrator can
+                // still resume its session, but sheds its task brief — dead
+                // records accumulate across a run and the full briefs pushed
+                // one group's roster to ~86KB. Live agents keep `task` so the
+                // orchestrator sees what each is working on.
+                let mut o = json!({
+                    "id": a.id, "name": a.name, "role": a.role,
+                    "status": a.status,
+                    "session": a.session_id, "cwd": a.cwd,
+                    "idle_since_ms": a.idle_since_ms,
+                });
+                if a.status != AgentStatus::Dead {
+                    o["task"] = json!(a.task);
+                }
+                o
+            })
             .collect();
         list.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
         json!(list)
@@ -4564,6 +4599,24 @@ impl OrchRegistry {
             .remove(agent_id)
             .ok_or_else(|| format!("no pending bind for agent {agent_id}"))?;
         tx.send(pty_id).map_err(|_| "spawner is gone (bind timed out)".to_string())
+    }
+
+    /// Tell a live-but-slow frontend to drop a queued `orch-spawn-request`
+    /// whose backend bind wait just timed out (#106): the minted config has
+    /// been cleaned and the pending bind removed, so a pane opened for this
+    /// agent now would boot a CLI against a dead config and its late
+    /// `bind_agent` would error. Emitting here lets a frontend that received
+    /// the request but hasn't opened the pane yet cancel it before that
+    /// happens; the deadline stamp (`spawn_request_expired`) and the frontend's
+    /// bind-rejection handling are the belt-and-braces for the other orderings.
+    /// Best-effort and a no-op in unit tests (no app handle).
+    fn emit_spawn_cancelled(&self, group_id: &str, agent_id: &str) {
+        if let Some(app) = self.app.lock_safe().clone() {
+            let _ = app.emit(
+                "orch-spawn-cancelled",
+                json!({ "group_id": group_id, "agent_id": agent_id }),
+            );
+        }
     }
 }
 
@@ -4888,6 +4941,8 @@ fn register_orchestrator_pane(
         name: "orchestrator".into(),
         cwd: group.repo.clone(),
         command,
+        // Expire the request when the background bind wait below would (#106).
+        deadline_ms: now_ms() + BIND_TIMEOUT.as_millis() as u64,
     };
 
     crate::obs::breadcrumb(
@@ -4914,6 +4969,8 @@ fn register_orchestrator_pane(
         let Ok(pty_id) = rx.recv_timeout(BIND_TIMEOUT) else {
             reg2.pending_binds.lock_safe().remove(&agent_id);
             reg2.mark_dead(&agent_id, None);
+            // Cancel the queued request frontend-side (#106) — see spawn_agent_ex.
+            reg2.emit_spawn_cancelled(&group2.id, &agent_id);
             return;
         };
         {

@@ -50,6 +50,22 @@ only gatekeeps final review + merge.
   agent + token + mcp-config → emits `orch-spawn-request` → frontend opens pane, reports
   `bind_agent(agent_id, pty_id)` → registry unblocks the tool call (mpsc, 20s timeout)
   → kickoff prompt typed into the new pane after a boot delay.
+- **Spawn expiry / cancellation (#106):** the round-trip has no in-band ack, so a
+  frontend stalled past the 20s bind wait used to service the request late — opening a
+  *zombie pane* whose CLI booted against a config the timeout had already deleted, plus
+  an unhandled `no pending bind` toast. Three layers now prevent it: (1) each
+  `orch-spawn-request` carries a `deadline_ms` (`now + BIND_TIMEOUT`); the frontend drops
+  any request already past it (`spawn_request_expired`, mirrored in `spawnexpiry.ts`) with
+  a console breadcrumb and no toast. (2) On bind timeout the backend emits
+  `orch-spawn-cancelled`, so a live-but-slow frontend drops the queued request (and closes
+  any pane already opened for it). (3) A late `bind_agent` still errors ("no pending
+  bind"); the frontend now handles that rejection by closing the just-opened pane (killing
+  the stray CLI) with a brief "stale spawn request discarded" toast — belt-and-braces for
+  the ordering where a pane opens before the cancel arrives.
+- **Registry hygiene (#106):** `list_agents` keeps a dead agent's identity
+  (id/name/role/session/status/cwd — needed to resume its session) but drops its task
+  body; dead records accumulate across a run and the full briefs had pushed one group's
+  roster payload to ~86KB.
 - **Isolation:** tools only see the caller's group. Panes without a token (normal shells,
   unrelated agents) have no access at all. `--strict-mcp-config` keeps workers off the
   user's other MCP servers.
