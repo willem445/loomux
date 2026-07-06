@@ -12,8 +12,8 @@ use loomux_lib::orchestration::{
     idle_should_kill, max_agents_notice,
     normalize_remote_web_base, parse_audit_lines, parse_session_cost, prompt_wait_detected,
     resolve_ref_url, rotate_audit_if_needed, sanitize_attachment_ext, should_flush_before_paste,
-    spawn_rate_exceeded, strip_ansi, submit_confirmed, submit_sequence, watchdog_should_notify,
-    worktree_cleanup_targets, AttentionItem, Caller,
+    spawn_rate_exceeded, spawn_request_expired, strip_ansi, submit_confirmed, submit_sequence,
+    watchdog_should_notify, worktree_cleanup_targets, AttentionItem, Caller,
     Guardrails, NameSource, OrchRegistry, Role, TaskPatch, UsageSnapshot, MAX_ATTACHMENT_BYTES,
     PLANNER_READONLY_NOTE,
 };
@@ -83,6 +83,82 @@ fn guardrail_caps_live_agents() {
     let id = reg.list_agents(&g.id)[0]["id"].as_str().unwrap().to_string();
     reg.mark_dead(&id, Some(0));
     reg.spawn_agent(&g.id, Role::Worker, "w3", "t", false, None).unwrap();
+}
+
+// ---------- #106: timed-out spawns must not resurrect as zombie panes -------
+
+#[test]
+fn spawn_request_expiry_decision() {
+    // The rule the backend stamps and the frontend enforces: a request is stale
+    // once wall-clock passes the deadline of the backend's own bind wait.
+    let now = 1_000_000u64;
+    // Future deadline (frontend recovered in time) → serviceable.
+    assert!(!spawn_request_expired(now + 20_000, now));
+    // Past deadline (stalled-then-recovered — the incident) → drop.
+    assert!(spawn_request_expired(now - 5_000, now));
+    // Boundary is a strict `>`: exactly at the deadline is still live.
+    assert!(!spawn_request_expired(now, now));
+    assert!(spawn_request_expired(now, now + 1));
+    // Deadline 0 = unstamped (legacy payload) → never expires.
+    assert!(!spawn_request_expired(0, u64::MAX));
+}
+
+#[test]
+fn late_bind_on_torn_down_spawn_is_rejected() {
+    // The frontend's zombie-pane guard leans on bind_agent ERRORING for a spawn
+    // whose bind wait already timed out (the backend removed the pending bind on
+    // timeout). Assert bind returns an error for an agent with no pending bind —
+    // this is exactly the rejection the recovered frontend now catches and turns
+    // into "close the stale pane" instead of an unhandled toast. (The 20s bind
+    // wait itself only runs with a live frontend, so it can't be driven here;
+    // in this headless registry no pending bind is ever registered.)
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let err = reg.bind(&w.id, 7).unwrap_err();
+    assert!(
+        err.contains("no pending bind"),
+        "a bind with no pending spawn must be rejected so the frontend can discard the pane, got: {err}"
+    );
+    // A bind for a never-known agent is likewise rejected, never a silent success.
+    assert!(reg.bind("w-999", 7).is_err());
+}
+
+#[test]
+fn list_agents_drops_task_bodies_for_dead_agents() {
+    // Registry hygiene (#106): dead roster entries kept their full (multi-KB)
+    // task briefs, pushing one group's list_agents payload to ~86KB. A dead
+    // agent must keep its identity (for resume) but shed its task body; a live
+    // agent keeps it so the orchestrator still sees what it's working on.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let big = "x".repeat(4096);
+    let dead = reg.spawn_agent(&g.id, Role::Worker, "dead", &big, false, None).unwrap();
+    let live = reg.spawn_agent(&g.id, Role::Worker, "live", &big, false, None).unwrap();
+    reg.mark_dead(&dead.id, Some(0));
+
+    let roster = reg.list_agents(&g.id);
+    let arr = roster.as_array().unwrap();
+    let dead_row = arr.iter().find(|a| a["id"] == json!(dead.id)).unwrap();
+    let live_row = arr.iter().find(|a| a["id"] == json!(live.id)).unwrap();
+
+    // Dead agent: task body gone, but identity preserved for resume.
+    assert!(dead_row.get("task").is_none(), "dead agent must not carry a task body");
+    assert_eq!(dead_row["status"], json!("dead"));
+    assert_eq!(dead_row["name"], json!("dead"));
+    assert_eq!(dead_row["role"], json!("worker"));
+    assert!(dead_row.get("session").is_some(), "session kept for resume");
+    assert!(dead_row.get("cwd").is_some());
+
+    // Live agent still reports its task.
+    assert_eq!(live_row["task"], json!(big));
+
+    // The heavy brief no longer appears twice (dead + live) in the payload.
+    assert_eq!(
+        roster.to_string().matches(&big).count(),
+        1,
+        "only the live agent's task body should remain in the roster"
+    );
 }
 
 #[test]

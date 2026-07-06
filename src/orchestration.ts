@@ -9,9 +9,11 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { Grid } from "./grid";
-import type { PaneEvents } from "./pane";
+import type { Pane, PaneEvents } from "./pane";
 import { panesInGroup } from "./group";
 import { badgeFor, type OrchRole } from "./orchbadge";
+import { isSpawnRequestExpired } from "./spawnexpiry";
+import { showToast } from "./toast";
 
 export type { OrchRole };
 export { badgeFor, metaForGroup } from "./orchbadge";
@@ -24,6 +26,11 @@ export interface OrchSpawnRequest {
   name: string;
   cwd: string;
   command: string;
+  /** Wall-clock Unix-ms after which a still-queued request must be dropped
+   *  unserviced (#106): the backend's own bind wait has elapsed, so opening a
+   *  pane now would spawn a zombie CLI against a torn-down config. See
+   *  `isSpawnRequestExpired`. 0/absent from a legacy backend = never expires. */
+  deadline_ms: number;
 }
 
 /** Launcher-collected group settings; guardrails are enforced backend-side. */
@@ -91,6 +98,25 @@ export const setNotify = (groupId: string, enabled: boolean): Promise<void> =>
 export const setMaxAgents = (groupId: string, maxAgents: number): Promise<number> =>
   invoke<number>("orch_set_max_agents", { groupId, maxAgents });
 
+/** Agent ids the backend cancelled via `orch-spawn-cancelled` (its bind wait
+ *  timed out) whose pane may still be mid-open (#106). Consulted in
+ *  `openAgentPane` right before binding so a live-but-slow frontend drops a
+ *  request the bind-timeout already tore down, instead of leaving a zombie. */
+const cancelledSpawns = new Set<string>();
+
+/** Close a pane we opened for a spawn that turned out to be stale, killing the
+ *  CLI it booted against a now-deleted config, and tell the human briefly.
+ *  Idempotent: when both the cancel event and the late-bind rejection fire for
+ *  the same spawn, the second call finds the pane already gone and does nothing
+ *  — no double close, no duplicate "discarded" toast (#106 rev-49). Killing the
+ *  pty reaps its CLI descendants via the pane's Job Object (#107), so the stray
+ *  agent process tree is fully torn down, not just the visible pane. */
+function discardStalePane(grid: Grid, pane: Pane): void {
+  if (!grid.allPanes().includes(pane)) return;
+  grid.closePane(pane, true);
+  showToast("stale spawn request discarded", "info");
+}
+
 async function openAgentPane(
   grid: Grid,
   paneEvents: PaneEvents,
@@ -109,10 +135,31 @@ async function openAgentPane(
     paneEvents,
     grid.paneCount >= 2 ? "column" : "row"
   );
-  // Report the pty so the backend can unblock the spawner and type the
-  // kickoff prompt. A failed spawn (ptyId null) times out backend-side.
-  if (pane.ptyId !== null) {
-    await invoke("bind_agent", { agentId: req.agent_id, ptyId: pane.ptyId });
+  try {
+    // A failed spawn (ptyId null) has no pty to bind; it times out backend-side.
+    if (pane.ptyId === null) return;
+    // A cancel that landed while the pane was opening (#106): the backend bind
+    // already timed out and cleaned up, so don't bind — discard the fresh pane.
+    if (cancelledSpawns.has(req.agent_id)) {
+      discardStalePane(grid, pane);
+      return;
+    }
+    // Report the pty so the backend can unblock the spawner and type the kickoff.
+    try {
+      await invoke("bind_agent", { agentId: req.agent_id, ptyId: pane.ptyId });
+    } catch {
+      // Late bind (#106): the backend's bind wait timed out and removed the
+      // pending bind, so this rejects ("no pending bind for agent …"). Handle it
+      // rather than leaking an unhandled-rejection toast — the pane is a zombie
+      // (its CLI booted against a deleted config), so close it with a brief
+      // notice. Belt-and-braces behind the deadline drop and the cancel event.
+      discardStalePane(grid, pane);
+    }
+  } finally {
+    // Whichever path we took, this request is now resolved — clear any cancel
+    // note so `cancelledSpawns` can't accumulate stale ids across a run, even
+    // on the race where the cancel arrives mid-bind (#106 rev-49).
+    cancelledSpawns.delete(req.agent_id);
   }
 }
 
@@ -120,8 +167,36 @@ async function openAgentPane(
  *  before any orchestrator can be launched. */
 export function initOrchestration(grid: Grid, paneEvents: PaneEvents): void {
   void listen<OrchSpawnRequest>("orch-spawn-request", ({ payload }) => {
+    // Drop a request whose backend bind wait already elapsed while this
+    // frontend was stalled (#106): servicing it now would open a zombie pane
+    // against a torn-down config. Breadcrumb-visible console line, no toast —
+    // the human never asked for this pane directly, so a toast would be noise.
+    if (isSpawnRequestExpired(payload.deadline_ms ?? 0, Date.now())) {
+      console.warn(
+        `[loomux] dropped expired spawn request agent=${payload.agent_id} ` +
+          `group=${payload.group_id} deadline_ms=${payload.deadline_ms}`
+      );
+      return;
+    }
     void openAgentPane(grid, paneEvents, payload);
   });
+  // The backend's bind wait for a spawn timed out (#106): it cleaned up the
+  // minted config and pending bind. Remember the agent so an in-flight
+  // openAgentPane drops it before binding, and close any pane already opened
+  // for it so a live frontend doesn't leave a zombie against the dead config.
+  void listen<{ group_id: string; agent_id: string }>(
+    "orch-spawn-cancelled",
+    ({ payload }) => {
+      // Note it for an openAgentPane still mid-open (pane not yet created), which
+      // reads the set right after its pane opens; the in-flight call's `finally`
+      // clears the note. Also close any pane already opened for this agent so a
+      // live frontend doesn't leave a zombie against the now-deleted config.
+      cancelledSpawns.add(payload.agent_id);
+      for (const pane of grid.allPanes()) {
+        if (pane.orchAgentId === payload.agent_id) discardStalePane(grid, pane);
+      }
+    }
+  );
   void listen<{ agent_id: string; pty_id: number | null }>("orch-focus", ({ payload }) => {
     if (payload.pty_id === null) return;
     const pane = grid.findByPtyId(payload.pty_id);

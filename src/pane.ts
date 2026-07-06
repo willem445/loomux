@@ -906,6 +906,12 @@ export class Pane {
     return this.orchGroup;
   }
 
+  /** The orchestration agent id this pane hosts, if any. Lets a cancelled
+   *  spawn (#106) find and close the pane it opened before the bind timed out. */
+  get orchAgentId(): string | null {
+    return this.orchAgent;
+  }
+
   /** This pane's orchestration role ("orchestrator" | "worker" | "reviewer"),
    *  or null for a non-orchestration pane. Lets group-wide actions (#46) tell
    *  the orchestrator's own pane apart from its workers/reviewers. */
