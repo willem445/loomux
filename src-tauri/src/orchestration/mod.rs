@@ -3155,7 +3155,10 @@ impl OrchRegistry {
     /// file never prompts) and the loomux MCP tools are pre-approved (so
     /// `report` etc. never prompt). `auto_ops` additionally pre-approves
     /// git/gh commands so the branch→commit→PR flow runs unattended;
-    /// everything else still asks the human.
+    /// everything else still asks the human. A `read_only` planner is
+    /// *always* treated as unattended (Auto perms + git/gh allowlist)
+    /// regardless of `auto_ops`: it never mutates and has no human in its
+    /// pane, so gating it would only deadlock it (see below).
     ///
     /// `read_only` hardens the planner contract at the CLI level (#47): where
     /// the CLI supports tool denial, the file-editing tools and the git
@@ -3181,6 +3184,15 @@ impl OrchRegistry {
         resume: bool,
         read_only: bool,
     ) -> String {
+        // A planner never mutates and has no human in its pane, so there is
+        // nothing for `auto_ops` to gate: it must explore, post its plan
+        // comment, and report with zero prompts, or it would stall waiting on
+        // an approval no one is there to give. So a planner (`read_only`)
+        // always runs unattended on BOTH CLIs; workers/reviewers follow the
+        // group's `auto_ops`. (This is also why claude's `plan` permission
+        // mode / copilot's `--plan` can't be used here — both hold the plan
+        // for interactive human sign-off.)
+        let unattended = auto_ops || read_only;
         match cli {
             "copilot" => {
                 // Copilot has `--resume <id>` but no way to pre-assign an
@@ -3204,9 +3216,13 @@ impl OrchRegistry {
                     group_dir.display(),
                     workdir.display()
                 );
-                if auto_ops {
+                if unattended {
                     // Copilot's own unattended mode: autopilot + all tools
-                    // + no path-verification prompts.
+                    // + no path-verification prompts. A planner (read_only)
+                    // always takes this path even in a non-auto_ops group —
+                    // interactive mode would stall it on a human that isn't
+                    // there; the deny rules below keep it read-only, and deny
+                    // takes precedence over --allow-all-tools in Copilot.
                     cmd.push_str(" --autopilot --allow-all-tools --allow-all-paths");
                 } else {
                     cmd.push_str(" --allow-tool \"shell(git:*)\" --allow-tool \"shell(gh:*)\"");
@@ -3234,18 +3250,23 @@ impl OrchRegistry {
                     (None, _) => String::new(),
                 };
                 // "Auto" preset = Claude Code's native auto permission mode
-                // (what the human uses interactively); "edits" = acceptEdits.
-                let perm = if auto_ops { "auto" } else { "acceptEdits" };
+                // (what the human uses interactively); otherwise acceptEdits.
+                // A planner (`read_only`) is always `unattended` (see above),
+                // so it runs under Auto perms even in a non-auto_ops group.
+                let perm = if unattended { "auto" } else { "acceptEdits" };
                 let mut cmd = format!(
                     "claude {session_flag}--mcp-config \"{}\" --strict-mcp-config --model {model} \
                      --permission-mode {perm} --add-dir \"{}\" --allowedTools mcp__loomux",
                     cfg.display(),
                     group_dir.display()
                 );
-                if auto_ops {
-                    // Both rule spellings: docs use `Bash(git:*)`, the CLI
-                    // help shows `Bash(git *)`; unmatched patterns are inert.
-                    cmd.push_str(" \"Bash(git:*)\" \"Bash(git *)\" \"Bash(gh:*)\" \"Bash(gh *)\"");
+                if unattended {
+                    // Pre-approve git + gh so the unattended flow runs without
+                    // prompts (workers: branch→commit→PR; planners: read-only
+                    // explore + `gh issue comment` for the plan). `Bash(git *)`
+                    // matches every git subcommand; a planner's denials below
+                    // carve commit/push back out.
+                    cmd.push_str(" \"Bash(git *)\" \"Bash(gh *)\"");
                 }
                 if read_only {
                     // Deny the file-editing tools and the git mutation
@@ -3253,11 +3274,20 @@ impl OrchRegistry {
                     // permission mode AND the allow list in Claude Code), so a
                     // planner can't write code or commit/push. `gh` (incl.
                     // `gh issue comment`) stays reachable for the plan comment.
-                    // Both git spellings, matching the allow list above.
+                    //
+                    // Spelling matters. `:*` is a valid wildcard only as a
+                    // TRAILING suffix (`Bash(gh:*)` is fine); a colon in the
+                    // MIDDLE of the command (`Bash(git commit:*)`) is not —
+                    // Claude Code discards that rule as malformed AND prints a
+                    // startup warning, the "auto deny rule" flash a human
+                    // caught on planner boot. So the enforcing denial rests on
+                    // the space form `Bash(git commit *)`: it is the canonical
+                    // spelling and actually blocks commit/push, with no
+                    // warning. (An earlier draft passed both spellings; the
+                    // colon-mid one added nothing but the warning.)
                     cmd.push_str(
                         " --disallowedTools Edit Write MultiEdit NotebookEdit \
-                         \"Bash(git commit:*)\" \"Bash(git commit *)\" \
-                         \"Bash(git push:*)\" \"Bash(git push *)\"",
+                         \"Bash(git commit *)\" \"Bash(git push *)\"",
                     );
                 }
                 cmd

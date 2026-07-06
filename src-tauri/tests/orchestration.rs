@@ -498,12 +498,12 @@ fn claude_command_minimizes_init_approvals_without_bypass() {
         "instructions dir must be a workspace so reading it never prompts");
     assert!(cmd.contains("--allowedTools mcp__loomux"),
         "loomux tools must be pre-approved so report/list never prompt");
-    assert!(!cmd.contains("Bash(git:*)"), "git is not pre-approved unless auto_ops");
+    assert!(!cmd.contains("Bash(git"), "git is not pre-approved for a non-auto_ops worker");
     let cmd = reg.build_agent_command("claude", "sonnet", true, cfg, gdir, Path::new("C:/repo"), None, false, false);
     assert!(cmd.contains("--permission-mode auto"),
         "the Auto preset must use Claude Code's native auto permission mode");
-    assert!(cmd.contains("\"Bash(git:*)\"") && cmd.contains("\"Bash(gh:*)\""));
-    assert!(cmd.contains("\"Bash(git *)\""), "both allowlist rule spellings must be present");
+    assert!(cmd.contains("\"Bash(git *)\"") && cmd.contains("\"Bash(gh *)\""),
+        "auto_ops pre-approves git + gh so the branch→commit→PR flow runs unattended");
     assert!(
         !cmd.contains("--dangerously-skip-permissions"),
         "bypass mode must never be used: its confirm dialog defaults to exit and kills the pane"
@@ -517,11 +517,44 @@ fn claude_command_minimizes_init_approvals_without_bypass() {
     for denied in ["Edit", "Write", "MultiEdit", "NotebookEdit"] {
         assert!(plan.contains(denied), "planner must deny the {denied} tool");
     }
-    assert!(plan.contains("\"Bash(git commit:*)\"") && plan.contains("\"Bash(git push:*)\""),
-        "planner must deny git commit/push");
-    assert!(plan.contains("\"Bash(gh:*)\""), "gh stays allowed so the planner can post its plan comment");
-    assert!(!plan.contains("\"Bash(git checkout:*)\""),
+    assert!(plan.contains("\"Bash(git commit *)\"") && plan.contains("\"Bash(git push *)\""),
+        "planner must deny git commit/push using the canonical (space-form) rule spelling");
+    assert!(plan.contains("\"Bash(gh *)\""), "gh stays allowed so the planner can post its plan comment");
+    assert!(!plan.contains("\"Bash(git checkout"),
         "read-only git usage (checkout/log/diff) must not be denied");
+    // The colon-mid wildcard is malformed: Claude Code ignores the rule AND
+    // prints a startup warning (the "auto deny rule" flash on planner boot).
+    // No rule may use it — that regression is what this pins down.
+    assert!(!plan.contains("commit:*") && !plan.contains("push:*"),
+        "no colon-mid wildcard rule (`Bash(git commit:*)`) — it is malformed and triggers the startup warning flash");
+}
+
+#[test]
+fn planner_runs_unattended_regardless_of_auto_ops() {
+    // A planner has no human in its pane, so it must reach gh + the loomux MCP
+    // and explore read-only WITHOUT prompting — even when the group is NOT in
+    // auto_ops. Otherwise it deadlocks on the first approval no one can give,
+    // which is exactly why claude's `plan` permission mode can't be used here.
+    let (reg, _d) = test_registry();
+    let cfg = Path::new("C:/x/cfg.json");
+    let gdir = Path::new("C:/data/group");
+    // auto_ops = FALSE, read_only = TRUE (a planner in a manual-ops group).
+    let plan = reg.build_agent_command("claude", "opus", false, cfg, gdir, Path::new("C:/repo"), None, false, true);
+    assert!(plan.contains("--permission-mode auto"),
+        "a planner runs unattended (Auto perms) even when the group is not auto_ops — else it deadlocks");
+    assert!(plan.contains("\"Bash(gh *)\""),
+        "a non-auto_ops planner must still have gh pre-approved so `gh issue comment` (its plan) never prompts");
+    assert!(plan.contains("\"Bash(git *)\""),
+        "a non-auto_ops planner must still have read-only git pre-approved for exploration");
+    assert!(plan.contains("--disallowedTools") && plan.contains("Write"),
+        "writes/commit/push stay denied structurally — Auto perms don't loosen the read-only contract");
+    // By contrast a non-auto_ops WORKER (read_only=false) is unchanged: it
+    // stays in acceptEdits with no pre-approved git/gh (the human gates ops).
+    let worker = reg.build_agent_command("claude", "sonnet", false, cfg, gdir, Path::new("C:/repo"), None, false, false);
+    assert!(worker.contains("--permission-mode acceptEdits"),
+        "a non-auto_ops worker is unaffected: it still gates ops through acceptEdits");
+    assert!(!worker.contains("\"Bash(gh *)\""),
+        "a non-auto_ops worker gets no pre-approved gh — only planners run unattended");
 }
 
 #[test]
@@ -570,6 +603,31 @@ fn copilot_command_uses_copilot_adapter_flags() {
     assert!(plan.contains("--deny-tool \"shell(git commit)\"") && plan.contains("--deny-tool \"shell(git push)\""),
         "planner must deny git commit/push");
     assert!(!plan.contains("--deny-tool \"shell(gh"), "gh stays allowed for the plan comment");
+}
+
+#[test]
+fn copilot_planner_runs_unattended_regardless_of_auto_ops() {
+    // Mirror of the claude fix on the copilot adapter: a planner has no human
+    // in its pane, so a NON-auto_ops copilot planner must still take copilot's
+    // unattended (autopilot) preset — the conservative interactive preset
+    // would stall it on approvals no one can give. Deny rules keep it
+    // read-only (deny wins over --allow-all-tools in Copilot).
+    let (reg, _d) = test_registry();
+    let cfg = Path::new("C:/x/cfg.json");
+    let gdir = Path::new("C:/data/group");
+    // auto_ops = FALSE, read_only = TRUE (a planner in a manual-ops group).
+    let plan = reg.build_agent_command("copilot", "auto", false, cfg, gdir, Path::new("C:/repo"), None, false, true);
+    assert!(plan.contains("--autopilot") && plan.contains("--allow-all-tools") && plan.contains("--allow-all-paths"),
+        "a non-auto_ops copilot planner must run unattended (autopilot), else it deadlocks: {plan}");
+    assert!(plan.contains("--deny-tool \"write\"") && plan.contains("--deny-tool \"shell(git commit)\""),
+        "writes/commit stay denied — the autopilot preset doesn't loosen the read-only contract");
+    assert!(!plan.contains("--deny-tool \"shell(gh"),
+        "gh stays allowed so the copilot planner can post its plan comment unattended");
+    // A non-auto_ops copilot WORKER (read_only=false) is unchanged: it keeps
+    // the conservative interactive preset, not autopilot.
+    let worker = reg.build_agent_command("copilot", "auto", false, cfg, gdir, Path::new("C:/repo"), None, false, false);
+    assert!(!worker.contains("--autopilot") && !worker.contains("--allow-all-tools"),
+        "a non-auto_ops copilot worker stays interactive — only planners run unattended");
 }
 
 #[test]

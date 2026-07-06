@@ -518,16 +518,70 @@ Two related additions: a **planner** role, and **per-role** agent CLI + model.
   - *Structural* (mechanical, verified by tests): a planner never gets a **worktree** —
     the spawn cwd logic runs it in `group.repo` even when `worktree: true` is passed; and
     its CLI is launched **read-only** (`build_agent_command(read_only=true)`): on Claude
-    `--disallowedTools Edit Write MultiEdit NotebookEdit` plus `Bash(git commit:*)` /
-    `Bash(git push:*)`, on Copilot `--deny-tool write|edit` plus `shell(git commit|push)`
+    `--disallowedTools Edit Write MultiEdit NotebookEdit` plus `Bash(git commit *)` /
+    `Bash(git push *)`, on Copilot `--deny-tool write|edit` plus `shell(git commit|push)`
     — deny rules override the allow list / Auto perms on both CLIs. So a planner **cannot
     edit files, commit, or push**, i.e. cannot produce code changes or push a branch.
+    (Rule-spelling note: on Claude the `:*` wildcard is valid *only* as a trailing suffix.
+    An earlier draft also passed the colon-mid forms `Bash(git commit:*)` / `Bash(git push:*)`
+    as redundant spellings; those are **malformed** — Claude Code ignores them *and* prints a
+    startup warning, which was the "auto deny rule" flash seen on planner boot. The canonical
+    space form is the only spelling now emitted; see the plan-mode decision below.)
   - *Instruction-backed* (the template + kickoff `PLANNER_READONLY_NOTE`, not a sandbox):
     `gh` stays allowed (a planner needs `gh issue comment` for its deliverable), so a
     planner *could* technically run `gh pr create` or create an inert local branch — it is
     told not to, and with commit/push denied such a branch carries nothing. This is a
     deliberate trade (plan-comment-as-deliverable over a full jail), now stated honestly
     rather than presented as an absolute guarantee.
+
+  **Why not the CLI's `plan` permission mode? (the "auto deny rule" flash, #79)** A human
+  reviewing the planner's first boot caught a message about an "auto deny rule" and asked
+  the obvious question: should the planner spawn in claude's `--permission-mode plan`
+  instead of Auto + deny rules, and would plan mode still let it talk to the orchestrator
+  over MCP and post its plan via `gh`? Both were investigated against the CLI docs (no live
+  agent was spawned — reasoning is from `claude --help` and
+  [permission-modes](https://code.claude.com/docs/en/permission-modes.md) /
+  [permissions](https://code.claude.com/docs/en/permissions.md)):
+  - **Plan mode would deadlock this planner.** Plan mode is read-only *and* built around an
+    **interactive** hand-off: Claude researches, presents a plan, and then *asks the human*
+    how to proceed (approve→auto, approve→acceptEdits, keep planning, …). There is **no
+    documented non-interactive / auto-approve** path. Our planner pane has **no human** —
+    so it would sit forever at the approval prompt. Worse, the two things the planner exists
+    to *emit* — the loomux **MCP `report`** and the **`gh issue comment`** plan — are exactly
+    the calls plan mode stops to prompt on before running them: in plan mode "permission
+    prompts still apply as they do in Manual mode", and a mutating shell like `gh issue
+    comment` is not a read, so each raises a **real-time approval prompt** — which, in a
+    human-less pane, is simply never answered. So plan mode does not just add a prompt; it
+    blocks the deliverable. **Copilot's `--plan` / `--mode plan` is the same shape** (an
+    initial mode a human reviews before switching to interactive/autopilot), so switching
+    CLIs doesn't buy a headless plan mode either.
+  - **So the planner keeps Auto + structural deny rules** — which is the *autonomous*
+    equivalent of plan mode's intent: read-only research, but free to emit its plan and
+    report and then exit without waiting on anyone. To make that hold with **no human in the
+    pane**, a `read_only` planner is now launched **unattended regardless of the group's
+    `auto_ops`** (`unattended = auto_ops || read_only` in `build_agent_command`, applied to
+    **both** CLIs): on Claude, Auto perms + a pre-approved `Bash(git *)` / `Bash(gh *)`
+    allowlist; on Copilot, `--autopilot --allow-all-tools --allow-all-paths` — so
+    exploration, `gh issue view`, and the `gh issue comment` plan never prompt, with edits +
+    `git commit`/`git push` denied on both (deny takes precedence over Auto / `--allow-all-tools`).
+    Previously a planner in a **non-auto_ops** group got the interactive preset (`acceptEdits`
+    with no git/gh allowlist on Claude; plain interactive mode with no autopilot on Copilot),
+    so its very first `gh`/explore call would have prompted into the void — a latent deadlock
+    this fixes **on both CLIs**. Workers/reviewers are untouched: without `auto_ops` they
+    still gate ops through the interactive preset.
+  - **The flash itself was ours, not alarming.** It was Claude Code's own startup warning
+    for a **malformed** deny rule: we passed both `Bash(git commit:*)` and `Bash(git commit *)`,
+    on the mistaken belief that an unmatched spelling is silently inert. It isn't — `:*` is a
+    valid wildcard only as a *trailing* suffix (`Bash(gh:*)` is fine); a colon in the *middle*
+    of the command is not, so `Bash(git commit:*)` is discarded as malformed and warns at
+    startup. The enforcing denial rests on the **space form** `Bash(git commit *)`, which is
+    the canonical spelling and actually blocks commit/push; dropping the redundant colon-mid
+    spelling removes the warning at its source (it never contributed to enforcement) rather
+    than papering over it. **Direct answers to the human's two questions:**
+    (a) No — the planner should *not* use plan mode; it would deadlock a human-less pane and
+    block the plan/report. (b) In plan mode it could *not* reliably use the loomux MCP or post
+    via `gh` unattended — each raises a real-time approval prompt no one is there to answer —
+    which is the second reason we keep Auto + deny.
 
 - **Per-role CLI + model.** `Guardrails` gains a per-role CLI (`orchestrator_cli`,
   `worker_cli`, `reviewer_cli`, `planner_cli`) and `planner_model`, alongside the existing
