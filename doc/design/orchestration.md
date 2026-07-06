@@ -73,6 +73,56 @@ only gatekeeps final review + merge.
   `[loomux] <name> reports …` into the orchestrator pane (queued if mid-turn) + audits it.
   PTY exit marks the agent dead and notifies the orchestrator the same way.
 
+### Pane process model: direct-CLI spawn (#78)
+
+Each pane is a ConPTY (`OpenConsole.exe` host) plus its child process tree. The agent
+CLI (`claude`/`copilot`) **is** the child — spawned directly, no wrapper shell:
+
+```
+loomux.exe
+├─ OpenConsole.exe … (ConPTY host, 1 per pane — inherent)
+└─ claude.exe --session-id … --mcp-config … (the agent — inherent)
+```
+
+Earlier every agent pane wrapped the CLI in a shell — `OpenConsole → pwsh -Command "claude …"
+→ claude.exe` — because `claude`/`copilot` used to ship as `.cmd`/`.ps1` PATH shims that only
+a shell could resolve. They are native `.exe` now, so the wrapper was pure overhead: one extra
+process + ~40–70 MB per pane, ~⅓ of a group's process count, and an extra layer where kills,
+typed input, and env could go sideways.
+
+`spawn_agent` now emits **both** a shell `command` string (the historical form) and a
+structured `argv` (program + literal args, built by `build_agent_argv` from the same flag
+atoms as `build_agent_command`; a test tokenizes the string and asserts it equals the argv, so
+the two can't drift). `spawn_pty` resolves `argv[0]` on PATH+PATHEXT (the shared
+`winpath::resolve_program`, reused from "open in editor") and, when it is a **native**
+executable (`winpath::is_native_executable`: `.exe`/`.com`, not a `.cmd`/`.ps1` shim),
+`CommandBuilder`s it directly as the ConPTY child. It falls back to wrapping `command` in the
+shell — the exact pre-#78 behavior — when resolution fails, the target is a shim, the escape
+hatch `LOOMUX_NO_DIRECT_SPAWN` is set (any value but empty/`0`/`false`), **or the resolved native
+exe fails to actually spawn** (corrupt/truncated PE, AV/ACL block, arch mismatch — caught in
+`spawn_pane_child` so a bad exe degrades to the wrapper instead of dying at the #106 bind
+timeout). Every fallback is breadcrumbed (`pty-direct` / `pty-direct-fallback`).
+
+Steady-state process count for a typical group (1 orchestrator + 3 workers + 1 reviewer):
+
+| | wrapper (pre-#78) | direct-CLI spawn |
+| --- | --- | --- |
+| ConPTY hosts (`OpenConsole.exe`) | 5 | 5 |
+| wrapper shells (`pwsh.exe`) | 5 | **0** |
+| agent CLIs (`claude`/`copilot`) | 5 | 5 |
+| **total** | **15** | **10** (−33%) |
+
+Scope: only the orchestration agent panes (known native CLIs) direct-spawn. Plain shell panes
+and the launcher's custom-command panes keep the shell — that's their purpose — as do shim CLIs
+(`gemini`/`opencode` installs that ship a `.cmd`), which the native-vs-shim check routes back to
+the wrapper automatically. OSC 7 cwd reporting is unaffected: agent panes never used the
+interactive shell's `cd`-reporting hook (they show no prompt); their branch/cwd chip is seeded
+statically from the spawn directory. Pane teardown is unchanged and *improved* — the kill-on-close
+Job Object (see [job-object-teardown.md](job-object-teardown.md)) now enrolls the agent itself
+rather than a wrapper, and an agent exit surfaces the CLI's own exit code directly (no pwsh in
+between), handled by the existing dead-pane path (expected kill → pane closes; unexpected exit →
+pane stays open showing the status).
+
 ## Tool surface (MCP)
 
 | tool | orchestrator | worker/reviewer/planner |

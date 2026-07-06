@@ -31,6 +31,10 @@ export interface OrchSpawnRequest {
    *  pane now would spawn a zombie CLI against a torn-down config. See
    *  `isSpawnRequestExpired`. 0/absent from a legacy backend = never expires. */
   deadline_ms: number;
+  /** Structured invocation for direct-CLI spawn (issue #78); the backend spawns
+   *  the agent executable directly when it resolves, else falls back to
+   *  `command`. Absent on payloads from an older backend. */
+  argv?: string[];
 }
 
 /** Launcher-collected group settings; guardrails are enforced backend-side. */
@@ -127,6 +131,7 @@ async function openAgentPane(
       name: req.name,
       cwd: req.cwd,
       command: req.command,
+      argv: req.argv,
       badge: badgeFor(req),
       orchGroup: req.group_id,
       orchRole: req.role,

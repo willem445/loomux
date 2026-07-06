@@ -123,6 +123,9 @@ export interface PaneOptions {
   name?: string;
   cwd?: string;
   command?: string;
+  /** Structured agent invocation for direct-CLI spawn (issue #78); the backend
+   *  falls back to `command` (shell wrapper) when it can't apply. */
+  argv?: string[];
   badge?: PaneBadge;
   /** Orchestration group this pane belongs to (enables the task board). */
   orchGroup?: string;
@@ -555,7 +558,13 @@ export class Pane {
       await ensureOutputRouter();
       const cols = Number.isFinite(this.term.cols) && this.term.cols > 1 ? this.term.cols : 80;
       const rows = Number.isFinite(this.term.rows) && this.term.rows > 1 ? this.term.rows : 24;
-      const ptyId = await spawnPty({ cols, rows, cwd: opts.cwd, command: opts.command });
+      const ptyId = await spawnPty({
+        cols,
+        rows,
+        cwd: opts.cwd,
+        command: opts.command,
+        argv: opts.argv,
+      });
       if (this.disposed) {
         killPty(ptyId).catch(() => {});
         return;
