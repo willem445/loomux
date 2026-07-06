@@ -539,16 +539,28 @@ fn should_flush_only_on_the_stranded_text_signature() {
 
 #[test]
 fn submit_confirmed_needs_a_real_output_burst() {
+    // Pane reached quiet before Enter (reached_quiet = true):
     // No / trivial growth after Enter -> not confirmed (an ignored key, or idle
     // cursor-blink noise, must not read as a landed submit).
-    assert!(!submit_confirmed(1000, 1000));
-    assert!(!submit_confirmed(1000, 1010));
+    assert!(!submit_confirmed(true, 1000, 1000));
+    assert!(!submit_confirmed(true, 1000, 1010));
     // A burst clearing the threshold -> confirmed.
-    assert!(submit_confirmed(1000, 1024));
-    assert!(submit_confirmed(1000, 100_000));
+    assert!(submit_confirmed(true, 1000, 1024));
+    assert!(submit_confirmed(true, 1000, 100_000));
     // Totals never go backwards, but a wrapped/garbage reading must not panic
     // or false-confirm.
-    assert!(!submit_confirmed(1000, 500));
+    assert!(!submit_confirmed(true, 1000, 500));
+}
+
+#[test]
+fn submit_never_confirmed_when_quiet_was_not_reached() {
+    // rev-32: on a busy pane the submit-wait hits SUBMIT_MAX_WAIT without ever
+    // reaching quiet, so the Enter lands mid-stream. Even a large burst is that
+    // ongoing stream, not the submit — it must NOT confirm, else the prompt is
+    // stranded but recorded confirmed and the next delivery skips the flush.
+    assert!(!submit_confirmed(false, 1000, 100_000));
+    assert!(!submit_confirmed(false, 1000, 1024));
+    assert!(!submit_confirmed(false, 1000, 1000));
 }
 
 #[test]

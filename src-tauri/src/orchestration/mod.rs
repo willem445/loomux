@@ -1371,10 +1371,18 @@ struct DeliveryOutcome {
 
 /// Whether output growth after the submit Enter counts as the submit landing.
 /// A successful submit clears the box and the CLI repaints / starts a turn (a
-/// burst of output); an ignored Enter produces effectively none. Pure so the
-/// threshold is testable; the polling loop lives in `deliver_prompt`.
-pub fn submit_confirmed(baseline_total: u64, observed_total: u64) -> bool {
-    observed_total.saturating_sub(baseline_total) >= SUBMIT_CONFIRM_MIN_BYTES
+/// burst of output); an ignored Enter produces effectively none.
+///
+/// Only trustworthy when the pane reached quiet *before* the Enter. If the
+/// submit-wait hit `SUBMIT_MAX_WAIT` while output was still streaming
+/// (`reached_quiet == false`), the Enter landed mid-stream and the window's
+/// growth is that stream, not the submit's — which would false-confirm and
+/// strand a prompt recorded as confirmed (rev-32). So a cap-hit-without-quiet
+/// is never confirmed; a false "unconfirmed" is just a harmless flush next
+/// time. Pure so the rule is testable; the polling loop lives in
+/// `deliver_prompt`.
+pub fn submit_confirmed(reached_quiet: bool, baseline_total: u64, observed_total: u64) -> bool {
+    reached_quiet && observed_total.saturating_sub(baseline_total) >= SUBMIT_CONFIRM_MIN_BYTES
 }
 
 /// Whether to flush a previous delivery's stranded text (a single submit press)
@@ -4018,6 +4026,10 @@ impl OrchRegistry {
             let submit_start = std::time::Instant::now();
             let mut last_total = ptys.output_total(pty_id).unwrap_or(0);
             let mut last_change = std::time::Instant::now();
+            // Whether the pane went quiet before we press Enter. If it never
+            // does (busy CLI, hit SUBMIT_MAX_WAIT), the Enter lands mid-stream
+            // and submit confirmation can't be trusted off that stream (rev-32).
+            let mut reached_quiet = false;
             while submit_start.elapsed() < SUBMIT_MAX_WAIT {
                 std::thread::sleep(Duration::from_millis(200));
                 match ptys.output_total(pty_id) {
@@ -4027,6 +4039,7 @@ impl OrchRegistry {
                     }
                     Some(_) => {
                         if last_change.elapsed() >= SUBMIT_QUIET {
+                            reached_quiet = true;
                             break;
                         }
                     }
@@ -4055,15 +4068,18 @@ impl OrchRegistry {
             // Confirm the submit landed: watch for the output burst of the box
             // clearing / the turn starting (#81/#84). Measured off the first
             // Enter, before the spaced retries, so the signal is that Enter's
-            // effect and not a retry's. A miss here is recorded honestly and is
-            // safe — the next delivery's flush would just no-op on an empty box.
+            // effect and not a retry's. Only trusted when the pane reached quiet
+            // first — on a busy pane that never did, the Enter landed mid-stream
+            // and that stream would false-confirm (rev-32), so we skip the
+            // window and leave it unconfirmed. A miss here is safe: the next
+            // delivery's flush just no-ops on an empty box.
             let confirm_deadline = std::time::Instant::now() + SUBMIT_CONFIRM_WINDOW;
             let mut confirmed = false;
-            while std::time::Instant::now() < confirm_deadline {
+            while reached_quiet && std::time::Instant::now() < confirm_deadline {
                 std::thread::sleep(Duration::from_millis(100));
                 match ptys.output_total(pty_id) {
                     Some(t) => {
-                        if submit_confirmed(submit_baseline, t) {
+                        if submit_confirmed(reached_quiet, submit_baseline, t) {
                             confirmed = true;
                             break;
                         }
