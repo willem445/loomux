@@ -504,14 +504,15 @@ in the prompt text. So the strip turns a pasted/attached image into a file-on-di
 reference, and the existing steer path carries it the rest of the way unchanged.
 
 *Copilot's equivalent (verified).* Claude Code reads an absolute image path mentioned in the
-prompt via its file tools. GitHub Copilot CLI documents the same capability with a native
-`@<path>` mention (["Using GitHub Copilot CLI"](https://docs.github.com/en/copilot/how-tos/copilot-cli/use-copilot-cli/overview);
-direct clipboard paste is still only a feature request — github/copilot-cli#363, #1276), and
-its agent likewise opens a clearly-labelled absolute path with its read tools. We therefore emit
-a plain, unambiguous `Attached image: <absolute path>` line that both agents act on, rather than
-branching the wire format per CLI; the path is what does the work in either case, and the
-save-to-file + reference approach is CLI-agnostic and degrades gracefully (worst case the human
-sees the path text).
+prompt via its file tools. GitHub Copilot CLI documents a native `@<path>` mention for
+referencing a file in a prompt (["Using GitHub Copilot CLI"](https://docs.github.com/en/copilot/how-tos/copilot-cli/use-copilot-cli/overview);
+direct clipboard paste is still only a feature request — github/copilot-cli#363, #1276). Because
+the documented forms differ, the reference line is **CLI-aware**: `save_attachment`'s command
+returns the group's resolved orchestrator CLI (`OrchRegistry::orchestrator_cli` → `cli_for`), and
+`attachmentLine(path, cli)` emits `Attached image: <path>` for `claude` and `Attached image:
+@<path>` for `copilot` (unknown CLIs fall back to the plain form). The `Attached image:` label is
+harmless prose to either agent; the path — bare or `@`-prefixed — is what does the work, and the
+save-to-file + reference approach degrades gracefully (worst case the human sees the path text).
 
 - *Save, don't decode.* `Ctrl+V` of a screenshot (or the paperclip → native file picker) hands
   the frontend a browser `Blob`. `pane.ts` base64-encodes the raw bytes and calls the
@@ -522,23 +523,31 @@ sees the path text).
   name is wall-clock ms plus a process-local `AtomicU32` so a same-millisecond multi-paste
   burst can't collide. base64 over IPC mirrors the OSC 52 clipboard bridge and survives any
   webview that won't pass raw bytes through `invoke`.
-- *Reference the agent will read.* On submit, `composeSteerText(draft, paths)` appends one
-  `Attached image: <absolute path>` line per queued image after the human's typed text, and the
-  whole thing goes through `orch_steer` exactly like any other steer. A message may be
-  images-only (no typed text). The path form is what prompts the agent to open the file.
+- *Reference the agent will read.* On submit, `composeSteerText(draft, paths, cli)` appends one
+  per-CLI reference line (see above) per queued image after the human's typed text, and the whole
+  thing goes through `orch_steer` exactly like any other steer. A message may be images-only (no
+  typed text). The path form is what prompts the agent to open the file.
 - *Chips with remove, before send.* Each queued image shows a thumbnail chip (a `blob:` object
   URL) with an `✕` in the strip; removing one revokes its object URL. Object URLs are also
   revoked on successful send and on pane dispose, so the webview never leaks them. The chip row
   collapses to zero height when empty (`:empty { display: none }`), so the strip keeps its
   baseline height — attaching an image is a deliberate, human-initiated growth, not the toggled
   overlay resize the strip is otherwise careful to avoid.
-- *Limits + feedback.* A single image is capped at `MAX_ATTACHMENT_BYTES` (10 MiB) and a
-  message at `MAX_ATTACHMENTS` (8); the extension is restricted to a vetted image allowlist
-  (`sanitize_attachment_ext`: png/jpg/jpeg→jpg/gif/webp/bmp) so an attacker-influenced clipboard
-  can't steer the saved filename (path traversal, executable extensions). Both limits and the
-  type check are enforced **frontend** (immediate toast via `checkAttachment`) *and* **backend**
-  (the real backstop, rejecting oversize *before* the base64 decode balloons memory — same
-  discipline as the clipboard cap). The save is audited (`attachment-save`, actor `human`).
+- *Limits + feedback.* Three limits, enforced where each actually has meaning:
+    - **Per-image size** (`MAX_ATTACHMENT_BYTES`, 10 MiB) and **type** (a vetted image allowlist,
+      `sanitize_attachment_ext`: png/jpg/jpeg→jpg/gif/webp/bmp) are enforced on **both** sides —
+      the frontend `checkAttachment` gives an immediate toast, and the backend is the real
+      backstop (rejecting oversize *before* the base64 decode balloons memory, same discipline as
+      the clipboard cap, and blocking an attacker-influenced extension from steering the saved
+      filename — path traversal, executable extensions).
+    - **Per-message count** (`MAX_ATTACHMENTS`, 8) is a **frontend-only** compose-state cap: it
+      bounds how many chips can be *queued* for one message, and the backend — which saves one
+      image per call and has no notion of a "message" boundary (files accumulate across a draft
+      and persist past send until the group-end sweep) — has no server-side batch to enforce it
+      against. So it lives where the batch exists.
+    - A **membership guard** on the backend refuses a save for any group id that isn't a known,
+      created group (the dir is `root.join(group)`), pinning `group_id` to a real group token.
+  The save is audited (`attachment-save`, actor `human`).
 - *Cleanup policy.* Attachments are a per-group **scratch** dir with a deliberately cheap
   policy: nothing is deleted per-image (a removed chip or an abandoned draft just leaves its
   file), and the whole `attachments/` subdir is swept in `end_group` alongside the worktree
@@ -548,11 +557,13 @@ sees the path text).
 
 **Tests.** `save_attachment_*` integration tests cover verbatim write + path placement + audit,
 the type/empty/oversize rejections (including exactly-at-cap), same-millisecond name uniqueness,
-and that `end_group` sweeps the scratch dir while leaving durable state. `sanitize_attachment_ext`
-has its own allowlist test. Frontend `steer.test.ts` covers the pure strip logic —
-`checkAttachment` (type/size/count precedence), `composeSteerText` (path lines, images-only,
-empty no-op, trimming), reject messages, and `bytesToBase64` round-trips across the chunk
-boundary. The live paste-and-open against a real CLI is validated by hand.
+the unknown-group / traversal rejection, and that `end_group` sweeps the scratch dir while leaving
+durable state. `sanitize_attachment_ext` has its own allowlist test, and `orchestrator_cli`
+resolution is tested for claude/copilot/unknown groups. Frontend `steer.test.ts` covers the pure
+strip logic — `checkAttachment` (type/size/count precedence), `attachmentLine` + `composeSteerText`
+(per-CLI path vs `@`-mention, images-only, empty no-op, trimming), reject messages, and
+`bytesToBase64` round-trips across the chunk boundary. The live paste-and-open against a real CLI
+is validated by hand.
 
 ## Plan agent + mixed agent types (#47, #4)
 

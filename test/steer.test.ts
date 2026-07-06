@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import {
   checkAttachment,
   composeSteerText,
+  attachmentLine,
   extForMime,
   attachRejectMessage,
   bytesToBase64,
@@ -59,31 +60,45 @@ test("type wins over size/count when several rules would fail", () => {
   );
 });
 
-test("composeSteerText appends one path line per image", () => {
+test("attachmentLine uses a plain path for Claude and an @mention for Copilot", () => {
+  assert.equal(attachmentLine("/a/1.png", "claude"), "Attached image: /a/1.png");
+  assert.equal(attachmentLine("/a/1.png", "copilot"), "Attached image: @/a/1.png");
+  // An unknown/empty CLI falls back to the plain-path form.
+  assert.equal(attachmentLine("/a/1.png", ""), "Attached image: /a/1.png");
+});
+
+test("composeSteerText appends one path line per image (Claude form)", () => {
   assert.equal(
-    composeSteerText("look at this", ["C:/g/attachments/1-0.png"]),
+    composeSteerText("look at this", ["C:/g/attachments/1-0.png"], "claude"),
     "look at this\nAttached image: C:/g/attachments/1-0.png",
   );
   assert.equal(
-    composeSteerText("two", ["/a/1.png", "/a/2.jpg"]),
+    composeSteerText("two", ["/a/1.png", "/a/2.jpg"], "claude"),
     "two\nAttached image: /a/1.png\nAttached image: /a/2.jpg",
+  );
+});
+
+test("composeSteerText emits @mentions for a Copilot orchestrator", () => {
+  assert.equal(
+    composeSteerText("check this", ["/a/1.png", "/a/2.jpg"], "copilot"),
+    "check this\nAttached image: @/a/1.png\nAttached image: @/a/2.jpg",
   );
 });
 
 test("composeSteerText allows an images-only message (no typed text)", () => {
   assert.equal(
-    composeSteerText("   ", ["/a/1.png"]),
+    composeSteerText("   ", ["/a/1.png"], "claude"),
     "Attached image: /a/1.png",
   );
 });
 
 test("composeSteerText is empty when there's nothing to send", () => {
-  assert.equal(composeSteerText("", []), "");
-  assert.equal(composeSteerText("   \n  ", []), "");
+  assert.equal(composeSteerText("", [], "claude"), "");
+  assert.equal(composeSteerText("   \n  ", [], "copilot"), "");
 });
 
 test("composeSteerText trims the draft but preserves interior text", () => {
-  assert.equal(composeSteerText("  hi there  ", []), "hi there");
+  assert.equal(composeSteerText("  hi there  ", [], "claude"), "hi there");
 });
 
 test("attachRejectMessage phrases each refusal", () => {

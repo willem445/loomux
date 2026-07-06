@@ -289,10 +289,11 @@ strip is the collision-proof path.
 *Attach a screenshot:* paste an image with **Ctrl+V** (or click the paperclip
 to pick files) and it joins the message as a thumbnail chip — remove one with
 its **✕**, or queue several. On send, loomux saves each image to the group's
-scratch dir and adds an `Attached image: <path>` line to the message; the
-orchestrator's CLI (Claude Code / Copilot) opens the file by path. PNG, JPEG,
-GIF, WebP, and BMP are accepted, up to 10 MB each and 8 per message; the saved
-files are cleaned up when the group ends.
+scratch dir and adds an `Attached image:` reference line to the message —
+formatted the way the orchestrator's CLI reads it (a plain path for Claude
+Code, an `@<path>` mention for Copilot) — so the agent opens the screenshot.
+PNG, JPEG, GIF, WebP, and BMP are accepted, up to 10 MB each and 8 per message;
+the saved files are cleaned up when the group ends.
 
 **Attention routing:** the human is the scheduler's bottleneck, so loomux
 surfaces *which* pane needs you instead of making you scan them. A pane earns a

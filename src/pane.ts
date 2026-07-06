@@ -226,6 +226,10 @@ export class Pane {
    *  scratch file (from `orch_save_attachment`); `url` is a blob: object URL for
    *  the chip thumbnail and must be revoked when the chip goes away. */
   private attachments: { path: string; url: string; name: string }[] = [];
+  /** The orchestrator's CLI, learned from the save-attachment response; decides
+   *  how image paths are referenced in the steer text (#72). Defaults to the
+   *  Claude form until a save reports otherwise. */
+  private orchCli = "claude";
   /** "needs attention" chip in the header (attention routing #6); hidden until
    *  the backend flags this pane. */
   private attnChip: HTMLButtonElement;
@@ -1163,14 +1167,15 @@ export class Pane {
     }
     try {
       const bytes = new Uint8Array(await blob.arrayBuffer());
-      const path = await invoke<string>("orch_save_attachment", {
+      const saved = await invoke<{ path: string; cli: string }>("orch_save_attachment", {
         groupId: this.orchGroup,
         ext: check.ext,
         dataB64: bytesToBase64(bytes),
       });
+      this.orchCli = saved.cli; // format references the way this orchestrator's CLI reads them
       // Only mint the thumbnail URL once the file is safely on disk.
       const url = URL.createObjectURL(blob);
-      this.attachments.push({ path, url, name: name || `image.${check.ext}` });
+      this.attachments.push({ path: saved.path, url, name: name || `image.${check.ext}` });
       this.renderChips();
     } catch (err) {
       showToast(`Attach failed: ${String(err)}`);
@@ -1257,7 +1262,7 @@ export class Pane {
     // message may be images-only (no typed text), so gate on either being
     // present rather than on the text alone.
     const queued = this.attachments;
-    const text = composeSteerText(draft, queued.map((a) => a.path));
+    const text = composeSteerText(draft, queued.map((a) => a.path), this.orchCli);
     if (!text) return;
     input.value = "";
     this.attachments = [];

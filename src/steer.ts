@@ -66,16 +66,31 @@ export function attachRejectMessage(reason: AttachReject, name?: string): string
   }
 }
 
+/** The in-prompt reference line for one attached image, formatted for how the
+ *  orchestrator's CLI consumes an image path:
+ *   - Claude Code reads a plain absolute path with its file tools;
+ *   - GitHub Copilot CLI documents an `@<path>` mention (["Using GitHub Copilot
+ *     CLI"](https://docs.github.com/en/copilot/how-tos/copilot-cli/use-copilot-cli/overview)),
+ *     which attaches the image into its context.
+ *  The human-readable "Attached image: " label is harmless prose to either
+ *  agent; the path (bare, or `@`-prefixed) is what does the work. Unknown CLIs
+ *  fall back to the plain-path form. */
+export function attachmentLine(path: string, cli: string): string {
+  return cli === "copilot"
+    ? `Attached image: @${path}`
+    : `Attached image: ${path}`;
+}
+
 /** Build the steering text delivered to the orchestrator: the human's typed
- *  draft, then one "Attached image: <path>" line per queued image. The line
- *  form is what the agent reads to open the file. Returns "" when there's
- *  nothing to send (no text and no attachments), which the caller treats as a
- *  no-op — so a stray Enter on an empty strip never fires a send. */
-export function composeSteerText(text: string, paths: string[]): string {
+ *  draft, then one attachment reference line per queued image, formatted for
+ *  the group's orchestrator `cli`. Returns "" when there's nothing to send (no
+ *  text and no attachments), which the caller treats as a no-op — so a stray
+ *  Enter on an empty strip never fires a send. */
+export function composeSteerText(text: string, paths: string[], cli: string): string {
   const lines: string[] = [];
   const t = text.trim();
   if (t) lines.push(t);
-  for (const p of paths) lines.push(`Attached image: ${p}`);
+  for (const p of paths) lines.push(attachmentLine(p, cli));
   return lines.join("\n");
 }
 

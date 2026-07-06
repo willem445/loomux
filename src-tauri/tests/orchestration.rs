@@ -3095,6 +3095,32 @@ fn save_attachment_gives_each_image_a_distinct_path_in_a_burst() {
 }
 
 #[test]
+fn save_attachment_rejects_an_unknown_group() {
+    // Membership guard (#72 review): the dir is root.join(group), so a group id
+    // that was never created — including a traversal attempt — must be refused
+    // before anything is written.
+    let (reg, dir) = test_registry();
+    assert!(reg.save_attachment("never-made", "png", &[1, 2, 3]).unwrap_err().contains("unknown"));
+    assert!(reg.save_attachment("../escape", "png", &[1, 2, 3]).unwrap_err().contains("unknown"));
+    // Nothing was written anywhere under the root.
+    assert!(!dir.path().join("never-made").exists());
+    assert!(!dir.path().join("attachments").exists());
+}
+
+#[test]
+fn orchestrator_cli_resolves_the_groups_cli_for_reference_formatting() {
+    // The save command returns this so the frontend formats image references the
+    // way the orchestrator's CLI reads them (#72 review note 3).
+    let (reg, _d) = test_registry();
+    let claude = reg.create_group("C:/tmp/claude-repo", rails()).unwrap();
+    let copilot = reg.create_group("C:/tmp/copilot-repo", copilot_rails()).unwrap();
+    assert_eq!(reg.orchestrator_cli(&claude.id), "claude");
+    assert_eq!(reg.orchestrator_cli(&copilot.id), "copilot");
+    // Unknown group → the safe default wording, never a panic.
+    assert_eq!(reg.orchestrator_cli("nope"), "claude");
+}
+
+#[test]
 fn end_group_sweeps_the_attachments_scratch_dir() {
     let (reg, dir) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();

@@ -1326,6 +1326,17 @@ impl OrchRegistry {
         self.group_dir(group).join("attachments")
     }
 
+    /// The CLI the group's orchestrator runs (`claude`/`copilot`/…), resolving
+    /// per-role overrides through `cli_for`. Used to format image references the
+    /// way that CLI consumes them (#72). Falls back to the default `claude`
+    /// wording if the group isn't loaded (a save always follows a live steer, so
+    /// this is just a safety net).
+    pub fn orchestrator_cli(&self, group: &str) -> String {
+        self.group(group)
+            .map(|g| g.guardrails.cli_for(Role::Orchestrator).to_string())
+            .unwrap_or_else(|| "claude".into())
+    }
+
     /// Persist a steered image to the group's `attachments/` scratch dir and
     /// return its absolute path (#72). The steering strip can't hand binary to
     /// a CLI prompt, but Claude Code and Copilot both *read image files from
@@ -1335,6 +1346,14 @@ impl OrchRegistry {
     /// (no image crate, no `getrandom` deps) — only size and extension are
     /// validated. Files are reclaimed when the group ends (see `end_group`).
     pub fn save_attachment(&self, group: &str, ext: &str, bytes: &[u8]) -> Result<PathBuf, String> {
+        // Membership guard: only ever write under a real, known group id (#72
+        // review). The dir is `root.join(group)`, so without this a caller could
+        // steer `group` to a traversal component; requiring the group to exist
+        // pins it to a generated group token. Cheap hardening on top of the
+        // pre-existing trusted-webview model (see the orch-command notes).
+        if self.group(group).is_none() {
+            return Err("unknown group".into());
+        }
         if bytes.is_empty() {
             return Err("empty attachment".into());
         }
@@ -4726,18 +4745,29 @@ pub fn orch_steer(
     reg.steer_orchestrator(&group_id, &text)
 }
 
-/// Save an image pasted/attached into the steering strip and return its
-/// absolute path (#72). The image rides over IPC as base64 (`data_b64`) — same
-/// wire form as the OSC 52 clipboard bridge — so it survives any webview that
-/// won't hand raw bytes through `invoke`. The path is written into the steer
-/// text as an "Attached image: <path>" line by the frontend before sending.
+/// Result of saving a steering-strip attachment: the absolute file path plus
+/// the resolved orchestrator CLI, so the frontend can format the in-prompt
+/// reference the way that CLI consumes it (Claude reads a plain path; Copilot
+/// documents an `@<path>` mention — #72 review note 3).
+#[derive(serde::Serialize)]
+pub struct SavedAttachment {
+    pub path: String,
+    pub cli: String,
+}
+
+/// Save an image pasted/attached into the steering strip (#72). The image rides
+/// over IPC as base64 (`data_b64`) — same wire form as the OSC 52 clipboard
+/// bridge — so it survives any webview that won't hand raw bytes through
+/// `invoke`. Returns the saved path and the group's orchestrator CLI; the
+/// frontend turns those into the per-CLI "Attached image" reference line before
+/// sending through `orch_steer`.
 #[tauri::command]
 pub fn orch_save_attachment(
     reg: tauri::State<Arc<OrchRegistry>>,
     group_id: String,
     ext: String,
     data_b64: String,
-) -> Result<String, String> {
+) -> Result<SavedAttachment, String> {
     use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
     // Reject an oversize payload before decoding — see MAX_ATTACHMENT_B64_LEN.
     if data_b64.len() > MAX_ATTACHMENT_B64_LEN {
@@ -4749,7 +4779,10 @@ pub fn orch_save_attachment(
         .decode(data_b64.as_bytes())
         .map_err(|e| format!("invalid attachment encoding: {e}"))?;
     let path = reg.save_attachment(&group_id, &ext, &bytes)?;
-    Ok(path.to_string_lossy().to_string())
+    Ok(SavedAttachment {
+        path: path.to_string_lossy().to_string(),
+        cli: reg.orchestrator_cli(&group_id),
+    })
 }
 
 #[tauri::command]
