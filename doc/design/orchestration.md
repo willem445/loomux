@@ -659,6 +659,29 @@ Two related additions: a **planner** role, and **per-role** agent CLI + model.
     autopilot mode, which opens a blocking "Enable autopilot mode" confirmation dialog on
     startup that a headless pane can't answer — #101. `--allow-all-tools` is Copilot's
     documented non-interactive enabler and needs no autopilot mode.)
+
+    - **What `--autopilot` would add, and why we don't chase it (#101 delta).** Reading the
+      installed Copilot bundle (v1.0.68, `app.js` + the `runtime.node` prompt strings)
+      settled what autopilot *mode* changes beyond the idle auto-continue loop: it injects an
+      extra **system-prompt** block, gated on `p.autopilotActive` (`_e = p.autopilotActive ?
+      promptsCliAutopilotInstructions(...) : ""`), that reads *"Autopilot mode is currently
+      active … persist autonomously to complete the user's task … continue executing without
+      waiting for user input … The user may not even be present."* So with our
+      `--allow-all-tools` posture the agent has every tool **pre-approved** but still runs in
+      Copilot's *interactive* framing — it keeps the `ask_user` tool (gated by the `ask-user`
+      feature flag, **not** by mode) and will describe itself as interactive / may pause to
+      ask. That is the whole story of the tools-vs-mode split, and it's acceptable here:
+      **single-pane** agents (#101) have a human at the pane, for whom interactive framing is
+      correct; **orchestration workers** are driven by loomux's own typed briefs (which carry
+      the "work autonomously, report when done" contract) and their `ask_user` calls surface
+      through the attention router, so they don't silently stall. We do **not** enter native
+      autopilot mode because there is no clean dialog-free way in: the dialog's acknowledgement
+      is a session-only React ref (`Qp.current`), not a persisted config key we could pre-seed;
+      only `--autopilot` / `--mode autopilot` set the mode and all route through the same
+      confirmation; and the sole remaining path — typing to answer the menu at boot — is
+      fragile and only reachable where loomux drives a kickoff (workers), not single panes. If
+      a future need for *true* worker autonomy proves out, the least-bad option on record is
+      that boot-menu auto-answer, weighed as its own change.
     Previously a planner in a **non-auto_ops** group got the interactive preset (`acceptEdits`
     with no git/gh allowlist on Claude; plain interactive mode with no allow-all on Copilot),
     so its very first `gh`/explore call would have prompted into the void — a latent deadlock

@@ -230,6 +230,13 @@ drift); the toggle only shows for CLIs that have an unattended mode
 CLI's normal interactive mode. Your last choice is remembered as the default
 next time (in `localStorage`, like the other launcher prefs).
 
+The toggle means **tools pre-approved** — the pane stops prompting you to
+approve each edit/command. It is *not* Copilot's experimental "autopilot mode":
+with a human at a single pane, Copilot still runs in its interactive framing (it
+keeps its `ask_user` tool and may pause to ask a question), which is what you
+want when you're there to answer. See the orchestration design note for why
+loomux doesn't opt agents into native autopilot mode.
+
 **How it works:** loomux hosts a local MCP server; every agent pane in a
 group connects with its own identity token (`--strict-mcp-config`, so
 workers see nothing else). The orchestrator plans work as GitHub issues
