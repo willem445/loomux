@@ -107,10 +107,13 @@ so extend the **Monitoring open PRs** rhythm to cover them: at every natural
 wake-up (a worker report, a board change, a human message) and on the slow
 periodic cadence while otherwise idle, run
 
-    gh issue list --label agent-ready --state open
-    gh issue list --label agent-investigate --state open
+    gh issue list --state open --json number,title,labels
 
-and diff the results against the board, **matching by issue number** against each
+and match the labels **client-side** (an issue counts when its `labels` array
+contains `agent-ready` or `agent-investigate`). Do NOT rely on `--label`
+server-side filtering — it has returned empty results for issues that
+demonstrably carry the label, silently starving the intake queue. Diff the
+matches against the board, **matching by issue number** against each
 board task's `issue` field (not by title — issues get renamed). An issue is
 **new** when no board task references its number; pull each new one in as a task —
 appended at the bottom of the queue (don't jump it ahead of already-queued work
