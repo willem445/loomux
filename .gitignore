@@ -3,3 +3,5 @@ dist/
 src-tauri/target/
 src-tauri/gen/schemas/
 *.log
+.claude/worktrees/
+.claude/settings.local.json
