@@ -46,6 +46,13 @@ export interface OrchestratorConfig {
   /** Model for the planner role (issue #47). */
   plannerModel: string;
   autoOps: boolean;
+  /** Trust this repo's own agent config for local code execution (issue #51):
+   *  merge repo `.mcp.json` MCP servers into agents (Claude) and engage a
+   *  Copilot persona via native `--agent` (which pulls its `mcp-servers`).
+   *  Default false — a repo MCP `command` is arbitrary code loomux would run.
+   *  Repo role *instructions* always apply; only this code-exec surface is
+   *  gated. */
+  trustRepoMcp: boolean;
   /** Cost guardrail: auto-kill an idle worker/reviewer after this many
    *  minutes without a task (0 = disabled). */
   idleKillMinutes: number;
@@ -70,6 +77,31 @@ export interface AttentionItem {
   reason: string;
   detail: string;
 }
+
+/** One repo-defined agent profile, discovered from `.github/agents/*.md`
+ *  (GitHub Copilot's agents.md convention), previewed in the launcher (#51). */
+export interface RepoProfile {
+  name: string;
+  /** loomux role this profile addends: orchestrator|worker|reviewer|planner. */
+  role: string;
+  description: string;
+  model: string | null;
+  allow: string[];
+}
+
+/** What a repo would contribute to a group: role/persona profiles plus the
+ *  names of the MCP servers its `.mcp.json` declares (the code-exec surface a
+ *  human gates with the trust toggle). Empty when the repo has neither. */
+export interface RepoConfigPreview {
+  profiles: RepoProfile[];
+  mcp_servers: string[];
+}
+
+/** Preview a repo's agent profiles + `.mcp.json` server names for the launcher
+ *  (#51), so the human sees what a repo contributes before launching — and,
+ *  for MCP, before deciding whether to trust it. */
+export const discoverRepoConfig = (repo: string): Promise<RepoConfigPreview> =>
+  invoke<RepoConfigPreview>("orch_discover_repo_config", { repo });
 
 /** The human focused/handled an attention-badged pane: clear its latched
  *  report backend-side so the badge drops. */
@@ -223,6 +255,7 @@ export async function launchOrchestrator(
     orchestratorModel: config.orchestratorModel,
     plannerModel: config.plannerModel,
     autoOps: config.autoOps,
+    trustRepoMcp: config.trustRepoMcp,
     idleKillMinutes: config.idleKillMinutes,
     maxSpawnsPerHour: config.maxSpawnsPerHour,
     watchdogStallMinutes: config.watchdogStallMinutes,

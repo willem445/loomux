@@ -14,6 +14,7 @@
 //! pane, and the audit log (`audit.jsonl`) records the full text.
 
 pub mod mcp;
+pub mod profiles;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -363,6 +364,15 @@ pub struct Guardrails {
     /// shows a confirm dialog whose default answer is "exit", which the
     /// kickoff typing would accept, killing the pane.
     pub auto_ops: bool,
+    /// Trust this repo's own agent config for local code execution (issue
+    /// #51). Default **off**: a repo's `.mcp.json` server entry is an
+    /// arbitrary `command` loomux would launch, and under `auto_ops` no human
+    /// approves each tool call — so repo MCP servers are only merged into an
+    /// agent's config (Claude), and a Copilot persona only engaged via its
+    /// native `--agent` (which pulls the file's `mcp-servers`), when the human
+    /// has explicitly trusted this repo. Repo role *instructions* always
+    /// apply (text, not code); only the MCP/code-exec surface is gated.
+    pub trust_repo_mcp: bool,
     /// Cost guardrail: auto-kill a worker/reviewer that has sat without a
     /// task for this many minutes (the orchestrator is notified so it can
     /// respawn on demand). 0 disables it. See `idle_should_kill`.
@@ -861,6 +871,24 @@ pub struct Caller {
     pub agent_id: String,
     pub group: String,
     pub role: Role,
+}
+
+/// Repo-profile extras threaded into `build_agent_command` (issue #51). A
+/// profile-less spawn passes `Default::default()` (all empty/none), which
+/// reproduces the pre-#51 command exactly. Kept as one struct so adding a
+/// profile knob doesn't grow the already-long positional signature.
+#[derive(Default)]
+pub struct ProfileInject<'a> {
+    /// Extra pre-approved tool patterns from the profile's `allow:`.
+    pub extra_allow: &'a [String],
+    /// Profile instructions rendered to a file, injected as Claude's appended
+    /// system prompt (`--append-system-prompt-file`). Text only — always
+    /// applied when a profile is present (not gated by `trust_repo_mcp`).
+    pub system_prompt_file: Option<&'a Path>,
+    /// Copilot native custom-agent name (`--agent <name>`). Only set when the
+    /// group trusts the repo, since `--agent` also pulls the file's
+    /// `mcp-servers` (local code execution).
+    pub copilot_agent: Option<&'a str>,
 }
 
 /// Payload asking the frontend to open a pane for an agent. Also the return
@@ -2011,6 +2039,9 @@ impl OrchRegistry {
                 orchestrator_model: s("orchestrator_model", ""),
                 planner_model: s("planner_model", ""),
                 auto_ops: g["auto_ops"].as_bool().unwrap_or(true),
+                // Additive (issue #51): absent in older group.json → false
+                // (repo MCP stays gated off until the human opts in).
+                trust_repo_mcp: g["trust_repo_mcp"].as_bool().unwrap_or(false),
                 idle_kill_minutes: g["idle_kill_minutes"].as_u64().unwrap_or(0) as u32,
                 max_spawns_per_hour: g["max_spawns_per_hour"].as_u64().unwrap_or(0) as u32,
                 watchdog_stall_minutes: g["watchdog_stall_minutes"].as_u64().unwrap_or(0) as u32,
@@ -2069,6 +2100,7 @@ impl OrchRegistry {
                     "orchestrator_model": info.guardrails.orchestrator_model,
                     "planner_model": info.guardrails.planner_model,
                     "auto_ops": info.guardrails.auto_ops,
+                    "trust_repo_mcp": info.guardrails.trust_repo_mcp,
                     "idle_kill_minutes": info.guardrails.idle_kill_minutes,
                     "max_spawns_per_hour": info.guardrails.max_spawns_per_hour,
                     "watchdog_stall_minutes": info.guardrails.watchdog_stall_minutes,
@@ -3285,15 +3317,63 @@ impl OrchRegistry {
             .count() as u32
     }
 
+    /// Servers from the repo's standard `.mcp.json` (the agent's workdir /
+    /// checkout first, then the group repo), for merging into a **Claude**
+    /// agent's per-agent config: `--strict-mcp-config` (required for group
+    /// isolation) suppresses Claude's native `.mcp.json` loading, so without
+    /// this a repo's declared MCP servers would never reach the agent. A
+    /// malformed or unreadable file is audited and skipped rather than
+    /// blocking the spawn.
+    ///
+    /// SECURITY (issue #51): an `.mcp.json` `stdio` entry is an arbitrary
+    /// `command` + `args` that loomux would launch — local code execution on
+    /// the operator's machine, with no per-call human approval under
+    /// `auto_ops`. Callers therefore only invoke this when the group's
+    /// `trust_repo_mcp` toggle is on. The reserved `loomux` identity entry is
+    /// stripped here as well, so a repo server named `loomux` can never shadow
+    /// it (defence in depth alongside `write_mcp_config`).
+    fn repo_mcp_servers(
+        &self,
+        group: &str,
+        workdir: &str,
+        repo: &str,
+    ) -> Option<serde_json::Map<String, Value>> {
+        let path = [workdir, repo]
+            .iter()
+            .map(|d| Path::new(d).join(".mcp.json"))
+            .find(|p| p.is_file())?;
+        let parsed = fs::read_to_string(&path)
+            .ok()
+            .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+            .and_then(|v| v.get("mcpServers").and_then(Value::as_object).cloned());
+        match parsed {
+            Some(mut servers) => {
+                servers.remove("loomux");
+                Some(servers)
+            }
+            None => {
+                self.audit(group, "loomux", "warning", json!({
+                    "what": ".mcp.json unreadable — repo MCP servers skipped",
+                    "path": path.display().to_string(),
+                }));
+                None
+            }
+        }
+    }
+
     /// Write the per-agent MCP config the agent CLI connects with. Claude
     /// and Copilot share the same core schema; Copilot additionally expects
-    /// a `tools` allowlist inside the server entry.
+    /// a `tools` allowlist inside the server entry. `extra_servers` (repo
+    /// `.mcp.json`, only when the group trusts it — see `repo_mcp_servers`)
+    /// ride in the same config; the reserved `loomux` identity entry always
+    /// wins and can never be shadowed.
     fn write_mcp_config(
         &self,
         group: &str,
         agent_id: &str,
         token: &str,
         cli: &str,
+        extra_servers: Option<&serde_json::Map<String, Value>>,
     ) -> Result<PathBuf, String> {
         let port = self.port();
         if port == 0 {
@@ -3307,7 +3387,17 @@ impl OrchRegistry {
         if cli == "copilot" {
             server["tools"] = json!(["*"]);
         }
-        let cfg = json!({ "mcpServers": { "loomux": server } });
+        let mut servers = serde_json::Map::new();
+        if let Some(extra) = extra_servers {
+            for (k, v) in extra {
+                if k != "loomux" {
+                    servers.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        // Inserted last so the loomux identity entry always wins on a clash.
+        servers.insert("loomux".into(), server);
+        let cfg = json!({ "mcpServers": servers });
         let dir = self.group_dir(group).join("configs");
         fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         let path = dir.join(format!("{agent_id}.json"));
@@ -3349,6 +3439,7 @@ impl OrchRegistry {
         session: Option<&str>,
         resume: bool,
         read_only: bool,
+        inject: &ProfileInject,
     ) -> String {
         // A planner never mutates and has no human in its pane, so there is
         // nothing for `auto_ops` to gate: it must explore, post its plan
@@ -3403,6 +3494,20 @@ impl OrchRegistry {
                          --deny-tool \"shell(git commit)\" --deny-tool \"shell(git push)\"",
                     );
                 }
+                // Repo persona: engage Copilot's native custom agent (issue
+                // #51). `--agent <name>` resolves the same .github/agents file
+                // and applies its instructions AND its `mcp-servers` scopes —
+                // which is why the caller only sets `copilot_agent` when the
+                // group trusts the repo (those `mcp-servers` are code exec).
+                // When untrusted, the persona still reaches the agent as text
+                // via the kickoff-referenced brief; only the native --agent is
+                // withheld.
+                if let Some(agent) = inject.copilot_agent {
+                    cmd.push_str(&format!(" --agent {agent}"));
+                }
+                for entry in inject.extra_allow {
+                    cmd.push_str(&format!(" --allow-tool \"{entry}\""));
+                }
                 cmd
             }
             // "claude" and the explicit fallback for anything unrecognized.
@@ -3434,6 +3539,14 @@ impl OrchRegistry {
                     // carve commit/push back out.
                     cmd.push_str(" \"Bash(git *)\" \"Bash(gh *)\"");
                 }
+                // Profile-declared extra tool patterns join the SAME
+                // --allowedTools list (issue #51): a second --allowedTools flag
+                // would replace the first and silently drop the loomux MCP
+                // approval. These land before --disallowedTools, which still
+                // overrides them for a read-only planner.
+                for entry in inject.extra_allow {
+                    cmd.push_str(&format!(" \"{entry}\""));
+                }
                 if read_only {
                     // Deny the file-editing tools and the git mutation
                     // subcommands outright (--disallowedTools overrides the
@@ -3456,6 +3569,15 @@ impl OrchRegistry {
                          \"Bash(git commit *)\" \"Bash(git push *)\"",
                     );
                 }
+                // Repo persona: inject the profile's instructions as the
+                // agent's appended system prompt (issue #51). Claude has no
+                // native `.github/agents` persona-by-name, so this is how the
+                // repo addendum reaches it — stronger than a kickoff mention,
+                // and it *appends to* Claude's built-in system prompt (base +
+                // repo additions). Text only, so it's not gated by trust.
+                if let Some(f) = inject.system_prompt_file {
+                    cmd.push_str(&format!(" --append-system-prompt-file \"{}\"", f.display()));
+                }
                 cmd
             }
         }
@@ -3473,7 +3595,7 @@ impl OrchRegistry {
         use_worktree: bool,
         branch: Option<String>,
     ) -> Result<AgentEntry, String> {
-        self.spawn_agent_ex(group_id, role, name, task, use_worktree, branch, None, None, None)
+        self.spawn_agent_ex(group_id, role, name, task, use_worktree, branch, None, None, None, None)
     }
 
     /// Full spawn: `resume_session` reopens a previous session (follow-ups
@@ -3488,11 +3610,42 @@ impl OrchRegistry {
         task: &str,
         use_worktree: bool,
         branch: Option<String>,
+        profile: Option<String>,
         resume_session: Option<String>,
         cwd_override: Option<String>,
         restore_name_source: Option<NameSource>,
     ) -> Result<AgentEntry, String> {
         let group = self.group(group_id).ok_or("unknown group")?;
+
+        // Resolve the repo profile that shapes this agent (issue #51), re-read
+        // fresh from the repo so edits to .github/agents/*.md apply to the next
+        // spawn without relaunching. Two paths:
+        //   * an explicit `profile` name (orchestrator's `spawn_agent(profile:)`)
+        //     — errors with the available list if unknown; else
+        //   * the role addendum: the repo file mapped to this spawn's role.
+        // A named profile's own role mapping wins over the requested `role`
+        // (e.g. a `kind: reviewer` persona spawns as a reviewer).
+        let all_profiles = profiles::discover_profiles(&group.repo);
+        let profile = match profile.map(|p| p.trim().to_string()).filter(|p| !p.is_empty()) {
+            Some(wanted) => match profiles::find_named(&all_profiles, &wanted) {
+                Some(p) => Some(p.clone()),
+                None => {
+                    let names: Vec<String> = all_profiles.iter().map(|p| p.name.clone()).collect();
+                    return Err(format!(
+                        "unknown profile {wanted:?}. Available profiles: {}",
+                        if names.is_empty() {
+                            "none — define <repo>/.github/agents/<name>.md".to_string()
+                        } else {
+                            names.join(", ")
+                        }
+                    ));
+                }
+            },
+            None => profiles::profile_for_role(&all_profiles, role).cloned(),
+        };
+        // A named profile may retarget the role (its `role`/`kind` mapping);
+        // a role-addendum profile already matches `role` by construction.
+        let role = profile.as_ref().map(|p| p.role).unwrap_or(role);
 
         // Guardrail: live delegate cap (the orchestrator itself is exempt).
         if role != Role::Orchestrator {
@@ -3523,7 +3676,14 @@ impl OrchRegistry {
             ));
         }
         let cli = cli.to_string();
-        let model = group.guardrails.model_for(role);
+        // The model is pinned per role (issue #4); a profile may override it
+        // (issue #51), sanitized like everything shell-bound. `profile_model`
+        // is owned so it outlives this borrow.
+        let profile_model = profile
+            .as_ref()
+            .and_then(|p| p.model.as_deref())
+            .map(|m| sanitize_model(m, group.guardrails.model_for(role)));
+        let model = profile_model.as_deref().unwrap_or(group.guardrails.model_for(role));
 
         let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
         let agent_id = format!("{}-{seq}", role.prefix());
@@ -3602,7 +3762,36 @@ impl OrchRegistry {
         if cli == "copilot" {
             pre_trust_copilot_folder(&cwd);
         }
-        let cfg = self.write_mcp_config(group_id, &agent_id, &token, &cli)?;
+
+        // Repo-profile extras (issue #51). The rendered instructions brief is
+        // written per-agent (keyed by agent id) so it survives concurrent
+        // spawns and the kickoff can point at it; on Claude it becomes the
+        // appended system prompt. Repo MCP servers + the Copilot native
+        // `--agent` are BOTH gated on `trust_repo_mcp` — they are the local
+        // code-execution surface.
+        let trust = group.guardrails.trust_repo_mcp;
+        let profile_brief: Option<PathBuf> = match &profile {
+            Some(p) => {
+                let dir = self.group_dir(group_id).join("profiles");
+                fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+                let path = dir.join(format!("{agent_id}.md"));
+                let vars = [("REPO", group.repo.as_str()), ("GROUP_ID", group_id)];
+                fs::write(&path, render_template(&p.instructions, &vars)).map_err(|e| e.to_string())?;
+                Some(path)
+            }
+            None => None,
+        };
+        // Claude needs the repo's `.mcp.json` merged (strict mode suppresses
+        // native loading); Copilot reads its own config, so no merge — and
+        // only when the repo is trusted.
+        let extra_servers = if cli == "claude" && trust {
+            self.repo_mcp_servers(group_id, &cwd, &group.repo)
+        } else {
+            None
+        };
+        let cfg = self.write_mcp_config(group_id, &agent_id, &token, &cli, extra_servers.as_ref())?;
+
+        let empty_allow: Vec<String> = Vec::new();
         let command = self.build_agent_command(
             &cli,
             model,
@@ -3613,6 +3802,16 @@ impl OrchRegistry {
             session_id.as_deref(),
             resume,
             role == Role::Planner, // read_only: deny writes/commits at the CLI level
+            &ProfileInject {
+                extra_allow: profile.as_ref().map(|p| p.allow.as_slice()).unwrap_or(&empty_allow),
+                system_prompt_file: profile_brief.as_deref(),
+                // Native Copilot persona (pulls the file's mcp-servers) only
+                // when trusted; untrusted, the brief still reaches it as text.
+                copilot_agent: profile
+                    .as_ref()
+                    .filter(|_| trust)
+                    .and_then(|p| p.copilot_agent.as_deref()),
+            },
         );
 
         let entry = AgentEntry {
@@ -3665,6 +3864,10 @@ impl OrchRegistry {
             "agent": agent_id, "role": role, "name": display, "cwd": cwd,
             "cli": cli, "model": model, "worktree": use_worktree, "branch": branch_name, "task": task,
             "session": session_id, "resume": resume,
+            // issue #51: which repo profile shaped this agent, and whether the
+            // repo's MCP/code-exec surface was trusted for it.
+            "profile": profile.as_ref().map(|p| p.name.clone()),
+            "trust_repo_mcp": group.guardrails.trust_repo_mcp,
         }));
         // Breadcrumb (no prompt/task text): ids + role only.
         crate::obs::breadcrumb(
@@ -3754,21 +3957,58 @@ impl OrchRegistry {
     #[doc(hidden)] // pub for integration tests
     pub fn kickoff_prompt(&self, a: &AgentEntry, g: &GroupInfo, branch_note: &str) -> String {
         let instructions = self.group_dir(&g.id).join(a.role.instructions_file());
+        // Repo persona brief for this agent, if one was rendered at spawn
+        // (issue #51). Referenced in the kickoff so the persona reaches BOTH
+        // CLIs as text, independent of the Claude system-prompt / Copilot
+        // --agent injection.
+        let brief = self.group_dir(&g.id).join("profiles").join(format!("{}.md", a.id));
+        let brief_note = if brief.is_file() {
+            format!(
+                "\nThis repo defines a custom profile for your role — read it and treat it as an \
+                 addendum to (not a replacement for) your role instructions above: {}",
+                brief.display()
+            )
+        } else {
+            String::new()
+        };
         match a.role {
-            Role::Orchestrator => format!(
-                "You are the orchestrator of loomux agent group {gid} for the repository {repo}.\n\
-                 First read your role instructions: {ins}\n\
-                 Guardrails (enforced by loomux): max {max} live agents, worker model {wm}, reviewer model {rm}, planner model {pm}.\n\
-                 Start by calling get_state, run `gh issue list --label agent-managed --state open`, call list_agents, \
-                 reconcile them, then give the human a short status summary and wait for direction.",
-                gid = g.id, repo = g.repo, ins = instructions.display(),
-                max = g.guardrails.max_agents, wm = g.guardrails.worker_model,
-                rm = g.guardrails.reviewer_model, pm = g.guardrails.planner_model,
-            ),
+            Role::Orchestrator => {
+                // Surface the repo's available profiles so the orchestrator can
+                // spawn a named persona with spawn_agent(profile: "<name>").
+                let repo_profiles = profiles::discover_profiles(&g.repo);
+                let profile_note = if repo_profiles.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "\nCustom agent profiles defined in this repo (.github/agents), spawn a named one with \
+                         spawn_agent(profile: \"<name>\"); a role's addendum also auto-applies to plain spawns of that role: {}.",
+                        repo_profiles
+                            .iter()
+                            .map(|p| format!(
+                                "{} [{}] — {}",
+                                p.name,
+                                p.role.as_str(),
+                                if p.description.is_empty() { "(no description)" } else { &p.description }
+                            ))
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    )
+                };
+                format!(
+                    "You are the orchestrator of loomux agent group {gid} for the repository {repo}.\n\
+                     First read your role instructions: {ins}{brief_note}\n\
+                     Guardrails (enforced by loomux): max {max} live agents, worker model {wm}, reviewer model {rm}, planner model {pm}.{profile_note}\n\
+                     Start by calling get_state, run `gh issue list --label agent-managed --state open`, call list_agents, \
+                     reconcile them, then give the human a short status summary and wait for direction.",
+                    gid = g.id, repo = g.repo, ins = instructions.display(),
+                    max = g.guardrails.max_agents, wm = g.guardrails.worker_model,
+                    rm = g.guardrails.reviewer_model, pm = g.guardrails.planner_model,
+                )
+            }
             Role::Worker | Role::Reviewer | Role::Planner => {
                 let head = format!(
                     "You are \"{name}\" ({id}), a {role} agent in loomux group {gid} for repository {repo}.\n\
-                     First read your role instructions: {ins}\n{note}",
+                     First read your role instructions: {ins}{brief_note}\n{note}",
                     name = a.name, id = a.id, role = a.role.as_str(),
                     gid = g.id, repo = g.repo, ins = instructions.display(), note = branch_note,
                 );
@@ -4239,6 +4479,9 @@ pub fn create_orchestration(
     orchestrator_model: String,
     planner_model: String,
     auto_ops: bool,
+    // Trust this repo's agent config for local code execution (issue #51).
+    // Default off; the launcher sends the toggle state.
+    trust_repo_mcp: bool,
     idle_kill_minutes: u32,
     max_spawns_per_hour: u32,
     watchdog_stall_minutes: u32,
@@ -4258,6 +4501,7 @@ pub fn create_orchestration(
             orchestrator_model,
             planner_model,
             auto_ops,
+            trust_repo_mcp,
             idle_kill_minutes,
             max_spawns_per_hour,
             watchdog_stall_minutes,
@@ -4266,6 +4510,37 @@ pub fn create_orchestration(
         None,
         initial_workers,
     )
+}
+
+/// Preview a repo's discovered agent profiles + `.mcp.json` server names for
+/// the launcher (issue #51), so the human sees what a repo would contribute
+/// *before* launching — and, for MCP, before deciding whether to trust it. A
+/// non-repo path or missing files yield empty lists (never an error).
+#[tauri::command]
+pub fn orch_discover_repo_config(repo: String) -> Value {
+    let profiles = profiles::discover_profiles(&repo);
+    let profile_json: Vec<Value> = profiles
+        .iter()
+        .map(|p| json!({
+            "name": p.name,
+            "role": p.role.as_str(),
+            "description": p.description,
+            "model": p.model,
+            "allow": p.allow,
+        }))
+        .collect();
+    // Repo MCP server names only (not their commands) — enough for the human
+    // to recognise what would run, without dumping arbitrary command lines.
+    let mcp_servers: Vec<String> = [".mcp.json"]
+        .iter()
+        .map(|f| Path::new(&repo).join(f))
+        .find(|p| p.is_file())
+        .and_then(|p| fs::read_to_string(&p).ok())
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .and_then(|v| v.get("mcpServers").and_then(Value::as_object).cloned())
+        .map(|m| m.keys().filter(|k| *k != "loomux").cloned().collect())
+        .unwrap_or_default();
+    json!({ "profiles": profile_json, "mcp_servers": mcp_servers })
 }
 
 /// Pause a group: loomux stops delivering prompts/kickoffs so its agents
@@ -4419,7 +4694,32 @@ fn register_orchestrator_pane(
     if cli == "copilot" {
         pre_trust_copilot_folder(&group.repo);
     }
-    let cfg = reg.write_mcp_config(&group.id, &agent_id, &token, &cli)?;
+
+    // Repo orchestrator addendum (issue #51): the human's "always branch + PR,
+    // never push to main"-style secondary prompt. loomux still owns the
+    // orchestrator base contract; a `.github/agents/orchestrator.md` appends to
+    // it. Rendered to a brief the kickoff references and (on Claude) injected as
+    // the appended system prompt. Repo MCP + Copilot --agent gated on trust.
+    let trust = group.guardrails.trust_repo_mcp;
+    let orch_profile =
+        profiles::discover_profiles(&group.repo).into_iter().find(|p| p.role == Role::Orchestrator);
+    let profile_brief: Option<PathBuf> = match &orch_profile {
+        Some(p) => {
+            let dir = reg.group_dir(&group.id).join("profiles");
+            fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+            let path = dir.join(format!("{agent_id}.md"));
+            let vars = [("REPO", group.repo.as_str()), ("GROUP_ID", group.id.as_str())];
+            fs::write(&path, render_template(&p.instructions, &vars)).map_err(|e| e.to_string())?;
+            Some(path)
+        }
+        None => None,
+    };
+    let extra_servers = if cli == "claude" && trust {
+        reg.repo_mcp_servers(&group.id, &group.repo, &group.repo)
+    } else {
+        None
+    };
+    let cfg = reg.write_mcp_config(&group.id, &agent_id, &token, &cli, extra_servers.as_ref())?;
     let resume = resume_session.is_some();
     let session_id = match resume_session {
         Some(s) => Some(sanitize_session(&s).ok_or("invalid resume session id")?),
@@ -4434,6 +4734,7 @@ fn register_orchestrator_pane(
                 .map(|root| crate::sessions::copilot_session_ids(&root))
                 .unwrap_or_default()
         });
+    let empty_allow: Vec<String> = Vec::new();
     let command = reg.build_agent_command(
         &cli,
         &model,
@@ -4444,6 +4745,14 @@ fn register_orchestrator_pane(
         session_id.as_deref(),
         resume,
         false, // the orchestrator is never read-only
+        &ProfileInject {
+            extra_allow: orch_profile.as_ref().map(|p| p.allow.as_slice()).unwrap_or(&empty_allow),
+            system_prompt_file: profile_brief.as_deref(),
+            copilot_agent: orch_profile
+                .as_ref()
+                .filter(|_| trust)
+                .and_then(|p| p.copilot_agent.as_deref()),
+        },
     );
     let entry = AgentEntry {
         id: agent_id.clone(),
@@ -4637,7 +4946,9 @@ pub fn resume_recorded_session(
     let (group_id, name) = (record.group_id.clone(), record.agent_name.clone());
     std::thread::spawn(move || {
         if let Err(e) = reg2.spawn_agent_ex(
-            &group_id, role, &name, "", false, None, Some(sid.clone()), cwd, restore_source,
+            // profile None on resume: the resumed session already carries its
+            // persona; re-injecting would double the addendum.
+            &group_id, role, &name, "", false, None, None, Some(sid.clone()), cwd, restore_source,
         ) {
             reg2.audit(&group_id, "loomux", "error",
                 json!({ "what": "session rejoin failed", "session": sid, "err": e.clone() }));

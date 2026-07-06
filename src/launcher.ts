@@ -11,7 +11,8 @@
 import { open } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
 import { gitWorktreeAdd } from "./git";
-import type { OrchestratorConfig } from "./orchestration";
+import type { OrchestratorConfig, RepoConfigPreview } from "./orchestration";
+import { discoverRepoConfig } from "./orchestration";
 import {
   AGENTS,
   addRecentRepo,
@@ -212,6 +213,16 @@ export class AgentLauncher {
     model: ModelPicker;
   }[];
   private permsSel: HTMLSelectElement;
+  /** Trust this repo's agent config for local code execution (issue #51):
+   *  merge repo `.mcp.json` and engage a Copilot persona natively. Default
+   *  off; only the MCP/code-exec surface is gated (instructions always apply). */
+  private trustRepoMcpInput: HTMLInputElement;
+  /** Read-only preview of what the selected repo contributes: discovered
+   *  `.github/agents/*.md` profiles + `.mcp.json` server names (issue #51). */
+  private repoConfigEl: HTMLElement;
+  /** Debounce + race guard for the async repo-config discovery. */
+  private repoConfigTimer: number | null = null;
+  private repoConfigSeq = 0;
   private agentWarn: HTMLElement;
   /** One probe per program per app run; backend caches too. */
   private probes = new Map<string, Promise<CliProbe>>();
@@ -275,7 +286,10 @@ export class AgentLauncher {
     this.repoList = document.createElement("datalist");
     this.repoList.id = "launcher-recent-repos";
     this.repoInput.setAttribute("list", this.repoList.id);
-    this.repoInput.addEventListener("input", () => this.updateName());
+    this.repoInput.addEventListener("input", () => {
+      this.updateName();
+      this.scheduleRepoConfig();
+    });
     const browse = document.createElement("button");
     browse.className = "dlg-btn";
     browse.type = "button";
@@ -327,6 +341,19 @@ export class AgentLauncher {
       ["auto", "Auto — pre-approve git/gh + agent tools (recommended)"],
       ["edits", "Accept edits only — you approve git/gh yourself"],
     ]);
+    // Repo-config trust (issue #51): default OFF. A repo's `.mcp.json` server
+    // entry is an arbitrary command loomux would launch — local code exec — so
+    // repo MCP (and the Copilot native persona, which pulls its `mcp-servers`)
+    // only engage when the human explicitly trusts this repo. Repo role
+    // *instructions* always apply regardless; only this surface is gated.
+    this.trustRepoMcpInput = document.createElement("input");
+    this.trustRepoMcpInput.type = "checkbox";
+    this.trustRepoMcpInput.className = "dlg-check";
+    // Read-only preview of the selected repo's discovered profiles + MCP
+    // servers, refreshed as the repo path changes.
+    this.repoConfigEl = document.createElement("div");
+    this.repoConfigEl.className = "dlg-repo-config opt";
+    this.repoConfigEl.hidden = true;
     const guardRow1 = document.createElement("div");
     guardRow1.className = "dlg-row";
     guardRow1.append(
@@ -353,9 +380,16 @@ export class AgentLauncher {
       field("Max spawns/hour (0=∞)", this.spawnRateInput),
       field("Watchdog stall (min, 0=off)", this.watchdogInput)
     );
+    // Trust toggle sits with the discovered-config preview so the human sees
+    // exactly what they'd be trusting right above the switch (issue #51).
+    const trustRow = document.createElement("label");
+    trustRow.className = "dlg-check-row";
+    trustRow.append(this.trustRepoMcpInput, document.createTextNode(" Trust this repo's agent config (merge its .mcp.json + Copilot personas — runs repo-declared MCP servers locally)"));
+    const trustField = field("Repo agent config (.github/agents + .mcp.json)", this.repoConfigEl);
+    trustField.append(trustRow);
     this.orchFields = document.createElement("div");
     this.orchFields.className = "dlg-field";
-    this.orchFields.append(guardRow1, guardRow2, guardRow3, field("Permissions", this.permsSel));
+    this.orchFields.append(guardRow1, guardRow2, guardRow3, field("Permissions", this.permsSel), trustField);
 
     this.errorEl = document.createElement("div");
     this.errorEl.className = "dlg-error";
@@ -440,6 +474,10 @@ export class AgentLauncher {
     );
     this.worktreeInput.value = "";
     this.nameDirty = false;
+    // Trust defaults OFF every open (issue #51) — a prior repo's trust never
+    // silently carries to the next launch.
+    this.trustRepoMcpInput.checked = false;
+    this.repoConfigEl.hidden = true;
     this.applyMode();
     this.setBusy(false);
     this.hideError();
@@ -455,6 +493,9 @@ export class AgentLauncher {
     this.nameField.hidden = m === "orchestrator";
     this.applyOrchCli();
     this.updateName();
+    // Preview the repo's agent config only in orchestrator mode (issue #51).
+    if (m === "orchestrator") this.scheduleRepoConfig();
+    else this.repoConfigEl.hidden = true;
   }
 
   private orchCliFor(id: string): OrchCli {
@@ -578,6 +619,58 @@ export class AgentLauncher {
     if (typeof picked === "string") {
       this.repoInput.value = picked;
       this.updateName();
+      this.scheduleRepoConfig();
+    }
+  }
+
+  /** Debounced trigger for the repo-config preview (issue #51). Only relevant
+   *  in orchestrator mode; typing settles for 300ms before we hit the backend. */
+  private scheduleRepoConfig(): void {
+    if (this.mode !== "orchestrator") return;
+    if (this.repoConfigTimer !== null) window.clearTimeout(this.repoConfigTimer);
+    this.repoConfigTimer = window.setTimeout(() => void this.refreshRepoConfig(), 300);
+  }
+
+  /** Discover and render what the selected repo would contribute — its
+   *  `.github/agents/*.md` role/persona profiles and `.mcp.json` server names
+   *  — so the human sees it before launching, and before trusting the MCP
+   *  servers. A stale response (repo changed mid-flight) is dropped via `seq`. */
+  private async refreshRepoConfig(): Promise<void> {
+    const repo = this.repoInput.value.trim();
+    const seq = ++this.repoConfigSeq;
+    if (!repo) {
+      this.repoConfigEl.hidden = true;
+      return;
+    }
+    let preview: RepoConfigPreview;
+    try {
+      preview = await discoverRepoConfig(repo);
+    } catch {
+      return; // a non-repo path just yields no preview; not worth surfacing
+    }
+    if (seq !== this.repoConfigSeq) return; // the repo moved on
+    this.renderRepoConfig(preview);
+  }
+
+  private renderRepoConfig(preview: RepoConfigPreview): void {
+    const { profiles, mcp_servers: mcp } = preview;
+    if (profiles.length === 0 && mcp.length === 0) {
+      this.repoConfigEl.hidden = true;
+      return;
+    }
+    this.repoConfigEl.hidden = false;
+    this.repoConfigEl.replaceChildren();
+    if (profiles.length > 0) {
+      const line = document.createElement("div");
+      line.textContent =
+        "Profiles (.github/agents): " +
+        profiles.map((p) => `${p.name} → ${p.role}`).join(", ");
+      this.repoConfigEl.append(line);
+    }
+    if (mcp.length > 0) {
+      const line = document.createElement("div");
+      line.textContent = `MCP servers (.mcp.json, gated by trust): ${mcp.join(", ")}`;
+      this.repoConfigEl.append(line);
     }
   }
 
@@ -641,6 +734,7 @@ export class AgentLauncher {
           orchestratorModel: orch.model,
           plannerModel: planner.model,
           autoOps: this.permsSel.value === "auto",
+          trustRepoMcp: this.trustRepoMcpInput.checked,
           idleKillMinutes: intVal(this.idleKillInput, 0),
           watchdogStallMinutes: intVal(this.watchdogInput, 10),
           maxSpawnsPerHour: intVal(this.spawnRateInput, 0),

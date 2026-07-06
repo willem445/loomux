@@ -589,6 +589,19 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .dlg-label .opt {
   text-transform: none; letter-spacing: 0.2px; font-weight: 400; color: #565c6d;
 }
+/* Repo agent-config preview + trust toggle (issue #51). */
+.dlg-repo-config {
+  display: flex; flex-direction: column; gap: 2px;
+  font-size: 11px; color: var(--text-dim);
+  padding: 4px 6px; border-radius: 4px;
+  background: rgba(255, 255, 255, 0.03);
+}
+.dlg-repo-config[hidden] { display: none; }
+.dlg-check-row {
+  display: flex; align-items: flex-start; gap: 6px;
+  font-size: 11px; color: var(--text-dim); cursor: pointer; line-height: 1.35;
+}
+.dlg-check { margin-top: 2px; flex: none; }
 .dlg-row { display: flex; gap: 6px; }
 .dlg-row > input { flex: 1; min-width: 0; }
 .dlg-row > .dlg-field { flex: 1; min-width: 0; }

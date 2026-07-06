@@ -191,6 +191,7 @@ fn tool_defs(role: Role) -> Vec<Value> {
                     "task": { "type": "string", "description": "Full task brief; empty = idle. With resume_session, this is the follow-up prompt." },
                     "worktree": { "type": "boolean", "description": "Create a dedicated git worktree + branch" },
                     "branch": { "type": "string", "description": "Branch name (default agent/<id>)" },
+                    "profile": { "type": "string", "description": "Custom agent profile from <repo>/.github/agents/<name>.md (GitHub Copilot agents.md convention): sets persona instructions (appended to the built-in role contract), model, and — when the group trusts this repo — extra MCP tools. A profile's own role mapping (kind/role) can retarget the spawn (e.g. a reviewer persona). Unknown names error with the available list. Omit to auto-apply the repo addendum for the chosen role, if any." },
                     "resume_session": { "type": "string", "description": "Session id to resume instead of starting fresh" },
                     "cwd": { "type": "string", "description": "Existing directory to run in (required with resume_session; use the original workspace)" },
                 }),
@@ -325,10 +326,11 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             let name = arg_str(args, "name").unwrap_or("");
             let worktree = args.get("worktree").and_then(Value::as_bool).unwrap_or(false);
             let branch = arg_str(args, "branch").map(str::to_string);
+            let profile = arg_str(args, "profile").map(str::to_string);
             let resume = arg_str(args, "resume_session").map(str::to_string);
             let cwd = arg_str(args, "cwd").map(str::to_string);
             let resumed = resume.is_some();
-            let a = reg.spawn_agent_ex(&caller.group, kind, name, task, worktree, branch, resume, cwd, None)?;
+            let a = reg.spawn_agent_ex(&caller.group, kind, name, task, worktree, branch, profile, resume, cwd, None)?;
             // Copilot mints its session id a few seconds into boot; loomux
             // binds it to the pane once it appears (visible then in
             // list_agents / the task board).

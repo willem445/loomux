@@ -82,6 +82,75 @@ reviewers + planners), CLI + model pinned per role (`{role}_cli` / `{role}_model
 codebase read-only and writes a structured implementation plan as a GitHub issue comment,
 then reports and exits; it never writes code, branches, worktrees, or PRs.
 
+### Repo agent profiles & MCP connectors (#51, prototype)
+
+A repo can carry its own agent personas and tool servers, discovered from the workspace
+and shareable via the repo — no loomux-specific config. This is the GitHub Copilot
+*agents.md* convention as a first-class citizen. (`orchestration/profiles.rs`.)
+
+**Discovery.** `<repo>/.github/agents/*.md` (both `<name>.md` and Copilot's
+`<name>.agent.md` stem). Each file is a YAML-frontmatter + body persona. The parser
+tolerates the real-world Copilot shape: folded `description: >` scalars whose continuation
+lines contain colons, copilot-native keys (`tools`, `agents`, `target`, …) ignored, body
+`---` separators preserved, `.agent` stem stripped. Files without frontmatter or without a
+body are not profiles. Discovery is re-run **per spawn**, so edits apply to the next agent
+without relaunching.
+
+**Mapping onto loomux roles.** loomux has four roles; a profile maps to one by, in
+precedence order: (1) an explicit frontmatter `role:` (or `kind:`), (2) the file base name
+(`worker.md` → worker, `reviewer.agent.md` → reviewer, `orchestrator.md` → orchestrator,
+`planner.md` → planner), (3) otherwise **worker** (a named specialist like `sempkg.agent.md`
+is a worker persona). Optional loomux extensions: `model:` (overrides the role's pinned
+model, sanitized), `allow:` (extra pre-approved tool patterns, sanitized).
+
+**Injection — profiles APPEND, never replace.** The built-in role contract
+(`worker.md`'s report/git-workflow guarantees, etc.) is always the base; a repo profile is
+an *addendum*. Two application paths:
+
+- **Role addendum (automatic).** When an agent of role R spawns, the repo file mapped to R
+  (if any) is applied. This is the "one agent.md per block/role" model — every worker in
+  the repo picks up `.github/agents/worker.md`; an `orchestrator.md` is the human's
+  "always branch + PR, never push to main" secondary prompt.
+- **Named persona (explicit).** `spawn_agent(profile: "<name>")` picks a persona by name;
+  its own `role`/`kind` mapping can retarget the spawn (e.g. a reviewer persona spawns as a
+  reviewer). Unknown names error with the available list.
+
+The rendered brief is written to `<group_dir>/profiles/<agent_id>.md` and the kickoff
+references it, so the persona reaches **both** CLIs as text regardless of CLI. Additionally,
+per CLI: **Claude** gets `--append-system-prompt-file <brief>` (appends to Claude's built-in
+system prompt) and the profile's `allow:` patterns extend the single `--allowedTools` list
+(a second flag would replace the first and silently drop the loomux MCP approval).
+**Copilot** engages the persona via its native `--agent <name>` (which resolves the same
+`.github/agents` file) and `allow:` becomes `--allow-tool` entries.
+
+Precedence overall: **profile file → built-in role template**, with the profile appending.
+(A launcher/group override layer, Option D in the #51 investigation, is future work.)
+
+**MCP connectors — repo `.mcp.json`, trust-gated.** Repo-declared MCP servers are merged
+into a **Claude** agent's per-agent config (`write_mcp_config`'s `extra_servers`), because
+`--strict-mcp-config` (group isolation) suppresses Claude's native `.mcp.json` loading.
+This is gated behind a per-group **`trust_repo_mcp`** toggle (default **off**): an
+`.mcp.json` `stdio` entry is an arbitrary `command` loomux would launch — local code
+execution, with no per-call human approval under `auto_ops`. So repo MCP servers merge
+**only** when the human has explicitly trusted the repo. The reserved `loomux` identity
+entry can never be shadowed by a repo server of the same name (stripped in both
+`repo_mcp_servers` and `write_mcp_config`). A malformed `.mcp.json` is audited and skipped,
+never blocking a spawn. The launcher previews the discovered profiles + MCP server names
+(`orch_discover_repo_config`) so the human sees what a repo contributes *before* launching.
+
+**Cross-CLI parity & honest gaps.** The Copilot custom-agent model maps natively (persona
+via `--agent`, per-agent `mcp-servers` declared inside the agent file); Claude is emulated
+(system-prompt injection + MCP merge). Because Copilot's `--agent` also pulls the agent
+file's `mcp-servers` (code exec), loomux only passes `--agent` when the repo is **trusted**
+— untrusted, a Copilot persona still reaches the agent as the kickoff-referenced brief
+text, just without the native engagement. Copilot's CLI does **not** consume a repo-level
+`.mcp.json` the way Claude does (its MCP lives in `~/.copilot/mcp-config.json` +
+per-agent `mcp-servers` frontmatter), so the `.mcp.json` merge is Claude-only by design;
+this asymmetry is inherent to the two CLIs, not a loomux limitation. Prototype grade:
+instructions/MCP injection + the trust gate are wired and unit-tested; a launcher-authored
+per-role override layer and a workflow-builder GUI (issue-comment idea) are tracked
+separately.
+
 ### Pane naming & rename precedence (#95r)
 
 A pane's name should say what the agent is *doing*; failing that, it must at least agree
@@ -116,7 +185,12 @@ with the pane's `W <seq>` badge (issue #75), never disagree with it. Two rules:
   orchestrator pane (badged `ORCH`) plus N idle workers (badged `W`), all sharing a
   group color shown as a header dot + pane accent. Reviewers get `REV`, planners `PLAN`.
   Changing a role's CLI re-populates its model suggestions; every distinct role CLI is
-  PATH-checked before launch so a missing CLI fails fast and legibly.
+  PATH-checked before launch so a missing CLI fails fast and legibly. A **repo agent
+  config** field (issue #51) previews the selected repo's discovered `.github/agents/*.md`
+  profiles (`name → role`) and `.mcp.json` server names, with a default-off **"trust this
+  repo's agent config"** toggle that gates the repo-MCP merge / native Copilot persona (the
+  code-exec surface). The preview refreshes as the repo path changes; the toggle resets to
+  off every time the dialog opens.
 
 ## Persistence & resume
 
