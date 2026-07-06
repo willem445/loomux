@@ -480,12 +480,23 @@ an empty box and holds/aborts rather than merge-submitting.
   attention routing, and the stranded-flush guard all rely on it); `input_pending` is a separate,
   additive flag written under the same `ptys` lock so the pair can't tear.
 - **Residual, and the #112 boundary.** Occupancy is inferred from keystrokes, not read from the
-  box, so two narrow cases still need true box-occupancy detection (issue #112): an editor mode
-  where Enter inserts a *soft* newline instead of submitting (a bare `\r` we'd read as a submit),
-  and a backspace that empties the box without a clear key (leaves `input_pending` true until the
-  bounded hold aborts). The guard errs toward the safe hold in the common case; this is the
-  paste-path guard only — the confirm-window semantics (`submit_confirmed` and false-confirm
-  handling) are #112, deliberately untouched here.
+  box, so some cases still need true box-occupancy detection (issue #112). Splitting them by
+  direction:
+  - *False-negative (correctness — the dangerous direction), all fenced to #112:* an editor mode
+    where Enter inserts a *soft* newline instead of submitting (a bare `\r` we'd read as a
+    submit). Bracketed pastes are **not** in this set — a write carrying the `ESC[200~`/`ESC[201~`
+    markers is classified `Content` regardless of any interior/trailing newline, so a pasted line
+    ending in `\n` is not misread as submitted.
+  - *False-positive (availability only — a stuck `input_pending`), each bounded by the 60s
+    hold → abort → one held-notice → orchestrator re-send, and cleared by the human's next
+    Enter/Ctrl-U/Ctrl-C:* **any** box-clear that isn't a trailing newline / Ctrl-U / Ctrl-C —
+    Esc-to-clear (common in Claude Code), Ctrl-W (delete word), Ctrl-K (kill to end), and
+    backspace-to-empty. These resolve to `Neutral` (they add no visible text), so a box the human
+    emptied that way still reads as pending until the bounded abort.
+
+  The guard errs toward the safe hold in the common case; this is the paste-path guard only — the
+  confirm-window semantics (`submit_confirmed` and false-confirm handling) are #112, deliberately
+  untouched here.
 
 ## Attention routing (#6) & interactive-question detection (#40)
 

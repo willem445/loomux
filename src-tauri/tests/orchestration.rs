@@ -694,11 +694,20 @@ fn classify_human_input_reads_box_occupancy_from_keystroke_content() {
     assert_eq!(classify_human_input("\u{1b}[A"), HumanInput::Neutral); // up arrow
     assert_eq!(classify_human_input("\u{7f}"), HumanInput::Neutral); // backspace/DEL
     assert_eq!(classify_human_input(""), HumanInput::Neutral);
-    // A bracketed paste of text is Content — its ESC[200~ / ESC[201~ markers and
-    // their printable finals (`~`, digits) are skipped, the payload is not.
+    // A bracketed paste is text sitting UNSUBMITTED in the box → Content.
     assert_eq!(classify_human_input("\u{1b}[200~hello\u{1b}[201~"), HumanInput::Content);
-    // A bracketed paste of only control noise adds nothing visible → Neutral.
-    assert_eq!(classify_human_input("\u{1b}[200~\u{1b}[201~"), HumanInput::Neutral);
+    // The finding-#1 shape: a paste ENDING IN A NEWLINE. The pasted newline is
+    // literal under bracketed-paste mode (the CLI holds it unsubmitted), so the
+    // marker — checked before the trailing-newline rule — must keep this Content,
+    // NOT Submit. Reading it as submitted would let the next delivery merge-submit
+    // the human's paste (the exact #111 loss).
+    assert_eq!(classify_human_input("\u{1b}[200~foo\n\u{1b}[201~"), HumanInput::Content);
+    assert_eq!(classify_human_input("\u{1b}[200~foo\r\n\u{1b}[201~"), HumanInput::Content);
+    // A multi-line paste (interior newlines) is likewise held unsubmitted → Content.
+    assert_eq!(classify_human_input("\u{1b}[200~a\nb\nc\u{1b}[201~"), HumanInput::Content);
+    // Even an empty bracketed paste carries the markers → Content (pending, the
+    // safe-hold direction), never a spurious Submit.
+    assert_eq!(classify_human_input("\u{1b}[200~\u{1b}[201~"), HumanInput::Content);
 }
 
 #[test]
@@ -4186,20 +4195,39 @@ fn paste_hold_releases_once_the_human_submits() {
 }
 
 #[test]
-fn paste_hold_never_false_clears_from_ambient_output_while_a_line_sits() {
-    // Finding #1 (adversarial ordering): the guard used to read a pane's output
-    // growth as "the human submitted", so a keystroke's redraw or the agent's own
-    // mid-turn streaming could clear the guard and let a paste merge-submit a
-    // still-sitting line. Occupancy is now a keystroke-content flag, wholly
-    // independent of output — so however much the pane streams, a line that is
-    // still pending holds the delivery to the cap and aborts. (`pending` here
-    // stays true no matter what the pane "prints".)
-    let cap = Duration::from_millis(40);
-    let out = hold_for_human_input(|| true, cap, HB_POLL);
-    assert!(
-        matches!(out, PasteDecision::Abort { .. }),
-        "ambient output must not clear a sitting human line: {out:?}",
-    );
+fn output_growth_never_flips_input_pending() {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    // Finding #1's real property, tested end-to-end rather than tautologically:
+    // occupancy responds ONLY to keystroke content — output arriving never clears
+    // a sitting line. `feed` mirrors write_pty's exact flag update (pty.rs); the
+    // `output` counter models the output pump, which — like the real pump — has no
+    // reference to the flag. We interleave large output growth with keystrokes and
+    // assert the flag tracks the keystrokes alone.
+    let pending = AtomicBool::new(false);
+    let output = AtomicU64::new(0);
+    let feed = |data: &str| match classify_human_input(data) {
+        HumanInput::Content => pending.store(true, Ordering::Relaxed),
+        HumanInput::Submit => pending.store(false, Ordering::Relaxed),
+        HumanInput::Neutral => {}
+    };
+
+    // Human types a line → pending.
+    feed("dfgdsfg");
+    assert!(pending.load(Ordering::Relaxed));
+    // The pane streams a massive burst of output (agent mid-turn, keystroke
+    // redraws — the old ≥24-byte false-clear source). It cannot touch the flag.
+    output.fetch_add(1_000_000, Ordering::Relaxed);
+    assert!(pending.load(Ordering::Relaxed), "output growth must not clear a sitting line");
+    // The delivery guard, reading only the flag, holds to the cap and aborts —
+    // never merge-submitting the still-sitting line, whatever the pane printed.
+    let out = hold_for_human_input(|| pending.load(Ordering::Relaxed), Duration::from_millis(40), HB_POLL);
+    assert!(matches!(out, PasteDecision::Abort { .. }), "sitting line must not paste: {out:?}");
+    // Only an Enter clears it; more output in between changes nothing.
+    output.fetch_add(1_000_000, Ordering::Relaxed);
+    feed("\r");
+    assert!(!pending.load(Ordering::Relaxed), "only a submit keystroke clears the flag");
+    let out2 = hold_for_human_input(|| pending.load(Ordering::Relaxed), Duration::from_secs(60), HB_POLL);
+    assert_eq!(out2, PasteDecision::Paste { held_ms: 0 });
 }
 
 #[test]

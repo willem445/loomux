@@ -1651,20 +1651,31 @@ pub enum HumanInput {
 /// rule is testable; `write_pty` calls it to maintain the per-pane
 /// `input_pending` flag.
 ///
-/// - A carriage return / newline submits the current line, UNLESS printable text
-///   follows the last newline (then that trailing text is a fresh unsubmitted
-///   line → `Content`).
+/// - A write carrying **bracketed-paste markers** (`ESC[200~` / `ESC[201~`) is
+///   pasted text held UNSUBMITTED in the box → `Content`, even if it ends in a
+///   newline: under bracketed-paste mode (Claude Code and most modern TUIs) a
+///   pasted newline is literal, not a submit — the human's separate Enter
+///   afterwards is the submit. Checked first so an interior/trailing newline
+///   can't misread the paste as submitted (the #111 loss otherwise).
+/// - Otherwise a carriage return / newline submits the current line, UNLESS
+///   printable text follows the last newline (then that trailing text is a fresh
+///   unsubmitted line → `Content`).
 /// - Ctrl-U (kill-line) / Ctrl-C (interrupt) empty the box → `Submit`.
 /// - Any remaining printable/graphic character (after skipping escape sequences)
 ///   → `Content`.
 /// - Otherwise (arrows, backspace, lone escape sequences) → `Neutral`.
 ///
 /// Erring toward `Content`/`Neutral` on ambiguous input keeps the guard biased
-/// to the safe hold: a real sitting line is never misread as empty. The residual
-/// gap — an editor where Enter inserts a soft newline instead of submitting, or a
-/// backspace that empties the box without a clear key — needs true box-occupancy
-/// detection, which is issue #112.
+/// to the safe hold: a real sitting line is never misread as empty. Residual
+/// clears that leave the flag stuck (bounded by the 60s abort) — Esc-to-clear,
+/// Ctrl-W/Ctrl-K, backspace-to-empty, and soft-newline editors — need true
+/// box-occupancy detection, which is issue #112.
 pub fn classify_human_input(data: &str) -> HumanInput {
+    // Bracketed paste: the text lands in the box unsubmitted regardless of any
+    // newline it contains, so never read it as a submit.
+    if data.contains(BRACKETED_PASTE_START) || data.contains(BRACKETED_PASTE_END) {
+        return HumanInput::Content;
+    }
     if let Some(pos) = data.rfind(['\r', '\n']) {
         // `\r`/`\n` are single-byte, so `pos + 1` is a valid char boundary.
         let after = &data[pos + 1..];
@@ -1682,6 +1693,11 @@ pub fn classify_human_input(data: &str) -> HumanInput {
         HumanInput::Neutral
     }
 }
+
+/// xterm bracketed-paste bracket sequences: the terminal wraps pasted text in
+/// these so an app can tell a paste from typing (and hold pasted newlines soft).
+const BRACKETED_PASTE_START: &str = "\u{1b}[200~";
+const BRACKETED_PASTE_END: &str = "\u{1b}[201~";
 
 /// Whether `s` contains a graphic character once terminal escape sequences are
 /// skipped — the test for "this write put visible text in the box". Skips CSI
