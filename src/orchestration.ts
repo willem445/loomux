@@ -9,10 +9,12 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { Grid } from "./grid";
-import type { PaneEvents, PaneBadge } from "./pane";
+import type { PaneEvents } from "./pane";
 import { panesInGroup } from "./group";
+import { badgeFor, type OrchRole } from "./orchbadge";
 
-export type OrchRole = "orchestrator" | "worker" | "reviewer" | "planner";
+export type { OrchRole };
+export { badgeFor, metaForGroup } from "./orchbadge";
 
 /** Backend request to open (or spec to open) an agent pane. */
 export interface OrchSpawnRequest {
@@ -53,44 +55,6 @@ export interface OrchestratorConfig {
   /** Recovery guardrail: nudge the orchestrator when a working agent goes
    *  silent (no output, no report) this many minutes (0 = disabled). */
   watchdogStallMinutes: number;
-}
-
-// Per-group identity: a stable accent color AND a short ordinal tag shown in
-// every badge, so with several orchestrations open you can pair each worker
-// to its orchestrator at a glance ("ORCH 2" ↔ "W 2") without relying on
-// color perception alone. Groups are few; palette wrap collisions are fine
-// because the tag still disambiguates.
-const GROUP_COLORS = ["#7aa2f7", "#9ece6a", "#e0af68", "#bb9af7", "#7dcfff", "#f7768e"];
-interface GroupMeta {
-  color: string;
-  tag: number;
-}
-const groupMeta = new Map<string, GroupMeta>();
-
-export function metaForGroup(groupId: string): GroupMeta {
-  let m = groupMeta.get(groupId);
-  if (!m) {
-    const tag = groupMeta.size + 1;
-    m = { tag, color: GROUP_COLORS[(tag - 1) % GROUP_COLORS.length] };
-    groupMeta.set(groupId, m);
-  }
-  return m;
-}
-
-const ROLE_LABELS: Record<OrchRole, string> = {
-  orchestrator: "ORCH",
-  worker: "W",
-  reviewer: "REV",
-  planner: "PLAN",
-};
-
-export function badgeFor(req: OrchSpawnRequest): PaneBadge {
-  const meta = metaForGroup(req.group_id);
-  return {
-    label: `${ROLE_LABELS[req.role] ?? "AGENT"} ${meta.tag}`,
-    color: meta.color,
-    title: `${req.role} · ${req.agent_id} · group ${req.group_id}`,
-  };
 }
 
 /** One pane that needs the human, from the backend attention scan. `reason`

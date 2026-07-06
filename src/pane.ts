@@ -28,6 +28,7 @@ import { createOrderedWriter } from "./ptywrite";
 import { showToast } from "./toast";
 import { isAppShortcut } from "./shortcuts";
 import { attentionPresentation } from "./attention";
+import { makeRenameCommit } from "./panerename";
 import { openInEditor, editorConfigDialog } from "./editor";
 import { GitView } from "./gitview";
 import { TasksView } from "./tasksview";
@@ -965,12 +966,22 @@ export class Pane {
     this.titleEl.replaceWith(input);
     input.focus();
     input.select();
-    const commit = (save: boolean) => {
-      if (save && input.value.trim()) this.name = input.value.trim();
-      input.replaceWith(this.titleEl);
-      this.titleEl.textContent = this.name;
-      this.focus();
-    };
+    // Enter/Escape commit AND blur commits; the first commit detaches the
+    // focused input, which itself fires blur → a second commit. makeRenameCommit
+    // is idempotent so that redundant call is a no-op (and Escape wins over the
+    // trailing blur-save) — otherwise replaceWith runs on a detached node and
+    // throws NotFoundError into the app-wide error banner (#75, twin of #77).
+    const commit = makeRenameCommit({
+      value: () => input.value,
+      save: (name) => {
+        this.name = name;
+      },
+      restore: () => {
+        input.replaceWith(this.titleEl);
+        this.titleEl.textContent = this.name;
+        this.focus();
+      },
+    });
     input.addEventListener("keydown", (e) => {
       e.stopPropagation();
       if (e.key === "Enter") commit(true);
