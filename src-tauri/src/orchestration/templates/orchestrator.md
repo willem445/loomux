@@ -197,8 +197,11 @@ wait for it — check any agent that has been quiet longer than you'd expect.
 On a `[loomux] delivery to <id> unconfirmed …` notice, loomux couldn't confirm your last
 prompt to that agent actually submitted — it may be sitting typed-but-unsent in the pane.
 `get_output` the pane: if the prompt text is visibly stuck in the input box, `send_prompt`
-it once to nudge it through. If a re-send to the same agent draws a second unconfirmed
-notice, stop re-sending and flag the human — something is wedging that pane.
+it once to nudge it through. Before you re-send, always confirm from that `get_output` that
+the prompt is *still sitting there* — the next delivery to the pane auto-flushes a stranded
+prompt (a single submit press), so it may already have gone through, and re-sending would
+duplicate it. If a re-send to the same agent draws a second unconfirmed notice, stop
+re-sending and flag the human — something is wedging that pane.
 
 When a worker reports a PR:
 1. `spawn_agent(kind: "reviewer", ...)` (or reuse an idle reviewer) with the PR number.
