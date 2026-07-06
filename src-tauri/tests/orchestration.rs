@@ -518,6 +518,31 @@ fn copilot_command_uses_copilot_adapter_flags() {
 }
 
 #[test]
+fn copilot_planner_runs_unattended_regardless_of_auto_ops() {
+    // Mirror of the claude fix on the copilot adapter: a planner has no human
+    // in its pane, so a NON-auto_ops copilot planner must still take copilot's
+    // unattended (autopilot) preset — the conservative interactive preset
+    // would stall it on approvals no one can give. Deny rules keep it
+    // read-only (deny wins over --allow-all-tools in Copilot).
+    let (reg, _d) = test_registry();
+    let cfg = Path::new("C:/x/cfg.json");
+    let gdir = Path::new("C:/data/group");
+    // auto_ops = FALSE, read_only = TRUE (a planner in a manual-ops group).
+    let plan = reg.build_agent_command("copilot", "auto", false, cfg, gdir, Path::new("C:/repo"), None, false, true);
+    assert!(plan.contains("--autopilot") && plan.contains("--allow-all-tools") && plan.contains("--allow-all-paths"),
+        "a non-auto_ops copilot planner must run unattended (autopilot), else it deadlocks: {plan}");
+    assert!(plan.contains("--deny-tool \"write\"") && plan.contains("--deny-tool \"shell(git commit)\""),
+        "writes/commit stay denied — the autopilot preset doesn't loosen the read-only contract");
+    assert!(!plan.contains("--deny-tool \"shell(gh"),
+        "gh stays allowed so the copilot planner can post its plan comment unattended");
+    // A non-auto_ops copilot WORKER (read_only=false) is unchanged: it keeps
+    // the conservative interactive preset, not autopilot.
+    let worker = reg.build_agent_command("copilot", "auto", false, cfg, gdir, Path::new("C:/repo"), None, false, false);
+    assert!(!worker.contains("--autopilot") && !worker.contains("--allow-all-tools"),
+        "a non-auto_ops copilot worker stays interactive — only planners run unattended");
+}
+
+#[test]
 fn copilot_mcp_config_includes_tools_allowlist() {
     let (reg, _d) = test_registry();
     let mut rails = rails();

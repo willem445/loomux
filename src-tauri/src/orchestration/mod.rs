@@ -3076,6 +3076,15 @@ impl OrchRegistry {
         resume: bool,
         read_only: bool,
     ) -> String {
+        // A planner never mutates and has no human in its pane, so there is
+        // nothing for `auto_ops` to gate: it must explore, post its plan
+        // comment, and report with zero prompts, or it would stall waiting on
+        // an approval no one is there to give. So a planner (`read_only`)
+        // always runs unattended on BOTH CLIs; workers/reviewers follow the
+        // group's `auto_ops`. (This is also why claude's `plan` permission
+        // mode / copilot's `--plan` can't be used here — both hold the plan
+        // for interactive human sign-off.)
+        let unattended = auto_ops || read_only;
         match cli {
             "copilot" => {
                 // Copilot has `--resume <id>` but no way to pre-assign an
@@ -3099,9 +3108,13 @@ impl OrchRegistry {
                     group_dir.display(),
                     workdir.display()
                 );
-                if auto_ops {
+                if unattended {
                     // Copilot's own unattended mode: autopilot + all tools
-                    // + no path-verification prompts.
+                    // + no path-verification prompts. A planner (read_only)
+                    // always takes this path even in a non-auto_ops group —
+                    // interactive mode would stall it on a human that isn't
+                    // there; the deny rules below keep it read-only, and deny
+                    // takes precedence over --allow-all-tools in Copilot.
                     cmd.push_str(" --autopilot --allow-all-tools --allow-all-paths");
                 } else {
                     cmd.push_str(" --allow-tool \"shell(git:*)\" --allow-tool \"shell(gh:*)\"");
@@ -3128,18 +3141,10 @@ impl OrchRegistry {
                     (Some(s), false) => format!("--session-id {s} "),
                     (None, _) => String::new(),
                 };
-                // A planner never mutates and has no human in its pane, so
-                // there is nothing for `auto_ops` to gate: it must explore,
-                // post its plan comment, and report with zero prompts, or it
-                // would deadlock waiting on an approval no one is there to
-                // give (claude's `plan` permission mode fails here for the
-                // same reason — it holds every side-effecting call, incl. the
-                // MCP report and `gh issue comment`, until an interactive
-                // approval). So a planner (`read_only`) always runs unattended;
-                // workers/reviewers follow the group's `auto_ops` setting.
-                let unattended = auto_ops || read_only;
                 // "Auto" preset = Claude Code's native auto permission mode
                 // (what the human uses interactively); otherwise acceptEdits.
+                // A planner (`read_only`) is always `unattended` (see above),
+                // so it runs under Auto perms even in a non-auto_ops group.
                 let perm = if unattended { "auto" } else { "acceptEdits" };
                 let mut cmd = format!(
                     "claude {session_flag}--mcp-config \"{}\" --strict-mcp-config --model {model} \
@@ -3162,12 +3167,16 @@ impl OrchRegistry {
                     // planner can't write code or commit/push. `gh` (incl.
                     // `gh issue comment`) stays reachable for the plan comment.
                     //
-                    // Spelling matters: `:*` is a valid wildcard ONLY as a
-                    // trailing suffix. A colon mid-pattern (`Bash(git commit:*)`)
-                    // is malformed — Claude Code ignores the rule AND prints a
-                    // startup warning, which is the "auto deny rule" flash a
-                    // human caught on planner boot. The space form
-                    // `Bash(git commit *)` is the canonical, warning-free rule.
+                    // Spelling matters. `:*` is a valid wildcard only as a
+                    // TRAILING suffix (`Bash(gh:*)` is fine); a colon in the
+                    // MIDDLE of the command (`Bash(git commit:*)`) is not —
+                    // Claude Code discards that rule as malformed AND prints a
+                    // startup warning, the "auto deny rule" flash a human
+                    // caught on planner boot. So the enforcing denial rests on
+                    // the space form `Bash(git commit *)`: it is the canonical
+                    // spelling and actually blocks commit/push, with no
+                    // warning. (An earlier draft passed both spellings; the
+                    // colon-mid one added nothing but the warning.)
                     cmd.push_str(
                         " --disallowedTools Edit Write MultiEdit NotebookEdit \
                          \"Bash(git commit *)\" \"Bash(git push *)\"",

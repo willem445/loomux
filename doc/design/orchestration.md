@@ -548,34 +548,40 @@ Two related additions: a **planner** role, and **per-role** agent CLI + model.
     documented non-interactive / auto-approve** path. Our planner pane has **no human** —
     so it would sit forever at the approval prompt. Worse, the two things the planner exists
     to *emit* — the loomux **MCP `report`** and the **`gh issue comment`** plan — are exactly
-    the side-effecting calls plan mode holds back until approval (in plan mode "permission
+    the calls plan mode stops to prompt on before running them: in plan mode "permission
     prompts still apply as they do in Manual mode", and a mutating shell like `gh issue
-    comment` is not a read). So plan mode does not just add a prompt; it blocks the
-    deliverable. **Copilot's `--plan` / `--mode plan` is the same shape** (an initial mode a
-    human reviews before switching to interactive/autopilot), so switching CLIs doesn't buy
-    a headless plan mode either.
+    comment` is not a read, so each raises a **real-time approval prompt** — which, in a
+    human-less pane, is simply never answered. So plan mode does not just add a prompt; it
+    blocks the deliverable. **Copilot's `--plan` / `--mode plan` is the same shape** (an
+    initial mode a human reviews before switching to interactive/autopilot), so switching
+    CLIs doesn't buy a headless plan mode either.
   - **So the planner keeps Auto + structural deny rules** — which is the *autonomous*
     equivalent of plan mode's intent: read-only research, but free to emit its plan and
     report and then exit without waiting on anyone. To make that hold with **no human in the
     pane**, a `read_only` planner is now launched **unattended regardless of the group's
-    `auto_ops`** (`unattended = auto_ops || read_only` in `build_agent_command`): Auto perms
-    + a pre-approved `Bash(git *)` / `Bash(gh *)` allowlist so exploration, `gh issue view`,
-    and the `gh issue comment` plan never prompt, with `Edit/Write/MultiEdit/NotebookEdit`
-    and `git commit`/`git push` denied. Previously a planner in a **non-auto_ops** group got
-    `acceptEdits` and *no* git/gh allowlist, so its very first `gh` call would have prompted
-    into the void — a latent deadlock this fixes. Workers/reviewers are untouched: without
-    `auto_ops` they still gate ops through `acceptEdits`.
+    `auto_ops`** (`unattended = auto_ops || read_only` in `build_agent_command`, applied to
+    **both** CLIs): on Claude, Auto perms + a pre-approved `Bash(git *)` / `Bash(gh *)`
+    allowlist; on Copilot, `--autopilot --allow-all-tools --allow-all-paths` — so
+    exploration, `gh issue view`, and the `gh issue comment` plan never prompt, with edits +
+    `git commit`/`git push` denied on both (deny takes precedence over Auto / `--allow-all-tools`).
+    Previously a planner in a **non-auto_ops** group got the interactive preset (`acceptEdits`
+    with no git/gh allowlist on Claude; plain interactive mode with no autopilot on Copilot),
+    so its very first `gh`/explore call would have prompted into the void — a latent deadlock
+    this fixes **on both CLIs**. Workers/reviewers are untouched: without `auto_ops` they
+    still gate ops through the interactive preset.
   - **The flash itself was ours, not alarming.** It was Claude Code's own startup warning
-    for a **malformed** deny rule: we passed both `Bash(git commit:*)` (colon mid-pattern)
-    and `Bash(git commit *)`, on the mistaken belief that an unmatched spelling is silently
-    inert. It isn't — `:*` is a valid wildcard only as a *trailing* suffix, so the colon-mid
-    form is malformed; Claude Code ignores it **and warns at startup**. Dropping the colon-mid
-    spellings (keeping the canonical space form, which still enforces) removes the warning at
-    its source rather than papering over it. **Direct answers to the human's two questions:**
+    for a **malformed** deny rule: we passed both `Bash(git commit:*)` and `Bash(git commit *)`,
+    on the mistaken belief that an unmatched spelling is silently inert. It isn't — `:*` is a
+    valid wildcard only as a *trailing* suffix (`Bash(gh:*)` is fine); a colon in the *middle*
+    of the command is not, so `Bash(git commit:*)` is discarded as malformed and warns at
+    startup. The enforcing denial rests on the **space form** `Bash(git commit *)`, which is
+    the canonical spelling and actually blocks commit/push; dropping the redundant colon-mid
+    spelling removes the warning at its source (it never contributed to enforcement) rather
+    than papering over it. **Direct answers to the human's two questions:**
     (a) No — the planner should *not* use plan mode; it would deadlock a human-less pane and
     block the plan/report. (b) In plan mode it could *not* reliably use the loomux MCP or post
-    via `gh` unattended (both are deferred to approval), which is the second reason we keep
-    Auto + deny.
+    via `gh` unattended — each raises a real-time approval prompt no one is there to answer —
+    which is the second reason we keep Auto + deny.
 
 - **Per-role CLI + model.** `Guardrails` gains a per-role CLI (`orchestrator_cli`,
   `worker_cli`, `reviewer_cli`, `planner_cli`) and `planner_model`, alongside the existing
