@@ -407,6 +407,33 @@ to actually do) with the orchestrator.
   outside the working-agent filter by construction, so a terminated pane is never flagged. The
   orchestrator is never watchdogged (it is the recipient).
 
+## Delivery feedback loop (#103)
+
+The watchdog catches an agent that goes wholly silent; this closes the tighter loop where a
+single prompt *lands in the box but never submits* and the orchestrator, having gotten an
+immediate-success `send_prompt` result (delivery is async), carries on none the wiser. It
+rides #99's per-delivery `submit_confirmed` signal (the pane going quiet then bursting as the
+box clears) rather than making the orchestrator poll terminals by hand.
+
+- **The trigger.** When a delivery thread finishes with `confirmed == false`, it calls
+  `notify_unconfirmed_delivery` off the outcome it recorded. The gate is the pure
+  `should_notify_unconfirmed(target_is_orchestrator, confirmed)`: notify only for an
+  unconfirmed delivery to a **non-orchestrator** agent.
+- **The action.** One audited (`delivery-unconfirmed-notice`) `[loomux]` notice
+  (`unconfirmed_delivery_notice`) to the orchestrator (`deliver_to_orchestrator`, actor
+  `loomux`) naming the agent and pointing at the recovery move — `get_output` the pane,
+  re-send if the prompt is stuck. Advice, not an action: loomux never re-types into the pane.
+- **No loops.** A notice about a delivery *to the orchestrator* would itself be a delivery to
+  the orchestrator — endless. So orchestrator-target deliveries never notify; they get #99's
+  stranded-text flush on the next delivery instead.
+- **One notice per delivery.** The emission sits past the submit retries, at the single tail
+  of the delivery thread, so retries never multiply it — the analogue of the watchdog's
+  once-per-stall latch, but scoped to the one delivery rather than a re-arming clock.
+- **Interactions.** A **paused** group is skipped wholesale (same reasoning as the watchdog:
+  delivery is suppressed there anyway, so we don't spend the notice). The template's
+  Silent-agent recovery adds the human-facing half: on a repeat unconfirmed notice for the
+  same agent, stop re-sending and flag the human.
+
 ## Attention routing (#6) & interactive-question detection (#40)
 
 The human is the scheduler's bottleneck; attention routing surfaces *which* pane needs

@@ -1618,6 +1618,30 @@ pub fn should_flush_before_paste(prev_confirmed: Option<bool>, human_typed_since
     matches!(prev_confirmed, Some(false)) && !human_typed_since
 }
 
+/// Whether an unconfirmed delivery should raise a one-shot notice to the group's
+/// orchestrator so it can close the loop (#103). Fires only for a delivery to a
+/// NON-orchestrator agent whose submit went unconfirmed: the prompt may be
+/// sitting unsubmitted in the pane while the orchestrator, believing it landed,
+/// is none the wiser. Suppressed when the target IS the orchestrator — a notice
+/// about a delivery to the orchestrator would itself be a delivery to the
+/// orchestrator, an endless loop; those rely on #99's stranded-text flush on the
+/// next delivery instead. Suppressed when confirmed: the prompt landed, nothing
+/// to chase. Pure so the gate is testable; emission (exactly once per delivery,
+/// past the submit retries) lives in `deliver_prompt`'s delivery thread.
+pub fn should_notify_unconfirmed(target_is_orchestrator: bool, confirmed: bool) -> bool {
+    !target_is_orchestrator && !confirmed
+}
+
+/// The one-shot notice delivered to the orchestrator for an unconfirmed delivery
+/// to `agent_id` (#103). Points it at the recovery move: read the pane back and
+/// re-send if the prompt is stuck.
+pub fn unconfirmed_delivery_notice(agent_id: &str) -> String {
+    format!(
+        "[loomux] delivery to {agent_id} unconfirmed — the prompt may be sitting \
+         unsubmitted in its pane; get_output it and re-send if needed"
+    )
+}
+
 impl OrchRegistry {
     pub fn new(root: PathBuf) -> Self {
         let _ = fs::create_dir_all(&root);
@@ -4301,6 +4325,12 @@ impl OrchRegistry {
             .clone();
         let (root, group, agent) = (self.root.clone(), a.group.clone(), a.id.clone());
         let last_delivery = self.last_delivery.clone();
+        // Captured for the unconfirmed-delivery notice (#103): whether this
+        // target is the orchestrator (a notice to it would loop, so it's
+        // suppressed) and an owned registry handle so the detached thread can
+        // deliver the notice once it knows the submit outcome.
+        let target_is_orchestrator = a.role == Role::Orchestrator;
+        let reg = self.arc();
         std::thread::spawn(move || {
             let _guard = lock.lock_safe();
             let ptys = app.state::<crate::pty::PtyManager>();
@@ -4519,6 +4549,13 @@ impl OrchRegistry {
                     start.elapsed().as_millis() as u64
                 ),
             );
+            // Close the loop (#103): an unconfirmed delivery to a worker/reviewer
+            // may be stranded in its input box — nudge the orchestrator once so it
+            // can read the pane back and re-send. Exactly one notice per delivery:
+            // this is the single emission point, past all the submit retries.
+            if let Some(reg) = reg {
+                reg.notify_unconfirmed_delivery(&group, &agent, target_is_orchestrator, confirmed);
+            }
         });
         Ok(())
     }
@@ -4539,6 +4576,31 @@ impl OrchRegistry {
             return Err("group is paused — resume it before steering".into());
         }
         self.deliver_to_orchestrator(group, text, "human")
+    }
+
+    /// Close the delivery feedback loop (#103): when a delivery to a
+    /// non-orchestrator agent finishes with its submit unconfirmed, tell the
+    /// group's orchestrator once so it can `get_output` the pane and re-send if
+    /// the prompt is stranded unsubmitted. No-op for orchestrator-target or
+    /// confirmed deliveries (`should_notify_unconfirmed`), and — like the
+    /// watchdog nudge — a paused group is skipped entirely: delivery is
+    /// suppressed there anyway, so we must not spend the notice budget while
+    /// paused. Best-effort (a dead orchestrator just drops it) and audited. The
+    /// notice is itself a delivery TO the orchestrator, so it can never trigger a
+    /// notice of its own — no loops.
+    #[doc(hidden)] // pub for integration tests
+    pub fn notify_unconfirmed_delivery(
+        &self,
+        group: &str,
+        agent_id: &str,
+        target_is_orchestrator: bool,
+        confirmed: bool,
+    ) {
+        if !should_notify_unconfirmed(target_is_orchestrator, confirmed) || self.is_paused(group) {
+            return;
+        }
+        self.audit(group, "loomux", "delivery-unconfirmed-notice", json!({ "to": agent_id }));
+        let _ = self.deliver_to_orchestrator(group, &unconfirmed_delivery_notice(agent_id), "loomux");
     }
 
     /// Deliver to the group's orchestrator (worker reports, exit notices).
