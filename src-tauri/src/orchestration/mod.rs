@@ -295,7 +295,7 @@ pub enum AgentStatus {
 /// `Default`. So the human's manual rename is never clobbered by the
 /// orchestrator's `rename_agent` or the id-derived default, while the
 /// orchestrator can still relabel an id-default (or its own earlier name).
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum NameSource {
     /// Minted from the agent id at spawn ("worker 2" for `w-2`).
@@ -304,6 +304,17 @@ pub enum NameSource {
     Orchestrator,
     /// Typed by the human into the pane title (F2 / double-click).
     Human,
+}
+
+impl Default for NameSource {
+    /// Legacy roster rows (written before the tier was persisted, #95r) carry a
+    /// name but no source. Treat them as orchestrator-chosen: their non-empty
+    /// name was picked deliberately, so a later `rename_agent` may still relabel
+    /// it, and it never sits *below* an id-default. (Pre-95r human renames were
+    /// frontend-only and never reached the roster, so none are being demoted.)
+    fn default() -> Self {
+        NameSource::Orchestrator
+    }
 }
 
 impl NameSource {
@@ -792,6 +803,11 @@ pub struct AgentRecord {
     pub id: String,
     pub role: String,
     pub name: String,
+    /// Precedence tier of `name` (#95r). Persisted so a session rejoin restores
+    /// the human's rename AND its "human beats orchestrator" tier, not just the
+    /// text. Additive: legacy rows without it deserialize to `Default::default`.
+    #[serde(default)]
+    pub name_source: NameSource,
     pub session: Option<String>,
     pub cwd: String,
     pub status: String,
@@ -1055,6 +1071,15 @@ fn sanitize_session(s: &str) -> Option<String> {
     let t = s.trim();
     (!t.is_empty() && t.len() <= 64 && t.chars().all(|c| c.is_ascii_hexdigit() || c == '-'))
         .then(|| t.to_string())
+}
+
+/// Normalize a caller-supplied pane name (#95r): trim, drop control characters
+/// (so a pasted name can't smuggle newlines/escape codes into the pane title or
+/// the roster JSON), and cap the length. Not a security boundary — the title is
+/// rendered via `textContent`, never HTML — just hygiene. May return empty (an
+/// all-control/whitespace name); callers decide what an empty result means.
+fn sanitize_agent_name(name: &str) -> String {
+    name.trim().chars().filter(|c| !c.is_control()).take(40).collect()
 }
 
 /// Add a folder to copilot's `trustedFolders` config, returning the new
@@ -1760,6 +1785,7 @@ impl OrchRegistry {
             id: entry.id.clone(),
             role: entry.role.as_str().into(),
             name: entry.name.clone(),
+            name_source: entry.name_source,
             session: entry.session_id.clone(),
             cwd: entry.cwd.clone(),
             status: status.to_string(),
@@ -1900,6 +1926,9 @@ impl OrchRegistry {
                     .as_str()
                     .unwrap_or(if role == "orchestrator" { "orchestrator" } else { "agent" })
                     .to_string(),
+                // The spawn audit predates the name-tier field; backfilled
+                // sessions restore at the default tier (#95r).
+                name_source: NameSource::default(),
                 role,
                 session: Some(session.to_string()),
                 cwd: d["cwd"].as_str().unwrap_or("").to_string(),
@@ -3509,7 +3538,7 @@ impl OrchRegistry {
         use_worktree: bool,
         branch: Option<String>,
     ) -> Result<AgentEntry, String> {
-        self.spawn_agent_ex(group_id, role, name, task, use_worktree, branch, None, None)
+        self.spawn_agent_ex(group_id, role, name, task, use_worktree, branch, None, None, None)
     }
 
     /// Full spawn: `resume_session` reopens a previous session (follow-ups
@@ -3526,6 +3555,7 @@ impl OrchRegistry {
         branch: Option<String>,
         resume_session: Option<String>,
         cwd_override: Option<String>,
+        restore_name_source: Option<NameSource>,
     ) -> Result<AgentEntry, String> {
         let group = self.group(group_id).ok_or("unknown group")?;
 
@@ -3568,14 +3598,19 @@ impl OrchRegistry {
         // default from the minted id — "worker 2" for `w-2` — which agrees with
         // the pane's "W 2" badge (#75) and the roster id instead of the old
         // per-launch "worker N" counter that drifted from the seq.
-        let (display, name_source) = {
-            let n = name.trim();
-            if n.is_empty() {
+        let (display, derived_source) = {
+            let cleaned = sanitize_agent_name(name);
+            if cleaned.is_empty() {
                 (format!("{} {seq}", role.as_str()), NameSource::Default)
             } else {
-                (n.chars().take(40).collect::<String>(), NameSource::Orchestrator)
+                (cleaned, NameSource::Orchestrator)
             }
         };
+        // A session rejoin re-spawns with the roster name (non-empty, so the
+        // derived tier would be `Orchestrator`); `restore_name_source` carries
+        // the persisted tier instead, so a human-renamed pane comes back at the
+        // `Human` tier and a later `rename_agent` still cannot clobber it.
+        let name_source = restore_name_source.unwrap_or(derived_source);
 
         // Workspace: dedicated worktree (branch of the same name) or the repo
         // itself, where the worker is instructed to branch before touching
@@ -4086,7 +4121,7 @@ impl OrchRegistry {
     /// the applied (trimmed/truncated) name is returned. Caller scopes the
     /// target to its group (see the MCP `rename_agent` tool).
     pub fn rename_agent(&self, agent_id: &str, name: &str, source: NameSource) -> Result<String, String> {
-        let name: String = name.trim().chars().take(40).collect();
+        let name = sanitize_agent_name(name);
         if name.is_empty() {
             return Err("name must not be empty".into());
         }
@@ -4651,19 +4686,24 @@ pub fn resume_recorded_session(
         "planner" => Role::Planner,
         _ => Role::Worker,
     };
-    let cwd = reg
+    // Pull the durable roster row for this session: its cwd (where the work
+    // happened) and its name tier — so a human-renamed pane rejoins at the
+    // `Human` tier and stays un-clobberable, not silently demoted to
+    // orchestrator (#95r). Absent (hint-restored, pre-roster) → `None`, and
+    // spawn derives the tier from the name as usual.
+    let matched = reg
         .merged_records(&record.group_id)
         .into_iter()
-        .find(|r| r.session.as_deref() == Some(session_id))
-        .map(|r| r.cwd)
-        .filter(|c| Path::new(c).is_dir());
+        .find(|r| r.session.as_deref() == Some(session_id));
+    let cwd = matched.as_ref().map(|r| r.cwd.clone()).filter(|c| Path::new(c).is_dir());
+    let restore_source = matched.as_ref().map(|r| r.name_source);
     let reg2 = reg.clone();
     let sid = session_id.to_string();
     let (group_id, name) = (record.group_id.clone(), record.agent_name.clone());
     std::thread::spawn(move || {
-        if let Err(e) =
-            reg2.spawn_agent_ex(&group_id, role, &name, "", false, None, Some(sid.clone()), cwd)
-        {
+        if let Err(e) = reg2.spawn_agent_ex(
+            &group_id, role, &name, "", false, None, Some(sid.clone()), cwd, restore_source,
+        ) {
             reg2.audit(&group_id, "loomux", "error",
                 json!({ "what": "session rejoin failed", "session": sid, "err": e.clone() }));
             let _ = reg2.deliver_to_orchestrator(

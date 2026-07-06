@@ -758,6 +758,7 @@ fn copilot_group_resumes_a_recorded_session() {
             None,
             Some(sid.clone()),
             Some(dir.path().to_string_lossy().into_owned()),
+            None,
         )
         .unwrap();
     assert_eq!(w.session_id.as_deref(), Some(sid.as_str()));
@@ -767,6 +768,7 @@ fn copilot_group_resumes_a_recorded_session() {
             &g.id, Role::Worker, "bad", "", false, None,
             Some("../../etc/passwd".into()),
             Some(dir.path().to_string_lossy().into_owned()),
+            None,
         )
         .is_err());
 }
@@ -1046,12 +1048,12 @@ fn resume_spawn_requires_valid_session_and_existing_cwd() {
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
     let bad_session = reg.spawn_agent_ex(
         &g.id, Role::Worker, "w", "follow-up", false, None,
-        Some("; rm -rf /".into()), None,
+        Some("; rm -rf /".into()), None, None,
     );
     assert!(bad_session.is_err(), "shell-metachar session ids must be rejected");
     let bad_cwd = reg.spawn_agent_ex(
         &g.id, Role::Worker, "w", "follow-up", false, None,
-        Some("abc-123".into()), Some("C:/definitely/not/a/dir".into()),
+        Some("abc-123".into()), Some("C:/definitely/not/a/dir".into()), None,
     );
     assert!(bad_cwd.unwrap_err().contains("cwd"), "resume cwd must exist");
     // Valid resume records the reused session on the agent.
@@ -1059,7 +1061,7 @@ fn resume_spawn_requires_valid_session_and_existing_cwd() {
     let ok = reg
         .spawn_agent_ex(
             &g.id, Role::Worker, "w", "follow-up", false, None,
-            Some("abc-123".into()), Some(dir.path().to_string_lossy().into_owned()),
+            Some("abc-123".into()), Some(dir.path().to_string_lossy().into_owned()), None,
         )
         .unwrap();
     assert_eq!(ok.session_id.as_deref(), Some("abc-123"));
@@ -1786,6 +1788,81 @@ fn rename_precedence_human_beats_orchestrator_beats_default() {
     // The human can still re-rename their own pane (human ≥ human).
     reg.rename_agent(&w.id, "parser v2", NameSource::Human).unwrap();
     assert_eq!(reg.agent(&w.id).unwrap().name, "parser v2");
+}
+
+#[test]
+fn rename_strips_control_characters() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "", "t", false, None).unwrap();
+    // A pasted name can't smuggle newlines/escape codes into the title/roster.
+    let applied = reg.rename_agent(&w.id, "w-2:\tgit\nfix\u{1b}[31m", NameSource::Orchestrator).unwrap();
+    assert_eq!(applied, "w-2:gitfix[31m");
+    assert!(!applied.chars().any(|c| c.is_control()));
+    // An all-control name is rejected, not silently applied as empty.
+    assert!(reg.rename_agent(&w.id, "\u{1b}\n\t", NameSource::Orchestrator).is_err());
+}
+
+#[test]
+fn roster_persists_the_name_source_tier() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "", "t", false, None).unwrap();
+    // A human rename must persist its tier, not just the text, so a later
+    // rejoin can restore the "human wins" guarantee (#95r).
+    reg.rename_agent(&w.id, "my parser work", NameSource::Human).unwrap();
+    let roster: Value =
+        serde_json::from_str(&fs::read_to_string(reg.state_root().join(&g.id).join("agents.json")).unwrap())
+            .unwrap();
+    let row = roster.as_array().unwrap().iter().find(|r| r["id"] == w.id.as_str()).unwrap();
+    assert_eq!(row["name"], "my parser work");
+    assert_eq!(row["name_source"], "human", "the tier must be durable, got: {row}");
+}
+
+#[test]
+fn rejoined_session_restores_the_human_name_tier() {
+    use loomux_lib::orchestration::resume_recorded_session;
+    use std::sync::Arc;
+    let dir = tempfile::tempdir().unwrap();
+    let reg = Arc::new(OrchRegistry::new(dir.path().to_path_buf()));
+    reg.set_port(45999);
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "", "t", false, None).unwrap();
+    let sid = w.session_id.clone().unwrap();
+    // Human renames the pane, then it dies (pre-"restart").
+    reg.rename_agent(&w.id, "my parser work", NameSource::Human).unwrap();
+    reg.mark_dead(&w.id, Some(0));
+
+    // Rejoin (background spawn) must come back at the human tier, not demoted
+    // to orchestrator — otherwise the "human wins" guarantee dies on restart.
+    assert!(resume_recorded_session(&reg, &sid, None).unwrap().is_none());
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let rejoined_id = loop {
+        let hit = reg
+            .list_agents(&g.id)
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["session"] == sid.as_str() && a["status"] == "running")
+            .map(|a| a["id"].as_str().unwrap().to_string());
+        if let Some(id) = hit {
+            break id;
+        }
+        assert!(std::time::Instant::now() < deadline, "rejoin did not complete");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_ne!(rejoined_id, w.id, "rejoin mints a fresh id");
+    assert_eq!(reg.agent(&rejoined_id).unwrap().name, "my parser work", "name restored");
+
+    // The orchestrator cannot clobber the restored human name.
+    let co = reg.resolve_token(&orch.token).unwrap();
+    let r = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "rename_agent", "arguments": { "agent_id": rejoined_id, "name": "w: something else" } }))
+        .unwrap();
+    assert_eq!(r["isError"], true, "orchestrator must not override a restored human rename");
+    assert!(r["content"][0]["text"].as_str().unwrap().contains("human"));
+    assert_eq!(reg.agent(&rejoined_id).unwrap().name, "my parser work");
 }
 
 // ---------- cost containment (#7): pause, idle-kill, spawn-rate, usage ----------

@@ -236,9 +236,10 @@ export class Pane {
   private attnChip: HTMLButtonElement;
   private attentionReason: string | null = null;
   private attentionDetail: string | null = null;
-  /** Notified when attention state changes; the grid uses it to keep a
-   *  minimized pane's dock chip in sync. */
-  private attentionListener: (() => void) | null = null;
+  /** Notified when something the dock chip shows changes (attention state or
+   *  the pane name); the grid uses it to keep a minimized pane's chip in sync,
+   *  since a docked pane's header is out of the DOM (#6, #95r). */
+  private dockSyncListener: (() => void) | null = null;
   /** True for agent/command panes (vs plain shells). */
   private launchedCommand = false;
   private shiftTimer: number | undefined;
@@ -622,6 +623,9 @@ export class Pane {
   setName(name: string): void {
     this.name = name;
     this.titleEl.textContent = name;
+    // A docked pane's header is detached, so refresh its dock chip too — else an
+    // orchestrator/human rename leaves the chip showing the stale name (#95r).
+    this.dockSyncListener?.();
   }
 
   /** Mark this pane as part of an orchestration group: role chip before the
@@ -657,7 +661,7 @@ export class Pane {
     }
     // A minimized pane's element is detached, so its header chip is invisible;
     // the listener lets the grid mirror this state onto the dock chip.
-    this.attentionListener?.();
+    this.dockSyncListener?.();
   }
 
   /** Current needs-attention state, or null. Lets the grid render an equivalent
@@ -669,10 +673,11 @@ export class Pane {
     return { reason: this.attentionReason, label, urgent, detail: this.attentionDetail };
   }
 
-  /** Register a callback fired whenever the attention state changes — used by
-   *  the grid to refresh the dock chip of a minimized pane. */
-  setAttentionListener(fn: (() => void) | null): void {
-    this.attentionListener = fn;
+  /** Register a callback fired whenever the dock chip's content changes
+   *  (attention state or name) — used by the grid to refresh the chip of a
+   *  minimized pane, whose header is out of the DOM. */
+  setDockSyncListener(fn: (() => void) | null): void {
+    this.dockSyncListener = fn;
   }
 
   /** The human is now on this pane: acknowledge its attention backend-side so
