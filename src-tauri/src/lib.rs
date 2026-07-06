@@ -6,7 +6,7 @@ mod winpath;
 mod metrics;
 mod obs;
 pub mod orchestration; // pub: integration smoke test links through it
-mod pty;
+pub mod pty; // pub: Job-Object integration test links `assign_kill_on_close_job`
 mod sessions;
 pub mod usage; // pub: exercised by orchestration integration tests
 
