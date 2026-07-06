@@ -8,16 +8,17 @@
 
 use loomux_lib::orchestration::mcp::dispatch;
 use loomux_lib::orchestration::{
-    add_trusted_folder, bracketed_paste, claude_permission_mode, cli_ready,
-    copilot_autopilot_prompt_detected, create_orchestration_group, hold_until_quiet,
-    idle_should_kill, max_agents_notice,
-    normalize_remote_web_base, parse_audit_lines, parse_session_cost, prompt_wait_detected,
-    resolve_ref_url, rotate_audit_if_needed, sanitize_attachment_ext, should_confirm_copilot_autopilot,
-    should_flush_before_paste, should_notify_unconfirmed, single_pane_autopilot_flags,
+    add_trusted_folder, box_holds_human_input, bracketed_paste, claude_permission_mode, cli_ready,
+    copilot_autopilot_prompt_detected, create_orchestration_group, hold_for_human_input,
+    hold_until_quiet, idle_should_kill, max_agents_notice,
+    normalize_remote_web_base, parse_audit_lines, parse_session_cost, paste_held_notice,
+    prompt_wait_detected, resolve_paste_gate, resolve_ref_url, rotate_audit_if_needed,
+    sanitize_attachment_ext, should_confirm_copilot_autopilot, should_flush_before_paste,
+    should_notify_paste_held, should_notify_unconfirmed, single_pane_autopilot_flags,
     spawn_rate_exceeded, spawn_request_expired, strip_ansi, submit_confirmed, submit_sequence,
     unconfirmed_delivery_notice, watchdog_should_notify, worktree_cleanup_targets,
-    AttentionItem, Caller, Delivery, Guardrails, NameSource, OrchRegistry, Role, TaskPatch,
-    UsageSnapshot, CLAUDE_UNATTENDED_ALLOW, COPILOT_AUTOPILOT_CONFIRM_KEYS,
+    AttentionItem, Caller, Delivery, Guardrails, NameSource, OrchRegistry, PasteDecision, PasteGate,
+    Role, TaskPatch, UsageSnapshot, CLAUDE_UNATTENDED_ALLOW, COPILOT_AUTOPILOT_CONFIRM_KEYS,
     COPILOT_GROUP_AUTOPILOT_FLAGS, COPILOT_UNATTENDED_FLAGS, MAX_ATTACHMENT_BYTES,
     PLANNER_READONLY_NOTE,
 };
@@ -666,6 +667,65 @@ fn unconfirmed_notice_text_names_the_agent_and_the_recovery_move() {
     // Points the orchestrator at the recovery move from the template.
     assert!(msg.contains("get_output"), "notice must point at reading the pane: {msg}");
     assert!(msg.contains("re-send"), "notice must point at re-sending: {msg}");
+}
+
+#[test]
+fn box_holds_human_input_only_when_a_line_is_still_sitting() {
+    const BURST: u64 = 24;
+    // Nobody ever typed here (0) — regardless of output totals, box is loomux's.
+    assert!(!box_holds_human_input(0, 0, 0, BURST));
+    assert!(!box_holds_human_input(0, 1000, 100_000, BURST));
+    // Human typed and little/no output since (their line's own echo only) — it's
+    // still sitting in the box: a paste here would merge-submit it.
+    assert!(box_holds_human_input(5_000, 1000, 1000, BURST));
+    assert!(box_holds_human_input(5_000, 1000, 1023, BURST));
+    // A real burst since their keystroke (they submitted / the CLI consumed the
+    // line): the box cleared, safe to paste.
+    assert!(!box_holds_human_input(5_000, 1000, 1024, BURST));
+    assert!(!box_holds_human_input(5_000, 1000, 100_000, BURST));
+    // A garbage/wrapped reading below the baseline must not panic or under-flow
+    // into "cleared" — saturating_sub keeps the diff 0 → still holds.
+    assert!(box_holds_human_input(5_000, 1000, 500, BURST));
+}
+
+#[test]
+fn paste_gate_holds_aborts_and_proceeds_on_the_right_signals() {
+    let cap = Duration::from_secs(60);
+    // No human line in the box → paste immediately (the normal delivery path).
+    assert_eq!(resolve_paste_gate(false, false, false, Duration::ZERO, cap), PasteGate::Paste);
+    // Human's line present, not cleared, still within the bound → keep holding.
+    assert_eq!(resolve_paste_gate(true, false, false, Duration::from_secs(1), cap), PasteGate::Hold);
+    // Human is actively typing → hold even if a burst was seen (they've started a
+    // fresh line; never paste onto a live one).
+    assert_eq!(resolve_paste_gate(true, true, true, Duration::from_secs(1), cap), PasteGate::Hold);
+    // They submitted/cleared (burst) and went quiet → paste the prompt.
+    assert_eq!(resolve_paste_gate(true, false, true, Duration::from_secs(1), cap), PasteGate::Paste);
+    // Bound elapsed and the box never cleared → abort (never blind-merge).
+    assert_eq!(resolve_paste_gate(true, false, false, cap, cap), PasteGate::Abort);
+    // At the cap while STILL typing: abort rather than paste onto their line.
+    assert_eq!(resolve_paste_gate(true, true, false, cap, cap), PasteGate::Abort);
+}
+
+#[test]
+fn paste_held_notice_names_the_agent_and_the_recovery_move() {
+    let msg = paste_held_notice("w-4");
+    assert!(msg.starts_with("[loomux] "), "notice is a loomux system message: {msg}");
+    assert!(msg.contains("w-4"), "notice must name the held agent: {msg}");
+    assert!(msg.contains("human input"), "notice must state the condition: {msg}");
+    assert!(msg.contains("re-send"), "notice must point at re-sending: {msg}");
+    // Distinct from the unconfirmed notice: nothing was pasted, so it must NOT
+    // tell the orchestrator the prompt is sitting unsubmitted.
+    assert!(!msg.contains("unsubmitted"), "held notice is not the unconfirmed one: {msg}");
+}
+
+#[test]
+fn paste_held_notice_fires_only_for_a_non_orchestrator_target() {
+    // A held delivery to a worker/reviewer: the prompt never landed, so the
+    // orchestrator must be told to re-send.
+    assert!(should_notify_paste_held(false));
+    // Target IS the orchestrator: a notice to it is itself a delivery to it — an
+    // endless loop. Never notify.
+    assert!(!should_notify_paste_held(true));
 }
 
 #[test]
@@ -3883,6 +3943,41 @@ fn unconfirmed_notice_is_suppressed_while_the_group_is_paused() {
     );
 }
 
+#[test]
+fn delivery_held_notice_fires_for_a_worker_but_not_the_orchestrator() {
+    // #111: a delivery aborted because the pane holds human input must nudge the
+    // orchestrator (once) to re-send — but never for an orchestrator target (that
+    // would loop) and never while paused (delivery is suppressed there anyway).
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let o = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+
+    // Worker target, group live: the notice is raised and audited.
+    reg.notify_delivery_held(&g.id, &w.id, false);
+    assert!(
+        reg.audit_log(&g.id).iter().any(|e| e.action == "delivery-held-notice"),
+        "an aborted worker delivery must raise the held notice"
+    );
+
+    // Orchestrator target: suppressed (a notice to it is a delivery to it — a loop).
+    reg.notify_delivery_held(&g.id, &o.id, true);
+    assert_eq!(
+        reg.audit_log(&g.id).iter().filter(|e| e.action == "delivery-held-notice").count(),
+        1,
+        "an orchestrator-target held delivery must not raise a notice"
+    );
+
+    // Paused group: suppressed even for a worker.
+    reg.pause_group(&g.id).unwrap();
+    reg.notify_delivery_held(&g.id, &w.id, false);
+    assert_eq!(
+        reg.audit_log(&g.id).iter().filter(|e| e.action == "delivery-held-notice").count(),
+        1,
+        "a paused group must not raise the held notice"
+    );
+}
+
 // ---------- #72: steering-strip image attachments ----------
 
 #[test]
@@ -4033,6 +4128,123 @@ fn hold_guard_releases_once_the_human_goes_quiet() {
         if calls.fetch_add(1, Ordering::Relaxed) < 3 { u64::MAX } else { 1 }
     };
     let held = hold_until_quiet(source, Duration::from_millis(50), Duration::from_secs(5), Duration::from_millis(5))
-        .expect("it must report having held while the human was typing");
+        .expect("it must release once the human goes quiet");
     assert!(held < 4000, "must release on quiet, not ride the cap, got {held}ms");
+}
+
+// --- #111 pre-paste human-input hold: the loop that drives the pure gate ---
+
+const HB_BURST: u64 = 24;
+const HB_QUIET: Duration = Duration::from_millis(50);
+const HB_POLL: Duration = Duration::from_millis(5);
+
+#[test]
+fn paste_hold_proceeds_immediately_when_box_is_empty() {
+    // No human keystroke ever (0) → the box was never dirty; paste at once.
+    let out = hold_for_human_input(
+        || (0, 0),
+        || 5000,
+        || 10_000,
+        HB_BURST,
+        HB_QUIET,
+        Duration::from_secs(5),
+        HB_POLL,
+    );
+    assert_eq!(out, PasteDecision::Paste { held_ms: 0 });
+}
+
+#[test]
+fn paste_hold_proceeds_when_the_human_already_submitted() {
+    // Human typed at output-total 1000, but the pane is now at 100_000: a burst
+    // since their keystroke means their line was submitted and the box cleared.
+    let out = hold_for_human_input(
+        || (5_000, 1000),
+        || 100_000,
+        || 10_000,
+        HB_BURST,
+        HB_QUIET,
+        Duration::from_secs(5),
+        HB_POLL,
+    );
+    assert_eq!(out, PasteDecision::Paste { held_ms: 0 });
+}
+
+#[test]
+fn paste_hold_aborts_when_the_line_never_clears() {
+    // Human typed (ms 1) with no output since (out_at_input == current total),
+    // and they never touch it again: the box holds their line for the whole
+    // bounded wait → abort rather than merge-submit. A small cap keeps it fast.
+    let cap = Duration::from_millis(40);
+    let out = hold_for_human_input(
+        || (1, 1000),
+        || 1000,        // no growth ever → never clears
+        || u64::MAX,    // "now" is huge → not currently typing (stale keystroke)
+        HB_BURST,
+        HB_QUIET,
+        cap,
+        HB_POLL,
+    );
+    match out {
+        PasteDecision::Abort { held_ms } => {
+            assert!(held_ms >= 30, "must have held near the cap before aborting, got {held_ms}ms");
+            assert!(held_ms < 2000, "cap must bound the hold, got {held_ms}ms");
+        }
+        other => panic!("expected Abort, got {other:?}"),
+    }
+}
+
+#[test]
+fn paste_hold_releases_once_the_human_submits() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    // The line is sitting (little output) for the first few polls, then the
+    // human submits and the pane bursts past the floor: the loop must release
+    // with Paste — exercising the poll loop, not just the pure gate (#40 lesson).
+    let polls = AtomicU64::new(0);
+    let output = move || {
+        // Baseline 1000; jump well past the burst floor after a few polls.
+        if polls.fetch_add(1, Ordering::Relaxed) < 3 { 1000 } else { 1000 + HB_BURST + 50 }
+    };
+    let out = hold_for_human_input(
+        || (5_000, 1000), // typed long ago (stale) → not "typing now"
+        output,
+        || 10_000,        // now: keystroke at 5_000 is 5s old → past the quiet window
+        HB_BURST,
+        HB_QUIET,
+        Duration::from_secs(5),
+        HB_POLL,
+    );
+    match out {
+        PasteDecision::Paste { held_ms } => {
+            assert!(held_ms < 4000, "must release on submit, not ride the cap, got {held_ms}ms");
+        }
+        other => panic!("expected Paste after the submit burst, got {other:?}"),
+    }
+}
+
+#[test]
+fn paste_hold_re_baselines_the_burst_window_on_a_fresh_keystroke() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    // The human keeps typing: each keystroke's echo grows the total, but the
+    // snapshot at that keystroke rises with it, so the growth SINCE the latest
+    // keystroke always stays under the burst floor. Because the loop re-baselines
+    // on every fresh keystroke, that accumulated echo must never read as a submit
+    // — the only exit under continuous typing is the cap → Abort. (A broken loop
+    // that kept the first baseline would see the total climb past floor and wrongly
+    // Paste.)
+    let typed = Arc::new(AtomicU64::new(0));
+    let ti = typed.clone();
+    let input = move || {
+        let n = ti.fetch_add(1, Ordering::Relaxed) + 1; // a fresh keystroke each poll
+        (10_000 + n, 1000 + n * 8) // out_at_input climbs with the echo
+    };
+    let to = typed.clone();
+    // Current total sits just 4 bytes past the latest snapshot — under the 24 floor.
+    let output = move || 1000 + to.load(Ordering::Relaxed) * 8 + 4;
+    let cap = Duration::from_millis(40);
+    let out = hold_for_human_input(input, output, || u64::MAX, HB_BURST, HB_QUIET, cap, HB_POLL);
+    assert!(
+        matches!(out, PasteDecision::Abort { .. }),
+        "continuous typing must never false-clear off accumulated echo: {out:?}",
+    );
 }

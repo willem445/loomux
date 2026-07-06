@@ -434,6 +434,45 @@ box clears) rather than making the orchestrator poll terminals by hand.
   Silent-agent recovery adds the human-facing half: on a repeat unconfirmed notice for the
   same agent, stop re-sending and flag the human.
 
+## Human-input paste guard (#111)
+
+The quiet backstop (#43, `wait_for_user_quiet`) only waits out *active* typing — it releases
+the moment the human stops. It does **not** stop a paste landing on top of a line the human
+typed and then **left sitting** in the box. When that happens the paste appends to their text
+and the submit Enter fires the merged line: the live repro was a worker pane holding `/model`
+(and later `dfgdsfg`) when a task delivery arrived, submitting `Unknown command: /modelRun …`
+— the human's input consumed *and* the task destroyed. The stranded-flush guard (#81/#84) is
+no help: it protects a *previous delivery's* text, not a *human's* fresh line, and explicitly
+declines to flush once a human has typed.
+
+So before the paste, delivery runs a second gate that distinguishes a sitting human line from
+an empty box and holds/aborts rather than merge-submitting.
+
+- **The signal.** Each human keystroke (`write_pty`) stamps both `user_input_ms` *and* the
+  pane's `output.total` at that instant (`last_user_input` → `(ms, output_at_input)`). The pure
+  `box_holds_human_input(last_input_ms, output_at_input, output_total, burst_min)` reads the box
+  as dirty when a human has typed and output has **not** since grown by a real burst
+  (`>= SUBMIT_CONFIRM_MIN_BYTES`). Little growth = only the line's own echo, so it's still
+  sitting; a burst = the line was submitted/consumed and the box cleared. Pairing the keystroke
+  with its output snapshot is what stops an *already-submitted* line from wrongly holding the
+  next delivery (a plain `last_user_input_ms > baseline` test can't tell the two apart).
+- **The hold.** `hold_for_human_input` drives the pure `resolve_paste_gate` each poll:
+  `Paste` when the box is clean or the human submitted and went quiet, `Hold` while their line
+  is still there, `Abort` at the bounded cap (`HUMAN_INPUT_HOLD_MAX`, 60s). The burst window
+  re-baselines on every fresh keystroke so continued composing can't read as a submit. Same
+  pure-gate-plus-testable-loop split as the quiet backstop (`should_hold_for_user` /
+  `hold_until_quiet`), for the same #40 reason: exercise the loop, not just the decision.
+- **The action.** On `Abort` the delivery pastes **nothing** and calls `notify_delivery_held`
+  (gate `should_notify_paste_held`): one audited (`delivery-held-notice`) `[loomux]` notice
+  (`paste_held_notice`) to the orchestrator — *"delivery to `<id>` held: pane has human input —
+  re-send when clear."* Distinct from the unconfirmed notice: nothing landed, so the move is to
+  wait for the box to clear and re-send, not to read back a stranded prompt. A cleared hold is
+  audited (`delivery-held-for-input`) and proceeds normally.
+- **No loops / paused.** Same discipline as #103: an orchestrator-target delivery never
+  notifies (a notice to it is a delivery to it), and a **paused** group is skipped wholesale.
+- **Scope.** This is the paste-path guard only. The confirm-window semantics (`submit_confirmed`
+  and the false-confirm handling) are #112, deliberately untouched here.
+
 ## Attention routing (#6) & interactive-question detection (#40)
 
 The human is the scheduler's bottleneck; attention routing surfaces *which* pane needs

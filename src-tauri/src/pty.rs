@@ -128,6 +128,13 @@ pub struct PtyHandle {
     /// `None` when job creation failed (fail-soft) — pre-#78 behavior.
     #[cfg(target_os = "windows")]
     _job: Option<JobHandle>,
+    /// The pane's `output.total` captured at that last human keystroke (#111).
+    /// Pairing "when they last typed" with "how much output had streamed by
+    /// then" lets delivery tell text still *sitting* in the box (little output
+    /// since) from text the human already *submitted* (a burst since) — so a
+    /// paste never merge-submits a human's half-typed line, but an already-sent
+    /// line doesn't wrongly hold the delivery either.
+    output_total_at_input: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Ring of recent output plus a monotonic byte counter. The counter lets
@@ -178,6 +185,19 @@ impl PtyManager {
     pub fn last_user_input_ms(&self, id: u32) -> Option<u64> {
         let ptys = self.ptys.lock_safe();
         Some(ptys.get(&id)?.user_input_ms.load(Ordering::Relaxed))
+    }
+
+    /// The last human keystroke as `(unix_ms, output_total_at_that_keystroke)`
+    /// (#111). The delivery guard compares the second value against the pane's
+    /// current output total: little growth since means their line is still
+    /// sitting unsubmitted in the box; a burst means it was already submitted.
+    pub fn last_user_input(&self, id: u32) -> Option<(u64, u64)> {
+        let ptys = self.ptys.lock_safe();
+        let pty = ptys.get(&id)?;
+        Some((
+            pty.user_input_ms.load(Ordering::Relaxed),
+            pty.output_total_at_input.load(Ordering::Relaxed),
+        ))
     }
 
     /// Monotonic count of bytes this pty has ever produced.
@@ -489,6 +509,7 @@ pub fn spawn_pty(
             user_input_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(target_os = "windows")]
             _job: job,
+            output_total_at_input: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         },
     );
 
@@ -600,6 +621,11 @@ pub fn write_pty(state: State<PtyManager>, id: u32, data: String) -> Result<(), 
             .unwrap_or(0),
         Ordering::Relaxed,
     );
+    // Snapshot how much output had streamed as of this keystroke (#111), so the
+    // delivery guard can later tell a still-sitting line (no burst since) from
+    // one the human already submitted (a burst since).
+    pty.output_total_at_input
+        .store(pty.output.lock_safe().total, Ordering::Relaxed);
     pty.writer
         .write_all(data.as_bytes())
         .map_err(|e| e.to_string())
