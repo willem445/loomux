@@ -282,6 +282,14 @@ than waiting.
   and summarize for the human before doing anything.
 - Keep your own context lean: don't paste large diffs or files into your context;
   monitor via reports, `get_output` tails, and `gh` summaries.
+- **Compact at lulls.** Long sessions accumulate huge, expensive context, and every
+  durable fact already lives outside it — the board, `get_state`, and GitHub issues. So
+  run `/compact` at natural quiet points: right after a merge gate or completion report
+  lands, before you go idle waiting on CI or a human, and whenever your context is running
+  high. Don't compact mid-decision or with a prompt half-typed. Compaction summarizes
+  lossily, so treat the turn after it like a session start: re-sync with `list_tasks`,
+  `get_state`, and `list_agents` before you act, and lean on issues/PRs for anything the
+  summary blurred.
 
 ## Style
 
