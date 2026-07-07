@@ -31,6 +31,26 @@ use std::process::{Command, Output};
 /// the write succeeds and the orchestrator's substring match still picks it up.
 const ALLOWED_LABELS: [&str; 3] = ["agent-ready", "agent-investigation", "agent-managed"];
 
+/// Color (6-hex, no `#`) and description used to *create* an allow-listed label
+/// in a repo that doesn't have it yet (see `ensure_labels_exist`). `gh issue
+/// edit --add-label` fails outright on a label the repo has never defined, so a
+/// fresh repo could never be handed to an orchestrator from the issues view
+/// without this. Kept in lockstep with `ALLOWED_LABELS` (a test asserts every
+/// allowed label has a spec). `agent-managed`'s color/description match the
+/// orchestrator template's convention so a loomux-created label is
+/// indistinguishable from one the orchestrator itself would create.
+fn label_spec(name: &str) -> Option<(&'static str, &'static str)> {
+    match name {
+        "agent-managed" => Some(("5319e7", "Managed by a loomux orchestrator")),
+        "agent-ready" => Some(("0e8a16", "Groomed and ready for a loomux agent to build")),
+        "agent-investigation" => Some((
+            "fbca04",
+            "Research only — findings as an issue comment; no code",
+        )),
+        _ => None,
+    }
+}
+
 /// Spawn `gh` and capture the raw `Output` (status + stdout + stderr). Only a
 /// spawn failure is an `Err`; a non-zero exit is left for the caller to
 /// interpret (e.g. `gh auth status` exits non-zero when unauthenticated, which
@@ -220,9 +240,60 @@ pub fn gh_issue_set_labels(
     if add.is_empty() && remove.is_empty() {
         return Ok(());
     }
+    // `gh issue edit --add-label` errors if the label isn't defined on the repo,
+    // so create any allow-listed label we're about to add that's missing. Only
+    // adds need this; removing a label the repo lacks is already a no-op at gh.
+    if !add.is_empty() {
+        ensure_labels_exist(&repo, &add)?;
+    }
     let args = issue_edit_args(number, &add, &remove);
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
     run_gh(Some(&repo), &argv).map(|_| ())
+}
+
+/// Create any allow-listed label in `labels` that the repo doesn't already
+/// define, so a following `gh issue edit --add-label` can attach it. Existing
+/// labels are left untouched (never re-colored). Callers must have validated
+/// `labels` against the allow-list first.
+///
+/// We list the repo's labels once and create only the genuinely-missing ones —
+/// rather than blindly `gh label create`-ing every label — so that a user who
+/// *can* toggle labels but *can't* manage them still succeeds when the labels
+/// already exist (a blind create would 403 and wrongly block the toggle). The
+/// remaining race window (a label created by someone else between our list and
+/// our create) is absorbed: an "already exists" create failure is success.
+fn ensure_labels_exist(repo: &str, labels: &[String]) -> Result<(), String> {
+    let existing = list_label_names(repo)?;
+    for name in labels {
+        if existing.iter().any(|e| e == name) {
+            continue;
+        }
+        // Unreachable for validated input (every allow-listed label has a spec,
+        // asserted by test); guard rather than panic if the two ever drift.
+        let (color, description) =
+            label_spec(name).ok_or_else(|| format!("no label spec for {name:?}"))?;
+        let args = label_create_args(name, color, description);
+        let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+        if let Err(e) = run_gh(Some(repo), &argv) {
+            if is_label_exists_error(&e) {
+                continue; // lost the race — the label is there now, which is all we want.
+            }
+            return Err(map_label_create_error(name, &e));
+        }
+    }
+    Ok(())
+}
+
+/// List the repo's label names via `gh label list --json name`. The `--limit` is
+/// deliberately generous: if an allow-listed label sits past the page we'd only
+/// attempt a redundant create and fall back to the already-exists path, but a
+/// high limit avoids that wasted round-trip on normally-sized repos.
+fn list_label_names(repo: &str) -> Result<Vec<String>, String> {
+    let out = run_gh(
+        Some(repo),
+        &["label", "list", "--json", "name", "--limit", "500"],
+    )?;
+    parse_label_names(&out)
 }
 
 // ---------- pure helpers (unit-tested) ----------
@@ -264,6 +335,62 @@ fn issue_edit_args(number: u64, add: &[String], remove: &[String]) -> Vec<String
         args.push(l.clone());
     }
     args
+}
+
+/// Build the `gh label create <name>` argv. Name/color/description are discrete
+/// args (never interpolated), so a description containing spaces, an em-dash, or
+/// a leading `-` stays data. Colors are passed without a leading `#` per gh.
+fn label_create_args(name: &str, color: &str, description: &str) -> Vec<String> {
+    vec![
+        "label".into(),
+        "create".into(),
+        name.into(),
+        "--color".into(),
+        color.into(),
+        "--description".into(),
+        description.into(),
+    ]
+}
+
+/// Parse `gh label list --json name` into a flat list of names. Reuses the
+/// `RawLabel` shape (`gh` emits the same `{"name": …}` objects here).
+fn parse_label_names(json: &str) -> Result<Vec<String>, String> {
+    let raw: Vec<RawLabel> =
+        serde_json::from_str(json).map_err(|e| format!("gh label list: bad JSON: {e}"))?;
+    Ok(raw.into_iter().map(|l| l.name).collect())
+}
+
+/// True when a `gh label create` failure means the label already exists — the
+/// race outcome we treat as success. `gh` phrases this as
+/// "… already exists"; match case-insensitively so a wording tweak doesn't slip.
+fn is_label_exists_error(stderr: &str) -> bool {
+    stderr.to_lowercase().contains("already exists")
+}
+
+/// True when a `gh label create` failure looks like a permissions problem (the
+/// account can view issues but can't manage labels): `gh` surfaces the API's
+/// 403 as "HTTP 403", "Resource not accessible", or a "must have … permission"
+/// GraphQL message. Best-effort — only used to pick a friendlier wording.
+fn looks_like_permission_error(stderr: &str) -> bool {
+    let s = stderr.to_lowercase();
+    s.contains("403")
+        || s.contains("not accessible")
+        || s.contains("must have")
+        || s.contains("permission")
+}
+
+/// Turn a real (non-race) `gh label create` failure into the message the issues
+/// view renders in its toast. The permission case gets an actionable hint since
+/// it's the common one (a contributor without label-management rights); anything
+/// else keeps gh's own text so network/other failures stay diagnosable.
+fn map_label_create_error(name: &str, stderr: &str) -> String {
+    if looks_like_permission_error(stderr) {
+        format!(
+            "Can't create the '{name}' label — your GitHub account lacks permission to manage labels on this repo. Ask a maintainer to add the agent labels, then try again."
+        )
+    } else {
+        format!("Couldn't create the '{name}' label: {stderr}")
+    }
 }
 
 /// Parse `gh issue list --json …` into `GhIssue`s, flattening label objects to
@@ -435,6 +562,98 @@ mod tests {
                 "agent-managed",
             ]
         );
+    }
+
+    #[test]
+    fn every_allowed_label_has_a_create_spec() {
+        // ensure_labels_exist relies on this: a validated (allow-listed) label
+        // must always have a color/description to create it with, or a fresh
+        // repo could accept the label past validation yet fail to create it.
+        for l in ALLOWED_LABELS {
+            let spec = label_spec(l);
+            assert!(spec.is_some(), "{l} has no create spec");
+            let (color, desc) = spec.unwrap();
+            assert_eq!(color.len(), 6, "{l} color must be 6 hex digits: {color:?}");
+            assert!(
+                color.chars().all(|c| c.is_ascii_hexdigit()),
+                "{l} color not hex: {color:?}"
+            );
+            assert!(!desc.is_empty(), "{l} has empty description");
+        }
+        // agent-managed keeps the orchestrator template's exact convention so a
+        // loomux-created label matches one the orchestrator would create.
+        assert_eq!(
+            label_spec("agent-managed"),
+            Some(("5319e7", "Managed by a loomux orchestrator"))
+        );
+        // Non-allow-listed names have no spec (defense in depth vs. arbitrary
+        // label creation).
+        assert!(label_spec("bug").is_none());
+    }
+
+    #[test]
+    fn label_create_args_keeps_fields_as_data() {
+        // A description with spaces / an em-dash / punctuation must remain the
+        // value of --description, and the color must not carry a '#'.
+        let args = label_create_args(
+            "agent-investigation",
+            "fbca04",
+            "Research only — findings as an issue comment; no code",
+        );
+        assert_eq!(
+            args,
+            vec![
+                "label",
+                "create",
+                "agent-investigation",
+                "--color",
+                "fbca04",
+                "--description",
+                "Research only — findings as an issue comment; no code",
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_label_names_flattens() {
+        let json = r#"[{"name":"agent-ready"},{"name":"bug"},{"name":"agent-managed"}]"#;
+        assert_eq!(
+            parse_label_names(json).unwrap(),
+            vec!["agent-ready", "bug", "agent-managed"]
+        );
+        assert!(parse_label_names("[]").unwrap().is_empty());
+        assert!(parse_label_names("not json").is_err());
+    }
+
+    #[test]
+    fn is_label_exists_error_detects_race() {
+        // The success-on-race path: a create that failed only because the label
+        // was created concurrently.
+        assert!(is_label_exists_error(
+            "failed to create label: 'agent-ready' already exists"
+        ));
+        assert!(is_label_exists_error("Label Already Exists")); // case-insensitive
+        // A genuine failure is not swallowed.
+        assert!(!is_label_exists_error("HTTP 403: Resource not accessible"));
+    }
+
+    #[test]
+    fn map_label_create_error_flags_permission_case() {
+        // 403 / not-accessible / must-have / permission all read as a perms
+        // problem and get the actionable hint.
+        for perm in [
+            "HTTP 403: Resource not accessible by integration",
+            "GraphQL: Must have push access to create a label",
+            "you do not have permission to manage labels",
+        ] {
+            let msg = map_label_create_error("agent-ready", perm);
+            assert!(msg.contains("lacks permission"), "got: {msg}");
+            assert!(msg.contains("agent-ready"), "got: {msg}");
+        }
+        // A non-permission failure keeps gh's own text so it stays diagnosable.
+        let net = map_label_create_error("agent-ready", "dial tcp: lookup api.github.com: no such host");
+        assert!(net.contains("no such host"), "got: {net}");
+        assert!(!net.contains("lacks permission"), "got: {net}");
     }
 
     #[test]
