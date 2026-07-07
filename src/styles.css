@@ -352,13 +352,28 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
    A fixed chrome element (present from pane start), so the terminal fits to
    the reduced height once — no toggling, no resize repaint into scrollback. */
 .orch-compose {
+  --steer-line: 18px; /* one text row in the steer box; drives the box's grow math (#100) */
   display: flex; flex-direction: column; gap: 4px; flex: none;
   padding: 6px 8px;
   border-top: 1px solid var(--group-color, var(--border-soft));
   background: linear-gradient(180deg, #121219, #0e0e14);
 }
 .orch-compose-row { display: flex; gap: 6px; }
-.orch-compose-input { flex: 1; min-width: 0; font-size: 12px; }
+/* The steer box wraps and auto-grows (#100). To keep the strip's flow footprint
+   fixed — a growing strip would shrink .pane-term and resize the PTY — the field
+   reserves exactly one line of layout height while the textarea inside it is
+   absolutely positioned and grows UPWARD, floating over the terminal above. */
+.orch-compose-field {
+  position: relative; flex: 1; min-width: 0;
+  min-height: calc(var(--steer-line) + 14px); /* one line + input padding(12) + border(2) */
+}
+.orch-compose-input {
+  position: absolute; left: 0; right: 0; bottom: 0;
+  font-size: 12px; line-height: var(--steer-line);
+  max-height: calc(var(--steer-line) * 6 + 14px); /* ~6 lines, then it scrolls internally */
+  resize: none; overflow-y: hidden; /* JS toggles overflow-y when the cap is hit */
+  white-space: pre-wrap; overflow-wrap: break-word;
+}
 .orch-compose-send { flex: none; }
 /* Attach (paperclip) button: icon-only, sized to sit flush with Send. */
 .orch-compose-attach {

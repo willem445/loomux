@@ -80,7 +80,7 @@ npm test           # unit tests (Node's built-in runner; no extra deps)
 | Minimize pane | `Alt+M` (or —); restore from the dock |
 | Session browser | `Ctrl+Shift+P` (or the *sessions* button) |
 | Open in editor | `Alt+E` (or the `</>` button in a pane header) |
-| Steer orchestrator | `Alt+P` (focus the compose strip under an orchestrator pane); `Esc` returns to the terminal; `Ctrl+V` in the strip attaches a pasted screenshot |
+| Steer orchestrator | `Alt+P` (focus the compose strip under an orchestrator pane); `Enter` sends, `Shift+Enter` inserts a newline; `Esc` returns to the terminal; `Ctrl+V` in the strip attaches a pasted screenshot |
 | Copy / paste | `Ctrl+Shift+C` / `Ctrl+Shift+V` (`Ctrl+V` also works) |
 
 A CLI running in a pane (e.g. an agent that says "copied to clipboard") copies
@@ -305,8 +305,11 @@ under its terminal (styled like the board's *Add a task* field). Type steering
 there and press **Enter** — loomux enqueues it to the orchestrator through the
 *same* serialized delivery path worker reports use, so your message and an
 incoming report can never land in each other's text: the pane's input has
-exactly one writer. Focus the strip with **Alt+P** (or click it); **Esc** hands
-focus back to the terminal. Because it's a loomux field and not the CLI's own
+exactly one writer. The field wraps and grows to a few lines as you type;
+**Shift+Enter** inserts a newline for a multi-line message, and past a few lines
+it scrolls internally rather than pushing the terminal (the strip floats over
+it, so the PTY is never resized). Focus the strip with **Alt+P** (or click it);
+**Esc** hands focus back to the terminal. Because it's a loomux field and not the CLI's own
 input box, it never steals the terminal's keys — type freely in the terminal
 and the strip stays out of the way. Steering a paused group or a pane with no
 live orchestrator is reported inline rather than silently dropped. You can

@@ -94,6 +94,55 @@ export function composeSteerText(text: string, paths: string[], cli: string): st
   return lines.join("\n");
 }
 
+// ---------------------------------------------------------------------------
+// Steering-box key handling & auto-grow (#100). The compose box used to be a
+// single-line <input> that scrolled one endless horizontal line; it's now a
+// wrapping <textarea> that grows to a few lines. These helpers keep the two
+// decisions that carry intent — what a keystroke means, and how tall the box
+// may get — DOM-free so they're unit-testable (test/steer.test.ts).
+
+/** The bits of a keydown the steer box cares about. DOM-free so the
+ *  submit-vs-newline decision is testable without synthesizing a KeyboardEvent. */
+export interface SteerKey {
+  key: string;
+  shiftKey: boolean;
+  /** True while an IME composition is in flight (`KeyboardEvent.isComposing`). */
+  isComposing: boolean;
+  /** Legacy IME sentinel: some IMEs report 229 without setting `isComposing`. */
+  keyCode: number;
+}
+
+/** What a keydown on the steer box should do:
+ *   - `submit`  send the draft (and swallow the key),
+ *   - `newline` insert a line break — the box wraps and grows,
+ *   - `blur`    hand focus back to the terminal (and swallow the key),
+ *   - `pass`    let the textarea handle it normally (ordinary typing). */
+export type SteerKeyAction = "submit" | "newline" | "blur" | "pass";
+
+/** Map a keydown to its steer-box action. Enter sends; **Shift+Enter** inserts a
+ *  newline so multi-line drafts are possible; Escape returns to the terminal.
+ *  Enter during an IME composition is the candidate-commit keystroke, not a
+ *  send, so it's treated as `newline` (i.e. left to the browser) — we must never
+ *  submit a half-composed word. */
+export function steerKeyAction(e: SteerKey): SteerKeyAction {
+  const composing = e.isComposing || e.keyCode === 229;
+  if (e.key === "Enter") {
+    return e.shiftKey || composing ? "newline" : "submit";
+  }
+  if (e.key === "Escape" && !composing) return "blur";
+  return "pass";
+}
+
+/** The height (px) to apply to the auto-growing steer box, plus whether it now
+ *  needs an internal scrollbar. `natural` is the content's measured scrollHeight;
+ *  `maxPx` the cap (a few lines). Past the cap the box scrolls internally instead
+ *  of getting taller — its footprint must stay put so the terminal below it is
+ *  never resized (a PTY resize repaints ConPTY; forbidden for UI chrome). */
+export function steerBoxHeight(natural: number, maxPx: number): { heightPx: number; scroll: boolean } {
+  const capped = maxPx > 0 && natural > maxPx;
+  return { heightPx: capped ? maxPx : natural, scroll: capped };
+}
+
 /** base64-encode raw bytes for the `orch_save_attachment` IPC payload. Chunked
  *  so a multi-MB screenshot doesn't blow the argument limit of
  *  `String.fromCharCode(...spread)`. Pure (no DOM) beyond the ambient `btoa`. */
