@@ -245,18 +245,94 @@ pub fn git_commit(repo: String, message: String) -> Result<(), String> {
     run_git(&repo, &["commit", "-m", &message]).map(|_| ())
 }
 
-/// Check out a ref. `track` for remote branches: creates a local tracking
-/// branch explicitly (dwim misfires when several remotes share the name).
+/// Check out a ref. With `track` the ref is a remote-tracking branch picked
+/// from the branch menu (`origin/topic`): resolve it to a local branch and
+/// switch there — reusing an existing local branch of that name, or creating a
+/// new tracking branch otherwise. Without `track` it's a plain checkout of a
+/// local branch, tag, or commit (detached).
+///
+/// #96: the old path was `checkout --track origin/topic`, which fatals with "a
+/// branch named 'topic' already exists" the moment a local `topic` is present
+/// (the common case — you've already worked on it once). Splitting the two
+/// cases makes checking out a remote branch idempotent.
 #[tauri::command]
 pub fn git_checkout(repo: String, refname: String, track: bool) -> Result<(), String> {
     // `--` can't guard this the way it does elsewhere — for checkout it's the
     // pathspec separator — so reject a leading-`-` name outright (see check_name).
     check_name(&refname, "ref")?;
-    if track {
-        run_git(&repo, &["checkout", "--track", &refname]).map(|_| ())
-    } else {
-        run_git(&repo, &["checkout", &refname]).map(|_| ())
+    if !track {
+        return run_git(&repo, &["checkout", &refname])
+            .map(|_| ())
+            .map_err(|e| checkout_error(&refname, &e));
     }
+    // `refname` is `<remote>/<branch>`; map it to the local branch to land on.
+    let local = local_branch_for_remote_ref(&refname, &list_remotes(&repo))
+        .ok_or_else(|| format!("{refname:?} is not a remote-tracking branch"))?;
+    // A stripped-prefix suffix can still begin with `-` (e.g. `origin/-x`), so
+    // re-guard it before it reaches git as a branch argument.
+    check_name(&local, "branch")?;
+    if local_branch_exists(&repo, &local) {
+        // Already have a local branch of that name — just switch to it;
+        // re-creating it is the #96 fatal error.
+        run_git(&repo, &["switch", &local])
+            .map(|_| ())
+            .map_err(|e| checkout_error(&local, &e))
+    } else {
+        // Create a local branch tracking the remote and switch to it.
+        run_git(&repo, &["switch", "-c", &local, "--track", &refname])
+            .map(|_| ())
+            .map_err(|e| checkout_error(&refname, &e))
+    }
+}
+
+/// Configured remote names (`git remote`). Empty on any error, so the caller
+/// falls back to a plain prefix strip.
+fn list_remotes(repo: &str) -> Vec<String> {
+    run_git(repo, &["remote"])
+        .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// True when `refs/heads/<name>` resolves — i.e. a local branch of that name
+/// already exists.
+fn local_branch_exists(repo: &str, name: &str) -> bool {
+    run_git(
+        repo,
+        &["show-ref", "--verify", "--quiet", &format!("refs/heads/{name}")],
+    )
+    .is_ok()
+}
+
+/// Map a remote-tracking ref (`origin/topic`, `up/feat/x`) to the local branch
+/// name to check out — the ref with its remote prefix removed. The first
+/// configured remote that prefixes it as `<remote>/…` wins (so a branch whose
+/// own name contains slashes survives); when none match (e.g. the remote was
+/// since removed) fall back to dropping the first path segment. `None` when
+/// there's nothing after the remote to name a branch.
+fn local_branch_for_remote_ref(refname: &str, remotes: &[String]) -> Option<String> {
+    let after_prefix = |prefix: &str| {
+        refname
+            .strip_prefix(prefix)
+            .and_then(|s| s.strip_prefix('/'))
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    remotes.iter().find_map(|r| after_prefix(r)).or_else(|| {
+        refname
+            .split_once('/')
+            .map(|(_, rest)| rest.to_string())
+            .filter(|s| !s.is_empty())
+    })
+}
+
+/// Wrap a raw git failure with the ref we were trying to check out, so the
+/// toast is actionable instead of a bare git error (#96).
+fn checkout_error(refname: &str, err: &str) -> String {
+    format!("could not check out {refname:?}:\n{err}")
 }
 
 // ---------- remote & history ops ----------
@@ -990,6 +1066,83 @@ mod tests {
         let err = git_checkout(p(d), "-f".into(), false).unwrap_err();
         assert!(err.contains("must not start with '-'"), "got: {err}");
         assert!(git_checkout(p(d), "--track".into(), true).is_err());
+    }
+
+    #[test]
+    fn resolve_remote_ref_strips_remote_prefix() {
+        let origin = vec!["origin".to_string()];
+        // Simple case.
+        assert_eq!(
+            local_branch_for_remote_ref("origin/feature", &origin).as_deref(),
+            Some("feature")
+        );
+        // Branch name with slashes (the #96 ref) keeps every segment after the
+        // remote — the remote is matched, not just "first path component".
+        assert_eq!(
+            local_branch_for_remote_ref("origin/orch/integration-46-65", &origin).as_deref(),
+            Some("orch/integration-46-65")
+        );
+        // The right remote among several wins; a look-alike prefix is not a
+        // false match (`orig` must not swallow `origin/…`).
+        let many = vec!["orig".to_string(), "origin".to_string(), "up".to_string()];
+        assert_eq!(
+            local_branch_for_remote_ref("up/feat/x", &many).as_deref(),
+            Some("feat/x")
+        );
+        assert_eq!(
+            local_branch_for_remote_ref("origin/x", &many).as_deref(),
+            Some("x")
+        );
+        // No configured remotes → fall back to dropping the first segment.
+        assert_eq!(
+            local_branch_for_remote_ref("origin/topic", &[]).as_deref(),
+            Some("topic")
+        );
+        // Nothing left to name a branch → None.
+        assert_eq!(local_branch_for_remote_ref("origin", &origin), None);
+        assert_eq!(local_branch_for_remote_ref("origin/", &origin), None);
+    }
+
+    #[test]
+    fn checkout_track_reuses_or_creates_local_branch() {
+        // Publish `main` + a `topic/nested` branch to a bare remote.
+        let bare = tempfile::tempdir().unwrap();
+        setup_git(bare.path(), &["init", "-q", "--bare"]);
+        setup_git(bare.path(), &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        let up = new_repo();
+        commit(up.path(), "f.txt", "one\n", "A");
+        setup_git(up.path(), &["branch", "topic/nested"]);
+        setup_git(up.path(), &["remote", "add", "origin", &p(bare.path())]);
+        git_push(p(up.path()), true).unwrap();
+        setup_git(up.path(), &["push", "-q", "origin", "topic/nested"]);
+
+        // Fresh clone: no local `topic/nested` yet → create a tracking branch.
+        let clone_dir = tempfile::tempdir().unwrap();
+        setup_git(clone_dir.path(), &["clone", "-q", &p(bare.path()), "wc"]);
+        let d = clone_dir.path().join("wc");
+        setup_git(&d, &["config", "user.name", "Two"]);
+        setup_git(&d, &["config", "user.email", "two@example.com"]);
+
+        git_checkout(p(&d), "origin/topic/nested".into(), true).unwrap();
+        assert_eq!(
+            run_git(&p(&d), &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap().trim(),
+            "topic/nested"
+        );
+        // The new branch tracks the remote.
+        assert_eq!(
+            run_git(&p(&d), &["rev-parse", "--abbrev-ref", "@{upstream}"]).unwrap().trim(),
+            "origin/topic/nested"
+        );
+
+        // Switch away, then re-check-out the remote ref. #96: the old
+        // `checkout --track` fataled here because `topic/nested` now exists
+        // locally; we must just switch back to it.
+        git_checkout(p(&d), "main".into(), false).unwrap();
+        git_checkout(p(&d), "origin/topic/nested".into(), true).unwrap();
+        assert_eq!(
+            run_git(&p(&d), &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap().trim(),
+            "topic/nested"
+        );
     }
 
     #[test]

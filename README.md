@@ -169,7 +169,8 @@ Toolbar (top-right of the graph):
 
 Click the **branch name** in the header to switch branches — the menu lists
 every local branch plus remote-tracking branches (checking a remote one out
-creates a local tracking branch).
+creates a local branch tracking it, or switches to the existing local branch of
+that name if you've checked it out before).
 
 **Right-click a commit** for its actions: checkout (detached), create a branch
 or tag here, cherry-pick / revert / merge / rebase onto the current branch, or
