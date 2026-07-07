@@ -203,6 +203,16 @@ impl PtyManager {
         Some(total)
     }
 
+    /// Snapshot the output ring AND its monotonic total under a SINGLE lock, so
+    /// the pair can't tear. `deliver_prompt`'s submit-confirm slices the ring by
+    /// `total` (bytes since the Enter); reading them separately could let the ring
+    /// grow between the two reads and over-reach the slice (#112 rev-9 note B).
+    pub fn output_tail_and_total(&self, id: u32) -> Option<(Vec<u8>, u64)> {
+        let ptys = self.ptys.lock_safe();
+        let buf = ptys.get(&id)?.output.lock_safe();
+        Some((buf.ring.iter().copied().collect(), buf.total))
+    }
+
     /// Ids of every live pty. Lets the attention scan (#40) cover *all* panes —
     /// including plain shells the human opened by hand, which have no
     /// orchestration identity — not just registered agents.

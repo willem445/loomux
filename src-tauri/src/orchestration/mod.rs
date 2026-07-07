@@ -1604,14 +1604,66 @@ pub fn submit_sequence(cli: &str) -> &'static [u8] {
     }
 }
 
+/// The three distinguishable results of watching a delivery's submit (#112). A
+/// plain `confirmed: bool` conflated the last two — so a delivery to a CLI whose
+/// turn shape we can't model looked identical to a genuinely stranded one,
+/// arming the #103 unconfirmed notice AND the #99 stranded-flush on a pane that
+/// in fact submits fine (rev-9 note A). Keeping the third state explicit means no
+/// downstream *action* fires on a result we couldn't verify.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubmitOutcome {
+    /// Positively observed the prompt enter the conversation.
+    Landed,
+    /// A modeled CLI, but no landing seen in the window — the prompt may be
+    /// sitting unsubmitted. Arms the #103 notice and the next-delivery flush.
+    NotLanded,
+    /// The CLI's committed-turn shape isn't modeled (only Claude Code is), so
+    /// there is NO signal either way. Never confirmed (that would false-confirm by
+    /// construction) and never acted on — no notice, no flush — only recorded.
+    Unverifiable,
+}
+
+impl SubmitOutcome {
+    /// Compact tag for the audit log so the three states are distinguishable.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SubmitOutcome::Landed => "landed",
+            SubmitOutcome::NotLanded => "not-landed",
+            SubmitOutcome::Unverifiable => "unverifiable",
+        }
+    }
+}
+
+/// Classify a delivery's submit from whether the CLI is modelable and, if so,
+/// whether a landing was observed. Pure so the three-way mapping is testable.
+/// Never returns `Landed` for an unmodeled CLI — `Unverifiable` is the explicit
+/// "took no action" state, NOT a disguised confirm.
+pub fn classify_submit(cli_modeled: bool, landed: bool) -> SubmitOutcome {
+    match (cli_modeled, landed) {
+        (false, _) => SubmitOutcome::Unverifiable,
+        (true, true) => SubmitOutcome::Landed,
+        (true, false) => SubmitOutcome::NotLanded,
+    }
+}
+
+/// Whether loomux can model this CLI's committed-user-turn rendering well enough
+/// to run the #112 landed check. Only Claude Code today (its un-framed `> …` turn
+/// shape); every other CLI yields `SubmitOutcome::Unverifiable` rather than an
+/// unsound guess (rev-9 finding #3). Widen this only alongside a real captured
+/// turn fixture for the added CLI.
+pub fn confirm_cli_modeled(cli: &str) -> bool {
+    cli == "claude"
+}
+
 /// The outcome of the most recent delivery to a pane, kept in-memory per pty so
 /// the next delivery can detect a previous prompt still stranded in the input
 /// box (#81/#84).
 #[derive(Clone, Copy, Debug)]
 struct DeliveryOutcome {
-    /// Whether that delivery's Enter was observed to submit (box cleared / turn
-    /// started). `false` means the text may still be sitting unsubmitted.
-    confirmed: bool,
+    /// How that delivery's submit resolved (#112). `NotLanded` means the text may
+    /// still be sitting unsubmitted; `Unverifiable` means we had no signal (an
+    /// unmodeled CLI) and must take no recovery action off it.
+    outcome: SubmitOutcome,
     /// Unix-ms the final Enter was sent — the reference point for deciding
     /// whether a human has since typed into the pane.
     submit_sent_ms: u64,
@@ -1645,9 +1697,13 @@ struct DeliveryOutcome {
 /// `reached_quiet` gates it (rev-32): if the submit-wait hit `SUBMIT_MAX_WAIT`
 /// while output still streamed, the Enter landed mid-stream and the delta is that
 /// stream, not the submit's — never confirmed.
+///
+/// This is the modeled-CLI *landed* check only. CLI modelability is a separate
+/// gate (`confirm_cli_modeled`) applied by `deliver_prompt` before it ever calls
+/// this, so an unmodeled CLI becomes `SubmitOutcome::Unverifiable`, not a `false`
+/// that would masquerade as `NotLanded` (rev-9 note A).
 pub fn submit_confirmed(
     reached_quiet: bool,
-    cli: &str,
     before_total: u64,
     after_ring: &[u8],
     after_total: u64,
@@ -1661,7 +1717,7 @@ pub fn submit_confirmed(
     // `saturating_sub` then just takes the whole ring, a safe over-approximation.
     let new_len = after_total.saturating_sub(before_total) as usize;
     let start = after_ring.len().saturating_sub(new_len);
-    prompt_landed(cli, &strip_ansi(&after_ring[start..]), prompt)
+    prompt_landed(&strip_ansi(&after_ring[start..]), prompt)
 }
 
 /// Evidence in `delta` (the ANSI-stripped bytes painted since the submit Enter)
@@ -1684,17 +1740,9 @@ pub fn submit_confirmed(
 /// 2. the delta's newest frame no longer holds the needle in the input box — it
 ///    isn't still sitting there.
 ///
-/// **Scoped to Claude Code.** The `>`-led-user-turn shape is Claude's; no real
-/// capture of a Copilot (or other CLI) *committed turn* exists to model, and a
-/// CLI that paints some non-turn line as un-framed `>`-led would be a
-/// false-confirm vector (rev-9 finding #3). Other CLIs therefore never
-/// content-confirm — they stay `unconfirmed` and lean on the #103 notice. When a
-/// real Copilot turn capture exists this can widen; until then, silence over an
-/// unsound guess.
-pub fn prompt_landed(cli: &str, delta: &str, prompt: &str) -> bool {
-    if cli != "claude" {
-        return false; // only Claude's committed-turn shape is modeled (rev-9 #3)
-    }
+/// The `>`-led-user-turn shape this matches is Claude Code's; callers gate on
+/// `confirm_cli_modeled` so this only ever runs for a CLI it fits (rev-9 #3).
+pub fn prompt_landed(delta: &str, prompt: &str) -> bool {
     let Some(needle) = prompt_needle(prompt) else {
         return false; // nothing distinctive enough to match — stay unconfirmed
     };
@@ -1808,14 +1856,16 @@ fn current_box_holds(delta: &str, needle: &str) -> bool {
 /// before pasting the next prompt (#81/#84).
 ///
 /// Flush only on the exact stranded-text signature: the previous delivery to
-/// this pane was NOT confirmed as submitted, AND no human has typed into the
-/// pane since (so the box holds the earlier *agent* prompt, not a person's
-/// half-written line — which must never be blind-submitted). Never flushes on
-/// the first delivery to a pane (`prev_confirmed == None`) or after a confirmed
-/// one. A false "unconfirmed" here is safe: the flush Enter lands on an already
-/// empty box and is a no-op.
-pub fn should_flush_before_paste(prev_confirmed: Option<bool>, human_typed_since: bool) -> bool {
-    matches!(prev_confirmed, Some(false)) && !human_typed_since
+/// this pane resolved `NotLanded`, AND no human has typed into the pane since (so
+/// the box holds the earlier *agent* prompt, not a person's half-written line —
+/// which must never be blind-submitted). Never flushes on the first delivery to a
+/// pane (`prev == None`), after a `Landed` one (box already clear), or after an
+/// `Unverifiable` one (an unmodeled CLI — we have no evidence anything is
+/// stranded, so we must not fire a blind Enter into its pane; rev-9 note A). A
+/// false `NotLanded` here is safe: the flush Enter lands on an already-empty box
+/// and is a no-op.
+pub fn should_flush_before_paste(prev: Option<SubmitOutcome>, human_typed_since: bool) -> bool {
+    matches!(prev, Some(SubmitOutcome::NotLanded)) && !human_typed_since
 }
 
 /// How a single human write into a pane's input changes box occupancy (#111).
@@ -1995,18 +2045,23 @@ fn wait_for_box_clear(ptys: &crate::pty::PtyManager, pty_id: u32) -> PasteDecisi
     )
 }
 
-/// Whether an unconfirmed delivery should raise a one-shot notice to the group's
-/// orchestrator so it can close the loop (#103). Fires only for a delivery to a
-/// NON-orchestrator agent whose submit went unconfirmed: the prompt may be
-/// sitting unsubmitted in the pane while the orchestrator, believing it landed,
-/// is none the wiser. Suppressed when the target IS the orchestrator — a notice
-/// about a delivery to the orchestrator would itself be a delivery to the
-/// orchestrator, an endless loop; those rely on #99's stranded-text flush on the
-/// next delivery instead. Suppressed when confirmed: the prompt landed, nothing
-/// to chase. Pure so the gate is testable; emission (exactly once per delivery,
-/// past the submit retries) lives in `deliver_prompt`'s delivery thread.
-pub fn should_notify_unconfirmed(target_is_orchestrator: bool, confirmed: bool) -> bool {
-    !target_is_orchestrator && !confirmed
+/// Whether a delivery should raise a one-shot notice to the group's orchestrator
+/// so it can close the loop (#103). Fires ONLY for a `NotLanded` delivery to a
+/// NON-orchestrator agent: the prompt may be sitting unsubmitted in the pane
+/// while the orchestrator, believing it landed, is none the wiser. Suppressed
+/// when:
+/// - the target IS the orchestrator — a notice about a delivery to the
+///   orchestrator is itself a delivery to it, an endless loop; those rely on
+///   #99's stranded-text flush on the next delivery instead;
+/// - the outcome is `Landed` — the prompt landed, nothing to chase; or
+/// - the outcome is `Unverifiable` — the CLI's turn shape isn't modeled, so we
+///   have NO evidence of a problem. Firing here would spam a false alarm on every
+///   delivery to an unmodeled CLI that in fact submits fine (rev-9 note A).
+///
+/// Pure so the gate is testable; emission (exactly once per delivery, past the
+/// submit retries) lives in `deliver_prompt`'s delivery thread.
+pub fn should_notify_unconfirmed(target_is_orchestrator: bool, outcome: SubmitOutcome) -> bool {
+    !target_is_orchestrator && matches!(outcome, SubmitOutcome::NotLanded)
 }
 
 /// The one-shot notice delivered to the orchestrator for an unconfirmed delivery
@@ -4802,7 +4857,7 @@ impl OrchRegistry {
             let human_typed_since = prev
                 .map(|o| ptys.last_user_input_ms(pty_id).unwrap_or(0) > o.submit_sent_ms)
                 .unwrap_or(false);
-            if should_flush_before_paste(prev.map(|o| o.confirmed), human_typed_since)
+            if should_flush_before_paste(prev.map(|o| o.outcome), human_typed_since)
                 && ptys.write_bytes(pty_id, submit).is_ok()
             {
                 append_audit(&root, &group, "loomux", "delivery-flush",
@@ -4933,21 +4988,28 @@ impl OrchRegistry {
             // Enter landed mid-stream and that stream would false-confirm
             // (rev-32), so we skip the window and leave it unconfirmed. A miss
             // here is safe: the next delivery's flush just no-ops on an empty box.
+            //
+            // Only a CLI whose committed-turn shape we model is watched at all
+            // (`confirm_cli_modeled`); for any other the outcome is `Unverifiable`
+            // — we have no signal, so we take NO recovery action off it (no #103
+            // notice, no next-delivery flush) rather than false-alarm on a pane
+            // that submits fine (rev-9 note A).
+            let modeled = confirm_cli_modeled(&cli);
             let confirm_deadline = std::time::Instant::now() + SUBMIT_CONFIRM_WINDOW;
-            let mut confirmed = false;
-            while reached_quiet && std::time::Instant::now() < confirm_deadline {
+            let mut landed = false;
+            while modeled && reached_quiet && std::time::Instant::now() < confirm_deadline {
                 std::thread::sleep(SUBMIT_CONFIRM_POLL);
-                let (Some(raw), Some(after_total)) =
-                    (ptys.output_tail(pty_id), ptys.output_total(pty_id))
-                else {
+                // Ring + total under ONE lock so the slice can't over-reach if the
+                // pane grows between two reads (rev-9 note B).
+                let Some((raw, after_total)) = ptys.output_tail_and_total(pty_id) else {
                     break; // terminal closed — leave unconfirmed
                 };
-                if submit_confirmed(reached_quiet, &cli, before_total, &raw, after_total, &prompt_text)
-                {
-                    confirmed = true;
+                if submit_confirmed(reached_quiet, before_total, &raw, after_total, &prompt_text) {
+                    landed = true;
                     break;
                 }
             }
+            let outcome = classify_submit(modeled, landed);
 
             for delay in SUBMIT_RETRY_DELAYS {
                 std::thread::sleep(delay);
@@ -4963,10 +5025,13 @@ impl OrchRegistry {
                 }
             }
             // Record the outcome so the next delivery to this pane can flush a
-            // prompt still stranded in the box (#81/#84).
+            // prompt still stranded in the box (#81/#84) — but only off a
+            // `NotLanded`, never an `Unverifiable` (rev-9 note A).
             last_delivery
                 .lock_safe()
-                .insert(pty_id, DeliveryOutcome { confirmed, submit_sent_ms });
+                .insert(pty_id, DeliveryOutcome { outcome, submit_sent_ms });
+            // `submit_outcome` is the distinguishable three-state tag; the boolean
+            // `submit_landed` is kept for at-a-glance filtering.
             append_audit(&root, &group, "loomux", "prompt-typed", json!({
                 "to": agent,
                 "cli": cli,
@@ -4974,22 +5039,25 @@ impl OrchRegistry {
                 "attempts": attempts,
                 "echoed": echoed,
                 "submit_waited_ms": submit_start.elapsed().as_millis() as u64,
-                "submit_confirmed": confirmed,
+                "submit_outcome": outcome.as_str(),
+                "submit_landed": outcome == SubmitOutcome::Landed,
             }));
             // Delivery outcome breadcrumb — timing + flags only, never the text.
             crate::obs::breadcrumb(
                 "delivery",
                 &format!(
-                    "agent={agent} pty={pty_id} outcome=typed echoed={echoed} confirmed={confirmed} attempts={attempts} waited_ms={}",
+                    "agent={agent} pty={pty_id} outcome=typed echoed={echoed} submit={} attempts={attempts} waited_ms={}",
+                    outcome.as_str(),
                     start.elapsed().as_millis() as u64
                 ),
             );
-            // Close the loop (#103): an unconfirmed delivery to a worker/reviewer
+            // Close the loop (#103): a `NotLanded` delivery to a worker/reviewer
             // may be stranded in its input box — nudge the orchestrator once so it
-            // can read the pane back and re-send. Exactly one notice per delivery:
-            // this is the single emission point, past all the submit retries.
+            // can read the pane back and re-send. Suppressed for `Landed` and for
+            // `Unverifiable` (no signal → no false alarm). Exactly one notice per
+            // delivery: this is the single emission point, past all submit retries.
             if let Some(reg) = reg {
-                reg.notify_unconfirmed_delivery(&group, &agent, target_is_orchestrator, confirmed);
+                reg.notify_unconfirmed_delivery(&group, &agent, target_is_orchestrator, outcome);
             }
         });
         Ok(())
@@ -5014,24 +5082,23 @@ impl OrchRegistry {
     }
 
     /// Close the delivery feedback loop (#103): when a delivery to a
-    /// non-orchestrator agent finishes with its submit unconfirmed, tell the
-    /// group's orchestrator once so it can `get_output` the pane and re-send if
-    /// the prompt is stranded unsubmitted. No-op for orchestrator-target or
-    /// confirmed deliveries (`should_notify_unconfirmed`), and — like the
-    /// watchdog nudge — a paused group is skipped entirely: delivery is
-    /// suppressed there anyway, so we must not spend the notice budget while
-    /// paused. Best-effort (a dead orchestrator just drops it) and audited. The
-    /// notice is itself a delivery TO the orchestrator, so it can never trigger a
-    /// notice of its own — no loops.
+    /// non-orchestrator agent finishes `NotLanded`, tell the group's orchestrator
+    /// once so it can `get_output` the pane and re-send if the prompt is stranded
+    /// unsubmitted. No-op for orchestrator-target, `Landed`, or `Unverifiable`
+    /// deliveries (`should_notify_unconfirmed`), and — like the watchdog nudge — a
+    /// paused group is skipped entirely: delivery is suppressed there anyway, so
+    /// we must not spend the notice budget while paused. Best-effort (a dead
+    /// orchestrator just drops it) and audited. The notice is itself a delivery TO
+    /// the orchestrator, so it can never trigger a notice of its own — no loops.
     #[doc(hidden)] // pub for integration tests
     pub fn notify_unconfirmed_delivery(
         &self,
         group: &str,
         agent_id: &str,
         target_is_orchestrator: bool,
-        confirmed: bool,
+        outcome: SubmitOutcome,
     ) {
-        if !should_notify_unconfirmed(target_is_orchestrator, confirmed) || self.is_paused(group) {
+        if !should_notify_unconfirmed(target_is_orchestrator, outcome) || self.is_paused(group) {
             return;
         }
         self.audit(group, "loomux", "delivery-unconfirmed-notice", json!({ "to": agent_id }));

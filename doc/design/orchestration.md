@@ -416,10 +416,14 @@ rides the per-delivery `submit_confirmed` signal (the prompt leaving the box and
 as a committed user turn — see [Submit-landed signal (#112)](#submit-landed-signal-112))
 rather than making the orchestrator poll terminals by hand.
 
-- **The trigger.** When a delivery thread finishes with `confirmed == false`, it calls
-  `notify_unconfirmed_delivery` off the outcome it recorded. The gate is the pure
-  `should_notify_unconfirmed(target_is_orchestrator, confirmed)`: notify only for an
-  unconfirmed delivery to a **non-orchestrator** agent.
+- **The trigger.** When a delivery thread finishes, it calls `notify_unconfirmed_delivery` off
+  the `SubmitOutcome` it recorded. The gate is the pure
+  `should_notify_unconfirmed(target_is_orchestrator, outcome)`: notify only for a **`NotLanded`**
+  delivery to a **non-orchestrator** agent. A `Landed` delivery has nothing to chase, and an
+  **`Unverifiable`** one (a CLI whose turn shape isn't modeled — see the
+  [Submit-landed signal](#submit-landed-signal-112)) carries *no signal*, so firing there would
+  false-alarm on every delivery to a pane that in fact submits fine — it is suppressed too, and
+  those panes rely on the silent-agent **watchdog** instead of this loop.
 - **The action.** One audited (`delivery-unconfirmed-notice`) `[loomux]` notice
   (`unconfirmed_delivery_notice`) to the orchestrator (`deliver_to_orchestrator`, actor
   `loomux`) naming the agent and pointing at the recovery move — `get_output` the pane,
@@ -554,30 +558,48 @@ painted *in response to* the Enter, so every stale pre-Enter frame is excluded b
   A swallowed re-send therefore can't borrow it as proof, and — unlike the rev-119 attempt — a
   re-send that *genuinely* lands still confirms (its committed turn is new bytes in the delta),
   with no false-unconfirmed.
-- **Scoped to Claude Code (rev-9 finding #3).** The `>`-led-user-turn shape is Claude's. No real
-  capture of a Copilot (or other CLI) *committed turn* exists to model it against, and a CLI that
-  painted some non-turn line as un-framed `>`-led would be a false-confirm vector — so
-  `prompt_landed` returns `false` for any `cli != "claude"`. Those deliveries stay `unconfirmed`
-  and lean on the #103 notice rather than an unsound guess; when a real Copilot turn capture
-  exists (from a live session — this project never spawns agent CLIs in tests) the scope can widen.
+- **Three outcomes, not a bool (rev-9 note A).** The result is a `SubmitOutcome`, not
+  `confirmed: bool`, because "didn't land" and "can't be verified" must drive *different*
+  actions. `deliver_prompt` classifies via `classify_submit(confirm_cli_modeled(cli), landed)`:
+  - `Landed` — a modeled CLI whose delta showed the committed turn. No notice, no flush.
+  - `NotLanded` — a modeled CLI with no landing in the window. Arms the #103 notice **and** the
+    #99 stranded-flush (the prompt may really be sitting there).
+  - `Unverifiable` — a CLI whose committed-turn shape isn't modeled, so there is *no signal
+    either way*. **No downstream action fires**: no #103 notice (else every delivery to that CLI
+    false-alarms and invites a duplicate re-send) and no #99 stranded-flush arm (else an extra
+    blind Enter into a pane that submits fine). It is recorded and audited distinctly
+    (`submit_outcome: "unverifiable"`), nothing more — those panes are covered by the silent-agent
+    watchdog. Crucially `Unverifiable` is **never** mapped to `Landed`: that would false-confirm by
+    construction; the point is inaction on an unverifiable result, not a false positive.
+- **Scoped to Claude Code (rev-9 finding #3).** The `>`-led-user-turn shape is Claude's, so
+  `confirm_cli_modeled` returns true only for `"claude"`. No real capture of a Copilot (or other
+  CLI) *committed turn* exists to model it against, and a CLI that painted some non-turn line as
+  un-framed `>`-led would be a false-confirm vector. Every other CLI is therefore `Unverifiable`
+  (above), not watched at all; when a real captured turn fixture exists for another CLI (from a
+  live session — this project never spawns agent CLIs in tests) `confirm_cli_modeled` can widen.
+- **One-lock ring snapshot (rev-9 note B).** Each poll reads the ring and its byte total via a
+  single `output_tail_and_total`, so the pair can't tear: reading them under separate locks could
+  let the pane grow between the two and make `after_total − before_total` over-reach the slice.
 - **rev-32 preserved.** Confirm still requires the pane reached quiet *before* Enter
-  (`reached_quiet`); a cap-hit-without-quiet is never confirmed. Every ambiguous case — unknown
-  CLI, unfingerprintable prompt, empty delta, ring evicted mid-window — resolves to `unconfirmed`,
-  whose worst case is one spurious #103 notice or a no-op stranded-flush next delivery; never a
-  false confirm that strands a prompt recorded as landed.
+  (`reached_quiet`); a cap-hit-without-quiet is never confirmed. Every ambiguous case — unmodeled
+  CLI, unfingerprintable prompt, empty delta, ring evicted mid-window — resolves to a non-`Landed`
+  outcome, whose worst case (for `NotLanded`) is one spurious #103 notice or a no-op
+  stranded-flush; never a false confirm that strands a prompt recorded as landed.
 - **Pure and unit-tested on the real input shape.** The fixtures build tails the way the ring
   actually fills — real escape-laden repaint **frames concatenated** into a growing ring, `after ⊇
   before` — and drive `submit_confirmed` through the same byte-total slicing as production (not
   idealized single screens, the rev-9 test-quality finding). They pin: both live false-confirm
   cases, a landing that survives several pre-Enter box repaints (the rev-119 false-*unconfirmed*),
   spinner/ignored-Enter repaint noise, the stale-scrollback re-send (both swallowed and landed),
-  the Claude-only scoping, an unfingerprintable prompt, mid-window ring eviction, the
-  never-confirm-without-quiet rule, and a never-false-confirm sweep over every non-landing delta.
+  the Claude-only scoping, the three-way `classify_submit` mapping, that an `Unverifiable` outcome
+  fires neither the #103 notice nor the stranded-flush, an unfingerprintable prompt, mid-window
+  ring eviction, the never-confirm-without-quiet rule, and a never-false-confirm sweep over every
+  non-landing delta.
 - **Known gaps (all conservative — they lose confirmations, never gain false ones).** A CLI that
   *collapses* a long bracketed paste to a placeholder (`[Pasted text +N lines]`) and never paints
-  the literal text as a committed turn stays `unconfirmed` (a #103 notice, not a false confirm).
-  Non-Claude CLIs stay `unconfirmed` wholesale (scoping, above). All degrade to the harmless
-  direction.
+  the literal text as a committed turn stays `NotLanded` (a #103 notice, not a false confirm).
+  Non-Claude CLIs are `Unverifiable` — no feedback at all, covered by the watchdog (above). All
+  degrade to the harmless direction.
 - **The #111 residual, and why the paste guard is left alone.** #111 fenced two residual classes
   to this issue. The *availability* residuals (a stuck `input_pending` after Esc/Ctrl-W/Ctrl-K/
   backspace-to-empty) would need the paste guard to read the box as *empty* — but Claude Code's

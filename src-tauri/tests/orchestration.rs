@@ -8,7 +8,8 @@
 
 use loomux_lib::orchestration::mcp::dispatch;
 use loomux_lib::orchestration::{
-    add_trusted_folder, bracketed_paste, classify_human_input, claude_permission_mode, cli_ready,
+    add_trusted_folder, bracketed_paste, classify_human_input, classify_submit,
+    claude_permission_mode, cli_ready, confirm_cli_modeled,
     copilot_autopilot_prompt_detected, create_orchestration_group, hold_for_human_input,
     hold_until_quiet, idle_should_kill, max_agents_notice,
     normalize_remote_web_base, parse_audit_lines, parse_session_cost, paste_held_notice,
@@ -18,7 +19,7 @@ use loomux_lib::orchestration::{
     spawn_rate_exceeded, spawn_request_expired, strip_ansi, submit_confirmed, submit_sequence,
     unconfirmed_delivery_notice, watchdog_should_notify, worktree_cleanup_targets,
     AttentionItem, Caller, Delivery, Guardrails, HumanInput, NameSource, OrchRegistry, PasteDecision,
-    PasteGate, Role, TaskPatch, UsageSnapshot, CLAUDE_UNATTENDED_ALLOW, COPILOT_AUTOPILOT_CONFIRM_KEYS,
+    PasteGate, Role, SubmitOutcome, TaskPatch, UsageSnapshot, CLAUDE_UNATTENDED_ALLOW, COPILOT_AUTOPILOT_CONFIRM_KEYS,
     COPILOT_GROUP_AUTOPILOT_FLAGS, COPILOT_UNATTENDED_FLAGS, MAX_ATTACHMENT_BYTES,
     PLANNER_READONLY_NOTE,
 };
@@ -608,14 +609,18 @@ fn should_flush_only_on_the_stranded_text_signature() {
     // First delivery to a pane (no prior outcome): never flush.
     assert!(!should_flush_before_paste(None, false));
     assert!(!should_flush_before_paste(None, true));
-    // Previous delivery confirmed as submitted: box is empty, never flush.
-    assert!(!should_flush_before_paste(Some(true), false));
-    assert!(!should_flush_before_paste(Some(true), true));
-    // Previous delivery unconfirmed BUT a human has typed since: their line may
-    // be in the box — never blind-submit it.
-    assert!(!should_flush_before_paste(Some(false), true));
-    // The one case that flushes: previous unconfirmed, no human input since.
-    assert!(should_flush_before_paste(Some(false), false));
+    // Previous delivery landed: box is empty, never flush.
+    assert!(!should_flush_before_paste(Some(SubmitOutcome::Landed), false));
+    assert!(!should_flush_before_paste(Some(SubmitOutcome::Landed), true));
+    // Previous delivery UNVERIFIABLE (unmodeled CLI): we have no evidence anything
+    // is stranded, so we must NOT fire a blind Enter into its pane (rev-9 note A).
+    assert!(!should_flush_before_paste(Some(SubmitOutcome::Unverifiable), false));
+    assert!(!should_flush_before_paste(Some(SubmitOutcome::Unverifiable), true));
+    // Previous delivery NotLanded BUT a human has typed since: their line may be
+    // in the box — never blind-submit it.
+    assert!(!should_flush_before_paste(Some(SubmitOutcome::NotLanded), true));
+    // The one case that flushes: previous NotLanded, no human input since.
+    assert!(should_flush_before_paste(Some(SubmitOutcome::NotLanded), false));
 }
 
 // ── Submit-landed signal (#112) ────────────────────────────────────────────
@@ -693,14 +698,17 @@ fn dialog_after_frame() -> String {
     )
 }
 
-/// Drive `submit_confirmed` exactly as `deliver_prompt` does: `before_frames` are
-/// the repaint frames already in the ring at the Enter; `new_frames` are painted
-/// after it. The ring is their concatenation (append-only, `after ⊇ before`), and
-/// the confirm slices the delta by the monotonic byte total.
+/// Drive the confirm exactly as `deliver_prompt` does: `before_frames` are the
+/// repaint frames already in the ring at the Enter; `new_frames` are painted
+/// after it. The ring is their concatenation (append-only, `after ⊇ before`); the
+/// confirm slices the delta by the monotonic byte total. Mirrors the two-stage
+/// production gate — an unmodeled CLI is never watched, so it can never land.
+/// Returns whether the delivery resolved `Landed`.
 fn confirm_over_ring(cli: &str, before_frames: &[String], new_frames: &[String], prompt: &str) -> bool {
     let before: String = before_frames.concat();
     let after: String = format!("{}{}", before, new_frames.concat());
-    submit_confirmed(true, cli, before.len() as u64, after.as_bytes(), after.len() as u64, prompt)
+    confirm_cli_modeled(cli)
+        && submit_confirmed(true, before.len() as u64, after.as_bytes(), after.len() as u64, prompt)
 }
 
 #[test]
@@ -779,7 +787,7 @@ fn submit_never_confirmed_when_quiet_was_not_reached() {
     let before = sitting_frame(DELIVERED);
     let after = format!("{before}{}", landing_frame());
     assert!(!submit_confirmed(
-        false, "claude", before.len() as u64, after.as_bytes(), after.len() as u64, DELIVERED
+        false, before.len() as u64, after.as_bytes(), after.len() as u64, DELIVERED
     ));
 }
 
@@ -787,8 +795,11 @@ fn submit_never_confirmed_when_quiet_was_not_reached() {
 fn submit_confirm_is_scoped_to_claude_until_other_cli_turns_are_captured() {
     // rev-9 finding #3: the `>`-led committed-turn shape is Claude's; no real
     // Copilot turn capture exists to model, and confirming on an unmodeled CLI
-    // would be a false-confirm vector. Copilot deliveries stay unconfirmed (the
-    // #103 notice covers them) rather than guess.
+    // would be a false-confirm vector.
+    assert!(confirm_cli_modeled("claude"));
+    assert!(!confirm_cli_modeled("copilot"));
+    assert!(!confirm_cli_modeled("some-future-cli"));
+
     let landing = &[landing_frame()];
     let sitting = &[sitting_frame(DELIVERED)];
     assert!(
@@ -803,6 +814,34 @@ fn submit_confirm_is_scoped_to_claude_until_other_cli_turns_are_captured() {
         !confirm_over_ring("some-future-cli", sitting, landing, DELIVERED),
         "an unknown CLI must never content-confirm"
     );
+}
+
+#[test]
+fn classify_submit_keeps_unverifiable_distinct_from_not_landed() {
+    // rev-9 note A: an unmodeled CLI must NOT collapse to `NotLanded` (which arms
+    // the #103 notice + the stranded-flush) nor to `Landed` (a false confirm by
+    // construction) — it is its own `Unverifiable` state, whatever the (unused)
+    // landed flag says.
+    assert_eq!(classify_submit(false, false), SubmitOutcome::Unverifiable);
+    assert_eq!(classify_submit(false, true), SubmitOutcome::Unverifiable);
+    // A modeled CLI maps landed → Landed, else → NotLanded.
+    assert_eq!(classify_submit(true, true), SubmitOutcome::Landed);
+    assert_eq!(classify_submit(true, false), SubmitOutcome::NotLanded);
+}
+
+#[test]
+fn submit_outcome_audits_the_three_states_distinctly() {
+    // The delivery audit records `submit_outcome: <tag>`; the three tags must be
+    // distinct so an `Unverifiable` delivery is visibly different in the log from
+    // a stranded `NotLanded` one (rev-9 note A: distinguishable in the audit).
+    let tags = [
+        SubmitOutcome::Landed.as_str(),
+        SubmitOutcome::NotLanded.as_str(),
+        SubmitOutcome::Unverifiable.as_str(),
+    ];
+    assert_eq!(tags, ["landed", "not-landed", "unverifiable"]);
+    // No two collide.
+    assert!(tags[0] != tags[1] && tags[1] != tags[2] && tags[0] != tags[2]);
 }
 
 #[test]
@@ -839,7 +878,7 @@ fn submit_unconfirmable_for_too_short_a_prompt() {
     let sitting_tiny = format!("{HOME}╭{b}╮\r\n│ > ok\x1b[K │\r\n╰{b}╯\r\n", b = bar());
     let after = format!("{sitting_tiny}{landed_tiny}");
     assert!(!submit_confirmed(
-        true, "claude", sitting_tiny.len() as u64, after.as_bytes(), after.len() as u64, tiny
+        true, sitting_tiny.len() as u64, after.as_bytes(), after.len() as u64, tiny
     ));
 }
 
@@ -856,7 +895,7 @@ fn submit_confirm_degrades_safely_when_the_ring_evicted_mid_window() {
     let before_total = 100u64;
     let after_total = before_total + 900; // claims 900 new bytes; ring is shorter
     assert!(after_total - before_total > ring.len() as u64);
-    assert!(submit_confirmed(true, "claude", before_total, ring, after_total, DELIVERED));
+    assert!(submit_confirmed(true, before_total, ring, after_total, DELIVERED));
 }
 
 #[test]
@@ -885,16 +924,20 @@ fn submit_never_false_confirms_across_non_landing_deltas() {
 
 #[test]
 fn unconfirmed_notice_fires_only_for_a_stranded_worker_delivery() {
-    // The one case that notifies: a delivery to a non-orchestrator agent whose
-    // submit went unconfirmed — the prompt may be sitting unsubmitted in the box.
-    assert!(should_notify_unconfirmed(false, false));
-    // Confirmed submit: the prompt landed, nothing to chase.
-    assert!(!should_notify_unconfirmed(false, true));
+    // The one case that notifies: a NotLanded delivery to a non-orchestrator
+    // agent — the prompt may be sitting unsubmitted in the box.
+    assert!(should_notify_unconfirmed(false, SubmitOutcome::NotLanded));
+    // Landed submit: the prompt landed, nothing to chase.
+    assert!(!should_notify_unconfirmed(false, SubmitOutcome::Landed));
+    // Unverifiable (unmodeled CLI): we have no signal, so no false alarm — this is
+    // the rev-9 note-A fix (Copilot submits fine but can't be content-confirmed).
+    assert!(!should_notify_unconfirmed(false, SubmitOutcome::Unverifiable));
     // Target IS the orchestrator: a notice to it would itself be a delivery to
-    // the orchestrator — an endless loop. Never notify, confirmed or not; those
-    // rely on #99's stranded-text flush on the next delivery instead.
-    assert!(!should_notify_unconfirmed(true, false));
-    assert!(!should_notify_unconfirmed(true, true));
+    // the orchestrator — an endless loop. Never notify, whatever the outcome;
+    // those rely on #99's stranded-text flush on the next delivery instead.
+    assert!(!should_notify_unconfirmed(true, SubmitOutcome::NotLanded));
+    assert!(!should_notify_unconfirmed(true, SubmitOutcome::Landed));
+    assert!(!should_notify_unconfirmed(true, SubmitOutcome::Unverifiable));
 }
 
 #[test]
@@ -4163,20 +4206,26 @@ fn unconfirmed_delivery_notifies_the_orchestrator_and_suppresses_the_exceptions(
             .collect::<Vec<_>>()
     };
 
-    // Confirmed delivery to the worker: the prompt landed, nothing to chase.
-    reg.notify_unconfirmed_delivery(&g.id, &w.id, false, true);
-    assert!(notices(&reg).is_empty(), "a confirmed delivery must not notify");
+    // Landed delivery to the worker: the prompt landed, nothing to chase.
+    reg.notify_unconfirmed_delivery(&g.id, &w.id, false, SubmitOutcome::Landed);
+    assert!(notices(&reg).is_empty(), "a landed delivery must not notify");
 
-    // Unconfirmed delivery TO the orchestrator: a notice about it would itself be
-    // a delivery to the orchestrator — an endless loop. Suppressed.
-    reg.notify_unconfirmed_delivery(&g.id, &orch.id, true, false);
-    assert!(notices(&reg).is_empty(), "an unconfirmed delivery to the orchestrator must not notify");
+    // Unverifiable delivery to the worker (unmodeled CLI, e.g. Copilot): we have
+    // no signal, so firing here would false-alarm on a pane that submits fine
+    // (rev-9 note A). Suppressed.
+    reg.notify_unconfirmed_delivery(&g.id, &w.id, false, SubmitOutcome::Unverifiable);
+    assert!(notices(&reg).is_empty(), "an unverifiable delivery must not notify");
 
-    // The real case: an unconfirmed delivery to the worker → exactly one notice,
+    // NotLanded delivery TO the orchestrator: a notice about it would itself be a
+    // delivery to the orchestrator — an endless loop. Suppressed.
+    reg.notify_unconfirmed_delivery(&g.id, &orch.id, true, SubmitOutcome::NotLanded);
+    assert!(notices(&reg).is_empty(), "a NotLanded delivery to the orchestrator must not notify");
+
+    // The real case: a NotLanded delivery to the worker → exactly one notice,
     // audited to loomux, naming the stranded agent.
-    reg.notify_unconfirmed_delivery(&g.id, &w.id, false, false);
+    reg.notify_unconfirmed_delivery(&g.id, &w.id, false, SubmitOutcome::NotLanded);
     let after = notices(&reg);
-    assert_eq!(after.len(), 1, "an unconfirmed worker delivery notifies exactly once");
+    assert_eq!(after.len(), 1, "a NotLanded worker delivery notifies exactly once");
     assert_eq!(after[0].actor, "loomux", "the notice is a loomux system message");
     assert_eq!(after[0].detail["to"], w.id, "the notice names the stranded worker");
 }
@@ -4192,7 +4241,7 @@ fn unconfirmed_notice_is_suppressed_while_the_group_is_paused() {
     let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
     reg.pause_group(&g.id).unwrap();
 
-    reg.notify_unconfirmed_delivery(&g.id, &w.id, false, false);
+    reg.notify_unconfirmed_delivery(&g.id, &w.id, false, SubmitOutcome::NotLanded);
     assert!(
         reg.audit_log(&g.id).iter().all(|e| e.action != "delivery-unconfirmed-notice"),
         "a paused group must not raise the unconfirmed notice"
