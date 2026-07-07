@@ -2162,6 +2162,74 @@ impl OrchRegistry {
         Ok(())
     }
 
+    /// Delete every task in the terminal `done` status in a single board write,
+    /// returning the ids removed (empty if none were done). The board's "delete
+    /// all done" action routes through here so the batch surfaces to the
+    /// orchestrator as ONE board-change notice, not one per task (#120) — the
+    /// coalesced notice is emitted here (best-effort), so callers must not fan
+    /// out per-task notices. A no-op (nothing done) writes nothing and notifies
+    /// nothing.
+    pub fn delete_done_tasks(&self, group: &str, actor: &str) -> Result<Vec<String>, String> {
+        let removed = {
+            let _guard = self.tasks_lock.lock_safe();
+            let mut tasks = self.tasks(group);
+            let removed: Vec<String> =
+                tasks.iter().filter(|t| t.status == "done").map(|t| t.id.clone()).collect();
+            if removed.is_empty() {
+                return Ok(removed);
+            }
+            tasks.retain(|t| t.status != "done");
+            self.write_tasks(group, &tasks)?;
+            self.audit(group, actor, "task-delete-done", json!({ "ids": removed }));
+            removed
+        };
+        // Outside the tasks lock: notify is best-effort and can block on delivery.
+        let n = removed.len();
+        self.notify_board_edit(
+            group,
+            &format!("deleted {n} done task{}", if n == 1 { "" } else { "s" }),
+        );
+        Ok(removed)
+    }
+
+    /// Delete a specific set of tasks by id in a single board write, returning
+    /// the ids actually removed (a subset of `ids`, in board order). Backs the
+    /// board's multi-select "delete selected" action and mirrors
+    /// `delete_done_tasks`: the whole batch surfaces to the orchestrator as ONE
+    /// board-change notice (#120), emitted here (best-effort), so callers must
+    /// not fan out per-task notices. Ids not on the board are skipped, not
+    /// errored — the board can change under the human's selection (the
+    /// orchestrator or a batch may have removed a row since they clicked) — and
+    /// the skipped ids are recorded in the audit entry. An empty selection, or
+    /// one matching nothing, writes nothing and notifies nothing.
+    pub fn delete_tasks(&self, group: &str, actor: &str, ids: &[String]) -> Result<Vec<String>, String> {
+        let removed = {
+            let _guard = self.tasks_lock.lock_safe();
+            let mut tasks = self.tasks(group);
+            let wanted: HashSet<&str> = ids.iter().map(String::as_str).collect();
+            let removed: Vec<String> =
+                tasks.iter().filter(|t| wanted.contains(t.id.as_str())).map(|t| t.id.clone()).collect();
+            if removed.is_empty() {
+                return Ok(removed);
+            }
+            // Ids the human selected that no longer name a board row. Skipped,
+            // not fatal — but audited, so the divergence is traceable.
+            let present: HashSet<&str> = removed.iter().map(String::as_str).collect();
+            let skipped: Vec<&str> = ids.iter().map(String::as_str).filter(|id| !present.contains(id)).collect();
+            tasks.retain(|t| !wanted.contains(t.id.as_str()));
+            self.write_tasks(group, &tasks)?;
+            self.audit(group, actor, "task-delete-selected", json!({ "ids": removed, "skipped": skipped }));
+            removed
+        };
+        // Outside the tasks lock: notify is best-effort and can block on delivery.
+        let n = removed.len();
+        self.notify_board_edit(
+            group,
+            &format!("deleted {n} selected task{}", if n == 1 { "" } else { "s" }),
+        );
+        Ok(removed)
+    }
+
     /// Reorder by explicit id list (board order = priority). Ids not
     /// mentioned keep their relative order after the mentioned ones.
     pub fn reorder_tasks(&self, group: &str, actor: &str, ids: &[String]) -> Result<(), String> {
@@ -5898,6 +5966,33 @@ pub fn orch_delete_task(
     reg.delete_task(&group_id, "human", &id)?;
     reg.notify_board_edit(&group_id, &format!("deleted task {id}"));
     Ok(())
+}
+
+/// Delete all `done` tasks in one action. The single board-change notice is
+/// emitted inside `delete_done_tasks` (coalesced for the batch, #120), so —
+/// unlike the single-delete command — none is fanned out here. Returns the ids
+/// removed so the frontend can confirm what it cleared.
+#[tauri::command]
+pub fn orch_delete_done_tasks(
+    reg: tauri::State<Arc<OrchRegistry>>,
+    group_id: String,
+) -> Result<Vec<String>, String> {
+    reg.delete_done_tasks(&group_id, "human")
+}
+
+/// Delete a specific set of tasks by id — the board's multi-select "delete
+/// selected" action. Mirrors `orch_delete_done_tasks`: the single coalesced
+/// board-change notice is emitted inside `delete_tasks` (#120), so — unlike the
+/// single-delete command — none is fanned out here. Unknown ids are skipped
+/// (the board may have changed under the selection), not errored. Returns the
+/// ids actually removed so the frontend can confirm what it cleared.
+#[tauri::command]
+pub fn orch_delete_tasks(
+    reg: tauri::State<Arc<OrchRegistry>>,
+    group_id: String,
+    ids: Vec<String>,
+) -> Result<Vec<String>, String> {
+    reg.delete_tasks(&group_id, "human", &ids)
 }
 
 #[tauri::command]

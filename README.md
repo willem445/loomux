@@ -90,7 +90,7 @@ npm test           # unit tests (Node's built-in runner; no extra deps)
 | Minimize pane | `Alt+M` (or —); restore from the dock |
 | Session browser | `Ctrl+Shift+P` (or the *sessions* button) |
 | Open in editor | `Alt+E` (or the `</>` button in a pane header) |
-| Steer orchestrator | `Alt+P` (focus the compose strip under an orchestrator pane); `Esc` returns to the terminal; `Ctrl+V` in the strip attaches a pasted screenshot |
+| Steer orchestrator | `Alt+P` (focus the compose strip under an orchestrator pane); `Enter` sends, `Shift+Enter` inserts a newline; `Esc` returns to the terminal; `Ctrl+V` in the strip attaches a pasted screenshot |
 | Voice prompt | `Alt+S` (push-to-talk; `Esc` cancels) — see [Voice prompts](#voice-prompts) |
 | Copy / paste | `Ctrl+Shift+C` / `Ctrl+Shift+V` (`Ctrl+V` also works) |
 
@@ -294,7 +294,8 @@ Toolbar (top-right of the graph):
 
 Click the **branch name** in the header to switch branches — the menu lists
 every local branch plus remote-tracking branches (checking a remote one out
-creates a local tracking branch).
+creates a local branch tracking it, or switches to the existing local branch of
+that name if you've checked it out before).
 
 **Right-click a commit** for its actions: checkout (detached), create a branch
 or tag here, cherry-pick / revert / merge / rebase onto the current branch, or
@@ -443,7 +444,10 @@ automatically.
 Panes are badged by role and group number (`ORCH 1` / `W 1` / `REV 1` / `PLAN 1`
 vs `ORCH 2` / `W 2`) with a per-group accent color, so parallel orchestrations — even on
 the same repository — pair up at a glance. Unrelated panes are fully
-isolated from a group's tools.
+isolated from a group's tools. When the orchestrator spawns an agent it opens
+that pane in the background — your keyboard focus stays exactly where you were
+typing, so a spawn never yanks the cursor mid-keystroke. Panes you open yourself
+(a split, the launcher, a session restore) still take focus as before.
 
 **Task board:** the orchestrator pane has a board toggle (`Alt+T` or the
 list icon) showing the group's work queue — status per item (`queued`,
@@ -452,6 +456,19 @@ links, notes, and priority order. You can add, edit, annotate, reorder, and
 delete tasks; the orchestrator is notified of your edits and maintains the
 same board through its tools. Issue and PR chips are **clickable** — they open
 in your browser.
+
+**Clear done:** when the board holds any `done` items, the header shows a
+**🗑 done (N)** button that deletes them all in one action (two-click confirm,
+so a mis-click can't wipe the board). The whole batch is a single backend
+operation, so the orchestrator hears about it **once** — one *board updated*
+notice for the sweep, not one per task deleted.
+
+**Delete selected:** tick the checkbox on any rows you want gone and the header
+shows a **🗑 selected (N)** button that deletes exactly those, by id, in one
+action (same two-click confirm and single coalesced notice as clear-done). The
+selection is pruned to live rows on every refresh, so a task the orchestrator
+removes out from under you drops out of the count; ids that no longer exist by
+the time you confirm are skipped, not errored.
 
 **Start:** a `queued` item shows a **▶ Start** button — your nudge to have the
 orchestrator begin work on it now. Clicking it records a human note on the task
@@ -475,8 +492,11 @@ under its terminal (styled like the board's *Add a task* field). Type steering
 there and press **Enter** — loomux enqueues it to the orchestrator through the
 *same* serialized delivery path worker reports use, so your message and an
 incoming report can never land in each other's text: the pane's input has
-exactly one writer. Focus the strip with **Alt+P** (or click it); **Esc** hands
-focus back to the terminal. Because it's a loomux field and not the CLI's own
+exactly one writer. The field wraps and grows to a few lines as you type;
+**Shift+Enter** inserts a newline for a multi-line message, and past a few lines
+it scrolls internally rather than pushing the terminal (the strip floats over
+it, so the PTY is never resized). Focus the strip with **Alt+P** (or click it);
+**Esc** hands focus back to the terminal. Because it's a loomux field and not the CLI's own
 input box, it never steals the terminal's keys — type freely in the terminal
 and the strip stays out of the way. Steering a paused group or a pane with no
 live orchestrator is reported inline rather than silently dropped. You can

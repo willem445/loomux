@@ -124,7 +124,11 @@ function discardStalePane(grid: Grid, pane: Pane): void {
 async function openAgentPane(
   grid: Grid,
   paneEvents: PaneEvents,
-  req: OrchSpawnRequest
+  req: OrchSpawnRequest,
+  // Orchestrator-driven spawns open in the background so they don't yank focus
+  // from the pane the human is typing in (#117). Human-initiated paths (session
+  // restore, launching an orchestrator) pass false to focus the new pane.
+  background: boolean
 ): Promise<void> {
   const pane = await grid.openPane(
     {
@@ -136,6 +140,7 @@ async function openAgentPane(
       orchGroup: req.group_id,
       orchRole: req.role,
       orchAgent: req.agent_id,
+      background,
     },
     paneEvents,
     grid.paneCount >= 2 ? "column" : "row"
@@ -183,7 +188,9 @@ export function initOrchestration(grid: Grid, paneEvents: PaneEvents): void {
       );
       return;
     }
-    void openAgentPane(grid, paneEvents, payload);
+    // An MCP spawn_agent request: open the pane in the background so it doesn't
+    // steal focus from where the human is typing (#117).
+    void openAgentPane(grid, paneEvents, payload, true);
   });
   // The backend's bind wait for a spawn timed out (#106): it cleaned up the
   // minted config and pending bind. Remember the agent so an in-flight
@@ -278,7 +285,8 @@ export async function resumeOrchSession(
     groupHint: hint?.group ?? null,
     roleHint: hint?.role ?? null,
   });
-  if (spec) await openAgentPane(grid, paneEvents, spec);
+  // Human clicked a recorded session in the browser — focus the restored pane.
+  if (spec) await openAgentPane(grid, paneEvents, spec, false);
 }
 
 /** Create/resume the group for `config.repo` and open its orchestrator
@@ -307,7 +315,8 @@ export async function launchOrchestrator(
     maxSpawnsPerHour: config.maxSpawnsPerHour,
     watchdogStallMinutes: config.watchdogStallMinutes,
   });
-  await openAgentPane(grid, paneEvents, spec);
+  // Human launched the orchestrator from the UI — focus its pane.
+  await openAgentPane(grid, paneEvents, spec, false);
 }
 
 // ---------- cost containment: pause/resume + per-group usage ----------
