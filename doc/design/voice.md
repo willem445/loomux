@@ -115,10 +115,12 @@ getrandom-clean at runtime, but `whisper-rs-sys` builds whisper.cpp from C++ via
 cmake, which would drag a cmake + MSVC toolchain requirement into
 `cargo check --locked` for every contributor and CI. Shelling out to a prebuilt
 binary keeps the gate a pure-Rust check and mirrors how git.rs already integrates
-an external CLI. The trade-off — shipping/fetching the binary — is handled by the
-bundling slice (whisper-cli.exe + DLLs + `base.en` as Tauri resources). If the
-team later accepts the C++ build, `whisper-rs` behind a Cargo feature is a clean
-swap; the frontend contract wouldn't change.
+an external CLI. The trade-off — the user fetches the binary — is deliberate:
+voice is an **opt-in** feature (the runtime and model are NOT shipped with the
+installer; the human chose download-it-yourself over +150 MB installers). The
+pinned, checksum-verified `scripts/stage-whisper.ps1` makes the opt-in a
+one-liner. If the team later accepts the C++ build, `whisper-rs` behind a Cargo
+feature is a clean swap; the frontend contract wouldn't change.
 
 ### Runtime resolution order
 
@@ -126,9 +128,9 @@ swap; the frontend contract wouldn't change.
 independently, each in this priority:
 
 1. **Bundled resources** — `<tauri resource dir>/whisper/whisper-cli.exe`
-   (+ its DLLs) and `<resource dir>/whisper/models/ggml-base.en.bin`. This is the
-   frozen convention the bundling slice builds to; it makes voice work out of the
-   box from the installer.
+   (+ its DLLs) and `<resource dir>/whisper/models/ggml-base.en.bin`. Nothing
+   ships there today (voice is opt-in); the probe is kept so a future decision
+   to bundle needs zero backend changes.
 2. **Env overrides** — `LOOMUX_WHISPER_CLI` / `LOOMUX_WHISPER_MODEL` (power users
    / a custom whisper build or model).
 3. **`%LOCALAPPDATA%\loomux\whisper\`** — `whisper-cli.exe` (or legacy `main.exe`)

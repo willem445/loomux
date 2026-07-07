@@ -56,21 +56,15 @@ run `xattr -cr /Applications/Loomux.app` (the install script does this for you).
   with the WebGL renderer + Unicode 11 addon, vanilla TypeScript, Vite.
   No UI framework.
 
-### Bundled third-party runtimes (Windows)
+### Bundled runtime (Windows)
 
-The Windows installer ships two prebuilt, MIT-licensed runtimes so features
-work out of the box; both are downloaded pinned + sha256-verified at build time
-(nothing is committed to the repo) and documented in
-[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md):
+The Windows installer ships one prebuilt, MIT-licensed runtime — a **modern
+ConPTY host** (`conpty.dll` + `OpenConsole.exe`, committed in
+`src-tauri/resources/conhost/`) for clean terminal resize. See
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
 
-- **whisper.cpp voice runtime** — local speech-to-text for push-to-talk voice
-  input (issue #58): `whisper-cli.exe` + DLLs and the `base.en` model, staged
-  by `scripts/stage-whisper.ps1` into `src-tauri/resources/whisper/`. This adds
-  **~150 MB** to the Windows installer (~141 MB model + ~9 MB runtime). Dev
-  builds without it degrade gracefully (see
-  [`src-tauri/resources/whisper/README.md`](src-tauri/resources/whisper/README.md)).
-- **Modern ConPTY host** — `conpty.dll` + `OpenConsole.exe` for clean terminal
-  resize (`src-tauri/resources/conhost/`).
+Voice input's whisper.cpp runtime is **not** shipped — it's an opt-in download
+(it would add ~150 MB to the installer); see [Voice prompts](#voice-prompts).
 
 ## Run
 
@@ -180,19 +174,50 @@ Enter yourself.
 - Only **one recording** runs at a time. While recording into a terminal, a red
   "Recording" badge floats over that pane.
 
-**Local & open source.** Speech-to-text is [whisper.cpp](https://github.com/ggml-org/whisper.cpp)
-(MIT) running entirely on your machine — no audio leaves the box, no cloud STT.
-The whisper runtime and a default `base.en` model **ship with the Windows
-installer**, so it works out of the box.
+**Local & open source, opt-in.** Speech-to-text is
+[whisper.cpp](https://github.com/ggml-org/whisper.cpp) (MIT) running entirely on
+your machine — no audio leaves the box, no cloud STT. Loomux does **not** ship
+the whisper runtime (it would add ~150 MB to the installer), so voice is opt-in:
+install a whisper build and a model once and loomux picks them up automatically.
 
-- **Use a different model:** point `LOOMUX_WHISPER_MODEL` at any ggml `.bin`
-  (e.g. a larger multilingual model), or drop models into
-  `%LOCALAPPDATA%\loomux\whisper\models\`.
-- **Use a different whisper build:** point `LOOMUX_WHISPER_CLI` at a
-  `whisper-cli.exe`. Resolution order is **bundled → env vars → `%LOCALAPPDATA%`**.
-- **Windows only** for now; on other platforms the hotkey reports that voice
-  capture isn't available. See [`doc/design/voice.md`](doc/design/voice.md) for
-  the architecture and the cross-platform path.
+**Set it up (Windows).** Easiest — run the convenience script from a checkout,
+which downloads a pinned, checksum-verified runtime + the `base.en` model into
+the location loomux auto-detects (`%LOCALAPPDATA%\loomux\whisper`):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\stage-whisper.ps1
+```
+
+Or install by hand:
+
+1. From a [whisper.cpp release](https://github.com/ggml-org/whisper.cpp/releases),
+   download the CPU `whisper-bin-x64.zip` and extract **`whisper-cli.exe`
+   together with _all_ of its DLLs** — `whisper.dll`, `ggml.dll`,
+   `ggml-base.dll`, and every `ggml-cpu-*.dll`. **Missing DLLs are the usual
+   cause of a silent "whisper failed to run"**: `ggml` loads the `ggml-cpu-*.dll`
+   matching your CPU at runtime, so keep the whole set together.
+2. Download a ggml model — e.g. `ggml-base.en.bin` from
+   [ggerganov/whisper.cpp](https://huggingface.co/ggerganov/whisper.cpp).
+3. Place them where loomux looks by default:
+
+   ```
+   %LOCALAPPDATA%\loomux\whisper\whisper-cli.exe      (with the DLLs beside it)
+   %LOCALAPPDATA%\loomux\whisper\models\ggml-base.en.bin
+   ```
+
+Restart loomux and press `Alt+V`.
+
+**Custom locations (env overrides).** To keep the runtime or model elsewhere,
+point loomux at them:
+
+- `LOOMUX_WHISPER_CLI` → a `whisper-cli.exe` (with its DLLs beside it)
+- `LOOMUX_WHISPER_MODEL` → any ggml `.bin` (e.g. a larger multilingual model)
+
+Resolution order is **env vars → `%LOCALAPPDATA%`**.
+
+**Windows only** for now; on other platforms the hotkey reports that voice
+capture isn't available. See [`doc/design/voice.md`](doc/design/voice.md) for
+the architecture and the cross-platform path.
 
 If the mic can't be opened (no device, or Windows microphone privacy blocks it),
 or the whisper runtime is missing/misconfigured, loomux surfaces a specific
