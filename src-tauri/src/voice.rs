@@ -2,18 +2,28 @@
 //! open-source Whisper transcription → text handed back to the steer strip
 //! (the human reviews it and presses Enter; loomux never auto-submits).
 //!
-//! ## Why this shape
+//! ## Platform scope
+//!
+//! Native capture is **Windows-only** in this prototype. `cpal` pulls
+//! `alsa-sys` on Linux (needs `libasound2-dev`) and CoreAudio on macOS, and the
+//! transcription path here is Windows-flavoured anyway (`whisper-cli.exe`,
+//! `%LOCALAPPDATA%`), so the whole capture + transcription implementation lives
+//! under `#[cfg(windows)]`. On other platforms the three `#[tauri::command]`s
+//! still exist but return a graceful "not available on this platform" error —
+//! the same shape the missing-binary path returns — so the frontend behaves
+//! identically everywhere and non-Windows builds don't drag in ALSA/CoreAudio.
+//!
+//! ## Why this shape (Windows)
 //!
 //! Two axes had to clear the Windows-10 baseline constraint (no getrandom /
 //! ProcessPrng in the shipped binary — see Cargo.toml) *and* keep the repo's
 //! `cargo check` gate cheap:
 //!
 //! * **Capture — `cpal` (native WASAPI).** Vetted getrandom-clean at runtime
-//!   (`cargo tree -i getrandom --target all` shows getrandom only under
-//!   build-dependencies / Android's oboe-sys, never in cpal's Windows runtime
-//!   tree). Native capture also sidesteps the WebView2 `getUserMedia`
-//!   microphone-permission dance, so the demo is deterministic. cpal is pure
-//!   Rust WASAPI bindings — no C++/cmake build.
+//!   (`cargo tree -i getrandom` shows getrandom only under build-dependencies /
+//!   Android's oboe-sys, never in cpal's Windows runtime tree). Native capture
+//!   also sidesteps the WebView2 `getUserMedia` microphone-permission dance, so
+//!   the demo is deterministic. cpal is pure Rust WASAPI bindings — no C++/cmake.
 //! * **Transcription — subprocess to a prebuilt whisper.cpp `whisper-cli.exe`**
 //!   (git.rs-style `Command`), NOT the `whisper-rs` crate. whisper-rs is itself
 //!   getrandom-clean at runtime, but `whisper-rs-sys` builds whisper.cpp from
@@ -22,341 +32,378 @@
 //!   Rust check and matches how git.rs already integrates an external CLI.
 //!
 //! The `whisper-cli.exe` binary and the model weights are NOT committed — they
-//! are downloaded once (see doc/demo/voice-prompt.md) and discovered at runtime
-//! by [`resolve_whisper`].
+//! are downloaded once (see doc/demo/voice-prompt.md) and discovered at runtime.
 //!
-//! ## Flow
-//!
-//! `voice_start` opens the default input device on a dedicated thread that owns
-//! the (non-`Send`) cpal stream and appends mono f32 samples to a shared buffer.
-//! `voice_stop` signals that thread, joins it, resamples the captured audio to
-//! the 16 kHz mono PCM Whisper expects, writes a scratch WAV, runs whisper.cpp,
-//! and returns the transcript. Pure helpers ([`resample_linear`],
-//! [`encode_wav_pcm16`], [`parse_whisper_output`]) are unit-tested below.
+//! The pure helpers ([`resample_linear`], [`encode_wav_pcm16`],
+//! [`parse_whisper_output`]) are cross-platform and unit-tested below.
 
-use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
+// ---------- Tauri state ----------
 
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-
-/// Sample rate Whisper (ggml) models are trained on. Everything is resampled to
-/// this mono rate before transcription.
-const WHISPER_SAMPLE_RATE: u32 = 16_000;
-
-/// Audio captured by the recording thread: interleaved-then-downmixed mono f32
-/// at the device's native rate (resampled to 16 kHz only at stop time).
-struct Captured {
-    samples: Vec<f32>,
-    sample_rate: u32,
-}
-
-/// A recording in flight. Dropping the [`Sender`] (or sending on it) tells the
-/// capture thread to stop; joining yields the captured audio. The cpal stream
-/// itself lives entirely inside that thread because it is `!Send` on Windows.
-struct Recording {
-    stop_tx: Sender<()>,
-    join: JoinHandle<Captured>,
-}
-
-/// Managed Tauri state: at most one active recording at a time.
+/// Managed Tauri state: on Windows it holds at most one active recording; on
+/// other platforms it is an empty marker so the command signatures still type.
+#[cfg(windows)]
 #[derive(Default)]
-pub struct VoiceState(Mutex<Option<Recording>>);
+pub struct VoiceState(std::sync::Mutex<Option<win::Recording>>);
 
-/// Begin capturing from the default input device. Errors immediately (before
-/// returning) if there is no input device or the stream can't be built, so the
-/// UI can surface a real message instead of a silent no-op.
+#[cfg(not(windows))]
+#[derive(Default)]
+pub struct VoiceState;
+
+/// Error surfaced by the voice commands where native capture isn't built in.
+#[cfg(not(windows))]
+const VOICE_UNAVAILABLE: &str = "voice capture is only available on Windows in this prototype";
+
+// ---------- commands ----------
+
+/// Begin capturing from the default input device.
+#[cfg(windows)]
 #[tauri::command]
 pub fn voice_start(state: tauri::State<'_, VoiceState>) -> Result<(), String> {
-    let mut slot = state.0.lock().map_err(|_| "voice state poisoned")?;
-    if slot.is_some() {
-        return Err("already recording".into());
-    }
-
-    let (stop_tx, stop_rx) = mpsc::channel::<()>();
-    // The thread reports stream-build success/failure back here so voice_start
-    // can fail synchronously with a useful message.
-    let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
-
-    let join = std::thread::spawn(move || capture_loop(stop_rx, ready_tx));
-
-    match ready_rx.recv() {
-        Ok(Ok(())) => {
-            *slot = Some(Recording { stop_tx, join });
-            Ok(())
-        }
-        // Build failed: the thread already returned; join it to avoid a leak.
-        Ok(Err(e)) => {
-            let _ = join.join();
-            Err(e)
-        }
-        Err(_) => {
-            let _ = join.join();
-            Err("recording thread died before start".into())
-        }
-    }
+    win::start(&state)
 }
 
 /// Stop the active recording, transcribe it locally, and return the text.
-/// Empty/near-silent captures return an empty string rather than an error, so a
-/// mis-click just yields nothing to insert.
+#[cfg(windows)]
 #[tauri::command]
 pub fn voice_stop(state: tauri::State<'_, VoiceState>) -> Result<String, String> {
-    let recording = {
-        let mut slot = state.0.lock().map_err(|_| "voice state poisoned")?;
-        slot.take().ok_or("not recording")?
-    };
-    // Signal stop (ignore error: if the thread already exited on device loss,
-    // the join below still yields whatever it captured).
-    let _ = recording.stop_tx.send(());
-    let captured = recording
-        .join
-        .join()
-        .map_err(|_| "recording thread panicked".to_string())?;
-
-    if captured.samples.is_empty() {
-        return Ok(String::new());
-    }
-    let mono16k = resample_linear(&captured.samples, captured.sample_rate, WHISPER_SAMPLE_RATE);
-    transcribe(&mono16k)
+    win::stop(&state)
 }
 
-/// Cancel any active recording without transcribing (e.g. the pane closed).
-/// Idempotent — a no-op when nothing is recording.
+/// Cancel any active recording without transcribing. Idempotent.
+#[cfg(windows)]
 #[tauri::command]
 pub fn voice_cancel(state: tauri::State<'_, VoiceState>) -> Result<(), String> {
-    let recording = {
-        let mut slot = state.0.lock().map_err(|_| "voice state poisoned")?;
-        slot.take()
-    };
-    if let Some(r) = recording {
-        let _ = r.stop_tx.send(());
-        let _ = r.join.join();
-    }
+    win::cancel(&state);
     Ok(())
 }
 
-/// Body of the capture thread. Builds the input stream, reports readiness, then
-/// blocks until stopped, appending downmixed-mono f32 samples to the buffer it
-/// returns. The cpal `Stream` never leaves this thread (it is `!Send`).
-fn capture_loop(stop_rx: Receiver<()>, ready_tx: Sender<Result<(), String>>) -> Captured {
-    let host = cpal::default_host();
-    let device = match host.default_input_device() {
-        Some(d) => d,
-        None => {
-            let _ = ready_tx.send(Err("no microphone / input device found".into()));
-            return Captured { samples: Vec::new(), sample_rate: WHISPER_SAMPLE_RATE };
-        }
-    };
-    let supported = match device.default_input_config() {
-        Ok(c) => c,
-        Err(e) => {
-            let _ = ready_tx.send(Err(format!("no default input config: {e}")));
-            return Captured { samples: Vec::new(), sample_rate: WHISPER_SAMPLE_RATE };
-        }
-    };
+#[cfg(not(windows))]
+#[tauri::command]
+pub fn voice_start(_state: tauri::State<'_, VoiceState>) -> Result<(), String> {
+    Err(VOICE_UNAVAILABLE.into())
+}
 
-    let sample_rate = supported.sample_rate().0;
-    let channels = supported.channels() as usize;
-    let sample_format = supported.sample_format();
-    let config: cpal::StreamConfig = supported.into();
+#[cfg(not(windows))]
+#[tauri::command]
+pub fn voice_stop(_state: tauri::State<'_, VoiceState>) -> Result<String, String> {
+    Err(VOICE_UNAVAILABLE.into())
+}
 
-    let buffer = Arc::new(Mutex::new(Vec::<f32>::new()));
-    let err_fn = |e| eprintln!("voice: input stream error: {e}");
+/// No-op off Windows: there is never an in-flight recording to cancel, and the
+/// frontend calls this on pane dispose, so it must succeed quietly.
+#[cfg(not(windows))]
+#[tauri::command]
+pub fn voice_cancel(_state: tauri::State<'_, VoiceState>) -> Result<(), String> {
+    Ok(())
+}
 
-    // One closure shape per sample format: downmix each frame to a single mono
-    // sample (average of channels) and append. Whisper is mono anyway.
-    macro_rules! build {
-        ($t:ty, $to_f32:expr) => {{
-            let buf = buffer.clone();
-            device.build_input_stream(
-                &config,
-                move |data: &[$t], _: &cpal::InputCallbackInfo| {
-                    let to_f32 = $to_f32;
-                    let mut b = buf.lock().unwrap();
-                    for frame in data.chunks(channels.max(1)) {
-                        let sum: f32 = frame.iter().map(|&s| to_f32(s)).sum();
-                        b.push(sum / frame.len().max(1) as f32);
-                    }
-                },
-                err_fn,
-                None,
-            )
-        }};
+// ---------- Windows implementation ----------
+
+#[cfg(windows)]
+mod win {
+    use super::{encode_wav_pcm16, parse_whisper_output, resample_linear, VoiceState};
+    use std::path::PathBuf;
+    use std::sync::mpsc::{self, Receiver, Sender};
+    use std::sync::{Arc, Mutex};
+    use std::thread::JoinHandle;
+
+    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+
+    /// Sample rate Whisper (ggml) models are trained on. Everything is resampled
+    /// to this mono rate before transcription.
+    const WHISPER_SAMPLE_RATE: u32 = 16_000;
+
+    /// Audio captured by the recording thread: downmixed mono f32 at the
+    /// device's native rate (resampled to 16 kHz only at stop time).
+    struct Captured {
+        samples: Vec<f32>,
+        sample_rate: u32,
     }
 
-    let stream = match sample_format {
-        cpal::SampleFormat::F32 => build!(f32, |s: f32| s),
-        cpal::SampleFormat::I16 => build!(i16, |s: i16| s as f32 / 32768.0),
-        cpal::SampleFormat::U16 => build!(u16, |s: u16| (s as f32 - 32768.0) / 32768.0),
-        other => {
-            let _ = ready_tx.send(Err(format!("unsupported sample format: {other:?}")));
+    /// A recording in flight. Sending on (or dropping) `stop_tx` tells the
+    /// capture thread to stop; joining yields the captured audio. The cpal
+    /// stream itself lives entirely inside that thread because it is `!Send`.
+    pub struct Recording {
+        stop_tx: Sender<()>,
+        join: JoinHandle<Captured>,
+    }
+
+    /// Begin capturing. Errors before returning if there is no input device or
+    /// the stream can't be built, so the UI can surface a real message.
+    pub fn start(state: &VoiceState) -> Result<(), String> {
+        let mut slot = state.0.lock().map_err(|_| "voice state poisoned")?;
+        if slot.is_some() {
+            return Err("already recording".into());
+        }
+
+        let (stop_tx, stop_rx) = mpsc::channel::<()>();
+        // The thread reports stream-build success/failure so start() can fail
+        // synchronously with a useful message.
+        let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
+
+        let join = std::thread::spawn(move || capture_loop(stop_rx, ready_tx));
+
+        match ready_rx.recv() {
+            Ok(Ok(())) => {
+                *slot = Some(Recording { stop_tx, join });
+                Ok(())
+            }
+            Ok(Err(e)) => {
+                let _ = join.join();
+                Err(e)
+            }
+            Err(_) => {
+                let _ = join.join();
+                Err("recording thread died before start".into())
+            }
+        }
+    }
+
+    /// Stop and transcribe. Empty/near-silent captures return an empty string
+    /// rather than an error, so a mis-click just yields nothing to insert.
+    pub fn stop(state: &VoiceState) -> Result<String, String> {
+        let recording = {
+            let mut slot = state.0.lock().map_err(|_| "voice state poisoned")?;
+            slot.take().ok_or("not recording")?
+        };
+        let _ = recording.stop_tx.send(());
+        let captured = recording
+            .join
+            .join()
+            .map_err(|_| "recording thread panicked".to_string())?;
+
+        if captured.samples.is_empty() {
+            return Ok(String::new());
+        }
+        let mono16k = resample_linear(&captured.samples, captured.sample_rate, WHISPER_SAMPLE_RATE);
+        transcribe(&mono16k)
+    }
+
+    /// Cancel any active recording without transcribing.
+    pub fn cancel(state: &VoiceState) {
+        let recording = state.0.lock().ok().and_then(|mut slot| slot.take());
+        if let Some(r) = recording {
+            let _ = r.stop_tx.send(());
+            let _ = r.join.join();
+        }
+    }
+
+    /// Body of the capture thread. Builds the input stream, reports readiness,
+    /// then blocks until stopped, appending downmixed-mono f32 samples to the
+    /// buffer it returns. The cpal `Stream` never leaves this thread (`!Send`).
+    fn capture_loop(stop_rx: Receiver<()>, ready_tx: Sender<Result<(), String>>) -> Captured {
+        let host = cpal::default_host();
+        let device = match host.default_input_device() {
+            Some(d) => d,
+            None => {
+                let _ = ready_tx.send(Err("no microphone / input device found".into()));
+                return Captured { samples: Vec::new(), sample_rate: WHISPER_SAMPLE_RATE };
+            }
+        };
+        let supported = match device.default_input_config() {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = ready_tx.send(Err(format!("no default input config: {e}")));
+                return Captured { samples: Vec::new(), sample_rate: WHISPER_SAMPLE_RATE };
+            }
+        };
+
+        let sample_rate = supported.sample_rate().0;
+        let channels = supported.channels() as usize;
+        let sample_format = supported.sample_format();
+        let config: cpal::StreamConfig = supported.into();
+
+        let buffer = Arc::new(Mutex::new(Vec::<f32>::new()));
+        let err_fn = |e| eprintln!("voice: input stream error: {e}");
+
+        // One closure per sample format: downmix each frame to a single mono
+        // sample (average of channels) and append. Whisper is mono anyway.
+        macro_rules! build {
+            ($t:ty, $to_f32:expr) => {{
+                let buf = buffer.clone();
+                device.build_input_stream(
+                    &config,
+                    move |data: &[$t], _: &cpal::InputCallbackInfo| {
+                        let to_f32 = $to_f32;
+                        let mut b = buf.lock().unwrap();
+                        for frame in data.chunks(channels.max(1)) {
+                            let sum: f32 = frame.iter().map(|&s| to_f32(s)).sum();
+                            b.push(sum / frame.len().max(1) as f32);
+                        }
+                    },
+                    err_fn,
+                    None,
+                )
+            }};
+        }
+
+        let stream = match sample_format {
+            cpal::SampleFormat::F32 => build!(f32, |s: f32| s),
+            cpal::SampleFormat::I16 => build!(i16, |s: i16| s as f32 / 32768.0),
+            cpal::SampleFormat::U16 => build!(u16, |s: u16| (s as f32 - 32768.0) / 32768.0),
+            other => {
+                let _ = ready_tx.send(Err(format!("unsupported sample format: {other:?}")));
+                return Captured { samples: Vec::new(), sample_rate };
+            }
+        };
+        let stream = match stream {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = ready_tx.send(Err(format!("failed to open mic stream: {e}")));
+                return Captured { samples: Vec::new(), sample_rate };
+            }
+        };
+        if let Err(e) = stream.play() {
+            let _ = ready_tx.send(Err(format!("failed to start mic stream: {e}")));
             return Captured { samples: Vec::new(), sample_rate };
         }
-    };
-    let stream = match stream {
-        Ok(s) => s,
-        Err(e) => {
-            let _ = ready_tx.send(Err(format!("failed to open mic stream: {e}")));
-            return Captured { samples: Vec::new(), sample_rate };
-        }
-    };
-    if let Err(e) = stream.play() {
-        let _ = ready_tx.send(Err(format!("failed to start mic stream: {e}")));
-        return Captured { samples: Vec::new(), sample_rate };
+
+        // Live: unblock start(), then record until told to stop.
+        let _ = ready_tx.send(Ok(()));
+        let _ = stop_rx.recv();
+        drop(stream); // stop capturing before we read the buffer out
+
+        let samples = std::mem::take(&mut *buffer.lock().unwrap());
+        Captured { samples, sample_rate }
     }
 
-    // Live: unblock voice_start, then record until told to stop.
-    let _ = ready_tx.send(Ok(()));
-    let _ = stop_rx.recv();
-    drop(stream); // stop capturing before we read the buffer out
+    // ----- transcription (subprocess to whisper.cpp) -----
 
-    let samples = std::mem::take(&mut *buffer.lock().unwrap());
-    Captured { samples, sample_rate }
-}
-
-// ---------- transcription (subprocess to whisper.cpp) ----------
-
-/// Locations of the prebuilt whisper.cpp CLI and a ggml model. Neither is
-/// committed to the repo; both are downloaded once (see the walkthrough).
-struct WhisperPaths {
-    cli: PathBuf,
-    model: PathBuf,
-}
-
-/// The install root the prototype looks in by default:
-/// `%LOCALAPPDATA%\loomux\whisper\`. `whisper-cli.exe` sits at the root and
-/// models under `models\`.
-fn whisper_dir() -> Option<PathBuf> {
-    dirs::data_local_dir().map(|d| d.join("loomux").join("whisper"))
-}
-
-/// Resolve the whisper CLI and model, in priority order:
-///   1. env `LOOMUX_WHISPER_CLI` / `LOOMUX_WHISPER_MODEL` (explicit override);
-///   2. the default install dir (`whisper-cli.exe`; model `ggml-base.en.bin`,
-///      else `ggml-tiny.en.bin`, else the first `models\*.bin`).
-/// Returns a human-readable, actionable error naming where it looked.
-fn resolve_whisper() -> Result<WhisperPaths, String> {
-    let dir = whisper_dir();
-
-    // --- CLI ---
-    let cli = match std::env::var_os("LOOMUX_WHISPER_CLI") {
-        Some(p) => PathBuf::from(p),
-        None => {
-            let d = dir
-                .clone()
-                .ok_or("cannot resolve %LOCALAPPDATA%")?;
-            // Accept either the current name (whisper-cli.exe) or the legacy
-            // `main.exe` that older whisper.cpp release zips shipped.
-            let candidates = [d.join("whisper-cli.exe"), d.join("main.exe")];
-            candidates
-                .iter()
-                .find(|p| p.is_file())
-                .cloned()
-                .ok_or_else(|| {
-                    format!(
-                        "whisper CLI not found. Put whisper-cli.exe in {} or set \
-                         LOOMUX_WHISPER_CLI. See doc/demo/voice-prompt.md.",
-                        d.display()
-                    )
-                })?
-        }
-    };
-    if !cli.is_file() {
-        return Err(format!("whisper CLI not found at {}", cli.display()));
+    /// Locations of the prebuilt whisper.cpp CLI and a ggml model. Neither is
+    /// committed to the repo; both are downloaded once (see the walkthrough).
+    struct WhisperPaths {
+        cli: PathBuf,
+        model: PathBuf,
     }
 
-    // --- model ---
-    let model = match std::env::var_os("LOOMUX_WHISPER_MODEL") {
-        Some(p) => PathBuf::from(p),
-        None => {
-            let models = dir
-                .ok_or("cannot resolve %LOCALAPPDATA%")?
-                .join("models");
-            let preferred = ["ggml-base.en.bin", "ggml-tiny.en.bin", "ggml-base.bin"];
-            preferred
-                .iter()
-                .map(|n| models.join(n))
-                .find(|p| p.is_file())
-                .or_else(|| first_bin_in(&models))
-                .ok_or_else(|| {
-                    format!(
-                        "no Whisper model found in {}. Download e.g. ggml-base.en.bin \
-                         or set LOOMUX_WHISPER_MODEL. See doc/demo/voice-prompt.md.",
-                        models.display()
-                    )
-                })?
-        }
-    };
-    if !model.is_file() {
-        return Err(format!("Whisper model not found at {}", model.display()));
+    /// The install root the prototype looks in by default:
+    /// `%LOCALAPPDATA%\loomux\whisper\`.
+    fn whisper_dir() -> Option<PathBuf> {
+        dirs::data_local_dir().map(|d| d.join("loomux").join("whisper"))
     }
 
-    Ok(WhisperPaths { cli, model })
-}
+    /// Resolve the whisper CLI and model, in priority order:
+    ///   1. env `LOOMUX_WHISPER_CLI` / `LOOMUX_WHISPER_MODEL` (explicit override);
+    ///   2. the default install dir (`whisper-cli.exe`; model `ggml-base.en.bin`,
+    ///      else `ggml-tiny.en.bin`, else the first `models\*.bin`).
+    /// Returns a human-readable, actionable error naming where it looked.
+    fn resolve_whisper() -> Result<WhisperPaths, String> {
+        let dir = whisper_dir();
 
-/// First `*.bin` in `dir` (sorted for determinism), if any.
-fn first_bin_in(dir: &std::path::Path) -> Option<PathBuf> {
-    let mut bins: Vec<PathBuf> = std::fs::read_dir(dir)
-        .ok()?
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().map(|x| x == "bin").unwrap_or(false))
-        .collect();
-    bins.sort();
-    bins.into_iter().next()
-}
+        // --- CLI ---
+        let cli = match std::env::var_os("LOOMUX_WHISPER_CLI") {
+            Some(p) => PathBuf::from(p),
+            None => {
+                let d = dir.clone().ok_or("cannot resolve %LOCALAPPDATA%")?;
+                // Accept either the current name (whisper-cli.exe) or the legacy
+                // `main.exe` that older whisper.cpp release zips shipped.
+                let candidates = [d.join("whisper-cli.exe"), d.join("main.exe")];
+                candidates
+                    .iter()
+                    .find(|p| p.is_file())
+                    .cloned()
+                    .ok_or_else(|| {
+                        format!(
+                            "whisper CLI not found. Put whisper-cli.exe in {} or set \
+                             LOOMUX_WHISPER_CLI. See doc/demo/voice-prompt.md.",
+                            d.display()
+                        )
+                    })?
+            }
+        };
+        if !cli.is_file() {
+            return Err(format!("whisper CLI not found at {}", cli.display()));
+        }
 
-/// Resample, write a scratch WAV, run whisper.cpp, and return the transcript.
-fn transcribe(mono16k: &[f32]) -> Result<String, String> {
-    let paths = resolve_whisper()?;
+        // --- model ---
+        let model = match std::env::var_os("LOOMUX_WHISPER_MODEL") {
+            Some(p) => PathBuf::from(p),
+            None => {
+                let models = dir.ok_or("cannot resolve %LOCALAPPDATA%")?.join("models");
+                let preferred = ["ggml-base.en.bin", "ggml-tiny.en.bin", "ggml-base.bin"];
+                preferred
+                    .iter()
+                    .map(|n| models.join(n))
+                    .find(|p| p.is_file())
+                    .or_else(|| first_bin_in(&models))
+                    .ok_or_else(|| {
+                        format!(
+                            "no Whisper model found in {}. Download e.g. ggml-base.en.bin \
+                             or set LOOMUX_WHISPER_MODEL. See doc/demo/voice-prompt.md.",
+                            models.display()
+                        )
+                    })?
+            }
+        };
+        if !model.is_file() {
+            return Err(format!("Whisper model not found at {}", model.display()));
+        }
 
-    let wav = encode_wav_pcm16(mono16k, WHISPER_SAMPLE_RATE);
-    // Scratch WAV in a per-process temp path. std's temp_dir + pid avoids a
-    // getrandom-based tempfile name (see the Windows-10 baseline note).
-    let wav_path = std::env::temp_dir().join(format!("loomux-voice-{}.wav", std::process::id()));
-    std::fs::write(&wav_path, &wav).map_err(|e| format!("write scratch wav: {e}"))?;
+        Ok(WhisperPaths { cli, model })
+    }
 
-    let result = run_whisper(&paths, &wav_path);
-    let _ = std::fs::remove_file(&wav_path); // best-effort cleanup
-    result
-}
+    /// First `*.bin` in `dir` (sorted for determinism), if any.
+    fn first_bin_in(dir: &std::path::Path) -> Option<PathBuf> {
+        let mut bins: Vec<PathBuf> = std::fs::read_dir(dir)
+            .ok()?
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().map(|x| x == "bin").unwrap_or(false))
+            .collect();
+        bins.sort();
+        bins.into_iter().next()
+    }
 
-/// Invoke whisper.cpp on `wav_path` and parse its stdout into plain text.
-fn run_whisper(paths: &WhisperPaths, wav_path: &std::path::Path) -> Result<String, String> {
-    use std::process::Command;
-    let mut cmd = Command::new(&paths.cli);
-    cmd.arg("-m")
-        .arg(&paths.model)
-        .arg("-f")
-        .arg(wav_path)
-        .arg("-nt") // no timestamps: stdout is just the recognized text
-        .arg("-l")
-        .arg("en");
-    #[cfg(windows)]
-    {
+    /// Write a scratch WAV, run whisper.cpp, and return the transcript.
+    fn transcribe(mono16k: &[f32]) -> Result<String, String> {
+        let paths = resolve_whisper()?;
+
+        let wav = encode_wav_pcm16(mono16k, WHISPER_SAMPLE_RATE);
+        // Scratch WAV in a per-process temp path. std's temp_dir + pid avoids a
+        // getrandom-based tempfile name (see the Windows-10 baseline note).
+        let wav_path =
+            std::env::temp_dir().join(format!("loomux-voice-{}.wav", std::process::id()));
+        std::fs::write(&wav_path, &wav).map_err(|e| format!("write scratch wav: {e}"))?;
+
+        let result = run_whisper(&paths, &wav_path);
+        let _ = std::fs::remove_file(&wav_path); // best-effort cleanup
+        result
+    }
+
+    /// Invoke whisper.cpp on `wav_path` and parse its stdout into plain text.
+    fn run_whisper(paths: &WhisperPaths, wav_path: &std::path::Path) -> Result<String, String> {
         use std::os::windows::process::CommandExt;
+        use std::process::Command;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
-    let out = cmd.output().map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            format!("whisper CLI not found at {}", paths.cli.display())
-        } else {
-            format!("failed to run whisper: {e}")
+
+        let out = Command::new(&paths.cli)
+            .arg("-m")
+            .arg(&paths.model)
+            .arg("-f")
+            .arg(wav_path)
+            .arg("-nt") // no timestamps: stdout is just the recognized text
+            .arg("-l")
+            .arg("en")
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    format!("whisper CLI not found at {}", paths.cli.display())
+                } else {
+                    format!("failed to run whisper: {e}")
+                }
+            })?;
+        if !out.status.success() {
+            return Err(format!(
+                "whisper failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
         }
-    })?;
-    if !out.status.success() {
-        return Err(format!(
-            "whisper failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
+        Ok(parse_whisper_output(&String::from_utf8_lossy(&out.stdout)))
     }
-    Ok(parse_whisper_output(&String::from_utf8_lossy(&out.stdout)))
 }
 
-// ---------- pure helpers (unit-tested) ----------
+// ---------- pure helpers (cross-platform, unit-tested) ----------
 
 /// Linear-interpolation resample of mono `input` from `from` Hz to `to` Hz.
 /// Good enough for speech STT; not a polyphase/anti-aliased resampler. Returns
@@ -422,7 +469,7 @@ pub fn parse_whisper_output(stdout: &str) -> String {
         if line.starts_with('[') {
             if let Some(end) = line.find(']') {
                 let inner = &line[1..end];
-                // Only strip it if it looks like a timestamp (has "-->" or digits+colons),
+                // Only strip it if it looks like a timestamp (has "-->"),
                 // otherwise it may be a real bracket in speech.
                 if inner.contains("-->") {
                     line = line[end + 1..].trim();

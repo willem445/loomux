@@ -27,16 +27,6 @@ tiny_http = "0.12"
 tauri-plugin-dialog = "2"
 sysinfo = "0.33"
 
-# Voice-prompt prototype (#58): native mic capture via WASAPI. cpal was vetted
-# with `cargo tree -i getrandom --target all` — getrandom appears ONLY as a
-# build-dependency (Android-only oboe-sys, and jobserver→cc), never in cpal's
-# runtime tree on Windows, so it does NOT import ProcessPrng and is safe on the
-# Windows 10 baseline (see the getrandom note above). Pure Rust WASAPI bindings
-# — no C++/cmake build step. Transcription shells out to a prebuilt whisper.cpp
-# binary (see src/voice.rs) rather than linking whisper-rs, which WOULD pull a
-# cmake/MSVC C++ build into `cargo check`. This is a prototype (issue #58).
-cpal = "0.15"
-
 # Vendor-neutral GPU metrics on Windows: PDH performance counters give
 # per-engine utilization + dedicated VRAM usage for any WDDM adapter (AMD,
 # Intel, NVIDIA); DXGI reports total VRAM and the adapter name.
@@ -58,6 +48,22 @@ windows = { version = "0.57", features = [
     "Win32_System_Threading",
     "Win32_Security",
 ] }
+
+# Voice-prompt prototype (#58): native mic capture via WASAPI. Windows-scoped on
+# purpose — cpal pulls alsa-sys on Linux (needs libasound2-dev, which the CI
+# runners lack) and coreaudio on macOS, but the feature's transcription path is
+# Windows-flavoured (whisper-cli.exe, %LOCALAPPDATA%). Keeping it under the
+# windows cfg means Linux/macOS builds don't drag in ALSA/CoreAudio, and the
+# voice module is stubbed there to return a graceful "not available" error.
+#
+# cpal was vetted with `cargo tree -i getrandom` — getrandom appears ONLY as a
+# build-dependency (jobserver→cc) or Android-only oboe-sys, never in cpal's
+# Windows runtime tree, so it does NOT import ProcessPrng and is safe on the
+# Windows 10 baseline (see the getrandom note above). Pure Rust WASAPI bindings,
+# no C++/cmake build. Transcription shells out to a prebuilt whisper.cpp binary
+# (see src/voice.rs) rather than linking whisper-rs, which WOULD pull a
+# cmake/MSVC C++ build into `cargo check`. This is a prototype (issue #58).
+cpal = "0.15"
 
 [dev-dependencies]
 # default-features = false drops tempfile's getrandom feature — see the

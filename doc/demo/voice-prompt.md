@@ -19,6 +19,14 @@ the recognized text into the compose box at the caret. Review, edit, hit Enter.
   (MIT), run entirely on your machine. No audio leaves the box; no cloud STT.
 - **Latency:** usable, not streaming. A few seconds of speech on the `base.en`
   model transcribes in ~1–3 s on CPU. `tiny.en` is faster and less accurate.
+- **Platform: Windows only** (this prototype). Native capture uses `cpal`, which
+  pulls `alsa-sys` on Linux (needs `libasound2-dev`) and CoreAudio on macOS, so
+  cpal and the whole capture/transcription implementation are scoped under
+  `#[cfg(windows)]` — Linux/macOS builds don't drag in those system packages.
+  The three voice `#[tauri::command]`s still exist off Windows but return a
+  graceful *"voice capture is only available on Windows in this prototype"*
+  error (same shape as the missing-binary path). Cross-platform capture is a
+  documented follow-up (see the production recommendation).
 
 ---
 
@@ -166,7 +174,12 @@ PR introduces.
 
 1. **Keep native cpal capture.** It's getrandom-clean, deterministic, and avoids
    the WebView2 mic-permission problem entirely. Add a device picker and a
-   simple input-level meter so the user can see the mic is hot.
+   simple input-level meter so the user can see the mic is hot. **For
+   cross-platform:** cpal already builds on macOS (CoreAudio, no extra packages)
+   and Linux (once `libasound2-dev` is available on the runner) — lift the
+   `#[cfg(windows)]` gate on `voice::win` and generalize the whisper-resolution
+   paths (drop the `.exe` suffix, use `data_local_dir()` per-OS). The gate is
+   purely to keep the prototype's CI cheap, not a cpal limitation.
 2. **Two viable transcription backends, pick per appetite:**
    - *Subprocess (this prototype)* — keeps `cargo check` a pure-Rust gate; the
      cost is shipping/fetching `whisper-cli.exe`. Best if you don't want a C++
