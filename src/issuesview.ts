@@ -48,7 +48,7 @@ function el<K extends keyof HTMLElementTagNameMap>(
 /** Short human label for a label chip. */
 const LABEL_SHORT: Record<string, string> = {
   "agent-ready": "ready",
-  "agent-investigate": "investigate",
+  "agent-investigation": "investigate",
   "agent-managed": "managed",
 };
 

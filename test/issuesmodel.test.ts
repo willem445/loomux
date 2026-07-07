@@ -26,6 +26,16 @@ function issue(over: Partial<GhIssue> = {}): GhIssue {
   };
 }
 
+test("label constants match the backend allow-list exactly", () => {
+  // gh_issue_set_labels rejects anything outside { agent-ready,
+  // agent-investigation, agent-managed } — note "agent-investigation", not the
+  // plan text's "agent-investigate". Pin the literals so a rename can't silently
+  // start sending a label the backend refuses.
+  assert.equal(AGENT_READY, "agent-ready");
+  assert.equal(AGENT_INVESTIGATE, "agent-investigation");
+  assert.equal(AGENT_MANAGED, "agent-managed");
+});
+
 test("isLabeledForAgents is true only for go-signal labels", () => {
   assert.equal(isLabeledForAgents(issue({ labels: [AGENT_READY] })), true);
   assert.equal(isLabeledForAgents(issue({ labels: [AGENT_INVESTIGATE] })), true);

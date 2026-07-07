@@ -10,7 +10,10 @@ import type { GhIssue } from "./issues";
  *  `agent-investigate` are the two the plan exposes as one-click actions;
  *  `agent-managed` is owned by a running orchestrator and shown read-only. */
 export const AGENT_READY = "agent-ready";
-export const AGENT_INVESTIGATE = "agent-investigate";
+// The repo's label is "agent-investigation" (not the plan text's
+// "agent-investigate") — that's what exists and what the backend allow-list
+// permits; the other value would be rejected by gh_issue_set_labels.
+export const AGENT_INVESTIGATE = "agent-investigation";
 export const AGENT_MANAGED = "agent-managed";
 
 /** The labels a human toggles from the issues view to hand an issue to the

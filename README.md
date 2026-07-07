@@ -212,7 +212,7 @@ From the panel you can:
   submits.
 - **Hand an issue to the orchestrator** by toggling a label directly on the
   row: **ready** applies `agent-ready` (start work) and **investigate** applies
-  `agent-investigate` (research + a plan). That's the whole handshake — a
+  `agent-investigation` (research + a plan). That's the whole handshake — a
   running orchestrator on this repo polls open issues and pulls any so labelled
   onto its board; no orchestrator needs to be running when you label, since the
   label is durable on GitHub and picked up whenever one next starts here. An
