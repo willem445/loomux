@@ -57,6 +57,7 @@ pub fn run() {
             orchestration::start_watchdog(reg.clone());
             orchestration::start_attention(reg.clone());
             orchestration::start_max_notice_flusher(reg.clone());
+            orchestration::start_idle_tick(reg.clone());
             std::thread::spawn(move || orchestration::mcp::serve(reg));
             Ok(())
         })
@@ -128,6 +129,10 @@ pub fn run() {
             orchestration::orch_notify_enabled,
             orchestration::orch_set_notify,
             orchestration::orch_set_max_agents,
+            orchestration::orch_set_autonomous,
+            orchestration::orch_set_auto_merge,
+            orchestration::orch_set_autonomy_budget,
+            orchestration::orch_autonomy,
             orchestration::orch_group_usage,
             orchestration::orch_group_summary,
             orchestration::orch_end_group,

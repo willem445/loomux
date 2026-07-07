@@ -572,6 +572,18 @@ new agent or disturbing a busy one — for Claude and Copilot groups alike.
 pinned per role at launch, and the permission mode fixed at group creation
 (native auto mode or acceptEdits — never bypass).
 
+**Autonomous mode** (off by default, toggled live per group) lets an idle
+orchestrator drive its own monitoring/intake cadence: when its pane goes
+output-quiet, loomux delivers a periodic `[loomux] idle tick` so it re-syncs,
+picks up `agent-ready`/`agent-investigate`-labeled issues, and re-checks open
+PRs without anyone typing — the label funnel stays the consent boundary (it
+never acts on unlabeled issues). Two cost/safety controls ride with it: a
+per-group **token budget** that suspends autonomous ticking (and notifies you)
+once autonomous-era spend crosses the cap, and an **auto-merge** toggle
+(default off = you merge) that, when on, lets the orchestrator merge an
+adequately-tested PR itself (reviewer-approved + green CI + acceptance met),
+still holding anything risky for you. Every toggle and merge is audited.
+
 **Restart after loomux closes:** orchestration sessions are marked in the
 session browser (`ORCH` / `W` / `REV` chips). Clicking a dead group's
 orchestrator session restores the *whole* orchestration — same group id,

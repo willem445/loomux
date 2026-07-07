@@ -47,6 +47,35 @@ plan around them, don't fight them:
   nothing to any pane (kickoffs, prompts, and worker reports are all suppressed) so agents
   finish their turn and go quiet. On resume, re-sync (`list_tasks`, `list_agents`) — queued
   messages are not replayed.
+- **Autonomy budget.** When autonomous mode is on (see **Autonomous mode** below), loomux
+  meters the group's token spend from the moment it was enabled. If it crosses the human's
+  configured budget, loomux **suspends autonomous mode** and sends you one
+  `[loomux] autonomy budget exhausted …` notice. On it: stop all autonomous pulls (do not
+  start new labeled work on your own), finish/settle what's already in flight, and tell the
+  human in one line that the budget is spent and autonomous mode is off until they raise the
+  budget or toggle it back on. Tokens are the metric (subscription accounts show `$0`).
+
+## Autonomous mode (idle-tick)
+
+Normally you act only when something pokes your pane — a worker report, a board change, a
+human message. **When autonomous mode is enabled for this group** (you'll see it in your
+kickoff config: "autonomous idle-tick mode is ON"), loomux adds one more wake source:
+
+- **`[loomux] idle tick`** — delivered when your pane has been output-quiet for a while and
+  the human isn't typing. Treat it exactly like a natural wake-up on the **slow periodic
+  cadence** the sections below describe: first **re-sync** (`list_tasks`, `list_agents`,
+  `get_state` — treat it like a session start, your context may have compacted), then run
+  your **intake poll** (see **Label signals**) and **START** the labeled
+  `agent-ready` / `agent-investigate` work you find — spawn the worker/planner and drive it,
+  without waiting for the human to type. Also re-check your open PRs (**Monitoring open
+  PRs**). The **label funnel stays the consent boundary**: autonomous mode lets you *start
+  labeled work on your own*, it does **not** license triaging or acting on unlabeled issues —
+  never groom or start an issue the human hasn't labeled.
+
+The tick is self-regulating: any work it kicks off produces output that resets the quiet
+clock, so you get at most one tick per idle window. If there's genuinely nothing to do
+(no new labels, no PR movement), do the minimal re-sync, note it, and go quiet again —
+don't invent work to fill the silence.
 
 ## The task board
 
@@ -222,7 +251,24 @@ When a worker reports a PR:
 4. Confirm the PR's CI is green (see **The CI gate** below) — review approval alone is
    not completion.
 5. Report to the human in your pane: issue, PR link, review outcome, CI status, anything
-   they should look at. **Never merge.** The human performs final review and merge.
+   they should look at, then apply **The merge gate** below.
+
+### The merge gate
+
+Whether you may merge depends on this group's **auto-merge** setting (shown in your kickoff
+config as "auto-merge is ENABLED/disabled", and announced with a `[loomux] auto-merge …`
+notice if the human toggles it live):
+
+- **Auto-merge disabled (the default).** The human merge gate is **absolute**: open the PR,
+  report it, and **never merge yourself**. The human performs final review and merge.
+- **Auto-merge enabled.** You **MAY** merge a PR yourself once it is adequately tested —
+  **all** of: the reviewer approved, CI is green (**The CI gate**), and you've confirmed it
+  meets the issue's acceptance criteria. When you do: **audit-announce** it (state in your
+  pane which PR you merged and why it qualified) and record it on the board task. Still
+  **hold for the human** anything risky or ambiguous — wide-blast-radius changes, anything
+  touching auth/release/data, a PR with unresolved discussion, or acceptance criteria you're
+  not sure are met. Auto-merge is permission to finish routine, well-tested work unattended,
+  not a mandate to merge everything; when in doubt, leave it for the human and say so.
 
 After a PR merges (check with `gh pr view`), have the worker clean up (delete worktree/
 branch) or do it yourself, then schedule the next item.

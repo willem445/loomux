@@ -8,9 +8,9 @@
 
 use loomux_lib::orchestration::mcp::dispatch;
 use loomux_lib::orchestration::{
-    add_trusted_folder, bracketed_paste, classify_human_input, claude_permission_mode, cli_ready,
-    copilot_autopilot_prompt_detected, create_orchestration_group, hold_for_human_input,
-    hold_until_quiet, idle_should_kill, max_agents_notice,
+    add_trusted_folder, autonomy_budget_exhausted, bracketed_paste, classify_human_input,
+    claude_permission_mode, cli_ready, copilot_autopilot_prompt_detected, create_orchestration_group,
+    hold_for_human_input, hold_until_quiet, idle_should_kill, idle_tick_should_fire, max_agents_notice,
     normalize_remote_web_base, parse_audit_lines, parse_session_cost, paste_held_notice,
     prompt_wait_detected, resolve_paste_gate, resolve_ref_url, rotate_audit_if_needed,
     sanitize_attachment_ext, should_confirm_copilot_autopilot, should_flush_before_paste,
@@ -2987,6 +2987,258 @@ fn watchdog_stall_resets_when_the_agent_reports_or_messages() {
         &json!({ "name": "message_orchestrator", "arguments": { "text": "checking in" } }));
     assert_eq!(reg.watchdog_tick(FAR + 120_000, &HashMap::new()), vec![w.id.clone()],
         "a message must also reset the stall, then a later silence re-notifies");
+}
+
+// ---------- autonomous mode: idle-tick, toggles, budget (#83) ----------
+
+/// An autonomous group with a live (Running, headless) orchestrator. Returns
+/// (reg, tempdir, group id, orchestrator id). Autonomous mode is ON, so
+/// `idle_tick_tick` considers it.
+fn autonomous_setup() -> (OrchRegistry, tempfile::TempDir, String, String) {
+    let (reg, dir) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let o = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    reg.set_autonomous(&g.id, true).unwrap();
+    (reg, dir, g.id, o.id)
+}
+
+/// Count how many times `needle` appears in a group's audit log.
+fn audit_count(reg: &OrchRegistry, group: &str, needle: &str) -> usize {
+    fs::read_to_string(reg.state_root().join(group).join("audit.jsonl"))
+        .unwrap_or_default()
+        .matches(needle)
+        .count()
+}
+
+/// A durable usage snapshot carrying `tokens` input tokens under a unique key, to
+/// seed a group's lifetime spend without a real transcript.
+fn seed_usage(reg: &OrchRegistry, group: &str, key: &str, tokens: u64) {
+    reg.upsert_usage_snapshot(group, UsageSnapshot {
+        key: key.to_string(),
+        agent_id: format!("agent-{key}"),
+        name: key.to_string(),
+        role: "worker".to_string(),
+        source: "transcript".to_string(),
+        input_tokens: tokens,
+        output_tokens: 0,
+        cache_creation_tokens: 0,
+        cache_read_tokens: 0,
+        cost_usd: None,
+        estimated: true,
+        model: Some("claude-opus-4-8".to_string()),
+        updated_ms: now_ms(),
+    });
+}
+
+#[test]
+fn idle_tick_should_fire_respects_threshold_latch_cap_and_skew() {
+    let min = 60_000u64;
+    let none: &[u64] = &[];
+    // A 0 threshold disables the tick entirely.
+    assert!(!idle_tick_should_fire(0, 100 * min, 0, false, none, 6));
+    // Inside the window: not yet. At/past: fire.
+    assert!(!idle_tick_should_fire(0, 14 * min, 15, false, none, 6));
+    assert!(idle_tick_should_fire(0, 15 * min, 15, false, none, 6), "exactly at the window fires");
+    assert!(idle_tick_should_fire(0, 30 * min, 15, false, none, 6));
+    // The one-notice latch suppresses a re-fire until output growth clears it.
+    assert!(!idle_tick_should_fire(0, 30 * min, 15, true, none, 6), "latched → no re-fire");
+    // Per-hour cap: at the cap (6 ticks inside the trailing hour) the backstop
+    // blocks even a legitimately-due tick; a stale timestamp outside the hour
+    // doesn't count.
+    let now = 100 * min;
+    let at_cap: Vec<u64> = (0..6).map(|i| now - i * min).collect(); // 6 within the hour
+    assert!(!idle_tick_should_fire(0, now, 15, false, &at_cap, 6), "per-hour cap is a hard backstop");
+    let under_cap: Vec<u64> = (0..5).map(|i| now - i * min).collect();
+    assert!(idle_tick_should_fire(0, now, 15, false, &under_cap, 6), "under the cap fires");
+    let cap_0 = at_cap.clone();
+    assert!(idle_tick_should_fire(0, now, 15, false, &cap_0, 0), "cap 0 = uncapped");
+    // Clock skew: now before the quiet clock reads as zero elapsed, never a huge
+    // interval that would spuriously fire.
+    assert!(!idle_tick_should_fire(50 * min, 10 * min, 15, false, none, 6), "no underflow on skew");
+}
+
+#[test]
+fn autonomy_budget_exhausted_rule() {
+    // 0 budget = no cap, never exhausted.
+    assert!(!autonomy_budget_exhausted(1_000_000, 0));
+    // Under budget: fine. At/over: exhausted (inclusive boundary).
+    assert!(!autonomy_budget_exhausted(499, 500));
+    assert!(autonomy_budget_exhausted(500, 500), "exactly at budget suspends");
+    assert!(autonomy_budget_exhausted(999, 500));
+}
+
+#[test]
+fn idle_tick_fires_once_per_window_and_rearms_on_output() {
+    let (reg, _d, gid, oid) = autonomous_setup();
+    let empty = HashMap::new();
+    // Output-quiet far past the window → exactly one tick, audited.
+    assert_eq!(reg.idle_tick_tick(FAR, &empty, &empty), vec![oid.clone()],
+        "an idle autonomous orchestrator must be idle-ticked");
+    assert_eq!(audit_count(&reg, &gid, "idle-tick"), 1, "the tick must be audited once");
+    // Anti-nag: still quiet, already notified → no second tick.
+    assert!(reg.idle_tick_tick(FAR + 60_000, &empty, &empty).is_empty(),
+        "one tick per idle window");
+    // The orchestrator produces output (it acted on the tick): clock + latch
+    // both reset, and this very tick can't also fire.
+    let grew: HashMap<String, u64> = [(oid.clone(), 4096u64)].into_iter().collect();
+    assert!(reg.idle_tick_tick(FAR, &grew, &empty).is_empty(),
+        "output growth is activity, not an idle window");
+    // No further growth; a whole fresh window elapses → a brand-new tick.
+    assert_eq!(reg.idle_tick_tick(FAR + 15 * 60_000 + 1, &grew, &empty), vec![oid.clone()],
+        "a new idle window after activity earns a new tick");
+    assert_eq!(audit_count(&reg, &gid, "idle-tick"), 2);
+}
+
+#[test]
+fn idle_tick_skips_non_autonomous_group() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    // Autonomous mode never enabled → the loop must ignore the group wholesale.
+    let empty = HashMap::new();
+    assert!(reg.idle_tick_tick(FAR, &empty, &empty).is_empty(),
+        "a group without autonomous mode is never idle-ticked");
+    assert_eq!(audit_count(&reg, &g.id, "idle-tick"), 0);
+}
+
+#[test]
+fn idle_tick_skips_paused_group_preserving_latch() {
+    let (reg, _d, gid, oid) = autonomous_setup();
+    let empty = HashMap::new();
+    reg.pause_group(&gid).unwrap();
+    assert!(reg.idle_tick_tick(FAR, &empty, &empty).is_empty(),
+        "a paused autonomous group is not idle-ticked");
+    // The one-notice latch must be intact: pausing must not have burned it, so on
+    // resume the outstanding idle window still earns its first tick.
+    reg.resume_group(&gid).unwrap();
+    assert_eq!(reg.idle_tick_tick(FAR, &empty, &empty), vec![oid.clone()],
+        "resuming a still-idle autonomous group earns its first tick");
+}
+
+#[test]
+fn idle_tick_defers_on_recent_human_input() {
+    let (reg, _d, _gid, oid) = autonomous_setup();
+    let empty = HashMap::new();
+    // Output-quiet, but the human just typed into the pane (input time == now):
+    // the belt-and-suspenders gate must defer the tick even though output is old.
+    let just_typed: HashMap<String, u64> = [(oid.clone(), FAR)].into_iter().collect();
+    assert!(reg.idle_tick_tick(FAR, &empty, &just_typed).is_empty(),
+        "never tick while the human is actively steering the pane");
+    // Once the human input recedes past the window, the tick fires again.
+    assert_eq!(reg.idle_tick_tick(FAR + 15 * 60_000 + 1, &empty, &just_typed), vec![oid.clone()],
+        "after the human-input window elapses, the idle tick resumes");
+}
+
+#[test]
+fn autonomous_toggle_roundtrip_durable_and_audited() {
+    let (reg, dir) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let marker = reg.state_root().join(&g.id).join("autonomous");
+    assert!(!reg.is_autonomous(&g.id), "default off");
+    // Enable: marker written (content is the budget anchor), state on, audited.
+    reg.set_autonomous(&g.id, true).unwrap();
+    assert!(reg.is_autonomous(&g.id));
+    assert!(marker.is_file(), "enabling must write the durable marker");
+    assert_eq!(audit_count(&reg, &g.id, "autonomous-on"), 1);
+    // Idempotent: a second enable does not re-anchor or re-audit.
+    reg.set_autonomous(&g.id, true).unwrap();
+    assert_eq!(audit_count(&reg, &g.id, "autonomous-on"), 1, "re-enable is a no-op");
+    // Restart survival: a fresh registry over the same root re-seeds the toggle
+    // from the marker on group resume.
+    let reg2 = OrchRegistry::new(dir.path().to_path_buf());
+    reg2.set_port(45999);
+    let g2 = reg2.create_group("C:/tmp/repo", rails()).unwrap();
+    assert_eq!(g2.id, g.id, "same repo resumes the same group");
+    assert!(reg2.is_autonomous(&g.id), "autonomous mode must survive a restart");
+    // Disable: marker gone, state off, audited.
+    reg2.set_autonomous(&g.id, false).unwrap();
+    assert!(!reg2.is_autonomous(&g.id));
+    assert!(!marker.is_file(), "disabling must remove the marker");
+    assert_eq!(audit_count(&reg2, &g.id, "autonomous-off"), 1);
+}
+
+#[test]
+fn auto_merge_toggle_roundtrip_durable_audited_and_in_kickoff() {
+    let (reg, dir) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let marker = reg.state_root().join(&g.id).join("auto_merge");
+    assert!(!reg.is_auto_merge(&g.id), "default off = human merge gate");
+    reg.set_auto_merge(&g.id, true).unwrap();
+    assert!(reg.is_auto_merge(&g.id));
+    assert!(marker.is_file());
+    assert_eq!(audit_count(&reg, &g.id, "auto-merge-on"), 1);
+    // The orchestrator kickoff must reflect the live gate so a fresh boot/resume
+    // sees it (the template's conditional merge section reads this).
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let entry = reg.agent(&orch.id).unwrap();
+    let info = reg.group(&g.id).unwrap();
+    let kickoff = reg.kickoff_prompt(&entry, &info, "");
+    assert!(kickoff.contains("auto-merge is ENABLED"), "kickoff must surface auto-merge on, got: {kickoff}");
+    // No-op re-enable does not re-audit.
+    reg.set_auto_merge(&g.id, true).unwrap();
+    assert_eq!(audit_count(&reg, &g.id, "auto-merge-on"), 1);
+    // Restart survival.
+    let reg2 = OrchRegistry::new(dir.path().to_path_buf());
+    reg2.set_port(45999);
+    reg2.create_group("C:/tmp/repo", rails()).unwrap();
+    assert!(reg2.is_auto_merge(&g.id), "auto-merge must survive a restart");
+    reg2.set_auto_merge(&g.id, false).unwrap();
+    assert!(!reg2.is_auto_merge(&g.id));
+    assert!(!marker.is_file());
+    assert_eq!(audit_count(&reg2, &g.id, "auto-merge-off"), 1);
+}
+
+#[test]
+fn autonomy_budget_set_persists_survives_restart_and_audits() {
+    let (reg, dir) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    assert_eq!(reg.group(&g.id).unwrap().guardrails.autonomy_budget_tokens, 0, "default no cap");
+    assert_eq!(reg.set_autonomy_budget(&g.id, 250_000).unwrap(), 250_000);
+    assert_eq!(reg.group(&g.id).unwrap().guardrails.autonomy_budget_tokens, 250_000,
+        "the live guardrail the budget check reads must update");
+    assert_eq!(audit_count(&reg, &g.id, "autonomy-budget-set"), 1);
+    // No-op set does not re-persist/re-audit.
+    reg.set_autonomy_budget(&g.id, 250_000).unwrap();
+    assert_eq!(audit_count(&reg, &g.id, "autonomy-budget-set"), 1);
+    // Persisted to group.json and preferred over the launch param on resume.
+    let reg2 = OrchRegistry::new(dir.path().to_path_buf());
+    reg2.set_port(45999);
+    let g2 = reg2.create_group("C:/tmp/repo", rails()).unwrap();
+    assert_eq!(reg2.group(&g2.id).unwrap().guardrails.autonomy_budget_tokens, 250_000,
+        "a live-set budget must survive a restart, not revert to the launch default");
+    // Unknown group errors.
+    assert!(reg.set_autonomy_budget("no-such-group", 1).is_err());
+}
+
+#[test]
+fn budget_metering_anchors_at_enable_and_suspends_once_on_delta() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    // Pre-existing (pre-autonomous) spend that the budget must NOT count.
+    seed_usage(&reg, &g.id, "history", 1_000);
+    // Enable autonomous mode: the anchor is stamped at the current 1_000 tokens.
+    reg.set_autonomous(&g.id, true).unwrap();
+    reg.set_autonomy_budget(&g.id, 500).unwrap();
+    // No autonomous-era spend yet → delta 0 < 500 → still ticking.
+    assert!(reg.enforce_autonomy_budgets(now_ms()).is_empty(), "under budget must not suspend");
+    assert!(reg.is_autonomous(&g.id), "still autonomous while under budget");
+    // Autonomous-era spend of 600 tokens crosses the 500 budget (delta metered
+    // from the enable-time anchor, not the 1_600 lifetime total).
+    seed_usage(&reg, &g.id, "autonomous-era", 600);
+    assert_eq!(reg.enforce_autonomy_budgets(now_ms()), vec![g.id.clone()],
+        "crossing the budget must suspend");
+    assert!(!reg.is_autonomous(&g.id), "suspension flips the marker off (consent to resume)");
+    assert_eq!(audit_count(&reg, &g.id, "autonomy-budget-exhausted"), 1);
+    // Suspension is a one-shot: a second pass sees a non-autonomous group and does
+    // nothing, so the notice/audit never repeats.
+    assert!(reg.enforce_autonomy_budgets(now_ms()).is_empty(), "no re-suspend once off");
+    assert_eq!(audit_count(&reg, &g.id, "autonomy-budget-exhausted"), 1, "exactly one suspension notice");
+    // Re-enabling re-anchors at the now-higher spend (1_600), so the same budget
+    // meters fresh autonomous-era spend rather than instantly re-suspending.
+    reg.set_autonomous(&g.id, true).unwrap();
+    assert!(reg.enforce_autonomy_budgets(now_ms()).is_empty(),
+        "re-enabling re-anchors: the meter restarts from the current spend");
+    assert!(reg.is_autonomous(&g.id));
 }
 
 // ---------- attention routing: surface which pane needs the human (#6) ----------
