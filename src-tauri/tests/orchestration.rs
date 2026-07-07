@@ -1639,6 +1639,68 @@ fn task_lifecycle_create_edit_note_delete() {
 }
 
 #[test]
+fn delete_done_removes_only_done_and_notifies_once() {
+    // #120: the board's "delete all done" clears every done task in one action,
+    // and the orchestrator must hear about it ONCE — not once per task (the
+    // per-task notices are the token waste the issue calls out).
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+
+    // Five tasks, three of them done, interleaved with non-done ones.
+    let ids: Vec<String> = ["a", "b", "c", "d", "e"]
+        .iter()
+        .map(|title| reg.upsert_task(&g.id, "orch", None, patch(Some(title), None, None)).unwrap().id)
+        .collect();
+    for (i, status) in [(0, "done"), (1, "in-progress"), (2, "done"), (3, "queued"), (4, "done")] {
+        reg.upsert_task(&g.id, "human", Some(&ids[i]), patch(None, Some(status), None)).unwrap();
+    }
+
+    // Pause the group so the best-effort board-change notice is observable as a
+    // suppression audit — test mode has no real PTY to deliver into. The pause
+    // guard fires inside deliver_to_orchestrator, past the coalescing point, so
+    // the suppression count equals the notice count.
+    reg.pause_group(&g.id).unwrap();
+
+    let removed = reg.delete_done_tasks(&g.id, "human").unwrap();
+    removed.iter().for_each(|id| assert!(ids.contains(id)));
+    assert_eq!(removed.len(), 3, "exactly the three done tasks are removed");
+
+    // Only the non-done tasks survive, in board order.
+    let survivors: Vec<String> = reg.tasks(&g.id).iter().map(|t| t.status.clone()).collect();
+    assert_eq!(survivors, ["in-progress", "queued"], "non-done tasks are untouched");
+
+    // The heart of #120: ONE board-change notice for the whole batch.
+    let notices: Vec<_> = reg
+        .audit_log(&g.id)
+        .into_iter()
+        .filter(|e| {
+            e.action == "prompt-suppressed-paused"
+                && e.detail["text"].as_str().is_some_and(|s| s.contains("updated the task board"))
+        })
+        .collect();
+    assert_eq!(notices.len(), 1, "the batch must coalesce to a single board-change notice");
+    assert!(
+        notices[0].detail["text"].as_str().unwrap().contains("3 done tasks"),
+        "the single notice names the batch size, got: {}",
+        notices[0].detail["text"]
+    );
+
+    // A second sweep with nothing done is a no-op: no delete, no new notice.
+    let again = reg.delete_done_tasks(&g.id, "human").unwrap();
+    assert!(again.is_empty(), "nothing left to delete");
+    let notice_count = reg
+        .audit_log(&g.id)
+        .into_iter()
+        .filter(|e| {
+            e.action == "prompt-suppressed-paused"
+                && e.detail["text"].as_str().is_some_and(|s| s.contains("updated the task board"))
+        })
+        .count();
+    assert_eq!(notice_count, 1, "a no-op sweep must not notify");
+}
+
+#[test]
 fn task_board_persists_and_reorders() {
     let dir = tempfile::tempdir().unwrap();
     let gid;

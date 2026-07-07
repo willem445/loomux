@@ -800,6 +800,15 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   border-bottom: 1px solid var(--border-soft);
 }
 .tasks-head .pane-btn { opacity: 1; }
+/* Batch-clear button carries a text label, so it sizes to its content unlike
+   the icon-only pane buttons; armed (awaiting the confirm click) it goes red. */
+.tasks-head .pane-btn.clear-done {
+  flex: none; width: auto; padding: 0 8px; font-size: 10.5px; height: 20px;
+}
+.tasks-head .pane-btn.clear-done:hover { color: var(--danger); }
+.tasks-head .pane-btn.clear-done[data-confirm] {
+  color: #1a1a22; background: var(--danger);
+}
 .tasks-title { font-weight: 600; font-size: 12px; }
 .tasks-group {
   flex: 1; min-width: 0; color: var(--text-dim); font-size: 10.5px;

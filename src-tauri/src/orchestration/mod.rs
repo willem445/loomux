@@ -2162,6 +2162,36 @@ impl OrchRegistry {
         Ok(())
     }
 
+    /// Delete every task in the terminal `done` status in a single board write,
+    /// returning the ids removed (empty if none were done). The board's "delete
+    /// all done" action routes through here so the batch surfaces to the
+    /// orchestrator as ONE board-change notice, not one per task (#120) — the
+    /// coalesced notice is emitted here (best-effort), so callers must not fan
+    /// out per-task notices. A no-op (nothing done) writes nothing and notifies
+    /// nothing.
+    pub fn delete_done_tasks(&self, group: &str, actor: &str) -> Result<Vec<String>, String> {
+        let removed = {
+            let _guard = self.tasks_lock.lock_safe();
+            let mut tasks = self.tasks(group);
+            let removed: Vec<String> =
+                tasks.iter().filter(|t| t.status == "done").map(|t| t.id.clone()).collect();
+            if removed.is_empty() {
+                return Ok(removed);
+            }
+            tasks.retain(|t| t.status != "done");
+            self.write_tasks(group, &tasks)?;
+            self.audit(group, actor, "task-delete-done", json!({ "ids": removed }));
+            removed
+        };
+        // Outside the tasks lock: notify is best-effort and can block on delivery.
+        let n = removed.len();
+        self.notify_board_edit(
+            group,
+            &format!("deleted {n} done task{}", if n == 1 { "" } else { "s" }),
+        );
+        Ok(removed)
+    }
+
     /// Reorder by explicit id list (board order = priority). Ids not
     /// mentioned keep their relative order after the mentioned ones.
     pub fn reorder_tasks(&self, group: &str, actor: &str, ids: &[String]) -> Result<(), String> {
@@ -5898,6 +5928,18 @@ pub fn orch_delete_task(
     reg.delete_task(&group_id, "human", &id)?;
     reg.notify_board_edit(&group_id, &format!("deleted task {id}"));
     Ok(())
+}
+
+/// Delete all `done` tasks in one action. The single board-change notice is
+/// emitted inside `delete_done_tasks` (coalesced for the batch, #120), so —
+/// unlike the single-delete command — none is fanned out here. Returns the ids
+/// removed so the frontend can confirm what it cleared.
+#[tauri::command]
+pub fn orch_delete_done_tasks(
+    reg: tauri::State<Arc<OrchRegistry>>,
+    group_id: String,
+) -> Result<Vec<String>, String> {
+    reg.delete_done_tasks(&group_id, "human")
 }
 
 #[tauri::command]

@@ -280,6 +280,12 @@ delete tasks; the orchestrator is notified of your edits and maintains the
 same board through its tools. Issue and PR chips are **clickable** — they open
 in your browser.
 
+**Clear done:** when the board holds any `done` items, the header shows a
+**🗑 done (N)** button that deletes them all in one action (two-click confirm,
+so a mis-click can't wipe the board). The whole batch is a single backend
+operation, so the orchestrator hears about it **once** — one *board updated*
+notice for the sweep, not one per task deleted.
+
 **Start:** a `queued` item shows a **▶ Start** button — your nudge to have the
 orchestrator begin work on it now. Clicking it records a human note on the task
 and delivers a *begin work* prompt to the orchestrator pane (same delivery path

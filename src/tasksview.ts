@@ -8,6 +8,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { swapIfConnected } from "./domutil";
+import { doneCount } from "./taskboard";
 
 export interface OrchTaskNote {
   ts_ms: number;
@@ -44,6 +45,8 @@ export class TasksView {
   readonly el: HTMLElement;
   private listEl: HTMLElement;
   private addInput: HTMLInputElement;
+  private clearDoneBtn: HTMLButtonElement;
+  private clearDoneTimer: number | undefined;
   private toastEl: HTMLElement;
   private toastTimer: number | undefined;
   private tasks: OrchTask[] = [];
@@ -65,6 +68,17 @@ export class TasksView {
     const head = el("div", "tasks-head");
     head.append(el("span", "tasks-title", "task board"));
     head.append(el("span", "tasks-group", groupId));
+
+    // Batch-clear all done tasks in one action. Hidden until there is
+    // something to clear (updated in render). Two-click confirm — a mis-click
+    // must not wipe the board — mirroring the per-row delete. The backend does
+    // this as one operation so the orchestrator gets a single board-change
+    // notice for the whole batch, not one per task (#120).
+    this.clearDoneBtn = el("button", "pane-btn clear-done", "") as HTMLButtonElement;
+    this.clearDoneBtn.hidden = true;
+    this.clearDoneBtn.addEventListener("click", () => this.onClearDone());
+    head.append(this.clearDoneBtn);
+
     const close = el("button", "pane-btn close", "✕") as HTMLButtonElement;
     close.title = "Close (Alt+T)";
     close.addEventListener("click", opts.onClose);
@@ -113,6 +127,7 @@ export class TasksView {
   dispose(): void {
     this.disposed = true;
     clearTimeout(this.toastTimer);
+    clearTimeout(this.clearDoneTimer);
     this.unlisten?.();
     this.el.remove();
   }
@@ -164,6 +179,34 @@ export class TasksView {
     if (!title) return;
     this.addInput.value = "";
     await this.mutate(invoke("orch_upsert_task", { groupId: this.groupId, title }));
+  }
+
+  /** Reflect the current done-count on the batch-clear button, resetting any
+   *  pending confirm — called from render() so the label always matches the
+   *  board (and a stale "sure?" can't linger after the set changes). */
+  private updateClearDone(): void {
+    clearTimeout(this.clearDoneTimer);
+    delete this.clearDoneBtn.dataset.confirm;
+    const n = doneCount(this.tasks);
+    this.clearDoneBtn.hidden = n === 0;
+    this.clearDoneBtn.textContent = `🗑 done (${n})`;
+    this.clearDoneBtn.title = `Delete all ${n} done task${n === 1 ? "" : "s"} — the orchestrator is notified once`;
+  }
+
+  /** Two-click confirm, then delete every done task in one backend call. The
+   *  batch is a single operation so the orchestrator gets ONE board-change
+   *  notice, not one per task (#120). */
+  private onClearDone(): void {
+    if (this.clearDoneBtn.dataset.confirm) {
+      clearTimeout(this.clearDoneTimer);
+      delete this.clearDoneBtn.dataset.confirm;
+      void this.mutate(invoke("orch_delete_done_tasks", { groupId: this.groupId }));
+      return;
+    }
+    const n = doneCount(this.tasks);
+    this.clearDoneBtn.dataset.confirm = "1";
+    this.clearDoneBtn.textContent = `delete ${n}?`;
+    this.clearDoneTimer = window.setTimeout(() => this.updateClearDone(), 2500);
   }
 
   /** Open a task's issue/PR reference in the default browser. */
@@ -227,6 +270,7 @@ export class TasksView {
   }
 
   private render(): void {
+    this.updateClearDone();
     this.listEl.replaceChildren();
     if (this.tasks.length === 0) {
       this.listEl.appendChild(el("div", "tasks-empty", "No tasks yet — the orchestrator adds them as work items come in, or add one below."));
