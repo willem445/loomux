@@ -29,6 +29,8 @@ import {
   attachRejectMessage,
   composeSteerText,
   bytesToBase64,
+  steerKeyAction,
+  steerBoxHeight,
 } from "./steer";
 import { createOrderedWriter } from "./ptywrite";
 import { showToast } from "./toast";
@@ -227,7 +229,7 @@ export class Pane {
   /** Loomux-owned steering strip docked under orchestrator panes (#43): the
    *  human types here and loomux enqueues it through the same serialized
    *  delivery path as worker reports, so the pane's stdin has one writer. */
-  private composeInput: HTMLInputElement | null = null;
+  private composeInput: HTMLTextAreaElement | null = null;
   private composeStatus: HTMLElement | null = null;
   private composeStatusTimer: number | undefined;
   /** Thumbnail-chip row for images pasted/attached into the strip (#72); hidden
@@ -1119,18 +1121,25 @@ export class Pane {
   }
 
   /** Build the loomux steering strip and dock it under the terminal (#43,
-   *  option C). It is a plain DOM input — NOT part of xterm — so it never
-   *  steals the terminal's keys: keystrokes only reach it while it holds
-   *  focus (click or Alt+P). Enter submits; Esc hands focus back to the term. */
+   *  option C). It is a plain DOM textarea — NOT part of xterm — so it never
+   *  steals the terminal's keys: keystrokes only reach it while it holds focus
+   *  (click or Alt+P). Enter submits; Shift+Enter inserts a newline (the box
+   *  wraps and grows, #100); Esc hands focus back to the term. */
   private buildComposeStrip(): void {
     const strip = document.createElement("div");
     strip.className = "orch-compose";
 
     const row = document.createElement("div");
     row.className = "orch-compose-row";
-    const input = document.createElement("input");
+    // The textarea floats inside a fixed-height field: it grows UPWARD over the
+    // terminal (see .orch-compose CSS) so a multi-line draft never shrinks the
+    // strip's flow footprint — that would resize .pane-term / the PTY (#100).
+    const field = document.createElement("div");
+    field.className = "orch-compose-field";
+    const input = document.createElement("textarea");
     input.className = "dlg-input orch-compose-input";
-    input.placeholder = "Steer the orchestrator — Alt+P to focus · Enter to send · Esc to terminal";
+    input.placeholder = "Steer the orchestrator — Enter to send · Shift+Enter for a newline · Esc to terminal";
+    input.rows = 1;
     input.spellcheck = false;
     input.autocomplete = "off";
     input.addEventListener("keydown", (e) => {
@@ -1139,18 +1148,23 @@ export class Pane {
       // while the strip is focused — but Enter/Esc/plain typing aren't app
       // shortcuts, so the strip handles them normally regardless.)
       e.stopPropagation();
-      // Ignore Enter/Escape while an IME composition is active (e.g. picking a
-      // candidate) — `isComposing`/keyCode 229 mean the key belongs to the IME,
-      // not us, so we must not submit or bail mid-word.
-      if (e.isComposing || e.keyCode === 229) return;
-      if (e.key === "Enter") {
-        e.preventDefault();
-        void this.submitCompose();
-      } else if (e.key === "Escape") {
-        e.preventDefault();
-        this.focus();
+      // Only Enter (send) and Escape (back to terminal) are ours; Shift+Enter,
+      // IME-commit Enter, and ordinary typing fall through to the textarea so it
+      // inserts a newline and auto-grows. See steerKeyAction for the rules.
+      switch (steerKeyAction(e)) {
+        case "submit":
+          e.preventDefault();
+          void this.submitCompose();
+          break;
+        case "blur":
+          e.preventDefault();
+          this.focus();
+          break;
       }
     });
+    // Reflow the box on every content change (typing, newline, paste, cut) so it
+    // tracks the draft's line count up to the CSS cap.
+    input.addEventListener("input", () => this.growCompose());
     // Ctrl+V of a screenshot: pull image blobs out of the clipboard and queue
     // them as attachments (#72). Text pastes fall through to the input's default
     // handling untouched — we only preventDefault when we actually took images.
@@ -1191,7 +1205,8 @@ export class Pane {
       e.stopPropagation();
       void this.submitCompose();
     });
-    row.append(input, attach, filePicker, send);
+    field.appendChild(input);
+    row.append(field, attach, filePicker, send);
 
     // Thumbnail-chip row for queued images (#72). Hidden (via .orch-compose-chips
     // being empty + CSS) until something is queued; kept above the status slot.
@@ -1209,6 +1224,9 @@ export class Pane {
     this.composeStatus = status;
     this.composeChips = chips;
     this.el.appendChild(strip);
+    // Set the box's initial one-line height explicitly (it's attached now), so
+    // the baseline matches the field's reserved height before any typing.
+    this.growCompose();
   }
 
   /** Queue one image for the next steer: vet it, base64 it to the backend
@@ -1292,6 +1310,27 @@ export class Pane {
     this.composeInput.select();
   }
 
+  /** Auto-grow the steer box to fit its draft, capped at the CSS `max-height`
+   *  (a few lines). The box is absolutely positioned and grows upward over the
+   *  terminal, so its height changes never touch .pane-term / the PTY (#100).
+   *  Past the cap it scrolls internally instead of getting taller. */
+  private growCompose(): void {
+    const t = this.composeInput;
+    if (!t) return;
+    // Collapse to content height first so the box can also SHRINK (e.g. after a
+    // send or a delete), then measure and clamp to the cap.
+    t.style.height = "auto";
+    const cs = getComputedStyle(t);
+    // scrollHeight is content+padding but excludes the border; under border-box
+    // the applied height must include it, or the box under-sizes by ~2px and
+    // clips the last line. maxHeight (border-box) is the CSS cap.
+    const border = (parseFloat(cs.borderTopWidth) || 0) + (parseFloat(cs.borderBottomWidth) || 0);
+    const maxPx = parseFloat(cs.maxHeight) || 0;
+    const { heightPx, scroll } = steerBoxHeight(t.scrollHeight + border, maxPx);
+    t.style.height = `${heightPx}px`;
+    t.style.overflowY = scroll ? "auto" : "hidden";
+  }
+
   /** Show a transient status line under the strip (errors only — a successful
    *  send is confirmed by the message landing in the terminal above). */
   private showComposeStatus(msg: string): void {
@@ -1321,6 +1360,7 @@ export class Pane {
     const text = composeSteerText(draft, queued.map((a) => a.path), this.orchCli);
     if (!text) return;
     input.value = "";
+    this.growCompose(); // collapse the (now empty) box back to one line
     this.attachments = [];
     this.renderChips();
     this.composeStatus?.classList.remove("show");
@@ -1333,7 +1373,10 @@ export class Pane {
       // Restore the draft and re-queue the images so a rejected send (paused
       // group, dead orchestrator) isn't lost — unless the human already started
       // a newer draft, which we must not clobber.
-      if (input.value === "") input.value = draft;
+      if (input.value === "") {
+        input.value = draft;
+        this.growCompose(); // regrow to fit the restored draft
+      }
       if (this.attachments.length === 0) {
         this.attachments = queued;
         this.renderChips();
