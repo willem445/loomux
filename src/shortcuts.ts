@@ -9,11 +9,13 @@ export type ShortcutAction =
   | "toggle-sessions"
   | "toggle-agent-mode"
   | "toggle-git"
+  | "toggle-issues"
   | "open-editor"
   | "toggle-tasks"
   | "toggle-audit"
   | "toggle-group"
   | "focus-compose"
+  | "voice-ptt"
   | "maximize-pane"
   | "minimize-pane"
   | "rename-pane"
@@ -43,11 +45,17 @@ export function matchShortcut(e: KeyboardEvent): ShortcutAction | null {
       // Alt+G, not Ctrl+Shift+G: WebView2 consumes that as its
       // find-previous accelerator before the page ever sees it.
       case "KeyG": return "toggle-git";
+      case "KeyI": return "toggle-issues";
       case "KeyE": return "open-editor";
       case "KeyT": return "toggle-tasks";
       case "KeyA": return "toggle-audit";
       case "KeyO": return "toggle-group";
       case "KeyP": return "focus-compose";
+      // Alt+S (voice / "speak"). NOT Alt+V: that's Claude Code's paste-image
+      // binding, and loomux intercepting it stole it inside agent panes. NOT
+      // Alt+M either (that's minimize-pane). Alt+S is free in loomux, unused by
+      // Claude Code, and not a readline word-motion binding.
+      case "KeyS": return "voice-ptt";
     }
   }
   if (e.code === "F2" && !e.ctrlKey && !e.altKey && !e.shiftKey) return "rename-pane";
