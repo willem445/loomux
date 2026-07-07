@@ -15,7 +15,18 @@ import { initStatusBar } from "./statusbar";
 import { initHintBar } from "./hintbar";
 import { AgentLauncher } from "./launcher";
 import { getAgentMode, setAgentMode } from "./agents";
-import { initOrchestration, launchOrchestrator, orchSessionRoles, resumeOrchSession } from "./orchestration";
+import {
+  initOrchestration,
+  launchOrchestrator,
+  orchSessionRoles,
+  resumeOrchSession,
+  type OrchWiring,
+  type OrchTarget,
+  type OrchestratorConfig,
+  type AttentionItem,
+} from "./orchestration";
+import { tabAttention, sameAttention, shouldRefreshPreview } from "./tabroute";
+import { encodeTabs, decodeTabs } from "./tabstore";
 
 // Surface unexpected errors as a visible banner instead of a silently
 // broken UI — a user-facing "crash" should always come with a message.
@@ -92,6 +103,116 @@ function findPaneAcrossTabs(ptyId: number): { ws: Workspace; pane: Pane } | null
   return null;
 }
 
+// ---------- project tabs: orchestration routing (#63 phase 3) ----------
+
+/** A short project name for a tab, from a repo/worktree path's last segment. */
+function projectName(path: string): string {
+  const parts = path.replace(/[\\/]+$/, "").split(/[\\/]/);
+  return parts[parts.length - 1] || "project";
+}
+
+/** Launch an orchestrator into its OWN project tab (created + activated + named
+ *  from the repo), then bind the group→tab routing so its workers land here and
+ *  focus/attention resolve to this tab (#63 phase 3). */
+async function launchOrchestratorTab(config: OrchestratorConfig): Promise<void> {
+  const ws = tabs.newTab();
+  tabs.renameTab(ws.id, projectName(config.repo));
+  const { groupId, pane } = await launchOrchestrator(ws.grid, eventsFor(ws), config);
+  tabs.bindGroup(groupId, ws.id);
+  if (pane?.ptyId != null) tabs.bindPty(pane.ptyId, ws.id);
+  persistTabs();
+}
+
+/** Apply an attention scan across all tabs: badge each pane by its pty (the
+ *  pre-tabs behavior, now spanning every tab) AND badge the tab-strip entry of
+ *  any tab that owns a needs-attention pty — so a hidden tab's blocked agent
+ *  still surfaces (#63 phase 3). Uses a live pty→tab map built from the actual
+ *  panes, so plain (#40) panes badge their tab too, not just bound agents. */
+function applyAttention(items: AttentionItem[]): void {
+  const byPty = new Map<number, AttentionItem>();
+  for (const it of items) if (it.pty_id !== null) byPty.set(it.pty_id, it);
+  const ptyToWs = new Map<number, string>();
+  for (const ws of tabs.tabs) {
+    for (const pane of ws.grid.allPanes()) {
+      if (pane.ptyId === null) continue;
+      ptyToWs.set(pane.ptyId, ws.id);
+      const it = byPty.get(pane.ptyId);
+      pane.setAttention(it ? it.reason : null, it?.detail);
+    }
+  }
+  // Dedup against the current set so the 3-second re-emits don't re-render the
+  // tab bar when nothing changed.
+  const next = tabAttention(items, ptyToWs);
+  if (!sameAttention(tabs.tabAttention, next)) tabs.setTabAttention(next);
+}
+
+/** The tab layer as the orchestration event router sees it (OrchWiring). */
+const orchWiring: OrchWiring = {
+  targetForGroup(req): OrchTarget {
+    let ws = tabs.workspaceForGroup(req.group_id);
+    if (!ws) {
+      // First sight of a group with no tab (e.g. a rejoin before its
+      // orchestrator restored) — open a background project tab for it.
+      ws = tabs.newTab(false);
+      tabs.renameTab(ws.id, projectName(req.cwd || req.name));
+      tabs.bindGroup(req.group_id, ws.id);
+      persistTabs();
+    }
+    return { grid: ws.grid, paneEvents: eventsFor(ws) };
+  },
+  bindPty(groupId, ptyId): void {
+    const ws = tabs.workspaceForGroup(groupId);
+    if (ws) tabs.bindPty(ptyId, ws.id);
+  },
+  findByPty(ptyId): Pane | undefined {
+    return findPaneAcrossTabs(ptyId)?.pane;
+  },
+  allGrids(): Grid[] {
+    return tabs.tabs.map((ws) => ws.grid);
+  },
+  focusPty(ptyId): void {
+    const found = findPaneAcrossTabs(ptyId);
+    if (!found) return;
+    tabs.switchTo(found.ws.id); // switch to the pane's TAB first…
+    found.ws.grid.setActive(found.pane); // …then focus the pane.
+    found.pane.focus();
+  },
+  applyAttention,
+};
+
+// ---------- project tabs: persistence (#63 phase 5, prototype-lite) ----------
+
+const TABS_STORAGE_KEY = "loomux.tabs";
+
+/** Persist the tab set (name/color/group membership) to localStorage — the same
+ *  cheap `loomux.*` store the launcher recents and editor command use. Pane/PTY
+ *  contents are not captured; see tabstore.ts / the walkthrough for the limits. */
+function persistTabs(): void {
+  try {
+    localStorage.setItem(TABS_STORAGE_KEY, encodeTabs(tabs.snapshot()));
+  } catch {
+    /* persistence is best-effort; never block the UI on it */
+  }
+}
+
+/** Recreate the saved tab set on boot, rebinding each tab's group so a later
+ *  session-restore of that group routes into the right tab. Returns whether any
+ *  tabs were restored (false → caller seeds one default tab). Live agent panes
+ *  do NOT come back here — only the tab shells + group bindings do. */
+function restoreTabs(): boolean {
+  const saved = decodeTabs(localStorage.getItem(TABS_STORAGE_KEY));
+  if (!saved) return false;
+  for (const t of saved.tabs) {
+    const ws = tabs.newTab(false);
+    tabs.renameTab(ws.id, t.name);
+    tabs.setColor(ws.id, t.color);
+    if (t.groupId) tabs.bindGroup(t.groupId, ws.id);
+  }
+  const activeWs = tabs.tabs[saved.activeIndex];
+  if (activeWs) tabs.switchTo(activeWs.id);
+  return true;
+}
+
 // PTYs whose exit event arrived before their pane finished starting.
 const earlyExits = new Map<number, PtyExit>();
 
@@ -149,7 +270,7 @@ async function openPaneIn(
     return;
   }
   if (result.kind === "orchestrator") {
-    await launchOrchestrator(ws.grid, eventsFor(ws), result.config);
+    await launchOrchestratorTab(result.config);
     return;
   }
   // Alternate split direction pane-to-pane so a fleet lays out as a grid
@@ -199,10 +320,17 @@ async function restoreSession(s: SessionInfo): Promise<void> {
   const orchRole = s.source === "claude" ? sessions.roleFor(s) : undefined;
   if (orchRole) {
     try {
-      await resumeOrchSession(ws.grid, eventsFor(ws), s.id, {
+      const restored = await resumeOrchSession(ws.grid, eventsFor(ws), s.id, {
         group: orchRole.group_id,
         role: orchRole.role,
       });
+      // Bind the restored group + pane to this tab so its rejoined workers and
+      // focus/attention route here (#63 phase 3).
+      if (restored) {
+        tabs.bindGroup(restored.groupId, ws.id);
+        if (restored.pane?.ptyId != null) tabs.bindPty(restored.pane.ptyId, ws.id);
+        persistTabs();
+      }
     } catch (err) {
       showFatal(String(err));
     }
@@ -375,20 +503,39 @@ initStatusBar();
 // overflows a narrow window.
 initHintBar();
 
-// Orchestration: open badged panes when the backend spawns agents. Every event
-// resolves to the ACTIVE tab for now; TODO(#63 phase 3, worker B) routes by
-// group_id/pty_id across all tabs (see OrchTargetResolver).
-initOrchestration(() => {
-  const ws = tabs.activeWorkspace;
-  return { grid: ws.grid, paneEvents: eventsFor(ws) };
-});
+// Orchestration is now tab-aware (#63 phase 3): spawns land in their group's
+// tab (auto-created on first sight), focus switches tab then pane, group-end
+// closes the owning tab's panes, and attention badges hidden tabs' strip
+// entries. The router (orchWiring) is implemented over the TabManager above.
+initOrchestration(orchWiring);
 
-// Seed the one default tab (the "never zero tabs" floor) and mount the tab bar,
-// then open the first pane in it once the output router is up.
-tabs.newTab();
+// Restore the saved tab set, or seed the one default tab (never-zero-tabs
+// floor). Persist on every subsequent change. Mount the tab bar last.
+const didRestore = restoreTabs();
+if (!didRestore) tabs.newTab();
+tabs.onChange(persistTabs);
 new TabBar(tabBarEl, tabs);
+
+// Keep hidden tabs' preview thumbnails fresh (#63 phase 4): serialize each
+// non-active tab's viewport buffer on a throttle. Never touches a laid-out
+// element — serialization reads the in-memory buffer, so no resize is armed.
+const PREVIEW_THROTTLE_MS = 4000;
+window.setInterval(() => {
+  const now = Date.now();
+  const active = tabs.activeTabId;
+  for (const ws of tabs.tabs) {
+    if (ws.id === active) continue; // the active tab is visible; no thumbnail needed
+    if (shouldRefreshPreview(ws.previewAt, now, PREVIEW_THROTTLE_MS)) ws.refreshPreview(now);
+  }
+}, 2000);
 
 void (async () => {
   await ensureOutputRouter();
-  await openPane();
+  // Fill any restored background tab that came back empty with a plain shell so
+  // it isn't blank (live agent panes don't auto-rehydrate — see the walkthrough).
+  for (const ws of tabs.tabs) {
+    if (ws.id !== tabs.activeTabId && ws.grid.paneCount === 0) await openShellIn(ws);
+  }
+  // The active tab opens per the current mode (launcher in agent mode), as before.
+  if (tabs.activeWorkspace.grid.paneCount === 0) await openPane();
 })();

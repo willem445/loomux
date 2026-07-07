@@ -122,6 +122,63 @@ html, body {
 .tab-name {
   min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
+
+/* Live status chip (#63 phase 4): agent count + cost for a group-bound tab. */
+.tab-status {
+  flex: none; font-size: 10.5px; color: var(--text-dim);
+  padding: 0 4px; border-radius: 4px; background: rgba(255, 255, 255, 0.04);
+}
+.tab.active .tab-status { color: var(--text); }
+.tab-paused { flex: none; font-size: 10px; color: #e0af68; }
+
+/* Attention (#63 phase 3): a leading dot + pulse on a tab whose (maybe hidden)
+   pane needs the human. Amber default, red when urgent — mirrors the pane/dock
+   chips (attention.ts). Always-visible dot so reduced-motion users see it too. */
+.tab.needs-attention { color: #f2c66a; border-top-color: #6a5230; }
+.tab.needs-attention.urgent { color: #ff9db0; border-top-color: rgba(247, 118, 142, 0.5); }
+.tab.needs-attention .tab-name::before {
+  content: "●"; margin-right: 5px; font-size: 8px; vertical-align: 1px; color: currentColor;
+}
+.tab.needs-attention { animation: tab-attn-pulse 1.6s ease-in-out infinite; }
+@keyframes tab-attn-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 transparent; }
+  50% { box-shadow: 0 -2px 10px 0 rgba(224, 175, 104, 0.35); }
+}
+.tab.needs-attention.urgent { animation-name: tab-attn-pulse-urgent; }
+@keyframes tab-attn-pulse-urgent {
+  0%, 100% { box-shadow: 0 0 0 0 transparent; }
+  50% { box-shadow: 0 -2px 12px 0 rgba(247, 118, 142, 0.45); }
+}
+@media (prefers-reduced-motion: reduce) { .tab.needs-attention { animation: none; } }
+
+/* Right-click context menu (#63 phase 5): pause/resume/rename/close. */
+.tab-menu {
+  position: fixed; z-index: 90; min-width: 150px;
+  display: flex; flex-direction: column; padding: 4px;
+  background: var(--panel-2); border: 1px solid var(--border);
+  border-radius: 8px; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+}
+.tab-menu-item {
+  text-align: left; font: inherit; font-size: 12px; color: var(--text);
+  background: transparent; border: none; border-radius: 5px;
+  padding: 6px 9px; cursor: pointer;
+}
+.tab-menu-item:hover { background: var(--panel); }
+.tab-menu-item.danger:hover { color: var(--danger); }
+
+/* Hover thumbnail (#63 phase 4): the tab's serialized viewport as plain text. */
+.tab-preview {
+  position: fixed; z-index: 85; max-width: 460px;
+  padding: 8px 10px; border-radius: 8px;
+  background: var(--bg-term); border: 1px solid var(--border);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+  pointer-events: none;
+}
+.tab-preview pre {
+  margin: 0; font-family: "Cascadia Code", "Consolas", ui-monospace, monospace;
+  font-size: 10.5px; line-height: 1.3; color: var(--text-dim);
+  white-space: pre; overflow: hidden; max-height: 210px;
+}
 .tab-name-input {
   font: inherit; font-size: 12px; color: var(--text);
   background: var(--bg-app); border: 1px solid var(--accent-dim);

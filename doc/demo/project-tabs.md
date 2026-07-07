@@ -1,8 +1,9 @@
 # Project tabs — prototype walkthrough (#63)
 
 > **Status: PROTOTYPE, Option A.** This is a demo build for direction feedback,
-> not a finished feature. Phases 1–2 (this doc) are functional; phases 3–5 are
-> stubbed with `TODO(#63 phase N)` seams. Do **not** merge — see the draft PR.
+> not a finished feature. All five phases are now wired end-to-end at
+> prototype/demo quality (see the honest limits near the end). Do **not** merge —
+> see the draft PR.
 
 ## What this is
 
@@ -25,11 +26,13 @@ tested pieces:
 | Piece | File | Role |
 | --- | --- | --- |
 | `TabManager` | `src/tabs.ts` | Ordered tab list, active tab, never-zero-tabs, phase-3 routing seams. DOM-free / unit-tested. |
-| `Workspace` | `src/workspace.ts` | One tab = a `Grid` + its own dock, in a container that hides via `display:none`. |
-| `TabBar` | `src/tabbar.ts` | The tab strip: switch, close, new (+), rename (dbl-click), color swatch. |
-| wiring | `src/main.ts` | The old module-scope single `grid` is gone; everything acts on `tabs.activeWorkspace.grid`. |
+| `Workspace` | `src/workspace.ts` | One tab = a `Grid` + its own dock; hides via `display:none`, drops WebGL when hidden, snapshots its viewport for previews. |
+| `TabBar` | `src/tabbar.ts` | The tab strip: switch, close, new (+), rename, color, attention dot, status chip, hover thumbnail, right-click pause menu. |
+| wiring | `src/main.ts` | The old module-scope single `grid` is gone; everything acts on `tabs.activeWorkspace.grid`. Owns the `OrchWiring` router + persistence + preview timer. |
 | shortcuts | `src/shortcuts.ts` | new / close / next / prev tab. |
 | fit guard | `src/panefit.ts` | The pure, tested "hidden ⇒ no resize" decision. |
+| routing/preview | `src/tabroute.ts` | Pure: cross-tab attention → tab badge, focus-switches-tab, preview throttle. |
+| persistence | `src/tabstore.ts` | Pure encode/decode of the saved tab set; stored in `localStorage` (`loomux.tabs`). |
 
 ## The load-bearing invariant (CLAUDE.md constraint 1)
 
@@ -68,16 +71,58 @@ any zero-width pane. This is the exact maximize precedent, now covering tabs.
 8. Click the small color dot on a tab → pick one of the shared group colors, a
    custom color, or **default**. The active tab shows the accent on its top edge.
 
-## Honest stubs / seams for phases 3–5 (worker B)
+**Orchestration ↔ tabs (phase 3)**
 
-- **Orchestration routing (phase 3).** `orch-spawn-request` / `orch-focus` /
-  `orch-attention` / `orch-group-ended` currently resolve to the **active** tab
-  (`OrchTargetResolver` in `src/orchestration.ts`) — so agents open in whatever
-  tab is focused. Phase 3 makes this route by `group_id` / `pty_id`: spawn into
-  the group's own tab (auto-created on first sight), and badge a background
-  tab whose agent needs attention. `TabManager.bindGroup` / `bindPty` /
-  `workspaceForGroup` / `workspaceForPty` are the seams (already unit-tested).
-- **Status + preview (phase 4).** No per-tab agent count / cost / attention
-  badge or terminal thumbnail yet.
-- **Persistence + per-tab pause (phase 5).** Tab set is in-memory only; nothing
-  is restored across restarts.
+9. Turn on agent mode (**Ctrl+Shift+A**) and launch an **orchestrator** from the
+   launcher. It opens in a **new project tab named for the repo** (not the tab
+   you were on). Its workers spawn **into that same tab** as the backend requests
+   them — switch away and they still land in the project's tab.
+10. Trigger a worker that blocks on the human (e.g. an agent asking a question)
+    and switch to another tab. The blocked agent's tab shows a **pulsing dot**
+    on its strip entry (red for `blocked`, amber otherwise) — reusing the same
+    attention mapping as the pane header / dock chip. Cross-tab, so a hidden
+    project surfaces its ask.
+11. When the orchestrator focuses an agent (or you restore a session), loomux
+    **switches to that agent's tab first, then focuses the pane**.
+12. End the orchestration — its (now-dead) panes close in the owning tab.
+
+**Status, preview & pause (phases 4–5)**
+
+13. A project tab shows a live **status chip**: `✦<agents> · $<cost>` from the
+    group summary/usage, refreshed on a timer.
+14. Hover a **background** tab → a small **thumbnail** of its viewport (a text
+    snapshot of the terminal, refreshed on switch-away and on a throttle). It is
+    a snapshot string, never a live/laid-out pane (that would re-arm the resize
+    storm the whole design avoids).
+15. **Right-click** a project tab → **Pause project** / **Resume project**
+    (`pauseGroup`/`resumeGroup`) to hold or resume prompt delivery and contain
+    unattended spend; a paused tab shows a **⏸**. The menu also has rename/close.
+16. **Restart loomux** — your tabs come back with their **names, colors, and
+    group bindings**. See the limits below.
+
+## Honest limits (prototype)
+
+- **Session/pane rehydration on restart (phase 5).** Persistence restores the
+  tab *shells* — name, color, and which orchestration group each tab owns — to
+  `localStorage`. It does **not** revive the live agent panes/PTYs: a restored
+  project tab comes back with a plain shell, and its bound group only truly
+  reconnects when you restore that group's session from the session browser
+  (which now routes into the correct tab). Full layout persistence is out of
+  scope for the prototype.
+- **Preview is text, not pixels.** The thumbnail strips ANSI and shows the last
+  lines of the serialized viewport — enough to recognize a tab at a glance, not
+  a pixel-accurate mini-terminal.
+- **Background tabs created while hidden keep a WebGL context** until first
+  shown-then-hidden; hidden *active-then-switched* tabs drop it immediately.
+  A minor resource nicety, not a correctness issue.
+- **Status polling** hits the backend every few seconds per group-bound tab;
+  fine for a handful of projects.
+
+## Tests
+
+- `test/tabs.test.ts` — TabManager: add/remove/switch, active invariant,
+  never-zero-tabs, switch-is-hide-not-dispose, group/pty routing seams.
+- `test/panefit.test.ts` — the no-resize invariant (hidden ⇒ no resize).
+- `test/tabroute.test.ts` — cross-tab attention badge, focus-switches-tab,
+  preview throttle.
+- `test/tabstore.test.ts` — persistence encode/decode round-trip + validation.

@@ -10,6 +10,9 @@
 // generic over the minimal `ManagedWorkspace` surface, so tests drive it with a
 // lightweight fake and production plugs in the real Grid-backed Workspace.
 
+import type { TabAttn } from "./tabroute";
+import type { PersistedTabs } from "./tabstore";
+
 /** The minimal surface TabManager needs from a workspace. `Workspace`
  *  (workspace.ts) implements this and adds the concrete Grid/DOM. */
 export interface ManagedWorkspace {
@@ -26,6 +29,9 @@ export interface ManagedWorkspace {
   setVisible(visible: boolean): void;
   /** Focus the workspace's active pane — called when a tab becomes active. */
   focus(): void;
+  /** Latest viewport snapshot for a hover thumbnail (#63 phase 4). A plain
+   *  string ("" when none); may contain ANSI escapes the tab bar strips. */
+  readonly preview: string;
   /** Tear the workspace down and kill its panes' PTYs (tab closed). */
   dispose(): void;
 }
@@ -48,6 +54,9 @@ export class TabManager<T extends ManagedWorkspace> {
   // and reads them is TODO(#63 phase 3).
   private groupToWs = new Map<string, string>();
   private ptyToWs = new Map<number, string>();
+  /** Per-tab attention badge state (phase 3), refreshed from the attention scan
+   *  by the router; read by the tab bar. Absent = no attention. */
+  private attn = new Map<string, TabAttn>();
 
   /** Builds a workspace for a freshly minted id (real Workspace in production;
    *  a fake in tests). Not a constructor parameter property — Node's strip-only
@@ -183,6 +192,50 @@ export class TabManager<T extends ManagedWorkspace> {
     const id = this.ptyToWs.get(ptyId);
     return id ? this.get(id) : undefined;
   }
+  /** The group a tab owns (inverse of bindGroup), or null for a plain tab. */
+  groupForWorkspace(workspaceId: string): string | null {
+    for (const [g, wid] of this.groupToWs) if (wid === workspaceId) return g;
+    return null;
+  }
+  /** Read-only view of the pty→tab routing, for the attention/focus routers. */
+  get ptyRoutes(): ReadonlyMap<number, string> {
+    return this.ptyToWs;
+  }
+
+  // ---------- per-tab attention (phase 3) ----------
+
+  /** Replace the whole per-tab attention set from an attention scan and emit.
+   *  The caller (main.ts) dedups with tabroute.sameAttention so the 3-second
+   *  re-emits don't reach here unchanged. */
+  setTabAttention(next: Map<string, TabAttn>): void {
+    this.attn = next;
+    this.emit();
+  }
+  /** The current per-tab attention set, for the caller's change-detection. */
+  get tabAttention(): ReadonlyMap<string, TabAttn> {
+    return this.attn;
+  }
+  attentionFor(workspaceId: string): TabAttn | undefined {
+    return this.attn.get(workspaceId);
+  }
+
+  // ---------- persistence (phase 5) ----------
+
+  /** Snapshot the tab set for persistence: each tab's name/color/owning group,
+   *  plus which tab was active. Pane/PTY contents are NOT captured (see
+   *  tabstore.ts). */
+  snapshot(): PersistedTabs {
+    const tabs = this.workspaces.map((w) => ({
+      name: w.name,
+      color: w.color,
+      groupId: this.groupForWorkspace(w.id),
+    }));
+    const activeIndex = Math.max(
+      0,
+      this.workspaces.findIndex((w) => w.id === this.activeId)
+    );
+    return { tabs, activeIndex };
+  }
 
   // ---------- subscription ----------
 
@@ -211,6 +264,7 @@ export class TabManager<T extends ManagedWorkspace> {
   private forgetRoutes(workspaceId: string): void {
     for (const [g, wid] of this.groupToWs) if (wid === workspaceId) this.groupToWs.delete(g);
     for (const [p, wid] of this.ptyToWs) if (wid === workspaceId) this.ptyToWs.delete(p);
+    this.attn.delete(workspaceId);
   }
 
   private emit(): void {

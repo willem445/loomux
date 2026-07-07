@@ -4,6 +4,7 @@
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
+import { SerializeAddon } from "@xterm/addon-serialize";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { Unicode11Addon } from "@xterm/addon-unicode11";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -629,13 +630,58 @@ export class Pane implements VoiceTargetPane {
     }
   }
 
+  /** The live WebGL renderer addon, if loaded. Held so hidden tabs can drop it
+   *  (browsers cap live GL contexts, and N mounted-but-hidden tabs would each
+   *  hold one) and reload it on show — the onContextLoss→DOM fallback path. */
+  private webgl: WebglAddon | null = null;
+  private serializer: SerializeAddon | null = null;
+
   private tryWebgl(): void {
+    if (this.webgl) return;
     try {
       const webgl = new WebglAddon();
-      webgl.onContextLoss(() => webgl.dispose()); // falls back to DOM renderer
+      webgl.onContextLoss(() => {
+        webgl.dispose(); // falls back to DOM renderer
+        if (this.webgl === webgl) this.webgl = null;
+      });
       this.term.loadAddon(webgl);
+      this.webgl = webgl;
     } catch {
       // WebGL unavailable — xterm's DOM renderer still works fine.
+    }
+  }
+
+  /** Show/hide bookkeeping for a project-tab switch (#63 phase 4). Hiding drops
+   *  the WebGL context (freeing it for the active tab and cutting idle VRAM);
+   *  showing reloads it. Purely a rendering concern — the PTY and buffer are
+   *  untouched, so no resize and no scrollback loss. Safe to call before the
+   *  terminal is even open (tryWebgl no-ops then). */
+  setHidden(hidden: boolean): void {
+    if (this.disposed) return;
+    if (hidden) {
+      this.webgl?.dispose();
+      this.webgl = null;
+    } else if (this.termEl.isConnected) {
+      this.tryWebgl();
+    }
+  }
+
+  /** A text snapshot of the terminal viewport, for a background tab's preview
+   *  thumbnail (#63 phase 4). Serializes the in-memory buffer (NOT the DOM), so
+   *  it works while the pane is hidden/zero-width — the whole point: a preview
+   *  must never require a laid-out element, which would re-arm applyFit and fire
+   *  a PTY resize. Returns "" if serialization isn't available. */
+  serializeViewport(): string {
+    if (this.disposed) return "";
+    try {
+      if (!this.serializer) {
+        this.serializer = new SerializeAddon();
+        this.term.loadAddon(this.serializer);
+      }
+      // scrollback: 0 → just the visible screen, which is all a thumbnail shows.
+      return this.serializer.serialize({ scrollback: 0 });
+    } catch {
+      return "";
     }
   }
 

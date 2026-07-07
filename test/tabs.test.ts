@@ -16,6 +16,7 @@ class FakeWorkspace implements ManagedWorkspace {
   focuses = 0;
   disposed = false;
   visLog: boolean[] = [];
+  preview = "";
   readonly id: string;
   constructor(id: string) {
     this.id = id;
