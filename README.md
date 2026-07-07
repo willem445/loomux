@@ -97,6 +97,7 @@ npm test           # unit tests (Node's built-in runner; no extra deps)
 | Session browser | `Ctrl+Shift+P` (or the *sessions* button) |
 | Open in editor | `Alt+E` (or the `</>` button in a pane header) |
 | Steer orchestrator | `Alt+P` (focus the compose strip under an orchestrator pane); `Esc` returns to the terminal; `Ctrl+V` in the strip attaches a pasted screenshot |
+| Voice prompt | `Alt+V` (push-to-talk; `Esc` cancels) — see [Voice prompts](#voice-prompts) |
 | Copy / paste | `Ctrl+Shift+C` / `Ctrl+Shift+V` (`Ctrl+V` also works) |
 
 A CLI running in a pane (e.g. an agent that says "copied to clipboard") copies
@@ -160,6 +161,42 @@ command; it's remembered after that.
 
 If nothing is configured, or the editor can't be found/launched, loomux shows a
 short toast explaining what went wrong.
+
+### Voice prompts
+
+Dictate a prompt instead of typing it. Press **`Alt+V`** to start recording
+(push-to-talk), speak, and press **`Alt+V`** again to stop — loomux transcribes
+your speech locally and drops the text at your current focus. **`Esc`** cancels
+a recording. Transcription is never auto-submitted: you review it and press
+Enter yourself.
+
+- **Where the text lands** follows focus, decided when you start:
+  - a **compose/steer box** focused → inserted at the caret;
+  - any **terminal pane** focused (an agent, the orchestrator pane, a plain
+    shell) → pasted into that pane's input as if typed (bracketed paste, no
+    trailing newline).
+- The orchestrator steer strip also has a **🎤 button** that records into the
+  strip; the hotkey works from any pane, with or without the button.
+- Only **one recording** runs at a time. While recording into a terminal, a red
+  "Recording" badge floats over that pane.
+
+**Local & open source.** Speech-to-text is [whisper.cpp](https://github.com/ggml-org/whisper.cpp)
+(MIT) running entirely on your machine — no audio leaves the box, no cloud STT.
+The whisper runtime and a default `base.en` model **ship with the Windows
+installer**, so it works out of the box.
+
+- **Use a different model:** point `LOOMUX_WHISPER_MODEL` at any ggml `.bin`
+  (e.g. a larger multilingual model), or drop models into
+  `%LOCALAPPDATA%\loomux\whisper\models\`.
+- **Use a different whisper build:** point `LOOMUX_WHISPER_CLI` at a
+  `whisper-cli.exe`. Resolution order is **bundled → env vars → `%LOCALAPPDATA%`**.
+- **Windows only** for now; on other platforms the hotkey reports that voice
+  capture isn't available. See [`doc/design/voice.md`](doc/design/voice.md) for
+  the architecture and the cross-platform path.
+
+If the mic can't be opened (no device, or Windows microphone privacy blocks it),
+or the whisper runtime is missing/misconfigured, loomux surfaces a specific
+message rather than failing silently.
 
 ### Git view
 
@@ -430,6 +467,7 @@ src-tauri/src/
   sessions.rs       agent session discovery (one scan_* fn per agent source)
   orchestration/    agent groups: registry, guardrails, MCP server, audit
   obs.rs            crash observability: panic hook, breadcrumb log, unclean-exit notice
+  voice.rs          voice prompts (#58): mic capture (cpal) → local whisper.cpp subprocess
   lib.rs            Tauri wiring
 src/
   pty.ts            typed bridge to the backend (invoke + event bus)
@@ -440,6 +478,8 @@ src/
   launcher.ts       new-agent-pane dialog (single / multi / orchestrator)
   orchestration.ts  frontend half of agent groups (panes, badges, focus)
   shortcuts.ts      app-level keybindings (single source of truth)
+  voice.ts          pure voice logic: target decision + push-to-talk state machine
+  voicecontrol.ts   global single-capture controller; routes transcripts to focus
   main.ts           composition root
 ```
 
