@@ -11,8 +11,9 @@ import {
   filterAndSortIssues,
   labelDelta,
   validateNewIssue,
+  validateComment,
 } from "../src/issuesmodel.ts";
-import type { GhIssue } from "../src/issues.ts";
+import type { GhIssue, GhPr } from "../src/issues.ts";
 
 function issue(over: Partial<GhIssue> = {}): GhIssue {
   return {
@@ -143,4 +144,55 @@ test("validateNewIssue allows an empty body", () => {
     title: "Just a title",
     body: "",
   });
+});
+
+test("validateComment rejects an empty or whitespace-only body", () => {
+  assert.deepEqual(validateComment(""), { ok: false, error: "Write a comment first." });
+  assert.deepEqual(validateComment("   \n\t"), {
+    ok: false,
+    error: "Write a comment first.",
+  });
+});
+
+test("validateComment keeps a non-empty body verbatim (no trim)", () => {
+  // GitHub markdown is whitespace-sensitive (indented code, fences), so the body
+  // must reach gh untrimmed — we only gate on emptiness.
+  assert.deepEqual(validateComment("  hi  "), { ok: true, body: "  hi  " });
+  assert.deepEqual(validateComment("```\n  indented\n```"), {
+    ok: true,
+    body: "```\n  indented\n```",
+  });
+});
+
+test("filterAndSortIssues works on PRs too (shared ListItem shape)", () => {
+  // The generic filter/sort must serve GhPr unchanged — number/title/labels/
+  // updated_at is the whole contract.
+  const prs: GhPr[] = [
+    {
+      number: 128,
+      title: "backend commands",
+      state: "OPEN",
+      labels: ["agent-managed"],
+      updated_at: "2026-07-01T00:00:00Z",
+      url: "https://github.com/o/r/pull/128",
+      head_ref: "feat/backend",
+    },
+    {
+      number: 130,
+      title: "umbrella",
+      state: "OPEN",
+      labels: [],
+      updated_at: "2026-07-06T00:00:00Z",
+      url: "https://github.com/o/r/pull/130",
+      head_ref: "orch/82",
+    },
+  ];
+  // Newest-updated first, and the result is still typed GhPr (head_ref present).
+  const sorted = filterAndSortIssues(prs, "");
+  assert.deepEqual(sorted.map((p) => p.number), [130, 128]);
+  assert.equal(sorted[0].head_ref, "orch/82");
+  // Filtering by a PR label narrows the set.
+  assert.deepEqual(filterAndSortIssues(prs, "agent-managed").map((p) => p.number), [128]);
+  // Filtering by number works with a leading '#'.
+  assert.deepEqual(filterAndSortIssues(prs, "#130").map((p) => p.number), [130]);
 });

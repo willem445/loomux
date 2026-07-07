@@ -5,6 +5,19 @@
 
 import type { GhIssue } from "./issues";
 
+/** Which list the overlay is showing. The PR mode reuses the issue list/filter
+ *  mechanics wholesale (see `ListItem`); only the fetch + row actions differ. */
+export type ViewMode = "issues" | "prs";
+
+/** The fields the filter/sort need — the common shape of `GhIssue` and `GhPr`,
+ *  so both flow through `matchesQuery` / `filterAndSortIssues` unchanged. */
+export interface ListItem {
+  number: number;
+  title: string;
+  labels: string[];
+  updated_at: string;
+}
+
 /** The go-signal labels the GUI can toggle. Mirrors the backend allow-list
  *  (validated there — this list only drives the buttons). `agent-ready` and
  *  `agent-investigate` are the two the plan exposes as one-click actions;
@@ -31,9 +44,10 @@ export function isLabeledForAgents(issue: GhIssue): boolean {
   return issue.labels.some((l) => AGENT_GO_LABELS.has(l));
 }
 
-/** Case-insensitive match of `query` against an issue's number (with or without
- *  a leading `#`), title, and label names. Empty/whitespace query matches all. */
-export function matchesQuery(issue: GhIssue, query: string): boolean {
+/** Case-insensitive match of `query` against an item's number (with or without
+ *  a leading `#`), title, and label names. Empty/whitespace query matches all.
+ *  Generic over `ListItem` so issues and PRs share it. */
+export function matchesQuery(issue: ListItem, query: string): boolean {
   const q = query.trim().toLowerCase();
   if (q === "") return true;
   const bare = q.startsWith("#") ? q.slice(1) : q;
@@ -42,10 +56,11 @@ export function matchesQuery(issue: GhIssue, query: string): boolean {
   return issue.labels.some((l) => l.toLowerCase().includes(q));
 }
 
-/** Filter to issues matching `query`, then sort newest-updated first. Stable
- *  for equal timestamps (falls back to descending issue number) so the order
- *  never jitters between refreshes. Does not mutate the input. */
-export function filterAndSortIssues(issues: GhIssue[], query: string): GhIssue[] {
+/** Filter to items matching `query`, then sort newest-updated first. Stable
+ *  for equal timestamps (falls back to descending number) so the order never
+ *  jitters between refreshes. Does not mutate the input. Generic over
+ *  `ListItem`, so the same call serves the issues and PR lists. */
+export function filterAndSortIssues<T extends ListItem>(issues: T[], query: string): T[] {
   return issues
     .filter((i) => matchesQuery(i, query))
     .slice()
@@ -91,4 +106,18 @@ export function validateNewIssue(draft: NewIssueDraft): NewIssueValidation {
   const title = draft.title.trim();
   if (title === "") return { ok: false, error: "A title is required." };
   return { ok: true, title, body: draft.body.trim() };
+}
+
+export type CommentValidation =
+  | { ok: true; body: string }
+  | { ok: false; error: string };
+
+/** Validate a comment before posting: a non-empty (post-trim) body is required.
+ *  Mirrors the backend guard in `gh_issue_comment` / `gh_pr_comment` (which
+ *  reject an empty `--body`), so the view fails fast without a round-trip. The
+ *  returned `body` is NOT trimmed — GitHub markdown can be leading/trailing
+ *  whitespace-sensitive (code fences, indentation); we only gate on emptiness. */
+export function validateComment(body: string): CommentValidation {
+  if (body.trim() === "") return { ok: false, error: "Write a comment first." };
+  return { ok: true, body };
 }
