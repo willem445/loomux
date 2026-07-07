@@ -51,6 +51,46 @@ pub fn max_agents_notice(from: u32, to: u32) -> String {
     format!("[loomux] max live agents changed {from}→{to} — re-plan accordingly")
 }
 
+/// The idle-tick notice delivered to an autonomous group's orchestrator (#83):
+/// names the `[loomux] idle tick` wake source the template documents and tells it
+/// to run its monitoring/intake cadence. Kept in one place so the template's wake
+/// clause and the delivered text can't drift.
+pub fn idle_tick_notice() -> String {
+    "[loomux] idle tick: you have been idle and autonomous mode is on. Run your \
+     monitoring cadence now — re-sync (list_tasks, list_agents, get_state), poll \
+     for labeled intake (agent-ready / agent-investigate) and START that work, and \
+     re-check your open PRs (CI + new comments). You will get this at most once per \
+     idle window; producing any output resets the clock."
+        .to_string()
+}
+
+/// One-line notice delivered to the orchestrator when the auto-merge gate is
+/// toggled mid-session (#83), so it learns the new merge policy without waiting to
+/// re-read its kickoff config.
+pub fn auto_merge_notice(on: bool) -> String {
+    if on {
+        "[loomux] auto-merge ENABLED for this group: you MAY now merge a PR yourself \
+         once it has reviewer approval, green CI, and meets the issue's acceptance \
+         criteria — audit and announce every merge, and still hold anything risky or \
+         ambiguous for the human.".to_string()
+    } else {
+        "[loomux] auto-merge DISABLED for this group: the human merge gate is absolute \
+         again — open the PR, report it, and never merge yourself.".to_string()
+    }
+}
+
+/// The notice delivered once when an autonomous group's token budget is exhausted
+/// and idle-ticking is suspended (#83). Tokens, not dollars (see `usage.rs`).
+pub fn autonomy_budget_notice(spent: u64, budget: u64) -> String {
+    format!(
+        "[loomux] autonomy budget exhausted ({spent} of {budget} tokens spent since \
+         autonomous mode was enabled) — autonomous mode has been SUSPENDED. Stop any \
+         autonomous pulls and tell the human: raise the budget or toggle autonomous \
+         mode back on to resume (re-enabling is explicit consent and re-anchors the \
+         meter)."
+    )
+}
+
 /// Quiet window a group's cap must fall silent for before its coalesced
 /// cap-change notice is delivered. Rapid stepper clicks (#79) each persist,
 /// enforce, and audit immediately, but the token-costing orchestrator notice
@@ -133,6 +173,23 @@ const IDLE_REAP_INTERVAL: Duration = Duration::from_secs(30);
 const WATCHDOG_INTERVAL: Duration = Duration::from_secs(30);
 /// Upper bound on the watchdog stall timeout (24h); 0 disables it.
 const MAX_WATCHDOG_STALL_MINUTES: u32 = 1440;
+/// Autonomous mode (#83): how often the idle-tick loop wakes to check whether an
+/// autonomous group's orchestrator has gone output-quiet long enough to warrant a
+/// tick, and to enforce autonomy budgets. Coarser than the watchdog because the
+/// gate is measured in minutes, not seconds — a 60s wake is cheap and precise
+/// enough. See `start_idle_tick` / `run_idle_tick`.
+const IDLE_TICK_INTERVAL: Duration = Duration::from_secs(60);
+/// Autonomous mode (#83): the orchestrator pane must be output-quiet (and free of
+/// recent human input) at least this long before an idle tick fires. The gate is
+/// self-regulating — any action the tick induces produces output that resets the
+/// clock — so worst case is one tick per this window. A fixed constant in v1 (the
+/// autonomous toggle is the on/off knob); tunable per group later if wanted.
+const IDLE_TICK_MINUTES: u32 = 15;
+/// Autonomous mode (#83): hard backstop on idle ticks delivered per rolling hour,
+/// independent of the one-notice latch — the analogue of `max_spawns_per_hour` for
+/// the tick source. With a 15-min quiet gate the latch already bounds this near
+/// ~4/hour; the cap catches any pathological re-arm. 0 would disable it.
+const MAX_IDLE_TICKS_PER_HOUR: u32 = 6;
 /// How often the attention scan recomputes which panes need the human
 /// (idle-with-prompt detection; report/gate signals are event-driven and
 /// picked up on the next tick).
@@ -428,6 +485,14 @@ pub struct Guardrails {
     /// (likely stalled or waiting on input). 0 disables it. See
     /// `watchdog_should_notify`.
     pub watchdog_stall_minutes: u32,
+    /// Autonomous mode cost cap (#83): the token budget an autonomous group may
+    /// spend *after* autonomous mode is enabled before idle ticking is suspended
+    /// and the human is notified. Metered as the delta from the usage snapshot
+    /// captured at enable time (the `autonomous` marker's content) — see
+    /// `enforce_autonomy_budgets`. Tokens, not dollars: subscription/Max accounts
+    /// pay $0 marginal, so tokens are the honest metric (see `usage.rs`). 0 =
+    /// no cap. Persisted in group.json, live-settable via `set_autonomy_budget`.
+    pub autonomy_budget_tokens: u64,
 }
 
 impl Guardrails {
@@ -625,6 +690,49 @@ pub fn watchdog_should_notify(
         return false;
     }
     now_ms.saturating_sub(silent_since_ms) >= (threshold_min as u64) * 60_000
+}
+
+/// Autonomous mode (#83): whether an idle tick should fire for an orchestrator
+/// that has been output-quiet since `quiet_since_ms`. Pure so the threshold /
+/// latch / per-hour-cap / clock-skew rules are testable without threads or a real
+/// pty; the scan loop lives in `idle_tick_tick` / `start_idle_tick`.
+///
+/// - `threshold_min` 0 disables the tick entirely.
+/// - `already_notified` is the one-notice-per-idle-window latch (mirrors
+///   `watchdog_should_notify`): once a tick fires, no re-fire until the
+///   orchestrator produces output (it acted), which clears the latch and resets
+///   the quiet clock. This is the primary self-regulation.
+/// - `tick_times` + `per_hour_cap` are the hard runaway backstop, reusing the
+///   same sliding-window rule as the spawn-rate guardrail (`spawn_rate_exceeded`);
+///   `per_hour_cap` 0 = uncapped.
+/// - `saturating_sub` tolerates a `now` before `quiet_since_ms` (clock skew /
+///   a freshly-stamped clock) as "no elapsed silence", never a giant interval.
+pub fn idle_tick_should_fire(
+    quiet_since_ms: u64,
+    now_ms: u64,
+    threshold_min: u32,
+    already_notified: bool,
+    tick_times: &[u64],
+    per_hour_cap: u32,
+) -> bool {
+    if threshold_min == 0 || already_notified {
+        return false;
+    }
+    if now_ms.saturating_sub(quiet_since_ms) < (threshold_min as u64) * 60_000 {
+        return false;
+    }
+    // Under the per-hour backstop → fire. Reuses the spawn-rate window rule so the
+    // "N events per rolling hour" arithmetic lives in exactly one place.
+    !spawn_rate_exceeded(tick_times, now_ms, per_hour_cap, SPAWN_RATE_WINDOW_MS)
+}
+
+/// Autonomous mode (#83): whether autonomous-era spend has crossed the group's
+/// token budget and idle ticking must be suspended. Pure so the metering rule is
+/// unit-testable. `spend_since_enable` is the delta from the enable-time usage
+/// anchor (autonomous mode meters spend *after* it was turned on, not lifetime
+/// history — see `enforce_autonomy_budgets`); `budget_tokens` 0 = no cap.
+pub fn autonomy_budget_exhausted(spend_since_enable: u64, budget_tokens: u64) -> bool {
+    budget_tokens != 0 && spend_since_enable >= budget_tokens
 }
 
 /// Attention routing (#6): does a pane's ANSI-stripped output tail look like a
@@ -909,6 +1017,13 @@ pub struct AgentEntry {
     /// Watchdog anti-nag latch: set once a stall notice has been delivered for
     /// the current stall, cleared when the agent produces output/reports again.
     pub watchdog_notified: bool,
+    /// Autonomous idle-tick latch (#83), meaningful only for the orchestrator:
+    /// set when an idle-tick notice is delivered, cleared when the pane produces
+    /// output again (the orchestrator acted on the tick). Mirrors
+    /// `watchdog_notified` — one notice per idle window. `last_output_total` /
+    /// `last_progress_ms` above double as the idle-tick output counter / quiet
+    /// clock for the orchestrator, which the watchdog never touches.
+    pub idle_tick_notified: bool,
 }
 
 /// One pane that needs the human, pushed to the frontend as an `orch-attention`
@@ -1148,6 +1263,22 @@ pub struct OrchRegistry {
     attn_emitted: Mutex<HashMap<String, String>>,
     /// Groups with desktop notifications enabled (durable `notify` marker file).
     notify_groups: Mutex<HashSet<String>>,
+    /// Autonomous mode (#83): groups whose orchestrator is idle-ticked to run its
+    /// monitoring/intake cadence unattended. Durable via an `autonomous` marker
+    /// file whose *content* is the enable-time usage-token anchor (see
+    /// `set_autonomous` / `autonomy_anchor`), so budget metering survives restarts.
+    autonomous_groups: Mutex<HashSet<String>>,
+    /// Autonomous mode (#83): groups where the orchestrator may merge an
+    /// adequately-tested PR itself instead of holding at the human merge gate.
+    /// Default OFF (absent) = today's behavior (human merges). Durable
+    /// `auto_merge` marker file, mirroring `notify`/`paused`. The behavior lives
+    /// in the orchestrator template; the backend stores/exposes the flag and
+    /// mirrors it into the orchestrator's kickoff config.
+    auto_merge_groups: Mutex<HashSet<String>>,
+    /// Autonomous mode (#83): per-group idle-tick delivery timestamps (Unix-ms)
+    /// for the `MAX_IDLE_TICKS_PER_HOUR` backstop; pruned to the trailing hour on
+    /// each check. The runaway analogue of `spawn_times`.
+    idle_tick_times: Mutex<HashMap<String, Vec<u64>>>,
     /// Debounced cap-change notices (#79): group → its pending, not-yet-
     /// delivered `PendingMaxNotice`. `set_max_agents` folds rapid stepper
     /// clicks in here (persist/enforce/audit stay per-click); the
@@ -1166,6 +1297,21 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Remove a durable consent marker (autonomous / auto_merge), treating "already
+/// gone" as success but a real IO failure as an error the caller MUST propagate
+/// (#83). A marker that survives a failed *disable* would silently re-enable the
+/// feature on the next restart's re-seed — the one failure direction this
+/// consent-boundary feature must never have — so the toggle fails loudly and
+/// leaves the in-memory flag matching the surviving marker rather than reporting a
+/// disable that didn't durably happen.
+fn remove_marker(path: &Path) -> Result<(), String> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("failed to remove marker {}: {e}", path.display())),
+    }
 }
 
 /// Map a caller-supplied image extension to a vetted one, rejecting anything
@@ -1881,6 +2027,9 @@ impl OrchRegistry {
             attn_waiting_ack: Mutex::new(HashSet::new()),
             attn_emitted: Mutex::new(HashMap::new()),
             notify_groups: Mutex::new(HashSet::new()),
+            autonomous_groups: Mutex::new(HashSet::new()),
+            auto_merge_groups: Mutex::new(HashSet::new()),
+            idle_tick_times: Mutex::new(HashMap::new()),
             pending_max_notice: Mutex::new(HashMap::new()),
             claude_projects_dir: Mutex::new(None),
         }
@@ -2632,6 +2781,9 @@ impl OrchRegistry {
                 idle_kill_minutes: g["idle_kill_minutes"].as_u64().unwrap_or(0) as u32,
                 max_spawns_per_hour: g["max_spawns_per_hour"].as_u64().unwrap_or(0) as u32,
                 watchdog_stall_minutes: g["watchdog_stall_minutes"].as_u64().unwrap_or(0) as u32,
+                // Autonomous token budget (#83) is a durable human choice, like
+                // max_agents: absent in older group.json → 0 (no cap).
+                autonomy_budget_tokens: g["autonomy_budget_tokens"].as_u64().unwrap_or(0),
             },
         ))
     }
@@ -2666,6 +2818,10 @@ impl OrchRegistry {
         if resumed {
             if let Some((_, persisted)) = self.load_group_file(&id) {
                 guardrails.max_agents = persisted.max_agents.clamp(1, MAX_AGENTS_CEILING);
+                // The autonomy budget (#83) is likewise live-adjustable and
+                // persisted, so a relaunch must keep the human's set value rather
+                // than reverting to the launcher's param.
+                guardrails.autonomy_budget_tokens = persisted.autonomy_budget_tokens;
             }
         }
         let info = GroupInfo { id: id.clone(), repo: repo.to_string(), guardrails };
@@ -2690,6 +2846,7 @@ impl OrchRegistry {
                     "idle_kill_minutes": info.guardrails.idle_kill_minutes,
                     "max_spawns_per_hour": info.guardrails.max_spawns_per_hour,
                     "watchdog_stall_minutes": info.guardrails.watchdog_stall_minutes,
+                    "autonomy_budget_tokens": info.guardrails.autonomy_budget_tokens,
                 },
             }))
             .unwrap(),
@@ -2704,6 +2861,30 @@ impl OrchRegistry {
         // Desktop-notification opt-in is likewise a durable per-group choice.
         if dir.join("notify").is_file() {
             self.notify_groups.lock_safe().insert(id.clone());
+        }
+        // Autonomous mode (#83) and the auto-merge gate are durable per-group
+        // choices too; re-seed them so a resumed group keeps ticking (and its
+        // budget anchor, stored in the marker's content) across restarts. Audit
+        // each resume so a persisted consent marker silently resuming autonomy/
+        // auto-merge is at least *visible* in the trail (belt-and-suspenders for
+        // the L2 consent-boundary concern — a marker that shouldn't be here shows
+        // up rather than resuming invisibly).
+        // A budget suspension takes precedence over the enable marker: if a failed
+        // suspension left the `autonomous` marker on disk, the co-written
+        // `autonomy_suspended` marker (rev-49) must still force the group back OFF at
+        // restart — never silently resume ticking past a spent budget. The group
+        // then reads as suspended (audited below + `orch_autonomy.suspended`).
+        if dir.join("autonomy_suspended").is_file() {
+            self.audit(&id, "loomux", "autonomous-suspended-resumed",
+                json!({ "from": "marker" }));
+        } else if dir.join("autonomous").is_file() {
+            self.autonomous_groups.lock_safe().insert(id.clone());
+            self.audit(&id, "loomux", "autonomous-resumed",
+                json!({ "from": "marker", "budget_anchor_tokens": self.autonomy_anchor(&id) }));
+        }
+        if dir.join("auto_merge").is_file() {
+            self.auto_merge_groups.lock_safe().insert(id.clone());
+            self.audit(&id, "loomux", "auto-merge-resumed", json!({ "from": "marker" }));
         }
         self.groups.lock_safe().insert(id.clone(), info.clone());
         self.audit(&id, "loomux", if resumed { "group-resume" } else { "group-create" },
@@ -2950,6 +3131,196 @@ impl OrchRegistry {
         self.watchdog_tick(now, &outputs)
     }
 
+    // ---------- autonomous mode (#83): idle-tick + budget enforcement ----------
+
+    /// Read every live orchestrator pane's output counter and last human-keystroke
+    /// time — the raw inputs `idle_tick_tick` needs to judge output-silence.
+    /// Split from the decision (as `agent_output_totals` is for the watchdog) so
+    /// the tick logic is testable with synthetic maps and no pty. Empty without an
+    /// app handle (unit tests drive `idle_tick_tick` directly).
+    fn orchestrator_activity(&self) -> (HashMap<String, u64>, HashMap<String, u64>) {
+        let mut outs = HashMap::new();
+        let mut ins = HashMap::new();
+        let Some(app) = self.app.lock_safe().clone() else {
+            return (outs, ins);
+        };
+        let ptys = app.state::<crate::pty::PtyManager>();
+        for a in self.agents.lock_safe().values() {
+            if a.role != Role::Orchestrator {
+                continue;
+            }
+            let Some(pid) = a.pty_id else { continue };
+            if let Some(t) = ptys.output_total(pid) {
+                outs.insert(a.id.clone(), t);
+            }
+            if let Some(u) = ptys.last_user_input_ms(pid) {
+                ins.insert(a.id.clone(), u);
+            }
+        }
+        (outs, ins)
+    }
+
+    /// One idle-tick pass. For each **autonomous, non-paused** group's running
+    /// orchestrator, fold in the latest pty output counter and last human-input
+    /// time: output growth (the orchestrator acting) resets the quiet clock and
+    /// the one-notice latch; recent human input also defers the clock (never tick
+    /// while the human steers — the belt-and-suspenders gate on top of
+    /// output-silence). An orchestrator output-quiet past `IDLE_TICK_MINUTES`,
+    /// not already latched, and under the per-hour cap earns exactly one audited
+    /// `[loomux] idle tick` notice telling it to run its monitoring/intake
+    /// cadence. Paused groups are skipped wholesale (delivery is suppressed there;
+    /// don't burn the latch). Returns the notified orchestrator ids. Split from
+    /// the pty read (`orchestrator_activity`) so the gate / latch / cap / pause
+    /// logic is testable with synthetic counters — the `watchdog_tick` shape.
+    pub fn idle_tick_tick(
+        &self,
+        now: u64,
+        outputs: &HashMap<String, u64>,
+        inputs: &HashMap<String, u64>,
+    ) -> Vec<String> {
+        let autonomous = self.autonomous_groups.lock_safe().clone();
+        if autonomous.is_empty() {
+            return Vec::new();
+        }
+        let paused = self.paused.lock_safe().clone();
+        let tick_times = self.idle_tick_times.lock_safe().clone();
+
+        let mut to_notify: Vec<(String, String)> = Vec::new();
+        {
+            let mut agents = self.agents.lock_safe();
+            for a in agents.values_mut() {
+                if a.role != Role::Orchestrator
+                    || a.status != AgentStatus::Running
+                    || !autonomous.contains(&a.group)
+                {
+                    continue;
+                }
+                // Output growth = the orchestrator produced something (it acted):
+                // reset the quiet clock and clear the latch, and this tick can't
+                // also fire.
+                if let Some(&cur) = outputs.get(&a.id) {
+                    if cur > a.last_output_total {
+                        a.last_output_total = cur;
+                        a.last_progress_ms = now;
+                        a.idle_tick_notified = false;
+                        continue;
+                    }
+                }
+                // Belt-and-suspenders: recent human input in the pane is activity
+                // — fold it into the quiet clock so a tick never lands while the
+                // human is steering (mirrors attention routing's `waiting`
+                // heuristic). Not latch-clearing: human typing isn't the
+                // orchestrator acting on our notice, it just defers the window.
+                if let Some(&last_in) = inputs.get(&a.id) {
+                    if last_in > a.last_progress_ms {
+                        a.last_progress_ms = last_in;
+                    }
+                }
+                // A paused group's orchestrator is deliberately quiet; never tick
+                // and never burn its one-notice latch while paused.
+                if paused.contains(&a.group) {
+                    continue;
+                }
+                let times = tick_times.get(&a.group).map(Vec::as_slice).unwrap_or(&[]);
+                if idle_tick_should_fire(
+                    a.last_progress_ms,
+                    now,
+                    IDLE_TICK_MINUTES,
+                    a.idle_tick_notified,
+                    times,
+                    MAX_IDLE_TICKS_PER_HOUR,
+                ) {
+                    a.idle_tick_notified = true;
+                    to_notify.push((a.id.clone(), a.group.clone()));
+                }
+            }
+        }
+
+        let mut notified = Vec::new();
+        for (id, group) in to_notify {
+            // Record the delivery for the per-hour backstop, pruning to the window.
+            // This ring is in-memory only (like `spawn_times`): a restart resets
+            // the window, which is the safe direction — the cap is a runaway
+            // backstop, and the quiet-window + one-notice latch already bound ticks
+            // to ~one per window regardless, so a fresh window after a (rare)
+            // restart can't produce a runaway, only at most a few extra ticks.
+            {
+                let mut tt = self.idle_tick_times.lock_safe();
+                let v = tt.entry(group.clone()).or_default();
+                v.push(now);
+                v.retain(|&t| now.saturating_sub(t) < SPAWN_RATE_WINDOW_MS);
+            }
+            self.audit(&group, "loomux", "idle-tick", json!({ "orchestrator": id }));
+            let _ = self.deliver_to_orchestrator(&group, &idle_tick_notice(), "loomux");
+            notified.push(id);
+        }
+        notified
+    }
+
+    /// Enforce every autonomous group's token budget (#83). For each autonomous,
+    /// non-paused group with a budget set, meter spend as the delta from the
+    /// enable-time anchor; once it crosses the budget, **suspend** autonomous mode
+    /// (flip the marker off — explicit consent required to resume), audit it, and
+    /// deliver ONE `[loomux]` notice. Because suspension removes the group from
+    /// the autonomous set, a later pass skips it, so the notice can't repeat.
+    /// Returns the suspended group ids. Runs before the idle tick each cycle.
+    pub fn enforce_autonomy_budgets(&self, _now: u64) -> Vec<String> {
+        let autonomous = self.autonomous_groups.lock_safe().clone();
+        if autonomous.is_empty() {
+            return Vec::new();
+        }
+        let paused = self.paused.lock_safe().clone();
+        let mut suspended = Vec::new();
+        for group in autonomous {
+            // Paused groups already don't tick; leave their meter frozen.
+            if paused.contains(&group) {
+                continue;
+            }
+            let budget = self
+                .group(&group)
+                .map(|g| g.guardrails.autonomy_budget_tokens)
+                .unwrap_or(0);
+            if budget == 0 {
+                continue; // no cap
+            }
+            let anchor = self.autonomy_anchor(&group);
+            let spent = self.group_token_total(&group).saturating_sub(anchor);
+            if autonomy_budget_exhausted(spent, budget) {
+                self.audit(&group, "loomux", "autonomy-budget-exhausted",
+                    json!({ "spent_tokens": spent, "budget_tokens": budget }));
+                // Money-stop: drop the group from the autonomous set unconditionally
+                // so ticking halts even if the marker can't be removed (rev-49).
+                self.suspend_autonomous(&group);
+                // Distinguish a budget suspension from a plain user-off with a
+                // durable `autonomy_suspended` marker, so the UI can tell the human
+                // "suspended — raise the budget or re-enable" instead of
+                // reconstructing it from the audit log. Written *after* the disable
+                // (which turns autonomous off); cleared on a genuine re-enable. A
+                // hint, not a consent gate, so a failed write fails soft.
+                let _ = fs::write(
+                    self.group_dir(&group).join("autonomy_suspended"),
+                    json!({ "spent_tokens": spent, "budget_tokens": budget }).to_string(),
+                );
+                let _ = self.deliver_to_orchestrator(
+                    &group,
+                    &autonomy_budget_notice(spent, budget),
+                    "loomux",
+                );
+                suspended.push(group);
+            }
+        }
+        suspended
+    }
+
+    /// One full idle-tick cycle: enforce budgets (which may suspend groups), then
+    /// read pty counters and tick the still-autonomous orchestrators. Called on a
+    /// timer by `start_idle_tick`; `now` injected so tests drive it deterministically.
+    pub fn run_idle_tick(&self, now: u64) -> Vec<String> {
+        self.enforce_autonomy_budgets(now);
+        let (outputs, inputs) = self.orchestrator_activity();
+        self.idle_tick_tick(now, &outputs, &inputs)
+    }
+
     // ---------- attention routing: surface which pane needs the human ----------
 
     /// Latch (or clear) a worker's report as an attention signal. `done` and
@@ -3013,6 +3384,276 @@ impl OrchRegistry {
             self.audit(group, "human", "notify-off", json!({}));
         }
         Ok(())
+    }
+
+    // ---------- autonomous mode (#83): idle-tick + auto-merge + budget ----------
+
+    /// Whether autonomous idle-ticking is enabled for a group (drives the toggle
+    /// button state and gates the idle-tick loop).
+    pub fn is_autonomous(&self, group: &str) -> bool {
+        self.autonomous_groups.lock_safe().contains(group)
+    }
+
+    /// The usage-token count captured when autonomous mode was last enabled — the
+    /// anchor the budget meters spend *from*, stored as the `autonomous` marker's
+    /// content so it survives restarts. 0 when off or unstamped (legacy/empty
+    /// marker → meters against 0, i.e. all history, which is the safe/conservative
+    /// direction: it can only suspend *sooner*).
+    fn autonomy_anchor(&self, group: &str) -> u64 {
+        fs::read_to_string(self.group_dir(group).join("autonomous"))
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+    }
+
+    /// Whether autonomous mode is OFF *because the budget enforcer suspended it*
+    /// (as opposed to a plain user toggle-off or never-on). Backed by a durable
+    /// `autonomy_suspended` marker written by `enforce_autonomy_budgets` and
+    /// cleared on a genuine re-enable, so it survives restarts. Only meaningful
+    /// while off — `autonomy_state` gates it on `!is_autonomous`.
+    fn autonomy_suspended(&self, group: &str) -> bool {
+        self.group_dir(group).join("autonomy_suspended").is_file()
+    }
+
+    /// Enable/disable autonomous idle-ticking for a group, durably (an
+    /// `autonomous` marker file, mirroring the pause/notify markers). Enabling
+    /// stamps the marker with the group's current usage-token total as the budget
+    /// anchor, so the budget meters only spend incurred *after* this point — the
+    /// "autonomous-era spend" the human is consenting to (re-enabling after a
+    /// budget suspension re-anchors, which is what "toggle to resume" means).
+    /// Audited on every real state change (actor `human`). The budget-suspension
+    /// path uses `suspend_autonomous` instead (different failure policy).
+    pub fn set_autonomous(&self, group: &str, on: bool) -> Result<(), String> {
+        self.set_autonomous_as(group, on, "human")
+    }
+
+    /// Disable autonomous mode as a **budget suspension** (actor `loomux`). Unlike a
+    /// user disable (`set_autonomous_as`, disk-first + fail-loud to protect the
+    /// consent boundary), the money-stop here is inverted: continued spend past the
+    /// cap is the one direction this feature must never allow, so the in-memory flag
+    /// is dropped **unconditionally** — ticking halts even if the durable marker
+    /// can't be removed. A marker-removal failure is audited, not fatal; a surviving
+    /// `autonomous` marker is then overridden at restart by the co-written
+    /// `autonomy_suspended` marker (see the re-seed in `create_group`), so the group
+    /// comes back OFF + suspended-visible, never silently ticking past its budget.
+    fn suspend_autonomous(&self, group: &str) {
+        // Stop the spend first and unconditionally.
+        self.autonomous_groups.lock_safe().remove(group);
+        self.clear_idle_tick_latch(group);
+        // Best-effort durable disable; failure is surfaced in the audit trail.
+        match remove_marker(&self.group_dir(group).join("autonomous")) {
+            Ok(()) => self.audit(group, "loomux", "autonomous-off", json!({})),
+            Err(e) => self.audit(group, "loomux", "autonomous-off-failed", json!({ "error": e })),
+        }
+    }
+
+    /// `set_autonomous` with an explicit actor so a loomux-initiated suspension
+    /// (budget exhausted) audits honestly rather than as a human toggle.
+    fn set_autonomous_as(&self, group: &str, on: bool, actor: &str) -> Result<(), String> {
+        let dir = self.group_dir(group);
+        if on {
+            // Reserve the enable atomically (L1): a single `insert` decides who
+            // proceeds, so a concurrent/duplicate enable can't double-anchor or
+            // race the marker write. Only the first caller (newly inserted) writes
+            // the anchor + marker; anyone else sees it already on and no-ops.
+            let newly = self.autonomous_groups.lock_safe().insert(group.to_string());
+            if !newly {
+                return Ok(()); // already on — don't re-anchor
+            }
+            // Anchor = spend at enable time, so the budget delta starts at 0.
+            // Computed without holding the set lock (group_usage takes its own).
+            let anchor = self.group_token_total(group);
+            if let Err(e) = fs::create_dir_all(&dir)
+                .and_then(|_| fs::write(dir.join("autonomous"), anchor.to_string()))
+            {
+                // Roll back the reservation so memory never claims ON without a
+                // durable marker (a lost enable is the safe direction — it fails
+                // OFF and re-asks for consent — but we still surface the failure).
+                self.autonomous_groups.lock_safe().remove(group);
+                return Err(format!("failed to enable autonomous mode: {e}"));
+            }
+            // A genuine (re-)enable resolves any prior budget suspension: clear the
+            // suspended marker so the UI stops flagging it. Best-effort — it's a
+            // UI hint, and `autonomy_state` only reports suspended while OFF anyway.
+            let _ = remove_marker(&dir.join("autonomy_suspended"));
+            self.audit(group, actor, "autonomous-on",
+                json!({ "budget_anchor_tokens": anchor }));
+        } else {
+            if !self.autonomous_groups.lock_safe().contains(group) {
+                return Ok(()); // already off
+            }
+            // Remove the durable marker FIRST and fail the call if it doesn't go
+            // (L2): a surviving marker would silently re-enable autonomous mode on
+            // the next restart's re-seed without renewed consent. Only flip the
+            // in-memory flag once disk agrees, so a failed disable leaves state
+            // consistently ON (matching the marker the human still sees).
+            if let Err(e) = remove_marker(&dir.join("autonomous")) {
+                self.audit(group, actor, "autonomous-off-failed", json!({ "error": e }));
+                return Err(format!(
+                    "couldn't disable autonomous mode: the consent marker could not be \
+                     removed, so it stays ON — retry or check disk/permissions"
+                ));
+            }
+            self.autonomous_groups.lock_safe().remove(group);
+            // Clear the idle-tick latch so a later re-enable starts clean.
+            self.clear_idle_tick_latch(group);
+            self.audit(group, actor, "autonomous-off", json!({}));
+        }
+        Ok(())
+    }
+
+    /// Whether the orchestrator may merge adequately-tested PRs itself for a group
+    /// (auto-merge gate off = the default human merge gate). Drives the toggle
+    /// state and is mirrored into the orchestrator's kickoff config.
+    pub fn is_auto_merge(&self, group: &str) -> bool {
+        self.auto_merge_groups.lock_safe().contains(group)
+    }
+
+    /// Enable/disable the auto-merge gate for a group, durably (an `auto_merge`
+    /// marker file). Default OFF = today's behavior (human merges). The behavior
+    /// lives in the orchestrator template, which reads the flag from its kickoff
+    /// config; a live toggle both re-seeds that config for a restart and delivers
+    /// one audited notice so the running orchestrator learns the new gate.
+    pub fn set_auto_merge(&self, group: &str, on: bool) -> Result<(), String> {
+        let dir = self.group_dir(group);
+        if on {
+            // Atomic reserve (mirrors set_autonomous_as): only the newly-inserting
+            // caller writes the marker; a duplicate enable no-ops.
+            let newly = self.auto_merge_groups.lock_safe().insert(group.to_string());
+            if !newly {
+                return Ok(()); // no-op: don't re-notify
+            }
+            if let Err(e) = fs::create_dir_all(&dir)
+                .and_then(|_| fs::write(dir.join("auto_merge"), b""))
+            {
+                self.auto_merge_groups.lock_safe().remove(group);
+                return Err(format!("failed to enable auto-merge: {e}"));
+            }
+            self.audit(group, "human", "auto-merge-on", json!({}));
+        } else {
+            if !self.auto_merge_groups.lock_safe().contains(group) {
+                return Ok(()); // no-op: don't re-notify
+            }
+            // Disk first, then memory (L2): a surviving `auto_merge` marker would
+            // silently re-enable the orchestrator's merge authority on restart
+            // without renewed consent, so a failed removal fails the toggle and
+            // leaves the gate consistently ON.
+            if let Err(e) = remove_marker(&dir.join("auto_merge")) {
+                self.audit(group, "human", "auto-merge-off-failed", json!({ "error": e }));
+                return Err(format!(
+                    "couldn't disable auto-merge: the consent marker could not be \
+                     removed, so it stays ON — retry or check disk/permissions"
+                ));
+            }
+            self.auto_merge_groups.lock_safe().remove(group);
+            self.audit(group, "human", "auto-merge-off", json!({}));
+        }
+        // Tell the running orchestrator the gate moved (best-effort; a dead/paused
+        // orchestrator just misses it and re-reads its kickoff config on resume).
+        let _ = self.deliver_to_orchestrator(group, &auto_merge_notice(on), "loomux");
+        Ok(())
+    }
+
+    /// Set a live group's autonomous token budget on the fly (0 = no cap). Written
+    /// to the in-memory guardrail (which the idle-tick budget check reads fresh)
+    /// and persisted to group.json so a restart keeps it, then audited. Does NOT
+    /// move the enable-time anchor — the delta the budget meters is unaffected, so
+    /// raising the budget after a suspension lets the human resume without losing
+    /// the already-counted spend. Returns the applied value.
+    pub fn set_autonomy_budget(&self, group: &str, tokens: u64) -> Result<u64, String> {
+        let old = self
+            .group(group)
+            .ok_or("unknown group")?
+            .guardrails
+            .autonomy_budget_tokens;
+        if tokens == old {
+            return Ok(tokens);
+        }
+        // Persist first: a failed disk write must leave the in-memory value (what
+        // the budget check reads) unchanged so the two never disagree.
+        self.persist_autonomy_budget(group, tokens)?;
+        self.groups
+            .lock_safe()
+            .get_mut(group)
+            .ok_or("unknown group")?
+            .guardrails
+            .autonomy_budget_tokens = tokens;
+        self.audit(group, "human", "autonomy-budget-set",
+            json!({ "from": old, "to": tokens }));
+        Ok(tokens)
+    }
+
+    /// Rewrite only `guardrails.autonomy_budget_tokens` in group.json, preserving
+    /// every other stored field (additive patch, same crash-safe write as
+    /// `persist_max_agents`).
+    fn persist_autonomy_budget(&self, group: &str, tokens: u64) -> Result<(), String> {
+        let dir = self.group_dir(group);
+        let path = dir.join("group.json");
+        let mut v: Value = serde_json::from_str(&fs::read_to_string(&path).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+        let obj = v.as_object_mut().ok_or("group.json root is not a JSON object")?;
+        match obj.get_mut("guardrails").and_then(Value::as_object_mut) {
+            Some(guard) => {
+                guard.insert("autonomy_budget_tokens".into(), json!(tokens));
+            }
+            None => {
+                obj.insert("guardrails".into(), json!({ "autonomy_budget_tokens": tokens }));
+            }
+        }
+        let body = serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?;
+        let tmp = dir.join("group.json.tmp");
+        fs::write(&tmp, &body).map_err(|e| e.to_string())?;
+        if fs::rename(&tmp, &path).is_err() {
+            fs::write(&path, &body).map_err(|e| e.to_string())?;
+            let _ = fs::remove_file(&tmp);
+        }
+        Ok(())
+    }
+
+    /// The group's lifetime usage-token total (live + historical snapshots), the
+    /// figure the autonomy budget meters against. Reuses `group_usage` so the
+    /// live-agent refresh and the exact-token summing live in one place.
+    fn group_token_total(&self, group: &str) -> u64 {
+        self.group_usage(group)
+            .get("lifetime_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+    }
+
+    /// The autonomous-mode state the frontend panel reads to render its toggle
+    /// rows and the budget meter (#83, W2's slice). One call for the whole panel:
+    /// on/off, the auto-merge gate, the token budget, its enable-time anchor, and
+    /// the spend metered since enable (`null` spend when off — no active meter).
+    pub fn autonomy_state(&self, group: &str) -> Value {
+        let on = self.is_autonomous(group);
+        let budget = self
+            .group(group)
+            .map(|g| g.guardrails.autonomy_budget_tokens)
+            .unwrap_or(0);
+        let anchor = if on { self.autonomy_anchor(group) } else { 0 };
+        let spend = on.then(|| self.group_token_total(group).saturating_sub(anchor));
+        // `suspended` is meaningful only while OFF: true iff the budget enforcer
+        // (not the user) flipped it off, so the UI can distinguish "budget spent —
+        // raise it or re-enable" from a plain user toggle-off.
+        let suspended = !on && self.autonomy_suspended(group);
+        json!({
+            "autonomous": on,
+            "auto_merge": self.is_auto_merge(group),
+            "budget_tokens": budget,
+            "budget_anchor_tokens": anchor,
+            "spend_since_enable_tokens": spend,
+            "suspended": suspended,
+        })
+    }
+
+    /// Clear the orchestrator's idle-tick anti-nag latch for a group (e.g. on
+    /// disable, so a later re-enable starts fresh).
+    fn clear_idle_tick_latch(&self, group: &str) {
+        for a in self.agents.lock_safe().values_mut() {
+            if a.group == group && a.role == Role::Orchestrator {
+                a.idle_tick_notified = false;
+            }
+        }
     }
 
     /// Adjust a live group's max live-agent cap on the fly. Bounds are the
@@ -4387,6 +5028,7 @@ impl OrchRegistry {
             last_progress_ms: now_ms(),
             last_output_total: 0,
             watchdog_notified: false,
+            idle_tick_notified: false,
         };
         {
             // Re-check the cap under the same lock as the insert: the early
@@ -4519,11 +5161,17 @@ impl OrchRegistry {
                 "You are the orchestrator of loomux agent group {gid} for the repository {repo}.\n\
                  First read your role instructions: {ins}\n\
                  Guardrails (enforced by loomux): max {max} live agents, worker model {wm}, reviewer model {rm}, planner model {pm}.\n\
+                 Group config: auto-merge is {automerge} (see the merge-gate section of your instructions); autonomous idle-tick mode is {autonomous}.\n\
                  Start by calling get_state, run `gh issue list --label agent-managed --state open`, call list_agents, \
                  reconcile them, then give the human a short status summary and wait for direction.",
                 gid = g.id, repo = g.repo, ins = instructions.display(),
                 max = g.guardrails.max_agents, wm = g.guardrails.worker_model,
                 rm = g.guardrails.reviewer_model, pm = g.guardrails.planner_model,
+                // Autonomous config the template's conditional sections read (#83).
+                // Live toggles also deliver a mid-session notice; this covers a
+                // fresh boot / resume, where there's no notice to have seen.
+                automerge = if self.is_auto_merge(&g.id) { "ENABLED (you may merge adequately-tested PRs yourself)" } else { "disabled (human merge gate is absolute — never merge)" },
+                autonomous = if self.is_autonomous(&g.id) { "ON (you will get [loomux] idle tick wakes to run your cadence unattended)" } else { "off" },
             ),
             Role::Worker | Role::Reviewer | Role::Planner => {
                 let head = format!(
@@ -5167,6 +5815,21 @@ pub fn start_watchdog(reg: Arc<OrchRegistry>) {
     });
 }
 
+/// Background loop for autonomous mode (#83): every `IDLE_TICK_INTERVAL` it
+/// enforces autonomy token budgets (suspending a group that has overspent) and
+/// then delivers one `[loomux] idle tick` to any autonomous group's orchestrator
+/// that has been output-quiet past `IDLE_TICK_MINUTES`, so the template's
+/// idle-cadence intake/monitoring actually runs unattended. Non-autonomous and
+/// paused groups are skipped inside `run_idle_tick`; the tick is self-regulating
+/// (any orchestrator action resets the quiet clock) and hard-capped per hour.
+/// Started once at app setup.
+pub fn start_idle_tick(reg: Arc<OrchRegistry>) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(IDLE_TICK_INTERVAL);
+        reg.run_idle_tick(now_ms());
+    });
+}
+
 /// Background loop for the debounced cap-change notice (#79): every
 /// `MAX_NOTICE_FLUSH_INTERVAL` it delivers any coalesced max-agents notice
 /// whose quiet window has elapsed, so a burst of stepper clicks reaches the
@@ -5246,6 +5909,9 @@ pub fn create_orchestration(
             idle_kill_minutes,
             max_spawns_per_hour,
             watchdog_stall_minutes,
+            // #83: no autonomous budget at launch; the human sets it live via
+            // orch_set_autonomy_budget (W2 adds the launcher knob later). 0 = no cap.
+            autonomy_budget_tokens: 0,
         },
         None,
         None,
@@ -5321,6 +5987,68 @@ pub fn orch_set_max_agents(
 #[tauri::command]
 pub fn orch_group_usage(reg: tauri::State<Arc<OrchRegistry>>, group_id: String) -> Value {
     reg.group_usage(&group_id)
+}
+
+// ---------- autonomous mode (#83): toggles + budget + state read ----------
+//
+// FROZEN COMMAND CONTRACT (W2 builds the group-panel UI against this):
+//   orch_set_autonomous(group_id, enabled: bool) -> Result<(), String>
+//     Flip autonomous idle-tick mode. Enabling anchors the budget meter at the
+//     group's current spend; disabling is the explicit consent needed to resume
+//     after a budget suspension.
+//   orch_set_auto_merge(group_id, enabled: bool) -> Result<(), String>
+//     Flip the merge gate. Default OFF = human approval required (today's
+//     behavior). ON lets the orchestrator merge adequately-tested PRs itself.
+//   orch_set_autonomy_budget(group_id, tokens: u64) -> Result<u64, String>
+//     Per-group autonomous-era token budget; 0 = no cap. Returns the applied value.
+//   orch_autonomy(group_id) -> Value
+//     The whole panel state in one read:
+//       { autonomous: bool, auto_merge: bool, budget_tokens: u64,
+//         budget_anchor_tokens: u64, spend_since_enable_tokens: u64 | null,
+//         suspended: bool }
+//     `spend_since_enable_tokens` is null when autonomous is off (no live meter).
+//     `suspended` is true iff autonomous is off *because the budget enforcer
+//     flipped it* (durable `autonomy_suspended` marker), vs a plain user toggle-off
+//     — so the UI shows "budget spent, raise it or re-enable" without parsing the
+//     audit log. Always false while autonomous is on.
+
+/// Enable/disable autonomous idle-tick mode for a group (durable, audited).
+#[tauri::command]
+pub fn orch_set_autonomous(
+    reg: tauri::State<Arc<OrchRegistry>>,
+    group_id: String,
+    enabled: bool,
+) -> Result<(), String> {
+    reg.set_autonomous(&group_id, enabled)
+}
+
+/// Enable/disable the auto-merge gate for a group (durable, audited). Default OFF
+/// = human merges; ON lets the orchestrator merge adequately-tested PRs itself.
+#[tauri::command]
+pub fn orch_set_auto_merge(
+    reg: tauri::State<Arc<OrchRegistry>>,
+    group_id: String,
+    enabled: bool,
+) -> Result<(), String> {
+    reg.set_auto_merge(&group_id, enabled)
+}
+
+/// Set a group's autonomous-era token budget (0 = no cap; durable, audited).
+/// Returns the applied value.
+#[tauri::command]
+pub fn orch_set_autonomy_budget(
+    reg: tauri::State<Arc<OrchRegistry>>,
+    group_id: String,
+    tokens: u64,
+) -> Result<u64, String> {
+    reg.set_autonomy_budget(&group_id, tokens)
+}
+
+/// The group's autonomous-mode state for the panel: toggles, budget, anchor, and
+/// spend-since-enable. Single read the UI renders all three controls from.
+#[tauri::command]
+pub fn orch_autonomy(reg: tauri::State<Arc<OrchRegistry>>, group_id: String) -> Value {
+    reg.autonomy_state(&group_id)
 }
 
 /// Live-agent count, role breakdown, and uptime for the lifecycle panel.
@@ -5458,9 +6186,11 @@ fn register_orchestrator_pane(
         cwd: group.repo.clone(),
         idle_since_ms: None, // the orchestrator is never idle-reaped
         started_ms: now_ms(),
-        last_progress_ms: now_ms(), // unused: the orchestrator is never watchdogged
+        last_progress_ms: now_ms(), // watchdog ignores the orchestrator; the
+        // idle-tick (#83) reuses this as the orchestrator's output-quiet clock.
         last_output_total: 0,
         watchdog_notified: false,
+        idle_tick_notified: false,
     };
     reg.agents.lock_safe().insert(agent_id.clone(), entry.clone());
     reg.by_token.lock_safe().insert(token, agent_id.clone());

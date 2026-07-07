@@ -434,6 +434,86 @@ box clears) rather than making the orchestrator poll terminals by hand.
   Silent-agent recovery adds the human-facing half: on a repeat unconfirmed notice for the
   same agent, stop re-sending and flag the human.
 
+## Autonomous mode (#83)
+
+The orchestrator template already documents a full idle cadence — poll `agent-ready`/
+`agent-investigate` labels, groom them, re-check open PRs — "on the slow periodic cadence
+while otherwise idle." But an LLM CLI only acts when text is typed into it, and **nothing in
+the backend ever poked an idle orchestrator**: every wake-up (worker report, board change,
+human message, watchdog stall, max-agents change) is event-driven. When a group went quiet
+the cadence simply never ran. Autonomous mode closes that gap with a **tick source**, plus
+the two cost/safety controls the unattended-spend risk demands.
+
+- **Idle-tick loop.** `start_idle_tick` (60s wake, clone of `start_watchdog`) calls
+  `run_idle_tick`, which reads each live orchestrator pane's `output_total` and
+  `last_user_input_ms` (`orchestrator_activity`, the analogue of `agent_output_totals`) and
+  hands the snapshot to `idle_tick_tick`. Splitting the pty read from the decision keeps the
+  gate/latch/cap/pause logic pure and fixture-testable with synthetic maps — the
+  `watchdog_tick` shape. An orchestrator output-quiet past `IDLE_TICK_MINUTES` (15, a fixed
+  constant in v1) earns exactly one audited (`idle-tick`) `[loomux] idle tick` notice via
+  `deliver_to_orchestrator` telling it to run its cadence and **start** labeled work. The
+  threshold arithmetic is the pure `idle_tick_should_fire`.
+- **Self-regulating + capped.** Output growth (the orchestrator acting) resets the quiet
+  clock **and** clears the one-notice latch (`AgentEntry.idle_tick_notified`, mirroring
+  `watchdog_notified`), so the worst case is one tick per idle window — an action defers the
+  next tick, so it can't tight-loop. A hard `MAX_IDLE_TICKS_PER_HOUR` backstop (per-group
+  timestamp ring, `idle_tick_times`, reusing `spawn_rate_exceeded`'s window rule) catches any
+  pathological re-arm. Recent **human input** in the pane folds into the quiet clock too
+  (belt-and-suspenders on top of output-silence), so a tick never lands while the human is
+  steering. **Paused** groups are skipped wholesale and their latch left intact (same
+  reasoning as the watchdog).
+- **The toggle.** Off by default. `is_autonomous`/`set_autonomous` on the `set_notify`
+  marker-file pattern (an `autonomous` marker), so it's live-togglable from the group panel
+  and survives restarts (re-seeded in `create_group` next to `paused`/`notify`). The label
+  funnel stays the consent boundary: autonomous mode starts *labeled* work on its own; it
+  never triages unlabeled issues (option (c) of the investigation, rejected).
+- **Cost guardrail — token budget.** The headline cost control. `Guardrails.autonomy_budget_tokens`
+  (u64; 0 = no cap; persisted in group.json, live-settable via `set_autonomy_budget` like
+  `max_agents`) caps **autonomous-era** spend. The anchor problem — budget lifetime history or
+  only new spend? — is settled by metering the **delta from an enable-time snapshot**: enabling
+  stamps the group's current `group_usage` token total into the `autonomous` marker's *content*
+  (`autonomy_anchor`), and `enforce_autonomy_budgets` (run each cycle before the tick) meters
+  `group_token_total(group) - anchor`. Crossing the budget (`autonomy_budget_exhausted`)
+  **suspends** autonomous mode — flips the marker off (explicit consent required to resume),
+  audits `autonomy-budget-exhausted`, and delivers **one** `[loomux]` notice; because
+  suspension leaves the autonomous set, later passes skip the group so it can't repeat. The
+  suspension also writes a durable `autonomy_suspended` marker (cleared on a genuine re-enable)
+  so `orch_autonomy` can report `suspended: true` — the UI distinguishes a budget suspension
+  from a plain user toggle-off without reconstructing it from the audit log. **The money-stop is
+  unconditional:** unlike a *user* disable (disk-first + fail-loud, to protect the consent
+  boundary — a failed removal keeps it ON), the suspension path (`suspend_autonomous`) drops the
+  in-memory flag **regardless of whether the marker can be removed**, because continued spend
+  past the cap is the one direction this feature must never allow. If the durable removal fails,
+  the surviving `autonomous` marker is overridden at restart by the `autonomy_suspended` marker
+  (the `create_group` re-seed checks suspended first), so the group comes back OFF +
+  suspended-visible rather than silently ticking. This is
+  genuinely **new enforcement** — exact per-session token accounting already existed
+  (`usage.rs`, `group_usage`) but no spend cap did. Tokens, not dollars: subscription/Max
+  accounts pay $0 marginal, so dollars are meaningless here (see `usage.rs`). Re-enabling
+  re-anchors at the now-higher spend, which is what "toggle to resume" means.
+- **Merge-approval toggle.** `is_auto_merge`/`set_auto_merge` (an `auto_merge` marker, default
+  OFF = today's human merge gate). The *behavior* lives in the orchestrator template — its merge
+  section is now conditional on the flag — and the backend just stores/exposes it and mirrors it
+  into the orchestrator's context two ways: the kickoff prompt renders the current gate (for a
+  fresh boot/resume) and a live toggle delivers an audited `[loomux] auto-merge …` notice (for
+  the running orchestrator), exactly how `max_agents` surfaces (kickoff render + live notice).
+  When enabled the orchestrator may merge an adequately-tested PR (reviewer-approved + green CI +
+  acceptance met) itself, auditing and announcing each merge and still holding anything
+  risky/ambiguous for the human.
+- **Commands (frozen contract; W2 builds the UI against it).** `orch_set_autonomous(group_id,
+  enabled)`, `orch_set_auto_merge(group_id, enabled)`, `orch_set_autonomy_budget(group_id,
+  tokens) -> u64`, and `orch_autonomy(group_id) -> { autonomous, auto_merge, budget_tokens,
+  budget_anchor_tokens, spend_since_enable_tokens, suspended }` — the one read the group panel
+  renders all three controls, the live budget meter, and the budget-suspended state from.
+  Registered in `lib.rs` beside `orch_set_notify`.
+- **This group could be affected.** The feature is generic — loomux's own orchestration group is
+  just another group, so nothing special-cases it. Turning autonomous mode on for the group
+  loomux is developed in would idle-tick *its* orchestrator like any other.
+- **Interactions.** Idle-kill is unaffected: the orchestrator is never idle-reaped, and a tick
+  delivered to it never touches worker `idle_since_ms`, so idle workers still reap on schedule.
+  Spawns a tick induces still count against `max_spawns_per_hour`. The human's pause/off-switch
+  is instant.
+
 ## Human-input paste guard (#111)
 
 The quiet backstop (#43, `wait_for_user_quiet`) only waits out *active* typing — it releases
