@@ -270,7 +270,10 @@ automatically.
 Panes are badged by role and group number (`ORCH 1` / `W 1` / `REV 1` / `PLAN 1`
 vs `ORCH 2` / `W 2`) with a per-group accent color, so parallel orchestrations — even on
 the same repository — pair up at a glance. Unrelated panes are fully
-isolated from a group's tools.
+isolated from a group's tools. When the orchestrator spawns an agent it opens
+that pane in the background — your keyboard focus stays exactly where you were
+typing, so a spawn never yanks the cursor mid-keystroke. Panes you open yourself
+(a split, the launcher, a session restore) still take focus as before.
 
 **Task board:** the orchestrator pane has a board toggle (`Alt+T` or the
 list icon) showing the group's work queue — status per item (`queued`,
