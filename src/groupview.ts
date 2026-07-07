@@ -203,6 +203,10 @@ export class GroupView {
     const approvalLbl = el("label", "group-auto-check") as HTMLLabelElement;
     this.approvalChk = document.createElement("input");
     this.approvalChk.type = "checkbox";
+    // Consent surface must never show the unsafe direction: start checked
+    // (approval required) so pre-load / a failed autonomyState read renders
+    // auto-merge as OFF, matching the backend default.
+    this.approvalChk.checked = true;
     this.approvalChk.addEventListener("change", () => void this.toggleApproval());
     approvalLbl.append(
       this.approvalChk,
