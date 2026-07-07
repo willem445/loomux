@@ -3281,6 +3281,16 @@ impl OrchRegistry {
                 self.audit(&group, "loomux", "autonomy-budget-exhausted",
                     json!({ "spent_tokens": spent, "budget_tokens": budget }));
                 let _ = self.set_autonomous_as(&group, false, "loomux");
+                // Distinguish a budget suspension from a plain user-off with a
+                // durable `autonomy_suspended` marker, so the UI can tell the human
+                // "suspended — raise the budget or re-enable" instead of
+                // reconstructing it from the audit log. Written *after* the disable
+                // (which turns autonomous off); cleared on a genuine re-enable. A
+                // hint, not a consent gate, so a failed write fails soft.
+                let _ = fs::write(
+                    self.group_dir(&group).join("autonomy_suspended"),
+                    json!({ "spent_tokens": spent, "budget_tokens": budget }).to_string(),
+                );
                 let _ = self.deliver_to_orchestrator(
                     &group,
                     &autonomy_budget_notice(spent, budget),
@@ -3386,6 +3396,15 @@ impl OrchRegistry {
             .unwrap_or(0)
     }
 
+    /// Whether autonomous mode is OFF *because the budget enforcer suspended it*
+    /// (as opposed to a plain user toggle-off or never-on). Backed by a durable
+    /// `autonomy_suspended` marker written by `enforce_autonomy_budgets` and
+    /// cleared on a genuine re-enable, so it survives restarts. Only meaningful
+    /// while off — `autonomy_state` gates it on `!is_autonomous`.
+    fn autonomy_suspended(&self, group: &str) -> bool {
+        self.group_dir(group).join("autonomy_suspended").is_file()
+    }
+
     /// Enable/disable autonomous idle-ticking for a group, durably (an
     /// `autonomous` marker file, mirroring the pause/notify markers). Enabling
     /// stamps the marker with the group's current usage-token total as the budget
@@ -3423,6 +3442,10 @@ impl OrchRegistry {
                 self.autonomous_groups.lock_safe().remove(group);
                 return Err(format!("failed to enable autonomous mode: {e}"));
             }
+            // A genuine (re-)enable resolves any prior budget suspension: clear the
+            // suspended marker so the UI stops flagging it. Best-effort — it's a
+            // UI hint, and `autonomy_state` only reports suspended while OFF anyway.
+            let _ = remove_marker(&dir.join("autonomy_suspended"));
             self.audit(group, actor, "autonomous-on",
                 json!({ "budget_anchor_tokens": anchor }));
         } else {
@@ -3579,12 +3602,17 @@ impl OrchRegistry {
             .unwrap_or(0);
         let anchor = if on { self.autonomy_anchor(group) } else { 0 };
         let spend = on.then(|| self.group_token_total(group).saturating_sub(anchor));
+        // `suspended` is meaningful only while OFF: true iff the budget enforcer
+        // (not the user) flipped it off, so the UI can distinguish "budget spent —
+        // raise it or re-enable" from a plain user toggle-off.
+        let suspended = !on && self.autonomy_suspended(group);
         json!({
             "autonomous": on,
             "auto_merge": self.is_auto_merge(group),
             "budget_tokens": budget,
             "budget_anchor_tokens": anchor,
             "spend_since_enable_tokens": spend,
+            "suspended": suspended,
         })
     }
 
@@ -5946,8 +5974,13 @@ pub fn orch_group_usage(reg: tauri::State<Arc<OrchRegistry>>, group_id: String) 
 //   orch_autonomy(group_id) -> Value
 //     The whole panel state in one read:
 //       { autonomous: bool, auto_merge: bool, budget_tokens: u64,
-//         budget_anchor_tokens: u64, spend_since_enable_tokens: u64 | null }
+//         budget_anchor_tokens: u64, spend_since_enable_tokens: u64 | null,
+//         suspended: bool }
 //     `spend_since_enable_tokens` is null when autonomous is off (no live meter).
+//     `suspended` is true iff autonomous is off *because the budget enforcer
+//     flipped it* (durable `autonomy_suspended` marker), vs a plain user toggle-off
+//     — so the UI shows "budget spent, raise it or re-enable" without parsing the
+//     audit log. Always false while autonomous is on.
 
 /// Enable/disable autonomous idle-tick mode for a group (durable, audited).
 #[tauri::command]

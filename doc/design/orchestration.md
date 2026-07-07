@@ -476,7 +476,10 @@ the two cost/safety controls the unattended-spend risk demands.
   `group_token_total(group) - anchor`. Crossing the budget (`autonomy_budget_exhausted`)
   **suspends** autonomous mode — flips the marker off (explicit consent required to resume),
   audits `autonomy-budget-exhausted`, and delivers **one** `[loomux]` notice; because
-  suspension leaves the autonomous set, later passes skip the group so it can't repeat. This is
+  suspension leaves the autonomous set, later passes skip the group so it can't repeat. The
+  suspension also writes a durable `autonomy_suspended` marker (cleared on a genuine re-enable)
+  so `orch_autonomy` can report `suspended: true` — the UI distinguishes a budget suspension
+  from a plain user toggle-off without reconstructing it from the audit log. This is
   genuinely **new enforcement** — exact per-session token accounting already existed
   (`usage.rs`, `group_usage`) but no spend cap did. Tokens, not dollars: subscription/Max
   accounts pay $0 marginal, so dollars are meaningless here (see `usage.rs`). Re-enabling
@@ -493,8 +496,9 @@ the two cost/safety controls the unattended-spend risk demands.
 - **Commands (frozen contract; W2 builds the UI against it).** `orch_set_autonomous(group_id,
   enabled)`, `orch_set_auto_merge(group_id, enabled)`, `orch_set_autonomy_budget(group_id,
   tokens) -> u64`, and `orch_autonomy(group_id) -> { autonomous, auto_merge, budget_tokens,
-  budget_anchor_tokens, spend_since_enable_tokens }` — the one read the group panel renders all
-  three controls and the live budget meter from. Registered in `lib.rs` beside `orch_set_notify`.
+  budget_anchor_tokens, spend_since_enable_tokens, suspended }` — the one read the group panel
+  renders all three controls, the live budget meter, and the budget-suspended state from.
+  Registered in `lib.rs` beside `orch_set_notify`.
 - **This group could be affected.** The feature is generic — loomux's own orchestration group is
   just another group, so nothing special-cases it. Turning autonomous mode on for the group
   loomux is developed in would idle-tick *its* orchestrator like any other.

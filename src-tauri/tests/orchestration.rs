@@ -3244,6 +3244,45 @@ fn budget_metering_anchors_at_enable_and_suspends_once_on_delta() {
 }
 
 #[test]
+fn autonomy_state_reports_budget_suspension_distinctly() {
+    // orch_autonomy must let the UI tell a budget suspension from a plain user-off
+    // without parsing the audit log — via a durable `suspended` flag.
+    let (reg, dir) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let suspended = |r: &OrchRegistry| r.autonomy_state(&g.id)["suspended"].as_bool().unwrap();
+
+    // Never-on: not suspended. An ON group: never suspended. A plain user-off:
+    // OFF but NOT a suspension.
+    assert!(!suspended(&reg), "never-enabled is not suspended");
+    reg.set_autonomous(&g.id, true).unwrap();
+    assert!(!suspended(&reg), "an ON group is never suspended");
+    reg.set_autonomous(&g.id, false).unwrap();
+    assert!(!suspended(&reg), "a plain user toggle-off must not read as budget-suspended");
+
+    // Budget suspension: re-enable, arm an exhausted budget, enforce → OFF + suspended.
+    reg.set_autonomous(&g.id, true).unwrap();
+    seed_usage(&reg, &g.id, "spend", 5_000);
+    reg.set_autonomy_budget(&g.id, 100).unwrap();
+    assert_eq!(reg.enforce_autonomy_budgets(now_ms()), vec![g.id.clone()]);
+    assert!(!reg.is_autonomous(&g.id));
+    assert!(suspended(&reg), "a budget suspension must read as suspended");
+
+    // Survives restart: a fresh registry over the same root still reports it.
+    let reg2 = OrchRegistry::new(dir.path().to_path_buf());
+    reg2.set_port(45999);
+    reg2.create_group("C:/tmp/repo", rails()).unwrap();
+    assert!(!reg2.is_autonomous(&g.id));
+    assert!(reg2.autonomy_state(&g.id)["suspended"].as_bool().unwrap(),
+        "budget suspension must survive a restart");
+
+    // A genuine re-enable resolves it: ON and no longer suspended.
+    reg2.set_autonomous(&g.id, true).unwrap();
+    assert!(reg2.is_autonomous(&g.id));
+    assert!(!reg2.autonomy_state(&g.id)["suspended"].as_bool().unwrap(),
+        "re-enabling clears the suspended state");
+}
+
+#[test]
 fn failed_disable_keeps_consent_on_and_is_audited() {
     // L2 consent-boundary: a disable whose marker removal fails must NOT report
     // success — a surviving marker would silently re-enable on restart. The toggle
