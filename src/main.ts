@@ -50,7 +50,7 @@ const grid = new Grid(gridRoot, paneDock, () => {
   void openPane();
 });
 
-// Voice push-to-talk (#58, Alt+V): the global capture controller finds its
+// Voice push-to-talk (#58, Alt+S): the global capture controller finds its
 // insertion target via the active pane.
 voiceController.init(() => grid.activePane);
 

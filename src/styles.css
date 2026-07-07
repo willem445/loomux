@@ -381,6 +381,15 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   0%, 100% { box-shadow: 0 0 0 0 rgba(217, 54, 76, 0.55); }
   50%      { box-shadow: 0 0 0 4px rgba(217, 54, 76, 0); }
 }
+/* Transcribing: amber, gently pulsing, to distinguish from the live-mic red. */
+.orch-compose-mic.transcribing {
+  color: #fff; background: #b8860b; border-color: #b8860b;
+  animation: orch-mic-work 1s ease-in-out infinite;
+}
+@keyframes orch-mic-work {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.55; }
+}
 /* Voice-capture overlay badge for terminal-targeted recording (#58). Floats
    over the top-right of the terminal — overlay chrome, so it never resizes the
    PTY. Non-interactive so it can't swallow clicks meant for the terminal. */
@@ -400,6 +409,14 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   0%, 100% { opacity: 1; }
   50%      { opacity: 0.25; }
 }
+/* Transcribing variant of the terminal overlay badge: amber with a spinner. */
+.pane-voice-indicator.transcribing { background: rgba(184, 134, 11, 0.94); }
+.pane-voice-spinner {
+  width: 9px; height: 9px; border-radius: 50%;
+  border: 2px solid rgba(255, 255, 255, 0.4); border-top-color: #fff;
+  animation: pane-voice-spin 0.7s linear infinite;
+}
+@keyframes pane-voice-spin { to { transform: rotate(360deg); } }
 /* Thumbnail-chip row for queued image attachments (#72). Empty → collapses to
    nothing (no queued images), so the strip keeps its baseline height until an
    image is added and the terminal only refits on a genuine change. */

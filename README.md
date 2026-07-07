@@ -91,7 +91,7 @@ npm test           # unit tests (Node's built-in runner; no extra deps)
 | Session browser | `Ctrl+Shift+P` (or the *sessions* button) |
 | Open in editor | `Alt+E` (or the `</>` button in a pane header) |
 | Steer orchestrator | `Alt+P` (focus the compose strip under an orchestrator pane); `Esc` returns to the terminal; `Ctrl+V` in the strip attaches a pasted screenshot |
-| Voice prompt | `Alt+V` (push-to-talk; `Esc` cancels) — see [Voice prompts](#voice-prompts) |
+| Voice prompt | `Alt+S` (push-to-talk; `Esc` cancels) — see [Voice prompts](#voice-prompts) |
 | Copy / paste | `Ctrl+Shift+C` / `Ctrl+Shift+V` (`Ctrl+V` also works) |
 
 A CLI running in a pane (e.g. an agent that says "copied to clipboard") copies
@@ -158,11 +158,14 @@ short toast explaining what went wrong.
 
 ### Voice prompts
 
-Dictate a prompt instead of typing it. Press **`Alt+V`** to start recording
-(push-to-talk), speak, and press **`Alt+V`** again to stop — loomux transcribes
+Dictate a prompt instead of typing it. Press **`Alt+S`** to start recording
+(push-to-talk), speak, and press **`Alt+S`** again to stop — loomux transcribes
 your speech locally and drops the text at your current focus. **`Esc`** cancels
-a recording. Transcription is never auto-submitted: you review it and press
-Enter yourself.
+at any point (including mid-transcription). Transcription is never auto-submitted:
+you review it and press Enter yourself.
+
+> **Note:** the hotkey is `Alt+S` (changed from `Alt+V`, which collided with
+> Claude Code's paste-image binding inside agent panes).
 
 - **Where the text lands** follows focus, decided when you start:
   - a **compose/steer box** focused → inserted at the caret;
@@ -171,8 +174,10 @@ Enter yourself.
     trailing newline).
 - The orchestrator steer strip also has a **🎤 button** that records into the
   strip; the hotkey works from any pane, with or without the button.
-- Only **one recording** runs at a time. While recording into a terminal, a red
-  "Recording" badge floats over that pane.
+- Only **one recording** runs at a time. While a capture targets a terminal, a
+  badge floats over that pane — red "Recording", then amber "Transcribing…"
+  while the speech is being converted. A large model can take a while; the app
+  stays responsive and you can `Esc` to abort.
 
 **Local & open source, opt-in.** Speech-to-text is
 [whisper.cpp](https://github.com/ggml-org/whisper.cpp) (MIT) running entirely on

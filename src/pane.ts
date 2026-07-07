@@ -22,7 +22,7 @@ import {
   detachGitWatch,
   ptyBackendInfo,
 } from "./pty";
-import { voiceController, type VoiceTargetPane } from "./voicecontrol";
+import { voiceController, type VoiceTargetPane, type VoicePhase } from "./voicecontrol";
 import { invoke } from "@tauri-apps/api/core";
 import { parseOsc52, writeClipboard } from "./clipboard";
 import {
@@ -239,7 +239,7 @@ export class Pane implements VoiceTargetPane {
    *  Claude form until a save reports otherwise. */
   private orchCli = "claude";
   /** Voice-prompt push-to-talk button on the steer strip (#58). Only present on
-   *  orchestrator panes; the hotkey (Alt+V) works on any pane regardless. */
+   *  orchestrator panes; the hotkey (Alt+S) works on any pane regardless. */
   private micBtn: HTMLButtonElement | null = null;
   /** Overlay badge shown while a voice capture targets THIS pane's terminal
    *  (#58). Overlay chrome — floats over `.xterm`, never resizes the PTY. */
@@ -1313,31 +1313,37 @@ export class Pane implements VoiceTargetPane {
   // to receive a transcript and show a recording indicator.
 
   /** Is this pane's compose box the focused element? Decides caret-insert vs
-   *  terminal-paste when the Alt+V hotkey fires. */
+   *  terminal-paste when the voice hotkey fires. */
   isComposeFocused(): boolean {
     return !!this.composeInput && document.activeElement === this.composeInput;
   }
 
-  /** Reflect the mic button's "recording" pulse (compose-target indicator). */
-  setMicRecording(on: boolean): void {
-    this.micBtn?.classList.toggle("recording", on);
-  }
-
-  /** Show/hide the terminal-capture overlay badge (terminal-target indicator).
-   *  Lazily created; floats over `.xterm` so it never resizes the PTY. */
-  setTerminalRecording(on: boolean): void {
-    if (on) {
-      if (!this.voiceIndicator) {
-        const badge = document.createElement("div");
-        badge.className = "pane-voice-indicator";
-        badge.innerHTML = `<span class="pane-voice-dot"></span>Recording — Alt+V to insert · Esc to cancel`;
-        this.termEl.appendChild(badge);
-        this.voiceIndicator = badge;
-      }
-    } else {
+  /** Reflect the capture phase on this pane's indicator. For a compose target
+   *  it's the mic button (pulse while recording, spin while transcribing); for a
+   *  terminal target it's a lazily-created overlay badge floating over `.xterm`
+   *  (so it never resizes the PTY). */
+  setVoicePhase(kind: "compose" | "terminal", phase: VoicePhase): void {
+    if (kind === "compose") {
+      this.micBtn?.classList.toggle("recording", phase === "recording");
+      this.micBtn?.classList.toggle("transcribing", phase === "transcribing");
+      return;
+    }
+    if (phase === "off") {
       this.voiceIndicator?.remove();
       this.voiceIndicator = null;
+      return;
     }
+    if (!this.voiceIndicator) {
+      const badge = document.createElement("div");
+      badge.className = "pane-voice-indicator";
+      this.termEl.appendChild(badge);
+      this.voiceIndicator = badge;
+    }
+    const recording = phase === "recording";
+    this.voiceIndicator.classList.toggle("transcribing", !recording);
+    this.voiceIndicator.innerHTML = recording
+      ? `<span class="pane-voice-dot"></span>Recording — Alt+S to insert · Esc to cancel`
+      : `<span class="pane-voice-spinner"></span>Transcribing… · Esc to cancel`;
   }
 
   /** Route a transcript into this pane's terminal as if pasted — xterm's paste

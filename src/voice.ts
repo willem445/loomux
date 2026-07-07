@@ -21,35 +21,46 @@ export function resolveVoiceTargetKind(opts: {
   return "none";
 }
 
-/** Push-to-talk lifecycle. `busy` is the transient state while an async
- *  backend round-trip (start, or stop+transcribe, or cancel) is in flight —
- *  toggles are ignored there so a double-tap can't double-start or race. */
-export type VoiceMachineState = "idle" | "recording" | "busy";
+/** Push-to-talk lifecycle:
+ *   - "idle"         nothing happening;
+ *   - "starting"     voice_start round-trip in flight (awaiting the mic-live ack);
+ *   - "recording"    mic is live and capturing;
+ *   - "transcribing" mic stopped; the (possibly multi-minute) local transcription
+ *                    is running — the webview stays responsive because the backend
+ *                    command is async, and this state drives a "Transcribing…"
+ *                    indicator.
+ *  A toggle (hotkey / button) is ignored while `starting` or `transcribing`; Esc
+ *  (`cancel`) abandons any active phase (and, in `transcribing`, kills the
+ *  subprocess). */
+export type VoiceMachineState = "idle" | "starting" | "recording" | "transcribing";
 
 /** Events driving the machine:
  *   - "toggle"        the hotkey / mic button was pressed;
  *   - "ackRecording"  the backend confirmed the mic is live;
- *   - "cancel"        Esc — abandon an in-flight recording;
- *   - "settle"        the async op finished (started-failed, transcribed, or
- *                     cancelled) → back to idle. */
+ *   - "cancel"        Esc — abandon the active phase;
+ *   - "settle"        the async op finished (start failed, or transcript ready). */
 export type VoiceEvent = "toggle" | "ackRecording" | "cancel" | "settle";
 
 /** Pure transition function. Unknown (state, event) pairs are no-ops (return the
- *  current state), which is what makes `busy` swallow stray toggles. */
+ *  current state) — that's what makes `starting`/`transcribing` swallow stray
+ *  toggles so a double-tap can't double-start or interrupt a transcription. */
 export function nextVoiceState(state: VoiceMachineState, event: VoiceEvent): VoiceMachineState {
   switch (state) {
     case "idle":
-      // Only a deliberate toggle starts a capture; it goes through `busy`
-      // until the backend acks the live mic.
-      return event === "toggle" ? "busy" : "idle";
-    case "recording":
-      // Toggling again stops (→ transcribe); Esc cancels. Both go via `busy`.
-      return event === "toggle" || event === "cancel" ? "busy" : "recording";
-    case "busy":
-      // `ackRecording` promotes a successful start to live; `settle` ends any
-      // in-flight op. Toggles are ignored while busy.
+      // Only a deliberate toggle starts a capture.
+      return event === "toggle" ? "starting" : "idle";
+    case "starting":
+      // Mic confirmed live → recording; a failed start or a cancel → idle.
       if (event === "ackRecording") return "recording";
-      if (event === "settle") return "idle";
-      return "busy";
+      if (event === "settle" || event === "cancel") return "idle";
+      return "starting"; // toggle ignored mid-start
+    case "recording":
+      if (event === "toggle") return "transcribing"; // stop → transcribe
+      if (event === "cancel") return "idle"; // Esc → discard
+      return "recording";
+    case "transcribing":
+      // Transcript delivered, or Esc cancelled (subprocess killed) → idle.
+      if (event === "settle" || event === "cancel") return "idle";
+      return "transcribing"; // toggle ignored while transcribing
   }
 }
