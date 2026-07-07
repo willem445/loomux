@@ -29,23 +29,62 @@
 //!   3. otherwise **worker** (a named specialist like `sempkg.agent.md` with
 //!      no role hint is a worker persona).
 //!
-//! A profile mapped to a role becomes that role's *repo addendum*: its
-//! instructions **append to** — never replace — loomux's built-in role
-//! contract (the `report`/git-workflow guarantees always hold). The
-//! orchestrator role can carry a repo addendum too (the human's "always
-//! branch + PR" secondary prompt); loomux still owns the orchestrator's base
-//! contract.
+//! ## Append vs replace (`mode:` frontmatter)
+//!
+//! A profile's `mode:` decides how it relates to loomux's built-in role
+//! contract:
+//!   - `mode: append` (**default**) — the profile's instructions are an
+//!     *addendum*: the built-in role contract (the `report`/git-workflow
+//!     guarantees, MCP tool guidance, session discipline) still applies, and
+//!     the repo text is layered on top.
+//!   - `mode: replace` — the profile's instructions **fully replace** the
+//!     built-in role contract for that agent. loomux's operational bootstrap
+//!     (guardrail facts, `get_state`, the trust gate) still runs, but the
+//!     role-instruction *content* is entirely the repo file's. This is
+//!     power-user, break-your-orchestration territory: a replace file MUST
+//!     carry everything the agent needs to stay functional (how to `report`,
+//!     the branch→PR discipline, that it must never push to the default
+//!     branch, how to use the loomux MCP tools). See the samples under
+//!     `doc/demo/` for a complete replace-mode file.
+//!
+//! Safety rail: a **replace-mode profile never auto-applies by role**
+//! ([`profile_for_role`] skips it). It only takes effect when *explicitly*
+//! chosen — via `spawn_agent(profile: "<name>")` or a manual per-role
+//! assignment in the launcher — so a repo file can't silently wipe a role's
+//! contract just by existing.
 //!
 //! On Claude the instructions body is injected as the agent's system prompt
 //! (`--append-system-prompt-file`) and referenced in the kickoff; on Copilot
-//! the persona engages via its native `--agent <name>`. MCP tool servers come
-//! from the repo's standard `.mcp.json` (see `repo_mcp_servers` in mod.rs),
-//! gated behind the group's `trust_repo_mcp` toggle. Profiles are re-read from
-//! disk on every spawn so edits apply to the next agent.
+//! the persona engages via its native `--agent <name>`. In replace mode the
+//! kickoff points the agent at the profile as its *sole* role instructions
+//! instead of the built-in template. MCP tool servers come from the repo's
+//! standard `.mcp.json` (see `repo_mcp_servers` in mod.rs), gated behind the
+//! group's `trust_repo_mcp` toggle. Profiles are re-read from disk on every
+//! spawn so edits apply to the next agent.
 
 use super::Role;
 use std::fs;
 use std::path::Path;
+
+/// How a profile relates to the built-in role contract. See the module docs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ProfileMode {
+    /// Repo instructions layer on top of the built-in role contract (default).
+    #[default]
+    Append,
+    /// Repo instructions fully replace the built-in role contract (power-user).
+    Replace,
+}
+
+impl ProfileMode {
+    /// Wire/label string (`"append"` | `"replace"`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProfileMode::Append => "append",
+            ProfileMode::Replace => "replace",
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct AgentProfile {
@@ -60,6 +99,8 @@ pub struct AgentProfile {
     pub model: Option<String>,
     /// loomux role this profile addends (from `role`/`kind`, else file name).
     pub role: Role,
+    /// Append (default) or fully replace the built-in role contract.
+    pub mode: ProfileMode,
     /// Extra pre-approved tool patterns (Claude `--allowedTools` / Copilot
     /// `--allow-tool`).
     pub allow: Vec<String>,
@@ -154,6 +195,7 @@ pub fn parse_profile(stem: &str, text: &str) -> Option<AgentProfile> {
         model: None,
         // Fall back to the file name for the role, before frontmatter overrides.
         role: role_from_hint(default_name).unwrap_or(Role::Worker),
+        mode: ProfileMode::Append,
         allow: Vec::new(),
         copilot_agent: None,
     };
@@ -174,6 +216,13 @@ pub fn parse_profile(stem: &str, text: &str) -> Option<AgentProfile> {
                 }
             }
             "allow" => p.allow = value.split(',').filter_map(sanitize_allow).collect(),
+            // append (default) | replace. Anything unrecognized stays append —
+            // the safe default (an addendum can't strip the built-in contract).
+            "mode" => {
+                if value.trim().eq_ignore_ascii_case("replace") {
+                    p.mode = ProfileMode::Replace;
+                }
+            }
             "copilot-agent" | "copilot_agent" => p.copilot_agent = sanitize_name(&value),
             // tools / agents / target / … are copilot-native; copilot reads
             // them itself via --agent.
@@ -209,11 +258,14 @@ pub fn discover_profiles(repo: &str) -> Vec<AgentProfile> {
     out
 }
 
-/// The repo profile that addends a given loomux role, if any. When several
-/// files map to the same role (e.g. two workers), the first by name wins —
-/// deterministic, and the human sees the full list in the launcher.
+/// The repo profile that **auto**-addends a given loomux role, if any. Only
+/// append-mode files auto-apply: a replace-mode profile would wipe the built-in
+/// contract, so it never activates implicitly — it must be picked explicitly
+/// (named spawn or manual launcher assignment). When several append-mode files
+/// map to the same role, the first by name wins (deterministic; the human sees
+/// the full list in the launcher).
 pub fn profile_for_role(profiles: &[AgentProfile], role: Role) -> Option<&AgentProfile> {
-    profiles.iter().find(|p| p.role == role)
+    profiles.iter().find(|p| p.role == role && p.mode == ProfileMode::Append)
 }
 
 /// Look up a profile by its (case-sensitive) name — the `spawn_agent(profile:)`
@@ -287,6 +339,56 @@ mod tests {
         // #5's `kind:` spelling keeps working alongside the new `role:`.
         let p = parse_profile("qa", "---\nkind: reviewer\n---\nReview it.").unwrap();
         assert_eq!(p.role, Role::Reviewer);
+    }
+
+    #[test]
+    fn mode_defaults_to_append_and_parses_replace() {
+        let appended = parse_profile("worker", "---\ndescription: x\n---\nBody.").unwrap();
+        assert_eq!(appended.mode, ProfileMode::Append, "mode defaults to append");
+        let replaced =
+            parse_profile("worker", "---\nmode: Replace\n---\nFull contract here.").unwrap();
+        assert_eq!(replaced.mode, ProfileMode::Replace, "mode: replace (any case) parses");
+        // An unrecognized mode stays append — the safe default.
+        let weird = parse_profile("worker", "---\nmode: nonsense\n---\nBody.").unwrap();
+        assert_eq!(weird.mode, ProfileMode::Append, "unknown mode falls back to append");
+    }
+
+    #[test]
+    fn replace_mode_never_auto_applies_but_is_findable_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let agents = dir.path().join(".github").join("agents");
+        fs::create_dir_all(&agents).unwrap();
+        // Two worker-role files: one append (auto-eligible), one replace (not).
+        fs::write(agents.join("worker.md"), "---\ndescription: append worker\n---\nAddendum.").unwrap();
+        fs::write(
+            agents.join("solo.agent.md"),
+            "---\nrole: worker\nmode: replace\n---\nFull self-contained contract.",
+        )
+        .unwrap();
+        let profiles = discover_profiles(&dir.path().to_string_lossy());
+        // Auto role-mapping must pick the append file, never the replace one —
+        // even though "solo" sorts before "worker".
+        assert_eq!(
+            profile_for_role(&profiles, Role::Worker).unwrap().name,
+            "worker",
+            "auto role-mapping skips replace-mode files"
+        );
+        // But the replace file is still explicitly selectable by name.
+        let solo = find_named(&profiles, "solo").unwrap();
+        assert_eq!(solo.mode, ProfileMode::Replace);
+        assert_eq!(solo.role, Role::Worker);
+
+        // If the ONLY worker file is replace-mode, auto yields nothing.
+        let dir2 = tempfile::tempdir().unwrap();
+        let agents2 = dir2.path().join(".github").join("agents");
+        fs::create_dir_all(&agents2).unwrap();
+        fs::write(agents2.join("solo.md"), "---\nrole: worker\nmode: replace\n---\nContract.").unwrap();
+        let only_replace = discover_profiles(&dir2.path().to_string_lossy());
+        assert!(
+            profile_for_role(&only_replace, Role::Worker).is_none(),
+            "a lone replace-mode file does not auto-apply — it must be chosen explicitly"
+        );
+        assert!(find_named(&only_replace, "solo").is_some());
     }
 
     #[test]

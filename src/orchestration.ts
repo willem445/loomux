@@ -53,6 +53,14 @@ export interface OrchestratorConfig {
    *  Repo role *instructions* always apply; only this code-exec surface is
    *  gated. */
   trustRepoMcp: boolean;
+  /** Manual per-role profile assignment (issue #51): the `.github/agents`
+   *  profile NAME the human picked for each role, overriding filename/frontmatter
+   *  auto-mapping. "" = auto (append file mapped to the role, if any); "none" =
+   *  built-in only; else a profile name (any mode, incl. replace). */
+  orchestratorProfile: string;
+  workerProfile: string;
+  reviewerProfile: string;
+  plannerProfile: string;
   /** Cost guardrail: auto-kill an idle worker/reviewer after this many
    *  minutes without a task (0 = disabled). */
   idleKillMinutes: number;
@@ -84,6 +92,9 @@ export interface RepoProfile {
   name: string;
   /** loomux role this profile addends: orchestrator|worker|reviewer|planner. */
   role: string;
+  /** "append" (default) or "replace" — replace swaps the persona body while
+   *  loomux still injects its mechanics core. Replace never auto-applies. */
+  mode: string;
   description: string;
   model: string | null;
   allow: string[];
@@ -256,6 +267,10 @@ export async function launchOrchestrator(
     plannerModel: config.plannerModel,
     autoOps: config.autoOps,
     trustRepoMcp: config.trustRepoMcp,
+    orchestratorProfile: config.orchestratorProfile,
+    workerProfile: config.workerProfile,
+    reviewerProfile: config.reviewerProfile,
+    plannerProfile: config.plannerProfile,
     idleKillMinutes: config.idleKillMinutes,
     maxSpawnsPerHour: config.maxSpawnsPerHour,
     watchdogStallMinutes: config.watchdogStallMinutes,

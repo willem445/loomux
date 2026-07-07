@@ -373,6 +373,17 @@ pub struct Guardrails {
     /// has explicitly trusted this repo. Repo role *instructions* always
     /// apply (text, not code); only the MCP/code-exec surface is gated.
     pub trust_repo_mcp: bool,
+    /// Manual per-role profile assignment (issue #51): the profile NAME the
+    /// human explicitly picked for each role in the launcher, overriding the
+    /// filename/frontmatter auto-mapping. Semantics of each string:
+    ///   - empty  → auto (append-mode file mapped to the role, if any),
+    ///   - `none` → explicit built-in only (no profile, even if one matches),
+    ///   - `<name>` → that named profile (any mode, incl. replace).
+    /// Additive in group.json; absent = auto (back-compat).
+    pub orchestrator_profile: String,
+    pub worker_profile: String,
+    pub reviewer_profile: String,
+    pub planner_profile: String,
     /// Cost guardrail: auto-kill a worker/reviewer that has sat without a
     /// task for this many minutes (the orchestrator is notified so it can
     /// respawn on demand). 0 disables it. See `idle_should_kill`.
@@ -438,6 +449,18 @@ impl Guardrails {
             Role::Worker => &self.worker_model,
             Role::Reviewer => &self.reviewer_model,
             Role::Planner => &self.planner_model,
+        }
+    }
+
+    /// The human's manual profile choice for a role (issue #51): a profile
+    /// name, the literal `none` (force built-in), or empty (auto). See the
+    /// field docs and `OrchRegistry::resolve_profile`.
+    pub fn profile_for(&self, role: Role) -> &str {
+        match role {
+            Role::Orchestrator => &self.orchestrator_profile,
+            Role::Worker => &self.worker_profile,
+            Role::Reviewer => &self.reviewer_profile,
+            Role::Planner => &self.planner_profile,
         }
     }
 }
@@ -1259,6 +1282,67 @@ fn render_template(tpl: &str, vars: &[(&str, &str)]) -> String {
     out
 }
 
+/// The **non-overridable loomux mechanics core** for a role (issue #51).
+///
+/// A repo profile in `mode: replace` swaps only the role's *personality/policy*
+/// body — it must NOT be able to strip the functional contract that makes the
+/// app work (the loomux MCP tools, the task board, `report()` discipline, the
+/// spawn/review/plan flow, the branch→PR git discipline). loomux always injects
+/// this core so those guarantees hold no matter what a replace-mode file omits.
+/// In `append` mode (and profile-less spawns) the full built-in `<role>.md`
+/// template already carries these mechanics, so the core is delivered only when
+/// a replace-mode persona has dropped the built-in body.
+///
+/// This is the extracted, always-on subset of the built-in templates; a fuller
+/// split of every template into `mechanics + body` files is follow-up work.
+fn mechanics_core(role: Role) -> String {
+    // Shared spine for every delegate; the orchestrator gets its own.
+    let common = "\
+These loomux mechanics are guaranteed by the app and are NOT optional, whatever your \
+persona says:\n\
+- You act through the loomux MCP tools. `report(status, summary)` (status: progress | \
+done | blocked) is your channel to the orchestrator — report `progress` on start, \
+`blocked` when stuck (say what you need), and `done` with the PR URL. \
+`message_orchestrator(text)` is for questions; `list_agents()` / `get_state()` are \
+read-only context. These tools never need approval; use them, don't ask the human to.\n\
+- Git discipline: work only in your assigned workspace; create your branch off the \
+default branch before changing anything; never commit to the default branch; open a PR \
+with `gh` linking the issue. NEVER merge — the human gates merges.\n\
+- One task per session. Follow-ups and review fixes for your own task are yours; a \
+different task means asking for a fresh agent.";
+    match role {
+        Role::Orchestrator => "\
+These loomux mechanics are guaranteed by the app and are NOT optional, whatever your \
+persona says:\n\
+- You drive the group through the loomux MCP tools: `spawn_agent` (worker | reviewer | \
+planner, with an optional `profile`), `send_prompt`, `get_output`, `kill_agent`, \
+`focus_agent`, `rename_agent`; the shared task board via `list_tasks` / `upsert_task` / \
+`remove_task`; and durable state via `get_state` / `set_state`. Guardrails (live-agent \
+cap, per-role CLI + model) are enforced by loomux.\n\
+- Maintain the task board: it is the human's view of the work. Record each agent's \
+`session` id on its task so finished work can be resumed for follow-ups instead of \
+cold-started. Never disturb a busy worker with a new task.\n\
+- Drive the flow: plan → spawn workers/reviewers/planners → branch → PR → review → human \
+merge gate. You never merge; you surface work at the gate for the human.\n\
+- Use `report`/`message_orchestrator` semantics from your delegates as their status \
+channel; keep the human oriented with short summaries."
+            .to_string(),
+        Role::Worker => format!(
+            "{common}\n- Deliverable: a branch → commit → PR with the project's tests green. \
+             Add tests that would fail if the feature regressed."
+        ),
+        Role::Reviewer => format!(
+            "{common}\n- You review PRs via `gh` (checking out the PR branch locally is fine); \
+             you do NOT create branches or push. Report findings via `report`/`message_orchestrator`."
+        ),
+        Role::Planner => format!(
+            "{common}\n- You explore the codebase READ-ONLY and write an implementation plan as a \
+             GitHub issue comment, then `report` and exit. You never write code, branches, \
+             worktrees, or PRs (loomux also denies those at the CLI level)."
+        ),
+    }
+}
+
 /// Strip ANSI escape sequences (CSI, OSC, two-byte ESC) and carriage
 /// returns so `get_output` returns readable text from raw terminal bytes.
 pub fn strip_ansi(bytes: &[u8]) -> String {
@@ -2042,6 +2126,11 @@ impl OrchRegistry {
                 // Additive (issue #51): absent in older group.json → false
                 // (repo MCP stays gated off until the human opts in).
                 trust_repo_mcp: g["trust_repo_mcp"].as_bool().unwrap_or(false),
+                // Manual per-role profile assignment (issue #51); absent = auto.
+                orchestrator_profile: s("orchestrator_profile", ""),
+                worker_profile: s("worker_profile", ""),
+                reviewer_profile: s("reviewer_profile", ""),
+                planner_profile: s("planner_profile", ""),
                 idle_kill_minutes: g["idle_kill_minutes"].as_u64().unwrap_or(0) as u32,
                 max_spawns_per_hour: g["max_spawns_per_hour"].as_u64().unwrap_or(0) as u32,
                 watchdog_stall_minutes: g["watchdog_stall_minutes"].as_u64().unwrap_or(0) as u32,
@@ -2101,6 +2190,10 @@ impl OrchRegistry {
                     "planner_model": info.guardrails.planner_model,
                     "auto_ops": info.guardrails.auto_ops,
                     "trust_repo_mcp": info.guardrails.trust_repo_mcp,
+                    "orchestrator_profile": info.guardrails.orchestrator_profile,
+                    "worker_profile": info.guardrails.worker_profile,
+                    "reviewer_profile": info.guardrails.reviewer_profile,
+                    "planner_profile": info.guardrails.planner_profile,
                     "idle_kill_minutes": info.guardrails.idle_kill_minutes,
                     "max_spawns_per_hour": info.guardrails.max_spawns_per_hour,
                     "watchdog_stall_minutes": info.guardrails.watchdog_stall_minutes,
@@ -3275,6 +3368,85 @@ impl OrchRegistry {
         }))
     }
 
+    /// Resolve the repo profile that shapes an agent of `role` (issue #51),
+    /// applying the precedence: explicit `spawn_agent(profile:)` name > manual
+    /// per-role assignment (persisted in group.json) > auto role-mapping
+    /// (append-mode files only) > built-in. Re-reads `.github/agents/*.md`
+    /// fresh so edits apply to the next spawn.
+    fn resolve_profile(
+        &self,
+        group: &GroupInfo,
+        role: Role,
+        explicit: Option<&str>,
+    ) -> Result<Option<profiles::AgentProfile>, String> {
+        let all = profiles::discover_profiles(&group.repo);
+        // 1. Explicit named profile — the orchestrator's deliberate choice.
+        if let Some(name) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
+            return match profiles::find_named(&all, name) {
+                Some(p) => Ok(Some(p.clone())),
+                None => {
+                    let names: Vec<&str> = all.iter().map(|p| p.name.as_str()).collect();
+                    Err(format!(
+                        "unknown profile {name:?}. Available profiles: {}",
+                        if names.is_empty() {
+                            "none — define <repo>/.github/agents/<name>.md".to_string()
+                        } else {
+                            names.join(", ")
+                        }
+                    ))
+                }
+            };
+        }
+        // 2. Manual per-role assignment from the launcher.
+        match group.guardrails.profile_for(role).trim() {
+            "" => {} // fall through to auto
+            "none" | "built-in" => return Ok(None),
+            name => {
+                if let Some(p) = profiles::find_named(&all, name) {
+                    return Ok(Some(p.clone()));
+                }
+                // The pinned file was removed; fall back to auto rather than
+                // failing the spawn, and note it.
+                self.audit(&group.id, "loomux", "warning", json!({
+                    "what": "assigned profile not found — falling back to auto/built-in",
+                    "role": role.as_str(), "profile": name,
+                }));
+            }
+        }
+        // 3. Auto role-mapping — append-mode files only (replace never auto-applies).
+        Ok(profiles::profile_for_role(&all, role).cloned())
+    }
+
+    /// Render a profile's persona to a per-agent brief and return its path. The
+    /// file name encodes the mode (`<id>.replace.md` vs `<id>.md`) so
+    /// `kickoff_prompt` honors replace without threading state through the bind
+    /// thread. For a replace-mode profile, loomux also (idempotently) writes the
+    /// role's non-overridable **mechanics core** — the persona body is replaced,
+    /// but the functional contract (MCP tools, board, report(), git flow) is
+    /// still guaranteed by loomux, not the repo file (issue #51).
+    fn write_profile_brief(
+        &self,
+        group_id: &str,
+        agent_id: &str,
+        repo: &str,
+        p: &profiles::AgentProfile,
+    ) -> Result<PathBuf, String> {
+        let dir = self.group_dir(group_id).join("profiles");
+        fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let vars = [("REPO", repo), ("GROUP_ID", group_id)];
+        let fname = match p.mode {
+            profiles::ProfileMode::Replace => format!("{agent_id}.replace.md"),
+            profiles::ProfileMode::Append => format!("{agent_id}.md"),
+        };
+        let path = dir.join(fname);
+        fs::write(&path, render_template(&p.instructions, &vars)).map_err(|e| e.to_string())?;
+        if p.mode == profiles::ProfileMode::Replace {
+            let mech = self.group_dir(group_id).join(format!("{}.mechanics.md", p.role.as_str()));
+            fs::write(&mech, mechanics_core(p.role)).map_err(|e| e.to_string())?;
+        }
+        Ok(path)
+    }
+
     /// Render the role instruction docs into the group dir so kickoff
     /// prompts can reference them by path instead of pasting pages of text.
     fn write_instruction_files(&self, g: &GroupInfo) -> Result<(), String> {
@@ -3617,34 +3789,12 @@ impl OrchRegistry {
     ) -> Result<AgentEntry, String> {
         let group = self.group(group_id).ok_or("unknown group")?;
 
-        // Resolve the repo profile that shapes this agent (issue #51), re-read
-        // fresh from the repo so edits to .github/agents/*.md apply to the next
-        // spawn without relaunching. Two paths:
-        //   * an explicit `profile` name (orchestrator's `spawn_agent(profile:)`)
-        //     — errors with the available list if unknown; else
-        //   * the role addendum: the repo file mapped to this spawn's role.
-        // A named profile's own role mapping wins over the requested `role`
-        // (e.g. a `kind: reviewer` persona spawns as a reviewer).
-        let all_profiles = profiles::discover_profiles(&group.repo);
-        let profile = match profile.map(|p| p.trim().to_string()).filter(|p| !p.is_empty()) {
-            Some(wanted) => match profiles::find_named(&all_profiles, &wanted) {
-                Some(p) => Some(p.clone()),
-                None => {
-                    let names: Vec<String> = all_profiles.iter().map(|p| p.name.clone()).collect();
-                    return Err(format!(
-                        "unknown profile {wanted:?}. Available profiles: {}",
-                        if names.is_empty() {
-                            "none — define <repo>/.github/agents/<name>.md".to_string()
-                        } else {
-                            names.join(", ")
-                        }
-                    ));
-                }
-            },
-            None => profiles::profile_for_role(&all_profiles, role).cloned(),
-        };
-        // A named profile may retarget the role (its `role`/`kind` mapping);
-        // a role-addendum profile already matches `role` by construction.
+        // Resolve the repo profile that shapes this agent (issue #51): explicit
+        // spawn_agent(profile:) name > manual per-role assignment > auto
+        // role-mapping (append-only) > built-in. Re-read fresh per spawn.
+        let profile = self.resolve_profile(&group, role, profile.as_deref())?;
+        // A named/assigned profile may retarget the role (its `role`/`kind`
+        // mapping); an auto role-addendum already matches `role` by construction.
         let role = profile.as_ref().map(|p| p.role).unwrap_or(role);
 
         // Guardrail: live delegate cap (the orchestrator itself is exempt).
@@ -3771,14 +3921,7 @@ impl OrchRegistry {
         // code-execution surface.
         let trust = group.guardrails.trust_repo_mcp;
         let profile_brief: Option<PathBuf> = match &profile {
-            Some(p) => {
-                let dir = self.group_dir(group_id).join("profiles");
-                fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-                let path = dir.join(format!("{agent_id}.md"));
-                let vars = [("REPO", group.repo.as_str()), ("GROUP_ID", group_id)];
-                fs::write(&path, render_template(&p.instructions, &vars)).map_err(|e| e.to_string())?;
-                Some(path)
-            }
+            Some(p) => Some(self.write_profile_brief(group_id, &agent_id, &group.repo, p)?),
             None => None,
         };
         // Claude needs the repo's `.mcp.json` merged (strict mode suppresses
@@ -3864,9 +4007,11 @@ impl OrchRegistry {
             "agent": agent_id, "role": role, "name": display, "cwd": cwd,
             "cli": cli, "model": model, "worktree": use_worktree, "branch": branch_name, "task": task,
             "session": session_id, "resume": resume,
-            // issue #51: which repo profile shaped this agent, and whether the
-            // repo's MCP/code-exec surface was trusted for it.
+            // issue #51: which repo profile shaped this agent, its mode
+            // (append|replace), and whether the repo's MCP/code-exec surface
+            // was trusted for it.
             "profile": profile.as_ref().map(|p| p.name.clone()),
+            "profile_mode": profile.as_ref().map(|p| p.mode.as_str()),
             "trust_repo_mcp": group.guardrails.trust_repo_mcp,
         }));
         // Breadcrumb (no prompt/task text): ids + role only.
@@ -3956,20 +4101,43 @@ impl OrchRegistry {
 
     #[doc(hidden)] // pub for integration tests
     pub fn kickoff_prompt(&self, a: &AgentEntry, g: &GroupInfo, branch_note: &str) -> String {
-        let instructions = self.group_dir(&g.id).join(a.role.instructions_file());
-        // Repo persona brief for this agent, if one was rendered at spawn
-        // (issue #51). Referenced in the kickoff so the persona reaches BOTH
-        // CLIs as text, independent of the Claude system-prompt / Copilot
-        // --agent injection.
-        let brief = self.group_dir(&g.id).join("profiles").join(format!("{}.md", a.id));
-        let brief_note = if brief.is_file() {
-            format!(
-                "\nThis repo defines a custom profile for your role — read it and treat it as an \
-                 addendum to (not a replacement for) your role instructions above: {}",
-                brief.display()
+        // Which file the agent reads as its ROLE INSTRUCTIONS, and any note
+        // about a profile (issue #51). A per-agent brief written at spawn
+        // encodes the mode in its name: `<id>.replace.md` (replace) vs
+        // `<id>.md` (append).
+        //   - replace: the persona body IS the role instructions; loomux's
+        //     non-overridable mechanics core is delivered alongside, so the
+        //     functional contract (MCP tools, board, report(), git/PR flow)
+        //     holds even though the built-in role body is gone.
+        //   - append: the built-in `<role>.md` is the base; the brief is an
+        //     addendum read on top of it.
+        let profiles_dir = self.group_dir(&g.id).join("profiles");
+        let replace_brief = profiles_dir.join(format!("{}.replace.md", a.id));
+        let append_brief = profiles_dir.join(format!("{}.md", a.id));
+        let (instructions, brief_note) = if replace_brief.is_file() {
+            let mechanics = self.group_dir(&g.id).join(format!("{}.mechanics.md", a.role.as_str()));
+            (
+                replace_brief.clone(),
+                format!(
+                    "\nThat file is this repo's REPLACE-mode role instructions — your \
+                     personality/policy fully replaces loomux's built-in role body. loomux's \
+                     functional mechanics are NON-overridable and are specified separately; read \
+                     and obey them too: {}",
+                    mechanics.display()
+                ),
             )
         } else {
-            String::new()
+            let built_in = self.group_dir(&g.id).join(a.role.instructions_file());
+            let note = if append_brief.is_file() {
+                format!(
+                    "\nThis repo also defines a custom profile for your role — read it and treat \
+                     it as an addendum to (not a replacement for) your role instructions above: {}",
+                    append_brief.display()
+                )
+            } else {
+                String::new()
+            };
+            (built_in, note)
         };
         match a.role {
             Role::Orchestrator => {
@@ -4482,6 +4650,12 @@ pub fn create_orchestration(
     // Trust this repo's agent config for local code execution (issue #51).
     // Default off; the launcher sends the toggle state.
     trust_repo_mcp: bool,
+    // Manual per-role profile assignment (issue #51): the profile name picked
+    // per role in the launcher ("" = auto, "none" = built-in, else a name).
+    orchestrator_profile: String,
+    worker_profile: String,
+    reviewer_profile: String,
+    planner_profile: String,
     idle_kill_minutes: u32,
     max_spawns_per_hour: u32,
     watchdog_stall_minutes: u32,
@@ -4502,6 +4676,10 @@ pub fn create_orchestration(
             planner_model,
             auto_ops,
             trust_repo_mcp,
+            orchestrator_profile,
+            worker_profile,
+            reviewer_profile,
+            planner_profile,
             idle_kill_minutes,
             max_spawns_per_hour,
             watchdog_stall_minutes,
@@ -4524,6 +4702,7 @@ pub fn orch_discover_repo_config(repo: String) -> Value {
         .map(|p| json!({
             "name": p.name,
             "role": p.role.as_str(),
+            "mode": p.mode.as_str(),
             "description": p.description,
             "model": p.model,
             "allow": p.allow,
@@ -4695,23 +4874,15 @@ fn register_orchestrator_pane(
         pre_trust_copilot_folder(&group.repo);
     }
 
-    // Repo orchestrator addendum (issue #51): the human's "always branch + PR,
-    // never push to main"-style secondary prompt. loomux still owns the
-    // orchestrator base contract; a `.github/agents/orchestrator.md` appends to
-    // it. Rendered to a brief the kickoff references and (on Claude) injected as
-    // the appended system prompt. Repo MCP + Copilot --agent gated on trust.
+    // Repo orchestrator profile (issue #51): the human's "always branch + PR,
+    // never push to main"-style secondary prompt, or a full replace-mode
+    // personality. loomux always injects the orchestrator mechanics core, so
+    // even a replace profile keeps the board/spawn/report contract. Resolved
+    // via the same precedence as a delegate (manual assignment > auto).
     let trust = group.guardrails.trust_repo_mcp;
-    let orch_profile =
-        profiles::discover_profiles(&group.repo).into_iter().find(|p| p.role == Role::Orchestrator);
+    let orch_profile = reg.resolve_profile(group, Role::Orchestrator, None)?;
     let profile_brief: Option<PathBuf> = match &orch_profile {
-        Some(p) => {
-            let dir = reg.group_dir(&group.id).join("profiles");
-            fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-            let path = dir.join(format!("{agent_id}.md"));
-            let vars = [("REPO", group.repo.as_str()), ("GROUP_ID", group.id.as_str())];
-            fs::write(&path, render_template(&p.instructions, &vars)).map_err(|e| e.to_string())?;
-            Some(path)
-        }
+        Some(p) => Some(reg.write_profile_brief(&group.id, &agent_id, &group.repo, p)?),
         None => None,
     };
     let extra_servers = if cli == "claude" && trust {

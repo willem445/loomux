@@ -103,28 +103,49 @@ precedence order: (1) an explicit frontmatter `role:` (or `kind:`), (2) the file
 is a worker persona). Optional loomux extensions: `model:` (overrides the role's pinned
 model, sanitized), `allow:` (extra pre-approved tool patterns, sanitized).
 
-**Injection — profiles APPEND, never replace.** The built-in role contract
-(`worker.md`'s report/git-workflow guarantees, etc.) is always the base; a repo profile is
-an *addendum*. Two application paths:
+**Append vs replace (`mode:`), and the non-overridable mechanics core.** A profile's
+frontmatter `mode:` decides how it relates to the built-in role contract:
 
-- **Role addendum (automatic).** When an agent of role R spawns, the repo file mapped to R
-  (if any) is applied. This is the "one agent.md per block/role" model — every worker in
-  the repo picks up `.github/agents/worker.md`; an `orchestrator.md` is the human's
-  "always branch + PR, never push to main" secondary prompt.
-- **Named persona (explicit).** `spawn_agent(profile: "<name>")` picks a persona by name;
-  its own `role`/`kind` mapping can retarget the spawn (e.g. a reviewer persona spawns as a
-  reviewer). Unknown names error with the available list.
+- **`mode: append` (default)** — the repo instructions are an *addendum*; the built-in
+  `<role>.md` (which carries both mechanics and the built-in persona/policy) is still the
+  base, and the repo text is layered on top.
+- **`mode: replace`** — the repo instructions become the agent's *sole* role
+  personality/policy. Critically, this replaces only the **persona body**, not loomux's
+  functional mechanics: loomux always injects a **mechanics core** — `mechanics_core(role)`,
+  the non-overridable subset covering the loomux MCP tools, the task board, `report()`
+  discipline, the spawn/review/plan flow, and the branch→PR git discipline — so the app
+  keeps working even if a replace file omits all of it. The kickoff points a replace agent
+  at the persona body as its role instructions AND at `<group_dir>/<role>.mechanics.md` as
+  the mechanics it must also obey; it does not reference the built-in `<role>.md` body.
+  (Fuller work: split every built-in template into `mechanics + body` files so append mode
+  composes them too; today the mechanics core is an extracted always-on guarantee delivered
+  only when a replace persona has dropped the built-in body.)
 
-The rendered brief is written to `<group_dir>/profiles/<agent_id>.md` and the kickoff
-references it, so the persona reaches **both** CLIs as text regardless of CLI. Additionally,
-per CLI: **Claude** gets `--append-system-prompt-file <brief>` (appends to Claude's built-in
-system prompt) and the profile's `allow:` patterns extend the single `--allowedTools` list
-(a second flag would replace the first and silently drop the loomux MCP approval).
-**Copilot** engages the persona via its native `--agent <name>` (which resolves the same
-`.github/agents` file) and `allow:` becomes `--allow-tool` entries.
+**Safety rail:** a replace-mode profile **never auto-applies by role** (`profile_for_role`
+skips it) — it would wipe the built-in body, so it activates only when *explicitly* chosen
+(a named `spawn_agent(profile:)` or a manual per-role launcher assignment). Auto
+role-mapping only picks append-mode files.
 
-Precedence overall: **profile file → built-in role template**, with the profile appending.
-(A launcher/group override layer, Option D in the #51 investigation, is future work.)
+**Three application paths, by precedence.** For a spawn of role R:
+
+1. **Explicit named** — `spawn_agent(profile: "<name>")`; the orchestrator's deliberate
+   pick (any mode). Its own `role`/`kind` mapping can retarget the spawn. Unknown → error
+   with the available list.
+2. **Manual per-role assignment** — the human's launcher choice, persisted in `group.json`
+   as `{role}_profile`: a profile name (any mode), the literal `none` (force built-in), or
+   empty (fall through to auto).
+3. **Auto role-mapping** — the first *append-mode* file mapped to R (the "one agent.md per
+   role" model). Replace files are excluded here (safety rail above).
+4. Else the built-in role contract, unmodified.
+
+The rendered brief is written per-agent to `<group_dir>/profiles/<agent_id>.md` (append) or
+`…/<agent_id>.replace.md` (replace) — the file name encodes the mode so the kickoff honors
+it without threading state through the pane-bind thread. The brief is referenced in the
+kickoff (both CLIs). Additionally, per CLI: **Claude** gets `--append-system-prompt-file
+<brief>` and the profile's `allow:` patterns extend the single `--allowedTools` list (a
+second flag would replace the first and silently drop the loomux MCP approval). **Copilot**
+engages the persona via its native `--agent <name>` and `allow:` becomes `--allow-tool`
+entries.
 
 **MCP connectors — repo `.mcp.json`, trust-gated.** Repo-declared MCP servers are merged
 into a **Claude** agent's per-agent config (`write_mcp_config`'s `extra_servers`), because
@@ -147,9 +168,10 @@ text, just without the native engagement. Copilot's CLI does **not** consume a r
 `.mcp.json` the way Claude does (its MCP lives in `~/.copilot/mcp-config.json` +
 per-agent `mcp-servers` frontmatter), so the `.mcp.json` merge is Claude-only by design;
 this asymmetry is inherent to the two CLIs, not a loomux limitation. Prototype grade:
-instructions/MCP injection + the trust gate are wired and unit-tested; a launcher-authored
-per-role override layer and a workflow-builder GUI (issue-comment idea) are tracked
-separately.
+instructions/MCP injection, the append/replace mode split with the guaranteed mechanics
+core, manual per-role assignment (launcher + `group.json`), and the trust gate are wired and
+tested; a full template split into `mechanics + body` files and a block-diagram
+workflow-builder GUI (issue-comment idea) are tracked separately.
 
 ### Pane naming & rename precedence (#95r)
 
@@ -187,10 +209,14 @@ with the pane's `W <seq>` badge (issue #75), never disagree with it. Two rules:
   Changing a role's CLI re-populates its model suggestions; every distinct role CLI is
   PATH-checked before launch so a missing CLI fails fast and legibly. A **repo agent
   config** field (issue #51) previews the selected repo's discovered `.github/agents/*.md`
-  profiles (`name → role`) and `.mcp.json` server names, with a default-off **"trust this
-  repo's agent config"** toggle that gates the repo-MCP merge / native Copilot persona (the
-  code-exec surface). The preview refreshes as the repo path changes; the toggle resets to
-  off every time the dialog opens.
+  profiles (`name → role`, replace-mode flagged) and `.mcp.json` server names; a per-role
+  **Agent profile** dropdown row (orchestrator / worker / reviewer / planner) lets the human
+  pick which file applies to each role — `Auto` (filename/frontmatter, the default
+  preselection, showing what it resolves to) / `Built-in (no profile)` / any discovered
+  profile — persisted to `group.json` as `{role}_profile`; and a default-off **"trust this
+  repo's agent config"** toggle gates the repo-MCP merge / native Copilot persona (the
+  code-exec surface). The preview + dropdowns refresh as the repo path changes; the toggle
+  and assignments reset every time the dialog opens.
 
 ## Persistence & resume
 

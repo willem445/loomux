@@ -354,17 +354,22 @@ personas and tool servers using the standard **GitHub Copilot agents.md
 convention** — `.github/agents/<name>.md` — and loomux discovers them from the
 workspace, no loomux-specific config. A file's name (or a `role:` frontmatter
 key) maps it to a loomux role: `worker.md`, `reviewer.md`, `planner.md`, and an
-`orchestrator.md` for repo-specific orchestrator rules (e.g. "always branch +
-PR, never push to main"). Profiles **append to** loomux's built-in role
-contract, never replace it. On Claude the persona is injected as the agent's
-system prompt; on Copilot via its native `--agent`. The orchestrator can also
-spawn a named specialist with `spawn_agent(profile: "<name>")`. MCP tool servers
-come from the repo's standard `.mcp.json` and merge into agents **only when you
-tick "trust this repo's agent config"** in the launcher (default off — a repo
-MCP server is an arbitrary command loomux would run locally); the loomux
-identity server can never be shadowed. The launcher previews a repo's discovered
-profiles and MCP servers before you launch. See
-[demo/repo-agents](doc/demo/repo-agents.md) for a walkthrough.
+`orchestrator.md` for repo-specific orchestrator rules. This repo ships working
+[examples](.github/agents). Each profile is either **`mode: append`** (default —
+layers on loomux's built-in role contract) or **`mode: replace`** (swaps the
+role's personality/policy entirely). Even in replace mode loomux always injects a
+non-overridable **mechanics core** — the MCP tools, task board, `report()`
+discipline, and branch→PR flow — so an agent stays functional no matter what a
+replace file omits; replace-mode files never auto-apply and must be chosen
+explicitly. In the launcher you pick, **per role**, which `.github/agents` file
+applies (Auto / built-in / any profile), persisted with the group. On Claude the
+persona is injected as the agent's system prompt; on Copilot via its native
+`--agent`. The orchestrator can also spawn a named specialist with
+`spawn_agent(profile: "<name>")`. MCP tool servers come from the repo's standard
+`.mcp.json` and merge into agents **only when you tick "trust this repo's agent
+config"** in the launcher (default off — a repo MCP server is an arbitrary
+command loomux would run locally); the loomux identity server can never be
+shadowed. See [demo/repo-agents](doc/demo/repo-agents.md) for a walkthrough.
 
 **Guardrails** are enforced by loomux, not the model: a cap on live agents
 (≤12, set at launch and adjustable live from the lifecycle panel), models

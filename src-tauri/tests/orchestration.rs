@@ -761,6 +761,71 @@ fn repo_profiles_apply_and_repo_mcp_is_trust_gated_with_reserved_loomux() {
     );
 }
 
+/// Manual per-role assignment (issue #51) overrides auto-mapping, `none` forces
+/// built-in, and a REPLACE-mode profile — which never auto-applies — is still
+/// selectable explicitly. In replace mode loomux points the agent at the
+/// persona body AND writes the non-overridable mechanics core, so the
+/// functional contract survives even when the persona drops the built-in body.
+#[test]
+fn manual_role_assignment_and_replace_mode_keep_the_mechanics_core() {
+    let repo = tempfile::tempdir().unwrap();
+    let agents = repo.path().join(".github").join("agents");
+    fs::create_dir_all(&agents).unwrap();
+    fs::write(agents.join("worker.md"), "---\ndescription: append worker\n---\nRun make check before every PR.").unwrap();
+    fs::write(
+        agents.join("solo.agent.md"),
+        "---\nrole: worker\nmode: replace\n---\nYou are a solo cowboy. Ship fast and trust yourself.",
+    )
+    .unwrap();
+    let repo_str = repo.path().to_string_lossy().into_owned();
+    let brief_path = |reg: &OrchRegistry, gid: &str, id: &str, ext: &str| {
+        reg.state_root().join(gid).join("profiles").join(format!("{id}.{ext}"))
+    };
+
+    // (a) Default: auto-mapping picks the append worker; kickoff references the
+    //     built-in role file + the addendum, never a replace body.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group(&repo_str, rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    assert!(brief_path(&reg, &g.id, &w.id, "md").is_file(), "auto append worker brief is <id>.md");
+    let ko = reg.kickoff_prompt(&w, &g, "note");
+    assert!(ko.contains("worker.md"), "append mode references the built-in role file");
+    assert!(ko.contains("addendum"), "append brief is framed as an addendum");
+    assert!(!ko.contains(".replace.md"), "no replace body in append mode");
+
+    // (b) Manual `none` forces built-in even though worker.md would auto-apply.
+    let (reg2, _d2) = test_registry();
+    let g2 = reg2.create_group(&repo_str, Guardrails { worker_profile: "none".into(), ..rails() }).unwrap();
+    let w2 = reg2.spawn_agent(&g2.id, Role::Worker, "w", "t", false, None).unwrap();
+    assert!(!brief_path(&reg2, &g2.id, &w2.id, "md").is_file(), "'none' writes no profile brief");
+    assert!(!brief_path(&reg2, &g2.id, &w2.id, "replace.md").is_file());
+
+    // (c) Manual assignment of a REPLACE-mode file: it applies (explicit),
+    //     writes the persona as <id>.replace.md, and loomux guarantees the
+    //     mechanics core so the functional contract is not lost.
+    let (reg3, _d3) = test_registry();
+    let g3 = reg3.create_group(&repo_str, Guardrails { worker_profile: "solo".into(), ..rails() }).unwrap();
+    let w3 = reg3.spawn_agent(&g3.id, Role::Worker, "w", "t", false, None).unwrap();
+    let replace_brief = brief_path(&reg3, &g3.id, &w3.id, "replace.md");
+    assert!(replace_brief.is_file(), "a replace-mode assignment writes <id>.replace.md");
+    assert!(fs::read_to_string(&replace_brief).unwrap().contains("solo cowboy"));
+    assert!(!brief_path(&reg3, &g3.id, &w3.id, "md").is_file(), "replace does not also write an append brief");
+    let mech = reg3.state_root().join(&g3.id).join("worker.mechanics.md");
+    assert!(mech.is_file(), "loomux writes the non-overridable mechanics core in replace mode");
+    let mtext = fs::read_to_string(&mech).unwrap();
+    assert!(
+        mtext.contains("report(") && mtext.contains("never commit to the default branch"),
+        "the mechanics core carries the functional contract a replace persona must not lose"
+    );
+    let ko3 = reg3.kickoff_prompt(&w3, &g3, "note");
+    assert!(ko3.contains(".replace.md"), "replace kickoff points the agent at the persona body");
+    assert!(
+        ko3.contains("worker.mechanics.md") && ko3.contains("NON-overridable"),
+        "replace kickoff still injects the loomux mechanics core"
+    );
+    assert!(!ko3.contains("worker.md"), "replace mode does not reference the built-in role body");
+}
+
 fn copilot_rails() -> Guardrails {
     let mut r = rails();
     r.agent_cli = "copilot".into();

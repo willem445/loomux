@@ -602,6 +602,10 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   font-size: 11px; color: var(--text-dim); cursor: pointer; line-height: 1.35;
 }
 .dlg-check { margin-top: 2px; flex: none; }
+.dlg-role-name {
+  flex: 0 0 84px; align-self: center;
+  font-size: 11px; color: var(--text-dim); text-transform: capitalize;
+}
 .dlg-row { display: flex; gap: 6px; }
 .dlg-row > input { flex: 1; min-width: 0; }
 .dlg-row > .dlg-field { flex: 1; min-width: 0; }

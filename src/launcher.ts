@@ -11,7 +11,7 @@
 import { open } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
 import { gitWorktreeAdd } from "./git";
-import type { OrchestratorConfig, RepoConfigPreview } from "./orchestration";
+import type { OrchestratorConfig, RepoConfigPreview, RepoProfile } from "./orchestration";
 import { discoverRepoConfig } from "./orchestration";
 import {
   AGENTS,
@@ -220,6 +220,12 @@ export class AgentLauncher {
   /** Read-only preview of what the selected repo contributes: discovered
    *  `.github/agents/*.md` profiles + `.mcp.json` server names (issue #51). */
   private repoConfigEl: HTMLElement;
+  /** Container for the per-role profile assignment dropdowns (issue #51),
+   *  shown only when the repo actually defines profiles. */
+  private roleProfileEl: HTMLElement;
+  /** Per-role "which agent.md applies" selects (issue #51). Value "" = auto
+   *  (filename/frontmatter), "none" = built-in, else a profile name. */
+  private roleProfileSelects: { key: OrchRole; sel: HTMLSelectElement }[];
   /** Debounce + race guard for the async repo-config discovery. */
   private repoConfigTimer: number | null = null;
   private repoConfigSeq = 0;
@@ -354,6 +360,35 @@ export class AgentLauncher {
     this.repoConfigEl = document.createElement("div");
     this.repoConfigEl.className = "dlg-repo-config opt";
     this.repoConfigEl.hidden = true;
+    // Per-role profile assignment (issue #51): one select per role. Populated
+    // from the repo's discovered profiles; hidden until the repo has any.
+    this.roleProfileSelects = ORCH_ROLES.map(({ key }) => ({
+      key,
+      sel: select([["", "Auto"]]),
+    }));
+    this.roleProfileEl = document.createElement("div");
+    this.roleProfileEl.className = "dlg-field";
+    this.roleProfileEl.hidden = true;
+    {
+      const lab = document.createElement("div");
+      lab.className = "dlg-label";
+      lab.textContent = "Agent profile per role";
+      const hint = document.createElement("span");
+      hint.className = "opt";
+      hint.textContent = " — which .github/agents file applies (Auto uses filename/frontmatter)";
+      lab.appendChild(hint);
+      this.roleProfileEl.appendChild(lab);
+      for (const { key, sel } of this.roleProfileSelects) {
+        const roleLabel = ORCH_ROLES.find((r) => r.key === key)!.label;
+        const row = document.createElement("div");
+        row.className = "dlg-row";
+        const name = document.createElement("span");
+        name.className = "dlg-role-name";
+        name.textContent = roleLabel;
+        row.append(name, sel);
+        this.roleProfileEl.appendChild(row);
+      }
+    }
     const guardRow1 = document.createElement("div");
     guardRow1.className = "dlg-row";
     guardRow1.append(
@@ -386,7 +421,7 @@ export class AgentLauncher {
     trustRow.className = "dlg-check-row";
     trustRow.append(this.trustRepoMcpInput, document.createTextNode(" Trust this repo's agent config (merge its .mcp.json + Copilot personas — runs repo-declared MCP servers locally)"));
     const trustField = field("Repo agent config (.github/agents + .mcp.json)", this.repoConfigEl);
-    trustField.append(trustRow);
+    trustField.append(this.roleProfileEl, trustRow);
     this.orchFields = document.createElement("div");
     this.orchFields.className = "dlg-field";
     this.orchFields.append(guardRow1, guardRow2, guardRow3, field("Permissions", this.permsSel), trustField);
@@ -478,6 +513,10 @@ export class AgentLauncher {
     // silently carries to the next launch.
     this.trustRepoMcpInput.checked = false;
     this.repoConfigEl.hidden = true;
+    // Per-role profile assignment resets to Auto and hides until a repo with
+    // profiles is (re)discovered.
+    this.roleProfileEl.hidden = true;
+    for (const { sel } of this.roleProfileSelects) sel.value = "";
     this.applyMode();
     this.setBusy(false);
     this.hideError();
@@ -494,8 +533,12 @@ export class AgentLauncher {
     this.applyOrchCli();
     this.updateName();
     // Preview the repo's agent config only in orchestrator mode (issue #51).
-    if (m === "orchestrator") this.scheduleRepoConfig();
-    else this.repoConfigEl.hidden = true;
+    if (m === "orchestrator") {
+      this.scheduleRepoConfig();
+    } else {
+      this.repoConfigEl.hidden = true;
+      this.roleProfileEl.hidden = true;
+    }
   }
 
   private orchCliFor(id: string): OrchCli {
@@ -640,6 +683,7 @@ export class AgentLauncher {
     const seq = ++this.repoConfigSeq;
     if (!repo) {
       this.repoConfigEl.hidden = true;
+      this.roleProfileEl.hidden = true;
       return;
     }
     let preview: RepoConfigPreview;
@@ -654,6 +698,7 @@ export class AgentLauncher {
 
   private renderRepoConfig(preview: RepoConfigPreview): void {
     const { profiles, mcp_servers: mcp } = preview;
+    this.populateRoleProfiles(profiles);
     if (profiles.length === 0 && mcp.length === 0) {
       this.repoConfigEl.hidden = true;
       return;
@@ -664,7 +709,7 @@ export class AgentLauncher {
       const line = document.createElement("div");
       line.textContent =
         "Profiles (.github/agents): " +
-        profiles.map((p) => `${p.name} → ${p.role}`).join(", ");
+        profiles.map((p) => `${p.name} → ${p.role}${p.mode === "replace" ? " (replace)" : ""}`).join(", ");
       this.repoConfigEl.append(line);
     }
     if (mcp.length > 0) {
@@ -672,6 +717,44 @@ export class AgentLauncher {
       line.textContent = `MCP servers (.mcp.json, gated by trust): ${mcp.join(", ")}`;
       this.repoConfigEl.append(line);
     }
+  }
+
+  /** Fill each role's profile dropdown from the repo's discovered profiles
+   *  (issue #51). Options: Auto (filename/frontmatter), Built-in (none), then
+   *  every profile. Default selection = Auto, whose label shows what it
+   *  currently resolves to (the first append-mode file mapping to that role).
+   *  Manual choice overrides. Hidden entirely when the repo has no profiles. */
+  private populateRoleProfiles(profiles: RepoProfile[]): void {
+    this.roleProfileEl.hidden = profiles.length === 0;
+    if (profiles.length === 0) return;
+    for (const { key, sel } of this.roleProfileSelects) {
+      // Preserve a manual choice across a repo re-scan if it still exists.
+      const prev = sel.value;
+      // Auto resolves to the first APPEND-mode profile mapping to this role —
+      // mirrors the backend's auto rule (replace never auto-applies).
+      const auto = profiles.find((p) => p.role === key && p.mode !== "replace");
+      sel.replaceChildren();
+      const opt = (value: string, label: string) => {
+        const o = document.createElement("option");
+        o.value = value;
+        o.textContent = label;
+        sel.appendChild(o);
+      };
+      opt("", `Auto — ${auto ? auto.name : "built-in"}`);
+      opt("none", "Built-in (no profile)");
+      for (const p of profiles) {
+        opt(p.name, `${p.name} [${p.role}${p.mode === "replace" ? ", replace" : ""}]`);
+      }
+      sel.value = profiles.some((p) => p.name === prev) || prev === "none" ? prev : "";
+    }
+  }
+
+  /** The manual profile choice for a role, for the launch config. */
+  private roleProfileValue(key: OrchRole): string {
+    // If the section is hidden (no profiles), everyone is Auto ("").
+    return this.roleProfileEl.hidden
+      ? ""
+      : this.roleProfileSelects.find((r) => r.key === key)?.sel.value ?? "";
   }
 
   private async launch(): Promise<void> {
@@ -735,6 +818,10 @@ export class AgentLauncher {
           plannerModel: planner.model,
           autoOps: this.permsSel.value === "auto",
           trustRepoMcp: this.trustRepoMcpInput.checked,
+          orchestratorProfile: this.roleProfileValue("orchestrator"),
+          workerProfile: this.roleProfileValue("worker"),
+          reviewerProfile: this.roleProfileValue("reviewer"),
+          plannerProfile: this.roleProfileValue("planner"),
           idleKillMinutes: intVal(this.idleKillInput, 0),
           watchdogStallMinutes: intVal(this.watchdogInput, 10),
           maxSpawnsPerHour: intVal(this.spawnRateInput, 0),
