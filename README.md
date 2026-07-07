@@ -190,6 +190,39 @@ repo's `.git` metadata (HEAD, index, refs) once a second while a pane has it
 open, and feeds the same throttled refresh a shell prompt would; it stops when
 the pane closes.
 
+### GitHub issues
+
+`Alt+I` (or the ◉ icon in a pane header) overlays a GitHub **issues** panel on
+the pane, scoped to the repository the shell is currently in — the durable
+upstream work queue, alongside the git view. Like the git view it floats over
+the terminal and **never resizes it**; press `Esc` (or ✕) to return.
+
+It reads and writes through the authenticated **`gh` CLI** — loomux stores no
+token or secret; `gh` uses whatever `gh auth login` you already have. If `gh`
+isn't installed, or you haven't logged in, the panel says so with a one-line
+hint instead of failing calls.
+
+From the panel you can:
+
+- **Browse** the repo's open issues (number, title, labels, and when each was
+  last updated), newest first. The **filter box** matches on number, title, or
+  label. Rows already carrying an agent go-signal label are marked with an
+  accent stripe.
+- **Create** an issue (＋) from a title and optional body. `Ctrl+Enter`
+  submits.
+- **Hand an issue to the orchestrator** by toggling a label directly on the
+  row: **ready** applies `agent-ready` (start work) and **investigate** applies
+  `agent-investigate` (research + a plan). That's the whole handshake — a
+  running orchestrator on this repo polls open issues and pulls any so labelled
+  onto its board; no orchestrator needs to be running when you label, since the
+  label is durable on GitHub and picked up whenever one next starts here. An
+  `agent-managed` label (set by an orchestrator that already owns the issue) is
+  shown read-only.
+- **Copy** any issue's URL (⧉) to the clipboard.
+
+The panel refreshes on open and on the ↻ button — a single cheap `gh issue
+list` call, with no background polling.
+
 ## Agent orchestration
 
 Loomux natively supports an **orchestrator / worker** pattern: a long-lived

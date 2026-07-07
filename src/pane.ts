@@ -38,6 +38,7 @@ import { makeRenameCommit } from "./panerename";
 import { swapEditor } from "./domutil";
 import { openInEditor, editorConfigDialog } from "./editor";
 import { GitView } from "./gitview";
+import { IssuesView } from "./issuesview";
 import { TasksView } from "./tasksview";
 import { AuditView } from "./auditview";
 import { GroupView } from "./groupview";
@@ -48,6 +49,8 @@ const FOLDER_ICON = `<svg viewBox="0 0 16 16" width="12" height="12" fill="none"
 const BRANCH_ICON = `<svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><circle cx="4.5" cy="3.6" r="1.7"/><circle cx="4.5" cy="12.4" r="1.7"/><circle cx="11.5" cy="5.4" r="1.7"/><path d="M4.5 5.3v5.4M11.5 7.1c0 2.4-1.9 3.1-4 3.6"/></svg>`;
 const TASKS_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><path d="M5.5 4h8M5.5 8h8M5.5 12h8"/><circle cx="2.3" cy="4" r="0.9" fill="currentColor" stroke="none"/><circle cx="2.3" cy="8" r="0.9" fill="currentColor" stroke="none"/><circle cx="2.3" cy="12" r="0.9" fill="currentColor" stroke="none"/></svg>`;
 const GIT_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><circle cx="8" cy="2.8" r="1.6"/><circle cx="4" cy="13.2" r="1.6"/><circle cx="12" cy="13.2" r="1.6"/><path d="M8 4.4v2.2M8 6.6c0 2.6-4 2.4-4 5M8 6.6c0 2.6 4 2.4 4 5"/></svg>`;
+// Issues view (Alt+I): a dot inside a circle — GitHub's open-issue glyph.
+const ISSUES_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.3"><circle cx="8" cy="8" r="5.4"/><circle cx="8" cy="8" r="1.5" fill="currentColor" stroke="none"/></svg>`;
 // Audit viewer: a clock/history glyph for the group's audit-log timeline.
 const AUDIT_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M2.2 8a5.8 5.8 0 1 1 1.7 4.1"/><path d="M2.2 12.2V8.6H5.8"/><path d="M8 5.2V8l2 1.4"/></svg>`;
 const GROUP_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="3.4" r="1.7"/><circle cx="3.4" cy="11" r="1.7"/><circle cx="12.6" cy="11" r="1.7"/><path d="M8 5.1v3M6.7 9.6 4.5 9.9M9.3 9.6l2.2.3"/></svg>`;
@@ -198,6 +201,9 @@ export class Pane {
    *  full-screen TUIs repaint from scratch, flooding scrollback with
    *  duplicate frames. */
   private gitOverlay: HTMLElement | null = null;
+  /** GitHub issues view (any pane in a git repo), same overlay mechanics. */
+  private issuesView: IssuesView | null = null;
+  private issuesOverlay: HTMLElement | null = null;
   /** Task board (orchestrator panes only), same overlay mechanics. */
   private tasksView: TasksView | null = null;
   private tasksOverlay: HTMLElement | null = null;
@@ -367,6 +373,16 @@ export class Pane {
       void editorConfigDialog().then(() => this.focus());
     });
     header.appendChild(editorBtn);
+
+    const issuesBtn = document.createElement("button");
+    issuesBtn.className = "pane-btn";
+    issuesBtn.innerHTML = ISSUES_ICON;
+    issuesBtn.title = "GitHub issues (Alt+I)";
+    issuesBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      this.toggleIssuesView();
+    });
+    header.appendChild(issuesBtn);
 
     const gitBtn = document.createElement("button");
     gitBtn.className = "pane-btn";
@@ -760,6 +776,7 @@ export class Pane {
         this.updateTermShift();
         this.focus();
       } else {
+        if (this.issuesView?.visible) this.toggleIssuesView();
         if (this.tasksOverlay && !this.tasksOverlay.hidden) this.toggleTasksView();
         if (this.auditOverlay && !this.auditOverlay.hidden) this.toggleAuditView();
         if (this.groupOverlay && !this.groupOverlay.hidden) this.toggleGroupView();
@@ -813,6 +830,43 @@ export class Pane {
     return div;
   }
 
+  /** Toggle the GitHub issues overlay. Available on any pane whose cwd is a git
+   *  repo (the view resolves the repo root itself). Same no-resize overlay
+   *  mechanics as the git view — it FLOATS over the terminal and never resizes
+   *  the PTY; only one overlay is open at a time. */
+  toggleIssuesView(): void {
+    if (!this.issuesView) {
+      this.issuesView = new IssuesView({
+        getCwd: () => this.cwdRaw,
+        onClose: () => this.toggleIssuesView(),
+      });
+      this.issuesOverlay = document.createElement("div");
+      this.issuesOverlay.className = "git-overlay";
+      this.issuesOverlay.hidden = true;
+      this.issuesOverlay.append(
+        this.issuesView.el,
+        this.makeOverlayDivider(() => this.issuesOverlay!)
+      );
+      this.el.appendChild(this.issuesOverlay);
+    }
+    if (this.issuesView.visible) {
+      this.issuesView.hide();
+      this.issuesOverlay!.hidden = true;
+      this.updateTermShift();
+      this.focus();
+    } else {
+      if (this.gitView?.visible) this.toggleGitView();
+      if (this.tasksOverlay && !this.tasksOverlay.hidden) this.toggleTasksView();
+      if (this.auditOverlay && !this.auditOverlay.hidden) this.toggleAuditView();
+      if (this.groupOverlay && !this.groupOverlay.hidden) this.toggleGroupView();
+      const strip = Math.max(140, Math.round(this.el.clientHeight * 0.35));
+      this.issuesOverlay!.style.height = `${this.overlayClamp(this.termEl.clientHeight - strip)}px`;
+      this.issuesOverlay!.hidden = false;
+      this.issuesView.show();
+      this.updateTermShift();
+    }
+  }
+
   /** Toggle the task board overlay (orchestrator panes). Same no-resize
    *  overlay mechanics as the git view; only one overlay is open at a time. */
   toggleTasksView(): void {
@@ -830,6 +884,7 @@ export class Pane {
       this.updateTermShift();
       this.focus();
     } else {
+      if (this.issuesView?.visible) this.toggleIssuesView();
       if (this.gitView?.visible) this.toggleGitView();
       if (this.auditOverlay && !this.auditOverlay.hidden) this.toggleAuditView();
       if (this.groupOverlay && !this.groupOverlay.hidden) this.toggleGroupView();
@@ -859,6 +914,7 @@ export class Pane {
       this.updateTermShift();
       this.focus();
     } else {
+      if (this.issuesView?.visible) this.toggleIssuesView();
       if (this.gitView?.visible) this.toggleGitView();
       if (this.tasksOverlay && !this.tasksOverlay.hidden) this.toggleTasksView();
       if (this.groupOverlay && !this.groupOverlay.hidden) this.toggleGroupView();
@@ -891,6 +947,7 @@ export class Pane {
       this.updateTermShift();
       this.focus();
     } else {
+      if (this.issuesView?.visible) this.toggleIssuesView();
       if (this.gitView?.visible) this.toggleGitView();
       if (this.tasksOverlay && !this.tasksOverlay.hidden) this.toggleTasksView();
       if (this.auditOverlay && !this.auditOverlay.hidden) this.toggleAuditView();
@@ -933,6 +990,7 @@ export class Pane {
    *  the terminal. */
   private activeOverlay(): HTMLElement | null {
     if (this.gitOverlay && !this.gitOverlay.hidden) return this.gitOverlay;
+    if (this.issuesOverlay && !this.issuesOverlay.hidden) return this.issuesOverlay;
     if (this.tasksOverlay && !this.tasksOverlay.hidden) return this.tasksOverlay;
     if (this.auditOverlay && !this.auditOverlay.hidden) return this.auditOverlay;
     if (this.groupOverlay && !this.groupOverlay.hidden) return this.groupOverlay;
@@ -1346,6 +1404,7 @@ export class Pane {
     clearTimeout(this.composeStatusTimer);
     this.clearAttachments(); // revoke any lingering thumbnail object URLs
     this.gitView?.dispose();
+    this.issuesView?.dispose();
     this.tasksView?.dispose();
     this.auditView?.dispose();
     this.groupView?.dispose();
