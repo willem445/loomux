@@ -56,6 +56,22 @@ run `xattr -cr /Applications/Loomux.app` (the install script does this for you).
   with the WebGL renderer + Unicode 11 addon, vanilla TypeScript, Vite.
   No UI framework.
 
+### Bundled third-party runtimes (Windows)
+
+The Windows installer ships two prebuilt, MIT-licensed runtimes so features
+work out of the box; both are downloaded pinned + sha256-verified at build time
+(nothing is committed to the repo) and documented in
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md):
+
+- **whisper.cpp voice runtime** — local speech-to-text for push-to-talk voice
+  input (issue #58): `whisper-cli.exe` + DLLs and the `base.en` model, staged
+  by `scripts/stage-whisper.ps1` into `src-tauri/resources/whisper/`. This adds
+  **~150 MB** to the Windows installer (~141 MB model + ~9 MB runtime). Dev
+  builds without it degrade gracefully (see
+  [`src-tauri/resources/whisper/README.md`](src-tauri/resources/whisper/README.md)).
+- **Modern ConPTY host** — `conpty.dll` + `OpenConsole.exe` for clean terminal
+  resize (`src-tauri/resources/conhost/`).
+
 ## Run
 
 ```sh

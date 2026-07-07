@@ -52,6 +52,24 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      # Voice runtime (issue #58) is bundled Windows-only. Cache the pinned,
+      # sha256-verified downloads (whisper-bin zip ~8 MB + base.en model
+      # ~141 MB) so builds don't refetch ~150 MB every run. The cache key is
+      # the staging script's hash, so bumping a pin in it invalidates the
+      # cache automatically. Regular PR CI (cargo check/test) never runs this
+      # or the bundle step, so it needs none of these artifacts.
+      - name: Cache whisper downloads (Windows)
+        if: matrix.platform == 'windows-latest'
+        uses: actions/cache@v4
+        with:
+          path: .whisper-cache
+          key: whisper-downloads-${{ hashFiles('scripts/stage-whisper.ps1') }}
+
+      - name: Stage bundled whisper runtime (Windows)
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: ./scripts/stage-whisper.ps1
+
       - name: Build and publish
         uses: tauri-apps/tauri-action@v0
         env:

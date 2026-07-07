@@ -5,3 +5,12 @@ src-tauri/gen/schemas/
 *.log
 .claude/worktrees/
 .claude/settings.local.json
+# CI download cache for the bundled whisper runtime (issue #58)
+.whisper-cache/
+# Bundled whisper runtime + model are downloaded at build time by
+# scripts/stage-whisper.ps1 and never committed (issue #58). Keep only the
+# provenance/license docs, which ship in the bundle alongside the binaries.
+src-tauri/resources/whisper/*
+!src-tauri/resources/whisper/README.md
+!src-tauri/resources/whisper/LICENSE-whisper.cpp.txt
+!src-tauri/resources/whisper/MODEL-CARD.txt
