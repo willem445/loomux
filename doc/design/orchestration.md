@@ -479,7 +479,14 @@ the two cost/safety controls the unattended-spend risk demands.
   suspension leaves the autonomous set, later passes skip the group so it can't repeat. The
   suspension also writes a durable `autonomy_suspended` marker (cleared on a genuine re-enable)
   so `orch_autonomy` can report `suspended: true` — the UI distinguishes a budget suspension
-  from a plain user toggle-off without reconstructing it from the audit log. This is
+  from a plain user toggle-off without reconstructing it from the audit log. **The money-stop is
+  unconditional:** unlike a *user* disable (disk-first + fail-loud, to protect the consent
+  boundary — a failed removal keeps it ON), the suspension path (`suspend_autonomous`) drops the
+  in-memory flag **regardless of whether the marker can be removed**, because continued spend
+  past the cap is the one direction this feature must never allow. If the durable removal fails,
+  the surviving `autonomous` marker is overridden at restart by the `autonomy_suspended` marker
+  (the `create_group` re-seed checks suspended first), so the group comes back OFF +
+  suspended-visible rather than silently ticking. This is
   genuinely **new enforcement** — exact per-session token accounting already existed
   (`usage.rs`, `group_usage`) but no spend cap did. Tokens, not dollars: subscription/Max
   accounts pay $0 marginal, so dollars are meaningless here (see `usage.rs`). Re-enabling

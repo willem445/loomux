@@ -3303,6 +3303,54 @@ fn failed_disable_keeps_consent_on_and_is_audited() {
 }
 
 #[test]
+fn suspension_stops_ticking_even_if_marker_removal_fails() {
+    // rev-49 money-stop: a budget suspension whose durable-marker removal fails must
+    // STILL stop ticking — continued spend past the cap is the one direction this
+    // feature must never allow. So unlike a user disable (which stays ON on failure
+    // to protect consent), suspension drops the in-memory flag unconditionally.
+    let (reg, _d, gid, oid) = autonomous_setup();
+    // First prove it IS ticking before the fault.
+    let empty = HashMap::new();
+    assert_eq!(reg.idle_tick_tick(FAR, &empty, &empty), vec![oid.clone()]);
+    // Arm an exhausted budget, then force the autonomous-marker removal to fail by
+    // swapping the marker file for a directory (fs::remove_file refuses it).
+    seed_usage(&reg, &gid, "spend", 5_000);
+    reg.set_autonomy_budget(&gid, 100).unwrap();
+    let marker = reg.state_root().join(&gid).join("autonomous");
+    fs::remove_file(&marker).unwrap();
+    fs::create_dir(&marker).unwrap();
+    // Suspend: the durable disable fails (audited) but the money-stop still lands.
+    assert_eq!(reg.enforce_autonomy_budgets(now_ms()), vec![gid.clone()]);
+    assert!(!reg.is_autonomous(&gid), "suspension must stop ticking even under a disk fault");
+    assert_eq!(audit_count(&reg, &gid, "autonomous-off-failed"), 1, "the failed durable disable is audited");
+    // The critical guarantee: NO further ticks after suspension, ever.
+    assert!(reg.idle_tick_tick(FAR + 60_000, &empty, &empty).is_empty(),
+        "no ticks may fire after a budget suspension, even a disk-faulted one");
+    // And a later enforce pass doesn't re-suspend/re-notify (already out of the set).
+    assert!(reg.enforce_autonomy_budgets(now_ms()).is_empty(), "no repeat suspension");
+    assert_eq!(audit_count(&reg, &gid, "autonomy-budget-exhausted"), 1, "the notice fires exactly once");
+}
+
+#[test]
+fn restart_treats_a_suspended_marker_as_authoritative_off() {
+    // Even if a failed suspension leaves the `autonomous` enable marker on disk, a
+    // co-present `autonomy_suspended` marker must win at restart: the group resumes
+    // OFF + suspended-visible, never silently ticking past its spent budget.
+    let (reg, dir) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let gdir = reg.state_root().join(&g.id);
+    fs::write(gdir.join("autonomous"), "0").unwrap();          // stale enable marker survived
+    fs::write(gdir.join("autonomy_suspended"), "{}").unwrap(); // suspension marker wins
+    let reg2 = OrchRegistry::new(dir.path().to_path_buf());
+    reg2.set_port(45999);
+    reg2.create_group("C:/tmp/repo", rails()).unwrap();
+    assert!(!reg2.is_autonomous(&g.id),
+        "a suspended marker forces OFF at restart despite a stale autonomous marker");
+    assert!(reg2.autonomy_state(&g.id)["suspended"].as_bool().unwrap(),
+        "and the resumed group reads as suspended");
+}
+
+#[test]
 fn run_idle_tick_composes_budget_enforcement_then_tick() {
     // run_idle_tick must enforce budgets BEFORE ticking. Headless:
     // orchestrator_activity returns empty maps (no app handle), so the

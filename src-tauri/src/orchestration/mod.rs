@@ -2869,7 +2869,15 @@ impl OrchRegistry {
         // auto-merge is at least *visible* in the trail (belt-and-suspenders for
         // the L2 consent-boundary concern — a marker that shouldn't be here shows
         // up rather than resuming invisibly).
-        if dir.join("autonomous").is_file() {
+        // A budget suspension takes precedence over the enable marker: if a failed
+        // suspension left the `autonomous` marker on disk, the co-written
+        // `autonomy_suspended` marker (rev-49) must still force the group back OFF at
+        // restart — never silently resume ticking past a spent budget. The group
+        // then reads as suspended (audited below + `orch_autonomy.suspended`).
+        if dir.join("autonomy_suspended").is_file() {
+            self.audit(&id, "loomux", "autonomous-suspended-resumed",
+                json!({ "from": "marker" }));
+        } else if dir.join("autonomous").is_file() {
             self.autonomous_groups.lock_safe().insert(id.clone());
             self.audit(&id, "loomux", "autonomous-resumed",
                 json!({ "from": "marker", "budget_anchor_tokens": self.autonomy_anchor(&id) }));
@@ -3280,7 +3288,9 @@ impl OrchRegistry {
             if autonomy_budget_exhausted(spent, budget) {
                 self.audit(&group, "loomux", "autonomy-budget-exhausted",
                     json!({ "spent_tokens": spent, "budget_tokens": budget }));
-                let _ = self.set_autonomous_as(&group, false, "loomux");
+                // Money-stop: drop the group from the autonomous set unconditionally
+                // so ticking halts even if the marker can't be removed (rev-49).
+                self.suspend_autonomous(&group);
                 // Distinguish a budget suspension from a plain user-off with a
                 // durable `autonomy_suspended` marker, so the UI can tell the human
                 // "suspended — raise the budget or re-enable" instead of
@@ -3412,9 +3422,29 @@ impl OrchRegistry {
     /// "autonomous-era spend" the human is consenting to (re-enabling after a
     /// budget suspension re-anchors, which is what "toggle to resume" means).
     /// Audited on every real state change (actor `human`). The budget-suspension
-    /// path disables it as `loomux` via `set_autonomous_as`.
+    /// path uses `suspend_autonomous` instead (different failure policy).
     pub fn set_autonomous(&self, group: &str, on: bool) -> Result<(), String> {
         self.set_autonomous_as(group, on, "human")
+    }
+
+    /// Disable autonomous mode as a **budget suspension** (actor `loomux`). Unlike a
+    /// user disable (`set_autonomous_as`, disk-first + fail-loud to protect the
+    /// consent boundary), the money-stop here is inverted: continued spend past the
+    /// cap is the one direction this feature must never allow, so the in-memory flag
+    /// is dropped **unconditionally** — ticking halts even if the durable marker
+    /// can't be removed. A marker-removal failure is audited, not fatal; a surviving
+    /// `autonomous` marker is then overridden at restart by the co-written
+    /// `autonomy_suspended` marker (see the re-seed in `create_group`), so the group
+    /// comes back OFF + suspended-visible, never silently ticking past its budget.
+    fn suspend_autonomous(&self, group: &str) {
+        // Stop the spend first and unconditionally.
+        self.autonomous_groups.lock_safe().remove(group);
+        self.clear_idle_tick_latch(group);
+        // Best-effort durable disable; failure is surfaced in the audit trail.
+        match remove_marker(&self.group_dir(group).join("autonomous")) {
+            Ok(()) => self.audit(group, "loomux", "autonomous-off", json!({})),
+            Err(e) => self.audit(group, "loomux", "autonomous-off-failed", json!({ "error": e })),
+        }
     }
 
     /// `set_autonomous` with an explicit actor so a loomux-initiated suspension
