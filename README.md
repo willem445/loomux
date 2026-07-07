@@ -414,6 +414,7 @@ src-tauri/src/
   sessions.rs       agent session discovery (one scan_* fn per agent source)
   orchestration/    agent groups: registry, guardrails, MCP server, audit
   obs.rs            crash observability: panic hook, breadcrumb log, unclean-exit notice
+  voice.rs          voice-prompt prototype (#58): mic capture (cpal) → local whisper.cpp
   lib.rs            Tauri wiring
 src/
   pty.ts            typed bridge to the backend (invoke + event bus)
