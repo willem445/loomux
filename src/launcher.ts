@@ -209,6 +209,7 @@ export class AgentLauncher {
   private idleKillInput: HTMLInputElement;
   private spawnRateInput: HTMLInputElement;
   private watchdogInput: HTMLInputElement;
+  private autonomyBudgetInput: HTMLInputElement;
   /** Per-role CLI + model controls (issue #4, mixed agent types). Built once
    *  in the constructor; the group's default CLI (the top Agent field) seeds
    *  every role and can be overridden per role. */
@@ -339,6 +340,17 @@ export class AgentLauncher {
     // goes silent (no output, no report) for this long. Default on — it's a
     // non-destructive safety net, not a cost driver.
     this.watchdogInput = numberInput(10, 0, 1440);
+    // Autonomous-era token budget (#83). Autonomous mode is off by default, so
+    // this only bites once the human turns it on from the group panel; setting
+    // a cap here just pre-loads it. 0 = no cap. Tokens (not dollars) — the
+    // reliable metric on subscription/Max accounts. Applied post-create via the
+    // setter (create_orchestration has no budget parameter).
+    this.autonomyBudgetInput = document.createElement("input");
+    this.autonomyBudgetInput.className = "dlg-input dlg-num";
+    this.autonomyBudgetInput.type = "number";
+    this.autonomyBudgetInput.min = "0";
+    this.autonomyBudgetInput.step = "10000";
+    this.autonomyBudgetInput.value = "0";
     // Per-role CLI + model. Each role picks its own agent CLI (claude /
     // copilot / …) and model; changing a role's CLI re-populates its model
     // list from that CLI's suggestions (issue #4).
@@ -383,7 +395,17 @@ export class AgentLauncher {
     );
     this.orchFields = document.createElement("div");
     this.orchFields.className = "dlg-field";
-    this.orchFields.append(guardRow1, guardRow2, guardRow3, field("Permissions", this.permsSel));
+    this.orchFields.append(
+      guardRow1,
+      guardRow2,
+      guardRow3,
+      field(
+        "Autonomy budget (tokens, 0=no cap)",
+        this.autonomyBudgetInput,
+        "caps autonomous-era spend once you enable autonomous mode from the group panel"
+      ),
+      field("Permissions", this.permsSel)
+    );
 
     this.errorEl = document.createElement("div");
     this.errorEl.className = "dlg-error";
@@ -709,6 +731,7 @@ export class AgentLauncher {
           idleKillMinutes: intVal(this.idleKillInput, 0),
           watchdogStallMinutes: intVal(this.watchdogInput, 10),
           maxSpawnsPerHour: intVal(this.spawnRateInput, 0),
+          autonomyBudgetTokens: Math.max(0, intVal(this.autonomyBudgetInput, 0)),
         },
       });
       return;

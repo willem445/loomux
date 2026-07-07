@@ -13,7 +13,10 @@ import type { Pane, PaneEvents } from "./pane";
 import { panesInGroup } from "./group";
 import { badgeFor, type OrchRole } from "./orchbadge";
 import { isSpawnRequestExpired } from "./spawnexpiry";
+import type { AutonomyState } from "./autonomy";
 import { showToast } from "./toast";
+
+export type { AutonomyState };
 
 export type { OrchRole };
 export { badgeFor, metaForGroup } from "./orchbadge";
@@ -66,6 +69,11 @@ export interface OrchestratorConfig {
   /** Recovery guardrail: nudge the orchestrator when a working agent goes
    *  silent (no output, no report) this many minutes (0 = disabled). */
   watchdogStallMinutes: number;
+  /** Cost guardrail (#83): autonomous-era token budget applied at creation
+   *  (0 = no cap). The backend `create_orchestration` command has no budget
+   *  parameter, so `launchOrchestrator` applies this via `setAutonomyBudget`
+   *  right after the group is created. */
+  autonomyBudgetTokens: number;
 }
 
 /** One pane that needs the human, from the backend attention scan. `reason`
@@ -101,6 +109,36 @@ export const setNotify = (groupId: string, enabled: boolean): Promise<void> =>
  *  current live count blocks new spawns until attrition — it kills no one. */
 export const setMaxAgents = (groupId: string, maxAgents: number): Promise<number> =>
   invoke<number>("orch_set_max_agents", { groupId, maxAgents });
+
+// ---------- autonomous mode (#83) ----------
+
+/** Enable/disable autonomous idle-tick mode for a group (durable, audited).
+ *  Enabling anchors the budget meter at the group's current spend; disabling is
+ *  the explicit consent needed to resume after a budget suspension (re-enabling
+ *  re-anchors). */
+export const setAutonomous = (groupId: string, enabled: boolean): Promise<void> =>
+  invoke("orch_set_autonomous", { groupId, enabled });
+
+/** Enable/disable the auto-merge gate for a group (durable, audited). Default
+ *  OFF = the human merges; ON lets the orchestrator merge an adequately-tested
+ *  PR itself. The human-facing control frames this as its inverse — a "require
+ *  approval" checkbox — so callers pass `enabled = auto_merge`, not the checkbox
+ *  value (see `autoMergeFromApproval`). */
+export const setAutoMerge = (groupId: string, enabled: boolean): Promise<void> =>
+  invoke("orch_set_auto_merge", { groupId, enabled });
+
+/** Set a group's autonomous-era token budget (0 = no cap; durable, audited).
+ *  Resolves to the applied value. Does not move the enable-time anchor, so
+ *  raising the budget after a suspension lets the human resume without losing
+ *  already-counted spend. */
+export const setAutonomyBudget = (groupId: string, tokens: number): Promise<number> =>
+  invoke<number>("orch_set_autonomy_budget", { groupId, tokens });
+
+/** The whole autonomous-mode panel state in one read: toggles, budget, its
+ *  enable-time anchor, the spend metered since enable (`null` when off), and
+ *  `suspended` (true when the budget enforcer turned autonomy off). */
+export const autonomyState = (groupId: string): Promise<AutonomyState> =>
+  invoke<AutonomyState>("orch_autonomy", { groupId });
 
 /** Agent ids the backend cancelled via `orch-spawn-cancelled` (its bind wait
  *  timed out) whose pane may still be mid-open (#106). Consulted in
@@ -315,6 +353,18 @@ export async function launchOrchestrator(
     maxSpawnsPerHour: config.maxSpawnsPerHour,
     watchdogStallMinutes: config.watchdogStallMinutes,
   });
+  // #83: create_orchestration has no budget parameter (W1's frozen contract), so
+  // apply any launcher-collected autonomous budget via the setter now the group
+  // exists. Best-effort: a failed budget write must not sink the launch — the
+  // group is already up and the human can set it live from the panel. 0 = no cap,
+  // which is the backend default anyway, so skip the round-trip.
+  if (config.autonomyBudgetTokens > 0) {
+    try {
+      await setAutonomyBudget(spec.group_id, config.autonomyBudgetTokens);
+    } catch (err) {
+      showToast(`autonomy budget not applied: ${String(err)}`, "info");
+    }
+  }
   // Human launched the orchestrator from the UI — focus its pane.
   await openAgentPane(grid, paneEvents, spec, false);
 }
