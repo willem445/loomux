@@ -13,6 +13,7 @@ import { Pane, type PaneEvents, type PaneOptions } from "./pane";
 import { dropZoneFor, indicatorFor, zoneToPlacement, type DropZone } from "./layout";
 import { dockChipAttention } from "./attention";
 import { planGroupMinimize } from "./group";
+import { shouldFocusNewPane } from "./panefocus";
 
 type Dir = "row" | "column";
 
@@ -96,7 +97,8 @@ export class Grid {
     this.leaves.set(pane, leaf);
 
     const target = relativeTo ?? this.active;
-    if (!this.root || !target) {
+    const wasEmpty = !this.root || !target;
+    if (wasEmpty) {
       this.root = leaf;
       pane.el.style.flex = "1 1 0";
       this.rootEl.appendChild(pane.el);
@@ -104,8 +106,12 @@ export class Grid {
       this.insertBeside(this.leaves.get(target)!, leaf, dir);
     }
 
-    this.setActive(pane);
-    await pane.start(opts);
+    // A background (orchestrator-driven) spawn opens the pane without stealing
+    // focus/active from where the human is typing (#117) — but an empty grid
+    // still focuses, or the app would be left with no active terminal.
+    const takeFocus = shouldFocusNewPane(!opts.background, wasEmpty);
+    if (takeFocus) this.setActive(pane);
+    await pane.start(opts, takeFocus);
     return pane;
   }
 

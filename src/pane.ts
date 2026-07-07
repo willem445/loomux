@@ -134,6 +134,12 @@ export interface PaneOptions {
   orchRole?: string;
   /** Agent id, for attention acks (clearing a "needs attention" badge). */
   orchAgent?: string;
+  /** Open without stealing keyboard focus (issue #117): an orchestrator-driven
+   *  spawn must not yank the cursor from the pane the human is typing in. The
+   *  human-initiated paths leave this unset (focus the new pane); only the
+   *  orch-spawn-request path sets it. Grid.openPane resolves the actual
+   *  decision — an empty grid still focuses regardless (see panefocus.ts). */
+  background?: boolean;
 }
 
 const TERM_THEME = {
@@ -495,7 +501,7 @@ export class Pane {
   }
 
   /** Open the terminal in the DOM and spawn its PTY. Call after `el` is attached. */
-  async start(opts: PaneOptions = {}): Promise<void> {
+  async start(opts: PaneOptions = {}, takeFocus = true): Promise<void> {
     this.setName(opts.name ?? "shell");
     this.launchedCommand = !!opts.command?.trim();
     if (opts.badge) this.setBadge(opts.badge);
@@ -553,7 +559,9 @@ export class Pane {
     // until we attach.
     this.term.onData((data) => this.writer.write(data));
     this.resizeObs.observe(this.termEl);
-    this.focus();
+    // A background (orchestrator-driven) spawn must not pull focus from the
+    // pane the human is typing in (#117); grid.openPane decides takeFocus.
+    if (takeFocus) this.focus();
 
     try {
       await ensureOutputRouter();
