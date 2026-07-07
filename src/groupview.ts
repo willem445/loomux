@@ -10,6 +10,7 @@
 // overlay mechanics as the git / tasks / audit views (never resizes the PTY).
 
 import {
+  autonomyState,
   endGroup,
   groupPaused,
   groupSummary,
@@ -17,11 +18,21 @@ import {
   notifyEnabled,
   pauseGroup,
   resumeGroup,
+  setAutoMerge,
+  setAutonomous,
+  setAutonomyBudget,
   setMaxAgents,
   setNotify,
+  type AutonomyState,
   type GroupSummary,
   type GroupUsage,
 } from "./orchestration";
+import {
+  autoMergeFromApproval,
+  budgetMeter,
+  formatTokens,
+  requireApprovalChecked,
+} from "./autonomy";
 
 /** Hard bounds on the live-agent cap, mirroring the launcher's input range and
  *  the backend's `MAX_AGENTS_CEILING`. The backend re-validates; these only
@@ -89,6 +100,17 @@ export class GroupView {
   private maxNoteEl: HTMLElement;
   private maxErrEl: HTMLElement;
   private listEl: HTMLElement;
+  // Autonomous-mode section (#83).
+  private autoBtn: HTMLButtonElement;
+  private autoCopyEl: HTMLElement;
+  private approvalChk: HTMLInputElement;
+  private budgetInput: HTMLInputElement;
+  private budgetErrEl: HTMLElement;
+  private meterEl: HTMLElement;
+  private meterBar: HTMLElement;
+  private meterFill: HTMLElement;
+  private meterLabel: HTMLElement;
+  private suspendEl: HTMLElement;
   private pauseBtn: HTMLButtonElement;
   private notifyBtn: HTMLButtonElement;
   private foldBtn: HTMLButtonElement | null = null;
@@ -101,6 +123,7 @@ export class GroupView {
   private usage: GroupUsage | null = null;
   private paused = false;
   private notify = false;
+  private autonomy: AutonomyState | null = null;
   private pollTimer: number | undefined;
   private disposed = false;
   /** True once End is clicked once: the second click within the window
@@ -160,6 +183,78 @@ export class GroupView {
 
     this.listEl = el("div", "group-list");
 
+    // Autonomous-mode section (#83): a live idle-tick toggle, the merge gate,
+    // and a token budget with a meter. All off/default until the human opts in —
+    // the copy is deliberately blunt that ticking spends money unattended.
+    const autoRow = el("div", "group-autorow");
+    const autoHead = el("div", "group-auto-head");
+    autoHead.append(el("span", "group-auto-title", "Autonomous mode"));
+    this.autoBtn = el("button", "group-btn", "🤖 Autonomous off") as HTMLButtonElement;
+    this.autoBtn.addEventListener("click", () => void this.toggleAutonomous());
+    autoHead.append(this.autoBtn);
+    this.autoCopyEl = el(
+      "div",
+      "group-auto-copy",
+      "autonomous ticks spend tokens without you present"
+    );
+
+    // Merge gate: the checkbox is the human's framing (ON = require approval,
+    // today's default) and maps to the inverse backend auto_merge flag.
+    const approvalLbl = el("label", "group-auto-check") as HTMLLabelElement;
+    this.approvalChk = document.createElement("input");
+    this.approvalChk.type = "checkbox";
+    this.approvalChk.addEventListener("change", () => void this.toggleApproval());
+    approvalLbl.append(
+      this.approvalChk,
+      document.createTextNode(" Require human approval before merge")
+    );
+    approvalLbl.title =
+      "On (default): the human merges every PR. Off: the orchestrator may merge an " +
+      "adequately-tested PR (reviewer-approved + green CI) itself while autonomous.";
+
+    // Token budget: 0 / empty = no cap. When autonomous is on this drives the
+    // live meter below.
+    const budgetRow = el("div", "group-auto-budget");
+    budgetRow.append(el("span", "group-auto-blabel", "Token budget"));
+    this.budgetInput = document.createElement("input");
+    this.budgetInput.className = "group-auto-binput";
+    this.budgetInput.type = "number";
+    this.budgetInput.min = "0";
+    this.budgetInput.step = "10000";
+    this.budgetInput.placeholder = "no cap";
+    this.budgetInput.title =
+      "Autonomous-era token spend cap (0 or empty = no cap). Metered from the moment " +
+      "you enable autonomous mode; crossing it suspends ticking until you re-enable.";
+    this.budgetInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") void this.applyBudget();
+    });
+    this.budgetInput.addEventListener("blur", () => void this.applyBudget());
+    this.budgetErrEl = el("span", "group-auto-berr");
+    budgetRow.append(this.budgetInput, this.budgetErrEl);
+
+    // Live meter (shown only while autonomous is on): spend-since-enable vs cap.
+    this.meterEl = el("div", "group-auto-meter");
+    this.meterEl.hidden = true;
+    this.meterBar = el("div", "group-auto-bar");
+    this.meterFill = el("div", "group-auto-fill");
+    this.meterBar.append(this.meterFill);
+    this.meterLabel = el("div", "group-auto-mlabel");
+    this.meterEl.append(this.meterBar, this.meterLabel);
+
+    // Budget-exhausted banner (autonomy auto-suspended): distinct state + the
+    // re-enable affordance is the toggle above (re-enabling re-anchors).
+    this.suspendEl = el("div", "group-auto-suspend");
+    this.suspendEl.hidden = true;
+
+    autoRow.append(
+      autoHead,
+      this.autoCopyEl,
+      approvalLbl,
+      budgetRow,
+      this.meterEl,
+      this.suspendEl
+    );
+
     // Footer: pause/resume + destructive end-orchestration.
     const foot = el("div", "group-actions");
     this.pauseBtn = el("button", "group-btn", "Pause") as HTMLButtonElement;
@@ -198,7 +293,7 @@ export class GroupView {
     this.toastEl = el("div", "git-toast");
     this.toastEl.hidden = true;
 
-    this.el.append(head, this.summaryEl, maxRow, this.listEl, foot, this.toastEl);
+    this.el.append(head, this.summaryEl, maxRow, autoRow, this.listEl, foot, this.toastEl);
   }
 
   /** Called by the pane whenever the overlay is (re)opened. */
@@ -225,11 +320,12 @@ export class GroupView {
   private async load(): Promise<void> {
     if (this.disposed) return;
     try {
-      [this.summary, this.usage, this.paused, this.notify] = await Promise.all([
+      [this.summary, this.usage, this.paused, this.notify, this.autonomy] = await Promise.all([
         groupSummary(this.groupId),
         groupUsage(this.groupId),
         groupPaused(this.groupId),
         notifyEnabled(this.groupId),
+        autonomyState(this.groupId),
       ]);
     } catch (err) {
       this.toast(String(err));
@@ -282,6 +378,46 @@ export class GroupView {
       await setNotify(this.groupId, !this.notify);
     } catch (err) {
       this.toast(String(err));
+    }
+    await this.load();
+  }
+
+  /** Flip autonomous idle-ticking. Enabling (including re-enabling after a
+   *  budget suspension) re-anchors the budget meter backend-side. */
+  private async toggleAutonomous(): Promise<void> {
+    const on = this.autonomy?.autonomous ?? false;
+    try {
+      await setAutonomous(this.groupId, !on);
+    } catch (err) {
+      this.toast(String(err));
+    }
+    await this.load();
+  }
+
+  /** Commit the merge gate from the "require approval" checkbox — the human
+   *  framing is the inverse of the backend `auto_merge` flag. */
+  private async toggleApproval(): Promise<void> {
+    try {
+      await setAutoMerge(this.groupId, autoMergeFromApproval(this.approvalChk.checked));
+    } catch (err) {
+      this.toast(String(err));
+    }
+    await this.load();
+  }
+
+  /** Commit the token budget (empty/non-numeric = no cap = 0). The backend
+   *  clamps/persists and returns the applied value; the poll then re-syncs the
+   *  input, so a rejected write restores the real value. */
+  private async applyBudget(): Promise<void> {
+    this.budgetErrEl.textContent = "";
+    const raw = this.budgetInput.value.trim();
+    const n = raw === "" ? 0 : parseInt(raw, 10);
+    const tokens = Number.isFinite(n) && n > 0 ? n : 0;
+    if (tokens === (this.autonomy?.budget_tokens ?? 0)) return; // no-op
+    try {
+      await setAutonomyBudget(this.groupId, tokens);
+    } catch (err) {
+      this.budgetErrEl.textContent = String(err);
     }
     await this.load();
   }
@@ -421,6 +557,63 @@ export class GroupView {
     this.notifyBtn.title = this.notify
       ? "Desktop toasts are on for this group — click to turn off"
       : "Turn on OS toasts for reports and idle-with-prompt panes in this group";
+
+    this.renderAutonomy();
+  }
+
+  /** Sync the autonomous-mode controls, budget meter, and suspended banner to
+   *  the last `orch_autonomy` read (+ audit-derived suspension). */
+  private renderAutonomy(): void {
+    const a = this.autonomy;
+    if (!a) return;
+
+    // Toggle button reflects the live marker.
+    this.autoBtn.textContent = a.autonomous ? "🤖 Autonomous on" : "🤖 Autonomous off";
+    this.autoBtn.classList.toggle("on", a.autonomous);
+    this.autoBtn.title = a.autonomous
+      ? "Idle-ticking is live — the orchestrator polls labeled issues and re-checks PRs while you're away. Click to stop."
+      : "Enable idle-ticking: loomux pokes the orchestrator to run its intake/monitoring cadence when the group goes quiet.";
+
+    // Merge gate: reflect unless the human is mid-click (change fires on commit,
+    // so no active-element guard is needed for a checkbox).
+    this.approvalChk.checked = requireApprovalChecked(a.auto_merge);
+
+    // Budget input: don't clobber while the human is editing it.
+    if (document.activeElement !== this.budgetInput) {
+      this.budgetInput.value = a.budget_tokens > 0 ? String(a.budget_tokens) : "";
+    }
+
+    // Live meter: only while autonomous (spend is null when off). Off ⇒ hidden.
+    if (a.autonomous && a.spend_since_enable_tokens != null) {
+      this.meterEl.hidden = false;
+      const m = budgetMeter(a.spend_since_enable_tokens, a.budget_tokens);
+      if (m.hasCap) {
+        this.meterBar.hidden = false;
+        this.meterFill.style.width = `${m.percent}%`;
+        this.meterFill.classList.toggle("warn", m.percent >= 80 && !m.exhausted);
+        this.meterFill.classList.toggle("over", m.exhausted);
+        this.meterLabel.textContent =
+          `${formatTokens(m.spend)} / ${formatTokens(m.budget)} tok · ${m.percent}%` +
+          (m.exhausted ? " · budget reached" : "");
+      } else {
+        this.meterBar.hidden = true;
+        this.meterLabel.textContent = `${formatTokens(m.spend)} tok spent this session · no cap`;
+      }
+    } else {
+      this.meterEl.hidden = true;
+    }
+
+    // Suspended banner: distinct from a plain-off state. `suspended` comes
+    // straight from orch_autonomy (true only while off, and only when the budget
+    // enforcer flipped it). The re-enable affordance is the toggle above
+    // (re-enabling re-anchors the meter).
+    if (a.suspended) {
+      this.suspendEl.hidden = false;
+      this.suspendEl.textContent =
+        "⏸ Suspended: token budget exhausted. Re-enable autonomous mode to resume (the budget re-anchors at the current spend).";
+    } else {
+      this.suspendEl.hidden = true;
+    }
   }
 
   /** Sync the max-agents stepper to the backend value and reflect whether the

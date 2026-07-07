@@ -584,6 +584,20 @@ once autonomous-era spend crosses the cap, and an **auto-merge** toggle
 adequately-tested PR itself (reviewer-approved + green CI + acceptance met),
 still holding anything risky for you. Every toggle and merge is audited.
 
+You drive all three from the **lifecycle panel** (`Alt+O`), in its *Autonomous
+mode* section: an **Autonomous** on/off toggle (blunt about the trade-off —
+autonomous ticks spend tokens without you present), a **Require human approval
+before merge** checkbox (on by default = today's human merge gate; clearing it
+is what enables auto-merge), and a **token budget** field (0 or empty = no cap).
+While autonomous mode is on, a live meter under the budget shows autonomous-era
+spend against the cap (progress bar, percent, and human-readable token counts),
+metered from the moment you enabled it — not lifetime history. If the budget is
+exhausted, the panel switches to a distinct **suspended: budget exhausted**
+state; flipping the Autonomous toggle back on resumes ticking and re-anchors the
+meter at the current spend. The budget can also be pre-set at group creation via
+the launcher's **Autonomy budget** guardrail field, though autonomous mode still
+starts off until you enable it.
+
 **Restart after loomux closes:** orchestration sessions are marked in the
 session browser (`ORCH` / `W` / `REV` chips). Clicking a dead group's
 orchestrator session restores the *whole* orchestration — same group id,

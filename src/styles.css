@@ -1330,6 +1330,49 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .group-max-err { color: var(--danger); font-size: 10px; }
 .group-cost { color: var(--text-dim); font-size: 11px; }
 .group-cost-live { color: var(--text-dim); font-size: 10px; opacity: 0.75; }
+
+/* -- autonomous mode (#83) -- */
+.group-autorow {
+  display: flex; flex-direction: column; gap: 6px; flex: none;
+  padding: 8px 12px; border-bottom: 1px solid var(--border-soft);
+}
+.group-auto-head { display: flex; align-items: center; gap: 10px; }
+.group-auto-title { color: var(--text); font-weight: 500; font-size: 12px; }
+.group-auto-copy { color: #e0af68; font-size: 10px; opacity: 0.85; }
+.group-auto-check {
+  display: flex; align-items: center; gap: 5px;
+  color: var(--text-dim); font-size: 11px; cursor: pointer; user-select: none;
+}
+.group-auto-budget { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.group-auto-blabel { color: var(--text-dim); font-size: 11px; }
+.group-auto-binput {
+  font: inherit; font-size: 12px; width: 96px;
+  background: var(--panel-2); color: var(--text);
+  border: 1px solid var(--border-soft); border-radius: 5px; padding: 2px 6px;
+}
+.group-auto-binput:focus { outline: none; border-color: var(--accent); }
+.group-auto-berr { color: var(--danger); font-size: 10px; }
+.group-auto-meter { display: flex; flex-direction: column; gap: 3px; }
+.group-auto-bar {
+  height: 6px; border-radius: 3px; overflow: hidden;
+  background: var(--panel-2); border: 1px solid var(--border-soft);
+}
+.group-auto-fill {
+  height: 100%; width: 0%; background: #9ece6a; border-radius: 3px;
+  transition: width 0.3s ease;
+}
+.group-auto-fill.warn { background: #e0af68; }
+.group-auto-fill.over { background: var(--danger); }
+.group-auto-mlabel {
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 10px; color: var(--text-dim);
+}
+.group-auto-suspend {
+  font-size: 10.5px; line-height: 1.4; color: #f7768e;
+  background: rgba(247, 118, 142, 0.12);
+  border: 1px solid rgba(247, 118, 142, 0.35); border-radius: 5px;
+  padding: 5px 8px;
+}
 .group-paused-badge {
   font-size: 9.5px; font-weight: 600; border-radius: 4px; padding: 1px 7px;
   background: rgba(224, 175, 104, 0.16); color: #e0af68;
