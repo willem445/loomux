@@ -217,7 +217,10 @@ From the panel you can:
   onto its board; no orchestrator needs to be running when you label, since the
   label is durable on GitHub and picked up whenever one next starts here. An
   `agent-managed` label (set by an orchestrator that already owns the issue) is
-  shown read-only.
+  shown read-only. If the repo doesn't have these agent labels yet, loomux
+  **creates the one you toggle on first use** (with its standard color and
+  description) — so the handshake works on a fresh repo without any manual label
+  setup; only these allow-listed labels are ever created.
 - **Copy** any issue's URL (⧉) to the clipboard.
 
 The panel refreshes on open and on the ↻ button — a single cheap `gh issue
