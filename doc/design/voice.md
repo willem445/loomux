@@ -122,8 +122,11 @@ RMS is sane).
 
 ### Transcription — subprocess to prebuilt `whisper-cli.exe`
 
-git.rs-style `Command` with `CREATE_NO_WINDOW`, `-nt -l en`; stdout parsed into
-one prompt line (timestamps and `[BLANK_AUDIO]`-style markers stripped).
+git.rs-style `Command` with `CREATE_NO_WINDOW`; args assembled by
+`build_whisper_args` (`-nt -l en -t <threads>`, plus optional `--prompt` and the
+`LOOMUX_WHISPER_ARGS` passthrough — see *Invocation tuning* below). stdout is
+parsed into one prompt line (timestamps and `[BLANK_AUDIO]`-style markers
+stripped).
 
 **Async + cancellable.** `voice_stop` is an `async` command that clones the state
 `Arc`s and runs the join + subprocess on `tauri::async_runtime::spawn_blocking`,
@@ -172,6 +175,40 @@ independently, each in this priority:
 
 Every failure names all three locations so the message is actionable.
 
+### Invocation tuning (threads, passthrough, vocabulary)
+
+The whisper argument vector is assembled by the pure, unit-tested
+`build_whisper_args` in a fixed order:
+`-m <model> -f <wav> -nt -l en -t <threads> [--prompt <p>] [<extra>…]`.
+
+- **Threads (`-t`).** whisper.cpp defaults to 4; on a many-core desktop (the
+  human's 16-core 5950X) that wastes 2-3× of available CPU. loomux passes `-t`
+  = `whisper_thread_count(available_parallelism())`, clamped to
+  `[1, WHISPER_MAX_THREADS]` (8). The cap is deliberate: whisper.cpp CPU
+  inference is memory-bandwidth-bound, so throughput flattens past ~8 threads,
+  and using all logical cores (SMT) on a busy desktop contends with the
+  OS/webview for little gain.
+- **`LOOMUX_WHISPER_ARGS`** — a raw passthrough (whitespace-split, no shell) for
+  power users. It is appended **last**; whisper.cpp's parser takes the *last*
+  occurrence of a scalar flag, so a user's `-t 12`/`-fa`/`-bs 5` overrides
+  loomux's defaults. No shell is involved — tokens go straight to `Command::arg`.
+- **Vocabulary → `--prompt`.** An optional
+  `%LOCALAPPDATA%\loomux\whisper\vocab.txt` (one term/phrase per line, `#`
+  comments) is assembled by the pure `build_prompt_arg` into a compact
+  `Terms: a, b, c.` biasing sentence and passed as whisper's initial `--prompt`.
+  Precedence: `LOOMUX_WHISPER_PROMPT` env (verbatim) **replaces** the file; empty
+  or missing → **no `--prompt` at all**.
+  - *Token budget is approximated.* whisper's initial-prompt cap is ~224 tokens
+    (`n_text_ctx/2`); we have no tokenizer, so `build_prompt_arg` truncates on
+    whole-term boundaries at `WHISPER_PROMPT_MAX_CHARS` (800 ≈ ~200 tokens at a
+    conservative ~4 chars/token) and flags truncation so the caller warns. This
+    is an admitted approximation — and prompt biasing only reliably honors a
+    short curated list (end-of-prompt tokens weigh more; there's no
+    equal-importance guarantee), so a long glossary wouldn't help anyway.
+  - *Argv hygiene.* The prompt is a single flag **value** passed as one discrete
+    argument (not a shell string), so spaces/quotes/special chars in vocab are
+    inert — same discrete-argv posture as the rest of the subprocess calls.
+
 ### Error surfaces
 
 - No input device → "no microphone / input device found".
@@ -188,10 +225,11 @@ Every failure names all three locations so the message is actionable.
 ### Tested pure logic
 
 `resample_linear`, `encode_wav_pcm16`, `parse_whisper_output`,
-`is_dll_load_failure`, and `ChunkedBuffer`/`rms`/`duration_secs` have inline unit
-tests (cross-platform); the push-to-talk state machine (`nextVoiceState`,
-including the `transcribing` state and Esc-cancel transitions) is tested in
-`test/voice.test.ts`. Live capture, the async command path, and the
+`is_dll_load_failure`, `ChunkedBuffer`/`rms`/`duration_secs`, and the invocation
+helpers (`whisper_thread_count`, `parse_extra_args`, `build_prompt_arg`,
+`build_whisper_args`) have inline unit tests (cross-platform); the push-to-talk
+state machine (`nextVoiceState`, including the `transcribing` state and
+Esc-cancel transitions) is tested in `test/voice.test.ts`. Live capture, the async command path, and the
 subprocess-kill (which need a real mic, a Tauri runtime, and the whisper runtime)
 are validated by hand — record 60–90 s, confirm a responsive UI during
 transcription, and confirm Esc/pane-close terminate the whisper process — per the
