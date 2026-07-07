@@ -82,6 +82,17 @@ export const changeDir = (id: number, path: string): Promise<void> =>
 
 export const listSessions = (): Promise<SessionInfo[]> => invoke("list_sessions");
 
+/** Result of probing for the OpenSSH client (issue #122, remote panes). */
+export interface SshProbe {
+  available: boolean;
+  path: string | null;
+  error: string | null;
+}
+
+/** Is `ssh` available on this machine? Backend resolves the executable
+ *  (PATH + the Windows OpenSSH optional-feature location); it never runs it. */
+export const probeSsh = (): Promise<SshProbe> => invoke<SshProbe>("probe_ssh");
+
 // ---------- output router ----------
 
 type OutputHandler = (data: Uint8Array) => void;

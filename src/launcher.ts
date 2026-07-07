@@ -11,6 +11,14 @@
 import { open } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
 import { gitWorktreeAdd } from "./git";
+import { probeSsh } from "./pty";
+import {
+  addRecentRemote,
+  buildRemoteInvocation,
+  getRecentRemotes,
+  sanitizeSessionName,
+  suggestSessionName,
+} from "./remote";
 import type { OrchestratorConfig } from "./orchestration";
 import {
   AGENTS,
@@ -29,13 +37,16 @@ export interface AgentLaunchSpec {
   /** Repo, worktree, or plain folder; undefined = home directory. */
   cwd?: string;
   command: string;
+  /** Structured invocation for the direct-spawn path (#110). Set for remote
+   *  SSH panes (#122), where the pane child is `ssh -t host tmux new -A …`. */
+  argv?: string[];
 }
 
 export type LaunchResult =
   | { kind: "panes"; specs: AgentLaunchSpec[] }
   | { kind: "orchestrator"; config: OrchestratorConfig };
 
-type Mode = "single" | "multi" | "orchestrator";
+type Mode = "single" | "multi" | "orchestrator" | "remote";
 
 /** Agent CLIs the orchestration backend has adapters for, with the model
  *  suggestions each CLI accepts. Free text is allowed — the lists are
@@ -196,6 +207,7 @@ export class AgentLauncher {
   private repoList: HTMLDataListElement;
   private worktreeField: HTMLElement;
   private worktreeInput: HTMLInputElement;
+  private repoField!: HTMLElement;
   private nameField: HTMLElement;
   private nameInput: HTMLInputElement;
   // Autopilot toggle (single + multi modes): launch with the CLI's unattended
@@ -218,6 +230,18 @@ export class AgentLauncher {
     model: ModelPicker;
   }[];
   private permsSel: HTMLSelectElement;
+  // Remote session (SSH + tmux) fields (#122). host is `user@host`; session is
+  // the tmux session to attach-or-create; remote cwd is optional. The recent
+  // datalists make reattaching a known session one keystroke.
+  private remoteFields: HTMLElement;
+  private hostInput: HTMLInputElement;
+  private hostList: HTMLDataListElement;
+  private sessionInput: HTMLInputElement;
+  private sessionDirty = false;
+  private remoteCwdInput: HTMLInputElement;
+  private remoteWarn: HTMLElement;
+  /** ssh presence probe, memoized for the app run. */
+  private sshProbe: Promise<{ available: boolean; error: string | null }> | null = null;
   private agentWarn: HTMLElement;
   /** One probe per program per app run; backend caches too. */
   private probes = new Map<string, Promise<CliProbe>>();
@@ -246,6 +270,7 @@ export class AgentLauncher {
       ["single", "Single pane"],
       ["multi", "Multiple panes"],
       ["orchestrator", "Orchestrator + workers"],
+      ["remote", "Remote session (SSH + tmux)"],
     ]);
     this.modeSel.addEventListener("change", () => this.applyMode());
 
@@ -385,6 +410,45 @@ export class AgentLauncher {
     this.orchFields.className = "dlg-field";
     this.orchFields.append(guardRow1, guardRow2, guardRow3, field("Permissions", this.permsSel));
 
+    // Remote session (SSH + tmux) fields (#122). The pane child becomes
+    // `ssh -t <host> tmux new -A -s <session> [-c <cwd>]` — a normal pane, so
+    // detach/reattach is just closing and reopening with the same host+session.
+    this.hostInput = document.createElement("input");
+    this.hostInput.className = "dlg-input";
+    this.hostInput.placeholder = "user@host";
+    this.hostInput.spellcheck = false;
+    this.hostList = document.createElement("datalist");
+    this.hostList.id = "launcher-recent-remotes";
+    this.hostInput.setAttribute("list", this.hostList.id);
+    this.hostInput.addEventListener("input", () => {
+      this.applyRecentSession();
+      this.updateRemoteName();
+    });
+    this.sessionInput = document.createElement("input");
+    this.sessionInput.className = "dlg-input";
+    this.sessionInput.placeholder = "loomux";
+    this.sessionInput.spellcheck = false;
+    this.sessionInput.addEventListener("input", () => {
+      this.sessionDirty = true;
+      this.updateRemoteName();
+    });
+    this.remoteCwdInput = document.createElement("input");
+    this.remoteCwdInput.className = "dlg-input";
+    this.remoteCwdInput.placeholder = "optional — e.g. /home/me/project (only used when first created)";
+    this.remoteCwdInput.spellcheck = false;
+    this.remoteCwdInput.addEventListener("input", () => this.updateRemoteName());
+    this.remoteWarn = document.createElement("div");
+    this.remoteWarn.className = "dlg-error";
+    this.remoteFields = document.createElement("div");
+    this.remoteFields.className = "dlg-field";
+    this.remoteFields.append(
+      field("Host", this.hostInput, "user@host — uses your ssh config/agent for auth"),
+      this.hostList, // datalist must live in the DOM for the list= binding to work
+      field("Session", this.sessionInput, "tmux session; reopen the same one to reattach"),
+      field("Remote directory", this.remoteCwdInput),
+      this.remoteWarn
+    );
+
     this.errorEl = document.createElement("div");
     this.errorEl.className = "dlg-error";
 
@@ -402,16 +466,18 @@ export class AgentLauncher {
     actions.className = "dlg-actions";
     actions.append(cancel, this.launchBtn);
 
+    this.repoField = field("Repository", repoRow);
     dlg.append(
       title,
       field("Mode", this.modeSel),
       this.agentField,
       this.customField,
       this.countField,
-      field("Repository", repoRow),
+      this.repoField,
       this.worktreeField,
       this.autopilotField,
       this.orchFields,
+      this.remoteFields,
       this.nameField,
       this.errorEl,
       actions
@@ -469,6 +535,13 @@ export class AgentLauncher {
     );
     this.worktreeInput.value = "";
     this.autopilotInput.checked = getAutopilot();
+    // Remote fields: prefill the most recent target so reattach is one click.
+    const lastRemote = getRecentRemotes()[0];
+    this.hostInput.value = lastRemote?.host ?? "";
+    this.sessionInput.value = lastRemote?.session ?? "";
+    this.remoteCwdInput.value = lastRemote?.cwd ?? "";
+    this.sessionDirty = Boolean(lastRemote?.session);
+    this.remoteWarn.classList.remove("visible");
     this.nameDirty = false;
     this.applyMode();
     this.setBusy(false);
@@ -478,14 +551,26 @@ export class AgentLauncher {
   /** Show/hide fields for the selected mode. */
   private applyMode(): void {
     const m = this.mode;
-    this.customField.hidden = m === "orchestrator" || this.agentSel.value !== "custom";
-    this.countField.hidden = m !== "multi";
-    this.worktreeField.hidden = m === "orchestrator"; // workers get worktrees on demand
+    const remote = m === "remote";
+    // Remote mode is its own flow (ssh+tmux), so the agent/repo/worktree
+    // chrome all step aside for the host/session fields.
+    this.agentField.hidden = remote;
+    this.repoField.hidden = remote;
+    this.customField.hidden = remote || m === "orchestrator" || this.agentSel.value !== "custom";
+    this.countField.hidden = remote || m !== "multi";
+    this.worktreeField.hidden = remote || m === "orchestrator"; // workers get worktrees on demand
     this.orchFields.hidden = m !== "orchestrator";
+    this.remoteFields.hidden = !remote;
     this.nameField.hidden = m === "orchestrator";
     this.applyOrchCli();
     this.applyAutopilot();
-    this.updateName();
+    if (remote) {
+      this.populateRecentRemotes();
+      this.updateRemoteName();
+      void this.checkSsh();
+    } else {
+      this.updateName();
+    }
   }
 
   /** Show the autopilot toggle only where it applies — single/multi mode, a
@@ -493,7 +578,8 @@ export class AgentLauncher {
    *  mode has its own permission control; custom commands the user fully owns
    *  (appending flags could collide with ones they typed). */
   private applyAutopilot(): void {
-    const applies = this.mode !== "orchestrator" && this.agentSel.value !== "custom";
+    const applies =
+      this.mode !== "orchestrator" && this.mode !== "remote" && this.agentSel.value !== "custom";
     if (!applies) {
       this.autopilotField.hidden = true;
       return;
@@ -634,6 +720,63 @@ export class AgentLauncher {
     this.nameInput.value = `${agent.label.toLowerCase()} · ${where}`;
   }
 
+  /** Fill the host datalist from persisted recent targets so a known session
+   *  is one keystroke to reattach. */
+  private populateRecentRemotes(): void {
+    const seen = new Set<string>();
+    const hosts: string[] = [];
+    for (const t of getRecentRemotes()) {
+      if (!seen.has(t.host)) {
+        seen.add(t.host);
+        hosts.push(t.host);
+      }
+    }
+    this.hostList.replaceChildren(
+      ...hosts.map((h) => {
+        const opt = document.createElement("option");
+        opt.value = h;
+        return opt;
+      })
+    );
+  }
+
+  /** When the host matches a recent target, pre-fill its last session (unless
+   *  the user has hand-edited the session field) so reattach is immediate. */
+  private applyRecentSession(): void {
+    if (this.sessionDirty) return;
+    const host = this.hostInput.value.trim();
+    const match = getRecentRemotes().find((t) => t.host === host);
+    if (match) this.sessionInput.value = match.session;
+  }
+
+  /** Auto-fill the pane name (`host · session`) until hand-edited, and suggest a
+   *  session name derived from host/cwd until the user types one. */
+  private updateRemoteName(): void {
+    const host = this.hostInput.value.trim();
+    if (!this.sessionDirty && !this.sessionInput.value.trim() && host) {
+      this.sessionInput.placeholder = suggestSessionName(host, this.remoteCwdInput.value);
+    }
+    if (this.nameDirty) return;
+    const session = this.sessionInput.value.trim() || this.sessionInput.placeholder || "loomux";
+    this.nameInput.value = host ? `${host} · ${session}` : "remote session";
+  }
+
+  /** Probe for the ssh client and surface an inline warning if it's missing —
+   *  the pane would otherwise just flash the shell's error and die. */
+  private async checkSsh(): Promise<void> {
+    this.sshProbe ??= probeSsh().catch(
+      (e): { available: boolean; error: string | null } => ({ available: false, error: String(e) })
+    );
+    const p = await this.sshProbe;
+    if (this.mode !== "remote") return; // mode changed while probing
+    if (p.available) {
+      this.remoteWarn.classList.remove("visible");
+    } else {
+      this.remoteWarn.textContent = `⚠ ${p.error ?? "ssh was not found."}`;
+      this.remoteWarn.classList.add("visible");
+    }
+  }
+
   private async pickRepo(): Promise<void> {
     const picked = await open({
       directory: true,
@@ -648,6 +791,10 @@ export class AgentLauncher {
 
   private async launch(): Promise<void> {
     if (this.busy) return;
+    if (this.mode === "remote") {
+      await this.launchRemote();
+      return;
+    }
     const repo = this.repoInput.value.trim();
 
     // Fail fast (and legibly) when a selected CLI isn't installed — otherwise
@@ -763,6 +910,35 @@ export class AgentLauncher {
       this.showError(String(err));
       this.setBusy(false);
     }
+  }
+
+  /** Remote session (SSH + tmux) launch: validate ssh presence + the target,
+   *  build the argv, persist for one-click reattach, and open the pane. */
+  private async launchRemote(): Promise<void> {
+    const probe = await (this.sshProbe ??= probeSsh().catch(
+      (e): { available: boolean; error: string | null } => ({ available: false, error: String(e) })
+    ));
+    if (!probe.available) {
+      this.showError(probe.error ?? "The OpenSSH client (ssh) was not found.");
+      return;
+    }
+    const host = this.hostInput.value.trim();
+    const sessionRaw = this.sessionInput.value.trim() || this.sessionInput.placeholder;
+    const cwd = this.remoteCwdInput.value.trim() || undefined;
+    let inv: { argv: string[]; command: string };
+    try {
+      inv = buildRemoteInvocation({ host, session: sessionRaw, cwd });
+    } catch (err) {
+      this.showError(err instanceof Error ? err.message : String(err));
+      this.hostInput.focus();
+      return;
+    }
+    // Persist the *sanitized* session — the name tmux actually uses — so the
+    // recent list reattaches to the real session, not the raw typed text.
+    const session = sanitizeSessionName(sessionRaw);
+    addRecentRemote({ host, session, cwd });
+    const name = this.nameInput.value.trim() || `${host} · ${session}`;
+    this.close({ kind: "panes", specs: [{ name, command: inv.command, argv: inv.argv }] });
   }
 
   private setBusy(busy: boolean): void {

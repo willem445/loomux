@@ -201,6 +201,57 @@ pub fn probe_agent_cli(program: String) -> CliProbe {
     probe
 }
 
+/// Result of probing for the OpenSSH client (issue #122). Unlike the agent
+/// CLIs we don't run `--help` — `ssh` has no such flag and prints usage to
+/// stderr with a non-zero exit — so this only resolves the executable.
+#[derive(Clone, Serialize)]
+pub struct SshProbe {
+    pub available: bool,
+    /// Resolved absolute path when found (for the docs/diagnostics).
+    pub path: Option<String>,
+    pub error: Option<String>,
+}
+
+/// Locate `ssh.exe` (or `ssh` off Windows). Windows 10+ ships the OpenSSH
+/// client but it is an *optional feature* that may be absent, so we probe
+/// rather than assume: first via PATH (a fresh registry PATH, so an SSH
+/// installed after loomux started still counts), then the well-known
+/// `%SystemRoot%\System32\OpenSSH\ssh.exe` fallback for the case where the
+/// feature is installed but its dir isn't on this process's PATH.
+#[tauri::command]
+pub fn probe_ssh() -> SshProbe {
+    let path = crate::winpath::launch_path();
+    let pathext = crate::winpath::launch_pathext();
+    if let Some(p) = crate::winpath::resolve_program("ssh", &path, &pathext) {
+        return SshProbe {
+            available: true,
+            path: Some(p.to_string_lossy().into_owned()),
+            error: None,
+        };
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+        let fallback = std::path::Path::new(&root).join("System32").join("OpenSSH").join("ssh.exe");
+        if fallback.is_file() {
+            return SshProbe {
+                available: true,
+                path: Some(fallback.to_string_lossy().into_owned()),
+                error: None,
+            };
+        }
+    }
+    SshProbe {
+        available: false,
+        path: None,
+        error: Some(
+            "OpenSSH client (ssh) was not found. On Windows 10/11 enable it via \
+             Settings ▸ Apps ▸ Optional features ▸ OpenSSH Client, or install OpenSSH."
+                .into(),
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

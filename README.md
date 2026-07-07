@@ -129,6 +129,41 @@ Scans the local machine for resumable agent sessions:
 Clicking a session opens a new pane in the session's original working
 directory and resumes it there. The pane is auto-named from the session.
 
+### Remote sessions (SSH + tmux) — prototype
+
+> **Prototype (issue #122, Part A).** Direction demo, not polish. See
+> `doc/demo/remote-sessions.md` for a full walkthrough and
+> `doc/design/remote-sessions.md` for the design.
+
+Run a persistent shell or agent on a remote host and see it in a loomux pane.
+In the **New agent pane** dialog pick **Mode → Remote session (SSH + tmux)** and
+give it:
+
+- **Host** — `user@host` (uses your own `ssh` config / agent / keys for auth;
+  loomux never handles credentials).
+- **Session** — the tmux session name. Reopening the *same* host + session
+  **reattaches** it, with all its server-side scrollback and layout intact.
+- **Remote directory** *(optional)* — the start directory, used only when the
+  session is first created.
+
+Under the hood the pane's child process is just
+`ssh -t <host> tmux new -A -s <session> [-c <dir>]` — an ordinary loomux pane, so
+detaching is nothing more than closing the pane (or the network dropping): the
+tmux session keeps running on the host. `tmux new -A` is *attach-or-create*, so
+reopening resumes it. Recent targets are remembered, so a known session is one
+click to reattach.
+
+Prereqs on the remote: an SSH server you can key-auth into and `tmux`
+installed. Any agent CLI you run there (`claude`, `copilot`, …) authenticates
+**on the remote** — loomux doesn't ferry credentials. If the local `ssh` client
+is missing (it's an optional Windows feature), the dialog says so before you
+launch; host-unreachable / `tmux`-missing errors surface as plain text in the
+pane.
+
+**Not in this prototype:** no remote *orchestration groups* (the MCP server is
+localhost-bound — that's the deferred remote-daemon work), and nothing
+web/phone-facing. This is a remote *terminal* you steer by hand.
+
 ### Open in editor
 
 Loomux is a terminal, not an editor — so when you need to open files in a real

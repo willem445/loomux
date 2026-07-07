@@ -119,7 +119,7 @@ async function openPane(dir: "row" | "column" = "row", relativeTo?: Pane): Promi
   let d = dir;
   for (const spec of result.specs) {
     const pane = await grid.openPane(
-      { name: spec.name, cwd: spec.cwd, command: spec.command },
+      { name: spec.name, cwd: spec.cwd, command: spec.command, argv: spec.argv },
       paneEvents,
       d,
       prev
