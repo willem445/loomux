@@ -164,9 +164,6 @@ your speech locally and drops the text at your current focus. **`Esc`** cancels
 at any point (including mid-transcription). Transcription is never auto-submitted:
 you review it and press Enter yourself.
 
-> **Note:** the hotkey is `Alt+S` (changed from `Alt+V`, which collided with
-> Claude Code's paste-image binding inside agent panes).
-
 - **Where the text lands** follows focus, decided when you start:
   - a **compose/steer box** focused → inserted at the caret;
   - any **terminal pane** focused (an agent, the orchestrator pane, a plain

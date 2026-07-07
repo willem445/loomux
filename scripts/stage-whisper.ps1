@@ -14,7 +14,7 @@
 
   -Dest defaults to %LOCALAPPDATA%\loomux\whisper — the power-user path in
   loomux's resolution order (bundled resources -> LOOMUX_WHISPER_* env vars ->
-  %LOCALAPPDATA%). After running, restart loomux and press Alt+V.
+  %LOCALAPPDATA%). After running, restart loomux and press Alt+S.
 
   If you install elsewhere, point loomux at it with the env overrides:
       setx LOOMUX_WHISPER_CLI   "<Dest>\whisper-cli.exe"
@@ -98,4 +98,4 @@ $model   = (Get-Item (Join-Path $ModelDir 'ggml-base.en.bin')).Length
 Write-Host ''
 Write-Host ("Installed whisper {0} to {1}" -f $WhisperVersion, $Dest)
 Write-Host ("  runtime {0:N1} MiB ({1} files) + model {2:N1} MiB" -f ($runtime / 1MB), $staged, ($model / 1MB))
-Write-Host '  Restart loomux and press Alt+V to dictate.'
+Write-Host '  Restart loomux and press Alt+S to dictate.'
