@@ -38,34 +38,40 @@ test("resolveVoiceTargetKind: nothing focusable → none", () => {
 test("voice machine: full happy-path capture cycle", () => {
   let s: VoiceMachineState = "idle";
   s = nextVoiceState(s, "toggle"); // press to record
-  assert.equal(s, "busy"); // awaiting backend start
+  assert.equal(s, "starting"); // awaiting backend start
   s = nextVoiceState(s, "ackRecording"); // mic confirmed live
   assert.equal(s, "recording");
   s = nextVoiceState(s, "toggle"); // press to stop
-  assert.equal(s, "busy"); // transcribing
+  assert.equal(s, "transcribing"); // local transcription running
   s = nextVoiceState(s, "settle"); // transcript delivered
   assert.equal(s, "idle");
 });
 
 test("voice machine: failed start settles back to idle", () => {
   let s: VoiceMachineState = nextVoiceState("idle", "toggle");
-  assert.equal(s, "busy");
+  assert.equal(s, "starting");
   s = nextVoiceState(s, "settle"); // start rejected (no mic, etc.)
   assert.equal(s, "idle");
 });
 
-test("voice machine: Esc cancels an active recording", () => {
-  let s: VoiceMachineState = "recording";
-  s = nextVoiceState(s, "cancel");
-  assert.equal(s, "busy"); // cancelling
-  s = nextVoiceState(s, "settle");
-  assert.equal(s, "idle");
+test("voice machine: Esc cancels an active recording immediately", () => {
+  assert.equal(nextVoiceState("recording", "cancel"), "idle");
 });
 
-test("voice machine: busy swallows stray toggles (no double-start)", () => {
-  assert.equal(nextVoiceState("busy", "toggle"), "busy");
-  // Esc while busy is also ignored until the in-flight op settles.
-  assert.equal(nextVoiceState("busy", "cancel"), "busy");
+test("voice machine: Esc during transcribing cancels (kills subprocess)", () => {
+  assert.equal(nextVoiceState("transcribing", "cancel"), "idle");
+});
+
+test("voice machine: toggle is ignored while transcribing (no interrupt)", () => {
+  assert.equal(nextVoiceState("transcribing", "toggle"), "transcribing");
+});
+
+test("voice machine: toggle is ignored while starting (no double-start)", () => {
+  assert.equal(nextVoiceState("starting", "toggle"), "starting");
+});
+
+test("voice machine: Esc while starting aborts to idle", () => {
+  assert.equal(nextVoiceState("starting", "cancel"), "idle");
 });
 
 test("voice machine: idle ignores non-toggle events", () => {

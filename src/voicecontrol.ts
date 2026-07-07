@@ -4,8 +4,10 @@
 // target chosen at capture start: a focused compose box (insert at caret) or the
 // active pane's terminal (paste into its PTY — bracketed, never auto-submitted).
 //
-// It stays out of pane.ts to keep that file focused and to make the single-
-// capture invariant obvious: there is one controller, one state, one target.
+// Transcription is async on the backend (the whisper subprocess can run for
+// minutes on a large model), so the flow has a visible "transcribing" phase and
+// Esc can cancel it. A generation counter guards against a late transcript
+// landing after the user cancelled or closed the pane.
 
 import { voiceStart, voiceStop, voiceCancel } from "./pty";
 import { showToast } from "./toast";
@@ -14,6 +16,9 @@ import {
   nextVoiceState,
   type VoiceMachineState,
 } from "./voice";
+
+/** Visual phase shown on the target while a capture is live. */
+export type VoicePhase = "recording" | "transcribing" | "off";
 
 /** The pane-side surface the controller drives. `Pane` implements this; the
  *  controller depends only on this interface so there's no import cycle. */
@@ -24,10 +29,9 @@ export interface VoiceTargetPane {
   insertTranscript(text: string): void;
   /** Paste transcribed text into the terminal's PTY (bracketed, no newline). */
   pasteToTerminal(text: string): void;
-  /** Toggle the mic-button "recording" pulse (compose-target indicator). */
-  setMicRecording(on: boolean): void;
-  /** Toggle the terminal-capture overlay badge (terminal-target indicator). */
-  setTerminalRecording(on: boolean): void;
+  /** Reflect the capture phase on the target's indicator (mic button for a
+   *  compose target, overlay badge for a terminal target). */
+  setVoicePhase(kind: "compose" | "terminal", phase: VoicePhase): void;
   /** Show a transient status/error line on the strip (compose panes only). */
   showVoiceStatus(msg: string): void;
 }
@@ -39,45 +43,45 @@ class VoiceController {
   private target: Target | null = null;
   private getActivePane: () => VoiceTargetPane | null = () => null;
   private escHandler: ((e: KeyboardEvent) => void) | null = null;
+  /** Bumped on every cancel/dispose so a late begin()/stop() result is dropped
+   *  instead of landing in a target the user has moved on from. */
+  private gen = 0;
 
   /** Wire the controller to the grid so the hotkey can find the active pane. */
   init(getActivePane: () => VoiceTargetPane | null): void {
     this.getActivePane = getActivePane;
   }
 
-  /** Alt+V from anywhere: stop if a capture is running, else start one aimed at
-   *  whatever holds focus (compose box → caret, else active terminal). */
+  /** Alt+S from anywhere: start a capture aimed at whatever holds focus, stop a
+   *  live recording (→ transcribe), or — while starting/transcribing — do
+   *  nothing (Esc is how you bail out of those). */
   toggleFromHotkey(): void {
-    if (this.state !== "idle") {
-      this.stopOrCancel(/* viaEsc */ false);
-      return;
-    }
-    const pane = this.getActivePane();
-    const kind = resolveVoiceTargetKind({
-      composeFocused: !!pane?.isComposeFocused(),
-      hasActivePane: !!pane,
+    this.toggle(() => {
+      const pane = this.getActivePane();
+      const kind = resolveVoiceTargetKind({
+        composeFocused: !!pane?.isComposeFocused(),
+        hasActivePane: !!pane,
+      });
+      if (kind === "none" || !pane) {
+        showToast("Voice: focus a pane or the compose box first.");
+        return null;
+      }
+      return { pane, kind };
     });
-    if (kind === "none" || !pane) {
-      showToast("Voice: focus a pane or the compose box first.");
-      return;
-    }
-    void this.begin({ pane, kind });
   }
 
-  /** Mic button on a compose strip: stop a running capture, else start one
-   *  targeting this strip's compose box. */
+  /** Mic button on a compose strip: same toggle, but the target is always this
+   *  strip's compose box. */
   toggleForCompose(pane: VoiceTargetPane): void {
-    if (this.state !== "idle") {
-      this.stopOrCancel(false);
-      return;
-    }
-    void this.begin({ pane, kind: "compose" });
+    this.toggle(() => ({ pane, kind: "compose" }));
   }
 
-  /** A pane is going away — abandon the capture if it was the target so the
-   *  backend mic stream is released and no transcript lands in a dead pane. */
+  /** A pane is going away — abandon the capture if it was the target so the mic
+   *  stream / whisper subprocess is released and no transcript lands in a dead
+   *  pane. */
   notifyPaneDisposed(pane: VoiceTargetPane): void {
     if (this.target?.pane === pane && this.state !== "idle") {
+      this.gen++;
       this.removeEsc();
       this.state = "idle";
       this.target = null;
@@ -87,58 +91,81 @@ class VoiceController {
 
   // ----- internals -----
 
-  /** Start a capture toward `t`. Errors (no mic, permission) settle back to
-   *  idle with a message on the target. */
+  /** Shared toggle: begin from idle, stop from recording, ignore otherwise. */
+  private toggle(resolve: () => Target | null): void {
+    if (this.state === "idle") {
+      const t = resolve();
+      if (t) void this.begin(t);
+    } else if (this.state === "recording") {
+      this.stop();
+    }
+    // starting / transcribing → ignored (use Esc to cancel)
+  }
+
+  /** Start a capture toward `t`. Errors (no mic, permission) settle back to idle
+   *  with a message on the target. */
   private async begin(t: Target): Promise<void> {
-    this.state = nextVoiceState(this.state, "toggle"); // → busy
+    const myGen = this.gen;
+    this.state = nextVoiceState(this.state, "toggle"); // → starting
     this.target = t;
     try {
       await voiceStart();
+      if (this.gen !== myGen) return; // cancelled during start
       this.state = nextVoiceState(this.state, "ackRecording"); // → recording
-      this.setIndicator(t, true);
-      this.installEsc();
+      this.setPhase(t, "recording");
+      this.installEsc(); // Esc now cancels; stays through transcribing
     } catch (err) {
+      if (this.gen !== myGen) return;
       this.state = nextVoiceState(this.state, "settle"); // → idle
       this.target = null;
       this.status(t, `Mic: ${String(err)}`);
     }
   }
 
-  /** Toggle/Esc while active: stop-and-transcribe (viaEsc=false) or cancel
-   *  (viaEsc=true). No-op unless we're actually recording. */
-  private stopOrCancel(viaEsc: boolean): void {
-    if (this.state !== "recording") return; // busy → ignore
+  /** Stop recording and run the (async) transcription, showing a transcribing
+   *  indicator meanwhile. */
+  private stop(): void {
     const t = this.target;
-    this.state = nextVoiceState(this.state, viaEsc ? "cancel" : "toggle"); // → busy
-    if (t) this.setIndicator(t, false);
-    this.removeEsc();
-    if (viaEsc) void this.doCancel(t);
-    else void this.doStop(t);
+    this.state = nextVoiceState(this.state, "toggle"); // recording → transcribing
+    if (t) this.setPhase(t, "transcribing");
+    void this.runStop(t);
   }
 
-  private async doStop(t: Target | null): Promise<void> {
+  private async runStop(t: Target | null): Promise<void> {
+    const myGen = this.gen;
     try {
       const text = await voiceStop();
-      if (!t) return;
-      if (text) this.deliver(t, text);
-      else this.status(t, "Voice: no speech detected.");
+      if (this.gen !== myGen) return; // cancelled/disposed mid-transcribe
+      if (t) {
+        this.setPhase(t, "off");
+        if (text) this.deliver(t, text);
+        else this.status(t, "Voice: no speech detected.");
+      }
     } catch (err) {
-      if (t) this.status(t, `Transcription: ${String(err)}`);
+      if (this.gen !== myGen) return;
+      if (t) {
+        this.setPhase(t, "off");
+        this.status(t, `Transcription: ${String(err)}`);
+      }
     } finally {
-      this.state = nextVoiceState(this.state, "settle"); // → idle
-      this.target = null;
+      if (this.gen === myGen) {
+        this.removeEsc();
+        this.state = nextVoiceState(this.state, "settle"); // → idle
+        this.target = null;
+      }
     }
   }
 
-  private async doCancel(t: Target | null): Promise<void> {
-    try {
-      await voiceCancel();
-    } catch {
-      /* best-effort */
-    } finally {
-      this.state = nextVoiceState(this.state, "settle"); // → idle
-      this.target = null;
-    }
+  /** Esc while recording (discard) or transcribing (kill the subprocess). */
+  private cancel(): void {
+    if (this.state === "idle") return;
+    const t = this.target;
+    this.gen++; // invalidate any in-flight begin()/runStop()
+    this.removeEsc();
+    if (t) this.setPhase(t, "off");
+    this.state = nextVoiceState(this.state, "cancel"); // → idle
+    this.target = null;
+    void voiceCancel().catch(() => {}); // stops the mic and/or kills whisper
     if (t) this.status(t, "Voice: cancelled.");
   }
 
@@ -147,9 +174,8 @@ class VoiceController {
     else t.pane.pasteToTerminal(text);
   }
 
-  private setIndicator(t: Target, on: boolean): void {
-    if (t.kind === "compose") t.pane.setMicRecording(on);
-    else t.pane.setTerminalRecording(on);
+  private setPhase(t: Target, phase: VoicePhase): void {
+    t.pane.setVoicePhase(t.kind, phase);
   }
 
   /** Errors/status go to the strip for compose targets (it has a status line)
@@ -159,15 +185,15 @@ class VoiceController {
     else showToast(msg);
   }
 
-  /** While recording, Esc cancels the capture instead of reaching the shell or
-   *  the compose box. Capture-phase so it wins over both. Removed on stop. */
+  /** While recording or transcribing, Esc cancels instead of reaching the shell
+   *  or the compose box. Capture-phase so it wins over both. Removed once idle. */
   private installEsc(): void {
     if (this.escHandler) return;
     this.escHandler = (e: KeyboardEvent) => {
       if (e.key !== "Escape") return;
       e.preventDefault();
       e.stopPropagation();
-      this.stopOrCancel(true);
+      this.cancel();
     };
     document.addEventListener("keydown", this.escHandler, { capture: true });
   }

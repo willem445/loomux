@@ -9,16 +9,17 @@ this note is the architecture and the decisions behind it.
 ## Flow
 
 ```
- Alt+V / 🎤 ─▶ voiceController.toggle ─▶ voice_start (Rust)
+ Alt+S / 🎤 ─▶ voiceController.toggle ─▶ voice_start (Rust)
  (main.ts /                                └─ cpal opens the default mic on a
   mic button)                                 dedicated thread; buffers mono f32
- Alt+V / 🎤 ─▶ voiceController.stop  ─▶ voice_stop(app, state)
-                                          ├─ join capture thread
-                                          ├─ resample → 16 kHz mono
-                                          ├─ encode WAV (scratch temp)
-                                          ├─ resolve whisper runtime (below)
-                                          ├─ run whisper-cli.exe (subprocess)
-                                          └─ parse stdout → transcript
+ Alt+S / 🎤 ─▶ voiceController.stop  ─▶ voice_stop(app, state)  [async]
+                                          └─ spawn_blocking:
+                                             ├─ join capture thread
+                                             ├─ resample → 16 kHz mono
+                                             ├─ encode WAV (scratch temp)
+                                             ├─ resolve whisper runtime (below)
+                                             ├─ spawn whisper-cli.exe (killable)
+                                             └─ parse stdout → transcript
    deliver to target ◀── transcript ─────────┘
      compose box → insert at caret   |   terminal → xterm paste (bracketed, no \n)
 ```
@@ -29,25 +30,39 @@ this note is the architecture and the decisions behind it.
   - `resolveVoiceTargetKind` — the insertion-target decision: a focused compose
     box wins; otherwise the active pane's terminal; otherwise nothing.
   - `nextVoiceState` — the push-to-talk state machine
-    (`idle → busy → recording → busy → idle`). `busy` is the async in-flight
-    guard that makes a double-tap a no-op, so only one capture ever runs.
+    (`idle → starting → recording → transcribing → idle`). `starting` and
+    `transcribing` swallow stray toggles so a double-tap can't double-start or
+    interrupt a transcription; only one capture ever runs.
 - **`src/voicecontrol.ts`** — one global `voiceController` (the single-capture
   invariant is "one controller, one state, one target"). It owns the state
-  machine, calls the backend, routes the transcript, drives the recording
-  indicator, and installs a capture-phase `Esc` handler *only while recording*
-  (so Esc cancels voice without otherwise stealing Esc from the shell/compose
-  box). Depends on panes only through the `VoiceTargetPane` interface — no import
-  cycle.
+  machine, calls the backend, routes the transcript, drives the phase indicator,
+  and installs a capture-phase `Esc` handler while recording *or transcribing*
+  (so Esc cancels without otherwise stealing Esc from the shell/compose box). A
+  **generation counter** invalidates a late `voiceStart`/`voiceStop` result when
+  the user cancelled or closed the pane mid-flight, so a stale transcript never
+  lands. Depends on panes only through the `VoiceTargetPane` interface — no
+  import cycle.
 - **`src/pane.ts`** implements `VoiceTargetPane`: `isComposeFocused()`,
   `insertTranscript()` (caret insert), `pasteToTerminal()` (`xterm.paste`, which
-  applies bracketed-paste semantics and adds no newline), plus the two indicator
-  toggles. The mic button (orchestrator strip only) and the `Alt+V` hotkey
-  (any pane) both go through the controller.
+  applies bracketed-paste semantics and adds no newline), plus `setVoicePhase()`
+  (mic-button pulse/spin for compose targets, overlay badge for terminal
+  targets). The mic button (orchestrator strip only) and the `Alt+S` hotkey (any
+  pane) both go through the controller.
 
-**Hotkey — `Alt+V`.** Chosen over `Ctrl+Shift+V` (the terminal paste combo,
-handled per-pane) and to match loomux's `Alt+<letter>` app-shortcut family
-(`shortcuts.ts`). Terminals decline app shortcuts (`isAppShortcut`) so `Alt+V`
-bubbles to the document handler from any focused pane.
+**Transcribing phase & responsiveness.** Stopping a recording enters
+`transcribing`, which shows a "Transcribing…" spinner (amber) distinct from the
+red "Recording" state. The backend `voice_stop` is **async** and runs the whisper
+subprocess on `spawn_blocking`, so the webview stays responsive even on a
+multi-minute large-model transcription (the original UI froze because the
+subprocess ran inline on the command path). A toggle during `transcribing` is
+ignored; **Esc cancels** it (see backend kill, below).
+
+**Hotkey — `Alt+S`** ("speak"). Changed from `Alt+V`, which is Claude Code's
+paste-image binding — and because loomux intercepts app shortcuts before the
+terminal (`isAppShortcut` → the pane declines them so they bubble to the document
+handler), `Alt+V` was *stolen* from agents in a pane. `Alt+M` (the obvious "mic")
+is already minimize-pane. `Alt+S` is free in loomux, unused by Claude Code
+(verified against its keybindings docs), and not a readline word-motion binding.
 
 **No PTY resize.** The terminal-capture indicator is an absolutely-positioned
 overlay badge inside `.pane-term` (which is `position: relative`); it floats over
@@ -110,6 +125,24 @@ RMS is sane).
 git.rs-style `Command` with `CREATE_NO_WINDOW`, `-nt -l en`; stdout parsed into
 one prompt line (timestamps and `[BLANK_AUDIO]`-style markers stripped).
 
+**Async + cancellable.** `voice_stop` is an `async` command that clones the state
+`Arc`s and runs the join + subprocess on `tauri::async_runtime::spawn_blocking`,
+so a multi-minute transcription never blocks the webview (the original freeze).
+The subprocess is `spawn()`ed (not `output()`) and **enrolled in a kill-on-close
+Job Object** — reusing `pty::assign_kill_on_close_job` (#78). The `JobHandle`
+lives in `VoiceState.transcribing`; dropping it fires `KILL_ON_JOB_CLOSE`, so:
+
+- **Esc while transcribing** → `voice_cancel` takes/drops the handle → whisper is
+  killed → the blocking `wait_with_output` returns and stops burning CPU. (Esc
+  while *recording* just discards the audio.)
+- **Pane close** → the frontend calls `voice_cancel` (same kill path).
+- **App exit / crash** → loomux's death closes its last handle to the job, so the
+  OS reaps whisper too — never orphaned. Fail-soft: if the job can't be created,
+  transcription still runs, just without the cancel/orphan guarantee.
+
+A `spawn_blocking` closure holds only `Send` values (the two `Arc`s + the bundled
+path), so the `State` guard is never held across an await.
+
 **Why subprocess, not the `whisper-rs` crate.** `whisper-rs` is itself
 getrandom-clean at runtime, but `whisper-rs-sys` builds whisper.cpp from C++ via
 cmake, which would drag a cmake + MSVC toolchain requirement into
@@ -154,10 +187,15 @@ Every failure names all three locations so the message is actionable.
 
 ### Tested pure logic
 
-`resample_linear`, `encode_wav_pcm16`, `parse_whisper_output`, and
-`is_dll_load_failure` have inline unit tests (cross-platform). Live capture and
-the subprocess call are validated by hand (they need a real mic + the whisper
-runtime), per the repo's no-DOM-sim / no-live-agent test policy.
+`resample_linear`, `encode_wav_pcm16`, `parse_whisper_output`,
+`is_dll_load_failure`, and `ChunkedBuffer`/`rms`/`duration_secs` have inline unit
+tests (cross-platform); the push-to-talk state machine (`nextVoiceState`,
+including the `transcribing` state and Esc-cancel transitions) is tested in
+`test/voice.test.ts`. Live capture, the async command path, and the
+subprocess-kill (which need a real mic, a Tauri runtime, and the whisper runtime)
+are validated by hand — record 60–90 s, confirm a responsive UI during
+transcription, and confirm Esc/pane-close terminate the whisper process — per the
+repo's no-DOM-sim / no-live-agent test policy.
 
 ## Cross-platform path (not yet built)
 

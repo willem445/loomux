@@ -41,11 +41,18 @@
 
 // ---------- Tauri state ----------
 
-/// Managed Tauri state: on Windows it holds at most one active recording; on
-/// other platforms it is an empty marker so the command signatures still type.
+/// Managed Tauri state. On Windows it holds the two live phases of a capture —
+/// the mic recording, and the running whisper subprocess (as a kill-on-close
+/// Job Object handle so cancel / pane-close / app-exit can terminate it, never
+/// orphan it — issue #78). Both are `Arc`s so the async `voice_stop` command can
+/// clone them out and move the blocking work onto `spawn_blocking` without
+/// holding the webview thread. Off Windows it's an empty marker.
 #[cfg(windows)]
 #[derive(Default)]
-pub struct VoiceState(std::sync::Mutex<Option<win::Recording>>);
+pub struct VoiceState {
+    recording: std::sync::Arc<std::sync::Mutex<Option<win::Recording>>>,
+    transcribing: std::sync::Arc<std::sync::Mutex<Option<crate::pty::JobHandle>>>,
+}
 
 #[cfg(not(windows))]
 #[derive(Default)]
@@ -61,25 +68,37 @@ const VOICE_UNAVAILABLE: &str = "voice capture is only available on Windows in t
 #[cfg(windows)]
 #[tauri::command]
 pub fn voice_start(state: tauri::State<'_, VoiceState>) -> Result<(), String> {
-    win::start(&state)
+    win::start(&state.recording)
 }
 
 /// Stop the active recording, transcribe it locally, and return the text.
-/// `app` is used to locate the whisper runtime bundled as a Tauri resource.
+///
+/// Async + `spawn_blocking`: the whisper subprocess can run for minutes on a
+/// large model, so it must NOT run inline on the command/webview path (that
+/// froze the UI). We clone the state `Arc`s out synchronously, then do the join
+/// + subprocess work on a blocking task while the webview stays responsive.
+/// `app` locates the whisper runtime bundled as a Tauri resource.
 #[cfg(windows)]
 #[tauri::command]
-pub fn voice_stop(
+pub async fn voice_stop(
     app: tauri::AppHandle,
     state: tauri::State<'_, VoiceState>,
 ) -> Result<String, String> {
-    win::stop(&state, win::bundled_whisper_dir(&app))
+    let recording = state.recording.clone();
+    let transcribing = state.transcribing.clone();
+    let bundled = win::bundled_whisper_dir(&app);
+    tauri::async_runtime::spawn_blocking(move || win::stop_blocking(&recording, &transcribing, bundled))
+        .await
+        .map_err(|e| format!("voice task failed: {e}"))?
 }
 
-/// Cancel any active recording without transcribing. Idempotent.
+/// Cancel any active capture: stop an in-flight recording and/or kill the
+/// running whisper subprocess (dropping the Job Object handle terminates it).
+/// Idempotent — used by Esc, pane close, and app teardown.
 #[cfg(windows)]
 #[tauri::command]
 pub fn voice_cancel(state: tauri::State<'_, VoiceState>) -> Result<(), String> {
-    win::cancel(&state);
+    win::cancel(&state.recording, &state.transcribing);
     Ok(())
 }
 
@@ -91,7 +110,7 @@ pub fn voice_start(_state: tauri::State<'_, VoiceState>) -> Result<(), String> {
 
 #[cfg(not(windows))]
 #[tauri::command]
-pub fn voice_stop(
+pub async fn voice_stop(
     _app: tauri::AppHandle,
     _state: tauri::State<'_, VoiceState>,
 ) -> Result<String, String> {
@@ -112,14 +131,21 @@ pub fn voice_cancel(_state: tauri::State<'_, VoiceState>) -> Result<(), String> 
 mod win {
     use super::{
         duration_secs, encode_wav_pcm16, is_dll_load_failure, parse_whisper_output, resample_linear,
-        rms, ChunkedBuffer, VoiceState,
+        rms, ChunkedBuffer,
     };
+    use crate::pty::JobHandle;
     use std::path::{Path, PathBuf};
     use std::sync::mpsc::{self, Receiver, Sender};
     use std::sync::{Arc, Mutex};
     use std::thread::JoinHandle;
 
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+
+    /// Shorthand for the recording slot shared with the Tauri state.
+    type RecSlot = Arc<Mutex<Option<Recording>>>;
+    /// Shorthand for the running-transcription slot: a kill-on-close Job Object
+    /// handle for the whisper subprocess (dropping it terminates the process).
+    type JobSlot = Arc<Mutex<Option<JobHandle>>>;
 
     /// Sample rate Whisper (ggml) models are trained on. Everything is resampled
     /// to this mono rate before transcription.
@@ -159,8 +185,8 @@ mod win {
 
     /// Begin capturing. Errors before returning if there is no input device or
     /// the stream can't be built, so the UI can surface a real message.
-    pub fn start(state: &VoiceState) -> Result<(), String> {
-        let mut slot = state.0.lock().map_err(|_| "voice state poisoned")?;
+    pub fn start(recording: &RecSlot) -> Result<(), String> {
+        let mut slot = recording.lock().map_err(|_| "voice state poisoned")?;
         if slot.is_some() {
             return Err("already recording".into());
         }
@@ -188,13 +214,20 @@ mod win {
         }
     }
 
-    /// Stop and transcribe. Empty/near-silent captures return an empty string
-    /// rather than an error, so a mis-click just yields nothing to insert — but
-    /// an empty capture caused by a mid-record device fault surfaces that error.
-    /// `bundled` is the resource-dir whisper runtime (highest resolution priority).
-    pub fn stop(state: &VoiceState, bundled: Option<PathBuf>) -> Result<String, String> {
+    /// Stop and transcribe — the blocking half, run on `spawn_blocking` so the
+    /// multi-minute whisper subprocess never stalls the webview. Empty/near-
+    /// silent captures return an empty string (a mis-click yields nothing); an
+    /// empty capture caused by a mid-record device fault surfaces that error.
+    /// The running subprocess registers itself in `transcribing` so a concurrent
+    /// `cancel` (Esc / pane close) can kill it. `bundled` is the resource-dir
+    /// whisper runtime (highest resolution priority).
+    pub fn stop_blocking(
+        recording: &RecSlot,
+        transcribing: &JobSlot,
+        bundled: Option<PathBuf>,
+    ) -> Result<String, String> {
         let recording = {
-            let mut slot = state.0.lock().map_err(|_| "voice state poisoned")?;
+            let mut slot = recording.lock().map_err(|_| "voice state poisoned")?;
             slot.take().ok_or("not recording")?
         };
         let _ = recording.stop_tx.send(());
@@ -226,7 +259,7 @@ mod win {
         // We have audio; transcribe it even if a late device error also occurred
         // (partial speech beats dropping it).
         let mono16k = resample_linear(&captured.samples, captured.sample_rate, WHISPER_SAMPLE_RATE);
-        let text = transcribe(&mono16k, bundled)?;
+        let text = transcribe(&mono16k, bundled, transcribing)?;
         // Surface the max-duration cap once we have a (partial) transcript, so
         // the user knows why a very long dictation was cut off.
         if captured.capped {
@@ -245,10 +278,18 @@ mod win {
         }
     }
 
-    /// Cancel any active recording without transcribing.
-    pub fn cancel(state: &VoiceState) {
-        let recording = state.0.lock().ok().and_then(|mut slot| slot.take());
-        if let Some(r) = recording {
+    /// Cancel any active capture. Kills a running whisper subprocess (dropping
+    /// the taken Job Object handle terminates it) and stops an in-flight
+    /// recording. Idempotent — safe to call from Esc, pane close, or teardown.
+    pub fn cancel(recording: &RecSlot, transcribing: &JobSlot) {
+        // Drop the job handle first: closing its last handle fires
+        // KILL_ON_JOB_CLOSE and terminates the whisper process immediately, so
+        // the blocking wait in stop_blocking returns and stops burning CPU.
+        if let Ok(mut slot) = transcribing.lock() {
+            slot.take(); // dropped here → whisper killed
+        }
+        let rec = recording.lock().ok().and_then(|mut slot| slot.take());
+        if let Some(r) = rec {
             let _ = r.stop_tx.send(());
             let _ = r.join.join();
         }
@@ -462,8 +503,13 @@ mod win {
         bins.into_iter().next()
     }
 
-    /// Write a scratch WAV, run whisper.cpp, and return the transcript.
-    fn transcribe(mono16k: &[f32], bundled: Option<PathBuf>) -> Result<String, String> {
+    /// Write a scratch WAV, run whisper.cpp, and return the transcript. The
+    /// subprocess registers in `transcribing` so `cancel` can kill it.
+    fn transcribe(
+        mono16k: &[f32],
+        bundled: Option<PathBuf>,
+        transcribing: &JobSlot,
+    ) -> Result<String, String> {
         let paths = resolve_whisper(&bundled)?;
 
         let wav = encode_wav_pcm16(mono16k, WHISPER_SAMPLE_RATE);
@@ -484,20 +530,28 @@ mod win {
             );
         }
 
-        let result = run_whisper(&paths, &wav_path);
+        let result = run_whisper(&paths, &wav_path, transcribing);
         if !keep {
             let _ = std::fs::remove_file(&wav_path); // best-effort cleanup
         }
         result
     }
 
-    /// Invoke whisper.cpp on `wav_path` and parse its stdout into plain text.
-    fn run_whisper(paths: &WhisperPaths, wav_path: &Path) -> Result<String, String> {
+    /// Invoke whisper.cpp on `wav_path` and parse its stdout into plain text. The
+    /// child is spawned (not `output()`) so it can be enrolled in a kill-on-close
+    /// Job Object stored in `transcribing`; `cancel` drops that handle to kill it
+    /// (Esc / pane close / app exit), and loomux's own death closes the last job
+    /// handle so the OS reaps it too — never orphaned (issue #78 pattern).
+    fn run_whisper(
+        paths: &WhisperPaths,
+        wav_path: &Path,
+        transcribing: &JobSlot,
+    ) -> Result<String, String> {
         use std::os::windows::process::CommandExt;
-        use std::process::Command;
+        use std::process::{Command, Stdio};
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-        let out = Command::new(&paths.cli)
+        let child = Command::new(&paths.cli)
             .arg("-m")
             .arg(&paths.model)
             .arg("-f")
@@ -506,7 +560,9 @@ mod win {
             .arg("-l")
             .arg("en")
             .creation_flags(CREATE_NO_WINDOW)
-            .output()
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .map_err(|e| {
                 // ERROR_MOD_NOT_FOUND (126) at CreateProcess = the exe's imported
                 // DLLs are missing (the demo failure). 127 ≈ not found.
@@ -518,6 +574,28 @@ mod win {
                     _ => format!("failed to run whisper: {e}"),
                 }
             })?;
+
+        // Enroll the child in a kill-on-close job so cancel/close/exit can kill
+        // it. Fail-soft (as in pty.rs): if the job can't be made, transcription
+        // still runs — just without the cancel/orphan guarantee.
+        if let Some(job) = crate::pty::assign_kill_on_close_job(child.id()) {
+            if let Ok(mut slot) = transcribing.lock() {
+                *slot = Some(job);
+            }
+        }
+
+        // Blocks here until whisper finishes — or until `cancel` drops the job
+        // handle, which terminates it and makes this return with a killed status.
+        let out = child
+            .wait_with_output()
+            .map_err(|e| format!("failed to run whisper: {e}"))?;
+
+        // Whisper is done (or was killed): drop our job handle so we don't keep a
+        // dead job around. If `cancel` already took it, this is a no-op.
+        if let Ok(mut slot) = transcribing.lock() {
+            slot.take();
+        }
+
         if !out.status.success() {
             // The process started but exited with a DLL-load NTSTATUS → same fix.
             if let Some(code) = out.status.code() {
@@ -525,8 +603,10 @@ mod win {
                     return Err(dll_error(&paths.cli));
                 }
             }
+            // A cancel kills the child; report it as cancelled (empty), which the
+            // frontend discards anyway once it moved past this capture.
             return Err(format!(
-                "whisper failed (exit {:?}): {}",
+                "whisper exited (code {:?}): {}",
                 out.status.code(),
                 String::from_utf8_lossy(&out.stderr).trim()
             ));
