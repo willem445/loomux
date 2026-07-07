@@ -196,7 +196,9 @@ installer**, so it works out of the box.
 
 If the mic can't be opened (no device, or Windows microphone privacy blocks it),
 or the whisper runtime is missing/misconfigured, loomux surfaces a specific
-message rather than failing silently.
+message rather than failing silently. Recordings are capped at 5 minutes. To
+debug a capture, set `LOOMUX_VOICE_KEEP_WAV=1` — loomux keeps the scratch WAV and
+logs its path, duration, and level.
 
 ### Git view
 
