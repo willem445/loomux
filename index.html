@@ -31,14 +31,19 @@
       <div id="workspace">
         <aside id="sessions" class="hidden"></aside>
         <div id="grid-area">
-          <main id="grid-root"></main>
-          <div id="pane-dock" hidden aria-label="Minimized panes"></div>
+          <!-- Project tabs (#63): one strip above a stack of per-tab
+               workspaces. main.ts seeds one default tab; each Workspace mounts
+               its own .grid-root + .pane-dock into #workspace-stack. -->
+          <nav id="tab-bar" aria-label="Project tabs"></nav>
+          <div id="workspace-stack"></div>
         </div>
       </div>
       <footer id="hintbar">
         <span><kbd>Ctrl+Shift+E</kbd> split right</span>
         <span><kbd>Ctrl+Shift+O</kbd> split down</span>
         <span><kbd>Ctrl+Shift+W</kbd> close pane</span>
+        <span><kbd>Ctrl+Shift+T</kbd> new tab</span>
+        <span><kbd>Ctrl+Shift+[ ]</kbd> prev/next tab</span>
         <span><kbd>Ctrl+Shift+P</kbd> sessions</span>
         <span><kbd>Ctrl+Shift+A</kbd> agent mode</span>
         <span><kbd>Ctrl+Shift+M</kbd> maximize</span>

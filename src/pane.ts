@@ -38,6 +38,7 @@ import { showToast } from "./toast";
 import { isAppShortcut } from "./shortcuts";
 import { attentionPresentation } from "./attention";
 import { makeRenameCommit } from "./panerename";
+import { shouldResizePty } from "./panefit";
 import { swapEditor } from "./domutil";
 import { openInEditor, editorConfigDialog } from "./editor";
 import { GitView } from "./gitview";
@@ -648,12 +649,15 @@ export class Pane implements VoiceTargetPane {
     clearTimeout(this.fitTimer);
     this.fitTimer = window.setTimeout(() => {
       if (this.disposed || !this.termEl.isConnected) return;
-      if (this.termEl.clientWidth === 0) return; // not laid out yet
+      if (this.termEl.clientWidth === 0) return; // hidden (inactive tab / maximized-behind) or unlaid — fit.fit() needs a laid-out element
       this.fit.fit();
       const size = `${this.term.cols}x${this.term.rows}`;
-      if (this.ptyId !== null && size !== this.sentSize) {
+      // The zero-width / same-size / no-pty skips live in the pure, tested
+      // shouldResizePty (panefit.ts) — THE invariant that keeps tab switches and
+      // maximize free of ConPTY repaints (#63, CLAUDE.md constraint 1).
+      if (shouldResizePty({ clientWidth: this.termEl.clientWidth, size, sentSize: this.sentSize, ptyId: this.ptyId })) {
         this.sentSize = size;
-        resizePty(this.ptyId, this.term.cols, this.term.rows).catch(() => {});
+        resizePty(this.ptyId!, this.term.cols, this.term.rows).catch(() => {});
       }
       // The pane itself changed size: keep the overlay within bounds and
       // re-anchor the visible strip on the cursor.

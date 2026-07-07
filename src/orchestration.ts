@@ -173,10 +173,29 @@ async function openAgentPane(
   }
 }
 
+/** Where an orchestration event should act: a grid and the pane-events to open
+ *  panes into it. With project tabs (#63) there are N grids (one per tab), so
+ *  the event router resolves a target instead of closing over a single grid. */
+export interface OrchTarget {
+  grid: Grid;
+  paneEvents: PaneEvents;
+}
+
+/** Resolve the target tab for an orchestration event.
+ *
+ *  PHASE 1–2 (this worker): returns the active tab for every event, so behavior
+ *  is identical to the pre-tabs single-grid app.
+ *  TODO(#63 phase 3, worker B): make this route by `group_id` / `pty_id` —
+ *  spawn into the group's own tab (auto-creating one on first sight), and make
+ *  focus/attention/rename/group-ended search across ALL tabs, not just the
+ *  active one. The `hint` carries the ids needed for that. */
+export type OrchTargetResolver = (hint: { groupId?: string; ptyId?: number | null }) => OrchTarget;
+
 /** Wire backend→frontend orchestration events. Call once at startup,
  *  before any orchestrator can be launched. */
-export function initOrchestration(grid: Grid, paneEvents: PaneEvents): void {
+export function initOrchestration(resolveTarget: OrchTargetResolver): void {
   void listen<OrchSpawnRequest>("orch-spawn-request", ({ payload }) => {
+    const { grid, paneEvents } = resolveTarget({ groupId: payload.group_id });
     // Drop a request whose backend bind wait already elapsed while this
     // frontend was stalled (#106): servicing it now would open a zombie pane
     // against a torn-down config. Breadcrumb-visible console line, no toast —
@@ -199,6 +218,7 @@ export function initOrchestration(grid: Grid, paneEvents: PaneEvents): void {
   void listen<{ group_id: string; agent_id: string }>(
     "orch-spawn-cancelled",
     ({ payload }) => {
+      const { grid } = resolveTarget({ groupId: payload.group_id });
       // Note it for an openAgentPane still mid-open (pane not yet created), which
       // reads the set right after its pane opens; the in-flight call's `finally`
       // clears the note. Also close any pane already opened for this agent so a
@@ -211,6 +231,7 @@ export function initOrchestration(grid: Grid, paneEvents: PaneEvents): void {
   );
   void listen<{ agent_id: string; pty_id: number | null }>("orch-focus", ({ payload }) => {
     if (payload.pty_id === null) return;
+    const { grid } = resolveTarget({ ptyId: payload.pty_id });
     const pane = grid.findByPtyId(payload.pty_id);
     if (pane) {
       grid.setActive(pane);
@@ -225,6 +246,7 @@ export function initOrchestration(grid: Grid, paneEvents: PaneEvents): void {
     "orch-rename",
     ({ payload }) => {
       if (payload.pty_id === null) return;
+      const { grid } = resolveTarget({ ptyId: payload.pty_id });
       const pane = grid.findByPtyId(payload.pty_id);
       if (pane) pane.setName(payload.name);
     }
@@ -236,6 +258,7 @@ export function initOrchestration(grid: Grid, paneEvents: PaneEvents): void {
   // human opened to run a CLI that's now blocked on a prompt must light up too
   // (#40); the backend emits `waiting` items for those, keyed only by pty_id.
   void listen<AttentionItem[]>("orch-attention", ({ payload }) => {
+    const { grid } = resolveTarget({});
     const byPty = new Map<number, AttentionItem>();
     for (const it of payload) if (it.pty_id !== null) byPty.set(it.pty_id, it);
     // allPanes(), not panes(): a minimized pane still needs the human, and its
@@ -250,6 +273,7 @@ export function initOrchestration(grid: Grid, paneEvents: PaneEvents): void {
   // close their (now-dead) panes rather than leaving a screen of dead
   // terminals — the pane-by-pane ✕-clicking this action exists to replace.
   void listen<{ group_id: string }>("orch-group-ended", ({ payload }) => {
+    const { grid } = resolveTarget({ groupId: payload.group_id });
     // allPanes(), not panes(): a minimized group pane must be closed too, or
     // it would linger in the dock (with a live agent) after its group ends.
     for (const pane of panesInGroup(grid.allPanes(), payload.group_id)) {
