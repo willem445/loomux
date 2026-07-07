@@ -22,6 +22,7 @@ import {
   detachGitWatch,
   ptyBackendInfo,
 } from "./pty";
+import { voiceController, type VoiceTargetPane, type VoicePhase } from "./voicecontrol";
 import { invoke } from "@tauri-apps/api/core";
 import { parseOsc52, writeClipboard } from "./clipboard";
 import {
@@ -59,6 +60,8 @@ const GROUP_MIN_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" fill="no
 const EDITOR_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M6 4.5 2.5 8 6 11.5M10 4.5 13.5 8 10 11.5"/></svg>`;
 // Attach affordance on the steering strip (#72): a paperclip.
 const PAPERCLIP_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M12.5 6.6 7.1 12a2.4 2.4 0 0 1-3.4-3.4l5.6-5.6a1.5 1.5 0 0 1 2.1 2.1l-5.4 5.4a.6.6 0 0 1-.9-.9l4.9-4.9"/></svg>`;
+// Voice-prompt push-to-talk button (#58): a simple microphone glyph.
+const MIC_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="1.8" width="4" height="7.4" rx="2"/><path d="M3.8 7.2a4.2 4.2 0 0 0 8.4 0M8 11.4v2.8M6 14.2h4"/></svg>`;
 
 /** Pull image files out of a paste/drag `DataTransfer`. Returns only entries
  *  the browser tags as images, so a text or mixed paste yields []. */
@@ -173,7 +176,7 @@ export interface PaneEvents {
   onToggleGroupMinimize: (pane: Pane) => void;
 }
 
-export class Pane {
+export class Pane implements VoiceTargetPane {
   readonly el: HTMLElement;
   readonly term: Terminal;
   ptyId: number | null = null;
@@ -235,6 +238,12 @@ export class Pane {
    *  how image paths are referenced in the steer text (#72). Defaults to the
    *  Claude form until a save reports otherwise. */
   private orchCli = "claude";
+  /** Voice-prompt push-to-talk button on the steer strip (#58). Only present on
+   *  orchestrator panes; the hotkey (Alt+S) works on any pane regardless. */
+  private micBtn: HTMLButtonElement | null = null;
+  /** Overlay badge shown while a voice capture targets THIS pane's terminal
+   *  (#58). Overlay chrome — floats over `.xterm`, never resizes the PTY. */
+  private voiceIndicator: HTMLElement | null = null;
   /** "needs attention" chip in the header (attention routing #6); hidden until
    *  the backend flags this pane. */
   private attnChip: HTMLButtonElement;
@@ -1176,6 +1185,20 @@ export class Pane {
       filePicker.value = ""; // allow re-picking the same file next time
     });
 
+    // Voice-prompt push-to-talk (#58): click to record, click again to stop and
+    // transcribe locally. Transcript is inserted into the input, NOT submitted —
+    // the human reviews it and hits Enter, same as typing.
+    const mic = document.createElement("button");
+    mic.className = "dlg-btn orch-compose-mic";
+    mic.type = "button";
+    mic.title = "Voice prompt — click to record, click again to transcribe";
+    mic.setAttribute("aria-label", "Record voice prompt");
+    mic.innerHTML = MIC_ICON;
+    mic.addEventListener("click", (e) => {
+      e.stopPropagation();
+      voiceController.toggleForCompose(this);
+    });
+
     const send = document.createElement("button");
     send.className = "dlg-btn primary orch-compose-send";
     send.textContent = "Send";
@@ -1183,7 +1206,8 @@ export class Pane {
       e.stopPropagation();
       void this.submitCompose();
     });
-    row.append(input, attach, filePicker, send);
+    row.append(input, attach, filePicker, mic, send);
+    this.micBtn = mic;
 
     // Thumbnail-chip row for queued images (#72). Hidden (via .orch-compose-chips
     // being empty + CSS) until something is queued; kept above the status slot.
@@ -1284,6 +1308,80 @@ export class Pane {
     this.composeInput.select();
   }
 
+  // ----- VoiceTargetPane (#58): the surface the global voiceController drives.
+  // The controller owns the single-capture state machine; a Pane only knows how
+  // to receive a transcript and show a recording indicator.
+
+  /** Is this pane's compose box the focused element? Decides caret-insert vs
+   *  terminal-paste when the voice hotkey fires. */
+  isComposeFocused(): boolean {
+    return !!this.composeInput && document.activeElement === this.composeInput;
+  }
+
+  /** Reflect the capture phase on this pane's indicator. For a compose target
+   *  it's the mic button (pulse while recording, spin while transcribing); for a
+   *  terminal target it's a lazily-created overlay badge floating over `.xterm`
+   *  (so it never resizes the PTY). */
+  setVoicePhase(kind: "compose" | "terminal", phase: VoicePhase): void {
+    if (kind === "compose") {
+      this.micBtn?.classList.toggle("recording", phase === "recording");
+      this.micBtn?.classList.toggle("transcribing", phase === "transcribing");
+      return;
+    }
+    if (phase === "off") {
+      this.voiceIndicator?.remove();
+      this.voiceIndicator = null;
+      return;
+    }
+    if (!this.voiceIndicator) {
+      const badge = document.createElement("div");
+      badge.className = "pane-voice-indicator";
+      this.termEl.appendChild(badge);
+      this.voiceIndicator = badge;
+    }
+    const recording = phase === "recording";
+    this.voiceIndicator.classList.toggle("transcribing", !recording);
+    this.voiceIndicator.innerHTML = recording
+      ? `<span class="pane-voice-dot"></span>Recording — Alt+S to insert · Esc to cancel`
+      : `<span class="pane-voice-spinner"></span>Transcribing… · Esc to cancel`;
+  }
+
+  /** Route a transcript into this pane's terminal as if pasted — xterm's paste
+   *  path applies bracketed-paste semantics (when the app enabled them) and adds
+   *  NO trailing newline, so the human reviews and presses Enter. */
+  pasteToTerminal(text: string): void {
+    if (this.disposed) return; // pane closed during transcription — drop it
+    const t = text.trim();
+    if (t) this.term.paste(t);
+  }
+
+  /** Surface a voice status/error on the strip (compose targets have one). */
+  showVoiceStatus(msg: string): void {
+    this.showComposeStatus(msg);
+  }
+
+  /** Insert transcribed text into the strip at the caret (or append), keeping a
+   *  single space between words, then focus the input so the human can edit and
+   *  press Enter. Never auto-submits. */
+  insertTranscript(text: string): void {
+    if (this.disposed) return; // pane closed during transcription — drop it
+    const input = this.composeInput;
+    if (!input) return;
+    const t = text.trim();
+    if (!t) return;
+    const start = input.selectionStart ?? input.value.length;
+    const end = input.selectionEnd ?? input.value.length;
+    const before = input.value.slice(0, start);
+    const after = input.value.slice(end);
+    // Add a separating space only when butting up against existing text.
+    const lead = before && !/\s$/.test(before) ? " " : "";
+    const trail = after && !/^\s/.test(after) ? " " : "";
+    input.value = before + lead + t + trail + after;
+    const caret = (before + lead + t).length;
+    input.focus();
+    input.setSelectionRange(caret, caret);
+  }
+
   /** Show a transient status line under the strip (errors only — a successful
    *  send is confirmed by the message landing in the terminal above). */
   private showComposeStatus(msg: string): void {
@@ -1344,6 +1442,9 @@ export class Pane {
     clearTimeout(this.fitTimer);
     clearTimeout(this.shiftTimer);
     clearTimeout(this.composeStatusTimer);
+    // Abort any in-flight voice capture aimed at this pane (releases the mic).
+    voiceController.notifyPaneDisposed(this);
+    this.voiceIndicator?.remove();
     this.clearAttachments(); // revoke any lingering thumbnail object URLs
     this.gitView?.dispose();
     this.tasksView?.dispose();

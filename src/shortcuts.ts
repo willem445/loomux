@@ -14,6 +14,7 @@ export type ShortcutAction =
   | "toggle-audit"
   | "toggle-group"
   | "focus-compose"
+  | "voice-ptt"
   | "maximize-pane"
   | "minimize-pane"
   | "rename-pane"
@@ -48,6 +49,11 @@ export function matchShortcut(e: KeyboardEvent): ShortcutAction | null {
       case "KeyA": return "toggle-audit";
       case "KeyO": return "toggle-group";
       case "KeyP": return "focus-compose";
+      // Alt+S (voice / "speak"). NOT Alt+V: that's Claude Code's paste-image
+      // binding, and loomux intercepting it stole it inside agent panes. NOT
+      // Alt+M either (that's minimize-pane). Alt+S is free in loomux, unused by
+      // Claude Code, and not a readline word-motion binding.
+      case "KeyS": return "voice-ptt";
     }
   }
   if (e.code === "F2" && !e.ctrlKey && !e.altKey && !e.shiftKey) return "rename-pane";

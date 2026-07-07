@@ -82,6 +82,22 @@ export const changeDir = (id: number, path: string): Promise<void> =>
 
 export const listSessions = (): Promise<SessionInfo[]> => invoke("list_sessions");
 
+// ---------- voice prompt (#58 prototype) ----------
+// Push-to-talk mic capture → local whisper.cpp transcription. The backend owns
+// the microphone (native WASAPI) so there's no WebView2 getUserMedia permission
+// to negotiate; these just start/stop the capture and hand back the transcript.
+
+/** Begin capturing from the default input device. Rejects if there's no mic or
+ *  a recording is already in flight. */
+export const voiceStart = (): Promise<void> => invoke("voice_start");
+
+/** Stop capturing and transcribe locally; resolves to the recognized text (""
+ *  for silence). Rejects if whisper.cpp / the model aren't installed. */
+export const voiceStop = (): Promise<string> => invoke("voice_stop");
+
+/** Abort an in-flight recording without transcribing. Idempotent. */
+export const voiceCancel = (): Promise<void> => invoke("voice_cancel");
+
 // ---------- output router ----------
 
 type OutputHandler = (data: Uint8Array) => void;
