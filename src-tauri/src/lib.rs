@@ -118,6 +118,7 @@ pub fn run() {
             orchestration::orch_group_summary,
             orchestration::orch_end_group,
             cliprobe::probe_agent_cli,
+            cliprobe::probe_ssh,
             editor::open_in_editor,
             obs::take_startup_notice,
         ])
