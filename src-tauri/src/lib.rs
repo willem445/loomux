@@ -1,5 +1,6 @@
 mod cliprobe;
 mod editor;
+mod gh;
 mod git;
 mod gitwatch;
 mod winpath;
@@ -89,6 +90,15 @@ pub fn run() {
             git::git_merge,
             git::git_rebase,
             git::git_branches,
+            gh::gh_auth_status,
+            gh::gh_issue_list,
+            gh::gh_issue_create,
+            gh::gh_issue_set_labels,
+            gh::gh_issue_view,
+            gh::gh_issue_comment,
+            gh::gh_pr_list,
+            gh::gh_pr_view,
+            gh::gh_pr_comment,
             gitwatch::git_watch,
             gitwatch::git_unwatch,
             orchestration::agent_autopilot_flags,

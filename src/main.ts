@@ -223,6 +223,9 @@ document.addEventListener(
       case "toggle-git":
         grid.activePane?.toggleGitView();
         break;
+      case "toggle-issues":
+        grid.activePane?.toggleIssuesView();
+        break;
       case "open-editor":
         void grid.activePane?.openInEditor();
         break;

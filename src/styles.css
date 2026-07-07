@@ -840,6 +840,199 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .git-head-branch.clickable { cursor: pointer; }
 .git-head-branch.clickable:hover { text-decoration: underline; }
 
+/* ---------- GitHub issues overlay ----------
+   Reuses .git-overlay / .git-divider / .git-blank / .git-toast (and the
+   .git-modal-btn buttons in the create form). Its own box never resizes, so the
+   PTY underneath is never touched (hard constraint 1). */
+.pane-issues {
+  flex: 1; min-height: 0; min-width: 0; position: relative;
+  display: flex; flex-direction: column;
+  background: var(--bg-app); font-size: 12px; outline: none;
+}
+.pane-issues[hidden] { display: none; }
+
+.issues-head {
+  flex: none; display: flex; align-items: center; gap: 8px;
+  padding: 6px 8px; border-bottom: 1px solid var(--border-soft);
+}
+.issues-head .pane-btn { opacity: 1; }
+.issues-head-title { font-weight: 600; font-size: 12px; }
+.issues-head-repo { color: var(--text-dim); font-size: 11.5px; }
+.issues-filter {
+  flex: 1; min-width: 0;
+  background: var(--bg-app); border: 1px solid var(--border); border-radius: 6px;
+  color: var(--text); font: inherit; font-size: 12px; padding: 4px 9px;
+}
+.issues-filter:focus { outline: none; border-color: var(--accent); }
+.issues-filter:disabled { opacity: 0.5; }
+
+.issues-list {
+  flex: 1 1 0; min-height: 0; overflow-y: auto;
+  display: flex; flex-direction: column;
+}
+.issues-empty {
+  padding: 22px; text-align: center; color: var(--text-dim); font-size: 12.5px;
+}
+
+.issues-row {
+  display: flex; align-items: flex-start; gap: 9px;
+  padding: 7px 10px; border-bottom: 1px solid var(--border-soft);
+}
+.issues-row:hover { background: var(--panel); }
+/* Already carries a go-signal label — an orchestrator will pull it in. */
+.issues-row.agent-labeled { border-left: 2px solid var(--accent); }
+
+.issues-num {
+  flex: none; color: var(--text-dim); font-variant-numeric: tabular-nums;
+  padding-top: 1px; min-width: 42px;
+}
+.issues-row-main { flex: 1 1 0; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.issues-title {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.issues-row-meta { display: flex; align-items: center; flex-wrap: wrap; gap: 5px; }
+.issues-label {
+  font-size: 10.5px; padding: 1px 6px; border-radius: 9px;
+  background: var(--panel-2); border: 1px solid var(--border); color: var(--text-dim);
+}
+.issues-label.agent {
+  background: var(--accent-dim); border-color: var(--accent); color: #eaf0ff;
+}
+.issues-when { font-size: 10.5px; color: var(--text-dim); }
+
+.issues-row-actions { flex: none; display: flex; align-items: center; gap: 5px; }
+.issues-toggle {
+  background: var(--panel); border: 1px solid var(--border); border-radius: 6px;
+  color: var(--text-dim); font: inherit; font-size: 10.5px;
+  padding: 2px 8px; cursor: pointer; white-space: nowrap;
+}
+.issues-toggle:hover:not(:disabled) { border-color: var(--accent); color: var(--text); }
+.issues-toggle:disabled { opacity: 0.5; cursor: default; }
+.issues-toggle.on {
+  background: var(--accent); border-color: var(--accent); color: #10131f; font-weight: 600;
+}
+/* Read-only orchestrator-owned marker. */
+.issues-toggle.managed {
+  cursor: default; background: transparent; border-style: dashed; color: var(--text-dim);
+}
+.issues-copy {
+  background: none; border: none; color: var(--text-dim);
+  font-size: 13px; padding: 2px 4px; cursor: pointer; border-radius: 5px;
+}
+.issues-copy:hover { color: var(--text); background: var(--panel-2); }
+
+/* -- create-issue form (modal over the list) -- */
+.issues-form-backdrop {
+  position: absolute; inset: 0; z-index: 8;
+  display: flex; align-items: flex-start; justify-content: center;
+  padding-top: 40px;
+  background: rgba(6, 8, 14, 0.55);
+}
+.issues-form {
+  width: min(520px, 88%);
+  background: var(--panel-2); border: 1px solid var(--border);
+  border-radius: 10px; padding: 16px 18px;
+  box-shadow: 0 12px 34px rgba(0, 0, 0, 0.55);
+  display: flex; flex-direction: column; gap: 10px;
+}
+.issues-form-title { font-weight: 600; font-size: 13px; }
+.issues-form-input, .issues-form-body {
+  width: 100%; box-sizing: border-box;
+  background: var(--bg-app); border: 1px solid var(--border); border-radius: 6px;
+  color: var(--text); font: inherit; font-size: 12.5px; padding: 7px 9px;
+}
+.issues-form-input:focus, .issues-form-body:focus { outline: none; border-color: var(--accent); }
+.issues-form-body { min-height: 120px; resize: vertical; line-height: 1.5; }
+.issues-form-actions { display: flex; justify-content: flex-end; gap: 8px; }
+
+/* -- Issues ⇄ PRs segmented toggle in the header -- */
+.issues-mode {
+  flex: none; display: flex; border: 1px solid var(--border); border-radius: 6px;
+  overflow: hidden;
+}
+.issues-mode-tab {
+  background: var(--bg-app); border: none; color: var(--text-dim);
+  font: inherit; font-size: 11.5px; font-weight: 600;
+  padding: 3px 10px; cursor: pointer;
+}
+.issues-mode-tab + .issues-mode-tab { border-left: 1px solid var(--border); }
+.issues-mode-tab:hover:not(.on) { color: var(--text); }
+.issues-mode-tab.on { background: var(--accent); color: #10131f; }
+
+/* PR head-branch chip in a row's meta line. */
+.issues-branch {
+  font-size: 10.5px; padding: 1px 6px; border-radius: 9px;
+  background: var(--panel-2); border: 1px solid var(--border);
+  color: var(--text-dim); font-variant-numeric: tabular-nums;
+  max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+/* A clickable list row (opens the detail pane). */
+.issues-row.clickable { cursor: pointer; }
+
+/* ---------- issue / PR detail pane (overlays the list) ---------- */
+.issues-detail {
+  position: absolute; inset: 0; z-index: 9;
+  display: flex; flex-direction: column;
+  background: var(--bg-app); outline: none;
+}
+.issues-detail-head {
+  flex: none; display: flex; align-items: center; gap: 8px;
+  padding: 6px 8px; border-bottom: 1px solid var(--border-soft);
+}
+.issues-detail-head .pane-btn { opacity: 1; }
+.issues-detail-num {
+  flex: none; color: var(--text-dim); font-variant-numeric: tabular-nums;
+}
+.issues-detail-title {
+  flex: 1 1 0; min-width: 0; font-weight: 600;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.issues-detail-state {
+  flex: none; font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.03em;
+  padding: 1px 7px; border-radius: 9px;
+  background: var(--panel-2); border: 1px solid var(--border); color: var(--text-dim);
+}
+.issues-detail-state.open { background: var(--accent-dim); border-color: var(--accent); color: #eaf0ff; }
+.issues-detail-state.merged { background: #5319e7; border-color: #5319e7; color: #fff; }
+
+.issues-detail-scroll {
+  flex: 1 1 0; min-height: 0; overflow-y: auto;
+  display: flex; flex-direction: column; gap: 10px; padding: 12px;
+}
+.issues-detail-thread { display: flex; flex-direction: column; gap: 10px; }
+.issues-detail-note {
+  color: var(--text-dim); font-size: 12px; padding: 6px 2px; white-space: pre-wrap;
+}
+.issues-detail-item {
+  border: 1px solid var(--border-soft); border-radius: 8px;
+  background: var(--panel); overflow: hidden;
+}
+.issues-detail-item.description { background: var(--panel-2); }
+.issues-detail-item-head {
+  display: flex; align-items: baseline; gap: 8px;
+  padding: 6px 10px; border-bottom: 1px solid var(--border-soft);
+  background: rgba(255, 255, 255, 0.02);
+}
+.issues-detail-author { font-weight: 600; font-size: 11.5px; }
+.issues-detail-when { font-size: 10.5px; color: var(--text-dim); }
+.issues-detail-body {
+  padding: 9px 11px; font-size: 12.5px; line-height: 1.55;
+  white-space: pre-wrap; word-break: break-word;
+}
+.issues-detail-body.empty { color: var(--text-dim); font-style: italic; }
+
+.issues-detail-composer {
+  flex: none; display: flex; gap: 8px; align-items: flex-end;
+  padding: 8px; border-top: 1px solid var(--border-soft);
+}
+.issues-detail-input {
+  flex: 1 1 0; min-width: 0; min-height: 54px; max-height: 160px; resize: vertical;
+  background: var(--bg-app); border: 1px solid var(--border); border-radius: 6px;
+  color: var(--text); font: inherit; font-size: 12.5px; padding: 7px 9px; line-height: 1.5;
+}
+.issues-detail-input:focus { outline: none; border-color: var(--accent); }
+
 /* ---------- task board overlay ---------- */
 .tasks-view {
   flex: 1; min-height: 0; position: relative;

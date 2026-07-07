@@ -9,6 +9,7 @@ export type ShortcutAction =
   | "toggle-sessions"
   | "toggle-agent-mode"
   | "toggle-git"
+  | "toggle-issues"
   | "open-editor"
   | "toggle-tasks"
   | "toggle-audit"
@@ -44,6 +45,7 @@ export function matchShortcut(e: KeyboardEvent): ShortcutAction | null {
       // Alt+G, not Ctrl+Shift+G: WebView2 consumes that as its
       // find-previous accelerator before the page ever sees it.
       case "KeyG": return "toggle-git";
+      case "KeyI": return "toggle-issues";
       case "KeyE": return "open-editor";
       case "KeyT": return "toggle-tasks";
       case "KeyA": return "toggle-audit";
