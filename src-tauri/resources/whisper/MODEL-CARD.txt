@@ -1,0 +1,31 @@
+Bundled model: ggml-base.en.bin (English-only, ~141 MiB)
+
+Source:   https://huggingface.co/ggerganov/whisper.cpp  (ggml-base.en.bin)
+Revision: 5359861c739e955e79d9a303bcbc70fb988958b1
+sha256:   a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002
+
+These are the OpenAI Whisper "base.en" model weights, converted to the ggml
+format distributed by the whisper.cpp project. The Whisper models and code are
+released by OpenAI under the MIT License.
+
+MIT License
+
+Copyright (c) 2022 OpenAI
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
