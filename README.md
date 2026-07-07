@@ -220,6 +220,49 @@ point loomux at them:
 
 Resolution order is **env vars → `%LOCALAPPDATA%`**.
 
+**Performance & tuning.**
+
+- **Threads.** loomux passes `-t` capped at your CPU's parallelism (max 8) —
+  whisper.cpp otherwise defaults to 4, so this is a 2× win on a many-core
+  machine, without oversubscribing (its CPU inference is memory-bandwidth-bound
+  and gains flatten past ~8 threads).
+- **Model choice** (biggest speed/quality lever). `base.en` is a fine default;
+  for noticeably better accuracy at similar speed, use **`large-v3-turbo`**
+  quantized — **`q8_0`** is the quality/speed sweet spot (`q5_0` is smaller/
+  faster). Drop the `.bin` in `models\` or point `LOOMUX_WHISPER_MODEL` at it.
+- **GPU.** NVIDIA owners get a large speed-up from a **cuBLAS/CUDA** whisper.cpp
+  build — download a `cublas` release asset and point `LOOMUX_WHISPER_CLI` at it.
+- **Extra flags.** `LOOMUX_WHISPER_ARGS` is appended verbatim to the whisper
+  command (whitespace-split, no shell quoting) for power users — e.g.
+  `LOOMUX_WHISPER_ARGS="-t 12 -bs 5"`. It comes *after* loomux's args and
+  whisper takes the last value of a flag, so your overrides win.
+
+**Vocabulary biasing.** Bias recognition toward your own jargon with an optional
+`%LOCALAPPDATA%\loomux\whisper\vocab.txt` — one term or phrase per line, `#` for
+comments. loomux assembles it into whisper's `--prompt` (an initial-prompt hint):
+
+```
+# loomux project terms
+loomux
+ConPTY
+tmux
+gh
+xterm
+WASAPI
+cpal
+Tauri
+ggml
+orchestrator
+```
+
+Keep it a **short curated list**: whisper's initial prompt is capped (~224
+tokens) and only a curated list is reliably honored — loomux truncates to a
+conservative budget and logs a warning if `vocab.txt` is over-long. Set
+`LOOMUX_WHISPER_PROMPT` to a raw prompt string to override the file entirely.
+(Fine-tuning a model is out of scope — it needs a GPU, a labeled dataset, and a
+multi-GB output; `--prompt` gets most of the domain-term benefit for none of the
+cost.)
+
 **Windows only** for now; on other platforms the hotkey reports that voice
 capture isn't available. See [`doc/design/voice.md`](doc/design/voice.md) for
 the architecture and the cross-platform path.

@@ -130,8 +130,9 @@ pub fn voice_cancel(_state: tauri::State<'_, VoiceState>) -> Result<(), String> 
 #[cfg(windows)]
 mod win {
     use super::{
-        duration_secs, encode_wav_pcm16, is_dll_load_failure, parse_whisper_output, resample_linear,
-        rms, ChunkedBuffer,
+        build_prompt_arg, build_whisper_args, duration_secs, encode_wav_pcm16, is_dll_load_failure,
+        parse_extra_args, parse_whisper_output, resample_linear, rms, whisper_thread_count,
+        ChunkedBuffer, WHISPER_PROMPT_MAX_CHARS,
     };
     use crate::pty::JobHandle;
     use std::path::{Path, PathBuf};
@@ -398,11 +399,13 @@ mod win {
 
     // ----- transcription (subprocess to whisper.cpp) -----
 
-    /// Locations of the prebuilt whisper.cpp CLI and a ggml model. Neither is
-    /// committed to the repo; both are downloaded once (see the walkthrough).
+    /// Locations of the prebuilt whisper.cpp CLI and a ggml model (neither is
+    /// committed — both are user-downloaded), plus an optional assembled
+    /// `--prompt` value biasing recognition toward the user's vocabulary.
     struct WhisperPaths {
         cli: PathBuf,
         model: PathBuf,
+        prompt: Option<String>,
     }
 
     /// The power-user install root: `%LOCALAPPDATA%\loomux\whisper\`.
@@ -422,7 +425,31 @@ mod win {
         Ok(WhisperPaths {
             cli: resolve_cli(bundled)?,
             model: resolve_model(bundled)?,
+            prompt: resolve_prompt(),
         })
+    }
+
+    /// Resolve the `--prompt` biasing text. Precedence: `LOOMUX_WHISPER_PROMPT`
+    /// env (used verbatim — the power-user override) REPLACES the file; else
+    /// assemble it from `%LOCALAPPDATA%\loomux\whisper\vocab.txt`. Returns `None`
+    /// when neither yields usable text (→ no `--prompt` is passed).
+    fn resolve_prompt() -> Option<String> {
+        if let Some(v) = std::env::var_os("LOOMUX_WHISPER_PROMPT") {
+            let s = v.to_string_lossy().trim().to_string();
+            return if s.is_empty() { None } else { Some(s) };
+        }
+        let path = local_whisper_dir()?.join("vocab.txt");
+        let raw = std::fs::read_to_string(&path).ok()?;
+        let assembled = build_prompt_arg(&raw, WHISPER_PROMPT_MAX_CHARS)?;
+        if assembled.truncated {
+            eprintln!(
+                "voice: {} exceeds the ~{}-char prompt budget; using the first terms only \
+                 (keep vocab.txt to a short curated list).",
+                path.display(),
+                WHISPER_PROMPT_MAX_CHARS,
+            );
+        }
+        Some(assembled.text)
     }
 
     /// whisper-cli.exe: bundled dir → `LOOMUX_WHISPER_CLI` → %LOCALAPPDATA%.
@@ -551,14 +578,25 @@ mod win {
         use std::process::{Command, Stdio};
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
+        // Threads: cap available parallelism (whisper.cpp defaults to only 4).
+        let threads = whisper_thread_count(
+            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4),
+        );
+        // Power-user raw passthrough, appended last so it overrides ours.
+        let extra = std::env::var("LOOMUX_WHISPER_ARGS")
+            .ok()
+            .map(|s| parse_extra_args(&s))
+            .unwrap_or_default();
+        let args = build_whisper_args(
+            &paths.model,
+            wav_path,
+            threads,
+            paths.prompt.as_deref(),
+            &extra,
+        );
+
         let child = Command::new(&paths.cli)
-            .arg("-m")
-            .arg(&paths.model)
-            .arg("-f")
-            .arg(wav_path)
-            .arg("-nt") // no timestamps: stdout is just the recognized text
-            .arg("-l")
-            .arg("en")
+            .args(&args)
             .creation_flags(CREATE_NO_WINDOW)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -820,6 +858,111 @@ pub fn duration_secs(sample_count: usize, sample_rate: u32) -> f32 {
     sample_count as f32 / sample_rate as f32
 }
 
+// ---------- whisper invocation tuning (pure, unit-tested) ----------
+
+/// Thread cap for whisper.cpp. whisper.cpp defaults to 4; on a many-core desktop
+/// (the human's 16-core 5950X) that leaves 2-3x of CPU on the table. But its CPU
+/// inference is memory-bandwidth-bound, so throughput flattens past ~8 threads
+/// and oversubscribing logical cores (SMT) contends with the OS/webview for
+/// little gain — so we cap here. Power users can override with
+/// `LOOMUX_WHISPER_ARGS="-t N"` (whisper takes the last `-t`, so it wins).
+pub const WHISPER_MAX_THREADS: usize = 8;
+
+/// Character budget for the assembled `--prompt`. whisper's initial-prompt cap is
+/// ~224 tokens (`n_text_ctx/2`). We have no tokenizer, so we approximate
+/// conservatively at ~4 chars/token → ~200 tokens, staying under the hard cap.
+/// This is an ADMITTED approximation (see doc/design/voice.md): keep vocab.txt to
+/// a short curated list, since only a curated list is reliably honored anyway.
+pub const WHISPER_PROMPT_MAX_CHARS: usize = 800;
+
+/// Clamp a machine's available parallelism to whisper's useful thread range
+/// `[1, WHISPER_MAX_THREADS]`. Pure so the clamp is unit-tested.
+pub fn whisper_thread_count(available: usize) -> usize {
+    available.clamp(1, WHISPER_MAX_THREADS)
+}
+
+/// Split a `LOOMUX_WHISPER_ARGS` string into discrete argv tokens on whitespace.
+/// This is a RAW passthrough: no shell, no quote handling — each whitespace-
+/// separated token becomes one argument. (Tokens reach `Command::arg` directly,
+/// so there is no shell to inject into; the value is the user's own env var.)
+pub fn parse_extra_args(raw: &str) -> Vec<String> {
+    raw.split_whitespace().map(str::to_owned).collect()
+}
+
+/// A `--prompt` value assembled from a user vocabulary, plus whether it had to be
+/// truncated to fit the budget (so the caller can warn).
+pub struct AssembledPrompt {
+    pub text: String,
+    pub truncated: bool,
+}
+
+/// Assemble whisper's `--prompt` from a `vocab.txt`: one term/phrase per line,
+/// `#` comments and blank lines dropped, joined into a compact biasing sentence
+/// and truncated to `max_chars` on whole-term boundaries. Returns `None` when
+/// there are no usable terms (→ no `--prompt` is passed at all). Pure + tested.
+pub fn build_prompt_arg(vocab: &str, max_chars: usize) -> Option<AssembledPrompt> {
+    let terms: Vec<&str> = vocab
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect();
+    if terms.is_empty() {
+        return None;
+    }
+    // Fixed overhead of the "Terms: " lead-in and the trailing ".".
+    const PREFIX: &str = "Terms: ";
+    let overhead = PREFIX.len() + 1;
+    let mut kept: Vec<&str> = Vec::new();
+    let mut len = overhead;
+    let mut truncated = false;
+    for t in terms {
+        let add = t.len() + if kept.is_empty() { 0 } else { 2 }; // ", "
+        if len + add > max_chars && !kept.is_empty() {
+            truncated = true;
+            break;
+        }
+        kept.push(t);
+        len += add;
+    }
+    Some(AssembledPrompt {
+        text: format!("{PREFIX}{}.", kept.join(", ")),
+        truncated,
+    })
+}
+
+/// Build the full whisper.cpp argument vector in a fixed order:
+/// `-m <model> -f <wav> -nt -l en -t <threads> [--prompt <p>] [<extra>…]`.
+/// loomux's args come FIRST and the `LOOMUX_WHISPER_ARGS` passthrough LAST, so —
+/// because whisper.cpp's parser takes the last occurrence of a scalar flag — a
+/// user override in `extra` wins. Discrete args (no shell). Pure so ordering is
+/// unit-tested without spawning.
+pub fn build_whisper_args(
+    model: &std::path::Path,
+    wav: &std::path::Path,
+    threads: usize,
+    prompt: Option<&str>,
+    extra: &[String],
+) -> Vec<std::ffi::OsString> {
+    use std::ffi::OsString;
+    let mut args: Vec<OsString> = vec![
+        "-m".into(),
+        model.into(),
+        "-f".into(),
+        wav.into(),
+        "-nt".into(), // no timestamps: stdout is just the recognized text
+        "-l".into(),
+        "en".into(),
+        "-t".into(),
+        threads.to_string().into(),
+    ];
+    if let Some(p) = prompt {
+        args.push("--prompt".into());
+        args.push(p.into());
+    }
+    args.extend(extra.iter().map(OsString::from));
+    args
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -964,5 +1107,85 @@ mod tests {
         assert!((duration_secs(16_000, 16_000) - 1.0).abs() < 1e-6);
         assert!((duration_secs(48_000, 16_000) - 3.0).abs() < 1e-6);
         assert_eq!(duration_secs(1_000, 0), 0.0); // guard against div-by-zero
+    }
+
+    #[test]
+    fn thread_count_clamps_to_useful_range() {
+        assert_eq!(whisper_thread_count(1), 1);
+        assert_eq!(whisper_thread_count(4), 4);
+        assert_eq!(whisper_thread_count(8), 8);
+        assert_eq!(whisper_thread_count(32), WHISPER_MAX_THREADS); // 5950X logical
+        assert_eq!(whisper_thread_count(0), 1); // never 0 threads
+    }
+
+    #[test]
+    fn extra_args_split_on_whitespace() {
+        assert_eq!(parse_extra_args("-fa -bs 5"), vec!["-fa", "-bs", "5"]);
+        assert_eq!(parse_extra_args("   -t   12  "), vec!["-t", "12"]);
+        assert!(parse_extra_args("").is_empty());
+        assert!(parse_extra_args("   ").is_empty());
+    }
+
+    #[test]
+    fn prompt_assembly_drops_comments_and_blanks() {
+        let vocab = "# project jargon\nloomux\n\n  ConPTY  \n# another comment\ntmux\n";
+        let p = build_prompt_arg(vocab, 800).unwrap();
+        assert_eq!(p.text, "Terms: loomux, ConPTY, tmux.");
+        assert!(!p.truncated);
+    }
+
+    #[test]
+    fn prompt_assembly_empty_or_comments_only_is_none() {
+        assert!(build_prompt_arg("", 800).is_none());
+        assert!(build_prompt_arg("   \n  \n", 800).is_none());
+        assert!(build_prompt_arg("# just\n# comments\n", 800).is_none());
+    }
+
+    #[test]
+    fn prompt_assembly_truncates_on_whole_terms() {
+        // Budget only fits the first couple of short terms; later ones dropped.
+        let vocab = "alpha\nbeta\ngammagammagamma\ndelta\n";
+        let p = build_prompt_arg(vocab, 22).unwrap(); // "Terms: alpha, beta." = 19
+        assert!(p.truncated);
+        assert!(p.text.starts_with("Terms: alpha"));
+        assert!(!p.text.contains("gammagammagamma"));
+        assert!(p.text.ends_with('.'));
+    }
+
+    #[test]
+    fn prompt_assembly_keeps_at_least_one_overlong_term() {
+        // A single term longer than the budget is still kept (better than empty).
+        let p = build_prompt_arg("supercalifragilistic\n", 8).unwrap();
+        assert_eq!(p.text, "Terms: supercalifragilistic.");
+    }
+
+    #[test]
+    fn whisper_args_order_and_overrides() {
+        let model = std::path::Path::new("m.bin");
+        let wav = std::path::Path::new("a.wav");
+        let extra = vec!["-t".to_string(), "16".to_string()]; // user override
+        let args = build_whisper_args(model, wav, 8, Some("Terms: loomux."), &extra);
+        let s: Vec<String> = args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert_eq!(
+            s,
+            vec![
+                "-m", "m.bin", "-f", "a.wav", "-nt", "-l", "en", "-t", "8",
+                "--prompt", "Terms: loomux.", "-t", "16",
+            ]
+        );
+        // Our "-t 8" precedes the passthrough "-t 16" → whisper's last-wins gives 16.
+    }
+
+    #[test]
+    fn whisper_args_without_prompt_or_extra() {
+        let args = build_whisper_args(
+            std::path::Path::new("m.bin"),
+            std::path::Path::new("a.wav"),
+            4,
+            None,
+            &[],
+        );
+        let s: Vec<String> = args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert_eq!(s, vec!["-m", "m.bin", "-f", "a.wav", "-nt", "-l", "en", "-t", "4"]);
     }
 }
