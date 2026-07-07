@@ -13,7 +13,7 @@ import { Pane, type PaneEvents, type PaneOptions } from "./pane";
 import { dropZoneFor, indicatorFor, zoneToPlacement, type DropZone } from "./layout";
 import { dockChipAttention } from "./attention";
 import { planGroupMinimize } from "./group";
-import { shouldFocusNewPane } from "./panefocus";
+import { shouldFocusNewPane, shouldRestoreFocus } from "./panefocus";
 
 type Dir = "row" | "column";
 
@@ -39,6 +39,54 @@ const MIN_PANE_PX = 80;
 const DRAG_THRESHOLD_PX = 6;
 
 const nodeEl = (n: TreeNode): HTMLElement => (n.kind === "leaf" ? n.pane.el : n.el);
+
+/** A snapshot of the keyboard focus, taken before a grid relayout so it can be
+ *  handed back afterward (#117 round 2). `sel` is the text caret/selection for
+ *  input/textarea controls (the steering strip is a textarea) — refocusing
+ *  alone can drop the caret to the end and lose the human's insertion point. */
+interface FocusSnapshot {
+  el: HTMLElement;
+  sel: { start: number; end: number; dir: "forward" | "backward" | "none" } | null;
+}
+
+/** Capture the currently-focused element and its caret. Returns null when
+ *  nothing meaningful holds focus (no active element, or it fell to <body>) —
+ *  there's then nothing to restore. */
+function captureFocus(): FocusSnapshot | null {
+  const el = document.activeElement;
+  if (!(el instanceof HTMLElement) || el === document.body) return null;
+  let sel: FocusSnapshot["sel"] = null;
+  if (el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement) {
+    // selectionStart is null for input types that don't expose a caret (number,
+    // email, …); only snapshot a real one.
+    if (el.selectionStart !== null && el.selectionEnd !== null) {
+      sel = {
+        start: el.selectionStart,
+        end: el.selectionEnd,
+        dir: el.selectionDirection ?? "none",
+      };
+    }
+  }
+  return { el, sel };
+}
+
+/** Restore a focus snapshot after a relayout, if the decision table says to and
+ *  the element is still in the document. Caret/selection is re-applied for text
+ *  controls so typing resumes exactly where it left off. */
+function restoreFocus(prior: FocusSnapshot | null, takeFocus: boolean): void {
+  const connected = !!prior && prior.el.isConnected;
+  if (!shouldRestoreFocus(takeFocus, prior !== null, connected)) return;
+  const { el, sel } = prior!;
+  el.focus({ preventScroll: true });
+  if (sel && (el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement)) {
+    // Guard: setSelectionRange throws on inputs that don't support selection.
+    try {
+      el.setSelectionRange(sel.start, sel.end, sel.dir);
+    } catch {
+      // Focus alone is enough for controls without a selection model.
+    }
+  }
+}
 
 export class Grid {
   private root: TreeNode | null = null;
@@ -91,6 +139,13 @@ export class Grid {
     dir: Dir = "row",
     relativeTo?: Pane
   ): Promise<Pane> {
+    // Snapshot the human's focus FIRST — before any relayout below. Both
+    // exitMaximize and insertBeside → renderSplit do replaceChildren(), which
+    // detaches the focused pane's subtree (the steering strip or a terminal) and
+    // re-appends it, implicitly blurring it to <body> so keystrokes go nowhere
+    // (#117 round 2; same DOM-detach class as #113). We hand it back after,
+    // unless the new pane is meant to take focus (see restoreFocus/takeFocus).
+    const prior = captureFocus();
     if (this.maximized) this.exitMaximize(); // a layout change exits fullscreen
     const pane = new Pane(events);
     const leaf: LeafNode = { kind: "leaf", pane, parent: null };
@@ -98,6 +153,12 @@ export class Grid {
 
     const target = relativeTo ?? this.active;
     const wasEmpty = !this.root || !target;
+
+    // A background (orchestrator-driven) spawn opens the pane without stealing
+    // focus/active from where the human is typing (#117) — but an empty grid
+    // still focuses, or the app would be left with no active terminal.
+    const takeFocus = shouldFocusNewPane(!opts.background, wasEmpty);
+
     if (wasEmpty) {
       this.root = leaf;
       pane.el.style.flex = "1 1 0";
@@ -106,11 +167,14 @@ export class Grid {
       this.insertBeside(this.leaves.get(target)!, leaf, dir);
     }
 
-    // A background (orchestrator-driven) spawn opens the pane without stealing
-    // focus/active from where the human is typing (#117) — but an empty grid
-    // still focuses, or the app would be left with no active terminal.
-    const takeFocus = shouldFocusNewPane(!opts.background, wasEmpty);
     if (takeFocus) this.setActive(pane);
+    // Hand focus back synchronously, in the same tick as the relayout — JS is
+    // single-threaded, so no keystroke can interleave between the blur and this
+    // restore; typing continues uninterrupted, mid-word. (A keystroke can only
+    // be lost if it lands during the synchronous relayout itself, which cannot
+    // happen.) Do this before awaiting pane.start so the async PTY spawn never
+    // runs with focus parked on <body>.
+    else restoreFocus(prior, takeFocus);
     await pane.start(opts, takeFocus);
     return pane;
   }

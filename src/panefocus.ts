@@ -24,3 +24,27 @@ export function shouldFocusNewPane(
 ): boolean {
   return humanInitiated || gridWasEmpty;
 }
+
+/** Whether to restore keyboard focus to the element that held it before a pane
+ *  open (issue #117 round 2).
+ *
+ *  Removing the explicit focus() call (round 1) wasn't enough: inserting a pane
+ *  restructures the grid DOM (renderSplit → replaceChildren detaches every child
+ *  of a split and re-appends it), which implicitly BLURS whatever the human was
+ *  typing into — the steering strip or a terminal — dropping focus to <body> so
+ *  their keystrokes go nowhere. This is the same DOM-detach class as the #113
+ *  rename crash. The caller snapshots document.activeElement before the relayout
+ *  and, when this returns true, refocuses it (with caret/selection) afterward.
+ *
+ *  Restore only when: the new pane isn't meant to take focus (`takeFocus` false,
+ *  i.e. a background spawn onto a non-empty grid); something meaningful actually
+ *  held focus (`hadPriorFocus` — not <body>/null); and that element is STILL in
+ *  the document (`priorStillConnected`) — a pane that closed mid-open has no
+ *  element to hand focus back to. */
+export function shouldRestoreFocus(
+  takeFocus: boolean,
+  hadPriorFocus: boolean,
+  priorStillConnected: boolean
+): boolean {
+  return !takeFocus && hadPriorFocus && priorStillConnected;
+}
