@@ -210,7 +210,7 @@ Or install by hand:
    %LOCALAPPDATA%\loomux\whisper\models\ggml-base.en.bin
    ```
 
-Restart loomux and press `Alt+V`.
+Restart loomux and press `Alt+S`.
 
 **Custom locations (env overrides).** To keep the runtime or model elsewhere,
 point loomux at them:
