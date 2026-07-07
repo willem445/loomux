@@ -1701,6 +1701,69 @@ fn delete_done_removes_only_done_and_notifies_once() {
 }
 
 #[test]
+fn delete_selected_removes_only_named_ids_and_notifies_once() {
+    // #120 follow-up: the board's multi-select "delete selected" clears exactly
+    // the ticked rows in one action — one coalesced board-change notice for the
+    // whole batch, unknown ids skipped (the board can shift under the human's
+    // selection), and an empty selection a silent no-op.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+
+    // Four tasks in assorted statuses — selection is by id, not status.
+    let ids: Vec<String> = ["a", "b", "c", "d"]
+        .iter()
+        .map(|title| reg.upsert_task(&g.id, "orch", None, patch(Some(title), None, None)).unwrap().id)
+        .collect();
+
+    // Pause so the best-effort notice is observable as a suppression audit (as
+    // in the delete-done test — test mode has no PTY to deliver into).
+    reg.pause_group(&g.id).unwrap();
+
+    // Select two real ids plus one that never existed: the unknown id is
+    // skipped, the two real ones go, and the removed set is exactly those two.
+    let selection = vec![ids[1].clone(), ids[3].clone(), "t-nope".to_string()];
+    let removed = reg.delete_tasks(&g.id, "human", &selection).unwrap();
+    assert_eq!(removed.len(), 2, "only the two real selected tasks are removed");
+    assert!(removed.contains(&ids[1]) && removed.contains(&ids[3]));
+    assert!(!removed.iter().any(|id| id == "t-nope"), "the unknown id is skipped, not returned");
+
+    // The un-ticked tasks survive, in board order; nothing else is touched.
+    let survivors: Vec<String> = reg.tasks(&g.id).iter().map(|t| t.id.clone()).collect();
+    assert_eq!(survivors, vec![ids[0].clone(), ids[2].clone()], "only the selected rows go");
+
+    // The skipped id is recorded in the audit entry for traceability.
+    let del = reg
+        .audit_log(&g.id)
+        .into_iter()
+        .find(|e| e.action == "task-delete-selected")
+        .expect("a delete-selected audit entry");
+    let skipped: Vec<&str> = del.detail["skipped"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+    assert_eq!(skipped, vec!["t-nope"], "the audit notes the id that no longer named a row");
+
+    // The heart of #120: ONE board-change notice for the whole batch.
+    let notices = |reg: &OrchRegistry| {
+        reg.audit_log(&g.id)
+            .into_iter()
+            .filter(|e| {
+                e.action == "prompt-suppressed-paused"
+                    && e.detail["text"].as_str().is_some_and(|s| s.contains("updated the task board"))
+            })
+            .count()
+    };
+    assert_eq!(notices(&reg), 1, "the batch must coalesce to a single board-change notice");
+
+    // An empty selection is a silent no-op: no delete, no new notice.
+    let none = reg.delete_tasks(&g.id, "human", &[]).unwrap();
+    assert!(none.is_empty(), "empty selection removes nothing");
+    // A selection of only unknown ids likewise no-ops (nothing matched).
+    let miss = reg.delete_tasks(&g.id, "human", &["t-gone".to_string()]).unwrap();
+    assert!(miss.is_empty(), "a selection matching nothing removes nothing");
+    assert_eq!(notices(&reg), 1, "no-op deletes must not notify");
+    assert_eq!(reg.tasks(&g.id).len(), 2, "the board is unchanged by the no-op sweeps");
+}
+
+#[test]
 fn task_board_persists_and_reorders() {
     let dir = tempfile::tempdir().unwrap();
     let gid;

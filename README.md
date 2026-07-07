@@ -290,6 +290,13 @@ so a mis-click can't wipe the board). The whole batch is a single backend
 operation, so the orchestrator hears about it **once** — one *board updated*
 notice for the sweep, not one per task deleted.
 
+**Delete selected:** tick the checkbox on any rows you want gone and the header
+shows a **🗑 selected (N)** button that deletes exactly those, by id, in one
+action (same two-click confirm and single coalesced notice as clear-done). The
+selection is pruned to live rows on every refresh, so a task the orchestrator
+removes out from under you drops out of the count; ids that no longer exist by
+the time you confirm are skipped, not errored.
+
 **Start:** a `queued` item shows a **▶ Start** button — your nudge to have the
 orchestrator begin work on it now. Clicking it records a human note on the task
 and delivers a *begin work* prompt to the orchestrator pane (same delivery path

@@ -824,6 +824,14 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .tasks-head .pane-btn.clear-done[data-confirm] {
   color: #1a1a22; background: var(--danger);
 }
+/* Multi-select batch delete — same shape/confirm treatment as clear-done. */
+.tasks-head .pane-btn.delete-selected {
+  flex: none; width: auto; padding: 0 8px; font-size: 10.5px; height: 20px;
+}
+.tasks-head .pane-btn.delete-selected:hover { color: var(--danger); }
+.tasks-head .pane-btn.delete-selected[data-confirm] {
+  color: #1a1a22; background: var(--danger);
+}
 .tasks-title { font-weight: 600; font-size: 12px; }
 .tasks-group {
   flex: 1; min-width: 0; color: var(--text-dim); font-size: 10.5px;
@@ -854,6 +862,8 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   background: rgba(224, 175, 104, 0.07);
 }
 .task-row.awaiting-human:hover { background: rgba(224, 175, 104, 0.12); }
+/* Multi-select tick box — nudged down to line up with the row's first line. */
+.task-select { flex: none; margin: 3px 0 0; cursor: pointer; accent-color: var(--danger); }
 .task-order { display: flex; flex-direction: column; flex: none; }
 .task-btn {
   background: none; border: none; border-radius: 4px;

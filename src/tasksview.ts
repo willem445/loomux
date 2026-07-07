@@ -8,7 +8,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { swapIfConnected } from "./domutil";
-import { doneCount } from "./taskboard";
+import { doneCount, retainExisting } from "./taskboard";
 
 export interface OrchTaskNote {
   ts_ms: number;
@@ -47,11 +47,16 @@ export class TasksView {
   private addInput: HTMLInputElement;
   private clearDoneBtn: HTMLButtonElement;
   private clearDoneTimer: number | undefined;
+  private deleteSelectedBtn: HTMLButtonElement;
+  private deleteSelectedTimer: number | undefined;
   private toastEl: HTMLElement;
   private toastTimer: number | undefined;
   private tasks: OrchTask[] = [];
   /** Task ids with their notes section expanded (survives re-renders). */
   private expanded = new Set<string>();
+  /** Task ids the human has ticked for batch delete. Frontend-only, so it's
+   *  pruned to live rows on every refresh (see retainExisting). */
+  private selected = new Set<string>();
   /** A refresh arrived while the human was mid-edit; run it on blur. */
   private pendingRefresh = false;
   /** The open request-changes modal, if any (kept to one at a time). */
@@ -78,6 +83,14 @@ export class TasksView {
     this.clearDoneBtn.hidden = true;
     this.clearDoneBtn.addEventListener("click", () => this.onClearDone());
     head.append(this.clearDoneBtn);
+
+    // Multi-select delete: tick task rows, then clear them in one action. Like
+    // "delete all done" it's a single backend call (one coalesced notice #120)
+    // with a two-click confirm; hidden until at least one row is selected.
+    this.deleteSelectedBtn = el("button", "pane-btn delete-selected", "") as HTMLButtonElement;
+    this.deleteSelectedBtn.hidden = true;
+    this.deleteSelectedBtn.addEventListener("click", () => this.onDeleteSelected());
+    head.append(this.deleteSelectedBtn);
 
     const close = el("button", "pane-btn close", "✕") as HTMLButtonElement;
     close.title = "Close (Alt+T)";
@@ -128,6 +141,7 @@ export class TasksView {
     this.disposed = true;
     clearTimeout(this.toastTimer);
     clearTimeout(this.clearDoneTimer);
+    clearTimeout(this.deleteSelectedTimer);
     this.unlisten?.();
     this.el.remove();
   }
@@ -171,6 +185,9 @@ export class TasksView {
       this.toast(String(err));
       return;
     }
+    // Drop any ticked rows that vanished from the board (orchestrator edit,
+    // another delete) so the "delete selected" count can't outlive its rows.
+    this.selected = retainExisting(this.selected, this.tasks);
     this.render();
   }
 
@@ -207,6 +224,38 @@ export class TasksView {
     this.clearDoneBtn.dataset.confirm = "1";
     this.clearDoneBtn.textContent = `delete ${n}?`;
     this.clearDoneTimer = window.setTimeout(() => this.updateClearDone(), 2500);
+  }
+
+  /** Reflect the current selection size on the delete-selected button and reset
+   *  any pending confirm — called from render() so the label tracks the (pruned)
+   *  selection and a stale "sure?" can't linger after the set changes. */
+  private updateDeleteSelected(): void {
+    clearTimeout(this.deleteSelectedTimer);
+    delete this.deleteSelectedBtn.dataset.confirm;
+    const n = this.selected.size;
+    this.deleteSelectedBtn.hidden = n === 0;
+    this.deleteSelectedBtn.textContent = `🗑 selected (${n})`;
+    this.deleteSelectedBtn.title = `Delete the ${n} selected task${n === 1 ? "" : "s"} — the orchestrator is notified once`;
+  }
+
+  /** Two-click confirm, then delete every selected task in one backend call —
+   *  by id, so exactly the ticked rows go (unknown ids are skipped backend-side
+   *  if the board shifted). One coalesced board-change notice for the batch,
+   *  mirroring "delete all done" (#120). Selection is cleared here; the refresh
+   *  that follows the delete re-prunes it anyway. */
+  private onDeleteSelected(): void {
+    if (this.deleteSelectedBtn.dataset.confirm) {
+      clearTimeout(this.deleteSelectedTimer);
+      delete this.deleteSelectedBtn.dataset.confirm;
+      const ids = [...this.selected];
+      this.selected = new Set();
+      void this.mutate(invoke("orch_delete_tasks", { groupId: this.groupId, ids }));
+      return;
+    }
+    const n = this.selected.size;
+    this.deleteSelectedBtn.dataset.confirm = "1";
+    this.deleteSelectedBtn.textContent = `delete ${n}?`;
+    this.deleteSelectedTimer = window.setTimeout(() => this.updateDeleteSelected(), 2500);
   }
 
   /** Open a task's issue/PR reference in the default browser. */
@@ -271,6 +320,7 @@ export class TasksView {
 
   private render(): void {
     this.updateClearDone();
+    this.updateDeleteSelected();
     this.listEl.replaceChildren();
     if (this.tasks.length === 0) {
       this.listEl.appendChild(el("div", "tasks-empty", "No tasks yet — the orchestrator adds them as work items come in, or add one below."));
@@ -286,6 +336,21 @@ export class TasksView {
   private renderTask(t: OrchTask, index: number): HTMLElement {
     const row = el("div", "task-row");
     if (TasksView.AWAITING_HUMAN.has(t.status)) row.classList.add("awaiting-human");
+
+    // Multi-select: tick to add the row to the batch-delete set. A checkbox
+    // (over ctrl/shift-click) keeps the affordance discoverable — the human
+    // asked to "multi select the tasks and click a button" (#120). Selection is
+    // frontend-only; the checked state is rebuilt from `selected` each render.
+    const check = document.createElement("input");
+    check.type = "checkbox";
+    check.className = "task-select";
+    check.checked = this.selected.has(t.id);
+    check.title = "Select for batch delete";
+    check.addEventListener("change", () => {
+      if (check.checked) this.selected.add(t.id);
+      else this.selected.delete(t.id);
+      this.updateDeleteSelected();
+    });
 
     // Reorder: board order is the priority order the orchestrator follows.
     const order = el("div", "task-order");
@@ -470,7 +535,7 @@ export class TasksView {
       main.appendChild(notes);
     }
 
-    row.append(order, main);
+    row.append(check, order, main);
     return row;
   }
 }
