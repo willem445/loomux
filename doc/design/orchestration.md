@@ -510,51 +510,74 @@ unconfirmed notice never fired. Two were caught live (2026-07-06): a delivery th
 human-typed `/model` and was submitted as `Unknown command: /modelRun …` (the error repaint
 cleared the floor), and an open `/model` picker that absorbed the paste + Enter.
 
-The signal now reads the ANSI-stripped pane instead of counting bytes, and confirms on the
-**box → committed-turn transition**: a landed submit makes the pasted text *leave* the input box
-and *reappear above it* as a `>`-led user turn. Everything else — an ignored Enter, an error
-repaint, a dialog, a spinner tick — fails at least one half of that transition and stays
-`unconfirmed`.
+### The signal reads a delta of the raw ring, not "a screen"
 
-- **The decision — `prompt_landed(before, after, prompt)`.** `before` is the ANSI-stripped pane
-  tail snapshotted just before the first Enter (our paste sitting in the box); `after` is polled
-  across the confirm window. It fingerprints the prompt into a normalised `needle` (frame glyphs
-  dropped, whitespace collapsed, lower-cased, capped) and requires **all four**:
-  1. `before` still holds the needle in the input box — our paste is really there to confirm.
-  2. `after` no longer holds it in the box — it left.
-  3. `after` has a committed `>`-led user turn whose text *starts with* the needle — positive
-     evidence it entered the conversation.
-  4. that committed turn is **not already in `before`** — it appeared because of *this* Enter.
-- **Why each clause, against the live cases.**
-  - The **box region** is everything from the pane's last box top-border (`╭`/`┌`/`╔`) downward,
-    so a prompt that wrapped to many rows inside the box is wholly contained — clause 2 can't miss
-    a still-sitting prompt (the spinner-tick and ignored-Enter cases both fail here).
-  - The `>`-**anchored, needle-*leading*** commit check (clause 3) is what rejects the
-    "Unknown command" repaint: `Unknown command: /modelRun <prompt>` contains the prompt text but
-    is not a `>`-led turn that *starts* with it (the `/modelRun` prefix pushes the needle off the
-    line start), and the merged `> /modelRun …` turn doesn't start with the clean needle either.
-    A `/model` dialog has no committed user turn at all.
-  - Clause 4 defeats the **stale-scrollback** trap on the #103 re-send path: a prior landing of
-    the *same* prompt leaves an identical `> …` turn in scrollback; without "new since `before`",
-    a later delivery that is itself swallowed (box empties, no *new* turn) would borrow that stale
-    copy as proof. The cost — a re-send of an *identical* prompt that genuinely lands while its
-    stale twin is still on screen stays `unconfirmed` — is the harmless direction.
+The confirm's real input is subtle, and the first rework (rev-119) got it wrong (caught in rev-9
+review). `output_tail` returns the pane's **raw append-only byte ring**, and `strip_ansi` deletes
+escape sequences **without emulating a terminal** — it never applies the cursor-move/erase escapes
+a TUI uses to repaint in place. So `strip_ansi(output_tail)` is *not the current screen*: it is
+every frame the CLI ever painted in the ring window, concatenated in emission order. A TUI
+repaints its box on the paste echo, on every spinner/blink tick, on each dialog keystroke, so the
+tail holds **many stacked copies** of the box, and a snapshot taken later is a **superset** of one
+taken earlier. Reasoning about "the input box" off that stack (keying on the *last* box border and
+scanning "above" it) reclassifies an earlier still-sitting box frame as a committed turn the
+moment one newer frame is appended below it — a false-confirm, the dangerous direction.
+
+The fix is to look only at the **bytes painted since the Enter**. `deliver_prompt` records the
+monotonic `output_total` just before the first Enter; each poll slices `after_total −
+before_total` bytes off the tail of the ring and strips *that* delta. The delta is what the CLI
+painted *in response to* the Enter, so every stale pre-Enter frame is excluded by construction.
+
+- **The decision — `submit_confirmed(reached_quiet, cli, before_total, after_ring, after_total,
+  prompt)` → `prompt_landed(cli, delta, prompt)`.** The slicing lives inside `submit_confirmed`
+  (pure, so the ring arithmetic rev-9 flagged is itself unit-tested). It fingerprints the prompt
+  into a normalised `needle` (frame glyphs dropped, whitespace collapsed, lower-cased, capped) and
+  confirms iff **both**:
+  1. the delta carries a committed **un-framed** `>`-led turn whose text *starts with* the needle,
+     and
+  2. the delta's newest frame no longer holds the needle in the input box.
+- **Framed box vs un-framed turn is the crux.** A landed submit paints the prompt as a committed
+  user message — in Claude Code an **un-framed** `> …` line (no box around it). A repaint of the
+  still-sitting input box is `│ > <needle> …` — it starts with the frame glyph `│`. So
+  `committed_unframed_turn` requires the `>` after trimming **whitespace only**, never a frame
+  glyph: a repainted sitting box, however many times it stacks into the delta, can *never* read as
+  a committed turn. That single distinction is what makes the signal sound against the raw ring —
+  the ignored-Enter, spinner-tick and `/model`-dialog cases all only ever paint framed box/dialog
+  lines in the delta.
+- **Why each live case fails to confirm.** *Unknown-command repaint:* the submitted merge renders
+  as `> /modelRun <needle>`, which starts with `/modelRun`, not the clean needle — rejected; the
+  error line isn't `>`-led at all. *`/model` dialog:* the filter frame carrying our text is in
+  `before`, not the delta; the delta (the post-select repaint) has only framed dialog lines and no
+  committed turn. *Spinner/ignored Enter:* the delta is a framed box repaint — no un-framed turn.
+- **Stale scrollback is handled for free.** A prior landing of the *same* prompt leaves an
+  identical `> …` turn in scrollback — but that turn is in `before`, so it never enters the delta.
+  A swallowed re-send therefore can't borrow it as proof, and — unlike the rev-119 attempt — a
+  re-send that *genuinely* lands still confirms (its committed turn is new bytes in the delta),
+  with no false-unconfirmed.
+- **Scoped to Claude Code (rev-9 finding #3).** The `>`-led-user-turn shape is Claude's. No real
+  capture of a Copilot (or other CLI) *committed turn* exists to model it against, and a CLI that
+  painted some non-turn line as un-framed `>`-led would be a false-confirm vector — so
+  `prompt_landed` returns `false` for any `cli != "claude"`. Those deliveries stay `unconfirmed`
+  and lean on the #103 notice rather than an unsound guess; when a real Copilot turn capture
+  exists (from a live session — this project never spawns agent CLIs in tests) the scope can widen.
 - **rev-32 preserved.** Confirm still requires the pane reached quiet *before* Enter
-  (`reached_quiet`); a cap-hit-without-quiet is never confirmed. Every ambiguous case resolves to
-  `unconfirmed`, whose worst case is one spurious #103 notice or a no-op stranded-flush next
-  delivery — never a false confirm that strands a prompt recorded as landed.
-- **Pure and unit-tested.** `prompt_landed` and its helpers are DOM-free/PTY-free; the delivery
-  thread only snapshots `before`, presses Enter, and polls `after`. Tests cover both live
-  false-confirm cases, spinner/statusline repaint noise, the stale-scrollback re-send, an
-  unfingerprintable (too-short) prompt, the never-confirm-without-quiet rule, and the genuine
-  landing.
+  (`reached_quiet`); a cap-hit-without-quiet is never confirmed. Every ambiguous case — unknown
+  CLI, unfingerprintable prompt, empty delta, ring evicted mid-window — resolves to `unconfirmed`,
+  whose worst case is one spurious #103 notice or a no-op stranded-flush next delivery; never a
+  false confirm that strands a prompt recorded as landed.
+- **Pure and unit-tested on the real input shape.** The fixtures build tails the way the ring
+  actually fills — real escape-laden repaint **frames concatenated** into a growing ring, `after ⊇
+  before` — and drive `submit_confirmed` through the same byte-total slicing as production (not
+  idealized single screens, the rev-9 test-quality finding). They pin: both live false-confirm
+  cases, a landing that survives several pre-Enter box repaints (the rev-119 false-*unconfirmed*),
+  spinner/ignored-Enter repaint noise, the stale-scrollback re-send (both swallowed and landed),
+  the Claude-only scoping, an unfingerprintable prompt, mid-window ring eviction, the
+  never-confirm-without-quiet rule, and a never-false-confirm sweep over every non-landing delta.
 - **Known gaps (all conservative — they lose confirmations, never gain false ones).** A CLI that
-  *collapses* a long bracketed paste to a placeholder (`[Pasted text +N lines]`) instead of
-  echoing the literal text in the box fails clause 1, so that delivery stays `unconfirmed` (a
-  #103 notice, not a false confirm). A frameless CLI (bare `> ` prompt, no border) falls back to
-  treating the last few lines as the box; a frameless prompt that hard-wrapped above that window
-  is the one shape where clause 2 could under-detect — the two shipped CLIs (Claude Code, Copilot)
-  both frame their input box, so this is a documented edge, not a live path.
+  *collapses* a long bracketed paste to a placeholder (`[Pasted text +N lines]`) and never paints
+  the literal text as a committed turn stays `unconfirmed` (a #103 notice, not a false confirm).
+  Non-Claude CLIs stay `unconfirmed` wholesale (scoping, above). All degrade to the harmless
+  direction.
 - **The #111 residual, and why the paste guard is left alone.** #111 fenced two residual classes
   to this issue. The *availability* residuals (a stuck `input_pending` after Esc/Ctrl-W/Ctrl-K/
   backspace-to-empty) would need the paste guard to read the box as *empty* — but Claude Code's
