@@ -192,6 +192,19 @@ const USER_QUIET_MAX_HOLD: Duration = Duration::from_secs(90);
 /// Poll interval while holding for the human to go quiet.
 const USER_QUIET_POLL: Duration = Duration::from_millis(250);
 
+// Human-input paste guard (#111): the quiet backstop above only waits out
+// active typing — it does NOT stop a paste landing on top of text a human
+// typed and then LEFT sitting in the box (a half-written `/model`, say). Pasting
+// there and pressing Enter merge-submits the human's line with the prompt (the
+// live `Unknown command: /modelRun ...` collision). So before pasting, if the
+// box still holds a human's unsubmitted line (tracked per keystroke as
+// `input_pending`), hold for them to submit/clear it, and if it never clears,
+// abort rather than blind-merge.
+/// Bounded wait for the box to clear before aborting the delivery.
+const HUMAN_INPUT_HOLD_MAX: Duration = Duration::from_secs(60);
+/// Poll interval while holding for the box to clear.
+const HUMAN_INPUT_POLL: Duration = Duration::from_millis(250);
+
 // Kickoff readiness: a fixed boot delay loses the race on a loaded machine
 // (a CLI that boots slower than the delay flushes the pasted prompt along
 // with its startup stdin buffer — observed live with a reviewer spawned
@@ -1618,6 +1631,183 @@ pub fn should_flush_before_paste(prev_confirmed: Option<bool>, human_typed_since
     matches!(prev_confirmed, Some(false)) && !human_typed_since
 }
 
+/// How a single human write into a pane's input changes box occupancy (#111).
+/// Classified from the keystroke's *content*, which is what tells a line still
+/// sitting in the box from one already submitted — an output-byte heuristic
+/// can't (one keystroke's input-line redraw, or ambient agent streaming, can
+/// exceed any fixed burst floor, and a sub-floor submit never clears it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HumanInput {
+    /// Printable text was entered — a line now sits unsubmitted in the box.
+    Content,
+    /// The line was submitted (Enter) or explicitly cleared — the box is empty.
+    Submit,
+    /// Navigation/editing that neither adds visible text nor submits (arrows,
+    /// backspace, bare escape sequences) — box occupancy is unchanged.
+    Neutral,
+}
+
+/// Classify one human write for the delivery paste guard (#111). Pure so the
+/// rule is testable; `write_pty` calls it to maintain the per-pane
+/// `input_pending` flag.
+///
+/// - A write carrying **bracketed-paste markers** (`ESC[200~` / `ESC[201~`) is
+///   pasted text held UNSUBMITTED in the box → `Content`, even if it ends in a
+///   newline: under bracketed-paste mode (Claude Code and most modern TUIs) a
+///   pasted newline is literal, not a submit — the human's separate Enter
+///   afterwards is the submit. Checked first so an interior/trailing newline
+///   can't misread the paste as submitted (the #111 loss otherwise).
+/// - Otherwise a carriage return / newline submits the current line, UNLESS
+///   printable text follows the last newline (then that trailing text is a fresh
+///   unsubmitted line → `Content`).
+/// - Ctrl-U (kill-line) / Ctrl-C (interrupt) empty the box → `Submit`.
+/// - Any remaining printable/graphic character (after skipping escape sequences)
+///   → `Content`.
+/// - Otherwise (arrows, backspace, lone escape sequences) → `Neutral`.
+///
+/// Erring toward `Content`/`Neutral` on ambiguous input keeps the guard biased
+/// to the safe hold: a real sitting line is never misread as empty. Residual
+/// clears that leave the flag stuck (bounded by the 60s abort) — Esc-to-clear,
+/// Ctrl-W/Ctrl-K, backspace-to-empty, and soft-newline editors — need true
+/// box-occupancy detection, which is issue #112.
+pub fn classify_human_input(data: &str) -> HumanInput {
+    // Bracketed paste: the text lands in the box unsubmitted regardless of any
+    // newline it contains, so never read it as a submit.
+    if data.contains(BRACKETED_PASTE_START) || data.contains(BRACKETED_PASTE_END) {
+        return HumanInput::Content;
+    }
+    if let Some(pos) = data.rfind(['\r', '\n']) {
+        // `\r`/`\n` are single-byte, so `pos + 1` is a valid char boundary.
+        let after = &data[pos + 1..];
+        return if input_has_printable(after) { HumanInput::Content } else { HumanInput::Submit };
+    }
+    // Line-clear controls empty the box even without a newline.
+    const KILL_LINE: char = '\u{15}'; // Ctrl-U
+    const INTERRUPT: char = '\u{03}'; // Ctrl-C
+    if !data.is_empty() && data.chars().all(|c| c == KILL_LINE || c == INTERRUPT) {
+        return HumanInput::Submit;
+    }
+    if input_has_printable(data) {
+        HumanInput::Content
+    } else {
+        HumanInput::Neutral
+    }
+}
+
+/// xterm bracketed-paste bracket sequences: the terminal wraps pasted text in
+/// these so an app can tell a paste from typing (and hold pasted newlines soft).
+const BRACKETED_PASTE_START: &str = "\u{1b}[200~";
+const BRACKETED_PASTE_END: &str = "\u{1b}[201~";
+
+/// Whether `s` contains a graphic character once terminal escape sequences are
+/// skipped — the test for "this write put visible text in the box". Skips CSI
+/// (`ESC [ … final`, e.g. arrow keys, bracketed-paste markers) and other short
+/// `ESC`-led sequences so their printable final bytes (`C`, `~`, digits) don't
+/// read as typed content.
+fn input_has_printable(s: &str) -> bool {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == 0x1b {
+            i += 1;
+            if i < b.len() && b[i] == b'[' {
+                i += 1;
+                while i < b.len() && !(0x40..=0x7e).contains(&b[i]) {
+                    i += 1;
+                }
+                i += 1; // consume the CSI final byte
+            } else {
+                i += 1; // 2-byte / lone ESC sequence
+            }
+            continue;
+        }
+        // Printable ASCII (space..~) or any UTF-8 multibyte lead/continuation.
+        if (0x20..0x7f).contains(&b[i]) || b[i] >= 0x80 {
+            return true;
+        }
+        i += 1; // C0 control (tab, backspace/DEL handled below, etc.)
+    }
+    false
+}
+
+/// One tick of the pre-paste human-input hold (#111): given whether a human's
+/// line is still sitting in the box, decide whether to paste, keep holding, or
+/// abort. Pure so the hold/abort rule is testable without a live PTY;
+/// `hold_for_human_input` drives it. Mirrors `should_flush_before_paste` — a
+/// small, total gate.
+///
+/// - `box_pending`: does the box still hold a human's unsubmitted line?
+/// - `held` / `max_hold`: the bounded wait; at the cap we abort rather than
+///   paste onto a line the human never cleared.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PasteGate {
+    /// Box is clear (or was never dirty) — paste the prompt.
+    Paste,
+    /// Human's line is still in the box — keep waiting.
+    Hold,
+    /// The box never cleared within the bound — do not paste; notify instead.
+    Abort,
+}
+
+pub fn resolve_paste_gate(box_pending: bool, held: Duration, max_hold: Duration) -> PasteGate {
+    if !box_pending {
+        return PasteGate::Paste; // box is empty — paste the prompt
+    }
+    if held >= max_hold {
+        return PasteGate::Abort; // bounded wait elapsed and the line never cleared
+    }
+    PasteGate::Hold
+}
+
+/// Outcome of the pre-paste human-input hold (#111): either the box is clear and
+/// delivery may paste, or it never cleared and the delivery must abort. Carries
+/// the held duration so the caller can audit how long it waited.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PasteDecision {
+    Paste { held_ms: u64 },
+    Abort { held_ms: u64 },
+}
+
+/// Poll-and-hold loop that drives `resolve_paste_gate`: if a human's line is
+/// sitting in the box (`box_pending`), block until they submit/clear it (the
+/// flag flips false) or the bounded wait elapses, then return `Paste`/`Abort`.
+/// Returns `Paste { held_ms: 0 }` immediately when the box is already clear.
+///
+/// Generic over the occupancy source and timings so the wiring — that the loop
+/// re-reads the flag each poll and honours the abort cap — is integration-
+/// testable without a live PTY (the #40 lesson: exercise the loop, not just the
+/// pure decision).
+#[doc(hidden)] // pub for integration tests
+pub fn hold_for_human_input<P: Fn() -> bool>(
+    box_pending: P,
+    max_hold: Duration,
+    poll: Duration,
+) -> PasteDecision {
+    if !box_pending() {
+        return PasteDecision::Paste { held_ms: 0 };
+    }
+    let start = std::time::Instant::now();
+    loop {
+        let held = start.elapsed();
+        match resolve_paste_gate(box_pending(), held, max_hold) {
+            PasteGate::Paste => return PasteDecision::Paste { held_ms: held.as_millis() as u64 },
+            PasteGate::Abort => return PasteDecision::Abort { held_ms: held.as_millis() as u64 },
+            PasteGate::Hold => std::thread::sleep(poll),
+        }
+    }
+}
+
+/// Production wrapper: hold prompt delivery to `pty_id` while a human's line is
+/// sitting in its input box, using the shipped cap / poll. A closed pty reads as
+/// "not pending" so a dead pane never blocks the thread.
+fn wait_for_box_clear(ptys: &crate::pty::PtyManager, pty_id: u32) -> PasteDecision {
+    hold_for_human_input(
+        || ptys.input_pending(pty_id).unwrap_or(false),
+        HUMAN_INPUT_HOLD_MAX,
+        HUMAN_INPUT_POLL,
+    )
+}
+
 /// Whether an unconfirmed delivery should raise a one-shot notice to the group's
 /// orchestrator so it can close the loop (#103). Fires only for a delivery to a
 /// NON-orchestrator agent whose submit went unconfirmed: the prompt may be
@@ -1639,6 +1829,30 @@ pub fn unconfirmed_delivery_notice(agent_id: &str) -> String {
     format!(
         "[loomux] delivery to {agent_id} unconfirmed — the prompt may be sitting \
          unsubmitted in its pane; get_output it and re-send if needed"
+    )
+}
+
+/// Whether a held-for-human-input delivery should raise a notice to the group's
+/// orchestrator (#111). Fires for a non-orchestrator target: the prompt was NOT
+/// delivered (the box held a human's line, so pasting was aborted rather than
+/// merge-submitting it), and the orchestrator — believing it landed — must know
+/// to re-send once the pane is clear. Suppressed when the target IS the
+/// orchestrator, exactly like the unconfirmed notice: a notice about a delivery
+/// to the orchestrator is itself a delivery to the orchestrator, an endless
+/// loop. Pure so the gate is testable; the paused-group skip and one-per-abort
+/// emission live in `notify_delivery_held`.
+pub fn should_notify_paste_held(target_is_orchestrator: bool) -> bool {
+    !target_is_orchestrator
+}
+
+/// The notice delivered to the orchestrator when a delivery to `agent_id` was
+/// held and aborted because the pane holds a human's unsubmitted line (#111).
+/// Distinct from `unconfirmed_delivery_notice`: nothing was pasted, so the move
+/// is to wait for the box to clear and re-send — not to read back a stranded
+/// prompt.
+pub fn paste_held_notice(agent_id: &str) -> String {
+    format!(
+        "[loomux] delivery to {agent_id} held: pane has human input — re-send when clear"
     )
 }
 
@@ -4406,6 +4620,34 @@ impl OrchRegistry {
                 std::thread::sleep(FLUSH_SETTLE);
             }
 
+            // Human-input paste guard (#111): the quiet backstop above only waits
+            // out ACTIVE typing — it doesn't stop a paste landing on top of a line
+            // the human typed and LEFT sitting in the box. Pasting there and
+            // pressing Enter merge-submits their line with the prompt (the live
+            // `/model` + task-text collision). So hold for the box to clear
+            // (they submit or clear it); if it never does, abort WITHOUT pasting
+            // and nudge the orchestrator to re-send once the pane is clear.
+            match wait_for_box_clear(&ptys, pty_id) {
+                PasteDecision::Paste { held_ms } if held_ms > 0 => {
+                    append_audit(&root, &group, "loomux", "delivery-held-for-input", json!({
+                        "to": agent, "held_ms": held_ms, "outcome": "cleared",
+                    }));
+                }
+                PasteDecision::Paste { .. } => {}
+                PasteDecision::Abort { held_ms } => {
+                    append_audit(&root, &group, "loomux", "delivery-aborted-human-input", json!({
+                        "to": agent, "held_ms": held_ms,
+                    }));
+                    // Best-effort one-shot nudge so the orchestrator re-sends once
+                    // the human's line is gone. Nothing was pasted, so there is no
+                    // outcome to record for the next delivery's flush.
+                    if let Some(reg) = reg {
+                        reg.notify_delivery_held(&group, &agent, target_is_orchestrator);
+                    }
+                    return;
+                }
+            }
+
             // Echo-verified typing: paste, then require the TUI to emit
             // output (its input box redrawing). No echo means the CLI
             // flushed the paste with its startup stdin buffer — retype.
@@ -4601,6 +4843,23 @@ impl OrchRegistry {
         }
         self.audit(group, "loomux", "delivery-unconfirmed-notice", json!({ "to": agent_id }));
         let _ = self.deliver_to_orchestrator(group, &unconfirmed_delivery_notice(agent_id), "loomux");
+    }
+
+    /// Notify the orchestrator that a delivery to `agent_id` was HELD and
+    /// aborted because the pane holds a human's unsubmitted line (#111) — the
+    /// prompt was never pasted, so the orchestrator must re-send once the box is
+    /// clear. Same discipline as `notify_unconfirmed_delivery`: skipped for an
+    /// orchestrator target (`should_notify_paste_held` — a notice to it would
+    /// loop) and for a paused group (delivery is suppressed there anyway, so we
+    /// must not spend the notice on it). Best-effort and audited; exactly one
+    /// notice per aborted delivery (the caller invokes this once, at the abort).
+    #[doc(hidden)] // pub for integration tests
+    pub fn notify_delivery_held(&self, group: &str, agent_id: &str, target_is_orchestrator: bool) {
+        if !should_notify_paste_held(target_is_orchestrator) || self.is_paused(group) {
+            return;
+        }
+        self.audit(group, "loomux", "delivery-held-notice", json!({ "to": agent_id }));
+        let _ = self.deliver_to_orchestrator(group, &paste_held_notice(agent_id), "loomux");
     }
 
     /// Deliver to the group's orchestrator (worker reports, exit notices).

@@ -8,16 +8,17 @@
 
 use loomux_lib::orchestration::mcp::dispatch;
 use loomux_lib::orchestration::{
-    add_trusted_folder, bracketed_paste, claude_permission_mode, cli_ready,
-    copilot_autopilot_prompt_detected, create_orchestration_group, hold_until_quiet,
-    idle_should_kill, max_agents_notice,
-    normalize_remote_web_base, parse_audit_lines, parse_session_cost, prompt_wait_detected,
-    resolve_ref_url, rotate_audit_if_needed, sanitize_attachment_ext, should_confirm_copilot_autopilot,
-    should_flush_before_paste, should_notify_unconfirmed, single_pane_autopilot_flags,
+    add_trusted_folder, bracketed_paste, classify_human_input, claude_permission_mode, cli_ready,
+    copilot_autopilot_prompt_detected, create_orchestration_group, hold_for_human_input,
+    hold_until_quiet, idle_should_kill, max_agents_notice,
+    normalize_remote_web_base, parse_audit_lines, parse_session_cost, paste_held_notice,
+    prompt_wait_detected, resolve_paste_gate, resolve_ref_url, rotate_audit_if_needed,
+    sanitize_attachment_ext, should_confirm_copilot_autopilot, should_flush_before_paste,
+    should_notify_paste_held, should_notify_unconfirmed, single_pane_autopilot_flags,
     spawn_rate_exceeded, spawn_request_expired, strip_ansi, submit_confirmed, submit_sequence,
     unconfirmed_delivery_notice, watchdog_should_notify, worktree_cleanup_targets,
-    AttentionItem, Caller, Delivery, Guardrails, NameSource, OrchRegistry, Role, TaskPatch,
-    UsageSnapshot, CLAUDE_UNATTENDED_ALLOW, COPILOT_AUTOPILOT_CONFIRM_KEYS,
+    AttentionItem, Caller, Delivery, Guardrails, HumanInput, NameSource, OrchRegistry, PasteDecision,
+    PasteGate, Role, TaskPatch, UsageSnapshot, CLAUDE_UNATTENDED_ALLOW, COPILOT_AUTOPILOT_CONFIRM_KEYS,
     COPILOT_GROUP_AUTOPILOT_FLAGS, COPILOT_UNATTENDED_FLAGS, MAX_ATTACHMENT_BYTES,
     PLANNER_READONLY_NOTE,
 };
@@ -666,6 +667,82 @@ fn unconfirmed_notice_text_names_the_agent_and_the_recovery_move() {
     // Points the orchestrator at the recovery move from the template.
     assert!(msg.contains("get_output"), "notice must point at reading the pane: {msg}");
     assert!(msg.contains("re-send"), "notice must point at re-sending: {msg}");
+}
+
+#[test]
+fn classify_human_input_reads_box_occupancy_from_keystroke_content() {
+    // Printable text → a line now sits in the box.
+    assert_eq!(classify_human_input("a"), HumanInput::Content);
+    assert_eq!(classify_human_input("/model"), HumanInput::Content);
+    assert_eq!(classify_human_input("dfgdsfg"), HumanInput::Content);
+    // Enter (any newline form) submits — the box clears. This is the fix's crux:
+    // a sub-"burst" submit (empty Enter, short command) is still positively a
+    // submit, so the pending flag can't get stuck (finding #2).
+    assert_eq!(classify_human_input("\r"), HumanInput::Submit);
+    assert_eq!(classify_human_input("\n"), HumanInput::Submit);
+    assert_eq!(classify_human_input("\r\n"), HumanInput::Submit);
+    assert_eq!(classify_human_input("ls\r"), HumanInput::Submit); // typed + submitted in one write
+    // Text AFTER the last newline is a fresh unsubmitted line → still Content.
+    assert_eq!(classify_human_input("done\rmore"), HumanInput::Content);
+    // Explicit line-clear controls empty the box.
+    assert_eq!(classify_human_input("\u{15}"), HumanInput::Submit); // Ctrl-U
+    assert_eq!(classify_human_input("\u{03}"), HumanInput::Submit); // Ctrl-C
+    // Navigation / editing that adds no visible text leaves occupancy unchanged —
+    // a stray arrow or backspace must NOT mark an empty box as pending (else a
+    // delivery to an idle pane would wedge).
+    assert_eq!(classify_human_input("\u{1b}[C"), HumanInput::Neutral); // right arrow
+    assert_eq!(classify_human_input("\u{1b}[A"), HumanInput::Neutral); // up arrow
+    assert_eq!(classify_human_input("\u{7f}"), HumanInput::Neutral); // backspace/DEL
+    assert_eq!(classify_human_input(""), HumanInput::Neutral);
+    // A bracketed paste is text sitting UNSUBMITTED in the box → Content.
+    assert_eq!(classify_human_input("\u{1b}[200~hello\u{1b}[201~"), HumanInput::Content);
+    // The finding-#1 shape: a paste ENDING IN A NEWLINE. The pasted newline is
+    // literal under bracketed-paste mode (the CLI holds it unsubmitted), so the
+    // marker — checked before the trailing-newline rule — must keep this Content,
+    // NOT Submit. Reading it as submitted would let the next delivery merge-submit
+    // the human's paste (the exact #111 loss).
+    assert_eq!(classify_human_input("\u{1b}[200~foo\n\u{1b}[201~"), HumanInput::Content);
+    assert_eq!(classify_human_input("\u{1b}[200~foo\r\n\u{1b}[201~"), HumanInput::Content);
+    // A multi-line paste (interior newlines) is likewise held unsubmitted → Content.
+    assert_eq!(classify_human_input("\u{1b}[200~a\nb\nc\u{1b}[201~"), HumanInput::Content);
+    // Even an empty bracketed paste carries the markers → Content (pending, the
+    // safe-hold direction), never a spurious Submit.
+    assert_eq!(classify_human_input("\u{1b}[200~\u{1b}[201~"), HumanInput::Content);
+}
+
+#[test]
+fn paste_gate_holds_until_clear_then_pastes_or_aborts_at_the_cap() {
+    let cap = Duration::from_secs(60);
+    // Box empty → paste immediately (the normal delivery path).
+    assert_eq!(resolve_paste_gate(false, Duration::ZERO, cap), PasteGate::Paste);
+    assert_eq!(resolve_paste_gate(false, cap, cap), PasteGate::Paste);
+    // Human's line still sitting, within the bound → keep holding.
+    assert_eq!(resolve_paste_gate(true, Duration::from_secs(1), cap), PasteGate::Hold);
+    // Bound elapsed and the line never cleared → abort (never blind-merge).
+    assert_eq!(resolve_paste_gate(true, cap, cap), PasteGate::Abort);
+    assert_eq!(resolve_paste_gate(true, cap + Duration::from_millis(1), cap), PasteGate::Abort);
+}
+
+#[test]
+fn paste_held_notice_names_the_agent_and_the_recovery_move() {
+    let msg = paste_held_notice("w-4");
+    assert!(msg.starts_with("[loomux] "), "notice is a loomux system message: {msg}");
+    assert!(msg.contains("w-4"), "notice must name the held agent: {msg}");
+    assert!(msg.contains("human input"), "notice must state the condition: {msg}");
+    assert!(msg.contains("re-send"), "notice must point at re-sending: {msg}");
+    // Distinct from the unconfirmed notice: nothing was pasted, so it must NOT
+    // tell the orchestrator the prompt is sitting unsubmitted.
+    assert!(!msg.contains("unsubmitted"), "held notice is not the unconfirmed one: {msg}");
+}
+
+#[test]
+fn paste_held_notice_fires_only_for_a_non_orchestrator_target() {
+    // A held delivery to a worker/reviewer: the prompt never landed, so the
+    // orchestrator must be told to re-send.
+    assert!(should_notify_paste_held(false));
+    // Target IS the orchestrator: a notice to it is itself a delivery to it — an
+    // endless loop. Never notify.
+    assert!(!should_notify_paste_held(true));
 }
 
 #[test]
@@ -3883,6 +3960,41 @@ fn unconfirmed_notice_is_suppressed_while_the_group_is_paused() {
     );
 }
 
+#[test]
+fn delivery_held_notice_fires_for_a_worker_but_not_the_orchestrator() {
+    // #111: a delivery aborted because the pane holds human input must nudge the
+    // orchestrator (once) to re-send — but never for an orchestrator target (that
+    // would loop) and never while paused (delivery is suppressed there anyway).
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let o = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+
+    // Worker target, group live: the notice is raised and audited.
+    reg.notify_delivery_held(&g.id, &w.id, false);
+    assert!(
+        reg.audit_log(&g.id).iter().any(|e| e.action == "delivery-held-notice"),
+        "an aborted worker delivery must raise the held notice"
+    );
+
+    // Orchestrator target: suppressed (a notice to it is a delivery to it — a loop).
+    reg.notify_delivery_held(&g.id, &o.id, true);
+    assert_eq!(
+        reg.audit_log(&g.id).iter().filter(|e| e.action == "delivery-held-notice").count(),
+        1,
+        "an orchestrator-target held delivery must not raise a notice"
+    );
+
+    // Paused group: suppressed even for a worker.
+    reg.pause_group(&g.id).unwrap();
+    reg.notify_delivery_held(&g.id, &w.id, false);
+    assert_eq!(
+        reg.audit_log(&g.id).iter().filter(|e| e.action == "delivery-held-notice").count(),
+        1,
+        "a paused group must not raise the held notice"
+    );
+}
+
 // ---------- #72: steering-strip image attachments ----------
 
 #[test]
@@ -4033,6 +4145,102 @@ fn hold_guard_releases_once_the_human_goes_quiet() {
         if calls.fetch_add(1, Ordering::Relaxed) < 3 { u64::MAX } else { 1 }
     };
     let held = hold_until_quiet(source, Duration::from_millis(50), Duration::from_secs(5), Duration::from_millis(5))
-        .expect("it must report having held while the human was typing");
+        .expect("it must release once the human goes quiet");
     assert!(held < 4000, "must release on quiet, not ride the cap, got {held}ms");
+}
+
+// --- #111 pre-paste human-input hold: the loop that drives the pure gate ---
+
+const HB_POLL: Duration = Duration::from_millis(5);
+
+#[test]
+fn paste_hold_proceeds_immediately_when_box_is_empty() {
+    // Not pending → the box is empty; paste at once with no hold.
+    let out = hold_for_human_input(|| false, Duration::from_secs(5), HB_POLL);
+    assert_eq!(out, PasteDecision::Paste { held_ms: 0 });
+}
+
+#[test]
+fn paste_hold_aborts_when_the_line_never_clears() {
+    // A human line sits and they never submit/clear it: the box stays pending for
+    // the whole bounded wait → abort rather than merge-submit. A small cap keeps
+    // the test fast. Importantly, the decision is independent of any output the
+    // pane streams meanwhile (finding #1: ambient output can't false-clear it).
+    let cap = Duration::from_millis(40);
+    let out = hold_for_human_input(|| true, cap, HB_POLL);
+    match out {
+        PasteDecision::Abort { held_ms } => {
+            assert!(held_ms >= 30, "must have held near the cap before aborting, got {held_ms}ms");
+            assert!(held_ms < 2000, "cap must bound the hold, got {held_ms}ms");
+        }
+        other => panic!("expected Abort, got {other:?}"),
+    }
+}
+
+#[test]
+fn paste_hold_releases_once_the_human_submits() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    // The line sits for the first few polls, then the human presses Enter and the
+    // pending flag flips false: the loop must release with Paste — exercising the
+    // poll loop, not just the pure gate (#40 lesson).
+    let polls = AtomicU64::new(0);
+    let pending = move || polls.fetch_add(1, Ordering::Relaxed) < 3;
+    let out = hold_for_human_input(pending, Duration::from_secs(5), HB_POLL);
+    match out {
+        PasteDecision::Paste { held_ms } => {
+            assert!(held_ms < 4000, "must release on submit, not ride the cap, got {held_ms}ms");
+        }
+        other => panic!("expected Paste after the submit, got {other:?}"),
+    }
+}
+
+#[test]
+fn output_growth_never_flips_input_pending() {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    // Finding #1's real property, tested end-to-end rather than tautologically:
+    // occupancy responds ONLY to keystroke content — output arriving never clears
+    // a sitting line. `feed` mirrors write_pty's exact flag update (pty.rs); the
+    // `output` counter models the output pump, which — like the real pump — has no
+    // reference to the flag. We interleave large output growth with keystrokes and
+    // assert the flag tracks the keystrokes alone.
+    let pending = AtomicBool::new(false);
+    let output = AtomicU64::new(0);
+    let feed = |data: &str| match classify_human_input(data) {
+        HumanInput::Content => pending.store(true, Ordering::Relaxed),
+        HumanInput::Submit => pending.store(false, Ordering::Relaxed),
+        HumanInput::Neutral => {}
+    };
+
+    // Human types a line → pending.
+    feed("dfgdsfg");
+    assert!(pending.load(Ordering::Relaxed));
+    // The pane streams a massive burst of output (agent mid-turn, keystroke
+    // redraws — the old ≥24-byte false-clear source). It cannot touch the flag.
+    output.fetch_add(1_000_000, Ordering::Relaxed);
+    assert!(pending.load(Ordering::Relaxed), "output growth must not clear a sitting line");
+    // The delivery guard, reading only the flag, holds to the cap and aborts —
+    // never merge-submitting the still-sitting line, whatever the pane printed.
+    let out = hold_for_human_input(|| pending.load(Ordering::Relaxed), Duration::from_millis(40), HB_POLL);
+    assert!(matches!(out, PasteDecision::Abort { .. }), "sitting line must not paste: {out:?}");
+    // Only an Enter clears it; more output in between changes nothing.
+    output.fetch_add(1_000_000, Ordering::Relaxed);
+    feed("\r");
+    assert!(!pending.load(Ordering::Relaxed), "only a submit keystroke clears the flag");
+    let out2 = hold_for_human_input(|| pending.load(Ordering::Relaxed), Duration::from_secs(60), HB_POLL);
+    assert_eq!(out2, PasteDecision::Paste { held_ms: 0 });
+}
+
+#[test]
+fn sub_floor_submit_does_not_wedge_future_deliveries() {
+    // Finding #2 (adversarial ordering): a human submit whose output burst is tiny
+    // (empty Enter, short command) must not leave the box "pending" forever and
+    // wedge every later delivery in a 60s hold→abort loop. With keystroke-content
+    // tracking, the Enter positively clears occupancy: classify a sub-floor submit
+    // as Submit, and a delivery consulting the resulting (false) flag pastes at
+    // once with no hold.
+    assert_eq!(classify_human_input("\r"), HumanInput::Submit); // empty Enter
+    assert_eq!(classify_human_input("q\r"), HumanInput::Submit); // one-char command + Enter
+    // The flag those submits leave (false) drives an immediate paste — no wedge.
+    let out = hold_for_human_input(|| false, Duration::from_secs(60), HB_POLL);
+    assert_eq!(out, PasteDecision::Paste { held_ms: 0 });
 }

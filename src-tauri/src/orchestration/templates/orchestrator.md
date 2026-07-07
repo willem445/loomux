@@ -203,6 +203,15 @@ prompt (a single submit press), so it may already have gone through, and re-send
 duplicate it. If a re-send to the same agent draws a second unconfirmed notice, stop
 re-sending and flag the human — something is wedging that pane.
 
+On a `[loomux] delivery to <id> held: pane has human input — re-send when clear` notice, your
+prompt was **not** delivered: the pane's input box held a line the human had typed and left
+sitting, so loomux held the paste rather than merge-submitting the two — then aborted when the
+box never cleared. Nothing is stuck in the box from you (unlike the unconfirmed case), so do
+not paste to clear it. Instead `get_output` the pane to see what the human left, give them a
+moment to submit or clear it, and `send_prompt` the task again once the box is empty. If it
+stays occupied, the human is mid-thought in that pane — leave it to them and flag it rather
+than fighting for the input box.
+
 When a worker reports a PR:
 1. `spawn_agent(kind: "reviewer", ...)` (or reuse an idle reviewer) with the PR number.
 2. When the reviewer reports findings, send them to the worker to address; loop until

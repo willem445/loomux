@@ -128,6 +128,14 @@ pub struct PtyHandle {
     /// `None` when job creation failed (fail-soft) — pre-#78 behavior.
     #[cfg(target_os = "windows")]
     _job: Option<JobHandle>,
+    /// Whether a human's typed line is currently sitting UNSUBMITTED in this
+    /// pane's input box (#111). Tracked from the *content* of each human write,
+    /// not from output bytes: printable input sets it (the box now holds a line),
+    /// an Enter / line-clear resets it (the line was submitted or cleared). This
+    /// positive submit/clear signal is what lets prompt delivery hold a paste off
+    /// a human's half-written line without wedging on an already-submitted one —
+    /// output-byte heuristics can't tell a keystroke's echo from a submit burst.
+    input_pending: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Ring of recent output plus a monotonic byte counter. The counter lets
@@ -178,6 +186,14 @@ impl PtyManager {
     pub fn last_user_input_ms(&self, id: u32) -> Option<u64> {
         let ptys = self.ptys.lock_safe();
         Some(ptys.get(&id)?.user_input_ms.load(Ordering::Relaxed))
+    }
+
+    /// Whether a human's line is currently sitting unsubmitted in this pane's
+    /// input box (#111). `None` if the pty is gone. Prompt delivery consults this
+    /// before pasting so it never merge-submits a human's half-written line.
+    pub fn input_pending(&self, id: u32) -> Option<bool> {
+        let ptys = self.ptys.lock_safe();
+        Some(ptys.get(&id)?.input_pending.load(Ordering::Relaxed))
     }
 
     /// Monotonic count of bytes this pty has ever produced.
@@ -489,6 +505,7 @@ pub fn spawn_pty(
             user_input_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(target_os = "windows")]
             _job: job,
+            input_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         },
     );
 
@@ -600,6 +617,14 @@ pub fn write_pty(state: State<PtyManager>, id: u32, data: String) -> Result<(), 
             .unwrap_or(0),
         Ordering::Relaxed,
     );
+    // Track box occupancy from the keystroke's CONTENT (#111): printable input
+    // leaves a line sitting in the box; an Enter / line-clear empties it. Neutral
+    // edits (arrows, backspace, bare escape sequences) leave occupancy unchanged.
+    match crate::orchestration::classify_human_input(&data) {
+        crate::orchestration::HumanInput::Content => pty.input_pending.store(true, Ordering::Relaxed),
+        crate::orchestration::HumanInput::Submit => pty.input_pending.store(false, Ordering::Relaxed),
+        crate::orchestration::HumanInput::Neutral => {}
+    }
     pty.writer
         .write_all(data.as_bytes())
         .map_err(|e| e.to_string())

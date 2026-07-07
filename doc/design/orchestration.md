@@ -434,6 +434,70 @@ box clears) rather than making the orchestrator poll terminals by hand.
   Silent-agent recovery adds the human-facing half: on a repeat unconfirmed notice for the
   same agent, stop re-sending and flag the human.
 
+## Human-input paste guard (#111)
+
+The quiet backstop (#43, `wait_for_user_quiet`) only waits out *active* typing — it releases
+the moment the human stops. It does **not** stop a paste landing on top of a line the human
+typed and then **left sitting** in the box. When that happens the paste appends to their text
+and the submit Enter fires the merged line: the live repro was a worker pane holding `/model`
+(and later `dfgdsfg`) when a task delivery arrived, submitting `Unknown command: /modelRun …`
+— the human's input consumed *and* the task destroyed. The stranded-flush guard (#81/#84) is
+no help: it protects a *previous delivery's* text, not a *human's* fresh line, and explicitly
+declines to flush once a human has typed.
+
+So before the paste, delivery runs a second gate that distinguishes a sitting human line from
+an empty box and holds/aborts rather than merge-submitting.
+
+- **The signal — keystroke content, not output bytes.** Box occupancy is tracked from what the
+  human *types*, which is the only thing that reliably tells a sitting line from a submitted one.
+  Each human write (`write_pty`) is classified by the pure `classify_human_input`: printable text
+  → `Content` (a line now sits in the box), an Enter / Ctrl-U / Ctrl-C → `Submit` (the box
+  cleared), navigation/backspace/bare escape sequences → `Neutral` (occupancy unchanged). That
+  updates a per-pane `input_pending` flag (`PtyManager::input_pending`). Delivery reads the flag;
+  it does **not** look at output bytes.
+  - **Why not an output-byte floor.** The first cut compared output growth since the last
+    keystroke against a fixed 24-byte "burst" floor. It failed both ways: a single keystroke's
+    input-line redraw in a full-repaint TUI — or the agent's own mid-turn streaming while a line
+    sits — can clear the floor, so a still-sitting line reads as *submitted* and the paste
+    merge-submits it (the exact #111 loss); and a *sub-floor* submit (empty Enter, short command)
+    never clears the floor, so the box reads as dirty forever and every later delivery wedges in a
+    60s hold. A keystroke's content has neither ambiguity: an Enter is positively a submit
+    regardless of how few bytes it echoes, and ambient output never touches the flag.
+- **The hold.** `hold_for_human_input` drives the pure `resolve_paste_gate(box_pending, held,
+  max_hold)` each poll: `Paste` when the box is clear (or clears mid-hold, as the human submits),
+  `Hold` while their line sits, `Abort` at the bounded cap (`HUMAN_INPUT_HOLD_MAX`, 60s). Same
+  pure-gate-plus-testable-loop split as the quiet backstop (`should_hold_for_user` /
+  `hold_until_quiet`), for the same #40 reason: exercise the loop, not just the decision.
+- **The action.** On `Abort` the delivery pastes **nothing** and calls `notify_delivery_held`
+  (gate `should_notify_paste_held`): one audited (`delivery-held-notice`) `[loomux]` notice
+  (`paste_held_notice`) to the orchestrator — *"delivery to `<id>` held: pane has human input —
+  re-send when clear."* Distinct from the unconfirmed notice: nothing landed, so the move is to
+  wait for the box to clear and re-send, not to read back a stranded prompt. A cleared hold is
+  audited (`delivery-held-for-input`) and proceeds normally.
+- **No loops / paused.** Same discipline as #103: an orchestrator-target delivery never
+  notifies (a notice to it is a delivery to it), and a **paused** group is skipped wholesale.
+- **`last_user_input_ms` is untouched.** Every human write still stamps it (the quiet backstop,
+  attention routing, and the stranded-flush guard all rely on it); `input_pending` is a separate,
+  additive flag written under the same `ptys` lock so the pair can't tear.
+- **Residual, and the #112 boundary.** Occupancy is inferred from keystrokes, not read from the
+  box, so some cases still need true box-occupancy detection (issue #112). Splitting them by
+  direction:
+  - *False-negative (correctness — the dangerous direction), all fenced to #112:* an editor mode
+    where Enter inserts a *soft* newline instead of submitting (a bare `\r` we'd read as a
+    submit). Bracketed pastes are **not** in this set — a write carrying the `ESC[200~`/`ESC[201~`
+    markers is classified `Content` regardless of any interior/trailing newline, so a pasted line
+    ending in `\n` is not misread as submitted.
+  - *False-positive (availability only — a stuck `input_pending`), each bounded by the 60s
+    hold → abort → one held-notice → orchestrator re-send, and cleared by the human's next
+    Enter/Ctrl-U/Ctrl-C:* **any** box-clear that isn't a trailing newline / Ctrl-U / Ctrl-C —
+    Esc-to-clear (common in Claude Code), Ctrl-W (delete word), Ctrl-K (kill to end), and
+    backspace-to-empty. These resolve to `Neutral` (they add no visible text), so a box the human
+    emptied that way still reads as pending until the bounded abort.
+
+  The guard errs toward the safe hold in the common case; this is the paste-path guard only — the
+  confirm-window semantics (`submit_confirmed` and false-confirm handling) are #112, deliberately
+  untouched here.
+
 ## Attention routing (#6) & interactive-question detection (#40)
 
 The human is the scheduler's bottleneck; attention routing surfaces *which* pane needs
