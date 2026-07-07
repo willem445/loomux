@@ -75,6 +75,36 @@ the cross-platform path below.
   `voice_stop` uses it to tell "you didn't say anything" (empty → `""`) apart
   from "the device died" (empty + error → surfaced).
 
+#### Real-time safety of the capture buffer (long-recording bug)
+
+The audio callback runs under a hard real-time deadline (WASAPI shared-mode
+buffers are ~10 ms). The first implementation appended into a single growing
+`Vec<f32>` from inside that callback — fine for short clips, but on long
+recordings the `Vec`'s doubling reallocations copy multi-MB **inside the
+callback**, blowing the deadline, starving/glitching the stream, and producing
+audio whisper heard as silence. That was the "long recording → empty transcript"
+bug: short words worked, long dictation returned nothing.
+
+The fix is `ChunkedBuffer` (pure, unit-tested): samples accumulate in fixed-size
+16,384-sample blocks that are **never reallocated** — a filled block is retired
+and a fresh one started, so the per-callback cost is bounded (O(samples) plus at
+most one small constant allocation per block boundary). The single contiguous
+`Vec` is materialized once, at stop time, off the audio thread. The buffer's
+`Mutex` is uncontended during capture (`voice_stop` only locks after the stream
+is dropped). A **max-duration guard** (`MAX_RECORDING_SECS`, 5 min) caps growth
+and appends a "recording capped" note to the transcript rather than growing
+memory without bound.
+
+**Diagnostics:** `LOOMUX_VOICE_KEEP_WAV=1` preserves the scratch WAV and logs its
+path, duration, and RMS level (via the pure `rms` / `duration_secs` helpers) — a
+near-zero RMS on a long capture is the fingerprint of a silent/starved capture.
+This is the tool that was missing while first chasing the bug.
+
+WASAPI callback timing itself can't be unit-tested; `ChunkedBuffer` accumulation,
+capping, and the RMS/duration helpers are covered hermetically, and the fix is
+verified by hand (record 60–90 s; the transcript is non-empty and the kept WAV's
+RMS is sane).
+
 ### Transcription — subprocess to prebuilt `whisper-cli.exe`
 
 git.rs-style `Command` with `CREATE_NO_WINDOW`, `-nt -l en`; stdout parsed into
