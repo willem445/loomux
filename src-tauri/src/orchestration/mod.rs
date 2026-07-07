@@ -1299,6 +1299,21 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Remove a durable consent marker (autonomous / auto_merge), treating "already
+/// gone" as success but a real IO failure as an error the caller MUST propagate
+/// (#83). A marker that survives a failed *disable* would silently re-enable the
+/// feature on the next restart's re-seed — the one failure direction this
+/// consent-boundary feature must never have — so the toggle fails loudly and
+/// leaves the in-memory flag matching the surviving marker rather than reporting a
+/// disable that didn't durably happen.
+fn remove_marker(path: &Path) -> Result<(), String> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("failed to remove marker {}: {e}", path.display())),
+    }
+}
+
 /// Map a caller-supplied image extension to a vetted one, rejecting anything
 /// outside the allowlist (#72). A pasted image's extension is attacker-influenced
 /// (it rides in from the browser clipboard), so we never echo it into a filename
@@ -2849,12 +2864,19 @@ impl OrchRegistry {
         }
         // Autonomous mode (#83) and the auto-merge gate are durable per-group
         // choices too; re-seed them so a resumed group keeps ticking (and its
-        // budget anchor, stored in the marker's content) across restarts.
+        // budget anchor, stored in the marker's content) across restarts. Audit
+        // each resume so a persisted consent marker silently resuming autonomy/
+        // auto-merge is at least *visible* in the trail (belt-and-suspenders for
+        // the L2 consent-boundary concern — a marker that shouldn't be here shows
+        // up rather than resuming invisibly).
         if dir.join("autonomous").is_file() {
             self.autonomous_groups.lock_safe().insert(id.clone());
+            self.audit(&id, "loomux", "autonomous-resumed",
+                json!({ "from": "marker", "budget_anchor_tokens": self.autonomy_anchor(&id) }));
         }
         if dir.join("auto_merge").is_file() {
             self.auto_merge_groups.lock_safe().insert(id.clone());
+            self.audit(&id, "loomux", "auto-merge-resumed", json!({ "from": "marker" }));
         }
         self.groups.lock_safe().insert(id.clone(), info.clone());
         self.audit(&id, "loomux", if resumed { "group-resume" } else { "group-create" },
@@ -3209,6 +3231,11 @@ impl OrchRegistry {
         let mut notified = Vec::new();
         for (id, group) in to_notify {
             // Record the delivery for the per-hour backstop, pruning to the window.
+            // This ring is in-memory only (like `spawn_times`): a restart resets
+            // the window, which is the safe direction — the cap is a runaway
+            // backstop, and the quiet-window + one-notice latch already bound ticks
+            // to ~one per window regardless, so a fresh window after a (rare)
+            // restart can't produce a runaway, only at most a few extra ticks.
             {
                 let mut tt = self.idle_tick_times.lock_safe();
                 let v = tt.entry(group.clone()).or_default();
@@ -3376,20 +3403,45 @@ impl OrchRegistry {
     fn set_autonomous_as(&self, group: &str, on: bool, actor: &str) -> Result<(), String> {
         let dir = self.group_dir(group);
         if on {
-            if self.autonomous_groups.lock_safe().contains(group) {
+            // Reserve the enable atomically (L1): a single `insert` decides who
+            // proceeds, so a concurrent/duplicate enable can't double-anchor or
+            // race the marker write. Only the first caller (newly inserted) writes
+            // the anchor + marker; anyone else sees it already on and no-ops.
+            let newly = self.autonomous_groups.lock_safe().insert(group.to_string());
+            if !newly {
                 return Ok(()); // already on — don't re-anchor
             }
-            fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-            // Anchor before flipping the flag on: capture the spend at enable
-            // time so the budget delta starts at 0. Computed outside the set lock
-            // (group_usage takes its own locks).
+            // Anchor = spend at enable time, so the budget delta starts at 0.
+            // Computed without holding the set lock (group_usage takes its own).
             let anchor = self.group_token_total(group);
-            fs::write(dir.join("autonomous"), anchor.to_string()).map_err(|e| e.to_string())?;
-            self.autonomous_groups.lock_safe().insert(group.to_string());
+            if let Err(e) = fs::create_dir_all(&dir)
+                .and_then(|_| fs::write(dir.join("autonomous"), anchor.to_string()))
+            {
+                // Roll back the reservation so memory never claims ON without a
+                // durable marker (a lost enable is the safe direction — it fails
+                // OFF and re-asks for consent — but we still surface the failure).
+                self.autonomous_groups.lock_safe().remove(group);
+                return Err(format!("failed to enable autonomous mode: {e}"));
+            }
             self.audit(group, actor, "autonomous-on",
                 json!({ "budget_anchor_tokens": anchor }));
-        } else if self.autonomous_groups.lock_safe().remove(group) {
-            let _ = fs::remove_file(dir.join("autonomous"));
+        } else {
+            if !self.autonomous_groups.lock_safe().contains(group) {
+                return Ok(()); // already off
+            }
+            // Remove the durable marker FIRST and fail the call if it doesn't go
+            // (L2): a surviving marker would silently re-enable autonomous mode on
+            // the next restart's re-seed without renewed consent. Only flip the
+            // in-memory flag once disk agrees, so a failed disable leaves state
+            // consistently ON (matching the marker the human still sees).
+            if let Err(e) = remove_marker(&dir.join("autonomous")) {
+                self.audit(group, actor, "autonomous-off-failed", json!({ "error": e }));
+                return Err(format!(
+                    "couldn't disable autonomous mode: the consent marker could not be \
+                     removed, so it stays ON — retry or check disk/permissions"
+                ));
+            }
+            self.autonomous_groups.lock_safe().remove(group);
             // Clear the idle-tick latch so a later re-enable starts clean.
             self.clear_idle_tick_latch(group);
             self.audit(group, actor, "autonomous-off", json!({}));
@@ -3411,23 +3463,36 @@ impl OrchRegistry {
     /// one audited notice so the running orchestrator learns the new gate.
     pub fn set_auto_merge(&self, group: &str, on: bool) -> Result<(), String> {
         let dir = self.group_dir(group);
-        let changed = {
-            let mut set = self.auto_merge_groups.lock_safe();
-            if on {
-                set.insert(group.to_string())
-            } else {
-                set.remove(group)
-            }
-        };
-        if !changed {
-            return Ok(()); // no-op: don't re-notify
-        }
         if on {
-            fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-            let _ = fs::write(dir.join("auto_merge"), b"");
+            // Atomic reserve (mirrors set_autonomous_as): only the newly-inserting
+            // caller writes the marker; a duplicate enable no-ops.
+            let newly = self.auto_merge_groups.lock_safe().insert(group.to_string());
+            if !newly {
+                return Ok(()); // no-op: don't re-notify
+            }
+            if let Err(e) = fs::create_dir_all(&dir)
+                .and_then(|_| fs::write(dir.join("auto_merge"), b""))
+            {
+                self.auto_merge_groups.lock_safe().remove(group);
+                return Err(format!("failed to enable auto-merge: {e}"));
+            }
             self.audit(group, "human", "auto-merge-on", json!({}));
         } else {
-            let _ = fs::remove_file(dir.join("auto_merge"));
+            if !self.auto_merge_groups.lock_safe().contains(group) {
+                return Ok(()); // no-op: don't re-notify
+            }
+            // Disk first, then memory (L2): a surviving `auto_merge` marker would
+            // silently re-enable the orchestrator's merge authority on restart
+            // without renewed consent, so a failed removal fails the toggle and
+            // leaves the gate consistently ON.
+            if let Err(e) = remove_marker(&dir.join("auto_merge")) {
+                self.audit(group, "human", "auto-merge-off-failed", json!({ "error": e }));
+                return Err(format!(
+                    "couldn't disable auto-merge: the consent marker could not be \
+                     removed, so it stays ON — retry or check disk/permissions"
+                ));
+            }
+            self.auto_merge_groups.lock_safe().remove(group);
             self.audit(group, "human", "auto-merge-off", json!({}));
         }
         // Tell the running orchestrator the gate moved (best-effort; a dead/paused

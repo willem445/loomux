@@ -3002,11 +3002,13 @@ fn autonomous_setup() -> (OrchRegistry, tempfile::TempDir, String, String) {
     (reg, dir, g.id, o.id)
 }
 
-/// Count how many times `needle` appears in a group's audit log.
-fn audit_count(reg: &OrchRegistry, group: &str, needle: &str) -> usize {
+/// Count audit entries whose action is exactly `action`. Matches the
+/// quote-delimited JSON value so a prefix action (`autonomous-off`) doesn't also
+/// count its superset (`autonomous-off-failed`).
+fn audit_count(reg: &OrchRegistry, group: &str, action: &str) -> usize {
     fs::read_to_string(reg.state_root().join(group).join("audit.jsonl"))
         .unwrap_or_default()
-        .matches(needle)
+        .matches(&format!("\"{action}\""))
         .count()
 }
 
@@ -3239,6 +3241,58 @@ fn budget_metering_anchors_at_enable_and_suspends_once_on_delta() {
     assert!(reg.enforce_autonomy_budgets(now_ms()).is_empty(),
         "re-enabling re-anchors: the meter restarts from the current spend");
     assert!(reg.is_autonomous(&g.id));
+}
+
+#[test]
+fn failed_disable_keeps_consent_on_and_is_audited() {
+    // L2 consent-boundary: a disable whose marker removal fails must NOT report
+    // success — a surviving marker would silently re-enable on restart. The toggle
+    // must error, leave state consistently ON, and audit the failure.
+    let (reg, _d, gid, _oid) = autonomous_setup();
+    assert!(reg.is_autonomous(&gid));
+    let marker = reg.state_root().join(&gid).join("autonomous");
+    // Force removal to fail deterministically: swap the marker file for a
+    // directory of the same name (fs::remove_file refuses a directory) — standing
+    // in for a real IO failure where the marker survives.
+    fs::remove_file(&marker).unwrap();
+    fs::create_dir(&marker).unwrap();
+    let err = reg.set_autonomous(&gid, false).unwrap_err();
+    assert!(err.to_lowercase().contains("disable"), "the UI must see a clear failure, got: {err}");
+    assert!(reg.is_autonomous(&gid), "a failed removal must leave autonomous ON, matching the surviving marker");
+    assert_eq!(audit_count(&reg, &gid, "autonomous-off-failed"), 1, "the failed disable must be audited");
+    assert_eq!(audit_count(&reg, &gid, "autonomous-off"), 0, "no success audit on a failed disable");
+}
+
+#[test]
+fn run_idle_tick_composes_budget_enforcement_then_tick() {
+    // run_idle_tick must enforce budgets BEFORE ticking. Headless:
+    // orchestrator_activity returns empty maps (no app handle), so the
+    // orchestrator reads as output-quiet and a due tick fires.
+    let (reg, _d, gid, oid) = autonomous_setup();
+    assert_eq!(reg.run_idle_tick(FAR), vec![oid.clone()], "run_idle_tick delivers the idle tick");
+    assert_eq!(audit_count(&reg, &gid, "idle-tick"), 1);
+    // Arm an exhausted budget: the next cycle must SUSPEND (enforce runs first) and
+    // therefore deliver no tick — proving the composition order.
+    seed_usage(&reg, &gid, "spend", 5_000);
+    reg.set_autonomy_budget(&gid, 100).unwrap();
+    assert!(reg.run_idle_tick(FAR + 60_000).is_empty(),
+        "an over-budget group is suspended before the tick, so no tick fires");
+    assert!(!reg.is_autonomous(&gid), "budget enforcement suspended autonomous mode");
+    assert_eq!(audit_count(&reg, &gid, "autonomy-budget-exhausted"), 1);
+}
+
+#[test]
+fn idle_tick_does_not_touch_worker_idle_clocks() {
+    // A tick pokes the orchestrator only; worker idle clocks (the reaper's, not
+    // the tick's) must be untouched, so idle workers still reap on schedule.
+    let (reg, _d, gid, oid) = autonomous_setup();
+    let w = reg.spawn_agent(&gid, Role::Worker, "idle-w", "", false, None).unwrap();
+    let before = reg.agent(&w.id).unwrap().idle_since_ms;
+    assert!(before.is_some(), "an untasked worker is idle");
+    let empty = HashMap::new();
+    assert_eq!(reg.idle_tick_tick(FAR, &empty, &empty), vec![oid.clone()]);
+    assert_eq!(reg.agent(&w.id).unwrap().idle_since_ms, before,
+        "an idle tick must leave worker idle_since_ms untouched");
 }
 
 // ---------- attention routing: surface which pane needs the human (#6) ----------
