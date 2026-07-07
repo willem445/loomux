@@ -24,6 +24,43 @@ export interface GhIssue {
   url: string;
 }
 
+/** A pull request, as returned by `gh pr list --json`. Mirrors GhIssue (same
+ *  filter/sort mechanics) plus `head_ref` (the source branch). Read-only in the
+ *  view: PRs can be listed, opened, and commented on — never labelled/merged. */
+export interface GhPr {
+  number: number;
+  title: string;
+  /** "OPEN" | "CLOSED" | "MERGED" (v1 only lists open). */
+  state: string;
+  labels: string[];
+  updated_at: string;
+  url: string;
+  /** The PR's source (head) branch name. */
+  head_ref: string;
+}
+
+/** One comment on an issue or PR (`comments` field of `gh {issue,pr} view`).
+ *  Every field is GitHub-authored text — render with textContent ONLY (the #129
+ *  no-innerHTML-on-GitHub-data XSS boundary), never innerHTML. */
+export interface GhComment {
+  /** Commenter login, or null for a deleted/ghost account. */
+  author: string | null;
+  created_at: string;
+  body: string;
+}
+
+/** Full detail for an issue or PR (`gh {issue,pr} view --json`). One shape backs
+ *  both detail panes. `body` is the markdown description verbatim (also
+ *  GitHub-authored — textContent only). */
+export interface GhDetail {
+  title: string;
+  body: string;
+  labels: string[];
+  state: string;
+  author: string | null;
+  comments: GhComment[];
+}
+
 /** Result of `gh auth status` — drives the empty-state. `login` is the
  *  authenticated account when known. */
 export interface GhAuth {
@@ -65,3 +102,32 @@ export const ghIssueSetLabels = (
   add: string[],
   remove: string[]
 ): Promise<void> => invoke("gh_issue_set_labels", { repo, number, add, remove });
+
+/** Full detail (description + comments) for one issue — backs the detail pane. */
+export const ghIssueView = (repo: string, number: number): Promise<GhDetail> =>
+  invoke("gh_issue_view", { repo, number });
+
+/** Post a comment on an issue. The backend passes `body` as the value of
+ *  `--body`, so its content (leading `-`, newlines) is data, not a flag; an
+ *  empty/whitespace body is rejected there. */
+export const ghIssueComment = (
+  repo: string,
+  number: number,
+  body: string
+): Promise<void> => invoke("gh_issue_comment", { repo, number, body });
+
+/** Open pull requests for `repo` (first page, ~50). Read-only in the view. */
+export const ghPrList = (repo: string): Promise<GhPr[]> =>
+  invoke("gh_pr_list", { repo });
+
+/** Full detail (description + comments) for one PR — same detail pane as issues. */
+export const ghPrView = (repo: string, number: number): Promise<GhDetail> =>
+  invoke("gh_pr_view", { repo, number });
+
+/** Post a comment on a PR (the one write read-only PR mode allows). Same
+ *  discrete-`--body` safety and empty-body guard as ghIssueComment. */
+export const ghPrComment = (
+  repo: string,
+  number: number,
+  body: string
+): Promise<void> => invoke("gh_pr_comment", { repo, number, body });

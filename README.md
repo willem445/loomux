@@ -202,14 +202,25 @@ token or secret; `gh` uses whatever `gh auth login` you already have. If `gh`
 isn't installed, or you haven't logged in, the panel says so with a one-line
 hint instead of failing calls.
 
+The header carries an **Issues ⇄ PRs** toggle: switch between the repo's open
+issues and its open **pull requests**. Both lists share the same filter, sort
+(newest-updated first), and detail pane; PR mode is **read-only** — you can
+browse, open, and **comment** on PRs, but the panel never labels, merges, or
+approves them (do that on GitHub or in the git view).
+
 From the panel you can:
 
-- **Browse** the repo's open issues (number, title, labels, and when each was
-  last updated), newest first. The **filter box** matches on number, title, or
-  label. Rows already carrying an agent go-signal label are marked with an
-  accent stripe.
+- **Browse** the repo's open issues or PRs (number, title, labels, and when each
+  was last updated), newest first. The **filter box** matches on number, title,
+  or label. Issue rows already carrying an agent go-signal label are marked with
+  an accent stripe; PR rows show their head branch.
+- **Open a detail view** by clicking a row: the full description, the whole
+  comment thread, and a box to **add a comment** (`Ctrl+Enter` posts; the thread
+  refreshes after). `Esc` (or ←) returns to the list. Commenting works on both
+  issues and PRs. All GitHub-authored text (descriptions, comments) is rendered
+  as plain text, never HTML.
 - **Create** an issue (＋) from a title and optional body. `Ctrl+Enter`
-  submits.
+  submits. (Creating is issues-only; PR mode has no ＋.)
 - **Hand an issue to the orchestrator** by toggling a label directly on the
   row: **ready** applies `agent-ready` (start work) and **investigate** applies
   `agent-investigation` (research + a plan). That's the whole handshake — a
@@ -223,8 +234,9 @@ From the panel you can:
   setup; only these allow-listed labels are ever created.
 - **Copy** any issue's URL (⧉) to the clipboard.
 
-The panel refreshes on open and on the ↻ button — a single cheap `gh issue
-list` call, with no background polling.
+The panel refreshes on open, when you switch mode, and on the ↻ button — a
+single cheap `gh issue list` / `gh pr list` call (and a `gh {issue,pr} view` when
+you open a detail), with no background polling.
 
 ## Agent orchestration
 

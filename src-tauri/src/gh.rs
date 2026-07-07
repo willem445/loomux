@@ -140,6 +140,49 @@ pub struct GhIssueRef {
     pub url: String,
 }
 
+/// One comment on an issue or PR, from the `comments` field of `gh {issue,pr}
+/// view --json`. `author` is the commenter's login (None for a deleted/ghost
+/// account). All fields are GitHub-authored text — the frontend renders them
+/// with `textContent` only (the #129 XSS boundary), never innerHTML.
+#[derive(Serialize, PartialEq, Debug)]
+pub struct GhComment {
+    pub author: Option<String>,
+    /// RFC-3339 timestamp string, e.g. "2026-07-07T04:18:09Z".
+    pub created_at: String,
+    pub body: String,
+}
+
+/// Full detail for one issue or PR, from `gh {issue,pr} view --json`. The two
+/// share a shape (title/body/labels/state/author/comments), so one struct backs
+/// both the issue- and PR-detail panes; `state` distinguishes them at the edges
+/// (a PR can be "MERGED"). `body` is the markdown description verbatim.
+#[derive(Serialize, PartialEq, Debug)]
+pub struct GhDetail {
+    pub title: String,
+    pub body: String,
+    pub labels: Vec<String>,
+    pub state: String,
+    pub author: Option<String>,
+    pub comments: Vec<GhComment>,
+}
+
+/// One open pull request, from `gh pr list --json`. Mirrors `GhIssue` (so the
+/// same client-side filter/sort applies) plus `head_ref` — the source branch,
+/// handy context in the list. Read-only in v1: the view lists, opens detail, and
+/// comments on PRs, but never labels/merges/approves.
+#[derive(Serialize, PartialEq, Debug)]
+pub struct GhPr {
+    pub number: u64,
+    pub title: String,
+    /// "OPEN" / "CLOSED" / "MERGED" as gh reports it (v1 lists only open).
+    pub state: String,
+    pub labels: Vec<String>,
+    pub updated_at: String,
+    pub url: String,
+    /// The PR's source (head) branch name.
+    pub head_ref: String,
+}
+
 // gh's JSON uses camelCase and nests labels as objects; these mirror it for
 // deserialization only. Extra fields (id, color, description) are ignored.
 #[derive(Deserialize)]
@@ -157,6 +200,58 @@ struct RawIssue {
 #[derive(Deserialize)]
 struct RawLabel {
     name: String,
+}
+
+// gh's `author` object carries several fields (id, is_bot, name, login); we only
+// keep `login`. `#[serde(default)]` so a missing login decodes to "" (mapped to
+// None by parse_detail) rather than failing the whole parse.
+#[derive(Deserialize)]
+struct RawAuthor {
+    #[serde(default)]
+    login: String,
+}
+
+// `gh {issue,pr} view --json comments` element. Extra fields (id, url,
+// authorAssociation, reactionGroups, includesCreatedEdit) are ignored.
+#[derive(Deserialize)]
+struct RawComment {
+    #[serde(default)]
+    author: Option<RawAuthor>,
+    #[serde(rename = "createdAt", default)]
+    created_at: String,
+    #[serde(default)]
+    body: String,
+}
+
+// `gh {issue,pr} view --json title,body,labels,state,author,comments`. `body`
+// defaults to "" (an issue can have an empty description).
+#[derive(Deserialize)]
+struct RawDetail {
+    title: String,
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    labels: Vec<RawLabel>,
+    state: String,
+    #[serde(default)]
+    author: Option<RawAuthor>,
+    #[serde(default)]
+    comments: Vec<RawComment>,
+}
+
+// `gh pr list --json number,title,state,labels,updatedAt,url,headRefName`.
+#[derive(Deserialize)]
+struct RawPr {
+    number: u64,
+    title: String,
+    state: String,
+    #[serde(default)]
+    labels: Vec<RawLabel>,
+    #[serde(rename = "updatedAt")]
+    updated_at: String,
+    url: String,
+    #[serde(rename = "headRefName", default)]
+    head_ref: String,
 }
 
 // ---------- commands ----------
@@ -247,6 +342,90 @@ pub fn gh_issue_set_labels(
         ensure_labels_exist(&repo, &add)?;
     }
     let args = issue_edit_args(number, &add, &remove);
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    run_gh(Some(&repo), &argv).map(|_| ())
+}
+
+/// Full detail for one issue: description, labels, state, author, and the whole
+/// comment thread — backing the issues-view detail pane. Read-only; writes go
+/// through `gh_issue_comment` / `gh_issue_set_labels`.
+#[tauri::command]
+pub fn gh_issue_view(repo: String, number: u64) -> Result<GhDetail, String> {
+    let n = number.to_string();
+    let out = run_gh(
+        Some(&repo),
+        &[
+            "issue",
+            "view",
+            &n,
+            "--json",
+            "title,body,labels,state,author,comments",
+        ],
+    )?;
+    parse_detail(&out)
+}
+
+/// Post a comment on an issue. `body` is the user's text, passed as the VALUE of
+/// `--body` (a discrete arg, never interpolated), so a leading `-`, spaces, or
+/// newlines stay data — see `comment_args`. Empty/whitespace bodies are rejected
+/// before spawning (gh would open an interactive editor with no `--body`).
+#[tauri::command]
+pub fn gh_issue_comment(repo: String, number: u64, body: String) -> Result<(), String> {
+    if body.trim().is_empty() {
+        return Err("empty comment".to_string());
+    }
+    let args = comment_args("issue", number, &body);
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    run_gh(Some(&repo), &argv).map(|_| ())
+}
+
+/// List open pull requests for the pane's repo (first page, up to 50). Mirrors
+/// `gh_issue_list`; labels returned verbatim for client-side matching. Read-only
+/// — the view lists and comments on PRs but never labels/merges/approves.
+#[tauri::command]
+pub fn gh_pr_list(repo: String) -> Result<Vec<GhPr>, String> {
+    let out = run_gh(
+        Some(&repo),
+        &[
+            "pr",
+            "list",
+            "--state",
+            "open",
+            "--json",
+            "number,title,state,labels,updatedAt,url,headRefName",
+            "--limit",
+            "50",
+        ],
+    )?;
+    parse_pr_list(&out)
+}
+
+/// Full detail for one PR — same shape as `gh_issue_view` (`gh pr view` exposes
+/// the identical `--json` fields), so both feed the one detail pane.
+#[tauri::command]
+pub fn gh_pr_view(repo: String, number: u64) -> Result<GhDetail, String> {
+    let n = number.to_string();
+    let out = run_gh(
+        Some(&repo),
+        &[
+            "pr",
+            "view",
+            &n,
+            "--json",
+            "title,body,labels,state,author,comments",
+        ],
+    )?;
+    parse_detail(&out)
+}
+
+/// Post a comment on a PR. Same discrete-`--body` safety and empty-body guard as
+/// `gh_issue_comment` (commenting is the one write the read-only PR mode allows).
+#[tauri::command]
+pub fn gh_pr_comment(repo: String, number: u64, body: String) -> Result<(), String> {
+    if body.trim().is_empty() {
+        return Err("empty comment".to_string());
+    }
+    let args = comment_args("pr", number, &body);
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
     run_gh(Some(&repo), &argv).map(|_| ())
 }
@@ -457,6 +636,64 @@ fn parse_issue_ref(stdout: &str) -> Result<GhIssueRef, String> {
     })
 }
 
+/// Build a `gh <kind> comment <n> --body <text>` argv (`kind` is "issue" or
+/// "pr"). The body is the VALUE of `--body`, so — like `issue_create_args` — its
+/// content is data, never a flag: a body starting with `-` can't be parsed as an
+/// option (the leading-`-` convention shared across git.rs/gh.rs), and newlines
+/// pass through intact.
+fn comment_args(kind: &str, number: u64, body: &str) -> Vec<String> {
+    vec![
+        kind.into(),
+        "comment".into(),
+        number.to_string(),
+        "--body".into(),
+        body.into(),
+    ]
+}
+
+/// Parse `gh {issue,pr} view --json …` into a `GhDetail`, flattening label and
+/// author objects to their names/logins. An empty author login (or absent
+/// author) becomes `None` rather than an empty string.
+fn parse_detail(json: &str) -> Result<GhDetail, String> {
+    let raw: RawDetail =
+        serde_json::from_str(json).map_err(|e| format!("gh view: bad JSON: {e}"))?;
+    let login = |a: Option<RawAuthor>| a.map(|a| a.login).filter(|s| !s.is_empty());
+    Ok(GhDetail {
+        title: raw.title,
+        body: raw.body,
+        labels: raw.labels.into_iter().map(|l| l.name).collect(),
+        state: raw.state,
+        author: login(raw.author),
+        comments: raw
+            .comments
+            .into_iter()
+            .map(|c| GhComment {
+                author: login(c.author),
+                created_at: c.created_at,
+                body: c.body,
+            })
+            .collect(),
+    })
+}
+
+/// Parse `gh pr list --json …` into `GhPr`s, flattening label objects to names.
+fn parse_pr_list(json: &str) -> Result<Vec<GhPr>, String> {
+    let raw: Vec<RawPr> =
+        serde_json::from_str(json).map_err(|e| format!("gh pr list: bad JSON: {e}"))?;
+    Ok(raw
+        .into_iter()
+        .map(|r| GhPr {
+            number: r.number,
+            title: r.title,
+            state: r.state,
+            labels: r.labels.into_iter().map(|l| l.name).collect(),
+            updated_at: r.updated_at,
+            url: r.url,
+            head_ref: r.head_ref,
+        })
+        .collect())
+}
+
 /// Pull the account name out of `gh auth status` text. Handles both the current
 /// "Logged in to github.com account NAME (keyring)" and the older
 /// "Logged in to github.com as NAME (oauth_token)" phrasings. Returns None when
@@ -552,6 +789,123 @@ mod tests {
     #[test]
     fn parse_issue_ref_errors_without_url() {
         assert!(parse_issue_ref("Creating issue...\n").is_err());
+    }
+
+    // A faithful `gh issue view --json title,body,labels,state,author,comments`
+    // blob: embedded quotes in the body, camelCase createdAt, a comment whose
+    // author is null (deleted account), and one label.
+    const DETAIL_FIXTURE: &str = r#"{
+      "title":"Add a \"detail\" pane",
+      "body":"First line\nSecond line",
+      "labels":[{"name":"agent-ready","color":"0e8a16"}],
+      "state":"OPEN",
+      "author":{"login":"willem445","is_bot":false},
+      "comments":[
+        {"author":{"login":"octocat"},"createdAt":"2026-07-07T05:00:00Z","body":"nice"},
+        {"author":null,"createdAt":"2026-07-07T06:00:00Z","body":"from a ghost"}
+      ]
+    }"#;
+
+    #[test]
+    fn parse_detail_flattens_author_labels_and_comments() {
+        let d = parse_detail(DETAIL_FIXTURE).unwrap();
+        assert_eq!(d.title, "Add a \"detail\" pane");
+        // Body newlines survive verbatim (rendered pre-wrap on the frontend).
+        assert_eq!(d.body, "First line\nSecond line");
+        assert_eq!(d.labels, vec!["agent-ready"]);
+        assert_eq!(d.state, "OPEN");
+        assert_eq!(d.author.as_deref(), Some("willem445"));
+        assert_eq!(d.comments.len(), 2);
+        assert_eq!(d.comments[0].author.as_deref(), Some("octocat"));
+        assert_eq!(d.comments[0].created_at, "2026-07-07T05:00:00Z");
+        assert_eq!(d.comments[0].body, "nice");
+        // A null author decodes to None, not a parse failure.
+        assert_eq!(d.comments[1].author, None);
+    }
+
+    #[test]
+    fn parse_detail_tolerates_missing_body_and_comments() {
+        // An issue with an empty description and no comments (gh emits body:"" and
+        // comments:[]); author with an empty login collapses to None.
+        let json = r#"{"title":"t","body":"","labels":[],"state":"CLOSED",
+                       "author":{"login":""},"comments":[]}"#;
+        let d = parse_detail(json).unwrap();
+        assert_eq!(d.body, "");
+        assert!(d.comments.is_empty());
+        assert!(d.labels.is_empty());
+        assert_eq!(d.author, None);
+    }
+
+    #[test]
+    fn parse_detail_rejects_garbage() {
+        assert!(parse_detail("not json").is_err());
+    }
+
+    // A faithful `gh pr list --json …` blob: headRefName present, a MERGED state
+    // is representable, and a PR with no labels.
+    const PR_LIST_FIXTURE: &str = r#"[
+      {"number":130,"title":"Umbrella PR","state":"OPEN",
+       "labels":[{"name":"agent-managed"}],
+       "updatedAt":"2026-07-07T04:09:31Z",
+       "url":"https://github.com/willem445/loomux/pull/130",
+       "headRefName":"orch/82-gh-issues"},
+      {"number":128,"title":"Backend gh commands","state":"OPEN","labels":[],
+       "updatedAt":"2026-07-07T03:00:00Z",
+       "url":"https://github.com/willem445/loomux/pull/128",
+       "headRefName":"feat/82-backend"}
+    ]"#;
+
+    #[test]
+    fn parse_pr_list_flattens_labels_and_head_ref() {
+        let prs = parse_pr_list(PR_LIST_FIXTURE).unwrap();
+        assert_eq!(prs.len(), 2);
+        assert_eq!(prs[0].number, 130);
+        assert_eq!(prs[0].title, "Umbrella PR");
+        assert_eq!(prs[0].labels, vec!["agent-managed"]);
+        assert_eq!(prs[0].head_ref, "orch/82-gh-issues");
+        assert_eq!(prs[0].url, "https://github.com/willem445/loomux/pull/130");
+        assert!(prs[1].labels.is_empty());
+        assert_eq!(prs[1].head_ref, "feat/82-backend");
+    }
+
+    #[test]
+    fn parse_pr_list_handles_empty_and_garbage() {
+        assert!(parse_pr_list("[]").unwrap().is_empty());
+        assert!(parse_pr_list("not json").is_err());
+    }
+
+    #[test]
+    fn comment_args_keeps_body_as_data() {
+        // A body starting with '-' must remain the VALUE of --body (never a flag),
+        // and newlines pass through — the arg-vector form guarantees both.
+        let args = comment_args("issue", 82, "-not a flag\nsecond line");
+        assert_eq!(
+            args,
+            vec![
+                "issue",
+                "comment",
+                "82",
+                "--body",
+                "-not a flag\nsecond line",
+            ]
+        );
+        // PR path differs only in the leading subcommand.
+        assert_eq!(comment_args("pr", 130, "hi")[0], "pr");
+    }
+
+    #[test]
+    fn issue_comment_rejects_empty_body_before_spawning() {
+        // Validation happens before any gh spawn, so this fails fast with no gh /
+        // no repo — a whitespace-only body would otherwise open gh's editor.
+        let err =
+            gh_issue_comment("C:/nonexistent".to_string(), 1, "   \n".to_string()).unwrap_err();
+        assert!(err.contains("empty comment"), "got: {err}");
+    }
+
+    #[test]
+    fn pr_comment_rejects_empty_body_before_spawning() {
+        let err = gh_pr_comment("C:/nonexistent".to_string(), 1, "".to_string()).unwrap_err();
+        assert!(err.contains("empty comment"), "got: {err}");
     }
 
     #[test]

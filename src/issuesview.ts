@@ -15,7 +15,14 @@ import {
   ghIssueList,
   ghIssueCreate,
   ghIssueSetLabels,
+  ghIssueView,
+  ghIssueComment,
+  ghPrList,
+  ghPrView,
+  ghPrComment,
   type GhIssue,
+  type GhPr,
+  type GhDetail,
   type GhAuth,
 } from "./issues";
 import {
@@ -25,7 +32,10 @@ import {
   filterAndSortIssues,
   labelDelta,
   validateNewIssue,
+  validateComment,
+  type ViewMode,
 } from "./issuesmodel";
+import { RefreshGate } from "./refreshgate";
 
 // gh.rs surfaces its bare "gh-not-found" sentinel from every command, not just
 // auth status (a gh removed mid-session) — map it to the install hint wherever
@@ -105,16 +115,23 @@ export class IssuesView {
 
   private repoRoot: string | null = null;
   private issues: GhIssue[] = [];
+  private prs: GhPr[] = [];
+  /** Which list is showing — issues or pull requests. */
+  private mode: ViewMode = "issues";
   private auth: GhAuth | null = null;
   private query = "";
   /** Issue numbers with a label-write in flight (buttons disabled meanwhile). */
   private busy = new Set<number>();
 
-  private refreshing = false;
+  /** Loss-safe single-flight guard for refresh(): a call arriving mid-fetch is
+   *  coalesced into one trailing re-fetch so a mode switch never strands the new
+   *  mode on stale/empty data (PR #136 review). */
+  private refreshGate = new RefreshGate();
   private disposed = false;
   private toastTimer: number | undefined;
 
-  private headTitleEl: HTMLElement;
+  private issuesTabBtn: HTMLButtonElement;
+  private prsTabBtn: HTMLButtonElement;
   private headRepoEl: HTMLElement;
   private filterInput: HTMLInputElement;
   private listEl: HTMLElement;
@@ -124,6 +141,14 @@ export class IssuesView {
   private refreshBtn: HTMLButtonElement;
   /** The open create-issue form, if any (kept to one at a time). */
   private formEl: HTMLElement | null = null;
+  /** The open detail pane, if any (issue or PR). */
+  private detailEl: HTMLElement | null = null;
+  /** What the open detail pane is showing, so a comment posts to the right thread. */
+  private detailCtx: { kind: ViewMode; number: number } | null = null;
+  /** The detail pane's thread region (description + comments), rebuilt per load. */
+  private detailThreadEl: HTMLElement | null = null;
+  private detailTitleEl: HTMLElement | null = null;
+  private detailStateEl: HTMLElement | null = null;
 
   constructor(private host: IssuesViewHost) {
     this.el = el("div", "pane-issues");
@@ -132,15 +157,23 @@ export class IssuesView {
     this.el.addEventListener("keydown", (e) => {
       if (e.key === "Escape") {
         e.stopPropagation();
-        // A mid-edit Esc should close the form, not the whole view.
-        if (this.formEl) this.closeForm();
+        // Peel back one layer at a time: detail → form → whole view.
+        if (this.detailEl) this.closeDetail();
+        else if (this.formEl) this.closeForm();
         else this.host.onClose();
       }
     });
 
-    // -- header: title, repo, filter, actions --
+    // -- header: mode toggle (Issues ⇄ PRs), repo, filter, actions --
     const head = el("div", "issues-head");
-    this.headTitleEl = el("span", "issues-head-title", "Issues");
+    const modeToggle = el("div", "issues-mode");
+    this.issuesTabBtn = el("button", "issues-mode-tab on", "Issues") as HTMLButtonElement;
+    this.issuesTabBtn.title = "Show issues";
+    this.issuesTabBtn.addEventListener("click", () => this.setMode("issues"));
+    this.prsTabBtn = el("button", "issues-mode-tab", "PRs") as HTMLButtonElement;
+    this.prsTabBtn.title = "Show pull requests";
+    this.prsTabBtn.addEventListener("click", () => this.setMode("prs"));
+    modeToggle.append(this.issuesTabBtn, this.prsTabBtn);
     this.headRepoEl = el("span", "issues-head-repo");
 
     this.filterInput = document.createElement("input");
@@ -177,7 +210,7 @@ export class IssuesView {
     closeBtn.addEventListener("click", () => this.host.onClose());
 
     head.append(
-      this.headTitleEl,
+      modeToggle,
       this.headRepoEl,
       this.filterInput,
       this.createBtn,
@@ -206,7 +239,23 @@ export class IssuesView {
 
   hide(): void {
     this.closeForm();
+    this.closeDetail();
     this.el.hidden = true;
+  }
+
+  /** Switch between the issues and PR lists. No-op if already there; otherwise
+   *  closes any open form/detail, updates the header, and refetches. */
+  private setMode(mode: ViewMode): void {
+    if (mode === this.mode) return;
+    this.closeForm();
+    this.closeDetail();
+    this.mode = mode;
+    this.issuesTabBtn.classList.toggle("on", mode === "issues");
+    this.prsTabBtn.classList.toggle("on", mode === "prs");
+    this.renderHead();
+    // Show the already-fetched list for this mode immediately, then refresh.
+    this.renderList();
+    void this.refresh();
   }
 
   dispose(): void {
@@ -218,8 +267,13 @@ export class IssuesView {
   // ---------- data ----------
 
   private async refresh(): Promise<void> {
-    if (this.disposed || this.refreshing) return;
-    this.refreshing = true;
+    if (this.disposed) return;
+    // Single-flight, but loss-safe: if a fetch is already in flight, the gate
+    // records that we must run again (a mode switch, a manual ↻) and the
+    // in-flight run re-fires refresh() on completion — so a switch never ends on
+    // the previous mode's stale/empty data. Any number of dropped calls collapse
+    // into one trailing re-fetch.
+    if (!this.refreshGate.begin()) return;
     this.setBusyBtn(this.refreshBtn, true);
     try {
       const cwd = this.host.getCwd();
@@ -243,9 +297,10 @@ export class IssuesView {
         return;
       }
       if (root !== this.repoRoot) {
-        // Entered a different repo: reset view state.
+        // Entered a different repo: reset view state (both lists).
         this.repoRoot = root;
         this.issues = [];
+        this.prs = [];
       }
 
       // gh presence/auth gates everything — one cheap check up front so a
@@ -275,21 +330,35 @@ export class IssuesView {
         return;
       }
 
-      let issues: GhIssue[];
+      const mode = this.mode;
       try {
-        issues = await ghIssueList(root);
+        if (mode === "issues") {
+          this.issues = await ghIssueList(root);
+        } else {
+          this.prs = await ghPrList(root);
+        }
       } catch (err) {
-        this.setBlank(`Could not list issues:\n${ghErrText(err)}`);
+        // Drop a stale failure too: a fetch that errored for the mode we've
+        // since left must not paint its error over the new mode (mirror of the
+        // success-path guard below); the trailing re-fetch will refresh the
+        // current mode.
+        if (this.disposed || this.mode !== mode) return;
+        this.setBlank(
+          `Could not list ${mode === "issues" ? "issues" : "pull requests"}:\n${ghErrText(err)}`
+        );
         return;
       }
       if (this.disposed) return;
-      this.issues = issues;
+      // A mode switch mid-fetch makes this response stale — drop it.
+      if (this.mode !== mode) return;
       this.setBlank(null);
       this.renderHead();
       this.renderList();
     } finally {
-      this.refreshing = false;
       this.setBusyBtn(this.refreshBtn, false);
+      // If a call was dropped while we were fetching (e.g. a mode switch), run
+      // exactly once more — now reading the current mode.
+      if (this.refreshGate.end() && !this.disposed) void this.refresh();
     }
   }
 
@@ -327,46 +396,61 @@ export class IssuesView {
     this.headRepoEl.title = root;
     // Create/filter only make sense once gh is authenticated and we're in a repo.
     const ready = !!this.repoRoot && !!this.auth?.authenticated;
+    // Creating is issue-only — the PR mode is read-only (list + comment).
+    this.createBtn.hidden = this.mode !== "issues";
     this.createBtn.disabled = !ready;
     this.filterInput.disabled = !ready;
+    this.filterInput.placeholder =
+      this.mode === "issues"
+        ? "Filter by number, title, or label…"
+        : "Filter PRs by number, title, or label…";
   }
 
   private renderList(): void {
     this.listEl.replaceChildren();
     if (!this.repoRoot) return;
 
-    const shown = filterAndSortIssues(this.issues, this.query);
+    const isIssues = this.mode === "issues";
+    const items = isIssues ? this.issues : this.prs;
+    const shown = filterAndSortIssues(items, this.query);
     if (shown.length === 0) {
+      const noun = isIssues ? "issues" : "pull requests";
       const empty = el(
         "div",
         "issues-empty",
-        this.issues.length === 0
-          ? "No open issues."
-          : "No issues match the filter."
+        items.length === 0
+          ? `No open ${noun}.`
+          : `No ${noun} match the filter.`
       );
       this.listEl.appendChild(empty);
       return;
     }
 
-    for (const issue of shown) {
-      this.listEl.appendChild(this.renderRow(issue));
+    for (const item of shown) {
+      this.listEl.appendChild(
+        isIssues ? this.renderIssueRow(item as GhIssue) : this.renderPrRow(item as GhPr)
+      );
     }
   }
 
-  private renderRow(issue: GhIssue): HTMLElement {
-    const row = el("div", "issues-row");
-    if (isLabeledForAgents(issue)) row.classList.add("agent-labeled");
-
-    const num = el("span", "issues-num", `#${issue.number}`);
+  /** The shared skeleton for a list row: number, title, read-only label chips,
+   *  updated-time, and an empty actions container. The whole row opens the detail
+   *  pane on click (each caller wires the right kind); action buttons inside must
+   *  `stopPropagation` so they don't also trigger the detail. */
+  private rowShell(
+    item: GhIssue | GhPr,
+    kind: ViewMode
+  ): { row: HTMLElement; meta: HTMLElement; actions: HTMLElement } {
+    const row = el("div", "issues-row clickable");
+    const num = el("span", "issues-num", `#${item.number}`);
 
     const main = el("div", "issues-row-main");
-    const title = el("span", "issues-title", issue.title);
-    title.title = issue.title;
+    const title = el("span", "issues-title", item.title);
+    title.title = item.title;
     main.appendChild(title);
 
-    // Existing labels (all of them, read-only chips) + the updated time.
     const meta = el("div", "issues-row-meta");
-    for (const label of issue.labels) {
+    for (const label of item.labels) {
       const known = label in LABEL_SHORT;
       const chip = el(
         "span",
@@ -376,13 +460,34 @@ export class IssuesView {
       chip.title = label;
       meta.appendChild(chip);
     }
-    const when = el("span", "issues-when", fmtUpdated(issue.updated_at));
-    when.title = issue.updated_at;
+    const when = el("span", "issues-when", fmtUpdated(item.updated_at));
+    when.title = item.updated_at;
     meta.appendChild(when);
     main.appendChild(meta);
 
-    // Toggle buttons for the go-signal labels + copy-URL.
     const actions = el("div", "issues-row-actions");
+    row.append(num, main, actions);
+    row.addEventListener("click", () => this.openDetail(kind, item.number, item.title));
+    return { row, meta, actions };
+  }
+
+  /** A copy-URL button that never bubbles a click up to the row's detail-open. */
+  private copyButton(url: string, number: number): HTMLButtonElement {
+    const copyBtn = el("button", "issues-copy", "⧉") as HTMLButtonElement;
+    copyBtn.title = "Copy URL";
+    copyBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      void copyText(url);
+      this.toast(`Copied #${number} URL`, "ok");
+    });
+    return copyBtn;
+  }
+
+  private renderIssueRow(issue: GhIssue): HTMLElement {
+    const { row, actions } = this.rowShell(issue, "issues");
+    if (isLabeledForAgents(issue)) row.classList.add("agent-labeled");
+
+    // Toggle buttons for the go-signal labels.
     for (const label of TOGGLEABLE_LABELS) {
       const on = issue.labels.includes(label);
       const btn = el(
@@ -392,7 +497,10 @@ export class IssuesView {
       ) as HTMLButtonElement;
       btn.title = on ? `Remove ${label}` : `Add ${label}`;
       btn.disabled = this.busy.has(issue.number);
-      btn.addEventListener("click", () => void this.toggleLabel(issue, label, !on));
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        void this.toggleLabel(issue, label, !on);
+      });
       actions.appendChild(btn);
     }
     // agent-managed is orchestrator-owned; show it read-only when present so the
@@ -402,15 +510,20 @@ export class IssuesView {
       chip.title = "Owned by an orchestrator";
       actions.appendChild(chip);
     }
-    const copyBtn = el("button", "issues-copy", "⧉") as HTMLButtonElement;
-    copyBtn.title = "Copy issue URL";
-    copyBtn.addEventListener("click", () => {
-      void copyText(issue.url);
-      this.toast(`Copied #${issue.number} URL`, "ok");
-    });
-    actions.appendChild(copyBtn);
+    actions.appendChild(this.copyButton(issue.url, issue.number));
+    return row;
+  }
 
-    row.append(num, main, actions);
+  private renderPrRow(pr: GhPr): HTMLElement {
+    const { row, meta, actions } = this.rowShell(pr, "prs");
+    // PRs are read-only here: no label toggles, no merge/approve — just the head
+    // branch as context and copy-URL. Comments are added from the detail pane.
+    if (pr.head_ref) {
+      const branch = el("span", "issues-branch", pr.head_ref);
+      branch.title = `head: ${pr.head_ref}`;
+      meta.insertBefore(branch, meta.firstChild);
+    }
+    actions.appendChild(this.copyButton(pr.url, pr.number));
     return row;
   }
 
@@ -453,6 +566,189 @@ export class IssuesView {
    *  "push to board now" when a live orchestrator owns the pane's repo. */
   private hasLiveOrchestratorHint(): boolean {
     return false;
+  }
+
+  // ---------- detail pane ----------
+
+  /** Open the detail pane over the list for issue/PR `number`. `kind` selects
+   *  the view + comment backend; `title` seeds the header immediately (refined
+   *  by the fetched detail). One pane at a time. */
+  private openDetail(kind: ViewMode, number: number, title: string): void {
+    if (!this.repoRoot) return;
+    this.closeForm();
+    this.closeDetail();
+    this.detailCtx = { kind, number };
+
+    const pane = el("div", "issues-detail");
+    pane.tabIndex = -1;
+
+    const head = el("div", "issues-detail-head");
+    const back = el("button", "pane-btn", "←") as HTMLButtonElement;
+    back.title = "Back to the list (Esc)";
+    back.addEventListener("click", () => this.closeDetail());
+    const num = el("span", "issues-detail-num", `#${number}`);
+    this.detailTitleEl = el("span", "issues-detail-title", title);
+    this.detailTitleEl.title = title;
+    this.detailStateEl = el("span", "issues-detail-state");
+    this.detailStateEl.hidden = true;
+    head.append(back, num, this.detailTitleEl, this.detailStateEl);
+
+    const scroll = el("div", "issues-detail-scroll");
+    this.detailThreadEl = el("div", "issues-detail-thread");
+    scroll.appendChild(this.detailThreadEl);
+
+    // Composer — the one write PR mode allows too (gh {issue,pr} comment).
+    const composer = el("div", "issues-detail-composer");
+    const box = document.createElement("textarea");
+    box.className = "issues-detail-input";
+    box.placeholder = "Add a comment…  (Ctrl+Enter to post)";
+    const submit = el("button", "git-modal-btn primary", "Comment") as HTMLButtonElement;
+    box.addEventListener("keydown", (e) => {
+      e.stopPropagation();
+      if (e.key === "Enter" && e.ctrlKey) {
+        e.preventDefault();
+        void this.postComment(box, submit);
+      } else if (e.key === "Escape") {
+        // Keep a typed draft on the first Esc (blur to the pane so a second Esc
+        // closes it via the view-level handler); close outright when empty.
+        if (box.value) pane.focus();
+        else this.closeDetail();
+      }
+    });
+    submit.addEventListener("click", () => void this.postComment(box, submit));
+    composer.append(box, submit);
+
+    pane.append(head, scroll, composer);
+    this.detailEl = pane;
+    this.el.appendChild(pane);
+    pane.focus();
+
+    this.setThreadNote("Loading…");
+    void this.loadDetail();
+  }
+
+  private closeDetail(): void {
+    this.detailEl?.remove();
+    this.detailEl = null;
+    this.detailThreadEl = null;
+    this.detailTitleEl = null;
+    this.detailStateEl = null;
+    this.detailCtx = null;
+  }
+
+  /** Replace the thread region with a single muted note (loading / error / empty). */
+  private setThreadNote(message: string): void {
+    if (!this.detailThreadEl) return;
+    this.detailThreadEl.replaceChildren(el("div", "issues-detail-note", message));
+  }
+
+  /** Fetch and render the open detail pane's description + comment thread. */
+  private async loadDetail(): Promise<void> {
+    const ctx = this.detailCtx;
+    if (!ctx || !this.repoRoot) return;
+    const repo = this.repoRoot;
+    let detail: GhDetail;
+    try {
+      detail =
+        ctx.kind === "issues"
+          ? await ghIssueView(repo, ctx.number)
+          : await ghPrView(repo, ctx.number);
+    } catch (err) {
+      // Ignore if the pane was closed or swapped while the fetch was in flight.
+      if (this.detailCtx !== ctx) return;
+      this.setThreadNote(`Could not load #${ctx.number}:\n${ghErrText(err)}`);
+      return;
+    }
+    if (this.disposed || this.detailCtx !== ctx) return;
+    this.renderDetail(detail);
+  }
+
+  private renderDetail(detail: GhDetail): void {
+    if (this.detailTitleEl) {
+      this.detailTitleEl.textContent = detail.title;
+      this.detailTitleEl.title = detail.title;
+    }
+    if (this.detailStateEl) {
+      this.detailStateEl.textContent = detail.state.toLowerCase();
+      this.detailStateEl.className = `issues-detail-state ${detail.state.toLowerCase()}`;
+      this.detailStateEl.hidden = false;
+    }
+    const thread = this.detailThreadEl;
+    if (!thread) return;
+    thread.replaceChildren();
+
+    // Description (GitHub-authored markdown — textContent only, never innerHTML;
+    // the #129 XSS boundary). Rendered pre-wrap so newlines survive.
+    thread.appendChild(this.renderComment(detail.author, null, detail.body, "description"));
+
+    // Comment thread.
+    if (detail.comments.length === 0) {
+      thread.appendChild(el("div", "issues-detail-note", "No comments yet."));
+    } else {
+      for (const c of detail.comments) {
+        thread.appendChild(this.renderComment(c.author, c.created_at, c.body, "comment"));
+      }
+    }
+  }
+
+  /** One authored block (the description or a comment). Every piece of text is
+   *  set via `textContent` — no innerHTML on GitHub data (the #129 boundary). */
+  private renderComment(
+    author: string | null,
+    createdAt: string | null,
+    body: string,
+    kind: "description" | "comment"
+  ): HTMLElement {
+    const block = el("div", `issues-detail-item ${kind}`);
+    const head = el("div", "issues-detail-item-head");
+    head.appendChild(el("span", "issues-detail-author", author ?? "(unknown)"));
+    if (createdAt) {
+      const when = el("span", "issues-detail-when", fmtUpdated(createdAt));
+      when.title = createdAt;
+      head.appendChild(when);
+    }
+    block.appendChild(head);
+    const text = body.trim();
+    const bodyEl = el(
+      "div",
+      text ? "issues-detail-body" : "issues-detail-body empty",
+      text || (kind === "description" ? "No description provided." : "(empty comment)")
+    );
+    block.appendChild(bodyEl);
+    return block;
+  }
+
+  private async postComment(
+    box: HTMLTextAreaElement,
+    submit: HTMLButtonElement
+  ): Promise<void> {
+    const ctx = this.detailCtx;
+    if (!ctx || !this.repoRoot) return;
+    const valid = validateComment(box.value);
+    if (!valid.ok) {
+      this.toast(valid.error);
+      box.focus();
+      return;
+    }
+    const repo = this.repoRoot;
+    this.setBusyBtn(submit, true);
+    try {
+      if (ctx.kind === "issues") {
+        await ghIssueComment(repo, ctx.number, valid.body);
+      } else {
+        await ghPrComment(repo, ctx.number, valid.body);
+      }
+      // The pane may have closed/swapped while posting — bail cleanly.
+      if (this.detailCtx !== ctx) return;
+      box.value = "";
+      this.toast(`Comment posted to #${ctx.number}`, "ok");
+      // Reflect the new comment: refetch the thread from GitHub's truth.
+      await this.loadDetail();
+    } catch (err) {
+      this.toast(ghErrText(err));
+    } finally {
+      if (this.detailCtx === ctx) this.setBusyBtn(submit, false);
+    }
   }
 
   // ---------- create form ----------
