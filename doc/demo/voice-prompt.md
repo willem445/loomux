@@ -47,7 +47,10 @@ Download them once into `%LOCALAPPDATA%\loomux\whisper\`:
 Download a prebuilt release zip from
 <https://github.com/ggml-org/whisper.cpp/releases> (the `whisper-bin-x64.zip`
 asset), and copy `whisper-cli.exe` (older releases name it `main.exe` — both are
-accepted) into `%LOCALAPPDATA%\loomux\whisper\`.
+accepted) **and every `.dll` beside it** (`whisper.dll`, `ggml*.dll`, …) into
+`%LOCALAPPDATA%\loomux\whisper\`. The exe is only a thin shell — without its
+sibling DLLs it exits immediately with a bare “whisper failed” / missing-DLL
+error (STATUS_DLL_NOT_FOUND).
 
 > Prefer to build it yourself? `cmake -B build && cmake --build build --config Release`
 > in a whisper.cpp checkout produces the same `whisper-cli.exe`.
