@@ -21,10 +21,8 @@ import {
   setGitWatch,
   detachGitWatch,
   ptyBackendInfo,
-  voiceStart,
-  voiceStop,
-  voiceCancel,
 } from "./pty";
+import { voiceController, type VoiceTargetPane } from "./voicecontrol";
 import { invoke } from "@tauri-apps/api/core";
 import { parseOsc52, writeClipboard } from "./clipboard";
 import {
@@ -178,7 +176,7 @@ export interface PaneEvents {
   onToggleGroupMinimize: (pane: Pane) => void;
 }
 
-export class Pane {
+export class Pane implements VoiceTargetPane {
   readonly el: HTMLElement;
   readonly term: Terminal;
   ptyId: number | null = null;
@@ -240,11 +238,12 @@ export class Pane {
    *  how image paths are referenced in the steer text (#72). Defaults to the
    *  Claude form until a save reports otherwise. */
   private orchCli = "claude";
-  /** Voice-prompt push-to-talk button on the steer strip (#58). */
+  /** Voice-prompt push-to-talk button on the steer strip (#58). Only present on
+   *  orchestrator panes; the hotkey (Alt+V) works on any pane regardless. */
   private micBtn: HTMLButtonElement | null = null;
-  /** Voice capture state: "idle" | "recording" (mic live) | "busy" (stopping /
-   *  transcribing). Gates re-entrancy so a double-click can't double-start. */
-  private voiceState: "idle" | "recording" | "busy" = "idle";
+  /** Overlay badge shown while a voice capture targets THIS pane's terminal
+   *  (#58). Overlay chrome — floats over `.xterm`, never resizes the PTY. */
+  private voiceIndicator: HTMLElement | null = null;
   /** "needs attention" chip in the header (attention routing #6); hidden until
    *  the backend flags this pane. */
   private attnChip: HTMLButtonElement;
@@ -1197,7 +1196,7 @@ export class Pane {
     mic.innerHTML = MIC_ICON;
     mic.addEventListener("click", (e) => {
       e.stopPropagation();
-      void this.toggleVoice();
+      voiceController.toggleForCompose(this);
     });
 
     const send = document.createElement("button");
@@ -1309,55 +1308,57 @@ export class Pane {
     this.composeInput.select();
   }
 
-  /** Push-to-talk toggle (#58): idle → start capturing; recording → stop and
-   *  transcribe locally, inserting the text into the strip (never submitting).
-   *  The "busy" state gates re-entrancy while a start/stop round-trip is live. */
-  private async toggleVoice(): Promise<void> {
-    if (this.voiceState === "busy") return;
-    if (this.voiceState === "idle") {
-      this.setMic("busy");
-      try {
-        await voiceStart();
-        this.setMic("recording");
-      } catch (err) {
-        this.setMic("idle");
-        this.showComposeStatus(`Mic: ${String(err)}`);
+  // ----- VoiceTargetPane (#58): the surface the global voiceController drives.
+  // The controller owns the single-capture state machine; a Pane only knows how
+  // to receive a transcript and show a recording indicator.
+
+  /** Is this pane's compose box the focused element? Decides caret-insert vs
+   *  terminal-paste when the Alt+V hotkey fires. */
+  isComposeFocused(): boolean {
+    return !!this.composeInput && document.activeElement === this.composeInput;
+  }
+
+  /** Reflect the mic button's "recording" pulse (compose-target indicator). */
+  setMicRecording(on: boolean): void {
+    this.micBtn?.classList.toggle("recording", on);
+  }
+
+  /** Show/hide the terminal-capture overlay badge (terminal-target indicator).
+   *  Lazily created; floats over `.xterm` so it never resizes the PTY. */
+  setTerminalRecording(on: boolean): void {
+    if (on) {
+      if (!this.voiceIndicator) {
+        const badge = document.createElement("div");
+        badge.className = "pane-voice-indicator";
+        badge.innerHTML = `<span class="pane-voice-dot"></span>Recording — Alt+V to insert · Esc to cancel`;
+        this.termEl.appendChild(badge);
+        this.voiceIndicator = badge;
       }
-      return;
-    }
-    // recording → stop + transcribe
-    this.setMic("busy");
-    try {
-      const text = await voiceStop();
-      if (text) this.insertTranscript(text);
-      else this.showComposeStatus("No speech detected.");
-    } catch (err) {
-      this.showComposeStatus(`Transcription: ${String(err)}`);
-    } finally {
-      this.setMic("idle");
+    } else {
+      this.voiceIndicator?.remove();
+      this.voiceIndicator = null;
     }
   }
 
-  /** Reflect voice state on the mic button (label + a .recording class the CSS
-   *  pulses) and remember it. */
-  private setMic(state: "idle" | "recording" | "busy"): void {
-    this.voiceState = state;
-    const btn = this.micBtn;
-    if (!btn) return;
-    btn.classList.toggle("recording", state === "recording");
-    btn.disabled = state === "busy";
-    btn.title =
-      state === "recording"
-        ? "Recording — click to stop and transcribe"
-        : state === "busy"
-          ? "Working…"
-          : "Voice prompt — click to record, click again to transcribe";
+  /** Route a transcript into this pane's terminal as if pasted — xterm's paste
+   *  path applies bracketed-paste semantics (when the app enabled them) and adds
+   *  NO trailing newline, so the human reviews and presses Enter. */
+  pasteToTerminal(text: string): void {
+    if (this.disposed) return; // pane closed during transcription — drop it
+    const t = text.trim();
+    if (t) this.term.paste(t);
+  }
+
+  /** Surface a voice status/error on the strip (compose targets have one). */
+  showVoiceStatus(msg: string): void {
+    this.showComposeStatus(msg);
   }
 
   /** Insert transcribed text into the strip at the caret (or append), keeping a
    *  single space between words, then focus the input so the human can edit and
    *  press Enter. Never auto-submits. */
-  private insertTranscript(text: string): void {
+  insertTranscript(text: string): void {
+    if (this.disposed) return; // pane closed during transcription — drop it
     const input = this.composeInput;
     if (!input) return;
     const t = text.trim();
@@ -1435,8 +1436,9 @@ export class Pane {
     clearTimeout(this.fitTimer);
     clearTimeout(this.shiftTimer);
     clearTimeout(this.composeStatusTimer);
-    // Abort any in-flight voice capture so the backend mic stream is released.
-    if (this.voiceState !== "idle") void voiceCancel().catch(() => {});
+    // Abort any in-flight voice capture aimed at this pane (releases the mic).
+    voiceController.notifyPaneDisposed(this);
+    this.voiceIndicator?.remove();
     this.clearAttachments(); // revoke any lingering thumbnail object URLs
     this.gitView?.dispose();
     this.tasksView?.dispose();

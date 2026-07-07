@@ -1,10 +1,11 @@
-//! Voice-prompt prototype (issue #58): push-to-talk mic capture → local,
-//! open-source Whisper transcription → text handed back to the steer strip
-//! (the human reviews it and presses Enter; loomux never auto-submits).
+//! Voice prompts (issue #58): push-to-talk mic capture → local, open-source
+//! Whisper transcription → text handed back to whatever holds focus (the human
+//! reviews it and presses Enter; loomux never auto-submits). The routing lives
+//! in the frontend (voicecontrol.ts); this module is capture + transcription.
 //!
 //! ## Platform scope
 //!
-//! Native capture is **Windows-only** in this prototype. `cpal` pulls
+//! Native capture is **Windows-only** for now. `cpal` pulls
 //! `alsa-sys` on Linux (needs `libasound2-dev`) and CoreAudio on macOS, and the
 //! transcription path here is Windows-flavoured anyway (`whisper-cli.exe`,
 //! `%LOCALAPPDATA%`), so the whole capture + transcription implementation lives
@@ -32,7 +33,8 @@
 //!   Rust check and matches how git.rs already integrates an external CLI.
 //!
 //! The `whisper-cli.exe` binary and the model weights are NOT committed — they
-//! are downloaded once (see doc/demo/voice-prompt.md) and discovered at runtime.
+//! discovered at runtime (bundled resources → env vars → %LOCALAPPDATA%; see
+//! doc/design/voice.md).
 //!
 //! The pure helpers ([`resample_linear`], [`encode_wav_pcm16`],
 //! [`parse_whisper_output`]) are cross-platform and unit-tested below.
@@ -63,10 +65,14 @@ pub fn voice_start(state: tauri::State<'_, VoiceState>) -> Result<(), String> {
 }
 
 /// Stop the active recording, transcribe it locally, and return the text.
+/// `app` is used to locate the whisper runtime bundled as a Tauri resource.
 #[cfg(windows)]
 #[tauri::command]
-pub fn voice_stop(state: tauri::State<'_, VoiceState>) -> Result<String, String> {
-    win::stop(&state)
+pub fn voice_stop(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, VoiceState>,
+) -> Result<String, String> {
+    win::stop(&state, win::bundled_whisper_dir(&app))
 }
 
 /// Cancel any active recording without transcribing. Idempotent.
@@ -85,7 +91,10 @@ pub fn voice_start(_state: tauri::State<'_, VoiceState>) -> Result<(), String> {
 
 #[cfg(not(windows))]
 #[tauri::command]
-pub fn voice_stop(_state: tauri::State<'_, VoiceState>) -> Result<String, String> {
+pub fn voice_stop(
+    _app: tauri::AppHandle,
+    _state: tauri::State<'_, VoiceState>,
+) -> Result<String, String> {
     Err(VOICE_UNAVAILABLE.into())
 }
 
@@ -101,8 +110,10 @@ pub fn voice_cancel(_state: tauri::State<'_, VoiceState>) -> Result<(), String> 
 
 #[cfg(windows)]
 mod win {
-    use super::{encode_wav_pcm16, parse_whisper_output, resample_linear, VoiceState};
-    use std::path::PathBuf;
+    use super::{
+        encode_wav_pcm16, is_dll_load_failure, parse_whisper_output, resample_linear, VoiceState,
+    };
+    use std::path::{Path, PathBuf};
     use std::sync::mpsc::{self, Receiver, Sender};
     use std::sync::{Arc, Mutex};
     use std::thread::JoinHandle;
@@ -114,10 +125,20 @@ mod win {
     const WHISPER_SAMPLE_RATE: u32 = 16_000;
 
     /// Audio captured by the recording thread: downmixed mono f32 at the
-    /// device's native rate (resampled to 16 kHz only at stop time).
+    /// device's native rate (resampled to 16 kHz only at stop time). `error` is
+    /// set if the input stream faulted mid-capture (e.g. the mic was unplugged).
     struct Captured {
         samples: Vec<f32>,
         sample_rate: u32,
+        error: Option<String>,
+    }
+
+    /// The whisper runtime bundled as a Tauri resource: `<resource>/whisper`,
+    /// holding `whisper-cli.exe` (+ its DLLs) and `models/`. `None` if the
+    /// resource dir can't be resolved (e.g. `cargo test` without a bundle).
+    pub fn bundled_whisper_dir(app: &tauri::AppHandle) -> Option<PathBuf> {
+        use tauri::Manager;
+        app.path().resource_dir().ok().map(|r| r.join("whisper"))
     }
 
     /// A recording in flight. Sending on (or dropping) `stop_tx` tells the
@@ -160,8 +181,10 @@ mod win {
     }
 
     /// Stop and transcribe. Empty/near-silent captures return an empty string
-    /// rather than an error, so a mis-click just yields nothing to insert.
-    pub fn stop(state: &VoiceState) -> Result<String, String> {
+    /// rather than an error, so a mis-click just yields nothing to insert — but
+    /// an empty capture caused by a mid-record device fault surfaces that error.
+    /// `bundled` is the resource-dir whisper runtime (highest resolution priority).
+    pub fn stop(state: &VoiceState, bundled: Option<PathBuf>) -> Result<String, String> {
         let recording = {
             let mut slot = state.0.lock().map_err(|_| "voice state poisoned")?;
             slot.take().ok_or("not recording")?
@@ -173,10 +196,16 @@ mod win {
             .map_err(|_| "recording thread panicked".to_string())?;
 
         if captured.samples.is_empty() {
-            return Ok(String::new());
+            // Distinguish "you didn't say anything" from "the mic died".
+            return match captured.error {
+                Some(e) => Err(format!("microphone stopped mid-recording: {e}")),
+                None => Ok(String::new()),
+            };
         }
+        // We have audio; transcribe it even if a late device error also occurred
+        // (partial speech beats dropping it).
         let mono16k = resample_linear(&captured.samples, captured.sample_rate, WHISPER_SAMPLE_RATE);
-        transcribe(&mono16k)
+        transcribe(&mono16k, bundled)
     }
 
     /// Cancel any active recording without transcribing.
@@ -197,14 +226,14 @@ mod win {
             Some(d) => d,
             None => {
                 let _ = ready_tx.send(Err("no microphone / input device found".into()));
-                return Captured { samples: Vec::new(), sample_rate: WHISPER_SAMPLE_RATE };
+                return Captured { samples: Vec::new(), sample_rate: WHISPER_SAMPLE_RATE, error: None };
             }
         };
         let supported = match device.default_input_config() {
             Ok(c) => c,
             Err(e) => {
                 let _ = ready_tx.send(Err(format!("no default input config: {e}")));
-                return Captured { samples: Vec::new(), sample_rate: WHISPER_SAMPLE_RATE };
+                return Captured { samples: Vec::new(), sample_rate: WHISPER_SAMPLE_RATE, error: None };
             }
         };
 
@@ -214,13 +243,18 @@ mod win {
         let config: cpal::StreamConfig = supported.into();
 
         let buffer = Arc::new(Mutex::new(Vec::<f32>::new()));
-        let err_fn = |e| eprintln!("voice: input stream error: {e}");
+        // Shared slot the stream error callback writes to (mic unplugged / device
+        // lost mid-record). stop() reads it to distinguish silence from a fault.
+        let err_slot = Arc::new(Mutex::new(None::<String>));
 
         // One closure per sample format: downmix each frame to a single mono
-        // sample (average of channels) and append. Whisper is mono anyway.
+        // sample (average of channels) and append. Whisper is mono anyway. The
+        // error closure is rebuilt per arm (it captures a fresh Arc clone) so it
+        // needn't be Copy.
         macro_rules! build {
             ($t:ty, $to_f32:expr) => {{
                 let buf = buffer.clone();
+                let errs = err_slot.clone();
                 device.build_input_stream(
                     &config,
                     move |data: &[$t], _: &cpal::InputCallbackInfo| {
@@ -231,7 +265,10 @@ mod win {
                             b.push(sum / frame.len().max(1) as f32);
                         }
                     },
-                    err_fn,
+                    move |e| {
+                        eprintln!("voice: input stream error: {e}");
+                        *errs.lock().unwrap() = Some(e.to_string());
+                    },
                     None,
                 )
             }};
@@ -243,19 +280,22 @@ mod win {
             cpal::SampleFormat::U16 => build!(u16, |s: u16| (s as f32 - 32768.0) / 32768.0),
             other => {
                 let _ = ready_tx.send(Err(format!("unsupported sample format: {other:?}")));
-                return Captured { samples: Vec::new(), sample_rate };
+                return Captured { samples: Vec::new(), sample_rate, error: None };
             }
         };
         let stream = match stream {
             Ok(s) => s,
             Err(e) => {
-                let _ = ready_tx.send(Err(format!("failed to open mic stream: {e}")));
-                return Captured { samples: Vec::new(), sample_rate };
+                // A build failure here is often the OS denying mic access.
+                let _ = ready_tx.send(Err(format!(
+                    "couldn't open the microphone: {e} (check Windows microphone privacy settings)"
+                )));
+                return Captured { samples: Vec::new(), sample_rate, error: None };
             }
         };
         if let Err(e) = stream.play() {
             let _ = ready_tx.send(Err(format!("failed to start mic stream: {e}")));
-            return Captured { samples: Vec::new(), sample_rate };
+            return Captured { samples: Vec::new(), sample_rate, error: None };
         }
 
         // Live: unblock start(), then record until told to stop.
@@ -264,7 +304,8 @@ mod win {
         drop(stream); // stop capturing before we read the buffer out
 
         let samples = std::mem::take(&mut *buffer.lock().unwrap());
-        Captured { samples, sample_rate }
+        let error = err_slot.lock().unwrap().take();
+        Captured { samples, sample_rate, error }
     }
 
     // ----- transcription (subprocess to whisper.cpp) -----
@@ -276,74 +317,94 @@ mod win {
         model: PathBuf,
     }
 
-    /// The install root the prototype looks in by default:
-    /// `%LOCALAPPDATA%\loomux\whisper\`.
-    fn whisper_dir() -> Option<PathBuf> {
+    /// The power-user install root: `%LOCALAPPDATA%\loomux\whisper\`.
+    fn local_whisper_dir() -> Option<PathBuf> {
         dirs::data_local_dir().map(|d| d.join("loomux").join("whisper"))
     }
 
-    /// Resolve the whisper CLI and model, in priority order:
-    ///   1. env `LOOMUX_WHISPER_CLI` / `LOOMUX_WHISPER_MODEL` (explicit override);
-    ///   2. the default install dir (`whisper-cli.exe`; model `ggml-base.en.bin`,
-    ///      else `ggml-tiny.en.bin`, else the first `models\*.bin`).
-    /// Returns a human-readable, actionable error naming where it looked.
-    fn resolve_whisper() -> Result<WhisperPaths, String> {
-        let dir = whisper_dir();
+    /// CLI names to accept in a whisper dir: the current one, then the legacy
+    /// `main.exe` older whisper.cpp release zips shipped.
+    const CLI_NAMES: [&str; 2] = ["whisper-cli.exe", "main.exe"];
 
-        // --- CLI ---
-        let cli = match std::env::var_os("LOOMUX_WHISPER_CLI") {
-            Some(p) => PathBuf::from(p),
-            None => {
-                let d = dir.clone().ok_or("cannot resolve %LOCALAPPDATA%")?;
-                // Accept either the current name (whisper-cli.exe) or the legacy
-                // `main.exe` that older whisper.cpp release zips shipped.
-                let candidates = [d.join("whisper-cli.exe"), d.join("main.exe")];
-                candidates
-                    .iter()
-                    .find(|p| p.is_file())
-                    .cloned()
-                    .ok_or_else(|| {
-                        format!(
-                            "whisper CLI not found. Put whisper-cli.exe in {} or set \
-                             LOOMUX_WHISPER_CLI. See doc/demo/voice-prompt.md.",
-                            d.display()
-                        )
-                    })?
+    /// Resolve the whisper CLI and model. Resolution order (per the shipped
+    /// design): **bundled resources → `LOOMUX_WHISPER_*` env → %LOCALAPPDATA%**.
+    /// `bundled` is `<resource>/whisper`. Returns an actionable error naming
+    /// every place it looked.
+    fn resolve_whisper(bundled: &Option<PathBuf>) -> Result<WhisperPaths, String> {
+        Ok(WhisperPaths {
+            cli: resolve_cli(bundled)?,
+            model: resolve_model(bundled)?,
+        })
+    }
+
+    /// whisper-cli.exe: bundled dir → `LOOMUX_WHISPER_CLI` → %LOCALAPPDATA%.
+    fn resolve_cli(bundled: &Option<PathBuf>) -> Result<PathBuf, String> {
+        if let Some(b) = bundled {
+            if let Some(p) = CLI_NAMES.iter().map(|n| b.join(n)).find(|p| p.is_file()) {
+                return Ok(p);
             }
-        };
-        if !cli.is_file() {
-            return Err(format!("whisper CLI not found at {}", cli.display()));
         }
+        if let Some(p) = std::env::var_os("LOOMUX_WHISPER_CLI") {
+            let p = PathBuf::from(p);
+            return if p.is_file() {
+                Ok(p)
+            } else {
+                Err(format!("LOOMUX_WHISPER_CLI is set but not a file: {}", p.display()))
+            };
+        }
+        let d = local_whisper_dir().ok_or("cannot resolve %LOCALAPPDATA%")?;
+        CLI_NAMES
+            .iter()
+            .map(|n| d.join(n))
+            .find(|p| p.is_file())
+            .ok_or_else(|| {
+                format!(
+                    "whisper CLI not found (looked in bundled resources, \
+                     LOOMUX_WHISPER_CLI, and {}). See doc/design/voice.md.",
+                    d.display()
+                )
+            })
+    }
 
-        // --- model ---
-        let model = match std::env::var_os("LOOMUX_WHISPER_MODEL") {
-            Some(p) => PathBuf::from(p),
-            None => {
-                let models = dir.ok_or("cannot resolve %LOCALAPPDATA%")?.join("models");
-                let preferred = ["ggml-base.en.bin", "ggml-tiny.en.bin", "ggml-base.bin"];
-                preferred
-                    .iter()
-                    .map(|n| models.join(n))
-                    .find(|p| p.is_file())
-                    .or_else(|| first_bin_in(&models))
-                    .ok_or_else(|| {
-                        format!(
-                            "no Whisper model found in {}. Download e.g. ggml-base.en.bin \
-                             or set LOOMUX_WHISPER_MODEL. See doc/demo/voice-prompt.md.",
-                            models.display()
-                        )
-                    })?
+    /// Model: bundled `models/` → `LOOMUX_WHISPER_MODEL` → %LOCALAPPDATA%\models.
+    fn resolve_model(bundled: &Option<PathBuf>) -> Result<PathBuf, String> {
+        if let Some(p) = bundled.as_ref().and_then(|b| pick_model(&b.join("models"))) {
+            return Ok(p);
+        }
+        if let Some(p) = std::env::var_os("LOOMUX_WHISPER_MODEL") {
+            let p = PathBuf::from(p);
+            return if p.is_file() {
+                Ok(p)
+            } else {
+                Err(format!("LOOMUX_WHISPER_MODEL is set but not a file: {}", p.display()))
+            };
+        }
+        let models = local_whisper_dir()
+            .ok_or("cannot resolve %LOCALAPPDATA%")?
+            .join("models");
+        pick_model(&models).ok_or_else(|| {
+            format!(
+                "no Whisper model found (looked in bundled resources, \
+                 LOOMUX_WHISPER_MODEL, and {}). See doc/design/voice.md.",
+                models.display()
+            )
+        })
+    }
+
+    /// Preferred model in `dir` (base.en, then tiny.en, then base), else the
+    /// first `*.bin` present.
+    fn pick_model(dir: &Path) -> Option<PathBuf> {
+        for n in ["ggml-base.en.bin", "ggml-tiny.en.bin", "ggml-base.bin"] {
+            let p = dir.join(n);
+            if p.is_file() {
+                return Some(p);
             }
-        };
-        if !model.is_file() {
-            return Err(format!("Whisper model not found at {}", model.display()));
         }
-
-        Ok(WhisperPaths { cli, model })
+        first_bin_in(dir)
     }
 
     /// First `*.bin` in `dir` (sorted for determinism), if any.
-    fn first_bin_in(dir: &std::path::Path) -> Option<PathBuf> {
+    fn first_bin_in(dir: &Path) -> Option<PathBuf> {
         let mut bins: Vec<PathBuf> = std::fs::read_dir(dir)
             .ok()?
             .flatten()
@@ -355,8 +416,8 @@ mod win {
     }
 
     /// Write a scratch WAV, run whisper.cpp, and return the transcript.
-    fn transcribe(mono16k: &[f32]) -> Result<String, String> {
-        let paths = resolve_whisper()?;
+    fn transcribe(mono16k: &[f32], bundled: Option<PathBuf>) -> Result<String, String> {
+        let paths = resolve_whisper(&bundled)?;
 
         let wav = encode_wav_pcm16(mono16k, WHISPER_SAMPLE_RATE);
         // Scratch WAV in a per-process temp path. std's temp_dir + pid avoids a
@@ -371,7 +432,7 @@ mod win {
     }
 
     /// Invoke whisper.cpp on `wav_path` and parse its stdout into plain text.
-    fn run_whisper(paths: &WhisperPaths, wav_path: &std::path::Path) -> Result<String, String> {
+    fn run_whisper(paths: &WhisperPaths, wav_path: &Path) -> Result<String, String> {
         use std::os::windows::process::CommandExt;
         use std::process::Command;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -387,19 +448,40 @@ mod win {
             .creation_flags(CREATE_NO_WINDOW)
             .output()
             .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    format!("whisper CLI not found at {}", paths.cli.display())
-                } else {
-                    format!("failed to run whisper: {e}")
+                // ERROR_MOD_NOT_FOUND (126) at CreateProcess = the exe's imported
+                // DLLs are missing (the demo failure). 127 ≈ not found.
+                match e.raw_os_error() {
+                    Some(126) | Some(127) => dll_error(&paths.cli),
+                    _ if e.kind() == std::io::ErrorKind::NotFound => {
+                        format!("whisper CLI not found at {}", paths.cli.display())
+                    }
+                    _ => format!("failed to run whisper: {e}"),
                 }
             })?;
         if !out.status.success() {
+            // The process started but exited with a DLL-load NTSTATUS → same fix.
+            if let Some(code) = out.status.code() {
+                if is_dll_load_failure(code) {
+                    return Err(dll_error(&paths.cli));
+                }
+            }
             return Err(format!(
-                "whisper failed: {}",
+                "whisper failed (exit {:?}): {}",
+                out.status.code(),
                 String::from_utf8_lossy(&out.stderr).trim()
             ));
         }
         Ok(parse_whisper_output(&String::from_utf8_lossy(&out.stdout)))
+    }
+
+    /// The actionable "missing DLLs" message (the human hit this in the demo:
+    /// whisper-cli.exe copied without its whisper.cpp / ggml DLLs).
+    fn dll_error(cli: &Path) -> String {
+        format!(
+            "whisper-cli.exe is missing its DLLs — copy the .dll files from the \
+             whisper.cpp release next to {}. See doc/design/voice.md.",
+            cli.display()
+        )
     }
 }
 
@@ -455,6 +537,17 @@ pub fn encode_wav_pcm16(samples: &[f32], sample_rate: u32) -> Vec<u8> {
         buf.extend_from_slice(&v.to_le_bytes());
     }
     buf
+}
+
+/// Does a process exit code mean the image couldn't load its dependent DLLs?
+/// This is the failure the human hit in the demo: whisper-cli.exe present but
+/// its whisper.cpp / ggml DLLs weren't copied next to it. The NTSTATUS values
+/// surface as the process exit code on Windows:
+///   0xC0000135 STATUS_DLL_NOT_FOUND, 0xC000007B STATUS_INVALID_IMAGE_FORMAT,
+///   0xC0000139 STATUS_ENTRYPOINT_NOT_FOUND; 127 is the shell "not found" code.
+/// Pure + cross-platform so it can be unit-tested off Windows.
+pub fn is_dll_load_failure(code: i32) -> bool {
+    matches!(code as u32, 0xC000_0135 | 0xC000_007B | 0xC000_0139 | 127)
 }
 
 /// Clean whisper.cpp stdout into a single-line prompt string: strip any
@@ -561,5 +654,22 @@ mod tests {
     #[test]
     fn parse_plain_no_timestamp_lines() {
         assert_eq!(parse_whisper_output(" just text \n"), "just text");
+    }
+
+    #[test]
+    fn dll_load_failure_codes_are_recognized() {
+        // STATUS_DLL_NOT_FOUND / INVALID_IMAGE_FORMAT / ENTRYPOINT_NOT_FOUND
+        // arrive as sign-extended i32 exit codes; 127 is the shell form.
+        assert!(is_dll_load_failure(0xC000_0135u32 as i32));
+        assert!(is_dll_load_failure(0xC000_007Bu32 as i32));
+        assert!(is_dll_load_failure(0xC000_0139u32 as i32));
+        assert!(is_dll_load_failure(127));
+    }
+
+    #[test]
+    fn normal_exit_codes_are_not_dll_failures() {
+        assert!(!is_dll_load_failure(0)); // success
+        assert!(!is_dll_load_failure(1)); // ordinary error
+        assert!(!is_dll_load_failure(2));
     }
 }

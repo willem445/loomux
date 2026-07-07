@@ -7,6 +7,7 @@ import type { Pane, PaneEvents } from "./pane";
 import { SessionBrowser } from "./sessions";
 import { ensureOutputRouter, onPtyExit, type PtyExit, type SessionInfo } from "./pty";
 import { matchShortcut } from "./shortcuts";
+import { voiceController } from "./voicecontrol";
 import { initStatusBar } from "./statusbar";
 import { initHintBar } from "./hintbar";
 import { AgentLauncher } from "./launcher";
@@ -48,6 +49,10 @@ const grid = new Grid(gridRoot, paneDock, () => {
   // Last pane closed → always keep one pane alive.
   void openPane();
 });
+
+// Voice push-to-talk (#58, Alt+V): the global capture controller finds its
+// insertion target via the active pane.
+voiceController.init(() => grid.activePane);
 
 const paneEvents: PaneEvents = {
   onFocus: (pane) => grid.setActive(pane),
@@ -232,6 +237,9 @@ document.addEventListener(
         break;
       case "focus-compose":
         grid.activePane?.focusCompose();
+        break;
+      case "voice-ptt":
+        voiceController.toggleFromHotkey();
         break;
       case "maximize-pane":
         if (grid.activePane) grid.toggleMaximize(grid.activePane);

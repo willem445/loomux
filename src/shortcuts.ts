@@ -14,6 +14,7 @@ export type ShortcutAction =
   | "toggle-audit"
   | "toggle-group"
   | "focus-compose"
+  | "voice-ptt"
   | "maximize-pane"
   | "minimize-pane"
   | "rename-pane"
@@ -48,6 +49,9 @@ export function matchShortcut(e: KeyboardEvent): ShortcutAction | null {
       case "KeyA": return "toggle-audit";
       case "KeyO": return "toggle-group";
       case "KeyP": return "focus-compose";
+      // Alt+V (voice), not Ctrl+Shift+V: the latter is the terminal paste combo
+      // (handled per-pane), and Alt+letter matches the app-shortcut family.
+      case "KeyV": return "voice-ptt";
     }
   }
   if (e.code === "F2" && !e.ctrlKey && !e.altKey && !e.shiftKey) return "rename-pane";
