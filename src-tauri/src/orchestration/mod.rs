@@ -162,20 +162,35 @@ const SUBMIT_MAX_WAIT: Duration = Duration::from_secs(45);
 /// Spaced blind Enter retries after the first (no-ops once submitted).
 const SUBMIT_RETRY_DELAYS: [Duration; 2] = [Duration::from_millis(2500), Duration::from_millis(4500)];
 
-// Submit confirmation + stranded-text flush (#81/#84). A submit that landed
-// clears the input box and the CLI repaints / starts its turn — a burst of
-// output. An Enter that was ignored (focus-gated pre-#99, still busy, or an
-// empty box) produces effectively none. We watch for that burst in a short
-// window after the first Enter and record the outcome, so the NEXT delivery to
-// the same pane can tell whether the previous prompt is still stranded in the
-// box (and would otherwise merge with the new paste).
-/// How long after the first Enter to watch for the submit's output burst.
+// Submit confirmation + stranded-text flush (#81/#84, #112). A submit that
+// landed makes the pasted prompt LEAVE the input box and reappear above it as a
+// committed `>`-led user turn. The first cut counted any >=24 bytes of output in
+// the window after Enter as "landed", but TUI CLIs repaint on error messages,
+// dialog interactions and spinner/statusline ticks — none of which mean the
+// prompt entered the conversation — so it false-confirmed exactly the
+// stuck-prompt cases #103's unconfirmed notice exists to catch (#112: a swallowed
+// slash-command's "Unknown command" repaint; a /model dialog absorbing the
+// paste+Enter). Now we read the ANSI-stripped pane and confirm on that box→turn
+// transition instead of raw byte growth (see `prompt_landed`). We record the
+// outcome so the NEXT delivery to the same pane can tell whether the previous
+// prompt is still stranded in the box (and would otherwise merge with the new
+// paste).
+/// How long after the first Enter to watch for the box→committed-turn transition.
 const SUBMIT_CONFIRM_WINDOW: Duration = Duration::from_millis(600);
-/// Output growth (bytes) within the window that counts as a landed submit.
-/// Set well above idle cursor-blink noise so confirmation biases against false
-/// positives: a false "unconfirmed" only costs a harmless no-op flush next
-/// time, whereas a false "confirmed" would let stranded text merge.
-const SUBMIT_CONFIRM_MIN_BYTES: u64 = 24;
+/// Poll interval while watching the pane for the submit to land.
+const SUBMIT_CONFIRM_POLL: Duration = Duration::from_millis(100);
+/// Shortest prompt fingerprint we'll match against pane output. Below this a
+/// needle is too generic to tell "our prompt landed" from ambient text, so such
+/// a prompt stays unconfirmable — the safe direction (rev-32).
+const NEEDLE_MIN_CHARS: usize = 12;
+/// Longest fingerprint we take from the prompt. Capped so a committed user turn
+/// that the TUI wrapped at the pane width still carries the whole needle on its
+/// first line(s).
+const NEEDLE_MAX_CHARS: usize = 40;
+/// Frameless-CLI fallback: with no box border to anchor on, treat the last few
+/// non-empty lines as the input box region (biased large so a still-sitting
+/// prompt is seen — the safe direction).
+const FRAMELESS_BOX_LINES: usize = 3;
 /// After flushing a previous delivery's stranded text, let the CLI settle
 /// (box clears, turn starts) before the new paste lands.
 const FLUSH_SETTLE: Duration = Duration::from_millis(400);
@@ -1601,20 +1616,168 @@ struct DeliveryOutcome {
     submit_sent_ms: u64,
 }
 
-/// Whether output growth after the submit Enter counts as the submit landing.
-/// A successful submit clears the box and the CLI repaints / starts a turn (a
-/// burst of output); an ignored Enter produces effectively none.
+/// Whether the pane shows the submitted prompt actually LANDED in the
+/// conversation (#112) — not merely that some bytes were painted after Enter.
 ///
 /// Only trustworthy when the pane reached quiet *before* the Enter. If the
 /// submit-wait hit `SUBMIT_MAX_WAIT` while output was still streaming
-/// (`reached_quiet == false`), the Enter landed mid-stream and the window's
-/// growth is that stream, not the submit's — which would false-confirm and
-/// strand a prompt recorded as confirmed (rev-32). So a cap-hit-without-quiet
-/// is never confirmed; a false "unconfirmed" is just a harmless flush next
-/// time. Pure so the rule is testable; the polling loop lives in
-/// `deliver_prompt`.
-pub fn submit_confirmed(reached_quiet: bool, baseline_total: u64, observed_total: u64) -> bool {
-    reached_quiet && observed_total.saturating_sub(baseline_total) >= SUBMIT_CONFIRM_MIN_BYTES
+/// (`reached_quiet == false`), the Enter landed mid-stream and any change we see
+/// is that stream, not the submit's — which would false-confirm and strand a
+/// prompt recorded as confirmed (rev-32). So a cap-hit-without-quiet is never
+/// confirmed; a false "unconfirmed" is just a harmless flush next time. Pure so
+/// the rule is testable; the polling loop lives in `deliver_prompt`.
+///
+/// `before` / `after` are the ANSI-stripped pane tail just before the Enter (our
+/// prompt sitting in the input box) and during the confirm window. The decision
+/// itself is `prompt_landed`.
+pub fn submit_confirmed(reached_quiet: bool, before: &str, after: &str, prompt: &str) -> bool {
+    reached_quiet && prompt_landed(before, after, prompt)
+}
+
+/// Evidence that `prompt` entered the conversation as a committed user turn,
+/// read from the pane's ANSI-stripped tail before (`before`) and after
+/// (`after`) the submit Enter.
+///
+/// A landed submit makes the pasted text LEAVE the input box and reappear above
+/// it as a `>`-led user message; an ignored Enter, an error repaint (a swallowed
+/// slash-command's "Unknown command …"), a dialog absorbing the paste, or a
+/// spinner/statusline tick does none of that. We confirm only on that full
+/// transition, so every other case stays the harmless `unconfirmed` (rev-32:
+/// never false-confirm; a false unconfirmed costs at most one spurious #103
+/// notice / a no-op flush next delivery).
+///
+/// All four clauses are required:
+/// 1. `before` shows the prompt sitting in the input box — our paste is really
+///    there to confirm (a collapsed/absent paste stays unconfirmable, safe).
+/// 2. `after` no longer holds it in the box — it left. A prompt still sitting
+///    (ignored Enter, spinner tick) fails here.
+/// 3. `after` has a committed `>`-led user turn carrying the needle — positive
+///    evidence it entered the conversation. An "Unknown command: /modelRun …"
+///    error line is not `>`-led-then-needle even when it contains the text, so
+///    it can't confirm; a /model dialog shows no such turn at all.
+/// 4. That committed turn is NOT already in `before` — it appeared because of
+///    THIS Enter, so a stale identical turn left in scrollback by a previous
+///    delivery (the #103 re-send path) can't be mistaken for this one landing.
+pub fn prompt_landed(before: &str, after: &str, prompt: &str) -> bool {
+    let Some(needle) = prompt_needle(prompt) else {
+        return false; // nothing distinctive enough to match — stay unconfirmed
+    };
+    box_holds_needle(before, &needle)
+        && !box_holds_needle(after, &needle)
+        && committed_user_turn(after, &needle)
+        && !committed_user_turn(before, &needle)
+}
+
+/// A distinctive, reflow-normalised fingerprint of the delivered prompt: its
+/// text with box-frame glyphs and whitespace collapsed and lower-cased, capped
+/// to `NEEDLE_MAX_CHARS`. `None` when too little survives to be distinctive
+/// (`< NEEDLE_MIN_CHARS`) — such a prompt stays unconfirmable, the safe
+/// direction.
+fn prompt_needle(prompt: &str) -> Option<String> {
+    let n = normalize_pane_text(prompt);
+    if n.chars().count() < NEEDLE_MIN_CHARS {
+        return None;
+    }
+    Some(n.chars().take(NEEDLE_MAX_CHARS).collect())
+}
+
+/// Lower-case, drop box-frame glyphs, and collapse every whitespace run to one
+/// space, so a value compares equal regardless of how a TUI framed, padded or
+/// wrapped it. The shared normaliser for both the needle and the pane text it's
+/// matched against.
+fn normalize_pane_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_space = false;
+    for c in s.chars() {
+        if is_frame_glyph(c) {
+            continue;
+        }
+        if c.is_whitespace() {
+            if !prev_space && !out.is_empty() {
+                out.push(' ');
+            }
+            prev_space = true;
+        } else {
+            out.extend(c.to_lowercase());
+            prev_space = false;
+        }
+    }
+    while out.ends_with(' ') {
+        out.pop();
+    }
+    out
+}
+
+/// Box-drawing glyphs a TUI uses to frame its input box / dialogs. Stripped
+/// during normalisation so `│ > text │` reflows to `> text`.
+fn is_frame_glyph(c: char) -> bool {
+    matches!(
+        c,
+        '│' | '┃' | '║' | '╭' | '╮' | '╰' | '╯' | '┌' | '┐' | '└' | '┘'
+            | '╔' | '╗' | '╚' | '╝' | '─' | '━' | '═' | '┄' | '┈' | '╌'
+    )
+}
+
+/// Index in `lines` at which the current input box begins: everything from the
+/// last box top-border (`╭`/`┌`/`╔`) downward is the input box plus its chrome
+/// (borders, the input line, hint/statusline); everything above it is the
+/// committed conversation. Taking the LAST top-border means a still-sitting
+/// prompt — however many lines it wrapped to inside the box — is wholly within
+/// the box region, so `box_holds_needle` can't miss it. Frameless CLIs (a bare
+/// `> ` prompt, no border) fall back to the last few non-empty lines.
+fn input_box_start(lines: &[&str]) -> usize {
+    for i in (0..lines.len()).rev() {
+        let t = lines[i].trim_start();
+        if t.starts_with('╭') || t.starts_with('┌') || t.starts_with('╔') {
+            return i;
+        }
+    }
+    lines.len().saturating_sub(FRAMELESS_BOX_LINES)
+}
+
+/// Whether the input box region of `tail` still contains `needle` — the prompt
+/// is sitting there unsubmitted. Reflow-normalised, so a needle the TUI wrapped
+/// across box rows is still found.
+fn box_holds_needle(tail: &str, needle: &str) -> bool {
+    let lines: Vec<&str> = tail.lines().collect();
+    if lines.is_empty() {
+        return false;
+    }
+    let start = input_box_start(&lines);
+    normalize_pane_text(&lines[start..].join("\n")).contains(needle)
+}
+
+/// Whether the committed conversation ABOVE the input box carries a `>`-led user
+/// turn whose text starts with `needle` — the prompt entered the conversation.
+///
+/// Anchored on the user-turn glyph `>` AND on the needle leading the turn's
+/// text: an error repaint ("Unknown command: /modelRun …") that merely contains
+/// the prompt text is not `>`-led-then-needle, so it can't confirm. A couple of
+/// continuation lines are joined so a user turn the TUI wrapped still matches.
+fn committed_user_turn(tail: &str, needle: &str) -> bool {
+    let lines: Vec<&str> = tail.lines().collect();
+    if lines.is_empty() {
+        return false;
+    }
+    let above = &lines[..input_box_start(&lines)];
+    for i in 0..above.len() {
+        let deframed =
+            above[i].trim_start_matches(|c: char| is_frame_glyph(c) || c.is_whitespace());
+        let Some(rest) = deframed.strip_prefix('>') else {
+            continue;
+        };
+        // A wrapped user turn continues on the next line(s); join a few so the
+        // whole needle is present even when the first row cut it short.
+        let mut joined = rest.to_string();
+        for cont in above.iter().skip(i + 1).take(2) {
+            joined.push(' ');
+            joined.push_str(cont);
+        }
+        if normalize_pane_text(&joined).starts_with(needle) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Whether to flush a previous delivery's stranded text (a single submit press)
@@ -4538,6 +4701,9 @@ impl OrchRegistry {
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone();
         let (root, group, agent) = (self.root.clone(), a.group.clone(), a.id.clone());
+        // Owned copy of the prompt for the detached thread's submit-confirm check
+        // (#112): it fingerprints this text against the pane to see it land.
+        let prompt_text = text.to_string();
         let last_delivery = self.last_delivery.clone();
         // Captured for the unconfirmed-delivery notice (#103): whether this
         // target is the orchestrator (a notice to it would loop, so it's
@@ -4728,31 +4894,32 @@ impl OrchRegistry {
                 }));
             }
             let submit_sent_ms = now_ms();
-            // Baseline just before the first Enter, so the confirmation window
-            // below measures only the burst that Enter produces.
-            let submit_baseline = ptys.output_total(pty_id).unwrap_or(last_total);
+            // Snapshot the pane just before the first Enter: our pasted prompt is
+            // sitting in the input box now. The confirm below looks for that text
+            // to LEAVE the box and reappear as a committed `>`-led user turn —
+            // evidence the prompt entered the conversation, not just that bytes
+            // were painted (#112).
+            let before_tail = ptys.output_tail(pty_id).map(|b| strip_ansi(&b)).unwrap_or_default();
             let _ = ptys.write_bytes(pty_id, submit);
 
-            // Confirm the submit landed: watch for the output burst of the box
-            // clearing / the turn starting (#81/#84). Measured off the first
-            // Enter, before the spaced retries, so the signal is that Enter's
-            // effect and not a retry's. Only trusted when the pane reached quiet
-            // first — on a busy pane that never did, the Enter landed mid-stream
-            // and that stream would false-confirm (rev-32), so we skip the
-            // window and leave it unconfirmed. A miss here is safe: the next
-            // delivery's flush just no-ops on an empty box.
+            // Confirm the submit landed: watch the pane for the box→committed-turn
+            // transition (#112). Measured off the first Enter, before the spaced
+            // retries, so the signal is that Enter's effect and not a retry's.
+            // Only trusted when the pane reached quiet first — on a busy pane that
+            // never did, the Enter landed mid-stream and that stream would
+            // false-confirm (rev-32), so we skip the window and leave it
+            // unconfirmed. A miss here is safe: the next delivery's flush just
+            // no-ops on an empty box.
             let confirm_deadline = std::time::Instant::now() + SUBMIT_CONFIRM_WINDOW;
             let mut confirmed = false;
             while reached_quiet && std::time::Instant::now() < confirm_deadline {
-                std::thread::sleep(Duration::from_millis(100));
-                match ptys.output_total(pty_id) {
-                    Some(t) => {
-                        if submit_confirmed(reached_quiet, submit_baseline, t) {
-                            confirmed = true;
-                            break;
-                        }
-                    }
-                    None => break,
+                std::thread::sleep(SUBMIT_CONFIRM_POLL);
+                let Some(raw) = ptys.output_tail(pty_id) else {
+                    break; // terminal closed — leave unconfirmed
+                };
+                if submit_confirmed(reached_quiet, &before_tail, &strip_ansi(&raw), &prompt_text) {
+                    confirmed = true;
+                    break;
                 }
             }
 

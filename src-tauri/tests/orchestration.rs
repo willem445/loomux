@@ -12,7 +12,7 @@ use loomux_lib::orchestration::{
     copilot_autopilot_prompt_detected, create_orchestration_group, hold_for_human_input,
     hold_until_quiet, idle_should_kill, max_agents_notice,
     normalize_remote_web_base, parse_audit_lines, parse_session_cost, paste_held_notice,
-    prompt_wait_detected, resolve_paste_gate, resolve_ref_url, rotate_audit_if_needed,
+    prompt_landed, prompt_wait_detected, resolve_paste_gate, resolve_ref_url, rotate_audit_if_needed,
     sanitize_attachment_ext, should_confirm_copilot_autopilot, should_flush_before_paste,
     should_notify_paste_held, should_notify_unconfirmed, single_pane_autopilot_flags,
     spawn_rate_exceeded, spawn_request_expired, strip_ansi, submit_confirmed, submit_sequence,
@@ -618,30 +618,206 @@ fn should_flush_only_on_the_stranded_text_signature() {
     assert!(should_flush_before_paste(Some(false), false));
 }
 
+// ── Submit-landed signal (#112) ────────────────────────────────────────────
+//
+// The prompt every fixture below is a delivery of. Distinctive and well over the
+// needle floor, and not `/`-led so a merge with a human `/model` can be told
+// apart from a clean landing.
+const DELIVERED: &str = "Investigate the flaky auth test and post your findings as a comment";
+
+// Pane tails are ANSI-stripped shapes exactly as `deliver_prompt` feeds them to
+// the signal (it runs `strip_ansi` before the check). Claude Code frames its
+// input box with rounded borders and renders a submitted prompt above the box as
+// a `>`-led user turn; the fixtures reproduce that structure.
+
+/// BEFORE Enter: our pasted prompt is sitting in the input box, unsubmitted.
+const BOX_SITTING: &str = "\
+╭────────────────────────────────────────────────────────────╮
+│ > Investigate the flaky auth test and post your findings as a comment │
+╰────────────────────────────────────────────────────────────╯
+  ? for shortcuts";
+
+/// AFTER a real landing: the prompt left the box and now reads as a committed
+/// user turn above a freshly-emptied input box, with the turn under way.
+const LANDED: &str = "\
+> Investigate the flaky auth test and post your findings as a comment
+
+⏺ I'll start by locating the failing test…
+
+╭────────────────────────────────────────────────────────────╮
+│ > Try \"fix the build\"                                       │
+╰────────────────────────────────────────────────────────────╯
+  ? for shortcuts";
+
+/// Live false-confirm #1: a delivery merged with a human-typed `/model` and was
+/// submitted as `/modelRun Investigate…`. BEFORE, the box holds the merged line.
+const BOX_SITTING_MERGED: &str = "\
+╭────────────────────────────────────────────────────────────╮
+│ > /modelRun Investigate the flaky auth test and post your findings as a comment │
+╰────────────────────────────────────────────────────────────╯
+  ? for shortcuts";
+
+/// …and AFTER Enter the CLI repaints an "Unknown command" error: the box cleared
+/// and >24 bytes were painted (which is why the byte heuristic false-confirmed),
+/// but no `>`-led turn carries our prompt — it did not enter the conversation.
+const UNKNOWN_COMMAND: &str = "\
+> /modelRun Investigate the flaky auth test and post your findings as a comment
+
+⎿  Unknown command: /modelRun Investigate the flaky auth test and post your findings as a comment
+
+╭────────────────────────────────────────────────────────────╮
+│ > Try \"fix the build\"                                       │
+╰────────────────────────────────────────────────────────────╯
+  ? for shortcuts";
+
+/// Live false-confirm #2: an open `/model` picker absorbs the paste (into its
+/// filter) and the Enter (selecting a row). BEFORE, our text is the dialog
+/// filter; the dialog — not the input box — is the bottom-most framed region.
+const MODEL_DIALOG_FILTER: &str = "\
+╭─ Select model ──────────────────────────────────────────────╮
+│ > Investigate the flaky auth test and post your findings as a comment │
+│ ❯ Sonnet 5                                                   │
+│   Opus 4.8                                                   │
+╰──────────────────────────────────────────────────────────────╯";
+
+/// …and AFTER Enter the dialog is still up (or reselected): no committed user
+/// turn ever carried our prompt.
+const MODEL_DIALOG_AFTER: &str = "\
+╭─ Select model ──────────────────────────────────────────────╮
+│ ❯ Sonnet 5                                                   │
+│   Opus 4.8                                                   │
+│   Haiku 4.5                                                  │
+╰──────────────────────────────────────────────────────────────╯";
+
+/// Repaint noise: a spinner / statusline tick after Enter grows the byte total,
+/// but the prompt is STILL sitting in the box — the Enter was ignored.
+const SPINNER_TICK_SITTING: &str = "\
+╭────────────────────────────────────────────────────────────╮
+│ > Investigate the flaky auth test and post your findings as a comment │
+╰────────────────────────────────────────────────────────────╯
+  ⠹ 12s · esc to interrupt";
+
 #[test]
-fn submit_confirmed_needs_a_real_output_burst() {
-    // Pane reached quiet before Enter (reached_quiet = true):
-    // No / trivial growth after Enter -> not confirmed (an ignored key, or idle
-    // cursor-blink noise, must not read as a landed submit).
-    assert!(!submit_confirmed(true, 1000, 1000));
-    assert!(!submit_confirmed(true, 1000, 1010));
-    // A burst clearing the threshold -> confirmed.
-    assert!(submit_confirmed(true, 1000, 1024));
-    assert!(submit_confirmed(true, 1000, 100_000));
-    // Totals never go backwards, but a wrapped/garbage reading must not panic
-    // or false-confirm.
-    assert!(!submit_confirmed(true, 1000, 500));
+fn submit_confirmed_on_a_real_landing() {
+    // The box→committed-turn transition is the confirm: our prompt left the box
+    // and reads as a `>`-led user turn above a freshly-emptied box.
+    assert!(
+        submit_confirmed(true, BOX_SITTING, LANDED, DELIVERED),
+        "a prompt that left the box and became a committed user turn must confirm"
+    );
+}
+
+#[test]
+fn submit_not_confirmed_on_the_live_false_confirm_cases() {
+    // #112 case 1: an "Unknown command" error repaint clears the box and paints
+    // >24 bytes (the old heuristic confirmed here), but our prompt never entered
+    // the conversation — the swallowed slash-command is not a `>`-led turn
+    // carrying our text.
+    assert!(
+        !submit_confirmed(true, BOX_SITTING_MERGED, UNKNOWN_COMMAND, DELIVERED),
+        "an Unknown-command error repaint must not confirm"
+    );
+    // #112 case 2: an open /model dialog absorbs the paste + Enter. No user turn
+    // is ever committed, so nothing confirms.
+    assert!(
+        !submit_confirmed(true, MODEL_DIALOG_FILTER, MODEL_DIALOG_AFTER, DELIVERED),
+        "a dialog absorbing the paste + Enter must not confirm"
+    );
+}
+
+#[test]
+fn submit_not_confirmed_on_tui_repaint_noise() {
+    // A spinner / statusline tick grows the byte total while the prompt is still
+    // sitting in the box: the box still holds it, so the box-veto blocks confirm.
+    assert!(
+        !submit_confirmed(true, BOX_SITTING, SPINNER_TICK_SITTING, DELIVERED),
+        "a spinner/statusline tick with the prompt still in the box must not confirm"
+    );
+    // An Enter that changed nothing (box unchanged) is likewise not a landing.
+    assert!(
+        !submit_confirmed(true, BOX_SITTING, BOX_SITTING, DELIVERED),
+        "an unchanged box (ignored Enter) must not confirm"
+    );
 }
 
 #[test]
 fn submit_never_confirmed_when_quiet_was_not_reached() {
     // rev-32: on a busy pane the submit-wait hits SUBMIT_MAX_WAIT without ever
-    // reaching quiet, so the Enter lands mid-stream. Even a large burst is that
-    // ongoing stream, not the submit — it must NOT confirm, else the prompt is
-    // stranded but recorded confirmed and the next delivery skips the flush.
-    assert!(!submit_confirmed(false, 1000, 100_000));
-    assert!(!submit_confirmed(false, 1000, 1024));
-    assert!(!submit_confirmed(false, 1000, 1000));
+    // reaching quiet, so the Enter lands mid-stream and any change is that stream,
+    // not the submit. Even the otherwise-confirming landing must NOT confirm —
+    // else the prompt is stranded but recorded confirmed and the next delivery
+    // skips the flush. A false "unconfirmed" is the harmless direction.
+    assert!(!submit_confirmed(false, BOX_SITTING, LANDED, DELIVERED));
+    assert!(!submit_confirmed(false, BOX_SITTING_MERGED, UNKNOWN_COMMAND, DELIVERED));
+}
+
+#[test]
+fn submit_never_false_confirms_across_non_landing_transitions() {
+    // The rev-32 property, swept over every non-landing shape: whatever the pane
+    // did after Enter, if the prompt did not become a committed user turn, the
+    // signal stays `unconfirmed`. Only the genuine landing (asserted separately)
+    // may confirm.
+    let non_landings: [(&str, &str, &str); 6] = [
+        ("ignored Enter", BOX_SITTING, BOX_SITTING),
+        ("spinner tick, still sitting", BOX_SITTING, SPINNER_TICK_SITTING),
+        ("unknown-command error", BOX_SITTING_MERGED, UNKNOWN_COMMAND),
+        ("model dialog absorbs it", MODEL_DIALOG_FILTER, MODEL_DIALOG_AFTER),
+        // Box empty both sides with no committed turn (nothing was ever sitting).
+        ("empty idle box", LANDED, LANDED),
+        // A blank/garbage pair must never panic or confirm.
+        ("blank pane", "", ""),
+    ];
+    for (name, before, after) in non_landings {
+        assert!(
+            !prompt_landed(before, after, DELIVERED),
+            "{name}: a non-landing transition must not confirm"
+        );
+    }
+}
+
+#[test]
+fn submit_not_confirmed_from_a_stale_scrollback_copy() {
+    // The #103 re-send path delivers the SAME prompt again. If a prior landing
+    // left an identical `> …` turn in scrollback, a later delivery that is itself
+    // swallowed (box empties, no NEW turn) must not borrow that stale copy as
+    // proof of landing. The "committed turn is new since BEFORE" clause blocks it.
+    let stale_then_sitting = format!(
+        "> {DELIVERED}\n\n⎿  (done)\n\n\
+         ╭──────────────────────────────────────────────────────────╮\n\
+         │ > {DELIVERED} │\n\
+         ╰──────────────────────────────────────────────────────────╯\n  ? for shortcuts"
+    );
+    let stale_then_swallowed = format!(
+        "> {DELIVERED}\n\n⎿  Unknown command\n\n\
+         ╭──────────────────────────────────────────────────────────╮\n\
+         │ > Try \"fix the build\" │\n\
+         ╰──────────────────────────────────────────────────────────╯\n  ? for shortcuts"
+    );
+    assert!(
+        !prompt_landed(&stale_then_sitting, &stale_then_swallowed, DELIVERED),
+        "a stale identical turn in scrollback must not confirm a swallowed re-send"
+    );
+}
+
+#[test]
+fn submit_unconfirmable_for_too_short_a_prompt() {
+    // A prompt too short to fingerprint distinctively (< the needle floor) can't
+    // be told from ambient output, so it stays unconfirmed even on an otherwise
+    // landing-shaped pane — the safe direction.
+    let tiny = "ok";
+    let landed_tiny = "\
+> ok
+
+⏺ working…
+
+╭──────────────╮
+│ > Try \"x\"    │
+╰──────────────╯";
+    let sitting_tiny = "\
+╭──────────────╮
+│ > ok         │
+╰──────────────╯";
+    assert!(!submit_confirmed(true, sitting_tiny, landed_tiny, tiny));
 }
 
 #[test]

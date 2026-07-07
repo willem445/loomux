@@ -412,8 +412,9 @@ to actually do) with the orchestrator.
 The watchdog catches an agent that goes wholly silent; this closes the tighter loop where a
 single prompt *lands in the box but never submits* and the orchestrator, having gotten an
 immediate-success `send_prompt` result (delivery is async), carries on none the wiser. It
-rides #99's per-delivery `submit_confirmed` signal (the pane going quiet then bursting as the
-box clears) rather than making the orchestrator poll terminals by hand.
+rides the per-delivery `submit_confirmed` signal (the prompt leaving the box and reappearing
+as a committed user turn — see [Submit-landed signal (#112)](#submit-landed-signal-112))
+rather than making the orchestrator poll terminals by hand.
 
 - **The trigger.** When a delivery thread finishes with `confirmed == false`, it calls
   `notify_unconfirmed_delivery` off the outcome it recorded. The gate is the pure
@@ -495,8 +496,77 @@ an empty box and holds/aborts rather than merge-submitting.
     emptied that way still reads as pending until the bounded abort.
 
   The guard errs toward the safe hold in the common case; this is the paste-path guard only — the
-  confirm-window semantics (`submit_confirmed` and false-confirm handling) are #112, deliberately
-  untouched here.
+  confirm-window semantics (`submit_confirmed` and false-confirm handling) are the
+  [Submit-landed signal (#112)](#submit-landed-signal-112) below.
+
+## Submit-landed signal (#112)
+
+The confirm that feeds the delivery feedback loop asks one question: *did the prompt actually
+enter the conversation?* The first cut (#99) answered it by byte count — any ≥24 bytes of output
+in the 600 ms after Enter counted as landed. But a TUI CLI repaints on things that are **not** a
+landed prompt: an error message, a dialog interaction, a spinner or statusline tick. So the byte
+heuristic false-confirmed exactly the stuck-prompt cases #103 exists to catch, and the
+unconfirmed notice never fired. Two were caught live (2026-07-06): a delivery that merged with a
+human-typed `/model` and was submitted as `Unknown command: /modelRun …` (the error repaint
+cleared the floor), and an open `/model` picker that absorbed the paste + Enter.
+
+The signal now reads the ANSI-stripped pane instead of counting bytes, and confirms on the
+**box → committed-turn transition**: a landed submit makes the pasted text *leave* the input box
+and *reappear above it* as a `>`-led user turn. Everything else — an ignored Enter, an error
+repaint, a dialog, a spinner tick — fails at least one half of that transition and stays
+`unconfirmed`.
+
+- **The decision — `prompt_landed(before, after, prompt)`.** `before` is the ANSI-stripped pane
+  tail snapshotted just before the first Enter (our paste sitting in the box); `after` is polled
+  across the confirm window. It fingerprints the prompt into a normalised `needle` (frame glyphs
+  dropped, whitespace collapsed, lower-cased, capped) and requires **all four**:
+  1. `before` still holds the needle in the input box — our paste is really there to confirm.
+  2. `after` no longer holds it in the box — it left.
+  3. `after` has a committed `>`-led user turn whose text *starts with* the needle — positive
+     evidence it entered the conversation.
+  4. that committed turn is **not already in `before`** — it appeared because of *this* Enter.
+- **Why each clause, against the live cases.**
+  - The **box region** is everything from the pane's last box top-border (`╭`/`┌`/`╔`) downward,
+    so a prompt that wrapped to many rows inside the box is wholly contained — clause 2 can't miss
+    a still-sitting prompt (the spinner-tick and ignored-Enter cases both fail here).
+  - The `>`-**anchored, needle-*leading*** commit check (clause 3) is what rejects the
+    "Unknown command" repaint: `Unknown command: /modelRun <prompt>` contains the prompt text but
+    is not a `>`-led turn that *starts* with it (the `/modelRun` prefix pushes the needle off the
+    line start), and the merged `> /modelRun …` turn doesn't start with the clean needle either.
+    A `/model` dialog has no committed user turn at all.
+  - Clause 4 defeats the **stale-scrollback** trap on the #103 re-send path: a prior landing of
+    the *same* prompt leaves an identical `> …` turn in scrollback; without "new since `before`",
+    a later delivery that is itself swallowed (box empties, no *new* turn) would borrow that stale
+    copy as proof. The cost — a re-send of an *identical* prompt that genuinely lands while its
+    stale twin is still on screen stays `unconfirmed` — is the harmless direction.
+- **rev-32 preserved.** Confirm still requires the pane reached quiet *before* Enter
+  (`reached_quiet`); a cap-hit-without-quiet is never confirmed. Every ambiguous case resolves to
+  `unconfirmed`, whose worst case is one spurious #103 notice or a no-op stranded-flush next
+  delivery — never a false confirm that strands a prompt recorded as landed.
+- **Pure and unit-tested.** `prompt_landed` and its helpers are DOM-free/PTY-free; the delivery
+  thread only snapshots `before`, presses Enter, and polls `after`. Tests cover both live
+  false-confirm cases, spinner/statusline repaint noise, the stale-scrollback re-send, an
+  unfingerprintable (too-short) prompt, the never-confirm-without-quiet rule, and the genuine
+  landing.
+- **Known gaps (all conservative — they lose confirmations, never gain false ones).** A CLI that
+  *collapses* a long bracketed paste to a placeholder (`[Pasted text +N lines]`) instead of
+  echoing the literal text in the box fails clause 1, so that delivery stays `unconfirmed` (a
+  #103 notice, not a false confirm). A frameless CLI (bare `> ` prompt, no border) falls back to
+  treating the last few lines as the box; a frameless prompt that hard-wrapped above that window
+  is the one shape where clause 2 could under-detect — the two shipped CLIs (Claude Code, Copilot)
+  both frame their input box, so this is a documented edge, not a live path.
+- **The #111 residual, and why the paste guard is left alone.** #111 fenced two residual classes
+  to this issue. The *availability* residuals (a stuck `input_pending` after Esc/Ctrl-W/Ctrl-K/
+  backspace-to-empty) would need the paste guard to read the box as *empty* — but Claude Code's
+  idle box paints a **dimmed placeholder** (`Try "fix the build"`) whose dim attribute is
+  stripped with the rest of the ANSI, leaving it indistinguishable *by content* from a typed
+  line. A box-emptiness read that mistook the placeholder for empty would let a paste merge onto a
+  human's sitting line — the exact #111 harm, and its *dangerous* direction. Since `#112`'s
+  needle-based read fingerprints a *specific* known string (our prompt) rather than judging
+  general emptiness, it can't safely answer the guard's "is the box empty?" question, so the
+  guard is deliberately left on its keystroke-classification signal (bounded by the 60 s
+  abort → held-notice → re-send). The soft-newline *false-negative* residual is orthogonal to the
+  confirm window and likewise untouched here.
 
 ## Attention routing (#6) & interactive-question detection (#40)
 
