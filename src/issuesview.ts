@@ -35,6 +35,7 @@ import {
   validateComment,
   type ViewMode,
 } from "./issuesmodel";
+import { RefreshGate } from "./refreshgate";
 
 // gh.rs surfaces its bare "gh-not-found" sentinel from every command, not just
 // auth status (a gh removed mid-session) — map it to the install hint wherever
@@ -122,7 +123,10 @@ export class IssuesView {
   /** Issue numbers with a label-write in flight (buttons disabled meanwhile). */
   private busy = new Set<number>();
 
-  private refreshing = false;
+  /** Loss-safe single-flight guard for refresh(): a call arriving mid-fetch is
+   *  coalesced into one trailing re-fetch so a mode switch never strands the new
+   *  mode on stale/empty data (PR #136 review). */
+  private refreshGate = new RefreshGate();
   private disposed = false;
   private toastTimer: number | undefined;
 
@@ -263,8 +267,13 @@ export class IssuesView {
   // ---------- data ----------
 
   private async refresh(): Promise<void> {
-    if (this.disposed || this.refreshing) return;
-    this.refreshing = true;
+    if (this.disposed) return;
+    // Single-flight, but loss-safe: if a fetch is already in flight, the gate
+    // records that we must run again (a mode switch, a manual ↻) and the
+    // in-flight run re-fires refresh() on completion — so a switch never ends on
+    // the previous mode's stale/empty data. Any number of dropped calls collapse
+    // into one trailing re-fetch.
+    if (!this.refreshGate.begin()) return;
     this.setBusyBtn(this.refreshBtn, true);
     try {
       const cwd = this.host.getCwd();
@@ -329,6 +338,11 @@ export class IssuesView {
           this.prs = await ghPrList(root);
         }
       } catch (err) {
+        // Drop a stale failure too: a fetch that errored for the mode we've
+        // since left must not paint its error over the new mode (mirror of the
+        // success-path guard below); the trailing re-fetch will refresh the
+        // current mode.
+        if (this.disposed || this.mode !== mode) return;
         this.setBlank(
           `Could not list ${mode === "issues" ? "issues" : "pull requests"}:\n${ghErrText(err)}`
         );
@@ -341,8 +355,10 @@ export class IssuesView {
       this.renderHead();
       this.renderList();
     } finally {
-      this.refreshing = false;
       this.setBusyBtn(this.refreshBtn, false);
+      // If a call was dropped while we were fetching (e.g. a mode switch), run
+      // exactly once more — now reading the current mode.
+      if (this.refreshGate.end() && !this.disposed) void this.refresh();
     }
   }
 
