@@ -1,6 +1,6 @@
 // Per-pane GitHub issues view: lists the repo's open issues, creates new ones,
 // and toggles the orchestrator go-signal labels (agent-ready /
-// agent-investigate). Toggled over the terminal like the git view; owns no PTY
+// agent-investigation). Toggled over the terminal like the git view; owns no PTY
 // state and NEVER resizes it (hard constraint 1). All GitHub access goes
 // through the typed src/issues.ts wrappers against the repo root resolved from
 // the pane's live cwd — the same availability model as the git view.
@@ -26,6 +26,15 @@ import {
   labelDelta,
   validateNewIssue,
 } from "./issuesmodel";
+
+// gh.rs surfaces its bare "gh-not-found" sentinel from every command, not just
+// auth status (a gh removed mid-session) — map it to the install hint wherever
+// an error is rendered, mirroring the git-not-found handling in refresh().
+function ghErrText(err: unknown): string {
+  return String(err) === "gh-not-found"
+    ? "GitHub CLI (gh) was not found on PATH — install it from https://cli.github.com."
+    : String(err);
+}
 
 export interface IssuesViewHost {
   /** The pane's live working directory (from shell integration). */
@@ -270,7 +279,7 @@ export class IssuesView {
       try {
         issues = await ghIssueList(root);
       } catch (err) {
-        this.setBlank(`Could not list issues:\n${String(err)}`);
+        this.setBlank(`Could not list issues:\n${ghErrText(err)}`);
         return;
       }
       if (this.disposed) return;
@@ -432,7 +441,7 @@ export class IssuesView {
         );
       }
     } catch (err) {
-      this.toast(String(err));
+      this.toast(ghErrText(err));
     } finally {
       this.busy.delete(issue.number);
       this.renderList();
@@ -518,7 +527,7 @@ export class IssuesView {
       this.toast(`Created #${created.number}`, "ok");
       await this.refresh();
     } catch (err) {
-      this.toast(String(err));
+      this.toast(ghErrText(err));
       this.setBusyBtn(submit, false);
     }
   }
