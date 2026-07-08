@@ -1386,7 +1386,11 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   font-size: 9.5px; font-weight: 600; border-radius: 4px; padding: 1px 7px;
   background: rgba(224, 175, 104, 0.16); color: #e0af68;
 }
-.group-list { flex: 1; overflow-y: auto; padding: 4px 0 8px; }
+/* The roster is the ONLY shrinkable element: min-height:0 lets it collapse and
+   scroll so the fixed chrome above (header/summary/max/autonomous) and the
+   footer below always render — nothing clips under .group-view's overflow:hidden
+   (#83 rev-58). The clamp floor guarantees a sliver of it stays visible. */
+.group-list { flex: 1; min-height: 0; overflow-y: auto; padding: 4px 0 8px; }
 .group-list::-webkit-scrollbar { width: 9px; }
 .group-list::-webkit-scrollbar-thumb {
   background: #262634; border-radius: 5px;

@@ -60,3 +60,13 @@ test("custom min/reserve are honored", () => {
   assert.equal(clampOverlayHeight(50, 500, 200, 120), 200); // below custom floor
   assert.equal(clampOverlayHeight(500, 500, 200, 120), 380); // capped at 500-120
 });
+
+test("a measured chrome floor keeps every control on-screen (rev-58)", () => {
+  // The group panel passes its measured fixed-chrome height (header + summary +
+  // max + autonomous + footer) plus a roster sliver as the floor. A collapse
+  // drag can't shrink below it, so the footer (End orchestration) never clips.
+  const chromeFloor = 232; // e.g. ~184px of fixed chrome + a 48px roster sliver
+  assert.equal(clampOverlayHeight(0, TALL, chromeFloor), chromeFloor);
+  assert.equal(clampOverlayHeight(OVERLAY_MIN_H, TALL, chromeFloor), chromeFloor); // baseline < chrome → chrome wins
+  assert.equal(clampOverlayHeight(400, TALL, chromeFloor), 400); // above the floor: unchanged
+});

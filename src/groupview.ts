@@ -44,6 +44,11 @@ const MAX_MAX_AGENTS = 12;
  *  and roster drift). Matches the audit viewer's follow cadence. */
 const POLL_MS = 2000;
 
+/** Roster height kept visible at the panel's minimum height — about two rows,
+ *  so at the collapse floor the list is present (and scrolls) rather than gone,
+ *  while the fixed chrome and footer stay fully rendered (#83 rev-58). */
+const MIN_ROSTER_SLIVER = 48;
+
 function el(tag: string, cls: string, text?: string): HTMLElement {
   const e = document.createElement(tag);
   e.className = cls;
@@ -130,10 +135,16 @@ export class GroupView {
   private endArmed = false;
   private endArmTimer: number | undefined;
 
+  /** Notified after each render (content height may have changed — e.g. the
+   *  suspended banner appeared), so the host can re-apply the overlay height
+   *  clamp and keep every control on-screen. */
+  private onResize?: () => void;
+
   constructor(
     private groupId: string,
-    opts: { onClose: () => void; onToggleMinimize?: () => void }
+    opts: { onClose: () => void; onToggleMinimize?: () => void; onResize?: () => void }
   ) {
+    this.onResize = opts.onResize;
     this.el = el("div", "group-view");
 
     const head = el("div", "group-head");
@@ -563,6 +574,28 @@ export class GroupView {
       : "Turn on OS toasts for reports and idle-with-prompt panes in this group";
 
     this.renderAutonomy();
+
+    // Content height may have changed (roster size, suspended banner) — let the
+    // host re-clamp the overlay so no control is pushed under overflow:hidden.
+    this.onResize?.();
+  }
+
+  /** The minimum overlay-content height at which every fixed control row renders
+   *  and a sliver of roster remains — so `.group-view`'s `overflow:hidden` never
+   *  clips a control (footer End/Pause, the suspended banner, #83 rev-58).
+   *  MEASURED, not guessed: sums the live heights of every child except the
+   *  scrollable roster (and the absolutely-positioned toast). The autonomous
+   *  row's height already includes the suspended banner when it's showing, so
+   *  the floor grows to fit it. Returns 0 before the panel is laid out (heights
+   *  unknown); the caller floors it against a baseline minimum. */
+  minChromeHeight(): number {
+    let fixed = 0;
+    for (const child of Array.from(this.el.children) as HTMLElement[]) {
+      if (child === this.listEl || child === this.toastEl) continue;
+      fixed += child.offsetHeight;
+    }
+    if (fixed === 0) return 0; // not laid out yet
+    return fixed + MIN_ROSTER_SLIVER;
   }
 
   /** Sync the autonomous-mode controls, budget meter, and suspended banner to
