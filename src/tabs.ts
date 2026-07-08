@@ -10,7 +10,7 @@
 // generic over the minimal `ManagedWorkspace` surface, so tests drive it with a
 // lightweight fake and production plugs in the real Grid-backed Workspace.
 
-import type { TabAttn } from "./tabroute";
+import type { TabAttn, PreviewNode } from "./tabroute";
 import type { PersistedTabs } from "./tabstore";
 
 /** The minimal surface TabManager needs from a workspace. `Workspace`
@@ -29,12 +29,13 @@ export interface ManagedWorkspace {
   setVisible(visible: boolean): void;
   /** Focus the workspace's active pane — called when a tab becomes active. */
   focus(): void;
-  /** Serialize the preview pane's FULL viewport right now, for a live hover
-   *  thumbnail (#63 finding 2). Reads the in-memory xterm buffer (which keeps
-   *  updating while hidden), so it works with zero layout and no PTY resize —
-   *  the tab bar re-calls it on a short interval while hovered for a live view.
-   *  May contain ANSI escapes the tab bar strips. "" when there's no pane. */
-  livePreview(): string;
+  /** Snapshot the tab's whole split layout for a live hover thumbnail (#63
+   *  findings 2/3): the split tree with EVERY pane's serialized-HTML viewport at
+   *  the leaves. Reads the in-memory xterm buffers (which keep updating while
+   *  hidden), so it works with zero layout and no PTY resize — the tab bar
+   *  re-calls it on a short interval while hovered for a live view, and renders
+   *  it SAFELY (spans → textContent). Null when the tab has no panes. */
+  previewLayout(): PreviewNode | null;
   /** Tear the workspace down and kill its panes' PTYs (tab closed). */
   dispose(): void;
 }

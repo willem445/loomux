@@ -666,12 +666,20 @@ export class Pane implements VoiceTargetPane {
     }
   }
 
-  /** A text snapshot of the terminal viewport, for a background tab's preview
-   *  thumbnail (#63 phase 4). Serializes the in-memory buffer (NOT the DOM), so
-   *  it works while the pane is hidden/zero-width — the whole point: a preview
+  /** An HTML snapshot of the terminal viewport, for a background tab's preview
+   *  thumbnail (#63 finding 2/3). Serializes the in-memory buffer (NOT the DOM),
+   *  so it works while the pane is hidden/zero-width — the whole point: a preview
    *  must never require a laid-out element, which would re-arm applyFit and fire
-   *  a PTY resize. Returns "" if serialization isn't available. */
-  serializeViewport(): string {
+   *  a PTY resize.
+   *
+   *  serializeAsHTML (not serialize): the string serializer emits cursor-forward
+   *  escapes (`ESC[nC`) to skip blank cells, which stripping collapses runs of
+   *  spaces ("Please count" → "Pleasecount", #63 finding 3). The HTML serializer
+   *  emits a literal space per blank cell and per-run `<span style='color:…'>`,
+   *  so the preview keeps spacing AND color. The caller parses this SAFELY (spans
+   *  → textContent + whitelisted styles), never innerHTML — the addon does not
+   *  escape cell text. Returns "" if serialization isn't available. */
+  serializeViewportHtml(): string {
     if (this.disposed) return "";
     try {
       if (!this.serializer) {
@@ -679,7 +687,7 @@ export class Pane implements VoiceTargetPane {
         this.term.loadAddon(this.serializer);
       }
       // scrollback: 0 → just the visible screen, which is all a thumbnail shows.
-      return this.serializer.serialize({ scrollback: 0 });
+      return this.serializer.serializeAsHTML({ scrollback: 0 });
     } catch {
       return "";
     }

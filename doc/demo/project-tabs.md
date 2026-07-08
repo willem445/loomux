@@ -10,6 +10,16 @@
 > preview is now the **full viewport, live** (re-serialized ~700ms while hovered)
 > instead of a clipped snapshot; (3) a **new tab opens the real starting surface**
 > (terminal / launcher) instead of blank.
+>
+> **Round 3 (preview re-demo):** (1) the preview no longer **sticks** — it
+> dismisses on tab click/activate, on leaving the tab strip, and on Escape;
+> (2) it now **composites EVERY pane** in the tab, arranged like the split layout
+> (each mini-pane titled, content scaled to fit its cell, capped at 8 panes);
+> (3) **spacing and color are fixed** — it renders `serializeAsHTML` (literal
+> spaces + per-run colors) instead of the string serializer whose cursor-forward
+> escapes were collapsing spaces (`Please count` → `Pleasecount`); the HTML is
+> rebuilt **safely** (spans → `textContent` + whitelisted styles, never
+> `innerHTML`).
 
 ## What this is
 
@@ -32,8 +42,8 @@ tested pieces:
 | Piece | File | Role |
 | --- | --- | --- |
 | `TabManager` | `src/tabs.ts` | Ordered tab list, active tab, never-zero-tabs, phase-3 routing seams. DOM-free / unit-tested. |
-| `Workspace` | `src/workspace.ts` | One tab = a `Grid` + its own dock; hides via `display:none`, drops WebGL when hidden, serializes its preview pane's full viewport on demand. |
-| `TabBar` | `src/tabbar.ts` | The tab strip: switch, close, new (+ → real starting surface), rename, color, **alert chip**, status chip, **live** hover thumbnail, right-click pause menu. |
+| `Workspace` | `src/workspace.ts` | One tab = a `Grid` + its own dock; hides via `display:none`, drops WebGL when hidden, composites its whole layout (`previewLayout`) for the preview. |
+| `TabBar` | `src/tabbar.ts` | The tab strip: switch, close, new (+ → real starting surface), rename, color, **alert chip**, status chip, **live multi-pane composite** hover preview (safe HTML render), right-click pause menu. |
 | wiring | `src/main.ts` | The old module-scope single `grid` is gone; everything acts on `tabs.activeWorkspace.grid`. Owns the `OrchWiring` router, `openUserTab`, and persistence. |
 | shortcuts | `src/shortcuts.ts` | new / close / next / prev tab. |
 | fit guard | `src/panefit.ts` | The pure, tested "hidden ⇒ no resize" decision. |
@@ -101,14 +111,14 @@ any zero-width pane. This is the exact maximize precedent, now covering tabs.
 
 13. A project tab shows a live **status chip**: `✦<agents> · $<cost>` from the
     group summary/usage, refreshed on a timer.
-14. Hover a **background** tab → a **live thumbnail** of its **full viewport**
-    (finding 2). It re-serializes the pane's in-memory buffer every ~700ms while
-    you hover, so a **currently-running prompt streams in** as you watch. The
-    whole viewport is rendered (all rows/cols) and CSS-scaled to fit — no
-    clipping. It shows the pane that **needs attention** if any, else the active
-    pane. It is still a serialized-text snapshot, **never a laid-out pane** (xterm
-    keeps processing writes into its buffer while hidden, so no layout and no PTY
-    resize is ever armed — the invariant holds).
+14. Hover a **background** tab → a **live composite thumbnail** of the whole tab
+    (findings 2/3). It arranges **every pane** like the tab's split layout (each
+    mini-pane titled, scaled to fit its cell; capped at 8 panes, extras shown as
+    a titled placeholder), **with terminal colors and correct spacing**, and
+    re-serializes every ~700ms so a **running prompt streams in** as you watch.
+    It reads the in-memory buffers (which keep filling while hidden), so it's
+    **never a laid-out pane** — no layout, no PTY resize; the invariant holds.
+    Move off the tab, click it, or press **Escape** to dismiss (no sticking).
 15. **Right-click** a project tab → **Pause project** / **Resume project**
     (`pauseGroup`/`resumeGroup`) to hold or resume prompt delivery and contain
     unattended spend; a paused tab shows a **⏸**. The menu also has rename/close.
@@ -124,9 +134,13 @@ any zero-width pane. This is the exact maximize precedent, now covering tabs.
   reconnects when you restore that group's session from the session browser
   (which now routes into the correct tab). Full layout persistence is out of
   scope for the prototype.
-- **Preview is text, not pixels.** The live thumbnail strips ANSI (colors) and
-  renders the full viewport as scaled monospace text — the content and layout of
-  the screen, not a pixel/color-accurate mini-terminal.
+- **Preview is scaled text, not a real terminal.** The composite renders each
+  pane's serialized viewport as colored, scaled monospace text arranged by the
+  split layout — faithful to content, colors, and spacing, but not a
+  pixel-perfect terminal (no cursor, no live redraw animations; a ~700ms
+  refresh). Serialization is capped at **8 panes** per tab; docked (minimized)
+  panes aren't shown. Injected `<`/`&` in cell text may shift a row slightly
+  (parsed detached, rebuilt via `textContent` — never a security issue).
 - **Background tabs created while hidden keep a WebGL context** until first
   shown-then-hidden; hidden *active-then-switched* tabs drop it immediately.
   A minor resource nicety, not a correctness issue.
@@ -148,7 +162,17 @@ any zero-width pane. This is the exact maximize precedent, now covering tabs.
   **background** tab → that tab shows `⚠ blocked`/`⚠ waiting` + pulse within one
   attention scan (~3s). Also fire it in a plain shell (a CLI waiting on input) to
   confirm non-agent panes badge too.
-- **Live preview (finding 2):** hover a background tab running a streaming
+- **Live preview (round 2):** hover a background tab running a streaming
   command → the thumbnail updates as output arrives, showing the whole screen.
-- **New tab (finding 3):** Ctrl+Shift+T / **+** in plain mode → a terminal
+- **New tab (round 2):** Ctrl+Shift+T / **+** in plain mode → a terminal
   appears immediately; in agent mode → the launcher appears immediately.
+- **Preview no longer sticks (round 3):** hover a background tab to show its
+  preview, then **click that tab** → the preview vanishes as the tab activates
+  (was left hanging over the now-active tab). Also confirm it dismisses on
+  moving off the strip and on **Escape**.
+- **Multi-pane composite (round 3):** split a background tab into several panes
+  (some side-by-side, some stacked) → the preview shows all of them arranged
+  like the real layout, each titled.
+- **Spacing + color (round 3):** in a background tab, print `echo "Please count
+  to 10 this is good"` (or hover a colored agent prompt) → the preview shows the
+  spaces intact and the colors (was `Pleasecountto10`, monochrome).

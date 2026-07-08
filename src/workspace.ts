@@ -8,9 +8,14 @@
 // constraint 1). Panes are NEVER detached on hide — detaching would lose
 // scrollback beyond the backend's ring — only hidden.
 
-import { Grid } from "./grid";
-import type { Pane } from "./pane";
+import { Grid, type GridLayoutNode } from "./grid";
 import type { ManagedWorkspace } from "./tabs";
+import type { PreviewNode } from "./tabroute";
+
+/** Cap on panes serialized per preview refresh — serializing every pane every
+ *  ~700ms would get expensive on a huge grid. Panes past the cap render as a
+ *  titled placeholder (#63 finding 2). */
+const PREVIEW_PANE_CAP = 8;
 
 export class Workspace implements ManagedWorkspace {
   /** Container in the workspace stack; hidden with display:none when inactive. */
@@ -74,18 +79,23 @@ export class Workspace implements ManagedWorkspace {
     this.grid.activePane?.focus();
   }
 
-  /** The pane a hover thumbnail shows: prefer one that needs the human (that's
-   *  what you'd want to peek at), else the active pane, else the first. */
-  private previewPane(): Pane | null {
-    const panes = this.grid.allPanes();
-    return (
-      panes.find((p) => p.attention !== null) ?? this.grid.activePane ?? panes[0] ?? null
-    );
-  }
-
-  /** Serialize the preview pane's full current viewport (see ManagedWorkspace). */
-  livePreview(): string {
-    return this.previewPane()?.serializeViewport() ?? "";
+  /** Composite the whole tab: the split tree with every pane's serialized-HTML
+   *  viewport at the leaves, capped at PREVIEW_PANE_CAP panes (see
+   *  ManagedWorkspace). Reads the in-memory buffers, so it's valid while hidden. */
+  previewLayout(): PreviewNode | null {
+    const tree = this.grid.layoutSnapshot();
+    if (!tree) return null;
+    let budget = PREVIEW_PANE_CAP;
+    const map = (n: GridLayoutNode): PreviewNode => {
+      if (n.kind === "split") {
+        return { kind: "split", dir: n.dir, weight: n.weight, children: n.children.map(map) };
+      }
+      const capped = budget <= 0;
+      const html = capped ? "" : n.pane.serializeViewportHtml();
+      if (!capped) budget--;
+      return { kind: "leaf", weight: n.weight, title: n.pane.name, html, capped };
+    };
+    return map(tree);
   }
 
   dispose(): void {

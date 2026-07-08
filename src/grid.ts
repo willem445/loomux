@@ -33,6 +33,14 @@ interface SplitNode {
 
 type TreeNode = LeafNode | SplitNode;
 
+/** A pure, DOM-free description of the split layout, so a tab preview can
+ *  composite every pane arranged like the real layout without touching the live
+ *  (hidden, zero-width) elements (#63 finding 2). `weight` is the flex-grow the
+ *  node occupies in its parent split. */
+export type GridLayoutNode =
+  | { kind: "leaf"; weight: number; pane: Pane }
+  | { kind: "split"; dir: Dir; weight: number; children: GridLayoutNode[] };
+
 const MIN_PANE_PX = 80;
 /** Pixels the pointer must travel from the header press before a click turns
  *  into a drag — keeps taps (focus, dblclick-rename) from starting a drag. */
@@ -122,6 +130,20 @@ export class Grid {
    *  scans (e.g. attention routing) that must reach docked panes too. */
   allPanes(): Pane[] {
     return [...this.leaves.keys(), ...this.minimizedPanes];
+  }
+
+  /** A snapshot of the split tree (dir + flex weights + panes at the leaves),
+   *  for compositing a tab preview (#63 finding 2). Reads the in-memory tree and
+   *  the elements' flex-grow — never geometry — so it works while the whole tab
+   *  is hidden/zero-width. Minimized (docked) panes are outside the tree and so
+   *  aren't included. Null when the grid is empty. */
+  layoutSnapshot(): GridLayoutNode | null {
+    const walk = (n: TreeNode): GridLayoutNode => {
+      const weight = parseFloat(nodeEl(n).style.flexGrow || "1") || 1;
+      if (n.kind === "leaf") return { kind: "leaf", weight, pane: n.pane };
+      return { kind: "split", dir: n.dir, weight, children: n.children.map(walk) };
+    };
+    return this.root ? walk(this.root) : null;
   }
 
   findByPtyId(ptyId: number): Pane | undefined {
