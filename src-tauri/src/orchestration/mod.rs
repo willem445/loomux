@@ -1300,8 +1300,9 @@ pub enum GitTagPush {
 /// Classify a `git` argv for tag-push gating (#83). Pure over the args (git global
 /// options like `-C <dir>` / `-c <k=v>` are skipped to find the `push` command).
 /// A bare refspec is treated as a tag only when it matches the release pattern
-/// (`v` + digit — the `release.yml` trigger); the shim confirms ambiguous cases
-/// against the real git, but the classification here is the testable spec.
+/// (`v*` — the `release.yml` `on.push.tags` trigger; these MUST stay in sync);
+/// the shim confirms ambiguous cases against the real git, but the classification
+/// here is the testable spec.
 pub fn git_tag_push(args: &[String]) -> GitTagPush {
     let a: Vec<&str> = args.iter().map(String::as_str).collect();
     // Locate the git subcommand, skipping value-taking globals.
