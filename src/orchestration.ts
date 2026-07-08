@@ -135,10 +135,22 @@ export const setAutonomyBudget = (groupId: string, tokens: number): Promise<numb
   invoke<number>("orch_set_autonomy_budget", { groupId, tokens });
 
 /** The whole autonomous-mode panel state in one read: toggles, budget, its
- *  enable-time anchor, the spend metered since enable (`null` when off), and
- *  `suspended` (true when the budget enforcer turned autonomy off). */
+ *  enable-time anchor, the spend metered since enable (`null` when off),
+ *  `suspended` (budget enforcer turned autonomy off), and the idle-tick
+ *  observability (status, countdown, minutes/floor knobs). */
 export const autonomyState = (groupId: string): Promise<AutonomyState> =>
   invoke<AutonomyState>("orch_autonomy", { groupId });
+
+/** Set a group's idle-tick window in minutes (0 → backend default 5; clamped
+ *  1..1440; durable, audited). Resolves to the applied value. */
+export const setIdleTickMinutes = (groupId: string, minutes: number): Promise<number> =>
+  invoke<number>("orch_set_idle_tick_minutes", { groupId, minutes });
+
+/** Set a group's idle-tick activity floor in bytes — output below this per
+ *  interval counts as idle, making the quiet clock repaint-tolerant (0 → backend
+ *  default 2048; clamped 1..1MiB; durable, audited). Resolves to the applied value. */
+export const setIdleActivityFloor = (groupId: string, bytes: number): Promise<number> =>
+  invoke<number>("orch_set_idle_activity_floor", { groupId, bytes });
 
 /** Agent ids the backend cancelled via `orch-spawn-cancelled` (its bind wait
  *  timed out) whose pane may still be mid-open (#106). Consulted in

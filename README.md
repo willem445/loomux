@@ -598,6 +598,18 @@ meter at the current spend. The budget can also be pre-set at group creation via
 the launcher's **Autonomy budget** guardrail field, though autonomous mode still
 starts off until you enable it.
 
+The same section carries the idle-tick controls. An **Idle tick … min** knob
+sets how long the orchestrator's pane must be output-quiet before a tick fires
+(default 5, minimum 1) — drop it to 1 to see a tick promptly. A power-user
+**floor** knob (bytes; default 2048) sets how much pane output per interval still
+counts as idle, so a CLI's repaint/spinner noise doesn't keep resetting the quiet
+clock. While autonomous mode is on, a live **status line** tells you where the
+tick stands: *next tick in ~Xm Ys* (counting down), *tick imminent* (eligible
+now), *waiting (orchestrator recently active)* (it just did work — the clock
+resets), *hourly cap — next in ~X* (the per-hour tick cap is full), or
+*paused — ticks suspended*. A countdown is shown only when one genuinely exists,
+so the timer never lies about when the next tick lands.
+
 **Restart after loomux closes:** orchestration sessions are marked in the
 session browser (`ORCH` / `W` / `REV` chips). Clicking a dead group's
 orchestrator session restores the *whole* orchestration — same group id,

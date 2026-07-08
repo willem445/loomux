@@ -11,16 +11,35 @@
 //      get the negation right.
 //   2. The budget meter math (spend vs cap → fraction / percent / exhausted),
 //      mirroring the backend `autonomy_budget_exhausted` rule.
+//   3. The idle-tick status → human label mapping, including the null-countdown
+//      discipline: a countdown is rendered ONLY for the statuses the backend
+//      gives a real `eligible_in_secs` (counting_down / eligible / rate_capped);
+//      the others (starting / paused / waiting_for_activity) never show a number,
+//      even if one were passed — the whole point of the backend's rev-59 rework.
 //
 // Suspension is *not* reconstructed here: `orch_autonomy` reports it directly
 // via `suspended` (true iff the budget enforcer flipped autonomy off, from a
 // durable marker), so the panel just reads the flag.
 
+/** The idle-tick lifecycle status the backend surfaces (`tick_status`). Only
+ *  `counting_down` / `eligible` / `rate_capped` carry a real `eligible_in_secs`
+ *  countdown; the rest are gated by something other than time. */
+export type TickStatus =
+  | "off"
+  | "starting"
+  | "paused"
+  | "counting_down"
+  | "eligible"
+  | "waiting_for_activity"
+  | "rate_capped";
+
 /** The whole autonomous-mode panel state, as returned by `orch_autonomy`.
  *  `spend_since_enable_tokens` is null when autonomous is off (no live meter).
  *  `suspended` is true only while off, and only when the budget enforcer (not
  *  the user) turned autonomy off — so the UI can show a distinct exhausted
- *  state vs a plain toggle-off. */
+ *  state vs a plain toggle-off. The idle-tick fields drive the observability
+ *  line + the two knobs (`idle_tick_minutes`, `idle_activity_floor_bytes`);
+ *  `eligible_in_secs`/`quiet_secs` are null unless a live countdown exists. */
 export interface AutonomyState {
   autonomous: boolean;
   auto_merge: boolean;
@@ -28,6 +47,11 @@ export interface AutonomyState {
   budget_anchor_tokens: number;
   spend_since_enable_tokens: number | null;
   suspended: boolean;
+  idle_tick_minutes: number;
+  idle_activity_floor_bytes: number;
+  tick_status: TickStatus;
+  eligible_in_secs: number | null;
+  quiet_secs: number | null;
 }
 
 // ---------- auto-merge ⇔ require-approval inversion ----------
@@ -87,4 +111,48 @@ export function formatTokens(n: number): string {
   if (v < 1000) return `${v}`;
   if (v < 1_000_000) return `${(v / 1000).toFixed(v < 10_000 ? 1 : 0)}K`;
   return `${(v / 1_000_000).toFixed(2)}M`;
+}
+
+// ---------- idle-tick observability ----------
+
+/** Approximate human countdown: "~45s", "~3m", "~3m 20s". Floors negatives at 0. */
+export function formatCountdown(secs: number): string {
+  const s = Math.max(0, Math.round(secs));
+  if (s < 60) return `~${s}s`;
+  const m = Math.floor(s / 60);
+  const rem = s % 60;
+  return rem === 0 ? `~${m}m` : `~${m}m ${rem}s`;
+}
+
+/** The idle-tick status as a human line for the panel. Enforces the null-
+ *  countdown discipline: a time is rendered ONLY for `counting_down` and
+ *  `rate_capped` (which carry a real `eligibleInSecs`); `eligible` reads
+ *  "imminent" without a number; and `starting` / `paused` /
+ *  `waiting_for_activity` never show a countdown, even if a stray `eligibleInSecs`
+ *  is passed — those gates aren't time-based, so a ticking number there would
+ *  lie (the exact bug the backend rev-59 rework removed). Returns "" for `off`
+ *  (the caller hides the line when autonomy is off). */
+export function tickStatusLabel(status: TickStatus, eligibleInSecs: number | null): string {
+  switch (status) {
+    case "off":
+      return "";
+    case "starting":
+      return "starting…";
+    case "paused":
+      return "paused — ticks suspended";
+    case "eligible":
+      return "tick imminent";
+    case "waiting_for_activity":
+      return "waiting (orchestrator recently active)";
+    case "counting_down":
+      return eligibleInSecs == null
+        ? "counting down…"
+        : `next tick in ${formatCountdown(eligibleInSecs)}`;
+    case "rate_capped":
+      return eligibleInSecs == null
+        ? "hourly cap reached"
+        : `hourly cap — next in ${formatCountdown(eligibleInSecs)}`;
+    default:
+      return "";
+  }
 }
