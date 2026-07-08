@@ -630,9 +630,15 @@ release grant keeps publishing a deliberate human act.
   `view`/`list`/`download` pass through) — `gh_release_action`.
 - **git shim** (new, same PATH-injection as the gh shim) gates `git push` that publishes a tag:
   `--tags`/`--follow-tags`/`--mirror` (bulk → blocked, push the specific approved tag),
-  `refs/tags/<t>` and the `tag <t>` form (explicit), and a bare `v<digit>…` refspec **confirmed
-  a tag** against the real git (`git_tag_push`). Local `git tag` is harmless — only the **push**
-  reaches the world — and a plain branch push execs the real git with **zero** extra work.
+  `refs/tags/<t>` and the `tag <t>` form (explicit), and a bare **`v*`** refspec (any v-prefixed
+  ref) **confirmed a tag** against the real git (`git_tag_push`). The `v*` pattern **must track
+  `.github/workflows/release.yml`'s `on.push.tags`** (both `git_tag_push` and the shim carry a
+  comment saying so): they matched `v<digit>` at first, which let `vbeta`/`vRelease` publish yet
+  slip the gate (rev-86). Local `git tag` is harmless — only the **push** reaches the world — and
+  a plain branch push (or a non-`v*` ref like `nightly`, which release.yml ignores) execs the
+  real git with **zero** extra work. The gh scanner's value-flag skip list is complete for
+  `gh release create` (`--title`/`--notes`/`--target`/… consume their value) so a granted release
+  with `--title "…"` before the tag isn't misparsed and wrongly blocked.
 
 - **Honest bypass surface** (documented, not hidden). The shims raise the cost of an unattended
   bad merge/publish from "type one command" to "deliberately evade a named control," but a

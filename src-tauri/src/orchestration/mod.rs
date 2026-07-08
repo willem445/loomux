@@ -139,8 +139,8 @@ for tok in "$@"; do
     -R|--repo) want="repo"; continue ;;
     --repo=*) repo="${tok#--repo=}"; continue ;;
     -R?*) repo="${tok#-R}"; continue ;;
-    -b|--body|-t|--subject|-F|--body-file|--author-email|--match-head-commit|--notes|--notes-file|--target|--discussion-category) want="skip"; continue ;;
-    --body=*|--subject=*|--body-file=*|--author-email=*|--match-head-commit=*|--notes=*|--notes-file=*|--target=*|--discussion-category=*) continue ;;
+    -b|--body|-t|--subject|--title|-F|--body-file|--author-email|--match-head-commit|-n|--notes|--notes-file|--notes-start-tag|--target|--discussion-category) want="skip"; continue ;;
+    --body=*|--subject=*|--title=*|--body-file=*|--author-email=*|--match-head-commit=*|--notes=*|--notes-file=*|--notes-start-tag=*|--target=*|--discussion-category=*) continue ;;
     -*) continue ;;
     *)
       if [ -z "$cmd" ]; then cmd="$tok"
@@ -316,9 +316,11 @@ for tok in "$@"; do
       if [ "$prevtag" = "1" ]; then tag="$tok"; break; fi
       if [ "$tok" = "tag" ]; then prevtag=1; continue; fi
       dst=${tok##*:}; dst=${dst#+}
+      # Match release.yml's on.push.tags (v*) — MUST track it; a bare `v*` is only
+      # a candidate, confirmed a real tag (not a same-named branch) below.
       case "$dst" in
         refs/tags/*) tag=${dst#refs/tags/}; break ;;
-        v[0-9]*)
+        v*)
           if "$REAL_GIT" rev-parse -q --verify "refs/tags/$dst" >/dev/null 2>&1; then tag="$dst"; break; fi ;;
       esac ;;
   esac
@@ -1121,26 +1123,37 @@ pub enum GhGate {
     BlockUnverifiable,
 }
 
-/// The positional (non-flag) tokens of a gh argv, in order, skipping flags —
-/// crucially the global `-R/--repo <value>` that gh accepts BEFORE or BETWEEN the
-/// command and subcommand (rev-79 F1: `gh -R o/r pr merge` and `gh pr -R o/r merge`
-/// are everyday forms that must not slip the gate). `-R/--repo` in its
-/// space-separated form consumes its value; every other flag is treated as a
-/// boolean (the only value-taking flag that can legitimately precede the
-/// subcommand is `-R/--repo`). `--repo=x` / `-Rx` are single tokens, so skipped
-/// as flags. Excludes the leading `gh`. So `positionals[0]`/`[1]` are the command
-/// + subcommand wherever the flags push them.
+/// gh flags (across the subcommands we gate — `pr merge`, `release create/edit/
+/// delete`, `-R/--repo`) that take a SEPARATE value token, so a positional scan
+/// must consume that value and not mistake it for the command/subcommand/target.
+/// Missing one mis-parses the target: e.g. `gh release create --title "X" v1`
+/// would read the tag as `X` and fail-safe-block a legitimately granted release
+/// (rev-86 LOW). `=`/glued forms are single tokens and handled separately. Keep
+/// this in sync with the shim's shell scanner value-flag list.
+const GH_VALUE_FLAGS: &[&str] = &[
+    "-R", "--repo", "-b", "--body", "-t", "--subject", "--title", "-F", "--body-file",
+    "--author-email", "--match-head-commit", "-n", "--notes", "--notes-file",
+    "--notes-start-tag", "--target", "--discussion-category",
+];
+
+/// The positional (non-flag) tokens of a gh argv, in order, skipping flags and
+/// consuming the values of `GH_VALUE_FLAGS` — crucially the global `-R/--repo` that
+/// gh accepts BEFORE or BETWEEN the command tokens (rev-79 F1), and the release
+/// value-flags before the tag positional (rev-86). `--flag=x` / `-Rx` are single
+/// tokens, skipped as flags. Excludes the leading `gh`. So `positionals[0]`/`[1]`
+/// are the command + subcommand and `[2]` is the target (PR ref / tag) wherever
+/// the flags land.
 pub fn gh_positionals(args: &[&str]) -> Vec<String> {
     let mut pos = Vec::new();
     let mut i = 0;
     while i < args.len() {
         let t = args[i];
-        if t == "-R" || t == "--repo" {
+        if GH_VALUE_FLAGS.contains(&t) {
             i += 2; // flag + its value
             continue;
         }
         if t.starts_with('-') {
-            i += 1; // boolean flag, or `--repo=…` / `-R…` glued (single token)
+            i += 1; // boolean flag, or `--flag=…` / `-R…` glued (single token)
             continue;
         }
         pos.push(t.to_string());
@@ -1333,10 +1346,15 @@ pub fn git_tag_push(args: &[String]) -> GitTagPush {
         if let Some(t) = dst.strip_prefix("refs/tags/") {
             return GitTagPush::Tag(grant_segment(t));
         }
-        // A bare refspec matching the release pattern `v<digit>…`.
+        // A bare refspec matching the RELEASE TRIGGER pattern. This MUST track
+        // `.github/workflows/release.yml`'s `on.push.tags` (currently `v*` — ANY
+        // ref starting with `v`, not just `v<digit>`), or a `vbeta`/`vRelease` tag
+        // push would publish to the world yet slip the gate (rev-86). It's only a
+        // *candidate* — the shim confirms it's actually a tag (not a same-prefixed
+        // branch) against the real git before gating, so a branch like `vfeature`
+        // still passes.
         let name = dst.trim_start_matches('+');
-        let mut ch = name.chars();
-        if ch.next() == Some('v') && ch.next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+        if name.starts_with('v') {
             return GitTagPush::Tag(grant_segment(name));
         }
     }

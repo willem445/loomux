@@ -3444,6 +3444,16 @@ fn gh_release_action_detects_publish_subcommands_and_tag() {
     assert_eq!(a(&["release", "delete", "v9"]), Some(("delete".into(), "v9".into())));
     // -R/--repo before the command is skipped, tag still found.
     assert_eq!(a(&["-R", "o/r", "release", "create", "v2"]), Some(("create".into(), "v2".into())));
+    // rev-86 LOW: value-flags BEFORE the tag (title/notes/target…) must be consumed
+    // so the tag positional isn't mis-read as the flag's value.
+    assert_eq!(a(&["release", "create", "--title", "My Release", "v1.2.3"]),
+        Some(("create".into(), "v1.2.3".into())), "--title value must not be mistaken for the tag");
+    assert_eq!(a(&["release", "create", "-n", "some notes", "--target", "main", "v1.2.3"]),
+        Some(("create".into(), "v1.2.3".into())));
+    assert_eq!(a(&["release", "create", "--title=X", "v1.2.3"]), Some(("create".into(), "v1.2.3".into())));
+    // Tag first, flags after (also fine).
+    assert_eq!(a(&["release", "create", "v1.2.3", "--title", "X", "--generate-notes"]),
+        Some(("create".into(), "v1.2.3".into())));
     // Read-only release subcommands and non-release commands are NOT publish actions.
     assert_eq!(a(&["release", "view", "v1"]), None);
     assert_eq!(a(&["release", "list"]), None);
@@ -3457,13 +3467,24 @@ fn git_tag_push_classifies_tag_pushes() {
     assert_eq!(g(&["push", "origin", "refs/tags/v1.2.3"]), GitTagPush::Tag("v1.2.3".into()));
     assert_eq!(g(&["push", "origin", "tag", "v9"]), GitTagPush::Tag("v9".into()));
     assert_eq!(g(&["push", "origin", "+v1:refs/tags/v1"]), GitTagPush::Tag("v1".into()));
-    // A bare `v*` refspec is treated as a (candidate) tag; the shim confirms it.
+    // A bare refspec matching release.yml's `v*` trigger is a (candidate) tag; the
+    // shim confirms it against real git. rev-86 BLOCKER: `v*` is ANY v-prefixed
+    // ref, not just `v<digit>` — `vbeta`/`vRelease`/`vv1.0.0` would publish yet the
+    // old `v[0-9]` pattern let them slip.
     assert_eq!(g(&["push", "origin", "v1.0.0"]), GitTagPush::Tag("v1.0.0".into()));
+    assert_eq!(g(&["push", "origin", "vbeta"]), GitTagPush::Tag("vbeta".into()), "vbeta matches v*");
+    assert_eq!(g(&["push", "origin", "vRelease"]), GitTagPush::Tag("vRelease".into()));
+    assert_eq!(g(&["push", "origin", "vv1.0.0"]), GitTagPush::Tag("vv1.0.0".into()));
+    // Non-`v*` refs never trigger release.yml, so they are NOT candidates — pinned
+    // so the scope stays explicit (a `nightly` tag would not publish).
+    assert_eq!(g(&["push", "origin", "nightly"]), GitTagPush::None, "non-v* ref is not a release candidate");
+    assert_eq!(g(&["push", "origin", "release-1"]), GitTagPush::None);
     // Bulk tag pushes → Bulk (blocked; can't match one grant).
     assert_eq!(g(&["push", "--tags"]), GitTagPush::Bulk);
     assert_eq!(g(&["push", "origin", "--follow-tags"]), GitTagPush::Bulk);
     assert_eq!(g(&["push", "--mirror"]), GitTagPush::Bulk);
-    // Plain branch pushes and non-push commands → None (fast passthrough).
+    // Plain branch pushes and non-push commands → None (fast passthrough). A
+    // `v*`-prefixed branch is a candidate here but the shim confirms-away non-tags.
     assert_eq!(g(&["push", "origin", "feat/x"]), GitTagPush::None);
     assert_eq!(g(&["push", "-u", "origin", "HEAD"]), GitTagPush::None);
     assert_eq!(g(&["push", "origin", "main"]), GitTagPush::None);
@@ -3614,6 +3635,13 @@ fn gh_shim_harness_grant_authorizes_one_merge_and_releases_are_gated() {
     assert!(!group.join("release_grants/v1.2.3").exists(), "release grant consumed");
     // Read-only release subcommand passes through.
     assert!(run(&["release", "view", "v1.2.3"], "0"), "release view is not gated");
+    // rev-86 LOW: value-flags BEFORE the tag must not misparse it — a granted
+    // release with --title still resolves tag v1.2.3 and is allowed.
+    write_grant("release_grants", "v1.2.3");
+    assert!(run(&["release", "create", "--title", "My Release", "v1.2.3"], "0"),
+        "granted release with --title before the tag must be allowed, not misparsed");
+    assert!(!run(&["release", "create", "--title", "My Release", "v9.9.9"], "0"),
+        "a release with --title and no grant is still blocked (tag parsed correctly)");
 }
 
 #[test]
@@ -3662,6 +3690,14 @@ fn git_shim_harness_gates_tag_pushes() {
     assert!(!run(&["push", "origin", "--follow-tags"], ""), "--follow-tags is blocked");
     // Bare v* refspec confirmed as a tag by real git → gated.
     assert!(!run(&["push", "origin", "v2.0.0"], "v2.0.0"), "confirmed bare v* tag is gated");
+    // rev-86 BLOCKER: v* is ANY v-prefixed tag, matching release.yml — a `vbeta`
+    // tag (v + letter) MUST be gated, not slip through the old `v[0-9]` pattern.
+    grant("vbeta");
+    assert!(run(&["push", "origin", "vbeta"], "vbeta"), "granted vbeta tag push allowed");
+    assert!(!run(&["push", "origin", "vbeta"], "vbeta"), "vbeta tag push blocked once the grant is consumed");
+    assert!(!run(&["push", "origin", "vRelease"], "vRelease"), "vRelease (v* tag) is gated");
+    // A non-v* ref never triggers release.yml, so it is NOT gated even if it's a tag.
+    assert!(run(&["push", "origin", "nightly"], "nightly"), "a non-v* tag is not a release → not gated");
     // Bare v* that is NOT a tag (a branch) → not gated (rev-parse fails to confirm).
     assert!(run(&["push", "origin", "v2-feature"], "nope"), "a v*-looking branch is not gated");
 }
