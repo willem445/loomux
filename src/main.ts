@@ -25,7 +25,7 @@ import {
   type OrchestratorConfig,
   type AttentionItem,
 } from "./orchestration";
-import { tabAttention, sameAttention, shouldRefreshPreview } from "./tabroute";
+import { tabAttention, sameAttention } from "./tabroute";
 import { encodeTabs, decodeTabs } from "./tabstore";
 
 // Surface unexpected errors as a visible banner instead of a silently
@@ -104,6 +104,20 @@ function findPaneAcrossTabs(ptyId: number): { ws: Workspace; pane: Pane } | null
 }
 
 // ---------- project tabs: orchestration routing (#63 phase 3) ----------
+
+/** Open a new tab the way the user expects (#63 finding 3): create + activate
+ *  it, then present the SAME starting surface a fresh loomux pane shows — a
+ *  terminal in plain mode, or the agent launcher in agent mode (openPaneIn is
+ *  the exact fresh-boot / new-pane flow). Never leaves the tab blank. */
+async function openUserTab(): Promise<void> {
+  const ws = tabs.newTab();
+  await openPaneIn(ws);
+  // In agent mode, choosing "orchestrator" from the launcher opens its OWN
+  // project tab (launchOrchestratorTab), leaving this one empty — drop the
+  // redundant blank tab in that one case. Every other path fills `ws`.
+  if (ws.grid.paneCount === 0 && tabs.count > 1) tabs.closeTab(ws.id);
+  persistTabs();
+}
 
 /** A short project name for a tab, from a repo/worktree path's last segment. */
 function projectName(path: string): string {
@@ -389,7 +403,7 @@ document.addEventListener(
         break;
       }
       case "new-tab":
-        tabs.newTab();
+        void openUserTab();
         break;
       case "close-tab":
         tabs.closeTab(tabs.activeTabId!);
@@ -514,20 +528,13 @@ initOrchestration(orchWiring);
 const didRestore = restoreTabs();
 if (!didRestore) tabs.newTab();
 tabs.onChange(persistTabs);
-new TabBar(tabBarEl, tabs);
+// The "+" button opens a real starting surface, same as the shortcut (finding 3).
+new TabBar(tabBarEl, tabs, () => void openUserTab());
 
-// Keep hidden tabs' preview thumbnails fresh (#63 phase 4): serialize each
-// non-active tab's viewport buffer on a throttle. Never touches a laid-out
-// element — serialization reads the in-memory buffer, so no resize is armed.
-const PREVIEW_THROTTLE_MS = 4000;
-window.setInterval(() => {
-  const now = Date.now();
-  const active = tabs.activeTabId;
-  for (const ws of tabs.tabs) {
-    if (ws.id === active) continue; // the active tab is visible; no thumbnail needed
-    if (shouldRefreshPreview(ws.previewAt, now, PREVIEW_THROTTLE_MS)) ws.refreshPreview(now);
-  }
-}, 2000);
+// Preview thumbnails are now serialized live on hover (see TabBar), not on a
+// background timer — a hovered background tab shows its currently-streaming
+// viewport. Serialization reads the in-memory buffer, so still no layout / no
+// PTY resize (#63 finding 2).
 
 void (async () => {
   await ensureOutputRouter();

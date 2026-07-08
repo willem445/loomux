@@ -29,9 +29,12 @@ export interface ManagedWorkspace {
   setVisible(visible: boolean): void;
   /** Focus the workspace's active pane — called when a tab becomes active. */
   focus(): void;
-  /** Latest viewport snapshot for a hover thumbnail (#63 phase 4). A plain
-   *  string ("" when none); may contain ANSI escapes the tab bar strips. */
-  readonly preview: string;
+  /** Serialize the preview pane's FULL viewport right now, for a live hover
+   *  thumbnail (#63 finding 2). Reads the in-memory xterm buffer (which keeps
+   *  updating while hidden), so it works with zero layout and no PTY resize —
+   *  the tab bar re-calls it on a short interval while hovered for a live view.
+   *  May contain ANSI escapes the tab bar strips. "" when there's no pane. */
+  livePreview(): string;
   /** Tear the workspace down and kill its panes' PTYs (tab closed). */
   dispose(): void;
 }

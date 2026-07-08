@@ -21,11 +21,6 @@ export class Workspace implements ManagedWorkspace {
   /** While tearing down, suppress the grid's "never empty" respawn so closing
    *  the last pane doesn't resurrect one mid-dispose. */
   private disposed = false;
-  /** Last serialized viewport snapshot of the representative pane, and when it
-   *  was taken (ms). A SNAPSHOT, never a live element — a hidden tab must never
-   *  hold a laid-out pane (nonzero width re-arms applyFit → resize storm). */
-  private _preview = "";
-  private _previewAt = 0;
 
   /** @param onEmpty invoked when the tab's grid goes empty (last pane closed)
    *  so the caller can keep the grid non-empty — the per-tab mirror of the
@@ -73,37 +68,24 @@ export class Workspace implements ManagedWorkspace {
     // tab, cutting idle VRAM), reload it on show. Rendering-only — the PTY and
     // buffer are untouched, so no resize / no scrollback loss (#63 phase 4).
     for (const pane of this.grid.allPanes()) pane.setHidden(!visible);
-    // Snapshot the viewport as we switch away, while the pane is still laid out.
-    if (!visible) this.refreshPreview(Date.now());
   }
 
   focus(): void {
     this.grid.activePane?.focus();
   }
 
-  /** The pane whose viewport represents this tab in a preview thumbnail: the
-   *  active pane, else the first one. */
-  private representativePane(): Pane | null {
-    return this.grid.activePane ?? this.grid.panes()[0] ?? null;
+  /** The pane a hover thumbnail shows: prefer one that needs the human (that's
+   *  what you'd want to peek at), else the active pane, else the first. */
+  private previewPane(): Pane | null {
+    const panes = this.grid.allPanes();
+    return (
+      panes.find((p) => p.attention !== null) ?? this.grid.activePane ?? panes[0] ?? null
+    );
   }
 
-  /** Re-serialize the representative pane's viewport into the preview snapshot.
-   *  Works while hidden (serializes the in-memory buffer, not the DOM). Cheap
-   *  and throttled by the caller (see tabroute.shouldRefreshPreview). */
-  refreshPreview(nowMs: number): void {
-    const pane = this.representativePane();
-    if (!pane) return;
-    this._preview = pane.serializeViewport();
-    this._previewAt = nowMs;
-  }
-
-  /** The latest viewport snapshot (may be empty). */
-  get preview(): string {
-    return this._preview;
-  }
-  /** When the snapshot was last refreshed (ms), for throttling. */
-  get previewAt(): number {
-    return this._previewAt;
+  /** Serialize the preview pane's full current viewport (see ManagedWorkspace). */
+  livePreview(): string {
+    return this.previewPane()?.serializeViewport() ?? "";
   }
 
   dispose(): void {

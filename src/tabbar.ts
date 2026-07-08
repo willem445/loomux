@@ -10,6 +10,7 @@
 import type { TabManager, ManagedWorkspace } from "./tabs";
 import { makeRenameCommit } from "./panerename";
 import { swapEditor } from "./domutil";
+import { attentionPresentation } from "./attention";
 import { pauseGroup, resumeGroup, groupSummary, groupUsage } from "./orchestration";
 
 // Reuse the orchestration group palette (orchbadge.ts GROUP_COLORS) so a tab's
@@ -44,14 +45,19 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
   private palette: HTMLElement | null = null;
   private menu: HTMLElement | null = null;
   private preview: HTMLElement | null = null;
+  private previewTimer: number | null = null;
   private status = new Map<string, TabStatus>();
 
   private el: HTMLElement;
   private tabs: TabManager<T>;
+  /** Opens a new tab WITH its starting pane (finding 3). Falls back to a bare
+   *  TabManager.newTab (blank) only if the host didn't wire one. */
+  private onNewTab: () => void;
 
-  constructor(el: HTMLElement, tabs: TabManager<T>) {
+  constructor(el: HTMLElement, tabs: TabManager<T>, onNewTab?: () => void) {
     this.el = el;
     this.tabs = tabs;
+    this.onNewTab = onNewTab ?? (() => void tabs.newTab());
     tabs.onChange(() => this.render());
     // Poll bound groups for agent count / cost / paused (phase 4). Cheap; the
     // strip only re-renders when a value actually differs.
@@ -97,6 +103,21 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
       });
 
       tab.append(swatch, name);
+
+      // Unmistakable alert (#63 round 2, finding 1): a pane in this tab is
+      // blocked/waiting or otherwise needs the human. Render the SAME label the
+      // pane header chip shows (attention.ts), red for the urgent `blocked`
+      // class, amber otherwise, pulsing — so a blocked agent in a background tab
+      // can't be missed. Covers every attention class (blocked/waiting/report/
+      // gate) and both agent and plain (#40) panes.
+      if (attn) {
+        const chip = document.createElement("span");
+        chip.className = "tab-attn";
+        chip.dataset.reason = attn.reason;
+        chip.textContent = attentionPresentation(attn.reason).label;
+        chip.title = `A pane in "${ws.name}" needs you (${attn.reason}) — click to switch`;
+        tab.appendChild(chip);
+      }
 
       // Live status chip: agent count + cost, when the tab owns a group.
       if (st) {
@@ -144,7 +165,7 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
     add.className = "tab-add";
     add.textContent = "+";
     add.title = "New tab (Ctrl+Shift+T)";
-    add.addEventListener("click", () => this.tabs.newTab());
+    add.addEventListener("click", () => this.onNewTab());
     this.el.appendChild(add);
   }
 
@@ -316,27 +337,63 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
     this.menu = null;
   }
 
-  /** Hover thumbnail: the tab's last serialized viewport as plain text. A
-   *  SNAPSHOT string (workspace.ts refreshes it on switch-away + a timer) — never
-   *  a live element, so it can't re-arm a hidden pane's fit. */
+  /** Live hover thumbnail (#63 finding 2): the tab's FULL current viewport,
+   *  re-serialized on a short interval so a running prompt streams in. It's a
+   *  serialized text SNAPSHOT of the in-memory buffer — never a laid-out pane —
+   *  so it can't re-arm a hidden pane's fit / PTY resize. The whole viewport is
+   *  rendered and CSS-scaled to fit, so nothing is clipped. */
   private openPreview(ws: ManagedWorkspace, anchor: HTMLElement): void {
-    const text = stripAnsi(ws.preview).replace(/\n{3,}/g, "\n\n").trimEnd();
-    if (!text) return;
     this.closePreview();
     const pop = document.createElement("div");
     pop.className = "tab-preview";
+    const scaler = document.createElement("div");
+    scaler.className = "tab-preview-scaler";
     const pre = document.createElement("pre");
-    // Show the tail (most recent output) — the visible screen bottom.
-    pre.textContent = text.split("\n").slice(-14).join("\n");
-    pop.appendChild(pre);
-    const r = anchor.getBoundingClientRect();
+    scaler.appendChild(pre);
+    pop.appendChild(scaler);
     document.body.appendChild(pop);
-    pop.style.left = `${Math.round(r.left)}px`;
-    pop.style.top = `${Math.round(r.bottom + 4)}px`;
     this.preview = pop;
+
+    const anchorRect = anchor.getBoundingClientRect();
+    const paint = () => {
+      // Trim only trailing blank rows (an agent screen is mostly empty below its
+      // prompt) — keep the full viewport above intact.
+      const text = stripAnsi(ws.livePreview()).replace(/[ \t]+$/gm, "").replace(/\n+$/, "");
+      pre.textContent = text || "(no output yet)";
+      this.layoutPreview(pop, scaler, pre, anchorRect);
+    };
+    paint();
+    // Re-serialize while hovered → effectively live.
+    this.previewTimer = window.setInterval(paint, 700);
+  }
+
+  /** Size the popup to the full viewport scaled to fit the screen, and clamp it
+   *  into view (flip above the tab if it would run off the bottom). */
+  private layoutPreview(pop: HTMLElement, scaler: HTMLElement, pre: HTMLElement, anchor: DOMRect): void {
+    scaler.style.transform = "none";
+    const naturalW = Math.max(1, pre.scrollWidth);
+    const naturalH = Math.max(1, pre.scrollHeight);
+    const maxW = Math.min(window.innerWidth * 0.9, 760);
+    const maxH = window.innerHeight * 0.72;
+    const scale = Math.min(1, maxW / naturalW, maxH / naturalH);
+    scaler.style.transform = `scale(${scale})`;
+    // +padding to match .tab-preview-scaler's 8px/6px inset so nothing clips.
+    const w = Math.ceil(naturalW * scale) + 16;
+    const h = Math.ceil(naturalH * scale) + 12;
+    pop.style.width = `${w}px`;
+    pop.style.height = `${h}px`;
+    const left = Math.max(8, Math.min(Math.round(anchor.left), window.innerWidth - w - 8));
+    let top = Math.round(anchor.bottom + 4);
+    if (top + h > window.innerHeight - 8) top = Math.max(8, Math.round(anchor.top - h - 4));
+    pop.style.left = `${left}px`;
+    pop.style.top = `${top}px`;
   }
 
   private closePreview(): void {
+    if (this.previewTimer !== null) {
+      clearInterval(this.previewTimer);
+      this.previewTimer = null;
+    }
     this.preview?.remove();
     this.preview = null;
   }

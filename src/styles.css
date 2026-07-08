@@ -131,23 +131,37 @@ html, body {
 .tab.active .tab-status { color: var(--text); }
 .tab-paused { flex: none; font-size: 10px; color: #e0af68; }
 
-/* Attention (#63 phase 3): a leading dot + pulse on a tab whose (maybe hidden)
-   pane needs the human. Amber default, red when urgent — mirrors the pane/dock
-   chips (attention.ts). Always-visible dot so reduced-motion users see it too. */
-.tab.needs-attention { color: #f2c66a; border-top-color: #6a5230; }
-.tab.needs-attention.urgent { color: #ff9db0; border-top-color: rgba(247, 118, 142, 0.5); }
-.tab.needs-attention .tab-name::before {
-  content: "●"; margin-right: 5px; font-size: 8px; vertical-align: 1px; color: currentColor;
+/* Attention (#63, finding 1): an unmistakable alert on a tab whose (maybe
+   hidden) pane needs the human — a colored, pulsing chip showing the SAME label
+   as the pane header (attention.ts), plus a tinted tab background + top edge so
+   the whole tab reads as "alert" at a glance. Amber default, red for the urgent
+   `blocked` class — mirrors the pane/dock chips. */
+.tab.needs-attention {
+  color: #f2c66a; border-top-color: #e0af68;
+  background: rgba(224, 175, 104, 0.1);
+  animation: tab-attn-pulse 1.6s ease-in-out infinite;
 }
-.tab.needs-attention { animation: tab-attn-pulse 1.6s ease-in-out infinite; }
+.tab.needs-attention.urgent {
+  color: #ff9db0; border-top-color: #f7768e;
+  background: rgba(247, 118, 142, 0.12);
+  animation-name: tab-attn-pulse-urgent;
+}
+/* The alert chip itself — same look as the pane header's .pane-attn. */
+.tab-attn {
+  flex: none; font-size: 9px; font-weight: 700; letter-spacing: 0.4px;
+  border: 1px solid #6a5230; border-radius: 4px; padding: 1.5px 6px;
+  color: #f2c66a; background: rgba(224, 175, 104, 0.16); white-space: nowrap;
+}
+.tab-attn[data-reason="blocked"] {
+  color: #ff9db0; background: rgba(247, 118, 142, 0.18); border-color: rgba(247, 118, 142, 0.5);
+}
 @keyframes tab-attn-pulse {
-  0%, 100% { box-shadow: 0 0 0 0 transparent; }
-  50% { box-shadow: 0 -2px 10px 0 rgba(224, 175, 104, 0.35); }
+  0%, 100% { box-shadow: inset 0 -2px 0 0 rgba(224, 175, 104, 0.5), 0 0 0 0 transparent; }
+  50% { box-shadow: inset 0 -2px 0 0 rgba(224, 175, 104, 0.9), 0 0 12px 1px rgba(224, 175, 104, 0.45); }
 }
-.tab.needs-attention.urgent { animation-name: tab-attn-pulse-urgent; }
 @keyframes tab-attn-pulse-urgent {
-  0%, 100% { box-shadow: 0 0 0 0 transparent; }
-  50% { box-shadow: 0 -2px 12px 0 rgba(247, 118, 142, 0.45); }
+  0%, 100% { box-shadow: inset 0 -2px 0 0 rgba(247, 118, 142, 0.55), 0 0 0 0 transparent; }
+  50% { box-shadow: inset 0 -2px 0 0 rgba(247, 118, 142, 1), 0 0 14px 1px rgba(247, 118, 142, 0.55); }
 }
 @media (prefers-reduced-motion: reduce) { .tab.needs-attention { animation: none; } }
 
@@ -166,18 +180,20 @@ html, body {
 .tab-menu-item:hover { background: var(--panel); }
 .tab-menu-item.danger:hover { color: var(--danger); }
 
-/* Hover thumbnail (#63 phase 4): the tab's serialized viewport as plain text. */
+/* Live hover thumbnail (#63 finding 2): the tab's FULL serialized viewport,
+   CSS-scaled to fit (see TabBar.layoutPreview) so nothing is clipped. The popup
+   is sized to the scaled content; the scaler holds the natural-size <pre>. */
 .tab-preview {
-  position: fixed; z-index: 85; max-width: 460px;
-  padding: 8px 10px; border-radius: 8px;
-  background: var(--bg-term); border: 1px solid var(--border);
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+  position: fixed; z-index: 85; overflow: hidden;
+  border-radius: 8px; background: var(--bg-term); border: 1px solid var(--border);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.55);
   pointer-events: none;
 }
+.tab-preview-scaler { position: absolute; top: 6px; left: 8px; transform-origin: top left; }
 .tab-preview pre {
   margin: 0; font-family: "Cascadia Code", "Consolas", ui-monospace, monospace;
-  font-size: 10.5px; line-height: 1.3; color: var(--text-dim);
-  white-space: pre; overflow: hidden; max-height: 210px;
+  font-size: 12px; line-height: 1.25; color: var(--text);
+  white-space: pre;
 }
 .tab-name-input {
   font: inherit; font-size: 12px; color: var(--text);
