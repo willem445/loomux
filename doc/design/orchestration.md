@@ -566,9 +566,15 @@ consent is *blocked*, not advised.
   shell (in loomux or out) has an untouched `PATH` and pays zero shim overhead. On Windows the
   shim dir is first on `PATH`, and the agent's Bash tool (Git Bash, where Claude Code runs `gh`)
   resolves the extension-less `gh` script ahead of the real `gh.exe`.
-- **The decision** is the pure, unit-tested `gh_gate_decision` (the shim mirrors it in shell):
-  only `gh pr merge` (and cheap `gh api` merge shapes — `gh_is_merge_invocation`) is gated; the
-  shim asks the *real* gh for the PR's `baseRefName` and the repo's `defaultBranchRef`. A base
+- **The decision** is the pure, unit-tested `gh_gate_decision` (the shim mirrors it in shell,
+  and a shell harness executes the real script against a fake gh to prove parity): only
+  `gh pr merge` (and cheap `gh api` merge shapes — `gh_is_merge_invocation`) is gated. Detection
+  parses gh's argv into positionals (`gh_positionals`), skipping the global `-R/--repo <value>`
+  and other flags that gh accepts **before or between** the command tokens — so
+  `gh -R o/r pr merge` and `gh pr -R o/r merge` are gated, not just the bare form (the rev-79 F1
+  hole). The shim asks the *real* gh for the PR's `baseRefName` and the repo's `defaultBranchRef`,
+  **honoring the same `-R/--repo`** the caller passed (`gh_repo_flag`) so both resolve for the
+  right repo, not the cwd repo (rev-79 F2). A base
   **≠ default** passes through untouched (the integration-branch flow agents rely on); a base
   **= default** is allowed **only** when both the `autonomous` and `auto_merge` markers are
   present; an **undeterminable** base fails safe (block). Every refusal/allow is appended to the
@@ -576,10 +582,12 @@ consent is *blocked*, not advised.
   non-zero with a clear message telling the agent to report to the human.
 - **The dependency.** Auto-merge authority exists *only* in autonomous mode, enforced at the API,
   not just the UI: `set_auto_merge(true)` is **rejected** unless autonomous is on; turning
-  autonomous **off force-disables** auto-merge (audited); and a stale on-disk `auto_merge`-without-
-  `autonomous` combo (older group, hand-edited state) is **reconciled off on read** (audited). So
-  the gate's "both markers present" test can never be satisfied by an orphaned `auto_merge`
-  marker. The UI mirrors this (`approvalControl`): with autonomous off the "Require human
+  autonomous **off force-disables** auto-merge (audited); a **budget suspension** does the same
+  (rev-79 F4); and a stale on-disk `auto_merge`-without-`autonomous` combo (older group,
+  hand-edited state) is **reconciled off on read** (audited). The force-disable drops auto-merge
+  from the in-memory gate set **unconditionally**, even if the durable marker removal fails (the
+  #149 money-stop pattern — in-memory authoritative). So the gate's "both markers present" test
+  can never be satisfied by an orphaned `auto_merge` marker. The UI mirrors this (`approvalControl`): with autonomous off the "Require human
   approval" checkbox is locked checked with a tooltip.
 - **Honest bypass surface** (documented, not hidden). The shim raises the cost of an unattended
   bad merge from "type one command" to "deliberately evade a named control," but a determined

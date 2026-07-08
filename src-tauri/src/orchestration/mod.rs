@@ -108,11 +108,36 @@ loomux_block() { # $1=reason $2=base $3=pr
   exit 1
 }
 
-# Is this a merge we must gate? `gh pr merge`, or a raw `gh api` merge shape.
+# Parse the argv ONCE (mirrors the Rust gh_positionals / gh_repo_flag spec):
+# collect the command (cmd), subcommand (sub), the PR selector (sel = 3rd
+# positional), and the -R/--repo value (repo) — skipping flags and consuming the
+# values of value-taking flags. gh accepts -R/--repo (and other flags) BEFORE or
+# BETWEEN the command tokens, so scanning for positionals — not fixed argv slots —
+# is what closes the `gh -R o/r pr merge` / `gh pr -R o/r merge` hole (rev-79 F1).
+cmd=""; sub=""; sel=""; repo=""; want=""
+for tok in "$@"; do
+  if [ "$want" = "repo" ]; then repo="$tok"; want=""; continue; fi
+  if [ "$want" = "skip" ]; then want=""; continue; fi
+  case "$tok" in
+    -R|--repo) want="repo"; continue ;;
+    --repo=*) repo="${tok#--repo=}"; continue ;;
+    -R?*) repo="${tok#-R}"; continue ;;
+    -b|--body|-t|--subject|-F|--body-file|--author-email|--match-head-commit) want="skip"; continue ;;
+    --body=*|--subject=*|--body-file=*|--author-email=*|--match-head-commit=*) continue ;;
+    -*) continue ;;
+    *)
+      if [ -z "$cmd" ]; then cmd="$tok"
+      elif [ -z "$sub" ]; then sub="$tok"
+      elif [ -z "$sel" ]; then sel="$tok"
+      fi ;;
+  esac
+done
+
+# Is this a merge we must gate? `gh pr merge` (wherever flags land), or an api shape.
 is_merge=0
-if [ "$1" = "pr" ] && [ "$2" = "merge" ]; then
+if [ "$cmd" = "pr" ] && [ "$sub" = "merge" ]; then
   is_merge=1
-elif [ "$1" = "api" ]; then
+elif [ "$cmd" = "api" ]; then
   all="$*"
   low=$(printf '%s' "$all" | tr '[:upper:]' '[:lower:]')
   case "$low" in *mergepullrequest*) is_merge=1 ;; esac
@@ -124,27 +149,17 @@ if [ "$is_merge" = "0" ]; then
 fi
 
 # A raw `gh api` merge has no cheaply-resolvable base ref → fail-safe block.
-if [ "$1" = "api" ]; then
+if [ "$cmd" = "api" ]; then
   loomux_block "api-merge" "(api)" "?"
 fi
 
-# Resolve the PR selector for `gh pr merge` (first positional after `merge`,
-# skipping flags and the values of value-taking flags), then its base branch.
-gh_selector() {
-  shift 2
-  while [ "$#" -gt 0 ]; do
-    case "$1" in
-      -b|--body|-t|--subject|-F|--body-file|--author-email|--match-head-commit)
-        if [ "$#" -ge 2 ]; then shift 2; else shift; fi ;;
-      --body=*|--subject=*|--body-file=*|--author-email=*|--match-head-commit=*) shift ;;
-      -*) shift ;;
-      *) printf '%s' "$1"; return ;;
-    esac
-  done
-}
-sel=$(gh_selector "$@")
-base=$("$REAL_GH" pr view $sel --json baseRefName --jq .baseRefName 2>/dev/null)
-default=$("$REAL_GH" repo view --json defaultBranchRef --jq .defaultBranchRef.name 2>/dev/null)
+# Resolve the PR's base branch and the repo's default branch via the REAL gh,
+# honoring the SAME -R/--repo the user passed so both resolve for the right repo
+# (rev-79 F2) — not always the cwd repo.
+rf=""
+[ -n "$repo" ] && rf="-R $repo"
+base=$("$REAL_GH" pr view $rf $sel --json baseRefName --jq .baseRefName 2>/dev/null)
+default=$("$REAL_GH" repo view $rf --json defaultBranchRef --jq .defaultBranchRef.name 2>/dev/null)
 
 if [ -z "$base" ] || [ -z "$default" ]; then
   loomux_block "unverifiable-base" "$base" "$sel"
@@ -927,21 +942,77 @@ pub enum GhGate {
     BlockUnverifiable,
 }
 
+/// The positional (non-flag) tokens of a gh argv, in order, skipping flags —
+/// crucially the global `-R/--repo <value>` that gh accepts BEFORE or BETWEEN the
+/// command and subcommand (rev-79 F1: `gh -R o/r pr merge` and `gh pr -R o/r merge`
+/// are everyday forms that must not slip the gate). `-R/--repo` in its
+/// space-separated form consumes its value; every other flag is treated as a
+/// boolean (the only value-taking flag that can legitimately precede the
+/// subcommand is `-R/--repo`). `--repo=x` / `-Rx` are single tokens, so skipped
+/// as flags. Excludes the leading `gh`. So `positionals[0]`/`[1]` are the command
+/// + subcommand wherever the flags push them.
+pub fn gh_positionals(args: &[&str]) -> Vec<String> {
+    let mut pos = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let t = args[i];
+        if t == "-R" || t == "--repo" {
+            i += 2; // flag + its value
+            continue;
+        }
+        if t.starts_with('-') {
+            i += 1; // boolean flag, or `--repo=…` / `-R…` glued (single token)
+            continue;
+        }
+        pos.push(t.to_string());
+        i += 1;
+    }
+    pos
+}
+
+/// The `-R/--repo` value from a gh argv, if present, in any accepted form
+/// (`-R x`, `--repo x`, `--repo=x`, `-Rx`). The shim passes this to its base /
+/// default-branch lookups so they resolve for the SAME repo the user targeted
+/// (rev-79 F2), not always the cwd repo. Pure/testable.
+pub fn gh_repo_flag(args: &[&str]) -> Option<String> {
+    let mut i = 0;
+    while i < args.len() {
+        let t = args[i];
+        if t == "-R" || t == "--repo" {
+            return args.get(i + 1).map(|s| s.to_string());
+        }
+        if let Some(v) = t.strip_prefix("--repo=") {
+            return Some(v.to_string());
+        }
+        if t.len() > 2 {
+            if let Some(v) = t.strip_prefix("-R") {
+                return Some(v.to_string());
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Whether an argv is a GitHub *merge* invocation the shim must gate: `gh pr merge`
-/// (in any flag arrangement) or a raw `gh api` call to a pull-request merge
-/// endpoint (the cheap-to-catch API bypass). Pure so both the shim's shell mirror
-/// and the tests agree on exactly what counts as a merge. `args` excludes the
-/// leading `gh`. The api-graphql `mergePullRequest` mutation is also caught.
+/// (in ANY flag arrangement, including `-R/--repo` before or between the command
+/// tokens — rev-79 F1) or a raw `gh api` call to a pull-request merge endpoint (the
+/// cheap-to-catch API bypass). Pure so both the shim's shell mirror and the tests
+/// agree on exactly what counts as a merge. `args` excludes the leading `gh`. The
+/// api-graphql `mergePullRequest` mutation is also caught.
 pub fn gh_is_merge_invocation(args: &[String]) -> bool {
     let a: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    // `gh pr merge ...`
-    if a.first() == Some(&"pr") && a.get(1) == Some(&"merge") {
+    let pos = gh_positionals(&a);
+    let cmd = pos.first().map(String::as_str);
+    let sub = pos.get(1).map(String::as_str);
+    // `gh [globals] pr [flags] merge …` — command+subcommand wherever the flags land.
+    if cmd == Some("pr") && sub == Some("merge") {
         return true;
     }
-    // `gh api ...` touching a pulls/<n>/merge REST endpoint or the graphql
+    // `gh api …` touching a pulls/<n>/merge REST endpoint or the graphql
     // mergePullRequest mutation. Conservative substring match over the args.
-    if a.first() == Some(&"api") {
-        let joined = a[1..].join(" ");
+    if cmd == Some("api") {
+        let joined = a.join(" ");
         let low = joined.to_ascii_lowercase();
         if low.contains("mergepullrequest") {
             return true;
@@ -3746,10 +3817,27 @@ impl OrchRegistry {
         // Stop the spend first and unconditionally.
         self.autonomous_groups.lock_safe().remove(group);
         self.clear_idle_tick_latch(group);
+        // Money-stop the merge gate too (rev-79 F4): auto-merge without autonomous
+        // would leave the gate open, so drop it from the in-memory gate set
+        // UNCONDITIONALLY — the same #149 pattern (in-memory authoritative even if
+        // disk removal fails).
+        self.force_disable_auto_merge(group, "loomux", "autonomous-suspended");
         // Best-effort durable disable; failure is surfaced in the audit trail.
         match remove_marker(&self.group_dir(group).join("autonomous")) {
             Ok(()) => self.audit(group, "loomux", "autonomous-off", json!({})),
             Err(e) => self.audit(group, "loomux", "autonomous-off-failed", json!({ "error": e })),
+        }
+    }
+
+    /// Drop auto-merge for a group UNCONDITIONALLY (rev-79 F4 / #149 money-stop):
+    /// the in-memory gate-decision set is authoritative and cleared even if the
+    /// durable marker removal fails, so autonomous-off can never leave the merge
+    /// gate open. Best-effort marker removal + audit/notify only when it was on.
+    fn force_disable_auto_merge(&self, group: &str, actor: &str, reason: &str) {
+        if self.auto_merge_groups.lock_safe().remove(group) {
+            let _ = remove_marker(&self.group_dir(group).join("auto_merge"));
+            self.audit(group, actor, "auto-merge-off", json!({ "reason": reason }));
+            let _ = self.deliver_to_orchestrator(group, &auto_merge_notice(false), "loomux");
         }
     }
 
@@ -3805,16 +3893,10 @@ impl OrchRegistry {
             self.clear_idle_tick_latch(group);
             self.audit(group, actor, "autonomous-off", json!({}));
             // Dependency (#83): auto-merge exists only in autonomous mode, so
-            // turning autonomous OFF force-disables auto-merge — the pair can never
-            // be auto_merge-on/autonomous-off (which the enforced gate keys on).
-            // Inline (not set_auto_merge) so it isn't blocked by the "autonomous
-            // must be on" guard, and audited distinctly as a forced reconcile.
-            if self.auto_merge_groups.lock_safe().remove(group) {
-                let _ = remove_marker(&dir.join("auto_merge"));
-                self.audit(group, actor, "auto-merge-off",
-                    json!({ "reason": "autonomous-disabled" }));
-                let _ = self.deliver_to_orchestrator(group, &auto_merge_notice(false), "loomux");
-            }
+            // turning autonomous OFF force-disables auto-merge unconditionally
+            // (rev-79 F4) — the pair can never be auto_merge-on/autonomous-off,
+            // which the enforced gate keys on.
+            self.force_disable_auto_merge(group, actor, "autonomous-disabled");
         }
         Ok(())
     }
