@@ -162,7 +162,6 @@ class CodeMirrorEditor implements EditorWidget {
         cm.commands.history(),
         cm.language.indentOnInput(),
         cm.language.bracketMatching(),
-        cm.language.syntaxHighlighting(cm.language.defaultHighlightStyle, { fallback: true }),
         cm.search.highlightSelectionMatches(),
         cm.view.keymap.of([
           cm.commands.indentWithTab,
@@ -175,7 +174,10 @@ class CodeMirrorEditor implements EditorWidget {
         cm.view.EditorView.updateListener.of((u: import("@codemirror/view").ViewUpdate) => {
           if (u.docChanged) this.changeCb();
         }),
-        theme(cm),
+        // Standard, widely-recognized syntax colours (One Dark), then our own
+        // font + sizing on top (One Dark doesn't set a font family).
+        cm.oneDark.oneDark,
+        editorChrome(cm),
       ],
     });
     this.view = new cm.view.EditorView({ state, parent });
@@ -240,29 +242,20 @@ interface CmModules {
   commands: typeof import("@codemirror/commands");
   language: typeof import("@codemirror/language");
   search: typeof import("@codemirror/search");
+  oneDark: typeof import("@codemirror/theme-one-dark");
 }
 
-/** A compact dark theme aligned with loomux's Tokyo-Night-ish `:root` palette
- *  (accent #7aa2f7). Uses `transparent` backgrounds so the overlay's own
- *  surface colour shows through and the editor blends into the pane chrome. */
-function theme(cm: CmModules): import("@codemirror/state").Extension {
-  const MONO = '"Cascadia Mono", Consolas, ui-monospace, monospace';
-  return cm.view.EditorView.theme(
-    {
-      "&": { color: "var(--text)", backgroundColor: "transparent", height: "100%" },
-      ".cm-content": { fontFamily: MONO, caretColor: "var(--accent)" },
-      ".cm-gutters": { backgroundColor: "transparent", color: "var(--text-dim)", border: "none" },
-      ".cm-activeLine": { backgroundColor: "rgba(122,162,247,0.06)" },
-      ".cm-activeLineGutter": { backgroundColor: "rgba(122,162,247,0.10)" },
-      "&.cm-focused .cm-selectionBackground, .cm-selectionBackground": {
-        backgroundColor: "rgba(122,162,247,0.22)",
-      },
-      ".cm-cursor": { borderLeftColor: "var(--accent)" },
-      ".cm-panels": { backgroundColor: "var(--panel-2)", color: "var(--text)" },
-      ".cm-panels input, .cm-panels button": { fontFamily: MONO },
-    },
-    { dark: true }
-  );
+/** A modern IDE monospace stack, tried in order. No bundled font files — these
+ *  are the fonts developers already have installed (or the OS ships). */
+const EDITOR_FONT =
+  '"Cascadia Code", "JetBrains Mono", "Fira Code", "Cascadia Mono", "SF Mono", Menlo, Consolas, ui-monospace, monospace';
+
+/** Font + sizing layered over One Dark (which sets the colours but no font). */
+function editorChrome(cm: CmModules): import("@codemirror/state").Extension {
+  return cm.view.EditorView.theme({
+    "&": { height: "100%" },
+    ".cm-scroller": { fontFamily: EDITOR_FONT, fontSize: "13px", lineHeight: "1.55" },
+  });
 }
 
 /** Build the best available editor into `parent`. Tries CodeMirror 6; if any of
@@ -274,15 +267,16 @@ export async function createEditor(
   filename: string
 ): Promise<EditorWidget> {
   try {
-    const [state, view, commands, language, search, lang] = await Promise.all([
+    const [state, view, commands, language, search, oneDark, lang] = await Promise.all([
       import("@codemirror/state"),
       import("@codemirror/view"),
       import("@codemirror/commands"),
       import("@codemirror/language"),
       import("@codemirror/search"),
+      import("@codemirror/theme-one-dark"),
       languageFor(filename),
     ]);
-    const cm: CmModules = { state, view, commands, language, search };
+    const cm: CmModules = { state, view, commands, language, search, oneDark };
     return new CodeMirrorEditor(parent, doc, lang, cm);
   } catch (err) {
     // CM6 unavailable (chunk load failure): degrade, don't break the feature.
