@@ -7,6 +7,9 @@ import {
   autoMergeFromApproval,
   budgetMeter,
   formatTokens,
+  formatCountdown,
+  tickStatusLabel,
+  type TickStatus,
 } from "../src/autonomy.ts";
 
 // ---------- the auto-merge / require-approval inversion ----------
@@ -80,4 +83,58 @@ test("formatTokens is compact and honest", () => {
   assert.equal(formatTokens(1200), "1.2K");
   assert.equal(formatTokens(12_000), "12K");
   assert.equal(formatTokens(1_200_000), "1.20M");
+});
+
+// ---------- idle-tick countdown formatting ----------
+
+test("formatCountdown renders compact human durations", () => {
+  assert.equal(formatCountdown(0), "~0s");
+  assert.equal(formatCountdown(45), "~45s");
+  assert.equal(formatCountdown(60), "~1m");
+  assert.equal(formatCountdown(200), "~3m 20s");
+  assert.equal(formatCountdown(180), "~3m");
+});
+
+test("formatCountdown floors negative/skewed input at zero", () => {
+  assert.equal(formatCountdown(-30), "~0s");
+});
+
+// ---------- idle-tick status → label mapping ----------
+
+test("countdown-bearing statuses render the time", () => {
+  assert.equal(tickStatusLabel("counting_down", 200), "next tick in ~3m 20s");
+  assert.equal(tickStatusLabel("rate_capped", 90), "hourly cap — next in ~1m 30s");
+});
+
+test("eligible reads 'imminent' with no number (secs is 0, not rendered)", () => {
+  assert.equal(tickStatusLabel("eligible", 0), "tick imminent");
+});
+
+test("non-time-gated statuses NEVER render a countdown, even if secs is passed", () => {
+  // The null-countdown discipline: a stray number must not leak a lying timer.
+  for (const status of ["starting", "paused", "waiting_for_activity"] as TickStatus[]) {
+    const withNum = tickStatusLabel(status, 999);
+    const withNull = tickStatusLabel(status, null);
+    assert.equal(withNum, withNull, `${status} must ignore eligibleInSecs`);
+    assert.ok(!/\d/.test(withNum), `${status} label must contain no digits: "${withNum}"`);
+  }
+});
+
+test("specific non-time-gated labels", () => {
+  assert.equal(tickStatusLabel("starting", null), "starting…");
+  assert.equal(tickStatusLabel("paused", null), "paused — ticks suspended");
+  assert.equal(
+    tickStatusLabel("waiting_for_activity", null),
+    "waiting (orchestrator recently active)"
+  );
+});
+
+test("off renders empty (the caller hides the line)", () => {
+  assert.equal(tickStatusLabel("off", null), "");
+});
+
+test("countdown statuses degrade gracefully if secs is unexpectedly null", () => {
+  // Contract says these carry a real secs, but never throw / print 'null'.
+  assert.equal(tickStatusLabel("counting_down", null), "counting down…");
+  assert.equal(tickStatusLabel("rate_capped", null), "hourly cap reached");
 });

@@ -1376,6 +1376,18 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   font-family: "Cascadia Mono", Consolas, monospace;
   font-size: 10px; color: var(--text-dim); white-space: nowrap;
 }
+/* Row C: idle-tick knobs + live status, a slim line. */
+.group-auto-tick { display: flex; align-items: center; gap: 6px 12px; flex-wrap: wrap; }
+.group-auto-tickwrap {
+  display: inline-flex; align-items: center; gap: 5px;
+  cursor: pointer; user-select: none;
+}
+.group-auto-binput.sm { width: 52px; }
+.group-auto-unit { color: var(--text-dim); font-size: 10px; }
+.group-auto-status {
+  font-size: 10.5px; color: #a7bff8; white-space: nowrap;
+}
+.group-auto-status[hidden] { display: none; }
 .group-auto-suspend {
   font-size: 10.5px; line-height: 1.4; color: #f7768e;
   background: rgba(247, 118, 142, 0.12);

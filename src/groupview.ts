@@ -21,6 +21,8 @@ import {
   setAutoMerge,
   setAutonomous,
   setAutonomyBudget,
+  setIdleActivityFloor,
+  setIdleTickMinutes,
   setMaxAgents,
   setNotify,
   type AutonomyState,
@@ -32,6 +34,7 @@ import {
   budgetMeter,
   formatTokens,
   requireApprovalChecked,
+  tickStatusLabel,
 } from "./autonomy";
 
 /** Hard bounds on the live-agent cap, mirroring the launcher's input range and
@@ -43,6 +46,11 @@ const MAX_MAX_AGENTS = 12;
 /** How often the panel re-polls the backend while open (uptime ticks, cost
  *  and roster drift). Matches the audit viewer's follow cadence. */
 const POLL_MS = 2000;
+
+/** Backend default idle-tick activity floor (bytes). Shown as the floor input's
+ *  placeholder, and used to render the input blank when it's at the default
+ *  (mirrors DEFAULT_IDLE_ACTIVITY_FLOOR_BYTES in the backend). */
+const DEFAULT_ACTIVITY_FLOOR = 2048;
 
 /** Roster height kept visible at the panel's minimum height — about two rows,
  *  so at the collapse floor the list is present (and scrolls) rather than gone,
@@ -114,6 +122,10 @@ export class GroupView {
   private meterBar: HTMLElement;
   private meterFill: HTMLElement;
   private meterLabel: HTMLElement;
+  private tickMinInput: HTMLInputElement;
+  private tickMinErrEl: HTMLElement;
+  private floorInput: HTMLInputElement;
+  private tickStatusEl: HTMLElement;
   private suspendEl: HTMLElement;
   private pauseBtn: HTMLButtonElement;
   private notifyBtn: HTMLButtonElement;
@@ -263,12 +275,55 @@ export class GroupView {
 
     ctlRow.append(approvalLbl, budgetWrap, this.meterEl);
 
+    // Row C (slim): idle-tick cadence knob + a power-user activity-floor knob +
+    // the live tick-status line. The knobs configure the tick even while off
+    // (set-then-enable); the status text only appears once autonomous is on.
+    const tickRow = el("div", "group-auto-tick");
+    const tickWrap = el("label", "group-auto-tickwrap") as HTMLLabelElement;
+    tickWrap.title =
+      "How long the orchestrator's pane must be output-quiet before loomux delivers one " +
+      "idle tick (poll labeled issues, re-check PRs). Default 5 min; min 1.";
+    tickWrap.append(el("span", "group-auto-blabel", "Idle tick"));
+    this.tickMinInput = document.createElement("input");
+    this.tickMinInput.className = "group-auto-binput sm";
+    this.tickMinInput.type = "number";
+    this.tickMinInput.min = "1";
+    this.tickMinInput.max = "1440";
+    this.tickMinInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") void this.applyTickMinutes();
+    });
+    this.tickMinInput.addEventListener("blur", () => void this.applyTickMinutes());
+    tickWrap.append(this.tickMinInput, el("span", "group-auto-unit", "min"));
+    this.tickMinErrEl = el("span", "group-auto-berr");
+
+    // Activity floor (power-user): output below this many bytes per interval is
+    // treated as idle, so CLI repaints/spinners don't reset the quiet clock.
+    const floorWrap = el("label", "group-auto-tickwrap") as HTMLLabelElement;
+    floorWrap.title =
+      "Advanced: bytes of pane output per interval below which the orchestrator counts as " +
+      "idle. Makes the quiet clock tolerant of repaint/spinner noise. Default 2048; 0 resets it.";
+    floorWrap.append(el("span", "group-auto-blabel", "· floor"));
+    this.floorInput = document.createElement("input");
+    this.floorInput.className = "group-auto-binput sm";
+    this.floorInput.type = "number";
+    this.floorInput.min = "0";
+    this.floorInput.step = "512";
+    this.floorInput.placeholder = String(DEFAULT_ACTIVITY_FLOOR);
+    this.floorInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") void this.applyFloor();
+    });
+    this.floorInput.addEventListener("blur", () => void this.applyFloor());
+    floorWrap.append(this.floorInput, el("span", "group-auto-unit", "B"));
+
+    this.tickStatusEl = el("span", "group-auto-status");
+    tickRow.append(tickWrap, this.tickMinErrEl, floorWrap, this.tickStatusEl);
+
     // Budget-exhausted banner (autonomy auto-suspended): distinct row + the
     // re-enable affordance is the toggle above (re-enabling re-anchors).
     this.suspendEl = el("div", "group-auto-suspend");
     this.suspendEl.hidden = true;
 
-    autoRow.append(autoHead, ctlRow, this.suspendEl);
+    autoRow.append(autoHead, ctlRow, tickRow, this.suspendEl);
 
     // Footer: pause/resume + destructive end-orchestration.
     const foot = el("div", "group-actions");
@@ -433,6 +488,40 @@ export class GroupView {
       await setAutonomyBudget(this.groupId, tokens);
     } catch (err) {
       this.budgetErrEl.textContent = String(err);
+    }
+    await this.load();
+  }
+
+  /** Commit the idle-tick window (empty/non-numeric → 0, which the backend maps
+   *  to its default). The backend clamps/persists and returns the applied value;
+   *  the poll then re-syncs the input from the response. */
+  private async applyTickMinutes(): Promise<void> {
+    this.tickMinErrEl.textContent = "";
+    const raw = this.tickMinInput.value.trim();
+    const n = raw === "" ? 0 : parseInt(raw, 10);
+    const minutes = Number.isFinite(n) && n > 0 ? n : 0;
+    if (minutes === (this.autonomy?.idle_tick_minutes ?? 0)) return; // no-op
+    try {
+      await setIdleTickMinutes(this.groupId, minutes);
+    } catch (err) {
+      this.tickMinErrEl.textContent = String(err);
+    }
+    await this.load();
+  }
+
+  /** Commit the activity floor (empty/non-numeric → 0 = reset to the backend
+   *  default). Backend clamps/persists and returns the applied value. */
+  private async applyFloor(): Promise<void> {
+    const raw = this.floorInput.value.trim();
+    const n = raw === "" ? 0 : parseInt(raw, 10);
+    const bytes = Number.isFinite(n) && n > 0 ? n : 0;
+    // A blank input means "default"; skip the round-trip when already at default.
+    const cur = this.autonomy?.idle_activity_floor_bytes ?? DEFAULT_ACTIVITY_FLOOR;
+    if (bytes === cur || (bytes === 0 && cur === DEFAULT_ACTIVITY_FLOOR)) return;
+    try {
+      await setIdleActivityFloor(this.groupId, bytes);
+    } catch (err) {
+      this.toast(String(err));
     }
     await this.load();
   }
@@ -642,6 +731,25 @@ export class GroupView {
     } else {
       this.meterEl.hidden = true;
     }
+
+    // Idle-tick knobs (don't clobber while the human is editing). Minutes always
+    // shows the applied value; the floor shows blank at the default so its
+    // placeholder (2048) reads as the current setting.
+    if (document.activeElement !== this.tickMinInput) {
+      this.tickMinInput.value = a.idle_tick_minutes > 0 ? String(a.idle_tick_minutes) : "";
+    }
+    if (document.activeElement !== this.floorInput) {
+      this.floorInput.value =
+        a.idle_activity_floor_bytes > 0 && a.idle_activity_floor_bytes !== DEFAULT_ACTIVITY_FLOOR
+          ? String(a.idle_activity_floor_bytes)
+          : "";
+    }
+
+    // Live tick-status line: only while autonomous. The label enforces the
+    // null-countdown discipline (no lying timer on non-time-gated statuses).
+    const statusText = a.autonomous ? tickStatusLabel(a.tick_status, a.eligible_in_secs) : "";
+    this.tickStatusEl.textContent = statusText;
+    this.tickStatusEl.hidden = statusText === "";
 
     // Suspended banner: distinct from a plain-off state. `suspended` comes
     // straight from orch_autonomy (true only while off, and only when the budget
