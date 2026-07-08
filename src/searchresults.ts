@@ -6,6 +6,28 @@
 
 import type { SearchMatch } from "./fileapi";
 
+/** The inputs that define *what* a search matched: the query plus the two match
+ *  modifiers. A replace must apply the SAME params it previewed, so the view
+ *  snapshots these at search time and compares live inputs against the snapshot
+ *  (`paramsEqual`) to invalidate a stale preview before it can be applied. */
+export interface SearchParams {
+  query: string;
+  caseInsensitive: boolean;
+  wholeWord: boolean;
+}
+
+/** Whether two search-parameter sets would match the same text. Used to detect
+ *  that the query/options changed since the last search, so the preview→apply
+ *  guarantee for cross-file replace can't be defeated by editing the query box
+ *  (or toggling case) after searching. */
+export function paramsEqual(a: SearchParams, b: SearchParams): boolean {
+  return (
+    a.query === b.query &&
+    a.caseInsensitive === b.caseInsensitive &&
+    a.wholeWord === b.wholeWord
+  );
+}
+
 /** All matches in one file, plus whether the file is selected for replace.
  *  Selection is per-file in v1 (per-match is a documented future step). */
 export interface FileGroup {

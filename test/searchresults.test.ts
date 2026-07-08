@@ -8,6 +8,8 @@ import {
   setAll,
   selectedFiles,
   selectedMatchCount,
+  paramsEqual,
+  type SearchParams,
 } from "../src/searchresults.ts";
 import type { SearchMatch } from "../src/fileapi.ts";
 
@@ -44,6 +46,16 @@ test("setAll selects or clears everything", () => {
   const groups = groupMatches([m("a", 1), m("b", 2)]);
   assert.deepEqual(selectedFiles(setAll(groups, false)), []);
   assert.deepEqual(selectedFiles(setAll(groups, true)), ["a", "b"]);
+});
+
+test("paramsEqual detects a changed query or option (preview-vs-apply guard)", () => {
+  const base: SearchParams = { query: "foo", caseInsensitive: false, wholeWord: false };
+  assert.equal(paramsEqual(base, { ...base }), true);
+  // Any single change makes them unequal, so the stale preview is invalidated
+  // before a replace can apply divergent params (finding #1).
+  assert.equal(paramsEqual(base, { ...base, query: "bar" }), false);
+  assert.equal(paramsEqual(base, { ...base, caseInsensitive: true }), false);
+  assert.equal(paramsEqual(base, { ...base, wholeWord: true }), false);
 });
 
 test("edge: zero matches and all-deselected", () => {

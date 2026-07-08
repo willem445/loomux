@@ -182,6 +182,21 @@ fn writes_create_and_overwrite_atomically() {
 }
 
 #[test]
+fn write_into_missing_dir_errors_and_leaves_no_orphan_temp() {
+    // The write path can't create the temp sibling (its parent dir is absent), so
+    // atomic_write fails — and must not leave a `.tmp` orphan behind (finding #4).
+    let root = tempfile::tempdir().unwrap();
+    let rp = root.path().to_str().unwrap();
+    let e = write_file(rp, "nope/deep/f.txt", "data", None).unwrap_err();
+    assert_eq!(err_code(&e), "io", "got: {e}");
+    let orphan = fs::read_dir(root.path())
+        .unwrap()
+        .filter_map(|d| d.ok())
+        .any(|d| d.file_name().to_string_lossy().ends_with(".tmp"));
+    assert!(!orphan, "a failed write must not leave a temp file");
+}
+
+#[test]
 fn write_with_stale_hash_is_conflict_and_leaves_file_untouched() {
     let root = tempfile::tempdir().unwrap();
     let rp = root.path().to_str().unwrap();

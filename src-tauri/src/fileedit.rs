@@ -274,11 +274,18 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let stem = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
     let seq = ATOMIC_WRITE_SEQ.fetch_add(1, Ordering::Relaxed);
     let tmp = dir.join(format!(".{stem}.{}.{seq}.tmp", std::process::id()));
-    {
+    // Write + fsync the temp; on any failure remove the partial sibling so a
+    // write/fsync error (e.g. disk full) can't leave an orphan `.tmp` behind.
+    let written = (|| -> Result<(), String> {
         use std::io::Write;
         let mut f = std::fs::File::create(&tmp).map_err(|e| err("io", e.to_string()))?;
         f.write_all(bytes).map_err(|e| err("io", e.to_string()))?;
         f.sync_all().map_err(|e| err("io", e.to_string()))?; // durable before rename
+        Ok(())
+    })();
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
     }
     if std::fs::rename(&tmp, path).is_err() {
         let direct = std::fs::write(path, bytes);

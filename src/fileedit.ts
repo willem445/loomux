@@ -25,7 +25,9 @@ import {
   toggleFile,
   selectedFiles,
   selectedMatchCount,
+  paramsEqual,
   type FileGroup,
+  type SearchParams,
 } from "./searchresults";
 import {
   makeRoot,
@@ -106,6 +108,11 @@ export class FileEditView {
   private summaryEl!: HTMLElement;
   private replaceBtn!: HTMLButtonElement;
   private searchGroups: FileGroup[] = [];
+  /** The query + options the current `searchGroups` were produced with. Replace
+   *  applies from THIS, not the live inputs, so a query/option edit after a
+   *  search can't make apply diverge from the preview. Nulled when the preview
+   *  is invalidated (inputs changed) so a stale preview can't be applied. */
+  private searchSnapshot: SearchParams | null = null;
 
   constructor(private host: FileEditHost) {
     this.el = el("div", "fileedit");
@@ -329,7 +336,7 @@ export class FileEditView {
 
   // ---------- open / save ----------
 
-  private async openFile(rel: string): Promise<void> {
+  private async openFile(rel: string, line?: number, col?: number): Promise<void> {
     if (this.openRel !== null && this.isDirtyNow()) {
       const ok = await this.confirmDiscard();
       if (!ok) return;
@@ -347,6 +354,7 @@ export class FileEditView {
       this.updateFileLabel();
       this.updateDirty();
       this.renderTree(); // reflect the .open highlight
+      if (line !== undefined) this.editor?.reveal(line, col);
     } catch (err) {
       this.explainOpenError(err);
     }
@@ -515,6 +523,10 @@ export class FileEditView {
       e.stopPropagation();
       if (e.key === "Enter") void this.runSearch();
     });
+    // Editing the query or toggling an option invalidates the preview: the
+    // results no longer reflect what a replace would touch, so clear them and
+    // disable Replace until the user searches again (finding #1).
+    this.searchInput.addEventListener("input", () => this.invalidateIfStale());
     const searchBtn = el("button", "fileedit-save", "Search") as HTMLButtonElement;
     searchBtn.addEventListener("click", () => void this.runSearch());
     searchRow.append(this.searchInput, searchBtn);
@@ -535,6 +547,8 @@ export class FileEditView {
     const [wwLabel, wwBox] = checkboxLabel("Whole word");
     this.ciBox = ciBox;
     this.wwBox = wwBox;
+    ciBox.addEventListener("change", () => this.invalidateIfStale());
+    wwBox.addEventListener("change", () => this.invalidateIfStale());
     this.summaryEl = el("span", "fileedit-search-summary", "");
     opts.append(ciLabel, wwLabel, this.summaryEl);
 
@@ -545,24 +559,49 @@ export class FileEditView {
     pane.append(form, this.resultsEl);
   }
 
-  private searchOpts(): SearchOpts {
+  /** The live search parameters from the inputs. */
+  private currentParams(): SearchParams {
     return {
-      case_insensitive: this.ciBox.checked,
-      whole_word: this.wwBox.checked,
+      query: this.searchInput.value,
+      caseInsensitive: this.ciBox.checked,
+      wholeWord: this.wwBox.checked,
+    };
+  }
+
+  private static paramsToOpts(p: SearchParams): SearchOpts {
+    return {
+      case_insensitive: p.caseInsensitive,
+      whole_word: p.wholeWord,
       max_results: 0,
     };
   }
 
-  private async runSearch(): Promise<void> {
-    const query = this.searchInput.value;
-    if (!this.root || query === "") {
+  /** If the live inputs no longer match the snapshot the current results were
+   *  produced with, drop the preview so it can't be applied (finding #1). */
+  private invalidateIfStale(): void {
+    if (this.searchSnapshot && !paramsEqual(this.searchSnapshot, this.currentParams())) {
+      this.searchSnapshot = null;
       this.searchGroups = [];
+      this.resultsEl.replaceChildren();
+      this.summaryEl.classList.remove("truncated");
+      this.summaryEl.textContent = "Press Enter to search";
+      this.updateReplaceBtn();
+    }
+  }
+
+  private async runSearch(): Promise<void> {
+    const params = this.currentParams();
+    if (!this.root || params.query === "") {
+      this.searchGroups = [];
+      this.searchSnapshot = null;
       this.renderResults(false);
       return;
     }
     try {
-      const out = await ftSearch(this.root, query, this.searchOpts());
+      const out = await ftSearch(this.root, params.query, FileEditView.paramsToOpts(params));
       this.searchGroups = groupMatches(out.matches);
+      // Snapshot exactly what these results reflect; replace applies from this.
+      this.searchSnapshot = params;
       this.renderResults(out.truncated);
     } catch (err) {
       if (errorCode(err) === "empty-query") return;
@@ -602,7 +641,7 @@ export class FileEditView {
         const loc = el("span", "fileedit-result-loc", `${mtch.line}:${mtch.col}`);
         const text = el("span", "fileedit-result-text", mtch.line_text);
         row.append(loc, text);
-        row.addEventListener("click", () => void this.openFromSearch(mtch.rel));
+        row.addEventListener("click", () => void this.openFromSearch(mtch.rel, mtch.line, mtch.col));
         fileEl.appendChild(row);
       }
       frag.appendChild(fileEl);
@@ -616,24 +655,38 @@ export class FileEditView {
     this.replaceBtn.textContent = n === 0 ? "Replace" : `Replace ${n}`;
   }
 
-  /** Open a search hit in the editor: switch to tree mode and load the file. */
-  private async openFromSearch(rel: string): Promise<void> {
+  /** Open a search hit in the editor: switch to tree mode, load the file, and
+   *  jump to the matched line/col (finding #3). */
+  private async openFromSearch(rel: string, line: number, col: number): Promise<void> {
     this.mode = "tree";
     this.applyModeClass();
     this.syncTabs();
-    await this.openFile(rel);
+    await this.openFile(rel, line, col);
   }
 
   private async runReplace(): Promise<void> {
     if (!this.root) return;
+    // Apply from the snapshot the preview was built with — NOT the live inputs —
+    // so what's applied is exactly what was previewed (finding #1). A null
+    // snapshot means the preview was invalidated; require a fresh search.
+    const snap = this.searchSnapshot;
+    if (!snap) {
+      showToast("Search again before replacing.", "info");
+      return;
+    }
     const files = selectedFiles(this.searchGroups);
     if (files.length === 0) return;
-    const query = this.searchInput.value;
     const replacement = this.replaceInput.value;
     const ok = await this.confirmReplace(selectedMatchCount(this.searchGroups), files.length);
     if (!ok) return;
     try {
-      const res = await ftReplace(this.root, query, replacement, files, this.searchOpts());
+      const res = await ftReplace(
+        this.root,
+        snap.query,
+        replacement,
+        files,
+        FileEditView.paramsToOpts(snap)
+      );
       const changedMatches = res.changed.reduce((s, c) => s + c.replacements, 0);
       let msg = `Replaced ${changedMatches} in ${res.changed.length} file${res.changed.length === 1 ? "" : "s"}`;
       if (res.skipped.length > 0) msg += `, skipped ${res.skipped.length}`;
@@ -651,6 +704,17 @@ export class FileEditView {
 
   private async reloadOpenFile(): Promise<void> {
     if (!this.root || this.openRel === null) return;
+    // Don't silently discard unsaved edits (finding #2): if the open buffer is
+    // dirty, confirm before overwriting it with the just-replaced disk content.
+    // Declining keeps the user's edits — the on-disk hash now differs, so the
+    // next save hits the conflict guard rather than losing anything silently.
+    if (this.isDirtyNow()) {
+      const discard = await this.confirmDiscard();
+      if (!discard) {
+        showToast("Kept your unsaved edits — saving will flag the on-disk change.", "info");
+        return;
+      }
+    }
     try {
       const fr = await ftReadFile(this.root, this.openRel);
       this.savedContent = fr.content;

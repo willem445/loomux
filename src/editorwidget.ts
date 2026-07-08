@@ -30,6 +30,9 @@ export interface EditorWidget {
   onChange(cb: () => void): void;
   /** Make the editor read-only (e.g. while a save is in flight) or editable. */
   setReadOnly(ro: boolean): void;
+  /** Move the caret to (1-based) line/col and scroll it into view — used to jump
+   *  to a search hit. Clamped to the document; a no-op if out of range. */
+  reveal(line: number, col?: number): void;
   focus(): void;
   /** Open the in-editor find/replace UI, if the implementation has one. */
   openFind(): void;
@@ -70,6 +73,18 @@ class TextareaEditor implements EditorWidget {
   }
   setReadOnly(ro: boolean): void {
     this.ta.readOnly = ro;
+  }
+  reveal(line: number, col = 1): void {
+    const lines = this.ta.value.split("\n");
+    const target = Math.max(1, Math.min(line, lines.length));
+    let offset = 0;
+    for (let i = 0; i < target - 1; i++) offset += lines[i].length + 1;
+    offset += Math.max(0, col - 1);
+    this.ta.focus();
+    this.ta.setSelectionRange(offset, offset);
+    // Best-effort scroll-to-caret for the fallback: approximate from line height.
+    const lh = parseFloat(getComputedStyle(this.ta).lineHeight) || 16;
+    this.ta.scrollTop = Math.max(0, (target - 1) * lh - this.ta.clientHeight / 2);
   }
   focus(): void {
     this.ta.focus();
@@ -193,6 +208,17 @@ class CodeMirrorEditor implements EditorWidget {
     });
   }
 
+  reveal(line: number, col = 1): void {
+    const doc = this.view.state.doc;
+    const l = Math.max(1, Math.min(line, doc.lines));
+    const lineObj = doc.line(l);
+    const pos = Math.min(lineObj.from + Math.max(0, col - 1), lineObj.to);
+    this.view.dispatch({
+      selection: { anchor: pos },
+      effects: this.cm.view.EditorView.scrollIntoView(pos, { y: "center" }),
+    });
+  }
+
   focus(): void {
     this.view.focus();
   }
@@ -271,6 +297,7 @@ export async function createEditor(
       setValue: (d) => ta.setValue(d),
       onChange: (cb) => ta.onChange(cb),
       setReadOnly: (ro) => ta.setReadOnly(ro),
+      reveal: (line, col) => ta.reveal(line, col),
       focus: () => ta.focus(),
       openFind: () => ta.openFind(),
       dispose: () => ta.dispose(),
