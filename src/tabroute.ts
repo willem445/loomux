@@ -13,6 +13,11 @@
 /** Whether an attention reason is urgent, mirroring attention.ts. */
 const isUrgentReason = (reason: string): boolean => reason === "blocked";
 
+// Priority when several panes in one tab need attention: show the most urgent
+// reason on the tab chip. Mirrors attention.ts's ordering (blocked first).
+const REASON_PRIORITY: Record<string, number> = { blocked: 4, waiting: 3, gate: 2, report: 1 };
+const reasonRank = (reason: string): number => REASON_PRIORITY[reason] ?? 0;
+
 /** The slice of a backend AttentionItem this module needs. The real
  *  AttentionItem (orchestration.ts) is a structural superset, so it satisfies it. */
 export interface AttnLike {
@@ -24,13 +29,16 @@ export interface AttnLike {
 /** Per-tab attention badge state. */
 export interface TabAttn {
   urgent: boolean;
+  /** The most-urgent reason among the tab's needing-attention panes, so the tab
+   *  chip can show the same label as the pane header (via attentionPresentation). */
+  reason: string;
 }
 
 /** Fold an attention scan into a per-workspace badge state, keyed by the
  *  pty→workspace routing map. A workspace is urgent if ANY of its ptys is
- *  urgent (blocked). Urgency reuses attention.ts's mapping verbatim, so the tab
- *  badge, pane header chip, and dock chip all agree on what "urgent" means.
- *  Workspaces with no attention item are simply absent from the result. */
+ *  urgent (blocked), and carries the highest-priority reason among its panes.
+ *  Urgency/priority reuse attention.ts's ordering, so the tab badge, pane header
+ *  chip, and dock chip all agree. Workspaces with no attention item are absent. */
 export function tabAttention(
   items: AttnLike[],
   ptyToWs: Map<number, string>
@@ -40,9 +48,11 @@ export function tabAttention(
     if (it.pty_id === null) continue;
     const wsId = ptyToWs.get(it.pty_id);
     if (!wsId) continue;
-    const urgent = isUrgentReason(it.reason);
     const prev = out.get(wsId);
-    out.set(wsId, { urgent: (prev?.urgent ?? false) || urgent });
+    // Keep whichever reason ranks highest (blocked > waiting > gate > report).
+    if (!prev || reasonRank(it.reason) > reasonRank(prev.reason)) {
+      out.set(wsId, { urgent: isUrgentReason(it.reason), reason: it.reason });
+    }
   }
   return out;
 }
@@ -56,7 +66,7 @@ export function sameAttention(
   if (a.size !== b.size) return false;
   for (const [k, v] of a) {
     const w = b.get(k);
-    if (!w || w.urgent !== v.urgent) return false;
+    if (!w || w.urgent !== v.urgent || w.reason !== v.reason) return false;
   }
   return true;
 }
@@ -73,11 +83,4 @@ export function revealPlan(
   const wsId = ptyToWs.get(ptyId);
   if (!wsId) return { switchTo: null, known: false };
   return { switchTo: wsId === activeWsId ? null : wsId, known: true };
-}
-
-/** Throttle gate for the viewport-preview snapshot: refresh only once the
- *  interval has elapsed. Time is passed in (no Date.now here) so it's testable,
- *  mirroring spawnexpiry.ts. */
-export function shouldRefreshPreview(lastMs: number, nowMs: number, throttleMs: number): boolean {
-  return nowMs - lastMs >= throttleMs;
 }

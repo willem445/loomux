@@ -1,9 +1,15 @@
 # Project tabs — prototype walkthrough (#63)
 
 > **Status: PROTOTYPE, Option A.** This is a demo build for direction feedback,
-> not a finished feature. All five phases are now wired end-to-end at
-> prototype/demo quality (see the honest limits near the end). Do **not** merge —
-> see the draft PR.
+> not a finished feature. All five phases are wired end-to-end at prototype/demo
+> quality (see the honest limits near the end). Do **not** merge — see the draft
+> PR.
+>
+> **Round 2 (live-demo feedback):** (1) the blocked-pane alert on a tab is now an
+> unmistakable labelled chip + tinted pulse (was a subtle dot); (2) the hover
+> preview is now the **full viewport, live** (re-serialized ~700ms while hovered)
+> instead of a clipped snapshot; (3) a **new tab opens the real starting surface**
+> (terminal / launcher) instead of blank.
 
 ## What this is
 
@@ -26,12 +32,12 @@ tested pieces:
 | Piece | File | Role |
 | --- | --- | --- |
 | `TabManager` | `src/tabs.ts` | Ordered tab list, active tab, never-zero-tabs, phase-3 routing seams. DOM-free / unit-tested. |
-| `Workspace` | `src/workspace.ts` | One tab = a `Grid` + its own dock; hides via `display:none`, drops WebGL when hidden, snapshots its viewport for previews. |
-| `TabBar` | `src/tabbar.ts` | The tab strip: switch, close, new (+), rename, color, attention dot, status chip, hover thumbnail, right-click pause menu. |
-| wiring | `src/main.ts` | The old module-scope single `grid` is gone; everything acts on `tabs.activeWorkspace.grid`. Owns the `OrchWiring` router + persistence + preview timer. |
+| `Workspace` | `src/workspace.ts` | One tab = a `Grid` + its own dock; hides via `display:none`, drops WebGL when hidden, serializes its preview pane's full viewport on demand. |
+| `TabBar` | `src/tabbar.ts` | The tab strip: switch, close, new (+ → real starting surface), rename, color, **alert chip**, status chip, **live** hover thumbnail, right-click pause menu. |
+| wiring | `src/main.ts` | The old module-scope single `grid` is gone; everything acts on `tabs.activeWorkspace.grid`. Owns the `OrchWiring` router, `openUserTab`, and persistence. |
 | shortcuts | `src/shortcuts.ts` | new / close / next / prev tab. |
 | fit guard | `src/panefit.ts` | The pure, tested "hidden ⇒ no resize" decision. |
-| routing/preview | `src/tabroute.ts` | Pure: cross-tab attention → tab badge, focus-switches-tab, preview throttle. |
+| routing | `src/tabroute.ts` | Pure: cross-tab attention → tab badge (+ most-urgent reason), focus-switches-tab. |
 | persistence | `src/tabstore.ts` | Pure encode/decode of the saved tab set; stored in `localStorage` (`loomux.tabs`). |
 
 ## The load-bearing invariant (CLAUDE.md constraint 1)
@@ -53,7 +59,9 @@ any zero-width pane. This is the exact maximize precedent, now covering tabs.
 1. Launch loomux. You start with one default tab (**Tab 1**) holding one pane —
    identical to before.
 2. Press **Ctrl+Shift+T** (or click **+** in the tab strip) → a second tab opens
-   and activates, with its own fresh pane.
+   and activates, **immediately showing the same starting surface a fresh loomux
+   pane does**: a terminal in plain mode, or the agent launcher in agent mode
+   (finding 3 — a new tab is never blank).
 3. Split panes in each tab (**Ctrl+Shift+E / O**), toggle agent mode
    (**Ctrl+Shift+A**) and open an agent pane. Each tab keeps its own layout.
 4. Switch tabs with **Ctrl+Shift+[** / **Ctrl+Shift+]** (or click a tab). The
@@ -77,11 +85,14 @@ any zero-width pane. This is the exact maximize precedent, now covering tabs.
    launcher. It opens in a **new project tab named for the repo** (not the tab
    you were on). Its workers spawn **into that same tab** as the backend requests
    them — switch away and they still land in the project's tab.
-10. Trigger a worker that blocks on the human (e.g. an agent asking a question)
-    and switch to another tab. The blocked agent's tab shows a **pulsing dot**
-    on its strip entry (red for `blocked`, amber otherwise) — reusing the same
-    attention mapping as the pane header / dock chip. Cross-tab, so a hidden
-    project surfaces its ask.
+10. Trigger a worker that blocks on the human (permission prompt / question) and
+    switch to another tab. The blocked agent's tab lights up with an
+    **unmistakable alert chip** on its strip entry — the **same label the pane
+    header shows** (`⚠ blocked` in red / `⚠ waiting` in amber, via
+    `attention.ts`), plus a tinted, pulsing tab (finding 1). It covers **every**
+    attention class (blocked/waiting/report/gate) and **both agent and plain
+    (#40) panes**, for any tab, cross-tab — so a hidden project can't hide its
+    ask. Click the tab to jump straight to it.
 11. When the orchestrator focuses an agent (or you restore a session), loomux
     **switches to that agent's tab first, then focuses the pane**.
 12. End the orchestration — its (now-dead) panes close in the owning tab.
@@ -90,10 +101,14 @@ any zero-width pane. This is the exact maximize precedent, now covering tabs.
 
 13. A project tab shows a live **status chip**: `✦<agents> · $<cost>` from the
     group summary/usage, refreshed on a timer.
-14. Hover a **background** tab → a small **thumbnail** of its viewport (a text
-    snapshot of the terminal, refreshed on switch-away and on a throttle). It is
-    a snapshot string, never a live/laid-out pane (that would re-arm the resize
-    storm the whole design avoids).
+14. Hover a **background** tab → a **live thumbnail** of its **full viewport**
+    (finding 2). It re-serializes the pane's in-memory buffer every ~700ms while
+    you hover, so a **currently-running prompt streams in** as you watch. The
+    whole viewport is rendered (all rows/cols) and CSS-scaled to fit — no
+    clipping. It shows the pane that **needs attention** if any, else the active
+    pane. It is still a serialized-text snapshot, **never a laid-out pane** (xterm
+    keeps processing writes into its buffer while hidden, so no layout and no PTY
+    resize is ever armed — the invariant holds).
 15. **Right-click** a project tab → **Pause project** / **Resume project**
     (`pauseGroup`/`resumeGroup`) to hold or resume prompt delivery and contain
     unattended spend; a paused tab shows a **⏸**. The menu also has rename/close.
@@ -109,9 +124,9 @@ any zero-width pane. This is the exact maximize precedent, now covering tabs.
   reconnects when you restore that group's session from the session browser
   (which now routes into the correct tab). Full layout persistence is out of
   scope for the prototype.
-- **Preview is text, not pixels.** The thumbnail strips ANSI and shows the last
-  lines of the serialized viewport — enough to recognize a tab at a glance, not
-  a pixel-accurate mini-terminal.
+- **Preview is text, not pixels.** The live thumbnail strips ANSI (colors) and
+  renders the full viewport as scaled monospace text — the content and layout of
+  the screen, not a pixel/color-accurate mini-terminal.
 - **Background tabs created while hidden keep a WebGL context** until first
   shown-then-hidden; hidden *active-then-switched* tabs drop it immediately.
   A minor resource nicety, not a correctness issue.
@@ -123,6 +138,17 @@ any zero-width pane. This is the exact maximize precedent, now covering tabs.
 - `test/tabs.test.ts` — TabManager: add/remove/switch, active invariant,
   never-zero-tabs, switch-is-hide-not-dispose, group/pty routing seams.
 - `test/panefit.test.ts` — the no-resize invariant (hidden ⇒ no resize).
-- `test/tabroute.test.ts` — cross-tab attention badge, focus-switches-tab,
-  preview throttle.
+- `test/tabroute.test.ts` — cross-tab attention badge (every class badges the
+  tab; most-urgent reason wins; blocked = urgent), focus-switches-tab.
 - `test/tabstore.test.ts` — persistence encode/decode round-trip + validation.
+
+## Manual checks for the round-2 fixes
+
+- **Alert (finding 1):** in agent mode, get an agent to a permission prompt in a
+  **background** tab → that tab shows `⚠ blocked`/`⚠ waiting` + pulse within one
+  attention scan (~3s). Also fire it in a plain shell (a CLI waiting on input) to
+  confirm non-agent panes badge too.
+- **Live preview (finding 2):** hover a background tab running a streaming
+  command → the thumbnail updates as output arrives, showing the whole screen.
+- **New tab (finding 3):** Ctrl+Shift+T / **+** in plain mode → a terminal
+  appears immediately; in agent mode → the launcher appears immediately.

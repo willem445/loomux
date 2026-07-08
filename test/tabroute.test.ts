@@ -3,13 +3,7 @@
 // Pure (tabroute.ts) — no DOM/Tauri. Run `npm test`.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import {
-  tabAttention,
-  sameAttention,
-  revealPlan,
-  shouldRefreshPreview,
-  type TabAttn,
-} from "../src/tabroute.ts";
+import { tabAttention, sameAttention, revealPlan, type TabAttn } from "../src/tabroute.ts";
 
 const ptyMap = (pairs: [number, string][]) => new Map<number, string>(pairs);
 
@@ -23,7 +17,7 @@ test("tabAttention badges the tab owning a needs-attention pty", () => {
     ])
   );
   assert.equal(out.size, 1);
-  assert.deepEqual(out.get("ws-b"), { urgent: false });
+  assert.deepEqual(out.get("ws-b"), { urgent: false, reason: "waiting" });
   assert.equal(out.has("ws-a"), false, "a tab with no attention item is not badged");
 });
 
@@ -38,7 +32,36 @@ test("tabAttention marks a tab urgent if ANY of its ptys is blocked", () => {
       [2, "ws-a"],
     ])
   );
-  assert.deepEqual(out.get("ws-a"), { urgent: true }, "urgency reuses attention.ts (blocked = urgent)");
+  assert.deepEqual(
+    out.get("ws-a"),
+    { urgent: true, reason: "blocked" },
+    "urgency reuses attention.ts (blocked = urgent) and shows the most urgent reason"
+  );
+});
+
+test("tabAttention keeps the highest-priority reason when a tab has several", () => {
+  const out = tabAttention(
+    [
+      { pty_id: 1, reason: "report" },
+      { pty_id: 2, reason: "waiting" },
+    ],
+    ptyMap([
+      [1, "ws-a"],
+      [2, "ws-a"],
+    ])
+  );
+  assert.deepEqual(out.get("ws-a"), { urgent: false, reason: "waiting" }, "waiting outranks report");
+});
+
+test("every attention class badges the tab (blocked/waiting/report/gate), urgent only for blocked", () => {
+  for (const reason of ["blocked", "waiting", "report", "gate"]) {
+    const out = tabAttention([{ pty_id: 1, reason }], ptyMap([[1, "ws-a"]]));
+    assert.deepEqual(
+      out.get("ws-a"),
+      { urgent: reason === "blocked", reason },
+      `${reason} must badge the tab`
+    );
+  }
 });
 
 test("tabAttention ignores null-pty items and ptys not mapped to a tab", () => {
@@ -53,12 +76,14 @@ test("tabAttention ignores null-pty items and ptys not mapped to a tab", () => {
 });
 
 test("sameAttention detects equal and changed sets (skips needless re-renders)", () => {
-  const a = new Map<string, TabAttn>([["ws-a", { urgent: false }]]);
-  const b = new Map<string, TabAttn>([["ws-a", { urgent: false }]]);
-  const c = new Map<string, TabAttn>([["ws-a", { urgent: true }]]);
+  const a = new Map<string, TabAttn>([["ws-a", { urgent: false, reason: "waiting" }]]);
+  const b = new Map<string, TabAttn>([["ws-a", { urgent: false, reason: "waiting" }]]);
+  const c = new Map<string, TabAttn>([["ws-a", { urgent: true, reason: "blocked" }]]);
+  const e = new Map<string, TabAttn>([["ws-a", { urgent: false, reason: "report" }]]);
   const d = new Map<string, TabAttn>();
   assert.equal(sameAttention(a, b), true);
   assert.equal(sameAttention(a, c), false, "urgency flip is a change");
+  assert.equal(sameAttention(a, e), false, "reason change is a change");
   assert.equal(sameAttention(a, d), false, "size change is a change");
 });
 
@@ -73,10 +98,4 @@ test("revealPlan: a pty in a hidden tab switches tabs; in the active tab it does
   assert.deepEqual(revealPlan(map, "ws-a", 5), { switchTo: null, known: true });
   // unknown pty → caller falls back to a cross-tab search.
   assert.deepEqual(revealPlan(map, "ws-a", 999), { switchTo: null, known: false });
-});
-
-test("shouldRefreshPreview gates on the throttle interval", () => {
-  assert.equal(shouldRefreshPreview(1000, 5000, 4000), true, "interval elapsed → refresh");
-  assert.equal(shouldRefreshPreview(1000, 4999, 4000), false, "just under → skip");
-  assert.equal(shouldRefreshPreview(1000, 5001, 4000), true);
 });
