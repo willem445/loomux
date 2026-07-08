@@ -466,10 +466,17 @@ the two cost/safety controls the unattended-spend risk demands.
   *any* growth as activity (as the watchdog does) let a single stray repaint byte reset the
   whole quiet window, so an orchestrator that repaints even occasionally could never
   accumulate a full window and never ticked. The idle tick instead discriminates by size (pure
-  `idle_output_is_activity`): only per-tick growth `>= IDLE_TICK_REPAINT_FLOOR` (2048 bytes — a
-  real turn dumps many KB, an idle repaint at most a few hundred) counts as the orchestrator
-  working and resets the clock + latch; sub-floor growth rebaselines the counter but leaves the
-  quiet clock running. So one repaint can never demand another full window of silence.
+  `idle_output_is_activity`): only per-tick growth `>= idle_activity_floor_bytes` counts as the
+  orchestrator working and resets the clock + latch; sub-floor growth rebaselines the counter but
+  leaves the quiet clock running. So one repaint can never demand another full window of silence.
+  The **default 2048** is justified by measurement — a captured full idle Claude Code input-box
+  render (box-drawing + ANSI) is ~164 bytes (`tests/fixtures/attention/idle-input-box.txt`, pinned
+  by a test), so 2048 gives ~12× headroom over a complete idle repaint. No raw idle-pane byte
+  *stream* is captured anywhere and spawning a live CLI is forbidden, so that rendered-frame size
+  is the honest available measurement. Because this rides the exact wake+spend axis that already
+  failed once, the floor is a **live-tunable guardrail** (`Guardrails.idle_activity_floor_bytes`,
+  0→default, clamped `1..=1 MiB`, persisted, audited, `set_idle_activity_floor`) — the runtime
+  remedy if a chattier CLI's idle repaints exceed the default.
 - **Self-regulating + capped.** A real output burst (the orchestrator acting) resets the quiet
   clock **and** clears the one-notice latch (`AgentEntry.idle_tick_notified`, mirroring
   `watchdog_notified`), so the worst case is one tick per idle window — an action defers the
@@ -480,8 +487,12 @@ the two cost/safety controls the unattended-spend risk demands.
   steering. **Paused** groups are skipped wholesale and their latch left intact (same
   reasoning as the watchdog).
 - **Observability.** Because the tick is otherwise invisible until it fires, `orch_autonomy`
-  surfaces `idle_tick_minutes` plus (while on) `quiet_secs` and `eligible_in_secs`, so the
-  panel can render "next tick in ~Xm" and the human isn't left wondering whether it's armed.
+  surfaces `idle_tick_minutes`, `idle_activity_floor_bytes`, and (while on) `quiet_secs`,
+  `eligible_in_secs`, and `tick_status`. The countdown is **honest** (`idle_tick_observability`):
+  `eligible_in_secs` is a real timer only for `counting_down` / `eligible` / `rate_capped`; when
+  the one-notice latch gates the next tick (`waiting_for_activity`) there is no timer — it waits
+  for the orchestrator to emit output — so `eligible_in_secs` is `null`, never a lying 0. The
+  per-hour cap folds in as a real timer (time until the oldest tick ages out of the window).
 - **The toggle.** Off by default. `is_autonomous`/`set_autonomous` on the `set_notify`
   marker-file pattern (an `autonomous` marker), so it's live-togglable from the group panel
   and survives restarts (re-seeded in `create_group` next to `paused`/`notify`). The label

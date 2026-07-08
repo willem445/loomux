@@ -3137,12 +3137,27 @@ fn idle_output_activity_ignores_subfloor_repaint_growth() {
     // The repaint-tolerant quiet signal: only a burst >= floor counts as the
     // orchestrator working; sub-floor creep is idle repaint noise.
     let floor = 2048u64;
-    assert!(idle_output_is_activity(0, 2048, floor), "a burst at the floor is activity");
+    // Boundary is a `>=`: floor-1 is noise, floor is activity (rev-59 pin).
+    assert!(!idle_output_is_activity(0, 2047, floor), "one byte under the floor is still noise");
+    assert!(idle_output_is_activity(0, 2048, floor), "exactly at the floor is activity");
     assert!(idle_output_is_activity(1_000, 10_000, floor));
     assert!(!idle_output_is_activity(0, 200, floor), "a 200-byte statusline repaint is noise");
     assert!(!idle_output_is_activity(5_000, 5_200, floor), "sub-floor creep is not work");
     assert!(!idle_output_is_activity(5_000, 5_000, floor), "no growth is not activity");
     assert!(!idle_output_is_activity(5_000, 10, floor), "a counter reset (pty swap) is not activity");
+}
+
+#[test]
+fn default_activity_floor_clears_a_real_idle_repaint_frame() {
+    // Justify the 2048-byte default from real data: a captured full idle Claude
+    // Code input-box render (box-drawing + ANSI) is the largest idle repaint frame
+    // we have, and it must sit comfortably under the floor so it reads as noise.
+    // (No raw idle-pane byte *stream* is captured anywhere and spawning a live CLI
+    // is forbidden, so this rendered-frame size is the honest available measurement;
+    // the tunable floor is the runtime remedy for a chattier CLI.)
+    let frame = FIX_IDLE_BOX.len() as u64;
+    assert!(frame < 2048, "idle box render is {frame}B — must be under the 2048B default floor");
+    assert!(frame * 4 < 2048, "with ~4x headroom for a richer statusline, got {frame}B");
 }
 
 #[test]
@@ -3207,6 +3222,94 @@ fn idle_tick_minutes_is_configurable_persisted_and_surfaced() {
     let off = reg.autonomy_state(&gid);
     assert!(off["quiet_secs"].is_null(), "no quiet meter while autonomous is off");
     assert!(off["eligible_in_secs"].is_null());
+    assert_eq!(off["tick_status"], "off");
+}
+
+#[test]
+fn idle_activity_floor_is_configurable_persisted_and_surfaced() {
+    // rev-59 MODERATE: the activity floor is a live-tunable guardrail, not a bare
+    // const — the runtime remedy if a chatty CLI's idle repaints exceed the default.
+    let (reg, dir, gid, _oid) = autonomous_setup();
+    assert_eq!(reg.autonomy_state(&gid)["idle_activity_floor_bytes"].as_u64().unwrap(), 2048,
+        "shipped default floor is 2048 bytes");
+    assert_eq!(reg.set_idle_activity_floor(&gid, 8192).unwrap(), 8192);
+    assert_eq!(reg.group(&gid).unwrap().guardrails.idle_activity_floor_bytes, 8192);
+    assert_eq!(reg.autonomy_state(&gid)["idle_activity_floor_bytes"].as_u64().unwrap(), 8192);
+    assert_eq!(audit_count(&reg, &gid, "idle-activity-floor-set"), 1);
+    // 0 → default; huge clamps to 1 MiB; unknown group errors.
+    assert_eq!(reg.set_idle_activity_floor(&gid, 0).unwrap(), 2048);
+    assert_eq!(reg.set_idle_activity_floor(&gid, 999_999_999).unwrap(), 1024 * 1024);
+    assert!(reg.set_idle_activity_floor("no-such-group", 4096).is_err());
+    // Persisted across restart (live value wins over the launch default).
+    reg.set_idle_activity_floor(&gid, 4096).unwrap();
+    let reg2 = OrchRegistry::new(dir.path().to_path_buf());
+    reg2.set_port(45999);
+    reg2.create_group("C:/tmp/repo", rails()).unwrap();
+    assert_eq!(reg2.group(&gid).unwrap().guardrails.idle_activity_floor_bytes, 4096,
+        "a live-set activity floor survives restart");
+}
+
+#[test]
+fn a_higher_activity_floor_treats_bigger_growth_as_noise() {
+    // The floor actually governs the tick: raise it above a 5 KB burst and that
+    // growth reads as repaint noise (doesn't reset the quiet clock), so the tick
+    // still fires — while a burst >= the floor is activity and re-arms the latch.
+    let (reg, _d, gid, oid) = autonomous_setup();
+    reg.set_idle_activity_floor(&gid, 8192).unwrap();
+    let m = |t: u64| -> HashMap<String, u64> { [(oid.clone(), t)].into_iter().collect() };
+    let none = HashMap::new();
+    assert!(reg.idle_tick_tick(1_000, &m(5_000), &none).is_empty());
+    assert_eq!(reg.idle_tick_tick(FAR, &m(9_000), &none), vec![oid.clone()],
+        "with an 8 KB floor, 4–5 KB growth is repaint noise and the tick still fires");
+    assert!(reg.idle_tick_tick(FAR, &m(20_000), &none).is_empty(),
+        "a growth >= the floor (11 KB) is activity and re-arms the latch");
+}
+
+#[test]
+fn idle_tick_status_is_honest_about_latch_and_cap() {
+    // rev-59 LOW: eligible_in_secs must never render a lying 0 while a non-time gate
+    // (latch / per-hour cap) holds the tick. tick_status carries the honest reason.
+    let (reg, _d, gid, oid) = autonomous_setup();
+    let m = |t: u64| -> HashMap<String, u64> { [(oid.clone(), t)].into_iter().collect() };
+    let none = HashMap::new();
+    let win = 5 * 60_000u64; // default 5-min window, in ms
+
+    // 1) Fresh: counting down toward the first tick.
+    let s = reg.autonomy_state(&gid);
+    assert_eq!(s["tick_status"], "counting_down");
+    assert!(s["eligible_in_secs"].as_u64().unwrap() <= 5 * 60);
+
+    // 2) After a tick fires the latch is set: waiting_for_activity, secs NULL — the
+    //    core rev-59 case (a countdown here would hit 0 while nothing fires).
+    assert_eq!(reg.idle_tick_tick(FAR, &none, &none), vec![oid.clone()]);
+    let s = reg.autonomy_state(&gid);
+    assert_eq!(s["tick_status"], "waiting_for_activity");
+    assert!(s["eligible_in_secs"].is_null(), "a latched tick must not render a countdown");
+
+    // 3) A real burst clears the latch and resets the clock so far in the (synthetic)
+    //    past that it reads as eligible now.
+    assert!(reg.idle_tick_tick(1_000, &m(100_000), &none).is_empty());
+    let s = reg.autonomy_state(&gid);
+    assert_eq!(s["tick_status"], "eligible");
+    assert_eq!(s["eligible_in_secs"].as_u64().unwrap(), 0);
+
+    // 4) Fill the per-hour cap to MAX_IDLE_TICKS_PER_HOUR (6). Step 2 already fired
+    //    one, so 5 more here reach the cap. Each needs the latch cleared (a real
+    //    burst that also resets the clock) then a full window of quiet.
+    for i in 0..5u64 {
+        let base = FAR + i * (win + 10);
+        assert!(reg.idle_tick_tick(base, &m(1_000_000 + i * 100_000), &none).is_empty(),
+            "burst i={i} resets, no fire");
+        assert_eq!(reg.idle_tick_tick(base + win + 1, &none, &none), vec![oid.clone()],
+            "a fresh window after the burst fires (i={i})");
+    }
+    // Cap now full; clear the last fire's latch with a burst (adds no tick_time) so
+    // the CAP is the sole remaining gate.
+    assert!(reg.idle_tick_tick(FAR + 100 * win, &m(9_000_000), &none).is_empty());
+    let s = reg.autonomy_state(&gid);
+    assert_eq!(s["tick_status"], "rate_capped", "cap full + latch clear → rate_capped");
+    assert!(s["eligible_in_secs"].as_u64().is_some(),
+        "rate_capped still yields a real (cap-based) countdown, not null");
 }
 
 #[test]

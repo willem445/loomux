@@ -190,16 +190,26 @@ const DEFAULT_IDLE_TICK_MINUTES: u32 = 5;
 /// `clamped()` (0 is treated as "unset" → default, not "disabled": the `autonomous`
 /// marker is the on/off switch, so a 0 here must never silently stop ticking).
 const MAX_IDLE_TICK_MINUTES: u32 = 1440;
-/// Autonomous mode (#83): per-tick pty-output growth (bytes) at or above which the
-/// orchestrator counts as *actively working* — the growth resets the quiet clock
-/// and the one-notice latch. Below it, growth is treated as idle **repaint noise**
-/// (statusline/spinner frames keep `output_total` creeping while the CLI is parked)
-/// and does NOT reset the clock, so an occasional repaint can't starve the tick
-/// (the bug where a single stray byte demanded another full quiet window). A coarse
-/// burst floor — there is no output-frame classifier — since a real orchestrator
-/// turn dumps many KB while an idle repaint is at most a few hundred bytes. See
-/// `idle_output_is_activity`.
-const IDLE_TICK_REPAINT_FLOOR: u64 = 2048;
+/// Autonomous mode (#83): default per-tick pty-output growth (bytes) at or above
+/// which the orchestrator counts as *actively working* — the growth resets the
+/// quiet clock and the one-notice latch. Below it, growth is treated as idle
+/// **repaint noise** (statusline/spinner frames keep `output_total` creeping while
+/// the CLI is parked) and does NOT reset the clock, so an occasional repaint can't
+/// starve the tick (the bug where a single stray byte demanded another full quiet
+/// window). A coarse burst floor — there is no output-frame classifier — since a
+/// real orchestrator turn dumps many KB while an idle repaint is a few hundred
+/// bytes. **Default justified by measurement:** a full idle Claude Code input-box
+/// render (box-drawing + ANSI) is ~164 bytes (`tests/fixtures/attention/
+/// idle-input-box.txt`), so 2048 leaves ~12× headroom over a complete idle
+/// repaint. Because this rides the exact wake+spend axis that already failed once
+/// (finding 2) and a chattier CLI could exceed it, it is a **live-tunable guardrail
+/// knob** (`Guardrails.idle_activity_floor_bytes`), not a bare const — see
+/// `set_idle_activity_floor` / `idle_output_is_activity`.
+const DEFAULT_IDLE_ACTIVITY_FLOOR_BYTES: u64 = 2048;
+/// Upper bound on the activity floor (1 MiB): beyond this no real orchestrator turn
+/// would clear it, so ticking would fire even while working. Floor is 1 (any growth
+/// = activity, the original behavior) — both enforced in `clamped()`.
+const MAX_IDLE_ACTIVITY_FLOOR_BYTES: u64 = 1024 * 1024;
 /// Autonomous mode (#83): hard backstop on idle ticks delivered per rolling hour,
 /// independent of the one-notice latch — the analogue of `max_spawns_per_hour` for
 /// the tick source. With a minutes-scale quiet gate the latch already bounds this
@@ -515,6 +525,14 @@ pub struct Guardrails {
     /// group.json, live-settable via `set_idle_tick_minutes` so the human can drop
     /// it to 1–2 min to verify quickly. See `idle_tick_should_fire`.
     pub idle_tick_minutes: u32,
+    /// Autonomous mode idle-tick activity floor in bytes (#83): per-tick pty-output
+    /// growth at/above which the orchestrator counts as working (resets the quiet
+    /// clock); sub-floor growth is idle repaint noise. 0 = unset →
+    /// `DEFAULT_IDLE_ACTIVITY_FLOOR_BYTES`; clamped to
+    /// `1..=MAX_IDLE_ACTIVITY_FLOOR_BYTES`. Live-settable via
+    /// `set_idle_activity_floor` so a chattier CLI whose idle repaints exceed the
+    /// default has a runtime remedy (rev-59). See `idle_output_is_activity`.
+    pub idle_activity_floor_bytes: u64,
 }
 
 impl Guardrails {
@@ -547,6 +565,13 @@ impl Guardrails {
             self.idle_tick_minutes = DEFAULT_IDLE_TICK_MINUTES;
         }
         self.idle_tick_minutes = self.idle_tick_minutes.clamp(1, MAX_IDLE_TICK_MINUTES);
+        // 0 = unset → default; floored at 1 (any growth = activity) so it can never
+        // be a no-op that treats real bursts as noise.
+        if self.idle_activity_floor_bytes == 0 {
+            self.idle_activity_floor_bytes = DEFAULT_IDLE_ACTIVITY_FLOOR_BYTES;
+        }
+        self.idle_activity_floor_bytes =
+            self.idle_activity_floor_bytes.clamp(1, MAX_IDLE_ACTIVITY_FLOOR_BYTES);
         self
     }
 
@@ -2832,6 +2857,8 @@ impl OrchRegistry {
                 autonomy_budget_tokens: g["autonomy_budget_tokens"].as_u64().unwrap_or(0),
                 // Idle-tick window (#83): absent → 0 → clamped() maps to the default.
                 idle_tick_minutes: g["idle_tick_minutes"].as_u64().unwrap_or(0) as u32,
+                // Idle-tick activity floor (#83): absent → 0 → clamped() → default.
+                idle_activity_floor_bytes: g["idle_activity_floor_bytes"].as_u64().unwrap_or(0),
             },
         ))
     }
@@ -2878,6 +2905,11 @@ impl OrchRegistry {
                 } else {
                     persisted.idle_tick_minutes.clamp(1, MAX_IDLE_TICK_MINUTES)
                 };
+                guardrails.idle_activity_floor_bytes = if persisted.idle_activity_floor_bytes == 0 {
+                    DEFAULT_IDLE_ACTIVITY_FLOOR_BYTES
+                } else {
+                    persisted.idle_activity_floor_bytes.clamp(1, MAX_IDLE_ACTIVITY_FLOOR_BYTES)
+                };
             }
         }
         let info = GroupInfo { id: id.clone(), repo: repo.to_string(), guardrails };
@@ -2904,6 +2936,7 @@ impl OrchRegistry {
                     "watchdog_stall_minutes": info.guardrails.watchdog_stall_minutes,
                     "autonomy_budget_tokens": info.guardrails.autonomy_budget_tokens,
                     "idle_tick_minutes": info.guardrails.idle_tick_minutes,
+                    "idle_activity_floor_bytes": info.guardrails.idle_activity_floor_bytes,
                 },
             }))
             .unwrap(),
@@ -3241,13 +3274,15 @@ impl OrchRegistry {
         }
         let paused = self.paused.lock_safe().clone();
         let tick_times = self.idle_tick_times.lock_safe().clone();
-        // Per-group idle-tick window (guardrail, live-adjustable). Snapshot like
-        // `watchdog_tick` does its thresholds.
-        let thresholds: HashMap<String, u32> = self
+        // Per-group idle-tick window + activity floor (guardrails, live-adjustable).
+        // Snapshot like `watchdog_tick` does its thresholds.
+        let cfg: HashMap<String, (u32, u64)> = self
             .groups
             .lock_safe()
             .iter()
-            .map(|(id, g)| (id.clone(), g.guardrails.idle_tick_minutes))
+            .map(|(id, g)| {
+                (id.clone(), (g.guardrails.idle_tick_minutes, g.guardrails.idle_activity_floor_bytes))
+            })
             .collect();
 
         let mut to_notify: Vec<(String, String)> = Vec::new();
@@ -3266,9 +3301,12 @@ impl OrchRegistry {
                 // rebaselines the counter but does NOT reset the clock, so an
                 // occasional statusline/spinner frame can't starve the tick (the
                 // bug where any stray byte demanded another full quiet window).
+                let (threshold, floor) = cfg
+                    .get(&a.group)
+                    .copied()
+                    .unwrap_or((DEFAULT_IDLE_TICK_MINUTES, DEFAULT_IDLE_ACTIVITY_FLOOR_BYTES));
                 if let Some(&cur) = outputs.get(&a.id) {
-                    let meaningful =
-                        idle_output_is_activity(a.last_output_total, cur, IDLE_TICK_REPAINT_FLOOR);
+                    let meaningful = idle_output_is_activity(a.last_output_total, cur, floor);
                     a.last_output_total = cur; // rebaseline every observation
                     if meaningful {
                         a.last_progress_ms = now;
@@ -3292,10 +3330,6 @@ impl OrchRegistry {
                     continue;
                 }
                 let times = tick_times.get(&a.group).map(Vec::as_slice).unwrap_or(&[]);
-                let threshold = thresholds
-                    .get(&a.group)
-                    .copied()
-                    .unwrap_or(DEFAULT_IDLE_TICK_MINUTES);
                 if idle_tick_should_fire(
                     a.last_progress_ms,
                     now,
@@ -3691,36 +3725,54 @@ impl OrchRegistry {
         Ok(applied)
     }
 
-    /// Rewrite only `guardrails.idle_tick_minutes` in group.json (additive patch,
-    /// same crash-safe write as `persist_autonomy_budget`).
+    /// Rewrite only `guardrails.idle_tick_minutes` in group.json (additive patch).
     fn persist_idle_tick_minutes(&self, group: &str, minutes: u32) -> Result<(), String> {
-        let dir = self.group_dir(group);
-        let path = dir.join("group.json");
-        let mut v: Value = serde_json::from_str(&fs::read_to_string(&path).map_err(|e| e.to_string())?)
-            .map_err(|e| e.to_string())?;
-        let obj = v.as_object_mut().ok_or("group.json root is not a JSON object")?;
-        match obj.get_mut("guardrails").and_then(Value::as_object_mut) {
-            Some(guard) => {
-                guard.insert("idle_tick_minutes".into(), json!(minutes));
-            }
-            None => {
-                obj.insert("guardrails".into(), json!({ "idle_tick_minutes": minutes }));
-            }
+        self.persist_guardrail_u64(group, "idle_tick_minutes", minutes as u64)
+    }
+
+    /// Set a live group's idle-tick activity floor in bytes on the fly (#83, the
+    /// rev-59 runtime remedy). 0 → default; floored at 1 and clamped to the max.
+    /// Persisted + audited; the idle-tick loop reads it fresh each pass. Returns the
+    /// applied (clamped) value — raise it if a chatty CLI's idle repaints starve the
+    /// tick, lower it if real small outputs read as idle.
+    pub fn set_idle_activity_floor(&self, group: &str, bytes: u64) -> Result<u64, String> {
+        let applied = if bytes == 0 {
+            DEFAULT_IDLE_ACTIVITY_FLOOR_BYTES
+        } else {
+            bytes.clamp(1, MAX_IDLE_ACTIVITY_FLOOR_BYTES)
+        };
+        let old = self
+            .group(group)
+            .ok_or("unknown group")?
+            .guardrails
+            .idle_activity_floor_bytes;
+        if applied == old {
+            return Ok(applied);
         }
-        let body = serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?;
-        let tmp = dir.join("group.json.tmp");
-        fs::write(&tmp, &body).map_err(|e| e.to_string())?;
-        if fs::rename(&tmp, &path).is_err() {
-            fs::write(&path, &body).map_err(|e| e.to_string())?;
-            let _ = fs::remove_file(&tmp);
-        }
-        Ok(())
+        self.persist_guardrail_u64(group, "idle_activity_floor_bytes", applied)?;
+        self.groups
+            .lock_safe()
+            .get_mut(group)
+            .ok_or("unknown group")?
+            .guardrails
+            .idle_activity_floor_bytes = applied;
+        self.audit(group, "human", "idle-activity-floor-set",
+            json!({ "from": old, "to": applied }));
+        Ok(applied)
     }
 
     /// Rewrite only `guardrails.autonomy_budget_tokens` in group.json, preserving
     /// every other stored field (additive patch, same crash-safe write as
     /// `persist_max_agents`).
     fn persist_autonomy_budget(&self, group: &str, tokens: u64) -> Result<(), String> {
+        self.persist_guardrail_u64(group, "autonomy_budget_tokens", tokens)
+    }
+
+    /// Additive crash-safe patch of a single numeric `guardrails.<key>` in
+    /// group.json (preserves every other field; temp-file + atomic rename, the
+    /// `persist_max_agents` pattern). The shared body behind the live-settable
+    /// numeric guardrails (budget, activity floor).
+    fn persist_guardrail_u64(&self, group: &str, key: &str, value: u64) -> Result<(), String> {
         let dir = self.group_dir(group);
         let path = dir.join("group.json");
         let mut v: Value = serde_json::from_str(&fs::read_to_string(&path).map_err(|e| e.to_string())?)
@@ -3728,10 +3780,10 @@ impl OrchRegistry {
         let obj = v.as_object_mut().ok_or("group.json root is not a JSON object")?;
         match obj.get_mut("guardrails").and_then(Value::as_object_mut) {
             Some(guard) => {
-                guard.insert("autonomy_budget_tokens".into(), json!(tokens));
+                guard.insert(key.into(), json!(value));
             }
             None => {
-                obj.insert("guardrails".into(), json!({ "autonomy_budget_tokens": tokens }));
+                obj.insert("guardrails".into(), json!({ key: value }));
             }
         }
         let body = serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?;
@@ -3776,29 +3828,29 @@ impl OrchRegistry {
         // (not the user) flipped it off, so the UI can distinguish "budget spent —
         // raise it or re-enable" from a plain user toggle-off.
         let suspended = !on && self.autonomy_suspended(group);
-        // Idle-tick observability (while on): how long output-quiet, and how long
-        // until the next tick is eligible. Read the orchestrator's quiet clock
-        // (`last_progress_ms`, maintained by the idle-tick loop). `null` when off or
-        // no live orchestrator — there's no live meter to report.
-        let (quiet_secs, eligible_in_secs) = if on {
-            let now = now_ms();
-            let quiet_since = self
-                .agents
-                .lock_safe()
-                .values()
-                .find(|a| a.group == group && a.role == Role::Orchestrator
-                    && a.status != AgentStatus::Dead)
-                .map(|a| a.last_progress_ms);
-            match quiet_since {
-                Some(since) => {
-                    let quiet = now.saturating_sub(since) / 1000;
-                    let window = idle_tick_minutes as u64 * 60;
-                    (Some(quiet), Some(window.saturating_sub(quiet)))
-                }
-                None => (None, None),
-            }
+        let floor = rails
+            .as_ref()
+            .map(|g| g.idle_activity_floor_bytes)
+            .filter(|&b| b > 0)
+            .unwrap_or(DEFAULT_IDLE_ACTIVITY_FLOOR_BYTES);
+
+        // Idle-tick observability (while on). `tick_status` is the honest reason the
+        // UI renders; `eligible_in_secs` is a *real* countdown only when one exists
+        // — never a lying 0 that hits zero while a non-time gate holds the tick
+        // (rev-59). Statuses:
+        //   "off"                 — autonomous off / no live orchestrator (null secs)
+        //   "counting_down"       — quiet clock < window; secs = time left in window
+        //   "eligible"            — window met, latch clear, under cap; secs = 0
+        //                           (fires within one loop pass, ≤ IDLE_TICK_INTERVAL)
+        //   "waiting_for_activity"— already ticked this window (latch set); no timer
+        //                           gates it — it waits for the orchestrator to emit
+        //                           output — so secs = null, NOT 0
+        //   "rate_capped"         — the per-hour cap is full; secs = time until the
+        //                           oldest tick ages out of the window (a real timer)
+        let (quiet_secs, eligible_in_secs, tick_status) = if on {
+            self.idle_tick_observability(group, idle_tick_minutes)
         } else {
-            (None, None)
+            (None, None, "off")
         };
         json!({
             "autonomous": on,
@@ -3808,9 +3860,69 @@ impl OrchRegistry {
             "spend_since_enable_tokens": spend,
             "suspended": suspended,
             "idle_tick_minutes": idle_tick_minutes,
+            "idle_activity_floor_bytes": floor,
             "quiet_secs": quiet_secs,
             "eligible_in_secs": eligible_in_secs,
+            "tick_status": tick_status,
         })
+    }
+
+    /// Compute the honest idle-tick countdown for `autonomy_state` (#83, rev-59):
+    /// `(quiet_secs, eligible_in_secs, tick_status)`, folding the quiet clock, the
+    /// one-notice latch, and the per-hour cap so a rendered `eligible_in_secs`
+    /// never hits 0 while a non-time gate still holds the tick. See the caller's
+    /// status table. `now_ms` is read once here so the arithmetic is self-contained.
+    fn idle_tick_observability(
+        &self,
+        group: &str,
+        idle_tick_minutes: u32,
+    ) -> (Option<u64>, Option<u64>, &'static str) {
+        let now = now_ms();
+        // The orchestrator's quiet clock + latch (maintained by the idle-tick loop).
+        let orch = self
+            .agents
+            .lock_safe()
+            .values()
+            .find(|a| a.group == group && a.role == Role::Orchestrator
+                && a.status != AgentStatus::Dead)
+            .map(|a| (a.last_progress_ms, a.idle_tick_notified));
+        let Some((since, latched)) = orch else {
+            return (None, None, "off"); // no live orchestrator → no meter
+        };
+        let quiet = now.saturating_sub(since) / 1000;
+        let window = idle_tick_minutes as u64 * 60;
+        let quiet_remaining = window.saturating_sub(quiet);
+
+        // Latch: already ticked this window — no timer counts down to the next
+        // (it waits for the orchestrator to produce output), so report it as such
+        // rather than a false 0.
+        if latched {
+            return (Some(quiet), None, "waiting_for_activity");
+        }
+        // Per-hour cap: if the trailing-hour tick count is at the cap, the next
+        // tick is gated until the oldest ages out — a real timer, so fold it in.
+        let cap_remaining = {
+            let times = self.idle_tick_times.lock_safe();
+            let recent: Vec<u64> = times
+                .get(group)
+                .map(|v| v.iter().copied().filter(|&t| now.saturating_sub(t) < SPAWN_RATE_WINDOW_MS).collect())
+                .unwrap_or_default();
+            if recent.len() as u32 >= MAX_IDLE_TICKS_PER_HOUR {
+                let oldest = recent.iter().copied().min().unwrap_or(now);
+                Some((oldest + SPAWN_RATE_WINDOW_MS).saturating_sub(now) / 1000)
+            } else {
+                None
+            }
+        };
+        if let Some(cap_wait) = cap_remaining {
+            // Eligible only once BOTH the quiet window and a cap slot are satisfied.
+            return (Some(quiet), Some(quiet_remaining.max(cap_wait)), "rate_capped");
+        }
+        if quiet_remaining > 0 {
+            (Some(quiet), Some(quiet_remaining), "counting_down")
+        } else {
+            (Some(quiet), Some(0), "eligible")
+        }
     }
 
     /// Clear the orchestrator's idle-tick anti-nag latch for a group (e.g. on
@@ -6082,6 +6194,9 @@ pub fn create_orchestration(
             // #83: 0 → clamped() applies DEFAULT_IDLE_TICK_MINUTES; live-settable via
             // orch_set_idle_tick_minutes.
             idle_tick_minutes: 0,
+            // #83: 0 → clamped() applies DEFAULT_IDLE_ACTIVITY_FLOOR_BYTES; live-settable
+            // via orch_set_idle_activity_floor.
+            idle_activity_floor_bytes: 0,
         },
         None,
         None,
@@ -6174,21 +6289,27 @@ pub fn orch_group_usage(reg: tauri::State<Arc<OrchRegistry>>, group_id: String) 
 //   orch_set_idle_tick_minutes(group_id, minutes: u32) -> Result<u32, String>
 //     Per-group idle-tick quiet window; 0 → default (5), floored at 1, clamped to
 //     1440. Returns the applied value. Lets the human set 1–2 min to verify fast.
+//   orch_set_idle_activity_floor(group_id, bytes: u64) -> Result<u64, String>
+//     Per-group per-tick byte floor separating a real turn from idle repaint noise;
+//     0 → default (2048), floored at 1, clamped to 1 MiB. Returns the applied value.
+//     The runtime remedy if a chatty CLI's idle repaints starve the tick.
 //   orch_autonomy(group_id) -> Value
 //     The whole panel state in one read:
 //       { autonomous: bool, auto_merge: bool, budget_tokens: u64,
 //         budget_anchor_tokens: u64, spend_since_enable_tokens: u64 | null,
-//         suspended: bool, idle_tick_minutes: u32,
-//         quiet_secs: u64 | null, eligible_in_secs: u64 | null }
+//         suspended: bool, idle_tick_minutes: u32, idle_activity_floor_bytes: u64,
+//         quiet_secs: u64 | null, eligible_in_secs: u64 | null,
+//         tick_status: "off"|"counting_down"|"eligible"|"waiting_for_activity"|"rate_capped" }
 //     `spend_since_enable_tokens` is null when autonomous is off (no live meter).
 //     `suspended` is true iff autonomous is off *because the budget enforcer
 //     flipped it* (durable `autonomy_suspended` marker), vs a plain user toggle-off
 //     — so the UI shows "budget spent, raise it or re-enable" without parsing the
 //     audit log. Always false while autonomous is on.
-//     `idle_tick_minutes` is the active quiet window. `quiet_secs` (how long the
-//     orchestrator has been output-quiet) and `eligible_in_secs` (seconds until the
-//     next tick is eligible, 0 = now) are non-null only while autonomous is on with
-//     a live orchestrator — the panel renders "next tick in ~Xm" from them.
+//     `idle_tick_minutes`/`idle_activity_floor_bytes` are the active knobs.
+//     `tick_status` is the honest idle-tick state; `eligible_in_secs` is a REAL
+//     countdown ONLY for `counting_down`/`eligible`/`rate_capped` (it never shows a
+//     lying 0 while the latch gates the tick — then it is null with status
+//     `waiting_for_activity`). Both are null while off / no live orchestrator.
 
 /// Enable/disable autonomous idle-tick mode for a group (durable, audited).
 #[tauri::command]
@@ -6232,6 +6353,18 @@ pub fn orch_set_idle_tick_minutes(
     minutes: u32,
 ) -> Result<u32, String> {
     reg.set_idle_tick_minutes(&group_id, minutes)
+}
+
+/// Set a group's idle-tick activity floor in bytes (0 → default; floored at 1,
+/// clamped to 1 MiB; durable, audited). Returns the applied value. The runtime
+/// remedy if a chatty CLI's idle repaints exceed the default and starve the tick.
+#[tauri::command]
+pub fn orch_set_idle_activity_floor(
+    reg: tauri::State<Arc<OrchRegistry>>,
+    group_id: String,
+    bytes: u64,
+) -> Result<u64, String> {
+    reg.set_idle_activity_floor(&group_id, bytes)
 }
 
 /// The group's autonomous-mode state for the panel: toggles, budget, anchor, and
