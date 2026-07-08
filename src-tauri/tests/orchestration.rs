@@ -3483,6 +3483,7 @@ fn git_shim_script_bakes_real_git_and_gates_tag_push() {
     assert!(sh.contains("refs/tags/"), "detects explicit tag refs");
     assert!(sh.contains("release_grants/"), "gates on a release grant");
     assert!(sh.contains("release-gate-blocked"), "audits refusals");
+    assert!(!sh.contains("\r"), "the POSIX git shim must be LF-only");
 }
 
 #[test]
@@ -3683,6 +3684,7 @@ fn gh_shim_script_bakes_real_gh_and_enforces_the_guards() {
         "checks both consent markers");
     assert!(sh.contains("unverifiable-base"), "fail-safe block on an undeterminable base");
     assert!(sh.contains("merge-gate-blocked") && sh.contains("audit.jsonl"), "audits refusals");
+    assert!(!sh.contains("\r"), "the POSIX shim must be LF-only (a CRLF #!/bin/sh is broken)");
     // rev-79 F1/F2: the shim parses positionals around global flags and honors the
     // caller's -R/--repo when resolving base + default branch.
     assert!(sh.contains("--repo") && sh.contains("-R"), "recognizes -R/--repo global flag");

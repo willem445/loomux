@@ -219,7 +219,11 @@ if [ -n "$gf" ] && loomux_grant_ok "$gf"; then
 fi
 loomux_block "gate-closed" "$default" "$num"
 "#;
-    TPL.replace("__REAL_GH__", real_gh)
+    // Normalize to LF: the raw-string newlines follow this source file's line
+    // endings, which git may check out as CRLF on Windows — but a CRLF `#!/bin/sh`
+    // script is broken under POSIX sh. The `.cmd` wrapper (which needs CRLF) is
+    // built separately with explicit `\r\n`.
+    TPL.replace("__REAL_GH__", real_gh).replace("\r\n", "\n")
 }
 
 /// The Windows `gh.cmd` wrapper: delegates to the POSIX shim (single source of
@@ -332,7 +336,8 @@ if [ -n "$gf" ] && loomux_grant_ok "$gf"; then
 fi
 loomux_block_release "$tag" "push"
 "#;
-    TPL.replace("__REAL_GIT__", real_git)
+    // Normalize to LF (see gh_shim_sh) — a CRLF POSIX script is broken.
+    TPL.replace("__REAL_GIT__", real_git).replace("\r\n", "\n")
 }
 
 /// The Windows `git.cmd` wrapper: delegates to the POSIX git shim via `sh`, or runs
