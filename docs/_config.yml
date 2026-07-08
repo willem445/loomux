@@ -1,0 +1,46 @@
+# Jekyll configuration for the Loomux documentation site.
+#
+# Tooling decision (see docs/README.md for the full rationale): this is a
+# GitHub-Pages-native Jekyll site — plain checked-in Markdown plus this config,
+# with *no* package.json, Gemfile, or other repo-local toolchain to maintain.
+# The `just-the-docs` theme (pinned below) is pulled in as a remote theme by
+# `actions/jekyll-build-pages` in .github/workflows/docs.yml, so there is
+# nothing to install, pin in a lockfile, or keep patched in this repo.
+
+title: Loomux
+description: >-
+  A dead-simple terminal multiplexer for AI agent management — instant matrix
+  splits, native agent-session restore, and a built-in orchestrator/worker
+  workflow.
+
+# Project-pages hosting: https://willem445.github.io/loomux/
+url: https://willem445.github.io
+baseurl: /loomux
+
+# Theme is fetched at build time by the github-pages gem's jekyll-remote-theme
+# plugin (bundled into actions/jekyll-build-pages). Pinned to a release tag so a
+# theme change upstream can never silently break a release-day publish; bump the
+# tag deliberately. See https://just-the-docs.com for theme options.
+remote_theme: just-the-docs/just-the-docs@v0.12.0
+
+# just-the-docs options.
+search_enabled: true
+heading_anchors: true
+color_scheme: dark
+
+aux_links:
+  "Loomux on GitHub":
+    - "https://github.com/willem445/loomux"
+aux_links_new_tab: true
+
+nav_external_links:
+  - title: Download the latest release
+    url: https://github.com/willem445/loomux/releases/latest
+
+footer_content: >-
+  Loomux is MIT-licensed. This site documents what ships on
+  <code>main</code>; the source of truth is the code.
+
+# Keep Jekyll from trying to render repo scaffolding as pages.
+exclude:
+  - README.md
