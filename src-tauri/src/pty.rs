@@ -8,7 +8,7 @@ use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, Pt
 use serde::Serialize;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -319,6 +319,62 @@ fn try_direct_command(argv: &[String]) -> Option<CommandBuilder> {
     Some(cmd)
 }
 
+/// Resolve `.`/`..` in a path lexically, without touching the filesystem. Kept
+/// off `fs::canonicalize` on purpose: that returns a `\\?\`-verbatim path on
+/// Windows, which some toolchains mishandle in env vars. Inputs here are real
+/// absolute paths, so a lexical fold is sufficient and deterministic (testable).
+fn lexical_normalize(p: &Path) -> PathBuf {
+    let mut out = Vec::new();
+    for comp in p.components() {
+        match comp {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => out.push(other),
+        }
+    }
+    out.iter().collect()
+}
+
+/// If `cwd` is a **linked git worktree**, return the shared per-repo cargo
+/// target dir to point `CARGO_TARGET_DIR` at — `<main-repo-root>/.loomux-target`
+/// — so every agent worktree reuses ONE build cache instead of each paying a
+/// fresh 5–7 GB `target/` (#134). Returns `None` for a normal checkout (whose
+/// `.git` is a directory), so the main repo keeps its own `target/`.
+///
+/// Pure filesystem inspection — no `git` subprocess: a linked worktree's `.git`
+/// is a *file* `gitdir: <main>/.git/worktrees/<id>`; that dir's `commondir`
+/// resolves to the main repo's `.git`, whose parent is the shared root. Kept
+/// pure so the mapping is unit-testable against a fixture tree.
+#[doc(hidden)] // pub for the worktree-target integration test
+pub fn shared_worktree_target_dir(cwd: &Path) -> Option<PathBuf> {
+    // Opt-out escape hatch, mirroring LOOMUX_NO_DIRECT_SPAWN: a one-env-var
+    // rollback if the shared cache ever misbehaves (a worktree then builds its
+    // own target/ as before).
+    if std::env::var_os("LOOMUX_NO_SHARED_TARGET").is_some() {
+        return None;
+    }
+    let dot_git = cwd.join(".git");
+    if !std::fs::metadata(&dot_git).ok()?.is_file() {
+        return None; // real checkout (dir) or no repo → keep the normal target/
+    }
+    let text = std::fs::read_to_string(&dot_git).ok()?;
+    let gitdir = text.lines().find_map(|l| l.strip_prefix("gitdir:"))?.trim();
+    let worktree_gitdir = PathBuf::from(gitdir);
+    let commondir = std::fs::read_to_string(worktree_gitdir.join("commondir")).ok()?;
+    let commondir = commondir.trim();
+    let common = if Path::new(commondir).is_absolute() {
+        PathBuf::from(commondir)
+    } else {
+        worktree_gitdir.join(commondir)
+    };
+    // `common` is the main repo's `.git`; its parent is the repo root.
+    let root = lexical_normalize(&common);
+    let root = root.parent()?;
+    Some(root.join(".loomux-target"))
+}
+
 /// Apply the shared per-pane cwd + environment (cwd, TERM/COLORTERM, fresh
 /// PATH) to a `CommandBuilder` regardless of whether it is a direct spawn or a
 /// shell wrapper.
@@ -327,8 +383,18 @@ fn apply_pane_env(mut cmd: CommandBuilder, cwd: Option<&str>) -> CommandBuilder 
         .filter(|d| std::path::Path::new(d).is_dir())
         .map(|d| d.to_string())
         .or_else(|| dirs::home_dir().map(|h| h.to_string_lossy().into_owned()));
-    if let Some(dir) = dir {
+    if let Some(dir) = dir.as_deref() {
         cmd.cwd(dir);
+        // #134: a pane whose cwd is a git worktree shares one cargo build cache
+        // across all worktrees instead of each growing its own 5–7 GB target/.
+        // Only linked worktrees get this; the main checkout keeps target/.
+        // Respect an operator-set CARGO_TARGET_DIR (don't override a deliberate
+        // choice).
+        if std::env::var_os("CARGO_TARGET_DIR").is_none() {
+            if let Some(target) = shared_worktree_target_dir(Path::new(dir)) {
+                cmd.env("CARGO_TARGET_DIR", target);
+            }
+        }
     }
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");

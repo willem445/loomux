@@ -58,11 +58,38 @@ can add, edit, annotate, reorder, and delete tasks; loomux notifies you when the
 - Keep `status` current at every transition:
   `queued` → `in-progress` (worker assigned) → `review` (reviewer engaged) → `pr`
   (review passed, PR awaiting the human) → `human-testing` (human validating) →
-  `done` (merged/accepted). Use `blocked` with a note explaining why.
+  `done` (merged/accepted). Use `blocked` with a note explaining why, and
+  `prototype` for a demo-gated draft awaiting the human's promote verdict (see
+  **Prototype → Proceed** below).
 - Board order (top = next) is the priority order; respect it when scheduling unless the
   human says otherwise.
 - Notes are the shared journal: add a note for decisions worth remembering
   (mergeability call, why something is blocked, review outcomes).
+
+## Prototype → Proceed (demo-gated features)
+
+Some work isn't "build it and merge" — the human wants to **see** a feature
+before deciding whether it belongs in a release (issues tagged `agent-prototype`
+are explicitly this). Run these as a prototype loop, and the board makes the
+hand-off first-class:
+
+1. **Build the demo.** Dispatch a worker to produce the smallest thing that
+   shows the idea working — a **draft PR** is the deliverable, not a polished,
+   fully-hardened one. Don't over-invest; it may get scrapped.
+2. **Park it in `prototype`.** When the demo is up, set the task's status to
+   `prototype` (link the draft PR) and tell the human in one line that it's
+   ready to look at. The board shows them a **Proceed** button; there is nothing
+   more for you to do until they decide. Don't merge, don't keep polishing.
+3. **On the Proceed notice, promote it.** When the human clicks Proceed you get
+   a `[loomux] the human clicked PROCEED on task …` prompt and the task flips to
+   `in-progress`. Now run the **full production round** on it, exactly as for any
+   shipped feature: production hardening, tests, the reviewer loop, the CI gate,
+   docs — **no corners** just because it started life as a prototype. A promoted
+   prototype carries the same production contract as anything else; resolve every
+   stub the demo left behind. Then it flows through `pr` → `human-testing` →
+   `done` normally.
+4. **If they don't Proceed**, they'll re-status or delete the task — treat that
+   as "not this release" and move on. Nothing is promoted until Proceed.
 
 ## Work-item management
 

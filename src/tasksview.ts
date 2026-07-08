@@ -8,7 +8,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { swapIfConnected } from "./domutil";
-import { doneCount, retainExisting } from "./taskboard";
+import { canProceed, doneCount, isAwaitingHuman, retainExisting, STATUSES } from "./taskboard";
 
 export interface OrchTaskNote {
   ts_ms: number;
@@ -27,9 +27,6 @@ export interface OrchTask {
   notes: OrchTaskNote[];
   updated_ms: number;
 }
-
-/** Mirrors TASK_STATUSES in the backend (validated there). */
-const STATUSES = ["queued", "in-progress", "review", "pr", "human-testing", "done", "blocked"];
 
 function el(tag: string, cls: string, text?: string): HTMLElement {
   const e = document.createElement(tag);
@@ -329,13 +326,9 @@ export class TasksView {
     this.tasks.forEach((t, i) => this.listEl.appendChild(this.renderTask(t, i)));
   }
 
-  /** Statuses where only the human can move the item forward — highlighted on
-   *  the board so what is waiting on you stands out (attention routing #6). */
-  private static AWAITING_HUMAN = new Set(["pr", "human-testing", "blocked"]);
-
   private renderTask(t: OrchTask, index: number): HTMLElement {
     const row = el("div", "task-row");
-    if (TasksView.AWAITING_HUMAN.has(t.status)) row.classList.add("awaiting-human");
+    if (isAwaitingHuman(t.status)) row.classList.add("awaiting-human");
 
     // Multi-select: tick to add the row to the batch-delete set. A checkbox
     // (over ctrl/shift-click) keeps the affordance discoverable — the human
@@ -474,6 +467,28 @@ export class TasksView {
       changes.title = "Request changes — send findings back to the orchestrator";
       changes.addEventListener("click", () => this.requestChanges(t));
       top.append(approve, changes);
+    }
+
+    // Proceed: the human's promote verdict on a prototype (#147). Flips the item
+    // to in-progress and tells the orchestrator to run the full production build.
+    // Two-click confirm (like delete) — promoting kicks off real work, so a
+    // mis-click shouldn't launch it.
+    if (canProceed(t.status)) {
+      const proceed = el("button", "task-btn proceed", "▶ Proceed") as HTMLButtonElement;
+      proceed.title = "Promote this prototype — tell the orchestrator to build the production version";
+      proceed.addEventListener("click", () => {
+        if (proceed.dataset.confirm) {
+          void this.mutate(invoke("orch_proceed_task", { groupId: this.groupId, id: t.id }));
+        } else {
+          proceed.dataset.confirm = "1";
+          proceed.textContent = "promote?";
+          window.setTimeout(() => {
+            delete proceed.dataset.confirm;
+            proceed.textContent = "▶ Proceed";
+          }, 2500);
+        }
+      });
+      top.appendChild(proceed);
     }
 
     const notesBtn = el("button", "task-btn notes", `🗨 ${t.notes.length}`) as HTMLButtonElement;

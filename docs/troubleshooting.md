@@ -111,6 +111,15 @@ prior generation is `audit.1.jsonl`, read alongside the current one in the audit
 viewer). Ending a group can optionally remove each agent's worktree to reclaim
 disk (branches are always kept).
 
+Durable files (the task board, group state, and friends) are written
+**atomically** — a same-directory temp file renamed over the original — so a
+failed write (full disk, crash) can never destroy the previous good copy.
+Worker worktrees in Rust repos share one cargo build cache
+(`<repo>\.loomux-target`, gitignored) instead of a multi-GB `target/` each, and
+loomux warns each group's orchestrator once when the workspace drive drops
+below ~5 GB free. Details in
+[doc/design/durability-and-disk.md](https://github.com/willem445/loomux/blob/main/doc/design/durability-and-disk.md).
+
 ## Crash logs
 
 If loomux exits uncleanly, the next launch surfaces a toast naming the newest
