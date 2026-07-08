@@ -935,11 +935,12 @@ pub struct AttentionItem {
 
 /// Work-item statuses shown on the task board. Kept as strings (not an
 /// enum) so the wire/JSON forms stay obvious; validated on every write.
-pub const TASK_STATUSES: [&str; 7] = [
+pub const TASK_STATUSES: [&str; 8] = [
     "queued",        // planned, not started
     "in-progress",   // a worker is on it
     "review",        // reviewer agent engaged
     "pr",            // PR open, review loop finished
+    "prototype",     // demo-gated draft awaiting the human's promote/scrap verdict (#147)
     "human-testing", // done pending the human's validation
     "done",          // merged / accepted by the human
     "blocked",
@@ -948,6 +949,11 @@ pub const TASK_STATUSES: [&str; 7] = [
 /// Statuses where the human's merge-gate actions (approve / request changes)
 /// apply: the PR is open and awaiting the human's decision.
 pub const MERGE_GATE_STATUSES: [&str; 2] = ["pr", "human-testing"];
+
+/// The demo-gate status (#147): a prototype the human is evaluating before
+/// deciding whether to promote it to a full production build. Its board action
+/// is **Proceed** (not the merge-gate approve/changes) — see `proceed_task`.
+pub const PROTOTYPE_STATUS: &str = "prototype";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TaskNote {
@@ -2378,6 +2384,63 @@ impl OrchRegistry {
         Ok(task)
     }
 
+    /// Guard the proceed action to items actually in `prototype`. The UI only
+    /// shows the button on prototype items, but the command surface is callable
+    /// directly, so enforce it backend-side too (constraint 6) — "proceeding" a
+    /// queued or done item is meaningless.
+    fn ensure_prototype(&self, group: &str, id: &str) -> Result<(), String> {
+        let status = self
+            .tasks(group)
+            .into_iter()
+            .find(|t| t.id == id)
+            .ok_or_else(|| format!("unknown task: {id}"))?
+            .status;
+        if status == PROTOTYPE_STATUS {
+            Ok(())
+        } else {
+            Err(format!(
+                "task {id} is {status:?}, not {PROTOTYPE_STATUS:?} — Proceed only applies to a prototype"
+            ))
+        }
+    }
+
+    /// Proceed on a prototype (#147): the human has validated the demo and wants
+    /// it promoted to a full production build. Flips `prototype` → `in-progress`
+    /// (the item is back in active development, no longer parked on the human's
+    /// verdict), records a human-attributed note, and delivers ONE typed notice
+    /// telling the orchestrator to run the promotion. Unlike `start_task`, the
+    /// status flip is durable — like `approve_task`, the board carries the
+    /// decision even if a paused group drops the notice — so this does NOT reject
+    /// on pause (the orchestrator sees the flip + note on resume via list_tasks).
+    /// The notice is best-effort (the board is the source of truth).
+    pub fn proceed_task(&self, group: &str, id: &str) -> Result<Task, String> {
+        self.ensure_prototype(group, id)?;
+        let task = self.upsert_task(
+            group,
+            "human",
+            Some(id),
+            TaskPatch {
+                status: Some("in-progress".into()),
+                note: Some(
+                    "Proceed — the human validated the prototype; promote it to a full production build."
+                        .into(),
+                ),
+                ..Default::default()
+            },
+        )?;
+        let _ = self.deliver_to_orchestrator(
+            group,
+            &format!(
+                "[loomux] the human clicked PROCEED on task {} (\"{}\") — the prototype is validated. \
+                 Promote it to a full production build: production hardening + full reviews, no corners, \
+                 the same promotion arc you'd run by hand.",
+                task.id, task.title
+            ),
+            "human",
+        );
+        Ok(task)
+    }
+
     /// Tell the orchestrator the human touched the board (best-effort; the
     /// board itself is the source of truth via list_tasks).
     fn notify_board_edit(&self, group: &str, summary: &str) {
@@ -3228,7 +3291,12 @@ impl OrchRegistry {
         let mut gate_of: HashMap<String, String> = HashMap::new();
         for g in &groups {
             for t in self.tasks(g) {
-                let is_gate = MERGE_GATE_STATUSES.contains(&t.status.as_str()) || t.status == "blocked";
+                // `prototype` is a human gate too (#147): the assigned pane is
+                // where the pending demo-verdict work lives, so flag it like the
+                // merge gates and `blocked`.
+                let is_gate = MERGE_GATE_STATUSES.contains(&t.status.as_str())
+                    || t.status == "blocked"
+                    || t.status == PROTOTYPE_STATUS;
                 if is_gate {
                     if let Some(assignee) = t.assignee.filter(|s| !s.trim().is_empty()) {
                         gate_of.insert(assignee, t.status);
@@ -6066,6 +6134,19 @@ pub fn orch_start_task(
     id: String,
 ) -> Result<Task, String> {
     reg.start_task(&group_id, &id)
+}
+
+/// Proceed on a prototype item (#147): flip it to `in-progress`, record the
+/// human's sign-off, and tell the orchestrator to promote the prototype to a
+/// full production build. The human's demo-gate verdict, so the status change
+/// is applied here (mirrors `orch_approve_task`).
+#[tauri::command]
+pub fn orch_proceed_task(
+    reg: tauri::State<Arc<OrchRegistry>>,
+    group_id: String,
+    id: String,
+) -> Result<Task, String> {
+    reg.proceed_task(&group_id, &id)
 }
 
 #[cfg(test)]

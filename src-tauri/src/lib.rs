@@ -120,6 +120,7 @@ pub fn run() {
             orchestration::orch_approve_task,
             orchestration::orch_request_changes,
             orchestration::orch_start_task,
+            orchestration::orch_proceed_task,
             orchestration::orch_pause_group,
             orchestration::orch_resume_group,
             orchestration::orch_group_paused,

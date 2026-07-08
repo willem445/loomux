@@ -454,8 +454,8 @@ typing, so a spawn never yanks the cursor mid-keystroke. Panes you open yourself
 
 **Task board:** the orchestrator pane has a board toggle (`Alt+T` or the
 list icon) showing the group's work queue — status per item (`queued`,
-`in-progress`, `review`, `pr`, `human-testing`, `done`, `blocked`), issue/PR
-links, notes, and priority order. You can add, edit, annotate, reorder, and
+`in-progress`, `review`, `pr`, `prototype`, `human-testing`, `done`,
+`blocked`), issue/PR links, notes, and priority order. You can add, edit, annotate, reorder, and
 delete tasks; the orchestrator is notified of your edits and maintains the
 same board through its tools. Issue and PR chips are **clickable** — they open
 in your browser.
@@ -489,6 +489,18 @@ orchestrator to merge. **✎ Changes** opens a box for your findings, records
 them on the board, and sends them to the orchestrator to route back to a
 worker. Both land as a message in the orchestrator pane, exactly as if you'd
 written it.
+
+**Prototype → Proceed:** for features you want to *see* before committing to a
+release, the orchestrator can have a worker build a quick demo (a draft PR) and
+park the task in the **`prototype`** status — a distinct magenta chip, and one
+of the human-gated states highlighted on the board. When you've looked at the
+demo and want it for real, the item shows a **▶ Proceed** button (two-click
+confirm, since it kicks off real work): clicking it flips the task to
+`in-progress`, records your sign-off as a note, and sends the orchestrator a
+*promote* prompt telling it to run the full production build — hardening plus
+the normal review/CI gate, no corners. If you don't want it, just delete or
+re-status the task; nothing is promoted until you Proceed. This makes the
+prototype→demo→promote loop first-class instead of something you drive by hand.
 
 **Steering strip:** the orchestrator pane has a thin compose field docked
 under its terminal (styled like the board's *Add a task* field). Type steering
@@ -525,8 +537,8 @@ stalled-agent watchdog uses, and suppressed while you're typing into it), when a
 worker **reports** done or blocked, or when its task reaches a **human merge
 gate**. Turning to the pane (or clicking the chip) clears a report badge; live
 signals clear themselves when the condition passes. On the task board, items
-that only you can advance (`pr`, `human-testing`, `blocked`) are highlighted so
-what's waiting on you stands out. Each group also has an optional **desktop
+that only you can advance (`pr`, `human-testing`, `prototype`, `blocked`) are
+highlighted so what's waiting on you stands out. Each group also has an optional **desktop
 notification** toggle (🔔 in the group lifecycle panel) that raises an OS toast
 for those report/blocked/idle-with-prompt events — off by default, durable
 per-group. Badges and highlights are header/board overlays; nothing ever
