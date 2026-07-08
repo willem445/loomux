@@ -176,3 +176,15 @@ test("steerBoxHeight: a zero/unknown cap never forces a scrollbar", () => {
   // getComputedStyle could hand us 0 before layout; fall back to the content height.
   assert.deepEqual(steerBoxHeight(40, 0), { heightPx: 40, scroll: false });
 });
+
+test("steerBoxHeight: shrinks back when a widened box re-measures fewer lines", () => {
+  // #163: widening the pane rewraps the same text onto fewer lines, so a
+  // re-measure yields a smaller natural height — the box must follow it down,
+  // not stay stuck at its earlier taller height. (growCompose sets height:auto
+  // before measuring; here that shows up as a smaller `natural`.)
+  const wrapped = steerBoxHeight(80, 122); // 4 lines while the pane is narrow
+  const widened = steerBoxHeight(40, 122); // same text, now 2 lines
+  assert.deepEqual(wrapped, { heightPx: 80, scroll: false });
+  assert.deepEqual(widened, { heightPx: 40, scroll: false });
+  assert.ok(widened.heightPx < wrapped.heightPx);
+});

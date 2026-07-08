@@ -23,8 +23,14 @@
 //! `#[tauri::command]`s below are wrapped by typed helpers in `src/pty.ts`.
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+
+/// Disambiguates concurrent temp files (with the pid), mirroring
+/// `orchestration::atomic_write` — two saves must not collide on the temp name.
+static ATOMIC_WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Test-only override for the state dir, so the atomic-write / quarantine logic
 /// is exercised against a tempdir without touching the real user data dir
@@ -49,21 +55,32 @@ fn tabs_path() -> PathBuf {
     state_dir().join("tabs.json")
 }
 
-/// Atomically write `contents` to `path`: create the parent dir, write a sibling
-/// `*.tmp`, then rename it over the target. See the module note — this is the
-/// #133 anti-truncation guarantee. Public so the integration test can drive it
-/// against a tempdir.
+/// Atomically write `contents` to `path`: create the parent dir, write a unique
+/// sibling temp file, **fsync it**, then rename it over the target. This mirrors
+/// the canonical `orchestration::atomic_write` (#133/#161) — the fsync is the
+/// disk-full guard: without it a rename could expose a metadata-only file whose
+/// data blocks never reached disk, the exact failure mode #133 hit. A crash
+/// leaves either the old (valid) file or the temp, never a truncated target.
+/// Public so the integration test can drive it against a tempdir.
 pub fn write_atomic(path: &Path, contents: &str) -> Result<(), String> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
-    let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, contents).map_err(|e| e.to_string())?;
+    // Unique temp (pid + seq) in the same dir, so concurrent saves and a
+    // cross-volume rename fallback can't collide or land on another writer's temp.
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = path.file_name().and_then(|n| n.to_str()).unwrap_or("state");
+    let seq = ATOMIC_WRITE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = dir.join(format!(".{stem}.{}.{seq}.tmp", std::process::id()));
+    {
+        let mut f = fs::File::create(&tmp).map_err(|e| e.to_string())?;
+        f.write_all(contents.as_bytes()).map_err(|e| e.to_string())?;
+        f.sync_all().map_err(|e| e.to_string())?; // durable before the rename
+    }
     // `fs::rename` replaces an existing destination on both Windows and Unix, so
     // this is the atomic swap. It can still fail if the destination is briefly
     // locked (a virus scanner / another handle on Windows); fall back to a direct
-    // write so the update isn't lost, then drop the temp. The fallback is the
-    // only path that can truncate, and only when rename is impossible.
+    // write so the update isn't lost, keeping the temp for recovery on failure.
     if fs::rename(&tmp, path).is_err() {
         fs::write(path, contents).map_err(|e| e.to_string())?;
         let _ = fs::remove_file(&tmp);
@@ -125,8 +142,14 @@ mod tests {
         let path = tmp.path().join("loomux").join("tabs.json");
         write_atomic(&path, "{}").unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "{}");
-        // No stray temp file left behind on the happy path.
-        assert!(!path.with_extension("json.tmp").exists());
+        // No stray temp file left behind on the happy path (the rename consumed it).
+        let leftovers: Vec<_> = fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().into_string().unwrap())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "no .tmp left: {leftovers:?}");
     }
 
     #[test]

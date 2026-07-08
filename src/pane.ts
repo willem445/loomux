@@ -728,6 +728,11 @@ export class Pane implements VoiceTargetPane {
         overlay.style.height = `${this.overlayClamp(overlay.offsetHeight)}px`;
         this.updateTermShift();
       }
+      // The steer box wraps to the strip's width, so a width change alters how
+      // many lines the placeholder/draft occupies. growCompose only ran on input
+      // events, so a widened pane never re-measured and the box stayed tall
+      // (#163). Re-measure here; it's a no-op on panes without a compose strip.
+      this.growCompose();
     }, 16);
   }
 
@@ -1271,7 +1276,10 @@ export class Pane implements VoiceTargetPane {
     field.className = "orch-compose-field";
     const input = document.createElement("textarea");
     input.className = "dlg-input orch-compose-input";
-    input.placeholder = "Steer the orchestrator — Enter to send · Shift+Enter for a newline · Esc to terminal";
+    // Terse enough to sit on one line at typical pane widths — a long hint here
+    // wraps the box to multi-line before the human even types (#163). The full
+    // Shift+Enter/Esc rules live in this method's doc comment, not the ghost text.
+    input.placeholder = "Steer the orchestrator — Enter sends";
     input.rows = 1;
     input.spellcheck = false;
     input.autocomplete = "off";

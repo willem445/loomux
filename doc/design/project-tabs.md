@@ -114,15 +114,17 @@ blob is opaque JSON; `tabstore.ts` owns the schema.
   "activeIndex": 0 }
 ```
 
-Writes go through `uistate::write_atomic`: serialize to a sibling `*.tmp`, then
+Writes go through `uistate::write_atomic`, which mirrors the canonical
+`orchestration::atomic_write` (the #133/#161 fix): write a **unique** sibling
+temp (pid + seq, so concurrent saves never collide), **`fsync` it**, then
 `fs::rename` over the target (atomic replace on Windows and Unix). This is the
 **#133 anti-truncation guarantee** — a bare `fs::write` truncates in place, so a
 crash / kill mid-write destroys the file, which is exactly what wiped the task
-board in #133. A temp-file + rename leaves either the old (valid) file or the
-temp behind, never a half-written target. The one path that can still truncate
-is the fallback direct write taken *only* if `rename` fails (a locked
-destination on Windows), matching the pattern `persist_max_agents` / `usage.json`
-already use.
+board in #133; and the `fsync` before the rename is the disk-full guard (a
+rename must not expose a metadata-only file whose data blocks never reached
+disk). A crash leaves either the old (valid) file or the temp, never a
+half-written target. The one path that can still truncate is the fallback direct
+write taken *only* if `rename` fails (a briefly-locked destination on Windows).
 
 ### Corrupt-file fail-safe (two layers)
 
