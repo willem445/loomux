@@ -276,13 +276,18 @@ export class TasksView {
     if (this.dialogEl) return; // one dialog at a time
     const overlay = el("div", "tasks-dialog");
     const box = el("div", "tasks-dialog-box");
-    box.append(el("div", "tasks-dialog-title", `Approve & allow merge — ${t.id}`));
+    box.append(
+      el("div", "tasks-dialog-title", `${t.pr ? "Approve & allow merge" : "Approve"} — ${t.id}`)
+    );
     box.append(
       el(
         "div",
         "tasks-dialog-note",
-        "This authorizes exactly one merge of this PR (single-use grant, expires in ~30 min) " +
-          "and tells the orchestrator to merge. Add optional instructions, or leave empty to just approve."
+        t.pr
+          ? "This authorizes exactly one merge of this PR (single-use grant, expires in ~30 min) " +
+              "and tells the orchestrator to merge. Add optional instructions, or leave empty to just approve."
+          : "This marks the item done and tells the orchestrator. No PR is linked, so no merge is " +
+              "authorized. Add optional instructions, or leave empty to just approve."
       )
     );
 
@@ -294,7 +299,11 @@ export class TasksView {
 
     const actions = el("div", "dlg-actions");
     const cancel = el("button", "dlg-btn", "Cancel") as HTMLButtonElement;
-    const confirm = el("button", "dlg-btn primary", "Approve & allow merge") as HTMLButtonElement;
+    const confirm = el(
+      "button",
+      "dlg-btn primary",
+      t.pr ? "Approve & allow merge" : "Approve"
+    ) as HTMLButtonElement;
     actions.append(cancel, confirm);
     box.append(ta, actions);
     overlay.append(box);
@@ -525,10 +534,16 @@ export class TasksView {
     // Merge-gate actions: the human's approve / request-changes touchpoints,
     // shown only where they belong — on items awaiting the merge decision.
     if (t.status === "pr" || t.status === "human-testing") {
-      const approve = el("button", "task-btn approve", "✓ Approve & allow merge") as HTMLButtonElement;
-      approve.title =
-        "Authorize the merge: write a one-time grant for this PR and tell the orchestrator to merge " +
-        "(optionally with instructions). The grant is single-use and expires in ~30 min.";
+      const approve = el(
+        "button",
+        "task-btn approve",
+        t.pr ? "✓ Approve & allow merge" : "✓ Approve"
+      ) as HTMLButtonElement;
+      approve.title = t.pr
+        ? "Authorize the merge: write a one-time grant for this PR and tell the orchestrator to merge " +
+          "(optionally with instructions). The grant is single-use and expires in ~30 min."
+        : "Approve: mark this item done and tell the orchestrator (optionally with instructions). " +
+          "No PR is linked, so no merge is authorized.";
       approve.addEventListener("click", () => this.approveWithComment(t));
       const changes = el("button", "task-btn changes", "✎ Changes") as HTMLButtonElement;
       changes.title = "Request changes — send findings back to the orchestrator";
