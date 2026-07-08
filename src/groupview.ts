@@ -102,7 +102,6 @@ export class GroupView {
   private listEl: HTMLElement;
   // Autonomous-mode section (#83).
   private autoBtn: HTMLButtonElement;
-  private autoCopyEl: HTMLElement;
   private approvalChk: HTMLInputElement;
   private budgetInput: HTMLInputElement;
   private budgetErrEl: HTMLElement;
@@ -183,20 +182,25 @@ export class GroupView {
 
     this.listEl = el("div", "group-list");
 
-    // Autonomous-mode section (#83): a live idle-tick toggle, the merge gate,
-    // and a token budget with a meter. All off/default until the human opts in —
-    // the copy is deliberately blunt that ticking spends money unattended.
+    // Autonomous-mode section (#83): two dense rows matching the max-agents
+    // row's density (finding 1). Row A = label + live toggle; the "spends money
+    // unattended" caveat is folded into the section tooltip, not its own line.
+    // Row B = merge gate + token budget + an inline meter. The suspended banner
+    // is a third row shown only while the budget enforcer has it paused. Every
+    // state stays visible — compressed, never hidden (it's the consent surface).
     const autoRow = el("div", "group-autorow");
+    autoRow.title =
+      "Autonomous ticks poll labeled issues and re-check PRs while you're away — " +
+      "they spend tokens without you present.";
+
     const autoHead = el("div", "group-auto-head");
     autoHead.append(el("span", "group-auto-title", "Autonomous mode"));
-    this.autoBtn = el("button", "group-btn", "🤖 Autonomous off") as HTMLButtonElement;
+    this.autoBtn = el("button", "group-btn sm", "🤖 Off") as HTMLButtonElement;
     this.autoBtn.addEventListener("click", () => void this.toggleAutonomous());
     autoHead.append(this.autoBtn);
-    this.autoCopyEl = el(
-      "div",
-      "group-auto-copy",
-      "autonomous ticks spend tokens without you present"
-    );
+
+    // Row B: merge gate + budget + inline meter, wrapping if the panel is narrow.
+    const ctlRow = el("div", "group-auto-controls");
 
     // Merge gate: the checkbox is the human's framing (ON = require approval,
     // today's default) and maps to the inverse backend auto_merge flag.
@@ -217,9 +221,9 @@ export class GroupView {
       "adequately-tested PR (reviewer-approved + green CI) itself while autonomous.";
 
     // Token budget: 0 / empty = no cap. When autonomous is on this drives the
-    // live meter below.
-    const budgetRow = el("div", "group-auto-budget");
-    budgetRow.append(el("span", "group-auto-blabel", "Token budget"));
+    // inline meter beside it.
+    const budgetWrap = el("div", "group-auto-budget");
+    budgetWrap.append(el("span", "group-auto-blabel", "Budget"));
     this.budgetInput = document.createElement("input");
     this.budgetInput.className = "group-auto-binput";
     this.budgetInput.type = "number";
@@ -234,30 +238,26 @@ export class GroupView {
     });
     this.budgetInput.addEventListener("blur", () => void this.applyBudget());
     this.budgetErrEl = el("span", "group-auto-berr");
-    budgetRow.append(this.budgetInput, this.budgetErrEl);
+    budgetWrap.append(this.budgetInput, this.budgetErrEl);
 
-    // Live meter (shown only while autonomous is on): spend-since-enable vs cap.
+    // Inline meter (shown only while autonomous is on): a slim bar + a compact
+    // "X / Y · Z%" (or "X · no cap") read of spend-since-enable vs the budget.
     this.meterEl = el("div", "group-auto-meter");
     this.meterEl.hidden = true;
     this.meterBar = el("div", "group-auto-bar");
     this.meterFill = el("div", "group-auto-fill");
     this.meterBar.append(this.meterFill);
-    this.meterLabel = el("div", "group-auto-mlabel");
+    this.meterLabel = el("span", "group-auto-mlabel");
     this.meterEl.append(this.meterBar, this.meterLabel);
 
-    // Budget-exhausted banner (autonomy auto-suspended): distinct state + the
+    ctlRow.append(approvalLbl, budgetWrap, this.meterEl);
+
+    // Budget-exhausted banner (autonomy auto-suspended): distinct row + the
     // re-enable affordance is the toggle above (re-enabling re-anchors).
     this.suspendEl = el("div", "group-auto-suspend");
     this.suspendEl.hidden = true;
 
-    autoRow.append(
-      autoHead,
-      this.autoCopyEl,
-      approvalLbl,
-      budgetRow,
-      this.meterEl,
-      this.suspendEl
-    );
+    autoRow.append(autoHead, ctlRow, this.suspendEl);
 
     // Footer: pause/resume + destructive end-orchestration.
     const foot = el("div", "group-actions");
@@ -571,8 +571,9 @@ export class GroupView {
     const a = this.autonomy;
     if (!a) return;
 
-    // Toggle button reflects the live marker.
-    this.autoBtn.textContent = a.autonomous ? "🤖 Autonomous on" : "🤖 Autonomous off";
+    // Toggle button reflects the live marker (dense label; the section title
+    // spells out "Autonomous mode", so the button just carries on/off).
+    this.autoBtn.textContent = a.autonomous ? "🤖 On" : "🤖 Off";
     this.autoBtn.classList.toggle("on", a.autonomous);
     this.autoBtn.title = a.autonomous
       ? "Idle-ticking is live — the orchestrator polls labeled issues and re-checks PRs while you're away. Click to stop."
@@ -587,7 +588,9 @@ export class GroupView {
       this.budgetInput.value = a.budget_tokens > 0 ? String(a.budget_tokens) : "";
     }
 
-    // Live meter: only while autonomous (spend is null when off). Off ⇒ hidden.
+    // Inline meter: only while autonomous (spend is null when off). Off ⇒ hidden.
+    // The slim bar shows only with a cap; capless still reads spend so the money
+    // surface stays visible.
     if (a.autonomous && a.spend_since_enable_tokens != null) {
       this.meterEl.hidden = false;
       const m = budgetMeter(a.spend_since_enable_tokens, a.budget_tokens);
@@ -597,11 +600,11 @@ export class GroupView {
         this.meterFill.classList.toggle("warn", m.percent >= 80 && !m.exhausted);
         this.meterFill.classList.toggle("over", m.exhausted);
         this.meterLabel.textContent =
-          `${formatTokens(m.spend)} / ${formatTokens(m.budget)} tok · ${m.percent}%` +
-          (m.exhausted ? " · budget reached" : "");
+          `${formatTokens(m.spend)} / ${formatTokens(m.budget)} · ${m.percent}%` +
+          (m.exhausted ? " · reached" : "");
       } else {
         this.meterBar.hidden = true;
-        this.meterLabel.textContent = `${formatTokens(m.spend)} tok spent this session · no cap`;
+        this.meterLabel.textContent = `${formatTokens(m.spend)} spent · no cap`;
       }
     } else {
       this.meterEl.hidden = true;

@@ -1285,6 +1285,11 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   flex: 1; min-height: 0; position: relative;
   display: flex; flex-direction: column;
   background: var(--bg-app); font-size: 12px;
+  /* Contain the fixed chrome: without this, when the panel is dragged short the
+     non-scrolling rows overflow the box and paint over the drag bar + terminal
+     below (#83 finding 3). The bar is a flex sibling pinned to the overlay's
+     bottom edge, so clipping here keeps it reachable at every splitter position. */
+  overflow: hidden;
 }
 .group-head {
   display: flex; align-items: center; gap: 9px; flex: none;
@@ -1331,30 +1336,34 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .group-cost { color: var(--text-dim); font-size: 11px; }
 .group-cost-live { color: var(--text-dim); font-size: 10px; opacity: 0.75; }
 
-/* -- autonomous mode (#83) -- */
+/* -- autonomous mode (#83) -- two dense rows, matching the max-agents row. */
 .group-autorow {
   display: flex; flex-direction: column; gap: 6px; flex: none;
-  padding: 8px 12px; border-bottom: 1px solid var(--border-soft);
+  padding: 6px 12px; border-bottom: 1px solid var(--border-soft);
 }
 .group-auto-head { display: flex; align-items: center; gap: 10px; }
 .group-auto-title { color: var(--text); font-weight: 500; font-size: 12px; }
-.group-auto-copy { color: #e0af68; font-size: 10px; opacity: 0.85; }
+/* Row B: merge gate + budget + inline meter on one wrapping line. */
+.group-auto-controls {
+  display: flex; align-items: center; gap: 8px 14px; flex-wrap: wrap;
+}
 .group-auto-check {
   display: flex; align-items: center; gap: 5px;
   color: var(--text-dim); font-size: 11px; cursor: pointer; user-select: none;
 }
-.group-auto-budget { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.group-auto-budget { display: flex; align-items: center; gap: 6px; }
 .group-auto-blabel { color: var(--text-dim); font-size: 11px; }
 .group-auto-binput {
-  font: inherit; font-size: 12px; width: 96px;
+  font: inherit; font-size: 12px; width: 88px;
   background: var(--panel-2); color: var(--text);
   border: 1px solid var(--border-soft); border-radius: 5px; padding: 2px 6px;
 }
 .group-auto-binput:focus { outline: none; border-color: var(--accent); }
 .group-auto-berr { color: var(--danger); font-size: 10px; }
-.group-auto-meter { display: flex; flex-direction: column; gap: 3px; }
+/* Inline meter: a slim fixed-width bar + a compact text read, side by side. */
+.group-auto-meter { display: inline-flex; align-items: center; gap: 6px; min-width: 0; }
 .group-auto-bar {
-  height: 6px; border-radius: 3px; overflow: hidden;
+  flex: none; width: 60px; height: 5px; border-radius: 3px; overflow: hidden;
   background: var(--panel-2); border: 1px solid var(--border-soft);
 }
 .group-auto-fill {
@@ -1365,7 +1374,7 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .group-auto-fill.over { background: var(--danger); }
 .group-auto-mlabel {
   font-family: "Cascadia Mono", Consolas, monospace;
-  font-size: 10px; color: var(--text-dim);
+  font-size: 10px; color: var(--text-dim); white-space: nowrap;
 }
 .group-auto-suspend {
   font-size: 10.5px; line-height: 1.4; color: #f7768e;
@@ -1421,6 +1430,7 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   border: 1px solid var(--border-soft); border-radius: 5px; padding: 4px 12px;
 }
 .group-btn:hover { border-color: var(--accent); }
+.group-btn.sm { padding: 2px 9px; font-size: 10.5px; }
 .group-btn.on { background: rgba(224, 175, 104, 0.16); color: #e0af68; border-color: #6a5230; }
 .group-btn.danger { color: var(--danger); border-color: rgba(247, 118, 142, 0.35); }
 .group-btn.danger:hover { border-color: var(--danger); }

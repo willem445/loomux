@@ -45,6 +45,7 @@ import { IssuesView } from "./issuesview";
 import { TasksView } from "./tasksview";
 import { AuditView } from "./auditview";
 import { GroupView } from "./groupview";
+import { clampOverlayHeight } from "./overlaysize";
 
 // Inline icons so the toolbar renders identically regardless of installed
 // fonts; they inherit color via `currentColor`.
@@ -817,11 +818,11 @@ export class Pane implements VoiceTargetPane {
     }
   }
 
-  /** Keep the overlay tall enough to be usable but always leave a terminal
-   *  strip visible at the bottom. */
+  /** Keep the overlay tall enough that its bottom drag bar stays grabbable, but
+   *  always leave a terminal strip visible at the bottom. Pure math + tests in
+   *  overlaysize.ts (#83 finding 3). */
   private overlayClamp(h: number): number {
-    const max = Math.max(160, this.termEl.clientHeight - 100);
-    return Math.max(160, Math.min(max, h));
+    return clampOverlayHeight(h, this.termEl.clientHeight);
   }
 
   /** Horizontal drag handle on an overlay's bottom edge. */
