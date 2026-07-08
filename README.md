@@ -82,6 +82,9 @@ npm test           # unit tests (Node's built-in runner; no extra deps)
 | Split right | `Ctrl+Shift+E` (or ◫ in a pane header) |
 | Split down | `Ctrl+Shift+O` (or ⬓) |
 | Close pane | `Ctrl+Shift+W` (or ✕) |
+| New project tab | `Ctrl+Shift+T` (or **+** in the tab strip) |
+| Close project tab | `Ctrl+Shift+K` (or the tab's ✕) |
+| Prev / next tab | `Ctrl+Shift+[` / `Ctrl+Shift+]` (or click a tab) |
 | Rename pane | `F2`, or double-click its title |
 | Move focus | `Alt+←/→/↑/↓` (or click) |
 | Resize panes | drag the divider between them |
@@ -99,6 +102,45 @@ straight to your system clipboard too, via OSC 52 — no manual re-select needed
 
 Splitting in the same direction adds a sibling column/row — repeated splits
 form an even matrix instead of a lopsided staircase.
+
+### Project tabs
+
+Each **project tab** is a whole workspace — its own split grid of panes and its
+own minimize dock. Switching tabs swaps the entire workspace in and out, so you
+can keep several projects side by side without their panes fighting for screen
+space.
+
+- **Open / switch / close** — `Ctrl+Shift+T` (or **+**) opens a new tab on the
+  current mode's starting surface (a terminal, or the agent launcher in agent
+  mode); `Ctrl+Shift+[` / `Ctrl+Shift+]` page between tabs; `Ctrl+Shift+K` (or
+  the tab's ✕) closes one and kills its panes. There's always at least one tab —
+  closing the last is refused.
+- **Background tabs keep running.** An inactive tab is *hidden, not torn down* —
+  its terminals keep streaming, scrollback stays intact, and its agents' PTYs
+  run untouched. Switching tabs never repaints or reflows a terminal (see the
+  no-resize invariant in [the design note](doc/design/project-tabs.md)).
+- **Name & color** — double-click a tab to rename it; click its color dot to
+  pick an accent (the shared group palette, a custom color, or default).
+- **Launch an orchestrator → it gets its own tab.** Starting an orchestrator
+  opens a project tab named for the repo; its workers spawn **into that tab**
+  even while you're looking at another. A blocked/waiting agent in a **hidden**
+  tab raises a labelled alert chip (`⚠ blocked` / `⚠ waiting`) on its tab so a
+  background project can't hide its ask; clicking the tab (or an orch-focus)
+  jumps straight to the pane. The tab also shows a live **✦agents · $cost** chip.
+- **Preview** — hover a background tab for a live thumbnail compositing its whole
+  layout (every pane, arranged like the split, with colors and spacing), updated
+  a few times a second while hovered. It's a text snapshot of the in-memory
+  buffer, never a live terminal, so it costs no PTY resize.
+- **Pause a project** — right-click a tab → **Pause project** to hold prompt /
+  kickoff delivery to its agents (they idle out, containing unattended spend);
+  **Resume project** re-enables it. A paused tab shows a **⏸**.
+- **Persistence** — your tabs (names, colors, order, active tab, and each tab's
+  bound orchestration group) survive a restart; they're saved to durable app
+  storage, not browser storage, so clearing webview data doesn't lose them. Live
+  agent panes are **not** auto-revived on boot (that would spawn a process storm
+  and burn credits without asking); instead a restored tab remembers its group,
+  so restoring that group's session from the [session browser](#session-browser)
+  re-inhabits the correct tab. See the design note for exactly what restores.
 
 ### Rearranging panes
 
@@ -611,19 +653,26 @@ src-tauri/src/
   orchestration/    agent groups: registry, guardrails, MCP server, audit
   obs.rs            crash observability: panic hook, breadcrumb log, unclean-exit notice
   voice.rs          voice prompts (#58): mic capture (cpal) → local whisper.cpp subprocess
+  uistate.rs        durable UI state (project tabs #63): atomic tabs.json store
   lib.rs            Tauri wiring
 src/
   pty.ts            typed bridge to the backend (invoke + event bus)
   pane.ts           one terminal pane: xterm instance + header UI
   grid.ts           split-tree layout, dividers, focus, drag/maximize/minimize
   layout.ts         pure drag-reorder geometry (unit-tested, DOM-free)
+  tabs.ts           project tabs (#63): TabManager — tab list, active tab, routing maps (DOM-free)
+  workspace.ts      one tab = a Grid + its own dock; hide/show, GL policy, preview composite
+  tabbar.ts         the tab strip: switch/close/new, rename, color, alert + status chips, preview
+  tabroute.ts       pure tab routing + preview sanitizer (unit-tested, DOM-free)
+  tabstore.ts       pure encode/decode + schema validation of the persisted tab set
+  panefit.ts        pure "hidden ⇒ no PTY resize" decision (the no-resize invariant)
   sessions.ts       session browser sidebar
   launcher.ts       new-agent-pane dialog (single / multi / orchestrator)
   orchestration.ts  frontend half of agent groups (panes, badges, focus)
   shortcuts.ts      app-level keybindings (single source of truth)
   voice.ts          pure voice logic: target decision + push-to-talk state machine
   voicecontrol.ts   global single-capture controller; routes transcripts to focus
-  main.ts           composition root
+  main.ts           composition root (owns the TabManager + OrchWiring router)
 ```
 
 The seams for future AI features (ccmux-style agent status, notifications,

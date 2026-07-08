@@ -10,11 +10,11 @@
 
 import { Grid, type GridLayoutNode } from "./grid";
 import type { ManagedWorkspace } from "./tabs";
-import type { PreviewNode } from "./tabroute";
+import { PreviewBudget, type PreviewNode } from "./tabroute";
 
 /** Cap on panes serialized per preview refresh — serializing every pane every
  *  ~700ms would get expensive on a huge grid. Panes past the cap render as a
- *  titled placeholder (#63 finding 2). */
+ *  titled placeholder (#63). */
 const PREVIEW_PANE_CAP = 8;
 
 export class Workspace implements ManagedWorkspace {
@@ -69,10 +69,13 @@ export class Workspace implements ManagedWorkspace {
 
   setVisible(visible: boolean): void {
     this.el.style.display = visible ? "" : "none";
-    // Drop each pane's WebGL context while hidden (freeing it for the active
-    // tab, cutting idle VRAM), reload it on show. Rendering-only — the PTY and
-    // buffer are untouched, so no resize / no scrollback loss (#63 phase 4).
-    for (const pane of this.grid.allPanes()) pane.setHidden(!visible);
+    // Delegate the WebGL drop/reload to the grid, which also applies it to any
+    // pane opened later while still hidden (a background orchestrator spawn) —
+    // so a hidden tab holds no GL contexts regardless of when its panes appear
+    // (#63 GL policy). Rendering-only: PTY + buffer untouched, no resize, no
+    // scrollback loss. The `display:none` above is what zeroes pane width and
+    // thus suppresses PTY resizes (the no-resize invariant).
+    this.grid.setHidden(!visible);
   }
 
   focus(): void {
@@ -85,15 +88,14 @@ export class Workspace implements ManagedWorkspace {
   previewLayout(): PreviewNode | null {
     const tree = this.grid.layoutSnapshot();
     if (!tree) return null;
-    let budget = PREVIEW_PANE_CAP;
+    const budget = new PreviewBudget(PREVIEW_PANE_CAP);
     const map = (n: GridLayoutNode): PreviewNode => {
       if (n.kind === "split") {
         return { kind: "split", dir: n.dir, weight: n.weight, children: n.children.map(map) };
       }
-      const capped = budget <= 0;
-      const html = capped ? "" : n.pane.serializeViewportHtml();
-      if (!capped) budget--;
-      return { kind: "leaf", weight: n.weight, title: n.pane.name, html, capped };
+      const render = budget.take();
+      const html = render ? n.pane.serializeViewportHtml() : "";
+      return { kind: "leaf", weight: n.weight, title: n.pane.name, html, capped: !render };
     };
     return map(tree);
   }

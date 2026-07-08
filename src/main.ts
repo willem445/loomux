@@ -8,7 +8,14 @@ import { TabManager } from "./tabs";
 import { TabBar } from "./tabbar";
 import type { Pane, PaneEvents } from "./pane";
 import { SessionBrowser } from "./sessions";
-import { ensureOutputRouter, onPtyExit, type PtyExit, type SessionInfo } from "./pty";
+import {
+  ensureOutputRouter,
+  onPtyExit,
+  loadUiTabs,
+  saveUiTabs,
+  type PtyExit,
+  type SessionInfo,
+} from "./pty";
 import { matchShortcut } from "./shortcuts";
 import { voiceController } from "./voicecontrol";
 import { initStatusBar } from "./statusbar";
@@ -103,9 +110,9 @@ function findPaneAcrossTabs(ptyId: number): { ws: Workspace; pane: Pane } | null
   return null;
 }
 
-// ---------- project tabs: orchestration routing (#63 phase 3) ----------
+// ---------- project tabs: orchestration routing (#63) ----------
 
-/** Open a new tab the way the user expects (#63 finding 3): create + activate
+/** Open a new tab the way the user expects (#63): create + activate
  *  it, then present the SAME starting surface a fresh loomux pane shows — a
  *  terminal in plain mode, or the agent launcher in agent mode (openPaneIn is
  *  the exact fresh-boot / new-pane flow). Never leaves the tab blank. */
@@ -127,7 +134,7 @@ function projectName(path: string): string {
 
 /** Launch an orchestrator into its OWN project tab (created + activated + named
  *  from the repo), then bind the group→tab routing so its workers land here and
- *  focus/attention resolve to this tab (#63 phase 3). */
+ *  focus/attention resolve to this tab (#63). */
 async function launchOrchestratorTab(config: OrchestratorConfig): Promise<void> {
   const ws = tabs.newTab();
   tabs.renameTab(ws.id, projectName(config.repo));
@@ -140,7 +147,7 @@ async function launchOrchestratorTab(config: OrchestratorConfig): Promise<void> 
 /** Apply an attention scan across all tabs: badge each pane by its pty (the
  *  pre-tabs behavior, now spanning every tab) AND badge the tab-strip entry of
  *  any tab that owns a needs-attention pty — so a hidden tab's blocked agent
- *  still surfaces (#63 phase 3). Uses a live pty→tab map built from the actual
+ *  still surfaces (#63). Uses a live pty→tab map built from the actual
  *  panes, so plain (#40) panes badge their tab too, not just bound agents. */
 function applyAttention(items: AttentionItem[]): void {
   const byPty = new Map<number, AttentionItem>();
@@ -194,27 +201,70 @@ const orchWiring: OrchWiring = {
   applyAttention,
 };
 
-// ---------- project tabs: persistence (#63 phase 5, prototype-lite) ----------
+// ---------- project tabs: persistence (#63) ----------
+// The tab set (name / color / order / active tab / owning group) persists to
+// durable BACKEND storage via a typed command (loadUiTabs/saveUiTabs → the
+// atomic, corrupt-safe tabs.json in AppData; see src-tauri/src/uistate.rs),
+// NOT localStorage — so it survives a webview data clear and sits alongside the
+// app's other durable state. tabstore.ts owns the schema (encode/decode +
+// validation); a bad file is quarantined backend-side and we degrade to a fresh
+// tab without losing it. Pane/PTY contents are not captured — see restoreTabs /
+// the design doc for what does and does not revive, and why.
 
-const TABS_STORAGE_KEY = "loomux.tabs";
+/** The pre-backend localStorage key, read once for migration then retired. */
+const LEGACY_TABS_KEY = "loomux.tabs";
 
-/** Persist the tab set (name/color/group membership) to localStorage — the same
- *  cheap `loomux.*` store the launcher recents and editor command use. Pane/PTY
- *  contents are not captured; see tabstore.ts / the walkthrough for the limits. */
+/** The last snapshot actually written, so persistTabs is a no-op when nothing
+ *  in the persisted set changed. tabs.onChange also fires for attention-scan
+ *  updates (every ~3s) and renames-in-progress, none of which alter the saved
+ *  fields — without this dedup we'd rewrite identical bytes to disk on a timer. */
+let lastPersisted: string | null = null;
+
+/** Persist the current tab set to the backend when it actually changed.
+ *  Fire-and-forget: persistence is best-effort and must never block or crash the
+ *  UI (a failed write just means the last change isn't durable until the next). */
 function persistTabs(): void {
-  try {
-    localStorage.setItem(TABS_STORAGE_KEY, encodeTabs(tabs.snapshot()));
-  } catch {
-    /* persistence is best-effort; never block the UI on it */
-  }
+  const encoded = encodeTabs(tabs.snapshot());
+  if (encoded === lastPersisted) return;
+  lastPersisted = encoded;
+  void saveUiTabs(encoded).catch(() => {
+    // The write didn't land — allow the next change to retry the same bytes.
+    lastPersisted = null;
+  });
 }
 
-/** Recreate the saved tab set on boot, rebinding each tab's group so a later
- *  session-restore of that group routes into the right tab. Returns whether any
- *  tabs were restored (false → caller seeds one default tab). Live agent panes
- *  do NOT come back here — only the tab shells + group bindings do. */
-function restoreTabs(): boolean {
-  const saved = decodeTabs(localStorage.getItem(TABS_STORAGE_KEY));
+/** Load the persisted tab-set JSON, migrating a pre-backend localStorage blob on
+ *  first run after upgrade: read the legacy key ONCE, hand it to the backend,
+ *  and clear it so the backend copy is thereafter the single source of truth. */
+async function loadPersistedTabs(): Promise<string | null> {
+  const fromBackend = await loadUiTabs();
+  if (fromBackend !== null) return fromBackend;
+  // No backend copy yet. One-time migration from the pre-backend localStorage.
+  const legacy = localStorage.getItem(LEGACY_TABS_KEY);
+  if (legacy !== null) {
+    localStorage.removeItem(LEGACY_TABS_KEY);
+    // Adopt the legacy blob as the backend copy immediately, so a crash before
+    // the next change doesn't lose it (and we never read localStorage again).
+    void saveUiTabs(legacy).catch(() => {});
+    return legacy;
+  }
+  return null;
+}
+
+/** Recreate the saved tab set on boot, rebinding each tab's group so a restored
+ *  session for that group routes into its own tab (see restoreSession). Returns
+ *  whether any tabs were restored (false → caller seeds one default tab).
+ *
+ *  DELIBERATE SCOPE (design doc — not a limitation we couldn't overcome): only
+ *  the tab SHELLS revive here (name / color / order / active / group binding).
+ *  Live agent panes/PTYs are NOT auto-spawned on boot — reviving N
+ *  orchestrator+worker CLIs on every launch would burn the user's credits and
+ *  spawn a process storm (#78) without them asking. Instead the persisted group
+ *  binding makes revival routing-correct: when the human restores that group's
+ *  session (or a spawn/rejoin event arrives for it), it lands in THIS tab via
+ *  the group→tab routing, not whatever tab is active. */
+async function restoreTabs(): Promise<boolean> {
+  const saved = decodeTabs(await loadPersistedTabs());
   if (!saved) return false;
   for (const t of saved.tabs) {
     const ws = tabs.newTab(false);
@@ -326,20 +376,26 @@ const sessions = new SessionBrowser(
 );
 
 async function restoreSession(s: SessionInfo): Promise<void> {
-  // Sessions restore into the active tab.
-  const ws = tabs.activeWorkspace;
-  // Recorded orchestration sessions restore into their group — MCP
-  // identity, badges, and task board included — instead of a powerless
-  // plain `--resume`.
+  // Recorded orchestration sessions restore into their group — MCP identity,
+  // badges, and task board included — instead of a powerless plain `--resume`.
   const orchRole = s.source === "claude" ? sessions.roleFor(s) : undefined;
   if (orchRole) {
+    // Route a restored group into the tab that OWNS it, if one exists — a
+    // persisted tab (its shell restored on boot) whose group binding survived,
+    // or a tab already hosting that group this session. This is the real
+    // persistence↔restore integration (#63): the group re-inhabits its own tab
+    // through the resume machinery, not whatever tab happens to be active. Only
+    // when no tab owns the group does it land in the active tab.
+    const owning = tabs.workspaceForGroup(orchRole.group_id);
+    const ws = owning ?? tabs.activeWorkspace;
+    if (owning && owning.id !== tabs.activeTabId) tabs.switchTo(owning.id);
     try {
       const restored = await resumeOrchSession(ws.grid, eventsFor(ws), s.id, {
         group: orchRole.group_id,
         role: orchRole.role,
       });
       // Bind the restored group + pane to this tab so its rejoined workers and
-      // focus/attention route here (#63 phase 3).
+      // focus/attention route here (#63); idempotent when the tab already owned it.
       if (restored) {
         tabs.bindGroup(restored.groupId, ws.id);
         if (restored.pane?.ptyId != null) tabs.bindPty(restored.pane.ptyId, ws.id);
@@ -350,6 +406,8 @@ async function restoreSession(s: SessionInfo): Promise<void> {
     }
     return;
   }
+  // Plain (non-orchestration) sessions restore into the active tab.
+  const ws = tabs.activeWorkspace;
   const name =
     (s.source === "claude" ? "claude · " : "copilot · ") +
     (s.title.length > 34 ? s.title.slice(0, 34) + "…" : s.title);
@@ -517,29 +575,30 @@ initStatusBar();
 // overflows a narrow window.
 initHintBar();
 
-// Orchestration is now tab-aware (#63 phase 3): spawns land in their group's
-// tab (auto-created on first sight), focus switches tab then pane, group-end
-// closes the owning tab's panes, and attention badges hidden tabs' strip
-// entries. The router (orchWiring) is implemented over the TabManager above.
+// Orchestration is tab-aware (#63): spawns land in their group's tab (created on
+// first sight), focus switches tab then pane, group-end closes the owning tab's
+// panes, and attention badges hidden tabs' strip entries. The router
+// (orchWiring) is implemented over the TabManager above. Wired before any
+// orchestrator can launch (below), so no spawn event races an unready router.
 initOrchestration(orchWiring);
 
-// Restore the saved tab set, or seed the one default tab (never-zero-tabs
-// floor). Persist on every subsequent change. Mount the tab bar last.
-const didRestore = restoreTabs();
-if (!didRestore) tabs.newTab();
-tabs.onChange(persistTabs);
-// The "+" button opens a real starting surface, same as the shortcut (finding 3).
-new TabBar(tabBarEl, tabs, () => void openUserTab());
-
-// Preview thumbnails are now serialized live on hover (see TabBar), not on a
-// background timer — a hovered background tab shows its currently-streaming
-// viewport. Serialization reads the in-memory buffer, so still no layout / no
-// PTY resize (#63 finding 2).
-
+// Boot the tab layer. Restoring the tab set is now async (it reads the durable
+// backend store), so the whole seed → mount → fill sequence is one async flow.
+// Preview thumbnails serialize live on hover (see TabBar) from the in-memory
+// buffer — no layout, no PTY resize (#63 no-resize invariant).
 void (async () => {
+  // Restore the saved tab set, or seed the one default tab (never-zero-tabs
+  // floor). Subscribe persistTabs AFTER restore so rebuilding the saved set
+  // doesn't redundantly write it straight back.
+  const didRestore = await restoreTabs();
+  if (!didRestore) tabs.newTab();
+  tabs.onChange(persistTabs);
+  // The "+" button opens a real starting surface, same as the shortcut.
+  new TabBar(tabBarEl, tabs, () => void openUserTab());
+
   await ensureOutputRouter();
   // Fill any restored background tab that came back empty with a plain shell so
-  // it isn't blank (live agent panes don't auto-rehydrate — see the walkthrough).
+  // it isn't blank (live agent panes don't auto-revive — see restoreTabs).
   for (const ws of tabs.tabs) {
     if (ws.id !== tabs.activeTabId && ws.grid.paneCount === 0) await openShellIn(ws);
   }

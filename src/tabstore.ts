@@ -1,13 +1,20 @@
-// Pure encode/decode for the persisted tab set (#63 phase 5, prototype-lite),
-// split out so the round-trip + validation is unit-testable under `node --test`.
-// The storage side is localStorage (the `loomux.*` convention every other
-// frontend setting uses — agents.ts, editor.ts, gitview.ts), wired in tabs.ts /
-// main.ts. No backend command, so no getrandom/Windows concern.
+// Pure encode/decode + validation for the persisted tab set (#63), split out so
+// the round-trip and the corrupt-input fail-safe are unit-testable under
+// `node --test` (CLAUDE.md: pure logic here, DOM/IPC wiring validated by hand).
 //
-// What persists: each tab's name, color, and bound orchestration group id (so a
-// restored group's session rehydrates into the right tab). What does NOT: the
-// live panes/PTYs themselves — agents only come back as far as the existing
-// per-session restore allows. See the walkthrough for the honest limits.
+// tabstore.ts is the SINGLE SOURCE of the tab schema. The bytes live in durable
+// backend storage — an atomic, corrupt-quarantining tabs.json in AppData
+// (src-tauri/src/uistate.rs), reached through the typed loadUiTabs/saveUiTabs
+// wrappers in pty.ts (main.ts does the load→decode / snapshot→encode→save). The
+// backend guarantees "valid JSON text or nothing"; decodeTabs below adds the
+// SCHEMA-level guard, returning null for anything malformed so a hand-edited or
+// partially-written blob degrades to a fresh tab instead of crashing boot.
+//
+// What persists: each tab's name, color, order, active index, and bound
+// orchestration group id (so a restored group's session rehydrates into the
+// right tab — see restoreSession). What does NOT: the live panes/PTYs — agents
+// revive only as far as the existing per-session restore allows, a deliberate
+// cost-safety decision documented in doc/design/project-tabs.md.
 
 export interface PersistedTab {
   name: string;

@@ -1,14 +1,14 @@
-// The project-tab strip (#63). Phases 1–2: switch, close, new (+), double-click
-// rename, color swatch. Phase 3–4: an attention dot on a tab whose (possibly
-// hidden) pane needs the human, a live status chip (agent count + cost), and a
-// hover thumbnail of the tab's viewport. Phase 5: a right-click context menu
-// that pauses/resumes the tab's orchestration group.
+// The project-tab strip (#63): switch, close, new (+), double-click rename,
+// color swatch; a labelled attention chip on a tab whose (possibly hidden) pane
+// needs the human; a live status chip (agent count + cost); a hover thumbnail
+// compositing the tab's whole layout; and a right-click menu that pauses/resumes
+// the tab's orchestration group.
 //
 // Pure tab state lives in TabManager (tabs.ts); this module renders it and turns
 // interactions into TabManager / backend calls, re-rendering on onChange.
 
 import type { TabManager, ManagedWorkspace } from "./tabs";
-import type { PreviewNode } from "./tabroute";
+import { safeStyleDeclarations, type PreviewNode } from "./tabroute";
 import { makeRenameCommit } from "./panerename";
 import { swapEditor } from "./domutil";
 import { attentionPresentation } from "./attention";
@@ -18,26 +18,25 @@ import { pauseGroup, resumeGroup, groupSummary, groupUsage } from "./orchestrati
 // color vocabulary matches the group-accent colors the panes already use.
 const TAB_COLORS = ["#7aa2f7", "#9ece6a", "#e0af68", "#bb9af7", "#7dcfff", "#f7768e"];
 
+// Preview cost, formalized (#63). Re-serializing every pane on a fast timer is
+// the preview's whole expense, so both levers are named + bounded here and in
+// workspace.ts (PREVIEW_PANE_CAP = 8 panes/refresh). See the design doc.
+//
+// PREVIEW_REFRESH_MS: how often a hovered background tab re-serializes its
+// viewport so a running prompt streams in. ~700ms is well below a human's sense
+// of "live" yet coarse enough that even an 8-pane composite is a trivial slice
+// of one frame budget; it only runs WHILE a background tab is hovered (one tab
+// at a time), and stops the instant the pointer leaves. Degradation if a grid is
+// enormous: panes past the cap render as a titled placeholder, never unbounded
+// work (workspace.ts).
+const PREVIEW_REFRESH_MS = 700;
+
 /** Live per-tab status pulled from the backend for a bound group. */
 interface TabStatus {
   agents: number;
   cost: number | null;
   paused: boolean;
 }
-
-// CSS properties the serialized-viewport spans are allowed to carry. The
-// @xterm/addon-serialize HTML output does NOT escape cell text and emits inline
-// styles, so we rebuild it safely (finding 3): text via textContent, and only
-// these style props with sanitized values — never innerHTML.
-const SAFE_STYLE_PROPS = new Set([
-  "color",
-  "background-color",
-  "font-weight",
-  "font-style",
-  "text-decoration",
-  "opacity",
-  "visibility",
-]);
 
 export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
   /** The id currently being renamed, so a re-render doesn't clobber the open
@@ -52,7 +51,7 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
 
   private el: HTMLElement;
   private tabs: TabManager<T>;
-  /** Opens a new tab WITH its starting pane (finding 3). Falls back to a bare
+  /** Opens a new tab WITH its starting pane . Falls back to a bare
    *  TabManager.newTab (blank) only if the host didn't wire one. */
   private onNewTab: () => void;
 
@@ -61,11 +60,11 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
     this.tabs = tabs;
     this.onNewTab = onNewTab ?? (() => void tabs.newTab());
     tabs.onChange(() => this.render());
-    // Poll bound groups for agent count / cost / paused (phase 4). Cheap; the
+    // Poll bound groups for agent count / cost / paused (#63). Cheap; the
     // strip only re-renders when a value actually differs.
     window.setInterval(() => void this.pollStatus(), 4000);
 
-    // Preview lifecycle (#63 finding 3 — no stuck preview). These live on the
+    // Preview lifecycle (#63 — no stuck preview). These live on the
     // stable strip element (not per-tab), so a re-render never orphans them and
     // the popup dismisses reliably. Delegation drives open/switch by whichever
     // non-active tab the pointer is over; anything else closes it.
@@ -132,7 +131,7 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
 
       tab.append(swatch, name);
 
-      // Unmistakable alert (#63 round 2, finding 1): a pane in this tab is
+      // Unmistakable alert (#63): a pane in this tab is
       // blocked/waiting or otherwise needs the human. Render the SAME label the
       // pane header chip shows (attention.ts), red for the urgent `blocked`
       // class, amber otherwise, pulsing — so a blocked agent in a background tab
@@ -177,7 +176,7 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
 
       tab.addEventListener("click", () => {
         // Activating a tab must dismiss the preview immediately — else it lingers
-        // over the now-active tab (#63 finding 3). Hover delegation handles the
+        // over the now-active tab (#63). Hover delegation handles the
         // rest (the newly-active tab won't re-open a preview).
         this.closePreview();
         this.tabs.switchTo(ws.id);
@@ -309,8 +308,8 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
   }
 
   /** Right-click context menu: pause/resume the tab's orchestration group
-   *  (phase 5), plus rename/close. Pause is only offered when the tab owns a
-   *  group. */
+   *  (contains unattended spend, #63/#78), plus rename/close. Pause is only
+   *  offered when the tab owns a group. */
   private openMenu(ws: ManagedWorkspace, x: number, y: number): void {
     this.closeMenu();
     const menu = document.createElement("div");
@@ -367,7 +366,7 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
     this.menu = null;
   }
 
-  /** Live hover thumbnail (#63 findings 2/3): a composite of the tab's FULL
+  /** Live hover thumbnail (#63): a composite of the tab's FULL
    *  layout — every pane serialized (with color + correct spacing) and arranged
    *  like its split tree — re-serialized every ~700ms so a running prompt streams
    *  in. It's a serialized snapshot of the in-memory buffers, NEVER a laid-out
@@ -401,7 +400,7 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
       this.positionPreview(pop, anchorRect, cw + 16, ch + 16);
     };
     paint();
-    this.previewTimer = window.setInterval(paint, 700);
+    this.previewTimer = window.setInterval(paint, PREVIEW_REFRESH_MS);
   }
 
   /** Build the preview composite: nested flex boxes mirroring the split tree,
@@ -439,7 +438,7 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
     return leaf;
   }
 
-  /** Rebuild @xterm/addon-serialize HTML SAFELY (finding 3): parse it detached,
+  /** Rebuild @xterm/addon-serialize HTML SAFELY : parse it detached,
    *  then re-emit each cell run as a <span> with textContent (auto-escaped) and
    *  a whitelisted, value-sanitized inline style — never innerHTML of the raw
    *  string, which the addon does not escape. */
@@ -474,16 +473,11 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
     return term;
   }
 
-  /** Apply only whitelisted CSS props with sanitized values to a preview span. */
+  /** Apply only whitelisted CSS props with sanitized values to a preview span.
+   *  The whitelist + value guards live in the pure `safeStyleDeclarations`
+   *  (tabroute.ts), unit-tested against injection attempts. */
   private applySafeStyle(el: HTMLElement, style: string | null): void {
-    if (!style) return;
-    for (const decl of style.split(";")) {
-      const idx = decl.indexOf(":");
-      if (idx < 0) continue;
-      const prop = decl.slice(0, idx).trim().toLowerCase();
-      const value = decl.slice(idx + 1).trim();
-      if (!SAFE_STYLE_PROPS.has(prop)) continue;
-      if (/[<>{}]|url\(|expression|javascript:/i.test(value)) continue;
+    for (const [prop, value] of safeStyleDeclarations(style)) {
       el.style.setProperty(prop, value);
     }
   }

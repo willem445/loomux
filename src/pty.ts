@@ -82,6 +82,22 @@ export const changeDir = (id: number, path: string): Promise<void> =>
 
 export const listSessions = (): Promise<SessionInfo[]> => invoke("list_sessions");
 
+// ---------- durable UI state: project tabs (#63) ----------
+// The tab set persists across launches through the backend (atomic temp+rename
+// write, corrupt-file quarantine — see src-tauri/src/uistate.rs), NOT
+// localStorage, so it survives a webview data clear and lives alongside the
+// app's other durable state. The blob is opaque JSON here; tabstore.ts owns its
+// schema (encode/decode + validation). These are the typed IPC wrappers every
+// frontend module goes through (CLAUDE.md constraint 5).
+
+/** Load the persisted tab-set JSON, or null on first run / after a corrupt file
+ *  was quarantined backend-side (the caller then seeds one default tab). */
+export const loadUiTabs = (): Promise<string | null> => invoke<string | null>("load_ui_tabs");
+
+/** Persist the tab-set JSON atomically. Best-effort — callers never block on it. */
+export const saveUiTabs = (contents: string): Promise<void> =>
+  invoke("save_ui_tabs", { contents });
+
 // ---------- voice prompt (#58 prototype) ----------
 // Push-to-talk mic capture → local whisper.cpp transcription. The backend owns
 // the microphone (native WASAPI) so there's no WebView2 getUserMedia permission

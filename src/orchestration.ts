@@ -182,7 +182,7 @@ export interface OrchTarget {
   paneEvents: PaneEvents;
 }
 
-/** The tab layer, as the orchestration event router sees it (#63 phase 3). Its
+/** The tab layer, as the orchestration event router sees it (#63). Its
  *  implementation (main.ts, over TabManager) owns tab creation/switching; this
  *  module owns the backend-event plumbing and calls into it. Keeping the
  *  interface here means orchestration.ts has no dependency on the concrete tabs
@@ -243,7 +243,7 @@ export function initOrchestration(wiring: OrchWiring): void {
       }
     }
   );
-  // Focus: switch to the pane's TAB first, then focus the pane (#63 phase 3).
+  // Focus: switch to the pane's TAB first, then focus the pane (#63).
   void listen<{ agent_id: string; pty_id: number | null }>("orch-focus", ({ payload }) => {
     if (payload.pty_id === null) return;
     wiring.focusPty(payload.pty_id);
@@ -261,7 +261,7 @@ export function initOrchestration(wiring: OrchWiring): void {
   );
   // Attention routing: the backend pushes the full current set of panes that
   // need the human every scan. Applied across ALL tabs — a hidden tab's blocked
-  // agent must still badge its tab strip entry (#63 phase 3) — reusing the same
+  // agent must still badge its tab strip entry (#63) — reusing the same
   // attention.ts mapping the pane header and dock chip use. Also covers plain
   // panes keyed only by pty (#40), not just orchestration agents.
   void listen<AttentionItem[]>("orch-attention", ({ payload }) => {
@@ -342,7 +342,7 @@ export async function launchOrchestrator(
     watchdogStallMinutes: config.watchdogStallMinutes,
   });
   // Human launched the orchestrator from the UI — focus its pane. Return the
-  // group + pane so the caller binds the tab routing (#63 phase 3).
+  // group + pane so the caller binds the tab routing (#63).
   const pane = await openAgentPane(grid, paneEvents, spec, false);
   return { groupId: spec.group_id, pane };
 }

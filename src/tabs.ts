@@ -2,8 +2,8 @@
 //
 // Each tab is a `Workspace`: one `Grid` + its own minimize dock (the DOM/Grid
 // half lives in workspace.ts). `TabManager` owns the ordered tab list, the
-// active tab, the "never zero tabs" invariant, and the routing maps that later
-// phases use to send an orchestration group / pty to the right tab.
+// active tab, the "never zero tabs" invariant, and the routing maps that send an
+// orchestration group / pty to the right tab.
 //
 // This file has NO Tauri/xterm/Grid imports so it runs under `node --test`
 // (CLAUDE.md: pure logic here, DOM wiring validated by hand). TabManager is
@@ -17,7 +17,8 @@ import type { PersistedTabs } from "./tabstore";
  *  (workspace.ts) implements this and adds the concrete Grid/DOM. */
 export interface ManagedWorkspace {
   readonly id: string;
-  /** Human-facing tab name (in-memory for the prototype; phase 5 persists it). */
+  /** Human-facing tab name. Persisted across launches via TabManager.snapshot →
+   *  the durable backend store (tabstore.ts, uistate.rs). */
   name: string;
   /** Tab accent color, or null for the default palette slot / no custom color. */
   color: string | null;
@@ -30,7 +31,7 @@ export interface ManagedWorkspace {
   /** Focus the workspace's active pane — called when a tab becomes active. */
   focus(): void;
   /** Snapshot the tab's whole split layout for a live hover thumbnail (#63
-   *  findings 2/3): the split tree with EVERY pane's serialized-HTML viewport at
+   *  the split tree with EVERY pane's serialized-HTML viewport at
    *  the leaves. Reads the in-memory xterm buffers (which keep updating while
    *  hidden), so it works with zero layout and no PTY resize — the tab bar
    *  re-calls it on a short interval while hovered for a live view, and renders
@@ -52,14 +53,14 @@ export class TabManager<T extends ManagedWorkspace> {
   private seq = 0;
   private listeners = new Set<TabsListener>();
 
-  // Routing seams for phase 3 (worker B): orchestration events (spawn/focus/
-  // attention/group-ended) resolve their target tab through these. Kept here so
-  // add/remove maintain them in one place; the tab-aware router that populates
-  // and reads them is TODO(#63 phase 3).
+  // Orchestration routing maps: spawn/focus/attention/group-ended events resolve
+  // their target tab through these. The tab-aware router (main.ts's OrchWiring,
+  // fed by orchestration.ts's backend listeners) populates and reads them;
+  // they're maintained here so add/remove keep them consistent in one place.
   private groupToWs = new Map<string, string>();
   private ptyToWs = new Map<number, string>();
-  /** Per-tab attention badge state (phase 3), refreshed from the attention scan
-   *  by the router; read by the tab bar. Absent = no attention. */
+  /** Per-tab attention badge state, refreshed from the backend attention scan by
+   *  the router; read by the tab bar. Absent = no attention. */
   private attn = new Map<string, TabAttn>();
 
   /** Builds a workspace for a freshly minted id (real Workspace in production;
@@ -177,14 +178,16 @@ export class TabManager<T extends ManagedWorkspace> {
     this.emit();
   }
 
-  // ---------- routing seams (phase 3, worker B) ----------
+  // ---------- orchestration routing ----------
 
-  /** Bind an orchestration group to the tab that owns it. TODO(#63 phase 3):
-   *  the tab-aware orchestration router calls this on first sight of a group. */
+  /** Bind an orchestration group to the tab that owns it. The router calls this
+   *  on first sight of a group (spawn request), on launching an orchestrator into
+   *  a fresh tab, and on restoring a group's session (main.ts). */
   bindGroup(groupId: string, workspaceId: string): void {
     this.groupToWs.set(groupId, workspaceId);
   }
-  /** Bind a pty to its owning tab (derived from the group). TODO(#63 phase 3). */
+  /** Bind a pty to its owning tab (derived from its group) so focus/attention
+   *  for that pty resolve to the right tab. */
   bindPty(ptyId: number, workspaceId: string): void {
     this.ptyToWs.set(ptyId, workspaceId);
   }
@@ -206,7 +209,7 @@ export class TabManager<T extends ManagedWorkspace> {
     return this.ptyToWs;
   }
 
-  // ---------- per-tab attention (phase 3) ----------
+  // ---------- per-tab attention ----------
 
   /** Replace the whole per-tab attention set from an attention scan and emit.
    *  The caller (main.ts) dedups with tabroute.sameAttention so the 3-second
@@ -223,7 +226,7 @@ export class TabManager<T extends ManagedWorkspace> {
     return this.attn.get(workspaceId);
   }
 
-  // ---------- persistence (phase 5) ----------
+  // ---------- persistence ----------
 
   /** Snapshot the tab set for persistence: each tab's name/color/owning group,
    *  plus which tab was active. Pane/PTY contents are NOT captured (see

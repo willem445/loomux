@@ -635,9 +635,14 @@ export class Pane implements VoiceTargetPane {
    *  hold one) and reload it on show — the onContextLoss→DOM fallback path. */
   private webgl: WebglAddon | null = null;
   private serializer: SerializeAddon | null = null;
+  /** True while this pane's project tab is hidden (#63). Held so `tryWebgl`
+   *  refuses to create a context for a hidden pane — start() calls tryWebgl
+   *  unconditionally, so a pane opened INTO a hidden tab (a background
+   *  orchestrator spawn) would otherwise take a GL context it isn't showing. */
+  private hiddenTab = false;
 
   private tryWebgl(): void {
-    if (this.webgl) return;
+    if (this.webgl || this.hiddenTab) return;
     try {
       const webgl = new WebglAddon();
       webgl.onContextLoss(() => {
@@ -651,13 +656,16 @@ export class Pane implements VoiceTargetPane {
     }
   }
 
-  /** Show/hide bookkeeping for a project-tab switch (#63 phase 4). Hiding drops
-   *  the WebGL context (freeing it for the active tab and cutting idle VRAM);
-   *  showing reloads it. Purely a rendering concern — the PTY and buffer are
-   *  untouched, so no resize and no scrollback loss. Safe to call before the
-   *  terminal is even open (tryWebgl no-ops then). */
+  /** Show/hide bookkeeping for a project-tab switch (#63). Hiding drops the
+   *  WebGL context (freeing it for the active tab and cutting idle VRAM) and
+   *  latches `hiddenTab` so start()/tryWebgl won't re-create one while hidden;
+   *  showing clears the latch and reloads it (via the onContextLoss→DOM fallback
+   *  if the GPU is out of contexts). Purely a rendering concern — the PTY and
+   *  buffer are untouched, so no resize and no scrollback loss. Safe to call
+   *  before the terminal is even open (tryWebgl no-ops until start opens it). */
   setHidden(hidden: boolean): void {
     if (this.disposed) return;
+    this.hiddenTab = hidden;
     if (hidden) {
       this.webgl?.dispose();
       this.webgl = null;
@@ -667,14 +675,14 @@ export class Pane implements VoiceTargetPane {
   }
 
   /** An HTML snapshot of the terminal viewport, for a background tab's preview
-   *  thumbnail (#63 finding 2/3). Serializes the in-memory buffer (NOT the DOM),
+   *  thumbnail (#63). Serializes the in-memory buffer (NOT the DOM),
    *  so it works while the pane is hidden/zero-width — the whole point: a preview
    *  must never require a laid-out element, which would re-arm applyFit and fire
    *  a PTY resize.
    *
    *  serializeAsHTML (not serialize): the string serializer emits cursor-forward
    *  escapes (`ESC[nC`) to skip blank cells, which stripping collapses runs of
-   *  spaces ("Please count" → "Pleasecount", #63 finding 3). The HTML serializer
+   *  spaces ("Please count" → "Pleasecount", #63). The HTML serializer
    *  emits a literal space per blank cell and per-run `<span style='color:…'>`,
    *  so the preview keeps spacing AND color. The caller parses this SAFELY (spans
    *  → textContent + whitelisted styles), never innerHTML — the addon does not
