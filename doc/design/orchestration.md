@@ -594,7 +594,9 @@ consent is *blocked*, not advised.
   agent with shell access *can* still: (1) call gh by its **absolute path**, skipping `PATH`
   entirely; (2) use a **raw REST/GraphQL** merge shape the cheap substring match doesn't catch
   (unusual `gh api` forms, a direct `curl` to the API with a token, or a library); (3) run in a
-  **cmd/pwsh** pane with no `sh` on `PATH` (the `gh.cmd` fallback runs the real gh). These are
+  **cmd/pwsh** pane with no `sh` on `PATH` (the `gh.cmd` fallback runs the real gh); (4) define a
+  **`gh` alias** that re-invokes the real binary (a deliberate multi-step move, same class as the
+  above). These are
   intentional trade-offs: catching every shape would need sandboxing or network egress control,
   out of scope here. **The gold-standard closing layer is a machine account**: give agents a
   GitHub token whose account has *no merge permission on the default branch* (branch protection
