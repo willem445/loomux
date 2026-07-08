@@ -128,9 +128,10 @@ src/
   fileedit.ts       file-editor overlay (#174): tree + code editor + search/replace (DOM wiring)
   filetreemodel.ts  pure lazy-tree model: sort/merge/flatten (DOM-free, unit-tested)
   fileicons.ts      pure filename -> inline-SVG icon mapping (DOM-free, unit-tested)
-  searchresults.ts  pure search grouping + replace-selection model (DOM-free, unit-tested)
-  dirtystate.ts     pure dirty/conflict/close-guard decisions (DOM-free, unit-tested)
-  editorwidget.ts   swappable editor widget: lazy CodeMirror 6 + textarea fallback
+  searchresults.ts  pure search grouping + tree-hit + replace-selection model (DOM-free, unit-tested)
+  dirtystate.ts     pure conflict/close-guard decisions (DOM-free, unit-tested)
+  eol.ts            pure line-ending detect/normalize/re-apply for EOL-safe dirty tracking (unit-tested)
+  editorwidget.ts   swappable editor widget: lazy CodeMirror 6 (One Dark) + textarea fallback
   voice.ts          pure voice logic: target decision + push-to-talk state machine
   voicecontrol.ts   global single-capture controller; routes transcripts to focus
   main.ts           composition root (owns the TabManager + OrchWiring router)

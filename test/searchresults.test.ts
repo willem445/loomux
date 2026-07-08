@@ -9,6 +9,8 @@ import {
   selectedFiles,
   selectedMatchCount,
   paramsEqual,
+  hitCounts,
+  firstMatch,
   type SearchParams,
 } from "../src/searchresults.ts";
 import type { SearchMatch } from "../src/fileapi.ts";
@@ -56,6 +58,20 @@ test("paramsEqual detects a changed query or option (preview-vs-apply guard)", (
   assert.equal(paramsEqual(base, { ...base, query: "bar" }), false);
   assert.equal(paramsEqual(base, { ...base, caseInsensitive: true }), false);
   assert.equal(paramsEqual(base, { ...base, wholeWord: true }), false);
+});
+
+test("hitCounts maps each file to its match count for tree highlighting", () => {
+  const groups = groupMatches([m("a.ts", 1), m("a.ts", 4), m("b.ts", 2)]);
+  const counts = hitCounts(groups);
+  assert.equal(counts.get("a.ts"), 2);
+  assert.equal(counts.get("b.ts"), 1);
+  assert.equal(counts.get("missing.ts"), undefined);
+});
+
+test("firstMatch returns the first hit in a file (for jump-to on open)", () => {
+  const groups = groupMatches([m("a.ts", 7), m("a.ts", 9)]);
+  assert.equal(firstMatch(groups, "a.ts")?.line, 7);
+  assert.equal(firstMatch(groups, "nope.ts"), null);
 });
 
 test("edge: zero matches and all-deselected", () => {

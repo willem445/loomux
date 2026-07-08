@@ -26,6 +26,8 @@ import {
   selectedFiles,
   selectedMatchCount,
   paramsEqual,
+  hitCounts,
+  firstMatch,
   type FileGroup,
   type SearchParams,
 } from "./searchresults";
@@ -33,10 +35,13 @@ import {
   makeRoot,
   mergeChildren,
   flatten,
+  findNode,
+  ancestorDirs,
   type TreeNode,
 } from "./filetreemodel";
 import { fileIconSvg, folderIconSvg } from "./fileicons";
-import { isDirty, closeDecision, type ConflictChoice } from "./dirtystate";
+import { closeDecision, type ConflictChoice } from "./dirtystate";
+import { detectEol, applyEol, textDiffers, type Eol } from "./eol";
 import { createEditor, type EditorWidget } from "./editorwidget";
 import { showToast } from "./toast";
 
@@ -51,12 +56,13 @@ export interface FileEditHost {
   isAgentWorktree?(): boolean;
 }
 
-type Mode = "tree" | "search";
-
 const TREE_W_KEY = "loomux.fileedit.treeW";
-const DEFAULT_TREE_W = 240;
-const MIN_TREE_W = 140;
-const MAX_TREE_W = 560;
+const DEFAULT_TREE_W = 280;
+const MIN_TREE_W = 180;
+const MAX_TREE_W = 640;
+/** Debounce for auto-search while typing, so the tree highlights update
+ *  "live" without a full-tree walk on every keystroke. */
+const SEARCH_DEBOUNCE_MS = 300;
 
 function el(tag: string, cls: string, text?: string): HTMLElement {
   const e = document.createElement(tag);
@@ -68,7 +74,6 @@ function el(tag: string, cls: string, text?: string): HTMLElement {
 export class FileEditView {
   readonly el: HTMLElement;
 
-  private mode: Mode = "tree";
   /** The directory the tree is rooted at. Seeded from the pane cwd on show;
    *  can be overridden by the folder picker (view-local — it does NOT cd the
    *  shell, so browsing here never disturbs the terminal or a running agent). */
@@ -76,8 +81,6 @@ export class FileEditView {
   private treeModel: TreeNode = makeRoot();
 
   // Header bits.
-  private treeTab!: HTMLButtonElement;
-  private searchTab!: HTMLButtonElement;
   private rootLabel: HTMLElement;
   private fileLabel: HTMLElement;
   private dirtyDot: HTMLElement;
@@ -91,23 +94,32 @@ export class FileEditView {
   private editorPane: HTMLElement;
   private editorHost: HTMLElement;
   private emptyState: HTMLElement;
-  private searchPane: HTMLElement;
 
   // Open-file state.
   private editor: EditorWidget | null = null;
   private openRel: string | null = null;
+  /** Last-saved snapshot, kept as the RAW on-disk text (its original line
+   *  endings). Dirty checks compare it to the editor's LF text in an
+   *  EOL-normalized space (`textDiffers`), so a CRLF file opened and untouched
+   *  reads as clean. */
   private savedContent = "";
   private savedHash = "";
+  /** The open file's line-ending style, re-applied on save so writing never
+   *  silently converts CRLF↔LF. */
+  private openEol: Eol = "\n";
 
   // Search/replace state.
   private searchInput!: HTMLInputElement;
   private replaceInput!: HTMLInputElement;
   private ciBox!: HTMLInputElement;
   private wwBox!: HTMLInputElement;
-  private resultsEl!: HTMLElement;
   private summaryEl!: HTMLElement;
   private replaceBtn!: HTMLButtonElement;
   private searchGroups: FileGroup[] = [];
+  /** rel → match count for the current search, consulted per tree row to
+   *  highlight + badge files that contain hits. */
+  private hits = new Map<string, number>();
+  private searchTimer: number | undefined;
   /** The query + options the current `searchGroups` were produced with. Replace
    *  applies from THIS, not the live inputs, so a query/option edit after a
    *  search can't make apply diverge from the preview. Nulled when the preview
@@ -127,13 +139,6 @@ export class FileEditView {
 
     // ---- header ----
     const head = el("div", "fileedit-head");
-
-    const tabs = el("div", "fileedit-tabs");
-    this.treeTab = el("button", "fileedit-tab active", "Files") as HTMLButtonElement;
-    this.searchTab = el("button", "fileedit-tab", "Search") as HTMLButtonElement;
-    this.treeTab.addEventListener("click", () => this.setMode("tree"));
-    this.searchTab.addEventListener("click", () => this.setMode("search"));
-    tabs.append(this.treeTab, this.searchTab);
 
     const rootWrap = el("div", "fileedit-root");
     this.rootLabel = el("span", "fileedit-root-path", "(no folder)");
@@ -163,7 +168,7 @@ export class FileEditView {
     closeBtn.title = "Close (Esc)";
     closeBtn.addEventListener("click", () => void this.requestClose());
 
-    head.append(tabs, rootWrap, spacer, this.fileLabel, this.dirtyDot, this.findBtn, this.saveBtn, closeBtn);
+    head.append(rootWrap, spacer, this.fileLabel, this.dirtyDot, this.findBtn, this.saveBtn, closeBtn);
 
     // ---- agent-worktree banner (subtle, non-blocking) ----
     this.agentBanner = el(
@@ -176,10 +181,14 @@ export class FileEditView {
     // ---- body ----
     const body = el("div", "fileedit-body");
 
+    // Left column: the search box sits ABOVE the tree (demo feedback) and drives
+    // the in-tree hit highlighting; the tree fills the rest.
     this.treePane = el("div", "fileedit-tree-pane");
     this.treePane.style.width = `${this.storedTreeW()}px`;
+    const searchForm = el("div", "fileedit-search-form");
+    this.buildSearchForm(searchForm);
     this.treeListEl = el("div", "fileedit-tree");
-    this.treePane.appendChild(this.treeListEl);
+    this.treePane.append(searchForm, this.treeListEl);
 
     const divider = el("div", "fileedit-vdivider");
     this.wireTreeDivider(divider);
@@ -204,13 +213,9 @@ export class FileEditView {
     this.emptyState = el("div", "fileedit-empty", "Select a file to edit.");
     this.editorPane.append(this.editorHost, this.emptyState);
 
-    this.searchPane = el("div", "fileedit-search-pane");
-    this.buildSearchPane(this.searchPane); // logic wired in step 6
-
-    body.append(this.treePane, divider, this.editorPane, this.searchPane);
+    body.append(this.treePane, divider, this.editorPane);
 
     this.el.append(head, this.agentBanner, body);
-    this.applyModeClass();
   }
 
   // ---------- overlay contract ----------
@@ -243,27 +248,9 @@ export class FileEditView {
   }
 
   dispose(): void {
+    clearTimeout(this.searchTimer);
     this.editor?.dispose();
     this.el.remove();
-  }
-
-  // ---------- mode ----------
-
-  private setMode(mode: Mode): void {
-    this.mode = mode;
-    this.syncTabs();
-    this.applyModeClass();
-    if (mode === "search") this.searchInput.focus();
-  }
-
-  private syncTabs(): void {
-    this.treeTab.classList.toggle("active", this.mode === "tree");
-    this.searchTab.classList.toggle("active", this.mode === "search");
-  }
-
-  private applyModeClass(): void {
-    this.el.classList.toggle("mode-tree", this.mode === "tree");
-    this.el.classList.toggle("mode-search", this.mode === "search");
   }
 
   // ---------- root / tree ----------
@@ -317,6 +304,25 @@ export class FileEditView {
         name.title = "symlink (not followed)";
       }
       row.append(icon, name);
+      // Search-hit highlight + count badge (demo feedback #3): a file with
+      // matches gets a highlight and a clickable count that toggles whether it's
+      // included in a replace.
+      const count = node.isDir ? undefined : this.hits.get(node.path);
+      if (count !== undefined) {
+        row.classList.add("hit");
+        const group = this.searchGroups.find((g) => g.rel === node.path);
+        const selected = group?.selected ?? true;
+        const badge = el("span", `fileedit-hit-badge${selected ? "" : " off"}`, String(count));
+        badge.title = selected ? "In replace set — click to exclude" : "Excluded from replace — click to include";
+        badge.addEventListener("click", (e) => {
+          e.stopPropagation();
+          this.searchGroups = toggleFile(this.searchGroups, node.path);
+          this.updateReplaceBtn();
+          this.renderTree();
+        });
+        if (!selected) row.classList.add("hit-off");
+        row.append(badge);
+      }
       row.addEventListener("click", () => void this.onRowClick(node));
       frag.appendChild(row);
     }
@@ -330,7 +336,9 @@ export class FileEditView {
       if (node.expanded && !node.loaded) await this.loadDir(node);
       this.renderTree();
     } else {
-      await this.openFile(node.path);
+      // Opening a file with hits jumps to its first match (demo feedback #3).
+      const first = firstMatch(this.searchGroups, node.path);
+      await this.openFile(node.path, first?.line, first?.col);
     }
   }
 
@@ -347,6 +355,7 @@ export class FileEditView {
       this.openRel = rel;
       this.savedContent = fr.content;
       this.savedHash = fr.hash;
+      this.openEol = detectEol(fr.content);
       await this.mountEditor(fr.content, rel);
       this.emptyState.hidden = true;
       this.editorHost.hidden = false;
@@ -371,7 +380,8 @@ export class FileEditView {
 
   private async save(): Promise<void> {
     if (!this.editor || this.openRel === null || !this.root) return;
-    const content = this.editor.getValue();
+    // Write with the file's original line ending; the editor works in LF.
+    const content = applyEol(this.editor.getValue(), this.openEol);
     try {
       const res = await ftWriteFile(this.root, this.openRel, content, this.savedHash || null);
       this.savedContent = content;
@@ -398,6 +408,7 @@ export class FileEditView {
         const fr = await ftReadFile(this.root, this.openRel);
         this.savedContent = fr.content;
         this.savedHash = fr.hash;
+        this.openEol = detectEol(fr.content);
         this.editor?.setValue(fr.content, this.openRel);
         this.updateDirty();
       } catch (err) {
@@ -420,7 +431,7 @@ export class FileEditView {
   // ---------- dirty tracking ----------
 
   private isDirtyNow(): boolean {
-    return this.editor !== null && isDirty(this.savedContent, this.editor.getValue());
+    return this.editor !== null && textDiffers(this.savedContent, this.editor.getValue());
   }
 
   private updateDirty(): void {
@@ -509,27 +520,29 @@ export class FileEditView {
     });
   }
 
-  // ---------- search + replace panel ----------
+  // ---------- search + replace (drives the in-tree hit highlighting) ----------
 
-  private buildSearchPane(pane: HTMLElement): void {
-    const form = el("div", "fileedit-search-form");
-
+  private buildSearchForm(form: HTMLElement): void {
     const searchRow = el("div", "fileedit-search-row");
     this.searchInput = document.createElement("input");
     this.searchInput.className = "fileedit-search-input";
-    this.searchInput.placeholder = "Search text…";
+    this.searchInput.placeholder = "Search in files…";
     this.searchInput.spellcheck = false;
     this.searchInput.addEventListener("keydown", (e) => {
       e.stopPropagation();
-      if (e.key === "Enter") void this.runSearch();
+      if (e.key === "Enter") {
+        clearTimeout(this.searchTimer);
+        void this.runSearch();
+      }
     });
-    // Editing the query or toggling an option invalidates the preview: the
-    // results no longer reflect what a replace would touch, so clear them and
-    // disable Replace until the user searches again (finding #1).
-    this.searchInput.addEventListener("input", () => this.invalidateIfStale());
-    const searchBtn = el("button", "fileedit-save", "Search") as HTMLButtonElement;
-    searchBtn.addEventListener("click", () => void this.runSearch());
-    searchRow.append(this.searchInput, searchBtn);
+    // Live highlight: debounce a search as the user types so tree hits update
+    // without a full-tree walk on every keystroke. Editing also invalidates the
+    // current preview immediately so a stale replace can't be applied (finding #1).
+    this.searchInput.addEventListener("input", () => {
+      this.invalidateIfStale();
+      this.scheduleSearch();
+    });
+    searchRow.append(this.searchInput);
 
     const replaceRow = el("div", "fileedit-search-row");
     this.replaceInput = document.createElement("input");
@@ -547,16 +560,16 @@ export class FileEditView {
     const [wwLabel, wwBox] = checkboxLabel("Whole word");
     this.ciBox = ciBox;
     this.wwBox = wwBox;
-    ciBox.addEventListener("change", () => this.invalidateIfStale());
-    wwBox.addEventListener("change", () => this.invalidateIfStale());
+    const onOpt = () => {
+      this.invalidateIfStale();
+      this.scheduleSearch();
+    };
+    ciBox.addEventListener("change", onOpt);
+    wwBox.addEventListener("change", onOpt);
     this.summaryEl = el("span", "fileedit-search-summary", "");
     opts.append(ciLabel, wwLabel, this.summaryEl);
 
     form.append(searchRow, replaceRow, opts);
-
-    this.resultsEl = el("div", "fileedit-results");
-
-    pane.append(form, this.resultsEl);
   }
 
   /** The live search parameters from the inputs. */
@@ -576,15 +589,17 @@ export class FileEditView {
     };
   }
 
-  /** If the live inputs no longer match the snapshot the current results were
-   *  produced with, drop the preview so it can't be applied (finding #1). */
+  private scheduleSearch(): void {
+    clearTimeout(this.searchTimer);
+    this.searchTimer = window.setTimeout(() => void this.runSearch(), SEARCH_DEBOUNCE_MS);
+  }
+
+  /** If the live inputs no longer match the snapshot the current hits were
+   *  produced with, drop the preview so a stale replace can't apply (finding #1
+   *  from the prior review) — the debounced search re-establishes it. */
   private invalidateIfStale(): void {
     if (this.searchSnapshot && !paramsEqual(this.searchSnapshot, this.currentParams())) {
       this.searchSnapshot = null;
-      this.searchGroups = [];
-      this.resultsEl.replaceChildren();
-      this.summaryEl.classList.remove("truncated");
-      this.summaryEl.textContent = "Press Enter to search";
       this.updateReplaceBtn();
     }
   }
@@ -592,76 +607,65 @@ export class FileEditView {
   private async runSearch(): Promise<void> {
     const params = this.currentParams();
     if (!this.root || params.query === "") {
-      this.searchGroups = [];
-      this.searchSnapshot = null;
-      this.renderResults(false);
+      this.clearSearch();
       return;
     }
     try {
       const out = await ftSearch(this.root, params.query, FileEditView.paramsToOpts(params));
       this.searchGroups = groupMatches(out.matches);
-      // Snapshot exactly what these results reflect; replace applies from this.
+      this.hits = hitCounts(this.searchGroups);
+      // Snapshot exactly what these hits reflect; replace applies from this.
       this.searchSnapshot = params;
-      this.renderResults(out.truncated);
+      this.updateSearchSummary(out.truncated);
+      // Auto-expand the branches leading to hits so they're visible, then paint.
+      await this.revealHits();
+      this.renderTree();
+      this.updateReplaceBtn();
     } catch (err) {
       if (errorCode(err) === "empty-query") return;
       showToast(`Search failed: ${errorMessage(err)}`);
     }
   }
 
-  private renderResults(truncated: boolean): void {
+  private clearSearch(): void {
+    this.searchGroups = [];
+    this.hits = new Map();
+    this.searchSnapshot = null;
+    this.summaryEl.textContent = "";
+    this.summaryEl.classList.remove("truncated");
+    this.updateReplaceBtn();
+    this.renderTree();
+  }
+
+  private updateSearchSummary(truncated: boolean): void {
     const { files, matches } = countSummary(this.searchGroups);
     this.summaryEl.textContent =
       matches === 0
-        ? this.searchInput.value
-          ? "No matches"
-          : ""
-        : `${matches} match${matches === 1 ? "" : "es"} in ${files} file${files === 1 ? "" : "s"}${truncated ? " (truncated)" : ""}`;
+        ? "No matches"
+        : `${matches} in ${files} file${files === 1 ? "" : "s"}${truncated ? " (truncated)" : ""}`;
     this.summaryEl.classList.toggle("truncated", truncated);
-    this.updateReplaceBtn();
+  }
 
-    const frag = document.createDocumentFragment();
-    for (const group of this.searchGroups) {
-      const fileEl = el("div", "fileedit-result-file");
-      const head = el("div", "fileedit-result-head");
-      const box = document.createElement("input");
-      box.type = "checkbox";
-      box.checked = group.selected;
-      box.addEventListener("click", (e) => {
-        e.stopPropagation();
-        this.searchGroups = toggleFile(this.searchGroups, group.rel);
-        this.updateReplaceBtn();
-      });
-      const name = el("span", "fileedit-name", group.rel);
-      const count = el("span", "fileedit-result-count", String(group.matches.length));
-      head.append(box, name, count);
-      fileEl.appendChild(head);
-      for (const mtch of group.matches) {
-        const row = el("div", "fileedit-result-match");
-        const loc = el("span", "fileedit-result-loc", `${mtch.line}:${mtch.col}`);
-        const text = el("span", "fileedit-result-text", mtch.line_text);
-        row.append(loc, text);
-        row.addEventListener("click", () => void this.openFromSearch(mtch.rel, mtch.line, mtch.col));
-        fileEl.appendChild(row);
-      }
-      frag.appendChild(fileEl);
+  /** Load + expand every directory on the path to a hit, so highlighted files
+   *  aren't hidden inside collapsed folders. Shallow → deep so parents load
+   *  before their children are needed. */
+  private async revealHits(): Promise<void> {
+    const dirs = new Set<string>();
+    for (const g of this.searchGroups) for (const d of ancestorDirs(g.rel)) dirs.add(d);
+    // Shallowest first (fewest separators) so each parent is loaded in turn.
+    const ordered = [...dirs].sort((a, b) => a.split("/").length - b.split("/").length);
+    for (const path of ordered) {
+      const node = findNode(this.treeModel, path);
+      if (!node || !node.isDir) continue;
+      if (!node.loaded) await this.loadDir(node);
+      node.expanded = true;
     }
-    this.resultsEl.replaceChildren(frag);
   }
 
   private updateReplaceBtn(): void {
-    const n = selectedMatchCount(this.searchGroups);
+    const n = this.searchSnapshot ? selectedMatchCount(this.searchGroups) : 0;
     this.replaceBtn.disabled = n === 0;
     this.replaceBtn.textContent = n === 0 ? "Replace" : `Replace ${n}`;
-  }
-
-  /** Open a search hit in the editor: switch to tree mode, load the file, and
-   *  jump to the matched line/col (finding #3). */
-  private async openFromSearch(rel: string, line: number, col: number): Promise<void> {
-    this.mode = "tree";
-    this.applyModeClass();
-    this.syncTabs();
-    await this.openFile(rel, line, col);
   }
 
   private async runReplace(): Promise<void> {
@@ -719,6 +723,7 @@ export class FileEditView {
       const fr = await ftReadFile(this.root, this.openRel);
       this.savedContent = fr.content;
       this.savedHash = fr.hash;
+      this.openEol = detectEol(fr.content);
       this.editor?.setValue(fr.content, this.openRel);
       this.updateDirty();
     } catch {

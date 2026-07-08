@@ -96,15 +96,42 @@ gitignore-aware upgrade are the obvious follow-ups.
     icon font/sprite); robust to case, multi-dot, dotfiles, unknown extensions.
   - `searchresults.ts` — group flat matches by file, per-file replace selection,
     confirmed-set + count summaries.
-  - `dirtystate.ts` — `isDirty`, close-guard, and conflict decisions.
+  - `dirtystate.ts` — close-guard and conflict decisions.
+  - `eol.ts` — line-ending detect / normalize / re-apply (see "Dirty tracking").
 - **`editorwidget.ts`** — the swappable editor seam (see below).
-- **`fileedit.ts` (`FileEditView`)** — DOM wiring only: header + Files/Search mode
-  toggle, lazy tree render, editor mount, save / dirty dot / Ctrl+S, the
-  conflict + discard dialogs (reusing the `.dlg-*` kit), the folder picker, the
-  agent-worktree banner, and the search/replace panel. Wired into every pane via
-  `pane.ts` (`toggleFileEditView`, unconditional header button, added to the
-  close-every-other-overlay blocks + `activeOverlay` + `dispose`), `shortcuts.ts`
-  (`Alt+F`), and `main.ts` (dispatch).
+- **`fileedit.ts` (`FileEditView`)** — DOM wiring only: the search box sits ABOVE
+  the tree in the left column and drives in-tree hit highlighting (below); lazy
+  tree render, editor mount, save / dirty dot / Ctrl+S, the conflict + discard
+  dialogs (reusing the `.dlg-*` kit), the folder picker, and the agent-worktree
+  banner. Wired into every pane via `pane.ts` (`toggleFileEditView`, unconditional
+  header button, added to the close-every-other-overlay blocks + `activeOverlay` +
+  `dispose`), `shortcuts.ts` (`Alt+F`), and `main.ts` (dispatch).
+
+## Search + in-tree highlighting
+
+Rather than a separate results panel, the search box lives at the top of the
+left column and highlights matching files directly in the tree (a lightweight
+take on VS Code): each hit file gets an accent highlight and a clickable
+match-count badge (the badge toggles whether that file is in the replace set).
+Typing debounces a search so highlights update live; the branches leading to
+hits auto-expand so they're visible; clicking a hit file opens it and jumps to
+its first match. Replace still applies from the *snapshot* the highlights were
+built with (not the live inputs), so editing the query after a search can't make
+apply diverge from what was shown — the two-phase preview→apply guarantee. The
+grouping / count / selection / first-match logic is the pure `searchresults`
+model; `filetreemodel.ancestorDirs` (pure, tested) computes the branches to
+expand.
+
+## Dirty tracking (line endings)
+
+Files on disk are often CRLF (Windows / git autocrlf) but the editor works in
+LF — CodeMirror splits on CR/LF and returns LF from `getValue()`. Comparing that
+against the raw CRLF bytes read from disk would flag a freshly-opened file as
+"modified" the instant it loads. So dirtiness is compared in an EOL-normalized
+space (`eol.textDiffers`), and the file's original line ending is detected on
+open and re-applied on save (`eol.applyEol`) so writing never silently rewrites
+CRLF↔LF. All pure and `node:test`-covered (`eol.test.ts`), including the
+open→no-edit→stays-clean regression.
 
 ## Key decision — editor widget: CodeMirror 6 vs `<textarea>`
 
@@ -118,7 +145,10 @@ implementations satisfy it:
   `@codemirror/search` panel. It is **lazy-loaded via dynamic `import()`**, so its
   ~40-package dependency tree is code-split by Vite into chunks that load only on
   first overlay open, never in the main bundle. Bundle weight is a non-issue for a
-  local desktop webview, which is CM6's only real cost here.
+  local desktop webview, which is CM6's only real cost here. Colours use the
+  standard **One Dark** theme (`@codemirror/theme-one-dark`), with a modern IDE
+  monospace stack layered on for the font (`"Cascadia Code", "JetBrains Mono",
+  "Fira Code", …` — no bundled font files).
 - **`<textarea>` fallback.** Zero-dependency; used automatically if the CM6 chunk
   fails to load.
 

@@ -84,3 +84,16 @@ export function selectedFiles(groups: FileGroup[]): string[] {
 export function selectedMatchCount(groups: FileGroup[]): number {
   return groups.filter((g) => g.selected).reduce((sum, g) => sum + g.matches.length, 0);
 }
+
+/** Map of `rel` → match count, for highlighting files with hits in the tree
+ *  (VS-Code-like) with a per-file count badge. Pure lookup the tree render
+ *  consults per row. */
+export function hitCounts(groups: FileGroup[]): Map<string, number> {
+  return new Map(groups.map((g) => [g.rel, g.matches.length]));
+}
+
+/** The first match in a file (line/col), for jumping to it when the file is
+ *  opened from the tree highlight. Null if the file has no matches. */
+export function firstMatch(groups: FileGroup[], rel: string): SearchMatch | null {
+  return groups.find((g) => g.rel === rel)?.matches[0] ?? null;
+}

@@ -130,6 +130,19 @@ export function findNode(root: TreeNode, path: string): TreeNode | null {
   return node;
 }
 
+/** The ancestor directory paths of a root-relative file path, shallow → deep.
+ *  `"a/b/c.ts"` → `["a", "a/b"]`; a top-level file → `[]`. Used to auto-expand
+ *  the branches that lead to a search hit so highlighted files are visible. */
+export function ancestorDirs(path: string): string[] {
+  if (path === "") return [];
+  const parts = path.split("/");
+  const dirs: string[] = [];
+  for (let i = 1; i < parts.length; i++) {
+    dirs.push(parts.slice(0, i).join("/"));
+  }
+  return dirs;
+}
+
 /** A fresh, empty root node for `rootPath` display (the actual filesystem root
  *  the pane points at). Its children are loaded on first expand. */
 export function makeRoot(): TreeNode {

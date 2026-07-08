@@ -9,6 +9,7 @@ import {
   flatten,
   findNode,
   makeRoot,
+  ancestorDirs,
   type TreeNode,
 } from "../src/filetreemodel.ts";
 import type { FtEntry } from "../src/fileapi.ts";
@@ -98,6 +99,12 @@ test("mergeChildren resets a node whose type flipped (dir↔file)", () => {
   const merged = mergeChildren(existing, "", [entry("x", false)]);
   assert.ok(!merged[0].expanded && !merged[0].loaded);
   assert.equal(merged[0].children.length, 0);
+});
+
+test("ancestorDirs lists the branch dirs to expand for a hit, shallow→deep", () => {
+  assert.deepEqual(ancestorDirs("a/b/c.ts"), ["a", "a/b"]);
+  assert.deepEqual(ancestorDirs("top.ts"), []); // top-level file: no ancestors
+  assert.deepEqual(ancestorDirs(""), []);
 });
 
 test("findNode walks loaded branches by path", () => {
