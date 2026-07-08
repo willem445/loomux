@@ -126,6 +126,10 @@ Board controls:
   the orchestrator to merge) and **✎ Changes** (opens a box for your findings,
   records them, and routes them back to a worker). Both land as a message in the
   orchestrator pane, exactly as if you'd typed it.
+- **▶ Proceed** on a `prototype` item (a demo-gated deliverable awaiting your
+  verdict) promotes it: two-click confirm flips it to `in-progress`, records
+  your decision, and prompts the orchestrator to take the prototype to a full
+  production build.
 - **🗑 done (N)** deletes all `done` items in one action (two-click confirm).
 - **🗑 selected (N)** deletes exactly the rows you tick, by id, in one action.
 
