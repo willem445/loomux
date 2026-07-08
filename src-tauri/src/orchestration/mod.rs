@@ -21,7 +21,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
@@ -131,6 +131,19 @@ const SPAWN_RATE_WINDOW_MS: u64 = 60 * 60 * 1000;
 const IDLE_REAP_INTERVAL: Duration = Duration::from_secs(30);
 /// How often the watchdog wakes to look for stalled working agents.
 const WATCHDOG_INTERVAL: Duration = Duration::from_secs(30);
+/// How often the low-disk backstop samples free space on the workspace drive
+/// (#134). Slow on purpose — disk pressure builds over minutes of cargo builds,
+/// not seconds — so the sysinfo scan stays negligible.
+const DISK_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+/// Arm the low-disk notice when free space on the workspace drive drops below
+/// this (#134). A disk-full write is what destroyed the board in the incident
+/// (#133); 5 GB leaves headroom for one more cold cargo build (~5–7 GB) to be
+/// reclaimed before writes start failing at 0.
+const LOW_DISK_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+/// Clear the low-disk latch only once free space recovers past this higher mark
+/// (arming + 2 GB). The hysteresis stops a disk hovering at the threshold from
+/// re-notifying every tick.
+const LOW_DISK_CLEAR_BYTES: u64 = LOW_DISK_BYTES + 2 * 1024 * 1024 * 1024;
 /// Upper bound on the watchdog stall timeout (24h); 0 disables it.
 const MAX_WATCHDOG_STALL_MINUTES: u32 = 1440;
 /// How often the attention scan recomputes which panes need the human
@@ -625,6 +638,34 @@ pub fn watchdog_should_notify(
         return false;
     }
     now_ms.saturating_sub(silent_since_ms) >= (threshold_min as u64) * 60_000
+}
+
+/// Pure latch transition for the low-disk backstop (#134). Given current free
+/// bytes on the workspace drive, the arming threshold `low`, the higher clear
+/// threshold `clear` (hysteresis), and whether a notice is already latched,
+/// return `(new_latched, fire_now)`. `fire_now` is the one-per-episode edge:
+/// true only on the tick that first crosses below `low`. Split out so the
+/// arm/clear hysteresis is unit-testable without a real disk.
+pub fn low_disk_transition(free: u64, low: u64, clear: u64, latched: bool) -> (bool, bool) {
+    if !latched && free < low {
+        (true, true) // crossed below → arm and fire this tick
+    } else if latched && free >= clear {
+        (false, false) // recovered past the hysteresis mark → reset the latch
+    } else {
+        (latched, false) // no edge — hold state, stay quiet
+    }
+}
+
+/// The one-per-episode low-disk notice delivered to a group's orchestrator.
+pub fn low_disk_notice(free_bytes: u64) -> String {
+    let free_gb = free_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+    format!(
+        "[loomux] disk space low: only {free_gb:.1} GB free on the workspace drive. \
+         At 0 bytes, backend builds (cargo) fail machine-wide and durable writes fail — \
+         a full disk previously destroyed a live task board. Reclaim space now: end merged \
+         worktrees (end_group with cleanup), `cargo clean` in idle worktrees, or clear temp \
+         files. You will get this notice at most once per low-disk episode."
+    )
 }
 
 /// Attention routing (#6): does a pane's ANSI-stripped output tail look like a
@@ -1165,6 +1206,10 @@ pub struct OrchRegistry {
     /// reader can be pointed at a fixture tree without touching global env —
     /// safe under parallel test execution.
     claude_projects_dir: Mutex<Option<PathBuf>>,
+    /// Low-disk backstop latch (#134): true once the one-per-episode disk-space
+    /// notice has been delivered, cleared when free space recovers past
+    /// `LOW_DISK_CLEAR_BYTES`. Machine-wide (the disk is shared across groups).
+    low_disk_notified: Mutex<bool>,
 }
 
 fn now_ms() -> u64 {
@@ -1432,6 +1477,55 @@ pub fn rotate_audit_if_needed(dir: &Path, cap: u64) {
     let path = dir.join("audit.jsonl");
     if fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > cap {
         let _ = fs::rename(&path, dir.join("audit.1.jsonl")); // replaces the old generation
+    }
+}
+
+/// Monotonic counter that makes every temp filename unique, so two concurrent
+/// writers to the same durable file never share a `.tmp` sibling. Some of the
+/// files written through `atomic_write` (state.json, group.json) are not
+/// serialized under a lock, so distinct temp names are what keeps a concurrent
+/// pair from corrupting each other's scratch file. A std atomic keeps us clear
+/// of the getrandom-based crates the Windows 10 baseline can't load (see the
+/// Cargo.toml notes) — no `tempfile` needed for a unique name.
+static ATOMIC_WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Durably replace `path` with `bytes`: write a same-directory temp file, flush
+/// it to disk, then atomically rename it over the destination. A failure or
+/// crash mid-write leaves the previous good file intact (at worst an orphaned
+/// `.tmp` sibling) — never the truncated/empty destination that plain
+/// `fs::write` produces. This is the #133 fix: a disk-full `fs::write` had
+/// truncated tasks.json and destroyed the live board.
+///
+/// Same-directory temp is required for rename atomicity on Windows — a rename
+/// across volumes falls back to a non-atomic copy. `fs::rename` on Windows maps
+/// to `MoveFileExW` with `REPLACE_EXISTING`, which atomically replaces the
+/// destination on the same volume, so the primary path already does the right
+/// thing; the fallback only covers the rare case where the destination is
+/// briefly locked (antivirus, an open reader). The temp is fsync'd before the
+/// rename so a rename can't expose a metadata-only file whose data blocks never
+/// reached disk — exactly the disk-full failure mode.
+fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = path.file_name().and_then(|n| n.to_str()).unwrap_or("state");
+    let seq = ATOMIC_WRITE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = dir.join(format!(".{stem}.{}.{seq}.tmp", std::process::id()));
+    {
+        let mut f = fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?; // durable before the rename — the disk-full guard
+    }
+    match fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            // Rename can fail if the destination is momentarily locked. Fall
+            // back to a direct write so the update isn't lost; keep the temp on
+            // failure so the new contents remain recoverable.
+            let r = fs::write(path, bytes);
+            if r.is_ok() {
+                let _ = fs::remove_file(&tmp);
+            }
+            r
+        }
     }
 }
 
@@ -1889,6 +1983,7 @@ impl OrchRegistry {
             notify_groups: Mutex::new(HashSet::new()),
             pending_max_notice: Mutex::new(HashMap::new()),
             claude_projects_dir: Mutex::new(None),
+            low_disk_notified: Mutex::new(false),
         }
     }
 
@@ -2039,7 +2134,12 @@ impl OrchRegistry {
         serde_json::from_str::<Value>(state).map_err(|e| format!("state must be valid JSON: {e}"))?;
         let dir = self.group_dir(group);
         fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        fs::write(dir.join("state.json"), state).map_err(|e| e.to_string())?;
+        // Atomic replace so a failed write (disk-full, crash) leaves the last
+        // good snapshot intact (#133). set_state holds no lock — the unique
+        // temp name in `atomic_write` keeps concurrent writers from clobbering
+        // one another's scratch file, and the rename makes it last-writer-wins
+        // rather than a torn file.
+        atomic_write(&dir.join("state.json"), state.as_bytes()).map_err(|e| e.to_string())?;
         self.audit(group, "loomux", "state-write", json!({ "bytes": state.len() }));
         Ok(())
     }
@@ -2056,8 +2156,11 @@ impl OrchRegistry {
     fn write_tasks(&self, group: &str, tasks: &[Task]) -> Result<(), String> {
         let dir = self.group_dir(group);
         fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        fs::write(dir.join("tasks.json"), serde_json::to_string_pretty(tasks).unwrap())
-            .map_err(|e| e.to_string())?;
+        // Atomic replace: the incident that filed #133 was a disk-full
+        // `fs::write` here that truncated tasks.json and destroyed the live
+        // board. All callers hold `tasks_lock`, so writes are serialized.
+        let body = serde_json::to_string_pretty(tasks).unwrap();
+        atomic_write(&dir.join("tasks.json"), body.as_bytes()).map_err(|e| e.to_string())?;
         self.emit_tasks_changed(group);
         Ok(())
     }
@@ -2485,7 +2588,10 @@ impl OrchRegistry {
             None => list.push(record),
         }
         let _ = fs::create_dir_all(self.group_dir(&entry.group));
-        let _ = fs::write(&path, serde_json::to_string_pretty(&list).unwrap());
+        // Atomic replace so a failed write can't wipe the agent roster (#133).
+        // Holds `tasks_lock` (taken above), so writes are serialized.
+        let body = serde_json::to_string_pretty(&list).unwrap();
+        let _ = atomic_write(&path, body.as_bytes());
     }
 
     fn group_records(&self, group: &str) -> Vec<AgentRecord> {
@@ -2732,32 +2838,33 @@ impl OrchRegistry {
             }
         }
         let info = GroupInfo { id: id.clone(), repo: repo.to_string(), guardrails };
-        fs::write(
-            dir.join("group.json"),
-            serde_json::to_string_pretty(&json!({
-                "group_id": info.id,
-                "repo": info.repo,
-                "created_ms": now_ms(),
-                "guardrails": {
-                    "max_agents": info.guardrails.max_agents,
-                    "agent_cli": info.guardrails.agent_cli,
-                    "orchestrator_cli": info.guardrails.orchestrator_cli,
-                    "worker_cli": info.guardrails.worker_cli,
-                    "reviewer_cli": info.guardrails.reviewer_cli,
-                    "planner_cli": info.guardrails.planner_cli,
-                    "worker_model": info.guardrails.worker_model,
-                    "reviewer_model": info.guardrails.reviewer_model,
-                    "orchestrator_model": info.guardrails.orchestrator_model,
-                    "planner_model": info.guardrails.planner_model,
-                    "auto_ops": info.guardrails.auto_ops,
-                    "idle_kill_minutes": info.guardrails.idle_kill_minutes,
-                    "max_spawns_per_hour": info.guardrails.max_spawns_per_hour,
-                    "watchdog_stall_minutes": info.guardrails.watchdog_stall_minutes,
-                },
-            }))
-            .unwrap(),
-        )
-        .map_err(|e| e.to_string())?;
+        // Atomic replace: group.json is identity-critical (a truncated file
+        // breaks the rejoin path), so a failed/interrupted write must leave the
+        // prior file intact rather than half-written (#133). Matches the
+        // crash-safe pattern `persist_max_agents` already uses for this file.
+        let body = serde_json::to_string_pretty(&json!({
+            "group_id": info.id,
+            "repo": info.repo,
+            "created_ms": now_ms(),
+            "guardrails": {
+                "max_agents": info.guardrails.max_agents,
+                "agent_cli": info.guardrails.agent_cli,
+                "orchestrator_cli": info.guardrails.orchestrator_cli,
+                "worker_cli": info.guardrails.worker_cli,
+                "reviewer_cli": info.guardrails.reviewer_cli,
+                "planner_cli": info.guardrails.planner_cli,
+                "worker_model": info.guardrails.worker_model,
+                "reviewer_model": info.guardrails.reviewer_model,
+                "orchestrator_model": info.guardrails.orchestrator_model,
+                "planner_model": info.guardrails.planner_model,
+                "auto_ops": info.guardrails.auto_ops,
+                "idle_kill_minutes": info.guardrails.idle_kill_minutes,
+                "max_spawns_per_hour": info.guardrails.max_spawns_per_hour,
+                "watchdog_stall_minutes": info.guardrails.watchdog_stall_minutes,
+            },
+        }))
+        .unwrap();
+        atomic_write(&dir.join("group.json"), body.as_bytes()).map_err(|e| e.to_string())?;
         self.write_instruction_files(&info)?;
         // A pause is a durable human safety action: re-seed it from the
         // marker file so a resumed group stays paused across restarts.
@@ -3013,6 +3120,54 @@ impl OrchRegistry {
         self.watchdog_tick(now, &outputs)
     }
 
+    // ---------- low-disk backstop (#134) ----------
+
+    /// One low-disk backstop pass given the current free bytes on the workspace
+    /// drive. On the tick that first crosses below `LOW_DISK_BYTES`, deliver ONE
+    /// audited notice to each live, non-paused group's orchestrator and latch;
+    /// the latch clears once free space recovers past `LOW_DISK_CLEAR_BYTES`.
+    /// Paused groups are skipped (like the watchdog) — their agents idle out on
+    /// purpose and prompt delivery is suppressed there anyway. Returns the
+    /// notified group ids. Free-bytes is injected so the latch/hysteresis logic
+    /// is testable without a real disk.
+    pub fn disk_tick(&self, free: u64) -> Vec<String> {
+        let fire = {
+            let mut latched = self.low_disk_notified.lock_safe();
+            let (new_latched, fire) =
+                low_disk_transition(free, LOW_DISK_BYTES, LOW_DISK_CLEAR_BYTES, *latched);
+            *latched = new_latched;
+            fire
+        };
+        if !fire {
+            return Vec::new();
+        }
+        // Snapshot groups/paused, then deliver outside any lock (delivery types
+        // into a pane and can block).
+        let paused = self.paused.lock_safe().clone();
+        let groups: Vec<String> = self.groups.lock_safe().keys().cloned().collect();
+        let notice = low_disk_notice(free);
+        let mut notified = Vec::new();
+        for group in groups {
+            if paused.contains(&group) {
+                continue;
+            }
+            self.audit(&group, "loomux", "low-disk", json!({ "free_bytes": free }));
+            if self.deliver_to_orchestrator(&group, &notice, "loomux").is_ok() {
+                notified.push(group);
+            }
+        }
+        notified
+    }
+
+    /// Sample free space on the workspace drive (the app-data root, where the
+    /// board/state live — the surface a disk-full write corrupts) and run one
+    /// `disk_tick`. Best-effort: if the disk can't be read, do nothing.
+    pub fn run_disk_monitor(&self) {
+        if let Some(free) = free_disk_bytes(&self.root) {
+            self.disk_tick(free);
+        }
+    }
+
     // ---------- attention routing: surface which pane needs the human ----------
 
     /// Latch (or clear) a worker's report as an attention signal. `done` and
@@ -3146,19 +3301,11 @@ impl OrchRegistry {
                 obj.insert("guardrails".into(), json!({ "max_agents": n }));
             }
         }
-        // Crash-safe write: serialize to a temp file, then atomically rename
-        // over group.json (same pattern as usage.json). group.json is
-        // identity-critical — a half-written file breaks the rejoin path
-        // ("group.json is missing") — so never expose a truncated version.
+        // Crash-safe write: group.json is identity-critical — a half-written
+        // file breaks the rejoin path ("group.json is missing") — so never
+        // expose a truncated version (#133).
         let body = serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?;
-        let tmp = dir.join("group.json.tmp");
-        fs::write(&tmp, &body).map_err(|e| e.to_string())?;
-        if fs::rename(&tmp, &path).is_err() {
-            // Rename can fail if the destination exists on some platforms; fall
-            // back to a direct write so the update isn't lost.
-            fs::write(&path, &body).map_err(|e| e.to_string())?;
-            let _ = fs::remove_file(&tmp);
-        }
+        atomic_write(&path, body.as_bytes()).map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -3646,20 +3793,10 @@ impl OrchRegistry {
         }
         let dir = self.group_dir(group);
         let _ = fs::create_dir_all(&dir);
-        // Crash-safe write: serialize to a temp file, then atomically rename
-        // over usage.json. A crash mid-write leaves the old (valid) file or
-        // the temp file behind, never a half-written usage.json.
-        let path = dir.join("usage.json");
-        let tmp = dir.join("usage.json.tmp");
+        // Crash-safe write: a crash mid-write leaves the old (valid) file
+        // intact, never a half-written usage.json (#133). Holds `tasks_lock`.
         let body = serde_json::to_string_pretty(&list).unwrap();
-        if fs::write(&tmp, &body).is_ok() {
-            if fs::rename(&tmp, &path).is_err() {
-                // Rename can fail if the destination exists on some platforms;
-                // fall back to a direct write so we don't lose the update.
-                let _ = fs::write(&path, &body);
-                let _ = fs::remove_file(&tmp);
-            }
-        }
+        let _ = atomic_write(&dir.join("usage.json"), body.as_bytes());
     }
 
     /// Aggregate the group's usage into one summary with a **live vs lifetime**
@@ -5232,6 +5369,29 @@ pub fn start_watchdog(reg: Arc<OrchRegistry>) {
     std::thread::spawn(move || loop {
         std::thread::sleep(WATCHDOG_INTERVAL);
         reg.run_watchdog(now_ms());
+    });
+}
+
+/// Free bytes on the disk that hosts `path`: the mounted volume whose mount
+/// point is the longest prefix of `path`. `None` if no volume matches (or the
+/// listing is empty), so the caller no-ops rather than guessing.
+fn free_disk_bytes(path: &Path) -> Option<u64> {
+    let disks = sysinfo::Disks::new_with_refreshed_list();
+    disks
+        .iter()
+        .filter(|d| path.starts_with(d.mount_point()))
+        .max_by_key(|d| d.mount_point().as_os_str().len())
+        .map(|d| d.available_space())
+}
+
+/// Background loop for the low-disk backstop (#134): every `DISK_CHECK_INTERVAL`
+/// it samples free space on the workspace drive and, on crossing below the
+/// threshold, sends one latched notice per group orchestrator. Started once at
+/// app setup. Slow cadence keeps the sysinfo scan negligible.
+pub fn start_disk_monitor(reg: Arc<OrchRegistry>) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(DISK_CHECK_INTERVAL);
+        reg.run_disk_monitor();
     });
 }
 

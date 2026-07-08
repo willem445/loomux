@@ -602,7 +602,23 @@ orchestrator's queue/plan memory, written via a tool after every change),
 each), `agents.json` (the roster: which sessions belonged to which role),
 and the rendered role instructions. The group id is derived from the
 repo path, so relaunching an orchestrator on the same repo resumes its
-state; GitHub issues remain the source of truth for the work queue.
+state; GitHub issues remain the source of truth for the work queue. Every
+durable file is written **atomically** (a same-directory temp file, fsync'd,
+then renamed over the original), so a failed write — a full disk, a crash —
+leaves the last good file intact instead of a truncated one. See
+[doc/design/durability-and-disk.md](doc/design/durability-and-disk.md).
+
+**Disk hygiene:** agent worktrees share one cargo build cache instead of each
+growing its own 5–7 GB `src-tauri/target`. Every git-worktree pane runs with
+`CARGO_TARGET_DIR` pointed at `<repo>/.loomux-target` (a gitignored, per-repo
+cache on the same drive), so a fleet of worktrees dedups to a single cache and
+later workers get warm builds; the main checkout keeps its own `target/`.
+Concurrent `cargo` runs serialize on the shared target-dir lock (workers mostly
+build at different times); `LOOMUX_NO_SHARED_TARGET=1` restores per-worktree
+caches if needed. As a backstop, when free space on the workspace drive drops
+below ~5 GB loomux drops a one-time notice into each orchestrator pane so it can
+reclaim space (end merged worktrees, `cargo clean` idle ones) before writes
+start failing.
 
 **Crash logs:** loomux writes forensics under `<data dir>/loomux/logs/` — a
 Rust panic hook drops `crash-<timestamp>.log` (message, thread, backtrace),
