@@ -1813,3 +1813,152 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   font-family: "Cascadia Mono", Consolas, monospace; font-size: 10.5px;
   user-select: text;
 }
+
+/* ============================================================================
+   File-editor overlay (#174): lazy file tree + code editor + search/replace.
+   Floats over the terminal exactly like .git-overlay — the PTY is never
+   resized. Reuses .git-overlay for the floating container; these rules style
+   the inner .fileedit surface, tree, editor host, and search panel. Built from
+   the :root palette so it themes with the rest of the app.
+   ========================================================================== */
+.fileedit {
+  flex: 1; min-height: 0; min-width: 0;
+  display: flex; flex-direction: column;
+  background: var(--bg-app);
+  font-size: 12px;
+  outline: none;
+}
+.fileedit[hidden] { display: none; }
+
+.fileedit-head {
+  flex: none; display: flex; align-items: center; gap: 6px;
+  padding: 4px 6px; border-bottom: 1px solid var(--border);
+  background: var(--panel);
+}
+.fileedit-tabs { display: flex; gap: 2px; }
+.fileedit-tab {
+  border: 1px solid transparent; background: none; color: var(--text-dim);
+  font: inherit; padding: 2px 8px; border-radius: 5px; cursor: pointer;
+}
+.fileedit-tab:hover { color: var(--text); background: var(--panel-2); }
+.fileedit-tab.active { color: var(--text); border-color: var(--border); background: var(--panel-2); }
+
+.fileedit-root { display: flex; align-items: center; gap: 3px; min-width: 0; }
+.fileedit-root-path {
+  color: var(--text-dim); max-width: 220px; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap;
+  font-family: "Cascadia Mono", Consolas, monospace; font-size: 11px;
+}
+.fileedit-spacer { flex: 1 1 auto; }
+.fileedit-file {
+  color: var(--text); max-width: 320px; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; direction: rtl; text-align: left;
+  font-family: "Cascadia Mono", Consolas, monospace; font-size: 11px;
+}
+.fileedit-dirty { color: var(--accent); font-size: 14px; line-height: 1; }
+.fileedit-dirty[hidden] { display: none; }
+
+.fileedit-save {
+  border: 1px solid var(--border); background: var(--panel-2); color: var(--text);
+  font: inherit; padding: 2px 10px; border-radius: 5px; cursor: pointer;
+}
+.fileedit-save:hover:not(:disabled) { background: var(--accent); color: #10131f; border-color: var(--accent); }
+.fileedit-save:disabled { opacity: 0.45; cursor: default; }
+
+.fileedit-banner {
+  flex: none; padding: 3px 10px; font-size: 11px;
+  color: #f0c674; background: rgba(240, 198, 116, 0.10);
+  border-bottom: 1px solid var(--border);
+}
+.fileedit-banner[hidden] { display: none; }
+
+.fileedit-body { flex: 1 1 0; min-height: 0; display: flex; flex-direction: row; }
+
+/* Tree pane (left). Width is set inline from localStorage; the vertical
+   divider only redistributes this inner flex row — the overlay box (and PTY)
+   never change size. */
+.fileedit-tree-pane {
+  flex: none; min-width: 0; overflow: auto;
+  border-right: 1px solid var(--border); background: var(--panel);
+}
+.fileedit .mode-search .fileedit-tree-pane,
+.fileedit.mode-search .fileedit-tree-pane { display: none; }
+
+.fileedit-vdivider {
+  flex: none; width: 5px; cursor: col-resize; align-self: stretch;
+  background: var(--border-soft); transition: background 0.15s var(--ease);
+}
+.fileedit-vdivider:hover, .fileedit-vdivider.dragging { background: var(--accent-dim); }
+.fileedit.mode-search .fileedit-vdivider { display: none; }
+
+.fileedit-tree { padding: 4px 0; user-select: none; }
+.fileedit-row {
+  display: flex; align-items: center; gap: 6px;
+  padding: 2px 8px; cursor: pointer; white-space: nowrap;
+  color: var(--text);
+}
+.fileedit-row:hover { background: var(--panel-2); }
+.fileedit-row.open { background: var(--accent-glow); }
+.fileedit-row.symlink .fileedit-name { color: var(--text-dim); font-style: italic; }
+.fileedit-icon { flex: none; display: inline-flex; color: var(--text-dim); }
+.fileedit-row.open .fileedit-icon { color: var(--accent); }
+.fileedit-name { overflow: hidden; text-overflow: ellipsis; }
+
+/* Editor pane (right). */
+.fileedit-editor-pane { flex: 1 1 0; min-width: 0; position: relative; display: flex; }
+.fileedit.mode-search .fileedit-editor-pane { display: none; }
+.fileedit-editor-host { flex: 1 1 0; min-width: 0; overflow: hidden; }
+.fileedit-editor-host[hidden] { display: none; }
+.fileedit-editor-host .cm-editor { height: 100%; }
+.fileedit-empty {
+  margin: auto; color: var(--text-dim); font-size: 12px; padding: 20px; text-align: center;
+}
+.fileedit-empty[hidden] { display: none; }
+
+/* Textarea fallback (used only if CodeMirror fails to load). */
+.fileedit-ta-wrap { flex: 1 1 0; min-width: 0; display: flex; }
+.fileedit-textarea {
+  flex: 1 1 0; resize: none; border: none; outline: none;
+  background: var(--bg-app); color: var(--text);
+  font-family: "Cascadia Mono", Consolas, monospace; font-size: 12.5px;
+  padding: 6px 8px; white-space: pre; tab-size: 2;
+}
+
+/* Search + replace panel. */
+.fileedit-search-pane {
+  flex: 1 1 0; min-width: 0; display: none; flex-direction: column; min-height: 0;
+}
+.fileedit.mode-search .fileedit-search-pane { display: flex; }
+.fileedit-search-form {
+  flex: none; display: flex; flex-direction: column; gap: 6px;
+  padding: 8px 10px; border-bottom: 1px solid var(--border); background: var(--panel);
+}
+.fileedit-search-row { display: flex; align-items: center; gap: 6px; }
+.fileedit-search-input {
+  flex: 1 1 auto; min-width: 0;
+  background: var(--panel-2); border: 1px solid var(--border); color: var(--text);
+  font-family: "Cascadia Mono", Consolas, monospace; font-size: 12px;
+  padding: 4px 8px; border-radius: 5px;
+}
+.fileedit-search-input:focus { outline: none; border-color: var(--accent-dim); }
+.fileedit-search-opts { display: flex; align-items: center; gap: 12px; color: var(--text-dim); font-size: 11px; }
+.fileedit-search-opts label { display: inline-flex; align-items: center; gap: 4px; cursor: pointer; }
+.fileedit-search-actions { display: flex; align-items: center; gap: 8px; }
+.fileedit-search-summary { color: var(--text-dim); font-size: 11px; }
+.fileedit-search-summary.truncated { color: #f0c674; }
+
+.fileedit-results { flex: 1 1 0; min-height: 0; overflow: auto; padding: 4px 0; }
+.fileedit-result-file { user-select: none; }
+.fileedit-result-head {
+  display: flex; align-items: center; gap: 6px; padding: 3px 10px; cursor: pointer;
+  color: var(--text); position: sticky; top: 0; background: var(--bg-app);
+}
+.fileedit-result-head:hover { background: var(--panel-2); }
+.fileedit-result-count { color: var(--text-dim); font-size: 11px; }
+.fileedit-result-match {
+  display: flex; gap: 8px; padding: 1px 10px 1px 30px; cursor: pointer;
+  font-family: "Cascadia Mono", Consolas, monospace; font-size: 11px; color: var(--text-dim);
+  white-space: pre; overflow: hidden; text-overflow: ellipsis;
+}
+.fileedit-result-match:hover { background: var(--panel-2); color: var(--text); }
+.fileedit-result-loc { color: var(--accent-dim); flex: none; }
