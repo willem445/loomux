@@ -96,9 +96,10 @@ automatically.
 - Add a page: create `foo.md` with front matter (`title`, `layout: default`,
   `nav_order`; add `parent: Features` for a feature sub-page). Keep `nav_order`
   values sane so the sidebar orders correctly.
-- Cross-page links use **repo-relative paths without `.md`** (e.g.
-  `[git view](features/git-view)`), which Jekyll + `baseurl` resolve correctly on
-  the published `/loomux/` site.
+- Cross-page links use **relative paths with `.html`** (e.g.
+  `[git view](features/git-view.html)`) — that's what every existing page uses
+  and what Jekyll + `baseurl` resolve on the published `/loomux/` site
+  (extensionless paths do not route on GitHub Pages' static hosting).
 - **Honesty rule:** document only what ships on `main`. Verify every flag,
   shortcut, and behavior against the code/README before writing it. No invented
   features; no fake screenshots.

@@ -111,8 +111,8 @@ You can add, edit, annotate, reorder, and delete tasks; the orchestrator is
 notified of your edits and maintains the same board through its tools. Issue and
 PR chips are **clickable** and open in your browser.
 
-Statuses: `queued`, `in-progress`, `review`, `pr`, `human-testing`, `done`,
-`blocked`.
+Statuses: `queued`, `in-progress`, `review`, `pr`, `human-testing`,
+`prototype`, `done`, `blocked`.
 
 Board controls:
 
