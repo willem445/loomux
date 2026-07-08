@@ -65,9 +65,11 @@ docs/
 ## How it's published
 
 [`.github/workflows/docs.yml`](../.github/workflows/docs.yml) builds and deploys
-via the official GitHub Pages Actions flow
-(`configure-pages` → `jekyll-build-pages` → `upload-pages-artifact` →
-`deploy-pages`). It runs:
+via the official GitHub Pages Actions flow (`jekyll-build-pages` →
+`upload-pages-artifact` → `deploy-pages`). `baseurl`/`url` are set here in
+`_config.yml`, so the workflow deliberately omits `actions/configure-pages` —
+that action queries the Pages API and 404s until Pages is enabled, which would
+break the PR dry-run before the one-time setup below. It runs:
 
 - **on release** — tag pushes matching `v*` (the same trigger as
   `release.yml`, which it deliberately does **not** modify), so the site

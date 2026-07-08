@@ -40,8 +40,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Configure Pages
-        uses: actions/configure-pages@v5
+      # NB: no actions/configure-pages step here on purpose. That action calls
+      # the Pages REST API to discover the site's base path — which 404s until
+      # the one-time "Source: GitHub Actions" setting is flipped, and would fail
+      # this build (including the PR dry-run) before Pages is enabled. We don't
+      # need it: `url`/`baseurl` are set explicitly in docs/_config.yml, so the
+      # build is self-contained and provable on a PR without any repo setup.
 
       # Provides the Jekyll runtime (github-pages gem) — no Ruby/Gemfile in the
       # repo. Builds docs/ into ./_site, resolving the pinned remote theme.
