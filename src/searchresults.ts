@@ -28,6 +28,14 @@ export function paramsEqual(a: SearchParams, b: SearchParams): boolean {
   );
 }
 
+/** Whether a replace may proceed: a snapshot exists AND it still matches the
+ *  live inputs. The belt-and-braces guard against a stale search resolution
+ *  leaving `snapshot` behind the query box — if they've diverged, the preview no
+ *  longer describes what a replace would touch, so it must not run. */
+export function replaceIsCurrent(snapshot: SearchParams | null, live: SearchParams): boolean {
+  return snapshot !== null && paramsEqual(snapshot, live);
+}
+
 /** All matches in one file, plus whether the file is selected for replace.
  *  Selection is per-file in v1 (per-match is a documented future step). */
 export interface FileGroup {

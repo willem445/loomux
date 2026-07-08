@@ -9,6 +9,7 @@ import {
   selectedFiles,
   selectedMatchCount,
   paramsEqual,
+  replaceIsCurrent,
   hitCounts,
   firstMatch,
   type SearchParams,
@@ -58,6 +59,18 @@ test("paramsEqual detects a changed query or option (preview-vs-apply guard)", (
   assert.equal(paramsEqual(base, { ...base, query: "bar" }), false);
   assert.equal(paramsEqual(base, { ...base, caseInsensitive: true }), false);
   assert.equal(paramsEqual(base, { ...base, wholeWord: true }), false);
+});
+
+test("replaceIsCurrent blocks a replace when a stale search left the snapshot behind", () => {
+  const live: SearchParams = { query: "foobar", caseInsensitive: false, wholeWord: false };
+  // A slow search for "foo" resolves after the user typed "foobar": the snapshot
+  // (from "foo") no longer matches the box, so replace must NOT proceed.
+  const staleSnapshot: SearchParams = { query: "foo", caseInsensitive: false, wholeWord: false };
+  assert.equal(replaceIsCurrent(staleSnapshot, live), false);
+  // In sync → allowed.
+  assert.equal(replaceIsCurrent({ ...live }, live), true);
+  // No snapshot at all (never searched / invalidated) → blocked.
+  assert.equal(replaceIsCurrent(null, live), false);
 });
 
 test("hitCounts maps each file to its match count for tree highlighting", () => {

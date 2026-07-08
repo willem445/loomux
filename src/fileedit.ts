@@ -26,6 +26,7 @@ import {
   selectedFiles,
   selectedMatchCount,
   paramsEqual,
+  replaceIsCurrent,
   hitCounts,
   firstMatch,
   type FileGroup,
@@ -120,6 +121,9 @@ export class FileEditView {
    *  highlight + badge files that contain hits. */
   private hits = new Map<string, number>();
   private searchTimer: number | undefined;
+  /** Monotonic id so a stale (slow) search resolution can't overwrite a newer
+   *  one and leave the snapshot behind the input box. */
+  private searchSeq = 0;
   /** The query + options the current `searchGroups` were produced with. Replace
    *  applies from THIS, not the live inputs, so a query/option edit after a
    *  search can't make apply diverge from the preview. Nulled when the preview
@@ -606,12 +610,18 @@ export class FileEditView {
 
   private async runSearch(): Promise<void> {
     const params = this.currentParams();
+    // Monotonic guard: a slow search resolving after the user has typed more (or
+    // launched a newer search) must not install a snapshot that's behind the
+    // input box — otherwise Replace could apply the previous query. Every call
+    // claims a seq; a resolution is applied only while it's still the latest.
+    const seq = ++this.searchSeq;
     if (!this.root || params.query === "") {
       this.clearSearch();
       return;
     }
     try {
       const out = await ftSearch(this.root, params.query, FileEditView.paramsToOpts(params));
+      if (seq !== this.searchSeq) return; // superseded by a newer search
       this.searchGroups = groupMatches(out.matches);
       this.hits = hitCounts(this.searchGroups);
       // Snapshot exactly what these hits reflect; replace applies from this.
@@ -619,6 +629,7 @@ export class FileEditView {
       this.updateSearchSummary(out.truncated);
       // Auto-expand the branches leading to hits so they're visible, then paint.
       await this.revealHits();
+      if (seq !== this.searchSeq) return; // a newer search resolved during reveal
       this.renderTree();
       this.updateReplaceBtn();
     } catch (err) {
@@ -674,7 +685,11 @@ export class FileEditView {
     // so what's applied is exactly what was previewed (finding #1). A null
     // snapshot means the preview was invalidated; require a fresh search.
     const snap = this.searchSnapshot;
-    if (!snap) {
+    // Belt-and-braces on top of the search seq guard: never apply unless the
+    // snapshot still matches the live inputs, so a stale resolution or an untimed
+    // edit can't replace a query the preview never showed. (The `!snap` also
+    // narrows the type for the `snap.query` use below.)
+    if (!snap || !replaceIsCurrent(snap, this.currentParams())) {
       showToast("Search again before replacing.", "info");
       return;
     }
