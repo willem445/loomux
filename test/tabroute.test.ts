@@ -10,6 +10,8 @@ import {
   safeStyleDeclarations,
   SAFE_STYLE_PROPS,
   PreviewBudget,
+  compositeScale,
+  type PreviewFit,
   type TabAttn,
 } from "../src/tabroute.ts";
 
@@ -200,4 +202,54 @@ test("PreviewBudget with a zero/negative cap caps everything", () => {
   assert.equal(zero.take(), false);
   const neg = new PreviewBudget(-1);
   assert.equal(neg.take(), false, "a nonsensical cap never renders rather than looping");
+});
+
+// ---- composite preview scaling (#63 review): ONE consistent text scale ----
+
+/** A pane whose content is `cw`×`ch` px in a `cellW`×`cellH` cell. */
+const fit = (contentW: number, contentH: number, cellW: number, cellH: number): PreviewFit => ({
+  contentW,
+  contentH,
+  cellW,
+  cellH,
+});
+
+test("compositeScale returns the shared fit when every pane fits alike", () => {
+  // Two identical panes each needing 0.5 to fit → the composite scale is 0.5,
+  // applied to both (identical, consistent text). No regression for uniform tabs.
+  const s = compositeScale([fit(200, 100, 100, 50), fit(200, 100, 100, 50)], 0.05, 1);
+  assert.equal(s, 0.5);
+});
+
+test("compositeScale is uniform: the binding axis (min of W/H) drives the fit", () => {
+  // content 400x100 in a 100x100 cell → width binds: 100/400 = 0.25 (not height's
+  // 1.0). One scalar for both axes ⇒ glyph aspect preserved, never squished.
+  assert.equal(compositeScale([fit(400, 100, 100, 100)], 0.05, 1), 0.25);
+});
+
+test("compositeScale ignores a single oversized OUTLIER (median, not min)", () => {
+  // Two normal panes fit at ~0.4; one stale full-width pane would need 0.08.
+  // min() would drag the whole composite to 0.08 (illegible for all); the median
+  // keeps the readable ~0.4 and lets the outlier crop to its cell.
+  const normalA = fit(250, 100, 100, 50); // 0.4
+  const normalB = fit(200, 100, 100, 50); // 0.5
+  const outlier = fit(1250, 100, 100, 50); // 0.08
+  const s = compositeScale([outlier, normalA, normalB], 0.05, 1);
+  assert.equal(s, 0.4, "median of {0.08,0.4,0.5} = 0.4 — the outlier doesn't shrink everyone");
+  assert.ok(s > 0.08, "not dragged down to the outlier's fit");
+});
+
+test("compositeScale clamps to [min, max] and never enlarges past 1", () => {
+  // Tiny content in a big cell would fit at 5x → clamped to max 1 (no upscale).
+  assert.equal(compositeScale([fit(10, 10, 100, 100)], 0.05, 1), 1);
+  // Everything huge → floored at min so text can't collapse to a sub-pixel smear
+  // (the outlier then crops instead of shrinking further).
+  assert.equal(compositeScale([fit(5000, 5000, 100, 100)], 0.16, 1), 0.16);
+});
+
+test("compositeScale: even count averages the two middle fits; empty → max", () => {
+  // {0.2, 0.4} → (0.2+0.4)/2 = 0.3 (allow FP slop).
+  const s = compositeScale([fit(500, 100, 100, 50), fit(250, 100, 100, 50)], 0.05, 1);
+  assert.ok(Math.abs(s - 0.3) < 1e-9, `expected ~0.3, got ${s}`);
+  assert.equal(compositeScale([], 0.05, 1), 1, "no panes → the max (nothing to fit)");
 });

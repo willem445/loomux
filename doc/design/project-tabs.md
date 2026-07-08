@@ -251,6 +251,30 @@ only while a single background tab is hovered, on ≤ 8 panes, at ~1.4 Hz — a
 trivial slice of one frame budget. Degradation on a huge grid is the pane cap,
 never unbounded work.
 
+### One shared scale across the composite
+
+Each pane is serialized at **its own** terminal `cols×rows` — whatever it was
+last laid out at (a hidden pane is never re-fitted, per the invariant), or 80×24
+if it was never laid out. Scaling each mini-pane to fit its *own* cell
+independently therefore gave every pane a **different effective font size**: a
+pane last laid out full-width shrank to an illegible, sub-pixel smear (its
+background-colored rows collapsing into horizontal bars) beside an 80-col pane at
+readable size (#63 review finding).
+
+The composite now renders **every** mini-pane at **one** shared scale
+(`compositeScale`, pure + tested in `tabroute.ts`): the **median** of the panes'
+per-cell fits, clamped to `[PREVIEW_MIN_SCALE, 1]`. The scale is always a single
+uniform `scale()` — glyph aspect is preserved, never squished. Median makes it
+robust to a **stale/oversized-dims** pane: rather than that one pane dragging the
+whole composite down to an illegible fit (what `min` would do), the composite
+stays at the typical readable scale and the oversized pane simply **crops** to
+its cell (cells are `overflow:hidden`) — crop, never squish; panes that would fit
+larger letterbox. `PREVIEW_MIN_SCALE` floors the scale off the sub-pixel range
+where the smear appeared. **Decision for the never-laid-out / stale-dims pane:**
+it is rendered at its own cols at the shared scale and cropped, *not* specially
+clamped by dims — the median already neutralizes its influence, so no magic
+dimension cap is needed.
+
 ### Why `serializeAsHTML`, and the sanitizer
 
 The string serializer emits cursor-forward escapes (`ESC[nC`) to skip blank
@@ -282,7 +306,7 @@ injection attempts (`test/tabroute.test.ts`).
 | --- | --- |
 | No-resize invariant (hidden ⇒ no resize) | `test/panefit.test.ts` |
 | TabManager: add/remove/switch, active invariant, never-zero-tabs, switch-is-hide-not-dispose, group routing + forget-on-close | `test/tabs.test.ts` |
-| Cross-tab attention folding, live cross-tab pane lookup (`findPaneByPty`), preview cap edge, preview sanitizer (whitelist + injection rejection) | `test/tabroute.test.ts` |
+| Cross-tab attention folding, live cross-tab pane lookup (`findPaneByPty`), preview cap edge, composite scale (median / outlier-crop / clamp), preview sanitizer (whitelist + injection rejection) | `test/tabroute.test.ts` |
 | Persistence round-trip + schema validation + clamp/coerce edges | `test/tabstore.test.ts` |
 | Backend atomic write + corrupt quarantine + migration-safe overwrite | `uistate.rs` (inline) |
 

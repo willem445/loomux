@@ -150,6 +150,51 @@ export class PreviewBudget {
   }
 }
 
+// ---------- preview composite scaling (#63 review) ----------
+//
+// The hover composite serializes each pane at ITS OWN terminal dims (cols×rows —
+// whatever it was last laid out at, or 80×24 if never laid out; a hidden pane is
+// never re-fitted, so these differ pane-to-pane). Scaling each pane to fit its
+// own cell independently therefore produced wildly different effective font
+// sizes across one composite — a pane last laid out full-width shrank to an
+// illegible, sub-pixel smear (its background-colored rows collapsing into
+// horizontal bars) next to an 80-col pane at readable size. The fix: ONE shared
+// scale for the whole composite, so text is the same size everywhere.
+
+/** One mini-pane's measured geometry: the natural (unscaled) size of its
+ *  serialized content, and the size of the cell it must fit — both in px. */
+export interface PreviewFit {
+  contentW: number;
+  contentH: number;
+  cellW: number;
+  cellH: number;
+}
+
+/** The single uniform scale every mini-pane in a composite renders at, so glyphs
+ *  are the SAME readable size across panes (uniform scale ⇒ aspect preserved, no
+ *  squish). Each pane's natural fit is `min(cellW/contentW, cellH/contentH)`;
+ *  the composite uses the **median** of those fits, clamped to `[min, max]`.
+ *
+ *  Median (not min) is deliberately robust to an OUTLIER pane — one serialized
+ *  at stale/oversized dims (e.g. last laid out full-width): rather than dragging
+ *  the whole composite down to that pane's tiny fit (illegible for everyone), the
+ *  composite renders at the typical scale and the outlier simply **crops** to its
+ *  cell (cells are `overflow:hidden`) — crop, never squish. Panes that would fit
+ *  larger letterbox instead. The `min` floor keeps text off the sub-pixel range
+ *  where downscaled background runs smear into bars; below it, panes crop rather
+ *  than shrink further. `max` (≤1) never enlarges past the source glyphs. Empty
+ *  input → `max`. */
+export function compositeScale(fits: readonly PreviewFit[], min: number, max: number): number {
+  if (fits.length === 0) return max;
+  const scales = fits
+    .map((f) => Math.min(f.cellW / Math.max(1, f.contentW), f.cellH / Math.max(1, f.contentH)))
+    .sort((a, b) => a - b);
+  const mid = Math.floor(scales.length / 2);
+  const median =
+    scales.length % 2 === 1 ? scales[mid] : (scales[mid - 1] + scales[mid]) / 2;
+  return Math.max(min, Math.min(max, median));
+}
+
 // ---------- cross-tab pane lookup (the live focus / exit / rename path) ----------
 
 /** Minimal grid surface for locating a pane by pty — the real Grid satisfies it. */

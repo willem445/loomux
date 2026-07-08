@@ -8,7 +8,7 @@
 // interactions into TabManager / backend calls, re-rendering on onChange.
 
 import type { TabManager, ManagedWorkspace } from "./tabs";
-import { safeStyleDeclarations, type PreviewNode } from "./tabroute";
+import { safeStyleDeclarations, compositeScale, type PreviewNode, type PreviewFit } from "./tabroute";
 import { makeRenameCommit } from "./panerename";
 import { swapEditor } from "./domutil";
 import { attentionPresentation } from "./attention";
@@ -30,6 +30,15 @@ const TAB_COLORS = ["#7aa2f7", "#9ece6a", "#e0af68", "#bb9af7", "#7dcfff", "#f77
 // enormous: panes past the cap render as a titled placeholder, never unbounded
 // work (workspace.ts).
 const PREVIEW_REFRESH_MS = 700;
+
+// Every mini-pane in a composite renders at ONE shared scale (compositeScale),
+// so text is a consistent, readable size across panes regardless of each pane's
+// serialized terminal dims (#63 review). PREVIEW_MIN_SCALE floors it off the
+// sub-pixel range where a heavily-downscaled pane's background rows smear into
+// bars — below it, an oversized pane crops to its cell rather than shrinking
+// further. 1 is the ceiling (never enlarge past the source glyphs).
+const PREVIEW_MIN_SCALE = 0.16;
+const PREVIEW_MAX_SCALE = 1;
 
 /** Live per-tab status pulled from the backend for a bound group. */
 interface TabStatus {
@@ -443,10 +452,9 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
       root.style.width = `${cw}px`;
       root.style.height = `${ch}px`;
       pop.replaceChildren(root);
-      // Scale each mini-pane's content into its cell now that the tree is laid out.
-      for (const pane of Array.from(pop.querySelectorAll<HTMLElement>(".mini-pane"))) {
-        this.scaleMiniPane(pane);
-      }
+      // Scale ALL mini-panes at one shared factor now that the tree is laid out,
+      // so text is a consistent size across the composite (#63 review).
+      this.scaleComposite(pop);
       this.positionPreview(pop, anchorRect, cw + 16, ch + 16);
     };
     paint();
@@ -532,19 +540,34 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
     }
   }
 
-  /** Scale a mini-pane's serialized content to fit its cell (never enlarge), so
-   *  each pane's whole viewport shows without clipping. */
-  private scaleMiniPane(pane: HTMLElement): void {
-    const body = pane.querySelector<HTMLElement>(".mini-pane-body");
-    const scaler = pane.querySelector<HTMLElement>(".mini-pane-scaler");
-    if (!body || !scaler) return;
-    scaler.style.transform = "none";
-    const cw = body.clientWidth;
-    const ch = body.clientHeight;
-    const sw = Math.max(1, scaler.scrollWidth);
-    const sh = Math.max(1, scaler.scrollHeight);
-    const scale = Math.max(0.05, Math.min(1, cw / sw, ch / sh));
-    scaler.style.transform = `scale(${scale})`;
+  /** Scale every mini-pane in the composite at ONE shared factor, so glyphs are
+   *  a consistent, readable size across panes — instead of fitting each pane to
+   *  its own cell, which made panes serialized at different terminal dims render
+   *  at wildly different font sizes (#63 review). Two passes: measure each pane's
+   *  natural content + cell size (transform reset so scrollWidth/Height are the
+   *  unscaled content), compute the shared scale (the pure, tested
+   *  `compositeScale` — median of per-pane fits, clamped), then apply it to all.
+   *  A pane whose content overflows its cell at that scale crops (cells are
+   *  `overflow:hidden`) — crop, never squish; the glyph aspect is always
+   *  preserved by the uniform `scale()`. */
+  private scaleComposite(root: HTMLElement): void {
+    const scalers: HTMLElement[] = [];
+    const fits: PreviewFit[] = [];
+    for (const pane of Array.from(root.querySelectorAll<HTMLElement>(".mini-pane"))) {
+      const body = pane.querySelector<HTMLElement>(".mini-pane-body");
+      const scaler = pane.querySelector<HTMLElement>(".mini-pane-scaler");
+      if (!body || !scaler) continue;
+      scaler.style.transform = "none"; // measure natural (unscaled) content size
+      scalers.push(scaler);
+      fits.push({
+        contentW: Math.max(1, scaler.scrollWidth),
+        contentH: Math.max(1, scaler.scrollHeight),
+        cellW: body.clientWidth,
+        cellH: body.clientHeight,
+      });
+    }
+    const scale = compositeScale(fits, PREVIEW_MIN_SCALE, PREVIEW_MAX_SCALE);
+    for (const scaler of scalers) scaler.style.transform = `scale(${scale})`;
   }
 
   /** Place the popup below the tab, clamped into view (flip above if needed). */
