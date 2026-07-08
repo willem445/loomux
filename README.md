@@ -15,6 +15,12 @@ Claude Code and GitHub Copilot CLI sessions straight into a pane, and a built-in
 **orchestrator/worker** workflow for running a fleet of AI agents you gatekeep
 only at review and merge.
 
+Every pane also carries an in-app **file editor** (`Alt+F`): a lazy file tree
+with extension icons, a CodeMirror code editor with per-language highlighting,
+and project-wide search-and-replace — floating over the terminal so the shell
+below is never disturbed. Available everywhere, plain terminals included. See
+the [design note](doc/design/fileedit.md).
+
 ![sample](sample.jpg)
 
 ## Install
@@ -101,6 +107,7 @@ src-tauri/src/
   obs.rs            crash observability: panic hook, breadcrumb log, unclean-exit notice
   voice.rs          voice prompts (#58): mic capture (cpal) -> local whisper.cpp subprocess
   uistate.rs        durable UI state (project tabs #63): atomic tabs.json store
+  fileedit.rs       file-editor overlay (#174): lazy tree, read/write (atomic + hash conflict), search/replace; server-side path safety
   lib.rs            Tauri wiring
 src/
   pty.ts            typed bridge to the backend (invoke + event bus)
@@ -117,14 +124,22 @@ src/
   launcher.ts       new-agent-pane dialog (single / multi / orchestrator)
   orchestration.ts  frontend half of agent groups (panes, badges, focus)
   shortcuts.ts      app-level keybindings (single source of truth)
+  fileapi.ts        typed bridge to fileedit.rs (per-feature wrapper, like git.ts)
+  fileedit.ts       file-editor overlay (#174): tree + code editor + search/replace (DOM wiring)
+  filetreemodel.ts  pure lazy-tree model: sort/merge/flatten (DOM-free, unit-tested)
+  fileicons.ts      pure filename -> inline-SVG icon mapping (DOM-free, unit-tested)
+  searchresults.ts  pure search grouping + replace-selection model (DOM-free, unit-tested)
+  dirtystate.ts     pure dirty/conflict/close-guard decisions (DOM-free, unit-tested)
+  editorwidget.ts   swappable editor widget: lazy CodeMirror 6 + textarea fallback
   voice.ts          pure voice logic: target decision + push-to-talk state machine
   voicecontrol.ts   global single-capture controller; routes transcripts to focus
   main.ts           composition root (owns the TabManager + OrchWiring router)
 ```
 
 Extension seams: new agent sources add a `scan_*` in `sessions.rs`; new backend
-capabilities add a `#[tauri::command]` plus a typed wrapper in `pty.ts` (the
-frontend never touches Tauri IPC directly elsewhere).
+capabilities add a `#[tauri::command]` plus a typed wrapper in `pty.ts` — or, for
+a self-contained feature, a dedicated wrapper module (`git.ts`, `gh.ts`,
+`fileapi.ts`). Either way the frontend never touches Tauri IPC directly.
 
 Requirements for the agent workflow: `claude` CLI on `PATH`; `gh` CLI
 authenticated for the issue/PR/review flow.
