@@ -115,10 +115,19 @@ take on VS Code): each hit file gets an accent highlight and a clickable
 match-count badge (the badge toggles whether that file is in the replace set).
 Typing debounces a search so highlights update live; the branches leading to
 hits auto-expand so they're visible; clicking a hit file opens it and jumps to
-its first match. Replace still applies from the *snapshot* the highlights were
-built with (not the live inputs), so editing the query after a search can't make
-apply diverge from what was shown — the two-phase preview→apply guarantee. The
-grouping / count / selection / first-match logic is the pure `searchresults`
+its first match. Opening a hit file also pushes the active query into the editor
+(`setHighlightQuery` → CodeMirror `setSearchQuery`) so every occurrence lights up
+*inside* the file, not just the file in the tree. The in-file **Find** button
+opens CodeMirror's search as a floating overlay (top-right, VS-Code-style —
+`search({top:true})` lifted out of flow in CSS) sharing that same query state, so
+it opens pre-filled. The textarea fallback can't highlight or float a find widget;
+it degrades to the project search box + jump-to-line (stated in the PR).
+
+Replace still applies from the *snapshot* the highlights were built with (not the
+live inputs), guarded additionally by a monotonic search-sequence id, so editing
+the query — or a slow search resolving late — can't make apply diverge from what
+was shown (the two-phase preview→apply guarantee). The grouping / count /
+selection / first-match / snapshot-currency logic is the pure `searchresults`
 model; `filetreemodel.ancestorDirs` (pure, tested) computes the branches to
 expand.
 

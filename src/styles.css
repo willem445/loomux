@@ -1853,9 +1853,12 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .fileedit-save {
   border: 1px solid var(--border); background: var(--panel-2); color: var(--text);
   font: inherit; padding: 3px 12px; border-radius: 5px; cursor: pointer;
+  white-space: nowrap; /* never wrap "Replace" onto a second line */
 }
 .fileedit-save:hover:not(:disabled) { background: var(--accent); color: #10131f; border-color: var(--accent); }
 .fileedit-save:disabled { opacity: 0.45; cursor: default; }
+/* In-file find trigger — bigger than a pane icon button, clearly labelled. */
+.fileedit-find { padding: 3px 12px; font-size: 13px; }
 
 .fileedit-banner {
   flex: none; padding: 4px 10px; font-size: 12px;
@@ -1887,6 +1890,9 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   padding: 8px; border-bottom: 1px solid var(--border); background: var(--panel);
 }
 .fileedit-search-row { display: flex; align-items: center; gap: 6px; }
+/* The Replace button keeps its width — the input flexes, the button never
+   shrinks or wraps its label. */
+.fileedit-search-row .fileedit-save { flex: none; }
 .fileedit-search-input {
   flex: 1 1 auto; min-width: 0;
   background: var(--panel-2); border: 1px solid var(--border); color: var(--text);
@@ -1929,7 +1935,24 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .fileedit-editor-pane { flex: 1 1 0; min-width: 0; position: relative; display: flex; }
 .fileedit-editor-host { flex: 1 1 0; min-width: 0; overflow: hidden; }
 .fileedit-editor-host[hidden] { display: none; }
-.fileedit-editor-host .cm-editor { height: 100%; }
+.fileedit-editor-host .cm-editor { height: 100%; position: relative; }
+/* In-file find as a VS-Code-style FLOATING overlay, top-right, over the editor —
+   not a bar docked at the bottom (search({top:true}) puts it in .cm-panels-top;
+   absolute-positioning lifts it out of flow so it floats instead of pushing the
+   content down). */
+.fileedit-editor-host .cm-panels.cm-panels-top {
+  position: absolute; top: 6px; right: 6px; left: auto;
+  z-index: 20; width: auto; max-width: calc(100% - 12px);
+  border: 1px solid var(--border); border-radius: 7px;
+  background: var(--panel-2); color: var(--text);
+  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.5);
+}
+.fileedit-editor-host .cm-panel.cm-search { padding: 6px 8px; }
+/* Occurrence highlighting inside the file — both the project search (pushed in
+   via setSearchQuery) and the in-file find use this, so matches always light up
+   (demo feedback #4). */
+.fileedit-editor-host .cm-searchMatch { background: rgba(122, 162, 247, 0.28); border-radius: 2px; }
+.fileedit-editor-host .cm-searchMatch-selected { background: rgba(122, 162, 247, 0.55); }
 .fileedit-empty {
   margin: auto; color: var(--text-dim); font-size: 13px; padding: 20px; text-align: center;
 }

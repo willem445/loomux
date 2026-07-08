@@ -36,6 +36,10 @@ export interface EditorWidget {
   focus(): void;
   /** Open the in-editor find/replace UI, if the implementation has one. */
   openFind(): void;
+  /** Highlight every occurrence of `query` in the open document (used to mirror
+   *  the project search's matches inside the editor). Empty query clears the
+   *  highlight. `caseInsensitive`/`wholeWord` mirror the project-search options. */
+  setHighlightQuery(query: string, caseInsensitive: boolean, wholeWord: boolean): void;
   dispose(): void;
 }
 
@@ -90,8 +94,13 @@ class TextareaEditor implements EditorWidget {
     this.ta.focus();
   }
   openFind(): void {
-    // No custom find panel; the WebView2 native find (or the project search
-    // panel) covers it. Intentionally a no-op.
+    // A plain <textarea> has no match-highlighting/find widget. Degradation: the
+    // project search box (which highlights hit files + jumps to the line) is the
+    // find affordance; native browser find also works. Intentionally a no-op.
+  }
+  setHighlightQuery(): void {
+    // No in-textarea occurrence highlighting is possible without a rich editor;
+    // the fallback relies on the project search + jump-to-line instead.
   }
   dispose(): void {
     this.el.remove();
@@ -163,6 +172,9 @@ class CodeMirrorEditor implements EditorWidget {
         cm.language.indentOnInput(),
         cm.language.bracketMatching(),
         cm.search.highlightSelectionMatches(),
+        // Float the find widget at the top (VS-Code-like) instead of docking a
+        // bar at the bottom; styled into an overlay in styles.css (.cm-panels-top).
+        cm.search.search({ top: true }),
         cm.view.keymap.of([
           cm.commands.indentWithTab,
           ...cm.commands.defaultKeymap,
@@ -227,6 +239,22 @@ class CodeMirrorEditor implements EditorWidget {
 
   openFind(): void {
     this.cm.search.openSearchPanel(this.view);
+  }
+
+  setHighlightQuery(query: string, caseInsensitive: boolean, wholeWord: boolean): void {
+    // Setting the search query decorates every match (.cm-searchMatch) even with
+    // the panel closed, so the project search's matches light up inside the file.
+    // `literal` keeps it a plain-text (non-regex) search, matching the backend.
+    this.view.dispatch({
+      effects: this.cm.search.setSearchQuery.of(
+        new this.cm.search.SearchQuery({
+          search: query,
+          caseSensitive: !caseInsensitive,
+          wholeWord,
+          literal: true,
+        })
+      ),
+    });
   }
 
   dispose(): void {
@@ -294,6 +322,7 @@ export async function createEditor(
       reveal: (line, col) => ta.reveal(line, col),
       focus: () => ta.focus(),
       openFind: () => ta.openFind(),
+      setHighlightQuery: () => ta.setHighlightQuery(),
       dispose: () => ta.dispose(),
     };
   }

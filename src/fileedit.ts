@@ -158,8 +158,8 @@ export class FileEditView {
     this.dirtyDot.title = "Unsaved changes";
     this.dirtyDot.hidden = true;
 
-    this.findBtn = el("button", "pane-btn", "⌕") as HTMLButtonElement;
-    this.findBtn.title = "Find in file";
+    this.findBtn = el("button", "fileedit-save fileedit-find", "⌕ Find") as HTMLButtonElement;
+    this.findBtn.title = "Find in this file — opens an overlay search bar";
     this.findBtn.hidden = true;
     this.findBtn.addEventListener("click", () => this.editor?.openFind());
 
@@ -367,6 +367,7 @@ export class FileEditView {
       this.updateFileLabel();
       this.updateDirty();
       this.renderTree(); // reflect the .open highlight
+      this.applyEditorHighlight(); // light up the project-search matches in-file
       if (line !== undefined) this.editor?.reveal(line, col);
     } catch (err) {
       this.explainOpenError(err);
@@ -632,6 +633,7 @@ export class FileEditView {
       if (seq !== this.searchSeq) return; // a newer search resolved during reveal
       this.renderTree();
       this.updateReplaceBtn();
+      this.applyEditorHighlight(); // mirror the matches inside the open file
     } catch (err) {
       if (errorCode(err) === "empty-query") return;
       showToast(`Search failed: ${errorMessage(err)}`);
@@ -646,6 +648,21 @@ export class FileEditView {
     this.summaryEl.classList.remove("truncated");
     this.updateReplaceBtn();
     this.renderTree();
+    this.applyEditorHighlight(); // clears the in-file highlight
+  }
+
+  /** Push the active project-search query into the open editor so its matches
+   *  are highlighted inside the file (demo feedback #4). No active search →
+   *  clears the highlight. The in-file Find button (CM6 overlay) uses the same
+   *  query state, so it opens pre-filled. */
+  private applyEditorHighlight(): void {
+    if (!this.editor) return;
+    const s = this.searchSnapshot;
+    if (s && s.query) {
+      this.editor.setHighlightQuery(s.query, s.caseInsensitive, s.wholeWord);
+    } else {
+      this.editor.setHighlightQuery("", false, false);
+    }
   }
 
   private updateSearchSummary(truncated: boolean): void {
@@ -674,9 +691,11 @@ export class FileEditView {
   }
 
   private updateReplaceBtn(): void {
+    // Label stays a plain "Replace" (no count — it was wrapping); the count lives
+    // in the summary line and the per-file badges instead.
     const n = this.searchSnapshot ? selectedMatchCount(this.searchGroups) : 0;
     this.replaceBtn.disabled = n === 0;
-    this.replaceBtn.textContent = n === 0 ? "Replace" : `Replace ${n}`;
+    this.replaceBtn.textContent = "Replace";
   }
 
   private async runReplace(): Promise<void> {
