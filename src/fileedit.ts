@@ -13,9 +13,20 @@ import {
   ftListDir,
   ftReadFile,
   ftWriteFile,
+  ftSearch,
+  ftReplace,
   errorCode,
   errorMessage,
+  type SearchOpts,
 } from "./fileapi";
+import {
+  groupMatches,
+  countSummary,
+  toggleFile,
+  selectedFiles,
+  selectedMatchCount,
+  type FileGroup,
+} from "./searchresults";
 import {
   makeRoot,
   mergeChildren,
@@ -63,6 +74,8 @@ export class FileEditView {
   private treeModel: TreeNode = makeRoot();
 
   // Header bits.
+  private treeTab!: HTMLButtonElement;
+  private searchTab!: HTMLButtonElement;
   private rootLabel: HTMLElement;
   private fileLabel: HTMLElement;
   private dirtyDot: HTMLElement;
@@ -84,6 +97,16 @@ export class FileEditView {
   private savedContent = "";
   private savedHash = "";
 
+  // Search/replace state.
+  private searchInput!: HTMLInputElement;
+  private replaceInput!: HTMLInputElement;
+  private ciBox!: HTMLInputElement;
+  private wwBox!: HTMLInputElement;
+  private resultsEl!: HTMLElement;
+  private summaryEl!: HTMLElement;
+  private replaceBtn!: HTMLButtonElement;
+  private searchGroups: FileGroup[] = [];
+
   constructor(private host: FileEditHost) {
     this.el = el("div", "fileedit");
     this.el.hidden = true;
@@ -99,11 +122,11 @@ export class FileEditView {
     const head = el("div", "fileedit-head");
 
     const tabs = el("div", "fileedit-tabs");
-    const treeTab = el("button", "fileedit-tab active", "Files") as HTMLButtonElement;
-    const searchTab = el("button", "fileedit-tab", "Search") as HTMLButtonElement;
-    treeTab.addEventListener("click", () => this.setMode("tree", treeTab, searchTab));
-    searchTab.addEventListener("click", () => this.setMode("search", treeTab, searchTab));
-    tabs.append(treeTab, searchTab);
+    this.treeTab = el("button", "fileedit-tab active", "Files") as HTMLButtonElement;
+    this.searchTab = el("button", "fileedit-tab", "Search") as HTMLButtonElement;
+    this.treeTab.addEventListener("click", () => this.setMode("tree"));
+    this.searchTab.addEventListener("click", () => this.setMode("search"));
+    tabs.append(this.treeTab, this.searchTab);
 
     const rootWrap = el("div", "fileedit-root");
     this.rootLabel = el("span", "fileedit-root-path", "(no folder)");
@@ -219,11 +242,16 @@ export class FileEditView {
 
   // ---------- mode ----------
 
-  private setMode(mode: Mode, treeTab: HTMLElement, searchTab: HTMLElement): void {
+  private setMode(mode: Mode): void {
     this.mode = mode;
-    treeTab.classList.toggle("active", mode === "tree");
-    searchTab.classList.toggle("active", mode === "search");
+    this.syncTabs();
     this.applyModeClass();
+    if (mode === "search") this.searchInput.focus();
+  }
+
+  private syncTabs(): void {
+    this.treeTab.classList.toggle("active", this.mode === "tree");
+    this.searchTab.classList.toggle("active", this.mode === "search");
   }
 
   private applyModeClass(): void {
@@ -473,15 +501,193 @@ export class FileEditView {
     });
   }
 
-  // ---------- search pane (wired in step 6) ----------
+  // ---------- search + replace panel ----------
 
-  private buildSearchPane(_pane: HTMLElement): void {
-    // Placeholder until the search+replace panel lands (issue #174, step 6).
-    _pane.appendChild(el("div", "fileedit-empty", "Search coming up."));
+  private buildSearchPane(pane: HTMLElement): void {
+    const form = el("div", "fileedit-search-form");
+
+    const searchRow = el("div", "fileedit-search-row");
+    this.searchInput = document.createElement("input");
+    this.searchInput.className = "fileedit-search-input";
+    this.searchInput.placeholder = "Search text…";
+    this.searchInput.spellcheck = false;
+    this.searchInput.addEventListener("keydown", (e) => {
+      e.stopPropagation();
+      if (e.key === "Enter") void this.runSearch();
+    });
+    const searchBtn = el("button", "fileedit-save", "Search") as HTMLButtonElement;
+    searchBtn.addEventListener("click", () => void this.runSearch());
+    searchRow.append(this.searchInput, searchBtn);
+
+    const replaceRow = el("div", "fileedit-search-row");
+    this.replaceInput = document.createElement("input");
+    this.replaceInput.className = "fileedit-search-input";
+    this.replaceInput.placeholder = "Replace with…";
+    this.replaceInput.spellcheck = false;
+    this.replaceInput.addEventListener("keydown", (e) => e.stopPropagation());
+    this.replaceBtn = el("button", "fileedit-save", "Replace") as HTMLButtonElement;
+    this.replaceBtn.disabled = true;
+    this.replaceBtn.addEventListener("click", () => void this.runReplace());
+    replaceRow.append(this.replaceInput, this.replaceBtn);
+
+    const opts = el("div", "fileedit-search-opts");
+    const [ciLabel, ciBox] = checkboxLabel("Ignore case");
+    const [wwLabel, wwBox] = checkboxLabel("Whole word");
+    this.ciBox = ciBox;
+    this.wwBox = wwBox;
+    this.summaryEl = el("span", "fileedit-search-summary", "");
+    opts.append(ciLabel, wwLabel, this.summaryEl);
+
+    form.append(searchRow, replaceRow, opts);
+
+    this.resultsEl = el("div", "fileedit-results");
+
+    pane.append(form, this.resultsEl);
+  }
+
+  private searchOpts(): SearchOpts {
+    return {
+      case_insensitive: this.ciBox.checked,
+      whole_word: this.wwBox.checked,
+      max_results: 0,
+    };
+  }
+
+  private async runSearch(): Promise<void> {
+    const query = this.searchInput.value;
+    if (!this.root || query === "") {
+      this.searchGroups = [];
+      this.renderResults(false);
+      return;
+    }
+    try {
+      const out = await ftSearch(this.root, query, this.searchOpts());
+      this.searchGroups = groupMatches(out.matches);
+      this.renderResults(out.truncated);
+    } catch (err) {
+      if (errorCode(err) === "empty-query") return;
+      showToast(`Search failed: ${errorMessage(err)}`);
+    }
+  }
+
+  private renderResults(truncated: boolean): void {
+    const { files, matches } = countSummary(this.searchGroups);
+    this.summaryEl.textContent =
+      matches === 0
+        ? this.searchInput.value
+          ? "No matches"
+          : ""
+        : `${matches} match${matches === 1 ? "" : "es"} in ${files} file${files === 1 ? "" : "s"}${truncated ? " (truncated)" : ""}`;
+    this.summaryEl.classList.toggle("truncated", truncated);
+    this.updateReplaceBtn();
+
+    const frag = document.createDocumentFragment();
+    for (const group of this.searchGroups) {
+      const fileEl = el("div", "fileedit-result-file");
+      const head = el("div", "fileedit-result-head");
+      const box = document.createElement("input");
+      box.type = "checkbox";
+      box.checked = group.selected;
+      box.addEventListener("click", (e) => {
+        e.stopPropagation();
+        this.searchGroups = toggleFile(this.searchGroups, group.rel);
+        this.updateReplaceBtn();
+      });
+      const name = el("span", "fileedit-name", group.rel);
+      const count = el("span", "fileedit-result-count", String(group.matches.length));
+      head.append(box, name, count);
+      fileEl.appendChild(head);
+      for (const mtch of group.matches) {
+        const row = el("div", "fileedit-result-match");
+        const loc = el("span", "fileedit-result-loc", `${mtch.line}:${mtch.col}`);
+        const text = el("span", "fileedit-result-text", mtch.line_text);
+        row.append(loc, text);
+        row.addEventListener("click", () => void this.openFromSearch(mtch.rel));
+        fileEl.appendChild(row);
+      }
+      frag.appendChild(fileEl);
+    }
+    this.resultsEl.replaceChildren(frag);
+  }
+
+  private updateReplaceBtn(): void {
+    const n = selectedMatchCount(this.searchGroups);
+    this.replaceBtn.disabled = n === 0;
+    this.replaceBtn.textContent = n === 0 ? "Replace" : `Replace ${n}`;
+  }
+
+  /** Open a search hit in the editor: switch to tree mode and load the file. */
+  private async openFromSearch(rel: string): Promise<void> {
+    this.mode = "tree";
+    this.applyModeClass();
+    this.syncTabs();
+    await this.openFile(rel);
+  }
+
+  private async runReplace(): Promise<void> {
+    if (!this.root) return;
+    const files = selectedFiles(this.searchGroups);
+    if (files.length === 0) return;
+    const query = this.searchInput.value;
+    const replacement = this.replaceInput.value;
+    const ok = await this.confirmReplace(selectedMatchCount(this.searchGroups), files.length);
+    if (!ok) return;
+    try {
+      const res = await ftReplace(this.root, query, replacement, files, this.searchOpts());
+      const changedMatches = res.changed.reduce((s, c) => s + c.replacements, 0);
+      let msg = `Replaced ${changedMatches} in ${res.changed.length} file${res.changed.length === 1 ? "" : "s"}`;
+      if (res.skipped.length > 0) msg += `, skipped ${res.skipped.length}`;
+      showToast(msg, "info");
+      // If the open file was among those changed, reload it so the buffer isn't
+      // stale against disk.
+      if (this.openRel && res.changed.some((c) => c.rel === this.openRel)) {
+        await this.reloadOpenFile();
+      }
+      await this.runSearch(); // refresh results against the new contents
+    } catch (err) {
+      showToast(`Replace failed: ${errorMessage(err)}`);
+    }
+  }
+
+  private async reloadOpenFile(): Promise<void> {
+    if (!this.root || this.openRel === null) return;
+    try {
+      const fr = await ftReadFile(this.root, this.openRel);
+      this.savedContent = fr.content;
+      this.savedHash = fr.hash;
+      this.editor?.setValue(fr.content, this.openRel);
+      this.updateDirty();
+    } catch {
+      /* file may have been removed; leave the buffer as-is */
+    }
+  }
+
+  private confirmReplace(matches: number, files: number): Promise<boolean> {
+    return modal<boolean>((resolve) => ({
+      title: "Replace across files?",
+      body: `Replace ${matches} occurrence${matches === 1 ? "" : "s"} in ${files} file${files === 1 ? "" : "s"}. Each file is written atomically; this can't be undone from here.`,
+      buttons: [
+        { label: "Cancel", value: false },
+        { label: "Replace", value: true, kind: "primary" },
+      ],
+      onKey: (k) => (k === "Escape" ? resolve(false) : undefined),
+    }));
   }
 }
 
 // ---------- helpers ----------
+
+/** A `<label>` wrapping a checkbox + caption, returned with the input so the
+ *  caller can read `.checked`. */
+function checkboxLabel(text: string): [HTMLLabelElement, HTMLInputElement] {
+  const label = document.createElement("label");
+  const box = document.createElement("input");
+  box.type = "checkbox";
+  const span = document.createElement("span");
+  span.textContent = text;
+  label.append(box, span);
+  return [label, box];
+}
 
 /** Abbreviate a long absolute path for the header (keep the tail, which is the
  *  meaningful folder name). */
