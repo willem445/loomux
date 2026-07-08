@@ -1139,6 +1139,9 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .task-status.st-in-progress { background: rgba(122, 162, 247, 0.16); color: #a7bff8; }
 .task-status.st-review { background: rgba(187, 154, 247, 0.16); color: #c7a9ff; }
 .task-status.st-pr { background: rgba(224, 175, 104, 0.16); color: #e0af68; }
+/* Prototype (#147): a distinct magenta so a demo-gated draft reads apart from
+   the merge-gate cyan and the terminal green. */
+.task-status.st-prototype { background: rgba(255, 122, 214, 0.16); color: #ff9edb; }
 .task-status.st-human-testing { background: rgba(125, 207, 255, 0.16); color: #7dcfff; }
 .task-status.st-done { background: rgba(158, 206, 106, 0.16); color: #b4e878; }
 .task-status.st-blocked { background: rgba(247, 118, 142, 0.16); color: #f7899d; }
@@ -1160,7 +1163,7 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 
 /* Merge-gate action buttons (approve / request changes) and the queued-task
    start button share the same compact pill shape. */
-.task-btn.approve, .task-btn.changes, .task-btn.start {
+.task-btn.approve, .task-btn.changes, .task-btn.start, .task-btn.proceed {
   flex: none; height: 18px; font-size: 10px; padding: 0 7px;
   border: 1px solid transparent; white-space: nowrap;
 }
@@ -1170,6 +1173,9 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .task-btn.changes:hover { background: rgba(224, 175, 104, 0.16); border-color: #55452c; }
 .task-btn.start { color: #7dcfff; }
 .task-btn.start:hover { background: rgba(125, 207, 255, 0.16); border-color: #2c485a; }
+/* Proceed (#147): magenta, matching the prototype chip it acts on. */
+.task-btn.proceed { color: #ff9edb; }
+.task-btn.proceed:hover { background: rgba(255, 122, 214, 0.16); border-color: #5a2c4c; }
 
 /* Request-changes modal, scoped inside the task-board overlay. */
 .tasks-dialog {

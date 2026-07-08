@@ -2048,6 +2048,78 @@ fn start_is_rejected_up_front_when_the_group_is_paused() {
     assert!(after.notes.last().unwrap().text.contains("Started"), "resumed start records the nudge");
 }
 
+// ---------- #147: prototype status + proceed workflow ----------
+
+/// Count the notices the orchestrator would have received, observed as
+/// `prompt-suppressed-paused` audit entries (delivery is suppressed in a paused
+/// group, but the text is still recorded) whose text contains `needle`.
+fn suppressed_notices(reg: &OrchRegistry, group: &str, needle: &str) -> usize {
+    reg.audit_log(group)
+        .into_iter()
+        .filter(|e| {
+            e.action == "prompt-suppressed-paused"
+                && e.detail["text"].as_str().is_some_and(|s| s.contains(needle))
+        })
+        .count()
+}
+
+#[test]
+fn prototype_is_a_valid_status() {
+    // The board must accept `prototype` on a write — it's a first-class status,
+    // not a free-text label. (The frontend picker mirrors TASK_STATUSES.)
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let t = reg.upsert_task(&g.id, "orch-1", None, patch(Some("Demo the thing"), None, None)).unwrap();
+    let after = reg.upsert_task(&g.id, "orch-1", Some(&t.id), patch(None, Some("prototype"), None)).unwrap();
+    assert_eq!(after.status, "prototype");
+}
+
+#[test]
+fn proceed_flips_to_in_progress_audits_and_sends_one_notice() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    // An orchestrator must exist for the notice to have a target; pause the group
+    // so delivery is suppressed-but-audited (test mode has no pane to type into),
+    // letting us observe the exact notice — and prove there is exactly one.
+    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    reg.pause_group(&g.id).unwrap();
+
+    let t = reg.upsert_task(&g.id, "orch-1", None, patch(Some("Prototype the sidebar"), Some("prototype"), None)).unwrap();
+    // Proceed is the human's promote verdict: unlike Start it is NOT rejected by
+    // a paused group — the durable status flip carries the decision regardless.
+    let after = reg.proceed_task(&g.id, &t.id).unwrap();
+    assert_eq!(after.status, "in-progress", "proceed promotes the item back into active work");
+    let note = after.notes.last().unwrap();
+    assert_eq!(note.author, "human");
+    assert!(note.text.contains("Proceed"), "the promote decision must be auditable on the board");
+
+    // Exactly one PROCEED notice reaches the orchestrator — no spam.
+    assert_eq!(
+        suppressed_notices(&reg, &g.id, "PROCEED"), 1,
+        "proceed delivers exactly one orchestrator notice"
+    );
+}
+
+#[test]
+fn proceed_is_guarded_to_prototype_items() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let t = reg.upsert_task(&g.id, "orch-1", None, patch(Some("Ship it"), None, None)).unwrap();
+    // An unknown id is an error, not a silent no-op.
+    assert!(reg.proceed_task(&g.id, "t-999").is_err());
+    // Every non-prototype status must refuse, and refuse without mutating.
+    for status in ["queued", "in-progress", "review", "pr", "human-testing", "done", "blocked"] {
+        reg.upsert_task(&g.id, "orch-1", Some(&t.id), patch(None, Some(status), None)).unwrap();
+        let before = reg.tasks(&g.id)[0].notes.len();
+        assert!(reg.proceed_task(&g.id, &t.id).is_err(), "cannot proceed a {status} item");
+        assert_eq!(reg.tasks(&g.id)[0].status, status, "a refused proceed must not change status");
+        assert_eq!(reg.tasks(&g.id)[0].notes.len(), before, "a refused proceed must not leave a note");
+    }
+    // In prototype, it's allowed.
+    reg.upsert_task(&g.id, "orch-1", Some(&t.id), patch(None, Some("prototype"), None)).unwrap();
+    assert!(reg.proceed_task(&g.id, &t.id).is_ok(), "prototype is proceedable");
+}
+
 // ---------- review-round regression tests ----------
 
 #[test]

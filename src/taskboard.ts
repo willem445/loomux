@@ -24,6 +24,44 @@ export function retainExisting(selected: Iterable<string>, tasks: readonly HasId
   return live;
 }
 
+/** The board's status vocabulary, in picker order. Mirrors the backend's
+ *  TASK_STATUSES (validated there) — the frontend only offers these; the
+ *  backend rejects anything else on write. */
+export const STATUSES = [
+  "queued",
+  "in-progress",
+  "review",
+  "pr",
+  "prototype",
+  "human-testing",
+  "done",
+  "blocked",
+] as const;
+
+/** The demo-gate status (#147): a prototype awaiting the human's promote/scrap
+ *  verdict. Must match the backend's `prototype` status string. */
+export const PROTOTYPE_STATUS = "prototype";
+
+/** Whether the board should show the **Proceed** button on an item — only a
+ *  prototype can be promoted. The backend enforces the same guard
+ *  (`ensure_prototype`), so this just governs whether the affordance appears. */
+export function canProceed(status: string): boolean {
+  return status === PROTOTYPE_STATUS;
+}
+
+/** Statuses only the human can move forward, highlighted on the board so what
+ *  is waiting on you stands out (attention routing #6). `prototype` belongs
+ *  here — it's parked on the human's demo verdict, like the merge gates and
+ *  `blocked`. */
+export function isAwaitingHuman(status: string): boolean {
+  return (
+    status === "pr" ||
+    status === "human-testing" ||
+    status === "blocked" ||
+    status === PROTOTYPE_STATUS
+  );
+}
+
 /** The terminal status whose tasks the "delete all done" action clears. Must
  *  match the backend's `done` status string (validated in orchestration). */
 export const DONE_STATUS = "done";

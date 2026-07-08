@@ -223,11 +223,11 @@ fn tool_defs(role: Role) -> Vec<Value> {
                 "Persist the group's orchestration state (must be a valid JSON string). Call after every queue/plan change; this is your memory across sessions.",
                 json!({ "state": { "type": "string" } }), &["state"]),
             tool("upsert_task",
-                "Create (omit id, title required) or update a task on the shared board. status: queued | in-progress | review | pr | human-testing | done | blocked. Keep the board current — it is the human's window into your queue. note appends a timestamped note.",
+                "Create (omit id, title required) or update a task on the shared board. status: queued | in-progress | review | pr | prototype | human-testing | done | blocked. Use `prototype` for a demo-gated draft the human will decide whether to promote — the board shows them a Proceed button, and clicking it prompts you to run the full production build. Keep the board current — it is the human's window into your queue. note appends a timestamped note.",
                 json!({
                     "id": { "type": "string", "description": "Existing task id; omit to create" },
                     "title": { "type": "string" },
-                    "status": { "type": "string", "enum": ["queued", "in-progress", "review", "pr", "human-testing", "done", "blocked"] },
+                    "status": { "type": "string", "enum": ["queued", "in-progress", "review", "pr", "prototype", "human-testing", "done", "blocked"] },
                     "issue": { "type": "string", "description": "GitHub issue ref, e.g. #12" },
                     "pr": { "type": "string", "description": "PR ref or URL" },
                     "assignee": { "type": "string", "description": "Agent id working on it" },
