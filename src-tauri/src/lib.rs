@@ -57,6 +57,7 @@ pub fn run() {
             orchestration::start_watchdog(reg.clone());
             orchestration::start_attention(reg.clone());
             orchestration::start_max_notice_flusher(reg.clone());
+            orchestration::start_disk_monitor(reg.clone());
             std::thread::spawn(move || orchestration::mcp::serve(reg));
             Ok(())
         })
