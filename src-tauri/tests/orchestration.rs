@@ -3313,6 +3313,23 @@ fn idle_tick_status_is_honest_about_latch_and_cap() {
 }
 
 #[test]
+fn idle_tick_status_reports_paused_with_no_countdown() {
+    // rev-59 re-check: autonomous and paused are INDEPENDENT markers. A paused
+    // autonomous group suppresses all delivery, so the tick never fires — the panel
+    // must not render a live countdown (the exact lying-countdown class).
+    let (reg, _d, gid, _oid) = autonomous_setup();
+    reg.pause_group(&gid).unwrap();
+    let s = reg.autonomy_state(&gid);
+    assert_eq!(s["tick_status"], "paused", "a paused autonomous group reports paused");
+    assert!(s["eligible_in_secs"].is_null(), "paused must not render a ticking countdown");
+    // Resuming restores a live countdown.
+    reg.resume_group(&gid).unwrap();
+    let s = reg.autonomy_state(&gid);
+    assert_eq!(s["tick_status"], "counting_down", "resume restores the live countdown");
+    assert!(s["eligible_in_secs"].as_u64().is_some());
+}
+
+#[test]
 fn autonomous_toggle_roundtrip_durable_and_audited() {
     let (reg, dir) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();

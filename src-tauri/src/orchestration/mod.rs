@@ -3839,6 +3839,10 @@ impl OrchRegistry {
         // — never a lying 0 that hits zero while a non-time gate holds the tick
         // (rev-59). Statuses:
         //   "off"                 — autonomous off / no live orchestrator (null secs)
+        //   "starting"            — orchestrator still booting (not Running); the tick
+        //                           only considers Running panes, so no timer yet (null)
+        //   "paused"              — group paused: delivery suppressed, so NO tick fires
+        //                           however long the clock runs; secs = null (not a lie)
         //   "counting_down"       — quiet clock < window; secs = time left in window
         //   "eligible"            — window met, latch clear, under cap; secs = 0
         //                           (fires within one loop pass, ≤ IDLE_TICK_INTERVAL)
@@ -3878,21 +3882,33 @@ impl OrchRegistry {
         idle_tick_minutes: u32,
     ) -> (Option<u64>, Option<u64>, &'static str) {
         let now = now_ms();
-        // The orchestrator's quiet clock + latch (maintained by the idle-tick loop).
+        // The orchestrator's status + quiet clock + latch (maintained by the loop).
         let orch = self
             .agents
             .lock_safe()
             .values()
             .find(|a| a.group == group && a.role == Role::Orchestrator
                 && a.status != AgentStatus::Dead)
-            .map(|a| (a.last_progress_ms, a.idle_tick_notified));
-        let Some((since, latched)) = orch else {
+            .map(|a| (a.status, a.last_progress_ms, a.idle_tick_notified));
+        let Some((status, since, latched)) = orch else {
             return (None, None, "off"); // no live orchestrator → no meter
         };
+        // Transient boot: `idle_tick_tick` only ticks a Running orchestrator, so a
+        // Starting one has no live countdown yet — report it honestly, not a timer.
+        if status != AgentStatus::Running {
+            return (None, None, "starting");
+        }
         let quiet = now.saturating_sub(since) / 1000;
         let window = idle_tick_minutes as u64 * 60;
         let quiet_remaining = window.saturating_sub(quiet);
 
+        // Paused: `idle_tick_tick` skips paused groups wholesale (delivery is
+        // suppressed there), so NO tick fires however long the quiet clock runs.
+        // Mirror the latch branch — the quiet clock is still live but there is no
+        // countdown — so the panel never shows a ticking timer while paused.
+        if self.is_paused(group) {
+            return (Some(quiet), None, "paused");
+        }
         // Latch: already ticked this window — no timer counts down to the next
         // (it waits for the orchestrator to produce output), so report it as such
         // rather than a false 0.
@@ -6299,7 +6315,7 @@ pub fn orch_group_usage(reg: tauri::State<Arc<OrchRegistry>>, group_id: String) 
 //         budget_anchor_tokens: u64, spend_since_enable_tokens: u64 | null,
 //         suspended: bool, idle_tick_minutes: u32, idle_activity_floor_bytes: u64,
 //         quiet_secs: u64 | null, eligible_in_secs: u64 | null,
-//         tick_status: "off"|"counting_down"|"eligible"|"waiting_for_activity"|"rate_capped" }
+//         tick_status: "off"|"starting"|"paused"|"counting_down"|"eligible"|"waiting_for_activity"|"rate_capped" }
 //     `spend_since_enable_tokens` is null when autonomous is off (no live meter).
 //     `suspended` is true iff autonomous is off *because the budget enforcer
 //     flipped it* (durable `autonomy_suspended` marker), vs a plain user toggle-off

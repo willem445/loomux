@@ -492,7 +492,11 @@ the two cost/safety controls the unattended-spend risk demands.
   `eligible_in_secs` is a real timer only for `counting_down` / `eligible` / `rate_capped`; when
   the one-notice latch gates the next tick (`waiting_for_activity`) there is no timer — it waits
   for the orchestrator to emit output — so `eligible_in_secs` is `null`, never a lying 0. The
-  per-hour cap folds in as a real timer (time until the oldest tick ages out of the window).
+  per-hour cap folds in as a real timer (time until the oldest tick ages out of the window). The
+  computation mirrors every skip-gate `idle_tick_tick` applies so the panel can't show a live
+  countdown while ticks are actually suppressed: `paused` (autonomous and paused are independent
+  markers — a paused group suppresses all delivery) and `starting` (a still-booting orchestrator;
+  the tick only considers Running panes) both report `null` countdown.
 - **The toggle.** Off by default. `is_autonomous`/`set_autonomous` on the `set_notify`
   marker-file pattern (an `autonomous` marker), so it's live-togglable from the group panel
   and survives restarts (re-seeded in `create_group` next to `paused`/`notify`). The label
