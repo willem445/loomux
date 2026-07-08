@@ -13,7 +13,7 @@ import { Pane, type PaneEvents, type PaneOptions } from "./pane";
 import { dropZoneFor, indicatorFor, zoneToPlacement, type DropZone } from "./layout";
 import { dockChipAttention } from "./attention";
 import { planGroupMinimize } from "./group";
-import { shouldFocusNewPane, shouldRestoreFocus } from "./panefocus";
+import { shouldFocusNewPane, shouldRestoreFocus, shouldPreserveMaximize } from "./panefocus";
 
 type Dir = "row" | "column";
 
@@ -146,7 +146,15 @@ export class Grid {
     // (#117 round 2; same DOM-detach class as #113). We hand it back after,
     // unless the new pane is meant to take focus (see restoreFocus/takeFocus).
     const prior = captureFocus();
-    if (this.maximized) this.exitMaximize(); // a layout change exits fullscreen
+    // A background (orchestrator-driven) spawn must not collapse the human's
+    // fullscreen view (#155): keep the pane maximized and grow the split tree
+    // underneath it. A human-initiated open still exits fullscreen so the new
+    // pane is shown in its landed layout. `keepMaximized` is the pane to re-lift
+    // after the tree mutation, or null when we let maximize exit as before.
+    const keepMaximized = shouldPreserveMaximize(!opts.background, this.maximized !== null)
+      ? this.maximized
+      : null;
+    if (this.maximized && !keepMaximized) this.exitMaximize(); // a layout change exits fullscreen
     const pane = new Pane(events);
     const leaf: LeafNode = { kind: "leaf", pane, parent: null };
     this.leaves.set(pane, leaf);
@@ -166,6 +174,14 @@ export class Grid {
     } else {
       this.insertBeside(this.leaves.get(target)!, leaf, dir);
     }
+
+    // Preserving fullscreen (#155): insertBeside re-seated the maximized pane's
+    // element into the now-hidden split, so lift it back to the top layer. We
+    // never removed `.has-maximized`/`.maximized`, so no pane repainted; the new
+    // pane sits in the hidden subtree (zero width → no fit → no PTY resize) and
+    // becomes visible when the human unmaximizes. Do this BEFORE restoreFocus so
+    // the re-lift's detach/reattach blur is the human's last focus event undone.
+    if (keepMaximized) this.rootEl.appendChild(keepMaximized.el);
 
     if (takeFocus) this.setActive(pane);
     // Hand focus back synchronously, in the same tick as the relayout — JS is

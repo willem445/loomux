@@ -114,7 +114,10 @@ can be rearranged without splitting from scratch:
   never resizes their terminals, so no scrollback is disturbed.
 - **Maximize** (`Ctrl+Shift+M` or the ⤢ button) blows one pane up to fill the
   grid; the same shortcut (or the ⤡ restore button) puts it back. The other
-  panes are hidden rather than shrunk, so they don't repaint.
+  panes are hidden rather than shrunk, so they don't repaint. Staying maximized
+  is sticky: when the orchestrator spawns an agent in the background, the new
+  pane joins the grid underneath without dropping you out of fullscreen — it's
+  there when you restore.
 - **Minimize** (`Alt+M` or the — button) parks a pane in the **dock** strip at
   the bottom of the grid — it keeps running. Click its chip to bring it back,
   or the chip's ✕ to close it for good. (This is loomux's take on the issue's

@@ -48,3 +48,23 @@ export function shouldRestoreFocus(
 ): boolean {
   return !takeFocus && hadPriorFocus && priorStillConnected;
 }
+
+/** Whether an opening pane must PRESERVE the current fullscreen (#155).
+ *
+ *  A background (orchestrator-driven) spawn while the human has a pane maximized
+ *  used to collapse the fullscreen view: openPane exits maximize unconditionally
+ *  before growing the split tree. It shouldn't — the human is watching one pane
+ *  full-screen and an agent spawning in the background must not yank them back to
+ *  the grid. So keep the pane maximized and grow the tree underneath it (the new
+ *  pane lands in the hidden subtree — zero width, no PTY fit — and shows on
+ *  unmaximize). A human-initiated open still exits fullscreen, because the human
+ *  asked for a pane and expects to see the layout it landed in.
+ *
+ *  Returns true only for a background open while something is maximized —
+ *  exactly the case that would otherwise strand the human out of fullscreen. */
+export function shouldPreserveMaximize(
+  humanInitiated: boolean,
+  isMaximized: boolean
+): boolean {
+  return !humanInitiated && isMaximized;
+}
