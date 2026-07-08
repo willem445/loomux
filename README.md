@@ -113,8 +113,10 @@ space.
 - **Open / switch / close** — `Ctrl+Shift+T` (or **+**) opens a new tab on the
   current mode's starting surface (a terminal, or the agent launcher in agent
   mode); `Ctrl+Shift+[` / `Ctrl+Shift+]` page between tabs; `Ctrl+Shift+K` (or
-  the tab's ✕) closes one and kills its panes. There's always at least one tab —
-  closing the last is refused.
+  the tab's ✕) closes one and kills its panes. Closing a tab that runs an
+  **orchestration project** asks for a two-step confirm first (the ✕ turns to
+  **✕?** — click again), since it ends that project's live agents. There's always
+  at least one tab — closing the last is refused.
 - **Background tabs keep running.** An inactive tab is *hidden, not torn down* —
   its terminals keep streaming, scrollback stays intact, and its agents' PTYs
   run untouched. Switching tabs never repaints or reflows a terminal (see the

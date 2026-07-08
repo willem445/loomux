@@ -19,7 +19,7 @@ become tab-aware routers.
 | `TabManager` | `src/tabs.ts` | Ordered tab list, active tab, the never-zero-tabs invariant, the group→tab / pty→tab routing maps, per-tab attention, and the persistence snapshot. **DOM- and Grid-free** → unit-tested under `node --test`. Generic over a minimal `ManagedWorkspace` so tests drive it with a fake. |
 | `Workspace` | `src/workspace.ts` | One tab = a `Grid` + its own dock, mounted in a container in the workspace stack. Owns hide/show (`display:none` + GL policy) and the preview composite. |
 | `TabBar` | `src/tabbar.ts` | The tab strip: switch/close/new, rename, color, the attention chip, the live status chip, the hover-preview composite (safe HTML render), and the right-click pause menu. |
-| `tabroute.ts` | `src/tabroute.ts` | Pure routing + preview decisions: cross-tab attention folding, focus-switches-tab, and the preview-style **sanitizer**. Unit-tested. |
+| `tabroute.ts` | `src/tabroute.ts` | Pure routing + preview decisions: cross-tab attention folding, the live cross-tab pane lookup (`findPaneByPty`), and the preview-style **sanitizer**. Unit-tested. |
 | `tabstore.ts` | `src/tabstore.ts` | Pure encode/decode + **schema validation** of the persisted tab set. The single source of the tab schema. Unit-tested. |
 | `panefit.ts` | `src/panefit.ts` | The pure `shouldResizePty` decision — the **no-resize invariant** at its testable core. |
 | `uistate.rs` | `src-tauri/src/uistate.rs` | Backend durable store: atomic `tabs.json` write + corrupt-file quarantine, behind two `#[tauri::command]`s. |
@@ -58,17 +58,28 @@ The backend is unchanged: pty↔agent↔group binding, the global id-demuxed
 `orch-focus` / `orch-spawn-request` / `orch-group-ended` events all already
 work across N grids. The tab layer is **additive routing** on top.
 
-`TabManager` owns two maps — `groupId → workspaceId` and `ptyId → workspaceId` —
-maintained in one place so add/close keep them consistent (closing a tab forgets
-its routes). `orchestration.ts` exposes an `OrchWiring` interface it calls into;
-`main.ts` implements it over the `TabManager`:
+`TabManager` owns **one** map — `groupId → workspaceId` — maintained in one place
+so add/close keep it consistent (closing a tab forgets its route). The group→tab
+binding is stable: a group belongs to a tab for that tab's life. `orchestration.ts`
+exposes an `OrchWiring` interface it calls into; `main.ts` implements it over the
+`TabManager`:
 
 - **spawn** (`orch-spawn-request`) → `targetForGroup(req)` returns the grid +
   pane-events for the group's tab, **creating and repo-naming a tab on first
-  sight**; the opened pane's pty is then bound to that tab. Background open, so
-  it never steals focus from where the human is typing (#117).
-- **focus** (`orch-focus`) → `focusPty(ptyId)` **switches to the pane's tab
-  first, then focuses the pane** (`revealPlan` is the pure decision).
+  sight**. Background open, so it never steals focus from where the human is
+  typing (#117).
+- **focus** (`orch-focus`) → `focusPty(ptyId)` finds the pane by scanning live
+  panes across tabs (`findPaneByPty`), **switches to its tab, then focuses it**
+  (`switchTo` no-ops if that tab is already active).
+
+**Why no `ptyId → tab` map.** An earlier cut maintained a pty→tab side-map, but
+the paths that need it — focus, pty-exit reaping, rename — all *scan live panes*
+(`findPaneByPty` over each grid's `findByPtyId`) instead. A maintained pty map
+would go **stale**: nothing removes a per-pty entry when an individual pane
+closes (only whole-tab close forgets routes), so a closed pty could resolve to a
+tab that no longer holds it. The scan is O(panes), runs only on rare events, and
+is always correct because it reads the panes that actually exist. So the pty map
+was deleted rather than papered over; the group map stays because it *is* stable.
 - **attention** (`orch-attention`) → `applyAttention` badges every pane by its
   pty across all tabs **and** folds the scan into per-tab badge state
   (`tabAttention`), so a hidden tab with a blocked/waiting agent raises a
@@ -79,8 +90,9 @@ its routes). `orchestration.ts` exposes an `OrchWiring` interface it calls into;
   whichever tab they live.
 
 Tests: `test/tabroute.test.ts` (attention folding — every class badges its tab,
-most-urgent reason wins; focus-switches-tab) and `test/tabs.test.ts` (bind/resolve
-group + pty, and route-forgetting on close).
+most-urgent reason wins; and `findPaneByPty` — the live cross-tab lookup, incl.
+the not-found case that makes the scan stale-proof) and `test/tabs.test.ts`
+(group bind/resolve + route-forgetting on close).
 
 ## Persistence (durable backend store)
 
@@ -143,8 +155,7 @@ truth and `localStorage` is never read again.
 ## Boot restore — what revives, and why not more
 
 On boot, `restoreTabs` rebuilds the tab **shells**: name, color, order, active
-tab, and each tab's group binding. Background tabs that come back empty get a
-plain shell so they're usable.
+tab, and each tab's group binding.
 
 **Live agent panes/PTYs are deliberately NOT auto-spawned on boot.** This is a
 design decision, not a missing feature: reviving N orchestrator + worker CLIs on
@@ -157,6 +168,32 @@ session from the session browser (or a spawn/rejoin event arrives for the group)
 re-inhabits its own tab through the existing per-session/per-group resume
 machinery (`resume_orch_session`), which is the real integration the prototype
 stubbed as "a named shell bound to a group."
+
+### The empty-tab rule — ONE rule, no background modals
+
+A tab must always hold at least one pane (the grid's "never empty" rule). There
+is exactly **one** rule for filling an empty tab, applied everywhere:
+
+> **An empty tab holds a SILENT plain shell — never the launcher modal — except
+> the single genuine fresh start, where the app opens its first pane and the
+> human picks via the launcher.**
+
+- **Last-pane exit** (a human ✕, or a background agent process exiting): the
+  grid's `onEmpty` refills with `openShellIn` (a plain shell). It must never call
+  the launcher — for a hidden/background tab that would pop an interactive modal
+  over the *active* tab, driven by a background lifecycle event the human never
+  triggered. (This was the review's MED-1.)
+- **Boot after a restore**: every restored tab that came back empty — active or
+  background, plain or group-bound — is filled with a silent shell. For a
+  group-bound tab the shell is a **placeholder** until that group's session is
+  restored into it (above); it is not "stray." (MED-1's rule reconciled with the
+  boot fill — the review's LOW-2.)
+- **Fresh start only** (no restore): the one brand-new default tab opens via the
+  normal first-pane flow — the launcher in agent mode. This is the *only* place a
+  modal appears on boot, and only when there is no restored state at all.
+
+The launcher otherwise appears solely from an explicit human action in the active
+tab: `Ctrl+Shift+T` / the **+** button (`openUserTab`), or a split.
 
 ## Memory / GL policy under many tabs
 
@@ -244,8 +281,8 @@ injection attempts (`test/tabroute.test.ts`).
 | Area | File |
 | --- | --- |
 | No-resize invariant (hidden ⇒ no resize) | `test/panefit.test.ts` |
-| TabManager: add/remove/switch, active invariant, never-zero-tabs, switch-is-hide-not-dispose, group/pty routing + forget-on-close | `test/tabs.test.ts` |
-| Cross-tab attention folding, focus-switches-tab, preview sanitizer (whitelist + injection rejection) | `test/tabroute.test.ts` |
+| TabManager: add/remove/switch, active invariant, never-zero-tabs, switch-is-hide-not-dispose, group routing + forget-on-close | `test/tabs.test.ts` |
+| Cross-tab attention folding, live cross-tab pane lookup (`findPaneByPty`), preview cap edge, preview sanitizer (whitelist + injection rejection) | `test/tabroute.test.ts` |
 | Persistence round-trip + schema validation + clamp/coerce edges | `test/tabstore.test.ts` |
 | Backend atomic write + corrupt quarantine + migration-safe overwrite | `uistate.rs` (inline) |
 
@@ -257,5 +294,23 @@ demo quality. This feature productionizes it: persistence moved from
 tab-routing; the GL-drop policy was closed to cover background-spawned panes;
 the preview cost was formalized and its sanitizer extracted + tested; and every
 prototype TODO/stub was resolved or documented as a deliberate decision (the
-boot-revive scope above). The prototype walkthrough (`doc/demo/project-tabs.md`)
-is retired into this note plus the README user section.
+boot-revive scope above). The prototype's separate demo walkthrough has been
+retired — its content now lives in this note plus the README user section
+([Project tabs](../../README.md#project-tabs)).
+
+## Interaction with maximize (#155)
+
+A background (orchestrator-driven) spawn preserves a maximized pane rather than
+collapsing the human's fullscreen view (#155): `openPane` keeps `.has-maximized`
+and re-lifts the maximized element after growing the split tree. This composes
+with tabs because it is **already per-workspace**: the CSS selector is
+`.grid-root.has-maximized > :not(.maximized)` (a class on *each* workspace's grid
+root, not a single `#grid-root` id), and the re-lift is `this.rootEl.appendChild`
+where `this.rootEl` is the grid's own per-tab root. So a spawn into a **hidden**
+tab that has a maximized pane keeps that tab fullscreen (revealed on switch-back),
+its new pane lands in the hidden, zero-width subtree (no fit → no PTY resize —
+the invariant holds), and its WebGL context is withheld by the hidden-tab GL
+policy above — all three properties independent and intact. The pure decision
+(`shouldPreserveMaximize`) is unit-tested in `test/panefocus.test.ts`; the
+per-workspace DOM wiring is validated by hand (no single-root global to make
+tab-aware — it never was one).

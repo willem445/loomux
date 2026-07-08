@@ -183,7 +183,7 @@ export class Grid {
     // exitMaximize and insertBeside → renderSplit do replaceChildren(), which
     // detaches the focused pane's subtree (the steering strip or a terminal) and
     // re-appends it, implicitly blurring it to <body> so keystrokes go nowhere
-    // (#117 ; same DOM-detach class as #113). We hand it back after,
+    // (#117; same DOM-detach class as #113). We hand it back after,
     // unless the new pane is meant to take focus (see restoreFocus/takeFocus).
     const prior = captureFocus();
     // A background (orchestrator-driven) spawn must not collapse the human's

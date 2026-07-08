@@ -218,29 +218,27 @@ test("onChange fires on add / switch / rename / close and unsubscribes", () => {
   assert.equal(n, 5, "no more notifications after unsubscribe");
 });
 
-// ---- phase-3 routing seams (worker B wires the tab-aware router) ----
+// ---- group→tab routing (the live orchestration router seam) ----
+// There is deliberately no pty→tab map on TabManager: focus/exit/rename scan
+// live panes via findPaneByPty (tabroute.test.ts) so a pane close can't leave a
+// stale route. Only the group binding — which is stable per tab — lives here.
 
-test("routing: group and pty bind to a workspace and resolve back", () => {
+test("routing: a group binds to a workspace and resolves back", () => {
   const { tabs } = makeManager();
   const a = tabs.newTab();
   const b = tabs.newTab();
   tabs.bindGroup("grp-1", a.id);
-  tabs.bindPty(42, a.id);
   assert.equal(tabs.workspaceForGroup("grp-1")?.id, a.id);
-  assert.equal(tabs.workspaceForPty(42)?.id, a.id);
+  assert.equal(tabs.groupForWorkspace(a.id), "grp-1", "inverse lookup");
   assert.equal(tabs.workspaceForGroup("nope"), undefined);
-  assert.equal(tabs.workspaceForPty(999), undefined);
-  // b has no bindings.
-  assert.equal(tabs.workspaceForGroup("grp-1")?.id !== b.id, true);
+  assert.equal(tabs.groupForWorkspace(b.id), null, "an unbound tab owns no group");
 });
 
-test("routing: closing a tab forgets its group/pty bindings", () => {
+test("routing: closing a tab forgets its group binding", () => {
   const { tabs } = makeManager();
   const a = tabs.newTab();
   tabs.newTab(); // keep a second tab so a can be closed (never zero tabs)
   tabs.bindGroup("grp-1", a.id);
-  tabs.bindPty(42, a.id);
   assert.equal(tabs.closeTab(a.id), true);
   assert.equal(tabs.workspaceForGroup("grp-1"), undefined, "stale group route dropped");
-  assert.equal(tabs.workspaceForPty(42), undefined, "stale pty route dropped");
 });

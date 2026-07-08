@@ -32,7 +32,7 @@ import {
   type OrchestratorConfig,
   type AttentionItem,
 } from "./orchestration";
-import { tabAttention, sameAttention } from "./tabroute";
+import { tabAttention, sameAttention, findPaneByPty } from "./tabroute";
 import { encodeTabs, decodeTabs } from "./tabstore";
 
 // Surface unexpected errors as a visible banner instead of a silently
@@ -70,12 +70,22 @@ const tabBarEl = document.getElementById("tab-bar")!;
 // module-scope single `grid` is gone; everything acts on the ACTIVE tab's grid.
 const tabs = new TabManager<Workspace>((id) => {
   const ws = new Workspace(id, (w) => {
-    // Last pane in this tab closed → keep the tab's grid non-empty.
-    void openPaneIn(w);
+    // Last pane in this tab closed (a human ✕, or a background agent exiting) →
+    // keep the tab's grid non-empty with a SILENT plain shell. This is a
+    // lifecycle refill, not a human "new pane" action, so it must never open the
+    // launcher modal — which, for a hidden/background tab, would pop over the
+    // ACTIVE tab (MED-1). The launcher only ever appears from an explicit human
+    // action in the active tab (openUserTab / a split). One rule for every empty
+    // tab: a plain shell (see the boot fill and the design note).
+    void openShellIn(w);
   });
   stackEl.appendChild(ws.el);
   return ws;
 });
+
+/** The tab strip, assigned once boot mounts it. Held so the keyboard
+ *  Ctrl+Shift+K routes through the same two-step close-confirm the ✕ uses. */
+let tabBar: TabBar<Workspace> | null = null;
 
 /** The active tab's grid — the single-grid `grid` of the pre-tabs app. */
 const activeGrid = (): Grid => tabs.activeWorkspace.grid;
@@ -100,14 +110,12 @@ function eventsFor(ws: Workspace): PaneEvents {
   };
 }
 
-/** Find a pane by pty id across ALL tabs — a PTY exit can belong to any tab,
- *  not just the active one. */
+/** Find a pane by pty id across ALL tabs — a PTY exit / focus / rename can
+ *  belong to any tab, not just the active one. Scans live panes (never a
+ *  maintained side-map, which a pane close would leave stale); the pure core is
+ *  `findPaneByPty` (tabroute.ts), unit-tested. */
 function findPaneAcrossTabs(ptyId: number): { ws: Workspace; pane: Pane } | null {
-  for (const ws of tabs.tabs) {
-    const pane = ws.grid.findByPtyId(ptyId);
-    if (pane) return { ws, pane };
-  }
-  return null;
+  return findPaneByPty(tabs.tabs, (ws) => ws.grid, ptyId);
 }
 
 // ---------- project tabs: orchestration routing (#63) ----------
@@ -138,9 +146,8 @@ function projectName(path: string): string {
 async function launchOrchestratorTab(config: OrchestratorConfig): Promise<void> {
   const ws = tabs.newTab();
   tabs.renameTab(ws.id, projectName(config.repo));
-  const { groupId, pane } = await launchOrchestrator(ws.grid, eventsFor(ws), config);
+  const { groupId } = await launchOrchestrator(ws.grid, eventsFor(ws), config);
   tabs.bindGroup(groupId, ws.id);
-  if (pane?.ptyId != null) tabs.bindPty(pane.ptyId, ws.id);
   persistTabs();
 }
 
@@ -180,10 +187,6 @@ const orchWiring: OrchWiring = {
       persistTabs();
     }
     return { grid: ws.grid, paneEvents: eventsFor(ws) };
-  },
-  bindPty(groupId, ptyId): void {
-    const ws = tabs.workspaceForGroup(groupId);
-    if (ws) tabs.bindPty(ptyId, ws.id);
   },
   findByPty(ptyId): Pane | undefined {
     return findPaneAcrossTabs(ptyId)?.pane;
@@ -394,11 +397,11 @@ async function restoreSession(s: SessionInfo): Promise<void> {
         group: orchRole.group_id,
         role: orchRole.role,
       });
-      // Bind the restored group + pane to this tab so its rejoined workers and
-      // focus/attention route here (#63); idempotent when the tab already owned it.
+      // Bind the restored group to this tab so its rejoined workers spawn here
+      // and focus/attention resolve here (#63); idempotent when the tab already
+      // owned it. Pane lookups scan live panes, so there's no per-pty binding.
       if (restored) {
         tabs.bindGroup(restored.groupId, ws.id);
-        if (restored.pane?.ptyId != null) tabs.bindPty(restored.pane.ptyId, ws.id);
         persistTabs();
       }
     } catch (err) {
@@ -464,7 +467,9 @@ document.addEventListener(
         void openUserTab();
         break;
       case "close-tab":
-        tabs.closeTab(tabs.activeTabId!);
+        // Route through the strip's two-step confirm (destructive if the tab
+        // owns a group), same as clicking its ✕ (LOW-1).
+        if (tabs.activeTabId) tabBar?.requestClose(tabs.activeTabId);
         break;
       case "next-tab":
         tabs.nextTab();
@@ -594,14 +599,21 @@ void (async () => {
   if (!didRestore) tabs.newTab();
   tabs.onChange(persistTabs);
   // The "+" button opens a real starting surface, same as the shortcut.
-  new TabBar(tabBarEl, tabs, () => void openUserTab());
+  tabBar = new TabBar(tabBarEl, tabs, () => void openUserTab());
 
   await ensureOutputRouter();
-  // Fill any restored background tab that came back empty with a plain shell so
-  // it isn't blank (live agent panes don't auto-revive — see restoreTabs).
-  for (const ws of tabs.tabs) {
-    if (ws.id !== tabs.activeTabId && ws.grid.paneCount === 0) await openShellIn(ws);
+  // Empty-tab fill — ONE rule (see the design note, and the factory onEmpty):
+  // an empty tab holds a SILENT plain shell, never the launcher modal, EXCEPT
+  // the genuine fresh start where the app opens its first pane and the human
+  // picks via the launcher. So a RESTORED session (any tab, active or
+  // background — including a group-bound one, whose shell is a placeholder until
+  // its group's session is restored into it) fills silently; only the brand-new
+  // default tab opens the launcher.
+  if (didRestore) {
+    for (const ws of tabs.tabs) {
+      if (ws.grid.paneCount === 0) await openShellIn(ws);
+    }
+  } else if (tabs.activeWorkspace.grid.paneCount === 0) {
+    await openPane();
   }
-  // The active tab opens per the current mode (launcher in agent mode), as before.
-  if (tabs.activeWorkspace.grid.paneCount === 0) await openPane();
 })();

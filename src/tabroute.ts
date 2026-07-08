@@ -150,16 +150,30 @@ export class PreviewBudget {
   }
 }
 
-/** Where an orch-focus for `ptyId` should move the active tab. Returns the
- *  workspace id to switch to, or null when the pty is already in the active tab
- *  (focus the pane in place) or is unknown to the router (caller falls back to
- *  a cross-tab search). Focus must switch the TAB first, then the pane. */
-export function revealPlan(
-  ptyToWs: Map<number, string>,
-  activeWsId: string | null,
+// ---------- cross-tab pane lookup (the live focus / exit / rename path) ----------
+
+/** Minimal grid surface for locating a pane by pty — the real Grid satisfies it. */
+export interface PtyLookupGrid<P> {
+  findByPtyId(ptyId: number): P | undefined;
+}
+
+/** Find the first workspace whose grid currently holds `ptyId`, scanning the
+ *  workspaces' LIVE panes in order. This is deliberately a scan over current
+ *  state, not a lookup in a maintained pty→tab side-map: a pane close would
+ *  leave such a map stale (nothing removes per-pty entries on individual pane
+ *  close), whereas `findByPtyId` always reflects the panes that actually exist.
+ *  The scan is O(panes) and only runs on rare orch-focus / rename / pty-exit
+ *  events. Pure over the minimal grid surface so the cross-tab routing that
+ *  ACTUALLY runs (main.ts `findPaneAcrossTabs`) is unit-tested. Returns the
+ *  owning workspace + pane, or null when no open pane has that pty. */
+export function findPaneByPty<W, P>(
+  workspaces: readonly W[],
+  gridOf: (ws: W) => PtyLookupGrid<P>,
   ptyId: number
-): { switchTo: string | null; known: boolean } {
-  const wsId = ptyToWs.get(ptyId);
-  if (!wsId) return { switchTo: null, known: false };
-  return { switchTo: wsId === activeWsId ? null : wsId, known: true };
+): { ws: W; pane: P } | null {
+  for (const ws of workspaces) {
+    const pane = gridOf(ws).findByPtyId(ptyId);
+    if (pane) return { ws, pane };
+  }
+  return null;
 }

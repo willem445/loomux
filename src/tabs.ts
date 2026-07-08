@@ -53,12 +53,13 @@ export class TabManager<T extends ManagedWorkspace> {
   private seq = 0;
   private listeners = new Set<TabsListener>();
 
-  // Orchestration routing maps: spawn/focus/attention/group-ended events resolve
-  // their target tab through these. The tab-aware router (main.ts's OrchWiring,
-  // fed by orchestration.ts's backend listeners) populates and reads them;
-  // they're maintained here so add/remove keep them consistent in one place.
+  // Group→tab routing: spawn / focus / group-ended events resolve their target
+  // tab through this. The router (main.ts's OrchWiring, fed by orchestration.ts's
+  // backend listeners) populates and reads it; maintained here so add/close keep
+  // it consistent in one place. (There is deliberately no pty→tab side-map: the
+  // focus/exit/rename paths scan live panes via findPaneByPty, which can't go
+  // stale on a pane close the way a maintained map would — see tabroute.ts.)
   private groupToWs = new Map<string, string>();
-  private ptyToWs = new Map<number, string>();
   /** Per-tab attention badge state, refreshed from the backend attention scan by
    *  the router; read by the tab bar. Absent = no attention. */
   private attn = new Map<string, TabAttn>();
@@ -186,27 +187,14 @@ export class TabManager<T extends ManagedWorkspace> {
   bindGroup(groupId: string, workspaceId: string): void {
     this.groupToWs.set(groupId, workspaceId);
   }
-  /** Bind a pty to its owning tab (derived from its group) so focus/attention
-   *  for that pty resolve to the right tab. */
-  bindPty(ptyId: number, workspaceId: string): void {
-    this.ptyToWs.set(ptyId, workspaceId);
-  }
   workspaceForGroup(groupId: string): T | undefined {
     const id = this.groupToWs.get(groupId);
-    return id ? this.get(id) : undefined;
-  }
-  workspaceForPty(ptyId: number): T | undefined {
-    const id = this.ptyToWs.get(ptyId);
     return id ? this.get(id) : undefined;
   }
   /** The group a tab owns (inverse of bindGroup), or null for a plain tab. */
   groupForWorkspace(workspaceId: string): string | null {
     for (const [g, wid] of this.groupToWs) if (wid === workspaceId) return g;
     return null;
-  }
-  /** Read-only view of the pty→tab routing, for the attention/focus routers. */
-  get ptyRoutes(): ReadonlyMap<number, string> {
-    return this.ptyToWs;
   }
 
   // ---------- per-tab attention ----------
@@ -270,7 +258,6 @@ export class TabManager<T extends ManagedWorkspace> {
 
   private forgetRoutes(workspaceId: string): void {
     for (const [g, wid] of this.groupToWs) if (wid === workspaceId) this.groupToWs.delete(g);
-    for (const [p, wid] of this.ptyToWs) if (wid === workspaceId) this.ptyToWs.delete(p);
     this.attn.delete(workspaceId);
   }
 

@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import {
   tabAttention,
   sameAttention,
-  revealPlan,
+  findPaneByPty,
   safeStyleDeclarations,
   SAFE_STYLE_PROPS,
   PreviewBudget,
@@ -95,17 +95,37 @@ test("sameAttention detects equal and changed sets (skips needless re-renders)",
   assert.equal(sameAttention(a, d), false, "size change is a change");
 });
 
-test("revealPlan: a pty in a hidden tab switches tabs; in the active tab it doesn't", () => {
-  const map = ptyMap([
-    [5, "ws-a"],
-    [6, "ws-b"],
-  ]);
-  // pty 6 is in ws-b while ws-a is active → switch to ws-b, then focus.
-  assert.deepEqual(revealPlan(map, "ws-a", 6), { switchTo: "ws-b", known: true });
-  // pty 5 is already in the active tab → no tab switch, just focus in place.
-  assert.deepEqual(revealPlan(map, "ws-a", 5), { switchTo: null, known: true });
-  // unknown pty → caller falls back to a cross-tab search.
-  assert.deepEqual(revealPlan(map, "ws-a", 999), { switchTo: null, known: false });
+// findPaneByPty is the core of the LIVE cross-tab lookup main.ts uses for
+// orch-focus / pty-exit / rename (findPaneAcrossTabs). Fakes stand in for the
+// Grid (findByPtyId) and the Workspace, exactly as production wires them.
+test("findPaneByPty locates the workspace + pane owning a pty, scanning in order", () => {
+  const paneA1 = { pty: 5 };
+  const paneB1 = { pty: 6 };
+  const gridOf = (ws: { panes: { pty: number }[] }) => ({
+    findByPtyId: (id: number) => ws.panes.find((p) => p.pty === id),
+  });
+  const wsA = { id: "ws-a", panes: [paneA1] };
+  const wsB = { id: "ws-b", panes: [paneB1] };
+  const tabs = [wsA, wsB];
+
+  // pty 6 lives in the (possibly hidden) second tab → returns ws-b + its pane.
+  assert.deepEqual(findPaneByPty(tabs, gridOf, 6), { ws: wsB, pane: paneB1 });
+  // pty 5 in the first tab.
+  assert.deepEqual(findPaneByPty(tabs, gridOf, 5), { ws: wsA, pane: paneA1 });
+  // no open pane has pty 999 → null (caller no-ops). This is why the scan beats
+  // a maintained map: a closed pane simply isn't found, never a stale hit.
+  assert.equal(findPaneByPty(tabs, gridOf, 999), null);
+});
+
+test("findPaneByPty returns the FIRST match when two tabs report the same pty", () => {
+  // Defensive: pty ids shouldn't collide across tabs, but the scan is
+  // deterministic (display order) rather than surfacing an arbitrary one.
+  const gridOf = (ws: { has: number[] }) => ({
+    findByPtyId: (id: number) => (ws.has.includes(id) ? { pty: id, ws } : undefined),
+  });
+  const first = { id: "ws-a", has: [7] };
+  const second = { id: "ws-b", has: [7] };
+  assert.equal(findPaneByPty([first, second], gridOf, 7)?.ws, first);
 });
 
 // ---- preview HTML sanitizer (#63 finding 3): the security-critical rule ----

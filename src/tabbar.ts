@@ -48,6 +48,12 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
   private previewTimer: number | null = null;
   private previewWsId: string | null = null;
   private status = new Map<string, TabStatus>();
+  /** The tab whose close is armed for a two-step confirm (destructive close of a
+   *  group-owning tab), and its auto-disarm timer. Mirrors the group view's
+   *  "End orchestration" arm/confirm (groupview.ts) so ending a project's agents
+   *  takes a deliberate second action. */
+  private closeArmedId: string | null = null;
+  private closeArmTimer: number | null = null;
 
   private el: HTMLElement;
   private tabs: TabManager<T>;
@@ -90,6 +96,43 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
     if (wsId === this.previewWsId) return; // already previewing this tab; the timer keeps it live
     const ws = this.tabs.get(wsId);
     if (ws && tabEl) this.openPreview(ws, tabEl);
+  }
+
+  /** Close a tab, requiring a two-step confirm when the close is destructive —
+   *  the tab owns an orchestration group, so closing it KILLS that project's
+   *  live agents (unrecoverable, and it's what the human is really asking for
+   *  when they hit ✕ / Ctrl+Shift+K). A plain-terminal tab closes immediately:
+   *  its panes are ordinary shells, on par with close-pane (itself unconfirmed),
+   *  so a confirm there would be heavier than closing the same panes directly.
+   *  Both the ✕ button and Ctrl+Shift+K route here (main.ts). */
+  requestClose(id: string): void {
+    const ws = this.tabs.get(id);
+    if (!ws || this.tabs.count <= 1) return; // never-zero-tabs floor
+    if (!this.tabs.groupForWorkspace(id)) {
+      this.tabs.closeTab(id); // non-destructive — no confirm
+      return;
+    }
+    if (this.closeArmedId === id) {
+      this.disarmClose();
+      this.tabs.closeTab(id); // second action within the window — do it
+      return;
+    }
+    // Arm this tab; a 4s window (matching groupview's End) then auto-disarms.
+    this.disarmClose();
+    this.closeArmedId = id;
+    this.closeArmTimer = window.setTimeout(() => {
+      this.closeArmedId = null;
+      this.render();
+    }, 4000);
+    this.render();
+  }
+
+  private disarmClose(): void {
+    if (this.closeArmTimer !== null) {
+      clearTimeout(this.closeArmTimer);
+      this.closeArmTimer = null;
+    }
+    this.closeArmedId = null;
   }
 
   private render(): void {
@@ -165,12 +208,19 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
 
       const close = document.createElement("button");
       close.className = "tab-close";
-      close.textContent = "✕";
-      close.title = "Close tab (Ctrl+Shift+K)";
+      const armed = this.closeArmedId === ws.id;
+      const ownsGroup = !!this.tabs.groupForWorkspace(ws.id);
+      close.classList.toggle("confirm", armed);
+      close.textContent = armed ? "✕?" : "✕";
+      close.title = armed
+        ? `Click again to close "${ws.name}" and end its agents`
+        : ownsGroup
+          ? "Close tab — ends this project's agents (confirm, Ctrl+Shift+K)"
+          : "Close tab (Ctrl+Shift+K)";
       close.hidden = this.tabs.count <= 1; // never zero tabs
       close.addEventListener("click", (e) => {
         e.stopPropagation();
-        this.tabs.closeTab(ws.id);
+        this.requestClose(ws.id);
       });
       tab.appendChild(close);
 
@@ -348,8 +398,8 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
       close.className = "tab-menu-item danger";
       close.textContent = "Close tab";
       close.addEventListener("click", () => {
-        this.tabs.closeTab(ws.id);
         this.closeMenu();
+        this.requestClose(ws.id); // same confirm as the ✕ / shortcut
       });
       menu.appendChild(close);
     }

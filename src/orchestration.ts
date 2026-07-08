@@ -129,7 +129,7 @@ async function openAgentPane(
   // from the pane the human is typing in (#117). Human-initiated paths (session
   // restore, launching an orchestrator) pass false to focus the new pane.
   background: boolean
-): Promise<Pane | null> {
+): Promise<void> {
   const pane = await grid.openPane(
     {
       name: req.name,
@@ -147,12 +147,12 @@ async function openAgentPane(
   );
   try {
     // A failed spawn (ptyId null) has no pty to bind; it times out backend-side.
-    if (pane.ptyId === null) return null;
+    if (pane.ptyId === null) return;
     // A cancel that landed while the pane was opening (#106): the backend bind
     // already timed out and cleaned up, so don't bind — discard the fresh pane.
     if (cancelledSpawns.has(req.agent_id)) {
       discardStalePane(grid, pane);
-      return null;
+      return;
     }
     // Report the pty so the backend can unblock the spawner and type the kickoff.
     try {
@@ -164,9 +164,7 @@ async function openAgentPane(
       // (its CLI booted against a deleted config), so close it with a brief
       // notice. Belt-and-braces behind the deadline drop and the cancel event.
       discardStalePane(grid, pane);
-      return null;
     }
-    return pane;
   } finally {
     // Whichever path we took, this request is now resolved — clear any cancel
     // note so `cancelledSpawns` can't accumulate stale ids across a run, even
@@ -191,9 +189,6 @@ export interface OrchWiring {
   /** Grid+events a group's spawns open into. Creates and binds a project tab on
    *  first sight of the group (named from the spawn request / repo). */
   targetForGroup(req: OrchSpawnRequest): OrchTarget;
-  /** Associate a just-opened pane's pty with its group's tab, so focus and
-   *  attention can route to it. No-op if the group has no tab. */
-  bindPty(groupId: string, ptyId: number): void;
   /** Locate a pane by pty across ALL tabs (rename, cancel sweep). */
   findByPty(ptyId: number): Pane | undefined;
   /** Every grid across every tab (spawn-cancel sweep, group-ended close). */
@@ -220,13 +215,12 @@ export function initOrchestration(wiring: OrchWiring): void {
       );
       return;
     }
-    // Route the spawn to the group's own tab (creating one on first sight), then
-    // bind its pty to that tab so focus/attention can find it. Background open so
-    // it doesn't steal focus from where the human is typing (#117).
+    // Route the spawn to the group's own tab (creating one on first sight).
+    // Background open so it doesn't steal focus from where the human is typing
+    // (#117). Focus/attention/rename later locate this pane by scanning live
+    // panes across tabs (findByPty), so there's no per-pty binding to maintain.
     const { grid, paneEvents } = wiring.targetForGroup(payload);
-    void openAgentPane(grid, paneEvents, payload, true).then((pane) => {
-      if (pane?.ptyId != null) wiring.bindPty(payload.group_id, pane.ptyId);
-    });
+    void openAgentPane(grid, paneEvents, payload, true);
   });
   // The backend's bind wait for a spawn timed out (#106): it cleaned up the
   // minted config and pending bind. Remember the agent so an in-flight
@@ -302,7 +296,7 @@ export async function resumeOrchSession(
   paneEvents: PaneEvents,
   sessionId: string,
   hint?: { group: string; role: string }
-): Promise<{ groupId: string; pane: Pane | null } | null> {
+): Promise<{ groupId: string } | null> {
   const spec = await invoke<OrchSpawnRequest | null>("resume_orch_session", {
     sessionId,
     groupHint: hint?.group ?? null,
@@ -310,9 +304,10 @@ export async function resumeOrchSession(
   });
   if (!spec) return null;
   // Human clicked a recorded session in the browser — focus the restored pane.
-  // Return the group + pane so the caller can bind the tab routing (#63 ph3).
-  const pane = await openAgentPane(grid, paneEvents, spec, false);
-  return { groupId: spec.group_id, pane };
+  // Return the group so the caller can bind it to the tab (#63); the pane itself
+  // is located later by scanning live panes (findByPty), so it isn't returned.
+  await openAgentPane(grid, paneEvents, spec, false);
+  return { groupId: spec.group_id };
 }
 
 /** Create/resume the group for `config.repo` and open its orchestrator
@@ -322,7 +317,7 @@ export async function launchOrchestrator(
   grid: Grid,
   paneEvents: PaneEvents,
   config: OrchestratorConfig
-): Promise<{ groupId: string; pane: Pane | null }> {
+): Promise<{ groupId: string }> {
   const spec = await invoke<OrchSpawnRequest>("create_orchestration", {
     repo: config.repo,
     agentCli: config.agentCli,
@@ -342,9 +337,10 @@ export async function launchOrchestrator(
     watchdogStallMinutes: config.watchdogStallMinutes,
   });
   // Human launched the orchestrator from the UI — focus its pane. Return the
-  // group + pane so the caller binds the tab routing (#63).
-  const pane = await openAgentPane(grid, paneEvents, spec, false);
-  return { groupId: spec.group_id, pane };
+  // group so the caller binds it to the tab (#63); the pane is located later by
+  // scanning live panes (findByPty), so it isn't returned.
+  await openAgentPane(grid, paneEvents, spec, false);
+  return { groupId: spec.group_id };
 }
 
 // ---------- cost containment: pause/resume + per-group usage ----------
