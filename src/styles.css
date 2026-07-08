@@ -182,7 +182,8 @@ html, body {
 
 /* Live hover thumbnail (#63 findings 2/3): a composite of the whole tab — every
    pane serialized (color + spacing preserved) and arranged like the split tree,
-   each pane's content scaled to fit its cell (TabBar.scaleMiniPane). */
+   all panes at one shared median scale (TabBar.scaleComposite / compositeScale)
+   so text size is consistent; oversized outliers crop to their cell. */
 .tab-preview {
   position: fixed; z-index: 85; overflow: hidden; padding: 8px;
   border-radius: 8px; background: #0a0a0e; border: 1px solid var(--border);
