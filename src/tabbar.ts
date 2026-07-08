@@ -8,6 +8,7 @@
 // interactions into TabManager / backend calls, re-rendering on onChange.
 
 import type { TabManager, ManagedWorkspace } from "./tabs";
+import type { PreviewNode } from "./tabroute";
 import { makeRenameCommit } from "./panerename";
 import { swapEditor } from "./domutil";
 import { attentionPresentation } from "./attention";
@@ -24,19 +25,19 @@ interface TabStatus {
   paused: boolean;
 }
 
-/** Strip ANSI/CSI escapes so a serialized viewport renders as plain text in the
- *  hover thumbnail (a real mini-terminal would be far heavier for a prototype). */
-function stripAnsi(s: string): string {
-  return (
-    s
-      // CSI sequences (colors, cursor moves): ESC [ … final byte.
-      .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "")
-      // OSC sequences (window title, etc.): ESC ] … BEL or ST.
-      .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "")
-      // Any other lone two-char escape.
-      .replace(/\x1b[@-Z\\-_]/g, "")
-  );
-}
+// CSS properties the serialized-viewport spans are allowed to carry. The
+// @xterm/addon-serialize HTML output does NOT escape cell text and emits inline
+// styles, so we rebuild it safely (finding 3): text via textContent, and only
+// these style props with sanitized values — never innerHTML.
+const SAFE_STYLE_PROPS = new Set([
+  "color",
+  "background-color",
+  "font-weight",
+  "font-style",
+  "text-decoration",
+  "opacity",
+  "visibility",
+]);
 
 export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
   /** The id currently being renamed, so a re-render doesn't clobber the open
@@ -46,6 +47,7 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
   private menu: HTMLElement | null = null;
   private preview: HTMLElement | null = null;
   private previewTimer: number | null = null;
+  private previewWsId: string | null = null;
   private status = new Map<string, TabStatus>();
 
   private el: HTMLElement;
@@ -62,7 +64,33 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
     // Poll bound groups for agent count / cost / paused (phase 4). Cheap; the
     // strip only re-renders when a value actually differs.
     window.setInterval(() => void this.pollStatus(), 4000);
+
+    // Preview lifecycle (#63 finding 3 — no stuck preview). These live on the
+    // stable strip element (not per-tab), so a re-render never orphans them and
+    // the popup dismisses reliably. Delegation drives open/switch by whichever
+    // non-active tab the pointer is over; anything else closes it.
+    this.el.addEventListener("mousemove", (e) => this.onStripHover(e));
+    this.el.addEventListener("mouseleave", () => this.closePreview()); // leaving the strip
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") this.closePreview();
+    });
+
     this.render();
+  }
+
+  /** Open/switch/close the hover preview from a pointer position over the strip. */
+  private onStripHover(e: MouseEvent): void {
+    const tabEl = (e.target as HTMLElement).closest<HTMLElement>(".tab");
+    const wsId = tabEl?.dataset.wsId ?? null;
+    // No tab under the pointer (gap / the + button), or the ACTIVE tab (it's
+    // right there) → close. A different non-active tab → (re)open for it.
+    if (!wsId || wsId === this.tabs.activeTabId) {
+      this.closePreview();
+      return;
+    }
+    if (wsId === this.previewWsId) return; // already previewing this tab; the timer keeps it live
+    const ws = this.tabs.get(wsId);
+    if (ws && tabEl) this.openPreview(ws, tabEl);
   }
 
   private render(): void {
@@ -147,17 +175,18 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
       });
       tab.appendChild(close);
 
-      tab.addEventListener("click", () => this.tabs.switchTo(ws.id));
+      tab.addEventListener("click", () => {
+        // Activating a tab must dismiss the preview immediately — else it lingers
+        // over the now-active tab (#63 finding 3). Hover delegation handles the
+        // rest (the newly-active tab won't re-open a preview).
+        this.closePreview();
+        this.tabs.switchTo(ws.id);
+      });
       tab.addEventListener("contextmenu", (e) => {
         e.preventDefault();
+        this.closePreview();
         this.openMenu(ws, e.clientX, e.clientY);
       });
-      // Hover thumbnail of the tab's viewport (phase 4) — only useful for a
-      // background tab (the active one is right there).
-      if (!active) {
-        tab.addEventListener("mouseenter", () => this.openPreview(ws, tab));
-        tab.addEventListener("mouseleave", () => this.closePreview());
-      }
       this.el.appendChild(tab);
     }
 
@@ -236,6 +265,7 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
   /** A small color palette anchored under the swatch: the shared group colors
    *  plus a native custom picker and a "default" (clear) option. */
   private openPalette(wsId: string, anchor: HTMLElement): void {
+    this.closePreview();
     this.closePalette();
     const pop = document.createElement("div");
     pop.className = "tab-palette";
@@ -337,51 +367,144 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
     this.menu = null;
   }
 
-  /** Live hover thumbnail (#63 finding 2): the tab's FULL current viewport,
-   *  re-serialized on a short interval so a running prompt streams in. It's a
-   *  serialized text SNAPSHOT of the in-memory buffer — never a laid-out pane —
-   *  so it can't re-arm a hidden pane's fit / PTY resize. The whole viewport is
-   *  rendered and CSS-scaled to fit, so nothing is clipped. */
+  /** Live hover thumbnail (#63 findings 2/3): a composite of the tab's FULL
+   *  layout — every pane serialized (with color + correct spacing) and arranged
+   *  like its split tree — re-serialized every ~700ms so a running prompt streams
+   *  in. It's a serialized snapshot of the in-memory buffers, NEVER a laid-out
+   *  pane, so it can't re-arm a hidden pane's fit / PTY resize. */
   private openPreview(ws: ManagedWorkspace, anchor: HTMLElement): void {
     this.closePreview();
     const pop = document.createElement("div");
     pop.className = "tab-preview";
-    const scaler = document.createElement("div");
-    scaler.className = "tab-preview-scaler";
-    const pre = document.createElement("pre");
-    scaler.appendChild(pre);
-    pop.appendChild(scaler);
     document.body.appendChild(pop);
     this.preview = pop;
+    this.previewWsId = ws.id;
 
     const anchorRect = anchor.getBoundingClientRect();
     const paint = () => {
-      // Trim only trailing blank rows (an agent screen is mostly empty below its
-      // prompt) — keep the full viewport above intact.
-      const text = stripAnsi(ws.livePreview()).replace(/[ \t]+$/gm, "").replace(/\n+$/, "");
-      pre.textContent = text || "(no output yet)";
-      this.layoutPreview(pop, scaler, pre, anchorRect);
+      const layout = ws.previewLayout();
+      if (!layout) {
+        this.closePreview();
+        return;
+      }
+      // Fixed content box; each pane's content is scaled to fit its own cell.
+      const cw = Math.min(window.innerWidth * 0.92, 860);
+      const ch = Math.min(window.innerHeight * 0.72, 540);
+      const root = this.buildPreviewNode(layout);
+      root.style.width = `${cw}px`;
+      root.style.height = `${ch}px`;
+      pop.replaceChildren(root);
+      // Scale each mini-pane's content into its cell now that the tree is laid out.
+      for (const pane of Array.from(pop.querySelectorAll<HTMLElement>(".mini-pane"))) {
+        this.scaleMiniPane(pane);
+      }
+      this.positionPreview(pop, anchorRect, cw + 16, ch + 16);
     };
     paint();
-    // Re-serialize while hovered → effectively live.
     this.previewTimer = window.setInterval(paint, 700);
   }
 
-  /** Size the popup to the full viewport scaled to fit the screen, and clamp it
-   *  into view (flip above the tab if it would run off the bottom). */
-  private layoutPreview(pop: HTMLElement, scaler: HTMLElement, pre: HTMLElement, anchor: DOMRect): void {
+  /** Build the preview composite: nested flex boxes mirroring the split tree,
+   *  each leaf a titled mini-pane holding the safely-rebuilt serialized viewport. */
+  private buildPreviewNode(node: PreviewNode): HTMLElement {
+    if (node.kind === "split") {
+      const box = document.createElement("div");
+      box.className = `mini-split ${node.dir}`;
+      for (const child of node.children) {
+        const el = this.buildPreviewNode(child);
+        el.style.flex = `${child.weight} 1 0`;
+        box.appendChild(el);
+      }
+      return box;
+    }
+    const leaf = document.createElement("div");
+    leaf.className = "mini-pane";
+    const title = document.createElement("div");
+    title.className = "mini-pane-title";
+    title.textContent = node.title;
+    const body = document.createElement("div");
+    body.className = "mini-pane-body";
+    const scaler = document.createElement("div");
+    scaler.className = "mini-pane-scaler";
+    if (node.capped) {
+      const note = document.createElement("div");
+      note.className = "mini-pane-note";
+      note.textContent = "(preview capped)";
+      scaler.appendChild(note);
+    } else {
+      scaler.appendChild(this.renderSerializedHtml(node.html));
+    }
+    body.appendChild(scaler);
+    leaf.append(title, body);
+    return leaf;
+  }
+
+  /** Rebuild @xterm/addon-serialize HTML SAFELY (finding 3): parse it detached,
+   *  then re-emit each cell run as a <span> with textContent (auto-escaped) and
+   *  a whitelisted, value-sanitized inline style — never innerHTML of the raw
+   *  string, which the addon does not escape. */
+  private renderSerializedHtml(html: string): HTMLElement {
+    const term = document.createElement("div");
+    term.className = "mini-term";
+    let container: Element | null = null;
+    try {
+      const doc = new DOMParser().parseFromString(html, "text/html");
+      container = doc.querySelector("pre > div") ?? doc.querySelector("pre") ?? doc.body;
+    } catch {
+      container = null;
+    }
+    if (!container) return term;
+    for (const rowEl of Array.from(container.children)) {
+      const row = document.createElement("div");
+      row.className = "mini-term-row";
+      const spans = rowEl.querySelectorAll(":scope > span");
+      let any = false;
+      for (const span of Array.from(spans)) {
+        const text = span.textContent ?? "";
+        if (!text) continue;
+        const s = document.createElement("span");
+        s.textContent = text; // auto-escapes — no injection from raw cell chars
+        this.applySafeStyle(s, span.getAttribute("style"));
+        row.appendChild(s);
+        any = true;
+      }
+      if (!any) row.textContent = " "; // keep a blank row's height
+      term.appendChild(row);
+    }
+    return term;
+  }
+
+  /** Apply only whitelisted CSS props with sanitized values to a preview span. */
+  private applySafeStyle(el: HTMLElement, style: string | null): void {
+    if (!style) return;
+    for (const decl of style.split(";")) {
+      const idx = decl.indexOf(":");
+      if (idx < 0) continue;
+      const prop = decl.slice(0, idx).trim().toLowerCase();
+      const value = decl.slice(idx + 1).trim();
+      if (!SAFE_STYLE_PROPS.has(prop)) continue;
+      if (/[<>{}]|url\(|expression|javascript:/i.test(value)) continue;
+      el.style.setProperty(prop, value);
+    }
+  }
+
+  /** Scale a mini-pane's serialized content to fit its cell (never enlarge), so
+   *  each pane's whole viewport shows without clipping. */
+  private scaleMiniPane(pane: HTMLElement): void {
+    const body = pane.querySelector<HTMLElement>(".mini-pane-body");
+    const scaler = pane.querySelector<HTMLElement>(".mini-pane-scaler");
+    if (!body || !scaler) return;
     scaler.style.transform = "none";
-    const naturalW = Math.max(1, pre.scrollWidth);
-    const naturalH = Math.max(1, pre.scrollHeight);
-    const maxW = Math.min(window.innerWidth * 0.9, 760);
-    const maxH = window.innerHeight * 0.72;
-    const scale = Math.min(1, maxW / naturalW, maxH / naturalH);
+    const cw = body.clientWidth;
+    const ch = body.clientHeight;
+    const sw = Math.max(1, scaler.scrollWidth);
+    const sh = Math.max(1, scaler.scrollHeight);
+    const scale = Math.max(0.05, Math.min(1, cw / sw, ch / sh));
     scaler.style.transform = `scale(${scale})`;
-    // +padding to match .tab-preview-scaler's 8px/6px inset so nothing clips.
-    const w = Math.ceil(naturalW * scale) + 16;
-    const h = Math.ceil(naturalH * scale) + 12;
-    pop.style.width = `${w}px`;
-    pop.style.height = `${h}px`;
+  }
+
+  /** Place the popup below the tab, clamped into view (flip above if needed). */
+  private positionPreview(pop: HTMLElement, anchor: DOMRect, w: number, h: number): void {
     const left = Math.max(8, Math.min(Math.round(anchor.left), window.innerWidth - w - 8));
     let top = Math.round(anchor.bottom + 4);
     if (top + h > window.innerHeight - 8) top = Math.max(8, Math.round(anchor.top - h - 4));
@@ -396,6 +519,7 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
     }
     this.preview?.remove();
     this.preview = null;
+    this.previewWsId = null;
   }
 
   private anchorPopover(pop: HTMLElement, r: DOMRect): void {

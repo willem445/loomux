@@ -20,8 +20,8 @@ class FakeWorkspace implements ManagedWorkspace {
   constructor(id: string) {
     this.id = id;
   }
-  livePreview(): string {
-    return "";
+  previewLayout(): null {
+    return null;
   }
   setVisible(v: boolean): void {
     this.visible = v;

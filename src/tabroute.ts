@@ -10,6 +10,14 @@
 // header / dock chip still render via attentionPresentation verbatim (main.ts
 // applies pane.setAttention, which uses it). Keep the two in lockstep.
 
+/** A pure description of a tab's split layout for the preview composite (#63
+ *  finding 2): the split tree with each pane's serialized-HTML viewport at the
+ *  leaves. Built by Workspace (which serializes each pane) from Grid's
+ *  layoutSnapshot; rendered SAFELY by the tab bar (spans → textContent). */
+export type PreviewNode =
+  | { kind: "leaf"; weight: number; title: string; html: string; capped: boolean }
+  | { kind: "split"; dir: "row" | "column"; weight: number; children: PreviewNode[] };
+
 /** Whether an attention reason is urgent, mirroring attention.ts. */
 const isUrgentReason = (reason: string): boolean => reason === "blocked";
 
