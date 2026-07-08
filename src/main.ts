@@ -486,6 +486,9 @@ document.addEventListener(
       case "toggle-issues":
         activeGrid().activePane?.toggleIssuesView();
         break;
+      case "toggle-files":
+        activeGrid().activePane?.toggleFileEditView();
+        break;
       case "open-editor":
         void activeGrid().activePane?.openInEditor();
         break;

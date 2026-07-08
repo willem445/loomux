@@ -14,6 +14,7 @@ export type ShortcutAction =
   | "toggle-agent-mode"
   | "toggle-git"
   | "toggle-issues"
+  | "toggle-files"
   | "open-editor"
   | "toggle-tasks"
   | "toggle-audit"
@@ -57,6 +58,9 @@ export function matchShortcut(e: KeyboardEvent): ShortcutAction | null {
       // find-previous accelerator before the page ever sees it.
       case "KeyG": return "toggle-git";
       case "KeyI": return "toggle-issues";
+      // Alt+F (files). Free in loomux; not a WebView2 accelerator (Ctrl+F is —
+      // that's why the in-file find uses a button, not Ctrl+F). (#174)
+      case "KeyF": return "toggle-files";
       case "KeyE": return "open-editor";
       case "KeyT": return "toggle-tasks";
       case "KeyA": return "toggle-audit";
