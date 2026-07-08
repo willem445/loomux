@@ -30,10 +30,10 @@ import {
   type GroupUsage,
 } from "./orchestration";
 import {
+  approvalControl,
   autoMergeFromApproval,
   budgetMeter,
   formatTokens,
-  requireApprovalChecked,
   tickStatusLabel,
 } from "./autonomy";
 
@@ -701,9 +701,13 @@ export class GroupView {
       ? "Idle-ticking is live — the orchestrator polls labeled issues and re-checks PRs while you're away. Click to stop."
       : "Enable idle-ticking: loomux pokes the orchestrator to run its intake/monitoring cadence when the group goes quiet.";
 
-    // Merge gate: reflect unless the human is mid-click (change fires on commit,
-    // so no active-element guard is needed for a checkbox).
-    this.approvalChk.checked = requireApprovalChecked(a.auto_merge);
+    // Merge gate: reflect the backend flag AND the #83 dependency — auto-merge
+    // exists only in autonomous mode, so with autonomous off the control is locked
+    // to "approval required" (the enforced human gate) with an explanatory tooltip.
+    const approval = approvalControl(a.autonomous, a.auto_merge);
+    this.approvalChk.checked = approval.checked;
+    this.approvalChk.disabled = approval.disabled;
+    this.approvalChk.title = approval.tooltip;
 
     // Budget input: don't clobber while the human is editing it.
     if (document.activeElement !== this.budgetInput) {

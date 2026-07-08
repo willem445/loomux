@@ -136,6 +136,10 @@ export interface PaneOptions {
   /** Structured agent invocation for direct-CLI spawn (issue #78); the backend
    *  falls back to `command` (shell wrapper) when it can't apply. */
   argv?: string[];
+  /** Extra per-pane env (#83): agent panes carry the gh-shim PATH +
+   *  `LOOMUX_GROUP_DIR` here so the merge gate is enforced. Omitted for plain
+   *  shells. Wire form: `[key, value]` pairs (the backend's `Vec<(String,String)>`). */
+  env?: [string, string][];
   badge?: PaneBadge;
   /** Orchestration group this pane belongs to (enables the task board). */
   orchGroup?: string;
@@ -601,6 +605,7 @@ export class Pane implements VoiceTargetPane {
         cwd: opts.cwd,
         command: opts.command,
         argv: opts.argv,
+        env: opts.env,
       });
       if (this.disposed) {
         killPty(ptyId).catch(() => {});

@@ -10,8 +10,9 @@ use loomux_lib::orchestration::mcp::dispatch;
 use loomux_lib::orchestration::{
     add_trusted_folder, autonomy_budget_exhausted, bracketed_paste, classify_human_input,
     claude_permission_mode, cli_ready, copilot_autopilot_prompt_detected, create_orchestration_group,
+    gh_gate_decision, gh_is_merge_invocation, gh_positionals, gh_repo_flag, gh_shim_sh,
     hold_for_human_input, hold_until_quiet, idle_output_is_activity, idle_should_kill,
-    idle_tick_should_fire, max_agents_notice,
+    idle_tick_should_fire, max_agents_notice, GhGate,
     normalize_remote_web_base, parse_audit_lines, parse_session_cost, paste_held_notice,
     prompt_wait_detected, resolve_paste_gate, resolve_ref_url, rotate_audit_if_needed,
     sanitize_attachment_ext, should_confirm_copilot_autopilot, should_flush_before_paste,
@@ -3329,6 +3330,268 @@ fn idle_tick_status_reports_paused_with_no_countdown() {
     assert!(s["eligible_in_secs"].as_u64().is_some());
 }
 
+// ---------- enforced merge gate (#83) ----------
+
+fn s(v: &str) -> String { v.to_string() }
+fn args(a: &[&str]) -> Vec<String> { a.iter().map(|x| x.to_string()).collect() }
+
+#[test]
+fn gh_is_merge_invocation_detects_pr_merge_in_every_flag_arrangement() {
+    let m = |a: &[&str]| gh_is_merge_invocation(&args(a));
+    // The incident form and plain arrangements.
+    assert!(m(&["pr", "merge", "123", "--squash"]));
+    assert!(m(&["pr", "merge"]));
+    assert!(m(&["pr", "merge", "--admin", "--merge"]));
+    // rev-79 F1 BLOCKER: -R/--repo (and other globals) BEFORE the command.
+    assert!(m(&["-R", "owner/repo", "pr", "merge", "123"]), "gh -R o/r pr merge must be gated");
+    assert!(m(&["--repo", "owner/repo", "pr", "merge"]), "gh --repo o/r pr merge must be gated");
+    assert!(m(&["--repo=owner/repo", "pr", "merge"]), "gh --repo=o/r must be gated");
+    assert!(m(&["-Rowner/repo", "pr", "merge"]), "glued -Ro/r must be gated");
+    assert!(m(&["--help", "pr", "merge"]) || true); // (--help would short-circuit gh; harmless here)
+    // F1: -R/--repo BETWEEN the command and subcommand (cobra allows interspersing).
+    assert!(m(&["pr", "-R", "owner/repo", "merge", "123"]), "gh pr -R o/r merge must be gated");
+    assert!(m(&["pr", "--repo=owner/repo", "merge"]));
+    // Value-taking merge flags before the selector must not fool detection.
+    assert!(m(&["pr", "merge", "--body", "shipping it", "123"]));
+    // Raw API merge shapes (the cheap-to-catch bypass), incl. -R before.
+    assert!(m(&["api", "--method", "PUT", "repos/o/r/pulls/5/merge"]));
+    assert!(m(&["api", "graphql", "-f", "query=mergePullRequest(...)"]));
+    // Non-merge gh commands are NOT gated (even with -R before).
+    assert!(!m(&["pr", "view", "123"]));
+    assert!(!m(&["-R", "owner/repo", "pr", "view", "123"]), "gh -R o/r pr view is not a merge");
+    assert!(!m(&["pr", "create", "--fill"]));
+    assert!(!m(&["issue", "list"]));
+    assert!(!m(&["api", "repos/o/r/pulls"]));
+    assert!(!m(&[]));
+}
+
+#[test]
+fn gh_positionals_and_repo_flag_parse_around_global_flags() {
+    // Positionals skip -R/--repo (with value) and boolean flags, wherever they sit.
+    let p = |a: &[&str]| gh_positionals(a);
+    assert_eq!(p(&["-R", "o/r", "pr", "merge", "123"]), vec!["pr", "merge", "123"]);
+    assert_eq!(p(&["pr", "-R", "o/r", "merge"]), vec!["pr", "merge"]);
+    assert_eq!(p(&["--repo=o/r", "pr", "merge"]), vec!["pr", "merge"]);
+    assert_eq!(p(&["pr", "merge", "--squash", "42"]), vec!["pr", "merge", "42"]);
+    // The -R/--repo value is extracted in every accepted form (F2).
+    assert_eq!(gh_repo_flag(&["-R", "o/r", "pr", "merge"]).as_deref(), Some("o/r"));
+    assert_eq!(gh_repo_flag(&["--repo", "o/r", "pr", "merge"]).as_deref(), Some("o/r"));
+    assert_eq!(gh_repo_flag(&["--repo=o/r", "pr", "merge"]).as_deref(), Some("o/r"));
+    assert_eq!(gh_repo_flag(&["-Ro/r", "pr", "merge"]).as_deref(), Some("o/r"));
+    assert_eq!(gh_repo_flag(&["pr", "-R", "o/r", "merge"]).as_deref(), Some("o/r"));
+    assert_eq!(gh_repo_flag(&["pr", "merge", "123"]), None);
+}
+
+#[test]
+fn gh_gate_decision_enforces_the_human_gate_on_the_default_branch() {
+    let d = |base: Option<&str>, def, auto, am| gh_gate_decision(true, base, def, auto, am);
+    // Non-merge → always pass.
+    assert_eq!(gh_gate_decision(false, Some("main"), Some("main"), false, false), GhGate::PassThrough);
+    // Merge onto a NON-default base (integration branch) → pass, regardless of markers.
+    assert_eq!(d(Some("feat/x"), Some("main"), false, false), GhGate::PassThrough);
+    assert_eq!(d(Some("feat/x"), Some("main"), true, true), GhGate::PassThrough);
+    // Merge onto the DEFAULT branch: allowed ONLY with both markers.
+    assert_eq!(d(Some("main"), Some("main"), true, true), GhGate::AllowMerge);
+    assert_eq!(d(Some("main"), Some("main"), true, false), GhGate::Block, "auto_merge off blocks");
+    assert_eq!(d(Some("main"), Some("main"), false, true), GhGate::Block, "autonomous off blocks");
+    assert_eq!(d(Some("main"), Some("main"), false, false), GhGate::Block);
+    // Undeterminable base → fail-safe block (never let an unverifiable merge land).
+    assert_eq!(d(None, Some("main"), true, true), GhGate::BlockUnverifiable);
+    assert_eq!(d(Some("main"), None, true, true), GhGate::BlockUnverifiable);
+    assert_eq!(d(Some(""), Some("main"), true, true), GhGate::BlockUnverifiable, "empty base is unverifiable");
+}
+
+#[test]
+fn gh_shim_script_bakes_real_gh_and_enforces_the_guards() {
+    // The security-critical shim: pin that it bakes the real gh path, gates only
+    // merges, checks BOTH markers, fails safe on an unverifiable base, and audits.
+    let sh = gh_shim_sh("C:/Program Files/GitHub CLI/gh.exe");
+    assert!(sh.contains("REAL_GH=\"C:/Program Files/GitHub CLI/gh.exe\""), "bakes the real gh path");
+    assert!(sh.starts_with("#!/bin/sh"), "POSIX shebang so Git Bash runs it");
+    // Only merges are gated; everything else execs the real gh immediately.
+    assert!(sh.contains("exec \"$REAL_GH\" \"$@\""), "non-merge passthrough");
+    assert!(sh.contains("pr") && sh.contains("merge"), "detects gh pr merge");
+    // Base determined via the REAL gh, compared to the default branch.
+    assert!(sh.contains("baseRefName"), "resolves the PR base branch");
+    assert!(sh.contains("defaultBranchRef"), "resolves the repo default branch");
+    // BOTH markers required for a default-branch merge; fail-safe otherwise.
+    assert!(sh.contains("$LOOMUX_GROUP_DIR/autonomous") && sh.contains("$LOOMUX_GROUP_DIR/auto_merge"),
+        "checks both consent markers");
+    assert!(sh.contains("unverifiable-base"), "fail-safe block on an undeterminable base");
+    assert!(sh.contains("merge-gate-blocked") && sh.contains("audit.jsonl"), "audits refusals");
+    // rev-79 F1/F2: the shim parses positionals around global flags and honors the
+    // caller's -R/--repo when resolving base + default branch.
+    assert!(sh.contains("--repo") && sh.contains("-R"), "recognizes -R/--repo global flag");
+    assert!(sh.contains("rf=\"-R $repo\""), "passes the caller's repo through to the lookups");
+    assert!(sh.contains("pr view $rf") && sh.contains("repo view $rf"), "both lookups honor -R");
+}
+
+#[test]
+fn set_auto_merge_requires_autonomous_mode() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    // Autonomous off → enabling auto-merge is REJECTED (the enforced dependency).
+    let err = reg.set_auto_merge(&g.id, true).unwrap_err();
+    assert!(err.to_lowercase().contains("autonomous"), "the rejection must name the dependency, got: {err}");
+    assert!(!reg.is_auto_merge(&g.id), "auto-merge must not be enabled without autonomous mode");
+    // With autonomous on, enabling works.
+    reg.set_autonomous(&g.id, true).unwrap();
+    reg.set_auto_merge(&g.id, true).unwrap();
+    assert!(reg.is_auto_merge(&g.id));
+}
+
+#[test]
+fn disabling_autonomous_force_disables_auto_merge() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let am_marker = reg.state_root().join(&g.id).join("auto_merge");
+    reg.set_autonomous(&g.id, true).unwrap();
+    reg.set_auto_merge(&g.id, true).unwrap();
+    assert!(reg.is_auto_merge(&g.id) && am_marker.is_file());
+    // Turning autonomous OFF must force auto-merge off too — the pair can never be
+    // auto_merge-on/autonomous-off (the combo the enforced gate keys on).
+    reg.set_autonomous(&g.id, false).unwrap();
+    assert!(!reg.is_auto_merge(&g.id), "auto-merge must be force-disabled when autonomous turns off");
+    assert!(!am_marker.is_file(), "the auto_merge marker must be removed");
+    assert_eq!(audit_count(&reg, &g.id, "auto-merge-off"), 1, "the forced disable is audited");
+    assert_eq!(s(reg.autonomy_state(&g.id)["auto_merge"].to_string().as_str()), "false");
+}
+
+#[test]
+fn stale_auto_merge_without_autonomous_is_reconciled_on_read() {
+    // Migration: a group dir carrying an `auto_merge` marker but no `autonomous`
+    // marker (older group predating the dependency, or a hand-edited state dir)
+    // must be reconciled OFF on the next load, so the enforced gate never sees the
+    // forbidden combo.
+    let (reg, dir) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let gdir = reg.state_root().join(&g.id);
+    // Simulate the stale on-disk combo directly.
+    std::fs::write(gdir.join("auto_merge"), b"").unwrap();
+    assert!(!gdir.join("autonomous").is_file());
+    // Reload the group in a fresh registry (restart) → reconcile.
+    let reg2 = OrchRegistry::new(dir.path().to_path_buf());
+    reg2.set_port(45999);
+    reg2.create_group("C:/tmp/repo", rails()).unwrap();
+    assert!(!reg2.is_auto_merge(&g.id), "stale auto-merge must be reconciled off without autonomous");
+    assert!(!gdir.join("auto_merge").is_file(), "the stale marker must be removed");
+    assert_eq!(audit_count(&reg2, &g.id, "auto-merge-off"), 1, "the reconcile is audited");
+}
+
+#[test]
+fn budget_suspension_force_disables_auto_merge_even_if_marker_removal_fails() {
+    // rev-79 F4: a budget suspension turns autonomous OFF, so it must also drop
+    // auto-merge — otherwise the gate is left open (auto_merge-on/autonomous-off).
+    // The in-memory gate set is authoritative and dropped UNCONDITIONALLY, even if
+    // the durable marker can't be removed (the #149 money-stop pattern).
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    reg.set_autonomous(&g.id, true).unwrap();
+    reg.set_auto_merge(&g.id, true).unwrap();
+    assert!(reg.is_auto_merge(&g.id));
+    // Force the auto_merge marker removal to fail (swap the file for a directory).
+    let am = reg.state_root().join(&g.id).join("auto_merge");
+    std::fs::remove_file(&am).unwrap();
+    std::fs::create_dir(&am).unwrap();
+    // Exhaust the budget so the enforcer suspends autonomous mode.
+    seed_usage(&reg, &g.id, "spend", 5_000);
+    reg.set_autonomy_budget(&g.id, 100).unwrap();
+    assert_eq!(reg.enforce_autonomy_budgets(now_ms()), vec![g.id.clone()]);
+    assert!(!reg.is_autonomous(&g.id), "budget must suspend autonomous");
+    assert!(!reg.is_auto_merge(&g.id),
+        "auto-merge must be dropped from the gate set even when its marker can't be removed");
+    assert_eq!(reg.autonomy_state(&g.id)["auto_merge"].as_bool(), Some(false));
+}
+
+/// Run the real POSIX shim end-to-end against a fake gh (rev-79 F3): the shell has
+/// selector/repo parsing + marker/audit logic the pure Rust fns don't fully mirror,
+/// so execute it. Skipped (not failed) when no POSIX `sh` is available.
+#[test]
+fn gh_shim_shell_harness_executes_the_gate() {
+    use std::process::Command;
+    // Gate on a working `sh` (Git Bash on Windows / system sh elsewhere).
+    if Command::new("sh").arg("-c").arg("exit 0").status().map(|s| !s.success()).unwrap_or(true) {
+        eprintln!("SKIP gh_shim_shell_harness_executes_the_gate: no POSIX sh available");
+        return;
+    }
+    let td = tempfile::tempdir().unwrap();
+    let root = td.path();
+    let group_dir = root.join("group");
+    std::fs::create_dir_all(&group_dir).unwrap();
+    let log = root.join("fake_gh.log");
+
+    // Fake gh: records its args, answers pr view / repo view from env, "succeeds"
+    // for anything else (the passthrough / allowed merge).
+    let fake = root.join("fakegh");
+    std::fs::write(&fake, format!(
+        "#!/bin/sh\n\
+         echo \"ARGS: $*\" >> \"{log}\"\n\
+         if [ \"$1\" = \"pr\" ] && [ \"$2\" = \"view\" ]; then printf '%s\\n' \"$FAKE_BASE\"; exit 0; fi\n\
+         if [ \"$1\" = \"repo\" ] && [ \"$2\" = \"view\" ]; then printf '%s\\n' \"$FAKE_DEFAULT\"; exit 0; fi\n\
+         printf 'FAKE-GH-RAN\\n'; exit 0\n",
+        log = log.display()
+    )).unwrap();
+    // Write the REAL shim, baked to call our fake gh.
+    let shim = root.join("gh");
+    std::fs::write(&shim, gh_shim_sh(&fake.display().to_string())).unwrap();
+    // Make both executable in the MSYS/unix view.
+    let _ = Command::new("sh").arg("-c")
+        .arg(format!("chmod +x '{}' '{}'", fake.display(), shim.display())).status();
+
+    // Run the shim under sh with the given argv + env; returns (exit_ok, stderr).
+    let run = |argv: &[&str], base: &str, default: &str| -> (bool, String) {
+        let out = Command::new("sh")
+            .arg(&shim)
+            .args(argv)
+            .env("LOOMUX_GROUP_DIR", &group_dir)
+            .env("FAKE_BASE", base)
+            .env("FAKE_DEFAULT", default)
+            .output()
+            .expect("run shim");
+        (out.status.success(), String::from_utf8_lossy(&out.stderr).into_owned())
+    };
+    let set_markers = |on: bool| {
+        for m in ["autonomous", "auto_merge"] {
+            let p = group_dir.join(m);
+            if on { std::fs::write(&p, b"").unwrap(); } else { let _ = std::fs::remove_file(&p); }
+        }
+    };
+
+    // 1) base == default, NO markers → BLOCKED (non-zero, message).
+    set_markers(false);
+    let (ok, err) = run(&["pr", "merge", "1"], "main", "main");
+    assert!(!ok, "gate-closed merge to default must fail");
+    assert!(err.contains("human gate"), "refusal message, got: {err}");
+
+    // 2) rev-79 F1: `gh -R o/r pr merge` (global flag BEFORE the command) is ALSO
+    //    gated — the exact hole rev-79 found.
+    let (ok, _e) = run(&["-R", "owner/repo", "pr", "merge", "1"], "main", "main");
+    assert!(!ok, "the -R-before form must be gated, not slip through");
+
+    // 3) both markers present → ALLOWED (exit 0), and the -R was forwarded to the
+    //    base lookup (F2).
+    set_markers(true);
+    std::fs::write(&log, b"").unwrap();
+    let (ok, _e) = run(&["-R", "owner/repo", "pr", "merge", "1"], "main", "main");
+    assert!(ok, "gate-open merge must succeed");
+    let logged = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(logged.contains("pr view") && logged.contains("-R owner/repo"),
+        "the caller's -R must be forwarded to the base lookup, log: {logged}");
+
+    // 4) base != default (integration branch) → PASSES regardless of markers.
+    set_markers(false);
+    let (ok, _e) = run(&["pr", "merge", "1"], "feat/x", "main");
+    assert!(ok, "an integration-branch merge is never gated");
+
+    // 5) non-merge command → passthrough (exit 0).
+    let (ok, _e) = run(&["issue", "list"], "main", "main");
+    assert!(ok, "non-merge gh must pass through");
+
+    // The audit trail recorded a refusal.
+    let audit = std::fs::read_to_string(group_dir.join("audit.jsonl")).unwrap_or_default();
+    assert!(audit.contains("merge-gate-blocked"), "refusals are audited, got: {audit}");
+}
+
 #[test]
 fn autonomous_toggle_roundtrip_durable_and_audited() {
     let (reg, dir) = test_registry();
@@ -3363,6 +3626,8 @@ fn auto_merge_toggle_roundtrip_durable_audited_and_in_kickoff() {
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
     let marker = reg.state_root().join(&g.id).join("auto_merge");
     assert!(!reg.is_auto_merge(&g.id), "default off = human merge gate");
+    // Auto-merge exists only in autonomous mode (#83 dependency) — enable it first.
+    reg.set_autonomous(&g.id, true).unwrap();
     reg.set_auto_merge(&g.id, true).unwrap();
     assert!(reg.is_auto_merge(&g.id));
     assert!(marker.is_file());

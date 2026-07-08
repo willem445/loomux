@@ -70,6 +70,35 @@ export function autoMergeFromApproval(checked: boolean): boolean {
   return !checked;
 }
 
+/** How the "Require human approval before merge" checkbox renders, given the two
+ *  backend flags. Encodes the #83 **dependency**: auto-merge authority exists ONLY
+ *  in autonomous mode (the backend rejects enabling it otherwise, and force-clears
+ *  it when autonomous turns off), so with autonomous OFF the control is locked to
+ *  checked (= approval required = the enforced human gate) and disabled with an
+ *  explanatory tooltip. With autonomous ON it reflects `auto_merge` and is
+ *  editable. Pure so the disabled/tooltip logic is tested without a DOM. */
+export interface ApprovalControl {
+  /** "Require human approval" checkbox state (checked = auto_merge OFF). */
+  checked: boolean;
+  /** True when the control can't be changed (autonomous off → auto-merge forbidden). */
+  disabled: boolean;
+  /** Tooltip explaining the disabled state; "" when editable. */
+  tooltip: string;
+}
+
+/** The disabled tooltip — one place so the UI and its tests agree. */
+export const AUTO_MERGE_REQUIRES_AUTONOMOUS = "auto-merge requires Autonomous mode";
+
+export function approvalControl(autonomous: boolean, autoMerge: boolean): ApprovalControl {
+  if (!autonomous) {
+    // Auto-merge is impossible while autonomous is off, so approval is forced on
+    // and locked — never surface an editable "allow auto-merge" the backend would
+    // reject. Ignores any stale `autoMerge` (the backend reconciles it off too).
+    return { checked: true, disabled: true, tooltip: AUTO_MERGE_REQUIRES_AUTONOMOUS };
+  }
+  return { checked: requireApprovalChecked(autoMerge), disabled: false, tooltip: "" };
+}
+
 // ---------- budget meter math ----------
 
 /** A rendered view of autonomous-era spend against the token budget. */
