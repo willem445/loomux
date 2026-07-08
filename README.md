@@ -585,13 +585,17 @@ adequately-tested PR itself (reviewer-approved + green CI + acceptance met),
 still holding anything risky for you. Every toggle and merge is audited.
 
 The human merge gate is **enforced, not just advised**: loomux runs every agent
-pane's `gh` through an interceptor, so an agent trying to `gh pr merge` onto your
-repo's **default branch** is *blocked* (non-zero, audited) unless auto-merge is
-enabled — which is possible only while autonomous mode is on. Merges onto
-integration branches are never gated. Your own terminals are untouched. (A raw
-API call or absolute-path `gh` can still bypass the local shim; the authoritative
-layer is a machine account with no default-branch merge rights — the shim is the
-always-on first line.)
+pane's `gh`/`git` through an interceptor, so an agent trying to `gh pr merge` onto
+your repo's **default branch** is *blocked* (non-zero, audited) unless auto-merge
+is enabled (only while autonomous mode is on) **or you granted that one merge** —
+clicking **Approve** on a PR task issues a single-use, 30-minute grant for exactly
+that PR (with an optional note delivered to the orchestrator). **Releases publish
+to the world**, so `gh release …` and pushing a `v*` tag are blocked *even in
+autonomous mode* — they need their own explicit human grant. Merges onto
+integration branches are never gated; your own terminals are untouched. (A raw API
+call, absolute-path `gh`, or a hand-forged grant file can still bypass the local
+shim; the authoritative layer is a machine account with no default-branch merge or
+tag-push rights — the shim is the always-on first line.)
 
 You drive all three from the **lifecycle panel** (`Alt+O`), in its *Autonomous
 mode* section: an **Autonomous** on/off toggle (blunt about the trade-off —

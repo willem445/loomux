@@ -10,9 +10,10 @@ use loomux_lib::orchestration::mcp::dispatch;
 use loomux_lib::orchestration::{
     add_trusted_folder, autonomy_budget_exhausted, bracketed_paste, classify_human_input,
     claude_permission_mode, cli_ready, copilot_autopilot_prompt_detected, create_orchestration_group,
-    gh_gate_decision, gh_is_merge_invocation, gh_positionals, gh_repo_flag, gh_shim_sh,
-    hold_for_human_input, hold_until_quiet, idle_output_is_activity, idle_should_kill,
-    idle_tick_should_fire, max_agents_notice, GhGate,
+    gh_gate_decision, gh_is_merge_invocation, gh_positionals, gh_release_action, gh_repo_flag,
+    gh_shim_sh, git_shim_sh, git_tag_push, grant_segment, grant_unexpired, hold_for_human_input,
+    hold_until_quiet, idle_output_is_activity, idle_should_kill, idle_tick_should_fire,
+    max_agents_notice, pr_number, release_gate_decision, GhGate, GitTagPush,
     normalize_remote_web_base, parse_audit_lines, parse_session_cost, paste_held_notice,
     prompt_wait_detected, resolve_paste_gate, resolve_ref_url, rotate_audit_if_needed,
     sanitize_attachment_ext, should_confirm_copilot_autopilot, should_flush_before_paste,
@@ -1937,7 +1938,7 @@ fn approve_marks_done_and_records_signoff() {
     p.pr = Some("#12".into());
     reg.upsert_task(&g.id, "orch-1", Some(&t.id), p).unwrap();
     // Approving is the human's sign-off: status → done, note recorded, actor human.
-    let done = reg.approve_task(&g.id, &t.id).unwrap();
+    let done = reg.approve_task(&g.id, &t.id, None).unwrap();
     assert_eq!(done.status, "done");
     let note = done.notes.last().unwrap();
     assert_eq!(note.author, "human");
@@ -1966,7 +1967,7 @@ fn merge_gate_actions_are_guarded_to_gate_statuses() {
     // A queued item is not at the merge gate — both actions must refuse, and
     // refuse without mutating (status unchanged, no note added).
     let t = reg.upsert_task(&g.id, "orch-1", None, patch(Some("Ship it"), None, None)).unwrap();
-    assert!(reg.approve_task(&g.id, &t.id).is_err(), "cannot approve a queued item");
+    assert!(reg.approve_task(&g.id, &t.id, None).is_err(), "cannot approve a queued item");
     assert!(reg.request_changes(&g.id, &t.id, "nope").is_err(), "cannot request changes off-gate");
     let stored = &reg.tasks(&g.id)[0];
     assert_eq!(stored.status, "queued", "a refused action must not change status");
@@ -1978,8 +1979,8 @@ fn merge_gate_actions_are_guarded_to_gate_statuses() {
     }
     // And once approved (→ done) it's off the gate again.
     reg.upsert_task(&g.id, "orch-1", Some(&t.id), patch(None, Some("pr"), None)).unwrap();
-    reg.approve_task(&g.id, &t.id).unwrap();
-    assert!(reg.approve_task(&g.id, &t.id).is_err(), "a done item is past the gate");
+    reg.approve_task(&g.id, &t.id, None).unwrap();
+    assert!(reg.approve_task(&g.id, &t.id, None).is_err(), "a done item is past the gate");
 }
 
 #[test]
@@ -3384,21 +3385,284 @@ fn gh_positionals_and_repo_flag_parse_around_global_flags() {
 
 #[test]
 fn gh_gate_decision_enforces_the_human_gate_on_the_default_branch() {
-    let d = |base: Option<&str>, def, auto, am| gh_gate_decision(true, base, def, auto, am);
+    // (base, default, autonomous, auto_merge, grant) — merge invocation.
+    let d = |base: Option<&str>, def, auto, am, grant| gh_gate_decision(true, base, def, auto, am, grant);
     // Non-merge → always pass.
-    assert_eq!(gh_gate_decision(false, Some("main"), Some("main"), false, false), GhGate::PassThrough);
-    // Merge onto a NON-default base (integration branch) → pass, regardless of markers.
-    assert_eq!(d(Some("feat/x"), Some("main"), false, false), GhGate::PassThrough);
-    assert_eq!(d(Some("feat/x"), Some("main"), true, true), GhGate::PassThrough);
-    // Merge onto the DEFAULT branch: allowed ONLY with both markers.
-    assert_eq!(d(Some("main"), Some("main"), true, true), GhGate::AllowMerge);
-    assert_eq!(d(Some("main"), Some("main"), true, false), GhGate::Block, "auto_merge off blocks");
-    assert_eq!(d(Some("main"), Some("main"), false, true), GhGate::Block, "autonomous off blocks");
-    assert_eq!(d(Some("main"), Some("main"), false, false), GhGate::Block);
-    // Undeterminable base → fail-safe block (never let an unverifiable merge land).
-    assert_eq!(d(None, Some("main"), true, true), GhGate::BlockUnverifiable);
-    assert_eq!(d(Some("main"), None, true, true), GhGate::BlockUnverifiable);
-    assert_eq!(d(Some(""), Some("main"), true, true), GhGate::BlockUnverifiable, "empty base is unverifiable");
+    assert_eq!(gh_gate_decision(false, Some("main"), Some("main"), false, false, false), GhGate::PassThrough);
+    // Merge onto a NON-default base (integration branch) → pass, regardless of markers/grant.
+    assert_eq!(d(Some("feat/x"), Some("main"), false, false, false), GhGate::PassThrough);
+    assert_eq!(d(Some("feat/x"), Some("main"), true, true, false), GhGate::PassThrough);
+    // Merge onto the DEFAULT branch: blanket-allowed with both markers.
+    assert_eq!(d(Some("main"), Some("main"), true, true, false), GhGate::AllowMerge);
+    // Without the blanket markers, a valid one-time GRANT authorizes it (consumed).
+    assert_eq!(d(Some("main"), Some("main"), false, false, true), GhGate::AllowGrant, "a human grant authorizes the merge");
+    assert_eq!(d(Some("main"), Some("main"), true, false, true), GhGate::AllowGrant);
+    // No markers and no grant → block.
+    assert_eq!(d(Some("main"), Some("main"), true, false, false), GhGate::Block, "auto_merge off + no grant blocks");
+    assert_eq!(d(Some("main"), Some("main"), false, true, false), GhGate::Block, "autonomous off + no grant blocks");
+    assert_eq!(d(Some("main"), Some("main"), false, false, false), GhGate::Block);
+    // Undeterminable base → fail-safe block (a grant can't override an unverifiable base).
+    assert_eq!(d(None, Some("main"), true, true, true), GhGate::BlockUnverifiable);
+    assert_eq!(d(Some("main"), None, true, true, true), GhGate::BlockUnverifiable);
+    assert_eq!(d(Some(""), Some("main"), true, true, true), GhGate::BlockUnverifiable, "empty base is unverifiable");
+}
+
+#[test]
+fn grant_helpers_normalize_and_expire() {
+    // PR number extraction from every board `pr` form.
+    assert_eq!(pr_number("7"), Some(7));
+    assert_eq!(pr_number("#42"), Some(42));
+    assert_eq!(pr_number("https://github.com/o/r/pull/123"), Some(123));
+    assert_eq!(pr_number("PR 9"), Some(9));
+    assert_eq!(pr_number("no-number-here"), None);
+    // Grant segment sanitization (must match the shim's `tr -c`): path-escaping and
+    // odd chars collapse to `_`, safe chars survive.
+    assert_eq!(grant_segment("v1.2.3"), "v1.2.3");
+    assert_eq!(grant_segment("release/../../etc"), "release_.._.._etc");
+    assert_eq!(grant_segment("v1/beta"), "v1_beta");
+    assert_eq!(grant_segment(""), "_");
+    // TTL rule: unexpired iff a future expiry exists.
+    assert!(grant_unexpired(Some(100), 99));
+    assert!(!grant_unexpired(Some(100), 100), "exactly at expiry is expired");
+    assert!(!grant_unexpired(Some(100), 200));
+    assert!(!grant_unexpired(None, 0), "no grant file → not authorized");
+}
+
+#[test]
+fn release_gate_blocks_without_a_grant_even_in_autonomous() {
+    // Releases publish to the world → NEVER blanket-allowed by autonomous mode; the
+    // only path is an explicit grant. (There is no autonomous/auto_merge input.)
+    assert_eq!(release_gate_decision(false), GhGate::Block);
+    assert_eq!(release_gate_decision(true), GhGate::AllowGrant);
+}
+
+#[test]
+fn gh_release_action_detects_publish_subcommands_and_tag() {
+    let a = |v: &[&str]| gh_release_action(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+    assert_eq!(a(&["release", "create", "v1.2.3"]), Some(("create".into(), "v1.2.3".into())));
+    assert_eq!(a(&["release", "edit", "v1.2.3", "--draft=false"]), Some(("edit".into(), "v1.2.3".into())));
+    assert_eq!(a(&["release", "delete", "v9"]), Some(("delete".into(), "v9".into())));
+    // -R/--repo before the command is skipped, tag still found.
+    assert_eq!(a(&["-R", "o/r", "release", "create", "v2"]), Some(("create".into(), "v2".into())));
+    // Read-only release subcommands and non-release commands are NOT publish actions.
+    assert_eq!(a(&["release", "view", "v1"]), None);
+    assert_eq!(a(&["release", "list"]), None);
+    assert_eq!(a(&["pr", "merge", "1"]), None);
+}
+
+#[test]
+fn git_tag_push_classifies_tag_pushes() {
+    let g = |v: &[&str]| git_tag_push(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+    // Explicit tag refs and the `tag <name>` form → gate that tag.
+    assert_eq!(g(&["push", "origin", "refs/tags/v1.2.3"]), GitTagPush::Tag("v1.2.3".into()));
+    assert_eq!(g(&["push", "origin", "tag", "v9"]), GitTagPush::Tag("v9".into()));
+    assert_eq!(g(&["push", "origin", "+v1:refs/tags/v1"]), GitTagPush::Tag("v1".into()));
+    // A bare `v*` refspec is treated as a (candidate) tag; the shim confirms it.
+    assert_eq!(g(&["push", "origin", "v1.0.0"]), GitTagPush::Tag("v1.0.0".into()));
+    // Bulk tag pushes → Bulk (blocked; can't match one grant).
+    assert_eq!(g(&["push", "--tags"]), GitTagPush::Bulk);
+    assert_eq!(g(&["push", "origin", "--follow-tags"]), GitTagPush::Bulk);
+    assert_eq!(g(&["push", "--mirror"]), GitTagPush::Bulk);
+    // Plain branch pushes and non-push commands → None (fast passthrough).
+    assert_eq!(g(&["push", "origin", "feat/x"]), GitTagPush::None);
+    assert_eq!(g(&["push", "-u", "origin", "HEAD"]), GitTagPush::None);
+    assert_eq!(g(&["push", "origin", "main"]), GitTagPush::None);
+    assert_eq!(g(&["-C", "/repo", "push", "origin", "main"]), GitTagPush::None, "git globals skipped");
+    assert_eq!(g(&["status"]), GitTagPush::None);
+    assert_eq!(g(&["commit", "-m", "x"]), GitTagPush::None);
+}
+
+#[test]
+fn git_shim_script_bakes_real_git_and_gates_tag_push() {
+    let sh = git_shim_sh("C:/Program Files/Git/cmd/git.exe");
+    assert!(sh.contains("REAL_GIT=\"C:/Program Files/Git/cmd/git.exe\""), "bakes the real git path");
+    assert!(sh.starts_with("#!/bin/sh"));
+    // Only `git push` is inspected; everything else execs immediately.
+    assert!(sh.contains("if [ \"$cmd\" != \"push\" ]") && sh.contains("exec \"$REAL_GIT\" \"$@\""));
+    assert!(sh.contains("--tags") && sh.contains("--follow-tags"), "blocks bulk tag pushes");
+    assert!(sh.contains("refs/tags/"), "detects explicit tag refs");
+    assert!(sh.contains("release_grants/"), "gates on a release grant");
+    assert!(sh.contains("release-gate-blocked"), "audits refusals");
+}
+
+#[test]
+fn grant_merge_writes_a_consumable_grant_file_and_audits() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    // A PR URL is normalized to the number; the grant is keyed pr-<N>.
+    let num = reg.grant_merge(&g.id, "https://github.com/o/r/pull/42", Some("bump the changelog first"), "human").unwrap();
+    assert_eq!(num, 42);
+    let grant = reg.state_root().join(&g.id).join("merge_grants").join("pr-42");
+    assert!(grant.is_file(), "the grant file must exist for the shim to consult");
+    // Line 1 is a future unix-seconds expiry.
+    let body = std::fs::read_to_string(&grant).unwrap();
+    let exp: u64 = body.lines().next().unwrap().parse().unwrap();
+    assert!(exp > now_ms() / 1000, "grant expiry must be in the future");
+    assert_eq!(audit_count(&reg, &g.id, "merge-grant-written"), 1);
+    // A bad PR ref is rejected, no grant written.
+    assert!(reg.grant_merge(&g.id, "not-a-pr", None, "human").is_err());
+}
+
+#[test]
+fn approve_task_writes_a_merge_grant_for_the_prs_number() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let t = reg.upsert_task(&g.id, "orch-1", None, patch(Some("Ship it"), None, None)).unwrap();
+    let mut p = patch(None, Some("pr"), None);
+    p.pr = Some("#7".into());
+    reg.upsert_task(&g.id, "orch-1", Some(&t.id), p).unwrap();
+    // Clicking Approve (with an optional comment) must mint the one-time grant for
+    // that PR — otherwise the enforced gate leaves the orchestrator unable to merge.
+    reg.approve_task(&g.id, &t.id, Some("also tag the release note")).unwrap();
+    assert!(reg.state_root().join(&g.id).join("merge_grants").join("pr-7").is_file(),
+        "Approve must write the merge grant for the task's PR");
+    assert_eq!(audit_count(&reg, &g.id, "merge-grant-written"), 1);
+}
+
+#[test]
+fn grants_are_not_writable_by_any_mcp_tool() {
+    // SECURITY BOUNDARY: grants are human-only (Tauri commands). No MCP tool an
+    // agent can call may write under the group dir at a grant path.
+    let (reg, _d, co, cw) = setup_mcp();
+    let tool_names = |c: &Caller| -> Vec<String> {
+        dispatch(&reg, c, "tools/list", &Value::Null).unwrap()["tools"].as_array().unwrap()
+            .iter().map(|t| t["name"].as_str().unwrap().to_string()).collect()
+    };
+    for c in [&co, &cw] {
+        for n in tool_names(c) {
+            assert!(!n.contains("grant"), "no MCP tool may write grants, found: {n}");
+        }
+    }
+    // Exercise the file-writing MCP tools an agent CAN call; none may create a
+    // grant dir/file under the group.
+    let _ = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "set_state", "arguments": { "state": "{\"x\":1}" } }));
+    let _ = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "upsert_task", "arguments": { "title": "t", "status": "pr" } }));
+    let gdir = reg.state_root().join(&co.group);
+    assert!(!gdir.join("merge_grants").exists(), "no MCP tool may create merge_grants");
+    assert!(!gdir.join("release_grants").exists(), "no MCP tool may create release_grants");
+}
+
+/// Fake gh recording args and answering pr/repo view from env; anything else
+/// "succeeds". Returns its path. Shared by the harness tests.
+fn write_fake_gh(root: &std::path::Path, log: &std::path::Path) -> std::path::PathBuf {
+    let p = root.join("fakegh");
+    std::fs::write(&p, format!(
+        "#!/bin/sh\n\
+         echo \"ARGS: $*\" >> \"{log}\"\n\
+         if [ \"$1\" = \"pr\" ] && [ \"$2\" = \"view\" ]; then printf '%s %s\\n' \"$FAKE_BASE\" \"$FAKE_NUM\"; exit 0; fi\n\
+         if [ \"$1\" = \"repo\" ] && [ \"$2\" = \"view\" ]; then printf '%s\\n' \"$FAKE_DEFAULT\"; exit 0; fi\n\
+         printf 'FAKE-GH-RAN\\n'; exit 0\n",
+        log = log.display()
+    )).unwrap();
+    p
+}
+
+#[test]
+fn gh_shim_harness_grant_authorizes_one_merge_and_releases_are_gated() {
+    use std::process::Command;
+    if Command::new("sh").arg("-c").arg("exit 0").status().map(|s| !s.success()).unwrap_or(true) {
+        eprintln!("SKIP gh_shim_harness_grant…: no POSIX sh");
+        return;
+    }
+    let td = tempfile::tempdir().unwrap();
+    let root = td.path();
+    let group = root.join("group");
+    std::fs::create_dir_all(&group).unwrap();
+    let log = root.join("gh.log");
+    let fake = write_fake_gh(root, &log);
+    let shim = root.join("gh");
+    std::fs::write(&shim, gh_shim_sh(&fake.display().to_string())).unwrap();
+    let _ = Command::new("sh").arg("-c").arg(format!("chmod +x '{}' '{}'", fake.display(), shim.display())).status();
+
+    let run = |argv: &[&str], num: &str| -> bool {
+        Command::new("sh").arg(&shim).args(argv)
+            .env("LOOMUX_GROUP_DIR", &group)
+            .env("FAKE_BASE", "main").env("FAKE_DEFAULT", "main").env("FAKE_NUM", num)
+            .status().unwrap().success()
+    };
+    let write_grant = |dir: &str, name: &str| {
+        let d = group.join(dir);
+        std::fs::create_dir_all(&d).unwrap();
+        // far-future expiry (unix seconds)
+        std::fs::write(d.join(name), b"99999999999\n1\n").unwrap();
+    };
+
+    // No grant, no markers → blocked.
+    assert!(!run(&["pr", "merge", "5"], "5"), "no grant → blocked");
+    // A grant for pr-5 authorizes exactly one merge, then is consumed.
+    write_grant("merge_grants", "pr-5");
+    assert!(run(&["pr", "merge", "5"], "5"), "valid grant → allowed");
+    assert!(!group.join("merge_grants/pr-5").exists(), "grant must be consumed");
+    assert!(!run(&["pr", "merge", "5"], "5"), "consumed grant → second merge blocked");
+    // A grant for pr-5 must NOT authorize merging pr-7.
+    write_grant("merge_grants", "pr-5");
+    assert!(!run(&["pr", "merge", "7"], "7"), "a pr-5 grant cannot merge pr-7");
+    // An expired grant does not authorize (and is cleaned up).
+    std::fs::create_dir_all(group.join("merge_grants")).unwrap();
+    std::fs::write(group.join("merge_grants/pr-9"), b"1\n1\n").unwrap();
+    assert!(!run(&["pr", "merge", "9"], "9"), "expired grant → blocked");
+
+    // Releases: blocked without a grant even though markers would allow a MERGE.
+    std::fs::write(group.join("autonomous"), b"").unwrap();
+    std::fs::write(group.join("auto_merge"), b"").unwrap();
+    assert!(!run(&["release", "create", "v1.2.3"], "0"), "release blocked even in autonomous+auto_merge");
+    write_grant("release_grants", "v1.2.3");
+    assert!(run(&["release", "create", "v1.2.3"], "0"), "release grant → allowed");
+    assert!(!group.join("release_grants/v1.2.3").exists(), "release grant consumed");
+    // Read-only release subcommand passes through.
+    assert!(run(&["release", "view", "v1.2.3"], "0"), "release view is not gated");
+}
+
+#[test]
+fn git_shim_harness_gates_tag_pushes() {
+    use std::process::Command;
+    if Command::new("sh").arg("-c").arg("exit 0").status().map(|s| !s.success()).unwrap_or(true) {
+        eprintln!("SKIP git_shim_harness…: no POSIX sh");
+        return;
+    }
+    let td = tempfile::tempdir().unwrap();
+    let root = td.path();
+    let group = root.join("group");
+    std::fs::create_dir_all(&group).unwrap();
+    // Fake git: rev-parse confirms a tag iff it matches $FAKE_TAG; push "succeeds".
+    let fake = root.join("fakegit");
+    std::fs::write(&fake,
+        "#!/bin/sh\n\
+         if [ \"$1\" = \"rev-parse\" ]; then\n\
+           for a in \"$@\"; do case \"$a\" in refs/tags/*) [ \"$a\" = \"refs/tags/$FAKE_TAG\" ] && exit 0 ;; esac; done\n\
+           exit 1\n\
+         fi\n\
+         printf 'FAKE-GIT-RAN\\n'; exit 0\n").unwrap();
+    let shim = root.join("git");
+    std::fs::write(&shim, git_shim_sh(&fake.display().to_string())).unwrap();
+    let _ = Command::new("sh").arg("-c").arg(format!("chmod +x '{}' '{}'", fake.display(), shim.display())).status();
+    let run = |argv: &[&str], fake_tag: &str| -> bool {
+        Command::new("sh").arg(&shim).args(argv)
+            .env("LOOMUX_GROUP_DIR", &group).env("FAKE_TAG", fake_tag)
+            .status().unwrap().success()
+    };
+    let grant = |name: &str| {
+        let d = group.join("release_grants");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join(name), b"99999999999\n1\n").unwrap();
+    };
+
+    // Branch push → untouched (fast passthrough).
+    assert!(run(&["push", "origin", "main"], ""), "branch push is never gated");
+    // Explicit tag ref → blocked without a grant, allowed (and consumed) with one.
+    assert!(!run(&["push", "origin", "refs/tags/v1.2.3"], ""), "tag push blocked without grant");
+    grant("v1.2.3");
+    assert!(run(&["push", "origin", "refs/tags/v1.2.3"], ""), "tag push allowed with grant");
+    assert!(!group.join("release_grants/v1.2.3").exists(), "release grant consumed");
+    // Bulk tag push → always blocked.
+    assert!(!run(&["push", "--tags"], ""), "--tags is blocked");
+    assert!(!run(&["push", "origin", "--follow-tags"], ""), "--follow-tags is blocked");
+    // Bare v* refspec confirmed as a tag by real git → gated.
+    assert!(!run(&["push", "origin", "v2.0.0"], "v2.0.0"), "confirmed bare v* tag is gated");
+    // Bare v* that is NOT a tag (a branch) → not gated (rev-parse fails to confirm).
+    assert!(run(&["push", "origin", "v2-feature"], "nope"), "a v*-looking branch is not gated");
 }
 
 #[test]
