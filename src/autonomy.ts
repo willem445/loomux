@@ -43,6 +43,9 @@ export type TickStatus =
 export interface AutonomyState {
   autonomous: boolean;
   auto_merge: boolean;
+  /** #83: whether the orchestrator may publish releases/tags itself (independent
+   *  of auto_merge; default OFF = releases need a per-tag human grant). */
+  auto_release: boolean;
   budget_tokens: number;
   budget_anchor_tokens: number;
   spend_since_enable_tokens: number | null;

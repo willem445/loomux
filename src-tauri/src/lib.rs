@@ -133,6 +133,7 @@ pub fn run() {
             orchestration::orch_set_max_agents,
             orchestration::orch_set_autonomous,
             orchestration::orch_set_auto_merge,
+            orchestration::orch_set_auto_release,
             orchestration::orch_set_autonomy_budget,
             orchestration::orch_set_idle_tick_minutes,
             orchestration::orch_set_idle_activity_floor,

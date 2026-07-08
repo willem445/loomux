@@ -620,11 +620,19 @@ one-time **grant** the shim also honors.
 
 Releases publish to the world — a `v*` tag push triggers `release.yml` (GitHub release + npm),
 and `gh release create` does likewise — a strictly bigger blast radius than a merge. So they get
-the **same enforcement, but never the blanket opening**: a release/tag is allowed ONLY by an
-explicit grant, **even in autonomous+auto_merge mode** (`release_gate_decision`). This is the
-conservative default and defensible: autonomous auto-merge is the human saying "land routine,
-well-tested PRs without me"; it is *not* "publish to the world without me." A separate, explicit
-release grant keeps publishing a deliberate human act.
+enforcement **parallel to merges but on a SEPARATE, independent toggle**: a release/tag is allowed
+when **`(autonomous && auto_release)`** OR by an explicit per-tag grant (`release_gate_decision`,
+exactly mirroring `gh_gate_decision`'s `(autonomous && auto_merge) || grant`). `auto_release`
+defaults **OFF** and is independent of `auto_merge` — the human can allow auto-merge while keeping
+releases manual, opt into both, or neither. (This supersedes the earlier "releases are never
+blanket-allowed by autonomous" policy, which conflated "autonomous" with "auto-merge"; the human
+live-tested it and asked for hands-off releasing as an explicit opt-in.) Because the default is
+off, turning autonomous on never surprise-publishes — releasing stays a deliberate act (the toggle
+or a grant). `auto_release` mirrors `auto_merge`'s machinery exactly: gated behind autonomous
+(rejects enable when off), disk-first fail-loud disable, force-disabled on autonomous-off / budget
+suspension (the money-stop drops it from the in-memory gate set unconditionally), stale-marker
+reconcile on read, mirrored into the kickoff config + a live notice, and surfaced additively on
+`orch_autonomy` (`auto_release: bool`) via `orch_set_auto_release`.
 
 - **gh shim** additionally gates `gh release create|edit|delete <tag>` (read-only
   `view`/`list`/`download` pass through) — `gh_release_action`.

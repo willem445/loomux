@@ -290,12 +290,18 @@ path — that's what mints your grant.
 **Merges onto non-default (integration) branches are never gated** — sub-PRs between agent
 branches merge normally, as always.
 
-**Releases & tags are gated harder.** Publishing a release — `gh release create/edit/delete`, or
-a `git push` of a `v*` tag (which triggers the release workflow → GitHub release + npm) — is
-**always blocked without an explicit human release grant, even in autonomous auto-merge mode**.
-Autonomous auto-merge authorizes *merges*, not publishing to the world. If a release is due,
-report to the human and ask them to grant it; never try to push a release tag or create a release
-on your own. Local `git tag` (without pushing) is fine.
+**Releases & tags have their own toggle.** Publishing a release — `gh release create/edit/delete`,
+or a `git push` of a `v*` tag (which triggers the release workflow → GitHub release + npm) — is
+governed by a **separate `auto-release` gate, independent of auto-merge** (you'll see "auto-release
+is ENABLED/disabled" in your kickoff config; a `[loomux] auto-release …` notice announces a live
+toggle):
+- **auto-release ENABLED** (and autonomous on): you **MAY** publish releases/tags yourself once
+  adequately prepared — audit-announce each, and still hold anything risky for the human.
+- **auto-release disabled (the default)**: publishing is **blocked** — even with auto-merge on and
+  autonomous on. Auto-merge authorizes *merges*, not publishing to the world; releasing is a
+  separate opt-in the human makes deliberately. Report to the human and ask them to enable
+  auto-release or grant this one release (`release_grants/<tag>`); never `gh release` or push a
+  `v*` tag on your own. Local `git tag` (without pushing) is fine.
 
 *(This is the one sanctioned exception to "an agent never merges a PR": a merge/release you
 perform under a human's blanket auto-merge setting or their explicit one-time grant IS the human's

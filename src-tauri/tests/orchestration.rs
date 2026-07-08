@@ -3429,11 +3429,19 @@ fn grant_helpers_normalize_and_expire() {
 }
 
 #[test]
-fn release_gate_blocks_without_a_grant_even_in_autonomous() {
-    // Releases publish to the world → NEVER blanket-allowed by autonomous mode; the
-    // only path is an explicit grant. (There is no autonomous/auto_merge input.)
-    assert_eq!(release_gate_decision(false), GhGate::Block);
-    assert_eq!(release_gate_decision(true), GhGate::AllowGrant);
+fn release_gate_allows_via_auto_release_or_grant_independently_of_auto_merge() {
+    // (autonomous, auto_release, grant). Parallel to merges, with its OWN toggle.
+    let d = |a, ar, g| release_gate_decision(a, ar, g);
+    // Blanket: autonomous + auto_release → allowed (not grant-consumed).
+    assert_eq!(d(true, true, false), GhGate::AllowMerge);
+    // auto_release OFF (the default) but a valid per-tag grant → allowed (consumed).
+    assert_eq!(d(true, false, true), GhGate::AllowGrant);
+    assert_eq!(d(false, false, true), GhGate::AllowGrant, "grant works even non-autonomous");
+    // No blanket opt-in and no grant → blocked, even while autonomous (default is
+    // conservative: turning autonomous on never surprise-publishes).
+    assert_eq!(d(true, false, false), GhGate::Block, "autonomous alone never publishes");
+    assert_eq!(d(false, true, false), GhGate::Block, "auto_release without autonomous never publishes");
+    assert_eq!(d(false, false, false), GhGate::Block);
 }
 
 #[test]
@@ -3642,6 +3650,12 @@ fn gh_shim_harness_grant_authorizes_one_merge_and_releases_are_gated() {
         "granted release with --title before the tag must be allowed, not misparsed");
     assert!(!run(&["release", "create", "--title", "My Release", "v9.9.9"], "0"),
         "a release with --title and no grant is still blocked (tag parsed correctly)");
+    // auto_release opt-in: autonomous + auto_release blanket-allows any release —
+    // and does NOT consume a grant (no per-tag file needed). auto_merge alone did
+    // NOT (asserted above), proving the two toggles are independent.
+    std::fs::write(group.join("auto_release"), b"").unwrap();
+    assert!(run(&["release", "create", "v3.0.0"], "0"), "autonomous+auto_release blanket-allows a release");
+    assert!(run(&["release", "create", "v3.0.1"], "0"), "blanket auto_release is repeatable (not a one-time grant)");
 }
 
 #[test]
@@ -3700,6 +3714,11 @@ fn git_shim_harness_gates_tag_pushes() {
     assert!(run(&["push", "origin", "nightly"], "nightly"), "a non-v* tag is not a release → not gated");
     // Bare v* that is NOT a tag (a branch) → not gated (rev-parse fails to confirm).
     assert!(run(&["push", "origin", "v2-feature"], "nope"), "a v*-looking branch is not gated");
+    // auto_release opt-in blanket-allows a v* tag push with NO grant (repeatable).
+    std::fs::write(group.join("autonomous"), b"").unwrap();
+    std::fs::write(group.join("auto_release"), b"").unwrap();
+    assert!(run(&["push", "origin", "refs/tags/v5.0.0"], ""), "autonomous+auto_release blanket-allows a tag push");
+    assert!(run(&["push", "origin", "refs/tags/v5.0.1"], ""), "blanket auto_release tag push is repeatable");
 }
 
 #[test]
@@ -3778,6 +3797,59 @@ fn stale_auto_merge_without_autonomous_is_reconciled_on_read() {
     assert!(!reg2.is_auto_merge(&g.id), "stale auto-merge must be reconciled off without autonomous");
     assert!(!gdir.join("auto_merge").is_file(), "the stale marker must be removed");
     assert_eq!(audit_count(&reg2, &g.id, "auto-merge-off"), 1, "the reconcile is audited");
+}
+
+#[test]
+fn set_auto_release_mirrors_auto_merge_dependency_and_is_independent() {
+    let (reg, dir) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let am = reg.state_root().join(&g.id).join("auto_merge");
+    let ar = reg.state_root().join(&g.id).join("auto_release");
+    // Dependency: enabling auto-release without autonomous is rejected.
+    let err = reg.set_auto_release(&g.id, true).unwrap_err();
+    assert!(err.to_lowercase().contains("autonomous"), "must name the dependency, got: {err}");
+    assert!(!reg.is_auto_release(&g.id));
+    // With autonomous on, the two toggles are INDEPENDENT: auto_merge on + auto_release
+    // off, and vice versa.
+    reg.set_autonomous(&g.id, true).unwrap();
+    reg.set_auto_merge(&g.id, true).unwrap();
+    assert!(reg.is_auto_merge(&g.id) && !reg.is_auto_release(&g.id), "auto_merge on must not enable auto_release");
+    assert!(am.is_file() && !ar.is_file());
+    reg.set_auto_release(&g.id, true).unwrap();
+    assert!(reg.is_auto_merge(&g.id) && reg.is_auto_release(&g.id));
+    reg.set_auto_merge(&g.id, false).unwrap();
+    assert!(!reg.is_auto_merge(&g.id) && reg.is_auto_release(&g.id), "disabling auto_merge must not touch auto_release");
+    assert!(!am.is_file() && ar.is_file());
+    assert_eq!(reg.autonomy_state(&g.id)["auto_release"].as_bool(), Some(true));
+    // Turning autonomous OFF force-disables auto_release too (money-stop), audited.
+    reg.set_autonomous(&g.id, false).unwrap();
+    assert!(!reg.is_auto_release(&g.id), "autonomous-off must force-disable auto_release");
+    assert!(!ar.is_file());
+    assert_eq!(audit_count(&reg, &g.id, "auto-release-off"), 1);
+    // Restart survival + stale reconcile: a stale auto_release without autonomous
+    // is reconciled off on read.
+    reg.set_autonomous(&g.id, true).unwrap();
+    reg.set_auto_release(&g.id, true).unwrap();
+    std::fs::remove_file(reg.state_root().join(&g.id).join("autonomous")).unwrap(); // hand-edit: drop autonomous, leave auto_release
+    let reg2 = OrchRegistry::new(dir.path().to_path_buf());
+    reg2.set_port(45999);
+    reg2.create_group("C:/tmp/repo", rails()).unwrap();
+    assert!(!reg2.is_auto_release(&g.id), "stale auto_release without autonomous reconciled off");
+    assert!(!reg2.state_root().join(&g.id).join("auto_release").is_file());
+}
+
+#[test]
+fn budget_suspension_force_disables_auto_release() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    reg.set_autonomous(&g.id, true).unwrap();
+    reg.set_auto_release(&g.id, true).unwrap();
+    assert!(reg.is_auto_release(&g.id));
+    seed_usage(&reg, &g.id, "spend", 5_000);
+    reg.set_autonomy_budget(&g.id, 100).unwrap();
+    assert_eq!(reg.enforce_autonomy_budgets(now_ms()), vec![g.id.clone()]);
+    assert!(!reg.is_autonomous(&g.id));
+    assert!(!reg.is_auto_release(&g.id), "budget suspension must drop auto_release (gate closed)");
 }
 
 #[test]
