@@ -18,6 +18,7 @@ import {
   notifyEnabled,
   pauseGroup,
   resumeGroup,
+  grantRelease,
   setAutoMerge,
   setAutonomous,
   setAutonomyBudget,
@@ -34,6 +35,8 @@ import {
   autoMergeFromApproval,
   budgetMeter,
   formatTokens,
+  isValidReleaseTag,
+  normalizeComment,
   tickStatusLabel,
 } from "./autonomy";
 
@@ -127,6 +130,18 @@ export class GroupView {
   private floorInput: HTMLInputElement;
   private tickStatusEl: HTMLElement;
   private suspendEl: HTMLElement;
+  // Release-grant control (#83): collapsed power action.
+  private releaseToggle: HTMLButtonElement;
+  private releaseBody: HTMLElement;
+  private releaseTagInput: HTMLInputElement;
+  private releaseCommentInput: HTMLInputElement;
+  private releaseBtn: HTMLButtonElement;
+  private releaseErrEl: HTMLElement;
+  private releaseOpen = false;
+  /** True once Authorize is clicked with a valid tag: the second click within
+   *  the window actually issues the release grant (publish is irreversible). */
+  private releaseArmed = false;
+  private releaseArmTimer: number | undefined;
   private pauseBtn: HTMLButtonElement;
   private notifyBtn: HTMLButtonElement;
   private foldBtn: HTMLButtonElement | null = null;
@@ -325,6 +340,51 @@ export class GroupView {
 
     autoRow.append(autoHead, ctlRow, tickRow, this.suspendEl);
 
+    // Release-grant control (#83): a collapsed power action — releases have no
+    // board task, so this is the human path to authorize one. Kept collapsed by
+    // default; the copy is blunt that it publishes.
+    const releaseRow = el("div", "group-releaserow");
+    this.releaseToggle = el("button", "group-release-toggle", "▸ Authorize a release…") as HTMLButtonElement;
+    this.releaseToggle.title =
+      "Authorize a one-time release/tag publish (GH release + npm). Releases are never " +
+      "auto-approved by autonomous mode — this explicit grant is the only path.";
+    this.releaseToggle.addEventListener("click", () => this.toggleRelease());
+
+    this.releaseBody = el("div", "group-release-body");
+    this.releaseBody.hidden = true;
+    this.releaseBody.append(
+      el(
+        "div",
+        "group-release-copy",
+        "Authorizes ONE publish of this tag (GH release + npm) — single-use, expires in ~30 min. " +
+          "Releases are never auto-approved by autonomous mode."
+      )
+    );
+    const releaseInputs = el("div", "group-release-inputs");
+    this.releaseTagInput = document.createElement("input");
+    this.releaseTagInput.className = "group-release-tag";
+    this.releaseTagInput.placeholder = "tag — e.g. v1.2.3";
+    this.releaseTagInput.spellcheck = false;
+    this.releaseTagInput.addEventListener("input", () => this.disarmRelease());
+    this.releaseTagInput.addEventListener("keydown", (e) => {
+      e.stopPropagation();
+      if (e.key === "Enter") this.onReleaseClick();
+    });
+    this.releaseCommentInput = document.createElement("input");
+    this.releaseCommentInput.className = "group-release-comment";
+    this.releaseCommentInput.placeholder = "optional instructions for the agent";
+    this.releaseCommentInput.spellcheck = false;
+    this.releaseCommentInput.addEventListener("keydown", (e) => {
+      e.stopPropagation();
+      if (e.key === "Enter") this.onReleaseClick();
+    });
+    this.releaseBtn = el("button", "group-btn sm", "Authorize") as HTMLButtonElement;
+    this.releaseBtn.addEventListener("click", () => this.onReleaseClick());
+    releaseInputs.append(this.releaseTagInput, this.releaseCommentInput, this.releaseBtn);
+    this.releaseErrEl = el("div", "group-release-err");
+    this.releaseBody.append(releaseInputs, this.releaseErrEl);
+    releaseRow.append(this.releaseToggle, this.releaseBody);
+
     // Footer: pause/resume + destructive end-orchestration.
     const foot = el("div", "group-actions");
     this.pauseBtn = el("button", "group-btn", "Pause") as HTMLButtonElement;
@@ -363,7 +423,7 @@ export class GroupView {
     this.toastEl = el("div", "git-toast");
     this.toastEl.hidden = true;
 
-    this.el.append(head, this.summaryEl, maxRow, autoRow, this.listEl, foot, this.toastEl);
+    this.el.append(head, this.summaryEl, maxRow, autoRow, releaseRow, this.listEl, foot, this.toastEl);
   }
 
   /** Called by the pane whenever the overlay is (re)opened. */
@@ -376,6 +436,7 @@ export class GroupView {
     this.disposed = true;
     clearTimeout(this.toastTimer);
     clearTimeout(this.endArmTimer);
+    clearTimeout(this.releaseArmTimer);
     if (this.pollTimer !== undefined) clearInterval(this.pollTimer);
     this.el.remove();
   }
@@ -524,6 +585,67 @@ export class GroupView {
       this.toast(String(err));
     }
     await this.load();
+  }
+
+  /** Expand/collapse the release-grant control. */
+  private toggleRelease(): void {
+    this.releaseOpen = !this.releaseOpen;
+    this.releaseBody.hidden = !this.releaseOpen;
+    this.releaseToggle.textContent = this.releaseOpen
+      ? "▾ Authorize a release"
+      : "▸ Authorize a release…";
+    if (!this.releaseOpen) this.disarmRelease();
+    else this.releaseTagInput.focus();
+    // Height changed — let the host re-clamp so no control clips (#83 rev-58).
+    this.onResize?.();
+  }
+
+  /** First click validates the tag and arms; the second within the window
+   *  actually issues the grant (a release publish is irreversible). */
+  private onReleaseClick(): void {
+    this.releaseErrEl.textContent = "";
+    const tag = this.releaseTagInput.value.trim();
+    if (!isValidReleaseTag(tag)) {
+      this.releaseErrEl.textContent = "enter a tag with no spaces — e.g. v1.2.3";
+      this.releaseTagInput.focus();
+      return;
+    }
+    if (!this.releaseArmed) {
+      this.releaseArmed = true;
+      this.releaseBtn.textContent = `Publish ${tag}?`;
+      this.releaseBtn.classList.add("armed");
+      this.releaseArmTimer = window.setTimeout(() => this.disarmRelease(), 4000);
+      return;
+    }
+    this.disarmRelease();
+    void this.doGrantRelease(tag, this.releaseCommentInput.value);
+  }
+
+  private disarmRelease(): void {
+    this.releaseArmed = false;
+    clearTimeout(this.releaseArmTimer);
+    this.releaseBtn.textContent = "Authorize";
+    this.releaseBtn.classList.remove("armed");
+  }
+
+  /** Issue the one-time release grant. On success, collapse and clear so the
+   *  control can't be re-fired by a stray click; a failure surfaces inline. */
+  private async doGrantRelease(tag: string, comment: string): Promise<void> {
+    this.releaseBtn.disabled = true;
+    try {
+      await grantRelease(this.groupId, tag, normalizeComment(comment));
+      this.toast(`release authorized: ${tag} (one-time, ~30 min)`);
+      this.releaseTagInput.value = "";
+      this.releaseCommentInput.value = "";
+      this.releaseOpen = false;
+      this.releaseBody.hidden = true;
+      this.releaseToggle.textContent = "▸ Authorize a release…";
+      this.onResize?.();
+    } catch (err) {
+      this.releaseErrEl.textContent = String(err);
+    } finally {
+      this.releaseBtn.disabled = false;
+    }
   }
 
   /** First click arms (turns the button into a confirm); the second within

@@ -11,6 +11,8 @@ import {
   formatTokens,
   formatCountdown,
   tickStatusLabel,
+  normalizeComment,
+  isValidReleaseTag,
   type TickStatus,
 } from "../src/autonomy.ts";
 
@@ -162,4 +164,23 @@ test("countdown statuses degrade gracefully if secs is unexpectedly null", () =>
   // Contract says these carry a real secs, but never throw / print 'null'.
   assert.equal(tickStatusLabel("counting_down", null), "counting down…");
   assert.equal(tickStatusLabel("rate_capped", null), "hourly cap reached");
+});
+
+// ---------- human grant inputs (approve-with-comment / release) ----------
+
+test("normalizeComment trims and maps empty to null (grant-only)", () => {
+  assert.equal(normalizeComment(""), null);
+  assert.equal(normalizeComment("   "), null);
+  assert.equal(normalizeComment("\n\t "), null);
+  assert.equal(normalizeComment("  bump the changelog  "), "bump the changelog");
+  assert.equal(normalizeComment("ok"), "ok");
+});
+
+test("isValidReleaseTag requires a non-empty, whitespace-free tag", () => {
+  assert.equal(isValidReleaseTag("v1.2.3"), true);
+  assert.equal(isValidReleaseTag("  v1.2.3  "), true); // trimmed edges are fine
+  assert.equal(isValidReleaseTag(""), false);
+  assert.equal(isValidReleaseTag("   "), false);
+  assert.equal(isValidReleaseTag("v1 2 3"), false); // internal space → invalid
+  assert.equal(isValidReleaseTag("release candidate"), false);
 });

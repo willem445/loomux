@@ -156,6 +156,40 @@ export const setIdleTickMinutes = (groupId: string, minutes: number): Promise<nu
 export const setIdleActivityFloor = (groupId: string, bytes: number): Promise<number> =>
   invoke<number>("orch_set_idle_activity_floor", { groupId, bytes });
 
+// ---------- human merge / release grants (#83) ----------
+
+/** Approve a merge-gate task: flip it done, write a one-time merge grant for its
+ *  PR, and deliver the optional `comment` to the orchestrator with the grant
+ *  (null = grant only, no note). Resolves to the updated task (callers that only
+ *  need success can ignore it). The grant is single-use and expires after ~30
+ *  min — see `grantMerge`. `comment` is optional so pre-existing callers that
+ *  approved without a note keep working. */
+export const approveTask = (
+  groupId: string,
+  id: string,
+  comment: string | null = null
+): Promise<unknown> => invoke("orch_approve_task", { groupId, id, comment });
+
+/** Issue a one-time human merge grant for a PR directly (board-independent path):
+ *  authorizes exactly one default-branch merge of that PR, single-use and
+ *  expiring after ~30 min. Optional `comment` is delivered to the orchestrator.
+ *  Human-only (no MCP tool can write a grant). Resolves to the grant nonce. */
+export const grantMerge = (
+  groupId: string,
+  pr: string,
+  comment: string | null = null
+): Promise<number> => invoke<number>("orch_grant_merge", { groupId, pr, comment });
+
+/** Issue a one-time human release/tag grant: authorizes exactly one publish of
+ *  `tag` (GH release + npm). Releases are NEVER blanket-allowed by autonomous
+ *  mode, so this explicit grant is the only path. Single-use, ~30-min TTL.
+ *  Optional `comment` is delivered to the orchestrator. Human-only. */
+export const grantRelease = (
+  groupId: string,
+  tag: string,
+  comment: string | null = null
+): Promise<void> => invoke("orch_grant_release", { groupId, tag, comment });
+
 /** Agent ids the backend cancelled via `orch-spawn-cancelled` (its bind wait
  *  timed out) whose pane may still be mid-open (#106). Consulted in
  *  `openAgentPane` right before binding so a live-but-slow frontend drops a
