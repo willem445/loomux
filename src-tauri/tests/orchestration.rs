@@ -10,7 +10,8 @@ use loomux_lib::orchestration::mcp::dispatch;
 use loomux_lib::orchestration::{
     add_trusted_folder, autonomy_budget_exhausted, bracketed_paste, classify_human_input,
     claude_permission_mode, cli_ready, copilot_autopilot_prompt_detected, create_orchestration_group,
-    hold_for_human_input, hold_until_quiet, idle_should_kill, idle_tick_should_fire, max_agents_notice,
+    hold_for_human_input, hold_until_quiet, idle_output_is_activity, idle_should_kill,
+    idle_tick_should_fire, max_agents_notice,
     normalize_remote_web_base, parse_audit_lines, parse_session_cost, paste_held_notice,
     prompt_wait_detected, resolve_paste_gate, resolve_ref_url, rotate_audit_if_needed,
     sanitize_attachment_ext, should_confirm_copilot_autopilot, should_flush_before_paste,
@@ -3129,6 +3130,83 @@ fn idle_tick_defers_on_recent_human_input() {
     // Once the human input recedes past the window, the tick fires again.
     assert_eq!(reg.idle_tick_tick(FAR + 15 * 60_000 + 1, &empty, &just_typed), vec![oid.clone()],
         "after the human-input window elapses, the idle tick resumes");
+}
+
+#[test]
+fn idle_output_activity_ignores_subfloor_repaint_growth() {
+    // The repaint-tolerant quiet signal: only a burst >= floor counts as the
+    // orchestrator working; sub-floor creep is idle repaint noise.
+    let floor = 2048u64;
+    assert!(idle_output_is_activity(0, 2048, floor), "a burst at the floor is activity");
+    assert!(idle_output_is_activity(1_000, 10_000, floor));
+    assert!(!idle_output_is_activity(0, 200, floor), "a 200-byte statusline repaint is noise");
+    assert!(!idle_output_is_activity(5_000, 5_200, floor), "sub-floor creep is not work");
+    assert!(!idle_output_is_activity(5_000, 5_000, floor), "no growth is not activity");
+    assert!(!idle_output_is_activity(5_000, 10, floor), "a counter reset (pty swap) is not activity");
+}
+
+#[test]
+fn idle_tick_tolerates_repaint_noise_but_resets_on_real_output() {
+    // Root cause (b) regression: an idle orchestrator that emits periodic sub-floor
+    // repaints (statusline/spinner) kept `output_total` creeping, so treating any
+    // growth as activity reset the quiet clock every time and the tick never fired.
+    let (reg, _d, gid, oid) = autonomous_setup();
+    let m = |total: u64| -> HashMap<String, u64> { [(oid.clone(), total)].into_iter().collect() };
+    let none = HashMap::new();
+    // Sub-floor repaint growth over time must NOT reset the quiet clock: the tick
+    // still fires after the threshold.
+    assert!(reg.idle_tick_tick(1_000, &m(500), &none).is_empty(), "an early sub-floor repaint is not a tick");
+    assert_eq!(reg.idle_tick_tick(FAR, &m(900), &none), vec![oid.clone()],
+        "repaint-only growth must not starve the tick — it fires after the threshold");
+    assert_eq!(audit_count(&reg, &gid, "idle-tick"), 1);
+    // A REAL burst (>= floor) after the tick IS genuine activity: it resets the
+    // clock and re-arms the latch, so this very pass can't fire.
+    assert!(reg.idle_tick_tick(FAR, &m(5_000), &none).is_empty(),
+        "a real output burst re-arms the latch and resets the clock");
+    // No immediate re-fire right after real activity...
+    assert!(reg.idle_tick_tick(FAR + 60_000, &m(5_000), &none).is_empty(),
+        "no re-fire within the window after real output");
+    // ...but after a fresh full (5-min) window of quiet — repaint noise tolerated —
+    // it fires again.
+    assert_eq!(reg.idle_tick_tick(FAR + 5 * 60_000 + 1, &m(5_000), &none), vec![oid.clone()],
+        "a fresh threshold of quiet after activity earns a new tick");
+    assert_eq!(audit_count(&reg, &gid, "idle-tick"), 2);
+}
+
+#[test]
+fn idle_tick_minutes_is_configurable_persisted_and_surfaced() {
+    // Root cause (a) fix: the window is a live-adjustable per-group knob (default 5),
+    // so the human can drop it to 1–2 min to verify quickly, and the panel can see it.
+    let (reg, dir, gid, _oid) = autonomous_setup();
+    assert_eq!(reg.autonomy_state(&gid)["idle_tick_minutes"].as_u64().unwrap(), 5,
+        "shipped default window is 5 minutes");
+    // Live-set to 2 min: applied, persisted to the live guardrail, surfaced, audited.
+    assert_eq!(reg.set_idle_tick_minutes(&gid, 2).unwrap(), 2);
+    assert_eq!(reg.group(&gid).unwrap().guardrails.idle_tick_minutes, 2);
+    assert_eq!(reg.autonomy_state(&gid)["idle_tick_minutes"].as_u64().unwrap(), 2);
+    assert_eq!(audit_count(&reg, &gid, "idle-tick-minutes-set"), 1);
+    // 0 coerces to the default (never "off" — the marker is the switch); huge clamps.
+    assert_eq!(reg.set_idle_tick_minutes(&gid, 0).unwrap(), 5);
+    assert_eq!(reg.set_idle_tick_minutes(&gid, 100_000).unwrap(), 1440);
+    assert!(reg.set_idle_tick_minutes("no-such-group", 5).is_err());
+    // Observability while ON: quiet_secs + eligible_in_secs are live, and the
+    // countdown never exceeds the window.
+    reg.set_idle_tick_minutes(&gid, 5).unwrap();
+    let st = reg.autonomy_state(&gid);
+    assert!(st["quiet_secs"].as_u64().is_some(), "quiet_secs is live while autonomous is on");
+    let eligible = st["eligible_in_secs"].as_u64().unwrap();
+    assert!(eligible <= 5 * 60, "eligible_in_secs counts down within the window, got {eligible}");
+    // Persisted across restart (live-set value wins over the launch default).
+    let reg2 = OrchRegistry::new(dir.path().to_path_buf());
+    reg2.set_port(45999);
+    reg2.create_group("C:/tmp/repo", rails()).unwrap();
+    assert_eq!(reg2.group(&gid).unwrap().guardrails.idle_tick_minutes, 5,
+        "a live-set window survives restart");
+    // OFF: no live meter.
+    reg.set_autonomous(&gid, false).unwrap();
+    let off = reg.autonomy_state(&gid);
+    assert!(off["quiet_secs"].is_null(), "no quiet meter while autonomous is off");
+    assert!(off["eligible_in_secs"].is_null());
 }
 
 #[test]

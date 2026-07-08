@@ -132,6 +132,7 @@ pub fn run() {
             orchestration::orch_set_autonomous,
             orchestration::orch_set_auto_merge,
             orchestration::orch_set_autonomy_budget,
+            orchestration::orch_set_idle_tick_minutes,
             orchestration::orch_autonomy,
             orchestration::orch_group_usage,
             orchestration::orch_group_summary,

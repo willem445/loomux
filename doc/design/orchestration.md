@@ -451,9 +451,26 @@ the two cost/safety controls the unattended-spend risk demands.
   gate/latch/cap/pause logic pure and fixture-testable with synthetic maps — the
   `watchdog_tick` shape. An orchestrator output-quiet past `IDLE_TICK_MINUTES` (15, a fixed
   constant in v1) earns exactly one audited (`idle-tick`) `[loomux] idle tick` notice via
-  `deliver_to_orchestrator` telling it to run its cadence and **start** labeled work. The
-  threshold arithmetic is the pure `idle_tick_should_fire`.
-- **Self-regulating + capped.** Output growth (the orchestrator acting) resets the quiet
+  `deliver_to_orchestrator` (mid-session delivery — the same #43-hardened paste path a live
+  orchestrator receives any prompt through) telling it to run its cadence and **start** labeled
+  work. The threshold arithmetic is the pure `idle_tick_should_fire`.
+- **Window: 5 min default, per-group tunable.** `Guardrails.idle_tick_minutes` (default
+  `DEFAULT_IDLE_TICK_MINUTES` = 5; 0 → default, floored at 1 — the `autonomous` marker, not
+  this, is the on/off switch; persisted in group.json, live-settable via
+  `set_idle_tick_minutes`). The original 15-min fixed constant was the root cause of a live
+  test where an 8-minute autonomous session simply never fired; 5 min matches the human's
+  "action within a few minutes" expectation, and the knob lets them drop to 1–2 min to verify.
+- **Repaint-tolerant quiet signal.** `output_total` counts *every* byte, including
+  statusline/spinner repaints that keep creeping while the CLI is parked — and there is no
+  output-frame classifier (the #112 work classifies human *input*, not output). So treating
+  *any* growth as activity (as the watchdog does) let a single stray repaint byte reset the
+  whole quiet window, so an orchestrator that repaints even occasionally could never
+  accumulate a full window and never ticked. The idle tick instead discriminates by size (pure
+  `idle_output_is_activity`): only per-tick growth `>= IDLE_TICK_REPAINT_FLOOR` (2048 bytes — a
+  real turn dumps many KB, an idle repaint at most a few hundred) counts as the orchestrator
+  working and resets the clock + latch; sub-floor growth rebaselines the counter but leaves the
+  quiet clock running. So one repaint can never demand another full window of silence.
+- **Self-regulating + capped.** A real output burst (the orchestrator acting) resets the quiet
   clock **and** clears the one-notice latch (`AgentEntry.idle_tick_notified`, mirroring
   `watchdog_notified`), so the worst case is one tick per idle window — an action defers the
   next tick, so it can't tight-loop. A hard `MAX_IDLE_TICKS_PER_HOUR` backstop (per-group
@@ -462,6 +479,9 @@ the two cost/safety controls the unattended-spend risk demands.
   (belt-and-suspenders on top of output-silence), so a tick never lands while the human is
   steering. **Paused** groups are skipped wholesale and their latch left intact (same
   reasoning as the watchdog).
+- **Observability.** Because the tick is otherwise invisible until it fires, `orch_autonomy`
+  surfaces `idle_tick_minutes` plus (while on) `quiet_secs` and `eligible_in_secs`, so the
+  panel can render "next tick in ~Xm" and the human isn't left wondering whether it's armed.
 - **The toggle.** Off by default. `is_autonomous`/`set_autonomous` on the `set_notify`
   marker-file pattern (an `autonomous` marker), so it's live-togglable from the group panel
   and survives restarts (re-seeded in `create_group` next to `paused`/`notify`). The label
@@ -502,10 +522,11 @@ the two cost/safety controls the unattended-spend risk demands.
   risky/ambiguous for the human.
 - **Commands (frozen contract; W2 builds the UI against it).** `orch_set_autonomous(group_id,
   enabled)`, `orch_set_auto_merge(group_id, enabled)`, `orch_set_autonomy_budget(group_id,
-  tokens) -> u64`, and `orch_autonomy(group_id) -> { autonomous, auto_merge, budget_tokens,
-  budget_anchor_tokens, spend_since_enable_tokens, suspended }` — the one read the group panel
-  renders all three controls, the live budget meter, and the budget-suspended state from.
-  Registered in `lib.rs` beside `orch_set_notify`.
+  tokens) -> u64`, `orch_set_idle_tick_minutes(group_id, minutes) -> u32`, and
+  `orch_autonomy(group_id) -> { autonomous, auto_merge, budget_tokens, budget_anchor_tokens,
+  spend_since_enable_tokens, suspended, idle_tick_minutes, quiet_secs, eligible_in_secs }` — the
+  one read the group panel renders all controls, the live budget meter, the budget-suspended
+  state, and the idle-tick countdown from. Registered in `lib.rs` beside `orch_set_notify`.
 - **This group could be affected.** The feature is generic — loomux's own orchestration group is
   just another group, so nothing special-cases it. Turning autonomous mode on for the group
   loomux is developed in would idle-tick *its* orchestrator like any other.
