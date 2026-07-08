@@ -185,3 +185,23 @@ export function tickStatusLabel(status: TickStatus, eligibleInSecs: number | nul
       return "";
   }
 }
+
+// ---------- human grant inputs (approve-with-comment / release, #83) ----------
+
+/** Normalize an optional free-text grant comment to what the backend commands
+ *  expect: the trimmed string, or `null` when empty/whitespace (→ Rust
+ *  `Option::None`, i.e. "grant only, no note"). Used by both the board
+ *  approve-with-comment flow and the release-grant control. */
+export function normalizeComment(raw: string): string | null {
+  const t = raw.trim();
+  return t === "" ? null : t;
+}
+
+/** Whether a release tag is well-formed enough to authorize: non-empty after
+ *  trim and free of internal whitespace (a git tag can't contain spaces; the
+ *  backend sanitizes further). Gates the release-grant button so an obviously
+ *  invalid tag never round-trips. */
+export function isValidReleaseTag(raw: string): boolean {
+  const t = raw.trim();
+  return t.length > 0 && !/\s/.test(t);
+}

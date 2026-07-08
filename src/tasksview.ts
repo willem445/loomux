@@ -9,6 +9,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { swapIfConnected } from "./domutil";
 import { doneCount, retainExisting } from "./taskboard";
+import { approveTask } from "./orchestration";
+import { normalizeComment } from "./autonomy";
 
 export interface OrchTaskNote {
   ts_ms: number;
@@ -265,6 +267,64 @@ export class TasksView {
     );
   }
 
+  /** Merge-gate "approve & allow merge": a modal confirm that makes explicit
+   *  this AUTHORIZES the merge (a real one-time grant, not just a status flip),
+   *  with an optional instructions box delivered to the orchestrator. Empty
+   *  comment = plain approve (grant only). The modal step is the confirm — a
+   *  bare click never issues a grant. */
+  private approveWithComment(t: OrchTask): void {
+    if (this.dialogEl) return; // one dialog at a time
+    const overlay = el("div", "tasks-dialog");
+    const box = el("div", "tasks-dialog-box");
+    box.append(el("div", "tasks-dialog-title", `Approve & allow merge — ${t.id}`));
+    box.append(
+      el(
+        "div",
+        "tasks-dialog-note",
+        "This authorizes exactly one merge of this PR (single-use grant, expires in ~30 min) " +
+          "and tells the orchestrator to merge. Add optional instructions, or leave empty to just approve."
+      )
+    );
+
+    const ta = document.createElement("textarea");
+    ta.className = "dlg-input tasks-dialog-text";
+    ta.placeholder = "Optional instructions for the agent — e.g. \"squash-merge and delete the branch\".";
+    ta.spellcheck = false;
+    ta.rows = 3;
+
+    const actions = el("div", "dlg-actions");
+    const cancel = el("button", "dlg-btn", "Cancel") as HTMLButtonElement;
+    const confirm = el("button", "dlg-btn primary", "Approve & allow merge") as HTMLButtonElement;
+    actions.append(cancel, confirm);
+    box.append(ta, actions);
+    overlay.append(box);
+
+    const close = () => {
+      overlay.remove();
+      this.dialogEl = null;
+    };
+    const submit = () => {
+      close();
+      // Empty/whitespace comment → null (grant only, no note).
+      void this.mutate(approveTask(this.groupId, t.id, normalizeComment(ta.value)));
+    };
+    cancel.addEventListener("click", close);
+    confirm.addEventListener("click", submit);
+    // Keep keystrokes off the underlying terminal; Esc cancels, Ctrl/⌘+Enter confirms.
+    ta.addEventListener("keydown", (e) => {
+      e.stopPropagation();
+      if (e.key === "Escape") close();
+      if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) submit();
+    });
+    overlay.addEventListener("mousedown", (e) => {
+      if (e.target === overlay) close();
+    });
+
+    this.dialogEl = overlay;
+    this.el.appendChild(overlay);
+    ta.focus();
+  }
+
   /** Merge-gate "request changes": collect findings in a modal, then hand
    *  them to the orchestrator (which routes them back to a worker). */
   private requestChanges(t: OrchTask): void {
@@ -465,11 +525,11 @@ export class TasksView {
     // Merge-gate actions: the human's approve / request-changes touchpoints,
     // shown only where they belong — on items awaiting the merge decision.
     if (t.status === "pr" || t.status === "human-testing") {
-      const approve = el("button", "task-btn approve", "✓ Approve") as HTMLButtonElement;
-      approve.title = "Mark done and tell the orchestrator to merge";
-      approve.addEventListener("click", () =>
-        void this.mutate(invoke("orch_approve_task", { groupId: this.groupId, id: t.id }))
-      );
+      const approve = el("button", "task-btn approve", "✓ Approve & allow merge") as HTMLButtonElement;
+      approve.title =
+        "Authorize the merge: write a one-time grant for this PR and tell the orchestrator to merge " +
+        "(optionally with instructions). The grant is single-use and expires in ~30 min.";
+      approve.addEventListener("click", () => this.approveWithComment(t));
       const changes = el("button", "task-btn changes", "✎ Changes") as HTMLButtonElement;
       changes.title = "Request changes — send findings back to the orchestrator";
       changes.addEventListener("click", () => this.requestChanges(t));

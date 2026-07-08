@@ -1186,6 +1186,7 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   animation: dlg-in 0.16s var(--ease);
 }
 .tasks-dialog-title { font-weight: 600; font-size: 12px; }
+.tasks-dialog-note { font-size: 10.5px; line-height: 1.4; color: var(--text-dim); }
 .tasks-dialog-text { resize: vertical; min-height: 66px; line-height: 1.4; }
 
 .task-notes { padding: 3px 4px 5px 26px; }
@@ -1398,6 +1399,35 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   font-size: 9.5px; font-weight: 600; border-radius: 4px; padding: 1px 7px;
   background: rgba(224, 175, 104, 0.16); color: #e0af68;
 }
+
+/* -- release-grant control (#83): collapsed power action -- */
+.group-releaserow {
+  display: flex; flex-direction: column; gap: 6px; flex: none;
+  padding: 6px 12px; border-bottom: 1px solid var(--border-soft);
+}
+.group-release-toggle {
+  align-self: flex-start; font: inherit; font-size: 11px; cursor: pointer;
+  background: none; border: none; color: var(--text-dim); padding: 0;
+}
+.group-release-toggle:hover { color: var(--text); }
+.group-release-body[hidden] { display: none; }
+.group-release-body { display: flex; flex-direction: column; gap: 6px; }
+.group-release-copy { color: #e0af68; font-size: 10px; line-height: 1.4; opacity: 0.9; }
+.group-release-inputs { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.group-release-tag, .group-release-comment {
+  font: inherit; font-size: 12px;
+  background: var(--panel-2); color: var(--text);
+  border: 1px solid var(--border-soft); border-radius: 5px; padding: 2px 6px;
+}
+.group-release-tag { width: 120px; }
+.group-release-comment { flex: 1; min-width: 140px; }
+.group-release-tag:focus, .group-release-comment:focus {
+  outline: none; border-color: var(--accent);
+}
+.group-btn.sm.armed {
+  background: rgba(224, 175, 104, 0.2); color: #e0af68; border-color: #6a5230;
+}
+.group-release-err { color: var(--danger); font-size: 10px; }
 /* The roster is the ONLY shrinkable element: min-height:0 lets it collapse and
    scroll so the fixed chrome above (header/summary/max/autonomous) and the
    footer below always render — nothing clips under .group-view's overflow:hidden

@@ -481,11 +481,14 @@ delivery is suppressed, so the nudge would otherwise be silently lost.
 
 **Merge gate:** when an item reaches `pr` or `human-testing` — the point where
 only you can decide — the board shows two buttons instead of making you type
-into the orchestrator. **✓ Approve** marks the item done and tells the
-orchestrator to merge. **✎ Changes** opens a box for your findings, records
-them on the board, and sends them to the orchestrator to route back to a
-worker. Both land as a message in the orchestrator pane, exactly as if you'd
-written it.
+into the orchestrator. **✓ Approve & allow merge** opens a small confirm with an
+optional instructions box: confirming marks the item done, writes a **one-time,
+~30-minute merge grant** for its PR (single-use — good for exactly one merge of
+your default branch, then it's spent or it expires), and tells the orchestrator
+to merge — with your note attached if you added one (leave it empty to just
+approve). **✎ Changes** opens a box for your findings, records them on the board,
+and sends them to the orchestrator to route back to a worker. Both land as a
+message in the orchestrator pane, exactly as if you'd written it.
 
 **Steering strip:** the orchestrator pane has a thin compose field docked
 under its terminal (styled like the board's *Add a task* field). Type steering
@@ -622,6 +625,15 @@ now), *waiting (orchestrator recently active)* (it just did work — the clock
 resets), *hourly cap — next in ~X* (the per-hour tick cap is full), or
 *paused — ticks suspended*. A countdown is shown only when one genuinely exists,
 so the timer never lies about when the next tick lands.
+
+Below that sits a collapsed **Authorize a release…** control. Releases have no
+board task (they aren't a PR), so this is your path to grant one: expand it, type
+the tag (e.g. `v1.2.3`) and optional instructions, and confirm. It writes a
+**one-time, ~30-minute** grant that authorizes exactly one publish of that tag
+(GitHub release + npm) — single-use, then spent or expired. **Releases are never
+auto-approved by autonomous mode**, so this explicit grant is the only path even
+with auto-merge on. Like Approve, the grant is single-use and short-lived; if CI
+takes longer than the window, just authorize again.
 
 **Restart after loomux closes:** orchestration sessions are marked in the
 session browser (`ORCH` / `W` / `REV` chips). Clicking a dead group's
