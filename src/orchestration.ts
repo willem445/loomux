@@ -38,6 +38,10 @@ export interface OrchSpawnRequest {
    *  the agent executable directly when it resolves, else falls back to
    *  `command`. Absent on payloads from an older backend. */
   argv?: string[];
+  /** Extra per-pane env (#83): the gh-shim PATH + `LOOMUX_GROUP_DIR` that enforce
+   *  the merge gate on agent panes. `[key, value]` pairs; absent on an older
+   *  backend or for panes with nothing extra to inject. */
+  env?: [string, string][];
 }
 
 /** Launcher-collected group settings; guardrails are enforced backend-side. */
@@ -186,6 +190,7 @@ async function openAgentPane(
       cwd: req.cwd,
       command: req.command,
       argv: req.argv,
+      env: req.env,
       badge: badgeFor(req),
       orchGroup: req.group_id,
       orchRole: req.role,

@@ -550,6 +550,50 @@ the two cost/safety controls the unattended-spend risk demands.
   Spawns a tick induces still count against `max_spawns_per_hour`. The human's pause/off-switch
   is instant.
 
+## Enforced merge gate (#83)
+
+Template guidance is not a security boundary. A live incident proved it: an orchestrator merged
+four PRs straight to `main`, ignoring the "never merge" instruction. So the human merge gate is
+now **structurally enforced** — an agent that tries to merge onto the default branch without
+consent is *blocked*, not advised.
+
+- **The interceptor.** Every *agent* pane (orchestrator/worker/reviewer/planner) is spawned with
+  a loomux `gh` shim prepended to its `PATH` and `LOOMUX_GROUP_DIR` set to its group's state dir.
+  The shim (`ensure_gh_shim`, written once under `<data>/loomux/ghshim`) is a POSIX `gh` script
+  (plus a Windows `gh.cmd` that delegates to it) with the *real* gh's absolute path baked in, so
+  it never re-resolves to itself. Injection is per-pane via a new `SpawnRequest.env` →
+  `spawn_pty(env)` → `apply_extra_env` path, so **only agent panes** carry it — a human's own
+  shell (in loomux or out) has an untouched `PATH` and pays zero shim overhead. On Windows the
+  shim dir is first on `PATH`, and the agent's Bash tool (Git Bash, where Claude Code runs `gh`)
+  resolves the extension-less `gh` script ahead of the real `gh.exe`.
+- **The decision** is the pure, unit-tested `gh_gate_decision` (the shim mirrors it in shell):
+  only `gh pr merge` (and cheap `gh api` merge shapes — `gh_is_merge_invocation`) is gated; the
+  shim asks the *real* gh for the PR's `baseRefName` and the repo's `defaultBranchRef`. A base
+  **≠ default** passes through untouched (the integration-branch flow agents rely on); a base
+  **= default** is allowed **only** when both the `autonomous` and `auto_merge` markers are
+  present; an **undeterminable** base fails safe (block). Every refusal/allow is appended to the
+  group's `audit.jsonl` in the backend's own line format (`actor: "gh-shim"`), and refusals exit
+  non-zero with a clear message telling the agent to report to the human.
+- **The dependency.** Auto-merge authority exists *only* in autonomous mode, enforced at the API,
+  not just the UI: `set_auto_merge(true)` is **rejected** unless autonomous is on; turning
+  autonomous **off force-disables** auto-merge (audited); and a stale on-disk `auto_merge`-without-
+  `autonomous` combo (older group, hand-edited state) is **reconciled off on read** (audited). So
+  the gate's "both markers present" test can never be satisfied by an orphaned `auto_merge`
+  marker. The UI mirrors this (`approvalControl`): with autonomous off the "Require human
+  approval" checkbox is locked checked with a tooltip.
+- **Honest bypass surface** (documented, not hidden). The shim raises the cost of an unattended
+  bad merge from "type one command" to "deliberately evade a named control," but a determined
+  agent with shell access *can* still: (1) call gh by its **absolute path**, skipping `PATH`
+  entirely; (2) use a **raw REST/GraphQL** merge shape the cheap substring match doesn't catch
+  (unusual `gh api` forms, a direct `curl` to the API with a token, or a library); (3) run in a
+  **cmd/pwsh** pane with no `sh` on `PATH` (the `gh.cmd` fallback runs the real gh). These are
+  intentional trade-offs: catching every shape would need sandboxing or network egress control,
+  out of scope here. **The gold-standard closing layer is a machine account**: give agents a
+  GitHub token whose account has *no merge permission on the default branch* (branch protection
+  requiring a human/CODEOWNER review). Then no client-side evasion matters — the server refuses
+  the merge. The shim is the cheap, local, always-on first layer; the machine account is the
+  authoritative one, and the two compose.
+
 ## Human-input paste guard (#111)
 
 The quiet backstop (#43, `wait_for_user_quiet`) only waits out *active* typing — it releases

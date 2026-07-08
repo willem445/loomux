@@ -340,6 +340,17 @@ fn apply_pane_env(mut cmd: CommandBuilder, cwd: Option<&str>) -> CommandBuilder 
     cmd
 }
 
+/// Apply per-pane extra environment on top of the shared pane env (#83). Set
+/// LAST so an agent pane's injected `PATH` (gh-shim prefix + fresh PATH) and
+/// `LOOMUX_GROUP_DIR` win over the defaults from `apply_pane_env`. Empty for a
+/// plain human shell, so those panes are byte-for-byte unchanged.
+fn apply_extra_env(mut cmd: CommandBuilder, env: &[(String, String)]) -> CommandBuilder {
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    cmd
+}
+
 /// Build the shell-wrapper child command — the pre-#78 path and the universal
 /// fallback. The `command` string is run *through* the default shell so PATH
 /// shims resolve the same way they do in a normal terminal; a plain interactive
@@ -418,9 +429,10 @@ pub fn spawn_pane_child(
     command: Option<&str>,
     argv: Option<&[String]>,
     cwd: Option<&str>,
+    env: &[(String, String)],
 ) -> Result<(Box<dyn portable_pty::Child + Send + Sync>, bool), String> {
     if let Some(direct) = argv.and_then(try_direct_command) {
-        let direct = apply_pane_env(direct, cwd);
+        let direct = apply_extra_env(apply_pane_env(direct, cwd), env);
         match slave.spawn_command(direct) {
             Ok(child) => return Ok((child, true)),
             Err(e) => {
@@ -431,7 +443,7 @@ pub fn spawn_pane_child(
             }
         }
     }
-    let shell = build_shell_command(command, cwd);
+    let shell = apply_extra_env(build_shell_command(command, cwd), env);
     slave
         .spawn_command(shell)
         .map(|c| (c, false))
@@ -450,6 +462,10 @@ pub fn spawn_pty(
     // program resolves to a native executable, the pane spawns it directly as
     // the ConPTY child instead of wrapping `command` in a shell (issue #78).
     argv: Option<Vec<String>>,
+    // Extra per-pane env, set on top of the shared pane env (#83). Agent panes
+    // pass the gh-shim PATH prefix + LOOMUX_GROUP_DIR here to enforce the merge
+    // gate; a plain human shell passes nothing and is unchanged.
+    env: Option<Vec<(String, String)>>,
 ) -> Result<u32, String> {
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -468,6 +484,7 @@ pub fn spawn_pty(
         command.as_deref(),
         argv.as_deref(),
         cwd.as_deref(),
+        env.as_deref().unwrap_or(&[]),
     )?;
     drop(pair.slave);
 

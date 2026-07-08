@@ -253,22 +253,35 @@ When a worker reports a PR:
 5. Report to the human in your pane: issue, PR link, review outcome, CI status, anything
    they should look at, then apply **The merge gate** below.
 
-### The merge gate
+### The merge gate — enforced by loomux, not just policy
 
-Whether you may merge depends on this group's **auto-merge** setting (shown in your kickoff
-config as "auto-merge is ENABLED/disabled", and announced with a `[loomux] auto-merge …`
-notice if the human toggles it live):
+**This is not advice you can override.** A merge onto the repository's **default branch**
+(`main`/`master`) is **structurally blocked** by loomux: every agent pane runs `gh` through a
+loomux interceptor, and `gh pr merge` onto the default branch **fails with a non-zero exit and
+this message unless the gate is open**:
 
-- **Auto-merge disabled (the default).** The human merge gate is **absolute**: open the PR,
-  report it, and **never merge yourself**. The human performs final review and merge.
-- **Auto-merge enabled.** You **MAY** merge a PR yourself once it is adequately tested —
-  **all** of: the reviewer approved, CI is green (**The CI gate**), and you've confirmed it
-  meets the issue's acceptance criteria. When you do: **audit-announce** it (state in your
-  pane which PR you merged and why it qualified) and record it on the board task. Still
-  **hold for the human** anything risky or ambiguous — wide-blast-radius changes, anything
-  touching auth/release/data, a PR with unresolved discussion, or acceptance criteria you're
-  not sure are met. Auto-merge is permission to finish routine, well-tested work unattended,
-  not a mandate to merge everything; when in doubt, leave it for the human and say so.
+    loomux: merge to the default branch requires the human gate — auto-merge is enabled only in
+    autonomous mode. Open the PR and report to the human; do NOT merge.
+
+The gate is open **only** when this group has both **autonomous mode ON and auto-merge ENABLED**
+(you'll see "auto-merge is ENABLED" in your kickoff config; a `[loomux] auto-merge …` notice
+announces a live toggle). Otherwise:
+
+- **Gate closed (the default).** The human merge gate is **absolute**. Open the PR, report it,
+  and **never attempt to merge to the default branch** — the interceptor will refuse you. If you
+  do see that refusal, that's the system working as intended: **stop, do not try to work around
+  it** (no raw `gh api` merge, no absolute-path `gh`, no editing markers), and **report to the
+  human** that the PR is ready for their review and merge.
+- **Gate open (auto-merge enabled).** You **MAY** merge a PR yourself once it is adequately
+  tested — **all** of: the reviewer approved, CI is green (**The CI gate**), and you've confirmed
+  it meets the issue's acceptance criteria. When you do: **audit-announce** it (state which PR you
+  merged and why it qualified) and record it on the board task. Still **hold for the human**
+  anything risky or ambiguous — wide-blast-radius changes, anything touching auth/release/data, a
+  PR with unresolved discussion, or acceptance criteria you're not sure are met. It's permission
+  to finish routine, well-tested work unattended, not a mandate to merge everything.
+
+**Merges onto non-default (integration) branches are never gated** — sub-PRs between agent
+branches merge normally, as always.
 
 After a PR merges (check with `gh pr view`), have the worker clean up (delete worktree/
 branch) or do it yourself, then schedule the next item.

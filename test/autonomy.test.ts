@@ -5,6 +5,8 @@ import assert from "node:assert/strict";
 import {
   requireApprovalChecked,
   autoMergeFromApproval,
+  approvalControl,
+  AUTO_MERGE_REQUIRES_AUTONOMOUS,
   budgetMeter,
   formatTokens,
   formatCountdown,
@@ -33,6 +35,29 @@ test("inversion round-trips both directions", () => {
     const checked = requireApprovalChecked(autoMerge);
     assert.equal(autoMergeFromApproval(checked), autoMerge);
   }
+});
+
+// ---------- auto-merge depends on autonomous mode (#83 enforced gate) ----------
+
+test("approval control is locked-checked while autonomous is off", () => {
+  // Autonomous OFF: auto-merge can't exist, so the control is forced to
+  // "approval required" and disabled with the explanatory tooltip — regardless of
+  // any stale auto_merge flag (the backend reconciles it off too).
+  for (const stale of [false, true]) {
+    const c = approvalControl(false, stale);
+    assert.equal(c.checked, true, "approval required while autonomous off");
+    assert.equal(c.disabled, true, "the control is locked while autonomous off");
+    assert.equal(c.tooltip, AUTO_MERGE_REQUIRES_AUTONOMOUS);
+  }
+});
+
+test("approval control is editable and reflects auto_merge while autonomous on", () => {
+  // Autonomous ON, auto_merge OFF → approval required, editable, no tooltip.
+  const off = approvalControl(true, false);
+  assert.deepEqual(off, { checked: true, disabled: false, tooltip: "" });
+  // Autonomous ON, auto_merge ON → approval not required, editable.
+  const on = approvalControl(true, true);
+  assert.deepEqual(on, { checked: false, disabled: false, tooltip: "" });
 });
 
 // ---------- budget meter math ----------
