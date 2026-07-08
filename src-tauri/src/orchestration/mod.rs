@@ -21,7 +21,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
@@ -103,17 +103,34 @@ loomux_audit() { # $1=action $2=detail-json
   fi
 }
 loomux_block() { # $1=reason $2=base $3=pr
-  printf '%s\n' "loomux: merge to the default branch requires the human gate — auto-merge is enabled only in autonomous mode. Open the PR and report to the human; do NOT merge." >&2
+  printf '%s\n' "loomux: merge to the default branch requires the human gate — enable auto-merge (autonomous mode) or have the human grant this one merge (board Approve). Open the PR and report to the human; do NOT merge." >&2
   loomux_audit "merge-gate-blocked" "{\"reason\":\"$1\",\"base\":\"$2\",\"pr\":\"$3\"}"
   exit 1
 }
+loomux_block_release() { # $1=tag $2=action
+  printf '%s\n' "loomux: publishing a release/tag ($1) requires an explicit human grant — releases publish to the world (GitHub release + npm), which autonomous mode does NOT authorize. Ask the human to grant the release; do NOT publish." >&2
+  loomux_audit "release-gate-blocked" "{\"tag\":\"$1\",\"action\":\"$2\"}"
+  exit 1
+}
+# Consume a one-time grant file: delete it (one use only) and return 0 iff it was
+# present AND unexpired (expiry = unix seconds on line 1). Expired grants are
+# cleaned up too. Reading is atomic on the writer side (see atomic_write).
+loomux_grant_ok() { # $1=grantfile
+  gf="$1"
+  [ -f "$gf" ] || return 1
+  exp=$(head -n1 "$gf" 2>/dev/null)
+  case "$exp" in ''|*[!0-9]*) exp=0 ;; esac
+  now=$(date +%s 2>/dev/null); [ -z "$now" ] && now=0
+  rm -f "$gf"
+  [ "$now" -lt "$exp" ]
+}
 
 # Parse the argv ONCE (mirrors the Rust gh_positionals / gh_repo_flag spec):
-# collect the command (cmd), subcommand (sub), the PR selector (sel = 3rd
-# positional), and the -R/--repo value (repo) — skipping flags and consuming the
-# values of value-taking flags. gh accepts -R/--repo (and other flags) BEFORE or
-# BETWEEN the command tokens, so scanning for positionals — not fixed argv slots —
-# is what closes the `gh -R o/r pr merge` / `gh pr -R o/r merge` hole (rev-79 F1).
+# collect the command (cmd), subcommand (sub), the target selector (sel = 3rd
+# positional: a PR ref for `pr merge`, a tag for `release …`), and the -R/--repo
+# value — skipping flags and consuming the values of value-taking flags. gh accepts
+# -R/--repo (and other flags) BEFORE or BETWEEN the command tokens, so scanning for
+# positionals — not fixed argv slots — closes the `gh -R o/r pr merge` hole.
 cmd=""; sub=""; sel=""; repo=""; want=""
 for tok in "$@"; do
   if [ "$want" = "repo" ]; then repo="$tok"; want=""; continue; fi
@@ -122,8 +139,8 @@ for tok in "$@"; do
     -R|--repo) want="repo"; continue ;;
     --repo=*) repo="${tok#--repo=}"; continue ;;
     -R?*) repo="${tok#-R}"; continue ;;
-    -b|--body|-t|--subject|-F|--body-file|--author-email|--match-head-commit) want="skip"; continue ;;
-    --body=*|--subject=*|--body-file=*|--author-email=*|--match-head-commit=*) continue ;;
+    -b|--body|-t|--subject|--title|-F|--body-file|--author-email|--match-head-commit|-n|--notes|--notes-file|--notes-start-tag|--target|--discussion-category) want="skip"; continue ;;
+    --body=*|--subject=*|--title=*|--body-file=*|--author-email=*|--match-head-commit=*|--notes=*|--notes-file=*|--notes-start-tag=*|--target=*|--discussion-category=*) continue ;;
     -*) continue ;;
     *)
       if [ -z "$cmd" ]; then cmd="$tok"
@@ -132,6 +149,25 @@ for tok in "$@"; do
       fi ;;
   esac
 done
+
+# RELEASE/TAG publish (#83): create/edit/delete a release is a publish-to-the-world
+# action — gated on an explicit release grant, NEVER blanket-allowed by autonomous
+# mode. Read-only release subcommands (view/list/download) pass through.
+if [ "$cmd" = "release" ]; then
+  case "$sub" in
+    create|edit|delete)
+      tag="$sel"
+      safe=$(printf '%s' "$tag" | tr -c 'A-Za-z0-9._-' '_')
+      gf=""
+      [ -n "$LOOMUX_GROUP_DIR" ] && [ -n "$safe" ] && gf="$LOOMUX_GROUP_DIR/release_grants/$safe"
+      if [ -n "$gf" ] && loomux_grant_ok "$gf"; then
+        loomux_audit "release-gate-granted" "{\"tag\":\"$tag\",\"action\":\"$sub\"}"
+        exec "$REAL_GH" "$@"
+      fi
+      loomux_block_release "$tag" "$sub" ;;
+    *) exec "$REAL_GH" "$@" ;;
+  esac
+fi
 
 # Is this a merge we must gate? `gh pr merge` (wherever flags land), or an api shape.
 is_merge=0
@@ -153,12 +189,14 @@ if [ "$cmd" = "api" ]; then
   loomux_block "api-merge" "(api)" "?"
 fi
 
-# Resolve the PR's base branch and the repo's default branch via the REAL gh,
-# honoring the SAME -R/--repo the user passed so both resolve for the right repo
-# (rev-79 F2) — not always the cwd repo.
+# Resolve the PR's base branch AND number via the REAL gh (one call), honoring the
+# SAME -R/--repo the user passed (rev-79 F2). The number keys the per-PR grant, so
+# a grant for one PR can't authorize merging another.
 rf=""
 [ -n "$repo" ] && rf="-R $repo"
-base=$("$REAL_GH" pr view $rf $sel --json baseRefName --jq .baseRefName 2>/dev/null)
+info=$("$REAL_GH" pr view $rf $sel --json baseRefName,number --jq '.baseRefName+" "+(.number|tostring)' 2>/dev/null)
+base=${info%% *}
+num=${info##* }
 default=$("$REAL_GH" repo view $rf --json defaultBranchRef --jq .defaultBranchRef.name 2>/dev/null)
 
 if [ -z "$base" ] || [ -z "$default" ]; then
@@ -167,14 +205,25 @@ fi
 if [ "$base" != "$default" ]; then
   exec "$REAL_GH" "$@"   # integration-branch merge — untouched
 fi
-# base == default: allowed only when BOTH consent markers are present.
+# base == default: blanket-allowed only when BOTH consent markers are present.
 if [ -n "$LOOMUX_GROUP_DIR" ] && [ -f "$LOOMUX_GROUP_DIR/autonomous" ] && [ -f "$LOOMUX_GROUP_DIR/auto_merge" ]; then
-  loomux_audit "merge-gate-allowed" "{\"base\":\"$default\",\"pr\":\"$sel\"}"
+  loomux_audit "merge-gate-allowed" "{\"base\":\"$default\",\"pr\":\"$num\"}"
   exec "$REAL_GH" "$@"
 fi
-loomux_block "gate-closed" "$default" "$sel"
+# Otherwise: a one-time human grant for THIS pr authorizes exactly one merge.
+gf=""
+[ -n "$LOOMUX_GROUP_DIR" ] && [ -n "$num" ] && gf="$LOOMUX_GROUP_DIR/merge_grants/pr-$num"
+if [ -n "$gf" ] && loomux_grant_ok "$gf"; then
+  loomux_audit "merge-gate-granted" "{\"base\":\"$default\",\"pr\":\"$num\"}"
+  exec "$REAL_GH" "$@"
+fi
+loomux_block "gate-closed" "$default" "$num"
 "#;
-    TPL.replace("__REAL_GH__", real_gh)
+    // Normalize to LF: the raw-string newlines follow this source file's line
+    // endings, which git may check out as CRLF on Windows — but a CRLF `#!/bin/sh`
+    // script is broken under POSIX sh. The `.cmd` wrapper (which needs CRLF) is
+    // built separately with explicit `\r\n`.
+    TPL.replace("__REAL_GH__", real_gh).replace("\r\n", "\n")
 }
 
 /// The Windows `gh.cmd` wrapper: delegates to the POSIX shim (single source of
@@ -189,6 +238,121 @@ fn gh_shim_cmd(real_gh: &str) -> String {
          for %%S in (sh.exe) do set \"LOOMUX_SH=%%~$PATH:S\"\r\n\
          if defined LOOMUX_SH (\r\n\
          \x20 \"%LOOMUX_SH%\" \"%~dp0gh\" %*\r\n\
+         ) else (\r\n\
+         \x20 \"{real_bs}\" %*\r\n\
+         )\r\n\
+         exit /b %errorlevel%\r\n"
+    )
+}
+
+/// The POSIX `git` shim (#83): gates a `git push` that publishes a TAG (a `v*`
+/// tag push triggers `release.yml` → GitHub release + npm), requiring an explicit
+/// release grant. Local `git tag` is harmless — only the push reaches the world —
+/// so only `git push` is inspected, and only when it targets a tag; every other
+/// git call (including a plain branch push) `exec`s the real git with no extra
+/// work. Mirrors the pure `git_tag_push` spec.
+#[doc(hidden)] // pub so the integration test can pin the guards
+pub fn git_shim_sh(real_git: &str) -> String {
+    const TPL: &str = r#"#!/bin/sh
+# loomux git shim (#83) — gate release/tag pushes. Generated by loomux; do not edit.
+REAL_GIT="__REAL_GIT__"
+
+loomux_audit() { # $1=action $2=detail-json
+  ts=$(date +%s%3N 2>/dev/null); [ -z "$ts" ] && ts=0
+  if [ -n "$LOOMUX_GROUP_DIR" ]; then
+    printf '{"ts_ms":%s,"actor":"git-shim","action":"%s","detail":%s}\n' "$ts" "$1" "$2" \
+      >> "$LOOMUX_GROUP_DIR/audit.jsonl" 2>/dev/null || true
+  fi
+}
+loomux_block_release() { # $1=tag $2=action
+  printf '%s\n' "loomux: pushing a release tag ($1) requires an explicit human grant — a v* tag push publishes to the world (GitHub release + npm via release.yml), which autonomous mode does NOT authorize. Ask the human to grant the release; do NOT push the tag." >&2
+  loomux_audit "release-gate-blocked" "{\"tag\":\"$1\",\"action\":\"$2\"}"
+  exit 1
+}
+loomux_grant_ok() { # $1=grantfile
+  gf="$1"
+  [ -f "$gf" ] || return 1
+  exp=$(head -n1 "$gf" 2>/dev/null)
+  case "$exp" in ''|*[!0-9]*) exp=0 ;; esac
+  now=$(date +%s 2>/dev/null); [ -z "$now" ] && now=0
+  rm -f "$gf"
+  [ "$now" -lt "$exp" ]
+}
+
+# Find the git subcommand, skipping value-taking globals. Non-push → exec now.
+cmd=""; want=""
+for tok in "$@"; do
+  if [ "$want" = "1" ]; then want=""; continue; fi
+  case "$tok" in
+    -C|-c|--git-dir|--work-tree|--namespace|--exec-path) want="1"; continue ;;
+    -*) continue ;;
+    *) cmd="$tok"; break ;;
+  esac
+done
+if [ "$cmd" != "push" ]; then
+  exec "$REAL_GIT" "$@"
+fi
+
+# Bulk tag pushes can't be matched to a single-tag grant → block with guidance.
+for a in "$@"; do
+  case "$a" in
+    --tags|--follow-tags|--mirror)
+      printf '%s\n' "loomux: a bulk tag push ($a) is not allowed — push the specific approved tag and have the human grant that release." >&2
+      loomux_audit "release-gate-blocked" "{\"tag\":\"(bulk)\",\"action\":\"push $a\"}"
+      exit 1 ;;
+  esac
+done
+
+# Scan refspecs after `push` (skip the remote) for a tag ref.
+seen=0; got_remote=0; want=""; tag=""; prevtag=0
+for tok in "$@"; do
+  if [ "$want" = "1" ]; then want=""; continue; fi
+  case "$tok" in
+    -C|-c|--git-dir|--work-tree|--namespace|--exec-path) want="1"; continue ;;
+    -*) continue ;;
+    *)
+      if [ "$seen" = "0" ]; then [ "$tok" = "push" ] && seen=1; continue; fi
+      if [ "$got_remote" = "0" ]; then got_remote=1; continue; fi
+      if [ "$prevtag" = "1" ]; then tag="$tok"; break; fi
+      if [ "$tok" = "tag" ]; then prevtag=1; continue; fi
+      dst=${tok##*:}; dst=${dst#+}
+      # Match release.yml's on.push.tags (v*) — MUST track it; a bare `v*` is only
+      # a candidate, confirmed a real tag (not a same-named branch) below.
+      case "$dst" in
+        refs/tags/*) tag=${dst#refs/tags/}; break ;;
+        v*)
+          if "$REAL_GIT" rev-parse -q --verify "refs/tags/$dst" >/dev/null 2>&1; then tag="$dst"; break; fi ;;
+      esac ;;
+  esac
+done
+
+if [ -z "$tag" ]; then
+  exec "$REAL_GIT" "$@"   # branch push — untouched
+fi
+safe=$(printf '%s' "$tag" | tr -c 'A-Za-z0-9._-' '_')
+gf=""
+[ -n "$LOOMUX_GROUP_DIR" ] && [ -n "$safe" ] && gf="$LOOMUX_GROUP_DIR/release_grants/$safe"
+if [ -n "$gf" ] && loomux_grant_ok "$gf"; then
+  loomux_audit "release-gate-granted" "{\"tag\":\"$tag\",\"action\":\"push\"}"
+  exec "$REAL_GIT" "$@"
+fi
+loomux_block_release "$tag" "push"
+"#;
+    // Normalize to LF (see gh_shim_sh) — a CRLF POSIX script is broken.
+    TPL.replace("__REAL_GIT__", real_git).replace("\r\n", "\n")
+}
+
+/// The Windows `git.cmd` wrapper: delegates to the POSIX git shim via `sh`, or runs
+/// the real git when no `sh` is on PATH (documented bypass). Same shape as gh.cmd.
+fn git_shim_cmd(real_git: &str) -> String {
+    let real_bs = real_git.replace('/', "\\");
+    format!(
+        "@echo off\r\n\
+         rem loomux git shim (#83) — delegate to the POSIX shim; run real git if no sh.\r\n\
+         setlocal\r\n\
+         for %%S in (sh.exe) do set \"LOOMUX_SH=%%~$PATH:S\"\r\n\
+         if defined LOOMUX_SH (\r\n\
+         \x20 \"%LOOMUX_SH%\" \"%~dp0git\" %*\r\n\
          ) else (\r\n\
          \x20 \"{real_bs}\" %*\r\n\
          )\r\n\
@@ -474,6 +638,18 @@ pub const MAX_ATTACHMENT_B64_LEN: usize = MAX_ATTACHMENT_BYTES / 3 * 4 + 16;
 /// distinct filenames without pulling in a randomness/uuid crate (the Windows
 /// `getrandom` backends are banned here — see the build notes).
 static ATTACH_SEQ: AtomicU32 = AtomicU32::new(0);
+
+/// Monotonic tiebreaker for grant temp-file names + grant nonces, so a grant
+/// write is atomic and each nonce is unique without a randomness/uuid crate
+/// (getrandom is banned — see the build notes). Combined with the pid it never
+/// collides across concurrent writers.
+static GRANT_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Enforced-gate grants (#83) are one-time and short-lived: a human sign-off
+/// authorizes exactly one privileged action within this window, then the grant is
+/// consumed or expires. 30 minutes is long enough for CI to finish and the merge
+/// to run, short enough that a forgotten grant can't linger as a standing opening.
+const GRANT_TTL_SECS: u64 = 30 * 60;
 
 // Copilot session tracking: unlike Claude, copilot can't be handed a session
 // id up front — it mints one and writes `~/.copilot/session-state/<id>/` a
@@ -935,33 +1111,49 @@ pub enum GhGate {
     /// A merge onto the default branch, and both consent markers are present:
     /// autonomous mode is on AND auto-merge is enabled — allow it.
     AllowMerge,
-    /// A merge onto the default branch without both markers: block (the human gate).
+    /// A privileged action (default-branch merge, or a release/tag publish)
+    /// authorized by a valid one-time human grant. The shim CONSUMES the grant and
+    /// allows exactly this one action.
+    AllowGrant,
+    /// A merge onto the default branch (or a release) without authorization: block
+    /// (the human gate — the human can grant a one-time exception).
     Block,
     /// A merge whose base branch couldn't be determined: block, fail-safe — we must
     /// never let an unverifiable merge reach the default branch.
     BlockUnverifiable,
 }
 
-/// The positional (non-flag) tokens of a gh argv, in order, skipping flags —
-/// crucially the global `-R/--repo <value>` that gh accepts BEFORE or BETWEEN the
-/// command and subcommand (rev-79 F1: `gh -R o/r pr merge` and `gh pr -R o/r merge`
-/// are everyday forms that must not slip the gate). `-R/--repo` in its
-/// space-separated form consumes its value; every other flag is treated as a
-/// boolean (the only value-taking flag that can legitimately precede the
-/// subcommand is `-R/--repo`). `--repo=x` / `-Rx` are single tokens, so skipped
-/// as flags. Excludes the leading `gh`. So `positionals[0]`/`[1]` are the command
-/// + subcommand wherever the flags push them.
+/// gh flags (across the subcommands we gate — `pr merge`, `release create/edit/
+/// delete`, `-R/--repo`) that take a SEPARATE value token, so a positional scan
+/// must consume that value and not mistake it for the command/subcommand/target.
+/// Missing one mis-parses the target: e.g. `gh release create --title "X" v1`
+/// would read the tag as `X` and fail-safe-block a legitimately granted release
+/// (rev-86 LOW). `=`/glued forms are single tokens and handled separately. Keep
+/// this in sync with the shim's shell scanner value-flag list.
+const GH_VALUE_FLAGS: &[&str] = &[
+    "-R", "--repo", "-b", "--body", "-t", "--subject", "--title", "-F", "--body-file",
+    "--author-email", "--match-head-commit", "-n", "--notes", "--notes-file",
+    "--notes-start-tag", "--target", "--discussion-category",
+];
+
+/// The positional (non-flag) tokens of a gh argv, in order, skipping flags and
+/// consuming the values of `GH_VALUE_FLAGS` — crucially the global `-R/--repo` that
+/// gh accepts BEFORE or BETWEEN the command tokens (rev-79 F1), and the release
+/// value-flags before the tag positional (rev-86). `--flag=x` / `-Rx` are single
+/// tokens, skipped as flags. Excludes the leading `gh`. So `positionals[0]`/`[1]`
+/// are the command + subcommand and `[2]` is the target (PR ref / tag) wherever
+/// the flags land.
 pub fn gh_positionals(args: &[&str]) -> Vec<String> {
     let mut pos = Vec::new();
     let mut i = 0;
     while i < args.len() {
         let t = args[i];
-        if t == "-R" || t == "--repo" {
+        if GH_VALUE_FLAGS.contains(&t) {
             i += 2; // flag + its value
             continue;
         }
         if t.starts_with('-') {
-            i += 1; // boolean flag, or `--repo=…` / `-R…` glued (single token)
+            i += 1; // boolean flag, or `--flag=…` / `-R…` glued (single token)
             continue;
         }
         pos.push(t.to_string());
@@ -1037,6 +1229,7 @@ pub fn gh_gate_decision(
     default: Option<&str>,
     autonomous: bool,
     auto_merge: bool,
+    grant_valid: bool,
 ) -> GhGate {
     if !is_merge {
         return GhGate::PassThrough;
@@ -1046,7 +1239,9 @@ pub fn gh_gate_decision(
             if b != d {
                 GhGate::PassThrough // integration-branch flow is untouched
             } else if autonomous && auto_merge {
-                GhGate::AllowMerge
+                GhGate::AllowMerge // blanket opening while in autonomous auto-merge
+            } else if grant_valid {
+                GhGate::AllowGrant // one-time human grant for THIS pr — consumed
             } else {
                 GhGate::Block
             }
@@ -1056,6 +1251,122 @@ pub fn gh_gate_decision(
         // surface; blocking the cheap-to-catch shape is the safe default).
         _ => GhGate::BlockUnverifiable,
     }
+}
+
+/// A release-publishing gh action the shim must gate (`gh release create|edit|
+/// delete <tag>`) and the tag it targets. `None` for any other gh (incl. read-only
+/// `release view`/`list`/`download`). Pure over the parsed positionals so the shim
+/// and tests agree. Uses `gh_positionals` so `-R/--repo` before/between tokens is
+/// handled like the merge path.
+pub fn gh_release_action(args: &[String]) -> Option<(String, String)> {
+    let a: Vec<&str> = args.iter().map(String::as_str).collect();
+    let pos = gh_positionals(&a);
+    if pos.first().map(String::as_str) != Some("release") {
+        return None;
+    }
+    let sub = pos.get(1).map(String::as_str)?;
+    if !matches!(sub, "create" | "edit" | "delete") {
+        return None; // view/list/download/upload/download → not a publish action
+    }
+    // `gh release <sub> <tag>` — the tag is the next positional.
+    let tag = pos.get(2)?.to_string();
+    Some((sub.to_string(), tag))
+}
+
+/// The gate decision for a release/tag publish (#83). Unlike a merge, a
+/// release/tag is allowed ONLY by an explicit one-time grant — never by the
+/// blanket autonomous+auto_merge opening, because publishing to the world (GitHub
+/// release + npm via the `v*` tag → release.yml) is a strictly bigger blast radius
+/// than merging, so it demands its own human sign-off even in autonomous mode.
+pub fn release_gate_decision(grant_valid: bool) -> GhGate {
+    if grant_valid { GhGate::AllowGrant } else { GhGate::Block }
+}
+
+/// What a `git push` publishes with respect to tags (#83). Local `git tag` is
+/// harmless — only the PUSH reaches the world — so the git shim gates pushes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GitTagPush {
+    /// Not a tag push (a branch push, or not `git push` at all): pass through.
+    None,
+    /// Pushes ALL/annotated tags in bulk (`--tags`/`--follow-tags`/`--mirror`) —
+    /// can't be matched to a single tag grant, so block with guidance to push the
+    /// one approved tag instead.
+    Bulk,
+    /// An explicit tag ref (`refs/tags/<t>`, `tag <t>`, or a bare `v*` refspec) →
+    /// gate on a release grant for `<t>`.
+    Tag(String),
+}
+
+/// Classify a `git` argv for tag-push gating (#83). Pure over the args (git global
+/// options like `-C <dir>` / `-c <k=v>` are skipped to find the `push` command).
+/// A bare refspec is treated as a tag only when it matches the release pattern
+/// (`v*` — the `release.yml` `on.push.tags` trigger; these MUST stay in sync);
+/// the shim confirms ambiguous cases against the real git, but the classification
+/// here is the testable spec.
+pub fn git_tag_push(args: &[String]) -> GitTagPush {
+    let a: Vec<&str> = args.iter().map(String::as_str).collect();
+    // Locate the git subcommand, skipping value-taking globals.
+    let mut i = 0;
+    let mut cmd: Option<&str> = None;
+    while i < a.len() {
+        let t = a[i];
+        if matches!(t, "-C" | "-c" | "--git-dir" | "--work-tree" | "--namespace" | "--exec-path") {
+            i += 2;
+            continue;
+        }
+        if t.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        cmd = Some(t);
+        break;
+    }
+    if cmd != Some("push") {
+        return GitTagPush::None;
+    }
+    let rest = &a[i + 1..];
+    // Bulk tag pushes.
+    if rest.iter().any(|t| matches!(*t, "--tags" | "--follow-tags" | "--mirror")) {
+        return GitTagPush::Bulk;
+    }
+    // Positional refspecs after `push`: the first non-flag is the remote; the rest
+    // are refspecs. Also handle the `git push <remote> tag <name>` form.
+    let mut positionals = rest.iter().filter(|t| !t.starts_with('-'));
+    let _remote = positionals.next();
+    let mut prev_tag_kw = false;
+    for spec in positionals {
+        if *spec == "tag" {
+            prev_tag_kw = true;
+            continue;
+        }
+        if prev_tag_kw {
+            return GitTagPush::Tag(grant_segment(spec));
+        }
+        // `src:dst` — the destination ref is what lands on the remote.
+        let dst = spec.rsplit(':').next().unwrap_or(spec);
+        if let Some(t) = dst.strip_prefix("refs/tags/") {
+            return GitTagPush::Tag(grant_segment(t));
+        }
+        // A bare refspec matching the RELEASE TRIGGER pattern. This MUST track
+        // `.github/workflows/release.yml`'s `on.push.tags` (currently `v*` — ANY
+        // ref starting with `v`, not just `v<digit>`), or a `vbeta`/`vRelease` tag
+        // push would publish to the world yet slip the gate (rev-86). It's only a
+        // *candidate* — the shim confirms it's actually a tag (not a same-prefixed
+        // branch) against the real git before gating, so a branch like `vfeature`
+        // still passes.
+        let name = dst.trim_start_matches('+');
+        if name.starts_with('v') {
+            return GitTagPush::Tag(grant_segment(name));
+        }
+    }
+    GitTagPush::None
+}
+
+/// Whether an unexpired grant authorizes an action right now: a grant exists and
+/// its expiry (unix seconds) is in the future. Pure so the TTL rule is testable;
+/// the shim reads the expiry from the grant file. `None` = no grant file.
+pub fn grant_unexpired(expires_secs: Option<u64>, now_secs: u64) -> bool {
+    matches!(expires_secs, Some(exp) if now_secs < exp)
 }
 
 /// Attention routing (#6): does a pane's ANSI-stripped output tail look like a
@@ -1641,6 +1952,50 @@ fn remove_marker(path: &Path) -> Result<(), String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(format!("failed to remove marker {}: {e}", path.display())),
     }
+}
+
+/// Crash-safe write: serialize into a unique temp file in the same dir, then
+/// atomically rename over the destination — so a reader (the shim) can never see a
+/// half-written grant and treat it as valid (#83). The temp name uses pid +
+/// `GRANT_SEQ` (no getrandom). Creates the parent dir. Used for grant files.
+fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), String> {
+    let dir = path.parent().ok_or("grant path has no parent dir")?;
+    fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let tmp = dir.join(format!(
+        ".tmp-{}-{}",
+        std::process::id(),
+        GRANT_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::write(&tmp, contents).map_err(|e| e.to_string())?;
+    if fs::rename(&tmp, path).is_err() {
+        // Some platforms refuse rename-over-existing; fall back to a direct write.
+        let r = fs::write(path, contents).map_err(|e| e.to_string());
+        let _ = fs::remove_file(&tmp);
+        r?;
+    }
+    Ok(())
+}
+
+/// Sanitize a grant target (PR ref / tag) into a safe single path segment: keep
+/// only `[A-Za-z0-9._-]`, everything else → `_`. Prevents a `/` or `..` in a tag
+/// from escaping the grant dir, and MUST match the shim's `tr -c` sanitizer so the
+/// backend and shim agree on the grant filename. Pure/testable.
+pub fn grant_segment(target: &str) -> String {
+    let s: String = target
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') { c } else { '_' })
+        .collect();
+    if s.is_empty() { "_".to_string() } else { s }
+}
+
+/// Extract the numeric PR id from a board task's `pr` field, which may be a bare
+/// number (`7`), a `#7`, or a full PR URL (`…/pull/7`). `None` if no number is
+/// found. Pure so the normalization is testable; the grant file is keyed `pr-<N>`.
+pub fn pr_number(pr: &str) -> Option<u64> {
+    // A PR URL ends in `/pull/<n>`; otherwise take the last run of digits.
+    let tail = pr.rsplit(['/', '#', ' ']).find(|s| !s.is_empty()).unwrap_or(pr);
+    let digits: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
 }
 
 /// Map a caller-supplied image extension to a vetted one, rejecting anything
@@ -2746,10 +3101,14 @@ impl OrchRegistry {
         }
     }
 
-    /// Merge-gate approve: mark the item done and tell the orchestrator to
-    /// merge. The status change is the human's direct sign-off, applied here;
-    /// the notice is best-effort (the board is the source of truth).
-    pub fn approve_task(&self, group: &str, id: &str) -> Result<Task, String> {
+    /// Merge-gate approve: mark the item done and issue a **one-time merge grant**
+    /// for its PR so the orchestrator can actually merge (the enforced gate blocks
+    /// a default-branch merge without a grant — clicking Approve without one leaves
+    /// the orchestrator stuck, #83). The status change is the human's direct
+    /// sign-off; `comment` is an optional approve-with-comment note delivered with
+    /// the grant. When the task has no resolvable PR number, no grant is written and
+    /// a plain approval notice is delivered instead (the human merges by hand).
+    pub fn approve_task(&self, group: &str, id: &str, comment: Option<&str>) -> Result<Task, String> {
         self.ensure_at_merge_gate(group, id)?;
         let task = self.upsert_task(
             group,
@@ -2761,16 +3120,30 @@ impl OrchRegistry {
                 ..Default::default()
             },
         )?;
-        let pr = task.pr.as_deref().unwrap_or("(no PR ref)");
-        let _ = self.deliver_to_orchestrator(
-            group,
-            &format!(
-                "[loomux] the human APPROVED {} \"{}\" ({}) at the merge gate and marked it done. \
-                 Merge the PR and close out the work item.",
-                task.id, task.title, pr
-            ),
-            "human",
-        );
+        // Grant the one-time merge for this PR (delivers the authorization + any
+        // comment to the orchestrator). Falls back to a plain notice if the task
+        // carries no PR number to key the grant on.
+        let granted = task
+            .pr
+            .as_deref()
+            .and_then(|pr| self.grant_merge(group, pr, comment, "human").ok());
+        if granted.is_none() {
+            let pr = task.pr.as_deref().unwrap_or("(no PR ref)");
+            let extra = comment
+                .map(str::trim)
+                .filter(|c| !c.is_empty())
+                .map(|c| format!(" Note from the human: {c}"))
+                .unwrap_or_default();
+            let _ = self.deliver_to_orchestrator(
+                group,
+                &format!(
+                    "[loomux] the human APPROVED {} \"{}\" ({}) at the merge gate and marked it done. \
+                     Merge the PR and close out the work item.{extra}",
+                    task.id, task.title, pr
+                ),
+                "human",
+            );
+        }
         Ok(task)
     }
 
@@ -5118,59 +5491,78 @@ impl OrchRegistry {
 
     // ---------- enforced merge gate (#83): gh shim + per-pane env ----------
 
-    /// The shared directory holding the `gh` interceptor shim, prepended to every
-    /// *agent* pane's PATH so `gh pr merge` onto the default branch is structurally
-    /// gated (a live incident showed template guidance alone fails). One shim for
-    /// all groups — it reads `LOOMUX_GROUP_DIR` at runtime to find the group's
-    /// markers — under the loomux data dir, beside the per-group orchestration state.
-    fn gh_shim_dir(&self) -> PathBuf {
+    /// The shared directory holding the `gh` + `git` interceptor shims, prepended
+    /// to every *agent* pane's PATH so a default-branch merge (`gh pr merge`) or a
+    /// release/tag publish (`gh release …`, `git push` of a `v*` tag) is
+    /// structurally gated (a live incident showed template guidance alone fails).
+    /// One shim set for all groups — it reads `LOOMUX_GROUP_DIR` at runtime to find
+    /// the group's markers/grants — under the loomux data dir, beside the per-group
+    /// orchestration state.
+    fn shim_dir(&self) -> PathBuf {
         self.root.parent().unwrap_or(&self.root).join("ghshim")
     }
 
-    /// Write (idempotently) the `gh` shim scripts and return the shim dir, or
-    /// `None` when no real `gh` is installed (nothing to intercept — agents can't
-    /// merge without it). The real gh's absolute path is baked into the scripts so
-    /// the shim never re-resolves to itself. Cheap (two small file writes); called
-    /// per spawn so a freshly-installed gh is picked up by the next pane.
-    fn ensure_gh_shim(&self) -> Option<PathBuf> {
-        let real = crate::winpath::resolve_program(
-            "gh",
+    /// Write one shim script (POSIX + a Windows `.cmd` delegator) for `program`,
+    /// resolving the real binary and baking its absolute path in so the shim never
+    /// re-resolves to itself. No-op returning `false` when the real program isn't
+    /// installed (nothing to intercept). `sh` builds the POSIX body from the
+    /// forward-slashed real path; `cmd` builds the `.cmd` delegator.
+    fn write_shim(
+        &self,
+        dir: &Path,
+        program: &str,
+        sh: impl Fn(&str) -> String,
+        cmd: impl Fn(&str) -> String,
+    ) -> bool {
+        let Some(real) = crate::winpath::resolve_program(
+            program,
             &crate::winpath::launch_path(),
             &crate::winpath::launch_pathext(),
-        )?;
-        // Forward-slash the path so it's safe inside the POSIX shim (Git Bash
-        // accepts `C:/…`), and it's still valid for the .cmd wrapper.
+        ) else {
+            return false;
+        };
+        // Forward-slash so the path is safe inside the POSIX shim (Git Bash accepts
+        // `C:/…`); still valid for the `.cmd` wrapper.
         let real_fwd = real.to_string_lossy().replace('\\', "/");
-        let dir = self.gh_shim_dir();
-        if fs::create_dir_all(&dir).is_err() {
-            return None;
-        }
-        let sh = gh_shim_sh(&real_fwd);
-        let gh_path = dir.join("gh");
-        let _ = fs::write(&gh_path, sh.as_bytes());
+        let script = dir.join(program);
+        let _ = fs::write(&script, sh(&real_fwd).as_bytes());
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&gh_path, fs::Permissions::from_mode(0o755));
+            let _ = fs::set_permissions(&script, fs::Permissions::from_mode(0o755));
         }
         #[cfg(target_os = "windows")]
         {
-            // cmd/pwsh panes resolve `gh` to `gh.cmd` (`.PS1` isn't on the default
-            // PATHEXT). It delegates to the POSIX shim so the gate logic lives in
-            // exactly one place; if no `sh` is on PATH it runs the real gh (a
+            // cmd/pwsh panes resolve `<program>` to `<program>.cmd` (`.PS1` isn't
+            // on the default PATHEXT). It delegates to the POSIX shim so the gate
+            // logic lives in one place; without `sh` it runs the real program (a
             // documented bypass — Git Bash, which ships `sh`, is present wherever
             // Claude Code runs its Bash tool, the primary interception point).
-            let _ = fs::write(dir.join("gh.cmd"), gh_shim_cmd(&real_fwd).as_bytes());
+            let _ = fs::write(dir.join(format!("{program}.cmd")), cmd(&real_fwd).as_bytes());
         }
-        Some(dir)
+        true
+    }
+
+    /// Write (idempotently) the `gh` + `git` shim scripts and return the shim dir,
+    /// or `None` when neither real binary is installed. Cheap (a few small file
+    /// writes); called per spawn so a freshly-installed gh/git is picked up by the
+    /// next pane.
+    fn ensure_shims(&self) -> Option<PathBuf> {
+        let dir = self.shim_dir();
+        if fs::create_dir_all(&dir).is_err() {
+            return None;
+        }
+        let gh = self.write_shim(&dir, "gh", gh_shim_sh, gh_shim_cmd);
+        let git = self.write_shim(&dir, "git", git_shim_sh, git_shim_cmd);
+        (gh || git).then_some(dir)
     }
 
     /// The extra environment injected into an *agent* pane (never a human's plain
-    /// shell): the gh shim prepended to PATH so the merge gate is enforced, and
-    /// `LOOMUX_GROUP_DIR` so the shim finds this group's markers. Empty when no gh
-    /// is installed (nothing to gate).
+    /// shell): the gh + git shims prepended to PATH so the merge/release gates are
+    /// enforced, and `LOOMUX_GROUP_DIR` so the shim finds this group's
+    /// markers/grants. Empty when neither gh nor git is installed (nothing to gate).
     fn agent_pane_env(&self, group: &str) -> Vec<(String, String)> {
-        let Some(shim) = self.ensure_gh_shim() else {
+        let Some(shim) = self.ensure_shims() else {
             return Vec::new();
         };
         let sep = if cfg!(windows) { ';' } else { ':' };
@@ -5182,6 +5574,96 @@ impl OrchRegistry {
             ("PATH".to_string(), path),
             ("LOOMUX_GROUP_DIR".to_string(), self.group_dir(group).display().to_string()),
         ]
+    }
+
+    /// Grant directory for a kind (`merge_grants` | `release_grants`), under the
+    /// group state dir. The shim reads these; only human Tauri commands write them.
+    fn grant_dir(&self, group: &str, kind: &str) -> PathBuf {
+        self.group_dir(group).join(kind)
+    }
+
+    /// Write a one-time human **merge** grant for PR `pr` (#83): authorizes exactly
+    /// one default-branch merge of that PR within `GRANT_TTL_SECS`, after which the
+    /// shim consumes it (one merge) or it expires. `pr` may be a number / `#n` /
+    /// PR URL — normalized to a number; the grant is keyed `merge_grants/pr-<N>` so
+    /// a grant for #5 can't authorize merging #7. Optional `comment` is delivered
+    /// to the orchestrator alongside the authorization (approve-with-comment).
+    /// Written atomically so the shim can never read a half-written grant. Returns
+    /// the normalized PR number.
+    ///
+    /// **Human-only boundary:** this is reachable ONLY through Tauri commands (the
+    /// board Approve button / a human grant action). No MCP tool calls it — agents
+    /// run the shim and consume grants, they never mint them.
+    pub fn grant_merge(
+        &self,
+        group: &str,
+        pr: &str,
+        comment: Option<&str>,
+        actor: &str,
+    ) -> Result<u64, String> {
+        if self.group(group).is_none() {
+            return Err("unknown group".into());
+        }
+        let num = pr_number(pr).ok_or_else(|| format!("no PR number found in {pr:?}"))?;
+        let nonce = GRANT_SEQ.fetch_add(1, Ordering::Relaxed);
+        let expires = now_ms() / 1000 + GRANT_TTL_SECS;
+        let path = self.grant_dir(group, "merge_grants").join(format!("pr-{num}"));
+        atomic_write(&path, format!("{expires}\n{nonce}\n").as_bytes())?;
+        self.audit(group, actor, "merge-grant-written",
+            json!({ "pr": num, "expires_secs": expires, "nonce": nonce }));
+        let mins = GRANT_TTL_SECS / 60;
+        let note = comment.map(str::trim).filter(|c| !c.is_empty());
+        let msg = match note {
+            Some(c) => format!(
+                "[loomux] the human GRANTED a one-time merge of PR #{num} (valid ~{mins} min). \
+                 Note from the human: {c}\nYou may now merge THAT PR once (only #{num}); report when done."),
+            None => format!(
+                "[loomux] the human GRANTED a one-time merge of PR #{num} (valid ~{mins} min). \
+                 You may now merge THAT PR once (only #{num}); report when done."),
+        };
+        let _ = self.deliver_to_orchestrator(group, &msg, "human");
+        Ok(num)
+    }
+
+    /// Write a one-time human **release/tag** grant for `tag` (#83): authorizes one
+    /// `gh release create|edit|delete <tag>` or one `git push` of that tag within
+    /// `GRANT_TTL_SECS`. Releases publish to the world, so — unlike merges — they
+    /// are NEVER blanket-allowed by autonomous+auto_merge; each needs an explicit
+    /// grant. Optional `comment` delivered to the orchestrator. Human-only, same
+    /// boundary as `grant_merge`.
+    pub fn grant_release(
+        &self,
+        group: &str,
+        tag: &str,
+        comment: Option<&str>,
+        actor: &str,
+    ) -> Result<(), String> {
+        if self.group(group).is_none() {
+            return Err("unknown group".into());
+        }
+        let tag = tag.trim();
+        if tag.is_empty() {
+            return Err("release grant needs a tag".into());
+        }
+        let seg = grant_segment(tag);
+        let nonce = GRANT_SEQ.fetch_add(1, Ordering::Relaxed);
+        let expires = now_ms() / 1000 + GRANT_TTL_SECS;
+        let path = self.grant_dir(group, "release_grants").join(&seg);
+        atomic_write(&path, format!("{expires}\n{nonce}\n").as_bytes())?;
+        self.audit(group, actor, "release-grant-written",
+            json!({ "tag": tag, "expires_secs": expires, "nonce": nonce }));
+        let mins = GRANT_TTL_SECS / 60;
+        let note = comment.map(str::trim).filter(|c| !c.is_empty());
+        let msg = match note {
+            Some(c) => format!(
+                "[loomux] the human GRANTED a one-time release/tag publish of {tag} (valid ~{mins} min). \
+                 Note from the human: {c}\nYou may now publish THAT release/tag once; report when done."),
+            None => format!(
+                "[loomux] the human GRANTED a one-time release/tag publish of {tag} (valid ~{mins} min). \
+                 You may now publish THAT release/tag once; report when done."),
+        };
+        let _ = self.deliver_to_orchestrator(group, &msg, "human");
+        Ok(())
     }
 
     pub fn resolve_token(&self, token: &str) -> Option<Caller> {
@@ -7482,8 +7964,39 @@ pub fn orch_approve_task(
     reg: tauri::State<Arc<OrchRegistry>>,
     group_id: String,
     id: String,
+    // Optional approve-with-comment note (#83): delivered to the orchestrator with
+    // the one-time merge grant, e.g. "approved — also bump the changelog first".
+    comment: Option<String>,
 ) -> Result<Task, String> {
-    reg.approve_task(&group_id, &id)
+    reg.approve_task(&group_id, &id, comment.as_deref())
+}
+
+/// Issue a one-time human merge grant for a PR (#83), independent of the board —
+/// a human-pane path to authorize exactly one default-branch merge. Optional
+/// comment is delivered to the orchestrator with the grant. HUMAN-ONLY (Tauri
+/// command; no MCP tool reaches grant-writing).
+#[tauri::command]
+pub fn orch_grant_merge(
+    reg: tauri::State<Arc<OrchRegistry>>,
+    group_id: String,
+    pr: String,
+    comment: Option<String>,
+) -> Result<u64, String> {
+    reg.grant_merge(&group_id, &pr, comment.as_deref(), "human")
+}
+
+/// Issue a one-time human release/tag grant for `tag` (#83): authorizes one
+/// `gh release …`/tag-push of that tag. Releases are never blanket-allowed by
+/// autonomous mode, so this explicit grant is the only path. Optional comment
+/// delivered to the orchestrator. HUMAN-ONLY.
+#[tauri::command]
+pub fn orch_grant_release(
+    reg: tauri::State<Arc<OrchRegistry>>,
+    group_id: String,
+    tag: String,
+    comment: Option<String>,
+) -> Result<(), String> {
+    reg.grant_release(&group_id, &tag, comment.as_deref(), "human")
 }
 
 /// Request changes on a merge-gate item: record the findings and deliver them

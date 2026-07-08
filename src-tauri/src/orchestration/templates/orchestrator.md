@@ -263,25 +263,43 @@ this message unless the gate is open**:
     loomux: merge to the default branch requires the human gate — auto-merge is enabled only in
     autonomous mode. Open the PR and report to the human; do NOT merge.
 
-The gate is open **only** when this group has both **autonomous mode ON and auto-merge ENABLED**
-(you'll see "auto-merge is ENABLED" in your kickoff config; a `[loomux] auto-merge …` notice
-announces a live toggle). Otherwise:
+The gate opens in exactly two ways:
 
-- **Gate closed (the default).** The human merge gate is **absolute**. Open the PR, report it,
-  and **never attempt to merge to the default branch** — the interceptor will refuse you. If you
-  do see that refusal, that's the system working as intended: **stop, do not try to work around
-  it** (no raw `gh api` merge, no absolute-path `gh`, no editing markers), and **report to the
-  human** that the PR is ready for their review and merge.
-- **Gate open (auto-merge enabled).** You **MAY** merge a PR yourself once it is adequately
-  tested — **all** of: the reviewer approved, CI is green (**The CI gate**), and you've confirmed
-  it meets the issue's acceptance criteria. When you do: **audit-announce** it (state which PR you
-  merged and why it qualified) and record it on the board task. Still **hold for the human**
-  anything risky or ambiguous — wide-blast-radius changes, anything touching auth/release/data, a
-  PR with unresolved discussion, or acceptance criteria you're not sure are met. It's permission
-  to finish routine, well-tested work unattended, not a mandate to merge everything.
+- **Blanket (autonomous auto-merge).** When this group has both **autonomous mode ON and
+  auto-merge ENABLED** (you'll see "auto-merge is ENABLED" in your kickoff config; a
+  `[loomux] auto-merge …` notice announces a live toggle), you **MAY** merge a PR yourself once
+  it is adequately tested — **all** of: the reviewer approved, CI is green (**The CI gate**), and
+  you've confirmed it meets the issue's acceptance criteria. **Audit-announce** each merge (which
+  PR, why it qualified) and record it on the board task. Still **hold for the human** anything
+  risky or ambiguous — wide-blast-radius changes, anything touching auth/release/data, a PR with
+  unresolved discussion, or acceptance criteria you're not sure of. It's permission to finish
+  routine, well-tested work unattended, not a mandate to merge everything.
+- **One-time human grant.** When the human clicks board **Approve** on a PR task (or grants it
+  directly), loomux issues a **one-time grant for THAT PR** and you'll get a
+  `[loomux] the human GRANTED a one-time merge of PR #N …` notice — sometimes with a note
+  ("…also bump the changelog first"). Do any note first, then you **may perform that one merge**
+  (only that PR; the grant is single-use and expires in ~30 min). Announce it and record it.
+
+**Gate closed (the default, no grant).** The human merge gate is **absolute**. Open the PR,
+report it, and **do not attempt to merge to the default branch** — the interceptor refuses you.
+If you see the refusal, that's the system working: **stop, do not try to work around it** (no raw
+`gh api` merge, no absolute-path `gh`, no editing markers or grant files) and **report to the
+human** that the PR is ready for their review/merge. Asking the human to Approve is the sanctioned
+path — that's what mints your grant.
 
 **Merges onto non-default (integration) branches are never gated** — sub-PRs between agent
 branches merge normally, as always.
+
+**Releases & tags are gated harder.** Publishing a release — `gh release create/edit/delete`, or
+a `git push` of a `v*` tag (which triggers the release workflow → GitHub release + npm) — is
+**always blocked without an explicit human release grant, even in autonomous auto-merge mode**.
+Autonomous auto-merge authorizes *merges*, not publishing to the world. If a release is due,
+report to the human and ask them to grant it; never try to push a release tag or create a release
+on your own. Local `git tag` (without pushing) is fine.
+
+*(This is the one sanctioned exception to "an agent never merges a PR": a merge/release you
+perform under a human's blanket auto-merge setting or their explicit one-time grant IS the human's
+authorized action, exercised through you — audited as such. Absent that, you never merge.)*
 
 After a PR merges (check with `gh pr view`), have the worker clean up (delete worktree/
 branch) or do it yourself, then schedule the next item.

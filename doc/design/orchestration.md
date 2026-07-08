@@ -589,20 +589,74 @@ consent is *blocked*, not advised.
   #149 money-stop pattern — in-memory authoritative). So the gate's "both markers present" test
   can never be satisfied by an orphaned `auto_merge` marker. The UI mirrors this (`approvalControl`): with autonomous off the "Require human
   approval" checkbox is locked checked with a tooltip.
-- **Honest bypass surface** (documented, not hidden). The shim raises the cost of an unattended
-  bad merge from "type one command" to "deliberately evade a named control," but a determined
-  agent with shell access *can* still: (1) call gh by its **absolute path**, skipping `PATH`
-  entirely; (2) use a **raw REST/GraphQL** merge shape the cheap substring match doesn't catch
-  (unusual `gh api` forms, a direct `curl` to the API with a token, or a library); (3) run in a
-  **cmd/pwsh** pane with no `sh` on `PATH` (the `gh.cmd` fallback runs the real gh); (4) define a
-  **`gh` alias** that re-invokes the real binary (a deliberate multi-step move, same class as the
-  above). These are
-  intentional trade-offs: catching every shape would need sandboxing or network egress control,
-  out of scope here. **The gold-standard closing layer is a machine account**: give agents a
-  GitHub token whose account has *no merge permission on the default branch* (branch protection
-  requiring a human/CODEOWNER review). Then no client-side evasion matters — the server refuses
-  the merge. The shim is the cheap, local, always-on first layer; the machine account is the
-  authoritative one, and the two compose.
+
+### Human-granted one-time exception (grants)
+
+The blanket markers are all-or-nothing, so a human clicking board **Approve** — or saying
+"merge it" — was *still* blocked (Approve doesn't set the markers). The fix is a per-target,
+one-time **grant** the shim also honors.
+
+- **Grant files.** A grant is a small file under the group dir the shim consults:
+  `merge_grants/pr-<N>` (a default-branch merge of PR N) or `release_grants/<tag>` (a
+  release/tag publish). Line 1 is a unix-seconds **expiry** (`GRANT_TTL_SECS` = 30 min); the
+  shim treats the grant as valid iff the file exists and now < expiry, and **consumes it**
+  (`rm`) on use — one action only. Files are written with `atomic_write` (temp + rename, temp
+  name = pid + `GRANT_SEQ`, no getrandom) so the shim can never read a half-written grant.
+- **Decision.** `gh_gate_decision` gains a `grant_valid` input: a default-branch merge is
+  allowed by `(autonomous && auto_merge)` **OR** a valid grant for *that* PR (`AllowGrant`,
+  consumed). The shim resolves the PR **number** via the real gh (`--json baseRefName,number`)
+  so a grant for #5 can't authorize merging #7 whatever selector form was used.
+- **Approve-with-comment.** The grant-writing methods (`grant_merge` / `grant_release`) take an
+  optional comment delivered to the orchestrator with the authorization via
+  `deliver_to_orchestrator` — "approved — also bump the changelog first". Board **Approve**
+  (`approve_task`) now writes the merge grant for the task's PR and delivers the comment.
+- **Agent-unreachable boundary.** Grants are written ONLY by Tauri commands (board Approve,
+  `orch_grant_merge`, `orch_grant_release`) — human surfaces. **No MCP tool** writes them
+  (regression-tested: no agent-visible tool name contains "grant", and the file-writing MCP
+  tools `set_state`/`upsert_task`/`save_attachment` write only their own fixed paths, never a
+  grant path). Agents *consume* grants (the shim) but never *mint* them through loomux.
+
+### Release & tag gating
+
+Releases publish to the world — a `v*` tag push triggers `release.yml` (GitHub release + npm),
+and `gh release create` does likewise — a strictly bigger blast radius than a merge. So they get
+the **same enforcement, but never the blanket opening**: a release/tag is allowed ONLY by an
+explicit grant, **even in autonomous+auto_merge mode** (`release_gate_decision`). This is the
+conservative default and defensible: autonomous auto-merge is the human saying "land routine,
+well-tested PRs without me"; it is *not* "publish to the world without me." A separate, explicit
+release grant keeps publishing a deliberate human act.
+
+- **gh shim** additionally gates `gh release create|edit|delete <tag>` (read-only
+  `view`/`list`/`download` pass through) — `gh_release_action`.
+- **git shim** (new, same PATH-injection as the gh shim) gates `git push` that publishes a tag:
+  `--tags`/`--follow-tags`/`--mirror` (bulk → blocked, push the specific approved tag),
+  `refs/tags/<t>` and the `tag <t>` form (explicit), and a bare **`v*`** refspec (any v-prefixed
+  ref) **confirmed a tag** against the real git (`git_tag_push`). The `v*` pattern **must track
+  `.github/workflows/release.yml`'s `on.push.tags`** (both `git_tag_push` and the shim carry a
+  comment saying so): they matched `v<digit>` at first, which let `vbeta`/`vRelease` publish yet
+  slip the gate (rev-86). Local `git tag` is harmless — only the **push** reaches the world — and
+  a plain branch push (or a non-`v*` ref like `nightly`, which release.yml ignores) execs the
+  real git with **zero** extra work. The gh scanner's value-flag skip list is complete for
+  `gh release create` (`--title`/`--notes`/`--target`/… consume their value) so a granted release
+  with `--title "…"` before the tag isn't misparsed and wrongly blocked.
+
+- **Honest bypass surface** (documented, not hidden). The shims raise the cost of an unattended
+  bad merge/publish from "type one command" to "deliberately evade a named control," but a
+  determined agent with shell access *can* still: (1) call gh/git by its **absolute path**,
+  skipping `PATH`; (2) use a **raw REST/GraphQL** merge/release shape the cheap match doesn't
+  catch (unusual `gh api`, a direct `curl` with a token, a library) — or a git remote helper /
+  bare `v*` tag push under `-C otherdir` the confirm can't see; (3) run in a **cmd/pwsh** pane
+  with no `sh` on `PATH` (the `.cmd` fallback runs the real binary); (4) define a **`gh`/`git`
+  alias** re-invoking the real binary; (5) **forge a grant file** directly (`echo … >
+  $LOOMUX_GROUP_DIR/merge_grants/pr-N`) — the grant dir is on disk under the agent's own uid, so
+  its *existence* isn't cryptographically unforgeable; the "human-only" boundary is that no
+  loomux surface (MCP) mints one, not that the filesystem forbids it. All the same class as
+  absolute-path gh. Catching every shape needs sandboxing or network egress control, out of
+  scope. **The gold-standard closing layer is a machine account**: give agents a GitHub token
+  whose account has *no merge permission on the default branch and no release/tag-push rights*
+  (branch protection + tag protection requiring a human/CODEOWNER). Then no client-side evasion
+  matters — the server refuses. The shims are the cheap, local, always-on first layer; the
+  machine account is the authoritative one, and the two compose.
 
 ## Human-input paste guard (#111)
 
