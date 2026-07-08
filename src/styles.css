@@ -72,18 +72,199 @@ html, body {
 
 /* ---------- workspace ---------- */
 #workspace { display: flex; flex: 1; min-height: 0; }
-/* The grid and its minimize dock stack vertically; the grid takes all the
-   room and the dock is a thin strip that only appears when non-empty. */
+/* The tab bar, then a stack of per-tab workspaces, fill the grid area. */
 #grid-area { flex: 1; min-width: 0; display: flex; flex-direction: column; }
-/* position: relative anchors a maximized pane's absolute overlay to the grid
+/* The workspace stack holds one .workspace per tab; only the active one is
+   shown (the rest are display:none — zero-width panes, no PTY resize, #63). */
+#workspace-stack { flex: 1; min-width: 0; min-height: 0; display: flex; }
+/* Each tab's workspace: its grid + dock stack vertically, filling the stack. */
+.workspace { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+/* The grid takes all the room; the dock is a thin strip shown only when non-empty.
+   position: relative anchors a maximized pane's absolute overlay to the grid
    content area (inside the 8px padding). */
-#grid-root { flex: 1; min-width: 0; min-height: 0; display: flex; padding: 8px; position: relative; }
+.grid-root { flex: 1; min-width: 0; min-height: 0; display: flex; padding: 8px; position: relative; }
+
+/* ---------- project tabs (#63) ---------- */
+#tab-bar {
+  flex: none; display: flex; align-items: stretch; gap: 4px;
+  padding: 4px 8px 0 8px;
+  background: linear-gradient(180deg, #16161e, var(--panel));
+  border-bottom: 1px solid var(--border);
+  overflow-x: auto;
+}
+#tab-bar::-webkit-scrollbar { display: none; }
+.tab {
+  flex: none; display: inline-flex; align-items: center; gap: 7px;
+  max-width: 220px;
+  padding: 5px 8px 6px 8px;
+  font-size: 12px; color: var(--text-dim); cursor: pointer;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-bottom: none;
+  border-radius: 8px 8px 0 0;
+  border-top: 2px solid transparent;
+  transition: color 0.15s var(--ease), background 0.15s var(--ease);
+}
+.tab:hover { color: var(--text); background: #232330; }
+.tab.active {
+  color: var(--text);
+  background: var(--bg-term);
+  /* The colored top edge is the tab's accent (falls back to --accent). */
+  border-top-color: var(--tab-color, var(--accent));
+}
+.tab-swatch {
+  flex: none; width: 10px; height: 10px; padding: 0; border-radius: 50%;
+  border: 1px solid var(--border);
+  background: var(--tab-color, var(--accent-dim));
+  cursor: pointer;
+}
+.tab.colored .tab-swatch { border-color: var(--tab-color); }
+.tab-name {
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+/* Live status chip (#63 phase 4): agent count + cost for a group-bound tab. */
+.tab-status {
+  flex: none; font-size: 10.5px; color: var(--text-dim);
+  padding: 0 4px; border-radius: 4px; background: rgba(255, 255, 255, 0.04);
+}
+.tab.active .tab-status { color: var(--text); }
+.tab-paused { flex: none; font-size: 10px; color: #e0af68; }
+
+/* Attention (#63, finding 1): an unmistakable alert on a tab whose (maybe
+   hidden) pane needs the human — a colored, pulsing chip showing the SAME label
+   as the pane header (attention.ts), plus a tinted tab background + top edge so
+   the whole tab reads as "alert" at a glance. Amber default, red for the urgent
+   `blocked` class — mirrors the pane/dock chips. */
+.tab.needs-attention {
+  color: #f2c66a; border-top-color: #e0af68;
+  background: rgba(224, 175, 104, 0.1);
+  animation: tab-attn-pulse 1.6s ease-in-out infinite;
+}
+.tab.needs-attention.urgent {
+  color: #ff9db0; border-top-color: #f7768e;
+  background: rgba(247, 118, 142, 0.12);
+  animation-name: tab-attn-pulse-urgent;
+}
+/* The alert chip itself — same look as the pane header's .pane-attn. */
+.tab-attn {
+  flex: none; font-size: 9px; font-weight: 700; letter-spacing: 0.4px;
+  border: 1px solid #6a5230; border-radius: 4px; padding: 1.5px 6px;
+  color: #f2c66a; background: rgba(224, 175, 104, 0.16); white-space: nowrap;
+}
+.tab-attn[data-reason="blocked"] {
+  color: #ff9db0; background: rgba(247, 118, 142, 0.18); border-color: rgba(247, 118, 142, 0.5);
+}
+@keyframes tab-attn-pulse {
+  0%, 100% { box-shadow: inset 0 -2px 0 0 rgba(224, 175, 104, 0.5), 0 0 0 0 transparent; }
+  50% { box-shadow: inset 0 -2px 0 0 rgba(224, 175, 104, 0.9), 0 0 12px 1px rgba(224, 175, 104, 0.45); }
+}
+@keyframes tab-attn-pulse-urgent {
+  0%, 100% { box-shadow: inset 0 -2px 0 0 rgba(247, 118, 142, 0.55), 0 0 0 0 transparent; }
+  50% { box-shadow: inset 0 -2px 0 0 rgba(247, 118, 142, 1), 0 0 14px 1px rgba(247, 118, 142, 0.55); }
+}
+@media (prefers-reduced-motion: reduce) { .tab.needs-attention { animation: none; } }
+
+/* Right-click context menu (#63 phase 5): pause/resume/rename/close. */
+.tab-menu {
+  position: fixed; z-index: 90; min-width: 150px;
+  display: flex; flex-direction: column; padding: 4px;
+  background: var(--panel-2); border: 1px solid var(--border);
+  border-radius: 8px; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+}
+.tab-menu-item {
+  text-align: left; font: inherit; font-size: 12px; color: var(--text);
+  background: transparent; border: none; border-radius: 5px;
+  padding: 6px 9px; cursor: pointer;
+}
+.tab-menu-item:hover { background: var(--panel); }
+.tab-menu-item.danger:hover { color: var(--danger); }
+
+/* Live hover thumbnail (#63 findings 2/3): a composite of the whole tab — every
+   pane serialized (color + spacing preserved) and arranged like the split tree,
+   all panes at one shared median scale (TabBar.scaleComposite / compositeScale)
+   so text size is consistent; oversized outliers crop to their cell. */
+.tab-preview {
+  position: fixed; z-index: 85; overflow: hidden; padding: 8px;
+  border-radius: 8px; background: #0a0a0e; border: 1px solid var(--border);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.6);
+  pointer-events: none;
+}
+.mini-split { display: flex; gap: 3px; min-width: 0; min-height: 0; }
+.mini-split.row { flex-direction: row; }
+.mini-split.column { flex-direction: column; }
+.mini-pane {
+  display: flex; flex-direction: column; min-width: 0; min-height: 0;
+  overflow: hidden; border: 1px solid var(--border-soft); border-radius: 4px;
+  background: var(--bg-term);
+}
+.mini-pane-title {
+  flex: none; font-size: 10px; line-height: 1.5; padding: 0 6px;
+  color: var(--text-dim); background: var(--panel-2);
+  border-bottom: 1px solid var(--border-soft);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.mini-pane-body { flex: 1; min-height: 0; position: relative; overflow: hidden; }
+.mini-pane-scaler { position: absolute; top: 3px; left: 5px; transform-origin: top left; }
+.mini-pane-note { color: var(--text-dim); font-size: 11px; font-style: italic; padding: 6px; }
+.mini-term {
+  font-family: "Cascadia Code", "Consolas", ui-monospace, monospace;
+  font-size: 13px; line-height: 1.2; color: var(--text);
+}
+.mini-term-row { white-space: pre; }
+.tab-name-input {
+  font: inherit; font-size: 12px; color: var(--text);
+  background: var(--bg-app); border: 1px solid var(--accent-dim);
+  border-radius: 4px; padding: 0 4px; width: 120px; outline: none;
+}
+.tab-close {
+  flex: none; display: inline-flex; align-items: center; justify-content: center;
+  width: 16px; height: 16px; padding: 0; border: none; border-radius: 4px;
+  background: transparent; color: var(--text-dim); font-size: 10px; cursor: pointer;
+}
+.tab-close:hover { background: var(--panel); color: var(--danger); }
+/* Armed for the two-step confirm on a destructive (group-owning) tab close —
+   the "✕?" affordance, matching the group view's armed End button. */
+.tab-close.confirm {
+  width: auto; padding: 0 5px; background: var(--danger); color: #1a1a22; font-weight: 700;
+}
+.tab-add {
+  flex: none; align-self: center; margin-left: 2px;
+  width: 24px; height: 24px; padding: 0; border-radius: 6px;
+  background: transparent; border: 1px solid var(--border);
+  color: var(--text-dim); font-size: 15px; line-height: 1; cursor: pointer;
+}
+.tab-add:hover { color: var(--text); border-color: var(--accent-dim); background: var(--panel-2); }
+
+/* Color palette popover, anchored under a tab's swatch. */
+.tab-palette {
+  position: fixed; z-index: 80;
+  display: flex; align-items: center; gap: 6px;
+  padding: 8px; border-radius: 8px;
+  background: var(--panel-2); border: 1px solid var(--border);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+}
+.tab-palette-dot {
+  width: 18px; height: 18px; padding: 0; border-radius: 50%;
+  border: 1px solid var(--border); cursor: pointer;
+}
+.tab-palette-dot:hover { transform: scale(1.12); }
+.tab-palette-custom {
+  width: 24px; height: 24px; padding: 0; border: 1px solid var(--border);
+  border-radius: 4px; background: none; cursor: pointer;
+}
+.tab-palette-clear {
+  font: inherit; font-size: 11px; color: var(--text-dim); cursor: pointer;
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: 5px; padding: 3px 8px;
+}
+.tab-palette-clear:hover { color: var(--text); }
 
 /* ---------- maximize ---------- */
-/* The maximized pane is lifted to a top layer directly under #grid-root and
+/* The maximized pane is lifted to a top layer directly under .grid-root and
    covers the content area; the rest of the split tree is hidden so its panes
    report zero size and skip their PTY fits (see Grid.toggleMaximize). */
-#grid-root.has-maximized > :not(.maximized) { display: none; }
+.grid-root.has-maximized > :not(.maximized) { display: none; }
 .pane.maximized {
   position: absolute;
   inset: 0;
@@ -128,7 +309,7 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 }
 
 /* ---------- minimize dock ---------- */
-#pane-dock {
+.pane-dock {
   flex: none;
   display: flex; align-items: center; gap: 8px;
   padding: 6px 10px;
@@ -136,7 +317,7 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   border-top: 1px solid var(--border);
   overflow-x: auto;
 }
-#pane-dock[hidden] { display: none; }
+.pane-dock[hidden] { display: none; }
 .dock-label {
   flex: none; font-size: 10px; text-transform: uppercase; letter-spacing: 1px;
   color: var(--text-dim); margin-right: 2px;

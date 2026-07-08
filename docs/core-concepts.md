@@ -68,6 +68,25 @@ be rearranged in place:
 > PTY box never changes size. You'll see this promise repeated across the
 > feature pages — it's a core design rule.
 
+## Project tabs
+
+The split grid above is *one* workspace. **Project tabs** give you several: each
+tab is a whole workspace — its own split grid and minimize dock — and switching
+tabs swaps the entire workspace in and out, so you can keep several projects side
+by side without their panes competing for space.
+
+- **New tab** `Ctrl+Shift+T` (or the **+** in the tab strip); **close** it with
+  `Ctrl+Shift+K` (or its ✕); page between tabs with `Ctrl+Shift+[` / `Ctrl+Shift+]`.
+- A background tab is **hidden, not torn down** — its terminals keep running and
+  its scrollback stays intact, and switching never repaints a terminal (the same
+  no-resize promise as maximize).
+- Launch an orchestrator and it opens **its own repo-named tab**; a blocked agent
+  in a hidden tab raises an alert on its tab so a background project can't hide
+  its ask.
+
+Full details — rename/color, live previews, per-project pause, and what survives
+a restart — are on the **[Project tabs](features/project-tabs.html)** feature page.
+
 ## Copy & paste
 
 - **Copy / paste** — `Ctrl+Shift+C` / `Ctrl+Shift+V` (`Ctrl+V` also pastes).
@@ -85,6 +104,9 @@ this table mirrors it.
 | Split right | `Ctrl+Shift+E` (or ◫ in a pane header) |
 | Split down | `Ctrl+Shift+O` (or ⬓) |
 | Close pane | `Ctrl+Shift+W` (or ✕) |
+| New project tab | `Ctrl+Shift+T` (or **+** in the tab strip) |
+| Close project tab | `Ctrl+Shift+K` (or the tab's ✕) |
+| Prev / next tab | `Ctrl+Shift+[` / `Ctrl+Shift+]` (or click a tab) |
 | Rename pane | `F2`, or double-click its title |
 | Move focus | `Alt+←/→/↑/↓` (or click) |
 | Resize panes | drag the divider between them |

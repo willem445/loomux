@@ -11,6 +11,9 @@ Deep dives on loomux's per-feature panels and tools. Each one floats *over* the
 terminal it's scoped to and never resizes the PTY underneath — press `Esc` to
 return to the shell.
 
+- **[Project tabs](project-tabs.html)** — several project workspaces in one
+  window; each a full split grid with its own dock, previews, and per-project
+  pause (`Ctrl+Shift+T`).
 - **[Git view](git-view.html)** — a commit graph, diff preview, and working-tree
   staging/commit, scoped to the pane's current repository (`Alt+G`).
 - **[GitHub issues view](github-issues.html)** — browse and comment on issues and PRs,

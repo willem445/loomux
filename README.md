@@ -100,19 +100,26 @@ src-tauri/src/
   orchestration/    agent groups: registry, guardrails, MCP server, audit
   obs.rs            crash observability: panic hook, breadcrumb log, unclean-exit notice
   voice.rs          voice prompts (#58): mic capture (cpal) -> local whisper.cpp subprocess
+  uistate.rs        durable UI state (project tabs #63): atomic tabs.json store
   lib.rs            Tauri wiring
 src/
   pty.ts            typed bridge to the backend (invoke + event bus)
   pane.ts           one terminal pane: xterm instance + header UI
   grid.ts           split-tree layout, dividers, focus, drag/maximize/minimize
   layout.ts         pure drag-reorder geometry (unit-tested, DOM-free)
+  tabs.ts           project tabs (#63): TabManager -- tab list, active tab, routing (DOM-free)
+  workspace.ts      one tab = a Grid + its own dock; hide/show, GL policy, preview composite
+  tabbar.ts         the tab strip: switch/close/new, rename, color, alert/status chips, preview
+  tabroute.ts       pure tab routing + preview scale/sanitizer (unit-tested, DOM-free)
+  tabstore.ts       pure encode/decode + schema validation of the persisted tab set
+  panefit.ts        pure "hidden => no PTY resize" decision (the no-resize invariant)
   sessions.ts       session browser sidebar
   launcher.ts       new-agent-pane dialog (single / multi / orchestrator)
   orchestration.ts  frontend half of agent groups (panes, badges, focus)
   shortcuts.ts      app-level keybindings (single source of truth)
   voice.ts          pure voice logic: target decision + push-to-talk state machine
   voicecontrol.ts   global single-capture controller; routes transcripts to focus
-  main.ts           composition root
+  main.ts           composition root (owns the TabManager + OrchWiring router)
 ```
 
 Extension seams: new agent sources add a `scan_*` in `sessions.rs`; new backend

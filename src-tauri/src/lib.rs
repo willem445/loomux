@@ -9,6 +9,7 @@ mod obs;
 pub mod orchestration; // pub: integration smoke test links through it
 pub mod pty; // pub: Job-Object integration test links `assign_kill_on_close_job`
 mod sessions;
+mod uistate; // durable UI state (project tabs, #63) — atomic tabs.json store
 pub mod usage; // pub: exercised by orchestration integration tests
 pub mod voice; // voice-prompt prototype (#58); pub: pure helpers are unit-tested
 
@@ -136,6 +137,8 @@ pub fn run() {
             cliprobe::probe_agent_cli,
             editor::open_in_editor,
             obs::take_startup_notice,
+            uistate::load_ui_tabs,
+            uistate::save_ui_tabs,
             voice::voice_start,
             voice::voice_stop,
             voice::voice_cancel,

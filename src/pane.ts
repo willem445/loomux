@@ -4,6 +4,7 @@
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
+import { SerializeAddon } from "@xterm/addon-serialize";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { Unicode11Addon } from "@xterm/addon-unicode11";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -38,6 +39,7 @@ import { showToast } from "./toast";
 import { isAppShortcut } from "./shortcuts";
 import { attentionPresentation } from "./attention";
 import { makeRenameCommit } from "./panerename";
+import { shouldResizePty } from "./panefit";
 import { swapEditor } from "./domutil";
 import { openInEditor, editorConfigDialog } from "./editor";
 import { GitView } from "./gitview";
@@ -628,13 +630,74 @@ export class Pane implements VoiceTargetPane {
     }
   }
 
+  /** The live WebGL renderer addon, if loaded. Held so hidden tabs can drop it
+   *  (browsers cap live GL contexts, and N mounted-but-hidden tabs would each
+   *  hold one) and reload it on show — the onContextLoss→DOM fallback path. */
+  private webgl: WebglAddon | null = null;
+  private serializer: SerializeAddon | null = null;
+  /** True while this pane's project tab is hidden (#63). Held so `tryWebgl`
+   *  refuses to create a context for a hidden pane — start() calls tryWebgl
+   *  unconditionally, so a pane opened INTO a hidden tab (a background
+   *  orchestrator spawn) would otherwise take a GL context it isn't showing. */
+  private hiddenTab = false;
+
   private tryWebgl(): void {
+    if (this.webgl || this.hiddenTab) return;
     try {
       const webgl = new WebglAddon();
-      webgl.onContextLoss(() => webgl.dispose()); // falls back to DOM renderer
+      webgl.onContextLoss(() => {
+        webgl.dispose(); // falls back to DOM renderer
+        if (this.webgl === webgl) this.webgl = null;
+      });
       this.term.loadAddon(webgl);
+      this.webgl = webgl;
     } catch {
       // WebGL unavailable — xterm's DOM renderer still works fine.
+    }
+  }
+
+  /** Show/hide bookkeeping for a project-tab switch (#63). Hiding drops the
+   *  WebGL context (freeing it for the active tab and cutting idle VRAM) and
+   *  latches `hiddenTab` so start()/tryWebgl won't re-create one while hidden;
+   *  showing clears the latch and reloads it (via the onContextLoss→DOM fallback
+   *  if the GPU is out of contexts). Purely a rendering concern — the PTY and
+   *  buffer are untouched, so no resize and no scrollback loss. Safe to call
+   *  before the terminal is even open (tryWebgl no-ops until start opens it). */
+  setHidden(hidden: boolean): void {
+    if (this.disposed) return;
+    this.hiddenTab = hidden;
+    if (hidden) {
+      this.webgl?.dispose();
+      this.webgl = null;
+    } else if (this.termEl.isConnected) {
+      this.tryWebgl();
+    }
+  }
+
+  /** An HTML snapshot of the terminal viewport, for a background tab's preview
+   *  thumbnail (#63). Serializes the in-memory buffer (NOT the DOM),
+   *  so it works while the pane is hidden/zero-width — the whole point: a preview
+   *  must never require a laid-out element, which would re-arm applyFit and fire
+   *  a PTY resize.
+   *
+   *  serializeAsHTML (not serialize): the string serializer emits cursor-forward
+   *  escapes (`ESC[nC`) to skip blank cells, which stripping collapses runs of
+   *  spaces ("Please count" → "Pleasecount", #63). The HTML serializer
+   *  emits a literal space per blank cell and per-run `<span style='color:…'>`,
+   *  so the preview keeps spacing AND color. The caller parses this SAFELY (spans
+   *  → textContent + whitelisted styles), never innerHTML — the addon does not
+   *  escape cell text. Returns "" if serialization isn't available. */
+  serializeViewportHtml(): string {
+    if (this.disposed) return "";
+    try {
+      if (!this.serializer) {
+        this.serializer = new SerializeAddon();
+        this.term.loadAddon(this.serializer);
+      }
+      // scrollback: 0 → just the visible screen, which is all a thumbnail shows.
+      return this.serializer.serializeAsHTML({ scrollback: 0 });
+    } catch {
+      return "";
     }
   }
 
@@ -648,12 +711,15 @@ export class Pane implements VoiceTargetPane {
     clearTimeout(this.fitTimer);
     this.fitTimer = window.setTimeout(() => {
       if (this.disposed || !this.termEl.isConnected) return;
-      if (this.termEl.clientWidth === 0) return; // not laid out yet
+      if (this.termEl.clientWidth === 0) return; // hidden (inactive tab / maximized-behind) or unlaid — fit.fit() needs a laid-out element
       this.fit.fit();
       const size = `${this.term.cols}x${this.term.rows}`;
-      if (this.ptyId !== null && size !== this.sentSize) {
+      // The zero-width / same-size / no-pty skips live in the pure, tested
+      // shouldResizePty (panefit.ts) — THE invariant that keeps tab switches and
+      // maximize free of ConPTY repaints (#63, CLAUDE.md constraint 1).
+      if (shouldResizePty({ clientWidth: this.termEl.clientWidth, size, sentSize: this.sentSize, ptyId: this.ptyId })) {
         this.sentSize = size;
-        resizePty(this.ptyId, this.term.cols, this.term.rows).catch(() => {});
+        resizePty(this.ptyId!, this.term.cols, this.term.rows).catch(() => {});
       }
       // The pane itself changed size: keep the overlay within bounds and
       // re-anchor the visible strip on the cursor.
