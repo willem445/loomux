@@ -1957,17 +1957,21 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
    controls wrap into tight rows within the fixed width — compact via layout,
    not by shrinking text. */
 .fileedit-editor-host .cm-panel.cm-search {
-  padding: 7px; display: flex; flex-wrap: wrap; align-items: center; gap: 5px;
+  /* Dense card: minimal padding and 3/4px gaps — the round-5 feedback was that
+     5px gaps on every control made the card tall and airy. Fonts stay as-is;
+     compactness comes from spacing only. */
+  padding: 5px; display: flex; flex-wrap: wrap; align-items: center;
+  row-gap: 3px; column-gap: 4px;
   font-family: inherit; font-size: 12px; color: var(--text);
 }
 .fileedit-editor-host .cm-panel.cm-search label {
-  display: inline-flex; align-items: center; gap: 5px;
+  display: inline-flex; align-items: center; gap: 3px;
   font-size: 12px; color: var(--text-dim); text-transform: none;
 }
 .fileedit-editor-host .cm-panel.cm-search .cm-textfield {
   background: var(--panel); border: 1px solid var(--border); color: var(--text);
   font-family: "Cascadia Mono", Consolas, monospace; font-size: 13px;
-  padding: 5px 9px; border-radius: 5px;
+  padding: 3px 7px; border-radius: 5px;
   /* Flex within the fixed-width card instead of forcing a 150px min that
      overflowed the widget wide. Each field takes a full row. */
   flex: 1 1 100%; min-width: 0;
@@ -1977,7 +1981,7 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 }
 .fileedit-editor-host .cm-panel.cm-search .cm-button {
   background: var(--panel-2); border: 1px solid var(--border); color: var(--text);
-  font: inherit; font-size: 12px; padding: 3px 8px; border-radius: 5px;
+  font: inherit; font-size: 12px; padding: 2px 7px; border-radius: 4px;
   cursor: pointer; text-transform: none; background-image: none;
 }
 .fileedit-editor-host .cm-panel.cm-search .cm-button:hover {
