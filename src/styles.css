@@ -131,6 +131,19 @@ html, body {
 .tab.active .tab-status { color: var(--text); }
 .tab-paused { flex: none; font-size: 10px; color: #e0af68; }
 
+/* Static orchestrator marker (#177): a subtle, always-present chip on a tab that
+   owns an orchestration group — keyed on the tab→group binding, so it shows even
+   before a restored group resumes (unlike .tab-status, which needs live status).
+   Uses the group-accent blue (orchbadge.ts GROUP_COLORS[0]) so it reads as
+   orchestration chrome; subtle enough not to compete with the tab name. */
+.tab-orch {
+  flex: none; font-size: 9px; font-weight: 700; letter-spacing: 0.4px;
+  padding: 1.5px 5px; border-radius: 4px; white-space: nowrap;
+  color: #7aa2f7; background: rgba(122, 162, 247, 0.14);
+  border: 1px solid rgba(122, 162, 247, 0.4);
+}
+.tab.active .tab-orch { color: #9db8ff; }
+
 /* Attention (#63, finding 1): an unmistakable alert on a tab whose (maybe
    hidden) pane needs the human — a colored, pulsing chip showing the SAME label
    as the pane header (attention.ts), plus a tinted tab background + top edge so

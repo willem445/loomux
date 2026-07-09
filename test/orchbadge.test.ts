@@ -6,7 +6,7 @@
 // Run with `npm test`.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { badgeFor, agentSeq, metaForGroup, resetGroupMeta } from "../src/orchbadge.ts";
+import { badgeFor, agentSeq, metaForGroup, resetGroupMeta, orchTabLabel } from "../src/orchbadge.ts";
 
 type Role = "orchestrator" | "worker" | "reviewer" | "planner";
 const req = (group_id: string, agent_id: string, role: Role) => ({ group_id, agent_id, role });
@@ -124,4 +124,22 @@ test("badgeFor ignores the pane name — re-badging never touches a renamed titl
   assert.deepEqual(withName, withoutName);
   // Deterministic across repeated calls (idempotent re-bind).
   assert.deepEqual(badgeFor(req("g1", "w-4", "worker")), withoutName);
+});
+
+// --- Static orchestrator tab marker (#177) -------------------------------
+
+test("orchTabLabel is the ORCH chip only when the tab owns a group", () => {
+  // Keyed on the static tab→group binding so a restored-but-dormant orchestrator
+  // tab is still identifiable before its group resumes (no live status needed).
+  assert.equal(orchTabLabel("loomux-68435179"), "ORCH");
+  // Plain tab (no bound group): no chip.
+  assert.equal(orchTabLabel(null), null);
+  assert.equal(orchTabLabel(undefined), null);
+  // Empty string is not a real group id → treated as no group.
+  assert.equal(orchTabLabel(""), null);
+});
+
+test("orchTabLabel shares the ORCH role tag the pane badge uses", () => {
+  // Tab chip and the group's orchestrator pane badge must read as one glyph.
+  assert.equal(orchTabLabel("g1"), badgeFor(req("g1", "orch-1", "orchestrator")).label.split(" ")[0]);
 });

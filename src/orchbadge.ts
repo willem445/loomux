@@ -44,6 +44,16 @@ const ROLE_LABELS: Record<OrchRole, string> = {
   planner: "PLAN",
 };
 
+/** The static chip a tab shows when it OWNS an orchestration group (#177). Keyed
+ *  on the tab→group binding (TabManager.groupForWorkspace), NOT on live status —
+ *  so a restored-but-dormant orchestrator tab is identifiable before its group
+ *  is resumed, unlike the live count+cost chip which only shows for a running
+ *  group. Returns the label, or null for a plain tab. The glyph is the same
+ *  "ORCH" role tag the pane badge uses, so the tab and its panes read as one. */
+export function orchTabLabel(groupId: string | null | undefined): string | null {
+  return groupId ? ROLE_LABELS.orchestrator : null;
+}
+
 /** The minimal identity a badge needs. `OrchSpawnRequest` is a structural
  *  superset, so spawn AND rejoin requests both satisfy it. */
 export interface BadgeAgent {

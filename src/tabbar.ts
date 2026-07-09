@@ -12,6 +12,7 @@ import { safeStyleDeclarations, compositeScale, type PreviewNode, type PreviewFi
 import { makeRenameCommit } from "./panerename";
 import { swapEditor } from "./domutil";
 import { attentionPresentation } from "./attention";
+import { orchTabLabel } from "./orchbadge";
 import { pauseGroup, resumeGroup, groupSummary, groupUsage } from "./orchestration";
 
 // Reuse the orchestration group palette (orchbadge.ts GROUP_COLORS) so a tab's
@@ -182,6 +183,21 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
       });
 
       tab.append(swatch, name);
+
+      // Static orchestrator marker (#177): a subtle "ORCH" chip on any tab that
+      // OWNS an orchestration group, keyed on the static tab→group binding (not
+      // live status) so a restored-but-dormant orchestrator tab is still
+      // identifiable before its group resumes. Additive — the tab keeps its
+      // normal renameable title. Distinct from the live count+cost chip below.
+      const groupId = this.tabs.groupForWorkspace(ws.id);
+      const orchLabel = orchTabLabel(groupId);
+      if (orchLabel) {
+        const badge = document.createElement("span");
+        badge.className = "tab-orch";
+        badge.textContent = orchLabel;
+        badge.title = `Orchestrator workflow — group ${groupId}`;
+        tab.appendChild(badge);
+      }
 
       // Unmistakable alert (#63): a pane in this tab is
       // blocked/waiting or otherwise needs the human. Render the SAME label the
