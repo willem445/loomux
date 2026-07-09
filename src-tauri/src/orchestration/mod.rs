@@ -234,33 +234,30 @@ const READY_MAX_WAIT: Duration = Duration::from_secs(25);
 /// Poll interval for the readiness check.
 const READY_POLL: Duration = Duration::from_millis(250);
 
-// Copilot autopilot consent (#101): a group copilot agent is launched with
-// `--autopilot`, which opens an "Enable autopilot mode" dialog at startup. The
-// kickoff path answers it deterministically (Enter on the default "Enable all
-// permissions") BEFORE pasting the brief, so the brief can't collide with the
-// dialog (the collision was the suspected kickoff-swallow race). Fail-soft: if
-// the dialog never appears (copilot changed the flow), delivery proceeds.
-/// How long to watch a freshly spawned autopilot copilot pane for its consent
-/// dialog before giving up and delivering normally.
+// Copilot autopilot consent (#101/#179): a group copilot agent is launched with
+// `--autopilot`, which makes copilot open an "Enable autopilot mode" dialog the
+// first time a message is submitted (NOT at boot — verified live on 1.0.69: a
+// fresh pane paints a normal input box). The kickoff path answers it
+// deterministically (Enter on the default "Enable all permissions") right AFTER
+// the first submit, which both enables autopilot and lets the just-submitted
+// brief proceed. Fail-soft: if the dialog never appears, delivery proceeds.
+/// How long to watch for the consent dialog after the kickoff submit before
+/// giving up and letting the submit retries carry on.
 const AUTOPILOT_DIALOG_WAIT: Duration = Duration::from_secs(12);
 /// Poll interval while watching for the consent dialog.
 const AUTOPILOT_DIALOG_POLL: Duration = Duration::from_millis(250);
-/// Pause after answering so the TUI dismisses the dialog and repaints before
-/// the kickoff paste begins.
+/// Pause after answering so the TUI dismisses the dialog and repaints / starts
+/// the turn before the delivery's confirmation window measures the burst.
 const AUTOPILOT_DIALOG_SETTLE: Duration = Duration::from_millis(700);
 /// Keys that confirm the highlighted menu item in Copilot's consent dialog.
 /// Focus-in report (`ESC[I`) + Enter (`\r`) — the SAME transport as
-/// [`submit_sequence`]`("copilot")`, and for the same reason (#98/#179): this
-/// dialog is answered on a freshly spawned pane the orchestrator delivers to
-/// while it is NOT the focused terminal, and Copilot drops every non-paste
-/// keystroke while its focus flag is false. A bare `\r` here is swallowed, so
-/// the dialog is never dismissed; the kickoff brief then pastes behind the
-/// still-open modal and the later submit's focus-in+Enter belatedly selects the
-/// dialog default (autopilot "engages") while the brief is discarded with it —
-/// the #179 "pane opens, autopilot on, prompt never delivered" symptom. The
-/// `ESC[I` flips Copilot's focus flag true so the trailing `\r` is accepted; it
-/// selects the default-highlighted "Enable all permissions" (menu `initialIndex`
-/// 0, `code==="return"`, verified against the 1.0.68 TUI) — no arrow keys.
+/// [`submit_sequence`]`("copilot")`. The dialog is answered after the kickoff
+/// submit, by which point copilot's focus flag is already true (the submit's
+/// own `ESC[I` set it); the prefix is kept so this stays consistent with the
+/// other pane-write sites and self-sufficient if a stray blur ever intervened
+/// (#98). The `\r` selects the default-highlighted "Enable all permissions"
+/// (menu `initialIndex` 0, `code==="return"`, verified against the 1.0.69 TUI)
+/// — no arrow keys needed.
 #[doc(hidden)] // pub for integration tests
 pub const COPILOT_AUTOPILOT_CONFIRM_KEYS: &[u8] = b"\x1b[I\r";
 
@@ -1307,13 +1304,14 @@ fn wait_for_user_quiet(ptys: &crate::pty::PtyManager, pty_id: u32) -> Option<u64
 }
 
 /// For a freshly spawned group copilot pane (launched with `--autopilot`): watch
-/// its boot output for the "Enable autopilot mode" consent dialog and answer it
-/// (Enter selects the default "Enable all permissions") BEFORE the caller pastes
-/// the kickoff brief — so the brief can never collide with the dialog, the race
-/// the kickoff-Enter used to answer by accident (and sometimes swallow the
-/// prompt over). Fail-soft: returns `false` without acting if the dialog does
+/// for the "Enable autopilot mode" consent dialog and answer it (Enter selects
+/// the default "Enable all permissions"). Copilot 1.0.69 opens this dialog in
+/// response to the FIRST message submit, not at boot (#179), so the caller runs
+/// this right AFTER the kickoff Enter — selecting the default both enables
+/// autopilot and lets the just-submitted brief proceed (the pending message is
+/// not discarded). Fail-soft: returns `false` without acting if the dialog does
 /// not appear within `AUTOPILOT_DIALOG_WAIT` (e.g. copilot changed the flow, or
-/// consent was already recorded), and the caller delivers normally.
+/// consent was already recorded), and the caller's submit retries carry on.
 ///
 /// Returns `true` iff it detected and answered the dialog. Times/keys come from
 /// module constants so the wiring is testable; the pure recognizer is
@@ -1809,23 +1807,56 @@ const BRACKETED_PASTE_END: &str = "\u{1b}[201~";
 
 /// Whether `s` contains a graphic character once terminal escape sequences are
 /// skipped — the test for "this write put visible text in the box". Skips CSI
-/// (`ESC [ … final`, e.g. arrow keys, bracketed-paste markers) and other short
-/// `ESC`-led sequences so their printable final bytes (`C`, `~`, digits) don't
-/// read as typed content.
+/// (`ESC [ … final`, e.g. arrow keys, bracketed-paste markers) AND the string
+/// sequences a terminal emits in *reply* to a program's query — OSC (`ESC ]`)
+/// and DCS/SOS/PM/APC (`ESC P`/`X`/`^`/`_`) — plus other short `ESC`-led
+/// sequences, so none of their printable bytes read as typed content.
+///
+/// The OSC/DCS skip is #179: GitHub Copilot queries the terminal's colors
+/// (`ESC]10;?`, `ESC]11;?`, `ESC]4;n;?`) and version (`ESC[>q`) at boot; the
+/// webview's xterm auto-answers, and those answers reach us through `write_pty`
+/// exactly like a keystroke. Their bodies are printable (`11;rgb:0d0d/1111/1717`),
+/// so without skipping the whole string they were misread as a human's line,
+/// wedging `input_pending` true and stalling the fresh-copilot kickoff paste in
+/// the #111 box-clear hold (up to its 60s abort) — the "prompt never delivered"
+/// symptom. Claude Code issues no such query, so only copilot tripped it.
 fn input_has_printable(s: &str) -> bool {
     let b = s.as_bytes();
     let mut i = 0;
     while i < b.len() {
         if b[i] == 0x1b {
             i += 1;
-            if i < b.len() && b[i] == b'[' {
-                i += 1;
-                while i < b.len() && !(0x40..=0x7e).contains(&b[i]) {
+            match b.get(i) {
+                // CSI: `ESC [` … final byte in 0x40..=0x7e.
+                Some(b'[') => {
+                    i += 1;
+                    while i < b.len() && !(0x40..=0x7e).contains(&b[i]) {
+                        i += 1;
+                    }
+                    i += 1; // consume the CSI final byte
+                }
+                // OSC / DCS / SOS / PM / APC: a string sequence whose body is
+                // arbitrary (often printable) text, terminated by BEL (0x07) or
+                // ST (`ESC \`). Skip the whole thing — it's a query reply, not
+                // typed input (#179).
+                Some(b']') | Some(b'P') | Some(b'X') | Some(b'^') | Some(b'_') => {
+                    i += 1;
+                    while i < b.len() {
+                        if b[i] == 0x07 {
+                            i += 1; // BEL terminator
+                            break;
+                        }
+                        if b[i] == 0x1b && b.get(i + 1) == Some(&b'\\') {
+                            i += 2; // ST terminator (ESC \)
+                            break;
+                        }
+                        i += 1;
+                    }
+                }
+                // Any other 2-byte / lone ESC sequence (charset select, `ESC=`, …).
+                _ => {
                     i += 1;
                 }
-                i += 1; // consume the CSI final byte
-            } else {
-                i += 1; // 2-byte / lone ESC sequence
             }
             continue;
         }
@@ -4759,8 +4790,9 @@ impl OrchRegistry {
     /// `delivery` classifies the call (see [`Delivery`]): a kickoff to a just-
     /// booted CLI holds the paste until the pane has painted its UI and gone
     /// quiet (input typed before the CLI's reader attaches is flushed and lost),
-    /// and a *fresh* boot additionally answers copilot's autopilot consent
-    /// dialog first; mid-session deliveries do neither.
+    /// and a *fresh* copilot boot additionally answers the autopilot consent
+    /// dialog that its first submit triggers (#179); mid-session deliveries do
+    /// neither.
     pub fn deliver_prompt(
         &self,
         agent_id: &str,
@@ -4856,20 +4888,14 @@ impl OrchRegistry {
                 }
             }
 
-            // Copilot autopilot consent (#101): the UI has painted, so if this
-            // is a fresh autopilot copilot spawn its "Enable autopilot mode"
-            // dialog is on screen. Answer it (Enter → "Enable all permissions")
-            // now — before the stranded-text flush (#99) below AND before any
-            // paste — so neither our brief nor a flush Enter can hit the dialog
-            // out of order. In practice the flush can't fire here anyway: the
-            // confirm only runs on a FreshKickoff (`is_fresh_boot`), whose pane
-            // has no prior `last_delivery` entry, so `should_flush_before_paste`
-            // sees `None` and returns false. Ordering the confirm first keeps
-            // that safe even if a pty id were ever recycled. Fail-soft: no-op if
-            // the dialog never shows.
-            if confirm_autopilot {
-                confirm_copilot_autopilot_dialog(&ptys, pty_id, &root, &group, &agent);
-            }
+            // Copilot autopilot consent (#101/#179): the "Enable autopilot mode"
+            // dialog does NOT open at boot — verified live against copilot 1.0.69,
+            // a fresh --autopilot pane paints a normal input box, and the consent
+            // dialog is triggered by the FIRST message submit. So the confirm is
+            // answered AFTER the kickoff Enter (below), not here: selecting its
+            // default "Enable all permissions" both enables autopilot and delivers
+            // the pending brief in one step. Watching at boot (as this used to)
+            // only burned the fail-soft wait on a dialog that never shows.
 
             // Human-typing backstop (#43, option A): if a human is typing
             // directly in this pane, hold the paste until they go quiet so a
@@ -5013,6 +5039,19 @@ impl OrchRegistry {
             // below measures only the burst that Enter produces.
             let submit_baseline = ptys.output_total(pty_id).unwrap_or(last_total);
             let _ = ptys.write_bytes(pty_id, submit);
+
+            // Copilot autopilot consent (#101/#179): a fresh --autopilot copilot
+            // opens its "Enable autopilot mode" dialog in response to this FIRST
+            // submit (not at boot). Answer it now — Enter selects the default
+            // "Enable all permissions", which enables autopilot AND lets the brief
+            // we just submitted proceed (verified live: the pending message is not
+            // discarded). Gated to a fresh unattended copilot boot; fail-soft, so
+            // if the dialog never shows (already consented, flow changed) delivery
+            // just continues to the retries. Must run before the confirm window so
+            // the dialog's Enter has landed before we judge whether the turn began.
+            if confirm_autopilot {
+                confirm_copilot_autopilot_dialog(&ptys, pty_id, &root, &group, &agent);
+            }
 
             // Confirm the submit landed: watch for the output burst of the box
             // clearing / the turn starting (#81/#84). Measured off the first

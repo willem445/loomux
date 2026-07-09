@@ -1077,14 +1077,14 @@ fn autopilot_confirm_gates_to_a_fresh_copilot_boot() {
 
 #[test]
 fn autopilot_confirm_and_stranded_flush_never_both_fire_on_a_fresh_boot() {
-    // #99-rebase interaction: `deliver_prompt` runs the autopilot confirm
-    // (Enter on the consent dialog) BEFORE #99's stranded-text flush (an Enter
-    // to clear a previous prompt still in the box). They must never both press
-    // Enter on the same fresh boot, or the flush Enter could land on the dialog
-    // out of order. They can't: the confirm runs only on a *fresh boot*, and a
-    // freshly booted pane has no prior delivery, so the flush's own guard
-    // (`should_flush_before_paste(None, _)`) is false. This pins that composition
-    // — if either guard's contract changes, this fails.
+    // #99/#179 interaction: the autopilot confirm (Enter on the consent dialog)
+    // now runs AFTER the kickoff submit, while #99's stranded-text flush (an
+    // Enter to clear a previous prompt still in the box) runs before the paste.
+    // Neither can fire on a fresh boot without the other being a no-op: the
+    // confirm runs only on a *fresh boot*, and a freshly booted pane has no prior
+    // delivery, so the flush's own guard (`should_flush_before_paste(None, _)`)
+    // is false. This pins that composition — if either guard's contract changes,
+    // this fails.
     // Fresh boot ⇒ confirm may run …
     assert!(should_confirm_copilot_autopilot("copilot", true, true));
     // … but the flush cannot: no previous delivery to key off (prev = None).
@@ -1094,27 +1094,54 @@ fn autopilot_confirm_and_stranded_flush_never_both_fire_on_a_fresh_boot() {
 }
 
 #[test]
-fn copilot_autopilot_confirm_carries_the_focus_in_prefix() {
-    // #179: the confirm answers the "Enable autopilot mode" dialog on a *fresh*
-    // copilot pane — which the orchestrator delivers to while it is NOT the
-    // focused terminal. Per #98 Copilot drops every non-paste keystroke while
-    // its focus flag is false, so a BARE Enter here is swallowed: the dialog is
-    // never dismissed, the kickoff brief pastes behind the still-open modal, and
-    // the later submit sequence's focus-in+Enter belatedly selects the dialog
-    // default (autopilot "engages") while the brief is discarded with it — the
-    // reported "pane opens, autopilot on, prompt never delivered, sits idle".
-    // So the confirm MUST carry the same focus-in prefix as any other copilot
-    // keystroke: CSI I flips the focus flag true, then Enter selects the
-    // default-highlighted "Enable all permissions" (menu initialIndex 0).
+fn copilot_autopilot_confirm_reuses_the_copilot_submit_transport() {
+    // #179: the confirm answers the "Enable autopilot mode" dialog copilot opens
+    // in response to the kickoff submit. The dialog default "Enable all
+    // permissions" is selected with Enter (menu initialIndex 0). The keys carry
+    // the focus-in prefix so this stays identical to every other copilot pane
+    // write (#98) — pin the two together so they can't silently drift apart.
     assert_eq!(COPILOT_AUTOPILOT_CONFIRM_KEYS, b"\x1b[I\r");
-    assert!(COPILOT_AUTOPILOT_CONFIRM_KEYS.starts_with(b"\x1b[I"),
-        "focus-in must precede the Enter, or Copilot drops it on the unfocused pane");
     assert!(COPILOT_AUTOPILOT_CONFIRM_KEYS.ends_with(b"\r"),
-        "the selection key is still Enter (menu initialIndex 0 = Enable all permissions)");
-    // Identical transport to a normal copilot submit — they share the focus-in
-    // requirement, so pin them together to stop the two drifting apart again.
+        "the selection key is Enter (menu initialIndex 0 = Enable all permissions)");
     assert_eq!(COPILOT_AUTOPILOT_CONFIRM_KEYS, submit_sequence("copilot"),
         "the autopilot confirm reuses copilot's focus-in+Enter transport");
+}
+
+#[test]
+fn terminal_query_replies_are_not_read_as_human_input() {
+    // #179 root cause: a fresh copilot pane queries the terminal's colors and
+    // version at boot (`ESC]10;?`, `ESC]11;?`, `ESC]4;n;?`, `ESC[>q`); the
+    // webview's xterm auto-answers, and those answers reach `classify_human_input`
+    // through `write_pty` exactly like a keystroke. Their bodies are printable, so
+    // when the classifier only skipped CSI they were read as a human's line —
+    // wedging `input_pending` true and stalling the kickoff paste in the #111
+    // box-clear hold until it aborted ("prompt never delivered"). A terminal
+    // reply must classify Neutral (it changes no box occupancy), never Content.
+
+    // OSC 11 (background color) reply — BEL-terminated, as xterm sends it.
+    assert_eq!(classify_human_input("\x1b]11;rgb:0d0d/1111/1717\x07"), HumanInput::Neutral,
+        "an OSC color-query reply is a terminal answer, not typed input");
+    // OSC 10 (foreground) reply — ST-terminated (ESC \) form.
+    assert_eq!(classify_human_input("\x1b]10;rgb:f0f6/f0f6/fcfc\x1b\\"), HumanInput::Neutral);
+    // OSC 4 palette-entry reply.
+    assert_eq!(classify_human_input("\x1b]4;1;rgb:ffff/0000/0000\x07"), HumanInput::Neutral);
+    // DCS reply to XTVERSION (`ESC[>q`) — `ESC P > | xterm(...) ESC \`.
+    assert_eq!(classify_human_input("\x1bP>|xterm(370)\x1b\\"), HumanInput::Neutral,
+        "a DCS version reply is a terminal answer, not typed input");
+    // Several batched into one write (xterm can coalesce replies) — still Neutral.
+    assert_eq!(
+        classify_human_input("\x1b]10;rgb:f0f6/f0f6/fcfc\x07\x1b]11;rgb:0d0d/1111/1717\x07"),
+        HumanInput::Neutral,
+    );
+    // A CSI DA/DSR reply was already Neutral — keep it that way.
+    assert_eq!(classify_human_input("\x1b[?64;1;2;6;9;15;18;21;22c"), HumanInput::Neutral);
+    assert_eq!(classify_human_input("\x1b[24;80R"), HumanInput::Neutral);
+
+    // Guardrail: a real typed line that merely *follows* a query reply in the same
+    // write must still register as Content — skipping the reply must not swallow
+    // the human's text after it.
+    assert_eq!(classify_human_input("\x1b]11;rgb:0d0d/1111/1717\x07hello"), HumanInput::Content,
+        "typed text after a query reply is still a human's unsubmitted line");
 }
 
 #[test]
