@@ -149,6 +149,9 @@ class CodeMirrorEditor implements EditorWidget {
   private readonly cm: CmModules;
   private readonly langCompartment: import("@codemirror/state").Compartment;
   private readonly roCompartment: import("@codemirror/state").Compartment;
+  /** Holds the always-on workspace-query highlighter (a ViewPlugin), or [] when
+   *  no query is active. Reconfigured imperatively by `setHighlightQuery`. */
+  private readonly wsHighlight: import("@codemirror/state").Compartment;
 
   constructor(
     parent: HTMLElement,
@@ -160,6 +163,7 @@ class CodeMirrorEditor implements EditorWidget {
     this.cm = cm;
     this.langCompartment = new cm.state.Compartment();
     this.roCompartment = new cm.state.Compartment();
+    this.wsHighlight = new cm.state.Compartment();
     const state = cm.state.EditorState.create({
       doc,
       extensions: [
@@ -183,6 +187,7 @@ class CodeMirrorEditor implements EditorWidget {
         ]),
         this.langCompartment.of(lang ?? []),
         this.roCompartment.of(cm.state.EditorState.readOnly.of(false)),
+        this.wsHighlight.of([]),
         cm.view.EditorView.updateListener.of((u: import("@codemirror/view").ViewUpdate) => {
           if (u.docChanged) this.changeCb();
         }),
@@ -242,19 +247,38 @@ class CodeMirrorEditor implements EditorWidget {
   }
 
   setHighlightQuery(query: string, caseInsensitive: boolean, wholeWord: boolean): void {
-    // Setting the search query decorates every match (.cm-searchMatch) even with
-    // the panel closed, so the project search's matches light up inside the file.
-    // `literal` keeps it a plain-text (non-regex) search, matching the backend.
+    // Why not `setSearchQuery`: CM's search extension only paints match
+    // decorations while its find PANEL is open, so with the panel closed the
+    // workspace query lit up nothing (the reported bug). Instead install our own
+    // always-on ViewPlugin whose decorations come from a MatchDecorator — that
+    // decorations facet renders whenever the plugin is in the config, panel or
+    // not, and is viewport-bounded (MatchDecorator only scans the visible range).
+    const re = buildHighlightRegex(query, caseInsensitive, wholeWord);
     this.view.dispatch({
-      effects: this.cm.search.setSearchQuery.of(
-        new this.cm.search.SearchQuery({
-          search: query,
-          caseSensitive: !caseInsensitive,
-          wholeWord,
-          literal: true,
-        })
-      ),
+      effects: this.wsHighlight.reconfigure(re ? this.highlightPlugin(re) : []),
     });
+  }
+
+  /** A ViewPlugin that decorates every match of `re` in the viewport with the
+   *  `.cm-wsMatch` class, kept current on edits and scrolls. */
+  private highlightPlugin(re: RegExp): import("@codemirror/state").Extension {
+    const cm = this.cm;
+    const matcher = new cm.view.MatchDecorator({
+      regexp: re,
+      decoration: cm.view.Decoration.mark({ class: "cm-wsMatch" }),
+    });
+    return cm.view.ViewPlugin.fromClass(
+      class {
+        decorations: import("@codemirror/view").DecorationSet;
+        constructor(view: import("@codemirror/view").EditorView) {
+          this.decorations = matcher.createDeco(view);
+        }
+        update(u: import("@codemirror/view").ViewUpdate) {
+          this.decorations = matcher.updateDeco(u, this.decorations);
+        }
+      },
+      { decorations: (v) => v.decorations }
+    );
   }
 
   dispose(): void {
@@ -277,6 +301,21 @@ interface CmModules {
  *  are the fonts developers already have installed (or the OS ships). */
 const EDITOR_FONT =
   '"Cascadia Code", "JetBrains Mono", "Fira Code", "Cascadia Mono", "SF Mono", Menlo, Consolas, ui-monospace, monospace';
+
+/** Build a global regex for the workspace query, or null for an empty query.
+ *  The query is literal (regex metachars escaped), matching the backend's
+ *  literal search; `ci`/`ww` mirror the project-search options. Exported for a
+ *  unit test of the escaping / whole-word / flag behaviour. */
+export function buildHighlightRegex(query: string, ci: boolean, ww: boolean): RegExp | null {
+  if (!query) return null;
+  const esc = query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const body = ww ? `\\b${esc}\\b` : esc;
+  try {
+    return new RegExp(body, ci ? "gi" : "g");
+  } catch {
+    return null; // never throw into the editor over a pathological query
+  }
+}
 
 /** Font + sizing layered over One Dark (which sets the colours but no font). */
 function editorChrome(cm: CmModules): import("@codemirror/state").Extension {
