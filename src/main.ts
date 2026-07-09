@@ -34,6 +34,7 @@ import {
 } from "./orchestration";
 import { tabAttention, sameAttention, findPaneByPty } from "./tabroute";
 import { encodeTabs, decodeTabs } from "./tabstore";
+import { bootFillKind } from "./bootfill";
 
 // Surface unexpected errors as a visible banner instead of a silently
 // broken UI — a user-facing "crash" should always come with a message.
@@ -605,18 +606,23 @@ void (async () => {
   tabBar = new TabBar(tabBarEl, tabs, () => void openUserTab());
 
   await ensureOutputRouter();
-  // Empty-tab fill — ONE rule (see the design note, and the factory onEmpty):
-  // an empty tab holds a SILENT plain shell, never the launcher modal, EXCEPT
-  // the genuine fresh start where the app opens its first pane and the human
-  // picks via the launcher. So a RESTORED session (any tab, active or
-  // background — including a group-bound one, whose shell is a placeholder until
-  // its group's session is restored into it) fills silently; only the brand-new
-  // default tab opens the launcher.
-  if (didRestore) {
-    for (const ws of tabs.tabs) {
-      if (ws.grid.paneCount === 0) await openShellIn(ws);
-    }
-  } else if (tabs.activeWorkspace.grid.paneCount === 0) {
-    await openPane();
+  // Empty-tab fill (#178) — bootFillKind() owns the ONE rule (see the design
+  // note, the factory onEmpty, and the pure module): the tab the human lands on
+  // honors agent mode and opens the new-agent launcher, while every other tab —
+  // background, or group-bound (whose shell is a placeholder until its group's
+  // session is restored into it) — fills with a SILENT plain shell, no modal.
+  // This holds for a fresh start and a restore alike; the earlier restore path
+  // filled every tab with a silent shell, which is what swallowed the agent
+  // launcher after the first run (tabs always persist, so didRestore is ~always
+  // true).
+  const activeId = tabs.activeWorkspace.id;
+  for (const ws of tabs.tabs) {
+    if (ws.grid.paneCount !== 0) continue;
+    const kind = bootFillKind(
+      { isActive: ws.id === activeId, isGroupBound: tabs.groupForWorkspace(ws.id) !== null },
+      agentMode
+    );
+    if (kind === "launcher") await openPaneIn(ws);
+    else await openShellIn(ws);
   }
 })();
