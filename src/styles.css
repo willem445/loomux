@@ -1942,15 +1942,22 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
    content down). */
 .fileedit-editor-host .cm-panels.cm-panels-top {
   position: absolute; top: 6px; right: 6px; left: auto;
-  z-index: 20; width: auto; max-width: calc(100% - 12px);
+  z-index: 20;
+  /* Firm, compact width so the widget stays a small floating card top-right
+     (VS-Code-like) with code visible beside/under it — NOT a full-width bar.
+     `width: auto` shrink-wrapped to the controls' wide natural width (up to the
+     old 100% cap), which is what let it span the whole editor. */
+  width: 320px; max-width: calc(100% - 12px);
   border: 1px solid var(--border); border-radius: 7px;
   background: var(--panel-2); color: var(--text);
   box-shadow: 0 8px 22px rgba(0, 0, 0, 0.5);
 }
 /* Restyle CM6's raw find panel to read as ONE design with the workspace search
-   (same input height/font, same button + checkbox styling, dark panel). */
+   (same input height/font, same button + checkbox styling, dark panel). The
+   controls wrap into tight rows within the fixed width — compact via layout,
+   not by shrinking text. */
 .fileedit-editor-host .cm-panel.cm-search {
-  padding: 8px; display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
+  padding: 7px; display: flex; flex-wrap: wrap; align-items: center; gap: 5px;
   font-family: inherit; font-size: 12px; color: var(--text);
 }
 .fileedit-editor-host .cm-panel.cm-search label {
@@ -1960,14 +1967,17 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .fileedit-editor-host .cm-panel.cm-search .cm-textfield {
   background: var(--panel); border: 1px solid var(--border); color: var(--text);
   font-family: "Cascadia Mono", Consolas, monospace; font-size: 13px;
-  padding: 5px 9px; border-radius: 5px; min-width: 150px;
+  padding: 5px 9px; border-radius: 5px;
+  /* Flex within the fixed-width card instead of forcing a 150px min that
+     overflowed the widget wide. Each field takes a full row. */
+  flex: 1 1 100%; min-width: 0;
 }
 .fileedit-editor-host .cm-panel.cm-search .cm-textfield:focus {
   outline: none; border-color: var(--accent-dim);
 }
 .fileedit-editor-host .cm-panel.cm-search .cm-button {
   background: var(--panel-2); border: 1px solid var(--border); color: var(--text);
-  font: inherit; font-size: 12px; padding: 4px 10px; border-radius: 5px;
+  font: inherit; font-size: 12px; padding: 3px 8px; border-radius: 5px;
   cursor: pointer; text-transform: none; background-image: none;
 }
 .fileedit-editor-host .cm-panel.cm-search .cm-button:hover {
