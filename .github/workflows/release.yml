@@ -88,7 +88,12 @@ jobs:
           node-version: 22
           registry-url: https://registry.npmjs.org
       - name: Upgrade npm for trusted publishing
-        run: npm install -g npm@latest && npm --version
+        # Pinned, not @latest: needs >= 11.5.1 for OIDC trusted publishing, but
+        # 11.18.0 is the last version verified good — the next release shipped
+        # without its sigstore bundle and broke `npm publish` with provenance
+        # (v0.7.1, MODULE_NOT_FOUND 'sigstore'). Bump deliberately, then verify
+        # a publish before trusting a newer pin.
+        run: npm install -g npm@11.18.0 && npm --version
       - name: Publish launcher to npm
         working-directory: npm
         run: |
