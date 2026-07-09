@@ -122,12 +122,23 @@ the file in the tree. Crucially this uses an **always-on `ViewPlugin` +
 `setSearchQuery` — the latter only paints matches while its find *panel* is open,
 so with the panel closed the workspace query lit up nothing. A ViewPlugin's
 `decorations` facet renders whenever it's in the config, panel or not, and
-`MatchDecorator` is viewport-bounded. The in-file **Find** button opens
-CodeMirror's search as a floating overlay (top-right, VS-Code-style —
-`search({top:true})` lifted out of flow in CSS and restyled to match the
-workspace search inputs/buttons). The textarea fallback can't highlight or float
-a find widget; it degrades to the project search box + jump-to-line (stated in
-the PR).
+`MatchDecorator` is viewport-bounded.
+
+The in-file **Find** button opens a **custom CodeMirror search panel**
+(`search({top:true, createPanel})`) — a compact two-row inline-icon find/replace
+widget floated top-right (VS-Code-inspired *shape*, but our own colours/borders
+and text-glyph toggles `Aa`/`W`/`.*`, not VS Code's icons). It drives CM6's
+native search state + commands (`setSearchQuery`, `findNext`/`findPrevious`,
+`replaceNext`/`replaceAll`, `closeSearchPanel`) with a live "n of m" count, so
+in-file replace edits the buffer through the normal dirty→Save path (hash
+conflict guard intact). Its pure logic — the regex build from the toggle state
+and the match-count + formatting — is the DOM-free `findwidget` module
+(`node:test`-covered); only the panel DOM is human-validated. It opens pre-filled
+from the workspace query (which `setHighlightQuery` also seeds into CM's search
+state), and is entirely separate from the workspace replace and its snapshot/seq
+guards — this panel is in-FILE, CM6-native. The textarea fallback can't highlight
+or float a find widget; it degrades to the project search box + jump-to-line
+(stated in the PR).
 
 Replace still applies from the *snapshot* the highlights were built with (not the
 live inputs), guarded additionally by a monotonic search-sequence id, so editing

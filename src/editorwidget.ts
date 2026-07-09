@@ -14,6 +14,20 @@
 //
 // The interface is the seam that keeps that choice cheap: the FileEditView never
 // imports CodeMirror directly.
+//
+// The in-file find/replace uses a CUSTOM CodeMirror search panel (a compact
+// two-row inline-icon widget, VS-Code-inspired but our own styling) built via
+// `search({createPanel})`; its logic (regex build, match count) is the pure
+// `findwidget` module, its DOM is here, and it drives CM6's own search state and
+// commands so replace edits the buffer through the normal dirty→Save flow.
+
+import {
+  buildHighlightRegex,
+  buildSearchRegex,
+  matchInfo,
+  formatMatchCount,
+  type FindFlags,
+} from "./findwidget";
 
 /** Minimal contract the overlay depends on. Keeping it this small is what makes
  *  the CM6-vs-textarea decision a one-line swap. */
@@ -176,9 +190,9 @@ class CodeMirrorEditor implements EditorWidget {
         cm.language.indentOnInput(),
         cm.language.bracketMatching(),
         cm.search.highlightSelectionMatches(),
-        // Float the find widget at the top (VS-Code-like) instead of docking a
-        // bar at the bottom; styled into an overlay in styles.css (.cm-panels-top).
-        cm.search.search({ top: true }),
+        // Float the find widget at the top (VS-Code-like) with our own compact
+        // two-row panel (createPanel); positioned as an overlay in styles.css.
+        cm.search.search({ top: true, createPanel: (view) => this.buildFindPanel(view) }),
         cm.view.keymap.of([
           cm.commands.indentWithTab,
           ...cm.commands.defaultKeymap,
@@ -255,7 +269,20 @@ class CodeMirrorEditor implements EditorWidget {
     // not, and is viewport-bounded (MatchDecorator only scans the visible range).
     const re = buildHighlightRegex(query, caseInsensitive, wholeWord);
     this.view.dispatch({
-      effects: this.wsHighlight.reconfigure(re ? this.highlightPlugin(re) : []),
+      effects: [
+        this.wsHighlight.reconfigure(re ? this.highlightPlugin(re) : []),
+        // Also seed CM6's own search state so the in-file Find widget opens
+        // pre-filled with the workspace query. This does NOT drive the visible
+        // highlight (the ViewPlugin above does) — it only feeds the panel.
+        this.cm.search.setSearchQuery.of(
+          new this.cm.search.SearchQuery({
+            search: query,
+            caseSensitive: !caseInsensitive,
+            wholeWord,
+            literal: true,
+          })
+        ),
+      ],
     });
   }
 
@@ -281,6 +308,151 @@ class CodeMirrorEditor implements EditorWidget {
     );
   }
 
+  /** Custom CodeMirror search panel: a compact two-row inline-icon find/replace
+   *  widget (VS-Code-inspired shape, our own styling + glyphs). It drives CM6's
+   *  native search state/commands, so in-file replace edits the buffer through
+   *  the normal dirty→Save path; the pure `findwidget` module owns the regex +
+   *  "n of m" logic. Returned to `search({createPanel})`. */
+  private buildFindPanel(view: import("@codemirror/view").EditorView): import("@codemirror/view").Panel {
+    const cm = this.cm;
+    const mk = (tag: string, cls: string, text?: string): HTMLElement => {
+      const e = document.createElement(tag);
+      e.className = cls;
+      if (text !== undefined) e.textContent = text;
+      return e;
+    };
+    const dom = mk("div", "fileedit-find-widget");
+    // Keep the widget's own typing/shortcuts out of the terminal + app handlers.
+    dom.addEventListener("keydown", (e) => e.stopPropagation());
+
+    // ---- row 1: find ----
+    const row1 = mk("div", "fileedit-find-row");
+    const findField = document.createElement("input");
+    findField.className = "fileedit-find-input";
+    findField.placeholder = "Find";
+    findField.spellcheck = false;
+    const caseTog = mk("button", "fileedit-find-toggle", "Aa") as HTMLButtonElement;
+    caseTog.title = "Match case";
+    const wordTog = mk("button", "fileedit-find-toggle", "W") as HTMLButtonElement;
+    wordTog.title = "Whole word";
+    const reTog = mk("button", "fileedit-find-toggle", ".*") as HTMLButtonElement;
+    reTog.title = "Regular expression";
+    const countEl = mk("span", "fileedit-find-count", "");
+    const prevBtn = mk("button", "fileedit-find-icon", "↑") as HTMLButtonElement;
+    prevBtn.title = "Previous match (Shift+Enter)";
+    const nextBtn = mk("button", "fileedit-find-icon", "↓") as HTMLButtonElement;
+    nextBtn.title = "Next match (Enter)";
+    const closeBtn = mk("button", "fileedit-find-icon", "✕") as HTMLButtonElement;
+    closeBtn.title = "Close (Esc)";
+    row1.append(findField, caseTog, wordTog, reTog, countEl, prevBtn, nextBtn, closeBtn);
+
+    // ---- row 2: replace ----
+    const row2 = mk("div", "fileedit-find-row");
+    const replaceField = document.createElement("input");
+    replaceField.className = "fileedit-find-input";
+    replaceField.placeholder = "Replace";
+    replaceField.spellcheck = false;
+    const replBtn = mk("button", "fileedit-find-icon", "⇥") as HTMLButtonElement;
+    replBtn.title = "Replace";
+    const replAllBtn = mk("button", "fileedit-find-icon", "⇟") as HTMLButtonElement;
+    replAllBtn.title = "Replace all";
+    row2.append(replaceField, replBtn, replAllBtn);
+
+    dom.append(row1, row2);
+
+    const flags = (): FindFlags => ({
+      caseSensitive: caseTog.classList.contains("on"),
+      wholeWord: wordTog.classList.contains("on"),
+      regexp: reTog.classList.contains("on"),
+    });
+    // Push the widget's query into CM6's search state so its commands act on it.
+    const commit = (): void => {
+      const f = flags();
+      view.dispatch({
+        effects: cm.search.setSearchQuery.of(
+          new cm.search.SearchQuery({
+            search: findField.value,
+            replace: replaceField.value,
+            caseSensitive: f.caseSensitive,
+            wholeWord: f.wholeWord,
+            regexp: f.regexp,
+            literal: true,
+          })
+        ),
+      });
+      refreshCount();
+    };
+    const refreshCount = (): void => {
+      const re = buildSearchRegex(findField.value, flags());
+      const info = matchInfo(view.state.doc.toString(), re, view.state.selection.main.from);
+      countEl.textContent = formatMatchCount(findField.value, info);
+    };
+
+    findField.addEventListener("input", commit);
+    replaceField.addEventListener("input", commit);
+    for (const t of [caseTog, wordTog, reTog]) {
+      t.addEventListener("click", () => {
+        t.classList.toggle("on");
+        commit();
+        findField.focus();
+      });
+    }
+    findField.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        if (e.shiftKey) cm.search.findPrevious(view);
+        else cm.search.findNext(view);
+        refreshCount();
+      } else if (e.key === "Escape") {
+        e.preventDefault();
+        cm.search.closeSearchPanel(view);
+      }
+    });
+    replaceField.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        cm.search.replaceNext(view);
+        refreshCount();
+      } else if (e.key === "Escape") {
+        e.preventDefault();
+        cm.search.closeSearchPanel(view);
+      }
+    });
+    prevBtn.addEventListener("click", () => { cm.search.findPrevious(view); refreshCount(); });
+    nextBtn.addEventListener("click", () => { cm.search.findNext(view); refreshCount(); });
+    closeBtn.addEventListener("click", () => cm.search.closeSearchPanel(view));
+    replBtn.addEventListener("click", () => { cm.search.replaceNext(view); refreshCount(); });
+    replAllBtn.addEventListener("click", () => { cm.search.replaceAll(view); refreshCount(); });
+
+    return {
+      dom,
+      top: true,
+      mount: () => {
+        // Prefill from the active query (seeded on open-from-search), so the
+        // widget shows the workspace query and its toggles.
+        const q = cm.search.getSearchQuery(view.state);
+        if (q.search) {
+          findField.value = q.search;
+          caseTog.classList.toggle("on", q.caseSensitive);
+          wordTog.classList.toggle("on", q.wholeWord);
+          reTog.classList.toggle("on", q.regexp);
+        }
+        findField.focus();
+        findField.select();
+        refreshCount();
+      },
+      update: (u: import("@codemirror/view").ViewUpdate) => {
+        if (
+          u.docChanged ||
+          u.selectionSet ||
+          u.transactions.some((t) => t.effects.some((e) => e.is(cm.search.setSearchQuery)))
+        ) {
+          refreshCount();
+        }
+      },
+    };
+  }
+
   dispose(): void {
     this.view.destroy();
   }
@@ -301,21 +473,6 @@ interface CmModules {
  *  are the fonts developers already have installed (or the OS ships). */
 const EDITOR_FONT =
   '"Cascadia Code", "JetBrains Mono", "Fira Code", "Cascadia Mono", "SF Mono", Menlo, Consolas, ui-monospace, monospace';
-
-/** Build a global regex for the workspace query, or null for an empty query.
- *  The query is literal (regex metachars escaped), matching the backend's
- *  literal search; `ci`/`ww` mirror the project-search options. Exported for a
- *  unit test of the escaping / whole-word / flag behaviour. */
-export function buildHighlightRegex(query: string, ci: boolean, ww: boolean): RegExp | null {
-  if (!query) return null;
-  const esc = query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const body = ww ? `\\b${esc}\\b` : esc;
-  try {
-    return new RegExp(body, ci ? "gi" : "g");
-  } catch {
-    return null; // never throw into the editor over a pathological query
-  }
-}
 
 /** Font + sizing layered over One Dark (which sets the colours but no font). */
 function editorChrome(cm: CmModules): import("@codemirror/state").Extension {

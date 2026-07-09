@@ -131,7 +131,8 @@ src/
   searchresults.ts  pure search grouping + tree-hit + replace-selection model (DOM-free, unit-tested)
   dirtystate.ts     pure conflict/close-guard decisions (DOM-free, unit-tested)
   eol.ts            pure line-ending detect/normalize/re-apply for EOL-safe dirty tracking (unit-tested)
-  editorwidget.ts   swappable editor widget: lazy CodeMirror 6 (One Dark) + textarea fallback
+  findwidget.ts     pure in-file-find logic: regex build + "n of m" match count (DOM-free, unit-tested)
+  editorwidget.ts   swappable editor widget: lazy CodeMirror 6 (One Dark) + custom find panel + textarea fallback
   voice.ts          pure voice logic: target decision + push-to-talk state machine
   voicecontrol.ts   global single-capture controller; routes transcripts to focus
   main.ts           composition root (owns the TabManager + OrchWiring router)
