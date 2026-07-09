@@ -1813,3 +1813,203 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   font-family: "Cascadia Mono", Consolas, monospace; font-size: 10.5px;
   user-select: text;
 }
+
+/* ============================================================================
+   File-editor overlay (#174): lazy file tree + code editor + search/replace.
+   Floats over the terminal exactly like .git-overlay — the PTY is never
+   resized. Reuses .git-overlay for the floating container; these rules style
+   the inner .fileedit surface. The search box sits ABOVE the tree and drives
+   in-tree hit highlighting (VS-Code-like). Built from the :root palette.
+   ========================================================================== */
+.fileedit {
+  flex: 1; min-height: 0; min-width: 0;
+  display: flex; flex-direction: column;
+  background: var(--bg-app);
+  font-size: 13px;
+  outline: none;
+}
+.fileedit[hidden] { display: none; }
+
+.fileedit-head {
+  flex: none; display: flex; align-items: center; gap: 6px;
+  padding: 5px 7px; border-bottom: 1px solid var(--border);
+  background: var(--panel);
+}
+.fileedit-root { display: flex; align-items: center; gap: 3px; min-width: 0; }
+.fileedit-root-path {
+  color: var(--text-dim); max-width: 240px; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap;
+  font-family: "Cascadia Mono", Consolas, monospace; font-size: 12px;
+}
+.fileedit-spacer { flex: 1 1 auto; }
+.fileedit-file {
+  color: var(--text); max-width: 340px; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; direction: rtl; text-align: left;
+  font-family: "Cascadia Mono", Consolas, monospace; font-size: 12px;
+}
+.fileedit-dirty { color: var(--accent); font-size: 15px; line-height: 1; }
+.fileedit-dirty[hidden] { display: none; }
+
+.fileedit-save {
+  border: 1px solid var(--border); background: var(--panel-2); color: var(--text);
+  font: inherit; padding: 3px 12px; border-radius: 5px; cursor: pointer;
+  white-space: nowrap; /* never wrap "Replace" onto a second line */
+}
+.fileedit-save:hover:not(:disabled) { background: var(--accent); color: #10131f; border-color: var(--accent); }
+.fileedit-save:disabled { opacity: 0.45; cursor: default; }
+/* In-file find trigger — bigger than a pane icon button, clearly labelled. */
+.fileedit-find { padding: 3px 12px; font-size: 13px; }
+
+.fileedit-banner {
+  flex: none; padding: 4px 10px; font-size: 12px;
+  color: #f0c674; background: rgba(240, 198, 116, 0.10);
+  border-bottom: 1px solid var(--border);
+}
+.fileedit-banner[hidden] { display: none; }
+
+.fileedit-body { flex: 1 1 0; min-height: 0; display: flex; flex-direction: row; }
+
+/* Left column: search form (fixed) atop a scrolling tree. Width is set inline
+   from localStorage; the vertical divider only redistributes this inner flex
+   row — the overlay box (and PTY) never change size. */
+.fileedit-tree-pane {
+  flex: none; min-width: 0; overflow: hidden;
+  display: flex; flex-direction: column;
+  border-right: 1px solid var(--border); background: var(--panel);
+}
+
+.fileedit-vdivider {
+  flex: none; width: 5px; cursor: col-resize; align-self: stretch;
+  background: var(--border-soft); transition: background 0.15s var(--ease);
+}
+.fileedit-vdivider:hover, .fileedit-vdivider.dragging { background: var(--accent-dim); }
+
+/* Search form, docked at the top of the left column. */
+.fileedit-search-form {
+  flex: none; display: flex; flex-direction: column; gap: 6px;
+  padding: 8px; border-bottom: 1px solid var(--border); background: var(--panel);
+}
+.fileedit-search-row { display: flex; align-items: center; gap: 6px; }
+/* The Replace button keeps its width — the input flexes, the button never
+   shrinks or wraps its label. */
+.fileedit-search-row .fileedit-save { flex: none; }
+.fileedit-search-input {
+  flex: 1 1 auto; min-width: 0;
+  background: var(--panel-2); border: 1px solid var(--border); color: var(--text);
+  font-family: "Cascadia Mono", Consolas, monospace; font-size: 13px;
+  padding: 5px 9px; border-radius: 5px;
+}
+.fileedit-search-input:focus { outline: none; border-color: var(--accent-dim); }
+.fileedit-search-input::placeholder { color: var(--text-dim); }
+.fileedit-search-opts { display: flex; align-items: center; gap: 14px; color: var(--text-dim); font-size: 12px; }
+.fileedit-search-opts label { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; }
+.fileedit-search-summary { margin-left: auto; color: var(--text-dim); font-size: 12px; }
+.fileedit-search-summary.truncated { color: #f0c674; }
+
+/* Tree list — fills the remaining height and scrolls. */
+.fileedit-tree { flex: 1 1 0; min-height: 0; overflow: auto; padding: 4px 0; user-select: none; }
+.fileedit-row {
+  display: flex; align-items: center; gap: 6px;
+  padding: 3px 8px; cursor: pointer; white-space: nowrap;
+  color: var(--text);
+}
+.fileedit-row:hover { background: var(--panel-2); }
+.fileedit-row.open { background: var(--accent-glow); }
+.fileedit-row.symlink .fileedit-name { color: var(--text-dim); font-style: italic; }
+.fileedit-icon { flex: none; display: inline-flex; color: var(--text-dim); }
+.fileedit-row.open .fileedit-icon { color: var(--accent); }
+.fileedit-name { overflow: hidden; text-overflow: ellipsis; }
+
+/* Search-hit highlight + per-file count badge in the tree. */
+.fileedit-row.hit .fileedit-name { color: var(--accent); font-weight: 600; }
+.fileedit-row.hit-off .fileedit-name { color: var(--text-dim); font-weight: 400; }
+.fileedit-hit-badge {
+  flex: none; margin-left: auto;
+  background: var(--accent); color: #10131f;
+  font-size: 11px; font-weight: 600; line-height: 1;
+  padding: 1px 6px; border-radius: 9px; cursor: pointer;
+}
+.fileedit-hit-badge.off { background: var(--panel-2); color: var(--text-dim); }
+
+/* Editor pane (right). */
+.fileedit-editor-pane { flex: 1 1 0; min-width: 0; position: relative; display: flex; }
+.fileedit-editor-host { flex: 1 1 0; min-width: 0; overflow: hidden; }
+.fileedit-editor-host[hidden] { display: none; }
+.fileedit-editor-host .cm-editor { height: 100%; position: relative; }
+/* In-file find as a VS-Code-style FLOATING overlay, top-right, over the editor —
+   not a bar docked at the bottom (search({top:true}) puts it in .cm-panels-top;
+   absolute-positioning lifts it out of flow so it floats instead of pushing the
+   content down). */
+.fileedit-editor-host .cm-panels.cm-panels-top {
+  position: absolute; top: 6px; right: 6px; left: auto;
+  z-index: 20;
+  /* Firm, compact width so the widget stays a small floating card top-right
+     (VS-Code-like) with code visible beside/under it — NOT a full-width bar.
+     `width: auto` shrink-wrapped to the controls' wide natural width (up to the
+     old 100% cap), which is what let it span the whole editor. */
+  width: 340px; max-width: calc(100% - 12px);
+  border: 1px solid var(--border); border-radius: 7px;
+  background: var(--panel-2); color: var(--text);
+  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.5);
+}
+/* Custom in-file find widget (createPanel): a compact two-row inline-icon
+   find/replace card — VS-Code-inspired SHAPE, but our own colours/borders/fonts
+   and text-glyph toggles (Aa / W / .* / arrows), not VS Code's icons. Row 1 =
+   find input + toggles + n-of-m count + prev/next + close; row 2 = replace input
+   + replace / replace-all. Fixed rows (no wrapping button stacks). */
+.fileedit-editor-host .cm-panel.fileedit-find-widget {
+  padding: 6px; display: flex; flex-direction: column; gap: 5px;
+  font-family: inherit; color: var(--text);
+}
+.fileedit-find-row { display: flex; align-items: center; gap: 4px; }
+.fileedit-find-input {
+  flex: 1 1 auto; min-width: 0;
+  background: var(--panel); border: 1px solid var(--border); color: var(--text);
+  font-family: "Cascadia Mono", Consolas, monospace; font-size: 13px;
+  padding: 4px 8px; border-radius: 5px;
+}
+.fileedit-find-input:focus { outline: none; border-color: var(--accent-dim); }
+.fileedit-find-input::placeholder { color: var(--text-dim); }
+/* Inline toggle buttons (match case / whole word / regex) with a clear active
+   state; glyphs are text so they inherit the theme and aren't VS Code's icons. */
+.fileedit-find-toggle,
+.fileedit-find-icon {
+  flex: none; width: 24px; height: 24px; padding: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: transparent; border: 1px solid transparent; border-radius: 4px;
+  color: var(--text-dim); cursor: pointer;
+}
+.fileedit-find-toggle { font-size: 11px; font-weight: 600; }
+.fileedit-find-icon { font-size: 13px; }
+.fileedit-find-toggle:hover, .fileedit-find-icon:hover { background: var(--panel); color: var(--text); }
+.fileedit-find-icon:hover { background: var(--accent); color: #10131f; border-color: var(--accent); }
+.fileedit-find-toggle.on {
+  background: var(--accent-glow); border-color: var(--accent-dim); color: var(--accent);
+}
+.fileedit-find-count {
+  flex: none; min-width: 48px; text-align: right; padding-right: 2px;
+  color: var(--text-dim); font-size: 11px; white-space: nowrap;
+}
+
+/* Occurrence highlighting inside the open file. The workspace query is painted
+   by our always-on ViewPlugin (.cm-wsMatch — renders with the find panel closed,
+   which .cm-searchMatch does NOT); the in-file find panel paints .cm-searchMatch.
+   Both use the same accent so the two searches look identical (demo feedback). */
+.fileedit-editor-host .cm-wsMatch,
+.fileedit-editor-host .cm-searchMatch { background: rgba(122, 162, 247, 0.30); border-radius: 2px; }
+.fileedit-editor-host .cm-searchMatch-selected { background: rgba(122, 162, 247, 0.60); }
+.fileedit-empty {
+  margin: auto; color: var(--text-dim); font-size: 13px; padding: 20px; text-align: center;
+}
+.fileedit-empty[hidden] { display: none; }
+
+/* Textarea fallback (used only if CodeMirror fails to load). A modern IDE
+   monospace stack — no bundled font files. */
+.fileedit-ta-wrap { flex: 1 1 0; min-width: 0; display: flex; }
+.fileedit-textarea {
+  flex: 1 1 0; resize: none; border: none; outline: none;
+  background: var(--bg-app); color: var(--text);
+  font-family: "Cascadia Code", "JetBrains Mono", "Fira Code", "Cascadia Mono", Consolas, ui-monospace, monospace;
+  font-size: 13px; line-height: 1.55;
+  padding: 6px 8px; white-space: pre; tab-size: 2;
+}

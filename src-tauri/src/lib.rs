@@ -1,5 +1,6 @@
 mod cliprobe;
 mod editor;
+pub mod fileedit; // pub: the file-editor integration test links its pure fns (#174)
 mod gh;
 mod git;
 mod gitwatch;
@@ -136,6 +137,11 @@ pub fn run() {
             orchestration::orch_end_group,
             cliprobe::probe_agent_cli,
             editor::open_in_editor,
+            fileedit::ft_list_dir,
+            fileedit::ft_read_file,
+            fileedit::ft_write_file,
+            fileedit::ft_search,
+            fileedit::ft_replace,
             obs::take_startup_notice,
             uistate::load_ui_tabs,
             uistate::save_ui_tabs,
