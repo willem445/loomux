@@ -1094,12 +1094,27 @@ fn autopilot_confirm_and_stranded_flush_never_both_fire_on_a_fresh_boot() {
 }
 
 #[test]
-fn copilot_autopilot_confirm_key_is_a_single_enter() {
-    // The dialog's default-highlighted item is "Enable all permissions" (menu
-    // initialIndex 0), and Enter (`code==="return"`) selects it — so a single
-    // carriage return enables all permissions + enters autopilot mode, no arrow
-    // keys. If copilot ever reorders the menu this pins what we must revisit.
-    assert_eq!(COPILOT_AUTOPILOT_CONFIRM_KEYS, b"\r");
+fn copilot_autopilot_confirm_carries_the_focus_in_prefix() {
+    // #179: the confirm answers the "Enable autopilot mode" dialog on a *fresh*
+    // copilot pane — which the orchestrator delivers to while it is NOT the
+    // focused terminal. Per #98 Copilot drops every non-paste keystroke while
+    // its focus flag is false, so a BARE Enter here is swallowed: the dialog is
+    // never dismissed, the kickoff brief pastes behind the still-open modal, and
+    // the later submit sequence's focus-in+Enter belatedly selects the dialog
+    // default (autopilot "engages") while the brief is discarded with it — the
+    // reported "pane opens, autopilot on, prompt never delivered, sits idle".
+    // So the confirm MUST carry the same focus-in prefix as any other copilot
+    // keystroke: CSI I flips the focus flag true, then Enter selects the
+    // default-highlighted "Enable all permissions" (menu initialIndex 0).
+    assert_eq!(COPILOT_AUTOPILOT_CONFIRM_KEYS, b"\x1b[I\r");
+    assert!(COPILOT_AUTOPILOT_CONFIRM_KEYS.starts_with(b"\x1b[I"),
+        "focus-in must precede the Enter, or Copilot drops it on the unfocused pane");
+    assert!(COPILOT_AUTOPILOT_CONFIRM_KEYS.ends_with(b"\r"),
+        "the selection key is still Enter (menu initialIndex 0 = Enable all permissions)");
+    // Identical transport to a normal copilot submit — they share the focus-in
+    // requirement, so pin them together to stop the two drifting apart again.
+    assert_eq!(COPILOT_AUTOPILOT_CONFIRM_KEYS, submit_sequence("copilot"),
+        "the autopilot confirm reuses copilot's focus-in+Enter transport");
 }
 
 #[test]

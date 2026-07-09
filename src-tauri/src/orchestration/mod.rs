@@ -248,13 +248,21 @@ const AUTOPILOT_DIALOG_POLL: Duration = Duration::from_millis(250);
 /// Pause after answering so the TUI dismisses the dialog and repaints before
 /// the kickoff paste begins.
 const AUTOPILOT_DIALOG_SETTLE: Duration = Duration::from_millis(700);
-/// Key that confirms the highlighted menu item in Copilot's consent dialog.
-/// Enter (`\r`); the default-highlighted item is "Enable all permissions"
-/// (index 0), so a single Enter enables all permissions + enters autopilot
-/// mode — no arrow keys needed (verified against the 1.0.68 TUI: the menu's
-/// `initialIndex` defaults to 0 and `code==="return"` selects it).
+/// Keys that confirm the highlighted menu item in Copilot's consent dialog.
+/// Focus-in report (`ESC[I`) + Enter (`\r`) — the SAME transport as
+/// [`submit_sequence`]`("copilot")`, and for the same reason (#98/#179): this
+/// dialog is answered on a freshly spawned pane the orchestrator delivers to
+/// while it is NOT the focused terminal, and Copilot drops every non-paste
+/// keystroke while its focus flag is false. A bare `\r` here is swallowed, so
+/// the dialog is never dismissed; the kickoff brief then pastes behind the
+/// still-open modal and the later submit's focus-in+Enter belatedly selects the
+/// dialog default (autopilot "engages") while the brief is discarded with it —
+/// the #179 "pane opens, autopilot on, prompt never delivered" symptom. The
+/// `ESC[I` flips Copilot's focus flag true so the trailing `\r` is accepted; it
+/// selects the default-highlighted "Enable all permissions" (menu `initialIndex`
+/// 0, `code==="return"`, verified against the 1.0.68 TUI) — no arrow keys.
 #[doc(hidden)] // pub for integration tests
-pub const COPILOT_AUTOPILOT_CONFIRM_KEYS: &[u8] = b"\r";
+pub const COPILOT_AUTOPILOT_CONFIRM_KEYS: &[u8] = b"\x1b[I\r";
 
 // Echo verification: a paste that landed makes the TUI redraw its input box
 // (observable as output bytes). A paste that produced no output within the
