@@ -3,21 +3,31 @@ name: Docs
 # Build and publish the user documentation site (docs/) to GitHub Pages.
 #
 # This is a SEPARATE workflow from release.yml (which builds the app binaries on
-# the same `v*` tag trigger) — release.yml is intentionally left untouched. The
-# app's CI (ci.yml) does NOT build the docs, so PR CI on code changes stays fast.
+# a `v*` tag trigger) — release.yml is intentionally left untouched. The app's
+# CI (ci.yml) does NOT build the docs, so PR CI on code changes stays fast.
+#
+# Publishing is driven by pushes to `main` (not `v*` tags): `main` is an allowed
+# deployment branch for the `github-pages` environment, whereas tags are not —
+# the old tag trigger was rejected by the environment's branch policy on every
+# release. Deploying from main also keeps the published docs current with the
+# repo instead of only refreshing at release time.
 #
 # ONE-TIME HUMAN SETUP (cannot be automated from here): set
 #   Settings -> Pages -> Build and deployment -> Source -> "GitHub Actions".
 # Until that is set, the deploy job has nowhere to publish.
 
 on:
-  # Publish with every release, matching release.yml's tag trigger.
+  # Publish whenever the docs (or this workflow) change on main. Path-scoped so
+  # unrelated code merges don't trigger a redundant Pages deploy.
   push:
-    tags: ["v*"]
-  # Manual button for docs-only fixes between releases.
+    branches: ["main"]
+    paths:
+      - "docs/**"
+      - ".github/workflows/docs.yml"
+  # Manual button to force a re-publish from main at any time.
   workflow_dispatch:
   # Build-only dry-run when a PR touches the docs (deploy is skipped below), so a
-  # broken _config.yml or theme pin is caught before it ships on a release.
+  # broken _config.yml or theme pin is caught before it ships.
   pull_request:
     paths:
       - "docs/**"
