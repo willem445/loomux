@@ -200,6 +200,14 @@ or cold-start a stranger: `spawn_agent(task: "<follow-up>", resume_session:
 "<session>", cwd: "<the task's original workspace>")` reopens that conversation with
 all its context.
 
+**Store session ids in full — never truncate.** A session id is a full UUID
+(e.g. `e3bc3b80-2bf6-4523-886f-b16716119bd7`), and `resume_session` needs the
+*exact* id — an abbreviated prefix (`e3bc3b80`) does not resolve and the resume
+fails with "session not found." When you copy an id from `list_agents` into a task's
+`session` field or into `set_state`, paste the whole UUID verbatim; do not shorten
+it for readability. This applies everywhere you persist an id the next session will
+resume from.
+
 ## Delegation protocol
 
 Task briefs you send to workers must include: the issue number, the goal and acceptance
