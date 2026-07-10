@@ -878,6 +878,13 @@ export class WelcomeForm {
         let cwd = plan.repo || undefined;
         if (plan.worktree) {
           // Fan out to isolated worktrees: fix-auth → fix-auth-1 … fix-auth-N.
+          // Each cut is from the repo's default branch, fetched fresh from
+          // origin (#204) — same fix the orchestration path gets, and the same
+          // trap for a human launcher parked on a feature branch. Cost: one
+          // `git fetch --prune origin` per pane, serialized here behind the
+          // "Creating worktree…" state (N launches → N fetches). Acceptable for
+          // the small fan-out counts this dialog produces; revisit with a
+          // resolve-default-once step if it ever grows.
           cwd = await gitWorktreeAdd(plan.repo, worktreeNameFor(plan.worktree, i, plan.count));
         }
         // Session-capable CLIs (Claude) get a pre-assigned session id (#194 P4)
