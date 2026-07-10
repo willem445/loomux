@@ -291,22 +291,41 @@ if [ "$cmd" = "api" ]; then
   ref_low=$(printf '%s' "$a_ref" | tr '[:upper:]' '[:lower:]')
 
   is_rel=0; rtag=""
-  if [ "$path_low" = "graphql" ]; then
-    # graphql WRITE. If the query is opaque (from --input/stdin or query=@file) we
-    # cannot scan it → fail-safe gate. Inline queries are scanned for the mutations
-    # that create/move a release or a tag ref (createRef of a refs/tags, not heads).
+  # Recognize the graphql endpoint by SUFFIX (like the REST URL arms below), not an
+  # exact 'graphql' — gh also accepts `/graphql` and the full-URL host form, all sent
+  # as a POST of {"query":…} (#196 r4). Any call to that locus is a graphql write.
+  is_graphql=0
+  case "$path_low" in graphql|/graphql|*/graphql) is_graphql=1 ;; esac
+  if [ "$is_graphql" = "1" ]; then
+    # If the query is opaque (from --input/stdin or query=@file) we cannot scan it →
+    # fail-safe gate. Otherwise scan the inline query: a *Release / createTag mutation
+    # always gates; a createRef/updateRef gates UNLESS the ref locus is PROVABLY a
+    # branch. The ref may live inline in the query OR in a `-F ref=`/`-f ref=` graphql
+    # VARIABLE (a_ref) OR the body — so both the query text and a_ref are consulted (a
+    # heads literal can't excuse a refs/tags variable, nor vice-versa); an unprovable
+    # ref (opaque/variable-we-can't-resolve) fails safe to the gate.
     if [ -n "$a_inputval" ] || [ "$a_qopaque" = "1" ]; then
       is_rel=1
     elif [ -n "$a_query" ]; then
       ql=$(printf '%s' "$a_query" | tr '[:upper:]' '[:lower:]')
+      case "$ql" in *createrelease*|*updaterelease*|*deleterelease*|*createtag*) is_rel=1 ;; esac
       case "$ql" in
-        *createrelease*|*updaterelease*|*deleterelease*|*createtag*) is_rel=1 ;;
-        *createref*|*updateref*) case "$ql" in *refs/tags/*) is_rel=1 ;; esac ;;
+        *createref*|*updateref*)
+          hh=0; tt=0
+          case "$ref_low" in refs/heads/*) hh=1 ;; esac
+          case "$ref_low" in refs/tags/*)  tt=1 ;; esac
+          case "$ql"      in *refs/heads/*) hh=1 ;; esac
+          case "$ql"      in *refs/tags/*)  tt=1 ;; esac
+          if [ "$hh" = "1" ] && [ "$tt" = "0" ]; then : ; else is_rel=1; fi ;;
       esac
-      case "$a_query" in
-        *tagName:*)   rest=${a_query#*tagName:}; rest=$(printf '%s' "$rest" | tr -d ' "'); rtag=${rest%%,*}; rtag=${rtag%%\}*}; rtag=${rtag%%)*} ;;
-        *refs/tags/*) rest=${a_query#*refs/tags/}; rest=$(printf '%s' "$rest" | tr -d ' "'); rtag=${rest%%,*}; rtag=${rtag%%\}*}; rtag=${rtag%%)*} ;;
-      esac
+      # resolve the tag for grant-keying: a refs/tags variable, else an inline literal.
+      case "$ref_low" in refs/tags/*) rtag=${a_ref#refs/tags/}; rtag=${rtag%% *} ;; esac
+      if [ -z "$rtag" ]; then
+        case "$a_query" in
+          *tagName:*)   rest=${a_query#*tagName:}; rest=$(printf '%s' "$rest" | tr -d ' "'); rtag=${rest%%,*}; rtag=${rtag%%\}*}; rtag=${rtag%%)*} ;;
+          *refs/tags/*) rest=${a_query#*refs/tags/}; rest=$(printf '%s' "$rest" | tr -d ' "'); rtag=${rest%%,*}; rtag=${rtag%%\}*}; rtag=${rtag%%)*} ;;
+        esac
+      fi
     fi
   elif [ "$is_write" = "1" ]; then
     # A non-GET write to the git refs/tags plumbing, decided by the URL path SEGMENT.

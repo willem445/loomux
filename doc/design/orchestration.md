@@ -678,7 +678,14 @@ reconcile on read, mirrored into the kickoff config + a live notice, and surface
   (stdin body, opaque graphql, `DELETE …/releases/<id>` by numeric id), only the blanket markers
   (`autonomous && auto_release`, or supervised `dangerous && !autonomous`) can allow it — otherwise
   **fail-safe block**. A non-release api call (an issues endpoint, a branch `refs/heads` write, an
-  inline graphql read, a read-only GET) passes through untouched.
+  inline graphql read, a read-only GET) passes through untouched. The **graphql arm carries the same
+  locus rigor** (#196 r4): the endpoint is recognized by **suffix** (`graphql` | `/graphql` |
+  `*/graphql`, incl. the full-URL host form) — not an exact `graphql` string, which a `gh api
+  /graphql`/full-URL POST would have slipped — and a `createRef`/`updateRef` gates unless its ref is
+  **provably heads**, consulting the ref wherever it lives: an inline `refs/heads`/`refs/tags`
+  literal in the query text **and** a `-F ref=`/`-f ref=` graphql **variable** (the parsed `a_ref`).
+  A `refs/tags` variable therefore can't hide behind a query with no literal, and a heads literal
+  can't excuse a `refs/tags` variable; an unresolvable/opaque ref fails safe to the gate.
 - **git shim** (new, same PATH-injection as the gh shim) gates `git push` that publishes a tag:
   `--tags`/`--follow-tags`/`--mirror` (bulk → blocked, push the specific approved tag),
   `refs/tags/<t>` and the `tag <t>` form (explicit), and a bare **`v*`** refspec (any v-prefixed

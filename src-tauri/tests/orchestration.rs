@@ -4185,6 +4185,10 @@ fn gh_shim_script_gates_raw_api_release_shapes() {
     assert!(sh.contains("path_low") && sh.contains("a_ref"), "decides by parsed URL path + ref field (locus), not raw argv");
     assert!(sh.contains("*/refs/heads/*") && sh.contains("refs/heads/*"), "branch exemption keys on the ref locus, not any argv token");
     assert!(sh.contains("a_qopaque") && sh.contains("a_inputval"), "opaque graphql (--input/@file) fails safe to the gate");
+    // #196 r4: graphql endpoint recognized by SUFFIX (graphql | /graphql | */graphql),
+    // and the createRef branch exemption consults the parsed ref variable (a_ref), not
+    // only a literal in the query text.
+    assert!(sh.contains("*/graphql"), "recognizes the graphql endpoint by suffix (/graphql, full-URL)");
     assert!(sh.contains("createrelease") && sh.contains("updaterelease") && sh.contains("deleterelease"),
         "catches graphql create/update/delete Release mutations");
     assert!(sh.contains("createref") && sh.contains("updateref"),
@@ -4433,6 +4437,88 @@ fn gh_shim_harness_gates_raw_api_tag_ref_by_locus_defeating_decoys() {
     let a = audit();
     assert!(a.contains("release-gate-blocked") && !a.contains("merge-gate-blocked"),
         "tag-ref api refusals audited as release-gate, got: {a}");
+}
+
+#[test]
+fn gh_shim_harness_gates_graphql_endpoint_variants_and_variable_ref() {
+    // #196 ROUND-4: the REST arm is locus-solid, but the graphql arm had two holes —
+    // (1) it keyed on the endpoint being EXACTLY `graphql`, so `/graphql` and the
+    // full-URL host form (both plain POSTs of {"query":…}) skipped the gate; (2) the
+    // createRef gate only fired on a `refs/tags/` LITERAL in the query text, so a
+    // `-F ref=refs/tags/v9` graphql VARIABLE kept the literal out and slipped. Both
+    // create a refs/tags ref → release.yml → npm. This EXECUTES the shim to pin that
+    // graphql is recognized by suffix and the ref locus consults the parsed variable
+    // too — with the same "unprovable-locus = fail-safe gate" rule as the REST arm.
+    use std::process::Command;
+    if Command::new("sh").arg("-c").arg("exit 0").status().map(|s| !s.success()).unwrap_or(true) {
+        eprintln!("SKIP gh_shim_harness_graphql_locus…: no POSIX sh");
+        return;
+    }
+    let td = tempfile::tempdir().unwrap();
+    let root = td.path();
+    let group = root.join("group");
+    std::fs::create_dir_all(&group).unwrap();
+    let log = root.join("gh.log");
+    let fake = write_fake_gh(root, &log);
+    let shim = root.join("gh");
+    std::fs::write(&shim, gh_shim_sh(&fake.display().to_string())).unwrap();
+    let _ = Command::new("sh").arg("-c").arg(format!("chmod +x '{}' '{}'", fake.display(), shim.display())).status();
+    let qfile = root.join("q.graphql");
+    std::fs::write(&qfile, b"mutation { createRef(input: { name: \"refs/tags/v9\", oid: \"a\" }) { ref { id } } }").unwrap();
+    let qopaque = format!("query=@{}", qfile.display());
+
+    let run = |argv: &[&str]| -> bool {
+        Command::new("sh").arg(&shim).args(argv).env("LOOMUX_GROUP_DIR", &group).status().unwrap().success()
+    };
+    let set = |name: &str| { std::fs::write(group.join(name), b"").unwrap(); };
+    let clear = |name: &str| { let _ = std::fs::remove_file(group.join(name)); };
+    let write_grant = |name: &str| {
+        let d = group.join("release_grants");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join(name), b"99999999999\n1\n").unwrap();
+    };
+
+    // Inline mutation queries (spaces so Rust passes them as one MSYS token).
+    let cr_tags = "query=mutation { createRef(input: { name: \"refs/tags/v9\", oid: \"a\" }) { ref { id } } }";
+    let cr_heads = "query=mutation { createRef(input: { name: \"refs/heads/feature\", oid: \"a\" }) { ref { id } } }";
+    let cr_var = "query=mutation($ref:String!){ createRef(input: { ref: $ref, oid: \"a\" }) { ref { id } } }"; // ref via variable
+    let read_q = "query={ repository { releases { nodes { id } } } }";
+
+    // ---- BLOCK with no markers: every endpoint spelling + the variable-hidden ref.
+    let block: [&[&str]; 7] = [
+        &["api", "graphql", "-f", cr_tags],                       // exact endpoint
+        &["api", "/graphql", "-f", cr_tags],                      // leading-slash
+        &["api", "https://api.github.com/graphql", "-f", cr_tags],// full URL host form
+        &["api", "graphql", "-F", "ref=refs/tags/v9", "-f", cr_var], // -F variable ref (no literal)
+        &["api", "/graphql", "-f", "ref=refs/tags/v9", "-f", cr_var], // -f variable ref
+        &["api", "graphql", "--input", "-"],                      // opaque stdin
+        &["api", "graphql", "-F", &qopaque],                      // opaque query=@file
+    ];
+    for s in block { assert!(!run(s), "graphql tag-ref write must block with no markers: {s:?}"); }
+
+    // ---- PASS: heads createRef (inline AND via a heads variable), full-URL heads, reads.
+    let pass: [&[&str]; 6] = [
+        &["api", "graphql", "-f", cr_heads],
+        &["api", "graphql", "-F", "ref=refs/heads/feature", "-f", cr_var],
+        &["api", "https://api.github.com/graphql", "-f", cr_heads],
+        &["api", "graphql", "-f", read_q],
+        &["api", "/graphql", "-f", read_q],
+        &["api", "https://api.github.com/graphql", "-f", read_q],
+    ];
+    for s in pass { assert!(run(s), "a branch createRef / read graphql query must pass through: {s:?}"); }
+
+    // ---- Blanket markers allow the opaque + variable-hidden shapes.
+    set("autonomous"); set("auto_release");
+    for s in [&["api", "/graphql", "-f", "ref=refs/tags/v9", "-f", cr_var] as &[&str], &["api", "graphql", "--input", "-"]] {
+        assert!(run(s), "autonomous+auto_release must allow: {s:?}");
+    }
+    clear("autonomous"); clear("auto_release");
+
+    // ---- A v9 grant resolves from the -F ref= variable, allows once, consumed.
+    write_grant("v9");
+    assert!(run(&["api", "https://api.github.com/graphql", "-F", "ref=refs/tags/v9", "-f", cr_var]),
+        "a v9 grant resolved from the graphql variable must allow the createRef");
+    assert!(!group.join("release_grants/v9").exists(), "grant consumed");
 }
 
 #[test]
