@@ -106,6 +106,47 @@ export function approvalControl(autonomous: boolean, autoMerge: boolean): Approv
   return { checked: requireApprovalChecked(autoMerge), disabled: false, tooltip: "" };
 }
 
+// ---------- auto-release + dangerous-mode toggle gating (#83) ----------
+
+/** How a POSITIVE checkbox (checked = the backend flag ON) renders given the live
+ *  autonomous state. Pure so the enabled/checked/tooltip logic is DOM-free tested. */
+export interface ToggleControl {
+  /** Whether the checkbox is checked (the effective backend flag). */
+  checked: boolean;
+  /** True when the control can't be changed in this autonomous state. */
+  disabled: boolean;
+  /** Tooltip explaining a disabled state; "" when editable. */
+  tooltip: string;
+}
+
+export const AUTO_RELEASE_REQUIRES_AUTONOMOUS = "auto-release requires Autonomous mode";
+export const DANGEROUS_NEEDS_AUTONOMOUS_OFF =
+  "dangerous mode doesn't apply while Autonomous is on (turn Autonomous off to supervise)";
+
+/** Auto-release checkbox (checked = `auto_release` ON, i.e. the orchestrator may
+ *  publish releases/tags itself). Same dependency as auto-merge: valid ONLY while
+ *  autonomous — with autonomous OFF the backend rejects/force-clears it, so the box
+ *  is unchecked + disabled with a tooltip (never offer an enable the backend
+ *  refuses). Stale `autoRelease` is ignored while off (the backend reconciles it). */
+export function autoReleaseControl(autonomous: boolean, autoRelease: boolean): ToggleControl {
+  if (!autonomous) {
+    return { checked: false, disabled: true, tooltip: AUTO_RELEASE_REQUIRES_AUTONOMOUS };
+  }
+  return { checked: autoRelease, disabled: false, tooltip: "" };
+}
+
+/** Dangerous-mode checkbox (checked = `dangerous_mode` ON). The INVERSE gating of
+ *  auto-release: dangerous mode is the *supervised, NOT-autonomous* mode, mutually
+ *  exclusive with autonomous. So it's usable ONLY while autonomous is OFF; with
+ *  autonomous ON the backend rejects/force-clears it, so the box is unchecked +
+ *  disabled with a tooltip. */
+export function dangerousControl(autonomous: boolean, dangerous: boolean): ToggleControl {
+  if (autonomous) {
+    return { checked: false, disabled: true, tooltip: DANGEROUS_NEEDS_AUTONOMOUS_OFF };
+  }
+  return { checked: dangerous, disabled: false, tooltip: "" };
+}
+
 // ---------- budget meter math ----------
 
 /** A rendered view of autonomous-era spend against the token budget. */

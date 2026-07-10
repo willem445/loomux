@@ -20,8 +20,10 @@ import {
   resumeGroup,
   grantRelease,
   setAutoMerge,
+  setAutoRelease,
   setAutonomous,
   setAutonomyBudget,
+  setDangerousMode,
   setIdleActivityFloor,
   setIdleTickMinutes,
   setMaxAgents,
@@ -33,6 +35,8 @@ import {
 import {
   approvalControl,
   autoMergeFromApproval,
+  autoReleaseControl,
+  dangerousControl,
   budgetMeter,
   formatTokens,
   isValidReleaseTag,
@@ -119,6 +123,8 @@ export class GroupView {
   // Autonomous-mode section (#83).
   private autoBtn: HTMLButtonElement;
   private approvalChk: HTMLInputElement;
+  private autoReleaseChk: HTMLInputElement;
+  private dangerousChk: HTMLInputElement;
   private budgetInput: HTMLInputElement;
   private budgetErrEl: HTMLElement;
   private meterEl: HTMLElement;
@@ -258,6 +264,34 @@ export class GroupView {
       "On (default): the human merges every PR. Off: the orchestrator may merge an " +
       "adequately-tested PR (reviewer-approved + green CI) itself while autonomous.";
 
+    // Auto-release: a POSITIVE checkbox (checked = orchestrator may publish
+    // releases/tags itself). Sibling of the merge gate, same dependency — only
+    // usable while autonomous (the backend rejects enabling it otherwise).
+    const releaseLbl = el("label", "group-auto-check") as HTMLLabelElement;
+    this.autoReleaseChk = document.createElement("input");
+    this.autoReleaseChk.type = "checkbox";
+    this.autoReleaseChk.checked = false; // safe default: releases need approval
+    this.autoReleaseChk.disabled = true; // until a status read shows autonomous on
+    this.autoReleaseChk.addEventListener("change", () => void this.toggleAutoRelease());
+    releaseLbl.append(this.autoReleaseChk, document.createTextNode(" Auto-release"));
+    releaseLbl.title =
+      "Off (default): publishing a release/tag needs an explicit human grant. On: the " +
+      "orchestrator may run `gh release` / push a v* tag itself while autonomous.";
+
+    // Dangerous mode: a DANGER-styled toggle for supervised, NOT-autonomous work.
+    // Lets agents merge & release without per-item approval while you watch.
+    // Mutually exclusive with autonomous (only usable while autonomous is OFF).
+    const dangerLbl = el("label", "group-auto-check danger") as HTMLLabelElement;
+    this.dangerousChk = document.createElement("input");
+    this.dangerousChk.type = "checkbox";
+    this.dangerousChk.checked = false;
+    this.dangerousChk.addEventListener("change", () => void this.toggleDangerous());
+    dangerLbl.append(this.dangerousChk, document.createTextNode(" ⚠ Dangerous mode"));
+    dangerLbl.title =
+      "SUPERVISED: while you're here (and NOT in autonomous mode), let agents merge to the " +
+      "default branch and publish releases/tags themselves — no per-item approval. Every " +
+      "action is audited. Enabling Autonomous clears this (they're mutually exclusive).";
+
     // Token budget: 0 / empty = no cap. When autonomous is on this drives the
     // inline meter beside it.
     const budgetWrap = el("div", "group-auto-budget");
@@ -288,7 +322,7 @@ export class GroupView {
     this.meterLabel = el("span", "group-auto-mlabel");
     this.meterEl.append(this.meterBar, this.meterLabel);
 
-    ctlRow.append(approvalLbl, budgetWrap, this.meterEl);
+    ctlRow.append(approvalLbl, releaseLbl, dangerLbl, budgetWrap, this.meterEl);
 
     // Row C (slim): idle-tick cadence knob + a power-user activity-floor knob +
     // the live tick-status line. The knobs configure the tick even while off
@@ -530,6 +564,28 @@ export class GroupView {
   private async toggleApproval(): Promise<void> {
     try {
       await setAutoMerge(this.groupId, autoMergeFromApproval(this.approvalChk.checked));
+    } catch (err) {
+      this.toast(String(err));
+    }
+    await this.load();
+  }
+
+  /** Commit the auto-release gate (positive checkbox = auto_release ON). A rejected
+   *  write (e.g. autonomous off) toasts and the poll re-syncs the real state. */
+  private async toggleAutoRelease(): Promise<void> {
+    try {
+      await setAutoRelease(this.groupId, this.autoReleaseChk.checked);
+    } catch (err) {
+      this.toast(String(err));
+    }
+    await this.load();
+  }
+
+  /** Commit supervised dangerous mode (positive checkbox = dangerous_mode ON).
+   *  Rejected while autonomous is on (mutually exclusive); toast + re-sync. */
+  private async toggleDangerous(): Promise<void> {
+    try {
+      await setDangerousMode(this.groupId, this.dangerousChk.checked);
     } catch (err) {
       this.toast(String(err));
     }
@@ -830,6 +886,23 @@ export class GroupView {
     this.approvalChk.checked = approval.checked;
     this.approvalChk.disabled = approval.disabled;
     this.approvalChk.title = approval.tooltip;
+
+    // Auto-release: same dependency as the merge gate (only under autonomous).
+    const release = autoReleaseControl(a.autonomous, a.auto_release);
+    this.autoReleaseChk.checked = release.checked;
+    this.autoReleaseChk.disabled = release.disabled;
+    if (release.tooltip) this.autoReleaseChk.title = release.tooltip;
+
+    // Dangerous mode: the INVERSE gating — usable only while autonomous is OFF.
+    // Enabling autonomous force-clears it backend-side; this render reflects that
+    // truthfully from the live status, and greys the toggle while autonomous is on.
+    const danger = dangerousControl(a.autonomous, a.dangerous_mode);
+    this.dangerousChk.checked = danger.checked;
+    this.dangerousChk.disabled = danger.disabled;
+    if (danger.tooltip) this.dangerousChk.title = danger.tooltip;
+    // DANGER affordance: highlight only when actually engaged.
+    (this.dangerousChk.closest(".group-auto-check") as HTMLElement | null)
+      ?.classList.toggle("on", danger.checked);
 
     // Budget input: don't clobber while the human is editing it.
     if (document.activeElement !== this.budgetInput) {

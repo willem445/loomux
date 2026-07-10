@@ -6,7 +6,11 @@ import {
   requireApprovalChecked,
   autoMergeFromApproval,
   approvalControl,
+  autoReleaseControl,
+  dangerousControl,
   AUTO_MERGE_REQUIRES_AUTONOMOUS,
+  AUTO_RELEASE_REQUIRES_AUTONOMOUS,
+  DANGEROUS_NEEDS_AUTONOMOUS_OFF,
   budgetMeter,
   formatTokens,
   formatCountdown,
@@ -60,6 +64,38 @@ test("approval control is editable and reflects auto_merge while autonomous on",
   // Autonomous ON, auto_merge ON → approval not required, editable.
   const on = approvalControl(true, true);
   assert.deepEqual(on, { checked: false, disabled: false, tooltip: "" });
+});
+
+// ---------- auto-release toggle gating (#83) ----------
+
+test("auto-release control is locked off while autonomous is off", () => {
+  // Same dependency as auto-merge: valid only under autonomous. Locked + unchecked
+  // regardless of any stale flag (the backend reconciles it off).
+  for (const stale of [false, true]) {
+    const c = autoReleaseControl(false, stale);
+    assert.deepEqual(c, { checked: false, disabled: true, tooltip: AUTO_RELEASE_REQUIRES_AUTONOMOUS });
+  }
+});
+
+test("auto-release control reflects the flag and is editable while autonomous on", () => {
+  assert.deepEqual(autoReleaseControl(true, false), { checked: false, disabled: false, tooltip: "" });
+  assert.deepEqual(autoReleaseControl(true, true), { checked: true, disabled: false, tooltip: "" });
+});
+
+// ---------- dangerous-mode toggle gating (#83, inverse) ----------
+
+test("dangerous control is locked off while autonomous is ON (mutually exclusive)", () => {
+  // Inverse of auto-release: usable only while autonomous is OFF. Locked + unchecked
+  // while autonomous, regardless of any stale flag (the backend force-clears it).
+  for (const stale of [false, true]) {
+    const c = dangerousControl(true, stale);
+    assert.deepEqual(c, { checked: false, disabled: true, tooltip: DANGEROUS_NEEDS_AUTONOMOUS_OFF });
+  }
+});
+
+test("dangerous control reflects the flag and is editable while autonomous OFF", () => {
+  assert.deepEqual(dangerousControl(false, false), { checked: false, disabled: false, tooltip: "" });
+  assert.deepEqual(dangerousControl(false, true), { checked: true, disabled: false, tooltip: "" });
 });
 
 // ---------- budget meter math ----------
