@@ -10,6 +10,7 @@
 // pure, unit-tested `layout.ts`; this file owns the DOM/tree mutation.
 
 import { Pane, type PaneEvents, type PaneOptions } from "./pane";
+import type { PersistedPane } from "./tabstore";
 import { dropZoneFor, indicatorFor, zoneToPlacement, type DropZone } from "./layout";
 import { dockChipAttention } from "./attention";
 import { planGroupMinimize } from "./group";
@@ -40,6 +41,14 @@ type TreeNode = LeafNode | SplitNode;
 export type GridLayoutNode =
   | { kind: "leaf"; weight: number; pane: Pane }
   | { kind: "split"; dir: Dir; weight: number; children: GridLayoutNode[] };
+
+/** The minimal shape `applyLayoutWeights` walks in parallel with the live tree:
+ *  a per-node flex-grow, and children for splits. A `PersistedLayoutNode`
+ *  (tabstore.ts) is structurally one of these, so a rebuild passes it directly. */
+export interface WeightNode {
+  weight: number;
+  children?: WeightNode[];
+}
 
 const MIN_PANE_PX = 80;
 /** Pixels the pointer must travel from the header press before a click turns
@@ -114,7 +123,11 @@ export class Grid {
   constructor(
     private rootEl: HTMLElement,
     private dockEl: HTMLElement,
-    private onEmpty: () => void
+    private onEmpty: () => void,
+    /** Fired whenever the pane set / layout changes (open, close) so the host can
+     *  re-render the tab strip's live agent counter and re-persist the layout
+     *  (#194 P4). Defaults to a no-op for callers that don't care. */
+    private onChange: () => void = () => {}
   ) {
     this.rootEl.addEventListener("pointerdown", (e) => this.onPointerDown(e));
     this.renderDock();
@@ -197,6 +210,47 @@ export class Grid {
     return pane;
   }
 
+  /** Land a pane in DORMANT restore state (#194 P4): placed like any pane but
+   *  with NO PTY — it shows `contentEl` (a Start/Resume affordance the caller
+   *  wires) and stands in for a persisted leaf we deliberately did NOT auto-spawn
+   *  (a no-session agent, or an orchestration pane whose group stays dormant). No
+   *  terminal opens, so nothing resizes a ConPTY; `record` is retained so the
+   *  pane re-captures identically if the session is closed without resuming.
+   *  Opened `background` so a restore rebuild never fights the human for focus. */
+  openDormantPane(
+    events: PaneEvents,
+    record: PersistedPane,
+    contentEl: HTMLElement,
+    dir: Dir = "row",
+    relativeTo?: Pane
+  ): Pane {
+    const pane = new Pane(events);
+    this.placeLeaf(pane, true, dir, relativeTo);
+    pane.startDormant(record, contentEl);
+    return pane;
+  }
+
+  /** Overwrite every node's flex-grow to match a persisted weight tree of the
+   *  SAME structure (session restore #194). `openPane`/`openDormantPane` reset
+   *  flex to equal shares as they split, so a rebuild replays the whole tree then
+   *  calls this once to put the saved divider positions back (the 25/75 drag that
+   *  would otherwise snap to 50/50). `weights` must mirror the tree the replay
+   *  just built — panerestore's plan guarantees that — and a shape mismatch stops
+   *  at the divergence rather than throwing. */
+  applyLayoutWeights(weights: WeightNode): void {
+    if (!this.root) return;
+    const walk = (n: TreeNode, w: WeightNode): void => {
+      nodeEl(n).style.flex = `${w.weight} 1 0`;
+      if (n.kind === "split" && w.children) {
+        n.children.forEach((c, i) => {
+          const cw = w.children![i];
+          if (cw) walk(c, cw);
+        });
+      }
+    };
+    walk(this.root, weights);
+  }
+
   /** Insert a freshly-constructed pane's leaf into the tree and settle focus.
    *  Shared by `openPane` (which then spawns a PTY) and `openWelcomePane` (which
    *  renders a setup form instead). Returns whether the new pane took focus.
@@ -258,6 +312,7 @@ export class Grid {
     // hold a WebGL context the tab isn't showing — drop it now, matching the
     // rest of the hidden tab (#63 GL policy). Reloaded when the tab is shown.
     if (this.hidden) pane.setHidden(true);
+    this.onChange();
     return takeFocus;
   }
 
@@ -309,6 +364,7 @@ export class Grid {
       pane.setDockSyncListener(null);
       pane.dispose(killBackend);
       this.renderDock();
+      this.onChange();
       return;
     }
 
@@ -331,6 +387,7 @@ export class Grid {
       if (parked) this.restore(parked);
       else this.onEmpty();
     }
+    this.onChange();
   }
 
   /** Detach a leaf's element and unlink it from the tree, collapsing a

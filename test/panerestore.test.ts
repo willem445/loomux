@@ -7,6 +7,7 @@ import assert from "node:assert/strict";
 import {
   planPaneRestore,
   planLayoutRestore,
+  agentResumeCommand,
   AUTO_RESUME_AGENTS,
   type RestoreAction,
   type RestoreOpenStep,
@@ -80,6 +81,43 @@ test("even with a session id, a group stays dormant (the rule is keyed on kind, 
 test("AUTO_RESUME_AGENTS is the adopted default (the one-line all-dormant flip)", () => {
   // Guards the promise that flipping this single constant makes agents dormant.
   assert.equal(AUTO_RESUME_AGENTS, true);
+});
+
+// ---------- resume command building ----------
+
+test("resume appends --resume to a plain claude command, keeping other flags", () => {
+  assert.deepEqual(agentResumeCommand("claude --dangerously-skip-permissions", null, "s1"), {
+    command: "claude --dangerously-skip-permissions --resume s1",
+  });
+});
+
+test("resume replaces a recorded --session-id (space form) rather than doubling it", () => {
+  assert.deepEqual(agentResumeCommand("claude --session-id old-id --model opus", null, "s2"), {
+    command: "claude --model opus --resume s2",
+  });
+});
+
+test("resume replaces a recorded --resume/--session-id in the `=` form too", () => {
+  assert.deepEqual(agentResumeCommand("claude --session-id=old --resume=stale", null, "s3"), {
+    command: "claude --resume s3",
+  });
+});
+
+test("resume never carries a prompt — only the launch flags plus --resume", () => {
+  // Guards the no-replay rule: whatever was recorded, the output is just the
+  // program + surviving flags + the resume id, never a queued prompt.
+  const out = agentResumeCommand("claude", null, "abc");
+  assert.equal(out.command, "claude --resume abc");
+});
+
+test("resume falls back to argv when there is no string command", () => {
+  assert.deepEqual(agentResumeCommand(null, ["claude", "--session-id", "old"], "s4"), {
+    argv: ["claude", "--resume", "s4"],
+  });
+});
+
+test("resume with neither command nor argv best-efforts a bare claude --resume", () => {
+  assert.deepEqual(agentResumeCommand(null, null, "s5"), { command: "claude --resume s5" });
 });
 
 // ---------- layout plan: reconstructible round-trip ----------

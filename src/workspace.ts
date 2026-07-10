@@ -11,6 +11,8 @@
 import { Grid, type GridLayoutNode } from "./grid";
 import type { ManagedWorkspace } from "./tabs";
 import { PreviewBudget, type PreviewNode } from "./tabroute";
+import type { PersistedLayoutNode } from "./tabstore";
+import type { TabPaneInfo } from "./tabcounts";
 
 /** Cap on panes serialized per preview refresh — serializing every pane every
  *  ~700ms would get expensive on a huge grid. Panes past the cap render as a
@@ -29,10 +31,14 @@ export class Workspace implements ManagedWorkspace {
 
   /** @param onEmpty invoked when the tab's grid goes empty (last pane closed)
    *  so the caller can keep the grid non-empty — the per-tab mirror of the
-   *  app-wide "never leave the grid empty" rule. */
+   *  app-wide "never leave the grid empty" rule.
+   *  @param onChange invoked when this tab's pane set / layout changes (open or
+   *  close) so the host can re-render the tab strip's live agent counter and
+   *  re-persist the layout (#194 P4). */
   constructor(
     readonly id: string,
-    onEmpty: (ws: Workspace) => void
+    onEmpty: (ws: Workspace) => void,
+    onChange: (ws: Workspace) => void = () => {}
   ) {
     this.el = document.createElement("div");
     this.el.className = "workspace";
@@ -48,9 +54,16 @@ export class Workspace implements ManagedWorkspace {
     dock.setAttribute("aria-label", "Minimized panes");
     this.el.append(gridRoot, dock);
 
-    this.grid = new Grid(gridRoot, dock, () => {
-      if (!this.disposed) onEmpty(this);
-    });
+    this.grid = new Grid(
+      gridRoot,
+      dock,
+      () => {
+        if (!this.disposed) onEmpty(this);
+      },
+      () => {
+        if (!this.disposed) onChange(this);
+      }
+    );
   }
 
   get name(): string {
@@ -98,6 +111,37 @@ export class Workspace implements ManagedWorkspace {
       return { kind: "leaf", weight: n.weight, title: n.pane.name, html, capped: !render };
     };
     return map(tree);
+  }
+
+  /** Capture this tab's whole pane layout as a serializable tree (#194 P4): the
+   *  split tree with each live pane reduced to a PersistedPane (Pane.capture()).
+   *  A welcome (setup) pane captures null and is pruned — a split that loses a
+   *  child collapses to its surviving child, and a tab that is nothing but a
+   *  welcome pane captures null (nothing worth restoring). Reads the in-memory
+   *  tree + flex weights only (no geometry, no PTY), so it's safe on a hidden tab
+   *  and under the no-resize invariant. */
+  captureLayout(): PersistedLayoutNode | null {
+    const tree = this.grid.layoutSnapshot();
+    if (!tree) return null;
+    const map = (n: GridLayoutNode): PersistedLayoutNode | null => {
+      if (n.kind === "leaf") {
+        const pane = n.pane.capture();
+        return pane ? { kind: "leaf", weight: n.weight, pane } : null;
+      }
+      const children = n.children
+        .map(map)
+        .filter((c): c is PersistedLayoutNode => c !== null);
+      if (children.length === 0) return null;
+      if (children.length === 1) return children[0]; // a split that lost siblings collapses
+      return { kind: "split", dir: n.dir, weight: n.weight, children };
+    };
+    return map(tree);
+  }
+
+  /** Classify every pane in the tab (visible AND docked) for the per-tab agent
+   *  counter / orchestration markers (#194 P4, tabcounts.ts). */
+  paneInfos(): TabPaneInfo[] {
+    return this.grid.allPanes().map((p) => p.tabPaneInfo());
   }
 
   dispose(): void {

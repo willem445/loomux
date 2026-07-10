@@ -51,6 +51,7 @@ import { GroupView } from "./groupview";
 import { clampOverlayHeight, OVERLAY_MIN_H } from "./overlaysize";
 import { FileEditView } from "./fileedit";
 import type { PersistedPane, PersistedPaneKind } from "./tabstore";
+import type { TabPaneInfo } from "./tabcounts";
 
 // Inline icons so the toolbar renders identically regardless of installed
 // fonts; they inherit color via `currentColor`.
@@ -313,6 +314,15 @@ export class Pane implements VoiceTargetPane {
    *  (`startFromWelcome`), so the no-resize invariant holds — there's nothing to
    *  resize before then. Null once the pane has become a real terminal. */
   private welcomeEl: HTMLElement | null = null;
+  /** Dormant restore placeholder (#194 P4): a pane rebuilt from a persisted leaf
+   *  that we deliberately did NOT auto-spawn — an agent CLI with no resumable id
+   *  (a Start button), or an orchestration pane whose whole group stays dormant
+   *  until the human resumes it (a Resume button). No PTY until acted on, so the
+   *  no-resize invariant holds. `dormantRecord` is the leaf it was built from, so
+   *  capture() re-serializes it verbatim: a session closed without resuming
+   *  still offers the same restore next boot. Null for any live/welcome pane. */
+  private dormantEl: HTMLElement | null = null;
+  private dormantRecord: PersistedPane | null = null;
   /** Ordered input pipe to the PTY: serializes every keystroke/paste so the
    *  async IPC writes can't reorder (a bracketed-paste terminator overtaking
    *  its body wedges the target app — #65). Buffers input produced before the
@@ -724,6 +734,46 @@ export class Pane implements VoiceTargetPane {
     this.welcomeEl?.remove();
     this.welcomeEl = null;
     this.el.classList.remove("is-welcome");
+    await this.start(opts, true);
+  }
+
+  /** Render a DORMANT restore placeholder (#194 P4): no terminal, no PTY, just
+   *  `contentEl` (a Start/Resume affordance the caller wires). `record` is the
+   *  persisted leaf this pane stands in for, retained so capture() re-serializes
+   *  it unchanged — a restore left dormant persists identically for next boot.
+   *  Nothing here spawns anything, honoring the group no-double-spawn contract. */
+  startDormant(record: PersistedPane, contentEl: HTMLElement): void {
+    this.setName(record.name);
+    this.el.classList.add("is-dormant");
+    const wrap = document.createElement("div");
+    wrap.className = "pane-dormant";
+    wrap.appendChild(contentEl);
+    this.dormantEl = wrap;
+    this.dormantRecord = record;
+    this.el.appendChild(wrap);
+  }
+
+  /** True while this pane is a dormant restore placeholder (no PTY yet). */
+  get isDormant(): boolean {
+    return this.dormantEl !== null;
+  }
+
+  /** The kind of a dormant placeholder ("agent" | "orch"), or null when not
+   *  dormant. Lets the grid/tab-bar tell a dormant Start pane from a dormant
+   *  group pane without re-reading the whole record. */
+  get dormantKind(): PersistedPaneKind | null {
+    return this.dormantRecord?.paneKind ?? null;
+  }
+
+  /** Convert a dormant agent placeholder into a live pane when the human clicks
+   *  Start: tear down the placeholder and spawn the recorded command in place.
+   *  Only used for `dormant-agent` (no-session CLIs) — a dormant GROUP is revived
+   *  through resumeOrchSession, never here (the double-spawn contract). */
+  async startFromDormant(opts: PaneOptions = {}): Promise<void> {
+    this.dormantEl?.remove();
+    this.dormantEl = null;
+    this.dormantRecord = null;
+    this.el.classList.remove("is-dormant");
     await this.start(opts, true);
   }
 
@@ -1258,12 +1308,10 @@ export class Pane implements VoiceTargetPane {
    *  panerestore.ts decides what each record becomes on restore. */
   capture(): PersistedPane | null {
     if (this.isWelcome) return null;
-    // orch (any orchestration role) > agent (launched a command) > plain terminal.
-    const kind: PersistedPaneKind = this.orchGroup
-      ? "orch"
-      : this.launchedCommand
-        ? "agent"
-        : "terminal";
+    // A dormant restore placeholder persists exactly as it came in, so a session
+    // closed without resuming offers the identical restore next boot.
+    if (this.dormantRecord) return { ...this.dormantRecord };
+    const kind = this.liveKind();
     return {
       paneKind: kind,
       name: this.name,
@@ -1273,6 +1321,25 @@ export class Pane implements VoiceTargetPane {
       shellKind: kind === "terminal" ? this.spawnShellKind : null,
       sessionId: kind === "agent" ? this.agentSessionId : null,
     };
+  }
+
+  /** This pane's persisted kind from its live launch state:
+   *  orch (any orchestration role) > agent (launched a command) > plain terminal. */
+  private liveKind(): PersistedPaneKind {
+    return this.orchGroup ? "orch" : this.launchedCommand ? "agent" : "terminal";
+  }
+
+  /** Classify this pane for the per-tab agent counter / orch markers (#194 P4,
+   *  tabcounts.ts). A welcome (setup) or dormant placeholder reports `live:false`
+   *  so it never inflates the count; a running pane reports its kind + that it has
+   *  a PTY. Reads no geometry, so it's safe on a hidden tab. */
+  tabPaneInfo(): TabPaneInfo {
+    if (this.isWelcome) return { kind: "terminal", live: false };
+    if (this.dormantRecord) {
+      return { kind: this.dormantRecord.paneKind === "orch" ? "orch" : "agent", live: false };
+    }
+    const kind = this.liveKind();
+    return { kind, live: this.ptyId !== null };
   }
 
   /** Whichever overlay (git / tasks / audit / group) is currently covering
@@ -1452,6 +1519,12 @@ export class Pane implements VoiceTargetPane {
     // LOW-6). `isWelcome` is null once the pane becomes a real terminal.
     if (this.isWelcome) {
       this.focusWelcome();
+      return;
+    }
+    // A dormant placeholder likewise has no terminal — land focus on its
+    // Start/Resume affordance so keyboard nav reaches a usable control.
+    if (this.dormantEl) {
+      this.dormantEl.querySelector<HTMLElement>("button, [tabindex]")?.focus();
       return;
     }
     this.term.focus();

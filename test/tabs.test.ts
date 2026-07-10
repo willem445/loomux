@@ -23,6 +23,12 @@ class FakeWorkspace implements ManagedWorkspace {
   previewLayout(): null {
     return null;
   }
+  captureLayout(): null {
+    return null;
+  }
+  paneInfos(): [] {
+    return [];
+  }
   setVisible(v: boolean): void {
     this.visible = v;
     this.visLog.push(v);

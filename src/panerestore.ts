@@ -89,6 +89,46 @@ export function planPaneRestore(pane: PersistedPane): RestoreAction {
   }
 }
 
+/** Turn a resumed agent's recorded launch line into the command that re-opens
+ *  its prior session — the "resume/reattach command from a recorded sessionId"
+ *  the plan calls for. Pure so it's unit-tested; main.ts feeds the result to
+ *  grid.openPane.
+ *
+ *  Only Claude has a clean resumable id (it's the only CLI we mint a session id
+ *  for at launch), so this rewrites a `claude …` line: drop any recorded
+ *  `--session-id`/`--resume` (both the space and `=` forms) so we never carry a
+ *  stale id or double the flag, KEEP every other flag (model, the autopilot
+ *  permission flag) so the resumed pane matches how it was launched, then append
+ *  `--resume <id>`. Resuming into the idle TUI costs nothing until a prompt is
+ *  sent — and we never append one (the no-replay rule). Prefers the string
+ *  `command`; falls back to structured `argv`, then to a bare `claude --resume`. */
+export function agentResumeCommand(
+  command: string | null,
+  argv: string[] | null,
+  sessionId: string
+): { command?: string; argv?: string[] } {
+  const strip = (tokens: string[]): string[] => {
+    const out: string[] = [];
+    for (let i = 0; i < tokens.length; i++) {
+      const t = tokens[i];
+      if (t === "--session-id" || t === "--resume") {
+        i++; // drop the flag AND its separate value token
+        continue;
+      }
+      if (t.startsWith("--session-id=") || t.startsWith("--resume=")) continue; // `=` form: one token
+      out.push(t);
+    }
+    return out;
+  };
+  if (command && command.trim()) {
+    return { command: [...strip(command.trim().split(/\s+/)), "--resume", sessionId].join(" ") };
+  }
+  if (argv && argv.length) {
+    return { argv: [...strip(argv), "--resume", sessionId] };
+  }
+  return { command: `claude --resume ${sessionId}` };
+}
+
 /** One `grid.openPane` call in a layout rebuild — enough to reconstruct ANY
  *  nested split tree, including telling a 2×2 grid apart from four stacked panes
  *  (which a flat leaf list cannot).

@@ -117,9 +117,13 @@ src/
   layout.ts         pure drag-reorder geometry (unit-tested, DOM-free)
   tabs.ts           project tabs (#63): TabManager -- tab list, active tab, routing (DOM-free)
   workspace.ts      one tab = a Grid + its own dock; hide/show, GL policy, preview composite
-  tabbar.ts         the tab strip: switch/close/new, rename, color, alert/status chips, preview
+  tabbar.ts         the tab strip: switch/close/new, rename, color, alert chips, deterministic agent counter + orchestration markers (#194), preview
   tabroute.ts       pure tab routing + preview scale/sanitizer (unit-tested, DOM-free)
-  tabstore.ts       pure encode/decode + schema validation of the persisted tab set
+  tabstore.ts       pure encode/decode + schema validation of the persisted tab set (tabs + per-tab pane layout + restore pref, #194)
+  restoredecision.ts pure restore-vs-fresh-vs-ask decision for the boot splash (DOM-free, unit-tested, #194)
+  panerestore.ts    pure per-pane restore policy + layout-tree -> ordered rebuild plan + agent resume-command builder (DOM-free, unit-tested, #194)
+  restoresplash.ts  cold-boot "restore last session?" overlay (thin DOM over restoredecision.ts, #194)
+  tabcounts.ts      pure per-tab live-agent counter + live/dormant orchestration markers (DOM-free, unit-tested, #194)
   panefit.ts        pure "hidden => no PTY resize" decision (the no-resize invariant)
   sessions.ts       session browser sidebar
   launcher.ts       in-pane welcome / pane-setup form (Agent / Orchestrator / Terminal kind picker)

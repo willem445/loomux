@@ -119,8 +119,81 @@ every worker (the #78 storm). That contract lives on the `RestoreAction`
 | Restore decision | `src/restoredecision.ts` | `decideRestore` — restore/fresh/prompt. Unit-tested. |
 | Per-pane policy | `src/panerestore.ts` | The adopted hybrid + tree flattening + the all-dormant flip. Unit-tested. |
 | Capture getter | `src/pane.ts` | `Pane.capture() → PersistedPane \| null` (null for a setup-state welcome pane); retains launch inputs (`command`/`argv`/`shellKind`/`sessionId`) for it. DOM-coupled → hand-validated. |
-| Wiring (Phase 4) | `src/main.ts` | Splash, `hasSnapshot`, layout capture into `snapshot()`, grid rebuild, auto-resume. *Not in this phase.* |
+| Wiring (Phase 4) | `src/main.ts` | Splash, `hasSnapshot`, layout capture into `snapshot()`, grid rebuild, auto-resume, dormant Start/Resume. |
+| Splash overlay (Phase 4) | `src/restoresplash.ts` | Cold-boot "Restore last session?" overlay (thin DOM over `decideRestore`). |
+| Counter/markers (Phase 4) | `src/tabcounts.ts` | Pure per-tab live-agent count + live/dormant orchestration markers. Unit-tested. |
 
 `shellKind` is recorded here but the backend spawn plumbing that acts on it lands
 in the shell-kinds phase; `sessionId` is populated by the launcher when it spawns
 a session-capable CLI (Phase 4). This phase makes both **capturable**.
+
+## Phase 4 — the wiring (this phase)
+
+The data layer above is now driven end to end by `main.ts` and a thin overlay.
+
+**Capture, populated.** `Pane.capture()` already reduced a live pane to a
+`PersistedPane`; Phase 4 fills the last gap — the **session id**. The launcher
+mints one for a session-capable CLI (Claude only) as `crypto.randomUUID()` — the
+webview's Web Crypto, **not** a getrandom crate, so constraint 2 (which governs
+`src-tauri` Rust) doesn't apply — appends `--session-id <uuid>` to the command,
+and threads the id onto the pane. `Workspace.captureLayout()` walks
+`grid.layoutSnapshot()` into a `PersistedLayoutNode` tree (pruning welcome/setup
+leaves, collapsing a split that thereby loses a sibling), and `TabManager.snapshot()`
+now carries each tab's `layout` plus the remembered `restorePref`. A new grid
+`onChange` callback (fired on pane open/close) re-persists and re-renders the tab
+strip, so **live panes persist on change and close** — no longer only on tab-level
+edits.
+
+**The boot decision.** `main.ts` decodes the blob, computes `hasSnapshot`
+(`hasRestorableContent`: ≥1 tab with a layout, a group binding, or simply >1 tab),
+and calls `decideRestore(pref, hasSnapshot)`. `prompt` shows `restoresplash.ts` —
+Restore / Start fresh, with a *Remember my choice* box that writes the preference
+back (unticked keeps it `"ask"`). It's a pure overlay before any tab exists, so it
+resizes nothing.
+
+**The rebuild.** For each restored tab, `rebuildLayout` runs
+`planLayoutRestore(layout)` and replays each `RestoreOpenStep` into the tab's grid
+(`relativeTo` → the anchor pane from an earlier step, `dir` → the split direction),
+then calls the new `grid.applyLayoutWeights(layout)` **once** — `openPane`/
+`openDormantPane` reset flex to equal shares as they split, so the saved divider
+drags are re-applied after the tree exists. The replay matches the pure model in
+`test/panerestore.test.ts` (same `insertBeside` semantics), so structure and
+weights come back identical.
+
+Per action:
+
+- **spawn-terminal** → `grid.openPane` with the recorded `cwd` + `shellKind`.
+- **resume-agent** → `grid.openPane` with `agentResumeCommand(command, argv,
+  sessionId)` — the recorded launch line with any `--session-id`/`--resume`
+  stripped and `--resume <id>` appended (flags like the autopilot permission flag
+  survive; **no prompt is ever appended** — the no-replay rule). The session id is
+  re-recorded so a *second* restore resumes identically.
+- **dormant-agent** → `grid.openDormantPane` showing a **Start** card that calls
+  `pane.startFromDormant(...)` with the recorded command.
+- **dormant-group** → `grid.openDormantPane` showing a **Resume group** card. This
+  is where the **no-double-spawn contract** is honored: the placeholder spawns
+  nothing. Resume looks up the group's recorded orchestrator session
+  (`orchSessionRoles`) and revives the whole group through the existing
+  `resumeOrchSession` — the *one* path that spawns it — **then** closes the now-
+  redundant dormant ORCH placeholders (after the revive added a real pane, so the
+  grid never empties). A dormant pane re-captures its record verbatim, so a session
+  closed without resuming offers the identical restore next boot.
+
+Every pane rebuilds `background` (no focus theft); the active tab is focused last.
+The rebuild runs with a `booting` guard so the many intermediate opens don't each
+re-persist — boot persists once at the end.
+
+**Counter + markers.** The tab strip's agent counter was unreliable (it read only
+a 4-second backend group poll, so a plain-agent tab showed nothing and a just-
+opened group flashed a stray `0`). It now derives from `tabcounts.ts` over the
+panes actually open in the tab (`Workspace.paneInfos()` → `Pane.tabPaneInfo()`):
+`agents` counts live agent + live orchestration panes; `liveOrch` drives the `⛓`
+icon; `dormantOrch` (a bound-but-not-live group, or a dormant ORCH placeholder)
+drives the static `ORCH` chip — never both at once. Cost/paused still come from the
+poll. The grid `onChange` re-render makes the count immediate, not poll-latent.
+
+**Stranded-form fix (P1 debt).** A welcome form fires its result and is retired,
+but an orchestrator launch that threw afterward left the form stranded with a
+disabled *Working…* button. `handleWelcomeSubmit` now catches it, toasts the
+error, and calls `form.reopenAfterLaunchFailure` (restoring the fired callback and
+re-opening the `SubmitLatch`) so the human can fix the cause and retry.

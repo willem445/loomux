@@ -45,6 +45,10 @@ export interface AgentLaunchSpec {
   /** Repo, worktree, or plain folder; undefined = home directory. */
   cwd?: string;
   command: string;
+  /** Recorded resumable session id (#194 P4): minted here for a session-capable
+   *  CLI (Claude) and passed to the pane so its layout snapshot can `--resume`
+   *  the exact session on restore. Absent for best-effort CLIs / custom commands. */
+  sessionId?: string;
 }
 
 /** What a submitted welcome form resolves to — the caller (main.ts) spawns the
@@ -876,10 +880,24 @@ export class WelcomeForm {
           // Fan out to isolated worktrees: fix-auth → fix-auth-1 … fix-auth-N.
           cwd = await gitWorktreeAdd(plan.repo, worktreeNameFor(plan.worktree, i, plan.count));
         }
+        // Session-capable CLIs (Claude) get a pre-assigned session id (#194 P4)
+        // so a restored pane can `--resume` the EXACT prior session — the tracked
+        // P3 deferral ("the launcher knows the session id"). Minted per agent so a
+        // fan-out's panes don't collide on one id. Skipped for custom commands
+        // (the user owns those) and best-effort CLIs (no clean resumable id).
+        // crypto.randomUUID is the webview's Web Crypto, NOT a getrandom crate —
+        // constraint 2 governs src-tauri Rust only, not the frontend.
+        let cmd = command;
+        let sessionId: string | undefined;
+        if (!plan.isCustom && program === "claude") {
+          sessionId = crypto.randomUUID();
+          cmd = `${command} --session-id ${sessionId}`;
+        }
         specs.push({
           name: plan.count > 1 ? `${plan.baseName} ${i}` : plan.baseName,
           cwd,
-          command,
+          command: cmd,
+          sessionId,
         });
       }
       setDefaultAgent(plan.isCustom ? "custom" : this.agentSel.value);
@@ -895,12 +913,29 @@ export class WelcomeForm {
 
   /** Deliver the one submit result and permanently close the latch, so no late
    *  re-entry into `submit()` can fire a second time (rev-74 HIGH-1). `onSubmit`
-   *  is also nulled as belt-and-suspenders. */
+   *  is also nulled as belt-and-suspenders — but retained so a downstream launch
+   *  failure can restore it for a retry (reopenAfterLaunchFailure). */
+  private lastSubmitCb: ((result: WelcomeResult) => void) | null = null;
   private fire(result: WelcomeResult): void {
     const cb = this.onSubmit;
+    this.lastSubmitCb = cb;
     this.onSubmit = null;
     this.latch.finish();
     cb?.(result);
+  }
+
+  /** Re-enable this still-mounted form after the caller failed to act on its
+   *  result (#194 P1 debt): a downstream launch (e.g. an orchestrator group)
+   *  threw, leaving the welcome form stranded with a disabled "Working…" button.
+   *  Surface the error, restore the fire()-cleared callback + latch, and re-enable
+   *  submit so the human can fix the cause and retry — instead of a dead form.
+   *  Only meaningful while the form is still on screen (the orchestrator path,
+   *  which doesn't convert its setup pane until the launch succeeds). */
+  reopenAfterLaunchFailure(msg: string): void {
+    this.onSubmit = this.lastSubmitCb;
+    this.latch.reopen();
+    this.setBusy(false);
+    this.showError(msg);
   }
 
   private setBusy(busy: boolean, label?: string): void {

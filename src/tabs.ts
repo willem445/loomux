@@ -11,7 +11,8 @@
 // lightweight fake and production plugs in the real Grid-backed Workspace.
 
 import type { TabAttn, PreviewNode } from "./tabroute";
-import type { PersistedTabs } from "./tabstore";
+import type { PersistedTabs, PersistedLayoutNode, RestorePref } from "./tabstore";
+import type { TabPaneInfo } from "./tabcounts";
 
 /** The minimal surface TabManager needs from a workspace. `Workspace`
  *  (workspace.ts) implements this and adds the concrete Grid/DOM. */
@@ -37,6 +38,13 @@ export interface ManagedWorkspace {
    *  re-calls it on a short interval while hovered for a live view, and renders
    *  it SAFELY (spans → textContent). Null when the tab has no panes. */
   previewLayout(): PreviewNode | null;
+  /** Capture the tab's whole pane layout for session restore (#194): the split
+   *  tree with each pane reduced to a serializable record, or null when there's
+   *  nothing worth restoring (an empty tab / only a welcome pane). */
+  captureLayout(): PersistedLayoutNode | null;
+  /** Classify every pane in the tab for the live per-tab agent counter and the
+   *  orchestration markers (#194 P4). */
+  paneInfos(): TabPaneInfo[];
   /** Tear the workspace down and kill its panes' PTYs (tab closed). */
   dispose(): void;
 }
@@ -63,6 +71,11 @@ export class TabManager<T extends ManagedWorkspace> {
   /** Per-tab attention badge state, refreshed from the backend attention scan by
    *  the router; read by the tab bar. Absent = no attention. */
   private attn = new Map<string, TabAttn>();
+
+  /** The remembered restore preference (#194 P4): "ask" until the human answers
+   *  the boot splash, then "restore"/"fresh". Persisted in snapshot() and read
+   *  back on boot to decide whether to prompt. */
+  private restorePref: RestorePref = "ask";
 
   /** Builds a workspace for a freshly minted id (real Workspace in production;
    *  a fake in tests). Not a constructor parameter property — Node's strip-only
@@ -216,20 +229,41 @@ export class TabManager<T extends ManagedWorkspace> {
 
   // ---------- persistence ----------
 
-  /** Snapshot the tab set for persistence: each tab's name/color/owning group,
-   *  plus which tab was active. Pane/PTY contents are NOT captured (see
-   *  tabstore.ts). */
+  /** The remembered restore preference (read on boot; set from the splash). */
+  get restorePreference(): RestorePref {
+    return this.restorePref;
+  }
+  /** Record the human's restore choice so future boots honor it (#194 P4). Emits
+   *  so it lands in the next persisted snapshot. */
+  setRestorePreference(pref: RestorePref): void {
+    if (this.restorePref === pref) return;
+    this.restorePref = pref;
+    this.emit();
+  }
+
+  /** Force a change notification when the pane set / layout changed inside a tab
+   *  (a pane opened, closed, or converted) — the tab list itself is unchanged, so
+   *  nothing else would emit. Drives the tab strip's live agent counter and the
+   *  layout re-persist (#194 P4). */
+  notifyLayoutChanged(): void {
+    this.emit();
+  }
+
+  /** Snapshot the tab set for persistence: each tab's name/color/owning group and
+   *  its captured pane LAYOUT (#194), which tab was active, and the remembered
+   *  restore preference. Live PTY/buffer contents are NOT captured (tabstore.ts). */
   snapshot(): PersistedTabs {
     const tabs = this.workspaces.map((w) => ({
       name: w.name,
       color: w.color,
       groupId: this.groupForWorkspace(w.id),
+      layout: w.captureLayout(),
     }));
     const activeIndex = Math.max(
       0,
       this.workspaces.findIndex((w) => w.id === this.activeId)
     );
-    return { tabs, activeIndex };
+    return { tabs, activeIndex, restorePref: this.restorePref };
   }
 
   // ---------- subscription ----------
