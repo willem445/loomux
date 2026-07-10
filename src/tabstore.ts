@@ -57,9 +57,16 @@ export interface PersistedPane {
   argv: string[] | null;
   /** Terminal shell kind (kind "terminal"); null when unknown / not a terminal. */
   shellKind: ShellKind | null;
-  /** Recorded resumable agent session id (kind "agent") — enables --resume into
-   *  the prior context. Absent for terminals and best-effort CLIs. */
+  /** Recorded resumable session id — enables --resume into the prior context.
+   *  Captured for kind "agent" AND kind "orch" (an orchestration pane's own
+   *  session, so a group resume restores exactly the captured members). Absent
+   *  for terminals and best-effort CLIs. */
   sessionId: string | null;
+  /** Orchestration role for kind "orch" ("orchestrator" | "worker" | "reviewer"
+   *  | "planner"), so a whole-group resume can tell the orchestrator (resume
+   *  first, relaunches the group) from its delegates. Null for agent/terminal
+   *  panes and for pre-#194.5 files. */
+  role: string | null;
 }
 
 /** A tab's pane layout: the split tree with PersistedPane leaves. Mirrors grid's
@@ -77,6 +84,11 @@ export interface PersistedTab {
   /** Pane layout tree (#194). Absent/null = old file or a group-only tab →
    *  restore falls back to a single fresh shell. */
   layout?: PersistedLayoutNode | null;
+  /** Minimized (docked) panes (#194 P4). These live OUTSIDE the layout tree, so
+   *  they're captured separately and restored back into the dock — otherwise a
+   *  docked agent session would be silently dropped on restore. Absent/empty when
+   *  the tab has no docked panes. */
+  docked?: PersistedPane[];
 }
 
 export interface PersistedTabs {
@@ -115,6 +127,8 @@ export function encodeTabs(state: PersistedTabs): string {
       groupId: t.groupId,
       // Only serialize a layout when present; an absent one keeps old-file shape.
       ...(t.layout ? { layout: t.layout } : {}),
+      // Same for docked panes: omit the key entirely when there are none.
+      ...(t.docked && t.docked.length ? { docked: t.docked } : {}),
     })),
   });
 }
@@ -136,6 +150,7 @@ function decodePane(v: unknown): PersistedPane | null {
     argv: argvOk ? (r.argv as string[]) : null,
     shellKind: isShellKind(r.shellKind) ? r.shellKind : null,
     sessionId: typeof r.sessionId === "string" ? r.sessionId : null,
+    role: typeof r.role === "string" ? r.role : null,
   };
 }
 
@@ -190,7 +205,13 @@ export function decodeTabs(raw: string | null): PersistedTabs | null {
   const tabs: PersistedTab[] = [];
   for (const t of obj.tabs) {
     if (!t || typeof t !== "object") continue;
-    const rec = t as { name?: unknown; color?: unknown; groupId?: unknown; layout?: unknown };
+    const rec = t as {
+      name?: unknown;
+      color?: unknown;
+      groupId?: unknown;
+      layout?: unknown;
+      docked?: unknown;
+    };
     if (typeof rec.name !== "string" || !rec.name.trim()) continue;
     const tab: PersistedTab = {
       name: rec.name,
@@ -201,6 +222,12 @@ export function decodeTabs(raw: string | null): PersistedTabs | null {
     // (old-file shape, so the round-trip is exact), while a present-but-malformed
     // layout degrades to null → the tab restores as a single fresh shell.
     if (rec.layout !== undefined) tab.layout = decodeLayout(rec.layout);
+    // Docked panes: drop any malformed entry rather than failing the whole tab
+    // (a lost dock chip is a smaller degradation than a lost tab).
+    if (Array.isArray(rec.docked)) {
+      const docked = rec.docked.map(decodePane).filter((p): p is PersistedPane => p !== null);
+      if (docked.length) tab.docked = docked;
+    }
     tabs.push(tab);
   }
   if (tabs.length === 0) return null;

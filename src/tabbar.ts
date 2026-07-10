@@ -13,6 +13,7 @@ import { makeRenameCommit } from "./panerename";
 import { swapEditor } from "./domutil";
 import { attentionPresentation } from "./attention";
 import { pauseGroup, resumeGroup, groupSummary, groupUsage } from "./orchestration";
+import { tabCounts } from "./tabcounts";
 
 // Reuse the orchestration group palette (orchbadge.ts GROUP_COLORS) so a tab's
 // color vocabulary matches the group-accent colors the panes already use.
@@ -153,6 +154,7 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
       const active = ws.id === this.tabs.activeTabId;
       const attn = this.tabs.attentionFor(ws.id);
       const st = this.status.get(ws.id);
+      const groupId = this.tabs.groupForWorkspace(ws.id);
 
       const tab = document.createElement("div");
       tab.className = "tab" + (active ? " active" : "");
@@ -198,27 +200,57 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
         tab.appendChild(chip);
       }
 
-      // Live status chip: agent count + cost, when the tab owns a group.
-      if (st) {
+      // Live agent counter + orchestration markers (#194 P4). The count is now
+      // DETERMINISTIC — derived from the panes actually open in this tab
+      // (tabcounts.ts), not the flaky 4s backend poll that made it render
+      // sometimes and flash a stray "+0". Cost/paused still come from the poll
+      // (backend-only facts), shown alongside.
+      const counts = tabCounts(ws.paneInfos(), !!groupId);
+      if (counts.agents > 0) {
         const status = document.createElement("span");
         status.className = "tab-status";
-        const cost = st.cost != null ? ` · $${st.cost.toFixed(2)}` : "";
-        status.textContent = `✦${st.agents}${cost}`;
-        status.title = `${st.agents} live agent(s)${cost ? `, ${cost.slice(3)} so far` : ""}`;
+        const cost = st?.cost != null ? ` · $${st.cost.toFixed(2)}` : "";
+        status.textContent = `✦${counts.agents}${cost}`;
+        status.title = `${counts.agents} live agent(s)${cost ? `, ${cost.slice(3)} so far` : ""}`;
         tab.appendChild(status);
-        if (st.paused) {
-          const pause = document.createElement("span");
-          pause.className = "tab-paused";
-          pause.textContent = "⏸";
-          pause.title = "Project paused — prompts/kickoffs held";
-          tab.appendChild(pause);
-        }
+      } else if (st?.cost != null && (groupId || counts.dormantOrch)) {
+        // No live agents, but the group's accrued cost is still worth showing —
+        // don't let it vanish when the last agent exits/idle-kills (#194 P4 LOW-8).
+        const status = document.createElement("span");
+        status.className = "tab-status";
+        status.textContent = `$${st.cost.toFixed(2)}`;
+        status.title = `$${st.cost.toFixed(2)} accrued (no live agents)`;
+        tab.appendChild(status);
+      }
+      // Orchestration marker: a live icon when a group is running in this tab, or
+      // the static ORCH chip for a dormant (restored-but-not-resumed) group — a
+      // tab can mix normal agents with orchestration, so this is independent of
+      // the agent count. Never both at once (tabCounts guarantees it).
+      if (counts.liveOrch) {
+        const orch = document.createElement("span");
+        orch.className = "tab-orch live";
+        orch.textContent = "⛓";
+        orch.title = "Orchestration active in this tab";
+        tab.appendChild(orch);
+      } else if (counts.dormantOrch) {
+        const orch = document.createElement("span");
+        orch.className = "tab-orch dormant";
+        orch.textContent = "ORCH";
+        orch.title = "Dormant orchestration group — open the tab and Resume it";
+        tab.appendChild(orch);
+      }
+      if (st?.paused) {
+        const pause = document.createElement("span");
+        pause.className = "tab-paused";
+        pause.textContent = "⏸";
+        pause.title = "Project paused — prompts/kickoffs held";
+        tab.appendChild(pause);
       }
 
       const close = document.createElement("button");
       close.className = "tab-close";
       const armed = this.closeArmedId === ws.id;
-      const ownsGroup = !!this.tabs.groupForWorkspace(ws.id);
+      const ownsGroup = !!groupId;
       close.classList.toggle("confirm", armed);
       close.textContent = armed ? "✕?" : "✕";
       close.title = armed

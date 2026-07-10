@@ -10,6 +10,7 @@
 // pure, unit-tested `layout.ts`; this file owns the DOM/tree mutation.
 
 import { Pane, type PaneEvents, type PaneOptions } from "./pane";
+import type { PersistedPane } from "./tabstore";
 import { dropZoneFor, indicatorFor, zoneToPlacement, type DropZone } from "./layout";
 import { dockChipAttention } from "./attention";
 import { planGroupMinimize } from "./group";
@@ -40,6 +41,14 @@ type TreeNode = LeafNode | SplitNode;
 export type GridLayoutNode =
   | { kind: "leaf"; weight: number; pane: Pane }
   | { kind: "split"; dir: Dir; weight: number; children: GridLayoutNode[] };
+
+/** The minimal shape `applyLayoutWeights` walks in parallel with the live tree:
+ *  a per-node flex-grow, and children for splits. A `PersistedLayoutNode`
+ *  (tabstore.ts) is structurally one of these, so a rebuild passes it directly. */
+export interface WeightNode {
+  weight: number;
+  children?: WeightNode[];
+}
 
 const MIN_PANE_PX = 80;
 /** Pixels the pointer must travel from the header press before a click turns
@@ -114,7 +123,11 @@ export class Grid {
   constructor(
     private rootEl: HTMLElement,
     private dockEl: HTMLElement,
-    private onEmpty: () => void
+    private onEmpty: () => void,
+    /** Fired whenever the pane set / layout changes (open, close) so the host can
+     *  re-render the tab strip's live agent counter and re-persist the layout
+     *  (#194 P4). Defaults to a no-op for callers that don't care. */
+    private onChange: () => void = () => {}
   ) {
     this.rootEl.addEventListener("pointerdown", (e) => this.onPointerDown(e));
     this.renderDock();
@@ -136,6 +149,12 @@ export class Grid {
    *  scans (e.g. attention routing) that must reach docked panes too. */
   allPanes(): Pane[] {
     return [...this.leaves.keys(), ...this.minimizedPanes];
+  }
+
+  /** Just the docked (minimized) panes — the ones OUTSIDE the split tree, so
+   *  layoutSnapshot misses them. Captured separately for restore (#194 P4). */
+  dockedPanes(): Pane[] {
+    return [...this.minimizedPanes];
   }
 
   /** Show/hide the whole grid for a project-tab switch (#63). Records the state
@@ -182,6 +201,10 @@ export class Grid {
     const pane = new Pane(events);
     const takeFocus = this.placeLeaf(pane, !!opts.background, dir, relativeTo);
     await pane.start(opts, takeFocus);
+    // Re-notify now that the PTY exists: placeLeaf fired onChange BEFORE start, so
+    // the pane was still ptyId-less (live:false) and the agent counter undercounted
+    // it. A second notify after start settles the count (#194 P4 HIGH-1).
+    this.onChange();
     return pane;
   }
 
@@ -195,6 +218,47 @@ export class Grid {
     pane.startWelcome(formEl);
     if (takeFocus) pane.focusWelcome();
     return pane;
+  }
+
+  /** Land a pane in DORMANT restore state (#194 P4): placed like any pane but
+   *  with NO PTY — it shows `contentEl` (a Start/Resume affordance the caller
+   *  wires) and stands in for a persisted leaf we deliberately did NOT auto-spawn
+   *  (a no-session agent, or an orchestration pane whose group stays dormant). No
+   *  terminal opens, so nothing resizes a ConPTY; `record` is retained so the
+   *  pane re-captures identically if the session is closed without resuming.
+   *  Opened `background` so a restore rebuild never fights the human for focus. */
+  openDormantPane(
+    events: PaneEvents,
+    record: PersistedPane,
+    contentEl: HTMLElement,
+    dir: Dir = "row",
+    relativeTo?: Pane
+  ): Pane {
+    const pane = new Pane(events);
+    this.placeLeaf(pane, true, dir, relativeTo);
+    pane.startDormant(record, contentEl);
+    return pane;
+  }
+
+  /** Overwrite every node's flex-grow to match a persisted weight tree of the
+   *  SAME structure (session restore #194). `openPane`/`openDormantPane` reset
+   *  flex to equal shares as they split, so a rebuild replays the whole tree then
+   *  calls this once to put the saved divider positions back (the 25/75 drag that
+   *  would otherwise snap to 50/50). `weights` must mirror the tree the replay
+   *  just built — panerestore's plan guarantees that — and a shape mismatch stops
+   *  at the divergence rather than throwing. */
+  applyLayoutWeights(weights: WeightNode): void {
+    if (!this.root) return;
+    const walk = (n: TreeNode, w: WeightNode): void => {
+      nodeEl(n).style.flex = `${w.weight} 1 0`;
+      if (n.kind === "split" && w.children) {
+        n.children.forEach((c, i) => {
+          const cw = w.children![i];
+          if (cw) walk(c, cw);
+        });
+      }
+    };
+    walk(this.root, weights);
   }
 
   /** Insert a freshly-constructed pane's leaf into the tree and settle focus.
@@ -258,6 +322,7 @@ export class Grid {
     // hold a WebGL context the tab isn't showing — drop it now, matching the
     // rest of the hidden tab (#63 GL policy). Reloaded when the tab is shown.
     if (this.hidden) pane.setHidden(true);
+    this.onChange();
     return takeFocus;
   }
 
@@ -309,6 +374,7 @@ export class Grid {
       pane.setDockSyncListener(null);
       pane.dispose(killBackend);
       this.renderDock();
+      this.onChange();
       return;
     }
 
@@ -331,6 +397,7 @@ export class Grid {
       if (parked) this.restore(parked);
       else this.onEmpty();
     }
+    this.onChange();
   }
 
   /** Detach a leaf's element and unlink it from the tree, collapsing a
@@ -404,6 +471,11 @@ export class Grid {
         div.classList.remove("dragging");
         window.removeEventListener("mousemove", move);
         window.removeEventListener("mouseup", up);
+        // A finished divider drag changed the flex weights that layoutSnapshot
+        // captures — persist them so a restore reproduces THIS split, not the
+        // pre-drag one (#194 P4). Terminal (one per drag), not per-mousemove, so
+        // no write storm; persistTabs dedups an unchanged snapshot.
+        this.onChange();
       };
       window.addEventListener("mousemove", move);
       window.addEventListener("mouseup", up);
@@ -483,6 +555,9 @@ export class Grid {
       if (next) this.setActive(next);
     }
     this.renderDock();
+    // Docking changed the tree AND which panes are captured (docked panes are
+    // captured separately, #194 P4 MED-6) — persist + re-count.
+    this.onChange();
   }
 
   /** Bring a parked pane back into the grid, beside the active pane (or as the
@@ -513,6 +588,7 @@ export class Grid {
     this.setActive(pane);
     pane.focus();
     this.renderDock();
+    this.onChange();
   }
 
   // ---------- batch minimize / restore (group fold, #46) ----------
@@ -544,6 +620,9 @@ export class Grid {
       if (next) this.setActive(next);
     }
     this.renderDock();
+    // A batch fold moved panes between the tree and the dock — capture the new
+    // shape so a fold-then-quit restores them docked, not re-expanded (#194 P4).
+    this.onChange();
   }
 
   /** Restore several docked panes as one batch — the mirror of `minimizeMany`.
@@ -578,6 +657,7 @@ export class Grid {
     }
     if (last) last.focus();
     this.renderDock();
+    this.onChange();
   }
 
   /** The group-fold toggle (#46): fold a whole orchestration group's
@@ -735,6 +815,9 @@ export class Grid {
           const placement = zoneToPlacement(hover.zone);
           if (placement) this.moveToEdge(source, hover.pane, placement.dir, placement.before);
         }
+        // A committed drag-reorder changed the split-tree order/shape that a
+        // restore must reproduce — persist it (#194 P4 HIGH-2).
+        this.onChange();
       }
       if (started) source.focus();
     };

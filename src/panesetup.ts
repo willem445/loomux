@@ -112,6 +112,15 @@ export class SubmitLatch {
     this.done = true;
   }
 
+  /** Re-open a FINISHED latch after a downstream launch failed (#194 P4): the
+   *  result fired but the caller couldn't act on it (e.g. an orchestrator launch
+   *  threw), so the form stays and must accept a retry. Distinct from `release`,
+   *  which only covers a validation bounce that never finished. */
+  reopen(): void {
+    this.inFlight = false;
+    this.done = false;
+  }
+
   /** Whether a submit has already fired its result (one-shot spent). */
   get settled(): boolean {
     return this.done;

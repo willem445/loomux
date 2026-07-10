@@ -67,7 +67,13 @@ you're looking at another project.
   tab raises an unmistakable **`⚠ blocked`** / **`⚠ waiting`** chip on that tab's
   strip entry — the same label the pane header shows — so a background project
   can't hide its ask. Click the tab to jump straight to the pane.
-- The tab shows a live **`✦agents · $cost`** status chip pulled from the group.
+- The tab shows a live **`✦agents · $cost`** chip. The **agent count is exact** —
+  it counts the agent panes actually open in that tab (normal agents *and* live
+  orchestration panes), so it never flashes a stray `0` or goes missing; the cost
+  comes from the group.
+- A tab running orchestration shows a **`⛓`** marker; a tab holding a **dormant**
+  (restored-but-not-resumed) group shows a static **`ORCH`** chip. A tab can mix
+  normal agents and orchestration, so these are independent of the agent count.
 - When the orchestrator focuses an agent (or you restore its session), loomux
   **switches to that agent's tab first, then focuses the pane**.
 
@@ -95,15 +101,46 @@ to that project's agents, so they idle out and stop spending while you're away;
 per-tab form of the group pause described in the
 [orchestration guide](../orchestration.html).
 
-## What survives a restart
+## Restore your session on launch
 
-Your tabs persist across launches — their **names, colors, order, the active
-tab, and each tab's bound orchestration group** — saved to durable app storage
-(not the browser's), so clearing webview data doesn't lose them.
+Reopen loomux with a saved session and it asks first: a **"Restore your last
+session?"** splash with **Restore** and **Start fresh**. Tick *Remember my
+choice* and future launches skip the splash and do what you picked; leave it
+unticked to be asked again next launch. Pressing **Esc** is a non-committal
+*Start fresh* — it never remembers and **leaves your saved session on disk**, so
+the splash comes back next launch (a stray Escape can't quietly wipe your
+session). There's no prompt when there's nothing worth restoring — you go
+straight to a fresh welcome tab.
 
-Live agent panes are **not** auto-revived on boot: relaunching every orchestrator
-and worker on startup would spawn a process storm and spend credits without your
-say-so. Instead a restored tab **remembers its group**, so when you restore that
-group's session from the [session browser](session-browser.html) it re-inhabits
-the correct tab. Restored tabs come back holding a plain shell as a placeholder
-until then.
+**Restore** brings back every tab — names, colors, order, the active tab, its
+group binding — **and each tab's full pane layout**, split for split, with the
+divider positions you'd dragged. Each pane comes back by kind:
+
+- **Terminals** re-spawn a fresh shell in their recorded folder and shell kind
+  (PowerShell / cmd / Git Bash) — instant, nothing to resume.
+- **Agent panes** (Claude) **auto-resume their session** — the CLI reopens with
+  its prior context loaded, into the idle TUI. Resuming **spends nothing until
+  you send a prompt**, and loomux never replays one for you. If the recorded
+  session has no saved conversation (you closed it before sending a prompt, or
+  the transcript was deleted), the pane comes back as a **fresh** session in the
+  same spot — same folder, same agent — instead of erroring; a best-effort CLI
+  with no resumable session at all comes back as a dormant pane with a **Start**
+  button.
+- **Orchestration panes** come back **dormant**, with a **Resume group** button —
+  reviving a whole group can spawn workers and spend credits, so that stays a
+  deliberate, human-triggered action. The tab keeps its group binding and shows
+  the `ORCH` marker until you resume. **Resume group** is one-click consent for
+  the **whole group**: the orchestrator relaunches (task board, MCP identity), and
+  then every worker/reviewer that had an active session **rejoins** the group and
+  resumes into its idle TUI — re-registered so the orchestrator can message it,
+  and spending nothing until it's given work. An idle agent that never started a
+  conversation isn't restored (there's nothing to resume); the orchestrator can
+  respawn one on demand.
+
+**Start fresh** opens a single blank welcome tab and leaves the rest behind.
+
+Everything is saved to durable app storage (not the browser's), so clearing
+webview data doesn't lose it. What is *never* captured is the live terminal
+buffer/scrollback or the process itself — a pane is re-created or resumed from
+its record, so its on-screen history from last session is gone (the process died
+with the app). See the [design note](https://github.com/willem445/loomux/blob/main/doc/design/session-restore.md).

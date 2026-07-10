@@ -26,6 +26,53 @@ test("encode → decode round-trips name / color / group / active index", () => 
   assert.deepEqual(back, { ...state, schemaVersion: SCHEMA_VERSION });
 });
 
+test("docked panes round-trip (captured outside the layout tree, #194 P4)", () => {
+  const state: PersistedTabs = {
+    tabs: [
+      {
+        name: "loomux",
+        color: null,
+        groupId: null,
+        docked: [
+          {
+            paneKind: "agent",
+            name: "claude · fix",
+            cwd: "/repo",
+            command: "claude --session-id abc",
+            argv: null,
+            shellKind: null,
+            sessionId: "abc",
+            role: null,
+          },
+        ],
+      },
+    ],
+    activeIndex: 0,
+    restorePref: "restore",
+  };
+  const back = decodeTabs(encodeTabs(state));
+  assert.deepEqual(back?.tabs[0].docked, state.tabs[0].docked, "docked pane survives the round-trip");
+});
+
+test("an empty docked list is omitted (old-file shape preserved)", () => {
+  const encoded = encodeTabs({
+    tabs: [{ name: "a", color: null, groupId: null, docked: [] }],
+    activeIndex: 0,
+  });
+  assert.equal(encoded.includes("docked"), false, "no docked key written for an empty list");
+  assert.equal(decodeTabs(encoded)?.tabs[0].docked, undefined);
+});
+
+test("a malformed docked entry is dropped, not fatal to the tab", () => {
+  const raw = JSON.stringify({
+    tabs: [{ name: "a", color: null, groupId: null, docked: [{ paneKind: "bogus" }, { nope: 1 }] }],
+    activeIndex: 0,
+  });
+  const back = decodeTabs(raw);
+  assert.equal(back?.tabs.length, 1, "the tab survives");
+  assert.equal(back?.tabs[0].docked, undefined, "all-malformed docked entries drop to no dock");
+});
+
 test("encode stamps the current schema version and defaults restorePref to ask", () => {
   // A pre-#194 snapshot object (no restorePref/schemaVersion) must still encode —
   // this is what lets main.ts keep calling encodeTabs(tabs.snapshot()) unchanged.
@@ -111,6 +158,7 @@ const NESTED_LAYOUT: PersistedLayoutNode = {
         argv: null,
         shellKind: "gitbash",
         sessionId: null,
+        role: null,
       },
     },
     {
@@ -129,6 +177,7 @@ const NESTED_LAYOUT: PersistedLayoutNode = {
             argv: ["claude", "--resume", "abc-123"],
             shellKind: null,
             sessionId: "abc-123",
+            role: null,
           },
         },
         {
@@ -141,7 +190,8 @@ const NESTED_LAYOUT: PersistedLayoutNode = {
             command: null,
             argv: null,
             shellKind: null,
-            sessionId: null,
+            sessionId: "orch-sess-9",
+            role: "orchestrator",
           },
         },
       ],
@@ -207,6 +257,7 @@ test("malformed pane fields inside a valid leaf coerce to null, not a drop", () 
       argv: ["ok", 7], // non-string element → whole argv null
       shellKind: "fish", // unknown → null
       sessionId: null,
+      role: 99, // non-string → null
     },
   };
   const back = decodeTabs(
@@ -223,6 +274,7 @@ test("malformed pane fields inside a valid leaf coerce to null, not a drop", () 
       argv: null,
       shellKind: null,
       sessionId: null,
+      role: null,
     },
   });
 });

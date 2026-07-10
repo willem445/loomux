@@ -7,6 +7,10 @@ import assert from "node:assert/strict";
 import {
   planPaneRestore,
   planLayoutRestore,
+  agentResumeCommand,
+  agentFreshCommand,
+  sessionIdFromCommand,
+  shouldRespawnFresh,
   AUTO_RESUME_AGENTS,
   type RestoreAction,
   type RestoreOpenStep,
@@ -20,6 +24,7 @@ const pane = (over: Partial<PersistedPane>): PersistedPane => ({
   command: null,
   argv: null,
   shellKind: null,
+  role: null,
   sessionId: null,
   ...over,
 });
@@ -66,20 +71,148 @@ test("an agent WITHOUT a session id falls back to a dormant Start placeholder", 
 test("an orchestration pane ALWAYS restores dormant — never auto-resumed", () => {
   // The one credit/process-storm-sensitive case (#83/#78): a group is only ever
   // revived by the human via resumeOrchSession, so restore must not spawn it.
-  const action = planPaneRestore(pane({ paneKind: "orch", name: "orchestrator", cwd: "/repo" }));
-  assert.deepEqual(action, { type: "dormant-group", name: "orchestrator" });
+  const action = planPaneRestore(pane({ paneKind: "orch", name: "orchestrator", cwd: "/repo", role: "orchestrator" }));
+  assert.deepEqual(action, { type: "dormant-group", name: "orchestrator", sessionId: null, role: "orchestrator" });
 });
 
 test("even with a session id, a group stays dormant (the rule is keyed on kind, not id)", () => {
   // A worker pane could carry a resumable session id; auto-resuming it would be
   // exactly the process storm we refuse. Kind wins over the presence of an id.
-  const action = planPaneRestore(pane({ paneKind: "orch", name: "worker-1", cwd: "/wt", sessionId: "xyz-1" }));
-  assert.deepEqual(action, { type: "dormant-group", name: "worker-1" });
+  const action = planPaneRestore(pane({ paneKind: "orch", name: "worker-1", cwd: "/wt", sessionId: "xyz-1", role: "worker" }));
+  assert.deepEqual(action, { type: "dormant-group", name: "worker-1", sessionId: "xyz-1", role: "worker" });
 });
 
 test("AUTO_RESUME_AGENTS is the adopted default (the one-line all-dormant flip)", () => {
   // Guards the promise that flipping this single constant makes agents dormant.
   assert.equal(AUTO_RESUME_AGENTS, true);
+});
+
+// ---------- session id extraction (orch capture, #194.5) ----------
+
+test("sessionIdFromCommand pulls the id from --session-id or --resume (space + = forms)", () => {
+  assert.equal(sessionIdFromCommand("claude --session-id abc --model opus", null), "abc");
+  assert.equal(sessionIdFromCommand("claude --resume def", null), "def");
+  assert.equal(sessionIdFromCommand("claude --session-id=ghi", null), "ghi");
+  assert.equal(sessionIdFromCommand("claude --resume=jkl", null), "jkl");
+});
+
+test("sessionIdFromCommand falls back to argv, and is null with no session flag", () => {
+  assert.equal(sessionIdFromCommand(null, ["claude", "--session-id", "xyz"]), "xyz");
+  assert.equal(sessionIdFromCommand("claude --model opus", null), null);
+  assert.equal(sessionIdFromCommand("copilot", null), null); // copilot mints its own id later
+  assert.equal(sessionIdFromCommand(null, null), null);
+});
+
+// ---------- BUG-1: resume vs fresh when the conversation is gone ----------
+
+test("an agent whose session HAS a resumable conversation still resumes", () => {
+  const action = planPaneRestore(
+    pane({ paneKind: "agent", name: "claude", cwd: "/repo", command: "claude --session-id s1", sessionId: "s1" }),
+    (id) => id === "s1" // predicate says the transcript exists
+  );
+  assert.equal(action.type, "resume-agent");
+});
+
+test("an agent whose session has NO conversation restores FRESH, keeping its identity", () => {
+  // The BUG-1 crash: `claude --resume <id>` exits 1 ("No conversation found") when
+  // the session was never prompted. With a predicate that says the id is gone, we
+  // plan a fresh start in place — same name/cwd/CLI/id — instead of the doomed resume.
+  const action = planPaneRestore(
+    pane({ paneKind: "agent", name: "claude", cwd: "/repo", command: "claude --session-id s2", sessionId: "s2" }),
+    () => false // no transcript for any id
+  );
+  assert.deepEqual(action, {
+    type: "fresh-agent",
+    name: "claude",
+    cwd: "/repo",
+    command: "claude --session-id s2",
+    argv: null,
+    sessionId: "s2",
+  });
+});
+
+test("with NO predicate, an agent with a session id resumes (unchanged behavior)", () => {
+  const action = planPaneRestore(
+    pane({ paneKind: "agent", name: "claude", command: "claude", sessionId: "s3" })
+  );
+  assert.equal(action.type, "resume-agent");
+});
+
+test("planLayoutRestore threads the resumable predicate to every leaf", () => {
+  const tree: PersistedLayoutNode = {
+    kind: "split",
+    dir: "row",
+    weight: 1,
+    children: [
+      leaf(1, { paneKind: "agent", name: "live", command: "claude", sessionId: "here" }),
+      leaf(1, { paneKind: "agent", name: "gone", command: "claude", sessionId: "missing" }),
+    ],
+  };
+  const steps = planLayoutRestore(tree, (id) => id === "here");
+  const types = steps.map((s) => s.action.type).sort();
+  assert.deepEqual(types, ["fresh-agent", "resume-agent"], "one resumes, the missing one goes fresh");
+});
+
+test("agentFreshCommand pins the recorded id via --session-id (not --resume), stripping stale flags", () => {
+  // From a resume line — becomes a fresh-start line with the same id, so the fresh
+  // session is itself resumable next boot, and it never carries a prompt.
+  assert.deepEqual(agentFreshCommand("claude --resume old --model opus", null, "s1"), {
+    command: "claude --model opus --session-id s1",
+  });
+  // From the original launch line — the stale --session-id is replaced, not doubled.
+  assert.deepEqual(agentFreshCommand("claude --session-id old", null, "s2"), {
+    command: "claude --session-id s2",
+  });
+  // argv + bare fallbacks.
+  assert.deepEqual(agentFreshCommand(null, ["claude", "--resume", "old"], "s3"), {
+    argv: ["claude", "--session-id", "s3"],
+  });
+  assert.deepEqual(agentFreshCommand(null, null, "s4"), { command: "claude --session-id s4" });
+});
+
+test("shouldRespawnFresh: fresh-respawn only on an unexpected non-zero exit", () => {
+  assert.equal(shouldRespawnFresh({ exit_code: 1, expected: false }), true, "resume-not-found (exit 1)");
+  assert.equal(shouldRespawnFresh({ exit_code: 2, expected: false }), true, "any resume-time failure");
+  assert.equal(shouldRespawnFresh({ exit_code: 0, expected: false }), false, "clean exit — the human quit");
+  assert.equal(shouldRespawnFresh({ exit_code: 1, expected: true }), false, "loomux killed it (pane close)");
+  assert.equal(shouldRespawnFresh({ exit_code: null, expected: false }), false, "no code — signal/kill");
+});
+
+// ---------- resume command building ----------
+
+test("resume appends --resume to a plain claude command, keeping other flags", () => {
+  assert.deepEqual(agentResumeCommand("claude --dangerously-skip-permissions", null, "s1"), {
+    command: "claude --dangerously-skip-permissions --resume s1",
+  });
+});
+
+test("resume replaces a recorded --session-id (space form) rather than doubling it", () => {
+  assert.deepEqual(agentResumeCommand("claude --session-id old-id --model opus", null, "s2"), {
+    command: "claude --model opus --resume s2",
+  });
+});
+
+test("resume replaces a recorded --resume/--session-id in the `=` form too", () => {
+  assert.deepEqual(agentResumeCommand("claude --session-id=old --resume=stale", null, "s3"), {
+    command: "claude --resume s3",
+  });
+});
+
+test("resume never carries a prompt — only the launch flags plus --resume", () => {
+  // Guards the no-replay rule: whatever was recorded, the output is just the
+  // program + surviving flags + the resume id, never a queued prompt.
+  const out = agentResumeCommand("claude", null, "abc");
+  assert.equal(out.command, "claude --resume abc");
+});
+
+test("resume falls back to argv when there is no string command", () => {
+  assert.deepEqual(agentResumeCommand(null, ["claude", "--session-id", "old"], "s4"), {
+    argv: ["claude", "--resume", "s4"],
+  });
+});
+
+test("resume with neither command nor argv best-efforts a bare claude --resume", () => {
+  assert.deepEqual(agentResumeCommand(null, null, "s5"), { command: "claude --resume s5" });
 });
 
 // ---------- layout plan: reconstructible round-trip ----------
