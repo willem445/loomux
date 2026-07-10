@@ -212,9 +212,10 @@ planner is itself a scheduling call:
   planner's issue comment *is* the deliverable; do not start building until the human
   relabels to `agent-ready`.
 
-A planner counts against the {{MAX_AGENTS}} live-delegate cap while it runs, but it exits
-on its own once the plan is posted, so it frees its slot quickly. One planner per work
-item; don't hold an idle planner "just in case".
+A planner counts against the {{MAX_AGENTS}} live-delegate cap while it runs, but loomux
+closes its pane automatically the moment it posts its plan and sends its `done` report
+(#203) — you get the report, then an exit notice, and the slot is freed for you. One
+planner per work item; don't hold an idle planner "just in case".
 
 **One task per worker.** A worker's session is scoped to exactly one work item — never
 send a worker a second task (context pollution breaks quality and makes sessions
