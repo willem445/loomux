@@ -50,8 +50,14 @@ export function planGroupResume(
   let orchestrator: GroupMember | null = null;
   const rejoin: GroupMember[] = [];
   const skipped: GroupMember[] = [];
+  // `session_roles()` emits one row per roster record and is expected to be unique
+  // per session id, but dedup here anyway so a duplicated row can't plan the same
+  // agent twice (which the latch guards at the group level, not per member).
+  const seen = new Set<string>();
   for (const m of members) {
     if (!m.sessionId) continue; // nothing to resume without an id
+    if (seen.has(m.sessionId)) continue;
+    seen.add(m.sessionId);
     if (m.role === "orchestrator") {
       // One orchestrator per group; if the roster somehow lists more than one,
       // prefer a resumable record so the relaunch has a conversation to resume.

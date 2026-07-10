@@ -64,6 +64,12 @@ test("members without a session id are ignored", () => {
   assert.deepEqual(plan.skipped, []);
 });
 
+test("a duplicated session id is planned only once (belt-and-braces dedup)", () => {
+  const members = [m("orch", "orchestrator"), m("w1", "worker"), m("w1", "worker")];
+  const plan = planGroupResume(members, () => true);
+  assert.deepEqual(plan.rejoin.map((x) => x.sessionId), ["w1"], "the duplicate row is dropped");
+});
+
 test("with duplicate orchestrator records, a resumable one wins", () => {
   const members = [m("dead", "orchestrator"), m("alive", "orchestrator")];
   const plan = planGroupResume(members, (id) => id === "alive");
