@@ -50,7 +50,6 @@ import { AuditView } from "./auditview";
 import { GroupView } from "./groupview";
 import { clampOverlayHeight, OVERLAY_MIN_H } from "./overlaysize";
 import { FileEditView } from "./fileedit";
-import type { ShellKind } from "./panesetup";
 import type { PersistedPane, PersistedPaneKind } from "./tabstore";
 
 // Inline icons so the toolbar renders identically regardless of installed
@@ -165,11 +164,6 @@ export interface PaneOptions {
    *  orch-spawn-request path sets it. Grid.openPane resolves the actual
    *  decision — an empty grid still focuses regardless (see panefocus.ts). */
   background?: boolean;
-  /** Terminal shell kind (Git Bash / cmd / PowerShell, #194). Retained on the
-   *  pane so a live terminal can be captured into the persisted layout for
-   *  session restore. The backend spawn plumbing that acts on it lands in the
-   *  shell-kinds phase; here it is record-only. */
-  shellKind?: ShellKind;
   /** Recorded resumable agent session id (#194): so a restored Agent pane can
    *  `--resume <id>` back into its prior context (resuming into an idle TUI
    *  costs nothing until a prompt is sent). Set by the launcher for
