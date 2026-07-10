@@ -75,7 +75,17 @@ test("captured-set in == planned-set out — a large historical roster is IRRELE
 test("no orchestrator in the roster → null (the caller falls back to the session browser)", () => {
   const plan = planGroupResume([m("w1", "worker")], () => true);
   assert.equal(plan.orchestrator, null);
+  assert.equal(plan.orchestratorUnresumable, false, "there was no orchestrator at all");
   assert.deepEqual(plan.rejoin.map((x) => x.sessionId), ["w1"]);
+});
+
+test("a stale orchestrator (no transcript) is gated too → null + unresumable flag, not a dead pane", () => {
+  // The orchestrator gets the same transcript check as delegates: if its own
+  // session can't resume, the group can't relaunch cleanly, so the caller falls
+  // back to the browser instead of resuming into a dead orchestrator pane.
+  const plan = planGroupResume([m("orch", "orchestrator"), m("w1", "worker")], (id) => id !== "orch");
+  assert.equal(plan.orchestrator, null, "not planned — its session is gone");
+  assert.equal(plan.orchestratorUnresumable, true, "flagged so the caller can say why");
 });
 
 test("members without a session id are ignored", () => {

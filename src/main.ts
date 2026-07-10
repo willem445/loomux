@@ -580,12 +580,19 @@ async function resumeDormantGroup(ws: Workspace): Promise<void> {
     // placeholders, one per orch pane that was live at close, each carrying its own
     // session id + role. This is the fix for the over-restore regression: the set
     // comes from what was captured, NEVER expanded by session_roles().
-    const captured = ws.grid
+    const orchRecords = ws.grid
       .allPanes()
       .filter((p) => p.isDormant && p.dormantKind === "orch")
       .map((p) => p.restoreRecord)
-      .filter((r): r is PersistedPane => r !== null && r.sessionId !== null)
+      .filter((r): r is PersistedPane => r !== null);
+    const captured = orchRecords
+      .filter((r) => r.sessionId !== null)
       .map((r) => ({ sessionId: r.sessionId as string, role: r.role ?? "worker" }));
+    // Captured members with no resumable id (e.g. a copilot delegate — copilot
+    // mints its own session id after boot, so there's nothing to --resume). They
+    // can't be brought back, but they WERE live at close, so they're counted in the
+    // skip toast below rather than silently dropped from the tally.
+    const idlessCount = orchRecords.length - captured.length;
 
     if (captured.length === 0) {
       // No captured orch session ids (a group captured before per-pane session
@@ -609,7 +616,14 @@ async function resumeDormantGroup(ws: Workspace): Promise<void> {
     const plan = planGroupResume(captured, (sid) => (seenAny ? resumableIds.has(sid) : true));
 
     if (!plan.orchestrator) {
-      showToast("No captured orchestrator session for this group — open the session browser.", "info");
+      // A stale orchestrator (transcript gone) is gated the same way delegates are:
+      // fall back to the browser rather than relaunch into a dead orchestrator pane.
+      showToast(
+        plan.orchestratorUnresumable
+          ? "This group's orchestrator session has no saved conversation to resume — open the session browser."
+          : "No captured orchestrator session for this group — open the session browser.",
+        "info"
+      );
       sessions.toggle();
       return;
     }
@@ -641,12 +655,14 @@ async function resumeDormantGroup(ws: Workspace): Promise<void> {
         showToast(`Couldn't rejoin a ${member.role}: ${String(err)}`, "info");
       }
     }
-    // 3. Report members we can't bring back (no transcript → would be a dead pane;
-    //    the orchestrator can respawn a fresh one).
-    if (plan.skipped.length > 0) {
-      const n = plan.skipped.length;
+    // 3. Report members we can't bring back — a captured delegate with no
+    //    transcript (would be a dead pane) OR one with no resumable id at all (a
+    //    copilot delegate). Both were live at close; count them together so the
+    //    tally reflects every captured member left behind, not a silent subset.
+    const notRestored = plan.skipped.length + idlessCount;
+    if (notRestored > 0) {
       showToast(
-        `${n} idle agent${n === 1 ? "" : "s"} had no saved conversation and ${n === 1 ? "was" : "were"} not restored — the orchestrator can respawn ${n === 1 ? "it" : "them"}.`,
+        `${notRestored} idle agent${notRestored === 1 ? "" : "s"} had no saved conversation and ${notRestored === 1 ? "was" : "were"} not restored — the orchestrator can respawn ${notRestored === 1 ? "it" : "them"}.`,
         "info"
       );
     }

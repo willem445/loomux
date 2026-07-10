@@ -302,10 +302,15 @@ resumed into its idle TUI; same number of panes out as were captured in. **What
 does NOT (stated, not silent):** a captured delegate that was never prompted has no
 transcript, so `--resume` would fail and strand a dead pane, and the frontend can't
 spawn a fresh *group-registered* worker (only the orchestrator spawns delegates).
-Those members are reported via toast and skipped; the orchestrator can respawn a
-fresh one on demand once it's live. Pane **positions** within the tab are also
-approximate — the orchestrator and rejoining workers lay out as they arrive (a
-fresh group layout), not the exact captured split; the tab, sessions, and roster
+Those members — plus any captured member with **no resumable id at all** (a copilot
+delegate: copilot mints its own id after boot, so there's nothing to `--resume`) —
+are counted together in the skip toast and left behind; the orchestrator can respawn
+a fresh one on demand once it's live. The **orchestrator itself** is gated on the
+same transcript predicate (`planGroupResume` → `orchestratorUnresumable`): a stale
+orchestrator session doesn't relaunch into a dead pane — the whole resume falls back
+to the session browser with a specific message. Pane **positions** within the tab
+are also approximate — the orchestrator and rejoining workers lay out as they arrive
+(a fresh group layout), not the exact captured split; the tab, sessions, and roster
 are what's preserved.
 
 **BUG-2 — decline crashed with "no active workspace".** The restore splash is

@@ -36,6 +36,13 @@ export interface GroupMember {
  *  session id — one click, one plan for the whole set. */
 export interface GroupResumePlan {
   orchestrator: GroupMember | null;
+  /** True when a captured orchestrator EXISTS but its own session has no
+   *  transcript to resume. The whole group can't be relaunched cleanly (a
+   *  `--resume` of a deleted orchestrator conversation lands in a dead pane), so
+   *  the caller falls back to the session browser instead — the same honest
+   *  degradation delegates get, applied to the orchestrator (#194.5). Distinct
+   *  from "no orchestrator captured at all" (both → browser, but different copy). */
+  orchestratorUnresumable: boolean;
   rejoin: GroupMember[];
   skipped: GroupMember[];
 }
@@ -47,26 +54,34 @@ export function planGroupResume(
   members: readonly GroupMember[],
   resumable: (sessionId: string) => boolean
 ): GroupResumePlan {
-  let orchestrator: GroupMember | null = null;
+  let orchRecord: GroupMember | null = null;
   const rejoin: GroupMember[] = [];
   const skipped: GroupMember[] = [];
-  // `session_roles()` emits one row per roster record and is expected to be unique
-  // per session id, but dedup here anyway so a duplicated row can't plan the same
-  // agent twice (which the latch guards at the group level, not per member).
+  // Members are expected to be unique per session id, but dedup here anyway so a
+  // duplicated record can't plan the same agent twice (the latch guards at the
+  // group level, not per member).
   const seen = new Set<string>();
   for (const m of members) {
     if (!m.sessionId) continue; // nothing to resume without an id
     if (seen.has(m.sessionId)) continue;
     seen.add(m.sessionId);
     if (m.role === "orchestrator") {
-      // One orchestrator per group; if the roster somehow lists more than one,
-      // prefer a resumable record so the relaunch has a conversation to resume.
-      if (!orchestrator || (!resumable(orchestrator.sessionId) && resumable(m.sessionId))) {
-        orchestrator = m;
+      // One orchestrator per group; if more than one is captured, prefer a
+      // resumable record so the relaunch has a conversation to resume.
+      if (!orchRecord || (!resumable(orchRecord.sessionId) && resumable(m.sessionId))) {
+        orchRecord = m;
       }
       continue;
     }
     (resumable(m.sessionId) ? rejoin : skipped).push(m);
   }
-  return { orchestrator, rejoin, skipped };
+  // Gate the orchestrator on the transcript predicate too — a stale orchestrator
+  // session shouldn't relaunch into a dead pane.
+  let orchestrator: GroupMember | null = null;
+  let orchestratorUnresumable = false;
+  if (orchRecord) {
+    if (resumable(orchRecord.sessionId)) orchestrator = orchRecord;
+    else orchestratorUnresumable = true;
+  }
+  return { orchestrator, orchestratorUnresumable, rejoin, skipped };
 }
