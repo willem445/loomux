@@ -26,6 +26,16 @@ const KEY_REPOS = "loomux.recentRepos";
 const KEY_AUTOPILOT = "loomux.singlePaneAutopilot";
 const MAX_RECENT_REPOS = 8;
 
+// One-time cleanup (#194): the removed agents-mode toggle left this key behind in
+// every existing profile. Drop it on load so stale profiles don't carry it
+// forever. Guarded because this module is also imported by DOM-free unit tests
+// (no localStorage in Node).
+try {
+  localStorage.removeItem("loomux.agentMode");
+} catch {
+  /* no localStorage (unit-test / SSR context) — nothing to clean */
+}
+
 /** Interpret a persisted autopilot value. Default ON (#101): only an explicit
  *  "0" is off, so an absent or unrecognized value stays on. Pure so the
  *  default-ON semantics are unit-testable without a localStorage shim. */

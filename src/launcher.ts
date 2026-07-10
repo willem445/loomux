@@ -18,7 +18,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { gitWorktreeAdd } from "./git";
 import type { OrchestratorConfig } from "./orchestration";
 import type { PaneKind, PaneSetupInput, ShellKind } from "./panesetup";
-import { planPaneSetup, worktreeNameFor } from "./panesetup";
+import { planPaneSetup, worktreeNameFor, SubmitLatch } from "./panesetup";
 import {
   AGENTS,
   addRecentRepo,
@@ -252,7 +252,11 @@ export class WelcomeForm {
   private submitBtn: HTMLButtonElement;
   /** True once the user hand-edits the pane name; stops auto-fill. */
   private nameDirty = false;
-  private busy = false;
+  /** One-shot re-entrancy guard across submit's async gaps (rev-74 HIGH-1): a
+   *  double-click / Enter-repeat can't spawn a duplicate group or double-start a
+   *  pane. Released on a validation error (retry allowed), finished once the
+   *  result fires (the pane is being converted/retired). */
+  private latch = new SubmitLatch();
 
   constructor() {
     this.el = document.createElement("div");
@@ -327,6 +331,10 @@ export class WelcomeForm {
     this.repoInput.className = "dlg-input";
     this.repoInput.placeholder = "Repository or folder — empty for home";
     this.repoInput.spellcheck = false;
+    // The pane routes its initial (and keyboard-nav) focus here (Pane.focus →
+    // this marker) rather than the Kind select, so a welcome pane is ready for a
+    // path the moment it opens (rev-74 LOW-4/LOW-6).
+    this.repoInput.setAttribute("data-initial-focus", "");
     this.repoList = document.createElement("datalist");
     this.repoList.id = "welcome-recent-repos";
     this.repoInput.setAttribute("list", this.repoList.id);
@@ -510,11 +518,6 @@ export class WelcomeForm {
 
   private get kind(): PaneKind {
     return this.kindSel.value as PaneKind;
-  }
-
-  /** Focus the first useful control (repository, or the shell for a terminal). */
-  focusInitial(): void {
-    (this.kind === "terminal" ? this.shellSel : this.repoInput).focus();
   }
 
   /** Show/hide fields for the selected kind. */
@@ -726,26 +729,32 @@ export class WelcomeForm {
   }
 
   private async submit(): Promise<void> {
-    if (this.busy) return;
-    // Static validation + shaping first (pure, tested).
+    // Re-entrancy guard FIRST — before any await — so a double-click / Enter
+    // auto-repeat / impatient second click during the probe/launch gaps can't
+    // run a second submit and duplicate the launch (rev-74 HIGH-1). A validation
+    // error releases it (retry allowed); a fired result finishes it (one-shot).
+    if (!this.latch.begin()) return;
+    // Static validation + shaping (pure, tested).
     const res = planPaneSetup(this.collectInput());
     if (!res.ok) {
       this.showError(res.error);
       if (res.focus === "repo") this.repoInput.focus();
       else if (res.focus === "custom") this.customInput.focus();
       else if (res.focus === "count") this.countInput.focus();
+      this.latch.release();
       return;
     }
     const plan = res.plan;
 
     if (plan.kind === "terminal") {
+      // Defensive: only Phase-1-ready shell kinds actually spawn a distinct shell;
+      // a not-yet-wired kind (a future non-UI caller — the UI disables them) falls
+      // back to PowerShell so the pane name can't misdescribe what spawned.
+      const ready = SHELL_KINDS.find((s) => s.key === plan.shellKind)?.ready;
+      const shellKind: ShellKind = ready ? plan.shellKind : "powershell";
       if (plan.cwd) addRecentRepo(plan.cwd);
-      this.onSubmit?.({
-        kind: "terminal",
-        name: plan.name,
-        cwd: plan.cwd ?? undefined,
-        shellKind: plan.shellKind,
-      });
+      this.setBusy(true, "Starting…");
+      this.fire({ kind: "terminal", name: plan.name, cwd: plan.cwd ?? undefined, shellKind });
       return;
     }
 
@@ -753,10 +762,13 @@ export class WelcomeForm {
     // pane just flashes the shell's error and dies. In orchestrator mode every
     // role can run a different CLI, so check each distinct one.
     if (plan.kind === "orchestrator") {
+      this.setBusy(true, "Launching…");
       for (const id of this.orchProgramsToCheck()) {
         const p = await this.probe(id);
         if (!p.available) {
           this.showError(p.error ?? `'${id}' was not found on PATH.`);
+          this.setBusy(false);
+          this.latch.release();
           return;
         }
       }
@@ -772,7 +784,7 @@ export class WelcomeForm {
       const worker = role("worker");
       const reviewer = role("reviewer");
       const planner = role("planner");
-      this.onSubmit?.({
+      this.fire({
         kind: "orchestrator",
         config: {
           repo: plan.repo,
@@ -798,11 +810,14 @@ export class WelcomeForm {
     }
 
     // agent kind
+    this.setBusy(true, "Starting…");
     const program = plan.command.split(/\s+/)[0]?.toLowerCase();
     if (program) {
       const p = await this.probe(program);
       if (!p.available) {
         this.showError(p.error ?? `'${program}' was not found on PATH.`);
+        this.setBusy(false);
+        this.latch.release();
         return;
       }
     }
@@ -819,7 +834,7 @@ export class WelcomeForm {
       if (flags) command = `${command} ${flags}`;
     }
 
-    this.setBusy(true);
+    this.setBusy(true, "Creating worktree…");
     this.hideError();
     try {
       const specs: AgentLaunchSpec[] = [];
@@ -838,17 +853,27 @@ export class WelcomeForm {
       setDefaultAgent(plan.isCustom ? "custom" : this.agentSel.value);
       if (plan.isCustom) setCustomCommand(command);
       if (plan.repo) addRecentRepo(plan.repo);
-      this.onSubmit?.({ kind: "panes", specs });
+      this.fire({ kind: "panes", specs });
     } catch (err) {
       this.showError(String(err));
       this.setBusy(false);
+      this.latch.release();
     }
   }
 
-  private setBusy(busy: boolean): void {
-    this.busy = busy;
+  /** Deliver the one submit result and permanently close the latch, so no late
+   *  re-entry into `submit()` can fire a second time (rev-74 HIGH-1). `onSubmit`
+   *  is also nulled as belt-and-suspenders. */
+  private fire(result: WelcomeResult): void {
+    const cb = this.onSubmit;
+    this.onSubmit = null;
+    this.latch.finish();
+    cb?.(result);
+  }
+
+  private setBusy(busy: boolean, label?: string): void {
     this.submitBtn.disabled = busy;
-    this.submitBtn.textContent = busy ? "Creating worktree…" : "Create";
+    this.submitBtn.textContent = busy ? label ?? "Working…" : "Create";
   }
 
   private showError(msg: string): void {

@@ -682,10 +682,14 @@ export class Pane implements VoiceTargetPane {
     return this.welcomeEl !== null;
   }
 
-  /** Focus the first control of the welcome form (harmless on a hidden tab —
-   *  focusing an element in a `display:none` subtree is a no-op). */
+  /** Focus the welcome form's preferred initial control (its `data-initial-focus`
+   *  marker — the repository field — falling back to the first focusable). Harmless
+   *  on a hidden tab: focusing inside a `display:none` subtree is a no-op. */
   focusWelcome(): void {
-    this.welcomeEl?.querySelector<HTMLElement>("select, input, button")?.focus();
+    const el =
+      this.welcomeEl?.querySelector<HTMLElement>("[data-initial-focus]") ??
+      this.welcomeEl?.querySelector<HTMLElement>("select, input, button");
+    el?.focus();
   }
 
   /** Convert a welcome pane into a real terminal: tear down the setup surface and
@@ -1391,6 +1395,14 @@ export class Pane implements VoiceTargetPane {
   }
 
   focus(): void {
+    // A setup-state pane has no terminal; route focus into its welcome form so
+    // keyboard nav (Alt+arrow), window-refocus (main.ts), and dock-restore land
+    // on a usable control instead of no-op'ing on an unopened terminal (rev-74
+    // LOW-6). `isWelcome` is null once the pane becomes a real terminal.
+    if (this.isWelcome) {
+      this.focusWelcome();
+      return;
+    }
     this.term.focus();
   }
 

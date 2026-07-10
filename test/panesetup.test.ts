@@ -8,6 +8,7 @@ import {
   planPaneSetup,
   pathTail,
   worktreeNameFor,
+  SubmitLatch,
   type PaneSetupInput,
 } from "../src/panesetup.ts";
 
@@ -152,4 +153,31 @@ test("worktreeNameFor keeps a single name but fans out a fleet", () => {
   assert.equal(worktreeNameFor("fix-auth", 1, 1), "fix-auth");
   assert.equal(worktreeNameFor("fix-auth", 1, 3), "fix-auth-1");
   assert.equal(worktreeNameFor("fix-auth", 3, 3), "fix-auth-3");
+});
+
+// ---------- submit latch (rev-74 HIGH-1: no duplicate launches) ----------
+
+test("SubmitLatch admits only the first of concurrent begins", () => {
+  const latch = new SubmitLatch();
+  assert.equal(latch.begin(), true); // first click enters
+  assert.equal(latch.begin(), false); // double-click / Enter-repeat is rejected
+  assert.equal(latch.begin(), false); // …and every further re-entry while in flight
+});
+
+test("SubmitLatch reopens after a validation error so the user can retry", () => {
+  const latch = new SubmitLatch();
+  assert.equal(latch.begin(), true);
+  latch.release(); // planPaneSetup returned an error; allow a fixed retry
+  assert.equal(latch.settled, false);
+  assert.equal(latch.begin(), true); // retry admitted
+});
+
+test("SubmitLatch is one-shot once a submit finishes", () => {
+  const latch = new SubmitLatch();
+  assert.equal(latch.begin(), true);
+  latch.finish(); // onSubmit fired — the pane is being converted/retired
+  assert.equal(latch.settled, true);
+  assert.equal(latch.begin(), false); // a late re-entry must never fire again
+  latch.release(); // even an errant release can't reopen a finished latch
+  assert.equal(latch.begin(), false);
 });

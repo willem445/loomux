@@ -73,6 +73,50 @@ export type PaneSetupResult =
   | { ok: true; plan: PaneSetupPlan }
   | { ok: false; error: string; focus?: PaneSetupFocus };
 
+/** A one-shot, re-entrancy-proof latch for the welcome form's async submit
+ *  (#194 rev-74 HIGH-1). The form's `submit()` spans `await`s (CLI probe,
+ *  worktree creation, group launch) during which the form stays rendered and
+ *  enabled; a double-click, Enter auto-repeat, or an impatient second click
+ *  would otherwise run `submit()` again and spawn a duplicate group / a second
+ *  PTY on the same pane. Pure + stateful so the double-fire semantics are
+ *  unit-testable without a DOM:
+ *
+ *   - `begin()` returns true only for the FIRST caller; every concurrent caller
+ *     gets false while a submit is in flight.
+ *   - `release()` re-opens the latch after a validation error (the user fixes
+ *     the field and retries).
+ *   - `finish()` closes it permanently once a submit has actually fired its
+ *     result — the form's pane is being converted/retired, so it must never
+ *     fire again even if some late event re-enters `submit()`. */
+export class SubmitLatch {
+  private inFlight = false;
+  private done = false;
+
+  /** Try to enter the critical section. True only if no submit is in flight and
+   *  none has already finished. */
+  begin(): boolean {
+    if (this.inFlight || this.done) return false;
+    this.inFlight = true;
+    return true;
+  }
+
+  /** Abandon the in-flight submit (validation failed) — a retry is allowed. */
+  release(): void {
+    this.inFlight = false;
+  }
+
+  /** Mark the submit permanently done — no further submit will be admitted. */
+  finish(): void {
+    this.inFlight = false;
+    this.done = true;
+  }
+
+  /** Whether a submit has already fired its result (one-shot spent). */
+  get settled(): boolean {
+    return this.done;
+  }
+}
+
 const clampCount = (n: number): number =>
   Number.isFinite(n) ? Math.min(AGENT_MAX, Math.max(AGENT_MIN, Math.trunc(n))) : AGENT_MIN;
 
