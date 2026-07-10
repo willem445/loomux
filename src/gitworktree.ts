@@ -102,33 +102,54 @@ export function findWorktree(worktrees: Worktree[], path: string | null): Worktr
 export interface Resolution {
   /** The worktree whose working dir the view runs git against. */
   active: Worktree | null;
-  /** The selection to keep, normalized: null once we're on the primary, so a
-   *  refresh doesn't keep re-reporting the same fall-back. */
+  /** The selection to persist: the honored explicit choice, or null when there
+   *  is none / we failed soft — so a refresh doesn't keep re-reporting a
+   *  fall-back and, with no explicit choice, the view follows the pane. */
   selected: string | null;
   /** True when the requested selection was gone and we dropped to primary — the
    *  caller surfaces a one-time message. */
   fellBack: boolean;
 }
 
-/** Decide which worktree the view is pointed at. `selectedPath` is the path the
- *  user last chose (null = primary). If that worktree is still listed we honor
- *  it; if it was pruned/removed we fail soft back to the primary and flag it.
- *  Selecting the primary explicitly collapses to `selected: null` so the state
- *  is always canonical. */
+/** Decide which worktree the view is pointed at.
+ *
+ *  `selectedPath` is the path the user explicitly chose via the chip, or null
+ *  when they haven't chosen. An explicit choice wins and is honored (even the
+ *  primary — so it sticks over the pane-follow default below); if that worktree
+ *  is no longer listed (pruned/removed) we fail soft back to the primary and
+ *  flag it.
+ *
+ *  With no explicit choice, the view **follows the pane** — it defaults to the
+ *  worktree containing `paneToplevel` (the pane cwd's `--show-toplevel`). This
+ *  is #208's headline case: opening the git view from an agent-worktree pane
+ *  must show THAT worktree, not the porcelain-first main checkout. When the pane
+ *  cwd isn't inside any listed worktree, fall back to the primary. */
 export function resolveSelection(
   worktrees: Worktree[],
-  selectedPath: string | null
+  selectedPath: string | null,
+  paneToplevel: string | null = null
 ): Resolution {
   const primary = primaryWorktree(worktrees);
-  if (selectedPath === null) {
-    return { active: primary, selected: null, fellBack: false };
+  if (selectedPath !== null) {
+    const match = findWorktree(worktrees, selectedPath);
+    if (match) {
+      return { active: match, selected: match.path, fellBack: false };
+    }
+    // The chosen worktree is gone: canonicalize to primary and flag it.
+    return { active: primary, selected: null, fellBack: true };
   }
-  const match = findWorktree(worktrees, selectedPath);
-  if (!match || match.primary) {
-    // Gone, or the user re-picked the primary: canonicalize to primary.
-    return { active: primary, selected: null, fellBack: match === null };
-  }
-  return { active: match, selected: match.path, fellBack: false };
+  // No explicit choice — follow the worktree the pane sits in.
+  const paneWt = findWorktree(worktrees, paneToplevel);
+  return { active: paneWt ?? primary, selected: null, fellBack: false };
+}
+
+/** True when a backend git error means the working directory it was run in no
+ *  longer exists — i.e. a worktree deleted without `git worktree remove`/prune.
+ *  Git 2.29 (this project's baseline) emits no `prunable` porcelain marker for
+ *  that case, so this runtime signal is the only reliable one. Mirrors the
+ *  message `run_git` returns from its `is_dir` guard in `src-tauri/src/git.rs`. */
+export function isMissingDir(err: unknown): boolean {
+  return /no such directory/i.test(String(err));
 }
 
 /** A short label for the selector chip / menu: the worktree's folder name. */

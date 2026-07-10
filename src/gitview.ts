@@ -33,7 +33,9 @@ import {
 } from "./git";
 import {
   parseWorktrees,
+  primaryWorktree,
   resolveSelection,
+  isMissingDir,
   worktreeLabel,
   normalizePath,
   type Worktree,
@@ -207,9 +209,11 @@ export class GitView {
   readonly el: HTMLElement;
 
   // `repoRoot` is the directory git commands run against — the primary repo, or
-  // the selected worktree's working dir (#208). `primaryRoot` is always the
-  // pane's main repo, used to enumerate worktrees and to fall back to. A
-  // worktree is selected by its path (`selectedWorktree`); null = primary.
+  // a selected worktree's working dir (#208). `primaryRoot` is the repo's MAIN
+  // working tree (the porcelain-first `git worktree list` entry), used to key
+  // repo identity and to fall back to — NOT the pane's `--show-toplevel`, which
+  // is the pane's own (possibly linked) worktree. `selectedWorktree` is an
+  // explicit chip choice by path; null means "follow the pane's worktree".
   private repoRoot: string | null = null;
   private primaryRoot: string | null = null;
   private worktrees: Worktree[] = [];
@@ -453,6 +457,19 @@ export class GitView {
 
   // ---------- data ----------
 
+  /** Point the view at `root` (primary or a worktree). Resets the graph/diff
+   *  view state only when the root actually changed — the worktree *selection*
+   *  itself is owned by the caller and left untouched. */
+  private pointViewAt(root: string): void {
+    if (root === this.repoRoot) return;
+    this.repoRoot = root;
+    this.commits = [];
+    this.selection = { kind: "working" };
+    this.selectedFile = null;
+    this.limit = LOG_STEP;
+    this.firstOpen = true;
+  }
+
   private async refresh(): Promise<void> {
     if (this.disposed) return;
     if (this.refreshing) {
@@ -467,9 +484,12 @@ export class GitView {
         this.setBlank("Waiting for the shell to report its folder…");
         return;
       }
-      let primary: string | null;
+      // The pane's own top level. Inside a linked worktree this is that
+      // worktree, not the main checkout — so it's the view's default target,
+      // not the repo identity (see below).
+      let paneTop: string | null;
       try {
-        primary = await gitRepoRoot(cwd);
+        paneTop = await gitRepoRoot(cwd);
       } catch (err) {
         this.setBlank(
           String(err) === "git-not-found"
@@ -478,33 +498,37 @@ export class GitView {
         );
         return;
       }
-      if (!primary) {
+      if (!paneTop) {
         this.setBlank(`Not a git repository:\n${cwd}`);
         return;
       }
-      if (primary !== this.primaryRoot) {
-        // Entered a different repo: drop the worktree selection with the rest.
-        this.primaryRoot = primary;
-        this.selectedWorktree = null;
-        this.worktrees = [];
-      }
 
-      // Enumerate the worktree set from the primary and settle on which one the
-      // view is pointed at. A pruned/removed selection fails soft back to the
-      // primary (#208). Enumeration failing (very old git, etc.) degrades to
-      // primary-only rather than breaking the whole view.
+      // Enumerate the worktree set from the pane's tree (any member lists them
+      // all). The MAIN working tree — the porcelain-first entry — is the repo's
+      // stable identity and fall-back, so cd'ing between a repo's own worktrees
+      // (same set) never counts as changing repos. Enumeration failing (very
+      // old git, etc.) degrades to primary-only rather than breaking the view.
       try {
-        this.worktrees = parseWorktrees(await gitWorktreeList(primary));
+        this.worktrees = parseWorktrees(await gitWorktreeList(paneTop));
       } catch {
         this.worktrees = [];
       }
       if (this.disposed) return;
-      // Only reconcile the selection against a real listing. An empty result
-      // means enumeration failed (or an unusual git) — keep the selection and
-      // just view the primary this pass, rather than dropping it on a blip.
+      const primary = primaryWorktree(this.worktrees)?.path ?? paneTop;
+      if (primary !== this.primaryRoot) {
+        // Entered a different repo: drop the worktree selection with the rest.
+        this.primaryRoot = primary;
+        this.selectedWorktree = null;
+      }
+
+      // Settle on which worktree the view targets. With no explicit chip choice
+      // the view follows the pane (paneTop); an explicit choice wins and fails
+      // soft to primary if it was pruned/removed. An empty listing means
+      // enumeration failed — keep the selection and just view the primary this
+      // pass, rather than dropping it on a blip.
       let root = primary;
       if (this.worktrees.length > 0) {
-        const res = resolveSelection(this.worktrees, this.selectedWorktree);
+        const res = resolveSelection(this.worktrees, this.selectedWorktree, paneTop);
         if (res.fellBack && this.selectedWorktree !== null) {
           this.toast("Selected worktree is gone — showing the primary repo.");
         }
@@ -512,21 +536,26 @@ export class GitView {
         if (res.active) root = res.active.path;
       }
 
-      if (root !== this.repoRoot) {
-        // Entered a different worktree (or repo): reset the graph/diff view
-        // state, but keep the worktree selection itself.
-        this.repoRoot = root;
-        this.commits = [];
-        this.selection = { kind: "working" };
-        this.selectedFile = null;
-        this.limit = LOG_STEP;
-        this.firstOpen = true;
-      }
+      this.pointViewAt(root);
 
-      const [commits, status] = await Promise.all([
-        gitLog(root, this.limit),
-        gitStatus(root),
-      ]);
+      let commits: CommitInfo[];
+      let status: GitStatus;
+      try {
+        [commits, status] = await Promise.all([gitLog(root, this.limit), gitStatus(root)]);
+      } catch (err) {
+        // A selected worktree whose directory was deleted without git knowing
+        // (manual rm -rf, crashed teardown) is still listed — resolveSelection
+        // can't see that, so the git call is the first to notice ("no such
+        // directory"). Fail soft to the primary here (#208 review). Any other
+        // error propagates to the outer catch as a toast.
+        const offPrimary = normalizePath(root) !== normalizePath(primary);
+        if (!offPrimary || !isMissingDir(err)) throw err;
+        this.toast("Selected worktree is gone — showing the primary repo.");
+        this.selectedWorktree = null;
+        root = primary;
+        this.pointViewAt(root);
+        [commits, status] = await Promise.all([gitLog(root, this.limit), gitStatus(root)]);
+      }
       if (this.disposed) return;
       this.commits = commits;
       this.status = status;
@@ -897,15 +926,18 @@ export class GitView {
       const name = w.primary ? `${worktreeLabel(w)} (primary)` : worktreeLabel(w);
       const detail = w.bare
         ? "  (bare)"
-        : w.branch
-          ? `  ${w.branch}`
-          : w.detached
-            ? "  (detached)"
-            : "";
+        : w.prunable
+          ? "  (missing)"
+          : w.branch
+            ? `  ${w.branch}`
+            : w.detached
+              ? "  (detached)"
+              : "";
       items.push({
-        // A bare tree has no working copy to inspect — list it, but disabled.
+        // A bare tree has no working copy to inspect; a prunable one's dir is
+        // already gone (git ≥ 2.31 flags it) — list both, but disabled.
         label: `${isActive ? "● " : "  "}${name}${detail}`,
-        disabled: isActive || w.bare,
+        disabled: isActive || w.bare || w.prunable,
         onClick: () => this.selectWorktree(w),
       });
     }
@@ -913,9 +945,11 @@ export class GitView {
     showMenu(r.left, r.bottom + 3, items);
   }
 
-  /** Point the view at `w` (primary → clear the selection) and refresh. */
+  /** Record `w` as the explicit selection and refresh. Always store the path —
+   *  including the primary — because a null selection means "follow the pane's
+   *  worktree", which for a pane inside a linked worktree is NOT the primary. */
   private selectWorktree(w: Worktree): void {
-    this.selectedWorktree = w.primary ? null : w.path;
+    this.selectedWorktree = w.path;
     void this.refresh();
   }
 

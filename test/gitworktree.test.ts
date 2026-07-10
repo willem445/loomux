@@ -12,7 +12,11 @@ import {
   findWorktree,
   worktreeLabel,
   normalizePath,
+  isMissingDir,
 } from "../src/gitworktree.ts";
+
+const MAIN = "C:/Projects/loomux";
+const LINKED = "C:/Projects/loomux-worktrees/feat/208";
 
 // A representative `git worktree list --porcelain` dump: main on a branch, a
 // linked worktree on a slashed branch, a detached one, and a locked one.
@@ -91,44 +95,63 @@ test("empty output yields no worktrees and a null primary", () => {
   assert.equal(primaryWorktree([]), null);
 });
 
-test("resolveSelection: null selection points at the primary", () => {
+test("resolveSelection: no selection + pane in the main tree points at the primary", () => {
   const wts = parseWorktrees(SAMPLE);
-  const r = resolveSelection(wts, null);
+  const r = resolveSelection(wts, null, MAIN);
   assert.equal(r.active, wts[0]);
   assert.equal(r.selected, null);
   assert.equal(r.fellBack, false);
 });
 
-test("resolveSelection: an existing selection is honored", () => {
+test("resolveSelection: no selection + pane INSIDE a linked worktree defaults to THAT worktree (#208 headline)", () => {
   const wts = parseWorktrees(SAMPLE);
-  const r = resolveSelection(wts, "C:/Projects/loomux-worktrees/feat/208");
+  // The pane cd'd into the agent worktree; with no explicit choice the view
+  // must follow the pane, not fall back to the porcelain-first main checkout.
+  const r = resolveSelection(wts, null, LINKED);
   assert.equal(r.active, wts[1]);
-  assert.equal(r.selected, "C:/Projects/loomux-worktrees/feat/208");
+  assert.equal(r.active?.primary, false);
+  assert.equal(r.selected, null); // still "follow the pane", not pinned
   assert.equal(r.fellBack, false);
 });
 
-test("resolveSelection: matches across separator and case differences", () => {
+test("resolveSelection: pane-follow matches across separator and case differences", () => {
   const wts = parseWorktrees(SAMPLE);
-  // Same worktree, back-slashed and upper-cased — still resolves to it.
-  const r = resolveSelection(wts, "C:\\PROJECTS\\loomux-worktrees\\feat\\208");
+  const r = resolveSelection(wts, null, "C:\\PROJECTS\\loomux-worktrees\\feat\\208");
   assert.equal(r.active, wts[1]);
+});
+
+test("resolveSelection: no selection + pane cwd not in any worktree falls back to primary", () => {
+  const wts = parseWorktrees(SAMPLE);
+  const r = resolveSelection(wts, null, "C:/somewhere/unrelated");
+  assert.equal(r.active, wts[0]);
   assert.equal(r.fellBack, false);
 });
 
-test("resolveSelection: a pruned selection fails soft back to primary", () => {
+test("resolveSelection: an explicit selection is honored", () => {
   const wts = parseWorktrees(SAMPLE);
-  const r = resolveSelection(wts, "C:/Projects/loomux-worktrees/deleted");
+  const r = resolveSelection(wts, LINKED, MAIN);
+  assert.equal(r.active, wts[1]);
+  assert.equal(r.selected, LINKED);
+  assert.equal(r.fellBack, false);
+});
+
+test("resolveSelection: an explicit selection overrides the pane-follow default", () => {
+  const wts = parseWorktrees(SAMPLE);
+  // Pane sits in the linked worktree, but the user pinned the primary — the
+  // explicit choice wins and must stick (stored, not canonicalized to null,
+  // which would silently drop back to following the pane).
+  const r = resolveSelection(wts, MAIN, LINKED);
+  assert.equal(r.active, wts[0]);
+  assert.equal(r.selected, MAIN);
+  assert.equal(r.fellBack, false);
+});
+
+test("resolveSelection: a pruned explicit selection fails soft back to primary", () => {
+  const wts = parseWorktrees(SAMPLE);
+  const r = resolveSelection(wts, "C:/Projects/loomux-worktrees/deleted", LINKED);
   assert.equal(r.active, wts[0]); // primary
   assert.equal(r.selected, null); // selection cleared
   assert.equal(r.fellBack, true); // caller shows a message
-});
-
-test("resolveSelection: re-picking the primary canonicalizes to null without a fallback message", () => {
-  const wts = parseWorktrees(SAMPLE);
-  const r = resolveSelection(wts, "C:/Projects/loomux");
-  assert.equal(r.active, wts[0]);
-  assert.equal(r.selected, null);
-  assert.equal(r.fellBack, false); // it existed — not a fail-soft
 });
 
 test("resolveSelection: empty list yields a null active and no crash", () => {
@@ -146,6 +169,31 @@ test("findWorktree returns null for a null path", () => {
 test("worktreeLabel is the folder name", () => {
   assert.equal(worktreeLabel({ path: "C:/Projects/loomux-worktrees/feat/208" } as never), "208");
   assert.equal(worktreeLabel({ path: "C:\\repos\\bare.git" } as never), "bare.git");
+});
+
+test("a worktree deleted without git's knowledge stays a normal listed entry (no prunable marker on git 2.29)", () => {
+  // rm -rf of the checkout without `git worktree remove`/prune: on the git 2.29
+  // baseline the porcelain has no `prunable` line, so the parser cannot know the
+  // dir is gone — it's an ordinary selectable entry. The runtime dir-existence
+  // check (isMissingDir on the git call) is what fails soft, not the parser.
+  const wts = parseWorktrees(
+    ["worktree /a", "HEAD ff", "branch refs/heads/main", "", "worktree /gone", "HEAD ee", "branch refs/heads/side", ""].join(
+      "\n"
+    )
+  );
+  assert.equal(wts[1].path, "/gone");
+  assert.equal(wts[1].prunable, false); // no marker — indistinguishable from a live worktree
+  assert.equal(wts[1].branch, "side");
+});
+
+test("isMissingDir recognizes the backend's no-such-directory error", () => {
+  assert.equal(isMissingDir("no such directory: C:/Projects/loomux-worktrees/gone"), true);
+  assert.equal(isMissingDir(new Error("no such directory: /gone")), true);
+  assert.equal(isMissingDir("No Such Directory: /gone"), true); // case-insensitive
+  // Unrelated git failures must NOT be mistaken for a deleted worktree.
+  assert.equal(isMissingDir("fatal: not a git repository"), false);
+  assert.equal(isMissingDir("error: pathspec 'x' did not match"), false);
+  assert.equal(isMissingDir(null), false);
 });
 
 test("normalizePath unifies separators, trailing slash, and case", () => {
