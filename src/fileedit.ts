@@ -13,11 +13,15 @@ import {
   ftListDir,
   ftReadFile,
   ftWriteFile,
-  ftSearch,
+  ftSearchStart,
+  ftSearchCancel,
+  onSearchBatch,
+  nextSearchId,
   ftReplace,
   errorCode,
   errorMessage,
   type SearchOpts,
+  type SearchBatch,
 } from "./fileapi";
 import {
   groupMatches,
@@ -32,6 +36,15 @@ import {
   type FileGroup,
   type SearchParams,
 } from "./searchresults";
+import {
+  idle,
+  begin,
+  accept,
+  isTruncated,
+  enumerationSource,
+  type SearchState,
+} from "./searchsession";
+import { gitRepoRoot } from "./git";
 import {
   makeRoot,
   mergeChildren,
@@ -114,6 +127,8 @@ export class FileEditView {
   private replaceInput!: HTMLInputElement;
   private ciBox!: HTMLInputElement;
   private wwBox!: HTMLInputElement;
+  private igBox!: HTMLInputElement;
+  private igLabel!: HTMLLabelElement;
   private summaryEl!: HTMLElement;
   private replaceBtn!: HTMLButtonElement;
   private searchGroups: FileGroup[] = [];
@@ -121,9 +136,23 @@ export class FileEditView {
    *  highlight + badge files that contain hits. */
   private hits = new Map<string, number>();
   private searchTimer: number | undefined;
-  /** Monotonic id so a stale (slow) search resolution can't overwrite a newer
-   *  one and leave the snapshot behind the input box. */
-  private searchSeq = 0;
+  /** Streaming-search accumulator (issue #207). Its `activeId` is the id whose
+   *  `ft-search` batches we currently accept; bumping it (new keystroke) or going
+   *  idle (Esc/clear) makes every in-flight batch from the old search a no-op —
+   *  the cancellation guarantee. Results never exceed the module's render cap. */
+  private session: SearchState = idle();
+  /** The params the in-flight search was launched with; promoted to
+   *  `searchSnapshot` only when that search *finishes* (so a partial/cancelled
+   *  search never enables replace against an incomplete result set). */
+  private pendingParams: SearchParams | null = null;
+  /** Unsubscribe for the `ft-search` event listener (torn down on dispose). */
+  private searchUnlisten: (() => void) | null = null;
+  /** Coalesces mid-search tree repaints to one per animation frame so a burst of
+   *  batches can't thrash the DOM. */
+  private renderScheduled = false;
+  /** Whether the current root is inside a git work tree — gates the ignore
+   *  toggle (a non-git root has no `.gitignore` to respect). Null until probed. */
+  private isGitRoot: boolean | null = null;
   /** The query + options the current `searchGroups` were produced with. Replace
    *  applies from THIS, not the live inputs, so a query/option edit after a
    *  search can't make apply diverge from the preview. Nulled when the preview
@@ -220,6 +249,12 @@ export class FileEditView {
     body.append(this.treePane, divider, this.editorPane);
 
     this.el.append(head, this.agentBanner, body);
+
+    // One `ft-search` listener per view; it drops batches whose id isn't the
+    // active session (`accept`), so cross-pane/stale events are harmless.
+    void onSearchBatch((b) => this.onSearchBatch(b)).then((un) => {
+      this.searchUnlisten = un;
+    });
   }
 
   // ---------- overlay contract ----------
@@ -253,6 +288,8 @@ export class FileEditView {
 
   dispose(): void {
     clearTimeout(this.searchTimer);
+    if (this.session.activeId !== null) void ftSearchCancel(this.session.activeId);
+    this.searchUnlisten?.();
     this.editor?.dispose();
     this.el.remove();
   }
@@ -277,8 +314,42 @@ export class FileEditView {
   private async reloadTree(): Promise<void> {
     if (!this.root) return;
     this.treeModel = makeRoot();
+    void this.refreshGitStatus(); // gates the ignore toggle; independent of the tree load
     await this.loadDir(this.treeModel);
     this.renderTree();
+  }
+
+  /** Probe whether the root is inside a git work tree and update the ignore
+   *  toggle accordingly (a non-git root has no `.gitignore` to respect, so the
+   *  toggle is disabled with an explanatory tooltip and the full tree is always
+   *  searched). */
+  private async refreshGitStatus(): Promise<void> {
+    const root = this.root;
+    if (!root) {
+      this.isGitRoot = null;
+    } else {
+      try {
+        this.isGitRoot = (await gitRepoRoot(root)) !== null;
+      } catch {
+        this.isGitRoot = false;
+      }
+      if (root !== this.root) return; // root changed while probing — stale result
+    }
+    this.updateIgnoreToggle();
+  }
+
+  private updateIgnoreToggle(): void {
+    const git = this.isGitRoot === true;
+    this.igBox.disabled = !git;
+    if (!git && this.igBox.checked) this.igBox.checked = false; // no meaning off-git
+    this.igLabel.classList.toggle("disabled", !git);
+    // Describe the *effective* enumeration (the same choice the backend makes).
+    const source = enumerationSource(git, this.igBox.checked);
+    this.igLabel.title = !git
+      ? "Not a git repository — nothing to ignore; the whole folder is searched."
+      : source === "git"
+        ? "Respecting .gitignore (node_modules, build output skipped). Check to include ignored files."
+        : "Including git-ignored files. Uncheck to respect .gitignore.";
   }
 
   /** Fetch one directory's children (lazy), merging so expansion survives. */
@@ -295,6 +366,10 @@ export class FileEditView {
 
   private renderTree(): void {
     const rows = flatten(this.treeModel);
+    // rel → group, built once per render so hit rows are an O(1) lookup instead
+    // of an O(files) scan each — the difference between fluid and janky when a
+    // big streamed search lights up thousands of files (issue #207).
+    const groupByRel = new Map(this.searchGroups.map((g) => [g.rel, g]));
     const frag = document.createDocumentFragment();
     for (const { node, depth } of rows) {
       const row = el("div", "fileedit-row");
@@ -314,7 +389,7 @@ export class FileEditView {
       const count = node.isDir ? undefined : this.hits.get(node.path);
       if (count !== undefined) {
         row.classList.add("hit");
-        const group = this.searchGroups.find((g) => g.rel === node.path);
+        const group = groupByRel.get(node.path);
         const selected = group?.selected ?? true;
         const badge = el("span", `fileedit-hit-badge${selected ? "" : " off"}`, String(count));
         badge.title = selected ? "In replace set — click to exclude" : "Excluded from replace — click to include";
@@ -534,10 +609,18 @@ export class FileEditView {
     this.searchInput.placeholder = "Search in files…";
     this.searchInput.spellcheck = false;
     this.searchInput.addEventListener("keydown", (e) => {
-      e.stopPropagation();
       if (e.key === "Enter") {
+        e.stopPropagation();
         clearTimeout(this.searchTimer);
-        void this.runSearch();
+        this.startSearch();
+      } else if (e.key === "Escape" && this.session.activeId !== null) {
+        // Esc cancels an in-flight search (keeping the partial results); only
+        // when nothing is running does Esc fall through to close the overlay.
+        e.stopPropagation();
+        clearTimeout(this.searchTimer);
+        this.cancelSearch();
+      } else {
+        e.stopPropagation();
       }
     });
     // Live highlight: debounce a search as the user types so tree hits update
@@ -563,26 +646,38 @@ export class FileEditView {
     const opts = el("div", "fileedit-search-opts");
     const [ciLabel, ciBox] = checkboxLabel("Ignore case");
     const [wwLabel, wwBox] = checkboxLabel("Whole word");
+    // The gitignore toggle (issue #207): off by default (searches respect
+    // .gitignore); on includes ignored files (node_modules, build output).
+    const [igLabel, igBox] = checkboxLabel("Ignored files");
     this.ciBox = ciBox;
     this.wwBox = wwBox;
+    this.igBox = igBox;
+    this.igLabel = igLabel;
     const onOpt = () => {
       this.invalidateIfStale();
       this.scheduleSearch();
     };
     ciBox.addEventListener("change", onOpt);
     wwBox.addEventListener("change", onOpt);
+    igBox.addEventListener("change", () => {
+      this.updateIgnoreToggle(); // refresh the effective-mode tooltip
+      onOpt();
+    });
     this.summaryEl = el("span", "fileedit-search-summary", "");
-    opts.append(ciLabel, wwLabel, this.summaryEl);
+    opts.append(ciLabel, wwLabel, igLabel, this.summaryEl);
 
     form.append(searchRow, replaceRow, opts);
   }
 
-  /** The live search parameters from the inputs. */
+  /** The live search parameters from the inputs. A disabled ignore toggle
+   *  (non-git root) always reads as false, so `include_ignored` never sneaks on
+   *  where it has no meaning. */
   private currentParams(): SearchParams {
     return {
       query: this.searchInput.value,
       caseInsensitive: this.ciBox.checked,
       wholeWord: this.wwBox.checked,
+      includeIgnored: this.igBox.checked && !this.igBox.disabled,
     };
   }
 
@@ -591,12 +686,13 @@ export class FileEditView {
       case_insensitive: p.caseInsensitive,
       whole_word: p.wholeWord,
       max_results: 0,
+      include_ignored: p.includeIgnored,
     };
   }
 
   private scheduleSearch(): void {
     clearTimeout(this.searchTimer);
-    this.searchTimer = window.setTimeout(() => void this.runSearch(), SEARCH_DEBOUNCE_MS);
+    this.searchTimer = window.setTimeout(() => this.startSearch(), SEARCH_DEBOUNCE_MS);
   }
 
   /** If the live inputs no longer match the snapshot the current hits were
@@ -609,38 +705,102 @@ export class FileEditView {
     }
   }
 
-  private async runSearch(): Promise<void> {
+  /** Launch a streaming search (issue #207). Cancels any in-flight one, opens a
+   *  fresh session under a new id, and kicks the backend walk off-thread — results
+   *  arrive via `onSearchBatch`. Non-blocking: this returns immediately and the UI
+   *  stays live (Esc/typing keep working) while the walk runs. */
+  private startSearch(): void {
     const params = this.currentParams();
-    // Monotonic guard: a slow search resolving after the user has typed more (or
-    // launched a newer search) must not install a snapshot that's behind the
-    // input box — otherwise Replace could apply the previous query. Every call
-    // claims a seq; a resolution is applied only while it's still the latest.
-    const seq = ++this.searchSeq;
+    // Cancel whatever's running; its late batches will be dropped by id anyway,
+    // but telling the backend stops a big walk from grinding on in the background.
+    if (this.session.activeId !== null) void ftSearchCancel(this.session.activeId);
     if (!this.root || params.query === "") {
       this.clearSearch();
       return;
     }
-    try {
-      const out = await ftSearch(this.root, params.query, FileEditView.paramsToOpts(params));
-      if (seq !== this.searchSeq) return; // superseded by a newer search
-      this.searchGroups = groupMatches(out.matches);
-      this.hits = hitCounts(this.searchGroups);
-      // Snapshot exactly what these hits reflect; replace applies from this.
-      this.searchSnapshot = params;
-      this.updateSearchSummary(out.truncated);
-      // Auto-expand the branches leading to hits so they're visible, then paint.
-      await this.revealHits();
-      if (seq !== this.searchSeq) return; // a newer search resolved during reveal
-      this.renderTree();
-      this.updateReplaceBtn();
-      this.applyEditorHighlight(); // mirror the matches inside the open file
-    } catch (err) {
-      if (errorCode(err) === "empty-query") return;
-      showToast(`Search failed: ${errorMessage(err)}`);
+    const id = nextSearchId();
+    this.session = begin(id);
+    this.pendingParams = params;
+    // The preview is invalid until this search *finishes*: a replace mustn't apply
+    // against a partial (or about-to-be-superseded) result set.
+    this.searchGroups = [];
+    this.hits = new Map();
+    this.searchSnapshot = null;
+    this.updateReplaceBtn();
+    this.summaryEl.textContent = "Searching…";
+    this.summaryEl.classList.remove("truncated");
+    this.renderTree();
+    void ftSearchStart(id, this.root, params.query, FileEditView.paramsToOpts(params));
+  }
+
+  /** Fold one streamed batch into the session and reflect it in the UI. Batches
+   *  from a superseded/cancelled search are dropped by `accept` (id mismatch), so
+   *  this is safe to call for every event regardless of which search it belongs
+   *  to. Live batches update the tree (throttled) and the running count; the
+   *  terminal `done` batch finalizes the preview + reveal. */
+  private onSearchBatch(b: SearchBatch): void {
+    if (b.id !== this.session.activeId) return; // stale / cancelled — ignore
+    if (b.error && errorCode(b.error) !== "empty-query") {
+      showToast(`Search failed: ${errorMessage(b.error)}`);
+    }
+    this.session = accept(this.session, b);
+    this.searchGroups = groupMatches(this.session.matches);
+    this.hits = hitCounts(this.searchGroups);
+    if (this.session.done) {
+      // Promote the snapshot only now the full result set is in — replace applies
+      // from this, exactly what was previewed (the preview→apply guarantee).
+      this.searchSnapshot = this.pendingParams;
+      void this.finishSearch();
+    } else {
+      this.updateLiveSummary();
+      this.scheduleRender();
     }
   }
 
+  /** Finalize a completed search: expand the branches leading to hits, paint, and
+   *  light up the matches inside any open file. Guarded so a search that gets
+   *  superseded *during* the async reveal doesn't paint stale results. */
+  private async finishSearch(): Promise<void> {
+    const id = this.session.activeId;
+    this.updateSearchSummary(isTruncated(this.session));
+    await this.revealHits();
+    if (id !== this.session.activeId) return; // superseded mid-reveal
+    this.renderTree();
+    this.updateReplaceBtn();
+    this.applyEditorHighlight();
+  }
+
+  /** Cancel the in-flight search but keep whatever was found so far, freezing it
+   *  as the (non-replaceable) result set. Going idle-but-done means no later batch
+   *  can land, and no partial preview enables replace. */
+  private cancelSearch(): void {
+    if (this.session.activeId === null) return;
+    void ftSearchCancel(this.session.activeId);
+    this.session = { ...this.session, activeId: null, done: true };
+    this.updateSearchSummary(isTruncated(this.session));
+    this.renderTree();
+  }
+
+  /** Coalesce mid-search repaints to one per frame. */
+  private scheduleRender(): void {
+    if (this.renderScheduled) return;
+    this.renderScheduled = true;
+    requestAnimationFrame(() => {
+      this.renderScheduled = false;
+      this.renderTree();
+    });
+  }
+
+  private updateLiveSummary(): void {
+    const { files, matches } = countSummary(this.searchGroups);
+    this.summaryEl.textContent = `Searching… ${matches} in ${files} file${files === 1 ? "" : "s"}`;
+    this.summaryEl.classList.remove("truncated");
+  }
+
   private clearSearch(): void {
+    if (this.session.activeId !== null) void ftSearchCancel(this.session.activeId);
+    this.session = idle();
+    this.pendingParams = null;
     this.searchGroups = [];
     this.hits = new Map();
     this.searchSnapshot = null;
@@ -734,7 +894,7 @@ export class FileEditView {
       if (this.openRel && res.changed.some((c) => c.rel === this.openRel)) {
         await this.reloadOpenFile();
       }
-      await this.runSearch(); // refresh results against the new contents
+      this.startSearch(); // re-run against the new contents (streams in)
     } catch (err) {
       showToast(`Replace failed: ${errorMessage(err)}`);
     }

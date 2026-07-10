@@ -40,6 +40,7 @@ pub fn run() {
         .manage(pty::PtyManager::default())
         .manage(voice::VoiceState::default())
         .manage(Arc::new(gitwatch::GitWatcher::new()))
+        .manage(Arc::new(fileedit::SearchRegistry::default()))
         .manage(Arc::new(orchestration::OrchRegistry::new(
             orchestration::OrchRegistry::default_root(),
         )))
@@ -152,7 +153,8 @@ pub fn run() {
             fileedit::ft_list_dir,
             fileedit::ft_read_file,
             fileedit::ft_write_file,
-            fileedit::ft_search,
+            fileedit::ft_search_start,
+            fileedit::ft_search_cancel,
             fileedit::ft_replace,
             obs::take_startup_notice,
             uistate::load_ui_tabs,

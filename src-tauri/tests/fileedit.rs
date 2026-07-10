@@ -7,17 +7,73 @@
 //! helpers the Tauri commands wrap, so no Tauri runtime is needed.
 
 use loomux_lib::fileedit::{
-    content_hash, list_dir, read_file, replace, search, write_file, SearchOpts,
+    content_hash, list_dir, read_file, replace, search, search_planned, write_file, SearchOpts,
 };
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 fn opts(case_insensitive: bool, whole_word: bool) -> SearchOpts {
     SearchOpts {
         case_insensitive,
         whole_word,
         max_results: 0,
+        include_ignored: false,
     }
+}
+
+/// Search opts with the gitignore toggle set — the only knob the #207 tests vary.
+fn opts_ig(include_ignored: bool) -> SearchOpts {
+    SearchOpts {
+        case_insensitive: false,
+        whole_word: false,
+        max_results: 0,
+        include_ignored,
+    }
+}
+
+/// Collect a `search_planned` run into a flat match list + the set of files hit.
+fn planned(
+    root: &str,
+    query: &str,
+    opts: SearchOpts,
+    cancelled: &dyn Fn() -> bool,
+) -> (Vec<loomux_lib::fileedit::Match>, BTreeSet<String>) {
+    let mut out = Vec::new();
+    search_planned(root, query, opts, cancelled, &mut |b| out.extend(b)).unwrap();
+    let files = out.iter().map(|m| m.rel.clone()).collect();
+    (out, files)
+}
+
+/// True if a usable `git` is on PATH (the gitignore test skips otherwise, like
+/// the symlink tests skip when the platform forbids symlinks).
+fn git_available() -> bool {
+    let mut cmd = std::process::Command::new("git");
+    cmd.arg("--version");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    cmd.output().map(|o| o.status.success()).unwrap_or(false)
+}
+
+/// Init a real git repo at `root` (needed so `git ls-files` classifies files);
+/// isolates config so a developer's global gitignore/hooks can't skew the test.
+fn git_init(root: &Path) {
+    let run = |args: &[&str]| {
+        let mut cmd = std::process::Command::new("git");
+        cmd.current_dir(root).args(args);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000);
+        }
+        assert!(cmd.output().unwrap().status.success(), "git {args:?} failed");
+    };
+    run(&["init"]);
+    run(&["config", "core.excludesFile", ""]);
 }
 
 /// Best-effort symlink creation; returns false if the platform refuses (Windows
@@ -266,10 +322,70 @@ fn search_flags_truncation_at_cap() {
         case_insensitive: false,
         whole_word: false,
         max_results: 5,
+        include_ignored: false,
     };
     let out = search(rp, "x", capped).unwrap();
     assert_eq!(out.matches.len(), 5);
     assert!(out.truncated, "hitting the cap must be surfaced, not silent");
+}
+
+// ---------- streaming search: gitignore + cancellation (issue #207) ----------
+
+#[test]
+fn search_respects_gitignore_by_default_and_toggle_includes_ignored() {
+    if !git_available() {
+        eprintln!("skipping: git not on PATH");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let rp = root.path().to_str().unwrap();
+    git_init(root.path());
+    // A tracked file, a gitignored file, and a gitignored directory — all with
+    // the same needle so only the ignore rules decide what's found.
+    fs::write(root.path().join(".gitignore"), "ignored.txt\nbuilddir/\n").unwrap();
+    fs::write(root.path().join("tracked.txt"), "needle here").unwrap();
+    fs::write(root.path().join("ignored.txt"), "needle here").unwrap();
+    fs::create_dir_all(root.path().join("builddir")).unwrap();
+    fs::write(root.path().join("builddir/gen.txt"), "needle here").unwrap();
+
+    // Default (include_ignored=false): the ignored file + dir are skipped, the
+    // tracked file (and the untracked-but-unignored .gitignore, which has no
+    // needle) are enumerated. This is the ignored-by-default guarantee.
+    let (_, files) = planned(rp, "needle", opts_ig(false), &|| false);
+    assert!(files.contains("tracked.txt"), "tracked file must be searched");
+    assert!(!files.contains("ignored.txt"), "gitignored file must be skipped");
+    assert!(
+        !files.iter().any(|f| f.starts_with("builddir")),
+        "gitignored dir must be skipped, got {files:?}"
+    );
+
+    // Toggle on: the full walk now reaches the ignored file and directory.
+    let (_, all) = planned(rp, "needle", opts_ig(true), &|| false);
+    assert!(all.contains("ignored.txt"), "toggle must include the ignored file");
+    assert!(
+        all.iter().any(|f| f == "builddir/gen.txt"),
+        "toggle must include the ignored dir, got {all:?}"
+    );
+}
+
+#[test]
+fn search_cancellation_stops_the_walk_before_it_reads() {
+    // A cancel flag that is already set before the search starts must stop the
+    // walk at the first check — no files are scanned, so no results land. This is
+    // the backend half of the "a cancelled search never yields results" contract
+    // (the frontend half — dropping late batches by id — is in searchsession).
+    let root = tempfile::tempdir().unwrap();
+    let rp = root.path().to_str().unwrap();
+    for i in 0..40 {
+        fs::write(root.path().join(format!("f{i}.txt")), "needle\n").unwrap();
+    }
+    let cancel = AtomicBool::new(true); // pre-cancelled
+    let (matches, _) = planned(rp, "needle", opts_ig(true), &|| cancel.load(Ordering::Relaxed));
+    assert!(
+        matches.is_empty(),
+        "a pre-cancelled search must scan nothing, got {} matches",
+        matches.len()
+    );
 }
 
 // ---------- replace ----------
