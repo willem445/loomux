@@ -52,6 +52,31 @@ Top-right of the graph:
 - **Right-click a branch/tag chip** to check it out directly (double-click works
   too).
 
+## Worktrees
+
+If the repository has [git worktrees](https://git-scm.com/docs/git-worktree)
+(loomux creates one per agent session during orchestration), a **worktree chip**
+appears in the header next to the repo name. Click it to switch the whole view —
+graph, commits, working-tree changes, diffs, and branch — to any listed worktree,
+or back to the primary checkout, **without leaving the pane or opening a new
+session**. This is the quick way to see what an agent's worktree has been up to:
+its history, its unstaged files, its commits.
+
+- The chip names the worktree you're viewing; it turns the accent color when
+  you're off the primary tree, so it's obvious the view is scoped elsewhere. Its
+  tooltip shows the full path and branch.
+- The primary checkout is the default and is labelled *(primary)* in the menu. A
+  bare repository entry is listed but can't be viewed (it has no working tree).
+- Every action (staging, commit, checkout, push/pull, history ops) targets the
+  **selected** worktree — so you can stage and commit in an agent's worktree from
+  here too.
+- The selection sticks across refreshes. If the worktree is pruned or removed
+  while you're viewing it, the view **fails soft back to the primary** and tells
+  you. Switching the pane into a different repository resets the selection.
+- External changes inside a *selected* worktree refresh on the next shell prompt
+  in the pane or when you press **↻** — the once-a-second auto-watch tracks the
+  pane's own repo.
+
 ## Safety
 
 History-changing operations (cherry-pick, revert, merge, rebase) ask for

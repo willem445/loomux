@@ -85,6 +85,7 @@ pub fn run() {
             git::git_checkout,
             git::git_discard,
             git::git_worktree_add,
+            git::git_worktree_list,
             git::git_fetch,
             git::git_push,
             git::git_pull,

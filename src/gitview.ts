@@ -24,12 +24,20 @@ import {
   gitMerge,
   gitRebase,
   gitBranches,
+  gitWorktreeList,
   type BranchInfo,
   type CommitInfo,
   type FileEntry,
   type GitStatus,
   type DiffMode,
 } from "./git";
+import {
+  parseWorktrees,
+  resolveSelection,
+  worktreeLabel,
+  normalizePath,
+  type Worktree,
+} from "./gitworktree";
 import { computeLanes, renderRowSvg } from "./gitgraph";
 import { shortRev, fmtWhen, fmtWhenFull, authorLine } from "./gitformat";
 import { renderDiff } from "./diffrender";
@@ -198,7 +206,14 @@ async function copyText(text: string): Promise<void> {
 export class GitView {
   readonly el: HTMLElement;
 
+  // `repoRoot` is the directory git commands run against — the primary repo, or
+  // the selected worktree's working dir (#208). `primaryRoot` is always the
+  // pane's main repo, used to enumerate worktrees and to fall back to. A
+  // worktree is selected by its path (`selectedWorktree`); null = primary.
   private repoRoot: string | null = null;
+  private primaryRoot: string | null = null;
+  private worktrees: Worktree[] = [];
+  private selectedWorktree: string | null = null;
   private commits: CommitInfo[] = [];
   private status: GitStatus | null = null;
   private selection: Selection = { kind: "working" };
@@ -214,6 +229,7 @@ export class GitView {
   private disposed = false;
 
   private headTitleEl: HTMLElement;
+  private headWorktreeEl: HTMLElement;
   private headBranchEl: HTMLElement;
   private graphListEl: HTMLElement;
   private diffHeadEl: HTMLElement;
@@ -247,6 +263,10 @@ export class GitView {
     this.graphEl = graph;
     const head = el("div", "git-graph-head");
     this.headTitleEl = el("span", "git-head-title");
+    this.headWorktreeEl = el("span", "git-head-worktree clickable");
+    this.headWorktreeEl.hidden = true;
+    this.headWorktreeEl.title = "Switch worktree";
+    this.headWorktreeEl.addEventListener("click", () => this.openWorktreeMenu());
     this.headBranchEl = el("span", "git-head-branch clickable");
     this.headBranchEl.title = "Switch branch";
     this.headBranchEl.addEventListener("click", () => void this.openBranchMenu());
@@ -267,7 +287,15 @@ export class GitView {
     const closeBtn = el("button", "pane-btn close", "✕");
     closeBtn.title = "Back to terminal (Esc)";
     closeBtn.addEventListener("click", () => this.host.onClose());
-    head.append(this.headTitleEl, this.headBranchEl, pullBtn, pushBtn, fetchBtn, closeBtn);
+    head.append(
+      this.headTitleEl,
+      this.headWorktreeEl,
+      this.headBranchEl,
+      pullBtn,
+      pushBtn,
+      fetchBtn,
+      closeBtn
+    );
     this.graphListEl = el("div", "git-graph-list");
     graph.append(head, this.graphListEl);
 
@@ -439,9 +467,9 @@ export class GitView {
         this.setBlank("Waiting for the shell to report its folder…");
         return;
       }
-      let root: string | null;
+      let primary: string | null;
       try {
-        root = await gitRepoRoot(cwd);
+        primary = await gitRepoRoot(cwd);
       } catch (err) {
         this.setBlank(
           String(err) === "git-not-found"
@@ -450,12 +478,43 @@ export class GitView {
         );
         return;
       }
-      if (!root) {
+      if (!primary) {
         this.setBlank(`Not a git repository:\n${cwd}`);
         return;
       }
+      if (primary !== this.primaryRoot) {
+        // Entered a different repo: drop the worktree selection with the rest.
+        this.primaryRoot = primary;
+        this.selectedWorktree = null;
+        this.worktrees = [];
+      }
+
+      // Enumerate the worktree set from the primary and settle on which one the
+      // view is pointed at. A pruned/removed selection fails soft back to the
+      // primary (#208). Enumeration failing (very old git, etc.) degrades to
+      // primary-only rather than breaking the whole view.
+      try {
+        this.worktrees = parseWorktrees(await gitWorktreeList(primary));
+      } catch {
+        this.worktrees = [];
+      }
+      if (this.disposed) return;
+      // Only reconcile the selection against a real listing. An empty result
+      // means enumeration failed (or an unusual git) — keep the selection and
+      // just view the primary this pass, rather than dropping it on a blip.
+      let root = primary;
+      if (this.worktrees.length > 0) {
+        const res = resolveSelection(this.worktrees, this.selectedWorktree);
+        if (res.fellBack && this.selectedWorktree !== null) {
+          this.toast("Selected worktree is gone — showing the primary repo.");
+        }
+        this.selectedWorktree = res.selected;
+        if (res.active) root = res.active.path;
+      }
+
       if (root !== this.repoRoot) {
-        // Entered a different repo: reset view state.
+        // Entered a different worktree (or repo): reset the graph/diff view
+        // state, but keep the worktree selection itself.
         this.repoRoot = root;
         this.commits = [];
         this.selection = { kind: "working" };
@@ -792,14 +851,72 @@ export class GitView {
   }
 
   private renderHead(): void {
-    const root = this.repoRoot ?? "";
+    // Title stays the primary repo name even when viewing a worktree, so the
+    // repo identity is stable; the worktree chip names which tree we're in.
+    const root = this.primaryRoot ?? this.repoRoot ?? "";
     this.headTitleEl.textContent = root.split(/[\\/]/).filter(Boolean).pop() ?? "";
+    this.renderWorktreeChip();
     const s = this.status;
     this.headBranchEl.textContent = s?.branch
       ? s.branch
       : s?.detached
         ? `detached @ ${this.headHash().slice(0, 7)}`
         : "";
+  }
+
+  /** The worktree currently being viewed (matched by path), or null. */
+  private activeWorktree(): Worktree | null {
+    const root = normalizePath(this.repoRoot ?? "");
+    return this.worktrees.find((w) => normalizePath(w.path) === root) ?? null;
+  }
+
+  /** Show a clickable chip naming the viewed worktree whenever there's more
+   *  than one to switch between (or a non-primary one is selected, so it's
+   *  obvious you're off the main tree). Hidden for a plain single-worktree repo. */
+  private renderWorktreeChip(): void {
+    const active = this.activeWorktree();
+    const show = this.worktrees.length > 1 || (active !== null && !active.primary);
+    this.headWorktreeEl.hidden = !show;
+    if (!show) return;
+    const label = active ? (active.primary ? "primary" : worktreeLabel(active)) : "primary";
+    this.headWorktreeEl.textContent = `⧉ ${label} ▾`;
+    this.headWorktreeEl.classList.toggle("non-primary", active !== null && !active.primary);
+    this.headWorktreeEl.title = active
+      ? `Worktree: ${active.path}${active.branch ? ` (${active.branch})` : ""}\nClick to switch`
+      : "Switch worktree";
+  }
+
+  private openWorktreeMenu(): void {
+    const active = normalizePath(this.repoRoot ?? "");
+    const items: MenuItem[] = [];
+    if (this.worktrees.length === 0) {
+      items.push({ label: "No worktrees", disabled: true });
+    }
+    for (const w of this.worktrees) {
+      const isActive = normalizePath(w.path) === active;
+      const name = w.primary ? `${worktreeLabel(w)} (primary)` : worktreeLabel(w);
+      const detail = w.bare
+        ? "  (bare)"
+        : w.branch
+          ? `  ${w.branch}`
+          : w.detached
+            ? "  (detached)"
+            : "";
+      items.push({
+        // A bare tree has no working copy to inspect — list it, but disabled.
+        label: `${isActive ? "● " : "  "}${name}${detail}`,
+        disabled: isActive || w.bare,
+        onClick: () => this.selectWorktree(w),
+      });
+    }
+    const r = this.headWorktreeEl.getBoundingClientRect();
+    showMenu(r.left, r.bottom + 3, items);
+  }
+
+  /** Point the view at `w` (primary → clear the selection) and refresh. */
+  private selectWorktree(w: Worktree): void {
+    this.selectedWorktree = w.primary ? null : w.path;
+    void this.refresh();
   }
 
   private headHash(): string {
