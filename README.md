@@ -124,6 +124,7 @@ src/
   panerestore.ts    pure per-pane restore policy + layout-tree -> ordered rebuild plan + agent resume-command builder (DOM-free, unit-tested, #194)
   restoresplash.ts  cold-boot "restore last session?" overlay (thin DOM over restoredecision.ts, #194)
   tabcounts.ts      pure per-tab live-agent counter + live/dormant orchestration markers (DOM-free, unit-tested, #194)
+  groupresume.ts    pure whole-group resume plan: orchestrator first, delegates rejoin-or-skip (DOM-free, unit-tested, #194)
   panefit.ts        pure "hidden => no PTY resize" decision (the no-resize invariant)
   sessions.ts       session browser sidebar
   launcher.ts       in-pane welcome / pane-setup form (Agent / Orchestrator / Terminal kind picker)

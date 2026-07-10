@@ -122,6 +122,7 @@ every worker (the #78 storm). That contract lives on the `RestoreAction`
 | Wiring (Phase 4) | `src/main.ts` | Splash, `hasSnapshot`, layout capture into `snapshot()`, grid rebuild, auto-resume, dormant Start/Resume. |
 | Splash overlay (Phase 4) | `src/restoresplash.ts` | Cold-boot "Restore last session?" overlay (thin DOM over `decideRestore`). |
 | Counter/markers (Phase 4) | `src/tabcounts.ts` | Pure per-tab live-agent count + live/dormant orchestration markers. Unit-tested. |
+| Group resume (Phase 4) | `src/groupresume.ts` | Pure whole-group resume plan (orchestrator first, delegates rejoin/skip). Unit-tested. |
 
 `shellKind` is recorded here but the backend spawn plumbing that acts on it lands
 in the shell-kinds phase; `sessionId` is populated by the launcher when it spawns
@@ -253,6 +254,43 @@ layers now handle it, both keeping panerestore pure:
   call `reapIfExited` after each `openActionPane`, matching the welcome/session
   paths — a spawn that exits in the sub-tick before `ptyId` is assigned is drained
   from `earlyExits` (and can trip the fresh-fallback) rather than leaking.
+
+### Whole-group resume (demo round 3)
+
+The dormant **Resume group** button restores the ENTIRE group, not just the
+orchestrator. The frontend never captured worker session ids (orch panes persist
+as bare `dormant-group` placeholders), and it doesn't need to: the backend roster
+(`orchSessionRoles` → `session_roles()`) already lists every member of a dead
+group — orchestrator, workers, reviewers, planners — with its session id and role.
+
+`planGroupResume` (pure, unit-tested) turns that roster into an ordered plan:
+orchestrator first, then the delegates, split into `rejoin` (session has a
+transcript) and `skipped` (none). `resumeDormantGroup` executes it through the
+**existing** `resumeOrchSession` path — no backend change:
+
+1. Resume the orchestrator → the backend `resume_recorded_session` relaunches the
+   whole control plane (`create_orchestration_group` with the resumed session),
+   bringing the group live.
+2. Resume each `rejoin` delegate **sequentially** — the backend refuses a rejoin
+   into a group that isn't live yet, so order matters and the orchestrator must be
+   awaited first. Each rejoin runs `spawn_agent_ex` with the recorded session id,
+   which **re-registers** the agent into the group (MCP identity, roster, cwd) so
+   the orchestrator can message it again, and `--resume`s its idle TUI (credit-
+   neutral, no prompt replay). Its pane arrives in this tab via the group→tab
+   routing.
+3. The per-group latch (`resumingGroups`) wraps the whole sequence, so one click is
+   one atomic multi-pane restore — the many placeholder cards of a group can't each
+   kick off a resume, and no member is double-spawned.
+
+**What restores:** every group member whose session has a saved conversation —
+re-registered with the group and resumed into its idle TUI. **What does NOT (stated,
+not silent):** a delegate that was never prompted has no transcript, so `--resume`
+would fail and strand a dead pane, and the frontend can't spawn a fresh
+*group-registered* worker (only the orchestrator spawns delegates). Those members
+are reported via toast and skipped; the orchestrator can respawn a fresh one on
+demand once it's live. Pane **positions** within the tab are also approximate — the
+orchestrator and rejoining workers lay out as they arrive (a fresh group layout),
+not the exact captured split; the tab, sessions, and roster are what's preserved.
 
 **BUG-2 — decline crashed with "no active workspace".** The restore splash is
 awaited while the app has zero tabs, and the window-focus handler (plus voice

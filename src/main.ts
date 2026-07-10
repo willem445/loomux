@@ -45,6 +45,7 @@ import {
   type SessionResumable,
 } from "./panerestore";
 import { showRestoreSplash } from "./restoresplash";
+import { planGroupResume } from "./groupresume";
 
 // Surface unexpected errors as a visible banner instead of a silently
 // broken UI — a user-facing "crash" should always come with a message.
@@ -541,12 +542,22 @@ function dormantCard(
 const resumingGroups = new Set<string>();
 
 /** Revive the dormant orchestration group bound to `ws` (the Resume button on a
- *  dormant-group placeholder). Resumes the recorded orchestrator session through
- *  the existing machinery — the whole group comes back, the workers rejoin into
- *  this tab via the group→tab routing — then clears the now-redundant dormant
- *  ORCH placeholders. Resume happens BEFORE the cleanup so the grid never goes
- *  empty (which would refill a welcome pane). Falls back to the session browser
- *  when no recorded session is found. */
+ *  dormant-group placeholder). ONE click restores the WHOLE group (demo round 3):
+ *  the orchestrator relaunches the control plane (MCP identity, task board) via
+ *  resumeOrchSession, and then every recorded worker/reviewer/planner with a
+ *  resumable session REJOINS — the backend re-registers each into the now-live
+ *  group (so the orchestrator can still message it) and its pane arrives in this
+ *  tab via the group→tab routing. Members are resumed sequentially, orchestrator
+ *  first (a delegate can't rejoin a group that isn't live yet). The whole
+ *  multi-pane resume is covered by the per-group latch, so it's one atomic
+ *  restore — no double-spawn of any member. The dormant ORCH placeholders are
+ *  cleared afterward, replaced by the resumed panes. Falls back to the session
+ *  browser when the group has no recorded roster.
+ *
+ *  WHAT DOESN'T re-attach: a delegate whose session was never prompted has no
+ *  transcript, so `--resume` would fail and strand a dead pane, and the frontend
+ *  can't spawn a fresh GROUP-registered worker (only the orchestrator does). Such
+ *  members are reported and skipped; the orchestrator can respawn them on demand. */
 async function resumeDormantGroup(ws: Workspace): Promise<void> {
   const groupId = tabs.groupForWorkspace(ws.id);
   if (!groupId) {
@@ -554,40 +565,74 @@ async function resumeDormantGroup(ws: Workspace): Promise<void> {
     return;
   }
   // Another card of this same group is already resuming — the whole group comes
-  // back at once, so ignore the duplicate rather than toast a redundant error.
+  // back at once, so ignore the duplicate rather than re-run the multi-pane resume.
   if (resumingGroups.has(groupId)) return;
   resumingGroups.add(groupId);
   try {
-    let entry: { session_id: string; role: string } | undefined;
+    // The group's recorded roster (every member with a session id + role), and
+    // which of those still have a transcript to resume (BUG-1 predicate).
+    let members: { sessionId: string; role: string }[] = [];
     try {
-      const roles = await orchSessionRoles();
-      entry =
-        roles.find((r) => r.group_id === groupId && r.role === "orchestrator") ??
-        roles.find((r) => r.group_id === groupId);
+      members = (await orchSessionRoles())
+        .filter((r) => r.group_id === groupId)
+        .map((r) => ({ sessionId: r.session_id, role: r.role }));
     } catch {
-      /* fall through to the browser */
+      /* fall through to the no-orchestrator branch */
     }
-    if (!entry) {
-      showToast("No recorded orchestration session for this group — open the session browser.", "info");
+    let resumableIds = new Set<string>();
+    try {
+      resumableIds = new Set((await listSessions()).map((s) => s.id));
+    } catch {
+      /* empty → assume resumable below */
+    }
+    const seenAny = resumableIds.size > 0;
+    const plan = planGroupResume(members, (sid) => (seenAny ? resumableIds.has(sid) : true));
+
+    if (!plan.orchestrator) {
+      showToast("No recorded orchestrator session for this group — open the session browser.", "info");
       sessions.toggle();
       return;
     }
+
     const preexisting = ws.grid.allPanes();
+    // 1. Orchestrator first — relaunches the group and makes it live so delegates
+    //    can rejoin. A failure here aborts the whole restore (nothing to rejoin into).
     try {
-      const restored = await resumeOrchSession(ws.grid, eventsFor(ws), entry.session_id, {
+      const restored = await resumeOrchSession(ws.grid, eventsFor(ws), plan.orchestrator.sessionId, {
         group: groupId,
-        role: entry.role,
+        role: "orchestrator",
       });
       if (restored) tabs.bindGroup(restored.groupId, ws.id);
     } catch (err) {
-      // A resume error is recoverable (retry the button) — a toast, not the
-      // app-crash banner (#194 P4 MED-3).
+      // Recoverable (retry the button) — a toast, not the app-crash banner (MED-3).
       showToast(`Couldn't resume group: ${String(err)}`, "error");
       return;
     }
-    // Drop the dormant ORCH placeholders that predated the resume (a mixed tab's
-    // dormant AGENT placeholders and live panes stay). The revive already added a
-    // real pane, so this can't empty the grid.
+    // 2. Rejoin each resumable delegate INTO the now-live group. Sequential (not
+    //    concurrent) so the group settles live before each rejoin and we don't
+    //    fan out a spawn burst; a single member's failure doesn't sink the rest.
+    for (const member of plan.rejoin) {
+      try {
+        await resumeOrchSession(ws.grid, eventsFor(ws), member.sessionId, {
+          group: groupId,
+          role: member.role,
+        });
+      } catch (err) {
+        showToast(`Couldn't rejoin a ${member.role}: ${String(err)}`, "info");
+      }
+    }
+    // 3. Report members we can't bring back (no transcript → would be a dead pane;
+    //    the orchestrator can respawn a fresh one).
+    if (plan.skipped.length > 0) {
+      const n = plan.skipped.length;
+      showToast(
+        `${n} idle agent${n === 1 ? "" : "s"} had no saved conversation and ${n === 1 ? "was" : "were"} not restored — the orchestrator can respawn ${n === 1 ? "it" : "them"}.`,
+        "info"
+      );
+    }
+    // 4. Drop the dormant ORCH placeholders that predated the resume (a mixed tab's
+    //    dormant AGENT placeholders and live panes stay). The orchestrator resume
+    //    already added a real pane, so this can't empty the grid.
     for (const p of preexisting) {
       if (p.isDormant && p.dormantKind === "orch") ws.grid.closePane(p, false);
     }

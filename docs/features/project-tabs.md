@@ -129,9 +129,13 @@ divider positions you'd dragged. Each pane comes back by kind:
 - **Orchestration panes** come back **dormant**, with a **Resume group** button —
   reviving a whole group can spawn workers and spend credits, so that stays a
   deliberate, human-triggered action. The tab keeps its group binding and shows
-  the `ORCH` marker until you resume; **Resume group** brings the whole group
-  back (equivalent to restoring its session from the
-  [session browser](session-browser.html)).
+  the `ORCH` marker until you resume. **Resume group** is one-click consent for
+  the **whole group**: the orchestrator relaunches (task board, MCP identity), and
+  then every worker/reviewer that had an active session **rejoins** the group and
+  resumes into its idle TUI — re-registered so the orchestrator can message it,
+  and spending nothing until it's given work. An idle agent that never started a
+  conversation isn't restored (there's nothing to resume); the orchestrator can
+  respawn one on demand.
 
 **Start fresh** opens a single blank welcome tab and leaves the rest behind.
 
