@@ -3385,26 +3385,30 @@ fn gh_positionals_and_repo_flag_parse_around_global_flags() {
 
 #[test]
 fn gh_gate_decision_enforces_the_human_gate_on_the_default_branch() {
-    // (base, default, autonomous, auto_merge, grant) — merge invocation.
-    let d = |base: Option<&str>, def, auto, am, grant| gh_gate_decision(true, base, def, auto, am, grant);
+    // (base, default, autonomous, auto_merge, dangerous, grant) — merge invocation.
+    let d = |base: Option<&str>, def, auto, am, dang, grant| gh_gate_decision(true, base, def, auto, am, dang, grant);
     // Non-merge → always pass.
-    assert_eq!(gh_gate_decision(false, Some("main"), Some("main"), false, false, false), GhGate::PassThrough);
+    assert_eq!(gh_gate_decision(false, Some("main"), Some("main"), false, false, false, false), GhGate::PassThrough);
     // Merge onto a NON-default base (integration branch) → pass, regardless of markers/grant.
-    assert_eq!(d(Some("feat/x"), Some("main"), false, false, false), GhGate::PassThrough);
-    assert_eq!(d(Some("feat/x"), Some("main"), true, true, false), GhGate::PassThrough);
-    // Merge onto the DEFAULT branch: blanket-allowed with both markers.
-    assert_eq!(d(Some("main"), Some("main"), true, true, false), GhGate::AllowMerge);
-    // Without the blanket markers, a valid one-time GRANT authorizes it (consumed).
-    assert_eq!(d(Some("main"), Some("main"), false, false, true), GhGate::AllowGrant, "a human grant authorizes the merge");
-    assert_eq!(d(Some("main"), Some("main"), true, false, true), GhGate::AllowGrant);
+    assert_eq!(d(Some("feat/x"), Some("main"), false, false, false, false), GhGate::PassThrough);
+    assert_eq!(d(Some("feat/x"), Some("main"), true, true, false, false), GhGate::PassThrough);
+    // Merge onto the DEFAULT branch: blanket-allowed with autonomous+auto_merge.
+    assert_eq!(d(Some("main"), Some("main"), true, true, false, false), GhGate::AllowMerge);
+    // Supervised dangerous mode (NOT autonomous) → allowed, distinct path.
+    assert_eq!(d(Some("main"), Some("main"), false, false, true, false), GhGate::AllowDangerous, "dangerous mode authorizes the merge");
+    // dangerous is a NO-OP while autonomous (mutually exclusive; guard is defensive).
+    assert_eq!(d(Some("main"), Some("main"), true, false, true, false), GhGate::Block, "dangerous ignored while autonomous, no auto_merge/grant → block");
+    // Without blanket/dangerous, a valid one-time GRANT authorizes it (consumed).
+    assert_eq!(d(Some("main"), Some("main"), false, false, false, true), GhGate::AllowGrant, "a human grant authorizes the merge");
+    assert_eq!(d(Some("main"), Some("main"), true, false, false, true), GhGate::AllowGrant);
     // No markers and no grant → block.
-    assert_eq!(d(Some("main"), Some("main"), true, false, false), GhGate::Block, "auto_merge off + no grant blocks");
-    assert_eq!(d(Some("main"), Some("main"), false, true, false), GhGate::Block, "autonomous off + no grant blocks");
-    assert_eq!(d(Some("main"), Some("main"), false, false, false), GhGate::Block);
-    // Undeterminable base → fail-safe block (a grant can't override an unverifiable base).
-    assert_eq!(d(None, Some("main"), true, true, true), GhGate::BlockUnverifiable);
-    assert_eq!(d(Some("main"), None, true, true, true), GhGate::BlockUnverifiable);
-    assert_eq!(d(Some(""), Some("main"), true, true, true), GhGate::BlockUnverifiable, "empty base is unverifiable");
+    assert_eq!(d(Some("main"), Some("main"), true, false, false, false), GhGate::Block, "auto_merge off + no grant blocks");
+    assert_eq!(d(Some("main"), Some("main"), false, true, false, false), GhGate::Block, "autonomous off + no grant blocks");
+    assert_eq!(d(Some("main"), Some("main"), false, false, false, false), GhGate::Block);
+    // Undeterminable base → fail-safe block (nothing overrides an unverifiable base).
+    assert_eq!(d(None, Some("main"), true, true, true, true), GhGate::BlockUnverifiable);
+    assert_eq!(d(Some("main"), None, true, true, true, true), GhGate::BlockUnverifiable);
+    assert_eq!(d(Some(""), Some("main"), false, false, true, false), GhGate::BlockUnverifiable, "empty base is unverifiable even in dangerous mode");
 }
 
 #[test]
@@ -3429,11 +3433,21 @@ fn grant_helpers_normalize_and_expire() {
 }
 
 #[test]
-fn release_gate_blocks_without_a_grant_even_in_autonomous() {
-    // Releases publish to the world → NEVER blanket-allowed by autonomous mode; the
-    // only path is an explicit grant. (There is no autonomous/auto_merge input.)
-    assert_eq!(release_gate_decision(false), GhGate::Block);
-    assert_eq!(release_gate_decision(true), GhGate::AllowGrant);
+fn release_gate_allows_via_auto_release_dangerous_or_grant() {
+    // (autonomous, auto_release, dangerous, grant). Parallel to merges.
+    let d = |a, ar, dang, g| release_gate_decision(a, ar, dang, g);
+    // Blanket: autonomous + auto_release → allowed (not grant-consumed).
+    assert_eq!(d(true, true, false, false), GhGate::AllowMerge);
+    // Supervised dangerous mode (NOT autonomous) → allowed, distinct path.
+    assert_eq!(d(false, false, true, false), GhGate::AllowDangerous, "dangerous mode publishes");
+    assert_eq!(d(true, false, true, false), GhGate::Block, "dangerous ignored while autonomous, no auto_release/grant → block");
+    // auto_release OFF but a valid per-tag grant → allowed (consumed).
+    assert_eq!(d(true, false, false, true), GhGate::AllowGrant);
+    assert_eq!(d(false, false, false, true), GhGate::AllowGrant, "grant works even non-autonomous");
+    // No blanket opt-in, no dangerous, no grant → blocked (conservative default).
+    assert_eq!(d(true, false, false, false), GhGate::Block, "autonomous alone never publishes");
+    assert_eq!(d(false, true, false, false), GhGate::Block, "auto_release without autonomous never publishes");
+    assert_eq!(d(false, false, false, false), GhGate::Block);
 }
 
 #[test]
@@ -3553,10 +3567,12 @@ fn grants_are_not_writable_by_any_mcp_tool() {
     for c in [&co, &cw] {
         for n in tool_names(c) {
             assert!(!n.contains("grant"), "no MCP tool may write grants, found: {n}");
+            // Supervised dangerous mode (#83) is likewise Tauri-only — no MCP surface.
+            assert!(!n.contains("dangerous"), "no MCP tool may enable dangerous mode, found: {n}");
         }
     }
     // Exercise the file-writing MCP tools an agent CAN call; none may create a
-    // grant dir/file under the group.
+    // grant dir/file or the dangerous_mode marker under the group.
     let _ = dispatch(&reg, &co, "tools/call",
         &json!({ "name": "set_state", "arguments": { "state": "{\"x\":1}" } }));
     let _ = dispatch(&reg, &co, "tools/call",
@@ -3564,6 +3580,7 @@ fn grants_are_not_writable_by_any_mcp_tool() {
     let gdir = reg.state_root().join(&co.group);
     assert!(!gdir.join("merge_grants").exists(), "no MCP tool may create merge_grants");
     assert!(!gdir.join("release_grants").exists(), "no MCP tool may create release_grants");
+    assert!(!gdir.join("dangerous_mode").exists(), "no MCP tool may create the dangerous_mode marker");
 }
 
 /// Fake gh recording args and answering pr/repo view from env; anything else
@@ -3642,6 +3659,30 @@ fn gh_shim_harness_grant_authorizes_one_merge_and_releases_are_gated() {
         "granted release with --title before the tag must be allowed, not misparsed");
     assert!(!run(&["release", "create", "--title", "My Release", "v9.9.9"], "0"),
         "a release with --title and no grant is still blocked (tag parsed correctly)");
+    // auto_release opt-in: autonomous + auto_release blanket-allows any release —
+    // and does NOT consume a grant (no per-tag file needed). auto_merge alone did
+    // NOT (asserted above), proving the two toggles are independent.
+    std::fs::write(group.join("auto_release"), b"").unwrap();
+    assert!(run(&["release", "create", "v3.0.0"], "0"), "autonomous+auto_release blanket-allows a release");
+    assert!(run(&["release", "create", "v3.0.1"], "0"), "blanket auto_release is repeatable (not a one-time grant)");
+
+    // Supervised dangerous mode (#83): the human is present, NOT autonomous. Clear
+    // the autonomous markers, set dangerous_mode → both a default-branch MERGE and a
+    // RELEASE are allowed (no grant), each with its DISTINCT audit marker.
+    for m in ["autonomous", "auto_merge", "auto_release"] { let _ = std::fs::remove_file(group.join(m)); }
+    std::fs::write(group.join("dangerous_mode"), b"").unwrap();
+    std::fs::write(group.join("audit.jsonl"), b"").unwrap();
+    assert!(run(&["pr", "merge", "5"], "5"), "dangerous mode → default-branch merge allowed");
+    assert!(run(&["release", "create", "v4.0.0"], "0"), "dangerous mode → release allowed");
+    let audit = std::fs::read_to_string(group.join("audit.jsonl")).unwrap_or_default();
+    assert!(audit.contains("merge-gate-dangerous"), "distinct merge audit marker, got: {audit}");
+    assert!(audit.contains("release-gate-dangerous"), "distinct release audit marker");
+    // dangerous is a NO-OP while autonomous (mutually exclusive; defensive guard):
+    // with autonomous back on but no auto_merge/auto_release/grant, both are blocked.
+    // Use PR 8 (no leftover grant) so only the dangerous path could have allowed it.
+    std::fs::write(group.join("autonomous"), b"0").unwrap();
+    assert!(!run(&["pr", "merge", "8"], "8"), "dangerous is ignored while autonomous → merge blocked");
+    assert!(!run(&["release", "create", "v4.0.1"], "0"), "dangerous is ignored while autonomous → release blocked");
 }
 
 #[test]
@@ -3700,6 +3741,22 @@ fn git_shim_harness_gates_tag_pushes() {
     assert!(run(&["push", "origin", "nightly"], "nightly"), "a non-v* tag is not a release → not gated");
     // Bare v* that is NOT a tag (a branch) → not gated (rev-parse fails to confirm).
     assert!(run(&["push", "origin", "v2-feature"], "nope"), "a v*-looking branch is not gated");
+    // auto_release opt-in blanket-allows a v* tag push with NO grant (repeatable).
+    std::fs::write(group.join("autonomous"), b"").unwrap();
+    std::fs::write(group.join("auto_release"), b"").unwrap();
+    assert!(run(&["push", "origin", "refs/tags/v5.0.0"], ""), "autonomous+auto_release blanket-allows a tag push");
+    assert!(run(&["push", "origin", "refs/tags/v5.0.1"], ""), "blanket auto_release tag push is repeatable");
+    // Supervised dangerous mode (not autonomous): a v* tag push is allowed with the
+    // distinct audit marker.
+    for m in ["autonomous", "auto_release"] { let _ = std::fs::remove_file(group.join(m)); }
+    std::fs::write(group.join("dangerous_mode"), b"").unwrap();
+    std::fs::write(group.join("audit.jsonl"), b"").unwrap();
+    assert!(run(&["push", "origin", "refs/tags/v6.0.0"], ""), "dangerous mode → tag push allowed");
+    let audit = std::fs::read_to_string(group.join("audit.jsonl")).unwrap_or_default();
+    assert!(audit.contains("release-gate-dangerous"), "distinct dangerous audit marker, got: {audit}");
+    // No-op while autonomous.
+    std::fs::write(group.join("autonomous"), b"").unwrap();
+    assert!(!run(&["push", "origin", "refs/tags/v6.0.1"], ""), "dangerous ignored while autonomous → tag push blocked");
 }
 
 #[test]
@@ -3778,6 +3835,110 @@ fn stale_auto_merge_without_autonomous_is_reconciled_on_read() {
     assert!(!reg2.is_auto_merge(&g.id), "stale auto-merge must be reconciled off without autonomous");
     assert!(!gdir.join("auto_merge").is_file(), "the stale marker must be removed");
     assert_eq!(audit_count(&reg2, &g.id, "auto-merge-off"), 1, "the reconcile is audited");
+}
+
+#[test]
+fn set_auto_release_mirrors_auto_merge_dependency_and_is_independent() {
+    let (reg, dir) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let am = reg.state_root().join(&g.id).join("auto_merge");
+    let ar = reg.state_root().join(&g.id).join("auto_release");
+    // Dependency: enabling auto-release without autonomous is rejected.
+    let err = reg.set_auto_release(&g.id, true).unwrap_err();
+    assert!(err.to_lowercase().contains("autonomous"), "must name the dependency, got: {err}");
+    assert!(!reg.is_auto_release(&g.id));
+    // With autonomous on, the two toggles are INDEPENDENT: auto_merge on + auto_release
+    // off, and vice versa.
+    reg.set_autonomous(&g.id, true).unwrap();
+    reg.set_auto_merge(&g.id, true).unwrap();
+    assert!(reg.is_auto_merge(&g.id) && !reg.is_auto_release(&g.id), "auto_merge on must not enable auto_release");
+    assert!(am.is_file() && !ar.is_file());
+    reg.set_auto_release(&g.id, true).unwrap();
+    assert!(reg.is_auto_merge(&g.id) && reg.is_auto_release(&g.id));
+    reg.set_auto_merge(&g.id, false).unwrap();
+    assert!(!reg.is_auto_merge(&g.id) && reg.is_auto_release(&g.id), "disabling auto_merge must not touch auto_release");
+    assert!(!am.is_file() && ar.is_file());
+    assert_eq!(reg.autonomy_state(&g.id)["auto_release"].as_bool(), Some(true));
+    // Turning autonomous OFF force-disables auto_release too (money-stop), audited.
+    reg.set_autonomous(&g.id, false).unwrap();
+    assert!(!reg.is_auto_release(&g.id), "autonomous-off must force-disable auto_release");
+    assert!(!ar.is_file());
+    assert_eq!(audit_count(&reg, &g.id, "auto-release-off"), 1);
+    // Restart survival + stale reconcile: a stale auto_release without autonomous
+    // is reconciled off on read.
+    reg.set_autonomous(&g.id, true).unwrap();
+    reg.set_auto_release(&g.id, true).unwrap();
+    std::fs::remove_file(reg.state_root().join(&g.id).join("autonomous")).unwrap(); // hand-edit: drop autonomous, leave auto_release
+    let reg2 = OrchRegistry::new(dir.path().to_path_buf());
+    reg2.set_port(45999);
+    reg2.create_group("C:/tmp/repo", rails()).unwrap();
+    assert!(!reg2.is_auto_release(&g.id), "stale auto_release without autonomous reconciled off");
+    assert!(!reg2.state_root().join(&g.id).join("auto_release").is_file());
+}
+
+#[test]
+fn budget_suspension_force_disables_auto_release() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    reg.set_autonomous(&g.id, true).unwrap();
+    reg.set_auto_release(&g.id, true).unwrap();
+    assert!(reg.is_auto_release(&g.id));
+    seed_usage(&reg, &g.id, "spend", 5_000);
+    reg.set_autonomy_budget(&g.id, 100).unwrap();
+    assert_eq!(reg.enforce_autonomy_budgets(now_ms()), vec![g.id.clone()]);
+    assert!(!reg.is_autonomous(&g.id));
+    assert!(!reg.is_auto_release(&g.id), "budget suspension must drop auto_release (gate closed)");
+}
+
+#[test]
+fn dangerous_mode_setter_and_autonomous_are_mutually_exclusive() {
+    let (reg, dir) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let marker = reg.state_root().join(&g.id).join("dangerous_mode");
+    // Default OFF; enable works while NOT autonomous.
+    assert!(!reg.is_dangerous_mode(&g.id));
+    reg.set_dangerous_mode(&g.id, true).unwrap();
+    assert!(reg.is_dangerous_mode(&g.id) && marker.is_file());
+    assert_eq!(audit_count(&reg, &g.id, "dangerous-mode-on"), 1);
+    assert_eq!(reg.autonomy_state(&g.id)["dangerous_mode"].as_bool(), Some(true));
+    // MUTUAL EXCLUSION: enabling autonomous force-CLEARS dangerous mode (audited).
+    reg.set_autonomous(&g.id, true).unwrap();
+    assert!(!reg.is_dangerous_mode(&g.id), "enabling autonomous must clear dangerous mode");
+    assert!(!marker.is_file(), "the dangerous_mode marker must be removed");
+    assert_eq!(audit_count(&reg, &g.id, "dangerous-mode-off"), 1, "the forced clear is audited");
+    // MUTUAL EXCLUSION the other way: enabling dangerous while autonomous is REJECTED.
+    let err = reg.set_dangerous_mode(&g.id, true).unwrap_err();
+    assert!(err.to_lowercase().contains("mutually exclusive") || err.to_lowercase().contains("autonomous"),
+        "clear error naming the exclusion, got: {err}");
+    assert!(!reg.is_dangerous_mode(&g.id));
+    // Turn autonomous off, re-enable dangerous, then restart → survives (it's valid
+    // standalone, unlike auto_merge/auto_release).
+    reg.set_autonomous(&g.id, false).unwrap();
+    reg.set_dangerous_mode(&g.id, true).unwrap();
+    let reg2 = OrchRegistry::new(dir.path().to_path_buf());
+    reg2.set_port(45999);
+    reg2.create_group("C:/tmp/repo", rails()).unwrap();
+    assert!(reg2.is_dangerous_mode(&g.id), "dangerous mode survives restart while not autonomous");
+    // Disable is disk-first + audited.
+    reg2.set_dangerous_mode(&g.id, false).unwrap();
+    assert!(!reg2.is_dangerous_mode(&g.id));
+    assert!(!reg2.state_root().join(&g.id).join("dangerous_mode").is_file());
+}
+
+#[test]
+fn stale_dangerous_mode_with_autonomous_is_reconciled_off_on_read() {
+    // Hand-edited/impossible combo (both markers) → autonomous wins, dangerous cleared.
+    let (reg, dir) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let gdir = reg.state_root().join(&g.id);
+    std::fs::write(gdir.join("autonomous"), b"0").unwrap();
+    std::fs::write(gdir.join("dangerous_mode"), b"").unwrap();
+    let reg2 = OrchRegistry::new(dir.path().to_path_buf());
+    reg2.set_port(45999);
+    reg2.create_group("C:/tmp/repo", rails()).unwrap();
+    assert!(!reg2.is_dangerous_mode(&g.id), "dangerous+autonomous combo reconciled: autonomous wins");
+    assert!(!gdir.join("dangerous_mode").is_file(), "the stale dangerous marker is removed");
+    assert!(reg2.is_autonomous(&g.id));
 }
 
 #[test]

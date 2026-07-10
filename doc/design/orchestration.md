@@ -620,11 +620,19 @@ one-time **grant** the shim also honors.
 
 Releases publish to the world — a `v*` tag push triggers `release.yml` (GitHub release + npm),
 and `gh release create` does likewise — a strictly bigger blast radius than a merge. So they get
-the **same enforcement, but never the blanket opening**: a release/tag is allowed ONLY by an
-explicit grant, **even in autonomous+auto_merge mode** (`release_gate_decision`). This is the
-conservative default and defensible: autonomous auto-merge is the human saying "land routine,
-well-tested PRs without me"; it is *not* "publish to the world without me." A separate, explicit
-release grant keeps publishing a deliberate human act.
+enforcement **parallel to merges but on a SEPARATE, independent toggle**: a release/tag is allowed
+when **`(autonomous && auto_release)`** OR by an explicit per-tag grant (`release_gate_decision`,
+exactly mirroring `gh_gate_decision`'s `(autonomous && auto_merge) || grant`). `auto_release`
+defaults **OFF** and is independent of `auto_merge` — the human can allow auto-merge while keeping
+releases manual, opt into both, or neither. (This supersedes the earlier "releases are never
+blanket-allowed by autonomous" policy, which conflated "autonomous" with "auto-merge"; the human
+live-tested it and asked for hands-off releasing as an explicit opt-in.) Because the default is
+off, turning autonomous on never surprise-publishes — releasing stays a deliberate act (the toggle
+or a grant). `auto_release` mirrors `auto_merge`'s machinery exactly: gated behind autonomous
+(rejects enable when off), disk-first fail-loud disable, force-disabled on autonomous-off / budget
+suspension (the money-stop drops it from the in-memory gate set unconditionally), stale-marker
+reconcile on read, mirrored into the kickoff config + a live notice, and surfaced additively on
+`orch_autonomy` (`auto_release: bool`) via `orch_set_auto_release`.
 
 - **gh shim** additionally gates `gh release create|edit|delete <tag>` (read-only
   `view`/`list`/`download` pass through) — `gh_release_action`.
@@ -639,6 +647,38 @@ release grant keeps publishing a deliberate human act.
   real git with **zero** extra work. The gh scanner's value-flag skip list is complete for
   `gh release create` (`--title`/`--notes`/`--target`/… consume their value) so a granted release
   with `--title "…"` before the tag isn't misparsed and wrongly blocked.
+
+### Supervised dangerous mode
+
+The human asked to "just instruct my agent to do merges and releases when I'm here supervising" —
+without turning on *autonomous* (which is the hands-off, unattended mode). So a `dangerous_mode`
+marker adds a fourth path to the **same single decision point**: a default-branch merge or a
+release/tag is allowed when `(autonomous && auto_merge/auto_release)` OR **`(dangerous && !autonomous)`**
+OR a valid grant. No new parallel checks — `gh_gate_decision` / `release_gate_decision` gain a
+`dangerous` param, and the shims read the `dangerous_mode` marker alongside the others.
+
+- **Mutually exclusive with autonomous**, enforced both ways: `set_dangerous_mode(true)` is
+  rejected while autonomous is on; enabling autonomous force-clears `dangerous_mode` (audited +
+  a human-visible notice). The shim's `dangerous && !autonomous` guard is defensive — if both
+  markers somehow coexist (hand-edit), autonomous wins and the stale `dangerous_mode` is
+  reconciled off on read. Unlike `auto_merge`/`auto_release`, `dangerous_mode` is valid
+  *standalone* (it IS the not-autonomous mode), so it survives restart without an `autonomous`
+  marker.
+- **Distinct audit path.** A merge/release allowed via dangerous mode audits `merge-gate-dangerous`
+  / `release-gate-dangerous` (vs `-allowed` for the autonomous blanket and `-granted` for a grant),
+  so the trail always records *which* gate path let it through — plus `GhGate::AllowDangerous` in
+  the pure spec.
+- **Agent-unreachable, same as grants.** The setter is a Tauri command
+  (`orch_set_dangerous_mode`); no MCP tool can enable it (regression-tested: no agent-visible tool
+  name contains "dangerous", and the file-writing MCP tools never create the marker). Surfaced
+  additively on `orch_autonomy` (`dangerous_mode: bool`) and mirrored into the kickoff config + a
+  live notice. Disk-first fail-loud disable. The marker's FS-forgeability is the same documented
+  bypass class as grant files (an agent's shell can `echo` it — closed only by a machine account).
+- **No TTL yet — hands-off only.** Dangerous mode is a standing marker with no auto-expiry: the
+  human turns it off (or it clears when they enable autonomous). A **TTL / auto-expire** (e.g.
+  clear after N minutes of no human input, or a fixed window) is a reasonable future hardening —
+  it would bound a forgotten "on" — but was left out per the frozen direction; noted here and in
+  the PR for the human to decide.
 
 - **Honest bypass surface** (documented, not hidden). The shims raise the cost of an unattended
   bad merge/publish from "type one command" to "deliberately evade a named control," but a

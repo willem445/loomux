@@ -1352,6 +1352,17 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   display: flex; align-items: center; gap: 5px;
   color: var(--text-dim); font-size: 11px; cursor: pointer; user-select: none;
 }
+/* A disabled toggle (e.g. auto-release off-autonomous, dangerous while autonomous)
+   reads as inert rather than clickable. */
+.group-auto-check:has(input:disabled) { opacity: 0.45; cursor: not-allowed; }
+/* Supervised dangerous mode: DANGER affordance. Amber-warning by default; when
+   actually engaged (`.on`) it goes solid danger so the risky state is unmissable. */
+.group-auto-check.danger { color: var(--danger); font-weight: 600; }
+.group-auto-check.danger input { accent-color: var(--danger); }
+.group-auto-check.danger.on {
+  background: color-mix(in srgb, var(--danger) 16%, transparent);
+  border-radius: 5px; padding: 1px 6px; margin: -1px -2px;
+}
 .group-auto-budget { display: flex; align-items: center; gap: 6px; }
 .group-auto-blabel { color: var(--text-dim); font-size: 11px; }
 .group-auto-binput {

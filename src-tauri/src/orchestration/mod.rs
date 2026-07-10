@@ -79,6 +79,42 @@ pub fn auto_merge_notice(on: bool) -> String {
     }
 }
 
+/// One-line notice delivered to the orchestrator when the auto-release gate is
+/// toggled mid-session (#83), so it learns the new release policy without waiting
+/// to re-read its kickoff config. Independent of auto-merge.
+pub fn auto_release_notice(on: bool) -> String {
+    if on {
+        "[loomux] auto-release ENABLED for this group: while autonomous you MAY now cut a \
+         release yourself (`gh release …`, pushing a v* tag) once it is adequately \
+         prepared — audit and announce every release, and still hold anything risky or \
+         ambiguous for the human.".to_string()
+    } else {
+        "[loomux] auto-release DISABLED for this group: publishing a release/tag now \
+         requires an explicit human release grant again — do not `gh release` or push a \
+         v* tag yourself; ask the human to grant it.".to_string()
+    }
+}
+
+/// Notice delivered to the orchestrator when supervised dangerous mode is toggled
+/// (#83), or force-cleared because autonomous mode was enabled (`by_autonomous`).
+pub fn dangerous_mode_notice(on: bool, by_autonomous: bool) -> String {
+    if on {
+        "[loomux] SUPERVISED DANGEROUS MODE enabled for this group: the human is present and \
+         has authorized you to perform merges (to the default branch) and releases/tags \
+         yourself, without a per-item grant. Audit and announce every merge/release; still \
+         hold anything genuinely risky and flag it. This is a supervised session — the human \
+         is watching.".to_string()
+    } else if by_autonomous {
+        "[loomux] supervised dangerous mode was turned OFF because autonomous mode was enabled \
+         (the two are mutually exclusive). Merge/release authority now follows the autonomous \
+         auto-merge / auto-release toggles + grants.".to_string()
+    } else {
+        "[loomux] supervised dangerous mode DISABLED for this group: the human gate is back — \
+         open PRs and report, do not merge to the default branch or publish releases/tags \
+         yourself unless the human grants it.".to_string()
+    }
+}
+
 /// The POSIX `gh` shim (#83), with the real gh's absolute path baked in. Mirrors
 /// the pure `gh_is_merge_invocation` / `gh_gate_decision` spec in shell: only
 /// `gh pr merge` (and cheap `gh api` merge shapes) is gated; a merge onto the
@@ -151,12 +187,25 @@ for tok in "$@"; do
 done
 
 # RELEASE/TAG publish (#83): create/edit/delete a release is a publish-to-the-world
-# action — gated on an explicit release grant, NEVER blanket-allowed by autonomous
-# mode. Read-only release subcommands (view/list/download) pass through.
+# action — allowed when the group is autonomous AND has opted in via the auto_release
+# marker (parallel to autonomous+auto_merge for merges), OR by an explicit per-tag
+# release grant. Read-only release subcommands (view/list/download) pass through.
 if [ "$cmd" = "release" ]; then
   case "$sub" in
     create|edit|delete)
       tag="$sel"
+      # Blanket: autonomous + auto_release opt-in (default off, so autonomous alone
+      # never publishes).
+      if [ -n "$LOOMUX_GROUP_DIR" ] && [ -f "$LOOMUX_GROUP_DIR/autonomous" ] && [ -f "$LOOMUX_GROUP_DIR/auto_release" ]; then
+        loomux_audit "release-gate-allowed" "{\"tag\":\"$tag\",\"action\":\"$sub\"}"
+        exec "$REAL_GH" "$@"
+      fi
+      # Supervised dangerous mode (human present, not autonomous). Distinct audit.
+      if [ -n "$LOOMUX_GROUP_DIR" ] && [ -f "$LOOMUX_GROUP_DIR/dangerous_mode" ] && [ ! -f "$LOOMUX_GROUP_DIR/autonomous" ]; then
+        loomux_audit "release-gate-dangerous" "{\"tag\":\"$tag\",\"action\":\"$sub\"}"
+        exec "$REAL_GH" "$@"
+      fi
+      # Otherwise a one-time per-tag grant authorizes exactly this publish.
       safe=$(printf '%s' "$tag" | tr -c 'A-Za-z0-9._-' '_')
       gf=""
       [ -n "$LOOMUX_GROUP_DIR" ] && [ -n "$safe" ] && gf="$LOOMUX_GROUP_DIR/release_grants/$safe"
@@ -205,9 +254,15 @@ fi
 if [ "$base" != "$default" ]; then
   exec "$REAL_GH" "$@"   # integration-branch merge — untouched
 fi
-# base == default: blanket-allowed only when BOTH consent markers are present.
+# base == default: blanket-allowed while autonomous + auto_merge.
 if [ -n "$LOOMUX_GROUP_DIR" ] && [ -f "$LOOMUX_GROUP_DIR/autonomous" ] && [ -f "$LOOMUX_GROUP_DIR/auto_merge" ]; then
   loomux_audit "merge-gate-allowed" "{\"base\":\"$default\",\"pr\":\"$num\"}"
+  exec "$REAL_GH" "$@"
+fi
+# Supervised dangerous mode: the human is present and enabled it (only valid while
+# NOT autonomous). Distinct audit marker.
+if [ -n "$LOOMUX_GROUP_DIR" ] && [ -f "$LOOMUX_GROUP_DIR/dangerous_mode" ] && [ ! -f "$LOOMUX_GROUP_DIR/autonomous" ]; then
+  loomux_audit "merge-gate-dangerous" "{\"base\":\"$default\",\"pr\":\"$num\"}"
   exec "$REAL_GH" "$@"
 fi
 # Otherwise: a one-time human grant for THIS pr authorizes exactly one merge.
@@ -329,6 +384,17 @@ done
 if [ -z "$tag" ]; then
   exec "$REAL_GIT" "$@"   # branch push — untouched
 fi
+# Blanket: autonomous + auto_release opt-in (parallel to the gh release path).
+if [ -n "$LOOMUX_GROUP_DIR" ] && [ -f "$LOOMUX_GROUP_DIR/autonomous" ] && [ -f "$LOOMUX_GROUP_DIR/auto_release" ]; then
+  loomux_audit "release-gate-allowed" "{\"tag\":\"$tag\",\"action\":\"push\"}"
+  exec "$REAL_GIT" "$@"
+fi
+# Supervised dangerous mode (human present, not autonomous). Distinct audit.
+if [ -n "$LOOMUX_GROUP_DIR" ] && [ -f "$LOOMUX_GROUP_DIR/dangerous_mode" ] && [ ! -f "$LOOMUX_GROUP_DIR/autonomous" ]; then
+  loomux_audit "release-gate-dangerous" "{\"tag\":\"$tag\",\"action\":\"push\"}"
+  exec "$REAL_GIT" "$@"
+fi
+# Otherwise a one-time per-tag grant authorizes exactly this tag push.
 safe=$(printf '%s' "$tag" | tr -c 'A-Za-z0-9._-' '_')
 gf=""
 [ -n "$LOOMUX_GROUP_DIR" ] && [ -n "$safe" ] && gf="$LOOMUX_GROUP_DIR/release_grants/$safe"
@@ -1115,6 +1181,11 @@ pub enum GhGate {
     /// authorized by a valid one-time human grant. The shim CONSUMES the grant and
     /// allows exactly this one action.
     AllowGrant,
+    /// Allowed by **supervised dangerous mode** (`dangerous_mode` marker, while NOT
+    /// autonomous): the human is present and told the agent to just do merges/
+    /// releases. Distinct from the autonomous blanket and from a grant so the audit
+    /// records which gate path allowed it. Not consumed (it's a standing mode).
+    AllowDangerous,
     /// A merge onto the default branch (or a release) without authorization: block
     /// (the human gate — the human can grant a one-time exception).
     Block,
@@ -1217,18 +1288,24 @@ pub fn gh_is_merge_invocation(args: &[String]) -> bool {
     false
 }
 
-/// The gate decision (pure spec for the shim). `is_merge` is
-/// [`gh_is_merge_invocation`]; `base`/`default` are the PR base branch and the
-/// repo default branch as resolved by the *real* gh (`None` = couldn't determine);
-/// `autonomous`/`auto_merge` are the group's live marker states. A merge onto the
-/// default branch is allowed ONLY when both markers are present; a non-default
-/// base passes; an undeterminable base fails safe (block).
+/// The gate decision (pure spec for the shim), the SINGLE decision point every
+/// merge form routes through. `is_merge` is [`gh_is_merge_invocation`];
+/// `base`/`default` are the PR base branch and the repo default branch as resolved
+/// by the *real* gh (`None` = couldn't determine); `autonomous`/`auto_merge`/
+/// `dangerous`/`grant_valid` are the group's live marker states. A merge onto the
+/// default branch is allowed when **`(autonomous && auto_merge)`** (autonomous
+/// blanket) OR **`(dangerous && !autonomous)`** (supervised dangerous mode — the
+/// human is present) OR a valid one-time grant; a non-default base passes; an
+/// undeterminable base fails safe (block). `dangerous` is a no-op while autonomous
+/// (the two are mutually exclusive, enforced at the setters; the `!autonomous`
+/// guard is defensive).
 pub fn gh_gate_decision(
     is_merge: bool,
     base: Option<&str>,
     default: Option<&str>,
     autonomous: bool,
     auto_merge: bool,
+    dangerous: bool,
     grant_valid: bool,
 ) -> GhGate {
     if !is_merge {
@@ -1240,6 +1317,8 @@ pub fn gh_gate_decision(
                 GhGate::PassThrough // integration-branch flow is untouched
             } else if autonomous && auto_merge {
                 GhGate::AllowMerge // blanket opening while in autonomous auto-merge
+            } else if dangerous && !autonomous {
+                GhGate::AllowDangerous // supervised: human present, told it to merge
             } else if grant_valid {
                 GhGate::AllowGrant // one-time human grant for THIS pr — consumed
             } else {
@@ -1273,13 +1352,28 @@ pub fn gh_release_action(args: &[String]) -> Option<(String, String)> {
     Some((sub.to_string(), tag))
 }
 
-/// The gate decision for a release/tag publish (#83). Unlike a merge, a
-/// release/tag is allowed ONLY by an explicit one-time grant — never by the
-/// blanket autonomous+auto_merge opening, because publishing to the world (GitHub
-/// release + npm via the `v*` tag → release.yml) is a strictly bigger blast radius
-/// than merging, so it demands its own human sign-off even in autonomous mode.
-pub fn release_gate_decision(grant_valid: bool) -> GhGate {
-    if grant_valid { GhGate::AllowGrant } else { GhGate::Block }
+/// The gate decision for a release/tag publish (#83). Parallel to
+/// `gh_gate_decision` for merges: allowed when **`(autonomous && auto_release)`**
+/// (the blanket opening) OR a valid one-time grant for that tag (consumed). Because
+/// publishing to the world (GitHub release + npm via a `v*` tag → release.yml) is a
+/// bigger blast radius than a merge, releases get their **own independent** toggle
+/// (`auto_release`, default OFF) — turning on autonomous never surprise-publishes;
+/// the human opts in separately, or grants each release one at a time.
+pub fn release_gate_decision(
+    autonomous: bool,
+    auto_release: bool,
+    dangerous: bool,
+    grant_valid: bool,
+) -> GhGate {
+    if autonomous && auto_release {
+        GhGate::AllowMerge // blanket opening (reusing the "allowed, not grant-consumed" variant)
+    } else if dangerous && !autonomous {
+        GhGate::AllowDangerous // supervised: human present, told it to release
+    } else if grant_valid {
+        GhGate::AllowGrant
+    } else {
+        GhGate::Block
+    }
 }
 
 /// What a `git push` publishes with respect to tags (#83). Local `git tag` is
@@ -1915,6 +2009,20 @@ pub struct OrchRegistry {
     /// in the orchestrator template; the backend stores/exposes the flag and
     /// mirrors it into the orchestrator's kickoff config.
     auto_merge_groups: Mutex<HashSet<String>>,
+    /// Autonomous mode (#83): groups where the orchestrator may publish a
+    /// release/tag itself (`gh release …`, pushing a `v*` tag) instead of needing a
+    /// per-tag human grant. **Independent of `auto_merge`** — the human can allow
+    /// auto-merge while keeping releases manual, or opt into both. Default OFF
+    /// (absent), so turning autonomous on never surprise-publishes. Durable
+    /// `auto_release` marker; gated behind autonomous exactly like `auto_merge`.
+    auto_release_groups: Mutex<HashSet<String>>,
+    /// Supervised dangerous mode (#83): groups where the human — present and
+    /// supervising — has authorized the orchestrator to merge/release itself
+    /// WITHOUT being autonomous. Default OFF. **Mutually exclusive with
+    /// `autonomous`**: enabling autonomous force-clears this, and enabling this is
+    /// rejected while autonomous. Durable `dangerous_mode` marker; the gate's single
+    /// decision point allows a privileged action via `(dangerous && !autonomous)`.
+    dangerous_groups: Mutex<HashSet<String>>,
     /// Autonomous mode (#83): per-group idle-tick delivery timestamps (Unix-ms)
     /// for the `MAX_IDLE_TICKS_PER_HOUR` backstop; pruned to the trailing hour on
     /// each check. The runaway analogue of `spawn_times`.
@@ -2713,6 +2821,8 @@ impl OrchRegistry {
             notify_groups: Mutex::new(HashSet::new()),
             autonomous_groups: Mutex::new(HashSet::new()),
             auto_merge_groups: Mutex::new(HashSet::new()),
+            auto_release_groups: Mutex::new(HashSet::new()),
+            dangerous_groups: Mutex::new(HashSet::new()),
             idle_tick_times: Mutex::new(HashMap::new()),
             pending_max_notice: Mutex::new(HashMap::new()),
             claude_projects_dir: Mutex::new(None),
@@ -3618,6 +3728,31 @@ impl OrchRegistry {
                     json!({ "reason": "reconcile-autonomous-off" }));
             }
         }
+        // Auto-release re-seed with the same dependency reconcile (independent of
+        // auto_merge): valid only alongside autonomous; a stale marker is cleared.
+        if dir.join("auto_release").is_file() {
+            if self.autonomous_groups.lock_safe().contains(&id) {
+                self.auto_release_groups.lock_safe().insert(id.clone());
+                self.audit(&id, "loomux", "auto-release-resumed", json!({ "from": "marker" }));
+            } else {
+                let _ = remove_marker(&dir.join("auto_release"));
+                self.audit(&id, "loomux", "auto-release-off",
+                    json!({ "reason": "reconcile-autonomous-off" }));
+            }
+        }
+        // Supervised dangerous mode re-seed (#83): valid only while NOT autonomous
+        // (mutually exclusive). If both markers survived a hand-edit, autonomous
+        // wins and the stale dangerous marker is cleared + audited.
+        if dir.join("dangerous_mode").is_file() {
+            if self.autonomous_groups.lock_safe().contains(&id) {
+                let _ = remove_marker(&dir.join("dangerous_mode"));
+                self.audit(&id, "loomux", "dangerous-mode-off",
+                    json!({ "reason": "reconcile-autonomous-on" }));
+            } else {
+                self.dangerous_groups.lock_safe().insert(id.clone());
+                self.audit(&id, "loomux", "dangerous-mode-resumed", json!({ "from": "marker" }));
+            }
+        }
         self.groups.lock_safe().insert(id.clone(), info.clone());
         self.audit(&id, "loomux", if resumed { "group-resume" } else { "group-create" },
             json!({ "repo": repo, "max_agents": info.guardrails.max_agents,
@@ -4195,6 +4330,7 @@ impl OrchRegistry {
         // UNCONDITIONALLY — the same #149 pattern (in-memory authoritative even if
         // disk removal fails).
         self.force_disable_auto_merge(group, "loomux", "autonomous-suspended");
+        self.force_disable_auto_release(group, "loomux", "autonomous-suspended");
         // Best-effort durable disable; failure is surfaced in the audit trail.
         match remove_marker(&self.group_dir(group).join("autonomous")) {
             Ok(()) => self.audit(group, "loomux", "autonomous-off", json!({})),
@@ -4211,6 +4347,30 @@ impl OrchRegistry {
             let _ = remove_marker(&self.group_dir(group).join("auto_merge"));
             self.audit(group, actor, "auto-merge-off", json!({ "reason": reason }));
             let _ = self.deliver_to_orchestrator(group, &auto_merge_notice(false), "loomux");
+        }
+    }
+
+    /// Drop auto-release for a group UNCONDITIONALLY (same money-stop as
+    /// `force_disable_auto_merge`): auto-release without autonomous would leave the
+    /// release gate open, so the in-memory gate set is authoritative and cleared
+    /// even if the marker removal fails.
+    fn force_disable_auto_release(&self, group: &str, actor: &str, reason: &str) {
+        if self.auto_release_groups.lock_safe().remove(group) {
+            let _ = remove_marker(&self.group_dir(group).join("auto_release"));
+            self.audit(group, actor, "auto-release-off", json!({ "reason": reason }));
+            let _ = self.deliver_to_orchestrator(group, &auto_release_notice(false), "loomux");
+        }
+    }
+
+    /// Drop supervised dangerous mode UNCONDITIONALLY (mutual exclusion: enabling
+    /// autonomous force-clears it — the two can never both be on). In-memory
+    /// authoritative even if the marker's disk removal fails, with an audit entry
+    /// and a human-visible notice. `by_autonomous` tailors the notice wording.
+    fn force_disable_dangerous_mode(&self, group: &str, actor: &str, reason: &str, by_autonomous: bool) {
+        if self.dangerous_groups.lock_safe().remove(group) {
+            let _ = remove_marker(&self.group_dir(group).join("dangerous_mode"));
+            self.audit(group, actor, "dangerous-mode-off", json!({ "reason": reason }));
+            let _ = self.deliver_to_orchestrator(group, &dangerous_mode_notice(false, by_autonomous), "loomux");
         }
     }
 
@@ -4245,6 +4405,10 @@ impl OrchRegistry {
             let _ = remove_marker(&dir.join("autonomy_suspended"));
             self.audit(group, actor, "autonomous-on",
                 json!({ "budget_anchor_tokens": anchor }));
+            // Mutual exclusion (#83): supervised dangerous mode is the *not*-
+            // autonomous manual mode, so enabling autonomous force-clears it
+            // (audited + human-visible notice).
+            self.force_disable_dangerous_mode(group, actor, "autonomous-enabled", true);
         } else {
             if !self.autonomous_groups.lock_safe().contains(group) {
                 return Ok(()); // already off
@@ -4265,11 +4429,11 @@ impl OrchRegistry {
             // Clear the idle-tick latch so a later re-enable starts clean.
             self.clear_idle_tick_latch(group);
             self.audit(group, actor, "autonomous-off", json!({}));
-            // Dependency (#83): auto-merge exists only in autonomous mode, so
-            // turning autonomous OFF force-disables auto-merge unconditionally
-            // (rev-79 F4) — the pair can never be auto_merge-on/autonomous-off,
-            // which the enforced gate keys on.
+            // Dependency (#83): auto-merge AND auto-release exist only in autonomous
+            // mode, so turning autonomous OFF force-disables both unconditionally
+            // (rev-79 F4) — the pair can never be gate-on/autonomous-off.
             self.force_disable_auto_merge(group, actor, "autonomous-disabled");
+            self.force_disable_auto_release(group, actor, "autonomous-disabled");
         }
         Ok(())
     }
@@ -4331,6 +4495,116 @@ impl OrchRegistry {
         // Tell the running orchestrator the gate moved (best-effort; a dead/paused
         // orchestrator just misses it and re-reads its kickoff config on resume).
         let _ = self.deliver_to_orchestrator(group, &auto_merge_notice(on), "loomux");
+        Ok(())
+    }
+
+    /// Whether the orchestrator may publish releases/tags itself for a group
+    /// (auto-release gate off = releases need a per-tag human grant). Independent
+    /// of auto-merge. Drives the toggle state + mirrored into the kickoff config.
+    pub fn is_auto_release(&self, group: &str) -> bool {
+        self.auto_release_groups.lock_safe().contains(group)
+    }
+
+    /// Enable/disable the auto-release gate for a group, durably (an `auto_release`
+    /// marker file). Default OFF = publishing needs a per-tag human grant. Mirrors
+    /// `set_auto_merge` exactly (independent marker): gated behind autonomous mode
+    /// (rejects enable unless autonomous is on), disk-first fail-loud disable, one
+    /// audited notice to the orchestrator.
+    pub fn set_auto_release(&self, group: &str, on: bool) -> Result<(), String> {
+        let dir = self.group_dir(group);
+        if on {
+            // Same dependency as auto-merge: auto-release authority exists ONLY in
+            // autonomous mode, so the pair can never be auto_release-on/autonomous-off.
+            if !self.is_autonomous(group) {
+                return Err(
+                    "auto-release requires autonomous mode — turn on Autonomous mode first".into(),
+                );
+            }
+            let newly = self.auto_release_groups.lock_safe().insert(group.to_string());
+            if !newly {
+                return Ok(()); // no-op: don't re-notify
+            }
+            if let Err(e) = fs::create_dir_all(&dir)
+                .and_then(|_| fs::write(dir.join("auto_release"), b""))
+            {
+                self.auto_release_groups.lock_safe().remove(group);
+                return Err(format!("failed to enable auto-release: {e}"));
+            }
+            self.audit(group, "human", "auto-release-on", json!({}));
+        } else {
+            if !self.auto_release_groups.lock_safe().contains(group) {
+                return Ok(()); // no-op: don't re-notify
+            }
+            // Disk first, then memory: a surviving `auto_release` marker would
+            // silently re-enable publishing authority on restart, so a failed
+            // removal fails the toggle and leaves the gate consistently ON.
+            if let Err(e) = remove_marker(&dir.join("auto_release")) {
+                self.audit(group, "human", "auto-release-off-failed", json!({ "error": e }));
+                return Err(format!(
+                    "couldn't disable auto-release: the consent marker could not be \
+                     removed, so it stays ON — retry or check disk/permissions"
+                ));
+            }
+            self.auto_release_groups.lock_safe().remove(group);
+            self.audit(group, "human", "auto-release-off", json!({}));
+        }
+        let _ = self.deliver_to_orchestrator(group, &auto_release_notice(on), "loomux");
+        Ok(())
+    }
+
+    /// Whether supervised dangerous mode is on for a group (the human is present and
+    /// authorized manual merges/releases outside autonomous mode). Mutually
+    /// exclusive with autonomous.
+    pub fn is_dangerous_mode(&self, group: &str) -> bool {
+        self.dangerous_groups.lock_safe().contains(group)
+    }
+
+    /// Enable/disable supervised dangerous mode, durably (a `dangerous_mode`
+    /// marker). **Mutually exclusive with autonomous**: enabling is REJECTED while
+    /// autonomous is on (with a clear error); enabling autonomous force-clears this
+    /// (see `set_autonomous_as`). Disk-first fail-loud disable, one audited notice.
+    /// Human-only (Tauri command; no MCP surface — an agent can no more enable this
+    /// than it can mint a grant; the marker's FS-forgeability is the same documented
+    /// bypass class as grant files, closed by a machine account).
+    pub fn set_dangerous_mode(&self, group: &str, on: bool) -> Result<(), String> {
+        let dir = self.group_dir(group);
+        if on {
+            // Mutual exclusion: dangerous mode is the *supervised, not-autonomous*
+            // mode. Reject enabling it while autonomous is on.
+            if self.is_autonomous(group) {
+                return Err(
+                    "dangerous mode can't be enabled while autonomous mode is on — they are \
+                     mutually exclusive; turn off Autonomous mode first".into(),
+                );
+            }
+            let newly = self.dangerous_groups.lock_safe().insert(group.to_string());
+            if !newly {
+                return Ok(()); // no-op
+            }
+            if let Err(e) = fs::create_dir_all(&dir)
+                .and_then(|_| fs::write(dir.join("dangerous_mode"), b""))
+            {
+                self.dangerous_groups.lock_safe().remove(group);
+                return Err(format!("failed to enable dangerous mode: {e}"));
+            }
+            self.audit(group, "human", "dangerous-mode-on", json!({}));
+        } else {
+            if !self.dangerous_groups.lock_safe().contains(group) {
+                return Ok(()); // no-op
+            }
+            // Disk first, fail loud: a surviving marker would silently re-enable
+            // merge/release authority on restart.
+            if let Err(e) = remove_marker(&dir.join("dangerous_mode")) {
+                self.audit(group, "human", "dangerous-mode-off-failed", json!({ "error": e }));
+                return Err(format!(
+                    "couldn't disable dangerous mode: the marker could not be removed, so it \
+                     stays ON — retry or check disk/permissions"
+                ));
+            }
+            self.dangerous_groups.lock_safe().remove(group);
+            self.audit(group, "human", "dangerous-mode-off", json!({ "reason": "human" }));
+        }
+        let _ = self.deliver_to_orchestrator(group, &dangerous_mode_notice(on, false), "loomux");
         Ok(())
     }
 
@@ -4531,6 +4805,8 @@ impl OrchRegistry {
         json!({
             "autonomous": on,
             "auto_merge": self.is_auto_merge(group),
+            "auto_release": self.is_auto_release(group),
+            "dangerous_mode": self.is_dangerous_mode(group),
             "budget_tokens": budget,
             "budget_anchor_tokens": anchor,
             "spend_since_enable_tokens": spend,
@@ -6308,7 +6584,7 @@ impl OrchRegistry {
                 "You are the orchestrator of loomux agent group {gid} for the repository {repo}.\n\
                  First read your role instructions: {ins}\n\
                  Guardrails (enforced by loomux): max {max} live agents, worker model {wm}, reviewer model {rm}, planner model {pm}.\n\
-                 Group config: auto-merge is {automerge} (see the merge-gate section of your instructions); autonomous idle-tick mode is {autonomous}.\n\
+                 Group config: auto-merge is {automerge}; auto-release is {autorelease}; supervised dangerous mode is {dangerous} (see the merge-gate section of your instructions); autonomous idle-tick mode is {autonomous}.\n\
                  Start by calling get_state, run `gh issue list --label agent-managed --state open`, call list_agents, \
                  reconcile them, then give the human a short status summary and wait for direction.",
                 gid = g.id, repo = g.repo, ins = instructions.display(),
@@ -6318,6 +6594,8 @@ impl OrchRegistry {
                 // Live toggles also deliver a mid-session notice; this covers a
                 // fresh boot / resume, where there's no notice to have seen.
                 automerge = if self.is_auto_merge(&g.id) { "ENABLED (you may merge adequately-tested PRs yourself)" } else { "disabled (human merge gate is absolute — never merge)" },
+                autorelease = if self.is_auto_release(&g.id) { "ENABLED (you may publish releases/tags yourself while autonomous)" } else { "disabled (releases/tags need an explicit human grant — never publish)" },
+                dangerous = if self.is_dangerous_mode(&g.id) { "ON — the human is present and supervising, and has authorized you to merge to the default branch AND publish releases/tags yourself without a per-item grant (audit + announce each; still hold anything genuinely risky)" } else { "off" },
                 autonomous = if self.is_autonomous(&g.id) { "ON (you will get [loomux] idle tick wakes to run your cadence unattended)" } else { "off" },
             ),
             Role::Worker | Role::Reviewer | Role::Planner => {
@@ -7198,6 +7476,33 @@ pub fn orch_set_auto_merge(
     enabled: bool,
 ) -> Result<(), String> {
     reg.set_auto_merge(&group_id, enabled)
+}
+
+/// Enable/disable the auto-release gate for a group (durable, audited, independent
+/// of auto-merge). Default OFF = releases/tags need a per-tag human grant; ON lets
+/// the orchestrator publish releases itself while autonomous. Rejects enable unless
+/// autonomous is on.
+#[tauri::command]
+pub fn orch_set_auto_release(
+    reg: tauri::State<Arc<OrchRegistry>>,
+    group_id: String,
+    enabled: bool,
+) -> Result<(), String> {
+    reg.set_auto_release(&group_id, enabled)
+}
+
+/// Enable/disable supervised dangerous mode for a group (#83, durable, audited).
+/// Lets the human — present and supervising — authorize the orchestrator to merge
+/// to the default branch and publish releases/tags itself, WITHOUT autonomous mode.
+/// Mutually exclusive with autonomous: rejects enable while autonomous is on, and
+/// enabling autonomous force-clears it.
+#[tauri::command]
+pub fn orch_set_dangerous_mode(
+    reg: tauri::State<Arc<OrchRegistry>>,
+    group_id: String,
+    enabled: bool,
+) -> Result<(), String> {
+    reg.set_dangerous_mode(&group_id, enabled)
 }
 
 /// Set a group's autonomous-era token budget (0 = no cap; durable, audited).
