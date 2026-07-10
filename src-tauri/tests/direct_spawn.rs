@@ -46,6 +46,7 @@ fn resolved_but_unspawnable_native_exe_falls_back_to_the_shell() {
         Some(&argv),
         None,
         &[],
+        loomux_lib::pty::ShellKind::PowerShell,
     )
     .expect("a resolved-but-unspawnable exe must still yield a child via the shell");
 
@@ -68,8 +69,15 @@ fn a_genuine_native_exe_spawns_directly() {
 
     let pair = open_slave();
     let (mut child, direct_used) =
-        loomux_lib::pty::spawn_pane_child(&*pair.slave, None, Some(&argv), None, &[])
-            .expect("a native exe must spawn");
+        loomux_lib::pty::spawn_pane_child(
+            &*pair.slave,
+            None,
+            Some(&argv),
+            None,
+            &[],
+            loomux_lib::pty::ShellKind::PowerShell,
+        )
+        .expect("a native exe must spawn");
 
     assert!(
         direct_used,

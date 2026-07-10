@@ -296,9 +296,13 @@ function openWelcomeIn(ws: Workspace, dir: "row" | "column" = "row", relativeTo?
  *  out beside it; Orchestrator → its own project tab (the setup pane retires). */
 async function handleWelcomeSubmit(ws: Workspace, pane: Pane, result: WelcomeResult): Promise<void> {
   if (result.kind === "terminal") {
-    // shellKind is captured (#194) but Phase 1 spawns the default shell only;
-    // per-kind shell spawning lands in Phase 2, so it isn't threaded to the PTY yet.
-    await pane.startFromWelcome({ name: result.name, cwd: result.cwd });
+    // Phase 2 (#194): the chosen shell kind is threaded to the PTY so a Terminal
+    // pane spawns PowerShell / cmd / Git Bash as picked.
+    await pane.startFromWelcome({
+      name: result.name,
+      cwd: result.cwd,
+      shellKind: result.shellKind,
+    });
     reapIfExited(ws, pane);
     persistTabs();
     return;

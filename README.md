@@ -7,7 +7,8 @@ A dead simple terminal multiplexer for AI agent management without all the bloat
 
 *Loom* + *mux*: a loom is the frame that holds every thread in place while the
 fabric is woven — here, the frame holding a matrix of terminal panes, each one
-carrying an agent (or just a shell).
+carrying an agent (or just a shell — PowerShell, Command Prompt, or Git Bash,
+picked per pane in the welcome screen).
 
 Windows Terminal–class smoothness with the multiplexing features it lacks:
 instant matrix splits, nameable panes, a native session browser that restores
@@ -101,7 +102,7 @@ and `cargo test --locked`.
 
 ```
 src-tauri/src/
-  pty.rs            PTY lifecycle (spawn/write/resize/kill) + output streaming
+  pty.rs            PTY lifecycle (spawn/write/resize/kill) + output streaming; per-kind Terminal shells (PowerShell/cmd/Git Bash, #194) + Git Bash discovery
   sessions.rs       agent session discovery (one scan_* fn per agent source)
   orchestration/    agent groups: registry, guardrails, MCP server, audit
   obs.rs            crash observability: panic hook, breadcrumb log, unclean-exit notice

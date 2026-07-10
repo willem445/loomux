@@ -84,6 +84,10 @@ From here you can:
 
 - **Split** the pane into a matrix — `Ctrl+Shift+E` (right) or `Ctrl+Shift+O`
   (down). See [Core concepts](core-concepts.html) for the whole grid model.
+- **Pick a shell** on the **Terminal** kind of the welcome screen — PowerShell,
+  Command Prompt, or Git Bash. Git Bash is offered only when Git for Windows is
+  installed; otherwise it's shown disabled with that reason, and any pane still
+  falls back to PowerShell rather than failing to start.
 - **Name** a pane with `F2` so you can tell your agents apart.
 - **Restore a past agent session** with the session browser (`Ctrl+Shift+P`) —
   it scans your machine for resumable Claude Code and Copilot CLI sessions and

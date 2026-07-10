@@ -4,8 +4,10 @@
 //                  name-1 … name-N so every agent gets an isolated worktree)
 //   Orchestrator — an orchestrator pane + N idle workers with guardrails
 //                  (max live agents, pinned models, permission mode)
-//   Terminal     — a plain shell; a shell-kind picker is present but Git Bash /
-//                  cmd land in Phase 2, so only PowerShell is selectable today.
+//   Terminal     — a plain shell; the shell-kind picker spawns PowerShell, cmd,
+//                  or Git Bash (#194 P2). Git Bash is enabled only when a
+//                  Git-for-Windows install is discovered (else disabled, with a
+//                  reason surfaced on the option).
 //
 // This replaces the old modal launcher AND the global "agent mode" toggle: there
 // is no global mode anymore, every pane declares its kind here at creation. The
@@ -17,8 +19,15 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
 import { gitWorktreeAdd } from "./git";
 import type { OrchestratorConfig } from "./orchestration";
-import type { PaneKind, PaneSetupInput, ShellKind } from "./panesetup";
-import { planPaneSetup, worktreeNameFor, SubmitLatch } from "./panesetup";
+import type { PaneKind, PaneSetupInput, ShellKind, ShellKindAvailability } from "./panesetup";
+import {
+  planPaneSetup,
+  worktreeNameFor,
+  SubmitLatch,
+  shellKindOptions,
+  resolveShellKind,
+} from "./panesetup";
+import { discoverGitBash } from "./pty";
 import {
   AGENTS,
   addRecentRepo,
@@ -74,15 +83,6 @@ const ORCH_CLIS: OrchCli[] = [
     models: ["auto", "claude-sonnet-4.6", "claude-haiku-4.5", "gpt-5.2", "gpt-5.3-codex"],
     defaults: { orchestrator: "auto", worker: "auto", reviewer: "auto", planner: "auto" },
   },
-];
-
-/** Terminal shell kinds. Only PowerShell spawns a distinct shell in Phase 1;
- *  Git Bash and cmd are plumbed (panesetup.ts) but per-kind spawning lands in
- *  Phase 2 (#194), so the form disables them for now. */
-const SHELL_KINDS: { key: ShellKind; label: string; ready: boolean }[] = [
-  { key: "powershell", label: "PowerShell", ready: true },
-  { key: "gitbash", label: "Git Bash · Phase 2", ready: false },
-  { key: "cmd", label: "Command Prompt · Phase 2", ready: false },
 ];
 
 const basename = (p: string): string => p.split(/[\\/]/).filter(Boolean).pop() ?? "";
@@ -213,6 +213,10 @@ export class WelcomeForm {
   private countInput: HTMLInputElement;
   private shellField: HTMLElement;
   private shellSel: HTMLSelectElement;
+  /** Discovered shell-kind availability (#194 P2). Git Bash starts unavailable
+   *  and is enabled once backend discovery resolves; PowerShell/cmd are always
+   *  available on Windows. */
+  private shellAvail: ShellKindAvailability = { gitBashPath: null };
   private repoField: HTMLElement;
   private repoInput: HTMLInputElement;
   private repoList: HTMLDataListElement;
@@ -311,21 +315,16 @@ export class WelcomeForm {
       "1 for a single agent; more fans out, suffixing worktrees -1…-N"
     );
 
-    // Terminal shell picker. All kinds are listed so the choice is discoverable,
-    // but only PowerShell spawns a distinct shell in Phase 1 (#194) — the rest
-    // are disabled until Phase 2 wires per-kind spawning.
-    this.shellSel = select(SHELL_KINDS.map((s) => [s.key, s.label]));
-    for (const opt of Array.from(this.shellSel.options)) {
-      const kind = SHELL_KINDS.find((s) => s.key === opt.value);
-      opt.disabled = !kind?.ready;
-    }
+    // Terminal shell picker (#194 P2): PowerShell / Command Prompt / Git Bash.
+    // Git Bash is disabled until backend discovery finds a Git-for-Windows
+    // install (probeGitBash below); PowerShell and cmd are always available.
+    this.shellSel = select(shellKindOptions(this.shellAvail).map((o) => [o.key, o.label]));
     this.shellSel.value = "powershell";
     this.shellSel.addEventListener("change", () => this.updateName());
-    this.shellField = field(
-      "Shell",
-      this.shellSel,
-      "Git Bash & cmd arrive in Phase 2 — PowerShell for now"
-    );
+    this.shellField = field("Shell", this.shellSel, "PowerShell, Command Prompt, or Git Bash");
+    this.applyShellAvailability();
+    // Discover Git Bash off the main path; enable its option when it resolves.
+    void this.probeGitBash();
 
     this.repoInput = document.createElement("input");
     this.repoInput.className = "dlg-input";
@@ -690,12 +689,46 @@ export class WelcomeForm {
     const where =
       this.worktreeInput.value.trim() || basename(this.repoInput.value.trim()) || "home";
     if (this.kind === "terminal") {
-      const shell = SHELL_KINDS.find((s) => s.key === this.shellSel.value);
+      const shell = shellKindOptions(this.shellAvail).find((s) => s.key === this.shellSel.value);
       this.nameInput.value = `${(shell?.label ?? "shell").toLowerCase()} · ${where}`;
       return;
     }
     const agent = AGENTS.find((a) => a.id === this.agentSel.value) ?? AGENTS[0];
     this.nameInput.value = `${agent.label.toLowerCase()} · ${where}`;
+  }
+
+  /** Reflect the discovered shell availability onto the picker: disable a kind
+   *  that isn't installed, surface the reason on its option, and fall the
+   *  selection back to PowerShell if the current kind just became unavailable
+   *  (#194 P2). */
+  private applyShellAvailability(): void {
+    const opts = shellKindOptions(this.shellAvail);
+    for (const optEl of Array.from(this.shellSel.options)) {
+      const o = opts.find((x) => x.key === optEl.value);
+      if (!o) continue;
+      optEl.disabled = !o.enabled;
+      optEl.textContent = o.enabled ? o.label : `${o.label} — not installed`;
+      optEl.title = o.reason;
+    }
+    const current = this.shellSel.value as ShellKind;
+    const resolved = resolveShellKind(current, this.shellAvail);
+    if (resolved !== current) {
+      this.shellSel.value = resolved;
+      this.updateName();
+    }
+  }
+
+  /** Discover Git Bash backend-side and update the picker. Failures leave it
+   *  unavailable (disabled with a reason) rather than crashing the form. */
+  private async probeGitBash(): Promise<void> {
+    let path: string | null = null;
+    try {
+      path = await discoverGitBash();
+    } catch {
+      path = null;
+    }
+    this.shellAvail = { gitBashPath: path };
+    this.applyShellAvailability();
   }
 
   private async pickRepo(): Promise<void> {
@@ -747,11 +780,10 @@ export class WelcomeForm {
     const plan = res.plan;
 
     if (plan.kind === "terminal") {
-      // Defensive: only Phase-1-ready shell kinds actually spawn a distinct shell;
-      // a not-yet-wired kind (a future non-UI caller — the UI disables them) falls
-      // back to PowerShell so the pane name can't misdescribe what spawned.
-      const ready = SHELL_KINDS.find((s) => s.key === plan.shellKind)?.ready;
-      const shellKind: ShellKind = ready ? plan.shellKind : "powershell";
+      // Resolve against discovered availability: an unavailable kind (a stale Git
+      // Bash selection, or a non-UI caller) falls back to PowerShell so the pane
+      // name can't misdescribe what spawned — mirrors the backend fallback.
+      const shellKind = resolveShellKind(plan.shellKind, this.shellAvail);
       if (plan.cwd) addRecentRepo(plan.cwd);
       this.setBusy(true, "Starting…");
       this.fire({ kind: "terminal", name: plan.name, cwd: plan.cwd ?? undefined, shellKind });

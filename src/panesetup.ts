@@ -5,10 +5,11 @@
 // repo", "a custom agent needs a command", count-clamping, and worktree fan-out
 // rule lives here so it is unit-tested without a DOM (test/panesetup.test.ts).
 //
-// Shell kinds are PLUMBED here (the type carries Git Bash / cmd / PowerShell) but
-// only PowerShell actually spawns a distinct shell in Phase 1 — per-kind spawning
-// lands in Phase 2 (#194). This module validates and passes the value through;
-// the live form disables the not-yet-wired kinds.
+// Phase 2 (#194) wires all three shell kinds (PowerShell / cmd / Git Bash) to
+// real per-kind spawning. PowerShell and cmd are always available on Windows;
+// Git Bash depends on a Git-for-Windows install, discovered backend-side. This
+// module owns the pure kind→enable/disable mapping and the fallback resolver so
+// the form logic is unit-tested without a DOM (test/panesetup.test.ts).
 
 export type PaneKind = "agent" | "orchestrator" | "terminal";
 export type ShellKind = "powershell" | "gitbash" | "cmd";
@@ -131,6 +132,54 @@ export function pathTail(p: string): string {
  *  isolated worktree (the existing multi-pane behavior, #194). */
 export function worktreeNameFor(base: string, index: number, count: number): string {
   return count > 1 ? `${base}-${index}` : base;
+}
+
+// ---------- shell kinds (#194 P2) ----------
+
+/** Backend-discovered availability of the shell kinds whose presence isn't
+ *  guaranteed. PowerShell and cmd are always present on Windows; only Git Bash
+ *  needs an install, so it's the only field here. */
+export interface ShellKindAvailability {
+  /** Git Bash `bash.exe` path, or null when Git for Windows isn't installed. */
+  gitBashPath: string | null;
+}
+
+/** A shell-kind choice for the picker: its label, whether it can be selected,
+ *  and — when it can't — the reason to surface (tooltip). */
+export interface ShellKindOption {
+  key: ShellKind;
+  label: string;
+  enabled: boolean;
+  /** Why the kind is disabled; "" when enabled. */
+  reason: string;
+}
+
+const GIT_BASH_MISSING = "Git Bash not found — install Git for Windows to enable it.";
+
+/** The shell-kind picker options given what the backend discovered. Order is the
+ *  menu order. PowerShell and cmd are always enabled; Git Bash is enabled only
+ *  when a `bash.exe` was found, otherwise disabled with a reason (#194 P2). */
+export function shellKindOptions(avail: ShellKindAvailability): ShellKindOption[] {
+  const gitBash = avail.gitBashPath !== null;
+  return [
+    { key: "powershell", label: "PowerShell", enabled: true, reason: "" },
+    { key: "cmd", label: "Command Prompt", enabled: true, reason: "" },
+    {
+      key: "gitbash",
+      label: "Git Bash",
+      enabled: gitBash,
+      reason: gitBash ? "" : GIT_BASH_MISSING,
+    },
+  ];
+}
+
+/** Resolve the shell kind a Terminal pane should actually spawn: the requested
+ *  kind when it's available, else PowerShell. Mirrors the backend's explicit
+ *  fallback so the pane name can't misdescribe what starts, and so a stale
+ *  selection (Git Bash uninstalled after it was picked) degrades cleanly. */
+export function resolveShellKind(requested: ShellKind, avail: ShellKindAvailability): ShellKind {
+  const opt = shellKindOptions(avail).find((o) => o.key === requested);
+  return opt && opt.enabled ? requested : "powershell";
 }
 
 /** Validate + shape the chosen pane setup. Pure — no probes, no worktree

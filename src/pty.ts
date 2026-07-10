@@ -7,6 +7,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import type { ShellKind } from "./panesetup";
 
 export interface SpawnOptions {
   cols: number;
@@ -15,6 +16,10 @@ export interface SpawnOptions {
   cwd?: string;
   /** Command line run through the default shell; omit for a plain shell. */
   command?: string;
+  /** Which interactive shell a plain Terminal pane spawns (#194 P2). Ignored
+   *  when `command`/`argv` is present (agent panes run through the default
+   *  shell). Unknown/absent falls back to PowerShell backend-side. */
+  shellKind?: ShellKind;
   /** Structured agent invocation (program + args). When present and its program
    *  resolves to a native executable, the backend spawns it directly as the pty
    *  child — no wrapper shell (issue #78) — falling back to `command` otherwise. */
@@ -80,6 +85,12 @@ let backendInfo: Promise<PtyBackendInfo> | null = null;
 
 /** Resolve display name + git branch for a directory the shell reported. */
 export const dirInfo = (path: string): Promise<DirInfo> => invoke("dir_info", { path });
+
+/** Discover the Git Bash `bash.exe` path, or null when Git for Windows isn't
+ *  installed (#194 P2). The welcome screen uses this to enable/disable the Git
+ *  Bash shell kind with a reason before any pane is spawned. */
+export const discoverGitBash = (): Promise<string | null> =>
+  invoke<string | null>("discover_git_bash");
 
 /** Drive a pane's shell to `cd` into `path`. */
 export const changeDir = (id: number, path: string): Promise<void> =>

@@ -24,6 +24,7 @@ import {
   ptyBackendInfo,
 } from "./pty";
 import { voiceController, type VoiceTargetPane, type VoicePhase } from "./voicecontrol";
+import type { ShellKind } from "./panesetup";
 import { invoke } from "@tauri-apps/api/core";
 import { parseOsc52, writeClipboard } from "./clipboard";
 import {
@@ -139,6 +140,9 @@ export interface PaneOptions {
   name?: string;
   cwd?: string;
   command?: string;
+  /** Which interactive shell a plain Terminal pane spawns (#194 P2). Only used
+   *  for shell panes (no `command`/`argv`); omitted panes spawn PowerShell. */
+  shellKind?: ShellKind;
   /** Structured agent invocation for direct-CLI spawn (issue #78); the backend
    *  falls back to `command` (shell wrapper) when it can't apply. */
   argv?: string[];
@@ -635,6 +639,7 @@ export class Pane implements VoiceTargetPane {
         command: opts.command,
         argv: opts.argv,
         env: opts.env,
+        shellKind: opts.shellKind,
       });
       if (this.disposed) {
         killPty(ptyId).catch(() => {});

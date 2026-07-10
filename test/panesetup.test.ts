@@ -9,6 +9,8 @@ import {
   pathTail,
   worktreeNameFor,
   SubmitLatch,
+  shellKindOptions,
+  resolveShellKind,
   type PaneSetupInput,
 } from "../src/panesetup.ts";
 
@@ -43,7 +45,7 @@ test("terminal always validates; empty repo means home", () => {
   }
 });
 
-test("terminal carries the chosen shell kind through (plumbed for P2)", () => {
+test("terminal carries the chosen shell kind through", () => {
   for (const shellKind of ["powershell", "gitbash", "cmd"] as const) {
     const res = planPaneSetup(input({ kind: "terminal", shellKind }));
     assert.ok(res.ok && res.plan.kind === "terminal" && res.plan.shellKind === shellKind);
@@ -59,6 +61,39 @@ test("terminal cwd + default name come from the repo path tail", () => {
     assert.equal(res.plan.cwd, "C:\\Projects\\loomux\\");
     assert.equal(res.plan.name, "loomux");
   }
+});
+
+// ---------- shell kinds (#194 P2) ----------
+
+test("PowerShell and cmd are always enabled; Git Bash follows discovery", () => {
+  const withBash = shellKindOptions({ gitBashPath: "C:\\Program Files\\Git\\bin\\bash.exe" });
+  const ps = withBash.find((o) => o.key === "powershell");
+  const cmd = withBash.find((o) => o.key === "cmd");
+  const bash = withBash.find((o) => o.key === "gitbash");
+  assert.ok(ps?.enabled && cmd?.enabled && bash?.enabled);
+  // No reason text on an enabled option.
+  assert.equal(bash?.reason, "");
+});
+
+test("Git Bash is disabled with a reason when not installed", () => {
+  const opts = shellKindOptions({ gitBashPath: null });
+  const bash = opts.find((o) => o.key === "gitbash");
+  assert.equal(bash?.enabled, false);
+  assert.match(bash?.reason ?? "", /Git for Windows/);
+  // The always-available kinds are unaffected.
+  assert.ok(opts.find((o) => o.key === "powershell")?.enabled);
+  assert.ok(opts.find((o) => o.key === "cmd")?.enabled);
+});
+
+test("resolveShellKind keeps an available kind but falls unavailable ones back to PowerShell", () => {
+  const installed = { gitBashPath: "C:\\Git\\bin\\bash.exe" };
+  const missing = { gitBashPath: null };
+  // Available → unchanged.
+  assert.equal(resolveShellKind("gitbash", installed), "gitbash");
+  assert.equal(resolveShellKind("cmd", missing), "cmd");
+  assert.equal(resolveShellKind("powershell", missing), "powershell");
+  // Requested-but-unavailable Git Bash → PowerShell fallback.
+  assert.equal(resolveShellKind("gitbash", missing), "powershell");
 });
 
 // ---------- orchestrator ----------
