@@ -102,6 +102,15 @@ change. It is: `export const AUTO_RESUME_AGENTS` in `panerestore.ts`. Set it to
 Rejected outright: **re-attaching** to the old PTY (impossible — it died with the
 process) and **auto-resume-with-a-replayed-prompt** (would spend credits on boot).
 
+**Orch leaves + the double-spawn contract.** Unlike the earlier plans, `capture()`
+*does* serialize orchestration panes (as `paneKind: "orch"`) rather than dropping
+them, so the layout keeps its shape — but `planPaneRestore` maps them to
+`dormant-group`, which **must spawn nothing**. The group is revived only by the
+tab's `groupId` binding through `resumeOrchSession`; if Phase 4's handling of
+`dormant-group` ever opened a pane, a subsequent group resume would double-spawn
+every worker (the #78 storm). That contract lives on the `RestoreAction`
+`dormant-group` variant and must be honored in the Phase 4 rebuild.
+
 ## Module map (this phase)
 
 | Piece | File | Role |
