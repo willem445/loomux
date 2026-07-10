@@ -323,6 +323,10 @@ export class Pane implements VoiceTargetPane {
    *  still offers the same restore next boot. Null for any live/welcome pane. */
   private dormantEl: HTMLElement | null = null;
   private dormantRecord: PersistedPane | null = null;
+  /** True once the pane's process has exited but the pane was kept open to show
+   *  its output (notifyExited). The counter must not count a dead agent as live
+   *  (#194 P4 LOW-7). */
+  private exited = false;
   /** Ordered input pipe to the PTY: serializes every keystroke/paste so the
    *  async IPC writes can't reorder (a bracketed-paste terminator overtaking
    *  its body wedges the target app — #65). Buffers input produced before the
@@ -1339,7 +1343,7 @@ export class Pane implements VoiceTargetPane {
       return { kind: this.dormantRecord.paneKind === "orch" ? "orch" : "agent", live: false };
     }
     const kind = this.liveKind();
-    return { kind, live: this.ptyId !== null };
+    return { kind, live: this.ptyId !== null && !this.exited };
   }
 
   /** Whichever overlay (git / tasks / audit / group) is currently covering
@@ -1484,6 +1488,10 @@ export class Pane implements VoiceTargetPane {
 
   /** Announce a kept-open pane's exit inside its terminal. */
   notifyExited(code: number | null): void {
+    // The pane stays open to show output, but its process is DEAD — mark it so the
+    // agent counter stops counting it as live (#194 P4 LOW-7). ptyId is left set
+    // (the buffer/scrollback is still attached) so isExited, not ptyId, gates live.
+    this.exited = true;
     const codeTxt = code === null ? "" : ` (code ${code})`;
     this.term.writeln(
       `

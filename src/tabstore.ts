@@ -77,6 +77,11 @@ export interface PersistedTab {
   /** Pane layout tree (#194). Absent/null = old file or a group-only tab →
    *  restore falls back to a single fresh shell. */
   layout?: PersistedLayoutNode | null;
+  /** Minimized (docked) panes (#194 P4). These live OUTSIDE the layout tree, so
+   *  they're captured separately and restored back into the dock — otherwise a
+   *  docked agent session would be silently dropped on restore. Absent/empty when
+   *  the tab has no docked panes. */
+  docked?: PersistedPane[];
 }
 
 export interface PersistedTabs {
@@ -115,6 +120,8 @@ export function encodeTabs(state: PersistedTabs): string {
       groupId: t.groupId,
       // Only serialize a layout when present; an absent one keeps old-file shape.
       ...(t.layout ? { layout: t.layout } : {}),
+      // Same for docked panes: omit the key entirely when there are none.
+      ...(t.docked && t.docked.length ? { docked: t.docked } : {}),
     })),
   });
 }
@@ -190,7 +197,13 @@ export function decodeTabs(raw: string | null): PersistedTabs | null {
   const tabs: PersistedTab[] = [];
   for (const t of obj.tabs) {
     if (!t || typeof t !== "object") continue;
-    const rec = t as { name?: unknown; color?: unknown; groupId?: unknown; layout?: unknown };
+    const rec = t as {
+      name?: unknown;
+      color?: unknown;
+      groupId?: unknown;
+      layout?: unknown;
+      docked?: unknown;
+    };
     if (typeof rec.name !== "string" || !rec.name.trim()) continue;
     const tab: PersistedTab = {
       name: rec.name,
@@ -201,6 +214,12 @@ export function decodeTabs(raw: string | null): PersistedTabs | null {
     // (old-file shape, so the round-trip is exact), while a present-but-malformed
     // layout degrades to null → the tab restores as a single fresh shell.
     if (rec.layout !== undefined) tab.layout = decodeLayout(rec.layout);
+    // Docked panes: drop any malformed entry rather than failing the whole tab
+    // (a lost dock chip is a smaller degradation than a lost tab).
+    if (Array.isArray(rec.docked)) {
+      const docked = rec.docked.map(decodePane).filter((p): p is PersistedPane => p !== null);
+      if (docked.length) tab.docked = docked;
+    }
     tabs.push(tab);
   }
   if (tabs.length === 0) return null;

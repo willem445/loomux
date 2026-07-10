@@ -105,8 +105,11 @@ per-tab form of the group pause described in the
 
 Reopen loomux with a saved session and it asks first: a **"Restore your last
 session?"** splash with **Restore** and **Start fresh**. Tick *Remember my
-choice* and it won't ask again (until you change it); leave it unticked to be
-asked next time. There's no prompt when there's nothing worth restoring — you go
+choice* and future launches skip the splash and do what you picked; leave it
+unticked to be asked again next launch. Pressing **Esc** is a non-committal
+*Start fresh* — it never remembers and **leaves your saved session on disk**, so
+the splash comes back next launch (a stray Escape can't quietly wipe your
+session). There's no prompt when there's nothing worth restoring — you go
 straight to a fresh welcome tab.
 
 **Restore** brings back every tab — names, colors, order, the active tab, its

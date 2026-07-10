@@ -34,7 +34,12 @@ import {
 import { tabAttention, sameAttention, findPaneByPty } from "./tabroute";
 import { encodeTabs, decodeTabs, type PersistedTabs, type PersistedLayoutNode, type PersistedPane } from "./tabstore";
 import { decideRestore } from "./restoredecision";
-import { planLayoutRestore, agentResumeCommand, type RestoreOpenStep } from "./panerestore";
+import {
+  planLayoutRestore,
+  planPaneRestore,
+  agentResumeCommand,
+  type RestoreAction,
+} from "./panerestore";
 import { showRestoreSplash } from "./restoresplash";
 
 // Surface unexpected errors as a visible banner instead of a silently
@@ -159,8 +164,17 @@ function projectName(path: string): string {
 async function launchOrchestratorTab(config: OrchestratorConfig): Promise<void> {
   const ws = tabs.newTab();
   tabs.renameTab(ws.id, projectName(config.repo));
-  const { groupId } = await launchOrchestrator(ws.grid, eventsFor(ws), config);
-  tabs.bindGroup(groupId, ws.id);
+  try {
+    const { groupId } = await launchOrchestrator(ws.grid, eventsFor(ws), config);
+    tabs.bindGroup(groupId, ws.id);
+  } catch (err) {
+    // The tab was created + activated before the launch could fail; don't leave
+    // the human staring at a stranded empty tab (and don't leak one per retry) —
+    // tear it down before propagating (#194 P4 MED-5). The caller re-focuses the
+    // form's own tab and re-enables it.
+    tabs.closeTab(ws.id);
+    throw err;
+  }
   persistTabs();
 }
 
@@ -291,6 +305,7 @@ async function restoreSessionTabs(saved: PersistedTabs): Promise<void> {
     tabs.setColor(ws.id, t.color);
     if (t.groupId) tabs.bindGroup(t.groupId, ws.id);
     if (t.layout) await rebuildLayout(ws, t.layout);
+    if (t.docked?.length) await restoreDocked(ws, t.docked);
   }
   const activeWs = tabs.tabs[saved.activeIndex];
   if (activeWs) tabs.switchTo(activeWs.id);
@@ -305,18 +320,35 @@ async function rebuildLayout(ws: Workspace, layout: PersistedLayoutNode): Promis
   const panes: Pane[] = [];
   for (const step of steps) {
     const anchor = step.relativeTo === null ? undefined : panes[step.relativeTo];
-    panes.push(await openRestoreStep(ws, step, anchor));
+    panes.push(await openActionPane(ws, step.action, step.dir, anchor));
   }
   // openPane/openDormantPane reset flex to equal shares as they split; put the
   // saved weights back now that the whole tree exists.
   ws.grid.applyLayoutWeights(layout);
 }
 
-/** Open the ONE pane a restore step describes, per the adopted hybrid. */
-async function openRestoreStep(ws: Workspace, step: RestoreOpenStep, anchor?: Pane): Promise<Pane> {
-  const a = step.action;
+/** Restore a tab's minimized (docked) panes: open each by its restore action,
+ *  then park it back in the dock (#194 P4 MED-6) — otherwise a docked agent
+ *  session would be silently lost. Its minimized-ness is preserved; if a docked
+ *  pane happens to be the tab's only pane it can't re-minimize (grid never empties
+ *  the dock's parent), so it stays visible rather than being dropped. */
+async function restoreDocked(ws: Workspace, docked: PersistedPane[]): Promise<void> {
+  for (const record of docked) {
+    const pane = await openActionPane(ws, planPaneRestore(record));
+    ws.grid.minimize(pane);
+  }
+}
+
+/** Open the ONE pane a restore action describes, per the adopted hybrid. Shared
+ *  by the layout replay (with the step's dir/anchor) and docked restore (default
+ *  placement, then minimized by the caller). */
+async function openActionPane(
+  ws: Workspace,
+  a: RestoreAction,
+  dir: "row" | "column" = "row",
+  anchor?: Pane
+): Promise<Pane> {
   const events = eventsFor(ws);
-  const dir = step.dir;
   switch (a.type) {
     case "spawn-terminal":
       return ws.grid.openPane(
@@ -360,13 +392,16 @@ async function openRestoreStep(ws: Workspace, step: RestoreOpenStep, anchor?: Pa
         "Start",
         a.name,
         "This agent had no resumable session — start it fresh in its folder.",
-        () =>
+        () => {
+          // startFromDormant tears the card down synchronously, so a second click
+          // can't re-fire; notify once it's live so the counter reflects it.
           void pane.startFromDormant({
             name: a.name,
             cwd: a.cwd ?? undefined,
             command: a.command ?? undefined,
             argv: a.argv ?? undefined,
-          })
+          }).then(() => onGridChanged());
+        }
       );
       pane = ws.grid.openDormantPane(events, record, content, dir, anchor);
       return pane;
@@ -388,7 +423,18 @@ async function openRestoreStep(ws: Workspace, step: RestoreOpenStep, anchor?: Pa
         "Resume group",
         a.name,
         "Orchestration group — dormant. Resume brings the whole group back; no agents run until you do.",
-        () => void resumeDormantGroup(ws)
+        (btn) => {
+          // In-flight guard (#194 P4 MED-3): resumeDormantGroup awaits, and the
+          // card stays until it succeeds — a second click while it's running could
+          // double-create the group (two orchestrator PTYs), the exact double-spawn
+          // the contract forbids. Disable on first click; re-enable only on failure
+          // (success disposes the card).
+          if (btn.disabled) return;
+          btn.disabled = true;
+          void resumeDormantGroup(ws).finally(() => {
+            btn.disabled = false;
+          });
+        }
       );
       return ws.grid.openDormantPane(events, record, content, dir, anchor);
     }
@@ -396,8 +442,14 @@ async function openRestoreStep(ws: Workspace, step: RestoreOpenStep, anchor?: Pa
 }
 
 /** The small card a dormant restore placeholder renders: a title, a one-line
- *  explanation, and the single action (Start / Resume group). */
-function dormantCard(action: string, title: string, body: string, onClick: () => void): HTMLElement {
+ *  explanation, and the single action (Start / Resume group). The click handler
+ *  receives the button so it can guard against a double-fire (MED-3). */
+function dormantCard(
+  action: string,
+  title: string,
+  body: string,
+  onClick: (btn: HTMLButtonElement) => void
+): HTMLElement {
   const wrap = document.createElement("div");
   wrap.className = "dormant-card";
   const h = document.createElement("div");
@@ -410,7 +462,7 @@ function dormantCard(action: string, title: string, body: string, onClick: () =>
   btn.className = "dormant-btn";
   btn.type = "button";
   btn.textContent = action;
-  btn.addEventListener("click", onClick);
+  btn.addEventListener("click", () => onClick(btn));
   wrap.append(h, p, btn);
   return wrap;
 }
@@ -450,7 +502,9 @@ async function resumeDormantGroup(ws: Workspace): Promise<void> {
     });
     if (restored) tabs.bindGroup(restored.groupId, ws.id);
   } catch (err) {
-    showFatal(String(err));
+    // A resume error is recoverable (retry the button) — a toast, not the
+    // app-crash banner (#194 P4 MED-3).
+    showToast(`Couldn't resume group: ${String(err)}`, "error");
     return;
   }
   // Drop the dormant ORCH placeholders that predated the resume (a mixed tab's
@@ -498,7 +552,9 @@ async function handleWelcomeSubmit(
       shellKind: result.shellKind,
     });
     reapIfExited(ws, pane);
-    persistTabs();
+    // The setup pane converted in place — no grid open/close fired, so notify
+    // explicitly (re-renders the agent counter AND persists) (#194 P4 HIGH-1).
+    onGridChanged();
     return;
   }
 
@@ -508,8 +564,10 @@ async function handleWelcomeSubmit(
     } catch (err) {
       // The group launch failed AFTER the form fired its result — without this the
       // welcome form would sit stranded with a disabled "Working…" button (#194 P1
-      // review debt). Surface the error and re-enable the still-mounted form so the
-      // human can fix the cause and retry, instead of a dead pane.
+      // review debt). launchOrchestratorTab already tore down its stranded tab
+      // (MED-5); switch back to the form's own tab, surface the error, and re-enable
+      // the still-mounted form so the human can fix the cause and retry.
+      if (tabs.get(ws.id)) tabs.switchTo(ws.id);
       showToast(`Couldn't start orchestrator: ${String(err)}`, "error");
       form.reopenAfterLaunchFailure(String(err));
       return;
@@ -535,6 +593,10 @@ async function handleWelcomeSubmit(
     sessionId: first.sessionId,
   });
   reapIfExited(ws, pane);
+  // The first agent converted the setup pane in place — notify so the counter
+  // reflects it immediately, not only after the fan-out (#194 P4 HIGH-1). The
+  // fan-out panes below use grid.openPane, which now notifies after each PTY.
+  onGridChanged();
   let prev: Pane = pane;
   let d: "row" | "column" = "column";
   for (const spec of rest) {
@@ -548,7 +610,6 @@ async function handleWelcomeSubmit(
     prev = p;
     d = d === "row" ? "column" : "row";
   }
-  persistTabs();
 }
 
 /** Open a welcome pane in the active tab — the entry point the toolbar/shortcuts
@@ -562,8 +623,10 @@ function reapIfExited(ws: Workspace, pane: Pane): void {
   const exit = earlyExits.get(pane.ptyId);
   if (!exit) return;
   earlyExits.delete(pane.ptyId);
-  if (pane.keepOpenOnExit(exit)) pane.notifyExited(exit.exit_code);
-  else ws.grid.closePane(pane, false);
+  if (pane.keepOpenOnExit(exit)) {
+    pane.notifyExited(exit.exit_code);
+    onGridChanged(); // a kept-open pane is now dead → drop it from the live count
+  } else ws.grid.closePane(pane, false);
 }
 
 const sessions = new SessionBrowser(
@@ -629,8 +692,10 @@ void onPtyExit((exit) => {
     return;
   }
   const { ws, pane } = found;
-  if (pane.keepOpenOnExit(exit)) pane.notifyExited(exit.exit_code);
-  else ws.grid.closePane(pane, false);
+  if (pane.keepOpenOnExit(exit)) {
+    pane.notifyExited(exit.exit_code);
+    onGridChanged(); // dead-but-kept-open → update the live agent count
+  } else ws.grid.closePane(pane, false);
 });
 
 // Global shortcuts (terminals decline these in their key handlers).
@@ -793,12 +858,18 @@ void (async () => {
   const hasSnapshot = hasRestorableContent(saved);
 
   let outcome = decideRestore(saved?.restorePref ?? "ask", hasSnapshot);
+  // Whether to overwrite the saved session at boot end. A NON-COMMITTAL fresh
+  // (Esc / decline without "remember") must leave the saved tabs.json untouched
+  // so the next boot can still offer it — otherwise one habitual Escape silently
+  // and permanently destroys the session (#194 P4 MED-4).
+  let committed = true;
   if (outcome === "prompt") {
     const choice = await showRestoreSplash();
     outcome = choice.restore ? "restore" : "fresh";
     // Remember the choice per the decision matrix; leaving it unremembered keeps
     // the preference "ask" so the splash returns next launch.
     if (choice.remember) tabs.setRestorePreference(outcome);
+    if (outcome === "fresh" && !choice.remember) committed = false;
   }
 
   // The PTY output router must be live before restore spawns any pane.
@@ -811,6 +882,16 @@ void (async () => {
     tabs.newTab();
   }
 
+  // Empty-tab fill (#194): any tab still empty after restore — a restored tab whose
+  // layout was null (old file / group-only), a group-bound tab whose orchestrator
+  // hasn't resumed, or the brand-new fresh-start tab — opens the welcome surface.
+  // In-pane content (no PTY until submit), so filling a background tab is safe.
+  // Still under the `booting` guard so it doesn't persist (which would clobber the
+  // saved session in the non-committal case).
+  for (const ws of tabs.tabs) {
+    if (ws.grid.paneCount === 0) openWelcomeIn(ws);
+  }
+
   // Boot rebuild done: from here every pane open/close re-renders + re-persists.
   booting = false;
   // Subscribe persistTabs AFTER restore so rebuilding the saved set doesn't
@@ -819,14 +900,8 @@ void (async () => {
   // The "+" button opens a real starting surface, same as the shortcut.
   tabBar = new TabBar(tabBarEl, tabs, () => void openUserTab());
 
-  // Empty-tab fill (#194): any tab still empty after restore — a restored tab whose
-  // layout was null (old file / group-only), a group-bound tab whose orchestrator
-  // hasn't resumed, or the brand-new fresh-start tab — opens the welcome surface.
-  // In-pane content (no PTY until submit), so filling a background tab is safe.
-  for (const ws of tabs.tabs) {
-    if (ws.grid.paneCount === 0) openWelcomeIn(ws);
-  }
   // Persist the freshly rebuilt session once (records the layout + the remembered
-  // restore preference); the onChange subscription covers every change after.
-  persistTabs();
+  // restore preference); the onChange subscription covers every change after. A
+  // non-committal decline skips this so the saved session survives to next boot.
+  if (committed) persistTabs();
 })();

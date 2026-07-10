@@ -197,3 +197,40 @@ but an orchestrator launch that threw afterward left the form stranded with a
 disabled *Working…* button. `handleWelcomeSubmit` now catches it, toasts the
 error, and calls `form.reopenAfterLaunchFailure` (restoring the fired callback and
 re-opening the `SubmitLatch`) so the human can fix the cause and retry.
+
+### rev-80 hardening — every population/layout change flows through one notify
+
+The first cut hooked `grid.onChange` only at leaf placement, which fired *before*
+`pane.start()` assigned a `ptyId` and never fired at all on the in-place
+conversion paths — so the counter missed a single-agent submit and undercounted a
+fan-out by one, and a divider drag or pane drag-move was never persisted (the
+demo's "drag then quit" restored stale weights). The rule now is: **anything that
+changes a tab's live pane population or its layout re-renders + re-persists.**
+
+- `grid.openPane` fires `onChange` *after* `pane.start()` resolves (PTY live), and
+  the in-place conversions (`startFromWelcome`, `startFromDormant`) + the
+  kept-open exit path call `onGridChanged()` in `main.ts` once they settle.
+- Terminal layout mutations that only touched flex/order — the divider-drag
+  `mouseup`, the drag-reorder commit, and dock/undock — now fire `onChange`. All
+  are terminal (one per gesture), so `persistTabs`'s snapshot dedup absorbs the
+  rest; no per-mousemove write storm.
+- A kept-open exited pane sets `Pane.exited`, so `tabPaneInfo().live` is
+  `ptyId !== null && !exited` — a dead agent stops inflating the count.
+
+**Docked panes are captured.** `layoutSnapshot` only covers the split tree, so a
+minimized pane would have been silently dropped. `PersistedTab.docked` (additive,
+migration-safe) carries `Workspace.captureDocked()`; restore reopens each via the
+same `openActionPane` used for layout leaves, then `grid.minimize`s it back into
+the dock. So the live buffer/scrollback is still never captured, but no *session*
+is lost to the dock.
+
+**The credit/data sharp edges.** The dormant **Resume group** button disables on
+first click and re-enables only on failure — a second click while the first resume
+is in flight can't double-create the group (the double-spawn the contract
+forbids), and a resume error is a toast, not the crash banner. The restore splash
+is non-committal on **Esc**: a keyboard dismiss is a one-time fresh that never
+writes the preference, and boot skips the end-of-boot persist for a non-committal
+decline, so the saved `tabs.json` survives for the next launch's splash (one
+habitual Escape can't wipe the session). An orchestrator launch that fails tears
+down the tab it just created (`launchOrchestratorTab`'s catch) instead of leaking
+an empty tab per retry, and re-focuses the form's own tab.

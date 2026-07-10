@@ -213,6 +213,14 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
         status.textContent = `✦${counts.agents}${cost}`;
         status.title = `${counts.agents} live agent(s)${cost ? `, ${cost.slice(3)} so far` : ""}`;
         tab.appendChild(status);
+      } else if (st?.cost != null && (groupId || counts.dormantOrch)) {
+        // No live agents, but the group's accrued cost is still worth showing —
+        // don't let it vanish when the last agent exits/idle-kills (#194 P4 LOW-8).
+        const status = document.createElement("span");
+        status.className = "tab-status";
+        status.textContent = `$${st.cost.toFixed(2)}`;
+        status.title = `$${st.cost.toFixed(2)} accrued (no live agents)`;
+        tab.appendChild(status);
       }
       // Orchestration marker: a live icon when a group is running in this tab, or
       // the static ORCH chip for a dormant (restored-but-not-resumed) group — a

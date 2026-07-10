@@ -6,6 +6,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { TabManager, type ManagedWorkspace } from "../src/tabs.ts";
+import { tabCounts, type TabPaneInfo } from "../src/tabcounts.ts";
 
 /** A lightweight ManagedWorkspace that records the visibility/focus/dispose
  *  calls TabManager makes, so tests can assert the switch mechanism. */
@@ -17,6 +18,9 @@ class FakeWorkspace implements ManagedWorkspace {
   disposed = false;
   visLog: boolean[] = [];
   readonly id: string;
+  /** Mutable so a test can simulate a pane's lifecycle (setup → live agent) and
+   *  assert the counter only reflects it after a notify. */
+  panes: TabPaneInfo[] = [];
   constructor(id: string) {
     this.id = id;
   }
@@ -26,8 +30,11 @@ class FakeWorkspace implements ManagedWorkspace {
   captureLayout(): null {
     return null;
   }
-  paneInfos(): [] {
+  captureDocked(): [] {
     return [];
+  }
+  paneInfos(): TabPaneInfo[] {
+    return this.panes;
   }
   setVisible(v: boolean): void {
     this.visible = v;
@@ -247,4 +254,61 @@ test("routing: closing a tab forgets its group binding", () => {
   tabs.bindGroup("grp-1", a.id);
   assert.equal(tabs.closeTab(a.id), true);
   assert.equal(tabs.workspaceForGroup("grp-1"), undefined, "stale group route dropped");
+});
+
+// ---------- P4: the counter re-render contract (HIGH-1) ----------
+//
+// The demo bug was that the tab strip's agent counter didn't update on the
+// conversion/spawn paths. The strip re-renders on TabManager change emits, and
+// tabCounts is the source of truth; these pin the contract the DOM wiring relies
+// on — a pane-population change is only reflected AFTER notifyLayoutChanged(),
+// which is exactly what main.ts/grid must call when a pane goes live.
+
+test("notifyLayoutChanged emits to change listeners (the strip re-render hook)", () => {
+  const { tabs } = makeManager();
+  tabs.newTab();
+  let emits = 0;
+  tabs.onChange(() => emits++);
+  tabs.notifyLayoutChanged();
+  tabs.notifyLayoutChanged();
+  assert.equal(emits, 2, "each notify re-renders the strip once");
+});
+
+test("a strip listener recomputes the count on notify — welcome→agent conversion", () => {
+  // Simulate the single-agent submit: the tab starts with a welcome pane (not
+  // live), converts in place to a live agent, and the strip only learns the new
+  // count when the conversion notifies. Without the notify the count is stale —
+  // which is the HIGH-1 symptom this guards against.
+  const { tabs, created } = makeManager();
+  const ws = tabs.newTab();
+  const fake = created.find((w) => w.id === ws.id)!;
+  fake.panes = [{ kind: "terminal", live: false }]; // welcome pane, not counted
+
+  let lastCount = -1;
+  tabs.onChange(() => {
+    lastCount = tabCounts(fake.paneInfos(), !!tabs.groupForWorkspace(fake.id)).agents;
+  });
+
+  // Conversion completes: the pane is now a live agent.
+  fake.panes = [{ kind: "agent", live: true }];
+  assert.equal(lastCount, -1, "no re-render has happened yet — count is stale");
+  tabs.notifyLayoutChanged();
+  assert.equal(lastCount, 1, "the notify makes the strip see the live agent");
+});
+
+test("a strip listener recomputes on notify — fan-out reaches the full count", () => {
+  // The fan-out undercount: each spawned agent must notify AFTER its PTY is live,
+  // or the last one is missed. Modeled as three live agents landing one at a time.
+  const { tabs, created } = makeManager();
+  const ws = tabs.newTab();
+  const fake = created.find((w) => w.id === ws.id)!;
+  let lastCount = 0;
+  tabs.onChange(() => {
+    lastCount = tabCounts(fake.paneInfos(), false).agents;
+  });
+  for (let n = 1; n <= 3; n++) {
+    fake.panes = Array.from({ length: n }, () => ({ kind: "agent", live: true }) as TabPaneInfo);
+    tabs.notifyLayoutChanged();
+  }
+  assert.equal(lastCount, 3, "every spawned agent, including the last, is counted");
 });

@@ -65,22 +65,28 @@ export function showRestoreSplash(host: HTMLElement = document.body): Promise<Sp
     overlay.appendChild(card);
 
     let settled = false;
-    const finish = (restore: boolean): void => {
+    // `rememberOverride` forces the remembered flag off for a non-committal
+    // dismissal (Esc): a habitual Escape must not permanently disable the whole
+    // feature and clobber the saved session — it's a one-time "fresh this boot",
+    // and the splash returns next launch (#194 P4 MED-4). A button click honors
+    // the checkbox.
+    const finish = (restore: boolean, rememberOverride?: boolean): void => {
       if (settled) return;
       settled = true;
       document.removeEventListener("keydown", onKey, true);
       overlay.remove();
-      resolve({ restore, remember: remember.checked });
+      resolve({ restore, remember: rememberOverride ?? remember.checked });
     };
-    // Enter confirms the recommended action (Restore); Esc starts fresh. Captured
-    // so the choice can't leak to the app underneath before it's built.
+    // Enter confirms the recommended action (Restore, honoring the checkbox); Esc
+    // is a non-committal one-time fresh (never remembered). Captured so the choice
+    // can't leak to the app underneath before it's built.
     const onKey = (e: KeyboardEvent): void => {
       if (e.key === "Enter") {
         e.preventDefault();
         finish(true);
       } else if (e.key === "Escape") {
         e.preventDefault();
-        finish(false);
+        finish(false, false);
       }
     };
     restoreBtn.addEventListener("click", () => finish(true));

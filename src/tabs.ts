@@ -11,7 +11,7 @@
 // lightweight fake and production plugs in the real Grid-backed Workspace.
 
 import type { TabAttn, PreviewNode } from "./tabroute";
-import type { PersistedTabs, PersistedLayoutNode, RestorePref } from "./tabstore";
+import type { PersistedTabs, PersistedLayoutNode, PersistedPane, RestorePref } from "./tabstore";
 import type { TabPaneInfo } from "./tabcounts";
 
 /** The minimal surface TabManager needs from a workspace. `Workspace`
@@ -42,6 +42,9 @@ export interface ManagedWorkspace {
    *  tree with each pane reduced to a serializable record, or null when there's
    *  nothing worth restoring (an empty tab / only a welcome pane). */
   captureLayout(): PersistedLayoutNode | null;
+  /** Capture the tab's minimized (docked) panes — outside the layout tree, so
+   *  restored separately rather than silently dropped (#194 P4). */
+  captureDocked(): PersistedPane[];
   /** Classify every pane in the tab for the live per-tab agent counter and the
    *  orchestration markers (#194 P4). */
   paneInfos(): TabPaneInfo[];
@@ -258,6 +261,7 @@ export class TabManager<T extends ManagedWorkspace> {
       color: w.color,
       groupId: this.groupForWorkspace(w.id),
       layout: w.captureLayout(),
+      docked: w.captureDocked(),
     }));
     const activeIndex = Math.max(
       0,

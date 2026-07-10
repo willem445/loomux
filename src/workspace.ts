@@ -11,7 +11,7 @@
 import { Grid, type GridLayoutNode } from "./grid";
 import type { ManagedWorkspace } from "./tabs";
 import { PreviewBudget, type PreviewNode } from "./tabroute";
-import type { PersistedLayoutNode } from "./tabstore";
+import type { PersistedLayoutNode, PersistedPane } from "./tabstore";
 import type { TabPaneInfo } from "./tabcounts";
 
 /** Cap on panes serialized per preview refresh — serializing every pane every
@@ -136,6 +136,16 @@ export class Workspace implements ManagedWorkspace {
       return { kind: "split", dir: n.dir, weight: n.weight, children };
     };
     return map(tree);
+  }
+
+  /** Capture the tab's minimized (docked) panes, which live outside the layout
+   *  tree and so are missed by captureLayout — otherwise a docked agent session
+   *  would be silently dropped on restore (#194 P4). */
+  captureDocked(): PersistedPane[] {
+    return this.grid
+      .dockedPanes()
+      .map((p) => p.capture())
+      .filter((p): p is PersistedPane => p !== null);
   }
 
   /** Classify every pane in the tab (visible AND docked) for the per-tab agent

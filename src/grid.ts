@@ -151,6 +151,12 @@ export class Grid {
     return [...this.leaves.keys(), ...this.minimizedPanes];
   }
 
+  /** Just the docked (minimized) panes — the ones OUTSIDE the split tree, so
+   *  layoutSnapshot misses them. Captured separately for restore (#194 P4). */
+  dockedPanes(): Pane[] {
+    return [...this.minimizedPanes];
+  }
+
   /** Show/hide the whole grid for a project-tab switch (#63). Records the state
    *  (so later-opened panes inherit it — see openPane) and drops/reloads every
    *  pane's WebGL context accordingly. This is a rendering concern ONLY: the PTY
@@ -195,6 +201,10 @@ export class Grid {
     const pane = new Pane(events);
     const takeFocus = this.placeLeaf(pane, !!opts.background, dir, relativeTo);
     await pane.start(opts, takeFocus);
+    // Re-notify now that the PTY exists: placeLeaf fired onChange BEFORE start, so
+    // the pane was still ptyId-less (live:false) and the agent counter undercounted
+    // it. A second notify after start settles the count (#194 P4 HIGH-1).
+    this.onChange();
     return pane;
   }
 
@@ -461,6 +471,11 @@ export class Grid {
         div.classList.remove("dragging");
         window.removeEventListener("mousemove", move);
         window.removeEventListener("mouseup", up);
+        // A finished divider drag changed the flex weights that layoutSnapshot
+        // captures — persist them so a restore reproduces THIS split, not the
+        // pre-drag one (#194 P4). Terminal (one per drag), not per-mousemove, so
+        // no write storm; persistTabs dedups an unchanged snapshot.
+        this.onChange();
       };
       window.addEventListener("mousemove", move);
       window.addEventListener("mouseup", up);
@@ -540,6 +555,9 @@ export class Grid {
       if (next) this.setActive(next);
     }
     this.renderDock();
+    // Docking changed the tree AND which panes are captured (docked panes are
+    // captured separately, #194 P4 MED-6) — persist + re-count.
+    this.onChange();
   }
 
   /** Bring a parked pane back into the grid, beside the active pane (or as the
@@ -570,6 +588,7 @@ export class Grid {
     this.setActive(pane);
     pane.focus();
     this.renderDock();
+    this.onChange();
   }
 
   // ---------- batch minimize / restore (group fold, #46) ----------
@@ -792,6 +811,9 @@ export class Grid {
           const placement = zoneToPlacement(hover.zone);
           if (placement) this.moveToEdge(source, hover.pane, placement.dir, placement.before);
         }
+        // A committed drag-reorder changed the split-tree order/shape that a
+        // restore must reproduce — persist it (#194 P4 HIGH-2).
+        this.onChange();
       }
       if (started) source.focus();
     };
