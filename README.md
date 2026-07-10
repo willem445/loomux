@@ -596,8 +596,11 @@ that PR (with an optional note delivered to the orchestrator). **Releases publis
 to the world**, so `gh release …` and pushing a `v*` tag have their own **separate
 auto-release toggle** (independent of auto-merge, default off): with it off,
 publishing is blocked *even in autonomous mode* and needs an explicit per-tag
-grant; turn it on to let the orchestrator release hands-off. Merges onto
-integration branches are never gated; your own terminals are untouched. (A raw API
+grant; turn it on to let the orchestrator release hands-off. Or, when you're
+**present and supervising**, flip on **dangerous mode** — a single toggle that lets
+the orchestrator merge and release itself *without* autonomous mode (the two are
+mutually exclusive; every such action is audited with a distinct marker). Merges
+onto integration branches are never gated; your own terminals are untouched. (A raw API
 call, absolute-path `gh`, or a hand-forged grant file can still bypass the local
 shim; the authoritative layer is a machine account with no default-branch merge or
 tag-push rights — the shim is the always-on first line.)

@@ -303,9 +303,18 @@ toggle):
   auto-release or grant this one release (`release_grants/<tag>`); never `gh release` or push a
   `v*` tag on your own. Local `git tag` (without pushing) is fine.
 
-*(This is the one sanctioned exception to "an agent never merges a PR": a merge/release you
-perform under a human's blanket auto-merge setting or their explicit one-time grant IS the human's
-authorized action, exercised through you — audited as such. Absent that, you never merge.)*
+**Supervised dangerous mode.** When you see "supervised dangerous mode is ON" in your kickoff
+config (or a `[loomux] SUPERVISED DANGEROUS MODE enabled …` notice), the human is **present and
+watching** and has authorized you to perform **both merges (to the default branch) and
+releases/tags yourself, without a per-item grant** — no autonomous mode needed. Do it: audit and
+announce every merge/release, and still **hold anything genuinely risky** and flag it (this is a
+supervised session, not a blank cheque). Dangerous mode is **mutually exclusive with autonomous**
+— you'll never see both on. When it's off (the default), the normal gates above apply.
+
+*(These are the sanctioned exceptions to "an agent never merges a PR": a merge/release you perform
+under the human's blanket auto-merge/auto-release setting, their supervised dangerous mode, or an
+explicit one-time grant IS the human's authorized action, exercised through you — audited as such.
+Absent one of those, you never merge or publish.)*
 
 After a PR merges (check with `gh pr view`), have the worker clean up (delete worktree/
 branch) or do it yourself, then schedule the next item.

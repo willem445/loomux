@@ -138,6 +138,13 @@ export const setAutoMerge = (groupId: string, enabled: boolean): Promise<void> =
 export const setAutoRelease = (groupId: string, enabled: boolean): Promise<void> =>
   invoke("orch_set_auto_release", { groupId, enabled });
 
+/** Enable/disable supervised dangerous mode (#83): the human, present and
+ *  supervising, authorizes the orchestrator to merge/release itself WITHOUT
+ *  autonomous mode. Mutually exclusive with autonomous — rejects enable while
+ *  autonomous is on; enabling autonomous force-clears it. */
+export const setDangerousMode = (groupId: string, enabled: boolean): Promise<void> =>
+  invoke("orch_set_dangerous_mode", { groupId, enabled });
+
 /** Set a group's autonomous-era token budget (0 = no cap; durable, audited).
  *  Resolves to the applied value. Does not move the enable-time anchor, so
  *  raising the budget after a suspension lets the human resume without losing

@@ -46,6 +46,10 @@ export interface AutonomyState {
   /** #83: whether the orchestrator may publish releases/tags itself (independent
    *  of auto_merge; default OFF = releases need a per-tag human grant). */
   auto_release: boolean;
+  /** #83 supervised dangerous mode: the human is present and authorized manual
+   *  merges/releases WITHOUT autonomous. Mutually exclusive with `autonomous`
+   *  (enabling autonomous clears it; enabling this while autonomous is rejected). */
+  dangerous_mode: boolean;
   budget_tokens: number;
   budget_anchor_tokens: number;
   spend_since_enable_tokens: number | null;
