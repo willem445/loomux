@@ -42,6 +42,7 @@ test("docked panes round-trip (captured outside the layout tree, #194 P4)", () =
             argv: null,
             shellKind: null,
             sessionId: "abc",
+            role: null,
           },
         ],
       },
@@ -157,6 +158,7 @@ const NESTED_LAYOUT: PersistedLayoutNode = {
         argv: null,
         shellKind: "gitbash",
         sessionId: null,
+        role: null,
       },
     },
     {
@@ -175,6 +177,7 @@ const NESTED_LAYOUT: PersistedLayoutNode = {
             argv: ["claude", "--resume", "abc-123"],
             shellKind: null,
             sessionId: "abc-123",
+            role: null,
           },
         },
         {
@@ -187,7 +190,8 @@ const NESTED_LAYOUT: PersistedLayoutNode = {
             command: null,
             argv: null,
             shellKind: null,
-            sessionId: null,
+            sessionId: "orch-sess-9",
+            role: "orchestrator",
           },
         },
       ],
@@ -253,6 +257,7 @@ test("malformed pane fields inside a valid leaf coerce to null, not a drop", () 
       argv: ["ok", 7], // non-string element → whole argv null
       shellKind: "fish", // unknown → null
       sessionId: null,
+      role: 99, // non-string → null
     },
   };
   const back = decodeTabs(
@@ -269,6 +274,7 @@ test("malformed pane fields inside a valid leaf coerce to null, not a drop", () 
       argv: null,
       shellKind: null,
       sessionId: null,
+      role: null,
     },
   });
 });

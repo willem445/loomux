@@ -1,10 +1,14 @@
-// Whole-group resume planning (#194 P4, demo round 3) — groupresume.ts. Pins that
-// ONE Resume click plans the entire group: orchestrator first, every resumable
-// delegate rejoined, and a no-transcript delegate skipped (not stranded).
+// Whole-group resume planning (#194 P4, demo rounds 3–4) — groupresume.ts. The
+// INPUT is the CAPTURED group panes (the orch panes live at close, read off the
+// tab's dormant placeholders) — NEVER the backend's full historical roster. These
+// pin that ONE Resume click plans exactly that captured set: orchestrator first,
+// every resumable delegate rejoined, a no-transcript delegate skipped (not
+// stranded), and nothing added beyond what was captured (the round-4 regression).
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { planGroupResume, type GroupMember } from "../src/groupresume.ts";
 
+// One CAPTURED group member (a dormant orch placeholder's recorded session + role).
 const m = (sessionId: string, role: string): GroupMember => ({ sessionId, role });
 
 test("plans the WHOLE group: orchestrator first, workers rejoined", () => {
@@ -49,6 +53,23 @@ test("the plan covers the ENTIRE set — one click, one atomic plan for every me
     ...plan.skipped.map((x) => x.sessionId),
   ].sort();
   assert.deepEqual(planned, ["orch", "r1", "w1", "w2"], "no member is silently dropped from the plan");
+});
+
+test("captured-set in == planned-set out — a large historical roster is IRRELEVANT (round-4 regression)", () => {
+  // The regression: the group had 10 sessions over its life (many long-killed
+  // workers), but only the orchestrator + 1 worker were OPEN at close. The plan is
+  // fed ONLY those 2 captured members, so exactly 2 come back — the roster's other
+  // 8 are never an input and can't expand the set. (Session_roles's 10 rows never
+  // reach this function; that's the whole fix.)
+  const captured = [m("orch", "orchestrator"), m("w-live", "worker")];
+  const plan = planGroupResume(captured, () => true);
+  const planned = [
+    ...(plan.orchestrator ? [plan.orchestrator.sessionId] : []),
+    ...plan.rejoin.map((x) => x.sessionId),
+    ...plan.skipped.map((x) => x.sessionId),
+  ];
+  assert.equal(planned.length, 2, "same number of panes out as captured in");
+  assert.deepEqual(planned.sort(), ["orch", "w-live"], "exactly the captured members, nothing added");
 });
 
 test("no orchestrator in the roster → null (the caller falls back to the session browser)", () => {

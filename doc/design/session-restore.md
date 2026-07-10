@@ -255,18 +255,32 @@ layers now handle it, both keeping panerestore pure:
   paths — a spawn that exits in the sub-tick before `ptyId` is assigned is drained
   from `earlyExits` (and can trip the fresh-fallback) rather than leaking.
 
-### Whole-group resume (demo round 3)
+### Whole-group resume (demo rounds 3–4)
 
-The dormant **Resume group** button restores the ENTIRE group, not just the
-orchestrator. The frontend never captured worker session ids (orch panes persist
-as bare `dormant-group` placeholders), and it doesn't need to: the backend roster
-(`orchSessionRoles` → `session_roles()`) already lists every member of a dead
-group — orchestrator, workers, reviewers, planners — with its session id and role.
+The dormant **Resume group** button restores the panes that were LIVE at close —
+the whole group, but **exactly** that group, no more.
 
-`planGroupResume` (pure, unit-tested) turns that roster into an ordered plan:
-orchestrator first, then the delegates, split into `rejoin` (session has a
-transcript) and `skipped` (none). `resumeDormantGroup` executes it through the
-**existing** `resumeOrchSession` path — no backend change:
+**The set comes from CAPTURE, never the roster.** An early cut derived the member
+set from `orchSessionRoles()` → `session_roles()`, which lists every member the
+group *ever* had (long-killed workers included) — so a group that closed with an
+orchestrator + 1 worker came back with a swarm of stale worker panes (demo round 4
+over-restore). The fix: each captured orch pane now records **its own session id
+and role** (`Pane.capture()` for kind `orch`, the id parsed from the backend-built
+command by `sessionIdFromCommand` at spawn), so the persisted layout carries one
+leaf per orch pane that was open at close. On restore those become `dormant-group`
+placeholders each holding that record; `resumeDormantGroup` reads the member set
+straight off the tab's placeholders (`Pane.restoreRecord`). `session_roles()` is
+no longer consulted for the SET — the backend still validates membership and drives
+re-registration when each member resumes, but it can never EXPAND beyond what was
+captured. Members that were not open at close stay dead; they remain resumable
+later from the session browser (out of scope, by design).
+
+`planGroupResume` (pure, unit-tested) turns the captured members into an ordered
+plan: orchestrator first, then the delegates, split into `rejoin` (session has a
+transcript) and `skipped` (none). Its tests pin captured-set-in == planned-set-out
+— a 10-member historical roster is irrelevant because it's never an input.
+`resumeDormantGroup` executes the plan through the **existing** `resumeOrchSession`
+path — no backend change:
 
 1. Resume the orchestrator → the backend `resume_recorded_session` relaunches the
    whole control plane (`create_orchestration_group` with the resumed session),
@@ -282,15 +296,17 @@ transcript) and `skipped` (none). `resumeDormantGroup` executes it through the
    one atomic multi-pane restore — the many placeholder cards of a group can't each
    kick off a resume, and no member is double-spawned.
 
-**What restores:** every group member whose session has a saved conversation —
-re-registered with the group and resumed into its idle TUI. **What does NOT (stated,
-not silent):** a delegate that was never prompted has no transcript, so `--resume`
-would fail and strand a dead pane, and the frontend can't spawn a fresh
-*group-registered* worker (only the orchestrator spawns delegates). Those members
-are reported via toast and skipped; the orchestrator can respawn a fresh one on
-demand once it's live. Pane **positions** within the tab are also approximate — the
-orchestrator and rejoining workers lay out as they arrive (a fresh group layout),
-not the exact captured split; the tab, sessions, and roster are what's preserved.
+**What restores:** exactly the captured members (the orch panes live at close),
+each whose session has a saved conversation — re-registered with the group and
+resumed into its idle TUI; same number of panes out as were captured in. **What
+does NOT (stated, not silent):** a captured delegate that was never prompted has no
+transcript, so `--resume` would fail and strand a dead pane, and the frontend can't
+spawn a fresh *group-registered* worker (only the orchestrator spawns delegates).
+Those members are reported via toast and skipped; the orchestrator can respawn a
+fresh one on demand once it's live. Pane **positions** within the tab are also
+approximate — the orchestrator and rejoining workers lay out as they arrive (a
+fresh group layout), not the exact captured split; the tab, sessions, and roster
+are what's preserved.
 
 **BUG-2 — decline crashed with "no active workspace".** The restore splash is
 awaited while the app has zero tabs, and the window-focus handler (plus voice

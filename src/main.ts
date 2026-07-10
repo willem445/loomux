@@ -453,6 +453,7 @@ async function openActionPane(
         argv: a.argv,
         shellKind: null,
         sessionId: null,
+        role: null,
       };
       let pane: Pane;
       const content = dormantCard(
@@ -484,7 +485,10 @@ async function openActionPane(
         command: null,
         argv: null,
         shellKind: null,
-        sessionId: null,
+        // Carry the captured member identity so a group resume restores exactly
+        // the panes that were live at close (#194.5) and re-capture is exact.
+        sessionId: a.sessionId,
+        role: a.role,
       };
       const content = dormantCard(
         "Resume group",
@@ -542,22 +546,25 @@ function dormantCard(
 const resumingGroups = new Set<string>();
 
 /** Revive the dormant orchestration group bound to `ws` (the Resume button on a
- *  dormant-group placeholder). ONE click restores the WHOLE group (demo round 3):
- *  the orchestrator relaunches the control plane (MCP identity, task board) via
- *  resumeOrchSession, and then every recorded worker/reviewer/planner with a
- *  resumable session REJOINS — the backend re-registers each into the now-live
- *  group (so the orchestrator can still message it) and its pane arrives in this
- *  tab via the group→tab routing. Members are resumed sequentially, orchestrator
- *  first (a delegate can't rejoin a group that isn't live yet). The whole
- *  multi-pane resume is covered by the per-group latch, so it's one atomic
- *  restore — no double-spawn of any member. The dormant ORCH placeholders are
- *  cleared afterward, replaced by the resumed panes. Falls back to the session
- *  browser when the group has no recorded roster.
+ *  dormant-group placeholder). ONE click restores exactly the panes that were LIVE
+ *  at close — no more (demo round 4). The member set is the tab's CAPTURED dormant
+ *  ORCH placeholders (one per orch pane open at close), NOT the backend's full
+ *  historical roster (which lists every worker the group ever had — resuming that
+ *  over-restores). The orchestrator relaunches the control plane (MCP identity,
+ *  task board) via resumeOrchSession, then every captured worker/reviewer/planner
+ *  with a resumable session REJOINS — the backend re-registers each into the
+ *  now-live group (so the orchestrator can message it) and its pane arrives in this
+ *  tab via the group→tab routing. Sequential, orchestrator first (a delegate can't
+ *  rejoin a group that isn't live yet). The per-group latch covers the whole set,
+ *  so it's one atomic restore — no double-spawn of any member. The dormant ORCH
+ *  placeholders are cleared afterward, replaced by the resumed panes.
  *
- *  WHAT DOESN'T re-attach: a delegate whose session was never prompted has no
- *  transcript, so `--resume` would fail and strand a dead pane, and the frontend
+ *  WHAT DOESN'T re-attach: a captured delegate whose session was never prompted has
+ *  no transcript, so `--resume` would fail and strand a dead pane, and the frontend
  *  can't spawn a fresh GROUP-registered worker (only the orchestrator does). Such
- *  members are reported and skipped; the orchestrator can respawn them on demand. */
+ *  members are reported and skipped; the orchestrator can respawn them on demand.
+ *  Members of the group that were NOT open at close stay dead — they remain
+ *  resumable later from the session browser (out of scope here, by design). */
 async function resumeDormantGroup(ws: Workspace): Promise<void> {
   const groupId = tabs.groupForWorkspace(ws.id);
   if (!groupId) {
@@ -569,16 +576,29 @@ async function resumeDormantGroup(ws: Workspace): Promise<void> {
   if (resumingGroups.has(groupId)) return;
   resumingGroups.add(groupId);
   try {
-    // The group's recorded roster (every member with a session id + role), and
-    // which of those still have a transcript to resume (BUG-1 predicate).
-    let members: { sessionId: string; role: string }[] = [];
-    try {
-      members = (await orchSessionRoles())
-        .filter((r) => r.group_id === groupId)
-        .map((r) => ({ sessionId: r.session_id, role: r.role }));
-    } catch {
-      /* fall through to the no-orchestrator branch */
+    // The member set is the CAPTURED orch panes — the tab's dormant ORCH
+    // placeholders, one per orch pane that was live at close, each carrying its own
+    // session id + role. This is the fix for the over-restore regression: the set
+    // comes from what was captured, NEVER expanded by session_roles().
+    const captured = ws.grid
+      .allPanes()
+      .filter((p) => p.isDormant && p.dormantKind === "orch")
+      .map((p) => p.restoreRecord)
+      .filter((r): r is PersistedPane => r !== null && r.sessionId !== null)
+      .map((r) => ({ sessionId: r.sessionId as string, role: r.role ?? "worker" }));
+
+    if (captured.length === 0) {
+      // No captured orch session ids (a group captured before per-pane session
+      // capture, or a copilot-only group with no resumable ids) — let the human
+      // resume it from the session browser instead of guessing at the roster.
+      showToast(
+        "This restored group has no captured agent sessions — resume it from the session browser.",
+        "info"
+      );
+      sessions.toggle();
+      return;
     }
+
     let resumableIds = new Set<string>();
     try {
       resumableIds = new Set((await listSessions()).map((s) => s.id));
@@ -586,10 +606,10 @@ async function resumeDormantGroup(ws: Workspace): Promise<void> {
       /* empty → assume resumable below */
     }
     const seenAny = resumableIds.size > 0;
-    const plan = planGroupResume(members, (sid) => (seenAny ? resumableIds.has(sid) : true));
+    const plan = planGroupResume(captured, (sid) => (seenAny ? resumableIds.has(sid) : true));
 
     if (!plan.orchestrator) {
-      showToast("No recorded orchestrator session for this group — open the session browser.", "info");
+      showToast("No captured orchestrator session for this group — open the session browser.", "info");
       sessions.toggle();
       return;
     }

@@ -13,6 +13,7 @@ import type { Pane, PaneEvents } from "./pane";
 import { panesInGroup } from "./group";
 import { badgeFor, type OrchRole } from "./orchbadge";
 import { isSpawnRequestExpired } from "./spawnexpiry";
+import { sessionIdFromCommand } from "./panerestore";
 import type { AutonomyState } from "./autonomy";
 import { showToast } from "./toast";
 
@@ -243,6 +244,10 @@ async function openAgentPane(
       orchGroup: req.group_id,
       orchRole: req.role,
       orchAgent: req.agent_id,
+      // Record the session id the backend embedded in the command (#194.5) so
+      // capture() persists it — a group resume then restores exactly the captured
+      // members from their own sessions, not the full historical roster.
+      sessionId: sessionIdFromCommand(req.command, req.argv ?? null) ?? undefined,
       background,
     },
     paneEvents,

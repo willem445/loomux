@@ -1356,8 +1356,21 @@ export class Pane implements VoiceTargetPane {
       command: kind === "agent" ? this.spawnCommand : null,
       argv: kind === "agent" ? this.spawnArgv : null,
       shellKind: kind === "terminal" ? this.spawnShellKind : null,
-      sessionId: kind === "agent" ? this.agentSessionId : null,
+      // Capture the session id for orch panes too (#194.5) so a group resume
+      // restores exactly the captured members from their own recorded sessions.
+      sessionId: kind === "agent" || kind === "orch" ? this.agentSessionId : null,
+      // The orchestration role distinguishes the orchestrator from its delegates.
+      role: kind === "orch" ? this.orchRoleName : null,
     };
+  }
+
+  /** The persisted record a dormant restore placeholder stands in for, or null
+   *  when this pane isn't dormant. Lets a whole-group resume read the CAPTURED
+   *  group members (session id + role) straight off the tab's dormant orch
+   *  placeholders — the set that was live at close — rather than the backend's
+   *  full historical roster (#194.5). */
+  get restoreRecord(): PersistedPane | null {
+    return this.dormantRecord;
   }
 
   /** This pane's persisted kind from its live launch state:

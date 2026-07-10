@@ -57,9 +57,16 @@ export interface PersistedPane {
   argv: string[] | null;
   /** Terminal shell kind (kind "terminal"); null when unknown / not a terminal. */
   shellKind: ShellKind | null;
-  /** Recorded resumable agent session id (kind "agent") — enables --resume into
-   *  the prior context. Absent for terminals and best-effort CLIs. */
+  /** Recorded resumable session id — enables --resume into the prior context.
+   *  Captured for kind "agent" AND kind "orch" (an orchestration pane's own
+   *  session, so a group resume restores exactly the captured members). Absent
+   *  for terminals and best-effort CLIs. */
   sessionId: string | null;
+  /** Orchestration role for kind "orch" ("orchestrator" | "worker" | "reviewer"
+   *  | "planner"), so a whole-group resume can tell the orchestrator (resume
+   *  first, relaunches the group) from its delegates. Null for agent/terminal
+   *  panes and for pre-#194.5 files. */
+  role: string | null;
 }
 
 /** A tab's pane layout: the split tree with PersistedPane leaves. Mirrors grid's
@@ -143,6 +150,7 @@ function decodePane(v: unknown): PersistedPane | null {
     argv: argvOk ? (r.argv as string[]) : null,
     shellKind: isShellKind(r.shellKind) ? r.shellKind : null,
     sessionId: typeof r.sessionId === "string" ? r.sessionId : null,
+    role: typeof r.role === "string" ? r.role : null,
   };
 }
 

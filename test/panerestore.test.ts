@@ -9,6 +9,7 @@ import {
   planLayoutRestore,
   agentResumeCommand,
   agentFreshCommand,
+  sessionIdFromCommand,
   shouldRespawnFresh,
   AUTO_RESUME_AGENTS,
   type RestoreAction,
@@ -23,6 +24,7 @@ const pane = (over: Partial<PersistedPane>): PersistedPane => ({
   command: null,
   argv: null,
   shellKind: null,
+  role: null,
   sessionId: null,
   ...over,
 });
@@ -69,20 +71,36 @@ test("an agent WITHOUT a session id falls back to a dormant Start placeholder", 
 test("an orchestration pane ALWAYS restores dormant — never auto-resumed", () => {
   // The one credit/process-storm-sensitive case (#83/#78): a group is only ever
   // revived by the human via resumeOrchSession, so restore must not spawn it.
-  const action = planPaneRestore(pane({ paneKind: "orch", name: "orchestrator", cwd: "/repo" }));
-  assert.deepEqual(action, { type: "dormant-group", name: "orchestrator" });
+  const action = planPaneRestore(pane({ paneKind: "orch", name: "orchestrator", cwd: "/repo", role: "orchestrator" }));
+  assert.deepEqual(action, { type: "dormant-group", name: "orchestrator", sessionId: null, role: "orchestrator" });
 });
 
 test("even with a session id, a group stays dormant (the rule is keyed on kind, not id)", () => {
   // A worker pane could carry a resumable session id; auto-resuming it would be
   // exactly the process storm we refuse. Kind wins over the presence of an id.
-  const action = planPaneRestore(pane({ paneKind: "orch", name: "worker-1", cwd: "/wt", sessionId: "xyz-1" }));
-  assert.deepEqual(action, { type: "dormant-group", name: "worker-1" });
+  const action = planPaneRestore(pane({ paneKind: "orch", name: "worker-1", cwd: "/wt", sessionId: "xyz-1", role: "worker" }));
+  assert.deepEqual(action, { type: "dormant-group", name: "worker-1", sessionId: "xyz-1", role: "worker" });
 });
 
 test("AUTO_RESUME_AGENTS is the adopted default (the one-line all-dormant flip)", () => {
   // Guards the promise that flipping this single constant makes agents dormant.
   assert.equal(AUTO_RESUME_AGENTS, true);
+});
+
+// ---------- session id extraction (orch capture, #194.5) ----------
+
+test("sessionIdFromCommand pulls the id from --session-id or --resume (space + = forms)", () => {
+  assert.equal(sessionIdFromCommand("claude --session-id abc --model opus", null), "abc");
+  assert.equal(sessionIdFromCommand("claude --resume def", null), "def");
+  assert.equal(sessionIdFromCommand("claude --session-id=ghi", null), "ghi");
+  assert.equal(sessionIdFromCommand("claude --resume=jkl", null), "jkl");
+});
+
+test("sessionIdFromCommand falls back to argv, and is null with no session flag", () => {
+  assert.equal(sessionIdFromCommand(null, ["claude", "--session-id", "xyz"]), "xyz");
+  assert.equal(sessionIdFromCommand("claude --model opus", null), null);
+  assert.equal(sessionIdFromCommand("copilot", null), null); // copilot mints its own id later
+  assert.equal(sessionIdFromCommand(null, null), null);
 });
 
 // ---------- BUG-1: resume vs fresh when the conversation is gone ----------

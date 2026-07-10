@@ -66,9 +66,13 @@ export type RestoreAction =
     }
   | {
       // The orchestration pane's whole group stays dormant; the human resumes it
-      // via resumeOrchSession. main.ts does NOT spawn a pane for this action.
+      // via resumeOrchSession. main.ts does NOT spawn a pane for this action. The
+      // recorded session id + role ride along so the dormant placeholder carries
+      // the CAPTURED group member — the set a whole-group resume restores (#194.5).
       type: "dormant-group";
       name: string;
+      sessionId: string | null;
+      role: string | null;
     };
 
 /** True when a recorded agent session id still has a resumable conversation on
@@ -88,8 +92,10 @@ export function planPaneRestore(pane: PersistedPane, resumable?: SessionResumabl
     case "terminal":
       return { type: "spawn-terminal", name: pane.name, cwd: pane.cwd, shellKind: pane.shellKind };
     case "orch":
-      // Never auto-resume a group — dormant, human-triggered Resume only.
-      return { type: "dormant-group", name: pane.name };
+      // Never auto-resume a group — dormant, human-triggered Resume only. Carry
+      // the captured session id + role so the placeholder knows which group member
+      // it is (a whole-group resume reads these off the tab's placeholders).
+      return { type: "dormant-group", name: pane.name, sessionId: pane.sessionId, role: pane.role };
     case "agent":
       // Auto-resume when we have a session id AND the hybrid is enabled; else a
       // dormant Start placeholder (no id to resume into, or the flip is off).
@@ -199,6 +205,30 @@ export function agentFreshCommand(
     return { argv: [...strip(argv), "--session-id", sessionId] };
   }
   return { command: `claude --session-id ${sessionId}` };
+}
+
+/** Extract the session id a spawn command carries via `--session-id <id>` or
+ *  `--resume <id>` (both the space and `=` forms). Used to populate an
+ *  orchestration pane's recorded session id from its backend-built command
+ *  (which embeds the id rather than passing it as a field), so `capture()` can
+ *  persist it for a whole-group resume (#194.5). Null when the command carries no
+ *  session flag. Prefers the string command; falls back to structured argv. */
+export function sessionIdFromCommand(command: string | null, argv: string[] | null): string | null {
+  const scan = (tokens: string[]): string | null => {
+    for (let i = 0; i < tokens.length; i++) {
+      const t = tokens[i];
+      if (t === "--session-id" || t === "--resume") return tokens[i + 1] ?? null;
+      if (t.startsWith("--session-id=")) return t.slice("--session-id=".length) || null;
+      if (t.startsWith("--resume=")) return t.slice("--resume=".length) || null;
+    }
+    return null;
+  };
+  if (command && command.trim()) {
+    const id = scan(command.trim().split(/\s+/));
+    if (id) return id;
+  }
+  if (argv && argv.length) return scan(argv);
+  return null;
 }
 
 /** The runtime backstop decision (#194 BUG-1): a resumed agent pane whose PTY
