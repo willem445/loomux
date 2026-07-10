@@ -147,12 +147,17 @@ export function planLayoutRestore(layout: PersistedLayoutNode): RestoreOpenStep[
   const expand = (node: PersistedLayoutNode, anchorIndex: number): void => {
     if (node.kind === "leaf") return;
     // c0 keeps the anchor slot; c1..cn open beside it in this split's direction.
+    // Each sibling anchors to the PREVIOUS one, not to c0: grid.insertBeside
+    // splices a same-direction sibling in AFTER its anchor, so anchoring every
+    // child to c0 would replay [A,B,C,D] as [A,D,C,B]. Walking the anchor forward
+    // keeps insertion order.
     const childAnchors = [anchorIndex];
     for (let i = 1; i < node.children.length; i++) {
+      const prevAnchor = childAnchors[i - 1];
       childAnchors.push(steps.length);
       steps.push({
         action: planPaneRestore(entryLeafPane(node.children[i])),
-        relativeTo: anchorIndex,
+        relativeTo: prevAnchor,
         dir: node.dir,
         weights: entryWeightChain(node.children[i]),
       });

@@ -129,8 +129,11 @@ function rebuild(steps: RestoreOpenStep[]): SimNode {
     leaves.push(leaf);
     const parent = anchor.parent;
     if (parent && parent.dir === s.dir) {
+      // Mirror grid.insertBeside: a same-direction sibling splices in AFTER the
+      // anchor (idx+1), NOT appended at the end — this is what makes a
+      // wrong-anchor plan reorder middle siblings and get caught here.
       leaf.parent = parent;
-      parent.children.push(leaf);
+      parent.children.splice(parent.children.indexOf(anchor) + 1, 0, leaf);
     } else {
       const split: SimSplit = {
         kind: "split",
@@ -219,6 +222,28 @@ for (const [label, tree] of [
     assert.deepEqual(simShape(rebuilt), actionTree(tree));
   });
 }
+
+/** In-order leaf names of a rebuilt tree — to pin sibling ORDER, not just shape. */
+function leafOrder(node: SimNode): string[] {
+  if (node.kind === "leaf") {
+    const a = node.action;
+    return [a.name];
+  }
+  return node.children.flatMap(leafOrder);
+}
+
+test("≥3 siblings replay in insertion order (grid splices after the anchor, so anchoring must walk forward)", () => {
+  // The exact regression: col[A,B,C,D] must NOT come back as col[A,D,C,B].
+  assert.deepEqual(leafOrder(rebuild(planLayoutRestore(STACK_4))), ["A", "B", "C", "D"]);
+  // And a 3-wide row, for good measure.
+  const ROW_3: PersistedLayoutNode = {
+    kind: "split",
+    dir: "row",
+    weight: 1,
+    children: [leaf(1, { name: "X" }), leaf(1, { name: "Y" }), leaf(1, { name: "Z" })],
+  };
+  assert.deepEqual(leafOrder(rebuild(planLayoutRestore(ROW_3))), ["X", "Y", "Z"]);
+});
 
 test("a 2×2 grid and 4 stacked panes produce DIFFERENT plans (the ambiguity the flat list lost)", () => {
   // The whole point: distinct nestings must not flatten to the same sequence, or
