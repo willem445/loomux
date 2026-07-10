@@ -311,8 +311,13 @@ if [ "$cmd" = "api" ]; then
       is_rel=1
     elif [ -n "$a_query" ]; then
       ql=$(printf '%s' "$a_query" | tr '[:upper:]' '[:lower:]')
+      # Full create+move+DELETE coverage of refs/tags/releases, matching the REST arm
+      # (which gates POST/PATCH/DELETE of git/refs|git/tags and create/edit/delete of
+      # releases). deleteRef is destructive — it can drop a published v* tag ref — so it
+      # gates like DELETE git/refs/tags/* and deleteRelease. Matched by the field-name
+      # token (an unescapable identifier), consistent with the class-closing fix.
       case "$ql" in
-        *createref*|*updateref*|*createtag*|*createrelease*|*updaterelease*|*deleterelease*) is_rel=1 ;;
+        *createref*|*updateref*|*deleteref*|*createtag*|*deletetag*|*createrelease*|*updaterelease*|*deleterelease*) is_rel=1 ;;
       esac
       # resolve the tag for grant-keying: a refs/tags variable, else an inline literal.
       case "$ref_low" in refs/tags/*) rtag=${a_ref#refs/tags/}; rtag=${rtag%% *} ;; esac

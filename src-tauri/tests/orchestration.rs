@@ -4189,8 +4189,8 @@ fn gh_shim_script_gates_raw_api_release_shapes() {
     assert!(sh.contains("*/graphql"), "recognizes the graphql endpoint by suffix (/graphql, full-URL)");
     assert!(sh.contains("createrelease") && sh.contains("updaterelease") && sh.contains("deleterelease"),
         "catches graphql create/update/delete Release mutations");
-    assert!(sh.contains("createref") && sh.contains("updateref"),
-        "catches graphql create/update Ref tag mutations");
+    assert!(sh.contains("createref") && sh.contains("updateref") && sh.contains("deleteref"),
+        "catches graphql create/update/DELETE Ref tag mutations (full create+move+delete coverage)");
     // #196 r6: the graphql arm gates every ref/tag/release-creating mutation with NO
     // "prove-it's-safe-from-the-text" logic (variables/comments/aliases/escapes each
     // defeat a text heuristic). No vestige of the removed heads-exemption may remain.
@@ -4505,7 +4505,15 @@ fn gh_shim_harness_gates_graphql_endpoint_variants_and_variable_ref() {
         "-f", "query=mutation { createRef(input: { name: \"refs\\/tags\\/v9\", oid: \"a\" }) { ref { id } } } # refs/heads/x"];
     let x5_aliased: &[&str] = &["api", "graphql",
         "-f", "query=mutation { myref: createRef(input: { name: \"refs/tags/v9\", oid: \"a\" }) { ref { id } } }"];
-    let block: [&[&str]; 13] = [
+    // Full delete coverage, matching the REST arm's DELETE git/refs/tags & deleteRelease:
+    // deleteRef is destructive (can drop a published v* tag ref) — by node-id and by name.
+    let del_ref_id: &[&str] = &["api", "graphql",
+        "-f", "query=mutation { deleteRef(input: { refId: \"REF_nodeid\" }) { clientMutationId } }"];
+    let del_ref_name: &[&str] = &["api", "graphql",
+        "-f", "query=mutation { deleteRef(input: { name: \"refs/tags/v9\" }) { clientMutationId } }"];
+    let del_tag: &[&str] = &["api", "graphql",
+        "-f", "query=mutation { deleteTag(input: { id: \"TAG_nodeid\" }) { clientMutationId } }"];
+    let block: [&[&str]; 16] = [
         &["api", "graphql", "-f", cr_tags],                       // exact endpoint
         &["api", "/graphql", "-f", cr_tags],                      // leading-slash
         &["api", "https://api.github.com/graphql", "-f", cr_tags],// full URL host form
@@ -4515,6 +4523,7 @@ fn gh_shim_harness_gates_graphql_endpoint_variants_and_variable_ref() {
         &["api", "graphql", "--input", "-"],                      // opaque stdin
         &["api", "graphql", "-F", &qopaque],                      // opaque query=@file
         x1_comment_tagvar, x2_decoy_headsvar, x3_updateref_nodeid, x4_escaped_slash, x5_aliased,
+        del_ref_id, del_ref_name, del_tag,                        // destructive delete coverage
     ];
     for s in block { assert!(!run(s), "graphql ref/tag mutation must block with no markers, any encoding: {s:?}"); }
 
@@ -4530,18 +4539,24 @@ fn gh_shim_harness_gates_graphql_endpoint_variants_and_variable_ref() {
     assert!(run(&["api", "-X", "POST", "repos/o/r/git/refs", "-f", "ref=refs/heads/x", "-f", "sha=y"]),
         "REST branch (refs/heads) create still passes by real locus");
 
-    // ---- Blanket markers allow the opaque + variable-hidden shapes.
+    // ---- Blanket markers allow the opaque + variable-hidden + destructive-delete shapes.
     set("autonomous"); set("auto_release");
-    for s in [&["api", "/graphql", "-f", "ref=refs/tags/v9", "-f", cr_var] as &[&str], &["api", "graphql", "--input", "-"]] {
+    for s in [&["api", "/graphql", "-f", "ref=refs/tags/v9", "-f", cr_var] as &[&str],
+              &["api", "graphql", "--input", "-"],
+              del_ref_id] {
         assert!(run(s), "autonomous+auto_release must allow: {s:?}");
     }
     clear("autonomous"); clear("auto_release");
 
-    // ---- A v9 grant resolves from the -F ref= variable, allows once, consumed.
+    // ---- A v9 grant allows once + consumed: resolved from the -F ref= variable, and
+    // from an inline refs/tags name in a deleteRef.
     write_grant("v9");
     assert!(run(&["api", "https://api.github.com/graphql", "-F", "ref=refs/tags/v9", "-f", cr_var]),
         "a v9 grant resolved from the graphql variable must allow the createRef");
     assert!(!group.join("release_grants/v9").exists(), "grant consumed");
+    write_grant("v9");
+    assert!(run(del_ref_name), "a v9 grant resolved from an inline deleteRef refs/tags name must allow");
+    assert!(!group.join("release_grants/v9").exists(), "grant consumed by deleteRef");
 }
 
 #[test]

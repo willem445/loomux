@@ -681,9 +681,11 @@ reconcile on read, mirrored into the kickoff config + a live notice, and surface
   read-only GET) passes through untouched. The **graphql arm**: the endpoint is recognized by
   **suffix** (`graphql` | `/graphql` | `*/graphql`, incl. the full-URL host form) — not an exact
   `graphql` string, which a `gh api /graphql`/full-URL POST would have slipped (#196 r4) — and it
-  gates **every ref/tag/release-creating mutation** (`createRef` | `updateRef` | `createTag` |
-  `create`/`update`/`deleteRelease`) **unconditionally**, plus opaque graphql (`--input`/stdin/
-  `@file`). There is **no "prove a mutation safe from the query text" logic** in the graphql arm,
+  gates **every ref/tag/release create+move+delete mutation** (`createRef` | `updateRef` |
+  `deleteRef` | `createTag` | `deleteTag` | `create`/`update`/`deleteRelease`) **unconditionally**,
+  plus opaque graphql (`--input`/stdin/`@file`). This matches the REST arm's full coverage — POST/
+  PATCH/**DELETE** of `git/refs`/`git/tags` and create/edit/**delete** of releases — so a destructive
+  `deleteRef` (which can drop a published `v*` tag ref) gates like `DELETE …/git/refs/tags/*`. There is **no "prove a mutation safe from the query text" logic** in the graphql arm,
   by design: every text heuristic tried was defeated by the next encoding — a `refs/tags` literal,
   a `-F ref=` variable, a no-`$`-variables rule — because graphql **variables, comments, aliases,
   and string escapes** (`refs\/tags\/`) each dodge a text scan and the next encoding would too
