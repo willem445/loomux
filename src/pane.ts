@@ -49,6 +49,8 @@ import { AuditView } from "./auditview";
 import { GroupView } from "./groupview";
 import { clampOverlayHeight, OVERLAY_MIN_H } from "./overlaysize";
 import { FileEditView } from "./fileedit";
+import type { ShellKind } from "./panesetup";
+import type { PersistedPane, PersistedPaneKind } from "./tabstore";
 
 // Inline icons so the toolbar renders identically regardless of installed
 // fonts; they inherit color via `currentColor`.
@@ -159,6 +161,17 @@ export interface PaneOptions {
    *  orch-spawn-request path sets it. Grid.openPane resolves the actual
    *  decision — an empty grid still focuses regardless (see panefocus.ts). */
   background?: boolean;
+  /** Terminal shell kind (Git Bash / cmd / PowerShell, #194). Retained on the
+   *  pane so a live terminal can be captured into the persisted layout for
+   *  session restore. The backend spawn plumbing that acts on it lands in the
+   *  shell-kinds phase; here it is record-only. */
+  shellKind?: ShellKind;
+  /** Recorded resumable agent session id (#194): so a restored Agent pane can
+   *  `--resume <id>` back into its prior context (resuming into an idle TUI
+   *  costs nothing until a prompt is sent). Set by the launcher for
+   *  session-capable CLIs; absent for terminals/orchestration and best-effort
+   *  CLIs. Retained for the layout snapshot — never used to drive the PTY. */
+  sessionId?: string;
 }
 
 const TERM_THEME = {
@@ -286,6 +299,13 @@ export class Pane implements VoiceTargetPane {
   private dockSyncListener: (() => void) | null = null;
   /** True for agent/command panes (vs plain shells). */
   private launchedCommand = false;
+  /** Spawn inputs retained for the session-restore layout snapshot (#194): how
+   *  this pane was launched, so `capture()` can serialize it. Record-only —
+   *  never read back to drive the live PTY. */
+  private spawnCommand: string | null = null;
+  private spawnArgv: string[] | null = null;
+  private spawnShellKind: ShellKind | null = null;
+  private agentSessionId: string | null = null;
   private shiftTimer: number | undefined;
   private fit = new FitAddon();
   private resizeObs: ResizeObserver;
@@ -565,6 +585,12 @@ export class Pane implements VoiceTargetPane {
   async start(opts: PaneOptions = {}, takeFocus = true): Promise<void> {
     this.setName(opts.name ?? "shell");
     this.launchedCommand = !!opts.command?.trim();
+    // Retain the launch inputs for a later capture() into the persisted layout
+    // (#194). Purely a record — the spawn below still reads them straight off opts.
+    this.spawnCommand = opts.command ?? null;
+    this.spawnArgv = opts.argv ?? null;
+    this.spawnShellKind = opts.shellKind ?? null;
+    this.agentSessionId = opts.sessionId ?? null;
     if (opts.badge) this.setBadge(opts.badge);
     if (opts.orchAgent) this.orchAgent = opts.orchAgent;
     if (opts.orchGroup) {
@@ -1222,6 +1248,32 @@ export class Pane implements VoiceTargetPane {
    *  the orchestrator's own pane apart from its workers/reviewers. */
   get orchRole(): string | null {
     return this.orchRoleName;
+  }
+
+  /** Capture this pane as a serializable record for the persisted layout (#194).
+   *  Reads only the retained launch inputs plus the live cwd — no geometry, no
+   *  PTY — so it is safe under the no-resize invariant and works even on a hidden
+   *  tab. Returns null for a welcome (setup-state) pane: it has no chosen kind
+   *  yet, so there is nothing to restore. main.ts pairs these with the flex
+   *  weights from grid.layoutSnapshot() to build the PersistedLayoutNode tree;
+   *  panerestore.ts decides what each record becomes on restore. */
+  capture(): PersistedPane | null {
+    if (this.isWelcome) return null;
+    // orch (any orchestration role) > agent (launched a command) > plain terminal.
+    const kind: PersistedPaneKind = this.orchGroup
+      ? "orch"
+      : this.launchedCommand
+        ? "agent"
+        : "terminal";
+    return {
+      paneKind: kind,
+      name: this.name,
+      cwd: this.cwdRaw,
+      command: kind === "agent" ? this.spawnCommand : null,
+      argv: kind === "agent" ? this.spawnArgv : null,
+      shellKind: kind === "terminal" ? this.spawnShellKind : null,
+      sessionId: kind === "agent" ? this.agentSessionId : null,
+    };
   }
 
   /** Whichever overlay (git / tasks / audit / group) is currently covering
