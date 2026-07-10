@@ -36,6 +36,7 @@ import {
   primaryWorktree,
   resolveSelection,
   isMissingDir,
+  isWritable,
   worktreeLabel,
   normalizePath,
   type Worktree,
@@ -218,6 +219,12 @@ export class GitView {
   private primaryRoot: string | null = null;
   private worktrees: Worktree[] = [];
   private selectedWorktree: string | null = null;
+  // Read-only / unlock (#208 human ruling): a non-primary worktree is browse-only
+  // until explicitly unlocked. `unlockedWorktree` pins the unlock to one path and
+  // is cleared on every switch (see pointViewAt). `writable` is recomputed each
+  // refresh and gates every write affordance below.
+  private unlockedWorktree: string | null = null;
+  private writable = true;
   private commits: CommitInfo[] = [];
   private status: GitStatus | null = null;
   private selection: Selection = { kind: "working" };
@@ -234,7 +241,10 @@ export class GitView {
 
   private headTitleEl: HTMLElement;
   private headWorktreeEl: HTMLElement;
+  private headLockEl: HTMLButtonElement;
   private headBranchEl: HTMLElement;
+  private pullBtn: HTMLButtonElement;
+  private pushBtn: HTMLButtonElement;
   private graphListEl: HTMLElement;
   private diffHeadEl: HTMLElement;
   private diffBodyEl: HTMLElement;
@@ -271,16 +281,24 @@ export class GitView {
     this.headWorktreeEl.hidden = true;
     this.headWorktreeEl.title = "Switch worktree";
     this.headWorktreeEl.addEventListener("click", () => this.openWorktreeMenu());
+    // Read-only indicator + per-selection unlock toggle (non-primary only).
+    this.headLockEl = el("button", "git-head-lock") as HTMLButtonElement;
+    this.headLockEl.hidden = true;
+    this.headLockEl.addEventListener("click", () => this.toggleUnlock());
     this.headBranchEl = el("span", "git-head-branch clickable");
     this.headBranchEl.title = "Switch branch";
-    this.headBranchEl.addEventListener("click", () => void this.openBranchMenu());
+    this.headBranchEl.addEventListener("click", () => {
+      if (this.writable) void this.openBranchMenu();
+    });
 
     const pullBtn = el("button", "pane-btn", "↓") as HTMLButtonElement;
+    this.pullBtn = pullBtn;
     pullBtn.title = "Pull (fast-forward only)";
     pullBtn.addEventListener("click", () =>
       void this.runOp(pullBtn, () => gitPull(this.repoRoot!), "Pulled")
     );
     const pushBtn = el("button", "pane-btn", "↑") as HTMLButtonElement;
+    this.pushBtn = pushBtn;
     pushBtn.title = "Push current branch";
     pushBtn.addEventListener("click", () => void this.push(pushBtn));
     const fetchBtn = el("button", "pane-btn", "↻") as HTMLButtonElement;
@@ -294,6 +312,7 @@ export class GitView {
     head.append(
       this.headTitleEl,
       this.headWorktreeEl,
+      this.headLockEl,
       this.headBranchEl,
       pullBtn,
       pushBtn,
@@ -463,6 +482,8 @@ export class GitView {
   private pointViewAt(root: string): void {
     if (root === this.repoRoot) return;
     this.repoRoot = root;
+    // Every switch drops the unlock — re-selecting a worktree is read-only again.
+    this.unlockedWorktree = null;
     this.commits = [];
     this.selection = { kind: "working" };
     this.selectedFile = null;
@@ -573,6 +594,10 @@ export class GitView {
             ? { kind: "working" }
             : { kind: "commit", hash: commits[0].hash };
       }
+
+      // Non-primary worktrees are read-only until unlocked (#208 ruling); every
+      // render below gates its write affordances on this.
+      this.writable = isWritable(this.activeWorktree(), this.unlockedWorktree);
 
       this.renderHead();
       this.renderGraph();
@@ -722,66 +747,73 @@ export class GitView {
     showMenu(r.left, r.bottom + 3, items);
   }
 
-  /** Right-click actions for a commit. */
+  /** Right-click actions for a commit. On a read-only worktree only the copy
+   *  actions remain — every history op mutates the checked-out branch. */
   private commitMenu(x: number, y: number, c: CommitInfo): void {
     if (!this.repoRoot) return;
     const short = c.hash.slice(0, 7);
     const branch = this.status?.branch ?? "HEAD";
-    showMenu(x, y, [
-      {
-        label: `Checkout ${short} (detached)`,
-        onClick: () => void this.checkout(c.hash, false),
-      },
-      { label: "Create branch here…", onClick: () => void this.createBranch(c.hash) },
-      { label: "Create tag here…", onClick: () => void this.createTag(c.hash) },
-      { label: "-" },
-      {
-        label: `Cherry-pick onto ${branch}`,
-        onClick: () =>
-          void this.confirmOp(
-            "Cherry-pick",
-            `Apply commit ${short} onto ${branch}?`,
-            "Cherry-pick",
-            () => gitCherryPick(this.repoRoot!, c.hash)
-          ),
-      },
-      {
-        label: `Revert ${short}`,
-        danger: true,
-        onClick: () =>
-          void this.confirmOp(
-            "Revert commit",
-            `Create a commit on ${branch} that undoes ${short}?`,
-            "Revert",
-            () => gitRevert(this.repoRoot!, c.hash)
-          ),
-      },
-      {
-        label: `Merge ${short} into ${branch}`,
-        danger: true,
-        onClick: () =>
-          void this.confirmOp(
-            "Merge",
-            `Merge commit ${short} into ${branch}?`,
-            "Merge",
-            () => gitMerge(this.repoRoot!, c.hash)
-          ),
-      },
-      {
-        label: `Rebase ${branch} onto ${short}`,
-        danger: true,
-        onClick: () =>
-          void this.confirmOp(
-            "Rebase",
-            `Rebase ${branch} onto ${short}? This rewrites history on ${branch}.`,
-            "Rebase",
-            () => gitRebase(this.repoRoot!, c.hash)
-          ),
-      },
-      { label: "-" },
+    const items: MenuItem[] = [];
+    if (this.writable) {
+      items.push(
+        {
+          label: `Checkout ${short} (detached)`,
+          onClick: () => void this.checkout(c.hash, false),
+        },
+        { label: "Create branch here…", onClick: () => void this.createBranch(c.hash) },
+        { label: "Create tag here…", onClick: () => void this.createTag(c.hash) },
+        { label: "-" },
+        {
+          label: `Cherry-pick onto ${branch}`,
+          onClick: () =>
+            void this.confirmOp(
+              "Cherry-pick",
+              `Apply commit ${short} onto ${branch}?`,
+              "Cherry-pick",
+              () => gitCherryPick(this.repoRoot!, c.hash)
+            ),
+        },
+        {
+          label: `Revert ${short}`,
+          danger: true,
+          onClick: () =>
+            void this.confirmOp(
+              "Revert commit",
+              `Create a commit on ${branch} that undoes ${short}?`,
+              "Revert",
+              () => gitRevert(this.repoRoot!, c.hash)
+            ),
+        },
+        {
+          label: `Merge ${short} into ${branch}`,
+          danger: true,
+          onClick: () =>
+            void this.confirmOp(
+              "Merge",
+              `Merge commit ${short} into ${branch}?`,
+              "Merge",
+              () => gitMerge(this.repoRoot!, c.hash)
+            ),
+        },
+        {
+          label: `Rebase ${branch} onto ${short}`,
+          danger: true,
+          onClick: () =>
+            void this.confirmOp(
+              "Rebase",
+              `Rebase ${branch} onto ${short}? This rewrites history on ${branch}.`,
+              "Rebase",
+              () => gitRebase(this.repoRoot!, c.hash)
+            ),
+        },
+        { label: "-" }
+      );
+    }
+    items.push(
       { label: "Copy commit hash", onClick: () => void copyText(c.hash) },
-      { label: "Copy subject", onClick: () => void copyText(c.subject) },
-    ]);
+      { label: "Copy subject", onClick: () => void copyText(c.subject) }
+    );
+    showMenu(x, y, items);
   }
 
   private async createBranch(hash: string): Promise<void> {
@@ -885,12 +917,45 @@ export class GitView {
     const root = this.primaryRoot ?? this.repoRoot ?? "";
     this.headTitleEl.textContent = root.split(/[\\/]/).filter(Boolean).pop() ?? "";
     this.renderWorktreeChip();
+    this.renderLockToggle();
+    // Branch switching is a write — only offer it (and the affordance) when
+    // writable; otherwise the name is shown read-only.
+    this.headBranchEl.classList.toggle("clickable", this.writable);
+    this.headBranchEl.title = this.writable ? "Switch branch" : "Read-only worktree";
+    // Pull/push mutate; disable them off a writable tree (fetch stays — it only
+    // refreshes remote-tracking refs, touching no working copy).
+    this.pullBtn.disabled = !this.writable;
+    this.pushBtn.disabled = !this.writable;
     const s = this.status;
     this.headBranchEl.textContent = s?.branch
       ? s.branch
       : s?.detached
         ? `detached @ ${this.headHash().slice(0, 7)}`
         : "";
+  }
+
+  /** The read-only badge + unlock toggle, shown only when a non-primary worktree
+   *  is active (the primary is always writable, so it needs no control). */
+  private renderLockToggle(): void {
+    const active = this.activeWorktree();
+    const show = active !== null && !active.primary;
+    this.headLockEl.hidden = !show;
+    if (!show) return;
+    const unlocked = this.writable;
+    this.headLockEl.textContent = unlocked ? "🔓 writable" : "🔒 read-only";
+    this.headLockEl.title = unlocked
+      ? "This worktree is unlocked for writes — click to lock (read-only)."
+      : "This worktree is read-only so a live agent isn't disturbed — click to unlock writes.";
+    this.headLockEl.classList.toggle("unlocked", unlocked);
+  }
+
+  /** Flip the active non-primary worktree between read-only and writable. The
+   *  unlock is pinned to this worktree's path and cleared on any switch. */
+  private toggleUnlock(): void {
+    const active = this.activeWorktree();
+    if (!active || active.primary) return;
+    this.unlockedWorktree = this.writable ? null : active.path;
+    void this.refresh();
   }
 
   /** The worktree currently being viewed (matched by path), or null. */
@@ -995,7 +1060,8 @@ export class GitView {
         for (const r of c.refs) {
           if (r.kind === "head" && c.refs.some((o) => o.kind === "branch")) continue;
           const chip = el("span", `git-chip ${r.kind}`, r.name);
-          if (r.kind === "branch" || r.kind === "remote" || r.kind === "tag") {
+          // Checkout is a write — the chip is inert on a read-only worktree.
+          if (this.writable && (r.kind === "branch" || r.kind === "remote" || r.kind === "tag")) {
             const remote = r.kind === "remote";
             chip.title = `Right-click for actions · double-click to checkout ${r.name}`;
             chip.addEventListener("dblclick", (e) => {
@@ -1070,33 +1136,51 @@ export class GitView {
       ...s.untracked.map((path) => ({ path, orig_path: null, status: "?" })),
     ];
 
+    // Read-only worktree: browse the same file lists (click to diff) but with no
+    // stage/unstage/discard affordances and no commit box (#208 ruling).
+    const rw = this.writable;
     this.changesEl.append(
       this.filesColumn("Staged", s.staged, {
-        allLabel: "unstage all",
+        allLabel: rw ? "unstage all" : "",
         onAll: () =>
           void this.act(() =>
             gitUnstage(this.repoRoot!, s.staged.map((f) => f.path), s.empty)
           ),
-        row: (f) => [
-          this.actionBtn("−", "Unstage", () =>
-            void this.act(() => gitUnstage(this.repoRoot!, [f.path], s.empty))
-          ),
-        ],
+        row: rw
+          ? (f) => [
+              this.actionBtn("−", "Unstage", () =>
+                void this.act(() => gitUnstage(this.repoRoot!, [f.path], s.empty))
+              ),
+            ]
+          : () => [],
         mode: () => "staged",
       }),
       this.filesColumn("Changes", changes, {
-        allLabel: "stage all",
+        allLabel: rw ? "stage all" : "",
         onAll: () =>
           void this.act(() => gitStage(this.repoRoot!, changes.map((f) => f.path))),
-        row: (f) => [
-          this.actionBtn("+", "Stage", () =>
-            void this.act(() => gitStage(this.repoRoot!, [f.path]))
-          ),
-          this.discardBtn(f),
-        ],
+        row: rw
+          ? (f) => [
+              this.actionBtn("+", "Stage", () =>
+                void this.act(() => gitStage(this.repoRoot!, [f.path]))
+              ),
+              this.discardBtn(f),
+            ]
+          : () => [],
         mode: (f) => (f.status === "?" ? "untracked" : "worktree"),
       })
     );
+
+    if (!rw) {
+      this.changesEl.appendChild(
+        el(
+          "div",
+          "git-readonly-note",
+          "Read-only worktree — unlock (🔒 in the header) to stage, commit, or discard."
+        )
+      );
+      return;
+    }
 
     // -- commit box --
     const box = el("div", "git-commit-box");

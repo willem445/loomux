@@ -152,6 +152,27 @@ export function isMissingDir(err: unknown): boolean {
   return /no such directory/i.test(String(err));
 }
 
+/** Whether write operations (stage/commit/discard/checkout/history ops/push…)
+ *  are enabled for the active worktree.
+ *
+ *  The human's #208 ruling: mutating a *live agent's* worktree mid-task is
+ *  dangerous (a discard destroys its uncommitted work, a checkout flips its
+ *  branch), so a **non-primary** worktree opens **read-only** — browsing only —
+ *  until the user explicitly unlocks it. The primary checkout (and a plain repo
+ *  with no worktree context, `active === null`) keeps full write access, exactly
+ *  as before this feature.
+ *
+ *  The unlock is **pinned to one worktree path**: `unlockedPath` enables writes
+ *  only while it matches the active worktree, so switching to any other worktree
+ *  (a different path, or back to primary) is read-only again — the unlock never
+ *  leaks across selections. (gitview also clears `unlockedPath` on every switch,
+ *  so re-selecting a previously-unlocked worktree still requires re-unlocking.) */
+export function isWritable(active: Worktree | null, unlockedPath: string | null): boolean {
+  if (active === null || active.primary) return true;
+  if (unlockedPath === null) return false;
+  return normalizePath(active.path) === normalizePath(unlockedPath);
+}
+
 /** A short label for the selector chip / menu: the worktree's folder name. */
 export function worktreeLabel(w: Worktree): string {
   const parts = w.path.replace(/[\\/]+$/, "").split(/[\\/]/);

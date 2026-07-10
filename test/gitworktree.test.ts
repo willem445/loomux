@@ -13,6 +13,7 @@ import {
   worktreeLabel,
   normalizePath,
   isMissingDir,
+  isWritable,
 } from "../src/gitworktree.ts";
 
 const MAIN = "C:/Projects/loomux";
@@ -194,6 +195,36 @@ test("isMissingDir recognizes the backend's no-such-directory error", () => {
   assert.equal(isMissingDir("fatal: not a git repository"), false);
   assert.equal(isMissingDir("error: pathspec 'x' did not match"), false);
   assert.equal(isMissingDir(null), false);
+});
+
+test("isWritable: the primary worktree is always writable (today's behavior)", () => {
+  const wts = parseWorktrees(SAMPLE);
+  assert.equal(isWritable(wts[0], null), true); // primary, no unlock
+  assert.equal(isWritable(wts[0], LINKED), true); // an unrelated unlock is irrelevant
+});
+
+test("isWritable: a plain repo with no worktree context is writable", () => {
+  assert.equal(isWritable(null, null), true);
+});
+
+test("isWritable: a non-primary worktree is read-only by default", () => {
+  const wts = parseWorktrees(SAMPLE);
+  assert.equal(isWritable(wts[1], null), false);
+  assert.equal(isWritable(wts[2], null), false); // detached one too
+});
+
+test("isWritable: unlocking is scoped to the exact worktree", () => {
+  const wts = parseWorktrees(SAMPLE);
+  assert.equal(isWritable(wts[1], wts[1].path), true); // unlocked THIS worktree
+  assert.equal(isWritable(wts[1], "C:\\PROJECTS\\loomux-worktrees\\feat\\208"), true); // separator/case
+});
+
+test("isWritable: an unlock does not leak to a different worktree (reset on switch)", () => {
+  const wts = parseWorktrees(SAMPLE);
+  // Unlock pinned to worktree[1]; the active worktree is now [3] → read-only.
+  assert.equal(isWritable(wts[3], wts[1].path), false);
+  // And switching back to primary is read-only-moot (primary is always writable).
+  assert.equal(isWritable(wts[0], wts[1].path), true);
 });
 
 test("normalizePath unifies separators, trailing slash, and case", () => {

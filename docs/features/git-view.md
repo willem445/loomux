@@ -62,20 +62,38 @@ or back to the primary checkout, **without leaving the pane or opening a new
 session**. This is the quick way to see what an agent's worktree has been up to:
 its history, its unstaged files, its commits.
 
+- **Opening the view from inside a worktree** (the normal case for an
+  orchestration agent pane, whose shell already sits in its own worktree) shows
+  **that** worktree by default — the view follows the pane. Use the chip to look
+  at any other worktree, or pin the primary.
 - The chip names the worktree you're viewing; it turns the accent color when
   you're off the primary tree, so it's obvious the view is scoped elsewhere. Its
   tooltip shows the full path and branch.
-- The primary checkout is the default and is labelled *(primary)* in the menu. A
-  bare repository entry is listed but can't be viewed (it has no working tree).
-- Every action (staging, commit, checkout, push/pull, history ops) targets the
-  **selected** worktree — so you can stage and commit in an agent's worktree from
-  here too.
+- The primary checkout is labelled *(primary)* in the menu. A bare repository
+  entry, or one whose directory git knows is gone, is listed but can't be viewed.
 - The selection sticks across refreshes. If the worktree is pruned or removed
-  while you're viewing it, the view **fails soft back to the primary** and tells
-  you. Switching the pane into a different repository resets the selection.
+  while you're viewing it — even by a plain `rm -rf` that git hasn't noticed —
+  the view **fails soft back to the primary** and tells you. Switching the pane
+  into a different repository resets the selection.
 - External changes inside a *selected* worktree refresh on the next shell prompt
   in the pane or when you press **↻** — the once-a-second auto-watch tracks the
   pane's own repo.
+
+### Read-only by default, with an explicit unlock
+
+A worktree you didn't check out yourself is very likely a **live agent's** — and
+staging, committing, discarding, or checking out under a running agent can break
+its work (a discard destroys uncommitted changes; a checkout flips its branch
+mid-task). So a **non-primary worktree opens read-only**: you can browse its
+history, status, diffs, and branch, but every write affordance (stage/unstage,
+commit, discard, checkout, push/pull, cherry-pick/revert/merge/rebase, branch/tag
+create) is hidden or disabled, with a **🔒 read-only** badge in the header.
+
+Click the badge to **unlock writes** for that worktree (it turns **🔓 writable**).
+The unlock is scoped to that one selection and is dropped the moment you switch
+worktrees — re-selecting it is read-only again, so you never leave writes armed
+on a tree you've moved away from. The **primary checkout keeps full write access**
+exactly as before.
 
 ## Safety
 
