@@ -127,7 +127,7 @@ pane stays open showing the status).
 
 | tool | orchestrator | worker/reviewer/planner |
 | --- | --- | --- |
-| `spawn_agent(name, kind, task, worktree?, branch?)` | ✓ (guardrailed) | ✗ |
+| `spawn_agent(name, kind, task, worktree?, branch?, base?)` | ✓ (guardrailed) | ✗ |
 | `send_prompt(agent_id, text)` | ✓ | ✗ |
 | `report(status, summary)` / `message_orchestrator(text)` | ✗ | ✓ |
 | `list_agents()` | ✓ | ✓ |
@@ -143,6 +143,28 @@ reviewers + planners), CLI + model pinned per role (`{role}_cli` / `{role}_model
 **Plan agent + mixed agent types** below), permission mode fixed at group creation
 (`acceptEdits` default; full-auto opt-in). Worktree creation reuses `git_worktree_add`
 (never for a planner — it is read-only).
+
+### Worktree base branch (#204)
+
+`git_worktree_add` cuts the agent branch from the repo's **default branch**, not the
+primary checkout's `HEAD`. It fetches `origin` first, then branches from the remote's
+advertised default (`origin/HEAD`, falling back to `origin/main`/`origin/master`); offline
+it uses the local default branch and drops a `worktree-base` breadcrumb. The primary
+checkout's `HEAD` is incidental state — before this fix, a worktree spawned while the main
+copy sat on a feature branch inherited that branch's commits, so agent PRs shipped stray
+commits and burned review rounds. The optional `base` arg overrides the start-point so an
+orchestrator can deliberately stack a worktree on an in-flight feature branch instead of
+instructing the worker to rebase by hand.
+
+The branch is created and checked out in one `git worktree add --no-track -b <name> <dir>
+<base>`. Keeping the `-b` and the start-point in a single command is deliberate: the naive
+"fix" (`git worktree add <dir> <origin-ref>` then `git switch -c`) checks out a
+remote-tracking ref, which lands the new worktree on a **detached HEAD** until the switch
+runs — the transient-detached-HEAD incidents reported alongside #204. The pre-#204 code was
+already a single `worktree add -b` off `HEAD` (attached, no detach window), so those
+incidents were not reproducible from our code path in isolation — most plausibly git's
+repo-level worktree lock racing under concurrent spawns; this fix keeps the atomic-`-b`
+invariant so the fix itself cannot introduce a detached-HEAD window.
 
 `kind` is `worker` (default), `reviewer`, or `planner`. A **planner** explores the
 codebase read-only and writes a structured implementation plan as a GitHub issue comment,

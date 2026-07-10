@@ -1472,6 +1472,7 @@ fn copilot_group_resumes_a_recorded_session() {
             "follow-up",
             false,
             None,
+            None,
             Some(sid.clone()),
             Some(dir.path().to_string_lossy().into_owned()),
             None,
@@ -1481,7 +1482,7 @@ fn copilot_group_resumes_a_recorded_session() {
     // A mangled id is rejected rather than silently resuming the wrong one.
     assert!(reg
         .spawn_agent_ex(
-            &g.id, Role::Worker, "bad", "", false, None,
+            &g.id, Role::Worker, "bad", "", false, None, None,
             Some("../../etc/passwd".into()),
             Some(dir.path().to_string_lossy().into_owned()),
             None,
@@ -1894,12 +1895,12 @@ fn resume_spawn_requires_valid_session_and_existing_cwd() {
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
     let bad_session = reg.spawn_agent_ex(
-        &g.id, Role::Worker, "w", "follow-up", false, None,
+        &g.id, Role::Worker, "w", "follow-up", false, None, None,
         Some("; rm -rf /".into()), None, None,
     );
     assert!(bad_session.is_err(), "shell-metachar session ids must be rejected");
     let bad_cwd = reg.spawn_agent_ex(
-        &g.id, Role::Worker, "w", "follow-up", false, None,
+        &g.id, Role::Worker, "w", "follow-up", false, None, None,
         Some("abc-123".into()), Some("C:/definitely/not/a/dir".into()), None,
     );
     assert!(bad_cwd.unwrap_err().contains("cwd"), "resume cwd must exist");
@@ -1907,7 +1908,7 @@ fn resume_spawn_requires_valid_session_and_existing_cwd() {
     let dir = tempfile::tempdir().unwrap();
     let ok = reg
         .spawn_agent_ex(
-            &g.id, Role::Worker, "w", "follow-up", false, None,
+            &g.id, Role::Worker, "w", "follow-up", false, None, None,
             Some("abc-123".into()), Some(dir.path().to_string_lossy().into_owned()), None,
         )
         .unwrap();
@@ -5911,6 +5912,76 @@ fn end_group_removes_worktrees_of_dead_and_live_agents() {
     assert!(!Path::new(&dead.cwd).exists(), "exited agent's worktree must be gone");
     // The main checkout is untouched.
     assert!(repo.path().join("f.txt").is_file(), "the repo root must survive teardown");
+}
+
+#[test]
+fn spawn_worktree_cuts_from_default_branch_not_primary_head() {
+    // #204 end-to-end: a spawn_agent worktree must be cut from origin/<default>,
+    // never the primary checkout's incidental HEAD. Simulate with a bare remote
+    // (default branch `main`) and a clone parked on a stray feature branch.
+    let git = |dir: &Path, args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "")
+            .env("GIT_CONFIG_SYSTEM", "")
+            .output()
+            .expect("git must be installed for this test");
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    };
+
+    let bare = tempfile::tempdir().unwrap();
+    git(bare.path(), &["init", "-q", "--bare"]);
+    git(bare.path(), &["symbolic-ref", "HEAD", "refs/heads/main"]);
+
+    // Seed `main` on the remote.
+    let seed = tempfile::tempdir().unwrap();
+    git(seed.path(), &["init", "-q"]);
+    git(seed.path(), &["symbolic-ref", "HEAD", "refs/heads/main"]);
+    git(seed.path(), &["config", "user.email", "t@t"]);
+    git(seed.path(), &["config", "user.name", "t"]);
+    fs::write(seed.path().join("base.txt"), "base").unwrap();
+    git(seed.path(), &["add", "-A"]);
+    git(seed.path(), &["commit", "-qm", "base on main"]);
+    git(seed.path(), &["remote", "add", "origin", &bare.path().to_string_lossy()]);
+    git(seed.path(), &["push", "-qu", "origin", "main"]);
+
+    // Primary clone wandered onto a stray branch with a stray commit.
+    let cloneparent = tempfile::tempdir().unwrap();
+    git(cloneparent.path(), &["clone", "-q", &bare.path().to_string_lossy(), "wc"]);
+    let primary = cloneparent.path().join("wc");
+    git(&primary, &["config", "user.email", "t@t"]);
+    git(&primary, &["config", "user.name", "t"]);
+    git(&primary, &["checkout", "-q", "-b", "docs/stray"]);
+    fs::write(primary.join("stray.txt"), "stray").unwrap();
+    git(&primary, &["add", "-A"]);
+    git(&primary, &["commit", "-qm", "stray docs commit"]);
+
+    let repo_path = primary.to_string_lossy().replace('\\', "/");
+    let (reg, _d) = test_registry();
+    let g = reg.create_group(&repo_path, rails()).unwrap();
+
+    // Default base: the worktree is cut from origin/main, not the stray HEAD.
+    let w = reg
+        .spawn_agent(&g.id, Role::Worker, "w", "t", true, Some("agent-x".into()))
+        .unwrap();
+    assert!(Path::new(&w.cwd).join("base.txt").exists(), "worktree should carry main");
+    assert!(
+        !Path::new(&w.cwd).join("stray.txt").exists(),
+        "#204: worktree must NOT inherit the primary checkout's stray HEAD"
+    );
+
+    // An explicit base stacks a worktree on the feature branch deliberately.
+    let stacked = reg
+        .spawn_agent_ex(
+            &g.id, Role::Worker, "s", "t", true, Some("agent-y".into()),
+            Some("docs/stray".into()), None, None, None,
+        )
+        .unwrap();
+    assert!(
+        Path::new(&stacked.cwd).join("stray.txt").exists(),
+        "an explicit base must place the worktree on top of the feature branch"
+    );
 }
 
 // ---------- #43: compose-strip steering + human-typing hold backstop ----------

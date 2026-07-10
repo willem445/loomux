@@ -191,6 +191,7 @@ fn tool_defs(role: Role) -> Vec<Value> {
                     "task": { "type": "string", "description": "Full task brief; empty = idle. With resume_session, this is the follow-up prompt." },
                     "worktree": { "type": "boolean", "description": "Create a dedicated git worktree + branch" },
                     "branch": { "type": "string", "description": "Branch name (default agent/<id>)" },
+                    "base": { "type": "string", "description": "Start-point for the worktree branch (default: the repo's default branch, fetched fresh from origin). Pass a feature branch (e.g. 'feat/x' or 'origin/feat/x') to deliberately stack this worktree on top of it. Ignored without worktree=true." },
                     "resume_session": { "type": "string", "description": "Session id to resume instead of starting fresh" },
                     "cwd": { "type": "string", "description": "Existing directory to run in (required with resume_session; use the original workspace)" },
                 }),
@@ -325,10 +326,11 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             let name = arg_str(args, "name").unwrap_or("");
             let worktree = args.get("worktree").and_then(Value::as_bool).unwrap_or(false);
             let branch = arg_str(args, "branch").map(str::to_string);
+            let base = arg_str(args, "base").map(str::to_string);
             let resume = arg_str(args, "resume_session").map(str::to_string);
             let cwd = arg_str(args, "cwd").map(str::to_string);
             let resumed = resume.is_some();
-            let a = reg.spawn_agent_ex(&caller.group, kind, name, task, worktree, branch, resume, cwd, None)?;
+            let a = reg.spawn_agent_ex(&caller.group, kind, name, task, worktree, branch, base, resume, cwd, None)?;
             // Copilot mints its session id a few seconds into boot; loomux
             // binds it to the pane once it appears (visible then in
             // list_agents / the task board).

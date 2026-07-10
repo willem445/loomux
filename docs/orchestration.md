@@ -61,7 +61,10 @@ its own identity token (`--strict-mcp-config`, so workers see nothing else). The
 orchestrator:
 
 - plans work as GitHub issues, labeling ones it owns **`agent-managed`**;
-- decides worktree-vs-branch per task by mergeability;
+- decides worktree-vs-branch per task by mergeability — a worktree branch is cut
+  from the repo's default branch (fetched fresh from origin), never from whatever
+  the primary checkout happens to sit on, so parallel work starts from a clean
+  base without a manual rebase;
 - delegates via tools that *type prompts into the worker's CLI* — you see every
   instruction verbatim in the pane, can steer any agent by typing yourself, and
   everything lands in the audit log.
