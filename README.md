@@ -56,6 +56,7 @@ Builds are unsigned for now — on macOS, if the app is reported as damaged, run
 - [Getting started](https://willem445.github.io/loomux/getting-started) — install, first launch, first agent pane
 - [Core concepts](https://willem445.github.io/loomux/core-concepts) — panes, the split grid, and the shortcut table
 - [Orchestration guide](https://willem445.github.io/loomux/orchestration) — agent groups, the task board, the label workflow
+- [Autonomous & supervised modes](https://willem445.github.io/loomux/autonomous-mode) — idle-tick autonomy, token budget, auto-merge/release, dangerous mode
 - Feature pages — [git view](https://willem445.github.io/loomux/features/git-view), [GitHub issues](https://willem445.github.io/loomux/features/github-issues), [voice prompts](https://willem445.github.io/loomux/features/voice-prompts), [steering](https://willem445.github.io/loomux/features/steering)
 - [Troubleshooting](https://willem445.github.io/loomux/troubleshooting) — whisper DLLs, `gh` auth, mic permission, disk
 

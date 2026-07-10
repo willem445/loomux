@@ -211,14 +211,20 @@ disturbing a busy one.
 ## Autonomous mode
 {: #autonomous-mode }
 
-> **Status: pending.** A fully autonomous idle-tick mode — where the orchestrator
-> keeps pulling work off the board on its own, under cost guardrails and an
-> auto-merge consent toggle
-> ([issue #151](https://github.com/willem445/loomux/issues/151)) — is in
-> development and had **not** merged when this page was written. Until it lands,
-> the orchestrator advances work in response to your nudges (**▶ Start**, the
-> label handshake, steering) and merge-gate decisions, as described above. This
-> section will be filled in when the feature ships.
+Everything above describes the **supervised** default: the orchestrator advances
+work in response to your nudges (**▶ Start**, the label handshake, steering) and
+your merge-gate decisions, and no agent ever merges or publishes.
+
+Two opt-in modes go further — an **autonomous** mode where the orchestrator wakes
+itself on an idle timer and pulls labeled work while you're away (under a token
+budget and optional auto-merge / auto-release consent toggles), and a
+**supervised dangerous mode** that lets agents merge and release without per-item
+approval while you're present. The default-branch merge/release gate that backs
+them is structurally enforced, not just asked of the model.
+
+**→ See [Autonomous & supervised modes](autonomous-mode.html)** for the full
+picture: the idle tick, the cost/budget money-stop, each consent toggle and what
+it gates, the per-item approve-with-comment grants, and the gate's audit trail.
 
 ## Requirements
 

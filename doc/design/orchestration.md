@@ -650,7 +650,50 @@ reconcile on read, mirrored into the kickoff config + a live notice, and surface
 `orch_autonomy` (`auto_release: bool`) via `orch_set_auto_release`.
 
 - **gh shim** additionally gates `gh release create|edit|delete <tag>` (read-only
-  `view`/`list`/`download` pass through) — `gh_release_action`.
+  `view`/`list`/`download` pass through) — `gh_release_action`. It **also** gates the raw
+  **`gh api` / graphql** shapes that publish the same way — otherwise an agent could drive a
+  release straight through the API and skip the subcommand gate entirely (**#196**: the release
+  path had *less* api coverage than the merge path, which already fail-safe-blocks raw `gh api`
+  merges). All of them route through **one** shared shell decision (`loomux_release_gate`, the
+  single decision point — no parallel checker), so the api path can never diverge from the
+  subcommand path: (a) a **write** (POST/PATCH/DELETE, not GET) to the **`git/refs` / `git/tags`**
+  plumbing that creates/moves/deletes a **`refs/tags/*`** ref, (b) a **write** to the `…/releases`
+  endpoint (create/edit/delete — read-only GET list/view passes), and (c) a graphql
+  **create/update/deleteRelease** mutation *or* a **`createRef`/`updateRef`** of a `refs/tags` ref
+  (a `*Tag` mutation). **Decision is by LOCUS, never substring-anywhere** — the shim parses gh
+  api's own flags and looks *only* at the request **method** (`-X`/`--method`, else POST when a
+  field/`--input` is present, else GET), the **URL path** (query string stripped), and the parsed
+  **`ref`/`query` field**. This was the crux of the #196 re-reviews: an argv-substring check gated
+  by "is `refs/tags/` anywhere / is `refs/heads/` anywhere", so a **decoy** `refs/heads/` token in a
+  `-q` jq filter, a `-H` header, a `-f sha=`, a `?d=` URL query, or an extra field flipped the
+  branch exemption while `ref=refs/tags/v9` created the tag; and an **opaque** graphql body
+  (`--input`/`-F query=@file`/stdin) hid the mutation entirely. Now the branch exemption fires
+  **only** when the ref *locus* is provably heads — the URL path is `…/git/refs/heads/…` **or** the
+  parsed `ref` field (argv `-f ref=`, or the `"ref"` read from a readable `--input <file>` body) is
+  `refs/heads/…` — **and** `refs/tags/` is absent from that locus. A non-GET write to `git/refs`/
+  `git/tags` whose locus can't be proven heads (a `--input -` stdin body, an opaque graphql query)
+  **fails safe to the gate** (blanket-markers-only). The tag is resolved for grant-keying from the
+  locus (argv `ref=refs/tags/<t>`, a `--input` file's `"ref"`, the URL `…/git/refs/tags/<t>`,
+  `tag_name=<t>`, or an inline graphql `tagName:"<t>"` / `name:"refs/tags/<t>"`); where it isn't
+  (stdin body, opaque graphql, `DELETE …/releases/<id>` by numeric id), only the blanket markers
+  (`autonomous && auto_release`, or supervised `dangerous && !autonomous`) can allow it — otherwise
+  **fail-safe block**. A non-release api call (an issues endpoint, a branch `refs/heads` write, an
+  read-only GET) passes through untouched. The **graphql arm**: the endpoint is recognized by
+  **suffix** (`graphql` | `/graphql` | `*/graphql`, incl. the full-URL host form) — not an exact
+  `graphql` string, which a `gh api /graphql`/full-URL POST would have slipped (#196 r4) — and it
+  gates **every ref/tag/release create+move+delete mutation** (`createRef` | `updateRef` |
+  `deleteRef` | `createTag` | `deleteTag` | `create`/`update`/`deleteRelease`) **unconditionally**,
+  plus opaque graphql (`--input`/stdin/`@file`). This matches the REST arm's full coverage — POST/
+  PATCH/**DELETE** of `git/refs`/`git/tags` and create/edit/**delete** of releases — so a destructive
+  `deleteRef` (which can drop a published `v*` tag ref) gates like `DELETE …/git/refs/tags/*`. There is **no "prove a mutation safe from the query text" logic** in the graphql arm,
+  by design: every text heuristic tried was defeated by the next encoding — a `refs/tags` literal,
+  a `-F ref=` variable, a no-`$`-variables rule — because graphql **variables, comments, aliases,
+  and string escapes** (`refs\/tags\/`) each dodge a text scan and the next encoding would too
+  (#196 r6). Closing the class (unconditional gate) removes the thing being decoyed. A graphql
+  `createRef` targeting a *branch* is a rare corner — agents create branches via `git push` or REST
+  `git/refs`, and the **REST arm still passes branch creation by real URL locus** (rev-68 confirmed
+  it airtight) — so gating the graphql-branch case fails safe: markers/grant still allow it. A
+  non-mutation graphql **read** query carries none of those tokens → passes.
 - **git shim** (new, same PATH-injection as the gh shim) gates `git push` that publishes a tag:
   `--tags`/`--follow-tags`/`--mirror` (bulk → blocked, push the specific approved tag),
   `refs/tags/<t>` and the `tag <t>` form (explicit), and a bare **`v*`** refspec (any v-prefixed
