@@ -679,13 +679,17 @@ reconcile on read, mirrored into the kickoff config + a live notice, and surface
   (`autonomous && auto_release`, or supervised `dangerous && !autonomous`) can allow it — otherwise
   **fail-safe block**. A non-release api call (an issues endpoint, a branch `refs/heads` write, an
   inline graphql read, a read-only GET) passes through untouched. The **graphql arm carries the same
-  locus rigor** (#196 r4): the endpoint is recognized by **suffix** (`graphql` | `/graphql` |
-  `*/graphql`, incl. the full-URL host form) — not an exact `graphql` string, which a `gh api
-  /graphql`/full-URL POST would have slipped — and a `createRef`/`updateRef` gates unless its ref is
-  **provably heads**, consulting the ref wherever it lives: an inline `refs/heads`/`refs/tags`
-  literal in the query text **and** a `-F ref=`/`-f ref=` graphql **variable** (the parsed `a_ref`).
-  A `refs/tags` variable therefore can't hide behind a query with no literal, and a heads literal
-  can't excuse a `refs/tags` variable; an unresolvable/opaque ref fails safe to the gate.
+  locus rigor**: the endpoint is recognized by **suffix** (`graphql` | `/graphql` | `*/graphql`,
+  incl. the full-URL host form) — not an exact `graphql` string, which a `gh api /graphql`/full-URL
+  POST would have slipped (#196 r4). A `createRef`/`updateRef` gets **no decoy-able prove-heads
+  exemption**: a positive "it looks like heads → pass" test is always defeatable — a heads-looking
+  token can be dropped in a comment or a decoy field while the real tag rides in a graphql `$`
+  variable (#196 r5). So a `createRef`/`updateRef` passes **only** when it has ZERO indirection —
+  (a) an inline `refs/heads/` literal is in the query, (b) there is **no `$` graphql variable
+  anywhere** in the query (any variable → gate), and (c) no `refs/tags/` literal appears in the
+  query or the parsed ref field — else it **fails safe to the gate**. This over-gates the rare
+  heads-`createRef`-via-variable case, which markers/grant still allow; safety beats a decoy-able
+  convenience. (`*Release` and `createTag` mutations, and opaque graphql, gate unconditionally.)
 - **git shim** (new, same PATH-injection as the gh shim) gates `git push` that publishes a tag:
   `--tags`/`--follow-tags`/`--mirror` (bulk → blocked, push the specific approved tag),
   `refs/tags/<t>` and the `tag <t>` form (explicit), and a bare **`v*`** refspec (any v-prefixed

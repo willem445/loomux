@@ -299,11 +299,11 @@ if [ "$cmd" = "api" ]; then
   if [ "$is_graphql" = "1" ]; then
     # If the query is opaque (from --input/stdin or query=@file) we cannot scan it →
     # fail-safe gate. Otherwise scan the inline query: a *Release / createTag mutation
-    # always gates; a createRef/updateRef gates UNLESS the ref locus is PROVABLY a
-    # branch. The ref may live inline in the query OR in a `-F ref=`/`-f ref=` graphql
-    # VARIABLE (a_ref) OR the body — so both the query text and a_ref are consulted (a
-    # heads literal can't excuse a refs/tags variable, nor vice-versa); an unprovable
-    # ref (opaque/variable-we-can't-resolve) fails safe to the gate.
+    # always gates; a createRef/updateRef gates UNLESS it is PROVABLY a branch with
+    # ZERO indirection (see below). A positive "prove it's heads → pass" test is always
+    # decoy-able — a heads-looking token can be added anywhere (a comment, a decoy
+    # field) while the real tag rides in a graphql variable — so the exemption forbids
+    # all indirection rather than trusting a token's presence (#196 r5).
     if [ -n "$a_inputval" ] || [ "$a_qopaque" = "1" ]; then
       is_rel=1
     elif [ -n "$a_query" ]; then
@@ -311,12 +311,21 @@ if [ "$cmd" = "api" ]; then
       case "$ql" in *createrelease*|*updaterelease*|*deleterelease*|*createtag*) is_rel=1 ;; esac
       case "$ql" in
         *createref*|*updateref*)
-          hh=0; tt=0
-          case "$ref_low" in refs/heads/*) hh=1 ;; esac
-          case "$ref_low" in refs/tags/*)  tt=1 ;; esac
-          case "$ql"      in *refs/heads/*) hh=1 ;; esac
-          case "$ql"      in *refs/tags/*)  tt=1 ;; esac
-          if [ "$hh" = "1" ] && [ "$tt" = "0" ]; then : ; else is_rel=1; fi ;;
+          # Pass ONLY when ALL hold, else fail-safe gate: (a) an INLINE refs/heads
+          # literal is in the query, AND (b) there is NO `$` graphql variable anywhere
+          # in the query (any variable → gate: a ref can hide behind `$v`), AND (c) NO
+          # refs/tags literal appears in the query or the parsed ref field. This
+          # over-gates the rare heads-createRef-via-variable case — acceptable, markers/
+          # grant still allow it; safety wins over a decoy-able convenience.
+          hpass=0
+          case "$a_query" in
+            *refs/heads/*)
+              hpass=1
+              case "$a_query" in *'$'*)        hpass=0 ;; esac
+              case "$a_query" in *refs/tags/*) hpass=0 ;; esac
+              case "$ref_low"  in refs/tags/*) hpass=0 ;; esac ;;
+          esac
+          [ "$hpass" = "1" ] || is_rel=1 ;;
       esac
       # resolve the tag for grant-keying: a refs/tags variable, else an inline literal.
       case "$ref_low" in refs/tags/*) rtag=${a_ref#refs/tags/}; rtag=${rtag%% *} ;; esac

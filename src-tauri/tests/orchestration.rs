@@ -4193,6 +4193,9 @@ fn gh_shim_script_gates_raw_api_release_shapes() {
         "catches graphql create/update/delete Release mutations");
     assert!(sh.contains("createref") && sh.contains("updateref"),
         "catches graphql create/update Ref tag mutations");
+    // #196 r5: the graphql createRef heads-exemption forbids ALL indirection — any `$`
+    // graphql variable gates (a positive prove-heads check is otherwise decoy-able).
+    assert!(sh.contains("*'$'*"), "any graphql `$` variable in a createRef fails safe to the gate");
     // The api path is audited as a release-gate event (same markers as the subcommand).
     assert!(sh.contains("release-gate-allowed") && sh.contains("release-gate-blocked"),
         "api release allows/blocks are audited as release-gate events");
@@ -4484,28 +4487,38 @@ fn gh_shim_harness_gates_graphql_endpoint_variants_and_variable_ref() {
     let cr_var = "query=mutation($ref:String!){ createRef(input: { ref: $ref, oid: \"a\" }) { ref { id } } }"; // ref via variable
     let read_q = "query={ repository { releases { nodes { id } } } }";
 
-    // ---- BLOCK with no markers: every endpoint spelling + the variable-hidden ref.
-    let block: [&[&str]; 7] = [
+    // ---- BLOCK with no markers: every endpoint spelling, the variable-hidden ref, AND
+    // (r5) a createRef with ANY graphql `$` variable — including a refs/heads variable,
+    // which is gated because variable indirection can hide the real ref (a positive
+    // prove-heads test is decoy-able). Comment/decoy heads tokens must not excuse it.
+    let x1_comment_tagvar: &[&str] = &["api", "graphql", "-F", "v=refs/tags/v9",
+        "-f", "query=mutation($v:String!){ createRef(input:{ref:$v, oid:\"a\"}){ ref { id } } } # refs/heads/x"];
+    let x2_decoy_headsvar: &[&str] = &["api", "graphql", "-F", "ref=refs/heads/x", "-F", "v=refs/tags/v9",
+        "-f", "query=mutation($ref:String!,$v:String!){ createRef(input:{ref:$v}){ ref { id } } }"];
+    let x3_updateref_nodeid: &[&str] = &["api", "graphql", "-F", "id=NODE123",
+        "-f", "query=mutation($id:ID!){ updateRef(input:{refId:$id, oid:\"a\"}){ ref { id } } } # refs/heads/x"];
+    let block: [&[&str]; 10] = [
         &["api", "graphql", "-f", cr_tags],                       // exact endpoint
         &["api", "/graphql", "-f", cr_tags],                      // leading-slash
         &["api", "https://api.github.com/graphql", "-f", cr_tags],// full URL host form
         &["api", "graphql", "-F", "ref=refs/tags/v9", "-f", cr_var], // -F variable ref (no literal)
         &["api", "/graphql", "-f", "ref=refs/tags/v9", "-f", cr_var], // -f variable ref
+        &["api", "graphql", "-F", "ref=refs/heads/feature", "-f", cr_var], // heads via VARIABLE → gated (r5)
         &["api", "graphql", "--input", "-"],                      // opaque stdin
         &["api", "graphql", "-F", &qopaque],                      // opaque query=@file
+        x1_comment_tagvar, x3_updateref_nodeid,
     ];
-    for s in block { assert!(!run(s), "graphql tag-ref write must block with no markers: {s:?}"); }
+    for s in block { assert!(!run(s), "graphql tag-ref/indirection write must block with no markers: {s:?}"); }
+    assert!(!run(x2_decoy_headsvar), "a decoy -F ref=refs/heads with the real tag in another variable must block");
 
-    // ---- PASS: heads createRef (inline AND via a heads variable), full-URL heads, reads.
-    let pass: [&[&str]; 6] = [
-        &["api", "graphql", "-f", cr_heads],
-        &["api", "graphql", "-F", "ref=refs/heads/feature", "-f", cr_var],
-        &["api", "https://api.github.com/graphql", "-f", cr_heads],
+    // ---- PASS: ONLY an inline refs/heads createRef with NO variables, and reads.
+    let pass: [&[&str]; 4] = [
+        &["api", "graphql", "-f", cr_heads],                      // inline heads, no `$`
         &["api", "graphql", "-f", read_q],
         &["api", "/graphql", "-f", read_q],
         &["api", "https://api.github.com/graphql", "-f", read_q],
     ];
-    for s in pass { assert!(run(s), "a branch createRef / read graphql query must pass through: {s:?}"); }
+    for s in pass { assert!(run(s), "an inline branch createRef (no variables) / read query must pass: {s:?}"); }
 
     // ---- Blanket markers allow the opaque + variable-hidden shapes.
     set("autonomous"); set("auto_release");
