@@ -245,7 +245,14 @@ layers now handle it, both keeping panerestore pure:
   pre-check and the spawn, or any other resume-time CLI failure. The time gate is
   essential: a resume that *succeeded* and was worked in for a while and then
   exits non-zero is the human's own session ending, not a resume failure, so it's
-  left alone.
+  left alone. Unlike the pre-check, the backstop mints a **new** session id for the
+  fresh command instead of reusing the recorded one: a resume can fail because the
+  transcript EXISTS but is corrupt/half-written, and `--session-id <recorded>`
+  would then hit the same conflict again — a brand-new id always creates cleanly.
+- *Early-exit symmetry.* Both restore open paths (`rebuildLayout`, `restoreDocked`)
+  call `reapIfExited` after each `openActionPane`, matching the welcome/session
+  paths — a spawn that exits in the sub-tick before `ptyId` is assigned is drained
+  from `earlyExits` (and can trip the fresh-fallback) rather than leaking.
 
 **BUG-2 — decline crashed with "no active workspace".** The restore splash is
 awaited while the app has zero tabs, and the window-focus handler (plus voice

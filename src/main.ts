@@ -333,7 +333,12 @@ async function rebuildLayout(
   const panes: Pane[] = [];
   for (const step of steps) {
     const anchor = step.relativeTo === null ? undefined : panes[step.relativeTo];
-    panes.push(await openActionPane(ws, step.action, step.dir, anchor));
+    const pane = await openActionPane(ws, step.action, step.dir, anchor);
+    // Symmetry with the welcome/session-restore spawn paths: an exit that raced in
+    // before `ptyId` was assigned sits in earlyExits — drain it here (also lets the
+    // resume fresh-fallback fire on a sub-tick resume failure) instead of leaking it.
+    reapIfExited(ws, pane);
+    panes.push(pane);
   }
   // openPane/openDormantPane reset flex to equal shares as they split; put the
   // saved weights back now that the whole tree exists.
@@ -352,6 +357,7 @@ async function restoreDocked(
 ): Promise<void> {
   for (const record of docked) {
     const pane = await openActionPane(ws, planPaneRestore(record, resumable));
+    reapIfExited(ws, pane); // same early-exit drain as the layout path
     ws.grid.minimize(pane);
   }
 }
@@ -395,14 +401,22 @@ async function openActionPane(
       // conversation (or any resume-time CLI failure), respawn fresh in place
       // instead of stranding a dead pane. Remember the fresh opts, keyed by pane;
       // the exit handler consumes it one-shot (see onPtyExit / reapIfExited).
-      const fresh = agentFreshCommand(a.command, a.argv, a.sessionId);
+      //
+      // The backstop mints a NEW session id rather than reusing the recorded one:
+      // if the resume failed because a transcript EXISTS but is corrupt/half-written,
+      // `--session-id <recorded>` would hit the same conflict and fail again. A
+      // brand-new id always `--session-id`-creates cleanly, and the fresh session is
+      // resumable next boot under that new id. (The pre-check path — fresh-agent —
+      // does reuse the recorded id; there we KNOW it has no transcript.)
+      const freshId = crypto.randomUUID();
+      const fresh = agentFreshCommand(a.command, a.argv, freshId);
       resumeFallbacks.set(pane, {
         opts: {
           name: a.name,
           cwd: a.cwd ?? undefined,
           command: fresh.command,
           argv: fresh.argv,
-          sessionId: a.sessionId,
+          sessionId: freshId,
         },
         at: Date.now(),
       });
