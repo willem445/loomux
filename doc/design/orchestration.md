@@ -239,9 +239,24 @@ intent, not vacuous passes) → design notes + user docs → commit → push →
   orchestrator/state, while a relaunch with no live group still resumes `base`'s
   state. Badges carry a group ordinal (`ORCH 2` ↔ `W 2`) plus the accent color.
 - **Task board**: structured `tasks.json` per group (statuses queued → in-progress →
-  review → pr → human-testing → done, plus blocked; notes; priority order), edited by
-  the orchestrator via MCP tools and by the human via the pane overlay (Alt+T); each
-  side's edits notify the other, and everything is audited.
+  review → pr → human-testing → done, plus blocked and `prototype`; notes; priority
+  order), edited by the orchestrator via MCP tools and by the human via the pane overlay
+  (Alt+T); each side's edits notify the other, and everything is audited. `TASK_STATUSES`
+  is the single source of truth — validated on every write; the frontend picker and MCP
+  `upsert_task` enum mirror it.
+- **Prototype → Proceed (#147)**: `prototype` is a demo-gate status — a draft the human
+  is evaluating before committing it to a release (the `agent-prototype` label's on-board
+  home). It renders as a distinct magenta chip and joins the human-gated states the board
+  highlights (`isAwaitingHuman` / `attention_tick`'s gate map). Its board action is **not**
+  the merge-gate approve/changes but a dedicated **Proceed** (`orch_proceed_task` →
+  `proceed_task`, two-click confirm): guarded to `prototype` items (`ensure_prototype`,
+  constraint 6), it flips the task to `in-progress` — the item re-enters active work rather
+  than parking on the verdict — records a human-attributed note, and delivers exactly one
+  typed "promote to a full production build" notice to the orchestrator. Like `approve_task`
+  (and unlike `start_task`), the durable status flip carries the decision, so it does **not**
+  reject on a paused group — the orchestrator sees the flip + note on resume via `list_tasks`.
+  The template documents the loop (build demo → park in `prototype` → on Proceed, run the
+  full production round, no corners).
 - **Merge-gate actions**: on `pr`/`human-testing` items — the exact point where the
   human gatekeeps — the board overlay exposes the three touchpoints that otherwise
   meant typing into the orchestrator by hand. Issue/PR chips are clickable and open in

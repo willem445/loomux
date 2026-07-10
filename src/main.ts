@@ -2,17 +2,38 @@ import "./styles.css";
 import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 import { showToast } from "./toast";
-import { Grid } from "./grid";
+import type { Grid } from "./grid";
+import { Workspace } from "./workspace";
+import { TabManager } from "./tabs";
+import { TabBar } from "./tabbar";
 import type { Pane, PaneEvents } from "./pane";
 import { SessionBrowser } from "./sessions";
-import { ensureOutputRouter, onPtyExit, type PtyExit, type SessionInfo } from "./pty";
+import {
+  ensureOutputRouter,
+  onPtyExit,
+  loadUiTabs,
+  saveUiTabs,
+  type PtyExit,
+  type SessionInfo,
+} from "./pty";
 import { matchShortcut } from "./shortcuts";
 import { voiceController } from "./voicecontrol";
 import { initStatusBar } from "./statusbar";
 import { initHintBar } from "./hintbar";
 import { AgentLauncher } from "./launcher";
 import { getAgentMode, setAgentMode } from "./agents";
-import { initOrchestration, launchOrchestrator, orchSessionRoles, resumeOrchSession } from "./orchestration";
+import {
+  initOrchestration,
+  launchOrchestrator,
+  orchSessionRoles,
+  resumeOrchSession,
+  type OrchWiring,
+  type OrchTarget,
+  type OrchestratorConfig,
+  type AttentionItem,
+} from "./orchestration";
+import { tabAttention, sameAttention, findPaneByPty } from "./tabroute";
+import { encodeTabs, decodeTabs } from "./tabstore";
 
 // Surface unexpected errors as a visible banner instead of a silently
 // broken UI — a user-facing "crash" should always come with a message.
@@ -41,37 +62,234 @@ window.addEventListener("unhandledrejection", (e) => {
   showFatal(`unhandled: ${String(e.reason)}`);
 });
 
-const gridRoot = document.getElementById("grid-root")!;
-const paneDock = document.getElementById("pane-dock")!;
 const sessionsEl = document.getElementById("sessions")!;
+const stackEl = document.getElementById("workspace-stack")!;
+const tabBarEl = document.getElementById("tab-bar")!;
 
-const grid = new Grid(gridRoot, paneDock, () => {
-  // Last pane closed → always keep one pane alive.
-  void openPane();
+// Project tabs (#63): each tab is a Workspace (its own Grid + dock). The old
+// module-scope single `grid` is gone; everything acts on the ACTIVE tab's grid.
+const tabs = new TabManager<Workspace>((id) => {
+  const ws = new Workspace(id, (w) => {
+    // Last pane in this tab closed (a human ✕, or a background agent exiting) →
+    // keep the tab's grid non-empty with a SILENT plain shell. This is a
+    // lifecycle refill, not a human "new pane" action, so it must never open the
+    // launcher modal — which, for a hidden/background tab, would pop over the
+    // ACTIVE tab (MED-1). The launcher only ever appears from an explicit human
+    // action in the active tab (openUserTab / a split). One rule for every empty
+    // tab: a plain shell (see the boot fill and the design note).
+    void openShellIn(w);
+  });
+  stackEl.appendChild(ws.el);
+  return ws;
 });
 
-// Voice push-to-talk (#58, Alt+S): the global capture controller finds its
-// insertion target via the active pane.
-voiceController.init(() => grid.activePane);
+/** The tab strip, assigned once boot mounts it. Held so the keyboard
+ *  Ctrl+Shift+K routes through the same two-step close-confirm the ✕ uses. */
+let tabBar: TabBar<Workspace> | null = null;
 
-const paneEvents: PaneEvents = {
-  onFocus: (pane) => grid.setActive(pane),
-  onCloseRequest: (pane) => grid.closePane(pane),
-  onSplit: (pane, dir) => void openPane(dir, pane),
-  onMinimize: (pane) => grid.minimize(pane),
-  onMaximize: (pane) => grid.toggleMaximize(pane),
-  onToggleGroupMinimize: (pane) => {
-    const groupId = pane.orchGroupId;
-    if (groupId) grid.toggleGroupMinimize(groupId);
+/** The active tab's grid — the single-grid `grid` of the pre-tabs app. */
+const activeGrid = (): Grid => tabs.activeWorkspace.grid;
+
+// Voice push-to-talk (#58, Alt+S): the global capture controller finds its
+// insertion target via the active pane (of the active tab).
+voiceController.init(() => activeGrid().activePane);
+
+/** Pane events bound to a specific workspace, so a pane always acts on its own
+ *  tab's grid — never whichever tab happens to be active when the event fires. */
+function eventsFor(ws: Workspace): PaneEvents {
+  return {
+    onFocus: (pane) => ws.grid.setActive(pane),
+    onCloseRequest: (pane) => ws.grid.closePane(pane),
+    onSplit: (pane, dir) => void openPaneIn(ws, dir, pane),
+    onMinimize: (pane) => ws.grid.minimize(pane),
+    onMaximize: (pane) => ws.grid.toggleMaximize(pane),
+    onToggleGroupMinimize: (pane) => {
+      const groupId = pane.orchGroupId;
+      if (groupId) ws.grid.toggleGroupMinimize(groupId);
+    },
+  };
+}
+
+/** Find a pane by pty id across ALL tabs — a PTY exit / focus / rename can
+ *  belong to any tab, not just the active one. Scans live panes (never a
+ *  maintained side-map, which a pane close would leave stale); the pure core is
+ *  `findPaneByPty` (tabroute.ts), unit-tested. */
+function findPaneAcrossTabs(ptyId: number): { ws: Workspace; pane: Pane } | null {
+  return findPaneByPty(tabs.tabs, (ws) => ws.grid, ptyId);
+}
+
+// ---------- project tabs: orchestration routing (#63) ----------
+
+/** Open a new tab the way the user expects (#63): create + activate
+ *  it, then present the SAME starting surface a fresh loomux pane shows — a
+ *  terminal in plain mode, or the agent launcher in agent mode (openPaneIn is
+ *  the exact fresh-boot / new-pane flow). Never leaves the tab blank. */
+async function openUserTab(): Promise<void> {
+  const ws = tabs.newTab();
+  await openPaneIn(ws);
+  // In agent mode, choosing "orchestrator" from the launcher opens its OWN
+  // project tab (launchOrchestratorTab), leaving this one empty — drop the
+  // redundant blank tab in that one case. Every other path fills `ws`.
+  if (ws.grid.paneCount === 0 && tabs.count > 1) tabs.closeTab(ws.id);
+  persistTabs();
+}
+
+/** A short project name for a tab, from a repo/worktree path's last segment. */
+function projectName(path: string): string {
+  const parts = path.replace(/[\\/]+$/, "").split(/[\\/]/);
+  return parts[parts.length - 1] || "project";
+}
+
+/** Launch an orchestrator into its OWN project tab (created + activated + named
+ *  from the repo), then bind the group→tab routing so its workers land here and
+ *  focus/attention resolve to this tab (#63). */
+async function launchOrchestratorTab(config: OrchestratorConfig): Promise<void> {
+  const ws = tabs.newTab();
+  tabs.renameTab(ws.id, projectName(config.repo));
+  const { groupId } = await launchOrchestrator(ws.grid, eventsFor(ws), config);
+  tabs.bindGroup(groupId, ws.id);
+  persistTabs();
+}
+
+/** Apply an attention scan across all tabs: badge each pane by its pty (the
+ *  pre-tabs behavior, now spanning every tab) AND badge the tab-strip entry of
+ *  any tab that owns a needs-attention pty — so a hidden tab's blocked agent
+ *  still surfaces (#63). Uses a live pty→tab map built from the actual
+ *  panes, so plain (#40) panes badge their tab too, not just bound agents. */
+function applyAttention(items: AttentionItem[]): void {
+  const byPty = new Map<number, AttentionItem>();
+  for (const it of items) if (it.pty_id !== null) byPty.set(it.pty_id, it);
+  const ptyToWs = new Map<number, string>();
+  for (const ws of tabs.tabs) {
+    for (const pane of ws.grid.allPanes()) {
+      if (pane.ptyId === null) continue;
+      ptyToWs.set(pane.ptyId, ws.id);
+      const it = byPty.get(pane.ptyId);
+      pane.setAttention(it ? it.reason : null, it?.detail);
+    }
+  }
+  // Dedup against the current set so the 3-second re-emits don't re-render the
+  // tab bar when nothing changed.
+  const next = tabAttention(items, ptyToWs);
+  if (!sameAttention(tabs.tabAttention, next)) tabs.setTabAttention(next);
+}
+
+/** The tab layer as the orchestration event router sees it (OrchWiring). */
+const orchWiring: OrchWiring = {
+  targetForGroup(req): OrchTarget {
+    let ws = tabs.workspaceForGroup(req.group_id);
+    if (!ws) {
+      // First sight of a group with no tab (e.g. a rejoin before its
+      // orchestrator restored) — open a background project tab for it.
+      ws = tabs.newTab(false);
+      tabs.renameTab(ws.id, projectName(req.cwd || req.name));
+      tabs.bindGroup(req.group_id, ws.id);
+      persistTabs();
+    }
+    return { grid: ws.grid, paneEvents: eventsFor(ws) };
   },
+  findByPty(ptyId): Pane | undefined {
+    return findPaneAcrossTabs(ptyId)?.pane;
+  },
+  allGrids(): Grid[] {
+    return tabs.tabs.map((ws) => ws.grid);
+  },
+  focusPty(ptyId): void {
+    const found = findPaneAcrossTabs(ptyId);
+    if (!found) return;
+    tabs.switchTo(found.ws.id); // switch to the pane's TAB first…
+    found.ws.grid.setActive(found.pane); // …then focus the pane.
+    found.pane.focus();
+  },
+  applyAttention,
 };
+
+// ---------- project tabs: persistence (#63) ----------
+// The tab set (name / color / order / active tab / owning group) persists to
+// durable BACKEND storage via a typed command (loadUiTabs/saveUiTabs → the
+// atomic, corrupt-safe tabs.json in AppData; see src-tauri/src/uistate.rs),
+// NOT localStorage — so it survives a webview data clear and sits alongside the
+// app's other durable state. tabstore.ts owns the schema (encode/decode +
+// validation); a bad file is quarantined backend-side and we degrade to a fresh
+// tab without losing it. Pane/PTY contents are not captured — see restoreTabs /
+// the design doc for what does and does not revive, and why.
+
+/** The pre-backend localStorage key, read once for migration then retired. */
+const LEGACY_TABS_KEY = "loomux.tabs";
+
+/** The last snapshot actually written, so persistTabs is a no-op when nothing
+ *  in the persisted set changed. tabs.onChange also fires for attention-scan
+ *  updates (every ~3s) and renames-in-progress, none of which alter the saved
+ *  fields — without this dedup we'd rewrite identical bytes to disk on a timer. */
+let lastPersisted: string | null = null;
+
+/** Persist the current tab set to the backend when it actually changed.
+ *  Fire-and-forget: persistence is best-effort and must never block or crash the
+ *  UI (a failed write just means the last change isn't durable until the next). */
+function persistTabs(): void {
+  const encoded = encodeTabs(tabs.snapshot());
+  if (encoded === lastPersisted) return;
+  lastPersisted = encoded;
+  void saveUiTabs(encoded).catch(() => {
+    // The write didn't land — allow the next change to retry the same bytes.
+    lastPersisted = null;
+  });
+}
+
+/** Load the persisted tab-set JSON, migrating a pre-backend localStorage blob on
+ *  first run after upgrade: read the legacy key ONCE, hand it to the backend,
+ *  and clear it so the backend copy is thereafter the single source of truth. */
+async function loadPersistedTabs(): Promise<string | null> {
+  const fromBackend = await loadUiTabs();
+  if (fromBackend !== null) return fromBackend;
+  // No backend copy yet. One-time migration from the pre-backend localStorage.
+  const legacy = localStorage.getItem(LEGACY_TABS_KEY);
+  if (legacy !== null) {
+    localStorage.removeItem(LEGACY_TABS_KEY);
+    // Adopt the legacy blob as the backend copy immediately, so a crash before
+    // the next change doesn't lose it (and we never read localStorage again).
+    void saveUiTabs(legacy).catch(() => {});
+    return legacy;
+  }
+  return null;
+}
+
+/** Recreate the saved tab set on boot, rebinding each tab's group so a restored
+ *  session for that group routes into its own tab (see restoreSession). Returns
+ *  whether any tabs were restored (false → caller seeds one default tab).
+ *
+ *  DELIBERATE SCOPE (design doc — not a limitation we couldn't overcome): only
+ *  the tab SHELLS revive here (name / color / order / active / group binding).
+ *  Live agent panes/PTYs are NOT auto-spawned on boot — reviving N
+ *  orchestrator+worker CLIs on every launch would burn the user's credits and
+ *  spawn a process storm (#78) without them asking. Instead the persisted group
+ *  binding makes revival routing-correct: when the human restores that group's
+ *  session (or a spawn/rejoin event arrives for it), it lands in THIS tab via
+ *  the group→tab routing, not whatever tab is active. */
+async function restoreTabs(): Promise<boolean> {
+  const saved = decodeTabs(await loadPersistedTabs());
+  if (!saved) return false;
+  for (const t of saved.tabs) {
+    const ws = tabs.newTab(false);
+    tabs.renameTab(ws.id, t.name);
+    tabs.setColor(ws.id, t.color);
+    if (t.groupId) tabs.bindGroup(t.groupId, ws.id);
+  }
+  const activeWs = tabs.tabs[saved.activeIndex];
+  if (activeWs) tabs.switchTo(activeWs.id);
+  return true;
+}
 
 // PTYs whose exit event arrived before their pane finished starting.
 const earlyExits = new Map<number, PtyExit>();
 
-async function openShell(dir: "row" | "column" = "row", relativeTo?: Pane): Promise<Pane> {
-  const pane = await grid.openPane({}, paneEvents, dir, relativeTo);
-  reapIfExited(pane);
+async function openShellIn(
+  ws: Workspace,
+  dir: "row" | "column" = "row",
+  relativeTo?: Pane
+): Promise<Pane> {
+  const pane = await ws.grid.openPane({}, eventsFor(ws), dir, relativeTo);
+  reapIfExited(ws, pane);
   return pane;
 }
 
@@ -103,19 +321,23 @@ renderAgentMode();
  *  launcher dialog; cancelling only falls back to a shell when the grid
  *  would otherwise be empty. The launcher can resolve to one pane, a fleet
  *  of N panes, or an orchestrator group (which opens its own panes). */
-async function openPane(dir: "row" | "column" = "row", relativeTo?: Pane): Promise<void> {
+async function openPaneIn(
+  ws: Workspace,
+  dir: "row" | "column" = "row",
+  relativeTo?: Pane
+): Promise<void> {
   if (!agentMode) {
-    await openShell(dir, relativeTo);
+    await openShellIn(ws, dir, relativeTo);
     return;
   }
   const result = await launcher.show();
   if (!result) {
-    if (grid.paneCount === 0) await openShell(dir);
-    else grid.activePane?.focus();
+    if (ws.grid.paneCount === 0) await openShellIn(ws, dir);
+    else ws.grid.activePane?.focus();
     return;
   }
   if (result.kind === "orchestrator") {
-    await launchOrchestrator(grid, paneEvents, result.config);
+    await launchOrchestratorTab(result.config);
     return;
   }
   // Alternate split direction pane-to-pane so a fleet lays out as a grid
@@ -123,25 +345,29 @@ async function openPane(dir: "row" | "column" = "row", relativeTo?: Pane): Promi
   let prev = relativeTo;
   let d = dir;
   for (const spec of result.specs) {
-    const pane = await grid.openPane(
+    const pane = await ws.grid.openPane(
       { name: spec.name, cwd: spec.cwd, command: spec.command },
-      paneEvents,
+      eventsFor(ws),
       d,
       prev
     );
-    reapIfExited(pane);
+    reapIfExited(ws, pane);
     prev = pane;
     d = d === "row" ? "column" : "row";
   }
 }
 
-function reapIfExited(pane: Pane): void {
+/** Open a pane in the active tab — the entry point the toolbar/shortcuts use. */
+const openPane = (dir: "row" | "column" = "row", relativeTo?: Pane): Promise<void> =>
+  openPaneIn(tabs.activeWorkspace, dir, relativeTo);
+
+function reapIfExited(ws: Workspace, pane: Pane): void {
   if (pane.ptyId === null) return;
   const exit = earlyExits.get(pane.ptyId);
   if (!exit) return;
   earlyExits.delete(pane.ptyId);
   if (pane.keepOpenOnExit(exit)) pane.notifyExited(exit.exit_code);
-  else grid.closePane(pane, false);
+  else ws.grid.closePane(pane, false);
 }
 
 const sessions = new SessionBrowser(
@@ -153,44 +379,62 @@ const sessions = new SessionBrowser(
 );
 
 async function restoreSession(s: SessionInfo): Promise<void> {
-  // Recorded orchestration sessions restore into their group — MCP
-  // identity, badges, and task board included — instead of a powerless
-  // plain `--resume`.
+  // Recorded orchestration sessions restore into their group — MCP identity,
+  // badges, and task board included — instead of a powerless plain `--resume`.
   const orchRole = s.source === "claude" ? sessions.roleFor(s) : undefined;
   if (orchRole) {
+    // Route a restored group into the tab that OWNS it, if one exists — a
+    // persisted tab (its shell restored on boot) whose group binding survived,
+    // or a tab already hosting that group this session. This is the real
+    // persistence↔restore integration (#63): the group re-inhabits its own tab
+    // through the resume machinery, not whatever tab happens to be active. Only
+    // when no tab owns the group does it land in the active tab.
+    const owning = tabs.workspaceForGroup(orchRole.group_id);
+    const ws = owning ?? tabs.activeWorkspace;
+    if (owning && owning.id !== tabs.activeTabId) tabs.switchTo(owning.id);
     try {
-      await resumeOrchSession(grid, paneEvents, s.id, {
+      const restored = await resumeOrchSession(ws.grid, eventsFor(ws), s.id, {
         group: orchRole.group_id,
         role: orchRole.role,
       });
+      // Bind the restored group to this tab so its rejoined workers spawn here
+      // and focus/attention resolve here (#63); idempotent when the tab already
+      // owned it. Pane lookups scan live panes, so there's no per-pty binding.
+      if (restored) {
+        tabs.bindGroup(restored.groupId, ws.id);
+        persistTabs();
+      }
     } catch (err) {
       showFatal(String(err));
     }
     return;
   }
+  // Plain (non-orchestration) sessions restore into the active tab.
+  const ws = tabs.activeWorkspace;
   const name =
     (s.source === "claude" ? "claude · " : "copilot · ") +
     (s.title.length > 34 ? s.title.slice(0, 34) + "…" : s.title);
-  const pane = await grid.openPane(
+  const pane = await ws.grid.openPane(
     { name, cwd: s.cwd || undefined, command: s.resume_command },
-    paneEvents,
-    grid.paneCount >= 2 ? "column" : "row"
+    eventsFor(ws),
+    ws.grid.paneCount >= 2 ? "column" : "row"
   );
-  reapIfExited(pane);
+  reapIfExited(ws, pane);
 }
 
 // When a process exits on its own, retire its pane — unless it was a
 // command pane dying with an error, which stays open to show the output.
 void onPtyExit((exit) => {
-  const pane = grid.findByPtyId(exit.id);
-  if (!pane) {
+  const found = findPaneAcrossTabs(exit.id);
+  if (!found) {
     earlyExits.set(exit.id, exit);
     // A pane that never finishes starting would leak its entry forever.
     window.setTimeout(() => earlyExits.delete(exit.id), 5 * 60_000);
     return;
   }
+  const { ws, pane } = found;
   if (pane.keepOpenOnExit(exit)) pane.notifyExited(exit.exit_code);
-  else grid.closePane(pane, false);
+  else ws.grid.closePane(pane, false);
 });
 
 // Global shortcuts (terminals decline these in their key handlers).
@@ -214,56 +458,79 @@ document.addEventListener(
       case "toggle-agent-mode":
         toggleAgentMode();
         break;
-      case "close-pane":
-        if (grid.activePane) grid.closePane(grid.activePane);
+      case "close-pane": {
+        const g = activeGrid();
+        if (g.activePane) g.closePane(g.activePane);
+        break;
+      }
+      case "new-tab":
+        void openUserTab();
+        break;
+      case "close-tab":
+        // Route through the strip's two-step confirm (destructive if the tab
+        // owns a group), same as clicking its ✕ (LOW-1).
+        if (tabs.activeTabId) tabBar?.requestClose(tabs.activeTabId);
+        break;
+      case "next-tab":
+        tabs.nextTab();
+        break;
+      case "prev-tab":
+        tabs.prevTab();
         break;
       case "toggle-sessions":
         sessions.toggle();
         break;
       case "toggle-git":
-        grid.activePane?.toggleGitView();
+        activeGrid().activePane?.toggleGitView();
         break;
       case "toggle-issues":
-        grid.activePane?.toggleIssuesView();
+        activeGrid().activePane?.toggleIssuesView();
+        break;
+      case "toggle-files":
+        activeGrid().activePane?.toggleFileEditView();
         break;
       case "open-editor":
-        void grid.activePane?.openInEditor();
+        void activeGrid().activePane?.openInEditor();
         break;
       case "toggle-tasks":
-        grid.activePane?.toggleTasksView();
+        activeGrid().activePane?.toggleTasksView();
         break;
       case "toggle-audit":
-        grid.activePane?.toggleAuditView();
+        activeGrid().activePane?.toggleAuditView();
         break;
       case "toggle-group":
-        grid.activePane?.toggleGroupView();
+        activeGrid().activePane?.toggleGroupView();
         break;
       case "focus-compose":
-        grid.activePane?.focusCompose();
+        activeGrid().activePane?.focusCompose();
         break;
       case "voice-ptt":
         voiceController.toggleFromHotkey();
         break;
-      case "maximize-pane":
-        if (grid.activePane) grid.toggleMaximize(grid.activePane);
+      case "maximize-pane": {
+        const g = activeGrid();
+        if (g.activePane) g.toggleMaximize(g.activePane);
         break;
-      case "minimize-pane":
-        if (grid.activePane) grid.minimize(grid.activePane);
+      }
+      case "minimize-pane": {
+        const g = activeGrid();
+        if (g.activePane) g.minimize(g.activePane);
         break;
+      }
       case "rename-pane":
-        grid.activePane?.startRename();
+        activeGrid().activePane?.startRename();
         break;
       case "focus-left":
-        grid.moveFocus("left");
+        activeGrid().moveFocus("left");
         break;
       case "focus-right":
-        grid.moveFocus("right");
+        activeGrid().moveFocus("right");
         break;
       case "focus-up":
-        grid.moveFocus("up");
+        activeGrid().moveFocus("up");
         break;
       case "focus-down":
-        grid.moveFocus("down");
+        activeGrid().moveFocus("down");
         break;
     }
   },
@@ -283,7 +550,7 @@ window.addEventListener("contextmenu", (e) => {
 
 // WebView2 can come up without keyboard focus; make sure the active
 // terminal reclaims it whenever the window is (re)focused.
-window.addEventListener("focus", () => grid.activePane?.focus());
+window.addEventListener("focus", () => activeGrid().activePane?.focus());
 
 // Stamp the running app version into the brand badge (single source of
 // truth: tauri.conf.json). Non-fatal — the badge just stays blank if the
@@ -316,10 +583,40 @@ initStatusBar();
 // overflows a narrow window.
 initHintBar();
 
-// Orchestration: open badged panes when the backend spawns agents.
-initOrchestration(grid, paneEvents);
+// Orchestration is tab-aware (#63): spawns land in their group's tab (created on
+// first sight), focus switches tab then pane, group-end closes the owning tab's
+// panes, and attention badges hidden tabs' strip entries. The router
+// (orchWiring) is implemented over the TabManager above. Wired before any
+// orchestrator can launch (below), so no spawn event races an unready router.
+initOrchestration(orchWiring);
 
+// Boot the tab layer. Restoring the tab set is now async (it reads the durable
+// backend store), so the whole seed → mount → fill sequence is one async flow.
+// Preview thumbnails serialize live on hover (see TabBar) from the in-memory
+// buffer — no layout, no PTY resize (#63 no-resize invariant).
 void (async () => {
+  // Restore the saved tab set, or seed the one default tab (never-zero-tabs
+  // floor). Subscribe persistTabs AFTER restore so rebuilding the saved set
+  // doesn't redundantly write it straight back.
+  const didRestore = await restoreTabs();
+  if (!didRestore) tabs.newTab();
+  tabs.onChange(persistTabs);
+  // The "+" button opens a real starting surface, same as the shortcut.
+  tabBar = new TabBar(tabBarEl, tabs, () => void openUserTab());
+
   await ensureOutputRouter();
-  await openPane();
+  // Empty-tab fill — ONE rule (see the design note, and the factory onEmpty):
+  // an empty tab holds a SILENT plain shell, never the launcher modal, EXCEPT
+  // the genuine fresh start where the app opens its first pane and the human
+  // picks via the launcher. So a RESTORED session (any tab, active or
+  // background — including a group-bound one, whose shell is a placeholder until
+  // its group's session is restored into it) fills silently; only the brand-new
+  // default tab opens the launcher.
+  if (didRestore) {
+    for (const ws of tabs.tabs) {
+      if (ws.grid.paneCount === 0) await openShellIn(ws);
+    }
+  } else if (tabs.activeWorkspace.grid.paneCount === 0) {
+    await openPane();
+  }
 })();

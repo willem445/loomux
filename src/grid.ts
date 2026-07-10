@@ -13,7 +13,7 @@ import { Pane, type PaneEvents, type PaneOptions } from "./pane";
 import { dropZoneFor, indicatorFor, zoneToPlacement, type DropZone } from "./layout";
 import { dockChipAttention } from "./attention";
 import { planGroupMinimize } from "./group";
-import { shouldFocusNewPane, shouldRestoreFocus } from "./panefocus";
+import { shouldFocusNewPane, shouldRestoreFocus, shouldPreserveMaximize } from "./panefocus";
 
 type Dir = "row" | "column";
 
@@ -33,6 +33,14 @@ interface SplitNode {
 
 type TreeNode = LeafNode | SplitNode;
 
+/** A pure, DOM-free description of the split layout, so a tab preview can
+ *  composite every pane arranged like the real layout without touching the live
+ *  (hidden, zero-width) elements (#63). `weight` is the flex-grow the
+ *  node occupies in its parent split. */
+export type GridLayoutNode =
+  | { kind: "leaf"; weight: number; pane: Pane }
+  | { kind: "split"; dir: Dir; weight: number; children: GridLayoutNode[] };
+
 const MIN_PANE_PX = 80;
 /** Pixels the pointer must travel from the header press before a click turns
  *  into a drag — keeps taps (focus, dblclick-rename) from starting a drag. */
@@ -41,7 +49,7 @@ const DRAG_THRESHOLD_PX = 6;
 const nodeEl = (n: TreeNode): HTMLElement => (n.kind === "leaf" ? n.pane.el : n.el);
 
 /** A snapshot of the keyboard focus, taken before a grid relayout so it can be
- *  handed back afterward (#117 round 2). `sel` is the text caret/selection for
+ *  handed back afterward (#117). `sel` is the text caret/selection for
  *  input/textarea controls (the steering strip is a textarea) — refocusing
  *  alone can drop the caret to the end and lose the human's insertion point. */
 interface FocusSnapshot {
@@ -96,6 +104,12 @@ export class Grid {
   private maximized: Pane | null = null;
   /** Panes parked out of the tree, oldest first — rendered as dock chips. */
   private minimizedPanes: Pane[] = [];
+  /** Whether this whole grid is hidden (its project tab is inactive, #63). Held
+   *  so a pane opened INTO a hidden tab (a background orchestrator spawn) drops
+   *  its WebGL context immediately too, not only the panes present at switch
+   *  time — otherwise hidden background tabs would silently accumulate GL
+   *  contexts (browsers cap them). See setHidden / GL policy in the design doc. */
+  private hidden = false;
 
   constructor(
     private rootEl: HTMLElement,
@@ -124,6 +138,32 @@ export class Grid {
     return [...this.leaves.keys(), ...this.minimizedPanes];
   }
 
+  /** Show/hide the whole grid for a project-tab switch (#63). Records the state
+   *  (so later-opened panes inherit it — see openPane) and drops/reloads every
+   *  pane's WebGL context accordingly. This is a rendering concern ONLY: the PTY
+   *  and in-memory buffer are untouched, so hiding issues no resize and loses no
+   *  scrollback. The container's `display:none` is what actually zeroes each
+   *  pane's width and thus suppresses PTY resizes (panefit.ts); this just frees
+   *  the GPU contexts a hidden tab doesn't need. */
+  setHidden(hidden: boolean): void {
+    this.hidden = hidden;
+    for (const pane of this.allPanes()) pane.setHidden(hidden);
+  }
+
+  /** A snapshot of the split tree (dir + flex weights + panes at the leaves),
+   *  for compositing a tab preview (#63). Reads the in-memory tree and
+   *  the elements' flex-grow — never geometry — so it works while the whole tab
+   *  is hidden/zero-width. Minimized (docked) panes are outside the tree and so
+   *  aren't included. Null when the grid is empty. */
+  layoutSnapshot(): GridLayoutNode | null {
+    const walk = (n: TreeNode): GridLayoutNode => {
+      const weight = parseFloat(nodeEl(n).style.flexGrow || "1") || 1;
+      if (n.kind === "leaf") return { kind: "leaf", weight, pane: n.pane };
+      return { kind: "split", dir: n.dir, weight, children: n.children.map(walk) };
+    };
+    return this.root ? walk(this.root) : null;
+  }
+
   findByPtyId(ptyId: number): Pane | undefined {
     return (
       this.panes().find((p) => p.ptyId === ptyId) ??
@@ -143,10 +183,18 @@ export class Grid {
     // exitMaximize and insertBeside → renderSplit do replaceChildren(), which
     // detaches the focused pane's subtree (the steering strip or a terminal) and
     // re-appends it, implicitly blurring it to <body> so keystrokes go nowhere
-    // (#117 round 2; same DOM-detach class as #113). We hand it back after,
+    // (#117; same DOM-detach class as #113). We hand it back after,
     // unless the new pane is meant to take focus (see restoreFocus/takeFocus).
     const prior = captureFocus();
-    if (this.maximized) this.exitMaximize(); // a layout change exits fullscreen
+    // A background (orchestrator-driven) spawn must not collapse the human's
+    // fullscreen view (#155): keep the pane maximized and grow the split tree
+    // underneath it. A human-initiated open still exits fullscreen so the new
+    // pane is shown in its landed layout. `keepMaximized` is the pane to re-lift
+    // after the tree mutation, or null when we let maximize exit as before.
+    const keepMaximized = shouldPreserveMaximize(!opts.background, this.maximized !== null)
+      ? this.maximized
+      : null;
+    if (this.maximized && !keepMaximized) this.exitMaximize(); // a layout change exits fullscreen
     const pane = new Pane(events);
     const leaf: LeafNode = { kind: "leaf", pane, parent: null };
     this.leaves.set(pane, leaf);
@@ -167,6 +215,14 @@ export class Grid {
       this.insertBeside(this.leaves.get(target)!, leaf, dir);
     }
 
+    // Preserving fullscreen (#155): insertBeside re-seated the maximized pane's
+    // element into the now-hidden split, so lift it back to the top layer. We
+    // never removed `.has-maximized`/`.maximized`, so no pane repainted; the new
+    // pane sits in the hidden subtree (zero width → no fit → no PTY resize) and
+    // becomes visible when the human unmaximizes. Do this BEFORE restoreFocus so
+    // the re-lift's detach/reattach blur is the human's last focus event undone.
+    if (keepMaximized) this.rootEl.appendChild(keepMaximized.el);
+
     if (takeFocus) this.setActive(pane);
     // Hand focus back synchronously, in the same tick as the relayout — JS is
     // single-threaded, so no keystroke can interleave between the blur and this
@@ -175,6 +231,10 @@ export class Grid {
     // happen.) Do this before awaiting pane.start so the async PTY spawn never
     // runs with focus parked on <body>.
     else restoreFocus(prior, takeFocus);
+    // A pane opened into a hidden tab (a background orchestrator spawn) must not
+    // hold a WebGL context the tab isn't showing — drop it now, matching the
+    // rest of the hidden tab (#63 GL policy). Reloaded when the tab is shown.
+    if (this.hidden) pane.setHidden(true);
     await pane.start(opts, takeFocus);
     return pane;
   }

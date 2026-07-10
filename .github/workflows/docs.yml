@@ -1,0 +1,72 @@
+name: Docs
+
+# Build and publish the user documentation site (docs/) to GitHub Pages.
+#
+# This is a SEPARATE workflow from release.yml (which builds the app binaries on
+# the same `v*` tag trigger) — release.yml is intentionally left untouched. The
+# app's CI (ci.yml) does NOT build the docs, so PR CI on code changes stays fast.
+#
+# ONE-TIME HUMAN SETUP (cannot be automated from here): set
+#   Settings -> Pages -> Build and deployment -> Source -> "GitHub Actions".
+# Until that is set, the deploy job has nowhere to publish.
+
+on:
+  # Publish with every release, matching release.yml's tag trigger.
+  push:
+    tags: ["v*"]
+  # Manual button for docs-only fixes between releases.
+  workflow_dispatch:
+  # Build-only dry-run when a PR touches the docs (deploy is skipped below), so a
+  # broken _config.yml or theme pin is caught before it ships on a release.
+  pull_request:
+    paths:
+      - "docs/**"
+      - ".github/workflows/docs.yml"
+
+# Least-privilege token scoped to what deploy-pages needs.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Never run two Pages deploys at once; don't cancel an in-flight publish.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # NB: no actions/configure-pages step here on purpose. That action calls
+      # the Pages REST API to discover the site's base path — which 404s until
+      # the one-time "Source: GitHub Actions" setting is flipped, and would fail
+      # this build (including the PR dry-run) before Pages is enabled. We don't
+      # need it: `url`/`baseurl` are set explicitly in docs/_config.yml, so the
+      # build is self-contained and provable on a PR without any repo setup.
+
+      # Provides the Jekyll runtime (github-pages gem) — no Ruby/Gemfile in the
+      # repo. Builds docs/ into ./_site, resolving the pinned remote theme.
+      - name: Build with Jekyll
+        uses: actions/jekyll-build-pages@v1
+        with:
+          source: ./docs
+          destination: ./_site
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+
+  deploy:
+    # Skip publishing on pull requests — PRs only get the build dry-run above.
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

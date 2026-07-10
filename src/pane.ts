@@ -4,6 +4,7 @@
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
+import { SerializeAddon } from "@xterm/addon-serialize";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { Unicode11Addon } from "@xterm/addon-unicode11";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -38,6 +39,7 @@ import { showToast } from "./toast";
 import { isAppShortcut } from "./shortcuts";
 import { attentionPresentation } from "./attention";
 import { makeRenameCommit } from "./panerename";
+import { shouldResizePty } from "./panefit";
 import { swapEditor } from "./domutil";
 import { openInEditor, editorConfigDialog } from "./editor";
 import { GitView } from "./gitview";
@@ -46,6 +48,7 @@ import { TasksView } from "./tasksview";
 import { AuditView } from "./auditview";
 import { GroupView } from "./groupview";
 import { clampOverlayHeight, OVERLAY_MIN_H } from "./overlaysize";
+import { FileEditView } from "./fileedit";
 
 // Inline icons so the toolbar renders identically regardless of installed
 // fonts; they inherit color via `currentColor`.
@@ -64,6 +67,9 @@ const GROUP_MIN_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" fill="no
 // "Open in editor": code-brackets glyph. Opens the pane's workspace folder in
 // the user's configured external editor (VS Code, Zed, …).
 const EDITOR_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M6 4.5 2.5 8 6 11.5M10 4.5 13.5 8 10 11.5"/></svg>`;
+// File-editor overlay (#174): a page with a fold + a small pencil, to read as
+// "edit files" distinct from the external-editor </> glyph above.
+const FILES_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 2.2h5l3.5 3.5v5.1"/><path d="M8.2 2.2v3.3h3.3"/><path d="M2.2 8.2h5.1v5.1H2.2z"/></svg>`;
 // Attach affordance on the steering strip (#72): a paperclip.
 const PAPERCLIP_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M12.5 6.6 7.1 12a2.4 2.4 0 0 1-3.4-3.4l5.6-5.6a1.5 1.5 0 0 1 2.1 2.1l-5.4 5.4a.6.6 0 0 1-.9-.9l4.9-4.9"/></svg>`;
 // Voice-prompt push-to-talk button (#58): a simple microphone glyph.
@@ -232,6 +238,12 @@ export class Pane implements VoiceTargetPane {
   private groupView: GroupView | null = null;
   private groupOverlay: HTMLElement | null = null;
   private groupBtn: HTMLButtonElement;
+  /** File-editor overlay (#174): file tree + code editor + search/replace.
+   *  Unlike the others it is UNGATED — present in every pane type, plain
+   *  terminals included. Same no-resize overlay mechanics. */
+  private fileEditView: FileEditView | null = null;
+  private fileEditOverlay: HTMLElement | null = null;
+  private fileEditBtn: HTMLButtonElement;
   /** Fold-group toggle (orchestrator panes only, #46): minimizes every
    *  worker/reviewer pane in the group to the dock, or restores them all. */
   private groupMinBtn: HTMLButtonElement;
@@ -415,6 +427,18 @@ export class Pane implements VoiceTargetPane {
       this.toggleGitView();
     });
     header.appendChild(gitBtn);
+
+    // File-editor overlay (#174). Unconditional — every pane type gets it,
+    // including plain terminals (unlike the orchestration-gated buttons above).
+    this.fileEditBtn = document.createElement("button");
+    this.fileEditBtn.className = "pane-btn";
+    this.fileEditBtn.innerHTML = FILES_ICON;
+    this.fileEditBtn.title = "File editor (Alt+F)";
+    this.fileEditBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      this.toggleFileEditView();
+    });
+    header.appendChild(this.fileEditBtn);
 
     // Minimize / maximize live next to close: the same window-control cluster
     // users expect. Maximize keeps a stored ref so its glyph can flip to a
@@ -634,13 +658,74 @@ export class Pane implements VoiceTargetPane {
     }
   }
 
+  /** The live WebGL renderer addon, if loaded. Held so hidden tabs can drop it
+   *  (browsers cap live GL contexts, and N mounted-but-hidden tabs would each
+   *  hold one) and reload it on show — the onContextLoss→DOM fallback path. */
+  private webgl: WebglAddon | null = null;
+  private serializer: SerializeAddon | null = null;
+  /** True while this pane's project tab is hidden (#63). Held so `tryWebgl`
+   *  refuses to create a context for a hidden pane — start() calls tryWebgl
+   *  unconditionally, so a pane opened INTO a hidden tab (a background
+   *  orchestrator spawn) would otherwise take a GL context it isn't showing. */
+  private hiddenTab = false;
+
   private tryWebgl(): void {
+    if (this.webgl || this.hiddenTab) return;
     try {
       const webgl = new WebglAddon();
-      webgl.onContextLoss(() => webgl.dispose()); // falls back to DOM renderer
+      webgl.onContextLoss(() => {
+        webgl.dispose(); // falls back to DOM renderer
+        if (this.webgl === webgl) this.webgl = null;
+      });
       this.term.loadAddon(webgl);
+      this.webgl = webgl;
     } catch {
       // WebGL unavailable — xterm's DOM renderer still works fine.
+    }
+  }
+
+  /** Show/hide bookkeeping for a project-tab switch (#63). Hiding drops the
+   *  WebGL context (freeing it for the active tab and cutting idle VRAM) and
+   *  latches `hiddenTab` so start()/tryWebgl won't re-create one while hidden;
+   *  showing clears the latch and reloads it (via the onContextLoss→DOM fallback
+   *  if the GPU is out of contexts). Purely a rendering concern — the PTY and
+   *  buffer are untouched, so no resize and no scrollback loss. Safe to call
+   *  before the terminal is even open (tryWebgl no-ops until start opens it). */
+  setHidden(hidden: boolean): void {
+    if (this.disposed) return;
+    this.hiddenTab = hidden;
+    if (hidden) {
+      this.webgl?.dispose();
+      this.webgl = null;
+    } else if (this.termEl.isConnected) {
+      this.tryWebgl();
+    }
+  }
+
+  /** An HTML snapshot of the terminal viewport, for a background tab's preview
+   *  thumbnail (#63). Serializes the in-memory buffer (NOT the DOM),
+   *  so it works while the pane is hidden/zero-width — the whole point: a preview
+   *  must never require a laid-out element, which would re-arm applyFit and fire
+   *  a PTY resize.
+   *
+   *  serializeAsHTML (not serialize): the string serializer emits cursor-forward
+   *  escapes (`ESC[nC`) to skip blank cells, which stripping collapses runs of
+   *  spaces ("Please count" → "Pleasecount", #63). The HTML serializer
+   *  emits a literal space per blank cell and per-run `<span style='color:…'>`,
+   *  so the preview keeps spacing AND color. The caller parses this SAFELY (spans
+   *  → textContent + whitelisted styles), never innerHTML — the addon does not
+   *  escape cell text. Returns "" if serialization isn't available. */
+  serializeViewportHtml(): string {
+    if (this.disposed) return "";
+    try {
+      if (!this.serializer) {
+        this.serializer = new SerializeAddon();
+        this.term.loadAddon(this.serializer);
+      }
+      // scrollback: 0 → just the visible screen, which is all a thumbnail shows.
+      return this.serializer.serializeAsHTML({ scrollback: 0 });
+    } catch {
+      return "";
     }
   }
 
@@ -654,12 +739,15 @@ export class Pane implements VoiceTargetPane {
     clearTimeout(this.fitTimer);
     this.fitTimer = window.setTimeout(() => {
       if (this.disposed || !this.termEl.isConnected) return;
-      if (this.termEl.clientWidth === 0) return; // not laid out yet
+      if (this.termEl.clientWidth === 0) return; // hidden (inactive tab / maximized-behind) or unlaid — fit.fit() needs a laid-out element
       this.fit.fit();
       const size = `${this.term.cols}x${this.term.rows}`;
-      if (this.ptyId !== null && size !== this.sentSize) {
+      // The zero-width / same-size / no-pty skips live in the pure, tested
+      // shouldResizePty (panefit.ts) — THE invariant that keeps tab switches and
+      // maximize free of ConPTY repaints (#63, CLAUDE.md constraint 1).
+      if (shouldResizePty({ clientWidth: this.termEl.clientWidth, size, sentSize: this.sentSize, ptyId: this.ptyId })) {
         this.sentSize = size;
-        resizePty(this.ptyId, this.term.cols, this.term.rows).catch(() => {});
+        resizePty(this.ptyId!, this.term.cols, this.term.rows).catch(() => {});
       }
       // The pane itself changed size: keep the overlay within bounds and
       // re-anchor the visible strip on the cursor.
@@ -668,6 +756,11 @@ export class Pane implements VoiceTargetPane {
         overlay.style.height = `${this.overlayClamp(overlay.offsetHeight)}px`;
         this.updateTermShift();
       }
+      // The steer box wraps to the strip's width, so a width change alters how
+      // many lines the placeholder/draft occupies. growCompose only ran on input
+      // events, so a widened pane never re-measured and the box stayed tall
+      // (#163). Re-measure here; it's a no-op on panes without a compose strip.
+      this.growCompose();
     }, 16);
   }
 
@@ -805,6 +898,7 @@ export class Pane implements VoiceTargetPane {
         if (this.tasksOverlay && !this.tasksOverlay.hidden) this.toggleTasksView();
         if (this.auditOverlay && !this.auditOverlay.hidden) this.toggleAuditView();
         if (this.groupOverlay && !this.groupOverlay.hidden) this.toggleGroupView();
+        if (this.fileEditView?.visible) this.toggleFileEditView();
         // Terminal keeps a fixed visible share at the bottom; the overlay
         // covers the rest.
         const strip = Math.max(140, Math.round(this.el.clientHeight * 0.35));
@@ -909,6 +1003,7 @@ export class Pane implements VoiceTargetPane {
       if (this.tasksOverlay && !this.tasksOverlay.hidden) this.toggleTasksView();
       if (this.auditOverlay && !this.auditOverlay.hidden) this.toggleAuditView();
       if (this.groupOverlay && !this.groupOverlay.hidden) this.toggleGroupView();
+      if (this.fileEditView?.visible) this.toggleFileEditView();
       const strip = Math.max(140, Math.round(this.el.clientHeight * 0.35));
       this.issuesOverlay!.style.height = `${this.overlayClamp(this.termEl.clientHeight - strip)}px`;
       this.issuesOverlay!.hidden = false;
@@ -938,6 +1033,7 @@ export class Pane implements VoiceTargetPane {
       if (this.gitView?.visible) this.toggleGitView();
       if (this.auditOverlay && !this.auditOverlay.hidden) this.toggleAuditView();
       if (this.groupOverlay && !this.groupOverlay.hidden) this.toggleGroupView();
+      if (this.fileEditView?.visible) this.toggleFileEditView();
       const strip = Math.max(140, Math.round(this.el.clientHeight * 0.35));
       this.tasksOverlay!.style.height = `${this.overlayClamp(this.termEl.clientHeight - strip)}px`;
       this.tasksOverlay!.hidden = false;
@@ -968,6 +1064,7 @@ export class Pane implements VoiceTargetPane {
       if (this.gitView?.visible) this.toggleGitView();
       if (this.tasksOverlay && !this.tasksOverlay.hidden) this.toggleTasksView();
       if (this.groupOverlay && !this.groupOverlay.hidden) this.toggleGroupView();
+      if (this.fileEditView?.visible) this.toggleFileEditView();
       const strip = Math.max(140, Math.round(this.el.clientHeight * 0.35));
       this.auditOverlay!.style.height = `${this.overlayClamp(this.termEl.clientHeight - strip)}px`;
       this.auditOverlay!.hidden = false;
@@ -1007,10 +1104,51 @@ export class Pane implements VoiceTargetPane {
       if (this.gitView?.visible) this.toggleGitView();
       if (this.tasksOverlay && !this.tasksOverlay.hidden) this.toggleTasksView();
       if (this.auditOverlay && !this.auditOverlay.hidden) this.toggleAuditView();
+      if (this.fileEditView?.visible) this.toggleFileEditView();
       const strip = Math.max(140, Math.round(this.el.clientHeight * 0.35));
       this.groupOverlay!.style.height = `${this.overlayClamp(this.termEl.clientHeight - strip, this.groupFloor())}px`;
       this.groupOverlay!.hidden = false;
       this.groupView.show();
+      this.updateTermShift();
+    }
+  }
+
+  /** Toggle the file-editor overlay (#174): file tree + code editor +
+   *  search/replace. Ungated — works in every pane type, plain terminals
+   *  included. Same no-resize overlay mechanics as the git/audit views; only
+   *  one overlay is open at a time. The tree roots at the pane's live cwd. */
+  toggleFileEditView(): void {
+    if (!this.fileEditView) {
+      this.fileEditView = new FileEditView({
+        getCwd: () => this.cwdRaw,
+        onClose: () => this.toggleFileEditView(),
+        isAgentWorktree: () =>
+          this.orchRoleName === "worker" || this.orchRoleName === "reviewer",
+      });
+      this.fileEditOverlay = document.createElement("div");
+      this.fileEditOverlay.className = "git-overlay";
+      this.fileEditOverlay.hidden = true;
+      this.fileEditOverlay.append(
+        this.fileEditView.el,
+        this.makeOverlayDivider(() => this.fileEditOverlay!)
+      );
+      this.el.appendChild(this.fileEditOverlay);
+    }
+    if (this.fileEditView.visible) {
+      this.fileEditView.hide();
+      this.fileEditOverlay!.hidden = true;
+      this.updateTermShift();
+      this.focus();
+    } else {
+      if (this.issuesView?.visible) this.toggleIssuesView();
+      if (this.gitView?.visible) this.toggleGitView();
+      if (this.tasksOverlay && !this.tasksOverlay.hidden) this.toggleTasksView();
+      if (this.auditOverlay && !this.auditOverlay.hidden) this.toggleAuditView();
+      if (this.groupOverlay && !this.groupOverlay.hidden) this.toggleGroupView();
+      const strip = Math.max(140, Math.round(this.el.clientHeight * 0.35));
+      this.fileEditOverlay!.style.height = `${this.overlayClamp(this.termEl.clientHeight - strip)}px`;
+      this.fileEditOverlay!.hidden = false;
+      this.fileEditView.show();
       this.updateTermShift();
     }
   }
@@ -1050,6 +1188,7 @@ export class Pane implements VoiceTargetPane {
     if (this.tasksOverlay && !this.tasksOverlay.hidden) return this.tasksOverlay;
     if (this.auditOverlay && !this.auditOverlay.hidden) return this.auditOverlay;
     if (this.groupOverlay && !this.groupOverlay.hidden) return this.groupOverlay;
+    if (this.fileEditOverlay && !this.fileEditOverlay.hidden) return this.fileEditOverlay;
     return null;
   }
 
@@ -1242,7 +1381,10 @@ export class Pane implements VoiceTargetPane {
     field.className = "orch-compose-field";
     const input = document.createElement("textarea");
     input.className = "dlg-input orch-compose-input";
-    input.placeholder = "Steer the orchestrator — Enter to send · Shift+Enter for a newline · Esc to terminal";
+    // Terse enough to sit on one line at typical pane widths — a long hint here
+    // wraps the box to multi-line before the human even types (#163). The full
+    // Shift+Enter/Esc rules live in this method's doc comment, not the ghost text.
+    input.placeholder = "Steer the orchestrator — Enter sends";
     input.rows = 1;
     input.spellcheck = false;
     input.autocomplete = "off";
@@ -1603,6 +1745,7 @@ export class Pane implements VoiceTargetPane {
     this.tasksView?.dispose();
     this.auditView?.dispose();
     this.groupView?.dispose();
+    this.fileEditView?.dispose();
     if (this.ptyId !== null) {
       detachOutput(this.ptyId);
       detachGitWatch(this.ptyId);

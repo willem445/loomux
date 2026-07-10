@@ -1,5 +1,6 @@
 mod cliprobe;
 mod editor;
+pub mod fileedit; // pub: the file-editor integration test links its pure fns (#174)
 mod gh;
 mod git;
 mod gitwatch;
@@ -9,6 +10,7 @@ mod obs;
 pub mod orchestration; // pub: integration smoke test links through it
 pub mod pty; // pub: Job-Object integration test links `assign_kill_on_close_job`
 mod sessions;
+mod uistate; // durable UI state (project tabs, #63) — atomic tabs.json store
 pub mod usage; // pub: exercised by orchestration integration tests
 pub mod voice; // voice-prompt prototype (#58); pub: pure helpers are unit-tested
 
@@ -58,6 +60,7 @@ pub fn run() {
             orchestration::start_attention(reg.clone());
             orchestration::start_max_notice_flusher(reg.clone());
             orchestration::start_idle_tick(reg.clone());
+            orchestration::start_disk_monitor(reg.clone());
             std::thread::spawn(move || orchestration::mcp::serve(reg));
             Ok(())
         })
@@ -123,6 +126,7 @@ pub fn run() {
             orchestration::orch_grant_release,
             orchestration::orch_request_changes,
             orchestration::orch_start_task,
+            orchestration::orch_proceed_task,
             orchestration::orch_pause_group,
             orchestration::orch_resume_group,
             orchestration::orch_group_paused,
@@ -144,7 +148,14 @@ pub fn run() {
             orchestration::orch_end_group,
             cliprobe::probe_agent_cli,
             editor::open_in_editor,
+            fileedit::ft_list_dir,
+            fileedit::ft_read_file,
+            fileedit::ft_write_file,
+            fileedit::ft_search,
+            fileedit::ft_replace,
             obs::take_startup_notice,
+            uistate::load_ui_tabs,
+            uistate::save_ui_tabs,
             voice::voice_start,
             voice::voice_stop,
             voice::voice_cancel,

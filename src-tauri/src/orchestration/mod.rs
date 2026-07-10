@@ -518,6 +518,19 @@ const SPAWN_RATE_WINDOW_MS: u64 = 60 * 60 * 1000;
 const IDLE_REAP_INTERVAL: Duration = Duration::from_secs(30);
 /// How often the watchdog wakes to look for stalled working agents.
 const WATCHDOG_INTERVAL: Duration = Duration::from_secs(30);
+/// How often the low-disk backstop samples free space on the workspace drive
+/// (#134). Slow on purpose — disk pressure builds over minutes of cargo builds,
+/// not seconds — so the sysinfo scan stays negligible.
+const DISK_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+/// Arm the low-disk notice when free space on the workspace drive drops below
+/// this (#134). A disk-full write is what destroyed the board in the incident
+/// (#133); 5 GB leaves headroom for one more cold cargo build (~5–7 GB) to be
+/// reclaimed before writes start failing at 0.
+const LOW_DISK_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+/// Clear the low-disk latch only once free space recovers past this higher mark
+/// (arming + 2 GB). The hysteresis stops a disk hovering at the threshold from
+/// re-notifying every tick.
+const LOW_DISK_CLEAR_BYTES: u64 = LOW_DISK_BYTES + 2 * 1024 * 1024 * 1024;
 /// Upper bound on the watchdog stall timeout (24h); 0 disables it.
 const MAX_WATCHDOG_STALL_MINUTES: u32 = 1440;
 /// Autonomous mode (#83): how often the idle-tick loop wakes to check whether an
@@ -650,27 +663,32 @@ const READY_MAX_WAIT: Duration = Duration::from_secs(25);
 /// Poll interval for the readiness check.
 const READY_POLL: Duration = Duration::from_millis(250);
 
-// Copilot autopilot consent (#101): a group copilot agent is launched with
-// `--autopilot`, which opens an "Enable autopilot mode" dialog at startup. The
-// kickoff path answers it deterministically (Enter on the default "Enable all
-// permissions") BEFORE pasting the brief, so the brief can't collide with the
-// dialog (the collision was the suspected kickoff-swallow race). Fail-soft: if
-// the dialog never appears (copilot changed the flow), delivery proceeds.
-/// How long to watch a freshly spawned autopilot copilot pane for its consent
-/// dialog before giving up and delivering normally.
+// Copilot autopilot consent (#101/#179): a group copilot agent is launched with
+// `--autopilot`, which makes copilot open an "Enable autopilot mode" dialog the
+// first time a message is submitted (NOT at boot — verified live on 1.0.69: a
+// fresh pane paints a normal input box). The kickoff path answers it
+// deterministically (Enter on the default "Enable all permissions") right AFTER
+// the first submit, which both enables autopilot and lets the just-submitted
+// brief proceed. Fail-soft: if the dialog never appears, delivery proceeds.
+/// How long to watch for the consent dialog after the kickoff submit before
+/// giving up and letting the submit retries carry on.
 const AUTOPILOT_DIALOG_WAIT: Duration = Duration::from_secs(12);
 /// Poll interval while watching for the consent dialog.
 const AUTOPILOT_DIALOG_POLL: Duration = Duration::from_millis(250);
-/// Pause after answering so the TUI dismisses the dialog and repaints before
-/// the kickoff paste begins.
+/// Pause after answering so the TUI dismisses the dialog and repaints / starts
+/// the turn before the delivery's confirmation window measures the burst.
 const AUTOPILOT_DIALOG_SETTLE: Duration = Duration::from_millis(700);
-/// Key that confirms the highlighted menu item in Copilot's consent dialog.
-/// Enter (`\r`); the default-highlighted item is "Enable all permissions"
-/// (index 0), so a single Enter enables all permissions + enters autopilot
-/// mode — no arrow keys needed (verified against the 1.0.68 TUI: the menu's
-/// `initialIndex` defaults to 0 and `code==="return"` selects it).
+/// Keys that confirm the highlighted menu item in Copilot's consent dialog.
+/// Focus-in report (`ESC[I`) + Enter (`\r`) — the SAME transport as
+/// [`submit_sequence`]`("copilot")`. The dialog is answered after the kickoff
+/// submit, by which point copilot's focus flag is already true (the submit's
+/// own `ESC[I` set it); the prefix is kept so this stays consistent with the
+/// other pane-write sites and self-sufficient if a stray blur ever intervened
+/// (#98). The `\r` selects the default-highlighted "Enable all permissions"
+/// (menu `initialIndex` 0, `code==="return"`, verified against the 1.0.69 TUI)
+/// — no arrow keys needed.
 #[doc(hidden)] // pub for integration tests
-pub const COPILOT_AUTOPILOT_CONFIRM_KEYS: &[u8] = b"\r";
+pub const COPILOT_AUTOPILOT_CONFIRM_KEYS: &[u8] = b"\x1b[I\r";
 
 // Echo verification: a paste that landed makes the TUI redraw its input box
 // (observable as output bytes). A paste that produced no output within the
@@ -1463,6 +1481,34 @@ pub fn grant_unexpired(expires_secs: Option<u64>, now_secs: u64) -> bool {
     matches!(expires_secs, Some(exp) if now_secs < exp)
 }
 
+/// Pure latch transition for the low-disk backstop (#134). Given current free
+/// bytes on the workspace drive, the arming threshold `low`, the higher clear
+/// threshold `clear` (hysteresis), and whether a notice is already latched,
+/// return `(new_latched, fire_now)`. `fire_now` is the one-per-episode edge:
+/// true only on the tick that first crosses below `low`. Split out so the
+/// arm/clear hysteresis is unit-testable without a real disk.
+pub fn low_disk_transition(free: u64, low: u64, clear: u64, latched: bool) -> (bool, bool) {
+    if !latched && free < low {
+        (true, true) // crossed below → arm and fire this tick
+    } else if latched && free >= clear {
+        (false, false) // recovered past the hysteresis mark → reset the latch
+    } else {
+        (latched, false) // no edge — hold state, stay quiet
+    }
+}
+
+/// The one-per-episode low-disk notice delivered to a group's orchestrator.
+pub fn low_disk_notice(free_bytes: u64) -> String {
+    let free_gb = free_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+    format!(
+        "[loomux] disk space low: only {free_gb:.1} GB free on the workspace drive. \
+         At 0 bytes, backend builds (cargo) fail machine-wide and durable writes fail — \
+         a full disk previously destroyed a live task board. Reclaim space now: end merged \
+         worktrees (end_group with cleanup), `cargo clean` in idle worktrees, or clear temp \
+         files. You will get this notice at most once per low-disk episode."
+    )
+}
+
 /// Attention routing (#6): does a pane's ANSI-stripped output tail look like a
 /// CLI parked on a prompt only the human can answer — a permission dialog, a
 /// yes/no confirmation, or a numbered/selection menu? This is the "last output"
@@ -1778,11 +1824,12 @@ pub struct AttentionItem {
 
 /// Work-item statuses shown on the task board. Kept as strings (not an
 /// enum) so the wire/JSON forms stay obvious; validated on every write.
-pub const TASK_STATUSES: [&str; 7] = [
+pub const TASK_STATUSES: [&str; 8] = [
     "queued",        // planned, not started
     "in-progress",   // a worker is on it
     "review",        // reviewer agent engaged
     "pr",            // PR open, review loop finished
+    "prototype",     // demo-gated draft awaiting the human's promote/scrap verdict (#147)
     "human-testing", // done pending the human's validation
     "done",          // merged / accepted by the human
     "blocked",
@@ -1791,6 +1838,11 @@ pub const TASK_STATUSES: [&str; 7] = [
 /// Statuses where the human's merge-gate actions (approve / request changes)
 /// apply: the PR is open and awaiting the human's decision.
 pub const MERGE_GATE_STATUSES: [&str; 2] = ["pr", "human-testing"];
+
+/// The demo-gate status (#147): a prototype the human is evaluating before
+/// deciding whether to promote it to a full production build. Its board action
+/// is **Proceed** (not the merge-gate approve/changes) — see `proceed_task`.
+pub const PROTOTYPE_STATUS: &str = "prototype";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TaskNote {
@@ -2038,6 +2090,10 @@ pub struct OrchRegistry {
     /// reader can be pointed at a fixture tree without touching global env —
     /// safe under parallel test execution.
     claude_projects_dir: Mutex<Option<PathBuf>>,
+    /// Low-disk backstop latch (#134): true once the one-per-episode disk-space
+    /// notice has been delivered, cleared when free space recovers past
+    /// `LOW_DISK_CLEAR_BYTES`. Machine-wide (the disk is shared across groups).
+    low_disk_notified: Mutex<bool>,
 }
 
 fn now_ms() -> u64 {
@@ -2060,28 +2116,6 @@ fn remove_marker(path: &Path) -> Result<(), String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(format!("failed to remove marker {}: {e}", path.display())),
     }
-}
-
-/// Crash-safe write: serialize into a unique temp file in the same dir, then
-/// atomically rename over the destination — so a reader (the shim) can never see a
-/// half-written grant and treat it as valid (#83). The temp name uses pid +
-/// `GRANT_SEQ` (no getrandom). Creates the parent dir. Used for grant files.
-fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), String> {
-    let dir = path.parent().ok_or("grant path has no parent dir")?;
-    fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    let tmp = dir.join(format!(
-        ".tmp-{}-{}",
-        std::process::id(),
-        GRANT_SEQ.fetch_add(1, Ordering::Relaxed)
-    ));
-    fs::write(&tmp, contents).map_err(|e| e.to_string())?;
-    if fs::rename(&tmp, path).is_err() {
-        // Some platforms refuse rename-over-existing; fall back to a direct write.
-        let r = fs::write(path, contents).map_err(|e| e.to_string());
-        let _ = fs::remove_file(&tmp);
-        r?;
-    }
-    Ok(())
 }
 
 /// Sanitize a grant target (PR ref / tag) into a safe single path segment: keep
@@ -2186,13 +2220,14 @@ fn wait_for_user_quiet(ptys: &crate::pty::PtyManager, pty_id: u32) -> Option<u64
 }
 
 /// For a freshly spawned group copilot pane (launched with `--autopilot`): watch
-/// its boot output for the "Enable autopilot mode" consent dialog and answer it
-/// (Enter selects the default "Enable all permissions") BEFORE the caller pastes
-/// the kickoff brief — so the brief can never collide with the dialog, the race
-/// the kickoff-Enter used to answer by accident (and sometimes swallow the
-/// prompt over). Fail-soft: returns `false` without acting if the dialog does
+/// for the "Enable autopilot mode" consent dialog and answer it (Enter selects
+/// the default "Enable all permissions"). Copilot 1.0.69 opens this dialog in
+/// response to the FIRST message submit, not at boot (#179), so the caller runs
+/// this right AFTER the kickoff Enter — selecting the default both enables
+/// autopilot and lets the just-submitted brief proceed (the pending message is
+/// not discarded). Fail-soft: returns `false` without acting if the dialog does
 /// not appear within `AUTOPILOT_DIALOG_WAIT` (e.g. copilot changed the flow, or
-/// consent was already recorded), and the caller delivers normally.
+/// consent was already recorded), and the caller's submit retries carry on.
 ///
 /// Returns `true` iff it detected and answered the dialog. Times/keys come from
 /// module constants so the wiring is testable; the pure recognizer is
@@ -2364,6 +2399,58 @@ pub fn rotate_audit_if_needed(dir: &Path, cap: u64) {
     let path = dir.join("audit.jsonl");
     if fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > cap {
         let _ = fs::rename(&path, dir.join("audit.1.jsonl")); // replaces the old generation
+    }
+}
+
+/// Monotonic counter that makes every temp filename unique, so two concurrent
+/// writers to the same durable file never share a `.tmp` sibling. Some of the
+/// files written through `atomic_write` (state.json, group.json) are not
+/// serialized under a lock, so distinct temp names are what keeps a concurrent
+/// pair from corrupting each other's scratch file. A std atomic keeps us clear
+/// of the getrandom-based crates the Windows 10 baseline can't load (see the
+/// Cargo.toml notes) — no `tempfile` needed for a unique name.
+static ATOMIC_WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Durably replace `path` with `bytes`: write a same-directory temp file, flush
+/// it to disk, then atomically rename it over the destination. A failure or
+/// crash mid-write leaves the previous good file intact (at worst an orphaned
+/// `.tmp` sibling) — never the truncated/empty destination that plain
+/// `fs::write` produces. This is the #133 fix: a disk-full `fs::write` had
+/// truncated tasks.json and destroyed the live board.
+///
+/// Same-directory temp is required for rename atomicity on Windows — a rename
+/// across volumes falls back to a non-atomic copy. `fs::rename` on Windows maps
+/// to `MoveFileExW` with `REPLACE_EXISTING`, which atomically replaces the
+/// destination on the same volume, so the primary path already does the right
+/// thing; the fallback only covers the rare case where the destination is
+/// briefly locked (antivirus, an open reader). The temp is fsync'd before the
+/// rename so a rename can't expose a metadata-only file whose data blocks never
+/// reached disk — exactly the disk-full failure mode.
+fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    // Ensure the destination dir exists — group state dirs always do, but the #83
+    // grant subdirs (`merge_grants/`, `release_grants/`) may be fresh.
+    fs::create_dir_all(dir)?;
+    let stem = path.file_name().and_then(|n| n.to_str()).unwrap_or("state");
+    let seq = ATOMIC_WRITE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = dir.join(format!(".{stem}.{}.{seq}.tmp", std::process::id()));
+    {
+        let mut f = fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?; // durable before the rename — the disk-full guard
+    }
+    match fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            // Rename can fail if the destination is momentarily locked. Fall
+            // back to a direct write so the update isn't lost; keep the temp on
+            // failure so the new contents remain recoverable.
+            let r = fs::write(path, bytes);
+            if r.is_ok() {
+                let _ = fs::remove_file(&tmp);
+            }
+            r
+        }
     }
 }
 
@@ -2639,23 +2726,56 @@ const BRACKETED_PASTE_END: &str = "\u{1b}[201~";
 
 /// Whether `s` contains a graphic character once terminal escape sequences are
 /// skipped — the test for "this write put visible text in the box". Skips CSI
-/// (`ESC [ … final`, e.g. arrow keys, bracketed-paste markers) and other short
-/// `ESC`-led sequences so their printable final bytes (`C`, `~`, digits) don't
-/// read as typed content.
+/// (`ESC [ … final`, e.g. arrow keys, bracketed-paste markers) AND the string
+/// sequences a terminal emits in *reply* to a program's query — OSC (`ESC ]`)
+/// and DCS/SOS/PM/APC (`ESC P`/`X`/`^`/`_`) — plus other short `ESC`-led
+/// sequences, so none of their printable bytes read as typed content.
+///
+/// The OSC/DCS skip is #179: GitHub Copilot queries the terminal's colors
+/// (`ESC]10;?`, `ESC]11;?`, `ESC]4;n;?`) and version (`ESC[>q`) at boot; the
+/// webview's xterm auto-answers, and those answers reach us through `write_pty`
+/// exactly like a keystroke. Their bodies are printable (`11;rgb:0d0d/1111/1717`),
+/// so without skipping the whole string they were misread as a human's line,
+/// wedging `input_pending` true and stalling the fresh-copilot kickoff paste in
+/// the #111 box-clear hold (up to its 60s abort) — the "prompt never delivered"
+/// symptom. Claude Code issues no such query, so only copilot tripped it.
 fn input_has_printable(s: &str) -> bool {
     let b = s.as_bytes();
     let mut i = 0;
     while i < b.len() {
         if b[i] == 0x1b {
             i += 1;
-            if i < b.len() && b[i] == b'[' {
-                i += 1;
-                while i < b.len() && !(0x40..=0x7e).contains(&b[i]) {
+            match b.get(i) {
+                // CSI: `ESC [` … final byte in 0x40..=0x7e.
+                Some(b'[') => {
+                    i += 1;
+                    while i < b.len() && !(0x40..=0x7e).contains(&b[i]) {
+                        i += 1;
+                    }
+                    i += 1; // consume the CSI final byte
+                }
+                // OSC / DCS / SOS / PM / APC: a string sequence whose body is
+                // arbitrary (often printable) text, terminated by BEL (0x07) or
+                // ST (`ESC \`). Skip the whole thing — it's a query reply, not
+                // typed input (#179).
+                Some(b']') | Some(b'P') | Some(b'X') | Some(b'^') | Some(b'_') => {
+                    i += 1;
+                    while i < b.len() {
+                        if b[i] == 0x07 {
+                            i += 1; // BEL terminator
+                            break;
+                        }
+                        if b[i] == 0x1b && b.get(i + 1) == Some(&b'\\') {
+                            i += 2; // ST terminator (ESC \)
+                            break;
+                        }
+                        i += 1;
+                    }
+                }
+                // Any other 2-byte / lone ESC sequence (charset select, `ESC=`, …).
+                _ => {
                     i += 1;
                 }
-                i += 1; // consume the CSI final byte
-            } else {
-                i += 1; // 2-byte / lone ESC sequence
             }
             continue;
         }
@@ -2826,6 +2946,7 @@ impl OrchRegistry {
             idle_tick_times: Mutex::new(HashMap::new()),
             pending_max_notice: Mutex::new(HashMap::new()),
             claude_projects_dir: Mutex::new(None),
+            low_disk_notified: Mutex::new(false),
         }
     }
 
@@ -2976,7 +3097,12 @@ impl OrchRegistry {
         serde_json::from_str::<Value>(state).map_err(|e| format!("state must be valid JSON: {e}"))?;
         let dir = self.group_dir(group);
         fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        fs::write(dir.join("state.json"), state).map_err(|e| e.to_string())?;
+        // Atomic replace so a failed write (disk-full, crash) leaves the last
+        // good snapshot intact (#133). set_state holds no lock — the unique
+        // temp name in `atomic_write` keeps concurrent writers from clobbering
+        // one another's scratch file, and the rename makes it last-writer-wins
+        // rather than a torn file.
+        atomic_write(&dir.join("state.json"), state.as_bytes()).map_err(|e| e.to_string())?;
         self.audit(group, "loomux", "state-write", json!({ "bytes": state.len() }));
         Ok(())
     }
@@ -2993,8 +3119,11 @@ impl OrchRegistry {
     fn write_tasks(&self, group: &str, tasks: &[Task]) -> Result<(), String> {
         let dir = self.group_dir(group);
         fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        fs::write(dir.join("tasks.json"), serde_json::to_string_pretty(tasks).unwrap())
-            .map_err(|e| e.to_string())?;
+        // Atomic replace: the incident that filed #133 was a disk-full
+        // `fs::write` here that truncated tasks.json and destroyed the live
+        // board. All callers hold `tasks_lock`, so writes are serialized.
+        let body = serde_json::to_string_pretty(tasks).unwrap();
+        atomic_write(&dir.join("tasks.json"), body.as_bytes()).map_err(|e| e.to_string())?;
         self.emit_tasks_changed(group);
         Ok(())
     }
@@ -3339,6 +3468,63 @@ impl OrchRegistry {
         Ok(task)
     }
 
+    /// Guard the proceed action to items actually in `prototype`. The UI only
+    /// shows the button on prototype items, but the command surface is callable
+    /// directly, so enforce it backend-side too (constraint 6) — "proceeding" a
+    /// queued or done item is meaningless.
+    fn ensure_prototype(&self, group: &str, id: &str) -> Result<(), String> {
+        let status = self
+            .tasks(group)
+            .into_iter()
+            .find(|t| t.id == id)
+            .ok_or_else(|| format!("unknown task: {id}"))?
+            .status;
+        if status == PROTOTYPE_STATUS {
+            Ok(())
+        } else {
+            Err(format!(
+                "task {id} is {status:?}, not {PROTOTYPE_STATUS:?} — Proceed only applies to a prototype"
+            ))
+        }
+    }
+
+    /// Proceed on a prototype (#147): the human has validated the demo and wants
+    /// it promoted to a full production build. Flips `prototype` → `in-progress`
+    /// (the item is back in active development, no longer parked on the human's
+    /// verdict), records a human-attributed note, and delivers ONE typed notice
+    /// telling the orchestrator to run the promotion. Unlike `start_task`, the
+    /// status flip is durable — like `approve_task`, the board carries the
+    /// decision even if a paused group drops the notice — so this does NOT reject
+    /// on pause (the orchestrator sees the flip + note on resume via list_tasks).
+    /// The notice is best-effort (the board is the source of truth).
+    pub fn proceed_task(&self, group: &str, id: &str) -> Result<Task, String> {
+        self.ensure_prototype(group, id)?;
+        let task = self.upsert_task(
+            group,
+            "human",
+            Some(id),
+            TaskPatch {
+                status: Some("in-progress".into()),
+                note: Some(
+                    "Proceed — the human validated the prototype; promote it to a full production build."
+                        .into(),
+                ),
+                ..Default::default()
+            },
+        )?;
+        let _ = self.deliver_to_orchestrator(
+            group,
+            &format!(
+                "[loomux] the human clicked PROCEED on task {} (\"{}\") — the prototype is validated. \
+                 Promote it to a full production build: production hardening + full reviews, no corners, \
+                 the same promotion arc you'd run by hand.",
+                task.id, task.title
+            ),
+            "human",
+        );
+        Ok(task)
+    }
+
     /// Tell the orchestrator the human touched the board (best-effort; the
     /// board itself is the source of truth via list_tasks).
     fn notify_board_edit(&self, group: &str, summary: &str) {
@@ -3383,7 +3569,10 @@ impl OrchRegistry {
             None => list.push(record),
         }
         let _ = fs::create_dir_all(self.group_dir(&entry.group));
-        let _ = fs::write(&path, serde_json::to_string_pretty(&list).unwrap());
+        // Atomic replace so a failed write can't wipe the agent roster (#133).
+        // Holds `tasks_lock` (taken above), so writes are serialized.
+        let body = serde_json::to_string_pretty(&list).unwrap();
+        let _ = atomic_write(&path, body.as_bytes());
     }
 
     fn group_records(&self, group: &str) -> Vec<AgentRecord> {
@@ -3654,35 +3843,37 @@ impl OrchRegistry {
             }
         }
         let info = GroupInfo { id: id.clone(), repo: repo.to_string(), guardrails };
-        fs::write(
-            dir.join("group.json"),
-            serde_json::to_string_pretty(&json!({
-                "group_id": info.id,
-                "repo": info.repo,
-                "created_ms": now_ms(),
-                "guardrails": {
-                    "max_agents": info.guardrails.max_agents,
-                    "agent_cli": info.guardrails.agent_cli,
-                    "orchestrator_cli": info.guardrails.orchestrator_cli,
-                    "worker_cli": info.guardrails.worker_cli,
-                    "reviewer_cli": info.guardrails.reviewer_cli,
-                    "planner_cli": info.guardrails.planner_cli,
-                    "worker_model": info.guardrails.worker_model,
-                    "reviewer_model": info.guardrails.reviewer_model,
-                    "orchestrator_model": info.guardrails.orchestrator_model,
-                    "planner_model": info.guardrails.planner_model,
-                    "auto_ops": info.guardrails.auto_ops,
-                    "idle_kill_minutes": info.guardrails.idle_kill_minutes,
-                    "max_spawns_per_hour": info.guardrails.max_spawns_per_hour,
-                    "watchdog_stall_minutes": info.guardrails.watchdog_stall_minutes,
-                    "autonomy_budget_tokens": info.guardrails.autonomy_budget_tokens,
-                    "idle_tick_minutes": info.guardrails.idle_tick_minutes,
-                    "idle_activity_floor_bytes": info.guardrails.idle_activity_floor_bytes,
-                },
-            }))
-            .unwrap(),
-        )
-        .map_err(|e| e.to_string())?;
+        // Atomic replace: group.json is identity-critical (a truncated file
+        // breaks the rejoin path), so a failed/interrupted write must leave the
+        // prior file intact rather than half-written (#133). Matches the
+        // crash-safe pattern `persist_max_agents` already uses for this file.
+        // Includes the #83 autonomous guardrails.
+        let body = serde_json::to_string_pretty(&json!({
+            "group_id": info.id,
+            "repo": info.repo,
+            "created_ms": now_ms(),
+            "guardrails": {
+                "max_agents": info.guardrails.max_agents,
+                "agent_cli": info.guardrails.agent_cli,
+                "orchestrator_cli": info.guardrails.orchestrator_cli,
+                "worker_cli": info.guardrails.worker_cli,
+                "reviewer_cli": info.guardrails.reviewer_cli,
+                "planner_cli": info.guardrails.planner_cli,
+                "worker_model": info.guardrails.worker_model,
+                "reviewer_model": info.guardrails.reviewer_model,
+                "orchestrator_model": info.guardrails.orchestrator_model,
+                "planner_model": info.guardrails.planner_model,
+                "auto_ops": info.guardrails.auto_ops,
+                "idle_kill_minutes": info.guardrails.idle_kill_minutes,
+                "max_spawns_per_hour": info.guardrails.max_spawns_per_hour,
+                "watchdog_stall_minutes": info.guardrails.watchdog_stall_minutes,
+                "autonomy_budget_tokens": info.guardrails.autonomy_budget_tokens,
+                "idle_tick_minutes": info.guardrails.idle_tick_minutes,
+                "idle_activity_floor_bytes": info.guardrails.idle_activity_floor_bytes,
+            },
+        }))
+        .unwrap();
+        atomic_write(&dir.join("group.json"), body.as_bytes()).map_err(|e| e.to_string())?;
         self.write_instruction_files(&info)?;
         // A pause is a durable human safety action: re-seed it from the
         // marker file so a resumed group stays paused across restarts.
@@ -4608,6 +4799,55 @@ impl OrchRegistry {
         Ok(())
     }
 
+    // ---------- low-disk backstop (#134) ----------
+
+    /// One low-disk backstop pass given the current free bytes on the workspace
+    /// drive. On the tick that first crosses below `LOW_DISK_BYTES`, deliver ONE
+    /// audited notice to each live, non-paused group's orchestrator and latch;
+    /// the latch clears once free space recovers past `LOW_DISK_CLEAR_BYTES`.
+    /// Paused groups are skipped (like the watchdog) — their agents idle out on
+    /// purpose and prompt delivery is suppressed there anyway. Returns the
+    /// notified group ids. Free-bytes is injected so the latch/hysteresis logic
+    /// is testable without a real disk.
+    pub fn disk_tick(&self, free: u64) -> Vec<String> {
+        let fire = {
+            let mut latched = self.low_disk_notified.lock_safe();
+            let (new_latched, fire) =
+                low_disk_transition(free, LOW_DISK_BYTES, LOW_DISK_CLEAR_BYTES, *latched);
+            *latched = new_latched;
+            fire
+        };
+        if !fire {
+            return Vec::new();
+        }
+        // Snapshot groups/paused, then deliver outside any lock (delivery types
+        // into a pane and can block).
+        let paused = self.paused.lock_safe().clone();
+        let groups: Vec<String> = self.groups.lock_safe().keys().cloned().collect();
+        let notice = low_disk_notice(free);
+        let mut notified = Vec::new();
+        for group in groups {
+            if paused.contains(&group) {
+                continue;
+            }
+            self.audit(&group, "loomux", "low-disk", json!({ "free_bytes": free }));
+            if self.deliver_to_orchestrator(&group, &notice, "loomux").is_ok() {
+                notified.push(group);
+            }
+        }
+        notified
+    }
+
+    /// Sample free space on the workspace drive (the app-data root, where the
+    /// board/state live — the surface a disk-full write corrupts) and run one
+    /// `disk_tick`. Best-effort: if the disk can't be read, do nothing.
+    pub fn run_disk_monitor(&self) {
+        if let Some(free) = free_disk_bytes(&self.root) {
+            self.disk_tick(free);
+        }
+    }
+
+
     /// Set a live group's autonomous token budget on the fly (0 = no cap). Written
     /// to the in-memory guardrail (which the idle-tick budget check reads fresh)
     /// and persisted to group.json so a restart keeps it, then audited. Does NOT
@@ -4967,19 +5207,11 @@ impl OrchRegistry {
                 obj.insert("guardrails".into(), json!({ "max_agents": n }));
             }
         }
-        // Crash-safe write: serialize to a temp file, then atomically rename
-        // over group.json (same pattern as usage.json). group.json is
-        // identity-critical — a half-written file breaks the rejoin path
-        // ("group.json is missing") — so never expose a truncated version.
+        // Crash-safe write: group.json is identity-critical — a half-written
+        // file breaks the rejoin path ("group.json is missing") — so never
+        // expose a truncated version (#133).
         let body = serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?;
-        let tmp = dir.join("group.json.tmp");
-        fs::write(&tmp, &body).map_err(|e| e.to_string())?;
-        if fs::rename(&tmp, &path).is_err() {
-            // Rename can fail if the destination exists on some platforms; fall
-            // back to a direct write so the update isn't lost.
-            fs::write(&path, &body).map_err(|e| e.to_string())?;
-            let _ = fs::remove_file(&tmp);
-        }
+        atomic_write(&path, body.as_bytes()).map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -5112,7 +5344,12 @@ impl OrchRegistry {
         let mut gate_of: HashMap<String, String> = HashMap::new();
         for g in &groups {
             for t in self.tasks(g) {
-                let is_gate = MERGE_GATE_STATUSES.contains(&t.status.as_str()) || t.status == "blocked";
+                // `prototype` is a human gate too (#147): the assigned pane is
+                // where the pending demo-verdict work lives, so flag it like the
+                // merge gates and `blocked`.
+                let is_gate = MERGE_GATE_STATUSES.contains(&t.status.as_str())
+                    || t.status == "blocked"
+                    || t.status == PROTOTYPE_STATUS;
                 if is_gate {
                     if let Some(assignee) = t.assignee.filter(|s| !s.trim().is_empty()) {
                         gate_of.insert(assignee, t.status);
@@ -5462,20 +5699,10 @@ impl OrchRegistry {
         }
         let dir = self.group_dir(group);
         let _ = fs::create_dir_all(&dir);
-        // Crash-safe write: serialize to a temp file, then atomically rename
-        // over usage.json. A crash mid-write leaves the old (valid) file or
-        // the temp file behind, never a half-written usage.json.
-        let path = dir.join("usage.json");
-        let tmp = dir.join("usage.json.tmp");
+        // Crash-safe write: a crash mid-write leaves the old (valid) file
+        // intact, never a half-written usage.json (#133). Holds `tasks_lock`.
         let body = serde_json::to_string_pretty(&list).unwrap();
-        if fs::write(&tmp, &body).is_ok() {
-            if fs::rename(&tmp, &path).is_err() {
-                // Rename can fail if the destination exists on some platforms;
-                // fall back to a direct write so we don't lose the update.
-                let _ = fs::write(&path, &body);
-                let _ = fs::remove_file(&tmp);
-            }
-        }
+        let _ = atomic_write(&dir.join("usage.json"), body.as_bytes());
     }
 
     /// Aggregate the group's usage into one summary with a **live vs lifetime**
@@ -5884,7 +6111,7 @@ impl OrchRegistry {
         let nonce = GRANT_SEQ.fetch_add(1, Ordering::Relaxed);
         let expires = now_ms() / 1000 + GRANT_TTL_SECS;
         let path = self.grant_dir(group, "merge_grants").join(format!("pr-{num}"));
-        atomic_write(&path, format!("{expires}\n{nonce}\n").as_bytes())?;
+        atomic_write(&path, format!("{expires}\n{nonce}\n").as_bytes()).map_err(|e| e.to_string())?;
         self.audit(group, actor, "merge-grant-written",
             json!({ "pr": num, "expires_secs": expires, "nonce": nonce }));
         let mins = GRANT_TTL_SECS / 60;
@@ -5925,7 +6152,7 @@ impl OrchRegistry {
         let nonce = GRANT_SEQ.fetch_add(1, Ordering::Relaxed);
         let expires = now_ms() / 1000 + GRANT_TTL_SECS;
         let path = self.grant_dir(group, "release_grants").join(&seg);
-        atomic_write(&path, format!("{expires}\n{nonce}\n").as_bytes())?;
+        atomic_write(&path, format!("{expires}\n{nonce}\n").as_bytes()).map_err(|e| e.to_string())?;
         self.audit(group, actor, "release-grant-written",
             json!({ "tag": tag, "expires_secs": expires, "nonce": nonce }));
         let mins = GRANT_TTL_SECS / 60;
@@ -6619,8 +6846,9 @@ impl OrchRegistry {
     /// `delivery` classifies the call (see [`Delivery`]): a kickoff to a just-
     /// booted CLI holds the paste until the pane has painted its UI and gone
     /// quiet (input typed before the CLI's reader attaches is flushed and lost),
-    /// and a *fresh* boot additionally answers copilot's autopilot consent
-    /// dialog first; mid-session deliveries do neither.
+    /// and a *fresh* copilot boot additionally answers the autopilot consent
+    /// dialog that its first submit triggers (#179); mid-session deliveries do
+    /// neither.
     pub fn deliver_prompt(
         &self,
         agent_id: &str,
@@ -6716,20 +6944,14 @@ impl OrchRegistry {
                 }
             }
 
-            // Copilot autopilot consent (#101): the UI has painted, so if this
-            // is a fresh autopilot copilot spawn its "Enable autopilot mode"
-            // dialog is on screen. Answer it (Enter → "Enable all permissions")
-            // now — before the stranded-text flush (#99) below AND before any
-            // paste — so neither our brief nor a flush Enter can hit the dialog
-            // out of order. In practice the flush can't fire here anyway: the
-            // confirm only runs on a FreshKickoff (`is_fresh_boot`), whose pane
-            // has no prior `last_delivery` entry, so `should_flush_before_paste`
-            // sees `None` and returns false. Ordering the confirm first keeps
-            // that safe even if a pty id were ever recycled. Fail-soft: no-op if
-            // the dialog never shows.
-            if confirm_autopilot {
-                confirm_copilot_autopilot_dialog(&ptys, pty_id, &root, &group, &agent);
-            }
+            // Copilot autopilot consent (#101/#179): the "Enable autopilot mode"
+            // dialog does NOT open at boot — verified live against copilot 1.0.69,
+            // a fresh --autopilot pane paints a normal input box, and the consent
+            // dialog is triggered by the FIRST message submit. So the confirm is
+            // answered AFTER the kickoff Enter (below), not here: selecting its
+            // default "Enable all permissions" both enables autopilot and delivers
+            // the pending brief in one step. Watching at boot (as this used to)
+            // only burned the fail-soft wait on a dialog that never shows.
 
             // Human-typing backstop (#43, option A): if a human is typing
             // directly in this pane, hold the paste until they go quiet so a
@@ -6873,6 +7095,19 @@ impl OrchRegistry {
             // below measures only the burst that Enter produces.
             let submit_baseline = ptys.output_total(pty_id).unwrap_or(last_total);
             let _ = ptys.write_bytes(pty_id, submit);
+
+            // Copilot autopilot consent (#101/#179): a fresh --autopilot copilot
+            // opens its "Enable autopilot mode" dialog in response to this FIRST
+            // submit (not at boot). Answer it now — Enter selects the default
+            // "Enable all permissions", which enables autopilot AND lets the brief
+            // we just submitted proceed (verified live: the pending message is not
+            // discarded). Gated to a fresh unattended copilot boot; fail-soft, so
+            // if the dialog never shows (already consented, flow changed) delivery
+            // just continues to the retries. Must run before the confirm window so
+            // the dialog's Enter has landed before we judge whether the turn began.
+            if confirm_autopilot {
+                confirm_copilot_autopilot_dialog(&ptys, pty_id, &root, &group, &agent);
+            }
 
             // Confirm the submit landed: watch for the output burst of the box
             // clearing / the turn starting (#81/#84). Measured off the first
@@ -7252,6 +7487,29 @@ pub fn start_idle_tick(reg: Arc<OrchRegistry>) {
     std::thread::spawn(move || loop {
         std::thread::sleep(IDLE_TICK_INTERVAL);
         reg.run_idle_tick(now_ms());
+    });
+}
+
+/// Free bytes on the disk that hosts `path`: the mounted volume whose mount
+/// point is the longest prefix of `path`. `None` if no volume matches (or the
+/// listing is empty), so the caller no-ops rather than guessing.
+fn free_disk_bytes(path: &Path) -> Option<u64> {
+    let disks = sysinfo::Disks::new_with_refreshed_list();
+    disks
+        .iter()
+        .filter(|d| path.starts_with(d.mount_point()))
+        .max_by_key(|d| d.mount_point().as_os_str().len())
+        .map(|d| d.available_space())
+}
+
+/// Background loop for the low-disk backstop (#134): every `DISK_CHECK_INTERVAL`
+/// it samples free space on the workspace drive and, on crossing below the
+/// threshold, sends one latched notice per group orchestrator. Started once at
+/// app setup. Slow cadence keeps the sysinfo scan negligible.
+pub fn start_disk_monitor(reg: Arc<OrchRegistry>) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(DISK_CHECK_INTERVAL);
+        reg.run_disk_monitor();
     });
 }
 
@@ -8326,6 +8584,19 @@ pub fn orch_start_task(
     id: String,
 ) -> Result<Task, String> {
     reg.start_task(&group_id, &id)
+}
+
+/// Proceed on a prototype item (#147): flip it to `in-progress`, record the
+/// human's sign-off, and tell the orchestrator to promote the prototype to a
+/// full production build. The human's demo-gate verdict, so the status change
+/// is applied here (mirrors `orch_approve_task`).
+#[tauri::command]
+pub fn orch_proceed_task(
+    reg: tauri::State<Arc<OrchRegistry>>,
+    group_id: String,
+    id: String,
+) -> Result<Task, String> {
+    reg.proceed_task(&group_id, &id)
 }
 
 #[cfg(test)]

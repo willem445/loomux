@@ -276,9 +276,36 @@ async function openAgentPane(
   }
 }
 
+/** Where an orchestration event should act: a grid and the pane-events to open
+ *  panes into it. With project tabs (#63) there are N grids (one per tab). */
+export interface OrchTarget {
+  grid: Grid;
+  paneEvents: PaneEvents;
+}
+
+/** The tab layer, as the orchestration event router sees it (#63). Its
+ *  implementation (main.ts, over TabManager) owns tab creation/switching; this
+ *  module owns the backend-event plumbing and calls into it. Keeping the
+ *  interface here means orchestration.ts has no dependency on the concrete tabs
+ *  module (avoids a cycle) while every event routes to the right tab. */
+export interface OrchWiring {
+  /** Grid+events a group's spawns open into. Creates and binds a project tab on
+   *  first sight of the group (named from the spawn request / repo). */
+  targetForGroup(req: OrchSpawnRequest): OrchTarget;
+  /** Locate a pane by pty across ALL tabs (rename, cancel sweep). */
+  findByPty(ptyId: number): Pane | undefined;
+  /** Every grid across every tab (spawn-cancel sweep, group-ended close). */
+  allGrids(): Grid[];
+  /** Focus the pane for `ptyId`, switching to its tab first (orch-focus). */
+  focusPty(ptyId: number): void;
+  /** Apply an attention scan across all tabs: badge each pane by its pty AND
+   *  badge the tab-bar entry of any tab that owns a needs-attention pty. */
+  applyAttention(items: AttentionItem[]): void;
+}
+
 /** Wire backend→frontend orchestration events. Call once at startup,
  *  before any orchestrator can be launched. */
-export function initOrchestration(grid: Grid, paneEvents: PaneEvents): void {
+export function initOrchestration(wiring: OrchWiring): void {
   void listen<OrchSpawnRequest>("orch-spawn-request", ({ payload }) => {
     // Drop a request whose backend bind wait already elapsed while this
     // frontend was stalled (#106): servicing it now would open a zombie pane
@@ -291,72 +318,62 @@ export function initOrchestration(grid: Grid, paneEvents: PaneEvents): void {
       );
       return;
     }
-    // An MCP spawn_agent request: open the pane in the background so it doesn't
-    // steal focus from where the human is typing (#117).
+    // Route the spawn to the group's own tab (creating one on first sight).
+    // Background open so it doesn't steal focus from where the human is typing
+    // (#117). Focus/attention/rename later locate this pane by scanning live
+    // panes across tabs (findByPty), so there's no per-pty binding to maintain.
+    const { grid, paneEvents } = wiring.targetForGroup(payload);
     void openAgentPane(grid, paneEvents, payload, true);
   });
   // The backend's bind wait for a spawn timed out (#106): it cleaned up the
   // minted config and pending bind. Remember the agent so an in-flight
   // openAgentPane drops it before binding, and close any pane already opened
-  // for it so a live frontend doesn't leave a zombie against the dead config.
+  // for it (in whichever tab) so a live frontend doesn't leave a zombie.
   void listen<{ group_id: string; agent_id: string }>(
     "orch-spawn-cancelled",
     ({ payload }) => {
-      // Note it for an openAgentPane still mid-open (pane not yet created), which
-      // reads the set right after its pane opens; the in-flight call's `finally`
-      // clears the note. Also close any pane already opened for this agent so a
-      // live frontend doesn't leave a zombie against the now-deleted config.
       cancelledSpawns.add(payload.agent_id);
-      for (const pane of grid.allPanes()) {
-        if (pane.orchAgentId === payload.agent_id) discardStalePane(grid, pane);
+      for (const grid of wiring.allGrids()) {
+        for (const pane of grid.allPanes()) {
+          if (pane.orchAgentId === payload.agent_id) discardStalePane(grid, pane);
+        }
       }
     }
   );
+  // Focus: switch to the pane's TAB first, then focus the pane (#63).
   void listen<{ agent_id: string; pty_id: number | null }>("orch-focus", ({ payload }) => {
     if (payload.pty_id === null) return;
-    const pane = grid.findByPtyId(payload.pty_id);
-    if (pane) {
-      grid.setActive(pane);
-      pane.focus();
-    }
+    wiring.focusPty(payload.pty_id);
   });
   // The orchestrator (or a human rename echoed back) renamed an agent pane
-  // (#95r): retitle it. The backend only emits renames it accepted under the
-  // precedence ladder, so a human-owned title never arrives back as an
-  // orchestrator override — no frontend guard needed. setName is idempotent.
+  // (#95r): retitle it in whichever tab it lives. The backend only emits renames
+  // it accepted under the precedence ladder, so a human-owned title never
+  // arrives back as an orchestrator override — no frontend guard. Idempotent.
   void listen<{ agent_id: string; pty_id: number | null; name: string }>(
     "orch-rename",
     ({ payload }) => {
       if (payload.pty_id === null) return;
-      const pane = grid.findByPtyId(payload.pty_id);
-      if (pane) pane.setName(payload.name);
+      wiring.findByPty(payload.pty_id)?.setName(payload.name);
     }
   );
   // Attention routing: the backend pushes the full current set of panes that
-  // need the human every scan; badge each pane by its pty (absent = clear).
-  // Idempotent per pane, so re-emits every few seconds are cheap. Applies to
-  // ALL panes with a pty, not just orchestration agents — a plain shell the
-  // human opened to run a CLI that's now blocked on a prompt must light up too
-  // (#40); the backend emits `waiting` items for those, keyed only by pty_id.
+  // need the human every scan. Applied across ALL tabs — a hidden tab's blocked
+  // agent must still badge its tab strip entry (#63) — reusing the same
+  // attention.ts mapping the pane header and dock chip use. Also covers plain
+  // panes keyed only by pty (#40), not just orchestration agents.
   void listen<AttentionItem[]>("orch-attention", ({ payload }) => {
-    const byPty = new Map<number, AttentionItem>();
-    for (const it of payload) if (it.pty_id !== null) byPty.set(it.pty_id, it);
-    // allPanes(), not panes(): a minimized pane still needs the human, and its
-    // dock chip mirrors the state (see Grid.renderDock / #6).
-    for (const pane of grid.allPanes()) {
-      if (pane.ptyId === null) continue;
-      const it = byPty.get(pane.ptyId);
-      pane.setAttention(it ? it.reason : null, it?.detail);
-    }
+    wiring.applyAttention(payload);
   });
   // End-orchestration: the backend has already killed the group's agents, so
-  // close their (now-dead) panes rather than leaving a screen of dead
-  // terminals — the pane-by-pane ✕-clicking this action exists to replace.
+  // close their (now-dead) panes across every tab rather than leaving a screen
+  // of dead terminals — the pane-by-pane ✕-clicking this action replaces.
   void listen<{ group_id: string }>("orch-group-ended", ({ payload }) => {
-    // allPanes(), not panes(): a minimized group pane must be closed too, or
-    // it would linger in the dock (with a live agent) after its group ends.
-    for (const pane of panesInGroup(grid.allPanes(), payload.group_id)) {
-      grid.closePane(pane, false);
+    for (const grid of wiring.allGrids()) {
+      // allPanes(): a minimized group pane must be closed too, or it would
+      // linger in the dock (with a live agent) after its group ends.
+      for (const pane of panesInGroup(grid.allPanes(), payload.group_id)) {
+        grid.closePane(pane, false);
+      }
     }
   });
 }
@@ -382,14 +399,18 @@ export async function resumeOrchSession(
   paneEvents: PaneEvents,
   sessionId: string,
   hint?: { group: string; role: string }
-): Promise<void> {
+): Promise<{ groupId: string } | null> {
   const spec = await invoke<OrchSpawnRequest | null>("resume_orch_session", {
     sessionId,
     groupHint: hint?.group ?? null,
     roleHint: hint?.role ?? null,
   });
+  if (!spec) return null;
   // Human clicked a recorded session in the browser — focus the restored pane.
-  if (spec) await openAgentPane(grid, paneEvents, spec, false);
+  // Return the group so the caller can bind it to the tab (#63); the pane itself
+  // is located later by scanning live panes (findByPty), so it isn't returned.
+  await openAgentPane(grid, paneEvents, spec, false);
+  return { groupId: spec.group_id };
 }
 
 /** Create/resume the group for `config.repo` and open its orchestrator
@@ -399,7 +420,7 @@ export async function launchOrchestrator(
   grid: Grid,
   paneEvents: PaneEvents,
   config: OrchestratorConfig
-): Promise<void> {
+): Promise<{ groupId: string }> {
   const spec = await invoke<OrchSpawnRequest>("create_orchestration", {
     repo: config.repo,
     agentCli: config.agentCli,
@@ -430,8 +451,11 @@ export async function launchOrchestrator(
       showToast(`autonomy budget not applied: ${String(err)}`, "info");
     }
   }
-  // Human launched the orchestrator from the UI — focus its pane.
+  // Human launched the orchestrator from the UI — focus its pane. Return the
+  // group so the caller binds it to the tab (#63); the pane is located later by
+  // scanning live panes (findByPty), so it isn't returned.
   await openAgentPane(grid, paneEvents, spec, false);
+  return { groupId: spec.group_id };
 }
 
 // ---------- cost containment: pause/resume + per-group usage ----------

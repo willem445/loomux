@@ -13,7 +13,8 @@ use loomux_lib::orchestration::{
     gh_gate_decision, gh_is_merge_invocation, gh_positionals, gh_release_action, gh_repo_flag,
     gh_shim_sh, git_shim_sh, git_tag_push, grant_segment, grant_unexpired, hold_for_human_input,
     hold_until_quiet, idle_output_is_activity, idle_should_kill, idle_tick_should_fire,
-    max_agents_notice, pr_number, release_gate_decision, GhGate, GitTagPush,
+    low_disk_notice, low_disk_transition, max_agents_notice, pr_number, release_gate_decision,
+    GhGate, GitTagPush,
     normalize_remote_web_base, parse_audit_lines, parse_session_cost, paste_held_notice,
     prompt_wait_detected, resolve_paste_gate, resolve_ref_url, rotate_audit_if_needed,
     sanitize_attachment_ext, should_confirm_copilot_autopilot, should_flush_before_paste,
@@ -1080,14 +1081,14 @@ fn autopilot_confirm_gates_to_a_fresh_copilot_boot() {
 
 #[test]
 fn autopilot_confirm_and_stranded_flush_never_both_fire_on_a_fresh_boot() {
-    // #99-rebase interaction: `deliver_prompt` runs the autopilot confirm
-    // (Enter on the consent dialog) BEFORE #99's stranded-text flush (an Enter
-    // to clear a previous prompt still in the box). They must never both press
-    // Enter on the same fresh boot, or the flush Enter could land on the dialog
-    // out of order. They can't: the confirm runs only on a *fresh boot*, and a
-    // freshly booted pane has no prior delivery, so the flush's own guard
-    // (`should_flush_before_paste(None, _)`) is false. This pins that composition
-    // — if either guard's contract changes, this fails.
+    // #99/#179 interaction: the autopilot confirm (Enter on the consent dialog)
+    // now runs AFTER the kickoff submit, while #99's stranded-text flush (an
+    // Enter to clear a previous prompt still in the box) runs before the paste.
+    // Neither can fire on a fresh boot without the other being a no-op: the
+    // confirm runs only on a *fresh boot*, and a freshly booted pane has no prior
+    // delivery, so the flush's own guard (`should_flush_before_paste(None, _)`)
+    // is false. This pins that composition — if either guard's contract changes,
+    // this fails.
     // Fresh boot ⇒ confirm may run …
     assert!(should_confirm_copilot_autopilot("copilot", true, true));
     // … but the flush cannot: no previous delivery to key off (prev = None).
@@ -1097,12 +1098,54 @@ fn autopilot_confirm_and_stranded_flush_never_both_fire_on_a_fresh_boot() {
 }
 
 #[test]
-fn copilot_autopilot_confirm_key_is_a_single_enter() {
-    // The dialog's default-highlighted item is "Enable all permissions" (menu
-    // initialIndex 0), and Enter (`code==="return"`) selects it — so a single
-    // carriage return enables all permissions + enters autopilot mode, no arrow
-    // keys. If copilot ever reorders the menu this pins what we must revisit.
-    assert_eq!(COPILOT_AUTOPILOT_CONFIRM_KEYS, b"\r");
+fn copilot_autopilot_confirm_reuses_the_copilot_submit_transport() {
+    // #179: the confirm answers the "Enable autopilot mode" dialog copilot opens
+    // in response to the kickoff submit. The dialog default "Enable all
+    // permissions" is selected with Enter (menu initialIndex 0). The keys carry
+    // the focus-in prefix so this stays identical to every other copilot pane
+    // write (#98) — pin the two together so they can't silently drift apart.
+    assert_eq!(COPILOT_AUTOPILOT_CONFIRM_KEYS, b"\x1b[I\r");
+    assert!(COPILOT_AUTOPILOT_CONFIRM_KEYS.ends_with(b"\r"),
+        "the selection key is Enter (menu initialIndex 0 = Enable all permissions)");
+    assert_eq!(COPILOT_AUTOPILOT_CONFIRM_KEYS, submit_sequence("copilot"),
+        "the autopilot confirm reuses copilot's focus-in+Enter transport");
+}
+
+#[test]
+fn terminal_query_replies_are_not_read_as_human_input() {
+    // #179 root cause: a fresh copilot pane queries the terminal's colors and
+    // version at boot (`ESC]10;?`, `ESC]11;?`, `ESC]4;n;?`, `ESC[>q`); the
+    // webview's xterm auto-answers, and those answers reach `classify_human_input`
+    // through `write_pty` exactly like a keystroke. Their bodies are printable, so
+    // when the classifier only skipped CSI they were read as a human's line —
+    // wedging `input_pending` true and stalling the kickoff paste in the #111
+    // box-clear hold until it aborted ("prompt never delivered"). A terminal
+    // reply must classify Neutral (it changes no box occupancy), never Content.
+
+    // OSC 11 (background color) reply — BEL-terminated, as xterm sends it.
+    assert_eq!(classify_human_input("\x1b]11;rgb:0d0d/1111/1717\x07"), HumanInput::Neutral,
+        "an OSC color-query reply is a terminal answer, not typed input");
+    // OSC 10 (foreground) reply — ST-terminated (ESC \) form.
+    assert_eq!(classify_human_input("\x1b]10;rgb:f0f6/f0f6/fcfc\x1b\\"), HumanInput::Neutral);
+    // OSC 4 palette-entry reply.
+    assert_eq!(classify_human_input("\x1b]4;1;rgb:ffff/0000/0000\x07"), HumanInput::Neutral);
+    // DCS reply to XTVERSION (`ESC[>q`) — `ESC P > | xterm(...) ESC \`.
+    assert_eq!(classify_human_input("\x1bP>|xterm(370)\x1b\\"), HumanInput::Neutral,
+        "a DCS version reply is a terminal answer, not typed input");
+    // Several batched into one write (xterm can coalesce replies) — still Neutral.
+    assert_eq!(
+        classify_human_input("\x1b]10;rgb:f0f6/f0f6/fcfc\x07\x1b]11;rgb:0d0d/1111/1717\x07"),
+        HumanInput::Neutral,
+    );
+    // A CSI DA/DSR reply was already Neutral — keep it that way.
+    assert_eq!(classify_human_input("\x1b[?64;1;2;6;9;15;18;21;22c"), HumanInput::Neutral);
+    assert_eq!(classify_human_input("\x1b[24;80R"), HumanInput::Neutral);
+
+    // Guardrail: a real typed line that merely *follows* a query reply in the same
+    // write must still register as Content — skipping the reply must not swallow
+    // the human's text after it.
+    assert_eq!(classify_human_input("\x1b]11;rgb:0d0d/1111/1717\x07hello"), HumanInput::Content,
+        "typed text after a query reply is still a human's unsubmitted line");
 }
 
 #[test]
@@ -2049,6 +2092,78 @@ fn start_is_rejected_up_front_when_the_group_is_paused() {
     let after = reg.start_task(&g.id, &t.id).unwrap();
     assert_eq!(after.status, "queued");
     assert!(after.notes.last().unwrap().text.contains("Started"), "resumed start records the nudge");
+}
+
+// ---------- #147: prototype status + proceed workflow ----------
+
+/// Count the notices the orchestrator would have received, observed as
+/// `prompt-suppressed-paused` audit entries (delivery is suppressed in a paused
+/// group, but the text is still recorded) whose text contains `needle`.
+fn suppressed_notices(reg: &OrchRegistry, group: &str, needle: &str) -> usize {
+    reg.audit_log(group)
+        .into_iter()
+        .filter(|e| {
+            e.action == "prompt-suppressed-paused"
+                && e.detail["text"].as_str().is_some_and(|s| s.contains(needle))
+        })
+        .count()
+}
+
+#[test]
+fn prototype_is_a_valid_status() {
+    // The board must accept `prototype` on a write — it's a first-class status,
+    // not a free-text label. (The frontend picker mirrors TASK_STATUSES.)
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let t = reg.upsert_task(&g.id, "orch-1", None, patch(Some("Demo the thing"), None, None)).unwrap();
+    let after = reg.upsert_task(&g.id, "orch-1", Some(&t.id), patch(None, Some("prototype"), None)).unwrap();
+    assert_eq!(after.status, "prototype");
+}
+
+#[test]
+fn proceed_flips_to_in_progress_audits_and_sends_one_notice() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    // An orchestrator must exist for the notice to have a target; pause the group
+    // so delivery is suppressed-but-audited (test mode has no pane to type into),
+    // letting us observe the exact notice — and prove there is exactly one.
+    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    reg.pause_group(&g.id).unwrap();
+
+    let t = reg.upsert_task(&g.id, "orch-1", None, patch(Some("Prototype the sidebar"), Some("prototype"), None)).unwrap();
+    // Proceed is the human's promote verdict: unlike Start it is NOT rejected by
+    // a paused group — the durable status flip carries the decision regardless.
+    let after = reg.proceed_task(&g.id, &t.id).unwrap();
+    assert_eq!(after.status, "in-progress", "proceed promotes the item back into active work");
+    let note = after.notes.last().unwrap();
+    assert_eq!(note.author, "human");
+    assert!(note.text.contains("Proceed"), "the promote decision must be auditable on the board");
+
+    // Exactly one PROCEED notice reaches the orchestrator — no spam.
+    assert_eq!(
+        suppressed_notices(&reg, &g.id, "PROCEED"), 1,
+        "proceed delivers exactly one orchestrator notice"
+    );
+}
+
+#[test]
+fn proceed_is_guarded_to_prototype_items() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let t = reg.upsert_task(&g.id, "orch-1", None, patch(Some("Ship it"), None, None)).unwrap();
+    // An unknown id is an error, not a silent no-op.
+    assert!(reg.proceed_task(&g.id, "t-999").is_err());
+    // Every non-prototype status must refuse, and refuse without mutating.
+    for status in ["queued", "in-progress", "review", "pr", "human-testing", "done", "blocked"] {
+        reg.upsert_task(&g.id, "orch-1", Some(&t.id), patch(None, Some(status), None)).unwrap();
+        let before = reg.tasks(&g.id)[0].notes.len();
+        assert!(reg.proceed_task(&g.id, &t.id).is_err(), "cannot proceed a {status} item");
+        assert_eq!(reg.tasks(&g.id)[0].status, status, "a refused proceed must not change status");
+        assert_eq!(reg.tasks(&g.id)[0].notes.len(), before, "a refused proceed must not leave a note");
+    }
+    // In prototype, it's allowed.
+    reg.upsert_task(&g.id, "orch-1", Some(&t.id), patch(None, Some("prototype"), None)).unwrap();
+    assert!(reg.proceed_task(&g.id, &t.id).is_ok(), "prototype is proceedable");
 }
 
 // ---------- review-round regression tests ----------
@@ -5047,7 +5162,14 @@ fn usage_json_write_is_atomic_and_leaves_no_temp() {
     let gdir = reg.state_root().join(&g.id);
     let path = gdir.join("usage.json");
     assert!(path.is_file(), "usage.json must exist after upsert");
-    assert!(!gdir.join("usage.json.tmp").is_file(), "temp file must be cleaned up");
+    // The atomic write renames its temp into place, so no `.tmp` scratch sibling
+    // is left behind (the temp name now carries a pid/seq suffix, so match the
+    // extension rather than a fixed name).
+    let leftover_tmp = fs::read_dir(&gdir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .any(|e| e.path().extension().is_some_and(|x| x == "tmp"));
+    assert!(!leftover_tmp, "temp file must be cleaned up");
     // Round-trips as valid JSON with the snapshot.
     let list: Vec<UsageSnapshot> =
         serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
@@ -5687,4 +5809,150 @@ fn sub_floor_submit_does_not_wedge_future_deliveries() {
     // The flag those submits leave (false) drives an immediate paste — no wedge.
     let out = hold_for_human_input(|| false, Duration::from_secs(60), HB_POLL);
     assert_eq!(out, PasteDecision::Paste { held_ms: 0 });
+}
+
+// ---------- #133: atomic durable writes ----------
+
+#[test]
+fn durable_writes_round_trip() {
+    // Happy path: the crash-safe temp+rename writers persist and read back
+    // unchanged, so making the writes atomic didn't alter their semantics.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    reg.upsert_task(&g.id, "orch", None, patch(Some("first"), None, None)).unwrap();
+    reg.upsert_task(&g.id, "orch", None, patch(Some("second"), None, None)).unwrap();
+    let titles: Vec<String> = reg.tasks(&g.id).iter().map(|t| t.title.clone()).collect();
+    assert_eq!(titles, vec!["first".to_string(), "second".to_string()]);
+    reg.set_state(&g.id, r#"{"cursor":7}"#).unwrap();
+    assert_eq!(reg.get_state(&g.id), r#"{"cursor":7}"#);
+}
+
+#[cfg(windows)]
+#[test]
+fn failed_task_write_leaves_board_intact() {
+    // #133: the incident — a disk-full write over tasks.json truncated it and
+    // wiped 13 live tasks. Fault-inject by making tasks.json read-only so the
+    // atomic rename-over AND the direct-write fallback both fail; the previous
+    // good board must survive, not come back empty.
+    //
+    // Windows-gated: rename-over-existing fails on a read-only *file* here — the
+    // OS the incident happened on. POSIX rename keys on directory write, not
+    // file perms, so this injection wouldn't bite there.
+    let (reg, d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let t1 = reg.upsert_task(&g.id, "orch", None, patch(Some("keep me"), None, None)).unwrap();
+    reg.upsert_task(&g.id, "orch", None, patch(Some("keep me too"), None, None)).unwrap();
+
+    let board = d.path().join(&g.id).join("tasks.json");
+    let before = fs::read_to_string(&board).unwrap();
+
+    let mut perms = fs::metadata(&board).unwrap().permissions();
+    perms.set_readonly(true);
+    fs::set_permissions(&board, perms).unwrap();
+
+    // A failed durable write must surface as an error, not silent data loss.
+    let res = reg.upsert_task(&g.id, "orch", Some(&t1.id), patch(None, Some("in-progress"), None));
+    assert!(res.is_err(), "a failed durable write must return Err, not swallow it");
+
+    // The last good board is byte-for-byte intact — the whole point of #133.
+    let after = fs::read_to_string(&board).unwrap();
+    assert_eq!(after, before, "the previous good tasks.json survived the failed write");
+    assert_eq!(reg.tasks(&g.id).len(), 2, "the board is not empty after a failed write");
+
+    // Restore write so the TempDir can be cleaned up.
+    let mut perms = fs::metadata(&board).unwrap().permissions();
+    perms.set_readonly(false);
+    fs::set_permissions(&board, perms).unwrap();
+}
+
+// ---------- #134: shared worktree target cache ----------
+
+#[test]
+fn worktree_cwd_maps_to_shared_target_dir() {
+    // #134: a pane whose cwd is a linked git worktree gets CARGO_TARGET_DIR at
+    // <main-repo-root>/.loomux-target (one shared build cache); a normal
+    // checkout gets None and keeps its own target/. Build the minimal
+    // git-worktree shape on disk and assert the mapping.
+    use loomux_lib::pty::shared_worktree_target_dir;
+    let root = tempfile::tempdir().unwrap();
+    let main = root.path().join("myrepo");
+    let wt_gitdir = main.join(".git").join("worktrees").join("feat");
+    fs::create_dir_all(&wt_gitdir).unwrap();
+    // git writes commondir as "../.." relative to the worktree's gitdir.
+    fs::write(wt_gitdir.join("commondir"), "../..\n").unwrap();
+
+    // The worktree checkout: a `.git` FILE pointing at its gitdir.
+    let wt = root.path().join("myrepo-worktrees").join("feat");
+    fs::create_dir_all(&wt).unwrap();
+    fs::write(wt.join(".git"), format!("gitdir: {}\n", wt_gitdir.display())).unwrap();
+
+    let target = shared_worktree_target_dir(&wt).expect("worktree cwd maps to a shared target");
+    assert_eq!(target, main.join(".loomux-target"));
+
+    // The main checkout (a real `.git` directory) is never redirected.
+    fs::create_dir_all(main.join(".git")).unwrap();
+    assert!(
+        shared_worktree_target_dir(&main).is_none(),
+        "the main checkout keeps its own target/"
+    );
+}
+
+// ---------- #134: low-disk backstop ----------
+
+#[test]
+fn low_disk_transition_latches_once_with_hysteresis() {
+    let (low, clear) = (5u64, 7u64);
+    // Above the floor, unarmed: quiet, stays unarmed.
+    assert_eq!(low_disk_transition(9, low, clear, false), (false, false));
+    // Cross below → arm and fire exactly this tick.
+    assert_eq!(low_disk_transition(4, low, clear, false), (true, true));
+    // Still low, already armed → latched, no re-fire (one per episode).
+    assert_eq!(low_disk_transition(4, low, clear, true), (true, false));
+    // Recovered a little but below the clear mark → stay latched (hysteresis).
+    assert_eq!(low_disk_transition(6, low, clear, true), (true, false));
+    // Recovered past the clear mark → reset the latch, no fire.
+    assert_eq!(low_disk_transition(7, low, clear, true), (false, false));
+    // ...and a fresh dip fires again.
+    assert_eq!(low_disk_transition(4, low, clear, false), (true, true));
+}
+
+#[test]
+fn low_disk_notice_reports_free_space() {
+    let n = low_disk_notice(3 * 1024 * 1024 * 1024 + 512 * 1024 * 1024); // 3.5 GB
+    assert!(n.contains("[loomux]"));
+    assert!(n.contains("3.5 GB"), "surfaces the free space so the orchestrator can judge urgency");
+    assert!(n.to_lowercase().contains("once per"), "promises one notice per episode");
+}
+
+#[test]
+fn disk_tick_notifies_once_per_episode_and_skips_paused() {
+    // #134: crossing below the free-space floor fires ONE audited low-disk
+    // notice per group; a second sub-threshold tick stays quiet until space
+    // recovers past the hysteresis mark; paused groups are skipped entirely.
+    let (reg, d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let low = 4 * 1024 * 1024 * 1024; // below LOW_DISK_BYTES (5 GB)
+    let recovered = 9 * 1024 * 1024 * 1024; // above LOW_DISK_CLEAR_BYTES (7 GB)
+
+    let count_low_disk = || {
+        fs::read_to_string(d.path().join(&g.id).join("audit.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| l.contains("low-disk"))
+            .count()
+    };
+
+    reg.disk_tick(low);
+    assert_eq!(count_low_disk(), 1, "the first dip fires exactly one notice");
+    reg.disk_tick(low);
+    assert_eq!(count_low_disk(), 1, "still low → latched, no second notice");
+    reg.disk_tick(recovered);
+    reg.disk_tick(low);
+    assert_eq!(count_low_disk(), 2, "recovery re-arms the latch for the next dip");
+
+    // A paused group is skipped: no low-disk audit accrues while paused.
+    reg.disk_tick(recovered); // clear the latch
+    reg.pause_group(&g.id).unwrap();
+    reg.disk_tick(low);
+    assert_eq!(count_low_disk(), 2, "a paused group is skipped, so no new notice");
 }

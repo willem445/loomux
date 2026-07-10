@@ -4,7 +4,14 @@
 // `npm test`.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { doneCount, retainExisting } from "../src/taskboard.ts";
+import {
+  canProceed,
+  doneCount,
+  isAwaitingHuman,
+  PROTOTYPE_STATUS,
+  retainExisting,
+  STATUSES,
+} from "../src/taskboard.ts";
 
 test("counts only tasks in the exact `done` status", () => {
   const tasks = [
@@ -53,4 +60,40 @@ test("retainExisting returns a fresh set, not the input", () => {
   const selected = new Set(["t-1"]);
   const live = retainExisting(selected, [{ id: "t-1" }]);
   assert.notEqual(live, selected);
+});
+
+// --- prototype status + proceed workflow (#147) ---
+
+test("prototype is offered in the status picker", () => {
+  // The picker must expose the status or the human can never park a demo item.
+  assert.ok(STATUSES.includes(PROTOTYPE_STATUS));
+});
+
+test("only a prototype is proceed-eligible (Proceed button gate)", () => {
+  assert.equal(canProceed("prototype"), true);
+  // Every other status the board knows about must NOT show Proceed.
+  for (const s of STATUSES) {
+    if (s === "prototype") continue;
+    assert.equal(canProceed(s), false, `${s} must not be proceed-eligible`);
+  }
+});
+
+test("proceed-eligibility does not match look-alike statuses", () => {
+  // Guards against a substring/loose match sweeping up near-misses.
+  assert.equal(canProceed("prototyped"), false);
+  assert.equal(canProceed("proto"), false);
+  assert.equal(canProceed(""), false);
+});
+
+test("a prototype is highlighted as awaiting the human", () => {
+  // Prototype joins the merge gates and blocked as human-gated attention.
+  assert.equal(isAwaitingHuman("prototype"), true);
+  assert.equal(isAwaitingHuman("pr"), true);
+  assert.equal(isAwaitingHuman("human-testing"), true);
+  assert.equal(isAwaitingHuman("blocked"), true);
+  // Statuses the human doesn't gate stay un-highlighted.
+  assert.equal(isAwaitingHuman("queued"), false);
+  assert.equal(isAwaitingHuman("in-progress"), false);
+  assert.equal(isAwaitingHuman("review"), false);
+  assert.equal(isAwaitingHuman("done"), false);
 });

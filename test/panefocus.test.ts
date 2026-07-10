@@ -7,7 +7,11 @@
 // rule; grid.ts's DOM wiring is validated by hand. Run with `npm test`.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { shouldFocusNewPane, shouldRestoreFocus } from "../src/panefocus.ts";
+import {
+  shouldFocusNewPane,
+  shouldRestoreFocus,
+  shouldPreserveMaximize,
+} from "../src/panefocus.ts";
 
 test("a human-initiated pane on a populated grid takes focus", () => {
   // Split button, launcher fleet, session restore, launching an orchestrator.
@@ -60,4 +64,32 @@ test("don't restore focus to an element the relayout removed", () => {
   // The prior element left the document mid-open (e.g. its pane closed) — there's
   // no live node to focus; guarding avoids a focus() on a detached element.
   assert.equal(shouldRestoreFocus(false, true, false), false);
+});
+
+// --- preserve-maximize decision (issue #155) ---
+// The bug: with a pane maximized, an orchestrator-driven spawn collapsed the
+// fullscreen view because openPane exits maximize before growing the split tree.
+// A background spawn must keep the human's fullscreen; a human open still exits
+// it (they asked for a pane and want to see the layout). This pins that rule;
+// grid.ts's lift/re-lift DOM wiring is validated by hand.
+
+test("a background spawn while maximized preserves fullscreen", () => {
+  // The regression: the human is watching one pane full-screen and an agent
+  // spawns — the view must stay maximized (new pane grows the tree underneath).
+  assert.equal(shouldPreserveMaximize(false, true), true);
+});
+
+test("a human-initiated open while maximized exits fullscreen (unchanged)", () => {
+  // The human asked for a pane (split/launcher) — show them the layout it
+  // landed in, as before.
+  assert.equal(shouldPreserveMaximize(true, true), false);
+});
+
+test("a background spawn with nothing maximized has no fullscreen to preserve", () => {
+  // Normal grid — the #117 focus path applies; nothing to keep maximized.
+  assert.equal(shouldPreserveMaximize(false, false), false);
+});
+
+test("a human open with nothing maximized has no fullscreen to preserve", () => {
+  assert.equal(shouldPreserveMaximize(true, false), false);
 });

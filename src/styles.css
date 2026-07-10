@@ -72,18 +72,199 @@ html, body {
 
 /* ---------- workspace ---------- */
 #workspace { display: flex; flex: 1; min-height: 0; }
-/* The grid and its minimize dock stack vertically; the grid takes all the
-   room and the dock is a thin strip that only appears when non-empty. */
+/* The tab bar, then a stack of per-tab workspaces, fill the grid area. */
 #grid-area { flex: 1; min-width: 0; display: flex; flex-direction: column; }
-/* position: relative anchors a maximized pane's absolute overlay to the grid
+/* The workspace stack holds one .workspace per tab; only the active one is
+   shown (the rest are display:none — zero-width panes, no PTY resize, #63). */
+#workspace-stack { flex: 1; min-width: 0; min-height: 0; display: flex; }
+/* Each tab's workspace: its grid + dock stack vertically, filling the stack. */
+.workspace { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+/* The grid takes all the room; the dock is a thin strip shown only when non-empty.
+   position: relative anchors a maximized pane's absolute overlay to the grid
    content area (inside the 8px padding). */
-#grid-root { flex: 1; min-width: 0; min-height: 0; display: flex; padding: 8px; position: relative; }
+.grid-root { flex: 1; min-width: 0; min-height: 0; display: flex; padding: 8px; position: relative; }
+
+/* ---------- project tabs (#63) ---------- */
+#tab-bar {
+  flex: none; display: flex; align-items: stretch; gap: 4px;
+  padding: 4px 8px 0 8px;
+  background: linear-gradient(180deg, #16161e, var(--panel));
+  border-bottom: 1px solid var(--border);
+  overflow-x: auto;
+}
+#tab-bar::-webkit-scrollbar { display: none; }
+.tab {
+  flex: none; display: inline-flex; align-items: center; gap: 7px;
+  max-width: 220px;
+  padding: 5px 8px 6px 8px;
+  font-size: 12px; color: var(--text-dim); cursor: pointer;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-bottom: none;
+  border-radius: 8px 8px 0 0;
+  border-top: 2px solid transparent;
+  transition: color 0.15s var(--ease), background 0.15s var(--ease);
+}
+.tab:hover { color: var(--text); background: #232330; }
+.tab.active {
+  color: var(--text);
+  background: var(--bg-term);
+  /* The colored top edge is the tab's accent (falls back to --accent). */
+  border-top-color: var(--tab-color, var(--accent));
+}
+.tab-swatch {
+  flex: none; width: 10px; height: 10px; padding: 0; border-radius: 50%;
+  border: 1px solid var(--border);
+  background: var(--tab-color, var(--accent-dim));
+  cursor: pointer;
+}
+.tab.colored .tab-swatch { border-color: var(--tab-color); }
+.tab-name {
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+/* Live status chip (#63 phase 4): agent count + cost for a group-bound tab. */
+.tab-status {
+  flex: none; font-size: 10.5px; color: var(--text-dim);
+  padding: 0 4px; border-radius: 4px; background: rgba(255, 255, 255, 0.04);
+}
+.tab.active .tab-status { color: var(--text); }
+.tab-paused { flex: none; font-size: 10px; color: #e0af68; }
+
+/* Attention (#63, finding 1): an unmistakable alert on a tab whose (maybe
+   hidden) pane needs the human — a colored, pulsing chip showing the SAME label
+   as the pane header (attention.ts), plus a tinted tab background + top edge so
+   the whole tab reads as "alert" at a glance. Amber default, red for the urgent
+   `blocked` class — mirrors the pane/dock chips. */
+.tab.needs-attention {
+  color: #f2c66a; border-top-color: #e0af68;
+  background: rgba(224, 175, 104, 0.1);
+  animation: tab-attn-pulse 1.6s ease-in-out infinite;
+}
+.tab.needs-attention.urgent {
+  color: #ff9db0; border-top-color: #f7768e;
+  background: rgba(247, 118, 142, 0.12);
+  animation-name: tab-attn-pulse-urgent;
+}
+/* The alert chip itself — same look as the pane header's .pane-attn. */
+.tab-attn {
+  flex: none; font-size: 9px; font-weight: 700; letter-spacing: 0.4px;
+  border: 1px solid #6a5230; border-radius: 4px; padding: 1.5px 6px;
+  color: #f2c66a; background: rgba(224, 175, 104, 0.16); white-space: nowrap;
+}
+.tab-attn[data-reason="blocked"] {
+  color: #ff9db0; background: rgba(247, 118, 142, 0.18); border-color: rgba(247, 118, 142, 0.5);
+}
+@keyframes tab-attn-pulse {
+  0%, 100% { box-shadow: inset 0 -2px 0 0 rgba(224, 175, 104, 0.5), 0 0 0 0 transparent; }
+  50% { box-shadow: inset 0 -2px 0 0 rgba(224, 175, 104, 0.9), 0 0 12px 1px rgba(224, 175, 104, 0.45); }
+}
+@keyframes tab-attn-pulse-urgent {
+  0%, 100% { box-shadow: inset 0 -2px 0 0 rgba(247, 118, 142, 0.55), 0 0 0 0 transparent; }
+  50% { box-shadow: inset 0 -2px 0 0 rgba(247, 118, 142, 1), 0 0 14px 1px rgba(247, 118, 142, 0.55); }
+}
+@media (prefers-reduced-motion: reduce) { .tab.needs-attention { animation: none; } }
+
+/* Right-click context menu (#63 phase 5): pause/resume/rename/close. */
+.tab-menu {
+  position: fixed; z-index: 90; min-width: 150px;
+  display: flex; flex-direction: column; padding: 4px;
+  background: var(--panel-2); border: 1px solid var(--border);
+  border-radius: 8px; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+}
+.tab-menu-item {
+  text-align: left; font: inherit; font-size: 12px; color: var(--text);
+  background: transparent; border: none; border-radius: 5px;
+  padding: 6px 9px; cursor: pointer;
+}
+.tab-menu-item:hover { background: var(--panel); }
+.tab-menu-item.danger:hover { color: var(--danger); }
+
+/* Live hover thumbnail (#63 findings 2/3): a composite of the whole tab — every
+   pane serialized (color + spacing preserved) and arranged like the split tree,
+   all panes at one shared median scale (TabBar.scaleComposite / compositeScale)
+   so text size is consistent; oversized outliers crop to their cell. */
+.tab-preview {
+  position: fixed; z-index: 85; overflow: hidden; padding: 8px;
+  border-radius: 8px; background: #0a0a0e; border: 1px solid var(--border);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.6);
+  pointer-events: none;
+}
+.mini-split { display: flex; gap: 3px; min-width: 0; min-height: 0; }
+.mini-split.row { flex-direction: row; }
+.mini-split.column { flex-direction: column; }
+.mini-pane {
+  display: flex; flex-direction: column; min-width: 0; min-height: 0;
+  overflow: hidden; border: 1px solid var(--border-soft); border-radius: 4px;
+  background: var(--bg-term);
+}
+.mini-pane-title {
+  flex: none; font-size: 10px; line-height: 1.5; padding: 0 6px;
+  color: var(--text-dim); background: var(--panel-2);
+  border-bottom: 1px solid var(--border-soft);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.mini-pane-body { flex: 1; min-height: 0; position: relative; overflow: hidden; }
+.mini-pane-scaler { position: absolute; top: 3px; left: 5px; transform-origin: top left; }
+.mini-pane-note { color: var(--text-dim); font-size: 11px; font-style: italic; padding: 6px; }
+.mini-term {
+  font-family: "Cascadia Code", "Consolas", ui-monospace, monospace;
+  font-size: 13px; line-height: 1.2; color: var(--text);
+}
+.mini-term-row { white-space: pre; }
+.tab-name-input {
+  font: inherit; font-size: 12px; color: var(--text);
+  background: var(--bg-app); border: 1px solid var(--accent-dim);
+  border-radius: 4px; padding: 0 4px; width: 120px; outline: none;
+}
+.tab-close {
+  flex: none; display: inline-flex; align-items: center; justify-content: center;
+  width: 16px; height: 16px; padding: 0; border: none; border-radius: 4px;
+  background: transparent; color: var(--text-dim); font-size: 10px; cursor: pointer;
+}
+.tab-close:hover { background: var(--panel); color: var(--danger); }
+/* Armed for the two-step confirm on a destructive (group-owning) tab close —
+   the "✕?" affordance, matching the group view's armed End button. */
+.tab-close.confirm {
+  width: auto; padding: 0 5px; background: var(--danger); color: #1a1a22; font-weight: 700;
+}
+.tab-add {
+  flex: none; align-self: center; margin-left: 2px;
+  width: 24px; height: 24px; padding: 0; border-radius: 6px;
+  background: transparent; border: 1px solid var(--border);
+  color: var(--text-dim); font-size: 15px; line-height: 1; cursor: pointer;
+}
+.tab-add:hover { color: var(--text); border-color: var(--accent-dim); background: var(--panel-2); }
+
+/* Color palette popover, anchored under a tab's swatch. */
+.tab-palette {
+  position: fixed; z-index: 80;
+  display: flex; align-items: center; gap: 6px;
+  padding: 8px; border-radius: 8px;
+  background: var(--panel-2); border: 1px solid var(--border);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+}
+.tab-palette-dot {
+  width: 18px; height: 18px; padding: 0; border-radius: 50%;
+  border: 1px solid var(--border); cursor: pointer;
+}
+.tab-palette-dot:hover { transform: scale(1.12); }
+.tab-palette-custom {
+  width: 24px; height: 24px; padding: 0; border: 1px solid var(--border);
+  border-radius: 4px; background: none; cursor: pointer;
+}
+.tab-palette-clear {
+  font: inherit; font-size: 11px; color: var(--text-dim); cursor: pointer;
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: 5px; padding: 3px 8px;
+}
+.tab-palette-clear:hover { color: var(--text); }
 
 /* ---------- maximize ---------- */
-/* The maximized pane is lifted to a top layer directly under #grid-root and
+/* The maximized pane is lifted to a top layer directly under .grid-root and
    covers the content area; the rest of the split tree is hidden so its panes
    report zero size and skip their PTY fits (see Grid.toggleMaximize). */
-#grid-root.has-maximized > :not(.maximized) { display: none; }
+.grid-root.has-maximized > :not(.maximized) { display: none; }
 .pane.maximized {
   position: absolute;
   inset: 0;
@@ -128,7 +309,7 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 }
 
 /* ---------- minimize dock ---------- */
-#pane-dock {
+.pane-dock {
   flex: none;
   display: flex; align-items: center; gap: 8px;
   padding: 6px 10px;
@@ -136,7 +317,7 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   border-top: 1px solid var(--border);
   overflow-x: auto;
 }
-#pane-dock[hidden] { display: none; }
+.pane-dock[hidden] { display: none; }
 .dock-label {
   flex: none; font-size: 10px; text-transform: uppercase; letter-spacing: 1px;
   color: var(--text-dim); margin-right: 2px;
@@ -1139,6 +1320,9 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .task-status.st-in-progress { background: rgba(122, 162, 247, 0.16); color: #a7bff8; }
 .task-status.st-review { background: rgba(187, 154, 247, 0.16); color: #c7a9ff; }
 .task-status.st-pr { background: rgba(224, 175, 104, 0.16); color: #e0af68; }
+/* Prototype (#147): a distinct magenta so a demo-gated draft reads apart from
+   the merge-gate cyan and the terminal green. */
+.task-status.st-prototype { background: rgba(255, 122, 214, 0.16); color: #ff9edb; }
 .task-status.st-human-testing { background: rgba(125, 207, 255, 0.16); color: #7dcfff; }
 .task-status.st-done { background: rgba(158, 206, 106, 0.16); color: #b4e878; }
 .task-status.st-blocked { background: rgba(247, 118, 142, 0.16); color: #f7899d; }
@@ -1160,7 +1344,7 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 
 /* Merge-gate action buttons (approve / request changes) and the queued-task
    start button share the same compact pill shape. */
-.task-btn.approve, .task-btn.changes, .task-btn.start {
+.task-btn.approve, .task-btn.changes, .task-btn.start, .task-btn.proceed {
   flex: none; height: 18px; font-size: 10px; padding: 0 7px;
   border: 1px solid transparent; white-space: nowrap;
 }
@@ -1170,6 +1354,9 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .task-btn.changes:hover { background: rgba(224, 175, 104, 0.16); border-color: #55452c; }
 .task-btn.start { color: #7dcfff; }
 .task-btn.start:hover { background: rgba(125, 207, 255, 0.16); border-color: #2c485a; }
+/* Proceed (#147): magenta, matching the prototype chip it acts on. */
+.task-btn.proceed { color: #ff9edb; }
+.task-btn.proceed:hover { background: rgba(255, 122, 214, 0.16); border-color: #5a2c4c; }
 
 /* Request-changes modal, scoped inside the task-board overlay. */
 .tasks-dialog {
@@ -1735,4 +1922,204 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .git-meta-line.hash {
   font-family: "Cascadia Mono", Consolas, monospace; font-size: 10.5px;
   user-select: text;
+}
+
+/* ============================================================================
+   File-editor overlay (#174): lazy file tree + code editor + search/replace.
+   Floats over the terminal exactly like .git-overlay — the PTY is never
+   resized. Reuses .git-overlay for the floating container; these rules style
+   the inner .fileedit surface. The search box sits ABOVE the tree and drives
+   in-tree hit highlighting (VS-Code-like). Built from the :root palette.
+   ========================================================================== */
+.fileedit {
+  flex: 1; min-height: 0; min-width: 0;
+  display: flex; flex-direction: column;
+  background: var(--bg-app);
+  font-size: 13px;
+  outline: none;
+}
+.fileedit[hidden] { display: none; }
+
+.fileedit-head {
+  flex: none; display: flex; align-items: center; gap: 6px;
+  padding: 5px 7px; border-bottom: 1px solid var(--border);
+  background: var(--panel);
+}
+.fileedit-root { display: flex; align-items: center; gap: 3px; min-width: 0; }
+.fileedit-root-path {
+  color: var(--text-dim); max-width: 240px; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap;
+  font-family: "Cascadia Mono", Consolas, monospace; font-size: 12px;
+}
+.fileedit-spacer { flex: 1 1 auto; }
+.fileedit-file {
+  color: var(--text); max-width: 340px; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; direction: rtl; text-align: left;
+  font-family: "Cascadia Mono", Consolas, monospace; font-size: 12px;
+}
+.fileedit-dirty { color: var(--accent); font-size: 15px; line-height: 1; }
+.fileedit-dirty[hidden] { display: none; }
+
+.fileedit-save {
+  border: 1px solid var(--border); background: var(--panel-2); color: var(--text);
+  font: inherit; padding: 3px 12px; border-radius: 5px; cursor: pointer;
+  white-space: nowrap; /* never wrap "Replace" onto a second line */
+}
+.fileedit-save:hover:not(:disabled) { background: var(--accent); color: #10131f; border-color: var(--accent); }
+.fileedit-save:disabled { opacity: 0.45; cursor: default; }
+/* In-file find trigger — bigger than a pane icon button, clearly labelled. */
+.fileedit-find { padding: 3px 12px; font-size: 13px; }
+
+.fileedit-banner {
+  flex: none; padding: 4px 10px; font-size: 12px;
+  color: #f0c674; background: rgba(240, 198, 116, 0.10);
+  border-bottom: 1px solid var(--border);
+}
+.fileedit-banner[hidden] { display: none; }
+
+.fileedit-body { flex: 1 1 0; min-height: 0; display: flex; flex-direction: row; }
+
+/* Left column: search form (fixed) atop a scrolling tree. Width is set inline
+   from localStorage; the vertical divider only redistributes this inner flex
+   row — the overlay box (and PTY) never change size. */
+.fileedit-tree-pane {
+  flex: none; min-width: 0; overflow: hidden;
+  display: flex; flex-direction: column;
+  border-right: 1px solid var(--border); background: var(--panel);
+}
+
+.fileedit-vdivider {
+  flex: none; width: 5px; cursor: col-resize; align-self: stretch;
+  background: var(--border-soft); transition: background 0.15s var(--ease);
+}
+.fileedit-vdivider:hover, .fileedit-vdivider.dragging { background: var(--accent-dim); }
+
+/* Search form, docked at the top of the left column. */
+.fileedit-search-form {
+  flex: none; display: flex; flex-direction: column; gap: 6px;
+  padding: 8px; border-bottom: 1px solid var(--border); background: var(--panel);
+}
+.fileedit-search-row { display: flex; align-items: center; gap: 6px; }
+/* The Replace button keeps its width — the input flexes, the button never
+   shrinks or wraps its label. */
+.fileedit-search-row .fileedit-save { flex: none; }
+.fileedit-search-input {
+  flex: 1 1 auto; min-width: 0;
+  background: var(--panel-2); border: 1px solid var(--border); color: var(--text);
+  font-family: "Cascadia Mono", Consolas, monospace; font-size: 13px;
+  padding: 5px 9px; border-radius: 5px;
+}
+.fileedit-search-input:focus { outline: none; border-color: var(--accent-dim); }
+.fileedit-search-input::placeholder { color: var(--text-dim); }
+.fileedit-search-opts { display: flex; align-items: center; gap: 14px; color: var(--text-dim); font-size: 12px; }
+.fileedit-search-opts label { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; }
+.fileedit-search-summary { margin-left: auto; color: var(--text-dim); font-size: 12px; }
+.fileedit-search-summary.truncated { color: #f0c674; }
+
+/* Tree list — fills the remaining height and scrolls. */
+.fileedit-tree { flex: 1 1 0; min-height: 0; overflow: auto; padding: 4px 0; user-select: none; }
+.fileedit-row {
+  display: flex; align-items: center; gap: 6px;
+  padding: 3px 8px; cursor: pointer; white-space: nowrap;
+  color: var(--text);
+}
+.fileedit-row:hover { background: var(--panel-2); }
+.fileedit-row.open { background: var(--accent-glow); }
+.fileedit-row.symlink .fileedit-name { color: var(--text-dim); font-style: italic; }
+.fileedit-icon { flex: none; display: inline-flex; color: var(--text-dim); }
+.fileedit-row.open .fileedit-icon { color: var(--accent); }
+.fileedit-name { overflow: hidden; text-overflow: ellipsis; }
+
+/* Search-hit highlight + per-file count badge in the tree. */
+.fileedit-row.hit .fileedit-name { color: var(--accent); font-weight: 600; }
+.fileedit-row.hit-off .fileedit-name { color: var(--text-dim); font-weight: 400; }
+.fileedit-hit-badge {
+  flex: none; margin-left: auto;
+  background: var(--accent); color: #10131f;
+  font-size: 11px; font-weight: 600; line-height: 1;
+  padding: 1px 6px; border-radius: 9px; cursor: pointer;
+}
+.fileedit-hit-badge.off { background: var(--panel-2); color: var(--text-dim); }
+
+/* Editor pane (right). */
+.fileedit-editor-pane { flex: 1 1 0; min-width: 0; position: relative; display: flex; }
+.fileedit-editor-host { flex: 1 1 0; min-width: 0; overflow: hidden; }
+.fileedit-editor-host[hidden] { display: none; }
+.fileedit-editor-host .cm-editor { height: 100%; position: relative; }
+/* In-file find as a VS-Code-style FLOATING overlay, top-right, over the editor —
+   not a bar docked at the bottom (search({top:true}) puts it in .cm-panels-top;
+   absolute-positioning lifts it out of flow so it floats instead of pushing the
+   content down). */
+.fileedit-editor-host .cm-panels.cm-panels-top {
+  position: absolute; top: 6px; right: 6px; left: auto;
+  z-index: 20;
+  /* Firm, compact width so the widget stays a small floating card top-right
+     (VS-Code-like) with code visible beside/under it — NOT a full-width bar.
+     `width: auto` shrink-wrapped to the controls' wide natural width (up to the
+     old 100% cap), which is what let it span the whole editor. */
+  width: 340px; max-width: calc(100% - 12px);
+  border: 1px solid var(--border); border-radius: 7px;
+  background: var(--panel-2); color: var(--text);
+  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.5);
+}
+/* Custom in-file find widget (createPanel): a compact two-row inline-icon
+   find/replace card — VS-Code-inspired SHAPE, but our own colours/borders/fonts
+   and text-glyph toggles (Aa / W / .* / arrows), not VS Code's icons. Row 1 =
+   find input + toggles + n-of-m count + prev/next + close; row 2 = replace input
+   + replace / replace-all. Fixed rows (no wrapping button stacks). */
+.fileedit-editor-host .cm-panel.fileedit-find-widget {
+  padding: 6px; display: flex; flex-direction: column; gap: 5px;
+  font-family: inherit; color: var(--text);
+}
+.fileedit-find-row { display: flex; align-items: center; gap: 4px; }
+.fileedit-find-input {
+  flex: 1 1 auto; min-width: 0;
+  background: var(--panel); border: 1px solid var(--border); color: var(--text);
+  font-family: "Cascadia Mono", Consolas, monospace; font-size: 13px;
+  padding: 4px 8px; border-radius: 5px;
+}
+.fileedit-find-input:focus { outline: none; border-color: var(--accent-dim); }
+.fileedit-find-input::placeholder { color: var(--text-dim); }
+/* Inline toggle buttons (match case / whole word / regex) with a clear active
+   state; glyphs are text so they inherit the theme and aren't VS Code's icons. */
+.fileedit-find-toggle,
+.fileedit-find-icon {
+  flex: none; width: 24px; height: 24px; padding: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: transparent; border: 1px solid transparent; border-radius: 4px;
+  color: var(--text-dim); cursor: pointer;
+}
+.fileedit-find-toggle { font-size: 11px; font-weight: 600; }
+.fileedit-find-icon { font-size: 13px; }
+.fileedit-find-toggle:hover, .fileedit-find-icon:hover { background: var(--panel); color: var(--text); }
+.fileedit-find-icon:hover { background: var(--accent); color: #10131f; border-color: var(--accent); }
+.fileedit-find-toggle.on {
+  background: var(--accent-glow); border-color: var(--accent-dim); color: var(--accent);
+}
+.fileedit-find-count {
+  flex: none; min-width: 48px; text-align: right; padding-right: 2px;
+  color: var(--text-dim); font-size: 11px; white-space: nowrap;
+}
+
+/* Occurrence highlighting inside the open file. The workspace query is painted
+   by our always-on ViewPlugin (.cm-wsMatch — renders with the find panel closed,
+   which .cm-searchMatch does NOT); the in-file find panel paints .cm-searchMatch.
+   Both use the same accent so the two searches look identical (demo feedback). */
+.fileedit-editor-host .cm-wsMatch,
+.fileedit-editor-host .cm-searchMatch { background: rgba(122, 162, 247, 0.30); border-radius: 2px; }
+.fileedit-editor-host .cm-searchMatch-selected { background: rgba(122, 162, 247, 0.60); }
+.fileedit-empty {
+  margin: auto; color: var(--text-dim); font-size: 13px; padding: 20px; text-align: center;
+}
+.fileedit-empty[hidden] { display: none; }
+
+/* Textarea fallback (used only if CodeMirror fails to load). A modern IDE
+   monospace stack — no bundled font files. */
+.fileedit-ta-wrap { flex: 1 1 0; min-width: 0; display: flex; }
+.fileedit-textarea {
+  flex: 1 1 0; resize: none; border: none; outline: none;
+  background: var(--bg-app); color: var(--text);
+  font-family: "Cascadia Code", "JetBrains Mono", "Fira Code", "Cascadia Mono", Consolas, ui-monospace, monospace;
+  font-size: 13px; line-height: 1.55;
+  padding: 6px 8px; white-space: pre; tab-size: 2;
 }
