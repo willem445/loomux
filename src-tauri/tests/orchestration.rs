@@ -4171,6 +4171,395 @@ fn gh_shim_shell_harness_executes_the_gate() {
 }
 
 #[test]
+fn gh_shim_script_gates_raw_api_release_shapes() {
+    // #196: the raw `gh api`/graphql release surface must route through the SAME
+    // single release-gate decision as `gh release …` — pinned in the shim text.
+    let sh = gh_shim_sh("C:/Program Files/GitHub CLI/gh.exe");
+    assert!(sh.contains("loomux_release_gate"), "a single shared release-gate function (no parallel checker)");
+    assert!(sh.contains("git/refs/tags/"), "catches a v* tag-ref create/move via api");
+    assert!(sh.contains("releases/*"), "catches the releases endpoint by URL segment");
+    // #196 r3: gate the git refs/tags plumbing by URL PATH + method (ref may hide in a
+    // --input body / a header / a jq filter), not by substring-anywhere; the branch
+    // exemption keys on the parsed ref LOCUS (path or ref= field), never a decoy token.
+    assert!(sh.contains("git/refs") && sh.contains("git/tags"), "gates the git refs/tags plumbing writes by URL");
+    assert!(sh.contains("path_low") && sh.contains("a_ref"), "decides by parsed URL path + ref field (locus), not raw argv");
+    assert!(sh.contains("*/refs/heads/*") && sh.contains("refs/heads/*"), "branch exemption keys on the ref locus, not any argv token");
+    assert!(sh.contains("a_qopaque") && sh.contains("a_inputval"), "opaque graphql (--input/@file) fails safe to the gate");
+    // #196 r4: graphql endpoint recognized by SUFFIX (graphql | /graphql | */graphql).
+    assert!(sh.contains("*/graphql"), "recognizes the graphql endpoint by suffix (/graphql, full-URL)");
+    assert!(sh.contains("createrelease") && sh.contains("updaterelease") && sh.contains("deleterelease"),
+        "catches graphql create/update/delete Release mutations");
+    assert!(sh.contains("createref") && sh.contains("updateref") && sh.contains("deleteref"),
+        "catches graphql create/update/DELETE Ref tag mutations (full create+move+delete coverage)");
+    // #196 r6: the graphql arm gates every ref/tag/release-creating mutation with NO
+    // "prove-it's-safe-from-the-text" logic (variables/comments/aliases/escapes each
+    // defeat a text heuristic). No vestige of the removed heads-exemption may remain.
+    assert!(!sh.contains("hpass"), "the decoy-able graphql heads-exemption must be fully removed");
+    assert!(!sh.contains("*'$'*"), "no residual `$`-variable text heuristic in the graphql arm");
+    // The api path is audited as a release-gate event (same markers as the subcommand).
+    assert!(sh.contains("release-gate-allowed") && sh.contains("release-gate-blocked"),
+        "api release allows/blocks are audited as release-gate events");
+    assert!(!sh.contains("\r"), "POSIX shim must stay LF-only (a CRLF #!/bin/sh is broken)");
+}
+
+#[test]
+fn gh_shim_harness_gates_raw_api_release_and_tag_ref_shapes() {
+    // The #196 hole, executed: raw `gh api` / graphql release shapes bypassed the
+    // release gate entirely (they EXECUTED with no marker/grant → release.yml → npm).
+    // This runs the real shim against each shape and pins BLOCK/ALLOW parity with the
+    // `gh release …` path. Mirrors gh_shim_harness_grant_authorizes_one_merge….
+    use std::process::Command;
+    if Command::new("sh").arg("-c").arg("exit 0").status().map(|s| !s.success()).unwrap_or(true) {
+        eprintln!("SKIP gh_shim_harness_api_release…: no POSIX sh");
+        return;
+    }
+    let td = tempfile::tempdir().unwrap();
+    let root = td.path();
+    let group = root.join("group");
+    std::fs::create_dir_all(&group).unwrap();
+    let log = root.join("gh.log");
+    let fake = write_fake_gh(root, &log);
+    let shim = root.join("gh");
+    std::fs::write(&shim, gh_shim_sh(&fake.display().to_string())).unwrap();
+    let _ = Command::new("sh").arg("-c").arg(format!("chmod +x '{}' '{}'", fake.display(), shim.display())).status();
+
+    let run = |argv: &[&str]| -> bool {
+        Command::new("sh").arg(&shim).args(argv)
+            .env("LOOMUX_GROUP_DIR", &group)
+            .status().unwrap().success()
+    };
+    let write_grant = |name: &str| {
+        let d = group.join("release_grants");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join(name), b"99999999999\n1\n").unwrap(); // far-future expiry
+    };
+    let set = |name: &str| { std::fs::write(group.join(name), b"").unwrap(); };
+    let clear = |name: &str| { let _ = std::fs::remove_file(group.join(name)); };
+    let audit = || std::fs::read_to_string(group.join("audit.jsonl")).unwrap_or_default();
+    let clear_audit = || { std::fs::write(group.join("audit.jsonl"), b"").unwrap(); };
+
+    // The four release-publishing api/graphql shapes the gate must catch. Each keys a
+    // resolvable tag v9 EXCEPT delete (by release id — not cheaply resolvable).
+    let post_tag_ref: &[&str] = &["api", "-X", "POST", "repos/o/r/git/refs", "-f", "ref=refs/tags/v9", "-f", "sha=deadbeef"];
+    let post_release: &[&str] = &["api", "-X", "POST", "repos/o/r/releases", "-f", "tag_name=v9", "-f", "name=v9"];
+    let delete_release: &[&str] = &["api", "-X", "DELETE", "repos/o/r/releases/1234"];
+    // NOTE the spaces in the query: they force Rust's Command to pass it as a single
+    // quoted Windows token, so MSYS `sh` reconstructs one argv element (a brace-dense
+    // unspaced arg gets truncated at the first `{` crossing the Rust→MSYS boundary —
+    // a test-harness quoting artifact, not a shim behavior). Real agents type this in
+    // Git Bash, which parses it natively.
+    let gql_create: &[&str] = &["api", "graphql", "-f", "query=mutation { createRelease(input: { tagName: \"v9\" }) { release { id } } }"];
+    let resolvable: [&[&str]; 3] = [post_tag_ref, post_release, gql_create];
+    let all_shapes: [&[&str]; 4] = [post_tag_ref, post_release, delete_release, gql_create];
+
+    // 1) No markers, no grant → every shape BLOCKED (fail-safe, the bug's fix).
+    for shape in all_shapes {
+        assert!(!run(shape), "raw api release shape must be blocked with no markers: {shape:?}");
+    }
+    // A NON-release api call passes through untouched — even a write to another
+    // endpoint, and read-only release GETs (list/view).
+    assert!(run(&["api", "-X", "POST", "repos/o/r/issues", "-f", "title=hi"]), "non-release api write must pass through");
+    assert!(run(&["api", "repos/o/r/releases"]), "read-only releases list (GET) must pass through");
+    assert!(run(&["api", "repos/o/r/releases/latest"]), "read-only release view (GET) must pass through");
+
+    // 2) autonomous + auto_release → blanket ALLOW for each shape (allowed marker).
+    set("autonomous"); set("auto_release");
+    for shape in all_shapes {
+        clear_audit();
+        assert!(run(shape), "autonomous+auto_release must allow: {shape:?}");
+        assert!(audit().contains("release-gate-allowed"), "allowed marker for {shape:?}, got: {}", audit());
+    }
+    clear("autonomous"); clear("auto_release");
+
+    // 3) supervised dangerous mode (human present, not autonomous) → ALLOW (dangerous marker).
+    set("dangerous_mode");
+    for shape in all_shapes {
+        clear_audit();
+        assert!(run(shape), "dangerous mode must allow: {shape:?}");
+        assert!(audit().contains("release-gate-dangerous"), "dangerous marker for {shape:?}, got: {}", audit());
+    }
+    // dangerous is a NO-OP while autonomous → blocked again.
+    set("autonomous");
+    assert!(!run(post_release), "dangerous ignored while autonomous → api release blocked");
+    clear("autonomous"); clear("dangerous_mode");
+
+    // 4) A matching per-tag grant authorizes exactly one publish of the resolvable-tag
+    //    shapes (tag resolved from the api fields), then is consumed.
+    for shape in resolvable {
+        clear_audit();
+        write_grant("v9");
+        assert!(run(shape), "grant for v9 must allow: {shape:?}");
+        assert!(audit().contains("release-gate-granted"), "granted marker for {shape:?}, got: {}", audit());
+        assert!(!group.join("release_grants/v9").exists(), "grant consumed for {shape:?}");
+        assert!(!run(shape), "consumed grant → second publish blocked: {shape:?}");
+    }
+    // A grant for the wrong tag cannot authorize another tag.
+    write_grant("v9");
+    assert!(!run(&["api", "-X", "POST", "repos/o/r/releases", "-f", "tag_name=v8"]), "a v9 grant cannot publish v8");
+
+    // 5) DELETE-by-id has no cheaply-resolvable tag → a per-tag grant can't help;
+    //    only the blanket markers (above) allow it. With just a grant present, blocked.
+    let _ = std::fs::remove_dir_all(group.join("release_grants"));
+    write_grant("v9");
+    assert!(!run(delete_release), "DELETE-by-id is not grant-keyable → blocked");
+
+    // Refusals are audited as release-gate (not merge-gate) events.
+    let _ = std::fs::remove_dir_all(group.join("release_grants"));
+    clear_audit();
+    assert!(!run(post_release), "no markers/grant → blocked");
+    let a = audit();
+    assert!(a.contains("release-gate-blocked"), "api release refusals audited as release-gate, got: {a}");
+    assert!(!a.contains("merge-gate-blocked"), "an api release refusal is NOT a merge-gate event, got: {a}");
+}
+
+#[test]
+fn gh_shim_harness_gates_raw_api_tag_ref_by_locus_defeating_decoys() {
+    // #196 ROUND-3: earlier fixes decided by substring-anywhere over the argv, so a
+    // cosmetic `refs/heads/` token (jq filter, header, sha value, URL query, decoy
+    // field) flipped the branch exemption while `ref=refs/tags/v9` created the tag —
+    // and an opaque graphql body (--input/-F @file) hid the mutation entirely. The shim
+    // now decides by LOCUS: request METHOD, URL PATH (query stripped), and the parsed
+    // `ref`/`query` field only. This EXECUTES the shim to pin that the decoys can't
+    // disguise a refs/tags create, opaque graphql fails safe, while branch writes /
+    // read GETs still pass. (Substring harnesses stayed green over these holes.)
+    use std::process::Command;
+    if Command::new("sh").arg("-c").arg("exit 0").status().map(|s| !s.success()).unwrap_or(true) {
+        eprintln!("SKIP gh_shim_harness_api_tag_ref_locus…: no POSIX sh");
+        return;
+    }
+    let td = tempfile::tempdir().unwrap();
+    let root = td.path();
+    let group = root.join("group");
+    std::fs::create_dir_all(&group).unwrap();
+    let log = root.join("gh.log");
+    let fake = write_fake_gh(root, &log);
+    let shim = root.join("gh");
+    std::fs::write(&shim, gh_shim_sh(&fake.display().to_string())).unwrap();
+    let _ = Command::new("sh").arg("-c").arg(format!("chmod +x '{}' '{}'", fake.display(), shim.display())).status();
+    // Body files: the ref lives in the JSON body (invisible to argv). A readable file is
+    // PARSED (so a heads body is provably a branch; a tags body is gated + grant-keyed);
+    // `--input -` (stdin) is unparseable → fail-safe.
+    let tagbody = root.join("tagbody.json");
+    std::fs::write(&tagbody, br#"{"ref":"refs/tags/v9","sha":"deadbeef"}"#).unwrap();
+    let tagp = tagbody.display().to_string();
+    let headbody = root.join("headbody.json");
+    std::fs::write(&headbody, br#"{"ref":"refs/heads/feature","sha":"abc"}"#).unwrap();
+    let headp = headbody.display().to_string();
+    let gqlfile = root.join("q.graphql");
+    std::fs::write(&gqlfile, b"mutation { createRef(input: { name: \"refs/tags/v9\", oid: \"a\" }) { ref { id } } }").unwrap();
+    let gqlp = format!("query=@{}", gqlfile.display());
+
+    let run = |argv: &[&str]| -> bool {
+        Command::new("sh").arg(&shim).args(argv)
+            .env("LOOMUX_GROUP_DIR", &group)
+            .status().unwrap().success()
+    };
+    let set = |name: &str| { std::fs::write(group.join(name), b"").unwrap(); };
+    let clear = |name: &str| { let _ = std::fs::remove_file(group.join(name)); };
+    let write_grant = |name: &str| {
+        let d = group.join("release_grants");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join(name), b"99999999999\n1\n").unwrap();
+    };
+    let audit = || std::fs::read_to_string(group.join("audit.jsonl")).unwrap_or_default();
+    let clear_audit = || { std::fs::write(group.join("audit.jsonl"), b"").unwrap(); };
+
+    // ---- Decoys: each creates ref=refs/tags/v9 with a cosmetic refs/heads token that
+    // must NOT flip the gate. All must BLOCK with no markers.
+    let decoys: [&[&str]; 5] = [
+        &["api", "-X", "POST", "repos/o/r/git/refs", "-f", "ref=refs/tags/v9", "-f", "sha=x", "-q", ".refs/heads/x"],
+        &["api", "-X", "POST", "repos/o/r/git/refs", "-f", "ref=refs/tags/v9", "-f", "sha=x", "-H", "X-Trace: refs/heads/z"],
+        &["api", "-X", "POST", "repos/o/r/git/refs", "-f", "ref=refs/tags/v9", "-f", "sha=refs/heads/deadbeef"],
+        &["api", "-X", "POST", "repos/o/r/git/refs?d=refs/heads/z", "-f", "ref=refs/tags/v9", "-f", "sha=x"],
+        &["api", "-X", "POST", "repos/o/r/git/refs", "-f", "ref=refs/tags/v9", "-f", "decoy=refs/heads/z"],
+    ];
+    for s in decoys { assert!(!run(s), "a refs/heads decoy must NOT disable the refs/tags gate: {s:?}"); }
+
+    // ---- Body/URL/graphql tag-ref writes that must BLOCK with no markers.
+    let plain: &[&str] = &["api", "-X", "POST", "repos/o/r/git/refs", "-f", "ref=refs/tags/v9", "-f", "sha=x"];
+    let autopost: &[&str] = &["api", "repos/o/r/git/refs", "-f", "ref=refs/tags/v9", "-f", "sha=x"]; // no -X → gh auto-POSTs
+    let input_tag: &[&str] = &["api", "-X", "POST", "repos/o/r/git/refs", "--input", &tagp];
+    let input_stdin: &[&str] = &["api", "-X", "POST", "repos/o/r/git/refs", "--input", "-"];
+    let patch_move: &[&str] = &["api", "-X", "PATCH", "repos/o/r/git/refs/tags/v9", "-f", "sha=x"];
+    let delete_ref: &[&str] = &["api", "-X", "DELETE", "repos/o/r/git/refs/tags/v9"];
+    let gql_createref: &[&str] = &["api", "graphql", "-f", "query=mutation { createRef(input: { name: \"refs/tags/v9\", oid: \"a\" }) { ref { id } } }"];
+    let gql_opaque_stdin: &[&str] = &["api", "graphql", "--input", "-"];
+    let gql_opaque_file: &[&str] = &["api", "graphql", "-F", &gqlp];
+    let blocked: [&[&str]; 9] = [plain, autopost, input_tag, input_stdin, patch_move, delete_ref, gql_createref, gql_opaque_stdin, gql_opaque_file];
+    for s in blocked { assert!(!run(s), "tag-ref/opaque-graphql write must block with no markers: {s:?}"); }
+
+    // ---- Must PASS: REST branch writes (argv, URL, parsed body) + a graphql read + GETs.
+    // (graphql ref mutations are covered — and now gate unconditionally — in the
+    // dedicated graphql test; here we only assert the REST branch-locus pass and reads.)
+    let head_create: &[&str] = &["api", "-X", "POST", "repos/o/r/git/refs", "-f", "ref=refs/heads/feature", "-f", "sha=x"];
+    let head_move: &[&str] = &["api", "-X", "PATCH", "repos/o/r/git/refs/heads/main", "-f", "sha=x"];
+    let input_head: &[&str] = &["api", "-X", "POST", "repos/o/r/git/refs", "--input", &headp];
+    let gql_inline_read: &[&str] = &["api", "graphql", "-f", "query={ repository { releases { nodes { id } } } }"];
+    let get_tag_ref: &[&str] = &["api", "repos/o/r/git/refs/tags/v9"];
+    let get_releases: &[&str] = &["api", "repos/o/r/releases"];
+    let issues_write: &[&str] = &["api", "-X", "POST", "repos/o/r/issues", "-f", "title=hi"];
+    for s in [head_create, head_move, input_head, gql_inline_read, get_tag_ref, get_releases, issues_write] {
+        assert!(run(s), "a REST branch write / graphql read / read GET must pass through: {s:?}");
+    }
+
+    // ---- Blanket markers ALLOW even the unparseable (stdin/opaque) shapes.
+    set("autonomous"); set("auto_release");
+    for s in [input_stdin, gql_opaque_stdin, patch_move, gql_createref] {
+        clear_audit();
+        assert!(run(s), "autonomous+auto_release must allow: {s:?}");
+        assert!(audit().contains("release-gate-allowed"), "allowed marker for {s:?}, got: {}", audit());
+    }
+    clear("autonomous"); clear("auto_release");
+    set("dangerous_mode");
+    for s in [input_stdin, gql_opaque_stdin] {
+        clear_audit();
+        assert!(run(s), "dangerous mode must allow: {s:?}");
+        assert!(audit().contains("release-gate-dangerous"), "dangerous marker for {s:?}, got: {}", audit());
+    }
+    clear("dangerous_mode");
+
+    // ---- Grant keys on the tag resolved from the LOCUS (argv ref, URL path, parsed
+    // body, graphql name); consumed on use; a wrong-tag grant does not authorize.
+    for s in [plain, patch_move, input_tag, gql_createref] {
+        clear_audit();
+        write_grant("v9");
+        assert!(run(s), "a v9 grant must allow the tag-resolvable shape: {s:?}");
+        assert!(audit().contains("release-gate-granted"), "granted marker for {s:?}, got: {}", audit());
+        assert!(!group.join("release_grants/v9").exists(), "grant consumed for {s:?}");
+    }
+    write_grant("v9");
+    assert!(!run(&["api", "-X", "PATCH", "repos/o/r/git/refs/tags/v8", "-f", "sha=x"]), "a v9 grant cannot move tag v8");
+    // stdin body carries no argv-resolvable tag → a grant can't key it → still blocked.
+    let _ = std::fs::remove_dir_all(group.join("release_grants"));
+    write_grant("v9");
+    assert!(!run(input_stdin), "an unparseable --input - write is not grant-keyable → blocked even with a grant");
+
+    // Refusals audit as release-gate (not merge-gate).
+    let _ = std::fs::remove_dir_all(group.join("release_grants"));
+    clear_audit();
+    assert!(!run(patch_move), "no markers/grant → blocked");
+    let a = audit();
+    assert!(a.contains("release-gate-blocked") && !a.contains("merge-gate-blocked"),
+        "tag-ref api refusals audited as release-gate, got: {a}");
+}
+
+#[test]
+fn gh_shim_harness_gates_graphql_endpoint_variants_and_variable_ref() {
+    // #196: the graphql arm is recognized by endpoint SUFFIX (graphql | /graphql |
+    // full-URL — r4), and gates EVERY ref/tag/release-creating mutation UNCONDITIONALLY
+    // (r6). Successive rounds showed a text heuristic to "prove a mutation safe" is a
+    // losing game — a refs/tags literal, a -F ref= variable, a heads comment, a string
+    // escape `refs\/tags\/`, an alias each defeat one scan and the next encoding would
+    // too — so the graphql arm has NO prove-safe logic left to decoy. Branch createRef
+    // via graphql is a rare corner that fails safe to markers/grant; agents branch via
+    // REST git/refs, which the REST arm still classifies by real locus. Executes the shim.
+    use std::process::Command;
+    if Command::new("sh").arg("-c").arg("exit 0").status().map(|s| !s.success()).unwrap_or(true) {
+        eprintln!("SKIP gh_shim_harness_graphql_locus…: no POSIX sh");
+        return;
+    }
+    let td = tempfile::tempdir().unwrap();
+    let root = td.path();
+    let group = root.join("group");
+    std::fs::create_dir_all(&group).unwrap();
+    let log = root.join("gh.log");
+    let fake = write_fake_gh(root, &log);
+    let shim = root.join("gh");
+    std::fs::write(&shim, gh_shim_sh(&fake.display().to_string())).unwrap();
+    let _ = Command::new("sh").arg("-c").arg(format!("chmod +x '{}' '{}'", fake.display(), shim.display())).status();
+    let qfile = root.join("q.graphql");
+    std::fs::write(&qfile, b"mutation { createRef(input: { name: \"refs/tags/v9\", oid: \"a\" }) { ref { id } } }").unwrap();
+    let qopaque = format!("query=@{}", qfile.display());
+
+    let run = |argv: &[&str]| -> bool {
+        Command::new("sh").arg(&shim).args(argv).env("LOOMUX_GROUP_DIR", &group).status().unwrap().success()
+    };
+    let set = |name: &str| { std::fs::write(group.join(name), b"").unwrap(); };
+    let clear = |name: &str| { let _ = std::fs::remove_file(group.join(name)); };
+    let write_grant = |name: &str| {
+        let d = group.join("release_grants");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join(name), b"99999999999\n1\n").unwrap();
+    };
+
+    // Inline mutation queries (spaces so Rust passes them as one MSYS token).
+    let cr_tags = "query=mutation { createRef(input: { name: \"refs/tags/v9\", oid: \"a\" }) { ref { id } } }";
+    let cr_heads = "query=mutation { createRef(input: { name: \"refs/heads/feature\", oid: \"a\" }) { ref { id } } }";
+    let cr_var = "query=mutation($ref:String!){ createRef(input: { ref: $ref, oid: \"a\" }) { ref { id } } }"; // ref via variable
+    let read_q = "query={ repository { releases { nodes { id } } } }";
+
+    // ---- r6: the graphql arm gates EVERY ref/tag/release-creating mutation with no
+    // "prove-it's-safe-from-the-text" logic — variables, comments, aliases, and string
+    // escapes each defeat a text heuristic, so there is none left to defeat. BLOCK with
+    // no markers, whatever the encoding of the ref.
+    let x1_comment_tagvar: &[&str] = &["api", "graphql", "-F", "v=refs/tags/v9",
+        "-f", "query=mutation($v:String!){ createRef(input:{ref:$v, oid:\"a\"}){ ref { id } } } # refs/heads/x"];
+    let x2_decoy_headsvar: &[&str] = &["api", "graphql", "-F", "ref=refs/heads/x", "-F", "v=refs/tags/v9",
+        "-f", "query=mutation($ref:String!,$v:String!){ createRef(input:{ref:$v}){ ref { id } } }"];
+    let x3_updateref_nodeid: &[&str] = &["api", "graphql", "-F", "id=NODE123",
+        "-f", "query=mutation($id:ID!){ updateRef(input:{refId:$id, oid:\"a\"}){ ref { id } } } # refs/heads/x"];
+    // r6 5th variant: a GraphQL string escape `refs\/tags\/v9` dodges a raw `refs/tags/`
+    // text scan, while a `# refs/heads/x` comment fakes a heads-proof. Unconditional
+    // gating kills the whole class.
+    let x4_escaped_slash: &[&str] = &["api", "graphql",
+        "-f", "query=mutation { createRef(input: { name: \"refs\\/tags\\/v9\", oid: \"a\" }) { ref { id } } } # refs/heads/x"];
+    let x5_aliased: &[&str] = &["api", "graphql",
+        "-f", "query=mutation { myref: createRef(input: { name: \"refs/tags/v9\", oid: \"a\" }) { ref { id } } }"];
+    // Full delete coverage, matching the REST arm's DELETE git/refs/tags & deleteRelease:
+    // deleteRef is destructive (can drop a published v* tag ref) — by node-id and by name.
+    let del_ref_id: &[&str] = &["api", "graphql",
+        "-f", "query=mutation { deleteRef(input: { refId: \"REF_nodeid\" }) { clientMutationId } }"];
+    let del_ref_name: &[&str] = &["api", "graphql",
+        "-f", "query=mutation { deleteRef(input: { name: \"refs/tags/v9\" }) { clientMutationId } }"];
+    let del_tag: &[&str] = &["api", "graphql",
+        "-f", "query=mutation { deleteTag(input: { id: \"TAG_nodeid\" }) { clientMutationId } }"];
+    let block: [&[&str]; 16] = [
+        &["api", "graphql", "-f", cr_tags],                       // exact endpoint
+        &["api", "/graphql", "-f", cr_tags],                      // leading-slash
+        &["api", "https://api.github.com/graphql", "-f", cr_tags],// full URL host form
+        &["api", "graphql", "-f", cr_heads],                      // inline HEADS now gates too (intended over-gate)
+        &["api", "graphql", "-F", "ref=refs/tags/v9", "-f", cr_var], // -F variable ref
+        &["api", "graphql", "-F", "ref=refs/heads/feature", "-f", cr_var], // heads via variable
+        &["api", "graphql", "--input", "-"],                      // opaque stdin
+        &["api", "graphql", "-F", &qopaque],                      // opaque query=@file
+        x1_comment_tagvar, x2_decoy_headsvar, x3_updateref_nodeid, x4_escaped_slash, x5_aliased,
+        del_ref_id, del_ref_name, del_tag,                        // destructive delete coverage
+    ];
+    for s in block { assert!(!run(s), "graphql ref/tag mutation must block with no markers, any encoding: {s:?}"); }
+
+    // ---- PASS: only NON-mutation read queries (no createRef/…/Release token at all).
+    let pass: [&[&str]; 3] = [
+        &["api", "graphql", "-f", read_q],
+        &["api", "/graphql", "-f", read_q],
+        &["api", "https://api.github.com/graphql", "-f", read_q],
+    ];
+    for s in pass { assert!(run(s), "a non-mutation graphql read query must pass: {s:?}"); }
+    // The REST arm's real-locus heads-pass is unchanged — a branch createRef via REST
+    // git/refs still passes (agents branch via REST/git push, not graphql).
+    assert!(run(&["api", "-X", "POST", "repos/o/r/git/refs", "-f", "ref=refs/heads/x", "-f", "sha=y"]),
+        "REST branch (refs/heads) create still passes by real locus");
+
+    // ---- Blanket markers allow the opaque + variable-hidden + destructive-delete shapes.
+    set("autonomous"); set("auto_release");
+    for s in [&["api", "/graphql", "-f", "ref=refs/tags/v9", "-f", cr_var] as &[&str],
+              &["api", "graphql", "--input", "-"],
+              del_ref_id] {
+        assert!(run(s), "autonomous+auto_release must allow: {s:?}");
+    }
+    clear("autonomous"); clear("auto_release");
+
+    // ---- A v9 grant allows once + consumed: resolved from the -F ref= variable, and
+    // from an inline refs/tags name in a deleteRef.
+    write_grant("v9");
+    assert!(run(&["api", "https://api.github.com/graphql", "-F", "ref=refs/tags/v9", "-f", cr_var]),
+        "a v9 grant resolved from the graphql variable must allow the createRef");
+    assert!(!group.join("release_grants/v9").exists(), "grant consumed");
+    write_grant("v9");
+    assert!(run(del_ref_name), "a v9 grant resolved from an inline deleteRef refs/tags name must allow");
+    assert!(!group.join("release_grants/v9").exists(), "grant consumed by deleteRef");
+}
+
+#[test]
 fn autonomous_toggle_roundtrip_durable_and_audited() {
     let (reg, dir) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();

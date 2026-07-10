@@ -160,6 +160,31 @@ loomux_grant_ok() { # $1=grantfile
   rm -f "$gf"
   [ "$now" -lt "$exp" ]
 }
+# The SINGLE release-gate decision (#83/#196): every release-publishing shape —
+# `gh release create|edit|delete` AND the raw `gh api`/graphql equivalents (create
+# a v* tag ref, create/edit/delete a release, graphql *Release mutation) — routes
+# through here, so the api path can never diverge from the subcommand path. Allowed
+# by autonomous+auto_release (blanket, not grant-consumed), supervised dangerous
+# mode (human present, not autonomous), or a valid one-time per-tag grant; else
+# fail-safe block. $1=tag ("" when not cheaply resolvable — then only the blanket
+# markers can allow), $2=action label. Returns 0 to allow (caller execs the real
+# gh); blocks with a message + exit 1 (never returns) otherwise.
+loomux_release_gate() { # $1=tag $2=action
+  _tag="$1"; _action="$2"
+  if [ -n "$LOOMUX_GROUP_DIR" ] && [ -f "$LOOMUX_GROUP_DIR/autonomous" ] && [ -f "$LOOMUX_GROUP_DIR/auto_release" ]; then
+    loomux_audit "release-gate-allowed" "{\"tag\":\"$_tag\",\"action\":\"$_action\"}"; return 0
+  fi
+  if [ -n "$LOOMUX_GROUP_DIR" ] && [ -f "$LOOMUX_GROUP_DIR/dangerous_mode" ] && [ ! -f "$LOOMUX_GROUP_DIR/autonomous" ]; then
+    loomux_audit "release-gate-dangerous" "{\"tag\":\"$_tag\",\"action\":\"$_action\"}"; return 0
+  fi
+  _safe=$(printf '%s' "$_tag" | tr -c 'A-Za-z0-9._-' '_')
+  _gf=""
+  [ -n "$LOOMUX_GROUP_DIR" ] && [ -n "$_safe" ] && _gf="$LOOMUX_GROUP_DIR/release_grants/$_safe"
+  if [ -n "$_gf" ] && loomux_grant_ok "$_gf"; then
+    loomux_audit "release-gate-granted" "{\"tag\":\"$_tag\",\"action\":\"$_action\"}"; return 0
+  fi
+  loomux_block_release "$_tag" "$_action"
+}
 
 # Parse the argv ONCE (mirrors the Rust gh_positionals / gh_repo_flag spec):
 # collect the command (cmd), subcommand (sub), the target selector (sel = 3rd
@@ -193,29 +218,144 @@ done
 if [ "$cmd" = "release" ]; then
   case "$sub" in
     create|edit|delete)
-      tag="$sel"
-      # Blanket: autonomous + auto_release opt-in (default off, so autonomous alone
-      # never publishes).
-      if [ -n "$LOOMUX_GROUP_DIR" ] && [ -f "$LOOMUX_GROUP_DIR/autonomous" ] && [ -f "$LOOMUX_GROUP_DIR/auto_release" ]; then
-        loomux_audit "release-gate-allowed" "{\"tag\":\"$tag\",\"action\":\"$sub\"}"
-        exec "$REAL_GH" "$@"
-      fi
-      # Supervised dangerous mode (human present, not autonomous). Distinct audit.
-      if [ -n "$LOOMUX_GROUP_DIR" ] && [ -f "$LOOMUX_GROUP_DIR/dangerous_mode" ] && [ ! -f "$LOOMUX_GROUP_DIR/autonomous" ]; then
-        loomux_audit "release-gate-dangerous" "{\"tag\":\"$tag\",\"action\":\"$sub\"}"
-        exec "$REAL_GH" "$@"
-      fi
-      # Otherwise a one-time per-tag grant authorizes exactly this publish.
-      safe=$(printf '%s' "$tag" | tr -c 'A-Za-z0-9._-' '_')
-      gf=""
-      [ -n "$LOOMUX_GROUP_DIR" ] && [ -n "$safe" ] && gf="$LOOMUX_GROUP_DIR/release_grants/$safe"
-      if [ -n "$gf" ] && loomux_grant_ok "$gf"; then
-        loomux_audit "release-gate-granted" "{\"tag\":\"$tag\",\"action\":\"$sub\"}"
-        exec "$REAL_GH" "$@"
-      fi
-      loomux_block_release "$tag" "$sub" ;;
+      loomux_release_gate "$sel" "$sub"   # allow (return) or block (exit); tag = $sel
+      exec "$REAL_GH" "$@" ;;
     *) exec "$REAL_GH" "$@" ;;
   esac
+fi
+
+# RELEASE via raw `gh api` / graphql (#196): the `gh release` subcommand above is the
+# ergonomic path, but the SAME publish can be driven through `gh api`. Decide by
+# LOCUS — the request METHOD, the URL PATH, and the parsed `ref`/`query` field — never
+# by substring-anywhere over the argv (a cosmetic `refs/heads/` in a header/jq/sha/
+# query string must NOT be able to disguise a `refs/tags/` create; #196 r3). We parse
+# gh api's own flags here (the shared positional parser above is tuned for pr/release).
+if [ "$cmd" = "api" ]; then
+  a_method=""; a_url=""; a_ref=""; a_query=""; a_qopaque=0; a_tagname=""
+  a_inputval=""; a_hasparam=0; aw=""; seen_cmd=0
+  for tok in "$@"; do
+    if [ -n "$aw" ]; then
+      case "$aw" in
+        method) a_method=$(printf '%s' "$tok" | tr '[:lower:]' '[:upper:]') ;;
+        field)
+          a_hasparam=1
+          case "$tok" in
+            ref=*)      a_ref=${tok#ref=} ;;
+            tag_name=*) a_tagname=${tok#tag_name=} ;;
+            query=*)    q=${tok#query=}; case "$q" in @*) a_qopaque=1 ;; *) a_query=$q ;; esac ;;
+          esac ;;
+        input) a_hasparam=1; a_inputval="$tok" ;;
+        skip) : ;;
+      esac
+      aw=""; continue
+    fi
+    case "$tok" in
+      -X|--method) aw="method"; continue ;;
+      -X?*)        a_method=$(printf '%s' "${tok#-X}" | tr '[:lower:]' '[:upper:]'); continue ;;
+      --method=*)  a_method=$(printf '%s' "${tok#--method=}" | tr '[:lower:]' '[:upper:]'); continue ;;
+      -f|-F|--field|--raw-field) aw="field"; continue ;;
+      --field=*|--raw-field=*)
+        a_hasparam=1; v=${tok#*=}
+        case "$v" in
+          ref=*)      a_ref=${v#ref=} ;;
+          tag_name=*) a_tagname=${v#tag_name=} ;;
+          query=*)    q=${v#query=}; case "$q" in @*) a_qopaque=1 ;; *) a_query=$q ;; esac ;;
+        esac
+        continue ;;
+      --input) aw="input"; continue ;;
+      --input=*) a_hasparam=1; a_inputval=${tok#--input=}; continue ;;
+      # Other value-taking gh-api flags: consume the value so it can never be mistaken
+      # for the URL, and so a decoy ref string inside it is never part of the locus.
+      -H|--header|-q|--jq|-t|--template|--cache|--hostname|-p|--preview) aw="skip"; continue ;;
+      --header=*|--jq=*|--template=*|--cache=*|--hostname=*|--preview=*) continue ;;
+      -*) continue ;;   # boolean flags (--paginate, -i/--include, --slurp, --silent, …)
+      *) # first bare positional is the `api` command token; the next is the endpoint.
+         if [ "$seen_cmd" = "0" ]; then seen_cmd=1; elif [ -z "$a_url" ]; then a_url="$tok"; fi ;;
+    esac
+  done
+  [ -z "$a_method" ] && { [ "$a_hasparam" = "1" ] && a_method="POST" || a_method="GET"; }
+  # gh reads the ref from a JSON body too (`--input <file>`): parse the file's "ref"
+  # so a heads-locus body is provably a branch. `--input -` (stdin) is unparseable →
+  # ref stays empty → cannot prove heads → fail-safe gate below.
+  if [ -n "$a_inputval" ] && [ "$a_inputval" != "-" ] && [ -z "$a_ref" ] && [ -f "$a_inputval" ]; then
+    body=$(cat "$a_inputval" 2>/dev/null)
+    case "$body" in
+      *'"ref"'*) r=${body#*\"ref\"}; r=${r#*:}; r=${r#*\"}; a_ref=${r%%\"*} ;;
+    esac
+  fi
+
+  is_write=0; case "$a_method" in GET|HEAD) is_write=0 ;; *) is_write=1 ;; esac
+  # URL PATH only (strip any ?query — a decoy `?d=refs/heads/z` must not read as heads).
+  a_path=${a_url%%\?*}
+  path_low=$(printf '%s' "$a_path" | tr '[:upper:]' '[:lower:]')
+  ref_low=$(printf '%s' "$a_ref" | tr '[:upper:]' '[:lower:]')
+
+  is_rel=0; rtag=""
+  # Recognize the graphql endpoint by SUFFIX (like the REST URL arms below), not an
+  # exact 'graphql' — gh also accepts `/graphql` and the full-URL host form, all sent
+  # as a POST of {"query":…} (#196 r4). Any call to that locus is a graphql write.
+  is_graphql=0
+  case "$path_low" in graphql|/graphql|*/graphql) is_graphql=1 ;; esac
+  if [ "$is_graphql" = "1" ]; then
+    # If the query is opaque (from --input/stdin or query=@file) we cannot scan it →
+    # fail-safe gate. Otherwise: any ref/tag/release-CREATING mutation gates
+    # UNCONDITIONALLY — there is NO "prove it's a safe branch from the text" logic in
+    # the graphql arm, by design. Every text heuristic we tried (a refs/tags literal, a
+    # -F ref= variable, a no-`$`-variables rule) was defeated by the next encoding —
+    # graphql variables, comments, aliases, and string escapes (`refs\/tags\/`) each dodge
+    # a text scan, and the next encoding would too (#196 r6). A graphql createRef to a
+    # BRANCH is a rare corner (agents branch via `git push` or REST `git/refs`, which the
+    # REST arm classifies by real locus); gating it fails safe — markers/grant still
+    # allow it. A non-mutation read query carries none of these tokens → passes.
+    if [ -n "$a_inputval" ] || [ "$a_qopaque" = "1" ]; then
+      is_rel=1
+    elif [ -n "$a_query" ]; then
+      ql=$(printf '%s' "$a_query" | tr '[:upper:]' '[:lower:]')
+      # Full create+move+DELETE coverage of refs/tags/releases, matching the REST arm
+      # (which gates POST/PATCH/DELETE of git/refs|git/tags and create/edit/delete of
+      # releases). deleteRef is destructive — it can drop a published v* tag ref — so it
+      # gates like DELETE git/refs/tags/* and deleteRelease. Matched by the field-name
+      # token (an unescapable identifier), consistent with the class-closing fix.
+      case "$ql" in
+        *createref*|*updateref*|*deleteref*|*createtag*|*deletetag*|*createrelease*|*updaterelease*|*deleterelease*) is_rel=1 ;;
+      esac
+      # resolve the tag for grant-keying: a refs/tags variable, else an inline literal.
+      case "$ref_low" in refs/tags/*) rtag=${a_ref#refs/tags/}; rtag=${rtag%% *} ;; esac
+      if [ -z "$rtag" ]; then
+        case "$a_query" in
+          *tagName:*)   rest=${a_query#*tagName:}; rest=$(printf '%s' "$rest" | tr -d ' "'); rtag=${rest%%,*}; rtag=${rtag%%\}*}; rtag=${rtag%%)*} ;;
+          *refs/tags/*) rest=${a_query#*refs/tags/}; rest=$(printf '%s' "$rest" | tr -d ' "'); rtag=${rest%%,*}; rtag=${rtag%%\}*}; rtag=${rtag%%)*} ;;
+        esac
+      fi
+    fi
+  elif [ "$is_write" = "1" ]; then
+    # A non-GET write to the git refs/tags plumbing, decided by the URL path SEGMENT.
+    case "$path_low" in
+      git/refs|git/refs/*|*/git/refs|*/git/refs/*|git/tags|git/tags/*|*/git/tags|*/git/tags/*)
+        # Exempt ONLY when the ref locus is PROVABLY a branch: URL path .../refs/heads/…
+        # OR the parsed ref field refs/heads/… — AND refs/tags/ absent from that locus.
+        heads=0; tags=0
+        case "$path_low" in */refs/heads/*) heads=1 ;; esac
+        case "$ref_low"  in refs/heads/*)   heads=1 ;; esac
+        case "$path_low" in */refs/tags/*)  tags=1 ;; esac
+        case "$ref_low"  in refs/tags/*)    tags=1 ;; esac
+        if [ "$heads" = "1" ] && [ "$tags" = "0" ]; then is_rel=0; else is_rel=1; fi ;;
+    esac
+    # A write to the releases endpoint (read-only GET list/view already excluded above).
+    if [ "$is_rel" = "0" ]; then
+      case "$path_low" in releases|releases/*|*/releases|*/releases/*) is_rel=1 ;; esac
+    fi
+    # Resolve the tag for grant-keying from the locus (ref field, URL path, tag_name).
+    if [ "$is_rel" = "1" ]; then
+      case "$ref_low" in refs/tags/*) rtag=${a_ref#refs/tags/}; rtag=${rtag%% *} ;; esac
+      case "$path_low" in */git/refs/tags/*) [ -z "$rtag" ] && { rest=${a_path##*/git/refs/tags/}; rtag=${rest%%/*}; } ;; esac
+      [ -z "$rtag" ] && [ -n "$a_tagname" ] && rtag="$a_tagname"
+    fi
+  fi
+  if [ "$is_rel" = "1" ]; then
+    loomux_release_gate "$rtag" "api"   # allow (return) or block (exit)
+    exec "$REAL_GH" "$@"
+  fi
 fi
 
 # Is this a merge we must gate? `gh pr merge` (wherever flags land), or an api shape.
