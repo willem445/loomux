@@ -225,77 +225,113 @@ if [ "$cmd" = "release" ]; then
 fi
 
 # RELEASE via raw `gh api` / graphql (#196): the `gh release` subcommand above is the
-# ergonomic path, but the SAME publish can be driven through `gh api` — which had
-# none of the above gating, an asymmetric bypass vs the merge path (which already
-# fail-safe-blocks raw `gh api` merges). Mirror it: any api call that (a) is a WRITE
-# to the git/refs|git/tags plumbing (create/move/delete a v* tag ref — gated by URL+
-# method since the ref may hide in --input/stdin; branch refs/heads writes excepted),
-# (b) writes the releases endpoint (create/edit/delete), or (c) is a graphql create/
-# update/deleteRelease or create/updateRef-of-a-tag / *Tag mutation routes through the
-# SAME loomux_release_gate. A non-release api call (issues, branch writes, read-only
-# GETs, …) passes through untouched.
+# ergonomic path, but the SAME publish can be driven through `gh api`. Decide by
+# LOCUS — the request METHOD, the URL PATH, and the parsed `ref`/`query` field — never
+# by substring-anywhere over the argv (a cosmetic `refs/heads/` in a header/jq/sha/
+# query string must NOT be able to disguise a `refs/tags/` create; #196 r3). We parse
+# gh api's own flags here (the shared positional parser above is tuned for pr/release).
 if [ "$cmd" = "api" ]; then
-  all="$*"
-  low=$(printf '%s' "$all" | tr '[:upper:]' '[:lower:]')
-  is_graphql=0; case "$low" in *graphql*) is_graphql=1 ;; esac
-  # Does this api call WRITE? Explicit non-GET -X/--method, or (default POST because
-  # a field/input flag is present with no explicit method). Read-only GETs pass.
-  meth=""; has_field=0; mwant=""
+  a_method=""; a_url=""; a_ref=""; a_query=""; a_qopaque=0; a_tagname=""
+  a_inputval=""; a_hasparam=0; aw=""; seen_cmd=0
   for tok in "$@"; do
-    if [ "$mwant" = "1" ]; then meth=$(printf '%s' "$tok" | tr '[:upper:]' '[:lower:]'); mwant=""; continue; fi
+    if [ -n "$aw" ]; then
+      case "$aw" in
+        method) a_method=$(printf '%s' "$tok" | tr '[:lower:]' '[:upper:]') ;;
+        field)
+          a_hasparam=1
+          case "$tok" in
+            ref=*)      a_ref=${tok#ref=} ;;
+            tag_name=*) a_tagname=${tok#tag_name=} ;;
+            query=*)    q=${tok#query=}; case "$q" in @*) a_qopaque=1 ;; *) a_query=$q ;; esac ;;
+          esac ;;
+        input) a_hasparam=1; a_inputval="$tok" ;;
+        skip) : ;;
+      esac
+      aw=""; continue
+    fi
     case "$tok" in
-      -X|--method) mwant="1" ;;
-      -X?*) meth=$(printf '%s' "${tok#-X}" | tr '[:upper:]' '[:lower:]') ;;
-      --method=*) meth=$(printf '%s' "${tok#--method=}" | tr '[:upper:]' '[:lower:]') ;;
-      -f|-F|--field|--raw-field|--input) has_field=1 ;;
-      -f?*|-F?*) has_field=1 ;;
+      -X|--method) aw="method"; continue ;;
+      -X?*)        a_method=$(printf '%s' "${tok#-X}" | tr '[:lower:]' '[:upper:]'); continue ;;
+      --method=*)  a_method=$(printf '%s' "${tok#--method=}" | tr '[:lower:]' '[:upper:]'); continue ;;
+      -f|-F|--field|--raw-field) aw="field"; continue ;;
+      --field=*|--raw-field=*)
+        a_hasparam=1; v=${tok#*=}
+        case "$v" in
+          ref=*)      a_ref=${v#ref=} ;;
+          tag_name=*) a_tagname=${v#tag_name=} ;;
+          query=*)    q=${v#query=}; case "$q" in @*) a_qopaque=1 ;; *) a_query=$q ;; esac ;;
+        esac
+        continue ;;
+      --input) aw="input"; continue ;;
+      --input=*) a_hasparam=1; a_inputval=${tok#--input=}; continue ;;
+      # Other value-taking gh-api flags: consume the value so it can never be mistaken
+      # for the URL, and so a decoy ref string inside it is never part of the locus.
+      -H|--header|-q|--jq|-t|--template|--cache|--hostname|-p|--preview) aw="skip"; continue ;;
+      --header=*|--jq=*|--template=*|--cache=*|--hostname=*|--preview=*) continue ;;
+      -*) continue ;;   # boolean flags (--paginate, -i/--include, --slurp, --silent, …)
+      *) # first bare positional is the `api` command token; the next is the endpoint.
+         if [ "$seen_cmd" = "0" ]; then seen_cmd=1; elif [ -z "$a_url" ]; then a_url="$tok"; fi ;;
     esac
   done
-  writes=0
-  case "$meth" in
-    post|patch|put|delete) writes=1 ;;
-    get|head) writes=0 ;;
-    "") [ "$has_field" = "1" ] && writes=1 ;;
-    *) writes=1 ;;   # unknown/custom verb → fail-safe treat as a write
-  esac
-  # Resolve the tag for grant-keying where cheap: create/move shapes carry it in an
-  # argv field OR the URL path (ref=refs/tags/<t> | git/refs/tags/<t> | tag_name=<t> |
-  # graphql tagName:"<t>" or name:"refs/tags/<t>"). When the ref lives only in a
-  # request BODY (--input file/stdin) it is not cheaply parseable → tag stays empty
-  # and only the blanket markers can allow (same fallback as DELETE-by-id).
-  rtag=""
-  case "$all" in
-    *ref=refs/tags/*)  rest=${all#*ref=refs/tags/};  rtag=${rest%% *} ;;
-    *git/refs/tags/*)  rest=${all#*git/refs/tags/};  rtag=${rest%% *} ;;
-    *tag_name=*)       rest=${all#*tag_name=};       rtag=${rest%% *} ;;
-    *tagName:*)        rest=${all#*tagName:};   rest=$(printf '%s' "$rest" | tr -d ' "'); rtag=${rest%%,*}; rtag=${rtag%%\}*}; rtag=${rtag%%)*} ;;
-    *refs/tags/*)      rest=${all#*refs/tags/}; rest=$(printf '%s' "$rest" | tr -d ' "'); rtag=${rest%%,*}; rtag=${rtag%%\}*}; rtag=${rtag%%)*} ;;
-  esac
-  is_rel=0
-  # (a) REST git refs/tags plumbing: a WRITE (POST/PATCH/DELETE, not GET) to git/refs
-  # or git/tags can create/move/delete a v* tag ref → release.yml → npm. Gate by
-  # URL+METHOD, not by an argv ref= field — the ref may live in --input/stdin, and
-  # git/refs is not a `releases` URL (the #196 re-review bypass). A clearly-branch ref
-  # (refs/heads, visible in argv or the URL) never triggers release.yml, so it passes;
-  # a body-only ref that can't be classified fail-safe-gates (blanket markers only).
-  if [ "$is_graphql" = "0" ] && [ "$writes" = "1" ]; then
-    case "$low" in
-      *git/refs*|*git/tags*)
-        case "$low" in *refs/heads/*) : ;; *) is_rel=1 ;; esac ;;
+  [ -z "$a_method" ] && { [ "$a_hasparam" = "1" ] && a_method="POST" || a_method="GET"; }
+  # gh reads the ref from a JSON body too (`--input <file>`): parse the file's "ref"
+  # so a heads-locus body is provably a branch. `--input -` (stdin) is unparseable →
+  # ref stays empty → cannot prove heads → fail-safe gate below.
+  if [ -n "$a_inputval" ] && [ "$a_inputval" != "-" ] && [ -z "$a_ref" ] && [ -f "$a_inputval" ]; then
+    body=$(cat "$a_inputval" 2>/dev/null)
+    case "$body" in
+      *'"ref"'*) r=${body#*\"ref\"}; r=${r#*:}; r=${r#*\"}; a_ref=${r%%\"*} ;;
     esac
   fi
-  # (b) REST release create/edit/delete: a WRITE to the releases endpoint (read-only
-  # GET list/view passes through).
-  if [ "$is_rel" = "0" ] && [ "$is_graphql" = "0" ] && [ "$writes" = "1" ]; then
-    case "$low" in *releases*) is_rel=1 ;; esac
+
+  is_write=0; case "$a_method" in GET|HEAD) is_write=0 ;; *) is_write=1 ;; esac
+  # URL PATH only (strip any ?query — a decoy `?d=refs/heads/z` must not read as heads).
+  a_path=${a_url%%\?*}
+  path_low=$(printf '%s' "$a_path" | tr '[:upper:]' '[:lower:]')
+  ref_low=$(printf '%s' "$a_ref" | tr '[:upper:]' '[:lower:]')
+
+  is_rel=0; rtag=""
+  if [ "$path_low" = "graphql" ]; then
+    # graphql WRITE. If the query is opaque (from --input/stdin or query=@file) we
+    # cannot scan it → fail-safe gate. Inline queries are scanned for the mutations
+    # that create/move a release or a tag ref (createRef of a refs/tags, not heads).
+    if [ -n "$a_inputval" ] || [ "$a_qopaque" = "1" ]; then
+      is_rel=1
+    elif [ -n "$a_query" ]; then
+      ql=$(printf '%s' "$a_query" | tr '[:upper:]' '[:lower:]')
+      case "$ql" in
+        *createrelease*|*updaterelease*|*deleterelease*|*createtag*) is_rel=1 ;;
+        *createref*|*updateref*) case "$ql" in *refs/tags/*) is_rel=1 ;; esac ;;
+      esac
+      case "$a_query" in
+        *tagName:*)   rest=${a_query#*tagName:}; rest=$(printf '%s' "$rest" | tr -d ' "'); rtag=${rest%%,*}; rtag=${rtag%%\}*}; rtag=${rtag%%)*} ;;
+        *refs/tags/*) rest=${a_query#*refs/tags/}; rest=$(printf '%s' "$rest" | tr -d ' "'); rtag=${rest%%,*}; rtag=${rtag%%\}*}; rtag=${rtag%%)*} ;;
+      esac
+    fi
+  elif [ "$is_write" = "1" ]; then
+    # A non-GET write to the git refs/tags plumbing, decided by the URL path SEGMENT.
+    case "$path_low" in
+      git/refs|git/refs/*|*/git/refs|*/git/refs/*|git/tags|git/tags/*|*/git/tags|*/git/tags/*)
+        # Exempt ONLY when the ref locus is PROVABLY a branch: URL path .../refs/heads/…
+        # OR the parsed ref field refs/heads/… — AND refs/tags/ absent from that locus.
+        heads=0; tags=0
+        case "$path_low" in */refs/heads/*) heads=1 ;; esac
+        case "$ref_low"  in refs/heads/*)   heads=1 ;; esac
+        case "$path_low" in */refs/tags/*)  tags=1 ;; esac
+        case "$ref_low"  in refs/tags/*)    tags=1 ;; esac
+        if [ "$heads" = "1" ] && [ "$tags" = "0" ]; then is_rel=0; else is_rel=1; fi ;;
+    esac
+    # A write to the releases endpoint (read-only GET list/view already excluded above).
+    if [ "$is_rel" = "0" ]; then
+      case "$path_low" in releases|releases/*|*/releases|*/releases/*) is_rel=1 ;; esac
+    fi
+    # Resolve the tag for grant-keying from the locus (ref field, URL path, tag_name).
+    if [ "$is_rel" = "1" ]; then
+      case "$ref_low" in refs/tags/*) rtag=${a_ref#refs/tags/}; rtag=${rtag%% *} ;; esac
+      case "$path_low" in */git/refs/tags/*) [ -z "$rtag" ] && { rest=${a_path##*/git/refs/tags/}; rtag=${rest%%/*}; } ;; esac
+      [ -z "$rtag" ] && [ -n "$a_tagname" ] && rtag="$a_tagname"
+    fi
   fi
-  # (c) graphql: a create/update/deleteRelease mutation, OR a create/update Ref / *Tag
-  # mutation targeting a refs/tags ref — createRef can publish a v* tag ref just like
-  # the REST git/refs write. A refs/heads (branch) createRef must NOT gate.
-  case "$low" in
-    *createrelease*|*updaterelease*|*deleterelease*|*createtag*) is_rel=1 ;;
-    *createref*|*updateref*) case "$low" in *refs/tags/*) is_rel=1 ;; esac ;;
-  esac
   if [ "$is_rel" = "1" ]; then
     loomux_release_gate "$rtag" "api"   # allow (return) or block (exit)
     exec "$REAL_GH" "$@"

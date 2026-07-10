@@ -660,17 +660,25 @@ reconcile on read, mirrored into the kickoff config + a live notice, and surface
   plumbing that creates/moves/deletes a **`refs/tags/*`** ref, (b) a **write** to the `…/releases`
   endpoint (create/edit/delete — read-only GET list/view passes), and (c) a graphql
   **create/update/deleteRelease** mutation *or* a **`createRef`/`updateRef`** of a `refs/tags` ref
-  (a `*Tag` mutation). Crucially (a) gates by **URL + method, not by an argv `ref=` field** — the
-  ref can hide in the request **body** (`--input <file>` / stdin), and `git/refs` is not a
-  `releases` URL, so a substring-of-argv check missed it (the #196 re-review found this residual
-  bypass three ways: `--input` file, `--input -` stdin, and `PATCH …/git/refs/tags/<t>` tag-move,
-  plus graphql `createRef`). A **branch** ref (`refs/heads/*`, visible in argv or the URL) never
-  triggers `release.yml`, so it passes through. The tag is resolved for grant-keying where cheap
-  (argv `ref=refs/tags/<t>`, the URL `git/refs/tags/<t>`, `tag_name=<t>`, or graphql
-  `tagName:"<t>"` / `name:"refs/tags/<t>"`); where it isn't (a body-only `--input` ref, or `DELETE
-  …/releases/<id>` by numeric id), only the blanket markers (`autonomous && auto_release`, or
-  supervised `dangerous && !autonomous`) can allow it — otherwise **fail-safe block**. A non-release
-  api call (an issues endpoint, a branch `refs/heads` write, a read-only GET) passes through untouched.
+  (a `*Tag` mutation). **Decision is by LOCUS, never substring-anywhere** — the shim parses gh
+  api's own flags and looks *only* at the request **method** (`-X`/`--method`, else POST when a
+  field/`--input` is present, else GET), the **URL path** (query string stripped), and the parsed
+  **`ref`/`query` field**. This was the crux of the #196 re-reviews: an argv-substring check gated
+  by "is `refs/tags/` anywhere / is `refs/heads/` anywhere", so a **decoy** `refs/heads/` token in a
+  `-q` jq filter, a `-H` header, a `-f sha=`, a `?d=` URL query, or an extra field flipped the
+  branch exemption while `ref=refs/tags/v9` created the tag; and an **opaque** graphql body
+  (`--input`/`-F query=@file`/stdin) hid the mutation entirely. Now the branch exemption fires
+  **only** when the ref *locus* is provably heads — the URL path is `…/git/refs/heads/…` **or** the
+  parsed `ref` field (argv `-f ref=`, or the `"ref"` read from a readable `--input <file>` body) is
+  `refs/heads/…` — **and** `refs/tags/` is absent from that locus. A non-GET write to `git/refs`/
+  `git/tags` whose locus can't be proven heads (a `--input -` stdin body, an opaque graphql query)
+  **fails safe to the gate** (blanket-markers-only). The tag is resolved for grant-keying from the
+  locus (argv `ref=refs/tags/<t>`, a `--input` file's `"ref"`, the URL `…/git/refs/tags/<t>`,
+  `tag_name=<t>`, or an inline graphql `tagName:"<t>"` / `name:"refs/tags/<t>"`); where it isn't
+  (stdin body, opaque graphql, `DELETE …/releases/<id>` by numeric id), only the blanket markers
+  (`autonomous && auto_release`, or supervised `dangerous && !autonomous`) can allow it — otherwise
+  **fail-safe block**. A non-release api call (an issues endpoint, a branch `refs/heads` write, an
+  inline graphql read, a read-only GET) passes through untouched.
 - **git shim** (new, same PATH-injection as the gh shim) gates `git push` that publishes a tag:
   `--tags`/`--follow-tags`/`--mirror` (bulk → blocked, push the specific approved tag),
   `refs/tags/<t>` and the `tag <t>` form (explicit), and a bare **`v*`** refspec (any v-prefixed
