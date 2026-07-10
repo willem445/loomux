@@ -160,6 +160,31 @@ loomux_grant_ok() { # $1=grantfile
   rm -f "$gf"
   [ "$now" -lt "$exp" ]
 }
+# The SINGLE release-gate decision (#83/#196): every release-publishing shape —
+# `gh release create|edit|delete` AND the raw `gh api`/graphql equivalents (create
+# a v* tag ref, create/edit/delete a release, graphql *Release mutation) — routes
+# through here, so the api path can never diverge from the subcommand path. Allowed
+# by autonomous+auto_release (blanket, not grant-consumed), supervised dangerous
+# mode (human present, not autonomous), or a valid one-time per-tag grant; else
+# fail-safe block. $1=tag ("" when not cheaply resolvable — then only the blanket
+# markers can allow), $2=action label. Returns 0 to allow (caller execs the real
+# gh); blocks with a message + exit 1 (never returns) otherwise.
+loomux_release_gate() { # $1=tag $2=action
+  _tag="$1"; _action="$2"
+  if [ -n "$LOOMUX_GROUP_DIR" ] && [ -f "$LOOMUX_GROUP_DIR/autonomous" ] && [ -f "$LOOMUX_GROUP_DIR/auto_release" ]; then
+    loomux_audit "release-gate-allowed" "{\"tag\":\"$_tag\",\"action\":\"$_action\"}"; return 0
+  fi
+  if [ -n "$LOOMUX_GROUP_DIR" ] && [ -f "$LOOMUX_GROUP_DIR/dangerous_mode" ] && [ ! -f "$LOOMUX_GROUP_DIR/autonomous" ]; then
+    loomux_audit "release-gate-dangerous" "{\"tag\":\"$_tag\",\"action\":\"$_action\"}"; return 0
+  fi
+  _safe=$(printf '%s' "$_tag" | tr -c 'A-Za-z0-9._-' '_')
+  _gf=""
+  [ -n "$LOOMUX_GROUP_DIR" ] && [ -n "$_safe" ] && _gf="$LOOMUX_GROUP_DIR/release_grants/$_safe"
+  if [ -n "$_gf" ] && loomux_grant_ok "$_gf"; then
+    loomux_audit "release-gate-granted" "{\"tag\":\"$_tag\",\"action\":\"$_action\"}"; return 0
+  fi
+  loomux_block_release "$_tag" "$_action"
+}
 
 # Parse the argv ONCE (mirrors the Rust gh_positionals / gh_repo_flag spec):
 # collect the command (cmd), subcommand (sub), the target selector (sel = 3rd
@@ -193,29 +218,63 @@ done
 if [ "$cmd" = "release" ]; then
   case "$sub" in
     create|edit|delete)
-      tag="$sel"
-      # Blanket: autonomous + auto_release opt-in (default off, so autonomous alone
-      # never publishes).
-      if [ -n "$LOOMUX_GROUP_DIR" ] && [ -f "$LOOMUX_GROUP_DIR/autonomous" ] && [ -f "$LOOMUX_GROUP_DIR/auto_release" ]; then
-        loomux_audit "release-gate-allowed" "{\"tag\":\"$tag\",\"action\":\"$sub\"}"
-        exec "$REAL_GH" "$@"
-      fi
-      # Supervised dangerous mode (human present, not autonomous). Distinct audit.
-      if [ -n "$LOOMUX_GROUP_DIR" ] && [ -f "$LOOMUX_GROUP_DIR/dangerous_mode" ] && [ ! -f "$LOOMUX_GROUP_DIR/autonomous" ]; then
-        loomux_audit "release-gate-dangerous" "{\"tag\":\"$tag\",\"action\":\"$sub\"}"
-        exec "$REAL_GH" "$@"
-      fi
-      # Otherwise a one-time per-tag grant authorizes exactly this publish.
-      safe=$(printf '%s' "$tag" | tr -c 'A-Za-z0-9._-' '_')
-      gf=""
-      [ -n "$LOOMUX_GROUP_DIR" ] && [ -n "$safe" ] && gf="$LOOMUX_GROUP_DIR/release_grants/$safe"
-      if [ -n "$gf" ] && loomux_grant_ok "$gf"; then
-        loomux_audit "release-gate-granted" "{\"tag\":\"$tag\",\"action\":\"$sub\"}"
-        exec "$REAL_GH" "$@"
-      fi
-      loomux_block_release "$tag" "$sub" ;;
+      loomux_release_gate "$sel" "$sub"   # allow (return) or block (exit); tag = $sel
+      exec "$REAL_GH" "$@" ;;
     *) exec "$REAL_GH" "$@" ;;
   esac
+fi
+
+# RELEASE via raw `gh api` / graphql (#196): the `gh release` subcommand above is the
+# ergonomic path, but the SAME publish can be driven through `gh api` — which had
+# none of the above gating, an asymmetric bypass vs the merge path (which already
+# fail-safe-blocks raw `gh api` merges). Mirror it: any api call that (a) creates a
+# refs/tags/v* ref, (b) writes the releases endpoint (create/edit/delete), or (c) is
+# a graphql create/update/deleteRelease mutation routes through the SAME
+# loomux_release_gate. A non-release api call (issues, read-only release GETs, …)
+# passes through untouched.
+if [ "$cmd" = "api" ]; then
+  all="$*"
+  low=$(printf '%s' "$all" | tr '[:upper:]' '[:lower:]')
+  is_graphql=0; case "$low" in *graphql*) is_graphql=1 ;; esac
+  # Does this api call WRITE? Explicit non-GET -X/--method, or (default POST because
+  # a field/input flag is present with no explicit method). Read-only GETs pass.
+  meth=""; has_field=0; mwant=""
+  for tok in "$@"; do
+    if [ "$mwant" = "1" ]; then meth=$(printf '%s' "$tok" | tr '[:upper:]' '[:lower:]'); mwant=""; continue; fi
+    case "$tok" in
+      -X|--method) mwant="1" ;;
+      -X?*) meth=$(printf '%s' "${tok#-X}" | tr '[:upper:]' '[:lower:]') ;;
+      --method=*) meth=$(printf '%s' "${tok#--method=}" | tr '[:upper:]' '[:lower:]') ;;
+      -f|-F|--field|--raw-field|--input) has_field=1 ;;
+      -f?*|-F?*) has_field=1 ;;
+    esac
+  done
+  writes=0
+  case "$meth" in
+    post|patch|put|delete) writes=1 ;;
+    get|head) writes=0 ;;
+    "") [ "$has_field" = "1" ] && writes=1 ;;
+    *) writes=1 ;;   # unknown/custom verb → fail-safe treat as a write
+  esac
+  # Resolve the tag for grant-keying where cheap: the create shapes carry it as a
+  # field (ref=refs/tags/<t> | tag_name=<t> | graphql tagName:"<t>"). DELETE-by-id
+  # and bulk shapes leave it empty → only the blanket markers can allow them.
+  rtag=""
+  case "$all" in
+    *ref=refs/tags/*) rest=${all#*ref=refs/tags/}; rtag=${rest%% *} ;;
+    *tag_name=*)      rest=${all#*tag_name=};      rtag=${rest%% *} ;;
+    *tagName:*)       rest=${all#*tagName:}; rest=$(printf '%s' "$rest" | tr -d ' "'); rtag=${rest%%,*}; rtag=${rtag%%\}*}; rtag=${rtag%%)*} ;;
+  esac
+  is_rel=0
+  case "$all" in *ref=refs/tags/v*) is_rel=1 ;; esac                 # (a) create a v* tag ref
+  if [ "$is_rel" = "0" ] && [ "$is_graphql" = "0" ] && [ "$writes" = "1" ]; then
+    case "$low" in *releases*) is_rel=1 ;; esac                      # (b) REST release write
+  fi
+  case "$low" in *createrelease*|*updaterelease*|*deleterelease*) is_rel=1 ;; esac  # (c) graphql mutation
+  if [ "$is_rel" = "1" ]; then
+    loomux_release_gate "$rtag" "api"   # allow (return) or block (exit)
+    exec "$REAL_GH" "$@"
+  fi
 fi
 
 # Is this a merge we must gate? `gh pr merge` (wherever flags land), or an api shape.

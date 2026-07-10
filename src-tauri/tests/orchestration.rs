@@ -4171,6 +4171,132 @@ fn gh_shim_shell_harness_executes_the_gate() {
 }
 
 #[test]
+fn gh_shim_script_gates_raw_api_release_shapes() {
+    // #196: the raw `gh api`/graphql release surface must route through the SAME
+    // single release-gate decision as `gh release …` — pinned in the shim text.
+    let sh = gh_shim_sh("C:/Program Files/GitHub CLI/gh.exe");
+    assert!(sh.contains("loomux_release_gate"), "a single shared release-gate function (no parallel checker)");
+    assert!(sh.contains("ref=refs/tags/v"), "catches a v* tag-ref create via api");
+    assert!(sh.contains("*releases*"), "catches the releases endpoint");
+    assert!(sh.contains("createrelease") && sh.contains("updaterelease") && sh.contains("deleterelease"),
+        "catches graphql create/update/delete Release mutations");
+    // The api path is audited as a release-gate event (same markers as the subcommand).
+    assert!(sh.contains("release-gate-allowed") && sh.contains("release-gate-blocked"),
+        "api release allows/blocks are audited as release-gate events");
+    assert!(!sh.contains("\r"), "POSIX shim must stay LF-only (a CRLF #!/bin/sh is broken)");
+}
+
+#[test]
+fn gh_shim_harness_gates_raw_api_release_and_tag_ref_shapes() {
+    // The #196 hole, executed: raw `gh api` / graphql release shapes bypassed the
+    // release gate entirely (they EXECUTED with no marker/grant → release.yml → npm).
+    // This runs the real shim against each shape and pins BLOCK/ALLOW parity with the
+    // `gh release …` path. Mirrors gh_shim_harness_grant_authorizes_one_merge….
+    use std::process::Command;
+    if Command::new("sh").arg("-c").arg("exit 0").status().map(|s| !s.success()).unwrap_or(true) {
+        eprintln!("SKIP gh_shim_harness_api_release…: no POSIX sh");
+        return;
+    }
+    let td = tempfile::tempdir().unwrap();
+    let root = td.path();
+    let group = root.join("group");
+    std::fs::create_dir_all(&group).unwrap();
+    let log = root.join("gh.log");
+    let fake = write_fake_gh(root, &log);
+    let shim = root.join("gh");
+    std::fs::write(&shim, gh_shim_sh(&fake.display().to_string())).unwrap();
+    let _ = Command::new("sh").arg("-c").arg(format!("chmod +x '{}' '{}'", fake.display(), shim.display())).status();
+
+    let run = |argv: &[&str]| -> bool {
+        Command::new("sh").arg(&shim).args(argv)
+            .env("LOOMUX_GROUP_DIR", &group)
+            .status().unwrap().success()
+    };
+    let write_grant = |name: &str| {
+        let d = group.join("release_grants");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join(name), b"99999999999\n1\n").unwrap(); // far-future expiry
+    };
+    let set = |name: &str| { std::fs::write(group.join(name), b"").unwrap(); };
+    let clear = |name: &str| { let _ = std::fs::remove_file(group.join(name)); };
+    let audit = || std::fs::read_to_string(group.join("audit.jsonl")).unwrap_or_default();
+    let clear_audit = || { std::fs::write(group.join("audit.jsonl"), b"").unwrap(); };
+
+    // The four release-publishing api/graphql shapes the gate must catch. Each keys a
+    // resolvable tag v9 EXCEPT delete (by release id — not cheaply resolvable).
+    let post_tag_ref: &[&str] = &["api", "-X", "POST", "repos/o/r/git/refs", "-f", "ref=refs/tags/v9", "-f", "sha=deadbeef"];
+    let post_release: &[&str] = &["api", "-X", "POST", "repos/o/r/releases", "-f", "tag_name=v9", "-f", "name=v9"];
+    let delete_release: &[&str] = &["api", "-X", "DELETE", "repos/o/r/releases/1234"];
+    // NOTE the spaces in the query: they force Rust's Command to pass it as a single
+    // quoted Windows token, so MSYS `sh` reconstructs one argv element (a brace-dense
+    // unspaced arg gets truncated at the first `{` crossing the Rust→MSYS boundary —
+    // a test-harness quoting artifact, not a shim behavior). Real agents type this in
+    // Git Bash, which parses it natively.
+    let gql_create: &[&str] = &["api", "graphql", "-f", "query=mutation { createRelease(input: { tagName: \"v9\" }) { release { id } } }"];
+    let resolvable: [&[&str]; 3] = [post_tag_ref, post_release, gql_create];
+    let all_shapes: [&[&str]; 4] = [post_tag_ref, post_release, delete_release, gql_create];
+
+    // 1) No markers, no grant → every shape BLOCKED (fail-safe, the bug's fix).
+    for shape in all_shapes {
+        assert!(!run(shape), "raw api release shape must be blocked with no markers: {shape:?}");
+    }
+    // A NON-release api call passes through untouched — even a write to another
+    // endpoint, and read-only release GETs (list/view).
+    assert!(run(&["api", "-X", "POST", "repos/o/r/issues", "-f", "title=hi"]), "non-release api write must pass through");
+    assert!(run(&["api", "repos/o/r/releases"]), "read-only releases list (GET) must pass through");
+    assert!(run(&["api", "repos/o/r/releases/latest"]), "read-only release view (GET) must pass through");
+
+    // 2) autonomous + auto_release → blanket ALLOW for each shape (allowed marker).
+    set("autonomous"); set("auto_release");
+    for shape in all_shapes {
+        clear_audit();
+        assert!(run(shape), "autonomous+auto_release must allow: {shape:?}");
+        assert!(audit().contains("release-gate-allowed"), "allowed marker for {shape:?}, got: {}", audit());
+    }
+    clear("autonomous"); clear("auto_release");
+
+    // 3) supervised dangerous mode (human present, not autonomous) → ALLOW (dangerous marker).
+    set("dangerous_mode");
+    for shape in all_shapes {
+        clear_audit();
+        assert!(run(shape), "dangerous mode must allow: {shape:?}");
+        assert!(audit().contains("release-gate-dangerous"), "dangerous marker for {shape:?}, got: {}", audit());
+    }
+    // dangerous is a NO-OP while autonomous → blocked again.
+    set("autonomous");
+    assert!(!run(post_release), "dangerous ignored while autonomous → api release blocked");
+    clear("autonomous"); clear("dangerous_mode");
+
+    // 4) A matching per-tag grant authorizes exactly one publish of the resolvable-tag
+    //    shapes (tag resolved from the api fields), then is consumed.
+    for shape in resolvable {
+        clear_audit();
+        write_grant("v9");
+        assert!(run(shape), "grant for v9 must allow: {shape:?}");
+        assert!(audit().contains("release-gate-granted"), "granted marker for {shape:?}, got: {}", audit());
+        assert!(!group.join("release_grants/v9").exists(), "grant consumed for {shape:?}");
+        assert!(!run(shape), "consumed grant → second publish blocked: {shape:?}");
+    }
+    // A grant for the wrong tag cannot authorize another tag.
+    write_grant("v9");
+    assert!(!run(&["api", "-X", "POST", "repos/o/r/releases", "-f", "tag_name=v8"]), "a v9 grant cannot publish v8");
+
+    // 5) DELETE-by-id has no cheaply-resolvable tag → a per-tag grant can't help;
+    //    only the blanket markers (above) allow it. With just a grant present, blocked.
+    let _ = std::fs::remove_dir_all(group.join("release_grants"));
+    write_grant("v9");
+    assert!(!run(delete_release), "DELETE-by-id is not grant-keyable → blocked");
+
+    // Refusals are audited as release-gate (not merge-gate) events.
+    let _ = std::fs::remove_dir_all(group.join("release_grants"));
+    clear_audit();
+    assert!(!run(post_release), "no markers/grant → blocked");
+    let a = audit();
+    assert!(a.contains("release-gate-blocked"), "api release refusals audited as release-gate, got: {a}");
+    assert!(!a.contains("merge-gate-blocked"), "an api release refusal is NOT a merge-gate event, got: {a}");
+}
+
+#[test]
 fn autonomous_toggle_roundtrip_durable_and_audited() {
     let (reg, dir) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();

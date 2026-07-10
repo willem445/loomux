@@ -650,7 +650,19 @@ reconcile on read, mirrored into the kickoff config + a live notice, and surface
 `orch_autonomy` (`auto_release: bool`) via `orch_set_auto_release`.
 
 - **gh shim** additionally gates `gh release create|edit|delete <tag>` (read-only
-  `view`/`list`/`download` pass through) — `gh_release_action`.
+  `view`/`list`/`download` pass through) — `gh_release_action`. It **also** gates the raw
+  **`gh api` / graphql** shapes that publish the same way — otherwise an agent could drive a
+  release straight through the API and skip the subcommand gate entirely (**#196**: the release
+  path had *less* api coverage than the merge path, which already fail-safe-blocks raw `gh api`
+  merges). All of them route through **one** shared shell decision (`loomux_release_gate`, the
+  single decision point — no parallel checker), so the api path can never diverge from the
+  subcommand path: (a) `POST …/git/refs` creating a **`refs/tags/v*`** ref, (b) a **write** to the
+  `…/releases` endpoint (create/edit/delete — read-only GET list/view passes), and (c) a graphql
+  **create/update/deleteRelease** mutation. The tag is resolved from the api fields for grant-keying
+  where cheap (`ref=refs/tags/<t>`, `tag_name=<t>`, graphql `tagName:"<t>"`); where it isn't (e.g.
+  `DELETE …/releases/<id>` by numeric id), only the blanket markers (`autonomous && auto_release`,
+  or supervised `dangerous && !autonomous`) can allow it — otherwise **fail-safe block**. A
+  non-release api call (an issues endpoint, a read-only release GET) passes through untouched.
 - **git shim** (new, same PATH-injection as the gh shim) gates `git push` that publishes a tag:
   `--tags`/`--follow-tags`/`--mirror` (bulk → blocked, push the specific approved tag),
   `refs/tags/<t>` and the `tag <t>` form (explicit), and a bare **`v*`** refspec (any v-prefixed
