@@ -467,6 +467,13 @@ function dormantCard(
   return wrap;
 }
 
+/** Groups with a resume in flight (#194 P4). A restored group tab renders one
+ *  Resume card per persisted orch pane, so two DIFFERENT buttons of the same
+ *  group can race — each button's own guard can't see the other. The backend
+ *  already refuses a double-create (safe either way), but this per-group latch
+ *  suppresses the redundant error toast the loser would otherwise raise. */
+const resumingGroups = new Set<string>();
+
 /** Revive the dormant orchestration group bound to `ws` (the Resume button on a
  *  dormant-group placeholder). Resumes the recorded orchestrator session through
  *  the existing machinery — the whole group comes back, the workers rejoin into
@@ -480,40 +487,48 @@ async function resumeDormantGroup(ws: Workspace): Promise<void> {
     sessions.toggle(); // no binding to resume from — let the human pick a session
     return;
   }
-  let entry: { session_id: string; role: string } | undefined;
+  // Another card of this same group is already resuming — the whole group comes
+  // back at once, so ignore the duplicate rather than toast a redundant error.
+  if (resumingGroups.has(groupId)) return;
+  resumingGroups.add(groupId);
   try {
-    const roles = await orchSessionRoles();
-    entry =
-      roles.find((r) => r.group_id === groupId && r.role === "orchestrator") ??
-      roles.find((r) => r.group_id === groupId);
-  } catch {
-    /* fall through to the browser */
+    let entry: { session_id: string; role: string } | undefined;
+    try {
+      const roles = await orchSessionRoles();
+      entry =
+        roles.find((r) => r.group_id === groupId && r.role === "orchestrator") ??
+        roles.find((r) => r.group_id === groupId);
+    } catch {
+      /* fall through to the browser */
+    }
+    if (!entry) {
+      showToast("No recorded orchestration session for this group — open the session browser.", "info");
+      sessions.toggle();
+      return;
+    }
+    const preexisting = ws.grid.allPanes();
+    try {
+      const restored = await resumeOrchSession(ws.grid, eventsFor(ws), entry.session_id, {
+        group: groupId,
+        role: entry.role,
+      });
+      if (restored) tabs.bindGroup(restored.groupId, ws.id);
+    } catch (err) {
+      // A resume error is recoverable (retry the button) — a toast, not the
+      // app-crash banner (#194 P4 MED-3).
+      showToast(`Couldn't resume group: ${String(err)}`, "error");
+      return;
+    }
+    // Drop the dormant ORCH placeholders that predated the resume (a mixed tab's
+    // dormant AGENT placeholders and live panes stay). The revive already added a
+    // real pane, so this can't empty the grid.
+    for (const p of preexisting) {
+      if (p.isDormant && p.dormantKind === "orch") ws.grid.closePane(p, false);
+    }
+    persistTabs();
+  } finally {
+    resumingGroups.delete(groupId);
   }
-  if (!entry) {
-    showToast("No recorded orchestration session for this group — open the session browser.", "info");
-    sessions.toggle();
-    return;
-  }
-  const preexisting = ws.grid.allPanes();
-  try {
-    const restored = await resumeOrchSession(ws.grid, eventsFor(ws), entry.session_id, {
-      group: groupId,
-      role: entry.role,
-    });
-    if (restored) tabs.bindGroup(restored.groupId, ws.id);
-  } catch (err) {
-    // A resume error is recoverable (retry the button) — a toast, not the
-    // app-crash banner (#194 P4 MED-3).
-    showToast(`Couldn't resume group: ${String(err)}`, "error");
-    return;
-  }
-  // Drop the dormant ORCH placeholders that predated the resume (a mixed tab's
-  // dormant AGENT placeholders and live panes stay). The revive already added a
-  // real pane, so this can't empty the grid.
-  for (const p of preexisting) {
-    if (p.isDormant && p.dormantKind === "orch") ws.grid.closePane(p, false);
-  }
-  persistTabs();
 }
 
 // PTYs whose exit event arrived before their pane finished starting.

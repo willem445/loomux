@@ -620,6 +620,9 @@ export class Grid {
       if (next) this.setActive(next);
     }
     this.renderDock();
+    // A batch fold moved panes between the tree and the dock — capture the new
+    // shape so a fold-then-quit restores them docked, not re-expanded (#194 P4).
+    this.onChange();
   }
 
   /** Restore several docked panes as one batch — the mirror of `minimizeMany`.
@@ -654,6 +657,7 @@ export class Grid {
     }
     if (last) last.focus();
     this.renderDock();
+    this.onChange();
   }
 
   /** The group-fold toggle (#46): fold a whole orchestration group's
