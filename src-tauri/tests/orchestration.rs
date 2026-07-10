@@ -4185,17 +4185,17 @@ fn gh_shim_script_gates_raw_api_release_shapes() {
     assert!(sh.contains("path_low") && sh.contains("a_ref"), "decides by parsed URL path + ref field (locus), not raw argv");
     assert!(sh.contains("*/refs/heads/*") && sh.contains("refs/heads/*"), "branch exemption keys on the ref locus, not any argv token");
     assert!(sh.contains("a_qopaque") && sh.contains("a_inputval"), "opaque graphql (--input/@file) fails safe to the gate");
-    // #196 r4: graphql endpoint recognized by SUFFIX (graphql | /graphql | */graphql),
-    // and the createRef branch exemption consults the parsed ref variable (a_ref), not
-    // only a literal in the query text.
+    // #196 r4: graphql endpoint recognized by SUFFIX (graphql | /graphql | */graphql).
     assert!(sh.contains("*/graphql"), "recognizes the graphql endpoint by suffix (/graphql, full-URL)");
     assert!(sh.contains("createrelease") && sh.contains("updaterelease") && sh.contains("deleterelease"),
         "catches graphql create/update/delete Release mutations");
     assert!(sh.contains("createref") && sh.contains("updateref"),
         "catches graphql create/update Ref tag mutations");
-    // #196 r5: the graphql createRef heads-exemption forbids ALL indirection — any `$`
-    // graphql variable gates (a positive prove-heads check is otherwise decoy-able).
-    assert!(sh.contains("*'$'*"), "any graphql `$` variable in a createRef fails safe to the gate");
+    // #196 r6: the graphql arm gates every ref/tag/release-creating mutation with NO
+    // "prove-it's-safe-from-the-text" logic (variables/comments/aliases/escapes each
+    // defeat a text heuristic). No vestige of the removed heads-exemption may remain.
+    assert!(!sh.contains("hpass"), "the decoy-able graphql heads-exemption must be fully removed");
+    assert!(!sh.contains("*'$'*"), "no residual `$`-variable text heuristic in the graphql arm");
     // The api path is audited as a release-gate event (same markers as the subcommand).
     assert!(sh.contains("release-gate-allowed") && sh.contains("release-gate-blocked"),
         "api release allows/blocks are audited as release-gate events");
@@ -4388,17 +4388,18 @@ fn gh_shim_harness_gates_raw_api_tag_ref_by_locus_defeating_decoys() {
     let blocked: [&[&str]; 9] = [plain, autopost, input_tag, input_stdin, patch_move, delete_ref, gql_createref, gql_opaque_stdin, gql_opaque_file];
     for s in blocked { assert!(!run(s), "tag-ref/opaque-graphql write must block with no markers: {s:?}"); }
 
-    // ---- Must PASS: branch writes (argv, URL, parsed body, inline graphql) + read GETs.
+    // ---- Must PASS: REST branch writes (argv, URL, parsed body) + a graphql read + GETs.
+    // (graphql ref mutations are covered — and now gate unconditionally — in the
+    // dedicated graphql test; here we only assert the REST branch-locus pass and reads.)
     let head_create: &[&str] = &["api", "-X", "POST", "repos/o/r/git/refs", "-f", "ref=refs/heads/feature", "-f", "sha=x"];
     let head_move: &[&str] = &["api", "-X", "PATCH", "repos/o/r/git/refs/heads/main", "-f", "sha=x"];
     let input_head: &[&str] = &["api", "-X", "POST", "repos/o/r/git/refs", "--input", &headp];
-    let gql_head_ref: &[&str] = &["api", "graphql", "-f", "query=mutation { createRef(input: { name: \"refs/heads/feature\", oid: \"a\" }) { ref { id } } }"];
     let gql_inline_read: &[&str] = &["api", "graphql", "-f", "query={ repository { releases { nodes { id } } } }"];
     let get_tag_ref: &[&str] = &["api", "repos/o/r/git/refs/tags/v9"];
     let get_releases: &[&str] = &["api", "repos/o/r/releases"];
     let issues_write: &[&str] = &["api", "-X", "POST", "repos/o/r/issues", "-f", "title=hi"];
-    for s in [head_create, head_move, input_head, gql_head_ref, gql_inline_read, get_tag_ref, get_releases, issues_write] {
-        assert!(run(s), "a branch write / inline-read / read GET must pass through: {s:?}");
+    for s in [head_create, head_move, input_head, gql_inline_read, get_tag_ref, get_releases, issues_write] {
+        assert!(run(s), "a REST branch write / graphql read / read GET must pass through: {s:?}");
     }
 
     // ---- Blanket markers ALLOW even the unparseable (stdin/opaque) shapes.
@@ -4444,14 +4445,14 @@ fn gh_shim_harness_gates_raw_api_tag_ref_by_locus_defeating_decoys() {
 
 #[test]
 fn gh_shim_harness_gates_graphql_endpoint_variants_and_variable_ref() {
-    // #196 ROUND-4: the REST arm is locus-solid, but the graphql arm had two holes —
-    // (1) it keyed on the endpoint being EXACTLY `graphql`, so `/graphql` and the
-    // full-URL host form (both plain POSTs of {"query":…}) skipped the gate; (2) the
-    // createRef gate only fired on a `refs/tags/` LITERAL in the query text, so a
-    // `-F ref=refs/tags/v9` graphql VARIABLE kept the literal out and slipped. Both
-    // create a refs/tags ref → release.yml → npm. This EXECUTES the shim to pin that
-    // graphql is recognized by suffix and the ref locus consults the parsed variable
-    // too — with the same "unprovable-locus = fail-safe gate" rule as the REST arm.
+    // #196: the graphql arm is recognized by endpoint SUFFIX (graphql | /graphql |
+    // full-URL — r4), and gates EVERY ref/tag/release-creating mutation UNCONDITIONALLY
+    // (r6). Successive rounds showed a text heuristic to "prove a mutation safe" is a
+    // losing game — a refs/tags literal, a -F ref= variable, a heads comment, a string
+    // escape `refs\/tags\/`, an alias each defeat one scan and the next encoding would
+    // too — so the graphql arm has NO prove-safe logic left to decoy. Branch createRef
+    // via graphql is a rare corner that fails safe to markers/grant; agents branch via
+    // REST git/refs, which the REST arm still classifies by real locus. Executes the shim.
     use std::process::Command;
     if Command::new("sh").arg("-c").arg("exit 0").status().map(|s| !s.success()).unwrap_or(true) {
         eprintln!("SKIP gh_shim_harness_graphql_locus…: no POSIX sh");
@@ -4487,38 +4488,47 @@ fn gh_shim_harness_gates_graphql_endpoint_variants_and_variable_ref() {
     let cr_var = "query=mutation($ref:String!){ createRef(input: { ref: $ref, oid: \"a\" }) { ref { id } } }"; // ref via variable
     let read_q = "query={ repository { releases { nodes { id } } } }";
 
-    // ---- BLOCK with no markers: every endpoint spelling, the variable-hidden ref, AND
-    // (r5) a createRef with ANY graphql `$` variable — including a refs/heads variable,
-    // which is gated because variable indirection can hide the real ref (a positive
-    // prove-heads test is decoy-able). Comment/decoy heads tokens must not excuse it.
+    // ---- r6: the graphql arm gates EVERY ref/tag/release-creating mutation with no
+    // "prove-it's-safe-from-the-text" logic — variables, comments, aliases, and string
+    // escapes each defeat a text heuristic, so there is none left to defeat. BLOCK with
+    // no markers, whatever the encoding of the ref.
     let x1_comment_tagvar: &[&str] = &["api", "graphql", "-F", "v=refs/tags/v9",
         "-f", "query=mutation($v:String!){ createRef(input:{ref:$v, oid:\"a\"}){ ref { id } } } # refs/heads/x"];
     let x2_decoy_headsvar: &[&str] = &["api", "graphql", "-F", "ref=refs/heads/x", "-F", "v=refs/tags/v9",
         "-f", "query=mutation($ref:String!,$v:String!){ createRef(input:{ref:$v}){ ref { id } } }"];
     let x3_updateref_nodeid: &[&str] = &["api", "graphql", "-F", "id=NODE123",
         "-f", "query=mutation($id:ID!){ updateRef(input:{refId:$id, oid:\"a\"}){ ref { id } } } # refs/heads/x"];
-    let block: [&[&str]; 10] = [
+    // r6 5th variant: a GraphQL string escape `refs\/tags\/v9` dodges a raw `refs/tags/`
+    // text scan, while a `# refs/heads/x` comment fakes a heads-proof. Unconditional
+    // gating kills the whole class.
+    let x4_escaped_slash: &[&str] = &["api", "graphql",
+        "-f", "query=mutation { createRef(input: { name: \"refs\\/tags\\/v9\", oid: \"a\" }) { ref { id } } } # refs/heads/x"];
+    let x5_aliased: &[&str] = &["api", "graphql",
+        "-f", "query=mutation { myref: createRef(input: { name: \"refs/tags/v9\", oid: \"a\" }) { ref { id } } }"];
+    let block: [&[&str]; 13] = [
         &["api", "graphql", "-f", cr_tags],                       // exact endpoint
         &["api", "/graphql", "-f", cr_tags],                      // leading-slash
         &["api", "https://api.github.com/graphql", "-f", cr_tags],// full URL host form
-        &["api", "graphql", "-F", "ref=refs/tags/v9", "-f", cr_var], // -F variable ref (no literal)
-        &["api", "/graphql", "-f", "ref=refs/tags/v9", "-f", cr_var], // -f variable ref
-        &["api", "graphql", "-F", "ref=refs/heads/feature", "-f", cr_var], // heads via VARIABLE → gated (r5)
+        &["api", "graphql", "-f", cr_heads],                      // inline HEADS now gates too (intended over-gate)
+        &["api", "graphql", "-F", "ref=refs/tags/v9", "-f", cr_var], // -F variable ref
+        &["api", "graphql", "-F", "ref=refs/heads/feature", "-f", cr_var], // heads via variable
         &["api", "graphql", "--input", "-"],                      // opaque stdin
         &["api", "graphql", "-F", &qopaque],                      // opaque query=@file
-        x1_comment_tagvar, x3_updateref_nodeid,
+        x1_comment_tagvar, x2_decoy_headsvar, x3_updateref_nodeid, x4_escaped_slash, x5_aliased,
     ];
-    for s in block { assert!(!run(s), "graphql tag-ref/indirection write must block with no markers: {s:?}"); }
-    assert!(!run(x2_decoy_headsvar), "a decoy -F ref=refs/heads with the real tag in another variable must block");
+    for s in block { assert!(!run(s), "graphql ref/tag mutation must block with no markers, any encoding: {s:?}"); }
 
-    // ---- PASS: ONLY an inline refs/heads createRef with NO variables, and reads.
-    let pass: [&[&str]; 4] = [
-        &["api", "graphql", "-f", cr_heads],                      // inline heads, no `$`
+    // ---- PASS: only NON-mutation read queries (no createRef/…/Release token at all).
+    let pass: [&[&str]; 3] = [
         &["api", "graphql", "-f", read_q],
         &["api", "/graphql", "-f", read_q],
         &["api", "https://api.github.com/graphql", "-f", read_q],
     ];
-    for s in pass { assert!(run(s), "an inline branch createRef (no variables) / read query must pass: {s:?}"); }
+    for s in pass { assert!(run(s), "a non-mutation graphql read query must pass: {s:?}"); }
+    // The REST arm's real-locus heads-pass is unchanged — a branch createRef via REST
+    // git/refs still passes (agents branch via REST/git push, not graphql).
+    assert!(run(&["api", "-X", "POST", "repos/o/r/git/refs", "-f", "ref=refs/heads/x", "-f", "sha=y"]),
+        "REST branch (refs/heads) create still passes by real locus");
 
     // ---- Blanket markers allow the opaque + variable-hidden shapes.
     set("autonomous"); set("auto_release");

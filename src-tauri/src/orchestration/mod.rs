@@ -298,34 +298,21 @@ if [ "$cmd" = "api" ]; then
   case "$path_low" in graphql|/graphql|*/graphql) is_graphql=1 ;; esac
   if [ "$is_graphql" = "1" ]; then
     # If the query is opaque (from --input/stdin or query=@file) we cannot scan it →
-    # fail-safe gate. Otherwise scan the inline query: a *Release / createTag mutation
-    # always gates; a createRef/updateRef gates UNLESS it is PROVABLY a branch with
-    # ZERO indirection (see below). A positive "prove it's heads → pass" test is always
-    # decoy-able — a heads-looking token can be added anywhere (a comment, a decoy
-    # field) while the real tag rides in a graphql variable — so the exemption forbids
-    # all indirection rather than trusting a token's presence (#196 r5).
+    # fail-safe gate. Otherwise: any ref/tag/release-CREATING mutation gates
+    # UNCONDITIONALLY — there is NO "prove it's a safe branch from the text" logic in
+    # the graphql arm, by design. Every text heuristic we tried (a refs/tags literal, a
+    # -F ref= variable, a no-`$`-variables rule) was defeated by the next encoding —
+    # graphql variables, comments, aliases, and string escapes (`refs\/tags\/`) each dodge
+    # a text scan, and the next encoding would too (#196 r6). A graphql createRef to a
+    # BRANCH is a rare corner (agents branch via `git push` or REST `git/refs`, which the
+    # REST arm classifies by real locus); gating it fails safe — markers/grant still
+    # allow it. A non-mutation read query carries none of these tokens → passes.
     if [ -n "$a_inputval" ] || [ "$a_qopaque" = "1" ]; then
       is_rel=1
     elif [ -n "$a_query" ]; then
       ql=$(printf '%s' "$a_query" | tr '[:upper:]' '[:lower:]')
-      case "$ql" in *createrelease*|*updaterelease*|*deleterelease*|*createtag*) is_rel=1 ;; esac
       case "$ql" in
-        *createref*|*updateref*)
-          # Pass ONLY when ALL hold, else fail-safe gate: (a) an INLINE refs/heads
-          # literal is in the query, AND (b) there is NO `$` graphql variable anywhere
-          # in the query (any variable → gate: a ref can hide behind `$v`), AND (c) NO
-          # refs/tags literal appears in the query or the parsed ref field. This
-          # over-gates the rare heads-createRef-via-variable case — acceptable, markers/
-          # grant still allow it; safety wins over a decoy-able convenience.
-          hpass=0
-          case "$a_query" in
-            *refs/heads/*)
-              hpass=1
-              case "$a_query" in *'$'*)        hpass=0 ;; esac
-              case "$a_query" in *refs/tags/*) hpass=0 ;; esac
-              case "$ref_low"  in refs/tags/*) hpass=0 ;; esac ;;
-          esac
-          [ "$hpass" = "1" ] || is_rel=1 ;;
+        *createref*|*updateref*|*createtag*|*createrelease*|*updaterelease*|*deleterelease*) is_rel=1 ;;
       esac
       # resolve the tag for grant-keying: a refs/tags variable, else an inline literal.
       case "$ref_low" in refs/tags/*) rtag=${a_ref#refs/tags/}; rtag=${rtag%% *} ;; esac

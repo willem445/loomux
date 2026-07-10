@@ -678,18 +678,20 @@ reconcile on read, mirrored into the kickoff config + a live notice, and surface
   (stdin body, opaque graphql, `DELETE …/releases/<id>` by numeric id), only the blanket markers
   (`autonomous && auto_release`, or supervised `dangerous && !autonomous`) can allow it — otherwise
   **fail-safe block**. A non-release api call (an issues endpoint, a branch `refs/heads` write, an
-  inline graphql read, a read-only GET) passes through untouched. The **graphql arm carries the same
-  locus rigor**: the endpoint is recognized by **suffix** (`graphql` | `/graphql` | `*/graphql`,
-  incl. the full-URL host form) — not an exact `graphql` string, which a `gh api /graphql`/full-URL
-  POST would have slipped (#196 r4). A `createRef`/`updateRef` gets **no decoy-able prove-heads
-  exemption**: a positive "it looks like heads → pass" test is always defeatable — a heads-looking
-  token can be dropped in a comment or a decoy field while the real tag rides in a graphql `$`
-  variable (#196 r5). So a `createRef`/`updateRef` passes **only** when it has ZERO indirection —
-  (a) an inline `refs/heads/` literal is in the query, (b) there is **no `$` graphql variable
-  anywhere** in the query (any variable → gate), and (c) no `refs/tags/` literal appears in the
-  query or the parsed ref field — else it **fails safe to the gate**. This over-gates the rare
-  heads-`createRef`-via-variable case, which markers/grant still allow; safety beats a decoy-able
-  convenience. (`*Release` and `createTag` mutations, and opaque graphql, gate unconditionally.)
+  read-only GET) passes through untouched. The **graphql arm**: the endpoint is recognized by
+  **suffix** (`graphql` | `/graphql` | `*/graphql`, incl. the full-URL host form) — not an exact
+  `graphql` string, which a `gh api /graphql`/full-URL POST would have slipped (#196 r4) — and it
+  gates **every ref/tag/release-creating mutation** (`createRef` | `updateRef` | `createTag` |
+  `create`/`update`/`deleteRelease`) **unconditionally**, plus opaque graphql (`--input`/stdin/
+  `@file`). There is **no "prove a mutation safe from the query text" logic** in the graphql arm,
+  by design: every text heuristic tried was defeated by the next encoding — a `refs/tags` literal,
+  a `-F ref=` variable, a no-`$`-variables rule — because graphql **variables, comments, aliases,
+  and string escapes** (`refs\/tags\/`) each dodge a text scan and the next encoding would too
+  (#196 r6). Closing the class (unconditional gate) removes the thing being decoyed. A graphql
+  `createRef` targeting a *branch* is a rare corner — agents create branches via `git push` or REST
+  `git/refs`, and the **REST arm still passes branch creation by real URL locus** (rev-68 confirmed
+  it airtight) — so gating the graphql-branch case fails safe: markers/grant still allow it. A
+  non-mutation graphql **read** query carries none of those tokens → passes.
 - **git shim** (new, same PATH-injection as the gh shim) gates `git push` that publishes a tag:
   `--tags`/`--follow-tags`/`--mirror` (bulk → blocked, push the specific approved tag),
   `refs/tags/<t>` and the `tag <t>` form (explicit), and a bare **`v*`** refspec (any v-prefixed
