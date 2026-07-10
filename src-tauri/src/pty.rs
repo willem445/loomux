@@ -136,11 +136,12 @@ pub struct PtyHandle {
     /// a human's half-written line without wedging on an already-submitted one —
     /// output-byte heuristics can't tell a keystroke's echo from a submit burst.
     input_pending: Arc<std::sync::atomic::AtomicBool>,
-    /// The interactive shell this pane was spawned with (#194 P2). Recorded so
-    /// the folder-picker `cd` (`change_dir`) emits the pane's *own* shell syntax
-    /// — cmd, PowerShell, or Git Bash — instead of guessing from the machine
-    /// default (rev-78 #3). Agent/custom panes record PowerShell (their default);
-    /// they don't drive the folder picker.
+    /// The interactive shell this pane *effectively* spawned (#194 P2) — after
+    /// any discovery-miss fallback, not the requested kind. Recorded so the
+    /// folder-picker `cd` (`change_dir`) emits the pane's own shell syntax — cmd,
+    /// PowerShell, or Git Bash — instead of guessing from the machine default
+    /// (rev-78 #3, nit 3). Agent/custom panes record PowerShell (or its cmd
+    /// degrade); they don't drive the folder picker.
     shell_kind: ShellKind,
 }
 
@@ -351,16 +352,23 @@ fn git_bash_candidates_from(program_roots: &[PathBuf], localappdata: Option<&Pat
 /// relocated / differently-cased Windows install.
 #[cfg(target_os = "windows")]
 fn is_system_bash(path: &Path, system_root: Option<&Path>) -> bool {
-    let lossy = path.to_string_lossy().to_ascii_lowercase();
+    // Normalize `/`→`\` before comparing so a forward-slash PATH entry
+    // (`C:/Windows/System32/bash.exe`) can't evade the check (rev-78 nit 2).
+    let norm = path.to_string_lossy().replace('/', "\\").to_ascii_lowercase();
     if let Some(root) = system_root {
-        let root = root.to_string_lossy().to_ascii_lowercase();
-        if !root.is_empty() && lossy.starts_with(&root) {
-            return true;
+        let root = root.to_string_lossy().replace('/', "\\").to_ascii_lowercase();
+        let root = root.trim_end_matches('\\');
+        if !root.is_empty() {
+            // Match at a component boundary (`<root>\…`) so `C:\WindowsFoo\…`
+            // isn't caught by a `C:\Windows` prefix.
+            if norm.starts_with(&format!("{root}\\")) {
+                return true;
+            }
         }
     }
     // Fallback when SystemRoot is unreadable: the WSL launcher lives in
     // ...\System32\bash.exe, a location Git for Windows never occupies.
-    lossy.contains("\\system32\\")
+    norm.contains("\\system32\\")
 }
 
 /// Derive `bash.exe` from a discovered `git.exe`. Git for Windows lays out
@@ -442,14 +450,16 @@ fn powershell_shell_command() -> CommandBuilder {
 /// emits a Windows-form path (`C:/Projects/x`), NOT MSYS `$PWD` (`/c/...`):
 /// `dir_info`, the branch chip, and the git-change watcher are all Windows-path
 /// consumers, and a raw MSYS path resolves to nothing (rev-78 #1). `cygpath`
-/// ships in every Git-for-Windows `/usr/bin`, on PATH under `--login`.
+/// ships in every Git-for-Windows `/usr/bin`, on PATH under `--login`; the
+/// `2>/dev/null || printf %s` guard keeps a stray shell (no cygpath) from
+/// printing a per-prompt error and degrades to the raw `$PWD` (rev-78 nit 1).
 #[cfg(target_os = "windows")]
 fn git_bash_shell_command(bash: &Path) -> CommandBuilder {
     let mut cmd = CommandBuilder::new(bash.as_os_str());
     cmd.args(["--login", "-i"]);
     cmd.env(
         "PROMPT_COMMAND",
-        "printf '\\033]7;%s\\007' \"$(cygpath -m \"$PWD\")\"",
+        "printf '\\033]7;%s\\007' \"$(cygpath -m \"$PWD\" 2>/dev/null || printf %s \"$PWD\")\"",
     );
     cmd
 }
@@ -483,6 +493,27 @@ fn interactive_shell_command(_kind: ShellKind) -> CommandBuilder {
     cmd.arg("-l");
     cmd.env("PROMPT_COMMAND", "printf '\\033]7;%s\\007' \"$PWD\"");
     cmd
+}
+
+/// The shell kind a pane will *actually* run, resolving the same fallbacks
+/// `interactive_shell_command` applies: a Git Bash discovery miss becomes
+/// PowerShell, and PowerShell with no pwsh installed becomes cmd. Recorded on
+/// the handle (not the *requested* kind) so `change_dir` emits the truthful
+/// shell's `cd` syntax even in the probe→spawn discovery-miss race (rev-78 nit 3).
+#[cfg(target_os = "windows")]
+fn effective_shell_kind(requested: ShellKind) -> ShellKind {
+    match requested {
+        ShellKind::GitBash if find_git_bash().is_none() => {
+            effective_shell_kind(ShellKind::PowerShell)
+        }
+        ShellKind::PowerShell if default_shell().contains("cmd.exe") => ShellKind::Cmd,
+        other => other,
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn effective_shell_kind(requested: ShellKind) -> ShellKind {
+    requested
 }
 
 /// Discover the Git Bash `bash.exe` path so the welcome screen can enable (or
@@ -826,7 +857,9 @@ pub fn spawn_pty(
             #[cfg(target_os = "windows")]
             _job: job,
             input_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            shell_kind: kind,
+            // Record what actually spawned, not what was requested, so the
+            // folder-picker cd is truthful even after a discovery-miss fallback.
+            shell_kind: effective_shell_kind(kind),
         },
     );
 
@@ -1299,6 +1332,13 @@ mod tests {
         // Even with SystemRoot unreadable, a System32 bash is still rejected.
         assert!(is_system_bash(Path::new(r"C:\Windows\System32\bash.exe"), None));
         assert!(!is_system_bash(Path::new(r"C:\Program Files\Git\bin\bash.exe"), None));
+        // Separator normalization: a forward-slash PATH entry can't evade it
+        // (rev-78 nit 2).
+        assert!(is_system_bash(Path::new("C:/Windows/System32/bash.exe"), Some(sysroot)));
+        assert!(is_system_bash(Path::new("C:/Windows/System32/bash.exe"), None));
+        // Component-boundary match: a sibling like C:\WindowsFoo is NOT excluded
+        // by the C:\Windows prefix.
+        assert!(!is_system_bash(Path::new(r"C:\WindowsFoo\bin\bash.exe"), Some(sysroot)));
     }
 
     #[cfg(windows)]
