@@ -524,6 +524,16 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   flex: 1; min-height: 0;
   /* Anchors the voice-capture overlay badge (#58); does not change geometry. */
   position: relative;
+  /* Contain xterm's own stacking. xterm styles its internal layers with
+     positive z-indexes (`.xterm-helpers` z-index:5, `.xterm-accessibility`
+     z-index:10) on the assumption that its container is a stacking context.
+     A bare `position: relative` with `z-index: auto` is NOT one, so those
+     layers leaked up into .pane's stacking context and painted ABOVE the
+     sibling steer strip. Where the expanded steer box floats over the
+     terminal, that stole the box's clicks and passed them to the CLI (#193).
+     `isolation: isolate` forms the stacking context with zero geometry impact —
+     no size change, so the PTY is never resized (hard constraint 1). */
+  isolation: isolate;
   /* Cursor-follow under the git overlay (see Pane.updateTermShift). */
   transition: transform 0.18s var(--ease);
 }
@@ -540,6 +550,16 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   padding: 6px 8px;
   border-top: 1px solid var(--group-color, var(--border-soft));
   background: linear-gradient(180deg, #121219, #0e0e14);
+  /* The steer textarea grows UPWARD and floats over the terminal (#100). Give
+     the whole strip its own stacking context above the terminal (isolated
+     separately) and the read-only pane overlays (.git-overlay z-index:15), so
+     every pixel of the expanded box is painted on top and owns its own clicks —
+     the box is the actively-focused input, so it must win the overlap (#193).
+     The strip's own box only covers its docked footprint; the floating textarea
+     is the only thing overhanging the terminal, so clicks OUTSIDE it still fall
+     through to the terminal normally. Purely a paint order — no geometry change,
+     so the PTY is untouched (hard constraint 1). */
+  position: relative; z-index: 16;
 }
 .orch-compose-row { display: flex; gap: 6px; }
 /* The steer box wraps and auto-grows (#100). To keep the strip's flow footprint
