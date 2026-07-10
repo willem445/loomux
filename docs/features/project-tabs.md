@@ -120,8 +120,12 @@ divider positions you'd dragged. Each pane comes back by kind:
   (PowerShell / cmd / Git Bash) — instant, nothing to resume.
 - **Agent panes** (Claude) **auto-resume their session** — the CLI reopens with
   its prior context loaded, into the idle TUI. Resuming **spends nothing until
-  you send a prompt**, and loomux never replays one for you. A best-effort CLI
-  with no resumable session comes back as a dormant pane with a **Start** button.
+  you send a prompt**, and loomux never replays one for you. If the recorded
+  session has no saved conversation (you closed it before sending a prompt, or
+  the transcript was deleted), the pane comes back as a **fresh** session in the
+  same spot — same folder, same agent — instead of erroring; a best-effort CLI
+  with no resumable session at all comes back as a dormant pane with a **Start**
+  button.
 - **Orchestration panes** come back **dormant**, with a **Resume group** button —
   reviving a whole group can spawn workers and spend credits, so that stays a
   deliberate, human-triggered action. The tab keeps its group binding and shows

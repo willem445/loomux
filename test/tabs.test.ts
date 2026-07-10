@@ -312,3 +312,30 @@ test("a strip listener recomputes on notify — fan-out reaches the full count",
   }
   assert.equal(lastCount, 3, "every spawned agent, including the last, is counted");
 });
+
+// ---------- P4 BUG-2: boot must never touch an empty TabManager ----------
+
+test("activeWorkspace throws on an empty manager — the invariant the seed protects", () => {
+  // The decline/restore boot flow resolves through activeWorkspace (window-focus
+  // handler, voice init) while the splash is up. Before any tab exists this throws
+  // — which is the crash. Seeding one tab first makes it safe.
+  const { tabs } = makeManager();
+  assert.throws(() => tabs.activeWorkspace, /no active workspace/);
+  const seed = tabs.newTab();
+  assert.equal(tabs.activeWorkspace.id, seed.id, "a seeded tab makes activeWorkspace safe");
+});
+
+test("restore indexes activeIndex against the restored tabs, not the pre-splash seed", () => {
+  // With a seed at index 0, indexing tabs.tabs[activeIndex] would be off by one.
+  // Mirror the boot flow: seed, create the restored tabs, switch to restored[idx],
+  // then drop the seed — the intended active tab must survive.
+  const { tabs } = makeManager();
+  const seed = tabs.newTab();
+  const restored = [tabs.newTab(false), tabs.newTab(false), tabs.newTab(false)];
+  const activeIndex = 1;
+  tabs.switchTo(restored[activeIndex].id);
+  assert.equal(tabs.count > 1, true);
+  tabs.closeTab(seed.id);
+  assert.equal(tabs.activeTabId, restored[activeIndex].id, "the saved active tab, not an off-by-one neighbor");
+  assert.equal(tabs.get(seed.id), undefined, "the seed is gone");
+});

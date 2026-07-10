@@ -6,13 +6,14 @@ import type { Grid } from "./grid";
 import { Workspace } from "./workspace";
 import { TabManager } from "./tabs";
 import { TabBar } from "./tabbar";
-import type { Pane, PaneEvents } from "./pane";
+import type { Pane, PaneEvents, PaneOptions } from "./pane";
 import { SessionBrowser } from "./sessions";
 import {
   ensureOutputRouter,
   onPtyExit,
   loadUiTabs,
   saveUiTabs,
+  listSessions,
   type PtyExit,
   type SessionInfo,
 } from "./pty";
@@ -38,7 +39,10 @@ import {
   planLayoutRestore,
   planPaneRestore,
   agentResumeCommand,
+  agentFreshCommand,
+  shouldRespawnFresh,
   type RestoreAction,
+  type SessionResumable,
 } from "./panerestore";
 import { showRestoreSplash } from "./restoresplash";
 
@@ -298,25 +302,34 @@ function hasRestorableContent(saved: PersistedTabs | null): boolean {
  *  button — the whole group is revived only by the human via resumeOrchSession, so
  *  nothing here spawns a group (the no-double-spawn contract). Group→tab bindings
  *  survive so a later resume/rejoin still routes into the right tab. */
-async function restoreSessionTabs(saved: PersistedTabs): Promise<void> {
+async function restoreSessionTabs(saved: PersistedTabs, resumable: SessionResumable): Promise<void> {
+  // Track the tabs WE create so activeIndex resolves against them, not against
+  // tabs.tabs — the pre-splash seed tab sits at index 0 and would offset it (BUG-2).
+  const restored: Workspace[] = [];
   for (const t of saved.tabs) {
     const ws = tabs.newTab(false);
+    restored.push(ws);
     tabs.renameTab(ws.id, t.name);
     tabs.setColor(ws.id, t.color);
     if (t.groupId) tabs.bindGroup(t.groupId, ws.id);
-    if (t.layout) await rebuildLayout(ws, t.layout);
-    if (t.docked?.length) await restoreDocked(ws, t.docked);
+    if (t.layout) await rebuildLayout(ws, t.layout, resumable);
+    if (t.docked?.length) await restoreDocked(ws, t.docked, resumable);
   }
-  const activeWs = tabs.tabs[saved.activeIndex];
+  const activeWs = restored[saved.activeIndex];
   if (activeWs) tabs.switchTo(activeWs.id);
 }
 
 /** Replay a persisted layout tree into a tab's grid via panerestore's ordered
  *  open-plan, then apply the saved flex weights so the divider positions come
  *  back exactly (not snapped to 50/50). Each step opens ONE pane; `relativeTo`
- *  indexes an earlier step's pane as the split anchor. */
-async function rebuildLayout(ws: Workspace, layout: PersistedLayoutNode): Promise<void> {
-  const steps = planLayoutRestore(layout);
+ *  indexes an earlier step's pane as the split anchor. `resumable` decides, per
+ *  agent, resume-vs-fresh (BUG-1). */
+async function rebuildLayout(
+  ws: Workspace,
+  layout: PersistedLayoutNode,
+  resumable: SessionResumable
+): Promise<void> {
+  const steps = planLayoutRestore(layout, resumable);
   const panes: Pane[] = [];
   for (const step of steps) {
     const anchor = step.relativeTo === null ? undefined : panes[step.relativeTo];
@@ -332,9 +345,13 @@ async function rebuildLayout(ws: Workspace, layout: PersistedLayoutNode): Promis
  *  session would be silently lost. Its minimized-ness is preserved; if a docked
  *  pane happens to be the tab's only pane it can't re-minimize (grid never empties
  *  the dock's parent), so it stays visible rather than being dropped. */
-async function restoreDocked(ws: Workspace, docked: PersistedPane[]): Promise<void> {
+async function restoreDocked(
+  ws: Workspace,
+  docked: PersistedPane[],
+  resumable: SessionResumable
+): Promise<void> {
   for (const record of docked) {
-    const pane = await openActionPane(ws, planPaneRestore(record));
+    const pane = await openActionPane(ws, planPaneRestore(record, resumable));
     ws.grid.minimize(pane);
   }
 }
@@ -361,12 +378,47 @@ async function openActionPane(
       // Resume into the idle TUI — loads context, spends nothing until a prompt,
       // and NEVER carries a replayed prompt (agentResumeCommand only rewrites flags).
       const resume = agentResumeCommand(a.command, a.argv, a.sessionId);
-      return ws.grid.openPane(
+      const pane = await ws.grid.openPane(
         {
           name: a.name,
           cwd: a.cwd ?? undefined,
           command: resume.command,
           argv: resume.argv,
+          sessionId: a.sessionId,
+          background: true,
+        },
+        events,
+        dir,
+        anchor
+      );
+      // Runtime backstop (BUG-1): if this `--resume` exits on a missing/deleted
+      // conversation (or any resume-time CLI failure), respawn fresh in place
+      // instead of stranding a dead pane. Remember the fresh opts, keyed by pane;
+      // the exit handler consumes it one-shot (see onPtyExit / reapIfExited).
+      const fresh = agentFreshCommand(a.command, a.argv, a.sessionId);
+      resumeFallbacks.set(pane, {
+        opts: {
+          name: a.name,
+          cwd: a.cwd ?? undefined,
+          command: fresh.command,
+          argv: fresh.argv,
+          sessionId: a.sessionId,
+        },
+        at: Date.now(),
+      });
+      return pane;
+    }
+    case "fresh-agent": {
+      // The recorded session has no resumable conversation (never prompted, or the
+      // transcript is gone) — start a fresh session in place with the same
+      // identity, reusing the recorded id so it's resumable again next boot (BUG-1).
+      const fresh = agentFreshCommand(a.command, a.argv, a.sessionId);
+      return ws.grid.openPane(
+        {
+          name: a.name,
+          cwd: a.cwd ?? undefined,
+          command: fresh.command,
+          argv: fresh.argv,
           sessionId: a.sessionId,
           background: true,
         },
@@ -534,6 +586,34 @@ async function resumeDormantGroup(ws: Workspace): Promise<void> {
 // PTYs whose exit event arrived before their pane finished starting.
 const earlyExits = new Map<number, PtyExit>();
 
+// Fresh-session fallback for resumed agent panes (#194 BUG-1): a `--resume` that
+// exits on a missing/deleted conversation should respawn FRESH in place, not
+// strand a dead pane. Keyed by pane, with the spawn time so we only treat an
+// IMMEDIATE failure as a resume failure — a resume that succeeded and was worked
+// in for a while before exiting must NOT be clobbered. Consumed one-shot.
+const resumeFallbacks = new Map<Pane, { opts: PaneOptions; at: number }>();
+
+/** How soon after a `--resume` spawn a failure exit still counts as "the resume
+ *  itself failed" (the CLI rejects a missing conversation at startup, within a
+ *  second). A later exit is the human's own session ending — leave it alone. */
+const RESUME_FAIL_WINDOW_MS = 15_000;
+
+/** If `pane` is a resumed agent whose `--resume` failed at startup, respawn it
+ *  fresh in place and report handled. One-shot: the fallback is removed whether
+ *  or not it fires, so a later exit falls through to the normal keep-open/close
+ *  path. Time-gated so a long-lived resumed session that later exits non-zero is
+ *  never mistaken for a resume failure and clobbered. */
+function tryResumeFallback(pane: Pane, exit: PtyExit): boolean {
+  const fb = resumeFallbacks.get(pane);
+  if (!fb) return false;
+  resumeFallbacks.delete(pane); // one-shot regardless of outcome
+  if (!shouldRespawnFresh(exit)) return false;
+  if (Date.now() - fb.at > RESUME_FAIL_WINDOW_MS) return false; // a real session ended, not a resume failure
+  showToast(`Recorded session not resumable — started a fresh ${pane.name} session.`, "info");
+  void pane.respawnFresh(fb.opts).then(() => onGridChanged());
+  return true;
+}
+
 // ---------- welcome / pane-setup surface (#194) ----------
 // There is no global "agent mode" anymore: every pane opens as the welcome /
 // pane-setup surface, where the user declares its kind (Agent / Orchestrator /
@@ -638,6 +718,7 @@ function reapIfExited(ws: Workspace, pane: Pane): void {
   const exit = earlyExits.get(pane.ptyId);
   if (!exit) return;
   earlyExits.delete(pane.ptyId);
+  if (tryResumeFallback(pane, exit)) return; // resume failed → fresh respawn in place
   if (pane.keepOpenOnExit(exit)) {
     pane.notifyExited(exit.exit_code);
     onGridChanged(); // a kept-open pane is now dead → drop it from the live count
@@ -707,6 +788,7 @@ void onPtyExit((exit) => {
     return;
   }
   const { ws, pane } = found;
+  if (tryResumeFallback(pane, exit)) return; // resume failed → fresh respawn in place
   if (pane.keepOpenOnExit(exit)) {
     pane.notifyExited(exit.exit_code);
     onGridChanged(); // dead-but-kept-open → update the live agent count
@@ -865,6 +947,15 @@ initOrchestration(orchWiring);
 // Preview thumbnails serialize live on hover (see TabBar) from the in-memory
 // buffer — no layout, no PTY resize (#63 no-resize invariant).
 void (async () => {
+  // Seed exactly one tab BEFORE anything can touch the active workspace (#194 P4
+  // BUG-2). The restore splash is awaited below, and during that await the
+  // window-focus handler (and voice init, etc.) resolve through
+  // `tabs.activeWorkspace`, which THROWS when the manager is empty ("no active
+  // workspace"). Seeding first guarantees there's always an active tab; the
+  // restore path discards this seed once it has built the saved tabs, and the
+  // fresh/decline path just keeps it as the blank welcome tab.
+  const seed = tabs.newTab();
+
   // Decode the persisted session and decide restore vs fresh (#194 P4). The
   // decision is pure (decideRestore); the splash only appears when the remembered
   // preference is still "ask" AND there's something worth restoring.
@@ -891,15 +982,30 @@ void (async () => {
   await ensureOutputRouter();
 
   if (outcome === "restore" && saved) {
-    await restoreSessionTabs(saved);
-  } else {
-    // Decline / nothing to restore → one blank tab showing the welcome screen.
-    tabs.newTab();
+    // Which recorded agent sessions still have a resumable conversation on disk:
+    // listSessions() lists exactly the sessions that HAVE a transcript, so an id
+    // absent here (a never-prompted / deleted session) restores FRESH instead of a
+    // doomed --resume (BUG-1). Best-effort — on failure, assume resumable and let
+    // the runtime backstop catch a resume that fails anyway.
+    let resumableIds = new Set<string>();
+    try {
+      resumableIds = new Set((await listSessions()).map((s) => s.id));
+    } catch {
+      /* keep the empty set's caller-friendly default below */
+    }
+    const seenAny = resumableIds.size > 0;
+    // If the list came back empty (or errored), don't force every agent fresh —
+    // fall back to "assume resumable" and lean on the runtime backstop.
+    const resumable: SessionResumable = (sid) => (seenAny ? resumableIds.has(sid) : true);
+    await restoreSessionTabs(saved, resumable);
+    // Drop the pre-splash seed now that the saved tabs (and their active tab) exist.
+    if (tabs.count > 1) tabs.closeTab(seed.id);
   }
+  // else: the seed tab IS the fresh/decline welcome tab — keep it.
 
   // Empty-tab fill (#194): any tab still empty after restore — a restored tab whose
   // layout was null (old file / group-only), a group-bound tab whose orchestrator
-  // hasn't resumed, or the brand-new fresh-start tab — opens the welcome surface.
+  // hasn't resumed, or the kept seed (fresh/decline) — opens the welcome surface.
   // In-pane content (no PTY until submit), so filling a background tab is safe.
   // Still under the `booting` guard so it doesn't persist (which would clobber the
   // saved session in the non-committal case).

@@ -662,6 +662,14 @@ export class Pane implements VoiceTargetPane {
     // pane the human is typing in (#117); grid.openPane decides takeFocus.
     if (takeFocus) this.focus();
 
+    await this.attachPty(opts);
+  }
+
+  /** Spawn (or respawn) the PTY for this already-open terminal and wire output /
+   *  git-watch / the ordered input writer to it. Split out of `start` so the
+   *  fresh-session backstop (`respawnFresh`) can reuse it without re-opening the
+   *  terminal (#194 BUG-1). */
+  private async attachPty(opts: PaneOptions): Promise<void> {
     try {
       await ensureOutputRouter();
       const cols = Number.isFinite(this.term.cols) && this.term.cols > 1 ? this.term.cols : 80;
@@ -700,6 +708,31 @@ export class Pane implements VoiceTargetPane {
       this.term.writeln(`\x1b[91mloomux: failed to start shell\x1b[0m`);
       this.term.writeln(`\x1b[90m${String(err)}\x1b[0m`);
     }
+  }
+
+  /** Respawn this pane with a FRESH process in place, reusing the already-open
+   *  terminal — the runtime backstop when a resumed agent's `--resume` exited on
+   *  a missing/deleted conversation (#194 BUG-1). Same pane, position, and cwd;
+   *  clears the dead error text and starts `opts`' command with a fresh ordered
+   *  writer bound to the new PTY. Not itself a resume, so it can't re-trigger the
+   *  fallback (the caller also makes the fallback one-shot). */
+  async respawnFresh(opts: PaneOptions = {}): Promise<void> {
+    if (this.disposed) return;
+    this.exited = false;
+    this.ptyId = null;
+    if (opts.name) this.setName(opts.name);
+    this.launchedCommand = !!opts.command?.trim();
+    this.spawnCommand = opts.command ?? null;
+    this.spawnArgv = opts.argv ?? null;
+    this.spawnShellKind = opts.shellKind ?? null;
+    this.agentSessionId = opts.sessionId ?? null;
+    if (opts.cwd) {
+      this.cwdRaw = opts.cwd;
+      void this.refreshDir(opts.cwd);
+    }
+    this.term.reset(); // wipe the "No conversation found …" error + resume banner
+    this.writer = createOrderedWriter(); // a fresh input pipe for the new PTY
+    await this.attachPty(opts);
   }
 
   /** Render the welcome / pane-setup surface in this pane instead of a terminal

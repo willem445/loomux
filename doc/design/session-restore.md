@@ -224,6 +224,38 @@ same `openActionPane` used for layout leaves, then `grid.minimize`s it back into
 the dock. So the live buffer/scrollback is still never captured, but no *session*
 is lost to the dock.
 
+### Post-demo fixes — resume-of-empty-session and the boot ordering
+
+**BUG-1 — a `--resume` with no conversation must not strand a dead pane.** We mint
+`--session-id` at launch, but a session the user never prompted persists no
+transcript, so `claude --resume <id>` exits 1 ("No conversation found …"). Two
+layers now handle it, both keeping panerestore pure:
+
+- *Pre-check.* `main.ts` fetches `listSessions()` (which lists exactly the
+  sessions that HAVE a transcript) and passes a `SessionResumable` predicate into
+  `planLayoutRestore`/`planPaneRestore`. An agent whose id is absent plans a new
+  `fresh-agent` action instead of `resume-agent` — a fresh session **in place**
+  with the same name/cwd/CLI, reusing the recorded id (via `agentFreshCommand`,
+  which pins `--session-id`, not `--resume`) so it's resumable again next boot.
+  On an empty/failed session list we assume resumable and lean on the backstop.
+- *Runtime backstop.* A resumed pane registers a one-shot fresh-fallback. If its
+  PTY exits unexpectedly non-zero **within a short window** of the resume spawn
+  (`shouldRespawnFresh` + a time gate), `Pane.respawnFresh` reuses the open
+  terminal to start fresh in place — covering a transcript deleted between the
+  pre-check and the spawn, or any other resume-time CLI failure. The time gate is
+  essential: a resume that *succeeded* and was worked in for a while and then
+  exits non-zero is the human's own session ending, not a resume failure, so it's
+  left alone.
+
+**BUG-2 — decline crashed with "no active workspace".** The restore splash is
+awaited while the app has zero tabs, and the window-focus handler (plus voice
+init) resolve through `tabs.activeWorkspace`, which throws when the manager is
+empty. Root cause was ordering, not a missing guard: boot now **seeds one tab
+before** the splash, so there is always an active workspace. The restore path
+builds its saved tabs and then drops the seed (indexing `activeIndex` against the
+tabs it created, not `tabs.tabs`, since the seed offsets it); the fresh/decline
+path just keeps the seed as the blank welcome tab.
+
 **The credit/data sharp edges.** The dormant **Resume group** button disables on
 first click and re-enables only on failure — a second click while the first resume
 is in flight can't double-create the group (the double-spawn the contract

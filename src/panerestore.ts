@@ -45,6 +45,19 @@ export type RestoreAction =
       sessionId: string;
     }
   | {
+      // An agent whose recorded session id has NO resumable conversation on disk
+      // (never prompted → no transcript, or the transcript was deleted). Resuming
+      // it would exit 1 ("No conversation found …") and strand a dead pane, so we
+      // start a FRESH session in place instead — SAME cwd / CLI / name — reusing the
+      // recorded id so the fresh session is itself resumable next boot. (#194 BUG-1)
+      type: "fresh-agent";
+      name: string;
+      cwd: string | null;
+      command: string | null;
+      argv: string[] | null;
+      sessionId: string;
+    }
+  | {
       type: "dormant-agent";
       name: string;
       cwd: string | null;
@@ -58,8 +71,19 @@ export type RestoreAction =
       name: string;
     };
 
-/** Map ONE persisted pane to its restore action, per the adopted hybrid. */
-export function planPaneRestore(pane: PersistedPane): RestoreAction {
+/** True when a recorded agent session id still has a resumable conversation on
+ *  disk. The wiring builds this from `listSessions()` (which lists exactly the
+ *  sessions that HAVE a transcript) and passes it in, keeping this module pure —
+ *  the alternative would be a Tauri call from here (#194 BUG-1). */
+export type SessionResumable = (sessionId: string) => boolean;
+
+/** Map ONE persisted pane to its restore action, per the adopted hybrid.
+ *
+ *  @param resumable optional predicate: does this session id still have a
+ *  resumable conversation? When omitted, an agent with an id is assumed
+ *  resumable (the original behavior). When provided and it returns false, the
+ *  agent restores FRESH (same identity) instead of a doomed `--resume`. */
+export function planPaneRestore(pane: PersistedPane, resumable?: SessionResumable): RestoreAction {
   switch (pane.paneKind) {
     case "terminal":
       return { type: "spawn-terminal", name: pane.name, cwd: pane.cwd, shellKind: pane.shellKind };
@@ -70,6 +94,20 @@ export function planPaneRestore(pane: PersistedPane): RestoreAction {
       // Auto-resume when we have a session id AND the hybrid is enabled; else a
       // dormant Start placeholder (no id to resume into, or the flip is off).
       if (AUTO_RESUME_AGENTS && pane.sessionId) {
+        // If we can tell the session has no resumable conversation, start fresh in
+        // place rather than crash on `--resume` (BUG-1). Unknown (no predicate) →
+        // attempt the resume; the runtime backstop (shouldRespawnFresh) catches a
+        // resume that fails anyway (deleted transcript, CLI error).
+        if (resumable && !resumable(pane.sessionId)) {
+          return {
+            type: "fresh-agent",
+            name: pane.name,
+            cwd: pane.cwd,
+            command: pane.command,
+            argv: pane.argv,
+            sessionId: pane.sessionId,
+          };
+        }
         return {
           type: "resume-agent",
           name: pane.name,
@@ -129,6 +167,52 @@ export function agentResumeCommand(
   return { command: `claude --resume ${sessionId}` };
 }
 
+/** Build the command that starts a FRESH agent session in place, for the
+ *  fallback when a recorded session has no resumable conversation (#194 BUG-1).
+ *  Same shape as agentResumeCommand but pins the recorded id via `--session-id`
+ *  (not `--resume`), so the fresh session is created with that id and becomes
+ *  resumable itself once a prompt is sent — and, like resume, never carries a
+ *  prompt. Drops any stale `--resume`/`--session-id` first so we don't double or
+ *  attempt a resume. */
+export function agentFreshCommand(
+  command: string | null,
+  argv: string[] | null,
+  sessionId: string
+): { command?: string; argv?: string[] } {
+  const strip = (tokens: string[]): string[] => {
+    const out: string[] = [];
+    for (let i = 0; i < tokens.length; i++) {
+      const t = tokens[i];
+      if (t === "--session-id" || t === "--resume") {
+        i++;
+        continue;
+      }
+      if (t.startsWith("--session-id=") || t.startsWith("--resume=")) continue;
+      out.push(t);
+    }
+    return out;
+  };
+  if (command && command.trim()) {
+    return { command: [...strip(command.trim().split(/\s+/)), "--session-id", sessionId].join(" ") };
+  }
+  if (argv && argv.length) {
+    return { argv: [...strip(argv), "--session-id", sessionId] };
+  }
+  return { command: `claude --session-id ${sessionId}` };
+}
+
+/** The runtime backstop decision (#194 BUG-1): a resumed agent pane whose PTY
+ *  just exited — should we respawn it FRESH in place instead of stranding a dead
+ *  pane? Yes for any UNEXPECTED non-zero exit — a `--resume` against a missing/
+ *  deleted transcript exits non-zero ("No conversation found …"), and any other
+ *  resume-time CLI failure is handled the same honest way. A loomux-initiated kill
+ *  (`expected`) or a clean exit (0, the human quit the resumed session) is left
+ *  alone. Pure so the caller can unit-test it; the caller makes it one-shot so a
+ *  fresh respawn (which is not a resume) never loops. */
+export function shouldRespawnFresh(exit: { exit_code: number | null; expected: boolean }): boolean {
+  return !exit.expected && exit.exit_code !== null && exit.exit_code !== 0;
+}
+
 /** One `grid.openPane` call in a layout rebuild — enough to reconstruct ANY
  *  nested split tree, including telling a 2×2 grid apart from four stacked panes
  *  (which a flat leaf list cannot).
@@ -180,9 +264,17 @@ function entryWeightChain(node: PersistedLayoutNode): number[] {
  *  the sibling steps, never collapsing distinct nestings into one sequence.
  *  main.ts turns each step into `grid.openPane(opts, dir, relativeTo)` and then
  *  applies the `weights`. */
-export function planLayoutRestore(layout: PersistedLayoutNode): RestoreOpenStep[] {
+export function planLayoutRestore(
+  layout: PersistedLayoutNode,
+  resumable?: SessionResumable
+): RestoreOpenStep[] {
   const steps: RestoreOpenStep[] = [
-    { action: planPaneRestore(entryLeafPane(layout)), relativeTo: null, dir: "row", weights: entryWeightChain(layout) },
+    {
+      action: planPaneRestore(entryLeafPane(layout), resumable),
+      relativeTo: null,
+      dir: "row",
+      weights: entryWeightChain(layout),
+    },
   ];
   const expand = (node: PersistedLayoutNode, anchorIndex: number): void => {
     if (node.kind === "leaf") return;
@@ -196,7 +288,7 @@ export function planLayoutRestore(layout: PersistedLayoutNode): RestoreOpenStep[
       const prevAnchor = childAnchors[i - 1];
       childAnchors.push(steps.length);
       steps.push({
-        action: planPaneRestore(entryLeafPane(node.children[i])),
+        action: planPaneRestore(entryLeafPane(node.children[i]), resumable),
         relativeTo: prevAnchor,
         dir: node.dir,
         weights: entryWeightChain(node.children[i]),
