@@ -84,9 +84,12 @@ export const gitDiscard = (repo: string, path: string, untracked: boolean): Prom
   invoke("git_discard", { repo, path, untracked });
 
 /** Create a worktree named `name` beside the repo (branch of the same name,
- *  created if needed). Resolves to the worktree's absolute path. */
-export const gitWorktreeAdd = (repo: string, name: string): Promise<string> =>
-  invoke("git_worktree_add", { repo, name });
+ *  created if needed). The branch is cut from `base` — omit it to cut from the
+ *  repo's default branch, fetched fresh from origin (#204), never the primary
+ *  checkout's incidental HEAD. `base` is ignored when `name` already exists.
+ *  Resolves to the worktree's absolute path. */
+export const gitWorktreeAdd = (repo: string, name: string, base?: string): Promise<string> =>
+  invoke("git_worktree_add", { repo, name, base: base ?? null });
 
 // -- remote & history ops --
 

@@ -7,8 +7,12 @@ watching and may type into any pane at any time — treat human input as authori
 
 ## Your loomux MCP tools
 
-- `spawn_agent(name, kind, task, worktree?, branch?)` — open a new worker/reviewer/planner
-  pane (`kind`: `worker` | `reviewer` | `planner`, default `worker`). Loomux enforces the
+- `spawn_agent(name, kind, task, worktree?, branch?, base?)` — open a new worker/reviewer/planner
+  pane (`kind`: `worker` | `reviewer` | `planner`, default `worker`). A `worktree` branch is
+  cut from the repo's default branch, fetched fresh from origin — never from whatever the
+  primary checkout happens to sit on — so workers no longer need a manual rebase before
+  starting. Pass `base` (e.g. `"feat/x"`) to deliberately stack a worktree on a feature
+  branch. Loomux enforces the
   guardrails: at most {{MAX_AGENTS}} live delegates (workers+reviewers+planners count
   together), worker model `{{WORKER_MODEL}}`, reviewer model `{{REVIEWER_MODEL}}`, planner
   model `{{PLANNER_MODEL}}`. You cannot change these. A **planner** explores the codebase
@@ -189,7 +193,8 @@ touched, test strategy, and a **mergeability assessment**:
 - **Sprawling / high-conflict changes** (wide refactors, files most tasks touch):
   serialize — finish and get it merged by the user before starting dependents.
 - **Independent, well-contained changes**: parallelize across workers, each in its own
-  **worktree** (`spawn_agent(..., worktree: true, branch: "feat/x")`).
+  **worktree** (`spawn_agent(..., worktree: true, branch: "feat/x")`). The worktree is cut
+  from the default branch; to stack one on an in-flight branch, pass `base: "that-branch"`.
 - **Small quick fixes** when nothing else is in flight: a plain branch in the repo
   (`worktree: false`) is fine.
 

@@ -6675,7 +6675,7 @@ impl OrchRegistry {
         use_worktree: bool,
         branch: Option<String>,
     ) -> Result<AgentEntry, String> {
-        self.spawn_agent_ex(group_id, role, name, task, use_worktree, branch, None, None, None)
+        self.spawn_agent_ex(group_id, role, name, task, use_worktree, branch, None, None, None, None)
     }
 
     /// Full spawn: `resume_session` reopens a previous session (follow-ups
@@ -6690,6 +6690,7 @@ impl OrchRegistry {
         task: &str,
         use_worktree: bool,
         branch: Option<String>,
+        base: Option<String>,
         resume_session: Option<String>,
         cwd_override: Option<String>,
         restore_name_source: Option<NameSource>,
@@ -6780,6 +6781,10 @@ impl OrchRegistry {
             .map(|b| b.trim().to_string())
             .filter(|b| !b.is_empty())
             .unwrap_or_else(|| format!("agent/{agent_id}"));
+        // Explicit worktree base (default: the repo's default branch, resolved
+        // in git_worktree_add). Normalized once for both the worktree cut and
+        // the audit record (#204).
+        let base = base.map(|b| b.trim().to_string()).filter(|b| !b.is_empty());
         let cwd_override = cwd_override.map(|c| c.trim().to_string()).filter(|c| !c.is_empty());
         let (cwd, branch_note) = if let Some(c) = cwd_override {
             if !Path::new(&c).is_dir() {
@@ -6787,7 +6792,9 @@ impl OrchRegistry {
             }
             (c, String::new())
         } else if use_worktree && role != Role::Orchestrator && role != Role::Planner {
-            let wt = crate::git::git_worktree_add(group.repo.clone(), branch_name.clone())?;
+            // Cut the branch from the default branch (or an explicit `base`),
+            // never the primary checkout's incidental HEAD (#204).
+            let wt = crate::git::git_worktree_add(group.repo.clone(), branch_name.clone(), base.clone())?;
             (wt.clone(), format!(
                 "Your working directory is a dedicated git worktree at {wt} already checked out on branch '{branch_name}'."
             ))
@@ -6899,7 +6906,7 @@ impl OrchRegistry {
         self.audit(group_id, "loomux", "agent-spawn", json!({
             "agent": agent_id, "role": role, "name": display, "cwd": cwd,
             "cli": cli, "model": model, "worktree": use_worktree, "branch": branch_name, "task": task,
-            "session": session_id, "resume": resume,
+            "base": base, "session": session_id, "resume": resume,
         }));
         // Breadcrumb (no prompt/task text): ids + role only.
         crate::obs::breadcrumb(
@@ -8377,7 +8384,7 @@ pub fn resume_recorded_session(
     let (group_id, name) = (record.group_id.clone(), record.agent_name.clone());
     std::thread::spawn(move || {
         if let Err(e) = reg2.spawn_agent_ex(
-            &group_id, role, &name, "", false, None, Some(sid.clone()), cwd, restore_source,
+            &group_id, role, &name, "", false, None, None, Some(sid.clone()), cwd, restore_source,
         ) {
             reg2.audit(&group_id, "loomux", "error",
                 json!({ "what": "session rejoin failed", "session": sid, "err": e.clone() }));

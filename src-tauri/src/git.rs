@@ -553,12 +553,119 @@ fn valid_worktree_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'))
 }
 
+/// Resolve the ref a fresh agent branch should be cut from when the caller
+/// gives no explicit base: the repository's default branch on `origin` (#204).
+///
+/// We fetch `origin` first so the worktree branches from up-to-date remote
+/// state rather than whatever the primary checkout happens to sit on. An
+/// unreachable or absent remote is *not* fatal — we fall back to a local
+/// default-branch ref and drop a breadcrumb so a stale base is diagnosable.
+/// Preference order: the remote's advertised default (`origin/HEAD`), then
+/// `origin/main` / `origin/master`, then local `main` / `master`, then the
+/// configured `init.defaultBranch`, and only as a last resort `HEAD` (the old
+/// bug). The HEAD corner is reached whenever *no* default branch is resolvable
+/// — no remote and no local `main`/`master`, or a remote whose `origin/HEAD` is
+/// unset, whose fetch failed, and which has no `origin/main`/`origin/master`.
+/// Every fallback drops a `worktree-base` breadcrumb naming the ref it landed on.
+fn default_base_ref(repo: &str) -> Result<String, String> {
+    let has_remote = !run_git(repo, &["remote"]).unwrap_or_default().trim().is_empty();
+    if has_remote {
+        // Best-effort refresh; offline / auth failure is tolerated (breadcrumb).
+        if run_git(repo, &["fetch", "--prune", "origin"]).is_err() {
+            crate::obs::breadcrumb(
+                "worktree-base",
+                &format!("origin fetch failed for {repo}; resolving base from last-known refs"),
+            );
+        }
+        // `origin/HEAD` follows the remote's real default branch (not hardcoded
+        // `main`). `git fetch` does not populate it, and a remote default-branch
+        // rename leaves it *dangling* (symbolic-ref resolves the name but the
+        // target ref is gone) — symbolic_origin_head verifies the target, so a
+        // dangling symref falls through to the `set-head` repair rather than
+        // returning a ref `worktree add` will reject (#204 review).
+        if let Some(r) = symbolic_origin_head(repo) {
+            return Ok(r);
+        }
+        let _ = run_git(repo, &["remote", "set-head", "origin", "--auto"]);
+        if let Some(r) = symbolic_origin_head(repo) {
+            return Ok(r);
+        }
+        for cand in ["origin/main", "origin/master"] {
+            if run_git(repo, &["rev-parse", "--verify", "--quiet", cand]).is_ok() {
+                return Ok(cand.to_string());
+            }
+        }
+    }
+    // No usable remote default (no remote, offline with origin/HEAD unset, or a
+    // remote without origin/main|master): fall back to a local default branch.
+    // Breadcrumb only once we've actually settled on a ref, so the message
+    // never claims a default branch the code didn't use.
+    for cand in ["main", "master"] {
+        if run_git(repo, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{cand}")]).is_ok() {
+            crate::obs::breadcrumb(
+                "worktree-base",
+                &format!("no origin default for {repo}; cutting agent worktree from local {cand}"),
+            );
+            return Ok(cand.to_string());
+        }
+    }
+    if let Ok(cfg) = run_git(repo, &["config", "init.defaultBranch"]) {
+        let cfg = cfg.trim();
+        if !cfg.is_empty()
+            && run_git(repo, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{cfg}")]).is_ok()
+        {
+            crate::obs::breadcrumb(
+                "worktree-base",
+                &format!("no origin default for {repo}; cutting agent worktree from local {cfg}"),
+            );
+            return Ok(cfg.to_string());
+        }
+    }
+    // No default branch resolvable anywhere: HEAD is the only ref we have. This
+    // re-enacts the pre-#204 HEAD cut, so the breadcrumb says so plainly — the
+    // agent branch may inherit the primary checkout, and an explicit `base`
+    // is the escape hatch.
+    crate::obs::breadcrumb(
+        "worktree-base",
+        &format!("no default branch resolvable for {repo}; cutting from HEAD (agent branch may inherit the primary checkout)"),
+    );
+    Ok("HEAD".to_string())
+}
+
+/// The remote's advertised default branch as a local ref (e.g. `origin/main`),
+/// or None when `origin/HEAD` is unset *or dangling*. A remote default-branch
+/// rename plus `fetch --prune` leaves the symref pointing at a deleted ref that
+/// `symbolic-ref` still resolves by name but `rev-parse` cannot; verifying the
+/// target keeps a stale symref from hard-failing every default-base spawn and
+/// lets `default_base_ref` fall through to its `set-head` repair (#204 review).
+fn symbolic_origin_head(repo: &str) -> Option<String> {
+    let name = run_git(repo, &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())?;
+    run_git(repo, &["rev-parse", "--verify", "--quiet", &name]).ok()?;
+    Some(name)
+}
+
 /// Create a worktree for an agent session at
-/// `<repo-parent>/<repo-name>-worktrees/<name>`, checked out on a branch
-/// named `name` — a new branch off HEAD, or the existing branch of that name.
+/// `<repo-parent>/<repo-name>-worktrees/<name>`, on a new branch named `name`
+/// cut from `base`.
+///
+/// `base` is the start-point for the new branch. `None` means "the repo's
+/// default branch": we fetch `origin` and cut from `origin/<default>` so the
+/// agent branch never inherits whatever the primary checkout happens to sit on
+/// (#204) — its HEAD is incidental state. An explicit `base` (a feature branch
+/// to stack on, `origin/main`, a tag, …) is honored verbatim so an orchestrator
+/// can deliberately stack work.
+///
+/// The branch is created and checked out by a single `git worktree add -b`, so
+/// the new worktree is born on `name` and never passes through a detached HEAD
+/// (the naive `worktree add <dir> <remote-ref>` would detach — see #204).
+/// `--no-track` keeps the agent branch upstream-free, matching the old
+/// HEAD-based behavior (the worker publishes with `push -u`).
 /// Returns the worktree's absolute path.
 #[tauri::command]
-pub fn git_worktree_add(repo: String, name: String) -> Result<String, String> {
+pub fn git_worktree_add(repo: String, name: String, base: Option<String>) -> Result<String, String> {
     if !valid_worktree_name(&name) {
         return Err(format!(
             "invalid worktree name {name:?} — use letters, digits, and . _ - /"
@@ -576,9 +683,22 @@ pub fn git_worktree_add(repo: String, name: String) -> Result<String, String> {
         return Err(format!("worktree path already exists: {}", dest.display()));
     }
     let dest_str = dest.to_string_lossy().into_owned();
-    if let Err(e) = run_git(&repo, &["worktree", "add", "-b", &name, &dest_str]) {
+
+    let start_point = match base.map(|b| b.trim().to_string()).filter(|b| !b.is_empty()) {
+        Some(b) => {
+            check_name(&b, "base")?;
+            b
+        }
+        None => default_base_ref(&repo)?,
+    };
+
+    if let Err(e) = run_git(
+        &repo,
+        &["worktree", "add", "--no-track", "-b", &name, &dest_str, &start_point],
+    ) {
         // `-b` refuses when the branch already exists; check that branch out
-        // into the new worktree instead.
+        // into the new worktree instead (its history already exists, so the
+        // start-point is moot). Still a single command — no detached window.
         if e.contains("already exists") {
             run_git(&repo, &["worktree", "add", &dest_str, &name])?;
         } else {
@@ -1275,5 +1395,122 @@ mod tests {
         commit(repo.path(), "f.txt", "a\n", "A");
         // No remote configured — fetch must succeed quietly, not error.
         git_fetch(p(repo.path()), None).unwrap();
+    }
+
+    /// Branch of a worktree checked out by `git_worktree_add` — errors (empty)
+    /// when the worktree is on a detached HEAD.
+    fn worktree_branch(dest: &str) -> String {
+        run_git(dest, &["symbolic-ref", "--short", "HEAD"])
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    }
+
+    #[test]
+    fn worktree_cut_from_default_branch_not_primary_head() {
+        // #204: a bare remote whose default branch is `main`.
+        let bare = tempfile::tempdir().unwrap();
+        setup_git(bare.path(), &["init", "-q", "--bare"]);
+        setup_git(bare.path(), &["symbolic-ref", "HEAD", "refs/heads/main"]);
+
+        // Seed `main` on the remote.
+        let seed = new_repo();
+        commit(seed.path(), "base.txt", "base\n", "base on main");
+        setup_git(seed.path(), &["remote", "add", "origin", &p(bare.path())]);
+        git_push(p(seed.path()), true).unwrap();
+
+        // The "primary" checkout: clone, then wander onto a feature branch with
+        // a stray commit — exactly the trap. Its HEAD is incidental state.
+        let clone_dir = tempfile::tempdir().unwrap();
+        setup_git(clone_dir.path(), &["clone", "-q", &p(bare.path()), "wc"]);
+        let primary = clone_dir.path().join("wc");
+        setup_git(&primary, &["config", "user.name", "T"]);
+        setup_git(&primary, &["config", "user.email", "t@e"]);
+        setup_git(&primary, &["config", "core.autocrlf", "false"]);
+        setup_git(&primary, &["checkout", "-q", "-b", "docs/stray"]);
+        commit(&primary, "stray.txt", "stray\n", "stray docs commit");
+
+        // Default base (None): must cut from origin/main, NOT the stray HEAD.
+        let wt = git_worktree_add(p(&primary), "agent-x".into(), None).unwrap();
+        // Born on the new branch — never a detached HEAD (#204).
+        assert_eq!(worktree_branch(&wt), "agent-x");
+        assert!(Path::new(&wt).join("base.txt").exists(), "should carry main's file");
+        assert!(
+            !Path::new(&wt).join("stray.txt").exists(),
+            "#204: worktree must NOT inherit the primary checkout's stray HEAD"
+        );
+
+        // Explicit base stacks deliberately: cut from the feature branch.
+        let wt2 = git_worktree_add(p(&primary), "agent-y".into(), Some("docs/stray".into())).unwrap();
+        assert_eq!(worktree_branch(&wt2), "agent-y");
+        assert!(
+            Path::new(&wt2).join("stray.txt").exists(),
+            "an explicit base must include its own commits"
+        );
+    }
+
+    #[test]
+    fn worktree_base_falls_back_to_local_default_when_offline() {
+        // No remote at all: cut from the local default branch (`main`), still on
+        // a real branch (not detached), ignoring the wandered feature HEAD.
+        let repo = new_repo();
+        commit(repo.path(), "base.txt", "base\n", "A");
+        setup_git(repo.path(), &["checkout", "-q", "-b", "feature/wip"]);
+        commit(repo.path(), "wip.txt", "wip\n", "wip");
+
+        let wt = git_worktree_add(p(repo.path()), "agent-z".into(), None).unwrap();
+        assert_eq!(worktree_branch(&wt), "agent-z");
+        assert!(Path::new(&wt).join("base.txt").exists());
+        assert!(
+            !Path::new(&wt).join("wip.txt").exists(),
+            "offline default must cut from local main, not the feature HEAD"
+        );
+    }
+
+    #[test]
+    fn worktree_survives_dangling_origin_head() {
+        // A remote default-branch rename plus `fetch --prune` leaves
+        // `origin/HEAD` pointing at a pruned ref: `symbolic-ref` still resolves
+        // the name, `rev-parse` cannot. The chain must not trust the dangling
+        // ref and hard-fail every default spawn — it must repair via `set-head`
+        // and cut from the real default (#204 review).
+        //
+        // The remote default is `trunk` (not main/master) deliberately: the
+        // `origin/main`/`origin/master` candidate loop can't coincidentally
+        // rescue this, so success *proves* the `set-head --auto` repair ran.
+        let bare = tempfile::tempdir().unwrap();
+        setup_git(bare.path(), &["init", "-q", "--bare"]);
+        setup_git(bare.path(), &["symbolic-ref", "HEAD", "refs/heads/trunk"]);
+
+        let seed = new_repo();
+        setup_git(seed.path(), &["checkout", "-q", "-B", "trunk"]);
+        commit(seed.path(), "base.txt", "base\n", "base");
+        commit(seed.path(), "trunk.txt", "trunk\n", "trunk only");
+        setup_git(seed.path(), &["remote", "add", "origin", &p(bare.path())]);
+        git_push(p(seed.path()), true).unwrap(); // pushes `trunk`, sets upstream
+
+        let clone_dir = tempfile::tempdir().unwrap();
+        setup_git(clone_dir.path(), &["clone", "-q", &p(bare.path()), "wc"]);
+        let primary = clone_dir.path().join("wc");
+        setup_git(&primary, &["config", "user.name", "T"]);
+        setup_git(&primary, &["config", "user.email", "t@e"]);
+        setup_git(&primary, &["config", "core.autocrlf", "false"]);
+
+        // Fabricate the trap deterministically: point origin/HEAD at a ref that
+        // does not resolve (no live `origin/master`).
+        setup_git(&primary, &["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/master"]);
+        assert!(
+            run_git(&p(&primary), &["rev-parse", "--verify", "--quiet", "origin/master"]).is_err(),
+            "precondition: origin/master must be unresolvable (dangling symref)"
+        );
+
+        // Must succeed, repairing origin/HEAD to origin/trunk and cutting from
+        // it — not `fatal: Not a valid object name: 'origin/master'`.
+        let wt = git_worktree_add(p(&primary), "agent-x".into(), None).unwrap();
+        assert_eq!(worktree_branch(&wt), "agent-x");
+        assert!(
+            Path::new(&wt).join("trunk.txt").exists(),
+            "must cut from the repaired default branch (trunk) via set-head"
+        );
     }
 }
