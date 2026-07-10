@@ -35,6 +35,9 @@ gatekeep only at review and merge.
   keyboard-shortcut table.
 - **[Orchestration guide](orchestration.html)** — agent groups, the task board, and
   the `agent-ready` / `agent-investigation` label handshake.
+- **[Autonomous & supervised modes](autonomous-mode.html)** — the idle-tick
+  autonomous mode, the token budget, auto-merge / auto-release, and supervised
+  dangerous mode.
 - **Feature pages** — [git view](features/git-view.html),
   [GitHub issues view](features/github-issues.html),
   [voice prompts](features/voice-prompts.html),

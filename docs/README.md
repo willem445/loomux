@@ -50,15 +50,16 @@ docs/
   index.md               Home (nav_order 1)
   getting-started.md     (2)
   core-concepts.md       (3) — panes/grid/shortcut table
-  orchestration.md       (4) — groups, board, label handshake, autonomous stub
+  orchestration.md       (4) — groups, board, label handshake
+  autonomous-mode.md     (5) — autonomous / supervised dangerous mode + the gate
   features/
-    index.md             "Features" nav parent
+    index.md             "Features" nav parent (6)
     git-view.md
     github-issues.md
     voice-prompts.md
     steering.md
     session-browser.md
-  troubleshooting.md     (6)
+  troubleshooting.md     (7)
   README.md              this file (excluded from the site)
 ```
 
