@@ -8,9 +8,13 @@
 
 use loomux_lib::orchestration::mcp::dispatch;
 use loomux_lib::orchestration::{
-    add_trusted_folder, bracketed_paste, classify_human_input, claude_permission_mode, cli_ready,
-    copilot_autopilot_prompt_detected, create_orchestration_group, hold_for_human_input,
-    hold_until_quiet, idle_should_kill, low_disk_notice, low_disk_transition, max_agents_notice,
+    add_trusted_folder, autonomy_budget_exhausted, bracketed_paste, classify_human_input,
+    claude_permission_mode, cli_ready, copilot_autopilot_prompt_detected, create_orchestration_group,
+    gh_gate_decision, gh_is_merge_invocation, gh_positionals, gh_release_action, gh_repo_flag,
+    gh_shim_sh, git_shim_sh, git_tag_push, grant_segment, grant_unexpired, hold_for_human_input,
+    hold_until_quiet, idle_output_is_activity, idle_should_kill, idle_tick_should_fire,
+    low_disk_notice, low_disk_transition, max_agents_notice, pr_number, release_gate_decision,
+    GhGate, GitTagPush,
     normalize_remote_web_base, parse_audit_lines, parse_session_cost, paste_held_notice,
     prompt_wait_detected, resolve_paste_gate, resolve_ref_url, rotate_audit_if_needed,
     sanitize_attachment_ext, should_confirm_copilot_autopilot, should_flush_before_paste,
@@ -1977,7 +1981,7 @@ fn approve_marks_done_and_records_signoff() {
     p.pr = Some("#12".into());
     reg.upsert_task(&g.id, "orch-1", Some(&t.id), p).unwrap();
     // Approving is the human's sign-off: status → done, note recorded, actor human.
-    let done = reg.approve_task(&g.id, &t.id).unwrap();
+    let done = reg.approve_task(&g.id, &t.id, None).unwrap();
     assert_eq!(done.status, "done");
     let note = done.notes.last().unwrap();
     assert_eq!(note.author, "human");
@@ -2006,7 +2010,7 @@ fn merge_gate_actions_are_guarded_to_gate_statuses() {
     // A queued item is not at the merge gate — both actions must refuse, and
     // refuse without mutating (status unchanged, no note added).
     let t = reg.upsert_task(&g.id, "orch-1", None, patch(Some("Ship it"), None, None)).unwrap();
-    assert!(reg.approve_task(&g.id, &t.id).is_err(), "cannot approve a queued item");
+    assert!(reg.approve_task(&g.id, &t.id, None).is_err(), "cannot approve a queued item");
     assert!(reg.request_changes(&g.id, &t.id, "nope").is_err(), "cannot request changes off-gate");
     let stored = &reg.tasks(&g.id)[0];
     assert_eq!(stored.status, "queued", "a refused action must not change status");
@@ -2018,8 +2022,8 @@ fn merge_gate_actions_are_guarded_to_gate_statuses() {
     }
     // And once approved (→ done) it's off the gate again.
     reg.upsert_task(&g.id, "orch-1", Some(&t.id), patch(None, Some("pr"), None)).unwrap();
-    reg.approve_task(&g.id, &t.id).unwrap();
-    assert!(reg.approve_task(&g.id, &t.id).is_err(), "a done item is past the gate");
+    reg.approve_task(&g.id, &t.id, None).unwrap();
+    assert!(reg.approve_task(&g.id, &t.id, None).is_err(), "a done item is past the gate");
 }
 
 #[test]
@@ -3101,6 +3105,1322 @@ fn watchdog_stall_resets_when_the_agent_reports_or_messages() {
         &json!({ "name": "message_orchestrator", "arguments": { "text": "checking in" } }));
     assert_eq!(reg.watchdog_tick(FAR + 120_000, &HashMap::new()), vec![w.id.clone()],
         "a message must also reset the stall, then a later silence re-notifies");
+}
+
+// ---------- autonomous mode: idle-tick, toggles, budget (#83) ----------
+
+/// An autonomous group with a live (Running, headless) orchestrator. Returns
+/// (reg, tempdir, group id, orchestrator id). Autonomous mode is ON, so
+/// `idle_tick_tick` considers it.
+fn autonomous_setup() -> (OrchRegistry, tempfile::TempDir, String, String) {
+    let (reg, dir) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let o = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    reg.set_autonomous(&g.id, true).unwrap();
+    (reg, dir, g.id, o.id)
+}
+
+/// Count audit entries whose action is exactly `action`. Matches the
+/// quote-delimited JSON value so a prefix action (`autonomous-off`) doesn't also
+/// count its superset (`autonomous-off-failed`).
+fn audit_count(reg: &OrchRegistry, group: &str, action: &str) -> usize {
+    fs::read_to_string(reg.state_root().join(group).join("audit.jsonl"))
+        .unwrap_or_default()
+        .matches(&format!("\"{action}\""))
+        .count()
+}
+
+/// A durable usage snapshot carrying `tokens` input tokens under a unique key, to
+/// seed a group's lifetime spend without a real transcript.
+fn seed_usage(reg: &OrchRegistry, group: &str, key: &str, tokens: u64) {
+    reg.upsert_usage_snapshot(group, UsageSnapshot {
+        key: key.to_string(),
+        agent_id: format!("agent-{key}"),
+        name: key.to_string(),
+        role: "worker".to_string(),
+        source: "transcript".to_string(),
+        input_tokens: tokens,
+        output_tokens: 0,
+        cache_creation_tokens: 0,
+        cache_read_tokens: 0,
+        cost_usd: None,
+        estimated: true,
+        model: Some("claude-opus-4-8".to_string()),
+        updated_ms: now_ms(),
+    });
+}
+
+#[test]
+fn idle_tick_should_fire_respects_threshold_latch_cap_and_skew() {
+    let min = 60_000u64;
+    let none: &[u64] = &[];
+    // A 0 threshold disables the tick entirely.
+    assert!(!idle_tick_should_fire(0, 100 * min, 0, false, none, 6));
+    // Inside the window: not yet. At/past: fire.
+    assert!(!idle_tick_should_fire(0, 14 * min, 15, false, none, 6));
+    assert!(idle_tick_should_fire(0, 15 * min, 15, false, none, 6), "exactly at the window fires");
+    assert!(idle_tick_should_fire(0, 30 * min, 15, false, none, 6));
+    // The one-notice latch suppresses a re-fire until output growth clears it.
+    assert!(!idle_tick_should_fire(0, 30 * min, 15, true, none, 6), "latched → no re-fire");
+    // Per-hour cap: at the cap (6 ticks inside the trailing hour) the backstop
+    // blocks even a legitimately-due tick; a stale timestamp outside the hour
+    // doesn't count.
+    let now = 100 * min;
+    let at_cap: Vec<u64> = (0..6).map(|i| now - i * min).collect(); // 6 within the hour
+    assert!(!idle_tick_should_fire(0, now, 15, false, &at_cap, 6), "per-hour cap is a hard backstop");
+    let under_cap: Vec<u64> = (0..5).map(|i| now - i * min).collect();
+    assert!(idle_tick_should_fire(0, now, 15, false, &under_cap, 6), "under the cap fires");
+    let cap_0 = at_cap.clone();
+    assert!(idle_tick_should_fire(0, now, 15, false, &cap_0, 0), "cap 0 = uncapped");
+    // Clock skew: now before the quiet clock reads as zero elapsed, never a huge
+    // interval that would spuriously fire.
+    assert!(!idle_tick_should_fire(50 * min, 10 * min, 15, false, none, 6), "no underflow on skew");
+}
+
+#[test]
+fn autonomy_budget_exhausted_rule() {
+    // 0 budget = no cap, never exhausted.
+    assert!(!autonomy_budget_exhausted(1_000_000, 0));
+    // Under budget: fine. At/over: exhausted (inclusive boundary).
+    assert!(!autonomy_budget_exhausted(499, 500));
+    assert!(autonomy_budget_exhausted(500, 500), "exactly at budget suspends");
+    assert!(autonomy_budget_exhausted(999, 500));
+}
+
+#[test]
+fn idle_tick_fires_once_per_window_and_rearms_on_output() {
+    let (reg, _d, gid, oid) = autonomous_setup();
+    let empty = HashMap::new();
+    // Output-quiet far past the window → exactly one tick, audited.
+    assert_eq!(reg.idle_tick_tick(FAR, &empty, &empty), vec![oid.clone()],
+        "an idle autonomous orchestrator must be idle-ticked");
+    assert_eq!(audit_count(&reg, &gid, "idle-tick"), 1, "the tick must be audited once");
+    // Anti-nag: still quiet, already notified → no second tick.
+    assert!(reg.idle_tick_tick(FAR + 60_000, &empty, &empty).is_empty(),
+        "one tick per idle window");
+    // The orchestrator produces output (it acted on the tick): clock + latch
+    // both reset, and this very tick can't also fire.
+    let grew: HashMap<String, u64> = [(oid.clone(), 4096u64)].into_iter().collect();
+    assert!(reg.idle_tick_tick(FAR, &grew, &empty).is_empty(),
+        "output growth is activity, not an idle window");
+    // No further growth; a whole fresh window elapses → a brand-new tick.
+    assert_eq!(reg.idle_tick_tick(FAR + 15 * 60_000 + 1, &grew, &empty), vec![oid.clone()],
+        "a new idle window after activity earns a new tick");
+    assert_eq!(audit_count(&reg, &gid, "idle-tick"), 2);
+}
+
+#[test]
+fn idle_tick_skips_non_autonomous_group() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    // Autonomous mode never enabled → the loop must ignore the group wholesale.
+    let empty = HashMap::new();
+    assert!(reg.idle_tick_tick(FAR, &empty, &empty).is_empty(),
+        "a group without autonomous mode is never idle-ticked");
+    assert_eq!(audit_count(&reg, &g.id, "idle-tick"), 0);
+}
+
+#[test]
+fn idle_tick_skips_paused_group_preserving_latch() {
+    let (reg, _d, gid, oid) = autonomous_setup();
+    let empty = HashMap::new();
+    reg.pause_group(&gid).unwrap();
+    assert!(reg.idle_tick_tick(FAR, &empty, &empty).is_empty(),
+        "a paused autonomous group is not idle-ticked");
+    // The one-notice latch must be intact: pausing must not have burned it, so on
+    // resume the outstanding idle window still earns its first tick.
+    reg.resume_group(&gid).unwrap();
+    assert_eq!(reg.idle_tick_tick(FAR, &empty, &empty), vec![oid.clone()],
+        "resuming a still-idle autonomous group earns its first tick");
+}
+
+#[test]
+fn idle_tick_defers_on_recent_human_input() {
+    let (reg, _d, _gid, oid) = autonomous_setup();
+    let empty = HashMap::new();
+    // Output-quiet, but the human just typed into the pane (input time == now):
+    // the belt-and-suspenders gate must defer the tick even though output is old.
+    let just_typed: HashMap<String, u64> = [(oid.clone(), FAR)].into_iter().collect();
+    assert!(reg.idle_tick_tick(FAR, &empty, &just_typed).is_empty(),
+        "never tick while the human is actively steering the pane");
+    // Once the human input recedes past the window, the tick fires again.
+    assert_eq!(reg.idle_tick_tick(FAR + 15 * 60_000 + 1, &empty, &just_typed), vec![oid.clone()],
+        "after the human-input window elapses, the idle tick resumes");
+}
+
+#[test]
+fn idle_output_activity_ignores_subfloor_repaint_growth() {
+    // The repaint-tolerant quiet signal: only a burst >= floor counts as the
+    // orchestrator working; sub-floor creep is idle repaint noise.
+    let floor = 2048u64;
+    // Boundary is a `>=`: floor-1 is noise, floor is activity (rev-59 pin).
+    assert!(!idle_output_is_activity(0, 2047, floor), "one byte under the floor is still noise");
+    assert!(idle_output_is_activity(0, 2048, floor), "exactly at the floor is activity");
+    assert!(idle_output_is_activity(1_000, 10_000, floor));
+    assert!(!idle_output_is_activity(0, 200, floor), "a 200-byte statusline repaint is noise");
+    assert!(!idle_output_is_activity(5_000, 5_200, floor), "sub-floor creep is not work");
+    assert!(!idle_output_is_activity(5_000, 5_000, floor), "no growth is not activity");
+    assert!(!idle_output_is_activity(5_000, 10, floor), "a counter reset (pty swap) is not activity");
+}
+
+#[test]
+fn default_activity_floor_clears_a_real_idle_repaint_frame() {
+    // Justify the 2048-byte default from real data: a captured full idle Claude
+    // Code input-box render (box-drawing + ANSI) is the largest idle repaint frame
+    // we have, and it must sit comfortably under the floor so it reads as noise.
+    // (No raw idle-pane byte *stream* is captured anywhere and spawning a live CLI
+    // is forbidden, so this rendered-frame size is the honest available measurement;
+    // the tunable floor is the runtime remedy for a chattier CLI.)
+    let frame = FIX_IDLE_BOX.len() as u64;
+    assert!(frame < 2048, "idle box render is {frame}B — must be under the 2048B default floor");
+    assert!(frame * 4 < 2048, "with ~4x headroom for a richer statusline, got {frame}B");
+}
+
+#[test]
+fn idle_tick_tolerates_repaint_noise_but_resets_on_real_output() {
+    // Root cause (b) regression: an idle orchestrator that emits periodic sub-floor
+    // repaints (statusline/spinner) kept `output_total` creeping, so treating any
+    // growth as activity reset the quiet clock every time and the tick never fired.
+    let (reg, _d, gid, oid) = autonomous_setup();
+    let m = |total: u64| -> HashMap<String, u64> { [(oid.clone(), total)].into_iter().collect() };
+    let none = HashMap::new();
+    // Sub-floor repaint growth over time must NOT reset the quiet clock: the tick
+    // still fires after the threshold.
+    assert!(reg.idle_tick_tick(1_000, &m(500), &none).is_empty(), "an early sub-floor repaint is not a tick");
+    assert_eq!(reg.idle_tick_tick(FAR, &m(900), &none), vec![oid.clone()],
+        "repaint-only growth must not starve the tick — it fires after the threshold");
+    assert_eq!(audit_count(&reg, &gid, "idle-tick"), 1);
+    // A REAL burst (>= floor) after the tick IS genuine activity: it resets the
+    // clock and re-arms the latch, so this very pass can't fire.
+    assert!(reg.idle_tick_tick(FAR, &m(5_000), &none).is_empty(),
+        "a real output burst re-arms the latch and resets the clock");
+    // No immediate re-fire right after real activity...
+    assert!(reg.idle_tick_tick(FAR + 60_000, &m(5_000), &none).is_empty(),
+        "no re-fire within the window after real output");
+    // ...but after a fresh full (5-min) window of quiet — repaint noise tolerated —
+    // it fires again.
+    assert_eq!(reg.idle_tick_tick(FAR + 5 * 60_000 + 1, &m(5_000), &none), vec![oid.clone()],
+        "a fresh threshold of quiet after activity earns a new tick");
+    assert_eq!(audit_count(&reg, &gid, "idle-tick"), 2);
+}
+
+#[test]
+fn idle_tick_minutes_is_configurable_persisted_and_surfaced() {
+    // Root cause (a) fix: the window is a live-adjustable per-group knob (default 5),
+    // so the human can drop it to 1–2 min to verify quickly, and the panel can see it.
+    let (reg, dir, gid, _oid) = autonomous_setup();
+    assert_eq!(reg.autonomy_state(&gid)["idle_tick_minutes"].as_u64().unwrap(), 5,
+        "shipped default window is 5 minutes");
+    // Live-set to 2 min: applied, persisted to the live guardrail, surfaced, audited.
+    assert_eq!(reg.set_idle_tick_minutes(&gid, 2).unwrap(), 2);
+    assert_eq!(reg.group(&gid).unwrap().guardrails.idle_tick_minutes, 2);
+    assert_eq!(reg.autonomy_state(&gid)["idle_tick_minutes"].as_u64().unwrap(), 2);
+    assert_eq!(audit_count(&reg, &gid, "idle-tick-minutes-set"), 1);
+    // 0 coerces to the default (never "off" — the marker is the switch); huge clamps.
+    assert_eq!(reg.set_idle_tick_minutes(&gid, 0).unwrap(), 5);
+    assert_eq!(reg.set_idle_tick_minutes(&gid, 100_000).unwrap(), 1440);
+    assert!(reg.set_idle_tick_minutes("no-such-group", 5).is_err());
+    // Observability while ON: quiet_secs + eligible_in_secs are live, and the
+    // countdown never exceeds the window.
+    reg.set_idle_tick_minutes(&gid, 5).unwrap();
+    let st = reg.autonomy_state(&gid);
+    assert!(st["quiet_secs"].as_u64().is_some(), "quiet_secs is live while autonomous is on");
+    let eligible = st["eligible_in_secs"].as_u64().unwrap();
+    assert!(eligible <= 5 * 60, "eligible_in_secs counts down within the window, got {eligible}");
+    // Persisted across restart (live-set value wins over the launch default).
+    let reg2 = OrchRegistry::new(dir.path().to_path_buf());
+    reg2.set_port(45999);
+    reg2.create_group("C:/tmp/repo", rails()).unwrap();
+    assert_eq!(reg2.group(&gid).unwrap().guardrails.idle_tick_minutes, 5,
+        "a live-set window survives restart");
+    // OFF: no live meter.
+    reg.set_autonomous(&gid, false).unwrap();
+    let off = reg.autonomy_state(&gid);
+    assert!(off["quiet_secs"].is_null(), "no quiet meter while autonomous is off");
+    assert!(off["eligible_in_secs"].is_null());
+    assert_eq!(off["tick_status"], "off");
+}
+
+#[test]
+fn idle_activity_floor_is_configurable_persisted_and_surfaced() {
+    // rev-59 MODERATE: the activity floor is a live-tunable guardrail, not a bare
+    // const — the runtime remedy if a chatty CLI's idle repaints exceed the default.
+    let (reg, dir, gid, _oid) = autonomous_setup();
+    assert_eq!(reg.autonomy_state(&gid)["idle_activity_floor_bytes"].as_u64().unwrap(), 2048,
+        "shipped default floor is 2048 bytes");
+    assert_eq!(reg.set_idle_activity_floor(&gid, 8192).unwrap(), 8192);
+    assert_eq!(reg.group(&gid).unwrap().guardrails.idle_activity_floor_bytes, 8192);
+    assert_eq!(reg.autonomy_state(&gid)["idle_activity_floor_bytes"].as_u64().unwrap(), 8192);
+    assert_eq!(audit_count(&reg, &gid, "idle-activity-floor-set"), 1);
+    // 0 → default; huge clamps to 1 MiB; unknown group errors.
+    assert_eq!(reg.set_idle_activity_floor(&gid, 0).unwrap(), 2048);
+    assert_eq!(reg.set_idle_activity_floor(&gid, 999_999_999).unwrap(), 1024 * 1024);
+    assert!(reg.set_idle_activity_floor("no-such-group", 4096).is_err());
+    // Persisted across restart (live value wins over the launch default).
+    reg.set_idle_activity_floor(&gid, 4096).unwrap();
+    let reg2 = OrchRegistry::new(dir.path().to_path_buf());
+    reg2.set_port(45999);
+    reg2.create_group("C:/tmp/repo", rails()).unwrap();
+    assert_eq!(reg2.group(&gid).unwrap().guardrails.idle_activity_floor_bytes, 4096,
+        "a live-set activity floor survives restart");
+}
+
+#[test]
+fn a_higher_activity_floor_treats_bigger_growth_as_noise() {
+    // The floor actually governs the tick: raise it above a 5 KB burst and that
+    // growth reads as repaint noise (doesn't reset the quiet clock), so the tick
+    // still fires — while a burst >= the floor is activity and re-arms the latch.
+    let (reg, _d, gid, oid) = autonomous_setup();
+    reg.set_idle_activity_floor(&gid, 8192).unwrap();
+    let m = |t: u64| -> HashMap<String, u64> { [(oid.clone(), t)].into_iter().collect() };
+    let none = HashMap::new();
+    assert!(reg.idle_tick_tick(1_000, &m(5_000), &none).is_empty());
+    assert_eq!(reg.idle_tick_tick(FAR, &m(9_000), &none), vec![oid.clone()],
+        "with an 8 KB floor, 4–5 KB growth is repaint noise and the tick still fires");
+    assert!(reg.idle_tick_tick(FAR, &m(20_000), &none).is_empty(),
+        "a growth >= the floor (11 KB) is activity and re-arms the latch");
+}
+
+#[test]
+fn idle_tick_status_is_honest_about_latch_and_cap() {
+    // rev-59 LOW: eligible_in_secs must never render a lying 0 while a non-time gate
+    // (latch / per-hour cap) holds the tick. tick_status carries the honest reason.
+    let (reg, _d, gid, oid) = autonomous_setup();
+    let m = |t: u64| -> HashMap<String, u64> { [(oid.clone(), t)].into_iter().collect() };
+    let none = HashMap::new();
+    let win = 5 * 60_000u64; // default 5-min window, in ms
+
+    // 1) Fresh: counting down toward the first tick.
+    let s = reg.autonomy_state(&gid);
+    assert_eq!(s["tick_status"], "counting_down");
+    assert!(s["eligible_in_secs"].as_u64().unwrap() <= 5 * 60);
+
+    // 2) After a tick fires the latch is set: waiting_for_activity, secs NULL — the
+    //    core rev-59 case (a countdown here would hit 0 while nothing fires).
+    assert_eq!(reg.idle_tick_tick(FAR, &none, &none), vec![oid.clone()]);
+    let s = reg.autonomy_state(&gid);
+    assert_eq!(s["tick_status"], "waiting_for_activity");
+    assert!(s["eligible_in_secs"].is_null(), "a latched tick must not render a countdown");
+
+    // 3) A real burst clears the latch and resets the clock so far in the (synthetic)
+    //    past that it reads as eligible now.
+    assert!(reg.idle_tick_tick(1_000, &m(100_000), &none).is_empty());
+    let s = reg.autonomy_state(&gid);
+    assert_eq!(s["tick_status"], "eligible");
+    assert_eq!(s["eligible_in_secs"].as_u64().unwrap(), 0);
+
+    // 4) Fill the per-hour cap to MAX_IDLE_TICKS_PER_HOUR (6). Step 2 already fired
+    //    one, so 5 more here reach the cap. Each needs the latch cleared (a real
+    //    burst that also resets the clock) then a full window of quiet.
+    for i in 0..5u64 {
+        let base = FAR + i * (win + 10);
+        assert!(reg.idle_tick_tick(base, &m(1_000_000 + i * 100_000), &none).is_empty(),
+            "burst i={i} resets, no fire");
+        assert_eq!(reg.idle_tick_tick(base + win + 1, &none, &none), vec![oid.clone()],
+            "a fresh window after the burst fires (i={i})");
+    }
+    // Cap now full; clear the last fire's latch with a burst (adds no tick_time) so
+    // the CAP is the sole remaining gate.
+    assert!(reg.idle_tick_tick(FAR + 100 * win, &m(9_000_000), &none).is_empty());
+    let s = reg.autonomy_state(&gid);
+    assert_eq!(s["tick_status"], "rate_capped", "cap full + latch clear → rate_capped");
+    assert!(s["eligible_in_secs"].as_u64().is_some(),
+        "rate_capped still yields a real (cap-based) countdown, not null");
+}
+
+#[test]
+fn idle_tick_status_reports_paused_with_no_countdown() {
+    // rev-59 re-check: autonomous and paused are INDEPENDENT markers. A paused
+    // autonomous group suppresses all delivery, so the tick never fires — the panel
+    // must not render a live countdown (the exact lying-countdown class).
+    let (reg, _d, gid, _oid) = autonomous_setup();
+    reg.pause_group(&gid).unwrap();
+    let s = reg.autonomy_state(&gid);
+    assert_eq!(s["tick_status"], "paused", "a paused autonomous group reports paused");
+    assert!(s["eligible_in_secs"].is_null(), "paused must not render a ticking countdown");
+    // Resuming restores a live countdown.
+    reg.resume_group(&gid).unwrap();
+    let s = reg.autonomy_state(&gid);
+    assert_eq!(s["tick_status"], "counting_down", "resume restores the live countdown");
+    assert!(s["eligible_in_secs"].as_u64().is_some());
+}
+
+// ---------- enforced merge gate (#83) ----------
+
+fn s(v: &str) -> String { v.to_string() }
+fn args(a: &[&str]) -> Vec<String> { a.iter().map(|x| x.to_string()).collect() }
+
+#[test]
+fn gh_is_merge_invocation_detects_pr_merge_in_every_flag_arrangement() {
+    let m = |a: &[&str]| gh_is_merge_invocation(&args(a));
+    // The incident form and plain arrangements.
+    assert!(m(&["pr", "merge", "123", "--squash"]));
+    assert!(m(&["pr", "merge"]));
+    assert!(m(&["pr", "merge", "--admin", "--merge"]));
+    // rev-79 F1 BLOCKER: -R/--repo (and other globals) BEFORE the command.
+    assert!(m(&["-R", "owner/repo", "pr", "merge", "123"]), "gh -R o/r pr merge must be gated");
+    assert!(m(&["--repo", "owner/repo", "pr", "merge"]), "gh --repo o/r pr merge must be gated");
+    assert!(m(&["--repo=owner/repo", "pr", "merge"]), "gh --repo=o/r must be gated");
+    assert!(m(&["-Rowner/repo", "pr", "merge"]), "glued -Ro/r must be gated");
+    assert!(m(&["--help", "pr", "merge"]) || true); // (--help would short-circuit gh; harmless here)
+    // F1: -R/--repo BETWEEN the command and subcommand (cobra allows interspersing).
+    assert!(m(&["pr", "-R", "owner/repo", "merge", "123"]), "gh pr -R o/r merge must be gated");
+    assert!(m(&["pr", "--repo=owner/repo", "merge"]));
+    // Value-taking merge flags before the selector must not fool detection.
+    assert!(m(&["pr", "merge", "--body", "shipping it", "123"]));
+    // Raw API merge shapes (the cheap-to-catch bypass), incl. -R before.
+    assert!(m(&["api", "--method", "PUT", "repos/o/r/pulls/5/merge"]));
+    assert!(m(&["api", "graphql", "-f", "query=mergePullRequest(...)"]));
+    // Non-merge gh commands are NOT gated (even with -R before).
+    assert!(!m(&["pr", "view", "123"]));
+    assert!(!m(&["-R", "owner/repo", "pr", "view", "123"]), "gh -R o/r pr view is not a merge");
+    assert!(!m(&["pr", "create", "--fill"]));
+    assert!(!m(&["issue", "list"]));
+    assert!(!m(&["api", "repos/o/r/pulls"]));
+    assert!(!m(&[]));
+}
+
+#[test]
+fn gh_positionals_and_repo_flag_parse_around_global_flags() {
+    // Positionals skip -R/--repo (with value) and boolean flags, wherever they sit.
+    let p = |a: &[&str]| gh_positionals(a);
+    assert_eq!(p(&["-R", "o/r", "pr", "merge", "123"]), vec!["pr", "merge", "123"]);
+    assert_eq!(p(&["pr", "-R", "o/r", "merge"]), vec!["pr", "merge"]);
+    assert_eq!(p(&["--repo=o/r", "pr", "merge"]), vec!["pr", "merge"]);
+    assert_eq!(p(&["pr", "merge", "--squash", "42"]), vec!["pr", "merge", "42"]);
+    // The -R/--repo value is extracted in every accepted form (F2).
+    assert_eq!(gh_repo_flag(&["-R", "o/r", "pr", "merge"]).as_deref(), Some("o/r"));
+    assert_eq!(gh_repo_flag(&["--repo", "o/r", "pr", "merge"]).as_deref(), Some("o/r"));
+    assert_eq!(gh_repo_flag(&["--repo=o/r", "pr", "merge"]).as_deref(), Some("o/r"));
+    assert_eq!(gh_repo_flag(&["-Ro/r", "pr", "merge"]).as_deref(), Some("o/r"));
+    assert_eq!(gh_repo_flag(&["pr", "-R", "o/r", "merge"]).as_deref(), Some("o/r"));
+    assert_eq!(gh_repo_flag(&["pr", "merge", "123"]), None);
+}
+
+#[test]
+fn gh_gate_decision_enforces_the_human_gate_on_the_default_branch() {
+    // (base, default, autonomous, auto_merge, dangerous, grant) — merge invocation.
+    let d = |base: Option<&str>, def, auto, am, dang, grant| gh_gate_decision(true, base, def, auto, am, dang, grant);
+    // Non-merge → always pass.
+    assert_eq!(gh_gate_decision(false, Some("main"), Some("main"), false, false, false, false), GhGate::PassThrough);
+    // Merge onto a NON-default base (integration branch) → pass, regardless of markers/grant.
+    assert_eq!(d(Some("feat/x"), Some("main"), false, false, false, false), GhGate::PassThrough);
+    assert_eq!(d(Some("feat/x"), Some("main"), true, true, false, false), GhGate::PassThrough);
+    // Merge onto the DEFAULT branch: blanket-allowed with autonomous+auto_merge.
+    assert_eq!(d(Some("main"), Some("main"), true, true, false, false), GhGate::AllowMerge);
+    // Supervised dangerous mode (NOT autonomous) → allowed, distinct path.
+    assert_eq!(d(Some("main"), Some("main"), false, false, true, false), GhGate::AllowDangerous, "dangerous mode authorizes the merge");
+    // dangerous is a NO-OP while autonomous (mutually exclusive; guard is defensive).
+    assert_eq!(d(Some("main"), Some("main"), true, false, true, false), GhGate::Block, "dangerous ignored while autonomous, no auto_merge/grant → block");
+    // Without blanket/dangerous, a valid one-time GRANT authorizes it (consumed).
+    assert_eq!(d(Some("main"), Some("main"), false, false, false, true), GhGate::AllowGrant, "a human grant authorizes the merge");
+    assert_eq!(d(Some("main"), Some("main"), true, false, false, true), GhGate::AllowGrant);
+    // No markers and no grant → block.
+    assert_eq!(d(Some("main"), Some("main"), true, false, false, false), GhGate::Block, "auto_merge off + no grant blocks");
+    assert_eq!(d(Some("main"), Some("main"), false, true, false, false), GhGate::Block, "autonomous off + no grant blocks");
+    assert_eq!(d(Some("main"), Some("main"), false, false, false, false), GhGate::Block);
+    // Undeterminable base → fail-safe block (nothing overrides an unverifiable base).
+    assert_eq!(d(None, Some("main"), true, true, true, true), GhGate::BlockUnverifiable);
+    assert_eq!(d(Some("main"), None, true, true, true, true), GhGate::BlockUnverifiable);
+    assert_eq!(d(Some(""), Some("main"), false, false, true, false), GhGate::BlockUnverifiable, "empty base is unverifiable even in dangerous mode");
+}
+
+#[test]
+fn grant_helpers_normalize_and_expire() {
+    // PR number extraction from every board `pr` form.
+    assert_eq!(pr_number("7"), Some(7));
+    assert_eq!(pr_number("#42"), Some(42));
+    assert_eq!(pr_number("https://github.com/o/r/pull/123"), Some(123));
+    assert_eq!(pr_number("PR 9"), Some(9));
+    assert_eq!(pr_number("no-number-here"), None);
+    // Grant segment sanitization (must match the shim's `tr -c`): path-escaping and
+    // odd chars collapse to `_`, safe chars survive.
+    assert_eq!(grant_segment("v1.2.3"), "v1.2.3");
+    assert_eq!(grant_segment("release/../../etc"), "release_.._.._etc");
+    assert_eq!(grant_segment("v1/beta"), "v1_beta");
+    assert_eq!(grant_segment(""), "_");
+    // TTL rule: unexpired iff a future expiry exists.
+    assert!(grant_unexpired(Some(100), 99));
+    assert!(!grant_unexpired(Some(100), 100), "exactly at expiry is expired");
+    assert!(!grant_unexpired(Some(100), 200));
+    assert!(!grant_unexpired(None, 0), "no grant file → not authorized");
+}
+
+#[test]
+fn release_gate_allows_via_auto_release_dangerous_or_grant() {
+    // (autonomous, auto_release, dangerous, grant). Parallel to merges.
+    let d = |a, ar, dang, g| release_gate_decision(a, ar, dang, g);
+    // Blanket: autonomous + auto_release → allowed (not grant-consumed).
+    assert_eq!(d(true, true, false, false), GhGate::AllowMerge);
+    // Supervised dangerous mode (NOT autonomous) → allowed, distinct path.
+    assert_eq!(d(false, false, true, false), GhGate::AllowDangerous, "dangerous mode publishes");
+    assert_eq!(d(true, false, true, false), GhGate::Block, "dangerous ignored while autonomous, no auto_release/grant → block");
+    // auto_release OFF but a valid per-tag grant → allowed (consumed).
+    assert_eq!(d(true, false, false, true), GhGate::AllowGrant);
+    assert_eq!(d(false, false, false, true), GhGate::AllowGrant, "grant works even non-autonomous");
+    // No blanket opt-in, no dangerous, no grant → blocked (conservative default).
+    assert_eq!(d(true, false, false, false), GhGate::Block, "autonomous alone never publishes");
+    assert_eq!(d(false, true, false, false), GhGate::Block, "auto_release without autonomous never publishes");
+    assert_eq!(d(false, false, false, false), GhGate::Block);
+}
+
+#[test]
+fn gh_release_action_detects_publish_subcommands_and_tag() {
+    let a = |v: &[&str]| gh_release_action(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+    assert_eq!(a(&["release", "create", "v1.2.3"]), Some(("create".into(), "v1.2.3".into())));
+    assert_eq!(a(&["release", "edit", "v1.2.3", "--draft=false"]), Some(("edit".into(), "v1.2.3".into())));
+    assert_eq!(a(&["release", "delete", "v9"]), Some(("delete".into(), "v9".into())));
+    // -R/--repo before the command is skipped, tag still found.
+    assert_eq!(a(&["-R", "o/r", "release", "create", "v2"]), Some(("create".into(), "v2".into())));
+    // rev-86 LOW: value-flags BEFORE the tag (title/notes/target…) must be consumed
+    // so the tag positional isn't mis-read as the flag's value.
+    assert_eq!(a(&["release", "create", "--title", "My Release", "v1.2.3"]),
+        Some(("create".into(), "v1.2.3".into())), "--title value must not be mistaken for the tag");
+    assert_eq!(a(&["release", "create", "-n", "some notes", "--target", "main", "v1.2.3"]),
+        Some(("create".into(), "v1.2.3".into())));
+    assert_eq!(a(&["release", "create", "--title=X", "v1.2.3"]), Some(("create".into(), "v1.2.3".into())));
+    // Tag first, flags after (also fine).
+    assert_eq!(a(&["release", "create", "v1.2.3", "--title", "X", "--generate-notes"]),
+        Some(("create".into(), "v1.2.3".into())));
+    // Read-only release subcommands and non-release commands are NOT publish actions.
+    assert_eq!(a(&["release", "view", "v1"]), None);
+    assert_eq!(a(&["release", "list"]), None);
+    assert_eq!(a(&["pr", "merge", "1"]), None);
+}
+
+#[test]
+fn git_tag_push_classifies_tag_pushes() {
+    let g = |v: &[&str]| git_tag_push(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+    // Explicit tag refs and the `tag <name>` form → gate that tag.
+    assert_eq!(g(&["push", "origin", "refs/tags/v1.2.3"]), GitTagPush::Tag("v1.2.3".into()));
+    assert_eq!(g(&["push", "origin", "tag", "v9"]), GitTagPush::Tag("v9".into()));
+    assert_eq!(g(&["push", "origin", "+v1:refs/tags/v1"]), GitTagPush::Tag("v1".into()));
+    // A bare refspec matching release.yml's `v*` trigger is a (candidate) tag; the
+    // shim confirms it against real git. rev-86 BLOCKER: `v*` is ANY v-prefixed
+    // ref, not just `v<digit>` — `vbeta`/`vRelease`/`vv1.0.0` would publish yet the
+    // old `v[0-9]` pattern let them slip.
+    assert_eq!(g(&["push", "origin", "v1.0.0"]), GitTagPush::Tag("v1.0.0".into()));
+    assert_eq!(g(&["push", "origin", "vbeta"]), GitTagPush::Tag("vbeta".into()), "vbeta matches v*");
+    assert_eq!(g(&["push", "origin", "vRelease"]), GitTagPush::Tag("vRelease".into()));
+    assert_eq!(g(&["push", "origin", "vv1.0.0"]), GitTagPush::Tag("vv1.0.0".into()));
+    // Non-`v*` refs never trigger release.yml, so they are NOT candidates — pinned
+    // so the scope stays explicit (a `nightly` tag would not publish).
+    assert_eq!(g(&["push", "origin", "nightly"]), GitTagPush::None, "non-v* ref is not a release candidate");
+    assert_eq!(g(&["push", "origin", "release-1"]), GitTagPush::None);
+    // Bulk tag pushes → Bulk (blocked; can't match one grant).
+    assert_eq!(g(&["push", "--tags"]), GitTagPush::Bulk);
+    assert_eq!(g(&["push", "origin", "--follow-tags"]), GitTagPush::Bulk);
+    assert_eq!(g(&["push", "--mirror"]), GitTagPush::Bulk);
+    // Plain branch pushes and non-push commands → None (fast passthrough). A
+    // `v*`-prefixed branch is a candidate here but the shim confirms-away non-tags.
+    assert_eq!(g(&["push", "origin", "feat/x"]), GitTagPush::None);
+    assert_eq!(g(&["push", "-u", "origin", "HEAD"]), GitTagPush::None);
+    assert_eq!(g(&["push", "origin", "main"]), GitTagPush::None);
+    assert_eq!(g(&["-C", "/repo", "push", "origin", "main"]), GitTagPush::None, "git globals skipped");
+    assert_eq!(g(&["status"]), GitTagPush::None);
+    assert_eq!(g(&["commit", "-m", "x"]), GitTagPush::None);
+}
+
+#[test]
+fn git_shim_script_bakes_real_git_and_gates_tag_push() {
+    let sh = git_shim_sh("C:/Program Files/Git/cmd/git.exe");
+    assert!(sh.contains("REAL_GIT=\"C:/Program Files/Git/cmd/git.exe\""), "bakes the real git path");
+    assert!(sh.starts_with("#!/bin/sh"));
+    // Only `git push` is inspected; everything else execs immediately.
+    assert!(sh.contains("if [ \"$cmd\" != \"push\" ]") && sh.contains("exec \"$REAL_GIT\" \"$@\""));
+    assert!(sh.contains("--tags") && sh.contains("--follow-tags"), "blocks bulk tag pushes");
+    assert!(sh.contains("refs/tags/"), "detects explicit tag refs");
+    assert!(sh.contains("release_grants/"), "gates on a release grant");
+    assert!(sh.contains("release-gate-blocked"), "audits refusals");
+    assert!(!sh.contains("\r"), "the POSIX git shim must be LF-only");
+}
+
+#[test]
+fn grant_merge_writes_a_consumable_grant_file_and_audits() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    // A PR URL is normalized to the number; the grant is keyed pr-<N>.
+    let num = reg.grant_merge(&g.id, "https://github.com/o/r/pull/42", Some("bump the changelog first"), "human").unwrap();
+    assert_eq!(num, 42);
+    let grant = reg.state_root().join(&g.id).join("merge_grants").join("pr-42");
+    assert!(grant.is_file(), "the grant file must exist for the shim to consult");
+    // Line 1 is a future unix-seconds expiry.
+    let body = std::fs::read_to_string(&grant).unwrap();
+    let exp: u64 = body.lines().next().unwrap().parse().unwrap();
+    assert!(exp > now_ms() / 1000, "grant expiry must be in the future");
+    assert_eq!(audit_count(&reg, &g.id, "merge-grant-written"), 1);
+    // A bad PR ref is rejected, no grant written.
+    assert!(reg.grant_merge(&g.id, "not-a-pr", None, "human").is_err());
+}
+
+#[test]
+fn approve_task_writes_a_merge_grant_for_the_prs_number() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let t = reg.upsert_task(&g.id, "orch-1", None, patch(Some("Ship it"), None, None)).unwrap();
+    let mut p = patch(None, Some("pr"), None);
+    p.pr = Some("#7".into());
+    reg.upsert_task(&g.id, "orch-1", Some(&t.id), p).unwrap();
+    // Clicking Approve (with an optional comment) must mint the one-time grant for
+    // that PR — otherwise the enforced gate leaves the orchestrator unable to merge.
+    reg.approve_task(&g.id, &t.id, Some("also tag the release note")).unwrap();
+    assert!(reg.state_root().join(&g.id).join("merge_grants").join("pr-7").is_file(),
+        "Approve must write the merge grant for the task's PR");
+    assert_eq!(audit_count(&reg, &g.id, "merge-grant-written"), 1);
+}
+
+#[test]
+fn grants_are_not_writable_by_any_mcp_tool() {
+    // SECURITY BOUNDARY: grants are human-only (Tauri commands). No MCP tool an
+    // agent can call may write under the group dir at a grant path.
+    let (reg, _d, co, cw) = setup_mcp();
+    let tool_names = |c: &Caller| -> Vec<String> {
+        dispatch(&reg, c, "tools/list", &Value::Null).unwrap()["tools"].as_array().unwrap()
+            .iter().map(|t| t["name"].as_str().unwrap().to_string()).collect()
+    };
+    for c in [&co, &cw] {
+        for n in tool_names(c) {
+            assert!(!n.contains("grant"), "no MCP tool may write grants, found: {n}");
+            // Supervised dangerous mode (#83) is likewise Tauri-only — no MCP surface.
+            assert!(!n.contains("dangerous"), "no MCP tool may enable dangerous mode, found: {n}");
+        }
+    }
+    // Exercise the file-writing MCP tools an agent CAN call; none may create a
+    // grant dir/file or the dangerous_mode marker under the group.
+    let _ = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "set_state", "arguments": { "state": "{\"x\":1}" } }));
+    let _ = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "upsert_task", "arguments": { "title": "t", "status": "pr" } }));
+    let gdir = reg.state_root().join(&co.group);
+    assert!(!gdir.join("merge_grants").exists(), "no MCP tool may create merge_grants");
+    assert!(!gdir.join("release_grants").exists(), "no MCP tool may create release_grants");
+    assert!(!gdir.join("dangerous_mode").exists(), "no MCP tool may create the dangerous_mode marker");
+}
+
+/// Fake gh recording args and answering pr/repo view from env; anything else
+/// "succeeds". Returns its path. Shared by the harness tests.
+fn write_fake_gh(root: &std::path::Path, log: &std::path::Path) -> std::path::PathBuf {
+    let p = root.join("fakegh");
+    std::fs::write(&p, format!(
+        "#!/bin/sh\n\
+         echo \"ARGS: $*\" >> \"{log}\"\n\
+         if [ \"$1\" = \"pr\" ] && [ \"$2\" = \"view\" ]; then printf '%s %s\\n' \"$FAKE_BASE\" \"$FAKE_NUM\"; exit 0; fi\n\
+         if [ \"$1\" = \"repo\" ] && [ \"$2\" = \"view\" ]; then printf '%s\\n' \"$FAKE_DEFAULT\"; exit 0; fi\n\
+         printf 'FAKE-GH-RAN\\n'; exit 0\n",
+        log = log.display()
+    )).unwrap();
+    p
+}
+
+#[test]
+fn gh_shim_harness_grant_authorizes_one_merge_and_releases_are_gated() {
+    use std::process::Command;
+    if Command::new("sh").arg("-c").arg("exit 0").status().map(|s| !s.success()).unwrap_or(true) {
+        eprintln!("SKIP gh_shim_harness_grant…: no POSIX sh");
+        return;
+    }
+    let td = tempfile::tempdir().unwrap();
+    let root = td.path();
+    let group = root.join("group");
+    std::fs::create_dir_all(&group).unwrap();
+    let log = root.join("gh.log");
+    let fake = write_fake_gh(root, &log);
+    let shim = root.join("gh");
+    std::fs::write(&shim, gh_shim_sh(&fake.display().to_string())).unwrap();
+    let _ = Command::new("sh").arg("-c").arg(format!("chmod +x '{}' '{}'", fake.display(), shim.display())).status();
+
+    let run = |argv: &[&str], num: &str| -> bool {
+        Command::new("sh").arg(&shim).args(argv)
+            .env("LOOMUX_GROUP_DIR", &group)
+            .env("FAKE_BASE", "main").env("FAKE_DEFAULT", "main").env("FAKE_NUM", num)
+            .status().unwrap().success()
+    };
+    let write_grant = |dir: &str, name: &str| {
+        let d = group.join(dir);
+        std::fs::create_dir_all(&d).unwrap();
+        // far-future expiry (unix seconds)
+        std::fs::write(d.join(name), b"99999999999\n1\n").unwrap();
+    };
+
+    // No grant, no markers → blocked.
+    assert!(!run(&["pr", "merge", "5"], "5"), "no grant → blocked");
+    // A grant for pr-5 authorizes exactly one merge, then is consumed.
+    write_grant("merge_grants", "pr-5");
+    assert!(run(&["pr", "merge", "5"], "5"), "valid grant → allowed");
+    assert!(!group.join("merge_grants/pr-5").exists(), "grant must be consumed");
+    assert!(!run(&["pr", "merge", "5"], "5"), "consumed grant → second merge blocked");
+    // A grant for pr-5 must NOT authorize merging pr-7.
+    write_grant("merge_grants", "pr-5");
+    assert!(!run(&["pr", "merge", "7"], "7"), "a pr-5 grant cannot merge pr-7");
+    // An expired grant does not authorize (and is cleaned up).
+    std::fs::create_dir_all(group.join("merge_grants")).unwrap();
+    std::fs::write(group.join("merge_grants/pr-9"), b"1\n1\n").unwrap();
+    assert!(!run(&["pr", "merge", "9"], "9"), "expired grant → blocked");
+
+    // Releases: blocked without a grant even though markers would allow a MERGE.
+    std::fs::write(group.join("autonomous"), b"").unwrap();
+    std::fs::write(group.join("auto_merge"), b"").unwrap();
+    assert!(!run(&["release", "create", "v1.2.3"], "0"), "release blocked even in autonomous+auto_merge");
+    write_grant("release_grants", "v1.2.3");
+    assert!(run(&["release", "create", "v1.2.3"], "0"), "release grant → allowed");
+    assert!(!group.join("release_grants/v1.2.3").exists(), "release grant consumed");
+    // Read-only release subcommand passes through.
+    assert!(run(&["release", "view", "v1.2.3"], "0"), "release view is not gated");
+    // rev-86 LOW: value-flags BEFORE the tag must not misparse it — a granted
+    // release with --title still resolves tag v1.2.3 and is allowed.
+    write_grant("release_grants", "v1.2.3");
+    assert!(run(&["release", "create", "--title", "My Release", "v1.2.3"], "0"),
+        "granted release with --title before the tag must be allowed, not misparsed");
+    assert!(!run(&["release", "create", "--title", "My Release", "v9.9.9"], "0"),
+        "a release with --title and no grant is still blocked (tag parsed correctly)");
+    // auto_release opt-in: autonomous + auto_release blanket-allows any release —
+    // and does NOT consume a grant (no per-tag file needed). auto_merge alone did
+    // NOT (asserted above), proving the two toggles are independent.
+    std::fs::write(group.join("auto_release"), b"").unwrap();
+    assert!(run(&["release", "create", "v3.0.0"], "0"), "autonomous+auto_release blanket-allows a release");
+    assert!(run(&["release", "create", "v3.0.1"], "0"), "blanket auto_release is repeatable (not a one-time grant)");
+
+    // Supervised dangerous mode (#83): the human is present, NOT autonomous. Clear
+    // the autonomous markers, set dangerous_mode → both a default-branch MERGE and a
+    // RELEASE are allowed (no grant), each with its DISTINCT audit marker.
+    for m in ["autonomous", "auto_merge", "auto_release"] { let _ = std::fs::remove_file(group.join(m)); }
+    std::fs::write(group.join("dangerous_mode"), b"").unwrap();
+    std::fs::write(group.join("audit.jsonl"), b"").unwrap();
+    assert!(run(&["pr", "merge", "5"], "5"), "dangerous mode → default-branch merge allowed");
+    assert!(run(&["release", "create", "v4.0.0"], "0"), "dangerous mode → release allowed");
+    let audit = std::fs::read_to_string(group.join("audit.jsonl")).unwrap_or_default();
+    assert!(audit.contains("merge-gate-dangerous"), "distinct merge audit marker, got: {audit}");
+    assert!(audit.contains("release-gate-dangerous"), "distinct release audit marker");
+    // dangerous is a NO-OP while autonomous (mutually exclusive; defensive guard):
+    // with autonomous back on but no auto_merge/auto_release/grant, both are blocked.
+    // Use PR 8 (no leftover grant) so only the dangerous path could have allowed it.
+    std::fs::write(group.join("autonomous"), b"0").unwrap();
+    assert!(!run(&["pr", "merge", "8"], "8"), "dangerous is ignored while autonomous → merge blocked");
+    assert!(!run(&["release", "create", "v4.0.1"], "0"), "dangerous is ignored while autonomous → release blocked");
+}
+
+#[test]
+fn git_shim_harness_gates_tag_pushes() {
+    use std::process::Command;
+    if Command::new("sh").arg("-c").arg("exit 0").status().map(|s| !s.success()).unwrap_or(true) {
+        eprintln!("SKIP git_shim_harness…: no POSIX sh");
+        return;
+    }
+    let td = tempfile::tempdir().unwrap();
+    let root = td.path();
+    let group = root.join("group");
+    std::fs::create_dir_all(&group).unwrap();
+    // Fake git: rev-parse confirms a tag iff it matches $FAKE_TAG; push "succeeds".
+    let fake = root.join("fakegit");
+    std::fs::write(&fake,
+        "#!/bin/sh\n\
+         if [ \"$1\" = \"rev-parse\" ]; then\n\
+           for a in \"$@\"; do case \"$a\" in refs/tags/*) [ \"$a\" = \"refs/tags/$FAKE_TAG\" ] && exit 0 ;; esac; done\n\
+           exit 1\n\
+         fi\n\
+         printf 'FAKE-GIT-RAN\\n'; exit 0\n").unwrap();
+    let shim = root.join("git");
+    std::fs::write(&shim, git_shim_sh(&fake.display().to_string())).unwrap();
+    let _ = Command::new("sh").arg("-c").arg(format!("chmod +x '{}' '{}'", fake.display(), shim.display())).status();
+    let run = |argv: &[&str], fake_tag: &str| -> bool {
+        Command::new("sh").arg(&shim).args(argv)
+            .env("LOOMUX_GROUP_DIR", &group).env("FAKE_TAG", fake_tag)
+            .status().unwrap().success()
+    };
+    let grant = |name: &str| {
+        let d = group.join("release_grants");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join(name), b"99999999999\n1\n").unwrap();
+    };
+
+    // Branch push → untouched (fast passthrough).
+    assert!(run(&["push", "origin", "main"], ""), "branch push is never gated");
+    // Explicit tag ref → blocked without a grant, allowed (and consumed) with one.
+    assert!(!run(&["push", "origin", "refs/tags/v1.2.3"], ""), "tag push blocked without grant");
+    grant("v1.2.3");
+    assert!(run(&["push", "origin", "refs/tags/v1.2.3"], ""), "tag push allowed with grant");
+    assert!(!group.join("release_grants/v1.2.3").exists(), "release grant consumed");
+    // Bulk tag push → always blocked.
+    assert!(!run(&["push", "--tags"], ""), "--tags is blocked");
+    assert!(!run(&["push", "origin", "--follow-tags"], ""), "--follow-tags is blocked");
+    // Bare v* refspec confirmed as a tag by real git → gated.
+    assert!(!run(&["push", "origin", "v2.0.0"], "v2.0.0"), "confirmed bare v* tag is gated");
+    // rev-86 BLOCKER: v* is ANY v-prefixed tag, matching release.yml — a `vbeta`
+    // tag (v + letter) MUST be gated, not slip through the old `v[0-9]` pattern.
+    grant("vbeta");
+    assert!(run(&["push", "origin", "vbeta"], "vbeta"), "granted vbeta tag push allowed");
+    assert!(!run(&["push", "origin", "vbeta"], "vbeta"), "vbeta tag push blocked once the grant is consumed");
+    assert!(!run(&["push", "origin", "vRelease"], "vRelease"), "vRelease (v* tag) is gated");
+    // A non-v* ref never triggers release.yml, so it is NOT gated even if it's a tag.
+    assert!(run(&["push", "origin", "nightly"], "nightly"), "a non-v* tag is not a release → not gated");
+    // Bare v* that is NOT a tag (a branch) → not gated (rev-parse fails to confirm).
+    assert!(run(&["push", "origin", "v2-feature"], "nope"), "a v*-looking branch is not gated");
+    // auto_release opt-in blanket-allows a v* tag push with NO grant (repeatable).
+    std::fs::write(group.join("autonomous"), b"").unwrap();
+    std::fs::write(group.join("auto_release"), b"").unwrap();
+    assert!(run(&["push", "origin", "refs/tags/v5.0.0"], ""), "autonomous+auto_release blanket-allows a tag push");
+    assert!(run(&["push", "origin", "refs/tags/v5.0.1"], ""), "blanket auto_release tag push is repeatable");
+    // Supervised dangerous mode (not autonomous): a v* tag push is allowed with the
+    // distinct audit marker.
+    for m in ["autonomous", "auto_release"] { let _ = std::fs::remove_file(group.join(m)); }
+    std::fs::write(group.join("dangerous_mode"), b"").unwrap();
+    std::fs::write(group.join("audit.jsonl"), b"").unwrap();
+    assert!(run(&["push", "origin", "refs/tags/v6.0.0"], ""), "dangerous mode → tag push allowed");
+    let audit = std::fs::read_to_string(group.join("audit.jsonl")).unwrap_or_default();
+    assert!(audit.contains("release-gate-dangerous"), "distinct dangerous audit marker, got: {audit}");
+    // No-op while autonomous.
+    std::fs::write(group.join("autonomous"), b"").unwrap();
+    assert!(!run(&["push", "origin", "refs/tags/v6.0.1"], ""), "dangerous ignored while autonomous → tag push blocked");
+}
+
+#[test]
+fn gh_shim_script_bakes_real_gh_and_enforces_the_guards() {
+    // The security-critical shim: pin that it bakes the real gh path, gates only
+    // merges, checks BOTH markers, fails safe on an unverifiable base, and audits.
+    let sh = gh_shim_sh("C:/Program Files/GitHub CLI/gh.exe");
+    assert!(sh.contains("REAL_GH=\"C:/Program Files/GitHub CLI/gh.exe\""), "bakes the real gh path");
+    assert!(sh.starts_with("#!/bin/sh"), "POSIX shebang so Git Bash runs it");
+    // Only merges are gated; everything else execs the real gh immediately.
+    assert!(sh.contains("exec \"$REAL_GH\" \"$@\""), "non-merge passthrough");
+    assert!(sh.contains("pr") && sh.contains("merge"), "detects gh pr merge");
+    // Base determined via the REAL gh, compared to the default branch.
+    assert!(sh.contains("baseRefName"), "resolves the PR base branch");
+    assert!(sh.contains("defaultBranchRef"), "resolves the repo default branch");
+    // BOTH markers required for a default-branch merge; fail-safe otherwise.
+    assert!(sh.contains("$LOOMUX_GROUP_DIR/autonomous") && sh.contains("$LOOMUX_GROUP_DIR/auto_merge"),
+        "checks both consent markers");
+    assert!(sh.contains("unverifiable-base"), "fail-safe block on an undeterminable base");
+    assert!(sh.contains("merge-gate-blocked") && sh.contains("audit.jsonl"), "audits refusals");
+    assert!(!sh.contains("\r"), "the POSIX shim must be LF-only (a CRLF #!/bin/sh is broken)");
+    // rev-79 F1/F2: the shim parses positionals around global flags and honors the
+    // caller's -R/--repo when resolving base + default branch.
+    assert!(sh.contains("--repo") && sh.contains("-R"), "recognizes -R/--repo global flag");
+    assert!(sh.contains("rf=\"-R $repo\""), "passes the caller's repo through to the lookups");
+    assert!(sh.contains("pr view $rf") && sh.contains("repo view $rf"), "both lookups honor -R");
+}
+
+#[test]
+fn set_auto_merge_requires_autonomous_mode() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    // Autonomous off → enabling auto-merge is REJECTED (the enforced dependency).
+    let err = reg.set_auto_merge(&g.id, true).unwrap_err();
+    assert!(err.to_lowercase().contains("autonomous"), "the rejection must name the dependency, got: {err}");
+    assert!(!reg.is_auto_merge(&g.id), "auto-merge must not be enabled without autonomous mode");
+    // With autonomous on, enabling works.
+    reg.set_autonomous(&g.id, true).unwrap();
+    reg.set_auto_merge(&g.id, true).unwrap();
+    assert!(reg.is_auto_merge(&g.id));
+}
+
+#[test]
+fn disabling_autonomous_force_disables_auto_merge() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let am_marker = reg.state_root().join(&g.id).join("auto_merge");
+    reg.set_autonomous(&g.id, true).unwrap();
+    reg.set_auto_merge(&g.id, true).unwrap();
+    assert!(reg.is_auto_merge(&g.id) && am_marker.is_file());
+    // Turning autonomous OFF must force auto-merge off too — the pair can never be
+    // auto_merge-on/autonomous-off (the combo the enforced gate keys on).
+    reg.set_autonomous(&g.id, false).unwrap();
+    assert!(!reg.is_auto_merge(&g.id), "auto-merge must be force-disabled when autonomous turns off");
+    assert!(!am_marker.is_file(), "the auto_merge marker must be removed");
+    assert_eq!(audit_count(&reg, &g.id, "auto-merge-off"), 1, "the forced disable is audited");
+    assert_eq!(s(reg.autonomy_state(&g.id)["auto_merge"].to_string().as_str()), "false");
+}
+
+#[test]
+fn stale_auto_merge_without_autonomous_is_reconciled_on_read() {
+    // Migration: a group dir carrying an `auto_merge` marker but no `autonomous`
+    // marker (older group predating the dependency, or a hand-edited state dir)
+    // must be reconciled OFF on the next load, so the enforced gate never sees the
+    // forbidden combo.
+    let (reg, dir) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let gdir = reg.state_root().join(&g.id);
+    // Simulate the stale on-disk combo directly.
+    std::fs::write(gdir.join("auto_merge"), b"").unwrap();
+    assert!(!gdir.join("autonomous").is_file());
+    // Reload the group in a fresh registry (restart) → reconcile.
+    let reg2 = OrchRegistry::new(dir.path().to_path_buf());
+    reg2.set_port(45999);
+    reg2.create_group("C:/tmp/repo", rails()).unwrap();
+    assert!(!reg2.is_auto_merge(&g.id), "stale auto-merge must be reconciled off without autonomous");
+    assert!(!gdir.join("auto_merge").is_file(), "the stale marker must be removed");
+    assert_eq!(audit_count(&reg2, &g.id, "auto-merge-off"), 1, "the reconcile is audited");
+}
+
+#[test]
+fn set_auto_release_mirrors_auto_merge_dependency_and_is_independent() {
+    let (reg, dir) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let am = reg.state_root().join(&g.id).join("auto_merge");
+    let ar = reg.state_root().join(&g.id).join("auto_release");
+    // Dependency: enabling auto-release without autonomous is rejected.
+    let err = reg.set_auto_release(&g.id, true).unwrap_err();
+    assert!(err.to_lowercase().contains("autonomous"), "must name the dependency, got: {err}");
+    assert!(!reg.is_auto_release(&g.id));
+    // With autonomous on, the two toggles are INDEPENDENT: auto_merge on + auto_release
+    // off, and vice versa.
+    reg.set_autonomous(&g.id, true).unwrap();
+    reg.set_auto_merge(&g.id, true).unwrap();
+    assert!(reg.is_auto_merge(&g.id) && !reg.is_auto_release(&g.id), "auto_merge on must not enable auto_release");
+    assert!(am.is_file() && !ar.is_file());
+    reg.set_auto_release(&g.id, true).unwrap();
+    assert!(reg.is_auto_merge(&g.id) && reg.is_auto_release(&g.id));
+    reg.set_auto_merge(&g.id, false).unwrap();
+    assert!(!reg.is_auto_merge(&g.id) && reg.is_auto_release(&g.id), "disabling auto_merge must not touch auto_release");
+    assert!(!am.is_file() && ar.is_file());
+    assert_eq!(reg.autonomy_state(&g.id)["auto_release"].as_bool(), Some(true));
+    // Turning autonomous OFF force-disables auto_release too (money-stop), audited.
+    reg.set_autonomous(&g.id, false).unwrap();
+    assert!(!reg.is_auto_release(&g.id), "autonomous-off must force-disable auto_release");
+    assert!(!ar.is_file());
+    assert_eq!(audit_count(&reg, &g.id, "auto-release-off"), 1);
+    // Restart survival + stale reconcile: a stale auto_release without autonomous
+    // is reconciled off on read.
+    reg.set_autonomous(&g.id, true).unwrap();
+    reg.set_auto_release(&g.id, true).unwrap();
+    std::fs::remove_file(reg.state_root().join(&g.id).join("autonomous")).unwrap(); // hand-edit: drop autonomous, leave auto_release
+    let reg2 = OrchRegistry::new(dir.path().to_path_buf());
+    reg2.set_port(45999);
+    reg2.create_group("C:/tmp/repo", rails()).unwrap();
+    assert!(!reg2.is_auto_release(&g.id), "stale auto_release without autonomous reconciled off");
+    assert!(!reg2.state_root().join(&g.id).join("auto_release").is_file());
+}
+
+#[test]
+fn budget_suspension_force_disables_auto_release() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    reg.set_autonomous(&g.id, true).unwrap();
+    reg.set_auto_release(&g.id, true).unwrap();
+    assert!(reg.is_auto_release(&g.id));
+    seed_usage(&reg, &g.id, "spend", 5_000);
+    reg.set_autonomy_budget(&g.id, 100).unwrap();
+    assert_eq!(reg.enforce_autonomy_budgets(now_ms()), vec![g.id.clone()]);
+    assert!(!reg.is_autonomous(&g.id));
+    assert!(!reg.is_auto_release(&g.id), "budget suspension must drop auto_release (gate closed)");
+}
+
+#[test]
+fn dangerous_mode_setter_and_autonomous_are_mutually_exclusive() {
+    let (reg, dir) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let marker = reg.state_root().join(&g.id).join("dangerous_mode");
+    // Default OFF; enable works while NOT autonomous.
+    assert!(!reg.is_dangerous_mode(&g.id));
+    reg.set_dangerous_mode(&g.id, true).unwrap();
+    assert!(reg.is_dangerous_mode(&g.id) && marker.is_file());
+    assert_eq!(audit_count(&reg, &g.id, "dangerous-mode-on"), 1);
+    assert_eq!(reg.autonomy_state(&g.id)["dangerous_mode"].as_bool(), Some(true));
+    // MUTUAL EXCLUSION: enabling autonomous force-CLEARS dangerous mode (audited).
+    reg.set_autonomous(&g.id, true).unwrap();
+    assert!(!reg.is_dangerous_mode(&g.id), "enabling autonomous must clear dangerous mode");
+    assert!(!marker.is_file(), "the dangerous_mode marker must be removed");
+    assert_eq!(audit_count(&reg, &g.id, "dangerous-mode-off"), 1, "the forced clear is audited");
+    // MUTUAL EXCLUSION the other way: enabling dangerous while autonomous is REJECTED.
+    let err = reg.set_dangerous_mode(&g.id, true).unwrap_err();
+    assert!(err.to_lowercase().contains("mutually exclusive") || err.to_lowercase().contains("autonomous"),
+        "clear error naming the exclusion, got: {err}");
+    assert!(!reg.is_dangerous_mode(&g.id));
+    // Turn autonomous off, re-enable dangerous, then restart → survives (it's valid
+    // standalone, unlike auto_merge/auto_release).
+    reg.set_autonomous(&g.id, false).unwrap();
+    reg.set_dangerous_mode(&g.id, true).unwrap();
+    let reg2 = OrchRegistry::new(dir.path().to_path_buf());
+    reg2.set_port(45999);
+    reg2.create_group("C:/tmp/repo", rails()).unwrap();
+    assert!(reg2.is_dangerous_mode(&g.id), "dangerous mode survives restart while not autonomous");
+    // Disable is disk-first + audited.
+    reg2.set_dangerous_mode(&g.id, false).unwrap();
+    assert!(!reg2.is_dangerous_mode(&g.id));
+    assert!(!reg2.state_root().join(&g.id).join("dangerous_mode").is_file());
+}
+
+#[test]
+fn stale_dangerous_mode_with_autonomous_is_reconciled_off_on_read() {
+    // Hand-edited/impossible combo (both markers) → autonomous wins, dangerous cleared.
+    let (reg, dir) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let gdir = reg.state_root().join(&g.id);
+    std::fs::write(gdir.join("autonomous"), b"0").unwrap();
+    std::fs::write(gdir.join("dangerous_mode"), b"").unwrap();
+    let reg2 = OrchRegistry::new(dir.path().to_path_buf());
+    reg2.set_port(45999);
+    reg2.create_group("C:/tmp/repo", rails()).unwrap();
+    assert!(!reg2.is_dangerous_mode(&g.id), "dangerous+autonomous combo reconciled: autonomous wins");
+    assert!(!gdir.join("dangerous_mode").is_file(), "the stale dangerous marker is removed");
+    assert!(reg2.is_autonomous(&g.id));
+}
+
+#[test]
+fn budget_suspension_force_disables_auto_merge_even_if_marker_removal_fails() {
+    // rev-79 F4: a budget suspension turns autonomous OFF, so it must also drop
+    // auto-merge — otherwise the gate is left open (auto_merge-on/autonomous-off).
+    // The in-memory gate set is authoritative and dropped UNCONDITIONALLY, even if
+    // the durable marker can't be removed (the #149 money-stop pattern).
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    reg.set_autonomous(&g.id, true).unwrap();
+    reg.set_auto_merge(&g.id, true).unwrap();
+    assert!(reg.is_auto_merge(&g.id));
+    // Force the auto_merge marker removal to fail (swap the file for a directory).
+    let am = reg.state_root().join(&g.id).join("auto_merge");
+    std::fs::remove_file(&am).unwrap();
+    std::fs::create_dir(&am).unwrap();
+    // Exhaust the budget so the enforcer suspends autonomous mode.
+    seed_usage(&reg, &g.id, "spend", 5_000);
+    reg.set_autonomy_budget(&g.id, 100).unwrap();
+    assert_eq!(reg.enforce_autonomy_budgets(now_ms()), vec![g.id.clone()]);
+    assert!(!reg.is_autonomous(&g.id), "budget must suspend autonomous");
+    assert!(!reg.is_auto_merge(&g.id),
+        "auto-merge must be dropped from the gate set even when its marker can't be removed");
+    assert_eq!(reg.autonomy_state(&g.id)["auto_merge"].as_bool(), Some(false));
+}
+
+/// Run the real POSIX shim end-to-end against a fake gh (rev-79 F3): the shell has
+/// selector/repo parsing + marker/audit logic the pure Rust fns don't fully mirror,
+/// so execute it. Skipped (not failed) when no POSIX `sh` is available.
+#[test]
+fn gh_shim_shell_harness_executes_the_gate() {
+    use std::process::Command;
+    // Gate on a working `sh` (Git Bash on Windows / system sh elsewhere).
+    if Command::new("sh").arg("-c").arg("exit 0").status().map(|s| !s.success()).unwrap_or(true) {
+        eprintln!("SKIP gh_shim_shell_harness_executes_the_gate: no POSIX sh available");
+        return;
+    }
+    let td = tempfile::tempdir().unwrap();
+    let root = td.path();
+    let group_dir = root.join("group");
+    std::fs::create_dir_all(&group_dir).unwrap();
+    let log = root.join("fake_gh.log");
+
+    // Fake gh: records its args, answers pr view / repo view from env, "succeeds"
+    // for anything else (the passthrough / allowed merge).
+    let fake = root.join("fakegh");
+    std::fs::write(&fake, format!(
+        "#!/bin/sh\n\
+         echo \"ARGS: $*\" >> \"{log}\"\n\
+         if [ \"$1\" = \"pr\" ] && [ \"$2\" = \"view\" ]; then printf '%s\\n' \"$FAKE_BASE\"; exit 0; fi\n\
+         if [ \"$1\" = \"repo\" ] && [ \"$2\" = \"view\" ]; then printf '%s\\n' \"$FAKE_DEFAULT\"; exit 0; fi\n\
+         printf 'FAKE-GH-RAN\\n'; exit 0\n",
+        log = log.display()
+    )).unwrap();
+    // Write the REAL shim, baked to call our fake gh.
+    let shim = root.join("gh");
+    std::fs::write(&shim, gh_shim_sh(&fake.display().to_string())).unwrap();
+    // Make both executable in the MSYS/unix view.
+    let _ = Command::new("sh").arg("-c")
+        .arg(format!("chmod +x '{}' '{}'", fake.display(), shim.display())).status();
+
+    // Run the shim under sh with the given argv + env; returns (exit_ok, stderr).
+    let run = |argv: &[&str], base: &str, default: &str| -> (bool, String) {
+        let out = Command::new("sh")
+            .arg(&shim)
+            .args(argv)
+            .env("LOOMUX_GROUP_DIR", &group_dir)
+            .env("FAKE_BASE", base)
+            .env("FAKE_DEFAULT", default)
+            .output()
+            .expect("run shim");
+        (out.status.success(), String::from_utf8_lossy(&out.stderr).into_owned())
+    };
+    let set_markers = |on: bool| {
+        for m in ["autonomous", "auto_merge"] {
+            let p = group_dir.join(m);
+            if on { std::fs::write(&p, b"").unwrap(); } else { let _ = std::fs::remove_file(&p); }
+        }
+    };
+
+    // 1) base == default, NO markers → BLOCKED (non-zero, message).
+    set_markers(false);
+    let (ok, err) = run(&["pr", "merge", "1"], "main", "main");
+    assert!(!ok, "gate-closed merge to default must fail");
+    assert!(err.contains("human gate"), "refusal message, got: {err}");
+
+    // 2) rev-79 F1: `gh -R o/r pr merge` (global flag BEFORE the command) is ALSO
+    //    gated — the exact hole rev-79 found.
+    let (ok, _e) = run(&["-R", "owner/repo", "pr", "merge", "1"], "main", "main");
+    assert!(!ok, "the -R-before form must be gated, not slip through");
+
+    // 3) both markers present → ALLOWED (exit 0), and the -R was forwarded to the
+    //    base lookup (F2).
+    set_markers(true);
+    std::fs::write(&log, b"").unwrap();
+    let (ok, _e) = run(&["-R", "owner/repo", "pr", "merge", "1"], "main", "main");
+    assert!(ok, "gate-open merge must succeed");
+    let logged = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(logged.contains("pr view") && logged.contains("-R owner/repo"),
+        "the caller's -R must be forwarded to the base lookup, log: {logged}");
+
+    // 4) base != default (integration branch) → PASSES regardless of markers.
+    set_markers(false);
+    let (ok, _e) = run(&["pr", "merge", "1"], "feat/x", "main");
+    assert!(ok, "an integration-branch merge is never gated");
+
+    // 5) non-merge command → passthrough (exit 0).
+    let (ok, _e) = run(&["issue", "list"], "main", "main");
+    assert!(ok, "non-merge gh must pass through");
+
+    // The audit trail recorded a refusal.
+    let audit = std::fs::read_to_string(group_dir.join("audit.jsonl")).unwrap_or_default();
+    assert!(audit.contains("merge-gate-blocked"), "refusals are audited, got: {audit}");
+}
+
+#[test]
+fn autonomous_toggle_roundtrip_durable_and_audited() {
+    let (reg, dir) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let marker = reg.state_root().join(&g.id).join("autonomous");
+    assert!(!reg.is_autonomous(&g.id), "default off");
+    // Enable: marker written (content is the budget anchor), state on, audited.
+    reg.set_autonomous(&g.id, true).unwrap();
+    assert!(reg.is_autonomous(&g.id));
+    assert!(marker.is_file(), "enabling must write the durable marker");
+    assert_eq!(audit_count(&reg, &g.id, "autonomous-on"), 1);
+    // Idempotent: a second enable does not re-anchor or re-audit.
+    reg.set_autonomous(&g.id, true).unwrap();
+    assert_eq!(audit_count(&reg, &g.id, "autonomous-on"), 1, "re-enable is a no-op");
+    // Restart survival: a fresh registry over the same root re-seeds the toggle
+    // from the marker on group resume.
+    let reg2 = OrchRegistry::new(dir.path().to_path_buf());
+    reg2.set_port(45999);
+    let g2 = reg2.create_group("C:/tmp/repo", rails()).unwrap();
+    assert_eq!(g2.id, g.id, "same repo resumes the same group");
+    assert!(reg2.is_autonomous(&g.id), "autonomous mode must survive a restart");
+    // Disable: marker gone, state off, audited.
+    reg2.set_autonomous(&g.id, false).unwrap();
+    assert!(!reg2.is_autonomous(&g.id));
+    assert!(!marker.is_file(), "disabling must remove the marker");
+    assert_eq!(audit_count(&reg2, &g.id, "autonomous-off"), 1);
+}
+
+#[test]
+fn auto_merge_toggle_roundtrip_durable_audited_and_in_kickoff() {
+    let (reg, dir) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let marker = reg.state_root().join(&g.id).join("auto_merge");
+    assert!(!reg.is_auto_merge(&g.id), "default off = human merge gate");
+    // Auto-merge exists only in autonomous mode (#83 dependency) — enable it first.
+    reg.set_autonomous(&g.id, true).unwrap();
+    reg.set_auto_merge(&g.id, true).unwrap();
+    assert!(reg.is_auto_merge(&g.id));
+    assert!(marker.is_file());
+    assert_eq!(audit_count(&reg, &g.id, "auto-merge-on"), 1);
+    // The orchestrator kickoff must reflect the live gate so a fresh boot/resume
+    // sees it (the template's conditional merge section reads this).
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let entry = reg.agent(&orch.id).unwrap();
+    let info = reg.group(&g.id).unwrap();
+    let kickoff = reg.kickoff_prompt(&entry, &info, "");
+    assert!(kickoff.contains("auto-merge is ENABLED"), "kickoff must surface auto-merge on, got: {kickoff}");
+    // No-op re-enable does not re-audit.
+    reg.set_auto_merge(&g.id, true).unwrap();
+    assert_eq!(audit_count(&reg, &g.id, "auto-merge-on"), 1);
+    // Restart survival.
+    let reg2 = OrchRegistry::new(dir.path().to_path_buf());
+    reg2.set_port(45999);
+    reg2.create_group("C:/tmp/repo", rails()).unwrap();
+    assert!(reg2.is_auto_merge(&g.id), "auto-merge must survive a restart");
+    reg2.set_auto_merge(&g.id, false).unwrap();
+    assert!(!reg2.is_auto_merge(&g.id));
+    assert!(!marker.is_file());
+    assert_eq!(audit_count(&reg2, &g.id, "auto-merge-off"), 1);
+}
+
+#[test]
+fn autonomy_budget_set_persists_survives_restart_and_audits() {
+    let (reg, dir) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    assert_eq!(reg.group(&g.id).unwrap().guardrails.autonomy_budget_tokens, 0, "default no cap");
+    assert_eq!(reg.set_autonomy_budget(&g.id, 250_000).unwrap(), 250_000);
+    assert_eq!(reg.group(&g.id).unwrap().guardrails.autonomy_budget_tokens, 250_000,
+        "the live guardrail the budget check reads must update");
+    assert_eq!(audit_count(&reg, &g.id, "autonomy-budget-set"), 1);
+    // No-op set does not re-persist/re-audit.
+    reg.set_autonomy_budget(&g.id, 250_000).unwrap();
+    assert_eq!(audit_count(&reg, &g.id, "autonomy-budget-set"), 1);
+    // Persisted to group.json and preferred over the launch param on resume.
+    let reg2 = OrchRegistry::new(dir.path().to_path_buf());
+    reg2.set_port(45999);
+    let g2 = reg2.create_group("C:/tmp/repo", rails()).unwrap();
+    assert_eq!(reg2.group(&g2.id).unwrap().guardrails.autonomy_budget_tokens, 250_000,
+        "a live-set budget must survive a restart, not revert to the launch default");
+    // Unknown group errors.
+    assert!(reg.set_autonomy_budget("no-such-group", 1).is_err());
+}
+
+#[test]
+fn budget_metering_anchors_at_enable_and_suspends_once_on_delta() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    // Pre-existing (pre-autonomous) spend that the budget must NOT count.
+    seed_usage(&reg, &g.id, "history", 1_000);
+    // Enable autonomous mode: the anchor is stamped at the current 1_000 tokens.
+    reg.set_autonomous(&g.id, true).unwrap();
+    reg.set_autonomy_budget(&g.id, 500).unwrap();
+    // No autonomous-era spend yet → delta 0 < 500 → still ticking.
+    assert!(reg.enforce_autonomy_budgets(now_ms()).is_empty(), "under budget must not suspend");
+    assert!(reg.is_autonomous(&g.id), "still autonomous while under budget");
+    // Autonomous-era spend of 600 tokens crosses the 500 budget (delta metered
+    // from the enable-time anchor, not the 1_600 lifetime total).
+    seed_usage(&reg, &g.id, "autonomous-era", 600);
+    assert_eq!(reg.enforce_autonomy_budgets(now_ms()), vec![g.id.clone()],
+        "crossing the budget must suspend");
+    assert!(!reg.is_autonomous(&g.id), "suspension flips the marker off (consent to resume)");
+    assert_eq!(audit_count(&reg, &g.id, "autonomy-budget-exhausted"), 1);
+    // Suspension is a one-shot: a second pass sees a non-autonomous group and does
+    // nothing, so the notice/audit never repeats.
+    assert!(reg.enforce_autonomy_budgets(now_ms()).is_empty(), "no re-suspend once off");
+    assert_eq!(audit_count(&reg, &g.id, "autonomy-budget-exhausted"), 1, "exactly one suspension notice");
+    // Re-enabling re-anchors at the now-higher spend (1_600), so the same budget
+    // meters fresh autonomous-era spend rather than instantly re-suspending.
+    reg.set_autonomous(&g.id, true).unwrap();
+    assert!(reg.enforce_autonomy_budgets(now_ms()).is_empty(),
+        "re-enabling re-anchors: the meter restarts from the current spend");
+    assert!(reg.is_autonomous(&g.id));
+}
+
+#[test]
+fn autonomy_state_reports_budget_suspension_distinctly() {
+    // orch_autonomy must let the UI tell a budget suspension from a plain user-off
+    // without parsing the audit log — via a durable `suspended` flag.
+    let (reg, dir) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let suspended = |r: &OrchRegistry| r.autonomy_state(&g.id)["suspended"].as_bool().unwrap();
+
+    // Never-on: not suspended. An ON group: never suspended. A plain user-off:
+    // OFF but NOT a suspension.
+    assert!(!suspended(&reg), "never-enabled is not suspended");
+    reg.set_autonomous(&g.id, true).unwrap();
+    assert!(!suspended(&reg), "an ON group is never suspended");
+    reg.set_autonomous(&g.id, false).unwrap();
+    assert!(!suspended(&reg), "a plain user toggle-off must not read as budget-suspended");
+
+    // Budget suspension: re-enable, arm an exhausted budget, enforce → OFF + suspended.
+    reg.set_autonomous(&g.id, true).unwrap();
+    seed_usage(&reg, &g.id, "spend", 5_000);
+    reg.set_autonomy_budget(&g.id, 100).unwrap();
+    assert_eq!(reg.enforce_autonomy_budgets(now_ms()), vec![g.id.clone()]);
+    assert!(!reg.is_autonomous(&g.id));
+    assert!(suspended(&reg), "a budget suspension must read as suspended");
+
+    // Survives restart: a fresh registry over the same root still reports it.
+    let reg2 = OrchRegistry::new(dir.path().to_path_buf());
+    reg2.set_port(45999);
+    reg2.create_group("C:/tmp/repo", rails()).unwrap();
+    assert!(!reg2.is_autonomous(&g.id));
+    assert!(reg2.autonomy_state(&g.id)["suspended"].as_bool().unwrap(),
+        "budget suspension must survive a restart");
+
+    // A genuine re-enable resolves it: ON and no longer suspended.
+    reg2.set_autonomous(&g.id, true).unwrap();
+    assert!(reg2.is_autonomous(&g.id));
+    assert!(!reg2.autonomy_state(&g.id)["suspended"].as_bool().unwrap(),
+        "re-enabling clears the suspended state");
+}
+
+#[test]
+fn failed_disable_keeps_consent_on_and_is_audited() {
+    // L2 consent-boundary: a disable whose marker removal fails must NOT report
+    // success — a surviving marker would silently re-enable on restart. The toggle
+    // must error, leave state consistently ON, and audit the failure.
+    let (reg, _d, gid, _oid) = autonomous_setup();
+    assert!(reg.is_autonomous(&gid));
+    let marker = reg.state_root().join(&gid).join("autonomous");
+    // Force removal to fail deterministically: swap the marker file for a
+    // directory of the same name (fs::remove_file refuses a directory) — standing
+    // in for a real IO failure where the marker survives.
+    fs::remove_file(&marker).unwrap();
+    fs::create_dir(&marker).unwrap();
+    let err = reg.set_autonomous(&gid, false).unwrap_err();
+    assert!(err.to_lowercase().contains("disable"), "the UI must see a clear failure, got: {err}");
+    assert!(reg.is_autonomous(&gid), "a failed removal must leave autonomous ON, matching the surviving marker");
+    assert_eq!(audit_count(&reg, &gid, "autonomous-off-failed"), 1, "the failed disable must be audited");
+    assert_eq!(audit_count(&reg, &gid, "autonomous-off"), 0, "no success audit on a failed disable");
+}
+
+#[test]
+fn suspension_stops_ticking_even_if_marker_removal_fails() {
+    // rev-49 money-stop: a budget suspension whose durable-marker removal fails must
+    // STILL stop ticking — continued spend past the cap is the one direction this
+    // feature must never allow. So unlike a user disable (which stays ON on failure
+    // to protect consent), suspension drops the in-memory flag unconditionally.
+    let (reg, _d, gid, oid) = autonomous_setup();
+    // First prove it IS ticking before the fault.
+    let empty = HashMap::new();
+    assert_eq!(reg.idle_tick_tick(FAR, &empty, &empty), vec![oid.clone()]);
+    // Arm an exhausted budget, then force the autonomous-marker removal to fail by
+    // swapping the marker file for a directory (fs::remove_file refuses it).
+    seed_usage(&reg, &gid, "spend", 5_000);
+    reg.set_autonomy_budget(&gid, 100).unwrap();
+    let marker = reg.state_root().join(&gid).join("autonomous");
+    fs::remove_file(&marker).unwrap();
+    fs::create_dir(&marker).unwrap();
+    // Suspend: the durable disable fails (audited) but the money-stop still lands.
+    assert_eq!(reg.enforce_autonomy_budgets(now_ms()), vec![gid.clone()]);
+    assert!(!reg.is_autonomous(&gid), "suspension must stop ticking even under a disk fault");
+    assert_eq!(audit_count(&reg, &gid, "autonomous-off-failed"), 1, "the failed durable disable is audited");
+    // The critical guarantee: NO further ticks after suspension, ever.
+    assert!(reg.idle_tick_tick(FAR + 60_000, &empty, &empty).is_empty(),
+        "no ticks may fire after a budget suspension, even a disk-faulted one");
+    // And a later enforce pass doesn't re-suspend/re-notify (already out of the set).
+    assert!(reg.enforce_autonomy_budgets(now_ms()).is_empty(), "no repeat suspension");
+    assert_eq!(audit_count(&reg, &gid, "autonomy-budget-exhausted"), 1, "the notice fires exactly once");
+}
+
+#[test]
+fn restart_treats_a_suspended_marker_as_authoritative_off() {
+    // Even if a failed suspension leaves the `autonomous` enable marker on disk, a
+    // co-present `autonomy_suspended` marker must win at restart: the group resumes
+    // OFF + suspended-visible, never silently ticking past its spent budget.
+    let (reg, dir) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let gdir = reg.state_root().join(&g.id);
+    fs::write(gdir.join("autonomous"), "0").unwrap();          // stale enable marker survived
+    fs::write(gdir.join("autonomy_suspended"), "{}").unwrap(); // suspension marker wins
+    let reg2 = OrchRegistry::new(dir.path().to_path_buf());
+    reg2.set_port(45999);
+    reg2.create_group("C:/tmp/repo", rails()).unwrap();
+    assert!(!reg2.is_autonomous(&g.id),
+        "a suspended marker forces OFF at restart despite a stale autonomous marker");
+    assert!(reg2.autonomy_state(&g.id)["suspended"].as_bool().unwrap(),
+        "and the resumed group reads as suspended");
+}
+
+#[test]
+fn run_idle_tick_composes_budget_enforcement_then_tick() {
+    // run_idle_tick must enforce budgets BEFORE ticking. Headless:
+    // orchestrator_activity returns empty maps (no app handle), so the
+    // orchestrator reads as output-quiet and a due tick fires.
+    let (reg, _d, gid, oid) = autonomous_setup();
+    assert_eq!(reg.run_idle_tick(FAR), vec![oid.clone()], "run_idle_tick delivers the idle tick");
+    assert_eq!(audit_count(&reg, &gid, "idle-tick"), 1);
+    // Arm an exhausted budget: the next cycle must SUSPEND (enforce runs first) and
+    // therefore deliver no tick — proving the composition order.
+    seed_usage(&reg, &gid, "spend", 5_000);
+    reg.set_autonomy_budget(&gid, 100).unwrap();
+    assert!(reg.run_idle_tick(FAR + 60_000).is_empty(),
+        "an over-budget group is suspended before the tick, so no tick fires");
+    assert!(!reg.is_autonomous(&gid), "budget enforcement suspended autonomous mode");
+    assert_eq!(audit_count(&reg, &gid, "autonomy-budget-exhausted"), 1);
+}
+
+#[test]
+fn idle_tick_does_not_touch_worker_idle_clocks() {
+    // A tick pokes the orchestrator only; worker idle clocks (the reaper's, not
+    // the tick's) must be untouched, so idle workers still reap on schedule.
+    let (reg, _d, gid, oid) = autonomous_setup();
+    let w = reg.spawn_agent(&gid, Role::Worker, "idle-w", "", false, None).unwrap();
+    let before = reg.agent(&w.id).unwrap().idle_since_ms;
+    assert!(before.is_some(), "an untasked worker is idle");
+    let empty = HashMap::new();
+    assert_eq!(reg.idle_tick_tick(FAR, &empty, &empty), vec![oid.clone()]);
+    assert_eq!(reg.agent(&w.id).unwrap().idle_since_ms, before,
+        "an idle tick must leave worker idle_since_ms untouched");
 }
 
 // ---------- attention routing: surface which pane needs the human (#6) ----------

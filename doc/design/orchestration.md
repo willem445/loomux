@@ -449,6 +449,270 @@ box clears) rather than making the orchestrator poll terminals by hand.
   Silent-agent recovery adds the human-facing half: on a repeat unconfirmed notice for the
   same agent, stop re-sending and flag the human.
 
+## Autonomous mode (#83)
+
+The orchestrator template already documents a full idle cadence — poll `agent-ready`/
+`agent-investigate` labels, groom them, re-check open PRs — "on the slow periodic cadence
+while otherwise idle." But an LLM CLI only acts when text is typed into it, and **nothing in
+the backend ever poked an idle orchestrator**: every wake-up (worker report, board change,
+human message, watchdog stall, max-agents change) is event-driven. When a group went quiet
+the cadence simply never ran. Autonomous mode closes that gap with a **tick source**, plus
+the two cost/safety controls the unattended-spend risk demands.
+
+- **Idle-tick loop.** `start_idle_tick` (60s wake, clone of `start_watchdog`) calls
+  `run_idle_tick`, which reads each live orchestrator pane's `output_total` and
+  `last_user_input_ms` (`orchestrator_activity`, the analogue of `agent_output_totals`) and
+  hands the snapshot to `idle_tick_tick`. Splitting the pty read from the decision keeps the
+  gate/latch/cap/pause logic pure and fixture-testable with synthetic maps — the
+  `watchdog_tick` shape. An orchestrator output-quiet past `IDLE_TICK_MINUTES` (15, a fixed
+  constant in v1) earns exactly one audited (`idle-tick`) `[loomux] idle tick` notice via
+  `deliver_to_orchestrator` (mid-session delivery — the same #43-hardened paste path a live
+  orchestrator receives any prompt through) telling it to run its cadence and **start** labeled
+  work. The threshold arithmetic is the pure `idle_tick_should_fire`.
+- **Window: 5 min default, per-group tunable.** `Guardrails.idle_tick_minutes` (default
+  `DEFAULT_IDLE_TICK_MINUTES` = 5; 0 → default, floored at 1 — the `autonomous` marker, not
+  this, is the on/off switch; persisted in group.json, live-settable via
+  `set_idle_tick_minutes`). The original 15-min fixed constant was the root cause of a live
+  test where an 8-minute autonomous session simply never fired; 5 min matches the human's
+  "action within a few minutes" expectation, and the knob lets them drop to 1–2 min to verify.
+- **Repaint-tolerant quiet signal.** `output_total` counts *every* byte, including
+  statusline/spinner repaints that keep creeping while the CLI is parked — and there is no
+  output-frame classifier (the #112 work classifies human *input*, not output). So treating
+  *any* growth as activity (as the watchdog does) let a single stray repaint byte reset the
+  whole quiet window, so an orchestrator that repaints even occasionally could never
+  accumulate a full window and never ticked. The idle tick instead discriminates by size (pure
+  `idle_output_is_activity`): only per-tick growth `>= idle_activity_floor_bytes` counts as the
+  orchestrator working and resets the clock + latch; sub-floor growth rebaselines the counter but
+  leaves the quiet clock running. So one repaint can never demand another full window of silence.
+  The **default 2048** is justified by measurement — a captured full idle Claude Code input-box
+  render (box-drawing + ANSI) is ~164 bytes (`tests/fixtures/attention/idle-input-box.txt`, pinned
+  by a test), so 2048 gives ~12× headroom over a complete idle repaint. No raw idle-pane byte
+  *stream* is captured anywhere and spawning a live CLI is forbidden, so that rendered-frame size
+  is the honest available measurement. Because this rides the exact wake+spend axis that already
+  failed once, the floor is a **live-tunable guardrail** (`Guardrails.idle_activity_floor_bytes`,
+  0→default, clamped `1..=1 MiB`, persisted, audited, `set_idle_activity_floor`) — the runtime
+  remedy if a chattier CLI's idle repaints exceed the default.
+- **Self-regulating + capped.** A real output burst (the orchestrator acting) resets the quiet
+  clock **and** clears the one-notice latch (`AgentEntry.idle_tick_notified`, mirroring
+  `watchdog_notified`), so the worst case is one tick per idle window — an action defers the
+  next tick, so it can't tight-loop. A hard `MAX_IDLE_TICKS_PER_HOUR` backstop (per-group
+  timestamp ring, `idle_tick_times`, reusing `spawn_rate_exceeded`'s window rule) catches any
+  pathological re-arm. Recent **human input** in the pane folds into the quiet clock too
+  (belt-and-suspenders on top of output-silence), so a tick never lands while the human is
+  steering. **Paused** groups are skipped wholesale and their latch left intact (same
+  reasoning as the watchdog).
+- **Observability.** Because the tick is otherwise invisible until it fires, `orch_autonomy`
+  surfaces `idle_tick_minutes`, `idle_activity_floor_bytes`, and (while on) `quiet_secs`,
+  `eligible_in_secs`, and `tick_status`. The countdown is **honest** (`idle_tick_observability`):
+  `eligible_in_secs` is a real timer only for `counting_down` / `eligible` / `rate_capped`; when
+  the one-notice latch gates the next tick (`waiting_for_activity`) there is no timer — it waits
+  for the orchestrator to emit output — so `eligible_in_secs` is `null`, never a lying 0. The
+  per-hour cap folds in as a real timer (time until the oldest tick ages out of the window). The
+  computation mirrors every skip-gate `idle_tick_tick` applies so the panel can't show a live
+  countdown while ticks are actually suppressed: `paused` (autonomous and paused are independent
+  markers — a paused group suppresses all delivery) and `starting` (a still-booting orchestrator;
+  the tick only considers Running panes) both report `null` countdown.
+- **The toggle.** Off by default. `is_autonomous`/`set_autonomous` on the `set_notify`
+  marker-file pattern (an `autonomous` marker), so it's live-togglable from the group panel
+  and survives restarts (re-seeded in `create_group` next to `paused`/`notify`). The label
+  funnel stays the consent boundary: autonomous mode starts *labeled* work on its own; it
+  never triages unlabeled issues (option (c) of the investigation, rejected).
+- **Cost guardrail — token budget.** The headline cost control. `Guardrails.autonomy_budget_tokens`
+  (u64; 0 = no cap; persisted in group.json, live-settable via `set_autonomy_budget` like
+  `max_agents`) caps **autonomous-era** spend. The anchor problem — budget lifetime history or
+  only new spend? — is settled by metering the **delta from an enable-time snapshot**: enabling
+  stamps the group's current `group_usage` token total into the `autonomous` marker's *content*
+  (`autonomy_anchor`), and `enforce_autonomy_budgets` (run each cycle before the tick) meters
+  `group_token_total(group) - anchor`. Crossing the budget (`autonomy_budget_exhausted`)
+  **suspends** autonomous mode — flips the marker off (explicit consent required to resume),
+  audits `autonomy-budget-exhausted`, and delivers **one** `[loomux]` notice; because
+  suspension leaves the autonomous set, later passes skip the group so it can't repeat. The
+  suspension also writes a durable `autonomy_suspended` marker (cleared on a genuine re-enable)
+  so `orch_autonomy` can report `suspended: true` — the UI distinguishes a budget suspension
+  from a plain user toggle-off without reconstructing it from the audit log. **The money-stop is
+  unconditional:** unlike a *user* disable (disk-first + fail-loud, to protect the consent
+  boundary — a failed removal keeps it ON), the suspension path (`suspend_autonomous`) drops the
+  in-memory flag **regardless of whether the marker can be removed**, because continued spend
+  past the cap is the one direction this feature must never allow. If the durable removal fails,
+  the surviving `autonomous` marker is overridden at restart by the `autonomy_suspended` marker
+  (the `create_group` re-seed checks suspended first), so the group comes back OFF +
+  suspended-visible rather than silently ticking. This is
+  genuinely **new enforcement** — exact per-session token accounting already existed
+  (`usage.rs`, `group_usage`) but no spend cap did. Tokens, not dollars: subscription/Max
+  accounts pay $0 marginal, so dollars are meaningless here (see `usage.rs`). Re-enabling
+  re-anchors at the now-higher spend, which is what "toggle to resume" means.
+- **Merge-approval toggle.** `is_auto_merge`/`set_auto_merge` (an `auto_merge` marker, default
+  OFF = today's human merge gate). The *behavior* lives in the orchestrator template — its merge
+  section is now conditional on the flag — and the backend just stores/exposes it and mirrors it
+  into the orchestrator's context two ways: the kickoff prompt renders the current gate (for a
+  fresh boot/resume) and a live toggle delivers an audited `[loomux] auto-merge …` notice (for
+  the running orchestrator), exactly how `max_agents` surfaces (kickoff render + live notice).
+  When enabled the orchestrator may merge an adequately-tested PR (reviewer-approved + green CI +
+  acceptance met) itself, auditing and announcing each merge and still holding anything
+  risky/ambiguous for the human.
+- **Commands (frozen contract; W2 builds the UI against it).** `orch_set_autonomous(group_id,
+  enabled)`, `orch_set_auto_merge(group_id, enabled)`, `orch_set_autonomy_budget(group_id,
+  tokens) -> u64`, `orch_set_idle_tick_minutes(group_id, minutes) -> u32`, and
+  `orch_autonomy(group_id) -> { autonomous, auto_merge, budget_tokens, budget_anchor_tokens,
+  spend_since_enable_tokens, suspended, idle_tick_minutes, quiet_secs, eligible_in_secs }` — the
+  one read the group panel renders all controls, the live budget meter, the budget-suspended
+  state, and the idle-tick countdown from. Registered in `lib.rs` beside `orch_set_notify`.
+- **This group could be affected.** The feature is generic — loomux's own orchestration group is
+  just another group, so nothing special-cases it. Turning autonomous mode on for the group
+  loomux is developed in would idle-tick *its* orchestrator like any other.
+- **Interactions.** Idle-kill is unaffected: the orchestrator is never idle-reaped, and a tick
+  delivered to it never touches worker `idle_since_ms`, so idle workers still reap on schedule.
+  Spawns a tick induces still count against `max_spawns_per_hour`. The human's pause/off-switch
+  is instant.
+
+## Enforced merge gate (#83)
+
+Template guidance is not a security boundary. A live incident proved it: an orchestrator merged
+four PRs straight to `main`, ignoring the "never merge" instruction. So the human merge gate is
+now **structurally enforced** — an agent that tries to merge onto the default branch without
+consent is *blocked*, not advised.
+
+- **The interceptor.** Every *agent* pane (orchestrator/worker/reviewer/planner) is spawned with
+  a loomux `gh` shim prepended to its `PATH` and `LOOMUX_GROUP_DIR` set to its group's state dir.
+  The shim (`ensure_gh_shim`, written once under `<data>/loomux/ghshim`) is a POSIX `gh` script
+  (plus a Windows `gh.cmd` that delegates to it) with the *real* gh's absolute path baked in, so
+  it never re-resolves to itself. Injection is per-pane via a new `SpawnRequest.env` →
+  `spawn_pty(env)` → `apply_extra_env` path, so **only agent panes** carry it — a human's own
+  shell (in loomux or out) has an untouched `PATH` and pays zero shim overhead. On Windows the
+  shim dir is first on `PATH`, and the agent's Bash tool (Git Bash, where Claude Code runs `gh`)
+  resolves the extension-less `gh` script ahead of the real `gh.exe`.
+- **The decision** is the pure, unit-tested `gh_gate_decision` (the shim mirrors it in shell,
+  and a shell harness executes the real script against a fake gh to prove parity): only
+  `gh pr merge` (and cheap `gh api` merge shapes — `gh_is_merge_invocation`) is gated. Detection
+  parses gh's argv into positionals (`gh_positionals`), skipping the global `-R/--repo <value>`
+  and other flags that gh accepts **before or between** the command tokens — so
+  `gh -R o/r pr merge` and `gh pr -R o/r merge` are gated, not just the bare form (the rev-79 F1
+  hole). The shim asks the *real* gh for the PR's `baseRefName` and the repo's `defaultBranchRef`,
+  **honoring the same `-R/--repo`** the caller passed (`gh_repo_flag`) so both resolve for the
+  right repo, not the cwd repo (rev-79 F2). A base
+  **≠ default** passes through untouched (the integration-branch flow agents rely on); a base
+  **= default** is allowed **only** when both the `autonomous` and `auto_merge` markers are
+  present; an **undeterminable** base fails safe (block). Every refusal/allow is appended to the
+  group's `audit.jsonl` in the backend's own line format (`actor: "gh-shim"`), and refusals exit
+  non-zero with a clear message telling the agent to report to the human.
+- **The dependency.** Auto-merge authority exists *only* in autonomous mode, enforced at the API,
+  not just the UI: `set_auto_merge(true)` is **rejected** unless autonomous is on; turning
+  autonomous **off force-disables** auto-merge (audited); a **budget suspension** does the same
+  (rev-79 F4); and a stale on-disk `auto_merge`-without-`autonomous` combo (older group,
+  hand-edited state) is **reconciled off on read** (audited). The force-disable drops auto-merge
+  from the in-memory gate set **unconditionally**, even if the durable marker removal fails (the
+  #149 money-stop pattern — in-memory authoritative). So the gate's "both markers present" test
+  can never be satisfied by an orphaned `auto_merge` marker. The UI mirrors this (`approvalControl`): with autonomous off the "Require human
+  approval" checkbox is locked checked with a tooltip.
+
+### Human-granted one-time exception (grants)
+
+The blanket markers are all-or-nothing, so a human clicking board **Approve** — or saying
+"merge it" — was *still* blocked (Approve doesn't set the markers). The fix is a per-target,
+one-time **grant** the shim also honors.
+
+- **Grant files.** A grant is a small file under the group dir the shim consults:
+  `merge_grants/pr-<N>` (a default-branch merge of PR N) or `release_grants/<tag>` (a
+  release/tag publish). Line 1 is a unix-seconds **expiry** (`GRANT_TTL_SECS` = 30 min); the
+  shim treats the grant as valid iff the file exists and now < expiry, and **consumes it**
+  (`rm`) on use — one action only. Files are written with `atomic_write` (temp + rename, temp
+  name = pid + `GRANT_SEQ`, no getrandom) so the shim can never read a half-written grant.
+- **Decision.** `gh_gate_decision` gains a `grant_valid` input: a default-branch merge is
+  allowed by `(autonomous && auto_merge)` **OR** a valid grant for *that* PR (`AllowGrant`,
+  consumed). The shim resolves the PR **number** via the real gh (`--json baseRefName,number`)
+  so a grant for #5 can't authorize merging #7 whatever selector form was used.
+- **Approve-with-comment.** The grant-writing methods (`grant_merge` / `grant_release`) take an
+  optional comment delivered to the orchestrator with the authorization via
+  `deliver_to_orchestrator` — "approved — also bump the changelog first". Board **Approve**
+  (`approve_task`) now writes the merge grant for the task's PR and delivers the comment.
+- **Agent-unreachable boundary.** Grants are written ONLY by Tauri commands (board Approve,
+  `orch_grant_merge`, `orch_grant_release`) — human surfaces. **No MCP tool** writes them
+  (regression-tested: no agent-visible tool name contains "grant", and the file-writing MCP
+  tools `set_state`/`upsert_task`/`save_attachment` write only their own fixed paths, never a
+  grant path). Agents *consume* grants (the shim) but never *mint* them through loomux.
+
+### Release & tag gating
+
+Releases publish to the world — a `v*` tag push triggers `release.yml` (GitHub release + npm),
+and `gh release create` does likewise — a strictly bigger blast radius than a merge. So they get
+enforcement **parallel to merges but on a SEPARATE, independent toggle**: a release/tag is allowed
+when **`(autonomous && auto_release)`** OR by an explicit per-tag grant (`release_gate_decision`,
+exactly mirroring `gh_gate_decision`'s `(autonomous && auto_merge) || grant`). `auto_release`
+defaults **OFF** and is independent of `auto_merge` — the human can allow auto-merge while keeping
+releases manual, opt into both, or neither. (This supersedes the earlier "releases are never
+blanket-allowed by autonomous" policy, which conflated "autonomous" with "auto-merge"; the human
+live-tested it and asked for hands-off releasing as an explicit opt-in.) Because the default is
+off, turning autonomous on never surprise-publishes — releasing stays a deliberate act (the toggle
+or a grant). `auto_release` mirrors `auto_merge`'s machinery exactly: gated behind autonomous
+(rejects enable when off), disk-first fail-loud disable, force-disabled on autonomous-off / budget
+suspension (the money-stop drops it from the in-memory gate set unconditionally), stale-marker
+reconcile on read, mirrored into the kickoff config + a live notice, and surfaced additively on
+`orch_autonomy` (`auto_release: bool`) via `orch_set_auto_release`.
+
+- **gh shim** additionally gates `gh release create|edit|delete <tag>` (read-only
+  `view`/`list`/`download` pass through) — `gh_release_action`.
+- **git shim** (new, same PATH-injection as the gh shim) gates `git push` that publishes a tag:
+  `--tags`/`--follow-tags`/`--mirror` (bulk → blocked, push the specific approved tag),
+  `refs/tags/<t>` and the `tag <t>` form (explicit), and a bare **`v*`** refspec (any v-prefixed
+  ref) **confirmed a tag** against the real git (`git_tag_push`). The `v*` pattern **must track
+  `.github/workflows/release.yml`'s `on.push.tags`** (both `git_tag_push` and the shim carry a
+  comment saying so): they matched `v<digit>` at first, which let `vbeta`/`vRelease` publish yet
+  slip the gate (rev-86). Local `git tag` is harmless — only the **push** reaches the world — and
+  a plain branch push (or a non-`v*` ref like `nightly`, which release.yml ignores) execs the
+  real git with **zero** extra work. The gh scanner's value-flag skip list is complete for
+  `gh release create` (`--title`/`--notes`/`--target`/… consume their value) so a granted release
+  with `--title "…"` before the tag isn't misparsed and wrongly blocked.
+
+### Supervised dangerous mode
+
+The human asked to "just instruct my agent to do merges and releases when I'm here supervising" —
+without turning on *autonomous* (which is the hands-off, unattended mode). So a `dangerous_mode`
+marker adds a fourth path to the **same single decision point**: a default-branch merge or a
+release/tag is allowed when `(autonomous && auto_merge/auto_release)` OR **`(dangerous && !autonomous)`**
+OR a valid grant. No new parallel checks — `gh_gate_decision` / `release_gate_decision` gain a
+`dangerous` param, and the shims read the `dangerous_mode` marker alongside the others.
+
+- **Mutually exclusive with autonomous**, enforced both ways: `set_dangerous_mode(true)` is
+  rejected while autonomous is on; enabling autonomous force-clears `dangerous_mode` (audited +
+  a human-visible notice). The shim's `dangerous && !autonomous` guard is defensive — if both
+  markers somehow coexist (hand-edit), autonomous wins and the stale `dangerous_mode` is
+  reconciled off on read. Unlike `auto_merge`/`auto_release`, `dangerous_mode` is valid
+  *standalone* (it IS the not-autonomous mode), so it survives restart without an `autonomous`
+  marker.
+- **Distinct audit path.** A merge/release allowed via dangerous mode audits `merge-gate-dangerous`
+  / `release-gate-dangerous` (vs `-allowed` for the autonomous blanket and `-granted` for a grant),
+  so the trail always records *which* gate path let it through — plus `GhGate::AllowDangerous` in
+  the pure spec.
+- **Agent-unreachable, same as grants.** The setter is a Tauri command
+  (`orch_set_dangerous_mode`); no MCP tool can enable it (regression-tested: no agent-visible tool
+  name contains "dangerous", and the file-writing MCP tools never create the marker). Surfaced
+  additively on `orch_autonomy` (`dangerous_mode: bool`) and mirrored into the kickoff config + a
+  live notice. Disk-first fail-loud disable. The marker's FS-forgeability is the same documented
+  bypass class as grant files (an agent's shell can `echo` it — closed only by a machine account).
+- **No TTL yet — hands-off only.** Dangerous mode is a standing marker with no auto-expiry: the
+  human turns it off (or it clears when they enable autonomous). A **TTL / auto-expire** (e.g.
+  clear after N minutes of no human input, or a fixed window) is a reasonable future hardening —
+  it would bound a forgotten "on" — but was left out per the frozen direction; noted here and in
+  the PR for the human to decide.
+
+- **Honest bypass surface** (documented, not hidden). The shims raise the cost of an unattended
+  bad merge/publish from "type one command" to "deliberately evade a named control," but a
+  determined agent with shell access *can* still: (1) call gh/git by its **absolute path**,
+  skipping `PATH`; (2) use a **raw REST/GraphQL** merge/release shape the cheap match doesn't
+  catch (unusual `gh api`, a direct `curl` with a token, a library) — or a git remote helper /
+  bare `v*` tag push under `-C otherdir` the confirm can't see; (3) run in a **cmd/pwsh** pane
+  with no `sh` on `PATH` (the `.cmd` fallback runs the real binary); (4) define a **`gh`/`git`
+  alias** re-invoking the real binary; (5) **forge a grant file** directly (`echo … >
+  $LOOMUX_GROUP_DIR/merge_grants/pr-N`) — the grant dir is on disk under the agent's own uid, so
+  its *existence* isn't cryptographically unforgeable; the "human-only" boundary is that no
+  loomux surface (MCP) mints one, not that the filesystem forbids it. All the same class as
+  absolute-path gh. Catching every shape needs sandboxing or network egress control, out of
+  scope. **The gold-standard closing layer is a machine account**: give agents a GitHub token
+  whose account has *no merge permission on the default branch and no release/tag-push rights*
+  (branch protection + tag protection requiring a human/CODEOWNER). Then no client-side evasion
+  matters — the server refuses. The shims are the cheap, local, always-on first layer; the
+  machine account is the authoritative one, and the two compose.
+
 ## Human-input paste guard (#111)
 
 The quiet backstop (#43, `wait_for_user_quiet`) only waits out *active* typing — it releases

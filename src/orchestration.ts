@@ -13,7 +13,10 @@ import type { Pane, PaneEvents } from "./pane";
 import { panesInGroup } from "./group";
 import { badgeFor, type OrchRole } from "./orchbadge";
 import { isSpawnRequestExpired } from "./spawnexpiry";
+import type { AutonomyState } from "./autonomy";
 import { showToast } from "./toast";
+
+export type { AutonomyState };
 
 export type { OrchRole };
 export { badgeFor, metaForGroup } from "./orchbadge";
@@ -35,6 +38,10 @@ export interface OrchSpawnRequest {
    *  the agent executable directly when it resolves, else falls back to
    *  `command`. Absent on payloads from an older backend. */
   argv?: string[];
+  /** Extra per-pane env (#83): the gh-shim PATH + `LOOMUX_GROUP_DIR` that enforce
+   *  the merge gate on agent panes. `[key, value]` pairs; absent on an older
+   *  backend or for panes with nothing extra to inject. */
+  env?: [string, string][];
 }
 
 /** Launcher-collected group settings; guardrails are enforced backend-side. */
@@ -66,6 +73,11 @@ export interface OrchestratorConfig {
   /** Recovery guardrail: nudge the orchestrator when a working agent goes
    *  silent (no output, no report) this many minutes (0 = disabled). */
   watchdogStallMinutes: number;
+  /** Cost guardrail (#83): autonomous-era token budget applied at creation
+   *  (0 = no cap). The backend `create_orchestration` command has no budget
+   *  parameter, so `launchOrchestrator` applies this via `setAutonomyBudget`
+   *  right after the group is created. */
+  autonomyBudgetTokens: number;
 }
 
 /** One pane that needs the human, from the backend attention scan. `reason`
@@ -102,6 +114,96 @@ export const setNotify = (groupId: string, enabled: boolean): Promise<void> =>
 export const setMaxAgents = (groupId: string, maxAgents: number): Promise<number> =>
   invoke<number>("orch_set_max_agents", { groupId, maxAgents });
 
+// ---------- autonomous mode (#83) ----------
+
+/** Enable/disable autonomous idle-tick mode for a group (durable, audited).
+ *  Enabling anchors the budget meter at the group's current spend; disabling is
+ *  the explicit consent needed to resume after a budget suspension (re-enabling
+ *  re-anchors). */
+export const setAutonomous = (groupId: string, enabled: boolean): Promise<void> =>
+  invoke("orch_set_autonomous", { groupId, enabled });
+
+/** Enable/disable the auto-merge gate for a group (durable, audited). Default
+ *  OFF = the human merges; ON lets the orchestrator merge an adequately-tested
+ *  PR itself. The human-facing control frames this as its inverse — a "require
+ *  approval" checkbox — so callers pass `enabled = auto_merge`, not the checkbox
+ *  value (see `autoMergeFromApproval`). */
+export const setAutoMerge = (groupId: string, enabled: boolean): Promise<void> =>
+  invoke("orch_set_auto_merge", { groupId, enabled });
+
+/** Enable/disable the auto-release gate for a group (#83), independent of
+ *  auto-merge. Default OFF = releases/tags need a per-tag human grant; ON lets the
+ *  orchestrator publish releases itself while autonomous. Rejects enable unless
+ *  autonomous is on (the follow-on UI locks the checkbox accordingly). */
+export const setAutoRelease = (groupId: string, enabled: boolean): Promise<void> =>
+  invoke("orch_set_auto_release", { groupId, enabled });
+
+/** Enable/disable supervised dangerous mode (#83): the human, present and
+ *  supervising, authorizes the orchestrator to merge/release itself WITHOUT
+ *  autonomous mode. Mutually exclusive with autonomous — rejects enable while
+ *  autonomous is on; enabling autonomous force-clears it. */
+export const setDangerousMode = (groupId: string, enabled: boolean): Promise<void> =>
+  invoke("orch_set_dangerous_mode", { groupId, enabled });
+
+/** Set a group's autonomous-era token budget (0 = no cap; durable, audited).
+ *  Resolves to the applied value. Does not move the enable-time anchor, so
+ *  raising the budget after a suspension lets the human resume without losing
+ *  already-counted spend. */
+export const setAutonomyBudget = (groupId: string, tokens: number): Promise<number> =>
+  invoke<number>("orch_set_autonomy_budget", { groupId, tokens });
+
+/** The whole autonomous-mode panel state in one read: toggles, budget, its
+ *  enable-time anchor, the spend metered since enable (`null` when off),
+ *  `suspended` (budget enforcer turned autonomy off), and the idle-tick
+ *  observability (status, countdown, minutes/floor knobs). */
+export const autonomyState = (groupId: string): Promise<AutonomyState> =>
+  invoke<AutonomyState>("orch_autonomy", { groupId });
+
+/** Set a group's idle-tick window in minutes (0 → backend default 5; clamped
+ *  1..1440; durable, audited). Resolves to the applied value. */
+export const setIdleTickMinutes = (groupId: string, minutes: number): Promise<number> =>
+  invoke<number>("orch_set_idle_tick_minutes", { groupId, minutes });
+
+/** Set a group's idle-tick activity floor in bytes — output below this per
+ *  interval counts as idle, making the quiet clock repaint-tolerant (0 → backend
+ *  default 2048; clamped 1..1MiB; durable, audited). Resolves to the applied value. */
+export const setIdleActivityFloor = (groupId: string, bytes: number): Promise<number> =>
+  invoke<number>("orch_set_idle_activity_floor", { groupId, bytes });
+
+// ---------- human merge / release grants (#83) ----------
+
+/** Approve a merge-gate task: flip it done, write a one-time merge grant for its
+ *  PR, and deliver the optional `comment` to the orchestrator with the grant
+ *  (null = grant only, no note). Resolves to the updated task (callers that only
+ *  need success can ignore it). The grant is single-use and expires after ~30
+ *  min — see `grantMerge`. `comment` is optional so pre-existing callers that
+ *  approved without a note keep working. */
+export const approveTask = (
+  groupId: string,
+  id: string,
+  comment: string | null = null
+): Promise<unknown> => invoke("orch_approve_task", { groupId, id, comment });
+
+/** Issue a one-time human merge grant for a PR directly (board-independent path):
+ *  authorizes exactly one default-branch merge of that PR, single-use and
+ *  expiring after ~30 min. Optional `comment` is delivered to the orchestrator.
+ *  Human-only (no MCP tool can write a grant). Resolves to the grant nonce. */
+export const grantMerge = (
+  groupId: string,
+  pr: string,
+  comment: string | null = null
+): Promise<number> => invoke<number>("orch_grant_merge", { groupId, pr, comment });
+
+/** Issue a one-time human release/tag grant: authorizes exactly one publish of
+ *  `tag` (GH release + npm). Releases are NEVER blanket-allowed by autonomous
+ *  mode, so this explicit grant is the only path. Single-use, ~30-min TTL.
+ *  Optional `comment` is delivered to the orchestrator. Human-only. */
+export const grantRelease = (
+  groupId: string,
+  tag: string,
+  comment: string | null = null
+): Promise<void> => invoke("orch_grant_release", { groupId, tag, comment });
+
 /** Agent ids the backend cancelled via `orch-spawn-cancelled` (its bind wait
  *  timed out) whose pane may still be mid-open (#106). Consulted in
  *  `openAgentPane` right before binding so a live-but-slow frontend drops a
@@ -136,6 +238,7 @@ async function openAgentPane(
       cwd: req.cwd,
       command: req.command,
       argv: req.argv,
+      env: req.env,
       badge: badgeFor(req),
       orchGroup: req.group_id,
       orchRole: req.role,
@@ -336,6 +439,18 @@ export async function launchOrchestrator(
     maxSpawnsPerHour: config.maxSpawnsPerHour,
     watchdogStallMinutes: config.watchdogStallMinutes,
   });
+  // #83: create_orchestration has no budget parameter (W1's frozen contract), so
+  // apply any launcher-collected autonomous budget via the setter now the group
+  // exists. Best-effort: a failed budget write must not sink the launch — the
+  // group is already up and the human can set it live from the panel. 0 = no cap,
+  // which is the backend default anyway, so skip the round-trip.
+  if (config.autonomyBudgetTokens > 0) {
+    try {
+      await setAutonomyBudget(spec.group_id, config.autonomyBudgetTokens);
+    } catch (err) {
+      showToast(`autonomy budget not applied: ${String(err)}`, "info");
+    }
+  }
   // Human launched the orchestrator from the UI — focus its pane. Return the
   // group so the caller binds it to the tab (#63); the pane is located later by
   // scanning live panes (findByPty), so it isn't returned.

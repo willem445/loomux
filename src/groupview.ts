@@ -10,6 +10,7 @@
 // overlay mechanics as the git / tasks / audit views (never resizes the PTY).
 
 import {
+  autonomyState,
   endGroup,
   groupPaused,
   groupSummary,
@@ -17,11 +18,31 @@ import {
   notifyEnabled,
   pauseGroup,
   resumeGroup,
+  grantRelease,
+  setAutoMerge,
+  setAutoRelease,
+  setAutonomous,
+  setAutonomyBudget,
+  setDangerousMode,
+  setIdleActivityFloor,
+  setIdleTickMinutes,
   setMaxAgents,
   setNotify,
+  type AutonomyState,
   type GroupSummary,
   type GroupUsage,
 } from "./orchestration";
+import {
+  approvalControl,
+  autoMergeFromApproval,
+  autoReleaseControl,
+  dangerousControl,
+  budgetMeter,
+  formatTokens,
+  isValidReleaseTag,
+  normalizeComment,
+  tickStatusLabel,
+} from "./autonomy";
 
 /** Hard bounds on the live-agent cap, mirroring the launcher's input range and
  *  the backend's `MAX_AGENTS_CEILING`. The backend re-validates; these only
@@ -32,6 +53,16 @@ const MAX_MAX_AGENTS = 12;
 /** How often the panel re-polls the backend while open (uptime ticks, cost
  *  and roster drift). Matches the audit viewer's follow cadence. */
 const POLL_MS = 2000;
+
+/** Backend default idle-tick activity floor (bytes). Shown as the floor input's
+ *  placeholder, and used to render the input blank when it's at the default
+ *  (mirrors DEFAULT_IDLE_ACTIVITY_FLOOR_BYTES in the backend). */
+const DEFAULT_ACTIVITY_FLOOR = 2048;
+
+/** Roster height kept visible at the panel's minimum height — about two rows,
+ *  so at the collapse floor the list is present (and scrolls) rather than gone,
+ *  while the fixed chrome and footer stay fully rendered (#83 rev-58). */
+const MIN_ROSTER_SLIVER = 48;
 
 function el(tag: string, cls: string, text?: string): HTMLElement {
   const e = document.createElement(tag);
@@ -89,6 +120,34 @@ export class GroupView {
   private maxNoteEl: HTMLElement;
   private maxErrEl: HTMLElement;
   private listEl: HTMLElement;
+  // Autonomous-mode section (#83).
+  private autoBtn: HTMLButtonElement;
+  private approvalChk: HTMLInputElement;
+  private autoReleaseChk: HTMLInputElement;
+  private dangerousChk: HTMLInputElement;
+  private budgetInput: HTMLInputElement;
+  private budgetErrEl: HTMLElement;
+  private meterEl: HTMLElement;
+  private meterBar: HTMLElement;
+  private meterFill: HTMLElement;
+  private meterLabel: HTMLElement;
+  private tickMinInput: HTMLInputElement;
+  private tickMinErrEl: HTMLElement;
+  private floorInput: HTMLInputElement;
+  private tickStatusEl: HTMLElement;
+  private suspendEl: HTMLElement;
+  // Release-grant control (#83): collapsed power action.
+  private releaseToggle: HTMLButtonElement;
+  private releaseBody: HTMLElement;
+  private releaseTagInput: HTMLInputElement;
+  private releaseCommentInput: HTMLInputElement;
+  private releaseBtn: HTMLButtonElement;
+  private releaseErrEl: HTMLElement;
+  private releaseOpen = false;
+  /** True once Authorize is clicked with a valid tag: the second click within
+   *  the window actually issues the release grant (publish is irreversible). */
+  private releaseArmed = false;
+  private releaseArmTimer: number | undefined;
   private pauseBtn: HTMLButtonElement;
   private notifyBtn: HTMLButtonElement;
   private foldBtn: HTMLButtonElement | null = null;
@@ -101,6 +160,7 @@ export class GroupView {
   private usage: GroupUsage | null = null;
   private paused = false;
   private notify = false;
+  private autonomy: AutonomyState | null = null;
   private pollTimer: number | undefined;
   private disposed = false;
   /** True once End is clicked once: the second click within the window
@@ -108,10 +168,16 @@ export class GroupView {
   private endArmed = false;
   private endArmTimer: number | undefined;
 
+  /** Notified after each render (content height may have changed — e.g. the
+   *  suspended banner appeared), so the host can re-apply the overlay height
+   *  clamp and keep every control on-screen. */
+  private onResize?: () => void;
+
   constructor(
     private groupId: string,
-    opts: { onClose: () => void; onToggleMinimize?: () => void }
+    opts: { onClose: () => void; onToggleMinimize?: () => void; onResize?: () => void }
   ) {
+    this.onResize = opts.onResize;
     this.el = el("div", "group-view");
 
     const head = el("div", "group-head");
@@ -160,6 +226,199 @@ export class GroupView {
 
     this.listEl = el("div", "group-list");
 
+    // Autonomous-mode section (#83): two dense rows matching the max-agents
+    // row's density (finding 1). Row A = label + live toggle; the "spends money
+    // unattended" caveat is folded into the section tooltip, not its own line.
+    // Row B = merge gate + token budget + an inline meter. The suspended banner
+    // is a third row shown only while the budget enforcer has it paused. Every
+    // state stays visible — compressed, never hidden (it's the consent surface).
+    const autoRow = el("div", "group-autorow");
+    autoRow.title =
+      "Autonomous ticks poll labeled issues and re-check PRs while you're away — " +
+      "they spend tokens without you present.";
+
+    const autoHead = el("div", "group-auto-head");
+    autoHead.append(el("span", "group-auto-title", "Autonomous mode"));
+    this.autoBtn = el("button", "group-btn sm", "🤖 Off") as HTMLButtonElement;
+    this.autoBtn.addEventListener("click", () => void this.toggleAutonomous());
+    autoHead.append(this.autoBtn);
+
+    // Row B: merge gate + budget + inline meter, wrapping if the panel is narrow.
+    const ctlRow = el("div", "group-auto-controls");
+
+    // Merge gate: the checkbox is the human's framing (ON = require approval,
+    // today's default) and maps to the inverse backend auto_merge flag.
+    const approvalLbl = el("label", "group-auto-check") as HTMLLabelElement;
+    this.approvalChk = document.createElement("input");
+    this.approvalChk.type = "checkbox";
+    // Consent surface must never show the unsafe direction: start checked
+    // (approval required) so pre-load / a failed autonomyState read renders
+    // auto-merge as OFF, matching the backend default.
+    this.approvalChk.checked = true;
+    this.approvalChk.addEventListener("change", () => void this.toggleApproval());
+    approvalLbl.append(
+      this.approvalChk,
+      document.createTextNode(" Require human approval before merge")
+    );
+    approvalLbl.title =
+      "On (default): the human merges every PR. Off: the orchestrator may merge an " +
+      "adequately-tested PR (reviewer-approved + green CI) itself while autonomous.";
+
+    // Auto-release: a POSITIVE checkbox (checked = orchestrator may publish
+    // releases/tags itself). Sibling of the merge gate, same dependency — only
+    // usable while autonomous (the backend rejects enabling it otherwise).
+    const releaseLbl = el("label", "group-auto-check") as HTMLLabelElement;
+    this.autoReleaseChk = document.createElement("input");
+    this.autoReleaseChk.type = "checkbox";
+    this.autoReleaseChk.checked = false; // safe default: releases need approval
+    this.autoReleaseChk.disabled = true; // until a status read shows autonomous on
+    this.autoReleaseChk.addEventListener("change", () => void this.toggleAutoRelease());
+    releaseLbl.append(this.autoReleaseChk, document.createTextNode(" Auto-release"));
+    releaseLbl.title =
+      "Off (default): publishing a release/tag needs an explicit human grant. On: the " +
+      "orchestrator may run `gh release` / push a v* tag itself while autonomous.";
+
+    // Dangerous mode: a DANGER-styled toggle for supervised, NOT-autonomous work.
+    // Lets agents merge & release without per-item approval while you watch.
+    // Mutually exclusive with autonomous (only usable while autonomous is OFF).
+    const dangerLbl = el("label", "group-auto-check danger") as HTMLLabelElement;
+    this.dangerousChk = document.createElement("input");
+    this.dangerousChk.type = "checkbox";
+    this.dangerousChk.checked = false;
+    this.dangerousChk.addEventListener("change", () => void this.toggleDangerous());
+    dangerLbl.append(this.dangerousChk, document.createTextNode(" ⚠ Dangerous mode"));
+    dangerLbl.title =
+      "SUPERVISED: while you're here (and NOT in autonomous mode), let agents merge to the " +
+      "default branch and publish releases/tags themselves — no per-item approval. Every " +
+      "action is audited. Enabling Autonomous clears this (they're mutually exclusive).";
+
+    // Token budget: 0 / empty = no cap. When autonomous is on this drives the
+    // inline meter beside it.
+    const budgetWrap = el("div", "group-auto-budget");
+    budgetWrap.append(el("span", "group-auto-blabel", "Budget"));
+    this.budgetInput = document.createElement("input");
+    this.budgetInput.className = "group-auto-binput";
+    this.budgetInput.type = "number";
+    this.budgetInput.min = "0";
+    this.budgetInput.step = "10000";
+    this.budgetInput.placeholder = "no cap";
+    this.budgetInput.title =
+      "Autonomous-era token spend cap (0 or empty = no cap). Metered from the moment " +
+      "you enable autonomous mode; crossing it suspends ticking until you re-enable.";
+    this.budgetInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") void this.applyBudget();
+    });
+    this.budgetInput.addEventListener("blur", () => void this.applyBudget());
+    this.budgetErrEl = el("span", "group-auto-berr");
+    budgetWrap.append(this.budgetInput, this.budgetErrEl);
+
+    // Inline meter (shown only while autonomous is on): a slim bar + a compact
+    // "X / Y · Z%" (or "X · no cap") read of spend-since-enable vs the budget.
+    this.meterEl = el("div", "group-auto-meter");
+    this.meterEl.hidden = true;
+    this.meterBar = el("div", "group-auto-bar");
+    this.meterFill = el("div", "group-auto-fill");
+    this.meterBar.append(this.meterFill);
+    this.meterLabel = el("span", "group-auto-mlabel");
+    this.meterEl.append(this.meterBar, this.meterLabel);
+
+    ctlRow.append(approvalLbl, releaseLbl, dangerLbl, budgetWrap, this.meterEl);
+
+    // Row C (slim): idle-tick cadence knob + a power-user activity-floor knob +
+    // the live tick-status line. The knobs configure the tick even while off
+    // (set-then-enable); the status text only appears once autonomous is on.
+    const tickRow = el("div", "group-auto-tick");
+    const tickWrap = el("label", "group-auto-tickwrap") as HTMLLabelElement;
+    tickWrap.title =
+      "How long the orchestrator's pane must be output-quiet before loomux delivers one " +
+      "idle tick (poll labeled issues, re-check PRs). Default 5 min; min 1.";
+    tickWrap.append(el("span", "group-auto-blabel", "Idle tick"));
+    this.tickMinInput = document.createElement("input");
+    this.tickMinInput.className = "group-auto-binput sm";
+    this.tickMinInput.type = "number";
+    this.tickMinInput.min = "1";
+    this.tickMinInput.max = "1440";
+    this.tickMinInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") void this.applyTickMinutes();
+    });
+    this.tickMinInput.addEventListener("blur", () => void this.applyTickMinutes());
+    tickWrap.append(this.tickMinInput, el("span", "group-auto-unit", "min"));
+    this.tickMinErrEl = el("span", "group-auto-berr");
+
+    // Activity floor (power-user): output below this many bytes per interval is
+    // treated as idle, so CLI repaints/spinners don't reset the quiet clock.
+    const floorWrap = el("label", "group-auto-tickwrap") as HTMLLabelElement;
+    floorWrap.title =
+      "Advanced: bytes of pane output per interval below which the orchestrator counts as " +
+      "idle. Makes the quiet clock tolerant of repaint/spinner noise. Default 2048; 0 resets it.";
+    floorWrap.append(el("span", "group-auto-blabel", "· floor"));
+    this.floorInput = document.createElement("input");
+    this.floorInput.className = "group-auto-binput sm";
+    this.floorInput.type = "number";
+    this.floorInput.min = "0";
+    this.floorInput.step = "512";
+    this.floorInput.placeholder = String(DEFAULT_ACTIVITY_FLOOR);
+    this.floorInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") void this.applyFloor();
+    });
+    this.floorInput.addEventListener("blur", () => void this.applyFloor());
+    floorWrap.append(this.floorInput, el("span", "group-auto-unit", "B"));
+
+    this.tickStatusEl = el("span", "group-auto-status");
+    tickRow.append(tickWrap, this.tickMinErrEl, floorWrap, this.tickStatusEl);
+
+    // Budget-exhausted banner (autonomy auto-suspended): distinct row + the
+    // re-enable affordance is the toggle above (re-enabling re-anchors).
+    this.suspendEl = el("div", "group-auto-suspend");
+    this.suspendEl.hidden = true;
+
+    autoRow.append(autoHead, ctlRow, tickRow, this.suspendEl);
+
+    // Release-grant control (#83): a collapsed power action — releases have no
+    // board task, so this is the human path to authorize one. Kept collapsed by
+    // default; the copy is blunt that it publishes.
+    const releaseRow = el("div", "group-releaserow");
+    this.releaseToggle = el("button", "group-release-toggle", "▸ Authorize a release…") as HTMLButtonElement;
+    this.releaseToggle.title =
+      "Authorize a one-time release/tag publish (GH release + npm). Releases are never " +
+      "auto-approved by autonomous mode — this explicit grant is the only path.";
+    this.releaseToggle.addEventListener("click", () => this.toggleRelease());
+
+    this.releaseBody = el("div", "group-release-body");
+    this.releaseBody.hidden = true;
+    this.releaseBody.append(
+      el(
+        "div",
+        "group-release-copy",
+        "Authorizes ONE publish of this tag (GH release + npm) — single-use, expires in ~30 min. " +
+          "Releases are never auto-approved by autonomous mode."
+      )
+    );
+    const releaseInputs = el("div", "group-release-inputs");
+    this.releaseTagInput = document.createElement("input");
+    this.releaseTagInput.className = "group-release-tag";
+    this.releaseTagInput.placeholder = "tag — e.g. v1.2.3";
+    this.releaseTagInput.spellcheck = false;
+    this.releaseTagInput.addEventListener("input", () => this.disarmRelease());
+    this.releaseTagInput.addEventListener("keydown", (e) => {
+      e.stopPropagation();
+      if (e.key === "Enter") this.onReleaseClick();
+    });
+    this.releaseCommentInput = document.createElement("input");
+    this.releaseCommentInput.className = "group-release-comment";
+    this.releaseCommentInput.placeholder = "optional instructions for the agent";
+    this.releaseCommentInput.spellcheck = false;
+    this.releaseCommentInput.addEventListener("keydown", (e) => {
+      e.stopPropagation();
+      if (e.key === "Enter") this.onReleaseClick();
+    });
+    this.releaseBtn = el("button", "group-btn sm", "Authorize") as HTMLButtonElement;
+    this.releaseBtn.addEventListener("click", () => this.onReleaseClick());
+    releaseInputs.append(this.releaseTagInput, this.releaseCommentInput, this.releaseBtn);
+    this.releaseErrEl = el("div", "group-release-err");
+    this.releaseBody.append(releaseInputs, this.releaseErrEl);
+    releaseRow.append(this.releaseToggle, this.releaseBody);
+
     // Footer: pause/resume + destructive end-orchestration.
     const foot = el("div", "group-actions");
     this.pauseBtn = el("button", "group-btn", "Pause") as HTMLButtonElement;
@@ -198,7 +457,7 @@ export class GroupView {
     this.toastEl = el("div", "git-toast");
     this.toastEl.hidden = true;
 
-    this.el.append(head, this.summaryEl, maxRow, this.listEl, foot, this.toastEl);
+    this.el.append(head, this.summaryEl, maxRow, autoRow, releaseRow, this.listEl, foot, this.toastEl);
   }
 
   /** Called by the pane whenever the overlay is (re)opened. */
@@ -211,6 +470,7 @@ export class GroupView {
     this.disposed = true;
     clearTimeout(this.toastTimer);
     clearTimeout(this.endArmTimer);
+    clearTimeout(this.releaseArmTimer);
     if (this.pollTimer !== undefined) clearInterval(this.pollTimer);
     this.el.remove();
   }
@@ -225,11 +485,12 @@ export class GroupView {
   private async load(): Promise<void> {
     if (this.disposed) return;
     try {
-      [this.summary, this.usage, this.paused, this.notify] = await Promise.all([
+      [this.summary, this.usage, this.paused, this.notify, this.autonomy] = await Promise.all([
         groupSummary(this.groupId),
         groupUsage(this.groupId),
         groupPaused(this.groupId),
         notifyEnabled(this.groupId),
+        autonomyState(this.groupId),
       ]);
     } catch (err) {
       this.toast(String(err));
@@ -284,6 +545,163 @@ export class GroupView {
       this.toast(String(err));
     }
     await this.load();
+  }
+
+  /** Flip autonomous idle-ticking. Enabling (including re-enabling after a
+   *  budget suspension) re-anchors the budget meter backend-side. */
+  private async toggleAutonomous(): Promise<void> {
+    const on = this.autonomy?.autonomous ?? false;
+    try {
+      await setAutonomous(this.groupId, !on);
+    } catch (err) {
+      this.toast(String(err));
+    }
+    await this.load();
+  }
+
+  /** Commit the merge gate from the "require approval" checkbox — the human
+   *  framing is the inverse of the backend `auto_merge` flag. */
+  private async toggleApproval(): Promise<void> {
+    try {
+      await setAutoMerge(this.groupId, autoMergeFromApproval(this.approvalChk.checked));
+    } catch (err) {
+      this.toast(String(err));
+    }
+    await this.load();
+  }
+
+  /** Commit the auto-release gate (positive checkbox = auto_release ON). A rejected
+   *  write (e.g. autonomous off) toasts and the poll re-syncs the real state. */
+  private async toggleAutoRelease(): Promise<void> {
+    try {
+      await setAutoRelease(this.groupId, this.autoReleaseChk.checked);
+    } catch (err) {
+      this.toast(String(err));
+    }
+    await this.load();
+  }
+
+  /** Commit supervised dangerous mode (positive checkbox = dangerous_mode ON).
+   *  Rejected while autonomous is on (mutually exclusive); toast + re-sync. */
+  private async toggleDangerous(): Promise<void> {
+    try {
+      await setDangerousMode(this.groupId, this.dangerousChk.checked);
+    } catch (err) {
+      this.toast(String(err));
+    }
+    await this.load();
+  }
+
+  /** Commit the token budget (empty/non-numeric = no cap = 0). The backend
+   *  clamps/persists and returns the applied value; the poll then re-syncs the
+   *  input, so a rejected write restores the real value. */
+  private async applyBudget(): Promise<void> {
+    this.budgetErrEl.textContent = "";
+    const raw = this.budgetInput.value.trim();
+    const n = raw === "" ? 0 : parseInt(raw, 10);
+    const tokens = Number.isFinite(n) && n > 0 ? n : 0;
+    if (tokens === (this.autonomy?.budget_tokens ?? 0)) return; // no-op
+    try {
+      await setAutonomyBudget(this.groupId, tokens);
+    } catch (err) {
+      this.budgetErrEl.textContent = String(err);
+    }
+    await this.load();
+  }
+
+  /** Commit the idle-tick window (empty/non-numeric → 0, which the backend maps
+   *  to its default). The backend clamps/persists and returns the applied value;
+   *  the poll then re-syncs the input from the response. */
+  private async applyTickMinutes(): Promise<void> {
+    this.tickMinErrEl.textContent = "";
+    const raw = this.tickMinInput.value.trim();
+    const n = raw === "" ? 0 : parseInt(raw, 10);
+    const minutes = Number.isFinite(n) && n > 0 ? n : 0;
+    if (minutes === (this.autonomy?.idle_tick_minutes ?? 0)) return; // no-op
+    try {
+      await setIdleTickMinutes(this.groupId, minutes);
+    } catch (err) {
+      this.tickMinErrEl.textContent = String(err);
+    }
+    await this.load();
+  }
+
+  /** Commit the activity floor (empty/non-numeric → 0 = reset to the backend
+   *  default). Backend clamps/persists and returns the applied value. */
+  private async applyFloor(): Promise<void> {
+    const raw = this.floorInput.value.trim();
+    const n = raw === "" ? 0 : parseInt(raw, 10);
+    const bytes = Number.isFinite(n) && n > 0 ? n : 0;
+    // A blank input means "default"; skip the round-trip when already at default.
+    const cur = this.autonomy?.idle_activity_floor_bytes ?? DEFAULT_ACTIVITY_FLOOR;
+    if (bytes === cur || (bytes === 0 && cur === DEFAULT_ACTIVITY_FLOOR)) return;
+    try {
+      await setIdleActivityFloor(this.groupId, bytes);
+    } catch (err) {
+      this.toast(String(err));
+    }
+    await this.load();
+  }
+
+  /** Expand/collapse the release-grant control. */
+  private toggleRelease(): void {
+    this.releaseOpen = !this.releaseOpen;
+    this.releaseBody.hidden = !this.releaseOpen;
+    this.releaseToggle.textContent = this.releaseOpen
+      ? "▾ Authorize a release"
+      : "▸ Authorize a release…";
+    if (!this.releaseOpen) this.disarmRelease();
+    else this.releaseTagInput.focus();
+    // Height changed — let the host re-clamp so no control clips (#83 rev-58).
+    this.onResize?.();
+  }
+
+  /** First click validates the tag and arms; the second within the window
+   *  actually issues the grant (a release publish is irreversible). */
+  private onReleaseClick(): void {
+    this.releaseErrEl.textContent = "";
+    const tag = this.releaseTagInput.value.trim();
+    if (!isValidReleaseTag(tag)) {
+      this.releaseErrEl.textContent = "enter a tag with no spaces — e.g. v1.2.3";
+      this.releaseTagInput.focus();
+      return;
+    }
+    if (!this.releaseArmed) {
+      this.releaseArmed = true;
+      this.releaseBtn.textContent = `Publish ${tag}?`;
+      this.releaseBtn.classList.add("armed");
+      this.releaseArmTimer = window.setTimeout(() => this.disarmRelease(), 4000);
+      return;
+    }
+    this.disarmRelease();
+    void this.doGrantRelease(tag, this.releaseCommentInput.value);
+  }
+
+  private disarmRelease(): void {
+    this.releaseArmed = false;
+    clearTimeout(this.releaseArmTimer);
+    this.releaseBtn.textContent = "Authorize";
+    this.releaseBtn.classList.remove("armed");
+  }
+
+  /** Issue the one-time release grant. On success, collapse and clear so the
+   *  control can't be re-fired by a stray click; a failure surfaces inline. */
+  private async doGrantRelease(tag: string, comment: string): Promise<void> {
+    this.releaseBtn.disabled = true;
+    try {
+      await grantRelease(this.groupId, tag, normalizeComment(comment));
+      this.toast(`release authorized: ${tag} (one-time, ~30 min)`);
+      this.releaseTagInput.value = "";
+      this.releaseCommentInput.value = "";
+      this.releaseOpen = false;
+      this.releaseBody.hidden = true;
+      this.releaseToggle.textContent = "▸ Authorize a release…";
+      this.onResize?.();
+    } catch (err) {
+      this.releaseErrEl.textContent = String(err);
+    } finally {
+      this.releaseBtn.disabled = false;
+    }
   }
 
   /** First click arms (turns the button into a confirm); the second within
@@ -421,6 +839,128 @@ export class GroupView {
     this.notifyBtn.title = this.notify
       ? "Desktop toasts are on for this group — click to turn off"
       : "Turn on OS toasts for reports and idle-with-prompt panes in this group";
+
+    this.renderAutonomy();
+
+    // Content height may have changed (roster size, suspended banner) — let the
+    // host re-clamp the overlay so no control is pushed under overflow:hidden.
+    this.onResize?.();
+  }
+
+  /** The minimum overlay-content height at which every fixed control row renders
+   *  and a sliver of roster remains — so `.group-view`'s `overflow:hidden` never
+   *  clips a control (footer End/Pause, the suspended banner, #83 rev-58).
+   *  MEASURED, not guessed: sums the live heights of every child except the
+   *  scrollable roster (and the absolutely-positioned toast). The autonomous
+   *  row's height already includes the suspended banner when it's showing, so
+   *  the floor grows to fit it. Returns 0 before the panel is laid out (heights
+   *  unknown); the caller floors it against a baseline minimum. */
+  minChromeHeight(): number {
+    let fixed = 0;
+    for (const child of Array.from(this.el.children) as HTMLElement[]) {
+      if (child === this.listEl || child === this.toastEl) continue;
+      fixed += child.offsetHeight;
+    }
+    if (fixed === 0) return 0; // not laid out yet
+    return fixed + MIN_ROSTER_SLIVER;
+  }
+
+  /** Sync the autonomous-mode controls, budget meter, and suspended banner to
+   *  the last `orch_autonomy` read (+ audit-derived suspension). */
+  private renderAutonomy(): void {
+    const a = this.autonomy;
+    if (!a) return;
+
+    // Toggle button reflects the live marker (dense label; the section title
+    // spells out "Autonomous mode", so the button just carries on/off).
+    this.autoBtn.textContent = a.autonomous ? "🤖 On" : "🤖 Off";
+    this.autoBtn.classList.toggle("on", a.autonomous);
+    this.autoBtn.title = a.autonomous
+      ? "Idle-ticking is live — the orchestrator polls labeled issues and re-checks PRs while you're away. Click to stop."
+      : "Enable idle-ticking: loomux pokes the orchestrator to run its intake/monitoring cadence when the group goes quiet.";
+
+    // Merge gate: reflect the backend flag AND the #83 dependency — auto-merge
+    // exists only in autonomous mode, so with autonomous off the control is locked
+    // to "approval required" (the enforced human gate) with an explanatory tooltip.
+    const approval = approvalControl(a.autonomous, a.auto_merge);
+    this.approvalChk.checked = approval.checked;
+    this.approvalChk.disabled = approval.disabled;
+    this.approvalChk.title = approval.tooltip;
+
+    // Auto-release: same dependency as the merge gate (only under autonomous).
+    const release = autoReleaseControl(a.autonomous, a.auto_release);
+    this.autoReleaseChk.checked = release.checked;
+    this.autoReleaseChk.disabled = release.disabled;
+    if (release.tooltip) this.autoReleaseChk.title = release.tooltip;
+
+    // Dangerous mode: the INVERSE gating — usable only while autonomous is OFF.
+    // Enabling autonomous force-clears it backend-side; this render reflects that
+    // truthfully from the live status, and greys the toggle while autonomous is on.
+    const danger = dangerousControl(a.autonomous, a.dangerous_mode);
+    this.dangerousChk.checked = danger.checked;
+    this.dangerousChk.disabled = danger.disabled;
+    if (danger.tooltip) this.dangerousChk.title = danger.tooltip;
+    // DANGER affordance: highlight only when actually engaged.
+    (this.dangerousChk.closest(".group-auto-check") as HTMLElement | null)
+      ?.classList.toggle("on", danger.checked);
+
+    // Budget input: don't clobber while the human is editing it.
+    if (document.activeElement !== this.budgetInput) {
+      this.budgetInput.value = a.budget_tokens > 0 ? String(a.budget_tokens) : "";
+    }
+
+    // Inline meter: only while autonomous (spend is null when off). Off ⇒ hidden.
+    // The slim bar shows only with a cap; capless still reads spend so the money
+    // surface stays visible.
+    if (a.autonomous && a.spend_since_enable_tokens != null) {
+      this.meterEl.hidden = false;
+      const m = budgetMeter(a.spend_since_enable_tokens, a.budget_tokens);
+      if (m.hasCap) {
+        this.meterBar.hidden = false;
+        this.meterFill.style.width = `${m.percent}%`;
+        this.meterFill.classList.toggle("warn", m.percent >= 80 && !m.exhausted);
+        this.meterFill.classList.toggle("over", m.exhausted);
+        this.meterLabel.textContent =
+          `${formatTokens(m.spend)} / ${formatTokens(m.budget)} · ${m.percent}%` +
+          (m.exhausted ? " · reached" : "");
+      } else {
+        this.meterBar.hidden = true;
+        this.meterLabel.textContent = `${formatTokens(m.spend)} spent · no cap`;
+      }
+    } else {
+      this.meterEl.hidden = true;
+    }
+
+    // Idle-tick knobs (don't clobber while the human is editing). Minutes always
+    // shows the applied value; the floor shows blank at the default so its
+    // placeholder (2048) reads as the current setting.
+    if (document.activeElement !== this.tickMinInput) {
+      this.tickMinInput.value = a.idle_tick_minutes > 0 ? String(a.idle_tick_minutes) : "";
+    }
+    if (document.activeElement !== this.floorInput) {
+      this.floorInput.value =
+        a.idle_activity_floor_bytes > 0 && a.idle_activity_floor_bytes !== DEFAULT_ACTIVITY_FLOOR
+          ? String(a.idle_activity_floor_bytes)
+          : "";
+    }
+
+    // Live tick-status line: only while autonomous. The label enforces the
+    // null-countdown discipline (no lying timer on non-time-gated statuses).
+    const statusText = a.autonomous ? tickStatusLabel(a.tick_status, a.eligible_in_secs) : "";
+    this.tickStatusEl.textContent = statusText;
+    this.tickStatusEl.hidden = statusText === "";
+
+    // Suspended banner: distinct from a plain-off state. `suspended` comes
+    // straight from orch_autonomy (true only while off, and only when the budget
+    // enforcer flipped it). The re-enable affordance is the toggle above
+    // (re-enabling re-anchors the meter).
+    if (a.suspended) {
+      this.suspendEl.hidden = false;
+      this.suspendEl.textContent =
+        "⏸ Suspended: token budget exhausted. Re-enable autonomous mode to resume (the budget re-anchors at the current spend).";
+    } else {
+      this.suspendEl.hidden = true;
+    }
   }
 
   /** Sync the max-agents stepper to the backend value and reflect whether the

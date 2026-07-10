@@ -19,6 +19,11 @@ export interface SpawnOptions {
    *  resolves to a native executable, the backend spawns it directly as the pty
    *  child — no wrapper shell (issue #78) — falling back to `command` otherwise. */
   argv?: string[];
+  /** Extra environment for the pane's child, set on top of the shared pane env
+   *  (#83). Agent panes carry the gh-shim PATH + `LOOMUX_GROUP_DIR` here so the
+   *  merge gate is enforced; a plain shell omits it and is unchanged. Wire form is
+   *  the backend's `Vec<(String, String)>` — a list of `[key, value]` pairs. */
+  env?: [string, string][];
 }
 
 export interface SessionInfo {

@@ -47,6 +47,7 @@ import { IssuesView } from "./issuesview";
 import { TasksView } from "./tasksview";
 import { AuditView } from "./auditview";
 import { GroupView } from "./groupview";
+import { clampOverlayHeight, OVERLAY_MIN_H } from "./overlaysize";
 import { FileEditView } from "./fileedit";
 
 // Inline icons so the toolbar renders identically regardless of installed
@@ -141,6 +142,10 @@ export interface PaneOptions {
   /** Structured agent invocation for direct-CLI spawn (issue #78); the backend
    *  falls back to `command` (shell wrapper) when it can't apply. */
   argv?: string[];
+  /** Extra per-pane env (#83): agent panes carry the gh-shim PATH +
+   *  `LOOMUX_GROUP_DIR` here so the merge gate is enforced. Omitted for plain
+   *  shells. Wire form: `[key, value]` pairs (the backend's `Vec<(String,String)>`). */
+  env?: [string, string][];
   badge?: PaneBadge;
   /** Orchestration group this pane belongs to (enables the task board). */
   orchGroup?: string;
@@ -624,6 +629,7 @@ export class Pane implements VoiceTargetPane {
         cwd: opts.cwd,
         command: opts.command,
         argv: opts.argv,
+        env: opts.env,
       });
       if (this.disposed) {
         killPty(ptyId).catch(() => {});
@@ -911,15 +917,40 @@ export class Pane implements VoiceTargetPane {
     }
   }
 
-  /** Keep the overlay tall enough to be usable but always leave a terminal
-   *  strip visible at the bottom. */
-  private overlayClamp(h: number): number {
-    const max = Math.max(160, this.termEl.clientHeight - 100);
-    return Math.max(160, Math.min(max, h));
+  /** Keep the overlay tall enough that its bottom drag bar stays grabbable and
+   *  no control clips, but always leave a terminal strip visible at the bottom.
+   *  `floor` overrides the baseline minimum with a panel-specific one (the group
+   *  panel measures its fixed chrome so the footer can't collapse — #83 rev-58).
+   *  Pure math + tests in overlaysize.ts. */
+  private overlayClamp(h: number, floor?: number): number {
+    return clampOverlayHeight(h, this.termEl.clientHeight, floor ?? OVERLAY_MIN_H);
   }
 
-  /** Horizontal drag handle on an overlay's bottom edge. */
-  private makeOverlayDivider(overlay: () => HTMLElement): HTMLElement {
+  /** The group panel's minimum content height — its measured fixed chrome so
+   *  every control (footer End/Pause, suspended banner) stays on-screen — never
+   *  below the shared baseline, and never so tall it can't fit the pane. */
+  private groupFloor(): number {
+    const measured = this.groupView?.minChromeHeight() ?? 0;
+    return Math.max(OVERLAY_MIN_H, measured);
+  }
+
+  /** Re-apply the height clamp to the open group overlay (its content height may
+   *  have changed since it was sized). Only touches the height when the clamp
+   *  actually moves it — typically a bump UP when the measured floor grew (the
+   *  suspended banner appeared) — so it never fights the user's chosen size. */
+  private reclampGroupOverlay(): void {
+    if (!this.groupOverlay || this.groupOverlay.hidden) return;
+    const cur = this.groupOverlay.offsetHeight;
+    const clamped = this.overlayClamp(cur, this.groupFloor());
+    if (clamped !== cur) {
+      this.groupOverlay.style.height = `${clamped}px`;
+      this.updateTermShift();
+    }
+  }
+
+  /** Horizontal drag handle on an overlay's bottom edge. `floor` (optional) is a
+   *  panel-specific minimum height provider passed to the clamp on each drag. */
+  private makeOverlayDivider(overlay: () => HTMLElement, floor?: () => number): HTMLElement {
     const div = document.createElement("div");
     div.className = "git-divider";
     div.addEventListener("mousedown", (e) => {
@@ -928,7 +959,7 @@ export class Pane implements VoiceTargetPane {
       const startH = overlay().offsetHeight;
       div.classList.add("dragging");
       const move = (ev: MouseEvent) => {
-        const h = this.overlayClamp(startH + (ev.clientY - startY));
+        const h = this.overlayClamp(startH + (ev.clientY - startY), floor?.());
         overlay().style.height = `${h}px`;
         this.updateTermShift();
       };
@@ -1051,11 +1082,17 @@ export class Pane implements VoiceTargetPane {
         onClose: () => this.toggleGroupView(),
         // Mirror the header's fold-group toggle inside the lifecycle panel (#46).
         onToggleMinimize: () => this.events.onToggleGroupMinimize(this),
+        // Content grew (e.g. the suspended banner appeared) — re-clamp so the
+        // footer never slides under overflow:hidden (#83 rev-58).
+        onResize: () => this.reclampGroupOverlay(),
       });
       this.groupOverlay = document.createElement("div");
       this.groupOverlay.className = "git-overlay";
       this.groupOverlay.hidden = true;
-      this.groupOverlay.append(this.groupView.el, this.makeOverlayDivider(() => this.groupOverlay!));
+      this.groupOverlay.append(
+        this.groupView.el,
+        this.makeOverlayDivider(() => this.groupOverlay!, () => this.groupFloor())
+      );
       this.el.appendChild(this.groupOverlay);
     }
     if (!this.groupOverlay!.hidden) {
@@ -1069,7 +1106,7 @@ export class Pane implements VoiceTargetPane {
       if (this.auditOverlay && !this.auditOverlay.hidden) this.toggleAuditView();
       if (this.fileEditView?.visible) this.toggleFileEditView();
       const strip = Math.max(140, Math.round(this.el.clientHeight * 0.35));
-      this.groupOverlay!.style.height = `${this.overlayClamp(this.termEl.clientHeight - strip)}px`;
+      this.groupOverlay!.style.height = `${this.overlayClamp(this.termEl.clientHeight - strip, this.groupFloor())}px`;
       this.groupOverlay!.hidden = false;
       this.groupView.show();
       this.updateTermShift();

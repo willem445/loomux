@@ -1373,6 +1373,7 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   animation: dlg-in 0.16s var(--ease);
 }
 .tasks-dialog-title { font-weight: 600; font-size: 12px; }
+.tasks-dialog-note { font-size: 10.5px; line-height: 1.4; color: var(--text-dim); }
 .tasks-dialog-text { resize: vertical; min-height: 66px; line-height: 1.4; }
 
 .task-notes { padding: 3px 4px 5px 26px; }
@@ -1472,6 +1473,11 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   flex: 1; min-height: 0; position: relative;
   display: flex; flex-direction: column;
   background: var(--bg-app); font-size: 12px;
+  /* Contain the fixed chrome: without this, when the panel is dragged short the
+     non-scrolling rows overflow the box and paint over the drag bar + terminal
+     below (#83 finding 3). The bar is a flex sibling pinned to the overlay's
+     bottom edge, so clipping here keeps it reachable at every splitter position. */
+  overflow: hidden;
 }
 .group-head {
   display: flex; align-items: center; gap: 9px; flex: none;
@@ -1517,11 +1523,114 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .group-max-err { color: var(--danger); font-size: 10px; }
 .group-cost { color: var(--text-dim); font-size: 11px; }
 .group-cost-live { color: var(--text-dim); font-size: 10px; opacity: 0.75; }
+
+/* -- autonomous mode (#83) -- two dense rows, matching the max-agents row. */
+.group-autorow {
+  display: flex; flex-direction: column; gap: 6px; flex: none;
+  padding: 6px 12px; border-bottom: 1px solid var(--border-soft);
+}
+.group-auto-head { display: flex; align-items: center; gap: 10px; }
+.group-auto-title { color: var(--text); font-weight: 500; font-size: 12px; }
+/* Row B: merge gate + budget + inline meter on one wrapping line. */
+.group-auto-controls {
+  display: flex; align-items: center; gap: 8px 14px; flex-wrap: wrap;
+}
+.group-auto-check {
+  display: flex; align-items: center; gap: 5px;
+  color: var(--text-dim); font-size: 11px; cursor: pointer; user-select: none;
+}
+/* A disabled toggle (e.g. auto-release off-autonomous, dangerous while autonomous)
+   reads as inert rather than clickable. */
+.group-auto-check:has(input:disabled) { opacity: 0.45; cursor: not-allowed; }
+/* Supervised dangerous mode: DANGER affordance. Amber-warning by default; when
+   actually engaged (`.on`) it goes solid danger so the risky state is unmissable. */
+.group-auto-check.danger { color: var(--danger); font-weight: 600; }
+.group-auto-check.danger input { accent-color: var(--danger); }
+.group-auto-check.danger.on {
+  background: color-mix(in srgb, var(--danger) 16%, transparent);
+  border-radius: 5px; padding: 1px 6px; margin: -1px -2px;
+}
+.group-auto-budget { display: flex; align-items: center; gap: 6px; }
+.group-auto-blabel { color: var(--text-dim); font-size: 11px; }
+.group-auto-binput {
+  font: inherit; font-size: 12px; width: 88px;
+  background: var(--panel-2); color: var(--text);
+  border: 1px solid var(--border-soft); border-radius: 5px; padding: 2px 6px;
+}
+.group-auto-binput:focus { outline: none; border-color: var(--accent); }
+.group-auto-berr { color: var(--danger); font-size: 10px; }
+/* Inline meter: a slim fixed-width bar + a compact text read, side by side. */
+.group-auto-meter { display: inline-flex; align-items: center; gap: 6px; min-width: 0; }
+.group-auto-bar {
+  flex: none; width: 60px; height: 5px; border-radius: 3px; overflow: hidden;
+  background: var(--panel-2); border: 1px solid var(--border-soft);
+}
+.group-auto-fill {
+  height: 100%; width: 0%; background: #9ece6a; border-radius: 3px;
+  transition: width 0.3s ease;
+}
+.group-auto-fill.warn { background: #e0af68; }
+.group-auto-fill.over { background: var(--danger); }
+.group-auto-mlabel {
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 10px; color: var(--text-dim); white-space: nowrap;
+}
+/* Row C: idle-tick knobs + live status, a slim line. */
+.group-auto-tick { display: flex; align-items: center; gap: 6px 12px; flex-wrap: wrap; }
+.group-auto-tickwrap {
+  display: inline-flex; align-items: center; gap: 5px;
+  cursor: pointer; user-select: none;
+}
+.group-auto-binput.sm { width: 52px; }
+.group-auto-unit { color: var(--text-dim); font-size: 10px; }
+.group-auto-status {
+  font-size: 10.5px; color: #a7bff8; white-space: nowrap;
+}
+.group-auto-status[hidden] { display: none; }
+.group-auto-suspend {
+  font-size: 10.5px; line-height: 1.4; color: #f7768e;
+  background: rgba(247, 118, 142, 0.12);
+  border: 1px solid rgba(247, 118, 142, 0.35); border-radius: 5px;
+  padding: 5px 8px;
+}
 .group-paused-badge {
   font-size: 9.5px; font-weight: 600; border-radius: 4px; padding: 1px 7px;
   background: rgba(224, 175, 104, 0.16); color: #e0af68;
 }
-.group-list { flex: 1; overflow-y: auto; padding: 4px 0 8px; }
+
+/* -- release-grant control (#83): collapsed power action -- */
+.group-releaserow {
+  display: flex; flex-direction: column; gap: 6px; flex: none;
+  padding: 6px 12px; border-bottom: 1px solid var(--border-soft);
+}
+.group-release-toggle {
+  align-self: flex-start; font: inherit; font-size: 11px; cursor: pointer;
+  background: none; border: none; color: var(--text-dim); padding: 0;
+}
+.group-release-toggle:hover { color: var(--text); }
+.group-release-body[hidden] { display: none; }
+.group-release-body { display: flex; flex-direction: column; gap: 6px; }
+.group-release-copy { color: #e0af68; font-size: 10px; line-height: 1.4; opacity: 0.9; }
+.group-release-inputs { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.group-release-tag, .group-release-comment {
+  font: inherit; font-size: 12px;
+  background: var(--panel-2); color: var(--text);
+  border: 1px solid var(--border-soft); border-radius: 5px; padding: 2px 6px;
+}
+.group-release-tag { width: 120px; }
+.group-release-comment { flex: 1; min-width: 140px; }
+.group-release-tag:focus, .group-release-comment:focus {
+  outline: none; border-color: var(--accent);
+}
+.group-btn.sm.armed {
+  background: rgba(224, 175, 104, 0.2); color: #e0af68; border-color: #6a5230;
+}
+.group-release-err { color: var(--danger); font-size: 10px; }
+/* The roster is the ONLY shrinkable element: min-height:0 lets it collapse and
+   scroll so the fixed chrome above (header/summary/max/autonomous) and the
+   footer below always render — nothing clips under .group-view's overflow:hidden
+   (#83 rev-58). The clamp floor guarantees a sliver of it stays visible. */
+.group-list { flex: 1; min-height: 0; overflow-y: auto; padding: 4px 0 8px; }
 .group-list::-webkit-scrollbar { width: 9px; }
 .group-list::-webkit-scrollbar-thumb {
   background: #262634; border-radius: 5px;
@@ -1565,6 +1674,7 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   border: 1px solid var(--border-soft); border-radius: 5px; padding: 4px 12px;
 }
 .group-btn:hover { border-color: var(--accent); }
+.group-btn.sm { padding: 2px 9px; font-size: 10.5px; }
 .group-btn.on { background: rgba(224, 175, 104, 0.16); color: #e0af68; border-color: #6a5230; }
 .group-btn.danger { color: var(--danger); border-color: rgba(247, 118, 142, 0.35); }
 .group-btn.danger:hover { border-color: var(--danger); }
