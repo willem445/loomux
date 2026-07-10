@@ -6331,6 +6331,27 @@ impl OrchRegistry {
             .count() as u32
     }
 
+    /// Human-readable roster of the group's live delegates (workers, reviewers,
+    /// planners — the orchestrator is exempt from the cap) for the cap-rejection
+    /// guardrail message (#203): each as `id (role, idle|working)`, sorted by id
+    /// for a stable message. `idle` means the agent has no task in flight
+    /// (`idle_since_ms` set) — the safe one to reuse or kill. Empty string when
+    /// there are none (the cap can't be hit then, but stay total).
+    fn live_delegate_roster(&self, group: &str) -> String {
+        let mut rows: Vec<(String, String)> = self
+            .agents
+            .lock_safe()
+            .values()
+            .filter(|a| a.group == group && a.role != Role::Orchestrator && a.status != AgentStatus::Dead)
+            .map(|a| {
+                let activity = if a.idle_since_ms.is_some() { "idle" } else { "working" };
+                (a.id.clone(), format!("{} ({}, {activity})", a.id, a.role.as_str()))
+            })
+            .collect();
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        rows.into_iter().map(|(_, s)| s).collect::<Vec<_>>().join(", ")
+    }
+
     /// Write the per-agent MCP config the agent CLI connects with. Claude
     /// and Copilot share the same core schema; Copilot additionally expects
     /// a `tools` allowlist inside the server entry.
@@ -6668,8 +6689,14 @@ impl OrchRegistry {
         if role != Role::Orchestrator {
             let live = self.live_delegate_count(group_id);
             if live >= group.guardrails.max_agents {
+                // #203: name who holds the slots so a rejected orchestrator can
+                // see which delegate to reuse/kill (idle ones first) instead of
+                // being told only a count. Without this the orchestrator's first
+                // clue that a zombie planner is squatting a slot is this bare
+                // rejection.
+                let roster = self.live_delegate_roster(group_id);
                 return Err(format!(
-                    "guardrail: {live} live agents already (max {}). Reuse an idle agent or kill one first.",
+                    "guardrail: {live} live agents already (max {}). Reuse an idle agent or kill one first. Live delegates: {roster}.",
                     group.guardrails.max_agents
                 ));
             }
@@ -7442,6 +7469,44 @@ impl OrchRegistry {
         }
         self.audit(&a.group, "loomux", "agent-kill", json!({ "agent": agent_id }));
         Ok(())
+    }
+
+    /// #203: a planner's contract is one plan → one report → exit, but the CLI
+    /// session lingers idle after its final report, silently holding a delegate
+    /// slot until idle-kill — and the orchestrator only finds out when a later
+    /// spawn is rejected at the cap. When a planner reports `done`, loomux closes
+    /// its pane deterministically here so the slot frees the moment the plan is
+    /// posted; the planner role-template exit instruction is only belt-and-braces.
+    ///
+    /// The caller (the MCP `report` handler) delivers the done report to the
+    /// orchestrator *first*, so this delivers a **completion** exit notice after
+    /// it — phrased as a normal finish, not a crash. It then marks the agent dead
+    /// (freeing the slot in the registry immediately) *before* killing the pty:
+    /// `mark_dead` drops the by-pty mapping, so the real pane exit lands as a
+    /// no-op in `on_pty_exit` instead of a duplicate generic "exited (code …)"
+    /// notice. No-op for a non-planner, an already-dead agent, or an unknown id.
+    pub fn close_completed_planner(&self, agent_id: &str) {
+        let Some(a) = self.agent(agent_id) else { return };
+        if a.role != Role::Planner || a.status == AgentStatus::Dead {
+            return;
+        }
+        let _ = self.deliver_to_orchestrator(
+            &a.group,
+            &format!(
+                "[loomux] planner {} ({}) posted its plan and exited — its delegate slot is free.",
+                a.name, a.id
+            ),
+            "loomux",
+        );
+        // Free the slot now and neutralize the real pane-exit (see doc comment),
+        // then terminate the actual CLI pane. The pty kill is best-effort: unit
+        // tests run without an app handle or a bound pty.
+        let snapshot = self.mark_dead(agent_id, Some(0));
+        if let (Some(app), Some(pty)) =
+            (self.app.lock_safe().clone(), snapshot.and_then(|s| s.pty_id))
+        {
+            app.state::<crate::pty::PtyManager>().kill(pty);
+        }
     }
 
     pub fn focus_agent(&self, agent_id: &str) -> Result<(), String> {

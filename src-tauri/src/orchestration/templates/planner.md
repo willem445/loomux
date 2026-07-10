@@ -44,7 +44,10 @@ read-only so its plan is trustworthy).
      what must be serialized vs what can run in parallel worktrees.
 4. `report("done", "issue #<n>: plan posted (<comment link>) — <one-paragraph summary of
    the recommended approach and the worker split>")`, then stop. The orchestrator turns
-   your plan into worker briefs.
+   your plan into worker briefs. Your contract is one plan → one `done` report → exit:
+   loomux closes your pane automatically once that report lands so you never sit idle
+   holding a delegate slot (#203), so do not keep working or wait around after it — end
+   the turn.
 
 Keep the plan concrete and skimmable — it becomes the orchestrator's delegation script,
 so a vague plan just moves the thinking downstream. Write for the worker who will build

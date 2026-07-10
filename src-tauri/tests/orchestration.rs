@@ -2573,6 +2573,121 @@ fn report_validates_status_and_role() {
 }
 
 #[test]
+fn planner_done_report_closes_pane_and_reports_before_exit() {
+    // #203: a planner's contract is one plan → one report → exit. When it
+    // reports `done`, loomux must close its pane deterministically (freeing the
+    // delegate slot it would otherwise hold idle until idle-kill), and the
+    // orchestrator must receive the plan report BEFORE the exit notice — which
+    // must read as a normal completion, not a crash.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let planner = reg
+        .spawn_agent(&g.id, Role::Planner, "plan", "plan issue #7", false, None)
+        .unwrap();
+    // Pause so deliveries are audited (suppressed) and observable in order —
+    // test mode has no pane to type into.
+    reg.pause_group(&g.id).unwrap();
+    let cp = reg.resolve_token(&planner.token).unwrap();
+
+    let r = dispatch(
+        &reg,
+        &cp,
+        "tools/call",
+        &json!({ "name": "report", "arguments": { "status": "done", "summary": "issue #7: plan posted" } }),
+    )
+    .unwrap();
+    assert_eq!(r["isError"], false, "the planner's done report must succeed");
+
+    // The pane is closed: the planner is dead and no longer holds a slot.
+    let dead = reg
+        .list_agents(&g.id)
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|a| a["id"] == json!(planner.id) && a["status"] == json!("dead"));
+    assert!(dead, "a planner's done report must close its pane (#203)");
+
+    // Ordering: the orchestrator gets the report before the exit notice.
+    let texts: Vec<String> = reg
+        .audit_log(&g.id)
+        .into_iter()
+        .filter(|e| e.action == "prompt-suppressed-paused")
+        .filter_map(|e| e.detail["text"].as_str().map(str::to_string))
+        .collect();
+    let report_at = texts
+        .iter()
+        .position(|t| t.contains("reports done") && t.contains("plan posted"))
+        .expect("orchestrator must receive the done report");
+    let exit_at = texts
+        .iter()
+        .position(|t| t.contains("posted its plan and exited"))
+        .expect("orchestrator must receive an exit notice");
+    assert!(report_at < exit_at, "report must arrive before the exit notice, got {texts:?}");
+
+    // The exit notice reads as a normal completion, not a crash.
+    let exit = &texts[exit_at];
+    assert!(exit.contains("slot is free"), "exit notice must say the slot freed, got: {exit}");
+    assert!(
+        !exit.contains("exited (code"),
+        "planner completion must not read as a crash, got: {exit}"
+    );
+}
+
+#[test]
+fn only_a_planner_done_report_auto_closes_the_pane() {
+    // The auto-close is scoped narrowly (#203): a *worker's* `done` (PR open,
+    // awaiting human review — it stays for follow-ups) and a *planner's*
+    // `progress` (still working) must both leave the pane alive.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let worker = reg.spawn_agent(&g.id, Role::Worker, "w", "task", false, None).unwrap();
+    let planner = reg.spawn_agent(&g.id, Role::Planner, "plan", "task", false, None).unwrap();
+    reg.pause_group(&g.id).unwrap(); // suppress delivery; keep the report path exercised
+    let cw = reg.resolve_token(&worker.token).unwrap();
+    let cp = reg.resolve_token(&planner.token).unwrap();
+
+    dispatch(&reg, &cw, "tools/call",
+        &json!({ "name": "report", "arguments": { "status": "done", "summary": "PR #1 open" } })).unwrap();
+    dispatch(&reg, &cp, "tools/call",
+        &json!({ "name": "report", "arguments": { "status": "progress", "summary": "still exploring" } })).unwrap();
+
+    let alive = |id: &str| {
+        reg.list_agents(&g.id).as_array().unwrap().iter().any(|a| {
+            a["id"] == json!(id) && a["status"] != json!("dead")
+        })
+    };
+    assert!(alive(&worker.id), "a worker's done report must not close its pane");
+    assert!(alive(&planner.id), "a planner's progress report must not close its pane");
+}
+
+#[test]
+fn spawn_cap_rejection_lists_the_delegate_roster() {
+    // #203: when spawn is refused at the delegate cap, the guardrail message
+    // must name who holds the slots (id, role, idle vs working) so the
+    // orchestrator can see which agent to reclaim — an idle planner squatting a
+    // slot is the whole reason the cap was hit with no visible cause.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap(); // cap 2
+    let worker = reg
+        .spawn_agent(&g.id, Role::Worker, "w", "build the thing", false, None)
+        .unwrap(); // has a task → working
+    let planner = reg.spawn_agent(&g.id, Role::Planner, "plan", "", false, None).unwrap(); // no task → idle
+    // Two live delegates == cap: the next spawn is refused with the roster.
+    let err = reg.spawn_agent(&g.id, Role::Worker, "w2", "t", false, None).unwrap_err();
+    assert!(err.contains("Live delegates:"), "rejection must list the roster, got: {err}");
+    assert!(
+        err.contains(&format!("{} (worker, working)", worker.id)),
+        "a tasked worker must show as working, got: {err}"
+    );
+    assert!(
+        err.contains(&format!("{} (planner, idle)", planner.id)),
+        "an idle planner must show as idle — the obvious slot to reclaim, got: {err}"
+    );
+}
+
+#[test]
 fn every_tool_call_is_audited() {
     let (reg, _d, co, _cw) = setup_mcp();
     dispatch(&reg, &co, "tools/call", &json!({ "name": "list_agents", "arguments": {} })).unwrap();
