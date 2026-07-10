@@ -1469,21 +1469,25 @@ mod tests {
 
     #[test]
     fn worktree_survives_dangling_origin_head() {
-        // A remote default-branch rename (master→main) plus `fetch --prune`
-        // leaves `origin/HEAD` pointing at the pruned `origin/master`:
-        // `symbolic-ref` still resolves the name, `rev-parse` cannot. The chain
-        // must not trust the dangling ref and hard-fail every default spawn — it
-        // must repair (`set-head`) / fall through and cut from the real default
-        // (#204 review).
+        // A remote default-branch rename plus `fetch --prune` leaves
+        // `origin/HEAD` pointing at a pruned ref: `symbolic-ref` still resolves
+        // the name, `rev-parse` cannot. The chain must not trust the dangling
+        // ref and hard-fail every default spawn — it must repair via `set-head`
+        // and cut from the real default (#204 review).
+        //
+        // The remote default is `trunk` (not main/master) deliberately: the
+        // `origin/main`/`origin/master` candidate loop can't coincidentally
+        // rescue this, so success *proves* the `set-head --auto` repair ran.
         let bare = tempfile::tempdir().unwrap();
         setup_git(bare.path(), &["init", "-q", "--bare"]);
-        setup_git(bare.path(), &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        setup_git(bare.path(), &["symbolic-ref", "HEAD", "refs/heads/trunk"]);
 
         let seed = new_repo();
+        setup_git(seed.path(), &["checkout", "-q", "-B", "trunk"]);
         commit(seed.path(), "base.txt", "base\n", "base");
-        commit(seed.path(), "main.txt", "main\n", "main only");
+        commit(seed.path(), "trunk.txt", "trunk\n", "trunk only");
         setup_git(seed.path(), &["remote", "add", "origin", &p(bare.path())]);
-        git_push(p(seed.path()), true).unwrap();
+        git_push(p(seed.path()), true).unwrap(); // pushes `trunk`, sets upstream
 
         let clone_dir = tempfile::tempdir().unwrap();
         setup_git(clone_dir.path(), &["clone", "-q", &p(bare.path()), "wc"]);
@@ -1500,13 +1504,13 @@ mod tests {
             "precondition: origin/master must be unresolvable (dangling symref)"
         );
 
-        // Must succeed, repairing to origin/main and cutting from it — not
-        // `fatal: Not a valid object name: 'origin/master'`.
+        // Must succeed, repairing origin/HEAD to origin/trunk and cutting from
+        // it — not `fatal: Not a valid object name: 'origin/master'`.
         let wt = git_worktree_add(p(&primary), "agent-x".into(), None).unwrap();
         assert_eq!(worktree_branch(&wt), "agent-x");
         assert!(
-            Path::new(&wt).join("main.txt").exists(),
-            "must cut from the repaired default branch (main)"
+            Path::new(&wt).join("trunk.txt").exists(),
+            "must cut from the repaired default branch (trunk) via set-head"
         );
     }
 }
