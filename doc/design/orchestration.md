@@ -656,13 +656,21 @@ reconcile on read, mirrored into the kickoff config + a live notice, and surface
   path had *less* api coverage than the merge path, which already fail-safe-blocks raw `gh api`
   merges). All of them route through **one** shared shell decision (`loomux_release_gate`, the
   single decision point — no parallel checker), so the api path can never diverge from the
-  subcommand path: (a) `POST …/git/refs` creating a **`refs/tags/v*`** ref, (b) a **write** to the
-  `…/releases` endpoint (create/edit/delete — read-only GET list/view passes), and (c) a graphql
-  **create/update/deleteRelease** mutation. The tag is resolved from the api fields for grant-keying
-  where cheap (`ref=refs/tags/<t>`, `tag_name=<t>`, graphql `tagName:"<t>"`); where it isn't (e.g.
-  `DELETE …/releases/<id>` by numeric id), only the blanket markers (`autonomous && auto_release`,
-  or supervised `dangerous && !autonomous`) can allow it — otherwise **fail-safe block**. A
-  non-release api call (an issues endpoint, a read-only release GET) passes through untouched.
+  subcommand path: (a) a **write** (POST/PATCH/DELETE, not GET) to the **`git/refs` / `git/tags`**
+  plumbing that creates/moves/deletes a **`refs/tags/*`** ref, (b) a **write** to the `…/releases`
+  endpoint (create/edit/delete — read-only GET list/view passes), and (c) a graphql
+  **create/update/deleteRelease** mutation *or* a **`createRef`/`updateRef`** of a `refs/tags` ref
+  (a `*Tag` mutation). Crucially (a) gates by **URL + method, not by an argv `ref=` field** — the
+  ref can hide in the request **body** (`--input <file>` / stdin), and `git/refs` is not a
+  `releases` URL, so a substring-of-argv check missed it (the #196 re-review found this residual
+  bypass three ways: `--input` file, `--input -` stdin, and `PATCH …/git/refs/tags/<t>` tag-move,
+  plus graphql `createRef`). A **branch** ref (`refs/heads/*`, visible in argv or the URL) never
+  triggers `release.yml`, so it passes through. The tag is resolved for grant-keying where cheap
+  (argv `ref=refs/tags/<t>`, the URL `git/refs/tags/<t>`, `tag_name=<t>`, or graphql
+  `tagName:"<t>"` / `name:"refs/tags/<t>"`); where it isn't (a body-only `--input` ref, or `DELETE
+  …/releases/<id>` by numeric id), only the blanket markers (`autonomous && auto_release`, or
+  supervised `dangerous && !autonomous`) can allow it — otherwise **fail-safe block**. A non-release
+  api call (an issues endpoint, a branch `refs/heads` write, a read-only GET) passes through untouched.
 - **git shim** (new, same PATH-injection as the gh shim) gates `git push` that publishes a tag:
   `--tags`/`--follow-tags`/`--mirror` (bulk → blocked, push the specific approved tag),
   `refs/tags/<t>` and the `tag <t>` form (explicit), and a bare **`v*`** refspec (any v-prefixed

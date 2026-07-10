@@ -227,11 +227,13 @@ fi
 # RELEASE via raw `gh api` / graphql (#196): the `gh release` subcommand above is the
 # ergonomic path, but the SAME publish can be driven through `gh api` — which had
 # none of the above gating, an asymmetric bypass vs the merge path (which already
-# fail-safe-blocks raw `gh api` merges). Mirror it: any api call that (a) creates a
-# refs/tags/v* ref, (b) writes the releases endpoint (create/edit/delete), or (c) is
-# a graphql create/update/deleteRelease mutation routes through the SAME
-# loomux_release_gate. A non-release api call (issues, read-only release GETs, …)
-# passes through untouched.
+# fail-safe-blocks raw `gh api` merges). Mirror it: any api call that (a) is a WRITE
+# to the git/refs|git/tags plumbing (create/move/delete a v* tag ref — gated by URL+
+# method since the ref may hide in --input/stdin; branch refs/heads writes excepted),
+# (b) writes the releases endpoint (create/edit/delete), or (c) is a graphql create/
+# update/deleteRelease or create/updateRef-of-a-tag / *Tag mutation routes through the
+# SAME loomux_release_gate. A non-release api call (issues, branch writes, read-only
+# GETs, …) passes through untouched.
 if [ "$cmd" = "api" ]; then
   all="$*"
   low=$(printf '%s' "$all" | tr '[:upper:]' '[:lower:]')
@@ -256,21 +258,44 @@ if [ "$cmd" = "api" ]; then
     "") [ "$has_field" = "1" ] && writes=1 ;;
     *) writes=1 ;;   # unknown/custom verb → fail-safe treat as a write
   esac
-  # Resolve the tag for grant-keying where cheap: the create shapes carry it as a
-  # field (ref=refs/tags/<t> | tag_name=<t> | graphql tagName:"<t>"). DELETE-by-id
-  # and bulk shapes leave it empty → only the blanket markers can allow them.
+  # Resolve the tag for grant-keying where cheap: create/move shapes carry it in an
+  # argv field OR the URL path (ref=refs/tags/<t> | git/refs/tags/<t> | tag_name=<t> |
+  # graphql tagName:"<t>" or name:"refs/tags/<t>"). When the ref lives only in a
+  # request BODY (--input file/stdin) it is not cheaply parseable → tag stays empty
+  # and only the blanket markers can allow (same fallback as DELETE-by-id).
   rtag=""
   case "$all" in
-    *ref=refs/tags/*) rest=${all#*ref=refs/tags/}; rtag=${rest%% *} ;;
-    *tag_name=*)      rest=${all#*tag_name=};      rtag=${rest%% *} ;;
-    *tagName:*)       rest=${all#*tagName:}; rest=$(printf '%s' "$rest" | tr -d ' "'); rtag=${rest%%,*}; rtag=${rtag%%\}*}; rtag=${rtag%%)*} ;;
+    *ref=refs/tags/*)  rest=${all#*ref=refs/tags/};  rtag=${rest%% *} ;;
+    *git/refs/tags/*)  rest=${all#*git/refs/tags/};  rtag=${rest%% *} ;;
+    *tag_name=*)       rest=${all#*tag_name=};       rtag=${rest%% *} ;;
+    *tagName:*)        rest=${all#*tagName:};   rest=$(printf '%s' "$rest" | tr -d ' "'); rtag=${rest%%,*}; rtag=${rtag%%\}*}; rtag=${rtag%%)*} ;;
+    *refs/tags/*)      rest=${all#*refs/tags/}; rest=$(printf '%s' "$rest" | tr -d ' "'); rtag=${rest%%,*}; rtag=${rtag%%\}*}; rtag=${rtag%%)*} ;;
   esac
   is_rel=0
-  case "$all" in *ref=refs/tags/v*) is_rel=1 ;; esac                 # (a) create a v* tag ref
-  if [ "$is_rel" = "0" ] && [ "$is_graphql" = "0" ] && [ "$writes" = "1" ]; then
-    case "$low" in *releases*) is_rel=1 ;; esac                      # (b) REST release write
+  # (a) REST git refs/tags plumbing: a WRITE (POST/PATCH/DELETE, not GET) to git/refs
+  # or git/tags can create/move/delete a v* tag ref → release.yml → npm. Gate by
+  # URL+METHOD, not by an argv ref= field — the ref may live in --input/stdin, and
+  # git/refs is not a `releases` URL (the #196 re-review bypass). A clearly-branch ref
+  # (refs/heads, visible in argv or the URL) never triggers release.yml, so it passes;
+  # a body-only ref that can't be classified fail-safe-gates (blanket markers only).
+  if [ "$is_graphql" = "0" ] && [ "$writes" = "1" ]; then
+    case "$low" in
+      *git/refs*|*git/tags*)
+        case "$low" in *refs/heads/*) : ;; *) is_rel=1 ;; esac ;;
+    esac
   fi
-  case "$low" in *createrelease*|*updaterelease*|*deleterelease*) is_rel=1 ;; esac  # (c) graphql mutation
+  # (b) REST release create/edit/delete: a WRITE to the releases endpoint (read-only
+  # GET list/view passes through).
+  if [ "$is_rel" = "0" ] && [ "$is_graphql" = "0" ] && [ "$writes" = "1" ]; then
+    case "$low" in *releases*) is_rel=1 ;; esac
+  fi
+  # (c) graphql: a create/update/deleteRelease mutation, OR a create/update Ref / *Tag
+  # mutation targeting a refs/tags ref — createRef can publish a v* tag ref just like
+  # the REST git/refs write. A refs/heads (branch) createRef must NOT gate.
+  case "$low" in
+    *createrelease*|*updaterelease*|*deleterelease*|*createtag*) is_rel=1 ;;
+    *createref*|*updateref*) case "$low" in *refs/tags/*) is_rel=1 ;; esac ;;
+  esac
   if [ "$is_rel" = "1" ]; then
     loomux_release_gate "$rtag" "api"   # allow (return) or block (exit)
     exec "$REAL_GH" "$@"
