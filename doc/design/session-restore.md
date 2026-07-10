@@ -80,9 +80,19 @@ resumed autonomous orchestrator (#83) can idle-tick and spawn a worker storm
 | **Orchestrator / worker / reviewer** (`orch`) | **Dormant** — the human resumes the whole group via the existing `resumeOrchSession` | The one place a resume can actually burn credits; keep the safety stance exactly here. The rule is keyed on **kind, not the presence of an id** — a worker with a session id still stays dormant. |
 
 `planPaneRestore(pane) → RestoreAction` is the per-pane core; `planLayoutRestore`
-flattens a layout tree into a pre-order sequence of `RestoreStep`s (action +
-parent-split `dir` + flex `weight`) that `main.ts` feeds to `grid.openPane`.
-Both are pure and exhaustively unit-tested.
+turns a layout tree into an ordered `RestoreOpenStep[]` — one `grid.openPane`
+call each, with `relativeTo` (the index of an earlier step's pane to split from),
+`dir`, and a `weights` chain. This is the **reconstructible** plan: a split's
+first child stays put as the anchor and its siblings open beside it, so the
+direction and the subtree's weights ride on the sibling steps. A flat
+`{dir, weight}[]` (an earlier draft) dropped `relativeTo` and split weights, which
+made a 2×2 grid and four stacked panes flatten to the *identical* sequence —
+unreconstructible. A serialize → `planLayoutRestore` → replay round-trip is now
+structure- **and** weight-identical; `test/panerestore.test.ts` proves it with a
+pure model of grid's `insertBeside` (and pins that the 2×2 and 4-stack plans
+differ). `grid.openPane` resets flex to equal shares as it splits, so `main.ts`
+applies the `weights` after building. All three functions are pure and
+exhaustively unit-tested.
 
 **The one-line flip.** The plan promised that switching to all-dormant (every
 agent gets a Start button, matching the earlier #167 default) is a single-line

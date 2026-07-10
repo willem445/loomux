@@ -89,33 +89,78 @@ export function planPaneRestore(pane: PersistedPane): RestoreAction {
   }
 }
 
-/** One step of a layout rebuild: the restore action for a leaf plus how to place
- *  it. `dir` is the direction of the leaf's parent split (the split direction
- *  main.ts opens the pane in); the first/root leaf carries "row" by convention
- *  and grid ignores direction for the first pane. `weight` is the flex-grow the
- *  leaf held, so the rebuilt split keeps the saved proportions. */
-export interface RestoreStep {
+/** One `grid.openPane` call in a layout rebuild — enough to reconstruct ANY
+ *  nested split tree, including telling a 2×2 grid apart from four stacked panes
+ *  (which a flat leaf list cannot).
+ *
+ *  - `relativeTo` — the index (into the returned array) of an EARLIER step whose
+ *    pane is the anchor this one splits from; null for the first pane, which
+ *    fills the empty grid (`dir`/`relativeTo` are then ignored). This anchor is
+ *    what a flat `{dir, weight}[]` dropped, making nested layouts unreconstructible.
+ *  - `dir` — the split direction to open in. Only the SECOND+ child of a split
+ *    carries its split's direction; the split's first child is an anchor reused
+ *    from an earlier step, never re-opened.
+ *  - `weights` — the flex-grow chain from the inserted subtree's OUTERMOST slot
+ *    down its left spine to this entry leaf (length 1 for a plain leaf child).
+ *    `grid.openPane` resets flex to equal shares as it splits, so restore applies
+ *    these afterward: the outermost entry is the weight of the (possibly new)
+ *    split element this insertion creates, and each deeper entry is the weight one
+ *    level in — exactly the values `grid.layoutSnapshot()` would read back. This
+ *    is how the saved 25/75 divider drag survives instead of snapping to 50/50.
+ *
+ *  A serialize → planLayoutRestore → replay round-trip is structure- AND
+ *  weight-identical; test/panerestore.test.ts pins that with a pure model of
+ *  grid's `insertBeside`. */
+export interface RestoreOpenStep {
   action: RestoreAction;
+  relativeTo: number | null;
   dir: "row" | "column";
-  weight: number;
+  weights: number[];
 }
 
-/** Flatten a persisted layout tree into a pre-order sequence of restore steps —
- *  the order main.ts opens panes in (each subsequent pane splits relative to an
- *  earlier one). Pure tree walk: no live panes, no DOM, so nested splits and
- *  weights are exercised in tests. main.ts owns turning this sequence into the
- *  actual grid.openPane(opts, dir, relativeTo) calls. */
-export function planLayoutRestore(layout: PersistedLayoutNode): RestoreStep[] {
-  const steps: RestoreStep[] = [];
-  const walk = (node: PersistedLayoutNode, dir: "row" | "column"): void => {
-    if (node.kind === "leaf") {
-      steps.push({ action: planPaneRestore(node.pane), dir, weight: node.weight });
-      return;
+/** The pane at a subtree's entry (its leftmost leaf) — the one leaf a split's
+ *  first child contributes as the anchor its siblings open relative to. */
+function entryLeafPane(node: PersistedLayoutNode): PersistedPane {
+  return node.kind === "leaf" ? node.pane : entryLeafPane(node.children[0]);
+}
+
+/** The flex-grow chain from a node's own slot down its left spine to the entry
+ *  leaf: `[node.weight, firstChild.weight, …, entryLeaf.weight]`. Carries every
+ *  split weight the old flat list discarded (only leaf weights survived it). */
+function entryWeightChain(node: PersistedLayoutNode): number[] {
+  return node.kind === "leaf"
+    ? [node.weight]
+    : [node.weight, ...entryWeightChain(node.children[0])];
+}
+
+/** Flatten a persisted layout tree into the ordered `grid.openPane` plan that
+ *  rebuilds it EXACTLY. Pure tree walk (no live panes, no DOM): the first child
+ *  of each split stays put as the anchor, and its siblings open beside it in the
+ *  split's direction — so a split's direction and its subtree's weights ride on
+ *  the sibling steps, never collapsing distinct nestings into one sequence.
+ *  main.ts turns each step into `grid.openPane(opts, dir, relativeTo)` and then
+ *  applies the `weights`. */
+export function planLayoutRestore(layout: PersistedLayoutNode): RestoreOpenStep[] {
+  const steps: RestoreOpenStep[] = [
+    { action: planPaneRestore(entryLeafPane(layout)), relativeTo: null, dir: "row", weights: entryWeightChain(layout) },
+  ];
+  const expand = (node: PersistedLayoutNode, anchorIndex: number): void => {
+    if (node.kind === "leaf") return;
+    // c0 keeps the anchor slot; c1..cn open beside it in this split's direction.
+    const childAnchors = [anchorIndex];
+    for (let i = 1; i < node.children.length; i++) {
+      childAnchors.push(steps.length);
+      steps.push({
+        action: planPaneRestore(entryLeafPane(node.children[i])),
+        relativeTo: anchorIndex,
+        dir: node.dir,
+        weights: entryWeightChain(node.children[i]),
+      });
     }
-    // Each child opens in THIS split's direction; recurse so a child that is
-    // itself a split re-parents its own children under its own direction.
-    for (const child of node.children) walk(child, node.dir);
+    // Recurse to subdivide every child (a child that is itself a split gets its
+    // own siblings opened relative to the anchor we just recorded for it).
+    node.children.forEach((child, i) => expand(child, childAnchors[i]));
   };
-  walk(layout, "row");
+  expand(layout, 0);
   return steps;
 }
