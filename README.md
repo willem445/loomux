@@ -121,7 +121,8 @@ src/
   tabstore.ts       pure encode/decode + schema validation of the persisted tab set
   panefit.ts        pure "hidden => no PTY resize" decision (the no-resize invariant)
   sessions.ts       session browser sidebar
-  launcher.ts       new-agent-pane dialog (single / multi / orchestrator)
+  launcher.ts       in-pane welcome / pane-setup form (Agent / Orchestrator / Terminal kind picker)
+  panesetup.ts      pure kind-selection + validation core for the welcome screen (DOM-free, unit-tested)
   orchestration.ts  frontend half of agent groups (panes, badges, focus)
   shortcuts.ts      app-level keybindings (single source of truth)
   fileapi.ts        typed bridge to fileedit.rs (per-feature wrapper, like git.ts)

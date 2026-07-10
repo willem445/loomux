@@ -30,8 +30,8 @@ repaints a terminal (the same no-resize promise as maximize).
 ## Open, switch, close
 
 - **New tab** — `Ctrl+Shift+T`, or the **+** at the end of the tab strip. It
-  opens on the current mode's starting surface: a terminal, or the agent launcher
-  in [agent mode](../getting-started.html) — never a blank tab.
+  opens on the [welcome / pane-setup screen](../getting-started.html) where you
+  pick the pane's kind (Agent, Orchestrator, or Terminal) — never a blank tab.
 - **Switch** — click a tab, or page with `Ctrl+Shift+[` (previous) and
   `Ctrl+Shift+]` (next).
 - **Close** — `Ctrl+Shift+K`, or the tab's **✕**. There's always at least one
@@ -58,7 +58,7 @@ backend, independent of which tab is on screen.
 
 ## Orchestration lands in its own tab
 
-Launch an orchestrator (agent mode → the launcher → *orchestrator*) and it opens
+Launch an orchestrator (welcome screen → **Orchestrator + workers**) and it opens
 a **new project tab named for the repo**, rather than taking over the tab you're
 on. Its workers spawn **into that tab** as the backend requests them — even while
 you're looking at another project.

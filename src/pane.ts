@@ -290,6 +290,11 @@ export class Pane implements VoiceTargetPane {
   private fit = new FitAddon();
   private resizeObs: ResizeObserver;
   private disposed = false;
+  /** Welcome / pane-setup content (#194): a pane can exist with NO PTY, showing
+   *  the setup form until the user picks a kind. The PTY spawns only on submit
+   *  (`startFromWelcome`), so the no-resize invariant holds — there's nothing to
+   *  resize before then. Null once the pane has become a real terminal. */
+  private welcomeEl: HTMLElement | null = null;
   /** Ordered input pipe to the PTY: serializes every keystroke/paste so the
    *  async IPC writes can't reorder (a bracketed-paste terminator overtaking
    *  its body wedges the target app — #65). Buffers input produced before the
@@ -656,6 +661,41 @@ export class Pane implements VoiceTargetPane {
       this.term.writeln(`\x1b[91mloomux: failed to start shell\x1b[0m`);
       this.term.writeln(`\x1b[90m${String(err)}\x1b[0m`);
     }
+  }
+
+  /** Render the welcome / pane-setup surface in this pane instead of a terminal
+   *  (#194). No terminal is opened and no PTY is spawned — the pane is inert
+   *  content until the user submits, so nothing can trigger a ConPTY resize
+   *  before then (constraint 1). `formEl` is the welcome form's root DOM. */
+  startWelcome(formEl: HTMLElement): void {
+    this.setName("welcome");
+    this.el.classList.add("is-welcome");
+    const wrap = document.createElement("div");
+    wrap.className = "pane-welcome";
+    wrap.appendChild(formEl);
+    this.welcomeEl = wrap;
+    this.el.appendChild(wrap);
+  }
+
+  /** True while this pane is showing the welcome form (no PTY yet). */
+  get isWelcome(): boolean {
+    return this.welcomeEl !== null;
+  }
+
+  /** Focus the first control of the welcome form (harmless on a hidden tab —
+   *  focusing an element in a `display:none` subtree is a no-op). */
+  focusWelcome(): void {
+    this.welcomeEl?.querySelector<HTMLElement>("select, input, button")?.focus();
+  }
+
+  /** Convert a welcome pane into a real terminal: tear down the setup surface and
+   *  spawn the chosen kind in place. The PTY is created here — its first and only
+   *  spawn — so the welcome-before-PTY flow never resizes anything. */
+  async startFromWelcome(opts: PaneOptions = {}): Promise<void> {
+    this.welcomeEl?.remove();
+    this.welcomeEl = null;
+    this.el.classList.remove("is-welcome");
+    await this.start(opts, true);
   }
 
   /** The live WebGL renderer addon, if loaded. Held so hidden tabs can drop it

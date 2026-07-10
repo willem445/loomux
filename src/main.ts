@@ -20,8 +20,7 @@ import { matchShortcut } from "./shortcuts";
 import { voiceController } from "./voicecontrol";
 import { initStatusBar } from "./statusbar";
 import { initHintBar } from "./hintbar";
-import { AgentLauncher } from "./launcher";
-import { getAgentMode, setAgentMode } from "./agents";
+import { WelcomeForm, type WelcomeResult } from "./launcher";
 import {
   initOrchestration,
   launchOrchestrator,
@@ -71,13 +70,11 @@ const tabBarEl = document.getElementById("tab-bar")!;
 const tabs = new TabManager<Workspace>((id) => {
   const ws = new Workspace(id, (w) => {
     // Last pane in this tab closed (a human ✕, or a background agent exiting) →
-    // keep the tab's grid non-empty with a SILENT plain shell. This is a
-    // lifecycle refill, not a human "new pane" action, so it must never open the
-    // launcher modal — which, for a hidden/background tab, would pop over the
-    // ACTIVE tab (MED-1). The launcher only ever appears from an explicit human
-    // action in the active tab (openUserTab / a split). One rule for every empty
-    // tab: a plain shell (see the boot fill and the design note).
-    void openShellIn(w);
+    // keep the tab's grid non-empty by refilling with the welcome / pane-setup
+    // surface (#194). This is safe for a hidden/background tab now that the
+    // welcome is IN-PANE content, not a floating modal over the active tab — the
+    // old MED-1 "silent shell only" rule existed solely to avoid that overlay.
+    openWelcomeIn(w);
   });
   stackEl.appendChild(ws.el);
   return ws;
@@ -100,7 +97,7 @@ function eventsFor(ws: Workspace): PaneEvents {
   return {
     onFocus: (pane) => ws.grid.setActive(pane),
     onCloseRequest: (pane) => ws.grid.closePane(pane),
-    onSplit: (pane, dir) => void openPaneIn(ws, dir, pane),
+    onSplit: (pane, dir) => openWelcomeIn(ws, dir, pane),
     onMinimize: (pane) => ws.grid.minimize(pane),
     onMaximize: (pane) => ws.grid.toggleMaximize(pane),
     onToggleGroupMinimize: (pane) => {
@@ -120,17 +117,13 @@ function findPaneAcrossTabs(ptyId: number): { ws: Workspace; pane: Pane } | null
 
 // ---------- project tabs: orchestration routing (#63) ----------
 
-/** Open a new tab the way the user expects (#63): create + activate
- *  it, then present the SAME starting surface a fresh loomux pane shows — a
- *  terminal in plain mode, or the agent launcher in agent mode (openPaneIn is
- *  the exact fresh-boot / new-pane flow). Never leaves the tab blank. */
-async function openUserTab(): Promise<void> {
+/** Open a new tab the way the user expects (#63): create + activate it, then
+ *  present the welcome / pane-setup surface — the SAME starting surface a fresh
+ *  loomux pane shows. The welcome pane fills the tab immediately, so it's never
+ *  left blank; the user picks the pane's kind from there (#194). */
+function openUserTab(): void {
   const ws = tabs.newTab();
-  await openPaneIn(ws);
-  // In agent mode, choosing "orchestrator" from the launcher opens its OWN
-  // project tab (launchOrchestratorTab), leaving this one empty — drop the
-  // redundant blank tab in that one case. Every other path fills `ws`.
-  if (ws.grid.paneCount === 0 && tabs.count > 1) tabs.closeTab(ws.id);
+  openWelcomeIn(ws);
   persistTabs();
 }
 
@@ -283,83 +276,72 @@ async function restoreTabs(): Promise<boolean> {
 // PTYs whose exit event arrived before their pane finished starting.
 const earlyExits = new Map<number, PtyExit>();
 
-async function openShellIn(
-  ws: Workspace,
-  dir: "row" | "column" = "row",
-  relativeTo?: Pane
-): Promise<Pane> {
-  const pane = await ws.grid.openPane({}, eventsFor(ws), dir, relativeTo);
-  reapIfExited(ws, pane);
+// ---------- welcome / pane-setup surface (#194) ----------
+// There is no global "agent mode" anymore: every pane opens as the welcome /
+// pane-setup surface, where the user declares its kind (Agent / Orchestrator /
+// Terminal). The setup pane has no PTY until the user submits — so nothing can
+// resize a ConPTY before then (constraint 1).
+
+/** Open a welcome / pane-setup pane in `ws`, wiring its submit to spawn the
+ *  chosen kind. Returns the setup pane (already placed; PTY-less until submit). */
+function openWelcomeIn(ws: Workspace, dir: "row" | "column" = "row", relativeTo?: Pane): Pane {
+  const form = new WelcomeForm();
+  const pane = ws.grid.openWelcomePane(eventsFor(ws), form.el, dir, relativeTo);
+  form.onSubmit = (result) => void handleWelcomeSubmit(ws, pane, result);
   return pane;
 }
 
-// ---------- agent mode ----------
-// When on, new panes host an agent CLI (chosen in the launcher dialog)
-// instead of a plain shell. Persisted across restarts.
-
-const launcher = new AgentLauncher();
-let agentMode = getAgentMode();
-
-const btnAgentMode = document.getElementById("btn-agent-mode")!;
-btnAgentMode.addEventListener("click", () => toggleAgentMode());
-
-function toggleAgentMode(): void {
-  agentMode = !agentMode;
-  setAgentMode(agentMode);
-  renderAgentMode();
-}
-
-function renderAgentMode(): void {
-  btnAgentMode.classList.toggle("on", agentMode);
-  const what = agentMode ? "agent" : "terminal";
-  document.getElementById("btn-split-right")!.title = `New ${what} right (Ctrl+Shift+E)`;
-  document.getElementById("btn-split-down")!.title = `New ${what} below (Ctrl+Shift+O)`;
-}
-renderAgentMode();
-
-/** Open a new pane honoring the current mode: agent mode routes through the
- *  launcher dialog; cancelling only falls back to a shell when the grid
- *  would otherwise be empty. The launcher can resolve to one pane, a fleet
- *  of N panes, or an orchestrator group (which opens its own panes). */
-async function openPaneIn(
-  ws: Workspace,
-  dir: "row" | "column" = "row",
-  relativeTo?: Pane
-): Promise<void> {
-  if (!agentMode) {
-    await openShellIn(ws, dir, relativeTo);
+/** Act on a welcome submission: convert the setup pane into the chosen kind.
+ *  Terminal → a shell in place; Agent → the first pane in place, the rest fanned
+ *  out beside it; Orchestrator → its own project tab (the setup pane retires). */
+async function handleWelcomeSubmit(ws: Workspace, pane: Pane, result: WelcomeResult): Promise<void> {
+  if (result.kind === "terminal") {
+    // shellKind is captured (#194) but Phase 1 spawns the default shell only;
+    // per-kind shell spawning lands in Phase 2, so it isn't threaded to the PTY yet.
+    await pane.startFromWelcome({ name: result.name, cwd: result.cwd });
+    reapIfExited(ws, pane);
+    persistTabs();
     return;
   }
-  const result = await launcher.show();
-  if (!result) {
-    if (ws.grid.paneCount === 0) await openShellIn(ws, dir);
-    else ws.grid.activePane?.focus();
-    return;
-  }
+
   if (result.kind === "orchestrator") {
     await launchOrchestratorTab(result.config);
+    // The setup pane has served its purpose. A split slot just closes; a
+    // dedicated welcome tab (fresh start / Ctrl+T) closes entirely so we don't
+    // strand a blank tab beside the new orchestrator tab. (The sole-pane /
+    // sole-tab case can't happen here — launchOrchestratorTab just added a tab.)
+    if (ws.grid.paneCount > 1) ws.grid.closePane(pane);
+    else if (tabs.count > 1) tabs.closeTab(ws.id);
     return;
   }
-  // Alternate split direction pane-to-pane so a fleet lays out as a grid
+
+  // Agent panes: the setup pane becomes the first agent; any extras fan out
+  // beside it, alternating split direction so a fleet lays out as a matrix
   // instead of ever-thinner slivers.
-  let prev = relativeTo;
-  let d = dir;
-  for (const spec of result.specs) {
-    const pane = await ws.grid.openPane(
+  const [first, ...rest] = result.specs;
+  await pane.startFromWelcome({ name: first.name, cwd: first.cwd, command: first.command });
+  reapIfExited(ws, pane);
+  let prev: Pane = pane;
+  let d: "row" | "column" = "column";
+  for (const spec of rest) {
+    const p = await ws.grid.openPane(
       { name: spec.name, cwd: spec.cwd, command: spec.command },
       eventsFor(ws),
       d,
       prev
     );
-    reapIfExited(ws, pane);
-    prev = pane;
+    reapIfExited(ws, p);
+    prev = p;
     d = d === "row" ? "column" : "row";
   }
+  persistTabs();
 }
 
-/** Open a pane in the active tab — the entry point the toolbar/shortcuts use. */
-const openPane = (dir: "row" | "column" = "row", relativeTo?: Pane): Promise<void> =>
-  openPaneIn(tabs.activeWorkspace, dir, relativeTo);
+/** Open a welcome pane in the active tab — the entry point the toolbar/shortcuts
+ *  use for a "new pane". */
+const openPane = (dir: "row" | "column" = "row", relativeTo?: Pane): void => {
+  openWelcomeIn(tabs.activeWorkspace, dir, relativeTo);
+};
 
 function reapIfExited(ws: Workspace, pane: Pane): void {
   if (pane.ptyId === null) return;
@@ -441,22 +423,16 @@ void onPtyExit((exit) => {
 document.addEventListener(
   "keydown",
   (e) => {
-    // The launcher dialog is modal: it handles Enter/Escape itself and
-    // app shortcuts must not fire behind it.
-    if (launcher.isOpen) return;
     const action = matchShortcut(e);
     if (!action) return;
     e.preventDefault();
     e.stopPropagation();
     switch (action) {
       case "split-right":
-        void openPane("row");
+        openPane("row");
         break;
       case "split-down":
-        void openPane("column");
-        break;
-      case "toggle-agent-mode":
-        toggleAgentMode();
+        openPane("column");
         break;
       case "close-pane": {
         const g = activeGrid();
@@ -539,8 +515,8 @@ document.addEventListener(
 
 // Top bar buttons.
 document.getElementById("btn-sessions")!.addEventListener("click", () => sessions.toggle());
-document.getElementById("btn-split-right")!.addEventListener("click", () => void openPane("row"));
-document.getElementById("btn-split-down")!.addEventListener("click", () => void openPane("column"));
+document.getElementById("btn-split-right")!.addEventListener("click", () => openPane("row"));
+document.getElementById("btn-split-down")!.addEventListener("click", () => openPane("column"));
 
 // Keep the browser from hijacking terminal-relevant defaults (Ctrl+F etc.
 // stays inside the shell; F5/F7 reach TUI apps instead of the webview).
@@ -605,18 +581,16 @@ void (async () => {
   tabBar = new TabBar(tabBarEl, tabs, () => void openUserTab());
 
   await ensureOutputRouter();
-  // Empty-tab fill — ONE rule (see the design note, and the factory onEmpty):
-  // an empty tab holds a SILENT plain shell, never the launcher modal, EXCEPT
-  // the genuine fresh start where the app opens its first pane and the human
-  // picks via the launcher. So a RESTORED session (any tab, active or
-  // background — including a group-bound one, whose shell is a placeholder until
-  // its group's session is restored into it) fills silently; only the brand-new
-  // default tab opens the launcher.
+  // Empty-tab fill (#194): every empty tab — a restored tab whose panes don't
+  // auto-revive, a group-bound tab whose orchestrator hasn't resumed, or the
+  // brand-new default tab on a fresh start — opens the welcome / pane-setup
+  // surface. It's in-pane content (no PTY until submit), so filling a background
+  // tab no longer risks the old floating-modal-over-the-active-tab problem.
   if (didRestore) {
     for (const ws of tabs.tabs) {
-      if (ws.grid.paneCount === 0) await openShellIn(ws);
+      if (ws.grid.paneCount === 0) openWelcomeIn(ws);
     }
   } else if (tabs.activeWorkspace.grid.paneCount === 0) {
-    await openPane();
+    openWelcomeIn(tabs.activeWorkspace);
   }
 })();

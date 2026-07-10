@@ -179,33 +179,57 @@ export class Grid {
     dir: Dir = "row",
     relativeTo?: Pane
   ): Promise<Pane> {
+    const pane = new Pane(events);
+    const takeFocus = this.placeLeaf(pane, !!opts.background, dir, relativeTo);
+    await pane.start(opts, takeFocus);
+    return pane;
+  }
+
+  /** Land a pane in "setup" state (#194): placed in the grid like any pane but
+   *  with NO PTY — it shows the welcome/pane-setup form (`formEl`) until the user
+   *  submits, at which point the caller converts it via `pane.startFromWelcome`.
+   *  No terminal is opened here, so nothing can resize a ConPTY before submit. */
+  openWelcomePane(events: PaneEvents, formEl: HTMLElement, dir: Dir = "row", relativeTo?: Pane): Pane {
+    const pane = new Pane(events);
+    const takeFocus = this.placeLeaf(pane, false, dir, relativeTo);
+    pane.startWelcome(formEl);
+    if (takeFocus) pane.focusWelcome();
+    return pane;
+  }
+
+  /** Insert a freshly-constructed pane's leaf into the tree and settle focus.
+   *  Shared by `openPane` (which then spawns a PTY) and `openWelcomePane` (which
+   *  renders a setup form instead). Returns whether the new pane took focus.
+   *
+   *  `background` is an orchestrator-driven spawn that must not steal focus/active
+   *  from where the human is typing (#117) nor collapse a fullscreen view (#155). */
+  private placeLeaf(pane: Pane, background: boolean, dir: Dir, relativeTo?: Pane): boolean {
     // Snapshot the human's focus FIRST — before any relayout below. Both
     // exitMaximize and insertBeside → renderSplit do replaceChildren(), which
     // detaches the focused pane's subtree (the steering strip or a terminal) and
     // re-appends it, implicitly blurring it to <body> so keystrokes go nowhere
-    // (#117; same DOM-detach class as #113). We hand it back after,
-    // unless the new pane is meant to take focus (see restoreFocus/takeFocus).
+    // (#117; same DOM-detach class as #113). We hand it back after, unless the
+    // new pane is meant to take focus (see restoreFocus/takeFocus).
     const prior = captureFocus();
     // A background (orchestrator-driven) spawn must not collapse the human's
     // fullscreen view (#155): keep the pane maximized and grow the split tree
     // underneath it. A human-initiated open still exits fullscreen so the new
     // pane is shown in its landed layout. `keepMaximized` is the pane to re-lift
     // after the tree mutation, or null when we let maximize exit as before.
-    const keepMaximized = shouldPreserveMaximize(!opts.background, this.maximized !== null)
+    const keepMaximized = shouldPreserveMaximize(!background, this.maximized !== null)
       ? this.maximized
       : null;
     if (this.maximized && !keepMaximized) this.exitMaximize(); // a layout change exits fullscreen
-    const pane = new Pane(events);
     const leaf: LeafNode = { kind: "leaf", pane, parent: null };
     this.leaves.set(pane, leaf);
 
     const target = relativeTo ?? this.active;
     const wasEmpty = !this.root || !target;
 
-    // A background (orchestrator-driven) spawn opens the pane without stealing
-    // focus/active from where the human is typing (#117) — but an empty grid
-    // still focuses, or the app would be left with no active terminal.
-    const takeFocus = shouldFocusNewPane(!opts.background, wasEmpty);
+    // A background spawn opens the pane without stealing focus/active from where
+    // the human is typing (#117) — but an empty grid still focuses, or the app
+    // would be left with no active terminal.
+    const takeFocus = shouldFocusNewPane(!background, wasEmpty);
 
     if (wasEmpty) {
       this.root = leaf;
@@ -226,17 +250,15 @@ export class Grid {
     if (takeFocus) this.setActive(pane);
     // Hand focus back synchronously, in the same tick as the relayout — JS is
     // single-threaded, so no keystroke can interleave between the blur and this
-    // restore; typing continues uninterrupted, mid-word. (A keystroke can only
-    // be lost if it lands during the synchronous relayout itself, which cannot
-    // happen.) Do this before awaiting pane.start so the async PTY spawn never
-    // runs with focus parked on <body>.
+    // restore; typing continues uninterrupted, mid-word. Do this before the
+    // caller awaits pane.start so the async PTY spawn never runs with focus
+    // parked on <body>.
     else restoreFocus(prior, takeFocus);
     // A pane opened into a hidden tab (a background orchestrator spawn) must not
     // hold a WebGL context the tab isn't showing — drop it now, matching the
     // rest of the hidden tab (#63 GL policy). Reloaded when the tab is shown.
     if (this.hidden) pane.setHidden(true);
-    await pane.start(opts, takeFocus);
-    return pane;
+    return takeFocus;
   }
 
   private insertBeside(at: LeafNode, leaf: LeafNode, dir: Dir, before = false): void {
