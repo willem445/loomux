@@ -33,7 +33,7 @@ Both are **off by default**, both survive an app restart, and both are
 **mutually exclusive** — one is for when you've stepped away, the other for when
 you're at the keyboard.
 
-Two of the guarantees below are **structurally enforced by loomux** — an agent
+Three of the guarantees below are **structurally enforced by loomux** — an agent
 that violates them is *blocked*, regardless of what it's instructed to do:
 
 - the **merge / release gate** (a default-branch merge or a release/tag publish is
