@@ -31,8 +31,24 @@ Two opt-in modes change that, at opposite ends of the "am I here?" spectrum:
 
 Both are **off by default**, both survive an app restart, and both are
 **mutually exclusive** — one is for when you've stepped away, the other for when
-you're at the keyboard. Everything below is enforced by loomux, not just asked of
-the model.
+you're at the keyboard.
+
+Two of the guarantees below are **structurally enforced by loomux** — an agent
+that violates them is *blocked*, regardless of what it's instructed to do:
+
+- the **merge / release gate** (a default-branch merge or a release/tag publish is
+  refused unless a toggle or grant authorizes it);
+- the **autonomous ↔ dangerous mutual exclusion** and the toggle dependencies (the
+  backend rejects an invalid combination);
+- the **token-budget money-stop** (crossing the cap suspends autonomous mode
+  unconditionally).
+
+Other behaviors on this page are **policy the orchestrator is *instructed* to
+follow**, not a hard wall — they're delivered to it as prompt text, so they hold
+as long as the orchestrator obeys its instructions, not as a boundary loomux
+enforces. Each is flagged where it appears (the labeled-work-only intake, and the
+"adequately tested" bar the orchestrator applies before self-merging). Treat those
+as convention, the enforced items as guarantees.
 
 ## Where the controls live
 
@@ -67,10 +83,14 @@ PRs) simply never runs. Autonomous mode adds the missing **tick source**.
   gets exactly **one** `[loomux] idle tick` notice telling it to run its cadence
   and **start** labeled work. An orchestrator that's actually working (a real burst
   of output) resets the clock, so a busy group never gets nagged.
-- **Labeled work only.** An autonomous wake pulls **labeled** issues
-  (`agent-ready` / `agent-investigation`) — exactly the
-  [label handshake](orchestration.html#the-label-handshake) you already control. It
-  never triages unlabeled issues on its own; the label stays your consent boundary.
+- **Labeled work only** *(policy, not enforced).* The idle-tick notice tells the
+  orchestrator to start **labeled** issues (`agent-ready` / `agent-investigation`) —
+  exactly the [label handshake](orchestration.html#the-label-handshake) you already
+  control — and the orchestrator's instructions keep it to those. This is a
+  convention the orchestrator is *instructed* to follow, not a gate loomux enforces:
+  the label funnel is your consent boundary as long as the orchestrator obeys it,
+  but nothing structurally blocks an unlabeled issue the way the merge gate blocks a
+  merge. (Merging/publishing what it produces is still gated regardless.)
 - **The window is tunable.** The default idle-tick window is **5 minutes**
   (adjustable per group, down to a minute or two if you want to watch it fire
   sooner). The autonomy panel shows a live countdown to the next eligible tick, and
@@ -123,10 +143,15 @@ these holds:
 | **Supervised** | dangerous mode on **and** *not* autonomous | dangerous mode on **and** *not* autonomous |
 | **Per-item grant** | a valid grant for *that PR* | a valid grant for *that tag* |
 
-Otherwise the action is **blocked** and the agent is told to report to you. A merge
-onto a **non-default** branch (the integration-branch flow agents use) passes
-through untouched; only the default branch and `v*` tags are gated. An
-undeterminable base **fails safe** (blocked).
+Otherwise the action is **blocked** and the agent is told to report to you. What's
+gated is: a merge onto the **default branch**; a `gh release create/edit/delete`
+for **any** tag; and a `git push` that publishes a tag — an explicit `refs/tags/…`
+or `git push … tag <name>` ref for **any** tag name, plus a bare tag-name push that
+matches the release trigger pattern (`v*`, kept in sync with the release workflow)
+and is confirmed a real tag. A merge onto a **non-default** branch (the
+integration-branch flow agents use), a plain branch push, and read-only
+`gh release view/list/download` all pass through untouched. An undeterminable merge
+base **fails safe** (blocked).
 
 > The shim is the cheap, always-on first layer — it raises an unattended bad merge
 > from "type one command" to "deliberately evade a named control." A determined
@@ -147,10 +172,14 @@ Unchecking **Require human approval before merge** grants merge authority — bu
 - Turning autonomous **off** — or a budget suspension — **force-disables**
   auto-merge automatically.
 
-When enabled, the orchestrator may merge an **adequately-tested** PR
-(reviewer-approved **+** green CI **+** acceptance met) itself, auditing and
-announcing each merge, and still holds anything risky or ambiguous for you.
-Default: **off** (approval required).
+When enabled, the orchestrator is *instructed* to merge only an **adequately-tested**
+PR (reviewer-approved **+** green CI **+** acceptance met), audit and announce each
+merge, and hold anything risky or ambiguous for you. That "adequately tested" bar is
+**policy in the orchestrator's prompt, not something the gate checks** — once
+auto-merge is on, the gate itself allows *any* default-branch merge and inspects no
+CI or review state. So auto-merge is a delegation of judgment to the orchestrator,
+not a guarantee that a red-CI PR will be refused; leave approval required if you want
+that guarantee. Default: **off** (approval required).
 
 ### Auto-release (while autonomous)
 
@@ -222,7 +251,7 @@ distinctly:
 | `merge-gate-allowed` / `release-gate-allowed` | the autonomous blanket toggle |
 | `merge-gate-granted` / `release-gate-granted` | a one-time human grant |
 | `merge-gate-dangerous` / `release-gate-dangerous` | supervised dangerous mode |
-| *refusal (non-zero exit)* | blocked — logged with the reason |
+| `merge-gate-blocked` / `release-gate-blocked` | refused — logged with the reason (agent exits non-zero) |
 
 So the trail always says *which* gate let something through, or why it was stopped.
 Open it in the [audit viewer](orchestration.html#steering-attention-and-audit)
@@ -235,7 +264,7 @@ row.
 | --- | --- | --- | --- |
 | **Autonomous mode** | off | you're away | the idle tick that starts labeled work |
 | **Token budget** | no cap | autonomous | hard-stops autonomous-era spend, then suspends |
-| **Auto-merge** | off (approval required) | autonomous | orchestrator self-merges adequately-tested PRs |
+| **Auto-merge** | off (approval required) | autonomous | orchestrator may self-merge default-branch PRs (instructed to require adequate testing) |
 | **Auto-release** | off | autonomous | orchestrator publishes releases/tags |
 | **Dangerous mode** | off | supervised (*not* autonomous) | manual merges/releases without per-item approval |
 | **Per-item grant** | — | any time | one merge or one release, single-use, 30-min TTL |
@@ -244,5 +273,5 @@ row.
 
 - `gh` CLI authenticated (the gate resolves PR base branches and repo defaults
   through it).
-- A group with a repository — the gate only applies to default-branch merges and
-  `v*` release tags.
+- A group with a repository — the gate applies to default-branch merges, `gh
+  release` commands, and tag pushes.
