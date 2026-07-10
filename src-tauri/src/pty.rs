@@ -136,6 +136,13 @@ pub struct PtyHandle {
     /// a human's half-written line without wedging on an already-submitted one —
     /// output-byte heuristics can't tell a keystroke's echo from a submit burst.
     input_pending: Arc<std::sync::atomic::AtomicBool>,
+    /// The interactive shell this pane *effectively* spawned (#194 P2) — after
+    /// any discovery-miss fallback, not the requested kind. Recorded so the
+    /// folder-picker `cd` (`change_dir`) emits the pane's own shell syntax — cmd,
+    /// PowerShell, or Git Bash — instead of guessing from the machine default
+    /// (rev-78 #3, nit 3). Agent/custom panes record PowerShell (or its cmd
+    /// degrade); they don't drive the folder picker.
+    shell_kind: ShellKind,
 }
 
 /// Ring of recent output plus a monotonic byte counter. The counter lets
@@ -246,6 +253,31 @@ if ($PWD.Provider.Name -eq 'FileSystem') { \
 [Console]::Write([char]27+']7;'+$PWD.ProviderPath+[char]7) }; \
 & $global:__loomuxInner }";
 
+/// The interactive shell a Terminal pane asks for (#194 P2). The wire value is
+/// the lowercase string the frontend's `ShellKind` sends; an unknown or absent
+/// value resolves to PowerShell **explicitly** (see `parse`) — never silently —
+/// so a Terminal pane always gets a working shell and a bad caller is visible.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ShellKind {
+    PowerShell,
+    Cmd,
+    GitBash,
+}
+
+impl ShellKind {
+    /// Map the frontend's wire string to a kind. Anything unrecognized —
+    /// including `None` (no `shell_kind` passed) — falls back to PowerShell, the
+    /// universal Windows default. On the fallback the caller breadcrumbs, so the
+    /// mismatch shows up instead of quietly spawning the wrong shell.
+    pub fn parse(raw: Option<&str>) -> Self {
+        match raw.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+            Some("cmd") => ShellKind::Cmd,
+            Some("gitbash") => ShellKind::GitBash,
+            _ => ShellKind::PowerShell,
+        }
+    }
+}
+
 /// Pick the user's default interactive shell.
 fn default_shell() -> String {
     #[cfg(target_os = "windows")]
@@ -268,6 +300,236 @@ fn default_shell() -> String {
 fn which(name: &str) -> bool {
     let path = std::env::var_os("PATH").unwrap_or_default();
     std::env::split_paths(&path).any(|dir| dir.join(name).is_file())
+}
+
+/// Resolve a program name to its first PATH hit — a discovery cousin of `which`
+/// that returns the path rather than a bool.
+#[cfg(target_os = "windows")]
+fn which_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|p| p.is_file())
+}
+
+/// Candidate `bash.exe` paths for a Git for Windows install, in preference
+/// order: the standard Program Files roots, then a per-user install under
+/// LOCALAPPDATA. `bin\bash.exe` is the launcher wrapper the Git Bash shortcut
+/// runs (it sets up the MSYS environment), so we prefer it over `usr\bin`.
+/// Env-driven so a relocated Program Files still resolves. Pure (only builds
+/// paths, touches no filesystem) so the layout logic is unit-testable.
+#[cfg(target_os = "windows")]
+fn git_bash_candidates() -> Vec<PathBuf> {
+    let program_roots: Vec<PathBuf> = ["ProgramW6432", "ProgramFiles", "ProgramFiles(x86)"]
+        .iter()
+        .filter_map(|var| std::env::var_os(var).map(PathBuf::from))
+        .collect();
+    let local = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+    git_bash_candidates_from(&program_roots, local.as_deref())
+}
+
+/// Pure core of `git_bash_candidates`: given the Program Files roots (in
+/// preference order) and the optional LOCALAPPDATA dir, produce the ordered
+/// `bin\bash.exe` candidates. Split out so the precedence is unit-testable
+/// against fixed inputs, independent of the machine's environment (rev-78 #5).
+#[cfg(target_os = "windows")]
+fn git_bash_candidates_from(program_roots: &[PathBuf], localappdata: Option<&Path>) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = program_roots.iter().map(|r| r.join("Git")).collect();
+    if let Some(local) = localappdata {
+        roots.push(local.join("Programs").join("Git"));
+    }
+    roots
+        .into_iter()
+        .map(|r| r.join("bin").join("bash.exe"))
+        .collect()
+}
+
+/// Whether a discovered `bash.exe` is a Windows system shell (WSL's launcher),
+/// not Git Bash. WSL ships `%SystemRoot%\System32\bash.exe`, which is on PATH on
+/// every machine with the feature enabled and would spawn a Linux distro in the
+/// pane — never Git for Windows. Pure (path + the provided system root) so the
+/// exclusion is unit-testable (rev-78 #2). Case-insensitive to tolerate a
+/// relocated / differently-cased Windows install.
+#[cfg(target_os = "windows")]
+fn is_system_bash(path: &Path, system_root: Option<&Path>) -> bool {
+    // Normalize `/`→`\` before comparing so a forward-slash PATH entry
+    // (`C:/Windows/System32/bash.exe`) can't evade the check (rev-78 nit 2).
+    let norm = path.to_string_lossy().replace('/', "\\").to_ascii_lowercase();
+    if let Some(root) = system_root {
+        let root = root.to_string_lossy().replace('/', "\\").to_ascii_lowercase();
+        let root = root.trim_end_matches('\\');
+        if !root.is_empty() {
+            // Match at a component boundary (`<root>\…`) so `C:\WindowsFoo\…`
+            // isn't caught by a `C:\Windows` prefix.
+            if norm.starts_with(&format!("{root}\\")) {
+                return true;
+            }
+        }
+    }
+    // Fallback when SystemRoot is unreadable: the WSL launcher lives in
+    // ...\System32\bash.exe, a location Git for Windows never occupies.
+    norm.contains("\\system32\\")
+}
+
+/// Derive `bash.exe` from a discovered `git.exe`. Git for Windows lays out
+/// `<root>\cmd\git.exe` (what lands on PATH) and `<root>\bin\git.exe`; bash lives
+/// at `<root>\bin\bash.exe` in both cases. Pure path arithmetic (no filesystem)
+/// so it is unit-testable against fixed inputs.
+#[cfg(target_os = "windows")]
+fn git_exe_to_bash(git_exe: &Path) -> Option<PathBuf> {
+    let root = git_exe.parent()?.parent()?;
+    Some(root.join("bin").join("bash.exe"))
+}
+
+/// Locate `bash.exe` for the Git Bash shell kind: the standard install roots
+/// first, then PATH (a direct `bash.exe`, or one derived from `git.exe`, which
+/// is on PATH far more often). `None` means Git for Windows isn't installed —
+/// the frontend disables the Git Bash option with that reason, and the spawn
+/// path falls back to PowerShell rather than crashing the pane (#194 P2).
+#[cfg(target_os = "windows")]
+fn find_git_bash() -> Option<PathBuf> {
+    // 1. Standard Git-for-Windows install roots — the most reliable signal.
+    for cand in git_bash_candidates() {
+        if cand.is_file() {
+            return Some(cand);
+        }
+    }
+    // 2. Derive from git.exe on PATH BEFORE trusting a bare bash.exe: git.exe is
+    //    almost always the Git-for-Windows one (scoop/winget portable installs
+    //    put only `…\cmd\git.exe` on PATH), whereas a bare `bash.exe` PATH hit is
+    //    frequently WSL's System32 launcher (rev-78 #2).
+    if let Some(git) = which_path("git.exe") {
+        if let Some(bash) = git_exe_to_bash(&git) {
+            if bash.is_file() {
+                return Some(bash);
+            }
+        }
+    }
+    // 3. Last resort: a bare bash.exe on PATH, excluding WSL's System32 launcher
+    //    (picking it would spawn a Linux distro in the pane, with our
+    //    `--login -i` args and PROMPT_COMMAND never reaching the Linux shell).
+    let system_root = std::env::var_os("SystemRoot").map(PathBuf::from);
+    if let Some(bash) = which_path("bash.exe") {
+        if !is_system_bash(&bash, system_root.as_deref()) {
+            return Some(bash);
+        }
+    }
+    None
+}
+
+/// `cmd.exe` interactive shell (`/K` keeps it open). The PROMPT string emits an
+/// OSC 7 sequence (`$E]7;…$E\`) before the visible `path>` so the pane's
+/// dir/branch chip tracks `cd`s — cmd has no prompt-hook mechanism, so its
+/// PROMPT is the only place to wire cwd reporting.
+#[cfg(target_os = "windows")]
+fn cmd_shell_command() -> CommandBuilder {
+    let mut cmd = CommandBuilder::new("cmd.exe");
+    cmd.args(["/K", "prompt $E]7;$P$E\\$P$G"]);
+    cmd
+}
+
+/// PowerShell interactive shell (pwsh 7, else Windows PowerShell) with the OSC 7
+/// prompt hook. Degrades to `cmd.exe` only when neither PowerShell is present —
+/// `default_shell` already encodes that preference order, so this is also the
+/// explicit fallback target for an unknown/absent or uninstalled shell kind.
+#[cfg(target_os = "windows")]
+fn powershell_shell_command() -> CommandBuilder {
+    let shell = default_shell();
+    if shell.contains("cmd.exe") {
+        return cmd_shell_command();
+    }
+    let mut cmd = CommandBuilder::new(&shell);
+    cmd.args(["-NoLogo", "-NoExit", "-Command", PWSH_CWD_HOOK]);
+    cmd
+}
+
+/// Git Bash interactive shell. Launched as a login+interactive shell
+/// (`--login -i`), exactly like the Git Bash shortcut, so the MSYS environment
+/// (coreutils on PATH, the MSYS home dir) is set up. OSC 7 cwd reporting is
+/// wired via PROMPT_COMMAND — but the payload is run through `cygpath -m` so it
+/// emits a Windows-form path (`C:/Projects/x`), NOT MSYS `$PWD` (`/c/...`):
+/// `dir_info`, the branch chip, and the git-change watcher are all Windows-path
+/// consumers, and a raw MSYS path resolves to nothing (rev-78 #1). `cygpath`
+/// ships in every Git-for-Windows `/usr/bin`, on PATH under `--login`; the
+/// `2>/dev/null || printf %s` guard keeps a stray shell (no cygpath) from
+/// printing a per-prompt error and degrades to the raw `$PWD` (rev-78 nit 1).
+#[cfg(target_os = "windows")]
+fn git_bash_shell_command(bash: &Path) -> CommandBuilder {
+    let mut cmd = CommandBuilder::new(bash.as_os_str());
+    cmd.args(["--login", "-i"]);
+    cmd.env(
+        "PROMPT_COMMAND",
+        "printf '\\033]7;%s\\007' \"$(cygpath -m \"$PWD\" 2>/dev/null || printf %s \"$PWD\")\"",
+    );
+    cmd
+}
+
+/// Build the interactive (no-command) shell for a Terminal pane's chosen kind
+/// (#194 P2). A Git Bash discovery miss falls back to PowerShell, breadcrumbed
+/// so it isn't silent (the frontend also disables an uninstalled Git Bash, so
+/// this only fires for a non-UI caller or an install/uninstall race).
+#[cfg(target_os = "windows")]
+fn interactive_shell_command(kind: ShellKind) -> CommandBuilder {
+    match kind {
+        ShellKind::PowerShell => powershell_shell_command(),
+        ShellKind::Cmd => cmd_shell_command(),
+        ShellKind::GitBash => match find_git_bash() {
+            Some(bash) => git_bash_shell_command(&bash),
+            None => {
+                crate::obs::breadcrumb("shell-kind-fallback", "gitbash-not-installed->powershell");
+                powershell_shell_command()
+            }
+        },
+    }
+}
+
+/// POSIX interactive shell. `shell_kind` is a Windows concept (PowerShell / cmd /
+/// Git Bash); off Windows the pane always gets the user's login shell with OSC 7
+/// wired via PROMPT_COMMAND.
+#[cfg(not(target_os = "windows"))]
+fn interactive_shell_command(_kind: ShellKind) -> CommandBuilder {
+    let shell = default_shell();
+    let mut cmd = CommandBuilder::new(&shell);
+    cmd.arg("-l");
+    cmd.env("PROMPT_COMMAND", "printf '\\033]7;%s\\007' \"$PWD\"");
+    cmd
+}
+
+/// The shell kind a pane will *actually* run, resolving the same fallbacks
+/// `interactive_shell_command` applies: a Git Bash discovery miss becomes
+/// PowerShell, and PowerShell with no pwsh installed becomes cmd. Recorded on
+/// the handle (not the *requested* kind) so `change_dir` emits the truthful
+/// shell's `cd` syntax even in the probe→spawn discovery-miss race (rev-78 nit 3).
+#[cfg(target_os = "windows")]
+fn effective_shell_kind(requested: ShellKind) -> ShellKind {
+    match requested {
+        ShellKind::GitBash if find_git_bash().is_none() => {
+            effective_shell_kind(ShellKind::PowerShell)
+        }
+        ShellKind::PowerShell if default_shell().contains("cmd.exe") => ShellKind::Cmd,
+        other => other,
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn effective_shell_kind(requested: ShellKind) -> ShellKind {
+    requested
+}
+
+/// Discover the Git Bash `bash.exe` path so the welcome screen can enable (or
+/// disable, with a reason) the Git Bash shell kind before a pane is spawned
+/// (#194 P2). `None` = Git for Windows isn't installed. Always `None` off
+/// Windows, where Git Bash isn't a concept.
+#[tauri::command]
+pub fn discover_git_bash() -> Option<String> {
+    #[cfg(target_os = "windows")]
+    {
+        find_git_bash().map(|p| p.to_string_lossy().into_owned())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        None
+    }
 }
 
 /// Whether the direct-CLI spawn path (issue #78) is disabled by the escape
@@ -420,46 +682,34 @@ fn apply_extra_env(mut cmd: CommandBuilder, env: &[(String, String)]) -> Command
 /// Build the shell-wrapper child command — the pre-#78 path and the universal
 /// fallback. The `command` string is run *through* the default shell so PATH
 /// shims resolve the same way they do in a normal terminal; a plain interactive
-/// shell (no command) also gets cwd-reporting (OSC 7) shell integration wired in.
-fn build_shell_command(command: Option<&str>, cwd: Option<&str>) -> CommandBuilder {
-    let shell = default_shell();
-    let mut cmd = CommandBuilder::new(&shell);
-
-    match command {
-        Some(line) if !line.trim().is_empty() => {
-            #[cfg(target_os = "windows")]
-            {
-                if shell.contains("cmd.exe") {
-                    cmd.args(["/C", line]);
-                } else {
-                    cmd.args(["-NoLogo", "-Command", line]);
-                }
-            }
-            #[cfg(not(target_os = "windows"))]
-            {
-                cmd.args(["-lc", line]);
-            }
-        }
-        _ => {
-            #[cfg(target_os = "windows")]
-            {
-                if shell.contains("cmd.exe") {
-                    // cmd's PROMPT understands $E (ESC), $P (path), $G (>).
-                    cmd.args(["/K", "prompt $E]7;$P$E\\$P$G"]);
-                } else {
-                    cmd.args(["-NoLogo", "-NoExit", "-Command", PWSH_CWD_HOOK]);
-                }
-            }
-            #[cfg(not(target_os = "windows"))]
-            {
-                cmd.arg("-l");
-                // bash emits OSC 7 before each prompt. (zsh ignores this.)
-                cmd.env("PROMPT_COMMAND", "printf '\\033]7;%s\\007' \"$PWD\"");
+/// shell (no command) instead spawns the requested `shell_kind` (#194 P2) with
+/// cwd-reporting (OSC 7) shell integration wired in.
+fn build_shell_command(
+    command: Option<&str>,
+    cwd: Option<&str>,
+    shell_kind: ShellKind,
+) -> CommandBuilder {
+    // A command (agent / custom pane) always runs through the default shell —
+    // `shell_kind` only selects the *interactive* Terminal shell.
+    if let Some(line) = command.filter(|l| !l.trim().is_empty()) {
+        let shell = default_shell();
+        let mut cmd = CommandBuilder::new(&shell);
+        #[cfg(target_os = "windows")]
+        {
+            if shell.contains("cmd.exe") {
+                cmd.args(["/C", line]);
+            } else {
+                cmd.args(["-NoLogo", "-Command", line]);
             }
         }
+        #[cfg(not(target_os = "windows"))]
+        {
+            cmd.args(["-lc", line]);
+        }
+        return apply_pane_env(cmd, cwd);
     }
 
-    apply_pane_env(cmd, cwd)
+    apply_pane_env(interactive_shell_command(shell_kind), cwd)
 }
 
 /// Build the child command for a pane — the direct-CLI executable when `argv`
@@ -476,7 +726,8 @@ fn build_command(
     if let Some(direct) = argv.as_deref().and_then(try_direct_command) {
         return apply_pane_env(direct, cwd.as_deref());
     }
-    build_shell_command(command.as_deref(), cwd.as_deref())
+    // Agent/custom panes ignore shell_kind; default to PowerShell here.
+    build_shell_command(command.as_deref(), cwd.as_deref(), ShellKind::PowerShell)
 }
 
 /// Spawn the pane's child on `slave`, applying the direct-CLI-spawn path with a
@@ -496,6 +747,7 @@ pub fn spawn_pane_child(
     argv: Option<&[String]>,
     cwd: Option<&str>,
     env: &[(String, String)],
+    shell_kind: ShellKind,
 ) -> Result<(Box<dyn portable_pty::Child + Send + Sync>, bool), String> {
     if let Some(direct) = argv.and_then(try_direct_command) {
         let direct = apply_extra_env(apply_pane_env(direct, cwd), env);
@@ -509,7 +761,7 @@ pub fn spawn_pane_child(
             }
         }
     }
-    let shell = apply_extra_env(build_shell_command(command, cwd), env);
+    let shell = apply_extra_env(build_shell_command(command, cwd, shell_kind), env);
     slave
         .spawn_command(shell)
         .map(|c| (c, false))
@@ -532,6 +784,10 @@ pub fn spawn_pty(
     // pass the gh-shim PATH prefix + LOOMUX_GROUP_DIR here to enforce the merge
     // gate; a plain human shell passes nothing and is unchanged.
     env: Option<Vec<(String, String)>>,
+    // Which interactive shell a Terminal pane wants: "powershell" | "cmd" |
+    // "gitbash" (#194 P2). Only consulted for a plain interactive shell (no
+    // `command`); unknown/absent falls back to PowerShell explicitly.
+    shell_kind: Option<String>,
 ) -> Result<u32, String> {
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -544,13 +800,25 @@ pub fn spawn_pty(
         .map_err(|e| e.to_string())?;
 
     // Direct-spawn the agent exe when argv resolves to a native image, with a
-    // full retry through the shell wrapper on any failure (issue #78).
+    // full retry through the shell wrapper on any failure (issue #78). A plain
+    // Terminal pane (no argv/command) spawns the requested shell kind (#194 P2).
+    let kind = ShellKind::parse(shell_kind.as_deref());
+    // A non-empty wire value we don't recognize silently maps to PowerShell in
+    // `parse`; breadcrumb it so the "explicit, not silent" fallback holds. `None`
+    // stays silent — it's every agent/custom pane's normal path (rev-78 #4).
+    if let Some(raw) = shell_kind.as_deref() {
+        let norm = raw.trim().to_ascii_lowercase();
+        if !norm.is_empty() && !matches!(norm.as_str(), "powershell" | "cmd" | "gitbash") {
+            crate::obs::breadcrumb("shell-kind-fallback", &format!("unknown={raw}->powershell"));
+        }
+    }
     let (mut child, _direct) = spawn_pane_child(
         &*pair.slave,
         command.as_deref(),
         argv.as_deref(),
         cwd.as_deref(),
         env.as_deref().unwrap_or(&[]),
+        kind,
     )?;
     drop(pair.slave);
 
@@ -589,6 +857,9 @@ pub fn spawn_pty(
             #[cfg(target_os = "windows")]
             _job: job,
             input_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            // Record what actually spawned, not what was requested, so the
+            // folder-picker cd is truthful even after a discovery-miss fallback.
+            shell_kind: effective_shell_kind(kind),
         },
     );
 
@@ -757,31 +1028,43 @@ pub fn dir_info(path: String) -> DirInfo {
 }
 
 /// Send a `cd` into a pane's shell, so the folder picker can drive it. The
-/// command is formatted for the platform's default shell.
+/// command is formatted for the pane's *own* shell kind (#194 P2), not the
+/// machine default — a cmd or Git Bash pane must not receive PowerShell syntax.
 #[tauri::command]
 pub fn change_dir(state: State<PtyManager>, id: u32, path: String) -> Result<(), String> {
-    let line = cd_command_line(&path);
     let mut ptys = state.ptys.lock_safe();
     let pty = ptys.get_mut(&id).ok_or("pty not found")?;
+    let line = cd_command_line(&path, pty.shell_kind);
     pty.writer
         .write_all(line.as_bytes())
         .map_err(|e| e.to_string())
 }
 
-/// Build a shell-appropriate `cd` command line (Enter-terminated) that
-/// tolerates spaces and quotes in `path`.
-fn cd_command_line(path: &str) -> String {
+/// Build a shell-appropriate `cd` command line (Enter-terminated) for the pane's
+/// shell `kind`, tolerating spaces and quotes in `path` (rev-78 #3).
+fn cd_command_line(path: &str, kind: ShellKind) -> String {
     #[cfg(target_os = "windows")]
     {
-        if default_shell().contains("cmd.exe") {
-            format!("cd /d \"{path}\"\r")
-        } else {
-            // PowerShell: single-quote and double any embedded quotes.
-            format!("Set-Location -LiteralPath '{}'\r", path.replace('\'', "''"))
+        match kind {
+            ShellKind::Cmd => format!("cd /d \"{path}\"\r"),
+            // Git Bash: MSYS `cd` accepts a Windows path; POSIX single-quote it
+            // (' -> '\'') so spaces/quotes survive.
+            ShellKind::GitBash => format!("cd '{}'\r", path.replace('\'', "'\\''")),
+            ShellKind::PowerShell => {
+                // A PowerShell pane with no pwsh installed degrades to cmd
+                // (`powershell_shell_command`), so mirror that here.
+                if default_shell().contains("cmd.exe") {
+                    format!("cd /d \"{path}\"\r")
+                } else {
+                    // PowerShell: single-quote and double any embedded quotes.
+                    format!("Set-Location -LiteralPath '{}'\r", path.replace('\'', "''"))
+                }
+            }
         }
     }
     #[cfg(not(target_os = "windows"))]
     {
+        let _ = kind;
         // POSIX single-quote escaping: ' -> '\''
         format!("cd '{}'\r", path.replace('\'', "'\\''"))
     }
@@ -966,6 +1249,163 @@ mod tests {
             assert!(!direct_spawn_disabled(), "{off:?} must leave direct spawn on");
         }
         std::env::remove_var("LOOMUX_NO_DIRECT_SPAWN");
+    }
+
+    #[test]
+    fn shell_kind_parse_maps_wire_values_with_powershell_fallback() {
+        assert_eq!(ShellKind::parse(Some("cmd")), ShellKind::Cmd);
+        assert_eq!(ShellKind::parse(Some("gitbash")), ShellKind::GitBash);
+        assert_eq!(ShellKind::parse(Some("powershell")), ShellKind::PowerShell);
+        // Case/whitespace tolerant.
+        assert_eq!(ShellKind::parse(Some(" CMD ")), ShellKind::Cmd);
+        assert_eq!(ShellKind::parse(Some("GitBash")), ShellKind::GitBash);
+        // Unknown and absent both fall back to PowerShell — explicit, never a
+        // silent wrong shell (#194 P2).
+        assert_eq!(ShellKind::parse(Some("fish")), ShellKind::PowerShell);
+        assert_eq!(ShellKind::parse(Some("")), ShellKind::PowerShell);
+        assert_eq!(ShellKind::parse(None), ShellKind::PowerShell);
+    }
+
+    /// Every argv token of a `CommandBuilder`, joined, for substring assertions.
+    #[cfg(windows)]
+    fn argv_joined(cmd: &CommandBuilder) -> String {
+        cmd.get_argv()
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cmd_kind_spawns_cmd_with_osc7_prompt() {
+        // No command → interactive shell for the chosen kind. cmd must be cmd.exe
+        // held open with /K and an OSC 7 (`]7;`) PROMPT so the dir chip tracks cd.
+        let cmd = build_shell_command(None, None, ShellKind::Cmd);
+        assert!(prog(&cmd).to_ascii_lowercase().contains("cmd.exe"));
+        let av = argv_joined(&cmd);
+        assert!(av.contains("/K"), "cmd must stay open with /K, got {av:?}");
+        assert!(av.contains("]7;"), "cmd prompt must emit OSC 7, got {av:?}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn git_bash_kind_launches_login_interactive_bash() {
+        // The command builder is pure w.r.t. the resolved bash path, so exercise
+        // it directly with a fixture path (discovery is machine-dependent).
+        let bash = Path::new(r"C:\Program Files\Git\bin\bash.exe");
+        let cmd = git_bash_shell_command(bash);
+        assert_eq!(prog(&cmd), bash.to_string_lossy());
+        let av = argv_joined(&cmd);
+        assert!(av.contains("--login"), "git bash must login-source, got {av:?}");
+        assert!(av.contains("-i"), "git bash must be interactive, got {av:?}");
+        // OSC 7 must run $PWD through cygpath so a Windows-form path reaches the
+        // dir chip / git watch, not MSYS `/c/...` (rev-78 #1).
+        let prompt = cmd
+            .get_env("PROMPT_COMMAND")
+            .and_then(|v| v.to_str())
+            .unwrap_or_default();
+        assert!(prompt.contains("cygpath"), "OSC 7 must Windows-ify $PWD, got {prompt:?}");
+        assert!(prompt.contains("]7;"), "must emit an OSC 7 sequence, got {prompt:?}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn wsl_system32_bash_is_not_git_bash() {
+        // WSL's launcher lives under %SystemRoot%; it must never be taken for Git
+        // Bash — picking it would spawn a Linux distro in the pane (rev-78 #2).
+        let sysroot = Path::new(r"C:\Windows");
+        assert!(is_system_bash(
+            Path::new(r"C:\Windows\System32\bash.exe"),
+            Some(sysroot)
+        ));
+        // Case-insensitive on both the path and the root.
+        assert!(is_system_bash(
+            Path::new(r"c:\windows\system32\BASH.EXE"),
+            Some(sysroot)
+        ));
+        // A real Git-for-Windows bash is not excluded.
+        assert!(!is_system_bash(
+            Path::new(r"C:\Program Files\Git\bin\bash.exe"),
+            Some(sysroot)
+        ));
+        // Even with SystemRoot unreadable, a System32 bash is still rejected.
+        assert!(is_system_bash(Path::new(r"C:\Windows\System32\bash.exe"), None));
+        assert!(!is_system_bash(Path::new(r"C:\Program Files\Git\bin\bash.exe"), None));
+        // Separator normalization: a forward-slash PATH entry can't evade it
+        // (rev-78 nit 2).
+        assert!(is_system_bash(Path::new("C:/Windows/System32/bash.exe"), Some(sysroot)));
+        assert!(is_system_bash(Path::new("C:/Windows/System32/bash.exe"), None));
+        // Component-boundary match: a sibling like C:\WindowsFoo is NOT excluded
+        // by the C:\Windows prefix.
+        assert!(!is_system_bash(Path::new(r"C:\WindowsFoo\bin\bash.exe"), Some(sysroot)));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cd_command_line_matches_the_pane_shell_kind() {
+        // Each kind gets its own cd syntax (rev-78 #3): a cmd/Git Bash pane must
+        // never receive PowerShell's Set-Location.
+        let cmd = cd_command_line(r"C:\a b", ShellKind::Cmd);
+        assert_eq!(cmd, "cd /d \"C:\\a b\"\r");
+        let bash = cd_command_line(r"C:\a b", ShellKind::GitBash);
+        assert_eq!(bash, "cd 'C:\\a b'\r");
+        // POSIX quote escaping for Git Bash.
+        assert_eq!(cd_command_line("it's", ShellKind::GitBash), "cd 'it'\\''s'\r");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn git_exe_to_bash_maps_install_layout() {
+        // Git for Windows: cmd\git.exe (on PATH) and bin\git.exe both sit two
+        // levels under the root; bash is at bin\bash.exe.
+        let from_cmd = git_exe_to_bash(Path::new(r"C:\Program Files\Git\cmd\git.exe")).unwrap();
+        assert_eq!(from_cmd, PathBuf::from(r"C:\Program Files\Git\bin\bash.exe"));
+        let from_bin = git_exe_to_bash(Path::new(r"C:\Program Files\Git\bin\git.exe")).unwrap();
+        assert_eq!(from_bin, PathBuf::from(r"C:\Program Files\Git\bin\bash.exe"));
+        // A bare name with no parents can't be mapped.
+        assert!(git_exe_to_bash(Path::new("git.exe")).is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn git_bash_candidates_preserve_precedence_order() {
+        // Pure helper over fixed inputs so precedence is asserted exactly, not
+        // vacuously (rev-78 #5): Program Files roots first, in the given order,
+        // then the per-user LOCALAPPDATA install last.
+        let roots = vec![PathBuf::from(r"C:\PF64"), PathBuf::from(r"C:\PF32")];
+        let cands = git_bash_candidates_from(&roots, Some(Path::new(r"C:\Local")));
+        assert_eq!(
+            cands,
+            vec![
+                PathBuf::from(r"C:\PF64\Git\bin\bash.exe"),
+                PathBuf::from(r"C:\PF32\Git\bin\bash.exe"),
+                PathBuf::from(r"C:\Local\Programs\Git\bin\bash.exe"),
+            ]
+        );
+        // No LOCALAPPDATA → just the Program Files candidates, order preserved.
+        let no_local = git_bash_candidates_from(&roots, None);
+        assert_eq!(
+            no_local,
+            vec![
+                PathBuf::from(r"C:\PF64\Git\bin\bash.exe"),
+                PathBuf::from(r"C:\PF32\Git\bin\bash.exe"),
+            ]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn command_pane_ignores_shell_kind() {
+        // An agent/custom pane carries a command; shell_kind must not change that
+        // it runs through the default shell (the wire value only picks the
+        // interactive Terminal shell).
+        let wrapped = build_shell_command(Some("claude --x"), None, ShellKind::Cmd);
+        assert!(
+            wrapped.get_argv().iter().any(|a| a == "claude --x"),
+            "the command must be handed to the shell verbatim, got {:?}",
+            wrapped.get_argv()
+        );
     }
 
     #[test]

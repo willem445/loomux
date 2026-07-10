@@ -84,6 +84,10 @@ From here you can:
 
 - **Split** the pane into a matrix — `Ctrl+Shift+E` (right) or `Ctrl+Shift+O`
   (down). See [Core concepts](core-concepts.html) for the whole grid model.
+- **Pick a shell** on the **Terminal** kind of the welcome screen — PowerShell,
+  Command Prompt, or Git Bash. Git Bash is offered only when Git for Windows is
+  installed; otherwise it's shown disabled with that reason, and any pane still
+  falls back to PowerShell rather than failing to start.
 - **Name** a pane with `F2` so you can tell your agents apart.
 - **Restore a past agent session** with the session browser (`Ctrl+Shift+P`) —
   it scans your machine for resumable Claude Code and Copilot CLI sessions and
@@ -102,9 +106,10 @@ the CLIs you already have installed. The two first-class ones are:
 Make sure at least one is installed and on your `PATH`. Then, to open an agent
 in a pane:
 
-1. Turn on **✦ agents** mode (the toggle in the app chrome).
-2. Open a new pane via the launcher.
-3. Choose **Single pane**, pick the agent CLI and model, and launch.
+1. Open a new pane (`Ctrl+Shift+E`/`O` to split, `Ctrl+Shift+T` for a new tab).
+   Every pane starts on the **welcome / pane-setup screen**.
+2. Choose the **Agent** kind, pick the agent CLI and model, leave **Panes** at 1,
+   and click **Create**.
 
 The **Autopilot — pre-approve all tools** checkbox (on by default) launches the
 agent with tools pre-approved so it stops prompting you to approve each edit or
@@ -113,7 +118,7 @@ Copilot's `--allow-all-tools --allow-all-paths`. Uncheck it to launch in the
 CLI's normal interactive mode. Loomux never uses
 `--dangerously-skip-permissions`. Your last choice is remembered for next time.
 
-Want more than one agent? The launcher's **Multiple panes** mode spawns *N*
+Want more than one agent? Set **Panes** above 1 on the Agent kind to spawn *N*
 independent agent panes at once. And when you're ready to hand a whole queue of
 work to a fleet that manages itself, that's the
 [orchestration guide](orchestration.html).

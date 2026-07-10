@@ -1,17 +1,33 @@
-// "New agent pane" modal. Three modes:
-//   single       — one agent pane (original behavior)
-//   multi        — N identical agent panes; a worktree name fans out to
-//                  name-1 … name-N so every agent gets an isolated worktree
-//   orchestrator — an orchestrator pane + N idle workers with guardrails
+// The in-pane welcome / pane-setup surface (#194). Shown on a fresh start, a new
+// tab, and a pane split: the user picks what the pane becomes —
+//   Agent        — one or N coding-agent CLI panes (a worktree name fans out to
+//                  name-1 … name-N so every agent gets an isolated worktree)
+//   Orchestrator — an orchestrator pane + N idle workers with guardrails
 //                  (max live agents, pinned models, permission mode)
+//   Terminal     — a plain shell; the shell-kind picker spawns PowerShell, cmd,
+//                  or Git Bash (#194 P2). Git Bash is enabled only when a
+//                  Git-for-Windows install is discovered (else disabled, with a
+//                  reason surfaced on the option).
 //
-// The dialog owns worktree creation so a failure surfaces inline and the
-// user can fix the name and retry instead of losing their input.
+// This replaces the old modal launcher AND the global "agent mode" toggle: there
+// is no global mode anymore, every pane declares its kind here at creation. The
+// form is DOM; the kind-selection + validation core is the pure `panesetup.ts`
+// (unit-tested). The form owns worktree creation so a failure surfaces inline and
+// the user can fix the name and retry instead of losing their input.
 
 import { open } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
 import { gitWorktreeAdd } from "./git";
 import type { OrchestratorConfig } from "./orchestration";
+import type { PaneKind, PaneSetupInput, ShellKind, ShellKindAvailability } from "./panesetup";
+import {
+  planPaneSetup,
+  worktreeNameFor,
+  SubmitLatch,
+  shellKindOptions,
+  resolveShellKind,
+} from "./panesetup";
+import { discoverGitBash } from "./pty";
 import {
   AGENTS,
   addRecentRepo,
@@ -29,18 +45,21 @@ export interface AgentLaunchSpec {
   /** Repo, worktree, or plain folder; undefined = home directory. */
   cwd?: string;
   command: string;
+  /** Recorded resumable session id (#194 P4): minted here for a session-capable
+   *  CLI (Claude) and passed to the pane so its layout snapshot can `--resume`
+   *  the exact session on restore. Absent for best-effort CLIs / custom commands. */
+  sessionId?: string;
 }
 
-export type LaunchResult =
+/** What a submitted welcome form resolves to — the caller (main.ts) spawns the
+ *  chosen kind: a terminal converts the setup pane in place, agent panes fan out
+ *  from it, and an orchestrator opens its own project tab. */
+export type WelcomeResult =
+  | { kind: "terminal"; name: string; cwd?: string; shellKind: ShellKind }
   | { kind: "panes"; specs: AgentLaunchSpec[] }
   | { kind: "orchestrator"; config: OrchestratorConfig };
 
-type Mode = "single" | "multi" | "orchestrator";
-
-/** Agent CLIs the orchestration backend has adapters for, with the model
- *  suggestions each CLI accepts. Free text is allowed — the lists are
- *  datalist suggestions, and the backend sanitizes whatever arrives. */
-/** Orchestration roles the launcher configures a CLI + model for. Mirrors the
+/** Orchestration roles the setup form configures a CLI + model for. Mirrors the
  *  backend `Role` variants that can be spawned in a group (issue #4/#47). */
 type OrchRole = "orchestrator" | "worker" | "reviewer" | "planner";
 const ORCH_ROLES: { key: OrchRole; label: string }[] = [
@@ -183,23 +202,34 @@ class ModelPicker {
   }
 }
 
-export class AgentLauncher {
-  private overlay: HTMLElement;
-  private modeSel: HTMLSelectElement;
+export class WelcomeForm {
+  /** The form root — mounted INSIDE a setup-state pane (not an overlay). */
+  readonly el: HTMLElement;
+  /** Called once with the chosen result; the caller spawns the kind. */
+  onSubmit: ((result: WelcomeResult) => void) | null = null;
+
+  private kindSel: HTMLSelectElement;
   private agentSel: HTMLSelectElement;
   private agentField: HTMLElement;
   private customField: HTMLElement;
   private customInput: HTMLInputElement;
   private countField: HTMLElement;
   private countInput: HTMLInputElement;
+  private shellField: HTMLElement;
+  private shellSel: HTMLSelectElement;
+  /** Discovered shell-kind availability (#194 P2). Git Bash starts unavailable
+   *  and is enabled once backend discovery resolves; PowerShell/cmd are always
+   *  available on Windows. */
+  private shellAvail: ShellKindAvailability = { gitBashPath: null };
+  private repoField: HTMLElement;
   private repoInput: HTMLInputElement;
   private repoList: HTMLDataListElement;
   private worktreeField: HTMLElement;
   private worktreeInput: HTMLInputElement;
   private nameField: HTMLElement;
   private nameInput: HTMLInputElement;
-  // Autopilot toggle (single + multi modes): launch with the CLI's unattended
-  // "allow all" flags. Default ON, persisted (#101).
+  // Autopilot toggle (agent kind): launch with the CLI's unattended "allow all"
+  // flags. Default ON, persisted (#101).
   private autopilotField: HTMLElement;
   private autopilotInput: HTMLInputElement;
   // Orchestrator guardrails.
@@ -210,9 +240,9 @@ export class AgentLauncher {
   private spawnRateInput: HTMLInputElement;
   private watchdogInput: HTMLInputElement;
   private autonomyBudgetInput: HTMLInputElement;
-  /** Per-role CLI + model controls (issue #4, mixed agent types). Built once
-   *  in the constructor; the group's default CLI (the top Agent field) seeds
-   *  every role and can be overridden per role. */
+  /** Per-role CLI + model controls (issue #4, mixed agent types). Built once in
+   *  the constructor; the group's default CLI (the top Agent field) seeds every
+   *  role and can be overridden per role. */
   private roleControls: {
     key: OrchRole;
     cli: HTMLSelectElement;
@@ -227,28 +257,34 @@ export class AgentLauncher {
   private autopilotFlags = new Map<string, Promise<string>>();
 
   private errorEl: HTMLElement;
-  private launchBtn: HTMLButtonElement;
+  private submitBtn: HTMLButtonElement;
   /** True once the user hand-edits the pane name; stops auto-fill. */
   private nameDirty = false;
-  private busy = false;
-  private resolver: ((result: LaunchResult | null) => void) | null = null;
+  /** One-shot re-entrancy guard across submit's async gaps (rev-74 HIGH-1): a
+   *  double-click / Enter-repeat can't spawn a duplicate group or double-start a
+   *  pane. Released on a validation error (retry allowed), finished once the
+   *  result fires (the pane is being converted/retired). */
+  private latch = new SubmitLatch();
 
   constructor() {
-    this.overlay = document.createElement("div");
-    this.overlay.className = "launcher-overlay";
+    this.el = document.createElement("div");
+    this.el.className = "welcome-form";
 
     const dlg = document.createElement("div");
-    dlg.className = "agent-dialog";
+    dlg.className = "welcome-card";
 
     const title = document.createElement("h2");
-    title.textContent = "New agent pane";
+    title.textContent = "New pane";
+    const subtitle = document.createElement("p");
+    subtitle.className = "welcome-sub";
+    subtitle.textContent = "Pick what this pane becomes.";
 
-    this.modeSel = select([
-      ["single", "Single pane"],
-      ["multi", "Multiple panes"],
+    this.kindSel = select([
+      ["agent", "Agent — a coding-agent CLI"],
       ["orchestrator", "Orchestrator + workers"],
+      ["terminal", "Terminal — a shell"],
     ]);
-    this.modeSel.addEventListener("change", () => this.applyMode());
+    this.kindSel.addEventListener("change", () => this.applyKind());
 
     this.agentSel = document.createElement("select");
     this.agentSel.className = "dlg-select";
@@ -259,7 +295,7 @@ export class AgentLauncher {
       this.agentSel.appendChild(opt);
     }
     this.agentSel.addEventListener("change", () => {
-      this.customField.hidden = this.agentSel.value !== "custom" || this.mode === "orchestrator";
+      this.customField.hidden = this.agentSel.value !== "custom" || this.kind === "orchestrator";
       this.applyOrchCli();
       this.applyAutopilot();
       this.updateName();
@@ -276,15 +312,34 @@ export class AgentLauncher {
     this.customInput.addEventListener("input", () => this.updateAgentWarning());
     this.customField = field("Command", this.customInput);
 
-    this.countInput = numberInput(3, 2, 8);
-    this.countField = field("Panes", this.countInput, "each gets its own pane; worktrees are suffixed -1…-N");
+    this.countInput = numberInput(1, 1, 8);
+    this.countField = field(
+      "Panes",
+      this.countInput,
+      "1 for a single agent; more fans out, suffixing worktrees -1…-N"
+    );
+
+    // Terminal shell picker (#194 P2): PowerShell / Command Prompt / Git Bash.
+    // Git Bash is disabled until backend discovery finds a Git-for-Windows
+    // install (probeGitBash below); PowerShell and cmd are always available.
+    this.shellSel = select(shellKindOptions(this.shellAvail).map((o) => [o.key, o.label]));
+    this.shellSel.value = "powershell";
+    this.shellSel.addEventListener("change", () => this.updateName());
+    this.shellField = field("Shell", this.shellSel, "PowerShell, Command Prompt, or Git Bash");
+    this.applyShellAvailability();
+    // Discover Git Bash off the main path; enable its option when it resolves.
+    void this.probeGitBash();
 
     this.repoInput = document.createElement("input");
     this.repoInput.className = "dlg-input";
     this.repoInput.placeholder = "Repository or folder — empty for home";
     this.repoInput.spellcheck = false;
+    // The pane routes its initial (and keyboard-nav) focus here (Pane.focus →
+    // this marker) rather than the Kind select, so a welcome pane is ready for a
+    // path the moment it opens (rev-74 LOW-4/LOW-6).
+    this.repoInput.setAttribute("data-initial-focus", "");
     this.repoList = document.createElement("datalist");
-    this.repoList.id = "launcher-recent-repos";
+    this.repoList.id = "welcome-recent-repos";
     this.repoInput.setAttribute("list", this.repoList.id);
     this.repoInput.addEventListener("input", () => this.updateName());
     const browse = document.createElement("button");
@@ -295,6 +350,7 @@ export class AgentLauncher {
     const repoRow = document.createElement("div");
     repoRow.className = "dlg-row";
     repoRow.append(this.repoInput, browse, this.repoList);
+    this.repoField = field("Repository", repoRow);
 
     this.worktreeInput = document.createElement("input");
     this.worktreeInput.className = "dlg-input";
@@ -327,33 +383,33 @@ export class AgentLauncher {
     this.autopilotField.className = "dlg-field";
     this.autopilotField.appendChild(autopilotLabel);
 
-    // Orchestrator guardrails: enforced by the backend; the dialog only
-    // collects them. Models are pinned per role at group creation; the
-    // suggestion list follows the selected agent CLI.
+    // Orchestrator guardrails: enforced by the backend; the form only collects
+    // them. Models are pinned per role at group creation; the suggestion list
+    // follows the selected agent CLI.
     this.workersInput = numberInput(2, 0, 6);
     this.maxAgentsInput = numberInput(4, 1, 12);
     // Cost guardrails (0 = off): idle-worker auto-kill timeout and a
     // spawns-per-hour backstop against a runaway orchestrator.
     this.idleKillInput = numberInput(0, 0, 1440);
     this.spawnRateInput = numberInput(0, 0, 240);
-    // Recovery guardrail: nudge the orchestrator once when a working agent
-    // goes silent (no output, no report) for this long. Default on — it's a
+    // Recovery guardrail: nudge the orchestrator once when a working agent goes
+    // silent (no output, no report) for this long. Default on — it's a
     // non-destructive safety net, not a cost driver.
     this.watchdogInput = numberInput(10, 0, 1440);
     // Autonomous-era token budget (#83). Autonomous mode is off by default, so
-    // this only bites once the human turns it on from the group panel; setting
-    // a cap here just pre-loads it. 0 = no cap. Tokens (not dollars) — the
-    // reliable metric on subscription/Max accounts. Applied post-create via the
-    // setter (create_orchestration has no budget parameter).
+    // this only bites once the human turns it on from the group panel; setting a
+    // cap here just pre-loads it. 0 = no cap. Tokens (not dollars) — the reliable
+    // metric on subscription/Max accounts. Applied post-create via the setter
+    // (create_orchestration has no budget parameter).
     this.autonomyBudgetInput = document.createElement("input");
     this.autonomyBudgetInput.className = "dlg-input dlg-num";
     this.autonomyBudgetInput.type = "number";
     this.autonomyBudgetInput.min = "0";
     this.autonomyBudgetInput.step = "10000";
     this.autonomyBudgetInput.value = "0";
-    // Per-role CLI + model. Each role picks its own agent CLI (claude /
-    // copilot / …) and model; changing a role's CLI re-populates its model
-    // list from that CLI's suggestions (issue #4).
+    // Per-role CLI + model. Each role picks its own agent CLI (claude / copilot /
+    // …) and model; changing a role's CLI re-populates its model list from that
+    // CLI's suggestions (issue #4).
     this.roleControls = ORCH_ROLES.map(({ key }) => {
       const cli = select(ORCH_CLIS.map((c) => [c.id, c.id]));
       const model = new ModelPicker();
@@ -410,27 +466,24 @@ export class AgentLauncher {
     this.errorEl = document.createElement("div");
     this.errorEl.className = "dlg-error";
 
-    const cancel = document.createElement("button");
-    cancel.className = "dlg-btn";
-    cancel.type = "button";
-    cancel.textContent = "Cancel";
-    cancel.addEventListener("click", () => this.close(null));
-    this.launchBtn = document.createElement("button");
-    this.launchBtn.className = "dlg-btn primary";
-    this.launchBtn.type = "button";
-    this.launchBtn.textContent = "Launch";
-    this.launchBtn.addEventListener("click", () => void this.launch());
+    this.submitBtn = document.createElement("button");
+    this.submitBtn.className = "dlg-btn primary";
+    this.submitBtn.type = "button";
+    this.submitBtn.textContent = "Create";
+    this.submitBtn.addEventListener("click", () => void this.submit());
     const actions = document.createElement("div");
     actions.className = "dlg-actions";
-    actions.append(cancel, this.launchBtn);
+    actions.append(this.submitBtn);
 
     dlg.append(
       title,
-      field("Mode", this.modeSel),
+      subtitle,
+      field("Kind", this.kindSel),
       this.agentField,
       this.customField,
       this.countField,
-      field("Repository", repoRow),
+      this.shellField,
+      this.repoField,
       this.worktreeField,
       this.autopilotField,
       this.orchFields,
@@ -438,46 +491,19 @@ export class AgentLauncher {
       this.errorEl,
       actions
     );
-    this.overlay.appendChild(dlg);
+    this.el.appendChild(dlg);
 
-    // Click outside the dialog cancels; keys are handled here so Enter
-    // launches and Escape cancels from any field.
-    this.overlay.addEventListener("mousedown", (e) => {
-      if (e.target === this.overlay && !this.busy) this.close(null);
-    });
-    this.overlay.addEventListener("keydown", (e) => {
+    // Enter submits from any field (number spinners included). No Escape/cancel:
+    // the welcome IS the pane's content, closed by closing the pane itself.
+    this.el.addEventListener("keydown", (e) => {
       if (e.key === "Enter") {
         e.preventDefault();
-        void this.launch();
-      } else if (e.key === "Escape" && !this.busy) {
-        e.preventDefault();
-        this.close(null);
+        void this.submit();
       }
     });
 
-    document.body.appendChild(this.overlay);
-  }
-
-  get isOpen(): boolean {
-    return this.resolver !== null;
-  }
-
-  private get mode(): Mode {
-    return this.modeSel.value as Mode;
-  }
-
-  /** Open the dialog; resolves with a launch result, or null on cancel.
-   *  A second call while open resolves null immediately. */
-  show(): Promise<LaunchResult | null> {
-    if (this.resolver) return Promise.resolve(null);
-    this.reset();
-    this.overlay.classList.add("visible");
-    this.repoInput.focus();
-    return new Promise((res) => (this.resolver = res));
-  }
-
-  private reset(): void {
-    this.modeSel.value = "single";
+    // Seed defaults (was the modal's reset()): the form is created fresh per
+    // welcome pane, so this runs once at construction.
     this.agentSel.value = getDefaultAgent().id;
     this.customInput.value = getCustomCommand();
     const recent = getRecentRepos();
@@ -489,33 +515,39 @@ export class AgentLauncher {
         return opt;
       })
     );
-    this.worktreeInput.value = "";
     this.autopilotInput.checked = getAutopilot();
-    this.nameDirty = false;
-    this.applyMode();
-    this.setBusy(false);
-    this.hideError();
+    this.applyKind();
   }
 
-  /** Show/hide fields for the selected mode. */
-  private applyMode(): void {
-    const m = this.mode;
-    this.customField.hidden = m === "orchestrator" || this.agentSel.value !== "custom";
-    this.countField.hidden = m !== "multi";
-    this.worktreeField.hidden = m === "orchestrator"; // workers get worktrees on demand
-    this.orchFields.hidden = m !== "orchestrator";
-    this.nameField.hidden = m === "orchestrator";
+  private get kind(): PaneKind {
+    return this.kindSel.value as PaneKind;
+  }
+
+  /** Show/hide fields for the selected kind. */
+  private applyKind(): void {
+    const k = this.kind;
+    const agent = k === "agent";
+    const orch = k === "orchestrator";
+    const term = k === "terminal";
+    this.agentField.hidden = term; // agent + orchestrator both pick a CLI
+    this.customField.hidden = !agent || this.agentSel.value !== "custom";
+    this.countField.hidden = !agent;
+    this.shellField.hidden = !term;
+    this.worktreeField.hidden = !agent; // workers get worktrees on demand
+    this.autopilotField.hidden = !agent;
+    this.orchFields.hidden = !orch;
+    this.nameField.hidden = orch; // orchestrator names its panes from the roles
     this.applyOrchCli();
     this.applyAutopilot();
     this.updateName();
   }
 
-  /** Show the autopilot toggle only where it applies — single/multi mode, a
-   *  non-custom agent whose CLI actually has unattended flags. Orchestrator
-   *  mode has its own permission control; custom commands the user fully owns
-   *  (appending flags could collide with ones they typed). */
+  /** Show the autopilot toggle only where it applies — agent kind, a non-custom
+   *  agent whose CLI actually has unattended flags. Orchestrator mode has its own
+   *  permission control; custom commands the user fully owns (appending flags
+   *  could collide with ones they typed). */
   private applyAutopilot(): void {
-    const applies = this.mode !== "orchestrator" && this.agentSel.value !== "custom";
+    const applies = this.kind === "agent" && this.agentSel.value !== "custom";
     if (!applies) {
       this.autopilotField.hidden = true;
       return;
@@ -527,14 +559,14 @@ export class AgentLauncher {
     }
     void this.autopilotFlagsFor(program).then((flags) => {
       // Bail if the selection moved while the (memoized) lookup resolved.
-      if (this.mode === "orchestrator" || this.agentSel.value === "custom") return;
+      if (this.kind !== "agent" || this.agentSel.value === "custom") return;
       if (this.currentProgram() !== program) return;
       this.autopilotField.hidden = !flags;
     });
   }
 
-  /** The unattended launch flags for a program, memoized. Empty when the CLI
-   *  has no autopilot surface (backend returns ""), or on any lookup error. */
+  /** The unattended launch flags for a program, memoized. Empty when the CLI has
+   *  no autopilot surface (backend returns ""), or on any lookup error. */
   private autopilotFlagsFor(program: string): Promise<string> {
     let p = this.autopilotFlags.get(program);
     if (!p) {
@@ -548,22 +580,22 @@ export class AgentLauncher {
     return ORCH_CLIS.find((c) => c.id === id) ?? ORCH_CLIS[0];
   }
 
-  /** In orchestrator mode the agent list is restricted to CLIs the backend
-   *  has orchestration adapters for, and the model options + defaults
-   *  follow the selected CLI: curated list immediately, then merged with
-   *  whatever the CLI's own help reports once the probe returns. */
+  /** In orchestrator mode the agent list is restricted to CLIs the backend has
+   *  orchestration adapters for, and the model options + defaults follow the
+   *  selected CLI: curated list immediately, then merged with whatever the CLI's
+   *  own help reports once the probe returns. */
   private applyOrchCli(): void {
     const supported = new Set(ORCH_CLIS.map((c) => c.id));
-    const restricted = this.mode === "orchestrator";
+    const restricted = this.kind === "orchestrator";
     for (const opt of Array.from(this.agentSel.options)) {
       opt.disabled = restricted && !supported.has(opt.value);
     }
     this.updateAgentWarning();
     if (!restricted) return;
     if (!supported.has(this.agentSel.value)) this.agentSel.value = ORCH_CLIS[0].id;
-    // The top Agent field is the group *default* CLI: seed every role's CLI
-    // from it (the common case is one CLI for the whole group), then populate
-    // each role's model list. Per-role selects override it afterward.
+    // The top Agent field is the group *default* CLI: seed every role's CLI from
+    // it (the common case is one CLI for the whole group), then populate each
+    // role's model list. Per-role selects override it afterward.
     for (const rc of this.roleControls) {
       rc.cli.value = this.agentSel.value;
       this.applyRoleModels(rc.key);
@@ -577,7 +609,7 @@ export class AgentLauncher {
     const cli = this.orchCliFor(rc.cli.value);
     rc.model.setOptions(cli.models, cli.defaults[role]);
     void this.probe(cli.id).then((p) => {
-      if (this.mode !== "orchestrator" || rc.cli.value !== cli.id) return;
+      if (this.kind !== "orchestrator" || rc.cli.value !== cli.id) return;
       if (p.models.length) {
         // CLI-reported models first, curated suggestions appended.
         const merged = [...p.models, ...cli.models.filter((m) => !p.models.includes(m))];
@@ -598,9 +630,11 @@ export class AgentLauncher {
     return p;
   }
 
-  /** The program a given launch would execute (first token of the command). */
+  /** The program a given launch would execute (first token of the command), or
+   *  null for a terminal (no CLI to probe). */
   private currentProgram(): string | null {
-    if (this.mode === "orchestrator") return this.orchCliFor(this.agentSel.value).id;
+    if (this.kind === "terminal") return null;
+    if (this.kind === "orchestrator") return this.orchCliFor(this.agentSel.value).id;
     const agent = AGENTS.find((a) => a.id === this.agentSel.value) ?? AGENTS[0];
     const command = agent.id === "custom" ? this.customInput.value.trim() : agent.command;
     return command.split(/\s+/)[0]?.toLowerCase() || null;
@@ -615,12 +649,17 @@ export class AgentLauncher {
   }
 
   /** Inline warning when a selected agent's CLI isn't on PATH. In orchestrator
-   *  mode every role's CLI is checked; the first missing one is surfaced. */
+   *  mode every role's CLI is checked; the first missing one is surfaced.
+   *  Terminals have no CLI, so the warning is cleared. */
   private updateAgentWarning(): void {
-    if (this.mode === "orchestrator") {
+    if (this.kind === "terminal") {
+      this.agentWarn.classList.remove("visible");
+      return;
+    }
+    if (this.kind === "orchestrator") {
       const ids = this.orchProgramsToCheck();
       void Promise.all(ids.map((id) => this.probe(id).then((p) => ({ id, p })))).then((results) => {
-        if (this.mode !== "orchestrator") return; // mode changed under us
+        if (this.kind !== "orchestrator") return; // kind changed under us
         const missing = results.find(({ p }) => !p.available);
         if (!missing) {
           this.agentWarn.classList.remove("visible");
@@ -647,13 +686,53 @@ export class AgentLauncher {
     });
   }
 
-  /** Auto-fill the pane name (`agent · worktree-or-repo`) until hand-edited. */
+  /** Auto-fill the pane name until hand-edited: `agent · where` for an agent,
+   *  `shell · where` for a terminal. */
   private updateName(): void {
     if (this.nameDirty) return;
-    const agent = AGENTS.find((a) => a.id === this.agentSel.value) ?? AGENTS[0];
     const where =
       this.worktreeInput.value.trim() || basename(this.repoInput.value.trim()) || "home";
+    if (this.kind === "terminal") {
+      const shell = shellKindOptions(this.shellAvail).find((s) => s.key === this.shellSel.value);
+      this.nameInput.value = `${(shell?.label ?? "shell").toLowerCase()} · ${where}`;
+      return;
+    }
+    const agent = AGENTS.find((a) => a.id === this.agentSel.value) ?? AGENTS[0];
     this.nameInput.value = `${agent.label.toLowerCase()} · ${where}`;
+  }
+
+  /** Reflect the discovered shell availability onto the picker: disable a kind
+   *  that isn't installed, surface the reason on its option, and fall the
+   *  selection back to PowerShell if the current kind just became unavailable
+   *  (#194 P2). */
+  private applyShellAvailability(): void {
+    const opts = shellKindOptions(this.shellAvail);
+    for (const optEl of Array.from(this.shellSel.options)) {
+      const o = opts.find((x) => x.key === optEl.value);
+      if (!o) continue;
+      optEl.disabled = !o.enabled;
+      optEl.textContent = o.enabled ? o.label : `${o.label} — not installed`;
+      optEl.title = o.reason;
+    }
+    const current = this.shellSel.value as ShellKind;
+    const resolved = resolveShellKind(current, this.shellAvail);
+    if (resolved !== current) {
+      this.shellSel.value = resolved;
+      this.updateName();
+    }
+  }
+
+  /** Discover Git Bash backend-side and update the picker. Failures leave it
+   *  unavailable (disabled with a reason) rather than crashing the form. */
+  private async probeGitBash(): Promise<void> {
+    let path: string | null = null;
+    try {
+      path = await discoverGitBash();
+    } catch {
+      path = null;
+    }
+    this.shellAvail = { gitBashPath: path };
+    this.applyShellAvailability();
   }
 
   private async pickRepo(): Promise<void> {
@@ -668,39 +747,68 @@ export class AgentLauncher {
     }
   }
 
-  private async launch(): Promise<void> {
-    if (this.busy) return;
-    const repo = this.repoInput.value.trim();
+  /** Gather the current control values into the pure planner's input shape. */
+  private collectInput(): PaneSetupInput {
+    const agent = AGENTS.find((a) => a.id === this.agentSel.value) ?? AGENTS[0];
+    return {
+      kind: this.kind,
+      agentId: agent.id,
+      isCustom: agent.id === "custom",
+      builtinCommand: agent.command,
+      customCommand: this.customInput.value,
+      count: intVal(this.countInput, 1),
+      repo: this.repoInput.value,
+      worktree: this.worktreeInput.value,
+      name: this.nameInput.value,
+      autopilot: this.autopilotInput.checked,
+      shellKind: this.shellSel.value as ShellKind,
+    };
+  }
 
-    // Fail fast (and legibly) when a selected CLI isn't installed — otherwise
-    // the pane just flashes the shell's error and dies. In orchestrator mode
-    // every role can run a different CLI, so check each distinct one.
-    if (this.mode === "orchestrator") {
+  private async submit(): Promise<void> {
+    // Re-entrancy guard FIRST — before any await — so a double-click / Enter
+    // auto-repeat / impatient second click during the probe/launch gaps can't
+    // run a second submit and duplicate the launch (rev-74 HIGH-1). A validation
+    // error releases it (retry allowed); a fired result finishes it (one-shot).
+    if (!this.latch.begin()) return;
+    // Static validation + shaping (pure, tested).
+    const res = planPaneSetup(this.collectInput());
+    if (!res.ok) {
+      this.showError(res.error);
+      if (res.focus === "repo") this.repoInput.focus();
+      else if (res.focus === "custom") this.customInput.focus();
+      else if (res.focus === "count") this.countInput.focus();
+      this.latch.release();
+      return;
+    }
+    const plan = res.plan;
+
+    if (plan.kind === "terminal") {
+      // Resolve against discovered availability: an unavailable kind (a stale Git
+      // Bash selection, or a non-UI caller) falls back to PowerShell so the pane
+      // name can't misdescribe what spawned — mirrors the backend fallback.
+      const shellKind = resolveShellKind(plan.shellKind, this.shellAvail);
+      if (plan.cwd) addRecentRepo(plan.cwd);
+      this.setBusy(true, "Starting…");
+      this.fire({ kind: "terminal", name: plan.name, cwd: plan.cwd ?? undefined, shellKind });
+      return;
+    }
+
+    // Fail fast (and legibly) when a selected CLI isn't installed — otherwise the
+    // pane just flashes the shell's error and dies. In orchestrator mode every
+    // role can run a different CLI, so check each distinct one.
+    if (plan.kind === "orchestrator") {
+      this.setBusy(true, "Launching…");
       for (const id of this.orchProgramsToCheck()) {
         const p = await this.probe(id);
         if (!p.available) {
           this.showError(p.error ?? `'${id}' was not found on PATH.`);
+          this.setBusy(false);
+          this.latch.release();
           return;
         }
       }
-    } else {
-      const program = this.currentProgram();
-      if (program) {
-        const p = await this.probe(program);
-        if (!p.available) {
-          this.showError(p.error ?? `'${program}' was not found on PATH.`);
-          return;
-        }
-      }
-    }
-
-    if (this.mode === "orchestrator") {
-      if (!repo) {
-        this.showError("The orchestrator needs a repository — pick one first.");
-        this.repoInput.focus();
-        return;
-      }
-      addRecentRepo(repo);
+      addRecentRepo(plan.repo);
       const groupCli = this.orchCliFor(this.agentSel.value);
       setDefaultAgent(groupCli.id);
       const role = (key: OrchRole): { cli: string; model: string } => {
@@ -712,10 +820,10 @@ export class AgentLauncher {
       const worker = role("worker");
       const reviewer = role("reviewer");
       const planner = role("planner");
-      this.close({
+      this.fire({
         kind: "orchestrator",
         config: {
-          repo,
+          repo: plan.repo,
           agentCli: groupCli.id,
           orchestratorCli: orch.cli,
           workerCli: worker.cli,
@@ -737,61 +845,102 @@ export class AgentLauncher {
       return;
     }
 
-    const agent = AGENTS.find((a) => a.id === this.agentSel.value) ?? AGENTS[0];
-    let command = agent.id === "custom" ? this.customInput.value.trim() : agent.command;
-    if (!command) {
-      this.showError("Enter the command line for the custom agent.");
-      this.customInput.focus();
-      return;
+    // agent kind
+    this.setBusy(true, "Starting…");
+    const program = plan.command.split(/\s+/)[0]?.toLowerCase();
+    if (program) {
+      const p = await this.probe(program);
+      if (!p.available) {
+        this.showError(p.error ?? `'${program}' was not found on PATH.`);
+        this.setBusy(false);
+        this.latch.release();
+        return;
+      }
     }
-    const worktree = this.worktreeInput.value.trim();
-    if (worktree && !repo) {
-      this.showError("A worktree needs a repository — pick one first.");
-      this.repoInput.focus();
-      return;
-    }
-    const count = this.mode === "multi" ? Math.min(8, Math.max(2, intVal(this.countInput, 3))) : 1;
 
-    // Autopilot (#101): append the CLI's unattended flags so every launched
-    // pane (single, or each of the N in multi mode) skips the interactive
-    // permission prompts. Persisted regardless of whether it applied this time.
-    // Skipped for custom commands (the user owns those) and CLIs with no
-    // unattended surface (backend returns ""). OFF → command is untouched.
-    setAutopilot(this.autopilotInput.checked);
-    const bareCommand = command; // pre-flags, for the pane-name fallback
-    if (agent.id !== "custom" && this.autopilotInput.checked) {
-      const flags = await this.autopilotFlagsFor(command.split(/\s+/)[0]?.toLowerCase() ?? "");
+    // Autopilot (#101): append the CLI's unattended flags so every launched pane
+    // (single, or each of the N) skips the interactive permission prompts.
+    // Persisted regardless of whether it applied this time. Skipped for custom
+    // commands (the user owns those) and CLIs with no unattended surface (backend
+    // returns ""). OFF → command is untouched.
+    setAutopilot(plan.autopilot);
+    let command = plan.command;
+    if (!plan.isCustom && plan.autopilot && program) {
+      const flags = await this.autopilotFlagsFor(program);
       if (flags) command = `${command} ${flags}`;
     }
 
-    this.setBusy(true);
+    this.setBusy(true, "Creating worktree…");
     this.hideError();
     try {
-      const baseName = this.nameInput.value.trim() || bareCommand;
       const specs: AgentLaunchSpec[] = [];
-      for (let i = 1; i <= count; i++) {
-        let cwd = repo || undefined;
-        if (worktree) {
+      for (let i = 1; i <= plan.count; i++) {
+        let cwd = plan.repo || undefined;
+        if (plan.worktree) {
           // Fan out to isolated worktrees: fix-auth → fix-auth-1 … fix-auth-N.
-          const wt = count > 1 ? `${worktree}-${i}` : worktree;
-          cwd = await gitWorktreeAdd(repo, wt);
+          cwd = await gitWorktreeAdd(plan.repo, worktreeNameFor(plan.worktree, i, plan.count));
         }
-        specs.push({ name: count > 1 ? `${baseName} ${i}` : baseName, cwd, command });
+        // Session-capable CLIs (Claude) get a pre-assigned session id (#194 P4)
+        // so a restored pane can `--resume` the EXACT prior session — the tracked
+        // P3 deferral ("the launcher knows the session id"). Minted per agent so a
+        // fan-out's panes don't collide on one id. Skipped for custom commands
+        // (the user owns those) and best-effort CLIs (no clean resumable id).
+        // crypto.randomUUID is the webview's Web Crypto, NOT a getrandom crate —
+        // constraint 2 governs src-tauri Rust only, not the frontend.
+        let cmd = command;
+        let sessionId: string | undefined;
+        if (!plan.isCustom && program === "claude") {
+          sessionId = crypto.randomUUID();
+          cmd = `${command} --session-id ${sessionId}`;
+        }
+        specs.push({
+          name: plan.count > 1 ? `${plan.baseName} ${i}` : plan.baseName,
+          cwd,
+          command: cmd,
+          sessionId,
+        });
       }
-      setDefaultAgent(agent.id);
-      if (agent.id === "custom") setCustomCommand(command);
-      if (repo) addRecentRepo(repo);
-      this.close({ kind: "panes", specs });
+      setDefaultAgent(plan.isCustom ? "custom" : this.agentSel.value);
+      if (plan.isCustom) setCustomCommand(command);
+      if (plan.repo) addRecentRepo(plan.repo);
+      this.fire({ kind: "panes", specs });
     } catch (err) {
       this.showError(String(err));
       this.setBusy(false);
+      this.latch.release();
     }
   }
 
-  private setBusy(busy: boolean): void {
-    this.busy = busy;
-    this.launchBtn.disabled = busy;
-    this.launchBtn.textContent = busy ? "Creating worktree…" : "Launch";
+  /** Deliver the one submit result and permanently close the latch, so no late
+   *  re-entry into `submit()` can fire a second time (rev-74 HIGH-1). `onSubmit`
+   *  is also nulled as belt-and-suspenders — but retained so a downstream launch
+   *  failure can restore it for a retry (reopenAfterLaunchFailure). */
+  private lastSubmitCb: ((result: WelcomeResult) => void) | null = null;
+  private fire(result: WelcomeResult): void {
+    const cb = this.onSubmit;
+    this.lastSubmitCb = cb;
+    this.onSubmit = null;
+    this.latch.finish();
+    cb?.(result);
+  }
+
+  /** Re-enable this still-mounted form after the caller failed to act on its
+   *  result (#194 P1 debt): a downstream launch (e.g. an orchestrator group)
+   *  threw, leaving the welcome form stranded with a disabled "Working…" button.
+   *  Surface the error, restore the fire()-cleared callback + latch, and re-enable
+   *  submit so the human can fix the cause and retry — instead of a dead form.
+   *  Only meaningful while the form is still on screen (the orchestrator path,
+   *  which doesn't convert its setup pane until the launch succeeds). */
+  reopenAfterLaunchFailure(msg: string): void {
+    this.onSubmit = this.lastSubmitCb;
+    this.latch.reopen();
+    this.setBusy(false);
+    this.showError(msg);
+  }
+
+  private setBusy(busy: boolean, label?: string): void {
+    this.submitBtn.disabled = busy;
+    this.submitBtn.textContent = busy ? label ?? "Working…" : "Create";
   }
 
   private showError(msg: string): void {
@@ -801,12 +950,5 @@ export class AgentLauncher {
 
   private hideError(): void {
     this.errorEl.classList.remove("visible");
-  }
-
-  private close(result: LaunchResult | null): void {
-    this.overlay.classList.remove("visible");
-    const res = this.resolver;
-    this.resolver = null;
-    res?.(result);
   }
 }

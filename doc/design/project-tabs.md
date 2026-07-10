@@ -171,31 +171,38 @@ re-inhabits its own tab through the existing per-session/per-group resume
 machinery (`resume_orch_session`), which is the real integration the prototype
 stubbed as "a named shell bound to a group."
 
-### The empty-tab rule — ONE rule, no background modals
+### The empty-tab rule — ONE rule, welcome in-pane (#194)
 
 A tab must always hold at least one pane (the grid's "never empty" rule). There
 is exactly **one** rule for filling an empty tab, applied everywhere:
 
-> **An empty tab holds a SILENT plain shell — never the launcher modal — except
-> the single genuine fresh start, where the app opens its first pane and the
-> human picks via the launcher.**
+> **An empty tab holds the welcome / pane-setup surface** — an in-pane, PTY-less
+> pane where the human picks the kind (Agent / Orchestrator / Terminal). No
+> shell is spawned until they submit.
+
+The welcome is **in-pane content, not a floating modal**, which is what mooted the
+prior design's MED-1: the old launcher was a centered overlay, so filling a
+*background* tab with it would have popped an interactive dialog over the *active*
+tab. A silent plain shell was the workaround. With the welcome living inside the
+pane's own body (`pane.startWelcome`), a background tab can safely open one — it's
+just content in a hidden (`display:none`) subtree, invisible until that tab is
+shown. So the single rule now applies to every empty-tab path uniformly:
 
 - **Last-pane exit** (a human ✕, or a background agent process exiting): the
-  grid's `onEmpty` refills with `openShellIn` (a plain shell). It must never call
-  the launcher — for a hidden/background tab that would pop an interactive modal
-  over the *active* tab, driven by a background lifecycle event the human never
-  triggered. (This was the review's MED-1.)
+  grid's `onEmpty` refills with `openWelcomeIn` (a welcome pane).
 - **Boot after a restore**: every restored tab that came back empty — active or
-  background, plain or group-bound — is filled with a silent shell. For a
-  group-bound tab the shell is a **placeholder** until that group's session is
-  restored into it (above); it is not "stray." (MED-1's rule reconciled with the
-  boot fill — the review's LOW-2.)
-- **Fresh start only** (no restore): the one brand-new default tab opens via the
-  normal first-pane flow — the launcher in agent mode. This is the *only* place a
-  modal appears on boot, and only when there is no restored state at all.
+  background, plain or group-bound — is filled with a welcome pane. For a
+  group-bound tab it doubles as the **placeholder** until that group's session is
+  restored into it (above); it is not "stray."
+- **Fresh start** (no restore): the one brand-new default tab opens a welcome
+  pane, same as everywhere else.
 
-The launcher otherwise appears solely from an explicit human action in the active
-tab: `Ctrl+Shift+T` / the **+** button (`openUserTab`), or a split.
+The setup pane spawns nothing until the human submits, so the no-resize invariant
+holds trivially (there is no PTY to resize). On submit it converts in place:
+Terminal → a shell (`pane.startFromWelcome`); Agent → the first pane in place with
+any extras fanned out beside it; Orchestrator → its own repo-named project tab
+(the setup pane then retires). `openWelcomeIn` is the sole entry point, used by
+`onEmpty`, the boot fill, `openUserTab` (`Ctrl+Shift+T` / **+**), and a split.
 
 ## Memory / GL policy under many tabs
 

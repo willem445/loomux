@@ -11,7 +11,6 @@ export type ShortcutAction =
   | "next-tab"
   | "prev-tab"
   | "toggle-sessions"
-  | "toggle-agent-mode"
   | "toggle-git"
   | "toggle-issues"
   | "toggle-files"
@@ -36,7 +35,8 @@ export function matchShortcut(e: KeyboardEvent): ShortcutAction | null {
       case "KeyO": return "split-down";
       case "KeyW": return "close-pane";
       case "KeyP": return "toggle-sessions";
-      case "KeyA": return "toggle-agent-mode";
+      // Ctrl+Shift+A is intentionally unbound: it toggled the removed agents
+      // mode (#194). Left free pending a repurpose decision.
       case "KeyM": return "maximize-pane";
       // Project tabs (#63). T=new, K=close; the bracket keys page between tabs
       // (VSCode-style) and stay clear of Alt+arrows (pane focus) and the browser

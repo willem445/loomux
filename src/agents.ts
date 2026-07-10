@@ -1,6 +1,8 @@
-// Agent mode: the catalog of launchable agent CLIs plus the small persisted
-// settings bundle (mode toggle, default agent, custom command, recent repos).
-// Everything lives in localStorage — there is no server-side config.
+// The catalog of launchable agent CLIs plus the small persisted settings bundle
+// (default agent, custom command, autopilot, recent repos). Everything lives in
+// localStorage — there is no server-side config. There is no global "agent mode"
+// toggle anymore: every pane declares its kind at creation via the welcome /
+// pane-setup screen (#194).
 
 export interface AgentDef {
   id: string;
@@ -18,16 +20,21 @@ export const AGENTS: AgentDef[] = [
   { id: "custom", label: "Custom…", command: "" },
 ];
 
-const KEY_MODE = "loomux.agentMode";
 const KEY_DEFAULT = "loomux.defaultAgent";
 const KEY_CUSTOM = "loomux.customAgentCommand";
 const KEY_REPOS = "loomux.recentRepos";
 const KEY_AUTOPILOT = "loomux.singlePaneAutopilot";
 const MAX_RECENT_REPOS = 8;
 
-export const getAgentMode = (): boolean => localStorage.getItem(KEY_MODE) === "1";
-export const setAgentMode = (on: boolean): void =>
-  localStorage.setItem(KEY_MODE, on ? "1" : "0");
+// One-time cleanup (#194): the removed agents-mode toggle left this key behind in
+// every existing profile. Drop it on load so stale profiles don't carry it
+// forever. Guarded because this module is also imported by DOM-free unit tests
+// (no localStorage in Node).
+try {
+  localStorage.removeItem("loomux.agentMode");
+} catch {
+  /* no localStorage (unit-test / SSR context) — nothing to clean */
+}
 
 /** Interpret a persisted autopilot value. Default ON (#101): only an explicit
  *  "0" is off, so an absent or unrecognized value stays on. Pure so the

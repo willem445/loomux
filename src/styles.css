@@ -797,13 +797,11 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 }
 .metric.metric-na .metric-val { color: var(--text-dim); font-style: italic; }
 
-/* ---------- agent mode + launcher dialog ---------- */
-#btn-agent-mode.on {
-  color: var(--accent); border-color: var(--accent-dim);
-  background: rgba(122, 162, 247, 0.12);
-  box-shadow: 0 0 12px var(--accent-glow);
-}
-
+/* ---------- shared modal dialog kit ---------- */
+/* A centered, backdropped modal card reused by the editor-config dialog
+   (editor.ts) and the file-editor confirm/choice modals (fileedit.ts). The
+   welcome/pane-setup surface (#194) is NOT a modal — it renders in-pane (below)
+   — but shares the same `.dlg-*` field styles. */
 .launcher-overlay {
   position: fixed; inset: 0; z-index: 60;
   display: none; align-items: center; justify-content: center;
@@ -827,6 +825,42 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .agent-dialog h2 {
   margin: 0 0 2px; font-size: 11.5px; font-weight: 600;
   letter-spacing: 1.5px; text-transform: uppercase; color: var(--text-dim);
+}
+
+/* ---------- welcome / pane-setup surface (#194) ---------- */
+/* The welcome screen is IN-PANE content, not a floating modal: a setup-state
+   pane (no PTY yet) renders the form until the user picks a kind. The pane's
+   header stays, but its terminal-oriented chrome (folder/branch chips, overlay
+   buttons) is irrelevant with no shell, so hide it. */
+.pane.is-welcome .pane-meta,
+.pane.is-welcome .pane-btn:not(.close) { display: none; }
+
+/* The form fills the pane's body below the header and scrolls if the card is
+   taller than the pane; the card itself is centered. */
+.pane-welcome {
+  position: absolute; top: var(--pane-header-h); left: 0; right: 0; bottom: 0;
+  z-index: 5;
+  display: flex; align-items: flex-start; justify-content: center;
+  overflow: auto; padding: 22px 16px;
+  background: var(--bg-app);
+}
+.welcome-form { width: 100%; display: flex; justify-content: center; }
+
+.welcome-card {
+  width: 440px; max-width: calc(100% - 16px);
+  background: var(--panel);
+  border: 1px solid var(--border); border-radius: 12px;
+  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.5);
+  padding: 16px 18px 14px;
+  display: flex; flex-direction: column; gap: 11px;
+  animation: dlg-in 0.16s var(--ease);
+}
+.welcome-card h2 {
+  margin: 0; font-size: 11.5px; font-weight: 600;
+  letter-spacing: 1.5px; text-transform: uppercase; color: var(--text-dim);
+}
+.welcome-sub {
+  margin: 0 0 2px; font-size: 12px; color: var(--text-dim); line-height: 1.4;
 }
 .dlg-field { display: flex; flex-direction: column; gap: 4px; }
 .dlg-field[hidden] { display: none; }
@@ -2123,3 +2157,75 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   font-size: 13px; line-height: 1.55;
   padding: 6px 8px; white-space: pre; tab-size: 2;
 }
+
+/* ---------- session restore (#194 P4) ---------- */
+
+/* Tab orchestration markers: a live icon on any tab running a group, and a
+   static ORCH chip on a tab holding a DORMANT restored group. Appended, not
+   editing the shared .tab-status selector. */
+.tab-orch {
+  flex: none; font-size: 9.5px; font-weight: 600; letter-spacing: 0.4px;
+  padding: 0 4px; border-radius: 4px; line-height: 1.7;
+}
+.tab-orch.live { color: #9ece6a; background: rgba(158, 206, 106, 0.14); }
+.tab-orch.dormant { color: var(--text-dim); background: rgba(255, 255, 255, 0.05); }
+.tab.active .tab-orch.dormant { color: var(--text); }
+
+/* Dormant restore placeholder: a PTY-less pane showing a Start/Resume card. Same
+   inert-content-over-the-pane treatment as the welcome surface, so nothing
+   resizes a ConPTY. */
+.pane-dormant {
+  position: absolute; top: var(--pane-header-h); left: 0; right: 0; bottom: 0;
+  z-index: 5;
+  display: flex; align-items: center; justify-content: center;
+  padding: 22px 16px; overflow: auto; background: var(--bg-app);
+}
+.dormant-card {
+  width: 340px; max-width: calc(100% - 16px);
+  display: flex; flex-direction: column; gap: 10px; text-align: center;
+  background: var(--panel); border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 10px; padding: 20px 18px;
+}
+.dormant-title { font-size: 13px; font-weight: 600; color: var(--text); }
+.dormant-body { font-size: 12px; color: var(--text-dim); line-height: 1.5; }
+.dormant-btn {
+  align-self: center; margin-top: 4px;
+  padding: 7px 16px; border-radius: 7px; cursor: pointer;
+  border: 1px solid rgba(122, 162, 247, 0.5);
+  background: rgba(122, 162, 247, 0.16); color: var(--text);
+  font-size: 12.5px; font-weight: 600;
+}
+.dormant-btn:hover { background: rgba(122, 162, 247, 0.28); }
+
+/* Cold-boot restore splash: a centered card over a dimmed backdrop, before any
+   tab exists. Pure overlay — no PTY, no layout change. */
+.restore-splash {
+  position: fixed; inset: 0; z-index: 1000;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(0, 0, 0, 0.55); backdrop-filter: blur(2px);
+}
+.restore-splash-card {
+  width: 440px; max-width: calc(100% - 32px);
+  background: var(--panel); border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 12px; padding: 24px 22px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+  display: flex; flex-direction: column; gap: 12px;
+}
+.restore-splash-title { margin: 0; font-size: 16px; font-weight: 650; color: var(--text); }
+.restore-splash-body { margin: 0; font-size: 12.5px; color: var(--text-dim); line-height: 1.55; }
+.restore-splash-remember {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 12.5px; color: var(--text-dim); cursor: pointer; user-select: none;
+}
+.restore-splash-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 4px; }
+.restore-splash-btn {
+  padding: 8px 18px; border-radius: 8px; cursor: pointer;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(255, 255, 255, 0.05); color: var(--text);
+  font-size: 13px; font-weight: 600;
+}
+.restore-splash-btn:hover { background: rgba(255, 255, 255, 0.1); }
+.restore-splash-btn.primary {
+  border-color: rgba(122, 162, 247, 0.6); background: rgba(122, 162, 247, 0.22);
+}
+.restore-splash-btn.primary:hover { background: rgba(122, 162, 247, 0.34); }

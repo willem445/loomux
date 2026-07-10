@@ -7,7 +7,8 @@ A dead simple terminal multiplexer for AI agent management without all the bloat
 
 *Loom* + *mux*: a loom is the frame that holds every thread in place while the
 fabric is woven — here, the frame holding a matrix of terminal panes, each one
-carrying an agent (or just a shell).
+carrying an agent (or just a shell — PowerShell, Command Prompt, or Git Bash,
+picked per pane in the welcome screen).
 
 Windows Terminal–class smoothness with the multiplexing features it lacks:
 instant matrix splits, nameable panes, a native session browser that restores
@@ -102,7 +103,7 @@ and `cargo test --locked`.
 
 ```
 src-tauri/src/
-  pty.rs            PTY lifecycle (spawn/write/resize/kill) + output streaming
+  pty.rs            PTY lifecycle (spawn/write/resize/kill) + output streaming; per-kind Terminal shells (PowerShell/cmd/Git Bash, #194) + Git Bash discovery
   sessions.rs       agent session discovery (one scan_* fn per agent source)
   orchestration/    agent groups: registry, guardrails, MCP server, audit
   obs.rs            crash observability: panic hook, breadcrumb log, unclean-exit notice
@@ -117,12 +118,18 @@ src/
   layout.ts         pure drag-reorder geometry (unit-tested, DOM-free)
   tabs.ts           project tabs (#63): TabManager -- tab list, active tab, routing (DOM-free)
   workspace.ts      one tab = a Grid + its own dock; hide/show, GL policy, preview composite
-  tabbar.ts         the tab strip: switch/close/new, rename, color, alert/status chips, preview
+  tabbar.ts         the tab strip: switch/close/new, rename, color, alert chips, deterministic agent counter + orchestration markers (#194), preview
   tabroute.ts       pure tab routing + preview scale/sanitizer (unit-tested, DOM-free)
-  tabstore.ts       pure encode/decode + schema validation of the persisted tab set
+  tabstore.ts       pure encode/decode + schema validation of the persisted tab set (tabs + per-tab pane layout + restore pref, #194)
+  restoredecision.ts pure restore-vs-fresh-vs-ask decision for the boot splash (DOM-free, unit-tested, #194)
+  panerestore.ts    pure per-pane restore policy + layout-tree -> ordered rebuild plan + agent resume-command builder (DOM-free, unit-tested, #194)
+  restoresplash.ts  cold-boot "restore last session?" overlay (thin DOM over restoredecision.ts, #194)
+  tabcounts.ts      pure per-tab live-agent counter + live/dormant orchestration markers (DOM-free, unit-tested, #194)
+  groupresume.ts    pure whole-group resume plan: orchestrator first, delegates rejoin-or-skip (DOM-free, unit-tested, #194)
   panefit.ts        pure "hidden => no PTY resize" decision (the no-resize invariant)
   sessions.ts       session browser sidebar
-  launcher.ts       new-agent-pane dialog (single / multi / orchestrator)
+  launcher.ts       in-pane welcome / pane-setup form (Agent / Orchestrator / Terminal kind picker)
+  panesetup.ts      pure kind-selection + validation core for the welcome screen (DOM-free, unit-tested)
   orchestration.ts  frontend half of agent groups (panes, badges, focus)
   shortcuts.ts      app-level keybindings (single source of truth)
   fileapi.ts        typed bridge to fileedit.rs (per-feature wrapper, like git.ts)

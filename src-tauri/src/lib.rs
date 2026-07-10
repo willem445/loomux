@@ -72,6 +72,7 @@ pub fn run() {
             pty::kill_pty,
             pty::dir_info,
             pty::change_dir,
+            pty::discover_git_bash,
             sessions::list_sessions,
             git::git_repo_root,
             git::git_log,

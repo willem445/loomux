@@ -28,8 +28,8 @@ in an audit log.
 
 ## Launching a group
 
-1. Turn on **✦ agents** mode, open a new pane, and pick **Orchestrator +
-   workers** in the launcher.
+1. Open a new pane (split or new tab) and pick the **Orchestrator + workers**
+   kind on the welcome / pane-setup screen.
 2. Choose the agent CLI and model **per role** — orchestrator, worker, reviewer,
    and planner each get their own CLI (Claude Code or Copilot CLI) and model, so
    you can mix agent types in one group (e.g. a Claude orchestrator driving
