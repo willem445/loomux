@@ -70,11 +70,14 @@ its history, its unstaged files, its commits.
   you're off the primary tree, so it's obvious the view is scoped elsewhere. Its
   tooltip shows the full path and branch.
 - The primary checkout is labelled *(primary)* in the menu. A bare repository
-  entry, or one whose directory git knows is gone, is listed but can't be viewed.
+  entry, or one whose directory is gone — whether git flagged it or loomux saw
+  it vanish — is listed but disabled *(missing)*.
 - The selection sticks across refreshes. If the worktree is pruned or removed
   while you're viewing it — even by a plain `rm -rf` that git hasn't noticed —
-  the view **fails soft back to the primary** and tells you. Switching the pane
-  into a different repository resets the selection.
+  the view **fails soft** to the default (the pane's own worktree if it sits in a
+  live one, otherwise the primary) and tells you; that dead entry is then
+  disabled in the menu. Switching the pane into a different repository resets the
+  selection.
 - External changes inside a *selected* worktree refresh on the next shell prompt
   in the pane or when you press **↻** — the once-a-second auto-watch tracks the
   pane's own repo.

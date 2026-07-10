@@ -14,6 +14,7 @@ import {
   normalizePath,
   isMissingDir,
   isWritable,
+  isDeadWorktree,
 } from "../src/gitworktree.ts";
 
 const MAIN = "C:/Projects/loomux";
@@ -225,6 +226,42 @@ test("isWritable: an unlock does not leak to a different worktree (reset on swit
   assert.equal(isWritable(wts[3], wts[1].path), false);
   // And switching back to primary is read-only-moot (primary is always writable).
   assert.equal(isWritable(wts[0], wts[1].path), true);
+});
+
+test("isWritable: fails closed (read-only) when the worktree list can't be enumerated", () => {
+  const wts = parseWorktrees(SAMPLE);
+  // `git worktree list` errored → enumerated=false → read-only even though we'd
+  // otherwise call the active tree primary/writable. Unknown state fails closed.
+  assert.equal(isWritable(wts[0], null, false), false);
+  assert.equal(isWritable(null, null, false), false);
+  assert.equal(isWritable(wts[1], wts[1].path, false), false); // even an unlock can't override
+  // Sanity: with enumeration OK the same inputs behave as before.
+  assert.equal(isWritable(wts[0], null, true), true);
+  assert.equal(isWritable(wts[0], null), true); // default enumerated=true
+});
+
+test("isDeadWorktree: bare, prunable, and runtime-missing entries are dead", () => {
+  const wts = parseWorktrees(SAMPLE);
+  const none = new Set<string>();
+  // wts[3] is the locked one — live, selectable.
+  assert.equal(isDeadWorktree(wts[3], none), false);
+
+  const bare = parseWorktrees(["worktree /b.git", "bare", ""].join("\n"))[0];
+  assert.equal(isDeadWorktree(bare, none), true);
+
+  const prunable = parseWorktrees(
+    ["worktree /gone", "HEAD ee", "detached", "prunable gitdir file points to non-existent location", ""].join("\n")
+  )[0];
+  assert.equal(isDeadWorktree(prunable, none), true);
+
+  // git 2.29 has no prunable marker — the memoized missing set is what disables it.
+  const missing = new Set([normalizePath(wts[1].path)]);
+  assert.equal(isDeadWorktree(wts[1], missing), true);
+  assert.equal(isDeadWorktree(wts[2], missing), false); // a different, live worktree
+
+  // The memo is separator/case tolerant (paths come from different git calls).
+  const missingBack = new Set(["C:\\PROJECTS\\loomux-worktrees\\feat\\208"].map(normalizePath));
+  assert.equal(isDeadWorktree(wts[1], missingBack), true);
 });
 
 test("normalizePath unifies separators, trailing slash, and case", () => {

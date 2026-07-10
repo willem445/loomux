@@ -166,11 +166,32 @@ export function isMissingDir(err: unknown): boolean {
  *  only while it matches the active worktree, so switching to any other worktree
  *  (a different path, or back to primary) is read-only again — the unlock never
  *  leaks across selections. (gitview also clears `unlockedPath` on every switch,
- *  so re-selecting a previously-unlocked worktree still requires re-unlocking.) */
-export function isWritable(active: Worktree | null, unlockedPath: string | null): boolean {
+ *  so re-selecting a previously-unlocked worktree still requires re-unlocking.)
+ *
+ *  `enumerated` is false when `git worktree list` failed outright, so we can't
+ *  confirm the active tree is the primary. Fail **closed** (read-only) then — an
+ *  unknown state is exactly when defaulting to writable is most dangerous
+ *  (rev-95). This never fires for a normal repo: `git worktree list` succeeds on
+ *  any repo (≥ git 2.5), listing at least the main tree. */
+export function isWritable(
+  active: Worktree | null,
+  unlockedPath: string | null,
+  enumerated = true
+): boolean {
+  if (!enumerated) return false;
   if (active === null || active.primary) return true;
   if (unlockedPath === null) return false;
   return normalizePath(active.path) === normalizePath(unlockedPath);
+}
+
+/** Whether a worktree can't be viewed and should be disabled in the selector:
+ *  a bare repo (no working tree), one git flagged `prunable` (git ≥ 2.31), or
+ *  one already seen to vanish at runtime. On git 2.29 there's no `prunable`
+ *  marker, so the caller memoizes normalized paths that tripped `isMissingDir`
+ *  and passes them here — a deleted-but-still-listed worktree stays disabled
+ *  instead of re-triggering the fail-soft each time it's picked (rev-95). */
+export function isDeadWorktree(w: Worktree, missing: ReadonlySet<string>): boolean {
+  return w.bare || w.prunable || missing.has(normalizePath(w.path));
 }
 
 /** A short label for the selector chip / menu: the worktree's folder name. */

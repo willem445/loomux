@@ -37,6 +37,7 @@ import {
   resolveSelection,
   isMissingDir,
   isWritable,
+  isDeadWorktree,
   worktreeLabel,
   normalizePath,
   type Worktree,
@@ -225,6 +226,10 @@ export class GitView {
   // refresh and gates every write affordance below.
   private unlockedWorktree: string | null = null;
   private writable = true;
+  // Normalized paths of worktrees seen to vanish at runtime (deleted without
+  // `git worktree remove`/prune — git 2.29 emits no `prunable` marker). Keeps
+  // the selector from re-offering a dead entry. Cleared on repo change.
+  private missingWorktrees = new Set<string>();
   private commits: CommitInfo[] = [];
   private status: GitStatus | null = null;
   private selection: Selection = { kind: "working" };
@@ -527,26 +532,30 @@ export class GitView {
       // Enumerate the worktree set from the pane's tree (any member lists them
       // all). The MAIN working tree — the porcelain-first entry — is the repo's
       // stable identity and fall-back, so cd'ing between a repo's own worktrees
-      // (same set) never counts as changing repos. Enumeration failing (very
-      // old git, etc.) degrades to primary-only rather than breaking the view.
+      // (same set) never counts as changing repos. `enumOk` is false only if the
+      // command errors outright — then we can't confirm primary-ness and fail
+      // read-only (below), rather than defaulting to writable when state is least
+      // known.
+      let enumOk = true;
       try {
         this.worktrees = parseWorktrees(await gitWorktreeList(paneTop));
       } catch {
         this.worktrees = [];
+        enumOk = false;
       }
       if (this.disposed) return;
       const primary = primaryWorktree(this.worktrees)?.path ?? paneTop;
       if (primary !== this.primaryRoot) {
-        // Entered a different repo: drop the worktree selection with the rest.
+        // Entered a different repo: drop the selection and the dead-entry memo.
         this.primaryRoot = primary;
         this.selectedWorktree = null;
+        this.missingWorktrees.clear();
       }
 
       // Settle on which worktree the view targets. With no explicit chip choice
       // the view follows the pane (paneTop); an explicit choice wins and fails
-      // soft to primary if it was pruned/removed. An empty listing means
-      // enumeration failed — keep the selection and just view the primary this
-      // pass, rather than dropping it on a blip.
+      // soft if it was pruned/removed. An empty listing means enumeration failed
+      // — keep the selection and just view the primary this pass, not drop it.
       let root = primary;
       if (this.worktrees.length > 0) {
         const res = resolveSelection(this.worktrees, this.selectedWorktree, paneTop);
@@ -563,19 +572,36 @@ export class GitView {
       let status: GitStatus;
       try {
         [commits, status] = await Promise.all([gitLog(root, this.limit), gitStatus(root)]);
+        // Loaded fine — if this root was previously flagged dead (recreated),
+        // clear it so the selector offers it again.
+        this.missingWorktrees.delete(normalizePath(root));
       } catch (err) {
         // A selected worktree whose directory was deleted without git knowing
         // (manual rm -rf, crashed teardown) is still listed — resolveSelection
         // can't see that, so the git call is the first to notice ("no such
-        // directory"). Fail soft to the primary here (#208 review). Any other
-        // error propagates to the outer catch as a toast.
+        // directory"). Only a non-primary root can vanish under us like this; a
+        // missing primary means the whole repo is gone, so let that surface.
         const offPrimary = normalizePath(root) !== normalizePath(primary);
         if (!offPrimary || !isMissingDir(err)) throw err;
-        this.toast("Selected worktree is gone — showing the primary repo.");
+        // Memoize the dead path so the selector disables it, drop the selection,
+        // and land where the default resolves in ONE step — the pane's own
+        // worktree if the pane sits in a live one, else the primary — instead of
+        // bouncing via primary this refresh and pane-following on the next.
+        this.missingWorktrees.add(normalizePath(root));
         this.selectedWorktree = null;
-        root = primary;
+        const fallback =
+          this.worktrees.length > 0
+            ? resolveSelection(this.worktrees, null, paneTop).active?.path ?? primary
+            : primary;
+        this.toast(
+          normalizePath(fallback) === normalizePath(primary)
+            ? "Selected worktree is gone — showing the primary repo."
+            : "Selected worktree is gone — showing this pane's worktree."
+        );
+        root = fallback;
         this.pointViewAt(root);
         [commits, status] = await Promise.all([gitLog(root, this.limit), gitStatus(root)]);
+        this.missingWorktrees.delete(normalizePath(root));
       }
       if (this.disposed) return;
       this.commits = commits;
@@ -596,8 +622,9 @@ export class GitView {
       }
 
       // Non-primary worktrees are read-only until unlocked (#208 ruling); every
-      // render below gates its write affordances on this.
-      this.writable = isWritable(this.activeWorktree(), this.unlockedWorktree);
+      // render below gates its write affordances on this. If enumeration failed
+      // we can't confirm primary-ness, so isWritable fails closed (read-only).
+      this.writable = isWritable(this.activeWorktree(), this.unlockedWorktree, enumOk);
 
       this.renderHead();
       this.renderGraph();
@@ -988,10 +1015,11 @@ export class GitView {
     }
     for (const w of this.worktrees) {
       const isActive = normalizePath(w.path) === active;
+      const dead = isDeadWorktree(w, this.missingWorktrees);
       const name = w.primary ? `${worktreeLabel(w)} (primary)` : worktreeLabel(w);
       const detail = w.bare
         ? "  (bare)"
-        : w.prunable
+        : dead
           ? "  (missing)"
           : w.branch
             ? `  ${w.branch}`
@@ -999,10 +1027,11 @@ export class GitView {
               ? "  (detached)"
               : "";
       items.push({
-        // A bare tree has no working copy to inspect; a prunable one's dir is
-        // already gone (git ≥ 2.31 flags it) — list both, but disabled.
+        // A bare tree has no working copy to inspect; a dead one's dir is gone —
+        // whether git flagged it prunable (≥ 2.31) or we saw it vanish at
+        // runtime (2.29 has no marker). List both, disabled.
         label: `${isActive ? "● " : "  "}${name}${detail}`,
-        disabled: isActive || w.bare || w.prunable,
+        disabled: isActive || dead,
         onClick: () => this.selectWorktree(w),
       });
     }
