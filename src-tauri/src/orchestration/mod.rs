@@ -1221,6 +1221,22 @@ pub fn idle_should_kill(idle_since_ms: Option<u64>, now_ms: u64, threshold_min: 
     }
 }
 
+/// Format the live-delegate roster line for the cap-rejection guardrail message
+/// (#203) from `(id, role, idle)` triples, sorted by id for a stable message:
+/// `id (role, idle|working), …`. `idle` (`idle_since_ms.is_some()`) is the
+/// same signal the idle-reaper kills on, so it genuinely means "safe to
+/// reclaim". Pure and free-standing so both `spawn_agent` cap checks can format
+/// an identical message — the fast path via [`OrchRegistry::live_delegate_roster`],
+/// the race-safe path directly against its already-held `agents` guard (no
+/// re-lock). Empty string for no rows (the cap can't be hit then, but stay total).
+fn format_delegate_roster(mut rows: Vec<(String, &'static str, bool)>) -> String {
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    rows.into_iter()
+        .map(|(id, role, idle)| format!("{id} ({role}, {})", if idle { "idle" } else { "working" }))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Whether a queued `orch-spawn-request` has expired and must be dropped
 /// unserviced (#106). The backend stamps each request with the wall-clock
 /// deadline of its own `bind` wait (`now + BIND_TIMEOUT`); a frontend that was
@@ -6333,23 +6349,18 @@ impl OrchRegistry {
 
     /// Human-readable roster of the group's live delegates (workers, reviewers,
     /// planners — the orchestrator is exempt from the cap) for the cap-rejection
-    /// guardrail message (#203): each as `id (role, idle|working)`, sorted by id
-    /// for a stable message. `idle` means the agent has no task in flight
-    /// (`idle_since_ms` set) — the safe one to reuse or kill. Empty string when
-    /// there are none (the cap can't be hit then, but stay total).
+    /// guardrail message (#203). Locks `agents`; the race-safe cap check in
+    /// `spawn_agent` already holds that lock, so it calls
+    /// [`format_delegate_roster`] directly against its guard instead of this.
     fn live_delegate_roster(&self, group: &str) -> String {
-        let mut rows: Vec<(String, String)> = self
+        let rows = self
             .agents
             .lock_safe()
             .values()
             .filter(|a| a.group == group && a.role != Role::Orchestrator && a.status != AgentStatus::Dead)
-            .map(|a| {
-                let activity = if a.idle_since_ms.is_some() { "idle" } else { "working" };
-                (a.id.clone(), format!("{} ({}, {activity})", a.id, a.role.as_str()))
-            })
+            .map(|a| (a.id.clone(), a.role.as_str(), a.idle_since_ms.is_some()))
             .collect();
-        rows.sort_by(|a, b| a.0.cmp(&b.0));
-        rows.into_iter().map(|(_, s)| s).collect::<Vec<_>>().join(", ")
+        format_delegate_roster(rows)
     }
 
     /// Write the per-agent MCP config the agent CLI connects with. Claude
@@ -6859,9 +6870,24 @@ impl OrchRegistry {
                     })
                     .count() as u32;
                 if live >= group.guardrails.max_agents {
+                    // #203: emit the same roster the fast path does — this is the
+                    // check that actually fires under concurrent spawns, so it's
+                    // the one an orchestrator most needs the squatter list from.
+                    // Formatted off the already-held guard to avoid re-locking.
+                    let roster = format_delegate_roster(
+                        agents
+                            .values()
+                            .filter(|a| {
+                                a.group == group_id
+                                    && a.role != Role::Orchestrator
+                                    && a.status != AgentStatus::Dead
+                            })
+                            .map(|a| (a.id.clone(), a.role.as_str(), a.idle_since_ms.is_some()))
+                            .collect(),
+                    );
                     let _ = fs::remove_file(&cfg);
                     return Err(format!(
-                        "guardrail: {live} live agents already (max {})",
+                        "guardrail: {live} live agents already (max {}). Reuse an idle agent or kill one first. Live delegates: {roster}.",
                         group.guardrails.max_agents
                     ));
                 }
@@ -7478,33 +7504,53 @@ impl OrchRegistry {
     /// its pane deterministically here so the slot frees the moment the plan is
     /// posted; the planner role-template exit instruction is only belt-and-braces.
     ///
-    /// The caller (the MCP `report` handler) delivers the done report to the
-    /// orchestrator *first*, so this delivers a **completion** exit notice after
-    /// it — phrased as a normal finish, not a crash. It then marks the agent dead
-    /// (freeing the slot in the registry immediately) *before* killing the pty:
-    /// `mark_dead` drops the by-pty mapping, so the real pane exit lands as a
-    /// no-op in `on_pty_exit` instead of a duplicate generic "exited (code …)"
-    /// notice. No-op for a non-planner, an already-dead agent, or an unknown id.
+    /// Ordering: the caller (the MCP `report` handler) hands the done report to
+    /// the orchestrator *first*, so the completion exit notice this delivers is
+    /// *enqueued* after it — phrased as a normal finish, not a crash. On the live
+    /// path both are pasted by detached threads serialized by the per-pty
+    /// delivery mutex, which is not FIFO-fair, so "enqueued after" is
+    /// overwhelmingly-but-not-strictly "delivered after" — the same semantics
+    /// every back-to-back notice pair in loomux has; both always arrive.
+    ///
+    /// Claiming the close: [`mark_dead`](Self::mark_dead) is the atomic gate. It
+    /// returns `Some` only for the caller that transitions the agent live→dead
+    /// (idempotent under the agents lock), so two concurrent `done` reports yield
+    /// exactly one exit notice and one kill. Marking dead first also frees the
+    /// slot immediately and drops the `by_pty` mapping, so the real pane exit
+    /// lands as a no-op in `on_pty_exit` rather than a duplicate generic "exited
+    /// (code …)" notice. No-op for a non-planner, an already-dead agent, or an
+    /// unknown id.
+    ///
+    /// Known edges (rare, documented not fixed — see PR #209): (a) if a human's
+    /// unsubmitted line is sitting in the orchestrator pane, the *report* paste
+    /// aborts and its re-send nudge is suppressed for orchestrator targets (the
+    /// #103 anti-loop rule), so the exit notice can arrive without the report —
+    /// but the plan is durable as a GitHub issue comment and the notice says so.
+    /// (b) A crash or human-kill of the planner pty in the microsecond window
+    /// between the report handoff and `mark_dead` lets `on_pty_exit` win and add
+    /// a generic crash notice; a *voluntary* exit can't race here (the CLI is
+    /// blocked awaiting this MCP response).
     pub fn close_completed_planner(&self, agent_id: &str) {
-        let Some(a) = self.agent(agent_id) else { return };
-        if a.role != Role::Planner || a.status == AgentStatus::Dead {
-            return;
+        // Role gate first — only a planner is auto-closed. Role is immutable, so
+        // reading it before the claim is safe; the claim below stays atomic.
+        match self.agent(agent_id) {
+            Some(a) if a.role == Role::Planner => {}
+            _ => return,
         }
+        // Atomic claim: only the winner of the live→dead transition proceeds, so
+        // a concurrent double `done` delivers one notice and one kill (see doc).
+        let Some(snapshot) = self.mark_dead(agent_id, Some(0)) else { return };
         let _ = self.deliver_to_orchestrator(
-            &a.group,
+            &snapshot.group,
             &format!(
                 "[loomux] planner {} ({}) posted its plan and exited — its delegate slot is free.",
-                a.name, a.id
+                snapshot.name, snapshot.id
             ),
             "loomux",
         );
-        // Free the slot now and neutralize the real pane-exit (see doc comment),
-        // then terminate the actual CLI pane. The pty kill is best-effort: unit
-        // tests run without an app handle or a bound pty.
-        let snapshot = self.mark_dead(agent_id, Some(0));
-        if let (Some(app), Some(pty)) =
-            (self.app.lock_safe().clone(), snapshot.and_then(|s| s.pty_id))
-        {
+        // Terminate the actual CLI pane. Best-effort: unit tests run without an
+        // app handle or a bound pty.
+        if let (Some(app), Some(pty)) = (self.app.lock_safe().clone(), snapshot.pty_id) {
             app.state::<crate::pty::PtyManager>().kill(pty);
         }
     }

@@ -2663,6 +2663,28 @@ fn only_a_planner_done_report_auto_closes_the_pane() {
 }
 
 #[test]
+fn closing_a_completed_planner_is_idempotent() {
+    // #203 (review finding 4): two concurrent `done` reports must not
+    // double-notify. `mark_dead` is the atomic claim inside
+    // `close_completed_planner`, so only the caller that wins the live→dead
+    // transition delivers the exit notice; a second (racing) call is a no-op.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let planner = reg.spawn_agent(&g.id, Role::Planner, "plan", "task", false, None).unwrap();
+    reg.pause_group(&g.id).unwrap(); // suppress+audit deliveries so notices are countable
+
+    reg.close_completed_planner(&planner.id);
+    reg.close_completed_planner(&planner.id); // the racing duplicate
+
+    assert_eq!(
+        suppressed_notices(&reg, &g.id, "posted its plan and exited"),
+        1,
+        "a completed planner must be closed and announced exactly once"
+    );
+}
+
+#[test]
 fn spawn_cap_rejection_lists_the_delegate_roster() {
     // #203: when spawn is refused at the delegate cap, the guardrail message
     // must name who holds the slots (id, role, idle vs working) so the
