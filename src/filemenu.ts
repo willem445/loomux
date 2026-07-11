@@ -116,18 +116,29 @@ export function buildContextMenu(
   const items: MenuItem[] = [];
   const isDir = target.isDir;
 
+  // A SYMLINK (or Windows junction) is shown and otherwise INERT: the backend refuses every
+  // op on it, because `ensure_no_symlink` lstats the final component too. Rather than offer
+  // six items that all end in the same toast, grey them all with the reason — the same
+  // courtesy a folder already got. (Why the refusal is that broad: a junction pointing
+  // outside the root is exactly the shape a recursive Recycle-Bin delete would escape
+  // through, so we never hand the shell the chance to ask. See the design note.)
+  const inert = target.isSymlink ? "Loomux doesn't follow or modify symlinks — this one is shown, but left alone." : undefined;
+
   items.push({
     label: isDir ? "Open" : "Open (default app)",
     action: { kind: "open", target },
+    disabled: !!inert,
+    reason: inert,
   });
 
   // Open-with is Windows-only: omitted entirely elsewhere rather than shown and broken.
   if (caps.open_with) {
+    const why = inert ?? (isDir ? "A folder has no application to open it with." : undefined);
     items.push({
       label: "Open with…",
       action: { kind: "open-with", target },
-      disabled: isDir,
-      reason: isDir ? "A folder has no application to open it with." : undefined,
+      disabled: !!why,
+      reason: why,
     });
   }
 
@@ -137,22 +148,31 @@ export function buildContextMenu(
     items.push({
       label: caps.reveal_selects ? "Reveal in file explorer" : "Open containing folder",
       action: { kind: "reveal", target },
+      disabled: !!inert,
+      reason: inert,
     });
   }
 
   items.push(sep);
-  items.push({ label: "Rename…", action: { kind: "rename", target } });
+  items.push({
+    label: "Rename…",
+    action: { kind: "rename", target },
+    disabled: !!inert,
+    reason: inert,
+  });
   items.push({
     label: caps.delete_mode === "recycle" ? "Delete (to Recycle Bin)" : "Delete permanently…",
     action: { kind: "delete", target },
+    disabled: !!inert,
+    reason: inert,
   });
 
   items.push(sep);
-  if (isDir) {
+  if (isDir || inert) {
     items.push({
       label: "Hash",
       disabled: true,
-      reason: "A folder has no file contents to hash.",
+      reason: inert ?? "A folder has no file contents to hash.",
     });
   } else {
     items.push(hashSubmenu(target, algos));

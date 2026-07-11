@@ -20,8 +20,12 @@ export function closeContextMenu(): void {
  *  picks. Resolves nothing — the menu is fire-and-forget; dismissal is silent.
  *
  *  Dismissal: Escape, a click anywhere outside, a scroll/resize, or any other menu
- *  opening. Focus goes INTO the menu so the keyboard works immediately (↑/↓/Enter,
- *  →/← for submenus) and so a blur is a reliable "the user went elsewhere" signal. */
+ *  opening. Focus goes INTO the menu so Escape lands here rather than in the pane.
+ *
+ *  KEYBOARD: Tab / Shift+Tab walk the items (each is focusable), Enter or Space fires the
+ *  focused one, and a submenu opens on `:focus-within` — so tabbing INTO one opens it. Esc
+ *  closes. Arrow-key navigation is NOT implemented; the doc used to claim it was, which is
+ *  the sort of comment that costs someone an afternoon. If it's wanted, it goes here. */
 export function showContextMenu(
   x: number,
   y: number,

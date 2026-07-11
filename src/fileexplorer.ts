@@ -272,9 +272,14 @@ export class FileExplorerView {
     // only the creates. A row's own handler stops propagation, so this fires only when the
     // click really did miss every row. The webview's default menu is suppressed only here
     // and on the rows — never over the rest of the pane.
-    this.listEl.addEventListener("contextmenu", (e) => this.onContextMenu(e, null));
+    this.listEl.addEventListener("contextmenu", (e) => this.onEmptyContextMenu(e));
     this.gotoListEl = el("div", "fileexp-goto-list");
     this.gotoListEl.hidden = true;
+    // Empty space in the RESULTS list: deliberately no menu. The creates act on the
+    // directory being browsed — which the results view isn't showing you — so offering them
+    // here would act somewhere the user can't see. A row's menu still works (the rows wire
+    // their own); this just stops the webview's default menu appearing in the gap.
+    this.gotoListEl.addEventListener("contextmenu", (e) => e.preventDefault());
 
     this.statusEl = el("div", "fileexp-status", "");
 
@@ -767,25 +772,79 @@ export class FileExplorerView {
 
   // ---------- context menu (#214) ----------
 
-  /** Right-click. The target is resolved from the view on screen and BOUND HERE — every
-   *  action the menu fires carries that path. A context menu is the identity-vs-index trap
-   *  with a longer fuse: it is built now and clicked seconds later, by which time the lists
-   *  have had every chance to re-rank, re-sort, or be replaced by search results. */
-  private onContextMenu(e: MouseEvent, rowIndex: number | null): void {
-    // Suppress the webview's own menu ONLY where ours appears (this handler is on the
-    // list and its rows, not on the whole pane).
+  /** Right-click on a ROW, in EITHER view.
+   *
+   *  Called from the listing's rows and the Go-to-file results' rows alike (see
+   *  `wireRowAffordances`, the one place a row's behaviours are attached — the results view
+   *  being the forgotten twin of the listing is a mistake this codebase has now made three
+   *  times, so the two no longer get separate wiring to forget).
+   *
+   *  `rowIndex` indexes whichever list is on screen. Selecting it FIRST matters: the menu
+   *  must bind the row under the cursor, not whatever was highlighted before — you can
+   *  right-click a row you never selected.
+   *
+   *  The target is then resolved from the view on screen and BOUND HERE; every action the
+   *  menu fires carries that path. A context menu is the identity-vs-index trap with a
+   *  longer fuse: it is built now and clicked seconds later, by which time the lists have
+   *  had every chance to re-rank, re-sort, or be replaced by search results. */
+  private onRowContextMenu(e: MouseEvent, rowIndex: number): void {
     e.preventDefault();
     e.stopPropagation();
-    // Right-clicking a row selects it, so the menu, the toolbar and the highlight all
-    // agree about what is being acted on.
-    if (rowIndex !== null && !this.filtering) {
+    if (this.filtering) {
+      this.gotoSel = rowIndex;
+      this.renderGoto();
+      this.syncOpButtons();
+    } else {
       this.sel = rowIndex;
       this.render();
     }
-    const target = rowIndex === null && !this.filtering ? null : this.target();
+    this.openMenuAt(e, this.target());
+  }
+
+  /** Right-click on the empty space below the rows: there is no row, so only the
+   *  directory-scoped creates apply. */
+  private onEmptyContextMenu(e: MouseEvent): void {
+    e.preventDefault();
+    e.stopPropagation();
+    this.openMenuAt(e, null);
+  }
+
+  private openMenuAt(e: MouseEvent, target: OpTarget | null): void {
     showContextMenu(e.clientX, e.clientY, buildContextMenu(target, this.caps, HASH_ALGOS), (a) =>
       this.runMenuAction(a)
     );
+  }
+
+  /** Attach every behaviour a ROW has, in whichever view it lives.
+   *
+   *  THE POINT OF THIS FUNCTION IS THAT THERE IS ONLY ONE OF IT. Three rounds running, an
+   *  affordance was built for the listing and quietly omitted from the Go-to-file results:
+   *  rename bound the wrong row (round 4), the rename editor mounted into the hidden list
+   *  (round 5), and the context menu simply wasn't wired there at all (round 6). Each time
+   *  the fix was correct and each time the NEXT affordance forgot again — because the two
+   *  views had two sets of listeners and nothing tied them together.
+   *
+   *  Now a row's behaviours are attached in exactly one place, so a new one lands in both
+   *  views by construction rather than by remembering. `ROW_AFFORDANCES` (the pure model)
+   *  is the declarative half of the same guard: a new affordance must state whether it
+   *  works in the results view, and the parity test fails until it does. */
+  private wireRowAffordances(row: HTMLElement, index: number, onOpen: () => void): void {
+    row.addEventListener("click", () => this.selectRow(index));
+    row.addEventListener("dblclick", () => onOpen());
+    row.addEventListener("contextmenu", (e) => this.onRowContextMenu(e, index));
+  }
+
+  /** Move the selection to `index` in whichever view is on screen. */
+  private selectRow(index: number): void {
+    if (this.filtering) {
+      this.gotoSel = index;
+      this.renderGoto();
+      this.syncOpButtons();
+    } else {
+      this.sel = index;
+      this.render();
+      this.listEl.focus();
+    }
   }
 
   /** Execute a bound menu action. Every one routes through the SAME op layer the toolbar
@@ -980,14 +1039,10 @@ export class FileExplorerView {
       this.fillHashCell(hash, this.hashCells.get(rel) ?? { kind: "pending" });
 
       row.append(icon, name, hash, size, mtime);
-      row.addEventListener("click", () => {
-        this.sel = i;
-        this.render();
-        this.listEl.focus();
-      });
-      // The heart of it: double-click a folder to go in, a file to hand it to the OS.
-      row.addEventListener("dblclick", () => void this.openEntry(entry));
-      row.addEventListener("contextmenu", (e) => this.onContextMenu(e, i));
+      // Click / double-click (a folder goes in, a file goes to the OS) / right-click — all
+      // from the ONE place a row's behaviours are attached, so the results rows below get
+      // exactly the same set. See wireRowAffordances.
+      this.wireRowAffordances(row, i, () => void this.openEntry(entry));
       frag.appendChild(row);
     });
 
@@ -1200,12 +1255,9 @@ export class FileExplorerView {
       dir.append(markUp(hit.rel.slice(0, base), clipRanges(hit.ranges, 0, base)));
       row.title = hit.rel;
       row.append(icon, name, dir);
-      row.addEventListener("dblclick", () => void this.openGotoHit(i));
-      row.addEventListener("click", () => {
-        this.gotoSel = i;
-        this.renderGoto();
-        this.syncOpButtons();
-      });
+      // The SAME wiring the listing rows get — click, double-click, and (the round-6 gap)
+      // right-click. A result is a row; every affordance a row has, it has.
+      this.wireRowAffordances(row, i, () => void this.openGotoHit(i));
       frag.appendChild(row);
     });
     this.gotoListEl.replaceChildren(frag);

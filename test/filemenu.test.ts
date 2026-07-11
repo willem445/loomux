@@ -6,7 +6,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { buildContextMenu, menuActions, type FmCaps, type MenuItem } from "../src/filemenu.ts";
 import { HASH_ALGOS } from "../src/filehashmodel.ts";
-import type { OpTarget } from "../src/fileexplorermodel.ts";
+import { ROW_AFFORDANCES, type OpTarget, type RowAffordance } from "../src/fileexplorermodel.ts";
 
 const WIN: FmCaps = { delete_mode: "recycle", open_with: true, reveal: true, reveal_selects: true };
 const MAC: FmCaps = { delete_mode: "permanent", open_with: false, reveal: true, reveal_selects: true };
@@ -16,9 +16,23 @@ const fileTarget: OpTarget = {
   rel: "deep/nested/report.pdf",
   name: "report.pdf",
   isDir: false,
+  isSymlink: false,
   from: "results",
 };
-const dirTarget: OpTarget = { rel: "src", name: "src", isDir: true, from: "listing" };
+const dirTarget: OpTarget = {
+  rel: "src",
+  name: "src",
+  isDir: true,
+  isSymlink: false,
+  from: "listing",
+};
+const linkTarget: OpTarget = {
+  rel: "link",
+  name: "link",
+  isDir: false,
+  isSymlink: true,
+  from: "listing",
+};
 
 const labels = (items: MenuItem[]) => items.filter((i) => !i.separator).map((i) => i.label);
 const find = (items: MenuItem[], label: string) => items.find((i) => i.label === label);
@@ -107,7 +121,7 @@ test("a FOLDER cannot be hashed or opened-with, and says why instead of vanishin
   assert.match(openWith.reason!, /folder/i);
 
   // But Open still works — on a folder it means "navigate into it".
-  assert.equal(find(menu, "Open")!.disabled, undefined);
+  assert.ok(!find(menu, "Open")!.disabled);
 });
 
 // ---------- OS capabilities: hide what would always fail, label what is approximate ----------
@@ -134,6 +148,99 @@ test("Delete says what it will actually do on this platform", () => {
   // platform that hasn't got one.
   assert.ok(find(buildContextMenu(fileTarget, WIN, HASH_ALGOS), "Delete (to Recycle Bin)"));
   assert.ok(find(buildContextMenu(fileTarget, MAC, HASH_ALGOS), "Delete permanently…"));
+});
+
+// ---------- VIEW PARITY (rev-106) ----------
+//
+// Three rounds running, an affordance was built for the listing and forgotten for the
+// Go-to-file results: rename bound the wrong row (round 4), the editor mounted into the
+// hidden list (round 5), the context menu wasn't wired to result rows at all (round 6).
+// Each fix was right; each time the NEXT affordance forgot again. These tests close the
+// CLASS rather than the instance — a new row affordance cannot be added without answering
+// "…and does it work in the results view?"
+
+test("PARITY: every row affordance the MENU offers is declared in ROW_AFFORDANCES", () => {
+  // The load-bearing one. Add an item to the context menu and forget the registry, and this
+  // fails — which is the only moment anyone is going to think about the results view.
+  const offered = new Set(
+    menuActions(buildContextMenu(fileTarget, WIN, HASH_ALGOS))
+      .map((a) => a.kind)
+      // The creates act on the DIRECTORY, not on a row, so they are not row affordances.
+      .filter((k) => k !== "new-folder" && k !== "new-file")
+  );
+  const declared = new Set(ROW_AFFORDANCES.map((a) => a.affordance));
+  for (const kind of offered) {
+    assert.ok(
+      declared.has(kind as RowAffordance),
+      `the menu offers "${kind}" but ROW_AFFORDANCES doesn't declare it — say whether it works on a Go-to-file result`
+    );
+  }
+});
+
+test("PARITY: every declared affordance either works on a RESULT, or says why not", () => {
+  for (const a of ROW_AFFORDANCES) {
+    if (a.results) continue;
+    assert.ok(
+      a.reason && a.reason.trim().length > 20,
+      `"${a.affordance}" is declared listing-only with no real reason — "we forgot" is what this test exists to catch`
+    );
+  }
+});
+
+test("PARITY: a RESULT-sourced target gets the same menu as a LISTING-sourced one", () => {
+  // Not "a menu" — the SAME menu. The model must not treat a result as a lesser row, which
+  // is exactly the assumption that produced three rounds of bugs.
+  const fromListing: OpTarget = { ...fileTarget, from: "listing" };
+  const fromResults: OpTarget = { ...fileTarget, from: "results" };
+
+  const kinds = (t: OpTarget) =>
+    menuActions(buildContextMenu(t, WIN, HASH_ALGOS))
+      .map((a) => a.kind)
+      .sort();
+  assert.deepEqual(kinds(fromResults), kinds(fromListing));
+
+  // …and every action still carries the result's own path.
+  for (const a of menuActions(buildContextMenu(fromResults, WIN, HASH_ALGOS))) {
+    if ("target" in a) assert.equal(a.target.rel, fileTarget.rel);
+  }
+});
+
+test("PARITY: the affordances declared results:true are all actually offered on a result", () => {
+  // The registry could lie in the other direction — claiming parity it doesn't have. Cross-
+  // check it against what the menu really builds for a result-sourced target.
+  const offered = new Set(menuActions(buildContextMenu(fileTarget, WIN, HASH_ALGOS)).map((a) => a.kind));
+  for (const a of ROW_AFFORDANCES) {
+    if (!a.results) continue;
+    // `context-menu` and `inline-edit` are not menu ITEMS — they're how you reach them.
+    if (a.affordance === "context-menu" || a.affordance === "inline-edit") continue;
+    assert.ok(
+      offered.has(a.affordance),
+      `ROW_AFFORDANCES claims "${a.affordance}" works on a result, but the menu doesn't offer it`
+    );
+  }
+});
+
+test("a SYMLINK's row actions are all greyed with a reason — it is shown, and inert", () => {
+  // Every backend op refuses a link (ensure_no_symlink lstats the final component too), so
+  // offering six items that all end in the same toast would be a menu that lies. Same
+  // courtesy the folder already got: disabled, with the reason on the tooltip.
+  const menu = buildContextMenu(linkTarget, WIN, HASH_ALGOS);
+  for (const label of [
+    "Open (default app)",
+    "Open with…",
+    "Reveal in file explorer",
+    "Rename…",
+    "Delete (to Recycle Bin)",
+    "Hash",
+  ]) {
+    const item = find(menu, label)!;
+    assert.ok(item, `${label} should still be listed`);
+    assert.equal(item.disabled, true, `${label} must be disabled on a symlink`);
+    assert.match(item.reason!, /symlink/i, `${label} must say WHY`);
+  }
+  // No Hash submenu to walk into, and New is still available (it acts on the directory).
+  assert.equal(find(menu, "Hash")!.children, undefined);
+  assert.ok(find(menu, "New"));
 });
 
 test("menuActions walks submenus, so nothing offered is unreachable", () => {

@@ -65,7 +65,11 @@ in file explorer** (opens your OS file manager with the file selected), **Rename
 **New →** on its own.
 
 The menu acts on **the row you right-clicked** — always, even if the list re-sorts or a
-search finishes underneath it while the menu is open.
+search finishes underneath it while the menu is open. It works the same on a **Go-to-file
+result**: right-click a search hit and you get the same menu, acting on that file.
+
+A **symlink** row's actions are greyed with a reason — loomux shows links but never follows
+or modifies them.
 
 #### Hashes
 

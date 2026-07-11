@@ -150,6 +150,11 @@ export interface OpTarget {
   /** Last path segment: what the confirm dialog and the rename editor show. */
   name: string;
   isDir: boolean;
+  /** A symlink (or a Windows junction). Shown in the listing and otherwise INERT: every
+   *  backend op refuses it (`ensure_no_symlink` lstats the final component too), so the
+   *  menu greys its row actions with a reason rather than offering six things that will
+   *  all toast. See the design note's symlink section for why the refusal is that broad. */
+  isSymlink: boolean;
   /** Which view it came from. The caller needs this: an op invoked on a RESULTS row
    *  has to leave the filtered view to show the user what it is doing to that file. */
   from: "listing" | "results";
@@ -185,14 +190,88 @@ export function activeTarget(view: ExplorerView): OpTarget | null {
       rel: joinRel(view.dir, entry.name),
       name: entry.name,
       isDir: entry.is_dir && !entry.is_symlink,
+      isSymlink: entry.is_symlink,
       from: "listing",
     };
   }
   const hit = view.hits[view.sel];
   if (!hit) return null;
-  // A Go-to-file hit is always a file (the enumeration lists files, never dirs).
-  return { rel: hit.rel, name: baseName(hit.rel), isDir: false, from: "results" };
+  // A Go-to-file hit is always a plain file: the enumeration lists files, never dirs, and
+  // skips symlinks (it must not follow one to somewhere outside the root).
+  return { rel: hit.rel, name: baseName(hit.rel), isDir: false, isSymlink: false, from: "results" };
 }
+
+// ---------- VIEW PARITY: the results view is not a second-class row list ----------
+//
+// THREE ROUNDS RUNNING, an affordance was built for the directory LISTING and quietly
+// omitted from the Go-to-file RESULTS:
+//
+//   round 4 — rename resolved its target from the listing's index even while the results
+//             were on screen, so it renamed a file the user could not see;
+//   round 5 — the fix navigated correctly but mounted its editor into the still-hidden
+//             listing, so "F2 does nothing" came back on the very path added to kill it;
+//   round 6 — the context menu was wired to the listing's rows and not the results' at
+//             all, so right-clicking a result got the webview's default menu.
+//
+// Each fix was correct. Each time, the NEXT affordance forgot again. That is not three
+// bugs, it is one: the results view kept being an afterthought, and nothing in the code
+// ever asked "…and does this work there?"
+//
+// Two guards now, one structural and one declarative:
+//
+//   * STRUCTURAL — `fileexplorer.wireRowAffordances` is the only place a row's behaviours
+//     are attached, and both views call it. A new affordance lands in both by construction.
+//   * DECLARATIVE — the registry below. Every row affordance must be listed, and must
+//     either work in the results view or say WHY not. The parity test enforces both, and
+//     cross-checks the registry against the context menu's own action set — so an
+//     affordance added to the menu without an entry here FAILS THE BUILD until someone
+//     answers the question for the results view.
+
+/** Everything a ROW can offer. Add a row affordance → add it here (the parity test makes
+ *  that non-optional) → state whether the results view has it. */
+export type RowAffordance =
+  | "open"
+  | "open-with"
+  | "reveal"
+  | "rename"
+  | "delete"
+  | "hash"
+  | "context-menu"
+  | "inline-edit";
+
+export interface AffordanceParity {
+  affordance: RowAffordance;
+  /** Does it work when the row is a Go-to-file RESULT? */
+  results: boolean;
+  /** REQUIRED when `results` is false. "We forgot" is not a reason; the test only checks
+   *  that a reason exists, but a reviewer reads it. */
+  reason?: string;
+}
+
+export const ROW_AFFORDANCES: readonly AffordanceParity[] = [
+  { affordance: "open", results: true },
+  { affordance: "open-with", results: true },
+  { affordance: "reveal", results: true },
+  // Rename from a result works, and is the one that cost two rounds to get right: it exits
+  // the filter, navigates to the file's folder, and mounts the editor there (editMountFor).
+  { affordance: "rename", results: true },
+  { affordance: "delete", results: true },
+  { affordance: "hash", results: true },
+  { affordance: "context-menu", results: true },
+  // The ONE genuine listing-only affordance, and the reason is structural rather than
+  // neglect: the inline-edit ROW exists only in the listing. An op that opens one therefore
+  // leaves the filter first (`editMountFor.exitFilter`) — so it is still *reachable* from a
+  // result, it just can't be hosted there. Hosting it in the results list would also put a
+  // focused text input in a list that re-renders on every streaming index batch.
+  {
+    affordance: "inline-edit",
+    results: false,
+    reason:
+      "The inline-edit row exists only in the listing. Ops that open one leave the filter " +
+      "first (editMountFor), so they remain reachable from a result — the editor simply " +
+      "cannot be hosted in a list that re-renders on every streaming index batch.",
+  },
+];
 
 // ---------- where an inline editor is allowed to mount ----------
 //

@@ -174,12 +174,14 @@ test("an op on the LISTING targets the selected row's path, joined to the curren
     rel: "sub/a.txt",
     name: "a.txt",
     isDir: false,
+    isSymlink: false,
     from: "listing",
   });
   assert.deepEqual(activeTarget(listingView(0)), {
     rel: "src",
     name: "src",
     isDir: true,
+    isSymlink: false,
     from: "listing",
   });
 });
@@ -193,6 +195,7 @@ test("an op on a FILTERED RESULT targets that result — not the listing's selec
     rel: "deep/nested/target.ts",
     name: "target.ts",
     isDir: false,
+    isSymlink: false,
     from: "results",
   });
 });
@@ -288,7 +291,7 @@ test("a HIDDEN target is reported as such — the Go-to-file index reaches files
   // at all AND leaves the edit state set with no input to Escape from, deadening the
   // listing's keyboard. The caller turns Hidden on for the op instead.
   const entries = [entry(".gitignore", { is_hidden: true }), entry("visible.ts")];
-  const target: OpTarget = { rel: ".gitignore", name: ".gitignore", isDir: false, from: "results" };
+  const target: OpTarget = { rel: ".gitignore", name: ".gitignore", isDir: false, isSymlink: false, from: "results" };
 
   assert.deepEqual(mountBlocker(target, entries, false), { kind: "hidden" });
   assert.deepEqual(mountBlocker(target, entries, true), { kind: "ok" }, "with Hidden on it renders fine");
@@ -296,12 +299,12 @@ test("a HIDDEN target is reported as such — the Go-to-file index reaches files
 
 test("a target that VANISHED between capture and mount is reported missing, not silently dropped", () => {
   // An agent (or another app) deleted it while the user was picking it out of the results.
-  const target: OpTarget = { rel: "sub/gone.ts", name: "gone.ts", isDir: false, from: "results" };
+  const target: OpTarget = { rel: "sub/gone.ts", name: "gone.ts", isDir: false, isSymlink: false, from: "results" };
   assert.deepEqual(mountBlocker(target, [entry("still-here.ts")], true), { kind: "missing" });
 });
 
 test("an ordinary visible target mounts without ceremony", () => {
-  const target: OpTarget = { rel: "sub/a.txt", name: "a.txt", isDir: false, from: "listing" };
+  const target: OpTarget = { rel: "sub/a.txt", name: "a.txt", isDir: false, isSymlink: false, from: "listing" };
   assert.deepEqual(mountBlocker(target, [entry("a.txt")], false), { kind: "ok" });
 });
 

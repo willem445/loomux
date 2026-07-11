@@ -30,23 +30,42 @@ sysinfo = "0.33"
 # File hashing for the file-manager pane (#214): a short SHA-256 per row, plus an
 # on-demand Hash submenu (SHA-256/512, SHA-1, CRC-32/16/8).
 #
-# VETTED AGAINST THE GETRANDOM BAN above, which is the only reason these are three
-# lines and not a hand-rolled SHA-256:
+# VETTED AGAINST THE GETRANDOM BAN above — which is the only reason this is three lines
+# rather than a hand-rolled SHA-256. Audit run 2026-07-11; re-run any time with the
+# commands below.
 #
-#   cargo tree -e normal --target all -i getrandom@0.3.4
-#     → getrandom v0.3.4 └── tauri v2.11.5      (pre-existing; tauri's own, unmoved)
-#   cargo tree -e normal --target all -i getrandom@0.2.17
-#     → "nothing to print"                       (not in the runtime tree at all)
+# THE QUESTION IS NOT "does the lock contain getrandom" — it already did, three times over,
+# and does on main today. It is "do THESE crates add a getrandom path". They do not:
+#
 #   cargo tree -e normal --target all -p sha2 / -p sha1 / -p crc
-#     → cfg-if, cpufeatures→libc, digest→block-buffer→generic-array→typenum
-#     → crc-catalog (a pure lookup-table crate, zero deps)
+#     sha2 / sha1 → cfg-if, cpufeatures → libc, digest → block-buffer →
+#                   generic-array → typenum          (no getrandom anywhere)
+#     crc         → crc-catalog                      (a pure lookup-table crate, zero deps)
 #
-# NONE of them touch getrandom, so none imports ProcessPrng. Cost in new packages:
-# `sha2` is **already in Cargo.lock** (a tauri transitive), and `sha1` reuses its
-# entire chain — so the three crates below add exactly THREE packages to the lock:
-# sha1, crc, crc-catalog. Hashing is not a place to be clever: these are the
-# RustCrypto reference implementations, and the integration tests check them against
-# the published NIST/standard vectors rather than against themselves.
+# For completeness, every getrandom in the lock and where it comes from — ALL PRE-EXISTING,
+# none of them ours (this is what the commands actually print, verbatim shape):
+#
+#   cargo tree -e normal --target all -i getrandom@0.2.17
+#     → getrandom v0.2.17 └── redox_users → dirs-sys → dirs → {loomux, tauri, wry}
+#       REDOX-ONLY. `dirs` gates redox_users behind cfg(target_os = "redox"), so this edge
+#       exists only under `--target all`; it is not compiled on Windows/macOS/Linux.
+#   cargo tree -e normal --target all -i getrandom@0.3.4
+#     → getrandom v0.3.4 └── tauri v2.11.5           (tauri's own)
+#   cargo tree -e normal --target all -i getrandom@0.4.3
+#     → getrandom v0.4.3 └── uuid → cfb → infer → tauri-utils → tauri-codegen/-macros
+#       (tauri's build/codegen chain)
+#
+# The binary loads today with all three present, so the ProcessPrng hazard is not what
+# these edges are — but they are named here so a future auditor re-running the commands
+# isn't ambushed by output the comment didn't predict. (An earlier version of this comment
+# claimed 0.2.17 printed nothing and never mentioned 0.4.3; rev-106 caught it. The
+# CONCLUSION was right; the recorded evidence has to be reproducible too.)
+#
+# Cost in new packages: `sha2` was ALREADY in Cargo.lock (a tauri transitive) with its whole
+# chain, and `sha1` reuses that chain — so these three lines add exactly THREE packages:
+# sha1, crc, crc-catalog. Hashing is not a place to be clever: these are the RustCrypto
+# reference implementations, and the integration tests check them against the published
+# FIPS 180-4 / CRC-catalogue vectors rather than against themselves.
 sha2 = "0.10"
 sha1 = "0.10"
 crc = "3"

@@ -150,10 +150,12 @@ whose failure mode is "deleted the wrong thing", that trade is worth an inconven
 
 The inconvenience is real, so it's surfaced honestly rather than leaked as jargon:
 the row tooltip says the link is shown but won't be followed, opened, renamed or
-deleted, and an attempted op toasts *"Loomux won't delete a symlink — it's shown
-here, but it's left alone. Use your OS file manager for links and junctions."* — not
-the raw backend `refusing to traverse symlink`, which is both jargon and, for a link
-you were trying to *delete*, the wrong verb entirely.
+deleted; the **context menu greys every row action** on a symlink with that reason (the
+same courtesy a folder already got — offering six items that all end in the same toast
+would be a menu that lies); and an op that does get attempted toasts *"Loomux won't delete
+a symlink — it's shown here, but it's left alone. Use your OS file manager for links and
+junctions."* — not the raw backend `refusing to traverse symlink`, which is both jargon
+and, for a link you were trying to *delete*, the wrong verb entirely.
 
 Deleting/renaming the **link itself** (never the target) is a reasonable follow-up.
 It needs `ensure_no_symlink` to grow a "final component may be a link" mode, and the
@@ -224,6 +226,40 @@ things.
 Nothing is ever cut silently: the result list is capped (ranking still runs over the
 *full* list, so the cap never costs the best hit) and the summary reports the true
 match count, the index size, and any backend truncation.
+
+## View parity: the results view is not a second-class row list
+
+**Three rounds running, an affordance was built for the directory listing and quietly
+omitted from the Go-to-file results:**
+
+| Round | The bug |
+| --- | --- |
+| 4 | Rename resolved its target from the *listing's* index even while the results were on screen — so it renamed a file the user could not see. |
+| 5 | The fix navigated correctly, but mounted its editor into the still-hidden listing — so *"F2 does nothing"* came back on the very path added to kill it. |
+| 6 | The context menu was wired to the listing's rows and not the results' at all — so right-clicking a result got the **webview's** default menu. |
+
+Each fix was correct. Each time, the *next* affordance forgot again. That is not three
+bugs; it is **one bug, three times**: the results view kept being an afterthought, and
+nothing in the code ever asked *"…and does this work there?"*
+
+So the class is closed twice over — structurally, and declaratively.
+
+**Structurally**, `fileexplorer.wireRowAffordances` is now the *only* place a row's
+behaviours are attached (click, double-click, right-click), and **both** views call it. A
+new affordance lands in both by construction, not by remembering.
+
+**Declaratively**, `ROW_AFFORDANCES` (in the pure model) lists every row affordance, and
+each must either work on a result or **say why not**. The parity test enforces that — and,
+crucially, **cross-checks the registry against the context menu's own action set**. Add an
+item to the menu without declaring it and the test fails, naming the affordance. That
+failure is the only moment anyone is going to think about the results view, so it is
+engineered to happen.
+
+Exactly one affordance is legitimately listing-only, and the reason is structural rather
+than neglect: the **inline-edit row** exists only in the listing. Ops that open one leave
+the filter first (`editMountFor.exitFilter`), so they are still *reachable* from a result —
+the editor simply cannot be *hosted* in a list that re-renders on every streaming index
+batch, where a focused text input would have its keystrokes eaten.
 
 ## The right-click menu
 
@@ -503,7 +539,7 @@ agents that don't exist. There's a test pinning that.
 | The pane | `src/pane.ts` | `startFiles()`, `isFiles`, `workdir`, `refuseOverlay()`, the `liveKind`/`capture`/`tabPaneInfo` arms. DOM-coupled → hand-validated. |
 | Placement | `src/grid.ts` | `openFilesPane()` — like `openWelcomePane`, but content instead of a form. Synchronous: there's no process to await. |
 | The manager | `src/fileexplorer.ts` | Toolbar, breadcrumb, listing, inline edits, Go-to-file. DOM wiring only. |
-| Its pure core | `src/fileexplorermodel.ts` | Listing order, rooted navigation, breadcrumb, formatting, inline-edit validation; `activeTarget` (which view an op resolves against), `editMountFor` (the view state an editor needs before it can mount) and `mountBlocker` (whether the target's row can be rendered at all). Unit-tested. |
+| Its pure core | `src/fileexplorermodel.ts` | Listing order, rooted navigation, breadcrumb, formatting, inline-edit validation; `activeTarget` (which view an op resolves against), `editMountFor` (the view state an editor needs before it can mount), `mountBlocker` (whether the target's row can be rendered at all), and `ROW_AFFORDANCES` (the view-parity registry). Unit-tested. |
 | Name ranking | `src/filematch.ts` | Substring + path-segment, best-occurrence, deterministic ties. Unit-tested. |
 | Typed bridge | `src/filemgr.ts` | `fm_*` wrappers (per-feature module, the `fileapi.ts` precedent). |
 | Menu model | `src/filemenu.ts` | What the context menu contains, what's enabled, and **what it acts on** (target bound at menu-open). Unit-tested. |
