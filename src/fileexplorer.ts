@@ -19,7 +19,9 @@ import {
   fmNewFolder,
   fmNewFile,
   fmRename,
-  fmDelete,
+  fmDeleteStart,
+  onDeleteEvent,
+  type DeleteEvent,
   fmCapabilities,
   fmOpen,
   fmOpenWith,
@@ -59,6 +61,12 @@ import {
   activeTarget,
   editMountFor,
   mountBlocker,
+  idleOp,
+  opBlockedReason,
+  isRowBusy,
+  baseName,
+  type PaneOp,
+  type OpRequest,
   type FmEntry,
   type EditState,
   type ExplorerView,
@@ -130,6 +138,19 @@ export class FileExplorerView {
   private crumbEl: HTMLElement;
   private renameBtn: HTMLButtonElement;
   private deleteBtn: HTMLButtonElement;
+  private newFileBtn: HTMLButtonElement;
+  private newFolderBtn: HTMLButtonElement;
+
+  // The long-running op, if any (#216). A delete now runs on a worker thread and reports
+  // back by event, so "a delete is happening" is a state the pane is IN — and a state has
+  // to be modelled, not implied by a boolean somebody forgets to clear. The rules live in
+  // the pure model (`opBlockedReason`): mutating ops wait, navigation and hashing don't.
+  private op: PaneOp = idleOp;
+  /** The id of the delete in flight — the same `nextSearchId()` counter as search, the
+   *  file index and hashing. Events for any other id are somebody else's (or a stale
+   *  pane's) and are dropped. */
+  private deleteId: number | null = null;
+  private deleteUnlisten: (() => void) | null = null;
   private listEl: HTMLElement;
   private statusEl: HTMLElement;
   /** The Hidden toggle's checkbox. Held so an op can turn it on (renaming a dotfile
@@ -187,15 +208,17 @@ export class FileExplorerView {
 
     this.crumbEl = el("div", "fileexp-crumbs");
 
-    const newFileBtn = el("button", "pane-btn", "") as HTMLButtonElement;
-    newFileBtn.innerHTML = SVG_NEW_FILE;
-    newFileBtn.title = "New file (Ctrl+N) — created empty; double-click it to open";
-    newFileBtn.addEventListener("click", () => this.beginCreate("new-file"));
+    this.newFileBtn = el("button", "pane-btn", "") as HTMLButtonElement;
+    this.newFileBtn.innerHTML = SVG_NEW_FILE;
+    this.newFileBtn.title = "New file (Ctrl+N) — created empty; double-click it to open";
+    this.newFileBtn.addEventListener("click", () => this.beginCreate("new-file"));
+    const newFileBtn = this.newFileBtn;
 
-    const newBtn = el("button", "pane-btn", "") as HTMLButtonElement;
-    newBtn.innerHTML = SVG_NEW_FOLDER;
-    newBtn.title = "New folder (Ctrl+Shift+N)";
-    newBtn.addEventListener("click", () => this.beginCreate("new-folder"));
+    this.newFolderBtn = el("button", "pane-btn", "") as HTMLButtonElement;
+    this.newFolderBtn.innerHTML = SVG_NEW_FOLDER;
+    this.newFolderBtn.title = "New folder (Ctrl+Shift+N)";
+    this.newFolderBtn.addEventListener("click", () => this.beginCreate("new-folder"));
+    const newBtn = this.newFolderBtn;
 
     this.renameBtn = el("button", "pane-btn", "") as HTMLButtonElement;
     this.renameBtn.innerHTML = SVG_RENAME;
@@ -303,6 +326,10 @@ export class FileExplorerView {
       if (this.disposed) un();
       else this.hashUnlisten = un;
     });
+    void onDeleteEvent((e) => this.onDeleteDone(e)).then((un) => {
+      if (this.disposed) un();
+      else this.deleteUnlisten = un;
+    });
   }
 
   // ---------- lifecycle ----------
@@ -320,6 +347,10 @@ export class FileExplorerView {
     this.cancelHashRun();
     this.filesUnlisten?.();
     this.hashUnlisten?.();
+    // The delete keeps running — it is a shell operation with no cancel handle, and half a
+    // deleted tree is worse than a finished one. Nothing is left to receive the event, which
+    // is exactly what closing the pane means. See `deleteTarget` for the full argument.
+    this.deleteUnlisten?.();
     closeContextMenu();
     this.el.remove();
   }
@@ -440,9 +471,30 @@ export class FileExplorerView {
 
   // ---------- operations ----------
 
+  /** May `request` run right now? Toasts the reason and returns false if not (#216).
+   *
+   *  Called at the TOP of every op — which works only because there is exactly one
+   *  implementation of each op and the toolbar, the keyboard and the context menu all
+   *  route through it (that is what `beginRenameOn`/`deleteTarget` are for). A guard on
+   *  the buttons alone would be a guard on one of three doors.
+   *
+   *  What it does NOT gate is the whole point: navigation and hashing stay live while a
+   *  delete runs. Blocking them would be #216's freeze all over again — just reimplemented
+   *  in TypeScript instead of on Tauri's main thread. The rules are pure and tested
+   *  (`opBlockedReason`). */
+  private allow(request: OpRequest): boolean {
+    const why = opBlockedReason(this.op, request);
+    if (why) {
+      showToast(why, "info");
+      return false;
+    }
+    return true;
+  }
+
   /** New folder / new file — the same interaction, so the same code path; only the
    *  backend call differs, at the single point where it has to. */
   private beginCreate(kind: "new-folder" | "new-file"): void {
+    if (!this.allow(kind)) return;
     // The new entry lands in the directory being BROWSED, so the listing has to be the
     // thing on screen — otherwise its editor row renders into a hidden list.
     this.exitFilter();
@@ -464,6 +516,7 @@ export class FileExplorerView {
    *  Both land here, so there is exactly one rename implementation and the
    *  editMountFor/mountBlocker discipline can't be forgotten by a second call site. */
   private beginRenameOn(target: OpTarget): void {
+    if (!this.allow("rename")) return;
     // What the VIEW must become before an editor can mount on this target (pure, and
     // tested: editMountFor). Getting the TARGET right was only half the bug — the other
     // half is where the editor LANDS. `exitFilter` is the load-bearing bit: render()
@@ -523,6 +576,10 @@ export class FileExplorerView {
   private async commitEdit(): Promise<void> {
     const state = this.edit;
     if (state.kind === "none") return;
+    // An editor can already be OPEN when a delete starts (from the context menu, say).
+    // Committing it would race a write against a shell operation walking the same tree — so
+    // refuse here too, and leave the editor up rather than throwing the typing away.
+    if (!this.allow(state.kind)) return;
     const siblings = this.rows().map((e) => e.name);
     if (!canCommit(state, siblings)) {
       // The row already shows the reason; don't also toast it.
@@ -582,8 +639,19 @@ export class FileExplorerView {
     await this.deleteTarget(target);
   }
 
-  /** Delete a target the caller has ALREADY bound (see `beginRenameOn` for why). */
+  /** Delete a target the caller has ALREADY bound (see `beginRenameOn` for why).
+   *
+   *  Runs on a WORKER THREAD and completes by event (#216) — this method returns as soon as
+   *  the thread is spawned. A recursive Recycle-Bin delete of a big tree used to run
+   *  synchronously on Tauri's main thread and froze the whole window until the shell was
+   *  finished.
+   *
+   *  There is no Cancel, deliberately. SHFileOperationW is one call with no cancel handle,
+   *  and a delete stopped mid-tree leaves half the children in the Recycle Bin and half on
+   *  disk — an outcome nobody can reason about. So the busy state says "in progress" and
+   *  never offers a button it could not honour. (doc/design/files-pane.md.) */
   private async deleteTarget(target: OpTarget): Promise<void> {
+    if (!this.allow("delete")) return;
     const what = target.isDir ? "folder" : "file";
     // Name the file in the dialog, and say what will ACTUALLY happen: promising the
     // Recycle Bin on a platform that has none is a lie the user only discovers when
@@ -597,14 +665,60 @@ export class FileExplorerView {
       !this.deleteRecycles
     );
     if (!ok) return;
+    // The confirm dialog was an await, so re-check: a delete could have been started from
+    // somewhere else while it was up. (It can't today — the dialog is modal — but this is
+    // the op layer, and "the dialog is modal" is not a property it should have to rely on.)
+    if (!this.allow("delete")) return;
+
+    const id = nextSearchId(); // one counter, four streams: search, index, hash, delete
+    this.deleteId = id;
+    this.op = { kind: "deleting", rel: target.rel, name: target.name };
+    this.render(); // the row goes busy and the mutating buttons grey out, NOW
+
     try {
-      await fmDelete(this.host.getRoot(), target.rel); // the captured path, not a re-lookup
-      this.invalidateIndex();
-      await this.refresh();
+      // The captured path, not a re-lookup. Resolves when the worker is SPAWNED; the
+      // delete itself completes on the `fm-delete` event.
+      await fmDeleteStart(id, this.host.getRoot(), target.rel);
     } catch (err) {
+      // The command itself was rejected (the path failed containment, say) — no worker
+      // exists, so no event is coming and the busy state must be cleared here.
+      this.finishDelete(id);
       showToast(explainOpError(err, "delete"));
-      await this.refresh();
+      this.render();
     }
+  }
+
+  /** A delete finished (or failed) on its worker thread. */
+  private onDeleteDone(e: DeleteEvent): void {
+    if (this.disposed || e.id !== this.deleteId) return; // not ours: another pane's delete
+    this.finishDelete(e.id);
+
+    if (e.error) {
+      // Already translated from the shell's own result code — "is open in another program"
+      // rather than "0x20". A failed delete leaves the entry there, so the re-list below
+      // matters: the rows on screen must agree with what is actually on disk.
+      showToast(e.error);
+    } else {
+      showToast(
+        e.recycled
+          ? `Moved "${baseName(e.rel)}" to the Recycle Bin.`
+          : `Deleted "${baseName(e.rel)}".`,
+        "info"
+      );
+    }
+    this.invalidateIndex(); // the index has an entry (or a subtree) that no longer exists
+
+    // Refresh only if we are still looking at the directory it happened in. The user is free
+    // to navigate DURING a delete — that is the whole point of not blocking navigation — and
+    // re-listing whatever they browsed to instead would be a refresh of the wrong place.
+    if (parentRel(e.rel) === this.rel) void this.refresh();
+    else this.render(); // elsewhere: just clear the busy chrome
+  }
+
+  private finishDelete(id: number): void {
+    if (this.deleteId !== id) return;
+    this.deleteId = null;
+    this.op = idleOp;
   }
 
   // ---------- hashing (#214) ----------
@@ -810,8 +924,13 @@ export class FileExplorerView {
   }
 
   private openMenuAt(e: MouseEvent, target: OpTarget | null): void {
-    showContextMenu(e.clientX, e.clientY, buildContextMenu(target, this.caps, HASH_ALGOS), (a) =>
-      this.runMenuAction(a)
+    // The menu's mutating items grey out for the same reason the buttons do, and from the
+    // same pure rule — so the two cannot drift apart.
+    showContextMenu(
+      e.clientX,
+      e.clientY,
+      buildContextMenu(target, this.caps, HASH_ALGOS, opBlockedReason(this.op, "delete")),
+      (a) => this.runMenuAction(a)
     );
   }
 
@@ -828,10 +947,22 @@ export class FileExplorerView {
    *  views by construction rather than by remembering. `ROW_AFFORDANCES` (the pure model)
    *  is the declarative half of the same guard: a new affordance must state whether it
    *  works in the results view, and the parity test fails until it does. */
-  private wireRowAffordances(row: HTMLElement, index: number, onOpen: () => void): void {
+  private wireRowAffordances(
+    row: HTMLElement,
+    index: number,
+    rel: string,
+    onOpen: () => void
+  ): void {
     row.addEventListener("click", () => this.selectRow(index));
     row.addEventListener("dblclick", () => onOpen());
     row.addEventListener("contextmenu", (e) => this.onRowContextMenu(e, index));
+    // The busy marker (#216) — attached HERE, with everything else, so it lands in the
+    // results view too rather than being remembered into it a round later. `rel` is why this
+    // takes a path: busy is a property of the FILE being deleted, not of a row index.
+    if (isRowBusy(this.op, rel)) {
+      row.classList.add("busy");
+      row.title = `Deleting "${baseName(rel)}"…`;
+    }
   }
 
   /** Move the selection to `index` in whichever view is on screen. */
@@ -975,8 +1106,17 @@ export class FileExplorerView {
    *  not even see. Now: no target in whichever list is showing → the buttons are dead. */
   private syncOpButtons(): void {
     const target = this.target();
-    this.renameBtn.disabled = !target;
-    this.deleteBtn.disabled = !target;
+    // A delete in flight greys every op that would WRITE — including the creates, which have
+    // no target and so were never touched by the rule above. Up/breadcrumbs/hash stay live.
+    const busy = opBlockedReason(this.op, "delete");
+    this.renameBtn.disabled = !target || !!busy;
+    this.deleteBtn.disabled = !target || !!busy;
+    this.newFileBtn.disabled = !!busy;
+    this.newFolderBtn.disabled = !!busy;
+    for (const b of [this.renameBtn, this.deleteBtn, this.newFileBtn, this.newFolderBtn]) {
+      if (busy) b.dataset.busy = "1";
+      else delete b.dataset.busy;
+    }
   }
 
   private renderCrumbs(): void {
@@ -1042,7 +1182,7 @@ export class FileExplorerView {
       // Click / double-click (a folder goes in, a file goes to the OS) / right-click — all
       // from the ONE place a row's behaviours are attached, so the results rows below get
       // exactly the same set. See wireRowAffordances.
-      this.wireRowAffordances(row, i, () => void this.openEntry(entry));
+      this.wireRowAffordances(row, i, rel, () => void this.openEntry(entry));
       frag.appendChild(row);
     });
 
@@ -1131,6 +1271,18 @@ export class FileExplorerView {
     const bits = [`${folders} folder${folders === 1 ? "" : "s"}`, `${files} file${files === 1 ? "" : "s"}`];
     if (!this.showHidden && hiddenCount > 0) bits.push(`${hiddenCount} hidden`);
     this.statusEl.textContent = bits.join(" · ");
+
+    // A delete in flight OWNS the status line for as long as it runs (#216). The greyed
+    // buttons say something is blocked; this says WHAT, and — because the row being deleted
+    // may well have been scrolled off, or the user may have navigated away, which they are
+    // free to do — it is the one place the state is always visible. No cancel is offered
+    // here either: see `deleteTarget`.
+    if (this.op.kind === "deleting") {
+      this.statusEl.textContent = `Deleting "${this.op.name}"…`;
+      this.statusEl.classList.add("busy");
+    } else {
+      this.statusEl.classList.remove("busy");
+    }
   }
 
   // ---------- Go to file (name index) ----------
@@ -1255,9 +1407,9 @@ export class FileExplorerView {
       dir.append(markUp(hit.rel.slice(0, base), clipRanges(hit.ranges, 0, base)));
       row.title = hit.rel;
       row.append(icon, name, dir);
-      // The SAME wiring the listing rows get — click, double-click, and (the round-6 gap)
-      // right-click. A result is a row; every affordance a row has, it has.
-      this.wireRowAffordances(row, i, () => void this.openGotoHit(i));
+      // The SAME wiring the listing rows get — click, double-click, right-click (the round-6
+      // gap) and the busy marker. A result is a row; every affordance a row has, it has.
+      this.wireRowAffordances(row, i, hit.rel, () => void this.openGotoHit(i));
       frag.appendChild(row);
     });
     this.gotoListEl.replaceChildren(frag);

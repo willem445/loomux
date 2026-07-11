@@ -50,6 +50,7 @@ use serde::Serialize;
 use std::path::{Path, PathBuf};
 
 use crate::fileedit::{err, safe_resolve};
+use tauri::{AppHandle, Emitter};
 
 /// Does any component of `rel` name something Windows would silently MANGLE?
 ///
@@ -367,6 +368,97 @@ pub fn delete(root: &str, rel: &str) -> Result<bool, String> {
     delete_path(&path, md.is_dir() && !md.file_type().is_symlink())
 }
 
+/// An RAII COM apartment for the calling thread (issue #216).
+///
+/// **This is the whole reason `fm_delete` was not simply made an `async fn`.**
+/// `SHFileOperationW` is a Shell API: the Shell is COM, and the documented contract is
+/// that the calling thread has initialized COM — in practice a single-threaded apartment,
+/// because the Shell's file-operation machinery is apartment-affine and (with UI enabled)
+/// pumps messages.
+///
+/// Today it works *by accident of where it runs*: the Tauri main thread is a GUI thread
+/// that `wry` has already `OleInitialize`d as an STA, so the requirement is satisfied by
+/// someone else. Hand the call to a bare worker thread and that stops being true — the
+/// worker inherits nothing. So the worker must enter its **own** apartment, and leave it
+/// again, exactly once. That is what this guard is.
+///
+/// The three return values all mean different things and all matter:
+///
+///   * `S_OK`     — we initialized the apartment. We must uninitialize it.
+///   * `S_FALSE`  — the thread was **already** initialized *in the same mode*. This is NOT
+///                  a no-op: the reference count **was** incremented, so it must still be
+///                  balanced by a `CoUninitialize`. Treating `S_FALSE` as "nothing to undo"
+///                  is the classic leak here, and `HRESULT::is_ok()` is true for it, which
+///                  is exactly why the two are handled together below rather than by
+///                  matching `S_OK` alone.
+///   * `RPC_E_CHANGED_MODE` — the thread is already an MTA and refuses to become an STA.
+///                  Our call took **no** reference, so we must **not** release one. (We
+///                  always spawn a fresh thread, so this cannot happen in practice; it is
+///                  handled because getting it wrong would unbalance somebody else's COM.)
+///
+/// RAII rather than a call pair: `delete_path` has several early returns, and an early
+/// return that skips `CoUninitialize` leaks an apartment reference for the life of the
+/// thread. `Drop` cannot be skipped.
+#[cfg(windows)]
+struct ComApartment {
+    /// Did our `CoInitializeEx` take a reference that we owe back?
+    owns_reference: bool,
+}
+
+#[cfg(windows)]
+impl ComApartment {
+    fn enter() -> Self {
+        use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
+        use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+        // SAFETY: plain COM initialization on the calling thread; no pointers are handed
+        // across, and the matching CoUninitialize is guaranteed by Drop below.
+        let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+        if hr == RPC_E_CHANGED_MODE {
+            return Self {
+                owns_reference: false,
+            };
+        }
+        // S_OK *and* S_FALSE both took a reference. `is_ok()` covers both.
+        Self {
+            owns_reference: hr.is_ok(),
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ComApartment {
+    fn drop(&mut self) {
+        if self.owns_reference {
+            use windows::Win32::System::Com::CoUninitialize;
+            // SAFETY: balances exactly the CoInitializeEx in `enter`, on the same thread.
+            unsafe { CoUninitialize() };
+        }
+    }
+}
+
+/// Turn `SHFileOperationW`'s return code into something a human can act on.
+///
+/// Its codes are its OWN — they are not `GetLastError` values, and they are not `HRESULT`s.
+/// The set below is the documented `DE_*` list plus the plain Win32 codes the shell also
+/// passes through. Anything unrecognized keeps the raw number in the message: a bug report
+/// with a code beats prose that invented a cause.
+pub fn describe_delete_failure(rc: i32) -> String {
+    match rc {
+        0x02 => "the item no longer exists".into(),
+        0x05 | 0x78 => "access denied — you may not have permission to delete it".into(),
+        0x20 => "the file is open in another program".into(),
+        0x75 | 0x4C7 => "the delete was cancelled".into(),
+        0x79 | 0x7A => "the path is too long for the shell to handle".into(),
+        0x7C => "the path is not valid".into(),
+        0x85 => "the disk is full".into(),
+        0x10000 => "the Recycle Bin refused the item (it may be too large, or on a drive with no bin)".into(),
+        // 0x402 is undocumented and, in the wild, almost always a path the shell couldn't
+        // resolve. Say what we can and keep the code.
+        0x402 => "the shell could not find the item (code 0x402)".into(),
+        other => format!("the shell refused to delete this item (code 0x{other:x})"),
+    }
+}
+
 #[cfg(windows)]
 fn delete_path(path: &Path, _is_dir: bool) -> Result<bool, String> {
     use std::os::windows::ffi::OsStrExt;
@@ -375,9 +467,16 @@ fn delete_path(path: &Path, _is_dir: bool) -> Result<bool, String> {
         FO_DELETE, SHFILEOPSTRUCTW,
     };
 
+    // Enter a single-threaded apartment for the duration of the call (#216). On the old
+    // main-thread path this was satisfied by wry's OleInitialize; on the worker thread we
+    // now run on, it is satisfied here. Held for the whole function: Drop releases it on
+    // every exit path, including the early returns below.
+    let _com = ComApartment::enter();
+
     // SHFileOperationW takes a DOUBLE-nul-terminated list of paths. One path here,
     // so: <path> NUL NUL. Getting this wrong reads past the buffer, so it is worth
-    // being explicit about.
+    // being explicit about. (Moving to a worker thread changed nothing here — the buffer
+    // is still built, used and dropped entirely inside this call.)
     let mut from: Vec<u16> = path.as_os_str().encode_wide().collect();
     from.push(0);
     from.push(0);
@@ -385,23 +484,24 @@ fn delete_path(path: &Path, _is_dir: bool) -> Result<bool, String> {
     let mut op = SHFILEOPSTRUCTW {
         wFunc: FO_DELETE as u32,
         pFrom: windows::core::PCWSTR(from.as_ptr()),
-        // ALLOWUNDO is the Recycle Bin. The other three suppress Explorer's own UI:
-        // loomux has already asked the user, and a modal from the shell on top of
-        // our own confirmation would be both redundant and (being another window)
-        // a focus-stealing surprise.
+        // ALLOWUNDO is the Recycle Bin. The other three suppress the shell's OWN UI:
+        //   FOF_SILENT        — no shell progress dialog. The PANE shows progress now
+        //                       (#216), and a second, separate, shell-owned window
+        //                       floating over loomux would be both redundant and a
+        //                       focus-stealing surprise.
+        //   FOF_NOCONFIRMATION — loomux already asked.
+        //   FOF_NOERRORUI      — errors come back as a code we translate and toast, rather
+        //                        than as a modal the user has to dismiss.
+        // Together these are the "no UI at all" set, which is also why the worker thread
+        // needs no message pump: nothing here can create a window.
         fFlags: (FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI).0 as u16,
         ..Default::default()
     };
     // SAFETY: `from` is a double-nul-terminated UTF-16 buffer that outlives the
-    // call, and `op` is fully initialized. SHFileOperationW returns 0 on success;
-    // its error codes are its own (not GetLastError), hence the bare code in the
-    // message — it is for a bug report, not for the user, who sees the prose.
+    // call, and `op` is fully initialized. COM is initialized on this thread (above).
     let rc = unsafe { SHFileOperationW(&mut op) };
     if rc != 0 {
-        return Err(err(
-            "io",
-            format!("the shell refused to delete this item (code {rc})"),
-        ));
+        return Err(err("io", describe_delete_failure(rc)));
     }
     // fAnyOperationsAborted is set when the user cancelled a shell prompt. We
     // suppressed those, so this really means "the shell declined" — report it
@@ -703,9 +803,97 @@ pub fn fm_rename(root: String, rel: String, name: String) -> Result<String, Stri
     rename(&root, &rel, &name)
 }
 
+/// One completed delete, streamed back as an `fm-delete` event (#216).
+///
+/// **The contract the pane reads:** exactly one of `recycled`/`error` is present, and the
+/// pane branches on `error`. Both absent would render as a silent success on a delete that
+/// never happened, so `delete_event` below is the *only* constructor — see the test that
+/// pins the wire shape.
+#[derive(Clone, Serialize)]
+pub struct DeleteEvent {
+    id: u64,
+    /// The `rel` the delete was asked to remove — so the pane can match the result to the
+    /// row it marked busy, even if it has navigated elsewhere since.
+    rel: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recycled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+/// Build the completion event from a delete's outcome. Factored out of the worker (which
+/// needs a live `AppHandle` to emit, and so can't be reached from a test) precisely so the
+/// **payload contract** can be: success ⇒ `recycled` and no `error`; failure ⇒ `error` and
+/// no `recycled`. The frontend's success/failure branch is `error != null`, and this is the
+/// one place that could ever break it.
+pub fn delete_event(id: u64, rel: String, outcome: Result<bool, String>) -> DeleteEvent {
+    match outcome {
+        Ok(recycled) => DeleteEvent {
+            id,
+            rel,
+            recycled: Some(recycled),
+            error: None,
+        },
+        Err(e) => DeleteEvent {
+            id,
+            rel,
+            recycled: None,
+            error: Some(e),
+        },
+    }
+}
+
+/// Delete `rel` on a **worker thread**, and report the outcome as an `fm-delete` event
+/// tagged with the caller's `id` (issue #216).
+///
+/// ## Why this is not a synchronous command
+///
+/// Tauri runs a sync command on the **main (webview) thread**. `SHFileOperationW` over a
+/// `node_modules`-sized tree is tens of thousands of file operations and takes seconds to
+/// minutes — for all of which the entire window, every pane, is frozen. Same class as the
+/// #207 search freeze; the same shape of fix.
+///
+/// ## Why it is not an `async fn` either
+///
+/// This is the part that made it worth deferring rather than rushing (rev-102, round 3).
+/// A plain `async fn` command runs on Tauri's async runtime, on a thread pool whose COM
+/// state is nobody's business — and `SHFileOperationW` is a **Shell/COM** API whose
+/// apartment requirement the main thread was silently satisfying for us (wry
+/// `OleInitialize`s it as an STA). Offloading it naively trades a freeze for an
+/// apartment question. So this spawns a **dedicated OS thread** that enters its own STA
+/// (`ComApartment`, above) for the duration and leaves it on the way out.
+///
+/// ## Why there is NO cancellation — deliberately
+///
+/// The other three streams on the shared id counter (search, name index, hashing) are all
+/// cancellable, and this one is conspicuously not. That is a decision, not an oversight:
+///
+///   * `SHFileOperationW` is **one call**. It exposes no cancel handle, no progress sink,
+///     and no way to ask it to stop. (`IFileOperation` does, via
+///     `IFileOperationProgressSink` — a different, much larger API surface, and a
+///     different conversation.)
+///   * Even if it could be stopped, a delete cancelled halfway through a tree leaves a
+///     **half-deleted directory** — some children in the Recycle Bin, some not, and a
+///     parent that may or may not still exist. That is a worse outcome than waiting.
+///
+/// So a delete, once confirmed, runs to completion. The UI says *"Deleting…"* and does not
+/// offer a Cancel button it could not honor. It does not register a flag in the cancel
+/// registry either — a flag nobody polls is a lie told to the next reader.
+///
+/// Navigation and hashing stay live throughout: they touch nothing the delete owns, and
+/// freezing them in the UI would reintroduce, one layer up, exactly the unresponsiveness
+/// this change exists to remove.
 #[tauri::command]
-pub fn fm_delete(root: String, rel: String) -> Result<bool, String> {
-    delete(&root, &rel)
+pub fn fm_delete_start(app: AppHandle, id: u64, root: String, rel: String) {
+    std::thread::spawn(move || {
+        // The apartment is entered inside `delete_path` (Windows), so the pure `delete`
+        // fn is correct on ANY thread — which is also what lets the integration tests
+        // drive the real, COM-initialized path rather than a stubbed one.
+        let event = delete_event(id, rel.clone(), delete(&root, &rel));
+        // A failed emit means the window is gone. The delete already happened; there is
+        // nobody left to tell, and that is exactly what closing the pane means.
+        let _ = app.emit("fm-delete", event);
+    });
 }
 
 #[tauri::command]

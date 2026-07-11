@@ -201,6 +201,82 @@ export function activeTarget(view: ExplorerView): OpTarget | null {
   return { rel: hit.rel, name: baseName(hit.rel), isDir: false, isSymlink: false, from: "results" };
 }
 
+// ---------- the long-running-op state machine (#216) ----------
+//
+// A delete used to run synchronously on Tauri's main thread, freezing the whole window —
+// every pane — for as long as `SHFileOperationW` took over the tree. It now runs on a
+// worker thread and reports back by event, which means the pane has, for the first time, a
+// state it can be IN: a delete is in flight, the row is going away, and the answer hasn't
+// arrived yet.
+//
+// That state has to be modelled, not implied, because two questions fall out of it and both
+// have wrong obvious answers:
+//
+//   1. What else may the user do meanwhile? Not "nothing" — freezing the UI during a delete
+//      would reintroduce, one layer up, the exact unresponsiveness that moving the delete
+//      off the main thread was meant to remove. And not "anything" either: a second delete
+//      or a rename of the same tree while the shell is halfway through it is a race with a
+//      destructive operation.
+//   2. Can it be cancelled? No — see `fm_delete_start`. `SHFileOperationW` is one call with
+//      no cancel handle, and a delete stopped mid-tree leaves half its children in the
+//      Recycle Bin and half on disk. So the UI must say "in progress", not offer a Cancel
+//      button it cannot honor. There is deliberately no `cancel` here to be tempted by.
+
+/** What the pane is doing that other requests have to respect. At most one at a time. */
+export type PaneOp =
+  | { kind: "idle" }
+  /** A delete is running on the backend worker. `rel` identifies the row (which is marked
+   *  busy); `name` is what the "please wait" message says. */
+  | { kind: "deleting"; rel: string; name: string };
+
+export const idleOp: PaneOp = { kind: "idle" };
+
+/** Everything the user can ask for while an op may be in flight. */
+export type OpRequest =
+  // MUTATING — these change the tree, so they must serialize against a delete.
+  | "delete"
+  | "rename"
+  | "new-folder"
+  | "new-file"
+  // READ-ONLY / hand-off — these touch nothing the delete owns, so they never wait.
+  | "navigate"
+  | "hash"
+  | "open"
+  | "open-with"
+  | "reveal";
+
+const MUTATING: ReadonlySet<OpRequest> = new Set<OpRequest>([
+  "delete",
+  "rename",
+  "new-folder",
+  "new-file",
+]);
+
+/** Why `request` can't run right now, or null when it can.
+ *
+ *  The split is between requests that MUTATE the tree and requests that don't. A delete in
+ *  flight blocks the mutating ones — racing a second destructive operation against a shell
+ *  operation that is halfway through the same tree is exactly the kind of thing that ends
+ *  with the user unable to say what is actually on disk.
+ *
+ *  It blocks NOTHING else. **Navigation and hashing stay live**: they read, they don't
+ *  write, and they touch nothing the delete owns. Blocking them would be the freeze all
+ *  over again — just implemented in TypeScript this time instead of on the main thread. */
+export function opBlockedReason(op: PaneOp, request: OpRequest): string | null {
+  if (op.kind === "idle") return null;
+  if (!MUTATING.has(request)) return null;
+  return `Deleting "${op.name}" — wait for that to finish first.`;
+}
+
+export function isOpBlocked(op: PaneOp, request: OpRequest): boolean {
+  return opBlockedReason(op, request) !== null;
+}
+
+/** Is `rel` the row a delete is currently working on? The listing renders it busy. */
+export function isRowBusy(op: PaneOp, rel: string): boolean {
+  return op.kind === "deleting" && op.rel === rel;
+}
+
 // ---------- VIEW PARITY: the results view is not a second-class row list ----------
 //
 // THREE ROUNDS RUNNING, an affordance was built for the directory LISTING and quietly
@@ -237,6 +313,7 @@ export type RowAffordance =
   | "delete"
   | "hash"
   | "context-menu"
+  | "busy-state"
   | "inline-edit";
 
 export interface AffordanceParity {
@@ -246,18 +323,32 @@ export interface AffordanceParity {
   /** REQUIRED when `results` is false. "We forgot" is not a reason; the test only checks
    *  that a reason exists, but a reviewer reads it. */
   reason?: string;
+  /** Is this affordance offered as a context-MENU item — i.e. can the parity test
+   *  cross-check it against what `buildContextMenu` really builds?
+   *
+   *  Most are. The exceptions are the ones that are row CHROME rather than commands:
+   *  `context-menu` itself (the right-click that opens the thing), `inline-edit` (the editor
+   *  row a command mounts), `busy-state` (#216, the marker on a row being deleted). Declared
+   *  here rather than skipped by name inside the test, because a hardcoded skip list is
+   *  exactly the place a future affordance gets quietly buried. */
+  menuItem: boolean;
 }
 
 export const ROW_AFFORDANCES: readonly AffordanceParity[] = [
-  { affordance: "open", results: true },
-  { affordance: "open-with", results: true },
-  { affordance: "reveal", results: true },
+  { affordance: "open", results: true, menuItem: true },
+  { affordance: "open-with", results: true, menuItem: true },
+  { affordance: "reveal", results: true, menuItem: true },
   // Rename from a result works, and is the one that cost two rounds to get right: it exits
   // the filter, navigates to the file's folder, and mounts the editor there (editMountFor).
-  { affordance: "rename", results: true },
-  { affordance: "delete", results: true },
-  { affordance: "hash", results: true },
-  { affordance: "context-menu", results: true },
+  { affordance: "rename", results: true, menuItem: true },
+  { affordance: "delete", results: true, menuItem: true },
+  { affordance: "hash", results: true, menuItem: true },
+  { affordance: "context-menu", results: true, menuItem: false },
+  // The busy marker on a row being deleted (#216). It is a row affordance like any other, so
+  // it is attached where all of them are (`wireRowAffordances`) and shows in BOTH views: a
+  // result row for the tree the shell is currently walking must not look idle and clickable
+  // just because the user typed into the filter box while it ran.
+  { affordance: "busy-state", results: true, menuItem: false },
   // The ONE genuine listing-only affordance, and the reason is structural rather than
   // neglect: the inline-edit ROW exists only in the listing. An op that opens one therefore
   // leaves the filter first (`editMountFor.exitFilter`) — so it is still *reachable* from a
@@ -266,6 +357,7 @@ export const ROW_AFFORDANCES: readonly AffordanceParity[] = [
   {
     affordance: "inline-edit",
     results: false,
+    menuItem: false,
     reason:
       "The inline-edit row exists only in the listing. Ops that open one leave the filter " +
       "first (editMountFor), so they remain reachable from a result — the editor simply " +

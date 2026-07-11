@@ -36,6 +36,12 @@ const linkTarget: OpTarget = {
 
 const labels = (items: MenuItem[]) => items.filter((i) => !i.separator).map((i) => i.label);
 const find = (items: MenuItem[], label: string) => items.find((i) => i.label === label);
+/** …and the same lookup where the item's absence is itself a failure. */
+const must = (items: MenuItem[], label: string): MenuItem => {
+  const item = find(items, label);
+  assert.ok(item, `expected a "${label}" item`);
+  return item;
+};
 
 // ---------- the rule: the target is BOUND at menu-open ----------
 
@@ -211,11 +217,28 @@ test("PARITY: the affordances declared results:true are all actually offered on 
   const offered = new Set(menuActions(buildContextMenu(fileTarget, WIN, HASH_ALGOS)).map((a) => a.kind));
   for (const a of ROW_AFFORDANCES) {
     if (!a.results) continue;
-    // `context-menu` and `inline-edit` are not menu ITEMS — they're how you reach them.
-    if (a.affordance === "context-menu" || a.affordance === "inline-edit") continue;
+    // Some affordances are row CHROME, not commands — the right-click itself, the inline
+    // editor a command mounts, the busy marker (#216). The registry SAYS so (`menuItem`);
+    // it is not a list of names buried in this test, which is where the next one would get
+    // quietly buried too.
+    if (!a.menuItem) continue;
     assert.ok(
       offered.has(a.affordance),
       `ROW_AFFORDANCES claims "${a.affordance}" works on a result, but the menu doesn't offer it`
+    );
+  }
+});
+
+test("PARITY: an affordance declared menuItem:false has to be one of the known chrome kinds", () => {
+  // Otherwise `menuItem: false` becomes the new hiding place: declare it, skip the
+  // cross-check, never wire it to a result. Chrome is a short, closed list — a NEW row
+  // affordance is a command until someone argues otherwise, right here.
+  const CHROME: RowAffordance[] = ["context-menu", "inline-edit", "busy-state"];
+  for (const a of ROW_AFFORDANCES) {
+    if (a.menuItem) continue;
+    assert.ok(
+      CHROME.includes(a.affordance),
+      `"${a.affordance}" claims not to be a menu item — if it is a COMMAND, it must appear in the menu (and on a result); if it is chrome, say so here`
     );
   }
 });
@@ -255,4 +278,45 @@ test("menuActions walks submenus, so nothing offered is unreachable", () => {
     "new-folder",
     "new-file",
   ]));
+});
+
+// ---------- a delete in flight (#216) ----------
+
+test("while a delete is in flight, the menu greys the ops that would mutate the tree", () => {
+  const busy = 'Deleting "node_modules" — wait for that to finish first.';
+  const items = buildContextMenu(fileTarget, WIN, HASH_ALGOS, busy);
+  for (const label of ["Rename…", "Delete (to Recycle Bin)"]) {
+    const item = must(items, label);
+    assert.ok(item.disabled, `${label} must be greyed while a delete runs`);
+    assert.equal(item.reason, busy, "and say what it's waiting on");
+  }
+  const created = must(items, "New").children!;
+  assert.ok(created.every((c) => c.disabled && c.reason === busy), "New → Folder/File too");
+});
+
+test("…but Open, Reveal and Hash stay live — they read, they don't write", () => {
+  // The same rule the op-state machine enforces: freezing the read paths would be the
+  // main-thread freeze all over again, just moved into the menu.
+  const items = buildContextMenu(fileTarget, WIN, HASH_ALGOS, "Deleting…");
+  for (const label of ["Open (default app)", "Open with…", "Reveal in file explorer"]) {
+    assert.ok(!must(items, label).disabled, `${label} must stay usable during a delete`);
+  }
+  assert.ok(must(items, "Hash").children!.every((c) => !c.disabled), "hashing stays live");
+});
+
+test("a symlink's reason beats the busy reason — the permanent fact is the useful one", () => {
+  const items = buildContextMenu(linkTarget, WIN, HASH_ALGOS, "Deleting…");
+  assert.match(must(items, "Rename…").reason!, /symlink/);
+});
+
+test("the empty-space menu is greyed too — a delete blocks creates wherever they're invoked", () => {
+  const items = buildContextMenu(null, WIN, HASH_ALGOS, "Deleting…");
+  assert.ok(must(items, "New").children!.every((c) => c.disabled));
+});
+
+test("no busy reason means nothing is greyed by it — idle is the default", () => {
+  for (const idle of [undefined, null, ""]) {
+    const items = buildContextMenu(fileTarget, WIN, HASH_ALGOS, idle as string | null | undefined);
+    assert.ok(!must(items, "Rename…").disabled);
+  }
 });

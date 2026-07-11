@@ -41,11 +41,43 @@ export const fmNewFile = (root: string, rel: string, name: string): Promise<stri
 export const fmRename = (root: string, rel: string, name: string): Promise<string> =>
   invoke("fm_rename", { root, rel, name });
 
-/** Delete the entry at `rel`. Resolves to `true` when it went to the Recycle Bin
- *  (recoverable) and `false` when it was destroyed — see `fmDeleteMode`, which the
- *  confirmation dialog uses so it can promise the truth BEFORE the user commits. */
-export const fmDelete = (root: string, rel: string): Promise<boolean> =>
-  invoke("fm_delete", { root, rel });
+/** One finished delete, streamed back from its worker thread (#216). */
+export interface DeleteEvent {
+  /** The id the caller passed to `fmDeleteStart` — from the same `nextSearchId()`
+   *  counter every other stream uses. Ignore events whose id isn't yours. */
+  id: number;
+  /** The path that was deleted — carried back so the pane never has to remember
+   *  "which delete was that?" across an await it doesn't control. */
+  rel: string;
+  /** `true` → it went to the Recycle Bin (recoverable); `false` → destroyed. Absent on
+   *  failure. See `fmDeleteMode`, which the confirm dialog uses to promise the truth
+   *  BEFORE the user commits. */
+  recycled?: boolean;
+  /** Present iff the delete failed — already translated from the shell's result code
+   *  into something a human can act on ("…is open in another program"). */
+  error?: string;
+}
+
+/** START deleting the entry at `rel`, on a dedicated worker thread; resolves as soon as
+ *  the thread is spawned, NOT when the delete finishes. Completion arrives on the
+ *  `fm-delete` event (`onDeleteEvent`), matched by `id`.
+ *
+ *  Why this is not a plain `Promise<boolean>` like every other fm_* op: Tauri runs
+ *  synchronous commands on the main (webview) thread, so a recursive Recycle-Bin delete
+ *  of a big tree froze the entire window until the shell was done (#216). The other ops
+ *  are single metadata calls and stay sync — this one can walk a `node_modules`.
+ *
+ *  There is deliberately NO cancel. SHFileOperationW is one call with no cancel handle,
+ *  and a delete stopped mid-tree would leave half the children in the Recycle Bin and
+ *  half on disk. The pane shows "in progress" rather than offering a Cancel it could not
+ *  honor. See doc/design/files-pane.md. */
+export const fmDeleteStart = (id: number, root: string, rel: string): Promise<void> =>
+  invoke("fm_delete_start", { id, root, rel });
+
+/** Subscribe to delete completions. The fourth stream on the shared id counter, after
+ *  `ft-search`, `ft-files` and `fm-hash`. */
+export const onDeleteEvent = (cb: (e: DeleteEvent) => void): Promise<UnlistenFn> =>
+  listen<DeleteEvent>("fm-delete", (e) => cb(e.payload));
 
 /** What this platform can actually do. Probed once per pane and consulted when the
  *  context menu is built, so an item that would always fail is HIDDEN rather than

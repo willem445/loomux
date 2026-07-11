@@ -362,6 +362,150 @@ code is deterministic. The CRC variants are pinned and *named* in the UI (ISO-HD
 SMBUS), because a bare "CRC-16" is genuinely ambiguous and a user comparing our checksum
 against another tool's needs to know which one they are looking at.
 
+## Deleting on a worker thread (#216)
+
+A delete used to run **synchronously on Tauri's main (webview) thread**, because that is
+what a `#[tauri::command] fn` does. A Recycle-Bin delete of a `node_modules` is tens of
+thousands of shell operations, and for every second of it the *entire window* — every
+terminal, every agent — was frozen. Same class of bug as the #207 search freeze, and the
+same shape of fix: a worker thread, a streamed completion event, an id.
+
+`fm_delete_start(id, root, rel)` spawns a thread and returns immediately. The thread does
+the delete and emits `fm-delete` with `{ id, rel, recycled? , error? }`. That is the
+**fourth stream** on the one monotonic id counter the frontend already keeps
+(`nextSearchId`), after `ft-search`, `ft-files` and `fm-hash`.
+
+### Why not just `async fn` — the question rev-102 raised
+
+This is the part that made the naive fix wrong, and the reason the issue was filed rather
+than patched in round 3.
+
+`SHFileOperationW` is a **Shell/COM** API. Its threading requirement was being satisfied
+for us *by accident*: wry `OleInitialize`s the main thread, so the main thread is an STA
+and the call was always made from inside a properly initialized apartment. An `async fn`
+command runs on Tauri's async runtime — a thread pool whose COM state is nobody's business
+and certainly not ours. Offloading naively would have traded a visible freeze for an
+invisible apartment bug: the kind that works on the developer's machine and fails on a
+user's, or fails only when some other subsystem happens to have initialized the pool
+thread first.
+
+So the delete gets a **dedicated OS thread that enters its own apartment**:
+
+```rust
+let _com = ComApartment::enter();   // CoInitializeEx(COINIT_APARTMENTTHREADED)
+// … SHFileOperationW …
+// CoUninitialize on drop — an early return cannot leak the init
+```
+
+`ComApartment` is an RAII guard, and the three-way return of `CoInitializeEx` is the whole
+reason it is a guard rather than two bare calls:
+
+| `CoInitializeEx` returns | meaning | must we `CoUninitialize`? |
+| --- | --- | --- |
+| `S_OK` | we initialized the apartment | **yes** |
+| `S_FALSE` | already initialized — *but the reference count was still incremented* | **yes** |
+| `RPC_E_CHANGED_MODE` | the thread is already an MTA; no reference taken | **no** — uninitializing here would decrement somebody else's count |
+
+`S_FALSE` is the one that gets written as a failure and skipped. It is a *success*: the
+reference was taken, and every `CoInitializeEx` that returns it must be balanced. The guard
+records `owns_reference` and drops accordingly.
+
+The apartment is entered inside `delete_path`, not at the top of the worker, so the pure
+`delete()` function is correct on **any** thread — which is also what lets the integration
+tests drive the real COM-initialized path instead of a stub. `delete_works_from_a_fresh_thread_that_has_never_initialized_com`
+is the test that would have failed before this change; `repeated_deletes_on_fresh_threads_do_not_unbalance_com`
+runs it 25 times, so a leaked or over-released reference surfaces rather than lurking.
+
+The worker needs **no message pump**, and this is a property of the flags rather than luck:
+
+```
+FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI
+```
+
+`FOF_ALLOWUNDO` is the Recycle Bin itself and stays. The other three are the *no UI at all*
+set — no progress dialog, no confirmation, no error box — which is right because the pane
+now shows the state itself, and it also means nothing in this call can create a window and
+sit waiting for messages we are not pumping. The **double-NUL** invariant on `pFrom` is
+unchanged: the path list is NUL-separated and NUL-NUL-terminated, and a worker thread does
+not alter that in any way.
+
+### Cancellation: there is none, deliberately
+
+The other three streams are cancellable and this one is conspicuously not. That is a
+decision:
+
+* `SHFileOperationW` is **one call**. No cancel handle, no progress sink, no way to ask it
+  to stop. (`IFileOperation` + `IFileOperationProgressSink` can — a much larger API surface
+  and a different conversation.)
+* Even if it could be stopped, a delete cancelled mid-tree leaves a **half-deleted
+  directory**: some children in the Recycle Bin, some not, a parent that may or may not
+  still exist. That is a worse thing to hand a user than a wait.
+
+So the pane's busy state communicates **"in progress"** — a pulsing row, greyed mutating
+buttons, and the status line naming the file — and offers no Cancel it could not honour. It
+does not register a flag in the cancel registry either: *a flag nobody polls is a lie told
+to the next reader.* Closing the pane does not cancel it; it merely stops anyone listening,
+which is what closing a pane means.
+
+### What the busy state blocks — and what it must not
+
+Modelled in `fileexplorermodel.ts` (`PaneOp`, `opBlockedReason`), pure and tested:
+
+| while a delete is in flight | |
+| --- | --- |
+| delete, rename, new folder, new file | **blocked**, with a reason naming the file |
+| navigate, hash, open, open-with, reveal | **live** |
+
+The second row is the load-bearing one. Blocking navigation or hashing would reintroduce
+the freeze one layer up — just implemented in TypeScript instead of on the main thread.
+They read; they don't write; they touch nothing the delete owns. You can browse away while
+a big tree deletes, and the completion event refreshes the listing **only if you are still
+in the directory it happened in** (`parentRel(rel) === this.rel`) — otherwise re-listing
+would refresh a place the user didn't ask about.
+
+The guard is applied at the top of each *op* (`beginCreate`, `beginRenameOn`,
+`deleteTarget`, `commitEdit`), not on the buttons — because the toolbar, the keyboard and
+the context menu are three doors into the same op layer, and guarding one door is guarding
+none. The context menu greys its mutating items from the *same* pure rule, so the two
+cannot drift.
+
+The busy marker on the row is attached in `wireRowAffordances` — the one place a row's
+behaviours are wired — and declared in `ROW_AFFORDANCES` with `results: true`. A result row
+for a tree the shell is currently walking must not look idle and clickable just because the
+user typed into the filter box.
+
+### Why rename / new file / new folder stay synchronous
+
+#216 says "the `fm_*` ops", so this needs answering precisely rather than by omission.
+
+They are **single metadata operations** — one `rename(2)`/`MoveFileW`, one `mkdir`, one
+`create`. They are bounded by a single directory-entry write and complete in microseconds
+regardless of how large the thing they act on is: renaming a 40 GB directory is exactly as
+fast as renaming an empty one, because nothing is copied or walked. There is no tree to
+recurse and therefore no freeze to remove. Moving them to workers would add an event round
+trip, a busy state and an id per op, and buy nothing — the async machinery here is not free
+of cost, it is a response to a specific unbounded operation.
+
+Delete is the outlier precisely *because* it recurses.
+
+### The non-Windows arms
+
+`std::fs::remove_dir_all` on a huge tree freezes just as thoroughly as the shell does, and
+`trash`-less platforms take the permanent-delete path. Both run on the same worker: the
+threading is in `fm_delete_start`, above `delete()`, so every platform gets it. Only the COM
+apartment is Windows-specific (`#[cfg(windows)]`), and it is entered below the split, where
+it applies.
+
+### Failure
+
+`SHFileOperationW` returns its **own** result codes, not `GetLastError` ones — a fact that
+is easy to get wrong and produces confidently mistranslated messages. `describe_delete_failure`
+maps the ones a user can act on (`0x20` "open in another program", `0x05`/`0x78` access
+denied, `0x10000` "the Recycle Bin refused it", `0x85` disk full, …) and keeps the raw hex
+for anything else rather than inventing a meaning. The event carries the translated string;
+the pane toasts it and re-lists, because a failed delete leaves the entry where it was and
+the rows on screen must agree with the disk.
+
 ## The pure core
 
 `fileexplorermodel.ts` holds everything decidable, DOM-free and tested:
@@ -564,12 +708,9 @@ agents that don't exist. There's a test pinning that.
 - **Deleting/renaming a symlink itself** (never its target) — see the symlink
   section above; needs `ensure_no_symlink` to grow a final-component-may-be-a-link
   mode.
-- **The `fm_*` commands are synchronous**, and Tauri runs sync commands on the main
-  thread — so a Recycle-Bin delete of a `node_modules`-scale folder will freeze the
-  window until `SHFileOperationW` returns. It matches house style (only `voice_stop`
-  is async), and the main thread's STA is genuinely the *right* apartment for these
-  shell APIs, so a naive `async fn` would trade a freeze for `CoInitializeEx`
-  questions in the worker. Filed as its own follow-up rather than rushed into this PR.
+- **Cancelling a delete** — not deferred so much as *declined*; see *Deleting on a
+  worker thread* for the argument, which is that `SHFileOperationW` cannot be stopped
+  and a half-deleted tree is worse than a slow one.
 
 ## A small bonus
 

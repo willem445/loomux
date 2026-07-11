@@ -54,6 +54,12 @@ window per project.
 - On Windows, delete goes to the **Recycle Bin**, so a mis-click is recoverable —
   and the confirmation says so. On macOS/Linux there's no bin, so it's permanent,
   and the confirmation says *that* instead. It never promises an undo you don't have.
+- A delete runs **off the UI thread**: a `node_modules`-sized folder can take a while,
+  and nothing else in loomux stops while it does. The row pulses, the status line names
+  what's going, and the ops that would write to the same tree wait their turn — but you
+  can keep browsing, hashing and opening files throughout. There is no Cancel, because
+  a delete stopped halfway leaves half a folder in the Recycle Bin and half on disk;
+  once you confirm, it finishes.
 - **Hidden** toggle — shows hidden files, and widens the Go-to-file index to include
   git-ignored paths (`node_modules`, build output).
 

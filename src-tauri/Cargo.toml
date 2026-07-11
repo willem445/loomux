@@ -104,6 +104,13 @@ windows = { version = "0.57", features = [
     # WindowsAndMessaging is pulled only for ShellExecuteW's SHOW_WINDOW_CMD arg.
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
+    # COM apartment init for the delete WORKER thread (#216). SHFileOperationW is a shell
+    # API and documents a COM requirement; the main thread satisfies it only because wry
+    # already OleInitialize'd it as an STA. Move the call to a worker and the worker must
+    # enter its own apartment — CoInitializeEx(COINIT_APARTMENTTHREADED) / CoUninitialize,
+    # RAII-guarded. That is the whole reason this was NOT a naive `async fn`. See
+    # `filemgr::ComApartment` and doc/design/files-pane.md.
+    "Win32_System_Com",
 ] }
 
 # Voice-prompt prototype (#58): native mic capture via WASAPI. Windows-scoped on

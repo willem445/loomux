@@ -986,6 +986,27 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .fileexp-row.symlink .fileexp-name { color: var(--text-dim); font-style: italic; }
 .fileexp-row.hidden-entry { opacity: 0.55; }
 .fileexp-row.editing { background: var(--panel-2); }
+/* A row whose file the shell is currently deleting (#216). The delete runs on a worker
+   thread now, so this state is VISIBLE for as long as it takes — a `node_modules` can be
+   seconds. It says "in progress", nothing more: there is deliberately no Cancel, because
+   SHFileOperationW has no cancel handle and a delete stopped mid-tree leaves half the
+   children in the Recycle Bin. Offering a button we could not honour would be worse than
+   offering none. The pulse is the whole affordance, and it is applied in BOTH views
+   (wireRowAffordances) — a result row for the tree being deleted must not look idle. */
+.fileexp-row.busy,
+.fileexp-goto-item.busy {
+  opacity: 0.5;
+  cursor: progress;
+  animation: fileexp-busy 1.4s ease-in-out infinite;
+}
+@keyframes fileexp-busy {
+  50% { opacity: 0.28; }
+}
+@media (prefers-reduced-motion: reduce) {
+  /* Still unmistakably not-idle, just not moving. */
+  .fileexp-row.busy,
+  .fileexp-goto-item.busy { animation: none; opacity: 0.4; }
+}
 .fileexp-icon { flex: none; display: inline-flex; color: var(--text-dim); }
 .fileexp-row.sel .fileexp-icon { color: var(--accent); }
 .fileexp-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
@@ -1008,6 +1029,10 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   background: var(--panel); color: var(--text-dim); font-size: 11px;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
+/* While a delete runs, the status line says what it is waiting on — the one place the
+   state is visible even after the user scrolls the row away or navigates elsewhere,
+   both of which they are free to do (#216). */
+.fileexp-status.busy { color: var(--text); }
 
 .fileexp-goto-item {
   display: flex; align-items: baseline; gap: 6px;

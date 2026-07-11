@@ -14,8 +14,8 @@
 //! the human GUI-validation list.
 
 use loomux_lib::filemgr::{
-    capabilities, delete, delete_mode, list, new_file, new_folder, open_default, open_with, rename,
-    reveal, validate_name,
+    capabilities, delete, delete_event, delete_mode, describe_delete_failure, list, new_file,
+    new_folder, open_default, open_with, rename, reveal, validate_name,
 };
 use std::fs;
 use std::path::Path;
@@ -542,4 +542,197 @@ fn capabilities_tell_the_truth_about_this_platform() {
     // Linux can open the folder but cannot SELECT the entry — the menu labels that
     // honestly rather than over-promising.
     assert_eq!(caps.reveal_selects, cfg!(any(windows, target_os = "macos")));
+}
+
+// ---------- #216: delete runs on a WORKER THREAD, in its own COM apartment ----------
+//
+// `fm_delete` used to be a synchronous Tauri command, so it ran on the main (webview)
+// thread and froze the entire window for the duration of a big tree. Moving it to a worker
+// is the obvious fix and the naive one is WRONG: `SHFileOperationW` is a Shell/COM API whose
+// apartment requirement the main thread was silently satisfying for us (wry OleInitialize's
+// it as an STA). A bare worker inherits nothing.
+//
+// These tests drive `delete` from threads that have NEVER touched COM — which is exactly the
+// condition the worker runs under. If `ComApartment` were missing or wrong, this is where it
+// would show.
+
+#[test]
+fn delete_works_from_a_fresh_thread_that_has_never_initialized_com() {
+    // THE #216 TEST. The main thread's apartment is not available here, so the delete has to
+    // stand up its own. A freshly spawned std thread is precisely what `fm_delete_start` uses.
+    let root = tempfile::tempdir().unwrap();
+    let rp = root.path().to_str().unwrap().to_string();
+    fs::create_dir_all(root.path().join("tree/nested/deeper")).unwrap();
+    fs::write(root.path().join("tree/a.txt"), "x").unwrap();
+    fs::write(root.path().join("tree/nested/b.txt"), "x").unwrap();
+    fs::write(root.path().join("tree/nested/deeper/c.txt"), "x").unwrap();
+
+    let handle = std::thread::spawn(move || delete(&rp, "tree"));
+    let recycled = handle.join().expect("the worker must not panic").unwrap();
+
+    assert_eq!(recycled, delete_mode().mode == "recycle");
+    assert!(!root.path().join("tree").exists(), "the whole tree is gone");
+}
+
+#[test]
+fn repeated_deletes_on_fresh_threads_do_not_unbalance_com() {
+    // The apartment guard is RAII: every enter must be matched by exactly one leave, on every
+    // exit path. A leak wouldn't fail loudly — it would quietly hold an apartment reference
+    // per delete for the life of the thread. Hammering it across many short-lived threads is
+    // the cheap way to notice a guard that only *sometimes* runs: an unbalanced init surfaces
+    // as a hang or a failure long before this loop ends.
+    let root = tempfile::tempdir().unwrap();
+    for i in 0..25 {
+        let name = format!("f{i}.txt");
+        fs::write(root.path().join(&name), "x").unwrap();
+        let rp = root.path().to_str().unwrap().to_string();
+        let n = name.clone();
+        std::thread::spawn(move || delete(&rp, &n))
+            .join()
+            .expect("no worker may panic")
+            .unwrap_or_else(|e| panic!("delete {i} failed: {e}"));
+        assert!(!root.path().join(&name).exists());
+    }
+}
+
+#[test]
+fn a_delete_on_a_worker_still_enforces_containment_and_the_root_guard() {
+    // Moving the call off the main thread must not have moved it out from behind the guards.
+    // Same refusals, same reasons, just on a different thread.
+    let parent = tempfile::tempdir().unwrap();
+    let root = parent.path().join("root");
+    fs::create_dir(&root).unwrap();
+    fs::write(parent.path().join("secret.txt"), "do not touch").unwrap();
+    let rp = root.to_str().unwrap().to_string();
+
+    for rel in ["../secret.txt", "", ".", "   "] {
+        let r = rp.clone();
+        let rel_owned = rel.to_string();
+        let e = std::thread::spawn(move || delete(&r, &rel_owned))
+            .join()
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            matches!(err_code(&e), "outside-root" | "not-found" | "invalid-path"),
+            "for {rel:?}: {e}"
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(parent.path().join("secret.txt")).unwrap(),
+        "do not touch"
+    );
+}
+
+#[test]
+fn the_failure_path_surfaces_an_error_rather_than_claiming_success() {
+    // A file the OS won't let go of. On Windows an open handle without FILE_SHARE_DELETE is a
+    // sharing violation and the shell refuses; the delete must report that, and the file must
+    // still be there afterwards — a delete that half-fails and reports success is how a user
+    // loses track of what is actually on disk.
+    //
+    // POSIX unlink happily removes an open file, so there is no equivalent condition there;
+    // the non-Windows arm of this is the containment test above (an error path that IS
+    // reachable on every platform).
+    if !cfg!(windows) {
+        eprintln!("skipping: an open file is not un-deletable on POSIX");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let rp = root.path().to_str().unwrap().to_string();
+    let path = root.path().join("locked.txt");
+    fs::write(&path, "held open").unwrap();
+
+    // Hold it open for the duration of the delete.
+    let _held = std::fs::File::open(&path).unwrap();
+    let result = std::thread::spawn(move || delete(&rp, "locked.txt"))
+        .join()
+        .unwrap();
+
+    // Windows *can* still recycle a file open for shared reading, so this is not a hard
+    // assertion that it fails — it is an assertion that the two agree. Whatever the shell
+    // decided, the reported outcome must match what is on disk.
+    let still_there = path.exists();
+    match (&result, still_there) {
+        (Ok(_), false) => {} // deleted, and says so
+        (Err(e), true) => {
+            // Refused, and says so — with prose, not a bare number.
+            assert_eq!(err_code(e), "io", "got: {e}");
+            assert!(e.len() > 10, "the failure must be described, not just coded: {e}");
+        }
+        (Ok(_), true) => panic!("claimed success while the file is still on disk"),
+        (Err(e), false) => panic!("reported failure ({e}) but the file is gone"),
+    }
+}
+
+#[test]
+fn shell_failure_codes_are_translated_into_something_a_human_can_act_on() {
+    // SHFileOperationW's codes are its OWN — not GetLastError, not HRESULT. A bare number in a
+    // toast is useless; these are the ones a user can actually do something about.
+    assert!(describe_delete_failure(0x20).contains("open in another program"));
+    assert!(describe_delete_failure(0x05).contains("permission"));
+    assert!(describe_delete_failure(0x02).contains("no longer exists"));
+    assert!(describe_delete_failure(0x85).contains("disk is full"));
+    assert!(describe_delete_failure(0x10000).contains("Recycle Bin"));
+
+    // An unknown code keeps the raw number: a bug report with a code beats prose that
+    // invented a cause.
+    let unknown = describe_delete_failure(0x1234);
+    assert!(unknown.contains("0x1234"), "got: {unknown}");
+}
+
+// ---------- the completion-event contract (#216) ----------
+//
+// The delete now finishes on a worker thread and reports by event, so the *payload* is the
+// interface — the pane has nothing else to go on. `fm_delete_start` itself needs a live
+// AppHandle to emit and cannot be called from here, which is exactly why the payload is
+// built by `delete_event`: the contract stays reachable.
+
+#[test]
+fn a_completed_delete_reports_what_actually_happened_to_the_tree() {
+    let td = tempfile::tempdir().unwrap();
+    let root = td.path();
+    let dir = root.join("tree");
+    fs::create_dir_all(dir.join("nested")).unwrap();
+    fs::write(dir.join("nested/a.txt"), b"a").unwrap();
+    fs::write(dir.join("b.txt"), b"b").unwrap();
+
+    // Exactly what the worker does: run the delete, turn the outcome into the event.
+    let outcome = delete(root.to_str().unwrap(), "tree");
+    let event = delete_event(7, "tree".into(), outcome);
+    let json: serde_json::Value = serde_json::to_value(&event).unwrap();
+
+    assert_eq!(json["id"], 7, "the id the pane will match its busy row against");
+    assert_eq!(json["rel"], "tree", "and the path, so it can match without remembering");
+    assert!(json.get("error").is_none(), "a success must carry NO error: the pane branches on it");
+    assert!(json["recycled"].is_boolean(), "…and must say whether it is recoverable");
+
+    // The event claims success — so the tree, recursively, must be gone. An event that says
+    // "deleted" over a directory still on disk is the one failure the pane cannot detect.
+    assert!(!dir.exists(), "the whole tree, not just the entries we could see");
+    assert!(root.exists(), "and nothing above it");
+}
+
+#[test]
+fn a_failed_delete_reports_an_error_and_never_a_recycled_flag() {
+    // The other half of the contract: `error` present, `recycled` ABSENT. If both were
+    // absent the pane would render a silent success over a file that is still there.
+    let td = tempfile::tempdir().unwrap();
+    let outcome = delete(td.path().to_str().unwrap(), "does-not-exist");
+    assert!(outcome.is_err(), "deleting a phantom must fail, not no-op into a success");
+    let json = serde_json::to_value(delete_event(9, "does-not-exist".into(), outcome)).unwrap();
+
+    assert!(json["error"].is_string());
+    assert!(json.get("recycled").is_none(), "a failure must not also claim a Recycle Bin outcome");
+    assert_eq!(json["id"], 9);
+}
+
+#[test]
+fn the_event_carries_the_path_so_a_pane_that_navigated_away_can_still_place_it() {
+    // The pane is free to browse elsewhere WHILE a delete runs (not blocking navigation is
+    // half the point of #216). When the event lands it must be able to answer "was that in
+    // the directory I'm looking at now?" — which it does from `rel`, not from memory of
+    // what it was doing when it started.
+    let json = serde_json::to_value(delete_event(1, "deep/nested/tree".into(), Ok(true))).unwrap();
+    assert_eq!(json["rel"], "deep/nested/tree", "the full rel, not a basename");
+    assert_eq!(json["recycled"], true);
 }

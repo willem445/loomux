@@ -71,12 +71,12 @@ const sep: MenuItem = { label: "", separator: true };
 
 /** The "New →" submenu. Present in every menu — on a row and on empty space alike,
  *  because "make something here" is always a sensible thing to want. */
-function newSubmenu(): MenuItem {
+function newSubmenu(busy?: string): MenuItem {
   return {
     label: "New",
     children: [
-      { label: "Folder", action: { kind: "new-folder" } },
-      { label: "File", action: { kind: "new-file" } },
+      { label: "Folder", action: { kind: "new-folder" }, disabled: !!busy, reason: busy },
+      { label: "File", action: { kind: "new-file" }, disabled: !!busy, reason: busy },
     ],
   };
 }
@@ -106,11 +106,18 @@ function hashSubmenu(target: OpTarget, algos: readonly AlgoChoice[]): MenuItem {
 export function buildContextMenu(
   target: OpTarget | null,
   caps: FmCaps,
-  algos: readonly AlgoChoice[]
+  algos: readonly AlgoChoice[],
+  /** Set while a long-running op (a delete) is in flight — from `opBlockedReason` (#216).
+   *  The MUTATING items are greyed with it, so the menu can't offer a rename of a tree the
+   *  shell is halfway through deleting. Everything else stays live: Open, Reveal and Hash
+   *  read, they don't write, and blocking them would be the main-thread freeze all over
+   *  again, just implemented in the menu instead. */
+  busyReason?: string | null
 ): MenuItem[] {
+  const busy = busyReason || undefined;
   if (!target) {
     // Empty space: nothing is selected, so only the directory-scoped actions apply.
-    return [newSubmenu()];
+    return [newSubmenu(busy)];
   }
 
   const items: MenuItem[] = [];
@@ -154,17 +161,20 @@ export function buildContextMenu(
   }
 
   items.push(sep);
+  // `inert` (a symlink) wins over `busy`: it is a permanent property of the row, and the
+  // more specific explanation is the more useful one.
+  const mutBlock = inert ?? busy;
   items.push({
     label: "Rename…",
     action: { kind: "rename", target },
-    disabled: !!inert,
-    reason: inert,
+    disabled: !!mutBlock,
+    reason: mutBlock,
   });
   items.push({
     label: caps.delete_mode === "recycle" ? "Delete (to Recycle Bin)" : "Delete permanently…",
     action: { kind: "delete", target },
-    disabled: !!inert,
-    reason: inert,
+    disabled: !!mutBlock,
+    reason: mutBlock,
   });
 
   items.push(sep);
@@ -179,7 +189,7 @@ export function buildContextMenu(
   }
 
   items.push(sep);
-  items.push(newSubmenu());
+  items.push(newSubmenu(busy));
   return items;
 }
 

@@ -164,7 +164,7 @@ pub fn run() {
             filemgr::fm_new_folder,
             filemgr::fm_new_file,
             filemgr::fm_rename,
-            filemgr::fm_delete,
+            filemgr::fm_delete_start,
             filemgr::fm_capabilities,
             filemgr::fm_open,
             filemgr::fm_open_with,

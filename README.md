@@ -43,7 +43,8 @@ A **file explorer** pane is loomux's Windows-Explorer equivalent: browse folders
 whatever application your OS associates with that extension** — a `.png` opens in
 your image viewer, a `.pdf` in your PDF reader. Loomux does not open it. You also
 get **new file**, **new folder**, **rename** (`F2`) and **delete** (`Del`; to the
-**Recycle Bin** on Windows), a **right-click menu** (open with…, reveal in your OS file
+**Recycle Bin** on Windows, and off the UI thread — a huge folder doesn't freeze the
+window while it goes), a **right-click menu** (open with…, reveal in your OS file
 manager, hash), a short **SHA-256** per file computed off-thread, and a fast **Go to
 file** name search that jumps anywhere under the root. It splits, docks, maximizes and restores like any other pane, and comes back
 at the same folder on session restore — but it is *not* an agent, so it never

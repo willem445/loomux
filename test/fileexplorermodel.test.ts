@@ -22,6 +22,12 @@ import {
   baseName,
   editMountFor,
   mountBlocker,
+  opBlockedReason,
+  isOpBlocked,
+  isRowBusy,
+  idleOp,
+  type PaneOp,
+  type OpRequest,
   type FmEntry,
   type EditState,
   type ExplorerView,
@@ -382,4 +388,74 @@ test("with no edit in flight there is nothing to validate or commit", () => {
   assert.equal(nameError(noEdit, ["anything"]), null);
   assert.ok(!canCommit(noEdit, []));
   assert.ok(!isNoopRename(noEdit));
+});
+
+// ---------- the long-running-op state machine (#216) ----------
+//
+// A delete used to run synchronously on Tauri's main thread and froze the whole window for
+// its duration. It now runs on a worker and reports by event — which gives the pane a state
+// it can be IN, and that state has to be modelled rather than implied.
+
+const deleting = (rel: string, name: string): PaneOp => ({ kind: "deleting", rel, name });
+
+test("nothing is blocked while the pane is idle", () => {
+  for (const req of [
+    "delete",
+    "rename",
+    "new-folder",
+    "new-file",
+    "navigate",
+    "hash",
+    "open",
+    "open-with",
+    "reveal",
+  ] as OpRequest[]) {
+    assert.equal(opBlockedReason(idleOp, req), null, `${req} must run when idle`);
+    assert.equal(isOpBlocked(idleOp, req), false);
+  }
+});
+
+test("a delete in flight blocks the MUTATING ops — and only those", () => {
+  // THE TABLE. Racing a second destructive op against a shell operation that is halfway
+  // through the same tree is how a user ends up unable to say what is actually on disk.
+  const op = deleting("sub/tree", "tree");
+  for (const req of ["delete", "rename", "new-folder", "new-file"] as OpRequest[]) {
+    assert.ok(isOpBlocked(op, req), `${req} mutates the tree — it must wait`);
+    assert.match(opBlockedReason(op, req)!, /tree/, "and the reason must name the file");
+  }
+});
+
+test("a delete in flight must NOT block navigation or hashing", () => {
+  // The load-bearing half. Blocking these would reintroduce the freeze one layer up — just
+  // implemented in TypeScript instead of on the main thread. They read; they don't write;
+  // they touch nothing the delete owns.
+  const op = deleting("sub/tree", "tree");
+  for (const req of ["navigate", "hash", "open", "open-with", "reveal"] as OpRequest[]) {
+    assert.equal(
+      opBlockedReason(op, req),
+      null,
+      `${req} reads but never writes — freezing it is the bug we just removed`
+    );
+  }
+});
+
+test("the reason names the file, so the user knows WHAT they're waiting on", () => {
+  assert.match(opBlockedReason(deleting("a/b/node_modules", "node_modules"), "rename")!, /node_modules/);
+});
+
+test("only the row being deleted is busy", () => {
+  const op = deleting("sub/tree", "tree");
+  assert.ok(isRowBusy(op, "sub/tree"));
+  assert.ok(!isRowBusy(op, "sub/other"), "a sibling is not busy");
+  assert.ok(!isRowBusy(op, "tree"), "and the match is on the full rel, not the name");
+  assert.ok(!isRowBusy(idleOp, "sub/tree"), "nothing is busy when idle");
+});
+
+test("there is no cancel — deliberately, and the model offers none to be tempted by", () => {
+  // SHFileOperationW is ONE call with no cancel handle, and a delete stopped mid-tree leaves
+  // half its children in the Recycle Bin and half on disk. So the UI says "in progress" and
+  // never offers a Cancel it could not honor. If a `cancel` ever appears in PaneOp, this test
+  // is the place someone has to come and argue for it.
+  const op = deleting("sub/tree", "tree");
+  assert.deepEqual(Object.keys(op).sort(), ["kind", "name", "rel"]);
 });
