@@ -127,7 +127,7 @@ voiceController.init(() => activeGrid().activePane);
 function eventsFor(ws: Workspace): PaneEvents {
   return {
     onFocus: (pane) => ws.grid.setActive(pane),
-    onCloseRequest: (pane) => ws.grid.closePane(pane),
+    onCloseRequest: (pane) => void requestClosePane(ws, pane),
     onSplit: (pane, dir) => openWelcomeIn(ws, dir, pane),
     onMinimize: (pane) => ws.grid.minimize(pane),
     onMaximize: (pane) => ws.grid.toggleMaximize(pane),
@@ -135,7 +135,20 @@ function eventsFor(ws: Workspace): PaneEvents {
       const groupId = pane.orchGroupId;
       if (groupId) ws.grid.toggleGroupMinimize(groupId);
     },
+    // A files pane re-rooted, or a pane was renamed: the persisted layout is stale
+    // but no grid event fired, so nothing else would save it (#214).
+    onRecordChanged: () => onGridChanged(),
   };
+}
+
+/** Close a pane at the HUMAN's request (the ✕, or Ctrl+Shift+W) — the one close
+ *  path that asks first. A file-explorer pane can be holding unsaved edits in its
+ *  editor, and it's the only pane kind where loomux itself owns that buffer, so it
+ *  gets a confirm instead of a silent discard (rev-99 finding 3). Every other pane
+ *  answers instantly and closes exactly as before. */
+async function requestClosePane(ws: Workspace, pane: Pane): Promise<void> {
+  if (!(await pane.confirmClose())) return;
+  ws.grid.closePane(pane);
 }
 
 /** Find a pane by pty id across ALL tabs — a PTY exit / focus / rename can
@@ -943,8 +956,11 @@ document.addEventListener(
         openPane("column");
         break;
       case "close-pane": {
-        const g = activeGrid();
-        if (g.activePane) g.closePane(g.activePane);
+        // Same guarded path as the ✕ — Ctrl+Shift+W must not be the one way to lose
+        // a files pane's unsaved edits without being asked.
+        const ws = tabs.activeWorkspace;
+        const pane = ws.grid.activePane;
+        if (pane) void requestClosePane(ws, pane);
         break;
       }
       case "new-tab":

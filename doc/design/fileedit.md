@@ -146,10 +146,29 @@ A `regex` mode remains the obvious follow-up.
   header button, added to the close-every-other-overlay blocks + `activeOverlay` +
   `dispose`), `shortcuts.ts` (`Alt+F`), and `main.ts` (dispatch).
 
+## Two searches: names vs contents
+
+The left column carries **two** boxes, and they answer different questions:
+
+| Box | Question | Reads file contents? |
+| --- | --- | --- |
+| **Go to file** (top, #214) | *Where is the file called X?* | No — paths only |
+| **Search in files** (below, #174/#207) | *Which files mention X?* | Yes |
+
+They share one enumeration source (`plan_enumeration` — `git ls-files` by default,
+full walk when **Ignored files** is on or the root isn't a repo), so the toggle
+means one thing in this view, not two. Their costs are wildly different, though:
+the content search must open and scan every candidate file on every query, while
+the name search enumerates paths **once** per root and then filters that cached
+list in memory — zero I/O per keystroke, which is what makes it instant. The name
+search's ranking is pure and lives in `src/filematch.ts`; the full rationale
+(including why it's substring rather than fuzzy) is in
+[`files-pane.md`](files-pane.md).
+
 ## Search + in-tree highlighting
 
-Rather than a separate results panel, the search box lives at the top of the
-left column and highlights matching files directly in the tree (a lightweight
+Rather than a separate results panel, the content-search box highlights matching
+files directly in the tree (a lightweight
 take on VS Code): each hit file gets an accent highlight and a clickable
 match-count badge (the badge toggles whether that file is in the replace set).
 Typing debounces a search so highlights update live; the branches leading to

@@ -837,6 +837,135 @@ pub fn search_planned(
     run_search(root, query, opts, enumeration, cancelled, on_batch)
 }
 
+// ---------- file-NAME enumeration (issue #214) ----------
+
+/// Paths are streamed to the UI in batches of this size. Bigger than
+/// `SEARCH_BATCH`: a path is a few dozen bytes against a match's line of context,
+/// and the frontend wants the whole list resident as fast as possible (it filters
+/// in memory from there).
+const FILES_BATCH: usize = 1_000;
+
+/// Is `rel` a plain, root-relative path — no `..`, no absolute root, no Windows
+/// drive prefix? The lexical half of `safe_resolve`'s guard, without its I/O.
+///
+/// Enumeration lists *names*; it opens nothing, so the per-path symlink/metadata
+/// walk `safe_resolve` does would be pure cost — and it is exactly the cost this
+/// feature exists to avoid (a 50k-file repo would pay 50k stat chains just to
+/// populate a filter list). Every path handed back here is re-validated through
+/// `safe_resolve` the moment it is actually *used* (`ft_read_file` when the user
+/// opens a result), so the guarantee is unchanged; this only keeps a malformed
+/// entry out of the list in the first place. `git ls-files` never emits such a
+/// path, and the walk builds its own — so in practice this rejects nothing. It's
+/// here so that stays true by construction rather than by assumption.
+fn is_plain_relative(rel: &str) -> bool {
+    !rel.is_empty()
+        && Path::new(rel)
+            .components()
+            .all(|c| matches!(c, Component::Normal(_)))
+}
+
+/// Enumerate every candidate file under `root` as a root-relative, forward-slashed
+/// path — **names only; no file is opened or read** (issue #214).
+///
+/// This is the "optimized and fast file search" the issue asks for, and the point
+/// of splitting it from `run_search` is that it does none of the expensive part:
+/// no `open`, no read, no binary sniff, no line scan. It reuses the *same*
+/// enumeration source as the content search (`plan_enumeration`: `git ls-files` in
+/// a git repo so `.gitignore` is respected for free, the full walk when
+/// `include_ignored` is set or the root isn't a repo), so the two agree on which
+/// files exist — the toggle means the same thing in both.
+///
+/// The frontend calls this **once per root** and then filters the cached list in
+/// memory on every keystroke, so typing costs zero I/O. Bounded by the same
+/// `SEARCH_FILE_CEILING` and reports `truncated` rather than silently cutting;
+/// polls `cancelled` between batches (and between directories in the walk) so a
+/// superseded/abandoned enumeration stops promptly.
+pub fn list_files(
+    root: &str,
+    include_ignored: bool,
+    cancelled: &dyn Fn() -> bool,
+    on_batch: &mut dyn FnMut(Vec<String>),
+) -> Result<bool, String> {
+    let root_norm = safe_resolve(root, "")?;
+    let mut buf: Vec<String> = Vec::new();
+    let mut seen = 0usize;
+    let mut truncated = false;
+
+    // Local so the two enumeration arms can't drift on batching/ceiling handling.
+    // Returns true when the caller must stop (cancelled or ceiling hit).
+    let mut push = |rel: String, seen: &mut usize, truncated: &mut bool, buf: &mut Vec<String>| {
+        if *seen >= SEARCH_FILE_CEILING {
+            *truncated = true;
+            return true;
+        }
+        *seen += 1;
+        buf.push(rel);
+        if buf.len() >= FILES_BATCH {
+            on_batch(std::mem::take(buf));
+        }
+        false
+    };
+
+    match plan_enumeration(root, include_ignored) {
+        Enumeration::Files(files) => {
+            for rel in files {
+                if cancelled() {
+                    break;
+                }
+                if !is_plain_relative(&rel) {
+                    continue;
+                }
+                if push(rel, &mut seen, &mut truncated, &mut buf) {
+                    break;
+                }
+            }
+        }
+        Enumeration::Walk { apply_excludes } => {
+            // Explicit stack, mirroring run_search: unbounded repo depth must not
+            // blow the Rust stack.
+            let mut stack = vec![root_norm.clone()];
+            'walk: while let Some(dir) = stack.pop() {
+                if cancelled() {
+                    break;
+                }
+                let rd = match std::fs::read_dir(&dir) {
+                    Ok(rd) => rd,
+                    Err(_) => continue, // unreadable dir: skip it, don't fail the listing
+                };
+                for ent in rd.flatten() {
+                    let ft = match ent.file_type() {
+                        Ok(ft) => ft,
+                        Err(_) => continue,
+                    };
+                    if ft.is_symlink() {
+                        continue; // listed nowhere, followed nowhere — same as the search walk
+                    }
+                    let path = ent.path();
+                    if ft.is_dir() {
+                        let name = ent.file_name().to_string_lossy().into_owned();
+                        if !should_skip_dir(&name, apply_excludes) {
+                            stack.push(path);
+                        }
+                        continue;
+                    }
+                    if !ft.is_file() {
+                        continue;
+                    }
+                    let rel = rel_display(&root_norm, &path);
+                    if push(rel, &mut seen, &mut truncated, &mut buf) {
+                        break 'walk;
+                    }
+                }
+            }
+        }
+    }
+
+    if !buf.is_empty() {
+        on_batch(buf);
+    }
+    Ok(truncated)
+}
+
 /// Cap a display line so one very long line can't bloat a result payload.
 fn cap_line(s: &str) -> String {
     const MAX: usize = 400;
@@ -1046,9 +1175,79 @@ pub fn ft_search_start(
 }
 
 /// Cancel the in-flight search `id` (a new keystroke or `Esc`). Idempotent.
+///
+/// Also cancels a `ft_files_start` enumeration (#214): both take their ids from
+/// the same monotonic frontend counter, so ids are unique across the two and one
+/// registry + one cancel command serves both.
 #[tauri::command]
 pub fn ft_search_cancel(registry: State<'_, Arc<SearchRegistry>>, id: u64) {
     registry.cancel(id);
+}
+
+/// One streamed batch of a file-name enumeration (#214), tagged with the caller's
+/// `id`. Same shape and same id-mismatch discipline as `SearchEvent`; `files` is
+/// empty on the terminal `done` event, which carries the final `truncated`/`error`.
+#[derive(Clone, Serialize)]
+struct FilesEvent {
+    id: u64,
+    files: Vec<String>,
+    done: bool,
+    truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+/// Kick off a file-NAME enumeration on a worker thread (issue #214). Returns
+/// immediately; paths arrive as `ft-files` events tagged with `id`, and
+/// `ft_search_cancel(id)` stops it.
+///
+/// Same off-thread/streaming/cancellable shape as `ft_search_start` and for the
+/// same reason (a sync command would walk a big repo on the webview thread and
+/// freeze it) — but it reads no file contents, so it is dramatically cheaper. The
+/// frontend runs this ONCE per root and filters the cached list in memory as the
+/// user types, which is what makes the name search instant.
+#[tauri::command]
+pub fn ft_files_start(
+    app: AppHandle,
+    registry: State<'_, Arc<SearchRegistry>>,
+    id: u64,
+    root: String,
+    include_ignored: bool,
+) {
+    let flag = registry.begin(id);
+    let reg = registry.inner().clone();
+    std::thread::spawn(move || {
+        let cancelled = || flag.load(Ordering::Relaxed);
+        let mut emit = |batch: Vec<String>| {
+            let _ = app.emit(
+                "ft-files",
+                FilesEvent {
+                    id,
+                    files: batch,
+                    done: false,
+                    truncated: false,
+                    error: None,
+                },
+            );
+        };
+        let (truncated, error) = match list_files(&root, include_ignored, &cancelled, &mut emit) {
+            Ok(truncated) => (truncated, None),
+            Err(e) => (false, Some(e)),
+        };
+        // Always send a terminal event, even when cancelled — the frontend keys off
+        // `id`, so a `done` for a superseded enumeration is simply ignored.
+        let _ = app.emit(
+            "ft-files",
+            FilesEvent {
+                id,
+                files: Vec::new(),
+                done: true,
+                truncated,
+                error,
+            },
+        );
+        reg.end(id);
+    });
 }
 
 #[tauri::command]

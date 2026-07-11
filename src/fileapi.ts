@@ -174,9 +174,41 @@ export const ftSearchStart = (
   opts: SearchOpts
 ): Promise<void> => invoke("ft_search_start", { id, root, query, opts });
 
-/** Cancel the in-flight search `id` (a newer keystroke or Esc). Idempotent. */
+/** Cancel the in-flight search `id` (a newer keystroke or Esc). Idempotent.
+ *  Also cancels a `ftFilesStart` enumeration (#214) — both draw their ids from
+ *  `nextSearchId`, so one registry and one cancel command serve both. */
 export const ftSearchCancel = (id: number): Promise<void> =>
   invoke("ft_search_cancel", { id });
+
+/** One streamed batch of a file-NAME enumeration (issue #214). Same id/done
+ *  discipline as `SearchBatch`: batches from a superseded enumeration are dropped
+ *  by id, and `done` carries the final `truncated` + any `error`. */
+export interface FilesBatch {
+  id: number;
+  files: string[];
+  done: boolean;
+  truncated: boolean;
+  error?: string;
+}
+
+/** Enumerate every file path under `root` — names only, NO contents read (#214).
+ *  Returns as soon as the walk is spawned; paths arrive as `ft-files` events tagged
+ *  with `id`. Cancel with `ftSearchCancel(id)`.
+ *
+ *  This is the backing store for the "Go to file" box: the view calls it ONCE per
+ *  root and then filters the cached list in memory on every keystroke, so typing
+ *  costs zero I/O. `includeIgnored` has exactly the same meaning as in a content
+ *  search — both route through the backend's one `plan_enumeration`. */
+export const ftFilesStart = (
+  id: number,
+  root: string,
+  includeIgnored: boolean
+): Promise<void> => invoke("ft_files_start", { id, root, includeIgnored });
+
+/** Subscribe to streamed file-name batches. One listener per view; each filters by
+ *  its own active id, so cross-pane events are harmless. */
+export const onFilesBatch = (cb: (batch: FilesBatch) => void): Promise<UnlistenFn> =>
+  listen<FilesBatch>("ft-files", (e) => cb(e.payload));
 
 /** Subscribe to streamed search batches. One listener serves every FileEditView;
  *  each filters by its own active id. Returns an unlisten fn for teardown. */

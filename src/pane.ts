@@ -220,6 +220,12 @@ export interface PaneEvents {
   /** Minimize (or restore) this pane's whole orchestration group's
    *  worker/reviewer panes at once (#46). No-op off an orchestrator pane. */
   onToggleGroupMinimize: (pane: Pane) => void;
+  /** The pane's PERSISTED identity changed without any grid mutation, so the saved
+   *  layout is now stale: a files pane was re-rooted, or a pane was renamed (#214).
+   *  Nothing opened or closed, so no grid event fires and nothing would otherwise
+   *  re-persist until the next unrelated one — meaning a quit right after a re-root
+   *  would restore the OLD root. The host re-persists. */
+  onRecordChanged: (pane: Pane) => void;
 }
 
 export class Pane implements VoiceTargetPane {
@@ -843,6 +849,10 @@ export class Pane implements VoiceTargetPane {
         const autoNamed = this.name === this.defaultFilesName(this.filesRoot);
         this.setFilesRoot(root);
         if (autoNamed) this.setName(this.defaultFilesName(root));
+        // Re-persist NOW. No grid event fired (nothing opened or closed), so without
+        // this the new root would sit unsaved until some unrelated layout change came
+        // along — and a quit in between would restore the old one (rev-99 finding 4).
+        this.events.onRecordChanged(this);
       },
     });
     const wrap = document.createElement("div");
@@ -856,6 +866,25 @@ export class Pane implements VoiceTargetPane {
   /** True when this pane is a file explorer (#214) — no PTY, ever. */
   get isFiles(): boolean {
     return this.filesRoot !== null;
+  }
+
+  /** May the human close this pane right now? True unless it holds unsaved work the
+   *  human then declines to discard.
+   *
+   *  A files pane is the first pane kind where LOOMUX ITSELF owns an unsaved buffer.
+   *  Every other pane's ✕ is safe to take literally: a terminal or agent owns no
+   *  editor state, and anything unsaved lives inside the CLI, which gets its own
+   *  say when its process is killed. Here, closing the pane is the only thing
+   *  standing between the human and their edits — so it asks, exactly as the
+   *  editor's own Esc/✕ already does (rev-99 finding 3).
+   *
+   *  Deliberately scoped to the HUMAN-initiated close paths (the ✕ and
+   *  Ctrl+Shift+W), which is what "close this pane" means. A tab close, a group
+   *  teardown, or app shutdown do not route through here — they're bulk operations
+   *  with their own semantics, and turning each into a per-pane interrogation is a
+   *  different feature. Non-files panes answer true instantly. */
+  async confirmClose(): Promise<boolean> {
+    return this.filesView ? this.filesView.canDiscard() : true;
   }
 
   /** Point this files pane at `root`, keeping `cwdRaw` in step so the chrome that
@@ -1147,8 +1176,8 @@ export class Pane implements VoiceTargetPane {
    *  here. Until then they are cleanly OFF on a files pane (buttons hidden by
    *  `.is-files`, hotkeys answered with this) rather than half-working.
    *
-   *  The git view over a files root is the one worth revisiting — it's tracked as a
-   *  follow-up on #214, not forgotten. */
+   *  The git view over a files root is the one worth revisiting; the deferral is
+   *  tracked on #214 (issuecomment-4942018258), not forgotten. */
   private refuseOverlay(what: string): boolean {
     if (!this.isFiles) return false;
     showToast(`${what} isn't available in a file explorer pane.`, "info");
@@ -1655,6 +1684,10 @@ export class Pane implements VoiceTargetPane {
         if (this.orchAgent && changed) {
           invoke("orch_agent_renamed", { agentId: this.orchAgent, name }).catch(() => {});
         }
+        // The pane's persisted name just changed with no grid mutation — same
+        // stale-snapshot class as a files-pane re-root, so re-persist here too.
+        // (persistTabs dedups on identical bytes, so a no-op rename costs nothing.)
+        if (changed) this.events.onRecordChanged(this);
       },
       restore: () => {
         // Put the label back showing the current name (the pre-edit name on a

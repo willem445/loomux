@@ -7,7 +7,8 @@
 //! helpers the Tauri commands wrap, so no Tauri runtime is needed.
 
 use loomux_lib::fileedit::{
-    content_hash, list_dir, read_file, replace, search, search_planned, write_file, SearchOpts,
+    content_hash, list_dir, list_files, read_file, replace, search, search_planned, write_file,
+    SearchOpts,
 };
 use std::collections::BTreeSet;
 use std::fs;
@@ -487,4 +488,138 @@ fn replace_skips_bad_file_without_partial_write() {
     // nomatch.txt (no-match) and ../escape.txt (path-rejected) both skipped.
     assert_eq!(res.skipped.len(), 2, "got {:?}", res.skipped.iter().map(|s| &s.rel).collect::<Vec<_>>());
     assert_eq!(fs::read_to_string(root.path().join("nomatch.txt")).unwrap(), "dog");
+}
+
+// ---------- file-NAME enumeration (issue #214) ----------
+
+/// Collect a `list_files` run into a flat, sorted path list + the truncated flag.
+fn listed(root: &str, include_ignored: bool, cancelled: &dyn Fn() -> bool) -> (Vec<String>, bool) {
+    let mut out: Vec<String> = Vec::new();
+    let truncated = list_files(root, include_ignored, cancelled, &mut |b| out.extend(b)).unwrap();
+    out.sort();
+    (out, truncated)
+}
+
+#[test]
+fn list_files_enumerates_paths_without_reading_them() {
+    // The whole point of the name search: it must list files the CONTENT search
+    // refuses to open — a binary blob and an over-cap file are perfectly valid
+    // things to jump to by name. If this ever starts reading/sniffing, they'd
+    // vanish from the list and this fails.
+    let root = tempfile::tempdir().unwrap();
+    let rp = root.path().to_str().unwrap();
+    fs::create_dir_all(root.path().join("src")).unwrap();
+    fs::write(root.path().join("src/pane.ts"), "x").unwrap();
+    fs::write(root.path().join("binary.bin"), [0u8, 1, 2, 0, 3]).unwrap();
+    // Over the content search's 1 MiB per-file bound, so `search` skips it entirely.
+    fs::write(root.path().join("huge.txt"), vec![b'x'; 1024 * 1024 + 1]).unwrap();
+
+    let (files, truncated) = listed(rp, true, &|| false);
+    assert!(!truncated);
+    assert_eq!(files, vec!["binary.bin", "huge.txt", "src/pane.ts"]);
+}
+
+#[test]
+fn list_files_uses_forward_slashes_and_lists_no_directories() {
+    // Paths are the frontend's `rel` convention (forward slashes, root-relative),
+    // and only FILES are listed — a directory in the list would be un-openable.
+    let root = tempfile::tempdir().unwrap();
+    let rp = root.path().to_str().unwrap();
+    fs::create_dir_all(root.path().join("a/b/c")).unwrap();
+    fs::write(root.path().join("a/b/c/deep.ts"), "x").unwrap();
+
+    let (files, _) = listed(rp, true, &|| false);
+    assert_eq!(files, vec!["a/b/c/deep.ts"], "dirs must not be listed; slashes must be /");
+}
+
+#[test]
+fn list_files_respects_gitignore_by_default_and_the_toggle_includes_ignored() {
+    // The toggle must mean the SAME thing it means for the content search (#207) —
+    // both go through plan_enumeration, and this pins that they can't drift.
+    if !git_available() {
+        eprintln!("skipping: git not on PATH");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let rp = root.path().to_str().unwrap();
+    git_init(root.path());
+    fs::write(root.path().join(".gitignore"), "ignored.txt\nbuilddir/\n").unwrap();
+    fs::write(root.path().join("tracked.txt"), "x").unwrap();
+    git_add(root.path(), "tracked.txt");
+    fs::write(root.path().join("untracked.txt"), "x").unwrap();
+    fs::write(root.path().join("ignored.txt"), "x").unwrap();
+    fs::create_dir_all(root.path().join("builddir")).unwrap();
+    fs::write(root.path().join("builddir/gen.txt"), "x").unwrap();
+
+    let (default, _) = listed(rp, false, &|| false);
+    assert!(default.contains(&"tracked.txt".to_string()), "got {default:?}");
+    assert!(default.contains(&"untracked.txt".to_string()), "got {default:?}");
+    assert!(!default.contains(&"ignored.txt".to_string()), "gitignored file must be skipped");
+    assert!(
+        !default.iter().any(|f| f.starts_with("builddir")),
+        "gitignored dir must be skipped, got {default:?}"
+    );
+
+    let (all, _) = listed(rp, true, &|| false);
+    assert!(all.contains(&"ignored.txt".to_string()), "toggle must include the ignored file");
+    assert!(
+        all.contains(&"builddir/gen.txt".to_string()),
+        "toggle must include the ignored dir, got {all:?}"
+    );
+}
+
+#[test]
+fn list_files_never_lists_the_git_directory() {
+    // .git is metadata, not source — the walk skips it in EVERY mode, including
+    // include_ignored (which drops the heuristic excludes but not this one).
+    if !git_available() {
+        eprintln!("skipping: git not on PATH");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let rp = root.path().to_str().unwrap();
+    git_init(root.path());
+    fs::write(root.path().join("real.txt"), "x").unwrap();
+
+    let (all, _) = listed(rp, true, &|| false);
+    assert!(all.contains(&"real.txt".to_string()));
+    assert!(
+        !all.iter().any(|f| f.starts_with(".git/")),
+        "the .git dir must never be enumerated, got {all:?}"
+    );
+}
+
+#[test]
+fn list_files_does_not_follow_symlinks() {
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    fs::write(outside.path().join("secret.txt"), "x").unwrap();
+    if !try_symlink(outside.path(), &root.path().join("link"), true) {
+        eprintln!("skipping: symlinks not permitted here");
+        return;
+    }
+    fs::write(root.path().join("real.txt"), "x").unwrap();
+
+    let (all, _) = listed(root.path().to_str().unwrap(), true, &|| false);
+    assert_eq!(all, vec!["real.txt"], "a symlinked dir must not be walked into");
+}
+
+#[test]
+fn list_files_is_cancellable_and_reports_truncation_rather_than_cutting_silently() {
+    let root = tempfile::tempdir().unwrap();
+    let rp = root.path().to_str().unwrap();
+    for i in 0..40 {
+        fs::write(root.path().join(format!("f{i:02}.txt")), "x").unwrap();
+    }
+    // Pre-cancelled: the enumeration must stop at the first check, listing nothing.
+    let (none, _) = listed(rp, true, &|| true);
+    assert!(none.is_empty(), "a pre-cancelled enumeration must list nothing, got {}", none.len());
+
+    // Cancelling partway through the git-list arm is checked per path; the walk arm
+    // is checked per directory, so with one directory the flat 40 files come back
+    // whole. What must NOT happen either way is a silent cut — a real ceiling hit
+    // sets `truncated`, and here nothing is truncated.
+    let (all, truncated) = listed(rp, true, &|| false);
+    assert_eq!(all.len(), 40);
+    assert!(!truncated, "40 files is nowhere near the ceiling");
 }

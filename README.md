@@ -44,6 +44,14 @@ splits, docks, maximizes and restores like any other pane, and comes back at the
 same folder on session restore — but it is *not* an agent, so it never counts
 toward a tab's agent badge. See the [design note](doc/design/files-pane.md).
 
+Both the pane and the overlay carry a **Go to file** box: a fast file-*name*
+search (paths only — the search below it is the one that reads contents). The
+backend enumerates the root's paths once, off-thread, honoring `.gitignore` via
+the same `git ls-files` source the content search uses; every keystroke then
+filters that cached list in memory, so typing costs zero I/O. Matching is
+substring with space-separated terms AND-ed across the path (`pane rest` →
+`src/panerestore.ts`); `↑`/`↓` pick, `Enter` opens, `Esc` clears.
+
 ![sample](sample.jpg)
 
 ## Install
@@ -155,7 +163,8 @@ src/
   orchestration.ts  frontend half of agent groups (panes, badges, focus)
   shortcuts.ts      app-level keybindings (single source of truth)
   fileapi.ts        typed bridge to fileedit.rs (per-feature wrapper, like git.ts)
-  fileedit.ts       file-editor surface (#174): tree + code editor + search/replace (DOM wiring). An Alt+F overlay, or a files pane's permanent content (#214)
+  fileedit.ts       file-editor surface (#174): tree + code editor + "Go to file" name search + content search/replace (DOM wiring). An Alt+F overlay, or a files pane's permanent content (#214)
+  filematch.ts      pure file-NAME matching + ranking for "Go to file" (#214, DOM-free, unit-tested)
   filetreemodel.ts  pure lazy-tree model: sort/merge/flatten (DOM-free, unit-tested)
   fileicons.ts      pure filename -> inline-SVG icon mapping (DOM-free, unit-tested)
   searchresults.ts  pure search grouping + tree-hit + replace-selection model (DOM-free, unit-tested)

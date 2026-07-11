@@ -17,12 +17,22 @@ import {
   ftSearchCancel,
   onSearchBatch,
   nextSearchId,
+  ftFilesStart,
+  onFilesBatch,
   ftReplace,
   errorCode,
   errorMessage,
   type SearchOpts,
   type SearchBatch,
+  type FilesBatch,
 } from "./fileapi";
+import {
+  rankFileNames,
+  moveSelection,
+  basenameStart,
+  queryTerms,
+  type FileNameHit,
+} from "./filematch";
 import {
   groupMatches,
   countSummary,
@@ -91,6 +101,11 @@ const MAX_TREE_W = 640;
 /** Debounce for auto-search while typing, so the tree highlights update
  *  "live" without a full-tree walk on every keystroke. */
 const SEARCH_DEBOUNCE_MS = 300;
+/** How many "Go to file" results are rendered (#214). The list is a jump target,
+ *  not a report: past a screenful you refine the query, you don't scroll. Ranking
+ *  runs over the FULL path list first, so the cap never costs you the best hit —
+ *  and the summary says how many matched, so a cut is never silent. */
+const GOTO_RESULT_CAP = 200;
 
 function el(tag: string, cls: string, text?: string): HTMLElement {
   const e = document.createElement(tag);
@@ -122,6 +137,33 @@ export class FileEditView {
   private editorPane: HTMLElement;
   private editorHost: HTMLElement;
   private emptyState: HTMLElement;
+
+  // "Go to file" — the file-NAME search (issue #214). Distinct from the content
+  // search below it: this matches PATHS and never opens a file. The backend
+  // enumerates the path list ONCE per root (`ftFilesStart` — off-thread,
+  // streaming, cancellable, same enumeration source as the content search) and we
+  // cache it here, so every keystroke is an in-memory rank over `fileList` with
+  // zero I/O. That is what makes it instant on a big repo, and it's the "optimized
+  // and fast file search" the issue asks for.
+  private gotoInput!: HTMLInputElement;
+  private gotoListEl!: HTMLElement;
+  private gotoSummaryEl!: HTMLElement;
+  /** Every path under the root, as enumerated. Empty until the first index. */
+  private fileList: string[] = [];
+  /** The in-flight enumeration's id (for cancel + batch demux), or null. */
+  private fileListId: number | null = null;
+  /** True once an enumeration has completed for the CURRENT root + ignore mode. */
+  private fileListLoaded = false;
+  /** The enumeration hit the backend's file ceiling — the list is incomplete, and
+   *  the summary says so rather than quietly under-reporting matches. */
+  private fileListTruncated = false;
+  /** Unsubscribe for the `ft-files` listener (torn down on dispose). */
+  private filesUnlisten: (() => void) | null = null;
+  private gotoHits: FileNameHit[] = [];
+  /** Index into `gotoHits` of the keyboard-selected row. */
+  private gotoSel = 0;
+  /** Coalesces repaints while paths stream in, one per animation frame. */
+  private gotoRenderScheduled = false;
 
   // Open-file state.
   private editor: EditorWidget | null = null;
@@ -239,14 +281,24 @@ export class FileEditView {
     // ---- body ----
     const body = el("div", "fileedit-body");
 
-    // Left column: the search box sits ABOVE the tree (demo feedback) and drives
-    // the in-tree hit highlighting; the tree fills the rest.
+    // Left column, top to bottom: the "Go to file" NAME filter (#214), then the
+    // content search (#174/#207) which drives the in-tree hit highlighting, then
+    // the tree itself. The two searches answer different questions — "where is the
+    // file called X" vs "which files mention X" — and the issue asks for the first
+    // one explicitly, so it goes first. While the name filter has a query, its
+    // result list takes the tree's place; clearing it puts the tree back.
     this.treePane = el("div", "fileedit-tree-pane");
     this.treePane.style.width = `${this.storedTreeW()}px`;
+    // Build the content-search form FIRST (it owns `igBox`, which the name filter
+    // reads to pick its enumeration mode), but mount the name filter above it.
     const searchForm = el("div", "fileedit-search-form");
     this.buildSearchForm(searchForm);
+    const gotoForm = el("div", "fileedit-goto-form");
+    this.buildGotoForm(gotoForm);
     this.treeListEl = el("div", "fileedit-tree");
-    this.treePane.append(searchForm, this.treeListEl);
+    this.gotoListEl = el("div", "fileedit-goto-list");
+    this.gotoListEl.hidden = true;
+    this.treePane.append(gotoForm, searchForm, this.treeListEl, this.gotoListEl);
 
     const divider = el("div", "fileedit-vdivider");
     this.wireTreeDivider(divider);
@@ -282,6 +334,11 @@ export class FileEditView {
     void onSearchBatch((b) => this.onSearchBatch(b)).then((un) => {
       if (this.disposed) un();
       else this.searchUnlisten = un;
+    });
+    // Same discipline for the `ft-files` enumeration stream (#214).
+    void onFilesBatch((b) => this.onFilesBatch(b)).then((un) => {
+      if (this.disposed) un();
+      else this.filesUnlisten = un;
     });
   }
 
@@ -323,12 +380,31 @@ export class FileEditView {
     this.disposed = true;
     clearTimeout(this.searchTimer);
     if (this.session.activeId !== null) void ftSearchCancel(this.session.activeId);
+    // An enumeration outliving its view would walk a whole repo for nobody (#214).
+    // Nulling the id also makes any batch that lands before the unlisten resolves a
+    // no-op via the id-mismatch guard — same reason `session` goes idle below.
+    if (this.fileListId !== null) void ftSearchCancel(this.fileListId);
+    this.fileListId = null;
     // Go idle so any batch that arrives before the listener is torn down (or an
     // unlisten that hasn't resolved yet) can't drive a removed view.
     this.session = idle();
     this.searchUnlisten?.();
+    this.filesUnlisten?.();
     this.editor?.dispose();
     this.el.remove();
+  }
+
+  /** May this view be torn down right now — is there unsaved work in the buffer?
+   *  True when it's clean, or when the human confirmed discarding it.
+   *
+   *  The host PANE calls this before closing a file-explorer pane (#214). A files
+   *  pane is the first pane kind where loomux itself owns an unsaved buffer, so a
+   *  ✕ / Ctrl+Shift+W must not drop edits silently — the same guard `requestClose`
+   *  already applies to the overlay's own Esc/✕, now reachable from the pane close
+   *  path too (rev-99 finding 3). */
+  async canDiscard(): Promise<boolean> {
+    if (!this.isDirtyNow() || closeDecision(true) !== "confirm") return true;
+    return this.confirmDiscard();
   }
 
   // ---------- root / tree ----------
@@ -356,6 +432,9 @@ export class FileEditView {
     if (!this.root) return;
     this.treeModel = makeRoot();
     void this.refreshGitStatus(); // gates the ignore toggle; independent of the tree load
+    // The cached path list belongs to the OLD root — drop it, or the name filter
+    // would happily offer files that aren't under this tree anymore (#214).
+    this.invalidateFileList();
     await this.loadDir(this.treeModel);
     this.renderTree();
   }
@@ -647,6 +726,238 @@ export class FileEditView {
     });
   }
 
+  // ---------- "Go to file": the file-NAME search (issue #214) ----------
+  //
+  // The owner's ask, verbatim: "an optimized and fast file search. It does not need
+  // to search into files as we already have the file editor pane that can do that."
+  // So: paths only, never contents. The speed comes from the split — enumerate once
+  // (backend, off-thread, no file opened), then filter in memory per keystroke. The
+  // ranking is pure and lives in filematch.ts (unit-tested); this is the wiring.
+
+  private buildGotoForm(form: HTMLElement): void {
+    const row = el("div", "fileedit-search-row");
+    this.gotoInput = document.createElement("input");
+    this.gotoInput.className = "fileedit-search-input";
+    this.gotoInput.placeholder = "Go to file… (by name)";
+    this.gotoInput.title =
+      "Find a file by NAME (not contents — that's the search below). Space-separated terms must all match. ↑/↓ to pick, Enter to open, Esc to clear.";
+    this.gotoInput.spellcheck = false;
+    // Index on FOCUS, not on construction: a pane that never uses the box never
+    // pays for the walk, and by the time the second character is typed the list is
+    // usually already in.
+    this.gotoInput.addEventListener("focus", () => this.ensureFileList());
+    this.gotoInput.addEventListener("input", () => {
+      this.ensureFileList();
+      this.gotoSel = 0; // a new query invalidates the old selection
+      this.refreshGoto();
+    });
+    this.gotoInput.addEventListener("keydown", (e) => this.onGotoKey(e));
+    this.gotoSummaryEl = el("span", "fileedit-goto-summary", "");
+    row.append(this.gotoInput);
+    form.append(row, this.gotoSummaryEl);
+  }
+
+  private onGotoKey(e: KeyboardEvent): void {
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault(); // don't move the text caret
+      e.stopPropagation();
+      this.gotoSel = moveSelection(this.gotoSel, e.key === "ArrowDown" ? 1 : -1, this.gotoHits.length);
+      this.renderGoto();
+      return;
+    }
+    if (e.key === "Enter") {
+      e.preventDefault();
+      e.stopPropagation();
+      void this.openGotoHit(this.gotoSel);
+      return;
+    }
+    if (e.key === "Escape") {
+      // A query in the box: Esc clears it (back to the tree) and is CONSUMED, so a
+      // single press doesn't also close the overlay out from under the user. Empty
+      // box: let it bubble — Esc then means what it always meant (close the overlay;
+      // nothing, in an embedded files pane).
+      if (this.gotoInput.value !== "") {
+        e.stopPropagation();
+        this.clearGoto();
+      }
+      return;
+    }
+    e.stopPropagation(); // ordinary typing must not reach the terminal / app shortcuts
+  }
+
+  /** The enumeration mode the name filter runs in — the SAME toggle the content
+   *  search uses, so "Ignored files" means one thing in this view, not two. */
+  private includeIgnored(): boolean {
+    return this.igBox.checked && !this.igBox.disabled;
+  }
+
+  /** Start indexing the root's paths, unless it's already done or in flight. Cheap
+   *  to call on every keystroke — the guards make repeats free. */
+  private ensureFileList(): void {
+    if (!this.root || this.fileListLoaded || this.fileListId !== null) return;
+    const id = nextSearchId();
+    this.fileListId = id;
+    this.fileList = [];
+    this.fileListTruncated = false;
+    this.updateGotoSummary();
+    void ftFilesStart(id, this.root, this.includeIgnored());
+  }
+
+  /** Drop the cached path list (the root or the ignore mode changed) and cancel any
+   *  enumeration still running for it. Re-indexes immediately if the box is in use,
+   *  so the user is never left filtering a list that describes a different tree. */
+  private invalidateFileList(): void {
+    if (this.fileListId !== null) {
+      void ftSearchCancel(this.fileListId); // one registry serves both streams
+      this.fileListId = null;
+    }
+    this.fileList = [];
+    this.fileListLoaded = false;
+    this.fileListTruncated = false;
+    if (this.gotoInput.value.trim()) {
+      this.ensureFileList();
+      this.refreshGoto();
+    } else {
+      this.updateGotoSummary();
+    }
+  }
+
+  /** Fold one streamed batch of paths in. Batches from a superseded/cancelled
+   *  enumeration are dropped by id, so this is safe to call for every event. */
+  private onFilesBatch(b: FilesBatch): void {
+    if (this.disposed) return;
+    if (b.id !== this.fileListId) return; // stale / cancelled — ignore
+    if (b.error) showToast(`Couldn't list files: ${errorMessage(b.error)}`);
+    this.fileList.push(...b.files);
+    if (b.truncated) this.fileListTruncated = true;
+    if (b.done) {
+      this.fileListId = null;
+      // Loaded even on error — the toast above already said what went wrong, and
+      // leaving it un-loaded would restart the walk (and re-toast) on every
+      // subsequent keystroke. A root change or an ignore-toggle flip invalidates and
+      // retries, which is the recovery path for the realistic failure (root is gone).
+      this.fileListLoaded = true;
+      this.refreshGoto();
+    } else {
+      // Results improve as paths arrive — repaint, but at most once a frame so a
+      // burst of 1000-path batches can't thrash the DOM.
+      if (this.gotoRenderScheduled) return;
+      this.gotoRenderScheduled = true;
+      requestAnimationFrame(() => {
+        this.gotoRenderScheduled = false;
+        if (!this.disposed) this.refreshGoto();
+      });
+    }
+  }
+
+  /** Re-rank and repaint. With a query the result list REPLACES the tree; with an
+   *  empty one the tree comes back — the box is a filter over the tree, not a
+   *  separate mode you have to leave. */
+  private refreshGoto(): void {
+    const active = queryTerms(this.gotoInput.value).length > 0;
+    this.gotoHits = active ? rankFileNames(this.fileList, this.gotoInput.value, GOTO_RESULT_CAP) : [];
+    this.gotoSel = Math.min(this.gotoSel, Math.max(0, this.gotoHits.length - 1));
+    this.gotoListEl.hidden = !active;
+    this.treeListEl.hidden = active;
+    this.renderGoto();
+    this.updateGotoSummary();
+  }
+
+  private clearGoto(): void {
+    this.gotoInput.value = "";
+    this.gotoSel = 0;
+    this.refreshGoto();
+  }
+
+  private renderGoto(): void {
+    if (this.gotoListEl.hidden) {
+      this.gotoListEl.replaceChildren();
+      return;
+    }
+    if (this.gotoHits.length === 0) {
+      const msg = this.fileListId !== null ? "Indexing…" : "No file matches.";
+      this.gotoListEl.replaceChildren(el("div", "fileedit-empty", msg));
+      return;
+    }
+    const frag = document.createDocumentFragment();
+    this.gotoHits.forEach((hit, i) => {
+      const base = basenameStart(hit.rel);
+      const row = el("div", "fileedit-goto-row");
+      if (i === this.gotoSel) row.classList.add("sel");
+      const icon = el("span", "fileedit-icon");
+      icon.innerHTML = fileIconSvg(hit.rel.slice(base));
+      // Name first, then the dim directory — the quick-open convention: you scan the
+      // names, and the path only disambiguates same-named files.
+      const name = el("span", "fileedit-goto-name");
+      name.append(markUp(hit.rel.slice(base), clipRanges(hit.ranges, base, hit.rel.length)));
+      const dir = el("span", "fileedit-goto-dir");
+      dir.append(markUp(hit.rel.slice(0, base), clipRanges(hit.ranges, 0, base)));
+      row.title = hit.rel;
+      row.append(icon, name, dir);
+      row.addEventListener("click", () => void this.openGotoHit(i));
+      frag.appendChild(row);
+    });
+    this.gotoListEl.replaceChildren(frag);
+    this.gotoListEl.querySelector(".fileedit-goto-row.sel")?.scrollIntoView({ block: "nearest" });
+  }
+
+  private updateGotoSummary(): void {
+    const s = this.gotoSummaryEl;
+    const indexing = this.fileListId !== null;
+    const active = queryTerms(this.gotoInput.value).length > 0;
+    if (!active) {
+      // Idle: say nothing while nothing is indexed, so the box doesn't nag. Once a
+      // list exists, its size is genuinely useful ("this root has 3,412 files").
+      s.textContent = indexing
+        ? `Indexing… ${this.fileList.length}`
+        : this.fileListLoaded
+          ? `${this.fileList.length} files${this.fileListTruncated ? " (truncated)" : ""}`
+          : "";
+      s.classList.toggle("truncated", this.fileListTruncated);
+      return;
+    }
+    const capped = this.gotoHits.length >= GOTO_RESULT_CAP;
+    const n = this.gotoHits.length;
+    s.textContent = indexing
+      ? `Indexing… ${n} of ${this.fileList.length} so far`
+      : n === 0
+        ? "No file matches"
+        : `${n}${capped ? "+" : ""} of ${this.fileList.length} files${this.fileListTruncated ? " (truncated)" : ""}`;
+    // Flag anything the user is NOT seeing: a capped result list or an incomplete
+    // index. A silent cut would read as "that file doesn't exist" (house rule).
+    s.classList.toggle("truncated", capped || this.fileListTruncated);
+  }
+
+  /** Open the selected result: the file lands in the editor, the filter clears, and
+   *  the tree comes back with that file revealed and highlighted where it lives —
+   *  so "jump to a file" leaves you oriented, not in a detached result list. */
+  private async openGotoHit(i: number): Promise<void> {
+    const hit = this.gotoHits[i];
+    if (!hit) return;
+    const rel = hit.rel;
+    await this.openFile(rel);
+    // The open can decline: a binary/oversize file toasts, and a dirty buffer whose
+    // discard the human refuses leaves `openRel` where it was. Only THEN clear the
+    // query and follow the tree — bailing here keeps the user's typed filter intact
+    // so they can pick a different file instead of retyping it.
+    if (this.openRel !== rel) return;
+    this.clearGoto();
+    await this.revealPath(rel);
+  }
+
+  /** Expand every directory on the way to `rel` so an opened file is visible in the
+   *  tree. Shallow → deep, so each parent is loaded before its child is needed —
+   *  the single-path twin of `revealHits`. */
+  private async revealPath(rel: string): Promise<void> {
+    for (const path of ancestorDirs(rel)) {
+      const node = findNode(this.treeModel, path);
+      if (!node || !node.isDir) continue;
+      if (!node.loaded) await this.loadDir(node);
+      node.expanded = true;
+    }
+    this.renderTree();
+  }
+
   // ---------- search + replace (drives the in-tree hit highlighting) ----------
 
   private buildSearchForm(form: HTMLElement): void {
@@ -713,6 +1024,9 @@ export class FileEditView {
     wwBox.addEventListener("change", onOpt);
     igBox.addEventListener("change", () => {
       this.updateIgnoreToggle(); // refresh the effective-mode tooltip
+      // The toggle governs the name filter's enumeration too — same meaning, same
+      // backend `plan_enumeration` — so its cached list is now stale (#214).
+      this.invalidateFileList();
       onOpt();
     });
     this.summaryEl = el("span", "fileedit-search-summary", "");
@@ -994,6 +1308,41 @@ export class FileEditView {
 }
 
 // ---------- helpers ----------
+
+/** The parts of `ranges` (which index into the whole path) that fall inside
+ *  `[from, to)`, rebased to `from` — so a path's highlight spans can be painted
+ *  separately onto its name and its directory parts (#214). */
+function clipRanges(
+  ranges: readonly [number, number][],
+  from: number,
+  to: number
+): [number, number][] {
+  const out: [number, number][] = [];
+  for (const [start, end] of ranges) {
+    const a = Math.max(start, from);
+    const b = Math.min(end, to);
+    if (a < b) out.push([a - from, b - from]);
+  }
+  return out;
+}
+
+/** `text` with `<mark>` over each range. Builds real text nodes — never innerHTML:
+ *  a file name is untrusted input (it's whatever is on disk), and this is the one
+ *  place a path is rendered as markup-adjacent content. */
+function markUp(text: string, ranges: readonly [number, number][]): DocumentFragment {
+  const frag = document.createDocumentFragment();
+  let at = 0;
+  for (const [start, end] of ranges) {
+    if (start > at) frag.append(text.slice(at, start));
+    const m = document.createElement("mark");
+    m.className = "fileedit-goto-mark";
+    m.textContent = text.slice(start, end);
+    frag.append(m);
+    at = end;
+  }
+  if (at < text.length) frag.append(text.slice(at));
+  return frag;
+}
 
 /** A `<label>` wrapping a checkbox + caption, returned with the input so the
  *  caller can read `.checked`. */

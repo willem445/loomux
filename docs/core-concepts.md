@@ -42,6 +42,24 @@ and the pane holds it for as long as you keep it open, so you can park a browser
 beside your agents instead of flicking an overlay in and out (or opening a
 separate Explorer window per repo).
 
+#### Go to file
+
+The **Go to file** box at the top of the tree finds a file by **name**. (The
+search box below it is the other one — it reads file *contents*.) It's built to
+be instant: the folder's paths are indexed once in the background, respecting
+`.gitignore` by default, and each keystroke filters that index in memory.
+
+- Type any part of a name or path — matching is plain substring, case-insensitive.
+- **Several terms, separated by spaces, must all match** somewhere in the path:
+  `pane rest` finds `src/panerestore.ts`, and `src pane` finds `src/pane.ts`.
+- `↑` / `↓` pick a result, `Enter` opens it, `Esc` clears the box and returns you
+  to the tree. Opening a file also reveals it in the tree, so you stay oriented.
+- The **Ignored files** toggle applies here too: off (the default) skips anything
+  `.gitignore`d, on includes `node_modules` and build output.
+
+If more files match than the list shows, the count above it tells you — results
+are never cut silently.
+
 It has no terminal underneath and never starts a process. That means the
 terminal-oriented chrome is gone from its header (no folder or branch chip; the
 git, issues, and file-editor overlays don't apply — `Alt+G`/`Alt+I` will tell you
@@ -52,6 +70,10 @@ agent, so it never counts toward a tab's agent badge.
 If the folder is gone when a session is restored (deleted, renamed, or on a drive
 that isn't mounted), that pane comes back as the welcome screen with a message
 instead of an empty tree — pick a new folder and carry on.
+
+Closing a file explorer with **unsaved edits** asks first. It's the one pane kind
+where loomux itself is holding your work, so its ✕ (and `Ctrl+Shift+W`) won't
+discard a dirty buffer without a prompt.
 
 ## The split grid
 

@@ -156,6 +156,7 @@ pub fn run() {
             fileedit::ft_write_file,
             fileedit::ft_search_start,
             fileedit::ft_search_cancel,
+            fileedit::ft_files_start,
             fileedit::ft_replace,
             obs::take_startup_notice,
             uistate::load_ui_tabs,
