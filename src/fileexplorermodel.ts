@@ -1,0 +1,194 @@
+// Pure core of the file-MANAGER pane (issue #214). DOM-free, so the listing order,
+// the breadcrumb, the navigation arithmetic, the display formatting and the
+// inline-edit state machine are all unit-tested without a DOM
+// (test/fileexplorermodel.test.ts). The DOM wiring lives in fileexplorer.ts and is
+// hand-validated, per house convention.
+//
+// The backend (filemgr.rs) deliberately returns directory entries UNSORTED and
+// UNFILTERED. Sorting and hiding are product decisions, not facts about the disk,
+// so they live here where they can be pinned by tests.
+
+/** One directory entry, exactly as `fm_list` returns it. */
+export interface FmEntry {
+  name: string;
+  is_dir: boolean;
+  is_symlink: boolean;
+  /** Bytes; 0 for directories and symlinks. */
+  size: number;
+  /** Last-modified, ms since the Unix epoch; 0 when unknown. */
+  modified_ms: number;
+  /** Platform-correct hidden flag (Windows attribute bit, or a leading dot). */
+  is_hidden: boolean;
+}
+
+// ---------- listing order + filter ----------
+
+/** Compare two entries the way every file manager does: **folders first**, then by
+ *  name, case-insensitively, with a case-sensitive tiebreak so the order is total
+ *  and stable (`README` and `readme` can coexist and must not swap between
+ *  listings). `localeCompare` with `numeric` gives `file2` before `file10`, which
+ *  is what a human means by "in order".
+ *
+ *  A symlink sorts with FILES even when it points at a directory: we never follow
+ *  it, so as far as this pane is concerned it isn't one. */
+export function compareEntries(a: FmEntry, b: FmEntry): number {
+  const aDir = a.is_dir && !a.is_symlink;
+  const bDir = b.is_dir && !b.is_symlink;
+  if (aDir !== bDir) return aDir ? -1 : 1;
+  const byName = a.name.localeCompare(b.name, undefined, { sensitivity: "base", numeric: true });
+  if (byName !== 0) return byName;
+  return a.name < b.name ? -1 : a.name > b.name ? 1 : 0;
+}
+
+/** The rows to render: hidden entries dropped unless asked for, then ordered.
+ *  Pure — it never mutates `entries`, so the caller's cached listing stays intact
+ *  when the hidden toggle flips (no refetch needed). */
+export function visibleEntries(entries: readonly FmEntry[], showHidden: boolean): FmEntry[] {
+  return entries.filter((e) => showHidden || !e.is_hidden).sort(compareEntries);
+}
+
+// ---------- navigation ----------
+
+/** Join a child name onto a `rel` directory, in the forward-slashed `rel`
+ *  convention the whole file stack (and the backend) uses. */
+export function joinRel(rel: string, name: string): string {
+  const base = rel.replace(/^\/+|\/+$/g, "");
+  return base ? `${base}/${name}` : name;
+}
+
+/** The parent of `rel`, or null when `rel` IS the root ("").
+ *
+ *  Null is what disables the Up button: this pane is rooted, and navigation is
+ *  bounded by that root — you can't climb out of the folder the pane was opened on.
+ *  That bound is also what makes the backend's `root` + `rel` containment model
+ *  meaningful rather than decorative. */
+export function parentRel(rel: string): string | null {
+  const base = rel.replace(/^\/+|\/+$/g, "");
+  if (base === "") return null;
+  const cut = base.lastIndexOf("/");
+  return cut < 0 ? "" : base.slice(0, cut);
+}
+
+/** One clickable crumb: what to show, and the `rel` it navigates to. */
+export interface Crumb {
+  label: string;
+  rel: string;
+}
+
+/** The breadcrumb trail for `rel`, starting at the root (labelled `rootLabel` —
+ *  the root folder's own short name, since "" would render as nothing). */
+export function breadcrumbs(rootLabel: string, rel: string): Crumb[] {
+  const crumbs: Crumb[] = [{ label: rootLabel, rel: "" }];
+  const base = rel.replace(/^\/+|\/+$/g, "");
+  if (base === "") return crumbs;
+  let acc = "";
+  for (const seg of base.split("/")) {
+    acc = acc ? `${acc}/${seg}` : seg;
+    crumbs.push({ label: seg, rel: acc });
+  }
+  return crumbs;
+}
+
+// ---------- display formatting ----------
+
+const UNITS = ["B", "KB", "MB", "GB", "TB"];
+
+/** A file's size, the way a file manager shows it. Directories get "" (a folder's
+ *  "size" would mean walking it, which this pane will not do just to fill a
+ *  column). */
+export function formatSize(entry: FmEntry): string {
+  if (entry.is_dir && !entry.is_symlink) return "";
+  let n = entry.size;
+  let u = 0;
+  while (n >= 1024 && u < UNITS.length - 1) {
+    n /= 1024;
+    u++;
+  }
+  // Bytes are whole; everything above gets one decimal, dropped when it's .0 —
+  // "1.5 MB" is useful, "1.0 MB" is just noise.
+  const shown = u === 0 ? String(entry.size) : n.toFixed(1).replace(/\.0$/, "");
+  return `${shown} ${UNITS[u]}`;
+}
+
+/** A last-modified stamp. `now` is injected rather than read from the clock so this
+ *  is deterministic and testable (and because CLAUDE.md keeps `Date.now()` out of
+ *  pure modules). 0 → "—": we don't know, and pretending it's 1970 is worse. */
+export function formatModified(ms: number, now: number): string {
+  if (!ms) return "—";
+  const d = new Date(ms);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  const hhmm = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  // Within the last ~24h, the time is what you actually want to compare on; older
+  // than that, the date is.
+  if (now - ms < 24 * 3600_000 && now >= ms) return hhmm;
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${hhmm}`;
+}
+
+// ---------- selection ----------
+
+/** Move a selection index by `delta` within `count` rows, CLAMPING at both ends.
+ *
+ *  Clamped, not wrapped — unlike the Go-to-file result list (`filematch.moveSelection`,
+ *  which wraps because a short result list is a menu you cycle). A directory listing
+ *  is a place: holding Down must come to rest on the last row, not silently teleport
+ *  you back to the top past a file you meant to land on. -1 means "nothing selected". */
+export function clampSelection(current: number, delta: number, count: number): number {
+  if (count <= 0) return -1;
+  const next = (current < 0 ? (delta > 0 ? -1 : count) : current) + delta;
+  return Math.max(0, Math.min(count - 1, next));
+}
+
+// ---------- inline edit (new folder / rename) ----------
+
+/** The pane's inline-edit state. Exactly one edit can be in flight, and both kinds
+ *  are the same interaction — an input row in the listing with a name in it — so
+ *  they are one state machine rather than two flags that can disagree.
+ *
+ *  `rename` carries the entry's CURRENT name so the model can tell "unchanged" from
+ *  "collides with a sibling" (renaming a file to its own name must be a no-op, not
+ *  a duplicate-name error). */
+export type EditState =
+  | { kind: "none" }
+  | { kind: "new-folder"; draft: string }
+  | { kind: "rename"; rel: string; original: string; draft: string };
+
+export const noEdit: EditState = { kind: "none" };
+
+/** Why a draft name can't be committed, or null when it can. Mirrors the backend's
+ *  `validate_name` (which is authoritative — this is a UI courtesy that answers
+ *  while the user types, not a security boundary), plus the one rule the backend
+ *  cannot check because it doesn't know the listing: a duplicate sibling name.
+ *
+ *  Case-insensitive duplicate check, because that is how the Windows and macOS
+ *  filesystems this runs on actually behave — offering to create `Foo` next to an
+ *  existing `foo` would just fail at the syscall with a worse message. */
+export function nameError(state: EditState, siblings: readonly string[]): string | null {
+  if (state.kind === "none") return null;
+  const name = state.draft.trim();
+  if (name === "") return "Name cannot be empty.";
+  if (name === "." || name === "..") return "Name cannot be '.' or '..'.";
+  const bad = [...name].find((c) => '/\\:*?"<>|'.includes(c));
+  if (bad) return `Name cannot contain '${bad}'.`;
+  if (name.endsWith(".")) return "Name cannot end with a dot.";
+
+  // A rename to the entry's own name is a no-op, NOT a collision with itself.
+  const original = state.kind === "rename" ? state.original : null;
+  if (original !== null && name.toLowerCase() === original.toLowerCase()) return null;
+  if (siblings.some((s) => s.toLowerCase() === name.toLowerCase())) {
+    return `'${name}' already exists here.`;
+  }
+  return null;
+}
+
+/** Can this edit be committed right now? */
+export function canCommit(state: EditState, siblings: readonly string[]): boolean {
+  return state.kind !== "none" && nameError(state, siblings) === null;
+}
+
+/** A rename whose name didn't actually change: the caller skips the round-trip and
+ *  just closes the editor. (The backend tolerates this too — it returns the same
+ *  rel rather than an "exists" error — but not making the call at all is better
+ *  than making one we know is pointless.) */
+export function isNoopRename(state: EditState): boolean {
+  return state.kind === "rename" && state.draft.trim() === state.original;
+}

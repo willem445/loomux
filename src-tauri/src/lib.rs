@@ -1,6 +1,7 @@
 mod cliprobe;
 mod editor;
 pub mod fileedit; // pub: the file-editor integration test links its pure fns (#174)
+pub mod filemgr; // pub: the file-manager integration test links its pure fns (#214)
 mod gh;
 mod git;
 mod gitwatch;
@@ -158,6 +159,12 @@ pub fn run() {
             fileedit::ft_search_cancel,
             fileedit::ft_files_start,
             fileedit::ft_replace,
+            filemgr::fm_list,
+            filemgr::fm_new_folder,
+            filemgr::fm_rename,
+            filemgr::fm_delete,
+            filemgr::fm_delete_mode,
+            filemgr::fm_open,
             obs::take_startup_notice,
             uistate::load_ui_tabs,
             uistate::save_ui_tabs,

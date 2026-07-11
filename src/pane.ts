@@ -50,6 +50,7 @@ import { AuditView } from "./auditview";
 import { GroupView } from "./groupview";
 import { clampOverlayHeight, OVERLAY_MIN_H } from "./overlaysize";
 import { FileEditView } from "./fileedit";
+import { FileExplorerView } from "./fileexplorer";
 import type { PersistedPane, PersistedPaneKind } from "./tabstore";
 import type { TabPaneInfo } from "./tabcounts";
 
@@ -349,7 +350,7 @@ export class Pane implements VoiceTargetPane {
    *  files pane" flag, and it doubles as the pane's cwd for the capture and for
    *  "open in editor". Null on every other pane. */
   private filesRoot: string | null = null;
-  private filesView: FileEditView | null = null;
+  private filesView: FileExplorerView | null = null;
   /** True once the pane's process has exited but the pane was kept open to show
    *  its output (notifyExited). The counter must not count a dead agent as live
    *  (#194 P4 LOW-7). */
@@ -806,10 +807,16 @@ export class Pane implements VoiceTargetPane {
     await this.start(opts, true);
   }
 
-  /** Turn this pane into a FILE EXPLORER (#214): its content becomes a FileEditView
-   *  — the same tree + editor + streaming search as the Alt+F overlay — rooted at
-   *  `opts.root`, permanently. Used both to convert a welcome pane in place (the
-   *  user picked "File explorer") and to open one directly on restore.
+  /** Turn this pane into a FILE EXPLORER (#214): its content becomes a
+   *  FileExplorerView — a native-style file MANAGER (browse, open with the OS
+   *  default app, new folder, rename, delete, jump-to-file), rooted at `opts.root`.
+   *  Used both to convert a welcome pane in place (the user picked "File explorer")
+   *  and to open one directly on restore.
+   *
+   *  NOT the in-app editor. An earlier cut of this embedded `FileEditView` (the
+   *  `Alt+F` tree + CodeMirror surface); the human's clarification on #214 is that a
+   *  native-style manager is the ask, and that reusing the editor is "explicitly NOT
+   *  the preferred direction". The editor is untouched and still lives behind Alt+F.
    *
    *  No terminal is opened and no PTY is ever spawned, so:
    *   - nothing can resize a ConPTY from here (constraint 1 holds by construction —
@@ -832,13 +839,10 @@ export class Pane implements VoiceTargetPane {
     this.setFilesRoot(opts.root);
     this.setName(opts.name);
 
-    this.filesView = new FileEditView({
-      getCwd: () => this.filesRoot,
-      // Embedded: no ✕, no Esc-to-close. The pane's own ✕ closes it.
-      embedded: true,
-      onClose: () => {},
-      // Re-rooting from the view's folder picker re-roots the PANE, so the persisted
-      // record follows and a restore reopens what was actually on screen.
+    this.filesView = new FileExplorerView({
+      getRoot: () => this.filesRoot ?? "",
+      // Re-rooting from the toolbar's folder picker re-roots the PANE, so the
+      // persisted record follows and a restore reopens what was actually on screen.
       //
       // The TITLE follows only if it was auto-derived from the old root — the same
       // "don't clobber what the human typed" rule the welcome form's name field uses
@@ -869,34 +873,12 @@ export class Pane implements VoiceTargetPane {
   }
 
   /** The human asked to close this pane — from its header ✕, its dock chip's ✕, or
-   *  Ctrl+Shift+W. THE single entry point for a human-initiated single-pane close:
-   *  it goes to the host, which runs the unsaved-edits guard (`confirmClose`) and
-   *  only then tears the pane down. Anything that calls `grid.closePane` directly
-   *  bypasses that guard, which is exactly the bug this method exists to prevent —
-   *  the dock chip's ✕ did (rev-100). Automatic closes (a PTY exiting, a group
-   *  ending, a tab disposing) deliberately do NOT come through here. */
+   *  Ctrl+Shift+W. THE single entry point for a human-initiated single-pane close,
+   *  so every affordance goes through one path instead of re-deriving it (the dock
+   *  chip's ✕ used to call `grid.closePane` directly — rev-100). Automatic closes (a
+   *  PTY exiting, a group ending, a tab disposing) deliberately do NOT come here. */
   requestClose(): void {
     this.events.onCloseRequest(this);
-  }
-
-  /** May the human close this pane right now? True unless it holds unsaved work the
-   *  human then declines to discard.
-   *
-   *  A files pane is the first pane kind where LOOMUX ITSELF owns an unsaved buffer.
-   *  Every other pane's ✕ is safe to take literally: a terminal or agent owns no
-   *  editor state, and anything unsaved lives inside the CLI, which gets its own
-   *  say when its process is killed. Here, closing the pane is the only thing
-   *  standing between the human and their edits — so it asks, exactly as the
-   *  editor's own Esc/✕ already does (rev-99 finding 3).
-   *
-   *  Deliberately scoped to the HUMAN-initiated single-pane close paths — the header
-   *  ✕, the dock chip's ✕, and Ctrl+Shift+W — which is what "close this pane" means.
-   *  All three now reach it through `requestClose()`. A tab close, a group teardown,
-   *  or app shutdown do not route through here: they're bulk operations with their
-   *  own semantics, and turning each into a per-pane interrogation is a different
-   *  feature. Non-files panes answer true instantly. */
-  async confirmClose(): Promise<boolean> {
-    return this.filesView ? this.filesView.canDiscard() : true;
   }
 
   /** Point this files pane at `root`, keeping `cwdRaw` in step so the chrome that
@@ -1781,7 +1763,7 @@ export class Pane implements VoiceTargetPane {
     // on a terminal that was never opened. The view doesn't grab the tree or the
     // editor — the user clicks into whichever they want.
     if (this.filesView) {
-      this.filesView.el.focus();
+      this.filesView.focus();
       return;
     }
     this.term.focus();
@@ -2189,7 +2171,7 @@ export class Pane implements VoiceTargetPane {
     this.auditView?.dispose();
     this.groupView?.dispose();
     this.fileEditView?.dispose();
-    this.filesView?.dispose(); // the files pane's permanent content (#214)
+    this.filesView?.dispose(); // the file manager a files pane hosts (#214)
     if (this.ptyId !== null) {
       detachOutput(this.ptyId);
       detachGitWatch(this.ptyId);

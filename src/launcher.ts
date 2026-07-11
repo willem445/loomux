@@ -8,10 +8,12 @@
 //                  or Git Bash (#194 P2). Git Bash is enabled only when a
 //                  Git-for-Windows install is discovered (else disabled, with a
 //                  reason surfaced on the option).
-//   File explorer— a PTY-less pane hosting the file tree + editor rooted at a
-//                  folder (#214). Its only input is that folder; it is validated
-//                  for real (does the directory exist?) before the pane is made,
-//                  so a typo'd path shows an inline error instead of an empty tree.
+//   File explorer— a PTY-less pane hosting a native-style file MANAGER rooted at a
+//                  folder (#214): browse, open a file in the OS default app for its
+//                  extension, new folder / rename / delete, jump-to-file by name.
+//                  Its only input is that folder, and it is validated for real (does
+//                  the directory exist?) before the pane is made, so a typo'd path
+//                  shows an inline error instead of a broken pane.
 //
 // This replaces the old modal launcher AND the global "agent mode" toggle: there
 // is no global mode anymore, every pane declares its kind here at creation. The
@@ -299,7 +301,7 @@ export class WelcomeForm {
       ["agent", "Agent — a coding-agent CLI"],
       ["orchestrator", "Orchestrator + workers"],
       ["terminal", "Terminal — a shell"],
-      ["files", "File explorer — browse and edit files"],
+      ["files", "File explorer — browse files, open in their default app"],
     ]);
     this.kindSel.addEventListener("change", () => this.applyKind());
 

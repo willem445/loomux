@@ -182,7 +182,7 @@ pub struct ChangedFile {
 // explain why the file won't open) without parsing prose. Keep these in sync
 // with the `FileEditError` discriminants in `src/fileapi.ts`.
 
-fn err(code: &str, msg: impl AsRef<str>) -> String {
+pub(crate) fn err(code: &str, msg: impl AsRef<str>) -> String {
     format!("{code}: {}", msg.as_ref())
 }
 
@@ -212,7 +212,7 @@ fn lexical_normalize(p: &Path) -> PathBuf {
 /// Turn a `(root, rel)` pair into a validated absolute path inside `root`, or a
 /// typed error. `rel` may be empty (means `root` itself). This is the single
 /// choke point every command routes through.
-fn safe_resolve(root: &str, rel: &str) -> Result<PathBuf, String> {
+pub(crate) fn safe_resolve(root: &str, rel: &str) -> Result<PathBuf, String> {
     let root_path = Path::new(root);
     if !root_path.is_dir() {
         return Err(err("not-found", format!("root is not a directory: {root}")));

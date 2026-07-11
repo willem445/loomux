@@ -33,47 +33,61 @@ There is no global mode — each pane declares its own kind:
 | **Agent** | A coding-agent CLI (Claude, Copilot, or your own command). Optionally fans out to *N* panes, each in its own git worktree. |
 | **Orchestrator + workers** | An orchestrator pane plus idle workers, in its own project tab, with guardrails. See the [orchestration guide](orchestration). |
 | **Terminal** | A plain shell — PowerShell, Command Prompt, or Git Bash. |
-| **File explorer** | A file tree + code editor rooted at a folder you choose. |
+| **File explorer** | A native-style **file manager** rooted at a folder you choose. |
 
-A **file explorer** pane is loomux's file editor — the same lazy tree, CodeMirror
-editor, and streaming project-wide search you get from the `Alt+F` overlay — as a
-*permanent* pane rather than something you toggle over a terminal. Pick a folder
-and the pane holds it for as long as you keep it open, so you can park a browser
-beside your agents instead of flicking an overlay in and out (or opening a
-separate Explorer window per repo).
+### The file explorer pane
+
+A **file explorer** pane is loomux's Windows-Explorer equivalent, living inside a
+pane. Pick a folder and you get a real file manager: browse it, open things, and
+do the usual housekeeping — without leaving loomux or opening an OS Explorer
+window per project.
+
+- **Browse** — double-click a folder to go in; the breadcrumb and the **↑** button
+  take you back out. `Backspace` (or `Alt+←`) goes up, arrow keys move the
+  selection, `Enter` opens.
+- **Double-click a file → it opens in your default app for that extension**, exactly
+  like Explorer. A `.png` goes to your image viewer, a `.pdf` to your PDF reader,
+  a `.docx` to Word. Loomux doesn't open it and has no opinion about its type.
+- **New folder** (`Ctrl+Shift+N`), **rename** (`F2`), **delete** (`Del`).
+- On Windows, delete goes to the **Recycle Bin**, so a mis-click is recoverable —
+  and the confirmation says so. On macOS/Linux there's no bin, so it's permanent,
+  and the confirmation says *that* instead. It never promises an undo you don't have.
+- **Hidden** toggle — shows hidden files, and widens the Go-to-file index to include
+  git-ignored paths (`node_modules`, build output).
+
+This is **not** the in-app editor. That's the `Alt+F` overlay, it still works
+everywhere, and it's the right tool for a quick look or a one-line fix. The
+explorer is the one for *"get this file into the application that owns it."*
 
 #### Go to file
 
-The **Go to file** box at the top of the tree finds a file by **name**. (The
-search box below it is the other one — it reads file *contents*.) It's built to
-be instant: the folder's paths are indexed once in the background, respecting
-`.gitignore` by default, and each keystroke filters that index in memory.
+The **Go to file** box finds a file by **name**, anywhere under the pane's root.
+It's built to be instant: the folder's paths are indexed once in the background,
+and each keystroke filters that index in memory.
 
 - Type any part of a name or path — matching is plain substring, case-insensitive.
 - **Several terms, separated by spaces, must all match** somewhere in the path:
   `pane rest` finds `src/panerestore.ts`, and `src pane` finds `src/pane.ts`.
-- `↑` / `↓` pick a result, `Enter` opens it, `Esc` clears the box and returns you
-  to the tree. Opening a file also reveals it in the tree, so you stay oriented.
-- The **Ignored files** toggle applies here too: off (the default) skips anything
-  `.gitignore`d, on includes `node_modules` and build output.
+- `↑` / `↓` pick a result, `Enter` opens it **in its default app**, `Esc` clears the
+  box. Opening a hit also navigates you to its folder with it selected, so you end
+  up somewhere useful rather than back where you started.
 
-If more files match than the list shows, the count above it tells you — results
-are never cut silently.
+If more files match than the list shows, the count above it tells you — results are
+never cut silently. (The same box is in the `Alt+F` editor too, where `Enter` opens
+the file *in the editor* instead.)
+
+#### The rest of the pane
 
 It has no terminal underneath and never starts a process. That means the
 terminal-oriented chrome is gone from its header (no folder or branch chip; the
-git, issues, and file-editor overlays don't apply — `Alt+G`/`Alt+I` will tell you
-so). Everything else is a normal pane: it splits, drags, docks, maximizes,
-renames, and comes back on session restore at the same folder. It is **not** an
-agent, so it never counts toward a tab's agent badge.
+git, issues, and file-editor overlays don't apply — `Alt+G` / `Alt+I` will tell you
+so). Everything else is a normal pane: it splits, drags, docks, maximizes, renames,
+and comes back on session restore at the same folder. It is **not** an agent, so it
+never counts toward a tab's agent badge.
 
 If the folder is gone when a session is restored (deleted, renamed, or on a drive
 that isn't mounted), that pane comes back as the welcome screen with a message
-instead of an empty tree — pick a new folder and carry on.
-
-Closing a file explorer with **unsaved edits** asks first. It's the one pane kind
-where loomux itself is holding your work, so its ✕ (and `Ctrl+Shift+W`) won't
-discard a dirty buffer without a prompt.
+instead of an empty listing — pick a new folder and carry on.
 
 ## The split grid
 

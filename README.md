@@ -36,21 +36,28 @@ no global mode:
 | **Agent** | A coding-agent CLI (Claude, Copilot, or a custom command), optionally fanned out to *N* panes each in its own git worktree. |
 | **Orchestrator + workers** | An orchestrator plus idle workers in their own project tab, with guardrails. |
 | **Terminal** | A plain shell: PowerShell, Command Prompt, or Git Bash. |
-| **File explorer** | The file editor above as a *permanent* pane, rooted at a folder you pick — no terminal underneath, no process, ever. |
+| **File explorer** | A native-style **file manager** rooted at a folder you pick — no terminal underneath, no process, ever. |
 
-A **file explorer** pane lets you park a tree + editor beside your agents instead
-of toggling the overlay in and out, or opening an OS Explorer window per repo. It
-splits, docks, maximizes and restores like any other pane, and comes back at the
-same folder on session restore — but it is *not* an agent, so it never counts
-toward a tab's agent badge. See the [design note](doc/design/files-pane.md).
+A **file explorer** pane is loomux's Windows-Explorer equivalent: browse folders
+(breadcrumb, Up, double-click to descend), and **double-click a file to open it in
+whatever application your OS associates with that extension** — a `.png` opens in
+your image viewer, a `.pdf` in your PDF reader. Loomux does not open it. You also
+get **new folder**, **rename** (`F2`) and **delete** (`Del`; to the **Recycle Bin**
+on Windows), plus a fast **Go to file** name search that jumps anywhere under the
+root. It splits, docks, maximizes and restores like any other pane, and comes back
+at the same folder on session restore — but it is *not* an agent, so it never
+counts toward a tab's agent badge. See the [design note](doc/design/files-pane.md).
 
-Both the pane and the overlay carry a **Go to file** box: a fast file-*name*
-search (paths only — the search below it is the one that reads contents). The
-backend enumerates the root's paths once, off-thread, honoring `.gitignore` via
-the same `git ls-files` source the content search uses; every keystroke then
-filters that cached list in memory, so typing costs zero I/O. Matching is
-substring with space-separated terms AND-ed across the path (`pane rest` →
-`src/panerestore.ts`); `↑`/`↓` pick, `Enter` opens, `Esc` clears.
+This is deliberately **not** the in-app editor: that is the `Alt+F` overlay above,
+unchanged, and it remains the right tool for a quick look or a one-line fix. The
+explorer is the one for "get this file into the app that owns it".
+
+The **Go to file** box matches file *names*, never contents. The backend
+enumerates the root's paths once, off-thread; every keystroke then filters that
+cached list in memory, so typing costs zero I/O. Matching is substring with
+space-separated terms AND-ed across the path (`pane rest` → `src/panerestore.ts`);
+`↑`/`↓` pick, `Enter` opens it in its default app, `Esc` clears. (The same box is
+also in the `Alt+F` editor, where `Enter` opens the file *in the editor* instead.)
 
 ![sample](sample.jpg)
 
@@ -139,7 +146,8 @@ src-tauri/src/
   obs.rs            crash observability: panic hook, breadcrumb log, unclean-exit notice
   voice.rs          voice prompts (#58): mic capture (cpal) -> local whisper.cpp subprocess
   uistate.rs        durable UI state (project tabs #63): atomic tabs.json store
-  fileedit.rs       file-editor overlay (#174): lazy tree, read/write (atomic + hash conflict), streaming gitignore-aware search/replace (#207); server-side path safety
+  fileedit.rs       file-editor overlay (#174): lazy tree, read/write (atomic + hash conflict), streaming gitignore-aware search/replace (#207) + path-only name enumeration (#214); server-side path safety
+  filemgr.rs        file-MANAGER pane (#214): list, new folder, rename, delete-to-Recycle-Bin, open-with-OS-default-app; reuses fileedit's path choke point. No new crates (ShellExecuteW + SHFileOperationW from the `windows` dep we already have)
   lib.rs            Tauri wiring
 src/
   pty.ts            typed bridge to the backend (invoke + event bus)
@@ -163,8 +171,12 @@ src/
   orchestration.ts  frontend half of agent groups (panes, badges, focus)
   shortcuts.ts      app-level keybindings (single source of truth)
   fileapi.ts        typed bridge to fileedit.rs (per-feature wrapper, like git.ts)
-  fileedit.ts       file-editor surface (#174): tree + code editor + "Go to file" name search + content search/replace (DOM wiring). An Alt+F overlay, or a files pane's permanent content (#214)
+  fileedit.ts       file-editor overlay (#174, Alt+F): tree + code editor + "Go to file" name search + content search/replace (DOM wiring)
+  fileexplorer.ts   the file MANAGER a files pane hosts (#214): browse, open-with-default-app, new folder / rename / delete, Go to file (DOM wiring)
+  fileexplorermodel.ts pure file-manager core: listing order, rooted navigation, breadcrumb, formatting, inline-edit validation (DOM-free, unit-tested)
+  filemgr.ts        typed bridge to filemgr.rs (per-feature wrapper, like fileapi.ts)
   filematch.ts      pure file-NAME matching + ranking for "Go to file" (#214, DOM-free, unit-tested)
+  modal.ts          the shared confirm/choice dialog (used by the editor and the file manager)
   filetreemodel.ts  pure lazy-tree model: sort/merge/flatten (DOM-free, unit-tested)
   fileicons.ts      pure filename -> inline-SVG icon mapping (DOM-free, unit-tested)
   searchresults.ts  pure search grouping + tree-hit + replace-selection model (DOM-free, unit-tested)

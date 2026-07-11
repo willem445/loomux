@@ -881,8 +881,128 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   display: flex; flex-direction: column; min-height: 0;
   background: var(--bg-app);
 }
-/* The embedded view is the pane's whole body. (.fileedit is `flex: 1` and
-   already lays itself out; it only needs a box to fill.) */
+/* The file MANAGER fills the pane's body. (.fileexp is `flex: 1` and lays itself
+   out; it only needs a box to fill.) */
+
+/* ---------- the file manager (#214) ---------- */
+/* Explorer/Finder-equivalent: toolbar + breadcrumb, a Go-to-file box, and a
+   listing whose rows open with the OS default app on double-click. Deliberately
+   NOT the .fileedit surface (that is the Alt+F in-app editor, unchanged). */
+.fileexp {
+  flex: 1; min-height: 0; min-width: 0;
+  display: flex; flex-direction: column;
+  background: var(--bg-app); font-size: 13px; outline: none;
+}
+
+.fileexp-head {
+  flex: none; display: flex; align-items: center; gap: 4px;
+  padding: 5px 7px; border-bottom: 1px solid var(--border); background: var(--panel);
+}
+.fileexp-head .pane-btn { opacity: 1; }
+.fileexp-head .pane-btn:disabled { opacity: 0.3; cursor: default; }
+
+/* Breadcrumb: takes the slack, and scrolls sideways rather than wrapping the
+   toolbar to a second line (which would change the pane's chrome height). */
+.fileexp-crumbs {
+  flex: 1 1 auto; min-width: 0;
+  display: flex; align-items: center; gap: 2px;
+  overflow-x: auto; white-space: nowrap;
+  scrollbar-width: none;
+}
+.fileexp-crumbs::-webkit-scrollbar { height: 0; }
+.fileexp-crumb {
+  flex: none; background: none; border: none; cursor: pointer;
+  color: var(--text-dim); font: inherit; font-size: 12px;
+  padding: 2px 5px; border-radius: 4px;
+}
+.fileexp-crumb:hover { background: var(--panel-2); color: var(--text); }
+.fileexp-crumb.current { color: var(--text); font-weight: 600; }
+.fileexp-crumb-sep { flex: none; color: var(--text-dim); font-size: 11px; }
+
+.fileexp-toggle {
+  flex: none; display: inline-flex; align-items: center; gap: 4px;
+  color: var(--text-dim); font-size: 12px; cursor: pointer; padding: 0 4px;
+}
+
+.fileexp-input {
+  background: var(--panel-2); border: 1px solid var(--border); color: var(--text);
+  font-family: "Cascadia Mono", Consolas, monospace; font-size: 13px;
+  padding: 4px 8px; border-radius: 5px;
+}
+.fileexp-input:focus { outline: none; border-color: var(--accent-dim); }
+.fileexp-input::placeholder { color: var(--text-dim); }
+.fileexp-input.invalid { border-color: #f7768e; }
+
+.fileexp-goto-form {
+  flex: none; display: flex; flex-direction: column; gap: 4px;
+  padding: 7px 8px 5px; border-bottom: 1px solid var(--border-soft); background: var(--panel);
+}
+.fileexp-goto-row { display: flex; }
+.fileexp-goto-row .fileexp-input { flex: 1 1 auto; min-width: 0; }
+.fileexp-goto-summary {
+  color: var(--text-dim); font-size: 12px; min-height: 14px; line-height: 14px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+/* A capped result list or an incomplete index is flagged, never silently cut —
+   otherwise "no such file" reads as fact when it isn't. */
+.fileexp-goto-summary.truncated { color: #f0c674; }
+
+/* Listing and Go-to-file results swap places in the column; exactly one shows. */
+.fileexp-list, .fileexp-goto-list {
+  flex: 1 1 0; min-height: 0; overflow: auto; padding: 3px 0;
+  user-select: none; outline: none;
+}
+.fileexp-list[hidden], .fileexp-goto-list[hidden] { display: none; }
+
+.fileexp-row {
+  display: flex; align-items: center; gap: 7px;
+  padding: 3px 9px; cursor: default; white-space: nowrap;
+  color: var(--text);
+}
+.fileexp-row:hover { background: var(--panel-2); }
+/* The keyboard selection: Enter opens THIS. Distinct from :hover so a resting
+   mouse can never be mistaken for what Enter is about to act on. */
+.fileexp-row.sel { background: var(--accent-glow); }
+.fileexp-row.symlink .fileexp-name { color: var(--text-dim); font-style: italic; }
+.fileexp-row.hidden-entry { opacity: 0.55; }
+.fileexp-row.editing { background: var(--panel-2); }
+.fileexp-icon { flex: none; display: inline-flex; color: var(--text-dim); }
+.fileexp-row.sel .fileexp-icon { color: var(--accent); }
+.fileexp-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+/* Size and time are reference columns — fixed width so they line up down the
+   listing, and dim so the names stay the thing you scan. */
+.fileexp-size {
+  flex: none; width: 68px; text-align: right;
+  color: var(--text-dim); font-size: 11px; font-variant-numeric: tabular-nums;
+}
+.fileexp-mtime {
+  flex: none; width: 108px; text-align: right;
+  color: var(--text-dim); font-size: 11px; font-variant-numeric: tabular-nums;
+}
+.fileexp-row.editing .fileexp-input { flex: 1 1 auto; min-width: 0; }
+.fileexp-edit-err { flex: none; color: #f7768e; font-size: 11px; }
+
+.fileexp-empty { padding: 14px 12px; color: var(--text-dim); font-size: 12px; }
+.fileexp-status {
+  flex: none; padding: 4px 9px; border-top: 1px solid var(--border-soft);
+  background: var(--panel); color: var(--text-dim); font-size: 11px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
+.fileexp-goto-item {
+  display: flex; align-items: baseline; gap: 6px;
+  padding: 3px 9px; cursor: pointer; white-space: nowrap; color: var(--text);
+}
+.fileexp-goto-item:hover { background: var(--panel-2); }
+.fileexp-goto-item.sel { background: var(--accent-glow); }
+.fileexp-goto-item .fileexp-icon { align-self: center; }
+.fileexp-goto-name { flex: none; overflow: hidden; text-overflow: ellipsis; }
+.fileexp-goto-dir {
+  flex: 1 1 auto; min-width: 0;
+  color: var(--text-dim); font-size: 11px;
+  overflow: hidden; text-overflow: ellipsis;
+}
+.fileexp-goto-mark { background: none; color: var(--accent); font-weight: 600; }
 
 /* The form fills the pane's body below the header and scrolls if the card is
    taller than the pane; the card itself is centered. */

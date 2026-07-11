@@ -47,6 +47,20 @@ windows = { version = "0.57", features = [
     "Win32_System_JobObjects",
     "Win32_System_Threading",
     "Win32_Security",
+    # File-manager pane (#214). Two Shell APIs, NO new crate — which is the whole
+    # point of reaching for the `windows` crate we already depend on rather than
+    # `tauri-plugin-opener` or the `trash` crate:
+    #   ShellExecuteW    — "open with the OS default app for this extension",
+    #                      exactly what Explorer's double-click does. Takes a path,
+    #                      never a shell string, so there is no injection surface
+    #                      (cf. `cmd /c start`, which re-parses its argument).
+    #   SHFileOperationW — delete to the RECYCLE BIN (FO_DELETE | FOF_ALLOWUNDO),
+    #                      so a mis-click is recoverable. The `trash` crate would
+    #                      have done this too, but it is an unvetted dependency and
+    #                      this is ~30 lines against an API we already link.
+    # WindowsAndMessaging is pulled only for ShellExecuteW's SHOW_WINDOW_CMD arg.
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 # Voice-prompt prototype (#58): native mic capture via WASAPI. Windows-scoped on

@@ -70,6 +70,7 @@ import { closeDecision, type ConflictChoice } from "./dirtystate";
 import { detectEol, applyEol, textDiffers, type Eol } from "./eol";
 import { createEditor, type EditorWidget } from "./editorwidget";
 import { showToast } from "./toast";
+import { modal } from "./modal";
 
 /** What the hosting pane provides to the overlay. */
 export interface FileEditHost {
@@ -80,18 +81,6 @@ export interface FileEditHost {
   /** True when the root is a running agent's worktree — the view shows a subtle
    *  banner (editing it is legitimate but the agent may also be writing). */
   isAgentWorktree?(): boolean;
-  /** EMBEDDED mode (#214): this view is a file-explorer pane's permanent content,
-   *  not an overlay floating over a terminal. There is nothing to close back TO,
-   *  so the ✕ and the Esc-to-close binding are dropped — the pane's own ✕ closes
-   *  it. Everything else (tree, editor, #207 streaming search, replace) is
-   *  identical; this is the only behavioral fork, and it's one the overlay
-   *  semantics genuinely don't have an answer for. */
-  embedded?: boolean;
-  /** The user re-rooted the tree from the header's folder picker. An overlay host
-   *  ignores this (the root is view-local and browsing must not disturb the
-   *  terminal); a files pane (#214) adopts it as the pane's root, so the title and
-   *  the persisted layout follow what's actually on screen. */
-  onRootChanged?(root: string): void;
 }
 
 const TREE_W_KEY = "loomux.fileedit.treeW";
@@ -224,17 +213,12 @@ export class FileEditView {
     this.el = el("div", "fileedit");
     this.el.hidden = true;
     this.el.tabIndex = -1;
-    // Esc closes the OVERLAY. An embedded (pane-content) view has nothing to
-    // close back to, so Esc is left alone there — closing the pane on a stray
-    // Escape would be a nasty surprise with unsaved edits in the buffer.
-    if (!host.embedded) {
-      this.el.addEventListener("keydown", (e) => {
-        if (e.key === "Escape") {
-          e.stopPropagation();
-          void this.requestClose();
-        }
-      });
-    }
+    this.el.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") {
+        e.stopPropagation();
+        void this.requestClose();
+      }
+    });
 
     // ---- header ----
     const head = el("div", "fileedit-head");
@@ -265,7 +249,6 @@ export class FileEditView {
 
     const closeBtn = el("button", "pane-btn close", "✕") as HTMLButtonElement;
     closeBtn.title = "Close (Esc)";
-    closeBtn.hidden = !!host.embedded; // pane content — the PANE's ✕ is the close affordance
     closeBtn.addEventListener("click", () => void this.requestClose());
 
     head.append(rootWrap, spacer, this.fileLabel, this.dirtyDot, this.findBtn, this.saveBtn, closeBtn);
@@ -394,20 +377,6 @@ export class FileEditView {
     this.el.remove();
   }
 
-  /** May this view be torn down right now — is there unsaved work in the buffer?
-   *  True when it's clean, or when the human confirmed discarding it.
-   *
-   *  The host PANE calls this before closing a file-explorer pane (#214). A files
-   *  pane is the first pane kind where loomux itself owns an unsaved buffer, so a
-   *  ✕ / Ctrl+Shift+W must not drop edits silently — the same guard `requestClose`
-   *  already applies to the overlay's own Esc/✕, now reachable from the pane close
-   *  path too (rev-99 finding 3). */
-  async canDiscard(): Promise<boolean> {
-    // Same pure gate the view's own Esc/✕ uses (`requestClose`), so "dirty means
-    // ask" is stated once, in closeDecision, and cannot drift between the two.
-    if (closeDecision(this.isDirtyNow()) === "close") return true;
-    return this.confirmDiscard();
-  }
 
   // ---------- root / tree ----------
 
@@ -421,10 +390,6 @@ export class FileEditView {
     if (typeof picked === "string") {
       this.root = picked;
       this.refreshRootLabel();
-      // A files pane (#214) adopts the new root as ITS root — title and persisted
-      // layout follow the tree the user is actually looking at. An overlay host
-      // doesn't implement this: there the root stays view-local by design.
-      this.host.onRootChanged?.(picked);
       await this.reloadTree();
     }
   }
@@ -776,8 +741,7 @@ export class FileEditView {
     if (e.key === "Escape") {
       // A query in the box: Esc clears it (back to the tree) and is CONSUMED, so a
       // single press doesn't also close the overlay out from under the user. Empty
-      // box: let it bubble — Esc then means what it always meant (close the overlay;
-      // nothing, in an embedded files pane).
+      // box: let it bubble — Esc then means what it always meant (close the overlay).
       if (this.gotoInput.value !== "") {
         e.stopPropagation();
         this.clearGoto();
@@ -1367,50 +1331,3 @@ function shortenPath(p: string): string {
   return `…/${parts.slice(-2).join("/")}`;
 }
 
-interface ModalButton<T> {
-  label: string;
-  value: T;
-  kind?: "danger" | "primary";
-}
-interface ModalSpec<T> {
-  title: string;
-  body: string;
-  buttons: ModalButton<T>[];
-  onKey?: (key: string) => void;
-}
-
-/** Minimal confirm/choice modal reusing the `.agent-dialog` / `.dlg-*` kit
- *  (same look as editorConfigDialog). Resolves with the chosen button value. */
-function modal<T>(build: (resolve: (v: T) => void) => ModalSpec<T>): Promise<T> {
-  return new Promise<T>((resolve) => {
-    let settled = false;
-    const done = (v: T) => {
-      if (settled) return;
-      settled = true;
-      overlay.remove();
-      resolve(v);
-    };
-    const spec = build(done);
-
-    const overlay = el("div", "launcher-overlay visible");
-    const dlg = el("div", "agent-dialog");
-    dlg.append(el("h2", "", spec.title), el("div", "dlg-hint", spec.body));
-    const actions = el("div", "dlg-actions");
-    for (const b of spec.buttons) {
-      const btn = el("button", `dlg-btn${b.kind === "danger" ? " danger" : b.kind === "primary" ? " primary" : ""}`, b.label);
-      btn.addEventListener("click", () => done(b.value));
-      actions.appendChild(btn);
-    }
-    dlg.appendChild(actions);
-    overlay.appendChild(dlg);
-    overlay.addEventListener("mousedown", (e) => {
-      if (e.target === overlay && spec.onKey) spec.onKey("Escape");
-    });
-    overlay.addEventListener("keydown", (e) => {
-      e.stopPropagation();
-      spec.onKey?.(e.key);
-    });
-    document.body.appendChild(overlay);
-    (dlg.querySelector(".dlg-btn:last-child") as HTMLElement | null)?.focus();
-  });
-}
