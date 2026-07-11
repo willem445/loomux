@@ -73,11 +73,13 @@ What differs from the overlay, and only this:
   Refreshing rebuilds the changes strip, which would wipe a half-typed commit message
   every time you tabbed away and back.
 
-`Alt+F` / `Alt+G` inside a terminal or agent pane are **unchanged** — same overlay,
-same sizing, same `Esc`. Inside a content pane there is no terminal for an overlay to
-float over, so the hotkey for the surface the pane already *is* just focuses it, and
-the others say why they don't apply (want a git view next to your editor pane? open a
-git pane).
+`Alt+F` / `Alt+G` inside a terminal or agent pane still open the overlays — same
+overlay, same sizing, same `Esc`. Inside a content pane there is no terminal for an
+overlay to float over, so the hotkey for the surface the pane already *is* just
+focuses it, and the others answer with a toast naming what isn't available where —
+*"The git view isn't available in a file editor pane."* If a git view is what you
+want beside your editor, open a **git pane**; the toast won't tell you that, this
+page does.
 
 Everything else is the same code. The editor pane is the same editor; the git pane
 is the same git view, worktree switching included.
@@ -176,8 +178,9 @@ the file *in the editor* instead.)
 It has no terminal underneath and never starts a process. That means the
 terminal-oriented chrome is gone from its header (no folder or branch chip; the
 overlays float over a *terminal* and are sized from it, so they don't apply here —
-`Alt+G` / `Alt+I` will tell you so, and if it's a git view you want over this
-project, open a **git pane**). Everything else is a normal pane: it splits, drags,
+`Alt+G` / `Alt+I` answer with a toast that names what isn't available where, e.g.
+*"The git view isn't available in a file explorer pane."* When it's a git view you
+want over this project, open a **git pane**). Everything else is a normal pane: it splits, drags,
 docks, maximizes, renames, and comes back on session restore at the same folder. It
 is **not** an agent, so it never counts toward a tab's agent badge.
 

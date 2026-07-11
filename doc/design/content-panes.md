@@ -6,7 +6,25 @@ no CLI, no PTY — the pane's content is a view, permanently.
 #214 built the first one (`files`, the file manager). #217 adds the two the human
 actually asks for most: `editor` (the #174 tree + code editor + #207 search) and
 `git` (the #208 git view). Both surfaces already existed as **overlays** inside a
-terminal pane, behind `Alt+F` and `Alt+G`, and both overlays are unchanged.
+terminal pane, behind `Alt+F` and `Alt+G`.
+
+**What "the overlays are unchanged" means, exactly** — because it is exact for one of
+them and deliberately not for the other:
+
+- **`Alt+G` (git): unchanged, byte for byte.** The only fork is `embedded`, which the
+  overlay host doesn't set. Nothing else about it moved.
+- **`Alt+F` (editor): unchanged in every way the pane kind is responsible for** — same
+  overlay, same terminal-derived sizing, same `Esc`/✕, same view-local root (an overlay
+  does **not** adopt a re-root; only a pane does). But it **inherits two bug fixes** the
+  editor-as-pane forced into the open, and inherits them on purpose:
+  1. a re-root now closes the open buffer (asking first if it's dirty) instead of
+     leaving it bound to a path under the *old* root — see *Unsaved buffers* below;
+  2. closing a pane that holds a dirty overlay buffer now asks, instead of discarding
+     it silently.
+
+  Both bugs were always in the overlay. They are fixed for it rather than fixed only
+  for the new pane, because a guard that covers the new hole and leaves the older,
+  likelier one open is not a guard — it is a claim.
 
 ```
                 overlay (Alt+F / Alt+G)            pane kind (#217)
@@ -50,8 +68,9 @@ the view.
 
 So the generalization is a container, not a layout engine:
 
-- **overlay path** — unchanged, byte for byte. `.git-overlay` floats over
-  `.pane-term`, height clamped from the terminal, cursor shift and all.
+- **overlay path** — its SIZING is unchanged, byte for byte: `.git-overlay` floats over
+  `.pane-term`, height clamped from the terminal, cursor shift and all. (Not a claim
+  about the overlays' *behavior* — `Alt+F` inherits two fixes; see the top of this note.)
 - **pane path** — `.pane-content` is a plain box filling the pane below the header.
   The view is `flex: 1` inside it (all three already were), so it fills the box,
   and its existing `ResizeObserver` re-clamps its sub-panes whenever the box

@@ -48,11 +48,13 @@ agents — never count toward a tab's agent badge.
 A **file editor** pane and a **git** pane are the `Alt+F` and `Alt+G` overlays
 promoted to first-class panes: park the editor beside your agent instead of
 toggling it in and out, or keep a git graph open in a split while the agent works.
-The overlays are unchanged and still there for a quick look inside a terminal pane;
-the panes are for when you want the surface *to stay*. An editor pane holds real
-unsaved buffers, so nothing throws them away without asking — closing the pane
-(header ✕, dock chip, or `Ctrl+Shift+W`), closing its **tab**, or re-rooting the
-editor elsewhere all ask first. See the [design note](doc/design/content-panes.md).
+The overlays are still there for a quick look inside a terminal pane; the panes are
+for when you want the surface *to stay*. The `Alt+G` overlay is untouched; the `Alt+F`
+one gains the same unsaved-edits protection the pane has (see below), which it always
+should have had. Because an editor holds real unsaved buffers, nothing throws them
+away without asking — closing the pane (header ✕, dock chip, or `Ctrl+Shift+W`),
+closing its **tab**, or re-rooting the editor elsewhere all ask first. See the
+[design note](doc/design/content-panes.md).
 
 From a **file explorer** pane, right-click a file → **Open in file editor pane**
 opens an editor pane beside it, rooted where the browser is rooted, with that file
