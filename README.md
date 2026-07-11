@@ -43,8 +43,9 @@ A **file explorer** pane is loomux's Windows-Explorer equivalent: browse folders
 whatever application your OS associates with that extension** — a `.png` opens in
 your image viewer, a `.pdf` in your PDF reader. Loomux does not open it. You also
 get **new file**, **new folder**, **rename** (`F2`) and **delete** (`Del`; to the
-**Recycle Bin** on Windows), plus a fast **Go to file** name search that jumps
-anywhere under the root. It splits, docks, maximizes and restores like any other pane, and comes back
+**Recycle Bin** on Windows), a **right-click menu** (open with…, reveal in your OS file
+manager, hash), a short **SHA-256** per file computed off-thread, and a fast **Go to
+file** name search that jumps anywhere under the root. It splits, docks, maximizes and restores like any other pane, and comes back
 at the same folder on session restore — but it is *not* an agent, so it never
 counts toward a tab's agent badge. See the [design note](doc/design/files-pane.md).
 
@@ -147,7 +148,8 @@ src-tauri/src/
   voice.rs          voice prompts (#58): mic capture (cpal) -> local whisper.cpp subprocess
   uistate.rs        durable UI state (project tabs #63): atomic tabs.json store
   fileedit.rs       file-editor overlay (#174): lazy tree, read/write (atomic + hash conflict), streaming gitignore-aware search/replace (#207) + path-only name enumeration (#214); server-side path safety
-  filemgr.rs        file-MANAGER pane (#214): list, new folder, rename, delete-to-Recycle-Bin, open-with-OS-default-app; reuses fileedit's path choke point. No new crates (ShellExecuteW + SHFileOperationW from the `windows` dep we already have)
+  filemgr.rs        file-MANAGER pane (#214): list, new file/folder, rename, delete-to-Recycle-Bin, open-with-default-app, open-with chooser, reveal-in-OS-file-manager; reuses fileedit's path choke point. Shell APIs come from the `windows` dep we already have (ShellExecuteW + SHFileOperationW)
+  filehash.rs       file hashing (#214): SHA-256/512, SHA-1, CRC-32/16/8 — streamed off-thread on a worker (never the main thread), cancellable via the #207 registry
   lib.rs            Tauri wiring
 src/
   pty.ts            typed bridge to the backend (invoke + event bus)
@@ -172,9 +174,12 @@ src/
   shortcuts.ts      app-level keybindings (single source of truth)
   fileapi.ts        typed bridge to fileedit.rs (per-feature wrapper, like git.ts)
   fileedit.ts       file-editor overlay (#174, Alt+F): tree + code editor + "Go to file" name search + content search/replace (DOM wiring)
-  fileexplorer.ts   the file MANAGER a files pane hosts (#214): browse, open-with-default-app, new folder / rename / delete, Go to file (DOM wiring)
-  fileexplorermodel.ts pure file-manager core: listing order, rooted navigation, breadcrumb, formatting, inline-edit validation (DOM-free, unit-tested)
-  filemgr.ts        typed bridge to filemgr.rs (per-feature wrapper, like fileapi.ts)
+  fileexplorer.ts   the file MANAGER a files pane hosts (#214): browse, open-with-default-app, new file/folder, rename, delete, context menu, SHA-256 column, Go to file (DOM wiring)
+  fileexplorermodel.ts pure file-manager core: listing order, rooted navigation, breadcrumb, formatting, inline-edit validation, op-target binding (DOM-free, unit-tested)
+  filemenu.ts       pure context-menu model: what appears, what it acts on (target bound at menu-open) (DOM-free, unit-tested)
+  contextmenu.ts    generic context-menu renderer: placement, submenus, Esc/click-away (DOM wiring)
+  filehashmodel.ts  pure hashing policy: auto-hash threshold, digest cache keying (path+size+mtime), formatting (DOM-free, unit-tested)
+  filemgr.ts        typed bridge to filemgr.rs + filehash.rs (per-feature wrapper, like fileapi.ts)
   filematch.ts      pure file-NAME matching + ranking for "Go to file" (#214, DOM-free, unit-tested)
   modal.ts          the shared confirm/choice dialog (used by the editor and the file manager)
   filetreemodel.ts  pure lazy-tree model: sort/merge/flatten (DOM-free, unit-tested)

@@ -14,7 +14,8 @@
 //! the human GUI-validation list.
 
 use loomux_lib::filemgr::{
-    delete, delete_mode, list, new_file, new_folder, open_default, rename, validate_name,
+    capabilities, delete, delete_mode, list, new_file, new_folder, open_default, open_with, rename,
+    reveal, validate_name,
 };
 use std::fs;
 use std::path::Path;
@@ -468,4 +469,77 @@ fn new_file_rejects_bad_names_through_the_same_validator_as_new_folder() {
         let e = new_file(rp, "", bad).unwrap_err();
         assert_eq!(err_code(&e), "invalid-name", "for {bad:?}: {e}");
     }
+}
+
+// ---------- reveal / open-with (SHAPE only — nothing is ever launched) ----------
+//
+// These stop at the containment + kind checks, deliberately: a test that got as far as
+// the hand-off would have popped Explorer, or the Open-with chooser, on a CI runner.
+// What CAN be wrong here is what the checks let through, and that is what is tested.
+
+#[test]
+fn reveal_and_open_with_refuse_to_escape_the_root() {
+    let parent = tempfile::tempdir().unwrap();
+    let root = parent.path().join("root");
+    fs::create_dir(&root).unwrap();
+    fs::write(parent.path().join("secret.txt"), "do not touch").unwrap();
+    let rp = root.to_str().unwrap();
+
+    for e in [reveal(rp, "../secret.txt").err(), open_with(rp, "../secret.txt").err()] {
+        let e = e.expect("a `..` path must be refused before any shell hand-off");
+        assert!(
+            matches!(err_code(&e), "outside-root" | "not-found" | "invalid-path"),
+            "got: {e}"
+        );
+    }
+}
+
+#[test]
+fn reveal_refuses_something_that_is_not_there() {
+    // Refused BEFORE the spawn, so no stray Explorer window opens on a dead path.
+    let root = tempfile::tempdir().unwrap();
+    let e = reveal(root.path().to_str().unwrap(), "ghost.txt").unwrap_err();
+    assert_eq!(err_code(&e), "not-found", "got: {e}");
+}
+
+#[test]
+fn open_with_refuses_a_directory_and_a_missing_file_before_any_shell_call() {
+    let root = tempfile::tempdir().unwrap();
+    fs::create_dir(root.path().join("sub")).unwrap();
+    let rp = root.path().to_str().unwrap();
+
+    assert_eq!(err_code(&open_with(rp, "sub").unwrap_err()), "is-dir");
+    assert_eq!(err_code(&open_with(rp, "ghost.pdf").unwrap_err()), "not-found");
+}
+
+#[test]
+fn open_with_is_refused_as_unsupported_where_the_os_has_no_chooser() {
+    // Windows has the `openas` verb; macOS and Linux have no clean equivalent, so the
+    // command says `unsupported` and `capabilities()` reports it — the menu HIDES the
+    // item there rather than offering something that fails when clicked. This pins that
+    // the two agree, so the UI can't advertise a capability the backend refuses.
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("a.txt"), "x").unwrap();
+    let caps = capabilities();
+
+    if caps.open_with {
+        // Windows. Not driven further — succeeding would mean CI just popped a chooser.
+        assert!(cfg!(windows));
+    } else {
+        let e = open_with(root.path().to_str().unwrap(), "a.txt").unwrap_err();
+        assert_eq!(err_code(&e), "unsupported", "got: {e}");
+    }
+}
+
+#[test]
+fn capabilities_tell_the_truth_about_this_platform() {
+    let caps = capabilities();
+    // The delete mode must agree with the pure fn the confirmation dialog is keyed off,
+    // or the UI promises a Recycle Bin the backend won't deliver.
+    assert_eq!(caps.delete_mode, delete_mode().mode);
+    assert_eq!(caps.open_with, cfg!(windows), "only Windows has an open-with chooser");
+    assert!(caps.reveal, "every platform can at least open the containing folder");
+    // Linux can open the folder but cannot SELECT the entry — the menu labels that
+    // honestly rather than over-promising.
+    assert_eq!(caps.reveal_selects, cfg!(any(windows, target_os = "macos")));
 }

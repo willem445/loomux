@@ -27,6 +27,30 @@ tiny_http = "0.12"
 tauri-plugin-dialog = "2"
 sysinfo = "0.33"
 
+# File hashing for the file-manager pane (#214): a short SHA-256 per row, plus an
+# on-demand Hash submenu (SHA-256/512, SHA-1, CRC-32/16/8).
+#
+# VETTED AGAINST THE GETRANDOM BAN above, which is the only reason these are three
+# lines and not a hand-rolled SHA-256:
+#
+#   cargo tree -e normal --target all -i getrandom@0.3.4
+#     → getrandom v0.3.4 └── tauri v2.11.5      (pre-existing; tauri's own, unmoved)
+#   cargo tree -e normal --target all -i getrandom@0.2.17
+#     → "nothing to print"                       (not in the runtime tree at all)
+#   cargo tree -e normal --target all -p sha2 / -p sha1 / -p crc
+#     → cfg-if, cpufeatures→libc, digest→block-buffer→generic-array→typenum
+#     → crc-catalog (a pure lookup-table crate, zero deps)
+#
+# NONE of them touch getrandom, so none imports ProcessPrng. Cost in new packages:
+# `sha2` is **already in Cargo.lock** (a tauri transitive), and `sha1` reuses its
+# entire chain — so the three crates below add exactly THREE packages to the lock:
+# sha1, crc, crc-catalog. Hashing is not a place to be clever: these are the
+# RustCrypto reference implementations, and the integration tests check them against
+# the published NIST/standard vectors rather than against themselves.
+sha2 = "0.10"
+sha1 = "0.10"
+crc = "3"
+
 # Vendor-neutral GPU metrics on Windows: PDH performance counters give
 # per-engine utilization + dedicated VRAM usage for any WDDM adapter (AMD,
 # Intel, NVIDIA); DXGI reports total VRAM and the adapter name.

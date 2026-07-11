@@ -1004,6 +1004,76 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 }
 .fileexp-goto-mark { background: none; color: var(--accent); font-weight: 600; }
 
+/* The SHA-256 column (#214). Monospaced + tabular so the digests line up down the
+   listing and a mismatched one is visible at a glance. Fixed width: the column must not
+   reflow as digests stream in (the row would jitter under the cursor). */
+.fileexp-hash {
+  flex: none; width: 104px; text-align: right;
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 11px; font-variant-numeric: tabular-nums;
+  color: var(--text-dim);
+  overflow: hidden; white-space: nowrap;
+}
+.fileexp-hash.done { cursor: pointer; }
+.fileexp-hash.done:hover { color: var(--accent); text-decoration: underline; }
+/* Over the auto-hash threshold: the read isn't free, so the user asks for it. */
+.fileexp-hash.on-demand { cursor: pointer; color: var(--accent-dim); font-style: italic; }
+.fileexp-hash.on-demand:hover { color: var(--accent); }
+.fileexp-hash.pending { opacity: 0.45; }
+.fileexp-hash.error { color: #f0c674; }
+
+/* ---------- context menu (#214) ---------- */
+/* Fixed-position, body-level, one at a time. Placed by JS (flipped to stay on screen);
+   everything else — including the submenus — is CSS, so there are no timers to leak. */
+.ctxmenu {
+  position: fixed; z-index: 200;
+  min-width: 190px; padding: 4px;
+  background: var(--panel); color: var(--text);
+  border: 1px solid var(--border); border-radius: 8px;
+  box-shadow: 0 10px 34px rgba(0, 0, 0, 0.55);
+  font-size: 12px; outline: none;
+  user-select: none;
+}
+.ctxmenu-level { display: flex; flex-direction: column; }
+.ctxmenu-item {
+  position: relative;
+  padding: 5px 9px; border-radius: 5px; cursor: pointer; white-space: nowrap;
+  outline: none;
+}
+.ctxmenu-item:hover, .ctxmenu-item:focus { background: var(--panel-2); }
+/* Disabled = inapplicable here (a folder has no hash), shown so the menu's shape stays
+   stable. Unsupported-on-this-OS items are omitted entirely instead — see filemenu.ts. */
+.ctxmenu-item.disabled { opacity: 0.4; cursor: default; }
+.ctxmenu-item.disabled:hover { background: none; }
+.ctxmenu-sep { height: 1px; margin: 4px 6px; background: var(--border-soft); }
+
+/* Submenu: the ▸ marker, and the panel itself, opened on hover/focus. */
+.ctxmenu-item.has-sub::after {
+  content: "›"; position: absolute; right: 8px; top: 4px; color: var(--text-dim);
+}
+.ctxmenu-sub {
+  display: none;
+  position: absolute; left: 100%; top: -5px;
+  min-width: 160px; padding: 4px;
+  background: var(--panel);
+  border: 1px solid var(--border); border-radius: 8px;
+  box-shadow: 0 10px 34px rgba(0, 0, 0, 0.55);
+}
+.ctxmenu-item.has-sub:hover > .ctxmenu-sub,
+.ctxmenu-item.has-sub:focus-within > .ctxmenu-sub { display: flex; flex-direction: column; }
+
+/* The hash dialog reuses the shared .agent-dialog kit; the digest IS the body, so it gets
+   a monospace, wrapping, SELECTABLE treatment rather than prose styling — a 128-char
+   SHA-512 you can't select is one you have to transcribe by hand. */
+.dlg-mono {
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 12px; line-height: 1.6;
+  color: var(--text);
+  word-break: break-all; user-select: text;
+  background: var(--panel-2); border: 1px solid var(--border-soft);
+  border-radius: 6px; padding: 8px 10px;
+}
+
 /* The form fills the pane's body below the header and scrolls if the card is
    taller than the pane; the card itself is centered. */
 .pane-welcome {

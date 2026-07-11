@@ -515,6 +515,172 @@ fn open_os(path: &Path) -> Result<(), String> {
         .map_err(|e| err("io", format!("could not launch {program}: {e}")))
 }
 
+// ---------- reveal in the OS file manager ----------
+
+/// Show `rel` in the operating system's own file manager, **with the entry selected**
+/// — Explorer's "Reveal in folder", Finder's "Show in Finder".
+///
+/// Best-effort by platform, and honestly so — `capabilities()` tells the UI which of
+/// these it is getting, and the menu says so rather than promising a selection it
+/// cannot deliver:
+///
+///   * **Windows** — `explorer /select,<path>`. Exact: the entry is selected.
+///   * **macOS** — `open -R <path>`. Exact: the entry is selected.
+///   * **Linux** — there is no standard "reveal" verb. `xdg-open <parent dir>` opens
+///     the containing folder in whatever file manager is configured, with **nothing
+///     selected**. That is the honest limit of what is portable; a per-DE special case
+///     (`nautilus --select`, `dolphin --select`, …) is a matrix we are not signing up
+///     to maintain in a terminal multiplexer.
+///
+/// A DIRECTORY reveals *itself* (selected in its parent), which is what every file
+/// manager does and what the user means by right-clicking a folder → Reveal.
+pub fn reveal(root: &str, rel: &str) -> Result<(), String> {
+    let path = resolve(root, rel)?;
+    if !path.exists() {
+        return Err(err("not-found", format!("'{rel}' no longer exists")));
+    }
+    reveal_os(&path)
+}
+
+#[cfg(windows)]
+fn reveal_os(path: &Path) -> Result<(), String> {
+    use std::process::{Command, Stdio};
+    // `/select,<path>` must arrive as ONE argv element — Explorer parses everything
+    // after the comma as the path, so this is not a shell string being concatenated;
+    // it is a single argument built with `format!` and handed straight to CreateProcess.
+    // A filename full of spaces, quotes or ampersands is inert (there is no shell).
+    let mut cmd = Command::new("explorer.exe");
+    cmd.arg(format!("/select,{}", path.display()))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // Explorer notoriously returns a NON-ZERO exit code on success, so its status is
+    // worthless — only the spawn itself can meaningfully fail.
+    cmd.spawn().map(|_| ()).map_err(|e| err("io", e.to_string()))
+}
+
+#[cfg(not(windows))]
+fn reveal_os(path: &Path) -> Result<(), String> {
+    use std::process::{Command, Stdio};
+    // argv, never a shell string — the same guarantee as `open_os` and `editor.rs`.
+    let mut cmd = if cfg!(target_os = "macos") {
+        let mut c = Command::new("open");
+        c.arg("-R").arg(path); // -R = reveal: opens the folder AND selects the entry
+        c
+    } else {
+        // No portable reveal on Linux: open the containing folder, select nothing.
+        let mut c = Command::new("xdg-open");
+        c.arg(path.parent().unwrap_or(path));
+        c
+    };
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| err("io", format!("could not reveal: {e}")))
+}
+
+// ---------- open with… ----------
+
+/// Ask the OS to show its **"Open with"** chooser for `rel`, so the user can send the
+/// file to an application other than the default.
+///
+/// **Windows only.** `ShellExecuteW` with the `openas` verb pops the same chooser
+/// Explorer's own "Open with →  Choose another app" does — and, like the default-open,
+/// it takes a **path**, never a command line, so there is nothing for a shell to
+/// re-parse.
+///
+/// macOS and Linux get a typed `unsupported` error rather than a bad approximation.
+/// There is no clean CLI for the Finder chooser (`open -a <App>` needs you to already
+/// know the app, which is precisely what the dialog is for), and Linux has no standard
+/// at all. `capabilities()` reports this, and the menu **hides** the item on those
+/// platforms rather than offering something that fails when clicked.
+pub fn open_with(root: &str, rel: &str) -> Result<(), String> {
+    let path = resolve(root, rel)?;
+    let md = std::fs::symlink_metadata(&path).map_err(|e| err("not-found", e.to_string()))?;
+    if md.is_dir() {
+        return Err(err("is-dir", "directories are navigated, not opened"));
+    }
+    open_with_os(&path)
+}
+
+#[cfg(windows)]
+fn open_with_os(path: &Path) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // The `openas` verb IS the Open-with dialog. (SHOpenWithDialog would also work but
+    // wants an HWND and an OPENASINFO; this needs neither and is the same chooser.)
+    let verb: Vec<u16> = "openas\0".encode_utf16().collect();
+
+    // SAFETY: both buffers are nul-terminated and outlive the call; the path is passed
+    // as a PATH (lpFile), with lpParameters NULL — no command line is ever formed.
+    let rc = unsafe {
+        ShellExecuteW(
+            None,
+            PCWSTR(verb.as_ptr()),
+            PCWSTR(wide.as_ptr()),
+            None,
+            None,
+            SW_SHOWNORMAL,
+        )
+    };
+    let code = rc.0 as usize;
+    if code > 32 {
+        return Ok(());
+    }
+    Err(match code {
+        2 | 3 => err("not-found", "the file could not be found"),
+        _ => err(
+            "io",
+            format!("the shell could not show the Open-with dialog (code {code})"),
+        ),
+    })
+}
+
+#[cfg(not(windows))]
+fn open_with_os(_path: &Path) -> Result<(), String> {
+    Err(err(
+        "unsupported",
+        "there is no OS \"open with\" chooser on this platform",
+    ))
+}
+
+// ---------- capabilities ----------
+
+/// What this platform can actually do, so the UI offers exactly that. Reported once and
+/// consulted when the context menu is built: an item that would always fail is HIDDEN
+/// rather than shown-and-broken, and one that is approximate (Linux reveal) says so.
+#[derive(Serialize, Debug, PartialEq)]
+pub struct Caps {
+    /// "recycle" | "permanent" — what `delete` will do here (see `delete_mode`).
+    pub delete_mode: &'static str,
+    /// Is there an OS "Open with" chooser? Windows only.
+    pub open_with: bool,
+    /// Can we reveal in the OS file manager, and does it SELECT the entry?
+    pub reveal: bool,
+    /// True when reveal opens the containing folder but cannot select the entry
+    /// (Linux). The menu labels it honestly instead of over-promising.
+    pub reveal_selects: bool,
+}
+
+pub fn capabilities() -> Caps {
+    Caps {
+        delete_mode: delete_mode().mode,
+        open_with: cfg!(windows),
+        reveal: true,
+        reveal_selects: cfg!(any(windows, target_os = "macos")),
+    }
+}
+
 // ---------- commands ----------
 
 #[tauri::command]
@@ -543,8 +709,18 @@ pub fn fm_delete(root: String, rel: String) -> Result<bool, String> {
 }
 
 #[tauri::command]
-pub fn fm_delete_mode() -> DeleteMode {
-    delete_mode()
+pub fn fm_capabilities() -> Caps {
+    capabilities()
+}
+
+#[tauri::command]
+pub fn fm_reveal(root: String, rel: String) -> Result<(), String> {
+    reveal(&root, &rel)
+}
+
+#[tauri::command]
+pub fn fm_open_with(root: String, rel: String) -> Result<(), String> {
+    open_with(&root, &rel)
 }
 
 #[tauri::command]

@@ -62,32 +62,44 @@ not just the new one: `tryWebgl()` and `serializeViewportHtml()` now bail when
 `term.element` is unset. Both previously threw-and-caught on a welcome or dormant
 pane whenever its tab was shown or hover-previewed.
 
-## Backend: no new crates
+## Backend: the dependency budget
 
-Three capabilities were needed, and the constraint that shaped all of them is
-CLAUDE.md #2 — **no getrandom-pulling crates**, because
-`bcryptprimitives.dll!ProcessPrng` isn't exported on this project's Windows 10
-baseline and the binary then fails to load with `0xc0000139`.
+The constraint shaping every choice here is CLAUDE.md #2 — **no getrandom-pulling
+crates**, because `bcryptprimitives.dll!ProcessPrng` isn't exported on this project's
+Windows 10 baseline and the binary then fails to load with `0xc0000139`.
+
+**The OS integrations cost nothing.** Every one of them turned out to be an API in the
+`windows` crate we *already* depend on — a couple of extra feature flags:
 
 | Need | Obvious dependency | What we did instead |
 | --- | --- | --- |
 | Open with default app | `tauri-plugin-opener` | `ShellExecuteW` |
+| The "Open with" chooser | — | `ShellExecuteW`, `openas` verb |
 | Delete to Recycle Bin | the `trash` crate | `SHFileOperationW` + `FOF_ALLOWUNDO` |
+| Reveal in the OS file manager | — | `explorer /select,` (argv) / `open -R` / `xdg-open` |
 | Enumerate paths for the name search | — | reuses `fileedit`'s walker |
 
-Both Shell APIs come from the **`windows` crate we already depend on** — two extra
-feature flags, ~40 lines. `Cargo.lock` is **byte-identical**, so the getrandom
-question isn't answered, it's *dissolved*: the dependency graph didn't move.
+`ShellExecuteW` is also the *safer* option, not just the cheaper one: it takes a **path**,
+not a command line, so unlike `cmd /c start "" <path>` there is nothing for a shell to
+re-parse and a filename full of spaces, quotes or ampersands is inert. (The reveal's
+`/select,<path>` is likewise one argv element handed straight to `CreateProcess`, not a
+concatenated shell string.)
 
-`ShellExecuteW` also happens to be the *safer* option, not just the cheaper one: it
-takes a **path**, not a command line, so unlike `cmd /c start "" <path>` there is
-nothing for a shell to re-parse and a filename full of spaces, quotes or ampersands
-is inert. (Same guarantee `editor.rs` gets by using argv.)
+**Hashing cost three packages**, and it is the only thing in this feature that did.
+`sha2`, `sha1` and `crc` were vetted against the ban before use, and the result is
+recorded in `Cargo.toml` and under *Hashing* below: none touches getrandom, `sha2` was
+**already in the lock** (a tauri transitive) with its whole dependency chain, and `sha1`
+reuses that chain — so the additions are exactly `sha1`, `crc`, `crc-catalog`.
 
-On macOS/Linux the open is `open` / `xdg-open` (spawned detached, argv), and there
-is **no Recycle Bin** without a new dependency. So delete is permanent there — and
-`fm_delete_mode` reports which, so the confirmation dialog says *"Permanently
-delete"* rather than promising an undo that doesn't exist.
+That is a deliberate departure from this feature's otherwise-zero-crate record, and the
+reason is judgement, not laziness: hand-rolling SHA-256, SHA-512 and SHA-1 to save three
+tiny, pure-Rust, widely-audited packages would trade a *known-correct* implementation for
+one that has to earn trust — in exchange for nothing the ban actually asks for.
+
+On macOS/Linux the open is `open` / `xdg-open` (spawned detached, argv), and there is **no
+Recycle Bin** without a new dependency. So delete is permanent there — and `fm_capabilities`
+reports which, so the confirmation dialog says *"Permanently delete"* rather than promising
+an undo that doesn't exist.
 
 ## Path safety
 
@@ -212,6 +224,107 @@ things.
 Nothing is ever cut silently: the result list is capped (ranking still runs over the
 *full* list, so the cap never costs the best hit) and the summary reports the true
 match count, the index size, and any backend truncation.
+
+## The right-click menu
+
+A context menu is the **identity-vs-index trap with a longer fuse**. It is built when you
+right-click and acted on *seconds later*, after you have read it, moved the mouse, and
+possibly let a streaming index batch re-rank the list underneath it. If it resolved its
+target when you *clicked an item*, it would be resolving against a list that has had
+every opportunity to change.
+
+So it binds an `OpTarget` — a row's **path** — at **menu-open**, and every action it
+fires carries that value (`buildContextMenu`, pure + tested; the first test in
+`filemenu.test.ts` asserts that *every* row-scoped action carries the bound target).
+
+Just as importantly, the menu is **a second way to reach the op layer, never a second
+copy of it**. `runMenuAction` calls `beginRenameOn`, `beginCreate`, `deleteTarget` — the
+same functions the toolbar and the keyboard call. That is why the round-4
+rename-from-results fix (clear the filter, navigate, *then* mount the editor) applies to
+the menu **for free**, rather than being a rule someone had to remember a third time.
+
+Two honesty rules in the menu's shape:
+
+- An item that is **inapplicable here** stays visible but disabled with a reason — a
+  folder has no hash and no "open with". The menu's shape shouldn't shift depending on
+  what you clicked, or you never learn where anything is.
+- An item that is **unsupported on this OS** is omitted entirely. `fm_capabilities`
+  reports what the platform can do, and the menu offers exactly that: no "Open with…"
+  outside Windows, and on Linux the reveal item is labelled *"Open containing folder"*
+  because that is all `xdg-open` can do — it cannot select the entry, and the label
+  refuses to pretend otherwise.
+
+## Hashing
+
+The listing carries a short **SHA-256** per file, and the menu's **Hash →** computes
+SHA-256/512, SHA-1, or CRC-32/16/8 on demand.
+
+### It must never block the window
+
+Tauri runs a synchronous command on the **main (webview) thread**. Hashing reads *every
+byte* of the file, so a sync `fm_hash(rel)` would freeze the whole window on the first
+multi-megabyte row — and a directory of them would freeze it for as long as the directory
+took. That is exactly the trap `ft_search` fell into in #207, and this takes the same way
+out: `fm_hash_start` spawns a **worker thread**, streams results back as `fm-hash` events
+tagged with the caller's id, and polls a cancel flag **between files and between chunks**,
+so navigating away abandons a 4 GiB hash immediately rather than "when it finishes". It
+reuses #207's registry and `ft_search_cancel` outright — ids come from one monotonic
+counter, so one registry and one cancel command serve the search, the name index, and
+hashing.
+
+The file is **streamed**, never read into memory: a 4 GiB ISO costs 64 KiB of RAM.
+
+The same worker path serves both the column (many rels) and the submenu (one rel), so
+there is exactly one place hashing can be wrong — and it is the one the tests cover.
+
+### The 32 MiB threshold
+
+Opening a directory must never cost you a disk read of every byte in it. A folder of
+source is nothing; a folder of ISOs, VM images or datasets is *gigabytes*, and hashing
+them unasked would spin the disk for minutes filling a column nobody was looking at.
+
+So files up to **32 MiB** are hashed automatically, and above it the cell shows a
+clickable **hash** instead. The number is chosen to sit above essentially all source,
+config, images and documents — the things you actually want a checksum of from a file
+manager — and below the archive/media sizes where the cost stops being free. A 32 MiB
+SHA-256 is ~30–60 ms, so even a directory of 50 files at the limit finishes in a couple of
+seconds of *background* work. Nothing is hidden: a big file's hash is one click away, and
+the click is the user saying *"yes, spend that."*
+
+### The cache key is (path, size, mtime) — and the size is not redundant
+
+A **stale hash is worse than no hash**, because it looks authoritative. Keying on mtime
+alone would serve one after a same-size edit that lands inside the filesystem's mtime
+granularity. Size and mtime together make "the file changed" observable without re-reading
+it, which is the whole point of a cache. (A digest whose entry is no longer in the listing
+is *dropped* rather than cached, since we can no longer observe the size/mtime it would be
+keyed by.)
+
+### The dependency gate
+
+The hash crates were checked against CLAUDE.md #2 before being used, and the result is
+worth recording:
+
+```
+cargo tree -e normal --target all -i getrandom@0.3.4
+  → getrandom v0.3.4 └── tauri v2.11.5      (pre-existing — tauri's own, unmoved)
+cargo tree -e normal --target all -i getrandom@0.2.17
+  → "nothing to print"                       (not in the runtime tree at all)
+cargo tree -e normal --target all -p sha2 / -p sha1 / -p crc
+  → cfg-if, cpufeatures→libc, digest→block-buffer→generic-array→typenum, crc-catalog
+```
+
+**None touches getrandom**, so none imports `ProcessPrng`. And the cost is smaller than it
+looks: `sha2` was **already in `Cargo.lock`** (a tauri transitive) with its whole chain, and
+`sha1` reuses that chain entirely — so the three crates add exactly **three packages**:
+`sha1`, `crc`, `crc-catalog`.
+
+Hashing is not a place to be clever. These are the RustCrypto reference implementations,
+and the integration tests check them against the **published FIPS 180-4 vectors** and the
+**CRC catalogue check values** — not against themselves, which would prove only that the
+code is deterministic. The CRC variants are pinned and *named* in the UI (ISO-HDLC, ARC,
+SMBUS), because a bare "CRC-16" is genuinely ambiguous and a user comparing our checksum
+against another tool's needs to know which one they are looking at.
 
 ## The pure core
 
@@ -393,7 +506,11 @@ agents that don't exist. There's a test pinning that.
 | Its pure core | `src/fileexplorermodel.ts` | Listing order, rooted navigation, breadcrumb, formatting, inline-edit validation; `activeTarget` (which view an op resolves against), `editMountFor` (the view state an editor needs before it can mount) and `mountBlocker` (whether the target's row can be rendered at all). Unit-tested. |
 | Name ranking | `src/filematch.ts` | Substring + path-segment, best-occurrence, deterministic ties. Unit-tested. |
 | Typed bridge | `src/filemgr.ts` | `fm_*` wrappers (per-feature module, the `fileapi.ts` precedent). |
-| Backend | `src-tauri/src/filemgr.rs` | list / new folder / **new file** / rename / delete / open-with-default. Reuses `fileedit::safe_resolve`. Integration-tested. |
+| Menu model | `src/filemenu.ts` | What the context menu contains, what's enabled, and **what it acts on** (target bound at menu-open). Unit-tested. |
+| Menu renderer | `src/contextmenu.ts` | Placement (flips to stay on screen), submenus, Esc/click-away. Generic — takes `MenuItem[]`. |
+| Hash policy | `src/filehashmodel.ts` | Auto-hash threshold, the (path, size, mtime) cache key, digest formatting. Unit-tested. |
+| Backend | `src-tauri/src/filemgr.rs` | list / new folder / **new file** / rename / delete / open-with-default / **open-with chooser** / **reveal** / capabilities. Reuses `fileedit::safe_resolve`. Integration-tested. |
+| Hashing backend | `src-tauri/src/filehash.rs` | SHA-256/512, SHA-1, CRC-32/16/8 — streamed on a worker thread, cancellable via #207's registry. Tested against published vectors. |
 | Name enumeration | `src-tauri/src/fileedit.rs` | `list_files` + `ft_files_start` — paths only, no file opened. Integration-tested. |
 | Persistence | `src/tabstore.ts` | `PersistedPaneKind` gains `"files"`; the root rides in `cwd`. No version bump. Unit-tested. |
 | Restore policy | `src/panerestore.ts` | The `open-files` action (root may be null → caller fails soft). Unit-tested. |

@@ -14,6 +14,9 @@ export interface ModalSpec<T> {
   body: string;
   buttons: ModalButton<T>[];
   onKey?: (key: string) => void;
+  /** Render the body as monospace, wrapping, and selectable — for a hash digest, where
+   *  128 hex characters have to be readable AND selectable, not laid out as prose. */
+  bodyMono?: boolean;
 }
 
 /** Show a modal and resolve with the chosen button's value. The builder receives
@@ -39,7 +42,8 @@ export function modal<T>(build: (resolve: (v: T) => void) => ModalSpec<T>): Prom
 
     const overlay = el("div", "launcher-overlay visible");
     const dlg = el("div", "agent-dialog");
-    dlg.append(el("h2", "", spec.title), el("div", "dlg-hint", spec.body));
+    const body = el("div", spec.bodyMono ? "dlg-hint dlg-mono" : "dlg-hint", spec.body);
+    dlg.append(el("h2", "", spec.title), body);
     const actions = el("div", "dlg-actions");
     for (const b of spec.buttons) {
       const cls = b.kind === "danger" ? " danger" : b.kind === "primary" ? " primary" : "";

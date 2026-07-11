@@ -57,6 +57,31 @@ window per project.
 - **Hidden** toggle — shows hidden files, and widens the Go-to-file index to include
   git-ignored paths (`node_modules`, build output).
 
+#### Right-click menu
+
+Right-click a row for **Open**, **Open with…** (the OS chooser — Windows only), **Reveal
+in file explorer** (opens your OS file manager with the file selected), **Rename**,
+**Delete**, **Hash →**, and **New →**. Right-click the empty space below the rows for
+**New →** on its own.
+
+The menu acts on **the row you right-clicked** — always, even if the list re-sorts or a
+search finishes underneath it while the menu is open.
+
+#### Hashes
+
+The listing carries a short **SHA-256** for every file. It is computed in the
+background, off the UI thread, and streamed in — opening a folder never waits on it, and
+navigating away cancels it. Click a digest to copy the full value.
+
+- Digests are cached per file, keyed by its **size and modification time**, so
+  re-entering a folder is instant and editing a file re-hashes it.
+- Files over **32 MB** show a **hash** link instead of a digest: reading a gigabyte
+  unasked isn't free, so that one's your call. Click it and it hashes.
+- **Hash →** in the right-click menu computes any of **SHA-256, SHA-512, SHA-1, CRC-32,
+  CRC-16, CRC-8** on demand and shows the full digest in a copyable dialog. (The CRC
+  variants are named — ISO-HDLC, ARC, SMBUS — because a bare "CRC-16" is ambiguous and
+  you need to know which one you're comparing against.)
+
 This is **not** the in-app editor. That's the `Alt+F` overlay, it still works
 everywhere, and it's the right tool for a quick look or a one-line fix. The
 explorer is the one for *"get this file into the application that owns it."*

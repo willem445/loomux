@@ -1,6 +1,7 @@
 mod cliprobe;
 mod editor;
 pub mod fileedit; // pub: the file-editor integration test links its pure fns (#174)
+pub mod filehash; // pub: the hashing integration test links its pure fns (#214)
 pub mod filemgr; // pub: the file-manager integration test links its pure fns (#214)
 mod gh;
 mod git;
@@ -164,8 +165,11 @@ pub fn run() {
             filemgr::fm_new_file,
             filemgr::fm_rename,
             filemgr::fm_delete,
-            filemgr::fm_delete_mode,
+            filemgr::fm_capabilities,
             filemgr::fm_open,
+            filemgr::fm_open_with,
+            filemgr::fm_reveal,
+            filehash::fm_hash_start,
             obs::take_startup_notice,
             uistate::load_ui_tabs,
             uistate::save_ui_tabs,

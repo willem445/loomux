@@ -11,7 +11,10 @@
 // boundary.
 
 import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { FmEntry } from "./fileexplorermodel";
+import type { FmCaps } from "./filemenu";
+import type { HashAlgo } from "./filehashmodel";
 
 export type { FmEntry };
 
@@ -44,11 +47,56 @@ export const fmRename = (root: string, rel: string, name: string): Promise<strin
 export const fmDelete = (root: string, rel: string): Promise<boolean> =>
   invoke("fm_delete", { root, rel });
 
-/** What a delete will actually do on this platform: "recycle" (Windows — the
- *  Recycle Bin, via SHFileOperationW) or "permanent" (elsewhere, where there is no
- *  bin without a new dependency the getrandom ban makes hard to justify). */
-export const fmDeleteMode = (): Promise<{ mode: "recycle" | "permanent" }> =>
-  invoke("fm_delete_mode");
+/** What this platform can actually do. Probed once per pane and consulted when the
+ *  context menu is built, so an item that would always fail is HIDDEN rather than
+ *  shown-and-broken, and one that is approximate (Linux reveal) says so. */
+export const fmCapabilities = (): Promise<FmCaps> => invoke("fm_capabilities");
+
+/** Show the OS "Open with" chooser for `rel`. Windows only — `fmCapabilities().open_with`
+ *  says whether the item should even be offered. */
+export const fmOpenWith = (root: string, rel: string): Promise<void> =>
+  invoke("fm_open_with", { root, rel });
+
+/** Show `rel` in the OS file manager, with the entry selected (Windows/macOS). On Linux
+ *  there is no portable reveal, so it opens the containing folder and selects nothing —
+ *  `fmCapabilities().reveal_selects` reports which you are getting. */
+export const fmReveal = (root: string, rel: string): Promise<void> =>
+  invoke("fm_reveal", { root, rel });
+
+/** One file's hash outcome. Exactly one of `digest`/`error` is set. */
+export interface HashResult {
+  rel: string;
+  digest?: string;
+  error?: string;
+}
+
+/** One streamed batch of hash results, tagged with the caller's id so batches from a
+ *  superseded run (the user navigated away) are dropped. */
+export interface HashBatch {
+  id: number;
+  algo: HashAlgo;
+  results: HashResult[];
+  done: boolean;
+}
+
+/** Hash `rels` under `root` on a worker thread (#214). Returns as soon as the thread is
+ *  spawned; results arrive as `fm-hash` events tagged with `id`, and `ftSearchCancel(id)`
+ *  stops it — one registry and one cancel command serve the search, the name index, and
+ *  this. Never blocks: a directory of large files must not freeze the window, which is
+ *  exactly what a synchronous hash command would do (Tauri runs those on the main thread).
+ *
+ *  Used for BOTH the listing column (many rels) and the Hash → submenu (one rel), so
+ *  there is one place hashing can be wrong and it is the tested one. */
+export const fmHashStart = (
+  id: number,
+  root: string,
+  rels: string[],
+  algo: HashAlgo
+): Promise<void> => invoke("fm_hash_start", { id, root, rels, algo });
+
+/** Subscribe to streamed hash batches. Each view filters by its own active id. */
+export const onHashBatch = (cb: (batch: HashBatch) => void): Promise<UnlistenFn> =>
+  listen<HashBatch>("fm-hash", (e) => cb(e.payload));
 
 /** Hand the file at `rel` to the OS default application for its extension — what a
  *  double-click in Explorer does. Loomux does not open, read, or interpret it.

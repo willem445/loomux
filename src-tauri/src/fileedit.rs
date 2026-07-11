@@ -1091,8 +1091,11 @@ pub struct SearchRegistry {
 }
 
 impl SearchRegistry {
+    // pub(crate): `filehash` (#214) drives the same registry — ids come from one
+    // monotonic frontend counter, so they're unique across the content search, the
+    // file-name enumeration, and hashing, and one cancel command serves all three.
     /// Register search `id` and hand back its (freshly un-set) cancel flag.
-    fn begin(&self, id: u64) -> Arc<AtomicBool> {
+    pub(crate) fn begin(&self, id: u64) -> Arc<AtomicBool> {
         let flag = Arc::new(AtomicBool::new(false));
         self.flags.lock_safe().insert(id, flag.clone());
         flag
@@ -1100,14 +1103,14 @@ impl SearchRegistry {
 
     /// Signal search `id` to stop. No-op if it already finished (its flag is
     /// gone), which is fine — the result is discarded by the id-mismatch guard.
-    fn cancel(&self, id: u64) {
+    pub(crate) fn cancel(&self, id: u64) {
         if let Some(flag) = self.flags.lock_safe().get(&id) {
             flag.store(true, Ordering::Relaxed);
         }
     }
 
     /// Drop search `id`'s flag once its worker finishes.
-    fn end(&self, id: u64) {
+    pub(crate) fn end(&self, id: u64) {
         self.flags.lock_safe().remove(&id);
     }
 }

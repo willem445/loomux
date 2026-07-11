@@ -14,7 +14,35 @@
 // ranking) — and all path safety is enforced backend-side in `filemgr.rs`.
 
 import { open } from "@tauri-apps/plugin-dialog";
-import { fmList, fmNewFolder, fmNewFile, fmRename, fmDelete, fmDeleteMode, fmOpen } from "./filemgr";
+import {
+  fmList,
+  fmNewFolder,
+  fmNewFile,
+  fmRename,
+  fmDelete,
+  fmCapabilities,
+  fmOpen,
+  fmOpenWith,
+  fmReveal,
+  fmHashStart,
+  onHashBatch,
+  type HashBatch,
+} from "./filemgr";
+import {
+  planListingHashes,
+  rememberDigest,
+  algoLabel,
+  HASH_ALGOS,
+  COLUMN_ALGO,
+  SHORT_DIGEST_CHARS,
+  type HashAlgo,
+  type HashCache,
+  type HashCell,
+} from "./filehashmodel";
+import { writeClipboard } from "./clipboard";
+import { buildContextMenu, type FmCaps, type MenuAction } from "./filemenu";
+import { showContextMenu, closeContextMenu } from "./contextmenu";
+import { modal } from "./modal";
 import {
   visibleEntries,
   joinRel,
@@ -107,6 +135,28 @@ export class FileExplorerView {
   /** The Hidden toggle's checkbox. Held so an op can turn it on (renaming a dotfile
    *  found via Go-to-file) and have the control reflect what's actually showing. */
   private hiddenBox: HTMLInputElement;
+
+  // Hashing (#214). The listing shows a short SHA-256 per file, computed OFF-THREAD and
+  // streamed in — opening a directory must never block on reading its files. Cells start
+  // "…", fill as results arrive, and are cancelled the moment you navigate away.
+  /** rel → what that row's hash cell shows right now. */
+  private hashCells = new Map<string, HashCell>();
+  /** Digest cache, keyed by (rel, size, mtime) — see hashCacheKey. Per-pane, dropped on
+   *  a re-root. A stale hash is worse than no hash, so the key includes both. */
+  private hashCache: HashCache = new Map();
+  /** The in-flight column run's id, or null. Cancelled on navigate/dispose. */
+  private hashRunId: number | null = null;
+  private hashUnlisten: (() => void) | null = null;
+  /** An on-demand digest we are waiting on (the Hash → submenu, or a click-to-hash cell).
+   *  Keyed by the run id so a late batch from an abandoned dialog can't land in a new one. */
+  private hashRequests = new Map<number, (r: { digest?: string; error?: string }) => void>();
+  /** What the OS can do here. Probed once; the context menu is built against it. */
+  private caps: FmCaps = {
+    delete_mode: "permanent",
+    open_with: false,
+    reveal: false,
+    reveal_selects: false,
+  };
 
   // Go-to-file (the fast file-NAME search, kept from the first cut — it fits a
   // manager perfectly: an index built once per root, filtered in memory per
@@ -218,6 +268,11 @@ export class FileExplorerView {
     this.listEl = el("div", "fileexp-list");
     this.listEl.tabIndex = 0; // so the listing itself takes arrow keys
     this.listEl.addEventListener("keydown", (e) => this.onListKey(e));
+    // Right-click on the empty space BELOW the rows: no row to act on, so the menu offers
+    // only the creates. A row's own handler stops propagation, so this fires only when the
+    // click really did miss every row. The webview's default menu is suppressed only here
+    // and on the rows — never over the rest of the pane.
+    this.listEl.addEventListener("contextmenu", (e) => this.onContextMenu(e, null));
     this.gotoListEl = el("div", "fileexp-goto-list");
     this.gotoListEl.hidden = true;
 
@@ -229,10 +284,20 @@ export class FileExplorerView {
       if (this.disposed) un();
       else this.filesUnlisten = un;
     });
-    // Ask once what a delete actually does here, so the confirmation can say so.
-    void fmDeleteMode()
-      .then((m) => (this.deleteRecycles = m.mode === "recycle"))
+    // Ask once what this platform can actually do: what a delete does (so the
+    // confirmation can promise the truth), and whether there is an Open-with chooser or a
+    // real reveal (so the menu offers exactly what works).
+    void fmCapabilities()
+      .then((caps) => {
+        if (this.disposed) return;
+        this.caps = caps;
+        this.deleteRecycles = caps.delete_mode === "recycle";
+      })
       .catch(() => {});
+    void onHashBatch((b) => this.onHashBatch(b)).then((un) => {
+      if (this.disposed) un();
+      else this.hashUnlisten = un;
+    });
   }
 
   // ---------- lifecycle ----------
@@ -246,7 +311,11 @@ export class FileExplorerView {
     this.disposed = true;
     if (this.fileIndexId !== null) void ftSearchCancel(this.fileIndexId);
     this.fileIndexId = null;
+    // A hash run outliving its view would read a whole directory for nobody.
+    this.cancelHashRun();
     this.filesUnlisten?.();
+    this.hashUnlisten?.();
+    closeContextMenu();
     this.el.remove();
   }
 
@@ -269,6 +338,7 @@ export class FileExplorerView {
       this.rel = rel;
       this.entries = entries;
       this.sel = selectName ? this.rows().findIndex((e) => e.name === selectName) : -1;
+      this.startHashRun(); // off-thread; the render below does NOT wait on it
       this.render();
     } catch (err) {
       if (this.disposed || seq !== this.listSeq) return;
@@ -381,6 +451,14 @@ export class FileExplorerView {
       showToast("Select an item to rename.", "info");
       return;
     }
+    this.beginRenameOn(target);
+  }
+
+  /** Rename a target that the caller has ALREADY bound — the toolbar/keyboard resolve it
+   *  from the current view, the context menu carries the one it captured at menu-open.
+   *  Both land here, so there is exactly one rename implementation and the
+   *  editMountFor/mountBlocker discipline can't be forgotten by a second call site. */
+  private beginRenameOn(target: OpTarget): void {
     // What the VIEW must become before an editor can mount on this target (pure, and
     // tested: editMountFor). Getting the TARGET right was only half the bug — the other
     // half is where the editor LANDS. `exitFilter` is the load-bearing bit: render()
@@ -496,6 +574,11 @@ export class FileExplorerView {
       showToast("Select an item to delete.", "info");
       return;
     }
+    await this.deleteTarget(target);
+  }
+
+  /** Delete a target the caller has ALREADY bound (see `beginRenameOn` for why). */
+  private async deleteTarget(target: OpTarget): Promise<void> {
     const what = target.isDir ? "folder" : "file";
     // Name the file in the dialog, and say what will ACTUALLY happen: promising the
     // Recycle Bin on a platform that has none is a lie the user only discovers when
@@ -516,6 +599,250 @@ export class FileExplorerView {
     } catch (err) {
       showToast(explainOpError(err, "delete"));
       await this.refresh();
+    }
+  }
+
+  // ---------- hashing (#214) ----------
+  //
+  // The listing's SHA-256 column. The rule that shapes all of this: opening a directory
+  // must NEVER block on reading its files. So the render paints a placeholder immediately
+  // and the digests arrive afterwards, from a worker thread, and stop the instant you
+  // leave. A sync command would have run on Tauri's main thread and frozen the window.
+
+  /** Plan and launch the column's hashes for the current listing. The pure model decides
+   *  WHAT to hash (`planListingHashes`: never a directory or a symlink, cached hits for
+   *  free, over-threshold files only on request); this just runs it. */
+  private startHashRun(): void {
+    this.cancelHashRun();
+    const { cells, toHash } = planListingHashes(this.entries, this.rel, this.hashCache);
+    this.hashCells = cells;
+    if (toHash.length === 0) return;
+    const id = nextSearchId();
+    this.hashRunId = id;
+    void fmHashStart(id, this.host.getRoot(), toHash, COLUMN_ALGO);
+  }
+
+  /** Stop the in-flight column run. Called on every navigate and on dispose: a run that
+   *  outlives its listing is reading a whole directory for a view nobody is looking at. */
+  private cancelHashRun(): void {
+    if (this.hashRunId !== null) {
+      void ftSearchCancel(this.hashRunId); // one registry serves search, index AND hashing
+      this.hashRunId = null;
+    }
+  }
+
+  /** Fold one streamed batch in. Batches from a superseded run are dropped by id — which
+   *  is what stops a digest computed for the PREVIOUS directory landing in a row of this
+   *  one that happens to share a name. */
+  private onHashBatch(b: HashBatch): void {
+    if (this.disposed) return;
+
+    // An on-demand request (Hash submenu, or a click-to-hash cell) waiting on this id.
+    const waiter = this.hashRequests.get(b.id);
+    if (waiter) {
+      const r = b.results[0];
+      if (r) {
+        this.hashRequests.delete(b.id);
+        waiter({ digest: r.digest, error: r.error });
+      } else if (b.done) {
+        // Done with no result: cancelled, or the file vanished. Never leave a dialog
+        // spinning on a promise nobody will resolve.
+        this.hashRequests.delete(b.id);
+        waiter({ error: "hashing was cancelled" });
+      }
+      return;
+    }
+
+    if (b.id !== this.hashRunId) return; // stale column run — its directory is gone
+    for (const r of b.results) {
+      if (r.digest) {
+        this.hashCells.set(r.rel, {
+          kind: "done",
+          full: r.digest,
+          short: r.digest.slice(0, SHORT_DIGEST_CHARS),
+        });
+        // Cache against the size+mtime it was computed from, so re-entering this folder is
+        // free — and so an EDIT to the file invalidates it (the key moves with the file).
+        rememberDigest(this.hashCache, r.rel, this.entries, this.rel, r.digest);
+      } else {
+        this.hashCells.set(r.rel, { kind: "error", message: r.error ?? "hash failed" });
+      }
+    }
+    if (b.done) this.hashRunId = null;
+    this.paintHashCells();
+  }
+
+  /** Update the hash column IN PLACE. Deliberately not a re-render: results stream in
+   *  while the user is selecting, scrolling, or typing in a rename editor, and blowing the
+   *  listing away underneath them for a cosmetic column would be its own bug. */
+  private paintHashCells(): void {
+    for (const cellEl of Array.from(this.listEl.querySelectorAll<HTMLElement>(".fileexp-hash"))) {
+      const rel = cellEl.dataset.rel;
+      if (rel) this.fillHashCell(cellEl, this.hashCells.get(rel) ?? { kind: "pending" });
+    }
+  }
+
+  private fillHashCell(cellEl: HTMLElement, cell: HashCell): void {
+    cellEl.className = "fileexp-hash " + cell.kind;
+    cellEl.onclick = null;
+    if (cell.kind === "none") {
+      cellEl.textContent = "";
+      cellEl.title = "";
+    } else if (cell.kind === "pending") {
+      cellEl.textContent = "…";
+      cellEl.title = "Hashing…";
+    } else if (cell.kind === "on-demand") {
+      // Over the auto threshold: the read is not free, so the user gets to ask for it.
+      cellEl.textContent = "hash";
+      cellEl.title = "This file is large — click to hash it (SHA-256).";
+      cellEl.onclick = (e) => {
+        e.stopPropagation();
+        const rel = cellEl.dataset.rel;
+        if (rel) void this.hashOnDemandIntoCell(rel);
+      };
+    } else if (cell.kind === "error") {
+      cellEl.textContent = "—";
+      cellEl.title = cell.message;
+    } else {
+      cellEl.textContent = cell.short;
+      cellEl.title = "SHA-256: " + cell.full + "\nClick to copy";
+      cellEl.onclick = (e) => {
+        e.stopPropagation();
+        void copyDigest(cell.full, "SHA-256");
+      };
+    }
+  }
+
+  /** Hash ONE file on demand. Same worker path as the column — there is one place hashing
+   *  can be wrong, and it is the one the published-vector tests cover. */
+  private hashOne(rel: string, algo: HashAlgo): Promise<{ digest?: string; error?: string }> {
+    const id = nextSearchId();
+    return new Promise((resolve) => {
+      this.hashRequests.set(id, resolve);
+      void fmHashStart(id, this.host.getRoot(), [rel], algo).catch((e) => {
+        this.hashRequests.delete(id);
+        resolve({ error: errorMessage(e) });
+      });
+    });
+  }
+
+  /** The click-to-hash cell for an over-threshold file. */
+  private async hashOnDemandIntoCell(rel: string): Promise<void> {
+    this.hashCells.set(rel, { kind: "pending" });
+    this.paintHashCells();
+    const r = await this.hashOne(rel, COLUMN_ALGO);
+    if (this.disposed) return;
+    this.hashCells.set(
+      rel,
+      r.digest
+        ? { kind: "done", full: r.digest, short: r.digest.slice(0, SHORT_DIGEST_CHARS) }
+        : { kind: "error", message: r.error ?? "hash failed" }
+    );
+    if (r.digest) rememberDigest(this.hashCache, rel, this.entries, this.rel, r.digest);
+    this.paintHashCells();
+  }
+
+  /** The Hash submenu: compute one digest and show it in a copyable dialog. */
+  private async showHashDialog(target: OpTarget, algo: HashAlgo): Promise<void> {
+    const label = algoLabel(algo);
+    const r = await this.hashOne(target.rel, algo);
+    if (this.disposed) return;
+    if (!r.digest) {
+      showToast(explainOpError(r.error ?? "", "hash"));
+      return;
+    }
+    const digest = r.digest;
+    const copy = await modal<boolean>((resolve) => ({
+      title: label + " — " + target.name,
+      body: digest,
+      bodyMono: true,
+      buttons: [
+        { label: "Close", value: false },
+        { label: "Copy", value: true, kind: "primary" },
+      ],
+      onKey: (k) => (k === "Escape" ? resolve(false) : undefined),
+    }));
+    if (copy) await copyDigest(digest, label);
+  }
+
+  // ---------- context menu (#214) ----------
+
+  /** Right-click. The target is resolved from the view on screen and BOUND HERE — every
+   *  action the menu fires carries that path. A context menu is the identity-vs-index trap
+   *  with a longer fuse: it is built now and clicked seconds later, by which time the lists
+   *  have had every chance to re-rank, re-sort, or be replaced by search results. */
+  private onContextMenu(e: MouseEvent, rowIndex: number | null): void {
+    // Suppress the webview's own menu ONLY where ours appears (this handler is on the
+    // list and its rows, not on the whole pane).
+    e.preventDefault();
+    e.stopPropagation();
+    // Right-clicking a row selects it, so the menu, the toolbar and the highlight all
+    // agree about what is being acted on.
+    if (rowIndex !== null && !this.filtering) {
+      this.sel = rowIndex;
+      this.render();
+    }
+    const target = rowIndex === null && !this.filtering ? null : this.target();
+    showContextMenu(e.clientX, e.clientY, buildContextMenu(target, this.caps, HASH_ALGOS), (a) =>
+      this.runMenuAction(a)
+    );
+  }
+
+  /** Execute a bound menu action. Every one routes through the SAME op layer the toolbar
+   *  and the keyboard use — `beginRenameOn` (and thus editMountFor / mountBlocker),
+   *  `beginCreate`, the same fm_* calls. The menu is a second way to REACH the ops, never
+   *  a second copy of them: that is why the round-4 rename-from-results fix applies here
+   *  for free rather than needing to be remembered again. */
+  private runMenuAction(a: MenuAction): void {
+    switch (a.kind) {
+      case "new-folder":
+        this.beginCreate("new-folder");
+        return;
+      case "new-file":
+        this.beginCreate("new-file");
+        return;
+      case "open":
+        void this.openTarget(a.target);
+        return;
+      case "open-with":
+        void this.openWithTarget(a.target);
+        return;
+      case "reveal":
+        void this.revealTarget(a.target);
+        return;
+      case "rename":
+        this.beginRenameOn(a.target);
+        return;
+      case "delete":
+        void this.deleteTarget(a.target);
+        return;
+      case "hash":
+        void this.showHashDialog(a.target, a.algo);
+        return;
+    }
+  }
+
+  private async openTarget(target: OpTarget): Promise<void> {
+    if (target.isDir) {
+      await this.navigate(target.rel);
+      return;
+    }
+    await this.openWithDefaultApp(target.rel);
+  }
+
+  private async openWithTarget(target: OpTarget): Promise<void> {
+    try {
+      await fmOpenWith(this.host.getRoot(), target.rel);
+    } catch (err) {
+      showToast(explainOpError(err, "open"));
+    }
+  }
+
+  private async revealTarget(target: OpTarget): Promise<void> {
+    try {
+      await fmReveal(this.host.getRoot(), target.rel);
+    } catch (err) {
+      showToast(explainOpError(err, "reveal"));
     }
   }
 
@@ -645,8 +972,14 @@ export class FileExplorerView {
       if (entry.is_hidden) row.classList.add("hidden-entry");
       const size = el("span", "fileexp-size", formatSize(entry));
       const mtime = el("span", "fileexp-mtime", formatModified(entry.modified_ms, now));
+      // The SHA-256 column. Painted from the cell map, which streams in from the worker —
+      // the row renders NOW and the digest catches up.
+      const rel = joinRel(this.rel, entry.name);
+      const hash = el("span", "fileexp-hash");
+      hash.dataset.rel = rel;
+      this.fillHashCell(hash, this.hashCells.get(rel) ?? { kind: "pending" });
 
-      row.append(icon, name, size, mtime);
+      row.append(icon, name, hash, size, mtime);
       row.addEventListener("click", () => {
         this.sel = i;
         this.render();
@@ -654,6 +987,7 @@ export class FileExplorerView {
       });
       // The heart of it: double-click a folder to go in, a file to hand it to the OS.
       row.addEventListener("dblclick", () => void this.openEntry(entry));
+      row.addEventListener("contextmenu", (e) => this.onContextMenu(e, i));
       frag.appendChild(row);
     });
 
@@ -937,6 +1271,13 @@ function explainOpError(err: unknown, verb: string): string {
     return `Loomux won't ${verb} a symlink — it's shown here, but it's left alone. Use your OS file manager for links and junctions.`;
   }
   return `Couldn't ${verb}: ${errorMessage(err)}`;
+}
+
+/** Put a digest on the clipboard and say so. A hash you can see but can't copy is a hash
+ *  you have to transcribe by hand, which for 128 hex characters is not a feature. */
+async function copyDigest(digest: string, label: string): Promise<void> {
+  const ok = await writeClipboard(digest);
+  showToast(ok ? `${label} copied` : "Copy failed — the clipboard is unavailable.");
 }
 
 /** The last segment of a path — the root folder's own name, for the breadcrumb. */
