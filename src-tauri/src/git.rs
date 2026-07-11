@@ -708,6 +708,18 @@ pub fn git_worktree_add(repo: String, name: String, base: Option<String>) -> Res
     Ok(dest_str)
 }
 
+/// List every worktree of this repo as raw `git worktree list --porcelain`
+/// output. The git view parses it in `src/gitworktree.ts` (rather than here,
+/// like the other commands) because the selector's parsing + fail-soft
+/// selection logic is unit-tested with node:test — keeping the parser on the
+/// frontend keeps that logic in one place with its tests. `repo` may be any
+/// worktree of the set; git reports the whole set (they share one object DB),
+/// with the main working tree listed first.
+#[tauri::command]
+pub fn git_worktree_list(repo: String) -> Result<String, String> {
+    run_git(&repo, &["worktree", "list", "--porcelain"])
+}
+
 /// Remove an agent's worktree during group teardown. `--force` because the
 /// worktree may hold uncommitted changes and ending an orchestration is an
 /// explicit, human-confirmed destructive action; the checked-out branch is
@@ -1386,6 +1398,36 @@ mod tests {
         assert!(
             err.contains("fast-forward") || err.contains("Not possible") || err.contains("diverging"),
             "diverged pull should refuse: {err}"
+        );
+    }
+
+    #[test]
+    fn worktree_list_reports_main_and_added() {
+        let repo = new_repo();
+        let d = repo.path();
+        commit(d, "f.txt", "a\n", "A");
+        // Add a second worktree via the same command the UI uses. Cut from
+        // HEAD explicitly so this doesn't depend on origin (no remote here).
+        let wt = git_worktree_add(p(d), "feature/x".into(), Some("HEAD".into())).unwrap();
+
+        let porcelain = git_worktree_list(p(d)).unwrap();
+        // The main tree is listed first, then the added one on its branch.
+        let first_worktree = porcelain
+            .lines()
+            .find(|l| l.starts_with("worktree "))
+            .unwrap();
+        assert!(
+            first_worktree.contains(&d.file_name().unwrap().to_string_lossy().into_owned())
+                || first_worktree.contains(&p(d)),
+            "main worktree should be listed first: {first_worktree}"
+        );
+        assert!(
+            porcelain.contains("branch refs/heads/feature/x"),
+            "added worktree's branch should appear: {porcelain}"
+        );
+        assert!(
+            porcelain.replace('\\', "/").contains(&wt.replace('\\', "/")),
+            "added worktree path should appear: {porcelain}"
         );
     }
 

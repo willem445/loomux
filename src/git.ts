@@ -91,6 +91,11 @@ export const gitDiscard = (repo: string, path: string, untracked: boolean): Prom
 export const gitWorktreeAdd = (repo: string, name: string, base?: string): Promise<string> =>
   invoke("git_worktree_add", { repo, name, base: base ?? null });
 
+/** Raw `git worktree list --porcelain` for the repo containing `repo` (parsed
+ *  by src/gitworktree.ts). Lists the whole worktree set, main tree first. */
+export const gitWorktreeList = (repo: string): Promise<string> =>
+  invoke("git_worktree_list", { repo });
+
 // -- remote & history ops --
 
 /** Fetch + prune from remotes (no-op on a repo with no remote configured). */

@@ -24,12 +24,24 @@ import {
   gitMerge,
   gitRebase,
   gitBranches,
+  gitWorktreeList,
   type BranchInfo,
   type CommitInfo,
   type FileEntry,
   type GitStatus,
   type DiffMode,
 } from "./git";
+import {
+  parseWorktrees,
+  primaryWorktree,
+  resolveSelection,
+  isMissingDir,
+  isWritable,
+  isDeadWorktree,
+  worktreeLabel,
+  normalizePath,
+  type Worktree,
+} from "./gitworktree";
 import { computeLanes, renderRowSvg } from "./gitgraph";
 import { shortRev, fmtWhen, fmtWhenFull, authorLine } from "./gitformat";
 import { renderDiff } from "./diffrender";
@@ -198,7 +210,26 @@ async function copyText(text: string): Promise<void> {
 export class GitView {
   readonly el: HTMLElement;
 
+  // `repoRoot` is the directory git commands run against — the primary repo, or
+  // a selected worktree's working dir (#208). `primaryRoot` is the repo's MAIN
+  // working tree (the porcelain-first `git worktree list` entry), used to key
+  // repo identity and to fall back to — NOT the pane's `--show-toplevel`, which
+  // is the pane's own (possibly linked) worktree. `selectedWorktree` is an
+  // explicit chip choice by path; null means "follow the pane's worktree".
   private repoRoot: string | null = null;
+  private primaryRoot: string | null = null;
+  private worktrees: Worktree[] = [];
+  private selectedWorktree: string | null = null;
+  // Read-only / unlock (#208 human ruling): a non-primary worktree is browse-only
+  // until explicitly unlocked. `unlockedWorktree` pins the unlock to one path and
+  // is cleared on every switch (see pointViewAt). `writable` is recomputed each
+  // refresh and gates every write affordance below.
+  private unlockedWorktree: string | null = null;
+  private writable = true;
+  // Normalized paths of worktrees seen to vanish at runtime (deleted without
+  // `git worktree remove`/prune — git 2.29 emits no `prunable` marker). Keeps
+  // the selector from re-offering a dead entry. Cleared on repo change.
+  private missingWorktrees = new Set<string>();
   private commits: CommitInfo[] = [];
   private status: GitStatus | null = null;
   private selection: Selection = { kind: "working" };
@@ -214,7 +245,11 @@ export class GitView {
   private disposed = false;
 
   private headTitleEl: HTMLElement;
+  private headWorktreeEl: HTMLElement;
+  private headLockEl: HTMLButtonElement;
   private headBranchEl: HTMLElement;
+  private pullBtn: HTMLButtonElement;
+  private pushBtn: HTMLButtonElement;
   private graphListEl: HTMLElement;
   private diffHeadEl: HTMLElement;
   private diffBodyEl: HTMLElement;
@@ -247,16 +282,28 @@ export class GitView {
     this.graphEl = graph;
     const head = el("div", "git-graph-head");
     this.headTitleEl = el("span", "git-head-title");
+    this.headWorktreeEl = el("span", "git-head-worktree clickable");
+    this.headWorktreeEl.hidden = true;
+    this.headWorktreeEl.title = "Switch worktree";
+    this.headWorktreeEl.addEventListener("click", () => this.openWorktreeMenu());
+    // Read-only indicator + per-selection unlock toggle (non-primary only).
+    this.headLockEl = el("button", "git-head-lock") as HTMLButtonElement;
+    this.headLockEl.hidden = true;
+    this.headLockEl.addEventListener("click", () => this.toggleUnlock());
     this.headBranchEl = el("span", "git-head-branch clickable");
     this.headBranchEl.title = "Switch branch";
-    this.headBranchEl.addEventListener("click", () => void this.openBranchMenu());
+    this.headBranchEl.addEventListener("click", () => {
+      if (this.writable) void this.openBranchMenu();
+    });
 
     const pullBtn = el("button", "pane-btn", "↓") as HTMLButtonElement;
+    this.pullBtn = pullBtn;
     pullBtn.title = "Pull (fast-forward only)";
     pullBtn.addEventListener("click", () =>
       void this.runOp(pullBtn, () => gitPull(this.repoRoot!), "Pulled")
     );
     const pushBtn = el("button", "pane-btn", "↑") as HTMLButtonElement;
+    this.pushBtn = pushBtn;
     pushBtn.title = "Push current branch";
     pushBtn.addEventListener("click", () => void this.push(pushBtn));
     const fetchBtn = el("button", "pane-btn", "↻") as HTMLButtonElement;
@@ -267,7 +314,16 @@ export class GitView {
     const closeBtn = el("button", "pane-btn close", "✕");
     closeBtn.title = "Back to terminal (Esc)";
     closeBtn.addEventListener("click", () => this.host.onClose());
-    head.append(this.headTitleEl, this.headBranchEl, pullBtn, pushBtn, fetchBtn, closeBtn);
+    head.append(
+      this.headTitleEl,
+      this.headWorktreeEl,
+      this.headLockEl,
+      this.headBranchEl,
+      pullBtn,
+      pushBtn,
+      fetchBtn,
+      closeBtn
+    );
     this.graphListEl = el("div", "git-graph-list");
     graph.append(head, this.graphListEl);
 
@@ -425,6 +481,21 @@ export class GitView {
 
   // ---------- data ----------
 
+  /** Point the view at `root` (primary or a worktree). Resets the graph/diff
+   *  view state only when the root actually changed — the worktree *selection*
+   *  itself is owned by the caller and left untouched. */
+  private pointViewAt(root: string): void {
+    if (root === this.repoRoot) return;
+    this.repoRoot = root;
+    // Every switch drops the unlock — re-selecting a worktree is read-only again.
+    this.unlockedWorktree = null;
+    this.commits = [];
+    this.selection = { kind: "working" };
+    this.selectedFile = null;
+    this.limit = LOG_STEP;
+    this.firstOpen = true;
+  }
+
   private async refresh(): Promise<void> {
     if (this.disposed) return;
     if (this.refreshing) {
@@ -439,9 +510,12 @@ export class GitView {
         this.setBlank("Waiting for the shell to report its folder…");
         return;
       }
-      let root: string | null;
+      // The pane's own top level. Inside a linked worktree this is that
+      // worktree, not the main checkout — so it's the view's default target,
+      // not the repo identity (see below).
+      let paneTop: string | null;
       try {
-        root = await gitRepoRoot(cwd);
+        paneTop = await gitRepoRoot(cwd);
       } catch (err) {
         this.setBlank(
           String(err) === "git-not-found"
@@ -450,24 +524,85 @@ export class GitView {
         );
         return;
       }
-      if (!root) {
+      if (!paneTop) {
         this.setBlank(`Not a git repository:\n${cwd}`);
         return;
       }
-      if (root !== this.repoRoot) {
-        // Entered a different repo: reset view state.
-        this.repoRoot = root;
-        this.commits = [];
-        this.selection = { kind: "working" };
-        this.selectedFile = null;
-        this.limit = LOG_STEP;
-        this.firstOpen = true;
+
+      // Enumerate the worktree set from the pane's tree (any member lists them
+      // all). The MAIN working tree — the porcelain-first entry — is the repo's
+      // stable identity and fall-back, so cd'ing between a repo's own worktrees
+      // (same set) never counts as changing repos. `enumOk` is false only if the
+      // command errors outright — then we can't confirm primary-ness and fail
+      // read-only (below), rather than defaulting to writable when state is least
+      // known.
+      let enumOk = true;
+      try {
+        this.worktrees = parseWorktrees(await gitWorktreeList(paneTop));
+      } catch {
+        this.worktrees = [];
+        enumOk = false;
+      }
+      if (this.disposed) return;
+      const primary = primaryWorktree(this.worktrees)?.path ?? paneTop;
+      if (primary !== this.primaryRoot) {
+        // Entered a different repo: drop the selection and the dead-entry memo.
+        this.primaryRoot = primary;
+        this.selectedWorktree = null;
+        this.missingWorktrees.clear();
       }
 
-      const [commits, status] = await Promise.all([
-        gitLog(root, this.limit),
-        gitStatus(root),
-      ]);
+      // Settle on which worktree the view targets. With no explicit chip choice
+      // the view follows the pane (paneTop); an explicit choice wins and fails
+      // soft if it was pruned/removed. An empty listing means enumeration failed
+      // — keep the selection and just view the primary this pass, not drop it.
+      let root = primary;
+      if (this.worktrees.length > 0) {
+        const res = resolveSelection(this.worktrees, this.selectedWorktree, paneTop);
+        if (res.fellBack && this.selectedWorktree !== null) {
+          this.toast("Selected worktree is gone — showing the primary repo.");
+        }
+        this.selectedWorktree = res.selected;
+        if (res.active) root = res.active.path;
+      }
+
+      this.pointViewAt(root);
+
+      let commits: CommitInfo[];
+      let status: GitStatus;
+      try {
+        [commits, status] = await Promise.all([gitLog(root, this.limit), gitStatus(root)]);
+        // Loaded fine — if this root was previously flagged dead (recreated),
+        // clear it so the selector offers it again.
+        this.missingWorktrees.delete(normalizePath(root));
+      } catch (err) {
+        // A selected worktree whose directory was deleted without git knowing
+        // (manual rm -rf, crashed teardown) is still listed — resolveSelection
+        // can't see that, so the git call is the first to notice ("no such
+        // directory"). Only a non-primary root can vanish under us like this; a
+        // missing primary means the whole repo is gone, so let that surface.
+        const offPrimary = normalizePath(root) !== normalizePath(primary);
+        if (!offPrimary || !isMissingDir(err)) throw err;
+        // Memoize the dead path so the selector disables it, drop the selection,
+        // and land where the default resolves in ONE step — the pane's own
+        // worktree if the pane sits in a live one, else the primary — instead of
+        // bouncing via primary this refresh and pane-following on the next.
+        this.missingWorktrees.add(normalizePath(root));
+        this.selectedWorktree = null;
+        const fallback =
+          this.worktrees.length > 0
+            ? resolveSelection(this.worktrees, null, paneTop).active?.path ?? primary
+            : primary;
+        this.toast(
+          normalizePath(fallback) === normalizePath(primary)
+            ? "Selected worktree is gone — showing the primary repo."
+            : "Selected worktree is gone — showing this pane's worktree."
+        );
+        root = fallback;
+        this.pointViewAt(root);
+        [commits, status] = await Promise.all([gitLog(root, this.limit), gitStatus(root)]);
+        this.missingWorktrees.delete(normalizePath(root));
+      }
       if (this.disposed) return;
       this.commits = commits;
       this.status = status;
@@ -485,6 +620,11 @@ export class GitView {
             ? { kind: "working" }
             : { kind: "commit", hash: commits[0].hash };
       }
+
+      // Non-primary worktrees are read-only until unlocked (#208 ruling); every
+      // render below gates its write affordances on this. If enumeration failed
+      // we can't confirm primary-ness, so isWritable fails closed (read-only).
+      this.writable = isWritable(this.activeWorktree(), this.unlockedWorktree, enumOk);
 
       this.renderHead();
       this.renderGraph();
@@ -634,66 +774,73 @@ export class GitView {
     showMenu(r.left, r.bottom + 3, items);
   }
 
-  /** Right-click actions for a commit. */
+  /** Right-click actions for a commit. On a read-only worktree only the copy
+   *  actions remain — every history op mutates the checked-out branch. */
   private commitMenu(x: number, y: number, c: CommitInfo): void {
     if (!this.repoRoot) return;
     const short = c.hash.slice(0, 7);
     const branch = this.status?.branch ?? "HEAD";
-    showMenu(x, y, [
-      {
-        label: `Checkout ${short} (detached)`,
-        onClick: () => void this.checkout(c.hash, false),
-      },
-      { label: "Create branch here…", onClick: () => void this.createBranch(c.hash) },
-      { label: "Create tag here…", onClick: () => void this.createTag(c.hash) },
-      { label: "-" },
-      {
-        label: `Cherry-pick onto ${branch}`,
-        onClick: () =>
-          void this.confirmOp(
-            "Cherry-pick",
-            `Apply commit ${short} onto ${branch}?`,
-            "Cherry-pick",
-            () => gitCherryPick(this.repoRoot!, c.hash)
-          ),
-      },
-      {
-        label: `Revert ${short}`,
-        danger: true,
-        onClick: () =>
-          void this.confirmOp(
-            "Revert commit",
-            `Create a commit on ${branch} that undoes ${short}?`,
-            "Revert",
-            () => gitRevert(this.repoRoot!, c.hash)
-          ),
-      },
-      {
-        label: `Merge ${short} into ${branch}`,
-        danger: true,
-        onClick: () =>
-          void this.confirmOp(
-            "Merge",
-            `Merge commit ${short} into ${branch}?`,
-            "Merge",
-            () => gitMerge(this.repoRoot!, c.hash)
-          ),
-      },
-      {
-        label: `Rebase ${branch} onto ${short}`,
-        danger: true,
-        onClick: () =>
-          void this.confirmOp(
-            "Rebase",
-            `Rebase ${branch} onto ${short}? This rewrites history on ${branch}.`,
-            "Rebase",
-            () => gitRebase(this.repoRoot!, c.hash)
-          ),
-      },
-      { label: "-" },
+    const items: MenuItem[] = [];
+    if (this.writable) {
+      items.push(
+        {
+          label: `Checkout ${short} (detached)`,
+          onClick: () => void this.checkout(c.hash, false),
+        },
+        { label: "Create branch here…", onClick: () => void this.createBranch(c.hash) },
+        { label: "Create tag here…", onClick: () => void this.createTag(c.hash) },
+        { label: "-" },
+        {
+          label: `Cherry-pick onto ${branch}`,
+          onClick: () =>
+            void this.confirmOp(
+              "Cherry-pick",
+              `Apply commit ${short} onto ${branch}?`,
+              "Cherry-pick",
+              () => gitCherryPick(this.repoRoot!, c.hash)
+            ),
+        },
+        {
+          label: `Revert ${short}`,
+          danger: true,
+          onClick: () =>
+            void this.confirmOp(
+              "Revert commit",
+              `Create a commit on ${branch} that undoes ${short}?`,
+              "Revert",
+              () => gitRevert(this.repoRoot!, c.hash)
+            ),
+        },
+        {
+          label: `Merge ${short} into ${branch}`,
+          danger: true,
+          onClick: () =>
+            void this.confirmOp(
+              "Merge",
+              `Merge commit ${short} into ${branch}?`,
+              "Merge",
+              () => gitMerge(this.repoRoot!, c.hash)
+            ),
+        },
+        {
+          label: `Rebase ${branch} onto ${short}`,
+          danger: true,
+          onClick: () =>
+            void this.confirmOp(
+              "Rebase",
+              `Rebase ${branch} onto ${short}? This rewrites history on ${branch}.`,
+              "Rebase",
+              () => gitRebase(this.repoRoot!, c.hash)
+            ),
+        },
+        { label: "-" }
+      );
+    }
+    items.push(
       { label: "Copy commit hash", onClick: () => void copyText(c.hash) },
-      { label: "Copy subject", onClick: () => void copyText(c.subject) },
-    ]);
+      { label: "Copy subject", onClick: () => void copyText(c.subject) }
+    );
+    showMenu(x, y, items);
   }
 
   private async createBranch(hash: string): Promise<void> {
@@ -792,14 +939,112 @@ export class GitView {
   }
 
   private renderHead(): void {
-    const root = this.repoRoot ?? "";
+    // Title stays the primary repo name even when viewing a worktree, so the
+    // repo identity is stable; the worktree chip names which tree we're in.
+    const root = this.primaryRoot ?? this.repoRoot ?? "";
     this.headTitleEl.textContent = root.split(/[\\/]/).filter(Boolean).pop() ?? "";
+    this.renderWorktreeChip();
+    this.renderLockToggle();
+    // Branch switching is a write — only offer it (and the affordance) when
+    // writable; otherwise the name is shown read-only.
+    this.headBranchEl.classList.toggle("clickable", this.writable);
+    this.headBranchEl.title = this.writable ? "Switch branch" : "Read-only worktree";
+    // Pull/push mutate; disable them off a writable tree (fetch stays — it only
+    // refreshes remote-tracking refs, touching no working copy).
+    this.pullBtn.disabled = !this.writable;
+    this.pushBtn.disabled = !this.writable;
     const s = this.status;
     this.headBranchEl.textContent = s?.branch
       ? s.branch
       : s?.detached
         ? `detached @ ${this.headHash().slice(0, 7)}`
         : "";
+  }
+
+  /** The read-only badge + unlock toggle, shown only when a non-primary worktree
+   *  is active (the primary is always writable, so it needs no control). */
+  private renderLockToggle(): void {
+    const active = this.activeWorktree();
+    const show = active !== null && !active.primary;
+    this.headLockEl.hidden = !show;
+    if (!show) return;
+    const unlocked = this.writable;
+    this.headLockEl.textContent = unlocked ? "🔓 writable" : "🔒 read-only";
+    this.headLockEl.title = unlocked
+      ? "This worktree is unlocked for writes — click to lock (read-only)."
+      : "This worktree is read-only so a live agent isn't disturbed — click to unlock writes.";
+    this.headLockEl.classList.toggle("unlocked", unlocked);
+  }
+
+  /** Flip the active non-primary worktree between read-only and writable. The
+   *  unlock is pinned to this worktree's path and cleared on any switch. */
+  private toggleUnlock(): void {
+    const active = this.activeWorktree();
+    if (!active || active.primary) return;
+    this.unlockedWorktree = this.writable ? null : active.path;
+    void this.refresh();
+  }
+
+  /** The worktree currently being viewed (matched by path), or null. */
+  private activeWorktree(): Worktree | null {
+    const root = normalizePath(this.repoRoot ?? "");
+    return this.worktrees.find((w) => normalizePath(w.path) === root) ?? null;
+  }
+
+  /** Show a clickable chip naming the viewed worktree whenever there's more
+   *  than one to switch between (or a non-primary one is selected, so it's
+   *  obvious you're off the main tree). Hidden for a plain single-worktree repo. */
+  private renderWorktreeChip(): void {
+    const active = this.activeWorktree();
+    const show = this.worktrees.length > 1 || (active !== null && !active.primary);
+    this.headWorktreeEl.hidden = !show;
+    if (!show) return;
+    const label = active ? (active.primary ? "primary" : worktreeLabel(active)) : "primary";
+    this.headWorktreeEl.textContent = `⧉ ${label} ▾`;
+    this.headWorktreeEl.classList.toggle("non-primary", active !== null && !active.primary);
+    this.headWorktreeEl.title = active
+      ? `Worktree: ${active.path}${active.branch ? ` (${active.branch})` : ""}\nClick to switch`
+      : "Switch worktree";
+  }
+
+  private openWorktreeMenu(): void {
+    const active = normalizePath(this.repoRoot ?? "");
+    const items: MenuItem[] = [];
+    if (this.worktrees.length === 0) {
+      items.push({ label: "No worktrees", disabled: true });
+    }
+    for (const w of this.worktrees) {
+      const isActive = normalizePath(w.path) === active;
+      const dead = isDeadWorktree(w, this.missingWorktrees);
+      const name = w.primary ? `${worktreeLabel(w)} (primary)` : worktreeLabel(w);
+      const detail = w.bare
+        ? "  (bare)"
+        : dead
+          ? "  (missing)"
+          : w.branch
+            ? `  ${w.branch}`
+            : w.detached
+              ? "  (detached)"
+              : "";
+      items.push({
+        // A bare tree has no working copy to inspect; a dead one's dir is gone —
+        // whether git flagged it prunable (≥ 2.31) or we saw it vanish at
+        // runtime (2.29 has no marker). List both, disabled.
+        label: `${isActive ? "● " : "  "}${name}${detail}`,
+        disabled: isActive || dead,
+        onClick: () => this.selectWorktree(w),
+      });
+    }
+    const r = this.headWorktreeEl.getBoundingClientRect();
+    showMenu(r.left, r.bottom + 3, items);
+  }
+
+  /** Record `w` as the explicit selection and refresh. Always store the path —
+   *  including the primary — because a null selection means "follow the pane's
+   *  worktree", which for a pane inside a linked worktree is NOT the primary. */
+  private selectWorktree(w: Worktree): void {
+    this.selectedWorktree = w.path;
+    void this.refresh();
   }
 
   private headHash(): string {
@@ -844,7 +1089,8 @@ export class GitView {
         for (const r of c.refs) {
           if (r.kind === "head" && c.refs.some((o) => o.kind === "branch")) continue;
           const chip = el("span", `git-chip ${r.kind}`, r.name);
-          if (r.kind === "branch" || r.kind === "remote" || r.kind === "tag") {
+          // Checkout is a write — the chip is inert on a read-only worktree.
+          if (this.writable && (r.kind === "branch" || r.kind === "remote" || r.kind === "tag")) {
             const remote = r.kind === "remote";
             chip.title = `Right-click for actions · double-click to checkout ${r.name}`;
             chip.addEventListener("dblclick", (e) => {
@@ -919,33 +1165,51 @@ export class GitView {
       ...s.untracked.map((path) => ({ path, orig_path: null, status: "?" })),
     ];
 
+    // Read-only worktree: browse the same file lists (click to diff) but with no
+    // stage/unstage/discard affordances and no commit box (#208 ruling).
+    const rw = this.writable;
     this.changesEl.append(
       this.filesColumn("Staged", s.staged, {
-        allLabel: "unstage all",
+        allLabel: rw ? "unstage all" : "",
         onAll: () =>
           void this.act(() =>
             gitUnstage(this.repoRoot!, s.staged.map((f) => f.path), s.empty)
           ),
-        row: (f) => [
-          this.actionBtn("−", "Unstage", () =>
-            void this.act(() => gitUnstage(this.repoRoot!, [f.path], s.empty))
-          ),
-        ],
+        row: rw
+          ? (f) => [
+              this.actionBtn("−", "Unstage", () =>
+                void this.act(() => gitUnstage(this.repoRoot!, [f.path], s.empty))
+              ),
+            ]
+          : () => [],
         mode: () => "staged",
       }),
       this.filesColumn("Changes", changes, {
-        allLabel: "stage all",
+        allLabel: rw ? "stage all" : "",
         onAll: () =>
           void this.act(() => gitStage(this.repoRoot!, changes.map((f) => f.path))),
-        row: (f) => [
-          this.actionBtn("+", "Stage", () =>
-            void this.act(() => gitStage(this.repoRoot!, [f.path]))
-          ),
-          this.discardBtn(f),
-        ],
+        row: rw
+          ? (f) => [
+              this.actionBtn("+", "Stage", () =>
+                void this.act(() => gitStage(this.repoRoot!, [f.path]))
+              ),
+              this.discardBtn(f),
+            ]
+          : () => [],
         mode: (f) => (f.status === "?" ? "untracked" : "worktree"),
       })
     );
+
+    if (!rw) {
+      this.changesEl.appendChild(
+        el(
+          "div",
+          "git-readonly-note",
+          "Read-only worktree — unlock (🔒 in the header) to stage, commit, or discard."
+        )
+      );
+      return;
+    }
 
     // -- commit box --
     const box = el("div", "git-commit-box");

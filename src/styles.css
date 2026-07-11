@@ -1753,6 +1753,32 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 }
 .git-graph-head .pane-btn { opacity: 1; }
 .git-head-title { font-weight: 600; font-size: 12px; }
+.git-head-worktree {
+  flex: none; max-width: 40%; min-width: 0; font-size: 11px;
+  color: var(--text-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  padding: 1px 6px; border: 1px solid var(--border-soft); border-radius: 10px;
+}
+.git-head-worktree[hidden] { display: none; }
+.git-head-worktree.clickable { cursor: pointer; }
+.git-head-worktree.clickable:hover { border-color: var(--accent); color: var(--text); }
+/* Off the main tree — make it stand out so you don't forget you're viewing a
+   worktree. */
+.git-head-worktree.non-primary { color: var(--accent); border-color: var(--accent); }
+/* Read-only badge + unlock toggle for a non-primary worktree (#208). Amber =
+   locked/read-only (the default, safe state); danger = unlocked for writes. */
+.git-head-lock {
+  flex: none; cursor: pointer; white-space: nowrap; font: inherit; font-size: 10.5px;
+  padding: 1px 7px; border-radius: 10px;
+  color: #e0af68; background: transparent; border: 1px solid #e0af68;
+}
+.git-head-lock[hidden] { display: none; }
+.git-head-lock:hover { background: rgba(224, 175, 104, 0.14); }
+.git-head-lock.unlocked { color: #f7768e; border-color: #f7768e; }
+.git-head-lock.unlocked:hover { background: rgba(247, 118, 142, 0.14); }
+.git-readonly-note {
+  flex: none; padding: 8px 12px; font-size: 11px; font-style: italic;
+  color: #e0af68; border-top: 1px solid var(--border-soft);
+}
 .git-head-branch {
   flex: 1; min-width: 0; color: var(--accent); font-size: 11px;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
