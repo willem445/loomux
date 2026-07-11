@@ -2098,6 +2098,9 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .fileedit-search-input::placeholder { color: var(--text-dim); }
 .fileedit-search-opts { display: flex; align-items: center; gap: 14px; color: var(--text-dim); font-size: 12px; }
 .fileedit-search-opts label { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; }
+/* The gitignore toggle is disabled off a git root (#207) — dim it and drop the
+   pointer affordance so it reads as unavailable, not merely unchecked. */
+.fileedit-search-opts label.disabled { cursor: default; opacity: 0.45; }
 .fileedit-search-summary { margin-left: auto; color: var(--text-dim); font-size: 12px; }
 .fileedit-search-summary.truncated { color: #f0c674; }
 

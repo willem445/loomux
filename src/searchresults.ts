@@ -14,6 +14,11 @@ export interface SearchParams {
   query: string;
   caseInsensitive: boolean;
   wholeWord: boolean;
+  /** Whether git-ignored files were included (issue #207). It changes *which
+   *  files* a search covers, so a replace previewed with one value must not apply
+   *  after it's toggled — hence it's part of the snapshot compared by
+   *  `paramsEqual`. */
+  includeIgnored: boolean;
 }
 
 /** Whether two search-parameter sets would match the same text. Used to detect
@@ -24,7 +29,8 @@ export function paramsEqual(a: SearchParams, b: SearchParams): boolean {
   return (
     a.query === b.query &&
     a.caseInsensitive === b.caseInsensitive &&
-    a.wholeWord === b.wholeWord
+    a.wholeWord === b.wholeWord &&
+    a.includeIgnored === b.includeIgnored
   );
 }
 

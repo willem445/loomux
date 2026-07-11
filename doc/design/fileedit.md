@@ -51,17 +51,18 @@ is `Alt+F`.
 
 ## Backend (`src-tauri/src/fileedit.rs`)
 
-Five `#[tauri::command]`s, each a thin wrapper over a `pub fn` the integration
-test drives directly. Every one takes a `root` (the pane cwd) + a `rel` and
-routes through one `safe_resolve` choke point.
+Six `#[tauri::command]`s, each a thin wrapper over a `pub fn` the integration
+test drives directly (search is split into start/cancel for the streaming worker,
+#207). Every path-taking one routes through one `safe_resolve` choke point.
 
 | Command | Purpose |
 | --- | --- |
 | `ft_list_dir(root, rel)` | **Lazy** — one directory per call (expand-on-demand). Dirs-first sort; symlinks flagged but reported non-expandable. |
 | `ft_read_file(root, rel)` | Rejects binary (NUL in the first 8 KB or invalid UTF-8) and files > 2 MiB with typed errors; returns content + FNV-1a hash. |
 | `ft_write_file(root, rel, content, expected_hash?)` | Atomic durable write; if `expected_hash` is set and the on-disk hash differs → `conflict`, file untouched. |
-| `ft_search(root, query, opts)` | Pure-`std` walker: skips `.git`/dot-dirs + `node_modules`/`target`/`dist`/`build`/`vendor`, symlinked dirs, binary, and over-cap files; literal / case-insensitive / whole-word; bounded, flags truncation. |
-| `ft_replace(root, query, replacement, files, opts)` | Applies only the confirmed files (the UI previews via `ft_search` first); re-reads + re-matches + writes each atomically; one bad file is skipped, never a partial write. |
+| `ft_search_start(id, root, query, opts)` | **Streaming, off-thread** (#207): spawns a worker that walks and emits `ft-search` batches tagged with `id`; polls a per-`id` cancel flag. Enumerates via `git ls-files` by default (gitignore-aware), or the full `std` walker when `include_ignored` is set / the root isn't a git repo. Literal / case-insensitive / whole-word; bounded, flags truncation. |
+| `ft_search_cancel(id)` | Flip search `id`'s cancel flag (a newer keystroke or `Esc`). Idempotent. |
+| `ft_replace(root, query, replacement, files, opts)` | Applies only the confirmed files (the UI previews the search first); re-reads + re-matches + writes each atomically; one bad file is skipped, never a partial write. |
 
 **Errors** are plain strings (house style) but each starts with a stable machine
 code (`conflict:`, `binary:`, `too-large:`, `symlink:`, `outside-root:`, …) so the
@@ -75,11 +76,44 @@ component is the one remaining way a lexically-in-root path could redirect
 outside, so we walk each component below the root with `symlink_metadata` and
 refuse any symlink.
 
-**Search performance.** ripgrep's `ignore`/`grep-searcher` (gitignore-aware,
-parallel) would be faster on huge repos but needs a `cargo tree -i getrandom` vet
-before adoption. v1 is a dependency-free `std` walker with excludes + caps —
-getrandom-safe and fast enough for on-demand desktop search. A `regex` mode and a
-gitignore-aware upgrade are the obvious follow-ups.
+**Search performance & the non-blocking rework (#207).** The v1 `ft_search` was a
+*synchronous* command. Tauri runs sync commands on the main (webview) thread, so a
+full-tree walk that reads every candidate file froze the whole UI for its
+duration — and the 300 ms-debounced auto-search relaunched that walk on every
+keystroke. On the main checkout (~19k files once node_modules + the Rust build dir
+are counted) an `include_ignored` walk for `"fn "` took **~62 s cold** / ~3 s warm;
+even the tracked-only walk was ~1.6 s cold — every millisecond of which was a hard
+UI freeze under the old command.
+
+The rework keeps the dependency-free `std` matcher (still getrandom-safe — no
+ripgrep/`ignore` crate, which would need a `cargo tree -i getrandom` vet) but
+changes the *structure*:
+
+- **Off the UI thread.** `ft_search_start` spawns a worker thread; the walk never
+  touches the webview thread, so the UI stays live no matter how big the tree.
+- **Cancellable.** Each search carries a frontend-issued id and an `AtomicBool`
+  cancel flag in a `SearchRegistry` (Tauri-managed, same shape as `GitWatcher`);
+  the worker polls it between files, so a superseded keystroke or `Esc` stops the
+  walk promptly instead of letting 62 s walks pile up.
+- **Streaming + capped.** Matches are emitted in 256-match batches as they're
+  found; the frontend accumulates at most `RENDER_CAP` (2 000) so a 10k-hit search
+  can't lock the DOM, and the tree render is throttled to one repaint per frame.
+- **Gitignore-aware by default.** Enumeration is `git ls-files --cached --others
+  --exclude-standard` (tracked + untracked-unignored) so `.gitignore` is respected
+  for free — on that ~19k-file tree the default search walks the 248 tracked files
+  in **~160 ms warm**. The **Ignored files** toggle (`include_ignored`) switches to
+  the full walk; a non-git root has no `.gitignore` to respect, so the toggle is
+  disabled there and the whole folder is always searched (the walk still applies
+  the heuristic `node_modules`/`target`/… excludes as a best-effort ignore, and
+  always skips `.git`). `git ls-files` is a plain subprocess — still no new crate.
+
+Submodules are asymmetric by design: default mode runs `git ls-files` *without*
+`--recurse-submodules`, so a submodule's contents aren't listed (its gitlink entry
+isn't a readable file and is skipped), whereas the include-ignored walk descends
+into the submodule directory like any other. Files inside a submodule are
+therefore searchable only with the toggle on.
+
+A `regex` mode remains the obvious follow-up.
 
 ## Frontend
 
@@ -96,6 +130,11 @@ gitignore-aware upgrade are the obvious follow-ups.
     icon font/sprite); robust to case, multi-dot, dotfiles, unknown extensions.
   - `searchresults.ts` — group flat matches by file, per-file replace selection,
     confirmed-set + count summaries.
+  - `searchsession.ts` — the streaming-search state machine (#207): `accept`
+    folds a batch into a session only when its id matches (dropping a
+    cancelled/superseded search's late batches — the cancellation guarantee),
+    caps accumulation at `RENDER_CAP`, and `enumerationSource` mirrors the
+    backend's gitignore-vs-walk choice.
   - `dirtystate.ts` — close-guard and conflict decisions.
   - `eol.ts` — line-ending detect / normalize / re-apply (see "Dirty tracking").
 - **`editorwidget.ts`** — the swappable editor seam (see below).
@@ -204,6 +243,12 @@ git-diff gutters; tree mutation (rename/delete/drag); regex search (v1 is litera
   stale-hash conflict leaves the file untouched; literal/case/whole-word search;
   exclude-dir skipping + empty-query guard + cap-truncation flag; replace applies
   only confirmed files atomically + skips a bad file without a partial write.
-- `test/{filetreemodel,fileicons,searchresults,dirtystate}.test.ts` — the pure
-  models, including the edge cases (path-join escapes, unknown/dotfile icons,
-  zero/all-deselected search, conflict on hash drift).
+  For #207: `git ls-files` respects `.gitignore` by default while the toggle
+  includes ignored files (skips if `git` isn't on PATH), and a pre-set cancel
+  flag stops the walk before it reads anything (the backend half of "a cancelled
+  search yields nothing").
+- `test/{filetreemodel,fileicons,searchresults,searchsession,dirtystate}.test.ts`
+  — the pure models, including the edge cases (path-join escapes, unknown/dotfile
+  icons, zero/all-deselected search, conflict on hash drift) and the #207
+  cancellation race (a stale-id batch never lands), render cap, and
+  ignored-by-default enumeration pick.

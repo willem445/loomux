@@ -52,20 +52,38 @@ test("setAll selects or clears everything", () => {
 });
 
 test("paramsEqual detects a changed query or option (preview-vs-apply guard)", () => {
-  const base: SearchParams = { query: "foo", caseInsensitive: false, wholeWord: false };
+  const base: SearchParams = {
+    query: "foo",
+    caseInsensitive: false,
+    wholeWord: false,
+    includeIgnored: false,
+  };
   assert.equal(paramsEqual(base, { ...base }), true);
   // Any single change makes them unequal, so the stale preview is invalidated
   // before a replace can apply divergent params (finding #1).
   assert.equal(paramsEqual(base, { ...base, query: "bar" }), false);
   assert.equal(paramsEqual(base, { ...base, caseInsensitive: true }), false);
   assert.equal(paramsEqual(base, { ...base, wholeWord: true }), false);
+  // The gitignore toggle changes which files are covered, so it too invalidates
+  // a stale preview (issue #207).
+  assert.equal(paramsEqual(base, { ...base, includeIgnored: true }), false);
 });
 
 test("replaceIsCurrent blocks a replace when a stale search left the snapshot behind", () => {
-  const live: SearchParams = { query: "foobar", caseInsensitive: false, wholeWord: false };
+  const live: SearchParams = {
+    query: "foobar",
+    caseInsensitive: false,
+    wholeWord: false,
+    includeIgnored: false,
+  };
   // A slow search for "foo" resolves after the user typed "foobar": the snapshot
   // (from "foo") no longer matches the box, so replace must NOT proceed.
-  const staleSnapshot: SearchParams = { query: "foo", caseInsensitive: false, wholeWord: false };
+  const staleSnapshot: SearchParams = {
+    query: "foo",
+    caseInsensitive: false,
+    wholeWord: false,
+    includeIgnored: false,
+  };
   assert.equal(replaceIsCurrent(staleSnapshot, live), false);
   // In sync → allowed.
   assert.equal(replaceIsCurrent({ ...live }, live), true);

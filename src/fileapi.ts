@@ -9,6 +9,7 @@
 // to it; ALL path safety is enforced server-side (see fileedit.rs).
 
 import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 /** One entry in a directory listing. Symlinks are shown but never expanded. */
 export interface FtEntry {
@@ -38,10 +39,16 @@ export interface SearchMatch {
   line_text: string;
 }
 
-export interface SearchOutcome {
+/** One streamed batch of a search, as delivered by the `ft-search` event
+ *  (issue #207). `id` is the search this batch belongs to; the frontend drops
+ *  batches from a superseded/cancelled search. `done` marks the terminal batch
+ *  (empty `matches`, final `truncated` + any `error`). */
+export interface SearchBatch {
+  id: number;
   matches: SearchMatch[];
-  /** A cap cut the walk short — results are partial. */
+  done: boolean;
   truncated: boolean;
+  error?: string;
 }
 
 export interface SearchOpts {
@@ -49,6 +56,9 @@ export interface SearchOpts {
   whole_word: boolean;
   /** 0 = backend default (capped at its own ceiling). */
   max_results: number;
+  /** Search files git ignores too (issue #207). Default `false` enumerates via
+   *  `git ls-files`, respecting `.gitignore`; `true` walks the full tree. */
+  include_ignored: boolean;
 }
 
 export interface ChangedFile {
@@ -128,11 +138,30 @@ export const ftWriteFile = (
 ): Promise<WriteResult> =>
   invoke("ft_write_file", { root, rel, content, expectedHash });
 
-export const ftSearch = (
+/** Monotonic search ids, unique across every FileEditView in the window, so the
+ *  single `ft-search` event stream can be demultiplexed by id (a stale search's
+ *  batches are ignored — the cancellation primitive). */
+let searchSeq = 0;
+export const nextSearchId = (): number => ++searchSeq;
+
+/** Start a streaming search (issue #207). Returns as soon as the walk is spawned
+ *  on a worker thread; matches arrive as `ft-search` events tagged with `id`
+ *  (subscribe via `onSearchBatch`). Never blocks the UI thread. */
+export const ftSearchStart = (
+  id: number,
   root: string,
   query: string,
   opts: SearchOpts
-): Promise<SearchOutcome> => invoke("ft_search", { root, query, opts });
+): Promise<void> => invoke("ft_search_start", { id, root, query, opts });
+
+/** Cancel the in-flight search `id` (a newer keystroke or Esc). Idempotent. */
+export const ftSearchCancel = (id: number): Promise<void> =>
+  invoke("ft_search_cancel", { id });
+
+/** Subscribe to streamed search batches. One listener serves every FileEditView;
+ *  each filters by its own active id. Returns an unlisten fn for teardown. */
+export const onSearchBatch = (cb: (batch: SearchBatch) => void): Promise<UnlistenFn> =>
+  listen<SearchBatch>("ft-search", (e) => cb(e.payload));
 
 export const ftReplace = (
   root: string,

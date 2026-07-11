@@ -19,8 +19,12 @@ only at review and merge.
 Every pane also carries an in-app **file editor** (`Alt+F`): a lazy file tree
 with extension icons, a CodeMirror code editor with per-language highlighting,
 and project-wide search-and-replace — floating over the terminal so the shell
-below is never disturbed. Available everywhere, plain terminals included. See
-the [design note](doc/design/fileedit.md).
+below is never disturbed. Available everywhere, plain terminals included. Search
+runs off the UI thread and streams results as it finds them, so it never freezes
+on a big repo (a new keystroke or `Esc` cancels the in-flight search); it
+respects `.gitignore` by default, with an **Ignored files** toggle to include
+git-ignored paths (node_modules, build output). See the
+[design note](doc/design/fileedit.md).
 
 ![sample](sample.jpg)
 
@@ -109,7 +113,7 @@ src-tauri/src/
   obs.rs            crash observability: panic hook, breadcrumb log, unclean-exit notice
   voice.rs          voice prompts (#58): mic capture (cpal) -> local whisper.cpp subprocess
   uistate.rs        durable UI state (project tabs #63): atomic tabs.json store
-  fileedit.rs       file-editor overlay (#174): lazy tree, read/write (atomic + hash conflict), search/replace; server-side path safety
+  fileedit.rs       file-editor overlay (#174): lazy tree, read/write (atomic + hash conflict), streaming gitignore-aware search/replace (#207); server-side path safety
   lib.rs            Tauri wiring
 src/
   pty.ts            typed bridge to the backend (invoke + event bus)
@@ -137,6 +141,7 @@ src/
   filetreemodel.ts  pure lazy-tree model: sort/merge/flatten (DOM-free, unit-tested)
   fileicons.ts      pure filename -> inline-SVG icon mapping (DOM-free, unit-tested)
   searchresults.ts  pure search grouping + tree-hit + replace-selection model (DOM-free, unit-tested)
+  searchsession.ts  pure streaming-search state machine: batch/cancel + result cap + enumeration-source pick (#207, DOM-free, unit-tested)
   dirtystate.ts     pure conflict/close-guard decisions (DOM-free, unit-tested)
   eol.ts            pure line-ending detect/normalize/re-apply for EOL-safe dirty tracking (unit-tested)
   findwidget.ts     pure in-file-find logic: regex build + "n of m" match count (DOM-free, unit-tested)

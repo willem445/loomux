@@ -28,10 +28,28 @@
 //! getrandom / ProcessPrng ban, CLAUDE.md constraint #2). Search is a pure-`std`
 //! walker — dependency-free, getrandom-safe, and bounded so a huge repo can't
 //! wedge the UI.
+//!
+//! Search runs off the UI thread and streams (issue #207). `ft_search` was a
+//! *synchronous* command: Tauri runs sync commands on the main (webview) thread,
+//! so a full-tree walk that reads tens of thousands of files froze the whole UI
+//! for its duration — and the debounced auto-search relaunched that walk on every
+//! keystroke. `ft_search_start` instead spawns a worker thread that walks, emits
+//! `ft-search` batches as they're found (tagged with the caller's search id), and
+//! polls a per-search cancel flag so a superseded search (new keystroke) or an
+//! `Esc` stops promptly instead of running to completion. Enumeration is
+//! gitignore-aware by default: in a git repo it uses `git ls-files` (tracked +
+//! untracked-unignored) so `.gitignore`d paths are skipped for free; the
+//! `include_ignored` toggle (or a non-git root) falls back to the full walk. The
+//! git call is a plain subprocess — still no new crate, still getrandom-safe.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+
+use crate::obs::LockExt;
+use tauri::{AppHandle, Emitter, State};
 
 /// Files larger than this are refused by `ft_read_file` — the editor is for
 /// source, not blobs, and loading multi-megabyte buffers into the webview would
@@ -53,6 +71,12 @@ const SEARCH_MATCH_CEILING: usize = 5_000;
 /// Hard ceiling on files visited by one search walk, so a giant tree can't hang
 /// the walker even with generous excludes.
 const SEARCH_FILE_CEILING: usize = 50_000;
+
+/// Matches are streamed to the UI in batches of this size (issue #207) so results
+/// appear as they're found and one giant payload never crosses the IPC boundary.
+/// The cancel flag is polled between files, so a batch bounds how long a
+/// superseded search keeps working before it notices.
+const SEARCH_BATCH: usize = 256;
 
 /// Directory names never descended into by the search walker: VCS metadata and
 /// the usual heavy build/dependency dirs. Any dot-directory is skipped too (see
@@ -96,7 +120,7 @@ pub struct WriteResult {
 /// A single search hit. `line`/`col` are 1-based (col counts characters, not
 /// bytes, so it lines up with what an editor shows); `line_text` is the matched
 /// line, trimmed of the trailing newline and capped for display.
-#[derive(Serialize, Debug)]
+#[derive(Serialize, Debug, Clone)]
 pub struct Match {
     pub rel: String,
     pub line: usize,
@@ -113,7 +137,7 @@ pub struct SearchOutcome {
 }
 
 /// Knobs for a search/replace. `max_results` is clamped to `SEARCH_MATCH_CEILING`.
-#[derive(Deserialize, Clone, Copy)]
+#[derive(Deserialize, Clone, Copy, Default)]
 pub struct SearchOpts {
     #[serde(default)]
     pub case_insensitive: bool,
@@ -121,6 +145,11 @@ pub struct SearchOpts {
     pub whole_word: bool,
     #[serde(default)]
     pub max_results: usize,
+    /// Include files git would ignore (issue #207). Default (`false`) enumerates
+    /// via `git ls-files` so `.gitignore` is respected; `true` walks the full
+    /// tree. No effect on `replace`, which acts on an explicit file list.
+    #[serde(default)]
+    pub include_ignored: bool,
 }
 
 /// A file the replace pass could not touch, with a human-readable reason. One
@@ -495,6 +524,319 @@ fn is_excluded_dir(name: &str) -> bool {
     name.starts_with('.') || EXCLUDED_DIRS.contains(&name)
 }
 
+/// Whether the walk should descend into a directory named `name`. `.git` is
+/// never searched (VCS metadata, not source) regardless of mode. When
+/// `apply_excludes` is set the heuristic ignore list (dot-dirs + the common
+/// heavy build/dependency dirs) is applied too — that's the best-effort ignore
+/// for a non-git root; a git root filters via `git ls-files` instead, and the
+/// `include_ignored` toggle drops the heuristic so even `node_modules` is walked.
+fn should_skip_dir(name: &str, apply_excludes: bool) -> bool {
+    name == ".git" || (apply_excludes && is_excluded_dir(name))
+}
+
+/// How a search discovers candidate files.
+enum Enumeration {
+    /// Recursively walk the tree; `apply_excludes` toggles the heuristic ignore
+    /// list (see `should_skip_dir`).
+    Walk { apply_excludes: bool },
+    /// An explicit, already root-relative file list (from `git ls-files`).
+    Files(Vec<String>),
+}
+
+/// Run `git` in `dir` and capture stdout, or `None` on any failure (git missing,
+/// not a repo, non-zero exit). A local, Option-returning twin of `git::run_git`
+/// — the file editor keeps its own tiny helper (house style duplicates per
+/// module) so a search never fails just because git is unavailable; it falls
+/// back to the walk. Never spawns a console window on Windows.
+fn git_output(dir: &str, args: &[&str]) -> Option<String> {
+    let mut cmd = std::process::Command::new("git");
+    cmd.current_dir(dir)
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let out = cmd.output().ok()?;
+    if out.status.success() {
+        Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    } else {
+        None
+    }
+}
+
+/// The gitignore-respecting file set for `root`: tracked files plus
+/// untracked-but-not-ignored ones (`--others --exclude-standard`), so a newly
+/// created, not-yet-committed source file is searchable while a `.gitignore`d
+/// path is not. `None` when `root` isn't a git work tree (or git is missing), so
+/// the caller walks instead. Paths are NUL-delimited (`-z`) and forward-slashed
+/// (git's native form) — exactly the `rel` convention the rest of this module
+/// uses, no re-encoding needed.
+fn git_tracked_files(root: &str) -> Option<Vec<String>> {
+    // Confirm it's really a work tree first: a stray or corrupt `.git` must fall
+    // through to the walk, not surface a git error as a failed search.
+    if git_output(root, &["rev-parse", "--is-inside-work-tree"])?.trim() != "true" {
+        return None;
+    }
+    let out = git_output(
+        root,
+        &["ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+    )?;
+    Some(
+        out.split('\0')
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
+/// Pick the enumeration strategy: gitignore-aware `git ls-files` by default in a
+/// git repo; the full walk when `include_ignored` is set or the root isn't a git
+/// work tree (`apply_excludes` then keeps the heuristic ignore for a non-git
+/// root, and is dropped when the user explicitly asked to include ignored files).
+fn plan_enumeration(root: &str, include_ignored: bool) -> Enumeration {
+    if !include_ignored {
+        if let Some(files) = git_tracked_files(root) {
+            return Enumeration::Files(files);
+        }
+    }
+    Enumeration::Walk {
+        apply_excludes: !include_ignored,
+    }
+}
+
+/// Scan one file for up to `remaining` matches of `needle`. Returns the matches
+/// and whether it stopped because it hit `remaining` (the global-cap signal).
+/// Unreadable, over-cap, binary, or non-UTF-8 files yield no matches — the walk
+/// skips them exactly as before.
+fn scan_file_matches(
+    path: &Path,
+    rel: &str,
+    needle: &[u8],
+    opts: SearchOpts,
+    remaining: usize,
+) -> (Vec<Match>, bool) {
+    let mut out = Vec::new();
+    if remaining == 0 {
+        return (out, true);
+    }
+    match std::fs::metadata(path) {
+        Ok(m) if m.len() > MAX_SEARCH_FILE_BYTES => return (out, false),
+        Ok(_) => {}
+        Err(_) => return (out, false),
+    }
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(_) => return (out, false),
+    };
+    if looks_binary(&bytes) {
+        return (out, false);
+    }
+    let text = match std::str::from_utf8(&bytes) {
+        Ok(t) => t,
+        Err(_) => return (out, false),
+    };
+    let mut hit_cap = false;
+    'lines: for (idx, line) in text.lines().enumerate() {
+        for &pos in &match_positions(line.as_bytes(), needle, opts.case_insensitive, opts.whole_word) {
+            // Byte offset → 1-based character column.
+            let col = line[..pos].chars().count() + 1;
+            out.push(Match {
+                rel: rel.to_string(),
+                line: idx + 1,
+                col,
+                line_text: cap_line(line),
+            });
+            if out.len() >= remaining {
+                hit_cap = true;
+                break 'lines;
+            }
+        }
+    }
+    (out, hit_cap)
+}
+
+/// Buffers matches and flushes them to `on_batch` in `SEARCH_BATCH`-sized chunks,
+/// enforcing the global match cap. Keeps the borrow simple so both enumeration
+/// arms can share the per-file feed without fighting the borrow checker.
+struct Sink<'a> {
+    buf: Vec<Match>,
+    total: usize,
+    cap: usize,
+    truncated: bool,
+    on_batch: &'a mut dyn FnMut(Vec<Match>),
+}
+
+impl Sink<'_> {
+    /// Feed one file's worth of scanning. Returns true when the global cap is
+    /// reached and the caller should stop the walk.
+    fn feed(&mut self, path: &Path, rel: &str, needle: &[u8], opts: SearchOpts) -> bool {
+        let remaining = self.cap - self.total;
+        let (mut found, hit_cap) = scan_file_matches(path, rel, needle, opts, remaining);
+        self.total += found.len();
+        self.buf.append(&mut found);
+        if self.buf.len() >= SEARCH_BATCH {
+            (self.on_batch)(std::mem::take(&mut self.buf));
+        }
+        if hit_cap {
+            self.truncated = true;
+        }
+        hit_cap
+    }
+
+    /// Flush the tail batch and report whether the cap truncated the results.
+    fn finish(mut self) -> bool {
+        if !self.buf.is_empty() {
+            (self.on_batch)(std::mem::take(&mut self.buf));
+        }
+        self.truncated
+    }
+}
+
+/// The shared search engine (issue #207). Enumerates per `enumeration`, scans
+/// each file, and streams matches to `on_batch` in batches. `cancelled` is polled
+/// between files so a superseded/aborted search stops promptly. Returns whether
+/// the results were truncated (match or file ceiling hit). Callers: `search`
+/// (walk-only collector, used by the tests) and `search_planned` (git-aware,
+/// used by the streaming command).
+fn run_search(
+    root: &str,
+    query: &str,
+    opts: SearchOpts,
+    enumeration: Enumeration,
+    cancelled: &dyn Fn() -> bool,
+    on_batch: &mut dyn FnMut(Vec<Match>),
+) -> Result<bool, String> {
+    if query.is_empty() {
+        return Err(err("empty-query", "search query is empty"));
+    }
+    let root_norm = safe_resolve(root, "")?;
+    let cap = if opts.max_results == 0 {
+        SEARCH_MATCH_CEILING
+    } else {
+        opts.max_results.min(SEARCH_MATCH_CEILING)
+    };
+    let needle = query.as_bytes();
+
+    let mut sink = Sink {
+        buf: Vec::new(),
+        total: 0,
+        cap,
+        truncated: false,
+        on_batch,
+    };
+    let mut files_seen = 0usize;
+    let mut ceiling_hit = false;
+
+    match enumeration {
+        Enumeration::Files(files) => {
+            for rel in files {
+                if cancelled() {
+                    break;
+                }
+                files_seen += 1;
+                if files_seen > SEARCH_FILE_CEILING {
+                    ceiling_hit = true;
+                    break;
+                }
+                // Re-validate every git-supplied path through the same choke point
+                // (rejects anything escaping the root or crossing a symlink).
+                let path = match safe_resolve(root, &rel) {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
+                if sink.feed(&path, &rel, needle, opts) {
+                    break;
+                }
+            }
+        }
+        Enumeration::Walk { apply_excludes } => {
+            // Explicit stack instead of recursion: unbounded repo depth mustn't
+            // blow the Rust stack, and the ceilings become a simple early-out.
+            let mut stack = vec![root_norm.clone()];
+            'walk: while let Some(dir) = stack.pop() {
+                if cancelled() {
+                    break;
+                }
+                let rd = match std::fs::read_dir(&dir) {
+                    Ok(rd) => rd,
+                    Err(_) => continue, // unreadable dir: skip, don't fail the search
+                };
+                for ent in rd.flatten() {
+                    let ft = match ent.file_type() {
+                        Ok(ft) => ft,
+                        Err(_) => continue,
+                    };
+                    if ft.is_symlink() {
+                        continue; // never follow symlinks (dir or file)
+                    }
+                    let path = ent.path();
+                    let name = ent.file_name().to_string_lossy().into_owned();
+                    if ft.is_dir() {
+                        if !should_skip_dir(&name, apply_excludes) {
+                            stack.push(path);
+                        }
+                        continue;
+                    }
+                    if !ft.is_file() {
+                        continue;
+                    }
+                    if cancelled() {
+                        break 'walk;
+                    }
+                    files_seen += 1;
+                    if files_seen > SEARCH_FILE_CEILING {
+                        ceiling_hit = true;
+                        break 'walk;
+                    }
+                    let rel = rel_display(&root_norm, &path);
+                    if sink.feed(&path, &rel, needle, opts) {
+                        break 'walk;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(sink.finish() || ceiling_hit)
+}
+
+/// Walk-only literal search that collects every match (issue #174 behaviour).
+/// Git-independent and deterministic — the integration tests drive this — so it
+/// always applies the heuristic excludes and never consults git. The live,
+/// gitignore-aware, streaming path is `search_planned`.
+pub fn search(root: &str, query: &str, opts: SearchOpts) -> Result<SearchOutcome, String> {
+    let mut matches = Vec::new();
+    let truncated = run_search(
+        root,
+        query,
+        opts,
+        Enumeration::Walk { apply_excludes: true },
+        &|| false,
+        &mut |batch| matches.extend(batch),
+    )?;
+    Ok(SearchOutcome { matches, truncated })
+}
+
+/// Streaming, gitignore-aware search (issue #207): picks the enumeration source
+/// from `opts.include_ignored` (git ls-files by default, full walk when the
+/// toggle is on or the root isn't a git repo) and feeds `on_batch` as matches are
+/// found, polling `cancelled` between files. Returns whether results were
+/// truncated. Testable without a Tauri runtime; the `ft_search_start` command
+/// wires `on_batch` to event emission and `cancelled` to a per-search flag.
+pub fn search_planned(
+    root: &str,
+    query: &str,
+    opts: SearchOpts,
+    cancelled: &dyn Fn() -> bool,
+    on_batch: &mut dyn FnMut(Vec<Match>),
+) -> Result<bool, String> {
+    let enumeration = plan_enumeration(root, opts.include_ignored);
+    run_search(root, query, opts, enumeration, cancelled, on_batch)
+}
+
 /// Cap a display line so one very long line can't bloat a result payload.
 fn cap_line(s: &str) -> String {
     const MAX: usize = 400;
@@ -507,97 +849,6 @@ fn cap_line(s: &str) -> String {
         }
         format!("{}…", &s[..end])
     }
-}
-
-/// Project-wide literal text search under `root`. Skips excluded/dot dirs,
-/// symlinked dirs, binary files, and files over the per-file size cap. Bounded
-/// by `opts.max_results` (clamped to `SEARCH_MATCH_CEILING`) and a file ceiling;
-/// when either bound cuts the walk short the result is flagged `truncated`.
-pub fn search(root: &str, query: &str, opts: SearchOpts) -> Result<SearchOutcome, String> {
-    if query.is_empty() {
-        return Err(err("empty-query", "search query is empty"));
-    }
-    let root_norm = safe_resolve(root, "")?;
-    let cap = if opts.max_results == 0 {
-        SEARCH_MATCH_CEILING
-    } else {
-        opts.max_results.min(SEARCH_MATCH_CEILING)
-    };
-    let needle = query.as_bytes();
-
-    let mut matches = Vec::new();
-    let mut truncated = false;
-    let mut files_seen = 0usize;
-    // Explicit stack instead of recursion: unbounded repo depth mustn't blow the
-    // Rust stack, and it makes the file/match ceilings a simple early-out.
-    let mut stack = vec![root_norm.clone()];
-    'walk: while let Some(dir) = stack.pop() {
-        let rd = match std::fs::read_dir(&dir) {
-            Ok(rd) => rd,
-            Err(_) => continue, // unreadable dir: skip, don't fail the whole search
-        };
-        for ent in rd.flatten() {
-            let ft = match ent.file_type() {
-                Ok(ft) => ft,
-                Err(_) => continue,
-            };
-            if ft.is_symlink() {
-                continue; // never follow symlinks (dir or file)
-            }
-            let path = ent.path();
-            let name = ent.file_name().to_string_lossy().into_owned();
-            if ft.is_dir() {
-                if !is_excluded_dir(&name) {
-                    stack.push(path);
-                }
-                continue;
-            }
-            if !ft.is_file() {
-                continue;
-            }
-            files_seen += 1;
-            if files_seen > SEARCH_FILE_CEILING {
-                truncated = true;
-                break 'walk;
-            }
-            match ent.metadata() {
-                Ok(m) if m.len() > MAX_SEARCH_FILE_BYTES => continue,
-                Ok(_) => {}
-                Err(_) => continue,
-            }
-            let bytes = match std::fs::read(&path) {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
-            if looks_binary(&bytes) {
-                continue;
-            }
-            let text = match std::str::from_utf8(&bytes) {
-                Ok(t) => t,
-                Err(_) => continue,
-            };
-            let rel = rel_display(&root_norm, &path);
-            for (idx, line) in text.lines().enumerate() {
-                for &pos in
-                    &match_positions(line.as_bytes(), needle, opts.case_insensitive, opts.whole_word)
-                {
-                    // Byte offset → 1-based character column.
-                    let col = line[..pos].chars().count() + 1;
-                    matches.push(Match {
-                        rel: rel.clone(),
-                        line: idx + 1,
-                        col,
-                        line_text: cap_line(line),
-                    });
-                    if matches.len() >= cap {
-                        truncated = true;
-                        break 'walk;
-                    }
-                }
-            }
-        }
-    }
-    Ok(SearchOutcome { matches, truncated })
 }
 
 /// Apply `query`→`replacement` to exactly the `files` the caller confirmed (the
@@ -698,9 +949,106 @@ pub fn ft_write_file(
     write_file(&root, &rel, &content, expected_hash)
 }
 
+// ---------- streaming search (issue #207) ----------
+
+/// Per-search cancel flags, keyed by the frontend-issued search id. A search
+/// worker holds an `Arc` to its own flag and polls it between files; the
+/// `ft_search_cancel` command flips it when a newer keystroke (or `Esc`)
+/// supersedes the search. Tauri-managed state, shared via `Arc` with each worker
+/// thread — the same pattern as `GitWatcher`.
+#[derive(Default)]
+pub struct SearchRegistry {
+    flags: Mutex<HashMap<u64, Arc<AtomicBool>>>,
+}
+
+impl SearchRegistry {
+    /// Register search `id` and hand back its (freshly un-set) cancel flag.
+    fn begin(&self, id: u64) -> Arc<AtomicBool> {
+        let flag = Arc::new(AtomicBool::new(false));
+        self.flags.lock_safe().insert(id, flag.clone());
+        flag
+    }
+
+    /// Signal search `id` to stop. No-op if it already finished (its flag is
+    /// gone), which is fine — the result is discarded by the id-mismatch guard.
+    fn cancel(&self, id: u64) {
+        if let Some(flag) = self.flags.lock_safe().get(&id) {
+            flag.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Drop search `id`'s flag once its worker finishes.
+    fn end(&self, id: u64) {
+        self.flags.lock_safe().remove(&id);
+    }
+}
+
+/// One streamed batch of a search, tagged with the caller's `id` so the frontend
+/// drops events from a superseded/cancelled search. `done` marks the terminal
+/// event (carrying final `truncated` + any `error`); `matches` is empty on it.
+#[derive(Clone, Serialize)]
+struct SearchEvent {
+    id: u64,
+    matches: Vec<Match>,
+    done: bool,
+    truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+/// Kick off a streaming search on a worker thread (issue #207). Returns
+/// immediately; results arrive as `ft-search` events tagged with `id`. Runs off
+/// the UI thread so a big-repo walk never freezes the webview, and polls the
+/// per-`id` cancel flag so a superseded search stops promptly.
 #[tauri::command]
-pub fn ft_search(root: String, query: String, opts: SearchOpts) -> Result<SearchOutcome, String> {
-    search(&root, &query, opts)
+pub fn ft_search_start(
+    app: AppHandle,
+    registry: State<'_, Arc<SearchRegistry>>,
+    id: u64,
+    root: String,
+    query: String,
+    opts: SearchOpts,
+) {
+    let flag = registry.begin(id);
+    let reg = registry.inner().clone();
+    std::thread::spawn(move || {
+        let cancelled = || flag.load(Ordering::Relaxed);
+        let mut emit = |batch: Vec<Match>| {
+            let _ = app.emit(
+                "ft-search",
+                SearchEvent {
+                    id,
+                    matches: batch,
+                    done: false,
+                    truncated: false,
+                    error: None,
+                },
+            );
+        };
+        let (truncated, error) = match search_planned(&root, &query, opts, &cancelled, &mut emit) {
+            Ok(truncated) => (truncated, None),
+            Err(e) => (false, Some(e)),
+        };
+        // Always send a terminal event (even when cancelled): the frontend keys
+        // off `id`, so a done for a superseded search is simply ignored.
+        let _ = app.emit(
+            "ft-search",
+            SearchEvent {
+                id,
+                matches: Vec::new(),
+                done: true,
+                truncated,
+                error,
+            },
+        );
+        reg.end(id);
+    });
+}
+
+/// Cancel the in-flight search `id` (a new keystroke or `Esc`). Idempotent.
+#[tauri::command]
+pub fn ft_search_cancel(registry: State<'_, Arc<SearchRegistry>>, id: u64) {
+    registry.cancel(id);
 }
 
 #[tauri::command]
