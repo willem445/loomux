@@ -46,6 +46,11 @@ export type MenuAction =
   | { kind: "open"; target: OpTarget }
   | { kind: "open-with"; target: OpTarget }
   | { kind: "reveal"; target: OpTarget }
+  /** Open an EDITOR pane beside this one (#217): rooted at the manager's root with
+   *  the clicked FILE open, or rooted at the clicked FOLDER. The in-app counterpart
+   *  to `open` — which hands the file to the OS default app and is deliberately not
+   *  the same thing (a .png belongs in an image viewer; a .ts belongs here). */
+  | { kind: "edit-pane"; target: OpTarget }
   | { kind: "rename"; target: OpTarget }
   | { kind: "delete"; target: OpTarget }
   | { kind: "hash"; target: OpTarget; algo: HashAlgo }
@@ -159,6 +164,18 @@ export function buildContextMenu(
       reason: inert,
     });
   }
+
+  // Open it in loomux's OWN editor, in a new pane beside this one (#217). Offered for a
+  // folder too — an editor pane is rooted at a directory, so "open this folder in an
+  // editor pane" is the same action with nothing to open in it, and the label says so
+  // rather than pretending a folder can be edited. Only a symlink is refused, for the
+  // same reason everything else is: we don't follow them.
+  items.push({
+    label: isDir ? "Open folder in editor pane" : "Open in file editor pane",
+    action: { kind: "edit-pane", target },
+    disabled: !!inert,
+    reason: inert,
+  });
 
   items.push(sep);
   // `inert` (a symlink) wins over `busy`: it is a permanent property of the row, and the

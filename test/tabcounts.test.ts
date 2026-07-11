@@ -32,6 +32,23 @@ test("a tab of nothing but file explorers reports no agents and no orch markers"
   });
 });
 
+test("editor and git panes are NOT agents either — same rule, same reason (#217)", () => {
+  // The exclusion is keyed on KIND, so it extends to every content pane by construction
+  // rather than by remembering. All three report `live: true` (they ARE functional), which
+  // is precisely why: a counter that keyed off `live` would show a tab of viewers as a tab
+  // of running agents — the exact class of bug tabcounts.ts was written to end.
+  const c = tabCounts([p("editor"), p("git"), p("files"), p("agent")], false);
+  assert.equal(c.agents, 1);
+  assert.equal(c.liveOrch, false);
+  assert.equal(c.dormantOrch, false);
+
+  assert.deepEqual(tabCounts([p("editor"), p("git")], false), {
+    agents: 0,
+    liveOrch: false,
+    dormantOrch: false,
+  });
+});
+
 test("an empty tab (only a welcome pane) counts zero and shows no markers", () => {
   const c = tabCounts([p("terminal", false)], false);
   assert.deepEqual(c, { agents: 0, liveOrch: false, dormantOrch: false });

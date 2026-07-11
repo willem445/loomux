@@ -56,6 +56,24 @@ export function joinRel(rel: string, name: string): string {
   return base ? `${base}/${name}` : name;
 }
 
+/** Turn a root-relative `rel` back into an ABSOLUTE path under `root` — the inverse
+ *  of the (root, rel) split the whole file stack passes around.
+ *
+ *  Needed exactly once, and it's worth saying where: "Open folder in editor pane"
+ *  (#217) makes a NEW pane rooted at the clicked folder, and a pane root is an absolute
+ *  path — every other op keeps the (root, rel) pair and hands both to the backend,
+ *  which is why this is the only place the two are ever joined.
+ *
+ *  The separator follows the ROOT's own style (a Windows root keeps backslashes) so the
+ *  path we hand back looks like the one the user gave us. `rel` "" is the root itself. */
+export function joinRoot(root: string, rel: string): string {
+  const base = root.replace(/[\\/]+$/, "");
+  const tail = rel.replace(/^\/+|\/+$/g, "");
+  if (!tail) return base;
+  const sep = base.includes("\\") && !base.includes("/") ? "\\" : "/";
+  return `${base}${sep}${tail.split("/").join(sep)}`;
+}
+
 /** The parent of `rel`, or null when `rel` IS the root ("").
  *
  *  Null is what disables the Up button: this pane is rooted, and navigation is
@@ -309,6 +327,7 @@ export type RowAffordance =
   | "open"
   | "open-with"
   | "reveal"
+  | "edit-pane"
   | "rename"
   | "delete"
   | "hash"
@@ -338,6 +357,12 @@ export const ROW_AFFORDANCES: readonly AffordanceParity[] = [
   { affordance: "open", results: true, menuItem: true },
   { affordance: "open-with", results: true, menuItem: true },
   { affordance: "reveal", results: true, menuItem: true },
+  // "Open in file editor pane" (#217): opens an EDITOR pane beside this one, rooted at
+  // this pane's root, with the clicked file open — the in-app answer to "open" for the
+  // files loomux itself can edit, next to the OS hand-off above. Works on a result for
+  // the same reason every other command does: the action carries the row's PATH, and a
+  // path is a path wherever it was clicked from.
+  { affordance: "edit-pane", results: true, menuItem: true },
   // Rename from a result works, and is the one that cost two rounds to get right: it exits
   // the filter, navigates to the file's folder, and mounts the editor there (editMountFor).
   { affordance: "rename", results: true, menuItem: true },

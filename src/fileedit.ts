@@ -72,15 +72,36 @@ import { createEditor, type EditorWidget } from "./editorwidget";
 import { showToast } from "./toast";
 import { modal } from "./modal";
 
-/** What the hosting pane provides to the overlay. */
+/** What the hosting pane provides. TWO hosts now (#217): the Alt+F OVERLAY over a
+ *  terminal (the original, unchanged), and an EDITOR PANE whose permanent content
+ *  this view is. The fork between them is these two optional hooks and nothing
+ *  else — the tree, the editor, the #207 streaming search and replace are the same
+ *  code in both. */
 export interface FileEditHost {
-  /** The pane's live working directory (shell-integration cwd / worktree). */
+  /** The pane's live working directory (shell-integration cwd / worktree) — or, in
+   *  an editor pane, that pane's root. */
   getCwd(): string | null;
-  /** Close the overlay and return focus to the terminal. */
+  /** Close the overlay and return focus to the terminal. Never called in embedded
+   *  mode (there is nothing to close back to). */
   onClose(): void;
   /** True when the root is a running agent's worktree — the view shows a subtle
    *  banner (editing it is legitimate but the agent may also be writing). */
   isAgentWorktree?(): boolean;
+  /** EMBEDDED mode: this view is an editor PANE's permanent content, not an overlay
+   *  floating over a terminal. There is nothing to close back TO, so the ✕ and the
+   *  Esc-to-close binding are dropped — the pane's own ✕ closes it (and asks about
+   *  unsaved edits first, via `canDiscard`). This is the only behavioral fork, and
+   *  it is one the overlay semantics genuinely don't have an answer for.
+   *
+   *  (First built in PR #215 round 1 for the #214 pane, reverted with it when that
+   *  pane became a file manager, and resurrected here — where the editor-as-pane is
+   *  the actual ask.) */
+  embedded?: boolean;
+  /** The user re-rooted the tree from the header's folder picker. An OVERLAY host
+   *  ignores this (the root is view-local by design — browsing must not disturb the
+   *  terminal or a running agent); an editor PANE adopts it as the pane's root, so
+   *  the title and the persisted layout follow what's actually on screen. */
+  onRootChanged?(root: string): void;
 }
 
 const TREE_W_KEY = "loomux.fileedit.treeW";
@@ -111,6 +132,9 @@ export class FileEditView {
    *  shell, so browsing here never disturbs the terminal or a running agent). */
   private root: string | null = null;
   private treeModel: TreeNode = makeRoot();
+  /** The in-flight (or last) load of the root's listing, so `openPath` can wait for
+   *  the tree to exist before revealing into it. Resolved when nothing is loading. */
+  private treeLoad: Promise<void> = Promise.resolve();
 
   // Header bits.
   private rootLabel: HTMLElement;
@@ -213,12 +237,17 @@ export class FileEditView {
     this.el = el("div", "fileedit");
     this.el.hidden = true;
     this.el.tabIndex = -1;
-    this.el.addEventListener("keydown", (e) => {
-      if (e.key === "Escape") {
-        e.stopPropagation();
-        void this.requestClose();
-      }
-    });
+    // Esc closes the OVERLAY. An embedded (pane-content) view has nothing to close
+    // back to, so Esc is left alone there — closing the pane on a stray Escape would
+    // be a nasty surprise with unsaved edits in the buffer.
+    if (!host.embedded) {
+      this.el.addEventListener("keydown", (e) => {
+        if (e.key === "Escape") {
+          e.stopPropagation();
+          void this.requestClose();
+        }
+      });
+    }
 
     // ---- header ----
     const head = el("div", "fileedit-head");
@@ -249,6 +278,7 @@ export class FileEditView {
 
     const closeBtn = el("button", "pane-btn close", "✕") as HTMLButtonElement;
     closeBtn.title = "Close (Esc)";
+    closeBtn.hidden = !!host.embedded; // pane content — the PANE's ✕ is the close affordance
     closeBtn.addEventListener("click", () => void this.requestClose());
 
     head.append(rootWrap, spacer, this.fileLabel, this.dirtyDot, this.findBtn, this.saveBtn, closeBtn);
@@ -342,12 +372,44 @@ export class FileEditView {
     this.agentBanner.hidden = !(this.host.isAgentWorktree?.() ?? false);
     this.refreshRootLabel();
     if (this.root) {
-      void this.reloadTree();
+      // Held so `openPath` (an editor pane opened ON a file, #217) can wait for the
+      // root's first listing instead of racing it — reloadTree() replaces treeModel
+      // wholesale, and a reveal that ran against the old one would expand nothing.
+      this.treeLoad = this.reloadTree();
+      void this.treeLoad;
     } else {
       this.treeListEl.replaceChildren(el("div", "fileedit-empty", "Pick a folder to browse."));
     }
     // No focus steal — the terminal below stays the primary input target until
     // the user clicks into the tree/editor.
+  }
+
+  /** Open `rel` (root-relative) and reveal it in the tree — the entry point for an
+   *  editor PANE opened from the file browser's "Open in file editor pane" (#217),
+   *  which creates the pane rooted at the browser's root with one file already up.
+   *  Safe to call right after `show()`: it waits for that root's first listing.
+   *
+   *  A refused open (binary, too large, a dirty buffer the human declined to discard)
+   *  leaves `openRel` where it was and is NOT followed by a reveal — same rule as the
+   *  Go-to-file jump, so the tree never points at a file the editor didn't take. */
+  async openPath(rel: string): Promise<void> {
+    await this.treeLoad;
+    await this.openFile(rel);
+    if (this.openRel === rel) await this.revealPath(rel);
+  }
+
+  /** May this view be torn down right now — is there unsaved work in the buffer?
+   *  True when it's clean, or when the human confirmed discarding it.
+   *
+   *  The host PANE calls this before closing an editor pane (#217): an editor pane is
+   *  the pane kind where loomux itself owns an unsaved buffer, so a ✕ / dock-chip ✕ /
+   *  Ctrl+Shift+W must not drop edits silently. Same guard `requestClose` applies to
+   *  the overlay's own Esc/✕ — reached from the pane-close path too. */
+  async canDiscard(): Promise<boolean> {
+    // The same pure gate the view's own Esc/✕ uses, so "dirty means ask" is stated
+    // once, in closeDecision, and cannot drift between the two.
+    if (closeDecision(this.isDirtyNow()) === "close") return true;
+    return this.confirmDiscard();
   }
 
   hide(): void {
@@ -390,7 +452,12 @@ export class FileEditView {
     if (typeof picked === "string") {
       this.root = picked;
       this.refreshRootLabel();
-      await this.reloadTree();
+      // An editor PANE (#217) adopts the new root as ITS root — title and persisted
+      // layout follow the tree the user is actually looking at. An overlay host does
+      // not implement this: there the root stays view-local by design.
+      this.host.onRootChanged?.(picked);
+      this.treeLoad = this.reloadTree();
+      await this.treeLoad;
     }
   }
 

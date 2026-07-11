@@ -19,6 +19,7 @@ import {
 } from "./pty";
 import { matchShortcut } from "./shortcuts";
 import { ftRootIsDir } from "./fileapi";
+import { gitRepoRoot } from "./git";
 import { voiceController } from "./voicecontrol";
 import { initStatusBar } from "./statusbar";
 import { initHintBar } from "./hintbar";
@@ -127,15 +128,33 @@ voiceController.init(() => activeGrid().activePane);
 function eventsFor(ws: Workspace): PaneEvents {
   return {
     onFocus: (pane) => ws.grid.setActive(pane),
-    onCloseRequest: (pane) => ws.grid.closePane(pane),
+    // Ask the pane first: an editor pane (#217) may hold unsaved edits, and this is
+    // THE human-initiated single-pane close path (header ✕, dock chip ✕, Ctrl+Shift+W —
+    // all route through Pane.requestClose). A clean pane answers true instantly, so
+    // nothing else changes shape.
+    onCloseRequest: (pane) => {
+      void pane.confirmClose().then((ok) => {
+        if (ok) ws.grid.closePane(pane);
+      });
+    },
     onSplit: (pane, dir) => openWelcomeIn(ws, dir, pane),
+    // The file browser's "Open in file editor pane" (#217): an editor pane beside the
+    // browser, in the browser's own tab. Same call the welcome flow makes.
+    onOpenEditorPane: (pane, opts) => {
+      ws.grid.openContentPane(
+        eventsFor(ws),
+        { kind: "editor", name: opts.name, root: opts.root, file: opts.file },
+        "row",
+        pane
+      );
+    },
     onMinimize: (pane) => ws.grid.minimize(pane),
     onMaximize: (pane) => ws.grid.toggleMaximize(pane),
     onToggleGroupMinimize: (pane) => {
       const groupId = pane.orchGroupId;
       if (groupId) ws.grid.toggleGroupMinimize(groupId);
     },
-    // A files pane re-rooted, or a pane was renamed: the persisted layout is stale
+    // A content pane re-rooted, or a pane was renamed: the persisted layout is stale
     // but no grid event fired, so nothing else would save it (#214).
     onRecordChanged: () => onGridChanged(),
   };
@@ -478,22 +497,51 @@ async function openActionPane(
       pane = ws.grid.openDormantPane(events, record, content, dir, anchor);
       return pane;
     }
-    case "open-files": {
-      // A file explorer comes straight back — no process, no session, no credits.
-      // The one thing that can have changed under it is the folder: deleted,
-      // renamed, or on a drive that isn't mounted this boot. A pane rooted at a
-      // vanished directory would render an empty tree and a mystery, so fail SOFT
-      // to the welcome form in that slot with a message — the human re-points it in
-      // two clicks, and the rest of the layout restores around it (#214).
+    case "open-files":
+    case "open-editor": {
+      // A file explorer / file editor comes straight back — no process, no session, no
+      // credits. The one thing that can have changed under it is the folder: deleted,
+      // renamed, or on a drive that isn't mounted this boot. A pane rooted at a vanished
+      // directory would render an empty tree and a mystery, so fail SOFT to the welcome
+      // form in that slot with a message — the human re-points it in two clicks, and the
+      // rest of the layout restores around it (#214, #217).
+      const kind = a.type === "open-files" ? "files" : "editor";
+      const what = kind === "files" ? "File explorer" : "File editor";
       const root = a.root;
       if (!root || !(await ftRootIsDir(root))) {
         showToast(
-          `File explorer "${a.name}": ${root ? `folder is gone — ${root}` : "no folder was recorded"}. Pick one to reopen it.`,
+          `${what} "${a.name}": ${root ? `folder is gone — ${root}` : "no folder was recorded"}. Pick one to reopen it.`,
           "info"
         );
         return openWelcomeIn(ws, dir, anchor);
       }
-      return ws.grid.openFilesPane(events, { name: a.name, root, background: true }, dir, anchor);
+      return ws.grid.openContentPane(events, { kind, name: a.name, root, background: true }, dir, anchor);
+    }
+    case "open-git": {
+      // Same fail-soft, stricter probe (#217): the folder can still be there and no
+      // longer be a git work tree — a removed worktree, a deleted .git, a repo restored
+      // from a backup as plain files. Ask git rather than the filesystem, so the pane
+      // never opens on something that can only tell you it isn't a repository.
+      const repo = a.repo;
+      let ok = false;
+      try {
+        ok = !!repo && (await gitRepoRoot(repo)) !== null;
+      } catch {
+        ok = false; // git missing / unreadable path — same soft landing
+      }
+      if (!ok) {
+        showToast(
+          `Git pane "${a.name}": ${repo ? `not a git repository any more — ${repo}` : "no repository was recorded"}. Pick one to reopen it.`,
+          "info"
+        );
+        return openWelcomeIn(ws, dir, anchor);
+      }
+      return ws.grid.openContentPane(
+        events,
+        { kind: "git", name: a.name, root: repo!, background: true },
+        dir,
+        anchor
+      );
     }
     case "dormant-group": {
       // The one credit/process-storm-sensitive case: keep the WHOLE group dormant.
@@ -777,11 +825,16 @@ async function handleWelcomeSubmit(
     return;
   }
 
-  if (result.kind === "files") {
-    // Convert the setup pane into a file explorer in place (#214). Synchronous —
-    // there is no process to start, so no await, no PTY, nothing to reap. The root
-    // was confirmed to exist by the form before it fired this.
-    pane.startFiles({ name: result.name, root: result.root });
+  if (result.kind === "files" || result.kind === "editor" || result.kind === "git") {
+    // Convert the setup pane into a CONTENT pane in place (#214 files, #217 editor /
+    // git). Synchronous — there is no process to start, so no await, no PTY, nothing to
+    // reap. The root was confirmed for real by the form before it fired this: a readable
+    // directory for files/editor, a git work tree for git.
+    pane.startContent(
+      result.kind === "git"
+        ? { kind: "git", name: result.name, root: result.repo }
+        : { kind: result.kind, name: result.name, root: result.root }
+    );
     // Converted in place — no grid open/close fired, so notify explicitly (this is
     // what re-renders the tab strip and re-persists the layout), same as terminal.
     onGridChanged();

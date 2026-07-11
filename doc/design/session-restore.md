@@ -78,12 +78,14 @@ resumed autonomous orchestrator (#83) can idle-tick and spawn a worker storm
 | **Agent** (has `sessionId`) | **Auto-resume** via `--resume <id>` into the idle TUI; **never** replay a queued prompt | Loads context, spends no credits — the "near-exact state" goal. |
 | **Agent** (no `sessionId`) | **Dormant** pane with a Start button, in the same cwd | Best-effort CLIs (copilot/codex/gemini) have no clean resumable id; honest, not silently broken. |
 | **Orchestrator / worker / reviewer** (`orch`) | **Dormant** — the human resumes the whole group via the existing `resumeOrchSession` | The one place a resume can actually burn credits; keep the safety stance exactly here. The rule is keyed on **kind, not the presence of an id** — a worker with a session id still stays dormant. |
-| **File explorer** (`files`, #214) | Re-open the tree at its recorded root — or, if that folder is gone, **fail soft to the welcome form** in that slot with a toast | Pure content: no process, no session, no credits, nothing to resume. The only thing that can rot under it is the *folder*, so the root is re-probed (`ftRootIsDir`) before the pane is built. Keyed on kind like the orch rule: a stray `sessionId` on a files leaf must never send it down an agent path. |
+| **File explorer** (`files`, #214) | Re-open the listing at its recorded root — or, if that folder is gone, **fail soft to the welcome form** in that slot with a toast | Pure content: no process, no session, no credits, nothing to resume. The only thing that can rot under it is the *folder*, so the root is re-probed (`ftRootIsDir`) before the pane is built. Keyed on kind like the orch rule: a stray `sessionId` on a files leaf must never send it down an agent path. |
+| **File editor** (`editor`, #217) | Re-open the editor at its recorded root; same `ftRootIsDir` probe, same fail-soft | Same reasoning. What is **not** restored: the open file and its buffer. Persisting an unsaved buffer would make the layout file a second, silent copy of the user's work — the close guard (`Pane.confirmClose`) is what ensures they were *asked* before it could be lost, and a snapshot that quietly preserves it undermines exactly that. |
+| **Git** (`git`, #217) | Re-open the git view over its recorded repo — probed with **`gitRepoRoot`**, not `ftRootIsDir` | A folder can still exist and no longer be a work tree (a pruned worktree, a deleted `.git`, a repo restored from backup as plain files), and a git pane over a non-repo can only tell you it isn't one. Also **not** restored: the selected worktree and the read-only unlock (#208) — a restored pane opens on the primary, locked, like a fresh one. An unlock that survived a restart is the one piece of this pane's state that could quietly cost you something. |
 
-The `files` kind needed **no schema change**: its root rides in the existing
-`cwd`, so `SCHEMA_VERSION` stays at 2 and older files (which simply never contain
-a `files` leaf) decode unchanged — the same shape-driven, additive move `role`
-made in #194.5. A rootless `files` leaf is *well-formed but unrestorable*, so it
+None of the content kinds needed a **schema change**: each one's root rides in the
+existing `cwd`, so `SCHEMA_VERSION` stays at 2 and older files (which simply never
+contain such a leaf) decode unchanged — the same shape-driven, additive move `role`
+made in #194.5. A rootless content leaf is *well-formed but unrestorable*, so it
 decodes (rather than triggering the whole-tree fail-safe and taking its sibling
 panes down with it) and is resolved in the one slot at restore time.
 

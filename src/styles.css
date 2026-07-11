@@ -875,34 +875,37 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .pane.is-welcome .pane-meta-item,
 .pane.is-welcome .pane-btn:not(.close) { display: none; }
 
-/* ---------- file-explorer pane (#214) ---------- */
-/* A pane whose content IS the file tree + editor — no terminal underneath, no
-   PTY, ever. Same in-pane content mechanics as the welcome surface above: the
-   (empty, never-opened) .pane-term stays in the flow and this covers it, so the
-   pane's own chrome — splits, drag/dock, maximize, minimize — needs no special
-   case. Nothing here can resize a ConPTY, because there isn't one.
+/* ---------- content panes (#214 files · #217 editor, git) ---------- */
+/* A pane whose content IS a surface — the file manager, the file editor, or the git
+   view — with no terminal underneath and no PTY, ever. Same in-pane content mechanics
+   as the welcome surface above: the (empty, never-opened) .pane-term stays in the flow
+   and this covers it, so the pane's own chrome — splits, drag/dock, maximize, minimize
+   — needs no special case. Nothing here can resize a ConPTY, because there isn't one.
 
-   Chrome that describes a SHELL is hidden: the folder chip cd's a shell, the
-   branch chip opens the git view, and the git/issues/file-editor buttons open
-   overlays sized against the terminal's height (see Pane.refuseOverlay). What
-   stays is what still means something: rename, "open in editor", split, dock,
-   maximize, close. */
+   Chrome that describes a SHELL is hidden: the folder chip cd's a shell, the branch chip
+   opens the git overlay, and the git/issues/file-editor buttons open overlays sized
+   against the TERMINAL's height (see Pane.refuseOverlay — the overlays are the one thing
+   that genuinely needs a terminal to measure). What stays is what still means something:
+   rename, "open in editor", split, dock, maximize, close. */
 /* Same rule, same reason: hide the chip ITEMS, never `.pane-meta` itself. It is the
    header's flex spacer, and removing it collapsed this pane's whole button cluster to the
-   left of the header while every other pane kind kept it on the right (human demo, final
-   round). The buttons now align, order and space exactly like a terminal pane's, because
+   left of the header while every other pane kind kept it on the right (human demo, #214
+   final round). The buttons align, order and space exactly like a terminal pane's, because
    they are laid out by exactly the same rules. */
-.pane.is-files .pane-meta-item,
-.pane.is-files .pane-btn.pty-only { display: none; }
+.pane.is-content .pane-meta-item,
+.pane.is-content .pane-btn.pty-only { display: none; }
 
-.pane-files {
+.pane-content {
   position: absolute; top: var(--pane-header-h); left: 0; right: 0; bottom: 0;
   z-index: 5;
   display: flex; flex-direction: column; min-height: 0;
   background: var(--bg-app);
 }
-/* The file MANAGER fills the pane's body. (.fileexp is `flex: 1` and lays itself
-   out; it only needs a box to fill.) */
+/* The hosted surface fills the pane's body. All three (.fileexp, .fileedit, .pane-git)
+   are already `flex: 1` and lay themselves out inside whatever box they're given — which
+   is the whole of the sizing generalization the git view needed to become pane content:
+   its inner dividers clamp against its OWN live size (its ResizeObserver), never against
+   a terminal. The overlay path (.git-overlay) is untouched. */
 
 /* ---------- the file manager (#214) ---------- */
 /* Explorer/Finder-equivalent: toolbar + breadcrumb, a Go-to-file box, and a

@@ -11,6 +11,7 @@ import {
   SubmitLatch,
   shellKindOptions,
   resolveShellKind,
+  isContentKind,
   type PaneSetupInput,
 } from "../src/panesetup.ts";
 
@@ -134,6 +135,58 @@ test("a file explorer's name defaults to the folder's own short name", () => {
   const res = planPaneSetup(input({ kind: "files", repo: "C:\\Projects\\loomux\\", name: "" }));
   assert.ok(res.ok && res.plan.kind === "files");
   assert.equal(res.plan.name, "loomux");
+});
+
+// ---------- editor + git (#217) ----------
+
+test("an editor pane needs a folder, and a git pane needs a repository", () => {
+  // Same rule as the files kind, same reason: "home" is not a project to edit, and it is
+  // certainly not a repository. A content pane with no root has no content — so this
+  // bounces the user back to the field instead of opening an empty pane.
+  const editor = planPaneSetup(input({ kind: "editor", repo: "  " }));
+  assert.ok(!editor.ok && editor.focus === "repo");
+  assert.match(editor.ok ? "" : editor.error, /folder/i);
+
+  const git = planPaneSetup(input({ kind: "git", repo: "" }));
+  assert.ok(!git.ok && git.focus === "repo");
+  assert.match(git.ok ? "" : git.error, /repositor/i);
+});
+
+test("an editor pane plans a root + name, and nothing else — no command, no shell", () => {
+  // Deep-equal, not a spot-check: this kind carries NO spawn inputs, and a command/argv/
+  // shellKind sneaking into the plan would mean something is about to start a process in
+  // a pane that must never have one.
+  const res = planPaneSetup(input({ kind: "editor", repo: "  C:/Projects/loomux  ", name: " code " }));
+  assert.ok(res.ok);
+  assert.deepEqual(res.plan, { kind: "editor", root: "C:/Projects/loomux", name: "code" });
+});
+
+test("a git pane plans a repo + name, and nothing else", () => {
+  const res = planPaneSetup(input({ kind: "git", repo: " /repo/x ", name: "  " }));
+  assert.ok(res.ok);
+  // Whether /repo/x is REALLY a git work tree is I/O — the form asks git (gitRepoRoot)
+  // before it fires, and this module deliberately doesn't pretend it can know.
+  assert.deepEqual(res.plan, { kind: "git", repo: "/repo/x", name: "x" });
+});
+
+test("both new kinds default their name to the root's own short name", () => {
+  const editor = planPaneSetup(input({ kind: "editor", repo: "C:\\Projects\\loomux\\", name: "" }));
+  assert.ok(editor.ok && editor.plan.kind === "editor");
+  assert.equal(editor.plan.name, "loomux");
+
+  const git = planPaneSetup(input({ kind: "git", repo: "C:\\Projects\\loomux\\", name: "" }));
+  assert.ok(git.ok && git.plan.kind === "git");
+  assert.equal(git.plan.name, "loomux");
+});
+
+test("isContentKind names exactly the PTY-less kinds — the ones that spawn nothing", () => {
+  // The welcome form hides every CLI/shell/worktree field off this one predicate, and the
+  // pane system keys "no PTY, ever" off the same idea. A kind added to one list and not
+  // the other is how a content pane ends up being asked which shell it wants.
+  assert.deepEqual(
+    (["agent", "orchestrator", "terminal", "files", "editor", "git"] as const).filter(isContentKind),
+    ["files", "editor", "git"]
+  );
 });
 
 // ---------- agent ----------

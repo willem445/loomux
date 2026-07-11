@@ -104,6 +104,10 @@ test("a FILE gets the full menu, including Hash with all six algorithms", () => 
     "Open (default app)",
     "Open with…",
     "Reveal in file explorer",
+    // The in-app counterpart to the OS hand-off above it (#217): loomux's own editor,
+    // in a new pane. Sits with the other "open this somewhere" items, not with the
+    // mutating ops below the separator.
+    "Open in file editor pane",
     "Rename…",
     "Delete (to Recycle Bin)",
     "Hash",
@@ -252,6 +256,7 @@ test("a SYMLINK's row actions are all greyed with a reason — it is shown, and 
     "Open (default app)",
     "Open with…",
     "Reveal in file explorer",
+    "Open in file editor pane",
     "Rename…",
     "Delete (to Recycle Bin)",
     "Hash",
@@ -272,12 +277,37 @@ test("menuActions walks submenus, so nothing offered is unreachable", () => {
     "open",
     "open-with",
     "reveal",
+    "edit-pane",
     "rename",
     "delete",
     "hash",
     "new-folder",
     "new-file",
   ]));
+});
+
+// ---------- open in an editor pane (#217) ----------
+
+test("a FILE offers 'Open in file editor pane', bound to that file's path", () => {
+  // The in-app answer to Open, which hands the file to the OS default app: a .png belongs
+  // in an image viewer, a .ts belongs in loomux's editor. The action carries the row's
+  // PATH (bound at menu-open), so the pane it opens edits the file that was clicked —
+  // not whatever the list has re-ranked to by the time the item is chosen.
+  const menu = buildContextMenu(fileTarget, WIN, HASH_ALGOS);
+  const item = must(menu, "Open in file editor pane");
+  assert.ok(!item.disabled);
+  assert.deepEqual(item.action, { kind: "edit-pane", target: fileTarget });
+});
+
+test("a FOLDER offers it too, and the label says what it will actually do", () => {
+  // An editor pane is rooted at a DIRECTORY, so "open this folder in an editor pane" is
+  // the same action with nothing to open in it. The label admits that rather than
+  // pretending a folder can be edited — and the item isn't disabled, because it works.
+  const menu = buildContextMenu(dirTarget, WIN, HASH_ALGOS);
+  assert.equal(find(menu, "Open in file editor pane"), undefined);
+  const item = must(menu, "Open folder in editor pane");
+  assert.ok(!item.disabled);
+  assert.deepEqual(item.action, { kind: "edit-pane", target: dirTarget });
 });
 
 // ---------- a delete in flight (#216) ----------
@@ -294,11 +324,18 @@ test("while a delete is in flight, the menu greys the ops that would mutate the 
   assert.ok(created.every((c) => c.disabled && c.reason === busy), "New → Folder/File too");
 });
 
-test("…but Open, Reveal and Hash stay live — they read, they don't write", () => {
+test("…but Open, Reveal, Hash and open-in-editor-pane stay live — they read, they don't write", () => {
   // The same rule the op-state machine enforces: freezing the read paths would be the
-  // main-thread freeze all over again, just moved into the menu.
+  // main-thread freeze all over again, just moved into the menu. Opening the file in an
+  // editor pane (#217) reads it into a new pane — it mutates nothing here, so a delete
+  // running elsewhere in the tree is no reason to withhold it.
   const items = buildContextMenu(fileTarget, WIN, HASH_ALGOS, "Deleting…");
-  for (const label of ["Open (default app)", "Open with…", "Reveal in file explorer"]) {
+  for (const label of [
+    "Open (default app)",
+    "Open with…",
+    "Reveal in file explorer",
+    "Open in file editor pane",
+  ]) {
     assert.ok(!must(items, label).disabled, `${label} must stay usable during a delete`);
   }
   assert.ok(must(items, "Hash").children!.every((c) => !c.disabled), "hashing stays live");

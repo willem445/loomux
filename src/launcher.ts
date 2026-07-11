@@ -11,9 +11,15 @@
 //   File explorer— a PTY-less pane hosting a native-style file MANAGER rooted at a
 //                  folder (#214): browse, open a file in the OS default app for its
 //                  extension, new folder / rename / delete, jump-to-file by name.
-//                  Its only input is that folder, and it is validated for real (does
-//                  the directory exist?) before the pane is made, so a typo'd path
-//                  shows an inline error instead of a broken pane.
+//   File editor  — a PTY-less pane hosting the #174 file tree + code editor + #207
+//                  search, rooted at a folder (#217). The Alt+F overlay, as a pane.
+//   Git          — a PTY-less pane hosting the git view over a repo (#217): graph,
+//                  status, diffs, staging, #208 worktree switching. The Alt+G
+//                  overlay, as a pane.
+//
+// The three CONTENT kinds take exactly one input — the folder / repo — and it is
+// validated for REAL before the pane is made (does the directory exist? is it a git
+// work tree?), so a typo'd path shows an inline error instead of a broken pane.
 //
 // This replaces the old modal launcher AND the global "agent mode" toggle: there
 // is no global mode anymore, every pane declares its kind here at creation. The
@@ -23,7 +29,7 @@
 
 import { open } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
-import { gitWorktreeAdd } from "./git";
+import { gitWorktreeAdd, gitRepoRoot } from "./git";
 import type { OrchestratorConfig } from "./orchestration";
 import type { PaneKind, PaneSetupInput, ShellKind, ShellKindAvailability } from "./panesetup";
 import {
@@ -32,6 +38,7 @@ import {
   SubmitLatch,
   shellKindOptions,
   resolveShellKind,
+  isContentKind,
 } from "./panesetup";
 import { discoverGitBash } from "./pty";
 import { ftRootIsDir } from "./fileapi";
@@ -67,7 +74,12 @@ export type WelcomeResult =
   | { kind: "orchestrator"; config: OrchestratorConfig }
   /** A file-explorer pane (#214): `root` is a directory this form has already
    *  confirmed exists, so the caller converts the setup pane in place. */
-  | { kind: "files"; name: string; root: string };
+  | { kind: "files"; name: string; root: string }
+  /** A file-editor pane (#217): same contract, same confirmed-directory `root`. */
+  | { kind: "editor"; name: string; root: string }
+  /** A git pane (#217): `repo` is a directory this form has already confirmed is
+   *  inside a git work tree (`gitRepoRoot`), so the pane can't open on a non-repo. */
+  | { kind: "git"; name: string; repo: string };
 
 /** Orchestration roles the setup form configures a CLI + model for. Mirrors the
  *  backend `Role` variants that can be spawned in a group (issue #4/#47). */
@@ -302,6 +314,8 @@ export class WelcomeForm {
       ["orchestrator", "Orchestrator + workers"],
       ["terminal", "Terminal — a shell"],
       ["files", "File explorer — browse files, open in their default app"],
+      ["editor", "File editor — tree + code editor, rooted at a folder"],
+      ["git", "Git — graph, status, diffs and worktrees for a repo"],
     ]);
     this.kindSel.addEventListener("change", () => this.applyKind());
 
@@ -549,10 +563,10 @@ export class WelcomeForm {
     const agent = k === "agent";
     const orch = k === "orchestrator";
     const term = k === "terminal";
-    const files = k === "files";
-    // A file explorer picks no CLI and spawns nothing: its ONLY input is the folder
-    // (plus a name), so every other field is out (#214).
-    this.agentField.hidden = term || files; // agent + orchestrator both pick a CLI
+    const content = isContentKind(k);
+    // A content pane picks no CLI and spawns nothing: its ONLY input is the folder /
+    // repo (plus a name), so every other field is out (#214, #217).
+    this.agentField.hidden = term || content; // agent + orchestrator both pick a CLI
     this.customField.hidden = !agent || this.agentSel.value !== "custom";
     this.countField.hidden = !agent;
     this.shellField.hidden = !term;
@@ -560,11 +574,17 @@ export class WelcomeForm {
     this.autopilotField.hidden = !agent;
     this.orchFields.hidden = !orch;
     this.nameField.hidden = orch; // orchestrator names its panes from the roles
-    // Same control, honest caption: a folder to browse, not a repository to work in.
-    this.repoLabel.textContent = files ? "Folder" : "Repository";
-    this.repoInput.placeholder = files
-      ? "Folder to browse — required"
-      : "Repository or folder — empty for home";
+    // Same control, honest caption per kind: a folder to browse or edit, a repository
+    // to view — not "a repository to work in".
+    this.repoLabel.textContent = k === "files" || k === "editor" ? "Folder" : "Repository";
+    this.repoInput.placeholder =
+      k === "files"
+        ? "Folder to browse — required"
+        : k === "editor"
+          ? "Folder to edit — required"
+          : k === "git"
+            ? "Repository — required"
+            : "Repository or folder — empty for home";
     this.applyOrchCli();
     this.applyAutopilot();
     this.updateName();
@@ -659,9 +679,9 @@ export class WelcomeForm {
   }
 
   /** The program a given launch would execute (first token of the command), or
-   *  null for a terminal / file explorer (no CLI to probe — neither runs one). */
+   *  null for a terminal / content pane (no CLI to probe — none of them runs one). */
   private currentProgram(): string | null {
-    if (this.kind === "terminal" || this.kind === "files") return null;
+    if (this.kind === "terminal" || isContentKind(this.kind)) return null;
     if (this.kind === "orchestrator") return this.orchCliFor(this.agentSel.value).id;
     const agent = AGENTS.find((a) => a.id === this.agentSel.value) ?? AGENTS[0];
     const command = agent.id === "custom" ? this.customInput.value.trim() : agent.command;
@@ -680,7 +700,7 @@ export class WelcomeForm {
    *  mode every role's CLI is checked; the first missing one is surfaced.
    *  Terminals have no CLI, so the warning is cleared. */
   private updateAgentWarning(): void {
-    if (this.kind === "terminal" || this.kind === "files") {
+    if (this.kind === "terminal" || isContentKind(this.kind)) {
       this.agentWarn.classList.remove("visible"); // no CLI involved — nothing to warn about
       return;
     }
@@ -715,15 +735,17 @@ export class WelcomeForm {
   }
 
   /** Auto-fill the pane name until hand-edited: `agent · where` for an agent,
-   *  `shell · where` for a terminal, the folder's own name for a file explorer. */
+   *  `shell · where` for a terminal, the folder/repo's own name for a content pane. */
   private updateName(): void {
     if (this.nameDirty) return;
     const where =
       this.worktreeInput.value.trim() || basename(this.repoInput.value.trim()) || "home";
-    if (this.kind === "files") {
+    if (isContentKind(this.kind)) {
       // The root's short name IS the useful title here — a "files · " prefix would
-      // just eat width in the header for something the pane's icon already says.
-      this.nameInput.value = basename(this.repoInput.value.trim()) || "files";
+      // just eat width in the header for something the pane's content already says.
+      // (Falls back to the kind's own name for an empty path, which validation is
+      // about to bounce anyway.)
+      this.nameInput.value = basename(this.repoInput.value.trim()) || this.kind;
       return;
     }
     if (this.kind === "terminal") {
@@ -828,9 +850,9 @@ export class WelcomeForm {
       return;
     }
 
-    if (plan.kind === "files") {
+    if (plan.kind === "files" || plan.kind === "editor") {
       // The root must really be there. A terminal or agent in a bad cwd at least
-      // fails loudly in its own output; a file explorer would just render an empty
+      // fails loudly in its own output; a content pane would just render an empty
       // tree with no explanation — so probe first and bounce the user back to the
       // field with an inline error, exactly like a missing CLI (#214).
       this.setBusy(true, "Opening…");
@@ -842,7 +864,43 @@ export class WelcomeForm {
         return;
       }
       addRecentRepo(plan.root);
-      this.fire({ kind: "files", name: plan.name, root: plan.root });
+      this.fire({ kind: plan.kind, name: plan.name, root: plan.root });
+      return;
+    }
+
+    if (plan.kind === "git") {
+      // A git pane over a folder that isn't a repo is a pane that can only say "not a
+      // git repository" — so ask git, here, while the human is still in the field that
+      // caused it (#217). `gitRepoRoot` accepts any directory INSIDE a work tree, which
+      // is the honest bar: the view resolves the top level itself, and picking a
+      // subfolder of your repo should just work.
+      this.setBusy(true, "Opening…");
+      let root: string | null;
+      try {
+        root = await gitRepoRoot(plan.repo);
+      } catch (err) {
+        // git missing from PATH, or an unreadable path — say which, don't guess.
+        this.showError(
+          String(err) === "git-not-found" ? "git was not found on PATH." : `git error: ${String(err)}`
+        );
+        this.repoInput.focus();
+        this.setBusy(false);
+        this.latch.release();
+        return;
+      }
+      if (!root) {
+        this.showError(`Not a git repository: ${plan.repo}`);
+        this.repoInput.focus();
+        this.setBusy(false);
+        this.latch.release();
+        return;
+      }
+      addRecentRepo(plan.repo);
+      // Hand over what the human typed, not the resolved top level: a repo path is the
+      // pane's identity and the view re-resolves it anyway — and inside a linked
+      // worktree, `--show-toplevel` is that worktree, which is exactly the pane the
+      // human asked for.
+      this.fire({ kind: "git", name: plan.name, repo: plan.repo });
       return;
     }
 

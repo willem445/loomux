@@ -19,12 +19,13 @@
 //                 the ONE place a resume can actually burn credits — a resumed
 //                 autonomous orchestrator (#83) may idle-tick and spawn a worker
 //                 storm (#78) — so the credit-safety stance stays exactly here.
-//   - Files     → re-open the file-explorer pane at its recorded root (#214).
-//                 No process, no session, nothing to resume — it's pure content,
-//                 so it comes straight back. Whether the root still EXISTS is
-//                 I/O, which this pure module can't do: `open-files` carries the
-//                 recorded root (possibly null) and the caller fails soft to the
-//                 welcome form in that slot when the folder is gone.
+//   - Content   → re-open the pane at its recorded root: the file MANAGER (#214),
+//                 the file EDITOR, or the GIT view (#217). No process, no session,
+//                 nothing to resume — they're pure content, so they come straight
+//                 back. Whether the root still exists (and, for git, is still a
+//                 repo) is I/O, which this pure module can't do: each action carries
+//                 the recorded root (possibly null) and the caller fails soft to the
+//                 welcome form in that slot when the probe says no.
 //
 // Flip AUTO_RESUME_AGENTS to false to make EVERY agent restore dormant instead —
 // the plan's promised one-line switch, kept literally one line here.
@@ -85,11 +86,31 @@ export type RestoreAction =
       // or resume — but `root` may be null (a record written without one) or name
       // a folder that has since been deleted/renamed/unmounted. The caller probes
       // it and, when it isn't a readable directory, opens the WELCOME form in that
-      // slot with a message instead — a broken tree pane would be worse than a
+      // slot with a message instead — a broken listing pane would be worse than a
       // legible "pick a folder".
       type: "open-files";
       name: string;
       root: string | null;
+    }
+  | {
+      // A file-EDITOR pane (#217), back at its recorded root. Same contract as
+      // open-files, same probe (is this still a readable directory?), same fail-soft.
+      // Unsaved buffers are NOT persisted: the layout records where the pane was
+      // rooted, never what was typed into it — capturing an unsaved buffer would be a
+      // second, silent copy of the user's file, and the close guard (confirmClose) is
+      // what makes sure they were asked before it could be lost.
+      type: "open-editor";
+      name: string;
+      root: string | null;
+    }
+  | {
+      // A GIT pane (#217), back over its recorded repo. The probe here is stricter
+      // than a directory check — the folder can still exist and no longer be a git
+      // work tree (deleted .git, a worktree pruned since) — so the caller resolves
+      // it with `gitRepoRoot` and fails soft to the welcome form when it isn't one.
+      type: "open-git";
+      name: string;
+      repo: string | null;
     };
 
 /** True when a recorded agent session id still has a resumable conversation on
@@ -117,6 +138,18 @@ export function planPaneRestore(pane: PersistedPane, resumable?: SessionResumabl
       // Pure content: no process, no credits, no session — it just comes back at
       // the root it was captured with (which lives in `cwd`).
       return { type: "open-files", name: pane.name, root: pane.cwd };
+    case "editor":
+      // Same deal (#217). The pane comes back rooted where it was; the FILE that was
+      // open — and anything unsaved in it — is deliberately not persisted (see the
+      // action's comment above).
+      return { type: "open-editor", name: pane.name, root: pane.cwd };
+    case "git":
+      // Same deal (#217), over a repo instead of a folder. The worktree SELECTION and
+      // the read-only unlock (#208) are view state, not layout: a restored git pane
+      // opens on the primary worktree, locked, exactly like a freshly opened one — an
+      // unlock that survived a restart would be the one piece of this pane's state
+      // that could quietly cost you something.
+      return { type: "open-git", name: pane.name, repo: pane.cwd };
     case "agent":
       // Auto-resume when we have a session id AND the hybrid is enabled; else a
       // dormant Start placeholder (no id to resume into, or the flip is off).

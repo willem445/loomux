@@ -287,6 +287,87 @@ test("a files leaf with no root decodes (null) rather than dropping the whole ta
   assert.equal(filesLeaf.pane.cwd, null);
 });
 
+// ---------- #217 editor + git leaves ----------
+
+test("editor and git leaves round-trip their root — still no new field, still v2", () => {
+  // The third and fourth members of the same family (#214's files was the first). The
+  // editor's FOLDER and the git pane's REPO both ride in the existing `cwd`, so this is
+  // additive in exactly the way `role` and the files root were: a decoder that has never
+  // heard of these kinds is not needed, because old snapshots simply never carry them.
+  const mk = (paneKind: PersistedPane["paneKind"]): PersistedPane => ({
+    paneKind,
+    name: "loomux",
+    cwd: "C:/Projects/loomux",
+    command: null,
+    argv: null,
+    shellKind: null,
+    sessionId: null,
+    role: null,
+  });
+  const state: PersistedTabs = {
+    tabs: [
+      {
+        name: "t",
+        color: null,
+        groupId: null,
+        layout: {
+          kind: "split",
+          dir: "row",
+          weight: 1,
+          children: [
+            { kind: "leaf", weight: 1, pane: mk("editor") },
+            { kind: "leaf", weight: 1, pane: mk("git") },
+          ],
+        },
+      },
+    ],
+    activeIndex: 0,
+  };
+  const back = decodeTabs(encodeTabs(state));
+  const layout = back?.tabs[0].layout;
+  assert.ok(layout?.kind === "split");
+  assert.deepEqual(layout.children[0].kind === "leaf" && layout.children[0].pane, mk("editor"));
+  assert.deepEqual(layout.children[1].kind === "leaf" && layout.children[1].pane, mk("git"));
+  assert.equal(back?.schemaVersion, 2, "additive — a bump here would be a false signal");
+});
+
+test("a rootless editor/git leaf decodes (null) rather than dropping the whole tab layout", () => {
+  // Same fail-soft as the files leaf: well-formed but unrestorable is NOT malformed, and
+  // killing the tab's whole layout over one such leaf would punish every sibling pane.
+  const raw = JSON.stringify({
+    tabs: [
+      {
+        name: "t",
+        color: null,
+        groupId: null,
+        layout: {
+          kind: "split",
+          dir: "row",
+          weight: 1,
+          children: [
+            { kind: "leaf", weight: 1, pane: { paneKind: "terminal", name: "shell" } },
+            { kind: "leaf", weight: 1, pane: { paneKind: "editor", name: "editor" } }, // no cwd
+            { kind: "leaf", weight: 1, pane: { paneKind: "git", name: "git" } }, // no cwd
+          ],
+        },
+      },
+    ],
+    activeIndex: 0,
+  });
+  const layout = decodeTabs(raw)?.tabs[0].layout;
+  assert.ok(layout?.kind === "split");
+  assert.equal(layout.children.length, 3, "the sibling terminal survives");
+  for (const [i, kind] of [
+    [1, "editor"],
+    [2, "git"],
+  ] as const) {
+    const leaf = layout.children[i];
+    assert.ok(leaf.kind === "leaf");
+    assert.equal(leaf.pane.paneKind, kind);
+    assert.equal(leaf.pane.cwd, null);
+  }
+});
+
 test("a malformed layout node degrades that tab's whole layout to null (not a throw)", () => {
   const raw = JSON.stringify({
     tabs: [

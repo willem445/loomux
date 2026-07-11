@@ -44,18 +44,20 @@ has **no PTY, ever** — its content *is* the `FileExplorerView`.
 
 This is less of a leap than it sounds, because #194 already built the machinery: a
 welcome (setup-state) pane and a dormant restore placeholder are both panes that
-exist, sit in the split tree, and hold no process. `Pane.startFiles()` is the third
-member of that family, and it follows the same recipe:
+exist, sit in the split tree, and hold no process. `Pane.startContent()` (which #217
+generalized from this pane's `startFiles()`) is the third member of that family, and
+it follows the same recipe:
 
 - the terminal is **never opened** (`term.open()` is not called), so there is no
   ConPTY and therefore nothing that could ever be resized — CLAUDE.md hard
   constraint #1 holds by construction rather than by care;
-- `.pane-term` stays in the flow, empty, and `.pane-files` covers it exactly the
+- `.pane-term` stays in the flow, empty, and `.pane-content` covers it exactly the
   way `.pane-welcome` does. The grid, the dock, drag-to-reorder, maximize and the
   divider math are all untouched, because from their point of view nothing is
   unusual about this pane;
-- `filesRoot !== null` **is** the kind flag, and it doubles as the pane's `cwd`, so
-  "open in editor" (`Alt+E`) and `capture()` both target the folder on screen.
+- `contentKind !== null` **is** the kind flag (it was `filesRoot`, until #217 made
+  this a family of three), and the root doubles as the pane's `cwd`, so "open in
+  editor" (`Alt+E`) and `capture()` both target the folder on screen.
 
 Two latent bugs fell out of the audit and are fixed here for *every* PTY-less pane,
 not just the new one: `tryWebgl()` and `serializeViewportHtml()` now bail when
@@ -173,10 +175,15 @@ open into a zero-height box.
 Making them work needs a **second sizing model** for overlays that don't assume a
 terminal underneath. That is real work and it isn't what #214 is about, so the
 overlays are cleanly **off** on a files pane rather than half-working: the buttons
-carry a `pty-only` class and are hidden by `.pane.is-files`, and the hotkey path is
-answered by `Pane.refuseOverlay()` with an honest toast. The git view over a files
-root is the one worth revisiting — the deferral is tracked on the issue
-([#214 comment](https://github.com/willem445/loomux/issues/214#issuecomment-4942018258)).
+carry a `pty-only` class and are hidden by `.pane.is-content` (was `.is-files`), and
+the hotkey path is answered by `Pane.refuseOverlay()` with an honest toast.
+
+> **Answered in #217, by the other road.** You don't overlay a git view onto a
+> content pane — you **open a git pane**: the same view as a pane's content, sized by
+> the pane's own box (it re-clamps its inner layout against its own element, and
+> always did). Same for the editor. The refusal above stands for the surfaces that
+> genuinely need a terminal underneath; the ones that never did are now pane kinds.
+> See [content-panes.md](content-panes.md).
 
 ## "Go to file" — the fast file-NAME search
 
@@ -680,8 +687,8 @@ agents that don't exist. There's a test pinning that.
 | Piece | File | Role |
 | --- | --- | --- |
 | Kind + root validation | `src/panesetup.ts` | `PaneKind` gains `"files"`; `planPaneSetup` requires a root (no home fallback — a manager rooted at `~` is never what anyone meant). Unit-tested. |
-| The pane | `src/pane.ts` | `startFiles()`, `isFiles`, `workdir`, `refuseOverlay()`, the `liveKind`/`capture`/`tabPaneInfo` arms. DOM-coupled → hand-validated. |
-| Placement | `src/grid.ts` | `openFilesPane()` — like `openWelcomePane`, but content instead of a form. Synchronous: there's no process to await. |
+| The pane | `src/pane.ts` | `startContent()` (`startFiles()` before #217), `isContent`, `workdir`, `refuseOverlay()`, the `liveKind`/`capture`/`tabPaneInfo` arms. DOM-coupled → hand-validated. |
+| Placement | `src/grid.ts` | `openContentPane()` (`openFilesPane()` before #217) — like `openWelcomePane`, but content instead of a form. Synchronous: there's no process to await. |
 | The manager | `src/fileexplorer.ts` | Toolbar, breadcrumb, listing, inline edits, Go-to-file. DOM wiring only. |
 | Its pure core | `src/fileexplorermodel.ts` | Listing order, rooted navigation, breadcrumb, formatting, inline-edit validation; `activeTarget` (which view an op resolves against), `editMountFor` (the view state an editor needs before it can mount), `mountBlocker` (whether the target's row can be rendered at all), and `ROW_AFFORDANCES` (the view-parity registry). Unit-tested. |
 | Name ranking | `src/filematch.ts` | Substring + path-segment, best-occurrence, deterministic ties. Unit-tested. |
@@ -702,8 +709,9 @@ agents that don't exist. There's a test pinning that.
 - **Multi-select, copy/move, drag-and-drop.** The issue's "etc." — v1 is the op set
   the human named. Multi-select is the natural next one, and the op layer is
   shaped for it (`fm_delete` takes one `rel`; taking a list is additive).
-- **Git view over a files root** — needs the second overlay sizing model. Tracked on
-  the issue.
+- ~~**Git view over a files root**~~ — **done in #217**, not by growing a second
+  overlay sizing model but by making the git view a **pane kind** of its own (and the
+  editor too). See [content-panes.md](content-panes.md).
 - **Restoring the sub-folder** you had navigated to (see *Session restore*).
 - **Deleting/renaming a symlink itself** (never its target) — see the symlink
   section above; needs `ensure_no_symlink` to grow a final-component-may-be-a-link

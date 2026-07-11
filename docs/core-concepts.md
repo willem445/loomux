@@ -34,6 +34,45 @@ There is no global mode — each pane declares its own kind:
 | **Orchestrator + workers** | An orchestrator pane plus idle workers, in its own project tab, with guardrails. See the [orchestration guide](orchestration). |
 | **Terminal** | A plain shell — PowerShell, Command Prompt, or Git Bash. |
 | **File explorer** | A native-style **file manager** rooted at a folder you choose. |
+| **File editor** | The file tree + code editor (the `Alt+F` surface) as a pane, rooted at a folder you choose. |
+| **Git** | The git view (the `Alt+G` surface) as a pane, over a repo you choose. |
+
+The last three are **content panes**: a pane that *is* a surface rather than a
+process. No shell, no CLI, no PTY — just the surface, in a pane. They split, dock,
+drag, maximize and restore exactly like a terminal pane, and they never count
+toward a tab's agent badge, because a viewer is not an agent.
+
+### The file editor and git panes
+
+The `Alt+F` editor and the `Alt+G` git view are **overlays**: they float over a
+terminal pane, so you can see the shell underneath, and they go away when you press
+`Esc`. That's right for a quick look. It's wrong when you want the surface to *stay*
+— you end up toggling it in and out, or you give up a whole terminal to it.
+
+So both are also **pane kinds**. Pick **File editor** on the welcome screen, give it
+a folder, and the pane is the editor: tree, code editor, project-wide search and
+replace, permanently. Pick **Git**, give it a repo, and the pane is the git view:
+graph, status, diffs, staging, and worktree switching. Split one beside your agent
+and it stays put while the agent works.
+
+What differs from the overlay, and only this:
+
+- **No ✕, no `Esc`-to-close.** There is nothing to close back to — the *pane's* ✕
+  closes it, like any pane.
+- **The pane adopts a re-root.** Change the editor's root folder from its header and
+  the pane follows: its title updates and session restore reopens *that* folder. (In
+  the overlay, browsing elsewhere is deliberately view-local — it must not disturb
+  the terminal underneath.)
+- **Unsaved edits are guarded at the pane boundary.** An editor pane holds real
+  buffers, so closing it with unsaved changes asks first — from the header ✕, from
+  its dock chip, or from `Ctrl+Shift+W`. All three ask the same question.
+
+`Alt+F` / `Alt+G` inside a terminal or agent pane are **unchanged** — same overlay,
+same sizing, same `Esc`. Inside a content pane, they simply focus it: the pane
+already *is* the surface.
+
+Everything else is the same code. The editor pane is the same editor; the git pane
+is the same git view, worktree switching included.
 
 ### The file explorer pane
 
@@ -66,9 +105,16 @@ window per project.
 #### Right-click menu
 
 Right-click a row for **Open**, **Open with…** (the OS chooser — Windows only), **Reveal
-in file explorer** (opens your OS file manager with the file selected), **Rename**,
-**Delete**, **Hash →**, and **New →**. Right-click the empty space below the rows for
-**New →** on its own.
+in file explorer** (opens your OS file manager with the file selected), **Open in file
+editor pane**, **Rename**, **Delete**, **Hash →**, and **New →**. Right-click the empty
+space below the rows for **New →** on its own.
+
+**Open in file editor pane** is the in-app counterpart to **Open**: where *Open* hands
+the file to the application your OS associates with it, this opens it in loomux's own
+editor, in a new pane beside the browser — rooted where the browser is rooted, so the
+editor's tree shows the same project. On a folder the item reads **Open folder in editor
+pane** and roots the new pane at that folder. Either way the browser stays exactly where
+it was: opening a file elsewhere is no reason to move the list you opened it from.
 
 The menu acts on **the row you right-clicked** — always, even if the list re-sorts or a
 search finishes underneath it while the menu is open. It works the same on a **Go-to-file
@@ -121,10 +167,11 @@ the file *in the editor* instead.)
 
 It has no terminal underneath and never starts a process. That means the
 terminal-oriented chrome is gone from its header (no folder or branch chip; the
-git, issues, and file-editor overlays don't apply — `Alt+G` / `Alt+I` will tell you
-so). Everything else is a normal pane: it splits, drags, docks, maximizes, renames,
-and comes back on session restore at the same folder. It is **not** an agent, so it
-never counts toward a tab's agent badge.
+overlays float over a *terminal* and are sized from it, so they don't apply here —
+`Alt+G` / `Alt+I` will tell you so, and if it's a git view you want over this
+project, open a **git pane**). Everything else is a normal pane: it splits, drags,
+docks, maximizes, renames, and comes back on session restore at the same folder. It
+is **not** an agent, so it never counts toward a tab's agent badge.
 
 If the folder is gone when a session is restored (deleted, renamed, or on a drive
 that isn't mounted), that pane comes back as the welcome screen with a message

@@ -59,14 +59,32 @@ import {
   parseStoredSize,
 } from "./gitlayout";
 
+/** What the hosting pane provides. TWO hosts (#217):
+ *
+ *   OVERLAY (Alt+G, unchanged) — the view floats over a terminal, in a container
+ *     pane.ts sizes from the TERMINAL's height (`overlayClamp`) and closes with
+ *     Esc/✕. That sizing model is the only thing that ever assumed a terminal.
+ *   PANE (`embedded`) — the view IS a pane's content, filling its content box.
+ *     There is no terminal to measure and none to close back to, so the ✕ and the
+ *     Esc binding are dropped and the box is sized by the pane's own layout.
+ *
+ * The view's INNER layout (graph | diff over the changes strip, both dividers)
+ * never cared: it has always clamped its sub-panes to `this.el`'s live size via
+ * its own ResizeObserver, so it fits whatever box it is handed. That is why
+ * hosting it in a pane needed a hook, not a second layout engine. */
 export interface GitViewHost {
-  /** The pane's live working directory (from shell integration). */
+  /** The pane's live working directory (from shell integration) — or, in a git
+   *  pane, that pane's repo. Any directory inside the work tree will do; the view
+   *  resolves the top level (and the worktree set) itself. */
   getCwd(): string | null;
-  /** Close the git view and return to the terminal. */
+  /** Close the git view and return to the terminal. Never called when `embedded`. */
   onClose(): void;
   /** A mutating git action ran (commit, checkout, …) — the host may want to
    *  refresh its own git-derived UI (e.g. the pane's branch chip). */
   onRepoAction?: () => void;
+  /** EMBEDDED mode: pane content, not an overlay. Drops the ✕ and the Esc-to-close
+   *  binding — the PANE's ✕ is the close affordance. */
+  embedded?: boolean;
 }
 
 type Selection = { kind: "working" } | { kind: "commit"; hash: string };
@@ -270,12 +288,16 @@ export class GitView {
     this.el = el("div", "pane-git");
     this.el.hidden = true;
     this.el.tabIndex = -1;
-    this.el.addEventListener("keydown", (e) => {
-      if (e.key === "Escape") {
-        e.stopPropagation();
-        this.host.onClose();
-      }
-    });
+    // Esc closes the OVERLAY. Embedded (pane content) there is nothing to close back
+    // to, so Esc is left alone — it belongs to whatever inner control has focus.
+    if (!host.embedded) {
+      this.el.addEventListener("keydown", (e) => {
+        if (e.key === "Escape") {
+          e.stopPropagation();
+          this.host.onClose();
+        }
+      });
+    }
 
     // -- graph column --
     const graph = el("div", "git-graph");
@@ -313,6 +335,7 @@ export class GitView {
     );
     const closeBtn = el("button", "pane-btn close", "✕");
     closeBtn.title = "Back to terminal (Esc)";
+    closeBtn.hidden = !!host.embedded; // pane content — the PANE's ✕ is the close affordance
     closeBtn.addEventListener("click", () => this.host.onClose());
     head.append(
       this.headTitleEl,

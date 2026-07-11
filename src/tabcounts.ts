@@ -15,13 +15,15 @@
  *  (kind + whether it has a running PTY); welcome/dormant panes report
  *  `live: false` so they add nothing to the agent count. */
 export interface TabPaneInfo {
-  /** "files" (#214) is the PTY-less file-explorer pane. It is NOT an agent and
-   *  never will be, so — like a terminal — it contributes nothing to the count
-   *  below, no matter what `live` says. */
-  kind: "terminal" | "agent" | "orch" | "files";
+  /** "files" (#214), "editor" and "git" (#217) are the PTY-less CONTENT panes.
+   *  None is an agent, and none ever will be, so — like a terminal — they
+   *  contribute nothing to the count below, no matter what `live` says. The count
+   *  keys off the KIND, not off `live`: a viewer that is fully functional (and so
+   *  honestly reports live) must not thereby claim to be a running agent. */
+  kind: "terminal" | "agent" | "orch" | "files" | "editor" | "git";
   /** True when the pane has a running PTY — a live terminal/agent. False for a
    *  setup (welcome) pane or a dormant restore placeholder (no process yet). A
-   *  files pane has no process at all; it reports `live: true` because it is
+   *  content pane has no process at all; it reports `live: true` because it is
    *  fully functional content, and the count ignores its kind regardless. */
   live: boolean;
 }
