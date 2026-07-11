@@ -195,6 +195,18 @@ test("a leading dot is a perfectly ordinary name", () => {
   assert.equal(nameError(newFolder(".github"), []), null);
 });
 
+test("the inline check is a SUBSET of the backend's — reserved device names pass here", () => {
+  // Deliberate, and pinned so nobody "fixes" it silently. Inline validation exists to
+  // catch the near-misses a user actually makes while typing; the Windows reserved
+  // device names (`con`, `nul`, `com1`, …) are long, obscure, and typed by accident by
+  // no one. They're left to the backend's `validate_name`, which refuses them on
+  // commit with a toast saying why. If this ever starts returning an error, the
+  // docs and the human-validation list have to change with it.
+  assert.equal(nameError(newFolder("con"), []), null);
+  assert.equal(nameError(newFolder("aux.txt"), []), null);
+  assert.ok(canCommit(newFolder("con"), []), "the UI lets it through — the BACKEND stops it");
+});
+
 test("with no edit in flight there is nothing to validate or commit", () => {
   assert.equal(nameError(noEdit, ["anything"]), null);
   assert.ok(!canCommit(noEdit, []));

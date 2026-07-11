@@ -154,14 +154,26 @@ export type EditState =
 
 export const noEdit: EditState = { kind: "none" };
 
-/** Why a draft name can't be committed, or null when it can. Mirrors the backend's
- *  `validate_name` (which is authoritative — this is a UI courtesy that answers
- *  while the user types, not a security boundary), plus the one rule the backend
- *  cannot check because it doesn't know the listing: a duplicate sibling name.
+/** Why a draft name can't be committed, or null when it can.
  *
- *  Case-insensitive duplicate check, because that is how the Windows and macOS
- *  filesystems this runs on actually behave — offering to create `Foo` next to an
- *  existing `foo` would just fail at the syscall with a worse message. */
+ *  This is a UI COURTESY, not a security boundary: the backend's `validate_name` is
+ *  authoritative and re-checks everything on commit. What this adds is an answer
+ *  *while the user types*, for the mistakes they are actually likely to make —
+ *  empty, `.`/`..`, a path separator or other illegal character, a trailing dot —
+ *  plus the one rule the backend CANNOT check, because it doesn't know the listing:
+ *  a duplicate sibling name.
+ *
+ *  It is a SUBSET of the backend's rules, deliberately, and the gap is worth naming:
+ *  the Windows RESERVED DEVICE NAMES (`con`, `nul`, `aux`, `com1`, `lpt9`, …) are
+ *  not checked here. Nobody types `con` by accident, and the list is long, obscure,
+ *  and would need a footnote to explain when it fired. So that one is left to the
+ *  backend, which refuses it on commit with a toast that says exactly why. Adding it
+ *  here would be three lines — the reason not to is that inline errors should cover
+ *  the near-misses, not enumerate the trivia.
+ *
+ *  The duplicate check is case-INSENSITIVE, because that is how the Windows and
+ *  macOS filesystems this runs on actually behave: offering to create `Foo` beside
+ *  an existing `foo` would just fail at the syscall with a worse message. */
 export function nameError(state: EditState, siblings: readonly string[]): string | null {
   if (state.kind === "none") return null;
   const name = state.draft.trim();

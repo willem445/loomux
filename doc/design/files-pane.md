@@ -119,6 +119,35 @@ The webview is trusted, so none of this is strictly load-bearing today. It is
 defense-in-depth exactly as constraint #6 asks — and destructive operations sitting
 next to agent-facing surfaces are precisely where that stops being theoretical.
 
+### Symlinks and junctions are shown, and otherwise inert
+
+A symlink is **listed** (reported as a link, never as its target, and sorted with
+files even when it points at a directory) and **nothing else**. You cannot navigate
+*through* it, and you cannot `open`, `rename` or `delete` **the link entry itself**
+either: `safe_resolve`'s `ensure_no_symlink` lstats the *final* component too, so
+every operation on a link is refused with a `symlink` error.
+
+Refusing the op *on* the link is stronger than it strictly needs to be — deleting a
+link is not the same as deleting its target, and the non-Windows arm would in fact
+get that right for free (`remove_file` on a symlink removes the link). It is
+deliberate anyway, because on Windows the reasoning is different: a **junction**
+pointing outside the root is exactly the shape a recursive Recycle-Bin delete would
+escape through, and rather than reason about whether `FO_DELETE` follows one, we
+never hand it the chance. **The question doesn't get to be asked.** For a feature
+whose failure mode is "deleted the wrong thing", that trade is worth an inconvenience.
+
+The inconvenience is real, so it's surfaced honestly rather than leaked as jargon:
+the row tooltip says the link is shown but won't be followed, opened, renamed or
+deleted, and an attempted op toasts *"Loomux won't delete a symlink — it's shown
+here, but it's left alone. Use your OS file manager for links and junctions."* — not
+the raw backend `refusing to traverse symlink`, which is both jargon and, for a link
+you were trying to *delete*, the wrong verb entirely.
+
+Deleting/renaming the **link itself** (never the target) is a reasonable follow-up.
+It needs `ensure_no_symlink` to grow a "final component may be a link" mode, and the
+Windows delete to use a link-aware call — not a two-line change, and not what #214
+is about.
+
 ## What the overlays do — and why they're off
 
 Every pane overlay (git, issues, tasks, audit, file editor) is sized *from the
@@ -206,16 +235,31 @@ match count, the index size, and any backend truncation.
   short result list is a *menu*, and cycling it is correct.
 - **The inline-edit state machine** — new-folder and rename are the same
   interaction (an input row with a name in it), so they are one state machine rather
-  than two flags that can disagree. Its validation mirrors the backend's (which stays
-  authoritative — this answers *while you type*) plus the one rule the backend can't
-  check because it doesn't know the listing: a duplicate sibling name,
-  case-insensitively, because that's how the filesystems this runs on behave.
+  than two flags that can disagree.
 
-Two cases in there are easy to get subtly wrong and each has a test: renaming an
-entry to **its own name** must be allowed (the entry is in the listing, so a naive
-duplicate check rejects it) and is then skipped as a no-op; and a rename that changes
-only **case** (`old.txt` → `Old.txt`) is a real rename — it must neither self-collide
-nor be skipped.
+Two cases in the edit validation are easy to get subtly wrong and each has a test:
+renaming an entry to **its own name** must be allowed (the entry is in the listing,
+so a naive duplicate check rejects it) and is then skipped as a no-op; and a rename
+that changes only **case** (`old.txt` → `Old.txt`) is a real rename — it must neither
+self-collide nor be skipped.
+
+### The inline check is a *subset* of the backend's, on purpose
+
+`nameError` is a **UI courtesy, not a boundary**: `validate_name` in `filemgr.rs` is
+authoritative and re-checks everything at commit. What the inline check adds is an
+answer *while you type* for the mistakes people actually make (empty, `.`/`..`, a
+separator or other illegal character, a trailing dot), plus the one rule the backend
+**cannot** check because it doesn't know the listing — a duplicate sibling name,
+case-insensitively, because that's how the filesystems this runs on behave.
+
+The gap is worth naming rather than glossing: the Windows **reserved device names**
+(`con`, `nul`, `aux`, `com1`, `lpt9`, …) are *not* checked inline. Nobody types `con`
+by accident; the list is long and obscure; and an inline error firing on it would
+need a footnote to explain itself. So it's left to the backend, which refuses it at
+commit with a toast that says exactly why. Adding it inline would be three lines —
+the reason not to is that inline errors should cover the **near-misses**, not
+enumerate the trivia. There's a test pinning that `con` passes `nameError`, so the
+boundary can't drift silently.
 
 ## Session restore
 
@@ -276,6 +320,15 @@ agents that don't exist. There's a test pinning that.
 - **Git view over a files root** — needs the second overlay sizing model. Tracked on
   the issue.
 - **Restoring the sub-folder** you had navigated to (see *Session restore*).
+- **Deleting/renaming a symlink itself** (never its target) — see the symlink
+  section above; needs `ensure_no_symlink` to grow a final-component-may-be-a-link
+  mode.
+- **The `fm_*` commands are synchronous**, and Tauri runs sync commands on the main
+  thread — so a Recycle-Bin delete of a `node_modules`-scale folder will freeze the
+  window until `SHFileOperationW` returns. It matches house style (only `voice_stop`
+  is async), and the main thread's STA is genuinely the *right* apartment for these
+  shell APIs, so a naive `async fn` would trade a freeze for `CoInitializeEx`
+  questions in the worker. Filed as its own follow-up rather than rushed into this PR.
 
 ## A small bonus
 

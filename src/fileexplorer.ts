@@ -35,6 +35,7 @@ import {
   onFilesBatch,
   ftSearchCancel,
   nextSearchId,
+  errorCode,
   errorMessage,
   type FilesBatch,
 } from "./fileapi";
@@ -295,7 +296,7 @@ export class FileExplorerView {
     try {
       await fmOpen(this.host.getRoot(), rel);
     } catch (err) {
-      showToast(`Cannot open: ${errorMessage(err)}`);
+      showToast(explainOpError(err, "open"));
     }
   }
 
@@ -361,7 +362,11 @@ export class FileExplorerView {
       this.invalidateIndex(); // the tree changed under the Go-to-file index
       await this.refresh(name); // re-list from disk, selecting what we just made
     } catch (err) {
-      showToast(`${state.kind === "new-folder" ? "Couldn't create folder" : "Couldn't rename"}: ${errorMessage(err)}`);
+      showToast(
+        state.kind === "new-folder"
+          ? `Couldn't create folder: ${errorMessage(err)}`
+          : explainOpError(err, "rename")
+      );
       await this.refresh();
     }
   }
@@ -395,7 +400,7 @@ export class FileExplorerView {
       this.invalidateIndex();
       await this.refresh();
     } catch (err) {
-      showToast(`Couldn't delete: ${errorMessage(err)}`);
+      showToast(explainOpError(err, "delete"));
       await this.refresh();
     }
   }
@@ -504,7 +509,10 @@ export class FileExplorerView {
       const name = el("span", "fileexp-name", entry.name);
       if (entry.is_symlink) {
         row.classList.add("symlink");
-        name.title = "symlink — shown, never followed";
+        // Say the whole truth: it is inert, not merely un-followed. Every op on it is
+        // refused (see `explainOpError`), and a tooltip that only said "never
+        // followed" would leave the user surprised when Del/F2 bounced.
+        name.title = "Symlink — shown, but loomux won't follow, open, rename or delete it.";
       }
       if (entry.is_hidden) row.classList.add("hidden-entry");
       const size = el("span", "fileexp-size", formatSize(entry));
@@ -761,6 +769,24 @@ export class FileExplorerView {
 }
 
 // ---------- helpers ----------
+
+/** Turn a backend error into something worth reading, for a toast.
+ *
+ *  One case needs the translation. Every operation on a SYMLINK (or a Windows
+ *  junction) is refused — not just navigation *through* one, but `open`, `rename`
+ *  and `delete` on the link entry itself: `safe_resolve`'s `ensure_no_symlink`
+ *  lstats the final component too. That is the right safety call — a junction
+ *  pointing outside the root is exactly how a recursive delete would escape, and
+ *  refusing the op outright means the question "does FO_DELETE recurse through a
+ *  junction" never gets to be asked — but the raw error says "refusing to traverse
+ *  symlink", which is both jargon and, for a link you were trying to *delete*,
+ *  simply the wrong verb. Say what actually happened instead. */
+function explainOpError(err: unknown, verb: string): string {
+  if (errorCode(err) === "symlink") {
+    return `Loomux won't ${verb} a symlink — it's shown here, but it's left alone. Use your OS file manager for links and junctions.`;
+  }
+  return `Couldn't ${verb}: ${errorMessage(err)}`;
+}
 
 /** The last segment of a path — the root folder's own name, for the breadcrumb. */
 function shortName(p: string): string {

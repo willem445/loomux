@@ -320,3 +320,90 @@ fn open_refuses_a_missing_file_without_launching_anything() {
     let e = open_default(root.path().to_str().unwrap(), "ghost.pdf").unwrap_err();
     assert_eq!(err_code(&e), "not-found", "got: {e}");
 }
+
+// ---------- containment, round 3 (rev-102's live-probe findings, pinned) ----------
+//
+// These three behaviors held when rev-102 attacked them with a scratch test run, but
+// nothing in the tree pinned them. They are load-bearing — each is a way the OS and
+// Rust disagree about what a path means — so they get tests, not trust.
+
+#[test]
+fn trailing_dot_component_cannot_alias_a_sibling_entry() {
+    // The root-delete test covers the trim-to-empty arm ("   " → the root). This is
+    // the OTHER half of the same hazard: Win32 strips "sub." to "sub", so an op on
+    // "sub." would have Rust believing it acted on one entry while the OS acted on a
+    // DIFFERENT, real one. `has_mangled_component` refuses it before the filesystem
+    // ever sees it.
+    let root = tempfile::tempdir().unwrap();
+    let rp = root.path().to_str().unwrap();
+    fs::create_dir(root.path().join("sub")).unwrap();
+    fs::write(root.path().join("sub/keep.txt"), "x").unwrap();
+
+    for (rel, e) in [
+        ("sub.", delete(rp, "sub.")),
+        ("sub ", delete(rp, "sub ")),
+        ("sub.", rename(rp, "sub.", "gone").map(|_| true)),
+    ] {
+        assert_eq!(err_code(&e.unwrap_err()), "invalid-path", "{rel:?}");
+    }
+    assert!(
+        root.path().join("sub/keep.txt").exists(),
+        "the real `sub` must be untouched — the alias must never have reached it"
+    );
+}
+
+#[test]
+fn drive_relative_unc_and_absolute_rels_are_refused() {
+    // The drive-relative form is the sneaky one: `root.join("C:evil.txt")` REPLACES
+    // the whole path in Rust rather than appending to it, so a naive join-and-go
+    // would write outside the root entirely. `safe_resolve` rejects any `rel`
+    // carrying a Prefix/RootDir component, which covers this whole family.
+    let root = tempfile::tempdir().unwrap();
+    let rp = root.path().to_str().unwrap();
+    for rel in [
+        "C:evil.txt",             // drive-relative — REPLACES the join, not appends
+        "C:\\Windows\\evil.txt",  // absolute, with a drive prefix
+        "\\\\server\\share\\x",   // UNC
+        "\\\\?\\C:\\x",           // verbatim
+        "/abs.txt",
+        "\\abs.txt",
+    ] {
+        let e = delete(rp, rel).unwrap_err();
+        assert!(
+            matches!(err_code(&e), "invalid-path" | "outside-root" | "not-found"),
+            "{rel:?}: {e}"
+        );
+    }
+}
+
+#[test]
+fn ops_on_a_symlink_entry_itself_are_refused_and_the_target_survives() {
+    // A symlink (or a Windows junction) is SHOWN in the listing but is inert: it is
+    // never followed, and it is never operated on either. `ensure_no_symlink` lstats
+    // the FINAL component too, so delete/rename/open on the link are refused outright
+    // — which is what makes a junction pointing outside the root a non-vector for a
+    // recursive Recycle-Bin delete. The question "does FO_DELETE recurse through a
+    // junction" never gets to be asked, because the op never runs.
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    fs::write(outside.path().join("secret.txt"), "precious").unwrap();
+    if !try_symlink(outside.path(), &root.path().join("link"), true) {
+        eprintln!("skipping: symlinks not permitted here");
+        return;
+    }
+    let rp = root.path().to_str().unwrap();
+
+    assert_eq!(err_code(&delete(rp, "link").unwrap_err()), "symlink");
+    assert_eq!(err_code(&rename(rp, "link", "l2").unwrap_err()), "symlink");
+    assert_eq!(err_code(&open_default(rp, "link").unwrap_err()), "symlink");
+
+    assert_eq!(
+        fs::read_to_string(outside.path().join("secret.txt")).unwrap(),
+        "precious",
+        "nothing outside the root may be touched through the link"
+    );
+    assert!(
+        fs::symlink_metadata(root.path().join("link")).is_ok(),
+        "and the link entry itself is left alone"
+    );
+}
