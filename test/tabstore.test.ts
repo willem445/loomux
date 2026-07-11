@@ -43,6 +43,7 @@ test("docked panes round-trip (captured outside the layout tree, #194 P4)", () =
             shellKind: null,
             sessionId: "abc",
             role: null,
+            file: null,
           },
         ],
       },
@@ -159,6 +160,7 @@ const NESTED_LAYOUT: PersistedLayoutNode = {
         shellKind: "gitbash",
         sessionId: null,
         role: null,
+        file: null,
       },
     },
     {
@@ -178,6 +180,7 @@ const NESTED_LAYOUT: PersistedLayoutNode = {
             shellKind: null,
             sessionId: "abc-123",
             role: null,
+            file: null,
           },
         },
         {
@@ -192,6 +195,7 @@ const NESTED_LAYOUT: PersistedLayoutNode = {
             shellKind: null,
             sessionId: "orch-sess-9",
             role: "orchestrator",
+            file: null,
           },
         },
         {
@@ -208,6 +212,7 @@ const NESTED_LAYOUT: PersistedLayoutNode = {
             shellKind: null,
             sessionId: null,
             role: null,
+            file: null,
           },
         },
       ],
@@ -237,6 +242,7 @@ test("a files leaf round-trips its root — and needed NO new field or schema bu
     shellKind: null,
     sessionId: null,
     role: null,
+    file: null,
   };
   const state: PersistedTabs = {
     tabs: [
@@ -289,12 +295,13 @@ test("a files leaf with no root decodes (null) rather than dropping the whole ta
 
 // ---------- #217 editor + git leaves ----------
 
-test("editor and git leaves round-trip their root — still no new field, still v2", () => {
+test("editor and git leaves round-trip their root — and the editor's open FILE", () => {
   // The third and fourth members of the same family (#214's files was the first). The
-  // editor's FOLDER and the git pane's REPO both ride in the existing `cwd`, so this is
+  // editor's FOLDER and the git pane's REPO both ride in the existing `cwd`; the editor
+  // also carries the file it was showing — a PATH, never a buffer (#217). Both are
   // additive in exactly the way `role` and the files root were: a decoder that has never
-  // heard of these kinds is not needed, because old snapshots simply never carry them.
-  const mk = (paneKind: PersistedPane["paneKind"]): PersistedPane => ({
+  // heard of them is not needed, because old snapshots simply never carry them.
+  const mk = (paneKind: PersistedPane["paneKind"], file: string | null = null): PersistedPane => ({
     paneKind,
     name: "loomux",
     cwd: "C:/Projects/loomux",
@@ -303,6 +310,7 @@ test("editor and git leaves round-trip their root — still no new field, still 
     shellKind: null,
     sessionId: null,
     role: null,
+    file,
   });
   const state: PersistedTabs = {
     tabs: [
@@ -315,7 +323,7 @@ test("editor and git leaves round-trip their root — still no new field, still 
           dir: "row",
           weight: 1,
           children: [
-            { kind: "leaf", weight: 1, pane: mk("editor") },
+            { kind: "leaf", weight: 1, pane: mk("editor", "src/pane.ts") },
             { kind: "leaf", weight: 1, pane: mk("git") },
           ],
         },
@@ -326,7 +334,7 @@ test("editor and git leaves round-trip their root — still no new field, still 
   const back = decodeTabs(encodeTabs(state));
   const layout = back?.tabs[0].layout;
   assert.ok(layout?.kind === "split");
-  assert.deepEqual(layout.children[0].kind === "leaf" && layout.children[0].pane, mk("editor"));
+  assert.deepEqual(layout.children[0].kind === "leaf" && layout.children[0].pane, mk("editor", "src/pane.ts"));
   assert.deepEqual(layout.children[1].kind === "leaf" && layout.children[1].pane, mk("git"));
   assert.equal(back?.schemaVersion, 2, "additive — a bump here would be a false signal");
 });
@@ -417,6 +425,7 @@ test("malformed pane fields inside a valid leaf coerce to null, not a drop", () 
       shellKind: "fish", // unknown → null
       sessionId: null,
       role: 99, // non-string → null
+      file: 7, // non-string → null (#217)
     },
   };
   const back = decodeTabs(
@@ -434,6 +443,7 @@ test("malformed pane fields inside a valid leaf coerce to null, not a drop", () 
       shellKind: null,
       sessionId: null,
       role: null,
+      file: null,
     },
   });
 });

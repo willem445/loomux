@@ -65,12 +65,18 @@ export function joinRel(rel: string, name: string): string {
  *  which is why this is the only place the two are ever joined.
  *
  *  The separator follows the ROOT's own style (a Windows root keeps backslashes) so the
- *  path we hand back looks like the one the user gave us. `rel` "" is the root itself. */
+ *  path we hand back looks like the one the user gave us. `rel` "" is the root itself.
+ *
+ *  A DRIVE ROOT is the case that catches this out: `C:\` strips to `C:`, which then
+ *  contains no separator at all to copy the style from — so the drive-letter shape is
+ *  recognized explicitly rather than falling through to "/" and handing back `C:/src`
+ *  for a path the user typed with backslashes. */
 export function joinRoot(root: string, rel: string): string {
   const base = root.replace(/[\\/]+$/, "");
   const tail = rel.replace(/^\/+|\/+$/g, "");
   if (!tail) return base;
-  const sep = base.includes("\\") && !base.includes("/") ? "\\" : "/";
+  const windows = base.includes("\\") || /^[A-Za-z]:$/.test(base);
+  const sep = windows && !base.includes("/") ? "\\" : "/";
   return `${base}${sep}${tail.split("/").join(sep)}`;
 }
 

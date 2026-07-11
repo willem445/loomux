@@ -154,6 +154,13 @@ export class Workspace implements ManagedWorkspace {
     return this.grid.allPanes().map((p) => p.tabPaneInfo());
   }
 
+  /** Any unsaved editor edits in this tab — visible panes AND docked ones (#217).
+   *  Closing the tab disposes them all, so a minimized editor's dirty buffer counts
+   *  every bit as much as a visible one's. */
+  hasUnsavedWork(): boolean {
+    return this.grid.allPanes().some((p) => p.hasUnsavedWork());
+  }
+
   dispose(): void {
     this.disposed = true;
     // Kill every pane (visible or docked) so the tab's PTYs don't leak.

@@ -120,6 +120,11 @@ test("joinRoot rebuilds an ABSOLUTE path, keeping the root's own separator style
   // A mixed-separator root (Windows accepts both) is left alone rather than rewritten:
   // guessing "/" there is safe on Win32, and rewriting the user's path is not our job.
   assert.equal(joinRoot("C:/Projects/loomux", "src"), "C:/Projects/loomux/src");
+  // A DRIVE ROOT is the case that catches a naive "copy the separator you see": `C:\`
+  // strips to `C:`, which has no separator left to copy from — so it must be recognized
+  // as the Windows shape it is, not fall through to `C:/src`.
+  assert.equal(joinRoot("C:\\", "src"), "C:\\src");
+  assert.equal(joinRoot("C:\\", ""), "C:");
 });
 
 test("breadcrumbs start at the root and each crumb navigates to its own level", () => {

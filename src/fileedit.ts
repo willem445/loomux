@@ -394,8 +394,27 @@ export class FileEditView {
    *  Go-to-file jump, so the tree never points at a file the editor didn't take. */
   async openPath(rel: string): Promise<void> {
     await this.treeLoad;
+    if (this.disposed) return; // the pane was closed while the root's listing loaded
     await this.openFile(rel);
-    if (this.openRel === rel) await this.revealPath(rel);
+    if (this.disposed || this.openRel !== rel) return;
+    await this.revealPath(rel);
+  }
+
+  /** The file currently open, root-relative — or null when none is. Captured into the
+   *  persisted layout for an editor pane (#217), so a restore reopens the file the
+   *  pane was showing rather than a bare tree with a title naming a file it never
+   *  opened. Only the PATH: the buffer is deliberately never persisted (see
+   *  panerestore.ts), and the file is re-read from disk on restore. */
+  get openPathRel(): string | null {
+    return this.openRel;
+  }
+
+  /** Unsaved edits in the buffer right now — asked WITHOUT prompting, unlike
+   *  `canDiscard()`. The tab-close path needs to know whether a close would destroy
+   *  work before it decides how to ask (tabbar's arm/confirm), and a question that
+   *  itself pops a modal is no use there. */
+  get dirty(): boolean {
+    return this.isDirtyNow();
   }
 
   /** May this view be torn down right now — is there unsaved work in the buffer?
@@ -449,16 +468,49 @@ export class FileEditView {
 
   private async pickRoot(): Promise<void> {
     const picked = await open({ directory: true, title: "Browse folder", defaultPath: this.root ?? undefined });
-    if (typeof picked === "string") {
-      this.root = picked;
-      this.refreshRootLabel();
-      // An editor PANE (#217) adopts the new root as ITS root — title and persisted
-      // layout follow the tree the user is actually looking at. An overlay host does
-      // not implement this: there the root stays view-local by design.
-      this.host.onRootChanged?.(picked);
-      this.treeLoad = this.reloadTree();
-      await this.treeLoad;
-    }
+    if (typeof picked !== "string" || picked === this.root) return;
+
+    // A RE-ROOT ABANDONS THE OPEN FILE, and it must say so out loud.
+    //
+    // `openRel` is a path *relative to the root*. Carry it across a re-root and it
+    // silently re-binds to a different file: with `notes.md` open under C:\A and the
+    // root moved to C:\B, a Ctrl+S writes A's buffer to `C:\B\notes.md` — the hash
+    // guard fires against a file the user never opened, and "Overwrite" then destroys
+    // an unrelated project's file with this one's contents. (The same trap sat in the
+    // Alt+F overlay; #217 makes it far easier to reach, because a re-root is now a
+    // first-class, persisted operation on an editor pane.)
+    //
+    // So: ask about unsaved edits FIRST — the human may want to save into the old
+    // root, and cancelling here must leave everything exactly as it was — then close
+    // the buffer and drop the search state, whose results are paths under a root that
+    // is no longer on screen.
+    if (!(await this.canDiscard())) return;
+    this.root = picked;
+    this.closeOpenFile();
+    this.clearSearch();
+    this.refreshRootLabel();
+    // An editor PANE (#217) adopts the new root as ITS root — title and persisted
+    // layout follow the tree the user is actually looking at. An overlay host does
+    // not implement this: there the root stays view-local by design.
+    this.host.onRootChanged?.(picked);
+    this.treeLoad = this.reloadTree();
+    await this.treeLoad;
+  }
+
+  /** Drop the open file: no buffer, no `openRel`, no stale hash — back to the empty
+   *  state. Used when the root moves out from under the file (`pickRoot`), where
+   *  keeping any of it would leave a save aimed at the wrong path. */
+  private closeOpenFile(): void {
+    this.openRel = null;
+    this.savedContent = "";
+    this.savedHash = "";
+    this.openEol = "\n";
+    this.editor?.setValue("", "");
+    this.editorHost.hidden = true;
+    this.emptyState.hidden = false;
+    this.findBtn.hidden = true;
+    this.updateFileLabel();
+    this.updateDirty();
   }
 
   /** (Re)load the root directory into a fresh model and render. */

@@ -50,13 +50,9 @@ export type RestorePref = "ask" | "restore" | "fresh";
  *  SCHEMA_VERSION stays at 2. */
 export type PersistedPaneKind = "terminal" | "agent" | "orch" | "files" | "editor" | "git";
 
-/** The PTY-less content kinds, in one place: what `cwd` means for them (a root,
- *  not a shell's directory) and what restore has to probe before reopening them. */
+/** The PTY-less content kinds, in one place — what `cwd` means for them is a ROOT,
+ *  not a shell's directory. */
 const CONTENT_KINDS: readonly PersistedPaneKind[] = ["files", "editor", "git"];
-
-export function isContentPaneKind(k: PersistedPaneKind): boolean {
-  return CONTENT_KINDS.includes(k);
-}
 
 /** One pane at a layout leaf, reduced to what restore needs. Never the live
  *  PTY/buffer — those are deliberately not captured (cost/#78 process-storm and
@@ -86,6 +82,13 @@ export interface PersistedPane {
    *  first, relaunches the group) from its delegates. Null for agent/terminal
    *  panes and for pre-#194.5 files. */
   role: string | null;
+  /** The file an EDITOR pane (#217) had open, root-relative — a PATH, never a buffer.
+   *  A pane opened on a file is titled after it, so without this a restore would show a
+   *  bare tree under a title naming a file it isn't showing. The content is re-read from
+   *  disk; unsaved edits are deliberately NOT persisted (see doc/design/content-panes.md
+   *  — the close guard's whole point is that the human was asked). Null for every other
+   *  kind, and absent from any snapshot written before #217. */
+  file: string | null;
 }
 
 /** A tab's pane layout: the split tree with PersistedPane leaves. Mirrors grid's
@@ -176,6 +179,7 @@ function decodePane(v: unknown): PersistedPane | null {
     shellKind: isShellKind(r.shellKind) ? r.shellKind : null,
     sessionId: typeof r.sessionId === "string" ? r.sessionId : null,
     role: typeof r.role === "string" ? r.role : null,
+    file: typeof r.file === "string" ? r.file : null,
   };
 }
 

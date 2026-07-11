@@ -128,15 +128,11 @@ voiceController.init(() => activeGrid().activePane);
 function eventsFor(ws: Workspace): PaneEvents {
   return {
     onFocus: (pane) => ws.grid.setActive(pane),
-    // Ask the pane first: an editor pane (#217) may hold unsaved edits, and this is
-    // THE human-initiated single-pane close path (header ✕, dock chip ✕, Ctrl+Shift+W —
-    // all route through Pane.requestClose). A clean pane answers true instantly, so
-    // nothing else changes shape.
-    onCloseRequest: (pane) => {
-      void pane.confirmClose().then((ok) => {
-        if (ok) ws.grid.closePane(pane);
-      });
-    },
+    // The pane has already asked its own unsaved-edits question by the time this
+    // fires (Pane.requestClose → confirmClose → here), so there is nothing to check:
+    // close it. Every human-initiated single-pane close — header ✕, dock chip ✕,
+    // Ctrl+Shift+W — arrives through that one path.
+    onCloseRequest: (pane) => ws.grid.closePane(pane),
     onSplit: (pane, dir) => openWelcomeIn(ws, dir, pane),
     // The file browser's "Open in file editor pane" (#217): an editor pane beside the
     // browser, in the browser's own tab. Same call the welcome flow makes.
@@ -477,6 +473,7 @@ async function openActionPane(
         shellKind: null,
         sessionId: null,
         role: null,
+        file: null,
       };
       let pane: Pane;
       const content = dormantCard(
@@ -515,33 +512,58 @@ async function openActionPane(
         );
         return openWelcomeIn(ws, dir, anchor);
       }
-      return ws.grid.openContentPane(events, { kind, name: a.name, root, background: true }, dir, anchor);
+      return ws.grid.openContentPane(
+        events,
+        {
+          kind,
+          name: a.name,
+          root,
+          // The editor reopens the file it was showing (a path — never a buffer; see
+          // panerestore). A file deleted since just fails to open with a toast, in a
+          // pane that is otherwise back exactly as it was.
+          file: a.type === "open-editor" ? a.file ?? undefined : undefined,
+          background: true,
+        },
+        dir,
+        anchor
+      );
     }
     case "open-git": {
       // Same fail-soft, stricter probe (#217): the folder can still be there and no
       // longer be a git work tree — a removed worktree, a deleted .git, a repo restored
       // from a backup as plain files. Ask git rather than the filesystem, so the pane
       // never opens on something that can only tell you it isn't a repository.
-      const repo = a.repo;
-      let ok = false;
-      try {
-        ok = !!repo && (await gitRepoRoot(repo)) !== null;
-      } catch {
-        ok = false; // git missing / unreadable path — same soft landing
+      //
+      // But TELL THE TWO FAILURES APART. `gitRepoRoot` returning null is git's own
+      // answer: not a repo — fail soft to the welcome form. `gitRepoRoot` THROWING is a
+      // tooling failure (git not on PATH this boot, an unreadable path, a network share
+      // that hasn't woken up) — a fact about the environment, not about the repo. Fail
+      // softing on that would replace every git pane with a welcome form AND drop the
+      // recorded repo from the next layout save, losing it permanently over a transient
+      // hiccup. So the pane opens anyway: the view itself reports "git was not found on
+      // PATH" / the error, and ↻ recovers it once the environment does.
+      const root = a.root;
+      if (root) {
+        let notARepo = false;
+        try {
+          notARepo = (await gitRepoRoot(root)) === null;
+        } catch {
+          notARepo = false; // couldn't ASK — that is not an answer; keep the pane
+        }
+        if (!notARepo) {
+          return ws.grid.openContentPane(
+            events,
+            { kind: "git", name: a.name, root, background: true },
+            dir,
+            anchor
+          );
+        }
       }
-      if (!ok) {
-        showToast(
-          `Git pane "${a.name}": ${repo ? `not a git repository any more — ${repo}` : "no repository was recorded"}. Pick one to reopen it.`,
-          "info"
-        );
-        return openWelcomeIn(ws, dir, anchor);
-      }
-      return ws.grid.openContentPane(
-        events,
-        { kind: "git", name: a.name, root: repo!, background: true },
-        dir,
-        anchor
+      showToast(
+        `Git pane "${a.name}": ${root ? `not a git repository any more — ${root}` : "no repository was recorded"}. Pick one to reopen it.`,
+        "info"
       );
+      return openWelcomeIn(ws, dir, anchor);
     }
     case "dormant-group": {
       // The one credit/process-storm-sensitive case: keep the WHOLE group dormant.
@@ -558,6 +580,7 @@ async function openActionPane(
         // the panes that were live at close (#194.5) and re-capture is exact.
         sessionId: a.sessionId,
         role: a.role,
+        file: null,
       };
       const content = dormantCard(
         "Resume group",
@@ -830,11 +853,7 @@ async function handleWelcomeSubmit(
     // git). Synchronous — there is no process to start, so no await, no PTY, nothing to
     // reap. The root was confirmed for real by the form before it fired this: a readable
     // directory for files/editor, a git work tree for git.
-    pane.startContent(
-      result.kind === "git"
-        ? { kind: "git", name: result.name, root: result.repo }
-        : { kind: result.kind, name: result.name, root: result.root }
-    );
+    pane.startContent({ kind: result.kind, name: result.name, root: result.root });
     // Converted in place — no grid open/close fired, so notify explicitly (this is
     // what re-renders the tab strip and re-persists the layout), same as terminal.
     onGridChanged();

@@ -63,13 +63,21 @@ What differs from the overlay, and only this:
   the pane follows: its title updates and session restore reopens *that* folder. (In
   the overlay, browsing elsewhere is deliberately view-local — it must not disturb
   the terminal underneath.)
-- **Unsaved edits are guarded at the pane boundary.** An editor pane holds real
-  buffers, so closing it with unsaved changes asks first — from the header ✕, from
-  its dock chip, or from `Ctrl+Shift+W`. All three ask the same question.
+- **Unsaved edits are guarded.** An editor pane holds real buffers, so closing it
+  with unsaved changes asks first — from the header ✕, from its dock chip, or from
+  `Ctrl+Shift+W`. Closing the whole **tab** asks too (click ✕ once to arm, again to
+  confirm — the same two-step a tab with live agents uses), and its tooltip says what
+  is at stake. Re-rooting the editor to a different folder also asks, because the file
+  you had open doesn't exist under the new root.
+- **The git pane refreshes on open, after its own actions, and on ↻** — not on focus.
+  Refreshing rebuilds the changes strip, which would wipe a half-typed commit message
+  every time you tabbed away and back.
 
 `Alt+F` / `Alt+G` inside a terminal or agent pane are **unchanged** — same overlay,
-same sizing, same `Esc`. Inside a content pane, they simply focus it: the pane
-already *is* the surface.
+same sizing, same `Esc`. Inside a content pane there is no terminal for an overlay to
+float over, so the hotkey for the surface the pane already *is* just focuses it, and
+the others say why they don't apply (want a git view next to your editor pane? open a
+git pane).
 
 Everything else is the same code. The editor pane is the same editor; the git pane
 is the same git view, worktree switching included.

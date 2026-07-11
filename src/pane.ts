@@ -959,33 +959,61 @@ export class Pane implements VoiceTargetPane {
   /** The human asked to close this pane — from its header ✕, its dock chip's ✕, or
    *  Ctrl+Shift+W. THE single entry point for a human-initiated single-pane close, so
    *  every affordance goes through one path instead of re-deriving it (the dock chip's
-   *  ✕ used to call `grid.closePane` directly — #214 rev-100). It goes to the host,
-   *  which runs the unsaved-edits guard (`confirmClose`) and only then tears the pane
-   *  down: anything calling `grid.closePane` directly bypasses that guard, which is
-   *  exactly the bug this method exists to prevent, and an editor pane (#217) can hold
-   *  a dirty buffer. Automatic closes (a PTY exiting, a group ending, a tab disposing)
-   *  deliberately do NOT come here — they are bulk operations with their own
-   *  semantics, not "the human closed this pane". */
+   *  ✕ used to call `grid.closePane` directly — #214 rev-100).
+   *
+   *  It runs the unsaved-edits guard (`confirmClose`) HERE, and only tells the host to
+   *  close once the human has said yes. Anything calling `grid.closePane` directly
+   *  bypasses that guard — exactly the bug this method exists to prevent, now that a
+   *  pane can hold a dirty buffer (an editor pane's, or an Alt+F overlay's).
+   *
+   *  `closing` is a one-shot latch, and it is load-bearing: the guard is ASYNC (a
+   *  modal), while the app's shortcut handler is registered capture-phase on
+   *  `document` — so a second Ctrl+Shift+W while the discard dialog is up still
+   *  reaches this method. Without the latch it would stack a second identical dialog
+   *  for the same pane, and answering both would re-enter `closePane` on a disposed
+   *  pane. Released on a declined close so the human can try again.
+   *
+   *  Automatic closes (a PTY exiting, a group ending, a tab disposing) deliberately do
+   *  NOT come here — they are bulk operations with their own semantics, not "the human
+   *  closed this pane". The tab-close path asks its own question (see
+   *  `hasUnsavedWork` / tabbar's arm-and-confirm). */
   requestClose(): void {
-    this.events.onCloseRequest(this);
+    if (this.closing || this.disposed) return;
+    this.closing = true;
+    void this.confirmClose().then(
+      (ok) => {
+        this.closing = false;
+        if (ok && !this.disposed) this.events.onCloseRequest(this);
+      },
+      () => {
+        this.closing = false; // a failed dialog must not wedge the pane shut
+      }
+    );
   }
 
-  /** May the human close this pane right now? True unless it holds unsaved work the
-   *  human then declines to discard.
+  /** True while a close request is waiting on the human's answer. */
+  private closing = false;
+
+  /** May the human close this pane right now? True unless it holds unsaved work they
+   *  then decline to discard.
    *
-   *  An EDITOR pane (#217) is the one pane kind where loomux itself owns an unsaved
-   *  buffer: the human typed into it, hasn't saved, and closing the pane is the only
-   *  thing standing between them and their edits — so it asks, exactly as the editor's
-   *  own Esc/✕ already does.
-   *
-   *  Deliberately scoped to the HUMAN-initiated single-pane close paths — the header
-   *  ✕, the dock chip's ✕, and Ctrl+Shift+W — which is what "close this pane" means.
-   *  All three reach it through `requestClose()`. A tab close, a group teardown, or app
-   *  shutdown do not route through here: they're bulk operations with their own
-   *  semantics, and turning each into a per-pane interrogation is a different feature.
-   *  Every other pane kind answers true instantly. */
+   *  BOTH editors count. An editor PANE (#217) is the obvious one — the pane IS the
+   *  buffer. But any terminal/agent pane can also be holding a dirty Alt+F OVERLAY
+   *  (#174), and closing the pane disposes it just as finally; guarding only the pane
+   *  kind would have fixed the new hole while leaving the older, likelier one open.
+   *  `FileEditView.canDiscard()` is the same gate in both cases (dirtystate.ts). */
   async confirmClose(): Promise<boolean> {
-    return this.editorPaneView ? this.editorPaneView.canDiscard() : true;
+    const editor = this.editorPaneView ?? this.fileEditView;
+    return editor ? editor.canDiscard() : true;
+  }
+
+  /** Does this pane hold unsaved edits RIGHT NOW — without asking the human anything?
+   *  `confirmClose` prompts; this only reports. The tab-close path needs the fact
+   *  before it can decide how to ask (a tab holding unsaved work closes behind the
+   *  same arm-and-confirm an orchestration tab does — tabbar.ts), and a question that
+   *  pops its own modal is no use to a synchronous bulk teardown. */
+  hasUnsavedWork(): boolean {
+    return (this.editorPaneView ?? this.fileEditView)?.dirty ?? false;
   }
 
   /** Point this content pane at `root`, keeping `cwdRaw` in step so the chrome that
@@ -1644,6 +1672,11 @@ export class Pane implements VoiceTargetPane {
       sessionId: kind === "agent" || kind === "orch" ? this.agentSessionId : null,
       // The orchestration role distinguishes the orchestrator from its delegates.
       role: kind === "orch" ? this.orchRoleName : null,
+      // An editor pane's OPEN FILE (#217) — a path, never a buffer. Without it a pane
+      // opened on `src/pane.ts` (and titled after it) restores as a bare tree that
+      // names a file it isn't showing. The file is re-read from disk on restore; what
+      // was typed and not saved is deliberately not persisted (panerestore.ts).
+      file: kind === "editor" ? this.editorPaneView?.openPathRel ?? null : null,
     };
   }
 
@@ -1891,13 +1924,15 @@ export class Pane implements VoiceTargetPane {
     }
     if (this.gitPaneView) {
       this.gitPaneView.el.focus();
-      // A git pane has no shell prompt and no PTY to hang a git watch off (the backend
-      // watch is keyed by pty id), so it has no push signal for "the repo changed under
-      // you". Turning to the pane is the cheapest honest pull: notifyPrompt is throttled
-      // to twice a second and no-ops when hidden, so this costs a `git status` at most
-      // that often — and only on a pane you are actually looking at. The ↻ button is
-      // still there for an explicit refresh.
-      this.gitPaneView.notifyPrompt();
+      // NOT a refresh. Refreshing on focus is the obvious idea and it is wrong: the
+      // git view rebuilds its changes strip from scratch (`renderWorking` →
+      // `replaceChildren`), which includes the COMMIT MESSAGE textarea — so a refresh
+      // fired by "the window regained focus" or "you tabbed back to this pane" would
+      // silently wipe a half-typed commit message. That never bit the overlay, whose
+      // only refresh trigger is a shell prompt (impossible while you type into the
+      // view). A git pane has no prompt and no PTY to hang a git watch off, so it
+      // refreshes on open, after its own actions, and on the ↻ button — an explicit,
+      // safe pull rather than an implicit, destructive one.
       return;
     }
     this.term.focus();

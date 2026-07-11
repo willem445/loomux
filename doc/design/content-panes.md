@@ -86,37 +86,62 @@ Two rules the CSS enforces, both learned the hard way:
   it — the same trick `.pane-welcome` uses, and the reason no grid/dock/drag path
   needs a special case.
 
-## Unsaved buffers: one close path
+## Unsaved buffers: where the work can be lost, and what asks
 
-An editor pane is the first pane kind where **loomux itself owns unsaved work**.
-That makes the close question real: a header ✕, a dock-chip ✕, or `Ctrl+Shift+W`
-must not silently discard a buffer the human typed into.
+An editor pane is the first pane kind where **loomux itself owns unsaved work** —
+and it turns out the Alt+F overlay always did too, silently. So the question is not
+"does the new pane guard its buffer" but **every way a buffer can die**:
 
-There is therefore exactly one human-initiated single-pane close path:
+**1. The pane closes** — header ✕, dock-chip ✕, `Ctrl+Shift+W`. One path:
 
 ```
 header ✕ / dock chip ✕ / Ctrl+Shift+W
-        └─► Pane.requestClose()  ─► host onCloseRequest
-                                        └─► Pane.confirmClose()  ─► FileEditView.canDiscard()
-                                                                        └─► closeDecision(dirty)   [dirtystate.ts]
-                                            └─► (only if allowed) grid.closePane()
+   └─► Pane.requestClose()          ← one-shot `closing` latch
+          └─► Pane.confirmClose()   ← the editor PANE's buffer, or the Alt+F OVERLAY's
+                 └─► FileEditView.canDiscard()
+                        └─► closeDecision(dirty)          [dirtystate.ts]
+          └─► (only if allowed) host onCloseRequest → grid.closePane()
 ```
 
-Anything that calls `grid.closePane` directly bypasses the guard — which is exactly
-the bug the dock chip had in #214 (rev-100), and why the routing is stated once, in
-one method, instead of re-derived per affordance. The *decision* ("dirty means ask")
-lives in `dirtystate.closeDecision` and is shared with the editor's own `Esc`/✕, so
-the two cannot drift; `test/dirtystate.test.ts` pins each consumer against it.
+Anything calling `grid.closePane` directly bypasses the guard — exactly the bug the
+dock chip had in #214 (rev-100), and why the routing is stated once, in one method.
+Two things this got wrong first time and now doesn't:
 
-Automatic closes — a PTY exiting, a group ending, a tab disposing, app shutdown —
-deliberately do **not** come through here. They are bulk operations with their own
-semantics, and turning each into a per-pane interrogation is a different feature.
+- It guarded only the *pane* editor. A terminal pane holding a dirty **Alt+F overlay**
+  is just as real, and closing it disposes that view just as finally. `confirmClose`
+  takes whichever editor the pane has.
+- The guard is **async** (a modal) while the app's shortcut handler is capture-phase on
+  `document`: a second `Ctrl+Shift+W` while the dialog is up re-entered and stacked a
+  second dialog for the same pane, whose second answer re-entered `closePane` on an
+  already-disposed pane. Hence the one-shot `closing` latch, released on a decline.
 
-The corollary, in `panerestore.ts`: **the buffer is not persisted.** The layout
-records where the pane was rooted, never what was typed into it. A snapshot that
-quietly preserved unsaved text would make the layout file a second copy of the
-user's work and would undercut the very guard above — the point of which is that
-they were *asked*.
+**2. The tab closes**, disposing every pane in it. A per-pane modal is no use in a
+synchronous bulk teardown, so the tab bar asks the way it already asks about something
+irreversible: **arm, then confirm** — the same two-step the ✕ of an orchestration tab
+(which kills live agents) has always used. `Workspace.hasUnsavedWork()` reports, never
+prompts, and the ✕'s tooltip names what is at stake ("will end its agents **and**
+discard unsaved edits") rather than only the half it used to know about.
+
+**3. The root moves under the open file.** `FileEditView.pickRoot()` re-points the
+tree — and `openRel` is *relative to the root*. Carrying it across a re-root silently
+re-binds the buffer to a different file: with `notes.md` open under `C:\A` and the root
+moved to `C:\B`, `Ctrl+S` writes A's text to `C:\B\notes.md`, and the conflict dialog
+then offers to overwrite a file the human never opened. So a re-root asks about unsaved
+edits first (cancelling leaves everything as it was), then **closes the buffer** and
+drops the search state, whose hits are paths under a root that is no longer on screen.
+The trap predates #217 — it sat in the overlay — but #217 makes a re-root a first-class,
+persisted operation on a pane, which is what turns it from obscure into reachable.
+
+**Known gap: app quit** does not ask. The whole-app teardown has no per-pane
+interrogation today (nor did it before this feature), and adding one means intercepting
+the Tauri window-close event — a different feature, and one that can wedge the quit if
+it goes wrong. Stated here rather than quietly left.
+
+The corollary, in `panerestore.ts`: **the buffer is never persisted.** The layout
+records where the pane was rooted and *which file it was showing* — a path, re-read
+from disk — never what was typed into it. A snapshot that quietly preserved unsaved
+text would make the layout file a second copy of the user's work and would undercut the
+very guards above, whose whole point is that the human was *asked*.
 
 ## Open in file editor pane (from the file browser)
 
@@ -166,6 +191,31 @@ exist and no longer be a repo. So the git pane is re-probed with `gitRepoRoot`, 
 a directory check, and — like the other content kinds — fails soft to the welcome
 form **in that one slot** with a toast, leaving the rest of the layout intact.
 
+But the two ways that probe can fail are **not** the same, and treating them alike is
+a data-loss bug in slow motion. `gitRepoRoot` returning `null` is git's own answer:
+*not a repo* — fail soft. `gitRepoRoot` **throwing** is a tooling failure: git isn't on
+`PATH` this boot, the path is unreadable, a network share hasn't woken up. That is a
+fact about the environment, not about the repo — and failing soft on it would replace
+every git pane with a welcome form *and* drop the recorded repo from the next layout
+save, losing the path for good over a transient hiccup. So a throw keeps the pane: the
+view itself says "git was not found on PATH", and ↻ recovers it when the environment
+does.
+
+## What a git pane does NOT do: refresh on focus
+
+The obvious idea — refresh the git view whenever the pane gains focus, since it has no
+shell prompt to drive it — is wrong, and the reason is worth recording. A refresh
+rebuilds the changes strip wholesale (`renderWorking` → `replaceChildren`), and that
+strip contains the **commit-message textarea**. Refreshing on focus would mean:
+alt-tab to your browser to copy an issue title, come back, and the commit message you
+were halfway through typing is gone.
+
+The overlay never had this problem because its only refresh trigger is a shell prompt —
+which cannot arrive while you are typing into the overlay. A pane has no prompt, so it
+refreshes on **open**, after **its own actions**, and on the **↻ button**: explicit and
+safe rather than implicit and destructive. (Auto-refresh on external repo changes would
+need the backend git watch, which is keyed by PTY id — and a git pane has no PTY.)
+
 ## Not agents
 
 `tabcounts` keys the agent count on **kind**, not on `live`. All three content kinds
@@ -179,12 +229,13 @@ construction, not by remembering.
 | File | What |
 | --- | --- |
 | `panesetup.ts` | `editor` / `git` kinds, their plans, `isContentKind` (pure) |
-| `pane.ts` | `startContent()`, `ContentPaneKind`, `confirmClose()`, `onOpenEditorPane` |
+| `pane.ts` | `startContent()`, `ContentPaneKind`, `requestClose()`'s latch + `confirmClose()`, `hasUnsavedWork()`, `onOpenEditorPane` |
 | `grid.ts` | `openContentPane()` (was `openFilesPane`) |
-| `fileedit.ts` | `embedded` / `onRootChanged` hooks, `canDiscard()`, `openPath()` |
+| `fileedit.ts` | `embedded` / `onRootChanged` hooks, `canDiscard()`, `dirty`, `openPath()` / `openPathRel`, the re-root buffer reset |
+| `tabbar.ts` / `workspace.ts` / `tabs.ts` | a tab holding unsaved edits closes behind the arm-and-confirm |
 | `gitview.ts` | `embedded` hook (the ✕ + `Esc` fork). Its layout needed nothing. |
 | `fileexplorer.ts` + `filemenu.ts` + `fileexplorermodel.ts` | the `edit-pane` affordance, declared and bound |
-| `tabstore.ts` / `panerestore.ts` / `tabcounts.ts` | the two kinds through the restore + counting paths |
+| `tabstore.ts` / `panerestore.ts` / `tabcounts.ts` | the two kinds through the restore + counting paths; the editor's open `file` (a path, not a buffer) |
 | `styles.css` | `.pane-content` / `.is-content` (generalized from `.pane-files` / `.is-files`) |
 
 No backend changes: `ft_list_dir` and `git_repo_root` already take a root, and both

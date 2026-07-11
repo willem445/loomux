@@ -26,6 +26,7 @@ const pane = (over: Partial<PersistedPane>): PersistedPane => ({
   shellKind: null,
   role: null,
   sessionId: null,
+  file: null,
   ...over,
 });
 
@@ -96,14 +97,24 @@ test("a files pane with NO recorded root surfaces a null root for the caller to 
 
 // ---------- editor + git (#217) ----------
 
-test("an editor pane reopens at its recorded root; a git pane over its recorded repo", () => {
+test("an editor pane reopens at its recorded root, showing the file it had open", () => {
+  // The FILE rides along (a path, never a buffer): a pane opened on src/pane.ts is
+  // TITLED after it, so restoring a bare tree under that title would name a file the
+  // pane isn't showing.
+  assert.deepEqual(
+    planPaneRestore(
+      pane({ paneKind: "editor", name: "pane.ts", cwd: "C:/Projects/loomux", file: "src/pane.ts" })
+    ),
+    { type: "open-editor", name: "pane.ts", root: "C:/Projects/loomux", file: "src/pane.ts" }
+  );
+  // No file open when it was captured → none reopened. Not an error, just a tree.
   assert.deepEqual(
     planPaneRestore(pane({ paneKind: "editor", name: "loomux", cwd: "C:/Projects/loomux" })),
-    { type: "open-editor", name: "loomux", root: "C:/Projects/loomux" }
+    { type: "open-editor", name: "loomux", root: "C:/Projects/loomux", file: null }
   );
   assert.deepEqual(
     planPaneRestore(pane({ paneKind: "git", name: "loomux", cwd: "C:/Projects/loomux" })),
-    { type: "open-git", name: "loomux", repo: "C:/Projects/loomux" }
+    { type: "open-git", name: "loomux", root: "C:/Projects/loomux" }
   );
 });
 
@@ -125,11 +136,12 @@ test("a rootless editor/git record surfaces null for the caller to fail soft on"
     type: "open-editor",
     name: "e",
     root: null,
+    file: null,
   });
   assert.deepEqual(planPaneRestore(pane({ paneKind: "git", name: "g", cwd: null })), {
     type: "open-git",
     name: "g",
-    repo: null,
+    root: null,
   });
 });
 

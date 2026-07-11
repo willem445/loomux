@@ -93,24 +93,33 @@ export type RestoreAction =
       root: string | null;
     }
   | {
-      // A file-EDITOR pane (#217), back at its recorded root. Same contract as
-      // open-files, same probe (is this still a readable directory?), same fail-soft.
-      // Unsaved buffers are NOT persisted: the layout records where the pane was
-      // rooted, never what was typed into it — capturing an unsaved buffer would be a
-      // second, silent copy of the user's file, and the close guard (confirmClose) is
-      // what makes sure they were asked before it could be lost.
+      // A file-EDITOR pane (#217), back at its recorded root, with the file it had
+      // open re-opened from disk. Same contract as open-files, same probe (is this
+      // still a readable directory?), same fail-soft.
+      //
+      // `file` is a PATH, not a buffer. Unsaved edits are NOT persisted: the layout
+      // records where the pane was rooted and what it was showing, never what was
+      // typed into it — a snapshot that quietly kept unsaved text would be a second
+      // copy of the user's file, and it would undercut the close guard
+      // (Pane.confirmClose), whose whole point is that they were ASKED before it could
+      // be lost. A file that has since been deleted/renamed just fails to open (a
+      // toast); the pane still comes back, rooted.
       type: "open-editor";
       name: string;
       root: string | null;
+      file: string | null;
     }
   | {
       // A GIT pane (#217), back over its recorded repo. The probe here is stricter
       // than a directory check — the folder can still exist and no longer be a git
       // work tree (deleted .git, a worktree pruned since) — so the caller resolves
-      // it with `gitRepoRoot` and fails soft to the welcome form when it isn't one.
+      // it with `gitRepoRoot`. A definitive "not a repo" fails soft to the welcome
+      // form; a git that could not be RUN at all does not (see main.ts) — that is a
+      // tooling failure, not a fact about the repo, and pruning the pane over it
+      // would lose the recorded path for good.
       type: "open-git";
       name: string;
-      repo: string | null;
+      root: string | null;
     };
 
 /** True when a recorded agent session id still has a resumable conversation on
@@ -139,17 +148,17 @@ export function planPaneRestore(pane: PersistedPane, resumable?: SessionResumabl
       // the root it was captured with (which lives in `cwd`).
       return { type: "open-files", name: pane.name, root: pane.cwd };
     case "editor":
-      // Same deal (#217). The pane comes back rooted where it was; the FILE that was
-      // open — and anything unsaved in it — is deliberately not persisted (see the
-      // action's comment above).
-      return { type: "open-editor", name: pane.name, root: pane.cwd };
+      // Same deal (#217): the pane comes back rooted where it was, showing the file it
+      // was showing — re-read from disk. What was typed and not saved is deliberately
+      // not persisted (see the action's comment above).
+      return { type: "open-editor", name: pane.name, root: pane.cwd, file: pane.file };
     case "git":
       // Same deal (#217), over a repo instead of a folder. The worktree SELECTION and
       // the read-only unlock (#208) are view state, not layout: a restored git pane
       // opens on the primary worktree, locked, exactly like a freshly opened one — an
       // unlock that survived a restart would be the one piece of this pane's state
       // that could quietly cost you something.
-      return { type: "open-git", name: pane.name, repo: pane.cwd };
+      return { type: "open-git", name: pane.name, root: pane.cwd };
     case "agent":
       // Auto-resume when we have a session id AND the hybrid is enabled; else a
       // dormant Start placeholder (no id to resume into, or the flip is off).

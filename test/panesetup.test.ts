@@ -161,12 +161,14 @@ test("an editor pane plans a root + name, and nothing else — no command, no sh
   assert.deepEqual(res.plan, { kind: "editor", root: "C:/Projects/loomux", name: "code" });
 });
 
-test("a git pane plans a repo + name, and nothing else", () => {
+test("a git pane plans a root + name, and nothing else", () => {
   const res = planPaneSetup(input({ kind: "git", repo: " /repo/x ", name: "  " }));
   assert.ok(res.ok);
-  // Whether /repo/x is REALLY a git work tree is I/O — the form asks git (gitRepoRoot)
-  // before it fires, and this module deliberately doesn't pretend it can know.
-  assert.deepEqual(res.plan, { kind: "git", repo: "/repo/x", name: "x" });
+  // `root`, not `repo`: a content pane has ONE input and every consumer (the pane, the
+  // capture, the restore) treats it identically — a synonym here would buy nothing and
+  // cost a special case. Whether /repo/x is REALLY a git work tree is I/O: the form asks
+  // git (gitRepoRoot) before it fires, and this module doesn't pretend it can know.
+  assert.deepEqual(res.plan, { kind: "git", root: "/repo/x", name: "x" });
 });
 
 test("both new kinds default their name to the root's own short name", () => {

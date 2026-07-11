@@ -77,9 +77,9 @@ export type WelcomeResult =
   | { kind: "files"; name: string; root: string }
   /** A file-editor pane (#217): same contract, same confirmed-directory `root`. */
   | { kind: "editor"; name: string; root: string }
-  /** A git pane (#217): `repo` is a directory this form has already confirmed is
+  /** A git pane (#217): `root` is a directory this form has already confirmed is
    *  inside a git work tree (`gitRepoRoot`), so the pane can't open on a non-repo. */
-  | { kind: "git"; name: string; repo: string };
+  | { kind: "git"; name: string; root: string };
 
 /** Orchestration roles the setup form configures a CLI + model for. Mirrors the
  *  backend `Role` variants that can be spawned in a group (issue #4/#47). */
@@ -875,9 +875,9 @@ export class WelcomeForm {
       // is the honest bar: the view resolves the top level itself, and picking a
       // subfolder of your repo should just work.
       this.setBusy(true, "Opening…");
-      let root: string | null;
+      let top: string | null;
       try {
-        root = await gitRepoRoot(plan.repo);
+        top = await gitRepoRoot(plan.root);
       } catch (err) {
         // git missing from PATH, or an unreadable path — say which, don't guess.
         this.showError(
@@ -888,19 +888,19 @@ export class WelcomeForm {
         this.latch.release();
         return;
       }
-      if (!root) {
-        this.showError(`Not a git repository: ${plan.repo}`);
+      if (!top) {
+        this.showError(`Not a git repository: ${plan.root}`);
         this.repoInput.focus();
         this.setBusy(false);
         this.latch.release();
         return;
       }
-      addRecentRepo(plan.repo);
+      addRecentRepo(plan.root);
       // Hand over what the human typed, not the resolved top level: a repo path is the
       // pane's identity and the view re-resolves it anyway — and inside a linked
       // worktree, `--show-toplevel` is that worktree, which is exactly the pane the
       // human asked for.
-      this.fire({ kind: "git", name: plan.name, repo: plan.repo });
+      this.fire({ kind: "git", name: plan.name, root: plan.root });
       return;
     }
 

@@ -106,13 +106,15 @@ export interface EditorPlan {
   name: string;
 }
 /** A GIT pane (#217): the git view (graph, status, diffs, staging, #208 worktree
- *  switching) as a pane's permanent content. `repo` need only be SOME directory
+ *  switching) as a pane's permanent content. `root` need only be SOME directory
  *  inside a work tree — the view resolves the top level itself — but it must be
  *  one, which is I/O the caller probes (gitRepoRoot), not a rule this module can
- *  decide. */
+ *  decide. Named `root` like its two siblings, deliberately: a content pane has ONE
+ *  input and every consumer (the pane, the capture, the restore) treats it the same
+ *  way, so calling it `repo` here would buy a synonym and cost a special case. */
 export interface GitPlan {
   kind: "git";
-  repo: string;
+  root: string;
   name: string;
 }
 export type PaneSetupPlan =
@@ -122,6 +124,15 @@ export type PaneSetupPlan =
   | FilesPlan
   | EditorPlan
   | GitPlan;
+
+/** The per-kind halves of the content-pane rule: what to call the missing path in
+ *  the error, and what to fall back to when the human names the pane nothing. The
+ *  RULE itself (the path is mandatory) is one branch below, not three. */
+const CONTENT_SETUP: Record<"files" | "editor" | "git", { missing: string; fallbackName: string }> = {
+  files: { missing: "The file explorer needs a folder — pick one first.", fallbackName: "files" },
+  editor: { missing: "The file editor needs a folder — pick one first.", fallbackName: "editor" },
+  git: { missing: "The git view needs a repository — pick one first.", fallbackName: "git" },
+};
 
 /** Which field to focus when validation fails, so the form can surface it. */
 export type PaneSetupFocus = "repo" | "custom" | "count";
@@ -270,44 +281,18 @@ export function planPaneSetup(input: PaneSetupInput): PaneSetupResult {
     return { ok: true, plan: { kind: "orchestrator", repo } };
   }
 
-  // The three CONTENT kinds (#214 files, #217 editor + git). The path is
-  // mandatory for all of them — unlike a terminal, "" can't fall back to home:
-  // a file tree over the whole home directory is never what the user meant, a
-  // rootless content pane has no content at all, and "home" is not a repo.
-  if (input.kind === "files") {
-    if (!repo) {
-      return {
-        ok: false,
-        error: "The file explorer needs a folder — pick one first.",
-        focus: "repo",
-      };
-    }
-    const name = input.name.trim() || pathTail(repo) || "files";
-    return { ok: true, plan: { kind: "files", root: repo, name } };
-  }
-
-  if (input.kind === "editor") {
-    if (!repo) {
-      return {
-        ok: false,
-        error: "The file editor needs a folder — pick one first.",
-        focus: "repo",
-      };
-    }
-    const name = input.name.trim() || pathTail(repo) || "editor";
-    return { ok: true, plan: { kind: "editor", root: repo, name } };
-  }
-
-  if (input.kind === "git") {
-    if (!repo) {
-      return {
-        ok: false,
-        error: "The git view needs a repository — pick one first.",
-        focus: "repo",
-      };
-    }
-    const name = input.name.trim() || pathTail(repo) || "git";
-    return { ok: true, plan: { kind: "git", repo, name } };
+  // The three CONTENT kinds (#214 files, #217 editor + git). ONE rule, because they
+  // have one: the path is mandatory. Unlike a terminal, "" can't fall back to home —
+  // a file tree over the whole home directory is never what the user meant, a rootless
+  // content pane has no content at all, and "home" is not a repo. What differs per kind
+  // is only the wording (CONTENT_SETUP), and whether the path is REAL — a directory? a
+  // work tree? — which is I/O the form probes, not a rule this module can decide.
+  if (isContentKind(input.kind)) {
+    const kind = input.kind as "files" | "editor" | "git";
+    const setup = CONTENT_SETUP[kind];
+    if (!repo) return { ok: false, error: setup.missing, focus: "repo" };
+    const name = input.name.trim() || pathTail(repo) || setup.fallbackName;
+    return { ok: true, plan: { kind, root: repo, name } };
   }
 
   // agent
