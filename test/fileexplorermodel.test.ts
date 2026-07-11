@@ -16,9 +16,13 @@ import {
   nameError,
   canCommit,
   isNoopRename,
+  isCreate,
   noEdit,
+  activeTarget,
+  baseName,
   type FmEntry,
   type EditState,
+  type ExplorerView,
 } from "../src/fileexplorermodel.ts";
 
 const entry = (name: string, over: Partial<FmEntry> = {}): FmEntry => ({
@@ -135,6 +139,99 @@ test("selection CLAMPS at both ends — a listing is a place, not a menu that wr
   assert.equal(clampSelection(-1, 1, 3), 0, "Down with nothing selected lands on the first");
   assert.equal(clampSelection(-1, -1, 3), 2, "Up with nothing selected lands on the last");
   assert.equal(clampSelection(1, 1, 0), -1, "an empty listing has nothing to select");
+});
+
+// ---------- what an operation acts on (the demo bug) ----------
+//
+// Reported: with the Go-to-file filter active, rename "does nothing"; clear the filter
+// and it fires against a DIFFERENT entry — the selection in the unfiltered listing.
+// Root cause: ops resolved a target from the listing's selection INDEX even while the
+// listing was hidden and the results were on screen. These pin the fix: an op resolves
+// a row's IDENTITY from the view actually being shown, and that value can't be
+// retargeted by anything that happens to the lists afterwards.
+
+const LISTING: FmEntry[] = [dir("src"), entry("a.txt"), entry("b.txt")];
+
+const listingView = (sel: number, dirRel = ""): ExplorerView => ({
+  kind: "listing",
+  dir: dirRel,
+  rows: visibleEntries(LISTING, false),
+  sel,
+});
+const resultsView = (sel: number, ...rels: string[]): ExplorerView => ({
+  kind: "results",
+  hits: rels.map((rel) => ({ rel })),
+  sel,
+});
+
+test("an op on the LISTING targets the selected row's path, joined to the current dir", () => {
+  // rows() is folders-first, so index 1 is a.txt.
+  assert.deepEqual(activeTarget(listingView(1, "sub")), {
+    rel: "sub/a.txt",
+    name: "a.txt",
+    isDir: false,
+    from: "listing",
+  });
+  assert.deepEqual(activeTarget(listingView(0)), {
+    rel: "src",
+    name: "src",
+    isDir: true,
+    from: "listing",
+  });
+});
+
+test("an op on a FILTERED RESULT targets that result — not the listing's selection", () => {
+  // THE BUG, stated as a test. The listing selection (index 1) is irrelevant while the
+  // results are what's on screen; resolving against it is what fired the rename at the
+  // wrong file. A hit carries its OWN full rel — it isn't relative to the browsed dir.
+  const view = resultsView(0, "deep/nested/target.ts", "other.ts");
+  assert.deepEqual(activeTarget(view), {
+    rel: "deep/nested/target.ts",
+    name: "target.ts",
+    isDir: false,
+    from: "results",
+  });
+});
+
+test("the reported sequence cannot fire against a different entry", () => {
+  // filter active, hit selected → the op targets the HIT.
+  const filtered = resultsView(0, "deep/nested/target.ts");
+  const captured = activeTarget(filtered)!;
+  assert.equal(captured.rel, "deep/nested/target.ts");
+
+  // The filter now clears — the listing (with its own, unrelated selection) is back.
+  // Under the old index-based resolution this is the moment the op would have
+  // retargeted onto b.txt. The captured target is a VALUE: it cannot.
+  const afterClear = activeTarget(listingView(2));
+  assert.equal(afterClear!.rel, "b.txt", "the listing would have resolved to something else entirely");
+  assert.notEqual(captured.rel, afterClear!.rel);
+  assert.equal(captured.rel, "deep/nested/target.ts", "the captured target is unmoved");
+});
+
+test("a target captured mid-op survives the lists changing underneath it", () => {
+  // The results list re-ranks and re-renders on every streaming index batch, and the
+  // listing reorders on refresh. Neither may retarget an op already in flight.
+  const captured = activeTarget(resultsView(1, "a/one.ts", "b/two.ts"))!;
+  assert.equal(captured.rel, "b/two.ts");
+
+  // A later batch lands and re-ranks the results; index 1 is now a different file.
+  const reranked = activeTarget(resultsView(1, "b/two.ts", "c/three.ts"))!;
+  assert.equal(reranked.rel, "c/three.ts", "index 1 now means something else");
+  assert.equal(captured.rel, "b/two.ts", "but the captured target still names the file it named");
+});
+
+test("nothing selected — or a stale, out-of-range selection — targets nothing", () => {
+  // The caller disables its buttons on null, so an op can never fire at nothing (or at
+  // whatever happens to sit at a stale index after the list shrank).
+  assert.equal(activeTarget(listingView(-1)), null);
+  assert.equal(activeTarget(listingView(99)), null);
+  assert.equal(activeTarget(resultsView(0)), null, "no hits at all");
+  assert.equal(activeTarget(resultsView(5, "only.ts")), null);
+});
+
+test("baseName takes the last segment of a rel", () => {
+  assert.equal(baseName("a/b/c.ts"), "c.ts");
+  assert.equal(baseName("top.ts"), "top.ts");
 });
 
 // ---------- inline edit ----------

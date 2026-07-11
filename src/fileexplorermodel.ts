@@ -124,6 +124,72 @@ export function formatModified(ms: number, now: number): string {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${hhmm}`;
 }
 
+// ---------- what an operation acts on ----------
+//
+// THE BUG THIS EXISTS TO KILL (human demo, #214). The explorer can be showing one of
+// two different row sets: the directory LISTING, or the Go-to-file RESULTS (which
+// replace it while a query is active). Ops used to resolve their target from the
+// listing's selection index — unconditionally, even while the listing was hidden and
+// the results were the thing on screen. So with a filter active, "rename" bound to an
+// invisible row in a list nobody was looking at, rendered its editor into the hidden
+// listing (hence "the click did nothing"), and then, when the filter cleared, appeared
+// on a completely different file. Delete had the identical defect, and delete is not
+// reversible with an "oh, that did nothing".
+//
+// The fix is structural, not a patch: an op resolves an `OpTarget` — a row's *identity*
+// (its path) — from the view the user is ACTUALLY LOOKING AT, at the moment it is
+// invoked. Once captured, that value is immune to anything that happens to the lists
+// underneath it: a streaming index batch re-ranking the results, the filter clearing,
+// a refresh reordering the listing. An index is a position in a list that may not even
+// be on screen; a path is the file.
+
+/** The row an operation acts on, captured by IDENTITY when the op is invoked. */
+export interface OpTarget {
+  /** Root-relative path — the identity. Valid no matter what the lists do next. */
+  rel: string;
+  /** Last path segment: what the confirm dialog and the rename editor show. */
+  name: string;
+  isDir: boolean;
+  /** Which view it came from. The caller needs this: an op invoked on a RESULTS row
+   *  has to leave the filtered view to show the user what it is doing to that file. */
+  from: "listing" | "results";
+}
+
+/** The two things the explorer can be showing. Ops resolve against whichever one the
+ *  user is looking at — conflating them is precisely what went wrong. */
+export type ExplorerView =
+  | { kind: "listing"; dir: string; rows: readonly FmEntry[]; sel: number }
+  /** Go-to-file hits. These are files from anywhere under the root, so a hit carries
+   *  its own full `rel` — it is NOT relative to the directory being browsed, which is
+   *  the other half of why resolving one against `dir` produced nonsense. */
+  | { kind: "results"; hits: readonly { rel: string }[]; sel: number };
+
+/** The last segment of a root-relative path. */
+export function baseName(rel: string): string {
+  const cut = rel.lastIndexOf("/");
+  return cut < 0 ? rel : rel.slice(cut + 1);
+}
+
+/** Resolve what an operation should act on, from the view currently on screen.
+ *  Null when nothing is selected (or the selection is stale/out of range) — the
+ *  caller disables its buttons on that, so an op can never fire at nothing. */
+export function activeTarget(view: ExplorerView): OpTarget | null {
+  if (view.kind === "listing") {
+    const entry = view.rows[view.sel];
+    if (!entry) return null;
+    return {
+      rel: joinRel(view.dir, entry.name),
+      name: entry.name,
+      isDir: entry.is_dir && !entry.is_symlink,
+      from: "listing",
+    };
+  }
+  const hit = view.hits[view.sel];
+  if (!hit) return null;
+  // A Go-to-file hit is always a file (the enumeration lists files, never dirs).
+  return { rel: hit.rel, name: baseName(hit.rel), isDir: false, from: "results" };
+}
+
 // ---------- selection ----------
 
 /** Move a selection index by `delta` within `count` rows, CLAMPING at both ends.
@@ -150,9 +216,20 @@ export function clampSelection(current: number, delta: number, count: number): n
 export type EditState =
   | { kind: "none" }
   | { kind: "new-folder"; draft: string }
+  | { kind: "new-file"; draft: string }
   | { kind: "rename"; rel: string; original: string; draft: string };
 
 export const noEdit: EditState = { kind: "none" };
+
+/** True for the two "make a new thing here" edits. They share every rule (same name
+ *  validation, same sibling-collision check, same commit-and-select flow) and differ
+ *  only in which backend command runs — so the code branches once, at the call, and
+ *  nowhere else. */
+export function isCreate(state: EditState): state is
+  | { kind: "new-folder"; draft: string }
+  | { kind: "new-file"; draft: string } {
+  return state.kind === "new-folder" || state.kind === "new-file";
+}
 
 /** Why a draft name can't be committed, or null when it can.
  *

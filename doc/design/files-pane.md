@@ -243,6 +243,47 @@ so a naive duplicate check rejects it) and is then skipped as a no-op; and a ren
 that changes only **case** (`old.txt` → `Old.txt`) is a real rename — it must neither
 self-collide nor be skipped.
 
+### Ops bind to a row's IDENTITY, never to a selection index
+
+This is the shape of a bug the human hit in the demo, and it is worth recording
+because it is the kind that comes back.
+
+The explorer can be showing **one of two different row sets**: the directory
+**listing**, or the Go-to-file **results**, which replace it while a query is active.
+The listing has a `sel` index; the results have their own `gotoSel`. Ops resolved
+their target from the *listing's* index — unconditionally, even while the listing was
+hidden and the results were the thing on screen.
+
+So with a filter active:
+
+- **Rename** bound to an invisible row in a list nobody was looking at, then rendered
+  its editor into the **hidden** listing. Visibly: *"clicking rename does nothing."*
+- Clear the filter and the editor was suddenly sitting on **a different file** — the
+  listing's own selection.
+- **Delete** had the identical defect, and its toolbar button was never disabled while
+  filtered. Nobody hit it in the demo, but it would have deleted a file the user could
+  not see. Delete is not recoverable with an *"oh, that did nothing"*.
+
+The fix is structural, not a patch on rename. Ops now resolve an **`OpTarget`** — a
+row's *identity*, its path — from the view the user is **actually looking at**, at the
+moment the op is invoked (`activeTarget` in the pure model, unit-tested). Once
+captured, that value is immune to everything that happens to the lists afterwards: a
+streaming index batch re-ranking the results, the filter clearing, a refresh
+reordering the listing, the user sitting on a confirm dialog. **An index is a position
+in a list that may not even be on screen; a path is the file.**
+
+Two consequences worth stating:
+
+- **Rename from a search result** navigates to the file's folder, selects it, and opens
+  the editor there. The op still acts on the row you invoked it on — that's the
+  identity capture — and now you can *see* it doing so. (Hosting the editor inside the
+  results list instead would put a focused text input in a list that re-renders on
+  every streaming index batch, which would eat keystrokes.)
+- **Creating** a folder or file first leaves the filtered view, because the new entry
+  lands in the directory being browsed and its editor row lives in the listing.
+  Rendering an editor into a hidden list is precisely how "the click did nothing"
+  happened; the same mistake is not available twice.
+
 ### The inline check is a *subset* of the backend's, on purpose
 
 `nameError` is a **UI courtesy, not a boundary**: `validate_name` in `filemgr.rs` is
@@ -302,10 +343,10 @@ agents that don't exist. There's a test pinning that.
 | The pane | `src/pane.ts` | `startFiles()`, `isFiles`, `workdir`, `refuseOverlay()`, the `liveKind`/`capture`/`tabPaneInfo` arms. DOM-coupled → hand-validated. |
 | Placement | `src/grid.ts` | `openFilesPane()` — like `openWelcomePane`, but content instead of a form. Synchronous: there's no process to await. |
 | The manager | `src/fileexplorer.ts` | Toolbar, breadcrumb, listing, inline edits, Go-to-file. DOM wiring only. |
-| Its pure core | `src/fileexplorermodel.ts` | Listing order, rooted navigation, breadcrumb, formatting, inline-edit validation. Unit-tested. |
+| Its pure core | `src/fileexplorermodel.ts` | Listing order, rooted navigation, breadcrumb, formatting, inline-edit validation, and `activeTarget` — which view an op resolves against. Unit-tested. |
 | Name ranking | `src/filematch.ts` | Substring + path-segment, best-occurrence, deterministic ties. Unit-tested. |
 | Typed bridge | `src/filemgr.ts` | `fm_*` wrappers (per-feature module, the `fileapi.ts` precedent). |
-| Backend | `src-tauri/src/filemgr.rs` | list / new folder / rename / delete / open-with-default. Reuses `fileedit::safe_resolve`. Integration-tested. |
+| Backend | `src-tauri/src/filemgr.rs` | list / new folder / **new file** / rename / delete / open-with-default. Reuses `fileedit::safe_resolve`. Integration-tested. |
 | Name enumeration | `src-tauri/src/fileedit.rs` | `list_files` + `ft_files_start` — paths only, no file opened. Integration-tested. |
 | Persistence | `src/tabstore.ts` | `PersistedPaneKind` gains `"files"`; the root rides in `cwd`. No version bump. Unit-tested. |
 | Restore policy | `src/panerestore.ts` | The `open-files` action (root may be null → caller fails soft). Unit-tested. |

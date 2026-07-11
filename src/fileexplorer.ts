@@ -14,7 +14,7 @@
 // ranking) — and all path safety is enforced backend-side in `filemgr.rs`.
 
 import { open } from "@tauri-apps/plugin-dialog";
-import { fmList, fmNewFolder, fmRename, fmDelete, fmDeleteMode, fmOpen } from "./filemgr";
+import { fmList, fmNewFolder, fmNewFile, fmRename, fmDelete, fmDeleteMode, fmOpen } from "./filemgr";
 import {
   visibleEntries,
   joinRel,
@@ -26,9 +26,13 @@ import {
   nameError,
   canCommit,
   isNoopRename,
+  isCreate,
   noEdit,
+  activeTarget,
   type FmEntry,
   type EditState,
+  type ExplorerView,
+  type OpTarget,
 } from "./fileexplorermodel";
 import {
   ftFilesStart,
@@ -59,6 +63,7 @@ export interface FileExplorerHost {
 const GOTO_RESULT_CAP = 200;
 
 const SVG_UP = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M8 12.5V3.5M4 7.5 8 3.5l4 4"/></svg>`;
+const SVG_NEW_FILE = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M9 1.9H4.4c-.6 0-1.1.5-1.1 1.1v10c0 .6.5 1.1 1.1 1.1h3.1"/><path d="M9 1.9l3.7 3.7V8"/><path d="M8.8 1.9v3.7h3.9"/><path d="M11.8 9.9v4.2M9.7 12h4.2"/></svg>`;
 const SVG_NEW_FOLDER = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M1.9 12.2V4.3c0-.6.5-1.1 1.1-1.1h3l1.4 1.5h5.6c.6 0 1.1.5 1.1 1.1v1.4"/><path d="M11.5 9.5v4.2M9.4 11.6h4.2"/></svg>`;
 const SVG_RENAME = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 11.2 10.8 2.9a1.6 1.6 0 0 1 2.3 2.3L4.8 13.5l-3 .7z"/></svg>`;
 const SVG_DELETE = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M2.8 4.3h10.4M6.2 4.3V2.8h3.6v1.5M4.2 4.3l.7 8.9h6.2l.7-8.9M6.6 6.6v4.4M9.4 6.6v4.4"/></svg>`;
@@ -127,10 +132,15 @@ export class FileExplorerView {
 
     this.crumbEl = el("div", "fileexp-crumbs");
 
+    const newFileBtn = el("button", "pane-btn", "") as HTMLButtonElement;
+    newFileBtn.innerHTML = SVG_NEW_FILE;
+    newFileBtn.title = "New file (Ctrl+N) — created empty; double-click it to open";
+    newFileBtn.addEventListener("click", () => this.beginCreate("new-file"));
+
     const newBtn = el("button", "pane-btn", "") as HTMLButtonElement;
     newBtn.innerHTML = SVG_NEW_FOLDER;
     newBtn.title = "New folder (Ctrl+Shift+N)";
-    newBtn.addEventListener("click", () => this.beginNewFolder());
+    newBtn.addEventListener("click", () => this.beginCreate("new-folder"));
 
     this.renameBtn = el("button", "pane-btn", "") as HTMLButtonElement;
     this.renameBtn.innerHTML = SVG_RENAME;
@@ -167,7 +177,16 @@ export class FileExplorerView {
     rootBtn.title = "Change the pane's root folder";
     rootBtn.addEventListener("click", () => void this.pickRoot());
 
-    head.append(this.upBtn, this.crumbEl, newBtn, this.renameBtn, this.deleteBtn, hiddenLabel, rootBtn);
+    head.append(
+      this.upBtn,
+      this.crumbEl,
+      newFileBtn,
+      newBtn,
+      this.renameBtn,
+      this.deleteBtn,
+      hiddenLabel,
+      rootBtn
+    );
 
     // ---- Go to file ----
     const gotoForm = el("div", "fileexp-goto-form");
@@ -300,43 +319,87 @@ export class FileExplorerView {
     }
   }
 
-  // ---------- rows ----------
+  // ---------- rows, and what an op acts on ----------
 
-  /** The rendered rows: hidden entries dropped unless asked for, folders first. */
+  /** The rendered listing rows: hidden entries dropped unless asked for, folders first. */
   private rows(): FmEntry[] {
     return visibleEntries(this.entries, this.showHidden);
   }
 
-  private selectedEntry(): FmEntry | null {
-    const rows = this.rows();
-    return this.sel >= 0 && this.sel < rows.length ? rows[this.sel] : null;
+  /** True while the Go-to-file results are what's on screen (the listing is hidden). */
+  private get filtering(): boolean {
+    return queryTerms(this.gotoInput.value).length > 0;
+  }
+
+  /** The view the user is ACTUALLY LOOKING AT. Ops resolve against this, never against
+   *  the listing unconditionally — conflating the two is the bug the human hit. */
+  private view(): ExplorerView {
+    return this.filtering
+      ? { kind: "results", hits: this.gotoHits, sel: this.gotoSel }
+      : { kind: "listing", dir: this.rel, rows: this.rows(), sel: this.sel };
+  }
+
+  /** What an operation invoked RIGHT NOW would act on — a path, captured by identity.
+   *  Immune to the lists changing underneath it afterwards (see fileexplorermodel). */
+  private target(): OpTarget | null {
+    return activeTarget(this.view());
+  }
+
+  /** Leave the filtered results and go back to the listing.
+   *
+   *  Any op that needs the LISTING to be visible calls this first. Creating a new
+   *  folder/file, and editing a name inline, both render a row into the listing — and
+   *  rendering into a hidden list is exactly how "the click did nothing" happened. */
+  private exitFilter(): void {
+    if (!this.filtering) return;
+    this.gotoInput.value = "";
+    this.gotoSel = 0;
+    this.refreshGoto();
   }
 
   // ---------- operations ----------
 
-  private beginNewFolder(): void {
-    this.edit = { kind: "new-folder", draft: "" };
+  /** New folder / new file — the same interaction, so the same code path; only the
+   *  backend call differs, at the single point where it has to. */
+  private beginCreate(kind: "new-folder" | "new-file"): void {
+    // The new entry lands in the directory being BROWSED, so the listing has to be the
+    // thing on screen — otherwise its editor row renders into a hidden list.
+    this.exitFilter();
+    this.edit = { kind, draft: "" };
     this.render();
   }
 
   private beginRename(): void {
-    const entry = this.selectedEntry();
-    if (!entry) {
+    const target = this.target();
+    if (!target) {
       showToast("Select an item to rename.", "info");
       return;
     }
-    this.edit = {
-      kind: "rename",
-      rel: joinRel(this.rel, entry.name),
-      original: entry.name,
-      draft: entry.name,
-    };
+    // Invoked on a FILTERED RESULT: that file may live in any folder under the root, and
+    // the inline editor only exists in the listing. So go to where the file actually is,
+    // select it, and open the editor on it there. The user sees the file they picked, in
+    // its folder, with the cursor in its name — which is what "rename this" should look
+    // like. (Hosting the editor in the results list instead would put a focused input in
+    // a list that re-renders on every streaming index batch — it would eat keystrokes.)
+    if (target.from === "results") {
+      void this.navigate(parentRel(target.rel) ?? "", target.name).then(() => {
+        if (this.disposed) return;
+        this.openRenameEditor(target);
+      });
+      return;
+    }
+    this.openRenameEditor(target);
+  }
+
+  /** Open the inline rename editor on `target`. The target's PATH is what's stored, so
+   *  the commit acts on the file the user picked no matter what the listing does next. */
+  private openRenameEditor(target: OpTarget): void {
+    this.edit = { kind: "rename", rel: target.rel, original: target.name, draft: target.name };
     this.render();
   }
 
-  /** Commit the inline edit. Validation mirrors the backend's (which remains
-   *  authoritative) so the user gets an answer while typing rather than after a
-   *  round-trip. */
+  /** Commit the inline edit. The inline validation is a courtesy that answers while the
+   *  user types; the backend re-checks everything and stays authoritative. */
   private async commitEdit(): Promise<void> {
     const state = this.edit;
     if (state.kind === "none") return;
@@ -352,19 +415,28 @@ export class FileExplorerView {
       this.render();
       return;
     }
+    // Latch BEFORE the await, so a double-Enter can't fire the op twice.
     this.edit = noEdit;
     try {
       if (state.kind === "new-folder") {
         await fmNewFolder(this.host.getRoot(), this.rel, name);
+      } else if (state.kind === "new-file") {
+        // Created empty and NOT opened — the user's double-click is what decides which
+        // app it belongs to. Loomux having an opinion about that is the thing this pane
+        // exists not to do.
+        await fmNewFile(this.host.getRoot(), this.rel, name);
       } else {
+        // `state.rel` — the path captured when the editor opened, not a re-resolved
+        // index. This is the fix for the demo bug: whatever the lists did in between,
+        // the rename lands on the file the user actually picked.
         await fmRename(this.host.getRoot(), state.rel, name);
       }
       this.invalidateIndex(); // the tree changed under the Go-to-file index
-      await this.refresh(name); // re-list from disk, selecting what we just made
+      await this.refresh(name); // re-list from disk, selecting what we just made/renamed
     } catch (err) {
       showToast(
-        state.kind === "new-folder"
-          ? `Couldn't create folder: ${errorMessage(err)}`
+        isCreate(state)
+          ? `Couldn't create ${state.kind === "new-file" ? "file" : "folder"}: ${errorMessage(err)}`
           : explainOpError(err, "rename")
       );
       await this.refresh();
@@ -378,25 +450,30 @@ export class FileExplorerView {
   }
 
   private async deleteSelected(): Promise<void> {
-    const entry = this.selectedEntry();
-    if (!entry) {
+    // Captured BEFORE the confirm dialog, from the view on screen. The dialog is an
+    // await: without capturing, the target would be re-resolved afterwards against
+    // whatever list is current by then. Delete is not undoable with an "oh, nothing
+    // happened" — this is the op where getting the target wrong costs the most.
+    const target = this.target();
+    if (!target) {
       showToast("Select an item to delete.", "info");
       return;
     }
-    const what = entry.is_dir && !entry.is_symlink ? "folder" : "file";
-    // Say what will ACTUALLY happen. Promising the Recycle Bin on a platform that
-    // has none would be a lie the user only discovers when they go looking for it.
+    const what = target.isDir ? "folder" : "file";
+    // Name the file in the dialog, and say what will ACTUALLY happen: promising the
+    // Recycle Bin on a platform that has none is a lie the user only discovers when
+    // they go looking for the file.
     const ok = await confirmModal(
       this.deleteRecycles ? `Move this ${what} to the Recycle Bin?` : `Permanently delete this ${what}?`,
       this.deleteRecycles
-        ? `"${entry.name}" will go to the Recycle Bin — you can restore it from there.`
-        : `"${entry.name}" will be deleted permanently. This cannot be undone${entry.is_dir ? ", and it will take everything inside it" : ""}.`,
+        ? `"${target.rel}" will go to the Recycle Bin — you can restore it from there.`
+        : `"${target.rel}" will be deleted permanently. This cannot be undone${target.isDir ? ", and it will take everything inside it" : ""}.`,
       this.deleteRecycles ? "Move to Recycle Bin" : "Delete permanently",
       !this.deleteRecycles
     );
     if (!ok) return;
     try {
-      await fmDelete(this.host.getRoot(), joinRel(this.rel, entry.name));
+      await fmDelete(this.host.getRoot(), target.rel); // the captured path, not a re-lookup
       this.invalidateIndex();
       await this.refresh();
     } catch (err) {
@@ -422,7 +499,7 @@ export class FileExplorerView {
       case "Enter": {
         e.preventDefault();
         e.stopPropagation();
-        const entry = this.selectedEntry();
+        const entry = this.rows()[this.sel];
         if (entry) void this.openEntry(entry);
         return;
       }
@@ -448,10 +525,12 @@ export class FileExplorerView {
       void this.goUp();
       return;
     }
-    if (e.key.toLowerCase() === "n" && e.ctrlKey && e.shiftKey) {
+    if (e.key.toLowerCase() === "n" && e.ctrlKey) {
+      // Pane-local, and only while the listing has focus — so neither can collide with
+      // an app shortcut (matchShortcut claims no Ctrl+N or Ctrl+Shift+N).
       e.preventDefault();
       e.stopPropagation();
-      this.beginNewFolder();
+      this.beginCreate(e.shiftKey ? "new-folder" : "new-file");
     }
   }
 
@@ -461,12 +540,20 @@ export class FileExplorerView {
     if (this.disposed) return;
     this.renderCrumbs();
     this.upBtn.disabled = parentRel(this.rel) === null;
-    const entry = this.selectedEntry();
-    this.renameBtn.disabled = !entry;
-    this.deleteBtn.disabled = !entry;
     this.renderList();
     this.renderStatus();
-    this.refreshGoto();
+    this.refreshGoto(); // re-ranks, swaps the visible list, and syncs the op buttons
+  }
+
+  /** Enable/disable Rename + Delete from the ACTIVE view's target.
+   *
+   *  They used to read the listing's selection unconditionally — which is how Delete
+   *  stayed live, while the results were on screen, pointed at a file the user could
+   *  not even see. Now: no target in whichever list is showing → the buttons are dead. */
+  private syncOpButtons(): void {
+    const target = this.target();
+    this.renameBtn.disabled = !target;
+    this.deleteBtn.disabled = !target;
   }
 
   private renderCrumbs(): void {
@@ -489,10 +576,12 @@ export class FileExplorerView {
     const now = Date.now();
     const frag = document.createDocumentFragment();
 
-    // The new-folder editor is a row at the TOP of the listing — where the folder
-    // will appear once created (folders sort first), so it doesn't jump on commit.
-    if (this.edit.kind === "new-folder") {
-      frag.appendChild(this.editRow(true));
+    // The new-folder / new-file editor is a row at the TOP of the listing, so it is
+    // visible without scrolling. On commit the entry is re-listed from disk and
+    // selected, so a new FILE landing further down (files sort after folders) is
+    // scrolled to rather than lost.
+    if (isCreate(this.edit)) {
+      frag.appendChild(this.editRow(this.edit.kind === "new-folder"));
     }
 
     rows.forEach((entry, i) => {
@@ -529,7 +618,7 @@ export class FileExplorerView {
       frag.appendChild(row);
     });
 
-    if (rows.length === 0 && this.edit.kind !== "new-folder") {
+    if (rows.length === 0 && !isCreate(this.edit)) {
       frag.appendChild(el("div", "fileexp-empty", "This folder is empty."));
     }
     this.listEl.replaceChildren(frag);
@@ -542,12 +631,13 @@ export class FileExplorerView {
     const state = this.edit;
     const row = el("div", "fileexp-row editing");
     const icon = el("span", "fileexp-icon");
-    icon.innerHTML = isDir ? folderIconSvg(false) : fileIconSvg(state.kind === "rename" ? state.original : "");
+    icon.innerHTML = isDir ? folderIconSvg(false) : fileIconSvg(state.kind === "rename" ? state.original : "new.txt");
     const input = document.createElement("input");
     input.className = "fileexp-input fileexp-edit-input";
     input.spellcheck = false;
     input.value = state.kind === "none" ? "" : state.draft;
-    input.placeholder = state.kind === "new-folder" ? "New folder name…" : "";
+    input.placeholder =
+      state.kind === "new-folder" ? "New folder name…" : state.kind === "new-file" ? "New file name…" : "";
 
     const err = el("span", "fileexp-edit-err", "");
     const paint = () => {
@@ -664,6 +754,7 @@ export class FileExplorerView {
     this.listEl.hidden = active;
     this.renderGoto();
     this.updateGotoSummary();
+    this.syncOpButtons();
   }
 
   private onGotoKey(e: KeyboardEvent): void {
@@ -672,12 +763,22 @@ export class FileExplorerView {
       e.stopPropagation();
       this.gotoSel = moveSelection(this.gotoSel, e.key === "ArrowDown" ? 1 : -1, this.gotoHits.length);
       this.renderGoto();
+      this.syncOpButtons(); // the op target just moved to a different file
       return;
     }
     if (e.key === "Enter") {
       e.preventDefault();
       e.stopPropagation();
       void this.openGotoHit(this.gotoSel);
+      return;
+    }
+    if (e.key === "F2") {
+      // Rename the highlighted RESULT, without having to leave the search box first.
+      // Delete is deliberately NOT bound here: inside a text input, Del means "delete
+      // the character under the caret", and stealing that would be its own bug.
+      e.preventDefault();
+      e.stopPropagation();
+      this.beginRename();
       return;
     }
     if (e.key === "Escape") {
@@ -720,6 +821,7 @@ export class FileExplorerView {
       row.addEventListener("click", () => {
         this.gotoSel = i;
         this.renderGoto();
+        this.syncOpButtons();
       });
       frag.appendChild(row);
     });

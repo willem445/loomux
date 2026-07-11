@@ -296,6 +296,40 @@ pub fn new_folder(root: &str, rel: &str, name: &str) -> Result<String, String> {
     Ok(child)
 }
 
+/// Create an EMPTY file named `name` inside `rel`. Returns the new entry's `rel`.
+///
+/// Deliberately empty, and deliberately not opened: the user's next double-click is
+/// what hands it to their default app. Creating it and launching an editor would be
+/// loomux deciding what the file is for, which is the thing this pane exists not to
+/// do.
+///
+/// `create_new(true)` is the load-bearing flag — it makes "create, but only if it
+/// isn't there" ATOMIC. The `exists()` check above it is only there for the nicer
+/// message; on its own it would be a TOCTOU window in which an agent (or the user's
+/// own editor) could create the file between the check and the write, and we would
+/// then truncate it to nothing. Same shape as `new_folder`'s `create_dir`, which is
+/// likewise a refuse-if-present call rather than a `create_dir_all`.
+pub fn new_file(root: &str, rel: &str, name: &str) -> Result<String, String> {
+    let name = validate_name(name)?;
+    let child = join_rel(rel, &name);
+    let path = resolve(root, &child)?;
+    if path.exists() {
+        return Err(err("exists", format!("'{name}' already exists")));
+    }
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                err("exists", format!("'{name}' already exists"))
+            } else {
+                err("io", e.to_string())
+            }
+        })?;
+    Ok(child)
+}
+
 /// Rename the entry at `rel` to `name`, in place. Returns the new `rel`.
 ///
 /// `name` is one validated segment, so this can only re-label — never move. The
@@ -491,6 +525,11 @@ pub fn fm_list(root: String, rel: String) -> Result<Vec<FmEntry>, String> {
 #[tauri::command]
 pub fn fm_new_folder(root: String, rel: String, name: String) -> Result<String, String> {
     new_folder(&root, &rel, &name)
+}
+
+#[tauri::command]
+pub fn fm_new_file(root: String, rel: String, name: String) -> Result<String, String> {
+    new_file(&root, &rel, &name)
 }
 
 #[tauri::command]

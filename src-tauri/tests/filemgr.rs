@@ -13,7 +13,9 @@
 //! wrong in a way that matters. The `ShellExecuteW` / `xdg-open` call itself is on
 //! the human GUI-validation list.
 
-use loomux_lib::filemgr::{delete, delete_mode, list, new_folder, open_default, rename, validate_name};
+use loomux_lib::filemgr::{
+    delete, delete_mode, list, new_file, new_folder, open_default, rename, validate_name,
+};
 use std::fs;
 use std::path::Path;
 
@@ -58,6 +60,7 @@ fn every_operation_refuses_to_escape_the_root() {
         delete(rp, "../secret.txt").err(),
         rename(rp, "../secret.txt", "pwned.txt").err(),
         new_folder(rp, "..", "pwned").err(),
+        new_file(rp, "..", "pwned.txt").err(),
         open_default(rp, "../secret.txt").err(),
     ] {
         let e = e.expect("a `..` path must be refused, not acted on");
@@ -406,4 +409,63 @@ fn ops_on_a_symlink_entry_itself_are_refused_and_the_target_survives() {
         fs::symlink_metadata(root.path().join("link")).is_ok(),
         "and the link entry itself is left alone"
     );
+}
+
+// ---------- new file (human demo feedback, #214) ----------
+
+#[test]
+fn new_file_creates_an_empty_file_and_refuses_to_clobber() {
+    // Mirrors the new_folder contract exactly — same validation path, same containment
+    // choke point, same refuse-don't-clobber rule. The only differences that matter:
+    // what lands on disk is a file, and it is EMPTY (loomux does not decide what a
+    // file the user just made is for — their next double-click hands it to their app).
+    let root = tempfile::tempdir().unwrap();
+    let rp = root.path().to_str().unwrap();
+    fs::create_dir(root.path().join("sub")).unwrap();
+
+    let rel = new_file(rp, "sub", "notes.md").unwrap();
+    assert_eq!(rel, "sub/notes.md", "returns the new entry's rel, forward-slashed");
+    let made = root.path().join("sub/notes.md");
+    assert!(made.is_file());
+    assert_eq!(fs::read(&made).unwrap().len(), 0, "a NEW file is empty");
+
+    // A second create with the same name is an ERROR, never a silent no-op — and in
+    // particular never a truncation of the file that's already there.
+    let e = new_file(rp, "sub", "notes.md").unwrap_err();
+    assert_eq!(err_code(&e), "exists", "got: {e}");
+}
+
+#[test]
+fn new_file_never_truncates_an_existing_file() {
+    // The decisive assertion behind `create_new(true)`: the refusal must leave the
+    // existing file's CONTENT alone. A plain `File::create` would have emptied it.
+    let root = tempfile::tempdir().unwrap();
+    let rp = root.path().to_str().unwrap();
+    fs::write(root.path().join("precious.txt"), "do not lose me").unwrap();
+
+    assert_eq!(err_code(&new_file(rp, "", "precious.txt").unwrap_err()), "exists");
+    assert_eq!(
+        fs::read_to_string(root.path().join("precious.txt")).unwrap(),
+        "do not lose me"
+    );
+}
+
+#[test]
+fn new_file_at_the_root_uses_an_empty_rel() {
+    let root = tempfile::tempdir().unwrap();
+    let rel = new_file(root.path().to_str().unwrap(), "", "top.txt").unwrap();
+    assert_eq!(rel, "top.txt");
+    assert!(root.path().join("top.txt").is_file());
+}
+
+#[test]
+fn new_file_rejects_bad_names_through_the_same_validator_as_new_folder() {
+    // Not a separate name policy — the same `validate_name`. A separator is the
+    // load-bearing case: it would turn "create here" into "create somewhere else".
+    let root = tempfile::tempdir().unwrap();
+    let rp = root.path().to_str().unwrap();
+    for bad in ["", "  ", ".", "..", "a/b.txt", "a\\b.txt", "trailing.", "con"] {
+        let e = new_file(rp, "", bad).unwrap_err();
+        assert_eq!(err_code(&e), "invalid-name", "for {bad:?}: {e}");
+    }
 }

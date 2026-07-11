@@ -26,6 +26,13 @@ export const fmList = (root: string, rel: string): Promise<FmEntry[]> =>
 export const fmNewFolder = (root: string, rel: string, name: string): Promise<string> =>
   invoke("fm_new_folder", { root, rel, name });
 
+/** Create an EMPTY file named `name` inside `rel`. Resolves to the new entry's `rel`.
+ *  Refuses to clobber — and, crucially, refuses without truncating: an existing file
+ *  keeps its contents. It is not opened afterwards; the user's double-click is what
+ *  hands it to their default app. */
+export const fmNewFile = (root: string, rel: string, name: string): Promise<string> =>
+  invoke("fm_new_file", { root, rel, name });
+
 /** Rename the entry at `rel` to `name`, in place. Resolves to its new `rel`.
  *  `name` is one path segment, so this can only re-label — never move. */
 export const fmRename = (root: string, rel: string, name: string): Promise<string> =>

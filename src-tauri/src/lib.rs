@@ -161,6 +161,7 @@ pub fn run() {
             fileedit::ft_replace,
             filemgr::fm_list,
             filemgr::fm_new_folder,
+            filemgr::fm_new_file,
             filemgr::fm_rename,
             filemgr::fm_delete,
             filemgr::fm_delete_mode,

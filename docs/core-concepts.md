@@ -48,7 +48,9 @@ window per project.
 - **Double-click a file → it opens in your default app for that extension**, exactly
   like Explorer. A `.png` goes to your image viewer, a `.pdf` to your PDF reader,
   a `.docx` to Word. Loomux doesn't open it and has no opinion about its type.
-- **New folder** (`Ctrl+Shift+N`), **rename** (`F2`), **delete** (`Del`).
+- **New file** (`Ctrl+N`) and **new folder** (`Ctrl+Shift+N`) — type the name inline.
+  A new file is created **empty** and is *not* opened; double-click it when you want it.
+- **Rename** (`F2`) and **delete** (`Del`).
 - On Windows, delete goes to the **Recycle Bin**, so a mis-click is recoverable —
   and the confirmation says so. On macOS/Linux there's no bin, so it's permanent,
   and the confirmation says *that* instead. It never promises an undo you don't have.
@@ -71,6 +73,10 @@ and each keystroke filters that index in memory.
 - `↑` / `↓` pick a result, `Enter` opens it **in its default app**, `Esc` clears the
   box. Opening a hit also navigates you to its folder with it selected, so you end
   up somewhere useful rather than back where you started.
+- **Rename and delete work on a search result too**, and act on *that* file: press
+  `F2` (or the toolbar buttons) with a result highlighted. Rename takes you to the
+  file's folder and opens the editor on it, so you can see exactly what you are
+  renaming.
 
 If more files match than the list shows, the count above it tells you — results are
 never cut silently. (The same box is in the `Alt+F` editor too, where `Enter` opens
