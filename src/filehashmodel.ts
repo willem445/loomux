@@ -1,0 +1,150 @@
+// Pure hashing logic for the file-manager pane (#214). DOM-free, so the cache keying,
+// the auto-hash policy, and the digest formatting are unit-tested (test/filehashmodel.test.ts).
+// The worker/streaming/cancel wiring is in fileexplorer.ts; the digests themselves are
+// computed in Rust (filehash.rs) and checked there against published FIPS/CRC vectors.
+
+/** The algorithms the Hash → submenu offers. The wire names the backend parses. */
+export type HashAlgo = "sha256" | "sha512" | "sha1" | "crc32" | "crc16" | "crc8";
+
+/** Menu labels. The CRC variants are NAMED, because "CRC-16" on its own is genuinely
+ *  ambiguous (there are dozens) and a user comparing our checksum against someone
+ *  else's needs to know which one they're looking at. */
+export const HASH_ALGOS: { algo: HashAlgo; label: string }[] = [
+  { algo: "sha256", label: "SHA-256" },
+  { algo: "sha512", label: "SHA-512" },
+  { algo: "sha1", label: "SHA-1" },
+  { algo: "crc32", label: "CRC-32 (ISO-HDLC)" },
+  { algo: "crc16", label: "CRC-16 (ARC)" },
+  { algo: "crc8", label: "CRC-8 (SMBUS)" },
+];
+
+export function algoLabel(algo: HashAlgo): string {
+  return HASH_ALGOS.find((a) => a.algo === algo)?.label ?? algo;
+}
+
+/** The algorithm the LISTING column shows. SHA-256 is what "the hash of this file"
+ *  means to most people, and it's what the human asked for. */
+export const COLUMN_ALGO: HashAlgo = "sha256";
+
+/** Auto-hash files up to this size; above it the column offers a click-to-hash instead.
+ *
+ *  WHY A THRESHOLD AT ALL. Opening a directory must never cost you a disk read of every
+ *  byte in it. A folder of source files is nothing (a few MB, done before you've focused
+ *  the window); a folder of ISOs, VM images or datasets is *gigabytes*, and hashing them
+ *  unasked would spin the disk for minutes for a column nobody was looking at.
+ *
+ *  WHY 32 MiB. It's above essentially all source, config, images and documents — the
+ *  things you're actually likely to want a checksum of from a file manager — and below
+ *  the archive/media/dataset sizes where the cost stops being free. A 32 MiB SHA-256 is
+ *  ~30–60 ms, so even a directory of 50 at the limit finishes in a couple of seconds of
+ *  background work, off-thread and cancelled the moment you navigate away.
+ *
+ *  Above it the cell says "hash" and hashes on click. Nothing is hidden: a big file's
+ *  hash is one click away, and the click is the user saying "yes, spend that". */
+export const AUTO_HASH_MAX_BYTES = 32 * 1024 * 1024;
+
+/** How many hex chars of the digest the column shows. Enough to be a useful fingerprint
+ *  at a glance; the full digest is one click (copy) or one right-click (Hash →) away. */
+export const SHORT_DIGEST_CHARS = 12;
+
+export function shortDigest(full: string): string {
+  return full.slice(0, SHORT_DIGEST_CHARS);
+}
+
+/** What one row's hash cell is currently showing. */
+export type HashCell =
+  /** A directory (or a symlink — never followed): there is no file to hash. */
+  | { kind: "none" }
+  /** Over the auto threshold — the user clicks to spend the read. */
+  | { kind: "on-demand" }
+  /** Queued or computing. */
+  | { kind: "pending" }
+  | { kind: "done"; full: string; short: string }
+  | { kind: "error"; message: string };
+
+// ---------- the cache ----------
+
+/** Cache key: path + size + mtime.
+ *
+ *  Size AND mtime, not just mtime: a same-size edit that lands within the filesystem's
+ *  mtime granularity would otherwise serve a stale digest — and a *stale hash* is worse
+ *  than no hash, because it looks authoritative. Cheap insurance; the two together are
+ *  what makes "the file changed" observable without re-reading it.
+ *
+ *  (There is no absolute-path component because a cache belongs to one pane, and a pane
+ *  belongs to one root. A re-root drops the cache.)
+ *
+ *  The separator is NUL because it is the one byte a path cannot contain, so no filename —
+ *  however adversarial — can forge a collision by embedding the separator itself. It is
+ *  written as the two-character ESCAPE `\0` and must never be typed as a literal 0x00: a
+ *  raw NUL in the source makes git classify the whole FILE as binary, and it then has no
+ *  diff and no blame, forever. Identical runtime string; the escape is not a style
+ *  preference. (It shipped as a literal once — rev-106 caught it.) */
+export function hashCacheKey(rel: string, size: number, mtimeMs: number): string {
+  return `${rel}\0${size}\0${mtimeMs}`;
+}
+
+/** The digest cache: key → full digest. Plain Map; the caller owns its lifetime. */
+export type HashCache = Map<string, string>;
+
+/** The subset of an entry hashing cares about. */
+export interface HashableEntry {
+  name: string;
+  is_dir: boolean;
+  is_symlink: boolean;
+  size: number;
+  modified_ms: number;
+}
+
+/** What to render, and what to ask the backend for, when a directory listing appears.
+ *
+ *  Pure: given the rows, the cache and the current directory, it decides every cell and
+ *  returns the exact list of rels the worker should hash. Directories and symlinks are
+ *  skipped entirely (there is nothing to hash and a link must never be followed); an
+ *  over-threshold file becomes a click-to-hash cell rather than silently costing a
+ *  gigabyte read; a cache hit is served without touching the disk at all. */
+export function planListingHashes(
+  entries: readonly HashableEntry[],
+  dir: string,
+  cache: HashCache,
+  maxAutoBytes: number = AUTO_HASH_MAX_BYTES
+): { cells: Map<string, HashCell>; toHash: string[] } {
+  const cells = new Map<string, HashCell>();
+  const toHash: string[] = [];
+  for (const e of entries) {
+    const rel = dir ? `${dir}/${e.name}` : e.name;
+    if (e.is_dir || e.is_symlink) {
+      cells.set(rel, { kind: "none" });
+      continue;
+    }
+    const cached = cache.get(hashCacheKey(rel, e.size, e.modified_ms));
+    if (cached !== undefined) {
+      cells.set(rel, { kind: "done", full: cached, short: shortDigest(cached) });
+      continue;
+    }
+    if (e.size > maxAutoBytes) {
+      cells.set(rel, { kind: "on-demand" });
+      continue;
+    }
+    cells.set(rel, { kind: "pending" });
+    toHash.push(rel);
+  }
+  return { cells, toHash };
+}
+
+/** Remember a digest against the entry it was computed from. Returns false (and stores
+ *  nothing) when the entry isn't in the listing any more — caching a digest against a
+ *  size/mtime we can't observe would be caching a key nobody will ever look up. */
+export function rememberDigest(
+  cache: HashCache,
+  rel: string,
+  entries: readonly HashableEntry[],
+  dir: string,
+  digest: string
+): boolean {
+  const name = rel.slice(dir ? dir.length + 1 : 0);
+  const entry = entries.find((e) => e.name === name);
+  if (!entry) return false;
+  cache.set(hashCacheKey(rel, entry.size, entry.modified_ms), digest);
+  return true;
+}

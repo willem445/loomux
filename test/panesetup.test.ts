@@ -109,6 +109,33 @@ test("orchestrator with a repo validates and trims", () => {
   assert.ok(res.ok && res.plan.kind === "orchestrator" && res.plan.repo === "/repo/x");
 });
 
+// ---------- files (#214) ----------
+
+test("a file explorer needs a folder — it does NOT fall back to home like a terminal", () => {
+  // A terminal with no repo opens in home, which is useful. A file tree over the
+  // whole home directory is not, and a rootless files pane has no content at all —
+  // so this is a hard error that bounces the user back to the field.
+  const res = planPaneSetup(input({ kind: "files", repo: "  " }));
+  assert.equal(res.ok, false);
+  assert.ok(!res.ok && res.focus === "repo");
+  assert.match(res.ok ? "" : res.error, /folder/i);
+});
+
+test("a file explorer plans a root + name, and nothing else — no command, no shell", () => {
+  const res = planPaneSetup(input({ kind: "files", repo: "  C:/Projects/loomux  ", name: " code " }));
+  assert.ok(res.ok);
+  // Deep-equal, not a field spot-check: the whole point of this kind is that it
+  // carries NO spawn inputs. An extra command/argv/shellKind sneaking into the plan
+  // would mean something is about to start a process in a pane that must never have one.
+  assert.deepEqual(res.plan, { kind: "files", root: "C:/Projects/loomux", name: "code" });
+});
+
+test("a file explorer's name defaults to the folder's own short name", () => {
+  const res = planPaneSetup(input({ kind: "files", repo: "C:\\Projects\\loomux\\", name: "" }));
+  assert.ok(res.ok && res.plan.kind === "files");
+  assert.equal(res.plan.name, "loomux");
+});
+
 // ---------- agent ----------
 
 test("agent with a built-in CLI validates", () => {

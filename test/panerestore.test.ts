@@ -68,6 +68,32 @@ test("an agent WITHOUT a session id falls back to a dormant Start placeholder", 
   });
 });
 
+// ---------- files (#214) ----------
+
+test("a file explorer pane reopens at its recorded root — no process, no session", () => {
+  const action = planPaneRestore(pane({ paneKind: "files", name: "loomux", cwd: "C:/Projects/loomux" }));
+  assert.deepEqual(action, { type: "open-files", name: "loomux", root: "C:/Projects/loomux" });
+});
+
+test("a files pane is never asked to resume, even if a session id somehow rode along", () => {
+  // The rule is keyed on KIND, like the group rule above: a files pane has no
+  // process to resume into, so a stray sessionId must not send it down an agent path.
+  const action = planPaneRestore(
+    pane({ paneKind: "files", name: "docs", cwd: "/docs", sessionId: "abc-123", command: "claude" }),
+    () => true
+  );
+  assert.deepEqual(action, { type: "open-files", name: "docs", root: "/docs" });
+});
+
+test("a files pane with NO recorded root surfaces a null root for the caller to fail soft on", () => {
+  // Whether the folder still EXISTS is I/O this pure module can't do, so the missing
+  // /deleted-root case is expressed as `root: null | <path>` and resolved by main.ts
+  // (which probes it and falls back to the welcome form in that slot). Pinning null
+  // here keeps that contract: we hand the caller the problem, we don't invent a root.
+  const action = planPaneRestore(pane({ paneKind: "files", name: "files", cwd: null }));
+  assert.deepEqual(action, { type: "open-files", name: "files", root: null });
+});
+
 test("an orchestration pane ALWAYS restores dormant — never auto-resumed", () => {
   // The one credit/process-storm-sensitive case (#83/#78): a group is only ever
   // revived by the human via resumeOrchSession, so restore must not spawn it.

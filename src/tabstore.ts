@@ -40,8 +40,13 @@ export type RestorePref = "ask" | "restore" | "fresh";
 /** The kind of a persisted pane leaf. Distinct from panesetup's setup-time
  *  `PaneKind` ("orchestrator" spawns a whole tab): here "orch" tags any
  *  orchestration pane (orchestrator / worker / reviewer) so restore keeps the
- *  whole group DORMANT and lets the group-resume path revive it. */
-export type PersistedPaneKind = "terminal" | "agent" | "orch";
+ *  whole group DORMANT and lets the group-resume path revive it.
+ *
+ *  "files" (#214) is the PTY-less file-explorer pane. It needs NO new persisted
+ *  field: its root rides in the existing `cwd`, exactly as `role` rode into the
+ *  schema for orch panes — decode is shape-driven, so old files (which simply
+ *  never carry a "files" leaf) are unaffected and SCHEMA_VERSION stays at 2. */
+export type PersistedPaneKind = "terminal" | "agent" | "orch" | "files";
 
 /** One pane at a layout leaf, reduced to what restore needs. Never the live
  *  PTY/buffer — those are deliberately not captured (cost/#78 process-storm and
@@ -49,7 +54,10 @@ export type PersistedPaneKind = "terminal" | "agent" | "orch";
 export interface PersistedPane {
   paneKind: PersistedPaneKind;
   name: string;
-  /** Directory to restore into — the pane's live cwd when captured; null = home. */
+  /** Directory to restore into — the pane's live cwd when captured; null = home.
+   *  For kind "files" this is the tree's ROOT (#214), and it is the one thing
+   *  that pane needs; a null root there is unrestorable (the slot fails soft to
+   *  the welcome form) rather than a decode failure. */
   cwd: string | null;
   /** Agent/command spawn line (kind "agent"); null for terminals. */
   command: string | null;
@@ -139,7 +147,7 @@ function decodePane(v: unknown): PersistedPane | null {
   if (!v || typeof v !== "object") return null;
   const r = v as Record<string, unknown>;
   const kind = r.paneKind;
-  if (kind !== "terminal" && kind !== "agent" && kind !== "orch") return null;
+  if (kind !== "terminal" && kind !== "agent" && kind !== "orch" && kind !== "files") return null;
   if (typeof r.name !== "string" || !r.name.trim()) return null;
   const argvOk = Array.isArray(r.argv) && r.argv.every((a) => typeof a === "string");
   return {

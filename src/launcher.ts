@@ -8,6 +8,12 @@
 //                  or Git Bash (#194 P2). Git Bash is enabled only when a
 //                  Git-for-Windows install is discovered (else disabled, with a
 //                  reason surfaced on the option).
+//   File explorer— a PTY-less pane hosting a native-style file MANAGER rooted at a
+//                  folder (#214): browse, open a file in the OS default app for its
+//                  extension, new folder / rename / delete, jump-to-file by name.
+//                  Its only input is that folder, and it is validated for real (does
+//                  the directory exist?) before the pane is made, so a typo'd path
+//                  shows an inline error instead of a broken pane.
 //
 // This replaces the old modal launcher AND the global "agent mode" toggle: there
 // is no global mode anymore, every pane declares its kind here at creation. The
@@ -28,6 +34,7 @@ import {
   resolveShellKind,
 } from "./panesetup";
 import { discoverGitBash } from "./pty";
+import { ftRootIsDir } from "./fileapi";
 import {
   AGENTS,
   addRecentRepo,
@@ -57,7 +64,10 @@ export interface AgentLaunchSpec {
 export type WelcomeResult =
   | { kind: "terminal"; name: string; cwd?: string; shellKind: ShellKind }
   | { kind: "panes"; specs: AgentLaunchSpec[] }
-  | { kind: "orchestrator"; config: OrchestratorConfig };
+  | { kind: "orchestrator"; config: OrchestratorConfig }
+  /** A file-explorer pane (#214): `root` is a directory this form has already
+   *  confirmed exists, so the caller converts the setup pane in place. */
+  | { kind: "files"; name: string; root: string };
 
 /** Orchestration roles the setup form configures a CLI + model for. Mirrors the
  *  backend `Role` variants that can be spawned in a group (issue #4/#47). */
@@ -222,6 +232,10 @@ export class WelcomeForm {
    *  available on Windows. */
   private shellAvail: ShellKindAvailability = { gitBashPath: null };
   private repoField: HTMLElement;
+  /** The repo field's caption. The same control is the Agent/Orchestrator
+   *  "Repository" and the File-explorer "Folder" (#214) — one path input, two
+   *  names, so the label follows the kind rather than lying about one of them. */
+  private repoLabel: HTMLElement;
   private repoInput: HTMLInputElement;
   private repoList: HTMLDataListElement;
   private worktreeField: HTMLElement;
@@ -266,7 +280,11 @@ export class WelcomeForm {
    *  result fires (the pane is being converted/retired). */
   private latch = new SubmitLatch();
 
-  constructor() {
+  /** `defaultFolder` seeds the path field: the working directory of the pane this
+   *  one is splitting from (or the tab's active pane), so a file explorer opened
+   *  beside an agent defaults to THAT agent's worktree rather than to whatever repo
+   *  was last used app-wide (#214). Falls back to the most recent repo, as before. */
+  constructor(defaultFolder?: string) {
     this.el = document.createElement("div");
     this.el.className = "welcome-form";
 
@@ -283,6 +301,7 @@ export class WelcomeForm {
       ["agent", "Agent — a coding-agent CLI"],
       ["orchestrator", "Orchestrator + workers"],
       ["terminal", "Terminal — a shell"],
+      ["files", "File explorer — browse files, open in their default app"],
     ]);
     this.kindSel.addEventListener("change", () => this.applyKind());
 
@@ -351,6 +370,7 @@ export class WelcomeForm {
     repoRow.className = "dlg-row";
     repoRow.append(this.repoInput, browse, this.repoList);
     this.repoField = field("Repository", repoRow);
+    this.repoLabel = this.repoField.querySelector<HTMLElement>(".dlg-label")!;
 
     this.worktreeInput = document.createElement("input");
     this.worktreeInput.className = "dlg-input";
@@ -507,7 +527,7 @@ export class WelcomeForm {
     this.agentSel.value = getDefaultAgent().id;
     this.customInput.value = getCustomCommand();
     const recent = getRecentRepos();
-    this.repoInput.value = recent[0] ?? "";
+    this.repoInput.value = defaultFolder?.trim() || recent[0] || "";
     this.repoList.replaceChildren(
       ...recent.map((p) => {
         const opt = document.createElement("option");
@@ -529,7 +549,10 @@ export class WelcomeForm {
     const agent = k === "agent";
     const orch = k === "orchestrator";
     const term = k === "terminal";
-    this.agentField.hidden = term; // agent + orchestrator both pick a CLI
+    const files = k === "files";
+    // A file explorer picks no CLI and spawns nothing: its ONLY input is the folder
+    // (plus a name), so every other field is out (#214).
+    this.agentField.hidden = term || files; // agent + orchestrator both pick a CLI
     this.customField.hidden = !agent || this.agentSel.value !== "custom";
     this.countField.hidden = !agent;
     this.shellField.hidden = !term;
@@ -537,6 +560,11 @@ export class WelcomeForm {
     this.autopilotField.hidden = !agent;
     this.orchFields.hidden = !orch;
     this.nameField.hidden = orch; // orchestrator names its panes from the roles
+    // Same control, honest caption: a folder to browse, not a repository to work in.
+    this.repoLabel.textContent = files ? "Folder" : "Repository";
+    this.repoInput.placeholder = files
+      ? "Folder to browse — required"
+      : "Repository or folder — empty for home";
     this.applyOrchCli();
     this.applyAutopilot();
     this.updateName();
@@ -631,9 +659,9 @@ export class WelcomeForm {
   }
 
   /** The program a given launch would execute (first token of the command), or
-   *  null for a terminal (no CLI to probe). */
+   *  null for a terminal / file explorer (no CLI to probe — neither runs one). */
   private currentProgram(): string | null {
-    if (this.kind === "terminal") return null;
+    if (this.kind === "terminal" || this.kind === "files") return null;
     if (this.kind === "orchestrator") return this.orchCliFor(this.agentSel.value).id;
     const agent = AGENTS.find((a) => a.id === this.agentSel.value) ?? AGENTS[0];
     const command = agent.id === "custom" ? this.customInput.value.trim() : agent.command;
@@ -652,8 +680,8 @@ export class WelcomeForm {
    *  mode every role's CLI is checked; the first missing one is surfaced.
    *  Terminals have no CLI, so the warning is cleared. */
   private updateAgentWarning(): void {
-    if (this.kind === "terminal") {
-      this.agentWarn.classList.remove("visible");
+    if (this.kind === "terminal" || this.kind === "files") {
+      this.agentWarn.classList.remove("visible"); // no CLI involved — nothing to warn about
       return;
     }
     if (this.kind === "orchestrator") {
@@ -687,11 +715,17 @@ export class WelcomeForm {
   }
 
   /** Auto-fill the pane name until hand-edited: `agent · where` for an agent,
-   *  `shell · where` for a terminal. */
+   *  `shell · where` for a terminal, the folder's own name for a file explorer. */
   private updateName(): void {
     if (this.nameDirty) return;
     const where =
       this.worktreeInput.value.trim() || basename(this.repoInput.value.trim()) || "home";
+    if (this.kind === "files") {
+      // The root's short name IS the useful title here — a "files · " prefix would
+      // just eat width in the header for something the pane's icon already says.
+      this.nameInput.value = basename(this.repoInput.value.trim()) || "files";
+      return;
+    }
     if (this.kind === "terminal") {
       const shell = shellKindOptions(this.shellAvail).find((s) => s.key === this.shellSel.value);
       this.nameInput.value = `${(shell?.label ?? "shell").toLowerCase()} · ${where}`;
@@ -791,6 +825,24 @@ export class WelcomeForm {
       if (plan.cwd) addRecentRepo(plan.cwd);
       this.setBusy(true, "Starting…");
       this.fire({ kind: "terminal", name: plan.name, cwd: plan.cwd ?? undefined, shellKind });
+      return;
+    }
+
+    if (plan.kind === "files") {
+      // The root must really be there. A terminal or agent in a bad cwd at least
+      // fails loudly in its own output; a file explorer would just render an empty
+      // tree with no explanation — so probe first and bounce the user back to the
+      // field with an inline error, exactly like a missing CLI (#214).
+      this.setBusy(true, "Opening…");
+      if (!(await ftRootIsDir(plan.root))) {
+        this.showError(`Folder not found (or not a directory): ${plan.root}`);
+        this.repoInput.focus();
+        this.setBusy(false);
+        this.latch.release();
+        return;
+      }
+      addRecentRepo(plan.root);
+      this.fire({ kind: "files", name: plan.name, root: plan.root });
       return;
     }
 

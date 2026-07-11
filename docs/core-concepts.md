@@ -18,10 +18,117 @@ nav_order: 3
 
 ## Panes
 
-A **pane** is one terminal. Every pane runs a real PTY — a shell, an agent CLI,
-or anything else you'd run in a terminal — with full color, escape-sequence, and
-wide-character fidelity. Panes can be **named** (`F2`, or double-click the
-title) so a wall of agents stays legible.
+A **pane** is one slot in the grid. Most panes are a terminal — a real PTY
+running a shell, an agent CLI, or anything else you'd run in a terminal, with
+full color, escape-sequence, and wide-character fidelity. Panes can be **named**
+(`F2`, or double-click the title) so a wall of agents stays legible.
+
+### Pane kinds
+
+Every pane starts on the **welcome screen**, where you pick what it becomes.
+There is no global mode — each pane declares its own kind:
+
+| Kind | What it is |
+| --- | --- |
+| **Agent** | A coding-agent CLI (Claude, Copilot, or your own command). Optionally fans out to *N* panes, each in its own git worktree. |
+| **Orchestrator + workers** | An orchestrator pane plus idle workers, in its own project tab, with guardrails. See the [orchestration guide](orchestration). |
+| **Terminal** | A plain shell — PowerShell, Command Prompt, or Git Bash. |
+| **File explorer** | A native-style **file manager** rooted at a folder you choose. |
+
+### The file explorer pane
+
+A **file explorer** pane is loomux's Windows-Explorer equivalent, living inside a
+pane. Pick a folder and you get a real file manager: browse it, open things, and
+do the usual housekeeping — without leaving loomux or opening an OS Explorer
+window per project.
+
+- **Browse** — double-click a folder to go in; the breadcrumb and the **↑** button
+  take you back out. `Backspace` (or `Alt+←`) goes up, arrow keys move the
+  selection, `Enter` opens.
+- **Double-click a file → it opens in your default app for that extension**, exactly
+  like Explorer. A `.png` goes to your image viewer, a `.pdf` to your PDF reader,
+  a `.docx` to Word. Loomux doesn't open it and has no opinion about its type.
+- **New file** (`Ctrl+N`) and **new folder** (`Ctrl+Shift+N`) — type the name inline.
+  A new file is created **empty** and is *not* opened; double-click it when you want it.
+- **Rename** (`F2`) and **delete** (`Del`).
+- On Windows, delete goes to the **Recycle Bin**, so a mis-click is recoverable —
+  and the confirmation says so. On macOS/Linux there's no bin, so it's permanent,
+  and the confirmation says *that* instead. It never promises an undo you don't have.
+- A delete runs **off the UI thread**: a `node_modules`-sized folder can take a while,
+  and nothing else in loomux stops while it does. The row pulses, the status line names
+  what's going, and the ops that would write to the same tree wait their turn — but you
+  can keep browsing, hashing and opening files throughout. There is no Cancel, because
+  a delete stopped halfway leaves half a folder in the Recycle Bin and half on disk;
+  once you confirm, it finishes.
+- **Hidden** toggle — shows hidden files, and widens the Go-to-file index to include
+  git-ignored paths (`node_modules`, build output).
+
+#### Right-click menu
+
+Right-click a row for **Open**, **Open with…** (the OS chooser — Windows only), **Reveal
+in file explorer** (opens your OS file manager with the file selected), **Rename**,
+**Delete**, **Hash →**, and **New →**. Right-click the empty space below the rows for
+**New →** on its own.
+
+The menu acts on **the row you right-clicked** — always, even if the list re-sorts or a
+search finishes underneath it while the menu is open. It works the same on a **Go-to-file
+result**: right-click a search hit and you get the same menu, acting on that file.
+
+A **symlink** row's actions are greyed with a reason — loomux shows links but never follows
+or modifies them.
+
+#### Hashes
+
+The listing carries a short **SHA-256** for every file. It is computed in the
+background, off the UI thread, and streamed in — opening a folder never waits on it, and
+navigating away cancels it. Click a digest to copy the full value.
+
+- Digests are cached per file, keyed by its **size and modification time**, so
+  re-entering a folder is instant and editing a file re-hashes it.
+- Files over **32 MB** show a **hash** link instead of a digest: reading a gigabyte
+  unasked isn't free, so that one's your call. Click it and it hashes.
+- **Hash →** in the right-click menu computes any of **SHA-256, SHA-512, SHA-1, CRC-32,
+  CRC-16, CRC-8** on demand and shows the full digest in a copyable dialog. (The CRC
+  variants are named — ISO-HDLC, ARC, SMBUS — because a bare "CRC-16" is ambiguous and
+  you need to know which one you're comparing against.)
+
+This is **not** the in-app editor. That's the `Alt+F` overlay, it still works
+everywhere, and it's the right tool for a quick look or a one-line fix. The
+explorer is the one for *"get this file into the application that owns it."*
+
+#### Go to file
+
+The **Go to file** box finds a file by **name**, anywhere under the pane's root.
+It's built to be instant: the folder's paths are indexed once in the background,
+and each keystroke filters that index in memory.
+
+- Type any part of a name or path — matching is plain substring, case-insensitive.
+- **Several terms, separated by spaces, must all match** somewhere in the path:
+  `pane rest` finds `src/panerestore.ts`, and `src pane` finds `src/pane.ts`.
+- `↑` / `↓` pick a result, `Enter` opens it **in its default app**, `Esc` clears the
+  box. Opening a hit also navigates you to its folder with it selected, so you end
+  up somewhere useful rather than back where you started.
+- **Rename and delete work on a search result too**, and act on *that* file: press
+  `F2` (or the toolbar buttons) with a result highlighted. Rename takes you to the
+  file's folder and opens the editor on it, so you can see exactly what you are
+  renaming.
+
+If more files match than the list shows, the count above it tells you — results are
+never cut silently. (The same box is in the `Alt+F` editor too, where `Enter` opens
+the file *in the editor* instead.)
+
+#### The rest of the pane
+
+It has no terminal underneath and never starts a process. That means the
+terminal-oriented chrome is gone from its header (no folder or branch chip; the
+git, issues, and file-editor overlays don't apply — `Alt+G` / `Alt+I` will tell you
+so). Everything else is a normal pane: it splits, drags, docks, maximizes, renames,
+and comes back on session restore at the same folder. It is **not** an agent, so it
+never counts toward a tab's agent badge.
+
+If the folder is gone when a session is restored (deleted, renamed, or on a drive
+that isn't mounted), that pane comes back as the welcome screen with a message
+instead of an empty listing — pick a new folder and carry on.
 
 ## The split grid
 

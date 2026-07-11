@@ -194,6 +194,22 @@ const NESTED_LAYOUT: PersistedLayoutNode = {
             role: "orchestrator",
           },
         },
+        {
+          // A file-explorer pane (#214): its root rides in `cwd`, and every
+          // spawn-shaped field is null — it has no process to describe.
+          kind: "leaf",
+          weight: 1,
+          pane: {
+            paneKind: "files",
+            name: "loomux",
+            cwd: "C:/Projects/loomux",
+            command: null,
+            argv: null,
+            shellKind: null,
+            sessionId: null,
+            role: null,
+          },
+        },
       ],
     },
   ],
@@ -207,6 +223,68 @@ test("layout tree round-trips exactly (nested split, weights, all pane kinds)", 
   };
   const back = decodeTabs(encodeTabs(state));
   assert.deepEqual(back?.tabs[0].layout, NESTED_LAYOUT);
+});
+
+// ---------- #214 file-explorer leaves ----------
+
+test("a files leaf round-trips its root — and needed NO new field or schema bump", () => {
+  const files: PersistedPane = {
+    paneKind: "files",
+    name: "loomux",
+    cwd: "C:/Projects/loomux",
+    command: null,
+    argv: null,
+    shellKind: null,
+    sessionId: null,
+    role: null,
+  };
+  const state: PersistedTabs = {
+    tabs: [
+      { name: "t", color: null, groupId: null, layout: { kind: "leaf", weight: 1, pane: files } },
+    ],
+    activeIndex: 0,
+  };
+  const back = decodeTabs(encodeTabs(state));
+  const leaf = back?.tabs[0].layout;
+  assert.ok(leaf?.kind === "leaf");
+  assert.deepEqual(leaf.pane, files);
+  // The root rides in the EXISTING `cwd`, exactly as `role` rode in for orch panes —
+  // so the decoder stays shape-driven and v2 files (which simply never contain a
+  // "files" leaf) still decode unchanged. A bump here would be a false signal.
+  assert.equal(back?.schemaVersion, 2);
+});
+
+test("a files leaf with no root decodes (null) rather than dropping the whole tab layout", () => {
+  // The strict whole-tree fail-safe is for MALFORMED data. A rootless files leaf is
+  // well-formed but unrestorable, and killing the entire tab's layout over it would
+  // punish every sibling pane. It decodes, and restore fails soft in that ONE slot
+  // (planPaneRestore → open-files with root null → main.ts opens the welcome form).
+  const raw = JSON.stringify({
+    tabs: [
+      {
+        name: "t",
+        color: null,
+        groupId: null,
+        layout: {
+          kind: "split",
+          dir: "row",
+          weight: 1,
+          children: [
+            { kind: "leaf", weight: 1, pane: { paneKind: "terminal", name: "shell" } },
+            { kind: "leaf", weight: 1, pane: { paneKind: "files", name: "files" } }, // no cwd
+          ],
+        },
+      },
+    ],
+    activeIndex: 0,
+  });
+  const layout = decodeTabs(raw)?.tabs[0].layout;
+  assert.ok(layout?.kind === "split");
+  assert.equal(layout.children.length, 2, "the sibling terminal survives");
+  const filesLeaf = layout.children[1];
+  assert.ok(filesLeaf.kind === "leaf");
+  assert.equal(filesLeaf.pane.paneKind, "files");
+  assert.equal(filesLeaf.pane.cwd, null);
 });
 
 test("a malformed layout node degrades that tab's whole layout to null (not a throw)", () => {

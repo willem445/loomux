@@ -18,6 +18,7 @@ import {
   type SessionInfo,
 } from "./pty";
 import { matchShortcut } from "./shortcuts";
+import { ftRootIsDir } from "./fileapi";
 import { voiceController } from "./voicecontrol";
 import { initStatusBar } from "./statusbar";
 import { initHintBar } from "./hintbar";
@@ -134,6 +135,9 @@ function eventsFor(ws: Workspace): PaneEvents {
       const groupId = pane.orchGroupId;
       if (groupId) ws.grid.toggleGroupMinimize(groupId);
     },
+    // A files pane re-rooted, or a pane was renamed: the persisted layout is stale
+    // but no grid event fired, so nothing else would save it (#214).
+    onRecordChanged: () => onGridChanged(),
   };
 }
 
@@ -474,6 +478,23 @@ async function openActionPane(
       pane = ws.grid.openDormantPane(events, record, content, dir, anchor);
       return pane;
     }
+    case "open-files": {
+      // A file explorer comes straight back — no process, no session, no credits.
+      // The one thing that can have changed under it is the folder: deleted,
+      // renamed, or on a drive that isn't mounted this boot. A pane rooted at a
+      // vanished directory would render an empty tree and a mystery, so fail SOFT
+      // to the welcome form in that slot with a message — the human re-points it in
+      // two clicks, and the rest of the layout restores around it (#214).
+      const root = a.root;
+      if (!root || !(await ftRootIsDir(root))) {
+        showToast(
+          `File explorer "${a.name}": ${root ? `folder is gone — ${root}` : "no folder was recorded"}. Pick one to reopen it.`,
+          "info"
+        );
+        return openWelcomeIn(ws, dir, anchor);
+      }
+      return ws.grid.openFilesPane(events, { name: a.name, root, background: true }, dir, anchor);
+    }
     case "dormant-group": {
       // The one credit/process-storm-sensitive case: keep the WHOLE group dormant.
       // The Resume button revives it via resumeOrchSession — the only path that
@@ -716,9 +737,17 @@ function tryResumeFallback(pane: Pane, exit: PtyExit): boolean {
 // resize a ConPTY before then (constraint 1).
 
 /** Open a welcome / pane-setup pane in `ws`, wiring its submit to spawn the
- *  chosen kind. Returns the setup pane (already placed; PTY-less until submit). */
+ *  chosen kind. Returns the setup pane (already placed; PTY-less until submit).
+ *
+ *  The form's folder field is seeded from the pane we're splitting FROM (or the
+ *  tab's active pane): its shell cwd, agent worktree, or files root. That's the
+ *  "current pane cwd context" a new pane almost always wants — most sharply for a
+ *  file explorer (#214), which should open on the project you're looking at, not
+ *  the last repo you happened to launch app-wide. Falls back to the recent-repo
+ *  default when there's no context (an empty tab, a welcome pane). */
 function openWelcomeIn(ws: Workspace, dir: "row" | "column" = "row", relativeTo?: Pane): Pane {
-  const form = new WelcomeForm();
+  const context = relativeTo ?? ws.grid.activePane;
+  const form = new WelcomeForm(context?.workdir ?? undefined);
   const pane = ws.grid.openWelcomePane(eventsFor(ws), form.el, dir, relativeTo);
   form.onSubmit = (result) => void handleWelcomeSubmit(ws, pane, form, result);
   return pane;
@@ -744,6 +773,17 @@ async function handleWelcomeSubmit(
     reapIfExited(ws, pane);
     // The setup pane converted in place — no grid open/close fired, so notify
     // explicitly (re-renders the agent counter AND persists) (#194 P4 HIGH-1).
+    onGridChanged();
+    return;
+  }
+
+  if (result.kind === "files") {
+    // Convert the setup pane into a file explorer in place (#214). Synchronous —
+    // there is no process to start, so no await, no PTY, nothing to reap. The root
+    // was confirmed to exist by the form before it fired this.
+    pane.startFiles({ name: result.name, root: result.root });
+    // Converted in place — no grid open/close fired, so notify explicitly (this is
+    // what re-renders the tab strip and re-persists the layout), same as terminal.
     onGridChanged();
     return;
   }
@@ -906,8 +946,9 @@ document.addEventListener(
         openPane("column");
         break;
       case "close-pane": {
-        const g = activeGrid();
-        if (g.activePane) g.closePane(g.activePane);
+        // Through the pane's own close request, like the header ✕ and the dock chip:
+        // one entry point for every human-initiated single-pane close (rev-100).
+        activeGrid().activePane?.requestClose();
         break;
       }
       case "new-tab":

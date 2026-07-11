@@ -24,7 +24,7 @@ import {
   ptyBackendInfo,
 } from "./pty";
 import { voiceController, type VoiceTargetPane, type VoicePhase } from "./voicecontrol";
-import type { ShellKind } from "./panesetup";
+import { pathTail, type ShellKind } from "./panesetup";
 import { invoke } from "@tauri-apps/api/core";
 import { parseOsc52, writeClipboard } from "./clipboard";
 import {
@@ -50,6 +50,7 @@ import { AuditView } from "./auditview";
 import { GroupView } from "./groupview";
 import { clampOverlayHeight, OVERLAY_MIN_H } from "./overlaysize";
 import { FileEditView } from "./fileedit";
+import { FileExplorerView } from "./fileexplorer";
 import type { PersistedPane, PersistedPaneKind } from "./tabstore";
 import type { TabPaneInfo } from "./tabcounts";
 
@@ -173,6 +174,18 @@ export interface PaneOptions {
   sessionId?: string;
 }
 
+/** What a file-explorer pane (#214) needs: the directory its tree roots at, and a
+ *  name. Deliberately NOT part of PaneOptions — every field there describes a PTY
+ *  spawn, and a files pane never has one. */
+export interface FilesPaneOptions {
+  name: string;
+  /** Absolute directory the tree roots at. Validated (exists + is a directory) by
+   *  the caller before we get here — see `ftRootIsDir`. */
+  root: string;
+  /** Open without stealing keyboard focus (same contract as PaneOptions). */
+  background?: boolean;
+}
+
 const TERM_THEME = {
   background: "#0b0b10",
   foreground: "#c9d1e3",
@@ -208,6 +221,12 @@ export interface PaneEvents {
   /** Minimize (or restore) this pane's whole orchestration group's
    *  worker/reviewer panes at once (#46). No-op off an orchestrator pane. */
   onToggleGroupMinimize: (pane: Pane) => void;
+  /** The pane's PERSISTED identity changed without any grid mutation, so the saved
+   *  layout is now stale: a files pane was re-rooted, or a pane was renamed (#214).
+   *  Nothing opened or closed, so no grid event fires and nothing would otherwise
+   *  re-persist until the next unrelated one — meaning a quit right after a re-root
+   *  would restore the OLD root. The host re-persists. */
+  onRecordChanged: (pane: Pane) => void;
 }
 
 export class Pane implements VoiceTargetPane {
@@ -323,6 +342,15 @@ export class Pane implements VoiceTargetPane {
    *  still offers the same restore next boot. Null for any live/welcome pane. */
   private dormantEl: HTMLElement | null = null;
   private dormantRecord: PersistedPane | null = null;
+  /** FILE-EXPLORER pane (#214): the pane's permanent content is a FileEditView —
+   *  file tree + editor + the #207 streaming search — rooted at `filesRoot`. No
+   *  terminal is ever opened and no PTY ever spawns (the `startWelcome` precedent
+   *  taken to its conclusion: a pane that is content, not a process), so the
+   *  no-resize invariant holds trivially. `filesRoot` non-null IS the "this is a
+   *  files pane" flag, and it doubles as the pane's cwd for the capture and for
+   *  "open in editor". Null on every other pane. */
+  private filesRoot: string | null = null;
+  private filesView: FileExplorerView | null = null;
   /** True once the pane's process has exited but the pane was kept open to show
    *  its output (notifyExited). The counter must not count a dead agent as live
    *  (#194 P4 LOW-7). */
@@ -445,8 +473,12 @@ export class Pane implements VoiceTargetPane {
     });
     header.appendChild(editorBtn);
 
+    // The three overlay buttons below are `pty-only`: their panels FLOAT over the
+    // terminal and are sized from its height, so they mean nothing on a pane that
+    // has no terminal. CSS hides them on a files pane (#214) — see the toggles,
+    // which refuse the hotkey path for the same reason.
     const issuesBtn = document.createElement("button");
-    issuesBtn.className = "pane-btn";
+    issuesBtn.className = "pane-btn pty-only";
     issuesBtn.innerHTML = ISSUES_ICON;
     issuesBtn.title = "GitHub issues (Alt+I)";
     issuesBtn.addEventListener("click", (e) => {
@@ -456,7 +488,7 @@ export class Pane implements VoiceTargetPane {
     header.appendChild(issuesBtn);
 
     const gitBtn = document.createElement("button");
-    gitBtn.className = "pane-btn";
+    gitBtn.className = "pane-btn pty-only";
     gitBtn.innerHTML = GIT_ICON;
     gitBtn.title = "Git view (Alt+G)";
     gitBtn.addEventListener("click", (e) => {
@@ -467,8 +499,9 @@ export class Pane implements VoiceTargetPane {
 
     // File-editor overlay (#174). Unconditional — every pane type gets it,
     // including plain terminals (unlike the orchestration-gated buttons above).
+    // Except a files pane, which IS this surface already.
     this.fileEditBtn = document.createElement("button");
-    this.fileEditBtn.className = "pane-btn";
+    this.fileEditBtn.className = "pane-btn pty-only";
     this.fileEditBtn.innerHTML = FILES_ICON;
     this.fileEditBtn.title = "File editor (Alt+F)";
     this.fileEditBtn.addEventListener("click", (e) => {
@@ -512,7 +545,7 @@ export class Pane implements VoiceTargetPane {
     closeBtn.title = "Close pane";
     closeBtn.addEventListener("click", (e) => {
       e.stopPropagation();
-      this.events.onCloseRequest(this);
+      this.requestClose();
     });
     header.appendChild(closeBtn);
     this.el.appendChild(header);
@@ -774,6 +807,102 @@ export class Pane implements VoiceTargetPane {
     await this.start(opts, true);
   }
 
+  /** Turn this pane into a FILE EXPLORER (#214): its content becomes a
+   *  FileExplorerView — a native-style file MANAGER (browse, open with the OS
+   *  default app, new folder, rename, delete, jump-to-file), rooted at `opts.root`.
+   *  Used both to convert a welcome pane in place (the user picked "File explorer")
+   *  and to open one directly on restore.
+   *
+   *  NOT the in-app editor. An earlier cut of this embedded `FileEditView` (the
+   *  `Alt+F` tree + CodeMirror surface); the human's clarification on #214 is that a
+   *  native-style manager is the ask, and that reusing the editor is "explicitly NOT
+   *  the preferred direction". The editor is untouched and still lives behind Alt+F.
+   *
+   *  No terminal is opened and no PTY is ever spawned, so:
+   *   - nothing can resize a ConPTY from here (constraint 1 holds by construction —
+   *     there is no ConPTY);
+   *   - `.pane-term` stays in the layout but empty, and `.pane-files` covers it the
+   *     way `.pane-welcome` does, so the pane's own chrome (splits, dock, maximize)
+   *     works unchanged;
+   *   - the PTY-dependent chrome (folder + branch chips, the git/issues/file-editor
+   *     overlay buttons) is hidden via `.is-files` rather than left clickable and
+   *     inert.
+   *
+   *  `root` must already be a readable directory — validated by the caller
+   *  (`ftRootIsDir`) at setup and again at restore, so this never builds a pane
+   *  around a folder that isn't there. */
+  startFiles(opts: FilesPaneOptions): void {
+    this.welcomeEl?.remove(); // converting a setup pane in place
+    this.welcomeEl = null;
+    this.el.classList.remove("is-welcome");
+    this.el.classList.add("is-files");
+    this.setFilesRoot(opts.root);
+    this.setName(opts.name);
+
+    this.filesView = new FileExplorerView({
+      getRoot: () => this.filesRoot ?? "",
+      // Re-rooting from the toolbar's folder picker re-roots the PANE, so the
+      // persisted record follows and a restore reopens what was actually on screen.
+      //
+      // The TITLE follows only if it was auto-derived from the old root — the same
+      // "don't clobber what the human typed" rule the welcome form's name field uses
+      // (nameDirty). A pane the user renamed to "docs" keeps that name across a
+      // re-root; one still called "loomux" (its old folder) becomes the new folder,
+      // instead of sitting there naming a directory it no longer shows.
+      onRootChanged: (root) => {
+        const autoNamed = this.name === this.defaultFilesName(this.filesRoot);
+        this.setFilesRoot(root);
+        if (autoNamed) this.setName(this.defaultFilesName(root));
+        // Re-persist NOW. No grid event fired (nothing opened or closed), so without
+        // this the new root would sit unsaved until some unrelated layout change came
+        // along — and a quit in between would restore the old one (rev-99 finding 4).
+        this.events.onRecordChanged(this);
+      },
+    });
+    const wrap = document.createElement("div");
+    wrap.className = "pane-files";
+    wrap.appendChild(this.filesView.el);
+    this.el.appendChild(wrap);
+    this.filesView.show();
+    if (!opts.background) this.focus();
+  }
+
+  /** True when this pane is a file explorer (#214) — no PTY, ever. */
+  get isFiles(): boolean {
+    return this.filesRoot !== null;
+  }
+
+  /** The human asked to close this pane — from its header ✕, its dock chip's ✕, or
+   *  Ctrl+Shift+W. THE single entry point for a human-initiated single-pane close,
+   *  so every affordance goes through one path instead of re-deriving it (the dock
+   *  chip's ✕ used to call `grid.closePane` directly — rev-100). Automatic closes (a
+   *  PTY exiting, a group ending, a tab disposing) deliberately do NOT come here. */
+  requestClose(): void {
+    this.events.onCloseRequest(this);
+  }
+
+  /** Point this files pane at `root`, keeping `cwdRaw` in step so the chrome that
+   *  legitimately works without a PTY — "open in editor", the capture's cwd —
+   *  targets the folder actually on screen. */
+  private setFilesRoot(root: string): void {
+    this.filesRoot = root;
+    this.cwdRaw = root;
+  }
+
+  /** The title a files pane gets when nobody has named it: the root's short name.
+   *  The SAME derivation the welcome form uses, so `name === defaultFilesName(root)`
+   *  reliably means "this title was auto-derived, not typed by the human". */
+  private defaultFilesName(root: string | null): string {
+    return root ? pathTail(root) || root : "";
+  }
+
+  /** This pane's working directory: a shell's live (OSC 7) cwd, an agent's launch
+   *  folder, or a files pane's root. Null when it has none yet (a welcome pane).
+   *  Used to seed a split's welcome form with the folder you split FROM. */
+  get workdir(): string | null {
+    return this.cwdRaw;
+  }
+
   /** Render a DORMANT restore placeholder (#194 P4): no terminal, no PTY, just
    *  `contentEl` (a Start/Resume affordance the caller wires). `record` is the
    *  persisted leaf this pane stands in for, retained so capture() re-serializes
@@ -826,7 +955,11 @@ export class Pane implements VoiceTargetPane {
   private hiddenTab = false;
 
   private tryWebgl(): void {
-    if (this.webgl || this.hiddenTab) return;
+    // No open terminal = a welcome, dormant, or files pane. WebglAddon.activate()
+    // throws on such a terminal (caught below, but pointlessly) and there is nothing
+    // to render anyway — setHidden() reaches here on every tab switch, so this is a
+    // real throw/catch per hidden PTY-less pane, not a hypothetical.
+    if (this.webgl || this.hiddenTab || !this.hasTerminal()) return;
     try {
       const webgl = new WebglAddon();
       webgl.onContextLoss(() => {
@@ -872,7 +1005,10 @@ export class Pane implements VoiceTargetPane {
    *  → textContent + whitelisted styles), never innerHTML — the addon does not
    *  escape cell text. Returns "" if serialization isn't available. */
   serializeViewportHtml(): string {
-    if (this.disposed) return "";
+    // A pane whose terminal was never opened (welcome / dormant / files) has no
+    // viewport to serialize — an empty string leaves the tab preview blank for
+    // that slot rather than painting a phantom 80×24 of nothing.
+    if (this.disposed || !this.hasTerminal()) return "";
     try {
       if (!this.serializer) {
         this.serializer = new SerializeAddon();
@@ -1022,12 +1158,33 @@ export class Pane implements VoiceTargetPane {
     if (this.cwdRaw) void this.refreshDir(this.cwdRaw);
   }
 
+  /** Refuse an overlay on a file-explorer pane (#214), with a reason.
+   *
+   *  Every pane overlay (git, issues, tasks, audit, group, file editor) floats over
+   *  `.pane-term` and takes its height from it — `overlayClamp` measures
+   *  `termEl.clientHeight`, and `updateTermShift` reads the live `.xterm-screen` to
+   *  keep the cursor visible under the panel. A files pane has no terminal at all,
+   *  so those measurements have no meaning and the panel would open into a
+   *  zero-height box. Making them work means giving the overlays a second sizing
+   *  model that doesn't assume a terminal underneath — real work, and out of scope
+   *  here. Until then they are cleanly OFF on a files pane (buttons hidden by
+   *  `.is-files`, hotkeys answered with this) rather than half-working.
+   *
+   *  The git view over a files root is the one worth revisiting; the deferral is
+   *  tracked on #214 (issuecomment-4942018258), not forgotten. */
+  private refuseOverlay(what: string): boolean {
+    if (!this.isFiles) return false;
+    showToast(`${what} isn't available in a file explorer pane.`, "info");
+    return true;
+  }
+
   /** Toggle the git view. It FLOATS over the top of the terminal — the
    *  terminal keeps its full size and PTY dimensions, so toggling never
    *  triggers a resize repaint (which would push duplicate TUI frames into
    *  scrollback). The bottom strip of the terminal stays visible and usable,
    *  with a draggable divider on the overlay's lower edge. */
   toggleGitView(): void {
+    if (this.refuseOverlay("The git view")) return;
     if (!this.gitView) {
       this.gitView = new GitView({
         getCwd: () => this.cwdRaw,
@@ -1135,6 +1292,7 @@ export class Pane implements VoiceTargetPane {
    *  mechanics as the git view — it FLOATS over the terminal and never resizes
    *  the PTY; only one overlay is open at a time. */
   toggleIssuesView(): void {
+    if (this.refuseOverlay("The issues view")) return;
     if (!this.issuesView) {
       this.issuesView = new IssuesView({
         getCwd: () => this.cwdRaw,
@@ -1274,6 +1432,12 @@ export class Pane implements VoiceTargetPane {
    *  included. Same no-resize overlay mechanics as the git/audit views; only
    *  one overlay is open at a time. The tree roots at the pane's live cwd. */
   toggleFileEditView(): void {
+    // Alt+F on a files pane: the pane already IS the file editor. Refusing with a
+    // toast would be absurd — just put the cursor in it.
+    if (this.isFiles) {
+      this.focus();
+      return;
+    }
     if (!this.fileEditView) {
       this.fileEditView = new FileEditView({
         getCwd: () => this.cwdRaw,
@@ -1373,21 +1537,30 @@ export class Pane implements VoiceTargetPane {
     return this.dormantRecord;
   }
 
-  /** This pane's persisted kind from its live launch state:
-   *  orch (any orchestration role) > agent (launched a command) > plain terminal. */
+  /** This pane's persisted kind from its live launch state: files (#214, no PTY at
+   *  all) > orch (any orchestration role) > agent (launched a command) > plain
+   *  terminal. `capture()`'s per-kind ternaries above then null every field a files
+   *  pane doesn't have (command, argv, shellKind, sessionId, role), leaving exactly
+   *  {paneKind, name, cwd:=root} — all it needs to come back. */
   private liveKind(): PersistedPaneKind {
+    if (this.filesRoot !== null) return "files";
     return this.orchGroup ? "orch" : this.launchedCommand ? "agent" : "terminal";
   }
 
   /** Classify this pane for the per-tab agent counter / orch markers (#194 P4,
    *  tabcounts.ts). A welcome (setup) or dormant placeholder reports `live:false`
    *  so it never inflates the count; a running pane reports its kind + that it has
-   *  a PTY. Reads no geometry, so it's safe on a hidden tab. */
+   *  a PTY. A files pane reports kind "files", which the counter ignores outright —
+   *  it is a viewer, not an agent (#214). Reads no geometry, so it's safe on a
+   *  hidden tab. */
   tabPaneInfo(): TabPaneInfo {
     if (this.isWelcome) return { kind: "terminal", live: false };
     if (this.dormantRecord) {
       return { kind: this.dormantRecord.paneKind === "orch" ? "orch" : "agent", live: false };
     }
+    // A files pane has no PTY by design, so `live` can't be derived from one; it is
+    // fully functional the moment it exists.
+    if (this.isFiles) return { kind: "files", live: true };
     const kind = this.liveKind();
     return { kind, live: this.ptyId !== null && !this.exited };
   }
@@ -1505,6 +1678,10 @@ export class Pane implements VoiceTargetPane {
         if (this.orchAgent && changed) {
           invoke("orch_agent_renamed", { agentId: this.orchAgent, name }).catch(() => {});
         }
+        // The pane's persisted name just changed with no grid mutation — same
+        // stale-snapshot class as a files-pane re-root, so re-persist here too.
+        // (persistTabs dedups on identical bytes, so a no-op rename costs nothing.)
+        if (changed) this.events.onRecordChanged(this);
       },
       restore: () => {
         // Put the label back showing the current name (the pre-edit name on a
@@ -1579,6 +1756,14 @@ export class Pane implements VoiceTargetPane {
     // Start/Resume affordance so keyboard nav reaches a usable control.
     if (this.dormantEl) {
       this.dormantEl.querySelector<HTMLElement>("button, [tabindex]")?.focus();
+      return;
+    }
+    // A files pane has no terminal either: focus its view (tabIndex -1), so Alt+arrow
+    // nav, window refocus, and dock-restore land ON the explorer instead of no-oping
+    // on a terminal that was never opened. The view doesn't grab the tree or the
+    // editor — the user clicks into whichever they want.
+    if (this.filesView) {
+      this.filesView.focus();
       return;
     }
     this.term.focus();
@@ -1834,6 +2019,16 @@ export class Pane implements VoiceTargetPane {
     return !!this.composeInput && document.activeElement === this.composeInput;
   }
 
+  /** Does this pane have an OPEN terminal? `term.element` is set by `term.open()`,
+   *  which only the PTY-backed start paths call — so this is false for a files pane
+   *  (#214, never), and for a welcome or dormant pane (not yet). The single honest
+   *  answer to "can this pane take a paste / be serialized / hold a WebGL context",
+   *  used by all three; without it, dictating (Alt+S) at a files pane would record,
+   *  transcribe, and paste the transcript into an xterm that isn't there. */
+  hasTerminal(): boolean {
+    return !!this.term.element;
+  }
+
   /** Reflect the capture phase on this pane's indicator. For a compose target
    *  it's the mic button (pulse while recording, spin while transcribing); for a
    *  terminal target it's a lazily-created overlay badge floating over `.xterm`
@@ -1976,6 +2171,7 @@ export class Pane implements VoiceTargetPane {
     this.auditView?.dispose();
     this.groupView?.dispose();
     this.fileEditView?.dispose();
+    this.filesView?.dispose(); // the file manager a files pane hosts (#214)
     if (this.ptyId !== null) {
       detachOutput(this.ptyId);
       detachGitWatch(this.ptyId);

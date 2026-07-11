@@ -26,6 +26,41 @@ respects `.gitignore` by default, with an **Ignored files** toggle to include
 git-ignored paths (node_modules, build output). See the
 [design note](doc/design/fileedit.md).
 
+### Pane kinds
+
+Every pane starts on the welcome screen and declares what it becomes — there is
+no global mode:
+
+| Kind | What it is |
+| --- | --- |
+| **Agent** | A coding-agent CLI (Claude, Copilot, or a custom command), optionally fanned out to *N* panes each in its own git worktree. |
+| **Orchestrator + workers** | An orchestrator plus idle workers in their own project tab, with guardrails. |
+| **Terminal** | A plain shell: PowerShell, Command Prompt, or Git Bash. |
+| **File explorer** | A native-style **file manager** rooted at a folder you pick — no terminal underneath, no process, ever. |
+
+A **file explorer** pane is loomux's Windows-Explorer equivalent: browse folders
+(breadcrumb, Up, double-click to descend), and **double-click a file to open it in
+whatever application your OS associates with that extension** — a `.png` opens in
+your image viewer, a `.pdf` in your PDF reader. Loomux does not open it. You also
+get **new file**, **new folder**, **rename** (`F2`) and **delete** (`Del`; to the
+**Recycle Bin** on Windows, and off the UI thread — a huge folder doesn't freeze the
+window while it goes), a **right-click menu** (open with…, reveal in your OS file
+manager, hash), a short **SHA-256** per file computed off-thread, and a fast **Go to
+file** name search that jumps anywhere under the root. It splits, docks, maximizes and restores like any other pane, and comes back
+at the same folder on session restore — but it is *not* an agent, so it never
+counts toward a tab's agent badge. See the [design note](doc/design/files-pane.md).
+
+This is deliberately **not** the in-app editor: that is the `Alt+F` overlay above,
+unchanged, and it remains the right tool for a quick look or a one-line fix. The
+explorer is the one for "get this file into the app that owns it".
+
+The **Go to file** box matches file *names*, never contents. The backend
+enumerates the root's paths once, off-thread; every keystroke then filters that
+cached list in memory, so typing costs zero I/O. Matching is substring with
+space-separated terms AND-ed across the path (`pane rest` → `src/panerestore.ts`);
+`↑`/`↓` pick, `Enter` opens it in its default app, `Esc` clears. (The same box is
+also in the `Alt+F` editor, where `Enter` opens the file *in the editor* instead.)
+
 ![sample](sample.jpg)
 
 ## Install
@@ -113,11 +148,13 @@ src-tauri/src/
   obs.rs            crash observability: panic hook, breadcrumb log, unclean-exit notice
   voice.rs          voice prompts (#58): mic capture (cpal) -> local whisper.cpp subprocess
   uistate.rs        durable UI state (project tabs #63): atomic tabs.json store
-  fileedit.rs       file-editor overlay (#174): lazy tree, read/write (atomic + hash conflict), streaming gitignore-aware search/replace (#207); server-side path safety
+  fileedit.rs       file-editor overlay (#174): lazy tree, read/write (atomic + hash conflict), streaming gitignore-aware search/replace (#207) + path-only name enumeration (#214); server-side path safety
+  filemgr.rs        file-MANAGER pane (#214): list, new file/folder, rename, delete-to-Recycle-Bin, open-with-default-app, open-with chooser, reveal-in-OS-file-manager; reuses fileedit's path choke point. Shell APIs come from the `windows` dep we already have (ShellExecuteW + SHFileOperationW)
+  filehash.rs       file hashing (#214): SHA-256/512, SHA-1, CRC-32/16/8 — streamed off-thread on a worker (never the main thread), cancellable via the #207 registry
   lib.rs            Tauri wiring
 src/
   pty.ts            typed bridge to the backend (invoke + event bus)
-  pane.ts           one terminal pane: xterm instance + header UI
+  pane.ts           one pane: xterm instance + header UI -- or, for a files pane (#214), a PTY-less file-explorer surface
   grid.ts           split-tree layout, dividers, focus, drag/maximize/minimize
   layout.ts         pure drag-reorder geometry (unit-tested, DOM-free)
   tabs.ts           project tabs (#63): TabManager -- tab list, active tab, routing (DOM-free)
@@ -132,12 +169,20 @@ src/
   groupresume.ts    pure whole-group resume plan: orchestrator first, delegates rejoin-or-skip (DOM-free, unit-tested, #194)
   panefit.ts        pure "hidden => no PTY resize" decision (the no-resize invariant)
   sessions.ts       session browser sidebar
-  launcher.ts       in-pane welcome / pane-setup form (Agent / Orchestrator / Terminal kind picker)
+  launcher.ts       in-pane welcome / pane-setup form (Agent / Orchestrator / Terminal / File-explorer kind picker)
   panesetup.ts      pure kind-selection + validation core for the welcome screen (DOM-free, unit-tested)
   orchestration.ts  frontend half of agent groups (panes, badges, focus)
   shortcuts.ts      app-level keybindings (single source of truth)
   fileapi.ts        typed bridge to fileedit.rs (per-feature wrapper, like git.ts)
-  fileedit.ts       file-editor overlay (#174): tree + code editor + search/replace (DOM wiring)
+  fileedit.ts       file-editor overlay (#174, Alt+F): tree + code editor + "Go to file" name search + content search/replace (DOM wiring)
+  fileexplorer.ts   the file MANAGER a files pane hosts (#214): browse, open-with-default-app, new file/folder, rename, delete, context menu, SHA-256 column, Go to file (DOM wiring)
+  fileexplorermodel.ts pure file-manager core: listing order, rooted navigation, breadcrumb, formatting, inline-edit validation, op-target binding (DOM-free, unit-tested)
+  filemenu.ts       pure context-menu model: what appears, what it acts on (target bound at menu-open) (DOM-free, unit-tested)
+  contextmenu.ts    generic context-menu renderer: placement, submenus, Esc/click-away (DOM wiring)
+  filehashmodel.ts  pure hashing policy: auto-hash threshold, digest cache keying (path+size+mtime), formatting (DOM-free, unit-tested)
+  filemgr.ts        typed bridge to filemgr.rs + filehash.rs (per-feature wrapper, like fileapi.ts)
+  filematch.ts      pure file-NAME matching + ranking for "Go to file" (#214, DOM-free, unit-tested)
+  modal.ts          the shared confirm/choice dialog (used by the editor and the file manager)
   filetreemodel.ts  pure lazy-tree model: sort/merge/flatten (DOM-free, unit-tested)
   fileicons.ts      pure filename -> inline-SVG icon mapping (DOM-free, unit-tested)
   searchresults.ts  pure search grouping + tree-hit + replace-selection model (DOM-free, unit-tested)
