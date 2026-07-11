@@ -102,6 +102,43 @@ export function quitDecision(dirty: readonly DirtyBuffer[]): CloseDecision {
   return closeDecision(dirty.length > 0);
 }
 
+/** How long the quit path waits for its final session save before giving up on it.
+ *
+ *  Short on purpose. The write is a backend round-trip to a small JSON file; if it hasn't
+ *  landed in a second and a half it is wedged (a stalled disk, a hung IPC), and waiting
+ *  longer only makes the app look frozen while the human clicks the ✕ again. */
+export const QUIT_FLUSH_TIMEOUT_MS = 1500;
+
+/** Wait for `work`, but never longer than `ms` — "done" when it landed, "timeout" when
+ *  the deadline won.
+ *
+ *  This exists for exactly one caller and one reason: the quit path AWAITS its final
+ *  session save, and an await with no deadline is an unquittable app. Failing open on a
+ *  throw (which the guard already does) does not cover a HANG — a promise that never
+ *  settles never throws. So the last write is raced, and on expiry the close proceeds
+ *  anyway: a possibly-stale layout snapshot is a small, recoverable loss (the previous
+ *  fire-and-forget write is at most one edit behind), while a window whose ✕ does nothing
+ *  is not recoverable at all. The trade is stated in doc/design/content-panes.md.
+ *
+ *  A rejection counts as "done" — not because the write succeeded, but because we are no
+ *  longer WAITING on it, and the caller's job here is only to decide when to stop. */
+export function withDeadline(work: Promise<unknown>, ms: number): Promise<"done" | "timeout"> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (outcome: "done" | "timeout") => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(outcome);
+    };
+    const timer = setTimeout(() => finish("timeout"), ms);
+    void work.then(
+      () => finish("done"),
+      () => finish("done")
+    );
+  });
+}
+
 /** One line per unsaved buffer for that confirm — "tab · pane — file", with the Alt+F
  *  overlays marked, since "which pane is that even in?" is the whole difficulty of the
  *  overlay case. */

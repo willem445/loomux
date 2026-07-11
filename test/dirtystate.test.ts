@@ -12,6 +12,8 @@ import {
   dirtyBufferLines,
   quitDecision,
   keepOpenOnExit,
+  withDeadline,
+  QUIT_FLUSH_TIMEOUT_MS,
   type PaneBufferReport,
 } from "../src/dirtystate.ts";
 
@@ -178,4 +180,34 @@ test("keepOpenOnExit: a crash AND a dirty buffer reports the crash — the banne
     keepOpenOnExit({ launchedCommand: true, exit: exited(1), hasUnsavedWork: true }),
     "output"
   );
+});
+
+// ---------- the quit path's final save must not be able to wedge the app (#219) ----------
+
+test("withDeadline: a save that lands is waited for", async () => {
+  const landed = await withDeadline(Promise.resolve("written"), 1000);
+  assert.equal(landed, "done");
+});
+
+test("withDeadline: a save that HANGS is abandoned — the app still quits", async () => {
+  // The failure the fail-open catch does NOT cover: a promise that never settles never
+  // throws. Without a deadline, awaiting the final session save means a stalled disk or a
+  // hung IPC leaves the human with a ✕ that does nothing. A possibly-stale snapshot is a
+  // small, recoverable loss (the fire-and-forget write is at most one edit behind); an
+  // unquittable app is not recoverable at all.
+  const neverSettles = new Promise<never>(() => {});
+  assert.equal(await withDeadline(neverSettles, 20), "timeout");
+});
+
+test("withDeadline: a save that REJECTS stops the wait too (we were only ever waiting)", async () => {
+  // Not a claim that the write succeeded — flushTabs owns that (it catches and lets the
+  // next change retry the bytes). This function's only job is deciding when to stop
+  // waiting, and a rejection has answered that.
+  assert.equal(await withDeadline(Promise.reject(new Error("disk full")), 1000), "done");
+});
+
+test("the quit flush deadline is short enough to be invisible, long enough for a real write", () => {
+  // A small JSON write to the backend that hasn't landed in this long is wedged, and
+  // waiting longer only makes the app look frozen while the human clicks ✕ again.
+  assert.ok(QUIT_FLUSH_TIMEOUT_MS >= 500 && QUIT_FLUSH_TIMEOUT_MS <= 3000);
 });

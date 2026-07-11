@@ -19,10 +19,13 @@ import {
   type SessionInfo,
 } from "./pty";
 import { modal } from "./modal";
+import { SubmitLatch } from "./panesetup";
 import {
   dirtyBuffers,
   dirtyBufferLines,
   quitDecision,
+  withDeadline,
+  QUIT_FLUSH_TIMEOUT_MS,
   type DirtyBuffer,
 } from "./dirtystate";
 import { matchShortcut } from "./shortcuts";
@@ -1042,6 +1045,34 @@ function unsavedBuffers(): DirtyBuffer[] {
   return dirtyBuffers(tabs.tabs.flatMap((ws) => ws.bufferReports()));
 }
 
+/** Persist on the way out — with a DEADLINE.
+ *
+ *  The final save is awaited (see flushTabs) because a quit is the one moment there is no
+ *  next change to retry on. But an await with no deadline is an unquittable app: the
+ *  guard fails open on a throw, and a promise that HANGS never throws. So the write is
+ *  raced, and on expiry the close proceeds regardless — a possibly-stale snapshot is a
+ *  small, recoverable loss (the fire-and-forget write is at most one edit behind), while a
+ *  ✕ that does nothing is not recoverable at all. */
+async function flushSessionForQuit(): Promise<void> {
+  const outcome = await withDeadline(flushTabs(), QUIT_FLUSH_TIMEOUT_MS);
+  if (outcome === "timeout") {
+    // No toast: the window is about to die and nobody would read it. The breadcrumb is
+    // for the next boot's crash/obs report, where "the last save never landed" is the
+    // one clue that explains a layout that looks a step behind.
+    console.warn(`loomux: final session save did not land within ${QUIT_FLUSH_TIMEOUT_MS}ms — quitting anyway`);
+  }
+}
+
+/** One-shot latch over the quit confirm (#194 P1's SubmitLatch, the same pattern the
+ *  welcome form uses for its async submit — and the same one `Pane.requestClose` uses).
+ *
+ *  The guard is ASYNC: while the confirm is on screen, a second ✕ (or Alt+F4, or an
+ *  impatient double-click on a window button that appears not to have registered) fires
+ *  onCloseRequested again and would stack a SECOND identical dialog — whose answer then
+ *  races the first one's. The in-flight ask already owns the decision, so a re-entrant
+ *  request is simply refused: keep the window, let the dialog that is up decide. */
+const quitLatch = new SubmitLatch();
+
 /** Gate the app's close. Nothing unsaved → quit silently (the common case must not grow
  *  a dialog). Something unsaved → ONE consolidated confirm listing every buffer, then
  *  quit or stay.
@@ -1049,32 +1080,44 @@ function unsavedBuffers(): DirtyBuffer[] {
  *  Deliberately one ask, not a save prompt per file: a human quitting with six dirty
  *  files wants to know that six files are dirty and decide once — a chain of six modals
  *  is how you train someone to hammer Enter through them. "Quit anyway" discards; Cancel
- *  leaves the app exactly as it was, every buffer intact, so they can go save.
- *
- *  Either way the session snapshot is FLUSHED (awaited, not fire-and-forget) before the
- *  window dies, so the #194 restore still brings the layout back. */
+ *  leaves the app exactly as it was, every buffer intact, so they can go save. */
 function guardQuit(): void {
   void guardAppClose(async () => {
-    const dirty = unsavedBuffers();
-    if (quitDecision(dirty) === "close") {
-      await flushTabs();
+    // A confirm is already up (see quitLatch): this close request is a duplicate, and the
+    // dialog on screen is the one that decides. Refuse it rather than stack a second.
+    if (!quitLatch.begin()) return false;
+    try {
+      const dirty = unsavedBuffers();
+      if (quitDecision(dirty) === "close") {
+        await flushSessionForQuit();
+        quitLatch.finish(); // quitting: admit nothing further
+        return true;
+      }
+      const files = dirtyBufferLines(dirty);
+      const quit = await modal<boolean>((resolve) => ({
+        title:
+          files.length === 1 ? "1 file has unsaved edits" : `${files.length} files have unsaved edits`,
+        body: "Quitting loomux now discards them. Cancel, save what you want to keep, then quit again.",
+        bodyLines: files,
+        buttons: [
+          { label: "Cancel", value: false },
+          { label: "Quit anyway", value: true, kind: "danger" },
+        ],
+        onKey: (k) => (k === "Escape" ? resolve(false) : undefined),
+      }));
+      if (!quit) {
+        quitLatch.release(); // they stayed — a later ✕ must ask again
+        return false;
+      }
+      await flushSessionForQuit();
+      quitLatch.finish();
       return true;
+    } catch (err) {
+      // Fail open, and re-open the latch with it: a guard that throws must neither block
+      // the close nor wedge the next one shut (guardAppClose lets this through).
+      quitLatch.release();
+      throw err;
     }
-    const files = dirtyBufferLines(dirty);
-    const quit = await modal<boolean>((resolve) => ({
-      title:
-        files.length === 1 ? "1 file has unsaved edits" : `${files.length} files have unsaved edits`,
-      body: "Quitting loomux now discards them. Cancel, save what you want to keep, then quit again.",
-      bodyLines: files,
-      buttons: [
-        { label: "Cancel", value: false },
-        { label: "Quit anyway", value: true, kind: "danger" },
-      ],
-      onKey: (k) => (k === "Escape" ? resolve(false) : undefined),
-    }));
-    if (!quit) return false;
-    await flushTabs();
-    return true;
   });
 }
 guardQuit();

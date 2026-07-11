@@ -185,10 +185,19 @@ Three choices worth defending:
   everything exactly as it was, so the human can go save.
 - **Nothing unsaved → no dialog.** A confirm that fires when there is nothing to lose is
   a confirm people stop reading.
-- **The session snapshot is flushed on the way out.** Persistence is fire-and-forget
-  everywhere else (a failed write just waits for the next change); a quit is the one
-  moment there is no next change, so the quit path *awaits* the write. The #194 restore
-  still brings the layout back — including from a "Quit anyway".
+- **The session snapshot is flushed on the way out — but not at any price.** Persistence
+  is fire-and-forget everywhere else (a failed write just waits for the next change); a
+  quit is the one moment there is no next change, so the quit path *awaits* the write. The
+  #194 restore still brings the layout back — including from a "Quit anyway".
+
+  That await is then **raced against a 1.5s deadline** (`withDeadline`), and on expiry the
+  close proceeds anyway. Failing open on a *throw* — which the guard does — is not enough:
+  a promise that HANGS never throws, so a stalled disk or a wedged IPC would leave the
+  human with a ✕ that does nothing. The trade is deliberate and one-sided: a possibly-stale
+  snapshot costs at most one edit's worth of layout (the fire-and-forget write is never
+  further behind than that, and it is *layout*, not content), while an unquittable app
+  costs everything and cannot be recovered from inside the app. **A stale snapshot beats a
+  window that won't close.**
 
 The mechanics: `guardAppClose` (in `pty.ts`, with the rest of the Tauri surface) wraps
 Tauri's `onCloseRequested`, which holds the close while our handler runs and destroys the
@@ -196,6 +205,23 @@ window unless we `preventDefault()`. Destroying is what fires the backend's
 `WindowEvent::Destroyed` — the PTY kill-all and the clean-exit sentinel in `lib.rs` — so
 a permitted quit tears down exactly as it did before. We put a question in front of the
 existing path; we did not add a second one.
+
+Three ways this hook can go wrong, and what each costs — all three land on the same side,
+because **a window that won't close is the worst outcome available here**:
+
+| Failure | Guarded by | Why that way |
+| --- | --- | --- |
+| The permission is missing | `core:window:allow-destroy` in the capability set | Registering a JS close-requested listener stops Rust from closing the window itself. Without the permission, the JS destroy is denied and the ✕ silently does **nothing**. |
+| The guard throws | fail **open** — the close proceeds | Not asking about a buffer is recoverable; an unquittable app is not. |
+| The final save hangs | the 1.5s `withDeadline` race | The fail-open catch cannot help: a promise that never settles never throws. |
+
+And one re-entrancy guard: the confirm is async, so a second ✕ (or Alt+F4, or an impatient
+double-click) fires `onCloseRequested` again while the dialog is up, and would stack a
+*second* quit dialog whose answer races the first's. A `SubmitLatch` — the same one-shot
+latch the welcome form's submit (#194 P1) and `Pane.requestClose` use — refuses the
+duplicate: the ask that is already on screen owns the decision. Cancel `release()`s it (a
+later ✕ must ask again); "Quit anyway" `finish()`es it (the window is going away; admit
+nothing more).
 
 **5. A process dies, or a group ends.** Both are *automatic* teardowns — nobody clicked
 "close this pane" — and both used to dispose a pane holding a dirty `Alt+F` buffer.

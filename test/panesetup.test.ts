@@ -191,6 +191,29 @@ test("isContentKind names exactly the PTY-less kinds — the ones that spawn not
   );
 });
 
+// ---------- SubmitLatch's second consumer: the app-quit confirm (#219) ----------
+
+test("the quit confirm reuses the latch: a second ✕ while the dialog is up is refused", () => {
+  // Same async-reentrancy shape as the welcome form's submit (#194 P1) and Pane.
+  // requestClose (#217): the guard awaits a modal, and meanwhile a second ✕ / Alt+F4 /
+  // impatient double-click fires the close request again. Without the latch that stacks a
+  // SECOND quit dialog whose answer races the first one's. The in-flight ask owns the
+  // decision, so the duplicate is refused and the window simply stays.
+  const latch = new SubmitLatch();
+  assert.equal(latch.begin(), true, "the ✕ that opened the dialog");
+  assert.equal(latch.begin(), false, "a second ✕ while it is up — no second dialog");
+  assert.equal(latch.begin(), false, "…nor a third");
+
+  // Cancel → the app stays, and a LATER ✕ must ask again (release, not finish).
+  latch.release();
+  assert.equal(latch.begin(), true);
+
+  // "Quit anyway" → finish: the window is going away, so nothing further is admitted even
+  // if a late close event lands while it does.
+  latch.finish();
+  assert.equal(latch.begin(), false);
+});
+
 // ---------- agent ----------
 
 test("agent with a built-in CLI validates", () => {
