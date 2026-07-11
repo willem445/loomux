@@ -41,6 +41,7 @@ import {
   begin,
   accept,
   isTruncated,
+  isSearching,
   enumerationSource,
   RENDER_CAP,
   type SearchState,
@@ -638,15 +639,16 @@ export class FileEditView {
         clearTimeout(this.searchTimer);
         this.startSearch();
       } else if (e.key === "Escape") {
-        if (this.session.activeId !== null) {
-          // A search is running: Esc cancels it (keeping the partial results)
-          // and is consumed here so it doesn't also close the overlay.
+        if (isSearching(this.session)) {
+          // A search is actively running: Esc cancels it (keeping the partial
+          // results) and is consumed here so it doesn't also close the overlay.
           e.stopPropagation();
           clearTimeout(this.searchTimer);
           this.cancelSearch();
         }
-        // Nothing running: let Escape bubble to the overlay's own handler
-        // (`this.el` keydown → requestClose), which closes the editor.
+        // Nothing running (idle *or* a finished search): let Escape bubble to the
+        // overlay's own handler (`this.el` keydown → requestClose) so a single
+        // press closes the editor.
       } else {
         e.stopPropagation();
       }

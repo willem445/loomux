@@ -107,6 +107,15 @@ export function isTruncated(state: SearchState): boolean {
   return state.truncated || state.overflow;
 }
 
+/** Whether a search is *actively running* (batches still arriving). Drives Esc
+ *  routing: Esc is consumed to cancel only while true — a session that has
+ *  finished (`done`) still carries its `activeId`, so without the `!done` check
+ *  the first Esc after a search completes would no-op instead of closing the
+ *  overlay (it would take two presses). Idle → false. */
+export function isSearching(state: SearchState): boolean {
+  return state.activeId !== null && !state.done;
+}
+
 /** Which file set a search enumerates.
  *  - `"git"`: `git ls-files` (tracked + untracked-unignored) — `.gitignore` is
  *    respected, so `node_modules`/build output are skipped for free.

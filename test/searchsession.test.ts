@@ -6,6 +6,7 @@ import {
   begin,
   accept,
   isTruncated,
+  isSearching,
   enumerationSource,
   RENDER_CAP,
   type SearchBatch,
@@ -92,6 +93,20 @@ test("accept caps accumulation at the render cap and latches overflow", () => {
 
 test("RENDER_CAP is a sane, DOM-safe bound", () => {
   assert.ok(RENDER_CAP > 0 && RENDER_CAP <= 5000);
+});
+
+test("isSearching drives Esc routing: true only while a search is actively running", () => {
+  // Idle → Esc should close the overlay, not cancel.
+  assert.equal(isSearching(idle()), false);
+  // Running (batches still arriving) → Esc cancels.
+  let s = begin(1);
+  assert.equal(isSearching(s), true);
+  s = accept(s, batch(1, [m("a.ts", 1)]));
+  assert.equal(isSearching(s), true);
+  // Finished → activeId is still set, but Esc must fall through to close in one
+  // press (the two-presses-to-close nit), so this must read false.
+  s = accept(s, batch(1, [], { done: true }));
+  assert.equal(isSearching(s), false);
 });
 
 test("enumerationSource: ignored-by-default respects .gitignore in a git repo", () => {
