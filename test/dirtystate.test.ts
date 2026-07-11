@@ -26,6 +26,19 @@ test("reload-after-replace guard: a clean buffer reloads, a dirty one confirms",
   assert.equal(closeDecision(dirty), "confirm"); // prompt before losing edits
 });
 
+test("pane-close guard: closing a file explorer pane is the SAME decision (#214)", () => {
+  // A files pane is the first pane kind where loomux itself owns an unsaved buffer,
+  // so the human-initiated single-pane closes — the header ✕, the DOCK CHIP's ✕
+  // (rev-100: this one bypassed the guard and silently discarded a docked pane's
+  // edits), and Ctrl+Shift+W — all run FileEditView.canDiscard(), which is this
+  // decision and nothing else. Pinned here so "dirty means ask" stays stated once:
+  // a third consumer must not grow its own private rule.
+  const clean = isDirty("saved", "saved");
+  const dirty = isDirty("saved", "saved + edits");
+  assert.equal(closeDecision(clean), "close"); // close the pane, no prompt
+  assert.equal(closeDecision(dirty), "confirm"); // ask before dropping the buffer
+});
+
 test("hasConflict fires when the on-disk hash drifted from the opened hash", () => {
   assert.equal(hasConflict("aaaa", "aaaa"), false);
   assert.equal(hasConflict("aaaa", "bbbb"), true);

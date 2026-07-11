@@ -544,7 +544,7 @@ export class Pane implements VoiceTargetPane {
     closeBtn.title = "Close pane";
     closeBtn.addEventListener("click", (e) => {
       e.stopPropagation();
-      this.events.onCloseRequest(this);
+      this.requestClose();
     });
     header.appendChild(closeBtn);
     this.el.appendChild(header);
@@ -868,6 +868,17 @@ export class Pane implements VoiceTargetPane {
     return this.filesRoot !== null;
   }
 
+  /** The human asked to close this pane — from its header ✕, its dock chip's ✕, or
+   *  Ctrl+Shift+W. THE single entry point for a human-initiated single-pane close:
+   *  it goes to the host, which runs the unsaved-edits guard (`confirmClose`) and
+   *  only then tears the pane down. Anything that calls `grid.closePane` directly
+   *  bypasses that guard, which is exactly the bug this method exists to prevent —
+   *  the dock chip's ✕ did (rev-100). Automatic closes (a PTY exiting, a group
+   *  ending, a tab disposing) deliberately do NOT come through here. */
+  requestClose(): void {
+    this.events.onCloseRequest(this);
+  }
+
   /** May the human close this pane right now? True unless it holds unsaved work the
    *  human then declines to discard.
    *
@@ -878,11 +889,12 @@ export class Pane implements VoiceTargetPane {
    *  standing between the human and their edits — so it asks, exactly as the
    *  editor's own Esc/✕ already does (rev-99 finding 3).
    *
-   *  Deliberately scoped to the HUMAN-initiated close paths (the ✕ and
-   *  Ctrl+Shift+W), which is what "close this pane" means. A tab close, a group
-   *  teardown, or app shutdown do not route through here — they're bulk operations
-   *  with their own semantics, and turning each into a per-pane interrogation is a
-   *  different feature. Non-files panes answer true instantly. */
+   *  Deliberately scoped to the HUMAN-initiated single-pane close paths — the header
+   *  ✕, the dock chip's ✕, and Ctrl+Shift+W — which is what "close this pane" means.
+   *  All three now reach it through `requestClose()`. A tab close, a group teardown,
+   *  or app shutdown do not route through here: they're bulk operations with their
+   *  own semantics, and turning each into a per-pane interrogation is a different
+   *  feature. Non-files panes answer true instantly. */
   async confirmClose(): Promise<boolean> {
     return this.filesView ? this.filesView.canDiscard() : true;
   }

@@ -403,7 +403,9 @@ export class FileEditView {
    *  already applies to the overlay's own Esc/✕, now reachable from the pane close
    *  path too (rev-99 finding 3). */
   async canDiscard(): Promise<boolean> {
-    if (!this.isDirtyNow() || closeDecision(true) !== "confirm") return true;
+    // Same pure gate the view's own Esc/✕ uses (`requestClose`), so "dirty means
+    // ask" is stated once, in closeDecision, and cannot drift between the two.
+    if (closeDecision(this.isDirtyNow()) === "close") return true;
     return this.confirmDiscard();
   }
 

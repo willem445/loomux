@@ -736,7 +736,11 @@ export class Grid {
       close.title = `Close ${pane.name}`;
       close.addEventListener("click", (e) => {
         e.stopPropagation();
-        this.closePane(pane);
+        // Through the pane's close REQUEST, not straight to closePane: this is a
+        // human-initiated single-pane close, identical in meaning to the header ✕,
+        // so it must hit the same unsaved-edits guard. Closing it directly here
+        // silently discarded a docked file explorer's dirty buffer (rev-100).
+        pane.requestClose();
       });
 
       chip.append(name, close);
