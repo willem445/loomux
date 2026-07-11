@@ -29,6 +29,11 @@ export interface VoiceTargetPane {
   insertTranscript(text: string): void;
   /** Paste transcribed text into the terminal's PTY (bracketed, no newline). */
   pasteToTerminal(text: string): void;
+  /** Does this pane have an OPEN terminal to paste a transcript into? False for a
+   *  file-explorer pane (#214 — it never has one) and for a welcome / dormant pane
+   *  (hasn't opened one yet). Consulted before a capture starts, so we never record
+   *  a prompt that would land nowhere. */
+  hasTerminal(): boolean;
   /** Reflect the capture phase on the target's indicator (mic button for a
    *  compose target, overlay badge for a terminal target). */
   setVoicePhase(kind: "compose" | "terminal", phase: VoicePhase): void;
@@ -61,9 +66,17 @@ class VoiceController {
       const kind = resolveVoiceTargetKind({
         composeFocused: !!pane?.isComposeFocused(),
         hasActivePane: !!pane,
+        paneHasTerminal: !!pane?.hasTerminal(),
       });
       if (kind === "none" || !pane) {
-        showToast("Voice: focus a pane or the compose box first.");
+        // Distinguish "nothing is focused" from "this pane can't take a transcript"
+        // (a file explorer, or a pane still on the welcome form) — otherwise the
+        // advice to "focus a pane" is exactly what the user already did.
+        showToast(
+          pane
+            ? "Voice: this pane has no terminal to dictate into — focus a terminal or agent pane."
+            : "Voice: focus a pane or the compose box first."
+        );
         return null;
       }
       return { pane, kind };

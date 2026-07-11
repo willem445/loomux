@@ -19,6 +19,12 @@
 //                 the ONE place a resume can actually burn credits — a resumed
 //                 autonomous orchestrator (#83) may idle-tick and spawn a worker
 //                 storm (#78) — so the credit-safety stance stays exactly here.
+//   - Files     → re-open the file-explorer pane at its recorded root (#214).
+//                 No process, no session, nothing to resume — it's pure content,
+//                 so it comes straight back. Whether the root still EXISTS is
+//                 I/O, which this pure module can't do: `open-files` carries the
+//                 recorded root (possibly null) and the caller fails soft to the
+//                 welcome form in that slot when the folder is gone.
 //
 // Flip AUTO_RESUME_AGENTS to false to make EVERY agent restore dormant instead —
 // the plan's promised one-line switch, kept literally one line here.
@@ -73,6 +79,17 @@ export type RestoreAction =
       name: string;
       sessionId: string | null;
       role: string | null;
+    }
+  | {
+      // A file-explorer pane (#214), back at its recorded root. Nothing to spawn
+      // or resume — but `root` may be null (a record written without one) or name
+      // a folder that has since been deleted/renamed/unmounted. The caller probes
+      // it and, when it isn't a readable directory, opens the WELCOME form in that
+      // slot with a message instead — a broken tree pane would be worse than a
+      // legible "pick a folder".
+      type: "open-files";
+      name: string;
+      root: string | null;
     };
 
 /** True when a recorded agent session id still has a resumable conversation on
@@ -96,6 +113,10 @@ export function planPaneRestore(pane: PersistedPane, resumable?: SessionResumabl
       // the captured session id + role so the placeholder knows which group member
       // it is (a whole-group resume reads these off the tab's placeholders).
       return { type: "dormant-group", name: pane.name, sessionId: pane.sessionId, role: pane.role };
+    case "files":
+      // Pure content: no process, no credits, no session — it just comes back at
+      // the root it was captured with (which lives in `cwd`).
+      return { type: "open-files", name: pane.name, root: pane.cwd };
     case "agent":
       // Auto-resume when we have a session id AND the hybrid is enabled; else a
       // dormant Start placeholder (no id to resume into, or the flip is off).

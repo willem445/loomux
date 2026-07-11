@@ -78,6 +78,14 @@ resumed autonomous orchestrator (#83) can idle-tick and spawn a worker storm
 | **Agent** (has `sessionId`) | **Auto-resume** via `--resume <id>` into the idle TUI; **never** replay a queued prompt | Loads context, spends no credits — the "near-exact state" goal. |
 | **Agent** (no `sessionId`) | **Dormant** pane with a Start button, in the same cwd | Best-effort CLIs (copilot/codex/gemini) have no clean resumable id; honest, not silently broken. |
 | **Orchestrator / worker / reviewer** (`orch`) | **Dormant** — the human resumes the whole group via the existing `resumeOrchSession` | The one place a resume can actually burn credits; keep the safety stance exactly here. The rule is keyed on **kind, not the presence of an id** — a worker with a session id still stays dormant. |
+| **File explorer** (`files`, #214) | Re-open the tree at its recorded root — or, if that folder is gone, **fail soft to the welcome form** in that slot with a toast | Pure content: no process, no session, no credits, nothing to resume. The only thing that can rot under it is the *folder*, so the root is re-probed (`ftRootIsDir`) before the pane is built. Keyed on kind like the orch rule: a stray `sessionId` on a files leaf must never send it down an agent path. |
+
+The `files` kind needed **no schema change**: its root rides in the existing
+`cwd`, so `SCHEMA_VERSION` stays at 2 and older files (which simply never contain
+a `files` leaf) decode unchanged — the same shape-driven, additive move `role`
+made in #194.5. A rootless `files` leaf is *well-formed but unrestorable*, so it
+decodes (rather than triggering the whole-tree fail-safe and taking its sibling
+panes down with it) and is resolved in the one slot at restore time.
 
 `planPaneRestore(pane) → RestoreAction` is the per-pane core; `planLayoutRestore`
 turns a layout tree into an ordered `RestoreOpenStep[]` — one `grid.openPane`

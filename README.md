@@ -26,6 +26,24 @@ respects `.gitignore` by default, with an **Ignored files** toggle to include
 git-ignored paths (node_modules, build output). See the
 [design note](doc/design/fileedit.md).
 
+### Pane kinds
+
+Every pane starts on the welcome screen and declares what it becomes — there is
+no global mode:
+
+| Kind | What it is |
+| --- | --- |
+| **Agent** | A coding-agent CLI (Claude, Copilot, or a custom command), optionally fanned out to *N* panes each in its own git worktree. |
+| **Orchestrator + workers** | An orchestrator plus idle workers in their own project tab, with guardrails. |
+| **Terminal** | A plain shell: PowerShell, Command Prompt, or Git Bash. |
+| **File explorer** | The file editor above as a *permanent* pane, rooted at a folder you pick — no terminal underneath, no process, ever. |
+
+A **file explorer** pane lets you park a tree + editor beside your agents instead
+of toggling the overlay in and out, or opening an OS Explorer window per repo. It
+splits, docks, maximizes and restores like any other pane, and comes back at the
+same folder on session restore — but it is *not* an agent, so it never counts
+toward a tab's agent badge. See the [design note](doc/design/files-pane.md).
+
 ![sample](sample.jpg)
 
 ## Install
@@ -117,7 +135,7 @@ src-tauri/src/
   lib.rs            Tauri wiring
 src/
   pty.ts            typed bridge to the backend (invoke + event bus)
-  pane.ts           one terminal pane: xterm instance + header UI
+  pane.ts           one pane: xterm instance + header UI -- or, for a files pane (#214), a PTY-less file-explorer surface
   grid.ts           split-tree layout, dividers, focus, drag/maximize/minimize
   layout.ts         pure drag-reorder geometry (unit-tested, DOM-free)
   tabs.ts           project tabs (#63): TabManager -- tab list, active tab, routing (DOM-free)
@@ -132,12 +150,12 @@ src/
   groupresume.ts    pure whole-group resume plan: orchestrator first, delegates rejoin-or-skip (DOM-free, unit-tested, #194)
   panefit.ts        pure "hidden => no PTY resize" decision (the no-resize invariant)
   sessions.ts       session browser sidebar
-  launcher.ts       in-pane welcome / pane-setup form (Agent / Orchestrator / Terminal kind picker)
+  launcher.ts       in-pane welcome / pane-setup form (Agent / Orchestrator / Terminal / File-explorer kind picker)
   panesetup.ts      pure kind-selection + validation core for the welcome screen (DOM-free, unit-tested)
   orchestration.ts  frontend half of agent groups (panes, badges, focus)
   shortcuts.ts      app-level keybindings (single source of truth)
   fileapi.ts        typed bridge to fileedit.rs (per-feature wrapper, like git.ts)
-  fileedit.ts       file-editor overlay (#174): tree + code editor + search/replace (DOM wiring)
+  fileedit.ts       file-editor surface (#174): tree + code editor + search/replace (DOM wiring). An Alt+F overlay, or a files pane's permanent content (#214)
   filetreemodel.ts  pure lazy-tree model: sort/merge/flatten (DOM-free, unit-tested)
   fileicons.ts      pure filename -> inline-SVG icon mapping (DOM-free, unit-tested)
   searchresults.ts  pure search grouping + tree-hit + replace-selection model (DOM-free, unit-tested)

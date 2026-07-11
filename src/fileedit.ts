@@ -70,6 +70,18 @@ export interface FileEditHost {
   /** True when the root is a running agent's worktree — the view shows a subtle
    *  banner (editing it is legitimate but the agent may also be writing). */
   isAgentWorktree?(): boolean;
+  /** EMBEDDED mode (#214): this view is a file-explorer pane's permanent content,
+   *  not an overlay floating over a terminal. There is nothing to close back TO,
+   *  so the ✕ and the Esc-to-close binding are dropped — the pane's own ✕ closes
+   *  it. Everything else (tree, editor, #207 streaming search, replace) is
+   *  identical; this is the only behavioral fork, and it's one the overlay
+   *  semantics genuinely don't have an answer for. */
+  embedded?: boolean;
+  /** The user re-rooted the tree from the header's folder picker. An overlay host
+   *  ignores this (the root is view-local and browsing must not disturb the
+   *  terminal); a files pane (#214) adopts it as the pane's root, so the title and
+   *  the persisted layout follow what's actually on screen. */
+  onRootChanged?(root: string): void;
 }
 
 const TREE_W_KEY = "loomux.fileedit.treeW";
@@ -170,12 +182,17 @@ export class FileEditView {
     this.el = el("div", "fileedit");
     this.el.hidden = true;
     this.el.tabIndex = -1;
-    this.el.addEventListener("keydown", (e) => {
-      if (e.key === "Escape") {
-        e.stopPropagation();
-        void this.requestClose();
-      }
-    });
+    // Esc closes the OVERLAY. An embedded (pane-content) view has nothing to
+    // close back to, so Esc is left alone there — closing the pane on a stray
+    // Escape would be a nasty surprise with unsaved edits in the buffer.
+    if (!host.embedded) {
+      this.el.addEventListener("keydown", (e) => {
+        if (e.key === "Escape") {
+          e.stopPropagation();
+          void this.requestClose();
+        }
+      });
+    }
 
     // ---- header ----
     const head = el("div", "fileedit-head");
@@ -206,6 +223,7 @@ export class FileEditView {
 
     const closeBtn = el("button", "pane-btn close", "✕") as HTMLButtonElement;
     closeBtn.title = "Close (Esc)";
+    closeBtn.hidden = !!host.embedded; // pane content — the PANE's ✕ is the close affordance
     closeBtn.addEventListener("click", () => void this.requestClose());
 
     head.append(rootWrap, spacer, this.fileLabel, this.dirtyDot, this.findBtn, this.saveBtn, closeBtn);
@@ -325,6 +343,10 @@ export class FileEditView {
     if (typeof picked === "string") {
       this.root = picked;
       this.refreshRootLabel();
+      // A files pane (#214) adopts the new root as ITS root — title and persisted
+      // layout follow the tree the user is actually looking at. An overlay host
+      // doesn't implement this: there the root stays view-local by design.
+      this.host.onRootChanged?.(picked);
       await this.reloadTree();
     }
   }

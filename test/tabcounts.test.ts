@@ -13,6 +13,25 @@ test("counts only LIVE agent panes — terminals and welcome/dormant panes add n
   assert.equal(c.dormantOrch, false);
 });
 
+test("file-explorer panes are NOT agents — they never touch the count (#214)", () => {
+  // A files pane is a viewer with no process. It is reported `live: true` (it IS
+  // functional), which is exactly why this has to be pinned: if the counter ever
+  // keyed off `live` instead of `kind`, a tab of file explorers would claim to be
+  // running agents that don't exist.
+  const c = tabCounts([p("files"), p("files"), p("agent")], false);
+  assert.equal(c.agents, 1);
+  assert.equal(c.liveOrch, false);
+  assert.equal(c.dormantOrch, false);
+});
+
+test("a tab of nothing but file explorers reports no agents and no orch markers", () => {
+  assert.deepEqual(tabCounts([p("files"), p("files")], false), {
+    agents: 0,
+    liveOrch: false,
+    dormantOrch: false,
+  });
+});
+
 test("an empty tab (only a welcome pane) counts zero and shows no markers", () => {
   const c = tabCounts([p("terminal", false)], false);
   assert.deepEqual(c, { agents: 0, liveOrch: false, dormantOrch: false });

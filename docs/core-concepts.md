@@ -18,10 +18,40 @@ nav_order: 3
 
 ## Panes
 
-A **pane** is one terminal. Every pane runs a real PTY — a shell, an agent CLI,
-or anything else you'd run in a terminal — with full color, escape-sequence, and
-wide-character fidelity. Panes can be **named** (`F2`, or double-click the
-title) so a wall of agents stays legible.
+A **pane** is one slot in the grid. Most panes are a terminal — a real PTY
+running a shell, an agent CLI, or anything else you'd run in a terminal, with
+full color, escape-sequence, and wide-character fidelity. Panes can be **named**
+(`F2`, or double-click the title) so a wall of agents stays legible.
+
+### Pane kinds
+
+Every pane starts on the **welcome screen**, where you pick what it becomes.
+There is no global mode — each pane declares its own kind:
+
+| Kind | What it is |
+| --- | --- |
+| **Agent** | A coding-agent CLI (Claude, Copilot, or your own command). Optionally fans out to *N* panes, each in its own git worktree. |
+| **Orchestrator + workers** | An orchestrator pane plus idle workers, in its own project tab, with guardrails. See the [orchestration guide](orchestration). |
+| **Terminal** | A plain shell — PowerShell, Command Prompt, or Git Bash. |
+| **File explorer** | A file tree + code editor rooted at a folder you choose. |
+
+A **file explorer** pane is loomux's file editor — the same lazy tree, CodeMirror
+editor, and streaming project-wide search you get from the `Alt+F` overlay — as a
+*permanent* pane rather than something you toggle over a terminal. Pick a folder
+and the pane holds it for as long as you keep it open, so you can park a browser
+beside your agents instead of flicking an overlay in and out (or opening a
+separate Explorer window per repo).
+
+It has no terminal underneath and never starts a process. That means the
+terminal-oriented chrome is gone from its header (no folder or branch chip; the
+git, issues, and file-editor overlays don't apply — `Alt+G`/`Alt+I` will tell you
+so). Everything else is a normal pane: it splits, drags, docks, maximizes,
+renames, and comes back on session restore at the same folder. It is **not** an
+agent, so it never counts toward a tab's agent badge.
+
+If the folder is gone when a session is restored (deleted, renamed, or on a drive
+that isn't mounted), that pane comes back as the welcome screen with a message
+instead of an empty tree — pick a new folder and carry on.
 
 ## The split grid
 

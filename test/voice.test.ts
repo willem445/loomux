@@ -11,26 +11,36 @@ import {
 
 test("resolveVoiceTargetKind: focused compose box wins", () => {
   assert.equal(
-    resolveVoiceTargetKind({ composeFocused: true, hasActivePane: true }),
+    resolveVoiceTargetKind({ composeFocused: true, hasActivePane: true, paneHasTerminal: true }),
     "compose",
   );
   // Even with no active pane, an explicitly focused compose box is the target.
   assert.equal(
-    resolveVoiceTargetKind({ composeFocused: true, hasActivePane: false }),
+    resolveVoiceTargetKind({ composeFocused: true, hasActivePane: false, paneHasTerminal: false }),
     "compose",
   );
 });
 
 test("resolveVoiceTargetKind: falls back to the active pane's terminal", () => {
   assert.equal(
-    resolveVoiceTargetKind({ composeFocused: false, hasActivePane: true }),
+    resolveVoiceTargetKind({ composeFocused: false, hasActivePane: true, paneHasTerminal: true }),
     "terminal",
   );
 });
 
 test("resolveVoiceTargetKind: nothing focusable → none", () => {
   assert.equal(
-    resolveVoiceTargetKind({ composeFocused: false, hasActivePane: false }),
+    resolveVoiceTargetKind({ composeFocused: false, hasActivePane: false, paneHasTerminal: false }),
+    "none",
+  );
+});
+
+test("resolveVoiceTargetKind: a pane with no terminal (file explorer) refuses the capture", () => {
+  // #214: a files pane has no PTY, and a welcome/dormant pane hasn't opened one.
+  // Without this the capture would run to completion and paste the transcript into
+  // an xterm that was never opened — the words silently vanish. Refuse up front.
+  assert.equal(
+    resolveVoiceTargetKind({ composeFocused: false, hasActivePane: true, paneHasTerminal: false }),
     "none",
   );
 });

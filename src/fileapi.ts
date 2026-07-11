@@ -127,6 +127,26 @@ export function errorMessage(e: unknown): string {
 export const ftListDir = (root: string, rel: string): Promise<FtEntry[]> =>
   invoke("ft_list_dir", { root, rel });
 
+/** Is `root` an existing, readable directory? The validation a file-explorer pane
+ *  (#214) needs — at setup, so a typo'd path surfaces inline instead of creating a
+ *  pane with a broken tree, and again at session restore, so a root that has since
+ *  been deleted/renamed/unmounted fails soft to the welcome form.
+ *
+ *  No new command: `ft_list_dir` with an empty `rel` resolves the root itself and
+ *  already rejects a missing or non-directory path (`safe_resolve` → "not-found"),
+ *  which is exactly the question being asked. Any error — including a permission
+ *  failure we can't read past — answers "no", which is the honest answer for a
+ *  tree we could not render anyway. */
+export async function ftRootIsDir(root: string): Promise<boolean> {
+  if (!root.trim()) return false;
+  try {
+    await ftListDir(root, "");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export const ftReadFile = (root: string, rel: string): Promise<FileRead> =>
   invoke("ft_read_file", { root, rel });
 

@@ -860,6 +860,30 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .pane.is-welcome .pane-meta,
 .pane.is-welcome .pane-btn:not(.close) { display: none; }
 
+/* ---------- file-explorer pane (#214) ---------- */
+/* A pane whose content IS the file tree + editor — no terminal underneath, no
+   PTY, ever. Same in-pane content mechanics as the welcome surface above: the
+   (empty, never-opened) .pane-term stays in the flow and this covers it, so the
+   pane's own chrome — splits, drag/dock, maximize, minimize — needs no special
+   case. Nothing here can resize a ConPTY, because there isn't one.
+
+   Chrome that describes a SHELL is hidden: the folder chip cd's a shell, the
+   branch chip opens the git view, and the git/issues/file-editor buttons open
+   overlays sized against the terminal's height (see Pane.refuseOverlay). What
+   stays is what still means something: rename, "open in editor", split, dock,
+   maximize, close. */
+.pane.is-files .pane-meta,
+.pane.is-files .pane-btn.pty-only { display: none; }
+
+.pane-files {
+  position: absolute; top: var(--pane-header-h); left: 0; right: 0; bottom: 0;
+  z-index: 5;
+  display: flex; flex-direction: column; min-height: 0;
+  background: var(--bg-app);
+}
+/* The embedded view is the pane's whole body. (.fileedit is `flex: 1` and
+   already lays itself out; it only needs a box to fill.) */
+
 /* The form fills the pane's body below the header and scrolls if the card is
    taller than the pane; the card itself is centered. */
 .pane-welcome {

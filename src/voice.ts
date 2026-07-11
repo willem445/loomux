@@ -6,18 +6,25 @@
  *  currently holds focus:
  *   - "compose"  → the focused steer/compose textbox (insert at caret);
  *   - "terminal" → the active pane's terminal (paste into its PTY, no newline);
- *   - "none"     → nothing focusable to receive it (no active pane) → don't start. */
+ *   - "none"     → nothing focusable to receive it → don't start. */
 export type VoiceTargetKind = "compose" | "terminal" | "none";
 
 /** Decide the target kind. A focused compose box wins (the human is clearly
- *  composing there); otherwise the active pane's terminal receives it; with no
- *  active pane there's nowhere to put it. */
+ *  composing there); otherwise the active pane's terminal receives it; with
+ *  nowhere to put it, we refuse to start (rather than record into the void). */
 export function resolveVoiceTargetKind(opts: {
   composeFocused: boolean;
   hasActivePane: boolean;
+  /** Does the active pane have an OPEN terminal to paste into? Not every pane
+   *  does: a file-explorer pane (#214) never has one, and a welcome / dormant pane
+   *  hasn't opened one yet. Aiming a transcript at those means pasting into an
+   *  unopened xterm — the words just vanish. Better to refuse the capture up front
+   *  than to record, transcribe, and silently drop it. Ignored when a compose box
+   *  is focused (that path doesn't touch the terminal). */
+  paneHasTerminal: boolean;
 }): VoiceTargetKind {
   if (opts.composeFocused) return "compose";
-  if (opts.hasActivePane) return "terminal";
+  if (opts.hasActivePane && opts.paneHasTerminal) return "terminal";
   return "none";
 }
 

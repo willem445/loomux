@@ -10,8 +10,14 @@
 // Git Bash depends on a Git-for-Windows install, discovered backend-side. This
 // module owns the pure kind→enable/disable mapping and the fallback resolver so
 // the form logic is unit-tested without a DOM (test/panesetup.test.ts).
+//
+// #214 adds a FOURTH kind: `files` — a PTY-less pane whose content is the file
+// tree + editor surface, rooted at a directory the user picks. Its only setup
+// input is that root, and the only rule this module can decide is "a root was
+// given"; whether the directory actually EXISTS is I/O, so the form probes it
+// (ftRootIsDir) after this returns ok and surfaces a failure inline.
 
-export type PaneKind = "agent" | "orchestrator" | "terminal";
+export type PaneKind = "agent" | "orchestrator" | "terminal" | "files";
 export type ShellKind = "powershell" | "gitbash" | "cmd";
 
 const AGENT_MIN = 1;
@@ -65,7 +71,16 @@ export interface OrchestratorPlan {
   kind: "orchestrator";
   repo: string;
 }
-export type PaneSetupPlan = TerminalPlan | AgentPlan | OrchestratorPlan;
+/** A file-explorer pane (#214): a directory to root the tree at, and a name. No
+ *  command, no shell, no PTY — the pane's content IS the file tree + editor. */
+export interface FilesPlan {
+  kind: "files";
+  /** Absolute directory the tree roots at. Non-empty (validated below); its
+   *  EXISTENCE is checked by the caller (I/O), not here. */
+  root: string;
+  name: string;
+}
+export type PaneSetupPlan = TerminalPlan | AgentPlan | OrchestratorPlan | FilesPlan;
 
 /** Which field to focus when validation fails, so the form can surface it. */
 export type PaneSetupFocus = "repo" | "custom" | "count";
@@ -212,6 +227,21 @@ export function planPaneSetup(input: PaneSetupInput): PaneSetupResult {
       };
     }
     return { ok: true, plan: { kind: "orchestrator", repo } };
+  }
+
+  // files (#214): the root is mandatory — unlike a terminal, "" can't fall back
+  // to home, because a file tree over the whole home directory is never what the
+  // user meant, and a rootless files pane has no content at all.
+  if (input.kind === "files") {
+    if (!repo) {
+      return {
+        ok: false,
+        error: "The file explorer needs a folder — pick one first.",
+        focus: "repo",
+      };
+    }
+    const name = input.name.trim() || pathTail(repo) || "files";
+    return { ok: true, plan: { kind: "files", root: repo, name } };
   }
 
   // agent
