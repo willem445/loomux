@@ -473,6 +473,18 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 }
 
 /* ---------- pane metadata (folder · branch) ---------- */
+/* The folder/branch chips — AND the header's flex spacer.
+ *
+ * This box is the only `flex: 1` child of `.pane-header`, so it is what eats the free
+ * space and pushes the button cluster to the right edge. That dual role is easy to miss:
+ * `display: none` it for a pane kind with no chips to show, and that kind's buttons
+ * silently collapse to the LEFT, next to the title, while every other pane kind keeps
+ * them on the right. (Which is exactly what happened to the files pane — and to the
+ * welcome pane before it, unnoticed because only its ✕ survives.)
+ *
+ * So: a pane kind with nothing to show here hides the ITEMS (`.pane-meta-item`), never
+ * this container. It then renders as an empty, zero-width, growing box — a spacer — and
+ * the buttons stay where they belong. Don't `display: none` this. */
 .pane-meta {
   flex: 1 1 auto; min-width: 0;
   display: flex; align-items: center; gap: 13px; overflow: hidden;
@@ -857,7 +869,10 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
    pane (no PTY yet) renders the form until the user picks a kind. The pane's
    header stays, but its terminal-oriented chrome (folder/branch chips, overlay
    buttons) is irrelevant with no shell, so hide it. */
-.pane.is-welcome .pane-meta,
+/* The chips describe a SHELL's live cwd and branch — a setup pane has neither. Hide the
+   ITEMS, not their container: the container is the header's flex spacer (see .pane-meta),
+   and hiding it is what used to shove the ✕ over to the left, next to the title. */
+.pane.is-welcome .pane-meta-item,
 .pane.is-welcome .pane-btn:not(.close) { display: none; }
 
 /* ---------- file-explorer pane (#214) ---------- */
@@ -872,7 +887,12 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
    overlays sized against the terminal's height (see Pane.refuseOverlay). What
    stays is what still means something: rename, "open in editor", split, dock,
    maximize, close. */
-.pane.is-files .pane-meta,
+/* Same rule, same reason: hide the chip ITEMS, never `.pane-meta` itself. It is the
+   header's flex spacer, and removing it collapsed this pane's whole button cluster to the
+   left of the header while every other pane kind kept it on the right (human demo, final
+   round). The buttons now align, order and space exactly like a terminal pane's, because
+   they are laid out by exactly the same rules. */
+.pane.is-files .pane-meta-item,
 .pane.is-files .pane-btn.pty-only { display: none; }
 
 .pane-files {
