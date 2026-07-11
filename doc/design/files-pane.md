@@ -272,17 +272,64 @@ streaming index batch re-ranking the results, the filter clearing, a refresh
 reordering the listing, the user sitting on a confirm dialog. **An index is a position
 in a list that may not even be on screen; a path is the file.**
 
+### …and the editor can only mount where it can be SEEN
+
+Fixing the target was only **half** the bug, and the other half then got built a second
+time — by the very code path added to fix the first half. This is worth recording
+plainly, because the second occurrence was not a slip; it was a consequence of thinking
+the problem was solved.
+
+The inline-edit row exists **only in the directory listing**. Mount it while the
+Go-to-file results are on screen and it lands inside a `display:none` list: the row
+never appears, and its focus call no-ops. The user sees nothing happen. That is the
+*same visible symptom* — "F2 does nothing" — from a *different cause*.
+
+The new rename-from-results path captured the right target, navigated to the right
+folder… and never cleared the query. `render()` ends in `refreshGoto()`, which
+recomputes "are we filtering?" from the (still non-empty) search box and re-hides the
+listing. Editor into a hidden list. Bug, again.
+
+So the rule is not a call to `exitFilter()` remembered at each call site — that is what
+was forgotten. It is stated **once, in the pure model** (`editMountFor`), where it is
+asserted:
+
+> **An inline editor may only mount in the listing, so any op that opens one must first
+> make the listing the visible view — and that is true even when the target is already
+> in the folder being browsed**, because it is the *query* that hides the listing, not
+> the folder. ("Only exit the filter if we also have to navigate" is a
+> reasonable-looking fix and a wrong one; there's a test named for it.)
+
+Belt and braces, `renderList` **self-heals**: a rename edit whose row it did not render
+is dropped. Without that, the edit state would sit there with no input to type in and no
+Escape to press, while `onListKey` swallowed every key. It should never fire — but it
+makes the whole class unreachable rather than merely fixed.
+
 Two consequences worth stating:
 
-- **Rename from a search result** navigates to the file's folder, selects it, and opens
-  the editor there. The op still acts on the row you invoked it on — that's the
-  identity capture — and now you can *see* it doing so. (Hosting the editor inside the
-  results list instead would put a focused text input in a list that re-renders on
-  every streaming index batch, which would eat keystrokes.)
-- **Creating** a folder or file first leaves the filtered view, because the new entry
-  lands in the directory being browsed and its editor row lives in the listing.
-  Rendering an editor into a hidden list is precisely how "the click did nothing"
-  happened; the same mistake is not available twice.
+- **Rename from a search result** clears the filter, navigates to the file's folder,
+  selects it, and opens the editor there. The op still acts on the row you invoked it
+  on — that's the identity capture — and now you can *see* it doing so. (Hosting the
+  editor inside the results list instead would put a focused text input in a list that
+  re-renders on every streaming index batch, which would eat keystrokes.)
+- **Creating** a folder or file also leaves the filtered view first, because the new
+  entry lands in the directory being browsed and its editor row lives in the listing.
+
+### A target whose row isn't there
+
+`mountBlocker` answers "can this target's row actually be rendered?", because two
+perfectly ordinary situations say no:
+
+- **It's hidden.** The Go-to-file index reaches files the listing hides — on macOS/Linux
+  that is *every tracked dotfile* (`.gitignore`, `.github/…`), on Windows every
+  hidden-attribute file. Renaming `.gitignore` from a search with **Hidden** off is a
+  normal thing to want. So the op turns Hidden **on** for you, and says so in a toast:
+  refusing would be perverse (you can see the file, right there in the results), and
+  silently sprouting dotfiles would be its own small mystery.
+- **It vanished** between capture and mount — an agent deleted it while you were picking
+  it out of the results. Say so, and drop the edit.
+
+Either, left unhandled, mounts no editor *and* leaves the edit state set with nothing to
+escape from — which is the keyboard-deadening the self-heal above also guards.
 
 ### The inline check is a *subset* of the backend's, on purpose
 
@@ -343,7 +390,7 @@ agents that don't exist. There's a test pinning that.
 | The pane | `src/pane.ts` | `startFiles()`, `isFiles`, `workdir`, `refuseOverlay()`, the `liveKind`/`capture`/`tabPaneInfo` arms. DOM-coupled → hand-validated. |
 | Placement | `src/grid.ts` | `openFilesPane()` — like `openWelcomePane`, but content instead of a form. Synchronous: there's no process to await. |
 | The manager | `src/fileexplorer.ts` | Toolbar, breadcrumb, listing, inline edits, Go-to-file. DOM wiring only. |
-| Its pure core | `src/fileexplorermodel.ts` | Listing order, rooted navigation, breadcrumb, formatting, inline-edit validation, and `activeTarget` — which view an op resolves against. Unit-tested. |
+| Its pure core | `src/fileexplorermodel.ts` | Listing order, rooted navigation, breadcrumb, formatting, inline-edit validation; `activeTarget` (which view an op resolves against), `editMountFor` (the view state an editor needs before it can mount) and `mountBlocker` (whether the target's row can be rendered at all). Unit-tested. |
 | Name ranking | `src/filematch.ts` | Substring + path-segment, best-occurrence, deterministic ties. Unit-tested. |
 | Typed bridge | `src/filemgr.ts` | `fm_*` wrappers (per-feature module, the `fileapi.ts` precedent). |
 | Backend | `src-tauri/src/filemgr.rs` | list / new folder / **new file** / rename / delete / open-with-default. Reuses `fileedit::safe_resolve`. Integration-tested. |

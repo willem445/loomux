@@ -156,13 +156,17 @@ export interface OpTarget {
 }
 
 /** The two things the explorer can be showing. Ops resolve against whichever one the
- *  user is looking at — conflating them is precisely what went wrong. */
+ *  user is looking at — conflating them is precisely what went wrong.
+ *
+ *  BOTH carry `dir`: the directory being browsed is a fact about the pane, not about
+ *  which list happens to be on screen. The results view still has one (it is what you
+ *  return to when the filter clears), and `editMountFor` needs it. */
 export type ExplorerView =
   | { kind: "listing"; dir: string; rows: readonly FmEntry[]; sel: number }
   /** Go-to-file hits. These are files from anywhere under the root, so a hit carries
    *  its own full `rel` — it is NOT relative to the directory being browsed, which is
    *  the other half of why resolving one against `dir` produced nonsense. */
-  | { kind: "results"; hits: readonly { rel: string }[]; sel: number };
+  | { kind: "results"; dir: string; hits: readonly { rel: string }[]; sel: number };
 
 /** The last segment of a root-relative path. */
 export function baseName(rel: string): string {
@@ -188,6 +192,68 @@ export function activeTarget(view: ExplorerView): OpTarget | null {
   if (!hit) return null;
   // A Go-to-file hit is always a file (the enumeration lists files, never dirs).
   return { rel: hit.rel, name: baseName(hit.rel), isDir: false, from: "results" };
+}
+
+// ---------- where an inline editor is allowed to mount ----------
+//
+// THE INVARIANT: the inline-edit row exists ONLY in the directory listing. Mounting it
+// while the Go-to-file results are on screen puts it inside a `display:none` list — the
+// row never appears, and the focus call no-ops on it. That is *exactly* the "F2 does
+// nothing" symptom, and it has now been built twice: once by the original index-based
+// targeting, and once again by the very code path added to fix that. Fixing the target
+// resolution was not enough, because the target was never the whole bug: the other half
+// is WHERE the editor lands.
+//
+// So the rule is stated here, in the pure model, where it can be asserted — instead of
+// living as an easily-forgotten `exitFilter()` call at each call site.
+
+/** The view changes an op must make BEFORE it can mount its inline editor. */
+export interface EditMount {
+  /** The directory whose listing must be showing (the target's own folder). */
+  dir: string;
+  /** Leave the Go-to-file results first. True whenever they are what's on screen —
+   *  INCLUDING when the target already lives in the directory being browsed. That case
+   *  is the trap: "only exit the filter if we also have to navigate" looks reasonable
+   *  and is wrong, because the listing is hidden either way. */
+  exitFilter: boolean;
+  /** Fetch a different directory first. False when the target is already in view. */
+  navigate: boolean;
+}
+
+export function editMountFor(target: OpTarget, view: ExplorerView): EditMount {
+  const dir = parentRel(target.rel) ?? "";
+  return {
+    dir,
+    exitFilter: view.kind === "results",
+    navigate: dir !== view.dir,
+  };
+}
+
+/** Why the target's row can't be rendered in the listing — or `ok` when it can.
+ *
+ *  `openRenameEditor` cannot just assume the row is there. The Go-to-file index reaches
+ *  files the listing HIDES: on macOS/Linux that is every tracked dotfile (`.gitignore`,
+ *  `.github/…`), on Windows every hidden-attribute file. Renaming `.gitignore` from a
+ *  search with **Hidden** off is an ordinary thing to do, and it must not silently mount
+ *  no editor — which would also leave `edit` set with no input to Escape from, deadening
+ *  the listing's keyboard until some other path happened to reset it. */
+export type MountBlock =
+  /** The row is present and visible — go ahead. */
+  | { kind: "ok" }
+  /** It exists, but the Hidden toggle is hiding it. */
+  | { kind: "hidden" }
+  /** It is gone from disk since the target was captured (an agent deleted it). */
+  | { kind: "missing" };
+
+export function mountBlocker(
+  target: OpTarget,
+  entries: readonly FmEntry[],
+  showHidden: boolean
+): MountBlock {
+  const entry = entries.find((e) => e.name === target.name);
+  if (!entry) return { kind: "missing" };
+  if (entry.is_hidden && !showHidden) return { kind: "hidden" };
+  return { kind: "ok" };
 }
 
 // ---------- selection ----------

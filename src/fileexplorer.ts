@@ -29,6 +29,8 @@ import {
   isCreate,
   noEdit,
   activeTarget,
+  editMountFor,
+  mountBlocker,
   type FmEntry,
   type EditState,
   type ExplorerView,
@@ -102,6 +104,9 @@ export class FileExplorerView {
   private deleteBtn: HTMLButtonElement;
   private listEl: HTMLElement;
   private statusEl: HTMLElement;
+  /** The Hidden toggle's checkbox. Held so an op can turn it on (renaming a dotfile
+   *  found via Go-to-file) and have the control reflect what's actually showing. */
+  private hiddenBox: HTMLInputElement;
 
   // Go-to-file (the fast file-NAME search, kept from the first cut — it fits a
   // manager perfectly: an index built once per root, filtered in memory per
@@ -161,6 +166,7 @@ export class FileExplorerView {
     hiddenLabel.className = "fileexp-toggle";
     const hiddenBox = document.createElement("input");
     hiddenBox.type = "checkbox";
+    this.hiddenBox = hiddenBox;
     hiddenBox.addEventListener("change", () => {
       this.showHidden = hiddenBox.checked;
       this.sel = -1;
@@ -335,7 +341,7 @@ export class FileExplorerView {
    *  the listing unconditionally — conflating the two is the bug the human hit. */
   private view(): ExplorerView {
     return this.filtering
-      ? { kind: "results", hits: this.gotoHits, sel: this.gotoSel }
+      ? { kind: "results", dir: this.rel, hits: this.gotoHits, sel: this.gotoSel }
       : { kind: "listing", dir: this.rel, rows: this.rows(), sel: this.sel };
   }
 
@@ -375,25 +381,56 @@ export class FileExplorerView {
       showToast("Select an item to rename.", "info");
       return;
     }
-    // Invoked on a FILTERED RESULT: that file may live in any folder under the root, and
-    // the inline editor only exists in the listing. So go to where the file actually is,
-    // select it, and open the editor on it there. The user sees the file they picked, in
-    // its folder, with the cursor in its name — which is what "rename this" should look
-    // like. (Hosting the editor in the results list instead would put a focused input in
-    // a list that re-renders on every streaming index batch — it would eat keystrokes.)
-    if (target.from === "results") {
-      void this.navigate(parentRel(target.rel) ?? "", target.name).then(() => {
-        if (this.disposed) return;
-        this.openRenameEditor(target);
-      });
+    // What the VIEW must become before an editor can mount on this target (pure, and
+    // tested: editMountFor). Getting the TARGET right was only half the bug — the other
+    // half is where the editor LANDS. `exitFilter` is the load-bearing bit: render()
+    // ends in refreshGoto(), which re-hides the listing while a query is still set, so
+    // without it the editor mounts inside a display:none list and its focus call no-ops
+    // — the "F2 does nothing" symptom, rebuilt on the very path added to kill it.
+    const mount = editMountFor(target, this.view());
+    if (mount.exitFilter) this.exitFilter();
+    if (!mount.navigate) {
+      this.openRenameEditor(target);
       return;
     }
-    this.openRenameEditor(target);
+    // The file lives in another folder (a Go-to-file hit can be anywhere under the
+    // root). Go to where it actually is and select it, so the user SEES the file they
+    // picked, in context, with the cursor in its name. (Hosting the editor in the
+    // results list instead would put a focused input in a list that re-renders on every
+    // streaming index batch — it would eat keystrokes.)
+    void this.navigate(mount.dir, target.name).then(() => {
+      if (this.disposed) return;
+      this.openRenameEditor(target);
+    });
   }
 
   /** Open the inline rename editor on `target`. The target's PATH is what's stored, so
-   *  the commit acts on the file the user picked no matter what the listing does next. */
+   *  the commit acts on the file the user picked no matter what the listing does next.
+   *
+   *  The row has to actually BE in the listing, though, and `mountBlocker` says whether
+   *  it is. Two ways it isn't — both reachable from a Go-to-file hit, and both of which
+   *  would otherwise mount no editor AND leave `edit` set with no input to Escape from,
+   *  deadening the listing's keyboard until some unrelated path reset it. */
   private openRenameEditor(target: OpTarget): void {
+    const block = mountBlocker(target, this.entries, this.showHidden);
+    if (block.kind === "missing") {
+      // Gone between capture and now — an agent, or another app, deleted it.
+      showToast(`"${target.name}" no longer exists.`);
+      this.edit = noEdit;
+      this.render();
+      return;
+    }
+    if (block.kind === "hidden") {
+      // The Go-to-file index reaches files the listing HIDES (every dotfile on
+      // macOS/Linux; hidden-attribute files on Windows). The user asked to rename a file
+      // they can plainly see in the results — hiding it from them now would be a
+      // non-sequitur. So turn Hidden on for them, and SAY so: a listing that silently
+      // sprouts dotfiles is its own small mystery.
+      this.showHidden = true;
+      this.hiddenBox.checked = true;
+      this.invalidateIndex(); // the index's scope follows the toggle
+      showToast(`Showing hidden files so "${target.name}" can be renamed.`, "info");
+    }
     this.edit = { kind: "rename", rel: target.rel, original: target.name, draft: target.name };
     this.render();
   }
@@ -584,9 +621,11 @@ export class FileExplorerView {
       frag.appendChild(this.editRow(this.edit.kind === "new-folder"));
     }
 
+    let renamedRowRendered = false;
     rows.forEach((entry, i) => {
       if (this.edit.kind === "rename" && this.edit.original === entry.name) {
         frag.appendChild(this.editRow(entry.is_dir && !entry.is_symlink));
+        renamedRowRendered = true;
         return;
       }
       const row = el("div", "fileexp-row");
@@ -623,6 +662,16 @@ export class FileExplorerView {
     }
     this.listEl.replaceChildren(frag);
     this.listEl.querySelector(".fileexp-row.sel")?.scrollIntoView({ block: "nearest" });
+
+    // SELF-HEAL. A rename edit whose row we did not render has no input to type in and
+    // no Escape to press — and `onListKey` would stay deadened by it (`edit.kind !==
+    // "none"` swallows every key) until some unrelated path happened to reset it.
+    // `openRenameEditor`'s mountBlocker check should mean this never fires; this is here
+    // so that no FUTURE path can reintroduce the whole class by forgetting to make the
+    // row visible first. Belt and braces on the bug that has now been built twice.
+    if (this.edit.kind === "rename" && !renamedRowRendered) {
+      this.edit = noEdit;
+    }
   }
 
   /** The inline input row shared by "new folder" and "rename" — one interaction, so

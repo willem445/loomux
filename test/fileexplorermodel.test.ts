@@ -20,9 +20,12 @@ import {
   noEdit,
   activeTarget,
   baseName,
+  editMountFor,
+  mountBlocker,
   type FmEntry,
   type EditState,
   type ExplorerView,
+  type OpTarget,
 } from "../src/fileexplorermodel.ts";
 
 const entry = (name: string, over: Partial<FmEntry> = {}): FmEntry => ({
@@ -160,6 +163,7 @@ const listingView = (sel: number, dirRel = ""): ExplorerView => ({
 });
 const resultsView = (sel: number, ...rels: string[]): ExplorerView => ({
   kind: "results",
+  dir: "",
   hits: rels.map((rel) => ({ rel })),
   sel,
 });
@@ -232,6 +236,73 @@ test("nothing selected — or a stale, out-of-range selection — targets nothin
 test("baseName takes the last segment of a rel", () => {
   assert.equal(baseName("a/b/c.ts"), "c.ts");
   assert.equal(baseName("top.ts"), "top.ts");
+});
+
+// ---------- where the inline editor is allowed to mount ----------
+//
+// The OTHER half of the same bug, and the one that got rebuilt on the very path added
+// to fix the first half. Capturing the right target is not enough: the inline editor row
+// exists ONLY in the directory listing, so mounting it while the Go-to-file results are
+// on screen puts it inside a `display:none` list — the row never appears and its focus
+// call no-ops. Same visible symptom ("F2 does nothing"), different cause. These pin the
+// required POST-OP VIEW STATE, not just the target path.
+
+test("rename from a RESULT must leave the filter — the editor cannot mount in a hidden list", () => {
+  const target = activeTarget(resultsView(0, "deep/nested/target.ts"))!;
+  const mount = editMountFor(target, resultsView(0, "deep/nested/target.ts"));
+  assert.equal(mount.exitFilter, true, "the results list must go, or the editor mounts nowhere");
+  assert.equal(mount.navigate, true);
+  assert.equal(mount.dir, "deep/nested", "and the listing shown must be the file's own folder");
+});
+
+test("rename from a result in the CURRENTLY BROWSED folder STILL leaves the filter", () => {
+  // The trap. "Only exit the filter if we also have to navigate" is a reasonable-looking
+  // fix and a wrong one: the listing is hidden either way, because it is the QUERY that
+  // hides it — not the folder. Nothing to navigate to here, and the filter must still go.
+  const view: ExplorerView = { kind: "results", dir: "src", hits: [{ rel: "src/pane.ts" }], sel: 0 };
+  const target = activeTarget(view)!;
+  const mount = editMountFor(target, view);
+  assert.equal(mount.exitFilter, true, "hidden by the QUERY, not by the folder");
+  assert.equal(mount.navigate, false, "already in the right folder — nothing to fetch");
+  assert.equal(mount.dir, "src");
+});
+
+test("rename from the LISTING needs no view change at all", () => {
+  const view = listingView(1, "sub");
+  const mount = editMountFor(activeTarget(view)!, view);
+  assert.deepEqual(mount, { dir: "sub", exitFilter: false, navigate: false });
+});
+
+test("a target at the ROOT resolves to the root listing, not to null", () => {
+  const view: ExplorerView = { kind: "results", dir: "sub", hits: [{ rel: "README.md" }], sel: 0 };
+  const mount = editMountFor(activeTarget(view)!, view);
+  assert.equal(mount.dir, "", "parentRel(README.md) is null → the root, which is \"\"");
+  assert.equal(mount.navigate, true);
+});
+
+// ---------- can the target's row actually be rendered? ----------
+
+test("a HIDDEN target is reported as such — the Go-to-file index reaches files the listing hides", () => {
+  // On macOS/Linux every tracked dotfile is `is_hidden`, so renaming `.gitignore` from a
+  // search with Hidden OFF is an ordinary thing to do. Left unhandled it mounts no editor
+  // at all AND leaves the edit state set with no input to Escape from, deadening the
+  // listing's keyboard. The caller turns Hidden on for the op instead.
+  const entries = [entry(".gitignore", { is_hidden: true }), entry("visible.ts")];
+  const target: OpTarget = { rel: ".gitignore", name: ".gitignore", isDir: false, from: "results" };
+
+  assert.deepEqual(mountBlocker(target, entries, false), { kind: "hidden" });
+  assert.deepEqual(mountBlocker(target, entries, true), { kind: "ok" }, "with Hidden on it renders fine");
+});
+
+test("a target that VANISHED between capture and mount is reported missing, not silently dropped", () => {
+  // An agent (or another app) deleted it while the user was picking it out of the results.
+  const target: OpTarget = { rel: "sub/gone.ts", name: "gone.ts", isDir: false, from: "results" };
+  assert.deepEqual(mountBlocker(target, [entry("still-here.ts")], true), { kind: "missing" });
+});
+
+test("an ordinary visible target mounts without ceremony", () => {
+  const target: OpTarget = { rel: "sub/a.txt", name: "a.txt", isDir: false, from: "listing" };
+  assert.deepEqual(mountBlocker(target, [entry("a.txt")], false), { kind: "ok" });
 });
 
 // ---------- inline edit ----------
