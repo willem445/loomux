@@ -66,7 +66,7 @@ import {
   type TreeNode,
 } from "./filetreemodel";
 import { fileIconSvg, folderIconSvg } from "./fileicons";
-import { closeDecision, type ConflictChoice } from "./dirtystate";
+import { closeDecision, discardEdits, type ConflictChoice } from "./dirtystate";
 import { detectEol, applyEol, textDiffers, type Eol } from "./eol";
 import { createEditor, type EditorWidget } from "./editorwidget";
 import { showToast } from "./toast";
@@ -758,16 +758,48 @@ export class FileEditView {
 
   // ---------- dialogs ----------
 
-  private confirmDiscard(): Promise<boolean> {
-    return modal<boolean>((resolve) => ({
+  /** Ask, and — on a yes — ACTUALLY DISCARD (#219).
+   *
+   *  The dialog used to be answered by hiding the overlay while the dirty buffer sat
+   *  there untouched: press Alt+F again and the edits were back, still unsaved, and the
+   *  same question came round again on the next close. A "Discard" that discards nothing
+   *  is a dialog that lies — and a second ask is how people learn to click through the
+   *  first one. So the yes-branch drops the edits here, in the one place the answer is
+   *  known, rather than at each of the four call sites (close, file-switch, re-root,
+   *  reload-after-replace) — three of which replace the buffer anyway and one of which
+   *  (a file-switch whose open then FAILS) used to leave the discarded edits in place. */
+  private async confirmDiscard(): Promise<boolean> {
+    const discard = await modal<boolean>((resolve) => ({
       title: "Discard unsaved changes?",
-      body: `${this.openRel ?? "This file"} has unsaved edits.`,
+      body: `${this.openRel ?? "This file"} has unsaved edits. Discarding drops them — the file goes back to what's on disk.`,
       buttons: [
         { label: "Cancel", value: false },
         { label: "Discard", value: true, kind: "danger" },
       ],
       onKey: (k) => (k === "Escape" ? resolve(false) : undefined),
     }));
+    if (discard) this.revertBuffer();
+    return discard;
+  }
+
+  /** Throw the edits away: the buffer goes back to the last-saved snapshot — the file as
+   *  it is on disk, as far as we know. (An external change since then is the CONFLICT
+   *  machinery's business, not this one's; a discard must not become a silent re-read.)
+   *  `discardEdits` is trivial on purpose — it is where the rule is stated, so the view
+   *  can't quietly re-implement "discard" as "hide". */
+  private revertBuffer(): void {
+    if (!this.editor || this.openRel === null) return;
+    this.editor.setValue(discardEdits(this.savedContent), this.openRel);
+    this.updateDirty();
+  }
+
+  /** What this view is holding, for the app-quit guard's enumeration (#219). Null when
+   *  there is nothing open at all — a clean buffer still reports (with `dirty: false`),
+   *  because "no editor here" and "an editor with nothing unsaved" are different facts
+   *  and only the pure filter should be deciding which ones matter. */
+  bufferReport(): { file: string | null; dirty: boolean } | null {
+    if (this.openRel === null) return null;
+    return { file: this.openRel, dirty: this.isDirtyNow() };
   }
 
   private conflictDialog(): Promise<ConflictChoice> {

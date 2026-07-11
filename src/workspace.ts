@@ -13,6 +13,7 @@ import type { ManagedWorkspace } from "./tabs";
 import { PreviewBudget, type PreviewNode } from "./tabroute";
 import type { PersistedLayoutNode, PersistedPane } from "./tabstore";
 import type { TabPaneInfo } from "./tabcounts";
+import type { PaneBufferReport } from "./dirtystate";
 
 /** Cap on panes serialized per preview refresh — serializing every pane every
  *  ~700ms would get expensive on a huge grid. Panes past the cap render as a
@@ -159,6 +160,18 @@ export class Workspace implements ManagedWorkspace {
    *  every bit as much as a visible one's. */
   hasUnsavedWork(): boolean {
     return this.grid.allPanes().some((p) => p.hasUnsavedWork());
+  }
+
+  /** Every pane's editor-buffer report, labelled with this tab's name (#219). The
+   *  app-quit guard concatenates these across ALL tabs — including hidden ones, whose
+   *  dirty buffers are exactly the ones a human forgets they left open — and the pure
+   *  `dirtyBuffers` filter decides which ones are unsaved. Docked panes included: a
+   *  minimized editor dies with the app just the same. */
+  bufferReports(): PaneBufferReport[] {
+    return this.grid
+      .allPanes()
+      .map((p) => p.bufferReport(this.name))
+      .filter((r): r is PaneBufferReport => r !== null);
   }
 
   dispose(): void {

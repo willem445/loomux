@@ -49,6 +49,13 @@ import { TasksView } from "./tasksview";
 import { AuditView } from "./auditview";
 import { GroupView } from "./groupview";
 import { clampOverlayHeight, OVERLAY_MIN_H } from "./overlaysize";
+import {
+  keepOpenOnExit,
+  type ExitInfo,
+  type KeepOpenReason,
+  type DirtyHost,
+  type PaneBufferReport,
+} from "./dirtystate";
 import { FileEditView } from "./fileedit";
 import { FileExplorerView } from "./fileexplorer";
 import type { PersistedPane, PersistedPaneKind } from "./tabstore";
@@ -1854,25 +1861,57 @@ export class Pane implements VoiceTargetPane {
     input.addEventListener("blur", () => commit(true));
   }
 
-  /** Command panes that die unexpectedly stay open so the human can read
-   *  the error (a crashing CLI's output would otherwise vanish with the
-   *  pane). Clean exits and loomux-initiated kills close as usual. */
-  keepOpenOnExit(exit: { exit_code: number | null; expected: boolean }): boolean {
-    return this.launchedCommand && !exit.expected && exit.exit_code !== 0;
+  /** Should this pane survive its process's death — and why? Null to dispose it.
+   *
+   *  Two reasons, composed in the pure `keepOpenOnExit` (dirtystate.ts): a command pane
+   *  that died unexpectedly stays so the human can read the error (the original rule),
+   *  and — new in #219 — a pane holding a DIRTY Alt+F buffer stays no matter how it
+   *  died, because an automatic teardown must never destroy work the human never agreed
+   *  to lose. Clean exits and loomux-initiated kills close as usual, unless that. */
+  keepOpenOnExit(exit: ExitInfo): KeepOpenReason | null {
+    return keepOpenOnExit({
+      launchedCommand: this.launchedCommand,
+      exit,
+      hasUnsavedWork: this.hasUnsavedWork(),
+    });
   }
 
-  /** Announce a kept-open pane's exit inside its terminal. */
-  notifyExited(code: number | null): void {
+  /** Announce a kept-open pane's exit inside its terminal, saying WHY it is still here.
+   *  A pane that outlives its process for an unsaved buffer must say so — otherwise it
+   *  reads as a bug ("why didn't this close?") and the buffer it is protecting stays
+   *  invisible, which is how it gets lost anyway. */
+  notifyExited(code: number | null, reason: KeepOpenReason = "output"): void {
     // The pane stays open to show output, but its process is DEAD — mark it so the
     // agent counter stops counting it as live (#194 P4 LOW-7). ptyId is left set
     // (the buffer/scrollback is still attached) so isExited, not ptyId, gates live.
     this.exited = true;
     const codeTxt = code === null ? "" : ` (code ${code})`;
-    this.term.writeln(
-      `
-[91mprocess exited${codeTxt}[0m [90m— pane kept open so you can read the output; close it with Ctrl+Shift+W[0m`
-    );
+    const why =
+      reason === "unsaved"
+        ? "— kept open: the file editor (Alt+F) here has UNSAVED edits. Save them, then close with Ctrl+Shift+W"
+        : "— pane kept open so you can read the output; close it with Ctrl+Shift+W";
+    this.term.writeln(`
+[91mprocess exited${codeTxt}[0m [90m${why}[0m`);
+    // A crashed pane that ALSO holds unsaved edits gets both facts: the dead process is
+    // the louder one, but the buffer is the one that can still be lost.
+    if (reason === "output" && this.hasUnsavedWork()) {
+      this.term.writeln(
+        `[93mThe file editor (Alt+F) in this pane has unsaved edits — closing the pane will ask.[0m`
+      );
+    }
     this.setName(`${this.name} · exited`);
+  }
+
+  /** What this pane is holding, for the app-quit guard's enumeration (#219): its editor's
+   *  buffer — the pane's own (an editor pane) or its Alt+F overlay's — labelled with
+   *  the tab and pane it lives in, so the confirm can say WHERE. Null when the pane has no
+   *  editor with a file open at all. */
+  bufferReport(tab: string): PaneBufferReport | null {
+    const view = this.editorPaneView ?? this.fileEditView;
+    const report = view?.bufferReport();
+    if (!report) return null;
+    const host: DirtyHost = this.editorPaneView ? "pane" : "overlay";
+    return { tab, pane: this.name, host, file: report.file, dirty: report.dirty };
   }
 
   setActive(active: boolean): void {

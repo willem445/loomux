@@ -15,16 +15,22 @@ them and deliberately not for the other:
   overlay host doesn't set. Nothing else about it moved.
 - **`Alt+F` (editor): unchanged in every way the pane kind is responsible for** — same
   overlay, same terminal-derived sizing, same `Esc`/✕, same view-local root (an overlay
-  does **not** adopt a re-root; only a pane does). But it **inherits two bug fixes** the
-  editor-as-pane forced into the open, and inherits them on purpose:
+  does **not** adopt a re-root; only a pane does). But it **inherits every unsaved-buffer
+  fix** the editor-as-pane forced into the open, and inherits them on purpose (#217 the
+  first two, #219 the rest):
   1. a re-root now closes the open buffer (asking first if it's dirty) instead of
-     leaving it bound to a path under the *old* root — see *Unsaved buffers* below;
-  2. closing a pane that holds a dirty overlay buffer now asks, instead of discarding
-     it silently.
+     leaving it bound to a path under the *old* root;
+  2. closing a pane that holds a dirty overlay buffer now asks, instead of discarding it
+     silently;
+  3. quitting the app with a dirty overlay buffer now asks;
+  4. a pane whose process dies — or whose group ends — no longer disposes a dirty overlay
+     buffer with it;
+  5. its **Discard** actually discards, instead of hiding the buffer and asking again.
 
-  Both bugs were always in the overlay. They are fixed for it rather than fixed only
-  for the new pane, because a guard that covers the new hole and leaves the older,
-  likelier one open is not a guard — it is a claim.
+  Every one of those bugs was *always* in the overlay; the pane kind only made them
+  reachable enough to notice. They are fixed for it rather than fixed only for the new
+  pane, because a guard that covers the new hole and leaves the older, likelier one open
+  is not a guard — it is a claim. See *Unsaved buffers* below.
 
 ```
                 overlay (Alt+F / Alt+G)            pane kind (#217)
@@ -109,7 +115,8 @@ Two rules the CSS enforces, both learned the hard way:
 
 An editor pane is the first pane kind where **loomux itself owns unsaved work** —
 and it turns out the Alt+F overlay always did too, silently. So the question is not
-"does the new pane guard its buffer" but **every way a buffer can die**:
+"does the new pane guard its buffer" but **every way a buffer can die**. There are six,
+and every one of them routes through the same pure gate (`dirtystate.closeDecision`):
 
 **1. The pane closes** — header ✕, dock-chip ✕, `Ctrl+Shift+W`. One path:
 
@@ -151,10 +158,74 @@ drops the search state, whose hits are paths under a root that is no longer on s
 The trap predates #217 — it sat in the overlay — but #217 makes a re-root a first-class,
 persisted operation on a pane, which is what turns it from obscure into reachable.
 
-**Known gap: app quit** does not ask. The whole-app teardown has no per-pane
-interrogation today (nor did it before this feature), and adding one means intercepting
-the Tauri window-close event — a different feature, and one that can wedge the quit if
-it goes wrong. Stated here rather than quietly left.
+**4. The app quits** (#219 — this was the stated gap; it is now the design). Quitting
+loomux used to discard every dirty buffer without a word. The close is now gated:
+
+```
+title-bar ✕ / Alt+F4 / the OS asks the app to quit
+   └─► pty.guardAppClose()                    ← Tauri's onCloseRequested; the close waits
+          └─► unsavedBuffers()                ← EVERY tab (hidden too), every pane
+                 └─► Workspace.bufferReports() → Pane.bufferReport() → the editor's or
+                                                 the Alt+F overlay's buffer
+          └─► quitDecision(dirty)             ← the SAME closeDecision gate  [dirtystate.ts]
+                 ├─ "close"   → flushTabs() → quit, silently
+                 └─ "confirm" → one modal listing every buffer
+                        ├─ Quit anyway → flushTabs() → quit
+                        └─ Cancel      → preventDefault(); the app stays, buffers intact
+```
+
+Three choices worth defending:
+
+- **One consolidated ask, not a save prompt per buffer.** A human quitting with six dirty
+  files does not want six dialogs; they want to know six files are dirty and decide once.
+  A chain of modals is how you train someone to hammer Enter through them — which is the
+  opposite of what a guard is for. The dialog *lists* what is unsaved (tab · pane — file,
+  with Alt+F overlays marked as such, since "which pane is that in?" is the entire
+  difficulty of the overlay case), and offers **Quit anyway** / **Cancel**. Cancel leaves
+  everything exactly as it was, so the human can go save.
+- **Nothing unsaved → no dialog.** A confirm that fires when there is nothing to lose is
+  a confirm people stop reading.
+- **The session snapshot is flushed on the way out.** Persistence is fire-and-forget
+  everywhere else (a failed write just waits for the next change); a quit is the one
+  moment there is no next change, so the quit path *awaits* the write. The #194 restore
+  still brings the layout back — including from a "Quit anyway".
+
+The mechanics: `guardAppClose` (in `pty.ts`, with the rest of the Tauri surface) wraps
+Tauri's `onCloseRequested`, which holds the close while our handler runs and destroys the
+window unless we `preventDefault()`. Destroying is what fires the backend's
+`WindowEvent::Destroyed` — the PTY kill-all and the clean-exit sentinel in `lib.rs` — so
+a permitted quit tears down exactly as it did before. We put a question in front of the
+existing path; we did not add a second one.
+
+**5. A process dies, or a group ends.** Both are *automatic* teardowns — nobody clicked
+"close this pane" — and both used to dispose a pane holding a dirty `Alt+F` buffer.
+
+The rule, stated once in `dirtystate.keepOpenOnExit` and obeyed by both reapers: **an
+automatic teardown never destroys a buffer.** A pane whose process exited stays open if
+it holds unsaved edits, exactly as a crashed command pane already stayed open to show its
+output — and its exit banner says *which* reason, because a pane that outlives its process
+for an invisible buffer otherwise just reads as a bug ("why didn't this close?"), and the
+buffer it is protecting stays invisible, which is how it gets lost anyway.
+
+Group-end is the same rule, and the distinction it turns on is worth naming: ending a
+group *is* a deliberate, confirmed act — but what it deliberately destroys is **agents**,
+not the human's half-written file. The two only got conflated because they live in the
+same pane. The agent is already dead by the time the frontend reaps it, so keeping the
+pane costs nothing; a toast says how many stayed and why, and closing one later asks like
+any human close.
+
+So the full picture: **automatic paths keep; human paths ask.** No path discards silently.
+
+**6. "Discard" now discards.** The overlay used to answer *"Discard unsaved changes?"* by
+hiding itself and keeping the buffer — press `Alt+F` again and the edits were back, still
+dirty, and the next close asked the same question. A Discard that discards nothing is a
+dialog that lies, and a second ask is how people learn to click through the first one. The
+yes-branch now reverts the buffer to the last-saved snapshot (`dirtystate.discardEdits` —
+trivial on purpose: it is where the rule is *stated*, so the view cannot quietly
+re-implement "discard" as "hide"). It also fixes a case nobody had noticed: discarding in
+order to open another file, when that open then *failed*, used to leave the discarded
+edits sitting there. (Hiding a view without dropping its buffer is a legitimate thing to
+want — it is just not "discard", and it would need its own affordance and its own word.)
 
 The corollary, in `panerestore.ts`: **the buffer is never persisted.** The layout
 records where the pane was rooted and *which file it was showing* — a path, re-read
@@ -255,7 +326,10 @@ construction, not by remembering.
 | `gitview.ts` | `embedded` hook (the ✕ + `Esc` fork). Its layout needed nothing. |
 | `fileexplorer.ts` + `filemenu.ts` + `fileexplorermodel.ts` | the `edit-pane` affordance, declared and bound |
 | `tabstore.ts` / `panerestore.ts` / `tabcounts.ts` | the two kinds through the restore + counting paths; the editor's open `file` (a path, not a buffer) |
-| `styles.css` | `.pane-content` / `.is-content` (generalized from `.pane-files` / `.is-files`) |
+| `styles.css` | `.pane-content` / `.is-content` (generalized from `.pane-files` / `.is-files`); `.dlg-list` for the quit confirm |
+| `dirtystate.ts` (#219) | `dirtyBuffers` / `quitDecision` / `dirtyBufferLines` (who is holding what, and may we quit), `keepOpenOnExit` (does a dead pane stay, and why), `discardEdits` (discard means discard) — all pure, all node:tested |
+| `pty.ts` / `main.ts` (#219) | `guardAppClose` (the Tauri close hook, kept on the one Tauri seam) + the quit guard and its awaited `flushTabs` |
+| `orchestration.ts` (#219) | group-end keeps a pane holding unsaved edits, and says so |
 
 No backend changes: `ft_list_dir` and `git_repo_root` already take a root, and both
 new panes are built from commands that existed. `Cargo.lock` is untouched.

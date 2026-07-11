@@ -13,10 +13,18 @@ import {
   onPtyExit,
   loadUiTabs,
   saveUiTabs,
+  guardAppClose,
   listSessions,
   type PtyExit,
   type SessionInfo,
 } from "./pty";
+import { modal } from "./modal";
+import {
+  dirtyBuffers,
+  dirtyBufferLines,
+  quitDecision,
+  type DirtyBuffer,
+} from "./dirtystate";
 import { matchShortcut } from "./shortcuts";
 import { ftRootIsDir } from "./fileapi";
 import { gitRepoRoot } from "./git";
@@ -285,6 +293,23 @@ function persistTabs(): void {
     // The write didn't land — allow the next change to retry the same bytes.
     lastPersisted = null;
   });
+}
+
+/** Persist NOW, and wait for the write to land — the app-quit path (#219).
+ *
+ *  Everywhere else persistence is fire-and-forget, and rightly so: a failed write just
+ *  waits for the next change to retry. A quit is the one moment there IS no next change.
+ *  So the quit path awaits the write (and skips the identical-bytes dedup, which exists
+ *  to spare the disk on a 3-second timer, not to skip the last save of the session).
+ *  This is what keeps the #194 restore snapshot honest across a quit. */
+async function flushTabs(): Promise<void> {
+  const encoded = encodeTabs(tabs.snapshot());
+  try {
+    await saveUiTabs(encoded);
+    lastPersisted = encoded;
+  } catch {
+    lastPersisted = null; // the write didn't land; let a later change retry these bytes
+  }
 }
 
 /** Load the persisted tab-set JSON, migrating a pre-backend localStorage blob on
@@ -926,8 +951,9 @@ function reapIfExited(ws: Workspace, pane: Pane): void {
   if (!exit) return;
   earlyExits.delete(pane.ptyId);
   if (tryResumeFallback(pane, exit)) return; // resume failed → fresh respawn in place
-  if (pane.keepOpenOnExit(exit)) {
-    pane.notifyExited(exit.exit_code);
+  const keep = pane.keepOpenOnExit(exit);
+  if (keep) {
+    pane.notifyExited(exit.exit_code, keep);
     onGridChanged(); // a kept-open pane is now dead → drop it from the live count
   } else ws.grid.closePane(pane, false);
 }
@@ -984,8 +1010,10 @@ async function restoreSession(s: SessionInfo): Promise<void> {
   reapIfExited(ws, pane);
 }
 
-// When a process exits on its own, retire its pane — unless it was a
-// command pane dying with an error, which stays open to show the output.
+// When a process exits on its own, retire its pane — unless the pane has a reason to
+// survive it: a command pane dying with an error (its output must stay readable), or an
+// unsaved Alt+F buffer (#219 — an automatic teardown must never destroy work nobody
+// agreed to lose). The pane says WHICH reason in its exit banner.
 void onPtyExit((exit) => {
   const found = findPaneAcrossTabs(exit.id);
   if (!found) {
@@ -996,11 +1024,60 @@ void onPtyExit((exit) => {
   }
   const { ws, pane } = found;
   if (tryResumeFallback(pane, exit)) return; // resume failed → fresh respawn in place
-  if (pane.keepOpenOnExit(exit)) {
-    pane.notifyExited(exit.exit_code);
+  const keep = pane.keepOpenOnExit(exit);
+  if (keep) {
+    pane.notifyExited(exit.exit_code, keep);
     onGridChanged(); // dead-but-kept-open → update the live agent count
   } else ws.grid.closePane(pane, false);
 });
+
+// ---------- app quit: the last place unsaved work can be lost (#219) ----------
+
+/** Every unsaved editor buffer in the app, across ALL tabs — visible, hidden, and
+ *  docked — and both hosts: an editor PANE's buffer and the Alt+F OVERLAY's inside a
+ *  terminal/agent pane. The overlay in a background tab is exactly the one a human
+ *  forgets, which is why the sweep is total rather than "the active tab". The pure
+ *  filter (dirtystate.dirtyBuffers) decides which reports count as unsaved. */
+function unsavedBuffers(): DirtyBuffer[] {
+  return dirtyBuffers(tabs.tabs.flatMap((ws) => ws.bufferReports()));
+}
+
+/** Gate the app's close. Nothing unsaved → quit silently (the common case must not grow
+ *  a dialog). Something unsaved → ONE consolidated confirm listing every buffer, then
+ *  quit or stay.
+ *
+ *  Deliberately one ask, not a save prompt per file: a human quitting with six dirty
+ *  files wants to know that six files are dirty and decide once — a chain of six modals
+ *  is how you train someone to hammer Enter through them. "Quit anyway" discards; Cancel
+ *  leaves the app exactly as it was, every buffer intact, so they can go save.
+ *
+ *  Either way the session snapshot is FLUSHED (awaited, not fire-and-forget) before the
+ *  window dies, so the #194 restore still brings the layout back. */
+function guardQuit(): void {
+  void guardAppClose(async () => {
+    const dirty = unsavedBuffers();
+    if (quitDecision(dirty) === "close") {
+      await flushTabs();
+      return true;
+    }
+    const files = dirtyBufferLines(dirty);
+    const quit = await modal<boolean>((resolve) => ({
+      title:
+        files.length === 1 ? "1 file has unsaved edits" : `${files.length} files have unsaved edits`,
+      body: "Quitting loomux now discards them. Cancel, save what you want to keep, then quit again.",
+      bodyLines: files,
+      buttons: [
+        { label: "Cancel", value: false },
+        { label: "Quit anyway", value: true, kind: "danger" },
+      ],
+      onKey: (k) => (k === "Escape" ? resolve(false) : undefined),
+    }));
+    if (!quit) return false;
+    await flushTabs();
+    return true;
+  });
+}
+guardQuit();
 
 // Global shortcuts (terminals decline these in their key handlers).
 document.addEventListener(

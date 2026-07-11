@@ -63,12 +63,21 @@ What differs from the overlay, and only this:
   the pane follows: its title updates and session restore reopens *that* folder. (In
   the overlay, browsing elsewhere is deliberately view-local — it must not disturb
   the terminal underneath.)
-- **Unsaved edits are guarded.** An editor pane holds real buffers, so closing it
-  with unsaved changes asks first — from the header ✕, from its dock chip, or from
-  `Ctrl+Shift+W`. Closing the whole **tab** asks too (click ✕ once to arm, again to
-  confirm — the same two-step a tab with live agents uses), and its tooltip says what
-  is at stake. Re-rooting the editor to a different folder also asks, because the file
-  you had open doesn't exist under the new root.
+- **Unsaved edits are guarded, everywhere.** An editor pane holds real buffers, so
+  closing it with unsaved changes asks first — from the header ✕, from its dock chip, or
+  from `Ctrl+Shift+W`. Closing the whole **tab** asks too (click ✕ once to arm, again to
+  confirm — the same two-step a tab with live agents uses), and its tooltip says what is
+  at stake. Re-rooting the editor to a different folder asks, because the file you had
+  open doesn't exist under the new root. And **quitting loomux** asks: one dialog listing
+  every unsaved file across every tab — including the `Alt+F` editors you left open
+  inside terminal panes, which are the ones you forget — with **Quit anyway** or
+  **Cancel**. If nothing is unsaved, quitting is silent, as it should be.
+- **Nothing automatic destroys a buffer.** A pane whose process exits (or whose
+  orchestration group is ended) *stays open* if its editor has unsaved edits, and its
+  banner says so. The agent is already dead; your half-written file needn't be.
+- **Discard means discard.** Answering "Discard unsaved changes?" with *Discard* drops
+  the edits — the file goes back to what's on disk. It no longer hides the buffer and
+  asks you the same question again later.
 - **The git pane refreshes on open, after its own actions, and on ↻** — not on focus.
   Refreshing rebuilds the changes strip, which would wipe a half-typed commit message
   every time you tabbed away and back.
