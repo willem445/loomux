@@ -12,7 +12,7 @@ use loomux_lib::fileedit::{
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 fn opts(case_insensitive: bool, whole_word: bool) -> SearchOpts {
     SearchOpts {
@@ -74,6 +74,19 @@ fn git_init(root: &Path) {
     };
     run(&["init"]);
     run(&["config", "core.excludesFile", ""]);
+}
+
+/// Stage `path` into the repo index (no identity needed — `add`, not `commit`),
+/// so it's a genuinely *tracked* file enumerated via `git ls-files --cached`.
+fn git_add(root: &Path, path: &str) {
+    let mut cmd = std::process::Command::new("git");
+    cmd.current_dir(root).args(["add", path]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    assert!(cmd.output().unwrap().status.success(), "git add {path} failed");
 }
 
 /// Best-effort symlink creation; returns false if the platform refuses (Windows
@@ -340,19 +353,30 @@ fn search_respects_gitignore_by_default_and_toggle_includes_ignored() {
     let root = tempfile::tempdir().unwrap();
     let rp = root.path().to_str().unwrap();
     git_init(root.path());
-    // A tracked file, a gitignored file, and a gitignored directory — all with
-    // the same needle so only the ignore rules decide what's found.
     fs::write(root.path().join(".gitignore"), "ignored.txt\nbuilddir/\n").unwrap();
+    // A TRACKED (staged) file — enumerated via `--cached`. Staging it is what
+    // makes this test actually cover tracked files: drop `--cached` from the
+    // ls-files call and the `tracked.txt` assertion below fails.
     fs::write(root.path().join("tracked.txt"), "needle here").unwrap();
+    git_add(root.path(), "tracked.txt");
+    // An UNTRACKED-but-unignored file — enumerated via `--others --exclude-standard`.
+    fs::write(root.path().join("untracked.txt"), "needle here").unwrap();
+    // A gitignored file and a gitignored directory — skipped by default.
     fs::write(root.path().join("ignored.txt"), "needle here").unwrap();
     fs::create_dir_all(root.path().join("builddir")).unwrap();
     fs::write(root.path().join("builddir/gen.txt"), "needle here").unwrap();
 
-    // Default (include_ignored=false): the ignored file + dir are skipped, the
-    // tracked file (and the untracked-but-unignored .gitignore, which has no
-    // needle) are enumerated. This is the ignored-by-default guarantee.
+    // Default (include_ignored=false): tracked + untracked-unignored are searched,
+    // the ignored file + dir are skipped. This is the ignored-by-default guarantee.
     let (_, files) = planned(rp, "needle", opts_ig(false), &|| false);
-    assert!(files.contains("tracked.txt"), "tracked file must be searched");
+    assert!(
+        files.contains("tracked.txt"),
+        "tracked (staged) file must be searched — pins `--cached`, got {files:?}"
+    );
+    assert!(
+        files.contains("untracked.txt"),
+        "untracked-unignored file must be searched — pins `--others`, got {files:?}"
+    );
     assert!(!files.contains("ignored.txt"), "gitignored file must be skipped");
     assert!(
         !files.iter().any(|f| f.starts_with("builddir")),
@@ -384,6 +408,29 @@ fn search_cancellation_stops_the_walk_before_it_reads() {
     assert!(
         matches.is_empty(),
         "a pre-cancelled search must scan nothing, got {} matches",
+        matches.len()
+    );
+}
+
+#[test]
+fn search_cancellation_stops_partway_through_the_walk() {
+    // Complements the pre-cancelled test: the flag flips true after a handful of
+    // between-files polls, so the walk must stop well before all 40 files are
+    // scanned. This pins that cancellation is checked *between files* — the
+    // property that makes a superseding keystroke stop the old walk promptly.
+    let root = tempfile::tempdir().unwrap();
+    let rp = root.path().to_str().unwrap();
+    for i in 0..40 {
+        fs::write(root.path().join(format!("f{i:02}.txt")), "needle\n").unwrap();
+    }
+    let polls = AtomicUsize::new(0);
+    let (matches, _) = planned(rp, "needle", opts_ig(true), &|| {
+        polls.fetch_add(1, Ordering::Relaxed) >= 8
+    });
+    assert!(!matches.is_empty(), "some files should scan before the cancel");
+    assert!(
+        matches.len() < 40,
+        "cancel mid-walk must stop early, got {} of 40",
         matches.len()
     );
 }

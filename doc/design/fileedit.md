@@ -107,6 +107,12 @@ changes the *structure*:
   the heuristic `node_modules`/`target`/… excludes as a best-effort ignore, and
   always skips `.git`). `git ls-files` is a plain subprocess — still no new crate.
 
+Submodules are asymmetric by design: default mode runs `git ls-files` *without*
+`--recurse-submodules`, so a submodule's contents aren't listed (its gitlink entry
+isn't a readable file and is skipped), whereas the include-ignored walk descends
+into the submodule directory like any other. Files inside a submodule are
+therefore searchable only with the toggle on.
+
 A `regex` mode remains the obvious follow-up.
 
 ## Frontend

@@ -42,6 +42,7 @@ import {
   accept,
   isTruncated,
   enumerationSource,
+  RENDER_CAP,
   type SearchState,
 } from "./searchsession";
 import { gitRepoRoot } from "./git";
@@ -153,6 +154,11 @@ export class FileEditView {
   /** Whether the current root is inside a git work tree — gates the ignore
    *  toggle (a non-git root has no `.gitignore` to respect). Null until probed. */
   private isGitRoot: boolean | null = null;
+  /** Set once `dispose()` runs. Guards the async `onSearchBatch` listener
+   *  registration: if the view is disposed mid-round-trip, the arriving unlisten
+   *  is called immediately instead of landing on a dead view (mirrors the
+   *  `tasksview.ts` disposed-before-`listen`-resolves pattern). */
+  private disposed = false;
   /** The query + options the current `searchGroups` were produced with. Replace
    *  applies from THIS, not the live inputs, so a query/option edit after a
    *  search can't make apply diverge from the preview. Nulled when the preview
@@ -251,9 +257,12 @@ export class FileEditView {
     this.el.append(head, this.agentBanner, body);
 
     // One `ft-search` listener per view; it drops batches whose id isn't the
-    // active session (`accept`), so cross-pane/stale events are harmless.
+    // active session (`accept`), so cross-pane/stale events are harmless. If the
+    // view is disposed before this IPC round-trip resolves, tear the listener
+    // down immediately so it can't outlive the (removed) view.
     void onSearchBatch((b) => this.onSearchBatch(b)).then((un) => {
-      this.searchUnlisten = un;
+      if (this.disposed) un();
+      else this.searchUnlisten = un;
     });
   }
 
@@ -284,11 +293,20 @@ export class FileEditView {
 
   hide(): void {
     this.el.hidden = true;
+    // Don't let a queued keystroke start a *new* search once the overlay is
+    // hidden. A search already in flight is deliberately left to finish — its
+    // worker frees its own registry entry and its results are ready on reopen;
+    // its batches paint into the hidden tree harmlessly.
+    clearTimeout(this.searchTimer);
   }
 
   dispose(): void {
+    this.disposed = true;
     clearTimeout(this.searchTimer);
     if (this.session.activeId !== null) void ftSearchCancel(this.session.activeId);
+    // Go idle so any batch that arrives before the listener is torn down (or an
+    // unlisten that hasn't resolved yet) can't drive a removed view.
+    this.session = idle();
     this.searchUnlisten?.();
     this.editor?.dispose();
     this.el.remove();
@@ -327,14 +345,20 @@ export class FileEditView {
     const root = this.root;
     if (!root) {
       this.isGitRoot = null;
-    } else {
-      try {
-        this.isGitRoot = (await gitRepoRoot(root)) !== null;
-      } catch {
-        this.isGitRoot = false;
-      }
-      if (root !== this.root) return; // root changed while probing — stale result
+      this.updateIgnoreToggle();
+      return;
     }
+    let git: boolean;
+    try {
+      git = (await gitRepoRoot(root)) !== null;
+    } catch {
+      git = false;
+    }
+    // Discard a probe that resolved after the root changed — assigning its value
+    // (even out of order vs a newer probe) would leave `isGitRoot` describing the
+    // wrong folder, which a later toggle refresh would then read.
+    if (root !== this.root) return;
+    this.isGitRoot = git;
     this.updateIgnoreToggle();
   }
 
@@ -613,12 +637,16 @@ export class FileEditView {
         e.stopPropagation();
         clearTimeout(this.searchTimer);
         this.startSearch();
-      } else if (e.key === "Escape" && this.session.activeId !== null) {
-        // Esc cancels an in-flight search (keeping the partial results); only
-        // when nothing is running does Esc fall through to close the overlay.
-        e.stopPropagation();
-        clearTimeout(this.searchTimer);
-        this.cancelSearch();
+      } else if (e.key === "Escape") {
+        if (this.session.activeId !== null) {
+          // A search is running: Esc cancels it (keeping the partial results)
+          // and is consumed here so it doesn't also close the overlay.
+          e.stopPropagation();
+          clearTimeout(this.searchTimer);
+          this.cancelSearch();
+        }
+        // Nothing running: let Escape bubble to the overlay's own handler
+        // (`this.el` keydown → requestClose), which closes the editor.
       } else {
         e.stopPropagation();
       }
@@ -685,7 +713,9 @@ export class FileEditView {
     return {
       case_insensitive: p.caseInsensitive,
       whole_word: p.wholeWord,
-      max_results: 0,
+      // One past what the UI will render: enough to detect+flag overflow, but the
+      // walk stops there instead of scanning thousands of matches the UI drops.
+      max_results: RENDER_CAP + 1,
       include_ignored: p.includeIgnored,
     };
   }
@@ -739,6 +769,7 @@ export class FileEditView {
    *  to. Live batches update the tree (throttled) and the running count; the
    *  terminal `done` batch finalizes the preview + reveal. */
   private onSearchBatch(b: SearchBatch): void {
+    if (this.disposed) return; // view is gone; never touch its DOM
     if (b.id !== this.session.activeId) return; // stale / cancelled — ignore
     if (b.error && errorCode(b.error) !== "empty-query") {
       showToast(`Search failed: ${errorMessage(b.error)}`);
