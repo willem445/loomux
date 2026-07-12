@@ -22,6 +22,28 @@
 
 * { box-sizing: border-box; }
 
+/* `hidden` MEANS HIDDEN — app-wide, and not negotiable by a later `display:` rule (#222).
+ *
+ * The UA stylesheet's `[hidden] { display: none }` sits in the USER-AGENT origin, and EVERY
+ * author declaration outranks it — specificity never enters into it, origin decides first. So any
+ * rule in this file that hands a toggled element a `display` (`.wf-body { display: flex }`)
+ * silently defeats `el.hidden = true`: the element stays on screen, and the code that "hid" it
+ * has no way to find out.
+ *
+ * That is not a hypothetical. It is the live bug this rule exists for: the workflow pane's three
+ * MUTUALLY EXCLUSIVE surfaces (error, start, body) are each `display: flex`, so `hidden` did
+ * nothing and the pane rendered all three at once — a "Can't read .loomux/workflow.yml" banner
+ * sitting over a workflow that had loaded and validated perfectly well, and beside it a live
+ * "Create workflow" button, which duly scaffolded straight over that workflow. The pane's surface
+ * rules (workflowpane.ts) were correct the whole time; they just had no effect on the screen.
+ *
+ * `!important`, rather than another per-class `[hidden]` companion — this file had nine of those,
+ * added one bug at a time, and the workflow pane's seven elements are what it cost to keep
+ * discovering the trap by hand. An author-origin `[hidden]` has the same specificity as any single
+ * class, so without `!important` the winner is decided by SOURCE ORDER: by whether the next person
+ * to add a `display:` rule happens to add it below this line. Correctness must not turn on that. */
+[hidden] { display: none !important; }
+
 html, body {
   margin: 0;
   height: 100%;

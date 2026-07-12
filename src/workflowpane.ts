@@ -42,6 +42,36 @@ export function paneSurface(state: {
   return "body";
 }
 
+/** May the pane CREATE a starter workflow right now?
+ *
+ *  THE LIVE BUG, and it is the one this whole file was supposed to have already prevented. The
+ *  "Create workflow" button lives on the start surface, and the pane's only defence against
+ *  scaffolding over a workflow that was already loaded was that the button is *supposed to be
+ *  invisible* anywhere else. It wasn't: a `display: flex` class rule out-specifies the `hidden`
+ *  attribute (see the `[hidden]` note at the top of styles.css), so all three surfaces rendered
+ *  at once and the button sat there, live, on top of a workflow the pane had read and validated.
+ *  Pressing it destroyed that workflow.
+ *
+ *  And `savePlan`'s claim-then-write (F2) did not catch it, because from the save's point of view
+ *  nothing was wrong: the pane KNEW the file was there and held its hash, so the plan was an
+ *  ordinary guarded write, the hash matched, and the backend wrote exactly what it was told to
+ *  write. Every guard downstream of the button was working. The button should not have been
+ *  pressable.
+ *
+ *  So: VISIBILITY IS NOT A SAFETY PROPERTY. Creating is permitted on the START surface and
+ *  nowhere else — the same single decision that puts the button on screen — which means the
+ *  button cannot be pressed in a state where pressing it would overwrite anything. And because
+ *  the start surface is *by definition* "no file on disk, nothing in the buffer", every create it
+ *  permits is a `claim-then-write`, which is the property the test in workflowpane.test.ts pins:
+ *  a create can never even be *asked* to clobber. */
+export function createAllowed(state: {
+  loadError: string | null;
+  exists: boolean;
+  text: string;
+}): boolean {
+  return paneSurface(state) === "start";
+}
+
 // ---------- how a save is allowed to write ----------
 
 /** How the next write must be performed.
