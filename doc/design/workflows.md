@@ -872,6 +872,112 @@ does:
 The orchestrator learns it from the workflow fragment (`templates/workflow.md`), which
 is likewise only rendered for a group whose workflow is in play.
 
+## loomux runs its own workflow (sub-PR 5)
+
+The feature ships with the repo using it. `.loomux/workflow.yml` at the root declares
+loomux's own roster, and `.github/agents/*.md` holds the five personas it points at:
+
+| block | kind | model | what it is for |
+|---|---|---|---|
+| `worker-deep` | worker | opus | work with judgment in it: a design with more than one defensible shape, a security/compatibility argument that has to be *made*, an honestly incomplete brief |
+| `worker-quick` | worker | haiku | work whose shape is already decided: a rename, a version bump, applying a review finding that names the file and the fix. **Escalates instead of improvising** |
+| `rev-orch` | reviewer | opus | the Rust backend: gate/shim security, capability closure, the `group_id` webview-trust boundary, the no-getrandom rule, integration-test-only linking |
+| `rev-ui` | reviewer | sonnet | the vanilla-TS frontend: no framework, panes/overlays, **never resize the PTY**, DOM-free pure-module tests, xterm quirks |
+| `rev-tests` | reviewer | sonnet | the tests *as tests*: intent vs implementation echo, the pin that cannot fail, cross-platform CI, the release path — and no live agent CLIs, ever |
+
+Three things about it are decisions rather than filler:
+
+- **The personas are files, not inline `prompt:`s** — and files in `.github/agents/`,
+  Copilot's own convention. That is the one shape that is native on *both* CLIs (the
+  matrix in *Personas: compiled to native flags*): `cli: copilot` loads it with
+  `--agent rev-ui`, `cli: claude` compiles the same bytes into `--agents`. An inline
+  prompt would have been Claude-only-native and unreviewable in a diff.
+- **The block descriptions are the routing surface.** The orchestrator template already
+  says to route with judgment; what it routes *on* is what each block says it is for. So
+  the deep/quick split is written as a *deployment heuristic* (ambiguity and design →
+  deep; mechanical and clearly-directed → quick), and `worker-deep` is declared **first**,
+  because the first block of a class is what a bare `spawn_agent(kind: "worker")` resolves
+  to and the safe default for an unrouted task is the tier that can handle being wrong.
+- **The gate is `all-pass` over the three reviewers, plus `ci-green`** — and the reason is
+  worth stating, because the first draft of this file said `threshold: 2` and a review
+  (rev-14 F1) showed why that is wrong *for a lane-scoped roster specifically*. **An
+  abstention is a pass.** A reviewer whose lane a PR doesn't touch is told to record
+  `pass` ("outside my lane") rather than to stay silent, and the gate counts passes, not
+  lanes. So on a backend-only PR the two out-of-lane reviewers — which are always the
+  *fast* ones, having nothing to reproduce — satisfy `threshold: 2` while `rev-orch`, the
+  only reviewer whose lane it is and the slowest by construction, is still running. The
+  gate opens on two agents that said they had not reviewed the change, which is precisely
+  the #151 failure the gate exists to prevent, dressed up as a quorum.
+
+  `all-pass` costs nothing to fix that: the orchestrator already runs **every** reviewer
+  block on every PR, and the out-of-lane ones pass in one turn, so the same three verdicts
+  get recorded either way — `all-pass` just requires that the in-lane one is among them.
+  The general rule this produces: **`threshold: N` is for *interchangeable* reviewers**
+  ("any 2 of these 5 senior people"), and a lane-scoped roster is the opposite of
+  interchangeable. Its other use — tolerating a dead reviewer — is a job for the human,
+  not for the gate.
+
+The persona files deliberately carry **no `model:`**. Copilot would read one (it is its
+key), loomux would not (the block's `model:` is its single source of truth), and two
+spellings of one pinned model is precisely the silent-divergence bug this issue exists to
+remove.
+
+### Tiered models: what a block's `model:` is actually worth
+
+The point of two worker tiers is that `model: haiku` reaches the CLI as haiku. That was
+**verified end to end rather than assumed**, because a clamp that flattened a block's model
+back to the group's per-role pick would have made the whole roster decorative:
+
+    workflow.yml  →  parse_workflow      model: haiku kept (sanitize_model_opt is a
+                                          character filter, not an allowlist)
+                  →  Guardrails::clamped  sanitize_model(b.model, default_model(cli, kind))
+                                          — the class default is the FALLBACK for an empty
+                                          model, never a ceiling on a declared one
+                  →  spawn_agent_ex       workflow::model_of(&block, agent_cli)
+                  →  build_agent_command  `--model haiku`  (both CLIs — the flag is spelled
+                                          the same for claude and copilot)
+
+So **a guardrail model is a launcher default, not a ceiling**: the launcher's per-role picks
+synthesize the *built-in* roster (and still fully decide it — `the_builtin_roster_still_honors_the_launchers_per_role_models`),
+and a workflow file replaces that roster wholesale. `the_repos_own_workflow_runs_its_worker_tiers_on_the_models_it_declares`
+pins the emitted command line for *this repo's actual file*, through the real load + clamp,
+against launcher picks that say something else.
+
+One resolution rule is worth stating plainly because it is the one people assume the other
+way round: **a declared block with no `model:` takes its class default for its own effective
+CLI — not the launcher's per-role pick.** The file is the roster; an undeclared field
+resolves from the block. That keeps `orch_workflow_preview` honest, which is the whole
+consent story — the preview resolves from `(file, group CLI)` and nothing else, so it cannot
+disagree with the launch, and it *shows the human the resolved model of every block* before
+they hit Create. Nothing is silent; it is simply the file's job to say what it wants. (Pinned
+by `a_declared_block_model_survives_both_clis_and_a_resume`.)
+
+### Keeping the file honest, forever
+
+The repo's own workflow is validated by **both** halves of the feature, in CI:
+
+- `the_repos_own_workflow_file_parses_clean_against_the_real_parser` (Rust) loads the real
+  file through `load_workflow`, loads every persona through `load_block_profile` (which is
+  also the kind-compatibility check), asserts each handle resolves back to its own file under
+  `handle_resolves_to` (so a `cli: copilot` flip stays native), and asserts every `also:`
+  condition is one this build can actually check — an unknown one fails closed, so shipping
+  it would mean loomux could never merge its own PRs.
+- `test/workflowdogfood.test.ts` (TypeScript) opens the same file in the **pane's** reader
+  and validator and asserts zero findings — errors *and* warnings, because a warning here
+  means the graph loomux draws of its own workflow has a block nothing points at.
+
+Two parsers, deliberately (the pane is an editor giving live feedback on text; the backend is
+the engine). A file only one of them accepts is a file the human is being lied to about, and
+these two tests are what stop that drifting apart.
+
+"In CI" was not true when this section was first written, and the fix was to make it true
+rather than to soften the sentence: `ci.yml` ran `npm run build` (a **typecheck**, not the
+suite), `cargo check` and `cargo test`, and **no `npm test` at all** — so the entire frontend
+suite, this pin included, gated nothing. A change to `src/workflowmodel.ts` that made loomux's
+own workflow file raise a finding in the pane would have merged green (rev-14 F2). `ci.yml`
+now runs `npm test` on all three platforms, which is also what makes every other pure-module
+test in `test/` a gate rather than a convention.
+
 ## Still to come
 
 - **`no-live-agents-on-pr`** (#197 Scope A.1) — "no agent tied to this PR is still

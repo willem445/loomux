@@ -2568,3 +2568,209 @@ fn an_also_condition_this_build_cannot_check_is_not_silently_ignored() {
     .unwrap();
     assert_eq!(wf.gates["merge"].also, vec!["no-live-agents-on-pr"]);
 }
+
+// ────────── loomux's own workflow, and what a block's model: is worth ─────────
+//
+// The repo dogfoods the feature (#222): `.loomux/workflow.yml` at the root declares
+// loomux's own roster — two worker tiers and three focused reviewers, each with a
+// persona in `.github/agents/` — and the tests below are what keep that file honest.
+// The pane's half of the same pin lives in `test/workflowdogfood.test.ts`.
+
+/// The loomux repo root (the crate's manifest dir is `src-tauri/`).
+fn repo_root() -> String {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("src-tauri always has a parent")
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+#[test]
+fn the_repos_own_workflow_file_parses_clean_against_the_real_parser() {
+    // Schema drift in CI, forever. A workflow file is only worth shipping if the
+    // engine that runs it accepts it — and this asserts that against the REAL parser
+    // and the REAL persona loader, not a copy of them.
+    let repo = repo_root();
+    let wf = match workflow::load_workflow(&repo) {
+        Ok(Some(wf)) => wf,
+        Ok(None) => panic!("the repo must ship its own {}", workflow::WORKFLOW_PATH),
+        Err(errors) => panic!("loomux's own workflow file does not validate: {errors:#?}"),
+    };
+
+    assert_eq!(
+        wf.blocks.iter().map(|b| b.id.as_str()).collect::<Vec<_>>(),
+        ["orchestrator", "planner", "worker-deep", "worker-quick", "rev-orch", "rev-ui", "rev-tests"],
+        "ids are what edges, gates and spawn_agent(block:) reference — a rename here breaks the gate"
+    );
+
+    for b in &wf.blocks {
+        let Some(rel) = b.profile.as_deref() else { continue };
+        // The persona file exists, has frontmatter and a body, and declares the SAME
+        // capability class as the block using it — the compatibility check that stops a
+        // reviewer persona from being pointed at by a worker block (and vice versa).
+        let p = profiles::load_block_profile(&repo, rel, b.kind)
+            .unwrap_or_else(|e| panic!("{}: {e}", b.id));
+        assert_eq!(p.mode, ProfileMode::Append, "{}: a repo persona layers on loomux's contract", b.id);
+        // Written in Copilot's own convention, so flipping a block to `cli: copilot`
+        // gets the NATIVE `--agent <name>` rather than a kickoff paste — which is only
+        // true if the handle resolves back, unambiguously, to the file we just read.
+        assert!(profiles::is_copilot_native(rel), "{}: {rel} must live in .github/agents", b.id);
+        let handle = p.copilot_agent.as_deref().unwrap_or(&p.name);
+        assert!(
+            profiles::handle_resolves_to(&repo, handle, rel),
+            "{}: `copilot --agent {handle}` must load {rel} and nothing else",
+            b.id
+        );
+    }
+
+    let gate = wf.gates.get("merge").expect("the dogfood file exists partly to demo the gate");
+    // ALL-PASS, and not `threshold: N` — the reviewers are LANE-SCOPED, and an
+    // out-of-lane reviewer is told to record a `pass` ("not my lane") rather than stay
+    // silent. The gate counts passes, not lanes, so under a threshold the two fastest
+    // abstentions satisfy it while the one in-lane reviewer — the slowest, because its
+    // persona tells it to reproduce findings — is still working (rev-14 F1). A threshold
+    // is right for INTERCHANGEABLE reviewers; this roster is the opposite of that.
+    assert_eq!(gate.require, GateRequire::AllPass);
+    assert_eq!(gate.reviewers, ["rev-orch", "rev-ui", "rev-tests"]);
+    assert_eq!(
+        workflow::gate_need(gate),
+        gate.reviewers.len() as u32,
+        "every named reviewer must have to speak — abstention is a pass, so a threshold would let \
+         the lanes that didn't review it open the gate ahead of the lane that must"
+    );
+    // Every named reviewer is a reviewer block that actually exists — a gate naming a
+    // worker, or a block that was renamed out from under it, could never open.
+    for r in &gate.reviewers {
+        assert_eq!(wf.block(r).map(|b| b.kind), Some(Role::Reviewer), "gate reviewer {r}");
+    }
+    // And every `also:` condition is one THIS build can check. An unknown condition is
+    // not ignored — it fails closed and refuses every merge — so shipping one in the
+    // repo's own file would mean loomux could never merge its own PRs.
+    for c in &gate.also {
+        assert!(
+            workflow::condition_supported(c),
+            "{c:?} would refuse every merge: this build can only check {:?}",
+            workflow::KNOWN_CONDITIONS
+        );
+    }
+
+    // Nothing the roster normalization drops: `clamped()` re-enforces the reserved-id
+    // rule and id uniqueness on rosters that never met the parser, and a block silently
+    // dropped there would be a delegate the human saw in the preview and never got.
+    let ids: Vec<String> = wf.blocks.iter().map(|b| b.id.clone()).collect();
+    let clamped = Guardrails { blocks: wf.blocks, ..rails() }.clamped();
+    assert_eq!(clamped.blocks.iter().map(|b| b.id.clone()).collect::<Vec<_>>(), ids);
+}
+
+#[test]
+fn the_repos_own_workflow_runs_its_worker_tiers_on_the_models_it_declares() {
+    // The end-to-end dogfood pin: the REAL file, through the REAL load + clamp, into
+    // the command line loomux would actually run. `model: haiku` on `worker-quick` is
+    // the whole point of having two tiers — if it arrived at the CLI as `sonnet`, the
+    // feature would be a comment in a YAML file.
+    let (reg, _d) = test_registry();
+    // The launcher's per-role picks say "workers run sonnet". The workflow file wins:
+    // a guardrail model is the default for the roster loomux synthesizes, never a
+    // ceiling on the roster a repo declares.
+    let launcher_picks = workflow::default_roster(&[
+        (Role::Orchestrator, "claude", "opus"),
+        (Role::Worker, "claude", "sonnet"),
+        (Role::Reviewer, "claude", "sonnet"),
+        (Role::Planner, "claude", "opus"),
+    ]);
+    let g = reg
+        .create_group(&repo_root(), Guardrails { blocks: launcher_picks, ..rails() })
+        .unwrap();
+
+    for (block, model) in [("worker-deep", "opus"), ("worker-quick", "haiku"), ("rev-orch", "opus")] {
+        let (cmd, argv, _kickoff) = compile(&reg, &g, block);
+        assert!(cmd.contains(&format!("--model {model}")), "{block} must run {model}: {cmd}");
+        assert!(
+            argv.windows(2).any(|w| w == ["--model", model]),
+            "{block}: the argv path must agree with the command line: {argv:?}"
+        );
+        assert!(
+            !cmd.contains("--model sonnet"),
+            "{block}: the launcher's per-role pick must not flatten a declared block model: {cmd}"
+        );
+        // And it is *this* block that ran: the persona rode in on the same command.
+        assert!(cmd.contains(&format!("--agent {block}")), "{block}: persona must reach the CLI: {cmd}");
+    }
+}
+
+#[test]
+fn a_declared_block_model_survives_both_clis_and_a_resume() {
+    let (reg, _d) = test_registry();
+    let repo = Repo::new().workflow(
+        "version: 1\nblocks:\n\
+         \x20 - id: quick\n    kind: worker\n    cli: claude\n    model: haiku\n    prompt: Small, clearly-directed edits only.\n\
+         \x20 - id: cheap-copilot\n    kind: reviewer\n    cli: copilot\n    model: claude-haiku-4.5\n    prompt: Review only for typos.\n\
+         \x20 - id: inherits\n    kind: reviewer\n    cli: claude\n",
+    );
+    // The launcher's per-role picks say OPUS for reviewers — deliberately NOT the class
+    // default (`sonnet`), so the two candidate semantics for an undeclared block model
+    // actually diverge below. With `rails()`'s empty roster the pick *was* the class
+    // default, and the `inherits` assertion passed under either rule: a pin that could
+    // not fail on the very claim the design note calls the surprising one (rev-14 F3).
+    let picks = workflow::default_roster(&[
+        (Role::Orchestrator, "claude", "opus"),
+        (Role::Worker, "claude", "opus"),
+        (Role::Reviewer, "claude", "opus"),
+        (Role::Planner, "claude", "opus"),
+    ]);
+    let g = reg.create_group(&repo.path(), Guardrails { blocks: picks, ..rails() }).unwrap();
+
+    // A tier reaches the flag on BOTH CLIs — the model is a block property, not a
+    // claude one, and `sanitize_model` keeps a dotted vendor id like the ones copilot
+    // takes (`claude-haiku-4.5`) intact rather than filtering it down to something else.
+    assert!(compile(&reg, &g, "quick").0.contains("--model haiku"));
+    assert!(compile(&reg, &g, "cheap-copilot").0.contains("--model claude-haiku-4.5"));
+
+    // A block that declares NO model takes its class default *for its own CLI* — NOT the
+    // launcher's per-role pick, which here says opus. The file is the roster, so an
+    // undeclared field resolves from the block, not from a launcher form the file never
+    // saw. (Nothing is silent about it: the launcher's roster preview runs this same
+    // load+clamp and shows the human the resolved model of every block before they hit
+    // Create.) Both halves are asserted: the rule that holds, and the one that doesn't.
+    let (inherits, _, _) = compile(&reg, &g, "inherits");
+    assert!(inherits.contains("--model sonnet"), "the class default must win: {inherits}");
+    assert!(
+        !inherits.contains("--model opus"),
+        "a declared block must never inherit the launcher's per-role model: {inherits}"
+    );
+
+    // The tier is durable: a resumed group must not come back one model tier up.
+    let (_repo, persisted) = reg.load_group_file(&g.id).expect("group.json");
+    assert_eq!(persisted.block("quick").unwrap().model, "haiku");
+    assert_eq!(persisted.block("cheap-copilot").unwrap().model, "claude-haiku-4.5");
+}
+
+#[test]
+fn the_builtin_roster_still_honors_the_launchers_per_role_models() {
+    // The other half of "a guardrail is a launcher default": with the advanced
+    // orchestrator OFF, the per-role picks are the ONLY thing that decides a model —
+    // even in this repo, which now ships a workflow file declaring otherwise. If a
+    // declared block could reach a toggle-off group, the compatibility promise (and
+    // the consent argument the toggle exists for) would both be false.
+    let (reg, _d) = test_registry();
+    let picks = workflow::default_roster(&[
+        (Role::Orchestrator, "claude", "opus"),
+        (Role::Worker, "claude", "opus"),    // deliberately NOT the class default
+        (Role::Reviewer, "claude", "haiku"), // ditto
+        (Role::Planner, "claude", "opus"),
+    ]);
+    let g = reg
+        .create_group(&repo_root(), Guardrails { blocks: picks, ..plain_rails() })
+        .unwrap();
+
+    assert_eq!(
+        g.guardrails.blocks.iter().map(|b| b.id.as_str()).collect::<Vec<_>>(),
+        ["orchestrator", "worker", "reviewer", "planner"],
+        "the toggle is off — the repo's own workflow file must not be read at all"
+    );
+    let (worker, _, _) = compile(&reg, &g, "worker");
+    assert!(worker.contains("--model opus"), "the launcher's worker pick decides: {worker}");
+    assert!(!worker.contains("--agent"), "and a toggle-off group has no personas: {worker}");
+    let (reviewer, _, _) = compile(&reg, &g, "reviewer");
+    assert!(reviewer.contains("--model haiku"), "the launcher's reviewer pick decides: {reviewer}");
+}
