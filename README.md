@@ -169,6 +169,8 @@ src-tauri/src/
   pty.rs            PTY lifecycle (spawn/write/resize/kill) + output streaming; per-kind Terminal shells (PowerShell/cmd/Git Bash, #194) + Git Bash discovery
   sessions.rs       agent session discovery (one scan_* fn per agent source)
   orchestration/    agent groups: registry, guardrails, MCP server, audit
+    workflow.rs     the block model (#222): a repo's agent roster as data — `<repo>/.loomux/workflow.yml` parse + validation. A block's id is the agent's identity; `kind` is its CAPABILITY CLASS, and stays a closed 4-variant enum, so a repo file can declare five reviewers with five prompts but can never grant one write access. See doc/design/workflows.md
+    profiles.rs     repo-authored personas from `.github/agents/*.md` (#51, harvested from PR #105): append/replace modes with a non-overridable loomux mechanics core. Compiled to each CLI's native custom-agent flag — `claude --agents` (inline) / `copilot --agent` (a user-authored file only)
   obs.rs            crash observability: panic hook, breadcrumb log, unclean-exit notice
   voice.rs          voice prompts (#58): mic capture (cpal) -> local whisper.cpp subprocess
   uistate.rs        durable UI state (project tabs #63): atomic tabs.json store

@@ -187,7 +187,8 @@ fn tool_defs(role: Role) -> Vec<Value> {
                 "Open a new worker, reviewer, or planner agent pane in this group. Guardrails apply: live-agent cap and per-role pinned CLI + model. Set worktree=true for parallel work that must not collide; give branch a meaningful name either way. Empty task spawns an idle agent awaiting prompts. A planner explores the codebase read-only and writes an implementation plan as a GitHub issue comment, then reports and exits. Its read-only contract is enforced structurally where the CLI allows it — it never gets a worktree, and its file-editing tools plus git commit/push are denied at the CLI level — so it cannot edit files or push code; not opening PRs is asked of it in its instructions (gh stays available so it can post the plan comment). For a FOLLOW-UP on a finished task, pass resume_session (from list_agents/the task board) plus cwd (where that work happened) — the pane reopens that conversation with its context instead of cold-starting.",
                 json!({
                     "name": { "type": "string", "description": "Short display name for the pane" },
-                    "kind": { "type": "string", "enum": ["worker", "reviewer", "planner"], "description": "Agent role (default worker)" },
+                    "kind": { "type": "string", "enum": ["worker", "reviewer", "planner"], "description": "Capability class (default worker). An unrecognized value is rejected, never treated as a worker." },
+                    "block": { "type": "string", "description": "Id of a block declared in the repo's .loomux/workflow.yml — e.g. 'rev-security'. The block supplies the persona, CLI, model and capability class (so `kind` is ignored when this is set). Your kickoff lists the blocks this group has; omit it to get the default block for `kind`." },
                     "task": { "type": "string", "description": "Full task brief; empty = idle. With resume_session, this is the follow-up prompt." },
                     "worktree": { "type": "boolean", "description": "Create a dedicated git worktree + branch" },
                     "branch": { "type": "string", "description": "Branch name (default agent/<id>)" },
@@ -317,11 +318,45 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
 
         "spawn_agent" => {
             require_orchestrator(caller)?;
-            let kind = match arg_str(args, "kind").unwrap_or("worker") {
-                "reviewer" => Role::Reviewer,
-                "planner" => Role::Planner,
-                _ => Role::Worker,
+            // An unrecognized kind is REJECTED (#222). This used to be
+            // `_ => Role::Worker` — so a typo'd or hallucinated kind silently
+            // became a *worker*, complete with a worktree and write access. A
+            // capability class is the one thing that must never be guessed.
+            let kind = match arg_str(args, "kind") {
+                None => Role::Worker, // documented default
+                Some(k) => super::workflow::kind_from_str(k).ok_or_else(|| {
+                    format!(
+                        "unknown kind {k:?} — must be one of {}",
+                        super::workflow::kind_names()
+                    )
+                })?,
             };
+            // ...but `orchestrator` is a kind loomux *can* name, and this tool is
+            // the one place an agent chooses one. Delegates only.
+            //
+            // This check is load-bearing, and it is easy to lose: before #222 the
+            // `_ => Role::Worker` catch-all above happened to swallow
+            // `kind: "orchestrator"` too, so nothing else ever had to say no.
+            // Making unknown kinds an error removed that accident — and an
+            // orchestrator-kind spawn is exempt from the live-agent cap AND the
+            // spawn-rate backstop (both sit inside `if role != Role::Orchestrator`
+            // in `spawn_agent_ex`) AND resolves to `Caller.role == Orchestrator`,
+            // which is what `require_orchestrator` gates the privileged tools on.
+            // An orchestrator that called `spawn_agent(kind: "orchestrator")` in a
+            // loop would fork-bomb the machine with fully-privileged panes.
+            // The JSON-schema `enum` in `tool_defs` is advertisement; it is never
+            // enforced against the incoming arguments. This is the enforcement.
+            if kind == Role::Orchestrator {
+                return Err(
+                    "kind must be worker | reviewer | planner — a group has exactly one \
+                     orchestrator (you), opened at launch"
+                        .into(),
+                );
+            }
+            // A block names one of the repo's declared personas (#222). Its
+            // `kind` is authoritative when set, so `kind` above is only the
+            // fallback for a plain spawn.
+            let block = arg_str(args, "block").map(str::to_string);
             let task = arg_str(args, "task").unwrap_or("");
             let name = arg_str(args, "name").unwrap_or("");
             let worktree = args.get("worktree").and_then(Value::as_bool).unwrap_or(false);
@@ -330,7 +365,7 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             let resume = arg_str(args, "resume_session").map(str::to_string);
             let cwd = arg_str(args, "cwd").map(str::to_string);
             let resumed = resume.is_some();
-            let a = reg.spawn_agent_ex(&caller.group, kind, name, task, worktree, branch, base, resume, cwd, None)?;
+            let a = reg.spawn_agent_ex(&caller.group, kind, block, name, task, worktree, branch, base, resume, cwd, None)?;
             // Copilot mints its session id a few seconds into boot; loomux
             // binds it to the pane once it appears (visible then in
             // list_agents / the task board).
@@ -340,9 +375,10 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                 .map(|s| format!("Session {s}."))
                 .unwrap_or_else(|| "Session id will appear in list_agents once Copilot initializes.".into());
             Ok(format!(
-                "spawned {} (\"{}\", {:?}){}. {} It will report when ready.",
+                "spawned {} (\"{}\", block {}, {:?}){}. {} It will report when ready.",
                 a.id,
                 a.name,
+                a.block,
                 a.role,
                 if resumed { " resuming its previous session" } else { "" },
                 session,
