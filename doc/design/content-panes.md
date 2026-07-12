@@ -650,9 +650,27 @@ another per-class `[hidden]` companion — the file had **nine** of those, added
 and the workflow pane's seven elements are what it cost to keep rediscovering the trap by hand. An
 author-origin `[hidden]` carries the same specificity as any single class, so without `!important`
 the winner is decided by **source order**: by whether the next person to write `display:` happens to
-write it below that line. `test/hiddenrule.test.ts` models the cascade and asserts the invariant
-over the whole stylesheet — *if the code hides an element, the element goes away* — so the next
-`display: flex` on a toggled class fails a test instead of a demo.
+write it below that line.
+
+It is app-wide because the bug is, and **two elements outside the pane were already living with
+it** — both silently ignoring their own `hidden` since the day they were written, and both now
+behaving as their code always said they did:
+
+- **`.group-auto-meter`** — the group view's budget meter, whose own comment reads `Off ⇒ hidden`.
+  It never hid; with autonomy off it sat there as an empty shell.
+- **`.tab-close`** — the tab bar's ✕, which `tabbar.ts` hides on a single tab (`never zero tabs`).
+  Visible, it was a **dead control**: `requestClose` floors at `count <= 1` and returns, so clicking
+  it did nothing. The never-zero-tabs floor is enforced in the handler and does not depend on this,
+  so restoring the ✕'s intended invisibility changes what you *see*, not what can happen.
+
+`test/hiddenrule.test.ts` guards the fix in the two places it can be attacked. An important
+declaration beats every normal one regardless of selector, so the *only* thing that can out-rank the
+guard is **another important `display`** — which the test forbids outright, reading every declaration
+in the file whatever its selector (a `display: flex !important` hung on a descendant selector would
+otherwise defeat the guard invisibly). The second half models the cascade over the compound
+selectors that actually carry `display` here and asserts the invariant itself: *if the code hides an
+element, the element goes away*. So the next `display: flex` on a toggled class fails a test instead
+of a demo.
 
 And `createAllowed` (`workflowpane.ts`): a create is permitted on the **start surface and nowhere
 else** — the same single decision that draws the button — and `scaffold()` refuses if it is called
@@ -706,8 +724,8 @@ construction, not by remembering.
 | `workflowlayout.ts` (#222 v2) | the canvas's pure half: `.loomux/workflow.layout.json`, placement, hit-testing, edge routing — all DOM-free, all node:tested |
 | `modal.ts` (#222 v2) | `promptModal` — one line of text, validated on every keystroke (the affirm button is disabled while the id is bad), so a new block can be ASKED for its id instead of being given a generated one |
 | `workflowpane.ts` (#222 v2) | the pane's pure DECISIONS — which surface it shows, how a save is allowed to write, what the layout file may forget. Three rules the view used to hold itself, and got wrong. Plus `createAllowed` (#222 live fix): a create is permitted on the **start surface and nowhere else**, so it can never be reached over a workflow that is already there |
-| `styles.css` → `[hidden] { display: none !important; }` (#222 live fix) | app-wide, one line: an author `display:` rule out-ranks the UA's `[hidden]` **by origin**, so `el.hidden = true` was silently ignored on all seven of the workflow pane's toggled elements — the pane drew its three exclusive surfaces at once, and the "Create workflow" button sat live over a loaded workflow. Also fixes the group view's budget meter, which never obeyed its own `Off ⇒ hidden` |
-| `test/hiddenrule.test.ts` (#222 live fix) | models the cascade over the real stylesheet and asserts the invariant *if the code hides an element, the element goes away* — for every class in the file, not just today's seven victims |
+| `styles.css` → `[hidden] { display: none !important; }` (#222 live fix) | app-wide, one line: an author `display:` rule out-ranks the UA's `[hidden]` **by origin**, so `el.hidden = true` was silently ignored on all seven of the workflow pane's toggled elements — the pane drew its three exclusive surfaces at once, and the "Create workflow" button sat live over a loaded workflow. It also un-breaks the two elements *outside* the pane that had the same defect: the group view's budget meter (`Off ⇒ hidden`) and the tab bar's ✕ on a single tab (`never zero tabs`) |
+| `test/hiddenrule.test.ts` (#222 live fix) | two halves of one guarantee: **the guard is the only important `display` in the stylesheet** (read off every declaration, any selector — an important `display` is the *only* thing that can out-rank `[hidden]`), and **hiding an element hides it** (the cascade, modelled over the compound selectors that carry `display` here) |
 | `src-tauri/tests/workflowfile.rs` (#222 v2) | pins the two backend facts the create path rests on: a null-hash write clobbers (why a create must never use one), and `new_file` refuses atomically without truncating (why claiming the path fixes it) |
 | `filemenu.ts` / `fileexplorer.ts` / `fileexplorermodel.ts` (#222) | the `workflow-pane` row affordance — declared, and offered only on a `.yml`/`.yaml` row |
 | `launcher.ts` (#222) | the `Workflow` kind in the welcome form's picker (one option, one plan, one probe — the same directory probe files/editor use) |
