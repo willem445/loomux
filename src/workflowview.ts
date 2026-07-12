@@ -721,7 +721,11 @@ export class WorkflowView {
     // honour. Refusing here means no future wiring mistake, CSS or otherwise, can turn "Create"
     // into "destroy" — the guard no longer depends on the button being where we think it is.
     if (!createAllowed({ loadError: this.loadError, exists: this.exists, text: this.text })) {
-      showToast(`${this.rel} is already open here — nothing was overwritten.`);
+      // Two states refuse a create, and the message has to be true in BOTH (rev-17 F5): a workflow
+      // is loaded, OR a file is there that we could not read. "Already open" is a lie in the second
+      // one — the file precisely did not open, which is the whole reason we won't scaffold over it.
+      // What holds either way is the only thing worth saying: nothing was destroyed.
+      showToast("Nothing was created or overwritten — Create is only offered where there's no workflow.");
       this.render();
       return;
     }

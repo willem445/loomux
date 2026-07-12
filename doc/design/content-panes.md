@@ -669,8 +669,12 @@ guard is **another important `display`** — which the test forbids outright, re
 in the file whatever its selector (a `display: flex !important` hung on a descendant selector would
 otherwise defeat the guard invisibly). The second half models the cascade over the compound
 selectors that actually carry `display` here and asserts the invariant itself: *if the code hides an
-element, the element goes away*. So the next `display: flex` on a toggled class fails a test instead
-of a demo.
+element, the element goes away*.
+
+So the next `display: flex` on a toggled class is simply **harmless** — the guard outranks it, the
+suite stays green, and nothing needs to be said to whoever wrote it. That is the point of fixing this
+in the cascade rather than element by element. What fails a test is **weakening the guard** or adding
+**a second important `display`** — which are the only two ways this bug can come back.
 
 And `createAllowed` (`workflowpane.ts`): a create is permitted on the **start surface and nowhere
 else** — the same single decision that draws the button — and `scaffold()` refuses if it is called
