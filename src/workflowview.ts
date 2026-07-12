@@ -30,6 +30,7 @@ import {
   analyzeWorkflow,
   parseWorkflow,
   serializeWorkflow,
+  formatWorkflowText,
   scaffoldWorkflowText,
   removeBlockAt,
   newBlock,
@@ -78,7 +79,14 @@ import {
 } from "./workflowlayout";
 import { ftReadFile, ftWriteFile, ftListDir, errorCode, errorMessage } from "./fileapi";
 import { fmNewFolder, fmNewFile, fmErrorCode } from "./filemgr";
-import { paneSurface, savePlan, layoutPruneIds, type LayoutWrite } from "./workflowpane";
+import {
+  paneSurface,
+  savePlan,
+  layoutPruneIds,
+  rewriteImpact,
+  rewriteImpactMessage,
+  type LayoutWrite,
+} from "./workflowpane";
 import { appVersion } from "./pty";
 import { closeDecision, discardEdits, type ConflictChoice } from "./dirtystate";
 import { showToast } from "./toast";
@@ -467,6 +475,9 @@ export class WorkflowView {
       this.render();
       return;
     }
+    // A fresh read is a different file (or a different version of one), so a rewrite the human
+    // consented to earlier was consent about text that is no longer there.
+    this.rewriteConfirmed = false;
     try {
       const fr = await ftReadFile(this.root, this.rel);
       if (this.disposed) return;
@@ -518,6 +529,7 @@ export class WorkflowView {
 
   private async save(): Promise<void> {
     if (!this.root || !this.dirty) return;
+    if (!(await this.confirmRewrite())) return;
     // Saving a file whose YAML doesn't parse is allowed on purpose: it is text, the human
     // may be mid-edit, and a half-finished workflow on disk is recoverable while a lost
     // one is not. The findings strip is what says it isn't runnable yet.
@@ -547,6 +559,48 @@ export class WorkflowView {
       if (errorCode(err) === "conflict") await this.resolveConflict();
       else showToast(`Save failed: ${errorMessage(err)}`);
     }
+  }
+
+  /** Ask ONCE, before the first save that would rewrite a human-authored file into canonical
+   *  form — and only when that rewrite actually costs them something (rev-15 F6).
+   *
+   *  A form or canvas edit re-serializes the whole workflow from the model, and the model does
+   *  not carry comments. For a file loomux wrote that costs nothing. For a file a HUMAN wrote,
+   *  the comments are often the most valuable lines in it — this repo's own `.loomux/workflow.yml`
+   *  is 126 lines of which 60 are comments explaining the roster and the `.github/agents/`
+   *  convention, and until now one dragged edge would have taken all 60 without a word.
+   *
+   *  Comment-preserving serialization is the real fix, and it is a feature with its own design.
+   *  Until then the honest thing is not to pretend the loss doesn't happen: say so, once, before
+   *  it does, and let the human decide. A rewrite they consented to is a trade; a rewrite they
+   *  find later in `git diff` is a bug.
+   *
+   *  ONCE per file, not once per save: a human who has said "yes, canonicalize it" has said it
+   *  about that file, and asking again on every Ctrl+S is how you train someone to stop reading
+   *  the question. Reset by `load()`, because that is a different file (or a different version
+   *  of it) and the answer was about the old one.
+   *
+   *  CANCEL IS THE DEFAULT — the affirmative button is deliberately not the focused one here,
+   *  which is the opposite of every other dialog in this pane. Everything else asks about
+   *  something recoverable; this asks about work that is not. */
+  private rewriteConfirmed = false;
+
+  private async confirmRewrite(): Promise<boolean> {
+    if (this.rewriteConfirmed) return true;
+    const impact = rewriteImpact(this.savedText, this.text, (t) => formatWorkflowText(t) === t);
+    if (!impact) return true; // a faithful save — silent, as it should be
+
+    const ok = await modal<boolean>((resolve) => ({
+      title: "This save rewrites the file",
+      body: rewriteImpactMessage(impact, this.rel),
+      buttons: [
+        { label: "Rewrite and save", value: true, kind: "danger" },
+        { label: "Cancel", value: false },
+      ],
+      onKey: (k) => (k === "Escape" ? resolve(false) : undefined),
+    }));
+    if (ok) this.rewriteConfirmed = true;
+    return ok;
   }
 
   /** Claim `this.rel` for a file that does not exist yet, and return the hash to write

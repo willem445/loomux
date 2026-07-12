@@ -16,7 +16,14 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { parseWorkflow, validateWorkflow, deriveGraph, serializeWorkflow } from "../src/workflowmodel.ts";
+import {
+  parseWorkflow,
+  validateWorkflow,
+  deriveGraph,
+  serializeWorkflow,
+  formatWorkflowText,
+} from "../src/workflowmodel.ts";
+import { rewriteImpact, rewriteImpactMessage } from "../src/workflowpane.ts";
 
 const text = readFileSync(new URL("../.loomux/workflow.yml", import.meta.url), "utf8");
 
@@ -98,19 +105,10 @@ test("every block is on the declared path — the graph loomux draws has no orph
 
 // ---------- and now the pane can WRITE it (#222 v2) ----------
 
-test("editing the repo's own workflow in the pane does not mangle it", () => {
-  // The canvas is editable now, so `.loomux/workflow.yml` is a file this app SAVES, not just
-  // one it reads — and every save re-serializes through the canonical formatter. Two things
-  // therefore have to be true of the real file, and neither was in scope before v2:
-  //
-  //   1. a save preserves its meaning (the workflow that comes back is the workflow that went
-  //      in — every block, persona, edge and gate);
-  //   2. a save does not CHURN it — the canonical form of the file is stable, so opening the
-  //      workflow in the pane, dragging a node, and hitting Ctrl+S must not produce a diff of
-  //      the whole file for a teammate to review.
-  //
-  // If someone hand-edits the shipped workflow into a shape the formatter would rewrite, this
-  // fails here rather than in the human's next `git diff`.
+test("a canonical save preserves the workflow's MEANING, exactly", () => {
+  // What serialization actually guarantees, and all it guarantees: the workflow that comes back
+  // is the workflow that went in — every block, persona, edge and gate — and the canonical form
+  // is stable, so saving twice is a no-op.
   const { workflow } = parseWorkflow(text);
   const saved = serializeWorkflow(workflow);
   const reread = parseWorkflow(saved);
@@ -119,3 +117,43 @@ test("editing the repo's own workflow in the pane does not mangle it", () => {
   assert.deepEqual(reread.workflow, workflow, "…and must mean exactly what the original meant");
   assert.equal(serializeWorkflow(reread.workflow), saved, "…and saving it twice must be a no-op");
 });
+
+test("a canonical save REWRITES this file — and the pane says so before it does", () => {
+  // The honest version of what this test used to claim (rev-15 F6). The old one asserted that a
+  // save "does not churn the file" — but it compared the canonical form against ITSELF and never
+  // against the bytes on disk, so it could not fail, and the property it was named after is
+  // FALSE: the shipped workflow is not canonical. It is deliberately-committed documentation —
+  // the comments explain the roster and the .github/agents/ convention — and a canonical
+  // re-serialize drops every one of them.
+  //
+  // So this asserts the truth instead, and then asserts the guard that makes the truth
+  // survivable: the pane warns, once, before the first save that would do it.
+  const { workflow } = parseWorkflow(text);
+  const canonical = serializeWorkflow(workflow);
+
+  assert.notEqual(canonical, text, "the shipped file is NOT in canonical form — it has comments");
+
+  const commentsOnDisk = text.split(/\r?\n/).filter((l) => /^\s*#/.test(l)).length;
+  assert.ok(commentsOnDisk > 20, `the file's comments are load-bearing (${commentsOnDisk} lines)`);
+
+  // The guard: a form or canvas edit re-serializes, and the human is told what that costs BEFORE
+  // it happens — not left to find it in `git diff`.
+  const impact = rewriteImpact(text, canonical, (t) => formatWorkflowText(t) === t);
+  assert.ok(impact, "saving canonical text over this file must raise a warning");
+  assert.ok(impact.reformats, "…it is a whole-file rewrite");
+  assert.ok(
+    impact.droppedComments >= 20,
+    `…and it drops the comments (${impact.droppedComments} lines)`
+  );
+  assert.match(rewriteImpactMessage(impact, ".loomux/workflow.yml"), /comments on \d+ lines/);
+
+  // And the case that must stay SILENT: a file loomux itself wrote is already canonical, so
+  // saving it costs nothing and asks nothing.
+  assert.equal(rewriteImpact(canonical, canonical, (t) => formatWorkflowText(t) === t), null);
+});
+
+// Comment-preserving serialization would make this whole trade go away, and it is a real
+// feature — the comments in this very file are the argument for it. It needs its own design and
+// its own review, so it is filed as a follow-up rather than smuggled in here. Until it lands,
+// the contract is: the YAML tab saves exactly what you type; the form and the canvas rewrite the
+// file, and say so first.

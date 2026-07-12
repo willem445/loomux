@@ -533,6 +533,40 @@ And the gate is still not a node you can drag or wire. It is not a block — it 
 blocks — and making it draggable would imply it can be rewired, which is the single most
 important thing about it that isn't true.
 
+### Comments, and the save that eats them
+
+A form or canvas edit re-serializes the **whole workflow from the model**, and the model does not
+carry comments — it cannot, because it is a workflow, not a document. For a file loomux wrote,
+that costs nothing. For a file a **human** wrote, the comments are frequently the most valuable
+lines in it: this repo's own `.loomux/workflow.yml` is 126 lines of which **60 are comments**
+explaining the roster and the `.github/agents/` convention. One dragged edge and a `Ctrl+S` used
+to take all 60, silently, and hand the human a whole-file diff to discover later.
+
+Three things follow, and the order matters:
+
+1. **The pane says so, once, before it does it.** `rewriteImpact` (pure, in `workflowpane.ts`) is
+   the signal: *are we about to write canonical text over a file that was not canonical?* If so
+   the save asks, naming what is lost ("the comments on 60 lines will be dropped"), with **Cancel
+   as the default** — the only dialog in this pane where the affirmative is not the focused
+   button, because it is the only one asking about work that is not recoverable. Once per file,
+   not once per save: a human who has said "yes, canonicalize it" has said it, and re-asking on
+   every `Ctrl+S` is how you train someone to stop reading the question.
+2. **A file already in canonical form saves silently** — anything loomux itself wrote. A confirm
+   that fires when nothing is at stake is a confirm people click through, and then they click
+   through the one that mattered.
+3. **The YAML tab is unaffected**: it saves exactly what you typed, comments and all. The
+   rewrite is a property of *re-serializing from the model*, not of saving.
+
+**The test used to claim the opposite, and could not fail.** It asserted that a save "does not
+churn the file" while comparing the canonical form against *itself* — never against the bytes on
+disk. It now asserts the truth (the shipped file is **not** canonical; a save rewrites it) and
+then asserts the guard. A test that cannot fail is worse than no test: it is a claim with a green
+tick next to it.
+
+Comment-preserving serialization is the real fix and it is a genuine feature — round-tripping
+comments through a structure the form can still rewrite. It needs its own design and its own
+review, so it is **filed as a follow-up** rather than smuggled in behind a bug fix.
+
 ### The three questions the view was never allowed to answer
 
 Review found the v2 pane getting three things wrong, and they had the same shape: the *view* was

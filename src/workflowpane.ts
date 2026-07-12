@@ -70,6 +70,80 @@ export function savePlan(state: { exists: boolean; savedHash: string }): SavePla
     : { kind: "claim-then-write" };
 }
 
+// ---------- what a canonical save is about to destroy ----------
+
+/** What saving would do to the file that is on disk, when it would do something the human did
+ *  not ask for. Null when the save is faithful — which is the common case, and which must stay
+ *  silent.
+ *
+ *  THE TRADE THIS EXISTS TO SURFACE. A form or canvas edit re-serializes the whole workflow
+ *  through the canonical formatter (that is what keeps the file legible and the diffs small),
+ *  and the formatter does not preserve comments — it cannot, because the model it serializes
+ *  from does not carry them. For a file loomux itself wrote, that costs nothing. For a file a
+ *  HUMAN wrote, the comments are frequently the most valuable lines in it: this repo's own
+ *  `.loomux/workflow.yml` is 126 lines of which 60 are comments explaining the roster and the
+ *  `.github/agents/` convention, and one dragged edge would have silently taken all 60.
+ *
+ *  Comment-preserving serialization is the real fix and it is a feature with its own design
+ *  (round-tripping comments through an AST that the form can still rewrite). Until then, the
+ *  honest thing is not to pretend the loss doesn't happen — it is to say so, once, before it
+ *  does, and let the human decide. A rewrite they consented to is a trade; a rewrite they
+ *  discovered in `git diff` is a bug. */
+export interface RewriteImpact {
+  /** Comment lines the rewrite would drop. */
+  droppedComments: number;
+  /** True when the write replaces a non-canonical file with the canonical form — i.e. the diff
+   *  is the whole file, not the lines that changed. */
+  reformats: boolean;
+}
+
+/** A `#` at the start of a line or after whitespace — a whole-line comment OR a trailing one
+ *  (`kind: worker   # the one that opens the PR`). Both are dropped by a canonical re-serialize,
+ *  so counting only the whole-line ones would under-report what the human is about to lose. */
+const CARRIES_COMMENT = /(^|\s)#/;
+
+/** Lines carrying a comment. Deliberately approximate in one direction: a `#` inside a quoted
+ *  scalar or a prompt body matches too — but it matches in BOTH texts and survives serialization,
+ *  so it cancels out of the DIFFERENCE, which is the only thing this is ever used for. */
+const commentLines = (text: string): number =>
+  text.split(/\r?\n/).filter((l) => CARRIES_COMMENT.test(l)).length;
+
+/** Would writing `next` over `disk` cost the human something they didn't ask to spend?
+ *
+ *  `isCanonical` is the signal the whole thing turns on: we are about to write canonical text
+ *  over a file that was NOT in canonical form, which is precisely the "the diff is the entire
+ *  file" case. A file already in canonical form — anything loomux wrote — saves silently, as it
+ *  should: there is nothing to warn about, and a confirm that fires when nothing is at stake is
+ *  a confirm people learn to click through. */
+export function rewriteImpact(
+  disk: string,
+  next: string,
+  isCanonical: (text: string) => boolean
+): RewriteImpact | null {
+  if (!disk.trim()) return null; // creating a file destroys nothing
+  if (next === disk) return null; // writing the same bytes is not a rewrite
+  const droppedComments = Math.max(0, commentLines(disk) - commentLines(next));
+  // Only a canonical write over a non-canonical file reformats. A human editing the raw YAML
+  // tab is writing THEIR text — they can see exactly what they are saving, and warning them
+  // about their own keystrokes would be absurd.
+  const reformats = isCanonical(next) && !isCanonical(disk);
+  if (!droppedComments && !reformats) return null;
+  return { droppedComments, reformats };
+}
+
+/** What to tell the human, in the words that name what they lose. */
+export function rewriteImpactMessage(impact: RewriteImpact, file: string): string {
+  const n = impact.droppedComments;
+  const comments = n > 0 ? `the comments on ${n} line${n === 1 ? "" : "s"} will be dropped` : "";
+  const shape = impact.reformats ? "the file will be rewritten in loomux's canonical form" : "";
+  const both = [comments, shape].filter(Boolean).join(", and ");
+  return (
+    `Saving ${file} from the form or the canvas re-writes the whole file from the workflow model — ` +
+    `so ${both}. The workflow itself is unchanged; the comments and the layout of the text are not recoverable. ` +
+    `(Editing the YAML tab directly saves exactly what you typed.)`
+  );
+}
+
 // ---------- what the layout file is allowed to forget ----------
 
 /** When the layout is being written. A drag writes it constantly; a save writes it once, at a

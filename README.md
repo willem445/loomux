@@ -208,6 +208,13 @@ one line of what a workflow is, the roster it is about to write, and a **Create 
 button that scaffolds a real, commented, valid `.loomux/workflow.yml` (today's plan → work
 → review pipeline, gate included) and drops you into the canvas on it.
 
+Editing through the **form or the canvas** rewrites the file from the workflow model, in
+canonical form — which keeps diffs small and the file legible, but **does not preserve
+comments**. So the first save that would do that asks first, naming what it costs ("the comments
+on 60 lines will be dropped"), with Cancel as the default; a file loomux itself wrote is already
+canonical and saves silently. The **YAML tab always saves exactly what you typed**, comments and
+all.
+
 The file is saved through the same hash-guarded path the editor uses, so an agent rewriting
 it under you is a **conflict** you get to resolve, not a silent overwrite — and unsaved
 edits are guarded on close, tab-close and quit exactly like an editor buffer's. A workflow
