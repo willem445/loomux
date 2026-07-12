@@ -66,10 +66,23 @@ fn read_and_write_resolve_the_same_file_from_a_cwd_that_is_somewhere_else() {
 
     // The spellings the live app can hand over. `rel` stays forward-slashed throughout — that is
     // what `WORKFLOW_FILE` is in TypeScript, and it never gets converted on the way down.
-    let with_backslashes = repo.root().replace('/', "\\");
-    let trailing = format!("{}\\", with_backslashes.trim_end_matches('\\'));
-    for root in [repo.root(), with_backslashes, trailing] {
-        let read = read_file(&root, ".loomux/workflow.yml")
+    #[allow(unused_mut)] // …on Unix, where the block below is compiled out
+    let mut roots = vec![repo.root()];
+
+    // The Windows ones, and they are Windows-only by construction rather than by oversight: a
+    // backslash is a legal FILENAME character on Unix, so `C:\...`-shaped roots don't name the same
+    // file there — they don't name a file at all. The mismatch this test rules out is a Windows
+    // mismatch (the live app is Windows), and these are the shapes it would have taken.
+    #[cfg(windows)]
+    {
+        let back = repo.root().replace('/', "\\");
+        roots.push(format!("{}\\", back.trim_end_matches('\\'))); // trailing separator
+        roots.push(repo.root().replace('\\', "/")); // …and the all-forward-slash spelling
+        roots.push(back);
+    }
+
+    for (i, root) in roots.iter().enumerate() {
+        let read = read_file(root, ".loomux/workflow.yml")
             .unwrap_or_else(|e| panic!("the file is THERE — a live root must read it: {root} => {e}"));
         assert_eq!(
             read.content, theirs,
@@ -79,8 +92,8 @@ fn read_and_write_resolve_the_same_file_from_a_cwd_that_is_somewhere_else() {
         // And the write goes back to the same file: guarded by the hash the read just returned, so
         // if it were resolving a DIFFERENT path this would either create a stray file in the decoy
         // or fail the hash check outright.
-        let mine = format!("version: 1\nname: written-via-{}\n", root.len());
-        write_file(&root, ".loomux/workflow.yml", &mine, Some(read.hash)).unwrap();
+        let mine = format!("version: 1\nname: written-via-spelling-{i}\n");
+        write_file(root, ".loomux/workflow.yml", &mine, Some(read.hash)).unwrap();
         assert_eq!(
             std::fs::read_to_string(repo.0.join(".loomux/workflow.yml")).unwrap(),
             mine,
