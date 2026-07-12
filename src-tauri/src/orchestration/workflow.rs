@@ -13,8 +13,20 @@
 //!   scope) still come from a **closed enum**;
 //! - persona (`prompt` / `profile`), `cli` and `model` are **unbounded data**.
 //!
-//! So you can declare as many reviewers as you like — but every one of them is
-//! a *reviewer* in the capability sense, and none of them can push to a branch.
+//! So you can declare as many reviewers as you like — but every one of them is a
+//! *reviewer* in the capability sense, and a repo file cannot make one anything
+//! else.
+//!
+//! Be precise about what "the capability sense" buys, because the enum enforces
+//! less than the word suggests: a **planner** is structurally read-only — its
+//! file-editing tools and `git commit`/`git push` are denied at the CLI level, so
+//! `is_read_only()` is a real, mechanical guarantee. A **reviewer**'s "never
+//! pushes" is *instruction-backed*, exactly as it was before #222: it holds the
+//! same write surface a worker does and is merely told not to use it. What the
+//! closed enum guarantees is that a repo file cannot *change* which of those two
+//! postures a block gets — not that every non-worker posture is a sandbox. (See
+//! `doc/design/orchestration.md` on structural vs instruction-backed enforcement;
+//! the capability table in `doc/design/workflows.md` is the honest summary.)
 //!
 //! # The capability-closure rule (the security spine)
 //!
@@ -277,6 +289,21 @@ pub fn sanitize_id(s: &str) -> Option<String> {
         .trim()
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+        .take(MAX_ID_CHARS)
+        .collect();
+    (!cleaned.is_empty()).then_some(cleaned)
+}
+
+/// A gate condition name (`ci-green`). Sub-PR 3 enforces gates inside the `gh`
+/// PATH shim — a shell script — so these follow the same conservative alphabet
+/// as a block id, with `.` allowed (CI check names carry it). Returns `None` for
+/// a name with no usable characters; `parse_workflow` *rejects* anything this
+/// would have changed rather than accepting the rewrite.
+pub fn sanitize_condition(s: &str) -> Option<String> {
+    let cleaned: String = s
+        .trim()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
         .take(MAX_ID_CHARS)
         .collect();
     (!cleaned.is_empty()).then_some(cleaned)
@@ -584,6 +611,46 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
                 continue;
             }
         }
+        // THE ORCHESTRATOR BLOCK IS LOOMUX-OWNED. A repo may pin its `cli` and
+        // `model` (sanitized like everywhere else) — but it may not author its
+        // persona or pre-approve its tools.
+        //
+        // This is not a capability question: the orchestrator already holds every
+        // tool, so a repo-authored prompt grants it nothing *new*. It is a TRUST
+        // question. The orchestrator is the group's trust root — it runs
+        // unsupervised under `auto_ops`, in the repo root with no worktree,
+        // holding the privileged MCP surface (`spawn_agent`, `kill_agent`,
+        // `set_state`). Letting `.loomux/workflow.yml` write its system prompt
+        // would hand a cloned repo a direct prompt-injection seam into that root
+        // (the #189 class) — and it would be the one orchestrator path with no
+        // gate, in a feature whose entire security argument is that a repo file
+        // never reconfigures trust. The rest of the model spends real effort
+        // making a *second* orchestrator impossible; leaving the *first* one's
+        // persona repo-writable would make that effort decorative.
+        //
+        // The declared feature ("five reviewers, five prompts") needs none of
+        // this. If app-level orchestrator customization is ever wanted, it can
+        // arrive as an explicit human opt-in — which is a different thing from a
+        // file that arrives with a `git clone`.
+        if kind == Role::Orchestrator {
+            let offenders: Vec<&str> = [
+                rb.prompt.is_some().then_some("prompt:"),
+                rb.profile.is_some().then_some("profile:"),
+                (!rb.allow.is_empty()).then_some("allow:"),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            if !offenders.is_empty() {
+                errs.push(format!(
+                    "blocks[{i}] ({id}): an orchestrator block may not declare {} — the orchestrator \
+                     is loomux's trust root and a repo file may not author its prompt or pre-approve \
+                     its tools. Pin its cli:/model: if you need to; put personas on the blocks it spawns.",
+                    offenders.join(" / ")
+                ));
+                continue;
+            }
+        }
         // CAPABILITY CLOSURE. `allow:` pre-approves tool patterns, and the
         // read-only class is read-only by *denial of a fixed list* — Edit, Write,
         // MultiEdit, NotebookEdit, `git commit`, `git push`. Deny beats allow on
@@ -712,6 +779,26 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
                 bad = true;
             }
         }
+        // `also:` names extra gate conditions (`ci-green`, …). Sanitized HERE,
+        // at the parse boundary, even though nothing consumes it yet: gate
+        // enforcement lands in sub-PR 3, in the `gh` shim, and a shim is a shell
+        // script. Whatever `parse_workflow` returns will be read there as already
+        // clean — that is the contract every other field in this file already
+        // honors, and the one moment to establish it is before a consumer exists
+        // to assume it. Rejected, not rewritten: an author must be able to
+        // reference the condition they actually wrote.
+        let mut also: Vec<String> = Vec::new();
+        for c in &rg.also {
+            match sanitize_condition(c) {
+                Some(clean) if clean == c.trim() => also.push(clean),
+                _ => {
+                    errs.push(format!(
+                        "gates.{name}: condition {c:?} is not a usable name (letters, digits, '-', '_', '.')"
+                    ));
+                    bad = true;
+                }
+            }
+        }
         if bad {
             continue;
         }
@@ -720,7 +807,7 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
             Gate {
                 require,
                 reviewers: rg.reviewers.iter().map(|r| r.trim().to_string()).collect(),
-                also: rg.also,
+                also,
             },
         );
     }

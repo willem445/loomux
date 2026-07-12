@@ -896,11 +896,17 @@ const COPILOT_SESSION_TIMEOUT: Duration = Duration::from_secs(90);
 /// That closure is the security spine of #222. Personas are unbounded data
 /// authored in a repo file; capabilities are not. A workflow file *selects* a
 /// class here — it can never define one, and there is no `read_only: false`
-/// escape hatch. So a repo can declare five reviewers with five prompts and
-/// five models, and not one of them can push to a branch: the deny-flags
+/// escape hatch. So a repo can declare five reviewers with five prompts and five
+/// models, and it cannot make one of them anything but a reviewer: the deny-flags
 /// (`build_agent_command`), the cwd rule (`spawn_agent_ex`) and the MCP tool
 /// scope (`mcp::tool_defs`) all key off this enum, and it has exactly four
 /// values.
+///
+/// What each class *is* varies, and the enum should not be read as promising more
+/// than it enforces: a planner is structurally read-only ([`Role::is_read_only`] —
+/// real CLI-level denials), while a reviewer's "never pushes" is instruction-
+/// backed, as it was before #222. The guarantee is over which posture a block
+/// gets, not that every posture is a sandbox.
 ///
 /// The name `Role` survives because ~72 call sites and the persisted wire
 /// format use it; read it as "capability class".
@@ -6845,6 +6851,27 @@ impl OrchRegistry {
         group: &GroupInfo,
         block: &workflow::Block,
     ) -> Result<Option<ResolvedPersona>, String> {
+        // The orchestrator block is loomux-owned: a repo may pin its cli/model,
+        // never author its persona or pre-approve its tools. `parse_workflow`
+        // rejects that outright and says why — but a hand-edited `group.json`
+        // never meets the parser, so the persona is dropped here too, and audited.
+        //
+        // Neutralizing it *here* (rather than only in `persona_inject`) is what
+        // makes it total: this is the single point both the CLI flags and the
+        // block's instruction file are resolved through, so a `mode: replace`
+        // orchestrator persona cannot rewrite `orchestrator.md` either. See
+        // `parse_workflow` for why the trust root is not a customization surface.
+        if block.kind == Role::Orchestrator && (block.has_persona() || !block.allow.is_empty()) {
+            self.audit(&group.id, "loomux", "workflow-orchestrator-persona-denied", json!({
+                "block": block.id,
+                "prompt": block.prompt.is_some(),
+                "profile": block.profile,
+                "allow": block.allow,
+                "why": "the orchestrator is loomux's trust root — a repo file may not author its \
+                        prompt or pre-approve its tools",
+            }));
+            return Ok(None);
+        }
         if let Some(rel) = block.profile.as_deref() {
             let p = profiles::load_block_profile(&group.repo, rel, block.kind)?;
             let handle = p.copilot_agent.clone().unwrap_or_else(|| p.name.clone());

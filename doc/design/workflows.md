@@ -51,7 +51,19 @@ class*, which for the built-in roster is the only one).
 
 **The honest summary of "custom roles":** you can have five reviewers with five
 prompts and five models — but all five are *reviewers* in the capability sense,
-and none of them can push to a branch. That is the feature, not a limitation.
+and a repo file cannot make any of them anything else. That is the feature, not a
+limitation.
+
+And "in the capability sense" is worth pinning down, because the enum enforces
+less than the phrase suggests. A **planner** is structurally read-only: its
+file-editing tools and `git commit`/`git push` are denied at the CLI level, so
+`is_read_only()` is a mechanical guarantee. A **reviewer**'s "never pushes" is
+*instruction-backed* — it holds the same write surface a worker does and is
+merely told not to use it, exactly as before #222. What the closed enum
+guarantees is that **a repo file cannot change which posture a block gets**; it
+does not claim every non-worker posture is a sandbox. `doc/design/orchestration.md`
+draws the same structural-vs-instruction-backed line, and this feature inherits
+it rather than tightening it.
 
 ## Capability closure — the security argument
 
@@ -73,6 +85,7 @@ inert text or a choice from a value set loomux already ships:
 | `profile` | name a repo file | confined to the repo (no `..`, no absolute path, no drive prefix) |
 | `allow` | add tool patterns | **banned outright on a read-only class** (see below); inert for the classes that already hold the write surface |
 | `id` | name the block | reserved: the four class names may only be used by their own class, so no block can hijack another's contract file |
+| *(on a `kind: orchestrator` block)* | pin `cli` / `model` only | `prompt:`/`profile:`/`allow:` are a **parse error** — the trust root is not a repo-writable surface (see below) |
 | — | grant write access | **no spelling exists.** No `read_only:`, no fifth class, no capability key of any kind |
 
 `deny_unknown_fields` on the wire types is what makes that last row true: a
@@ -98,6 +111,37 @@ in a loop would fork-bomb the machine with fully-privileged panes. The MCP tool
 now refuses that kind explicitly — the JSON-schema `enum` in `tool_defs` is
 advertisement and is never checked against incoming arguments, so the check has
 to be in `call_tool`. `mcp_spawn_refuses_kind_orchestrator` pins it.
+
+### The orchestrator block is loomux-owned
+
+A repo may pin the orchestrator's `cli` and `model`. It may **not** author its
+`prompt:`/`profile:`, and may not give it `allow:`. Both are parse errors, and
+both are dropped-and-audited if they arrive from a hand-edited `group.json` that
+never met the parser.
+
+This one is not a capability argument, and it is worth being clear about that:
+the orchestrator already holds every tool, so a repo-authored prompt grants it
+nothing *new*, and a malicious repo under `auto_ops` can already reach code
+execution through a worker. It is a **trust** argument. The orchestrator is the
+group's trust root — it runs unsupervised under `auto_ops`, in the repo root with
+no worktree, holding the privileged MCP surface (`spawn_agent`, `kill_agent`,
+`set_state`). Letting a file that arrives with a `git clone` write its system
+prompt is a direct prompt-injection seam into that root (the #189 class), and it
+would have been the one orchestrator path with no gate.
+
+The asymmetry is what makes it indefensible rather than merely unfortunate: this
+feature spends real effort making a *second* orchestrator impossible
+(`spawn_agent(kind: "orchestrator")` refused at the MCP tool, an orchestrator
+block refused at `spawn_agent_ex`) — and leaving the *first* one's persona
+repo-writable would make that effort decorative. The stated feature ("five
+reviewers, five prompts") needs none of it. If app-level orchestrator
+customization is ever wanted it can arrive as an explicit human opt-in, which is
+a categorically different thing from a file you get by cloning a repo.
+
+The enforcement sits in `resolve_persona` rather than only in `persona_inject`,
+because that is the single point both the CLI flags *and* the block's instruction
+file resolve through — so a `mode: replace` orchestrator persona cannot rewrite
+`orchestrator.md` either.
 
 ### `allow:` is banned on a read-only class
 
