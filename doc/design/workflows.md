@@ -593,8 +593,14 @@ An edge is advisory. **A gate is enforced** — and this is the part of the feat
 nobody else in the survey ships. LangGraph, CrewAI, AutoGen and every node-canvas
 tool leave "did the reviewer approve?" as a critic agent plus a magic termination
 string; claude-flow ships consensus *agent prompts* (byzantine, raft, gossip) with
-no enforcing runtime at all. loomux already owns the one thing that makes a gate
-real: the `gh`/`git` PATH shim, which an agent physically cannot route around.
+no enforcing runtime at all. loomux already owns the machinery that makes a gate
+more than prose: the `gh`/`git` PATH shim, which refuses the merge *mechanically*
+rather than asking an agent nicely.
+
+"Mechanically" is not "unconditionally", and the difference matters — see **The
+bypass surface, honestly** below. The gate constrains an agent that plays by the
+PATH and by loomux's trust model, which is every agent loomux actually runs. It is
+not a sandbox.
 
 ### Why `report()` could never be the gate
 
@@ -627,17 +633,52 @@ should look at this" becomes either a false approval or a false defect report.
 Here it is a first-class outcome, and the summary that comes with it is what a
 human actually reads.
 
-Two rules, both from #197:
+Three rules, all from #197:
 
 - **Blockers beat approvals.** One `fail`/`escalate` refuses the merge whatever the
   others recorded and whatever the threshold says — checked *before* any counting.
   First-to-report must never win.
 - **The named reviewer's verdict is the gate**, not the first approval that turns
   up. A verdict from a reviewer the gate doesn't name satisfies nothing.
+- **A verdict binds to a revision, not to a PR number** — next section.
 
 Re-recording replaces that reviewer's own verdict — the `fail` → worker fixes it →
 `pass` loop — and every write is audited, so the history is in the trail even
 though only the latest verdict gates.
+
+### A pass does not survive a re-push
+
+Each verdict stores the PR's **head commit at record time** (`headRefOid`, captured
+by the tool), and the gate compares it against the PR's current head. A `pass`
+recorded against an earlier commit is **stale**: it counts as outstanding, not as a
+pass, and the refusal names both the reviewer and the revision they must look at.
+
+Without that binding the gate has a hole big enough to drive #197 through:
+
+1. `rev-security` and `rev-tests` both pass PR #7 → gate satisfied.
+2. The worker pushes two more commits ("fixed lint", "one more edge case").
+3. `gh pr merge 7` → still satisfied. Those commits merge with **no reviewer having
+   seen them**, through a gate reporting green.
+
+Every requirement #197 states is met to the letter there ("every required verdict is
+recorded PASS") and its actual point — don't merge code nobody reviewed — is
+violated. It is the same failure GitHub's own review model closes by dismissing
+stale approvals on new commits. Found in review of the first draft of this PR, which
+keyed verdicts to the PR number alone.
+
+Consequences worth knowing:
+
+- A **blocking** verdict is *revision-independent*: a `fail` recorded against an
+  older commit still refuses the merge. "This PR has a defect" doesn't stop being
+  true because the author pushed more code; the reviewer clears it by re-reviewing.
+- A verdict loomux could **not** bind to a commit (gh unavailable at record time)
+  stores an empty head, which can never equal a real one — so it reads as stale
+  rather than as "unbound, therefore fine".
+- If the *current* head can't be resolved at merge time, the gate **refuses**: with
+  no revision to compare against there is no way to know what any pass covers. Same
+  fail-safe the human gate takes on an undeterminable base.
+- Practically: don't send a worker back to "just tidy one thing" on an approved PR
+  and expect it to merge. Send the reviewer back too. Both role templates say so.
 
 ### The gate
 
@@ -671,8 +712,11 @@ by itself, and nothing opens *it* but the verdicts:
 
     gh pr merge
       │
+      ├─ no LOOMUX_GROUP_DIR ── a merge loomux cannot gate ───────────── REFUSE
+      │
       ├─ workflow merge gate  ── declared in .loomux/workflow.yml ────── REFUSE unless satisfied
-      │                          (verdicts + also: conditions)
+      │                          (verdicts for the CURRENT head,
+      │                           + also: conditions)
       │                          ↑ checked FIRST — no grant, no autonomous
       │                            marker, no dangerous mode can satisfy it
       └─ human merge gate     ── default branch only (#83) ───────────── REFUSE unless
@@ -698,18 +742,75 @@ already reads (`autonomous`, `auto_merge`, `merge_grants/pr-<N>`) is exactly thi
 shape:
 
     <group-dir>/merge_gate                    # the declared gate, `key value` lines
-    <group-dir>/verdicts/pr-<N>/<block-id>    # line 1 = pass|fail|escalate; then ts, agent, summary
+    <group-dir>/verdicts/pr-<N>/<block-id>    # line 1 = pass|fail|escalate
+                                              # line 2 = the head commit it reviewed
+                                              # then: ts, agent id, summary
 
-The verdict word is line 1, so the shim's whole read is `head -n1`. The durable
-record and the enforcement input are *one artifact*, so they cannot drift. Every
-token in `merge_gate` is already shell-inert: block ids and conditions are
-*rejected* — never rewritten — by the parser when they leave their alphabet
+The verdict word is line 1 and the reviewed head line 2 — that *is* the shim's read.
+The durable record and the enforcement input are **one artifact**, so they cannot
+drift. Every token in `merge_gate` is already shell-inert: block ids and conditions
+are *rejected* — never rewritten — by the parser when they leave their alphabet
 (`sanitize_id` / `sanitize_condition`), which is the contract the parse boundary
 established for precisely this consumer.
 
+Three fail-closed rules govern reading those files, and each exists because the
+alternative silently *weakens* a gate:
+
+- **One verdict-token definition.** `Verdict::parse` is lowercase-strict, because
+  the shim's `case "$v" in pass)` is a shell `case` and cannot be anything else. If
+  Rust lowercased, a hand-edited `PASS` would read as satisfied to the orchestrator
+  while the shim refused the merge — the two halves of one gate disagreeing about
+  what a verdict *is*. Both now fail closed on it.
+- **A truncated gate file refuses.** POSIX `read` returns non-zero at
+  EOF-without-newline, so a final line with no `\n` is dropped by the loop — and a
+  dropped `reviewer`/`also` line makes the gate *laxer*. `|| [ -n "$g_k" ]` is what
+  keeps that from happening; a line the shim cannot parse at all refuses outright.
+- **An unrepresentable token poisons the file** rather than vanishing from it. If a
+  block id ever failed its sanitizer, dropping it from `merge_gate` would emit a
+  gate one requirement short of what the repo declared. It writes an
+  `unrepresentable` line instead, which nothing parses and which therefore refuses.
+
 The decision itself is pure and unit-tested (`workflow::evaluate_merge_gate`); the
-shim mirrors it in shell, and a harness executes the *real* script against a fake
-`gh` — the same pure-spec-plus-shell-harness pattern the #83 gate uses.
+shim mirrors it in shell, and harnesses execute the *real* script against a fake
+`gh` for every claim made here — including that a merge is refused under
+`autonomous + auto_merge` and under supervised dangerous mode. A source-order
+assertion would not do: a substring search still passes if someone hoists a marker
+check above the gate block. The behaviour is what's pinned.
+
+### The bypass surface, honestly
+
+`doc/design/orchestration.md` → *Honest bypass surface* says of the human merge gate
+that the shim "constrains an agent that plays by the rules — it is not a sandbox",
+and lists calling the real `gh` by absolute path, a shell alias, or **forging a
+grant file** as the shapes it does not close. **Everything there applies to this
+gate too**, and the verdict store adds its own shapes. An agent with a shell can:
+
+- **Forge a verdict.** `printf 'pass\n<head-sha>\n' > $LOOMUX_GROUP_DIR/verdicts/pr-7/rev-tests`
+  satisfies the gate. The verdict dir is on disk under the agent's own uid, exactly
+  like `merge_grants/`. What loomux guarantees is that no *MCP surface* lets a
+  non-reviewer record one (enforced twice — dispatch and registry), not that the
+  filesystem forbids it.
+- **Delete the gate.** `rm $LOOMUX_GROUP_DIR/merge_gate` removes it for that group
+  until the next launch re-reads the workflow file.
+- **Unset the group dir.** `env -u LOOMUX_GROUP_DIR gh pr merge 7` used to skip the
+  workflow gate entirely — with nothing in the audit, since there is no audit log
+  without a group dir. **That one is now closed**: the shim refuses *any* merge with
+  no `LOOMUX_GROUP_DIR`, matching what the human gate already did on the default
+  branch. Every agent pane gets the variable and the shimmed PATH together, and a
+  human's own shell has neither, so an unset variable at the shim is evasion rather
+  than a supported flow. The remaining shapes above are the same class as
+  absolute-path `gh`: closing them needs sandboxing, which is out of scope.
+
+And the mitigation that closes the *human* gate does **not** close this one. A
+machine account with no merge permission on the default branch means no client-side
+evasion matters — the server refuses. But a machine account **cannot tell a forged
+verdict from a real one**: to GitHub, a merge by an agent whose reviewers all
+"passed" looks exactly like a merge by an agent that fabricated the files. This gate
+is a *process* guarantee about loomux's own state, not an authorization boundary at
+the forge. Branch protection with required reviews from real GitHub accounts is the
+authoritative version of this idea; the workflow gate is the local, always-on,
+zero-setup layer that catches the failure that actually happened (#151 — a
+cooperating orchestrator merging too early), and the two compose.
 
 ### The gate file tracks the repo, with one deliberate asymmetry
 
@@ -744,4 +845,10 @@ know why.
   it refuses every merge — which is the correct failure direction, and says so.
 - **Verdict visibility for the human.** Verdicts are agent-facing state today: the
   human sees them in the audit log and in the orchestrator's pane. A per-reviewer
-  verdict column on the board task (#197 Scope C's panel) is the natural next step.
+  verdict column on the board task (#197 Scope C's panel) is the natural next step —
+  including which verdicts have gone *stale*, which the orchestrator can already read
+  from `list_verdicts` but the human cannot see at a glance.
+- **The forge-side gate.** Branch protection with required reviews from real GitHub
+  accounts is the authoritative version of this idea, and the only one a forged
+  verdict file cannot touch (see *The bypass surface, honestly*). loomux could help
+  set it up; it can never substitute for it.

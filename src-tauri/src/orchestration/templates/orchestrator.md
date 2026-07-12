@@ -358,6 +358,13 @@ wins. **Nothing opens this gate but the verdicts**: not autonomous auto-merge, n
 supervised dangerous mode, not a one-time human grant. It applies to integration-branch
 merges too, because the reviewers reviewed *that PR*.
 
+**A verdict is bound to the commit it reviewed.** If a worker pushes anything to the PR
+branch after a reviewer passed — even a lint fix — that pass goes **stale**, the gate
+reopens, and the merge is refused until that reviewer reviews the new head and records
+again. So don't send a worker back to "just tidy one thing" on an approved PR and expect
+to merge it: send the reviewer back too. `list_verdicts(pr)` tells you which verdicts are
+stale.
+
 So when a gate is declared: spawn a reviewer for **every** block it names (`spawn_agent`
 with `block: "rev-security"`), and do not attempt a merge until `list_verdicts(pr)` shows
 the gate satisfied. If you see the refusal, that is the system working — read

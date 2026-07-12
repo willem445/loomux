@@ -2235,10 +2235,41 @@ fn gate(require: GateRequire, reviewers: &[&str], also: &[&str]) -> workflow::Ga
     }
 }
 
+/// The revision every verdict below reviewed, unless it says otherwise.
+const HEAD: &str = "a3f9c21";
+/// The PR moved: the worker pushed after the reviews came in.
+const NEW_HEAD: &str = "e1c4861";
+
+/// Verdict records keyed by block. `(block, verdict, head-it-reviewed)`.
 fn verdicts(
-    pairs: &[(&str, workflow::Verdict)],
-) -> std::collections::BTreeMap<String, workflow::Verdict> {
-    pairs.iter().map(|(b, v)| (b.to_string(), *v)).collect()
+    pairs: &[(&str, workflow::Verdict, &str)],
+) -> std::collections::BTreeMap<String, workflow::ReviewVerdict> {
+    pairs
+        .iter()
+        .map(|(b, v, head)| {
+            (
+                b.to_string(),
+                workflow::ReviewVerdict {
+                    pr: 7,
+                    block: b.to_string(),
+                    agent_id: "rev-1".into(),
+                    verdict: *v,
+                    head: head.to_string(),
+                    summary: "…".into(),
+                    ts_ms: 1,
+                },
+            )
+        })
+        .collect()
+}
+
+/// `evaluate_merge_gate` against the current head, which is `HEAD` unless a test
+/// is exercising a re-push.
+fn eval(
+    g: &workflow::Gate,
+    v: &std::collections::BTreeMap<String, workflow::ReviewVerdict>,
+) -> workflow::GateOutcome {
+    workflow::evaluate_merge_gate(g, v, Some(HEAD))
 }
 
 #[test]
@@ -2250,24 +2281,29 @@ fn all_pass_gate_refuses_while_one_named_verdict_is_outstanding() {
     use workflow::{GateOutcome, Verdict};
     let g = gate(GateRequire::AllPass, &["rev-security", "rev-tests"], &[]);
 
-    let one_in = workflow::evaluate_merge_gate(&g, &verdicts(&[("rev-security", Verdict::Pass)]));
+    let one_in = eval(&g, &verdicts(&[("rev-security", Verdict::Pass, HEAD)]));
     assert_eq!(
         one_in,
-        GateOutcome::Short { passes: 1, need: 2, outstanding: vec!["rev-tests".into()] },
+        GateOutcome::Short {
+            passes: 1,
+            need: 2,
+            outstanding: vec!["rev-tests".into()],
+            stale: vec![]
+        },
         "one reviewer's pass must NOT satisfy an all-pass gate while the other is still reviewing"
     );
     assert!(!one_in.satisfied());
 
     // Both in: satisfied — and only then.
-    assert!(workflow::evaluate_merge_gate(
+    assert!(eval(
         &g,
-        &verdicts(&[("rev-security", Verdict::Pass), ("rev-tests", Verdict::Pass)])
+        &verdicts(&[("rev-security", Verdict::Pass, HEAD), ("rev-tests", Verdict::Pass, HEAD)])
     )
     .satisfied());
 
     // Nobody in at all: shut, and it names who it is waiting for.
-    match workflow::evaluate_merge_gate(&g, &verdicts(&[])) {
-        GateOutcome::Short { passes: 0, need: 2, outstanding } => {
+    match eval(&g, &verdicts(&[])) {
+        GateOutcome::Short { passes: 0, need: 2, outstanding, .. } => {
             assert_eq!(outstanding, vec!["rev-security", "rev-tests"])
         }
         other => panic!("an empty verdict set must not satisfy a gate: {other:?}"),
@@ -2275,7 +2311,72 @@ fn all_pass_gate_refuses_while_one_named_verdict_is_outstanding() {
 
     // A verdict from a reviewer the gate does NOT name satisfies nothing — the gate
     // reads the *dispatched* reviewers, not the first approve that turns up (#197 A.2).
-    assert!(!workflow::evaluate_merge_gate(&g, &verdicts(&[("rev-perf", Verdict::Pass)])).satisfied());
+    assert!(!eval(&g, &verdicts(&[("rev-perf", Verdict::Pass, HEAD)])).satisfied());
+}
+
+#[test]
+fn a_pass_does_not_survive_a_re_push() {
+    // A verdict binds to a COMMIT, not to a PR number. Without that, the gate goes
+    // green over code nobody reviewed: both reviewers pass #7, the worker pushes
+    // "fixed lint" + "one more edge case", and the merge proceeds — satisfied to the
+    // letter of #197 and violated in its spirit. GitHub's own review model dismisses
+    // stale approvals for the same reason.
+    use workflow::{GateOutcome, Verdict};
+    let g = gate(GateRequire::AllPass, &["rev-security", "rev-tests"], &[]);
+    let both_passed = verdicts(&[
+        ("rev-security", Verdict::Pass, HEAD),
+        ("rev-tests", Verdict::Pass, HEAD),
+    ]);
+    assert!(eval(&g, &both_passed).satisfied(), "as reviewed, the gate is satisfied");
+
+    // The branch moves under them.
+    assert_eq!(
+        workflow::evaluate_merge_gate(&g, &both_passed, Some(NEW_HEAD)),
+        GateOutcome::Short {
+            passes: 0,
+            need: 2,
+            outstanding: vec![],
+            stale: vec!["rev-security".into(), "rev-tests".into()],
+        },
+        "a pass reviewed at an earlier head must count as stale, not as a pass"
+    );
+
+    // Re-reviewing the new head clears it — one reviewer at a time.
+    let refreshed = verdicts(&[
+        ("rev-security", Verdict::Pass, NEW_HEAD),
+        ("rev-tests", Verdict::Pass, HEAD),
+    ]);
+    match workflow::evaluate_merge_gate(&g, &refreshed, Some(NEW_HEAD)) {
+        GateOutcome::Short { passes: 1, stale, .. } => assert_eq!(stale, vec!["rev-tests"]),
+        other => panic!("one refreshed pass is not two: {other:?}"),
+    }
+
+    // A verdict loomux could not bind to a commit (empty head — gh unavailable at
+    // record time) is stale too: it can never equal a real head. Fail closed.
+    assert!(!eval(&g, &verdicts(&[
+        ("rev-security", Verdict::Pass, ""),
+        ("rev-tests", Verdict::Pass, ""),
+    ]))
+    .satisfied(), "an unbound verdict must not open a gate");
+
+    // And if the head itself can't be resolved, there is no way to know what any
+    // pass covers — refuse, rather than fall back to 'a pass is a pass'.
+    assert_eq!(
+        workflow::evaluate_merge_gate(&g, &both_passed, None),
+        GateOutcome::UnknownRevision
+    );
+
+    // A BLOCKING verdict is revision-independent: "this PR has a defect" doesn't
+    // stop being true because the author pushed more code. It still blocks.
+    let stale_fail = verdicts(&[
+        ("rev-security", Verdict::Pass, NEW_HEAD),
+        ("rev-tests", Verdict::Fail, HEAD),
+    ]);
+    assert_eq!(
+        workflow::evaluate_merge_gate(&g, &stale_fail, Some(NEW_HEAD)),
+        GateOutcome::Blocked { blocking: vec!["rev-tests".into()] },
+        "a fail against an older revision still refuses the merge until it is re-reviewed"
+    );
 }
 
 #[test]
@@ -2288,9 +2389,9 @@ fn a_blocking_verdict_beats_any_number_of_passes() {
         assert!(blocker.is_blocking(), "{blocker:?} must refuse a merge");
         // Even against a threshold the passes already meet.
         let g = gate(GateRequire::Threshold(2), &["a", "b", "c"], &[]);
-        let out = workflow::evaluate_merge_gate(
+        let out = eval(
             &g,
-            &verdicts(&[("a", Verdict::Pass), ("b", Verdict::Pass), ("c", blocker)]),
+            &verdicts(&[("a", Verdict::Pass, HEAD), ("b", Verdict::Pass, HEAD), ("c", blocker, HEAD)]),
         );
         assert_eq!(
             out,
@@ -2308,41 +2409,46 @@ fn threshold_gate_needs_n_passes_and_all_pass_needs_everyone() {
 
     // One pass is short, and the outcome names who is still to report.
     assert_eq!(
-        workflow::evaluate_merge_gate(&g, &verdicts(&[("a", Verdict::Pass)])),
-        GateOutcome::Short { passes: 1, need: 2, outstanding: vec!["b".into(), "c".into()] }
+        eval(&g, &verdicts(&[("a", Verdict::Pass, HEAD)])),
+        GateOutcome::Short {
+            passes: 1,
+            need: 2,
+            outstanding: vec!["b".into(), "c".into()],
+            stale: vec![]
+        }
     );
     // Two passes satisfy it: `threshold: 2` over three reviewers is the author
     // saying, in the file, that two are enough — it does not wait for the third.
     // (`all-pass`, the default, is the one that waits for everybody — above.)
-    assert!(workflow::evaluate_merge_gate(
-        &g,
-        &verdicts(&[("a", Verdict::Pass), ("b", Verdict::Pass)])
-    )
-    .satisfied());
+    assert!(eval(&g, &verdicts(&[("a", Verdict::Pass, HEAD), ("b", Verdict::Pass, HEAD)]))
+        .satisfied());
+    // …but they must be passes for the code that would actually merge.
+    assert!(!eval(&g, &verdicts(&[("a", Verdict::Pass, HEAD), ("b", Verdict::Pass, "0ldc0de")]))
+        .satisfied(), "a threshold cannot be met with a stale pass");
 
     // The same two verdicts against an all-pass gate over the same three: still shut.
     let strict = gate(GateRequire::AllPass, &["a", "b", "c"], &[]);
     assert_eq!(workflow::gate_need(&strict), 3);
-    assert!(!workflow::evaluate_merge_gate(
-        &strict,
-        &verdicts(&[("a", Verdict::Pass), ("b", Verdict::Pass)])
-    )
-    .satisfied());
+    assert!(!eval(&strict, &verdicts(&[("a", Verdict::Pass, HEAD), ("b", Verdict::Pass, HEAD)]))
+        .satisfied());
 }
 
 #[test]
 fn a_verdict_is_never_guessed_and_an_unreadable_one_is_not_a_pass() {
     use workflow::Verdict;
-    assert_eq!(Verdict::parse("PASS"), Some(Verdict::Pass), "case-insensitive");
-    assert_eq!(Verdict::parse(" escalate "), Some(Verdict::Escalate));
-    // Anything else is REJECTED, not coerced: a verdict loomux cannot read must
-    // never default to one that opens a gate.
-    for junk in ["approve", "lgtm", "yes", "true", "", "pass!", "ok"] {
+    assert_eq!(Verdict::parse("pass"), Some(Verdict::Pass));
+    assert_eq!(Verdict::parse(" escalate \n"), Some(Verdict::Escalate), "trailing newline is file format, not content");
+    // LOWERCASE-STRICT, and that is the whole point: the shim's `case "$v" in pass)`
+    // is a shell case and cannot be case-insensitive, so if THIS half lowercased, a
+    // hand-edited `PASS` would read as satisfied to the orchestrator while the shim
+    // refused the merge — the two halves of one gate disagreeing about what a verdict
+    // is. One token definition; both sides fail closed on anything else.
+    for junk in ["PASS", "Pass", "approve", "lgtm", "yes", "true", "", "pass!", "ok"] {
         assert_eq!(Verdict::parse(junk), None, "{junk:?} must not parse as a verdict");
     }
-    // So a verdict file whose first line isn't a verdict reads as *no verdict*,
-    // which an all-pass gate treats as outstanding — never as a pass.
-    assert!(workflow::parse_verdict_file(7, "rev-a", "approved!\n123\nrev-1\nlgtm\n").is_none());
+    // So a verdict file whose first line isn't exactly a verdict word reads as *no
+    // verdict*, which an all-pass gate treats as outstanding — never as a pass.
+    assert!(workflow::parse_verdict_file(7, "rev-a", "PASS\na3f9c21\n1\nrev-1\nlgtm\n").is_none());
     assert!(workflow::parse_verdict_file(7, "rev-a", "").is_none());
 }
 
@@ -2356,16 +2462,26 @@ fn verdict_file_round_trips_with_its_attribution() {
         block: "rev-security".into(),
         agent_id: "rev-4".into(),
         verdict: workflow::Verdict::Fail,
+        head: "a3f9c21".into(),
         summary: "release-gate bypass:\n  gh api can create a v* tag ref".into(),
         ts_ms: 1_720_000_000_000,
     };
     let text = workflow::verdict_file_text(&rec);
     assert!(
-        text.starts_with("fail\n"),
-        "the verdict word is line 1 — the shim's whole read is `head -n1`"
+        text.starts_with("fail\na3f9c21\n"),
+        "the verdict word is line 1 and the reviewed head line 2 — that IS the shim's read"
     );
     let back = workflow::parse_verdict_file(151, "rev-security", &text).unwrap();
     assert_eq!(back, rec, "the record must survive the round trip, multi-line summary and all");
+
+    // A head that isn't a commit id is stored EMPTY, and an empty head never equals
+    // a real one — so it reads as stale rather than as "unbound, therefore fine".
+    assert_eq!(workflow::sanitize_sha("not a sha; rm -rf /"), "");
+    assert_eq!(workflow::sanitize_sha("  A3F9C21\n"), "a3f9c21", "normalized, so the shim's `case` compare agrees");
+    assert!(!rec.reviewed(""), "an empty current head matches nothing");
+    assert!(!workflow::ReviewVerdict { head: String::new(), ..rec.clone() }.reviewed("a3f9c21"),
+        "an unbound verdict has reviewed no revision");
+    assert!(rec.reviewed("a3f9c21"));
 
     // A control character in a summary would ride straight into a pane; newlines and
     // tabs are prose and survive.
@@ -2401,14 +2517,31 @@ fn the_gate_file_the_shim_reads_round_trips_and_carries_only_clean_tokens() {
     assert!(workflow::gate_file_text(&t).contains("require threshold 2\n"));
     assert_eq!(workflow::parse_gate_file(&workflow::gate_file_text(&t)), Some(t));
 
-    // A gate file naming nobody is not a gate — read as one it would refuse every
-    // merge in the group forever. A malformed threshold falls back to the STRICTER
-    // all-pass, never to a number that lets something through.
+    // A gate file naming nobody is not a usable gate; a malformed threshold falls
+    // back to the STRICTER all-pass, never to a number that lets something through.
     assert!(workflow::parse_gate_file("# empty\nrequire all-pass\n").is_none());
     assert_eq!(
         workflow::parse_gate_file("require threshold 0\nreviewer a\n").unwrap().require,
         GateRequire::AllPass
     );
+
+    // A token that cannot be serialized safely POISONS the file — it is not silently
+    // dropped. Dropping it would emit a *weaker* gate than the repo declared (a
+    // reviewer just disappears, and the gate goes green one requirement short), and
+    // every other fork in this feature chooses fail-closed on exactly that question.
+    // Unreachable while the parse contract holds; this is what happens if it stops.
+    let bad = gate(GateRequire::AllPass, &["rev ok", "rev-fine"], &["ci green"]);
+    let poisoned = workflow::gate_file_text(&bad);
+    assert!(poisoned.contains(workflow::POISON_KEY), "an unrepresentable token poisons the file");
+    assert!(poisoned.contains("reviewer rev-fine"), "the representable ones still land");
+    assert!(
+        workflow::parse_gate_file(&poisoned).is_none(),
+        "and neither half of the gate will read a poisoned file as a usable gate"
+    );
+    // Any line loomux cannot parse — poison, truncation, hand edit — makes the file
+    // unusable rather than partially enforced. (The shim refuses on the same shape;
+    // `gh_shim_harness_refuses_a_malformed_or_truncated_gate_file` executes it.)
+    assert!(workflow::parse_gate_file("require all-pass\nreviewer a\nsomething else\n").is_none());
 }
 
 #[test]

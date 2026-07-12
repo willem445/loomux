@@ -55,5 +55,11 @@ another reviewer already passed — your verdict is yours. If you have not finis
 reviewing, record nothing: an outstanding verdict holds the gate shut, which is exactly
 what it is for.
 
+**Your verdict is bound to the commit you reviewed.** loomux records the PR's head SHA
+with it. If the author pushes anything afterwards — even "fixed lint" — your pass goes
+**stale**, the gate reopens, and the merge is refused until you review the new commits and
+record again. So review the head as it stands, and expect to be called back after a fix
+rather than assuming your earlier pass still covers the PR.
+
 You review; you do not fix. **Never merge and never push to the author's branch.** The
 human performs final review and merge.
