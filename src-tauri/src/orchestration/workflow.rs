@@ -825,6 +825,29 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
     })
 }
 
+/// Whether the repo declares a workflow at all, asked without parsing it.
+///
+/// Used where the *existence* of the file is the whole question: `create_group`
+/// audits that it deliberately ignored one (the advanced-orchestrator toggle is
+/// off, #222), and the launcher's preview distinguishes "this repo has no
+/// workflow" from "it has one and it is broken".
+pub fn workflow_file_exists(repo: &str) -> bool {
+    Path::new(repo).join(WORKFLOW_PATH).is_file()
+}
+
+/// Whether a roster carries anything a workflow file put there — a block outside
+/// the built-in four, or a built-in one given a persona.
+///
+/// False for the synthesized default roster, and that is the point: it is the
+/// single condition guarding every piece of workflow-aware text loomux emits (the
+/// orchestrator's roster note, the workflow section of its instructions, a
+/// delegate's block note). A group with no workflow reads exactly as it did
+/// before blocks existed because this returns false and all of it collapses to
+/// the empty string.
+pub fn roster_is_custom(blocks: &[Block]) -> bool {
+    blocks.iter().any(|b| !b.is_builtin() || b.has_persona())
+}
+
 /// Read + validate `<repo>/.loomux/workflow.yml`.
 ///
 /// - `Ok(None)` — no file (the common case): the caller synthesizes

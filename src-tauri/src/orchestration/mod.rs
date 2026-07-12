@@ -30,10 +30,29 @@ use tauri::{AppHandle, Emitter, Manager};
 
 use crate::obs::LockExt;
 
-const ORCHESTRATOR_TPL: &str = include_str!("templates/orchestrator.md");
-const WORKER_TPL: &str = include_str!("templates/worker.md");
-const REVIEWER_TPL: &str = include_str!("templates/reviewer.md");
-const PLANNER_TPL: &str = include_str!("templates/planner.md");
+// doc-hidden `pub` so the integration tests can reconstruct the pre-#222
+// rendering of a template and assert loomux still writes exactly that when no
+// workflow is active (`the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was`).
+#[doc(hidden)]
+pub const ORCHESTRATOR_TPL: &str = include_str!("templates/orchestrator.md");
+#[doc(hidden)]
+pub const WORKER_TPL: &str = include_str!("templates/worker.md");
+#[doc(hidden)]
+pub const REVIEWER_TPL: &str = include_str!("templates/reviewer.md");
+#[doc(hidden)]
+pub const PLANNER_TPL: &str = include_str!("templates/planner.md");
+/// Workflow-aware fragments (#222), substituted into the role templates above as
+/// `{{WORKFLOW}}` (orchestrator) and `{{BLOCK_NOTE}}` (worker/reviewer/planner).
+///
+/// They are *fragments*, not templates, for one reason: `render_template` is a
+/// dumb `{{KEY}}` replace with no conditionals, and it should stay that way. So
+/// the conditional lives in Rust (`workflow::roster_is_custom`) and the prose
+/// lives in markdown, where the rest of the prose lives and where it can be read
+/// and reviewed as prose. **Both placeholders resolve to the empty string for the
+/// default roster**, and both sit line-final in their templates, so a group with
+/// no workflow gets instruction files that are byte-for-byte the pre-#222 ones.
+const WORKFLOW_TPL: &str = include_str!("templates/workflow.md");
+const BLOCK_TPL: &str = include_str!("templates/block.md");
 
 /// Read-only containment note handed to a planner at spawn time as its kickoff
 /// "branch note". The worktree denial (spawn cwd logic) and the CLI-level
@@ -1112,6 +1131,22 @@ pub struct Guardrails {
     /// Empty is legal only transiently: `clamped()` fills it with the built-in
     /// roster, so no code downstream has to handle an agent-less group.
     pub blocks: Vec<workflow::Block>,
+    /// **The advanced-orchestrator toggle (#222).** Off — the default, and what
+    /// every group.json written before this field existed means — is today's
+    /// experience byte for byte: `<repo>/.loomux/workflow.yml` is not read, not
+    /// validated and not obeyed, and `blocks` stays the roster the launcher's
+    /// per-role picks synthesized. On, the repo's workflow file is loaded in
+    /// `create_group` and *its* blocks become the roster.
+    ///
+    /// The toggle exists because a workflow file is repo-authored input that
+    /// arrives with a `git clone`. Letting one take effect merely by being
+    /// present would mean cloning a repo could change which agents a human's
+    /// group runs, with which personas, before they had ever seen the file — so
+    /// the human opts in per launch, having been shown the roster it resolves to.
+    ///
+    /// A *launch* choice, not a live one: it is persisted with the group so a
+    /// resumed orchestration comes back with the roster it was launched with.
+    pub advanced_orchestrator: bool,
     /// Additionally pre-approve `git`/`gh` shell commands for the group's
     /// agents. Never maps to `--dangerously-skip-permissions`: bypass mode
     /// shows a confirm dialog whose default answer is "exit", which the
@@ -4266,6 +4301,12 @@ impl OrchRegistry {
                 // whole migration: a pre-#222 group rejoins with exactly the CLIs
                 // and models it was launched with.
                 blocks: read_blocks(g),
+                // The advanced-orchestrator toggle (#222). Absent → false: a
+                // group launched before the toggle existed ran the built-in
+                // roster, so that is what it rejoins as. This is also what makes
+                // the toggle durable — a resumed orchestration (session browser)
+                // rebuilds its guardrails from here, not from a launcher form.
+                advanced_orchestrator: g["advanced_orchestrator"].as_bool().unwrap_or(false),
                 auto_ops: g["auto_ops"].as_bool().unwrap_or(true),
                 idle_kill_minutes: g["idle_kill_minutes"].as_u64().unwrap_or(0) as u32,
                 max_spawns_per_hour: g["max_spawns_per_hour"].as_u64().unwrap_or(0) as u32,
@@ -4301,37 +4342,54 @@ impl OrchRegistry {
         fs::create_dir_all(dir.join("configs")).map_err(|e| e.to_string())?;
         let resumed = dir.join("group.json").is_file();
 
-        // The repo's declared roster (#222). Three outcomes, and only the first
-        // changes anything:
-        //   - a valid `.loomux/workflow.yml` → its blocks ARE the roster;
-        //   - no file (the common case) → the launcher's 4-block roster stands,
-        //     and the group is byte-for-byte what it was before blocks existed;
-        //   - a broken file → AUDITED AND SKIPPED. A repo file must never be
-        //     able to stop a group from launching, so a validation failure falls
-        //     back to the default roster rather than erroring out. Every problem
-        //     is recorded, not just the first, so one look at the audit log fixes
-        //     the file in one pass.
-        match workflow::load_workflow(repo) {
-            Ok(Some(wf)) => {
-                self.audit(&id, "loomux", "workflow-loaded", json!({
-                    "path": workflow::WORKFLOW_PATH,
-                    "name": wf.name,
-                    "blocks": wf.blocks.iter().map(|b| json!({ "id": b.id, "kind": b.kind })).collect::<Vec<_>>(),
-                    "gates": wf.gates.keys().collect::<Vec<_>>(),
-                }));
-                guardrails.blocks = wf.blocks;
-                // Re-run the roster normalization (model defaults follow each
-                // block's *effective* CLI, which the file may have changed).
-                guardrails = guardrails.clamped();
+        // The repo's declared roster (#222), read ONLY when the human turned the
+        // advanced orchestrator on for this launch. With the toggle off — the
+        // default — the file is not even opened: this is the whole promise that
+        // the default experience is byte-for-byte what it was before #222, and
+        // the cheapest way to keep that promise is to not have a code path.
+        if guardrails.advanced_orchestrator {
+            // Three outcomes, and only the first changes anything:
+            //   - a valid `.loomux/workflow.yml` → its blocks ARE the roster;
+            //   - no file → the launcher's 4-block roster stands (turning the
+            //     toggle on in a repo that declares nothing is a no-op, not an
+            //     error — it is how you launch before you write the file);
+            //   - a broken file → AUDITED AND SKIPPED. A repo file must never be
+            //     able to stop a group from launching, so a validation failure
+            //     falls back to the default roster rather than erroring out.
+            //     Every problem is recorded, not just the first, so one look at
+            //     the audit log fixes the file in one pass. The launcher shows
+            //     the human the same findings *before* they hit Create.
+            match workflow::load_workflow(repo) {
+                Ok(Some(wf)) => {
+                    self.audit(&id, "loomux", "workflow-loaded", json!({
+                        "path": workflow::WORKFLOW_PATH,
+                        "name": wf.name,
+                        "blocks": wf.blocks.iter().map(|b| json!({ "id": b.id, "kind": b.kind })).collect::<Vec<_>>(),
+                        "gates": wf.gates.keys().collect::<Vec<_>>(),
+                    }));
+                    guardrails.blocks = wf.blocks;
+                    // Re-run the roster normalization (model defaults follow each
+                    // block's *effective* CLI, which the file may have changed).
+                    guardrails = guardrails.clamped();
+                }
+                Ok(None) => {}
+                Err(errors) => {
+                    self.audit(&id, "loomux", "workflow-invalid", json!({
+                        "path": workflow::WORKFLOW_PATH,
+                        "errors": errors,
+                        "action": "skipped — using the built-in roster",
+                    }));
+                }
             }
-            Ok(None) => {}
-            Err(errors) => {
-                self.audit(&id, "loomux", "workflow-invalid", json!({
-                    "path": workflow::WORKFLOW_PATH,
-                    "errors": errors,
-                    "action": "skipped — using the built-in roster",
-                }));
-            }
+        } else if workflow::workflow_file_exists(repo) {
+            // The repo declares a workflow and this group is deliberately not
+            // running it. Say so in the trail: "my workflow file did nothing" is
+            // otherwise a silent, and very confusing, non-event.
+            self.audit(&id, "loomux", "workflow-ignored", json!({
+                "path": workflow::WORKFLOW_PATH,
+                "reason": "the advanced orchestrator is off for this group",
+                "action": "using the built-in roster",
+            }));
         }
         // The live-agent cap is adjustable mid-session (`set_max_agents`) and
         // persisted, so it's a durable human choice — like the pause/notify
@@ -4380,6 +4438,10 @@ impl OrchRegistry {
                 // reader still understands the old shape (`read_blocks`), so a
                 // group.json from 0.8.0 keeps loading; nothing writes it again.
                 "blocks": blocks_json(&info.guardrails.blocks),
+                // #222: whether this group runs the repo's workflow file. Absent
+                // from an older group.json → false on read, which is exactly what
+                // that group was: a built-in roster.
+                "advanced_orchestrator": info.guardrails.advanced_orchestrator,
                 "auto_ops": info.guardrails.auto_ops,
                 "idle_kill_minutes": info.guardrails.idle_kill_minutes,
                 "max_spawns_per_hour": info.guardrails.max_spawns_per_hour,
@@ -6371,6 +6433,12 @@ impl OrchRegistry {
                 earliest = Some(earliest.map_or(a.started_ms, |e| e.min(a.started_ms)));
                 json!({
                     "id": a.id, "name": a.name, "role": a.role,
+                    // The block this agent IS (#222). Equal to the role for the
+                    // built-in roster, so the group panel shows nothing new for a
+                    // default group — and shows `rev-security` rather than a
+                    // second anonymous "REV" chip for a workflow group, which is
+                    // the whole point of declaring the reviewers separately.
+                    "block": a.block,
                     "task": a.task, "idle_since_ms": a.idle_since_ms,
                     "uptime_ms": now.saturating_sub(a.started_ms),
                 })
@@ -6489,6 +6557,149 @@ impl OrchRegistry {
         }))
     }
 
+    /// The orchestrator's **This repo declares a workflow** section, or `""` for
+    /// the default roster (#222).
+    ///
+    /// It tells the orchestrator the three things the file actually changes about
+    /// its job — spawn by block id rather than by kind, run *every* declared
+    /// reviewer on each PR rather than one, and treat a declared gate as a hard
+    /// precondition — and the one thing it does not: the edges are advisory, and
+    /// the scheduling judgment stays the orchestrator's. See doc/design/workflows.md
+    /// ("Why edges are advisory") for why that asymmetry is the whole design.
+    ///
+    /// `{{MAX_AGENTS}}` is rendered here rather than left to the caller: the
+    /// caller substitutes this text *into* the orchestrator template, and by then
+    /// its own `MAX_AGENTS` pass has already gone by.
+    fn workflow_section(&self, g: &GroupInfo) -> String {
+        if !workflow::roster_is_custom(&g.guardrails.blocks) {
+            return String::new();
+        }
+        let cli = &g.guardrails.agent_cli;
+        let rows: Vec<String> = g
+            .guardrails
+            .blocks
+            .iter()
+            .filter(|b| b.kind != Role::Orchestrator)
+            .map(|b| {
+                format!(
+                    "- **`{id}`** — {name} · {kind} · {cli} · model `{model}`{persona}",
+                    id = b.id,
+                    name = b.name,
+                    kind = b.kind.as_str(),
+                    cli = workflow::cli_of(b, cli),
+                    model = workflow::model_of(b, cli),
+                    persona = if b.has_persona() { " · has a persona" } else { "" },
+                )
+            })
+            .collect();
+        let reviewers: Vec<String> = g
+            .guardrails
+            .blocks
+            .iter()
+            .filter(|b| b.kind == Role::Reviewer)
+            .map(|b| format!("`{}`", b.id))
+            .collect();
+        // Leading blank line, and the fragment's own trailing one trimmed: the
+        // placeholder sits at the END of the preceding sentence in the template
+        // (never on a line of its own), which is exactly what lets the empty case
+        // above leave the file untouched to the byte.
+        format!(
+            "\n\n{}",
+            render_template(
+            WORKFLOW_TPL,
+            &[
+                ("WORKFLOW_PATH", workflow::WORKFLOW_PATH),
+                ("MAX_AGENTS", &g.guardrails.max_agents.to_string()),
+                // A roster can legally declare no reviewer at all (a build-only
+                // workflow). Say that, rather than emitting an empty list and
+                // leaving the sentence dangling.
+                (
+                    "REVIEWERS",
+                    &if reviewers.is_empty() {
+                        "— this workflow declares no reviewer block, so there is nobody to fan out to; \
+                         tell the human if a PR looks like it needs review"
+                            .to_string()
+                    } else {
+                        reviewers.join(", ")
+                    },
+                ),
+                ("BLOCKS", &rows.join("\n")),
+            ],
+            )
+            .trim_end()
+        )
+    }
+
+    /// A delegate's **Your block** section, or `""` when the workflow file did not
+    /// touch this block (#222) — which is every block of the default roster, and
+    /// is why a no-workflow group's `worker.md` is the pre-#222 file to the byte.
+    ///
+    /// Emitted per block, not per group: a plain built-in `worker` block sitting
+    /// in a roster whose *reviewers* are custom has had nothing about its own
+    /// identity changed, and telling it otherwise is noise in a file agents are
+    /// expected to actually read. The one exception is a reviewer with siblings —
+    /// being one of several focused reviewers *is* a change to how it should
+    /// review, so it gets the lane note even with no persona of its own.
+    ///
+    /// Not reached for a `replace`-mode persona: that block's file is the
+    /// non-overridable mechanics core, which makes every point below in its own
+    /// voice, and "everything else in this document still holds" would be
+    /// pointing at a document that isn't there.
+    fn block_note(&self, g: &GroupInfo, b: &workflow::Block) -> String {
+        let reviewers: Vec<&str> = g
+            .guardrails
+            .blocks
+            .iter()
+            .filter(|x| x.kind == Role::Reviewer)
+            .map(|x| x.id.as_str())
+            .collect();
+        let multi_reviewer = b.kind == Role::Reviewer && reviewers.len() > 1;
+        if b.is_builtin() && !b.has_persona() && !multi_reviewer {
+            return String::new();
+        }
+        let persona_note = if b.has_persona() {
+            " Your **persona** comes from that file too: it reached you through your CLI's own \
+             custom-agent flag, or — on a CLI that has no inline one — as an addendum in your \
+             kickoff prompt. Adopt it."
+        } else {
+            ""
+        };
+        let lane_note = if multi_reviewer {
+            let others: Vec<String> = reviewers
+                .iter()
+                .filter(|id| **id != b.id)
+                .map(|id| format!("`{id}`"))
+                .collect();
+            format!(
+                "\n\nYou are **one of {n} reviewer blocks** on each PR — the others are {others}. \
+                 Review **only your lane**. The split is deliberate: another block is covering what \
+                 you skip, and duplicating its work costs the human money and buries your own \
+                 findings. A serious defect plainly outside your lane is worth one line, not a \
+                 second review. Say in your report which lane you reviewed and give a clear \
+                 verdict — a merge gate may be waiting on it.",
+                n = reviewers.len(),
+                others = others.join(", "),
+            )
+        } else {
+            String::new()
+        };
+        format!(
+            "\n\n{}",
+            render_template(
+                BLOCK_TPL,
+                &[
+                    ("WORKFLOW_PATH", workflow::WORKFLOW_PATH),
+                    ("BLOCK_ID", &b.id),
+                    ("BLOCK_NAME", &b.name),
+                    ("BLOCK_KIND", b.kind.as_str()),
+                    ("PERSONA_NOTE", persona_note),
+                    ("LANE_NOTE", &lane_note),
+                ],
+            )
+            .trim_end()
+        )
+    }
+
     /// Render every block's role-instruction doc into the group dir so kickoff
     /// prompts can reference them by path instead of pasting pages of text.
     ///
@@ -6499,6 +6710,13 @@ impl OrchRegistry {
     /// measured against and what a rejoined legacy session may still reference.
     fn write_instruction_files(&self, g: &GroupInfo) -> Result<(), String> {
         let max = g.guardrails.max_agents.to_string();
+        // The orchestrator's workflow section (#222) — EMPTY for the default
+        // roster, which is what keeps every no-workflow group's instruction files
+        // byte-for-byte what they were. `BLOCK_NOTE` is per-block, so the base
+        // vars carry the empty default and `write_block_instructions` overrides
+        // it; without the default here, a class-fallback file written by the loop
+        // below would keep a literal `{{BLOCK_NOTE}}` in its text.
+        let workflow_section = self.workflow_section(g);
         let vars: Vec<(&str, &str)> = vec![
             ("REPO", g.repo.as_str()),
             ("GROUP_ID", g.id.as_str()),
@@ -6506,6 +6724,8 @@ impl OrchRegistry {
             ("WORKER_MODEL", g.guardrails.model_for(Role::Worker)),
             ("REVIEWER_MODEL", g.guardrails.model_for(Role::Reviewer)),
             ("PLANNER_MODEL", g.guardrails.model_for(Role::Planner)),
+            ("WORKFLOW", workflow_section.as_str()),
+            ("BLOCK_NOTE", ""),
         ];
         let dir = self.group_dir(&g.id);
         for role in [Role::Orchestrator, Role::Worker, Role::Reviewer, Role::Planner] {
@@ -6586,7 +6806,17 @@ impl OrchRegistry {
                 mechanics_core(b.kind),
             )
         } else {
-            render_template(b.kind.template(), vars)
+            // This block's own `## Your block` section (#222) — empty for a block
+            // the workflow file didn't touch, which is every block of the default
+            // roster. It is appended LAST: `render_template` walks the list in
+            // order, so nothing after it can rescan the note's text, and the note
+            // is the one place a repo-authored string (a block's `name`) reaches a
+            // template. A `{{MAX_AGENTS}}` in a block name stays inert text.
+            let note = self.block_note(g, b);
+            let mut vars: Vec<(&str, &str)> =
+                vars.iter().filter(|(k, _)| *k != "BLOCK_NOTE").copied().collect();
+            vars.push(("BLOCK_NOTE", note.as_str()));
+            render_template(b.kind.template(), &vars)
         };
         fs::write(self.group_dir(&g.id).join(b.instructions_file()), body)
             .map_err(|e| e.to_string())
@@ -7851,12 +8081,7 @@ impl OrchRegistry {
     /// that makes it good, and a static graph would replace it with something
     /// dumber. See doc/design/workflows.md.
     fn roster_note(&self, g: &GroupInfo) -> String {
-        let custom = g
-            .guardrails
-            .blocks
-            .iter()
-            .any(|b| !b.is_builtin() || b.has_persona());
-        if !custom {
+        if !workflow::roster_is_custom(&g.guardrails.blocks) {
             return String::new();
         }
         let rows: Vec<String> = g
@@ -8726,12 +8951,17 @@ pub fn create_orchestration(
     idle_kill_minutes: u32,
     max_spawns_per_hour: u32,
     watchdog_stall_minutes: u32,
+    // The advanced-orchestrator toggle (#222). Off = this group never opens the
+    // repo's `.loomux/workflow.yml` and runs the roster below, exactly as loomux
+    // did before workflows existed.
+    advanced_orchestrator: bool,
 ) -> Result<SpawnRequest, String> {
     // The launcher still collects one CLI + model per role — that IS the
     // built-in 4-block roster (#222), just spelled as flat form fields. Convert
     // it here, at the boundary, so the launcher's wire shape is untouched and
     // the backend has blocks from this point on. A repo that declares
-    // `.loomux/workflow.yml` overrides this roster in `create_group`.
+    // `.loomux/workflow.yml` overrides this roster in `create_group` — but only
+    // when `advanced_orchestrator` is on.
     let blocks = workflow::default_roster(&[
         (Role::Orchestrator, &orchestrator_cli, &orchestrator_model),
         (Role::Worker, &worker_cli, &worker_model),
@@ -8745,6 +8975,7 @@ pub fn create_orchestration(
             max_agents,
             agent_cli,
             blocks,
+            advanced_orchestrator,
             auto_ops,
             idle_kill_minutes,
             max_spawns_per_hour,
@@ -8763,6 +8994,66 @@ pub fn create_orchestration(
         None,
         initial_workers,
     )
+}
+
+/// What turning the **advanced orchestrator** on for `repo` would actually run
+/// (#222) — asked by the launcher *before* the human hits Create, so they see the
+/// roster they are enabling rather than discovering it in four spawned panes.
+///
+/// This is deliberately not a second implementation of the schema. It runs the
+/// same `load_workflow` + `Guardrails::clamped` that `create_group` runs, on a
+/// throwaway `Guardrails`, and reports the resolved blocks — so a preview that
+/// disagrees with the launch is a bug in one shared path, not a drift between two.
+/// (The workflow *pane* validates the file too, in TypeScript, but that pane is an
+/// editor giving live feedback on text; this is the launcher asking the engine.)
+///
+/// `agent_cli` is the group's default CLI, because a block may inherit from it —
+/// the same picker feeds this and the launch.
+///
+/// Never fails: a broken file is `{ valid: false, errors: [...] }` and the group
+/// would fall back to the built-in roster, which is precisely what the launcher
+/// needs to say. Nothing here is persisted and no group is created.
+#[tauri::command]
+pub fn orch_workflow_preview(repo: String, agent_cli: String) -> Value {
+    let present = workflow::workflow_file_exists(&repo);
+    let (name, blocks, gates, errors) = match workflow::load_workflow(&repo) {
+        Ok(Some(wf)) => {
+            let gates: Vec<String> = wf.gates.keys().cloned().collect();
+            (wf.name, wf.blocks, gates, Vec::new())
+        }
+        Ok(None) => (String::new(), Vec::new(), Vec::new(), Vec::new()),
+        Err(errors) => (String::new(), Vec::new(), Vec::new(), errors),
+    };
+    // Resolve exactly as a launch would: `clamped()` is what fills in an
+    // inherited CLI's default model, guarantees the orchestrator block, and drops
+    // a row a hand-edit could have made unreachable. Without it the preview would
+    // show `model: ""` for every block that inherits — i.e. most of them.
+    let resolved = if blocks.is_empty() {
+        Vec::new()
+    } else {
+        Guardrails { agent_cli: agent_cli.clone(), blocks, ..Guardrails::default() }
+            .clamped()
+            .blocks
+    };
+    let agent_cli = if SUPPORTED_CLIS.contains(&agent_cli.as_str()) { agent_cli } else { "claude".into() };
+    json!({
+        "path": workflow::WORKFLOW_PATH,
+        "present": present,
+        "valid": errors.is_empty(),
+        "name": name,
+        "errors": errors,
+        "gates": gates,
+        "blocks": resolved.iter().map(|b| json!({
+            "id": b.id,
+            "name": b.name,
+            "kind": b.kind.as_str(),
+            "cli": workflow::cli_of(b, &agent_cli),
+            "model": workflow::model_of(b, &agent_cli),
+            // What the human is really being asked to consent to: whether this
+            // block carries repo-authored instructions for the agent.
+            "persona": if b.profile.is_some() { "profile" } else if b.prompt.is_some() { "prompt" } else { "none" },
+        })).collect::<Vec<_>>(),
+    })
 }
 
 /// Pause a group: loomux stops delivering prompts/kickoffs so its agents

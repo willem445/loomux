@@ -33,11 +33,17 @@ fn test_registry() -> (OrchRegistry, tempfile::TempDir) {
     (reg, dir)
 }
 
+/// Guardrails for a group that RUNS the repo's workflow file — i.e. the human
+/// turned the advanced orchestrator on (#222). Every test below that is about the
+/// schema, personas or the block model wants this; the toggle-off behavior (the
+/// default, and the one the whole feature promises leaves loomux unchanged) has
+/// its own tests in the *advanced-orchestrator toggle* section at the bottom.
 fn rails() -> Guardrails {
     Guardrails {
         max_agents: 6,
         agent_cli: "claude".into(),
         auto_ops: false,
+        advanced_orchestrator: true,
         ..Guardrails::default()
     }
 }
@@ -1592,4 +1598,342 @@ fn discovery_reads_github_agents_and_only_that_directory_feeds_copilots_native_f
     assert!(profiles::is_copilot_native(".github\\agents\\worker.md"), "windows separators too");
     assert!(!profiles::is_copilot_native(".loomux/personas/worker.md"));
     assert!(!profiles::is_copilot_native("docs/worker.md"));
+}
+
+// ───────────────── the advanced-orchestrator toggle (sub-PR 4) ──────────────
+//
+// The feature's compatibility promise, restated as a switch: a workflow file
+// takes effect only when the human turned the advanced orchestrator ON for that
+// launch. Off — the default, and what every pre-#222 group.json means — the file
+// is not read, not validated, and not obeyed.
+
+/// Guardrails with the toggle OFF: the default experience, and the thing most of
+/// this section defends. Identical to `rails()` in every other respect, so a
+/// difference between the two is a difference the TOGGLE made.
+fn plain_rails() -> Guardrails {
+    Guardrails { advanced_orchestrator: false, ..rails() }
+}
+
+/// The six variables `render_template` had before this sub-PR, for a given group.
+fn legacy_vars(g: &loomux_lib::orchestration::GroupInfo) -> Vec<(String, String)> {
+    vec![
+        ("REPO".into(), g.repo.clone()),
+        ("GROUP_ID".into(), g.id.clone()),
+        ("MAX_AGENTS".into(), g.guardrails.max_agents.to_string()),
+        ("WORKER_MODEL".into(), g.guardrails.model_for(Role::Worker).to_string()),
+        ("REVIEWER_MODEL".into(), g.guardrails.model_for(Role::Reviewer).to_string()),
+        ("PLANNER_MODEL".into(), g.guardrails.model_for(Role::Planner).to_string()),
+    ]
+}
+
+/// Render a role template the way loomux did BEFORE the workflow placeholders
+/// existed: the six variables, and the two new placeholders simply not there.
+fn render_as_pre_222(tpl: &str, g: &loomux_lib::orchestration::GroupInfo) -> String {
+    let mut out = tpl.replace("{{WORKFLOW}}", "").replace("{{BLOCK_NOTE}}", "");
+    for (k, v) in legacy_vars(g) {
+        out = out.replace(&format!("{{{{{k}}}}}"), &v);
+    }
+    out
+}
+
+fn instructions(reg: &OrchRegistry, group: &str, file: &str) -> String {
+    fs::read_to_string(reg.state_root().join(group).join(file))
+        .unwrap_or_else(|e| panic!("{file} must exist: {e}"))
+}
+
+/// The same file with line endings normalized to `\n`.
+///
+/// The templates are `include_str!`ed from the working tree, which has no
+/// `.gitattributes` — so they arrive CRLF on Windows and LF everywhere else. An
+/// assertion about the *shape* of the rendered markdown (a heading needs a blank
+/// line before it) must not accidentally also be an assertion about the platform's
+/// line endings, or it passes in CI and fails on the machine that wrote it.
+///
+/// The byte-for-byte test deliberately does NOT use this: both sides of that
+/// comparison come from the same `include_str!`, so it is exact either way.
+fn instructions_lf(reg: &OrchRegistry, group: &str, file: &str) -> String {
+    instructions(reg, group, file).replace("\r\n", "\n")
+}
+
+fn audit_actions(reg: &OrchRegistry, group: &str) -> Vec<String> {
+    fs::read_to_string(reg.state_root().join(group).join("audit.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter_map(|v| v["action"].as_str().map(str::to_string))
+        .collect()
+}
+
+#[test]
+fn the_toggle_off_ignores_a_declared_workflow_entirely() {
+    // The repo declares four custom blocks with personas and a gate. The human
+    // did not opt in. Nothing about the group may reflect any of it.
+    let (reg, _d) = test_registry();
+    let repo = Repo::new()
+        .workflow(FOCUSED_REVIEW)
+        .agent_file("worker.md", "---\ndescription: repo worker\n---\nBranch first, always.");
+    let g = reg.create_group(&repo.path(), plain_rails()).unwrap();
+
+    assert_eq!(g.guardrails.blocks.len(), 4, "the built-in roster, not the file's");
+    for b in &g.guardrails.blocks {
+        assert!(b.is_builtin(), "block {:?} came from the file", b.id);
+        assert!(!b.has_persona(), "block {:?} took a persona from the file", b.id);
+    }
+    assert!(
+        g.guardrails.block("rev-security").is_none(),
+        "a block the file declared must not exist in an opted-out group"
+    );
+
+    // The delegates are never told about a workflow the group isn't running...
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let k = reg.kickoff_prompt(&w, &g, "note", None);
+    assert!(!k.contains("workflow.yml"), "the kickoff must not mention the ignored file: {k}");
+
+    // ...but the human is: a file that silently did nothing is exactly the
+    // confusing non-event this audit line exists to prevent.
+    let actions = audit_actions(&reg, &g.id);
+    assert!(
+        actions.iter().any(|a| a == "workflow-ignored"),
+        "ignoring a declared workflow must be audited, got {actions:?}"
+    );
+    assert!(
+        !actions.iter().any(|a| a == "workflow-loaded"),
+        "and it must certainly not have been loaded: {actions:?}"
+    );
+}
+
+#[test]
+fn the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was() {
+    // The promise, at the level it is actually made: the *text the agents read*.
+    // Compare what loomux writes against the pre-#222 rendering of the same
+    // template — the six variables, no workflow placeholders. Unconditional prose
+    // added to a template, a placeholder left on a line of its own (which would
+    // leave a stray blank line), or a variable left unsubstituted all fail this.
+    let (reg, _d) = test_registry();
+    let repo = Repo::new().workflow(FOCUSED_REVIEW); // declared, and ignored
+    let g = reg.create_group(&repo.path(), plain_rails()).unwrap();
+
+    for (file, tpl) in [
+        ("orchestrator.md", loomux_lib::orchestration::ORCHESTRATOR_TPL),
+        ("worker.md", loomux_lib::orchestration::WORKER_TPL),
+        ("reviewer.md", loomux_lib::orchestration::REVIEWER_TPL),
+        ("planner.md", loomux_lib::orchestration::PLANNER_TPL),
+    ] {
+        let written = instructions(&reg, &g.id, file);
+        assert_eq!(
+            written,
+            render_as_pre_222(tpl, &g),
+            "{file} must be byte-for-byte the file loomux wrote before #222"
+        );
+        assert!(!written.contains("{{"), "{file} has an unsubstituted variable");
+        assert!(
+            !written.contains("declares a workflow") && !written.contains("## Your block"),
+            "{file} leaked workflow prose into a group that has no workflow"
+        );
+    }
+}
+
+#[test]
+fn the_toggle_survives_group_json_and_an_older_group_rejoins_with_it_off() {
+    let (reg, dir) = test_registry();
+    let repo = Repo::new().workflow(FOCUSED_REVIEW);
+    let g = reg.create_group(&repo.path(), rails()).unwrap();
+    assert!(g.guardrails.advanced_orchestrator);
+
+    // A resume (the session browser) rebuilds guardrails from group.json, not
+    // from a launcher form — so the toggle has to be durable, or a resumed group
+    // would quietly lose the roster it was launched with.
+    let (_repo, persisted) = reg.load_group_file(&g.id).expect("group.json");
+    assert!(persisted.advanced_orchestrator, "the toggle must round-trip");
+    assert!(persisted.block("rev-security").is_some(), "...and with it, the roster");
+
+    let g2 = reg.create_group(&repo.path(), plain_rails()).unwrap();
+    let (_r, off) = reg.load_group_file(&g2.id).unwrap();
+    assert!(!off.advanced_orchestrator, "off must persist as off, not as absent-means-on");
+
+    // A group.json written before the field existed: absent => OFF, which is
+    // exactly what that group was.
+    let gj = dir.path().join(&g.id).join("group.json");
+    let mut v: Value = serde_json::from_str(&fs::read_to_string(&gj).unwrap()).unwrap();
+    v["guardrails"].as_object_mut().unwrap().remove("advanced_orchestrator");
+    fs::write(&gj, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+    let (_r, legacy) = reg.load_group_file(&g.id).expect("group.json still loads");
+    assert!(
+        !legacy.advanced_orchestrator,
+        "a group.json with no toggle predates the toggle — it ran the built-in roster"
+    );
+}
+
+#[test]
+fn a_workflow_group_is_told_to_spawn_by_block_and_fan_out_to_every_reviewer() {
+    // The point of declaring three focused reviewers is that all three run. The
+    // pipeline is prose (templates/orchestrator.md), so this is where "run them
+    // all" has to be said — and it may only be said to a group that has them.
+    let (reg, _d) = test_registry();
+    let repo = Repo::new()
+        .workflow(FOCUSED_REVIEW)
+        .agent_file("worker.md", "---\ndescription: repo worker\n---\nBranch first.");
+    let g = reg.create_group(&repo.path(), rails()).unwrap();
+
+    let orch = instructions_lf(&reg, &g.id, "orchestrator.md");
+    assert!(!orch.contains("{{"), "no unsubstituted variable: {orch}");
+    // Spacing, not just presence: the placeholder is line-final (that is what makes
+    // the empty case byte-identical), so the fragment has to bring its own blank
+    // line — without one the `##` lands mid-paragraph and is not a heading at all.
+    assert!(
+        orch.contains("messages.\n\n## This repo declares a workflow\n\n"),
+        "the section must open as a real markdown heading: {orch}"
+    );
+    assert!(
+        orch.contains("\n\n## Cost guardrails"),
+        "…and must not swallow the section that follows it: {orch}"
+    );
+    assert!(
+        orch.contains("spawn_agent(block: \"<id>\""),
+        "the orchestrator must be told to spawn by BLOCK, not by kind"
+    );
+    for id in ["rev-security", "rev-tests", "worker", "planner"] {
+        assert!(orch.contains(&format!("**`{id}`**")), "block {id} is missing from the roster");
+    }
+    assert!(
+        orch.contains("spawn **all** of `rev-security`, `rev-tests`"),
+        "every declared reviewer must be named as a fan-out target: {orch}"
+    );
+    assert!(
+        orch.contains("Edges are advisory"),
+        "the orchestrator keeps its scheduling judgment — the file declares, it routes"
+    );
+    // The gate wording stays generic: gate ENFORCEMENT is sub-PR 3's, and this
+    // text must not depend on how it works, only that it does.
+    assert!(orch.contains("Gates are enforced, not advice"), "{orch}");
+
+    // The persona'd worker block knows it has one, and which block it is.
+    let worker = instructions_lf(&reg, &g.id, "worker.md");
+    assert!(
+        worker.contains("orchestrator's.\n\n## Your block\n\n"),
+        "the block note is a real heading, not a run-on paragraph: {worker}"
+    );
+    assert!(worker.contains("**`worker`**"));
+    assert!(worker.contains("Your **persona** comes from that file"), "{worker}");
+    assert!(!worker.contains("{{"), "{worker}");
+}
+
+#[test]
+fn a_focused_reviewer_is_told_it_is_one_of_several_and_to_stay_in_its_lane() {
+    // The failure this prevents: three reviewers each doing the same generic
+    // review, tripling the bill and burying the one finding that was theirs.
+    let (reg, _d) = test_registry();
+    let repo = Repo::new().workflow(FOCUSED_REVIEW);
+    let g = reg.create_group(&repo.path(), rails()).unwrap();
+
+    let sec = instructions(&reg, &g.id, "rev-security.md");
+    assert!(sec.contains("one of 2 reviewer blocks"), "it must know it isn't alone: {sec}");
+    assert!(sec.contains("`rev-tests`"), "and who is covering the rest: {sec}");
+    assert!(sec.contains("Review **only your lane**"), "{sec}");
+    assert!(!sec.contains("{{"), "{sec}");
+
+    // The lane note is about having SIBLINGS, not about having a persona: a
+    // reviewer with no prompt of its own still needs to know it is one of N.
+    let (reg2, _d2) = test_registry();
+    let two_plain =
+        "version: 1\nblocks:\n  - id: rev-a\n    kind: reviewer\n  - id: rev-b\n    kind: reviewer\n";
+    let g2 = reg2.create_group(&Repo::new().workflow(two_plain).path(), rails()).unwrap();
+    assert!(instructions(&reg2, &g2.id, "rev-a.md").contains("one of 2 reviewer blocks"));
+
+    // ...and a LONE reviewer is not told it is one of many, because it isn't.
+    let (reg3, _d3) = test_registry();
+    let one = "version: 1\nblocks:\n  - id: rev-only\n    kind: reviewer\n";
+    let g3 = reg3.create_group(&Repo::new().workflow(one).path(), rails()).unwrap();
+    let lone = instructions(&reg3, &g3.id, "rev-only.md");
+    assert!(!lone.contains("reviewer blocks** on each PR"), "no phantom siblings: {lone}");
+    assert!(lone.contains("## Your block"), "it is still a declared block: {lone}");
+
+    // A built-in block the file didn't touch gets no note at all: a `worker`
+    // sitting in a roster whose REVIEWERS are custom has had nothing about its
+    // own identity changed, and saying otherwise is noise in a file the agent is
+    // expected to actually read.
+    let plain_worker = instructions(&reg3, &g3.id, "worker.md");
+    assert!(!plain_worker.contains("## Your block"), "{plain_worker}");
+}
+
+#[test]
+fn the_preview_reports_the_roster_the_launch_would_actually_run() {
+    // The launcher shows this BEFORE the human hits Create. If it disagreed with
+    // what create_group then does, the consent it collected would be worthless —
+    // so it runs the same load + clamp, and this pins that the two agree.
+    let repo = Repo::new()
+        .workflow(FOCUSED_REVIEW)
+        .agent_file("worker.md", "---\ndescription: repo worker\n---\nBranch first.");
+    let p = loomux_lib::orchestration::orch_workflow_preview(repo.path(), "claude".into());
+
+    assert_eq!(p["present"], true);
+    assert_eq!(p["valid"], true);
+    assert_eq!(p["name"], "focused-review");
+    assert_eq!(p["gates"], json!(["merge"]));
+
+    let blocks = p["blocks"].as_array().unwrap().clone();
+    let by_id = |id: &str| -> Value {
+        blocks.iter().find(|b| b["id"] == id).unwrap_or_else(|| panic!("block {id} missing")).clone()
+    };
+    // The orchestrator loomux always guarantees is in the preview, because it
+    // will be in the group — a roster that omitted it would be a lie.
+    assert_eq!(by_id("orchestrator")["kind"], "orchestrator");
+    assert_eq!(by_id("rev-security")["model"], "opus");
+    assert_eq!(by_id("rev-security")["persona"], "prompt");
+    assert_eq!(by_id("rev-tests")["model"], "sonnet");
+    assert_eq!(by_id("worker")["cli"], "copilot", "the block's own cli wins over the group default");
+    assert_eq!(by_id("worker")["persona"], "profile");
+    // An INHERITED model is resolved, not shown blank: a block that omits `cli:`
+    // must still preview the model it will really run.
+    assert_eq!(by_id("planner")["model"], "opus");
+    assert_eq!(by_id("planner")["cli"], "claude");
+
+    // And the preview matches the group a launch actually creates.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group(&repo.path(), rails()).unwrap();
+    for b in &blocks {
+        let id = b["id"].as_str().unwrap();
+        let real = g.guardrails.block(id).unwrap_or_else(|| panic!("launched group has no {id}"));
+        assert_eq!(b["kind"], json!(real.kind), "{id}");
+        assert_eq!(b["cli"], workflow::cli_of(real, &g.guardrails.agent_cli), "{id}");
+        assert_eq!(b["model"], workflow::model_of(real, &g.guardrails.agent_cli), "{id}");
+    }
+    assert_eq!(blocks.len(), g.guardrails.blocks.len(), "same roster, same size");
+}
+
+#[test]
+fn the_preview_shows_every_finding_and_absence_is_not_invalidity() {
+    // A broken file is skipped, never fatal — so the launcher must be able to say
+    // "you would get the built-in roster, and here is why", with EVERY problem at
+    // once rather than one per edit-and-rerun cycle.
+    let broken =
+        "version: 1\nblocks:\n  - id: w\n    kind: not-a-kind\n  - id: r\n    kind: reviewer\n    cli: emacs\n";
+    let p = loomux_lib::orchestration::orch_workflow_preview(
+        Repo::new().workflow(broken).path(),
+        "claude".into(),
+    );
+    assert_eq!(p["present"], true, "the file is there...");
+    assert_eq!(p["valid"], false, "...and it is broken");
+    assert!(p["blocks"].as_array().unwrap().is_empty(), "a broken file resolves to no roster");
+    let errors: Vec<String> =
+        p["errors"].as_array().unwrap().iter().map(|e| e.as_str().unwrap().to_string()).collect();
+    assert!(errors.iter().any(|e| e.contains("unknown kind")), "{errors:?}");
+    assert!(
+        errors.iter().any(|e| e.contains("emacs")),
+        "every problem, not just the first: {errors:?}"
+    );
+
+    // No file is not a problem — it is how you launch before you write one.
+    let none = loomux_lib::orchestration::orch_workflow_preview(Repo::new().path(), "claude".into());
+    assert_eq!(none["present"], false);
+    assert_eq!(none["valid"], true, "absence is not invalidity");
+    assert!(none["errors"].as_array().unwrap().is_empty());
+    assert!(none["blocks"].as_array().unwrap().is_empty());
+
+    // ...and turning the toggle on against a repo with no file is a no-op, not an
+    // error: the built-in roster stands and the group launches normally.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group(&Repo::new().path(), rails()).unwrap();
+    assert_eq!(g.guardrails.blocks.len(), 4);
+    assert!(!instructions(&reg, &g.id, "orchestrator.md").contains("declares a workflow"));
 }
