@@ -47,6 +47,7 @@ import {
   type GraphNode,
 } from "./workflowmodel";
 import { ftReadFile, ftWriteFile, errorCode, errorMessage } from "./fileapi";
+import { appVersion } from "./pty";
 import { closeDecision, discardEdits, type ConflictChoice } from "./dirtystate";
 import { showToast } from "./toast";
 import { modal } from "./modal";
@@ -120,6 +121,10 @@ export class WorkflowView {
   private selection: Selection = { kind: "workflow" };
   private tab: Tab = "form";
   private disposed = false;
+  /** This build's version, for `authored_with:` on a workflow this pane CREATES. Empty
+   *  until the async lookup lands (and if it never does — the key is simply not written,
+   *  which beats writing `authored_with: unknown`). */
+  private appVersion = "";
 
   // Header
   private pathLabel: HTMLElement;
@@ -198,7 +203,11 @@ export class WorkflowView {
     starterBtn.className = "wf-btn wf-btn-primary";
     starterBtn.textContent = "Create a starter workflow";
     starterBtn.addEventListener("click", () => {
-      this.setText(serializeWorkflow(starterWorkflow()));
+      // The ONE moment `authored_with:` is written — this pane is CREATING the file. Every
+      // later save leaves the key exactly as it found it (it round-trips through the
+      // unknown-key bag), so opening a workflow and changing a model doesn't also restamp
+      // a version line nobody asked to change.
+      this.setText(serializeWorkflow(starterWorkflow(this.appVersion)));
       this.render();
       showToast("Starter workflow created — Save (Ctrl+S) writes it to disk.", "info");
     });
@@ -267,6 +276,9 @@ export class WorkflowView {
   /** Load the file and render. Called by the pane once the view is in the document. */
   show(): void {
     this.el.hidden = false;
+    void appVersion().then((v) => {
+      if (!this.disposed) this.appVersion = v;
+    });
     this.root = this.host.getRoot();
     this.rel = this.host.getFile?.() || WORKFLOW_FILE;
     this.pathLabel.textContent = this.rel;
@@ -1081,18 +1093,33 @@ export class WorkflowView {
     // GHOST nodes: an edge naming a block that doesn't exist still gets drawn, into a
     // dashed placeholder. Silently omitting it would make the graph disagree with the file
     // — and the graph is supposed to be how you SEE the file.
-    const known = new Set(g.nodes.map((n) => n.block.id));
+    const known = new Set(g.nodes.map((n) => n.block.id).filter(Boolean));
     const ghosts = [...new Set(g.edges.flatMap((e) => [e.from, e.to]).filter((id) => id && !known.has(id)))];
 
-    const layers = g.layers.map((ids) => [...ids]);
-    if (ghosts.length) layers.push(ghosts);
+    // POSITIONS ARE KEYED BY ROW, NOT BY ID (rev-5 F5). Two id-less stubs share an id ("")
+    // and so did their position: they were drawn on top of each other, and a file with two
+    // broken blocks showed one — in the view whose entire job is to show you the file. So a
+    // block is keyed by its index (`b:2`), and a ghost — which is not a row at all, only a
+    // name an edge mentions — by its id (`g:rev-perf`).
+    const blockKey = (index: number): string => `b:${index}`;
+    const ghostKey = (id: string): string => `g:${id}`;
+    // An edge names an id; it draws to the FIRST row answering to that id. A duplicate pair
+    // is a validation error either way, and drawing to one of them beats drawing to neither.
+    const rowOf = (id: string): string | null => {
+      const n = g.nodes.find((x) => x.block.id === id);
+      return n ? blockKey(n.index) : known.has(id) ? null : ghostKey(id);
+    };
+
+    const columns: string[][] = g.layers.map((indices) => indices.map(blockKey));
+    if (ghosts.length) columns.push(ghosts.map(ghostKey));
 
     const pos = new Map<string, { x: number; y: number }>();
-    layers.forEach((ids, col) => {
-      ids.forEach((id, row) => {
-        pos.set(id, { x: PAD + col * (NODE_W + COL_GAP), y: PAD + row * (NODE_H + ROW_GAP) });
+    columns.forEach((keys, col) => {
+      keys.forEach((key, row) => {
+        pos.set(key, { x: PAD + col * (NODE_W + COL_GAP), y: PAD + row * (NODE_H + ROW_GAP) });
       });
     });
+    const layers = columns;
 
     const gate = g.gates[0];
     const gateX = PAD + layers.length * (NODE_W + COL_GAP);
@@ -1122,8 +1149,10 @@ export class WorkflowView {
 
     // ADVISORY edges: solid, plain arrow. They say what the workflow INTENDS.
     for (const e of g.edges) {
-      const a = pos.get(e.from);
-      const b = pos.get(e.to);
+      const fromKey = rowOf(e.from);
+      const toKey = rowOf(e.to);
+      const a = fromKey ? pos.get(fromKey) : undefined;
+      const b = toKey ? pos.get(toKey) : undefined;
       if (!a || !b) continue;
       const path = svg("path");
       const x1 = a.x + NODE_W;
@@ -1137,15 +1166,16 @@ export class WorkflowView {
       root.append(path);
     }
 
-    for (const n of g.nodes) node(root, pos.get(n.block.id)!, n);
-    for (const id of ghosts) ghostNode(root, pos.get(id)!, id);
+    for (const n of g.nodes) node(root, pos.get(blockKey(n.index))!, n);
+    for (const id of ghosts) ghostNode(root, pos.get(ghostKey(id))!, id);
 
     // The ENFORCED gate: a different shape (dashed, amber) and a dashed connector from
     // every reviewer it names. Advisory and enforced must not look alike — the whole point
     // of the distinction is that one of them can actually stop a merge.
     if (gate) {
       for (const rid of gate.reviewers) {
-        const a = pos.get(rid);
+        const key = rowOf(rid);
+        const a = key ? pos.get(key) : undefined;
         if (!a) continue;
         const line = svg("path");
         const x1 = a.x + NODE_W;

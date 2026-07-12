@@ -238,13 +238,28 @@ class YamlReader {
   }
 
   /** The next SIGNIFICANT line (blank and comment-only lines skipped), without consuming
-   *  it. Callers consume by setting the cursor past the line they took. */
+   *  it. Callers consume by setting the cursor past the line they took.
+   *
+   *  TABS. YAML forbids a tab in indentation, and this pane must say so — because the
+   *  backend validator (a real parser) will refuse the same file, and a pane that reports
+   *  `valid` on a file the spawn then rejects is worse than one that reports nothing.
+   *  The line is skipped with a finding rather than aborting the read: the rest of the
+   *  file still opens, which is this module's whole contract.
+   *
+   *  (A tab INSIDE a block scalar is content, not indentation, and stays that way —
+   *  `blockScalar` reads `this.raw` directly and never comes through here.) */
   private peek(): RawLine | null {
     for (let j = this.i; j < this.raw.length; j++) {
       const raw = this.raw[j]!;
-      if (raw.includes("\t") && raw.trimStart().startsWith("\t")) {
-        this.err(j, "tabs cannot be used for indentation in YAML — use spaces");
-        return null;
+      // Test the RAW leading whitespace. The previous form — `raw.trimStart().startsWith("\t")`
+      // — could never fire, because trimStart() strips the very tab it was looking for
+      // (rev-5 F2): the guard was dead, and a fully tab-indented file validated clean.
+      if (/^[ ]*\t/.test(raw)) {
+        if (!this.tabLines.has(j)) {
+          this.tabLines.add(j); // peek() is called repeatedly; the finding is reported once
+          this.err(j, "tabs cannot be used for indentation in YAML — use spaces");
+        }
+        continue;
       }
       const text = stripComment(raw).trimEnd();
       if (!text.trim()) continue;
@@ -252,6 +267,9 @@ class YamlReader {
     }
     return null;
   }
+
+  /** Lines already reported as tab-indented, so a re-peek doesn't report them twice. */
+  private readonly tabLines = new Set<number>();
 
   /** Read the whole document as a mapping. */
   document(): YamlValue {
@@ -304,7 +322,9 @@ class YamlReader {
       }
       return null;
     }
-    if (/^[|>][-+]?$/.test(rest)) return this.blockScalar(rest, indent);
+    // `|`, `>`, with an optional INDENTATION INDICATOR and/or chomping marker, in either
+    // order (`|2`, `|-`, `|2-`, `|-2` are all legal YAML).
+    if (/^[|>](?:\d[-+]?|[-+]?\d?)$/.test(rest)) return this.blockScalar(rest, indent);
     return this.flowOrScalar(rest, at);
   }
 
@@ -342,14 +362,22 @@ class YamlReader {
     return items;
   }
 
-  /** A `|` / `>` block scalar: every line indented past the key, dedented by the first
-   *  content line's indent. Comments are NOT stripped here — inside a block scalar a `#`
-   *  is content, and a prompt that says "# Review checklist" must survive. */
+  /** A `|` / `>` block scalar: every line indented past the key, dedented by the content's
+   *  indent — which the header STATES (`|2`) when it can, and which is otherwise inferred
+   *  from the first content line. The explicit form is what we emit, and it is the only one
+   *  that survives a prompt whose own first line is indented (rev-5 F3): inferring the
+   *  dedent from content that is itself indented eats exactly that indentation.
+   *
+   *  Comments are NOT stripped here — inside a block scalar a `#` is content, and a prompt
+   *  that says "# Review checklist" must survive. Tabs likewise: in here they are text. */
   private blockScalar(header: string, parentIndent: number): string {
     const folded = header.startsWith(">");
     const chomp = header.includes("-") ? "strip" : header.includes("+") ? "keep" : "clip";
+    const indicator = /\d/.exec(header);
     const body: string[] = [];
-    let contentIndent = -1;
+    // -1 = "infer from the first content line". An explicit indicator is RELATIVE to the
+    // parent node's indentation, which is what makes it independent of the content.
+    let contentIndent = indicator ? parentIndent + Number(indicator[0]) : -1;
     while (this.i < this.raw.length) {
       const raw = this.raw[this.i]!;
       if (!raw.trim()) {
@@ -559,11 +587,25 @@ class FlowReader {
 // would do harm: the roster reads top-to-bottom, and re-sorting it alphabetically on
 // every save would churn the diff of the file it is supposed to keep legible.
 
-/** Quote a scalar when leaving it bare would change what it means (or fail to parse). */
+/** Quote a scalar when leaving it bare would change what it means (or fail to parse).
+ *
+ *  `,` `[` `]` `{` `}` are in the list for a reason worth stating, because leaving them out
+ *  was a silent file-corrupting bug (rev-5 F1): this ONE emitter serves both contexts —
+ *  block (`name: …`) and FLOW (`reviewers: [a, b]`, `also: […]`, an unknown key's array or
+ *  map). In flow context those five characters are STRUCTURAL, so an unquoted
+ *  `Bash(gh pr view --json title,body)` re-reads as two list entries and an unquoted
+ *  `fmt{x}` closes the collection early and takes the whole value down with it — and both
+ *  happen on an ordinary form edit, because every form edit re-serializes the file.
+ *
+ *  Rather than keep two emitters and a rule about which context is which (the rule you
+ *  forget at exactly one of the six call sites), the ONE emitter quotes for the strictest
+ *  context. A quote is always SAFE in block context — it just isn't always necessary — and
+ *  "sometimes unnecessary" is a far cheaper failure than "sometimes destroys the value". */
 function emitScalar(v: string): string {
   if (v === "") return '""';
   if (
     /^[-?:,[\]{}#&*!|>'"%@`]/.test(v) ||
+    /[,[\]{}]/.test(v) || // structural in a flow collection, anywhere in the string
     /:\s/.test(v) ||
     /\s#/.test(v) ||
     v !== v.trim() ||
@@ -595,10 +637,26 @@ function emitValue(v: YamlValue): string {
 function emitBlockScalar(key: string, text: string, indent: string): string[] {
   // A body that ends in a newline is `|` (clip); one that doesn't is `|-` (strip). That
   // is what makes prompt → YAML → prompt exact rather than approximately exact.
-  const header = text.endsWith("\n") ? "|" : "|-";
+  const chomp = text.endsWith("\n") ? "" : "-";
   const body = text.replace(/\n$/, "").split("\n");
-  return [`${indent}${key}: ${header}`, ...body.map((l) => (l ? `${indent}  ${l}` : ""))];
+  // The INDENTATION INDICATOR (`|2`), and why it isn't optional (rev-5 F3): a plain `|` is
+  // read back by dedenting to the FIRST CONTENT LINE's indent, so a prompt whose first line
+  // is itself indented — a code snippet, an indented checklist, and it comes straight out of
+  // the form's textarea — silently loses that indent on the next read. Same for a prompt
+  // that opens with a blank line, where the "first content line" is the second one. Stating
+  // the indent explicitly makes the reader's dedent independent of the content, which is the
+  // only way this round-trips.
+  const first = body[0] ?? "";
+  const explicit = first === "" || /^\s/.test(first);
+  const header = `|${explicit ? BLOCK_SCALAR_INDENT : ""}${chomp}`;
+  const pad = " ".repeat(BLOCK_SCALAR_INDENT);
+  return [`${indent}${key}: ${header}`, ...body.map((l) => (l ? `${indent}${pad}${l}` : ""))];
 }
+
+/** How far a block scalar's body is indented past its key. Both halves of the round-trip
+ *  read it: the emitter pads by it, and the `|2` indicator it writes tells the reader to
+ *  dedent by exactly it rather than by guessing from the content. */
+const BLOCK_SCALAR_INDENT = 2;
 
 function extraLines(extra: Record<string, YamlValue> | undefined, indent: string): string[] {
   if (!extra) return [];
@@ -617,7 +675,11 @@ export function serializeWorkflow(w: Workflow): string {
   if (w.name) out.push(`name: ${emitScalar(w.name)}`);
   out.push(...extraLines(w.extra, ""));
 
-  out.push("", "blocks:");
+  // An EMPTY roster emits `blocks: []`, not a bare `blocks:` (rev-5 F4). A bare key is
+  // YAML `null`, so the pane would re-read its own output as a malformed shape and report a
+  // syntax-ish error against text it had just written itself — on top of the honest
+  // `no-blocks`. Deleting the last block in the form is the ordinary way to get here.
+  out.push("", w.blocks.length ? "blocks:" : "blocks: []");
   for (const b of w.blocks) {
     out.push(`  - id: ${emitScalar(b.id)}`);
     out.push(`    name: ${emitScalar(b.name)}`);
@@ -771,8 +833,12 @@ export function parseWorkflow(text: string): ParseResult {
   w.name = asString(root.name ?? "") ?? "";
   w.extra = collectExtra(root, KNOWN_TOP);
 
+  // `blocks:` / `edges:` written with nothing after them are YAML null, and null here means
+  // EMPTY — an empty roster, no edges. Only a value that is present and is not a list is a
+  // shape error (rev-5 F4): reporting "must be a list" against an empty one would have the
+  // pane complain about the file it just wrote itself when you delete the last block.
   const blocks = root.blocks;
-  if (blocks !== undefined && !Array.isArray(blocks)) {
+  if (blocks !== undefined && blocks !== null && !Array.isArray(blocks)) {
     findings.push({
       severity: "error",
       code: "block-not-a-mapping",
@@ -783,7 +849,7 @@ export function parseWorkflow(text: string): ParseResult {
   }
 
   const edges = root.edges;
-  if (edges !== undefined && !Array.isArray(edges)) {
+  if (edges !== undefined && edges !== null && !Array.isArray(edges)) {
     findings.push({
       severity: "error",
       code: "edge-not-a-mapping",
@@ -1055,6 +1121,11 @@ function reachabilityFindings(w: Workflow, byId: Map<string, WorkflowBlock>): Fi
   if (!w.edges.length || w.blocks.length < 2) return out;
 
   const ids = [...byId.keys()];
+  // Nothing here has an ID, so there is no graph to reason about — every edge is dangling
+  // and `edge-unknown-block` has already said so. Without this, `entries` came out empty
+  // and we announced that "every block is pointed at by another", which is neither true nor
+  // useful about a file whose blocks have no identities yet (rev-5 F6).
+  if (!ids.length) return out;
   const inDeg = new Map(ids.map((id) => [id, 0]));
   const outAdj = new Map<string, string[]>(ids.map((id) => [id, []]));
   for (const e of w.edges) {
@@ -1115,6 +1186,13 @@ function reachabilityFindings(w: Workflow, byId: Map<string, WorkflowBlock>): Fi
 
 export interface GraphNode {
   block: WorkflowBlock;
+  /** The block's INDEX in the roster — its identity in the picture. Not its id: the blocks
+   *  that most need drawing are the broken ones, and two id-less stubs (or a duplicate-id
+   *  pair) share an id while being two different rows. Keying the graph by id drew them on
+   *  top of each other, so a file with two stubs showed one (rev-5 F5) — in the very view
+   *  whose job is to let you SEE the file. The roster already keys by index for exactly
+   *  this reason; now the graph agrees with it. */
+  index: number;
   /** False when the block's kind isn't a capability class — the view draws it as a stub. */
   known: boolean;
   /** Column in the layered layout: distance from the nearest entry block. */
@@ -1138,8 +1216,8 @@ export interface WorkflowGraph {
   nodes: GraphNode[];
   edges: GraphEdge[];
   gates: GraphGate[];
-  /** Node ids grouped by layer, left to right. */
-  layers: string[][];
+  /** Block INDICES grouped by layer, left to right (see GraphNode.index). */
+  layers: number[][];
 }
 
 /** Derive the picture: the blocks, the advisory edges between them, and the enforced
@@ -1157,8 +1235,11 @@ export function deriveGraph(w: Workflow): WorkflowGraph {
     resolved: byId.has(e.from) && byId.has(e.to),
   }));
 
+  // Layering is computed over IDS — an edge names ids, so that is what a column can be
+  // derived from — and then handed to the NODES, which are rows. The two are different
+  // things, and conflating them is what stacked the broken blocks on one another.
   const layer = new Map<string, number>();
-  for (const b of w.blocks) layer.set(b.id, 0);
+  for (const b of w.blocks) if (b.id) layer.set(b.id, 0);
 
   // Relax forward edges |blocks| times: a node sits one column right of its deepest
   // predecessor. Bounded, so a cycle terminates instead of spinning.
@@ -1175,15 +1256,19 @@ export function deriveGraph(w: Workflow): WorkflowGraph {
     if (!moved) break;
   }
 
-  const nodes: GraphNode[] = w.blocks.map((b) => ({
+  // An id-less block has no column of its own to compute (nothing can point at it), so it
+  // sits in the first one — visible, drawn as the stub it is, next to the finding that says
+  // to give it an id.
+  const nodes: GraphNode[] = w.blocks.map((b, index) => ({
     block: b,
+    index,
     known: isBlockKind(b.kind),
-    layer: layer.get(b.id) ?? 0,
+    layer: (b.id && layer.get(b.id)) || 0,
   }));
 
   const depth = nodes.reduce((m, n) => Math.max(m, n.layer), 0);
-  const layers: string[][] = Array.from({ length: depth + 1 }, () => []);
-  for (const n of nodes) layers[n.layer]!.push(n.block.id);
+  const layers: number[][] = Array.from({ length: depth + 1 }, () => []);
+  for (const n of nodes) layers[n.layer]!.push(n.index);
 
   const gates: GraphGate[] = w.gates.merge
     ? [
@@ -1249,13 +1334,31 @@ export function removeBlockAt(w: Workflow, index: number): Workflow {
   };
 }
 
+/** The optional top-level key recording which loomux WROTE this file — §4's "record the
+ *  loomux version that authored it" (the Langflow `last_tested_version` lesson: when a file
+ *  misbehaves, the first question is always which build produced it).
+ *
+ *  It is written EXACTLY ONCE, when the pane creates a new workflow, and never touched
+ *  again: on an existing file it rides the unknown-key bag and round-trips verbatim. That
+ *  is deliberate — stamping it on every save would mean every human who opens the pane and
+ *  changes a model name also produces a one-line diff nobody asked for, in a file whose
+ *  whole point is a legible history. It records who authored the workflow, not who last
+ *  looked at it. (Deliberately NOT in KNOWN_TOP: the preservation path already handles it,
+ *  and the backend — sub-PR 1 — owns whatever meaning it ever grows.) */
+export const AUTHORED_WITH_KEY = "authored_with";
+
 /** The workflow loomux runs today, as a file: plan → work → review, with the reviewer's
  *  verdict gating the merge. The starting point a repo with no `.loomux/workflow.yml`
- *  opens on, so the pane's empty state is a working example rather than a blank page. */
-export function starterWorkflow(): Workflow {
+ *  opens on, so the pane's empty state is a working example rather than a blank page.
+ *
+ *  `authoredWith` is the loomux version doing the creating; omit it and the key is simply
+ *  not written (which is what the tests do, and what a caller with no version to hand
+ *  should do — an `authored_with: unknown` would be worse than an absent key). */
+export function starterWorkflow(authoredWith?: string): Workflow {
   return {
     version: WORKFLOW_VERSION,
     name: "default",
+    ...(authoredWith ? { extra: { [AUTHORED_WITH_KEY]: authoredWith } } : {}),
     blocks: [
       { id: "planner", name: "Planner", kind: "planner", cli: "claude", model: "opus" },
       { id: "worker", name: "Worker", kind: "worker", cli: "claude", model: "" },

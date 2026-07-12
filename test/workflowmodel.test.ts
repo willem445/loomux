@@ -232,6 +232,65 @@ test("a prompt's trailing newline is preserved exactly", () => {
   assert.equal(parseWorkflow(serializeWorkflow(withoutNl)).workflow.blocks[0]!.prompt, "a\nb");
 });
 
+// ---------- the flow-context quoting bug (rev-5 F1) ----------
+//
+// The emitter serves BOTH block context (`name: …`) and FLOW context (`reviewers: [a, b]`,
+// an unknown key's array or map), and in flow context `, [ ] { }` are STRUCTURAL. Quoting
+// only for block context meant an ordinary form edit — every one of which re-serializes the
+// file — silently destroyed any value containing one. These are the values that actually
+// occur: `allow` patterns of exactly this shape are what the backend's agent profiles carry.
+
+test("a comma inside a flow-emitted value does not split it into two", () => {
+  const w = starterWorkflow();
+  w.gates.merge!.also = ["Bash(gh pr view --json title,body)", "ci-green"];
+  const reread = parseWorkflow(serializeWorkflow(w)).workflow;
+  assert.deepEqual(
+    reread.gates.merge!.also,
+    ["Bash(gh pr view --json title,body)", "ci-green"],
+    "a comma is structural in a flow list — unquoted, this came back as three conditions"
+  );
+});
+
+test("braces and brackets inside a flow-emitted value do not destroy it", () => {
+  // Unquoted, the mid-string `}` closed the flow collection early, the reader threw, and the
+  // whole value came back as `null` — with a bogus syntax finding on a line the pane itself
+  // had just written.
+  const w = starterWorkflow();
+  w.gates.merge!.also = ["fmt{x}", "arr[0]", "map{a: b}"];
+  const out = serializeWorkflow(w);
+  const { workflow: reread, findings } = parseWorkflow(out);
+  assert.deepEqual(reread.gates.merge!.also, ["fmt{x}", "arr[0]", "map{a: b}"]);
+  assert.deepEqual(findings, [], "and it must not report a syntax error against its own output");
+});
+
+test("unknown keys holding arrays and maps survive a round-trip, structural characters and all", () => {
+  // The PR's stated guarantee — "an older pane never strips a newer file's fields" — is only
+  // true if it holds for the values those fields actually carry. The original unknown-key
+  // test used scalars only (`retries: 3`), which is exactly the hole this closes.
+  const text = `version: 1
+blocks:
+  - id: w
+    name: W
+    kind: worker
+    cli: claude
+    tools: ["fmt{x}", "Read"]
+    allow: ["Bash(gh pr view --json title,body)", "Bash(git status)"]
+    limits: { cpu: 2, note: "a,b" }
+`;
+  const w = parseWorkflow(text).workflow;
+  assert.deepEqual(w.blocks[0]!.extra, {
+    tools: ["fmt{x}", "Read"],
+    allow: ["Bash(gh pr view --json title,body)", "Bash(git status)"],
+    limits: { cpu: 2, note: "a,b" },
+  });
+  const out = serializeWorkflow(w);
+  const reread = parseWorkflow(out);
+  assert.deepEqual(reread.findings, [], "the serialized form must re-read cleanly");
+  assert.deepEqual(reread.workflow, w, "…and identically — a form edit must not eat a field it doesn't know");
+  // Twice, because the corruption in the original bug only appeared on the SECOND read.
+  assert.equal(serializeWorkflow(reread.workflow), out);
+});
+
 test("a value that would change meaning unquoted is quoted", () => {
   const w: Workflow = {
     version: 1,
@@ -243,6 +302,61 @@ test("a value that would change meaning unquoted is quoted", () => {
   const reread = parseWorkflow(serializeWorkflow(w)).workflow;
   assert.equal(reread.name, "yes: really");
   assert.equal(reread.blocks[0]!.name, "1.5", "a numeric-looking NAME must come back a string");
+});
+
+test("a tab-indented file is reported, not silently accepted (rev-5 F2)", () => {
+  // YAML forbids tabs in indentation, so the backend validator will refuse this file. A pane
+  // that reports `valid` on a file the spawn then rejects is worse than one that says
+  // nothing — the human is told their workflow is good and the run fails anyway.
+  const { findings } = analyzeWorkflow("version: 1\nblocks:\n\t- id: w\n");
+  const tab = findings.find((f) => f.code === "yaml-syntax" && /tab/i.test(f.message));
+  assert.ok(tab, "a tab in the indentation must produce a finding");
+  assert.equal(tab!.line, 3, "and it must say which line");
+  // Reported ONCE, not once per re-peek of the same line.
+  assert.equal(findings.filter((f) => /tab/i.test(f.message)).length, 1);
+});
+
+test("a tab INSIDE a prompt is content, and stays content", () => {
+  // The guard is about indentation. A prompt body is text — a tab in it is the user's tab.
+  const { workflow, findings } = analyzeWorkflow(`version: 1
+blocks:
+  - id: rev
+    name: R
+    kind: reviewer
+    cli: claude
+    prompt: |
+      col1\tcol2
+`);
+  assert.equal(workflow.blocks[0]!.prompt, "col1\tcol2\n");
+  assert.deepEqual(codes(findings), []);
+});
+
+test("a prompt whose first line is indented round-trips (rev-5 F3)", () => {
+  // Straight out of the form's textarea: a code snippet, an indented checklist. A bare `|`
+  // is read back by dedenting to the first content line's indent, which ate exactly this.
+  for (const prompt of ["  indented\nplain\n", "\n  after a blank line\n", "\tstarts with a tab\n"]) {
+    const w = starterWorkflow();
+    w.blocks[2]!.prompt = prompt;
+    const out = serializeWorkflow(w);
+    assert.equal(
+      parseWorkflow(out).workflow.blocks[2]!.prompt,
+      prompt,
+      `prompt ${JSON.stringify(prompt)} must survive`
+    );
+    assert.equal(serializeWorkflow(parseWorkflow(out).workflow), out, "…and stay stable");
+  }
+});
+
+test("an empty roster serializes to something that re-reads as an empty roster (rev-5 F4)", () => {
+  // Delete the last block in the form and the pane used to report a YAML-shape error against
+  // text it had just written itself (a bare `blocks:` is YAML null).
+  const empty: Workflow = { version: 1, name: "x", blocks: [], edges: [], gates: {} };
+  const out = serializeWorkflow(empty);
+  const { workflow, findings } = analyzeWorkflow(out);
+  assert.deepEqual(workflow.blocks, []);
+  assert.deepEqual(codes(findings), ["no-blocks"], "the honest error, and ONLY the honest error");
+  // A hand-authored bare `blocks:` means the same thing and must not be a shape error either.
+  assert.deepEqual(codes(analyzeWorkflow("version: 1\nblocks:\n").findings), ["no-blocks"]);
 });
 
 // ---------- broken files still open ----------
@@ -441,7 +555,8 @@ test("the version is checked before anything else trusts the shape", () => {
 
 test("the graph layers the declared path and flags what doesn't resolve", () => {
   const g = deriveGraph(parseWorkflow(SAMPLE).workflow);
-  assert.deepEqual(g.layers, [["planner"], ["worker"], ["rev-security", "rev-tests"]]);
+  // Layers hold block INDICES (rev-5 F5) — the roster's rows, not their ids.
+  assert.deepEqual(g.layers, [[0], [1], [2, 3]]);
   assert.ok(g.nodes.every((n) => n.known));
   assert.ok(g.edges.every((e) => e.resolved));
   assert.deepEqual(g.gates, [
@@ -454,6 +569,54 @@ test("the graph layers the declared path and flags what doesn't resolve", () => 
   const bg = deriveGraph(broken);
   assert.equal(bg.nodes.find((n) => n.block.id === "planner")!.known, false);
   assert.equal(bg.edges.find((e) => e.to === "ghost")!.resolved, false);
+});
+
+test("broken blocks each get their OWN node in the graph (rev-5 F5)", () => {
+  // Keyed by id, two id-less stubs (both "") mapped to ONE position and rendered stacked, so
+  // a file with two broken blocks showed one — in the view whose whole job is to show you the
+  // file. Same for a duplicate-id pair.
+  const stubs: Workflow = {
+    version: 1,
+    name: "",
+    blocks: [
+      { id: "", name: "stub A", kind: "worker", cli: "claude", model: "" },
+      { id: "", name: "stub B", kind: "reviewer", cli: "claude", model: "" },
+      { id: "dupe", name: "first", kind: "reviewer", cli: "claude", model: "" },
+      { id: "dupe", name: "second", kind: "reviewer", cli: "claude", model: "" },
+    ],
+    edges: [],
+    gates: {},
+  };
+  const g = deriveGraph(stubs);
+  assert.equal(g.nodes.length, 4);
+  assert.deepEqual(
+    g.nodes.map((n) => n.index),
+    [0, 1, 2, 3],
+    "every row is its own node, whatever its id says"
+  );
+  // …and no two nodes share a slot: the flattened layers hold each index exactly once.
+  const placed = g.layers.flat();
+  assert.deepEqual([...placed].sort((a, b) => a - b), [0, 1, 2, 3]);
+});
+
+test("a file whose blocks have no ids at all makes no claim about entry points (rev-5 F6)", () => {
+  // With no ids there is no graph to reason about — every edge is dangling, and
+  // `edge-unknown-block` has already said so. "Every block is pointed at by another" was
+  // neither true nor useful here.
+  const w: Workflow = {
+    version: 1,
+    name: "",
+    blocks: [
+      { id: "", name: "a", kind: "worker", cli: "claude", model: "" },
+      { id: "", name: "b", kind: "reviewer", cli: "claude", model: "" },
+    ],
+    edges: [{ from: "a", to: "b" }],
+    gates: {},
+  };
+  const f = validateWorkflow(w);
+  assert.ok(!has(f, "no-entry-block"));
+  assert.ok(has(f, "block-id-missing"), "the finding that IS true still fires");
+  assert.ok(has(f, "edge-unknown-block"));
 });
 
 test("a cyclic graph still layers (it must never spin)", () => {
@@ -472,6 +635,31 @@ test("a new block's id is unique and derived from its name", () => {
   assert.equal(nextBlockId(w, "Worker"), "worker-2", "an id already in use gets suffixed, never reused");
   assert.equal(nextBlockId(w, "!!!"), "block");
   assert.ok(isValidBlockId(nextBlockId(w, "2nd reviewer")));
+});
+
+test("a created workflow records which loomux wrote it — and only a created one (rev-5 F7)", () => {
+  // §4's "record the loomux version that authored it" (Langflow's last_tested_version
+  // lesson). Written EXACTLY ONCE, at creation.
+  const created = starterWorkflow("0.8.0");
+  assert.match(serializeWorkflow(created), /^authored_with: 0\.8\.0$/m);
+  assert.deepEqual(codes(validateWorkflow(created)), [], "and it is not itself a finding");
+
+  // No version to hand → no key. An `authored_with: unknown` would be worse than an absent one.
+  assert.ok(!serializeWorkflow(starterWorkflow()).includes("authored_with"));
+
+  // On an EXISTING file it round-trips verbatim and is never restamped: opening a workflow
+  // written by an older build and changing a model must not also rewrite the version line.
+  const older = parseWorkflow(`version: 1
+authored_with: 0.6.1
+blocks:
+  - id: w
+    name: W
+    kind: worker
+    cli: claude
+`).workflow;
+  assert.deepEqual(older.extra, { authored_with: "0.6.1" });
+  older.blocks[0]!.model = "opus"; // the ordinary form edit
+  assert.match(serializeWorkflow(older), /^authored_with: 0\.6\.1$/m, "preserved, not restamped");
 });
 
 test("deleting a block takes every reference to it with it", () => {

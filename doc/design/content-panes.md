@@ -431,6 +431,24 @@ the very diff the formatter exists to keep readable. Unknown keys (from a file w
 newer loomux) are preserved verbatim across the round-trip — an older pane must not silently
 strip a field the user's backend depends on.
 
+**One emitter, quoting for the strictest context.** The formatter serves both block context
+(`name: …`) and *flow* context (`reviewers: [a, b]`, an unknown key's array), and in flow
+context `, [ ] { }` are structural. The emitter therefore quotes any value containing one,
+even where block context wouldn't need it. This is not fastidiousness: with the flow
+characters left out, an `allow: ["Bash(gh pr view --json title,body)"]` re-read as *two*
+entries and a `tools: ["fmt{x}"]` re-read as `null` — on an ordinary form edit, because every
+form edit re-serializes the file. A quote that wasn't strictly necessary costs a character; a
+quote that was missing costs the user's data. (Found in review, rev-5 F1.)
+
+**`authored_with:`** — an optional top-level key naming the loomux that *created* the file
+(§4's "record the loomux version that authored it", the Langflow `last_tested_version`
+lesson). Written exactly once, when the pane creates a new workflow; on an existing file it
+rides the unknown-key bag and round-trips verbatim. Deliberately *not* restamped on every
+save: it records who authored the workflow, not who last looked at it, and a version line that
+churned on every model-name tweak would be noise in a file whose whole point is a readable
+history. **Sub-PR 1: this key is optional and pass-through — a validator should tolerate it,
+not require it.**
+
 ### The rest is the pattern #217 already set
 
 The workflow file rides in the persisted `file` field the editor pane added; `cwd` carries the
