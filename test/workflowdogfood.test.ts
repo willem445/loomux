@@ -66,17 +66,18 @@ test("the roster is the one the repo means to run", () => {
   }
 });
 
-test("the merge gate names the three reviewers and can actually open", () => {
+test("the merge gate waits for every lane, because an abstention is a pass", () => {
   const { workflow } = parseWorkflow(text);
   const gate = workflow.gates.merge;
   assert.ok(gate, "the point of the dogfood file is that the human can demo the gate");
   assert.deepEqual(gate.reviewers, ["rev-orch", "rev-ui", "rev-tests"]);
-  assert.equal(gate.require, "threshold");
-  assert.equal(gate.threshold, 2);
-  assert.ok(
-    gate.threshold! <= gate.reviewers.length,
-    "a threshold above the reviewer count is a gate that could never open"
-  );
+  // NOT a threshold. These reviewers are lane-scoped, and one whose lane a PR doesn't
+  // touch records a `pass` immediately rather than staying silent — so a `threshold: 2`
+  // is satisfied by the two fastest abstentions while the only in-lane reviewer (the
+  // slowest, by design) is still working. all-pass costs nothing: all three are spawned
+  // on every PR anyway, and the out-of-lane ones pass in one turn.
+  assert.equal(gate.require, "all-pass");
+  assert.equal(gate.threshold, undefined, "an all-pass gate takes no threshold");
   assert.deepEqual(gate.also, ["ci-green"]);
   const kinds = new Map(workflow.blocks.map((b) => [b.id, b.kind]));
   for (const r of gate.reviewers) {

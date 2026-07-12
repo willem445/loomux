@@ -898,11 +898,24 @@ Three things about it are decisions rather than filler:
   deep; mechanical and clearly-directed → quick), and `worker-deep` is declared **first**,
   because the first block of a class is what a bare `spawn_agent(kind: "worker")` resolves
   to and the safe default for an unrouted task is the tier that can handle being wrong.
-- **The gate is a proposal with its reasoning in the file**: `threshold: 2` over the three
-  reviewers, plus `ci-green`. All-pass would hold every merge hostage to a reviewer with
-  nothing to say about a one-lane PR — while a `fail`/`escalate` from *any* of the three
-  still refuses the merge (blockers beat approvals), and every pass still dies on a
-  re-push. A release PR raises it to `all-pass`.
+- **The gate is `all-pass` over the three reviewers, plus `ci-green`** — and the reason is
+  worth stating, because the first draft of this file said `threshold: 2` and a review
+  (rev-14 F1) showed why that is wrong *for a lane-scoped roster specifically*. **An
+  abstention is a pass.** A reviewer whose lane a PR doesn't touch is told to record
+  `pass` ("outside my lane") rather than to stay silent, and the gate counts passes, not
+  lanes. So on a backend-only PR the two out-of-lane reviewers — which are always the
+  *fast* ones, having nothing to reproduce — satisfy `threshold: 2` while `rev-orch`, the
+  only reviewer whose lane it is and the slowest by construction, is still running. The
+  gate opens on two agents that said they had not reviewed the change, which is precisely
+  the #151 failure the gate exists to prevent, dressed up as a quorum.
+
+  `all-pass` costs nothing to fix that: the orchestrator already runs **every** reviewer
+  block on every PR, and the out-of-lane ones pass in one turn, so the same three verdicts
+  get recorded either way — `all-pass` just requires that the in-lane one is among them.
+  The general rule this produces: **`threshold: N` is for *interchangeable* reviewers**
+  ("any 2 of these 5 senior people"), and a lane-scoped roster is the opposite of
+  interchangeable. Its other use — tolerating a dead reviewer — is a job for the human,
+  not for the gate.
 
 The persona files deliberately carry **no `model:`**. Copilot would read one (it is its
 key), loomux would not (the block's `model:` is its single source of truth), and two
@@ -956,6 +969,14 @@ The repo's own workflow is validated by **both** halves of the feature, in CI:
 Two parsers, deliberately (the pane is an editor giving live feedback on text; the backend is
 the engine). A file only one of them accepts is a file the human is being lied to about, and
 these two tests are what stop that drifting apart.
+
+"In CI" was not true when this section was first written, and the fix was to make it true
+rather than to soften the sentence: `ci.yml` ran `npm run build` (a **typecheck**, not the
+suite), `cargo check` and `cargo test`, and **no `npm test` at all** — so the entire frontend
+suite, this pin included, gated nothing. A change to `src/workflowmodel.ts` that made loomux's
+own workflow file raise a finding in the pane would have merged green (rev-14 F2). `ci.yml`
+now runs `npm test` on all three platforms, which is also what makes every other pure-module
+test in `test/` a gate rather than a convention.
 
 ## Still to come
 

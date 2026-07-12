@@ -56,6 +56,13 @@ blocks:
   # Each reviews ONLY its lane and stays out of the others'. rev-orch runs the
   # strong tier: it holds the security surface (gate/shim, capability closure, the
   # group_id trust boundary) where a missed defect is not a nit.
+  #
+  # ALL THREE run on EVERY PR — including a one-line typo fix from worker-quick, and
+  # the merge gate below needs all three verdicts, so this is not a lane you can skip
+  # to save a spawn. A reviewer whose lane the PR does not touch reads the diff, says
+  # so, and records `pass` in one turn; that abstention is cheap, and the alternative
+  # (letting the orchestrator decide which lanes a diff "really" touches) is how a
+  # backend change that arrived disguised as a docs PR goes unreviewed.
 
   - id: rev-orch
     name: Backend review
@@ -92,14 +99,27 @@ edges:
 # ENFORCED — the gh shim refuses `gh pr merge` until this is satisfied, whatever
 # an agent believes about its own approval (that is what #151 taught).
 #
-# Why threshold 2 of 3 and not all-pass: most loomux PRs land in one or two lanes,
-# so all-pass would hold every merge hostage to a reviewer with nothing to say —
-# while a `fail` or `escalate` from ANY of the three still refuses the merge
-# (blockers beat approvals, always), and every pass dies the moment the branch
-# moves. Raise it to `require: all-pass` for a release PR.
+# WHY all-pass AND NOT `threshold: 2` — read this before "loosening" it (rev-14 F1):
+# the reviewers above are LANE-SCOPED, and a reviewer whose lane a PR doesn't touch
+# is told to record a `pass` immediately ("outside my lane") rather than to stay
+# silent. To the gate an abstention is indistinguishable from an approval — it counts
+# a `pass`, not a lane. So on a backend-only PR, `rev-ui` and `rev-tests` can abstain
+# in seconds and satisfy `threshold: 2` **while `rev-orch` — the only reviewer whose
+# lane it actually is, and the slowest by construction, because its persona tells it
+# to reproduce findings and run the suite — is still working.** The gate would open on
+# two agents that said in as many words that they had not reviewed the change.
+#
+# all-pass costs nothing to fix that: the orchestrator is already told to run EVERY
+# reviewer block on every PR, and the out-of-lane ones pass immediately, so the same
+# three verdicts are recorded either way. What all-pass buys is the guarantee that the
+# in-lane reviewer is one of them. (`threshold: N` is the right tool when reviewers are
+# INTERCHANGEABLE — "any 2 of these 5" — which is exactly what a lane-scoped roster is
+# not. Its other use, tolerating a dead reviewer, is a job for the human, not the gate.)
+#
+# A `fail` or `escalate` from any reviewer refuses the merge whatever the others
+# recorded (blockers beat approvals), and every pass dies the moment the branch moves.
 gates:
   merge:
-    require: threshold
-    threshold: 2
+    require: all-pass
     reviewers: [rev-orch, rev-ui, rev-tests]
     also: [ci-green]

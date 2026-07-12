@@ -2624,8 +2624,20 @@ fn the_repos_own_workflow_file_parses_clean_against_the_real_parser() {
     }
 
     let gate = wf.gates.get("merge").expect("the dogfood file exists partly to demo the gate");
-    assert_eq!(gate.require, GateRequire::Threshold(2));
+    // ALL-PASS, and not `threshold: N` — the reviewers are LANE-SCOPED, and an
+    // out-of-lane reviewer is told to record a `pass` ("not my lane") rather than stay
+    // silent. The gate counts passes, not lanes, so under a threshold the two fastest
+    // abstentions satisfy it while the one in-lane reviewer — the slowest, because its
+    // persona tells it to reproduce findings — is still working (rev-14 F1). A threshold
+    // is right for INTERCHANGEABLE reviewers; this roster is the opposite of that.
+    assert_eq!(gate.require, GateRequire::AllPass);
     assert_eq!(gate.reviewers, ["rev-orch", "rev-ui", "rev-tests"]);
+    assert_eq!(
+        workflow::gate_need(gate),
+        gate.reviewers.len() as u32,
+        "every named reviewer must have to speak — abstention is a pass, so a threshold would let \
+         the lanes that didn't review it open the gate ahead of the lane that must"
+    );
     // Every named reviewer is a reviewer block that actually exists — a gate naming a
     // worker, or a block that was renamed out from under it, could never open.
     for r in &gate.reviewers {
@@ -2695,7 +2707,18 @@ fn a_declared_block_model_survives_both_clis_and_a_resume() {
          \x20 - id: cheap-copilot\n    kind: reviewer\n    cli: copilot\n    model: claude-haiku-4.5\n    prompt: Review only for typos.\n\
          \x20 - id: inherits\n    kind: reviewer\n    cli: claude\n",
     );
-    let g = reg.create_group(&repo.path(), rails()).unwrap();
+    // The launcher's per-role picks say OPUS for reviewers — deliberately NOT the class
+    // default (`sonnet`), so the two candidate semantics for an undeclared block model
+    // actually diverge below. With `rails()`'s empty roster the pick *was* the class
+    // default, and the `inherits` assertion passed under either rule: a pin that could
+    // not fail on the very claim the design note calls the surprising one (rev-14 F3).
+    let picks = workflow::default_roster(&[
+        (Role::Orchestrator, "claude", "opus"),
+        (Role::Worker, "claude", "opus"),
+        (Role::Reviewer, "claude", "opus"),
+        (Role::Planner, "claude", "opus"),
+    ]);
+    let g = reg.create_group(&repo.path(), Guardrails { blocks: picks, ..rails() }).unwrap();
 
     // A tier reaches the flag on BOTH CLIs — the model is a block property, not a
     // claude one, and `sanitize_model` keeps a dotted vendor id like the ones copilot
@@ -2703,12 +2726,18 @@ fn a_declared_block_model_survives_both_clis_and_a_resume() {
     assert!(compile(&reg, &g, "quick").0.contains("--model haiku"));
     assert!(compile(&reg, &g, "cheap-copilot").0.contains("--model claude-haiku-4.5"));
 
-    // A block that declares NO model takes its class default *for its own CLI* — the
-    // file is the roster, so an undeclared field resolves from the block, not from a
-    // launcher form the file never saw. (Nothing is silent about it: the launcher's
-    // roster preview runs this same load+clamp and shows the human the resolved model
-    // for every block before they hit Create.)
-    assert!(compile(&reg, &g, "inherits").0.contains("--model sonnet"));
+    // A block that declares NO model takes its class default *for its own CLI* — NOT the
+    // launcher's per-role pick, which here says opus. The file is the roster, so an
+    // undeclared field resolves from the block, not from a launcher form the file never
+    // saw. (Nothing is silent about it: the launcher's roster preview runs this same
+    // load+clamp and shows the human the resolved model of every block before they hit
+    // Create.) Both halves are asserted: the rule that holds, and the one that doesn't.
+    let (inherits, _, _) = compile(&reg, &g, "inherits");
+    assert!(inherits.contains("--model sonnet"), "the class default must win: {inherits}");
+    assert!(
+        !inherits.contains("--model opus"),
+        "a declared block must never inherit the launcher's per-role model: {inherits}"
+    );
 
     // The tier is durable: a resumed group must not come back one model tier up.
     let (_repo, persisted) = reg.load_group_file(&g.id).expect("group.json");
