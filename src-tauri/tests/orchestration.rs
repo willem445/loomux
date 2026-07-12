@@ -7,6 +7,7 @@
 //! applies to integration-test targets.
 
 use loomux_lib::orchestration::mcp::dispatch;
+use loomux_lib::orchestration::workflow;
 use loomux_lib::orchestration::{
     add_trusted_folder, autonomy_budget_exhausted, bracketed_paste, classify_human_input,
     claude_permission_mode, cli_ready, copilot_autopilot_prompt_detected, create_orchestration_group,
@@ -22,6 +23,7 @@ use loomux_lib::orchestration::{
     spawn_rate_exceeded, spawn_request_expired, strip_ansi, submit_confirmed, submit_sequence,
     unconfirmed_delivery_notice, watchdog_should_notify, worktree_cleanup_targets,
     AttentionItem, Caller, Delivery, Guardrails, HumanInput, NameSource, OrchRegistry, PasteDecision,
+    PersonaInject,
     PasteGate, Role, TaskPatch, UsageSnapshot, CLAUDE_UNATTENDED_ALLOW, COPILOT_AUTOPILOT_CONFIRM_KEYS,
     COPILOT_GROUP_AUTOPILOT_FLAGS, COPILOT_UNATTENDED_FLAGS, MAX_ATTACHMENT_BYTES,
     PLANNER_READONLY_NOTE,
@@ -54,19 +56,24 @@ fn kickoff_readiness_waits_for_painted_and_quiet_cli() {
     assert!(cli_ready(4096, s(2), s(3)));
 }
 
+/// The built-in 4-block roster on claude with the historic per-class models —
+/// i.e. exactly what a plain launcher run produces (#222). Every block inherits
+/// `agent_cli` and carries no persona, so nothing reaches a command line that
+/// didn't before.
 fn rails() -> Guardrails {
     Guardrails {
         max_agents: 2,
         agent_cli: "claude".into(),
-        worker_model: "sonnet".into(),
-        reviewer_model: "sonnet".into(),
-        orchestrator_model: "opus".into(),
-        planner_model: "opus".into(),
+        blocks: workflow::default_roster(&[
+            (Role::Orchestrator, "", "opus"),
+            (Role::Worker, "", "sonnet"),
+            (Role::Reviewer, "", "sonnet"),
+            (Role::Planner, "", "opus"),
+        ]),
         auto_ops: false,
         idle_kill_minutes: 0,
         max_spawns_per_hour: 0,
         watchdog_stall_minutes: 0,
-        // Per-role CLIs default to inheriting `agent_cli`.
         ..Guardrails::default()
     }
 }
@@ -175,10 +182,12 @@ fn guardrail_clamps_and_sanitizes() {
     let g = Guardrails {
         max_agents: 99,
         agent_cli: "definitely-not-a-cli".into(),
-        worker_model: "sonnet; rm -rf /".into(),
-        reviewer_model: "".into(),
-        orchestrator_model: "opus".into(),
-        planner_model: "".into(),
+        blocks: workflow::default_roster(&[
+            (Role::Orchestrator, "", "opus"),
+            (Role::Worker, "", "sonnet; rm -rf /"),
+            (Role::Reviewer, "", ""),
+            (Role::Planner, "", ""),
+        ]),
         auto_ops: true,
         idle_kill_minutes: 99999,
         max_spawns_per_hour: 9999,
@@ -191,19 +200,14 @@ fn guardrail_clamps_and_sanitizes() {
     assert_eq!(g.max_spawns_per_hour, 240, "spawn-rate cap clamps to the ceiling");
     assert_eq!(g.watchdog_stall_minutes, 1440, "watchdog stall timeout clamps to 24h");
     assert_eq!(g.agent_cli, "claude", "unknown group CLIs fall back to claude explicitly");
-    assert_eq!(g.worker_model, "sonnetrm-rf", "shell metacharacters must be stripped");
-    assert_eq!(g.reviewer_model, "sonnet", "empty model falls back to default");
-    // Reasoning roles (orchestrator, planner) default to the strong tier on Claude.
-    assert_eq!(g.planner_model, "opus", "empty planner model falls back to the reasoning tier");
-    // Copilot's fallback model is "auto" (it picks the best itself), and a
-    // per-role CLI overrides the group default (issue #4).
+    assert_eq!(g.model_for(Role::Worker), "sonnetrm-rf", "shell metacharacters must be stripped");
+    assert_eq!(g.model_for(Role::Reviewer), "sonnet", "empty model falls back to default");
+    // Reasoning classes (orchestrator, planner) default to the strong tier on Claude.
+    assert_eq!(g.model_for(Role::Planner), "opus", "empty planner model falls back to the reasoning tier");
+    // Copilot's fallback model is "auto" (it picks the best itself).
     let g = Guardrails {
         max_agents: 4,
         agent_cli: "copilot".into(),
-        worker_model: "".into(),
-        reviewer_model: "".into(),
-        orchestrator_model: "".into(),
-        planner_model: "".into(),
         auto_ops: false,
         idle_kill_minutes: 0,
         max_spawns_per_hour: 0,
@@ -211,23 +215,28 @@ fn guardrail_clamps_and_sanitizes() {
         ..Guardrails::default()
     }
     .clamped();
-    assert_eq!(g.worker_model, "auto");
-    assert_eq!(g.orchestrator_model, "auto");
-    assert_eq!(g.planner_model, "auto");
-    // A per-role CLI is honored by `cli_for` (empty roles inherit agent_cli);
-    // its model fallback follows the role's *effective* CLI.
+    assert_eq!(g.model_for(Role::Worker), "auto");
+    assert_eq!(g.model_for(Role::Orchestrator), "auto");
+    assert_eq!(g.model_for(Role::Planner), "auto");
+    assert_eq!(g.blocks.len(), 4, "an empty roster is filled with the built-in 4 blocks");
+    // A per-block CLI overrides the group default (issue #4, now a block field);
+    // the model fallback follows the block's *effective* CLI.
     let g = Guardrails {
         max_agents: 4,
         agent_cli: "copilot".into(),
-        worker_cli: "claude".into(),
-        worker_model: "".into(),
+        blocks: workflow::default_roster(&[
+            (Role::Orchestrator, "", ""),
+            (Role::Worker, "claude", ""),
+            (Role::Reviewer, "", ""),
+            (Role::Planner, "", ""),
+        ]),
         ..Guardrails::default()
     }
     .clamped();
-    assert_eq!(g.cli_for(Role::Worker), "claude", "per-role CLI overrides the group default");
-    assert_eq!(g.cli_for(Role::Reviewer), "copilot", "an empty per-role CLI inherits the group default");
-    assert_eq!(g.worker_model, "sonnet", "worker model fallback follows the worker's claude CLI");
-    assert_eq!(g.reviewer_model, "auto", "reviewer model fallback follows the inherited copilot CLI");
+    assert_eq!(g.cli_for(Role::Worker), "claude", "a block's CLI overrides the group default");
+    assert_eq!(g.cli_for(Role::Reviewer), "copilot", "an empty block CLI inherits the group default");
+    assert_eq!(g.model_for(Role::Worker), "sonnet", "worker model fallback follows the worker block's claude CLI");
+    assert_eq!(g.model_for(Role::Reviewer), "auto", "reviewer model fallback follows the inherited copilot CLI");
 }
 
 // ---------- #56: adjustable max_agents on the fly ----------
@@ -304,7 +313,15 @@ fn max_agents_change_survives_launcher_relaunch() {
     let v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
     assert_eq!(v["guardrails"]["max_agents"].as_u64().unwrap(), 9);
     assert!(v["created_ms"].as_u64().is_some(), "created_ms must survive the patch");
-    assert_eq!(v["guardrails"]["worker_model"], json!("sonnet"), "other guardrails must survive the patch");
+    // The in-place patch must not disturb the block roster (#222) — it is the
+    // group's whole agent identity, and set_max_agents rewrites one integer.
+    let worker = v["guardrails"]["blocks"]
+        .as_array()
+        .expect("the roster must survive the patch")
+        .iter()
+        .find(|b| b["id"] == "worker")
+        .expect("the worker block must survive the patch");
+    assert_eq!(worker["model"], json!("sonnet"), "other guardrails must survive the patch");
     // A fresh registry (app restart) + a real launcher relaunch on the same
     // repo: this drives create_group's actual resume path, not a hand-fed
     // group.json. The launcher hardcodes its default cap (rails() = 2), but the
@@ -760,7 +777,7 @@ fn claude_command_minimizes_init_approvals_without_bypass() {
     let (reg, _d) = test_registry();
     let cfg = Path::new("C:/x/cfg.json");
     let gdir = Path::new("C:/data/group");
-    let cmd = reg.build_agent_command("claude", "sonnet", false, cfg, gdir, Path::new("C:/repo"), None, false, false);
+    let cmd = reg.build_agent_command("claude", "sonnet", false, cfg, gdir, Path::new("C:/repo"), None, false, false, &PersonaInject::default());
     assert!(cmd.contains("--model sonnet"));
     assert!(cmd.contains("--permission-mode acceptEdits"));
     assert!(cmd.contains("--strict-mcp-config"), "workers must not see the user's other MCP servers");
@@ -769,7 +786,7 @@ fn claude_command_minimizes_init_approvals_without_bypass() {
     assert!(cmd.contains("--allowedTools mcp__loomux"),
         "loomux tools must be pre-approved so report/list never prompt");
     assert!(!cmd.contains("Bash(git"), "git is not pre-approved for a non-auto_ops worker");
-    let cmd = reg.build_agent_command("claude", "sonnet", true, cfg, gdir, Path::new("C:/repo"), None, false, false);
+    let cmd = reg.build_agent_command("claude", "sonnet", true, cfg, gdir, Path::new("C:/repo"), None, false, false, &PersonaInject::default());
     assert!(cmd.contains("--permission-mode auto"),
         "the Auto preset must use Claude Code's native auto permission mode");
     assert!(cmd.contains("\"Bash(git *)\"") && cmd.contains("\"Bash(gh *)\""),
@@ -782,7 +799,7 @@ fn claude_command_minimizes_init_approvals_without_bypass() {
     assert!(!cmd.contains("--disallowedTools"), "non-planner agents get no tool denials");
     // A planner (read_only=true) is denied file writes + git commit/push at
     // the CLI level, even under Auto perms — but keeps gh for the plan comment.
-    let plan = reg.build_agent_command("claude", "opus", true, cfg, gdir, Path::new("C:/repo"), None, false, true);
+    let plan = reg.build_agent_command("claude", "opus", true, cfg, gdir, Path::new("C:/repo"), None, false, true, &PersonaInject::default());
     assert!(plan.contains("--disallowedTools"), "planner must deny tools structurally");
     for denied in ["Edit", "Write", "MultiEdit", "NotebookEdit"] {
         assert!(plan.contains(denied), "planner must deny the {denied} tool");
@@ -809,7 +826,7 @@ fn planner_runs_unattended_regardless_of_auto_ops() {
     let cfg = Path::new("C:/x/cfg.json");
     let gdir = Path::new("C:/data/group");
     // auto_ops = FALSE, read_only = TRUE (a planner in a manual-ops group).
-    let plan = reg.build_agent_command("claude", "opus", false, cfg, gdir, Path::new("C:/repo"), None, false, true);
+    let plan = reg.build_agent_command("claude", "opus", false, cfg, gdir, Path::new("C:/repo"), None, false, true, &PersonaInject::default());
     assert!(plan.contains("--permission-mode auto"),
         "a planner runs unattended (Auto perms) even when the group is not auto_ops — else it deadlocks");
     assert!(plan.contains("\"Bash(gh *)\""),
@@ -820,7 +837,7 @@ fn planner_runs_unattended_regardless_of_auto_ops() {
         "writes/commit/push stay denied structurally — Auto perms don't loosen the read-only contract");
     // By contrast a non-auto_ops WORKER (read_only=false) is unchanged: it
     // stays in acceptEdits with no pre-approved git/gh (the human gates ops).
-    let worker = reg.build_agent_command("claude", "sonnet", false, cfg, gdir, Path::new("C:/repo"), None, false, false);
+    let worker = reg.build_agent_command("claude", "sonnet", false, cfg, gdir, Path::new("C:/repo"), None, false, false, &PersonaInject::default());
     assert!(worker.contains("--permission-mode acceptEdits"),
         "a non-auto_ops worker is unaffected: it still gates ops through acceptEdits");
     assert!(!worker.contains("\"Bash(gh *)\""),
@@ -832,7 +849,7 @@ fn copilot_command_uses_copilot_adapter_flags() {
     let (reg, _d) = test_registry();
     let cfg = Path::new("C:/x/cfg.json");
     let gdir = Path::new("C:/data/group");
-    let cmd = reg.build_agent_command("copilot", "auto", true, cfg, gdir, Path::new("C:/repo"), None, false, false);
+    let cmd = reg.build_agent_command("copilot", "auto", true, cfg, gdir, Path::new("C:/repo"), None, false, false, &PersonaInject::default());
     assert!(cmd.starts_with("copilot "), "selected CLI must actually be launched, not claude");
     assert!(
         cmd.contains("--additional-mcp-config \"@C:/x/cfg.json\""),
@@ -856,22 +873,22 @@ fn copilot_command_uses_copilot_adapter_flags() {
     assert!(cmd.contains("--autopilot"),
         "group copilot workers run in true autopilot mode; the kickoff confirms the consent dialog");
     // Conservative preset keeps the explicit allowlist instead.
-    let cmd = reg.build_agent_command("copilot", "auto", false, cfg, gdir, Path::new("C:/repo"), None, false, false);
+    let cmd = reg.build_agent_command("copilot", "auto", false, cfg, gdir, Path::new("C:/repo"), None, false, false, &PersonaInject::default());
     assert!(!cmd.contains("--allow-all-tools") && !cmd.contains("--autopilot"));
     assert!(cmd.contains("--allow-tool \"shell(git:*)\"") && cmd.contains("--allow-tool \"shell(gh:*)\""));
     // Resume reopens a tracked session via --resume; copilot has no
     // pre-assignable id, so a session without resume adds no session flag.
     let sid = "aabbccdd-1122-4334-8556-77889900aabb";
-    let cmd = reg.build_agent_command("copilot", "auto", true, cfg, gdir, Path::new("C:/repo"), Some(sid), true, false);
+    let cmd = reg.build_agent_command("copilot", "auto", true, cfg, gdir, Path::new("C:/repo"), Some(sid), true, false, &PersonaInject::default());
     assert!(cmd.contains(&format!("--resume {sid}")), "copilot resume must pass --resume, got: {cmd}");
-    let cmd = reg.build_agent_command("copilot", "auto", true, cfg, gdir, Path::new("C:/repo"), Some(sid), false, false);
+    let cmd = reg.build_agent_command("copilot", "auto", true, cfg, gdir, Path::new("C:/repo"), Some(sid), false, false, &PersonaInject::default());
     assert!(!cmd.contains("--resume") && !cmd.contains("--session-id"),
         "a fresh copilot spawn cannot pin a session id");
     // A non-planner copilot agent gets no deny-tool flags.
     assert!(!cmd.contains("--deny-tool"), "non-planner copilot agents get no tool denials");
     // A planner (read_only=true) denies writes + git commit/push even under
     // --allow-all-tools (deny wins in Copilot); gh stays reachable.
-    let plan = reg.build_agent_command("copilot", "auto", true, cfg, gdir, Path::new("C:/repo"), None, false, true);
+    let plan = reg.build_agent_command("copilot", "auto", true, cfg, gdir, Path::new("C:/repo"), None, false, true, &PersonaInject::default());
     assert!(plan.contains("--deny-tool \"write\"") && plan.contains("--deny-tool \"edit\""),
         "planner must deny copilot's write/edit tools, got: {plan}");
     assert!(plan.contains("--deny-tool \"shell(git commit)\"") && plan.contains("--deny-tool \"shell(git push)\""),
@@ -890,7 +907,7 @@ fn copilot_planner_runs_unattended_regardless_of_auto_ops() {
     let cfg = Path::new("C:/x/cfg.json");
     let gdir = Path::new("C:/data/group");
     // auto_ops = FALSE, read_only = TRUE (a planner in a manual-ops group).
-    let plan = reg.build_agent_command("copilot", "auto", false, cfg, gdir, Path::new("C:/repo"), None, false, true);
+    let plan = reg.build_agent_command("copilot", "auto", false, cfg, gdir, Path::new("C:/repo"), None, false, true, &PersonaInject::default());
     assert!(plan.contains("--allow-all-tools") && plan.contains("--allow-all-paths"),
         "a non-auto_ops copilot planner must run unattended (all tools/paths), else it deadlocks: {plan}");
     assert!(plan.contains("--autopilot"),
@@ -901,7 +918,7 @@ fn copilot_planner_runs_unattended_regardless_of_auto_ops() {
         "gh stays allowed so the copilot planner can post its plan comment unattended");
     // A non-auto_ops copilot WORKER (read_only=false) is unchanged: it keeps
     // the conservative interactive preset (no allow-all).
-    let worker = reg.build_agent_command("copilot", "auto", false, cfg, gdir, Path::new("C:/repo"), None, false, false);
+    let worker = reg.build_agent_command("copilot", "auto", false, cfg, gdir, Path::new("C:/repo"), None, false, false, &PersonaInject::default());
     assert!(!worker.contains("--allow-all-tools") && !worker.contains("--autopilot"),
         "a non-auto_ops copilot worker stays interactive — only planners run unattended");
 }
@@ -952,7 +969,7 @@ fn single_pane_flags_reuse_the_group_path_atoms() {
 
     // Claude: permission mode + the shared git/gh allowlist constant.
     let group_claude =
-        reg.build_agent_command("claude", "sonnet", true, cfg, gdir, Path::new("C:/repo"), None, false, false);
+        reg.build_agent_command("claude", "sonnet", true, cfg, gdir, Path::new("C:/repo"), None, false, false, &PersonaInject::default());
     let single_claude = single_pane_autopilot_flags("claude");
     assert!(single_claude.contains(&format!("--permission-mode {}", claude_permission_mode(true))));
     assert!(group_claude.contains(&format!("--permission-mode {}", claude_permission_mode(true))));
@@ -962,7 +979,7 @@ fn single_pane_flags_reuse_the_group_path_atoms() {
     // Copilot: single-pane uses the allow-all atom; the group path uses the
     // group-autopilot atom, which is that same allow-all atom PLUS --autopilot.
     let group_copilot =
-        reg.build_agent_command("copilot", "auto", true, cfg, gdir, Path::new("C:/repo"), None, false, false);
+        reg.build_agent_command("copilot", "auto", true, cfg, gdir, Path::new("C:/repo"), None, false, false, &PersonaInject::default());
     let single_copilot = single_pane_autopilot_flags("copilot");
     assert_eq!(single_copilot, COPILOT_UNATTENDED_FLAGS);
     assert!(group_copilot.contains(COPILOT_GROUP_AUTOPILOT_FLAGS),
@@ -1002,8 +1019,8 @@ fn copilot_autopilot_posture_splits_group_from_single_pane() {
     let (reg, _d) = test_registry();
     let cfg = Path::new("C:/x/cfg.json");
     let gdir = Path::new("C:/data/group");
-    let worker = reg.build_agent_command("copilot", "auto", true, cfg, gdir, Path::new("C:/repo"), None, false, false);
-    let planner = reg.build_agent_command("copilot", "auto", false, cfg, gdir, Path::new("C:/repo"), None, false, true);
+    let worker = reg.build_agent_command("copilot", "auto", true, cfg, gdir, Path::new("C:/repo"), None, false, false, &PersonaInject::default());
+    let planner = reg.build_agent_command("copilot", "auto", false, cfg, gdir, Path::new("C:/repo"), None, false, true, &PersonaInject::default());
     assert!(worker.contains("--autopilot") && planner.contains("--autopilot"),
         "group-mode unattended copilot spawns enter true autopilot mode");
 }
@@ -1162,7 +1179,7 @@ fn build_agent_command_full_line_snapshots() {
     let wd = Path::new("C:/repo");
     // signature: (cli, model, auto_ops, cfg, group_dir, workdir, session, resume, read_only)
     let cmd = |cli, model, auto_ops, read_only| {
-        reg.build_agent_command(cli, model, auto_ops, cfg, gdir, wd, None, false, read_only)
+        reg.build_agent_command(cli, model, auto_ops, cfg, gdir, wd, None, false, read_only, &PersonaInject::default())
     };
 
     // Claude worker, auto_ops ON → native Auto mode + git/gh pre-approval.
@@ -1226,21 +1243,28 @@ fn build_agent_command_full_line_snapshots() {
     );
 }
 
-/// Split a shell command line into argv, honoring double quotes (the only
-/// quoting `build_agent_command` emits). `--add-dir "C:/a b"` → two tokens;
-/// `@"C:/x"` → `@C:/x`; `"Bash(git *)"` → one token with its inner space.
+/// Split a shell command line into argv, honoring the two quotings
+/// `build_agent_command` emits. Double quotes wrap paths and tool patterns
+/// (`--add-dir "C:/a b"`, `"Bash(git *)"`, `@"C:/x"` → `@C:/x`); single quotes
+/// wrap the `--agents` JSON payload, whose body is full of double quotes
+/// (#222) — which is exactly why that one is single-quoted, in both PowerShell
+/// and POSIX sh.
 fn shell_tokenize(line: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
-    let mut in_quote = false;
+    let mut quote: Option<char> = None;
     let mut started = false; // distinguishes "" (empty token) from whitespace
     for c in line.chars() {
         match c {
-            '"' => {
-                in_quote = !in_quote;
+            '"' | '\'' if quote.is_none() => {
+                quote = Some(c);
                 started = true;
             }
-            ' ' | '\t' if !in_quote => {
+            _ if quote == Some(c) => {
+                quote = None;
+                started = true;
+            }
+            ' ' | '\t' if quote.is_none() => {
                 if started {
                     out.push(std::mem::take(&mut cur));
                     started = false;
@@ -1268,7 +1292,7 @@ fn build_agent_argv_snapshots() {
     let gdir = Path::new("C:/data/group");
     let wd = Path::new("C:/repo");
     let argv =
-        |cli, model, auto_ops, read_only| reg.build_agent_argv(cli, model, auto_ops, cfg, gdir, wd, None, false, read_only);
+        |cli, model, auto_ops, read_only| reg.build_agent_argv(cli, model, auto_ops, cfg, gdir, wd, None, false, read_only, &PersonaInject::default());
 
     // Claude worker, auto_ops ON. Note the quote-free literal tool tokens.
     assert_eq!(
@@ -1312,23 +1336,45 @@ fn build_agent_argv_matches_command_line() {
     let sid = "11111111-2222-3333-4444-555555555555";
     let sessions: [(Option<&str>, bool); 3] =
         [(None, false), (Some(sid), false), (Some(sid), true)];
+    // The matrix now includes the #222 persona flags. The `--agents` payload is
+    // the only token loomux single-quotes, and it is stuffed with double quotes,
+    // spaces and escapes — so it is by far the most likely place for the two
+    // forms to drift.
+    let personas: [PersonaInject; 4] = [
+        PersonaInject::default(),
+        PersonaInject {
+            claude_agents_json: Some(
+                r#"{"rev-sec":{"description":"Security review","prompt":"Look for authz holes.\nNothing else."}}"#
+                    .to_string(),
+            ),
+            claude_agent: Some("rev-sec".into()),
+            ..PersonaInject::default()
+        },
+        PersonaInject { copilot_agent: Some("repo-worker".into()), ..PersonaInject::default() },
+        PersonaInject {
+            extra_allow: vec!["Bash(make:*)".into(), "mcp__probe".into()],
+            ..PersonaInject::default()
+        },
+    ];
     for cli in ["claude", "copilot", "totally-unknown-cli"] {
         for auto_ops in [false, true] {
             for read_only in [false, true] {
                 for (session, resume) in sessions {
-                    let line = reg.build_agent_command(
-                        cli, "m", auto_ops, cfg, gdir, wd, session, resume, read_only,
-                    );
-                    let argv = reg.build_agent_argv(
-                        cli, "m", auto_ops, cfg, gdir, wd, session, resume, read_only,
-                    );
-                    assert_eq!(
-                        shell_tokenize(&line),
-                        argv,
-                        "argv must equal the tokenized command line for \
-                         cli={cli} auto_ops={auto_ops} read_only={read_only} \
-                         session={session:?} resume={resume}\n  line: {line}"
-                    );
+                    for persona in &personas {
+                        let line = reg.build_agent_command(
+                            cli, "m", auto_ops, cfg, gdir, wd, session, resume, read_only, persona,
+                        );
+                        let argv = reg.build_agent_argv(
+                            cli, "m", auto_ops, cfg, gdir, wd, session, resume, read_only, persona,
+                        );
+                        assert_eq!(
+                            shell_tokenize(&line),
+                            argv,
+                            "argv must equal the tokenized command line for \
+                             cli={cli} auto_ops={auto_ops} read_only={read_only} \
+                             session={session:?} resume={resume} persona={persona:?}\n  line: {line}"
+                        );
+                    }
                 }
             }
         }
@@ -1468,6 +1514,7 @@ fn copilot_group_resumes_a_recorded_session() {
         .spawn_agent_ex(
             &g.id,
             Role::Worker,
+            None,
             "resumed",
             "follow-up",
             false,
@@ -1482,7 +1529,7 @@ fn copilot_group_resumes_a_recorded_session() {
     // A mangled id is rejected rather than silently resuming the wrong one.
     assert!(reg
         .spawn_agent_ex(
-            &g.id, Role::Worker, "bad", "", false, None, None,
+            &g.id, Role::Worker, None, "bad", "", false, None, None,
             Some("../../etc/passwd".into()),
             Some(dir.path().to_string_lossy().into_owned()),
             None,
@@ -1517,11 +1564,11 @@ fn kickoff_prompt_references_instructions_and_task() {
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
     let w = reg.spawn_agent(&g.id, Role::Worker, "fix-auth", "Fix issue #7", false, None).unwrap();
-    let k = reg.kickoff_prompt(&w, &g, "note");
+    let k = reg.kickoff_prompt(&w, &g, "note", None);
     assert!(k.contains("worker.md"));
     assert!(k.contains("Fix issue #7"));
     let idle = reg.spawn_agent(&g.id, Role::Worker, "idle", "", false, None).unwrap();
-    let k = reg.kickoff_prompt(&idle, &g, "");
+    let k = reg.kickoff_prompt(&idle, &g, "", None);
     assert!(k.contains("No task is assigned yet"));
 }
 
@@ -1532,7 +1579,7 @@ fn planner_kickoff_references_planner_instructions() {
     let p = reg
         .spawn_agent(&g.id, Role::Planner, "plan-47", "Plan issue #47", false, None)
         .unwrap();
-    let k = reg.kickoff_prompt(&p, &g, "note");
+    let k = reg.kickoff_prompt(&p, &g, "note", None);
     assert!(k.contains("planner.md"), "planner kickoff must reference its instructions file");
     assert!(k.contains("a planner agent"), "kickoff must name the planner role");
     assert!(k.contains("Plan issue #47"));
@@ -1554,7 +1601,7 @@ fn planner_explores_read_only_and_never_gets_a_worktree() {
     );
     // The planner's spawn-time read-only note (PLANNER_READONLY_NOTE) is threaded
     // verbatim into its kickoff, communicating the no-code/branches/PRs contract.
-    let k = reg.kickoff_prompt(&p, &g, PLANNER_READONLY_NOTE);
+    let k = reg.kickoff_prompt(&p, &g, PLANNER_READONLY_NOTE, None);
     assert!(
         k.contains("never create branches, worktrees, commits, or PRs"),
         "planner kickoff must carry the read-only containment note, got: {k}"
@@ -1579,41 +1626,58 @@ fn planner_counts_toward_the_live_agent_cap() {
 }
 
 #[test]
-fn per_role_cli_is_pinned_at_spawn_and_persisted() {
+fn per_block_cli_is_pinned_at_spawn_and_persisted() {
     let (reg, _d) = test_registry();
-    // Group default is copilot, but the reviewer role overrides to claude (#4).
+    // Group default is copilot, but the reviewer BLOCK overrides to claude
+    // (#4's per-role CLI, now a block field — #222).
     let rails = Guardrails {
         agent_cli: "copilot".into(),
-        reviewer_cli: "claude".into(),
+        blocks: workflow::default_roster(&[
+            (Role::Orchestrator, "", ""),
+            (Role::Worker, "", ""),
+            (Role::Reviewer, "claude", ""),
+            (Role::Planner, "", ""),
+        ]),
         max_agents: 4,
         ..rails()
     };
     let g = reg.create_group("C:/tmp/mixed-repo", rails).unwrap();
-    // Observable per-role effect: claude agents get a pre-assigned session id;
+    // Observable per-block effect: claude agents get a pre-assigned session id;
     // copilot agents mint their own later, so start without one.
     let worker = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
     let reviewer = reg.spawn_agent(&g.id, Role::Reviewer, "rev", "t", false, None).unwrap();
     assert!(worker.session_id.is_none(), "worker inherits the copilot group default (no pre-assigned session)");
-    assert!(reviewer.session_id.is_some(), "reviewer's per-role claude CLI pre-assigns a session id");
-    // The per-role config is persisted additively to group.json.
+    assert!(reviewer.session_id.is_some(), "the reviewer block's claude CLI pre-assigns a session id");
+    // The roster is persisted to group.json as the block array.
     let gj = fs::read_to_string(reg.state_root().join(&g.id).join("group.json")).unwrap();
     let v: Value = serde_json::from_str(&gj).unwrap();
-    assert_eq!(v["guardrails"]["reviewer_cli"], "claude");
     assert_eq!(v["guardrails"]["agent_cli"], "copilot");
-    assert!(v["guardrails"].get("planner_cli").is_some(), "planner_cli must be persisted");
-    assert!(v["guardrails"].get("planner_model").is_some(), "planner_model must be persisted");
+    let blocks = v["guardrails"]["blocks"].as_array().expect("blocks array persisted");
+    let rev = blocks.iter().find(|b| b["id"] == "reviewer").expect("reviewer block persisted");
+    assert_eq!(rev["cli"], "claude");
+    assert_eq!(rev["kind"], "reviewer");
+    assert!(blocks.iter().any(|b| b["id"] == "planner"), "every block is persisted, not just the overridden one");
 }
 
 #[test]
-fn unknown_per_role_cli_is_rejected_at_spawn() {
+fn unknown_block_cli_is_rejected_at_spawn() {
     let (reg, _d) = test_registry();
-    // A hand-edited group.json could pin an unsupported CLI to a role; the
+    // A hand-edited group.json could pin an unsupported CLI to a block; the
     // spawn must reject it rather than silently downgrade (#4).
-    let rails = Guardrails { worker_cli: "aider".into(), max_agents: 4, ..rails() };
+    let rails = Guardrails {
+        blocks: workflow::default_roster(&[
+            (Role::Orchestrator, "", ""),
+            (Role::Worker, "aider", ""),
+            (Role::Reviewer, "", ""),
+            (Role::Planner, "", ""),
+        ]),
+        max_agents: 4,
+        ..rails()
+    };
     let g = reg.create_group("C:/tmp/bad-cli-repo", rails).unwrap();
     let err = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap_err();
-    assert!(err.contains("unsupported agent CLI"), "unknown per-role CLI must be rejected: {err}");
-    // Roles that inherit the (valid) group default still spawn fine.
+    assert!(err.contains("unsupported agent CLI"), "unknown block CLI must be rejected: {err}");
+    // Blocks that inherit the (valid) group default still spawn fine.
     reg.spawn_agent(&g.id, Role::Reviewer, "rev", "t", false, None).unwrap();
 }
 
@@ -1883,10 +1947,10 @@ fn claude_agents_get_preassigned_resumable_sessions() {
     // The launch command pins the id.
     let cfg = Path::new("C:/x/cfg.json");
     let gdir = Path::new("C:/x/g");
-    let cmd = reg.build_agent_command("claude", "sonnet", false, cfg, gdir, Path::new("C:/repo"), Some(&sid), false, false);
+    let cmd = reg.build_agent_command("claude", "sonnet", false, cfg, gdir, Path::new("C:/repo"), Some(&sid), false, false, &PersonaInject::default());
     assert!(cmd.contains(&format!("--session-id {sid}")));
     // Resume uses --resume instead.
-    let cmd = reg.build_agent_command("claude", "sonnet", false, cfg, gdir, Path::new("C:/repo"), Some(&sid), true, false);
+    let cmd = reg.build_agent_command("claude", "sonnet", false, cfg, gdir, Path::new("C:/repo"), Some(&sid), true, false, &PersonaInject::default());
     assert!(cmd.contains(&format!("--resume {sid}")) && !cmd.contains("--session-id"));
 }
 
@@ -1895,12 +1959,12 @@ fn resume_spawn_requires_valid_session_and_existing_cwd() {
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
     let bad_session = reg.spawn_agent_ex(
-        &g.id, Role::Worker, "w", "follow-up", false, None, None,
+        &g.id, Role::Worker, None, "w", "follow-up", false, None, None,
         Some("; rm -rf /".into()), None, None,
     );
     assert!(bad_session.is_err(), "shell-metachar session ids must be rejected");
     let bad_cwd = reg.spawn_agent_ex(
-        &g.id, Role::Worker, "w", "follow-up", false, None, None,
+        &g.id, Role::Worker, None, "w", "follow-up", false, None, None,
         Some("abc-123".into()), Some("C:/definitely/not/a/dir".into()), None,
     );
     assert!(bad_cwd.unwrap_err().contains("cwd"), "resume cwd must exist");
@@ -1908,7 +1972,7 @@ fn resume_spawn_requires_valid_session_and_existing_cwd() {
     let dir = tempfile::tempdir().unwrap();
     let ok = reg
         .spawn_agent_ex(
-            &g.id, Role::Worker, "w", "follow-up", false, None, None,
+            &g.id, Role::Worker, None, "w", "follow-up", false, None, None,
             Some("abc-123".into()), Some(dir.path().to_string_lossy().into_owned()), None,
         )
         .unwrap();
@@ -2393,7 +2457,7 @@ fn orchestrator_session_restores_full_group_with_fresh_mcp_identity() {
     assert!(req.command.contains("--mcp-config"),
         "restore must re-wire MCP identity — the whole point");
     let g = reg.group(&gid).expect("group re-registered in memory");
-    assert_eq!(g.guardrails.worker_model, "sonnet", "guardrails must be restored from group.json");
+    assert_eq!(g.guardrails.model_for(Role::Worker), "sonnet", "the block roster must be restored from group.json");
     // A second restore while live is refused.
     let err = resume_recorded_session(&reg, &orch_sid, None).unwrap_err();
     assert!(err.contains("already"), "got: {err}");
@@ -4742,7 +4806,7 @@ fn auto_merge_toggle_roundtrip_durable_audited_and_in_kickoff() {
     let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
     let entry = reg.agent(&orch.id).unwrap();
     let info = reg.group(&g.id).unwrap();
-    let kickoff = reg.kickoff_prompt(&entry, &info, "");
+    let kickoff = reg.kickoff_prompt(&entry, &info, "", None);
     assert!(kickoff.contains("auto-merge is ENABLED"), "kickoff must surface auto-merge on, got: {kickoff}");
     // No-op re-enable does not re-audit.
     reg.set_auto_merge(&g.id, true).unwrap();
@@ -5974,7 +6038,7 @@ fn spawn_worktree_cuts_from_default_branch_not_primary_head() {
     // An explicit base stacks a worktree on the feature branch deliberately.
     let stacked = reg
         .spawn_agent_ex(
-            &g.id, Role::Worker, "s", "t", true, Some("agent-y".into()),
+            &g.id, Role::Worker, None, "s", "t", true, Some("agent-y".into()),
             Some("docs/stray".into()), None, None, None,
         )
         .unwrap();
