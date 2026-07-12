@@ -155,6 +155,16 @@ function eventsFor(ws: Workspace): PaneEvents {
         pane
       );
     },
+    // The file browser's "Open in workflow pane" (#222), on a .yml/.yaml row: the same
+    // call, one kind over. `openContentPane` was already generic — it needed nothing.
+    onOpenWorkflowPane: (pane, opts) => {
+      ws.grid.openContentPane(
+        eventsFor(ws),
+        { kind: "workflow", name: opts.name, root: opts.root, file: opts.file },
+        "row",
+        pane
+      );
+    },
     onMinimize: (pane) => ws.grid.minimize(pane),
     onMaximize: (pane) => ws.grid.toggleMaximize(pane),
     onToggleGroupMinimize: (pane) => {
@@ -523,15 +533,23 @@ async function openActionPane(
       return pane;
     }
     case "open-files":
-    case "open-editor": {
-      // A file explorer / file editor comes straight back — no process, no session, no
-      // credits. The one thing that can have changed under it is the folder: deleted,
-      // renamed, or on a drive that isn't mounted this boot. A pane rooted at a vanished
-      // directory would render an empty tree and a mystery, so fail SOFT to the welcome
-      // form in that slot with a message — the human re-points it in two clicks, and the
-      // rest of the layout restores around it (#214, #217).
-      const kind = a.type === "open-files" ? "files" : "editor";
-      const what = kind === "files" ? "File explorer" : "File editor";
+    case "open-editor":
+    case "open-workflow": {
+      // A file explorer / file editor / workflow pane comes straight back — no process,
+      // no session, no credits. The one thing that can have changed under it is the
+      // folder: deleted, renamed, or on a drive that isn't mounted this boot. A pane
+      // rooted at a vanished directory would render an empty tree and a mystery, so fail
+      // SOFT to the welcome form in that slot with a message — the human re-points it in
+      // two clicks, and the rest of the layout restores around it (#214, #217, #222).
+      //
+      // The WORKFLOW pane probes the same way (is the root a readable directory?) and
+      // deliberately does NOT probe the workflow FILE: a repo whose `.loomux/workflow.yml`
+      // has been deleted is not a broken pane, it is a pane with nothing in it yet — and
+      // it opens on the empty state that offers to create one.
+      const kind =
+        a.type === "open-files" ? "files" : a.type === "open-editor" ? "editor" : "workflow";
+      const what =
+        kind === "files" ? "File explorer" : kind === "editor" ? "File editor" : "Workflow pane";
       const root = a.root;
       if (!root || !(await ftRootIsDir(root))) {
         showToast(
@@ -548,8 +566,9 @@ async function openActionPane(
           root,
           // The editor reopens the file it was showing (a path — never a buffer; see
           // panerestore). A file deleted since just fails to open with a toast, in a
-          // pane that is otherwise back exactly as it was.
-          file: a.type === "open-editor" ? a.file ?? undefined : undefined,
+          // pane that is otherwise back exactly as it was. The workflow pane's file rides
+          // the same field, and an ABSENT one means the default `.loomux/workflow.yml`.
+          file: a.type === "open-files" ? undefined : a.file ?? undefined,
           background: true,
         },
         dir,
@@ -876,11 +895,18 @@ async function handleWelcomeSubmit(
     return;
   }
 
-  if (result.kind === "files" || result.kind === "editor" || result.kind === "git") {
+  if (
+    result.kind === "files" ||
+    result.kind === "editor" ||
+    result.kind === "git" ||
+    result.kind === "workflow"
+  ) {
     // Convert the setup pane into a CONTENT pane in place (#214 files, #217 editor /
-    // git). Synchronous — there is no process to start, so no await, no PTY, nothing to
-    // reap. The root was confirmed for real by the form before it fired this: a readable
-    // directory for files/editor, a git work tree for git.
+    // git, #222 workflow). Synchronous — there is no process to start, so no await, no
+    // PTY, nothing to reap. The root was confirmed for real by the form before it fired
+    // this: a readable directory for files/editor/workflow, a git work tree for git. The
+    // workflow pane takes no `file` here — the welcome flow means the repo's default
+    // `.loomux/workflow.yml`.
     pane.startContent({ kind: result.kind, name: result.name, root: result.root });
     // Converted in place — no grid open/close fired, so notify explicitly (this is
     // what re-renders the tab strip and re-persists the layout), same as terminal.
