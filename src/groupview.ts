@@ -43,6 +43,7 @@ import {
   normalizeComment,
   tickStatusLabel,
 } from "./autonomy";
+import { roleLabel } from "./orchbadge";
 
 /** Hard bounds on the live-agent cap, mirroring the launcher's input range and
  *  the backend's `MAX_AGENTS_CEILING`. The backend re-validates; these only
@@ -105,11 +106,10 @@ function costWithBasis(
   return `${approx}${fmtCost(n)}${label}`;
 }
 
-const ROLE_LABEL: Record<string, string> = {
-  orchestrator: "ORCH",
-  worker: "W",
-  reviewer: "REV",
-};
+// Role chip text comes from orchbadge.ts — the same table the PANE badge reads, so
+// a pane and its roster row can never label the same agent differently. This panel
+// kept its own copy for a while and it silently missed `planner` (#47): every
+// planner in the list showed a generic "AGENT" chip.
 
 export class GroupView {
   readonly el: HTMLElement;
@@ -793,9 +793,17 @@ export class GroupView {
       const usageOf = new Map(this.usage?.agents.map((a) => [a.id, a] as const));
       for (const a of s.agents) {
         const row = el("div", "group-row");
-        const chip = el("span", `group-role role-${a.role}`, ROLE_LABEL[a.role] ?? "AGENT");
+        const chip = el("span", `group-role role-${a.role}`, roleLabel(a.role));
         const name = el("span", "group-name", a.name);
         name.title = a.id;
+        // A workflow group's agents are BLOCKS (#222). Three reviewers all badged
+        // "REV" is exactly the ambiguity declaring them separately was meant to
+        // remove, so name the block beside the chip. For the built-in roster a
+        // block id IS its role name, so a default group's rows gain nothing and
+        // look exactly as they did.
+        const block =
+          a.block && a.block !== a.role ? el("span", "group-block", a.block) : null;
+        if (block) block.title = `workflow block ${a.block}`;
         const state = el(
           "span",
           "group-state",
@@ -820,7 +828,7 @@ export class GroupView {
         if (usage) {
           c.title = `source: ${usage.source}${usage.model ? ` · ${usage.model}` : ""} · ${usage.tokens.total} tokens (in ${usage.tokens.input}, out ${usage.tokens.output}, cache +${usage.tokens.cache_creation}/${usage.tokens.cache_read})`;
         }
-        row.append(chip, name, state, up, c);
+        row.append(chip, name, ...(block ? [block] : []), state, up, c);
         this.listEl.append(row);
       }
     }

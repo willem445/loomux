@@ -44,6 +44,16 @@ const ROLE_LABELS: Record<OrchRole, string> = {
   planner: "PLAN",
 };
 
+/** The short chip text for a role ("REV"). The one source for it: the pane badge
+ *  and the group panel's roster row both read this, so a pane and its row can
+ *  never label the same agent differently. (`groupview.ts` kept its own copy for a
+ *  while, and it silently missed `planner` — every planner showed as "AGENT".)
+ *  Unknown roles — a payload from a newer backend — degrade to "AGENT" rather
+ *  than to an empty chip. */
+export function roleLabel(role: string): string {
+  return ROLE_LABELS[role as OrchRole] ?? "AGENT";
+}
+
 /** The minimal identity a badge needs. `OrchSpawnRequest` is a structural
  *  superset, so spawn AND rejoin requests both satisfy it. */
 export interface BadgeAgent {
@@ -72,7 +82,7 @@ export function agentSeq(agentId: string): string {
 export function badgeFor(req: BadgeAgent): PaneBadge {
   const meta = metaForGroup(req.group_id);
   return {
-    label: `${ROLE_LABELS[req.role] ?? "AGENT"} ${agentSeq(req.agent_id)}`,
+    label: `${roleLabel(req.role)} ${agentSeq(req.agent_id)}`,
     color: meta.color,
     title: `${req.role} · ${req.agent_id} · group ${req.group_id}`,
   };

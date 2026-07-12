@@ -79,13 +79,82 @@ This is deliberately **not** the in-app editor: that is the `Alt+F` overlay abov
 unchanged, and it remains the right tool for a quick look or a one-line fix. The
 explorer is the one for "get this file into the app that owns it".
 
+### The advanced orchestrator
+
+By default an orchestration group runs loomux's four built-in roles — orchestrator,
+worker, reviewer, planner — with the CLI and model you pick per role in the launcher.
+That is the whole experience, and it is unchanged.
+
+Tick **Advanced orchestrator** in the launcher and the group runs the roster the *repo*
+declares, in `.loomux/workflow.yml`: as many blocks as you like, each with its own
+**kind** (worker / reviewer / planner — the capability class), **agent CLI**, **model**
+and **persona**. The obvious thing this buys you is **several focused reviewers** —
+security, tests, performance — each with its own prompt and its own model, all run on
+every PR, instead of one generalist reviewer told to look at everything.
+
+```yaml
+# .loomux/workflow.yml — committed, so everyone who clones the repo gets it
+version: 1
+name: focused-review
+
+blocks:
+  - id: worker
+    kind: worker
+    cli: claude
+    model: sonnet
+
+  - id: rev-security
+    name: Security review
+    kind: reviewer
+    model: opus
+    prompt: |
+      Review ONLY for security defects: injection, authz, secrets, path traversal.
+      Ignore style and perf — other reviewers cover those.
+
+  - id: rev-tests
+    name: Test-quality review
+    kind: reviewer
+    model: sonnet
+    prompt: Review ONLY test quality. Flag tests that cannot fail.
+
+edges:                       # advisory — the happy path, not a schedule
+  - { from: worker, to: [rev-security, rev-tests] }
+
+gates:                       # enforced — loomux holds the merge until it passes
+  merge:
+    require: all-pass
+    reviewers: [rev-security, rev-tests]
+```
+
+**The toggle is off by default, and that is deliberate.** A workflow file arrives with a
+`git clone`, and it can hand an agent repo-authored instructions — so it takes effect only
+when *you* turn it on, for that launch. Before you do, the launcher shows you the roster it
+resolves to: every block, its kind, CLI and model, and which blocks carry a repo-authored
+persona. If the file is broken you get **every** validation finding right there, and the
+group still launches — on the standard roster, never blocked by a file in the repo. **Edit
+workflow…** opens the file in a [workflow pane](#the-workflow-pane) so you can fix it first.
+
+What a workflow file can *never* do is grant a capability. `kind` is a closed set of four
+classes, and there is no spelling — no `read_only: false`, no fifth class — that makes a
+block anything it couldn't already be. You can have five reviewers with five prompts and
+five models; all five are still reviewers. See the
+[design note](doc/design/workflows.md).
+
+With the toggle on, the orchestrator is told the roster and the gates, and nothing else:
+it spawns delegates **by block id**, runs **every** declared reviewer on each PR, and treats
+a declared gate as a hard precondition on merging. What it keeps is its **scheduling
+judgment** — what to serialize, what to parallelize across worktrees, when to plan first.
+The edges declare the happy path; the orchestrator still routes.
+
 ### The workflow pane
 
 A **workflow** pane opens on a repo's `.loomux/workflow.yml` — the file that declares
 **which agent blocks** an orchestration run may use (a planner, a worker, three focused
 reviewers…), each with its own **prompt, model and agent CLI**; the **edges** between
 them; and the **merge gate** that must pass before anything is merged. The file is
-committed, so a workflow is shared with everyone who clones the repo.
+committed, so a workflow is shared with everyone who clones the repo — and it takes
+effect on a group only when that group was launched with the **advanced orchestrator**
+ticked (above).
 
 **The file is the source of truth.** The pane is three synced views over it:
 
