@@ -6617,3 +6617,83 @@ fn disk_tick_notifies_once_per_episode_and_skips_paused() {
     reg.disk_tick(low);
     assert_eq!(count_low_disk(), 2, "a paused group is skipped, so no new notice");
 }
+
+#[test]
+fn create_orchestration_group_maps_resume_session_onto_the_workflow_pin() {
+    use std::sync::Arc;
+    // #222 rev-11 F2, at the entry point instead of one layer below it.
+    //
+    // `create_group_ex(.., Launch::Resume)` pins the roster, and tests/workflow.rs
+    // asserts that directly. What THIS asserts is the wiring above it — that the two
+    // real callers land on the right side of the switch. `create_orchestration`
+    // passes no resume session (a human at the launcher, who has just been shown the
+    // roster preview: read the file). `resume_orch_session` passes one (a recorded
+    // session being reopened, which is nobody's consent moment: pin the roster).
+    // Swap those two and the unit test still passes while the feature is inverted.
+    let state = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    let repo_path = repo.path().to_string_lossy().replace('\\', "/");
+    let loomux = repo.path().join(".loomux");
+    fs::create_dir_all(&loomux).unwrap();
+    let declare = |id: &str| {
+        fs::write(
+            loomux.join("workflow.yml"),
+            format!("version: 1\nblocks:\n  - id: {id}\n    kind: reviewer\n"),
+        )
+        .unwrap()
+    };
+
+    let reg = Arc::new(OrchRegistry::new(state.path().to_path_buf()));
+    reg.set_port(45999);
+    let advanced = Guardrails { advanced_orchestrator: true, ..rails() };
+
+    // ── launch: no resume session ⇒ Fresh ⇒ the repo's file is read ──
+    declare("rev-approved");
+    let launched =
+        create_orchestration_group(&reg, &repo_path, advanced.clone(), None, None, 0).unwrap();
+    let gid = launched.group_id.clone();
+    assert!(
+        reg.group(&gid).unwrap().guardrails.block("rev-approved").is_some(),
+        "a launch reads the workflow file — this is the roster the human was shown"
+    );
+
+    // The human ends the group, and the repo moves on underneath them: a `git pull`
+    // brings a reviewer block they have never seen.
+    reg.end_group(&gid, false).unwrap();
+    declare("rev-never-seen");
+
+    // ── resume: a session id ⇒ Resume ⇒ the PERSISTED roster stands ──
+    let (persisted_repo, persisted) = reg.load_group_file(&gid).expect("group.json");
+    create_orchestration_group(
+        &reg,
+        &persisted_repo,
+        persisted,
+        Some("11111111-2222-3333-4444-555555555555".into()),
+        Some(&gid),
+        0,
+    )
+    .expect("a resume must not fail");
+
+    let resumed = reg.group(&gid).unwrap().guardrails;
+    assert!(
+        resumed.block("rev-approved").is_some(),
+        "the resumed group keeps the reviewer its human approved"
+    );
+    assert!(
+        resumed.block("rev-never-seen").is_none(),
+        "a block the repo gained AFTER the launch must not join a resumed group through the \
+         real entry point either — nobody consented to it"
+    );
+
+    // ...and a FRESH launch on that same repo does pick the new one up, so the pin is
+    // "a resume doesn't re-read", not "loomux stopped reading the file".
+    let state2 = tempfile::tempdir().unwrap();
+    let reg2 = Arc::new(OrchRegistry::new(state2.path().to_path_buf()));
+    reg2.set_port(45999);
+    let relaunched =
+        create_orchestration_group(&reg2, &repo_path, advanced, None, None, 0).unwrap();
+    assert!(
+        reg2.group(&relaunched.group_id).unwrap().guardrails.block("rev-never-seen").is_some(),
+        "editing the workflow and launching again must pick up the new roster"
+    );
+}

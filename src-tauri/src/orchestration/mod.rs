@@ -4372,7 +4372,17 @@ impl OrchRegistry {
                 if resolved == g.blocks {
                     return; // the file still says what the group is running
                 }
-                (ids(&resolved), "the file has changed since this group was launched")
+                // "Appeared" and "changed" are different events to a human reading
+                // the trail, and only one of them means "somebody edited the file
+                // you approved". A group whose running roster is the built-in four
+                // was launched without a workflow in play at all — so the repo has
+                // *gained* one since, and this group is simply not running it.
+                let note = if workflow::roster_is_custom(&g.blocks) {
+                    "the file has changed since this group was launched"
+                } else {
+                    "the repo has gained a workflow file since this group was launched"
+                };
+                (ids(&resolved), note)
             }
             Ok(None) if !workflow::roster_is_custom(&g.blocks) => return, // no file, no workflow: nothing to drift from
             Ok(None) => (Vec::new(), "the file the group was launched from is gone"),
@@ -7252,11 +7262,11 @@ impl OrchRegistry {
             return Ok(Some(ResolvedPersona {
                 text: workflow::sanitize_persona(prompt),
                 name: block.id.clone(),
-                // `sanitize_display` keeps a name readable (it only strips
-                // control characters), so it can still contain an apostrophe —
-                // and the description rides into the single-quoted `--agents`
-                // token. Persona-sanitize it too, or a block named `Bob's review`
-                // would close that quote.
+                // `sanitize_display` keeps a name readable — it strips control
+                // characters and braces, and nothing else — so it can still
+                // contain an apostrophe, and the description rides into the
+                // single-quoted `--agents` token. Persona-sanitize it too, or a
+                // block named `Bob's review` would close that quote.
                 description: workflow::sanitize_persona(&block.name),
                 // An inline `prompt:` is an addendum to the built-in role
                 // contract. Only a persona FILE can declare `mode: replace` —

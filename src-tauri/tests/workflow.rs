@@ -2059,6 +2059,37 @@ fn a_resumed_group_runs_the_roster_it_was_launched_with_not_the_file_as_it_is_no
     assert!(running.contains(&"rev-security"), "the audit says what is RUNNING: {running:?}");
     assert!(on_disk.contains(&"rev-perf"), "…and what the file now says: {on_disk:?}");
 
+    assert!(
+        drift["detail"]["note"].as_str().unwrap().contains("changed"),
+        "a file that was there and was edited reads as CHANGED: {drift}"
+    );
+
+    // A file that APPEARED is a different event to the human reading the trail, and
+    // only one of the two means "somebody edited the roster you approved". The group
+    // was launched with no workflow in play, so it is not running one — say that,
+    // rather than claiming a file it never read has changed.
+    let (reg_a, _da) = test_registry();
+    let repo_a = Repo::new(); // no workflow at launch...
+    let g_a = reg_a.create_group(&repo_a.path(), rails()).unwrap();
+    assert_eq!(g_a.guardrails.blocks.len(), 4, "…so the built-in roster runs");
+    fs::create_dir_all(Path::new(&repo_a.path()).join(".loomux")).unwrap();
+    fs::write(
+        Path::new(&repo_a.path()).join(".loomux").join("workflow.yml"),
+        "version: 1\nblocks:\n  - id: rev-new\n    kind: reviewer\n",
+    )
+    .unwrap();
+    let (pa, persisted_a) = reg_a.load_group_file(&g_a.id).unwrap();
+    let resumed_a = reg_a.create_group_ex(&pa, persisted_a, Launch::Resume).unwrap();
+    assert!(resumed_a.guardrails.block("rev-new").is_none(), "still not running it");
+    let appeared: Value = audit_entries(&reg_a, &g_a.id)
+        .into_iter()
+        .find(|v| v["action"] == "workflow-changed-since-launch")
+        .expect("a repo gaining a workflow a running group isn't using is worth saying");
+    assert!(
+        appeared["detail"]["note"].as_str().unwrap().contains("gained"),
+        "a file that appeared must not read as one that changed: {appeared}"
+    );
+
     // A resume with the file UNCHANGED is not drift, and must not cry wolf.
     let (reg2, _d2) = test_registry();
     let repo2 = Repo::new().workflow(FOCUSED_REVIEW).agent_file(
