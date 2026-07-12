@@ -7130,6 +7130,13 @@ fn gh_shim_harness_refuses_a_merge_that_moved_past_the_reviewed_revision() {
     assert!(!ok, "a pass must NOT survive a re-push — that merges code no reviewer saw");
     assert!(err.contains("rev-security") && err.contains("rev-tests") && err.contains(NEW_HEAD),
         "the refusal must name the stale reviewers and the revision they must re-review: {err}");
+    // …and say only what is true. Every reviewer here HAS recorded a verdict, so a
+    // refusal that also claims it is waiting on a verdict from nobody sends the
+    // orchestrator looking for a reviewer that isn't missing.
+    assert!(!err.contains("no verdict yet"),
+        "with every verdict stale and none outstanding, the refusal must not dangle an empty \
+         'no verdict yet from reviewer(s)' clause: {err}");
+    assert!(err.contains("EARLIER revision"), "{err}");
 
     // One reviewer re-reviews the new head: still short (the other is stale).
     reg.set_pr_head_override(Some(NEW_HEAD.into()));
@@ -7382,6 +7389,23 @@ fn a_hand_edited_verdict_word_is_read_the_same_way_by_both_halves_of_the_gate() 
     let status = reg.gate_status_line(&gid, 7).unwrap();
     assert!(status.contains("NOT YET SATISFIED") && status.contains("rev-tests"),
         "the two halves of the gate must agree on what a verdict is: {status}");
+
+    // The same agreement, on what the gate SAYS rather than on what a verdict is: an
+    // unrecognized `require` value is MALFORMED to both halves. `all-pass` is the strict
+    // rule, so silently falling back to it would look safe — but the shim would then be
+    // enforcing a rule the file does not state, and the two halves would agree only by
+    // luck. Neither guesses.
+    fs::write(group_dir.join("merge_gate"), "require bogus\nreviewer rev-security\nreviewer rev-tests\n").unwrap();
+    reg.grant_merge(&gid, "7", None, "human").unwrap();
+    let (ok, err) = merge(&shim, &group_dir);
+    assert!(!ok, "an unrecognized require value must refuse the merge, not read as all-pass");
+    assert!(err.contains("bogus") && err.contains("all-pass"),
+        "and must name the value it could not read, and what it does understand: {err}");
+    assert!(reg.merge_gate(&gid).is_none(), "Rust reads the same file as unusable");
+    assert!(reg.gate_status_line(&gid, 7).unwrap().contains("MALFORMED"),
+        "and reports it as MALFORMED — every merge refused — not as 'no gate declared'");
+    let audit = fs::read_to_string(group_dir.join("audit.jsonl")).unwrap_or_default();
+    assert!(audit.contains("malformed-gate"), "audited: {audit}");
 }
 
 #[test]

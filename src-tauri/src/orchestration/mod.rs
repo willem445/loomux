@@ -502,9 +502,16 @@ if [ -f "$LOOMUX_GROUP_DIR/merge_gate" ]; then
   # — refuse rather than wave it through. (loomux only ever writes well-formed gate
   # files; this is the hand-edited/truncated case.)
   [ -n "$g_revs" ] || loomux_block_wf "malformed-gate" "the declared merge gate names no reviewers"
+  # The gate's RULE, validated up front. An unrecognized `require` is refused, not
+  # quietly read as all-pass: `all-pass` happens to be the strict one today, so the
+  # silent fallback looked safe — but it means the shim would enforce a rule the file
+  # does not state, and the Rust half already calls this file MALFORMED. Two halves of
+  # one gate must agree about what it says, not merely land on the same answer by luck.
   case "$g_req" in
+    all-pass) : ;;
     threshold) case "$g_thr" in ''|*[!0-9]*) g_thr=0 ;; esac
                [ "$g_thr" -ge 1 ] || loomux_block_wf "malformed-gate" "the declared merge gate says require: threshold but carries no usable threshold number" ;;
+    *) loomux_block_wf "malformed-gate" "the merge gate declares an unrecognized require value ('$g_req') — loomux understands 'all-pass' and 'threshold'. A rule it cannot read is not a rule it will guess at" ;;
   esac
   g_pass=0; g_out=""; g_bad=""; g_stale=""
   for g_r in $g_revs; do
@@ -531,14 +538,23 @@ if [ -f "$LOOMUX_GROUP_DIR/merge_gate" ]; then
   # Blockers beat approvals (#197 A.3): one fail/escalate refuses the merge whatever
   # the others recorded and whatever the threshold says. Checked before any counting.
   [ -z "$g_bad" ] || loomux_block_wf "verdict-blocks" "reviewer(s)$g_bad recorded a fail/escalate verdict"
+  # Say only what is TRUE: a gate held up purely by stale verdicts must not also claim
+  # it is waiting on a verdict from nobody, and vice versa. A refusal message is the
+  # only thing the agent reading it has to act on.
+  g_why=""
+  [ -n "$g_out" ] && g_why="no verdict yet from reviewer(s)$g_out"
+  if [ -n "$g_stale" ]; then
+    [ -n "$g_why" ] && g_why="$g_why; "
+    g_why="${g_why}reviewer(s)$g_stale passed an EARLIER revision and must re-review"
+  fi
   case "$g_req" in
     threshold)
-      [ "$g_pass" -ge "$g_thr" ] || loomux_block_wf "below-threshold" "only $g_pass of the required $g_thr PASS verdicts cover the current revision $cur_head (no verdict yet from:$g_out; passed an earlier revision and must re-review:$g_stale)" ;;
+      [ "$g_pass" -ge "$g_thr" ] || loomux_block_wf "below-threshold" "only $g_pass of the required $g_thr PASS verdicts cover the PR's current head $cur_head — $g_why" ;;
     *)
       # all-pass — THE #151 CASE: a reviewer that has not recorded anything (or whose
       # pass predates the code that would merge) keeps the gate shut, however loudly
       # the others approved.
-      [ -z "$g_out$g_stale" ] || loomux_block_wf "verdict-outstanding" "the PR is now at $cur_head — no verdict yet from reviewer(s)$g_out; passed an earlier revision and must re-review:$g_stale" ;;
+      [ -z "$g_why" ] || loomux_block_wf "verdict-outstanding" "the PR is now at $cur_head — $g_why" ;;
   esac
   # `also:` conditions. ci-green is checked against the real gh; anything this build
   # does not know how to check FAILS CLOSED — a clause loomux silently ignored would

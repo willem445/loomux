@@ -753,8 +753,9 @@ are *rejected* — never rewritten — by the parser when they leave their alpha
 (`sanitize_id` / `sanitize_condition`), which is the contract the parse boundary
 established for precisely this consumer.
 
-Three fail-closed rules govern reading those files, and each exists because the
-alternative silently *weakens* a gate:
+Four fail-closed rules govern reading those files. Each exists because the
+alternative silently *weakens* a gate — or, in the last case, silently enforces a
+rule the file never stated:
 
 - **One verdict-token definition.** `Verdict::parse` is lowercase-strict, because
   the shim's `case "$v" in pass)` is a shell `case` and cannot be anything else. If
@@ -769,6 +770,11 @@ alternative silently *weakens* a gate:
   block id ever failed its sanitizer, dropping it from `merge_gate` would emit a
   gate one requirement short of what the repo declared. It writes an
   `unrepresentable` line instead, which nothing parses and which therefore refuses.
+- **An unrecognized `require:` refuses, rather than defaulting to `all-pass`.**
+  `all-pass` is the *strict* rule, so the fallback looked safe — but it would mean
+  the shim enforcing a rule the file does not state, and agreeing with the Rust half
+  (which calls that file malformed) only by luck. Two halves of one gate have to
+  agree about what it *says*, not merely land on the same answer.
 
 The decision itself is pure and unit-tested (`workflow::evaluate_merge_gate`); the
 shim mirrors it in shell, and harnesses execute the *real* script against a fake

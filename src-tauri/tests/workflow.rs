@@ -2539,9 +2539,13 @@ fn the_gate_file_the_shim_reads_round_trips_and_carries_only_clean_tokens() {
         "and neither half of the gate will read a poisoned file as a usable gate"
     );
     // Any line loomux cannot parse — poison, truncation, hand edit — makes the file
-    // unusable rather than partially enforced. (The shim refuses on the same shape;
-    // `gh_shim_harness_refuses_a_malformed_or_truncated_gate_file` executes it.)
+    // unusable rather than partially enforced. (The shim refuses on the same shapes;
+    // `gh_shim_harness_refuses_a_truncated_or_malformed_gate_file` executes them.)
     assert!(workflow::parse_gate_file("require all-pass\nreviewer a\nsomething else\n").is_none());
+    // Including an unrecognized RULE. `all-pass` is the strict one, so quietly falling
+    // back to it would look safe — but it would mean enforcing a rule the file does not
+    // state, and the shim would have to make the same lucky guess to agree. Refuse.
+    assert!(workflow::parse_gate_file("require bogus\nreviewer a\n").is_none());
 }
 
 #[test]
