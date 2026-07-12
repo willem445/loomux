@@ -8,6 +8,7 @@ import {
   visibleEntries,
   compareEntries,
   joinRel,
+  joinRoot,
   parentRel,
   breadcrumbs,
   formatSize,
@@ -103,6 +104,27 @@ test("joinRel builds forward-slashed rels and treats the root as empty", () => {
   assert.equal(joinRel("", "src"), "src");
   assert.equal(joinRel("src", "pane.ts"), "src/pane.ts");
   assert.equal(joinRel("/src/", "pane.ts"), "src/pane.ts");
+});
+
+test("joinRoot rebuilds an ABSOLUTE path, keeping the root's own separator style (#217)", () => {
+  // "Open folder in editor pane" makes a NEW pane rooted at the clicked folder, and a
+  // pane root is an absolute path — the one place the (root, rel) pair every other op
+  // keeps split is joined back up. A Windows root keeps backslashes, so the path we hand
+  // back looks like the one the user gave us (and like the one a restore will persist).
+  assert.equal(joinRoot("C:\\Projects\\loomux", "src/design"), "C:\\Projects\\loomux\\src\\design");
+  assert.equal(joinRoot("/home/w/loomux", "src/design"), "/home/w/loomux/src/design");
+  // Trailing separators on the root, and the root itself (rel "") — neither may produce
+  // a doubled separator or a path with a dangling slash.
+  assert.equal(joinRoot("C:\\Projects\\loomux\\", "src"), "C:\\Projects\\loomux\\src");
+  assert.equal(joinRoot("/repo/", ""), "/repo");
+  // A mixed-separator root (Windows accepts both) is left alone rather than rewritten:
+  // guessing "/" there is safe on Win32, and rewriting the user's path is not our job.
+  assert.equal(joinRoot("C:/Projects/loomux", "src"), "C:/Projects/loomux/src");
+  // A DRIVE ROOT is the case that catches a naive "copy the separator you see": `C:\`
+  // strips to `C:`, which has no separator left to copy from — so it must be recognized
+  // as the Windows shape it is, not fall through to `C:/src`.
+  assert.equal(joinRoot("C:\\", "src"), "C:\\src");
+  assert.equal(joinRoot("C:\\", ""), "C:");
 });
 
 test("breadcrumbs start at the root and each crumb navigates to its own level", () => {

@@ -13,12 +13,24 @@ import {
   onPtyExit,
   loadUiTabs,
   saveUiTabs,
+  guardAppClose,
   listSessions,
   type PtyExit,
   type SessionInfo,
 } from "./pty";
+import { modal } from "./modal";
+import { SubmitLatch } from "./panesetup";
+import {
+  dirtyBuffers,
+  dirtyBufferLines,
+  quitDecision,
+  withDeadline,
+  QUIT_FLUSH_TIMEOUT_MS,
+  type DirtyBuffer,
+} from "./dirtystate";
 import { matchShortcut } from "./shortcuts";
 import { ftRootIsDir } from "./fileapi";
+import { gitRepoRoot } from "./git";
 import { voiceController } from "./voicecontrol";
 import { initStatusBar } from "./statusbar";
 import { initHintBar } from "./hintbar";
@@ -127,15 +139,29 @@ voiceController.init(() => activeGrid().activePane);
 function eventsFor(ws: Workspace): PaneEvents {
   return {
     onFocus: (pane) => ws.grid.setActive(pane),
+    // The pane has already asked its own unsaved-edits question by the time this
+    // fires (Pane.requestClose → confirmClose → here), so there is nothing to check:
+    // close it. Every human-initiated single-pane close — header ✕, dock chip ✕,
+    // Ctrl+Shift+W — arrives through that one path.
     onCloseRequest: (pane) => ws.grid.closePane(pane),
     onSplit: (pane, dir) => openWelcomeIn(ws, dir, pane),
+    // The file browser's "Open in file editor pane" (#217): an editor pane beside the
+    // browser, in the browser's own tab. Same call the welcome flow makes.
+    onOpenEditorPane: (pane, opts) => {
+      ws.grid.openContentPane(
+        eventsFor(ws),
+        { kind: "editor", name: opts.name, root: opts.root, file: opts.file },
+        "row",
+        pane
+      );
+    },
     onMinimize: (pane) => ws.grid.minimize(pane),
     onMaximize: (pane) => ws.grid.toggleMaximize(pane),
     onToggleGroupMinimize: (pane) => {
       const groupId = pane.orchGroupId;
       if (groupId) ws.grid.toggleGroupMinimize(groupId);
     },
-    // A files pane re-rooted, or a pane was renamed: the persisted layout is stale
+    // A content pane re-rooted, or a pane was renamed: the persisted layout is stale
     // but no grid event fired, so nothing else would save it (#214).
     onRecordChanged: () => onGridChanged(),
   };
@@ -270,6 +296,23 @@ function persistTabs(): void {
     // The write didn't land — allow the next change to retry the same bytes.
     lastPersisted = null;
   });
+}
+
+/** Persist NOW, and wait for the write to land — the app-quit path (#219).
+ *
+ *  Everywhere else persistence is fire-and-forget, and rightly so: a failed write just
+ *  waits for the next change to retry. A quit is the one moment there IS no next change.
+ *  So the quit path awaits the write (and skips the identical-bytes dedup, which exists
+ *  to spare the disk on a 3-second timer, not to skip the last save of the session).
+ *  This is what keeps the #194 restore snapshot honest across a quit. */
+async function flushTabs(): Promise<void> {
+  const encoded = encodeTabs(tabs.snapshot());
+  try {
+    await saveUiTabs(encoded);
+    lastPersisted = encoded;
+  } catch {
+    lastPersisted = null; // the write didn't land; let a later change retry these bytes
+  }
 }
 
 /** Load the persisted tab-set JSON, migrating a pre-backend localStorage blob on
@@ -458,6 +501,7 @@ async function openActionPane(
         shellKind: null,
         sessionId: null,
         role: null,
+        file: null,
       };
       let pane: Pane;
       const content = dormantCard(
@@ -478,22 +522,76 @@ async function openActionPane(
       pane = ws.grid.openDormantPane(events, record, content, dir, anchor);
       return pane;
     }
-    case "open-files": {
-      // A file explorer comes straight back — no process, no session, no credits.
-      // The one thing that can have changed under it is the folder: deleted,
-      // renamed, or on a drive that isn't mounted this boot. A pane rooted at a
-      // vanished directory would render an empty tree and a mystery, so fail SOFT
-      // to the welcome form in that slot with a message — the human re-points it in
-      // two clicks, and the rest of the layout restores around it (#214).
+    case "open-files":
+    case "open-editor": {
+      // A file explorer / file editor comes straight back — no process, no session, no
+      // credits. The one thing that can have changed under it is the folder: deleted,
+      // renamed, or on a drive that isn't mounted this boot. A pane rooted at a vanished
+      // directory would render an empty tree and a mystery, so fail SOFT to the welcome
+      // form in that slot with a message — the human re-points it in two clicks, and the
+      // rest of the layout restores around it (#214, #217).
+      const kind = a.type === "open-files" ? "files" : "editor";
+      const what = kind === "files" ? "File explorer" : "File editor";
       const root = a.root;
       if (!root || !(await ftRootIsDir(root))) {
         showToast(
-          `File explorer "${a.name}": ${root ? `folder is gone — ${root}` : "no folder was recorded"}. Pick one to reopen it.`,
+          `${what} "${a.name}": ${root ? `folder is gone — ${root}` : "no folder was recorded"}. Pick one to reopen it.`,
           "info"
         );
         return openWelcomeIn(ws, dir, anchor);
       }
-      return ws.grid.openFilesPane(events, { name: a.name, root, background: true }, dir, anchor);
+      return ws.grid.openContentPane(
+        events,
+        {
+          kind,
+          name: a.name,
+          root,
+          // The editor reopens the file it was showing (a path — never a buffer; see
+          // panerestore). A file deleted since just fails to open with a toast, in a
+          // pane that is otherwise back exactly as it was.
+          file: a.type === "open-editor" ? a.file ?? undefined : undefined,
+          background: true,
+        },
+        dir,
+        anchor
+      );
+    }
+    case "open-git": {
+      // Same fail-soft, stricter probe (#217): the folder can still be there and no
+      // longer be a git work tree — a removed worktree, a deleted .git, a repo restored
+      // from a backup as plain files. Ask git rather than the filesystem, so the pane
+      // never opens on something that can only tell you it isn't a repository.
+      //
+      // But TELL THE TWO FAILURES APART. `gitRepoRoot` returning null is git's own
+      // answer: not a repo — fail soft to the welcome form. `gitRepoRoot` THROWING is a
+      // tooling failure (git not on PATH this boot, an unreadable path, a network share
+      // that hasn't woken up) — a fact about the environment, not about the repo. Fail
+      // softing on that would replace every git pane with a welcome form AND drop the
+      // recorded repo from the next layout save, losing it permanently over a transient
+      // hiccup. So the pane opens anyway: the view itself reports "git was not found on
+      // PATH" / the error, and ↻ recovers it once the environment does.
+      const root = a.root;
+      if (root) {
+        let notARepo = false;
+        try {
+          notARepo = (await gitRepoRoot(root)) === null;
+        } catch {
+          notARepo = false; // couldn't ASK — that is not an answer; keep the pane
+        }
+        if (!notARepo) {
+          return ws.grid.openContentPane(
+            events,
+            { kind: "git", name: a.name, root, background: true },
+            dir,
+            anchor
+          );
+        }
+      }
+      showToast(
+        `Git pane "${a.name}": ${root ? `not a git repository any more — ${root}` : "no repository was recorded"}. Pick one to reopen it.`,
+        "info"
+      );
+      return openWelcomeIn(ws, dir, anchor);
     }
     case "dormant-group": {
       // The one credit/process-storm-sensitive case: keep the WHOLE group dormant.
@@ -510,6 +608,7 @@ async function openActionPane(
         // the panes that were live at close (#194.5) and re-capture is exact.
         sessionId: a.sessionId,
         role: a.role,
+        file: null,
       };
       const content = dormantCard(
         "Resume group",
@@ -777,11 +876,12 @@ async function handleWelcomeSubmit(
     return;
   }
 
-  if (result.kind === "files") {
-    // Convert the setup pane into a file explorer in place (#214). Synchronous —
-    // there is no process to start, so no await, no PTY, nothing to reap. The root
-    // was confirmed to exist by the form before it fired this.
-    pane.startFiles({ name: result.name, root: result.root });
+  if (result.kind === "files" || result.kind === "editor" || result.kind === "git") {
+    // Convert the setup pane into a CONTENT pane in place (#214 files, #217 editor /
+    // git). Synchronous — there is no process to start, so no await, no PTY, nothing to
+    // reap. The root was confirmed for real by the form before it fired this: a readable
+    // directory for files/editor, a git work tree for git.
+    pane.startContent({ kind: result.kind, name: result.name, root: result.root });
     // Converted in place — no grid open/close fired, so notify explicitly (this is
     // what re-renders the tab strip and re-persists the layout), same as terminal.
     onGridChanged();
@@ -854,8 +954,9 @@ function reapIfExited(ws: Workspace, pane: Pane): void {
   if (!exit) return;
   earlyExits.delete(pane.ptyId);
   if (tryResumeFallback(pane, exit)) return; // resume failed → fresh respawn in place
-  if (pane.keepOpenOnExit(exit)) {
-    pane.notifyExited(exit.exit_code);
+  const keep = pane.keepOpenOnExit(exit);
+  if (keep) {
+    pane.notifyExited(exit.exit_code, keep);
     onGridChanged(); // a kept-open pane is now dead → drop it from the live count
   } else ws.grid.closePane(pane, false);
 }
@@ -912,8 +1013,10 @@ async function restoreSession(s: SessionInfo): Promise<void> {
   reapIfExited(ws, pane);
 }
 
-// When a process exits on its own, retire its pane — unless it was a
-// command pane dying with an error, which stays open to show the output.
+// When a process exits on its own, retire its pane — unless the pane has a reason to
+// survive it: a command pane dying with an error (its output must stay readable), or an
+// unsaved Alt+F buffer (#219 — an automatic teardown must never destroy work nobody
+// agreed to lose). The pane says WHICH reason in its exit banner.
 void onPtyExit((exit) => {
   const found = findPaneAcrossTabs(exit.id);
   if (!found) {
@@ -924,11 +1027,100 @@ void onPtyExit((exit) => {
   }
   const { ws, pane } = found;
   if (tryResumeFallback(pane, exit)) return; // resume failed → fresh respawn in place
-  if (pane.keepOpenOnExit(exit)) {
-    pane.notifyExited(exit.exit_code);
+  const keep = pane.keepOpenOnExit(exit);
+  if (keep) {
+    pane.notifyExited(exit.exit_code, keep);
     onGridChanged(); // dead-but-kept-open → update the live agent count
   } else ws.grid.closePane(pane, false);
 });
+
+// ---------- app quit: the last place unsaved work can be lost (#219) ----------
+
+/** Every unsaved editor buffer in the app, across ALL tabs — visible, hidden, and
+ *  docked — and both hosts: an editor PANE's buffer and the Alt+F OVERLAY's inside a
+ *  terminal/agent pane. The overlay in a background tab is exactly the one a human
+ *  forgets, which is why the sweep is total rather than "the active tab". The pure
+ *  filter (dirtystate.dirtyBuffers) decides which reports count as unsaved. */
+function unsavedBuffers(): DirtyBuffer[] {
+  return dirtyBuffers(tabs.tabs.flatMap((ws) => ws.bufferReports()));
+}
+
+/** Persist on the way out — with a DEADLINE.
+ *
+ *  The final save is awaited (see flushTabs) because a quit is the one moment there is no
+ *  next change to retry on. But an await with no deadline is an unquittable app: the
+ *  guard fails open on a throw, and a promise that HANGS never throws. So the write is
+ *  raced, and on expiry the close proceeds regardless — a possibly-stale snapshot is a
+ *  small, recoverable loss (the fire-and-forget write is at most one edit behind), while a
+ *  ✕ that does nothing is not recoverable at all. */
+async function flushSessionForQuit(): Promise<void> {
+  const outcome = await withDeadline(flushTabs(), QUIT_FLUSH_TIMEOUT_MS);
+  if (outcome === "timeout") {
+    // No toast: the window is about to die and nobody would read it. The breadcrumb is
+    // for the next boot's crash/obs report, where "the last save never landed" is the
+    // one clue that explains a layout that looks a step behind.
+    console.warn(`loomux: final session save did not land within ${QUIT_FLUSH_TIMEOUT_MS}ms — quitting anyway`);
+  }
+}
+
+/** One-shot latch over the quit confirm (#194 P1's SubmitLatch, the same pattern the
+ *  welcome form uses for its async submit — and the same one `Pane.requestClose` uses).
+ *
+ *  The guard is ASYNC: while the confirm is on screen, a second ✕ (or Alt+F4, or an
+ *  impatient double-click on a window button that appears not to have registered) fires
+ *  onCloseRequested again and would stack a SECOND identical dialog — whose answer then
+ *  races the first one's. The in-flight ask already owns the decision, so a re-entrant
+ *  request is simply refused: keep the window, let the dialog that is up decide. */
+const quitLatch = new SubmitLatch();
+
+/** Gate the app's close. Nothing unsaved → quit silently (the common case must not grow
+ *  a dialog). Something unsaved → ONE consolidated confirm listing every buffer, then
+ *  quit or stay.
+ *
+ *  Deliberately one ask, not a save prompt per file: a human quitting with six dirty
+ *  files wants to know that six files are dirty and decide once — a chain of six modals
+ *  is how you train someone to hammer Enter through them. "Quit anyway" discards; Cancel
+ *  leaves the app exactly as it was, every buffer intact, so they can go save. */
+function guardQuit(): void {
+  void guardAppClose(async () => {
+    // A confirm is already up (see quitLatch): this close request is a duplicate, and the
+    // dialog on screen is the one that decides. Refuse it rather than stack a second.
+    if (!quitLatch.begin()) return false;
+    try {
+      const dirty = unsavedBuffers();
+      if (quitDecision(dirty) === "close") {
+        await flushSessionForQuit();
+        quitLatch.finish(); // quitting: admit nothing further
+        return true;
+      }
+      const files = dirtyBufferLines(dirty);
+      const quit = await modal<boolean>((resolve) => ({
+        title:
+          files.length === 1 ? "1 file has unsaved edits" : `${files.length} files have unsaved edits`,
+        body: "Quitting loomux now discards them. Cancel, save what you want to keep, then quit again.",
+        bodyLines: files,
+        buttons: [
+          { label: "Cancel", value: false },
+          { label: "Quit anyway", value: true, kind: "danger" },
+        ],
+        onKey: (k) => (k === "Escape" ? resolve(false) : undefined),
+      }));
+      if (!quit) {
+        quitLatch.release(); // they stayed — a later ✕ must ask again
+        return false;
+      }
+      await flushSessionForQuit();
+      quitLatch.finish();
+      return true;
+    } catch (err) {
+      // Fail open, and re-open the latch with it: a guard that throws must neither block
+      // the close nor wedge the next one shut (guardAppClose lets this through).
+      quitLatch.release();
+      throw err;
+    }
+  });
+}
+guardQuit();
 
 // Global shortcuts (terminals decline these in their key handlers).
 document.addEventListener(

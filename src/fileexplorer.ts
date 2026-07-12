@@ -48,6 +48,7 @@ import { modal } from "./modal";
 import {
   visibleEntries,
   joinRel,
+  joinRoot,
   parentRel,
   breadcrumbs,
   formatSize,
@@ -93,6 +94,11 @@ export interface FileExplorerHost {
   /** The user re-rooted via the folder picker: the pane adopts it (title + the
    *  persisted layout follow), so a restore reopens what was on screen. */
   onRootChanged?(root: string): void;
+  /** "Open in file editor pane" (#217): open an EDITOR pane beside this one, rooted at
+   *  `root`, with `file` (root-relative) open — or, for a folder, rooted AT that folder
+   *  with nothing open (`file: null`). The explorer can't reach the grid, so it asks;
+   *  this pane stays exactly where it was. */
+  onOpenEditorPane?(req: { root: string; file: string | null }): void;
 }
 
 /** Cap on rendered Go-to-file results — same reasoning as the editor's: a jump list
@@ -1000,6 +1006,9 @@ export class FileExplorerView {
       case "reveal":
         void this.revealTarget(a.target);
         return;
+      case "edit-pane":
+        this.openInEditorPane(a.target);
+        return;
       case "rename":
         this.beginRenameOn(a.target);
         return;
@@ -1018,6 +1027,23 @@ export class FileExplorerView {
       return;
     }
     await this.openWithDefaultApp(target.rel);
+  }
+
+  /** "Open in file editor pane" (#217). A FILE opens an editor pane rooted where THIS
+   *  pane is rooted — so the editor's tree shows the same project you were browsing,
+   *  with the clicked file up — while a FOLDER roots the new pane at itself, which is
+   *  what "open this folder in an editor" can only mean.
+   *
+   *  Note what does NOT happen: this pane doesn't navigate, doesn't clear its filter,
+   *  and doesn't lose its selection. Opening a file elsewhere is not a reason to move
+   *  the browser you opened it from — the same courtesy the OS hand-off (`open`) gives.
+   *  The target's `rel` was bound at menu-open, so a re-ranked result list underneath
+   *  can't redirect it. */
+  private openInEditorPane(target: OpTarget): void {
+    const root = this.host.getRoot();
+    this.host.onOpenEditorPane?.(
+      target.isDir ? { root: joinRoot(root, target.rel), file: null } : { root, file: target.rel }
+    );
   }
 
   private async openWithTarget(target: OpTarget): Promise<void> {

@@ -42,11 +42,17 @@ export type RestorePref = "ask" | "restore" | "fresh";
  *  orchestration pane (orchestrator / worker / reviewer) so restore keeps the
  *  whole group DORMANT and lets the group-resume path revive it.
  *
- *  "files" (#214) is the PTY-less file-explorer pane. It needs NO new persisted
- *  field: its root rides in the existing `cwd`, exactly as `role` rode into the
- *  schema for orch panes — decode is shape-driven, so old files (which simply
- *  never carry a "files" leaf) are unaffected and SCHEMA_VERSION stays at 2. */
-export type PersistedPaneKind = "terminal" | "agent" | "orch" | "files";
+ *  "files" (#214), "editor" and "git" (#217) are the PTY-less CONTENT panes. None
+ *  needs a new persisted field: the kind's root — the folder a tree/listing is
+ *  rooted at, the repo a git view is pointed at — rides in the existing `cwd`,
+ *  exactly as `role` rode into the schema for orch panes. Decode is shape-driven,
+ *  so old files (which simply never carry these leaves) are unaffected and
+ *  SCHEMA_VERSION stays at 2. */
+export type PersistedPaneKind = "terminal" | "agent" | "orch" | "files" | "editor" | "git";
+
+/** The PTY-less content kinds, in one place — what `cwd` means for them is a ROOT,
+ *  not a shell's directory. */
+const CONTENT_KINDS: readonly PersistedPaneKind[] = ["files", "editor", "git"];
 
 /** One pane at a layout leaf, reduced to what restore needs. Never the live
  *  PTY/buffer — those are deliberately not captured (cost/#78 process-storm and
@@ -55,9 +61,10 @@ export interface PersistedPane {
   paneKind: PersistedPaneKind;
   name: string;
   /** Directory to restore into — the pane's live cwd when captured; null = home.
-   *  For kind "files" this is the tree's ROOT (#214), and it is the one thing
-   *  that pane needs; a null root there is unrestorable (the slot fails soft to
-   *  the welcome form) rather than a decode failure. */
+   *  For a CONTENT kind ("files" #214, "editor"/"git" #217) this is instead the
+   *  pane's ROOT (the folder browsed/edited, the repo viewed), and it is the one
+   *  thing that pane needs; a null root there is unrestorable (the slot fails soft
+   *  to the welcome form) rather than a decode failure. */
   cwd: string | null;
   /** Agent/command spawn line (kind "agent"); null for terminals. */
   command: string | null;
@@ -75,6 +82,13 @@ export interface PersistedPane {
    *  first, relaunches the group) from its delegates. Null for agent/terminal
    *  panes and for pre-#194.5 files. */
   role: string | null;
+  /** The file an EDITOR pane (#217) had open, root-relative — a PATH, never a buffer.
+   *  A pane opened on a file is titled after it, so without this a restore would show a
+   *  bare tree under a title naming a file it isn't showing. The content is re-read from
+   *  disk; unsaved edits are deliberately NOT persisted (see doc/design/content-panes.md
+   *  — the close guard's whole point is that the human was asked). Null for every other
+   *  kind, and absent from any snapshot written before #217. */
+  file: string | null;
 }
 
 /** A tab's pane layout: the split tree with PersistedPane leaves. Mirrors grid's
@@ -111,6 +125,12 @@ export interface PersistedTabs {
   schemaVersion?: number;
 }
 
+const PANE_KINDS: readonly PersistedPaneKind[] = [
+  "terminal",
+  "agent",
+  "orch",
+  ...CONTENT_KINDS,
+];
 const SHELL_KINDS: readonly ShellKind[] = ["powershell", "gitbash", "cmd"];
 const RESTORE_PREFS: readonly RestorePref[] = ["ask", "restore", "fresh"];
 
@@ -147,11 +167,11 @@ function decodePane(v: unknown): PersistedPane | null {
   if (!v || typeof v !== "object") return null;
   const r = v as Record<string, unknown>;
   const kind = r.paneKind;
-  if (kind !== "terminal" && kind !== "agent" && kind !== "orch" && kind !== "files") return null;
+  if (!PANE_KINDS.includes(kind as PersistedPaneKind)) return null;
   if (typeof r.name !== "string" || !r.name.trim()) return null;
   const argvOk = Array.isArray(r.argv) && r.argv.every((a) => typeof a === "string");
   return {
-    paneKind: kind,
+    paneKind: kind as PersistedPaneKind,
     name: r.name,
     cwd: typeof r.cwd === "string" ? r.cwd : null,
     command: typeof r.command === "string" ? r.command : null,
@@ -159,6 +179,7 @@ function decodePane(v: unknown): PersistedPane | null {
     shellKind: isShellKind(r.shellKind) ? r.shellKind : null,
     sessionId: typeof r.sessionId === "string" ? r.sessionId : null,
     role: typeof r.role === "string" ? r.role : null,
+    file: typeof r.file === "string" ? r.file : null,
   };
 }
 

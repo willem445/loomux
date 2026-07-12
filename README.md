@@ -37,6 +37,30 @@ no global mode:
 | **Orchestrator + workers** | An orchestrator plus idle workers in their own project tab, with guardrails. |
 | **Terminal** | A plain shell: PowerShell, Command Prompt, or Git Bash. |
 | **File explorer** | A native-style **file manager** rooted at a folder you pick — no terminal underneath, no process, ever. |
+| **File editor** | The file tree + code editor above, as a **pane** rather than an overlay, rooted at a folder you pick. |
+| **Git** | The git view — graph, status, diffs, staging, worktree switching — as a **pane**, over a repo you pick. |
+
+The last three are **content panes**: a pane that *is* a surface rather than a
+process. They spawn nothing, split/dock/drag/maximize like any other pane, come
+back at the same root on session restore, and — because they are viewers, not
+agents — never count toward a tab's agent badge.
+
+A **file editor** pane and a **git** pane are the `Alt+F` and `Alt+G` overlays
+promoted to first-class panes: park the editor beside your agent instead of
+toggling it in and out, or keep a git graph open in a split while the agent works.
+The overlays are still there for a quick look inside a terminal pane; the panes are
+for when you want the surface *to stay*. The `Alt+G` overlay is untouched; the `Alt+F`
+one gains the same unsaved-edits protection the pane has, which it always should have
+had. Because an editor holds real unsaved buffers, **nothing throws them away without
+asking**: closing the pane (header ✕, dock chip, or `Ctrl+Shift+W`), closing its **tab**,
+re-rooting the editor elsewhere, and **quitting loomux** all ask first — and a pane whose
+process dies (or whose orchestration group ends) *keeps* its unsaved buffer instead of
+taking it to the grave. See the [design note](doc/design/content-panes.md).
+
+From a **file explorer** pane, right-click a file → **Open in file editor pane**
+opens an editor pane beside it, rooted where the browser is rooted, with that file
+open. (Right-clicking a *folder* offers **Open folder in editor pane**, rooted at
+that folder.) The browser stays exactly where it was.
 
 A **file explorer** pane is loomux's Windows-Explorer equivalent: browse folders
 (breadcrumb, Up, double-click to descend), and **double-click a file to open it in
@@ -154,7 +178,7 @@ src-tauri/src/
   lib.rs            Tauri wiring
 src/
   pty.ts            typed bridge to the backend (invoke + event bus)
-  pane.ts           one pane: xterm instance + header UI -- or, for a files pane (#214), a PTY-less file-explorer surface
+  pane.ts           one pane: xterm instance + header UI -- or, for a CONTENT pane, a PTY-less surface: file manager (#214), file editor or git view (#217)
   grid.ts           split-tree layout, dividers, focus, drag/maximize/minimize
   layout.ts         pure drag-reorder geometry (unit-tested, DOM-free)
   tabs.ts           project tabs (#63): TabManager -- tab list, active tab, routing (DOM-free)
@@ -169,12 +193,12 @@ src/
   groupresume.ts    pure whole-group resume plan: orchestrator first, delegates rejoin-or-skip (DOM-free, unit-tested, #194)
   panefit.ts        pure "hidden => no PTY resize" decision (the no-resize invariant)
   sessions.ts       session browser sidebar
-  launcher.ts       in-pane welcome / pane-setup form (Agent / Orchestrator / Terminal / File-explorer kind picker)
+  launcher.ts       in-pane welcome / pane-setup form (Agent / Orchestrator / Terminal / File-explorer / File-editor / Git kind picker)
   panesetup.ts      pure kind-selection + validation core for the welcome screen (DOM-free, unit-tested)
   orchestration.ts  frontend half of agent groups (panes, badges, focus)
   shortcuts.ts      app-level keybindings (single source of truth)
   fileapi.ts        typed bridge to fileedit.rs (per-feature wrapper, like git.ts)
-  fileedit.ts       file-editor overlay (#174, Alt+F): tree + code editor + "Go to file" name search + content search/replace (DOM wiring)
+  fileedit.ts       the file editor (#174): tree + code editor + "Go to file" name search + content search/replace. Two hosts: the Alt+F overlay, and an editor PANE (#217, `embedded`) (DOM wiring)
   fileexplorer.ts   the file MANAGER a files pane hosts (#214): browse, open-with-default-app, new file/folder, rename, delete, context menu, SHA-256 column, Go to file (DOM wiring)
   fileexplorermodel.ts pure file-manager core: listing order, rooted navigation, breadcrumb, formatting, inline-edit validation, op-target binding (DOM-free, unit-tested)
   filemenu.ts       pure context-menu model: what appears, what it acts on (target bound at menu-open) (DOM-free, unit-tested)
@@ -187,7 +211,7 @@ src/
   fileicons.ts      pure filename -> inline-SVG icon mapping (DOM-free, unit-tested)
   searchresults.ts  pure search grouping + tree-hit + replace-selection model (DOM-free, unit-tested)
   searchsession.ts  pure streaming-search state machine: batch/cancel + result cap + enumeration-source pick (#207, DOM-free, unit-tested)
-  dirtystate.ts     pure conflict/close-guard decisions (DOM-free, unit-tested)
+  dirtystate.ts     pure conflict/close-guard decisions -- shared by the editor's Esc/close and the editor PANE's close (#217) (DOM-free, unit-tested)
   eol.ts            pure line-ending detect/normalize/re-apply for EOL-safe dirty tracking (unit-tested)
   findwidget.ts     pure in-file-find logic: regex build + "n of m" match count (DOM-free, unit-tested)
   editorwidget.ts   swappable editor widget: lazy CodeMirror 6 (One Dark) + custom find panel + textarea fallback

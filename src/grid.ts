@@ -9,7 +9,7 @@
 // decision logic (which zone the pointer is over → what happens) lives in the
 // pure, unit-tested `layout.ts`; this file owns the DOM/tree mutation.
 
-import { Pane, type PaneEvents, type PaneOptions, type FilesPaneOptions } from "./pane";
+import { Pane, type PaneEvents, type PaneOptions, type ContentPaneOptions } from "./pane";
 import type { PersistedPane } from "./tabstore";
 import { dropZoneFor, indicatorFor, zoneToPlacement, type DropZone } from "./layout";
 import { dockChipAttention } from "./attention";
@@ -220,23 +220,23 @@ export class Grid {
     return pane;
   }
 
-  /** Land a FILE-EXPLORER pane (#214): placed in the grid like any other pane —
-   *  it splits, moves, docks, maximizes and counts identically — but with NO PTY.
-   *  Its content is the file tree + editor rooted at `opts.root`, permanently. No
-   *  terminal opens, so nothing here can resize a ConPTY. Synchronous (there is no
-   *  process to await), unlike `openPane`. */
-  openFilesPane(
+  /** Land a CONTENT pane (#214 files, #217 editor / git): placed in the grid like any
+   *  other pane — it splits, moves, docks, maximizes and counts identically — but with
+   *  NO PTY. Its content is the file manager / file editor / git view rooted at
+   *  `opts.root`, permanently. No terminal opens, so nothing here can resize a ConPTY.
+   *  Synchronous (there is no process to await), unlike `openPane`. */
+  openContentPane(
     events: PaneEvents,
-    opts: FilesPaneOptions,
+    opts: ContentPaneOptions,
     dir: Dir = "row",
     relativeTo?: Pane
   ): Pane {
     const pane = new Pane(events);
     const takeFocus = this.placeLeaf(pane, !!opts.background, dir, relativeTo);
-    pane.startFiles({ ...opts, background: !takeFocus });
-    // Re-notify now that the pane KNOWS it's a files pane. placeLeaf fired onChange
-    // while it was still a bare Pane, and `capture()` would have serialized it as a
-    // rootless terminal leaf — same reason openPane re-notifies once its PTY exists.
+    pane.startContent({ ...opts, background: !takeFocus });
+    // Re-notify now that the pane KNOWS what kind it is. placeLeaf fired onChange while
+    // it was still a bare Pane, and `capture()` would have serialized it as a rootless
+    // terminal leaf — same reason openPane re-notifies once its PTY exists.
     this.onChange();
     return pane;
   }

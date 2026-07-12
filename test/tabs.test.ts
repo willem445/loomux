@@ -36,6 +36,12 @@ class FakeWorkspace implements ManagedWorkspace {
   paneInfos(): TabPaneInfo[] {
     return this.panes;
   }
+  /** Unsaved editor edits in this tab (#217). Settable, so a test can put a tab in the
+   *  state where closing it would destroy work — the tab bar makes that close confirm. */
+  unsaved = false;
+  hasUnsavedWork(): boolean {
+    return this.unsaved;
+  }
   setVisible(v: boolean): void {
     this.visible = v;
     this.visLog.push(v);

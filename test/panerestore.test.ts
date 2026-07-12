@@ -26,6 +26,7 @@ const pane = (over: Partial<PersistedPane>): PersistedPane => ({
   shellKind: null,
   role: null,
   sessionId: null,
+  file: null,
   ...over,
 });
 
@@ -92,6 +93,56 @@ test("a files pane with NO recorded root surfaces a null root for the caller to 
   // here keeps that contract: we hand the caller the problem, we don't invent a root.
   const action = planPaneRestore(pane({ paneKind: "files", name: "files", cwd: null }));
   assert.deepEqual(action, { type: "open-files", name: "files", root: null });
+});
+
+// ---------- editor + git (#217) ----------
+
+test("an editor pane reopens at its recorded root, showing the file it had open", () => {
+  // The FILE rides along (a path, never a buffer): a pane opened on src/pane.ts is
+  // TITLED after it, so restoring a bare tree under that title would name a file the
+  // pane isn't showing.
+  assert.deepEqual(
+    planPaneRestore(
+      pane({ paneKind: "editor", name: "pane.ts", cwd: "C:/Projects/loomux", file: "src/pane.ts" })
+    ),
+    { type: "open-editor", name: "pane.ts", root: "C:/Projects/loomux", file: "src/pane.ts" }
+  );
+  // No file open when it was captured → none reopened. Not an error, just a tree.
+  assert.deepEqual(
+    planPaneRestore(pane({ paneKind: "editor", name: "loomux", cwd: "C:/Projects/loomux" })),
+    { type: "open-editor", name: "loomux", root: "C:/Projects/loomux", file: null }
+  );
+  assert.deepEqual(
+    planPaneRestore(pane({ paneKind: "git", name: "loomux", cwd: "C:/Projects/loomux" })),
+    { type: "open-git", name: "loomux", root: "C:/Projects/loomux" }
+  );
+});
+
+test("neither new kind is ever asked to resume, even with a session id and a command", () => {
+  // Keyed on KIND, exactly like the group and files rules above. A content pane has no
+  // process to resume into, so a stray sessionId (a record hand-edited, or written by a
+  // future version) must not send it down an agent path and spawn a CLI in a pane that
+  // is supposed to be a viewer.
+  const stray = { cwd: "/repo", sessionId: "abc-123", command: "claude" };
+  assert.equal(planPaneRestore(pane({ paneKind: "editor", name: "e", ...stray }), () => true).type, "open-editor");
+  assert.equal(planPaneRestore(pane({ paneKind: "git", name: "g", ...stray }), () => true).type, "open-git");
+});
+
+test("a rootless editor/git record surfaces null for the caller to fail soft on", () => {
+  // Same contract as files: whether the folder still exists — and, for git, whether it is
+  // still a work tree — is I/O this pure module can't do. We hand the caller the problem
+  // (null, or a path it must probe), we don't invent a root.
+  assert.deepEqual(planPaneRestore(pane({ paneKind: "editor", name: "e", cwd: null })), {
+    type: "open-editor",
+    name: "e",
+    root: null,
+    file: null,
+  });
+  assert.deepEqual(planPaneRestore(pane({ paneKind: "git", name: "g", cwd: null })), {
+    type: "open-git",
+    name: "g",
+    root: null,
+  });
 });
 
 test("an orchestration pane ALWAYS restores dormant — never auto-resumed", () => {

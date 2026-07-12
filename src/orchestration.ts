@@ -373,12 +373,33 @@ export function initOrchestration(wiring: OrchWiring): void {
   // close their (now-dead) panes across every tab rather than leaving a screen
   // of dead terminals — the pane-by-pane ✕-clicking this action replaces.
   void listen<{ group_id: string }>("orch-group-ended", ({ payload }) => {
+    let kept = 0;
     for (const grid of wiring.allGrids()) {
       // allPanes(): a minimized group pane must be closed too, or it would
       // linger in the dock (with a live agent) after its group ends.
       for (const pane of panesInGroup(grid.allPanes(), payload.group_id)) {
+        // …unless the human left unsaved edits in that pane's Alt+F editor (#219).
+        // Ending a group is a deliberate, confirmed act — but what it is deliberately
+        // destroying is AGENTS, not the human's own half-written file, and the two got
+        // conflated because both live in the same pane. The agent is already dead, so
+        // keeping the pane costs nothing; disposing it costs work nobody agreed to lose.
+        // The pane stays with its exit banner (which says the editor is unsaved), and
+        // closing it later asks like any human close. Same rule the PTY-exit reaper
+        // follows — automatic teardown never destroys a buffer.
+        if (pane.hasUnsavedWork()) {
+          kept++;
+          continue;
+        }
         grid.closePane(pane, false);
       }
+    }
+    if (kept > 0) {
+      showToast(
+        kept === 1
+          ? "Group ended. One pane stayed open — it has unsaved edits in its file editor."
+          : `Group ended. ${kept} panes stayed open — they have unsaved edits in their file editors.`,
+        "info"
+      );
     }
   });
 }

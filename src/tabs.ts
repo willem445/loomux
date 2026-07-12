@@ -48,6 +48,12 @@ export interface ManagedWorkspace {
   /** Classify every pane in the tab for the live per-tab agent counter and the
    *  orchestration markers (#194 P4). */
   paneInfos(): TabPaneInfo[];
+  /** Does any pane in this tab hold unsaved editor edits (#217)? Closing the tab
+   *  disposes every pane in it, which would destroy them — so the tab bar treats such
+   *  a close as DESTRUCTIVE and makes the human confirm, the same arm-and-confirm an
+   *  orchestration tab already gets. Reports; never prompts (the teardown is
+   *  synchronous, so a question that pops its own modal is no use here). */
+  hasUnsavedWork(): boolean;
   /** Tear the workspace down and kill its panes' PTYs (tab closed). */
   dispose(): void;
 }

@@ -66,21 +66,42 @@ import {
   type TreeNode,
 } from "./filetreemodel";
 import { fileIconSvg, folderIconSvg } from "./fileicons";
-import { closeDecision, type ConflictChoice } from "./dirtystate";
+import { closeDecision, discardEdits, type ConflictChoice } from "./dirtystate";
 import { detectEol, applyEol, textDiffers, type Eol } from "./eol";
 import { createEditor, type EditorWidget } from "./editorwidget";
 import { showToast } from "./toast";
 import { modal } from "./modal";
 
-/** What the hosting pane provides to the overlay. */
+/** What the hosting pane provides. TWO hosts now (#217): the Alt+F OVERLAY over a
+ *  terminal (the original, unchanged), and an EDITOR PANE whose permanent content
+ *  this view is. The fork between them is these two optional hooks and nothing
+ *  else — the tree, the editor, the #207 streaming search and replace are the same
+ *  code in both. */
 export interface FileEditHost {
-  /** The pane's live working directory (shell-integration cwd / worktree). */
+  /** The pane's live working directory (shell-integration cwd / worktree) — or, in
+   *  an editor pane, that pane's root. */
   getCwd(): string | null;
-  /** Close the overlay and return focus to the terminal. */
+  /** Close the overlay and return focus to the terminal. Never called in embedded
+   *  mode (there is nothing to close back to). */
   onClose(): void;
   /** True when the root is a running agent's worktree — the view shows a subtle
    *  banner (editing it is legitimate but the agent may also be writing). */
   isAgentWorktree?(): boolean;
+  /** EMBEDDED mode: this view is an editor PANE's permanent content, not an overlay
+   *  floating over a terminal. There is nothing to close back TO, so the ✕ and the
+   *  Esc-to-close binding are dropped — the pane's own ✕ closes it (and asks about
+   *  unsaved edits first, via `canDiscard`). This is the only behavioral fork, and
+   *  it is one the overlay semantics genuinely don't have an answer for.
+   *
+   *  (First built in PR #215 round 1 for the #214 pane, reverted with it when that
+   *  pane became a file manager, and resurrected here — where the editor-as-pane is
+   *  the actual ask.) */
+  embedded?: boolean;
+  /** The user re-rooted the tree from the header's folder picker. An OVERLAY host
+   *  ignores this (the root is view-local by design — browsing must not disturb the
+   *  terminal or a running agent); an editor PANE adopts it as the pane's root, so
+   *  the title and the persisted layout follow what's actually on screen. */
+  onRootChanged?(root: string): void;
 }
 
 const TREE_W_KEY = "loomux.fileedit.treeW";
@@ -111,6 +132,9 @@ export class FileEditView {
    *  shell, so browsing here never disturbs the terminal or a running agent). */
   private root: string | null = null;
   private treeModel: TreeNode = makeRoot();
+  /** The in-flight (or last) load of the root's listing, so `openPath` can wait for
+   *  the tree to exist before revealing into it. Resolved when nothing is loading. */
+  private treeLoad: Promise<void> = Promise.resolve();
 
   // Header bits.
   private rootLabel: HTMLElement;
@@ -213,12 +237,17 @@ export class FileEditView {
     this.el = el("div", "fileedit");
     this.el.hidden = true;
     this.el.tabIndex = -1;
-    this.el.addEventListener("keydown", (e) => {
-      if (e.key === "Escape") {
-        e.stopPropagation();
-        void this.requestClose();
-      }
-    });
+    // Esc closes the OVERLAY. An embedded (pane-content) view has nothing to close
+    // back to, so Esc is left alone there — closing the pane on a stray Escape would
+    // be a nasty surprise with unsaved edits in the buffer.
+    if (!host.embedded) {
+      this.el.addEventListener("keydown", (e) => {
+        if (e.key === "Escape") {
+          e.stopPropagation();
+          void this.requestClose();
+        }
+      });
+    }
 
     // ---- header ----
     const head = el("div", "fileedit-head");
@@ -249,6 +278,7 @@ export class FileEditView {
 
     const closeBtn = el("button", "pane-btn close", "✕") as HTMLButtonElement;
     closeBtn.title = "Close (Esc)";
+    closeBtn.hidden = !!host.embedded; // pane content — the PANE's ✕ is the close affordance
     closeBtn.addEventListener("click", () => void this.requestClose());
 
     head.append(rootWrap, spacer, this.fileLabel, this.dirtyDot, this.findBtn, this.saveBtn, closeBtn);
@@ -342,12 +372,63 @@ export class FileEditView {
     this.agentBanner.hidden = !(this.host.isAgentWorktree?.() ?? false);
     this.refreshRootLabel();
     if (this.root) {
-      void this.reloadTree();
+      // Held so `openPath` (an editor pane opened ON a file, #217) can wait for the
+      // root's first listing instead of racing it — reloadTree() replaces treeModel
+      // wholesale, and a reveal that ran against the old one would expand nothing.
+      this.treeLoad = this.reloadTree();
+      void this.treeLoad;
     } else {
       this.treeListEl.replaceChildren(el("div", "fileedit-empty", "Pick a folder to browse."));
     }
     // No focus steal — the terminal below stays the primary input target until
     // the user clicks into the tree/editor.
+  }
+
+  /** Open `rel` (root-relative) and reveal it in the tree — the entry point for an
+   *  editor PANE opened from the file browser's "Open in file editor pane" (#217),
+   *  which creates the pane rooted at the browser's root with one file already up.
+   *  Safe to call right after `show()`: it waits for that root's first listing.
+   *
+   *  A refused open (binary, too large, a dirty buffer the human declined to discard)
+   *  leaves `openRel` where it was and is NOT followed by a reveal — same rule as the
+   *  Go-to-file jump, so the tree never points at a file the editor didn't take. */
+  async openPath(rel: string): Promise<void> {
+    await this.treeLoad;
+    if (this.disposed) return; // the pane was closed while the root's listing loaded
+    await this.openFile(rel);
+    if (this.disposed || this.openRel !== rel) return;
+    await this.revealPath(rel);
+  }
+
+  /** The file currently open, root-relative — or null when none is. Captured into the
+   *  persisted layout for an editor pane (#217), so a restore reopens the file the
+   *  pane was showing rather than a bare tree with a title naming a file it never
+   *  opened. Only the PATH: the buffer is deliberately never persisted (see
+   *  panerestore.ts), and the file is re-read from disk on restore. */
+  get openPathRel(): string | null {
+    return this.openRel;
+  }
+
+  /** Unsaved edits in the buffer right now — asked WITHOUT prompting, unlike
+   *  `canDiscard()`. The tab-close path needs to know whether a close would destroy
+   *  work before it decides how to ask (tabbar's arm/confirm), and a question that
+   *  itself pops a modal is no use there. */
+  get dirty(): boolean {
+    return this.isDirtyNow();
+  }
+
+  /** May this view be torn down right now — is there unsaved work in the buffer?
+   *  True when it's clean, or when the human confirmed discarding it.
+   *
+   *  The host PANE calls this before closing an editor pane (#217): an editor pane is
+   *  the pane kind where loomux itself owns an unsaved buffer, so a ✕ / dock-chip ✕ /
+   *  Ctrl+Shift+W must not drop edits silently. Same guard `requestClose` applies to
+   *  the overlay's own Esc/✕ — reached from the pane-close path too. */
+  async canDiscard(): Promise<boolean> {
+    // The same pure gate the view's own Esc/✕ uses, so "dirty means ask" is stated
+    // once, in closeDecision, and cannot drift between the two.
+    if (closeDecision(this.isDirtyNow()) === "close") return true;
+    return this.confirmDiscard();
   }
 
   hide(): void {
@@ -387,11 +468,49 @@ export class FileEditView {
 
   private async pickRoot(): Promise<void> {
     const picked = await open({ directory: true, title: "Browse folder", defaultPath: this.root ?? undefined });
-    if (typeof picked === "string") {
-      this.root = picked;
-      this.refreshRootLabel();
-      await this.reloadTree();
-    }
+    if (typeof picked !== "string" || picked === this.root) return;
+
+    // A RE-ROOT ABANDONS THE OPEN FILE, and it must say so out loud.
+    //
+    // `openRel` is a path *relative to the root*. Carry it across a re-root and it
+    // silently re-binds to a different file: with `notes.md` open under C:\A and the
+    // root moved to C:\B, a Ctrl+S writes A's buffer to `C:\B\notes.md` — the hash
+    // guard fires against a file the user never opened, and "Overwrite" then destroys
+    // an unrelated project's file with this one's contents. (The same trap sat in the
+    // Alt+F overlay; #217 makes it far easier to reach, because a re-root is now a
+    // first-class, persisted operation on an editor pane.)
+    //
+    // So: ask about unsaved edits FIRST — the human may want to save into the old
+    // root, and cancelling here must leave everything exactly as it was — then close
+    // the buffer and drop the search state, whose results are paths under a root that
+    // is no longer on screen.
+    if (!(await this.canDiscard())) return;
+    this.root = picked;
+    this.closeOpenFile();
+    this.clearSearch();
+    this.refreshRootLabel();
+    // An editor PANE (#217) adopts the new root as ITS root — title and persisted
+    // layout follow the tree the user is actually looking at. An overlay host does
+    // not implement this: there the root stays view-local by design.
+    this.host.onRootChanged?.(picked);
+    this.treeLoad = this.reloadTree();
+    await this.treeLoad;
+  }
+
+  /** Drop the open file: no buffer, no `openRel`, no stale hash — back to the empty
+   *  state. Used when the root moves out from under the file (`pickRoot`), where
+   *  keeping any of it would leave a save aimed at the wrong path. */
+  private closeOpenFile(): void {
+    this.openRel = null;
+    this.savedContent = "";
+    this.savedHash = "";
+    this.openEol = "\n";
+    this.editor?.setValue("", "");
+    this.editorHost.hidden = true;
+    this.emptyState.hidden = false;
+    this.findBtn.hidden = true;
+    this.updateFileLabel();
+    this.updateDirty();
   }
 
   /** (Re)load the root directory into a fresh model and render. */
@@ -639,16 +758,48 @@ export class FileEditView {
 
   // ---------- dialogs ----------
 
-  private confirmDiscard(): Promise<boolean> {
-    return modal<boolean>((resolve) => ({
+  /** Ask, and — on a yes — ACTUALLY DISCARD (#219).
+   *
+   *  The dialog used to be answered by hiding the overlay while the dirty buffer sat
+   *  there untouched: press Alt+F again and the edits were back, still unsaved, and the
+   *  same question came round again on the next close. A "Discard" that discards nothing
+   *  is a dialog that lies — and a second ask is how people learn to click through the
+   *  first one. So the yes-branch drops the edits here, in the one place the answer is
+   *  known, rather than at each of the four call sites (close, file-switch, re-root,
+   *  reload-after-replace) — three of which replace the buffer anyway and one of which
+   *  (a file-switch whose open then FAILS) used to leave the discarded edits in place. */
+  private async confirmDiscard(): Promise<boolean> {
+    const discard = await modal<boolean>((resolve) => ({
       title: "Discard unsaved changes?",
-      body: `${this.openRel ?? "This file"} has unsaved edits.`,
+      body: `${this.openRel ?? "This file"} has unsaved edits. Discarding drops them — the file goes back to what's on disk.`,
       buttons: [
         { label: "Cancel", value: false },
         { label: "Discard", value: true, kind: "danger" },
       ],
       onKey: (k) => (k === "Escape" ? resolve(false) : undefined),
     }));
+    if (discard) this.revertBuffer();
+    return discard;
+  }
+
+  /** Throw the edits away: the buffer goes back to the last-saved snapshot — the file as
+   *  it is on disk, as far as we know. (An external change since then is the CONFLICT
+   *  machinery's business, not this one's; a discard must not become a silent re-read.)
+   *  `discardEdits` is trivial on purpose — it is where the rule is stated, so the view
+   *  can't quietly re-implement "discard" as "hide". */
+  private revertBuffer(): void {
+    if (!this.editor || this.openRel === null) return;
+    this.editor.setValue(discardEdits(this.savedContent), this.openRel);
+    this.updateDirty();
+  }
+
+  /** What this view is holding, for the app-quit guard's enumeration (#219). Null when
+   *  there is nothing open at all — a clean buffer still reports (with `dirty: false`),
+   *  because "no editor here" and "an editor with nothing unsaved" are different facts
+   *  and only the pure filter should be deciding which ones matter. */
+  bufferReport(): { file: string | null; dirty: boolean } | null {
+    if (this.openRel === null) return null;
+    return { file: this.openRel, dirty: this.isDirtyNow() };
   }
 
   private conflictDialog(): Promise<ConflictChoice> {

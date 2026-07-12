@@ -34,6 +34,64 @@ There is no global mode — each pane declares its own kind:
 | **Orchestrator + workers** | An orchestrator pane plus idle workers, in its own project tab, with guardrails. See the [orchestration guide](orchestration). |
 | **Terminal** | A plain shell — PowerShell, Command Prompt, or Git Bash. |
 | **File explorer** | A native-style **file manager** rooted at a folder you choose. |
+| **File editor** | The file tree + code editor (the `Alt+F` surface) as a pane, rooted at a folder you choose. |
+| **Git** | The git view (the `Alt+G` surface) as a pane, over a repo you choose. |
+
+The last three are **content panes**: a pane that *is* a surface rather than a
+process. No shell, no CLI, no PTY — just the surface, in a pane. They split, dock,
+drag, maximize and restore exactly like a terminal pane, and they never count
+toward a tab's agent badge, because a viewer is not an agent.
+
+### The file editor and git panes
+
+The `Alt+F` editor and the `Alt+G` git view are **overlays**: they float over a
+terminal pane, so you can see the shell underneath, and they go away when you press
+`Esc`. That's right for a quick look. It's wrong when you want the surface to *stay*
+— you end up toggling it in and out, or you give up a whole terminal to it.
+
+So both are also **pane kinds**. Pick **File editor** on the welcome screen, give it
+a folder, and the pane is the editor: tree, code editor, project-wide search and
+replace, permanently. Pick **Git**, give it a repo, and the pane is the git view:
+graph, status, diffs, staging, and worktree switching. Split one beside your agent
+and it stays put while the agent works.
+
+What differs from the overlay, and only this:
+
+- **No ✕, no `Esc`-to-close.** There is nothing to close back to — the *pane's* ✕
+  closes it, like any pane.
+- **The pane adopts a re-root.** Change the editor's root folder from its header and
+  the pane follows: its title updates and session restore reopens *that* folder. (In
+  the overlay, browsing elsewhere is deliberately view-local — it must not disturb
+  the terminal underneath.)
+- **Unsaved edits are guarded, everywhere.** An editor pane holds real buffers, so
+  closing it with unsaved changes asks first — from the header ✕, from its dock chip, or
+  from `Ctrl+Shift+W`. Closing the whole **tab** asks too (click ✕ once to arm, again to
+  confirm — the same two-step a tab with live agents uses), and its tooltip says what is
+  at stake. Re-rooting the editor to a different folder asks, because the file you had
+  open doesn't exist under the new root. And **quitting loomux** asks: one dialog listing
+  every unsaved file across every tab — including the `Alt+F` editors you left open
+  inside terminal panes, which are the ones you forget — with **Quit anyway** or
+  **Cancel**. If nothing is unsaved, quitting is silent, as it should be.
+- **Nothing automatic destroys a buffer.** A pane whose process exits (or whose
+  orchestration group is ended) *stays open* if its editor has unsaved edits, and its
+  banner says so. The agent is already dead; your half-written file needn't be.
+- **Discard means discard.** Answering "Discard unsaved changes?" with *Discard* drops
+  the edits — the file goes back to what's on disk. It no longer hides the buffer and
+  asks you the same question again later.
+- **The git pane refreshes on open, after its own actions, and on ↻** — not on focus.
+  Refreshing rebuilds the changes strip, which would wipe a half-typed commit message
+  every time you tabbed away and back.
+
+`Alt+F` / `Alt+G` inside a terminal or agent pane still open the overlays — same
+overlay, same sizing, same `Esc`. Inside a content pane there is no terminal for an
+overlay to float over, so the hotkey for the surface the pane already *is* just
+focuses it, and the others answer with a toast naming what isn't available where —
+*"The git view isn't available in a file editor pane."* If a git view is what you
+want beside your editor, open a **git pane**; the toast won't tell you that, this
+page does.
+
+Everything else is the same code. The editor pane is the same editor; the git pane
+is the same git view, worktree switching included.
 
 ### The file explorer pane
 
@@ -66,9 +124,16 @@ window per project.
 #### Right-click menu
 
 Right-click a row for **Open**, **Open with…** (the OS chooser — Windows only), **Reveal
-in file explorer** (opens your OS file manager with the file selected), **Rename**,
-**Delete**, **Hash →**, and **New →**. Right-click the empty space below the rows for
-**New →** on its own.
+in file explorer** (opens your OS file manager with the file selected), **Open in file
+editor pane**, **Rename**, **Delete**, **Hash →**, and **New →**. Right-click the empty
+space below the rows for **New →** on its own.
+
+**Open in file editor pane** is the in-app counterpart to **Open**: where *Open* hands
+the file to the application your OS associates with it, this opens it in loomux's own
+editor, in a new pane beside the browser — rooted where the browser is rooted, so the
+editor's tree shows the same project. On a folder the item reads **Open folder in editor
+pane** and roots the new pane at that folder. Either way the browser stays exactly where
+it was: opening a file elsewhere is no reason to move the list you opened it from.
 
 The menu acts on **the row you right-clicked** — always, even if the list re-sorts or a
 search finishes underneath it while the menu is open. It works the same on a **Go-to-file
@@ -121,10 +186,12 @@ the file *in the editor* instead.)
 
 It has no terminal underneath and never starts a process. That means the
 terminal-oriented chrome is gone from its header (no folder or branch chip; the
-git, issues, and file-editor overlays don't apply — `Alt+G` / `Alt+I` will tell you
-so). Everything else is a normal pane: it splits, drags, docks, maximizes, renames,
-and comes back on session restore at the same folder. It is **not** an agent, so it
-never counts toward a tab's agent badge.
+overlays float over a *terminal* and are sized from it, so they don't apply here —
+`Alt+G` / `Alt+I` answer with a toast that names what isn't available where, e.g.
+*"The git view isn't available in a file explorer pane."* When it's a git view you
+want over this project, open a **git pane**). Everything else is a normal pane: it splits, drags,
+docks, maximizes, renames, and comes back on session restore at the same folder. It
+is **not** an agent, so it never counts toward a tab's agent badge.
 
 If the folder is gone when a session is restored (deleted, renamed, or on a drive
 that isn't mounted), that pane comes back as the welcome screen with a message

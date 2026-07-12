@@ -22,6 +22,17 @@ pane, scoped to the repository the shell is currently in — a commit graph, a d
 preview, and the working-tree changes with staging and commit. It floats over the
 terminal and never resizes it; press `Esc` (or ✕) to return.
 
+## …or give it a pane of its own
+
+The overlay is for a *look*. When you want the git view to **stay** — beside an
+agent, in a split, while it works — pick **Git** on the welcome screen and give it a
+repo: the pane *is* the git view, permanently. Everything below applies unchanged
+(worktree switching included); the only differences are that there's no `Esc`/✕ (the
+pane's own ✕ closes it) and it's sized by the pane rather than by the terminal it
+would otherwise float over. A restored git pane opens on the **primary** worktree,
+read-only — an unlock never survives a restart. See
+[core concepts](../core-concepts#the-file-editor-and-git-panes).
+
 ## Layout
 
 Drag the divider **between the graph and diff** (or **above the changes strip**)

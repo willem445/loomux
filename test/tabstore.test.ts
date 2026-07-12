@@ -43,6 +43,7 @@ test("docked panes round-trip (captured outside the layout tree, #194 P4)", () =
             shellKind: null,
             sessionId: "abc",
             role: null,
+            file: null,
           },
         ],
       },
@@ -159,6 +160,7 @@ const NESTED_LAYOUT: PersistedLayoutNode = {
         shellKind: "gitbash",
         sessionId: null,
         role: null,
+        file: null,
       },
     },
     {
@@ -178,6 +180,7 @@ const NESTED_LAYOUT: PersistedLayoutNode = {
             shellKind: null,
             sessionId: "abc-123",
             role: null,
+            file: null,
           },
         },
         {
@@ -192,6 +195,7 @@ const NESTED_LAYOUT: PersistedLayoutNode = {
             shellKind: null,
             sessionId: "orch-sess-9",
             role: "orchestrator",
+            file: null,
           },
         },
         {
@@ -208,6 +212,7 @@ const NESTED_LAYOUT: PersistedLayoutNode = {
             shellKind: null,
             sessionId: null,
             role: null,
+            file: null,
           },
         },
       ],
@@ -237,6 +242,7 @@ test("a files leaf round-trips its root — and needed NO new field or schema bu
     shellKind: null,
     sessionId: null,
     role: null,
+    file: null,
   };
   const state: PersistedTabs = {
     tabs: [
@@ -285,6 +291,89 @@ test("a files leaf with no root decodes (null) rather than dropping the whole ta
   assert.ok(filesLeaf.kind === "leaf");
   assert.equal(filesLeaf.pane.paneKind, "files");
   assert.equal(filesLeaf.pane.cwd, null);
+});
+
+// ---------- #217 editor + git leaves ----------
+
+test("editor and git leaves round-trip their root — and the editor's open FILE", () => {
+  // The third and fourth members of the same family (#214's files was the first). The
+  // editor's FOLDER and the git pane's REPO both ride in the existing `cwd`; the editor
+  // also carries the file it was showing — a PATH, never a buffer (#217). Both are
+  // additive in exactly the way `role` and the files root were: a decoder that has never
+  // heard of them is not needed, because old snapshots simply never carry them.
+  const mk = (paneKind: PersistedPane["paneKind"], file: string | null = null): PersistedPane => ({
+    paneKind,
+    name: "loomux",
+    cwd: "C:/Projects/loomux",
+    command: null,
+    argv: null,
+    shellKind: null,
+    sessionId: null,
+    role: null,
+    file,
+  });
+  const state: PersistedTabs = {
+    tabs: [
+      {
+        name: "t",
+        color: null,
+        groupId: null,
+        layout: {
+          kind: "split",
+          dir: "row",
+          weight: 1,
+          children: [
+            { kind: "leaf", weight: 1, pane: mk("editor", "src/pane.ts") },
+            { kind: "leaf", weight: 1, pane: mk("git") },
+          ],
+        },
+      },
+    ],
+    activeIndex: 0,
+  };
+  const back = decodeTabs(encodeTabs(state));
+  const layout = back?.tabs[0].layout;
+  assert.ok(layout?.kind === "split");
+  assert.deepEqual(layout.children[0].kind === "leaf" && layout.children[0].pane, mk("editor", "src/pane.ts"));
+  assert.deepEqual(layout.children[1].kind === "leaf" && layout.children[1].pane, mk("git"));
+  assert.equal(back?.schemaVersion, 2, "additive — a bump here would be a false signal");
+});
+
+test("a rootless editor/git leaf decodes (null) rather than dropping the whole tab layout", () => {
+  // Same fail-soft as the files leaf: well-formed but unrestorable is NOT malformed, and
+  // killing the tab's whole layout over one such leaf would punish every sibling pane.
+  const raw = JSON.stringify({
+    tabs: [
+      {
+        name: "t",
+        color: null,
+        groupId: null,
+        layout: {
+          kind: "split",
+          dir: "row",
+          weight: 1,
+          children: [
+            { kind: "leaf", weight: 1, pane: { paneKind: "terminal", name: "shell" } },
+            { kind: "leaf", weight: 1, pane: { paneKind: "editor", name: "editor" } }, // no cwd
+            { kind: "leaf", weight: 1, pane: { paneKind: "git", name: "git" } }, // no cwd
+          ],
+        },
+      },
+    ],
+    activeIndex: 0,
+  });
+  const layout = decodeTabs(raw)?.tabs[0].layout;
+  assert.ok(layout?.kind === "split");
+  assert.equal(layout.children.length, 3, "the sibling terminal survives");
+  for (const [i, kind] of [
+    [1, "editor"],
+    [2, "git"],
+  ] as const) {
+    const leaf = layout.children[i];
+    assert.ok(leaf.kind === "leaf");
+    assert.equal(leaf.pane.paneKind, kind);
+    assert.equal(leaf.pane.cwd, null);
+  }
 });
 
 test("a malformed layout node degrades that tab's whole layout to null (not a throw)", () => {
@@ -336,6 +425,7 @@ test("malformed pane fields inside a valid leaf coerce to null, not a drop", () 
       shellKind: "fish", // unknown → null
       sessionId: null,
       role: 99, // non-string → null
+      file: 7, // non-string → null (#217)
     },
   };
   const back = decodeTabs(
@@ -353,6 +443,7 @@ test("malformed pane fields inside a valid leaf coerce to null, not a drop", () 
       shellKind: null,
       sessionId: null,
       role: null,
+      file: null,
     },
   });
 });

@@ -7,6 +7,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { ShellKind } from "./panesetup";
 
 export interface SpawnOptions {
@@ -113,6 +114,44 @@ export const loadUiTabs = (): Promise<string | null> => invoke<string | null>("l
 /** Persist the tab-set JSON atomically. Best-effort — callers never block on it. */
 export const saveUiTabs = (contents: string): Promise<void> =>
   invoke("save_ui_tabs", { contents });
+
+// ---------- window lifecycle (#219) ----------
+
+/** Gate the app's own close (title-bar ✕, Alt+F4, the OS asking it to quit).
+ *
+ *  `allow()` runs when the window is asked to close and decides whether it may: true
+ *  quits, false keeps the app running (the human cancelled). It is `await`ed, so it may
+ *  put a dialog on screen — which is the whole point, because until now quitting loomux
+ *  with unsaved editor edits threw them away without a word (#219).
+ *
+ *  Tauri's own `onCloseRequested` contract, and the two things it costs:
+ *
+ *   - Registering ANY js listener for close-requested makes the Rust side stop closing
+ *     the window itself; the JS layer destroys it once our handler resolves without a
+ *     `preventDefault()`. So this hook is now the only way loomux exits...
+ *   - ...which is why `core:window:allow-destroy` is in the capability set. Without it
+ *     that destroy is denied and the app becomes UNQUITTABLE — the failure mode is not
+ *     "the guard doesn't run", it's "the ✕ does nothing", so it is called out here.
+ *
+ *  Destroying is what fires the backend's `WindowEvent::Destroyed` — the PTY kill-all and
+ *  the clean-exit sentinel (lib.rs) — so a permitted quit still tears everything down
+ *  exactly as before. We put a question in front of the existing path, not a second path.
+ *
+ *  Lives HERE, with the rest of the Tauri surface, so the app's modules keep talking to
+ *  one seam instead of importing the window API each (CLAUDE.md constraint 5). */
+export async function guardAppClose(allow: () => Promise<boolean>): Promise<void> {
+  const win = getCurrentWindow();
+  await win.onCloseRequested(async (event) => {
+    try {
+      if (!(await allow())) event.preventDefault();
+    } catch {
+      // FAIL OPEN. A guard that throws must let the close through: trapping the human in
+      // an app whose ✕ does nothing is a far worse failure than not asking them about a
+      // buffer. (The one thing we lose is the awaited final save — and the fire-and-forget
+      // persist on every change means the layout is already durable to within one edit.)
+    }
+  });
+}
 
 // ---------- voice prompt (#58 prototype) ----------
 // Push-to-talk mic capture → local whisper.cpp transcription. The backend owns

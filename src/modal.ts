@@ -17,6 +17,11 @@ export interface ModalSpec<T> {
   /** Render the body as monospace, wrapping, and selectable — for a hash digest, where
    *  128 hex characters have to be readable AND selectable, not laid out as prose. */
   bodyMono?: boolean;
+  /** An itemized list under the body (#219): the quit confirm has to ENUMERATE the
+   *  unsaved buffers, and a run-on paragraph of file paths is unreadable at exactly the
+   *  moment the human must read it. A real list, so each path wraps as its own item and
+   *  a long one scrolls instead of pushing the buttons off-screen. */
+  bodyLines?: string[];
 }
 
 /** Show a modal and resolve with the chosen button's value. The builder receives
@@ -44,6 +49,11 @@ export function modal<T>(build: (resolve: (v: T) => void) => ModalSpec<T>): Prom
     const dlg = el("div", "agent-dialog");
     const body = el("div", spec.bodyMono ? "dlg-hint dlg-mono" : "dlg-hint", spec.body);
     dlg.append(el("h2", "", spec.title), body);
+    if (spec.bodyLines?.length) {
+      const list = el("ul", "dlg-list");
+      for (const line of spec.bodyLines) list.appendChild(el("li", "", line));
+      dlg.appendChild(list);
+    }
     const actions = el("div", "dlg-actions");
     for (const b of spec.buttons) {
       const cls = b.kind === "danger" ? " danger" : b.kind === "primary" ? " primary" : "";

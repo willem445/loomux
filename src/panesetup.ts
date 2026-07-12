@@ -12,16 +12,33 @@
 // the form logic is unit-tested without a DOM (test/panesetup.test.ts).
 //
 // #214 adds a FOURTH kind: `files` — a PTY-less pane whose content is the file
-// tree + editor surface, rooted at a directory the user picks. Its only setup
-// input is that root, and the only rule this module can decide is "a root was
-// given"; whether the directory actually EXISTS is I/O, so the form probes it
-// (ftRootIsDir) after this returns ok and surfaces a failure inline.
+// MANAGER, rooted at a directory the user picks. Its only setup input is that
+// root, and the only rule this module can decide is "a root was given"; whether
+// the directory actually EXISTS is I/O, so the form probes it (ftRootIsDir)
+// after this returns ok and surfaces a failure inline.
+//
+// #217 adds two more of the same family — `editor` (the #174 file tree + code
+// editor, rooted at a folder) and `git` (the #208 git view, over a repo). All
+// three are PTY-less CONTENT panes and validate the same way here: the path is
+// mandatory, and its REALITY (a directory? a git repo?) is I/O the form probes.
+// The one asymmetry is what "real" means per kind — a folder for files/editor, a
+// git work tree for git — which is why the probe stays in the form and only the
+// "a path was given" rule lives here.
 
-export type PaneKind = "agent" | "orchestrator" | "terminal" | "files";
+export type PaneKind = "agent" | "orchestrator" | "terminal" | "files" | "editor" | "git";
 export type ShellKind = "powershell" | "gitbash" | "cmd";
 
 const AGENT_MIN = 1;
 const AGENT_MAX = 8;
+
+/** The PTY-less CONTENT kinds (#214 files, #217 editor + git): a pane that IS a
+ *  surface rather than a process. They spawn nothing, pick no CLI, and take exactly
+ *  one input — the folder / repo they are rooted at — which is why the welcome form
+ *  can hide every other field off this one predicate instead of listing the kinds at
+ *  each site (and forgetting one when a fourth arrives). */
+export function isContentKind(kind: PaneKind): boolean {
+  return kind === "files" || kind === "editor" || kind === "git";
+}
 
 export interface PaneSetupInput {
   kind: PaneKind;
@@ -71,16 +88,51 @@ export interface OrchestratorPlan {
   kind: "orchestrator";
   repo: string;
 }
-/** A file-explorer pane (#214): a directory to root the tree at, and a name. No
- *  command, no shell, no PTY — the pane's content IS the file tree + editor. */
+/** A file-explorer pane (#214): a directory to root the manager at, and a name. No
+ *  command, no shell, no PTY — the pane's content IS the file manager. */
 export interface FilesPlan {
   kind: "files";
-  /** Absolute directory the tree roots at. Non-empty (validated below); its
+  /** Absolute directory the listing roots at. Non-empty (validated below); its
    *  EXISTENCE is checked by the caller (I/O), not here. */
   root: string;
   name: string;
 }
-export type PaneSetupPlan = TerminalPlan | AgentPlan | OrchestratorPlan | FilesPlan;
+/** A file-EDITOR pane (#217): the #174 tree + code editor as a pane's permanent
+ *  content, rooted at a folder. Same shape as FilesPlan and validated the same
+ *  way — a different surface over the same one input. */
+export interface EditorPlan {
+  kind: "editor";
+  root: string;
+  name: string;
+}
+/** A GIT pane (#217): the git view (graph, status, diffs, staging, #208 worktree
+ *  switching) as a pane's permanent content. `root` need only be SOME directory
+ *  inside a work tree — the view resolves the top level itself — but it must be
+ *  one, which is I/O the caller probes (gitRepoRoot), not a rule this module can
+ *  decide. Named `root` like its two siblings, deliberately: a content pane has ONE
+ *  input and every consumer (the pane, the capture, the restore) treats it the same
+ *  way, so calling it `repo` here would buy a synonym and cost a special case. */
+export interface GitPlan {
+  kind: "git";
+  root: string;
+  name: string;
+}
+export type PaneSetupPlan =
+  | TerminalPlan
+  | AgentPlan
+  | OrchestratorPlan
+  | FilesPlan
+  | EditorPlan
+  | GitPlan;
+
+/** The per-kind halves of the content-pane rule: what to call the missing path in
+ *  the error, and what to fall back to when the human names the pane nothing. The
+ *  RULE itself (the path is mandatory) is one branch below, not three. */
+const CONTENT_SETUP: Record<"files" | "editor" | "git", { missing: string; fallbackName: string }> = {
+  files: { missing: "The file explorer needs a folder — pick one first.", fallbackName: "files" },
+  editor: { missing: "The file editor needs a folder — pick one first.", fallbackName: "editor" },
+  git: { missing: "The git view needs a repository — pick one first.", fallbackName: "git" },
+};
 
 /** Which field to focus when validation fails, so the form can surface it. */
 export type PaneSetupFocus = "repo" | "custom" | "count";
@@ -229,19 +281,18 @@ export function planPaneSetup(input: PaneSetupInput): PaneSetupResult {
     return { ok: true, plan: { kind: "orchestrator", repo } };
   }
 
-  // files (#214): the root is mandatory — unlike a terminal, "" can't fall back
-  // to home, because a file tree over the whole home directory is never what the
-  // user meant, and a rootless files pane has no content at all.
-  if (input.kind === "files") {
-    if (!repo) {
-      return {
-        ok: false,
-        error: "The file explorer needs a folder — pick one first.",
-        focus: "repo",
-      };
-    }
-    const name = input.name.trim() || pathTail(repo) || "files";
-    return { ok: true, plan: { kind: "files", root: repo, name } };
+  // The three CONTENT kinds (#214 files, #217 editor + git). ONE rule, because they
+  // have one: the path is mandatory. Unlike a terminal, "" can't fall back to home —
+  // a file tree over the whole home directory is never what the user meant, a rootless
+  // content pane has no content at all, and "home" is not a repo. What differs per kind
+  // is only the wording (CONTENT_SETUP), and whether the path is REAL — a directory? a
+  // work tree? — which is I/O the form probes, not a rule this module can decide.
+  if (isContentKind(input.kind)) {
+    const kind = input.kind as "files" | "editor" | "git";
+    const setup = CONTENT_SETUP[kind];
+    if (!repo) return { ok: false, error: setup.missing, focus: "repo" };
+    const name = input.name.trim() || pathTail(repo) || setup.fallbackName;
+    return { ok: true, plan: { kind, root: repo, name } };
   }
 
   // agent

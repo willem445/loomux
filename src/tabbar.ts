@@ -108,17 +108,25 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
     if (ws && tabEl) this.openPreview(ws, tabEl);
   }
 
-  /** Close a tab, requiring a two-step confirm when the close is destructive —
-   *  the tab owns an orchestration group, so closing it KILLS that project's
-   *  live agents (unrecoverable, and it's what the human is really asking for
-   *  when they hit ✕ / Ctrl+Shift+K). A plain-terminal tab closes immediately:
-   *  its panes are ordinary shells, on par with close-pane (itself unconfirmed),
-   *  so a confirm there would be heavier than closing the same panes directly.
-   *  Both the ✕ button and Ctrl+Shift+K route here (main.ts). */
+  /** Close a tab, requiring a two-step confirm when the close is DESTRUCTIVE. Two
+   *  things make it so:
+   *
+   *   - the tab owns an orchestration group, so closing it KILLS that project's live
+   *     agents (unrecoverable, and it's what the human is really asking for when they
+   *     hit ✕ / Ctrl+Shift+K);
+   *   - a pane in it holds UNSAVED editor edits (#217) — closing the tab disposes every
+   *     pane, and those edits are gone. A single-pane close asks about them with a
+   *     modal (Pane.requestClose); a tab close tears down N panes synchronously, so it
+   *     asks the way this bar already asks about something irreversible: arm, then
+   *     confirm. Cheap, sync, and it reuses the affordance the human has already met.
+   *
+   *  An ordinary tab still closes immediately: its panes are shells, on par with
+   *  close-pane (itself unconfirmed), so a confirm there would be heavier than closing
+   *  the same panes directly. Both the ✕ button and Ctrl+Shift+K route here (main.ts). */
   requestClose(id: string): void {
     const ws = this.tabs.get(id);
     if (!ws || this.tabs.count <= 1) return; // never-zero-tabs floor
-    if (!this.tabs.groupForWorkspace(id)) {
+    if (!this.destructiveClose(id)) {
       this.tabs.closeTab(id); // non-destructive — no confirm
       return;
     }
@@ -135,6 +143,16 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
       this.render();
     }, 4000);
     this.render();
+  }
+
+  /** Would closing this tab destroy something the human can't get back — its group's
+   *  live agents, or unsaved editor edits in one of its panes (#217)? Asked fresh on
+   *  every close attempt and on every render, so saving the file (or ending the group)
+   *  disarms the confirm without anything having to remember to. */
+  private destructiveClose(id: string): boolean {
+    const ws = this.tabs.get(id);
+    if (!ws) return false;
+    return !!this.tabs.groupForWorkspace(id) || ws.hasUnsavedWork();
   }
 
   private disarmClose(): void {
@@ -251,12 +269,19 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
       close.className = "tab-close";
       const armed = this.closeArmedId === ws.id;
       const ownsGroup = !!groupId;
+      // Say what will actually be lost. A tab can be destructive for two different
+      // reasons now (live agents, unsaved edits — #217) and it can be both at once;
+      // naming only the group would let a human confirm a close believing their edits
+      // were safe.
+      const stake = [ownsGroup ? "end its agents" : null, ws.hasUnsavedWork() ? "discard unsaved edits" : null]
+        .filter(Boolean)
+        .join(" and ");
       close.classList.toggle("confirm", armed);
       close.textContent = armed ? "✕?" : "✕";
       close.title = armed
-        ? `Click again to close "${ws.name}" and end its agents`
-        : ownsGroup
-          ? "Close tab — ends this project's agents (confirm, Ctrl+Shift+K)"
+        ? `Click again to close "${ws.name}" — this will ${stake}`
+        : stake
+          ? `Close tab — will ${stake} (confirm, Ctrl+Shift+K)`
           : "Close tab (Ctrl+Shift+K)";
       close.hidden = this.tabs.count <= 1; // never zero tabs
       close.addEventListener("click", (e) => {
