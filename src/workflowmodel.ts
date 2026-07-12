@@ -460,14 +460,19 @@ function splitKey(text: string): { key: string; rest: string } | null {
   return null;
 }
 
+/** Escape codes a double-quoted scalar can carry. `default: the character itself` covers
+ *  `\"` and `\\`, which is the whole point of an escape. */
+const ESCAPES: Record<string, string> = { n: "\n", t: "\t", r: "\r" };
+
 function unquote(s: string): string {
   if (s.length >= 2 && s[0] === '"' && s.endsWith('"')) {
-    return s
-      .slice(1, -1)
-      .replace(/\\n/g, "\n")
-      .replace(/\\t/g, "\t")
-      .replace(/\\"/g, '"')
-      .replace(/\\\\/g, "\\");
+    // ONE PASS, left to right (rev-6 F8). Chained `.replace()`s unescape in the wrong order:
+    // `\\n` (an escaped backslash followed by the letter n) had its `\n` expanded to a
+    // NEWLINE by the first replace, before the later one could collapse `\\` to a single
+    // backslash — so `"C:\\new"` read back as `C:` + newline + `ew`. A single pass consumes
+    // each backslash with the character it actually escapes, so an escaped backslash can
+    // never be re-read as the start of another escape.
+    return s.slice(1, -1).replace(/\\(.)/g, (_, c: string) => ESCAPES[c] ?? c);
   }
   if (s.length >= 2 && s[0] === "'" && s.endsWith("'")) return s.slice(1, -1).replace(/''/g, "'");
   return s;
@@ -614,9 +619,17 @@ function emitScalar(v: string): string {
     v === "null" ||
     v === "~" ||
     /^-?\d+(\.\d+)?$/.test(v) ||
-    v.includes("\n")
+    /[\n\t\r]/.test(v)
   ) {
-    return `"${v.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "\\n")}"`;
+    // Backslash FIRST, so the escapes introduced below aren't themselves re-escaped — the
+    // mirror image of the reader's single pass (see `unquote`), and the two must stay
+    // symmetric or a value stops surviving the round-trip it just survived.
+    return `"${v
+      .replace(/\\/g, "\\\\")
+      .replace(/"/g, '\\"')
+      .replace(/\n/g, "\\n")
+      .replace(/\t/g, "\\t")
+      .replace(/\r/g, "\\r")}"`;
   }
   return v;
 }
@@ -626,9 +639,13 @@ function emitValue(v: YamlValue): string {
   if (typeof v === "boolean" || typeof v === "number") return String(v);
   if (typeof v === "string") return emitScalar(v);
   if (Array.isArray(v)) return `[${v.map(emitValue).join(", ")}]`;
+  // The KEY goes through the emitter too (rev-6 F9). A key is a string in a flow mapping and
+  // is every bit as capable of holding a `,` or a `}` as a value is — emitting it raw was the
+  // value-side bug (F1) with the two halves of the pair swapped, and it survived F1's fix
+  // only because nothing had put a structural character in a key yet.
   return `{ ${Object.keys(v)
     .sort()
-    .map((k) => `${k}: ${emitValue(v[k]!)}`)
+    .map((k) => `${emitScalar(k)}: ${emitValue(v[k]!)}`)
     .join(", ")} }`;
 }
 
@@ -660,9 +677,13 @@ const BLOCK_SCALAR_INDENT = 2;
 
 function extraLines(extra: Record<string, YamlValue> | undefined, indent: string): string[] {
   if (!extra) return [];
+  // The key goes through the emitter here too, for the same reason as in `emitValue` — an
+  // unknown key is as arbitrary as an unknown value, and a key carrying a `: ` would
+  // otherwise re-read as a different key with a different value. (`splitKey`/`unquote`
+  // already read a quoted key; only the writing side was asymmetric.)
   return Object.keys(extra)
     .sort()
-    .map((k) => `${indent}${k}: ${emitValue(extra[k]!)}`);
+    .map((k) => `${indent}${emitScalar(k)}: ${emitValue(extra[k]!)}`);
 }
 
 /** Render the workflow in canonical form. `parseWorkflow(serializeWorkflow(w)).workflow`

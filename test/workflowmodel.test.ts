@@ -291,6 +291,43 @@ blocks:
   assert.equal(serializeWorkflow(reread.workflow), out);
 });
 
+test("an escaped backslash is not re-read as the start of another escape (rev-6 F8)", () => {
+  // A Windows path is the obvious carrier, and it is one form edit away: `C:\new,dir` emits
+  // as "C:\\new,dir", and unescaping in the wrong order expanded the `\n` — of the escaped
+  // BACKSLASH plus the letter n — into a newline before the `\\` could collapse. It read back
+  // as `C:` + newline + `ew,dir`. (The comma is what drags a path into the quoted path at
+  // all, so this only became reachable when F1 widened quoting.)
+  for (const raw of ["C:\\new,dir", "C:\\temp\\{x}", "a\\\\b", 'quote " and \\ backslash, comma']) {
+    const w = starterWorkflow();
+    w.gates.merge!.also = [raw];
+    w.blocks[0]!.model = raw;
+    const reread = parseWorkflow(serializeWorkflow(w)).workflow;
+    assert.equal(reread.gates.merge!.also[0], raw, `flow: ${JSON.stringify(raw)}`);
+    assert.equal(reread.blocks[0]!.model, raw, `block: ${JSON.stringify(raw)}`);
+  }
+  // Real escapes still decode — the fix must not turn \n into a literal "n".
+  assert.equal(parseWorkflow('version: 1\nname: "a\\nb\\tc"').workflow.name, "a\nb\tc");
+});
+
+test("a KEY carrying structural characters survives too (rev-6 F9)", () => {
+  // The value side of this was F1; the key side is the same bug with the pair swapped. An
+  // unknown key's nested map is arbitrary data from a newer loomux — its keys are as free as
+  // its values, and emitting them raw split or truncated the map on re-read.
+  const w = starterWorkflow();
+  w.blocks[0]!.extra = {
+    limits: { "cpu,mem": 2, "brace{}": "x", "colon: here": true },
+    "top,key": ["a,b"],
+  };
+  const out = serializeWorkflow(w);
+  const reread = parseWorkflow(out);
+  assert.deepEqual(reread.findings, [], "the pane must not report a syntax error on its own output");
+  assert.deepEqual(reread.workflow.blocks[0]!.extra, {
+    limits: { "cpu,mem": 2, "brace{}": "x", "colon: here": true },
+    "top,key": ["a,b"],
+  });
+  assert.equal(serializeWorkflow(reread.workflow), out, "…and it stays stable");
+});
+
 test("a value that would change meaning unquoted is quoted", () => {
   const w: Workflow = {
     version: 1,
