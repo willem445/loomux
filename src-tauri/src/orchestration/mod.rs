@@ -6991,7 +6991,14 @@ impl OrchRegistry {
             .map(|x| x.id.as_str())
             .collect();
         let multi_reviewer = b.kind == Role::Reviewer && reviewers.len() > 1;
-        if b.is_builtin() && !b.has_persona() && !multi_reviewer {
+        // A reviewer the group's merge gate NAMES is told so, whatever else is true of
+        // it (#222/#197). This has to be part of the early-return test, not just an
+        // extra paragraph: a gate can name a plain built-in `reviewer` block with no
+        // persona and no siblings, and that block would otherwise be the one agent in
+        // the group that never learns its verdict is the thing holding the merge.
+        let gate = self.merge_gate(&g.id).filter(|_| b.kind == Role::Reviewer);
+        let gated = gate.as_ref().is_some_and(|gt| gt.reviewers.iter().any(|r| *r == b.id));
+        if b.is_builtin() && !b.has_persona() && !multi_reviewer && !gated {
             return String::new();
         }
         // `persona_allowed` for the same reason the preview asks it: an orchestrator
@@ -7023,6 +7030,51 @@ impl OrchRegistry {
         } else {
             String::new()
         };
+        // The verdict contract, given ONLY to a reviewer a gate actually names — for
+        // everyone else it would be prose about a tool that gates nothing. It is the
+        // one instruction in this file that a merge physically waits on, so it says
+        // what the shim will do rather than asking nicely.
+        let gate_note = match gate.filter(|_| gated) {
+            Some(gt) => {
+                let rule = match gt.require {
+                    workflow::GateRequire::AllPass => format!(
+                        "every one of {} must record a `pass`",
+                        gt.reviewers.iter().map(|r| format!("`{r}`")).collect::<Vec<_>>().join(", ")
+                    ),
+                    workflow::GateRequire::Threshold(n) => format!(
+                        "{n} of {} must record a `pass`",
+                        gt.reviewers.iter().map(|r| format!("`{r}`")).collect::<Vec<_>>().join(", ")
+                    ),
+                };
+                format!(
+                    "\n\n**Your verdict is the merge gate.** This repo's workflow declares a merge \
+                     gate that names you, so `gh pr merge` is **refused** until {rule} — loomux's \
+                     `gh` interceptor enforces it, and nobody can talk it into merging: not the \
+                     orchestrator, not a human grant. Record yours with \
+                     `review_verdict(pr, verdict, summary)` once you have finished reviewing and \
+                     posted your review on the PR:\n\
+                     \n\
+                     - `pass` — reviewed, nothing blocking.\n\
+                     - `fail` — blocking findings. Re-review after the fix and record `pass` to \
+                     clear it (re-recording replaces your earlier verdict).\n\
+                     - `escalate` — you are **not deciding this one**: ambiguous requirement, \
+                     outside what you can judge, a risk you won't sign off on. A human must look.\n\
+                     \n\
+                     `fail` and `escalate` both refuse the merge, and **one blocking verdict beats \
+                     any number of passes** — so never record `pass` to be agreeable, to unblock a \
+                     queue, or because another reviewer already passed. If you have not finished, \
+                     record nothing: an outstanding verdict holds the gate shut, which is exactly \
+                     what it is for.\n\
+                     \n\
+                     **Your verdict is bound to the commit you reviewed.** If anything is pushed to \
+                     the PR afterwards — even a lint fix — your pass goes **stale**, the gate \
+                     reopens, and the merge is refused until you review the new head and record \
+                     again. Expect to be called back after a fix; do not assume an earlier pass \
+                     still covers the PR. `list_verdicts(pr)` shows you where the gate stands."
+                )
+            }
+            None => String::new(),
+        };
         format!(
             "\n\n{}",
             render_template(
@@ -7033,6 +7085,7 @@ impl OrchRegistry {
                     ("BLOCK_KIND", b.kind.as_str()),
                     ("PERSONA_NOTE", persona_note),
                     ("LANE_NOTE", &lane_note),
+                    ("GATE_NOTE", &gate_note),
                     // LAST, and this is the same discipline the caller applies to
                     // `{{BLOCK_NOTE}}` itself: `render_template` walks its list in
                     // order, so the only var whose value is repo-authored goes in

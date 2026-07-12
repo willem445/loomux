@@ -818,13 +818,26 @@ authoritative version of this idea; the workflow gate is the local, always-on,
 zero-setup layer that catches the failure that actually happened (#151 — a
 cooperating orchestrator merging too early), and the two compose.
 
-### The gate file tracks the repo, with one deliberate asymmetry
+### A gate lives and dies with the toggle that authorized it
 
-`merge_gate` is rewritten at every group create/resume from the repo's workflow
-file. Delete `gates.merge` (or the whole workflow file) and the gate is **cleared** —
-a group must not keep enforcing a rule its repo has walked back.
+A gate is part of the workflow, so it exists exactly when the workflow does — which
+means **only when the human turned the advanced orchestrator on for that launch**
+(*The advanced-orchestrator toggle*, above). Toggle off: the file is never opened, so
+there is no gate, and the merge path is byte-for-byte what it was before #222.
+Toggle back off after a gated launch and the gate is **cleared** — it must not
+outlive the consent that authorized it.
 
-But a workflow file that **fails to parse** keeps the last known gate, loudly
+On a **resume**, the gate is pinned to the launch exactly as the roster is, and the
+argument is sharper for it. The roster pin exists so a `git pull` cannot swap a
+delegate's persona under a session the human already approved; re-reading the file on
+resume could just as easily *loosen* a gate — drop a reviewer, delete the clause —
+under a session already running with it. The gate written at launch stands; drift is
+audited (`workflow-changed-since-launch`), not applied.
+
+Within a toggled-on launch, `merge_gate` tracks the repo, with one deliberate
+asymmetry. Delete `gates.merge` (or the whole workflow file) and the gate is
+**cleared** — a group must not keep enforcing a rule its repo has walked back. But a
+workflow file that **fails to parse** keeps the last known gate, loudly
 (`merge-gate-retained` in the audit). #225's rule — *a broken file is audited and
 skipped, never fatal* — is right for the roster, where falling back to the built-in
 four blocks still lets every agent spawn. It is exactly wrong for a gate: dropping
@@ -834,12 +847,30 @@ code.
 
 ### Where the reviewer learns about it
 
-`review_verdict` is documented in `reviewer.md` — and in **`mechanics_core(Reviewer)`**,
-the non-overridable contract loomux injects into every reviewer block. That is not
-belt-and-braces: a gate names *custom* reviewer blocks, and a custom block with a
-`mode: replace` persona never sees the built-in reviewer template. A reviewer that
-didn't know to record a verdict would hold the gate shut forever and nobody would
-know why.
+Nowhere in the base templates — and that is deliberate. A group with no workflow has
+no gate, so gate prose in `reviewer.md` would be instructions about a tool that gates
+nothing, in a file agents are expected to actually read. It also would have broken the
+toggle's compatibility promise: with the advanced orchestrator off, every instruction
+file is byte-identical to what loomux wrote before #222, and a golden-fixture test
+holds that line.
+
+So the verdict contract rides on the two surfaces that exist *because* a workflow
+does:
+
+- **The reviewer's block note**, and only for a reviewer the gate actually **names**.
+  It tells that block what the gate requires, who else it is waiting on, that a
+  blocking verdict beats any number of passes, and that its pass goes stale on a
+  re-push. The "does the gate name me" test is part of deciding whether the block note
+  is written at all — a gate can name a plain built-in `reviewer` block with no persona
+  and no siblings, and that block would otherwise be the one agent in the group that
+  never learns its verdict is what the merge is waiting on.
+- **`mechanics_core(Reviewer)`** — the non-overridable contract injected into every
+  reviewer block. A custom block with a `mode: replace` persona never sees the built-in
+  reviewer template at all, so without this the very population a gate is most likely
+  to name would be the population that never heard of the tool.
+
+The orchestrator learns it from the workflow fragment (`templates/workflow.md`), which
+is likewise only rendered for a group whose workflow is in play.
 
 ## Still to come
 

@@ -22,7 +22,7 @@ use loomux_lib::orchestration::{
     should_notify_paste_held, should_notify_unconfirmed, single_pane_autopilot_flags,
     spawn_rate_exceeded, spawn_request_expired, strip_ansi, submit_confirmed, submit_sequence,
     unconfirmed_delivery_notice, watchdog_should_notify, worktree_cleanup_targets,
-    AttentionItem, Caller, Delivery, Guardrails, HumanInput, NameSource, OrchRegistry, PasteDecision,
+    AttentionItem, Caller, Delivery, Guardrails, HumanInput, Launch, NameSource, OrchRegistry, PasteDecision,
     PersonaInject,
     PasteGate, Role, TaskPatch, UsageSnapshot, CLAUDE_UNATTENDED_ALLOW, COPILOT_AUTOPILOT_CONFIRM_KEYS,
     COPILOT_GROUP_AUTOPILOT_FLAGS, COPILOT_UNATTENDED_FLAGS, MAX_ATTACHMENT_BYTES,
@@ -6734,11 +6734,21 @@ fn gated_repo(gate_extra: &str) -> tempfile::TempDir {
 
 /// A gated group whose verdicts bind to `HEAD` — the test seam standing in for
 /// `gh pr view --json headRefOid`, since no test repo is a real GitHub PR.
+///
+/// The **advanced orchestrator is on**, because that is the only way a repo's
+/// workflow — and therefore its gate — is in play at all (#229): a gate exists
+/// exactly when the human turned the file on for that launch.
+/// `a_gate_exists_only_while_the_advanced_orchestrator_is_on` pins the other side.
 fn gated_group(gate_extra: &str) -> (OrchRegistry, tempfile::TempDir, tempfile::TempDir, String) {
     let (reg, d) = test_registry();
     reg.set_pr_head_override(Some(HEAD.into()));
     let repo = gated_repo(gate_extra);
-    let g = reg.create_group(&repo.path().to_string_lossy(), rails()).unwrap();
+    let g = reg
+        .create_group(
+            &repo.path().to_string_lossy(),
+            Guardrails { advanced_orchestrator: true, ..rails() },
+        )
+        .unwrap();
     let id = g.id.clone();
     (reg, d, repo, id)
 }
@@ -6827,12 +6837,98 @@ fn a_declared_gate_becomes_the_spec_file_the_shim_reads_and_a_deleted_one_is_cle
 
     // The repo deletes its workflow → the gate is CLEARED. A gate the file no longer
     // declares must not outlive it, or a group would keep enforcing a rule its repo
-    // has walked back.
+    // has walked back. Relaunched with the toggle still ON, so this pins the *file*
+    // being gone rather than the toggle being off (which clears it for its own
+    // reasons — `a_gate_exists_only_while_the_advanced_orchestrator_is_on`).
     fs::remove_file(repo.path().join(".loomux").join("workflow.yml")).unwrap();
-    let g2 = reg.create_group(&repo.path().to_string_lossy(), rails()).unwrap();
+    let g2 = reg.create_group(&repo.path().to_string_lossy(),
+        Guardrails { advanced_orchestrator: true, ..rails() }).unwrap();
     assert_eq!(g2.id, gid, "same repo → same group dir");
     assert!(!gate_file.is_file(), "no workflow file → no gate → the pre-#222 flow, exactly");
     assert!(reg.merge_gate(&gid).is_none() && !reg.merge_gate_declared(&gid));
+}
+
+#[test]
+fn a_reviewer_a_gate_names_is_told_its_verdict_is_the_gate() {
+    // A gate that nobody knows to satisfy is a gate that hangs forever. The verdict
+    // contract therefore reaches a reviewer through its BLOCK NOTE — which is where
+    // workflow-specific instructions live (#229 keeps the base templates byte-for-byte
+    // pre-#222, and rightly: a group with no workflow has no gate to explain).
+    let (reg, d, _repo, gid) = gated_group("");
+    let note = fs::read_to_string(d.path().join(&gid).join("rev-security.md")).unwrap();
+    assert!(note.contains("review_verdict"), "the named reviewer is taught the tool");
+    assert!(note.contains("rev-security") && note.contains("rev-tests"),
+        "and told who else the gate is waiting on: {note}");
+    assert!(note.contains("stale"), "and that its pass does not survive a re-push");
+    assert!(note.contains("escalate") && note.contains("beats any number of passes"),
+        "and what a blocking verdict does");
+
+    // A group with NO gate says none of it — prose about a tool that gates nothing is
+    // noise in a file agents are meant to actually read.
+    let (reg2, d2) = test_registry();
+    let plain = tempfile::tempdir().unwrap();
+    let g = reg2.create_group(&plain.path().to_string_lossy(), rails()).unwrap();
+    let reviewer = fs::read_to_string(d2.path().join(&g.id).join("reviewer.md")).unwrap();
+    assert!(!reviewer.contains("review_verdict"),
+        "an ungated group's reviewer must not read gate prose that applies to nothing");
+    let _ = &reg; // keep the gated registry alive for the temp dirs above
+}
+
+#[test]
+fn a_gate_exists_only_while_the_advanced_orchestrator_is_on() {
+    // The gate is part of the workflow, so it lives and dies with the switch that
+    // authorizes the workflow (#229). Two directions, both of which would be bugs:
+    //
+    //  - toggle OFF with a gate-declaring file in the repo → NO gate. The default
+    //    experience has to stay byte-for-byte pre-#222 on the merge path too, and a
+    //    file that arrives with a `git clone` must not be able to gate anything the
+    //    human didn't turn on.
+    //  - a gate declared under an earlier ON launch must not OUTLIVE the toggle: the
+    //    same group dir, relaunched with the toggle off, must come back ungated.
+    let (reg, d) = test_registry();
+    let repo = gated_repo("");
+
+    let g = reg.create_group(&repo.path().to_string_lossy(), rails()).unwrap(); // toggle OFF
+    assert!(!reg.merge_gate_declared(&g.id),
+        "a workflow file the human never turned on must not gate anything");
+    let audit = fs::read_to_string(d.path().join(&g.id).join("audit.jsonl")).unwrap();
+    assert!(audit.contains("workflow-ignored"), "and the trail says the file did nothing: {audit}");
+
+    // Turn it on: the gate appears.
+    let on = Guardrails { advanced_orchestrator: true, ..rails() };
+    let g = reg.create_group(&repo.path().to_string_lossy(), on).unwrap();
+    assert!(reg.merge_gate_declared(&g.id));
+
+    // Turn it off again: the gate goes with it, rather than outliving the consent
+    // that created it.
+    let g = reg.create_group(&repo.path().to_string_lossy(), rails()).unwrap();
+    assert!(!reg.merge_gate_declared(&g.id),
+        "a gate must not survive the toggle that authorized it being turned off");
+}
+
+#[test]
+fn a_resumed_group_keeps_the_gate_it_launched_with() {
+    // #229 pins the ROSTER to the launch: a `git pull` between launch and resume must
+    // not swap a delegate's persona under a session the human already consented to.
+    // The gate is pinned by the same rule, and the argument is stronger for it — a
+    // re-read on resume is precisely how a pulled file could *loosen* the gate a
+    // running session is under (drop a reviewer, delete the clause). The launch-time
+    // gate stands; the drift is audited.
+    let (reg, d, repo, gid) = gated_group("");
+    assert_eq!(reg.merge_gate(&gid).unwrap().reviewers, vec!["rev-security", "rev-tests"]);
+
+    // The repo drops a reviewer from the gate…
+    fs::write(repo.path().join(".loomux").join("workflow.yml"),
+        "version: 1\nblocks:\n  - id: rev-security\n    kind: reviewer\n\
+         gates:\n  merge:\n    reviewers: [rev-security]\n").unwrap();
+    // …and the session RESUMES (guardrails from group.json, as the restore path builds them).
+    let (repo_path, persisted) = reg.load_group_file(&gid).expect("group.json");
+    let g = reg.create_group_ex(&repo_path, persisted, Launch::Resume).unwrap();
+    assert_eq!(reg.merge_gate(&g.id).unwrap().reviewers, vec!["rev-security", "rev-tests"],
+        "a resume must not let a pulled workflow file weaken the gate the session is running under");
+    let audit = fs::read_to_string(d.path().join(&gid).join("audit.jsonl")).unwrap();
+    assert!(audit.contains("workflow-changed-since-launch"),
+        "and the human is told the repo has moved on: {audit}");
 }
 
 #[test]
@@ -6848,7 +6944,10 @@ fn a_broken_workflow_file_keeps_the_last_known_gate_instead_of_failing_open() {
 
     fs::write(repo.path().join(".loomux").join("workflow.yml"),
         "version: 1\nblocks:\n  - id: x\n    kind: nonsense\n").unwrap();
-    let g2 = reg.create_group(&repo.path().to_string_lossy(), rails()).unwrap();
+    // Relaunched with the advanced orchestrator still ON — the human still wants the
+    // repo's workflow; it is the file that broke, not their mind.
+    let g2 = reg.create_group(&repo.path().to_string_lossy(),
+        Guardrails { advanced_orchestrator: true, ..rails() }).unwrap();
     assert!(gate_file.is_file(), "a broken workflow file must NOT drop the gate it can no longer read");
     assert_eq!(reg.merge_gate(&g2.id).unwrap().reviewers, vec!["rev-security", "rev-tests"]);
     let audit = fs::read_to_string(d.path().join(&gid).join("audit.jsonl")).unwrap();
