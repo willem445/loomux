@@ -603,6 +603,87 @@ be changed. The position table now has **no prototype** and is read through `Obj
 Tightening the +Block dialog would not have fixed it: an id can arrive from a hand edit, the YAML
 tab, or an agent, and none of those pass through a dialog. Fix the lookup, not the instance.
 
+### The rules were right and the screen disagreed: `hidden` doesn't hide
+
+Everything above was true, tested, and shipped — and the pane still failed in the demo, in three
+ways at once. It rendered its **three mutually exclusive surfaces simultaneously**: a *"Can't read
+.loomux/workflow.yml"* banner, the *"Start a workflow"* front door, **and** the workflow itself,
+loaded, in the roster, badged **valid**. It said it could not read a file it had plainly just read.
+And pressing **Create workflow** — the button from the start surface, sitting live on top of a
+loaded workflow — scaffolded straight over it. Exactly the data-loss class the claim-then-write
+fix above was written to close.
+
+They are one bug, and it is not in any of the rules. `render()` picks one surface with
+`paneSurface` and sets `hidden` on the other two, correctly. **`hidden` was doing nothing.** The
+UA stylesheet's `[hidden] { display: none }` lives in the *user-agent origin*, and every author
+declaration outranks it — origin is decided before specificity is ever consulted. The pane's
+surfaces are `.wf-start`, `.wf-body`, `.wf-findings`, all `display: flex`. So the attribute was set,
+and the element stayed on screen, and the code that "hid" it had no way to find out.
+
+Read the three symptoms again with that in hand and they collapse into it:
+
+- **All three surfaces at once** — none of them was ever hidden.
+- **"Can't read .loomux/workflow.yml"** — the *static title* of an error surface that had never
+  been shown and never been hidden. The read never failed. There was no error. (The detail line
+  under it was blank, which is the tell: `errorTextEl` is set from `loadError`, and `loadError`
+  was `null`.)
+- **Create overwrote the workflow** — the button was visible over a loaded workflow, so it was
+  pressable, so it was pressed. And *every guard below it worked*: the pane had read the file and
+  held its hash, so `savePlan` returned an ordinary `guarded-write`, the hash **matched** (nothing
+  else had touched the file), and the backend wrote what it was told. Claim-then-write never armed,
+  because claim-then-write is what happens when the pane believes there is **no file** — and here
+  it knew there was one. There was no missing refusal downstream. The button should not have been
+  pressable.
+
+The attractive theory was a **root/cwd mismatch** — the read probe resolving one root, the write
+another. It is wrong, and `src-tauri/tests/workflowfile.rs` now contains the experiment that killed
+it: the process cwd pointed at a decoy repo of identical layout, the root in every spelling Windows
+hands over (backslashes, trailing separator) against the frontend's forward-slash `rel`. Read and
+write resolve the same absolute file, every time. A successful read *proves* the probe worked — the
+pane could not have shown a valid workflow otherwise — which is the deduction that ends the theory:
+a "Can't read" banner over a file that read fine cannot be a read failure.
+
+**Two fixes, and only one of them is in the pane.**
+
+`[hidden] { display: none !important; }`, once, at the top of `styles.css`. `!important` and not
+another per-class `[hidden]` companion — the file had **nine** of those, added one bug at a time,
+and the workflow pane's seven elements are what it cost to keep rediscovering the trap by hand. An
+author-origin `[hidden]` carries the same specificity as any single class, so without `!important`
+the winner is decided by **source order**: by whether the next person to write `display:` happens to
+write it below that line.
+
+It is app-wide because the bug is, and **two elements outside the pane were already living with
+it** — both silently ignoring their own `hidden` since the day they were written, and both now
+behaving as their code always said they did:
+
+- **`.group-auto-meter`** — the group view's budget meter, whose own comment reads `Off ⇒ hidden`.
+  It never hid; with autonomy off it sat there as an empty shell.
+- **`.tab-close`** — the tab bar's ✕, which `tabbar.ts` hides on a single tab (`never zero tabs`).
+  Visible, it was a **dead control**: `requestClose` floors at `count <= 1` and returns, so clicking
+  it did nothing. The never-zero-tabs floor is enforced in the handler and does not depend on this,
+  so restoring the ✕'s intended invisibility changes what you *see*, not what can happen.
+
+`test/hiddenrule.test.ts` guards the fix in the two places it can be attacked. An important
+declaration beats every normal one regardless of selector, so the *only* thing that can out-rank the
+guard is **another important `display`** — which the test forbids outright, reading every declaration
+in the file whatever its selector (a `display: flex !important` hung on a descendant selector would
+otherwise defeat the guard invisibly). The second half models the cascade over the compound
+selectors that actually carry `display` here and asserts the invariant itself: *if the code hides an
+element, the element goes away*.
+
+So the next `display: flex` on a toggled class is simply **harmless** — the guard outranks it, the
+suite stays green, and nothing needs to be said to whoever wrote it. That is the point of fixing this
+in the cascade rather than element by element. What fails a test is **weakening the guard** or adding
+**a second important `display`** — which are the only two ways this bug can come back.
+
+And `createAllowed` (`workflowpane.ts`): a create is permitted on the **start surface and nowhere
+else** — the same single decision that draws the button — and `scaffold()` refuses if it is called
+anywhere else. Because the start surface is *by definition* "no file, empty buffer", every create it
+permits is a `claim-then-write`; the two rules cannot drift apart into a create that overwrites. The
+lesson is the one the CSS taught: **visibility is not a safety property.** The pane's defence
+against scaffolding over a workflow was that the button was *supposed to be invisible*, and a
+stylesheet was all it took to make that false.
+
 ### The rest is the pattern #217 already set
 
 The workflow file rides in the persisted `file` field the editor pane added; `cwd` carries the
@@ -646,7 +727,9 @@ construction, not by remembering.
 | `workflowview.ts` (#222) | the DOM: roster + property form, raw YAML, the **editable canvas**, findings strip, save/conflict, the start + error surfaces — and the same `dirty` / `canDiscard` / `bufferReport` contract the editor has |
 | `workflowlayout.ts` (#222 v2) | the canvas's pure half: `.loomux/workflow.layout.json`, placement, hit-testing, edge routing — all DOM-free, all node:tested |
 | `modal.ts` (#222 v2) | `promptModal` — one line of text, validated on every keystroke (the affirm button is disabled while the id is bad), so a new block can be ASKED for its id instead of being given a generated one |
-| `workflowpane.ts` (#222 v2) | the pane's pure DECISIONS — which surface it shows, how a save is allowed to write, what the layout file may forget. Three rules the view used to hold itself, and got wrong |
+| `workflowpane.ts` (#222 v2) | the pane's pure DECISIONS — which surface it shows, how a save is allowed to write, what the layout file may forget. Three rules the view used to hold itself, and got wrong. Plus `createAllowed` (#222 live fix): a create is permitted on the **start surface and nowhere else**, so it can never be reached over a workflow that is already there |
+| `styles.css` → `[hidden] { display: none !important; }` (#222 live fix) | app-wide, one line: an author `display:` rule out-ranks the UA's `[hidden]` **by origin**, so `el.hidden = true` was silently ignored on all seven of the workflow pane's toggled elements — the pane drew its three exclusive surfaces at once, and the "Create workflow" button sat live over a loaded workflow. It also un-breaks the two elements *outside* the pane that had the same defect: the group view's budget meter (`Off ⇒ hidden`) and the tab bar's ✕ on a single tab (`never zero tabs`) |
+| `test/hiddenrule.test.ts` (#222 live fix) | two halves of one guarantee: **the guard is the only important `display` in the stylesheet** (read off every declaration, any selector — an important `display` is the *only* thing that can out-rank `[hidden]`), and **hiding an element hides it** (the cascade, modelled over the compound selectors that carry `display` here) |
 | `src-tauri/tests/workflowfile.rs` (#222 v2) | pins the two backend facts the create path rests on: a null-hash write clobbers (why a create must never use one), and `new_file` refuses atomically without truncating (why claiming the path fixes it) |
 | `filemenu.ts` / `fileexplorer.ts` / `fileexplorermodel.ts` (#222) | the `workflow-pane` row affordance — declared, and offered only on a `.yml`/`.yaml` row |
 | `launcher.ts` (#222) | the `Workflow` kind in the welcome form's picker (one option, one plan, one probe — the same directory probe files/editor use) |

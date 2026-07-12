@@ -81,6 +81,7 @@ import { ftReadFile, ftWriteFile, ftListDir, errorCode, errorMessage } from "./f
 import { fmNewFolder, fmNewFile, fmErrorCode } from "./filemgr";
 import {
   paneSurface,
+  createAllowed,
   savePlan,
   layoutPruneIds,
   rewriteImpact,
@@ -195,6 +196,15 @@ export class WorkflowView {
   private errorEl: HTMLElement;
   private errorTextEl: HTMLElement;
   private bodyEl: HTMLElement;
+  /** The create button, and the two labels that name the file. All three are re-stated in
+   *  `render()` rather than fixed at construction: the button because being pressable is a
+   *  DECISION (`createAllowed`) and not a side-effect of being on screen, and the labels because
+   *  this pane opens on any `.yml` the file browser hands it (#217's `file`), so a pane rooted on
+   *  `ci/flow.yml` that says `.loomux/workflow.yml` is telling the human about a file they are
+   *  not looking at — which, on the error surface, means naming the wrong file as unreadable. */
+  private starterBtn: HTMLButtonElement;
+  private startPathEl: HTMLElement;
+  private errorTitleEl: HTMLElement;
 
   // Canvas interaction state. All three are transient — none of them is ever serialized, and
   // the model never learns they existed.
@@ -258,10 +268,8 @@ export class WorkflowView {
     // so nobody has to press the button to find out what it does.
     this.emptyEl = el("div", "wf-start");
     const startHead = el("div", "wf-start-head");
-    startHead.append(
-      el("span", "wf-start-title", "Start a workflow"),
-      el("span", "wf-start-path", WORKFLOW_FILE)
-    );
+    this.startPathEl = el("span", "wf-start-path", WORKFLOW_FILE);
+    startHead.append(el("span", "wf-start-title", "Start a workflow"), this.startPathEl);
     const startBody = el(
       "div",
       "wf-start-body",
@@ -270,6 +278,7 @@ export class WorkflowView {
         "it only when Advanced orchestrator is ticked."
     );
     const starterBtn = document.createElement("button");
+    this.starterBtn = starterBtn;
     starterBtn.className = "wf-btn wf-btn-primary";
     starterBtn.textContent = "Create workflow";
     starterBtn.title = "Scaffold a commented .loomux/workflow.yml — today's pipeline, ready to edit";
@@ -301,17 +310,14 @@ export class WorkflowView {
     // The pane must never invite you to overwrite a file it refused to show you.
     this.errorEl = el("div", "wf-start");
     this.errorTextEl = el("div", "wf-start-body");
+    this.errorTitleEl = el("div", "wf-start-title", `Can't read ${WORKFLOW_FILE}`);
     const retry = document.createElement("button");
     retry.className = "wf-btn";
     retry.textContent = "Retry";
     retry.addEventListener("click", () => void this.load());
     const errRow = el("div", "wf-start-row");
     errRow.append(retry);
-    this.errorEl.append(
-      el("div", "wf-start-title", `Can't read ${WORKFLOW_FILE}`),
-      this.errorTextEl,
-      errRow
-    );
+    this.errorEl.append(this.errorTitleEl, this.errorTextEl, errRow);
     this.errorEl.hidden = true;
 
     // ---- roster (left) ----
@@ -707,6 +713,22 @@ export class WorkflowView {
    *  moment `authored_with:` is stamped, because this is the one moment the pane AUTHORS a
    *  file rather than editing one. */
   private async scaffold(): Promise<void> {
+    // THE LAST WORD ON THE CREATE PATH (#222 live bug 3). A create is allowed on the start
+    // surface and nowhere else — `createAllowed` is the same decision that draws the button, so
+    // reaching here in any other state means the DOM has drifted from the rules, which is exactly
+    // what happened: a stylesheet left the button on screen over a loaded workflow, and pressing
+    // it scaffolded over that workflow with a hash-guarded write that the backend was right to
+    // honour. Refusing here means no future wiring mistake, CSS or otherwise, can turn "Create"
+    // into "destroy" — the guard no longer depends on the button being where we think it is.
+    if (!createAllowed({ loadError: this.loadError, exists: this.exists, text: this.text })) {
+      // Two states refuse a create, and the message has to be true in BOTH (rev-17 F5): a workflow
+      // is loaded, OR a file is there that we could not read. "Already open" is a lie in the second
+      // one — the file precisely did not open, which is the whole reason we won't scaffold over it.
+      // What holds either way is the only thing worth saying: nothing was destroyed.
+      showToast("Nothing was created or overwritten — Create is only offered where there's no workflow.");
+      this.render();
+      return;
+    }
     this.setText(scaffoldWorkflowText(this.appVersion));
     this.render();
     await this.save();
@@ -802,7 +824,8 @@ export class WorkflowView {
     // WHICH SURFACE is a rule, and it lives in `workflowpane.paneSurface` — pure, and tested.
     // The last time this view worked it out for itself, it showed "there is no workflow here"
     // for a file that was there and merely unreadable, and then offered to create one over it.
-    const surface = paneSurface({ loadError: this.loadError, exists: this.exists, text: this.text });
+    const state = { loadError: this.loadError, exists: this.exists, text: this.text };
+    const surface = paneSurface(state);
     const error = surface === "error";
     const start = surface === "start";
     this.errorEl.hidden = !error;
@@ -810,6 +833,15 @@ export class WorkflowView {
     this.emptyEl.hidden = !start;
     this.bodyEl.hidden = error || start;
     this.findingsEl.hidden = error || start;
+    // Both surfaces name the file this pane is actually open on, not the default one.
+    this.errorTitleEl.textContent = `Can't read ${this.rel}`;
+    this.startPathEl.textContent = this.rel;
+    // Pressability is the RULE, not a side-effect of being on screen. `hidden` is now honoured
+    // (styles.css `[hidden]`), so this is belt and braces — but it is the belt that matters: the
+    // live bug was a create button the human could press over a loaded workflow, and the thing
+    // that made it pressable was a stylesheet. A `disabled` that follows the same decision as the
+    // surface cannot be undone by one.
+    this.starterBtn.disabled = !createAllowed(state);
     this.yamlArea.value = this.text;
     this.updateDirty();
     if (error || start) {

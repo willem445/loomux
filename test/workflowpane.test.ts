@@ -8,6 +8,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   paneSurface,
+  createAllowed,
   savePlan,
   layoutPruneIds,
   rewriteImpact,
@@ -49,6 +50,71 @@ test("a workflow — saved, or scaffolded and not yet saved — is the BODY", ()
   // A scaffold the human hasn't saved yet is content: dropping them back to the start surface
   // ("create a workflow") while one is sitting unsaved in the buffer would be absurd.
   assert.equal(paneSurface({ loadError: null, exists: false, text: "version: 1\n" }), "body");
+});
+
+// ---------- the live bug: a create that was reachable over a workflow that was RIGHT THERE ----------
+
+test("CREATE is refused while a workflow is loaded — the one the human watched get overwritten", () => {
+  // WHAT ACTUALLY HAPPENED (the demo, in loomux-testbed). The pane read `.loomux/workflow.yml`,
+  // validated it, and showed it — and showed the "Create workflow" button on top of it, because
+  // `hidden` doesn't hide anything the stylesheet gave a `display` to (test/hiddenrule.test.ts).
+  // The human pressed it and the scaffold replaced their workflow.
+  //
+  // Every guard BELOW the button did its job. That is the part worth staring at: from the save's
+  // point of view this was an ordinary edit — the pane had read the file and held its hash, so
+  // there was no conflict to detect and nothing to refuse. The rule below is the only place the
+  // answer could have come from.
+  const loaded = { loadError: null, exists: true, text: "version: 1\nname: default\n" };
+  assert.equal(paneSurface(loaded), "body");
+  assert.equal(createAllowed(loaded), false, "there is a workflow here — creating means destroying it");
+});
+
+test("CREATE is refused on the ERROR surface — you cannot scaffold over what you refused to show", () => {
+  // The older, subtler shape of the same thing: a file that is THERE and unreadable (UTF-16 from
+  // PowerShell) must not be offered a "Create workflow" button either, and the reason is exactly
+  // that the pane cannot see what it would be destroying.
+  assert.equal(createAllowed({ loadError: "not valid UTF-8", exists: false, text: "" }), false);
+});
+
+test("CREATE is allowed only where there is nothing to lose", () => {
+  assert.equal(createAllowed({ loadError: null, exists: false, text: "" }), true);
+  // …and not once a scaffold is sitting unsaved in the buffer: that is content, the pane is on its
+  // body surface, and a second create would throw away the first one's edits.
+  assert.equal(createAllowed({ loadError: null, exists: false, text: "version: 1\n" }), false);
+});
+
+test("every state that permits a CREATE plans a claim — a create can never be ASKED to clobber", () => {
+  // The property that makes the gate structural rather than a second opinion. `createAllowed` is
+  // true only on the start surface, and the start surface is BY DEFINITION "no file, empty buffer"
+  // — which is exactly the state in which `savePlan` claims the path atomically instead of writing
+  // against a hash. So the two rules cannot drift apart into a create that overwrites: the write
+  // plan for a permitted create is a `claim-then-write`, always, and `fm_new_file` refuses without
+  // truncating if anything got there first (src-tauri/tests/workflowfile.rs).
+  const states = [
+    { loadError: null, exists: false, text: "" },
+    { loadError: null, exists: false, text: "   \n\t " },
+    { loadError: null, exists: true, text: "version: 1\n" },
+    { loadError: "unreadable", exists: false, text: "" },
+    { loadError: null, exists: false, text: "version: 1\n" },
+  ];
+  for (const s of states) {
+    if (!createAllowed(s)) continue;
+    // A permitted create never believes a file is there, so it never has a hash to write against.
+    assert.deepEqual(savePlan({ exists: s.exists, savedHash: "" }), { kind: "claim-then-write" });
+  }
+});
+
+test("the save layer could not have saved us — which is why the gate is above it", () => {
+  // Not a guard, a POST-MORTEM, pinned so nobody re-argues that F2's claim-then-write already
+  // covered this. It didn't, and it couldn't: claim-then-write arms when the pane believes there
+  // is NO file. Pressing Create over a LOADED workflow is the opposite state — `exists` is true
+  // and the hash is the real file's — so the plan is a guarded write, the hash matches (nothing
+  // else touched the file), and the backend overwrites, correctly, as instructed.
+  assert.deepEqual(savePlan({ exists: true, savedHash: "the-real-file's-hash" }), {
+    kind: "guarded-write",
+    expectedHash: "the-real-file's-hash",
+  });
+  // No conflict. No refusal. No dialog. The write is only wrong because the BUTTON was wrong.
 });
 
 // ---------- F2: a create can never overwrite ----------
