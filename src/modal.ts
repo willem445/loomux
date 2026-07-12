@@ -75,6 +75,112 @@ export function modal<T>(build: (resolve: (v: T) => void) => ModalSpec<T>): Prom
   });
 }
 
+/** Ask for one line of text, validated as it is typed. Resolves to the value, or null if the
+ *  human cancelled.
+ *
+ *  Added for the workflow canvas (#222 v2), which must ASK for a block's id rather than mint
+ *  one: an id is immutable and human-meaningful (§4), and a canvas that generates
+ *  `node_1720794829558` — Dify's actual behaviour — makes every edge in the file unreadable.
+ *  `validate` runs on every keystroke and on submit, so a duplicate or malformed id is refused
+ *  in the dialog, where the human is still typing it, rather than becoming a finding they have
+ *  to go and understand afterwards.
+ *
+ *  Same overlay kit as `modal`, deliberately: one dialog look, one Escape behaviour, one
+ *  place to fix them. */
+export function promptModal(spec: {
+  title: string;
+  body: string;
+  label: string;
+  placeholder?: string;
+  initial?: string;
+  affirm: string;
+  /** Return an error to REFUSE the value, or null to allow it. */
+  validate?: (value: string) => string | null;
+}): Promise<string | null> {
+  return new Promise<string | null>((resolve) => {
+    let settled = false;
+    const done = (v: string | null) => {
+      if (settled) return;
+      settled = true;
+      overlay.remove();
+      resolve(v);
+    };
+
+    const el = (tag: string, cls: string, text?: string): HTMLElement => {
+      const e = document.createElement(tag);
+      e.className = cls;
+      if (text !== undefined) e.textContent = text;
+      return e;
+    };
+
+    const overlay = el("div", "launcher-overlay visible");
+    const dlg = el("div", "agent-dialog");
+    const input = document.createElement("input");
+    input.className = "dlg-input";
+    input.type = "text";
+    input.value = spec.initial ?? "";
+    if (spec.placeholder) input.placeholder = spec.placeholder;
+    // `.dlg-error` is shown by the `visible` CLASS, not by the `hidden` attribute — the rule is
+    // `display: none` until then, so an attribute toggle would leave it invisible forever.
+    const error = el("div", "dlg-error");
+
+    const actions = el("div", "dlg-actions");
+    const cancel = el("button", "dlg-btn", "Cancel");
+    cancel.addEventListener("click", () => done(null));
+    const ok = el("button", "dlg-btn primary", spec.affirm) as HTMLButtonElement;
+    actions.append(cancel, ok);
+
+    /** Validate what is in the box RIGHT NOW, and reflect it. Runs on every keystroke and
+     *  again on submit (rev-15 F4 — it used to run only on submit, while three comments claimed
+     *  otherwise). "A bad id can't be confirmed" should mean a button you can SEE is disabled,
+     *  not a button that works until you press it and then refuses. The empty box is the one
+     *  case that shows no error: you haven't typed anything wrong, you just haven't typed. */
+    const check = (): string | null => {
+      const value = input.value.trim();
+      const err = spec.validate?.(value) ?? null;
+      const complain = err !== null && value !== "";
+      error.textContent = complain ? err : "";
+      error.classList.toggle("visible", complain);
+      ok.disabled = err !== null;
+      return err;
+    };
+
+    const submit = () => {
+      if (check() !== null) {
+        input.focus();
+        return;
+      }
+      done(input.value.trim());
+    };
+
+    input.addEventListener("input", check);
+    input.addEventListener("keydown", (e) => {
+      e.stopPropagation();
+      if (e.key === "Enter") submit();
+      if (e.key === "Escape") done(null);
+    });
+    ok.addEventListener("click", submit);
+
+    dlg.append(
+      el("h2", "", spec.title),
+      el("div", "dlg-hint", spec.body),
+      el("div", "dlg-label", spec.label),
+      input,
+      error,
+      actions
+    );
+    overlay.appendChild(dlg);
+    overlay.addEventListener("mousedown", (e) => {
+      if (e.target === overlay) done(null);
+    });
+    overlay.addEventListener("keydown", (e) => e.stopPropagation());
+    document.body.appendChild(overlay);
+    check(); // an empty box starts with the affirm button disabled — nothing to confirm yet
+    input.focus();
+    input.select();
+  });
+}
+
 /** A yes/no confirmation. `danger` styles the affirmative button red (destructive). */
 export function confirmModal(
   title: string,

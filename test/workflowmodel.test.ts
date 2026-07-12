@@ -19,6 +19,12 @@ import {
   removeBlockAt,
   nextBlockId,
   starterWorkflow,
+  scaffoldWorkflowText,
+  connectBlocks,
+  disconnectBlocks,
+  connectionError,
+  addBlock,
+  newBlock,
   isValidBlockId,
   hasErrors,
   BLOCK_KINDS,
@@ -394,6 +400,129 @@ test("an empty roster serializes to something that re-reads as an empty roster (
   assert.deepEqual(codes(findings), ["no-blocks"], "the honest error, and ONLY the honest error");
   // A hand-authored bare `blocks:` means the same thing and must not be a shape error either.
   assert.deepEqual(codes(analyzeWorkflow("version: 1\nblocks:\n").findings), ["no-blocks"]);
+});
+
+// ---------- the empty-state bug (v2) ----------
+
+test("a BOM does not make a valid workflow look broken", () => {
+  // A workflow file written by a Windows editor starts with U+FEFF. The reader took it as
+  // part of the first KEY, so `version: 1` arrived as a key named "﻿version" and the pane
+  // reported `version-missing` against a file the human could see was correct — and the
+  // character is INVISIBLE, so nothing in the error could lead them to the cause.
+  const { workflow, findings } = analyzeWorkflow("﻿" + SAMPLE);
+  assert.deepEqual(codes(findings), []);
+  assert.equal(workflow.version, 1);
+  assert.equal(workflow.blocks.length, 4);
+});
+
+test("the scaffold is a valid workflow, and canonicalizes to the same one", () => {
+  // What a repo with no workflow gets when the human asks for one. If this stops parsing
+  // clean, every new workflow in the world starts life with a finding on it.
+  const { workflow, findings } = analyzeWorkflow(scaffoldWorkflowText("0.9.0"));
+  assert.deepEqual(codes(findings), [], "a scaffold that isn't valid is a scaffold that lies");
+  assert.deepEqual(
+    workflow.blocks.map((b) => b.id),
+    ["planner", "worker", "reviewer"]
+  );
+  assert.deepEqual(workflow.edges, [
+    { from: "planner", to: "worker" },
+    { from: "worker", to: "reviewer" },
+  ]);
+  assert.deepEqual(workflow.gates.merge, { require: "all-pass", reviewers: ["reviewer"], also: [] });
+  assert.equal(workflow.extra?.authored_with, "0.9.0");
+  // It is the same workflow the model's starter describes — the commented file and the
+  // programmatic one must not drift into being two different pipelines.
+  const starter = starterWorkflow("0.9.0");
+  assert.deepEqual(workflow.blocks.map((b) => b.id), starter.blocks.map((b) => b.id));
+  assert.deepEqual(workflow.edges, starter.edges);
+  // And a form edit (which re-serializes) produces canonical text that still round-trips.
+  const canonical = serializeWorkflow(workflow);
+  assert.equal(serializeWorkflow(parseWorkflow(canonical).workflow), canonical);
+});
+
+// ---------- graph edit operations (v2: the canvas edits the file) ----------
+
+test("drawing an edge, then re-reading the file, gives back the edge you drew", () => {
+  // The round-trip the editable canvas rests on: a gesture → the model → the canonical file
+  // → the model again, with the same GRAPH. If this doesn't hold, the canvas is lying about
+  // the file.
+  const w = starterWorkflow();
+  const connected = connectBlocks(w, "planner", "reviewer");
+  assert.deepEqual(connected.edges.at(-1), { from: "planner", to: "reviewer" });
+
+  const reread = parseWorkflow(serializeWorkflow(connected)).workflow;
+  // As a SET, not a sequence — and that is a property, not a concession: the canonical form
+  // groups edges by source in roster order, so the file's edge order is a function of the
+  // workflow rather than of the order the human happened to draw them in. Two people who draw
+  // the same graph in a different order get the same file, and neither sees a diff from the
+  // other's clicking sequence.
+  const key = (e: { from: string; to: string }): string => `${e.from}->${e.to}`;
+  assert.deepEqual(new Set(reread.edges.map(key)), new Set(connected.edges.map(key)));
+  assert.equal(reread.edges.length, connected.edges.length, "no edge invented, none lost");
+  assert.deepEqual(codes(validateWorkflow(reread)), []);
+});
+
+test("an edge that would be nonsense is refused before it is drawn, not after", () => {
+  // A canvas that lets you complete the gesture and THEN says the edge was invalid has
+  // wasted the gesture and left you to undo it.
+  const w = starterWorkflow();
+  assert.equal(connectionError(w, "planner", "reviewer"), null, "a legal edge has no error");
+  assert.match(connectionError(w, "worker", "worker") ?? "", /itself/);
+  assert.match(connectionError(w, "worker", "ghost") ?? "", /doesn't exist/);
+  assert.match(connectionError(w, "", "worker") ?? "", /needs an id/);
+  assert.match(connectionError(w, "planner", "worker") ?? "", /already exists/, "planner→worker is already drawn");
+
+  // And the operation enforces it too, not only the pre-check — the canvas is the first line
+  // of defence, not the only one.
+  assert.deepEqual(connectBlocks(w, "worker", "worker").edges, w.edges);
+  assert.deepEqual(connectBlocks(w, "worker", "ghost").edges, w.edges);
+  assert.deepEqual(connectBlocks(w, "planner", "worker").edges, w.edges, "no duplicate edge");
+});
+
+test("erasing an edge takes the edge and nothing else", () => {
+  const w = starterWorkflow();
+  const cut = disconnectBlocks(w, "worker", "reviewer");
+  assert.deepEqual(cut.edges, [{ from: "planner", to: "worker" }]);
+  assert.deepEqual(cut.blocks, w.blocks, "the blocks it joined are untouched");
+  // The reviewer is now unwired, which the validator says out loud — as a WARNING, because
+  // edges are advisory and the workflow still runs.
+  const f = validateWorkflow(cut);
+  assert.equal(hasErrors(f), false);
+  assert.ok(f.some((x) => x.code === "isolated-block" && x.blockId === "reviewer"));
+});
+
+test("a block created on the canvas keeps the id the human gave it", () => {
+  // §4's first commitment. Dify mints `node_1720794829558`; n8n keys the graph by the display
+  // NAME so a rename silently breaks it. A block created here gets a human id, edges name that
+  // id, and a rename touches nothing.
+  const w = addBlock(starterWorkflow(), newBlock("rev-security", "Security review"));
+  const wired = connectBlocks(w, "worker", "rev-security");
+  const reread = parseWorkflow(serializeWorkflow(wired)).workflow;
+  const made = reread.blocks.find((b) => b.id === "rev-security")!;
+  assert.equal(made.name, "Security review");
+  assert.equal(made.kind, "reviewer");
+  assert.ok(reread.edges.some((e) => e.from === "worker" && e.to === "rev-security"));
+
+  // Renaming it (display only) leaves every reference alone — the property the id buys.
+  const renamed: Workflow = {
+    ...reread,
+    blocks: reread.blocks.map((b) => (b.id === "rev-security" ? { ...b, name: "Sec" } : b)),
+  };
+  assert.deepEqual(parseWorkflow(serializeWorkflow(renamed)).workflow.edges, reread.edges);
+  assert.deepEqual(codes(validateWorkflow(renamed)), []);
+});
+
+test("a canvas-authored workflow serializes canonically and stays stable", () => {
+  // Build one entirely through the edit ops — the way the canvas does — and it must produce
+  // the same shape as a hand-written file: canonical, idempotent, no findings.
+  let w = starterWorkflow("0.9.0");
+  w = addBlock(w, newBlock("rev-perf", "Perf review"));
+  w = connectBlocks(w, "worker", "rev-perf");
+  w = disconnectBlocks(w, "planner", "worker");
+  w = connectBlocks(w, "planner", "worker");
+  const once = serializeWorkflow(w);
+  assert.equal(serializeWorkflow(parseWorkflow(once).workflow), once, "GUI-authored files format like any other");
+  assert.deepEqual(analyzeWorkflow(once).findings.filter((f) => f.severity === "error"), []);
 });
 
 // ---------- broken files still open ----------

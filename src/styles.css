@@ -2678,14 +2678,34 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .wf-btn-primary { border-color: var(--accent-dim); background: rgba(122, 162, 247, 0.2); }
 .wf-btn-danger { border-color: rgba(247, 118, 142, 0.5); color: var(--danger); align-self: flex-start; }
 
-/* Empty state: a repo with no workflow yet is the NORMAL starting point, not an error. */
-.wf-empty {
-  flex: 1; display: flex; flex-direction: column; gap: 12px;
-  align-items: flex-start; justify-content: center;
-  padding: 0 48px; max-width: 620px; margin: 0 auto;
+/* The START surface (v2). A repo with no workflow is the NORMAL beginning of every repo, so
+   this is a front door, not an apology — and a front door is a doorway, not a hall. It sits at
+   the TOP of the pane rather than centred in a screenful of nothing: the old empty state spent
+   a whole pane on two sentences, which is what the human called out. */
+.wf-start {
+  flex: none; display: flex; flex-direction: column; gap: 10px;
+  padding: 18px 20px; border-bottom: 1px solid var(--border);
+  background: var(--panel);
 }
-.wf-empty-title { font-size: 15px; font-weight: 650; color: var(--text); }
-.wf-empty-body { font-size: 12.5px; color: var(--text-dim); line-height: 1.6; }
+.wf-start-head { display: flex; align-items: baseline; gap: 10px; }
+.wf-start-title { font-size: 14px; font-weight: 650; color: var(--text); }
+.wf-start-path {
+  font-size: 11.5px; color: var(--text-dim);
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+}
+.wf-start-body { font-size: 12.5px; color: var(--text-dim); line-height: 1.6; max-width: 74ch; }
+.wf-start-row { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+/* The roster the button is about to write — cheaper than a paragraph, and it is the thing they
+   actually want to know before they press it. */
+.wf-start-preview { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.wf-chip {
+  padding: 2px 9px; border-radius: 999px; font-size: 11.5px;
+  border: 1px solid var(--border); background: var(--panel-2); color: var(--text);
+}
+.wf-chip-planner { border-color: #7dcfff; }
+.wf-chip-worker { border-color: #9ece6a; }
+.wf-chip-reviewer { border-color: #bb9af7; }
+.wf-start-gate { font-size: 11.5px; color: #e0af68; }
 
 .wf-body { flex: 1; min-height: 0; display: flex; }
 
@@ -2770,10 +2790,31 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   font-size: 12.5px; line-height: 1.55; tab-size: 2;
 }
 
-/* The derived graph — read-only, and it says so by having nothing to grab. */
+/* The CANVAS (v2 — it edits the file now). Everything it can do goes through the pure model
+   and out through the canonical formatter, so it is a second way to edit the workflow, never a
+   second source of truth. Positions are the one thing it owns, and they live in a different
+   file entirely (.loomux/workflow.layout.json). */
 .wf-graph { display: flex; flex-direction: column; }
+.wf-graph-bar {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  padding: 6px 10px; border-bottom: 1px solid var(--border-soft);
+}
+.wf-graph-hint { font-size: 11px; color: var(--text-dim); }
+.wf-graph-bar .wf-legend { margin-left: auto; border: none; padding: 0; }
 .wf-graph-scroll { flex: 1; overflow: auto; padding: 8px; }
-.wf-graph-svg { display: block; }
+.wf-graph-svg { display: block; touch-action: none; user-select: none; }
+
+/* A node you can pick up. The cursor is the affordance — a box that moves under the pointer
+   without ever having said it could is a box people don't try to move. */
+.wf-node-g { cursor: grab; }
+.wf-node-g.selected .wf-node { stroke-width: 2; filter: drop-shadow(0 0 6px var(--accent-glow)); }
+.wf-node-g:active { cursor: grabbing; }
+/* The port you drag an edge FROM. Drawn, because a gesture nobody can see is a gesture nobody
+   performs; it grows on hover so the 12px hit radius is honest about where it is. */
+.wf-port { fill: var(--panel); stroke: #6b7394; stroke-width: 1.5; }
+.wf-port-out { cursor: crosshair; }
+.wf-node-g:hover .wf-port-out { fill: var(--accent); stroke: var(--accent); r: 6; }
+.wf-port-in { fill: #6b7394; stroke: none; }
 .wf-node { fill: var(--panel-2); stroke: var(--border); stroke-width: 1; }
 .wf-node-orchestrator { stroke: var(--accent); }
 .wf-node-worker { stroke: #9ece6a; }
@@ -2785,6 +2826,16 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 /* ADVISORY: a plain solid arrow. It declares intent; the orchestrator still schedules. */
 .wf-edge { fill: none; stroke: #6b7394; stroke-width: 1.5; }
 .wf-edge-broken { stroke: var(--danger); stroke-dasharray: 3 3; }
+/* The edge being dragged out of a port — not yet a fact about the workflow, and drawn like it. */
+.wf-edge-draft { stroke: var(--accent); stroke-dasharray: 4 4; pointer-events: none; }
+.wf-edge-g .wf-edge { transition: stroke 0.1s var(--ease); }
+.wf-edge-g:hover .wf-edge, .wf-edge-g.selected .wf-edge { stroke: var(--accent); stroke-width: 2.5; }
+/* The ✕ that erases an edge: hidden until you mean it (hover, or the edge is selected), so the
+   canvas isn't a field of delete buttons. It sits on the CURVE's midpoint — see edgeMidpoint. */
+.wf-edge-del { opacity: 0; cursor: pointer; transition: opacity 0.1s var(--ease); }
+.wf-edge-g:hover .wf-edge-del, .wf-edge-g.selected .wf-edge-del { opacity: 1; }
+.wf-edge-del circle { fill: var(--panel-2); stroke: var(--danger); stroke-width: 1.5; }
+.wf-edge-del-x { fill: var(--danger); font-size: 11px; font-weight: 700; pointer-events: none; }
 /* ENFORCED: amber and dashed, into a gate box shaped nothing like a block. The two are
    drawn differently because only ONE of them can stop a merge. */
 .wf-edge-gate { stroke: #e0af68; stroke-dasharray: 5 4; }
