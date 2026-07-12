@@ -260,15 +260,33 @@ fn a_workflow_file_can_never_grant_a_capability() {
     }
 
     // A `profile:` cannot escape the repo — the file's body is injected straight
-    // into an agent's system prompt, so `..` would let a repo pull any file on
-    // the operator's disk into an agent's context.
-    for escape in ["../../../../etc/passwd", "C:/Windows/win.ini", "/etc/shadow"] {
+    // into an agent's system prompt, so an escape would let a repo pull any file
+    // on the operator's disk into an agent's context.
+    //
+    // These must be refused ON EVERY PLATFORM, which is the whole reason the
+    // check runs on the string rather than deferring to `std::path`. A workflow
+    // file is committed and shared between developers, so a `profile:` that is an
+    // escape on Windows and an innocent relative path on Linux is precisely the
+    // divergence to kill — and `std::path` on Unix will happily read
+    // `C:/Windows/win.ini` as a directory called `C:`, and `..\..\x` as a single
+    // filename.
+    for escape in [
+        "../../../../etc/passwd",
+        "..\\..\\..\\Windows\\win.ini",
+        "C:/Windows/win.ini",
+        "c:\\Windows\\win.ini",
+        "/etc/shadow",
+        "\\\\server\\share\\x.md",
+        ".github/agents/../../../../etc/passwd",
+    ] {
         assert!(
-            workflow::resolve_profile_path("C:/repo", escape).is_err(),
-            "{escape:?} must be refused as a profile path"
+            workflow::resolve_profile_path("/repo", escape).is_err(),
+            "{escape:?} must be refused as a profile path on every platform"
         );
     }
-    assert!(workflow::resolve_profile_path("C:/repo", ".github/agents/x.md").is_ok());
+    // The legitimate shape still resolves, with either separator.
+    assert!(workflow::resolve_profile_path("/repo", ".github/agents/x.md").is_ok());
+    assert!(workflow::resolve_profile_path("/repo", ".github\\agents\\x.md").is_ok());
 }
 
 #[test]

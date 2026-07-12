@@ -330,18 +330,37 @@ pub fn ascii_escape_json(json: &str) -> String {
     out
 }
 
-/// Confine a `profile:` path to the repo. A workflow file is repo-authored
-/// input and its `profile:` names a file loomux **reads and injects into an
-/// agent's system prompt** — so an absolute path or a `..` escape would let a
-/// repo pull any file on the operator's disk into an agent's context. Rejects
-/// absolute paths, drive prefixes, and any parent-dir component; returns the
-/// repo-joined path only when it stays inside the repo.
+/// Confine a `profile:` path to the repo. A workflow file is repo-authored input
+/// and its `profile:` names a file loomux **reads and injects into an agent's
+/// system prompt** — so an absolute path or a `..` escape would let a repo pull
+/// any file on the operator's disk into an agent's context.
+///
+/// **The rules are the same on every platform, deliberately.** A workflow file is
+/// committed and shared between developers (the #51 requirement), so a `profile:`
+/// that is an escape on Windows and an innocent relative path on Linux is exactly
+/// the divergence to kill: `std::path` would happily read `C:/Windows/win.ini` as
+/// a *relative* path called `C:` on Unix, and `\\server\share\x` as a filename.
+/// Both are rejected everywhere. The `Component` walk below is then belt and
+/// braces on the platform that does understand them.
 pub fn resolve_profile_path(repo: &str, rel: &str) -> Result<PathBuf, String> {
     let rel = rel.trim();
     if rel.is_empty() {
         return Err("profile path is empty".into());
     }
-    let p = Path::new(rel);
+    // Platform-independent rejections, done on the STRING before `std::path` gets
+    // a chance to interpret it differently per OS.
+    let norm = rel.replace('\\', "/");
+    if norm.starts_with('/') {
+        return Err(format!("profile {rel:?} must be a repo-relative path, not absolute"));
+    }
+    if norm.chars().nth(1) == Some(':') && norm.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+    {
+        return Err(format!("profile {rel:?} must be a repo-relative path (no drive letter)"));
+    }
+    if norm.split('/').any(|seg| seg == "..") {
+        return Err(format!("profile {rel:?} must stay inside the repo (no '..')"));
+    }
+    let p = Path::new(&norm);
     if p.is_absolute() {
         return Err(format!("profile {rel:?} must be a repo-relative path, not absolute"));
     }
@@ -356,6 +375,9 @@ pub fn resolve_profile_path(repo: &str, rel: &str) -> Result<PathBuf, String> {
             }
         }
     }
+    // Join the FORWARD-SLASH form: Windows accepts it, and it means a file
+    // written `.github\agents\x.md` by a Windows author still resolves for a
+    // colleague on Linux, where a backslash is an ordinary filename character.
     Ok(Path::new(repo).join(p))
 }
 
