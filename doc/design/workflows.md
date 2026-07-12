@@ -587,9 +587,161 @@ roster and the gates; the orchestrator routes.
 The gate wording is kept generic on purpose: gate *enforcement* is sub-PR 3's, and
 the template must depend on the fact that gates are enforced, never on how.
 
+## The merge gate: verdicts as state (#222, closing the loomux half of #197)
+
+An edge is advisory. **A gate is enforced** — and this is the part of the feature
+nobody else in the survey ships. LangGraph, CrewAI, AutoGen and every node-canvas
+tool leave "did the reviewer approve?" as a critic agent plus a magic termination
+string; claude-flow ships consensus *agent prompts* (byzantine, raft, gossip) with
+no enforcing runtime at all. loomux already owns the one thing that makes a gate
+real: the `gh`/`git` PATH shim, which an agent physically cannot route around.
+
+### Why `report()` could never be the gate
+
+`report("done", "approved — looks good")` is a **notification**: untyped text typed
+into the orchestrator's pane. That is exactly how PR #151 merged on the first
+"approve" that arrived while a second, dedicated review was still running — and it
+was the second review that found a real release-gate bypass (#196). The review
+discipline worked; the merge jumped the gate before it finished.
+
+A gate cannot key off a notification. It needs **state**: durable, attributed to
+the reviewer that recorded it, and readable by something that can refuse a merge.
+That is one new MCP tool and one new file tree.
+
+### The verdict
+
+    review_verdict(pr, verdict, summary)      # reviewer-kind blocks only
+
+**A verdict is not a boolean.** Dify's Human Input node and Windmill's
+`resume[...]` both give each decision its own outgoing edge and keep the approver's
+typed input readable downstream; ours does the same:
+
+| verdict | means | effect on the gate |
+|---|---|---|
+| `pass` | reviewed, nothing blocking | the only verdict that satisfies a gate |
+| `fail` | blocking findings | refuses the merge |
+| `escalate` | *not deciding* — ambiguous requirement, out of its depth, a risk it won't sign off on | refuses the merge |
+
+`escalate` is the one that earns the model. Forced into a pass/fail bit, "a human
+should look at this" becomes either a false approval or a false defect report.
+Here it is a first-class outcome, and the summary that comes with it is what a
+human actually reads.
+
+Two rules, both from #197:
+
+- **Blockers beat approvals.** One `fail`/`escalate` refuses the merge whatever the
+  others recorded and whatever the threshold says — checked *before* any counting.
+  First-to-report must never win.
+- **The named reviewer's verdict is the gate**, not the first approval that turns
+  up. A verdict from a reviewer the gate doesn't name satisfies nothing.
+
+Re-recording replaces that reviewer's own verdict — the `fail` → worker fixes it →
+`pass` loop — and every write is audited, so the history is in the trail even
+though only the latest verdict gates.
+
+### The gate
+
+    gates:
+      merge:
+        require: all-pass        # or: threshold: 2
+        reviewers: [rev-security, rev-tests]
+        also: [ci-green]
+
+`all-pass` (the default when `require:` is omitted) needs every named reviewer to
+have recorded a `pass` — so **a reviewer that has recorded nothing keeps the gate
+shut**, which is literally the #151 bug. `threshold: N` needs N passes and does
+*not* wait for the reviewers it doesn't need: an author who writes `threshold: 2`
+over three reviewers has said in the file that two are enough. They still cannot
+merge over a `fail`.
+
+`also:` names extra conditions. **`ci-green`** is checked in the shim with
+`gh pr checks` (which exits non-zero when a check is failing, still running, or
+absent). Anything this build does not know how to check **fails closed** — the
+merge is refused, with the condition named, and audited. That asymmetry is
+deliberate: a gate is a safety claim, and silently ignoring a clause of it would
+turn a stricter-looking workflow file into a weaker one, which is the worst thing a
+gate can do. (#197 Scope A's other condition, `no-live-agents-on-pr`, is therefore
+*declarable but not yet enforceable* — it refuses every merge until a build knows
+it. See **Still to come**.)
+
+### How it composes with the human gate
+
+The workflow gate is an **additional necessary condition**. It never opens a merge
+by itself, and nothing opens *it* but the verdicts:
+
+    gh pr merge
+      │
+      ├─ workflow merge gate  ── declared in .loomux/workflow.yml ────── REFUSE unless satisfied
+      │                          (verdicts + also: conditions)
+      │                          ↑ checked FIRST — no grant, no autonomous
+      │                            marker, no dangerous mode can satisfy it
+      └─ human merge gate     ── default branch only (#83) ───────────── REFUSE unless
+                                 autonomous+auto_merge, dangerous mode, or a one-time grant
+
+That order *is* #197 Scope B — *"an auto-merge must be structurally impossible
+until every required review verdict is recorded PASS"*. A gate a human grant could
+override would not be that. Two consequences worth stating:
+
+- The workflow gate applies to **every** merge of the PR, not only to the default
+  branch. The reviewers reviewed *that PR*; where it lands doesn't change whether
+  they finished. (The human gate stays default-branch-only, unchanged — an
+  integration-branch merge is still ungated *by it*.)
+- A refused merge does **not** consume the human's one-time grant: the workflow gate
+  exits before the grant is read, so nobody has to re-approve a merge that never
+  happened.
+
+### Where the state lives
+
+Both artifacts are small files in the group's state dir, because the enforcement
+point is a POSIX shell script with no `jq` — and because the gate state the shim
+already reads (`autonomous`, `auto_merge`, `merge_grants/pr-<N>`) is exactly this
+shape:
+
+    <group-dir>/merge_gate                    # the declared gate, `key value` lines
+    <group-dir>/verdicts/pr-<N>/<block-id>    # line 1 = pass|fail|escalate; then ts, agent, summary
+
+The verdict word is line 1, so the shim's whole read is `head -n1`. The durable
+record and the enforcement input are *one artifact*, so they cannot drift. Every
+token in `merge_gate` is already shell-inert: block ids and conditions are
+*rejected* — never rewritten — by the parser when they leave their alphabet
+(`sanitize_id` / `sanitize_condition`), which is the contract the parse boundary
+established for precisely this consumer.
+
+The decision itself is pure and unit-tested (`workflow::evaluate_merge_gate`); the
+shim mirrors it in shell, and a harness executes the *real* script against a fake
+`gh` — the same pure-spec-plus-shell-harness pattern the #83 gate uses.
+
+### The gate file tracks the repo, with one deliberate asymmetry
+
+`merge_gate` is rewritten at every group create/resume from the repo's workflow
+file. Delete `gates.merge` (or the whole workflow file) and the gate is **cleared** —
+a group must not keep enforcing a rule its repo has walked back.
+
+But a workflow file that **fails to parse** keeps the last known gate, loudly
+(`merge-gate-retained` in the audit). #225's rule — *a broken file is audited and
+skipped, never fatal* — is right for the roster, where falling back to the built-in
+four blocks still lets every agent spawn. It is exactly wrong for a gate: dropping
+one because the file that declares it stopped parsing would quietly *widen* what
+the group's agents may do, and a syntax error is not consent to merge unreviewed
+code.
+
+### Where the reviewer learns about it
+
+`review_verdict` is documented in `reviewer.md` — and in **`mechanics_core(Reviewer)`**,
+the non-overridable contract loomux injects into every reviewer block. That is not
+belt-and-braces: a gate names *custom* reviewer blocks, and a custom block with a
+`mode: replace` persona never sees the built-in reviewer template. A reviewer that
+didn't know to record a verdict would hold the gate shut forever and nobody would
+know why.
+
 ## Still to come
 
-- **sub-PR 3** — `review_verdict(pr, verdict, summary)` as recorded,
-  reviewer-attributed state, and gate enforcement in the `gh` shim: `gh pr merge`
-  refused until every reviewer a gate names has recorded PASS. That is what makes
-  a declared gate more than prose, and it closes the loomux side of #197.
+- **`no-live-agents-on-pr`** (#197 Scope A.1) — "no agent tied to this PR is still
+  running" is the other half of the completeness check, and the gate schema already
+  carries it. It needs a PR→agent binding loomux doesn't have today (the task board's
+  `pr` + `assignee` fields are the obvious candidate, but they are orchestrator-
+  maintained, so they are evidence, not proof). Until a build can check it, declaring
+  it refuses every merge — which is the correct failure direction, and says so.
+- **Verdict visibility for the human.** Verdicts are agent-facing state today: the
+  human sees them in the audit log and in the orchestrator's pane. A per-reviewer
+  verdict column on the board task (#197 Scope C's panel) is the natural next step.

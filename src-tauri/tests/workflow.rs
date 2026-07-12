@@ -2220,3 +2220,214 @@ fn the_preview_never_reports_a_persona_the_spawn_would_deny() {
         .expect("the guaranteed orchestrator block is previewed");
     assert_eq!(orch["persona"], "none", "a preview must not claim what a launch would drop");
 }
+
+// ───────── verdicts + the merge gate: the pure semantics (#222 / #197) ─────────
+//
+// The gate decision is pure (`evaluate_merge_gate`) so it can be pinned here in
+// microseconds, and so the `gh` shim's shell mirror has a spec to agree with. The
+// shell itself is executed end-to-end in tests/orchestration.rs.
+
+fn gate(require: GateRequire, reviewers: &[&str], also: &[&str]) -> workflow::Gate {
+    workflow::Gate {
+        require,
+        reviewers: reviewers.iter().map(|s| s.to_string()).collect(),
+        also: also.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
+fn verdicts(
+    pairs: &[(&str, workflow::Verdict)],
+) -> std::collections::BTreeMap<String, workflow::Verdict> {
+    pairs.iter().map(|(b, v)| (b.to_string(), *v)).collect()
+}
+
+#[test]
+fn all_pass_gate_refuses_while_one_named_verdict_is_outstanding() {
+    // THE test. This is the #151 bug that produced #197: a PR merged on the FIRST
+    // reviewer's approve while a second, dedicated review was still running — and
+    // that second review found a real release-gate bypass (#196). One reviewer
+    // still silent must mean the gate stays shut, however loudly the other approved.
+    use workflow::{GateOutcome, Verdict};
+    let g = gate(GateRequire::AllPass, &["rev-security", "rev-tests"], &[]);
+
+    let one_in = workflow::evaluate_merge_gate(&g, &verdicts(&[("rev-security", Verdict::Pass)]));
+    assert_eq!(
+        one_in,
+        GateOutcome::Short { passes: 1, need: 2, outstanding: vec!["rev-tests".into()] },
+        "one reviewer's pass must NOT satisfy an all-pass gate while the other is still reviewing"
+    );
+    assert!(!one_in.satisfied());
+
+    // Both in: satisfied — and only then.
+    assert!(workflow::evaluate_merge_gate(
+        &g,
+        &verdicts(&[("rev-security", Verdict::Pass), ("rev-tests", Verdict::Pass)])
+    )
+    .satisfied());
+
+    // Nobody in at all: shut, and it names who it is waiting for.
+    match workflow::evaluate_merge_gate(&g, &verdicts(&[])) {
+        GateOutcome::Short { passes: 0, need: 2, outstanding } => {
+            assert_eq!(outstanding, vec!["rev-security", "rev-tests"])
+        }
+        other => panic!("an empty verdict set must not satisfy a gate: {other:?}"),
+    }
+
+    // A verdict from a reviewer the gate does NOT name satisfies nothing — the gate
+    // reads the *dispatched* reviewers, not the first approve that turns up (#197 A.2).
+    assert!(!workflow::evaluate_merge_gate(&g, &verdicts(&[("rev-perf", Verdict::Pass)])).satisfied());
+}
+
+#[test]
+fn a_blocking_verdict_beats_any_number_of_passes() {
+    // #197 A.3: "blockers beat approvals — first-to-report must never win." A fail
+    // (and an escalate, which is a refusal to decide, not an approval) refuses the
+    // merge whatever the others recorded and whatever the threshold says.
+    use workflow::{GateOutcome, Verdict};
+    for blocker in [Verdict::Fail, Verdict::Escalate] {
+        assert!(blocker.is_blocking(), "{blocker:?} must refuse a merge");
+        // Even against a threshold the passes already meet.
+        let g = gate(GateRequire::Threshold(2), &["a", "b", "c"], &[]);
+        let out = workflow::evaluate_merge_gate(
+            &g,
+            &verdicts(&[("a", Verdict::Pass), ("b", Verdict::Pass), ("c", blocker)]),
+        );
+        assert_eq!(
+            out,
+            GateOutcome::Blocked { blocking: vec!["c".into()] },
+            "two passes must not outvote a {blocker:?} — a disagreement resolves to do-not-merge"
+        );
+    }
+}
+
+#[test]
+fn threshold_gate_needs_n_passes_and_all_pass_needs_everyone() {
+    use workflow::{GateOutcome, Verdict};
+    let g = gate(GateRequire::Threshold(2), &["a", "b", "c"], &[]);
+    assert_eq!(workflow::gate_need(&g), 2);
+
+    // One pass is short, and the outcome names who is still to report.
+    assert_eq!(
+        workflow::evaluate_merge_gate(&g, &verdicts(&[("a", Verdict::Pass)])),
+        GateOutcome::Short { passes: 1, need: 2, outstanding: vec!["b".into(), "c".into()] }
+    );
+    // Two passes satisfy it: `threshold: 2` over three reviewers is the author
+    // saying, in the file, that two are enough — it does not wait for the third.
+    // (`all-pass`, the default, is the one that waits for everybody — above.)
+    assert!(workflow::evaluate_merge_gate(
+        &g,
+        &verdicts(&[("a", Verdict::Pass), ("b", Verdict::Pass)])
+    )
+    .satisfied());
+
+    // The same two verdicts against an all-pass gate over the same three: still shut.
+    let strict = gate(GateRequire::AllPass, &["a", "b", "c"], &[]);
+    assert_eq!(workflow::gate_need(&strict), 3);
+    assert!(!workflow::evaluate_merge_gate(
+        &strict,
+        &verdicts(&[("a", Verdict::Pass), ("b", Verdict::Pass)])
+    )
+    .satisfied());
+}
+
+#[test]
+fn a_verdict_is_never_guessed_and_an_unreadable_one_is_not_a_pass() {
+    use workflow::Verdict;
+    assert_eq!(Verdict::parse("PASS"), Some(Verdict::Pass), "case-insensitive");
+    assert_eq!(Verdict::parse(" escalate "), Some(Verdict::Escalate));
+    // Anything else is REJECTED, not coerced: a verdict loomux cannot read must
+    // never default to one that opens a gate.
+    for junk in ["approve", "lgtm", "yes", "true", "", "pass!", "ok"] {
+        assert_eq!(Verdict::parse(junk), None, "{junk:?} must not parse as a verdict");
+    }
+    // So a verdict file whose first line isn't a verdict reads as *no verdict*,
+    // which an all-pass gate treats as outstanding — never as a pass.
+    assert!(workflow::parse_verdict_file(7, "rev-a", "approved!\n123\nrev-1\nlgtm\n").is_none());
+    assert!(workflow::parse_verdict_file(7, "rev-a", "").is_none());
+}
+
+#[test]
+fn verdict_file_round_trips_with_its_attribution() {
+    // The record is durable and ATTRIBUTED: which block recorded it, which agent
+    // instance that was, when, and why. That is what makes it state rather than a
+    // notification — #197's whole complaint about `report()`.
+    let rec = workflow::ReviewVerdict {
+        pr: 151,
+        block: "rev-security".into(),
+        agent_id: "rev-4".into(),
+        verdict: workflow::Verdict::Fail,
+        summary: "release-gate bypass:\n  gh api can create a v* tag ref".into(),
+        ts_ms: 1_720_000_000_000,
+    };
+    let text = workflow::verdict_file_text(&rec);
+    assert!(
+        text.starts_with("fail\n"),
+        "the verdict word is line 1 — the shim's whole read is `head -n1`"
+    );
+    let back = workflow::parse_verdict_file(151, "rev-security", &text).unwrap();
+    assert_eq!(back, rec, "the record must survive the round trip, multi-line summary and all");
+
+    // A control character in a summary would ride straight into a pane; newlines and
+    // tabs are prose and survive.
+    assert_eq!(workflow::sanitize_summary("bad\u{1b}[31m\tred\nline"), "bad[31m\tred\nline");
+    assert_eq!(
+        workflow::sanitize_summary(&"x".repeat(9000)).chars().count(),
+        workflow::MAX_SUMMARY_CHARS
+    );
+}
+
+#[test]
+fn the_gate_file_the_shim_reads_round_trips_and_carries_only_clean_tokens() {
+    // The shim is a POSIX script that word-splits this file, so every token in it
+    // must already be shell-inert: ids and conditions are *rejected* (never
+    // rewritten) by the parser when they leave their alphabet — the contract #225
+    // established at the parse boundary precisely so this consumer could assume it.
+    let wf = workflow::parse_workflow(FOCUSED_REVIEW).unwrap();
+    let g = wf.gates.get("merge").unwrap();
+    let text = workflow::gate_file_text(g);
+    assert!(text.contains("require all-pass\n"));
+    assert!(text.contains("reviewer rev-security\n") && text.contains("reviewer rev-tests\n"));
+    assert!(text.contains("also ci-green\n"));
+    for line in text.lines().filter(|l| !l.starts_with('#')) {
+        assert!(
+            line.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ' ')),
+            "every token the shim word-splits must be shell-inert: {line:?}"
+        );
+    }
+    assert_eq!(workflow::parse_gate_file(&text).as_ref(), Some(g), "round trip");
+
+    // Threshold form.
+    let t = gate(GateRequire::Threshold(2), &["a", "b", "c"], &[]);
+    assert!(workflow::gate_file_text(&t).contains("require threshold 2\n"));
+    assert_eq!(workflow::parse_gate_file(&workflow::gate_file_text(&t)), Some(t));
+
+    // A gate file naming nobody is not a gate — read as one it would refuse every
+    // merge in the group forever. A malformed threshold falls back to the STRICTER
+    // all-pass, never to a number that lets something through.
+    assert!(workflow::parse_gate_file("# empty\nrequire all-pass\n").is_none());
+    assert_eq!(
+        workflow::parse_gate_file("require threshold 0\nreviewer a\n").unwrap().require,
+        GateRequire::AllPass
+    );
+}
+
+#[test]
+fn an_also_condition_this_build_cannot_check_is_not_silently_ignored() {
+    // A gate is a safety claim, so dropping a clause loomux doesn't understand would
+    // turn a stricter-looking workflow file into a weaker one. An unknown condition
+    // fails CLOSED in the shim (pinned in the shell, in tests/orchestration.rs); this
+    // pins the classification the shim keys off.
+    assert!(workflow::condition_supported("ci-green"));
+    for unknown in ["no-live-agents-on-pr", "human-signoff", "ci_green", "CI-GREEN"] {
+        assert!(!workflow::condition_supported(unknown), "{unknown:?} must not read as supported");
+    }
+    // The PARSER still accepts them — the file format is forward-compatible, and a
+    // future build may know more conditions than this one. What it rejects is a
+    // condition that is not a usable *name* at all. Enforcement is where the refusal
+    // lives, because that is the only place that can fail closed.
+    let wf = workflow::parse_workflow(
+        "version: 1\nblocks:\n  - id: r\n    kind: reviewer\ngates:\n  merge:\n    reviewers: [r]\n    also: [no-live-agents-on-pr]\n",
+    )
+    .unwrap();
+    assert_eq!(wf.gates["merge"].also, vec!["no-live-agents-on-pr"]);
+}

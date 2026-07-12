@@ -180,6 +180,12 @@ fn tool_defs(role: Role) -> Vec<Value> {
         tool("list_tasks",
             "Read the group's task board (JSON array, order = priority). The human sees and edits this same board.",
             json!({}), &[]),
+        tool("list_verdicts",
+            "Read the recorded review verdicts for a PR: which reviewer block recorded what (pass | fail | escalate), when, and its summary — plus, when this repo's .loomux/workflow.yml declares a merge gate, whether that gate is satisfied. This is STATE, not a notification: it is what the loomux gh interceptor reads when it decides whether to allow `gh pr merge`. Omit pr to list every PR with a recorded verdict.",
+            json!({
+                "pr": { "type": "string", "description": "PR number, #n, or URL. Omit to list all PRs with verdicts." },
+            }),
+            &[]),
     ];
     if role == Role::Orchestrator {
         tools.extend([
@@ -255,6 +261,19 @@ fn tool_defs(role: Role) -> Vec<Value> {
             tool("message_orchestrator", "Send a free-form message to the orchestrator.",
                 json!({ "text": { "type": "string" } }), &["text"]),
         ]);
+    }
+    // Reviewers only: the verdict is the gate. Listed for the capability class, and
+    // re-checked in `call_tool` — the listing is cosmetic, the dispatch check is the
+    // enforcement (a worker that could file its own PASS would make the gate a prop).
+    if role == Role::Reviewer {
+        tools.push(tool("review_verdict",
+            "Record your REVIEW OUTCOME for a pull request. This is durable, attributed state — not a notification — and when this repo's .loomux/workflow.yml declares a merge gate, it is what loomux's gh interceptor reads before allowing `gh pr merge`. Call it once you have finished reviewing, after posting your review on the PR, and then report() to the orchestrator as usual. verdict: `pass` (reviewed, nothing blocking), `fail` (blocking findings — fix and re-review), `escalate` (you will not decide this one: ambiguous requirement, out of your depth, a risk you won't sign off on — a human must look). fail and escalate BOTH refuse the merge, and one blocking verdict beats any number of passes, so never record `pass` to be agreeable or to unblock the queue. Re-recording replaces your own earlier verdict, which is how you upgrade a `fail` to a `pass` after the worker fixes it. The summary must stand on its own for a human reading it a week later: what you reviewed, and what decided the verdict.",
+            json!({
+                "pr": { "type": "string", "description": "PR number, #n, or URL — the PR you reviewed." },
+                "verdict": { "type": "string", "enum": ["pass", "fail", "escalate"], "description": "pass | fail | escalate. Never guessed: an unrecognized value is rejected." },
+                "summary": { "type": "string", "description": "Why. One or two lines a human can act on." },
+            }),
+            &["pr", "verdict", "summary"]));
     }
     tools
 }
@@ -470,6 +489,66 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             }
             Ok("reported to orchestrator".into())
         }
+        "review_verdict" => {
+            // Authorization is enforced twice on purpose: here, and again in
+            // `record_verdict` next to the write. A verdict is what opens a merge
+            // gate, so "only a reviewer may record one" must not depend on a single
+            // check in a JSON shim.
+            if caller.role != Role::Reviewer {
+                return Err("permission denied: review_verdict is for reviewer-kind blocks — \
+                            use report(status, summary)".into());
+            }
+            let pr = arg_str(args, "pr").ok_or("pr required")?;
+            let verdict = arg_str(args, "verdict").ok_or("verdict required")?;
+            let summary = arg_str(args, "summary").ok_or("summary required")?;
+            let rec = reg.record_verdict(&caller.group, &caller.agent_id, pr, verdict, summary)?;
+            // A verdict is also news: the orchestrator is the one that decides what
+            // happens next (send the findings back to the worker, ask the human,
+            // merge), and loomux's design norm is that agent→agent traffic arrives
+            // as a VISIBLE prompt in the recipient's pane — never a side channel.
+            let gate = reg.gate_status_line(&caller.group, rec.pr);
+            let _ = reg.deliver_to_orchestrator(
+                &caller.group,
+                &format!(
+                    "[loomux] {} ({}) recorded verdict {} on PR #{}: {}{}",
+                    caller.agent_id,
+                    rec.block,
+                    rec.verdict.as_str().to_uppercase(),
+                    rec.pr,
+                    rec.summary,
+                    gate.as_deref().map(|g| format!("\n[loomux] {g}")).unwrap_or_default(),
+                ),
+                &caller.agent_id,
+            );
+            Ok(format!(
+                "recorded: {} on PR #{} attributed to block {}. {}",
+                rec.verdict.as_str().to_uppercase(),
+                rec.pr,
+                rec.block,
+                gate.unwrap_or_else(|| "This group declares no merge gate, so the verdict is \
+                    recorded for the humans and the orchestrator to read; the human merge gate \
+                    is unchanged.".into()),
+            ))
+        }
+        "list_verdicts" => {
+            let prs = match arg_str(args, "pr") {
+                Some(pr) => vec![super::pr_number(pr)
+                    .ok_or_else(|| format!("no PR number found in {pr:?}"))?],
+                None => reg.verdict_prs(&caller.group),
+            };
+            let out: Vec<Value> = prs
+                .into_iter()
+                .map(|pr| {
+                    json!({
+                        "pr": pr,
+                        "verdicts": reg.verdicts(&caller.group, pr),
+                        "gate": reg.gate_status_line(&caller.group, pr),
+                    })
+                })
+                .collect();
+            Ok(serde_json::to_string(&out).unwrap_or_default())
+        }
+
         "message_orchestrator" => {
             if caller.role == Role::Orchestrator {
                 return Err("you are the orchestrator".into());

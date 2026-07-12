@@ -653,6 +653,20 @@ one-time **grant** the shim also honors.
   tools `set_state`/`upsert_task`/`save_attachment` write only their own fixed paths, never a
   grant path). Agents *consume* grants (the shim) but never *mint* them through loomux.
 
+### The workflow merge gate composes on top (#222 / #197)
+
+Everything above is the **human** gate. A repo that declares `gates.merge` in its
+`.loomux/workflow.yml` adds a **second, independent** necessary condition to the same shim:
+`gh pr merge` is refused until every reviewer block the gate names has recorded a `pass` via the
+`review_verdict` MCP tool (`threshold: N` needs N of them; a `fail`/`escalate` from any of them
+refuses outright). It is evaluated **before** every opening above — a grant, `autonomous +
+auto_merge` and supervised dangerous mode all sit below it and none of them can satisfy it, which
+is what makes #197 Scope B ("an auto-merge must be structurally impossible until every required
+review verdict is recorded PASS") true rather than aspirational. Unlike the human gate it applies
+to non-default merges too, and a refused merge does not consume a pending grant. Verdicts live in
+`verdicts/pr-<N>/<block>` and the declared gate in `merge_gate`, both under the group dir, both in
+the same small-file shape the shim already reads. Full design: `doc/design/workflows.md`.
+
 ### Release & tag gating
 
 Releases publish to the world — a `v*` tag push triggers `release.yml` (GitHub release + npm),

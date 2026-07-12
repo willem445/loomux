@@ -6697,3 +6697,429 @@ fn create_orchestration_group_maps_resume_session_onto_the_workflow_pin() {
         "editing the workflow and launching again must pick up the new roster"
     );
 }
+
+// ───────── review verdicts + the enforced consensus gate (#222 / #197) ─────────
+//
+// The pure gate semantics live in tests/workflow.rs. These drive the whole stack:
+// a repo's `.loomux/workflow.yml` → the `merge_gate` spec file → verdicts recorded
+// through the real MCP dispatch → the real POSIX `gh` shim, executed.
+
+/// A repo whose workflow declares two focused reviewers and an all-pass merge gate.
+/// `extra` is spliced into `gates.merge` (e.g. a threshold, or an `also:` clause).
+fn gated_repo(gate_extra: &str) -> tempfile::TempDir {
+    let td = tempfile::tempdir().unwrap();
+    let dir = td.path().join(".loomux");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("workflow.yml"),
+        format!(
+            "version: 1\nname: focused-review\n\
+             blocks:\n\
+             \x20 - id: worker\n    kind: worker\n\
+             \x20 - id: rev-security\n    kind: reviewer\n    prompt: Security only.\n\
+             \x20 - id: rev-tests\n    kind: reviewer\n    prompt: Test quality only.\n\
+             gates:\n  merge:\n    reviewers: [rev-security, rev-tests]\n{gate_extra}"
+        ),
+    )
+    .unwrap();
+    td
+}
+
+/// Spawn a reviewer bound to `block` and return an MCP caller for it.
+fn reviewer_caller(reg: &OrchRegistry, group: &str, block: &str) -> Caller {
+    let a = reg
+        .spawn_agent_ex(group, Role::Reviewer, Some(block.into()), block, "review #7",
+                        false, None, None, None, None, None)
+        .unwrap();
+    assert_eq!(a.block, block, "the agent must carry its block identity");
+    reg.resolve_token(&a.token).unwrap()
+}
+
+fn record(reg: &OrchRegistry, c: &Caller, pr: &str, verdict: &str, summary: &str) -> Value {
+    dispatch(reg, c, "tools/call", &json!({
+        "name": "review_verdict",
+        "arguments": { "pr": pr, "verdict": verdict, "summary": summary },
+    }))
+    .unwrap()
+}
+
+/// `record` for the happy path: fails the test loudly if the tool rejected the call,
+/// so a broken verdict write can never masquerade as a gate that stayed shut.
+fn recorded(reg: &OrchRegistry, c: &Caller, pr: &str, verdict: &str, summary: &str) {
+    let out = record(reg, c, pr, verdict, summary);
+    assert_eq!(out["isError"], false, "review_verdict rejected the call: {out:?}");
+}
+
+#[test]
+fn a_declared_gate_becomes_the_spec_file_the_shim_reads_and_a_deleted_one_is_cleared() {
+    let (reg, d) = test_registry();
+    let repo = gated_repo("    also: [ci-green]\n");
+    let g = reg.create_group(&repo.path().to_string_lossy(), rails()).unwrap();
+    let gate_file = d.path().join(&g.id).join("merge_gate");
+
+    let text = fs::read_to_string(&gate_file).expect("a declared gates.merge must be written out");
+    assert!(text.contains("require all-pass"), "require: omitted defaults to all-pass");
+    assert!(text.contains("reviewer rev-security") && text.contains("reviewer rev-tests"));
+    assert!(text.contains("also ci-green"));
+    let parsed = reg.merge_gate(&g.id).expect("and must read back");
+    assert_eq!(parsed.reviewers, vec!["rev-security", "rev-tests"]);
+
+    // The repo deletes its workflow → the gate is CLEARED. A gate the file no longer
+    // declares must not outlive it, or a group would keep enforcing a rule its repo
+    // has walked back.
+    fs::remove_file(repo.path().join(".loomux").join("workflow.yml")).unwrap();
+    let g2 = reg.create_group(&repo.path().to_string_lossy(), rails()).unwrap();
+    assert_eq!(g2.id, g.id, "same repo → same group dir");
+    assert!(!gate_file.is_file(), "no workflow file → no gate → the pre-#222 flow, exactly");
+    assert!(reg.merge_gate(&g.id).is_none());
+}
+
+#[test]
+fn a_broken_workflow_file_keeps_the_last_known_gate_instead_of_failing_open() {
+    // #225's rule is that a broken workflow file is audited and skipped — the roster
+    // falls back to the built-in one so every agent still spawns. A GATE is the
+    // opposite kind of thing: dropping it because the file stopped parsing would
+    // quietly *widen* what the group's agents may do. A syntax error is not consent
+    // to merge unreviewed code.
+    let (reg, d) = test_registry();
+    let repo = gated_repo("");
+    let g = reg.create_group(&repo.path().to_string_lossy(), rails()).unwrap();
+    let gate_file = d.path().join(&g.id).join("merge_gate");
+    assert!(gate_file.is_file());
+
+    fs::write(repo.path().join(".loomux").join("workflow.yml"), "version: 1\nblocks:\n  - id: x\n    kind: nonsense\n").unwrap();
+    let g2 = reg.create_group(&repo.path().to_string_lossy(), rails()).unwrap();
+    assert!(gate_file.is_file(), "a broken workflow file must NOT drop the gate it can no longer read");
+    assert_eq!(reg.merge_gate(&g2.id).unwrap().reviewers, vec!["rev-security", "rev-tests"]);
+    let audit = fs::read_to_string(d.path().join(&g.id).join("audit.jsonl")).unwrap();
+    assert!(audit.contains("merge-gate-retained"), "and it must say so, loudly: {audit}");
+}
+
+#[test]
+fn a_verdict_is_attributed_readable_and_survives_a_restart() {
+    let (reg, d) = test_registry();
+    let repo = gated_repo("");
+    let gid;
+    {
+        let g = reg.create_group(&repo.path().to_string_lossy(), rails()).unwrap();
+        gid = g.id.clone();
+        let sec = reviewer_caller(&reg, &g.id, "rev-security");
+        let out = record(&reg, &sec, "https://github.com/o/r/pull/7", "pass",
+                         "Checked authz + path handling on the new gate reader. No injection surface.");
+        assert_eq!(out["isError"], false);
+        let text = out["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("PASS") && text.contains("rev-security"), "the tool echoes the record: {text}");
+        assert!(text.contains("rev-tests"), "and tells the reviewer the gate is still waiting on its peer: {text}");
+    }
+    // A fresh registry over the same state root — the app restarted.
+    let reg = OrchRegistry::new(d.path().to_path_buf());
+    reg.set_port(45999);
+    let v = reg.verdicts(&gid, 7);
+    assert_eq!(v.len(), 1);
+    assert_eq!(v[0].block, "rev-security", "attributed to the BLOCK the gate names");
+    assert!(v[0].agent_id.starts_with("rev-"), "and to the agent instance that recorded it");
+    assert_eq!(v[0].verdict, workflow::Verdict::Pass);
+    assert!(v[0].summary.contains("No injection surface"), "the summary is readable downstream");
+    assert!(v[0].ts_ms > 0, "and stamped");
+    assert_eq!(reg.verdict_prs(&gid), vec![7]);
+    // The gate reads it back and is still short — the peer never voted.
+    assert!(reg.gate_status_line(&gid, 7).unwrap().contains("rev-tests"));
+}
+
+#[test]
+fn only_a_reviewer_block_can_record_a_verdict() {
+    // The verdict is what opens a merge gate. A worker (or the orchestrator) able to
+    // file its own PASS would make the whole gate decorative — so the refusal is
+    // enforced in the MCP dispatch AND again in the registry next to the write, and
+    // the tool is not even listed for a class that may not call it.
+    let (reg, _d, co, cw) = setup_mcp();
+    for c in [&co, &cw] {
+        let denied = dispatch(&reg, c, "tools/call", &json!({
+            "name": "review_verdict",
+            "arguments": { "pr": "7", "verdict": "pass", "summary": "looks fine to me" },
+        }))
+        .unwrap();
+        assert_eq!(denied["isError"], true, "{:?} must not be able to record a verdict", c.role);
+        let names: Vec<String> = dispatch(&reg, c, "tools/list", &Value::Null).unwrap()["tools"]
+            .as_array().unwrap().iter()
+            .map(|t| t["name"].as_str().unwrap_or("").to_string()).collect();
+        assert!(!names.contains(&"review_verdict".to_string()),
+            "{:?} must not even see the tool", c.role);
+        assert!(names.contains(&"list_verdicts".to_string()),
+            "but everyone can READ verdicts — the orchestrator needs them to decide");
+    }
+    // Straight at the registry, bypassing the dispatch check entirely.
+    assert!(reg.record_verdict(&cw.group, &cw.agent_id, "7", "pass", "sneaking one in").is_err(),
+        "the authorization must not live only in the JSON shim");
+}
+
+#[test]
+fn a_verdict_tool_call_never_panics_on_bad_input() {
+    let (reg, _d) = test_registry();
+    let repo = gated_repo("");
+    let g = reg.create_group(&repo.path().to_string_lossy(), rails()).unwrap();
+    let sec = reviewer_caller(&reg, &g.id, "rev-security");
+
+    // An unknown verdict word is REJECTED — never coerced toward `pass`.
+    let bad = record(&reg, &sec, "7", "approve", "lgtm");
+    assert_eq!(bad["isError"], true);
+    assert!(bad["content"][0]["text"].as_str().unwrap().contains("pass, fail, escalate"));
+    // A PR ref with no number in it.
+    assert_eq!(record(&reg, &sec, "the one about tabs", "pass", "fine")["isError"], true);
+    // An empty summary: the record has to mean something to the human who reads it.
+    assert_eq!(record(&reg, &sec, "7", "pass", "   ")["isError"], true);
+    // Nothing was written by any of that.
+    assert!(reg.verdicts(&g.id, 7).is_empty());
+
+    // Re-recording REPLACES a reviewer's own verdict — the fail → fixed → pass loop.
+    assert_eq!(record(&reg, &sec, "#7", "fail", "unbounded read in the parser")["isError"], false);
+    assert_eq!(reg.verdicts(&g.id, 7)[0].verdict, workflow::Verdict::Fail);
+    assert_eq!(record(&reg, &sec, "#7", "pass", "fixed in a3f9c21")["isError"], false);
+    let v = reg.verdicts(&g.id, 7);
+    assert_eq!(v.len(), 1, "a reviewer has one live verdict per PR, not a pile");
+    assert_eq!(v[0].verdict, workflow::Verdict::Pass);
+}
+
+#[test]
+fn list_verdicts_reports_the_gate_state_the_shim_will_enforce() {
+    let (reg, _d) = test_registry();
+    let repo = gated_repo("");
+    let g = reg.create_group(&repo.path().to_string_lossy(), rails()).unwrap();
+    let sec = reviewer_caller(&reg, &g.id, "rev-security");
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let co = reg.resolve_token(&orch.token).unwrap();
+
+    recorded(&reg, &sec, "7", "escalate", "auth change I will not sign off on — needs a human");
+    let out = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "list_verdicts", "arguments": { "pr": "7" } })).unwrap();
+    let parsed: Value = serde_json::from_str(out["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(parsed[0]["pr"], 7);
+    assert_eq!(parsed[0]["verdicts"][0]["verdict"], "escalate");
+    assert_eq!(parsed[0]["verdicts"][0]["block"], "rev-security");
+    assert!(parsed[0]["verdicts"][0]["summary"].as_str().unwrap().contains("needs a human"));
+    assert!(parsed[0]["gate"].as_str().unwrap().contains("BLOCKED"),
+        "an escalate blocks the gate, and the orchestrator must be able to see that");
+}
+
+#[test]
+fn gh_shim_script_enforces_the_workflow_merge_gate() {
+    // Pin the security-critical shape of the shell (the harness below executes it).
+    let sh = gh_shim_sh("C:/Program Files/GitHub CLI/gh.exe");
+    assert!(sh.contains("loomux_block_wf"), "the workflow gate has its own refusal path");
+    assert!(sh.contains("$LOOMUX_GROUP_DIR/merge_gate"), "keyed off the declared-gate spec file");
+    assert!(sh.contains("verdicts/pr-$num/$g_r"), "reads the per-reviewer verdict files for THIS pr");
+    // Order is the whole security argument: the workflow gate is evaluated BEFORE the
+    // autonomous / dangerous / grant openings, so none of them can satisfy it (#197 B).
+    let wf_at = sh.find("THE WORKFLOW MERGE GATE").expect("the workflow gate block");
+    let auto_at = sh.find("blanket-allowed while autonomous").expect("the autonomous opening");
+    let grant_at = sh.find("merge_grants/pr-").expect("the human grant opening");
+    assert!(wf_at < auto_at && wf_at < grant_at,
+        "the workflow gate must be checked before every opening that could otherwise merge");
+    // Fail-closed clauses.
+    assert!(sh.contains("unknown-condition"), "an also: condition this build can't check refuses");
+    assert!(sh.contains("ci-green") && sh.contains("pr checks"), "ci-green is checked with the real gh");
+    assert!(sh.contains("malformed-gate"), "a truncated/hand-edited gate file refuses, not passes");
+    assert!(sh.contains("fail|escalate"), "a blocking verdict is refused");
+    assert!(sh.contains("merge-gate-workflow-blocked") && sh.contains("merge-gate-workflow-ok"),
+        "every workflow-gate decision is audited");
+    assert!(!sh.contains('\r'), "POSIX shim must stay LF-only (a CRLF #!/bin/sh is broken)");
+}
+
+/// The #197/#151 case, executed end to end: a repo's declared gate, verdicts recorded
+/// through the real MCP tool, and the REAL POSIX shim deciding the merge. Skipped (not
+/// failed) where no POSIX `sh` exists.
+#[test]
+fn gh_shim_harness_refuses_the_merge_until_every_named_reviewer_has_passed() {
+    use std::process::Command;
+    if Command::new("sh").arg("-c").arg("exit 0").status().map(|s| !s.success()).unwrap_or(true) {
+        eprintln!("SKIP gh_shim_harness_refuses_the_merge_until_every_named_reviewer_has_passed: no POSIX sh");
+        return;
+    }
+    let (reg, d) = test_registry();
+    let repo = gated_repo("    also: [ci-green]\n");
+    let g = reg.create_group(&repo.path().to_string_lossy(), rails()).unwrap();
+    let group_dir = d.path().join(&g.id);
+
+    // A fake gh: `pr view` answers "<base> <num>", `repo view` the default branch,
+    // `pr checks` exits with $FAKE_CHECKS (gh exits non-zero when CI isn't all-green).
+    let bin = tempfile::tempdir().unwrap();
+    let fake = bin.path().join("fakegh");
+    fs::write(&fake,
+        "#!/bin/sh\n\
+         if [ \"$1\" = \"pr\" ] && [ \"$2\" = \"view\" ]; then printf '%s\\n' \"$FAKE_PRVIEW\"; exit 0; fi\n\
+         if [ \"$1\" = \"repo\" ] && [ \"$2\" = \"view\" ]; then printf 'main\\n'; exit 0; fi\n\
+         if [ \"$1\" = \"pr\" ] && [ \"$2\" = \"checks\" ]; then exit \"${FAKE_CHECKS:-0}\"; fi\n\
+         printf 'MERGED\\n'; exit 0\n").unwrap();
+    let shim = bin.path().join("gh");
+    fs::write(&shim, gh_shim_sh(&fake.display().to_string())).unwrap();
+    let _ = Command::new("sh").arg("-c")
+        .arg(format!("chmod +x '{}' '{}'", fake.display(), shim.display())).status();
+
+    // Merge PR #7 into `base`; returns (allowed, stderr).
+    let merge = |base: &str, checks: &str| -> (bool, String) {
+        let out = Command::new("sh").arg(&shim).args(["pr", "merge", "7"])
+            .env("LOOMUX_GROUP_DIR", &group_dir)
+            .env("FAKE_PRVIEW", format!("{base} 7"))
+            .env("FAKE_CHECKS", checks)
+            .output().expect("run shim");
+        (out.status.success(), String::from_utf8_lossy(&out.stderr).into_owned())
+    };
+    // The human gate is open throughout, so anything that refuses below is refused by
+    // the WORKFLOW gate — and proves a grant can't buy its way past it.
+    reg.grant_merge(&g.id, "7", None, "human").unwrap();
+    let regrant = || {
+        reg.grant_merge(&g.id, "7", None, "human").unwrap(); // the shim consumes it on use
+    };
+
+    // 1) No verdicts at all → refused, naming both reviewers.
+    let (ok, err) = merge("main", "0");
+    assert!(!ok, "a gated PR with no recorded verdict must not merge");
+    assert!(err.contains("rev-security") && err.contains("rev-tests"), "and must say who it waits for: {err}");
+
+    // 2) THE #151 CASE: one reviewer passed, the other is still reviewing → refused.
+    let sec = reviewer_caller(&reg, &g.id, "rev-security");
+    recorded(&reg, &sec, "7", "pass", "no security defects");
+    regrant();
+    let (ok, err) = merge("main", "0");
+    assert!(!ok, "one approval must never merge a PR whose second reviewer is still running");
+    assert!(err.contains("rev-tests") && !err.contains("rev-security"),
+        "the refusal names the OUTSTANDING reviewer only: {err}");
+
+    // 3) The second reviewer FAILS → refused, and no number of passes outvotes it.
+    let tests = reviewer_caller(&reg, &g.id, "rev-tests");
+    recorded(&reg, &tests, "7", "fail", "the new tests assert on mocks and cannot fail");
+    regrant();
+    let (ok, err) = merge("main", "0");
+    assert!(!ok, "a fail refuses the merge");
+    assert!(err.contains("rev-tests"), "{err}");
+
+    // 4) …and an escalate blocks exactly like a fail (a refusal to decide is not an approval).
+    recorded(&reg, &tests, "7", "escalate", "this needs a human");
+    regrant();
+    assert!(!merge("main", "0").0, "an escalate refuses the merge");
+
+    // 5) Both pass → the workflow gate is satisfied and the (granted) merge goes through.
+    recorded(&reg, &tests, "7", "pass", "tests exercise intent now");
+    regrant();
+    let (ok, err) = merge("main", "0");
+    assert!(ok, "with every named reviewer passed and CI green, the merge proceeds: {err}");
+
+    // 6) `also: [ci-green]` is real: same verdicts, red CI → refused.
+    regrant();
+    let (ok, err) = merge("main", "1");
+    assert!(!ok, "ci-green must be enforced, not decorative");
+    assert!(err.contains("ci-green"), "{err}");
+
+    // 7) The gate applies to an INTEGRATION-branch merge too — the reviewers reviewed
+    //    *this PR*, and where it lands doesn't change whether they finished. (The human
+    //    gate stays default-branch-only; this one doesn't.)
+    fs::remove_file(group_dir.join("verdicts").join("pr-7").join("rev-tests")).unwrap();
+    let (ok, err) = merge("feat/integration", "0");
+    assert!(!ok, "a declared gate applies wherever the PR lands");
+    assert!(err.contains("rev-tests"), "{err}");
+
+    // 8) A workflow-gate refusal must not BURN the human's one-time grant: the gate
+    //    exits before the grant is ever consumed, so the human doesn't have to
+    //    re-approve a merge that never happened.
+    recorded(&reg, &tests, "7", "pass", "re-reviewed, fine");
+    assert!(group_dir.join("merge_grants").join("pr-7").is_file(),
+        "the grant from the refused merges above must still be unspent");
+
+    // 9) NO GRANT + gate satisfied: the human merge gate still stands on the default
+    //    branch. The workflow gate composes with it — it never replaces it.
+    fs::remove_file(group_dir.join("merge_grants").join("pr-7")).unwrap();
+    let (ok, err) = merge("main", "0");
+    assert!(!ok, "satisfying the workflow gate must not open the HUMAN gate");
+    assert!(err.contains("human gate"), "{err}");
+
+    // The audit trail carries both kinds of refusal, distinctly.
+    let audit = fs::read_to_string(group_dir.join("audit.jsonl")).unwrap_or_default();
+    assert!(audit.contains("merge-gate-workflow-blocked"), "workflow-gate refusals are audited");
+    assert!(audit.contains("merge-gate-workflow-ok"), "and so is a satisfied gate");
+    assert!(audit.contains("\"reason\":\"verdict-outstanding\"") && audit.contains("\"reason\":\"verdict-blocks\""),
+        "with the reason, so a human can reconstruct the run: {audit}");
+}
+
+#[test]
+fn an_unknown_also_condition_refuses_the_merge_rather_than_passing_it() {
+    use std::process::Command;
+    if Command::new("sh").arg("-c").arg("exit 0").status().map(|s| !s.success()).unwrap_or(true) {
+        eprintln!("SKIP an_unknown_also_condition_refuses_the_merge_rather_than_passing_it: no POSIX sh");
+        return;
+    }
+    // A gate is a safety claim. A clause loomux cannot check must not be silently
+    // dropped — that would turn a stricter-looking workflow file into a weaker one.
+    // (`no-live-agents-on-pr` is #197 Scope A's other condition; this build does not
+    // implement it, so it fails closed and says so — see the PR notes.)
+    let (reg, d) = test_registry();
+    let repo = gated_repo("    also: [no-live-agents-on-pr]\n");
+    let g = reg.create_group(&repo.path().to_string_lossy(), rails()).unwrap();
+    let group_dir = d.path().join(&g.id);
+    for block in ["rev-security", "rev-tests"] {
+        let c = reviewer_caller(&reg, &g.id, block);
+        recorded(&reg, &c, "7", "pass", "fine");
+    }
+    reg.grant_merge(&g.id, "7", None, "human").unwrap();
+
+    let bin = tempfile::tempdir().unwrap();
+    let fake = bin.path().join("fakegh");
+    fs::write(&fake,
+        "#!/bin/sh\n\
+         if [ \"$1\" = \"pr\" ] && [ \"$2\" = \"view\" ]; then printf 'main 7\\n'; exit 0; fi\n\
+         if [ \"$1\" = \"repo\" ] && [ \"$2\" = \"view\" ]; then printf 'main\\n'; exit 0; fi\n\
+         printf 'MERGED\\n'; exit 0\n").unwrap();
+    let shim = bin.path().join("gh");
+    fs::write(&shim, gh_shim_sh(&fake.display().to_string())).unwrap();
+    let _ = Command::new("sh").arg("-c")
+        .arg(format!("chmod +x '{}' '{}'", fake.display(), shim.display())).status();
+
+    let out = Command::new("sh").arg(&shim).args(["pr", "merge", "7"])
+        .env("LOOMUX_GROUP_DIR", &group_dir).output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "every verdict passed, but an uncheckable condition must still refuse");
+    assert!(err.contains("no-live-agents-on-pr") && err.contains("fails closed"),
+        "and it must name the condition and say why: {err}");
+    let audit = fs::read_to_string(group_dir.join("audit.jsonl")).unwrap_or_default();
+    assert!(audit.contains("unknown-condition"), "audited, never silent: {audit}");
+}
+
+#[test]
+fn a_group_with_no_workflow_gate_merges_exactly_as_it_did_before() {
+    use std::process::Command;
+    if Command::new("sh").arg("-c").arg("exit 0").status().map(|s| !s.success()).unwrap_or(true) {
+        eprintln!("SKIP a_group_with_no_workflow_gate_merges_exactly_as_it_did_before: no POSIX sh");
+        return;
+    }
+    // The back-compat pin: no workflow file → no `merge_gate` → the shim's new block
+    // is skipped entirely and the human gate behaves exactly as it did before #222.
+    // A one-time grant is still the whole story, and no verdict is needed anywhere.
+    let (reg, d) = test_registry();
+    let plain = tempfile::tempdir().unwrap(); // a repo with no .loomux/workflow.yml
+    let g = reg.create_group(&plain.path().to_string_lossy(), rails()).unwrap();
+    let group_dir = d.path().join(&g.id);
+    assert!(!group_dir.join("merge_gate").is_file(), "no workflow → no gate file at all");
+
+    let bin = tempfile::tempdir().unwrap();
+    let fake = bin.path().join("fakegh");
+    fs::write(&fake,
+        "#!/bin/sh\n\
+         if [ \"$1\" = \"pr\" ] && [ \"$2\" = \"view\" ]; then printf 'main 7\\n'; exit 0; fi\n\
+         if [ \"$1\" = \"repo\" ] && [ \"$2\" = \"view\" ]; then printf 'main\\n'; exit 0; fi\n\
+         printf 'MERGED\\n'; exit 0\n").unwrap();
+    let shim = bin.path().join("gh");
+    fs::write(&shim, gh_shim_sh(&fake.display().to_string())).unwrap();
+    let _ = Command::new("sh").arg("-c")
+        .arg(format!("chmod +x '{}' '{}'", fake.display(), shim.display())).status();
+    let merge = || -> (bool, String) {
+        let o = Command::new("sh").arg(&shim).args(["pr", "merge", "7"])
+            .env("LOOMUX_GROUP_DIR", &group_dir).output().unwrap();
+        (o.status.success(), String::from_utf8_lossy(&o.stderr).into_owned())
+    };
+
+    let (ok, err) = merge();
+    assert!(!ok, "the human gate still closes an ungranted default-branch merge");
+    assert!(err.contains("human gate") && !err.contains("workflow"),
+        "and it is the HUMAN gate's message, not the workflow gate's: {err}");
+    reg.grant_merge(&g.id, "7", None, "human").unwrap();
+    assert!(merge().0, "a granted merge goes through with no verdict recorded anywhere");
+}

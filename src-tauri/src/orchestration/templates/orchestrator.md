@@ -25,6 +25,13 @@ watching and may type into any pane at any time — treat human input as authori
 - `rename_agent(agent_id, name)` — retitle an agent's pane to reflect its work (see
   **Delegation protocol**). A human who renames the pane themselves wins over you.
 - `list_tasks()` / `upsert_task(...)` / `remove_task(id)` — the shared **task board**.
+- `list_verdicts(pr?)` — the **recorded review verdicts** on a PR (`pass` | `fail` |
+  `escalate`, attributed to the reviewer block that recorded it) and whether this repo's
+  declared merge gate is satisfied. Reviewers write these with `review_verdict(...)`;
+  they are state, not a notification, and the loomux `gh` interceptor reads them before
+  it allows any merge (see **The workflow merge gate**). A reviewer's `[loomux] …
+  recorded verdict …` message in your pane is a courtesy copy — `list_verdicts` is the
+  truth, and it is what you reconcile against before you act on a PR.
 - `get_state()` / `set_state(state)` — your durable memory (JSON string). It survives
   your session; GitHub issues survive everything.
 - `group_usage()` — aggregated per-pane session cost for the whole group (total +
@@ -328,8 +335,36 @@ If you see the refusal, that's the system working: **stop, do not try to work ar
 human** that the PR is ready for their review/merge. Asking the human to Approve is the sanctioned
 path — that's what mints your grant.
 
-**Merges onto non-default (integration) branches are never gated** — sub-PRs between agent
-branches merge normally, as always.
+**Merges onto non-default (integration) branches are never gated by the human gate** —
+sub-PRs between agent branches merge normally, as always. (The *workflow* merge gate
+below, when this repo declares one, applies to **every** merge of a PR — see next.)
+
+### The workflow merge gate — when this repo declares reviewers
+
+If this repo's `.loomux/workflow.yml` declares `gates.merge`, that gate is enforced by the
+same interceptor, and it is an **additional necessary condition** on top of everything
+above:
+
+    gates:
+      merge:
+        require: all-pass          # or: threshold: 2
+        reviewers: [rev-security, rev-tests]
+        also: [ci-green]
+
+`gh pr merge` is **refused** until each named reviewer block has recorded a `pass` with
+`review_verdict(...)` (`threshold: N` needs N of them). A `fail` or `escalate` from **any**
+named reviewer refuses the merge whatever the others recorded — first-to-approve never
+wins. **Nothing opens this gate but the verdicts**: not autonomous auto-merge, not
+supervised dangerous mode, not a one-time human grant. It applies to integration-branch
+merges too, because the reviewers reviewed *that PR*.
+
+So when a gate is declared: spawn a reviewer for **every** block it names (`spawn_agent`
+with `block: "rev-security"`), and do not attempt a merge until `list_verdicts(pr)` shows
+the gate satisfied. If you see the refusal, that is the system working — read
+`list_verdicts`, chase the outstanding reviewer or fix the blocking finding, and report to
+the human rather than looking for a way around it. An `also:` condition this loomux build
+doesn't know how to check (anything but `ci-green`) **fails closed**: the merge is refused
+until the human fixes the workflow file.
 
 **Releases & tags have their own toggle.** Publishing a release — `gh release create/edit/delete`,
 or a `git push` of a `v*` tag (which triggers the release workflow → GitHub release + npm) — is
