@@ -146,6 +146,17 @@ a declared gate as a hard precondition on merging. What it keeps is its **schedu
 judgment** — what to serialize, what to parallelize across worktrees, when to plan first.
 The edges declare the happy path; the orchestrator still routes.
 
+**loomux runs its own.** [`.loomux/workflow.yml`](.loomux/workflow.yml) in this repo is the
+living example: two worker tiers (`worker-deep` on opus for work with judgment in it,
+`worker-quick` on haiku for tightly-scoped edits the brief has already decided) and three
+focused reviewers — [`rev-orch`](.github/agents/rev-orch.md) for the Rust backend,
+[`rev-ui`](.github/agents/rev-ui.md) for the vanilla-TS frontend,
+[`rev-tests`](.github/agents/rev-tests.md) for whether the tests can actually fail — behind a
+merge gate. The personas live in [`.github/agents/`](.github/agents), which is Copilot's own
+custom-agent convention: a `cli: copilot` block loads one natively (`copilot --agent rev-ui`)
+and a `cli: claude` block gets the same text compiled into `claude --agents`. Copy the pair of
+files into your repo and edit the lanes.
+
 ### The workflow pane
 
 A **workflow** pane opens on a repo's `.loomux/workflow.yml` — the file that declares
