@@ -51,6 +51,10 @@ export type MenuAction =
    *  to `open` — which hands the file to the OS default app and is deliberately not
    *  the same thing (a .png belongs in an image viewer; a .ts belongs here). */
   | { kind: "edit-pane"; target: OpTarget }
+  /** Open a WORKFLOW pane on this YAML file (#222): the agent blocks, the advisory path
+   *  between them and the enforced merge gate, as a form + a graph rather than as text.
+   *  Only offered on a .yml/.yaml row — everything else has no workflow in it. */
+  | { kind: "workflow-pane"; target: OpTarget }
   | { kind: "rename"; target: OpTarget }
   | { kind: "delete"; target: OpTarget }
   | { kind: "hash"; target: OpTarget; algo: HashAlgo }
@@ -95,6 +99,14 @@ function hashSubmenu(target: OpTarget, algos: readonly AlgoChoice[]): MenuItem {
       action: { kind: "hash", target, algo } as MenuAction,
     })),
   };
+}
+
+/** Is this filename a YAML file — i.e. something the workflow pane (#222) could read?
+ *  Extension only, and deliberately: the alternative is reading the file to find out,
+ *  which is I/O this pure module can't do and a menu shouldn't wait on. A .yml that has
+ *  no workflow in it opens on the pane's empty state, which is the honest answer. */
+export function isYamlName(name: string): boolean {
+  return /\.ya?ml$/i.test(name);
 }
 
 /** Build the context menu for a right-click.
@@ -176,6 +188,19 @@ export function buildContextMenu(
     disabled: !!inert,
     reason: inert,
   });
+
+  // …and, for a YAML file, in the WORKFLOW pane (#222) — the same file, read as a
+  // workflow (blocks, edges, gates) instead of as text. Offered ONLY on a .yml/.yaml row:
+  // an item that appeared on every file and then told you the file has no workflow in it
+  // would be a menu that wastes a click to say no.
+  if (!isDir && isYamlName(target.name)) {
+    items.push({
+      label: "Open in workflow pane",
+      action: { kind: "workflow-pane", target },
+      disabled: !!inert,
+      reason: inert,
+    });
+  }
 
   items.push(sep);
   // `inert` (a symlink) wins over `busy`: it is a permanent property of the row, and the

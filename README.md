@@ -39,8 +39,9 @@ no global mode:
 | **File explorer** | A native-style **file manager** rooted at a folder you pick — no terminal underneath, no process, ever. |
 | **File editor** | The file tree + code editor above, as a **pane** rather than an overlay, rooted at a folder you pick. |
 | **Git** | The git view — graph, status, diffs, staging, worktree switching — as a **pane**, over a repo you pick. |
+| **Workflow** | The repo's agent workflow — which blocks a run may use, the path between them, the gate that must pass before a merge — as an editable **pane** over `.loomux/workflow.yml`. |
 
-The last three are **content panes**: a pane that *is* a surface rather than a
+The last four are **content panes**: a pane that *is* a surface rather than a
 process. They spawn nothing, split/dock/drag/maximize like any other pane, come
 back at the same root on session restore, and — because they are viewers, not
 agents — never count toward a tab's agent badge.
@@ -77,6 +78,48 @@ counts toward a tab's agent badge. See the [design note](doc/design/files-pane.m
 This is deliberately **not** the in-app editor: that is the `Alt+F` overlay above,
 unchanged, and it remains the right tool for a quick look or a one-line fix. The
 explorer is the one for "get this file into the app that owns it".
+
+### The workflow pane
+
+A **workflow** pane opens on a repo's `.loomux/workflow.yml` — the file that declares
+**which agent blocks** an orchestration run may use (a planner, a worker, three focused
+reviewers…), each with its own **prompt, model and agent CLI**; the **edges** between
+them; and the **merge gate** that must pass before anything is merged. The file is
+committed, so a workflow is shared with everyone who clones the repo.
+
+**The file is the source of truth.** The pane is three synced views over it:
+
+- a **block roster + property form** — pick a block, set its kind, CLI, model and
+  persona; every edit rewrites the YAML immediately;
+- the **raw YAML**, editable as text (typing here updates the other two);
+- a **read-only graph** of the declared path and the gate.
+
+Two things in that graph mean genuinely different things, so they are drawn differently.
+An **edge is advisory**: it declares the intended path, and the orchestrator still decides
+when to spawn what — its judgment about what can run in parallel is the thing that makes
+it good, and a static DAG would replace it with something dumber. A **gate is enforced**:
+loomux refuses `gh pr merge` until every reviewer the gate names has recorded a PASS, and
+an agent cannot get around it (it goes through the same `gh` PATH shim that has always
+required a human grant to merge). That is what makes a second reviewer more than a
+suggestion.
+
+Before anything spawns, the pane runs a **validation pass** over the whole file: an
+unknown block kind, an agent CLI loomux can't launch, an edge to a block that doesn't
+exist, a gate demanding a verdict from a reviewer that was deleted, a threshold no number
+of reviewers could reach, a block nothing ever reaches. Each finding says where, and
+clicking it takes you to the block or the line. A block it can't understand still opens —
+as a stub, with the finding attached — because a block you cannot see is a block you
+cannot repair.
+
+A repo with no workflow file yet is the normal starting point: the pane offers to create a
+starter one (today's plan → work → review pipeline), and `Ctrl+S` writes it. The file is
+saved through the same hash-guarded path the editor uses, so an agent rewriting it under
+you is a **conflict** you get to resolve, not a silent overwrite — and unsaved edits are
+guarded on close, tab-close and quit exactly like an editor buffer's.
+
+Open one from the welcome screen (**Workflow**, pointed at a repo), or right-click any
+`.yml` / `.yaml` in a **file explorer** pane → **Open in workflow pane**. See the
+[design note](doc/design/content-panes.md).
 
 The **Go to file** box matches file *names*, never contents. The backend
 enumerates the root's paths once, off-thread; every keystroke then filters that

@@ -2600,3 +2600,180 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   border-color: rgba(122, 162, 247, 0.6); background: rgba(122, 162, 247, 0.22);
 }
 .restore-splash-btn.primary:hover { background: rgba(122, 162, 247, 0.34); }
+
+/* ---------- the workflow pane (#222) ---------- */
+/* `.loomux/workflow.yml` as a surface: the roster + property form (which WRITES the
+   YAML), the raw YAML, and a READ-ONLY derived graph. Three views, one buffer. The
+   advisory/enforced distinction is carried in the styling on purpose — an edge the
+   orchestrator may reorder and a gate that physically blocks a merge must not look
+   alike. */
+.wf {
+  flex: 1; min-height: 0; min-width: 0;
+  display: flex; flex-direction: column;
+  background: var(--bg-app); font-size: 13px; outline: none;
+}
+
+.wf-head {
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 8px; border-bottom: 1px solid var(--border);
+  background: var(--panel);
+}
+.wf-path { color: var(--text); font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; }
+.wf-dirty { color: var(--accent); font-size: 10px; }
+.wf-spacer { flex: 1; }
+.wf-status { font-size: 11.5px; }
+.wf-status.wf-ok { color: #9ece6a; }
+.wf-status.wf-warning { color: #e0af68; }
+.wf-status.wf-error { color: var(--danger); }
+
+.wf-btn {
+  padding: 3px 10px; border-radius: 6px; cursor: pointer;
+  border: 1px solid var(--border); background: var(--panel-2); color: var(--text);
+  font-size: 12px;
+}
+.wf-btn:hover:not(:disabled) { background: #262633; }
+.wf-btn:disabled { opacity: 0.45; cursor: default; }
+.wf-btn-primary { border-color: var(--accent-dim); background: rgba(122, 162, 247, 0.2); }
+.wf-btn-danger { border-color: rgba(247, 118, 142, 0.5); color: var(--danger); align-self: flex-start; }
+
+/* Empty state: a repo with no workflow yet is the NORMAL starting point, not an error. */
+.wf-empty {
+  flex: 1; display: flex; flex-direction: column; gap: 12px;
+  align-items: flex-start; justify-content: center;
+  padding: 0 48px; max-width: 620px; margin: 0 auto;
+}
+.wf-empty-title { font-size: 15px; font-weight: 650; color: var(--text); }
+.wf-empty-body { font-size: 12.5px; color: var(--text-dim); line-height: 1.6; }
+
+.wf-body { flex: 1; min-height: 0; display: flex; }
+
+/* The roster: the workflow, every block, the gate — one column, one click each. */
+.wf-roster {
+  width: 210px; flex: none; overflow: auto;
+  border-right: 1px solid var(--border); background: var(--panel);
+  display: flex; flex-direction: column; padding: 6px;
+}
+.wf-roster-head {
+  font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.06em;
+  color: var(--text-dim); padding: 8px 6px 4px;
+}
+.wf-row {
+  display: flex; align-items: center; gap: 6px; text-align: left;
+  padding: 6px 8px; border-radius: 6px; cursor: pointer;
+  border: 1px solid transparent; background: transparent; color: var(--text);
+  font-size: 12.5px; width: 100%;
+}
+.wf-row:hover { background: var(--panel-2); }
+.wf-row.active { background: var(--accent-glow); border-color: var(--accent-dim); }
+.wf-row-main { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wf-row-sub { color: var(--text-dim); font-size: 11px; }
+.wf-row-bad { color: var(--danger); font-weight: 700; }
+.wf-add {
+  margin: 4px 0 0; padding: 5px 8px; border-radius: 6px; cursor: pointer;
+  border: 1px dashed var(--border); background: transparent; color: var(--text-dim);
+  font-size: 12px; text-align: left;
+}
+.wf-add:hover:not(:disabled) { color: var(--text); border-color: var(--accent-dim); }
+.wf-add:disabled { opacity: 0.4; cursor: default; }
+
+.wf-panel { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.wf-tabs { display: flex; gap: 2px; padding: 6px 8px 0; border-bottom: 1px solid var(--border); }
+.wf-tab {
+  padding: 5px 12px; cursor: pointer; font-size: 12.5px;
+  border: 1px solid transparent; border-bottom: none; border-radius: 6px 6px 0 0;
+  background: transparent; color: var(--text-dim);
+}
+.wf-tab:hover { color: var(--text); }
+.wf-tab.active {
+  color: var(--text); background: var(--panel-2);
+  border-color: var(--border); margin-bottom: -1px;
+}
+
+.wf-form, .wf-yaml, .wf-graph { flex: 1; min-height: 0; overflow: auto; }
+.wf-fields { display: flex; flex-direction: column; gap: 14px; padding: 14px 16px; max-width: 680px; }
+.wf-form-title { margin: 0; font-size: 14px; font-weight: 650; color: var(--text); }
+.wf-field { display: flex; flex-direction: column; gap: 4px; }
+.wf-label { font-size: 11.5px; color: var(--text-dim); }
+.wf-hint { font-size: 11px; color: var(--text-dim); line-height: 1.5; }
+.wf-note {
+  margin: 0; font-size: 11.5px; color: var(--text-dim); line-height: 1.6;
+  border-left: 2px solid var(--border); padding-left: 10px;
+}
+.wf-input {
+  padding: 5px 8px; border-radius: 6px; font-size: 12.5px;
+  border: 1px solid var(--border); background: var(--panel-2); color: var(--text);
+}
+.wf-input:disabled { opacity: 0.6; }
+.wf-textarea {
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  line-height: 1.5; resize: vertical;
+}
+.wf-checks { display: flex; flex-direction: column; gap: 4px; }
+.wf-check { display: flex; align-items: center; gap: 7px; cursor: pointer; font-size: 12.5px; }
+.wf-check-label.wf-bad { color: var(--danger); }
+.wf-blocked {
+  margin: 16px; padding: 12px 14px; border-radius: 8px; line-height: 1.6;
+  border: 1px solid rgba(247, 118, 142, 0.4); background: rgba(247, 118, 142, 0.08);
+  color: var(--text); font-size: 12.5px;
+}
+
+/* The raw YAML. A plain textarea, not the CodeMirror editor: this buffer is a few dozen
+   lines of a closed schema, and the findings strip below already carries the diagnostics
+   an editor gutter would. */
+.wf-yaml { display: flex; }
+.wf-yaml-area {
+  flex: 1; border: none; outline: none; resize: none; padding: 12px 14px;
+  background: var(--bg-term); color: var(--text);
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 12.5px; line-height: 1.55; tab-size: 2;
+}
+
+/* The derived graph — read-only, and it says so by having nothing to grab. */
+.wf-graph { display: flex; flex-direction: column; }
+.wf-graph-scroll { flex: 1; overflow: auto; padding: 8px; }
+.wf-graph-svg { display: block; }
+.wf-node { fill: var(--panel-2); stroke: var(--border); stroke-width: 1; }
+.wf-node-orchestrator { stroke: var(--accent); }
+.wf-node-worker { stroke: #9ece6a; }
+.wf-node-reviewer { stroke: #bb9af7; }
+.wf-node-planner { stroke: #7dcfff; }
+.wf-node-unknown, .wf-node-ghost { stroke: var(--danger); stroke-dasharray: 4 3; }
+.wf-node-title { fill: var(--text); font-size: 12.5px; font-weight: 600; }
+.wf-node-sub { fill: var(--text-dim); font-size: 11px; }
+/* ADVISORY: a plain solid arrow. It declares intent; the orchestrator still schedules. */
+.wf-edge { fill: none; stroke: #6b7394; stroke-width: 1.5; }
+.wf-edge-broken { stroke: var(--danger); stroke-dasharray: 3 3; }
+/* ENFORCED: amber and dashed, into a gate box shaped nothing like a block. The two are
+   drawn differently because only ONE of them can stop a merge. */
+.wf-edge-gate { stroke: #e0af68; stroke-dasharray: 5 4; }
+.wf-gate-box { fill: rgba(224, 175, 104, 0.08); stroke: #e0af68; stroke-width: 1.5; stroke-dasharray: 5 4; }
+.wf-gate-title { fill: #e0af68; font-size: 12.5px; font-weight: 650; }
+.wf-gate-sub { fill: var(--text-dim); font-size: 11px; }
+.wf-legend { display: flex; gap: 16px; padding: 6px 12px; border-top: 1px solid var(--border-soft); }
+.wf-legend-item { font-size: 11px; color: var(--text-dim); }
+.wf-legend-gate { color: #e0af68; }
+
+/* The pre-run validation pass, always visible: what is wrong, and WHERE. Click one and
+   it takes you to the block (or the line) it is about. */
+.wf-findings {
+  flex: none; max-height: 132px; overflow: auto;
+  border-top: 1px solid var(--border); background: var(--panel);
+  display: flex; flex-direction: column;
+}
+.wf-finding {
+  display: flex; gap: 8px; align-items: baseline; text-align: left; width: 100%;
+  padding: 5px 12px; font-size: 12px; line-height: 1.45;
+  border: none; background: transparent; color: var(--text); cursor: pointer;
+}
+button.wf-finding:hover { background: var(--panel-2); }
+.wf-finding-where {
+  flex: none; min-width: 76px; color: var(--text-dim); font-size: 11px;
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+}
+.wf-finding.wf-error .wf-finding-msg { color: var(--danger); }
+.wf-finding.wf-warning .wf-finding-msg { color: #e0af68; }
+.wf-finding.wf-ok { color: var(--text-dim); cursor: default; }
+.wf-inline-findings { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 4px; }
+.wf-inline-findings .wf-finding { display: list-item; padding: 0; cursor: default; }
+.wf-inline-findings .wf-error { color: var(--danger); }
+.wf-inline-findings .wf-warning { color: #e0af68; }

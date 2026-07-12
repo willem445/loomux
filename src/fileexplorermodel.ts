@@ -334,6 +334,7 @@ export type RowAffordance =
   | "open-with"
   | "reveal"
   | "edit-pane"
+  | "workflow-pane"
   | "rename"
   | "delete"
   | "hash"
@@ -369,6 +370,13 @@ export const ROW_AFFORDANCES: readonly AffordanceParity[] = [
   // the same reason every other command does: the action carries the row's PATH, and a
   // path is a path wherever it was clicked from.
   { affordance: "edit-pane", results: true, menuItem: true },
+  // "Open in workflow pane" (#222): a YAML file opened as a WORKFLOW — the block roster,
+  // the advisory edges, the enforced merge gate — rather than as text. Offered only on a
+  // .yml/.yaml row (it is the only row where it means anything), which is why the parity
+  // check for it is one-directional: the menu it is absent from is a menu of files it
+  // could not have opened. Works on a Go-to-file result for the same reason every other
+  // command does — the action carries the row's PATH, not its index.
+  { affordance: "workflow-pane", results: true, menuItem: true },
   // Rename from a result works, and is the one that cost two rounds to get right: it exits
   // the filter, navigates to the file's folder, and mounts the editor there (editMountFor).
   { affordance: "rename", results: true, menuItem: true },

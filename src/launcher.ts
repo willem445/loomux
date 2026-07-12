@@ -16,8 +16,11 @@
 //   Git          — a PTY-less pane hosting the git view over a repo (#217): graph,
 //                  status, diffs, staging, #208 worktree switching. The Alt+G
 //                  overlay, as a pane.
+//   Workflow     — a PTY-less pane over the repo's `.loomux/workflow.yml` (#222): the
+//                  agent blocks a run may use, the advisory path between them, and the
+//                  enforced merge gate. Rooted at the repo; the file need not exist yet.
 //
-// The three CONTENT kinds take exactly one input — the folder / repo — and it is
+// The CONTENT kinds take exactly one input — the folder / repo — and it is
 // validated for REAL before the pane is made (does the directory exist? is it a git
 // work tree?), so a typo'd path shows an inline error instead of a broken pane.
 //
@@ -79,7 +82,11 @@ export type WelcomeResult =
   | { kind: "editor"; name: string; root: string }
   /** A git pane (#217): `root` is a directory this form has already confirmed is
    *  inside a git work tree (`gitRepoRoot`), so the pane can't open on a non-repo. */
-  | { kind: "git"; name: string; root: string };
+  | { kind: "git"; name: string; root: string }
+  /** A workflow pane (#222): `root` is the repo whose `.loomux/workflow.yml` the pane
+   *  edits — a confirmed directory, like files/editor. The workflow FILE is not probed:
+   *  a repo without one is the normal starting point, and the pane offers to create it. */
+  | { kind: "workflow"; name: string; root: string };
 
 /** Orchestration roles the setup form configures a CLI + model for. Mirrors the
  *  backend `Role` variants that can be spawned in a group (issue #4/#47). */
@@ -316,6 +323,7 @@ export class WelcomeForm {
       ["files", "File explorer — browse files, open in their default app"],
       ["editor", "File editor — tree + code editor, rooted at a folder"],
       ["git", "Git — graph, status, diffs and worktrees for a repo"],
+      ["workflow", "Workflow — agent blocks, edges and merge gates for a repo"],
     ]);
     this.kindSel.addEventListener("change", () => this.applyKind());
 
@@ -584,7 +592,9 @@ export class WelcomeForm {
           ? "Folder to edit — required"
           : k === "git"
             ? "Repository — required"
-            : "Repository or folder — empty for home";
+            : k === "workflow"
+              ? "Repository whose workflow to edit — required"
+              : "Repository or folder — empty for home";
     this.applyOrchCli();
     this.applyAutopilot();
     this.updateName();
@@ -850,11 +860,16 @@ export class WelcomeForm {
       return;
     }
 
-    if (plan.kind === "files" || plan.kind === "editor") {
+    if (plan.kind === "files" || plan.kind === "editor" || plan.kind === "workflow") {
       // The root must really be there. A terminal or agent in a bad cwd at least
       // fails loudly in its own output; a content pane would just render an empty
       // tree with no explanation — so probe first and bounce the user back to the
       // field with an inline error, exactly like a missing CLI (#214).
+      //
+      // The workflow pane (#222) probes the same way and no further: `.loomux/workflow.yml`
+      // NOT existing is the normal way to start (the pane offers to create it), so probing
+      // for the file would turn "you don't have a workflow yet" into "this pane refuses to
+      // open" — which is the one thing a config editor must never do.
       this.setBusy(true, "Opening…");
       if (!(await ftRootIsDir(plan.root))) {
         this.showError(`Folder not found (or not a directory): ${plan.root}`);
