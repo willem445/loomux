@@ -167,12 +167,23 @@ committed, so a workflow is shared with everyone who clones the repo — and it 
 effect on a group only when that group was launched with the **advanced orchestrator**
 ticked (above).
 
-**The file is the source of truth.** The pane is three synced views over it:
+**The file is the source of truth.** The pane is three synced views over it, and you can
+edit the workflow from any of them:
 
 - a **block roster + property form** — pick a block, set its kind, CLI, model and
   persona; every edit rewrites the YAML immediately;
 - the **raw YAML**, editable as text (typing here updates the other two);
-- a **read-only graph** of the declared path and the gate.
+- an **editable graph** — drag a node to move it, drag from its **●** to another node to
+  draw an edge, click an edge and **✕** (or `Delete`) to erase it, **+ Block** to add one.
+
+The graph is a second way to *edit the file*, never a second source of truth: every gesture
+goes through the same model and the same canonical formatter as a form edit, so the canvas
+cannot express anything the YAML can't. Two things it will not do, both on purpose. It
+**never invents an id** — creating a block asks you for one, because an id is immutable and
+is what edges and gates reference (the tools that auto-generate `node_1720794829558` produce
+files nobody can read). And it **never writes a position into your workflow**: where the
+boxes sit lives in `.loomux/workflow.layout.json`, which you can gitignore, so nudging a box
+is not a change to the logic and does not show up in a teammate's diff.
 
 Two things in that graph mean genuinely different things, so they are drawn differently.
 An **edge is advisory**: it declares the intended path, and the orchestrator still decides
@@ -191,11 +202,17 @@ clicking it takes you to the block or the line. A block it can't understand stil
 as a stub, with the finding attached — because a block you cannot see is a block you
 cannot repair.
 
-A repo with no workflow file yet is the normal starting point: the pane offers to create a
-starter one (today's plan → work → review pipeline), and `Ctrl+S` writes it. The file is
-saved through the same hash-guarded path the editor uses, so an agent rewriting it under
-you is a **conflict** you get to resolve, not a silent overwrite — and unsaved edits are
-guarded on close, tab-close and quit exactly like an editor buffer's.
+A repo with no workflow file yet is the normal starting point — it is where every repo
+begins — so the pane opens on a **Start a workflow** strip rather than a page of nothing:
+one line of what a workflow is, the roster it is about to write, and a **Create workflow**
+button that scaffolds a real, commented, valid `.loomux/workflow.yml` (today's plan → work
+→ review pipeline, gate included) and drops you into the canvas on it.
+
+The file is saved through the same hash-guarded path the editor uses, so an agent rewriting
+it under you is a **conflict** you get to resolve, not a silent overwrite — and unsaved
+edits are guarded on close, tab-close and quit exactly like an editor buffer's. A workflow
+file that is *there* but cannot be read (it isn't UTF-8 — a file written from PowerShell
+with `>` is UTF-16) says exactly that, and offers no button that would overwrite it.
 
 Open one from the welcome screen (**Workflow**, pointed at a repo), or right-click any
 `.yml` / `.yaml` in a **file explorer** pane → **Open in workflow pane**. See the

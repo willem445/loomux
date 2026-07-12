@@ -29,9 +29,12 @@
 import {
   analyzeWorkflow,
   serializeWorkflow,
-  starterWorkflow,
+  scaffoldWorkflowText,
   removeBlockAt,
-  nextBlockId,
+  newBlock,
+  connectBlocks,
+  disconnectBlocks,
+  connectionError,
   isValidBlockId,
   isBlockKind,
   isWorkflowCli,
@@ -46,11 +49,38 @@ import {
   type Finding,
   type GraphNode,
 } from "./workflowmodel";
-import { ftReadFile, ftWriteFile, errorCode, errorMessage } from "./fileapi";
+import {
+  LAYOUT_FILE,
+  parseLayout,
+  serializeLayout,
+  emptyLayout,
+  layoutEquals,
+  pruneLayout,
+  withPosition,
+  resolvePositions,
+  freeSlot,
+  rectOf,
+  outPort,
+  inPort,
+  edgePath,
+  edgeMidpoint,
+  hitTestNodes,
+  hitTestEdges,
+  blockKey,
+  ghostKey,
+  NODE_W,
+  NODE_H,
+  PAD,
+  type Point,
+  type Rect,
+  type WorkflowLayout,
+} from "./workflowlayout";
+import { ftReadFile, ftWriteFile, ftListDir, errorCode, errorMessage } from "./fileapi";
+import { fmNewFolder } from "./filemgr";
 import { appVersion } from "./pty";
 import { closeDecision, discardEdits, type ConflictChoice } from "./dirtystate";
 import { showToast } from "./toast";
-import { modal } from "./modal";
+import { modal, promptModal } from "./modal";
 
 /** What the hosting pane provides. Only one host today (the workflow PANE — a workflow
  *  builder is a station you keep open beside an agent, never a glance-and-dismiss
@@ -79,7 +109,14 @@ type Tab = "form" | "yaml" | "graph";
  *  would make two id-less stubs indistinguishable, and a duplicate pair unfixable — the
  *  form would edit whichever came first, forever. The index addresses a ROW, which is what
  *  the human is actually pointing at. */
-type Selection = { kind: "workflow" } | { kind: "block"; index: number } | { kind: "gate" };
+type Selection =
+  | { kind: "workflow" }
+  | { kind: "block"; index: number }
+  | { kind: "gate" }
+  /** An EDGE selected on the canvas (v2). Held by the pair of ids it joins, not by its index in
+   *  the edge list: the canonical formatter re-groups edges on every save, so an index would
+   *  point at a different edge the moment anything else changed. */
+  | { kind: "edge"; from: string; to: string };
 
 function el(tag: string, cls: string, text?: string): HTMLElement {
   const e = document.createElement(tag);
@@ -90,14 +127,9 @@ function el(tag: string, cls: string, text?: string): HTMLElement {
 
 const svg = (tag: string): SVGElement => document.createElementNS("http://www.w3.org/2000/svg", tag);
 
-// Graph geometry. Fixed, not measured: a layered draw with known box sizes is
-// deterministic — it cannot flash wrong on first paint or depend on a font that hasn't
-// loaded, and there is nothing here a ResizeObserver would tell us that we don't know.
-const NODE_W = 168;
-const NODE_H = 52;
-const COL_GAP = 72;
-const ROW_GAP = 22;
-const PAD = 16;
+// The graph's geometry now lives in `workflowlayout.ts` (imported above) — fixed, not
+// measured, and pure, which is what lets the hit-testing and edge-routing be tested as
+// arithmetic instead of by dragging things around and squinting.
 
 export class WorkflowView {
   readonly el: HTMLElement;
@@ -116,6 +148,15 @@ export class WorkflowView {
   private savedHash = "";
   /** False until the file exists on disk (a repo that has never had a workflow). */
   private exists = false;
+  /** Why the workflow file could not be READ, when it is there but we can't show it. Distinct
+   *  from "there isn't one" — see the error surface. Null when the file loaded (or is simply
+   *  absent, which is not an error). */
+  private loadError: string | null = null;
+  /** Node positions (`.loomux/workflow.layout.json`). NOT part of the workflow: a drag changes
+   *  this and nothing else, and it is never serialized into the semantic file (§4). */
+  private layout: WorkflowLayout = emptyLayout();
+  /** The layout as last written, so a drag that ends where it began writes nothing. */
+  private savedLayout: WorkflowLayout = emptyLayout();
 
   private analysis: WorkflowAnalysis;
   private selection: Selection = { kind: "workflow" };
@@ -141,7 +182,16 @@ export class WorkflowView {
   private graphPane: HTMLElement;
   private findingsEl: HTMLElement;
   private emptyEl: HTMLElement;
+  private errorEl: HTMLElement;
+  private errorTextEl: HTMLElement;
   private bodyEl: HTMLElement;
+
+  // Canvas interaction state. All three are transient — none of them is ever serialized, and
+  // the model never learns they existed.
+  /** A node being dragged: which one, and where the pointer grabbed it. */
+  private dragging: { key: string; id: string; grab: Point; at: Point } | null = null;
+  /** An edge being drawn: the block it left, and where the pointer is now. */
+  private connecting: { from: string; at: Point } | null = null;
 
   constructor(host: WorkflowHost) {
     this.host = host;
@@ -189,30 +239,70 @@ export class WorkflowView {
       head.append(closeBtn);
     }
 
-    // ---- empty state (no workflow file yet) ----
-    this.emptyEl = el("div", "wf-empty");
-    const emptyTitle = el("div", "wf-empty-title", "No workflow in this repo yet");
-    const emptyBody = el(
+    // ---- the START surface (no workflow file yet) ----
+    //
+    // Not a big empty box with a sentence in it. A repo with no workflow is the NORMAL
+    // starting point — it is where every repo begins — so this is the pane's front door, and
+    // a front door should be the shortest path to being inside. One line of what a workflow
+    // is, one button that writes a real, commented, valid one, and the roster it will contain
+    // so nobody has to press the button to find out what it does.
+    this.emptyEl = el("div", "wf-start");
+    const startHead = el("div", "wf-start-head");
+    startHead.append(
+      el("span", "wf-start-title", "Start a workflow"),
+      el("span", "wf-start-path", WORKFLOW_FILE)
+    );
+    const startBody = el(
       "div",
-      "wf-empty-body",
-      `A workflow declares the agent blocks a run may use, the path between them, and the ` +
-        `gate that must pass before a merge. It lives in ${WORKFLOW_FILE} — committed, so it ` +
-        `is shared with everyone who clones the repo.`
+      "wf-start-body",
+      "Declares the agent blocks a run may use, the path between them, and the gate that must " +
+        "pass before a merge. Committed, so everyone who clones the repo gets it. Loomux reads " +
+        "it only when Advanced orchestrator is ticked."
     );
     const starterBtn = document.createElement("button");
     starterBtn.className = "wf-btn wf-btn-primary";
-    starterBtn.textContent = "Create a starter workflow";
-    starterBtn.addEventListener("click", () => {
-      // The ONE moment `authored_with:` is written — this pane is CREATING the file. Every
-      // later save leaves the key exactly as it found it (it round-trips through the
-      // unknown-key bag), so opening a workflow and changing a model doesn't also restamp
-      // a version line nobody asked to change.
-      this.setText(serializeWorkflow(starterWorkflow(this.appVersion)));
-      this.render();
-      showToast("Starter workflow created — Save (Ctrl+S) writes it to disk.", "info");
-    });
-    this.emptyEl.append(emptyTitle, emptyBody, starterBtn);
+    starterBtn.textContent = "Create workflow";
+    starterBtn.title = "Scaffold a commented .loomux/workflow.yml — today's pipeline, ready to edit";
+    starterBtn.addEventListener("click", () => void this.scaffold());
+
+    // What the button is about to write. A preview is cheaper than a paragraph and it is the
+    // thing they actually want to know.
+    const preview = el("div", "wf-start-preview");
+    for (const [kind, label] of [
+      ["planner", "Planner"],
+      ["worker", "Worker"],
+      ["reviewer", "Reviewer"],
+    ] as const) {
+      const chip = el("span", `wf-chip wf-chip-${kind}`, label);
+      preview.append(chip);
+    }
+    preview.append(el("span", "wf-start-gate", "→ merge gate: the reviewer must PASS"));
+
+    const startRow = el("div", "wf-start-row");
+    startRow.append(starterBtn, preview);
+    this.emptyEl.append(startHead, startBody, startRow);
     this.emptyEl.hidden = true;
+
+    // ---- the ERROR surface (a workflow file that exists but cannot be read) ----
+    //
+    // Its own state, and that is the whole point (v2 bug 1). This used to fall through to the
+    // empty state: a file that WAS there — saved as UTF-16 by a PowerShell redirect, say —
+    // reported "No workflow in this repo yet" and offered to create one over the top of it.
+    // The pane must never invite you to overwrite a file it refused to show you.
+    this.errorEl = el("div", "wf-start");
+    this.errorTextEl = el("div", "wf-start-body");
+    const retry = document.createElement("button");
+    retry.className = "wf-btn";
+    retry.textContent = "Retry";
+    retry.addEventListener("click", () => void this.load());
+    const errRow = el("div", "wf-start-row");
+    errRow.append(retry);
+    this.errorEl.append(
+      el("div", "wf-start-title", `Can't read ${WORKFLOW_FILE}`),
+      this.errorTextEl,
+      errRow
+    );
+    this.errorEl.hidden = true;
 
     // ---- roster (left) ----
     this.rosterEl = el("div", "wf-roster");
@@ -267,6 +357,16 @@ export class WorkflowView {
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") {
         e.preventDefault();
         void this.save();
+        return;
+      }
+      // Delete removes what the CANVAS has selected — and only on the canvas. Anywhere else in
+      // the pane, Delete is the key that deletes a character, and a Delete that erased a block
+      // while you were editing a prompt would be the most expensive keystroke in the app.
+      if ((e.key === "Delete" || e.key === "Backspace") && this.tab === "graph") {
+        const inField = (e.target as HTMLElement | null)?.closest?.("input, textarea, select");
+        if (inField) return;
+        e.preventDefault();
+        this.deleteSelection();
       }
     });
   }
@@ -345,6 +445,16 @@ export class WorkflowView {
 
   // ---------- disk ----------
 
+  /** Read the workflow, and the canvas layout beside it.
+   *
+   *  THE BUG THIS METHOD USED TO HAVE (v2 bug 1, and it is the one the human hit): it treated
+   *  EVERY read failure as "there is no workflow here". Only `not-found` means that. A file
+   *  that exists but cannot be decoded — and the ordinary way to produce one on Windows is to
+   *  create it from PowerShell, whose `>` and `Out-File` write UTF-16, which is not valid
+   *  UTF-8, which the backend correctly reports as `binary` — rendered the "no workflow yet"
+   *  empty state behind a toast that had already gone. The pane then offered to CREATE a
+   *  starter over the top of a file it had refused to show. So the two are now separate
+   *  states, and the error one has no create button in it. */
   private async load(): Promise<void> {
     if (!this.root) {
       this.setText("");
@@ -355,25 +465,44 @@ export class WorkflowView {
       const fr = await ftReadFile(this.root, this.rel);
       if (this.disposed) return;
       this.exists = true;
+      this.loadError = null;
       this.savedHash = fr.hash;
       this.savedText = fr.content;
       this.text = fr.content;
     } catch (err) {
       if (this.disposed) return;
       const code = errorCode(err);
-      if (code !== "not-found") {
-        // A file that exists but can't be read (binary, too large, unreadable) is a fact
-        // worth saying out loud — silently showing the "no workflow yet" empty state would
-        // invite the human to overwrite a file they can't see.
-        showToast(`Cannot open ${this.rel}: ${errorMessage(err)}`);
-      }
       this.exists = false;
       this.savedHash = "";
       this.savedText = "";
       this.text = "";
+      // "not-found" is not an error: it is a repo that hasn't written a workflow yet, which is
+      // where every repo starts. ANYTHING else means the file is there and we can't read it.
+      this.loadError =
+        code === "not-found"
+          ? null
+          : code === "binary"
+            ? `The file is there, but it isn't valid UTF-8 text — so loomux can't read it, and neither can the backend. A workflow written from PowerShell with \`>\` or \`Out-File\` is UTF-16; re-save it as UTF-8 (\`Set-Content -Encoding utf8NoBOM\`) and it will open.`
+            : `${errorMessage(err)}`;
     }
+    await this.loadLayout();
     this.reanalyze();
     this.render();
+  }
+
+  /** The canvas positions. A layout that is missing or corrupt is simply COMPUTED instead —
+   *  never a finding, never a dialog, never a reason not to open the workflow. Nothing in that
+   *  file is anyone's work; it is a picture we can redraw. */
+  private async loadLayout(): Promise<void> {
+    if (!this.root) return;
+    try {
+      const fr = await ftReadFile(this.root, LAYOUT_FILE);
+      if (this.disposed) return;
+      this.layout = parseLayout(fr.content);
+    } catch {
+      this.layout = emptyLayout();
+    }
+    this.savedLayout = this.layout;
   }
 
   private async reload(): Promise<void> {
@@ -387,16 +516,86 @@ export class WorkflowView {
     // may be mid-edit, and a half-finished workflow on disk is recoverable while a lost
     // one is not. The findings strip is what says it isn't runnable yet.
     try {
+      await this.ensureLoomuxDir();
       const res = await ftWriteFile(this.root, this.rel, this.text, this.exists ? this.savedHash : null);
       this.savedText = this.text;
       this.savedHash = res.hash;
       this.exists = true;
       this.updateDirty();
+      await this.saveLayout();
       showToast(`Saved ${this.rel}`, "info");
     } catch (err) {
       if (errorCode(err) === "conflict") await this.resolveConflict();
       else showToast(`Save failed: ${errorMessage(err)}`);
     }
+  }
+
+  /** Make sure `.loomux/` exists before writing into it.
+   *
+   *  THE OTHER HALF OF v2 BUG 1, and it made the pane's headline feature a lie: `ft_write_file`
+   *  writes atomically (temp file + rename) and does NOT create parent directories, so in a
+   *  repo with no `.loomux/` — i.e. EVERY repo that has never had a workflow, which is exactly
+   *  the repo the "create a workflow" button exists for — the write failed with a raw io error
+   *  ("The system cannot find the path specified"). The button appeared to work, the toast
+   *  said "Save failed", and reopening the pane showed the empty state again, because nothing
+   *  had ever been written. Between the two halves, the pane both mis-reported an existing
+   *  workflow as absent AND could not create the one it offered to create.
+   *
+   *  No new backend command: `fm_new_folder` (#214, the file manager's "New folder") already
+   *  does exactly this, through the same root+rel path safety. An "it already exists" failure
+   *  is the success case here, so every error is swallowed and the WRITE is left to be the
+   *  thing that reports a real problem — it is the one that knows whether it worked. */
+  private async ensureLoomuxDir(): Promise<void> {
+    if (!this.root) return;
+    const dir = this.rel.split(/[\\/]/).slice(0, -1).join("/");
+    if (!dir) return; // a workflow file at the repo root needs no directory
+    try {
+      await ftListDir(this.root, dir);
+      return; // already there
+    } catch {
+      // Not there (or not readable) — try to create it. One level is all the schema needs.
+      try {
+        await fmNewFolder(this.root, "", dir);
+      } catch {
+        // Swallowed on purpose: a race with something else creating it lands here too, and
+        // the write immediately after is the honest test of whether we can proceed.
+      }
+    }
+  }
+
+  /** Write the canvas positions, if they changed.
+   *
+   *  Deliberately NOT part of the dirty/unsaved-work contract: a node's x/y is not the human's
+   *  WORK, and a dialog asking whether to save the fact that you nudged a box is a dialog that
+   *  teaches people to click through dialogs. It rides along with a real save, and a drag
+   *  writes it directly (see `commitDrag`). No hash guard either — this file is ours, nobody
+   *  else writes it, and a lost position costs a drag. */
+  private async saveLayout(): Promise<void> {
+    if (!this.root) return;
+    const pruned = pruneLayout(this.layout, this.analysis.workflow.blocks.map((b) => b.id));
+    this.layout = pruned;
+    if (layoutEquals(pruned, this.savedLayout)) return;
+    try {
+      await this.ensureLoomuxDir();
+      await ftWriteFile(this.root, LAYOUT_FILE, serializeLayout(pruned), null);
+      this.savedLayout = pruned;
+    } catch {
+      // A layout we couldn't save is a picture that comes back computed instead. Not worth a
+      // toast, and certainly not worth failing the workflow save that may have preceded it.
+    }
+  }
+
+  /** Write the scaffold — a commented, valid workflow — into the buffer, and save it. The one
+   *  moment `authored_with:` is stamped, because this is the one moment the pane AUTHORS a
+   *  file rather than editing one. */
+  private async scaffold(): Promise<void> {
+    this.setText(scaffoldWorkflowText(this.appVersion));
+    this.render();
+    await this.save();
+    // Land them in the canvas, on the thing they just made. The empty state's job was to get
+    // out of the way; leaving them on a form with nothing selected would be a second empty
+    // state wearing a different hat.
+    this.setTab("graph");
   }
 
   /** The file changed under us since we read it — an agent, git, or another editor. Same
@@ -474,15 +673,26 @@ export class WorkflowView {
 
   // ---------- render ----------
 
+  /** Three states, and telling them apart is the fix for v2 bug 1:
+   *
+   *    ERROR — the file is THERE and we cannot read it. Say why; offer Retry; offer NOTHING
+   *            that writes, because writing here means overwriting a file we refused to show.
+   *    START — there is no file. The normal beginning of every repo, so this is a front door,
+   *            not an apology: one line, one button, and the roster it is about to write.
+   *    BODY  — a workflow. The roster, the form, the canvas, the YAML, the findings. */
   private render(): void {
-    const empty = !this.exists && !this.text.trim();
-    this.emptyEl.hidden = !empty;
-    this.bodyEl.hidden = empty;
-    this.findingsEl.hidden = empty;
+    const error = this.loadError !== null;
+    const start = !error && !this.exists && !this.text.trim();
+    this.errorEl.hidden = !error;
+    this.errorTextEl.textContent = this.loadError ?? "";
+    this.emptyEl.hidden = !start;
+    this.bodyEl.hidden = error || start;
+    this.findingsEl.hidden = error || start;
     this.yamlArea.value = this.text;
     this.updateDirty();
-    if (empty) {
+    if (error || start) {
       this.statusEl.textContent = "";
+      this.statusEl.className = "wf-status";
       return;
     }
     this.renderRoster();
@@ -552,7 +762,7 @@ export class WorkflowView {
     });
 
     const add = el("button", "wf-add", "+ Add block");
-    add.addEventListener("click", () => this.addBlock());
+    add.addEventListener("click", () => void this.createBlock());
     (add as HTMLButtonElement).disabled = this.syntaxBroken();
     rows.push(add);
 
@@ -602,6 +812,18 @@ export class WorkflowView {
         return;
       }
       this.formPane.replaceChildren(this.blockForm(w, block, index));
+      return;
+    }
+    if (this.selection.kind === "edge") {
+      const { from, to } = this.selection;
+      // An edge that no longer exists (erased here, or in the YAML tab) is not an edge to show
+      // a panel for.
+      if (!w.edges.some((e) => e.from === from && e.to === to)) {
+        this.selection = { kind: "workflow" };
+        this.renderForm();
+        return;
+      }
+      this.formPane.replaceChildren(this.edgeForm(from, to));
       return;
     }
     this.formPane.replaceChildren(this.selection.kind === "gate" ? this.gateForm(w) : this.workflowForm(w));
@@ -845,6 +1067,31 @@ export class WorkflowView {
     return box;
   }
 
+  /** The panel for a selected EDGE. Short, because an edge is a short thing: it has no
+   *  properties — it is a pair of ids — so all there is to say is what it means and how to
+   *  remove it. Saying *what it means* is the part that earns the panel: this is the one place
+   *  a human clicks on an advisory edge, and it is where they should learn that it is advisory. */
+  private edgeForm(from: string, to: string): HTMLElement {
+    const box = el("div", "wf-fields");
+    box.append(el("h3", "wf-form-title", `${from} → ${to}`));
+    box.append(
+      el(
+        "p",
+        "wf-note",
+        "An ADVISORY edge: it declares the intended path. The orchestrator still decides when to " +
+          "spawn what — its judgment about what can run in parallel is the thing that makes it good, " +
+          "and a static DAG would replace that with something dumber. The half that is actually " +
+          "enforced is the merge gate."
+      )
+    );
+    const del = document.createElement("button");
+    del.className = "wf-btn wf-btn-danger";
+    del.textContent = "Delete edge";
+    del.addEventListener("click", () => this.eraseEdge(from, to));
+    box.append(del);
+    return box;
+  }
+
   private gateForm(w: Workflow): HTMLElement {
     const box = el("div", "wf-fields");
     box.append(el("h3", "wf-form-title", "Merge gate"));
@@ -987,17 +1234,50 @@ export class WorkflowView {
     if (rerenderForm) this.renderForm();
   }
 
-  private addBlock(): void {
+  /** Create a block — from the roster's "+ Add block" or the canvas's "+ Block", the same one
+   *  path.
+   *
+   *  IT ASKS FOR THE ID, and that is a design commitment rather than a dialog I forgot to
+   *  remove (§4): an id is immutable and human-meaningful, edges and gates reference it, and it
+   *  is the thing you read in a diff. Dify mints `node_1720794829558`; n8n keys the graph by
+   *  the DISPLAY NAME so a rename silently breaks every reference. Asking costs one dialog,
+   *  once, and it is validated as they type — a malformed or duplicate id can't be confirmed at
+   *  all, so it never becomes a finding they have to go and decode afterwards.
+   *
+   *  Everything ELSE about the block (kind, cli, model, prompt/profile) is configured in the
+   *  property form, which the new block is immediately selected in. That split is deliberate:
+   *  the id is the one field that can never be changed later, so it is the one field worth
+   *  interrupting for. */
+  private async createBlock(at?: Point): Promise<void> {
     const w = this.analysis.workflow;
-    const id = nextBlockId(w, "block");
+    const id = await promptModal({
+      title: "New block",
+      body: "The id is the block's identity — edges and the merge gate reference it, and it can never be changed. Make it something you'd want to read in a diff (rev-security, worker, planner).",
+      label: "Block id",
+      placeholder: "rev-security",
+      affirm: "Create",
+      validate: (v) => {
+        if (!v) return "A block needs an id.";
+        if (!isValidBlockId(v)) return "Use lowercase letters, digits, - and _ (e.g. rev-security).";
+        if (w.blocks.some((b) => b.id === v)) return `This workflow already has a block called "${v}".`;
+        return null;
+      },
+    });
+    if (!id) return;
+
     const index = w.blocks.length;
     this.mutate((next) => {
-      next.blocks.push({ id, name: "New block", kind: "reviewer", cli: "claude", model: "" });
+      next.blocks = [...next.blocks, newBlock(id, id)];
     });
+    // Put it where the human asked for it (a canvas right-click carries the point), or in the
+    // first free slot. Either way it is placed BEFORE it is drawn, so it never flashes at the
+    // origin on top of something else.
+    this.layout = withPosition(this.layout, id, at ?? freeSlot(this.positions()));
+    void this.saveLayout();
     this.selection = { kind: "block", index };
-    this.setTab("form");
     this.renderRoster();
     this.renderForm();
+    this.renderGraph();
   }
 
   private async deleteBlock(b: WorkflowBlock, index: number): Promise<void> {
@@ -1081,109 +1361,198 @@ export class WorkflowView {
     this.yamlArea.setSelectionRange(at, at + (lines[line - 1]?.length ?? 0));
   }
 
-  // ---------- the read-only graph ----------
+  // ---------- the canvas (#222 v2: it EDITS the file now) ----------
+  //
+  // The graph was read-only in v1, on the reasoning that a canvas which can corrupt the file is
+  // worse than no canvas. The human demoed it and asked for an editable one. So it edits — and
+  // the original reasoning is ANSWERED rather than abandoned: every gesture goes through the
+  // pure model (`connectBlocks`, `addBlock`, `removeBlockAt`) and out through the same
+  // canonical formatter as every other edit. The canvas cannot express anything the YAML
+  // can't, it cannot write a position into the workflow, and it cannot invent an id. It is a
+  // second way to EDIT the file, not a second source of truth.
+  //
+  // Drag a node (position → the LAYOUT file, never the workflow) · drag from a node's port to
+  // another node to draw an advisory edge · click an edge to select it, ✕ to erase it · +Block
+  // to add one (it asks for the id) · Delete to remove what's selected.
+
+  /** Every node's position right now: stored where the human has dragged one, computed
+   *  everywhere else, and overridden by the drag in flight. */
+  private positions(): Map<string, Point> {
+    const pos = resolvePositions(this.analysis.graph, this.layout, this.ghosts());
+    if (this.dragging) pos.set(this.dragging.key, this.dragging.at);
+    return pos;
+  }
+
+  private nodeRects(): Map<string, Rect> {
+    return new Map([...this.positions()].map(([k, p]) => [k, rectOf(p)] as const));
+  }
+
+  /** The names an edge mentions that no block answers to. Drawn, because a graph that quietly
+   *  omitted them would disagree with the file it exists to show you. */
+  private ghosts(): string[] {
+    const g = this.analysis.graph;
+    const known = new Set(g.nodes.map((n) => n.block.id).filter(Boolean));
+    return [...new Set(g.edges.flatMap((e) => [e.from, e.to]).filter((id) => id && !known.has(id)))];
+  }
+
+  /** The block (or ghost) a name resolves to. A duplicate id draws to the FIRST row answering
+   *  to it — that is a validation error either way, and drawing to one of them beats drawing to
+   *  neither. */
+  private keyOf(id: string): string | null {
+    const n = this.analysis.graph.nodes.find((x) => x.block.id === id);
+    if (n) return blockKey(n.index);
+    return this.ghosts().includes(id) ? ghostKey(id) : null;
+  }
+
+  /** Pointer → canvas coordinates. The SVG renders at natural size (no zoom, no viewBox
+   *  scaling), so this is a translation and nothing more — which is why there is no transform
+   *  maths anywhere else in here to get wrong. */
+  private canvasPoint(e: PointerEvent, root: SVGElement): Point {
+    const r = (root as unknown as HTMLElement).getBoundingClientRect();
+    return { x: e.clientX - r.left, y: e.clientY - r.top };
+  }
+
+  /** The drawn edges as GEOMETRY, in render order — the list the pure hit-test is asked about. */
+  private drawnEdges(
+    rects: ReadonlyMap<string, Rect>
+  ): { edge: { from: string; to: string }; geom: { from: Point; to: Point } }[] {
+    const out: { edge: { from: string; to: string }; geom: { from: Point; to: Point } }[] = [];
+    for (const e of this.analysis.graph.edges) {
+      const a = this.keyOf(e.from);
+      const b = this.keyOf(e.to);
+      const ra = a ? rects.get(a) : undefined;
+      const rb = b ? rects.get(b) : undefined;
+      if (!ra || !rb) continue;
+      out.push({ edge: { from: e.from, to: e.to }, geom: { from: outPort(ra), to: inPort(rb) } });
+    }
+    return out;
+  }
 
   private renderGraph(): void {
     const g = this.analysis.graph;
+
+    const bar = el("div", "wf-graph-bar");
+    const addBtn = document.createElement("button");
+    addBtn.className = "wf-btn";
+    addBtn.textContent = "+ Block";
+    addBtn.disabled = this.syntaxBroken();
+    addBtn.addEventListener("click", () => void this.createBlock());
+    bar.append(
+      addBtn,
+      el(
+        "span",
+        "wf-graph-hint",
+        "Drag a node to move it · drag from its ● to another node to connect · click an edge to select it"
+      )
+    );
+    const legend = el("div", "wf-legend");
+    legend.append(
+      el("span", "wf-legend-item wf-legend-edge", "— advisory edge (the declared path)"),
+      el("span", "wf-legend-item wf-legend-gate", "-- enforced gate (blocks the merge)")
+    );
+    bar.append(legend);
+
     if (!g.nodes.length) {
-      this.graphPane.replaceChildren(el("div", "wf-hint", "No blocks to draw yet."));
+      this.graphPane.replaceChildren(bar, el("div", "wf-hint", "No blocks yet — “+ Block” adds one."));
       return;
     }
 
-    // GHOST nodes: an edge naming a block that doesn't exist still gets drawn, into a
-    // dashed placeholder. Silently omitting it would make the graph disagree with the file
-    // — and the graph is supposed to be how you SEE the file.
-    const known = new Set(g.nodes.map((n) => n.block.id).filter(Boolean));
-    const ghosts = [...new Set(g.edges.flatMap((e) => [e.from, e.to]).filter((id) => id && !known.has(id)))];
+    const pos = this.positions();
+    const rects = this.nodeRects();
+    const ghosts = this.ghosts();
 
-    // POSITIONS ARE KEYED BY ROW, NOT BY ID (rev-5 F5). Two id-less stubs share an id ("")
-    // and so did their position: they were drawn on top of each other, and a file with two
-    // broken blocks showed one — in the view whose entire job is to show you the file. So a
-    // block is keyed by its index (`b:2`), and a ghost — which is not a row at all, only a
-    // name an edge mentions — by its id (`g:rev-perf`).
-    const blockKey = (index: number): string => `b:${index}`;
-    const ghostKey = (id: string): string => `g:${id}`;
-    // An edge names an id; it draws to the FIRST row answering to that id. A duplicate pair
-    // is a validation error either way, and drawing to one of them beats drawing to neither.
-    const rowOf = (id: string): string | null => {
-      const n = g.nodes.find((x) => x.block.id === id);
-      return n ? blockKey(n.index) : known.has(id) ? null : ghostKey(id);
-    };
-
-    const columns: string[][] = g.layers.map((indices) => indices.map(blockKey));
-    if (ghosts.length) columns.push(ghosts.map(ghostKey));
-
-    const pos = new Map<string, { x: number; y: number }>();
-    columns.forEach((keys, col) => {
-      keys.forEach((key, row) => {
-        pos.set(key, { x: PAD + col * (NODE_W + COL_GAP), y: PAD + row * (NODE_H + ROW_GAP) });
-      });
-    });
-    const layers = columns;
-
+    // The gate hangs off the reviewers it names, to the right of everything else. It is NOT a
+    // draggable, wireable node: it is not a block, it is a rule ABOUT blocks, and letting it be
+    // dragged around like one would imply it can be rewired like one — which is the single most
+    // important thing about it that isn't true.
     const gate = g.gates[0];
-    const gateX = PAD + layers.length * (NODE_W + COL_GAP);
-    const gateRows = gate ? Math.max(1, gate.reviewers.length) : 0;
+    const right = Math.max(...[...pos.values()].map((p) => p.x + NODE_W), PAD);
+    const gateX = right + 96;
+    const gateH = gate ? Math.max(NODE_H, Math.max(1, gate.reviewers.length) * 22 + 30) : 0;
     const gateY = PAD;
-    const gateH = gate ? Math.max(NODE_H, gateRows * 22 + 30) : 0;
 
-    // Without a gate the drawing ends at the last column's right edge (gateX is one full
-    // column-plus-gap past it), so the trailing gap comes back off.
-    const width = gate ? gateX + NODE_W + PAD : gateX - COL_GAP + PAD;
-    const height =
-      PAD * 2 +
-      Math.max(
-        ...layers.map((ids) => ids.length * (NODE_H + ROW_GAP) - ROW_GAP),
-        gate ? gateH : 0
-      );
+    const bottom = Math.max(...[...pos.values()].map((p) => p.y + NODE_H), gateY + gateH);
+    const width = (gate ? gateX + NODE_W : right) + PAD * 4;
+    const height = bottom + PAD * 4;
 
     const root = svg("svg");
     root.setAttribute("class", "wf-graph-svg");
     root.setAttribute("width", String(width));
     root.setAttribute("height", String(height));
-    root.setAttribute("viewBox", `0 0 ${width} ${height}`);
 
     const defs = svg("defs");
     defs.append(arrowMarker("wf-arrow", "#6b7394"), arrowMarker("wf-arrow-gate", "#e0af68"));
     root.append(defs);
 
-    // ADVISORY edges: solid, plain arrow. They say what the workflow INTENDS.
+    // ---- advisory edges: solid, selectable, erasable ----
     for (const e of g.edges) {
-      const fromKey = rowOf(e.from);
-      const toKey = rowOf(e.to);
-      const a = fromKey ? pos.get(fromKey) : undefined;
-      const b = toKey ? pos.get(toKey) : undefined;
+      const aKey = this.keyOf(e.from);
+      const bKey = this.keyOf(e.to);
+      const a = aKey ? rects.get(aKey) : undefined;
+      const b = bKey ? rects.get(bKey) : undefined;
       if (!a || !b) continue;
+      const from = outPort(a);
+      const to = inPort(b);
+      const selected =
+        this.selection.kind === "edge" && this.selection.from === e.from && this.selection.to === e.to;
+
+      const group = svg("g");
+      group.setAttribute("class", `wf-edge-g${selected ? " selected" : ""}`);
       const path = svg("path");
-      const x1 = a.x + NODE_W;
-      const y1 = a.y + NODE_H / 2;
-      const x2 = b.x;
-      const y2 = b.y + NODE_H / 2;
-      const mid = (x1 + x2) / 2;
-      path.setAttribute("d", `M ${x1} ${y1} C ${mid} ${y1}, ${mid} ${y2}, ${x2} ${y2}`);
+      path.setAttribute("d", edgePath(from, to));
       path.setAttribute("class", e.resolved ? "wf-edge" : "wf-edge wf-edge-broken");
       path.setAttribute("marker-end", "url(#wf-arrow)");
-      root.append(path);
+      group.append(path);
+
+      // The ✕ hangs off the CURVE's midpoint — on an edge that doubles back (the reviewer →
+      // worker rework loop, a real workflow) the straight-line middle is nowhere near the line
+      // you can see, and a ✕ floating in empty space is a ✕ nobody trusts.
+      const mid = edgeMidpoint(from, to);
+      const del = svg("g");
+      del.setAttribute("class", "wf-edge-del");
+      const disc = svg("circle");
+      disc.setAttribute("cx", String(mid.x));
+      disc.setAttribute("cy", String(mid.y));
+      disc.setAttribute("r", "9");
+      const glyph = text(mid.x, mid.y + 4, "✕", "wf-edge-del-x");
+      glyph.setAttribute("text-anchor", "middle");
+      del.append(disc, glyph);
+      del.addEventListener("pointerdown", (ev) => {
+        ev.stopPropagation(); // this is a click on the ✕, not a canvas gesture
+        this.eraseEdge(e.from, e.to);
+      });
+      group.append(del);
+      root.append(group);
     }
 
-    for (const n of g.nodes) node(root, pos.get(blockKey(n.index))!, n);
-    for (const id of ghosts) ghostNode(root, pos.get(ghostKey(id))!, id);
+    // ---- the edge being drawn ----
+    if (this.connecting) {
+      const fromKey = this.keyOf(this.connecting.from);
+      const a = fromKey ? rects.get(fromKey) : undefined;
+      if (a) {
+        const rubber = svg("path");
+        rubber.setAttribute("d", edgePath(outPort(a), this.connecting.at));
+        rubber.setAttribute("class", "wf-edge wf-edge-draft");
+        rubber.setAttribute("marker-end", "url(#wf-arrow)");
+        root.append(rubber);
+      }
+    }
 
-    // The ENFORCED gate: a different shape (dashed, amber) and a dashed connector from
-    // every reviewer it names. Advisory and enforced must not look alike — the whole point
-    // of the distinction is that one of them can actually stop a merge.
+    // ---- nodes ----
+    for (const n of g.nodes) {
+      const selected = this.selection.kind === "block" && this.selection.index === n.index;
+      root.append(nodeGroup(rects.get(blockKey(n.index))!, n, selected));
+    }
+    for (const id of ghosts) root.append(ghostGroup(rects.get(ghostKey(id))!, id));
+
+    // ---- the ENFORCED gate ----
     if (gate) {
       for (const rid of gate.reviewers) {
-        const key = rowOf(rid);
-        const a = key ? pos.get(key) : undefined;
+        const rKey = this.keyOf(rid);
+        const a = rKey ? rects.get(rKey) : undefined;
         if (!a) continue;
         const line = svg("path");
-        const x1 = a.x + NODE_W;
-        const y1 = a.y + NODE_H / 2;
-        const x2 = gateX;
-        const y2 = gateY + gateH / 2;
-        const mid = (x1 + x2) / 2;
-        line.setAttribute("d", `M ${x1} ${y1} C ${mid} ${y1}, ${mid} ${y2}, ${x2} ${y2}`);
+        line.setAttribute("d", edgePath(outPort(a), { x: gateX, y: gateY + gateH / 2 }));
         line.setAttribute("class", "wf-edge wf-edge-gate");
         line.setAttribute("marker-end", "url(#wf-arrow-gate)");
         root.append(line);
@@ -1195,25 +1564,173 @@ export class WorkflowView {
       box.setAttribute("height", String(gateH));
       box.setAttribute("rx", "8");
       box.setAttribute("class", "wf-gate-box");
+      box.addEventListener("pointerdown", (ev) => {
+        ev.stopPropagation();
+        this.selection = { kind: "gate" };
+        this.setTab("form");
+        this.renderRoster();
+        this.renderGraph();
+      });
       root.append(box);
       root.append(text(gateX + 12, gateY + 22, "⛔ merge gate", "wf-gate-title"));
-      const detail =
-        gate.require === "threshold"
-          ? `${gate.threshold ?? "?"} of ${gate.reviewers.length} must PASS`
-          : `all ${gate.reviewers.length} must PASS`;
-      root.append(text(gateX + 12, gateY + 40, detail, "wf-gate-sub"));
+      root.append(
+        text(
+          gateX + 12,
+          gateY + 40,
+          gate.require === "threshold"
+            ? `${gate.threshold ?? "?"} of ${gate.reviewers.length} must PASS`
+            : `all ${gate.reviewers.length} must PASS`,
+          "wf-gate-sub"
+        )
+      );
     }
 
-    const legend = el("div", "wf-legend");
-    legend.append(
-      el("span", "wf-legend-item wf-legend-edge", "— advisory edge (the declared path)"),
-      el("span", "wf-legend-item wf-legend-gate", "-- enforced gate (blocks the merge)")
-    );
+    root.addEventListener("pointerdown", (ev) => this.onCanvasDown(ev, root));
+    root.addEventListener("pointermove", (ev) => this.onCanvasMove(ev, root));
+    root.addEventListener("pointerup", (ev) => this.onCanvasUp(ev, root));
+    root.addEventListener("pointercancel", () => {
+      this.dragging = null;
+      this.connecting = null;
+      this.renderGraph();
+    });
+
     const scroll = el("div", "wf-graph-scroll");
     scroll.append(root as unknown as HTMLElement);
-    this.graphPane.replaceChildren(scroll, legend);
+    this.graphPane.replaceChildren(bar, scroll);
+  }
+
+  /** Where a gesture begins: on a node's PORT (draw an edge), on a node (move it, select it),
+   *  on an edge (select it), or on nothing (deselect). */
+  private onCanvasDown(e: PointerEvent, root: SVGElement): void {
+    if (e.button !== 0 || this.syntaxBroken()) return;
+    const pt = this.canvasPoint(e, root);
+    const rects = this.nodeRects();
+    const key = hitTestNodes(rects, pt);
+
+    if (key?.startsWith("b:")) {
+      const index = Number(key.slice(2));
+      const block = this.analysis.workflow.blocks[index];
+      const rect = rects.get(key)!;
+      const port = outPort(rect);
+
+      if (Math.hypot(pt.x - port.x, pt.y - port.y) <= PORT_HIT && block?.id) {
+        // An edge is a pair of IDS, so a block with no id cannot be an endpoint. Offering the
+        // gesture would only manufacture the dangling reference the validator then complains
+        // about — the file would be describing a mistake the canvas talked you into.
+        this.connecting = { from: block.id, at: pt };
+        root.setPointerCapture(e.pointerId);
+        this.renderGraph();
+        return;
+      }
+
+      this.selection = { kind: "block", index };
+      this.dragging = {
+        key,
+        id: block?.id ?? "",
+        grab: { x: pt.x - rect.x, y: pt.y - rect.y },
+        at: { x: rect.x, y: rect.y },
+      };
+      root.setPointerCapture(e.pointerId);
+      this.renderRoster();
+      this.renderForm();
+      this.renderGraph();
+      return;
+    }
+
+    // Not a node. An edge, then? THIS is where the pure hit-test earns its keep: an edge is a
+    // 1.5px line and nobody can hit that with a mouse — the tolerance is what makes it
+    // clickable at all, and it is arithmetic, so it is tested rather than eyeballed.
+    const drawn = this.drawnEdges(rects);
+    const hit = hitTestEdges(
+      drawn.map((d) => d.geom),
+      pt
+    );
+    this.selection =
+      hit !== null
+        ? { kind: "edge", from: drawn[hit]!.edge.from, to: drawn[hit]!.edge.to }
+        : { kind: "workflow" };
+    this.renderRoster();
+    this.renderForm();
+    this.renderGraph();
+  }
+
+  private onCanvasMove(e: PointerEvent, root: SVGElement): void {
+    if (!this.dragging && !this.connecting) return;
+    const pt = this.canvasPoint(e, root);
+    if (this.dragging) {
+      this.dragging.at = { x: pt.x - this.dragging.grab.x, y: pt.y - this.dragging.grab.y };
+    }
+    if (this.connecting) this.connecting.at = pt;
+    this.renderGraph();
+  }
+
+  private onCanvasUp(e: PointerEvent, root: SVGElement): void {
+    const pt = this.canvasPoint(e, root);
+
+    if (this.dragging) {
+      const { id, at } = this.dragging;
+      this.dragging = null;
+      if (id) {
+        // A drag writes the LAYOUT file and nothing else. The workflow is not re-serialized, the
+        // dirty flag does not move, and your teammate's `git pull` does not show a change to the
+        // logic because you nudged a box (§4 — the thing Dify, ComfyUI and Langflow all get
+        // wrong by embedding x/y in the semantic file).
+        const moved = withPosition(this.layout, id, { x: Math.max(0, at.x), y: Math.max(0, at.y) });
+        if (!layoutEquals(moved, this.layout)) {
+          this.layout = moved;
+          void this.saveLayout();
+        }
+      }
+      this.renderGraph();
+      return;
+    }
+
+    if (this.connecting) {
+      const from = this.connecting.from;
+      this.connecting = null;
+      const key = hitTestNodes(this.nodeRects(), pt);
+      if (key?.startsWith("b:")) {
+        const to = this.analysis.workflow.blocks[Number(key.slice(2))]?.id ?? "";
+        // Refused BEFORE the edge exists, with the reason. A canvas that lets you complete the
+        // gesture and only then tells you the edge was invalid has wasted the gesture and left
+        // you to undo it.
+        const err = connectionError(this.analysis.workflow, from, to);
+        if (err) showToast(err, "info");
+        else this.mutate((next) => Object.assign(next, connectBlocks(next, from, to)));
+      }
+      this.renderGraph();
+    }
+  }
+
+  /** Erase one edge. No confirm: an edge is one gesture to redraw, and a dialog for something
+   *  that cheap is a dialog people learn to click through. A BLOCK is different — it carries a
+   *  prompt, a model, a seat on the gate — and deleting one still asks. */
+  private eraseEdge(from: string, to: string): void {
+    this.mutate((next) => Object.assign(next, disconnectBlocks(next, from, to)));
+    if (this.selection.kind === "edge" && this.selection.from === from && this.selection.to === to) {
+      this.selection = { kind: "workflow" };
+      this.renderForm();
+    }
+    this.renderGraph();
+  }
+
+  /** Delete whatever is selected — the keyboard half of the canvas. A canvas you can only
+   *  operate with a mouse is a canvas that is tiring to use. */
+  private deleteSelection(): void {
+    if (this.selection.kind === "edge") {
+      this.eraseEdge(this.selection.from, this.selection.to);
+      return;
+    }
+    if (this.selection.kind === "block") {
+      const block = this.analysis.workflow.blocks[this.selection.index];
+      if (block) void this.deleteBlock(block, this.selection.index);
+    }
   }
 }
+
+/** How close to a node's out-port a press must land to mean "draw an edge" rather than "move
+ *  the node". Generous — the port is a 5px dot, and the two gestures start in the same place. */
+const PORT_HIT = 12;
 
 // ---------- SVG helpers ----------
 
@@ -1246,36 +1763,69 @@ function text(x: number, y: number, s: string, cls: string): SVGElement {
  *  width, so a fixed budget is the honest bound. */
 const clip = (s: string, max: number): string => (s.length > max ? s.slice(0, max - 1) + "…" : s);
 
-function node(root: SVGElement, at: { x: number; y: number }, n: GraphNode): void {
+/** One block, as a draggable, connectable node. */
+function nodeGroup(r: Rect, n: GraphNode, selected: boolean): SVGElement {
   const bad = !n.known || !isWorkflowCli(n.block.cli);
+  const g = svg("g");
+  g.setAttribute("class", `wf-node-g${selected ? " selected" : ""}`);
+
   const box = svg("rect");
-  box.setAttribute("x", String(at.x));
-  box.setAttribute("y", String(at.y));
-  box.setAttribute("width", String(NODE_W));
-  box.setAttribute("height", String(NODE_H));
+  box.setAttribute("x", String(r.x));
+  box.setAttribute("y", String(r.y));
+  box.setAttribute("width", String(r.w));
+  box.setAttribute("height", String(r.h));
   box.setAttribute("rx", "8");
   box.setAttribute("class", `wf-node wf-node-${isBlockKind(n.block.kind) ? n.block.kind : "unknown"}`);
-  root.append(box);
-  root.append(text(at.x + 12, at.y + 21, clip(n.block.name || n.block.id, 20), "wf-node-title"));
-  root.append(
+  g.append(box);
+  g.append(text(r.x + 12, r.y + 21, clip(n.block.name || n.block.id || "(no id)", 20), "wf-node-title"));
+  g.append(
     text(
-      at.x + 12,
-      at.y + 38,
+      r.x + 12,
+      r.y + 38,
       clip(`${bad ? "⚠ " : ""}${n.block.kind || "?"} · ${n.block.cli || "?"}`, 22),
       "wf-node-sub"
     )
   );
+
+  // The ports. The OUT port is the handle you drag an edge from, so it is drawn — a gesture
+  // nobody can see is a gesture nobody performs. The IN port is drawn too, smaller, because an
+  // arrow that arrives somewhere unmarked looks like it is pointing at the box rather than
+  // connecting to it. An id-less block gets no out-port at all: it cannot be an edge's endpoint
+  // (an edge is a pair of ids), and offering the handle would be offering a broken promise.
+  if (n.block.id) {
+    const out = svg("circle");
+    const p = outPort(r);
+    out.setAttribute("cx", String(p.x));
+    out.setAttribute("cy", String(p.y));
+    out.setAttribute("r", "5");
+    out.setAttribute("class", "wf-port wf-port-out");
+    g.append(out);
+  }
+  const inp = svg("circle");
+  const ip = inPort(r);
+  inp.setAttribute("cx", String(ip.x));
+  inp.setAttribute("cy", String(ip.y));
+  inp.setAttribute("r", "3");
+  inp.setAttribute("class", "wf-port wf-port-in");
+  g.append(inp);
+  return g;
 }
 
-function ghostNode(root: SVGElement, at: { x: number; y: number }, id: string): void {
+/** A name an edge mentions that no block answers to. Dashed, unmovable, unconnectable — it is
+ *  not a block, it is the ABSENCE of one, and it disappears the moment the file stops
+ *  mentioning it. */
+function ghostGroup(r: Rect, id: string): SVGElement {
+  const g = svg("g");
+  g.setAttribute("class", "wf-node-g");
   const box = svg("rect");
-  box.setAttribute("x", String(at.x));
-  box.setAttribute("y", String(at.y));
-  box.setAttribute("width", String(NODE_W));
-  box.setAttribute("height", String(NODE_H));
+  box.setAttribute("x", String(r.x));
+  box.setAttribute("y", String(r.y));
+  box.setAttribute("width", String(r.w));
+  box.setAttribute("height", String(r.h));
   box.setAttribute("rx", "8");
   box.setAttribute("class", "wf-node wf-node-ghost");
-  root.append(box);
-  root.append(text(at.x + 12, at.y + 21, clip(id, 20), "wf-node-title"));
-  root.append(text(at.x + 12, at.y + 38, "no such block", "wf-node-sub"));
+  g.append(box);
+  g.append(text(r.x + 12, r.y + 21, clip(id, 20), "wf-node-title"));
+  g.append(text(r.x + 12, r.y + 38, "no such block", "wf-node-sub"));
+  return g;
 }

@@ -811,7 +811,12 @@ function collectExtra(
  *  because the pane's job is to let the human FIX the file — which it cannot do if the
  *  file won't open. */
 export function parseWorkflow(text: string): ParseResult {
-  const reader = new YamlReader(text.split(/\r?\n/));
+  // Strip a BOM. A workflow file written by a Windows editor (or by `Set-Content` without
+  // `-Encoding utf8NoBOM`) starts with U+FEFF, and the reader would otherwise take it as part
+  // of the first KEY — so `version: 1` arrived as a key named "﻿version", the version
+  // read as missing, and the pane reported a file the human could see was right as broken.
+  // It is invisible, so nothing about the error message could have led them to the cause.
+  const reader = new YamlReader(text.replace(/^﻿/, "").split(/\r?\n/));
   const doc = reader.document();
   const findings = reader.findings;
   const w: Workflow = { version: WORKFLOW_VERSION, name: "", blocks: [], edges: [], gates: {} };
@@ -1325,6 +1330,58 @@ export function nextBlockId(w: Workflow, base: string): string {
   }
 }
 
+// ---------- graph EDIT operations (#222 v2: the canvas edits the file) ----------
+//
+// The canvas is now bidirectional — you can draw an edge, add a block, delete either — and
+// every one of those goes through a function here, in the pure module, rather than through
+// the DOM layer poking at the model. That is what makes "draw an edge, serialize, re-read,
+// get the same workflow" a unit test instead of a thing you check by hand with a mouse.
+//
+// They all return a NEW workflow, and none of them is allowed to invent an identity: a block
+// gets its id from the human (immutable, human-meaningful — §4), and an edge is a pair of ids
+// that already exist.
+
+/** Why a proposed edge can't be drawn, or null when it can. Checked BEFORE the edge is
+ *  created rather than reported after — an editable canvas that lets you draw an edge and
+ *  then tells you it was invalid has wasted the gesture and left you to undo it. */
+export function connectionError(w: Workflow, from: string, to: string): string | null {
+  if (!from || !to) return "A block needs an id before an edge can name it.";
+  if (from === to) return "A block can't run after itself.";
+  if (!w.blocks.some((b) => b.id === from) || !w.blocks.some((b) => b.id === to)) {
+    return "That block doesn't exist.";
+  }
+  if (w.edges.some((e) => e.from === from && e.to === to)) return "That edge already exists.";
+  return null;
+}
+
+/** Draw an advisory edge. A duplicate or illegal edge is a no-op rather than a throw — the
+ *  canvas has already refused the gesture (`connectionError`), and this is the second line of
+ *  defence, not the first. */
+export function connectBlocks(w: Workflow, from: string, to: string): Workflow {
+  if (connectionError(w, from, to)) return w;
+  return { ...w, edges: [...w.edges, { from, to }] };
+}
+
+/** Erase an edge. Only that edge: the blocks it joined are untouched, which is the whole
+ *  difference between deleting a connection and deleting the work. */
+export function disconnectBlocks(w: Workflow, from: string, to: string): Workflow {
+  return { ...w, edges: w.edges.filter((e) => !(e.from === from && e.to === to)) };
+}
+
+/** Add a block. The caller supplies the ID — the canvas asks the human for it, because §4's
+ *  first commitment is that an id is human-meaningful and immutable, and a canvas that mints
+ *  `node_1720794829558` (Dify's actual behaviour) makes every edge in the file unreadable
+ *  and every id a lie about what the block is. */
+export function addBlock(w: Workflow, block: WorkflowBlock): Workflow {
+  return { ...w, blocks: [...w.blocks, block] };
+}
+
+/** A new block, filled in with the defaults a reviewer usually wants — the caller overrides
+ *  what it asked the human about. Kept here so "what a new block is" has one answer. */
+export function newBlock(id: string, name: string, kind: BlockKind = "reviewer"): WorkflowBlock {
+  return { id, name: name || id, kind, cli: "claude", model: "" };
+}
+
 /** Remove the block at `index`, AND every reference to it — edges at either end, and its
  *  seat on the merge gate. A delete that left the references behind would turn one click
  *  into three validation errors, which is exactly the "dangling reference" class this file
@@ -1353,6 +1410,77 @@ export function removeBlockAt(w: Workflow, index: number): Workflow {
         : undefined,
     },
   };
+}
+
+/** The file a repo with no workflow gets when the human asks for one: today's built-in
+ *  pipeline, written out — plus the comments that say what each part is FOR.
+ *
+ *  Comments, and not just `serializeWorkflow(starterWorkflow())`, because this is the one
+ *  moment the file is read by someone who has never seen the schema: it arrives in their
+ *  editor, in their diff, in their teammate's `git pull`. A commented scaffold is how every
+ *  config-as-code tool worth using introduces itself, and it costs one string.
+ *
+ *  (They are comments, so they do not survive a canonical re-serialize — the first form edit
+ *  rewrites the file without them. That is the honest trade of having ONE canonical shape,
+ *  it is stated in the design note, and it is why the scaffold is offered at CREATION rather
+ *  than being something the formatter tries to preserve. What the human writes in the YAML
+ *  tab and saves is kept verbatim; only an edit made through the form or the canvas
+ *  re-serializes.)
+ *
+ *  `authoredWith` is stamped in the same one moment `starterWorkflow` stamps it. */
+export function scaffoldWorkflowText(authoredWith?: string): string {
+  const stamp = authoredWith ? `authored_with: ${authoredWith}\n` : "";
+  return `# .loomux/workflow.yml — this repo's agent workflow (loomux #222).
+# Committed on purpose: everyone who clones the repo gets the same roster.
+# Loomux reads it only when "Advanced orchestrator" is ticked in the launcher.
+
+version: 1
+${stamp}name: default
+
+# BLOCKS — the agents a run may use. \`kind\` is a capability class and the list is
+# closed (orchestrator | worker | reviewer | planner): a workflow file can define any
+# persona, but it can never grant a capability. A planner is read-only; a reviewer can
+# review but never push; a worker gets a worktree.
+blocks:
+  - id: planner            # immutable, human-meaningful — edges and gates name THIS
+    name: Planner          # display only; safe to rename at any time
+    kind: planner
+    cli: claude
+    model: opus
+
+  - id: worker
+    name: Worker
+    kind: worker
+    cli: claude
+
+  - id: reviewer
+    name: Reviewer
+    kind: reviewer
+    cli: claude
+    model: opus
+    # A persona is optional: an inline \`prompt:\` (compiled to the CLI's native inline
+    # agent) or a \`profile:\` path to a .github/agents/*.md file. Omit both and the
+    # block runs loomux's built-in role instructions.
+    #
+    # prompt: |
+    #   Review ONLY for security defects: injection, authz, secrets, path traversal.
+
+# EDGES — ADVISORY. They declare the intended path; the orchestrator still decides when
+# to spawn what. (Its judgment about what can run in parallel is the thing that makes it
+# good — a static DAG would replace that with something dumber.)
+edges:
+  - { from: planner, to: worker }
+  - { from: worker, to: reviewer }
+
+# GATES — ENFORCED. Loomux refuses \`gh pr merge\` until every reviewer named here has
+# recorded a PASS verdict. An agent cannot get around it: the refusal lives in the PATH
+# shim, not in a prompt. Add a second reviewer to the list and it is a second reviewer
+# that must actually pass — which is what makes multi-reviewer more than theatre.
+gates:
+  merge:
+    require: all-pass      # or: threshold, with \`threshold: N\`
+    reviewers: [reviewer]
+`;
 }
 
 /** The optional top-level key recording which loomux WROTE this file — §4's "record the

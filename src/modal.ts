@@ -75,6 +75,104 @@ export function modal<T>(build: (resolve: (v: T) => void) => ModalSpec<T>): Prom
   });
 }
 
+/** Ask for one line of text, validated as it is typed. Resolves to the value, or null if the
+ *  human cancelled.
+ *
+ *  Added for the workflow canvas (#222 v2), which must ASK for a block's id rather than mint
+ *  one: an id is immutable and human-meaningful (§4), and a canvas that generates
+ *  `node_1720794829558` — Dify's actual behaviour — makes every edge in the file unreadable.
+ *  `validate` runs on every keystroke and on submit, so a duplicate or malformed id is refused
+ *  in the dialog, where the human is still typing it, rather than becoming a finding they have
+ *  to go and understand afterwards.
+ *
+ *  Same overlay kit as `modal`, deliberately: one dialog look, one Escape behaviour, one
+ *  place to fix them. */
+export function promptModal(spec: {
+  title: string;
+  body: string;
+  label: string;
+  placeholder?: string;
+  initial?: string;
+  affirm: string;
+  /** Return an error to REFUSE the value, or null to allow it. */
+  validate?: (value: string) => string | null;
+}): Promise<string | null> {
+  return new Promise<string | null>((resolve) => {
+    let settled = false;
+    const done = (v: string | null) => {
+      if (settled) return;
+      settled = true;
+      overlay.remove();
+      resolve(v);
+    };
+
+    const el = (tag: string, cls: string, text?: string): HTMLElement => {
+      const e = document.createElement(tag);
+      e.className = cls;
+      if (text !== undefined) e.textContent = text;
+      return e;
+    };
+
+    const overlay = el("div", "launcher-overlay visible");
+    const dlg = el("div", "agent-dialog");
+    const input = document.createElement("input");
+    input.className = "dlg-input";
+    input.type = "text";
+    input.value = spec.initial ?? "";
+    if (spec.placeholder) input.placeholder = spec.placeholder;
+    // `.dlg-error` is shown by the `visible` CLASS, not by the `hidden` attribute — the rule is
+    // `display: none` until then, so an attribute toggle would leave it invisible forever.
+    const error = el("div", "dlg-error");
+
+    const submit = () => {
+      const value = input.value.trim();
+      const err = spec.validate?.(value) ?? null;
+      if (err) {
+        error.textContent = err;
+        error.classList.add("visible");
+        input.focus();
+        return;
+      }
+      done(value);
+    };
+
+    input.addEventListener("input", () => {
+      // Clear the complaint as soon as they start fixing it — an error that persists while you
+      // type is an error you learn to ignore.
+      error.classList.remove("visible");
+    });
+    input.addEventListener("keydown", (e) => {
+      e.stopPropagation();
+      if (e.key === "Enter") submit();
+      if (e.key === "Escape") done(null);
+    });
+
+    const actions = el("div", "dlg-actions");
+    const cancel = el("button", "dlg-btn", "Cancel");
+    cancel.addEventListener("click", () => done(null));
+    const ok = el("button", "dlg-btn primary", spec.affirm);
+    ok.addEventListener("click", submit);
+    actions.append(cancel, ok);
+
+    dlg.append(
+      el("h2", "", spec.title),
+      el("div", "dlg-hint", spec.body),
+      el("div", "dlg-label", spec.label),
+      input,
+      error,
+      actions
+    );
+    overlay.appendChild(dlg);
+    overlay.addEventListener("mousedown", (e) => {
+      if (e.target === overlay) done(null);
+    });
+    overlay.addEventListener("keydown", (e) => e.stopPropagation());
+    document.body.appendChild(overlay);
+    input.focus();
+    input.select();
+  });
+}
+
 /** A yes/no confirmation. `danger` styles the affirmative button red (destructive). */
 export function confirmModal(
   title: string,
