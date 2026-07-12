@@ -433,14 +433,45 @@ tick it and the launcher shows the resolved roster — every block, its kind, CL
 and model, and **which blocks carry repo-authored personas** — before the group
 spawns.
 
-It is a *launch* choice, not a live one, and it is persisted in `group.json`
-(absent → `false`, so every group launched before this field rejoins as what it
-was: a built-in roster). A resumed orchestration rebuilds its guardrails from
-that file, not from a launcher form, so without persistence a resume would
-quietly lose the roster it was launched with.
+The toggle is persisted in `group.json` (absent → `false`, so every group launched
+before this field rejoins as what it was: a built-in roster). A resumed
+orchestration rebuilds its guardrails from that file, not from a launcher form.
 
-Three secondary outcomes, each chosen so the launcher never has to invent a
-failure the engine doesn't have:
+### A resumed group runs the roster it was launched with
+
+The consent above has a corollary that took a review round to see clearly
+(rev-11 F2). If the launcher preview is *the* consent moment, then nothing that
+happens afterwards may quietly change what the human agreed to — and a resume is
+not a consent moment, because nobody is being shown anything.
+
+So `create_group` takes a `Launch` (`Fresh` | `Resume`), and **only a fresh launch
+reads `.loomux/workflow.yml`.** A resume runs the blocks persisted in `group.json`
+— the ones the human actually looked at. Without that, the sequence
+
+> launch with the advanced orchestrator on, having reviewed the roster → `git pull`
+> (or check out a contributor's branch), which adds a reviewer block with a persona
+> → close the orchestrator and reopen it from the session browser
+
+hands the resumed group a delegate, and a repo-authored persona, that its human
+never approved and was never shown. The blast radius is bounded by the capability
+closure, as ever; the *consent* is not bounded by anything, which is the whole
+point of having a toggle.
+
+Drift is **audited, never applied**: on a resume whose roster no longer matches
+what the file now resolves to, loomux writes `workflow-changed-since-launch` with
+both block lists. A silent pin would be indistinguishable from a stale read. To run
+a changed workflow you launch a group — which shows you the new roster first.
+
+Note that `Launch` is deliberately *not* "does `group.json` already exist". A human
+who edits their workflow and launches again on the same repo **is** at the launcher,
+has seen the new preview, and must get the new roster; keying the pin off
+group-exists would make editing your workflow file appear to do nothing, forever —
+a worse bug than the one being fixed. `relaunching_after_editing_the_workflow_picks_up_the_new_file`
+pins that half.
+
+### Three secondary outcomes
+
+Each chosen so the launcher never has to invent a failure the engine doesn't have:
 
 - **On, but the repo declares nothing.** A no-op, not an error — it is how you
   launch before you have written the file.
@@ -493,16 +524,49 @@ rest of the prose lives:
 Both placeholders sit **line-final**, at the end of an existing sentence, never on
 a line of their own — a placeholder on its own line would leave a stray blank line
 behind when it resolved to `""`, and "byte-for-byte unchanged" would be false by
-one newline. `the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was`
-reconstructs the pre-#222 rendering of each template and asserts equality, so any
-unconditional prose added to a template fails a test rather than a demo.
+one newline.
+
+### Pinning that, for real
+
+The first version of this pin was self-referential and rev-11 caught it (F1). It
+built the expected value by taking the **live** template and replacing the
+placeholders with `""` — which is exactly what production does when the toggle is
+off, so both sides moved together. Unconditional prose added to a template passed.
+A placeholder moved onto its own line passed. It was a test that the *gating* works,
+wearing the name of a test that the *text* is unchanged.
+
+What replaced it:
+
+- **Golden fixtures.** `tests/fixtures/pre222/{orchestrator,worker,reviewer,planner}.md`
+  are byte copies of the four templates from the commit before the toggle. The pin
+  renders **those** with the six pre-#222 variables and diffs the result against what
+  a toggle-off group is actually written. Any edit to a role template that changes
+  what a default group reads now fails until a human re-blesses the fixture — and
+  the diff on that directory becomes the review surface for "what did we just tell
+  every worker to do differently?".
+- **Placement asserted on the template source.** `{{WORKFLOW}}` / `{{BLOCK_NOTE}}`
+  must each appear exactly once, be preceded by a non-newline character, and be
+  followed immediately by a newline. That is the invariant the empty case rests on,
+  and it is a one-keystroke mistake to break (wrapping a long line).
+
+`a_workflow_placeholder_must_sit_at_the_end_of_a_line_it_shares` also asserts that
+the live template differs from its golden by *nothing but* the placeholder, which
+keeps "the fixture is stale" and "someone edited a template" distinguishable.
 
 Two smaller decisions worth recording:
 
-- **`{{BLOCK_NOTE}}` is substituted last.** It is the one place a repo-authored
-  string (a block's `name`) reaches a template, and `render_template` walks its
-  var list in order — so nothing after it can rescan the note's text. A block
-  named `{{MAX_AGENTS}}` stays inert text.
+- **The one repo-authored string that reaches a template is defended twice.** A
+  block's `name` is substituted **last** in `block_note`'s var list (and
+  `{{BLOCK_NOTE}}` itself last in the caller's), because `render_template` walks its
+  list in order and a value that goes in last has no pass left to rescan it. That
+  ordering was originally claimed for the outer render only, and rev-11 found the
+  gap: inside `block_note` the name went in *third*, so a block called
+  `{{LANE_NOTE}}` was substituted in and then expanded — splicing loomux's own lane
+  note into the middle of a sentence in a file the agent is told to read (bounded —
+  only loomux's fragments were reachable, never attacker text — but prose corruption
+  from a repo string, and a lie in this document). Now the name goes last **and**
+  `sanitize_display` strips `{` and `}` outright. The order protects this template;
+  the sanitizer protects the next one somebody writes.
 - **The block note is per-block, not per-group.** A plain built-in `worker`
   sitting in a roster whose *reviewers* are custom has had nothing about its own
   identity changed, and telling it otherwise is noise in a file the agent is

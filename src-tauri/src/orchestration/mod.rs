@@ -1111,6 +1111,31 @@ impl NameSource {
 /// to Claude (explicitly, in `clamped`, never silently at spawn time).
 pub const SUPPORTED_CLIS: [&str; 2] = ["claude", "copilot"];
 
+/// Which kind of start a `create_group` call is (#222).
+///
+/// It exists for exactly one decision — **does the repo's `.loomux/workflow.yml`
+/// get read?** — and the answer is "on a fresh launch, yes; on a resume, no".
+///
+/// The reason is consent, not caching. The roster the advanced orchestrator runs
+/// is repo-authored, and the moment the human agrees to it is the launcher preview
+/// they saw before hitting Create. A resume is not that moment: nobody is being
+/// shown anything. So a `git pull` (or checking out a contributor's branch) between
+/// launch and resume must not be able to hand a resumed group a reviewer, or a
+/// persona, that its human never approved. The roster that comes back is the one in
+/// `group.json` — the one they approved. Drift against the file on disk is audited
+/// (`workflow-changed-since-launch`), never applied.
+///
+/// Note this is *not* the same question as "does `group.json` already exist" — a
+/// human relaunching a group on a repo they have orchestrated before is a fresh
+/// launch, preview and all, and must pick up a workflow file they have just edited.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Launch {
+    /// The human is at the launcher and has seen the roster preview.
+    Fresh,
+    /// A recorded orchestrator session is being reopened (the session browser).
+    Resume,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Guardrails {
     pub max_agents: u32,
@@ -4324,10 +4349,69 @@ impl OrchRegistry {
 
     // ---------- groups & agents ----------
 
+    /// Record that a resumed group's pinned roster no longer matches what the
+    /// repo's workflow file now says (#222, rev-11 F2). Audit only — the pinned
+    /// roster is what runs, deliberately.
+    ///
+    /// The comparison is against the roster the file *would resolve to* (same
+    /// `clamped()` a launch applies), not against its raw blocks, so an inherited
+    /// model filled in at launch doesn't read as drift. A file that has since been
+    /// deleted or broken is drift too: the group is running blocks its repo no
+    /// longer declares, which is exactly the thing worth being able to see.
+    fn audit_workflow_drift(&self, id: &str, repo: &str, g: &Guardrails) {
+        let ids = |bs: &[workflow::Block]| -> Vec<String> { bs.iter().map(|b| b.id.clone()).collect() };
+        let (now, note) = match workflow::load_workflow(repo) {
+            Ok(Some(wf)) => {
+                let resolved = Guardrails {
+                    agent_cli: g.agent_cli.clone(),
+                    blocks: wf.blocks,
+                    ..Guardrails::default()
+                }
+                .clamped()
+                .blocks;
+                if resolved == g.blocks {
+                    return; // the file still says what the group is running
+                }
+                (ids(&resolved), "the file has changed since this group was launched")
+            }
+            Ok(None) if !workflow::roster_is_custom(&g.blocks) => return, // no file, no workflow: nothing to drift from
+            Ok(None) => (Vec::new(), "the file the group was launched from is gone"),
+            Err(_) => (Vec::new(), "the file no longer validates"),
+        };
+        self.audit(id, "loomux", "workflow-changed-since-launch", json!({
+            "path": workflow::WORKFLOW_PATH,
+            "note": note,
+            "running": ids(&g.blocks),
+            "on_disk": now,
+            "action": "keeping the roster this group was launched with — relaunch to pick up the new one",
+        }));
+    }
+
     /// Create (or reattach to) the group for `repo`. State and audit history
     /// persist under the repo-derived group id; guardrails are refreshed from
     /// the new launch.
+    ///
+    /// A **fresh launch** — the human is at the launcher, and has just been shown
+    /// what the advanced orchestrator would run. [`create_group_ex`] is the same
+    /// thing for a resumed orchestrator session, which is a different question.
+    ///
+    /// [`create_group_ex`]: Self::create_group_ex
     pub fn create_group(&self, repo: &str, guardrails: Guardrails) -> Result<GroupInfo, String> {
+        self.create_group_ex(repo, guardrails, Launch::Fresh)
+    }
+
+    /// [`create_group`](Self::create_group), told which kind of start this is.
+    ///
+    /// The distinction only matters for the advanced orchestrator (#222), and it
+    /// matters a lot: **a resumed group runs the roster it was launched with.**
+    /// See [`Launch`].
+    #[doc(hidden)] // pub for integration tests (the resume pin is asserted on this)
+    pub fn create_group_ex(
+        &self,
+        repo: &str,
+        guardrails: Guardrails,
+        launch: Launch,
+    ) -> Result<GroupInfo, String> {
         let mut guardrails = guardrails.clamped();
         // Base id is repo-derived so a relaunch resumes the same state dir —
         // but a repo can host several *concurrent* orchestrations, and those
@@ -4343,11 +4427,21 @@ impl OrchRegistry {
         let resumed = dir.join("group.json").is_file();
 
         // The repo's declared roster (#222), read ONLY when the human turned the
-        // advanced orchestrator on for this launch. With the toggle off — the
-        // default — the file is not even opened: this is the whole promise that
-        // the default experience is byte-for-byte what it was before #222, and
-        // the cheapest way to keep that promise is to not have a code path.
-        if guardrails.advanced_orchestrator {
+        // advanced orchestrator on **and this is a fresh launch**.
+        //
+        // With the toggle off — the default — the file is not even opened: this is
+        // the whole promise that the default experience is byte-for-byte what it
+        // was before #222, and the cheapest way to keep that promise is to not have
+        // a code path.
+        //
+        // On a RESUME the file is not read for the roster either, and that is a
+        // consent rule, not an optimization (rev-11 F2). The roster in `group.json`
+        // is the one the human was shown in the launcher preview and approved. A
+        // `git pull` between launch and resume must not be able to swap a delegate's
+        // persona under a session they already consented to — the consent moment is
+        // the launch, so the launch is what the roster is pinned to. Drift is
+        // *audited* below, not applied; to run a changed workflow, launch a group.
+        if guardrails.advanced_orchestrator && launch == Launch::Fresh {
             // Three outcomes, and only the first changes anything:
             //   - a valid `.loomux/workflow.yml` → its blocks ARE the roster;
             //   - no file → the launcher's 4-block roster stands (turning the
@@ -4381,6 +4475,12 @@ impl OrchRegistry {
                     }));
                 }
             }
+        } else if guardrails.advanced_orchestrator {
+            // A resume. The persisted roster stands — but if the file has moved on
+            // since the launch, the human should be able to SEE that the group they
+            // are looking at is not what their repo now says. Silence here would
+            // make the pin indistinguishable from a stale read.
+            self.audit_workflow_drift(&id, repo, &guardrails);
         } else if workflow::workflow_file_exists(repo) {
             // The repo declares a workflow and this group is deliberately not
             // running it. Say so in the trail: "my workflow file did nothing" is
@@ -6657,7 +6757,10 @@ impl OrchRegistry {
         if b.is_builtin() && !b.has_persona() && !multi_reviewer {
             return String::new();
         }
-        let persona_note = if b.has_persona() {
+        // `persona_allowed` for the same reason the preview asks it: an orchestrator
+        // block's persona is denied at spawn, so "adopt it" would point at
+        // instructions that never arrive.
+        let persona_note = if b.has_persona() && workflow::persona_allowed(b) {
             " Your **persona** comes from that file too: it reached you through your CLI's own \
              custom-agent flag, or — on a CLI that has no inline one — as an addendum in your \
              kickoff prompt. Adopt it."
@@ -6690,10 +6793,19 @@ impl OrchRegistry {
                 &[
                     ("WORKFLOW_PATH", workflow::WORKFLOW_PATH),
                     ("BLOCK_ID", &b.id),
-                    ("BLOCK_NAME", &b.name),
                     ("BLOCK_KIND", b.kind.as_str()),
                     ("PERSONA_NOTE", persona_note),
                     ("LANE_NOTE", &lane_note),
+                    // LAST, and this is the same discipline the caller applies to
+                    // `{{BLOCK_NOTE}}` itself: `render_template` walks its list in
+                    // order, so the only var whose value is repo-authored goes in
+                    // when there are no passes left to rescan it. A block named
+                    // `{{LANE_NOTE}}` is inert text, not a second lane note spliced
+                    // into the middle of a sentence (rev-11 F3). `sanitize_display`
+                    // strips braces as well, so this is belt AND braces — the order
+                    // is what protects the template, the sanitizer what protects any
+                    // future template that puts a name somewhere else.
+                    ("BLOCK_NAME", &b.name),
                 ],
             )
             .trim_end()
@@ -7091,7 +7203,7 @@ impl OrchRegistry {
         // block's instruction file are resolved through, so a `mode: replace`
         // orchestrator persona cannot rewrite `orchestrator.md` either. See
         // `parse_workflow` for why the trust root is not a customization surface.
-        if block.kind == Role::Orchestrator && (block.has_persona() || !block.allow.is_empty()) {
+        if !workflow::persona_allowed(block) && (block.has_persona() || !block.allow.is_empty()) {
             self.audit(&group.id, "loomux", "workflow-orchestrator-persona-denied", json!({
                 "block": block.id,
                 "prompt": block.prompt.is_some(),
@@ -9051,7 +9163,22 @@ pub fn orch_workflow_preview(repo: String, agent_cli: String) -> Value {
             "model": workflow::model_of(b, &agent_cli),
             // What the human is really being asked to consent to: whether this
             // block carries repo-authored instructions for the agent.
-            "persona": if b.profile.is_some() { "profile" } else if b.prompt.is_some() { "prompt" } else { "none" },
+            //
+            // Asked through the same predicate the SPAWN asks (rev-11's nit): an
+            // orchestrator block's persona is denied at `resolve_persona`, so
+            // reporting one here would advertise instructions that will never
+            // reach an agent. Unreachable from a parsed workflow file, which
+            // rejects it outright — but a preview must not be able to claim what a
+            // launch would drop, whatever produced the block.
+            "persona": if !workflow::persona_allowed(b) {
+                "none"
+            } else if b.profile.is_some() {
+                "profile"
+            } else if b.prompt.is_some() {
+                "prompt"
+            } else {
+                "none"
+            },
         })).collect::<Vec<_>>(),
     })
 }
@@ -9294,7 +9421,11 @@ pub fn create_orchestration_group(
         return Err(format!("repository path does not exist: {repo}"));
     }
     let _creation = reg.creation.lock_safe();
-    let group = reg.create_group(repo, guardrails)?;
+    // A resume reopens a recorded orchestrator session; anything else is the human
+    // at the launcher, who has just been shown what the advanced orchestrator would
+    // run. Only the latter reads the repo's workflow file (#222) — see [`Launch`].
+    let launch = if resume_session.is_some() { Launch::Resume } else { Launch::Fresh };
+    let group = reg.create_group_ex(repo, guardrails, launch)?;
     if let Some(want) = expect_group {
         if group.id != want {
             return Err(format!(

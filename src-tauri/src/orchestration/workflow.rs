@@ -314,7 +314,18 @@ pub fn sanitize_condition(s: &str) -> Option<String> {
 /// characters (a pasted name must not smuggle escape codes into a pane title)
 /// and cap the length. Mirrors `sanitize_agent_name`.
 pub fn sanitize_display(s: &str) -> String {
-    s.trim().chars().filter(|c| !c.is_control()).take(40).collect()
+    // Braces go too (rev-11 F3). A display string is repo-authored text that gets
+    // substituted INTO a `{{KEY}}` template — the block note, the orchestrator's
+    // roster rows — and `render_template` is a dumb ordered replace with no idea
+    // which text is template and which is data. Substitution order alone is not
+    // enough to make that safe: it protects a name against the passes that come
+    // *after* it, not against a template whose own later keys it can name. Nobody
+    // needs a brace in a pane title, so the character never gets that far.
+    s.trim()
+        .chars()
+        .filter(|c| !c.is_control() && *c != '{' && *c != '}')
+        .take(40)
+        .collect()
 }
 
 /// Persona text ends up inside a **single-quoted** shell token (the `--agents`
@@ -833,6 +844,21 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
 /// workflow" from "it has one and it is broken".
 pub fn workflow_file_exists(repo: &str) -> bool {
     Path::new(repo).join(WORKFLOW_PATH).is_file()
+}
+
+/// Whether a block may carry a persona at all.
+///
+/// The orchestrator block is loomux-owned: a repo may pin its `cli`/`model`, never
+/// author its persona or pre-approve its tools. `parse_workflow` rejects that
+/// outright, and [`OrchRegistry::resolve_persona`](super::OrchRegistry::resolve_persona)
+/// drops one that arrives from a hand-edited `group.json` — so the *only* honest
+/// answer about an orchestrator block's persona is "there isn't one".
+///
+/// Anything that merely *reports* on a block therefore has to ask this too, or it
+/// advertises a persona the spawn will deny (rev-11's preview nit). One predicate,
+/// so the report and the spawn cannot disagree.
+pub fn persona_allowed(block: &Block) -> bool {
+    block.kind != Role::Orchestrator
 }
 
 /// Whether a roster carries anything a workflow file put there — a block outside
