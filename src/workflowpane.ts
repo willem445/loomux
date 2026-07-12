@@ -127,7 +127,16 @@ export function rewriteImpact(
   // tab is writing THEIR text — they can see exactly what they are saving, and warning them
   // about their own keystrokes would be absurd.
   const reformats = isCanonical(next) && !isCanonical(disk);
-  if (!droppedComments && !reformats) return null;
+
+  // REFORMATTING IS THE WHOLE TRIGGER (rev-15 F7). Warning on dropped comments *alone* looked
+  // like belt-and-braces and was in fact the one case the docblock above says must never fire:
+  // a form or canvas save always sets `reformats` (a commented file is never canonical, and the
+  // model always emits canonical text), so the comments-only branch is reachable ONLY from text
+  // the human typed into the YAML tab themselves — i.e. it fired exactly when they had just
+  // deleted a comment on purpose, to tell them they were about to delete a comment. A dialog
+  // that explains your own keystroke back to you is how a guard becomes noise, and noise is how
+  // the guard that matters gets clicked through.
+  if (!reformats) return null;
   return { droppedComments, reformats };
 }
 

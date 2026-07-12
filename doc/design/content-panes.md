@@ -555,7 +555,14 @@ Three things follow, and the order matters:
    that fires when nothing is at stake is a confirm people click through, and then they click
    through the one that mattered.
 3. **The YAML tab is unaffected**: it saves exactly what you typed, comments and all. The
-   rewrite is a property of *re-serializing from the model*, not of saving.
+   rewrite is a property of *re-serializing from the model*, not of saving — so the guard keys on
+   the **reformat**, never on the comment count alone. That distinction is not fussiness: a form
+   or canvas save *always* reformats (a commented file is never canonical, and the model always
+   emits canonical text), so a comments-only warning could only ever fire on text the human typed
+   themselves — i.e. it would fire exactly when they had just deleted a comment on purpose, to
+   tell them they were about to delete a comment. A dialog that explains your own keystroke back
+   to you is how a guard becomes noise, and noise is how the guard that matters gets clicked
+   through.
 
 **The test used to claim the opposite, and could not fail.** It asserted that a save "does not
 churn the file" while comparing the canonical form against *itself* — never against the bytes on

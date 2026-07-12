@@ -127,21 +127,44 @@ test("creating a file destroys nothing, so it never asks", () => {
 
 test("editing the YAML tab by hand is never a 'rewrite' — you can see what you're saving", () => {
   // The human typed it. Warning them that their own keystrokes will change the file would be
-  // absurd, and it is the case that would have made this dialog noise instead of a guard.
-  const commented = "# keep me\nversion: 1\nblocks:\n  - id: w\n    kind: worker\n    cli: claude\n";
-  const handEdited = commented.replace("id: w", "id: worker");
-  assert.equal(rewriteImpact(commented, handEdited, canon), null, "their comments survive; nothing is lost");
+  // absurd — and DELETING A COMMENT is the sharpest version of that, because it is exactly what
+  // the `droppedComments` signal would otherwise trip on. They selected the line and pressed
+  // Delete; a dialog explaining that the line is about to be deleted is not a guard, it is a
+  // dialog explaining your own keystroke back to you.
+  const commented =
+    "# the roster, and why\nversion: 1\nblocks:\n  - id: w\n    kind: worker\n    cli: claude\n";
+  const commentDeleted = commented.replace("# the roster, and why\n", "");
+  assert.equal(
+    rewriteImpact(commented, commentDeleted, canon),
+    null,
+    "they deleted the comment themselves — there is nothing to tell them"
+  );
+
+  // …and the same for a hand edit that keeps the comments.
+  const renamed = commented.replace("id: w", "id: worker");
+  assert.equal(rewriteImpact(commented, renamed, canon), null, "their comments survive; nothing is lost");
 });
 
-test("a rewrite that drops comments warns even where the shape is otherwise unchanged", () => {
-  // Belt and braces: the two halves of "material difference" are independent, and either one on
-  // its own is worth a word.
+test("the guard fires on the REWRITE, not on the comment count (rev-15 F7)", () => {
+  // `droppedComments` describes the loss; it does not decide whether to warn. A form or canvas
+  // save ALWAYS reformats — a commented file is never canonical, and the model always emits
+  // canonical text — so a comments-only impact can only ever come from text the human typed
+  // themselves, which is precisely the case that must stay silent. Warning on it looked like
+  // belt-and-braces and was in fact noise, and noise is how the guard that MATTERS gets clicked
+  // through.
   const withComments = "version: 1\n# a note the human wrote\nblocks: []\n";
   const stripped = "version: 1\nblocks: []\n";
-  const impact = rewriteImpact(withComments, stripped, () => false); // neither side canonical
-  assert.ok(impact);
-  assert.equal(impact.droppedComments, 1);
-  assert.equal(impact.reformats, false, "no reformat — but a comment is still gone");
+  assert.equal(
+    rewriteImpact(withComments, stripped, () => false), // neither side canonical → a hand edit
+    null,
+    "comments dropped, nothing reformatted — so this is the human's own edit, and it is silent"
+  );
+
+  // The case that DOES warn is unchanged: canonical text written over a non-canonical file.
+  const impact = rewriteImpact(withComments, stripped, (t) => t === stripped);
+  assert.ok(impact, "a canonical write over a commented file still warns");
+  assert.equal(impact.reformats, true);
+  assert.equal(impact.droppedComments, 1, "…and still says what it costs");
 });
 
 // ---------- F5: a drag cannot write a deletion the human hasn't made ----------
