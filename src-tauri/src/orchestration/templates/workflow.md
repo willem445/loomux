@@ -24,11 +24,34 @@ and loop until every reviewer is satisfied. Pace them against the live-delegate 
 ({{MAX_AGENTS}}) if you must, but do not quietly drop a reviewer because the queue is busy —
 a review that never ran is the failure this feature exists to prevent.
 
-**Gates are enforced, not advice.** A `gates:` entry in the workflow file is a hard
+**Gates are enforced, not advice.** A `gates.merge` entry in the workflow file is a hard
 precondition on merging, held by the same loomux interceptor that enforces **The merge gate**
-below — not by your good intentions. Satisfy a gate (run every reviewer it names; let each
-record its outcome) rather than routing around it, and never treat a busy queue as a reason to
-merge past one.
+below — not by your good intentions. `gh pr merge` is **refused** until every reviewer block
+the gate names has recorded a `pass` with `review_verdict(...)` (a `threshold: N` gate needs N
+of them). A `fail` or `escalate` from **any** named reviewer refuses the merge whatever the
+others recorded — first-to-approve never wins. Read the state with **`list_verdicts(pr)`**: it
+is what the interceptor reads, and it tells you whether a merge is possible before you attempt
+one. A reviewer's `[loomux] … recorded verdict …` message in your pane is a courtesy copy;
+`list_verdicts` is the truth.
+
+Three things follow, and each of them bites if you learn it the hard way:
+
+- **Nothing opens this gate but the verdicts.** Not an autonomous auto-merge, not supervised
+  dangerous mode, not a one-time human grant. They all sit *below* it. If you see the refusal,
+  that is the system working: read `list_verdicts`, chase the outstanding reviewer or get the
+  blocking finding fixed, and report to the human — do not look for a way around it.
+- **It applies to every merge of the PR, not just the default branch.** The reviewers reviewed
+  *that PR*; where it lands doesn't change whether they finished. (The *human* merge gate below
+  is still default-branch-only — the two are separate.)
+- **A verdict is bound to the commit it reviewed.** If anything is pushed to the PR branch after
+  a reviewer passed — even a lint fix — that pass goes **stale**, the gate reopens, and the merge
+  is refused until that reviewer reviews the new head and records again. So do not send a worker
+  back for "just one tidy-up" on an approved PR and expect to merge it: send the reviewer back
+  too. `list_verdicts` shows you which verdicts have gone stale.
+
+An `also:` condition (e.g. `ci-green`) is checked at merge time as well; one this loomux build
+cannot check refuses the merge until a human fixes the file. Satisfy a gate rather than routing
+around it, and never treat a busy queue as a reason to merge past one.
 
 **Edges are advisory.** The file's `edges:` are the declared happy path — the shape the repo's
 author had in mind. They are **not a schedule**, and loomux does not walk them. Every

@@ -88,7 +88,7 @@
 //! nudge never churns the semantic diff.
 
 use super::{default_model, Role, SUPPORTED_CLIS};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 
@@ -193,10 +193,9 @@ pub enum GateRequire {
 }
 
 /// A declared gate (today: only `merge`). **Parsed and validated here; enforced
-/// in the `gh` shim** — that work (plus the `review_verdict` tool that records
-/// the reviewer-attributed state a gate keys off) is sub-PR 3 of #222. Parsing
-/// it now means the file format is settled and a workflow authored today keeps
-/// working when the enforcement lands.
+/// in the `gh` shim** — see [`evaluate_merge_gate`] for the decision and
+/// [`gate_file_text`] for the spec file the shim reads. The reviewer-attributed
+/// state it keys off is written by the `review_verdict` MCP tool ([`Verdict`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Gate {
     pub require: GateRequire,
@@ -204,7 +203,10 @@ pub struct Gate {
     /// exist and to be `kind: reviewer` — a gate naming a worker would be
     /// unsatisfiable.
     pub reviewers: Vec<BlockId>,
-    /// Extra named conditions (e.g. `ci-green`). Opaque to this parser.
+    /// Extra named conditions (e.g. `ci-green`). Sanitized at parse
+    /// ([`sanitize_condition`]); a condition this build cannot check **fails
+    /// closed** in the shim rather than silently passing — see
+    /// [`KNOWN_CONDITIONS`].
     pub also: Vec<String>,
 }
 
@@ -908,4 +910,422 @@ pub fn cli_of<'a>(block: &'a Block, agent_cli: &'a str) -> &'a str {
     } else {
         &block.cli
     }
+}
+
+// ── verdicts: the state a gate reads (#222 / #197) ──────────────────────────
+//
+// Before this, a review outcome was a *notification*: `report("done", "approved
+// — looks good")`, untyped text typed into the orchestrator's pane. That is
+// exactly how PR #151 merged on the first "approve" that arrived while a second,
+// dedicated review was still running — and that second review was the one that
+// found a real release-gate bypass (#196). #197 asks for the outcome to be
+// **state**: durable, attributed to the reviewer that recorded it, and readable
+// by something that can refuse a merge.
+
+/// A recorded review outcome. **Deliberately not a boolean.** Dify's Human Input
+/// node and Windmill's `resume[...]` both give each decision its own outgoing
+/// edge and keep the approver's typed input readable downstream; the investigation
+/// (§2d) says to model ours the same way. So a reviewer can say "this needs a
+/// human", which is neither an approval nor a defect report — and the gate can
+/// treat it as the blocker it is instead of forcing it into a pass/fail bit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Verdict {
+    /// Reviewed; no blocking findings. The only verdict that satisfies a gate.
+    Pass,
+    /// Reviewed; blocking findings. Refuses the merge.
+    Fail,
+    /// Not a defect call — the reviewer is handing the decision to a human
+    /// (out of its depth, an ambiguous requirement, a risk it won't sign off on).
+    /// Refuses the merge, exactly like `fail`: a gate must never be satisfiable
+    /// by a reviewer that declined to decide.
+    Escalate,
+}
+
+impl Verdict {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Verdict::Pass => "pass",
+            Verdict::Fail => "fail",
+            Verdict::Escalate => "escalate",
+        }
+    }
+
+    /// Parse a verdict word. `None` for anything unrecognized — never coerced,
+    /// and never defaulted to `pass`: a verdict loomux cannot read must not be
+    /// able to open a gate.
+    ///
+    /// **Lowercase-strict, and that is a decision, not an oversight.** This is one
+    /// half of a gate; the other half is the shim's `case "$v" in pass)`, which is
+    /// a shell `case` and is case-sensitive. If this half lowercased, a
+    /// hand-edited `PASS` in a verdict file would read as *satisfied* to the
+    /// orchestrator (`list_verdicts`, `gate_status_line`) while the shim refused
+    /// the merge — two halves of the same gate disagreeing about what a verdict
+    /// *is*. One token definition, both sides, and the odd casing fails closed on
+    /// both. Whitespace is trimmed because a trailing newline is file format, not
+    /// content.
+    pub fn parse(s: &str) -> Option<Verdict> {
+        match s.trim() {
+            "pass" => Some(Verdict::Pass),
+            "fail" => Some(Verdict::Fail),
+            "escalate" => Some(Verdict::Escalate),
+            _ => None,
+        }
+    }
+
+    /// Whether this verdict refuses a merge on its own. `fail` and `escalate`
+    /// both do: **blockers beat approvals** (#197 Scope A.3) — with more than one
+    /// reviewer, a disagreement resolves to "do not merge", and first-to-approve
+    /// never wins.
+    pub fn is_blocking(self) -> bool {
+        !matches!(self, Verdict::Pass)
+    }
+}
+
+/// The verdict words a reviewer may record, for error messages.
+pub fn verdict_names() -> String {
+    "pass, fail, escalate".to_string()
+}
+
+/// Longest verdict summary kept. The summary is durable state and is read back
+/// into a gate refusal / the orchestrator's pane, not a transcript — a couple of
+/// paragraphs is the useful range, and an unbounded one is a file-size footgun.
+pub const MAX_SUMMARY_CHARS: usize = 4000;
+
+/// A reviewer's summary is free prose that lands in a file loomux reads back and
+/// re-renders. Drop control characters (they would ride into a terminal) but keep
+/// newlines and tabs so the prose survives, and cap the length.
+pub fn sanitize_summary(s: &str) -> String {
+    s.trim()
+        .chars()
+        .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
+        .take(MAX_SUMMARY_CHARS)
+        .collect()
+}
+
+/// One durable, **reviewer-attributed** verdict: which block recorded it, which
+/// agent instance that was, **which revision it reviewed**, when, and why. The
+/// attribution is the point — #197's second requirement is that "the specific
+/// dispatched reviewer's recorded verdict is the gate, not the first approve that
+/// arrives from any agent".
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ReviewVerdict {
+    pub pr: u64,
+    /// The reviewer **block** id (`rev-security`) — the identity a gate names.
+    pub block: BlockId,
+    /// The agent instance that recorded it (`rev-4`). Two spawns of the same
+    /// block are the same gate slot; this says which one actually spoke.
+    pub agent_id: String,
+    pub verdict: Verdict,
+    /// **The PR head commit this verdict reviewed** (`headRefOid`), captured when
+    /// it was recorded.
+    ///
+    /// A verdict binds to a *revision*, not to a PR number. Without this a `pass`
+    /// survives a re-push: two reviewers approve #7, the worker pushes "fixed
+    /// lint" and "one more edge case", and the gate still reads green over commits
+    /// nobody reviewed — #197's failure class exactly, and the reason GitHub's own
+    /// review model dismisses stale approvals on new commits. The gate compares
+    /// this against the PR's current head and treats a mismatch as **outstanding**.
+    ///
+    /// Empty when loomux could not resolve the head at record time (no gh, no
+    /// network, a repo gh can't see). That is *not* treated as "unbound, therefore
+    /// fine" — an empty head can never equal a real one, so it reads as stale and
+    /// the reviewer must re-record. Fail closed, like everything else here.
+    pub head: String,
+    pub summary: String,
+    pub ts_ms: u64,
+}
+
+impl ReviewVerdict {
+    /// Whether this verdict reviewed the PR's current head. A blocking verdict is
+    /// *revision-independent* — a `fail` recorded against an older commit still
+    /// refuses the merge until the reviewer re-records, because "this PR has a
+    /// defect" does not stop being true when the author pushes more code.
+    pub fn reviewed(&self, head: &str) -> bool {
+        !self.head.is_empty() && self.head == head
+    }
+}
+
+/// Group-dir subdirectory holding recorded verdicts, one file per reviewer block:
+/// `verdicts/pr-<N>/<block-id>`.
+///
+/// **Why a file tree and not JSON:** the enforcement point is the `gh` PATH shim
+/// — a POSIX shell script with no `jq` — and the existing gate state it reads
+/// (`autonomous`, `auto_merge`, `merge_grants/pr-<N>`) is already exactly this:
+/// small files whose presence and first line say everything. A verdict file's
+/// first line is the verdict word, so the shim's read is `head -n1`. Keeping the
+/// durable record and the enforcement input as *one* artifact means they cannot
+/// drift.
+pub const VERDICTS_DIR: &str = "verdicts";
+
+/// A commit id is compared against gh's `headRefOid` inside a shell `case`, so
+/// keep it to what a git object id can actually be. Anything else stores as empty,
+/// which reads as **stale** — never as "unbound, therefore fine".
+pub fn sanitize_sha(s: &str) -> String {
+    let s = s.trim();
+    if !s.is_empty() && s.len() <= 64 && s.chars().all(|c| c.is_ascii_hexdigit()) {
+        s.to_ascii_lowercase()
+    } else {
+        String::new()
+    }
+}
+
+/// Serialize a verdict record for `verdicts/pr-<N>/<block>`. Line-oriented, with
+/// the verdict word FIRST (the shim reads it with `head -n1`) and the reviewed
+/// head SECOND; the summary runs to EOF, being the only field that may contain
+/// newlines.
+pub fn verdict_file_text(v: &ReviewVerdict) -> String {
+    format!(
+        "{}\n{}\n{}\n{}\n{}\n",
+        v.verdict.as_str(),
+        sanitize_sha(&v.head),
+        v.ts_ms,
+        v.agent_id,
+        sanitize_summary(&v.summary)
+    )
+}
+
+/// Read a verdict file back. `None` for anything that isn't a verdict this build
+/// understands — an unparseable file is *not* a pass (see [`Verdict::parse`]).
+/// `pr`/`block` come from the path, which is loomux-generated.
+pub fn parse_verdict_file(pr: u64, block: &str, text: &str) -> Option<ReviewVerdict> {
+    let mut lines = text.lines();
+    let verdict = Verdict::parse(lines.next()?)?;
+    let head = sanitize_sha(lines.next().unwrap_or(""));
+    let ts_ms = lines.next().and_then(|l| l.trim().parse().ok()).unwrap_or(0);
+    let agent_id = lines.next().unwrap_or("").trim().to_string();
+    let summary = lines.collect::<Vec<_>>().join("\n");
+    Some(ReviewVerdict {
+        pr,
+        block: sanitize_id(block)?,
+        agent_id,
+        verdict,
+        head,
+        summary: sanitize_summary(&summary),
+        ts_ms,
+    })
+}
+
+// ── the merge gate: the decision, and the spec file the shim reads ──────────
+
+/// Gate conditions this build knows how to check (`gates.merge.also`).
+///
+/// The list is short on purpose, and the rule for everything *not* on it is the
+/// important half: a condition loomux cannot check **refuses the merge** rather
+/// than passing it. A gate is a safety claim; silently ignoring a clause of it
+/// would turn a stricter-looking workflow file into a weaker one, which is the
+/// worst failure mode a gate can have.
+pub const KNOWN_CONDITIONS: [&str; 1] = ["ci-green"];
+
+/// Whether the shim can evaluate this `also:` condition. See [`KNOWN_CONDITIONS`].
+pub fn condition_supported(c: &str) -> bool {
+    KNOWN_CONDITIONS.contains(&c.trim())
+}
+
+/// Why a merge gate is (not) satisfied — the pure spec the shim's shell mirrors,
+/// and what the `review_verdict` tool reports back to the reviewer that just voted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GateOutcome {
+    /// Every requirement met: the merge may proceed to the *other* gates (the
+    /// human grant / autonomous markers) — this one never opens a merge by itself.
+    Satisfied,
+    /// At least one named reviewer recorded `fail`/`escalate`. Blockers beat
+    /// approvals: this refuses the merge whatever the others recorded, and
+    /// whatever the threshold is.
+    Blocked { blocking: Vec<BlockId> },
+    /// Not enough live PASS verdicts yet.
+    ///
+    /// - `outstanding` — named reviewers with **no verdict recorded at all**. The
+    ///   #151 case: a merge landing while a dispatched review is still running.
+    /// - `stale` — named reviewers whose `pass` was recorded against an **earlier
+    ///   revision** of the PR (or against none at all). The branch moved under
+    ///   them; what they approved is not what would merge.
+    Short { passes: u32, need: u32, outstanding: Vec<BlockId>, stale: Vec<BlockId> },
+    /// loomux could not resolve the PR's current head, so it cannot tell whether
+    /// any recorded verdict reviewed the code that would merge. Refuses — the same
+    /// fail-safe the human gate takes on an undeterminable base.
+    UnknownRevision,
+}
+
+impl GateOutcome {
+    pub fn satisfied(&self) -> bool {
+        matches!(self, GateOutcome::Satisfied)
+    }
+}
+
+/// How many PASS verdicts this gate needs: every named reviewer (`all-pass`) or
+/// `threshold: N`.
+pub fn gate_need(gate: &Gate) -> u32 {
+    match gate.require {
+        GateRequire::AllPass => gate.reviewers.len() as u32,
+        GateRequire::Threshold(n) => n,
+    }
+}
+
+/// **The gate decision** (reviewer half; the `also:` conditions are checked in the
+/// shim, which is the only place that can call `gh pr checks`). Pure, so the
+/// semantics are pinned by fast tests and the shell mirror has something to agree
+/// with. `head` is the PR's current head commit — `None` when loomux could not
+/// resolve it.
+///
+/// Order matters, and it is the order #197 asks for:
+///
+/// 1. **A blocking verdict refuses the merge** — before any counting, and
+///    regardless of which revision it was recorded against. One reviewer's `fail`
+///    is not outvoted by two passes, and `threshold: 2` does not mean "two yeses
+///    beat a no". (A `fail` against an older commit still stands: "this PR has a
+///    defect" does not stop being true because the author pushed more code. The
+///    reviewer clears it by re-reviewing and re-recording.)
+/// 2. **A `pass` only counts for the revision it reviewed.** A pass recorded
+///    against an earlier head is *stale*: the branch moved, and what that reviewer
+///    approved is not what would merge. It counts as outstanding, not as a pass —
+///    which is why GitHub's own review model dismisses stale approvals on new
+///    commits, and it is the #197 failure class ("merging code no reviewer saw")
+///    that a PR-keyed verdict would have left wide open.
+/// 3. Then the live PASS count must reach [`gate_need`]. Under `all-pass` that
+///    means every named reviewer has passed *this* revision — a reviewer that
+///    hasn't recorded anything keeps the gate shut, which is precisely the bug that
+///    produced #197.
+///
+/// `threshold: N` deliberately does *not* wait for the reviewers it doesn't need:
+/// an author who writes `threshold: 2` over three reviewers has said, in the file,
+/// that two passes are enough. They still cannot merge over a `fail` (rule 1), and
+/// the passes still have to be for the code that would actually merge (rule 2).
+/// `all-pass` — the default when `require:` is omitted — is the one that waits for
+/// everybody.
+pub fn evaluate_merge_gate(
+    gate: &Gate,
+    verdicts: &BTreeMap<BlockId, ReviewVerdict>,
+    head: Option<&str>,
+) -> GateOutcome {
+    let mut blocking: Vec<BlockId> = Vec::new();
+    let mut outstanding: Vec<BlockId> = Vec::new();
+    let mut stale: Vec<BlockId> = Vec::new();
+    let mut passes = 0u32;
+    // No resolvable head → no way to know whether any pass reviewed the code that
+    // would merge. Refuse, rather than fall back to "a pass is a pass" — that
+    // fallback IS the bug this binding closes.
+    let Some(head) = head else {
+        return GateOutcome::UnknownRevision;
+    };
+    for r in &gate.reviewers {
+        match verdicts.get(r) {
+            Some(v) if v.verdict.is_blocking() => blocking.push(r.clone()),
+            Some(v) if v.reviewed(head) => passes += 1,
+            Some(_) => stale.push(r.clone()),
+            None => outstanding.push(r.clone()),
+        }
+    }
+    if !blocking.is_empty() {
+        return GateOutcome::Blocked { blocking };
+    }
+    let need = gate_need(gate);
+    if passes >= need {
+        GateOutcome::Satisfied
+    } else {
+        GateOutcome::Short { passes, need, outstanding, stale }
+    }
+}
+
+/// Group-dir file holding the declared merge gate, written from the repo's
+/// `.loomux/workflow.yml` at group create/resume and read by the `gh` shim.
+/// **Absent = no gate**, which is what makes a repo with no workflow file (or one
+/// declaring no `gates.merge`) behave byte-for-byte as it did before #222.
+pub const MERGE_GATE_FILE: &str = "merge_gate";
+
+/// Serialize a gate for [`MERGE_GATE_FILE`].
+///
+/// Line-oriented `key value [value]`, because the reader is a POSIX `while read`
+/// loop with no JSON parser — the same reason the verdicts are a file tree. Every
+/// token written here is already sanitized: block ids through [`sanitize_id`] and
+/// conditions through [`sanitize_condition`], both of which *reject* (never
+/// rewrite) anything outside their alphabet at parse time. That is the contract
+/// #225 established for exactly this consumer, and it is what lets the shim word-
+/// split the line without quoting. Belt and braces anyway: a token that would not
+/// survive its sanitizer is dropped here rather than written into a shell's
+/// `for` loop.
+///
+/// **A token that fails its sanitizer poisons the file rather than vanishing from
+/// it.** The first draft silently dropped such a token — which, if the parse
+/// contract ever regressed, would have emitted a *weaker* gate than the repo
+/// declared (a reviewer or a condition just disappears, and the gate goes green
+/// one requirement short). Every other fork in this feature chooses fail-closed on
+/// exactly that question; this one now does too. [`POISON_KEY`] is a line the shim
+/// cannot parse, and an unparseable line refuses every merge until a human looks.
+pub fn gate_file_text(gate: &Gate) -> String {
+    let mut out = String::from(
+        "# loomux merge gate — generated from .loomux/workflow.yml (#222). Do not edit.\n",
+    );
+    match gate.require {
+        GateRequire::AllPass => out.push_str("require all-pass\n"),
+        GateRequire::Threshold(n) => out.push_str(&format!("require threshold {n}\n")),
+    }
+    for r in &gate.reviewers {
+        match sanitize_id(r) {
+            Some(clean) if clean == *r => out.push_str(&format!("reviewer {r}\n")),
+            _ => out.push_str(&format!("{POISON_KEY} unusable-reviewer-id\n")),
+        }
+    }
+    for c in &gate.also {
+        match sanitize_condition(c) {
+            Some(clean) if clean == *c => out.push_str(&format!("also {c}\n")),
+            _ => out.push_str(&format!("{POISON_KEY} unusable-condition\n")),
+        }
+    }
+    out
+}
+
+/// The key [`gate_file_text`] writes when a token cannot be represented safely.
+/// Nothing parses it — by design: the shim refuses any gate-file line whose key it
+/// does not recognize, so an unrepresentable gate refuses merges instead of
+/// silently becoming a laxer one. Unreachable while the parse contract holds
+/// (`parse_workflow` rejects such tokens outright); this is what happens if it
+/// ever stops holding.
+pub const POISON_KEY: &str = "unrepresentable";
+
+/// Read [`MERGE_GATE_FILE`] back into a [`Gate`] — the inverse of
+/// [`gate_file_text`], used by the registry to report gate status to the agent
+/// that just recorded a verdict (the shim does its own read, in shell).
+///
+/// `None` means **this file is not a usable gate**, which the callers must report
+/// as "malformed — every merge refused" rather than as "no gate": the file is on
+/// disk, the shim will read it, and the shim refuses on exactly the things that
+/// return `None` here. Those are a file with no reviewers (nobody could ever
+/// satisfy it) and any line whose key loomux does not recognize — a poison line
+/// ([`POISON_KEY`]), a truncation, a hand edit. The two halves agree, and both fail
+/// closed.
+pub fn parse_gate_file(text: &str) -> Option<Gate> {
+    let mut require = GateRequire::AllPass;
+    let mut reviewers: Vec<BlockId> = Vec::new();
+    let mut also: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut f = line.split_whitespace();
+        match (f.next(), f.next(), f.next()) {
+            // A threshold that doesn't parse (or is 0) leaves `require` at
+            // `all-pass` — the STRICTER of the two. A malformed gate line must
+            // never be the reason a merge gets easier.
+            (Some("require"), Some("threshold"), Some(n)) => {
+                if let Some(n) = n.parse().ok().filter(|n| *n > 0) {
+                    require = GateRequire::Threshold(n);
+                }
+            }
+            (Some("require"), Some("all-pass"), _) => require = GateRequire::AllPass,
+            (Some("reviewer"), Some(id), _) => match sanitize_id(id) {
+                Some(id) => reviewers.push(id),
+                None => return None,
+            },
+            (Some("also"), Some(c), _) => match sanitize_condition(c) {
+                Some(c) => also.push(c),
+                None => return None,
+            },
+            // Anything else — a poison line, a truncated key, a hand edit — makes
+            // the whole file unusable. Skipping it would drop a requirement.
+            _ => return None,
+        }
+    }
+    (!reviewers.is_empty()).then_some(Gate { require, reviewers, also })
 }

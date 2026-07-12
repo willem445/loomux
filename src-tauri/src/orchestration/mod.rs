@@ -19,7 +19,7 @@ pub mod workflow;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -144,6 +144,15 @@ pub fn dangerous_mode_notice(on: bool, by_autonomous: bool) -> String {
 /// an undeterminable base fails safe (block). Refusals/allows are appended to the
 /// group's `audit.jsonl` in the backend's line format. Everything else `exec`s the
 /// real gh with no extra work.
+///
+/// **Two independent gates live here (#222/#197).** The *human* gate above is one.
+/// The other is the repo's own **workflow merge gate**: when `.loomux/workflow.yml`
+/// declares `gates.merge`, loomux writes a `merge_gate` spec file into the group
+/// dir and the shim refuses the merge until the named reviewers' recorded verdicts
+/// (`verdicts/pr-<N>/<block>`, written by the `review_verdict` MCP tool) satisfy it.
+/// It is checked **first**, so no grant and no autonomous marker can open it — the
+/// `workflow::evaluate_merge_gate` spec is the pure mirror of that decision. With
+/// no `merge_gate` file the shim behaves exactly as it did before #222.
 #[doc(hidden)] // pub so the integration test can pin the security-critical guards
 pub fn gh_shim_sh(real_gh: &str) -> String {
     // Template uses a placeholder (not format!) so the shell's own `$`/`{}` stay
@@ -162,6 +171,15 @@ loomux_audit() { # $1=action $2=detail-json
 loomux_block() { # $1=reason $2=base $3=pr
   printf '%s\n' "loomux: merge to the default branch requires the human gate — enable auto-merge (autonomous mode) or have the human grant this one merge (board Approve). Open the PR and report to the human; do NOT merge." >&2
   loomux_audit "merge-gate-blocked" "{\"reason\":\"$1\",\"base\":\"$2\",\"pr\":\"$3\"}"
+  exit 1
+}
+# The WORKFLOW merge gate (#222/#197), distinct from the human gate above: this is
+# the repo's own `gates.merge` clause, and it is an ADDITIONAL necessary condition —
+# a human grant, autonomous auto-merge and supervised dangerous mode all sit BELOW
+# it and none of them can open it. $1=reason (audit) $2=human-readable detail.
+loomux_block_wf() { # $1=reason $2=detail
+  printf '%s\n' "loomux: this repo's .loomux/workflow.yml declares a merge gate on PR #$num and it is NOT satisfied — $2. The merge is refused. Reviewers record their outcome with the review_verdict MCP tool (pass | fail | escalate); a fail/escalate from ANY named reviewer refuses the merge whatever the others said. Wait for the reviews, or take it to the human — do NOT work around this." >&2
+  loomux_audit "merge-gate-workflow-blocked" "{\"reason\":\"$1\",\"pr\":\"$num\"}"
   exit 1
 }
 loomux_block_release() { # $1=tag $2=action
@@ -394,6 +412,22 @@ if [ "$is_merge" = "0" ]; then
   exec "$REAL_GH" "$@"
 fi
 
+# A MERGE WITH NO GROUP DIR IS A MERGE loomux CANNOT GATE — refuse it. Every agent
+# pane gets `LOOMUX_GROUP_DIR` and the shimmed PATH together (`agent_pane_env`), and
+# a human's own shell never has the shim on PATH at all — so reaching the shim
+# without the variable means it was unset on the way (`env -u LOOMUX_GROUP_DIR gh pr
+# merge …`), which is evasion, not a supported flow. The human gate already fails
+# closed on this shape for a default-branch merge (no markers, no grant → blocked);
+# without this, an unset variable still slipped a NON-default merge past the workflow
+# gate — with nothing in the audit, because there is no audit log to write to.
+# Symmetry is the honest fix. (This closes the cheap shape only: an agent with a
+# shell can still call the real gh by absolute path. See doc/design/workflows.md →
+# "The bypass surface, honestly".)
+if [ -z "$LOOMUX_GROUP_DIR" ]; then
+  printf '%s\n' "loomux: refusing to merge — LOOMUX_GROUP_DIR is not set, so loomux cannot check this merge against the group's gates. Run gh from your agent pane's normal environment; do NOT unset it." >&2
+  exit 1
+fi
+
 # A raw `gh api` merge has no cheaply-resolvable base ref → fail-safe block.
 if [ "$cmd" = "api" ]; then
   loomux_block "api-merge" "(api)" "?"
@@ -412,8 +446,134 @@ default=$("$REAL_GH" repo view $rf --json defaultBranchRef --jq .defaultBranchRe
 if [ -z "$base" ] || [ -z "$default" ]; then
   loomux_block "unverifiable-base" "$base" "$sel"
 fi
+
+# ── THE WORKFLOW MERGE GATE (#222, closing the loomux half of #197) ───────────
+# When the repo declares `gates.merge`, loomux writes a `merge_gate` spec file into
+# the group dir, and every reviewer's `review_verdict` lands in
+# `verdicts/pr-<N>/<block>` with the verdict word (pass|fail|escalate) as line 1.
+#
+# THREE properties, in the order they are enforced:
+#  1. It runs BEFORE the human-grant / autonomous / dangerous-mode openings below,
+#     so none of them can satisfy it. #197 Scope B asks for an auto-merge to be
+#     "structurally impossible until every required review verdict is recorded
+#     PASS"; a gate that a grant could override would not be that.
+#  2. It applies to EVERY merge of the PR, not only to the default branch. The
+#     declared reviewers reviewed *this PR*; where it lands doesn't change whether
+#     they finished. (The human gate below stays default-branch-only — unchanged.)
+#  3. No `merge_gate` file → this whole block is skipped → byte-for-byte the
+#     pre-#222 flow. Every group without a workflow file is in that case.
+if [ -f "$LOOMUX_GROUP_DIR/merge_gate" ]; then
+  gatef="$LOOMUX_GROUP_DIR/merge_gate"
+  # Without a PR number no verdict can be attributed to this merge → fail closed.
+  [ -n "$num" ] || loomux_block_wf "unresolved-pr" "loomux could not resolve the PR number, so it cannot check the recorded verdicts against it"
+  # THE REVISION THIS MERGE WOULD LAND. A verdict binds to a COMMIT, not to a PR
+  # number: without this, two reviewers pass #7, the worker pushes "fixed lint",
+  # and the gate still reads green over code nobody reviewed — #197's failure class,
+  # and the reason GitHub dismisses stale approvals on new commits. Unresolvable →
+  # refuse, the same fail-safe an undeterminable base takes.
+  cur_head=$("$REAL_GH" pr view $rf "$num" --json headRefOid --jq .headRefOid 2>/dev/null)
+  cur_head=$(printf '%s' "$cur_head" | tr '[:upper:]' '[:lower:]')
+  [ -n "$cur_head" ] || loomux_block_wf "unresolved-head" "loomux could not resolve the PR's current head commit, so it cannot tell whether the recorded verdicts reviewed the code that would merge"
+  # No globbing anywhere below: the gate file's tokens are word-split into `for`
+  # loops, and a security shim should not leave the next reader working out whether
+  # a `*` could reach a filename. (loomux never writes one — sanitize_id /
+  # sanitize_condition reject glob characters — so this is belt, not braces.)
+  set -f
+  g_req="all-pass"; g_thr=0; g_revs=""; g_also=""
+  # `|| [ -n "$g_k" ]` is load-bearing: POSIX `read` returns non-zero at EOF, so a
+  # final line with NO trailing newline would otherwise be silently DROPPED — and a
+  # dropped `reviewer`/`also` line makes the gate WEAKER, which is the one direction
+  # this design says must never happen. A truncated gate file is exactly the case
+  # the malformed-gate check below claims to handle.
+  while read -r g_k g_v g_w || [ -n "$g_k" ]; do
+    case "$g_k" in
+      \#*|'')   : ;;   # comment / blank
+      require)  g_req="$g_v"; [ -n "$g_w" ] && g_thr="$g_w" ;;
+      reviewer) [ -n "$g_v" ] && g_revs="$g_revs $g_v" ;;
+      also)     [ -n "$g_v" ] && g_also="$g_also $g_v" ;;
+      # An unrecognized key is NOT skipped. loomux writes an `unrepresentable` line
+      # when it cannot safely serialize a token (rather than dropping the clause),
+      # and a hand edit or a truncation lands here too. Skipping any of them would
+      # silently drop a requirement from a gate.
+      *) loomux_block_wf "malformed-gate" "the merge gate file contains a line loomux cannot parse ('$g_k') — a gate it cannot read in full is not a gate it will enforce in part. Fix .loomux/workflow.yml and relaunch the group" ;;
+    esac
+  done < "$gatef"
+  # A gate naming nobody, or a threshold with no usable number, is a MALFORMED gate
+  # — refuse rather than wave it through. (loomux only ever writes well-formed gate
+  # files; this is the hand-edited/truncated case.)
+  [ -n "$g_revs" ] || loomux_block_wf "malformed-gate" "the declared merge gate names no reviewers"
+  # The gate's RULE, validated up front. An unrecognized `require` is refused, not
+  # quietly read as all-pass: `all-pass` happens to be the strict one today, so the
+  # silent fallback looked safe — but it means the shim would enforce a rule the file
+  # does not state, and the Rust half already calls this file MALFORMED. Two halves of
+  # one gate must agree about what it says, not merely land on the same answer by luck.
+  case "$g_req" in
+    all-pass) : ;;
+    threshold) case "$g_thr" in ''|*[!0-9]*) g_thr=0 ;; esac
+               [ "$g_thr" -ge 1 ] || loomux_block_wf "malformed-gate" "the declared merge gate says require: threshold but carries no usable threshold number" ;;
+    *) loomux_block_wf "malformed-gate" "the merge gate declares an unrecognized require value ('$g_req') — loomux understands 'all-pass' and 'threshold'. A rule it cannot read is not a rule it will guess at" ;;
+  esac
+  g_pass=0; g_out=""; g_bad=""; g_stale=""
+  for g_r in $g_revs; do
+    g_vf="$LOOMUX_GROUP_DIR/verdicts/pr-$num/$g_r"
+    g_v=""; g_vh=""
+    if [ -f "$g_vf" ]; then
+      g_v=$(head -n1 "$g_vf" 2>/dev/null)                  # line 1: the verdict word
+      g_vh=$(head -n2 "$g_vf" 2>/dev/null | tail -n1)      # line 2: the head it reviewed
+    fi
+    case "$g_v" in
+      # A pass counts ONLY for the revision it reviewed. Recorded against an older
+      # head (or against none) → stale: the branch moved, and what that reviewer
+      # approved is not what would merge.
+      pass)          if [ "$g_vh" = "$cur_head" ]; then g_pass=$((g_pass+1)); else g_stale="$g_stale $g_r"; fi ;;
+      # A blocking verdict is revision-INDEPENDENT: "this PR has a defect" does not
+      # stop being true because the author pushed more code. Re-review clears it.
+      fail|escalate) g_bad="$g_bad $g_r" ;;
+      # No verdict recorded — or one this build cannot read (a hand-edited `PASS`,
+      # say), which is NOT a pass. The Rust `Verdict::parse` is lowercase-strict for
+      # exactly this reason: one token definition, and both halves fail closed on it.
+      *)             g_out="$g_out $g_r" ;;
+    esac
+  done
+  # Blockers beat approvals (#197 A.3): one fail/escalate refuses the merge whatever
+  # the others recorded and whatever the threshold says. Checked before any counting.
+  [ -z "$g_bad" ] || loomux_block_wf "verdict-blocks" "reviewer(s)$g_bad recorded a fail/escalate verdict"
+  # Say only what is TRUE: a gate held up purely by stale verdicts must not also claim
+  # it is waiting on a verdict from nobody, and vice versa. A refusal message is the
+  # only thing the agent reading it has to act on.
+  g_why=""
+  [ -n "$g_out" ] && g_why="no verdict yet from reviewer(s)$g_out"
+  if [ -n "$g_stale" ]; then
+    [ -n "$g_why" ] && g_why="$g_why; "
+    g_why="${g_why}reviewer(s)$g_stale passed an EARLIER revision and must re-review"
+  fi
+  case "$g_req" in
+    threshold)
+      [ "$g_pass" -ge "$g_thr" ] || loomux_block_wf "below-threshold" "only $g_pass of the required $g_thr PASS verdicts cover the PR's current head $cur_head — $g_why" ;;
+    *)
+      # all-pass — THE #151 CASE: a reviewer that has not recorded anything (or whose
+      # pass predates the code that would merge) keeps the gate shut, however loudly
+      # the others approved.
+      [ -z "$g_why" ] || loomux_block_wf "verdict-outstanding" "the PR is now at $cur_head — $g_why" ;;
+  esac
+  # `also:` conditions. ci-green is checked against the real gh; anything this build
+  # does not know how to check FAILS CLOSED — a clause loomux silently ignored would
+  # make a stricter-looking workflow file a weaker one, the worst thing a gate can do.
+  for g_c in $g_also; do
+    case "$g_c" in
+      ci-green)
+        if ! "$REAL_GH" pr checks $rf "$num" >/dev/null 2>&1; then
+          loomux_block_wf "ci-not-green" "the gate requires ci-green and 'gh pr checks $num' is not all-green (failing, still running, or no checks reported)"
+        fi ;;
+      *) loomux_block_wf "unknown-condition" "the gate names the condition '$g_c', which this loomux build does not know how to check — an unknown condition fails closed. Remove it from gates.merge.also, or upgrade loomux" ;;
+    esac
+  done
+  set +f
+  loomux_audit "merge-gate-workflow-ok" "{\"pr\":\"$num\",\"require\":\"$g_req\",\"passes\":$g_pass,\"head\":\"$cur_head\"}"
+fi
+
 if [ "$base" != "$default" ]; then
-  exec "$REAL_GH" "$@"   # integration-branch merge — untouched
+  exec "$REAL_GH" "$@"   # integration-branch merge — untouched by the HUMAN gate
 fi
 # base == default: blanket-allowed while autonomous + auto_merge.
 if [ -n "$LOOMUX_GROUP_DIR" ] && [ -f "$LOOMUX_GROUP_DIR/autonomous" ] && [ -f "$LOOMUX_GROUP_DIR/auto_merge" ]; then
@@ -1041,9 +1201,22 @@ channel; keep the human oriented with short summaries."
             "{common}\n- Deliverable: a branch → commit → PR with the project's tests green. \
              Add tests that would fail if the feature regressed."
         ),
+        // The verdict tool belongs in the CORE, not only in `reviewer.md` (#222/#197):
+        // a merge gate names *custom* reviewer blocks, and a custom block with a
+        // `mode: replace` persona never sees the built-in reviewer template — this
+        // core is its whole loomux contract. A reviewer that didn't know to record a
+        // verdict would hold the gate shut forever and nobody would know why.
         Role::Reviewer => format!(
             "{common}\n- You review PRs via `gh` (checking out the PR branch locally is fine); \
-             you do NOT create branches or push. Report findings via `report`/`message_orchestrator`."
+             you do NOT create branches or push. Report findings via `report`/`message_orchestrator`.\n\
+             - Record your review outcome with `review_verdict(pr, verdict, summary)` — verdict: \
+             pass | fail | escalate. It is durable, attributed STATE (not a notification): when the \
+             repo's workflow declares a merge gate, loomux refuses `gh pr merge` until every reviewer \
+             it names has recorded a `pass`. `fail` and `escalate` each refuse the merge, and one \
+             blocking verdict beats any number of passes — so never record `pass` to be agreeable or \
+             to unblock a queue, and record nothing until you have actually finished reviewing. Your \
+             verdict is bound to the commit you reviewed: if the author pushes more commits your pass \
+             goes stale and the gate reopens until you review the new head and record again."
         ),
         Role::Planner => format!(
             "{common}\n- You explore the codebase READ-ONLY and write an implementation plan as a \
@@ -2559,6 +2732,11 @@ pub struct OrchRegistry {
     /// orchestrator is registered — without this, two concurrent launches
     /// on one repo would share an id.
     creation: Mutex<()>,
+    /// Test seam (#222): when set, `pr_head` returns this instead of shelling out
+    /// to `gh pr view --json headRefOid`. The verdict↔revision binding has to be
+    /// exercised through the real MCP dispatch against a repo that isn't on GitHub;
+    /// mirrors `claude_projects_dir`. `None` in the app, always.
+    pr_head_override: Mutex<Option<String>>,
     /// Groups the human has paused: loomux stops delivering prompts/kickoffs
     /// to them so their agents idle out (see `deliver_prompt`). Mirrored to a
     /// `paused` marker file per group so it survives restarts.
@@ -3474,6 +3652,7 @@ impl OrchRegistry {
             last_delivery: Arc::new(Mutex::new(HashMap::new())),
             tasks_lock: Mutex::new(()),
             creation: Mutex::new(()),
+            pr_head_override: Mutex::new(None),
             paused: Mutex::new(HashSet::new()),
             spawn_times: Mutex::new(HashMap::new()),
             self_arc: Mutex::new(Weak::new()),
@@ -4436,8 +4615,8 @@ impl OrchRegistry {
         fs::create_dir_all(dir.join("configs")).map_err(|e| e.to_string())?;
         let resumed = dir.join("group.json").is_file();
 
-        // The repo's declared roster (#222), read ONLY when the human turned the
-        // advanced orchestrator on **and this is a fresh launch**.
+        // The repo's declared roster AND its merge gate (#222), read ONLY when the
+        // human turned the advanced orchestrator on **and this is a fresh launch**.
         //
         // With the toggle off — the default — the file is not even opened: this is
         // the whole promise that the default experience is byte-for-byte what it
@@ -4471,18 +4650,50 @@ impl OrchRegistry {
                         "blocks": wf.blocks.iter().map(|b| json!({ "id": b.id, "kind": b.kind })).collect::<Vec<_>>(),
                         "gates": wf.gates.keys().collect::<Vec<_>>(),
                     }));
+                    // The declared merge gate (#222/#197) becomes the `merge_gate`
+                    // spec file the gh shim enforces — or, when the file declares
+                    // none, is cleared, so removing a gate from the workflow really
+                    // removes it.
+                    self.sync_merge_gate(&id, wf.gates.get("merge"));
+                    // `merge` is the only gate loomux enforces. A gate under any other
+                    // name parses (the schema is open) but does nothing — say so, rather
+                    // than letting a `gates: { deploy: … }` clause look enforced.
+                    let unenforced: Vec<&String> =
+                        wf.gates.keys().filter(|k| k.as_str() != "merge").collect();
+                    if !unenforced.is_empty() {
+                        self.audit(&id, "loomux", "workflow-gate-unenforced", json!({
+                            "gates": unenforced,
+                            "note": "only gates.merge is enforced by this build — the rest are inert",
+                        }));
+                    }
                     guardrails.blocks = wf.blocks;
                     // Re-run the roster normalization (model defaults follow each
                     // block's *effective* CLI, which the file may have changed).
                     guardrails = guardrails.clamped();
                 }
-                Ok(None) => {}
+                // No workflow file: no gate. Clears a stale one from a previous
+                // launch, so deleting `.loomux/workflow.yml` restores the pre-#222
+                // flow exactly.
+                Ok(None) => self.sync_merge_gate(&id, None),
                 Err(errors) => {
                     self.audit(&id, "loomux", "workflow-invalid", json!({
                         "path": workflow::WORKFLOW_PATH,
                         "errors": errors,
                         "action": "skipped — using the built-in roster",
                     }));
+                    // A BROKEN workflow file does NOT clear an existing gate. The
+                    // roster can safely fall back to the built-in one — every agent
+                    // still spawns, which is #225's "a repo file must never block a
+                    // launch". A gate is the opposite kind of thing: dropping it
+                    // because the file that declares it stopped parsing would quietly
+                    // *widen* what the group's agents may do, and a syntax error is
+                    // not consent to merge unreviewed code. So the last known gate
+                    // stands, loudly.
+                    if self.merge_gate_path(&id).is_file() {
+                        self.audit(&id, "loomux", "merge-gate-retained", json!({
+                            "reason": "the workflow file is invalid — keeping the last known merge gate rather than failing open",
+                        }));
+                    }
                 }
             }
         } else if guardrails.advanced_orchestrator {
@@ -4490,16 +4701,32 @@ impl OrchRegistry {
             // since the launch, the human should be able to SEE that the group they
             // are looking at is not what their repo now says. Silence here would
             // make the pin indistinguishable from a stale read.
+            //
+            // **The merge gate is pinned by the same rule, and left untouched here.**
+            // The consent argument applies to it at least as strongly as to the
+            // roster: a `git pull` between launch and resume must not be able to
+            // *loosen* the gate a session is running under (drop a reviewer, remove
+            // the clause entirely) — and re-reading the file is precisely how that
+            // would happen. The gate file written at launch stands; the drift audit
+            // tells the human the repo has moved on.
             self.audit_workflow_drift(&id, repo, &guardrails);
-        } else if workflow::workflow_file_exists(repo) {
-            // The repo declares a workflow and this group is deliberately not
-            // running it. Say so in the trail: "my workflow file did nothing" is
-            // otherwise a silent, and very confusing, non-event.
-            self.audit(&id, "loomux", "workflow-ignored", json!({
-                "path": workflow::WORKFLOW_PATH,
-                "reason": "the advanced orchestrator is off for this group",
-                "action": "using the built-in roster",
-            }));
+        } else {
+            // The toggle is off, so the workflow is not running — and neither is its
+            // gate. Clearing it here is what makes "the default experience is
+            // byte-for-byte pre-#222" true for the *merge path* too, and it is what
+            // stops a gate declared under an earlier advanced launch of this same
+            // group dir from outliving the toggle that authorized it.
+            self.sync_merge_gate(&id, None);
+            if workflow::workflow_file_exists(repo) {
+                // The repo declares a workflow and this group is deliberately not
+                // running it. Say so in the trail: "my workflow file did nothing" is
+                // otherwise a silent, and very confusing, non-event.
+                self.audit(&id, "loomux", "workflow-ignored", json!({
+                    "path": workflow::WORKFLOW_PATH,
+                    "reason": "the advanced orchestrator is off for this group",
+                    "action": "using the built-in roster",
+                }));
+            }
         }
         // The live-agent cap is adjustable mid-session (`set_max_agents`) and
         // persisted, so it's a durable human choice — like the pause/notify
@@ -6764,7 +6991,14 @@ impl OrchRegistry {
             .map(|x| x.id.as_str())
             .collect();
         let multi_reviewer = b.kind == Role::Reviewer && reviewers.len() > 1;
-        if b.is_builtin() && !b.has_persona() && !multi_reviewer {
+        // A reviewer the group's merge gate NAMES is told so, whatever else is true of
+        // it (#222/#197). This has to be part of the early-return test, not just an
+        // extra paragraph: a gate can name a plain built-in `reviewer` block with no
+        // persona and no siblings, and that block would otherwise be the one agent in
+        // the group that never learns its verdict is the thing holding the merge.
+        let gate = self.merge_gate(&g.id).filter(|_| b.kind == Role::Reviewer);
+        let gated = gate.as_ref().is_some_and(|gt| gt.reviewers.iter().any(|r| *r == b.id));
+        if b.is_builtin() && !b.has_persona() && !multi_reviewer && !gated {
             return String::new();
         }
         // `persona_allowed` for the same reason the preview asks it: an orchestrator
@@ -6796,6 +7030,51 @@ impl OrchRegistry {
         } else {
             String::new()
         };
+        // The verdict contract, given ONLY to a reviewer a gate actually names — for
+        // everyone else it would be prose about a tool that gates nothing. It is the
+        // one instruction in this file that a merge physically waits on, so it says
+        // what the shim will do rather than asking nicely.
+        let gate_note = match gate.filter(|_| gated) {
+            Some(gt) => {
+                let rule = match gt.require {
+                    workflow::GateRequire::AllPass => format!(
+                        "every one of {} must record a `pass`",
+                        gt.reviewers.iter().map(|r| format!("`{r}`")).collect::<Vec<_>>().join(", ")
+                    ),
+                    workflow::GateRequire::Threshold(n) => format!(
+                        "{n} of {} must record a `pass`",
+                        gt.reviewers.iter().map(|r| format!("`{r}`")).collect::<Vec<_>>().join(", ")
+                    ),
+                };
+                format!(
+                    "\n\n**Your verdict is the merge gate.** This repo's workflow declares a merge \
+                     gate that names you, so `gh pr merge` is **refused** until {rule} — loomux's \
+                     `gh` interceptor enforces it, and nobody can talk it into merging: not the \
+                     orchestrator, not a human grant. Record yours with \
+                     `review_verdict(pr, verdict, summary)` once you have finished reviewing and \
+                     posted your review on the PR:\n\
+                     \n\
+                     - `pass` — reviewed, nothing blocking.\n\
+                     - `fail` — blocking findings. Re-review after the fix and record `pass` to \
+                     clear it (re-recording replaces your earlier verdict).\n\
+                     - `escalate` — you are **not deciding this one**: ambiguous requirement, \
+                     outside what you can judge, a risk you won't sign off on. A human must look.\n\
+                     \n\
+                     `fail` and `escalate` both refuse the merge, and **one blocking verdict beats \
+                     any number of passes** — so never record `pass` to be agreeable, to unblock a \
+                     queue, or because another reviewer already passed. If you have not finished, \
+                     record nothing: an outstanding verdict holds the gate shut, which is exactly \
+                     what it is for.\n\
+                     \n\
+                     **Your verdict is bound to the commit you reviewed.** If anything is pushed to \
+                     the PR afterwards — even a lint fix — your pass goes **stale**, the gate \
+                     reopens, and the merge is refused until you review the new head and record \
+                     again. Expect to be called back after a fix; do not assume an earlier pass \
+                     still covers the PR. `list_verdicts(pr)` shows you where the gate stands."
+                )
+            }
+            None => String::new(),
+        };
         format!(
             "\n\n{}",
             render_template(
@@ -6806,6 +7085,7 @@ impl OrchRegistry {
                     ("BLOCK_KIND", b.kind.as_str()),
                     ("PERSONA_NOTE", persona_note),
                     ("LANE_NOTE", &lane_note),
+                    ("GATE_NOTE", &gate_note),
                     // LAST, and this is the same discipline the caller applies to
                     // `{{BLOCK_NOTE}}` itself: `render_template` walks its list in
                     // order, so the only var whose value is repo-authored goes in
@@ -7119,6 +7399,304 @@ impl OrchRegistry {
         };
         let _ = self.deliver_to_orchestrator(group, &msg, "human");
         Ok(())
+    }
+
+    // ---------- the workflow merge gate + review verdicts (#222 / #197) ----------
+
+    /// The group-dir spec file the `gh` shim reads to enforce `gates.merge`.
+    /// Absent = no declared gate = the pre-#222 flow, exactly.
+    fn merge_gate_path(&self, group: &str) -> PathBuf {
+        self.group_dir(group).join(workflow::MERGE_GATE_FILE)
+    }
+
+    /// The group's declared merge gate, or `None` if the repo declared none **or
+    /// the gate file is unusable**. Callers must not read `None` as "no gate" when
+    /// the file exists (`merge_gate_declared`) — the shim will read that file and
+    /// refuse on exactly what makes this return `None`. The shim does its own read
+    /// (in shell); this is for the Rust side — reporting gate status back to a
+    /// reviewer that just recorded a verdict, and to the orchestrator that has to
+    /// decide what to do next.
+    pub fn merge_gate(&self, group: &str) -> Option<workflow::Gate> {
+        workflow::parse_gate_file(&fs::read_to_string(self.merge_gate_path(group)).ok()?)
+    }
+
+    /// Whether the group has a gate file at all — the shim's own precondition.
+    pub fn merge_gate_declared(&self, group: &str) -> bool {
+        self.merge_gate_path(group).is_file()
+    }
+
+    /// Bring the group's `merge_gate` file in line with the repo's workflow file,
+    /// called on every group create/resume.
+    ///
+    /// `Some(gate)` writes it; `None` **removes** it — a repo that deletes its
+    /// `gates.merge` clause (or its whole workflow file) must not keep a gate the
+    /// file no longer declares. The one case that is *not* routed here is a
+    /// workflow file that fails to parse: `create_group` leaves an existing gate
+    /// file alone there, because "I can't read your workflow" is not evidence that
+    /// you stopped wanting the gate — see the call site.
+    fn sync_merge_gate(&self, group: &str, gate: Option<&workflow::Gate>) {
+        let path = self.merge_gate_path(group);
+        match gate {
+            Some(g) => {
+                if atomic_write(&path, workflow::gate_file_text(g).as_bytes()).is_ok() {
+                    self.audit(group, "loomux", "merge-gate-declared", json!({
+                        "require": match g.require {
+                            workflow::GateRequire::AllPass => "all-pass".to_string(),
+                            workflow::GateRequire::Threshold(n) => format!("threshold {n}"),
+                        },
+                        "reviewers": g.reviewers,
+                        "also": g.also,
+                        // Say it out loud in the trail: an `also:` condition this
+                        // build can't check refuses every merge (fail closed).
+                        "unsupported_conditions": g.also.iter()
+                            .filter(|c| !workflow::condition_supported(c)).collect::<Vec<_>>(),
+                    }));
+                }
+            }
+            None => {
+                if path.is_file() && remove_marker(&path).is_ok() {
+                    self.audit(group, "loomux", "merge-gate-cleared",
+                        json!({ "reason": "the repo's workflow declares no gates.merge" }));
+                }
+            }
+        }
+    }
+
+    /// Where this group's recorded verdicts for one PR live: one file per reviewer
+    /// block (`verdicts/pr-<N>/<block-id>`). Both segments are loomux-generated —
+    /// `pr` is a parsed number and a block id is sanitized to `[A-Za-z0-9_-]` — so
+    /// neither can walk out of the group dir.
+    fn verdict_dir(&self, group: &str, pr: u64) -> PathBuf {
+        self.group_dir(group).join(workflow::VERDICTS_DIR).join(format!("pr-{pr}"))
+    }
+
+    /// The PR's current head commit, via the **real** gh (the backend's PATH is
+    /// unshimmed, so resolve the binary the same way `write_shim` does rather than
+    /// trusting `PATH`). `None` when gh is absent, unauthenticated, or the repo/PR
+    /// isn't there — which the verdict path records as an *empty* head, i.e. stale,
+    /// never as "unbound, therefore fine".
+    ///
+    /// `pr_head_override` is the test seam (mirroring `claude_projects_dir`): the
+    /// integration tests must be able to record a verdict against a known revision
+    /// without a GitHub repo, and every one of them drives the real MCP dispatch.
+    fn pr_head(&self, repo: &str, pr: u64) -> Option<String> {
+        if let Some(sha) = self.pr_head_override.lock_safe().clone() {
+            return Some(sha);
+        }
+        if !Path::new(repo).is_dir() {
+            return None;
+        }
+        let gh = crate::winpath::resolve_program(
+            "gh",
+            &crate::winpath::launch_path(),
+            &crate::winpath::launch_pathext(),
+        )?;
+        let mut cmd = std::process::Command::new(gh);
+        cmd.current_dir(repo)
+            .args(["pr", "view", &pr.to_string(), "--json", "headRefOid", "--jq", ".headRefOid"]);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW — never flash a console
+        }
+        let out = cmd.output().ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let sha = workflow::sanitize_sha(&String::from_utf8_lossy(&out.stdout));
+        (!sha.is_empty()).then_some(sha)
+    }
+
+    /// Test seam: pretend `gh pr view --json headRefOid` returns this commit for
+    /// every PR. Lets the integration tests bind verdicts to a revision (and then
+    /// move it, to simulate a re-push) without a live GitHub repo.
+    #[doc(hidden)]
+    pub fn set_pr_head_override(&self, sha: Option<String>) {
+        *self.pr_head_override.lock_safe() = sha;
+    }
+
+    /// Record a reviewer's verdict on a PR (the `review_verdict` MCP tool) — the
+    /// durable, attributed state the merge gate reads.
+    ///
+    /// **Only a reviewer-kind block may record one**, re-checked here and not only
+    /// in the MCP dispatch: the verdict is the thing that opens a gate, so the
+    /// authorization belongs next to the write. A worker that could file its own
+    /// PASS would make the gate decorative.
+    ///
+    /// The verdict is bound to the PR's **head commit at record time**, so it
+    /// cannot survive a re-push: the gate compares that against the PR's current
+    /// head and treats a mismatch as outstanding. Without the binding, a `pass` on
+    /// #7 still reads green after the worker pushes two more commits — the gate
+    /// would be satisfied to the letter of #197 and violated in its spirit.
+    ///
+    /// Re-recording replaces that reviewer's verdict (a reviewer that re-reviews
+    /// after a fix upgrades its own `fail` to a `pass`, and a reviewer whose pass
+    /// went stale re-reviews the new head); every write is audited, so the history
+    /// is in the trail even though only the latest verdict gates.
+    pub fn record_verdict(
+        &self,
+        group: &str,
+        agent_id: &str,
+        pr: &str,
+        verdict: &str,
+        summary: &str,
+    ) -> Result<workflow::ReviewVerdict, String> {
+        let a = self.agent(agent_id).ok_or_else(|| format!("unknown agent: {agent_id}"))?;
+        if a.group != group {
+            return Err(format!("unknown agent: {agent_id}")); // never leak other groups' ids
+        }
+        if a.role != Role::Reviewer {
+            return Err(format!(
+                "permission denied: review_verdict records a REVIEW outcome, so only a \
+                 reviewer-kind block may call it — you are block {:?} (kind {}). Use \
+                 report(status, summary) instead.",
+                a.block,
+                a.role.as_str()
+            ));
+        }
+        let num = pr_number(pr)
+            .ok_or_else(|| format!("no PR number found in {pr:?} — pass the number, #n, or the PR URL"))?;
+        let verdict = workflow::Verdict::parse(verdict).ok_or_else(|| {
+            format!("unknown verdict {verdict:?} — must be one of {}", workflow::verdict_names())
+        })?;
+        let summary = workflow::sanitize_summary(summary);
+        if summary.is_empty() {
+            return Err("summary required — one or two lines a human can act on: what you \
+                        reviewed, and what decided the verdict".into());
+        }
+        let block = workflow::sanitize_id(&a.block)
+            .ok_or("this agent's block id is unusable — it cannot be attributed a verdict")?;
+        // The revision this verdict reviewed. Best-effort: an unresolvable head is
+        // stored empty, which the gate reads as stale — so a verdict loomux could
+        // not bind to a commit can never open a gate on its own.
+        let repo = self.group(group).map(|g| g.repo).unwrap_or_default();
+        let head = self.pr_head(&repo, num).unwrap_or_default();
+        let rec = workflow::ReviewVerdict {
+            pr: num,
+            block,
+            agent_id: a.id.clone(),
+            verdict,
+            head,
+            summary,
+            ts_ms: now_ms(),
+        };
+        // Atomic: the shim may read this file at any instant, and a half-written
+        // verdict must never read as a `pass` (the first line is the verdict word).
+        atomic_write(
+            &self.verdict_dir(group, num).join(&rec.block),
+            workflow::verdict_file_text(&rec).as_bytes(),
+        )
+        .map_err(|e| e.to_string())?;
+        self.audit(group, &rec.agent_id, "review-verdict", json!({
+            "pr": num,
+            "block": rec.block,
+            "verdict": rec.verdict.as_str(),
+            "head": rec.head,
+            "summary": rec.summary.chars().take(500).collect::<String>(),
+        }));
+        Ok(rec)
+    }
+
+    /// Every verdict recorded for a PR, by reviewer block (block order).
+    pub fn verdicts(&self, group: &str, pr: u64) -> Vec<workflow::ReviewVerdict> {
+        let mut out: Vec<workflow::ReviewVerdict> = fs::read_dir(self.verdict_dir(group, pr))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| {
+                let block = e.file_name().to_string_lossy().into_owned();
+                let text = fs::read_to_string(e.path()).ok()?;
+                workflow::parse_verdict_file(pr, &block, &text)
+            })
+            .collect();
+        out.sort_by(|a, b| a.block.cmp(&b.block));
+        out
+    }
+
+    /// The verdicts a gate decision reads: reviewer block → its latest record.
+    fn verdict_map(&self, group: &str, pr: u64) -> BTreeMap<String, workflow::ReviewVerdict> {
+        self.verdicts(group, pr).into_iter().map(|v| (v.block.clone(), v)).collect()
+    }
+
+    /// PRs this group has any recorded verdict for (ascending).
+    pub fn verdict_prs(&self, group: &str) -> Vec<u64> {
+        let mut prs: Vec<u64> = fs::read_dir(self.group_dir(group).join(workflow::VERDICTS_DIR))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| e.file_name().to_string_lossy().strip_prefix("pr-")?.parse().ok())
+            .collect();
+        prs.sort_unstable();
+        prs
+    }
+
+    /// One line telling an agent where a PR stands against the declared gate —
+    /// handed back to the reviewer that just voted and delivered to the
+    /// orchestrator, so nobody has to guess whether a merge is now possible.
+    /// `None` when the group declares no gate (then only the human gate applies).
+    ///
+    /// This must agree with the shim, which is the thing that actually refuses the
+    /// merge: it reads the same files, resolves the same head, and fails closed on
+    /// the same shapes. A status line that said SATISFIED while the shim refused
+    /// would be worse than no status line at all.
+    pub fn gate_status_line(&self, group: &str, pr: u64) -> Option<String> {
+        if !self.merge_gate_declared(group) {
+            return None;
+        }
+        // The file exists but doesn't parse: the shim refuses every merge on it
+        // (`malformed-gate`), so say that rather than "no gate".
+        let Some(gate) = self.merge_gate(group) else {
+            return Some(format!(
+                "merge gate for PR #{pr}: the group's merge_gate file is MALFORMED — every merge \
+                 is refused until it is fixed (repair .loomux/workflow.yml and relaunch the group)."
+            ));
+        };
+        let repo = self.group(group).map(|g| g.repo).unwrap_or_default();
+        let head = self.pr_head(&repo, pr);
+        let outcome = workflow::evaluate_merge_gate(&gate, &self.verdict_map(group, pr), head.as_deref());
+        let also = if gate.also.is_empty() {
+            String::new()
+        } else {
+            format!(" Condition(s) checked at merge time: {}.", gate.also.join(", "))
+        };
+        // "still waiting on X (no verdict) / Y (passed an older revision)".
+        let waiting = |outstanding: &[String], stale: &[String]| -> String {
+            let mut parts: Vec<String> = Vec::new();
+            if !outstanding.is_empty() {
+                parts.push(format!("{} (no verdict yet)", outstanding.join(", ")));
+            }
+            if !stale.is_empty() {
+                parts.push(format!(
+                    "{} (passed an EARLIER revision — the branch has moved, so they must re-review)",
+                    stale.join(", ")
+                ));
+            }
+            parts.join("; ")
+        };
+        Some(match outcome {
+            workflow::GateOutcome::Satisfied => format!(
+                "merge gate for PR #{pr}: SATISFIED by the reviewer verdicts ({}) for the current \
+                 revision.{also} The human merge gate still applies on the default branch.",
+                gate.reviewers.join(", ")
+            ),
+            workflow::GateOutcome::Blocked { blocking } => format!(
+                "merge gate for PR #{pr}: BLOCKED — {} recorded a fail/escalate verdict. A \
+                 blocking verdict beats any number of passes; the PR must be fixed and \
+                 re-reviewed.",
+                blocking.join(", ")
+            ),
+            workflow::GateOutcome::Short { passes, need, outstanding, stale } => format!(
+                "merge gate for PR #{pr}: NOT YET SATISFIED — {passes} of {need} required PASS \
+                 verdicts cover the PR's current head; still waiting on {}. `gh pr merge` is \
+                 refused until then.{also}",
+                waiting(&outstanding, &stale)
+            ),
+            workflow::GateOutcome::UnknownRevision => format!(
+                "merge gate for PR #{pr}: loomux cannot resolve the PR's current head commit, so \
+                 it cannot tell whether the recorded verdicts reviewed the code that would merge. \
+                 The merge is refused until it can."
+            ),
+        })
     }
 
     pub fn resolve_token(&self, token: &str) -> Option<Caller> {

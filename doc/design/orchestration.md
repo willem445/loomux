@@ -653,6 +653,30 @@ one-time **grant** the shim also honors.
   tools `set_state`/`upsert_task`/`save_attachment` write only their own fixed paths, never a
   grant path). Agents *consume* grants (the shim) but never *mint* them through loomux.
 
+### The workflow merge gate composes on top (#222 / #197)
+
+Everything above is the **human** gate. A repo that declares `gates.merge` in its
+`.loomux/workflow.yml` adds a **second, independent** necessary condition to the same shim:
+`gh pr merge` is refused until every reviewer block the gate names has recorded a `pass` via the
+`review_verdict` MCP tool (`threshold: N` needs N of them; a `fail`/`escalate` from any of them
+refuses outright). It is evaluated **before** every opening above — a grant, `autonomous +
+auto_merge` and supervised dangerous mode all sit below it and none of them can satisfy it, which
+is what makes #197 Scope B ("an auto-merge must be structurally impossible until every required
+review verdict is recorded PASS") true rather than aspirational (executed in the shell harness,
+not merely asserted about the source order). A verdict is bound to the PR's **head commit**, so a
+pass does not survive a re-push — otherwise the gate reads green over commits nobody reviewed.
+Unlike the human gate it applies to non-default merges too, and a refused merge does not consume a
+pending grant. Verdicts live in `verdicts/pr-<N>/<block>` and the declared gate in `merge_gate`,
+both under the group dir, both in the same small-file shape the shim already reads.
+
+Two notes that belong next to *Honest bypass surface* above. (1) A **merge with no
+`LOOMUX_GROUP_DIR` is now refused outright** — an agent pane always has it, so an unset variable
+at the shim is evasion; previously it slipped a non-default merge past the workflow gate with
+nothing in the audit. (2) The verdict store is forgeable by an agent with a shell exactly as grant
+files are, and — unlike the human gate — **a machine account does not close it**: the forge cannot
+tell a fabricated verdict file from a real one. Full design + the honest limits:
+`doc/design/workflows.md`.
+
 ### Release & tag gating
 
 Releases publish to the world — a `v*` tag push triggers `release.yml` (GitHub release + npm),
