@@ -1,10 +1,11 @@
 # User-defined agent workflows: the block model
 
-Issue #222. This note covers **sub-PR 1** — the backend core: roles as data,
+Issue #222. This note covers the backend core — roles as data,
 `<repo>/.loomux/workflow.yml`, and compiling a block's persona down to each
-agent CLI's native custom-agent flag. The workflow pane (sub-PR 2), the
-`review_verdict` tool and gate enforcement (sub-PR 3), and the launcher's
-"advanced orchestrator" toggle (sub-PR 4) build on what is described here.
+agent CLI's native custom-agent flag (**sub-PR 1**) — and, at the end, **the
+switch that turns any of it on**: the launcher's *advanced orchestrator* toggle
+and the workflow-aware role templates (**sub-PR 4**). The workflow pane is
+sub-PR 2; the `review_verdict` tool and gate enforcement are sub-PR 3.
 
 ## The problem
 
@@ -346,11 +347,12 @@ flow, and *never merge — the human gates merges*. A replace persona can change
 who the agent is. It can never leave it unable to report, or able to merge.
 `replace_mode_persona_still_gets_the_mechanics_core` pins that.
 
-## Nothing changes when there's no workflow file
+## Nothing changes when there's no workflow in play
 
 The compatibility guarantee, and the thing most of the test suite defends: a
-repo with no `.loomux/workflow.yml` gets a synthesized roster of exactly today's
-four blocks — ids `orchestrator` / `worker` / `reviewer` / `planner`, no
+group with no workflow in play — the advanced-orchestrator toggle off (the
+default; see below), or on in a repo with no `.loomux/workflow.yml` — gets a
+synthesized roster of exactly today's four blocks — ids `orchestrator` / `worker` / `reviewer` / `planner`, no
 personas, inheriting the launcher's per-role CLI and model picks. Because the
 ids are the role names, the instruction files keep their historic paths
 (`worker.md`), the agent ids keep their historic prefixes (`w-3`), and because
@@ -403,14 +405,191 @@ The spawn audit records the block and how its persona reached the CLI
 (`copilot --agent` / `claude --agents` / `kickoff`), so a run stays reproducible
 after the workflow file changes.
 
+## The advanced-orchestrator toggle (sub-PR 4)
+
+Everything above describes what a workflow file *does*. This section is about
+when it is allowed to do it.
+
+`Guardrails::advanced_orchestrator` is a per-launch boolean, default **off**.
+Off, `create_group` does not open `.loomux/workflow.yml` — not "opens it and
+ignores it", **does not open it**. There is no code path from the file to the
+group, which is the cheapest possible way to keep the compatibility promise: the
+default experience cannot regress on a file it never reads. On, the load-and-
+validate above runs and the file's blocks become the roster.
+
+### Why it isn't just "a file that exists takes effect"
+
+That was the shape until this sub-PR, and it is wrong for one reason: **a
+workflow file arrives with a `git clone`.** Anyone who can open a PR against a
+repo can propose one. Without a toggle, cloning a repo and launching an
+orchestrator would silently run *that repo's* agents, with *that repo's*
+personas, before the human had ever seen the file.
+
+The capability closure (above) means the worst case is bounded — a repo file can
+never grant a capability, so those agents can't do anything loomux's own agents
+couldn't. But "bounded" is not "consented to". The persona of every delegate is a
+thing the human should have looked at, and the toggle is what makes them look:
+tick it and the launcher shows the resolved roster — every block, its kind, CLI
+and model, and **which blocks carry repo-authored personas** — before the group
+spawns.
+
+The toggle is persisted in `group.json` (absent → `false`, so every group launched
+before this field rejoins as what it was: a built-in roster). A resumed
+orchestration rebuilds its guardrails from that file, not from a launcher form.
+
+### A resumed group runs the roster it was launched with
+
+The consent above has a corollary that took a review round to see clearly
+(rev-11 F2). If the launcher preview is *the* consent moment, then nothing that
+happens afterwards may quietly change what the human agreed to — and a resume is
+not a consent moment, because nobody is being shown anything.
+
+So `create_group` takes a `Launch` (`Fresh` | `Resume`), and **only a fresh launch
+reads `.loomux/workflow.yml`.** A resume runs the blocks persisted in `group.json`
+— the ones the human actually looked at. Without that, the sequence
+
+> launch with the advanced orchestrator on, having reviewed the roster → `git pull`
+> (or check out a contributor's branch), which adds a reviewer block with a persona
+> → close the orchestrator and reopen it from the session browser
+
+hands the resumed group a delegate, and a repo-authored persona, that its human
+never approved and was never shown. The blast radius is bounded by the capability
+closure, as ever; the *consent* is not bounded by anything, which is the whole
+point of having a toggle.
+
+Drift is **audited, never applied**: on a resume whose roster no longer matches
+what the file now resolves to, loomux writes `workflow-changed-since-launch` with
+both block lists. A silent pin would be indistinguishable from a stale read. To run
+a changed workflow you launch a group — which shows you the new roster first.
+
+Note that `Launch` is deliberately *not* "does `group.json` already exist". A human
+who edits their workflow and launches again on the same repo **is** at the launcher,
+has seen the new preview, and must get the new roster; keying the pin off
+group-exists would make editing your workflow file appear to do nothing, forever —
+a worse bug than the one being fixed. `relaunching_after_editing_the_workflow_picks_up_the_new_file`
+pins that half.
+
+### Three secondary outcomes
+
+Each chosen so the launcher never has to invent a failure the engine doesn't have:
+
+- **On, but the repo declares nothing.** A no-op, not an error — it is how you
+  launch before you have written the file.
+- **On, and the file is broken.** Audited, skipped, and the group launches on the
+  built-in roster (a repo file may never stop a group from starting). So the
+  launcher shows every finding as a **warning**, and Create stays enabled. A
+  submit-blocking red box here would be the UI lying about what the backend does.
+- **Off, but the repo declares a workflow.** Audited (`workflow-ignored`). A file
+  that silently did nothing is the single most confusing thing this feature could
+  produce, and the launcher says it too.
+
+### The preview is the engine, not a second opinion
+
+`orch_workflow_preview(repo, agent_cli)` runs the same `load_workflow` +
+`Guardrails::clamped` that `create_group` runs, on a throwaway `Guardrails`, and
+returns the resolved rows. It is deliberately **not** a second implementation of
+the schema: a preview that disagreed with the launch would make the consent it
+collected worthless. `the_preview_reports_the_roster_the_launch_would_actually_run`
+asserts the two agree block for block.
+
+(The workflow *pane* does validate the file independently, in TypeScript. That is
+not a contradiction: the pane is an editor giving live feedback on text as you
+type it, which cannot be a round trip to a backend that only reads files from
+disk. The launcher is asking a different question — "what would you run?" — and
+only the engine can answer it.)
+
+The pure `src/roster.ts` holds what is left: the canonical role table (the union
+and the badge text stay in `orchbadge.ts`; `launcher.ts` and `groupview.ts` had
+each grown their own copy, and `groupview`'s had gone stale — it never gained
+`planner`, so every planner showed a generic `AGENT` chip), and the resolution of
+`(toggle, preview, per-role picks) → the roster that will run`. DOM-free, so the
+four outcomes above are unit-tested rather than clicked through.
+
+## Workflow-aware templates
+
+The pipeline is prose (`templates/orchestrator.md`), not code — that was finding
+#1 of the investigation. So "run **all** the declared reviewers on each PR" has to
+be said in the prose, and it may only be said to a group that has them.
+
+`render_template` is a dumb `{{KEY}}` replace with no conditionals, and it stays
+that way. The conditional lives in Rust — `workflow::roster_is_custom(&blocks)`,
+one predicate, used by everything — and the prose lives in markdown, where the
+rest of the prose lives:
+
+| Placeholder | In | Fragment | Empty when |
+|---|---|---|---|
+| `{{WORKFLOW}}` | `orchestrator.md` | `templates/workflow.md` | the roster is the built-in four |
+| `{{BLOCK_NOTE}}` | `worker.md`, `reviewer.md`, `planner.md` | `templates/block.md` | *this block* is a built-in with no persona (and no reviewer siblings) |
+
+Both placeholders sit **line-final**, at the end of an existing sentence, never on
+a line of their own — a placeholder on its own line would leave a stray blank line
+behind when it resolved to `""`, and "byte-for-byte unchanged" would be false by
+one newline.
+
+### Pinning that, for real
+
+The first version of this pin was self-referential and rev-11 caught it (F1). It
+built the expected value by taking the **live** template and replacing the
+placeholders with `""` — which is exactly what production does when the toggle is
+off, so both sides moved together. Unconditional prose added to a template passed.
+A placeholder moved onto its own line passed. It was a test that the *gating* works,
+wearing the name of a test that the *text* is unchanged.
+
+What replaced it:
+
+- **Golden fixtures.** `tests/fixtures/pre222/{orchestrator,worker,reviewer,planner}.md`
+  are byte copies of the four templates from the commit before the toggle. The pin
+  renders **those** with the six pre-#222 variables and diffs the result against what
+  a toggle-off group is actually written. Any edit to a role template that changes
+  what a default group reads now fails until a human re-blesses the fixture — and
+  the diff on that directory becomes the review surface for "what did we just tell
+  every worker to do differently?".
+- **Placement asserted on the template source.** `{{WORKFLOW}}` / `{{BLOCK_NOTE}}`
+  must each appear exactly once, be preceded by a non-newline character, and be
+  followed immediately by a newline. That is the invariant the empty case rests on,
+  and it is a one-keystroke mistake to break (wrapping a long line).
+
+`a_workflow_placeholder_must_sit_at_the_end_of_a_line_it_shares` also asserts that
+the live template differs from its golden by *nothing but* the placeholder, which
+keeps "the fixture is stale" and "someone edited a template" distinguishable.
+
+Two smaller decisions worth recording:
+
+- **The one repo-authored string that reaches a template is defended twice.** A
+  block's `name` is substituted **last** in `block_note`'s var list (and
+  `{{BLOCK_NOTE}}` itself last in the caller's), because `render_template` walks its
+  list in order and a value that goes in last has no pass left to rescan it. That
+  ordering was originally claimed for the outer render only, and rev-11 found the
+  gap: inside `block_note` the name went in *third*, so a block called
+  `{{LANE_NOTE}}` was substituted in and then expanded — splicing loomux's own lane
+  note into the middle of a sentence in a file the agent is told to read (bounded —
+  only loomux's fragments were reachable, never attacker text — but prose corruption
+  from a repo string, and a lie in this document). Now the name goes last **and**
+  `sanitize_display` strips `{` and `}` outright. The order protects this template;
+  the sanitizer protects the next one somebody writes.
+- **The block note is per-block, not per-group.** A plain built-in `worker`
+  sitting in a roster whose *reviewers* are custom has had nothing about its own
+  identity changed, and telling it otherwise is noise in a file the agent is
+  expected to actually read. The exception is a reviewer with siblings: being one
+  of several focused reviewers *is* a change to how it should review, so it gets
+  the lane note ("review **only your lane**; `rev-tests` is covering the rest")
+  even with no persona of its own. That note is the difference between three
+  focused reviews and three copies of the same generic one.
+
+What the orchestrator's section says, and deliberately does not say: spawn by
+**block id** (`spawn_agent(block: "<id>")`, not by kind — the file decides the
+CLI, model and persona); run **every** reviewer block on each PR; treat a declared
+gate as a **hard precondition** on merging, enforced by loomux rather than by good
+intentions. And then the asymmetry the whole design turns on — **edges are
+advisory**. Every scheduling call stays the orchestrator's. The file declares the
+roster and the gates; the orchestrator routes.
+
+The gate wording is kept generic on purpose: gate *enforcement* is sub-PR 3's, and
+the template must depend on the fact that gates are enforced, never on how.
+
 ## Still to come
 
-- **sub-PR 2** — the workflow pane: `ContentPaneKind = "workflow"`, a text
-  editor over the YAML plus a read-only derived graph (the Kestra/GitLab shape —
-  the file is the source of truth and a GUI cannot corrupt it).
 - **sub-PR 3** — `review_verdict(pr, verdict, summary)` as recorded,
   reviewer-attributed state, and gate enforcement in the `gh` shim: `gh pr merge`
   refused until every reviewer a gate names has recorded PASS. That is what makes
   a declared gate more than prose, and it closes the loomux side of #197.
-- **sub-PR 4** — the launcher's "advanced orchestrator" toggle. Until it lands, a
-  workflow file takes effect whenever one exists; the toggle will gate the load.

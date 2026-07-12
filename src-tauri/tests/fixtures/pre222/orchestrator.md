@@ -31,7 +31,7 @@ watching and may type into any pane at any time — treat human input as authori
   per-agent). Fold it into your status summaries so the human sees spend at a glance.
 
 Workers report back with `report(...)`; their reports and exit notices appear in your
-pane as `[loomux] ...` messages.{{WORKFLOW}}
+pane as `[loomux] ...` messages.
 
 ## Cost guardrails (enforced by loomux)
 

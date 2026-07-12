@@ -1184,6 +1184,36 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 }
 .dlg-error.visible { display: block; }
 .dlg-hint { font-size: 11px; line-height: 1.5; color: var(--text-dim); }
+/* The advanced-orchestrator roster preview (#222): what the group WILL run, shown
+   before it runs. Quiet by default (one line for the standard roster), and only
+   really present once the toggle is on — this is a consent surface, not a feature
+   advertisement. It scrolls internally so a 12-block workflow can't push Create
+   off-screen. */
+.roster-preview {
+  display: flex; flex-direction: column; gap: 4px;
+  margin-top: 6px; max-height: 260px; overflow-y: auto;
+}
+.roster-preview:empty { display: none; }
+.roster-summary { font-size: 11.5px; line-height: 1.5; color: var(--text-dim); }
+/* A DECLARED roster is the one thing here the human has to actually read. */
+.roster-declared { color: var(--text); }
+/* An invalid file is a warning, never a blocker: the group still launches on the
+   standard roster, so this must not read like a failure. */
+.roster-invalid { color: #e0af68; }
+.roster-block {
+  display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+  padding: 3px 8px; border-radius: 6px;
+  background: rgba(255, 255, 255, 0.03);
+  font-size: 11.5px;
+}
+.roster-id { font-weight: 600; color: var(--text); }
+.roster-meta { color: var(--text-dim); font-size: 11px; }
+.roster-error {
+  font-size: 11px; line-height: 1.45; color: #f7a2b2;
+  padding-left: 8px; border-left: 2px solid #55303a;
+  user-select: text; word-break: break-word;
+}
+.roster-note { font-size: 11px; line-height: 1.5; color: var(--text-dim); }
 /* Itemized modal body (#219): the quit confirm lists every unsaved buffer. Each item
    wraps on its own, and a long list scrolls INSIDE the dialog rather than pushing the
    buttons off-screen — a confirm whose confirm button you can't reach is a trap. */
@@ -1979,6 +2009,18 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .group-role.role-orchestrator { background: rgba(122, 162, 247, 0.16); color: #a7bff8; }
 .group-role.role-worker { background: rgba(158, 206, 106, 0.16); color: #b4e878; }
 .group-role.role-reviewer { background: rgba(187, 154, 247, 0.16); color: #cbb2fb; }
+/* Planner (#47) — the row this table never gained, so a planner fell through to
+   the neutral base color while its chip also read "AGENT" (#222 §2a). */
+.group-role.role-planner { background: rgba(224, 175, 104, 0.16); color: #e6c08a; }
+/* The workflow block an agent IS (#222). Only rendered when it differs from the
+   role — i.e. never for the built-in roster. */
+.group-block {
+  flex: none; max-width: 96px;
+  font-size: 9.5px; font-family: "Cascadia Mono", Consolas, monospace;
+  color: var(--text-dim); background: var(--panel-2);
+  border-radius: 4px; padding: 1px 5px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 .group-name {
   flex: 1; min-width: 0; color: var(--text);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
