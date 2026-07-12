@@ -9,3 +9,8 @@ src-tauri/gen/schemas/
 *.log
 .claude/worktrees/
 .claude/settings.local.json
+
+# The workflow pane's canvas positions (#222): where the boxes sit, never what the
+# workflow IS. Disposable and per-developer — the workflow itself (.loomux/workflow.yml)
+# is committed, this is not.
+.loomux/workflow.layout.json

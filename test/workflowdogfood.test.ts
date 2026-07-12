@@ -16,7 +16,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { parseWorkflow, validateWorkflow, deriveGraph } from "../src/workflowmodel.ts";
+import { parseWorkflow, validateWorkflow, deriveGraph, serializeWorkflow } from "../src/workflowmodel.ts";
 
 const text = readFileSync(new URL("../.loomux/workflow.yml", import.meta.url), "utf8");
 
@@ -94,4 +94,28 @@ test("every block is on the declared path — the graph loomux draws has no orph
   // forgot — the fan-out someone meant to wire and didn't.
   assert.equal(graph.nodes.length, workflow.blocks.length);
   assert.ok(graph.edges.length > 0, "the declared happy path must actually be declared");
+});
+
+// ---------- and now the pane can WRITE it (#222 v2) ----------
+
+test("editing the repo's own workflow in the pane does not mangle it", () => {
+  // The canvas is editable now, so `.loomux/workflow.yml` is a file this app SAVES, not just
+  // one it reads — and every save re-serializes through the canonical formatter. Two things
+  // therefore have to be true of the real file, and neither was in scope before v2:
+  //
+  //   1. a save preserves its meaning (the workflow that comes back is the workflow that went
+  //      in — every block, persona, edge and gate);
+  //   2. a save does not CHURN it — the canonical form of the file is stable, so opening the
+  //      workflow in the pane, dragging a node, and hitting Ctrl+S must not produce a diff of
+  //      the whole file for a teammate to review.
+  //
+  // If someone hand-edits the shipped workflow into a shape the formatter would rewrite, this
+  // fails here rather than in the human's next `git diff`.
+  const { workflow } = parseWorkflow(text);
+  const saved = serializeWorkflow(workflow);
+  const reread = parseWorkflow(saved);
+
+  assert.deepEqual(reread.findings, [], "a saved copy must still be clean");
+  assert.deepEqual(reread.workflow, workflow, "…and must mean exactly what the original meant");
+  assert.equal(serializeWorkflow(reread.workflow), saved, "…and saving it twice must be a no-op");
 });
