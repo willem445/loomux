@@ -36,8 +36,9 @@ import {
   LAYOUT_VERSION,
   type WorkflowLayout,
   type Rect,
+  type Point,
 } from "../src/workflowlayout.ts";
-import { deriveGraph, starterWorkflow, type Workflow } from "../src/workflowmodel.ts";
+import { deriveGraph, starterWorkflow, analyzeWorkflow, type Workflow } from "../src/workflowmodel.ts";
 
 const graph = () => deriveGraph(starterWorkflow());
 
@@ -52,7 +53,7 @@ test("the layout file is a separate, gitignorable file — never the workflow", 
   const moved = withPosition(emptyLayout(), "worker", { x: 304, y: 120 });
   // The workflow is untouched by a drag: nothing to re-serialize, nothing to save, no diff.
   assert.deepEqual(w, starterWorkflow());
-  assert.deepEqual(moved.positions, { worker: { x: 304, y: 120 } });
+  assert.deepEqual(own(moved.positions), { worker: { x: 304, y: 120 } });
 });
 
 test("a layout round-trips, and is written sorted so a drag is a one-line diff", () => {
@@ -74,9 +75,73 @@ test("a corrupt layout file is redrawn, never reported", () => {
   }
   // Partial garbage keeps the good entries and drops only what it can't read.
   assert.deepEqual(
-    parseLayout('{"positions": {"good": {"x": 1, "y": 2}, "bad": {"x": null, "y": 2}}}').positions,
+    own(parseLayout('{"positions": {"good": {"x": 1, "y": 2}, "bad": {"x": null, "y": 2}}}').positions),
     { good: { x: 1, y: 2 } }
   );
+});
+
+/** Own entries as a plain object. The position table has NO PROTOTYPE (that is the F3 fix), and
+ *  `deepStrictEqual` compares prototypes — so a null-proto table never equals an object literal
+ *  however identical its contents. Comparing the CONTENTS is what these tests mean. */
+const own = (positions: Record<string, Point>): Record<string, Point> => ({ ...positions });
+
+test("a block whose id names an Object.prototype member is still just a block (rev-15 F3)", () => {
+  // `id: constructor` is a LEGAL workflow — `isValidBlockId` says yes and the validator reports
+  // zero findings — and it can arrive from a hand edit, the YAML tab, or an agent, so tightening
+  // the +Block dialog would not have closed this. On a plain object literal,
+  // `positions["constructor"]` returned the INHERITED Object function: truthy, so the caller took
+  // the "it has a stored position" branch and read `{x: undefined, y: undefined}` off it. The NaN
+  // reached the SVG's width/height and the canvas did not render at all — for a workflow that is
+  // entirely valid, keyed by an id that can never be changed.
+  const a = analyzeWorkflow(
+    "version: 1\nname: x\nblocks:\n  - id: constructor\n    kind: worker\n    cli: claude\n" +
+      "  - id: worker\n    kind: worker\n    cli: claude\n"
+  );
+  assert.deepEqual(a.findings, [], "this is a VALID workflow — that is what makes it a real bug");
+
+  const pos = resolvePositions(a.graph, emptyLayout());
+  for (const p of pos.values()) {
+    assert.ok(Number.isFinite(p.x) && Number.isFinite(p.y), `not a coordinate: ${JSON.stringify(p)}`);
+  }
+  assert.ok(Number.isFinite(freeSlot(pos).y), "…and the NEXT block must still be placeable");
+
+  // A position stored FOR it round-trips like any other block's.
+  const layout = withPosition(emptyLayout(), "constructor", { x: 80, y: 40 });
+  assert.deepEqual(own(parseLayout(serializeLayout(layout)).positions), { constructor: { x: 80, y: 40 } });
+  assert.deepEqual(resolvePositions(a.graph, layout).get(blockKey(0)), { x: 80, y: 40 });
+});
+
+test("an id the validator REJECTS still cannot produce a NaN coordinate", () => {
+  // `__proto__`, `hasOwnProperty` and `toString` are not legal block ids (leading underscore,
+  // uppercase) — the validator says so. But a broken file still OPENS, as stubs with findings,
+  // which means the canvas still has to draw them: "we reject it" is not the same as "it never
+  // reaches the geometry", and the whole contract of this pane is that it renders files it
+  // disapproves of.
+  for (const id of ["__proto__", "hasOwnProperty", "toString"]) {
+    const a = analyzeWorkflow(
+      `version: 1\nblocks:\n  - id: ${id}\n    kind: worker\n    cli: claude\n` +
+        `  - id: worker\n    kind: worker\n    cli: claude\n`
+    );
+    assert.ok(
+      a.findings.some((f) => f.code === "block-id-invalid"),
+      `"${id}" should be reported as an invalid id`
+    );
+    const layout = withPosition(emptyLayout(), id, { x: 24, y: 24 });
+    for (const p of resolvePositions(a.graph, layout).values()) {
+      assert.ok(Number.isFinite(p.x) && Number.isFinite(p.y), `${id}: ${JSON.stringify(p)}`);
+    }
+  }
+});
+
+test("a hostile KEY in the layout file on disk is data, not a prototype member", () => {
+  // The layout file is JSON that arrives from the repo. `__proto__` in it must land as an
+  // ordinary entry that no lookup can confuse with an inherited one — and must pollute nothing.
+  const layout = parseLayout('{"positions": {"__proto__": {"x": 1, "y": 2}, "a": {"x": 3, "y": 4}}}');
+  assert.deepEqual(own(layout.positions).a, { x: 3, y: 4 });
+  assert.equal(Object.getPrototypeOf(layout.positions), null, "the table has no prototype to inherit from");
+  assert.equal(({} as Record<string, unknown>).x, undefined, "and nothing anywhere was polluted");
+  assert.deepEqual(own(pruneLayout(layout, ["a"]).positions), { a: { x: 3, y: 4 } });
+  assert.equal(serializeLayout(parseLayout(serializeLayout(layout))), serializeLayout(layout));
 });
 
 test("positions are keyed by block id, which is why an immutable id matters", () => {
@@ -115,7 +180,7 @@ test("an id-less stub has no stored position — there is nothing stable to key 
   // Inventing a key for it would be inventing an identity, which is the one thing the schema
   // says a workflow file may never do behind the human's back.
   const layout = withPosition(emptyLayout(), "", { x: 10, y: 10 });
-  assert.deepEqual(layout.positions, {});
+  assert.deepEqual(own(layout.positions), {});
 });
 
 // ---------- placement ----------
@@ -142,7 +207,7 @@ test("ghosts are placed but never persisted", () => {
   // Persisting a position for it would outlive the mistake that created it.
   const pos = resolvePositions(graph(), emptyLayout(), ["rev-perf"]);
   assert.ok(pos.has(ghostKey("rev-perf")));
-  assert.deepEqual(withPosition(emptyLayout(), "", { x: 1, y: 1 }).positions, {});
+  assert.deepEqual(own(withPosition(emptyLayout(), "", { x: 1, y: 1 }).positions), {});
 });
 
 test("a new block lands somewhere free — not at the origin, not under an existing node", () => {
@@ -222,9 +287,15 @@ test("an edge is routed from the two nodes it joins — there are no waypoints t
   assert.match(edgePath({ x: 0, y: 0 }, { x: 100, y: 50 }), /^M 0 0 C /, "a cubic, horizontal control points");
 });
 
-test("the layout file records a version, so a future format can tell itself apart", () => {
+test("the layout file STAMPS a version on write and deliberately ignores it on read", () => {
+  // The honest name for what this asserts (rev-15 minor): the version is written, and a file
+  // claiming to be a FUTURE version is still read — its positions are taken and its version is
+  // discarded. That is the right behaviour for a disposable picture (a v2 file still has x/y in
+  // it, and the worst case of misreading one is a node in the wrong place), but the old test
+  // name promised a format check that does not exist and would have misled whoever writes v2.
   assert.equal(emptyLayout().version, LAYOUT_VERSION);
-  assert.equal(parseLayout('{"version": 99, "positions": {}}').version, LAYOUT_VERSION);
-  const layout: WorkflowLayout = { version: LAYOUT_VERSION, positions: {} };
-  assert.match(serializeLayout(layout), /"version": 1/);
+  const future = parseLayout('{"version": 99, "positions": {"a": {"x": 8, "y": 8}}}');
+  assert.equal(future.version, LAYOUT_VERSION, "read as this build's format…");
+  assert.deepEqual(own(future.positions), { a: { x: 8, y: 8 } }, "…and its positions are used anyway");
+  assert.match(serializeLayout(emptyLayout()), /"version": 1/);
 });

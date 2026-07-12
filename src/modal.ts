@@ -124,35 +124,42 @@ export function promptModal(spec: {
     // `display: none` until then, so an attribute toggle would leave it invisible forever.
     const error = el("div", "dlg-error");
 
-    const submit = () => {
+    const actions = el("div", "dlg-actions");
+    const cancel = el("button", "dlg-btn", "Cancel");
+    cancel.addEventListener("click", () => done(null));
+    const ok = el("button", "dlg-btn primary", spec.affirm) as HTMLButtonElement;
+    actions.append(cancel, ok);
+
+    /** Validate what is in the box RIGHT NOW, and reflect it. Runs on every keystroke and
+     *  again on submit (rev-15 F4 — it used to run only on submit, while three comments claimed
+     *  otherwise). "A bad id can't be confirmed" should mean a button you can SEE is disabled,
+     *  not a button that works until you press it and then refuses. The empty box is the one
+     *  case that shows no error: you haven't typed anything wrong, you just haven't typed. */
+    const check = (): string | null => {
       const value = input.value.trim();
       const err = spec.validate?.(value) ?? null;
-      if (err) {
-        error.textContent = err;
-        error.classList.add("visible");
+      const complain = err !== null && value !== "";
+      error.textContent = complain ? err : "";
+      error.classList.toggle("visible", complain);
+      ok.disabled = err !== null;
+      return err;
+    };
+
+    const submit = () => {
+      if (check() !== null) {
         input.focus();
         return;
       }
-      done(value);
+      done(input.value.trim());
     };
 
-    input.addEventListener("input", () => {
-      // Clear the complaint as soon as they start fixing it — an error that persists while you
-      // type is an error you learn to ignore.
-      error.classList.remove("visible");
-    });
+    input.addEventListener("input", check);
     input.addEventListener("keydown", (e) => {
       e.stopPropagation();
       if (e.key === "Enter") submit();
       if (e.key === "Escape") done(null);
     });
-
-    const actions = el("div", "dlg-actions");
-    const cancel = el("button", "dlg-btn", "Cancel");
-    cancel.addEventListener("click", () => done(null));
-    const ok = el("button", "dlg-btn primary", spec.affirm);
     ok.addEventListener("click", submit);
-    actions.append(cancel, ok);
 
     dlg.append(
       el("h2", "", spec.title),
@@ -168,6 +175,7 @@ export function promptModal(spec: {
     });
     overlay.addEventListener("keydown", (e) => e.stopPropagation());
     document.body.appendChild(overlay);
+    check(); // an empty box starts with the affirm button disabled — nothing to confirm yet
     input.focus();
     input.select();
   });

@@ -533,6 +533,35 @@ And the gate is still not a node you can drag or wire. It is not a block — it 
 blocks — and making it draggable would imply it can be rewired, which is the single most
 important thing about it that isn't true.
 
+### The three questions the view was never allowed to answer
+
+Review found the v2 pane getting three things wrong, and they had the same shape: the *view* was
+deciding something that is a **rule**. Rules live in `workflowpane.ts` now — pure, tested, stated
+once — the same move `dirtystate.ts` makes for the editor.
+
+| The rule | What the view did instead |
+| --- | --- |
+| `paneSurface` — which surface to show | Showed *"no workflow in this repo yet"* for a file that was **there** and merely unreadable, and then offered to create one **over the top of it**. |
+| `savePlan` — how a save may write | A **create** wrote with a null expected hash, which the backend reads as *write unconditionally*. A workflow that arrived while the pane sat on its start surface (an agent wrote one, a `git pull` brought one in) was **destroyed**, with a green "Saved" toast. |
+| `layoutPruneIds` — what the layout may forget | Pruned the layout file against the **unsaved buffer**, so deleting a block (without saving) and then dragging another one wrote the deletion to disk *before the human had made it*. |
+
+The save fix is the one worth naming: a create now **claims the path atomically** with
+`fm_new_file` (which is `create_new(true)` — "create, but only if it isn't there", one syscall,
+no TOCTOU window) and then writes against the claimed file's own hash. So even the sliver between
+the claim and the write is an ordinary conflict-guarded write, and the *only* code path left that
+can overwrite a workflow is a human answering **Overwrite** in the conflict dialog — which is an
+answer to a question, not a save plan. `src-tauri/tests/workflowfile.rs` pins both halves of why
+that works, at the layer where the behaviour lives.
+
+And one more, in the module whose whole job is to be the hostile-input-proof half of the canvas:
+a block whose id is **`constructor`** is a perfectly legal workflow (the validator reports zero
+findings), but `positions["constructor"]` on a plain object literal returns the *inherited* `Object`
+function — truthy, so the canvas read `{x: undefined, y: undefined}` off it, and `NaN` reached the
+SVG's width and height. The canvas did not render, for a valid file, keyed by an id that can never
+be changed. The position table now has **no prototype** and is read through `Object.hasOwn`.
+Tightening the +Block dialog would not have fixed it: an id can arrive from a hand edit, the YAML
+tab, or an agent, and none of those pass through a dialog. Fix the lookup, not the instance.
+
 ### The rest is the pattern #217 already set
 
 The workflow file rides in the persisted `file` field the editor pane added; `cwd` carries the
@@ -575,7 +604,9 @@ construction, not by remembering.
 | `workflowmodel.ts` (#222) | the pure half: the YAML subset, the schema, the canonical formatter, the pre-run validation pass, the derived graph — all node:tested |
 | `workflowview.ts` (#222) | the DOM: roster + property form, raw YAML, the **editable canvas**, findings strip, save/conflict, the start + error surfaces — and the same `dirty` / `canDiscard` / `bufferReport` contract the editor has |
 | `workflowlayout.ts` (#222 v2) | the canvas's pure half: `.loomux/workflow.layout.json`, placement, hit-testing, edge routing — all DOM-free, all node:tested |
-| `modal.ts` (#222 v2) | `promptModal` — one validated line of text, so a new block can be ASKED for its id instead of being given a generated one |
+| `modal.ts` (#222 v2) | `promptModal` — one line of text, validated on every keystroke (the affirm button is disabled while the id is bad), so a new block can be ASKED for its id instead of being given a generated one |
+| `workflowpane.ts` (#222 v2) | the pane's pure DECISIONS — which surface it shows, how a save is allowed to write, what the layout file may forget. Three rules the view used to hold itself, and got wrong |
+| `src-tauri/tests/workflowfile.rs` (#222 v2) | pins the two backend facts the create path rests on: a null-hash write clobbers (why a create must never use one), and `new_file` refuses atomically without truncating (why claiming the path fixes it) |
 | `filemenu.ts` / `fileexplorer.ts` / `fileexplorermodel.ts` (#222) | the `workflow-pane` row affordance — declared, and offered only on a `.yml`/`.yaml` row |
 | `launcher.ts` (#222) | the `Workflow` kind in the welcome form's picker (one option, one plan, one probe — the same directory probe files/editor use) |
 

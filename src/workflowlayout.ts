@@ -42,7 +42,25 @@ export interface WorkflowLayout {
   positions: Record<string, Point>;
 }
 
-export const emptyLayout = (): WorkflowLayout => ({ version: LAYOUT_VERSION, positions: {} });
+/** A position table with NO PROTOTYPE, and every read of it goes through `Object.hasOwn`.
+ *
+ *  Not defensive theatre — a plain object literal here is a live bug (rev-15 F3). A block id
+ *  is arbitrary text from the file: `id: constructor` is a perfectly legal, zero-findings
+ *  workflow (`isValidBlockId("constructor")` is true, and it can arrive from a hand edit, the
+ *  YAML tab, or an agent — nothing forces it through the +Block dialog). On a plain object,
+ *  `positions["constructor"]` returns the INHERITED `Object` function: truthy, so the caller
+ *  takes the "it has a stored position" branch, and reads `{ x: undefined, y: undefined }` off
+ *  it. That NaN then propagates into the SVG's width and height and the canvas does not render
+ *  at all — for a workflow that is entirely valid, and for an id that can never be changed.
+ *
+ *  Fixing the id validator would not fix this; only the lookup can. So the lookup is fixed. */
+const table = (): Record<string, Point> => Object.create(null) as Record<string, Point>;
+
+/** The stored position for `id`, or undefined — the ONE place `positions` is read by key. */
+const storedAt = (layout: WorkflowLayout, id: string): Point | undefined =>
+  id && Object.hasOwn(layout.positions, id) ? layout.positions[id] : undefined;
+
+export const emptyLayout = (): WorkflowLayout => ({ version: LAYOUT_VERSION, positions: table() });
 
 // ---------- geometry ----------
 
@@ -184,7 +202,7 @@ export function resolvePositions(
   const pos = new Map<string, Point>();
   const auto = autoPositions(graph, ghosts);
   for (const n of graph.nodes) {
-    const stored = n.block.id ? layout.positions[n.block.id] : undefined;
+    const stored = storedAt(layout, n.block.id);
     pos.set(blockKey(n.index), stored ? { x: stored.x, y: stored.y } : auto.get(blockKey(n.index))!);
   }
   // A ghost is never stored: it isn't a block, it is the ABSENCE of one, and persisting a
@@ -230,20 +248,24 @@ export function freeSlot(positions: ReadonlyMap<string, Point>): Point {
 /** Record where a block was dropped. Snapped, so nodes line up. */
 export function withPosition(layout: WorkflowLayout, id: string, p: Point): WorkflowLayout {
   if (!id) return layout; // an id-less stub has nothing stable to key a position by
-  return {
-    ...layout,
-    version: LAYOUT_VERSION,
-    positions: { ...layout.positions, [id]: { x: snap(p.x), y: snap(p.y) } },
-  };
+  const positions = table();
+  for (const [k, v] of entries(layout)) positions[k] = v;
+  positions[id] = { x: snap(p.x), y: snap(p.y) };
+  return { version: LAYOUT_VERSION, positions };
 }
+
+/** Every stored position, own keys only. `Object.entries` already skips the prototype, but the
+ *  whole module reads the table through these two helpers so that no future edit can quietly
+ *  reintroduce a raw `positions[id]`. */
+const entries = (layout: WorkflowLayout): [string, Point][] => Object.entries(layout.positions);
 
 /** Drop the positions of blocks that no longer exist. Without this the file grows forever —
  *  every block ever deleted leaves a coordinate behind, and the layout of a workflow you have
  *  edited for a year is mostly ghosts. Called on save, where we know the full block set. */
 export function pruneLayout(layout: WorkflowLayout, liveIds: readonly string[]): WorkflowLayout {
   const live = new Set(liveIds.filter(Boolean));
-  const positions: Record<string, Point> = {};
-  for (const [id, p] of Object.entries(layout.positions)) if (live.has(id)) positions[id] = p;
+  const positions = table();
+  for (const [id, p] of entries(layout)) if (live.has(id)) positions[id] = p;
   return { version: LAYOUT_VERSION, positions };
 }
 
@@ -254,7 +276,11 @@ export function layoutEquals(a: WorkflowLayout, b: WorkflowLayout): boolean {
   const ak = Object.keys(a.positions).sort();
   const bk = Object.keys(b.positions).sort();
   if (ak.length !== bk.length || ak.some((k, i) => k !== bk[i])) return false;
-  return ak.every((k) => a.positions[k]!.x === b.positions[k]!.x && a.positions[k]!.y === b.positions[k]!.y);
+  return ak.every((k) => {
+    const pa = storedAt(a, k);
+    const pb = storedAt(b, k);
+    return !!pa && !!pb && pa.x === pb.x && pa.y === pb.y;
+  });
 }
 
 // ---------- the layout file ----------
@@ -268,9 +294,12 @@ export function parseLayout(text: string): WorkflowLayout {
   try {
     const raw = JSON.parse(text) as unknown;
     if (!raw || typeof raw !== "object") return emptyLayout();
-    const positions: Record<string, Point> = {};
+    const positions = table();
     const src = (raw as { positions?: unknown }).positions;
     if (src && typeof src === "object") {
+      // `Object.entries` walks own keys only, and the table it fills has no prototype — so a
+      // hostile key in the FILE ("__proto__", "constructor") lands as an ordinary entry that
+      // no lookup can confuse with an inherited member.
       for (const [id, v] of Object.entries(src as Record<string, unknown>)) {
         const p = v as { x?: unknown; y?: unknown };
         if (typeof p?.x === "number" && typeof p?.y === "number" && Number.isFinite(p.x) && Number.isFinite(p.y)) {
@@ -278,6 +307,10 @@ export function parseLayout(text: string): WorkflowLayout {
         }
       }
     }
+    // The version is READ and deliberately not honoured: there is exactly one format, and a
+    // file claiming to be a future one still has x/y in it, which is all we want from it. When
+    // there is a v2 this is where it forks — and until then, saying so here beats a version
+    // field that looks like it does something.
     return { version: LAYOUT_VERSION, positions };
   } catch {
     return emptyLayout();
@@ -288,7 +321,7 @@ export function parseLayout(text: string): WorkflowLayout {
  *  moved — the same reason the workflow file has a canonical formatter. It is gitignorable,
  *  but plenty of teams will commit it, and it should be legible when they do. */
 export function serializeLayout(layout: WorkflowLayout): string {
-  const positions: Record<string, Point> = {};
-  for (const id of Object.keys(layout.positions).sort()) positions[id] = layout.positions[id]!;
+  const positions = table();
+  for (const id of Object.keys(layout.positions).sort()) positions[id] = storedAt(layout, id)!;
   return JSON.stringify({ version: LAYOUT_VERSION, positions }, null, 2) + "\n";
 }

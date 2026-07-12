@@ -28,6 +28,7 @@
 
 import {
   analyzeWorkflow,
+  parseWorkflow,
   serializeWorkflow,
   scaffoldWorkflowText,
   removeBlockAt,
@@ -76,7 +77,8 @@ import {
   type WorkflowLayout,
 } from "./workflowlayout";
 import { ftReadFile, ftWriteFile, ftListDir, errorCode, errorMessage } from "./fileapi";
-import { fmNewFolder } from "./filemgr";
+import { fmNewFolder, fmNewFile, fmErrorCode } from "./filemgr";
+import { paneSurface, savePlan, layoutPruneIds, type LayoutWrite } from "./workflowpane";
 import { appVersion } from "./pty";
 import { closeDecision, discardEdits, type ConflictChoice } from "./dirtystate";
 import { showToast } from "./toast";
@@ -349,7 +351,11 @@ export class WorkflowView {
 
     this.findingsEl = el("div", "wf-findings");
 
-    this.el.append(head, this.emptyEl, this.bodyEl, this.findingsEl);
+    // All FIVE surfaces. `errorEl` was built and never appended (rev-15 F1), so the state
+    // added to fix the UTF-16 bug rendered as a blank pane — the fix's own headline case was
+    // the one thing that didn't work. `render()` only toggles `hidden`; a surface that is not
+    // in the document has nothing to un-hide.
+    this.el.append(head, this.errorEl, this.emptyEl, this.bodyEl, this.findingsEl);
 
     // Ctrl+S saves from anywhere in the pane — including from inside the textarea, where
     // the browser would otherwise do nothing at all.
@@ -517,17 +523,62 @@ export class WorkflowView {
     // one is not. The findings strip is what says it isn't runnable yet.
     try {
       await this.ensureLoomuxDir();
-      const res = await ftWriteFile(this.root, this.rel, this.text, this.exists ? this.savedHash : null);
+      // CREATING vs EDITING are different writes, and conflating them destroyed files
+      // (rev-15 F2). When we believe there is no file, we cannot write with a null expected
+      // hash — `write_file` reads that as "write unconditionally", so a workflow that appeared
+      // AFTER the pane opened (an agent wrote one, a `git pull` brought one in, a teammate's
+      // branch landed) was overwritten by our scaffold, and the pane said "Saved".
+      //
+      // So a create CLAIMS THE PATH first, atomically: `fm_new_file` is `create_new(true)`,
+      // which refuses — without truncating — if anything is already there. Then we read the
+      // (empty) file we just made and write against ITS hash, so even the sliver between the
+      // claim and the write is guarded by the same conflict machinery as every other save.
+      const plan = savePlan({ exists: this.exists, savedHash: this.savedHash });
+      const hash = plan.kind === "guarded-write" ? plan.expectedHash : await this.claimFile();
+      if (hash === null) return; // the path was taken; the error surface now says so
+      const res = await ftWriteFile(this.root, this.rel, this.text, hash);
       this.savedText = this.text;
       this.savedHash = res.hash;
       this.exists = true;
       this.updateDirty();
-      await this.saveLayout();
+      await this.saveLayout("save"); // the roster on disk and in memory are the same roster now
       showToast(`Saved ${this.rel}`, "info");
     } catch (err) {
       if (errorCode(err) === "conflict") await this.resolveConflict();
       else showToast(`Save failed: ${errorMessage(err)}`);
     }
+  }
+
+  /** Claim `this.rel` for a file that does not exist yet, and return the hash to write
+   *  against — or null when something got there first, in which case the pane is now showing
+   *  the error surface and the caller must not write.
+   *
+   *  `fm_new_file` is the atomic half: `create_new(true)` ("create, but only if it isn't
+   *  there") is one syscall, so there is no window between the check and the create. The
+   *  `ftReadFile` after it is what turns the rest of the save into an ordinary hash-guarded
+   *  write — if anything touches the file between our claim and our write, that is a conflict
+   *  and the human gets the same three-way choice as always, instead of a silent overwrite. */
+  private async claimFile(): Promise<string | null> {
+    const root = this.root!;
+    const parts = this.rel.split(/[\\/]/);
+    const name = parts.pop() ?? WORKFLOW_FILE;
+    const dir = parts.join("/");
+    try {
+      await fmNewFile(root, dir, name);
+    } catch (err) {
+      if (fmErrorCode(err) !== "exists") throw err;
+      // Something wrote a workflow while this pane was sitting on its start surface. Do NOT
+      // scaffold over it — it is somebody's work, it is probably the thing they wanted, and
+      // this pane has never even shown it to them. Say so, and let Retry read it.
+      this.loadError =
+        `A workflow appeared at ${this.rel} while this pane was open — written by an agent, a git pull, or another editor. ` +
+        `It has NOT been overwritten. Retry to load it (your unsaved text is discarded).`;
+      this.render();
+      showToast(`${this.rel} already exists — nothing was overwritten.`);
+      return null;
+    }
+    const fresh = await ftReadFile(root, this.rel); // the empty file we just created
+    return fresh.hash;
   }
 
   /** Make sure `.loomux/` exists before writing into it.
@@ -567,18 +618,31 @@ export class WorkflowView {
    *
    *  Deliberately NOT part of the dirty/unsaved-work contract: a node's x/y is not the human's
    *  WORK, and a dialog asking whether to save the fact that you nudged a box is a dialog that
-   *  teaches people to click through dialogs. It rides along with a real save, and a drag
-   *  writes it directly (see `commitDrag`). No hash guard either — this file is ours, nobody
-   *  else writes it, and a lost position costs a drag. */
-  private async saveLayout(): Promise<void> {
+   *  teaches people to click through dialogs. A drag writes it directly; a real save writes it
+   *  too. No hash guard — this file is ours, nobody else writes it, and a lost position costs a
+   *  drag.
+   *
+   *  `prune` is only ever true from `save()`, and that is the whole of rev-15 F5. Pruning drops
+   *  the positions of blocks that "no longer exist" — but a DRAG happens against the unsaved
+   *  buffer, where a block the human has deleted-but-not-saved does not exist *yet*. Pruning
+   *  there wrote the deletion into `workflow.layout.json` on disk before the human had committed
+   *  it to `workflow.yml`, so discarding the edit brought the block back with its position gone.
+   *  Pruning belongs where its own comment always claimed it was: at a save, just after the
+   *  workflow write succeeded — which is the one moment the roster on disk and the roster in
+   *  memory are the same roster. */
+  private async saveLayout(when: LayoutWrite = "drag"): Promise<void> {
     if (!this.root) return;
-    const pruned = pruneLayout(this.layout, this.analysis.workflow.blocks.map((b) => b.id));
-    this.layout = pruned;
-    if (layoutEquals(pruned, this.savedLayout)) return;
+    // WHAT MAY BE FORGOTTEN is a rule (`workflowpane.layoutPruneIds`), not a flag: on a save the
+    // roster on disk and the roster in memory are the same, so pruning against it is safe; on a
+    // drag they are not, so the union of the two is what survives.
+    const saved = this.savedText.trim() ? parseWorkflow(this.savedText).workflow : null;
+    const next = pruneLayout(this.layout, layoutPruneIds(saved, this.analysis.workflow, when));
+    this.layout = next;
+    if (layoutEquals(next, this.savedLayout)) return;
     try {
       await this.ensureLoomuxDir();
-      await ftWriteFile(this.root, LAYOUT_FILE, serializeLayout(pruned), null);
-      this.savedLayout = pruned;
+      await ftWriteFile(this.root, LAYOUT_FILE, serializeLayout(next), null);
+      this.savedLayout = next;
     } catch {
       // A layout we couldn't save is a picture that comes back computed instead. Not worth a
       // toast, and certainly not worth failing the workflow save that may have preceded it.
@@ -681,8 +745,12 @@ export class WorkflowView {
    *            not an apology: one line, one button, and the roster it is about to write.
    *    BODY  — a workflow. The roster, the form, the canvas, the YAML, the findings. */
   private render(): void {
-    const error = this.loadError !== null;
-    const start = !error && !this.exists && !this.text.trim();
+    // WHICH SURFACE is a rule, and it lives in `workflowpane.paneSurface` — pure, and tested.
+    // The last time this view worked it out for itself, it showed "there is no workflow here"
+    // for a file that was there and merely unreadable, and then offered to create one over it.
+    const surface = paneSurface({ loadError: this.loadError, exists: this.exists, text: this.text });
+    const error = surface === "error";
+    const start = surface === "start";
     this.errorEl.hidden = !error;
     this.errorTextEl.textContent = this.loadError ?? "";
     this.emptyEl.hidden = !start;
@@ -1442,7 +1510,7 @@ export class WorkflowView {
       el(
         "span",
         "wf-graph-hint",
-        "Drag a node to move it · drag from its ● to another node to connect · click an edge to select it"
+        "Drag a node to move it · drag from its ● to another node to connect · click an edge to select it · double-click the canvas to add a block"
       )
     );
     const legend = el("div", "wf-legend");
@@ -1585,6 +1653,14 @@ export class WorkflowView {
       );
     }
 
+    // Double-click on empty canvas → a block, THERE. (rev-15 minor: `createBlock(at)` took a
+    // point no caller ever passed, and its comment promised a gesture that did not exist. It
+    // does now — it is the first thing anyone tries on a canvas, and it was one line to honour.)
+    root.addEventListener("dblclick", (ev) => {
+      const pt = this.canvasPoint(ev as unknown as PointerEvent, root);
+      if (hitTestNodes(this.nodeRects(), pt)) return; // double-clicking a node is not "add here"
+      void this.createBlock(pt);
+    });
     root.addEventListener("pointerdown", (ev) => this.onCanvasDown(ev, root));
     root.addEventListener("pointermove", (ev) => this.onCanvasMove(ev, root));
     root.addEventListener("pointerup", (ev) => this.onCanvasUp(ev, root));
