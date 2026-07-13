@@ -1181,7 +1181,7 @@ fn every_reviewer_hears_the_findings_duty_however_its_persona_was_written() {
     // and a quadratic scan is invisible in a passing test. Matched case-insensitively and on
     // SUBSTANCE, not phrasing — reword freely, but do not drop the lane.
     for (surface, doc) in [("mechanics_core(Reviewer)", &core), ("reviewer.md", &builtin)] {
-        let low = doc.to_lowercase();
+        let low = flat(doc);
         for (lane, why) in [
             ("trust boundar", "the security lane — which inputs are attacker-controllable, and where they land"),
             ("new dependency", "the dependency lane — a dep is permanent and can violate a repo's platform rules fatally"),
@@ -1212,7 +1212,7 @@ fn red_before_green_is_demanded_evidenced_and_verified_across_every_surface() {
     let reviewer = instructions_lf(&reg, &g.id, "reviewer.md");
 
     // The worker runs the new tests against the code WITHOUT the change and shows the failure.
-    let w = worker.to_lowercase();
+    let w = flat(&worker);
     assert!(w.contains("base branch"), "worker.md must name where the test has to fail: {worker}");
     assert!(
         w.contains("failure line"),
@@ -1226,7 +1226,7 @@ fn red_before_green_is_demanded_evidenced_and_verified_across_every_surface() {
         .workflow("version: 1\nblocks:\n  - id: w-x\n    kind: worker\n    profile: .github/agents/w-x.md\n")
         .agent_file("w-x.md", "---\nname: w-x\nmode: replace\ndescription: Repo's own worker.\n---\nShip it fast.");
     let g2 = reg2.create_group(&repo.path(), rails()).unwrap();
-    let core = instructions_lf(&reg2, &g2.id, "w-x.md").to_lowercase();
+    let core = flat(&instructions_lf(&reg2, &g2.id, "w-x.md"));
     assert!(
         core.contains("base branch") && core.contains("failure line"),
         "mechanics_core(Worker) must carry the evidence duty too — a replace persona never \
@@ -1235,9 +1235,9 @@ fn red_before_green_is_demanded_evidenced_and_verified_across_every_surface() {
 
     // The orchestrator treats an unevidenced `done` as not done — otherwise the duty is
     // advice, and advice is what the DoD already was.
-    let o = orch.to_lowercase();
+    let o = flat(&orch);
     assert!(
-        orch.contains("**red-before-green evidence**"),
+        o.contains("**red-before-green evidence**"),
         "the worker brief must ask for the evidence up front — a bar the worker first hears \
          about at the completion check is a round-trip nobody needed: {orch}"
     );
@@ -1248,7 +1248,7 @@ fn red_before_green_is_demanded_evidenced_and_verified_across_every_surface() {
     );
 
     // The reviewer verifies the evidence instead of believing it.
-    let r = reviewer.to_lowercase();
+    let r = flat(&reviewer);
     assert!(
         r.contains("red-before-green"),
         "reviewer.md must check the evidence in the test-quality lane: {reviewer}"
@@ -1282,8 +1282,8 @@ fn the_orchestrator_can_send_work_back_on_design_grounds_not_only_acceptance_cri
     let orch = instructions_lf(&reg, &g.id, "orchestrator.md");
     let planner = instructions_lf(&reg, &g.id, "planner.md");
 
-    assert!(orch.contains("## Engineering standards"), "the grounds need one authoritative site: {orch}");
-    let o = orch.to_lowercase();
+    let o = flat(&orch);
+    assert!(o.contains("## engineering standards"), "the grounds need one authoritative site: {orch}");
     for (ground, why) in [
         ("coupling", "cross-module coupling / a dependency pointing the wrong way"),
         ("duplicat", "a second mechanism where the repo already had one"),
@@ -1298,12 +1298,12 @@ fn the_orchestrator_can_send_work_back_on_design_grounds_not_only_acceptance_cri
         "the standards must gate the PLAN — before any code exists is the cheap moment: {orch}"
     );
     assert!(
-        orch.contains("Does it clear the bar in Engineering standards?"),
+        o.contains("does it clear the bar in engineering standards?"),
         "…and the completion check, where the PR is still cheaper to bounce than to revert: {orch}"
     );
 
     // The planner's plan has to carry what the gate reads.
-    let p = planner.to_lowercase();
+    let p = flat(&planner);
     for (duty, why) in [
         ("boundaries", "which module owns the code and which seams it crosses"),
         ("alternatives considered", "the options that lost, and why — a plan with one option didn't look"),
@@ -1324,7 +1324,7 @@ fn a_merge_the_orchestrator_performed_owns_the_default_branchs_next_ci_run() {
     let (reg, _d) = test_registry();
     let g = reg.create_group(&Repo::new().path(), plain_rails()).unwrap();
     let orch = instructions_lf(&reg, &g.id, "orchestrator.md");
-    let o = orch.to_lowercase();
+    let o = flat(&orch);
 
     assert!(
         o.contains("post-merge run"),
@@ -1359,11 +1359,11 @@ fn every_open_branch_is_re_synced_after_the_default_branch_moves() {
     let (reg, _d) = test_registry();
     let g = reg.create_group(&Repo::new().path(), plain_rails()).unwrap();
     let orch = instructions_lf(&reg, &g.id, "orchestrator.md");
-    let o = orch.to_lowercase();
+    let o = flat(&orch);
 
     // Detection: checks are silent about mergeability, so the sweep has to ask.
     assert!(
-        orch.contains("--json mergeable"),
+        o.contains("--json mergeable"),
         "the sweep must ask whether the PR still merges — green checks say nothing about it: {orch}"
     );
     assert!(o.contains("conflicting"), "…and know the state it is looking for: {orch}");
@@ -1401,6 +1401,68 @@ fn every_open_branch_is_re_synced_after_the_default_branch_moves() {
 }
 
 #[test]
+fn the_invariants_digest_leads_the_document_and_carries_what_compaction_would_cost() {
+    // #236 F8. The prompt anticipates its own compaction ("your context may have compacted";
+    // "compact at lulls") and was then written as ~500 lines of prose optimized for one careful
+    // read — with the load-bearing rules restated three and four times, which is what long
+    // documents do INSTEAD of being memorable. A summary keeps a document's shape and loses its
+    // rules.
+    //
+    // The digest is the answer: the rules that must survive summarization, stated once, at the
+    // top, where a compacted orchestrator that re-reads its instruction file hits them first. It
+    // is only worth anything if it (a) precedes the bulk of the document and (b) actually names
+    // the rules whose loss would be dangerous — a merge without a gate, a merge past an open
+    // question, a dropped finding, an unevidenced test, a red main, an unlabelled issue started.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group(&Repo::new().path(), plain_rails()).unwrap();
+    let orch = instructions_lf(&reg, &g.id, "orchestrator.md");
+    let o = flat(&orch);
+
+    let digest = o.find("## invariants").expect("orchestrator.md must open with an INVARIANTS digest");
+    let tools = o.find("## your loomux mcp tools").expect("the tools section still exists");
+    assert!(
+        digest < tools,
+        "the digest must lead the document — a rule stated 400 lines in is a rule a summary \
+         already dropped: {orch}"
+    );
+
+    // It is FOR the compacted reader, and says so: re-read it, don't trust your memory of it.
+    let head = &o[digest..tools];
+    assert!(
+        head.contains("compact"),
+        "the digest must say what it is for — surviving compaction — and tell the orchestrator to \
+         re-read it after one: {head}"
+    );
+
+    // The rules whose loss is dangerous. Substance, matched loosely: reword freely, but a digest
+    // that has stopped naming one of these has stopped being the thing that survives.
+    for (rule, why) in [
+        ("never merge to the default branch", "the merge gate — the one rule an agent must never forget it is under"),
+        ("holds that pr's merge", "a question you asked the human holds the merge, in every mode (#222)"),
+        ("not a disposition", "an approval with findings open is not done (#222)"),
+        ("own the architecture", "the engineering bar beyond the acceptance criteria"),
+        ("seen to fail", "no test is believed until it has been watched failing"),
+        ("red main", "a merge it performed owns the default branch's next CI run"),
+        ("stale", "a moved default branch makes every open branch stale, not just conflicted"),
+        ("consent boundary", "the label funnel: file freely, never start unlabelled"),
+        ("bounded", "every loop terminates — CI, review rounds, rebases"),
+        ("full", "a session id resumes only in full"),
+    ] {
+        assert!(head.contains(rule), "INVARIANTS must carry {why}: {head}");
+    }
+
+    // And the body must not re-argue what the digest owns — the failure mode the digest exists to
+    // fix is repetition, so re-adding a rule in three places would defeat it. The disposition
+    // rule is the canary: it was the most-restated rule in the pre-#236 document.
+    let body = &o[tools..];
+    assert!(
+        body.matches("an approval with findings").count() <= 1,
+        "the body restates a rule the digest owns — compression means stating it once and \
+         cross-referencing, not moving the repetition around: {body}"
+    );
+}
+
+#[test]
 fn the_orchestrator_may_file_an_issue_it_may_never_start_and_it_distils_what_recurs() {
     // #236 F6 + F5, together because they are the same boundary seen from both sides: what the
     // orchestrator may do UNPROMPTED. Filing is free (an observation that never became an issue
@@ -1410,7 +1472,7 @@ fn the_orchestrator_may_file_an_issue_it_may_never_start_and_it_distils_what_rec
     let (reg, _d) = test_registry();
     let g = reg.create_group(&Repo::new().path(), plain_rails()).unwrap();
     let orch = instructions_lf(&reg, &g.id, "orchestrator.md");
-    let o = orch.to_lowercase();
+    let o = flat(&orch);
 
     assert!(
         o.contains("you may file; you may not start"),
@@ -2008,6 +2070,17 @@ fn render_with_legacy_vars(tpl: &str, g: &loomux_lib::orchestration::GroupInfo) 
 /// and failing on the machine that wrote them.
 fn lf(s: &str) -> String {
     s.replace("\r\n", "\n")
+}
+
+/// Lowercased, with every run of whitespace collapsed to one space.
+///
+/// The substance pins below match *phrases*, and a phrase in a hard-wrapped markdown file
+/// straddles a newline the moment someone reflows the paragraph around it. Anchoring on the raw
+/// text would make a pin fire on a line wrap — a red that says "you changed the rule" when the
+/// rule did not move, which is exactly the noise that teaches people to re-bless without reading.
+/// Substance is the claim these tests make; typography is not.
+fn flat(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
 }
 
 fn instructions(reg: &OrchRegistry, group: &str, file: &str) -> String {

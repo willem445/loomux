@@ -324,9 +324,24 @@ orchestrator a value system to match its operational one:
   is the argument for paying it early and in the quiet rather than on the PR you were about to
   land. Paced against the delegate cap, never bursty.
 
+- **Compression, and the INVARIANTS digest.** The prompt predicts its own compaction ("your
+  context may have compacted"; "compact at lulls") and was nonetheless written as ~500 lines of
+  prose optimized for one careful read, with the load-bearing rules restated three and four times.
+  Repetition is not memory: a summary keeps a document's *shape* and loses its *rules*. So the
+  eleven rules whose loss is dangerous — the merge gate, the question-hold, disposition, the
+  architectural bar, red-before-green, red main, fleet staleness, the label funnel, bounded loops,
+  one-task-per-worker, externalized memory — are stated **once**, in an `## INVARIANTS` digest at
+  the very top, which the orchestrator is told to re-read at session start and after every
+  compaction. Every body section then *stops restating them* and holds only the procedure and the
+  why, cross-referencing the digest by number. That is what pays for the additions above: the
+  orchestrator template grew seven new rules and still ends up denser than it was
+  (≈513 → 625 lines for ~2× the rules), because the rhetoric that carried the old ones is gone.
+
 Each rule is pinned in `tests/workflow.rs` on the surfaces that carry it, and the golden fixtures
 in `tests/fixtures/pre222/` are re-blessed in their own commit — the diff on that directory is the
-review surface for "what did we just tell every default group to do differently?".
+review surface for "what did we just tell every default group to do differently?". The pins match
+**substance with whitespace collapsed** (`flat()`), deliberately: a pin that fires when a
+paragraph is re-wrapped is a pin that teaches people to re-bless without reading.
 
 ## Validation-round additions (2026-07-03)
 
