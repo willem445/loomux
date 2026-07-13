@@ -15,6 +15,21 @@ so far:
   (findings labelled blocking/non-blocking; an approval with findings open must say so).
   `worker.md` and `planner.md` still stand exactly as they did pre-#222.
 
+- **#236, engineering standards** — all four files, the first time `worker.md` and
+  `planner.md` have moved since the seed. `orchestrator.md`: an **Engineering standards**
+  section (concrete grounds to reject a plan or bounce a PR — coupling, a duplicated
+  mechanism, an unargued dependency, a contract change with no design note), gated at plan
+  intake *and* the completion check; red-before-green evidence demanded and an unevidenced
+  `done` refused; post-merge ownership of the default branch (red main stops the queue, one
+  fix-forward attempt, then revert); **re-sync the fleet** — every open branch rebases when
+  the default branch moves, stale as well as conflicted; a learning loop; and permission to
+  *file* an issue (never to *start* one). `worker.md`: red-before-green in the DoD, plus the
+  stated-constraints bar (dependencies, public contracts, reuse). `reviewer.md`: three new
+  lanes — security/trust boundaries, dependency hygiene, algorithmic cost — and the duty to
+  *verify* the author's evidence rather than read it. `planner.md`: a plan must address
+  boundaries, reuse-before-invention, dependencies, public-contract changes and the
+  alternatives it considered.
+
 `the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was` renders
 **these** with the six pre-#222 template variables and asserts that a group launched
 with the advanced orchestrator **off** gets exactly that text. They are the

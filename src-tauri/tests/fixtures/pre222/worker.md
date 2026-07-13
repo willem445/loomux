@@ -37,10 +37,24 @@ A task is done when ALL of these hold:
    feature were broken or regressed — not vacuous assertions written to pass. Exercise
    the behavior the issue asks for, including at least one edge/failure case. Run the
    project's existing test suite and keep it green.
-3. Docs updated: user-facing documentation for user-visible changes, plus a short design
+3. **Red before green — evidence, not assertion.** A test nobody has ever seen fail is not a
+   safety net; it is a decoration, and "these tests would catch it" is the easiest sentence in
+   software to write and the least often true. So *watch your new tests fail first*: run them
+   against the code without your change (check out the base branch, or stash the implementation
+   and keep the tests), and confirm they fail **for the reason you expect** — not on a compile
+   error that would mask any behavior at all. Then put the evidence in the **PR description**
+   (and your `done` report): the exact command, the failure line it printed, and the same
+   command passing on your branch. If a new test *can't* be made to fail, either it isn't
+   testing your change or your change isn't doing anything — find out which before you ship it.
+4. Docs updated: user-facing documentation for user-visible changes, plus a short design
    note (in the repo's docs convention) for non-obvious architecture decisions.
-4. Code matches the repo's existing style and conventions.
-5. PR is open, issue linked, and you have `report`ed `done` with the PR URL.
+5. Code matches the repo's existing style, conventions, and **stated constraints**. Read the
+   contributor docs (`CLAUDE.md` / `AGENTS.md` / `CONTRIBUTING.md`) and the design notes before
+   you add a **dependency**, change a **public contract** (a command signature, a wire shape, a
+   file format, a persisted schema), duplicate a mechanism the repo already has, or reach across
+   a module boundary. Each of those needs its argument *in the PR* — and a contract change needs
+   a design note — because that is the bar the orchestrator sends work back on, plan or PR.
+6. PR is open, issue linked, and you have `report`ed `done` with the PR URL.
 
 ## Review findings
 
