@@ -217,9 +217,18 @@ fn the_orchestrators_findings_policy_survives_in_substance() {
         (disposition, "the disposition step", "whatever severity the reviewer gave it",
          "…and that the call is the ORCHESTRATOR's — the reviewer rates the diff, it owns the \
           requirement"),
-        (disposition, "the disposition step", "`--request-changes`, not `--approve`",
-         "…and that the label BINDS to the action: an approval carrying a reviewer-labelled \
-          blocking finding is a contradiction to send back, not to merge on"),
+        // The bind is on the VERDICT, not on the `gh` flag (rev-23 F1). GitHub refuses BOTH
+        // `--request-changes` and `--approve` on a PR opened by your own account — which is the
+        // normal case here, since every agent in a group authenticates as one GitHub user and that
+        // user authors the PRs. Every review this repository has ever received is `COMMENTED`. So a
+        // rule anchored on the flag binds nothing, while the channel the orchestrator actually
+        // gates on — "the reviewer approved", learned from its `report(...)` — stays unconstrained:
+        // a reviewer could label a finding blocking, report `approved`, and satisfy every sentence.
+        // That is #235's original incident, resurrected by the rule written to prevent it.
+        (disposition, "the disposition step", "\"changes requested\" verdict, not an approval",
+         "…and that the label BINDS to the VERDICT: an approval carrying a reviewer-labelled \
+          blocking finding is a contradiction to send back, not to merge on — and the verdict, not \
+          GitHub's review state, is what the orchestrator reads"),
         (disposition, "the disposition step", "why the fix doesn't belong in",
          "deferral cost 1 — a REASON naming why the fix doesn't belong in THIS PR ('scope' is a \
           category word; 'it'd only take ten minutes' is a reason to FIX it)"),
@@ -233,6 +242,15 @@ fn the_orchestrators_findings_policy_survives_in_substance() {
         (disposition, "the disposition step", "round of findings on the same pr",
          "the loop's BOUND — three rounds and the PR settles, or a reviewer with one new nit per \
           round runs it forever"),
+        // rev-23 F1's other half: the merge gate opens on "the reviewer approved", and the
+        // orchestrator learns that from the reviewer's report + review body — NOT from GitHub's
+        // review state, which stays COMMENTED whenever the reviewer and the author are the same
+        // account. Say where the verdict lives, or the gate reads a channel nobody constrained.
+        (gate, "the merge gate", "not github's review state",
+         "the gate must say WHERE the verdict lives: the reviewer's `report(...)` and the top of \
+          its review body. GitHub's review state stays COMMENTED on a same-account PR, so an \
+          orchestrator that looked there would find no approval to gate on — and one that treats \
+          COMMENTED as approval has no gate at all"),
         (gate, "the merge gate", "open-question hold",
          "the HOLD: a question you asked the human holds that PR's merge in every mode"),
         (gate, "the merge gate", "telling is not asking",
@@ -523,18 +541,35 @@ fn the_reviewer_has_the_lanes_and_classifies_every_finding() {
     }
 
     // And every finding is classified, because the orchestrator has to disposition each one before
-    // the PR merges and cannot do that from unlabelled prose. The label BINDS to the action: a
-    // reviewer that may call a finding blocking and approve anyway has reopened the hole the label
-    // was added to close.
+    // the PR merges and cannot do that from unlabelled prose. The label then BINDS — but it binds
+    // to the VERDICT, not to a `gh` flag (rev-23 F1): GitHub refuses `--request-changes` AND
+    // `--approve` on a PR opened by your own account, which is the normal case when a whole group
+    // authenticates as one GitHub user, so every review this repo has ever received is `COMMENTED`.
+    // A reviewer that could not `--request-changes` had been given no legal way to say "no", and
+    // the only other action the template named was `--approve` — the #235 incident, rebuilt by the
+    // rule meant to prevent it. So: the verdict in the review body and the `report(...)` is the
+    // binding record, `--comment` is the named fallback, and a refused `--request-changes` may
+    // never decay into an approval or a softer verdict.
     pinned("reviewer.md", &r, "label every finding",
         "findings are labelled blocking / non-blocking — the orchestrator dispositions each one and \
          cannot do it from unlabelled prose");
     pinned("reviewer.md", &r, "stated rationale",
         "…and a finding that contradicts the change's OWN stated rationale is not a nit, however \
          small the fix: it says the change does not do what it claims");
-    pinned("reviewer.md", &r, "not `--approve`",
-        "…and the label binds to the ACTION: a blocking finding means `--request-changes`, so an \
-         approval with findings open is only ever an approval with NON-blocking findings open");
+    pinned("reviewer.md", &r, "your verdict is \"changes requested\", not \"approve\"",
+        "…and the label binds to the VERDICT: a blocking finding means a changes-requested verdict, \
+         so an approval with findings open is only ever an approval with NON-blocking findings open");
+    pinned("reviewer.md", &r, "the binding record is the verdict you state",
+        "…and the VERDICT — stated in the review body and repeated in `report(...)` — is the binding \
+         surface, because it is the channel the orchestrator actually merges on; the `gh` flag is \
+         only the mechanism, and it is one GitHub refuses on a same-account PR");
+    pinned("reviewer.md", &r, "post with `--comment`",
+        "…so the fallback must be NAMED (`--comment`, verdict at the top of the body), or a reviewer \
+         that hits the refusal improvises — and the only other action the template names is \
+         `--approve`");
+    pinned("reviewer.md", &r, "never a reason to `--approve`",
+        "…and a refused `--request-changes` may never decay into an approval or a softened verdict: \
+         the mechanism was unavailable, the finding was not");
     // `findings still open` occurs twice — step 3 states the rule, step 5 states the reporting
     // duty — so `pinned` rejects it: either would rescue the other. Anchor step 5's own clause.
     pinned("reviewer.md", &r, "disposition pending",

@@ -367,8 +367,9 @@ When a worker reports a PR:
      bypassable, the error the PR promised to raise doesn't fire — means the change does not do
      what it claims, whatever severity the reviewer gave it. Send it back. (An approval that
      *itself* carries a finding the reviewer labelled **blocking** is a contradiction — a blocking
-     finding means `--request-changes`, not `--approve`. Don't merge on it: treat the finding as
-     blocking, send it back, and tell the reviewer its approval didn't match its own findings.)
+     finding means a **"changes requested" verdict, not an approval**. Don't merge on it: treat the
+     finding as blocking, send it back, and tell the reviewer its verdict didn't match its own
+     findings.)
    - **Deferring is the exception, and it is never silent.** It costs three things, and skipping
      any one of them drops the finding:
      1. **A reason naming why the fix doesn't belong in *this* PR** — it needs a decision you
@@ -423,8 +424,10 @@ The gate opens in exactly two ways:
 
 - **Blanket (autonomous auto-merge).** With **autonomous mode ON and auto-merge ENABLED** (your
   kickoff config says so; a `[loomux] auto-merge …` notice announces a live toggle), you **MAY**
-  merge a PR yourself once **all** of: the reviewer approved, CI is green, and you've confirmed
-  it meets the acceptance criteria. **Audit-announce** each merge (which PR, why it qualified)
+  merge a PR yourself once **all** of: the reviewer approved — **the verdict it states in its
+  `report(...)` and at the top of its review body, not GitHub's review state, which stays
+  `COMMENTED` whenever the reviewer and the PR's author are the same account** — CI is green, and
+  you've confirmed it meets the acceptance criteria. **Audit-announce** each merge (which PR, why it qualified)
   and record it on the board task. Still **hold for the human** anything risky or ambiguous —
   wide blast radius, auth/release/data, unresolved discussion, criteria you're unsure of. This is
   permission to finish routine, well-tested work unattended, not a mandate to merge everything;
@@ -438,7 +441,7 @@ The gate opens in exactly two ways:
 
 **The open-question hold, in practice** (INVARIANT 2). Each of the gates above authorizes a merge
 *you were ready to make*; none of them answers a question you asked, and a reviewer's second
-`pass` landing is not the human replying.
+approval landing is not the human replying.
 
 - **What holds:** a question whose answer you are waiting on ("should this guard reject the
   string, or is `Infinity` acceptable here?"). Nothing else does — **telling is not asking**. A

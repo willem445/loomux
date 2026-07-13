@@ -272,10 +272,19 @@ The failure is **policy**, so the fix is prose, in the surfaces the agents actua
 - **Severity is the reviewer's rating; the requirement is the orchestrator's.** A finding that
   contradicts the change's *own stated rationale* is blocking regardless of the label the reviewer
   put on it, because a change that doesn't do what it claims hasn't met the issue.
-- **Label binds to action.** A blocking *finding* means `--request-changes`, never `--approve`
-  with a note: an approval with findings open is only ever an approval with *non-blocking* findings
-  open, and its summary has to say so ("approved, 2 non-blocking, disposition pending") — the
-  orchestrator merges on what the reviewer told it.
+- **Label binds to verdict — and the verdict is not the `gh` flag.** A blocking *finding* means a
+  **"changes requested" verdict**, never an approval with a note: an approval with findings open is
+  only ever an approval with *non-blocking* findings open, and its summary has to say so
+  ("approved, 2 non-blocking, disposition pending"). The **binding surface is the verdict the
+  reviewer states at the top of its review body and repeats in `report(...)`** — because that is
+  the channel the orchestrator actually merges on. `gh pr review --request-changes` / `--approve`
+  is only the *mechanism*, and **GitHub refuses both on a PR opened by your own account** — the
+  normal case here, since a whole group authenticates as one GitHub user and that user authors the
+  PRs (every review this repo has ever received is `COMMENTED`). So the fallback is named —
+  `--comment`, with the verdict leading the body — and a `--request-changes` GitHub refused is
+  **never** a reason to `--approve` or to soften the verdict: the mechanism was unavailable, the
+  finding was not. A bind anchored on the flag would bind nothing while leaving the channel the
+  orchestrator reads unconstrained, which is the original incident wearing the new rule's clothes.
 - **Hold on an open question — and know what a question is.** If the orchestrator asked the human
   to *decide* something about a PR, the merge holds until they answer, explicitly including when
   auto-merge, a one-time grant or supervised dangerous mode would otherwise authorize it: those
