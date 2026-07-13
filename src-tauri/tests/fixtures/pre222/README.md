@@ -1,9 +1,19 @@
-# Golden templates — the four role instruction files as they stood before #222
+# Golden templates — what a default group reads, pinned
 
-These are byte copies of `src/orchestration/templates/{orchestrator,worker,reviewer,planner}.md`
-taken from the commit *before* the advanced-orchestrator toggle
-(`4b93282`, the #222 integration branch with the block model and the workflow pane
-on it, and nothing else).
+These are byte copies of `src/orchestration/templates/{orchestrator,worker,reviewer,planner}.md`,
+**seeded** from the commit *before* the advanced-orchestrator toggle (`4b93282`, the #222
+integration branch with the block model and the workflow pane on it, and nothing else) —
+which is where the directory's name comes from.
+
+They are not frozen forever: they are the *last human-blessed* copy. When the role
+templates deliberately change, the fixture is re-blessed (see below) and the diff on this
+directory is the record of what every default group was told to do differently. Re-blessings
+so far:
+
+- **#222, findings-disposition policy** — `orchestrator.md` (disposition step in the review
+  loop; open-question merge hold; "the codebase's advocate" posture) and `reviewer.md`
+  (findings labelled blocking/non-blocking; an approval with findings open must say so).
+  `worker.md` and `planner.md` still stand exactly as they did pre-#222.
 
 `the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was` renders
 **these** with the six pre-#222 template variables and asserts that a group launched
