@@ -1186,9 +1186,9 @@ fn every_reviewer_hears_the_findings_duty_however_its_persona_was_written() {
             ("trust boundar", "the security lane — which inputs are attacker-controllable, and where they land"),
             ("new dependency", "the dependency lane — a dep is permanent and can violate a repo's platform rules fatally"),
             ("algorithmic cost", "the cost lane — what the change costs at the sizes it will really see"),
-            ("red-before-green", "the duty to check the author's fail-then-pass evidence rather than trust it"),
+            ("red-before-green", "the duty to CHECK the author's fail-then-pass evidence rather than trust it"),
         ] {
-            assert!(low.contains(lane), "{surface} must give the reviewer {why}: {doc}");
+            pinned(surface, &low, lane, why);
         }
     }
 }
@@ -1212,13 +1212,18 @@ fn red_before_green_is_demanded_evidenced_and_verified_across_every_surface() {
     let reviewer = instructions_lf(&reg, &g.id, "reviewer.md");
 
     // The worker runs the new tests against the code WITHOUT the change and shows the failure.
+    // Scoped to the DoD, and through `pinned`: "base branch" also appears in worker.md's git
+    // workflow ("create your branch off the default branch"), so the evidence duty needs an
+    // anchor of its own or the pin is rescued by prose about something else entirely (rev-21).
     let w = flat(&worker);
-    assert!(w.contains("base branch"), "worker.md must name where the test has to fail: {worker}");
-    assert!(
-        w.contains("failure line"),
-        "worker.md must demand the evidence itself (command + failure line), not a claim that \
-         the tests are good: {worker}"
-    );
+    let dod = section(&w, "## definition of done", "## review findings");
+    pinned("worker.md's DoD", dod, "against the code *without* your change",
+        "the worker must run the new tests against the code WITHOUT the change — that is the \
+         whole of red-before-green, and 'base branch' alone is a phrase it shares with the git \
+         workflow");
+    pinned("worker.md's DoD", dod, "the failure line it printed",
+        "…and produce the evidence itself (command + failure line), not a claim that the tests \
+         are good");
 
     // ...and so does a worker whose persona replaced the template outright.
     let (reg2, _d2) = test_registry();
@@ -1227,42 +1232,33 @@ fn red_before_green_is_demanded_evidenced_and_verified_across_every_surface() {
         .agent_file("w-x.md", "---\nname: w-x\nmode: replace\ndescription: Repo's own worker.\n---\nShip it fast.");
     let g2 = reg2.create_group(&repo.path(), rails()).unwrap();
     let core = flat(&instructions_lf(&reg2, &g2.id, "w-x.md"));
-    assert!(
-        core.contains("base branch") && core.contains("failure line"),
-        "mechanics_core(Worker) must carry the evidence duty too — a replace persona never \
-         reads worker.md, and 'my tests would catch it' is exactly the claim it would make: {core}"
-    );
+    pinned("mechanics_core(Worker)", &core, "run them against the base branch",
+        "the core must carry the evidence duty too — a replace persona never reads worker.md, and \
+         'my tests would catch it' is exactly the claim it would make");
+    pinned("mechanics_core(Worker)", &core, "failure line in the pr description",
+        "…including the evidence itself");
 
     // The orchestrator treats an unevidenced `done` as not done — otherwise the duty is
     // advice, and advice is what the DoD already was.
     let o = flat(&orch);
-    assert!(
-        o.contains("**red-before-green evidence**"),
-        "the worker brief must ask for the evidence up front — a bar the worker first hears \
-         about at the completion check is a round-trip nobody needed: {orch}"
-    );
-    assert!(
-        o.contains("not done"),
+    pinned("the worker brief", &o, "**red-before-green evidence**",
+        "the brief must ask for the evidence up front — a bar the worker first hears about at the \
+         completion check is a round-trip nobody needed");
+    let check = section(&o, "4. do your own **high-level** completion check", "5. confirm the pr's ci");
+    pinned("the completion check", check, "is **not done**",
         "the completion check must reject a `done` whose PR shows no test failing on the base \
-         branch — a duty nobody enforces is a duty nobody performs: {orch}"
-    );
+         branch — a duty nobody enforces is a duty nobody performs");
 
     // The reviewer verifies the evidence instead of believing it.
     let r = flat(&reviewer);
-    assert!(
-        r.contains("red-before-green"),
-        "reviewer.md must check the evidence in the test-quality lane: {reviewer}"
-    );
-    assert!(
-        r.contains("missing evidence is a finding"),
-        "…absent evidence is itself a finding, or the worker's duty has no consequence: {reviewer}"
-    );
-    assert!(
-        r.contains("neutralize the change"),
-        "…and PRESENT evidence is a claim to reproduce, not proof: the reviewer breaks the \
-         behavior and watches the test go red itself, because a quoted failure line is text and \
-         text is not a red test: {reviewer}"
-    );
+    pinned("reviewer.md", &r, "check the red-before-green",
+        "reviewer.md must check the evidence in the test-quality lane");
+    pinned("reviewer.md", &r, "missing evidence is a finding",
+        "…absent evidence is itself a finding, or the worker's duty has no consequence");
+    pinned("reviewer.md", &r, "neutralize the change",
+        "…and PRESENT evidence is a claim to reproduce, not proof: the reviewer breaks the behavior \
+         and watches the test go red itself, because a quoted failure line is text and text is not \
+         a red test");
 
     // rev-21 F2 — the rule needs its boundary, or it bounces the work the rest of this PR
     // depends on. Unconditional red-before-green refuses a PR that legitimately adds no test,
@@ -1357,47 +1353,39 @@ fn the_orchestrator_can_send_work_back_on_design_grounds_not_only_acceptance_cri
         ("an unjustified new dependency", "a dependency nobody argued for — permanent, and the whole repo carries it"),
         ("public-contract change with no design note", "a public-contract change that ships undocumented"),
     ] {
-        assert!(standards.contains(ground), "Engineering standards must name {why}: {standards}");
+        pinned("Engineering standards", standards, ground, why);
     }
     // Both sites, or the rubric is a section nobody reads at the moment it matters.
-    assert!(
-        o.contains("intake the plan before you delegate"),
-        "the standards must gate the PLAN — before any code exists is the cheap moment: {orch}"
-    );
-    assert!(
-        o.contains("does it clear the bar in engineering standards?"),
-        "…and the completion check, where the PR is still cheaper to bounce than to revert: {orch}"
-    );
+    pinned("orchestrator.md", &o, "intake the plan before you delegate",
+        "the standards must gate the PLAN — before any code exists is the cheap moment");
+    pinned("orchestrator.md", &o, "does it clear the bar in engineering standards?",
+        "…and the completion check, where the PR is still cheaper to bounce than to revert");
 
     // rev-21 F10 — and the bounce is bounded like every other loop. Six grounds, several of them
     // judgment calls (coupling, scope drift), sitting at a step the reviewer has already passed:
     // without a bound, "fix the coupling → now the scope drifted → now the design note is missing"
     // is a loop only the orchestrator can see and nobody can converge.
-    assert!(
-        standards.contains("architectural bounce per pr or plan"),
-        "the architectural bounce must be bounded (INVARIANT 9): one bounce, naming every ground \
-         it has — grounds discovered one round at a time are a loop, not a standard: {orch}"
-    );
-    // rev-21 R1: anchored on `question for the human`, this was rescued by the section's own
-    // closing sentence ("an ambiguous case is a question for the human, not a reason to wave it
-    // through") — so the BOUND could be deleted whole while the pin stayed green. Anchor the bound.
-    assert!(
-        standards.contains("no longer a bounce"),
+    pinned("Engineering standards", standards, "architectural bounce per pr or plan",
+        "the bounce must be bounded (INVARIANT 9): ONE bounce, naming every ground it has — \
+         grounds discovered one round at a time are a loop, not a standard");
+    // R1: anchored on `question for the human`, this was rescued by the section's own closing
+    // sentence ("an ambiguous case is a question for the human, not a reason to wave it through"),
+    // so the BOUND was deletable with the pin green. Anchor the bound itself.
+    pinned("Engineering standards", standards, "no longer a bounce",
         "…and a second disagreement is not a second bounce: it is a question for the human, which \
-         holds the merge like any other (INVARIANT 2). Without the bound, 'fix the coupling → now \
-         the scope drifted → now the design note is missing' is a loop only the orchestrator can \
-         see and nobody can converge: {standards}"
-    );
+         holds the merge like any other (INVARIANT 2)");
 
     // The planner's plan has to carry what the gate reads.
     let p = flat(&planner);
+    let design = section(&p, "- **design: boundaries, dependencies, alternatives**", "- **test strategy**");
     for (duty, why) in [
-        ("boundaries", "which module owns the code and which seams it crosses"),
+        ("which module owns the new code", "which module owns the code and which seams it crosses"),
         ("alternatives considered", "the options that lost, and why — a plan with one option didn't look"),
-        ("dependencies", "every new dependency, argued"),
-        ("public-contract", "a contract change, with its design note planned as part of the work"),
+        ("name every new one and argue it", "every new dependency, argued"),
+        ("public-contract changes", "a contract change, with its design note planned as part of the work"),
+        ("reuse before invention", "the mechanism the repo already has — the alternative that should most often win"),
     ] {
-        assert!(p.contains(duty), "planner.md must make the plan address {why}: {planner}");
+        pinned("planner.md's design section", design, duty, why);
     }
 }
 
@@ -1419,41 +1407,36 @@ fn a_merge_the_orchestrator_performed_owns_the_default_branchs_next_ci_run() {
     // no instructions attached. The rule-level mutation harness caught exactly that on
     // `fix forward once` (rev-21 R1's lesson, one layer further down than R1 itself).
     let aftermath = section(&o, "### after a merge you performed", "### re-sync the fleet");
-    assert!(
-        aftermath.contains("post-merge run"),
-        "a merge the orchestrator performed must be followed to the default branch's CI: {aftermath}"
-    );
-    assert!(
-        aftermath.contains("stop merging"),
-        "red main halts the merge queue — the next merge lands on a broken branch: {aftermath}"
-    );
-    // Revert is the DEFAULT, not the fallback: one fix-forward attempt, then restore main.
-    assert!(
-        aftermath.contains("revert"),
-        "…and a revert PR is the remedy it must know about: {aftermath}"
-    );
-    assert!(
-        aftermath.contains("fix forward once"),
-        "fixing forward is bounded to ONE attempt and the revert is the default — an unbounded \
-         fix loop on a red main is how the branch stays red all afternoon, and the CI gate's \
-         3-attempt bound does not apply here because the damage is already merged: {aftermath}"
-    );
-    // rev-21 F3: "stop merging until main is green" and "merge the revert to make main green"
-    // are the same rule contradicting itself — main can only BECOME green through that merge, so
-    // a literal orchestrator halts, hands the revert to the human, and waits. Under auto-merge —
-    // the mode this whole rule exists for, where nobody is at the keyboard — main then stays red
-    // until a human wakes up, which is the status quo F3 was written to end. The carve-out is
-    // what makes the state exitable, so it is pinned, not left to good sense.
-    assert!(
-        aftermath.contains("no further **feature** merges"),
-        "the merge freeze must carve out its own remedy — it freezes FEATURE merges, or it \
-         forbids the one merge that makes main green: {orch}"
-    );
-    assert!(
-        aftermath.contains("the merge that *makes* main green"),
-        "…and must say WHY the fix/revert PR is the exception: it is the exit from the red state, \
-         not an exception to the freeze so much as the point of it: {orch}"
-    );
+    let at = "the red-main procedure";
+    pinned(at, aftermath, "post-merge run",
+        "a merge the orchestrator performed must be followed to the default branch's CI");
+    pinned(at, aftermath, "stop merging",
+        "red main halts the merge queue — the next merge lands on a broken branch");
+    // N1 (rev-21) — this was anchored on the bare word `revert`, which occurs all over the
+    // section ("Fix forward once, then revert", "the revert PR", "a revert *is* a merge"). So the
+    // REMEDY ITSELF — branch, `git revert -m 1 <merge-sha>`, drive it through the gate — was
+    // deletable with the pin green, leaving an unbounded fix-forward loop on a red main: F3's
+    // own failure mode, reintroduced by the test that was supposed to prevent it. Anchor the
+    // remedy, not the word.
+    pinned(at, aftermath, "git revert -m 1",
+        "the remedy is a REVERT PR, concretely — without the command the rule degrades into \
+         'keep trying to fix it', which is the unbounded loop F3 exists to stop");
+    pinned(at, aftermath, "restoring main costs a revert",
+        "…and the revert is the DEFAULT, not the fallback: restoring main costs a revert, \
+         debugging it in place costs everybody's afternoon");
+    pinned(at, aftermath, "fix forward once",
+        "fixing forward is bounded to ONE attempt — the CI gate's 3-attempt bound does not apply \
+         here, because the damage is already merged");
+    // rev-21 F3: "stop merging until main is green" and "merge the revert to make main green" are
+    // the same rule contradicting itself — main can only BECOME green through that merge, so a
+    // literal orchestrator halts, hands the revert to the human, and waits. Under auto-merge —
+    // the mode this rule exists for, where nobody is at the keyboard — main then stays red until
+    // a human wakes up, which is the status quo F3 was written to end.
+    pinned(at, aftermath, "no further **feature** merges",
+        "the merge freeze must carve out its own remedy — it freezes FEATURE merges, or it forbids \
+         the one merge that makes main green");
+    pinned(at, aftermath, "the merge that *makes* main green",
+        "…and must say WHY the fix/revert PR is the exception: it is the exit from the red state");
 }
 
 #[test]
@@ -1472,43 +1455,32 @@ fn every_open_branch_is_re_synced_after_the_default_branch_moves() {
     let orch = instructions_lf(&reg, &g.id, "orchestrator.md");
     let o = flat(&orch);
 
-    // Detection: checks are silent about mergeability, so the sweep has to ask.
-    assert!(
-        o.contains("--json mergeable"),
-        "the sweep must ask whether the PR still merges — green checks say nothing about it: {orch}"
-    );
-    assert!(o.contains("conflicting"), "…and know the state it is looking for: {orch}");
+    // Detection lives in the open-PR sweep; the rebase rules live in their own section. Both are
+    // scoped, and every anchor goes through `pinned` — present exactly once in the region that
+    // owes it, so it can actually fail when that rule is deleted (rev-21).
+    let sweep = section(&o, "## monitoring open prs", "## the learning loop");
+    pinned("the open-PR sweep", sweep, "--json mergeable",
+        "the sweep must ask whether the PR still merges — green checks say nothing about it");
+    pinned("the open-PR sweep", sweep, "conflicting",
+        "…and know the state it is looking for");
 
-    // Action: rebase the fleet on freshness, not on conflict.
-    assert!(
-        o.contains("## re-sync the fleet") || o.contains("### re-sync the fleet"),
-        "the re-sync is a rule with its own site, not a footnote to conflict handling: {orch}"
-    );
-    assert!(
-        o.contains("stale is not the same as conflicted"),
-        "the whole upgrade lives in that distinction — a conflict-only trigger waits for the \
-         most expensive moment to rebase: {orch}"
-    );
-    assert!(
-        o.contains("branch it will merge into"),
+    let resync = section(&o, "### re-sync the fleet", "## the ci gate");
+    let at = "the re-sync rule";
+    pinned(at, resync, "stale is not the same as conflicted",
+        "the whole upgrade lives in that distinction — a conflict-only trigger waits for the most \
+         expensive moment to rebase");
+    pinned(at, resync, "branch it will merge into",
         "a sub-PR rebases onto ITS base (an integration branch), not reflexively onto main — \
-         get it backwards and a merged feature's commits get dragged through someone else's PR: {orch}"
-    );
-    assert!(
-        o.contains("owning worker"),
+         backwards, and a merged feature's commits get dragged through someone else's PR");
+    pinned(at, resync, "owning worker",
         "a real conflict belongs to the worker that wrote the code (resumed), not to the \
-         orchestrator: {orch}"
-    );
-    assert!(
-        o.contains("one attempt"),
-        "…bounded exactly like the CI gate's fix loop — a rebase loop is an expensive way to \
-         not ship: {orch}"
-    );
-    assert!(
-        o.contains("re-stales every verdict"),
-        "…and the rebase IS a push: CI re-runs and every reviewer verdict goes stale, which is \
-         the price of freshness and the reason to pay it early: {orch}"
-    );
+         orchestrator");
+    pinned(at, resync, "one attempt",
+        "…bounded exactly like the CI gate's fix loop — a rebase loop is an expensive way to not \
+         ship");
+    pinned(at, resync, "re-stales every verdict",
+        "…and the rebase IS a push: CI re-runs and every reviewer verdict goes stale, which is the \
+         price of freshness and the reason to pay it early");
 
     // rev-21 F7: the same rule at the same frequency on an INTEGRATION branch is quadratic. An
     // n-deep stack (this PR's own topology) re-synced after every sub-PR merge costs ~n²/2
@@ -1516,33 +1488,28 @@ fn every_open_branch_is_re_synced_after_the_default_branch_moves() {
     // delegate cap and the autonomy budget, for sub-PRs that usually touch disjoint files. The
     // license to scope it is therefore part of the rule, not a footnote: rebase the frontier,
     // let the deeper stack wait for its own base, and leave a question-held PR alone.
-    assert!(
-        o.contains("re-sync the merge frontier, not the whole tree"),
-        "the re-sync must scope itself to the branch that actually MOVED — a PR two levels deep \
-         is not stale until its own base moves, and re-syncing it early pays twice: {orch}"
-    );
-    assert!(
-        o.contains("o(n²)") || o.contains("o(n^2)"),
+    pinned(at, resync, "re-sync the merge frontier, not the whole tree",
+        "the re-sync must scope itself to the branch that actually MOVED — a PR two levels deep is \
+         not stale until its own base moves, and re-syncing it early pays twice");
+    // `o(n²)` alone occurs twice here — the depth clause and the fan clause both name the cost —
+    // so `pinned` rejects it: either occurrence would rescue the other. Anchor the depth rule's
+    // own clause. (The fan clause has its own anchor, `a fan is not a stack`.)
+    pinned(at, resync, "costs o(n²) reviews",
         "…and must name the cost it is avoiding: per-merge re-syncing of an n-deep stack is \
-         quadratic in REVIEWS, not just rebases — the verdict-invalidation interaction is the \
-         whole reason the license exists: {orch}"
-    );
-    assert!(
-        o.contains("held on an unanswered question alone"),
-        "…and a PR held on an unanswered question is not going anywhere (INVARIANT 2): rebasing \
-         it re-stales verdicts to buy a re-review nobody can act on: {orch}"
-    );
+         quadratic in REVIEWS, not just rebases — the verdict-invalidation interaction is the whole \
+         reason the license exists");
+    pinned(at, resync, "held on an unanswered question alone",
+        "…and a PR held on an unanswered question is not going anywhere (INVARIANT 2): rebasing it \
+         re-stales verdicts to buy a re-review nobody can act on");
     // rev-21 R3 — the license was written for DEPTH and the common topology is a FAN: 8 sub-PRs
     // on one integration branch, where every sibling IS the frontier. "Rebase the frontier
     // immediately" then reads as exactly the O(n²) it was meant to prevent. The O(n) behavior is
     // already licensed by the other two clauses (always rebase the one you're about to merge;
     // batch the rest) — it just has to be said, or the fan reads the rule literally.
-    assert!(
-        o.contains("a fan is not a stack"),
+    pinned(at, resync, "a fan is not a stack",
         "the license must name the FAN case: with many siblings on one base, every sibling is on \
          the frontier, so 'rebase the frontier immediately' after each merge is the O(n²) the \
-         license exists to avoid — rebase the one you are about to merge, and batch the rest: {orch}"
-    );
+         license exists to avoid — rebase the one you are about to merge, and batch the rest");
 }
 
 #[test]
@@ -1573,11 +1540,10 @@ fn the_invariants_digest_leads_the_document_and_carries_what_compaction_would_co
 
     // It is FOR the compacted reader, and says so: re-read it, don't trust your memory of it.
     let head = &o[digest..tools];
-    assert!(
-        head.contains("compact"),
-        "the digest must say what it is for — surviving compaction — and tell the orchestrator to \
-         re-read it after one: {head}"
-    );
+    pinned("the INVARIANTS digest", head, "re-read this block at every session start",
+        "the digest must say what it is FOR — surviving compaction — and tell the orchestrator to \
+         re-read it after one, because the whole premise is that its memory of these rules is the \
+         thing a summary throws away");
 
     // The rules whose loss is dangerous — anchored on the RULE, never on a word that happens to
     // appear in it (rev-21 F1). `("stale", …)` and `("full", …)` were the old anchors, and they
@@ -1633,7 +1599,7 @@ fn the_invariants_digest_leads_the_document_and_carries_what_compaction_would_co
         ("your context is not the memory",
          "externalize every decision — the board and GitHub outlive the session"),
     ] {
-        assert!(head.contains(rule), "INVARIANTS must carry {why}: {head}");
+        pinned("the INVARIANTS digest", head, rule, why);
     }
 
     // And the body must not RE-ARGUE what the digest owns. The digest states each rule; exactly
@@ -1729,14 +1695,11 @@ fn the_orchestrators_findings_policy_survives_in_substance_not_just_in_bytes() {
          "rev-19 F2 — a question never answered leaves the PR open: a correct outcome, and never \
           a reason to merge anyway"),
     ] {
-        assert!(
-            region.contains(rule),
-            "orchestrator.md's {name} has lost part of the findings-disposition policy: {why}.\n\
-             This is the prose #222/#235 exist for — a live run merged a PR that both reviewers \
-             had passed and both had filed the same finding on. If you are deliberately changing \
-             it, change this pin in the same commit and say so in the PR.\n\nRegion as rendered:\n\
-             {region}"
-        );
+        // Through `pinned`, so this goes red both when a rule is DELETED and when its anchor
+        // could be rescued by a second occurrence in its own region (rev-21). This is the prose
+        // #222/#235 exist for — a live run merged a PR that both reviewers had passed and both
+        // had filed the same finding on.
+        pinned(name, region, rule, why);
     }
 }
 
@@ -1752,59 +1715,45 @@ fn the_orchestrator_may_file_an_issue_it_may_never_start_and_it_distils_what_rec
     let orch = instructions_lf(&reg, &g.id, "orchestrator.md");
     let o = flat(&orch);
 
-    assert!(
-        o.contains("you may file; you may not start"),
-        "the permission and its boundary must be stated in one breath — the whole point is that \
-         they are inseparable: {orch}"
-    );
-    assert!(
-        o.contains("gh issue create"),
-        "…concretely enough to act on: {orch}"
-    );
-    assert!(
-        o.contains("filing it is not doing it"),
-        "a filed issue is PARKED in the label funnel, exactly like a deferred finding (#222) — \
-         say so, or 'I filed it' becomes a way to close a problem without solving it: {orch}"
-    );
-
-    // …and the funnel forbids GROOMING, not just starting (rev-21 F8). Rewriting an unlabelled
-    // issue with acceptance criteria and a plan is the step immediately before starting it; the
-    // pre-#236 prose banned it by name and the compression dropped the verb.
-    // rev-21 R1: anchored on `groom`, this pin was rescued by the `agent-ready` bullet three
-    // paragraphs above it ("the issue is GROOMED and ready to build") — inside its own region.
-    // The prohibition could be deleted whole and the pin stayed green. Anchor the RULE.
+    // The funnel prose owns both halves of the boundary — and the RULES are pinned in the funnel
+    // region, not document-wide. N2 (rev-21): `filing it is not doing it` also appears in the
+    // disposition step (a deferred finding parks in the funnel too — the same rule, said to the
+    // other half of the policy), so a document-wide match was rescued by that copy: the funnel's
+    // own statement of it was deletable with this pin green. The two occurrences are deliberate
+    // prose; the pin just has to know which one it is talking about.
     let funnel = section(&o, "## label signals", "## planning & scheduling");
-    assert!(
-        funnel.contains("groom an issue the human hasn't"),
-        "the funnel must still forbid GROOMING an unlabelled issue — it is how an agent talks \
-         itself into ownership, and 'you may not start it' does not cover it: {orch}"
-    );
+    let at = "the label funnel";
+    pinned(at, funnel, "you may file; you may not start",
+        "the permission and its boundary, stated in one breath — the whole point is that they are \
+         inseparable");
+    pinned(at, funnel, "gh issue create", "…concretely enough to act on");
+    pinned(at, funnel, "filing it is not doing it",
+        "a filed issue is PARKED in the funnel, exactly like a deferred finding (#222) — say so, \
+         or 'I filed it' becomes a way to close a problem without solving it");
+    // …and the funnel forbids GROOMING, not just starting (rev-21 F8): rewriting an unlabelled
+    // issue with acceptance criteria and a plan is the step immediately before starting it. R1:
+    // anchored on `groom`, this was rescued by the `agent-ready` bullet three paragraphs above
+    // ("the issue is GROOMED and ready to build"), so the prohibition was deletable whole.
+    pinned(at, funnel, "groom an issue the human hasn't",
+        "the funnel forbids GROOMING an unlabelled issue — it is how an agent talks itself into \
+         ownership, and 'you may not start it' does not cover it");
 
-    // The learning loop: a pattern, not an incident, distilled ONCE into something durable.
-    assert!(o.contains("## the learning loop"), "{orch}");
-    assert!(
-        o.contains("pattern"),
+    // The learning loop: a pattern, not an incident, distilled ONCE into something durable — and
+    // filed through the funnel like everything else (rev-21 F4: "a docs PR — dispatch it as a
+    // normal work item" was an opt-out from INVARIANT 8 sitting three sections below INVARIANT 8,
+    // and it inverted the policy, since a finding a REVIEWER raised must park in the funnel while
+    // a pattern the orchestrator noticed BY ITSELF could be dispatched directly).
+    let loop_ = section(&o, "## the learning loop", "## durability rules");
+    let at = "the learning loop";
+    pinned(at, loop_, "not an incident",
         "it triggers on a recurring PATTERN (a finding class, a repeated CI burn, a convention \
-         re-flagged), never on a single incident — that is the whole guard against make-work: {orch}"
-    );
-
-    // rev-21 F4 — and its artefact goes through the funnel like everything else. The prose used
-    // to offer "a small docs PR (dispatch it as a normal work item)" as the FIRST option, which
-    // is the orchestrator spawning a worker on work no human ever labelled: an opt-out from
-    // INVARIANT 8 sitting three sections below INVARIANT 8, and the more attractive of the two
-    // options for an agent that wants to act. Worse, it inverts the policy — a finding a REVIEWER
-    // raised has to park in the funnel (step 3's deferral), while a pattern the orchestrator
-    // noticed by itself could be dispatched directly.
-    assert!(
-        o.contains("do not dispatch a worker on it because it is \"only docs\""),
-        "the learning loop must NOT dispatch its own artefact — an unlabelled issue the \
-         orchestrator noticed itself is not more startable than a finding a reviewer raised: {orch}"
-    );
-    assert!(
-        o.contains("suggested label"),
-        "…it files the lesson with a suggested label and stops. The human's label starts it, like \
-         any other work: the lesson is yours to notice and theirs to start: {orch}"
-    );
+         re-flagged), never on a single incident — the whole guard against make-work");
+    pinned(at, loop_, "do not dispatch a worker on it because it is \"only docs\"",
+        "the loop must NOT dispatch its own artefact — an unlabelled issue the orchestrator \
+         noticed itself is not more startable than a finding a reviewer raised");
+    pinned(at, loop_, "suggested label",
+        "…it files the lesson with a suggested label and stops; the human's label starts it, like \
+         any other work");
 }
 
 #[test]
@@ -2402,6 +2351,46 @@ fn section<'a>(flat_doc: &'a str, start: &str, end: &str) -> &'a str {
     let rest = &flat_doc[from..];
     let to = rest[start.len()..].find(end).map(|i| i + start.len()).unwrap_or(rest.len());
     &rest[..to]
+}
+
+/// Assert that `region` carries the rule `why` — and that `anchor` names it **uniquely**.
+///
+/// Presence is the obvious half. Uniqueness is the half that makes the pin *able to fail*, and it
+/// is the lesson of three rounds of review (rev-21). A prose pin can be dead in three ways:
+///
+/// 1. **The anchor doesn't exist** — `matches(…).count() <= 1` on a phrase the document no longer
+///    contains reads `0 <= 1`: green forever, in both directions.
+/// 2. **The anchor exists twice and the rule lives in only one of them** — every load-bearing rule
+///    here appears in the INVARIANTS digest *and* in the body by design (the rule, and its
+///    procedure), so a document-wide match is satisfied by either. Delete the body's procedure and
+///    the pin stays green, rescued by the digest: the rule survives as a slogan with no
+///    instructions attached. [`section`] is the answer to that one.
+/// 3. **The anchor's words show up in unrelated prose inside that same region** — `"groom"` was
+///    rescued by "the issue is *groomed* and ready to build" three paragraphs above the
+///    prohibition; `"one line"` in `worker.md` by "report … one line restating the task", which
+///    left the red-before-green exemption's *price* silently deletable; a bare `"revert"` by the
+///    word appearing in the surrounding sentence, leaving the whole red-main remedy deletable
+///    behind an unbounded fix-forward loop.
+///
+/// Scoping fixes (2). **This function fixes (3), mechanically**: an anchor that occurs more than
+/// once in its region cannot detect the deletion of the rule it names — some other occurrence will
+/// rescue it — so that is a failing test *here*, not a defect discovered later by mutating the
+/// prose. A pin you cannot make fail is worse than no pin: it is a claim of coverage.
+fn pinned(region_label: &str, region: &str, anchor: &str, why: &str) {
+    let n = region.matches(anchor).count();
+    assert!(
+        n > 0,
+        "{region_label} has lost the rule it owes: {why}\n\nanchor `{anchor}` is gone. If you are \
+         changing this deliberately, change the pin in the same commit and say so in the PR.\n\n\
+         Region as rendered:\n{region}"
+    );
+    assert_eq!(
+        n, 1,
+        "the anchor `{anchor}` occurs {n}× in {region_label}, so it CANNOT FAIL when the rule it \
+         names is deleted — another occurrence rescues it, and the pin silently stops pinning \
+         ({why}). Anchor the rule's own clause instead of a phrase it shares with its \
+         neighbours.\n\nRegion as rendered:\n{region}"
+    );
 }
 
 fn instructions(reg: &OrchRegistry, group: &str, file: &str) -> String {

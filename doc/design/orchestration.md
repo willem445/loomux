@@ -402,13 +402,25 @@ the templates, never by reading the tests — the progression is the reusable pa
    anchor the rule's **own clause**: `"groom an issue the human hasn't"`, `"naming which of"`,
    `"no longer a bounce"`.
 
-Which is why **the mutation harness has to delete the rule, not the string.** Deleting every
-occurrence of a phrase measures whether the pin can see the *phrase* vanish, which is not the
-question anyone is asking. The harness used here deletes the markdown unit — the list item or
-paragraph — that carries the rule, inside the region the pin scopes to, and requires the owning
-test to go red: **60/60 rules**, one at a time. That is what surfaced failure mode 3, and (on its
-own first case list) a fourth instance of mode 2: `"fix forward once"`, rescued by INVARIANT 6's
-one-line copy while the red-main *procedure* was gone.
+Two rules follow, and together they make the dead pin a *test failure* rather than a discovery:
+
+- **The mutation harness deletes the rule, not the string.** Deleting every occurrence of a phrase
+  measures whether the pin can see the *phrase* vanish, which is not the question anyone is
+  asking. The harness deletes the markdown unit — the list item or paragraph — that carries the
+  rule, inside the region the pin scopes to, and requires the owning test to go red: **60/60
+  rules**, one at a time. That is what surfaced failure mode 3, and (on its own first case list) a
+  fourth instance of mode 2: `"fix forward once"`, rescued by INVARIANT 6's one-line copy while
+  the red-main *procedure* was gone.
+- **An anchor must occur exactly once in the region it is asserted in** — enforced by `pinned()`,
+  which every #236 anchor goes through. This is failure mode 3 made *mechanically impossible to
+  reintroduce*: an anchor that appears twice in its own region cannot fail when the rule it names
+  is deleted, because the other occurrence rescues it, so it is a **red test right there** instead
+  of a defect someone finds later by mutating prose. It pays immediately — it rejected `O(n²)` in
+  the re-sync section (the depth clause and the fan clause both name the cost, so either would
+  have rescued the other) and forced the depth rule onto its own clause.
+
+A pin you cannot make fail is worse than no pin: it is a claim of coverage. The uniqueness rule is
+what keeps that claim honest without anyone having to remember to re-run the harness.
 
 ## Validation-round additions (2026-07-03)
 
