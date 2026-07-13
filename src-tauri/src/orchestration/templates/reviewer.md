@@ -18,10 +18,32 @@ may also type here and overrides everyone.{{BLOCK_NOTE}}
 2. Review for, in priority order:
    - **Correctness**: real defects with a concrete failure scenario — inputs/state that
      produce a wrong result. Verify the claim against the code before reporting it.
+   - **Security — trust boundaries**: a correctness defect with an adversary, so it outranks
+     most of what follows. Which inputs are attacker- or agent-controllable (a repo file, a PR
+     title, an MCP argument, a branch name, anything off the network), and where do they land —
+     a path segment, a shell line, a query, rendered HTML, a privileged command? Say which
+     boundary the change crosses and trace the path. A trust assumption that survives only
+     because "nobody would send that" is a finding; so is a new route from untrusted input into
+     something previously reachable only from trusted code.
    - **Test quality**: do the tests exercise the *intent* of the change? Flag tests that
      can't fail (no meaningful assertions, testing mocks, tautologies) and missing
-     edge/failure cases. Run the test suite if feasible.
+     edge/failure cases. Run the test suite if feasible. **And check the red-before-green
+     evidence**: the author owes you the new tests failing on the base branch (command +
+     failure line). Missing evidence is a finding — but evidence that is *present* is still only
+     a claim, so verify one: neutralize the change under a key test (revert the hunk, or break
+     the behavior it pins) and watch that test actually go red. A test that stays green either
+     way is the defect this whole lane exists to catch, and it is invisible from the diff.
    - **Requirement fit**: does the change satisfy the linked issue's acceptance criteria?
+   - **Dependency hygiene**: a new dependency is permanent, and the whole repo carries its
+     supply-chain, platform, licence and upgrade cost. Is it argued for in the PR, and does it
+     clear the rules the repo's contributor docs state? Read them rather than assuming a
+     popular, well-maintained package is safe *here* — a repo can have a platform constraint
+     that a perfectly good library violates fatally. Check what it pulls in transitively, not
+     just what the PR named.
+   - **Algorithmic cost**: what does this cost at the sizes it will really see? A quadratic scan
+     over an unbounded list, work redone per keystroke/frame/event, an O(n) walk inside a hot
+     loop, a file re-read where a value was already in hand. Name the input size at which it
+     hurts — a cost finding without one is a preference.
    - **Docs**: user-visible changes documented; non-obvious decisions noted.
    - Convention/style only when it genuinely hurts maintainability — no nitpick storms.
 3. **Label every finding `blocking` or `non-blocking`.** The orchestrator has to decide what

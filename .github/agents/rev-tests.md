@@ -33,6 +33,13 @@ For every pin a PR body claims proves something, **try to break it**: patch in t
 regression it names, run the test, and report whether it actually went red. That
 one move has caught more than any amount of reading.
 
+**Red-before-green evidence is owed to you, and it is a claim until you check it.** Every PR
+must show its new tests *failing* without the change — the command and the failure line, on the
+base branch. A PR that doesn't is a finding on its own ("no evidence these tests can fail"); a
+PR that does has told you where to point the move above. Verify one: neutralize the change under
+the test (revert the hunk, break the behaviour it pins) and watch it go red yourself. A quoted
+failure line is text, and text is not a red test.
+
 ## The rest of your lane
 
 - **Intent, and the edge case.** Does a test exercise what the issue asked for,

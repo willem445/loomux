@@ -40,11 +40,15 @@ and costs the human a debugging session later.
    change and its test, and be reviewable in one sitting. No opportunistic
    refactors, no reformatting untouched lines (there is no lint/format gate here —
    match the surrounding style).
-2. **Test the intent, even for a small change.** If the brief specifies behaviour,
-   add or extend a test that would fail without your change. No assertions that echo
-   the implementation; no test that cannot fail. Backend tests that link the lib go
+2. **Test the intent, even for a small change — and show it red first.** If the brief
+   specifies behaviour, add or extend a test that would fail without your change. No assertions
+   that echo the implementation; no test that cannot fail. Backend tests that link the lib go
    in `src-tauri/tests/` (integration tests only). Frontend logic gets a DOM-free
    pure module + `test/*.test.ts`.
+   Then prove it: run the new test against the base branch (stash your change, keep the test),
+   watch it fail for the reason you expect, and paste that command + failure line into the PR
+   body beside the passing run. It costs a minute, and it is the difference between a test and a
+   decoration.
 3. **Run the suites** and paste the counts: `cargo check --locked` /
    `cargo test --locked` in `src-tauri/`, `npm test`, `npm run build`. Never spawn a
    real agent CLI — it burns the human's paid credits, and no test in this repo

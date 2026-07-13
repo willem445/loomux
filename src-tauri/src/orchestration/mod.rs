@@ -1197,9 +1197,17 @@ merge gate. You never merge; you surface work at the gate for the human.\n\
 - Use `report`/`message_orchestrator` semantics from your delegates as their status \
 channel; keep the human oriented with short summaries."
             .to_string(),
+        // Red-before-green rides in the core for the same reason the reviewer's duties do
+        // (#236): a `mode: replace` worker persona never reads `worker.md`, and "the tests
+        // would catch it" is precisely the claim that is worthless unevidenced — the
+        // orchestrator is told to treat a `done` without the evidence as not done, so every
+        // worker has to have been told to produce it, however its persona was written.
         Role::Worker => format!(
             "{common}\n- Deliverable: a branch → commit → PR with the project's tests green. \
-             Add tests that would fail if the feature regressed."
+             Add tests that would fail if the feature regressed — and SHOW that they do: run \
+             them against the base branch (without your change) first, confirm they fail for \
+             the expected reason, and put the command and its failure line in the PR \
+             description. A test nobody has seen fail is not evidence of anything."
         ),
         // The verdict tool belongs in the CORE, not only in `reviewer.md` (#222/#197):
         // a merge gate names *custom* reviewer blocks, and a custom block with a
@@ -1211,9 +1219,31 @@ channel; keep the human oriented with short summaries."
         // replace persona never reads `reviewer.md`, and a `pass` whose summary hides
         // the findings it left behind is how the gate opens on a change that still
         // contradicts its own rationale. Keep the two in lockstep.
+        //
+        // So do the review LANES (#236). A persona is free to narrow a reviewer to one
+        // lane — that is the whole point of a focused roster — but the lanes below are the
+        // BASELINE a repo's reviewers must cover between them: a security/dependency/cost
+        // defect that no block was told to look for is one that no verdict will ever
+        // reflect, and the gate cannot tell the difference between "reviewed and clean" and
+        // "never looked at". `reviewer.md` carries the same list; keep them in lockstep.
         Role::Reviewer => format!(
             "{common}\n- You review PRs via `gh` (checking out the PR branch locally is fine); \
              you do NOT create branches or push. Report findings via `report`/`message_orchestrator`.\n\
+             - Review lanes, in priority order: **correctness** (a real defect with a concrete \
+             failure scenario, verified against the code); **security** — the trust boundaries \
+             the change crosses: which inputs are attacker- or agent-controllable (a repo file, \
+             a PR title, an MCP argument, anything off the network) and where they land (a path \
+             segment, a shell line, rendered HTML, a privileged command); **test quality** — do \
+             the tests test intent, or are they tautologies that cannot fail, and is the \
+             red-before-green evidence (the new tests failing on the base branch) actually there \
+             and actually real (neutralize the change and watch a key test go red — a present \
+             claim is still only a claim); **requirement fit** against the issue; **dependency \
+             hygiene** — a new dependency is permanent and the whole repo carries it, so it must \
+             be argued in the PR and must clear the rules the repo's contributor docs state \
+             (a popular package can violate a platform constraint fatally); **algorithmic cost** \
+             at the sizes the code will really see (name the input size that hurts); **docs**. \
+             If your persona narrows you to one lane, stay in it and say so — but a lane nobody \
+             was assigned is a lane nobody reviewed.\n\
              - Label every finding `blocking` or `non-blocking` — the orchestrator dispositions each \
              one before the PR merges and cannot do that from unlabelled prose. A finding that \
              contradicts the change's OWN stated rationale (the guard the issue asked for is \

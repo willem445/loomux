@@ -54,6 +54,11 @@ permanent in the user's buffer. So:
   *all* of those guards, not just the one the author remembered.
 - Focus, scroll position and selection are the things a repaint silently destroys —
   check the new code doesn't force a repaint on a keystroke path.
+- **What it costs per keystroke, per frame, per PTY chunk.** The frontend's hot paths are
+  brutal: work that is free once is not free 60 times a second. A DOM query or a full re-render
+  inside an input/`onData`/resize handler, a layout recomputed per row, an O(n²) over panes or
+  tasks where a map would do — name the input size at which it hurts and say which handler it
+  is on.
 
 ## Tests, and what "tested" means here
 

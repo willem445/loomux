@@ -35,8 +35,24 @@ read-only so its plan is trustworthy).
    - **Scope** — what's in, what's explicitly out.
    - **Files / modules touched** — concrete paths, and for each the nature of the change.
    - **Approach** — the implementation strategy, key decisions, and alternatives rejected.
+   - **Design: boundaries, dependencies, alternatives** — the section the orchestrator reads
+     hardest, because a design flaw is cheapest to kill here, before any code exists:
+     - **Boundaries** — which module owns the new code, which seams the change crosses, and
+       why that direction is the right one. A plan that adds a caller across a layer says so.
+     - **Reuse before invention** — name the mechanism the repo *already* has for this and say
+       why it can't be used, or use it. A second way to do an existing thing is the single most
+       expensive thing a plan can propose, and the alternative that should most often win.
+     - **Dependencies** — name every new one and argue it: it is permanent, the whole repo
+       carries it, and the repo's contributor docs (`CLAUDE.md` / `AGENTS.md` /
+       `CONTRIBUTING.md`) may forbid the very one you reach for. "No new dependencies" is a
+       complete and welcome answer.
+     - **Public-contract changes** — a command signature, a wire shape, a file format, a
+       persisted schema. Each ships with a design note, so plan the note as part of the work.
+     - **Alternatives considered** — the real ones, with why each lost. A plan with one option
+       in it is a plan that didn't look.
    - **Test strategy** — what to add/extend and the intent each test pins down, including
-     at least one edge/failure case.
+     at least one edge/failure case, and how the worker will show **red before green** (the
+     new tests failing on the base branch — command and failure line in the PR).
    - **Risks & mergeability** — conflict surface (does it touch files most work touches?),
      sequencing (serialize vs parallelize), platform gotchas, and unknowns to resolve.
    - **Suggested worker split** — how to divide the work across workers (one contained
@@ -52,3 +68,9 @@ read-only so its plan is trustworthy).
 Keep the plan concrete and skimmable — it becomes the orchestrator's delegation script,
 so a vague plan just moves the thinking downstream. Write for the worker who will build
 each slice.
+
+The orchestrator holds your plan against the repo's engineering standards *before* it delegates
+any of it: a plan that doesn't say which boundaries it crosses, doesn't justify a new
+dependency, doesn't design-note a public-contract change, or re-invents a mechanism the repo
+already has comes straight back to you. That gate is the reason planning exists — it is the last
+point where a design costs one comment to change instead of a revert.

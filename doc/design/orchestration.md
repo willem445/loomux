@@ -259,6 +259,75 @@ announced) holds the merge even where auto-merge, a one-time grant or supervised
 mode would otherwise allow it. The policy and the live incident that produced it are in
 `doc/design/workflows.md` → **Findings disposition**.
 
+### Engineering standards, not just process (#236)
+
+The prompt suite's *process* half was strong (gates, bounded loops, externalized state,
+disposition) and its *engineering* half was one line long: "does the PR satisfy the acceptance
+criteria?" A codebase can answer yes to that on fifty consecutive PRs and still rot, because
+acceptance criteria say what a change must **do** and never what it must **be**. #236 gives the
+orchestrator a value system to match its operational one:
+
+- **Grounds to send work back** (`orchestrator.md` → *Engineering standards*, the one
+  authoritative site; referenced from plan intake and from the completion check). Cross-module
+  coupling, a duplicated mechanism, an unargued new dependency, a public-contract change with no
+  design note, a change that contradicts a design note, scope drift. Naming one is *blocking*
+  whatever the reviewer labelled it — the same call the orchestrator already owns for a finding
+  that contradicts the change's own rationale: the reviewer rates the diff, the orchestrator owns
+  the requirement **and the architecture**. The gate is sited at **plan intake** as well as at the
+  PR, because a design flaw costs one planner comment before code exists and a revert after it.
+  `planner.md` owes the matching content — boundaries, reuse-before-invention, dependencies,
+  public-contract changes, alternatives considered — since a plan that never named its boundaries
+  cannot be gated on them.
+- **Red before green, evidenced.** "Tests that would fail if the feature were broken" was in the
+  worker's DoD from the start — as an *assertion nobody ever checked*, which is the most common
+  quality failure in autonomous coding and is invisible from the diff. Now the worker runs its new
+  tests against the base branch, watches them fail *for the expected reason* (not on a compile
+  error), and pastes the command and failure line into the PR; the orchestrator treats a `done`
+  without that evidence as **not done**; the reviewer verifies it rather than reading it (a quoted
+  failure line is text, and text is not a red test). All four surfaces move together —
+  `worker.md`, `mechanics_core(Worker)`, `orchestrator.md`, `reviewer.md` — because any one of
+  them dropping it restores the status quo.
+- **Post-merge ownership.** Auto-merge, a one-time grant and supervised dangerous mode all let the
+  orchestrator *land* code, and the prompt then went quiet — nothing told it to watch the default
+  branch. A PR green on its own branch still breaks main (a semantic conflict with whatever landed
+  under it; a job that only runs post-merge), and a red default branch blocks every worker in the
+  group. So a merge it performed makes it the owner of main's next CI run: on red, **stop merging**,
+  **fix forward once**, then **revert** (the default — restoring main costs a revert, debugging it
+  in place costs everyone's afternoon), and flag the human.
+- **Review lanes.** The default reviewer covered correctness, tests, requirement fit, docs and
+  style — and nothing on **trust boundaries**, **dependency hygiene** or **algorithmic cost**, in a
+  repo where a bad dependency bricks the binary (`getrandom`/`ProcessPrng`) and a trust boundary
+  holds only because the webview is trusted (`group_id`). Added to `reviewer.md` **and**
+  `mechanics_core(Reviewer)` in lockstep, for the reason the findings duty is: a `mode: replace`
+  persona never reads `reviewer.md`, and a lane nobody was assigned is a lane no verdict reflects —
+  the gate cannot tell "reviewed and clean" from "never looked at".
+- **The learning loop, and filing without starting.** A pattern (a finding class on three PRs, a CI
+  failure mode that has burned two fix rounds, a convention reviewers keep re-flagging) gets
+  distilled **once** into something durable — a docs PR or a filed convention issue — because a
+  review that re-teaches the same lesson every week is how a codebase stays exactly as good as it
+  was. And the orchestrator may **file** an issue for debt it observes, with a suggested label,
+  though it may never **start** one: the label funnel governs what it *begins*, not what it
+  *notices*, and filing it is not doing it (it parks in the funnel exactly like a deferred
+  finding). Autonomy at zero consent cost.
+- **Post-merge re-sync of the fleet.** #236 asked only for *detection* — add `--json mergeable` to
+  the sweep and route a `CONFLICTING` PR to its owner. That fires at the most expensive possible
+  moment. The rule shipped instead is the one a human maintainer actually follows: **the default
+  branch moving is an event**, whoever moved it (the orchestrator's merge, the human's, one it
+  merely observed), and every open branch behind it is then **stale** — which is *not* the same as
+  conflicted. A branch that still merges cleanly was reviewed, tested and CI'd against code that no
+  longer exists, so its green checks describe the past. After any merge (and again on the sweep, as
+  the backstop for drift nobody saw), every open PR is rebased onto **the branch it will merge
+  into** — a sub-PR onto its integration branch, not reflexively onto `main`. A clean rebase the
+  orchestrator does itself (mechanical, no delegate slot); the first real conflict routes to the
+  **owning** worker's resumed session, **one attempt**, then the human — the CI gate's bound, for
+  the CI gate's reason. The rebase is a push, so CI re-runs and every verdict goes stale: that cost
+  is the argument for paying it early and in the quiet rather than on the PR you were about to
+  land. Paced against the delegate cap, never bursty.
+
+Each rule is pinned in `tests/workflow.rs` on the surfaces that carry it, and the golden fixtures
+in `tests/fixtures/pre222/` are re-blessed in their own commit — the diff on that directory is the
+review surface for "what did we just tell every default group to do differently?".
+
 ## Validation-round additions (2026-07-03)
 
 - **Init friction / permissions**: agents launch with `--add-dir <group dir>` and

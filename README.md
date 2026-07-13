@@ -206,6 +206,25 @@ leaves the PR open and re-raised on each sweep, which is the point: review feedb
 improve the change, not get dropped the moment the gate turns green
 ([design note](doc/design/workflows.md)).
 
+**The orchestrator holds the work to an engineering bar, not just to the acceptance criteria.**
+A change can satisfy every criterion an issue lists and still be one you'd reject — it couples
+two modules that shouldn't know about each other, it re-implements something the repo already
+has, it adds a dependency nobody argued for, it changes a public contract with no design note.
+Those are stated grounds for the orchestrator to send a **plan** back before any code exists, or
+to bounce a **PR** however green it is. Alongside them: every PR must show its new tests *failing*
+on the base branch (a test nobody has watched fail is not a safety net), the reviewer checks the
+security, dependency and cost lanes rather than just correctness and style, a merge the
+orchestrator performed makes it responsible for the default branch's next CI run (red main stops
+the queue and gets reverted, not debugged in place), and a lesson that keeps recurring becomes a
+docs PR or a filed convention issue instead of the same review round every week.
+
+**And it keeps the fleet fresh.** Whenever the default branch moves — its merge, yours, or one it
+just watched land — it rebases the remaining open branches onto the branch each will merge into.
+Not only the conflicted ones: a branch that *still merges cleanly* was reviewed and CI'd against
+code that no longer exists, so its green checks describe the past. Trivial rebases it does itself;
+the first real conflict goes back to the worker that wrote the code, one attempt, then you
+([design note](doc/design/orchestration.md)).
+
 Before anything spawns, the pane runs a **validation pass** over the whole file: an
 unknown block kind, an agent CLI loomux can't launch, an edge to a block that doesn't
 exist, a gate demanding a verdict from a reviewer that was deleted, a threshold no number

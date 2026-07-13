@@ -1172,6 +1172,273 @@ fn every_reviewer_hears_the_findings_duty_however_its_persona_was_written() {
         "mechanics_core(Reviewer) must forbid the `pass` verdict on a blocking finding — the \
          gate opens on the verdict and cannot see the finding: {core}"
     );
+
+    // The review LANES ride the same lockstep, and for the same reason (#236 F4). A repo may
+    // narrow a reviewer to one lane — that is what a focused roster is for — but a lane no
+    // block was ever told to cover is a lane no verdict reflects, and the gate cannot tell
+    // "reviewed and clean" from "never looked at". These three were missing from the default
+    // reviewer entirely: a bad dependency can brick a binary, a trust boundary leaks silently,
+    // and a quadratic scan is invisible in a passing test. Matched case-insensitively and on
+    // SUBSTANCE, not phrasing — reword freely, but do not drop the lane.
+    for (surface, doc) in [("mechanics_core(Reviewer)", &core), ("reviewer.md", &builtin)] {
+        let low = doc.to_lowercase();
+        for (lane, why) in [
+            ("trust boundar", "the security lane — which inputs are attacker-controllable, and where they land"),
+            ("new dependency", "the dependency lane — a dep is permanent and can violate a repo's platform rules fatally"),
+            ("algorithmic cost", "the cost lane — what the change costs at the sizes it will really see"),
+            ("red-before-green", "the duty to check the author's fail-then-pass evidence rather than trust it"),
+        ] {
+            assert!(low.contains(lane), "{surface} must give the reviewer {why}: {doc}");
+        }
+    }
+}
+
+#[test]
+fn red_before_green_is_demanded_evidenced_and_verified_across_every_surface() {
+    // #236 F2. "Tests that would fail if the feature were broken" was already in the DoD and
+    // in the reviewer's lanes — as an ASSERTION nobody ever checked. The failure it lets
+    // through is the most common one in autonomous coding and it is invisible from the diff:
+    // a suite that is green whether or not the feature exists.
+    //
+    // Closing it needs all four surfaces to move together, because each of them can drop it
+    // alone: the worker must PRODUCE the evidence (`worker.md`, and `mechanics_core(Worker)`
+    // for a replace-mode persona that never reads it), the orchestrator must REFUSE `done`
+    // without it, and the reviewer must VERIFY it rather than read it — a quoted failure line
+    // is text, and text is not a red test.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group(&Repo::new().path(), plain_rails()).unwrap();
+    let worker = instructions_lf(&reg, &g.id, "worker.md");
+    let orch = instructions_lf(&reg, &g.id, "orchestrator.md");
+    let reviewer = instructions_lf(&reg, &g.id, "reviewer.md");
+
+    // The worker runs the new tests against the code WITHOUT the change and shows the failure.
+    let w = worker.to_lowercase();
+    assert!(w.contains("base branch"), "worker.md must name where the test has to fail: {worker}");
+    assert!(
+        w.contains("failure line"),
+        "worker.md must demand the evidence itself (command + failure line), not a claim that \
+         the tests are good: {worker}"
+    );
+
+    // ...and so does a worker whose persona replaced the template outright.
+    let (reg2, _d2) = test_registry();
+    let repo = Repo::new()
+        .workflow("version: 1\nblocks:\n  - id: w-x\n    kind: worker\n    profile: .github/agents/w-x.md\n")
+        .agent_file("w-x.md", "---\nname: w-x\nmode: replace\ndescription: Repo's own worker.\n---\nShip it fast.");
+    let g2 = reg2.create_group(&repo.path(), rails()).unwrap();
+    let core = instructions_lf(&reg2, &g2.id, "w-x.md").to_lowercase();
+    assert!(
+        core.contains("base branch") && core.contains("failure line"),
+        "mechanics_core(Worker) must carry the evidence duty too — a replace persona never \
+         reads worker.md, and 'my tests would catch it' is exactly the claim it would make: {core}"
+    );
+
+    // The orchestrator treats an unevidenced `done` as not done — otherwise the duty is
+    // advice, and advice is what the DoD already was.
+    let o = orch.to_lowercase();
+    assert!(
+        orch.contains("**red-before-green evidence**"),
+        "the worker brief must ask for the evidence up front — a bar the worker first hears \
+         about at the completion check is a round-trip nobody needed: {orch}"
+    );
+    assert!(
+        o.contains("not done"),
+        "the completion check must reject a `done` whose PR shows no test failing on the base \
+         branch — a duty nobody enforces is a duty nobody performs: {orch}"
+    );
+
+    // The reviewer verifies the evidence instead of believing it.
+    let r = reviewer.to_lowercase();
+    assert!(
+        r.contains("red-before-green"),
+        "reviewer.md must check the evidence in the test-quality lane: {reviewer}"
+    );
+    assert!(
+        r.contains("missing evidence is a finding"),
+        "…absent evidence is itself a finding, or the worker's duty has no consequence: {reviewer}"
+    );
+    assert!(
+        r.contains("neutralize the change"),
+        "…and PRESENT evidence is a claim to reproduce, not proof: the reviewer breaks the \
+         behavior and watches the test go red itself, because a quoted failure line is text and \
+         text is not a red test: {reviewer}"
+    );
+}
+
+#[test]
+fn the_orchestrator_can_send_work_back_on_design_grounds_not_only_acceptance_criteria() {
+    // #236 F1. The completion check used to ask exactly one question — "does the PR satisfy the
+    // acceptance criteria?" — and a codebase can meet every criterion on every PR and still rot:
+    // coupling, a second copy of a mechanism it already had, a dependency nobody argued for, a
+    // contract changed with no design note. The prompt gave the orchestrator the MANDATE ("the
+    // codebase's advocate") and no grounds to exercise it on.
+    //
+    // The grounds are stated ONCE (an **Engineering standards** section) and referenced from the
+    // two places a decision is actually made: plan intake, where a design flaw costs a comment,
+    // and the completion check, where it costs a revert. The planner owes the matching content —
+    // a plan that never named its boundaries cannot be gated on them.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group(&Repo::new().path(), plain_rails()).unwrap();
+    let orch = instructions_lf(&reg, &g.id, "orchestrator.md");
+    let planner = instructions_lf(&reg, &g.id, "planner.md");
+
+    assert!(orch.contains("## Engineering standards"), "the grounds need one authoritative site: {orch}");
+    let o = orch.to_lowercase();
+    for (ground, why) in [
+        ("coupling", "cross-module coupling / a dependency pointing the wrong way"),
+        ("duplicat", "a second mechanism where the repo already had one"),
+        ("new dependency", "a dependency nobody argued for — permanent, and the whole repo carries it"),
+        ("design note", "a public-contract change that ships undocumented"),
+    ] {
+        assert!(o.contains(ground), "Engineering standards must name {why}: {orch}");
+    }
+    // Both sites, or the rubric is a section nobody reads at the moment it matters.
+    assert!(
+        o.contains("intake the plan before you delegate"),
+        "the standards must gate the PLAN — before any code exists is the cheap moment: {orch}"
+    );
+    assert!(
+        orch.contains("Does it clear the bar in Engineering standards?"),
+        "…and the completion check, where the PR is still cheaper to bounce than to revert: {orch}"
+    );
+
+    // The planner's plan has to carry what the gate reads.
+    let p = planner.to_lowercase();
+    for (duty, why) in [
+        ("boundaries", "which module owns the code and which seams it crosses"),
+        ("alternatives considered", "the options that lost, and why — a plan with one option didn't look"),
+        ("dependencies", "every new dependency, argued"),
+        ("public-contract", "a contract change, with its design note planned as part of the work"),
+    ] {
+        assert!(p.contains(duty), "planner.md must make the plan address {why}: {planner}");
+    }
+}
+
+#[test]
+fn a_merge_the_orchestrator_performed_owns_the_default_branchs_next_ci_run() {
+    // #236 F3. Auto-merge, a one-time grant and supervised dangerous mode all let the
+    // orchestrator LAND code — and then the prompt went quiet. A PR green on its own branch can
+    // still break main (a semantic conflict with whatever landed under it; a job that only runs
+    // post-merge), and a red default branch blocks every worker in the group. Nothing told it to
+    // look, so nothing would have looked.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group(&Repo::new().path(), plain_rails()).unwrap();
+    let orch = instructions_lf(&reg, &g.id, "orchestrator.md");
+    let o = orch.to_lowercase();
+
+    assert!(
+        o.contains("post-merge run"),
+        "a merge the orchestrator performed must be followed to the default branch's CI: {orch}"
+    );
+    assert!(
+        o.contains("stop merging"),
+        "red main halts the merge queue — the next merge lands on a broken branch: {orch}"
+    );
+    // Revert is the DEFAULT, not the fallback: one fix-forward attempt, then restore main.
+    // Written as substance (revert + the bound on fixing forward), not as a phrasing.
+    assert!(o.contains("revert"), "…and a revert PR is the remedy it must know about: {orch}");
+    assert!(
+        o.contains("fix forward once"),
+        "fixing forward is bounded to ONE attempt and the revert is the default — an unbounded \
+         fix loop on a red main is how the branch stays red all afternoon, and the CI gate's \
+         3-attempt bound does not apply here because the damage is already merged: {orch}"
+    );
+}
+
+#[test]
+fn every_open_branch_is_re_synced_after_the_default_branch_moves() {
+    // #236 F7, upgraded from detection to ACTION at the human's request: the orchestrator
+    // mirrors what a human maintainer does after a merge — it rebases the rest of the fleet,
+    // rather than waiting for `CONFLICTING` to appear on a PR it was about to land.
+    //
+    // The distinction the prose has to carry is STALE vs CONFLICTED. A branch that still merges
+    // cleanly was reviewed, tested and CI'd against code that no longer exists: its green checks
+    // are a statement about the past, and a conflict-only trigger fires at the one moment the
+    // rebase is most expensive. So freshness, not conflict-avoidance, is the rule — and it fires
+    // on ANY move of the default branch (its own merge, the human's, one it merely observed).
+    let (reg, _d) = test_registry();
+    let g = reg.create_group(&Repo::new().path(), plain_rails()).unwrap();
+    let orch = instructions_lf(&reg, &g.id, "orchestrator.md");
+    let o = orch.to_lowercase();
+
+    // Detection: checks are silent about mergeability, so the sweep has to ask.
+    assert!(
+        orch.contains("--json mergeable"),
+        "the sweep must ask whether the PR still merges — green checks say nothing about it: {orch}"
+    );
+    assert!(o.contains("conflicting"), "…and know the state it is looking for: {orch}");
+
+    // Action: rebase the fleet on freshness, not on conflict.
+    assert!(
+        o.contains("## re-sync the fleet") || o.contains("### re-sync the fleet"),
+        "the re-sync is a rule with its own site, not a footnote to conflict handling: {orch}"
+    );
+    assert!(
+        o.contains("stale is not the same as conflicted"),
+        "the whole upgrade lives in that distinction — a conflict-only trigger waits for the \
+         most expensive moment to rebase: {orch}"
+    );
+    assert!(
+        o.contains("branch it will merge into"),
+        "a sub-PR rebases onto ITS base (an integration branch), not reflexively onto main — \
+         get it backwards and a merged feature's commits get dragged through someone else's PR: {orch}"
+    );
+    assert!(
+        o.contains("owning worker"),
+        "a real conflict belongs to the worker that wrote the code (resumed), not to the \
+         orchestrator: {orch}"
+    );
+    assert!(
+        o.contains("one attempt"),
+        "…bounded exactly like the CI gate's fix loop — a rebase loop is an expensive way to \
+         not ship: {orch}"
+    );
+    assert!(
+        o.contains("stale"),
+        "…and the rebase IS a push: CI re-runs and every reviewer verdict goes stale, which is \
+         the price of freshness and the reason to pay it early: {orch}"
+    );
+}
+
+#[test]
+fn the_orchestrator_may_file_an_issue_it_may_never_start_and_it_distils_what_recurs() {
+    // #236 F6 + F5, together because they are the same boundary seen from both sides: what the
+    // orchestrator may do UNPROMPTED. Filing is free (an observation that never became an issue
+    // is one nobody acts on); starting is the human's consent, and the label funnel is where it
+    // is given. A learning loop that files a convention issue is inside that boundary; one that
+    // grooms and starts it is not.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group(&Repo::new().path(), plain_rails()).unwrap();
+    let orch = instructions_lf(&reg, &g.id, "orchestrator.md");
+    let o = orch.to_lowercase();
+
+    assert!(
+        o.contains("you may file; you may not start"),
+        "the permission and its boundary must be stated in one breath — the whole point is that \
+         they are inseparable: {orch}"
+    );
+    assert!(
+        o.contains("gh issue create"),
+        "…concretely enough to act on: {orch}"
+    );
+    assert!(
+        o.contains("filing it is not doing it"),
+        "a filed issue is PARKED in the label funnel, exactly like a deferred finding (#222) — \
+         say so, or 'I filed it' becomes a way to close a problem without solving it: {orch}"
+    );
+
+    // The learning loop: a pattern, not an incident, distilled ONCE into something durable.
+    assert!(o.contains("## the learning loop"), "{orch}");
+    assert!(
+        o.contains("pattern"),
+        "it triggers on a recurring PATTERN (a finding class, a repeated CI burn, a convention \
+         re-flagged), never on a single incident — that is the whole guard against make-work: {orch}"
+    );
+    assert!(
+        o.contains("convention issue") || o.contains("docs pr"),
+        "…and lands somewhere durable (a docs PR or a filed convention issue), not in the \
+         orchestrator's context, which is the one thing guaranteed to be lost: {orch}"
+    );
 }
 
 #[test]

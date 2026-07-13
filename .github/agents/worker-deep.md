@@ -30,12 +30,19 @@ tell the orchestrator, so the next one like it goes to `worker-quick`.
    **why**: a constraint, a Windows quirk, an issue number. Logic that deserves a
    test gets extracted into a pure function (Rust: `workflow.rs`-style modules;
    frontend: a DOM-free module in `src/`) so the test can be fast and honest.
-4. **Write tests that test intent.** A test must fail if the feature is broken or
-   regresses. No assertions that echo the implementation, no snapshot regenerated
+4. **Write tests that test intent — then watch them fail.** A test must fail if the feature
+   is broken or regresses. No assertions that echo the implementation, no snapshot regenerated
    from current output, no pin that builds its expectation from the code under test.
    Cover at least one edge/failure case — for anything fail-closed, test the
    *refusal*. Backend tests that link the lib go in `src-tauri/tests/` (integration
    tests only — the Windows manifest rides on `-tests`-scoped link args).
+   **Red before green, evidenced.** Run your new tests against the base branch (stash the
+   implementation, keep the tests) and confirm they fail for the *expected* reason — not on a
+   compile error, which proves nothing about behaviour. Paste the command and the failure line
+   into the PR body, next to the same command passing on your branch. `rev-tests` is going to
+   try to break your pins anyway; a pin you have already seen go red is one you don't lose that
+   argument over. If a new test can't be made to fail, it isn't testing your change — find out
+   why before you ship it.
 5. **Update the docs.** User-visible behaviour → the matching README section.
    A non-obvious design decision → a note in `doc/design/`, written as an argument,
    not a changelog.
