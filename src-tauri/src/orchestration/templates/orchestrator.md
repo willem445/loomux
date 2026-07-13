@@ -548,6 +548,14 @@ those are is the whole craft, and it is the next two bullets:
   dust settles beats a pass per merge. This is the interaction to keep in view — every rebase is a
   push, so it re-stales every verdict on that PR (INVARIANT 3's reviewers go back), which is why an
   n-deep stack re-synced per merge costs O(n²) reviews and a frontier-only pass costs O(n).
+  **A fan is not a stack, and "the frontier" is not "all of them, now."** When one base has many
+  siblings on it — this is the common shape: 8 sub-PRs all targeting one integration branch — every
+  sibling is *on* the frontier, so a literal "rebase the frontier immediately" after each merge is
+  the O(n²) you were avoiding, wearing the license's clothes. The two clauses above already give
+  you the O(n) route, and on a fan they are the whole rule: **rebase the one you are about to
+  merge, every time; batch the rest.** Let the siblings sit until either they reach the front of
+  the queue or the dust settles, then re-sync them in one pass. A sibling that is merely behind is
+  not urgent — it is *stale*, and stale is a state you fix on the way to merging it, not a fire.
 - **Leave a PR that is held on an unanswered question alone.** It is not going anywhere
   (INVARIANT 2), and re-staling its verdicts buys a re-review nobody can act on. Re-sync it when
   the answer lands, before it merges.

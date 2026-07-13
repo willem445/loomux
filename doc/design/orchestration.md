@@ -379,9 +379,36 @@ the red this very design calls the one that teaches people to re-bless without r
 `the_orchestrators_findings_policy_survives_in_substance_not_just_in_bytes` asserts each rule of
 the policy **inside the section that owes it** (a document-wide match lets the digest's one-line
 copy rescue a body section someone gutted), one assert per rule, so a deletion *names what it
-deleted*. Every anchor is mutation-verified red on removal; single-word anchors (`"full"`,
-`"stale"`) are banned, because whitespace-collapsed matching on a generic word is close to a
-tautology.
+deleted*. Single-word anchors (`"full"`, `"stale"`) are banned: whitespace-collapsed matching on a
+generic word is close to a tautology.
+
+**Prose pins have three failure modes, and only the first is obvious.** Each was found by mutating
+the templates, never by reading the tests — the progression is the reusable part:
+
+1. **The anchor no longer exists.** `body.matches("an approval with findings") <= 1` against a
+   document that no longer contains the phrase: `0 <= 1`, green forever, in both directions.
+2. **The anchor exists twice and the rule lives in only one of them.** Every load-bearing rule now
+   appears in the digest *and* in the body by design — the rule, and its procedure. A
+   document-wide `contains` is satisfied by either, so deleting the body's procedure leaves the
+   pin green, rescued by the digest: the rule survives as a slogan with no instructions attached.
+   Fixed by scoping every assert to the region that owes it (`section()`), which is why the pins
+   read `disposition.contains(…)` and `aftermath.contains(…)` rather than `orch.contains(…)`.
+3. **The anchor's words appear in unrelated prose inside that same region.** `"groom"` was rescued
+   by the `agent-ready` bullet three paragraphs above the prohibition ("the issue is *groomed* and
+   ready to build"); `"one line"` in `worker.md` by the report guidance ("one line restating the
+   task") — which meant the red-before-green exemption's **price**, the stated reviewable claim
+   that is the entire safety of the exemption, could be deleted in silence; `"question for the
+   human"` by the Engineering-standards section's own ambiguous-case sentence. The fix is to
+   anchor the rule's **own clause**: `"groom an issue the human hasn't"`, `"naming which of"`,
+   `"no longer a bounce"`.
+
+Which is why **the mutation harness has to delete the rule, not the string.** Deleting every
+occurrence of a phrase measures whether the pin can see the *phrase* vanish, which is not the
+question anyone is asking. The harness used here deletes the markdown unit — the list item or
+paragraph — that carries the rule, inside the region the pin scopes to, and requires the owning
+test to go red: **60/60 rules**, one at a time. That is what surfaced failure mode 3, and (on its
+own first case list) a fourth instance of mode 2: `"fix forward once"`, rescued by INVARIANT 6's
+one-line copy while the red-main *procedure* was gone.
 
 ## Validation-round additions (2026-07-03)
 

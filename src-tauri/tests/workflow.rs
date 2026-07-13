@@ -1307,11 +1307,14 @@ fn red_before_green_is_demanded_evidenced_and_verified_across_every_surface() {
             );
         }
         assert!(
-            doc.contains("one line"),
-            "{surface} must make the exemption COST something: one line naming which class it is \
-             and why, with the suite green. 'There was nothing to test' is a claim like any \
-             other — stated, it is reviewable; unstated, it is indistinguishable from an untested \
-             feature: {doc}"
+            doc.contains("naming which of"),
+            "{surface} must make the exemption COST something: one line NAMING WHICH class it is, \
+             and why, with the suite green. That line is the entire safety of the exemption — it \
+             turns 'there was nothing to test' into a reviewable claim instead of an assertion \
+             nobody can check; unstated, it is indistinguishable from an untested feature. \
+             (rev-21 R1: anchored on `one line`, this pin was rescued by worker.md's REPORT \
+             guidance — 'report on start, one line restating the task' — so the price could be \
+             deleted while the pin stayed green.): {doc}"
         );
     }
     assert!(
@@ -1375,10 +1378,15 @@ fn the_orchestrator_can_send_work_back_on_design_grounds_not_only_acceptance_cri
         "the architectural bounce must be bounded (INVARIANT 9): one bounce, naming every ground \
          it has — grounds discovered one round at a time are a loop, not a standard: {orch}"
     );
+    // rev-21 R1: anchored on `question for the human`, this was rescued by the section's own
+    // closing sentence ("an ambiguous case is a question for the human, not a reason to wave it
+    // through") — so the BOUND could be deleted whole while the pin stayed green. Anchor the bound.
     assert!(
-        standards.contains("question for the human"),
+        standards.contains("no longer a bounce"),
         "…and a second disagreement is not a second bounce: it is a question for the human, which \
-         holds the merge like any other (INVARIANT 2): {orch}"
+         holds the merge like any other (INVARIANT 2). Without the bound, 'fix the coupling → now \
+         the scope drifted → now the design note is missing' is a loop only the orchestrator can \
+         see and nobody can converge: {standards}"
     );
 
     // The planner's plan has to carry what the gate reads.
@@ -1405,22 +1413,30 @@ fn a_merge_the_orchestrator_performed_owns_the_default_branchs_next_ci_run() {
     let orch = instructions_lf(&reg, &g.id, "orchestrator.md");
     let o = flat(&orch);
 
+    // Scoped to the section that owes the PROCEDURE. INVARIANT 6 states the rule in one line
+    // ("stop merging, fix forward once, then revert"), so a document-wide match is satisfied by
+    // the digest even after the body's procedure is deleted — the rule survives as a slogan with
+    // no instructions attached. The rule-level mutation harness caught exactly that on
+    // `fix forward once` (rev-21 R1's lesson, one layer further down than R1 itself).
+    let aftermath = section(&o, "### after a merge you performed", "### re-sync the fleet");
     assert!(
-        o.contains("post-merge run"),
-        "a merge the orchestrator performed must be followed to the default branch's CI: {orch}"
+        aftermath.contains("post-merge run"),
+        "a merge the orchestrator performed must be followed to the default branch's CI: {aftermath}"
     );
     assert!(
-        o.contains("stop merging"),
-        "red main halts the merge queue — the next merge lands on a broken branch: {orch}"
+        aftermath.contains("stop merging"),
+        "red main halts the merge queue — the next merge lands on a broken branch: {aftermath}"
     );
     // Revert is the DEFAULT, not the fallback: one fix-forward attempt, then restore main.
-    // Written as substance (revert + the bound on fixing forward), not as a phrasing.
-    assert!(o.contains("revert"), "…and a revert PR is the remedy it must know about: {orch}");
     assert!(
-        o.contains("fix forward once"),
+        aftermath.contains("revert"),
+        "…and a revert PR is the remedy it must know about: {aftermath}"
+    );
+    assert!(
+        aftermath.contains("fix forward once"),
         "fixing forward is bounded to ONE attempt and the revert is the default — an unbounded \
          fix loop on a red main is how the branch stays red all afternoon, and the CI gate's \
-         3-attempt bound does not apply here because the damage is already merged: {orch}"
+         3-attempt bound does not apply here because the damage is already merged: {aftermath}"
     );
     // rev-21 F3: "stop merging until main is green" and "merge the revert to make main green"
     // are the same rule contradicting itself — main can only BECOME green through that merge, so
@@ -1429,12 +1445,12 @@ fn a_merge_the_orchestrator_performed_owns_the_default_branchs_next_ci_run() {
     // until a human wakes up, which is the status quo F3 was written to end. The carve-out is
     // what makes the state exitable, so it is pinned, not left to good sense.
     assert!(
-        o.contains("no further **feature** merges"),
+        aftermath.contains("no further **feature** merges"),
         "the merge freeze must carve out its own remedy — it freezes FEATURE merges, or it \
          forbids the one merge that makes main green: {orch}"
     );
     assert!(
-        o.contains("the merge that *makes* main green"),
+        aftermath.contains("the merge that *makes* main green"),
         "…and must say WHY the fix/revert PR is the exception: it is the exit from the red state, \
          not an exception to the freeze so much as the point of it: {orch}"
     );
@@ -1516,6 +1532,17 @@ fn every_open_branch_is_re_synced_after_the_default_branch_moves() {
         "…and a PR held on an unanswered question is not going anywhere (INVARIANT 2): rebasing \
          it re-stales verdicts to buy a re-review nobody can act on: {orch}"
     );
+    // rev-21 R3 — the license was written for DEPTH and the common topology is a FAN: 8 sub-PRs
+    // on one integration branch, where every sibling IS the frontier. "Rebase the frontier
+    // immediately" then reads as exactly the O(n²) it was meant to prevent. The O(n) behavior is
+    // already licensed by the other two clauses (always rebase the one you're about to merge;
+    // batch the rest) — it just has to be said, or the fan reads the rule literally.
+    assert!(
+        o.contains("a fan is not a stack"),
+        "the license must name the FAN case: with many siblings on one base, every sibling is on \
+         the frontier, so 'rebase the frontier immediately' after each merge is the O(n²) the \
+         license exists to avoid — rebase the one you are about to merge, and batch the rest: {orch}"
+    );
 }
 
 #[test]
@@ -1564,8 +1591,27 @@ fn the_invariants_digest_leads_the_document_and_carries_what_compaction_would_co
          "the merge gate — the one rule an agent must never forget it is under"),
         ("holds that pr's merge, in every mode",
          "a question you asked the human holds the merge in EVERY mode — auto-merge, grant, dangerous (#222)"),
+        // rev-21 R2 — INVARIANT 2 and 3 are not one-liners; they are compressions of the rules
+        // rev-19 had to fight for, and the digest is the layer that SURVIVES a compaction. Pinning
+        // only the headline clause let the distinctions inside them be deleted from the digest
+        // while the body's copies kept the pin green — i.e. deleted from the only layer that is
+        // guaranteed to still be there when it matters. Each clause is anchored on its own.
+        ("telling is not asking",
+         "INVARIANT 2's first distinction (rev-19 F1) — without it a compacted orchestrator \
+          deadlocks on its own required deferral notice: it announced something, and now believes \
+          it is waiting on an answer"),
+        ("your call",
+         "INVARIANT 2's second (rev-19 F2) — 'answered' means DECIDED, including the human handing \
+          the decision straight back"),
+        ("the pr stays open",
+         "INVARIANT 2's third (rev-19 F2) — a question never answered leaves the PR open, which is \
+          a correct outcome and never a reason to merge anyway"),
         ("an approval is not a disposition",
          "an approval with findings open is not done (#222)"),
+        ("a reason, a filed issue",
+         "INVARIANT 3's three deferral costs — a reason, a filed issue AND a line to the human. \
+          Drop them from the digest and 'deferred' silently becomes free, which is the exact \
+          failure #235 was written to stop"),
         ("you own the architecture, not only the acceptance criteria",
          "the engineering bar beyond the acceptance criteria (#236 F1)"),
         ("no test is believed until it has been seen to fail",
@@ -1724,9 +1770,12 @@ fn the_orchestrator_may_file_an_issue_it_may_never_start_and_it_distils_what_rec
     // …and the funnel forbids GROOMING, not just starting (rev-21 F8). Rewriting an unlabelled
     // issue with acceptance criteria and a plan is the step immediately before starting it; the
     // pre-#236 prose banned it by name and the compression dropped the verb.
+    // rev-21 R1: anchored on `groom`, this pin was rescued by the `agent-ready` bullet three
+    // paragraphs above it ("the issue is GROOMED and ready to build") — inside its own region.
+    // The prohibition could be deleted whole and the pin stayed green. Anchor the RULE.
     let funnel = section(&o, "## label signals", "## planning & scheduling");
     assert!(
-        funnel.contains("groom"),
+        funnel.contains("groom an issue the human hasn't"),
         "the funnel must still forbid GROOMING an unlabelled issue — it is how an agent talks \
          itself into ownership, and 'you may not start it' does not cover it: {orch}"
     );
