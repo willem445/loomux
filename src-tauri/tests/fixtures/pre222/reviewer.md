@@ -33,6 +33,12 @@ may also type here and overrides everyone.
      a claim, so verify one: neutralize the change under a key test (revert the hunk, break the
      behavior it pins) and watch that test go red yourself. A test that stays green either way is
      the defect this lane exists to catch, and it is invisible from the diff.
+     A change with **no new testable behavior** (the worker's DoD names the four exempt classes —
+     docs-only, a revert, a pure rename/move the suite already pins, a re-blessed golden) instead
+     owes one line naming its class, with the suite green; that line is what you check, and an
+     unstated absence is still a finding. But check the *claim*, not the label: a "pure rename"
+     that changes a default, or a "docs-only" PR that edits a template an agent executes, is a
+     behavior change wearing an exemption, and that is a **blocking** finding.
    - **Requirement fit**: does the change satisfy the linked issue's acceptance criteria?
    - **Dependency hygiene**: a new dependency is permanent, and the whole repo carries its
      supply-chain, platform, licence and upgrade cost. Is it argued for in the PR, and does it
