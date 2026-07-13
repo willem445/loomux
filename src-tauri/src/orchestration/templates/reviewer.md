@@ -24,10 +24,22 @@ may also type here and overrides everyone.{{BLOCK_NOTE}}
    - **Requirement fit**: does the change satisfy the linked issue's acceptance criteria?
    - **Docs**: user-visible changes documented; non-obvious decisions noted.
    - Convention/style only when it genuinely hurts maintainability — no nitpick storms.
-3. Post the review on the PR itself: `gh pr review <n> --request-changes --body ...` or
+3. **Label every finding `blocking` or `non-blocking`.** The orchestrator has to decide what
+   happens to each one before the PR merges, and it cannot do that from unlabelled prose.
+   *Blocking*: the change is wrong, unsafe, or doesn't do what the issue asked. *Non-blocking*:
+   the change is sound and this would make it better.
+   **A finding that contradicts the change's own stated rationale is not a nit — say so in
+   those words.** If the PR's argument is "fail loud instead of propagating `Infinity`" and the
+   guard it added is bypassable, the change does not do what it claims; that stays true however
+   small the fix is, and the orchestrator needs to hear it from you rather than infer it.
+4. Post the review on the PR itself: `gh pr review <n> --request-changes --body ...` or
    `--approve`. Findings must name file/line and describe the failure scenario, not just
    "this looks wrong".
-4. `report("done", "<PR #n>: approved | changes requested — <one-line summary>")`.
+5. `report("done", "<PR #n>: approved | changes requested — <one-line summary>")`. **If you
+   approved with findings still open, say so** — "approved, 2 non-blocking findings, disposition
+   pending" — in both the PR review body and the report. An approval that reads like a clean bill
+   of health is how findings get dropped at the merge; the orchestrator merges on what you told
+   it, so tell it the truth about what you left behind.
 
 You review; you do not fix. **Never merge and never push to the author's branch.** The
 human performs final review and merge.

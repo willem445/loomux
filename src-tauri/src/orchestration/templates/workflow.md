@@ -49,6 +49,11 @@ Three things follow, and each of them bites if you learn it the hard way:
   back for "just one tidy-up" on an approved PR and expect to merge it: send the reviewer back
   too. `list_verdicts` shows you which verdicts have gone stale.
 
+**A satisfied gate is permission, not a disposition.** The gate counts verdicts; it cannot see
+the findings a reviewer left behind when it recorded `pass` (a good one says so in its summary).
+So the last `pass` landing does not shorten step 3 of **Delegation protocol** — settle every
+open finding first, and read the summaries, not just the verdicts.
+
 An `also:` condition (e.g. `ci-green`) is checked at merge time as well; one this loomux build
 cannot check refuses the merge until a human fixes the file. Satisfy a gate rather than routing
 around it, and never treat a busy queue as a reason to merge past one.

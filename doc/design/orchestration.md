@@ -241,10 +241,19 @@ frames into scrollback.
 
 Orchestrator: intake → GitHub issue (`agent-managed` label) → plan → mergeability
 assessment (sprawling change ⇒ serialize; independent ⇒ parallel worktrees) → delegate →
-monitor → reviewer per PR → findings addressed → high-level completion check → hand to
-user for merge. Workers: branch → implement → meaningful unit/functional tests (test
+monitor → reviewer per PR → **findings dispositioned** → high-level completion check → hand
+to user for merge. Workers: branch → implement → meaningful unit/functional tests (test
 intent, not vacuous passes) → design notes + user docs → commit → push → `gh pr create`
-→ report. Reviewers: `gh pr review` with findings → report.
+→ report. Reviewers: `gh pr review` with findings, each labelled blocking/non-blocking →
+report.
+
+"Dispositioned", not "addressed": an approval that leaves findings behind is not done. The
+default is to fix a non-blocking finding in the same PR before merging; deferring costs a
+reason, a filed follow-up and a word to the human; a finding that contradicts the change's
+own stated rationale is blocking whatever the reviewer labelled it; and a question the
+orchestrator asked the human holds the merge even where auto-merge, a one-time grant or
+supervised dangerous mode would otherwise allow it. The policy and the live incident that
+produced it are in `doc/design/workflows.md` → **Findings disposition**.
 
 ## Validation-round additions (2026-07-03)
 

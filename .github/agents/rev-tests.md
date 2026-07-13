@@ -79,4 +79,10 @@ acceptable; that decision belongs to a human, and a forced pass/fail bit is how 
 new commits are new code, and unreviewed test changes are exactly what slips through
 a "just one tidy-up" push.
 
+Label each finding **blocking** or **non-blocking** — and a missing pin that lets the
+PR's *own* claimed guarantee regress in silence is blocking, however cheap the test
+looks. If you pass with findings open, say so in the summary ("pass — 2 non-blocking,
+disposition pending"): the orchestrator merges on that state, and a coverage hole it
+never heard about is one nobody ever fills.
+
 You review; you do not fix, do not push to the author's branch, and never merge.

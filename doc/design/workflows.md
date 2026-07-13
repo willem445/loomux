@@ -734,6 +734,51 @@ override would not be that. Two consequences worth stating:
   exits before the grant is read, so nobody has to re-approve a merge that never
   happened.
 
+### Findings disposition: a `pass` is not a disposition (#222)
+
+The gate answers *"did the reviewers finish?"*. It cannot answer *"was what they found
+dealt with?"* — and the first live run of this feature found the gap between the two.
+
+The shape of it, from the human's dogfood run: a worker shipped a `divide()` with a
+zero-guard. Both reviewers recorded **`pass`** — and both, in the same breath, posted the
+*same* non-blocking finding: `b === 0` is bypassable by coercion, so `divide(5, '0')`
+still returns `Infinity`, which is precisely what the change's own rationale ("fail loud
+instead of propagating `Infinity`") said it existed to prevent. The orchestrator relayed
+the finding to the human as an open question and then, when the second `pass` landed,
+merged it under supervised dangerous mode — before the answer came, with the finding
+unaddressed. Every gate was green. The feature shipped weaker than the issue asked for,
+and two reviews' worth of feedback went in the bin.
+
+Nothing there was a bug in the gate. The gate did its job: it counts verdicts, and both
+verdicts were `pass`. The failure was **policy** — so the fix is policy, in the templates
+rather than in the shim (`templates/orchestrator.md`, `templates/reviewer.md`,
+`templates/workflow.md`, and `mechanics_core(Reviewer)` for replace-mode personas). Four
+rules, and they are what the golden fixtures were re-blessed for:
+
+- **Pass-with-findings is not "done" — it opens a disposition step.** The default
+  disposition of a non-blocking finding is *fix it in this PR*: route it back to the
+  worker before the merge. These are usually minutes of work, and they are the signal
+  that compounds. Deferring is the exception and it is never silent — it costs a stated
+  reason, a filed follow-up issue, and a line to the human.
+- **Severity is the reviewer's rating; the requirement is the orchestrator's.** A finding
+  that contradicts the change's *own stated rationale* is blocking regardless of the label
+  the reviewer put on it, because a change that doesn't do what it claims hasn't met the
+  issue — and the orchestrator, not the reviewer, owns that call.
+- **Hold on an open question.** If the orchestrator asked the human about a PR, the merge
+  holds until they answer — explicitly including when auto-merge, a one-time grant, or
+  supervised dangerous mode would otherwise authorize it. Those authorize a merge you were
+  *ready* to make; none of them is the answer. Asking and then acting before the reply is
+  not autonomy, it is self-contradiction.
+- **Verdict summaries must tell the truth about what they left behind.** A `pass` recorded
+  with findings open says so in its summary (`"pass — 2 non-blocking, disposition
+  pending"`). The verdict is *state that something merges on*; a summary that reads like a
+  clean bill of health is how the feedback gets dropped at the gate.
+
+The through-line, and the standing posture the orchestrator template now states outright:
+**the orchestrator is the codebase's advocate, and merge speed is never the tiebreaker
+against maintainability.** Autonomy is making that call unprompted — not taking the
+shortest path to green.
+
 ### Where the state lives
 
 Both artifacts are small files in the group's state dir, because the enforcement
@@ -849,10 +894,14 @@ code.
 
 Nowhere in the base templates — and that is deliberate. A group with no workflow has
 no gate, so gate prose in `reviewer.md` would be instructions about a tool that gates
-nothing, in a file agents are expected to actually read. It also would have broken the
-toggle's compatibility promise: with the advanced orchestrator off, every instruction
-file is byte-identical to what loomux wrote before #222, and a golden-fixture test
-holds that line.
+nothing, in a file agents are expected to actually read. It would also have smuggled a
+workflow-only contract into the default experience, which is exactly what the golden
+fixtures exist to catch: the pin holds every default-group instruction file against a
+checked-in copy (seeded from the templates as they stood before #222), so any change to
+what a default group reads fails the suite until a human re-blesses it. That is a
+review surface, not a freeze — the findings-disposition policy above is a deliberate
+change to the default templates and was re-blessed as one. Workflow-conditional prose
+still has no business there.
 
 So the verdict contract rides on the two surfaces that exist *because* a workflow
 does:

@@ -1206,9 +1206,19 @@ channel; keep the human oriented with short summaries."
         // `mode: replace` persona never sees the built-in reviewer template — this
         // core is its whole loomux contract. A reviewer that didn't know to record a
         // verdict would hold the gate shut forever and nobody would know why.
+        //
+        // The findings-classification duty rides here for the same reason (#222): a
+        // replace persona never reads `reviewer.md`, and a `pass` whose summary hides
+        // the findings it left behind is how the gate opens on a change that still
+        // contradicts its own rationale. Keep the two in lockstep.
         Role::Reviewer => format!(
             "{common}\n- You review PRs via `gh` (checking out the PR branch locally is fine); \
              you do NOT create branches or push. Report findings via `report`/`message_orchestrator`.\n\
+             - Label every finding `blocking` or `non-blocking` — the orchestrator dispositions each \
+             one before the PR merges and cannot do that from unlabelled prose. A finding that \
+             contradicts the change's OWN stated rationale (the guard the issue asked for is \
+             bypassable; the error the PR promised to raise never fires) is not a nit, however small \
+             the fix: say that the change does not do what it claims.\n\
              - Record your review outcome with `review_verdict(pr, verdict, summary)` — verdict: \
              pass | fail | escalate. It is durable, attributed STATE (not a notification): when the \
              repo's workflow declares a merge gate, loomux refuses `gh pr merge` until every reviewer \
@@ -1216,7 +1226,11 @@ channel; keep the human oriented with short summaries."
              blocking verdict beats any number of passes — so never record `pass` to be agreeable or \
              to unblock a queue, and record nothing until you have actually finished reviewing. Your \
              verdict is bound to the commit you reviewed: if the author pushes more commits your pass \
-             goes stale and the gate reopens until you review the new head and record again."
+             goes stale and the gate reopens until you review the new head and record again.\n\
+             - A `pass` recorded with findings still open must SAY so in its summary (\"pass — 2 \
+             non-blocking findings, disposition pending\"). The verdict is the gate's state, and the \
+             gate is read by something that will merge on it: a summary that reads like a clean bill \
+             of health is how review feedback gets dropped at the merge."
         ),
         Role::Planner => format!(
             "{common}\n- You explore the codebase READ-ONLY and write an implementation plan as a \
