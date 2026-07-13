@@ -1098,6 +1098,83 @@ fn replace_mode_persona_still_gets_the_mechanics_core() {
 }
 
 #[test]
+fn every_reviewer_hears_the_findings_duty_however_its_persona_was_written() {
+    // The findings-disposition policy (#222) rests on the reviewer saying which
+    // findings block and admitting the ones it left behind when it passed — the
+    // incident it comes from is two reviewers recording `pass` while both posted the
+    // same finding, and a merge that read the verdicts and never the summaries.
+    //
+    // That duty therefore has to reach a reviewer down BOTH paths, exactly like the
+    // verdict contract it rides with: the built-in `reviewer.md` (which a `mode:
+    // replace` persona never sees) and `mechanics_core(Reviewer)` (which is all such
+    // a block ever gets). Drift between them is silent — the group that skipped the
+    // duty is the one whose repo bothered to write its own reviewer.
+    let (reg, _d) = test_registry();
+    let repo = Repo::new()
+        .workflow(
+            "version: 1\nblocks:\n  - id: rev-x\n    kind: reviewer\n    profile: .github/agents/rev-x.agent.md\n",
+        )
+        .agent_file(
+            "rev-x.agent.md",
+            "---\nname: rev-x\nmode: replace\ndescription: Repo's own reviewer.\n---\n\
+             Review the diff. Be quick about it.",
+        );
+    let g = reg.create_group(&repo.path(), rails()).unwrap();
+    let core = instructions_lf(&reg, &g.id, "rev-x.md");
+
+    // ...and the built-in template, which is what every default group's reviewer reads.
+    let (reg2, _d2) = test_registry();
+    let plain = Repo::new();
+    let g2 = reg2.create_group(&plain.path(), plain_rails()).unwrap();
+    let builtin = instructions_lf(&reg2, &g2.id, "reviewer.md");
+
+    // These three strings are pinned AS STRINGS, deliberately (rev-19 F8). `non-blocking`
+    // is no longer prose — it is the label `orchestrator.md` tells the orchestrator to READ,
+    // so the literal token IS the contract; the other two are the phrasings that carry the
+    // duty. A meaning-preserving reword therefore turns this red on purpose: reword the
+    // templates and this test together, as one decision, rather than reading the red as noise.
+    for (surface, doc) in [("mechanics_core(Reviewer)", &core), ("reviewer.md", &builtin)] {
+        assert!(
+            doc.contains("non-blocking"),
+            "{surface} must make the reviewer classify a finding — the orchestrator \
+             dispositions each one and cannot do it from unlabelled prose: {doc}"
+        );
+        assert!(
+            doc.contains("stated rationale"),
+            "{surface} must say that a finding contradicting the change's own rationale is \
+             not a nit — that is the finding the live incident dropped: {doc}"
+        );
+        assert!(
+            doc.contains("findings still open"),
+            "{surface} must forbid the silent approval: a pass that hides what it left \
+             behind is how the feedback dies at the merge: {doc}"
+        );
+    }
+
+    // The label has to BIND to the action, or it is decoration: a reviewer that may call a
+    // finding blocking and approve anyway has reopened the hole the label was added to close
+    // (rev-19 F3) — the gate reads the verdict, never the prose. Each surface says it in its
+    // own vocabulary, and that asymmetry is load-bearing: `reviewer.md` is what an UNGATED
+    // group reads, so it may not mention `review_verdict` at all (see
+    // `a_reviewer_a_gate_names_is_told_its_verdict_is_the_gate`) — it binds to the `gh` action
+    // instead.
+    assert!(
+        builtin.contains("not `--approve`"),
+        "reviewer.md must forbid approving past a blocking finding, in the vocabulary an \
+         ungated reviewer actually has (`gh pr review`, not the verdict tool): {builtin}"
+    );
+    assert!(
+        !builtin.contains("review_verdict"),
+        "...and must still not name the verdict tool — an ungated group has no gate for it"
+    );
+    assert!(
+        core.contains("never `pass`"),
+        "mechanics_core(Reviewer) must forbid the `pass` verdict on a blocking finding — the \
+         gate opens on the verdict and cannot see the finding: {core}"
+    );
+}
+
+#[test]
 fn a_persona_file_cannot_move_a_block_into_another_capability_class() {
     // The one thing a repo file must never do. A persona that declares
     // `kind: worker` while the block that uses it is a `planner` is an ERROR —
@@ -1614,8 +1691,9 @@ fn plain_rails() -> Guardrails {
     Guardrails { advanced_orchestrator: false, ..rails() }
 }
 
-/// The four role templates **as they stood before #222** — checked-in golden
-/// copies, not the live ones (see `tests/fixtures/pre222/README.md`).
+/// The four role templates as a **human last blessed** them — checked-in golden
+/// copies, not the live ones (seeded from before #222, re-blessed on a deliberate
+/// policy edit; see `tests/fixtures/pre222/README.md`).
 ///
 /// This independence is the entire point. The first cut of the pin below built its
 /// expected value by taking the *live* template and replacing the placeholders with
@@ -1748,7 +1826,7 @@ fn the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was() {
         assert_eq!(
             written,
             render_with_legacy_vars(golden, &g),
-            "{file} is no longer what loomux wrote before #222 — see tests/fixtures/pre222/README.md"
+            "{file} is no longer the text a default group reads — see tests/fixtures/pre222/README.md"
         );
         assert!(!written.contains("{{"), "{file} has an unsubstituted variable");
         assert!(
@@ -1791,7 +1869,7 @@ fn a_workflow_placeholder_must_sit_at_the_end_of_a_line_it_shares() {
         assert_eq!(
             lf(live).replace(key, ""),
             lf(golden),
-            "{file}: the live template differs from its pre-#222 golden by more than {key}"
+            "{file}: the live template differs from its blessed golden by more than {key}"
         );
     }
 }

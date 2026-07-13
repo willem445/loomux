@@ -194,6 +194,18 @@ an agent cannot get around it (it goes through the same `gh` PATH shim that has 
 required a human grant to merge). That is what makes a second reviewer more than a
 suggestion.
 
+A PASS is permission to merge, not a verdict that the review is *finished*: reviewers may
+approve and still leave non-blocking findings behind. The orchestrator's instructions make
+that a **disposition** step — the default is to send those findings back to the worker and
+fix them in the same PR, deferring only with a stated reason and a filed follow-up issue;
+a finding that contradicts the change's own stated rationale is treated as blocking however
+the reviewer labelled it; and a **question** the orchestrator has put to you — a decision it
+is waiting on, not a status line it is telling you — holds the merge until you answer, even
+when auto-merge or dangerous mode would otherwise allow it. Don't want to answer? Ignoring it
+leaves the PR open and re-raised on each sweep, which is the point: review feedback should
+improve the change, not get dropped the moment the gate turns green
+([design note](doc/design/workflows.md)).
+
 Before anything spawns, the pane runs a **validation pass** over the whole file: an
 unknown block kind, an agent CLI loomux can't launch, an edge to a block that doesn't
 exist, a gate demanding a verdict from a reviewer that was deleted, a threshold no number

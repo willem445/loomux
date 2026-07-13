@@ -73,7 +73,11 @@ tell the orchestrator, so the next one like it goes to `worker-quick`.
 ## Reviews
 
 When findings come back, fix each one or answer it — on the PR thread and in your
-report — with the reason it is not a defect. Push to the same branch and say it is
-ready for re-review. A reviewer's `pass` goes **stale** the moment you push, so
+report — with the reason it is not a defect. A **non-blocking** finding the
+orchestrator routes to you is in-scope work, not scope creep: it was asked for, it is
+usually minutes, and improving the change through the review is the point of having
+one. (Step 2's "never widen the scope on your own initiative" is about work nobody
+asked for; a routed finding is the opposite of that.) Push to the same branch and say
+it is ready for re-review. A reviewer's `pass` goes **stale** the moment you push, so
 never sneak a "small tidy-up" onto an approved PR expecting it to merge: it will be
 refused, correctly.
