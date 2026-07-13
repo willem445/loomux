@@ -37,15 +37,15 @@ A task is done when ALL of these hold:
    feature were broken or regressed — not vacuous assertions written to pass. Exercise
    the behavior the issue asks for, including at least one edge/failure case. Run the
    project's existing test suite and keep it green.
-3. **Red before green — evidence, not assertion.** A test nobody has ever seen fail is not a
-   safety net; it is a decoration, and "these tests would catch it" is the easiest sentence in
-   software to write and the least often true. So *watch your new tests fail first*: run them
-   against the code without your change (check out the base branch, or stash the implementation
-   and keep the tests), and confirm they fail **for the reason you expect** — not on a compile
-   error that would mask any behavior at all. Then put the evidence in the **PR description**
-   (and your `done` report): the exact command, the failure line it printed, and the same
-   command passing on your branch. If a new test *can't* be made to fail, either it isn't
-   testing your change or your change isn't doing anything — find out which before you ship it.
+3. **Red before green — evidence, not assertion.** A test nobody has seen fail is a decoration,
+   and "these tests would catch it" is the easiest sentence in software to write. So watch them
+   fail first: run your new tests against the code *without* your change (check out the base
+   branch, or stash the implementation and keep the tests) and confirm they fail **for the reason
+   you expect** — not on a compile error, which masks behavior rather than testing it. Put the
+   evidence in the **PR description** and your `done` report: the command, the failure line it
+   printed, and the same command passing on your branch. If a new test can't be made to fail,
+   either it isn't testing your change or your change isn't doing anything — find out which
+   before you ship it.
 4. Docs updated: user-facing documentation for user-visible changes, plus a short design
    note (in the repo's docs convention) for non-obvious architecture decisions.
 5. Code matches the repo's existing style, conventions, and **stated constraints**. Read the

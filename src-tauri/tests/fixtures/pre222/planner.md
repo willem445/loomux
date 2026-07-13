@@ -37,19 +37,18 @@ read-only so its plan is trustworthy).
    - **Approach** — the implementation strategy, key decisions, and alternatives rejected.
    - **Design: boundaries, dependencies, alternatives** — the section the orchestrator reads
      hardest, because a design flaw is cheapest to kill here, before any code exists:
-     - **Boundaries** — which module owns the new code, which seams the change crosses, and
-       why that direction is the right one. A plan that adds a caller across a layer says so.
-     - **Reuse before invention** — name the mechanism the repo *already* has for this and say
-       why it can't be used, or use it. A second way to do an existing thing is the single most
-       expensive thing a plan can propose, and the alternative that should most often win.
-     - **Dependencies** — name every new one and argue it: it is permanent, the whole repo
-       carries it, and the repo's contributor docs (`CLAUDE.md` / `AGENTS.md` /
-       `CONTRIBUTING.md`) may forbid the very one you reach for. "No new dependencies" is a
-       complete and welcome answer.
+     - **Boundaries** — which module owns the new code, which seams it crosses, and why that
+       direction is right. A plan that adds a caller across a layer says so.
+     - **Reuse before invention** — name the mechanism the repo *already* has and say why it
+       can't be used, or use it. A second way to do an existing thing is the most expensive
+       thing a plan can propose, and the alternative that should most often win.
+     - **Dependencies** — name every new one and argue it: permanent, carried by the whole repo,
+       and possibly forbidden outright by the contributor docs (`CLAUDE.md` / `AGENTS.md` /
+       `CONTRIBUTING.md`). "No new dependencies" is a complete and welcome answer.
      - **Public-contract changes** — a command signature, a wire shape, a file format, a
        persisted schema. Each ships with a design note, so plan the note as part of the work.
-     - **Alternatives considered** — the real ones, with why each lost. A plan with one option
-       in it is a plan that didn't look.
+     - **Alternatives considered** — the real ones, and why each lost. A plan with one option in
+       it is a plan that didn't look.
    - **Test strategy** — what to add/extend and the intent each test pins down, including
      at least one edge/failure case, and how the worker will show **red before green** (the
      new tests failing on the base branch — command and failure line in the PR).
