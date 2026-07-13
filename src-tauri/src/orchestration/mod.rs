@@ -1207,7 +1207,12 @@ channel; keep the human oriented with short summaries."
              Add tests that would fail if the feature regressed — and SHOW that they do: run \
              them against the base branch (without your change) first, confirm they fail for \
              the expected reason, and put the command and its failure line in the PR \
-             description. A test nobody has seen fail is not evidence of anything."
+             description. A test nobody has seen fail is not evidence of anything. The exemption \
+             (it rides here too, or a replace-persona worker could never legally ship a docs PR or \
+             a revert): a change with NO new testable behavior — docs/prose-only, a revert, a pure \
+             rename/move the suite already pins, a re-blessed golden fixture — owes instead ONE \
+             LINE in the PR naming which of those it is and why, with the existing suite green. An \
+             unstated absence of evidence is not done; anything else evidences the normal way."
         ),
         // The verdict tool belongs in the CORE, not only in `reviewer.md` (#222/#197):
         // a merge gate names *custom* reviewer blocks, and a custom block with a

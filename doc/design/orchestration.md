@@ -337,11 +337,51 @@ orchestrator a value system to match its operational one:
   orchestrator template grew seven new rules and still ends up denser than it was
   (≈513 → 625 lines for ~2× the rules), because the rhetoric that carried the old ones is gone.
 
+- **The rules that bound the rules** (rev-21's review of the above). Four of the new rules were
+  executable-by-a-literal-agent failures, and they are the same species as #235's:
+  - **Red-before-green needs an exemption, or it refuses the work it exists to enable.** Stated
+    unconditionally, it bounces every PR that legitimately adds no test — including the two this
+    very design prescribes: the learning loop's **docs PR** and a red main's **revert**. So the
+    exempt class is enumerated once, in `worker.md` (four members: docs/comment-only, a revert, a
+    pure rename/move the suite already pins, a re-blessed golden), and it **costs one line**: the
+    PR names which class it is and why, with the suite green. "There was nothing to test" is a
+    claim like any other — stated, it is reviewable; unstated, it is indistinguishable from an
+    untested feature, which is what the rule was written to stop.
+  - **"Stop merging until main is green" forbade the merge that makes main green.** The freeze is
+    on *feature* merges; the fix-forward or revert PR is the exception, because it is the exit
+    from the state. Without that clause a literal orchestrator halts and waits for a human — in
+    auto-merge, the unattended mode the rule was written for.
+  - **The learning loop may not dispatch its own artefact.** "A docs PR — dispatch it as a normal
+    work item" was an opt-out from the label funnel sitting three sections below the label funnel,
+    and it inverted the policy: a finding a *reviewer* raised has to park in the funnel, while a
+    pattern the orchestrator noticed *by itself* could be started directly. It files the lesson
+    with a suggested label and stops, like everything else.
+  - **The architectural bounce is bounded** like every other loop: one bounce, naming every ground
+    it has; a second disagreement is a question for the human, not a second bounce.
+  - And the re-sync has a **topology license**: rebase the *merge frontier* (the PRs targeting the
+    branch that actually moved), let a deeper stack wait for its own base, batch on deep stacks.
+    Because a rebase re-stales every verdict, re-syncing an n-deep stack after every sub-PR merge
+    costs O(n²) *re-reviews*, not just rebases — and a PR held on an unanswered question is left
+    alone entirely: it isn't going anywhere, and re-staling it buys a review nobody can act on.
+
 Each rule is pinned in `tests/workflow.rs` on the surfaces that carry it, and the golden fixtures
 in `tests/fixtures/pre222/` are re-blessed in their own commit — the diff on that directory is the
 review surface for "what did we just tell every default group to do differently?". The pins match
 **substance with whitespace collapsed** (`flat()`), deliberately: a pin that fires when a
 paragraph is re-wrapped is a pin that teaches people to re-bless without reading.
+
+**A pin is a claim until it has been watched failing** — the suite's own rule, applied to itself
+(rev-21 F1). The first cut of the compression pin asserted that the body did not restate what the
+digest owned, anchored on a phrase *the compression had deleted*: it read `0 <= 1` and could not
+fail in either direction. Worse, nothing pinned the orchestrator's #235 policy at all — deleting
+it turned exactly one test red, the **byte fixture**, whose message says "re-bless me", which is
+the red this very design calls the one that teaches people to re-bless without reading. So:
+`the_orchestrators_findings_policy_survives_in_substance_not_just_in_bytes` asserts each rule of
+the policy **inside the section that owes it** (a document-wide match lets the digest's one-line
+copy rescue a body section someone gutted), one assert per rule, so a deletion *names what it
+deleted*. Every anchor is mutation-verified red on removal; single-word anchors (`"full"`,
+`"stale"`) are banned, because whitespace-collapsed matching on a generic word is close to a
+tautology.
 
 ## Validation-round additions (2026-07-03)
 

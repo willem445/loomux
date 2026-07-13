@@ -1263,6 +1263,67 @@ fn red_before_green_is_demanded_evidenced_and_verified_across_every_surface() {
          behavior and watches the test go red itself, because a quoted failure line is text and \
          text is not a red test: {reviewer}"
     );
+
+    // rev-21 F2 — the rule needs its boundary, or it bounces the work the rest of this PR
+    // depends on. Unconditional red-before-green refuses a PR that legitimately adds no test,
+    // and the suite's own two new artefacts are exactly that: the learning loop's output is a
+    // DOCS PR, and a red main's remedy is a REVERT. Both would be sent back for evidence that
+    // cannot exist — on red main, in the unattended mode the rule was written for.
+    //
+    // The four exempt classes are enumerated ONCE, in worker.md (the surface that must produce
+    // the thing), and the enforcing surfaces reference the class rather than re-listing it —
+    // except mechanics_core, which must carry it in full for the same reason it carries
+    // everything else: a replace-mode worker never reads worker.md, and would otherwise have no
+    // legal way to ship a docs PR at all.
+    // Each surface must carry the class ITSELF and all four members: a boundary an agent has to
+    // guess at is one it will guess wrong, and "my change is basically a refactor" is how an
+    // untested feature ships. The two surfaces word the list differently (worker.md enumerates it
+    // as the DoD; the core states it compactly), so each is pinned in its own vocabulary.
+    for (surface, doc, classes) in [
+        (
+            "worker.md",
+            &w,
+            ["docs- or comment-only", "a revert", "a pure rename/move", "a re-blessed golden"],
+        ),
+        (
+            "mechanics_core(Worker)",
+            &core,
+            ["docs/prose-only", "a revert", "rename/move the suite already pins", "golden fixture"],
+        ),
+    ] {
+        assert!(
+            doc.contains("no new testable behavior"),
+            "{surface} must name the exempt CLASS — a change whose intent carries no new testable \
+             behavior. Without it, red-before-green refuses the two artefacts this very suite \
+             prescribes: the learning loop's docs PR, and a red main's revert, which it then \
+             bounces for evidence that cannot exist (rev-21 F2): {doc}"
+        );
+        for class in classes {
+            assert!(
+                doc.contains(class),
+                "{surface} must enumerate the exempt class `{class}` — the four are exhaustive on \
+                 purpose, and a class that quietly drops out is a PR nobody can legally report \
+                 done: {doc}"
+            );
+        }
+        assert!(
+            doc.contains("one line"),
+            "{surface} must make the exemption COST something: one line naming which class it is \
+             and why, with the suite green. 'There was nothing to test' is a claim like any \
+             other — stated, it is reviewable; unstated, it is indistinguishable from an untested \
+             feature: {doc}"
+        );
+    }
+    assert!(
+        o.contains("the exemption, and its price"),
+        "the orchestrator's completion check must know the exemption exists, or it bounces a \
+         docs PR forever: {orch}"
+    );
+    assert!(
+        r.contains("no new testable behavior"),
+        "…and the reviewer must check the CLAIM rather than the label — a 'pure rename' that \
+         changes a default is a behavior change wearing an exemption: {reviewer}"
+    );
 }
 
 #[test]
@@ -1284,13 +1345,16 @@ fn the_orchestrator_can_send_work_back_on_design_grounds_not_only_acceptance_cri
 
     let o = flat(&orch);
     assert!(o.contains("## engineering standards"), "the grounds need one authoritative site: {orch}");
+    // Scoped to the section that owes them: INVARIANT 4 names several of these in one line, and a
+    // document-wide match would let the digest stand in for the rubric it is meant to summarize.
+    let standards = section(&o, "## engineering standards", "## delegation protocol");
     for (ground, why) in [
-        ("coupling", "cross-module coupling / a dependency pointing the wrong way"),
-        ("duplicat", "a second mechanism where the repo already had one"),
-        ("new dependency", "a dependency nobody argued for — permanent, and the whole repo carries it"),
-        ("design note", "a public-contract change that ships undocumented"),
+        ("cross-module coupling", "cross-module coupling / a dependency pointing the wrong way"),
+        ("duplicating an existing mechanism", "a second mechanism where the repo already had one"),
+        ("an unjustified new dependency", "a dependency nobody argued for — permanent, and the whole repo carries it"),
+        ("public-contract change with no design note", "a public-contract change that ships undocumented"),
     ] {
-        assert!(o.contains(ground), "Engineering standards must name {why}: {orch}");
+        assert!(standards.contains(ground), "Engineering standards must name {why}: {standards}");
     }
     // Both sites, or the rubric is a section nobody reads at the moment it matters.
     assert!(
@@ -1300,6 +1364,21 @@ fn the_orchestrator_can_send_work_back_on_design_grounds_not_only_acceptance_cri
     assert!(
         o.contains("does it clear the bar in engineering standards?"),
         "…and the completion check, where the PR is still cheaper to bounce than to revert: {orch}"
+    );
+
+    // rev-21 F10 — and the bounce is bounded like every other loop. Six grounds, several of them
+    // judgment calls (coupling, scope drift), sitting at a step the reviewer has already passed:
+    // without a bound, "fix the coupling → now the scope drifted → now the design note is missing"
+    // is a loop only the orchestrator can see and nobody can converge.
+    assert!(
+        standards.contains("architectural bounce per pr or plan"),
+        "the architectural bounce must be bounded (INVARIANT 9): one bounce, naming every ground \
+         it has — grounds discovered one round at a time are a loop, not a standard: {orch}"
+    );
+    assert!(
+        standards.contains("question for the human"),
+        "…and a second disagreement is not a second bounce: it is a question for the human, which \
+         holds the merge like any other (INVARIANT 2): {orch}"
     );
 
     // The planner's plan has to carry what the gate reads.
@@ -1342,6 +1421,22 @@ fn a_merge_the_orchestrator_performed_owns_the_default_branchs_next_ci_run() {
         "fixing forward is bounded to ONE attempt and the revert is the default — an unbounded \
          fix loop on a red main is how the branch stays red all afternoon, and the CI gate's \
          3-attempt bound does not apply here because the damage is already merged: {orch}"
+    );
+    // rev-21 F3: "stop merging until main is green" and "merge the revert to make main green"
+    // are the same rule contradicting itself — main can only BECOME green through that merge, so
+    // a literal orchestrator halts, hands the revert to the human, and waits. Under auto-merge —
+    // the mode this whole rule exists for, where nobody is at the keyboard — main then stays red
+    // until a human wakes up, which is the status quo F3 was written to end. The carve-out is
+    // what makes the state exitable, so it is pinned, not left to good sense.
+    assert!(
+        o.contains("no further **feature** merges"),
+        "the merge freeze must carve out its own remedy — it freezes FEATURE merges, or it \
+         forbids the one merge that makes main green: {orch}"
+    );
+    assert!(
+        o.contains("the merge that *makes* main green"),
+        "…and must say WHY the fix/revert PR is the exception: it is the exit from the red state, \
+         not an exception to the freeze so much as the point of it: {orch}"
     );
 }
 
@@ -1394,9 +1489,32 @@ fn every_open_branch_is_re_synced_after_the_default_branch_moves() {
          not ship: {orch}"
     );
     assert!(
-        o.contains("stale"),
+        o.contains("re-stales every verdict"),
         "…and the rebase IS a push: CI re-runs and every reviewer verdict goes stale, which is \
          the price of freshness and the reason to pay it early: {orch}"
+    );
+
+    // rev-21 F7: the same rule at the same frequency on an INTEGRATION branch is quadratic. An
+    // n-deep stack (this PR's own topology) re-synced after every sub-PR merge costs ~n²/2
+    // rebases and — because each rebase re-stales every verdict — ~n²/2 re-reviews, against the
+    // delegate cap and the autonomy budget, for sub-PRs that usually touch disjoint files. The
+    // license to scope it is therefore part of the rule, not a footnote: rebase the frontier,
+    // let the deeper stack wait for its own base, and leave a question-held PR alone.
+    assert!(
+        o.contains("re-sync the merge frontier, not the whole tree"),
+        "the re-sync must scope itself to the branch that actually MOVED — a PR two levels deep \
+         is not stale until its own base moves, and re-syncing it early pays twice: {orch}"
+    );
+    assert!(
+        o.contains("o(n²)") || o.contains("o(n^2)"),
+        "…and must name the cost it is avoiding: per-merge re-syncing of an n-deep stack is \
+         quadratic in REVIEWS, not just rebases — the verdict-invalidation interaction is the \
+         whole reason the license exists: {orch}"
+    );
+    assert!(
+        o.contains("held on an unanswered question alone"),
+        "…and a PR held on an unanswered question is not going anywhere (INVARIANT 2): rebasing \
+         it re-stales verdicts to buy a re-review nobody can act on: {orch}"
     );
 }
 
@@ -1434,32 +1552,146 @@ fn the_invariants_digest_leads_the_document_and_carries_what_compaction_would_co
          re-read it after one: {head}"
     );
 
-    // The rules whose loss is dangerous. Substance, matched loosely: reword freely, but a digest
-    // that has stopped naming one of these has stopped being the thing that survives.
+    // The rules whose loss is dangerous — anchored on the RULE, never on a word that happens to
+    // appear in it (rev-21 F1). `("stale", …)` and `("full", …)` were the old anchors, and they
+    // were tautologies: rev-21 gutted INVARIANT 10 down to "read this list in full" and the pin
+    // stayed green, because a four-letter substring survives the deletion of the rule that
+    // contains it. Whitespace-collapsed matching (`flat`) makes that worse, not better — it is
+    // only as good as the phrase you anchor with. Each anchor below is a clause that cannot
+    // survive its rule's removal, and each mutation was verified red one at a time.
     for (rule, why) in [
-        ("never merge to the default branch", "the merge gate — the one rule an agent must never forget it is under"),
-        ("holds that pr's merge", "a question you asked the human holds the merge, in every mode (#222)"),
-        ("not a disposition", "an approval with findings open is not done (#222)"),
-        ("own the architecture", "the engineering bar beyond the acceptance criteria"),
-        ("seen to fail", "no test is believed until it has been watched failing"),
-        ("red main", "a merge it performed owns the default branch's next CI run"),
-        ("stale", "a moved default branch makes every open branch stale, not just conflicted"),
-        ("consent boundary", "the label funnel: file freely, never start unlabelled"),
-        ("bounded", "every loop terminates — CI, review rounds, rebases"),
-        ("full", "a session id resumes only in full"),
+        ("never merge to the default branch unless a gate opened for you",
+         "the merge gate — the one rule an agent must never forget it is under"),
+        ("holds that pr's merge, in every mode",
+         "a question you asked the human holds the merge in EVERY mode — auto-merge, grant, dangerous (#222)"),
+        ("an approval is not a disposition",
+         "an approval with findings open is not done (#222)"),
+        ("you own the architecture, not only the acceptance criteria",
+         "the engineering bar beyond the acceptance criteria (#236 F1)"),
+        ("no test is believed until it has been seen to fail",
+         "red-before-green: an unevidenced test is a decoration (#236 F2)"),
+        ("red main stops everything",
+         "a merge it performed owns the default branch's next CI run (#236 F3)"),
+        ("when the default branch moves, every open branch is stale",
+         "a moved base makes every open branch STALE, which is not the same as conflicted (#236 F7)"),
+        ("the label funnel is the consent boundary",
+         "file freely; never groom or start an unlabelled issue (#236 F6)"),
+        ("look, don't build",
+         "…and the label says WHICH work: agent-investigate is not a licence to write code \
+          (rev-21 F5 — the digest is what survives a compaction, so it must carry the distinction)"),
+        ("every loop is bounded",
+         "every loop terminates — CI attempts, review rounds, rebases, architectural bounces"),
+        ("full uuid",
+         "a session id resumes only in FULL — a truncated one does not resolve (rev-21 F1: \
+          `full` alone matched anything)"),
+        ("your context is not the memory",
+         "externalize every decision — the board and GitHub outlive the session"),
     ] {
         assert!(head.contains(rule), "INVARIANTS must carry {why}: {head}");
     }
 
-    // And the body must not re-argue what the digest owns — the failure mode the digest exists to
-    // fix is repetition, so re-adding a rule in three places would defeat it. The disposition
-    // rule is the canary: it was the most-restated rule in the pre-#236 document.
+    // And the body must not RE-ARGUE what the digest owns. The digest states each rule; exactly
+    // one body section then carries its procedure, and cross-references by number. A rule whose
+    // own words turn up in a second body section is the repetition creeping back — which is the
+    // failure the digest exists to fix, so it has to be the failure this test can see.
+    //
+    // The old anchor here (`"an approval with findings"`) was DELETED by the very compression it
+    // was written to police, so the assertion read `0 <= 1` and could not fail in either direction
+    // (rev-21 F1 — it re-added INVARIANT 3 to three more sections and this test stayed green).
+    // The canary now has to be a phrase that is actually IN the document: INVARIANT 3's own
+    // sentence, which the digest states and step 3's procedure restates once, legitimately.
+    // Verified by mutation: pasting that sentence into a second body section turns this red.
     let body = &o[tools..];
-    assert!(
-        body.matches("an approval with findings").count() <= 1,
-        "the body restates a rule the digest owns — compression means stating it once and \
-         cross-referencing, not moving the repetition around: {body}"
+    let canary = "a finding that contradicts the change's";
+    assert_eq!(
+        body.matches(canary).count(),
+        1,
+        "INVARIANT 3's rule must appear EXACTLY once in the body — 0 means the disposition \
+         procedure was dropped (the digest's one line cannot carry #235's semantics on its own), \
+         and 2+ means a compression put the repetition back rather than removing it: {body}"
     );
+}
+
+#[test]
+fn the_orchestrators_findings_policy_survives_in_substance_not_just_in_bytes() {
+    // rev-21 F1, the pin that was missing entirely. The #235 findings-disposition policy is the
+    // most load-bearing prose in this file — it exists because a live run merged a PR that both
+    // reviewers had passed and both had filed the same finding on — and NOTHING pinned it. rev-21
+    // deleted 1,417 characters of it (the blocking-regardless call and all three deferral costs)
+    // and exactly one test went red: `the_toggle_off_leaves_every_instruction_file…`, the byte
+    // fixture, whose message says "you changed the default rendering, re-bless me".
+    //
+    // That red is indistinguishable from a re-wrap — which is precisely the red this PR's own
+    // `flat()` rationale calls the one that "teaches people to re-bless a fixture without reading
+    // it". A policy guarded only by a fixture a future commit is expected to re-bless is a policy
+    // guarded by nothing.
+    //
+    // So: one assert per rule, each anchored on the clause that carries it, so a deletion NAMES
+    // what it deleted instead of saying "the bytes moved". Every anchor below was mutation-tested
+    // red on its own.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group(&Repo::new().path(), plain_rails()).unwrap();
+    let orch = instructions_lf(&reg, &g.id, "orchestrator.md");
+    let o = flat(&orch);
+
+    // Each rule is asserted inside the region that owes it, never against the whole document:
+    // the digest carries one-line copies of several of these, and a document-wide `contains`
+    // would let the digest rescue a body section someone had gutted (see `section`).
+    let disposition = section(&o, "3. **disposition every finding**", "### the merge gate");
+    let gate = section(&o, "### the merge gate", "### after a merge you performed");
+
+    for (region, name, rule, why) in [
+        // The step itself: an approval opens a disposition step, it does not open the merge.
+        (disposition, "the disposition step", "default: fix it in this pr",
+         "the DEFAULT disposition — route the finding back to the worker and re-review; a \
+          non-blocking finding is minutes of work and it is the signal that compounds"),
+        // Severity is the reviewer's rating; the requirement is the orchestrator's.
+        (disposition, "the disposition step", "a finding that contradicts the change's",
+         "the blocking-REGARDLESS call: a finding contradicting the change's own stated rationale \
+          means the change does not do what it claims"),
+        (disposition, "the disposition step", "whatever severity the reviewer gave it",
+         "…and that the call is the ORCHESTRATOR's — the reviewer rates the diff, it owns the \
+          requirement"),
+        (disposition, "the disposition step", "not a `pass` with a note",
+         "the label→verdict bind (rev-19 F3): an approval carrying a reviewer-labelled BLOCKING \
+          finding is a contradiction to send back, not to merge on"),
+        // Deferring costs three things, and skipping any one of them drops the finding.
+        (disposition, "the disposition step", "why the fix doesn't belong in",
+         "deferral cost 1 — a REASON naming why the fix doesn't belong in THIS PR ('scope' is a \
+          category word; 'it'd only take ten minutes' is a reason to FIX it)"),
+        (disposition, "the disposition step", "carrying the finding verbatim",
+         "deferral cost 2 — a filed FOLLOW-UP ISSUE carrying the finding, not a paraphrase"),
+        (disposition, "the disposition step", "one line to the human",
+         "deferral cost 3 — the LINE TO THE HUMAN, which is the only thing that gives a deferred \
+          finding a future"),
+        (disposition, "the disposition step", "filing it is not doing it",
+         "…and that the filed issue PARKS the finding in the label funnel rather than \
+          discharging it"),
+        (disposition, "the disposition step", "round of findings on the same pr",
+         "the loop's BOUND (rev-19 F5) — three rounds and the PR settles, or a reviewer with one \
+          new nit per round runs it forever"),
+        // The open-question hold, and the distinctions rev-19 had to fight for.
+        (gate, "the merge gate", "open-question hold",
+         "the HOLD: a question you asked the human holds that PR's merge in every mode — \
+          auto-merge, one-time grant, supervised dangerous mode"),
+        (gate, "the merge gate", "telling is not asking",
+         "rev-19 F1 — without it the policy deadlocks on its OWN required deferral notice: a \
+          deferral you announced is not a question you await"),
+        (gate, "the merge gate", "your call",
+         "rev-19 F2 — 'answered' means DECIDED, including the human handing the decision back"),
+        (gate, "the merge gate", "the pr stays open",
+         "rev-19 F2 — a question never answered leaves the PR open: a correct outcome, and never \
+          a reason to merge anyway"),
+    ] {
+        assert!(
+            region.contains(rule),
+            "orchestrator.md's {name} has lost part of the findings-disposition policy: {why}.\n\
+             This is the prose #222/#235 exist for — a live run merged a PR that both reviewers \
+             had passed and both had filed the same finding on. If you are deliberately changing \
+             it, change this pin in the same commit and say so in the PR.\n\nRegion as rendered:\n\
+             {region}"
+        );
+    }
 }
 
 #[test]
@@ -1489,6 +1721,16 @@ fn the_orchestrator_may_file_an_issue_it_may_never_start_and_it_distils_what_rec
          say so, or 'I filed it' becomes a way to close a problem without solving it: {orch}"
     );
 
+    // …and the funnel forbids GROOMING, not just starting (rev-21 F8). Rewriting an unlabelled
+    // issue with acceptance criteria and a plan is the step immediately before starting it; the
+    // pre-#236 prose banned it by name and the compression dropped the verb.
+    let funnel = section(&o, "## label signals", "## planning & scheduling");
+    assert!(
+        funnel.contains("groom"),
+        "the funnel must still forbid GROOMING an unlabelled issue — it is how an agent talks \
+         itself into ownership, and 'you may not start it' does not cover it: {orch}"
+    );
+
     // The learning loop: a pattern, not an incident, distilled ONCE into something durable.
     assert!(o.contains("## the learning loop"), "{orch}");
     assert!(
@@ -1496,10 +1738,23 @@ fn the_orchestrator_may_file_an_issue_it_may_never_start_and_it_distils_what_rec
         "it triggers on a recurring PATTERN (a finding class, a repeated CI burn, a convention \
          re-flagged), never on a single incident — that is the whole guard against make-work: {orch}"
     );
+
+    // rev-21 F4 — and its artefact goes through the funnel like everything else. The prose used
+    // to offer "a small docs PR (dispatch it as a normal work item)" as the FIRST option, which
+    // is the orchestrator spawning a worker on work no human ever labelled: an opt-out from
+    // INVARIANT 8 sitting three sections below INVARIANT 8, and the more attractive of the two
+    // options for an agent that wants to act. Worse, it inverts the policy — a finding a REVIEWER
+    // raised has to park in the funnel (step 3's deferral), while a pattern the orchestrator
+    // noticed by itself could be dispatched directly.
     assert!(
-        o.contains("convention issue") || o.contains("docs pr"),
-        "…and lands somewhere durable (a docs PR or a filed convention issue), not in the \
-         orchestrator's context, which is the one thing guaranteed to be lost: {orch}"
+        o.contains("do not dispatch a worker on it because it is \"only docs\""),
+        "the learning loop must NOT dispatch its own artefact — an unlabelled issue the \
+         orchestrator noticed itself is not more startable than a finding a reviewer raised: {orch}"
+    );
+    assert!(
+        o.contains("suggested label"),
+        "…it files the lesson with a suggested label and stops. The human's label starts it, like \
+         any other work: the lesson is yours to notice and theirs to start: {orch}"
     );
 }
 
@@ -2081,6 +2336,23 @@ fn lf(s: &str) -> String {
 /// Substance is the claim these tests make; typography is not.
 fn flat(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+}
+
+/// The slice of a `flat`ted document between two markers — the SECTION a rule must live in.
+///
+/// Scoping is what makes these pins discriminate, and it is the second half of rev-21 F1's
+/// lesson. Most of the load-bearing phrases now appear twice by design: once in the INVARIANTS
+/// digest (the rule) and once in the body (the procedure). A whole-document `contains` is then
+/// satisfied by *either*, so deleting the body's copy — the compression failure mode this suite
+/// exists to catch — leaves the assertion green, rescued by the digest. Mutation-testing every
+/// anchor found exactly that on 10 of them. Assert each rule inside the region that owes it.
+fn section<'a>(flat_doc: &'a str, start: &str, end: &str) -> &'a str {
+    let from = flat_doc
+        .find(start)
+        .unwrap_or_else(|| panic!("the document has lost its `{start}` section entirely:\n{flat_doc}"));
+    let rest = &flat_doc[from..];
+    let to = rest[start.len()..].find(end).map(|i| i + start.len()).unwrap_or(rest.len());
+    &rest[..to]
 }
 
 fn instructions(reg: &OrchRegistry, group: &str, file: &str) -> String {
