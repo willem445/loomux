@@ -136,11 +136,13 @@ fn breadcrumb_in(dir: &Path, event: &str, detail: &str) {
         &dir.join("breadcrumbs.1.log"),
         BREADCRUMB_ROTATE_BYTES,
     );
-    // Build the whole line first and emit it with ONE write: `O_APPEND` is atomic
-    // per write syscall, and a `writeln!` with several arguments emits one write
-    // per fragment — which is precisely how the audit log ended up with records
-    // spliced into each other (#240). Breadcrumbs are written from every pane
-    // thread, so the same race lives here.
+    // Build the whole line first and emit it with ONE `write_all`: `O_APPEND` is
+    // atomic per write syscall, and a `writeln!` with several arguments emits one
+    // write per fragment — which is precisely how the audit log ended up with
+    // records spliced into each other (#240). Breadcrumbs are written from every
+    // pane thread, so the same race lives here. (`write_all` loops on a short
+    // write, so this is one syscall *in practice* — regular files don't
+    // short-write at these sizes — rather than by contract; see `append_audit`.)
     let line = format!("{} {} {}\n", stamp(now_ms()), event, detail);
     if let Ok(mut f) = fs::OpenOptions::new()
         .create(true)

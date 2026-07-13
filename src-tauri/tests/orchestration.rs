@@ -18,7 +18,8 @@ use loomux_lib::orchestration::{
     normalize_remote_web_base, parse_audit_lines, parse_audit_lines_counted, parse_session_cost,
     paste_held_notice,
     prompt_wait_detected, resolve_paste_gate, resolve_ref_url, rotate_audit_if_needed,
-    sanitize_attachment_ext, should_confirm_copilot_autopilot, should_flush_before_paste,
+    sanitize_attachment_ext, set_rotate_check_pause_for_test, should_confirm_copilot_autopilot,
+    should_flush_before_paste,
     should_notify_paste_held, should_notify_unconfirmed, single_pane_autopilot_flags,
     spawn_rate_exceeded, spawn_request_expired, strip_ansi, submit_confirmed, submit_sequence,
     unconfirmed_delivery_notice, watchdog_should_notify, worktree_cleanup_targets,
@@ -2443,45 +2444,61 @@ fn audit_rotation_racing_appends_loses_no_lines() {
     );
 }
 
-/// #240, the other half: rotation is check-then-rename. Two threads that both
-/// read a past-the-cap size before either renames would BOTH rename — the
-/// second one moving the fresh, nearly-empty log over `audit.1.jsonl` and
-/// destroying the generation the first just retained (8 MB of history, in
-/// production). Rotation and appends therefore share one lock.
+/// #240, the other half — the one the single `write_all` does NOT fix, so it
+/// needs its own reproducer rather than an argument.
 ///
-/// Unlike the two tests above this one does NOT go red on the pre-fix code: the
-/// check-to-rename window is a few instructions wide and a test can't force a
-/// thread into it without a seam in the production path. It's kept as an
-/// invariant guard — the lock makes check+rename atomic, and CI's slower,
-/// contended scheduling is where a regression would surface.
+/// Rotation is check-then-rename. Two threads that both read a past-the-cap size
+/// before either renames will BOTH rename: the first retires the full log to
+/// `audit.1.jsonl`, appenders start refilling a fresh `audit.jsonl`, and then the
+/// second — acting on its now-stale size check — renames that fresh, nearly-empty
+/// log over `audit.1.jsonl`, discarding the generation the first just retained
+/// (8 MB of history, in production). `AUDIT_LOCK` closes the window by making
+/// check+rename atomic.
+///
+/// The window is a few instructions wide, so the test widens it through the
+/// `set_rotate_check_pause_for_test` seam and staggers the two rotators: A
+/// renames early, appenders write into the fresh log, B renames late. Without the
+/// lock B's rename lands on a refilled log and the seeded generation is gone —
+/// verified red (see the PR). With it, B's check runs *after* A's rename, sees a
+/// log under the cap, and declines to rotate.
 #[test]
 fn concurrent_rotations_keep_the_retained_generation() {
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
     let gdir = reg.state_root().join(&g.id);
     const SEEDED: usize = 50;
-    const ROTATORS: usize = 8;
+    // Staggered pauses, so the second rotator's rename lands well after the
+    // first's — with appenders writing in between. Equal pauses would let both
+    // renames fire within microseconds of each other, and the race could hide.
+    const PAUSES_MS: [u64; 2] = [150, 600];
+
     for i in 0..SEEDED {
-        reg.audit(&g.id, "w-0", "agent-exit", fat_detail(0, i));
+        reg.audit(&g.id, "w-0", "seeded", fat_detail(0, i));
     }
     let seeded_bytes = fs::metadata(gdir.join("audit.jsonl")).unwrap().len();
-    // A cap the seeded log is comfortably past, so every rotator's size check
-    // says "rotate" — they race on the rename.
+    // Past the cap for the seeded log (so both rotators' checks say "rotate"),
+    // but far above anything the appenders below can add — a *legitimate* second
+    // rotation would be the documented cap behavior, not the bug under test.
     let cap = seeded_bytes / 2;
 
     std::thread::scope(|s| {
-        for _ in 0..ROTATORS {
+        for pause in PAUSES_MS {
             let gdir = &gdir;
-            s.spawn(move || rotate_audit_if_needed(gdir, cap));
+            s.spawn(move || {
+                set_rotate_check_pause_for_test(Duration::from_millis(pause));
+                rotate_audit_if_needed(gdir, cap);
+            });
         }
-        // Appenders refill the fresh log while the rotators fight over it — this
-        // is what gives a stale-check rotator something to clobber with.
-        for t in 1..4 {
+        // Appenders refill the fresh log across the whole rotation window — this
+        // is what gives a stale-check rotator something to clobber with. Small
+        // details on purpose: they must not push the fresh log past `cap`.
+        for t in 1..3 {
             let reg = &reg;
             let gid = g.id.as_str();
             s.spawn(move || {
-                for i in 0..20 {
-                    reg.audit(gid, &format!("w-{t}"), "agent-exit", fat_detail(t, i));
+                for i in 0..15 {
+                    reg.audit(gid, &format!("w-{t}"), "agent-exit", json!({ "seq": i }));
+                    std::thread::sleep(Duration::from_millis(50));
                 }
             });
         }
@@ -2489,10 +2506,11 @@ fn concurrent_rotations_keep_the_retained_generation() {
 
     let rotated = fs::read_to_string(gdir.join("audit.1.jsonl")).unwrap();
     let kept = assert_all_lines_parse(&rotated);
-    let exits = kept.iter().filter(|v| v["action"] == "agent-exit").count();
+    let seeded = kept.iter().filter(|v| v["action"] == "seeded").count();
     assert_eq!(
-        exits, SEEDED,
-        "the retained generation must survive a rotation stampede — a second rename would discard it"
+        seeded, SEEDED,
+        "the retained generation must survive a rotation stampede — a second, stale-check rename \
+         would move the refilled log over it and discard every seeded record"
     );
 }
 

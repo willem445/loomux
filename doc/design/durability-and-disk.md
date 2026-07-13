@@ -101,9 +101,17 @@ just read as a slightly shorter timeline.
 
 The fix has three parts:
 
-1. **One syscall per record.** The record and its `\n` are serialized into a
-   single buffer and emitted with one `write_all`. This alone is what makes a
-   record atomic against *any* appender, in this process or another.
+1. **One buffer, one `write_all`.** The record and its `\n` are serialized up
+   front and handed to the OS in a single call. This alone is what makes a record
+   atomic against *any* appender, in this process or another.
+
+   Stated precisely, because the whole argument rests on it: `write_all` *loops*
+   on a short write, and each iteration would be its own append — so this is one
+   write syscall **in practice**, not by contract. Regular-file writes of a
+   record-sized buffer on our baselines (Windows, Linux) are issued as one write
+   and return complete or fail; short writes are pipe/socket/`ENOSPC` behavior.
+   Worth restating rather than claiming a guarantee the API doesn't make — audit
+   records can be large, since full prompt texts land here.
 2. **`AUDIT_LOCK`** — a process-wide `std::sync::Mutex<()>` (no new deps, no
    getrandom) held across `rotate_audit_if_needed` + the append, as one unit. It
    buys two things a single write can't: no thread holds an append handle across
@@ -114,6 +122,16 @@ The fix has three parts:
    few hundred bytes written every few seconds, and the lock is held only for
    the open+write, never across orchestration work. `lock_safe` (obs::LockExt)
    keeps a poisoned lock from turning best-effort auditing into a panic cascade.
+
+   The two halves of the fix protect *different* failures, and each is verified
+   by a test that goes red without it. This matters: the single `write_all` alone
+   makes the corruption tests pass, so without a dedicated reproducer the lock
+   would ship on argument only. The check-to-rename window is a few instructions
+   wide, so `set_rotate_check_pause_for_test` (a thread-local, zero in production,
+   read only when a rollover actually fires) widens it on demand and lets
+   `concurrent_rotations_keep_the_retained_generation` force the double-rename.
+   With the lock removed but `write_all` kept, that test loses **all 50** seeded
+   records, 6 runs out of 6.
 3. **The shims stay single-`printf`.** `gh_shim_sh` / `git_shim_sh` append from
    *other processes*, where no mutex of ours reaches. They're correct for the
    same reason as rule 1 — one `printf` of one whole line through `>>` is one
@@ -220,10 +238,14 @@ orchestrator discipline and is left to the orchestrator/human for now.
   reproducing the incident's exact `""actionaction""::""agent-exit…` signature.
 - `audit_rotation_racing_appends_loses_no_lines` (#240): appenders racing one
   mid-burst `rotate_audit_if_needed`; the union of both generations must hold
-  every record, uncorrupted. Also red pre-fix.
-- `concurrent_rotations_keep_the_retained_generation` (#240): a rotation
-  stampede must not discard `audit.1.jsonl`. An invariant guard, not a
-  reproducer — the check-to-rename window is too narrow to force from a test, so
-  it passes pre-fix too.
+  every record, uncorrupted. Also red pre-fix — but note its redness comes from
+  the *writer* (interleaved records), not the lock: it stays green if only the
+  lock is removed. The lock's evidence is the test below.
+- `concurrent_rotations_keep_the_retained_generation` (#240): two rotators
+  staggered through the `set_rotate_check_pause_for_test` seam, with appenders
+  refilling the fresh log between their renames; the retained generation must
+  survive. This is the **lock's** reproducer — it's the one test the single
+  `write_all` does not make pass. Red without `AUDIT_LOCK` (`left: 0, right: 50`
+  — every seeded record gone), green with it.
 - `parse_audit_lines_counts_what_it_skips` (#240): a spliced line is counted as
   skipped, a blank line is not, and the whole records still parse.

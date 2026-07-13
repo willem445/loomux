@@ -17,6 +17,7 @@ pub mod mcp;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write as _;
@@ -2571,6 +2572,31 @@ const AUDIT_ROTATE_BYTES: u64 = 8 * 1024 * 1024;
 /// cascade (see `obs::LockExt`).
 static AUDIT_LOCK: Mutex<()> = Mutex::new(());
 
+thread_local! {
+    /// Test-only seam (#240): how long *this thread* pauses between rotation's
+    /// size check and its rename. Rotation is check-then-rename, and the window
+    /// between the two is a few instructions wide — too narrow for a test to
+    /// force a second rotator into it, which is why the lock's rotation-race
+    /// protection would otherwise ship unverified. Widening the window on demand
+    /// makes the race a real reproducer (see
+    /// `concurrent_rotations_keep_the_retained_generation`).
+    ///
+    /// Zero in production, and read only when a rotation actually fires (an 8 MB
+    /// rollover), so the production path pays one thread-local read per rollover
+    /// and nothing else. Thread-local rather than a global so it can't leak into
+    /// the other tests cargo runs in parallel in this process. Mirrors the
+    /// existing `set_claude_projects_dir` test seam.
+    static ROTATE_CHECK_PAUSE: Cell<Duration> = const { Cell::new(Duration::ZERO) };
+}
+
+/// Widen this thread's rotation check-to-rename window. Test-only (see
+/// `ROTATE_CHECK_PAUSE`); production never calls it, so the window stays as
+/// narrow as the code makes it.
+#[doc(hidden)] // pub for integration tests
+pub fn set_rotate_check_pause_for_test(pause: Duration) {
+    ROTATE_CHECK_PAUSE.with(|p| p.set(pause));
+}
+
 /// Roll `audit.jsonl` over to `audit.1.jsonl` once it exceeds `cap`.
 /// Factored out so the threshold behavior is testable with a tiny cap.
 #[doc(hidden)] // pub for integration tests
@@ -2593,6 +2619,16 @@ pub fn rotate_audit_if_needed(dir: &Path, cap: u64) {
 fn rotate_audit_locked(dir: &Path, cap: u64) {
     let path = dir.join("audit.jsonl");
     if fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > cap {
+        // Check-then-rename: the size we just read is only still true because
+        // `AUDIT_LOCK` is held. Without it a second rotator could pass this same
+        // check, wait out the first one's rename, and then rename the *fresh*
+        // log over `audit.1.jsonl` — discarding the generation the first just
+        // retained. `ROTATE_CHECK_PAUSE` (zero outside tests) widens exactly
+        // this window so that race can be reproduced rather than argued.
+        let pause = ROTATE_CHECK_PAUSE.with(|p| p.get());
+        if !pause.is_zero() {
+            std::thread::sleep(pause);
+        }
         let _ = fs::rename(&path, dir.join("audit.1.jsonl")); // replaces the old generation
     }
 }
@@ -2656,27 +2692,38 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// give you — that one makes whole-file *replaces* crash-safe (#133), a
 /// different failure mode. Two rules keep a record whole (#240):
 ///
-/// 1. **One syscall per line.** The record and its newline are serialized into a
-///    single buffer and emitted with one `write_all`. Append-mode atomicity is
-///    per write syscall, so a record that takes many writes is a record other
-///    writers can interleave with. The old code wrote `writeln!(f, "{line}")`
-///    with `line` a `serde_json::Value`: `Display` walks the tree and emits a
-///    write per token, and concurrent writers (mass agent-exit at shutdown,
-///    delivery threads) spliced each other character by character — real logs
-///    ended up with `{{""actionaction""::""agent-exitagent-exit""`.
+/// 1. **One buffer, one `write_all`.** The record and its newline are serialized
+///    up front and handed to the OS in a single call. Append-mode atomicity is
+///    per write *syscall*, so a record emitted as many writes is a record other
+///    writers can be scheduled into the middle of. The old code wrote
+///    `writeln!(f, "{line}")` with `line` a `serde_json::Value`: `Display` walks
+///    the tree and emits a write per token, and concurrent writers (mass
+///    agent-exit at shutdown, delivery threads) spliced each other character by
+///    character — real logs ended up with
+///    `{{""actionaction""::""agent-exitagent-exit""`.
+///
+///    Precisely: `write_all` *loops* on a short write, and each iteration is its
+///    own append — so the atomicity rests on the file not short-writing, not on
+///    a contract. For a regular file on our baselines (Windows, Linux) a
+///    blocking write of a record-sized buffer is issued as one write and returns
+///    complete or fails; short writes are a pipe/socket/`ENOSPC` behavior. That
+///    is the practice this relies on, and it is worth restating rather than
+///    claiming a guarantee the API doesn't make: audit records can be large
+///    (full prompt texts land here).
 /// 2. **`AUDIT_LOCK` for in-process writers**, so appends don't race rotation.
 ///
 /// The *other* writers are the gh/git shims (`gh_shim_sh`, `git_shim_sh`), in
 /// other processes and beyond any mutex of ours. They rely on rule 1 alone, and
-/// satisfy it the same way: one `printf` of one whole line, appended with `>>`
-/// — one `write(2)` under `O_APPEND`. Any shim audit line must stay a single
-/// `printf`; building a line across two redirections would reintroduce exactly
-/// this bug across processes.
+/// satisfy it the same way: one `printf` of one whole line, appended with `>>`.
+/// Any shim audit line must stay a single `printf`; building a line across two
+/// redirections would reintroduce exactly this bug across processes.
 fn append_audit(root: &Path, group: &str, actor: &str, action: &str, detail: Value) {
     let dir = root.join(group);
     let record = json!({ "ts_ms": now_ms(), "actor": actor, "action": action, "detail": detail });
     let mut line = record.to_string();
     line.push('\n'); // newline in the same buffer — a separate write could be split off
+    // Serialize before taking the lock: JSON formatting is the expensive part
+    // and no other writer cares about it.
     let _ = fs::create_dir_all(&dir);
     let _guard = AUDIT_LOCK.lock_safe(); // covers rotate + append as one unit
     rotate_audit_locked(&dir, AUDIT_ROTATE_BYTES);
