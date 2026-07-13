@@ -32,14 +32,17 @@ may also type here and overrides everyone.
    those words.** If the PR's argument is "fail loud instead of propagating `Infinity`" and the
    guard it added is bypassable, the change does not do what it claims; that stays true however
    small the fix is, and the orchestrator needs to hear it from you rather than infer it.
+   **A blocking finding means `--request-changes`, not `--approve`.** "Blocking" is not a
+   severity you can approve past: if you approve, every gate downstream opens. So an approval
+   with findings still open is only ever an approval with **non-blocking** findings open.
 4. Post the review on the PR itself: `gh pr review <n> --request-changes --body ...` or
    `--approve`. Findings must name file/line and describe the failure scenario, not just
    "this looks wrong".
 5. `report("done", "<PR #n>: approved | changes requested — <one-line summary>")`. **If you
-   approved with findings still open, say so** — "approved, 2 non-blocking findings, disposition
-   pending" — in both the PR review body and the report. An approval that reads like a clean bill
-   of health is how findings get dropped at the merge; the orchestrator merges on what you told
-   it, so tell it the truth about what you left behind.
+   approved with (non-blocking) findings still open, say so** — "approved, 2 non-blocking
+   findings, disposition pending" — in both the PR review body and the report. An approval that
+   reads like a clean bill of health is how findings get dropped at the merge; the orchestrator
+   merges on what you told it, so tell it the truth about what you left behind.
 
 You review; you do not fix. **Never merge and never push to the author's branch.** The
 human performs final review and merge.
