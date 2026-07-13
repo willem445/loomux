@@ -134,6 +134,10 @@ REAL_GH="__REAL_GH__"
 loomux_audit() { # $1=action $2=detail-json
   ts=$(date +%s%3N 2>/dev/null); [ -z "$ts" ] && ts=0
   if [ -n "$LOOMUX_GROUP_DIR" ]; then
+    # ONE printf of the whole line (record + \n) — O_APPEND is atomic per write,
+    # and the backend can't lock us out of another process. Splitting this across
+    # two printfs/redirections would let a concurrent writer splice the record
+    # (#240). Keep it a single append.
     printf '{"ts_ms":%s,"actor":"gh-shim","action":"%s","detail":%s}\n' "$ts" "$1" "$2" \
       >> "$LOOMUX_GROUP_DIR/audit.jsonl" 2>/dev/null || true
   fi
@@ -455,6 +459,8 @@ REAL_GIT="__REAL_GIT__"
 loomux_audit() { # $1=action $2=detail-json
   ts=$(date +%s%3N 2>/dev/null); [ -z "$ts" ] && ts=0
   if [ -n "$LOOMUX_GROUP_DIR" ]; then
+    # ONE printf of the whole line — see the gh shim's note (#240): cross-process
+    # append atomicity is per write syscall, and no backend mutex reaches here.
     printf '{"ts_ms":%s,"actor":"git-shim","action":"%s","detail":%s}\n' "$ts" "$1" "$2" \
       >> "$LOOMUX_GROUP_DIR/audit.jsonl" 2>/dev/null || true
   fi
@@ -2250,6 +2256,12 @@ pub struct OrchRegistry {
     /// notice has been delivered, cleared when free space recovers past
     /// `LOW_DISK_CLEAR_BYTES`. Machine-wide (the disk is shared across groups).
     low_disk_notified: Mutex<bool>,
+    /// Per-group count of unreadable audit lines already breadcrumbed (#240).
+    /// The viewer re-polls `audit_log` in follow mode, so a log that already
+    /// carries torn lines — every log written before the append fix — would
+    /// otherwise emit a breadcrumb per poll and flood out the crash-forensics
+    /// history it shares the file with. Report only when the count *changes*.
+    audit_skips_notified: Mutex<HashMap<String, usize>>,
 }
 
 fn now_ms() -> u64 {
@@ -2548,10 +2560,37 @@ pub(crate) fn group_id_for_repo(repo: &str) -> String {
 /// generation kept). Full prompt texts land in the audit, so it grows fast.
 const AUDIT_ROTATE_BYTES: u64 = 8 * 1024 * 1024;
 
+/// Serializes every in-process audit writer — appends *and* rotation — against
+/// each other (#240). Two guarantees hang off it: no thread holds an append
+/// handle across another thread's rotation rename, and two threads can't both
+/// decide to rotate (the second rename would discard the generation the first
+/// just created). Uncontended in practice — an append is a few hundred bytes
+/// every few seconds — and held only for the open+write, never across
+/// orchestration work, so it can't meaningfully block a pane. `lock_safe`
+/// keeps a poisoned lock from turning best-effort auditing into a panic
+/// cascade (see `obs::LockExt`).
+static AUDIT_LOCK: Mutex<()> = Mutex::new(());
+
 /// Roll `audit.jsonl` over to `audit.1.jsonl` once it exceeds `cap`.
 /// Factored out so the threshold behavior is testable with a tiny cap.
 #[doc(hidden)] // pub for integration tests
 pub fn rotate_audit_if_needed(dir: &Path, cap: u64) {
+    let _guard = AUDIT_LOCK.lock_safe();
+    rotate_audit_locked(dir, cap);
+}
+
+/// Rotation body. Callers must already hold `AUDIT_LOCK` — `append_audit` takes
+/// it once and covers rotate+append with a single acquisition (the lock is not
+/// reentrant).
+///
+/// A *cross-process* writer (the gh/git shims' `>>`) can still open the log a
+/// moment before this rename and write through the handle afterwards. That's
+/// accepted, not a defect: the handle keeps pointing at the same file, so the
+/// line lands at the tail of `audit.1.jsonl` instead of the fresh `audit.jsonl`
+/// — never lost, and the viewer reads both generations (`audit_log`). Only its
+/// position in the timeline shifts, and only for a record that raced an 8 MB
+/// rollover.
+fn rotate_audit_locked(dir: &Path, cap: u64) {
     let path = dir.join("audit.jsonl");
     if fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > cap {
         let _ = fs::rename(&path, dir.join("audit.1.jsonl")); // replaces the old generation
@@ -2612,13 +2651,37 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 
 /// Audit-log writer usable from background threads (delivery outcomes)
 /// without holding a registry reference.
+///
+/// Appends are atomic *per record*, which the sibling `atomic_write` does not
+/// give you — that one makes whole-file *replaces* crash-safe (#133), a
+/// different failure mode. Two rules keep a record whole (#240):
+///
+/// 1. **One syscall per line.** The record and its newline are serialized into a
+///    single buffer and emitted with one `write_all`. Append-mode atomicity is
+///    per write syscall, so a record that takes many writes is a record other
+///    writers can interleave with. The old code wrote `writeln!(f, "{line}")`
+///    with `line` a `serde_json::Value`: `Display` walks the tree and emits a
+///    write per token, and concurrent writers (mass agent-exit at shutdown,
+///    delivery threads) spliced each other character by character — real logs
+///    ended up with `{{""actionaction""::""agent-exitagent-exit""`.
+/// 2. **`AUDIT_LOCK` for in-process writers**, so appends don't race rotation.
+///
+/// The *other* writers are the gh/git shims (`gh_shim_sh`, `git_shim_sh`), in
+/// other processes and beyond any mutex of ours. They rely on rule 1 alone, and
+/// satisfy it the same way: one `printf` of one whole line, appended with `>>`
+/// — one `write(2)` under `O_APPEND`. Any shim audit line must stay a single
+/// `printf`; building a line across two redirections would reintroduce exactly
+/// this bug across processes.
 fn append_audit(root: &Path, group: &str, actor: &str, action: &str, detail: Value) {
     let dir = root.join(group);
-    let line = json!({ "ts_ms": now_ms(), "actor": actor, "action": action, "detail": detail });
+    let record = json!({ "ts_ms": now_ms(), "actor": actor, "action": action, "detail": detail });
+    let mut line = record.to_string();
+    line.push('\n'); // newline in the same buffer — a separate write could be split off
     let _ = fs::create_dir_all(&dir);
-    rotate_audit_if_needed(&dir, AUDIT_ROTATE_BYTES);
+    let _guard = AUDIT_LOCK.lock_safe(); // covers rotate + append as one unit
+    rotate_audit_locked(&dir, AUDIT_ROTATE_BYTES);
     if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(dir.join("audit.jsonl")) {
-        let _ = writeln!(f, "{line}");
+        let _ = f.write_all(line.as_bytes());
     }
 }
 
@@ -2638,12 +2701,27 @@ pub struct AuditEntry {
 /// the filesystem or a registry.
 #[doc(hidden)] // pub for integration tests
 pub fn parse_audit_lines(text: &str) -> Vec<AuditEntry> {
-    text.lines()
+    parse_audit_lines_counted(text).0
+}
+
+/// Same, but also reports how many non-blank lines failed to parse. Skipping
+/// silently is how #240 stayed invisible for so long: a corrupt log read as a
+/// slightly shorter timeline, with nothing anywhere saying lines had been
+/// dropped. Blank lines don't count — a torn tail or a trailing newline is
+/// normal; unparseable *content* is not.
+#[doc(hidden)] // pub for integration tests
+pub fn parse_audit_lines_counted(text: &str) -> (Vec<AuditEntry>, usize) {
+    let mut skipped = 0usize;
+    let entries = text
+        .lines()
         .filter_map(|line| {
             if line.trim().is_empty() {
                 return None;
             }
-            let v: Value = serde_json::from_str(line).ok()?;
+            let Ok(v) = serde_json::from_str::<Value>(line) else {
+                skipped += 1;
+                return None;
+            };
             Some(AuditEntry {
                 ts_ms: v["ts_ms"].as_u64().unwrap_or(0),
                 actor: v["actor"].as_str().unwrap_or("").to_string(),
@@ -2651,7 +2729,8 @@ pub fn parse_audit_lines(text: &str) -> Vec<AuditEntry> {
                 detail: v.get("detail").cloned().unwrap_or(Value::Null),
             })
         })
-        .collect()
+        .collect();
+    (entries, skipped)
 }
 
 /// Upper bound on entries returned to the viewer: the audit grows fast (full
@@ -3103,6 +3182,7 @@ impl OrchRegistry {
             pending_max_notice: Mutex::new(HashMap::new()),
             claude_projects_dir: Mutex::new(None),
             low_disk_notified: Mutex::new(false),
+            audit_skips_notified: Mutex::new(HashMap::new()),
         }
     }
 
@@ -3221,6 +3301,12 @@ impl OrchRegistry {
     /// Reads the rotated generation (`audit.1.jsonl`) before the current one
     /// so a rotation doesn't drop history mid-session, then keeps only the
     /// most recent `AUDIT_VIEW_LIMIT` entries. Missing files read as empty.
+    ///
+    /// Unreadable lines are still skipped — a log with a torn record must not
+    /// blank the viewer — but they are no longer skipped *silently*: the count
+    /// goes to the breadcrumb log (#240). A non-zero count now means a writer
+    /// is not appending whole lines, which is a bug worth seeing rather than a
+    /// timeline that quietly comes up short.
     pub fn audit_log(&self, group: &str) -> Vec<AuditEntry> {
         let dir = self.group_dir(group);
         let mut text = String::new();
@@ -3232,7 +3318,12 @@ impl OrchRegistry {
                 }
             }
         }
-        let mut entries = parse_audit_lines(&text);
+        let (mut entries, skipped) = parse_audit_lines_counted(&text);
+        if skipped > 0 && self.audit_skips_notified.lock_safe().insert(group.to_string(), skipped) != Some(skipped) {
+            // Only on a change: follow mode re-polls this, and a pre-fix log
+            // keeps its torn lines forever (see `audit_skips_notified`).
+            crate::obs::breadcrumb("audit-lines-unreadable", &format!("group={group} skipped={skipped}"));
+        }
         if entries.len() > AUDIT_VIEW_LIMIT {
             entries.drain(0..entries.len() - AUDIT_VIEW_LIMIT);
         }
