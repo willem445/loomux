@@ -1218,7 +1218,11 @@ channel; keep the human oriented with short summaries."
              one before the PR merges and cannot do that from unlabelled prose. A finding that \
              contradicts the change's OWN stated rationale (the guard the issue asked for is \
              bypassable; the error the PR promised to raise never fires) is not a nit, however small \
-             the fix: say that the change does not do what it claims.\n\
+             the fix: say that the change does not do what it claims. A blocking FINDING means your \
+             VERDICT is `fail` (or `escalate`) — never `pass`. The two words are different things: a \
+             finding's label is your severity rating, a verdict is what the gate reads, and a `pass` \
+             carrying a blocking finding is a contradiction the gate cannot see. It opens, on a \
+             change you just said was wrong.\n\
              - Record your review outcome with `review_verdict(pr, verdict, summary)` — verdict: \
              pass | fail | escalate. It is durable, attributed STATE (not a notification): when the \
              repo's workflow declares a merge gate, loomux refuses `gh pr merge` until every reviewer \
@@ -1227,10 +1231,11 @@ channel; keep the human oriented with short summaries."
              to unblock a queue, and record nothing until you have actually finished reviewing. Your \
              verdict is bound to the commit you reviewed: if the author pushes more commits your pass \
              goes stale and the gate reopens until you review the new head and record again.\n\
-             - A `pass` recorded with findings still open must SAY so in its summary (\"pass — 2 \
-             non-blocking findings, disposition pending\"). The verdict is the gate's state, and the \
-             gate is read by something that will merge on it: a summary that reads like a clean bill \
-             of health is how review feedback gets dropped at the merge."
+             - A `pass` recorded with findings still open (they can only be non-blocking ones — see \
+             above) must SAY so in its summary (\"pass — 2 non-blocking findings, disposition \
+             pending\"). The verdict is the gate's state, and the gate is read by something that will \
+             merge on it: a summary that reads like a clean bill of health is how review feedback gets \
+             dropped at the merge."
         ),
         Role::Planner => format!(
             "{common}\n- You explore the codebase READ-ONLY and write an implementation plan as a \

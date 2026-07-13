@@ -758,21 +758,37 @@ rules, and they are what the golden fixtures were re-blessed for:
 - **Pass-with-findings is not "done" — it opens a disposition step.** The default
   disposition of a non-blocking finding is *fix it in this PR*: route it back to the
   worker before the merge. These are usually minutes of work, and they are the signal
-  that compounds. Deferring is the exception and it is never silent — it costs a stated
-  reason, a filed follow-up issue, and a line to the human.
+  that compounds. Deferring is the exception and it is never silent — it costs a reason
+  that says why the fix does not belong in *this* PR (a category word like "scope" is not
+  one), a follow-up issue, and a line to the human. Filing that issue **parks** the
+  finding rather than discharging it: it lands in the same label funnel as everything else
+  (`agent-ready` is the human's go button, and the orchestrator may not pull an unlabelled
+  issue), which is exactly why the line to the human is part of the price. The loop is
+  bounded like the CI gate — three rounds of findings on one PR and it settles rather than
+  ping-ponging, because a review loop that never terminates never ships the fix either.
 - **Severity is the reviewer's rating; the requirement is the orchestrator's.** A finding
   that contradicts the change's *own stated rationale* is blocking regardless of the label
   the reviewer put on it, because a change that doesn't do what it claims hasn't met the
   issue — and the orchestrator, not the reviewer, owns that call.
-- **Hold on an open question.** If the orchestrator asked the human about a PR, the merge
-  holds until they answer — explicitly including when auto-merge, a one-time grant, or
-  supervised dangerous mode would otherwise authorize it. Those authorize a merge you were
-  *ready* to make; none of them is the answer. Asking and then acting before the reply is
-  not autonomy, it is self-contradiction.
-- **Verdict summaries must tell the truth about what they left behind.** A `pass` recorded
-  with findings open says so in its summary (`"pass — 2 non-blocking, disposition
-  pending"`). The verdict is *state that something merges on*; a summary that reads like a
-  clean bill of health is how the feedback gets dropped at the gate.
+- **Label and verdict move together.** A blocking *finding* means a `fail`/`escalate`
+  *verdict*, never a `pass` that mentions it. Without that rule the new vocabulary would
+  reopen the very hole it was added to close: a reviewer could label a finding blocking,
+  record `pass`, and the gate — which reads verdicts, not prose — would open on a change
+  its own reviewer called wrong. An approval with findings open is only ever an approval
+  with *non-blocking* findings open, and its summary has to say so (`"pass — 2
+  non-blocking, disposition pending"`): the verdict is *state that something merges on*, so
+  a summary that reads like a clean bill of health is how feedback dies at the gate.
+- **Hold on an open question — and know what a question is.** If the orchestrator asked the
+  human to *decide* something about a PR, the merge holds until they answer, explicitly
+  including when auto-merge, a one-time grant, or supervised dangerous mode would otherwise
+  authorize it: those authorize a merge you were *ready* to make; none of them is the
+  answer. But **telling is not asking** — a deferral the orchestrator decided, a status
+  line, an audit announcement hold nothing, or the policy would deadlock on its own
+  required deferral notice (and agents phrase decisions as confirmations: "deferring the
+  nit to #240 — sound OK?" must not be a merge hold). Answered means *decided*, including
+  "your call", which decides it by handing it back. A question never answered simply leaves
+  the PR open — a correct outcome, not a stall — held visibly on the board and re-raised on
+  each open-PR sweep, so it can't rot into a PR nobody merges.
 
 The through-line, and the standing posture the orchestrator template now states outright:
 **the orchestrator is the codebase's advocate, and merge speed is never the tiebreaker

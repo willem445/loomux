@@ -248,12 +248,16 @@ intent, not vacuous passes) → design notes + user docs → commit → push →
 report.
 
 "Dispositioned", not "addressed": an approval that leaves findings behind is not done. The
-default is to fix a non-blocking finding in the same PR before merging; deferring costs a
-reason, a filed follow-up and a word to the human; a finding that contradicts the change's
-own stated rationale is blocking whatever the reviewer labelled it; and a question the
-orchestrator asked the human holds the merge even where auto-merge, a one-time grant or
-supervised dangerous mode would otherwise allow it. The policy and the live incident that
-produced it are in `doc/design/workflows.md` → **Findings disposition**.
+default is to fix a non-blocking finding in the same PR before merging (bounded like the CI
+gate — three rounds and the PR settles); deferring costs a reason saying why the fix doesn't
+belong in *this* PR, a filed follow-up (which parks the finding in the label funnel, so it is
+not a discharge) and a word to the human. A finding that contradicts the change's own stated
+rationale is blocking whatever the reviewer labelled it — and a blocking finding is a `fail`
+verdict, never a `pass` that mentions it, or the gate opens on prose it cannot read. A
+*question* the orchestrator asked the human (a decision it awaits — not a status line it
+announced) holds the merge even where auto-merge, a one-time grant or supervised dangerous
+mode would otherwise allow it. The policy and the live incident that produced it are in
+`doc/design/workflows.md` → **Findings disposition**.
 
 ## Validation-round additions (2026-07-03)
 

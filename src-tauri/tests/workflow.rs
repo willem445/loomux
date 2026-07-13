@@ -1128,6 +1128,11 @@ fn every_reviewer_hears_the_findings_duty_however_its_persona_was_written() {
     let g2 = reg2.create_group(&plain.path(), plain_rails()).unwrap();
     let builtin = instructions_lf(&reg2, &g2.id, "reviewer.md");
 
+    // These three strings are pinned AS STRINGS, deliberately (rev-19 F8). `non-blocking`
+    // is no longer prose — it is the label `orchestrator.md` tells the orchestrator to READ,
+    // so the literal token IS the contract; the other two are the phrasings that carry the
+    // duty. A meaning-preserving reword therefore turns this red on purpose: reword the
+    // templates and this test together, as one decision, rather than reading the red as noise.
     for (surface, doc) in [("mechanics_core(Reviewer)", &core), ("reviewer.md", &builtin)] {
         assert!(
             doc.contains("non-blocking"),
@@ -1145,6 +1150,28 @@ fn every_reviewer_hears_the_findings_duty_however_its_persona_was_written() {
              behind is how the feedback dies at the merge: {doc}"
         );
     }
+
+    // The label has to BIND to the action, or it is decoration: a reviewer that may call a
+    // finding blocking and approve anyway has reopened the hole the label was added to close
+    // (rev-19 F3) — the gate reads the verdict, never the prose. Each surface says it in its
+    // own vocabulary, and that asymmetry is load-bearing: `reviewer.md` is what an UNGATED
+    // group reads, so it may not mention `review_verdict` at all (see
+    // `a_reviewer_a_gate_names_is_told_its_verdict_is_the_gate`) — it binds to the `gh` action
+    // instead.
+    assert!(
+        builtin.contains("not `--approve`"),
+        "reviewer.md must forbid approving past a blocking finding, in the vocabulary an \
+         ungated reviewer actually has (`gh pr review`, not the verdict tool): {builtin}"
+    );
+    assert!(
+        !builtin.contains("review_verdict"),
+        "...and must still not name the verdict tool — an ungated group has no gate for it"
+    );
+    assert!(
+        core.contains("never `pass`"),
+        "mechanics_core(Reviewer) must forbid the `pass` verdict on a blocking finding — the \
+         gate opens on the verdict and cannot see the finding: {core}"
+    );
 }
 
 #[test]
