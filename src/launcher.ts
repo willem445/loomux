@@ -36,7 +36,9 @@ import { gitWorktreeAdd, gitRepoRoot } from "./git";
 import type { OrchestratorConfig, WorkflowPreview } from "./orchestration";
 import { workflowPreview } from "./orchestration";
 import {
+  MAX_AGENTS_CEILING,
   ORCH_ROLES,
+  capacityRaiseTarget,
   capacityWarning,
   describeBlock,
   resolveRoster,
@@ -452,7 +454,7 @@ export class WelcomeForm {
     // them. Models are pinned per role at group creation; the suggestion list
     // follows the selected agent CLI.
     this.workersInput = numberInput(2, 0, 6);
-    this.maxAgentsInput = numberInput(4, 1, 12);
+    this.maxAgentsInput = numberInput(4, 1, MAX_AGENTS_CEILING);
     // #255: the cap this input sets is exactly what a declared workflow's
     // capacity warning is judged against — repaint (no new backend fetch, the
     // roster itself hasn't changed) on every edit so the warning tracks live.
@@ -839,7 +841,7 @@ export class WelcomeForm {
         }
         // #255: advisory only — this never touches max_agents itself, it just
         // names the shortfall and offers the fix as a click. Quiet whenever the
-        // cap already covers the workflow's structural minimum.
+        // cap already covers the workflow's full recommended roster.
         const warning = capacityWarning(r, intVal(this.maxAgentsInput, 4));
         if (warning) {
           const row = document.createElement("div");
@@ -847,9 +849,12 @@ export class WelcomeForm {
           const raise = document.createElement("button");
           raise.type = "button";
           raise.className = "dlg-btn";
-          raise.textContent = `Raise to ${r.capacity!.recommended}`;
+          // Clamped to MAX_AGENTS_CEILING (rev-1 NB2) — never a number the
+          // input's own `max` (and `clamped()` at Create) would silently clip.
+          const target = capacityRaiseTarget(r)!;
+          raise.textContent = `Raise to ${target}`;
           raise.addEventListener("click", () => {
-            this.maxAgentsInput.value = String(r.capacity!.recommended);
+            this.maxAgentsInput.value = String(target);
             this.paintRoster(r, advanced);
           });
           row.append(line("roster-error", warning), raise);

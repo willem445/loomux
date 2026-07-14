@@ -76,7 +76,29 @@ export interface WorkflowPreview {
    *  absent or invalid — the group would run the built-in roster instead). */
   min_agents: number | null;
   recommended_agents: number | null;
+  /** The gate's own reviewer requirement folded into `min_agents` — NOT a
+   *  count of reviewer blocks. Read this, never `blocks.filter(reviewer)`, to
+   *  describe why `min_agents` is what it is: a `threshold: N` gate over a
+   *  larger or different set of reviewer blocks makes those two numbers
+   *  genuinely different, and recounting blocks to describe a gate-derived
+   *  number was rev-1 of #255's review catching exactly that bug. */
+  reviewers_needed: number | null;
+  /** Which declared tiers `recommended_agents` adds over `min_agents` — short
+   *  noun phrases (`"the planner"`, `"1 more worker tier"`), backend-computed
+   *  (`workflow::extra_tiers`) for the same reason as `reviewers_needed`: so
+   *  the launcher never re-derives which blocks are "extra" from the roster
+   *  and the gate need separately. `[]` when nothing is (minimum ==
+   *  recommended), `null` alongside the other `null`s above. */
+  extra_tiers: string[] | null;
 }
+
+/** The launcher's own hard ceiling on `max_agents` (`numberInput(4, 1, 12)`
+ *  below) — mirrors `MAX_AGENTS_CEILING` in `src-tauri/src/orchestration/mod.rs`.
+ *  Kept as one named constant, rather than the `12` the form field already
+ *  hardcoded, so the capacity advisory below can reason about "the most this
+ *  cap could ever reach" instead of silently assuming the recommendation
+ *  always fits under whatever the input's `max` happens to be. */
+export const MAX_AGENTS_CEILING = 12;
 
 /** #255: the agent-capacity a declared workflow needs, mirrored from the
  *  backend's `recommend_capacity` (`orch_workflow_preview` / the
@@ -86,8 +108,15 @@ export interface CapacityRecommendation {
   /** What one review round costs without evicting anything already live: the
    *  gate's reviewer requirement plus one worker slot. */
   minimum: number;
-  /** What running every declared tier concurrently costs. */
+  /** What running every declared tier concurrently costs. May exceed
+   *  {@link MAX_AGENTS_CEILING} — a workflow file is not bounded by it, only
+   *  `max_agents` is. */
   recommended: number;
+  /** The gate's reviewer requirement alone (see `WorkflowPreview.reviewers_needed`). */
+  reviewersNeeded: number;
+  /** Which declared tiers `recommended` adds over `minimum` (see
+   *  `WorkflowPreview.extra_tiers`). */
+  extraTiers: string[];
 }
 
 /** A launcher per-role pick: the CLI and model the form collected for a class. */
@@ -200,8 +229,13 @@ export function resolveRoster(
       preview.gates.length ? `, gated on ${preview.gates.join(", ")}` : ""
     }.`,
     capacity:
-      preview.min_agents != null && preview.recommended_agents != null
-        ? { minimum: preview.min_agents, recommended: preview.recommended_agents }
+      preview.min_agents != null && preview.recommended_agents != null && preview.reviewers_needed != null
+        ? {
+            minimum: preview.min_agents,
+            recommended: preview.recommended_agents,
+            reviewersNeeded: preview.reviewers_needed,
+            extraTiers: preview.extra_tiers ?? [],
+          }
         : null,
   };
 }
@@ -238,27 +272,71 @@ export function rosterNeedsReview(r: ResolvedRoster): boolean {
   return r.status !== "builtin";
 }
 
-/** #255: the launcher's advisory — non-null when `maxAgents` would starve this
- *  roster's structural minimum (the merge gate's reviewer requirement plus one
- *  worker slot: what a single review round costs without evicting a live
- *  agent). `null` for a `builtin`/`none`/`invalid` roster (no gate to derive a
- *  minimum from) and whenever `maxAgents` already covers it — quiet at or
- *  above, exactly like the backend's own `max-agents-below-minimum` audit
- *  record.
+/** English-join a short list of noun phrases: `"a"`, `"a and b"`, `"a, b, and
+ *  c"` — mirrors the backend's `workflow::join_with_and` so `extraTiers` reads
+ *  the same sentence wherever it's rendered. */
+export function joinWithAnd(parts: readonly string[]): string {
+  if (parts.length === 0) return "";
+  if (parts.length === 1) return parts[0];
+  if (parts.length === 2) return `${parts[0]} and ${parts[1]}`;
+  return `${parts.slice(0, -1).join(", ")}, and ${parts[parts.length - 1]}`;
+}
+
+/** The "Raise to N" the launcher can actually offer: `recommended`, clamped to
+ *  {@link MAX_AGENTS_CEILING}. A workflow's structural need isn't bounded by
+ *  the ceiling, but the `max_agents` field is — offering a number the field
+ *  (and `clamped()` at Create) would silently clip is offering a fix that
+ *  doesn't land (#255 rev-1 NB2). `null` when there's nothing to raise to. */
+export function capacityRaiseTarget(r: ResolvedRoster): number | null {
+  return r.capacity ? Math.min(r.capacity.recommended, MAX_AGENTS_CEILING) : null;
+}
+
+/** #255: the launcher's advisory. Two tiers, matched to the backend's two
+ *  audit records:
+ *
+ *  - `maxAgents < minimum` — HARD: not even one review round fits without
+ *    evicting a live agent.
+ *  - `minimum <= maxAgents < recommended` — SOFT: every review round
+ *    completes, but named tiers (an extra worker lane, extra reviewers, the
+ *    planner) can never be live *alongside* one. This is the #255 incident's
+ *    own boundary — `max_agents == minimum` there, which the hard-only check
+ *    rev-1 of this PR's review caught as silent on the exact run that thrashed.
+ *
+ *  `null` for a `builtin`/`none`/`invalid` roster (no gate to derive anything
+ *  from) and whenever `maxAgents` already covers `recommended` — fully quiet
+ *  there, matching the backend's `max-agents-below-recommended` boundary.
  *
  *  Advisory only: this never touches `maxAgents` itself, it only describes why
  *  raising it (the #56 on-the-fly cap, or just the number on this form before
  *  Create) would help. */
 export function capacityWarning(r: ResolvedRoster, maxAgents: number): string | null {
-  if (!r.capacity || maxAgents >= r.capacity.minimum) return null;
-  const { minimum, recommended } = r.capacity;
+  if (!r.capacity || maxAgents >= r.capacity.recommended) return null;
+  const { minimum, recommended, reviewersNeeded, extraTiers } = r.capacity;
+  // The gate's OWN requirement, never a recount of reviewer BLOCKS (rev-1 B1) —
+  // the worker count is safe to read off the blocks, since `minimum`'s worker
+  // slot is derived the same "any worker block at all" way on both sides.
   const workers = r.blocks.filter((b) => b.kind === "worker").length;
-  const reviewers = r.blocks.filter((b) => b.kind === "reviewer").length;
-  const reviewerPart = reviewers > 0 ? `${reviewers} reviewer${reviewers > 1 ? "s" : ""}` : "its reviewers";
+  const reviewerPart =
+    reviewersNeeded > 0 ? `${reviewersNeeded} reviewer${reviewersNeeded > 1 ? "s" : ""}` : "its reviewers";
   const workerPart = workers > 0 ? " + a worker" : "";
+  const target = capacityRaiseTarget(r)!;
+  const overCeiling =
+    recommended > MAX_AGENTS_CEILING
+      ? ` (this workflow's full roster needs ${recommended}, above loomux's ${MAX_AGENTS_CEILING}-agent ` +
+        `limit — ${MAX_AGENTS_CEILING} is as high as this cap can go)`
+      : "";
+
+  if (maxAgents < minimum) {
+    return (
+      `This workflow's merge gate needs ${reviewerPart}${workerPart} (minimum ${minimum} live agents) to run ` +
+      `one review round without evicting a live agent — max_agents is ${maxAgents}. Raise it to at least ` +
+      `${minimum}, or ${target} to run every declared tier at once${overCeiling}.`
+    );
+  }
+  const extras = extraTiers.length ? joinWithAnd(extraTiers) : "some of its declared tiers";
   return (
-    `This workflow's merge gate needs ${reviewerPart}${workerPart} (minimum ${minimum} live agents) to run ` +
-    `one review round without evicting a live agent — max_agents is ${maxAgents}. Raise it to at least ` +
-    `${minimum}, or ${recommended} to run every declared tier at once.`
+    `This workflow's full roster needs ${recommended} live agents to run every declared tier at once — ` +
+    `max_agents is ${maxAgents}, which covers one review round but not the rest, so ${extras} can never be ` +
+    `live alongside a review round. Raise it to ${target}${overCeiling}.`
   );
 }

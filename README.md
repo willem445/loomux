@@ -134,16 +134,24 @@ persona. If the file is broken you get **every** validation finding right there,
 group still launches — on the standard roster, never blocked by a file in the repo. **Edit
 workflow…** opens the file in a [workflow pane](#the-workflow-pane) so you can fix it first.
 
-A declared roster and its merge gate have a real **structural minimum agent count**: the
-gate's reviewer requirement (an `all-pass` gate over 3 reviewers needs all 3; a
-`threshold: 2` gate over those same 3 needs only 2) plus one worker, since a review round
-needs something to review. Fall below it and the orchestrator can't run a single review
-round without killing a live agent to free a slot — the launcher checks **Max live agents**
-against that minimum and, if it's short, names the shortfall in the roster preview and
-offers to raise the cap: to the minimum (stops the eviction thrashing) or to the full
-**recommended** count (every declared tier — every worker block, every reviewer block, the
-planner if there is one — live at once, so no tier is ever starved of a slot). This is
-advisory only: loomux never overrides a cap you set, it only tells you what it costs.
+A declared roster and its merge gate have two real agent-count thresholds. The **minimum**
+is what one review round costs without evicting anything already live: the gate's reviewer
+requirement (an `all-pass` gate over 3 reviewers needs all 3; a `threshold: 2` gate over
+those same 3 needs only 2) plus one worker, since a review round needs something to review.
+The **recommended** count is every declared tier live at once — every worker block, every
+reviewer block, the planner if there is one.
+
+The launcher checks **Max live agents** against both. Below the minimum, it's a hard warning:
+the orchestrator can't complete a single review round without killing a live agent to free a
+slot. At or above the minimum but short of recommended, it's a softer one: every review round
+completes, but named tiers — an extra worker lane, extra reviewers, the planner — can never be
+live *alongside* one, which is exactly what silently starved the roster that motivated this
+feature (its cap sat right at the minimum, two short of what the full two-tier roster needed).
+Either way the roster preview names the shortfall and offers a one-click **Raise to N**, where
+N is the recommended count (clamped to loomux's live-agent ceiling — a workflow's structural
+need isn't bounded by it, but the cap is, so the button never offers a number the field would
+silently clip). This is advisory only: loomux never overrides a cap you set, it only tells you
+what it costs.
 
 What a workflow file can *never* do is grant a capability. `kind` is a closed set of four
 classes, and there is no spelling — no `read_only: false`, no fifth class — that makes a

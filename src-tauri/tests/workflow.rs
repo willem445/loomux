@@ -3292,6 +3292,7 @@ fn capacity_minimum_is_gate_aware_not_just_a_reviewer_count() {
     let rec = workflow::recommend_capacity(&blocks, Some(&threshold));
     assert_eq!(rec.minimum, 3, "threshold: 2 + 1 worker");
     assert_eq!(rec.recommended, 6, "1 worker + 5 reviewers, no planner block");
+    assert_eq!(rec.reviewers_needed, 2, "the gate's own requirement, not the 5 declared reviewer blocks");
 
     let all_pass = gate(GateRequire::AllPass, &reviewers, &[]);
     let rec = workflow::recommend_capacity(&blocks, Some(&all_pass));
@@ -3300,6 +3301,30 @@ fn capacity_minimum_is_gate_aware_not_just_a_reviewer_count() {
         "all-pass over the same five reviewers needs every one of them live at once"
     );
     assert_eq!(rec.recommended, 6, "recommended follows the roster, not the gate — unchanged");
+    assert_eq!(rec.reviewers_needed, 5);
+}
+
+#[test]
+fn capacity_reviewers_needed_is_what_a_caller_must_describe_the_minimum_with() {
+    // rev-1 B1 of the #255 review: a caller describing `minimum` must read
+    // `reviewers_needed`, never recount reviewer BLOCKS — a threshold gate over
+    // a subset makes those two numbers genuinely different, and reading the
+    // wrong one is exactly the bug that shipped ("needs 5 reviewers + a worker
+    // (minimum 3 live agents)" — 5 + 1 != 3).
+    let blocks = vec![
+        block("worker", Role::Worker),
+        block("rev-1", Role::Reviewer),
+        block("rev-2", Role::Reviewer),
+        block("rev-3", Role::Reviewer),
+        block("rev-4", Role::Reviewer),
+        block("rev-5", Role::Reviewer),
+    ];
+    // The gate names only 2 of the 5 declared reviewer blocks.
+    let g = gate(GateRequire::Threshold(2), &["rev-1", "rev-2"], &[]);
+    let rec = workflow::recommend_capacity(&blocks, Some(&g));
+    assert_eq!(rec.reviewers_needed, 2, "the gate's requirement, over the gate's own reviewers");
+    assert_eq!(rec.minimum, 3, "2 (reviewers_needed) + 1 worker — NOT 5 (reviewer blocks) + 1");
+    assert_eq!(rec.recommended, 6, "recommended still counts every declared reviewer block");
 }
 
 #[test]
@@ -3344,6 +3369,65 @@ fn capacity_with_no_worker_block_needs_no_worker_slot() {
     let rec = workflow::recommend_capacity(&blocks, Some(&g));
     assert_eq!(rec.minimum, 2, "no worker block declared — nothing to add the +1 slot for");
     assert_eq!(rec.recommended, 2);
+}
+
+#[test]
+fn extra_tiers_names_exactly_what_recommended_adds_over_minimum() {
+    // The #255 incident roster again: minimum (4) budgets 1 worker + the 3
+    // gated reviewers; recommended (6) adds the second worker tier and the
+    // planner. Those two are exactly what a cap sitting between the two can
+    // never keep live alongside a review round.
+    let blocks = vec![
+        block("orchestrator", Role::Orchestrator),
+        block("planner", Role::Planner),
+        block("worker-deep", Role::Worker),
+        block("worker-quick", Role::Worker),
+        block("rev-1", Role::Reviewer),
+        block("rev-2", Role::Reviewer),
+        block("rev-3", Role::Reviewer),
+    ];
+    let g = gate(GateRequire::AllPass, &["rev-1", "rev-2", "rev-3"], &[]);
+    let rec = workflow::recommend_capacity(&blocks, Some(&g));
+    let extras = workflow::extra_tiers(&blocks, rec.reviewers_needed);
+    assert_eq!(extras, vec!["1 more worker tier".to_string(), "the planner".to_string()]);
+
+    // An all-pass gate naming only a SUBSET of the declared reviewer blocks:
+    // the ones outside the gate are "extra" too, exactly like an extra worker
+    // tier — they still cannot merge-gate anything, but the roster budgets a
+    // slot for them.
+    let blocks2 = vec![
+        block("worker", Role::Worker),
+        block("rev-1", Role::Reviewer),
+        block("rev-2", Role::Reviewer),
+        block("rev-3", Role::Reviewer),
+    ];
+    let g2 = gate(GateRequire::AllPass, &["rev-1", "rev-2"], &[]);
+    let rec2 = workflow::recommend_capacity(&blocks2, Some(&g2));
+    assert_eq!(workflow::extra_tiers(&blocks2, rec2.reviewers_needed), vec!["1 more reviewer".to_string()]);
+
+    // Exactly at the minimum (no planner, no second worker tier, gate needs
+    // every declared reviewer): nothing is left over to name.
+    let tight = vec![
+        block("worker", Role::Worker),
+        block("rev-1", Role::Reviewer),
+        block("rev-2", Role::Reviewer),
+    ];
+    let g3 = gate(GateRequire::AllPass, &["rev-1", "rev-2"], &[]);
+    let rec3 = workflow::recommend_capacity(&tight, Some(&g3));
+    assert_eq!(rec3.minimum, rec3.recommended, "nothing beyond the minimum was declared");
+    assert!(workflow::extra_tiers(&tight, rec3.reviewers_needed).is_empty());
+}
+
+#[test]
+fn join_with_and_reads_like_english_at_every_list_length() {
+    let s = |v: &[&str]| workflow::join_with_and(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+    assert_eq!(s(&[]), "");
+    assert_eq!(s(&["the planner"]), "the planner");
+    assert_eq!(s(&["the planner", "1 more worker tier"]), "the planner and 1 more worker tier");
+    assert_eq!(
+        s(&["the planner", "1 more worker tier", "2 more reviewers"]),
+        "the planner, 1 more worker tier, and 2 more reviewers"
+    );
 }
 
 #[test]
