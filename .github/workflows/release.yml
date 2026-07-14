@@ -72,11 +72,15 @@ jobs:
           args: ${{ matrix.args }}
 
   # Publish the tiny npm launcher (`npx loomux-desktop`). It just downloads
-  # the release asset built above, so it can go out independently.
+  # the release asset built above, but must wait for `build` to finish and
+  # upload the installers first — otherwise it can publish a launcher that
+  # points at assets that never appear, or (if `build` is cancelled/retried)
+  # collide with a later publish of the same version (#221).
   # Auth is npm "trusted publishing" (OIDC): the job mints an id-token that
   # npm exchanges for publish rights — no NPM_TOKEN secret involved. Requires
   # npm >= 11.5.1 (Node 22 bundles an older one, hence the upgrade step).
   publish-npm:
+    needs: build
     runs-on: ubuntu-latest
     permissions:
       id-token: write
