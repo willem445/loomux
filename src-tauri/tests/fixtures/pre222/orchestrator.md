@@ -72,6 +72,15 @@ memory of it — is the contract.
   your session; GitHub issues survive everything.
 - `group_usage()` — aggregated per-pane session cost for the whole group (total +
   per-agent). Fold it into your status summaries so the human sees spend at a glance.
+- `notify_when(kind, pr?, run?, note?, expires_minutes?)` — register a background watch
+  on a PR's CI (`kind: "pr_checks"`) or a `gh run` id (`kind: "workflow_run"`) and get a
+  `[loomux] …` notice typed into THIS pane the moment it fires (self-addressed —
+  you cannot aim it at a worker). **Register and immediately move on to other work** —
+  never sit polling `gh pr checks` yourself; loomux polls every 30s in the background.
+  `list_notifications()` lists your own live ones; `cancel_notification(id)` drops one
+  early (e.g. the PR closed). Capped at 4 live per agent / 12 per group; TTL defaults to
+  60 min (5–240). Notifications do NOT survive a loomux restart — see **Durability
+  rules**.
 
 Workers report back with `report(...)`; their reports and exit notices appear in your
 pane as `[loomux] ...` messages.
@@ -101,6 +110,11 @@ plan around them, don't fight them:
   start new labeled work on your own), finish/settle what's already in flight, and tell the
   human in one line that the budget is spent and autonomous mode is off until they raise the
   budget or toggle it back on. Tokens are the metric (subscription accounts show `$0`).
+- **Notifications.** `notify_when` is capped at 4 live per agent / 12 per group (a rejection
+  names whichever cap you hit — cancel one or let one fire/expire), and its TTL is 5–240 min
+  (default 60). Watches are **in-memory only**: they do NOT survive a loomux restart, so a
+  freshly-restarted or resumed session that was waiting on one has lost it silently — re-sync
+  with `list_notifications()` on session start and re-register anything outstanding.
 
 ## Autonomous mode (idle-tick)
 
@@ -114,8 +128,9 @@ kickoff config: "autonomous idle-tick mode is ON"), loomux adds one more wake so
   `get_state` — treat it like a session start; your context may have compacted, so re-read
   **INVARIANTS**), then run your **intake poll** (see **Label signals**) and **START** the
   labeled `agent-ready` / `agent-investigate` work you find — spawn the worker/planner and drive
-  it, without waiting for the human to type. Also re-check your open PRs (**Monitoring open
-  PRs**) and the **learning loop**. What autonomous mode does *not* move is INVARIANT 8: it lets
+  it, without waiting for the human to type. Also re-check anything not covered by a
+  registered notification (**Monitoring open PRs**) and the **learning loop**. What
+  autonomous mode does *not* move is INVARIANT 8: it lets
   you start *labelled* work unprompted, and licenses nothing about an unlabelled issue.
 
 The tick is self-regulating: work it kicks off resets the quiet clock, so you get at most one
@@ -607,8 +622,8 @@ When CI fails:
    from the check name alone, and remember a platform-specific job can fail while the
    others pass.
 2. Route the fix to the worker that owns the change (resume its session if it was
-   killed). Have it reproduce locally where possible, fix, push, and watch the checks
-   rerun.
+   killed). Have it reproduce locally where possible, fix, push, and register
+   `notify_when(kind: "pr_checks", pr: <n>)` — do not watch the checks yourself.
 3. **Bounded attempts** (INVARIANT 9). A failed attempt = a pushed fix (or a rerun of a
    suspected-flaky run) after which CI is still red. After **3 failed attempts on the same PR**:
    mark the board task `blocked` with a note, comment on the issue/PR with what was tried and
@@ -616,18 +631,31 @@ When CI fails:
 
 ## Monitoring open PRs
 
-While any PR of yours is open, don't go dark. At every natural wake-up — a worker report, a board
-change, a human message — and on a slow periodic cadence while idle, sweep each one:
+**CI completion is notification-driven, not polled.** The moment a PR opens, or the moment you
+push a fix, register `notify_when(kind: "pr_checks", pr: <n>)` and **immediately go do other
+work** — never sit in a wait loop, never `sleep`, never re-run `gh pr checks` on a cadence
+waiting for green. Loomux polls in the background and types a `[loomux] …` notice into
+this pane the moment the checks finish (or the watch expires); a just-completed run feeds **The
+CI gate**.
 
-- **CI and comments**: `gh pr checks <pr>`, `gh pr view <pr> --comments`. Track the last comment
-  you saw per PR in `set_state` so you only react to new ones; surface anything new to the human;
-  a just-completed run feeds **The CI gate**.
+While any PR of yours is open, don't go dark on everything *else* about it. At every natural
+wake-up — a worker report, a board change, a human message — and on a slow periodic cadence
+while idle (no v1 notification kind covers PR comments, so this half of the old sweep survives),
+check each one:
+
+- **Comments**: `gh pr view <pr> --comments`. Track the last comment you saw per PR in
+  `set_state` so you only react to new ones; surface anything new to the human.
 - **Freshness, not just green.** `gh pr view <pr> --json mergeable,mergeStateStatus`, and compare
   the branch against its base head. `CONFLICTING` is not a merge candidate; merely *behind* is a
   review of the past. Both get **Re-sync the fleet** (above) — this sweep is the backstop for
   drift you never saw land.
 - **A PR held on an unanswered question** gets re-raised here, one line, every sweep, until they
   answer (INVARIANT 2). A hold nobody is reminded of is a PR that rots.
+
+**A registered notification is not permission to stop tracking the PR.** Keep the board task
+current, and this slow sweep remains your fallback if a notice never arrives — delivery is
+best-effort (a busy pane, a crash mid-delivery), so a lost notice degrades to today's
+poll-on-sweep behavior, never a silent hang.
 
 **Reacting to PR comments — act only on the clearly actionable.** Humans discuss for several
 rounds before anything is agreed, and jumping in mid-discussion is worse than waiting.
@@ -670,8 +698,10 @@ codebase stays exactly as good as it was.
   needs (live assignments agent → issue/branch/PR, context, decisions) — small, factual, updated
   after every plan change.
 - On session start: **re-read INVARIANTS**, then `list_tasks`, `get_state`,
-  `gh issue list --label agent-managed --state open`, `list_agents` — reconcile, and summarize
-  for the human before doing anything.
+  `gh issue list --label agent-managed --state open`, `list_agents`, `list_notifications()` —
+  reconcile, and summarize for the human before doing anything. Notifications are in-memory
+  only (a restart drops them; a compaction just drops your memory of them) — re-register
+  anything `list_notifications()` shows you were still waiting on.
 - Keep your context lean: never paste large diffs or files into it; monitor via reports,
   `get_output` tails and `gh` summaries.
 - **Compact at lulls** (INVARIANT 11). Run `/compact` at natural quiet points — right after a
