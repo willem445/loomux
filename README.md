@@ -16,6 +16,34 @@ Claude Code and GitHub Copilot CLI sessions straight into a pane, and a built-in
 **orchestrator/worker** workflow for running a fleet of AI agents you gatekeep
 only at review and merge.
 
+### Meets you where you are
+
+Every rung is a complete tool on its own — climb when you're ready:
+
+1. **Terminal multiplexer** — Windows-first GUI terminal: instant matrix
+   splits, project tabs, session restore. No agents required.
+2. **Agent multiplexer** — panes that know they carry an agent: alert chips
+   when a CLI needs you, resume Claude Code / Copilot sessions into a pane.
+3. **Agent orchestration, native** — a planning agent delegates GitHub issues
+   to worker and reviewer panes. Every prompt visible, every action audited,
+   guardrails host-enforced, no agent ever merges.
+4. **Custom agent workflows** — commit `.loomux/workflow.yml` and your repo
+   declares its own roster and merge gate: five focused reviewers, five
+   prompts, five models.
+
+Plus a git view, file editor, file explorer, and voice prompts — one
+keystroke away on any rung, never disturbing the shell underneath.
+
+### Why loomux over…
+
+- **tmux / zellij / [herdr](https://github.com/ogulcancelik/herdr)** — they
+  stop at rungs 1–2. herdr multiplexes your agents; loomux manages your
+  agents' work.
+- **IDE-shaped agent platforms** — loomux is still a terminal: lightweight,
+  native, opens your IDE instead of embedding one.
+- **Unattended agent fleets** — loomux picks trust over throughput: watch and
+  steer any agent mid-task, and the human keeps the merge button.
+
 Every pane also carries an in-app **file editor** (`Alt+F`): a lazy file tree
 with extension icons, a CodeMirror code editor with per-language highlighting,
 and project-wide search-and-replace — floating over the terminal so the shell
