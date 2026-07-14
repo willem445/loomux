@@ -6990,6 +6990,101 @@ fn notify_paused_group_freezes_the_ttl_clock_across_a_long_pause() {
 }
 
 #[test]
+fn notify_stale_pause_entry_is_reconciled_even_while_its_group_has_no_watches() {
+    // rev-orch (PR #247 round 2), "B1": the freeze reconcile used to build its
+    // scan from "groups that currently hold a watch". A group that emptied
+    // out entirely while still paused (its one worker idle-killed, cancelled,
+    // or crashed — all routine, all funnel through mark_dead) dropped out of
+    // that scan completely — no tick could even see the group to reconcile
+    // its `paused_watch_since` entry, so it sat stranded, untouched, straight
+    // through the resume. The entry only got consumed once SOME watch
+    // finally reappeared in that group, at which point the elapsed span was
+    // computed from the ORIGINAL pause observation all the way to that much
+    // later moment — charging a completely unrelated, freshly-registered
+    // watch for time it never lived through.
+    let (reg, _d, _co, cw) = setup_mcp();
+    register_notify(&reg, &cw, json!({ "kind": "pr_checks", "pr": "1", "expires_minutes": 5 })).unwrap();
+    reg.pause_group(&cw.group).unwrap();
+    let pause_observed_at = now_ms();
+    // Observe the pause starting (mirrors the live poller's cadence).
+    reg.notify_tick(pause_observed_at, &HashMap::new());
+
+    // The group empties out entirely while still paused.
+    reg.mark_dead(&cw.agent_id, Some(0));
+    assert!(reg.list_notifications(&cw.agent_id).as_array().unwrap().is_empty());
+
+    reg.resume_group(&cw.group).unwrap();
+    // A tick occurs while the group is resumed but OWNS ZERO WATCHES — the
+    // exact gap the old "scan groups with watches" reconcile skipped
+    // entirely. A real pause of only ~5 seconds.
+    let resumed_tick_at = pause_observed_at + 5_000;
+    assert!(reg.notify_tick(resumed_tick_at, &HashMap::new()).is_empty());
+
+    // Much later, a fresh, entirely unrelated watch registers into this
+    // (long since resumed) group, via a fresh agent (the old one is dead).
+    let w2 = reg.spawn_agent(&cw.group, Role::Worker, "w2", "t", false, None).unwrap();
+    let c2 = reg.resolve_token(&w2.token).unwrap();
+    let text2 = register_notify(&reg, &c2, json!({ "kind": "pr_checks", "pr": "2", "expires_minutes": 5 })).unwrap();
+    let id2 = extract_watch_id(&text2);
+    let registered_ms2 =
+        reg.list_notifications(&c2.agent_id).as_array().unwrap()[0]["registered_ms"].as_u64().unwrap();
+
+    // 6 minutes past ITS OWN registration — past its ordinary 5-min TTL, and
+    // nowhere near the multi-minute-plus-the-whole-original-pause span the
+    // bug would have granted it via the stale entry.
+    let fired = reg.notify_tick(registered_ms2 + 6 * 60_000, &HashMap::new());
+    assert_eq!(
+        fired,
+        vec![id2.clone()],
+        "a watch registered into a group long since resumed must expire on its own ordinary TTL, \
+         not inherit a stale pre-resume pause span from a watch it never coexisted with, got: {fired:?}"
+    );
+}
+
+#[test]
+fn notify_watch_registered_mid_pause_is_credited_only_the_span_it_actually_lived_through() {
+    // rev-orch (PR #247 round 2), "B2": the per-group pause span used to be
+    // applied to EVERY watch in the group with no regard for when it
+    // registered. A watch registered mid-pause — panes keep running while
+    // paused, only prompt DELIVERY is suppressed, so `notify_when` still
+    // works — got charged for the part of the pause that elapsed before it
+    // even existed.
+    let (reg, _d, _co, cw) = setup_mcp();
+    reg.pause_group(&cw.group).unwrap();
+
+    // The tick mechanism observes the pause starting well "before" the watch
+    // below will register (paused_watch_since is keyed off whatever `now` a
+    // tick is called with, never real wall-clock — see notify_tick's doc).
+    let pause_observed_at = now_ms() - 3_600_000; // 1h "before", in that timeline
+    reg.notify_tick(pause_observed_at, &HashMap::new());
+
+    // The watch registers well INTO that pause (registered_ms is real
+    // wall-clock, stamped by register_notification itself, so it lands well
+    // after pause_observed_at in the same timeline).
+    let text = register_notify(&reg, &cw, json!({ "kind": "pr_checks", "pr": "1", "expires_minutes": 5 })).unwrap();
+    let id = extract_watch_id(&text);
+    let registered_ms = reg.list_notifications(&cw.agent_id).as_array().unwrap()[0]["registered_ms"].as_u64().unwrap();
+
+    // Resume exactly 1 minute after the watch actually registered: it only
+    // ever overlapped ~1 minute of the pause, even though the GROUP's
+    // observed pause span (from pause_observed_at) is over an hour.
+    reg.resume_group(&cw.group).unwrap();
+    let resume_tick_at = registered_ms + 60_000;
+    assert!(reg.notify_tick(resume_tick_at, &HashMap::new()).is_empty(), "must not fire on the resuming tick itself");
+
+    // 9 minutes after its own registration: past its ordinary 5-min TTL plus
+    // the ~1 minute it could legitimately have earned mid-pause (6 min
+    // total) — nowhere near the ~61 minutes the bug would have credited it.
+    let fired = reg.notify_tick(registered_ms + 9 * 60_000, &HashMap::new());
+    assert_eq!(
+        fired,
+        vec![id.clone()],
+        "a watch registered mid-pause must be credited only the pause span it actually lived \
+         through (~1 min here), not the group's whole ~61-minute observed pause span, got: {fired:?}"
+    );
+}
+
+#[test]
 fn notify_tools_are_denied_to_a_planner_in_listing_and_dispatch() {
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();

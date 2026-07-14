@@ -372,11 +372,19 @@ pub fn watch_expired_notice(id: &str, condition: &Condition, minutes: u32) -> St
 /// The notice delivered when a watch is cancelled after `NOTIFY_FAIL_STREAK_LIMIT`
 /// consecutive `gh` failures. `why` is `gh`'s own stderr (already first-lined by
 /// the predicate) and is sanitized again here as the untrusted field it is.
-/// Event-led, watch id trailing — see `watch_fired_notice`'s doc for why.
+///
+/// Deliberately NOT event-led like the other two notices (rev-ui, PR #247):
+/// "cancelled" is also a legitimate GitHub run *conclusion* (the fired notice
+/// for the very same watch can read `run 17812: completed — conclusion:
+/// cancelled`), so `"{label} cancelled after…"` reads as "the CI RUN got
+/// cancelled" when the actual news is "gh couldn't be reached three times".
+/// Putting the watch id right after the label, as the grammatical subject of
+/// "cancelled", removes the ambiguity — the run/PR is what this watch was
+/// *about*, not what got cancelled.
 pub fn watch_failed_notice(id: &str, condition: &Condition, why: &str) -> String {
     let why = sanitize_gh_text(why, NOTICE_FIELD_CAP);
     truncate_notice(&format!(
-        "[loomux] {} cancelled after {NOTIFY_FAIL_STREAK_LIMIT} failed polls (watch {id}): {why}",
+        "[loomux] {}: watch {id} cancelled after {NOTIFY_FAIL_STREAK_LIMIT} failed polls — {why}",
         condition.label()
     ))
 }
@@ -615,6 +623,19 @@ mod tests {
         let n = watch_failed_notice("n-5", &Condition::WorkflowRun { run: 1 }, "gh-not-found");
         assert!(n.contains("3 failed polls"), "got: {n}");
         assert!(n.contains("gh-not-found"), "got: {n}");
+    }
+
+    #[test]
+    fn failed_notice_makes_the_watch_the_subject_not_the_run() {
+        // rev-ui (PR #247 round 2): "cancelled" is also a legitimate GitHub
+        // run conclusion (see `workflow_run_completed_reports_conclusion`'s
+        // "cancelled" fixture) — "run 17812 cancelled" reads as the CI run
+        // itself getting cancelled, not as gh being unreachable three times.
+        // The watch id must sit between the label and "cancelled" so the
+        // watch, not the run, is what the sentence says got cancelled.
+        let n = watch_failed_notice("n-5", &Condition::WorkflowRun { run: 17812 }, "gh-not-found");
+        assert!(n.contains("watch n-5 cancelled"), "the WATCH must be the subject of 'cancelled', got: {n}");
+        assert!(!n.contains("run 17812 cancelled"), "must not read as the run itself being cancelled, got: {n}");
     }
 
     #[test]

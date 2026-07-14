@@ -74,7 +74,7 @@ memory of it — is the contract.
   per-agent). Fold it into your status summaries so the human sees spend at a glance.
 - `notify_when(kind, pr?, run?, note?, expires_minutes?)` — register a background watch
   on a PR's CI (`kind: "pr_checks"`) or a `gh run` id (`kind: "workflow_run"`) and get a
-  `[loomux] notification …` typed into THIS pane the moment it fires (self-addressed —
+  `[loomux] …` notice typed into THIS pane the moment it fires (self-addressed —
   you cannot aim it at a worker). **Register and immediately move on to other work** —
   never sit polling `gh pr checks` yourself; loomux polls every 30s in the background.
   `list_notifications()` lists your own live ones; `cancel_notification(id)` drops one
@@ -629,7 +629,7 @@ When CI fails:
 **CI completion is notification-driven, not polled.** The moment a PR opens, or the moment you
 push a fix, register `notify_when(kind: "pr_checks", pr: <n>)` and **immediately go do other
 work** — never sit in a wait loop, never `sleep`, never re-run `gh pr checks` on a cadence
-waiting for green. Loomux polls in the background and types a `[loomux] notification …` into
+waiting for green. Loomux polls in the background and types a `[loomux] …` notice into
 this pane the moment the checks finish (or the watch expires); a just-completed run feeds **The
 CI gate**.
 
