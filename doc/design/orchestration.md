@@ -684,7 +684,13 @@ orchestrator, a worker, or a reviewer register a structured condition (a PR's CI
 a `gh run` id) and get a `[loomux] …` notice (event-led, e.g. `[loomux] PR #241 checks:
 SUCCESS — … (watch n-3)` — matching the house style of every other `[loomux]` notice, which
 leads with what happened and names itself last) typed into their **own** pane the moment it
-resolves, instead of sitting in a wait loop or re-polling `gh pr checks` on a cadence. Not
+resolves, instead of sitting in a wait loop or re-polling `gh pr checks` on a cadence. The
+`workflow_run` fail-cancel notice is the one deliberate exception to event-leading: "cancelled"
+is also a legitimate GitHub run *conclusion*, so `"run 17812 cancelled after 3 failed polls"`
+would read as the CI run itself being cancelled rather than as `gh` being unreachable three
+times. That notice instead puts the watch id between the label and the verb — `[loomux] run
+17812: watch n-5 cancelled after 3 failed polls — gh-not-found` — so the watch, not the run, is
+what the sentence says got cancelled (rev-ui, PR #247 round 2). Not
 available to a planner (see **Tool surface** above). The audit trail for all six lifecycle
 events uses a `watch-*` action prefix (`watch-register`/`watch-fired`/`watch-expired`/
 `watch-failed`/`watch-cancel`/`watch-cleanup`) — deliberately not `notify-*`, which the
@@ -799,18 +805,44 @@ notice carries `conclusion`.
   its own: real time keeps passing underneath it, and the first tick after a long pause would
   find every outstanding watch already past its (unmoved) deadline — evaporating exactly the
   watches the freeze exists to protect. This shipped broken in the first version of this PR
-  (rev-orch, PR #247, with a repro) and is fixed by `notify_tick` maintaining
-  `paused_watch_since: HashMap<group, tick_time>`: the first tick that observes a group as
-  newly paused records `now`; the first tick that observes it as no-longer-paused extends
-  every one of that group's watches' `deadline_ms` by the elapsed span, once, and clears the
-  record. This bookkeeping deliberately lives in `notify_tick`, not in
-  `pause_group`/`resume_group`: those two use real wall-clock `now_ms()` directly (they are
-  Tauri-command-reachable, unrelated to the notify subsystem, and changing their signature to
-  accept an injectable `now` would be a wider API change than this fix warrants), which a
-  test's simulated `now` can never reach — so the freeze has to be reconstructed from the
-  `now` values `notify_tick` is actually called with. In production this lags true pause/resume
-  by at most one `NOTIFY_POLL_INTERVAL` (`start_notify_poller` ticks every group regardless of
-  its pause state), which is the same granularity the poll cadence already has.
+  (rev-orch, PR #247 round 1, with a repro) and is fixed by `notify_tick` maintaining
+  `paused_watch_since: HashMap<group, tick_time>`, reconciled against **the current `paused`
+  set itself**, not "groups that currently hold a watch": every group in `paused` not already
+  recorded gets `paused_watch_since[group] = now`; every group recorded but no longer in
+  `paused` (it resumed) has its span computed once and its record cleared. This bookkeeping
+  deliberately lives in `notify_tick`, not in `pause_group`/`resume_group`: those two use real
+  wall-clock `now_ms()` directly (they are Tauri-command-reachable, unrelated to the notify
+  subsystem, and changing their signature to accept an injectable `now` would be a wider API
+  change than this fix warrants), which a test's simulated `now` can never reach — so the
+  freeze has to be reconstructed from the `now` values `notify_tick` is actually called with.
+  In production this lags true pause/resume by at most one `NOTIFY_POLL_INTERVAL`
+  (`start_notify_poller` ticks every group regardless of its pause state).
+
+  **Two round-2 defects in this mechanism, both from the same root cause** (rev-orch, PR #247
+  round 2, with reproducing probes): the span is computed *per group* but was being applied to
+  *every* watch in it with no regard for that watch's own lifetime.
+  - **B1 — a stale entry outlives the group emptying out.** Scanning "groups that currently
+    hold a watch" (rather than `paused` itself) meant a group that lost every watch while
+    paused — its one worker idle-killed, cancelled, or crashed, all routine, all funnel through
+    `mark_dead` — dropped out of the scan entirely. No later tick could even see the group to
+    reconcile it, so the entry sat stranded, unreconciled, straight through the resume, until
+    some completely unrelated LATER watch registered into that (long-since-resumed) group —
+    which then inherited the whole stale span. **Fixed** by reconciling against `paused`
+    directly (above), which cannot go stale: it is re-derived from the live pause state every
+    single tick, with or without a watch present.
+  - **B2 — a watch registered mid-pause is charged time it never lived through.** Agent panes
+    keep running while their group is paused (only prompt *delivery* is suppressed), so
+    `notify_when` still works mid-pause. Applying the group's whole elapsed span to that watch
+    charged it for the part of the pause that predates its own existence. **Fixed** by clamping
+    each watch's credit to `(elapsed span).min(now - w.registered_ms)` — the span it actually
+    lived through, never more.
+  - Both fixes are independently necessary: the scan fix alone still lets a *live* watch in a
+    stale-but-since-cleared group over-credit itself once (bounded by its own age at that
+    point); the clamp alone bounds a single tick's damage but doesn't stop a group's stale entry
+    from recurring across ticks. Regression-pinned in `tests/orchestration.rs`
+    (`notify_stale_pause_entry_is_reconciled_even_while_its_group_has_no_watches`,
+    `notify_watch_registered_mid_pause_is_credited_only_the_span_it_actually_lived_through`),
+    each mutation-verified red against its own fix removed.
 - **Agent death** (`mark_dead`, covering idle-kill, `kill_agent`, a crash, and the planner
   auto-close identically, since all four funnel through it) drops that agent's watches in
   one line, audited (`watch-cleanup`) only when something was actually removed. No delivery

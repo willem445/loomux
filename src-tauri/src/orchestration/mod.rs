@@ -5654,18 +5654,27 @@ impl OrchRegistry {
     /// use `now_ms()` directly and aren't reachable from a test's simulated
     /// clock, so the bookkeeping has to live here instead, driven by the
     /// ticks that actually observe the pause):
-    /// - A group newly observed paused (not already recorded) gets
+    /// - Every group in the CURRENT `paused` set (not "every group with a
+    ///   live watch" — that scan let a group that emptied out mid-pause drop
+    ///   off the radar entirely and strand its entry forever, rev-orch, PR
+    ///   #247, "B1") that isn't already recorded gets
     ///   `paused_watch_since[group] = now` — the earliest a paused group can
     ///   be caught is the very next tick, and `start_notify_poller` ticks
     ///   every `NOTIFY_POLL_INTERVAL` regardless of any group's pause state,
     ///   so this lags true pause-start by at most one poll interval.
-    /// - A group recorded as paused that is NOT paused any more (it resumed)
-    ///   gets every one of its watches' `deadline_ms` pushed forward by
-    ///   `now - paused_watch_since[group]` — the whole elapsed span, applied
-    ///   once — and the record is cleared, ready for a future pause/resume
-    ///   cycle. `nominal_ttl_ms` (fixed at registration) is what the expiry
-    ///   notice reports, precisely so this mutation of `deadline_ms` never
-    ///   corrupts the "expired after N min" figure shown to the agent.
+    /// - A group recorded as paused that is no longer in `paused` (it
+    ///   resumed) is reconciled: the elapsed span since it was recorded is
+    ///   computed once and the record is cleared, ready for a future
+    ///   pause/resume cycle.
+    /// - That span is a per-GROUP number, but the credit applied to each
+    ///   watch is clamped to `now - w.registered_ms` — the span THIS watch
+    ///   actually lived through — because a watch registered mid-pause
+    ///   (panes keep running while paused; only prompt delivery is
+    ///   suppressed, so `notify_when` still works) never experienced the
+    ///   part of the span that predates it (rev-orch, PR #247, "B2").
+    ///   `nominal_ttl_ms` (fixed at registration) is what the expiry notice
+    ///   reports, precisely so this mutation of `deadline_ms` never corrupts
+    ///   the "expired after N min" figure shown to the agent.
     pub fn notify_tick(&self, now: u64, results: &HashMap<String, notify::PollResult>) -> Vec<String> {
         enum Fate {
             Fire(String),
@@ -5674,14 +5683,27 @@ impl OrchRegistry {
         }
         let paused = self.paused.lock_safe().clone();
 
-        let groups: HashSet<String> = self.watches.lock_safe().values().map(|w| w.group.clone()).collect();
+        // Reconcile against the PAUSED SET ITSELF, not "groups that currently
+        // hold a watch": scanning only live watches let a group that emptied
+        // out while paused (its one worker idle-killed, cancelled, or
+        // crashed — all routine) drop out of the scan entirely, so its
+        // `paused_watch_since` entry was never reconciled and sat stranded
+        // until some later, unrelated watch appeared in that group — which
+        // then got charged the ENTIRE stale span, even though it never lived
+        // through that pause (rev-orch, PR #247, "B1"). Scanning `paused`
+        // instead means every group this tick believes is paused gets an
+        // entry, and every group that WAS recorded paused but no longer is
+        // gets reconciled, regardless of whether it currently owns any
+        // watches at all.
         let extend_by: HashMap<String, u64> = {
             let mut since = self.paused_watch_since.lock_safe();
+            for g in paused.iter() {
+                since.entry(g.clone()).or_insert(now);
+            }
+            let resumed: Vec<String> = since.keys().filter(|g| !paused.contains(*g)).cloned().collect();
             let mut extend = HashMap::new();
-            for g in groups {
-                if paused.contains(&g) {
-                    since.entry(g).or_insert(now);
-                } else if let Some(started) = since.remove(&g) {
+            for g in resumed {
+                if let Some(started) = since.remove(&g) {
                     extend.insert(g, now.saturating_sub(started));
                 }
             }
@@ -5696,7 +5718,14 @@ impl OrchRegistry {
             let mut to_remove: Vec<String> = Vec::new();
             for (id, w) in watches.iter_mut() {
                 if let Some(extra) = extend_by.get(&w.group) {
-                    w.deadline_ms = w.deadline_ms.saturating_add(*extra);
+                    // Clamp to the span THIS watch actually lived through: a
+                    // watch registered mid-pause (panes keep running while
+                    // paused — only prompt delivery is suppressed, so
+                    // `notify_when` still works) never experienced the part
+                    // of the span that elapsed before it existed, and must
+                    // not be charged for it (rev-orch, PR #247, "B2").
+                    let earned = (*extra).min(now.saturating_sub(w.registered_ms));
+                    w.deadline_ms = w.deadline_ms.saturating_add(earned);
                 }
                 // Paused: frozen solid — no poll (already true in
                 // `poll_watches`), no fire, and (via the extension above,
@@ -10224,7 +10253,7 @@ pub fn start_watchdog(reg: Arc<OrchRegistry>) {
 /// Background loop for the notification backend (#243): every
 /// `notify::NOTIFY_POLL_INTERVAL` it polls due watches (`gh pr checks` / `gh
 /// run view`, backend-owned argv only — see `gh_capture`) and delivers a
-/// `[loomux] notification …` into the registering agent's own pane the
+/// `[loomux] …` notice into the registering agent's own pane the
 /// moment its condition is met, its TTL expires, or it fails
 /// `notify::NOTIFY_FAIL_STREAK_LIMIT` polls running. Started once at app
 /// setup, beside `start_watchdog`.

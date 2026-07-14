@@ -12,7 +12,7 @@ may also type here and overrides everyone.{{BLOCK_NOTE}}
 - `list_agents()`, `get_state()` — group context (read-only).
 - `notify_when(kind, pr?, run?, note?, expires_minutes?)` / `list_notifications()` /
   `cancel_notification(id)` — register a background watch on a PR's CI or a `gh run` id and
-  get a `[loomux] notification …` in this pane when it fires, instead of polling yourself.
+  get a `[loomux] …` notice in this pane when it fires, instead of polling yourself.
 
 ## Review protocol
 
