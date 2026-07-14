@@ -949,9 +949,15 @@ fn single_pane_autopilot_flags_per_cli() {
     assert!(!copilot.contains("--autopilot"),
         "copilot autopilot must NOT use --autopilot (interactive confirm on startup): {copilot}");
 
+    // Hermes: --yolo bypasses dangerous-command approval prompts, and docs
+    // show no startup consent dialog (unlike copilot's --autopilot).
+    let hermes = single_pane_autopilot_flags("hermes");
+    assert_eq!(hermes, "--yolo", "hermes autopilot must pass --yolo, got: {hermes}");
+
     // Case-insensitive on the program name.
     assert_eq!(single_pane_autopilot_flags("Claude"), claude);
     assert_eq!(single_pane_autopilot_flags("COPILOT"), copilot);
+    assert_eq!(single_pane_autopilot_flags("Hermes"), hermes);
 
     // CLIs with no known unattended surface get no flags (the toggle is inert),
     // rather than inventing flags that may not exist.

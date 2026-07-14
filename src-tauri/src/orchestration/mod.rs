@@ -1684,6 +1684,11 @@ pub fn single_pane_autopilot_flags(program: &str) -> String {
             claude_permission_mode(true)
         ),
         "copilot" => COPILOT_UNATTENDED_FLAGS.to_string(),
+        // Hermes: "Bypass dangerous-command approval prompts", and docs show no
+        // startup consent dialog (unlike copilot's --autopilot) — safe for a
+        // single-pane launch. cli-commands.md:
+        // https://github.com/NousResearch/hermes-agent/blob/main/website/docs/reference/cli-commands.md
+        "hermes" => "--yolo".to_string(),
         _ => String::new(),
     }
 }
