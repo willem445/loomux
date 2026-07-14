@@ -58,6 +58,8 @@ import {
 } from "./dirtystate";
 import { FileEditView } from "./fileedit";
 import { FileExplorerView } from "./fileexplorer";
+import { WorkflowView } from "./workflowview";
+import { WORKFLOW_FILE } from "./workflowmodel";
 import type { PersistedPane, PersistedPaneKind } from "./tabstore";
 import type { TabPaneInfo } from "./tabcounts";
 
@@ -182,10 +184,20 @@ export interface PaneOptions {
 }
 
 /** The PTY-less CONTENT pane kinds. A pane of one of these kinds IS a surface —
- *  a file manager (#214), the file editor, or the git view (#217) — rather than a
- *  process. They share every pane mechanic (split, dock, drag, maximize, restore)
- *  and differ only in which view fills the content box. */
-export type ContentPaneKind = "files" | "editor" | "git";
+ *  a file manager (#214), the file editor, the git view (#217), or the workflow
+ *  builder (#222) — rather than a process. They share every pane mechanic (split,
+ *  dock, drag, maximize, restore) and differ only in which view fills the content box. */
+export type ContentPaneKind = "files" | "editor" | "git" | "workflow";
+
+/** What to CALL each content kind when a message has to name it ("the git view isn't
+ *  available in a workflow pane"). A table rather than a ternary chain, so a fifth kind
+ *  is a row and not a nested conditional nobody re-reads. */
+const CONTENT_KIND_LABEL: Record<ContentPaneKind, string> = {
+  files: "file explorer",
+  editor: "file editor",
+  git: "git",
+  workflow: "workflow",
+};
 
 /** What a content pane needs: which surface, the root it is pointed at, and a name.
  *  Deliberately NOT part of PaneOptions — every field there describes a PTY spawn,
@@ -198,9 +210,13 @@ export interface ContentPaneOptions {
    *  the caller before we get here — `ftRootIsDir` for files/editor, `gitRepoRoot`
    *  for git — so this never builds a pane around a root that isn't what it claims. */
   root: string;
-  /** EDITOR kind only: a root-relative file to open immediately. Set by the file
-   *  browser's "Open in file editor pane" (#217); absent from the welcome flow, which
-   *  opens the editor on its tree with nothing selected. */
+  /** EDITOR kind: a root-relative file to open immediately. Set by the file browser's
+   *  "Open in file editor pane" (#217); absent from the welcome flow, which opens the
+   *  editor on its tree with nothing selected.
+   *
+   *  WORKFLOW kind (#222): which workflow file to edit, root-relative. Defaults to
+   *  `.loomux/workflow.yml` when absent — the welcome flow's case — and is set when the
+   *  browser opens a *different* YAML as a workflow. */
   file?: string;
   /** Open without stealing keyboard focus (same contract as PaneOptions). */
   background?: boolean;
@@ -251,6 +267,9 @@ export interface PaneEvents {
    *  editor pane". The pane can't reach the grid itself (it doesn't know which tab
    *  it is in), so it asks its host, exactly as `onSplit` does for a welcome pane. */
   onOpenEditorPane: (pane: Pane, opts: { name: string; root: string; file?: string }) => void;
+  /** Open a WORKFLOW pane beside `pane` (#222) — the file browser's "Open in workflow
+   *  pane" on a YAML row. Same shape, same reason, as `onOpenEditorPane`. */
+  onOpenWorkflowPane: (pane: Pane, opts: { name: string; root: string; file: string }) => void;
 }
 
 export class Pane implements VoiceTargetPane {
@@ -373,12 +392,16 @@ export class Pane implements VoiceTargetPane {
    *  process), so the no-resize invariant holds trivially — there is no ConPTY to
    *  resize. `contentKind` non-null IS the "this is a content pane" flag; `contentRoot`
    *  doubles as the pane's cwd for the capture and for "open in editor". Exactly one
-   *  of the three views below is non-null on such a pane; all are null elsewhere. */
+   *  of the four views below is non-null on such a pane; all are null elsewhere. */
   private contentKind: ContentPaneKind | null = null;
   private contentRoot: string | null = null;
+  /** The file a content pane opened ON: the editor's open file, or the workflow pane's
+   *  workflow file (#222). Null for the kinds whose only input is a root. */
+  private contentFile: string | null = null;
   private filesView: FileExplorerView | null = null;
   private editorPaneView: FileEditView | null = null;
   private gitPaneView: GitView | null = null;
+  private workflowPaneView: WorkflowView | null = null;
   /** True once the pane's process has exited but the pane was kept open to show
    *  its output (notifyExited). The counter must not count a dead agent as live
    *  (#194 P4 LOW-7). */
@@ -877,6 +900,7 @@ export class Pane implements VoiceTargetPane {
     // A per-kind class would be a hook with nothing on the other end of it.
     this.el.classList.add("is-content");
     this.contentKind = opts.kind;
+    this.contentFile = opts.file ?? null;
     this.setContentRoot(opts.root);
     this.setName(opts.name);
 
@@ -931,6 +955,15 @@ export class Pane implements VoiceTargetPane {
             root: req.root,
             file: req.file ?? undefined,
           }),
+        // Right-click a .yml → "Open in workflow pane" (#222). Named after the FILE, like
+        // the editor pane is: a pane called "workflow.yml" says what it is showing, while
+        // one called after the repo would collide with every other pane in it.
+        onOpenWorkflowPane: (req) =>
+          this.events.onOpenWorkflowPane(this, {
+            name: pathTail(req.file) || "workflow",
+            root: req.root,
+            file: req.file,
+          }),
       });
       return this.filesView;
     }
@@ -945,6 +978,19 @@ export class Pane implements VoiceTargetPane {
         onRootChanged: adoptRoot,
       });
       return this.editorPaneView;
+    }
+
+    if (opts.kind === "workflow") {
+      // The workflow file rides in `file`, exactly as the editor's open file does, so the
+      // capture/restore path needed no new field (tabstore.ts). Absent = the default
+      // `.loomux/workflow.yml`, which is what the welcome form creates.
+      this.workflowPaneView = new WorkflowView({
+        getRoot: () => this.contentRoot,
+        getFile: () => this.contentFile ?? WORKFLOW_FILE,
+        onClose: () => {}, // never called — see the editor's note above
+        embedded: true,
+      });
+      return this.workflowPaneView;
     }
 
     this.gitPaneView = new GitView({
@@ -1001,17 +1047,29 @@ export class Pane implements VoiceTargetPane {
   /** True while a close request is waiting on the human's answer. */
   private closing = false;
 
-  /** May the human close this pane right now? True unless it holds unsaved work they
-   *  then decline to discard.
+  /** The view in this pane that owns unsaved work, if any — asked ONCE, here, so every
+   *  guard (close, tab-close, app-quit, a dead process) sees the same set of holders and
+   *  a new one cannot be wired into two of the four and forgotten in the others.
    *
-   *  BOTH editors count. An editor PANE (#217) is the obvious one — the pane IS the
-   *  buffer. But any terminal/agent pane can also be holding a dirty Alt+F OVERLAY
-   *  (#174), and closing the pane disposes it just as finally; guarding only the pane
-   *  kind would have fixed the new hole while leaving the older, likelier one open.
-   *  `FileEditView.canDiscard()` is the same gate in both cases (dirtystate.ts). */
+   *  THREE can hold a buffer: the editor PANE (#217 — the pane IS the buffer), the
+   *  WORKFLOW pane (#222 — same, over `.loomux/workflow.yml`), and the Alt+F OVERLAY
+   *  inside any terminal/agent pane (#174) — the likeliest one, because it is the one you
+   *  forget you left open. They share the contract (`dirty` / `canDiscard` / `bufferReport`)
+   *  rather than a base class: it is three methods, and the shared gate that matters is
+   *  the pure one in dirtystate.ts. */
+  private unsavedHolder(): {
+    readonly dirty: boolean;
+    canDiscard(): Promise<boolean>;
+    bufferReport(): { file: string | null; dirty: boolean } | null;
+  } | null {
+    return this.editorPaneView ?? this.workflowPaneView ?? this.fileEditView;
+  }
+
+  /** May the human close this pane right now? True unless it holds unsaved work they
+   *  then decline to discard. */
   async confirmClose(): Promise<boolean> {
-    const editor = this.editorPaneView ?? this.fileEditView;
-    return editor ? editor.canDiscard() : true;
+    const holder = this.unsavedHolder();
+    return holder ? holder.canDiscard() : true;
   }
 
   /** Does this pane hold unsaved edits RIGHT NOW — without asking the human anything?
@@ -1020,7 +1078,7 @@ export class Pane implements VoiceTargetPane {
    *  same arm-and-confirm an orchestration tab does — tabbar.ts), and a question that
    *  pops its own modal is no use to a synchronous bulk teardown. */
   hasUnsavedWork(): boolean {
-    return (this.editorPaneView ?? this.fileEditView)?.dirty ?? false;
+    return this.unsavedHolder()?.dirty ?? false;
   }
 
   /** Point this content pane at `root`, keeping `cwdRaw` in step so the chrome that
@@ -1317,8 +1375,7 @@ export class Pane implements VoiceTargetPane {
    *  terminal underneath still say so; the ones that never did are now panes. */
   private refuseOverlay(what: string): boolean {
     if (!this.isContent) return false;
-    const kind =
-      this.contentKind === "files" ? "file explorer" : this.contentKind === "editor" ? "file editor" : "git";
+    const kind = CONTENT_KIND_LABEL[this.contentKind!];
     showToast(`${what} isn't available in a ${kind} pane.`, "info");
     return true;
   }
@@ -1683,7 +1740,14 @@ export class Pane implements VoiceTargetPane {
       // opened on `src/pane.ts` (and titled after it) restores as a bare tree that
       // names a file it isn't showing. The file is re-read from disk on restore; what
       // was typed and not saved is deliberately not persisted (panerestore.ts).
-      file: kind === "editor" ? this.editorPaneView?.openPathRel ?? null : null,
+      // A workflow pane (#222) records the workflow file it is on, for the same reason
+      // and on the same terms.
+      file:
+        kind === "editor"
+          ? this.editorPaneView?.openPathRel ?? null
+          : kind === "workflow"
+            ? this.workflowPaneView?.openPathRel ?? null
+            : null,
     };
   }
 
@@ -1907,10 +1971,12 @@ export class Pane implements VoiceTargetPane {
    *  the tab and pane it lives in, so the confirm can say WHERE. Null when the pane has no
    *  editor with a file open at all. */
   bufferReport(tab: string): PaneBufferReport | null {
-    const view = this.editorPaneView ?? this.fileEditView;
-    const report = view?.bufferReport();
+    const report = this.unsavedHolder()?.bufferReport();
     if (!report) return null;
-    const host: DirtyHost = this.editorPaneView ? "pane" : "overlay";
+    // "pane" vs "overlay" is what the quit confirm needs to say WHERE the work is: a
+    // content pane is visibly what it is, while an Alt+F overlay is tucked inside a
+    // terminal that looks like any other.
+    const host: DirtyHost = this.editorPaneView || this.workflowPaneView ? "pane" : "overlay";
     return { tab, pane: this.name, host, file: report.file, dirty: report.dirty };
   }
 
@@ -1959,6 +2025,10 @@ export class Pane implements VoiceTargetPane {
     }
     if (this.editorPaneView) {
       this.editorPaneView.el.focus();
+      return;
+    }
+    if (this.workflowPaneView) {
+      this.workflowPaneView.focus();
       return;
     }
     if (this.gitPaneView) {
@@ -2383,6 +2453,7 @@ export class Pane implements VoiceTargetPane {
     this.filesView?.dispose();
     this.editorPaneView?.dispose();
     this.gitPaneView?.dispose();
+    this.workflowPaneView?.dispose();
     if (this.ptyId !== null) {
       detachOutput(this.ptyId);
       detachGitWatch(this.ptyId);

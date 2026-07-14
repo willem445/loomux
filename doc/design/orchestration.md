@@ -241,146 +241,213 @@ frames into scrollback.
 
 Orchestrator: intake → GitHub issue (`agent-managed` label) → plan → mergeability
 assessment (sprawling change ⇒ serialize; independent ⇒ parallel worktrees) → delegate →
-monitor → reviewer per PR → **findings dispositioned** → high-level completion check → hand to
-user for merge. Workers: branch → implement → meaningful unit/functional tests (test
-intent, not vacuous passes) → **red-before-green evidence** → design notes + user docs → commit →
-push → `gh pr create` → report. Reviewers: `gh pr review` with findings, each labelled
-blocking/non-blocking → report.
+monitor → reviewer per PR → **findings dispositioned** → high-level completion check → hand
+to user for merge. Workers: branch → implement → meaningful unit/functional tests (test
+intent, not vacuous passes) → **red-before-green evidence** → design notes + user docs →
+commit → push → `gh pr create` → report. Reviewers: `gh pr review` with findings, each
+labelled blocking/non-blocking → report.
 
-### Findings disposition: an approval is not a disposition (#235)
+"Dispositioned", not "addressed": an approval that leaves findings behind is not done. The
+default is to fix a non-blocking finding in the same PR before merging (bounded like the CI
+gate — three rounds and the PR settles); deferring costs a reason saying why the fix doesn't
+belong in *this* PR, a filed follow-up (which parks the finding in the label funnel, so it is
+not a discharge) and a word to the human. A finding that contradicts the change's own stated
+rationale is blocking whatever the reviewer labelled it — and a blocking finding is a `fail`
+verdict, never a `pass` that mentions it, or the gate opens on prose it cannot read. A
+*question* the orchestrator asked the human (a decision it awaits — not a status line it
+announced) holds the merge even where auto-merge, a one-time grant or supervised dangerous
+mode would otherwise allow it. The policy and the live incident that produced it are in
+`doc/design/workflows.md` → **Findings disposition**.
 
-The reviewer answers *"is this diff sound?"*. Nobody was answering *"was what it found dealt
-with?"* — and a live dogfood run found the gap. A worker shipped a `divide()` with a zero-guard.
-Both reviewers **approved** — and both, in the same breath, posted the *same* non-blocking
-finding: `b === 0` is bypassable by coercion, so `divide(5, '0')` still returns `Infinity`, which
-is precisely what the change's own rationale ("fail loud instead of propagating `Infinity`") said
-it existed to prevent. The orchestrator relayed the finding to the human as an open question and
-then merged the moment the second approval landed, before the answer came. Everything was
-procedurally green. The feature shipped weaker than the issue asked for, and two reviews' worth of
-feedback went in the bin.
-
-The failure is **policy**, so the fix is prose, in the surfaces the agents actually read:
-
-- **Pass-with-findings is not "done" — it opens a disposition step.** The default disposition of a
-  non-blocking finding is *fix it in this PR*: route it back to the worker before the merge. These
-  are usually minutes of work, and they are the signal that compounds. Deferring is the exception
-  and never silent — it costs a reason that says why the fix does not belong in *this* PR (a
-  category word like "scope" is not one), a filed follow-up issue, and a line to the human. Filing
-  that issue **parks** the finding rather than discharging it: it lands in the same label funnel as
-  everything else, which is exactly why the line to the human is part of the price. The loop is
-  bounded like the CI gate — three rounds of findings on one PR and it settles.
-- **Severity is the reviewer's rating; the requirement is the orchestrator's.** A finding that
-  contradicts the change's *own stated rationale* is blocking regardless of the label the reviewer
-  put on it, because a change that doesn't do what it claims hasn't met the issue.
-- **Label binds to verdict — and the verdict is not the `gh` flag.** A blocking *finding* means a
-  **"changes requested" verdict**, never an approval with a note: an approval with findings open is
-  only ever an approval with *non-blocking* findings open, and its summary has to say so
-  ("approved, 2 non-blocking, disposition pending"). The **binding surface is the verdict the
-  reviewer states at the top of its review body and repeats in `report(...)`** — because that is
-  the channel the orchestrator actually merges on. `gh pr review --request-changes` / `--approve`
-  is only the *mechanism*, and **GitHub refuses both on a PR opened by your own account** — the
-  normal case here, since a whole group authenticates as one GitHub user and that user authors the
-  PRs (every review this repo has ever received is `COMMENTED`). So the fallback is named —
-  `--comment`, with the verdict leading the body — and a `--request-changes` GitHub refused is
-  **never** a reason to `--approve` or to soften the verdict: the mechanism was unavailable, the
-  finding was not. A bind anchored on the flag would bind nothing while leaving the channel the
-  orchestrator reads unconstrained, which is the original incident wearing the new rule's clothes.
-- **Hold on an open question — and know what a question is.** If the orchestrator asked the human
-  to *decide* something about a PR, the merge holds until they answer, explicitly including when
-  auto-merge, a one-time grant or supervised dangerous mode would otherwise authorize it: those
-  authorize a merge you were *ready* to make; none of them is the answer. But **telling is not
-  asking** — a deferral the orchestrator decided, a status line, an audit announcement hold
-  nothing, or the policy would deadlock on its own required deferral notice. Answered means
-  *decided*, including "your call". A question never answered simply leaves the PR open — a correct
-  outcome, not a stall — held visibly on the board and re-raised on each open-PR sweep.
-
-The through-line, and the standing posture the orchestrator template states outright: **the
-orchestrator is the codebase's advocate, and merge speed is never the tiebreaker against
-maintainability.**
+**The bind is on the verdict, not on the `gh` flag** (#239, carried forward from #238's
+review of the same arc on `main`). The recorded verdict above is the *gate's* record, and it
+only exists for a group whose workflow declares one; the reviewer's *GitHub-facing* record is
+the review it posts, and there the original rule — "a blocking finding means
+`--request-changes`, not `--approve`" — is **unsatisfiable**: GitHub refuses both flags on a
+PR opened by your own account, which is the normal case when a whole group authenticates as
+one GitHub user (every review this repository has received is `COMMENTED`). A rule anchored on
+a flag nobody can use binds nothing, while the channel the orchestrator actually merges on —
+the verdict the reviewer *states* — stays unconstrained: label a finding blocking, report
+`approved`, and every sentence is satisfied. That is the #222 incident rebuilt by the rule
+written to prevent it. So the binding record is **the verdict stated at the top of the review
+body and repeated in `report(...)`**; `--comment` is the named fallback when the flag is
+refused; and a `--request-changes` GitHub refused is never a reason to `--approve`, to soften
+the verdict, or to record a `pass`. The two surfaces are complementary — the recorded verdict
+is what the *gate* reads, the stated verdict is what the *orchestrator* reads — and an ungated
+group has only the second, which is why it cannot be left to the flag. `reviewer.md` and
+`mechanics_core(Reviewer)` carry it in lockstep, for the reason every reviewer duty does: a
+`mode: replace` persona never reads `reviewer.md`.
 
 ### Engineering standards, not just process (#236)
 
-The process half of the prompt suite was strong (gates, bounded loops, externalized state,
-disposition); the *engineering* half was one line long — "does the PR satisfy the acceptance
+The prompt suite's *process* half was strong (gates, bounded loops, externalized state,
+disposition) and its *engineering* half was one line long: "does the PR satisfy the acceptance
 criteria?" A codebase can answer yes to that on fifty consecutive PRs and still rot, because
-acceptance criteria say what a change must **do** and never what it must **be**.
+acceptance criteria say what a change must **do** and never what it must **be**. #236 gives the
+orchestrator a value system to match its operational one:
 
-- **Grounds to send work back** (`orchestrator.md` → *Engineering standards*, the one authoritative
-  site; referenced from plan intake and from the completion check): cross-module coupling, a
-  duplicated mechanism, an unargued new dependency, a public-contract change with no design note, a
-  change contradicting a design note, scope drift. Naming one is *blocking* whatever the reviewer
-  labelled it — the reviewer rates the diff, the orchestrator owns the requirement **and the
-  architecture**. Gated at **plan intake** as well as at the PR, because a design flaw costs one
-  planner comment before code exists and a revert after it; `planner.md` owes the matching content
-  (boundaries, reuse-before-invention, dependencies, contract changes, alternatives considered).
-  The bounce is bounded like every other loop: one bounce naming every ground, then it is a
-  question for the human.
+- **Grounds to send work back** (`orchestrator.md` → *Engineering standards*, the one
+  authoritative site; referenced from plan intake and from the completion check). Cross-module
+  coupling, a duplicated mechanism, an unargued new dependency, a public-contract change with no
+  design note, a change that contradicts a design note, scope drift. Naming one is *blocking*
+  whatever the reviewer labelled it — the same call the orchestrator already owns for a finding
+  that contradicts the change's own rationale: the reviewer rates the diff, the orchestrator owns
+  the requirement **and the architecture**. The gate is sited at **plan intake** as well as at the
+  PR, because a design flaw costs one planner comment before code exists and a revert after it.
+  `planner.md` owes the matching content — boundaries, reuse-before-invention, dependencies,
+  public-contract changes, alternatives considered — since a plan that never named its boundaries
+  cannot be gated on them.
 - **Red before green, evidenced.** "Tests that would fail if the feature were broken" was in the
-  DoD from the start — as an assertion nobody ever checked, which is the most common quality
-  failure in autonomous coding and is invisible from the diff. The worker now runs its new tests
-  against the base branch, watches them fail *for the expected reason*, and pastes the command and
-  failure line into the PR; the orchestrator treats a `done` without that evidence as **not done**;
-  the reviewer verifies it rather than reading it (a quoted failure line is text, and text is not a
-  red test). The rule needs a **boundary** or it refuses the work it exists to enable — a change
-  with no new testable behavior (docs/comment-only, a revert, a pure rename/move the suite already
-  pins, a re-blessed golden) instead owes one line naming which class it is and why, with the suite
-  green. "There was nothing to test" is a claim like any other: stated, it is reviewable; unstated,
-  it is indistinguishable from an untested feature.
+  worker's DoD from the start — as an *assertion nobody ever checked*, which is the most common
+  quality failure in autonomous coding and is invisible from the diff. Now the worker runs its new
+  tests against the base branch, watches them fail *for the expected reason* (not on a compile
+  error), and pastes the command and failure line into the PR; the orchestrator treats a `done`
+  without that evidence as **not done**; the reviewer verifies it rather than reading it (a quoted
+  failure line is text, and text is not a red test). All four surfaces move together —
+  `worker.md`, `mechanics_core(Worker)`, `orchestrator.md`, `reviewer.md` — because any one of
+  them dropping it restores the status quo.
 - **Post-merge ownership.** Auto-merge, a one-time grant and supervised dangerous mode all let the
-  orchestrator *land* code, and the prompt then went quiet. A merge it performed makes it the owner
-  of the default branch's next CI run: on red, **stop feature merges** (the fix-forward or revert
-  PR is the exception — it is the merge that *makes* main green, and the exit from the state),
-  **fix forward once**, then **revert**, and flag the human.
-- **Re-sync the fleet.** The default branch moving is an event, whoever moved it, and every open
-  branch behind it is then **stale** — which is not the same as conflicted: a branch that still
-  merges cleanly was reviewed and CI'd against code that no longer exists. Every open PR rebases
-  onto *the branch it will merge into*, clean rebases in-house, the first real conflict to the
-  owning worker for one attempt. Because a rebase invalidates the review it carries, the re-sync is
-  scoped to the **merge frontier** (a deeper stack waits for its own base; a fan batches) — applied
-  literally to every sibling after every merge it would cost O(n²) *reviews*, not just rebases.
+  orchestrator *land* code, and the prompt then went quiet — nothing told it to watch the default
+  branch. A PR green on its own branch still breaks main (a semantic conflict with whatever landed
+  under it; a job that only runs post-merge), and a red default branch blocks every worker in the
+  group. So a merge it performed makes it the owner of main's next CI run: on red, **stop merging**,
+  **fix forward once**, then **revert** (the default — restoring main costs a revert, debugging it
+  in place costs everyone's afternoon), and flag the human.
 - **Review lanes.** The default reviewer covered correctness, tests, requirement fit, docs and
   style — and nothing on **trust boundaries**, **dependency hygiene** or **algorithmic cost**, in a
   repo where a bad dependency bricks the binary (`getrandom`/`ProcessPrng`) and a trust boundary
-  holds only because the webview is trusted (`group_id`).
-- **The learning loop, and filing without starting.** A recurring pattern (a finding class on three
-  PRs, a CI failure mode that burned two fix rounds, a convention reviewers keep re-flagging) gets
-  distilled **once** into a filed issue with a suggested label — never dispatched, because an
-  unlabelled issue the orchestrator noticed *itself* is not more startable than a finding a reviewer
-  raised. And it may **file** an issue for debt it observes, though it may never **start** or
-  **groom** one: the label funnel governs what it *begins*, not what it *notices*.
-- **Compression, and the INVARIANTS digest.** The prompt predicts its own compaction and was
-  nonetheless written as ~500 lines of prose with the load-bearing rules restated three and four
-  times. Repetition is not memory: a summary keeps a document's *shape* and loses its *rules*. The
-  eleven rules whose loss is dangerous are stated **once**, in an `## INVARIANTS` digest at the top,
-  which the orchestrator re-reads at session start and after every compaction; the body sections
-  stop re-arguing them and keep only the procedure, cross-referencing by number.
+  holds only because the webview is trusted (`group_id`). Added to `reviewer.md` **and**
+  `mechanics_core(Reviewer)` in lockstep, for the reason the findings duty is: a `mode: replace`
+  persona never reads `reviewer.md`, and a lane nobody was assigned is a lane no verdict reflects —
+  the gate cannot tell "reviewed and clean" from "never looked at".
+- **The learning loop, and filing without starting.** A pattern (a finding class on three PRs, a CI
+  failure mode that has burned two fix rounds, a convention reviewers keep re-flagging) gets
+  distilled **once** into something durable — a docs PR or a filed convention issue — because a
+  review that re-teaches the same lesson every week is how a codebase stays exactly as good as it
+  was. And the orchestrator may **file** an issue for debt it observes, with a suggested label,
+  though it may never **start** one: the label funnel governs what it *begins*, not what it
+  *notices*, and filing it is not doing it (it parks in the funnel exactly like a deferred
+  finding). Autonomy at zero consent cost.
+- **Post-merge re-sync of the fleet.** #236 asked only for *detection* — add `--json mergeable` to
+  the sweep and route a `CONFLICTING` PR to its owner. That fires at the most expensive possible
+  moment. The rule shipped instead is the one a human maintainer actually follows: **the default
+  branch moving is an event**, whoever moved it (the orchestrator's merge, the human's, one it
+  merely observed), and every open branch behind it is then **stale** — which is *not* the same as
+  conflicted. A branch that still merges cleanly was reviewed, tested and CI'd against code that no
+  longer exists, so its green checks describe the past. After any merge (and again on the sweep, as
+  the backstop for drift nobody saw), every open PR is rebased onto **the branch it will merge
+  into** — a sub-PR onto its integration branch, not reflexively onto `main`. A clean rebase the
+  orchestrator does itself (mechanical, no delegate slot); the first real conflict routes to the
+  **owning** worker's resumed session, **one attempt**, then the human — the CI gate's bound, for
+  the CI gate's reason. The rebase is a push, so CI re-runs and every verdict goes stale: that cost
+  is the argument for paying it early and in the quiet rather than on the PR you were about to
+  land. Paced against the delegate cap, never bursty.
 
-### Pinning prose (`tests/prompts.rs`)
+- **Compression, and the INVARIANTS digest.** The prompt predicts its own compaction ("your
+  context may have compacted"; "compact at lulls") and was nonetheless written as ~500 lines of
+  prose optimized for one careful read, with the load-bearing rules restated three and four times.
+  Repetition is not memory: a summary keeps a document's *shape* and loses its *rules*. So the
+  eleven rules whose loss is dangerous — the merge gate, the question-hold, disposition, the
+  architectural bar, red-before-green, red main, fleet staleness, the label funnel, bounded loops,
+  one-task-per-worker, externalized memory — are stated **once**, in an `## INVARIANTS` digest at
+  the very top, which the orchestrator is told to re-read at session start and after every
+  compaction. Every body section then *stops restating them* and holds only the procedure and the
+  why, cross-referencing the digest by number. That is what pays for the additions above: the
+  orchestrator template grew seven new rules and still ends up denser than it was
+  (≈513 → 625 lines for ~2× the rules), because the rhetoric that carried the old ones is gone.
 
-Prose is production code here: every sentence is executed literally by an agent, and a rule that
-quietly disappears in an edit fails **silently** — the agent simply stops doing it. So every
-load-bearing rule is pinned to the text that carries it, and a deletion is a failing test that
-*names the rule it deleted*.
+- **The rules that bound the rules** (rev-21's review of the above). Four of the new rules were
+  executable-by-a-literal-agent failures, and they are the same species as #235's:
+  - **Red-before-green needs an exemption, or it refuses the work it exists to enable.** Stated
+    unconditionally, it bounces every PR that legitimately adds no test — including the two this
+    very design prescribes: the learning loop's **docs PR** and a red main's **revert**. So the
+    exempt class is enumerated once, in `worker.md` (four members: docs/comment-only, a revert, a
+    pure rename/move the suite already pins, a re-blessed golden), and it **costs one line**: the
+    PR names which class it is and why, with the suite green. "There was nothing to test" is a
+    claim like any other — stated, it is reviewable; unstated, it is indistinguishable from an
+    untested feature, which is what the rule was written to stop.
+  - **"Stop merging until main is green" forbade the merge that makes main green.** The freeze is
+    on *feature* merges; the fix-forward or revert PR is the exception, because it is the exit
+    from the state. Without that clause a literal orchestrator halts and waits for a human — in
+    auto-merge, the unattended mode the rule was written for.
+  - **The learning loop may not dispatch its own artefact.** "A docs PR — dispatch it as a normal
+    work item" was an opt-out from the label funnel sitting three sections below the label funnel,
+    and it inverted the policy: a finding a *reviewer* raised has to park in the funnel, while a
+    pattern the orchestrator noticed *by itself* could be started directly. It files the lesson
+    with a suggested label and stops, like everything else.
+  - **The architectural bounce is bounded** like every other loop: one bounce, naming every ground
+    it has; a second disagreement is a question for the human, not a second bounce.
+  - And the re-sync has a **topology license**: rebase the *merge frontier* (the PRs targeting the
+    branch that actually moved), let a deeper stack wait for its own base, batch on deep stacks.
+    Because a rebase re-stales every verdict, re-syncing an n-deep stack after every sub-PR merge
+    costs O(n²) *re-reviews*, not just rebases — and a PR held on an unanswered question is left
+    alone entirely: it isn't going anywhere, and re-staling it buys a review nobody can act on.
 
-Prose pins have three failure modes, and only the first is obvious. Each was found by mutating the
-templates, never by reading the tests:
+Each rule is pinned in `tests/workflow.rs` on the surfaces that carry it, and the golden fixtures
+in `tests/fixtures/pre222/` are re-blessed in their own commit — the diff on that directory is the
+review surface for "what did we just tell every default group to do differently?". The pins match
+**substance with whitespace collapsed** (`flat()`), deliberately: a pin that fires when a
+paragraph is re-wrapped is a pin that teaches people to re-bless without reading.
 
-1. **The anchor no longer exists** — an assertion on a phrase the document no longer contains
-   (`count() <= 1` against zero occurrences) is green forever, in both directions.
-2. **The anchor exists twice and the rule lives in only one of them** — every rule appears in the
-   digest *and* in the body by design (the rule, and its procedure), so a document-wide match is
-   satisfied by either: delete the body's procedure and the pin stays green, rescued by the digest,
-   and the rule survives as a slogan with no instructions attached. Hence `section()` scoping.
-3. **The anchor's words appear in unrelated prose inside that same region** — a bare `"revert"` is
-   rescued by the surrounding sentence, leaving the whole red-main remedy deletable behind an
-   unbounded fix-forward loop; `"groom"` by "the issue is *groomed* and ready to build".
+`tests/prompts.rs` (from #238, which front-ran this arc's policy half onto `main`) pins the same
+rules on the **default rendering** — the templates as an ungated group reads them, with no
+workflow file and no placeholders substituted in. The two suites are complementary and both are
+kept green: `workflow.rs` pins the duties across *both* surfaces a reviewer can reach
+(`reviewer.md` and `mechanics_core`) and pins the machinery vocabulary; `prompts.rs` pins the
+region-scoped prose of what every group gets by default. A rule that lives in only one of them is
+a rule one kind of group is not being told.
 
-Two rules close them: the mutation harness **deletes the rule, not the string** (the markdown unit
-carrying the anchor, inside the pin's region), and `pinned()` requires every anchor to occur
-**exactly once** in the region it is asserted in — which makes failure mode 3 a red test at the
-moment an anchor is written, rather than a defect found later. Matching is whitespace-collapsed, so
-re-wrapping a paragraph never fires a pin: that red would report "you changed the rule" when no rule
-moved, and it is what teaches people to bless a diff without reading it.
+**A pin is a claim until it has been watched failing** — the suite's own rule, applied to itself
+(rev-21 F1). The first cut of the compression pin asserted that the body did not restate what the
+digest owned, anchored on a phrase *the compression had deleted*: it read `0 <= 1` and could not
+fail in either direction. Worse, nothing pinned the orchestrator's #235 policy at all — deleting
+it turned exactly one test red, the **byte fixture**, whose message says "re-bless me", which is
+the red this very design calls the one that teaches people to re-bless without reading. So:
+`the_orchestrators_findings_policy_survives_in_substance_not_just_in_bytes` asserts each rule of
+the policy **inside the section that owes it** (a document-wide match lets the digest's one-line
+copy rescue a body section someone gutted), one assert per rule, so a deletion *names what it
+deleted*. Single-word anchors (`"full"`, `"stale"`) are banned: whitespace-collapsed matching on a
+generic word is close to a tautology.
+
+**Prose pins have three failure modes, and only the first is obvious.** Each was found by mutating
+the templates, never by reading the tests — the progression is the reusable part:
+
+1. **The anchor no longer exists.** `body.matches("an approval with findings") <= 1` against a
+   document that no longer contains the phrase: `0 <= 1`, green forever, in both directions.
+2. **The anchor exists twice and the rule lives in only one of them.** Every load-bearing rule now
+   appears in the digest *and* in the body by design — the rule, and its procedure. A
+   document-wide `contains` is satisfied by either, so deleting the body's procedure leaves the
+   pin green, rescued by the digest: the rule survives as a slogan with no instructions attached.
+   Fixed by scoping every assert to the region that owes it (`section()`), which is why the pins
+   read `disposition.contains(…)` and `aftermath.contains(…)` rather than `orch.contains(…)`.
+3. **The anchor's words appear in unrelated prose inside that same region.** `"groom"` was rescued
+   by the `agent-ready` bullet three paragraphs above the prohibition ("the issue is *groomed* and
+   ready to build"); `"one line"` in `worker.md` by the report guidance ("one line restating the
+   task") — which meant the red-before-green exemption's **price**, the stated reviewable claim
+   that is the entire safety of the exemption, could be deleted in silence; `"question for the
+   human"` by the Engineering-standards section's own ambiguous-case sentence. The fix is to
+   anchor the rule's **own clause**: `"groom an issue the human hasn't"`, `"naming which of"`,
+   `"no longer a bounce"`.
+
+Two rules follow, and together they make the dead pin a *test failure* rather than a discovery:
+
+- **The mutation harness deletes the rule, not the string.** Deleting every occurrence of a phrase
+  measures whether the pin can see the *phrase* vanish, which is not the question anyone is
+  asking. The harness deletes the markdown unit — the list item or paragraph — that carries the
+  rule, inside the region the pin scopes to, and requires the owning test to go red: **60/60
+  rules**, one at a time. That is what surfaced failure mode 3, and (on its own first case list) a
+  fourth instance of mode 2: `"fix forward once"`, rescued by INVARIANT 6's one-line copy while
+  the red-main *procedure* was gone.
+- **An anchor must occur exactly once in the region it is asserted in** — enforced by `pinned()`,
+  which every #236 anchor goes through. This is failure mode 3 made *mechanically impossible to
+  reintroduce*: an anchor that appears twice in its own region cannot fail when the rule it names
+  is deleted, because the other occurrence rescues it, so it is a **red test right there** instead
+  of a defect someone finds later by mutating prose. It pays immediately — it rejected `O(n²)` in
+  the re-sync section (the depth clause and the fan clause both name the cost, so either would
+  have rescued the other) and forced the depth rule onto its own clause.
+
+A pin you cannot make fail is worse than no pin: it is a claim of coverage. The uniqueness rule is
+what keeps that claim honest without anyone having to remember to re-run the harness.
 
 ## Validation-round additions (2026-07-03)
 
@@ -788,6 +855,30 @@ one-time **grant** the shim also honors.
   (regression-tested: no agent-visible tool name contains "grant", and the file-writing MCP
   tools `set_state`/`upsert_task`/`save_attachment` write only their own fixed paths, never a
   grant path). Agents *consume* grants (the shim) but never *mint* them through loomux.
+
+### The workflow merge gate composes on top (#222 / #197)
+
+Everything above is the **human** gate. A repo that declares `gates.merge` in its
+`.loomux/workflow.yml` adds a **second, independent** necessary condition to the same shim:
+`gh pr merge` is refused until every reviewer block the gate names has recorded a `pass` via the
+`review_verdict` MCP tool (`threshold: N` needs N of them; a `fail`/`escalate` from any of them
+refuses outright). It is evaluated **before** every opening above — a grant, `autonomous +
+auto_merge` and supervised dangerous mode all sit below it and none of them can satisfy it, which
+is what makes #197 Scope B ("an auto-merge must be structurally impossible until every required
+review verdict is recorded PASS") true rather than aspirational (executed in the shell harness,
+not merely asserted about the source order). A verdict is bound to the PR's **head commit**, so a
+pass does not survive a re-push — otherwise the gate reads green over commits nobody reviewed.
+Unlike the human gate it applies to non-default merges too, and a refused merge does not consume a
+pending grant. Verdicts live in `verdicts/pr-<N>/<block>` and the declared gate in `merge_gate`,
+both under the group dir, both in the same small-file shape the shim already reads.
+
+Two notes that belong next to *Honest bypass surface* above. (1) A **merge with no
+`LOOMUX_GROUP_DIR` is now refused outright** — an agent pane always has it, so an unset variable
+at the shim is evasion; previously it slipped a non-default merge past the workflow gate with
+nothing in the audit. (2) The verdict store is forgeable by an agent with a shell exactly as grant
+files are, and — unlike the human gate — **a machine account does not close it**: the forge cannot
+tell a fabricated verdict file from a real one. Full design + the honest limits:
+`doc/design/workflows.md`.
 
 ### Release & tag gating
 

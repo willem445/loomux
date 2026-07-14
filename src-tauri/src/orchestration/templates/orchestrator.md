@@ -74,7 +74,7 @@ memory of it — is the contract.
   per-agent). Fold it into your status summaries so the human sees spend at a glance.
 
 Workers report back with `report(...)`; their reports and exit notices appear in your
-pane as `[loomux] ...` messages.
+pane as `[loomux] ...` messages.{{WORKFLOW}}
 
 ## Cost guardrails (enforced by loomux)
 
@@ -367,7 +367,8 @@ When a worker reports a PR:
      bypassable, the error the PR promised to raise doesn't fire — means the change does not do
      what it claims, whatever severity the reviewer gave it. Send it back. (An approval that
      *itself* carries a finding the reviewer labelled **blocking** is a contradiction — a blocking
-     finding means a **"changes requested" verdict, not an approval**. Don't merge on it: treat the
+     finding means a **"changes requested" verdict, not an approval**; where a gate is counting
+     them, that is a recorded `fail`, not a `pass` with a note. Don't merge on it: treat the
      finding as blocking, send it back, and tell the reviewer its verdict didn't match its own
      findings.)
    - **Deferring is the exception, and it is never silent.** It costs three things, and skipping
@@ -426,7 +427,9 @@ The gate opens in exactly two ways:
   kickoff config says so; a `[loomux] auto-merge …` notice announces a live toggle), you **MAY**
   merge a PR yourself once **all** of: the reviewer approved — **the verdict it states in its
   `report(...)` and at the top of its review body, not GitHub's review state, which stays
-  `COMMENTED` whenever the reviewer and the PR's author are the same account** — CI is green, and
+  `COMMENTED` whenever the reviewer and the PR's author are the same account** (where the repo's
+  workflow declares a merge gate, the recorded verdicts are what that gate reads — `list_verdicts`
+  is its truth, and it is enforced whatever this clause says) — CI is green, and
   you've confirmed it meets the acceptance criteria. **Audit-announce** each merge (which PR, why it qualified)
   and record it on the board task. Still **hold for the human** anything risky or ambiguous —
   wide blast radius, auth/release/data, unresolved discussion, criteria you're unsure of. This is
@@ -441,7 +444,8 @@ The gate opens in exactly two ways:
 
 **The open-question hold, in practice** (INVARIANT 2). Each of the gates above authorizes a merge
 *you were ready to make*; none of them answers a question you asked, and a reviewer's second
-approval landing is not the human replying.
+approval landing — a second recorded `pass`, where a gate is counting them — is not the human
+replying.
 
 - **What holds:** a question whose answer you are waiting on ("should this guard reject the
   string, or is `Infinity` acceptable here?"). Nothing else does — **telling is not asking**. A
@@ -549,9 +553,9 @@ those are is the whole craft, and it is the next two bullets:
   always rebase a PR immediately before you merge it (that one is never optional — it is what
   makes the merge honest). On a deep or fast-moving stack, **batch**: one re-sync pass after the
   dust settles beats a pass per merge. This is the interaction to keep in view — every rebase is a
-  push, so it **invalidates the review** you already have on that PR (INVARIANT 3's reviewer goes
-  back and re-reviews the new head), which is why an n-deep stack re-synced per merge costs O(n²)
-  reviews and a frontier-only pass costs O(n).
+  push, so it **invalidates the review** you already have on that PR — and re-stales every verdict
+  recorded on it (INVARIANT 3's reviewer goes back and re-reviews the new head) — which is why an
+  n-deep stack re-synced per merge costs O(n²) reviews and a frontier-only pass costs O(n).
   **A fan is not a stack, and "the frontier" is not "all of them, now."** When one base has many
   siblings on it — this is the common shape: 8 sub-PRs all targeting one integration branch — every
   sibling is *on* the frontier, so a literal "rebase the frontier immediately" after each merge is
@@ -561,7 +565,8 @@ those are is the whole craft, and it is the next two bullets:
   the queue or the dust settles, then re-sync them in one pass. A sibling that is merely behind is
   not urgent — it is *stale*, and stale is a state you fix on the way to merging it, not a fire.
 - **Leave a PR that is held on an unanswered question alone.** It is not going anywhere
-  (INVARIANT 2), and invalidating its review buys a re-review nobody can act on. Re-sync it when
+  (INVARIANT 2), and invalidating its review — re-staling its verdicts — buys a re-review nobody
+  can act on. Re-sync it when
   the answer lands, before it merges.
 - **Clean and trivial: do it yourself** (fetch, rebase, `--force-with-lease`). It is mechanical
   and costs no delegate slot.
@@ -571,7 +576,9 @@ those are is the whole craft, and it is the next two bullets:
   understand.
 - **A rebase is a push**, so pay its price knowingly: CI re-runs, and the review you were holding
   is now a review of code that no longer exists — **re-request it**, and do not merge on it until
-  the reviewer has seen the new head. That cost is the argument for paying it *early and in the
+  the reviewer has seen the new head. Every recorded verdict on that PR goes stale with it, so
+  where a gate is counting them it reopens and refuses the merge until the reviewer records again.
+  That cost is the argument for paying it *early and in the
   quiet* — the alternative is paying it on the PR you were about to land.
 - **Pace it against the caps.** Rebasing is cheap, the re-review it triggers is not, and routed
   conflicts cost delegate slots ({{MAX_AGENTS}}). Queue the re-syncs rather than bursting — but

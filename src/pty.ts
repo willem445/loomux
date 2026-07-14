@@ -8,6 +8,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { getVersion } from "@tauri-apps/api/app";
 import type { ShellKind } from "./panesetup";
 
 export interface SpawnOptions {
@@ -116,6 +117,24 @@ export const saveUiTabs = (contents: string): Promise<void> =>
   invoke("save_ui_tabs", { contents });
 
 // ---------- window lifecycle (#219) ----------
+
+/** This build's version, as declared in `tauri.conf.json` / `package.json`.
+ *
+ *  Here rather than imported where it is used, for the reason the rest of this module
+ *  exists (CLAUDE.md constraint 5): the app's modules talk to ONE Tauri seam. The workflow
+ *  pane (#222) stamps it into a workflow file it CREATES (`authored_with:`), so a file that
+ *  later misbehaves can say which build wrote it.
+ *
+ *  Never throws: a version we couldn't read is not worth failing a feature over, and the
+ *  callers all treat "" as "don't write the key", which is the honest outcome — an absent
+ *  key beats an `authored_with: unknown`. */
+export async function appVersion(): Promise<string> {
+  try {
+    return await getVersion();
+  } catch {
+    return "";
+  }
+}
 
 /** Gate the app's own close (title-bar ✕, Alt+F4, the OS asking it to quit).
  *

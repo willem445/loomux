@@ -39,8 +39,9 @@ no global mode:
 | **File explorer** | A native-style **file manager** rooted at a folder you pick — no terminal underneath, no process, ever. |
 | **File editor** | The file tree + code editor above, as a **pane** rather than an overlay, rooted at a folder you pick. |
 | **Git** | The git view — graph, status, diffs, staging, worktree switching — as a **pane**, over a repo you pick. |
+| **Workflow** | The repo's agent workflow — which blocks a run may use, the path between them, the gate that must pass before a merge — as an editable **pane** over `.loomux/workflow.yml`. |
 
-The last three are **content panes**: a pane that *is* a surface rather than a
+The last four are **content panes**: a pane that *is* a surface rather than a
 process. They spawn nothing, split/dock/drag/maximize like any other pane, come
 back at the same root on session restore, and — because they are viewers, not
 agents — never count toward a tab's agent badge.
@@ -77,6 +78,183 @@ counts toward a tab's agent badge. See the [design note](doc/design/files-pane.m
 This is deliberately **not** the in-app editor: that is the `Alt+F` overlay above,
 unchanged, and it remains the right tool for a quick look or a one-line fix. The
 explorer is the one for "get this file into the app that owns it".
+
+### The advanced orchestrator
+
+By default an orchestration group runs loomux's four built-in roles — orchestrator,
+worker, reviewer, planner — with the CLI and model you pick per role in the launcher.
+That is the whole experience, and it is unchanged.
+
+Tick **Advanced orchestrator** in the launcher and the group runs the roster the *repo*
+declares, in `.loomux/workflow.yml`: as many blocks as you like, each with its own
+**kind** (worker / reviewer / planner — the capability class), **agent CLI**, **model**
+and **persona**. The obvious thing this buys you is **several focused reviewers** —
+security, tests, performance — each with its own prompt and its own model, all run on
+every PR, instead of one generalist reviewer told to look at everything.
+
+```yaml
+# .loomux/workflow.yml — committed, so everyone who clones the repo gets it
+version: 1
+name: focused-review
+
+blocks:
+  - id: worker
+    kind: worker
+    cli: claude
+    model: sonnet
+
+  - id: rev-security
+    name: Security review
+    kind: reviewer
+    model: opus
+    prompt: |
+      Review ONLY for security defects: injection, authz, secrets, path traversal.
+      Ignore style and perf — other reviewers cover those.
+
+  - id: rev-tests
+    name: Test-quality review
+    kind: reviewer
+    model: sonnet
+    prompt: Review ONLY test quality. Flag tests that cannot fail.
+
+edges:                       # advisory — the happy path, not a schedule
+  - { from: worker, to: [rev-security, rev-tests] }
+
+gates:                       # enforced — loomux holds the merge until it passes
+  merge:
+    require: all-pass
+    reviewers: [rev-security, rev-tests]
+```
+
+**The toggle is off by default, and that is deliberate.** A workflow file arrives with a
+`git clone`, and it can hand an agent repo-authored instructions — so it takes effect only
+when *you* turn it on, for that launch. Before you do, the launcher shows you the roster it
+resolves to: every block, its kind, CLI and model, and which blocks carry a repo-authored
+persona. If the file is broken you get **every** validation finding right there, and the
+group still launches — on the standard roster, never blocked by a file in the repo. **Edit
+workflow…** opens the file in a [workflow pane](#the-workflow-pane) so you can fix it first.
+
+What a workflow file can *never* do is grant a capability. `kind` is a closed set of four
+classes, and there is no spelling — no `read_only: false`, no fifth class — that makes a
+block anything it couldn't already be. You can have five reviewers with five prompts and
+five models; all five are still reviewers. See the
+[design note](doc/design/workflows.md).
+
+With the toggle on, the orchestrator is told the roster and the gates, and nothing else:
+it spawns delegates **by block id**, runs **every** declared reviewer on each PR, and treats
+a declared gate as a hard precondition on merging. What it keeps is its **scheduling
+judgment** — what to serialize, what to parallelize across worktrees, when to plan first.
+The edges declare the happy path; the orchestrator still routes.
+
+**loomux runs its own.** [`.loomux/workflow.yml`](.loomux/workflow.yml) in this repo is the
+living example: two worker tiers (`worker-deep` on opus for work with judgment in it,
+`worker-quick` on haiku for tightly-scoped edits the brief has already decided) and three
+focused reviewers — [`rev-orch`](.github/agents/rev-orch.md) for the Rust backend,
+[`rev-ui`](.github/agents/rev-ui.md) for the vanilla-TS frontend,
+[`rev-tests`](.github/agents/rev-tests.md) for whether the tests can actually fail — behind a
+merge gate. The personas live in [`.github/agents/`](.github/agents), which is Copilot's own
+custom-agent convention: a `cli: copilot` block loads one natively (`copilot --agent rev-ui`)
+and a `cli: claude` block gets the same text compiled into `claude --agents`. Copy the pair of
+files into your repo and edit the lanes.
+
+### The workflow pane
+
+A **workflow** pane opens on a repo's `.loomux/workflow.yml` — the file that declares
+**which agent blocks** an orchestration run may use (a planner, a worker, three focused
+reviewers…), each with its own **prompt, model and agent CLI**; the **edges** between
+them; and the **merge gate** that must pass before anything is merged. The file is
+committed, so a workflow is shared with everyone who clones the repo — and it takes
+effect on a group only when that group was launched with the **advanced orchestrator**
+ticked (above).
+
+**The file is the source of truth.** The pane is three synced views over it, and you can
+edit the workflow from any of them:
+
+- a **block roster + property form** — pick a block, set its kind, CLI, model and
+  persona; every edit rewrites the YAML immediately;
+- the **raw YAML**, editable as text (typing here updates the other two);
+- an **editable graph** — drag a node to move it, drag from its **●** to another node to
+  draw an edge, click an edge and **✕** (or `Delete`) to erase it, **+ Block** to add one.
+
+The graph is a second way to *edit the file*, never a second source of truth: every gesture
+goes through the same model and the same canonical formatter as a form edit, so the canvas
+cannot express anything the YAML can't. Two things it will not do, both on purpose. It
+**never invents an id** — creating a block asks you for one, because an id is immutable and
+is what edges and gates reference (the tools that auto-generate `node_1720794829558` produce
+files nobody can read). And it **never writes a position into your workflow**: where the
+boxes sit lives in `.loomux/workflow.layout.json`, which you can gitignore, so nudging a box
+is not a change to the logic and does not show up in a teammate's diff.
+
+Two things in that graph mean genuinely different things, so they are drawn differently.
+An **edge is advisory**: it declares the intended path, and the orchestrator still decides
+when to spawn what — its judgment about what can run in parallel is the thing that makes
+it good, and a static DAG would replace it with something dumber. A **gate is enforced**:
+loomux refuses `gh pr merge` until every reviewer the gate names has recorded a PASS, and
+an agent cannot get around it (it goes through the same `gh` PATH shim that has always
+required a human grant to merge). That is what makes a second reviewer more than a
+suggestion.
+
+A PASS is permission to merge, not a verdict that the review is *finished*: reviewers may
+approve and still leave non-blocking findings behind. The orchestrator's instructions make
+that a **disposition** step — the default is to send those findings back to the worker and
+fix them in the same PR, deferring only with a stated reason and a filed follow-up issue;
+a finding that contradicts the change's own stated rationale is treated as blocking however
+the reviewer labelled it; and a **question** the orchestrator has put to you — a decision it
+is waiting on, not a status line it is telling you — holds the merge until you answer, even
+when auto-merge or dangerous mode would otherwise allow it. Don't want to answer? Ignoring it
+leaves the PR open and re-raised on each sweep, which is the point: review feedback should
+improve the change, not get dropped the moment the gate turns green
+([design note](doc/design/workflows.md)).
+
+**The orchestrator holds the work to an engineering bar, not just to the acceptance criteria.**
+A change can satisfy every criterion an issue lists and still be one you'd reject — it couples
+two modules that shouldn't know about each other, it re-implements something the repo already
+has, it adds a dependency nobody argued for, it changes a public contract with no design note.
+Those are stated grounds for the orchestrator to send a **plan** back before any code exists, or
+to bounce a **PR** however green it is. Alongside them: every PR must show its new tests *failing*
+on the base branch (a test nobody has watched fail is not a safety net), the reviewer checks the
+security, dependency and cost lanes rather than just correctness and style, a merge the
+orchestrator performed makes it responsible for the default branch's next CI run (red main stops
+the queue and gets reverted, not debugged in place), and a lesson that keeps recurring becomes a
+docs PR or a filed convention issue instead of the same review round every week.
+
+**And it keeps the fleet fresh.** Whenever the default branch moves — its merge, yours, or one it
+just watched land — it rebases the remaining open branches onto the branch each will merge into.
+Not only the conflicted ones: a branch that *still merges cleanly* was reviewed and CI'd against
+code that no longer exists, so its green checks describe the past. Trivial rebases it does itself;
+the first real conflict goes back to the worker that wrote the code, one attempt, then you
+([design note](doc/design/orchestration.md)).
+
+Before anything spawns, the pane runs a **validation pass** over the whole file: an
+unknown block kind, an agent CLI loomux can't launch, an edge to a block that doesn't
+exist, a gate demanding a verdict from a reviewer that was deleted, a threshold no number
+of reviewers could reach, a block nothing ever reaches. Each finding says where, and
+clicking it takes you to the block or the line. A block it can't understand still opens —
+as a stub, with the finding attached — because a block you cannot see is a block you
+cannot repair.
+
+A repo with no workflow file yet is the normal starting point — it is where every repo
+begins — so the pane opens on a **Start a workflow** strip rather than a page of nothing:
+one line of what a workflow is, the roster it is about to write, and a **Create workflow**
+button that scaffolds a real, commented, valid `.loomux/workflow.yml` (today's plan → work
+→ review pipeline, gate included) and drops you into the canvas on it.
+
+Editing through the **form or the canvas** rewrites the file from the workflow model, in
+canonical form — which keeps diffs small and the file legible, but **does not preserve
+comments**. So the first save that would do that asks first, naming what it costs ("the comments
+on 60 lines will be dropped"), with Cancel as the default; a file loomux itself wrote is already
+canonical and saves silently. The **YAML tab always saves exactly what you typed**, comments and
+all.
+
+The file is saved through the same hash-guarded path the editor uses, so an agent rewriting
+it under you is a **conflict** you get to resolve, not a silent overwrite — and unsaved
+edits are guarded on close, tab-close and quit exactly like an editor buffer's. A workflow
+file that is *there* but cannot be read (it isn't UTF-8 — a file written from PowerShell
+with `>` is UTF-16) says exactly that, and offers no button that would overwrite it.
+
+Open one from the welcome screen (**Workflow**, pointed at a repo), or right-click any
+`.yml` / `.yaml` in a **file explorer** pane → **Open in workflow pane**. See the
+[design note](doc/design/content-panes.md).
 
 The **Go to file** box matches file *names*, never contents. The backend
 enumerates the root's paths once, off-thread; every keystroke then filters that
@@ -169,6 +347,8 @@ src-tauri/src/
   pty.rs            PTY lifecycle (spawn/write/resize/kill) + output streaming; per-kind Terminal shells (PowerShell/cmd/Git Bash, #194) + Git Bash discovery
   sessions.rs       agent session discovery (one scan_* fn per agent source)
   orchestration/    agent groups: registry, guardrails, MCP server, audit
+    workflow.rs     the block model (#222): a repo's agent roster as data — `<repo>/.loomux/workflow.yml` parse + validation. A block's id is the agent's identity; `kind` is its CAPABILITY CLASS, and stays a closed 4-variant enum, so a repo file can declare five reviewers with five prompts but can never grant one write access. Also the ENFORCED merge gate (#222/#197): reviewer-attributed verdicts (pass | fail | escalate) as durable state, and the pure gate decision the `gh` shim mirrors — `gh pr merge` is refused until every reviewer the gate names has recorded a pass, and no human grant or autonomous marker can open it. See doc/design/workflows.md
+    profiles.rs     repo-authored personas from `.github/agents/*.md` (#51, harvested from PR #105): append/replace modes with a non-overridable loomux mechanics core. Compiled to each CLI's native custom-agent flag — `claude --agents` (inline) / `copilot --agent` (a user-authored file only)
   obs.rs            crash observability: panic hook, breadcrumb log, unclean-exit notice
   voice.rs          voice prompts (#58): mic capture (cpal) -> local whisper.cpp subprocess
   uistate.rs        durable UI state (project tabs #63): atomic tabs.json store

@@ -16,8 +16,11 @@
 //   Git          — a PTY-less pane hosting the git view over a repo (#217): graph,
 //                  status, diffs, staging, #208 worktree switching. The Alt+G
 //                  overlay, as a pane.
+//   Workflow     — a PTY-less pane over the repo's `.loomux/workflow.yml` (#222): the
+//                  agent blocks a run may use, the advisory path between them, and the
+//                  enforced merge gate. Rooted at the repo; the file need not exist yet.
 //
-// The three CONTENT kinds take exactly one input — the folder / repo — and it is
+// The CONTENT kinds take exactly one input — the folder / repo — and it is
 // validated for REAL before the pane is made (does the directory exist? is it a git
 // work tree?), so a typo'd path shows an inline error instead of a broken pane.
 //
@@ -30,7 +33,16 @@
 import { open } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
 import { gitWorktreeAdd, gitRepoRoot } from "./git";
-import type { OrchestratorConfig } from "./orchestration";
+import type { OrchestratorConfig, WorkflowPreview } from "./orchestration";
+import { workflowPreview } from "./orchestration";
+import {
+  ORCH_ROLES,
+  describeBlock,
+  resolveRoster,
+  type OrchRole,
+  type ResolvedRoster,
+  type RolePick,
+} from "./roster";
 import type { PaneKind, PaneSetupInput, ShellKind, ShellKindAvailability } from "./panesetup";
 import {
   planPaneSetup,
@@ -79,17 +91,11 @@ export type WelcomeResult =
   | { kind: "editor"; name: string; root: string }
   /** A git pane (#217): `root` is a directory this form has already confirmed is
    *  inside a git work tree (`gitRepoRoot`), so the pane can't open on a non-repo. */
-  | { kind: "git"; name: string; root: string };
-
-/** Orchestration roles the setup form configures a CLI + model for. Mirrors the
- *  backend `Role` variants that can be spawned in a group (issue #4/#47). */
-type OrchRole = "orchestrator" | "worker" | "reviewer" | "planner";
-const ORCH_ROLES: { key: OrchRole; label: string }[] = [
-  { key: "orchestrator", label: "Orchestrator" },
-  { key: "worker", label: "Worker" },
-  { key: "reviewer", label: "Reviewer" },
-  { key: "planner", label: "Planner" },
-];
+  | { kind: "git"; name: string; root: string }
+  /** A workflow pane (#222): `root` is the repo whose `.loomux/workflow.yml` the pane
+   *  edits — a confirmed directory, like files/editor. The workflow FILE is not probed:
+   *  a repo without one is the normal starting point, and the pane offers to create it. */
+  | { kind: "workflow"; name: string; root: string };
 
 interface OrchCli {
   id: string;
@@ -274,6 +280,21 @@ export class WelcomeForm {
     cli: HTMLSelectElement;
     model: ModelPicker;
   }[];
+  // Advanced orchestrator (#222): run the repo's `.loomux/workflow.yml` instead
+  // of the four fixed roles. OFF by default — a workflow file arrives with a
+  // `git clone`, so it takes effect only when the human opts in, having been
+  // shown (in `rosterEl`) the blocks and repo-authored personas they'd be
+  // enabling.
+  private advancedField: HTMLElement;
+  private advancedInput: HTMLInputElement;
+  private rosterEl: HTMLElement;
+  private editWorkflowBtn: HTMLButtonElement;
+  /** One backend preview per (repo, group CLI), memoized for the form's life. */
+  private previews = new Map<string, Promise<WorkflowPreview | null>>();
+  /** Monotonic token: a preview that resolves after the human has moved on
+   *  (retyped the path, flipped the toggle) must not paint over the current one. */
+  private rosterSeq = 0;
+  private rosterTimer: number | null = null;
   private permsSel: HTMLSelectElement;
   private agentWarn: HTMLElement;
   /** One probe per program per app run; backend caches too. */
@@ -316,6 +337,7 @@ export class WelcomeForm {
       ["files", "File explorer — browse files, open in their default app"],
       ["editor", "File editor — tree + code editor, rooted at a folder"],
       ["git", "Git — graph, status, diffs and worktrees for a repo"],
+      ["workflow", "Workflow — agent blocks, edges and merge gates for a repo"],
     ]);
     this.kindSel.addEventListener("change", () => this.applyKind());
 
@@ -374,7 +396,11 @@ export class WelcomeForm {
     this.repoList = document.createElement("datalist");
     this.repoList.id = "welcome-recent-repos";
     this.repoInput.setAttribute("list", this.repoList.id);
-    this.repoInput.addEventListener("input", () => this.updateName());
+    this.repoInput.addEventListener("input", () => {
+      this.updateName();
+      // Which repo it is decides which workflow file (if any) the group would run.
+      this.scheduleRosterRefresh();
+    });
     const browse = document.createElement("button");
     browse.className = "dlg-btn";
     browse.type = "button";
@@ -450,9 +476,46 @@ export class WelcomeForm {
       cli.addEventListener("change", () => {
         this.applyRoleModels(key);
         this.updateAgentWarning();
+        this.refreshRoster();
       });
       return { key, cli, model };
     });
+    // Advanced orchestrator (#222). The checkbox is the whole opt-in; everything
+    // below it is the human being shown what they are opting into, BEFORE the
+    // group spawns — the roster the repo declares, each block's CLI/model, which
+    // blocks carry repo-authored personas, and every validation finding if the
+    // file is broken (in which case the launch still succeeds, on the standard
+    // roster — a repo file may never stop a group from starting).
+    this.advancedInput = document.createElement("input");
+    this.advancedInput.type = "checkbox";
+    this.advancedInput.className = "dlg-check";
+    this.advancedInput.addEventListener("change", () => {
+      // Ticking the box is the human asking "what would this run?" — answer it
+      // from the disk, not from a memo taken before they went and edited the file
+      // in a workflow pane. A stale answer on a consent surface is worse than a
+      // slow one.
+      this.previews.clear();
+      this.refreshRoster();
+    });
+    const advancedLabel = document.createElement("label");
+    advancedLabel.className = "dlg-toggle";
+    const advancedText = document.createElement("span");
+    advancedText.textContent = "Advanced orchestrator — run this repo's .loomux/workflow.yml";
+    advancedLabel.append(this.advancedInput, advancedText);
+    this.editWorkflowBtn = document.createElement("button");
+    this.editWorkflowBtn.className = "dlg-btn";
+    this.editWorkflowBtn.type = "button";
+    this.editWorkflowBtn.textContent = "Edit workflow…";
+    this.editWorkflowBtn.title =
+      "Open .loomux/workflow.yml in a workflow pane. This setup pane BECOMES that " +
+      "editor, so the launcher settings here are not kept — open a new pane to launch " +
+      "once the file is right.";
+    this.editWorkflowBtn.addEventListener("click", () => void this.openWorkflowPane());
+    this.rosterEl = document.createElement("div");
+    this.rosterEl.className = "roster-preview";
+    this.advancedField = document.createElement("div");
+    this.advancedField.className = "dlg-field";
+    this.advancedField.append(advancedLabel, this.rosterEl);
     this.permsSel = select([
       ["auto", "Auto — pre-approve git/gh + agent tools (recommended)"],
       ["edits", "Accept edits only — you approve git/gh yourself"],
@@ -494,7 +557,8 @@ export class WelcomeForm {
         this.autonomyBudgetInput,
         "caps autonomous-era spend once you enable autonomous mode from the group panel"
       ),
-      field("Permissions", this.permsSel)
+      field("Permissions", this.permsSel),
+      this.advancedField
     );
 
     this.errorEl = document.createElement("div");
@@ -584,10 +648,13 @@ export class WelcomeForm {
           ? "Folder to edit — required"
           : k === "git"
             ? "Repository — required"
-            : "Repository or folder — empty for home";
+            : k === "workflow"
+              ? "Repository whose workflow to edit — required"
+              : "Repository or folder — empty for home";
     this.applyOrchCli();
     this.applyAutopilot();
     this.updateName();
+    this.refreshRoster();
   }
 
   /** Show the autopilot toggle only where it applies — agent kind, a non-custom
@@ -648,6 +715,9 @@ export class WelcomeForm {
       rc.cli.value = this.agentSel.value;
       this.applyRoleModels(rc.key);
     }
+    // The group default CLI is what a declared block with no `cli:` inherits, so
+    // the resolved roster changes with it.
+    this.refreshRoster();
   }
 
   /** Populate a role's model picker from its selected CLI: curated suggestions
@@ -664,6 +734,137 @@ export class WelcomeForm {
         rc.model.setOptions(merged, cli.defaults[role]);
       }
     });
+  }
+
+  // ---------- advanced orchestrator: the roster preview (#222) ----------
+
+  /** The launcher's per-role picks, as the roster resolver takes them. */
+  private rolePicks(): RolePick[] {
+    return this.roleControls.map((rc) => ({
+      key: rc.key,
+      cli: this.orchCliFor(rc.cli.value).id,
+      model: rc.model.value || this.orchCliFor(rc.cli.value).defaults[rc.key],
+    }));
+  }
+
+  /** The backend's read of a repo's workflow file, memoized per (repo, group CLI).
+   *  `null` on any failure: a preview we couldn't fetch must degrade to "we don't
+   *  know", never to a thrown launcher. */
+  private previewFor(repo: string, cli: string): Promise<WorkflowPreview | null> {
+    const key = `${repo}|${cli}`;
+    let p = this.previews.get(key);
+    if (!p) {
+      p = workflowPreview(repo, cli).catch(() => null);
+      this.previews.set(key, p);
+    }
+    return p;
+  }
+
+  /** Re-resolve and repaint the roster box. Cheap and idempotent — called from
+   *  every control that can change what the group would run (the toggle, the repo
+   *  path, the group CLI, a per-role CLI/model). */
+  private refreshRoster(): void {
+    if (this.kind !== "orchestrator") {
+      this.rosterEl.replaceChildren();
+      return;
+    }
+    const advanced = this.advancedInput.checked;
+    const repo = this.repoInput.value.trim();
+    const cli = this.orchCliFor(this.agentSel.value).id;
+    const seq = ++this.rosterSeq;
+    // With the toggle off there is nothing to ask the backend *unless* we want to
+    // tell the human their workflow file is being ignored — which is worth one
+    // cached call, and is why this path fetches too. No repo yet: nothing to read.
+    if (!repo) {
+      this.paintRoster(resolveRoster(advanced, null, this.rolePicks(), cli), advanced);
+      return;
+    }
+    void this.previewFor(repo, cli).then((preview) => {
+      // A slow preview must not paint over a form the human has moved on from.
+      if (seq !== this.rosterSeq || this.kind !== "orchestrator") return;
+      this.paintRoster(
+        resolveRoster(this.advancedInput.checked, preview, this.rolePicks(), cli),
+        this.advancedInput.checked
+      );
+    });
+  }
+
+  /** Debounced refresh, for the repo field (one preview per pause in typing, not
+   *  one per keystroke). */
+  private scheduleRosterRefresh(): void {
+    if (this.rosterTimer !== null) window.clearTimeout(this.rosterTimer);
+    this.rosterTimer = window.setTimeout(() => {
+      this.rosterTimer = null;
+      this.refreshRoster();
+    }, 250);
+  }
+
+  /** Render the resolved roster. With the toggle off this is one quiet line — the
+   *  standard roster is what the human already expects, and a table of it would be
+   *  noise in the form's default state. */
+  private paintRoster(r: ResolvedRoster, advanced: boolean): void {
+    const rows: HTMLElement[] = [];
+    const line = (cls: string, text: string): HTMLElement => {
+      const el = document.createElement("div");
+      el.className = cls;
+      el.textContent = text;
+      return el;
+    };
+    rows.push(line(`roster-summary roster-${r.status}`, r.summary));
+    if (advanced) {
+      // Only a DECLARED roster is worth tabulating: for every other status the
+      // blocks are the standard four, which the summary line has already named.
+      if (r.status === "declared") {
+        for (const b of r.blocks) {
+          const row = document.createElement("div");
+          row.className = "roster-block";
+          const id = document.createElement("span");
+          id.className = "roster-id";
+          id.textContent = b.name && b.name !== b.id ? `${b.id} — ${b.name}` : b.id;
+          row.append(id, line("roster-meta", describeBlock(b)));
+          rows.push(row);
+        }
+      }
+      for (const err of r.errors) rows.push(line("roster-error", err));
+      const actions = document.createElement("div");
+      actions.className = "dlg-row";
+      actions.append(this.editWorkflowBtn);
+      rows.push(actions);
+      if (r.status === "declared") {
+        rows.push(
+          line(
+            "roster-note",
+            "Blocks come from the file — the per-role CLI and model above are used only " +
+              "as the defaults a block inherits when it names none."
+          )
+        );
+      }
+    }
+    this.rosterEl.replaceChildren(...rows);
+  }
+
+  /** Turn this setup pane into a workflow pane over the repo (#223), so the human
+   *  can fix or write `.loomux/workflow.yml` before launching. One-shot, like every
+   *  other kind this form can become — the launcher settings are not carried over,
+   *  which the button's tooltip says. */
+  private async openWorkflowPane(): Promise<void> {
+    const root = this.repoInput.value.trim();
+    if (!root) {
+      this.showError("Enter the repository first — the workflow file lives inside it.");
+      this.repoInput.focus();
+      return;
+    }
+    if (!this.latch.begin()) return;
+    this.setBusy(true, "Opening…");
+    if (!(await ftRootIsDir(root))) {
+      this.showError(`Folder not found (or not a directory): ${root}`);
+      this.repoInput.focus();
+      this.setBusy(false);
+      this.latch.release();
+      return;
+    }
+    addRecentRepo(root);
+    this.fire({ kind: "workflow", name: basename(root) || "workflow", root });
   }
 
   /** Probe an agent program (availability + models), memoized. */
@@ -800,6 +1001,7 @@ export class WelcomeForm {
     if (typeof picked === "string") {
       this.repoInput.value = picked;
       this.updateName();
+      this.refreshRoster();
     }
   }
 
@@ -850,11 +1052,16 @@ export class WelcomeForm {
       return;
     }
 
-    if (plan.kind === "files" || plan.kind === "editor") {
+    if (plan.kind === "files" || plan.kind === "editor" || plan.kind === "workflow") {
       // The root must really be there. A terminal or agent in a bad cwd at least
       // fails loudly in its own output; a content pane would just render an empty
       // tree with no explanation — so probe first and bounce the user back to the
       // field with an inline error, exactly like a missing CLI (#214).
+      //
+      // The workflow pane (#222) probes the same way and no further: `.loomux/workflow.yml`
+      // NOT existing is the normal way to start (the pane offers to create it), so probing
+      // for the file would turn "you don't have a workflow yet" into "this pane refuses to
+      // open" — which is the one thing a config editor must never do.
       this.setBusy(true, "Opening…");
       if (!(await ftRootIsDir(plan.root))) {
         this.showError(`Folder not found (or not a directory): ${plan.root}`);
@@ -950,6 +1157,12 @@ export class WelcomeForm {
           watchdogStallMinutes: intVal(this.watchdogInput, 10),
           maxSpawnsPerHour: intVal(this.spawnRateInput, 0),
           autonomyBudgetTokens: Math.max(0, intVal(this.autonomyBudgetInput, 0)),
+          // #222. Off = the backend never opens `.loomux/workflow.yml`. A broken
+          // file is deliberately NOT a submit blocker: the backend audits it and
+          // falls back to the standard roster, so refusing the launch here would
+          // invent a failure mode the engine doesn't have. The roster box has
+          // already shown the human every finding.
+          advancedOrchestrator: this.advancedInput.checked,
         },
       });
       return;

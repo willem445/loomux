@@ -38,6 +38,14 @@ jobs:
       - name: Build frontend (typecheck + bundle)
         run: npm run build
 
+      # `npm run build` above is a typecheck, not a test run — the frontend suite
+      # (node:test over `test/**/*.test.ts`) was never gated by CI at all, so a
+      # regression in a pure module merged green as long as it still typechecked.
+      # That includes the pin on the repo's OWN `.loomux/workflow.yml` (#222), which
+      # is only worth having if it runs on every PR.
+      - name: Test frontend
+        run: npm test
+
       - name: Check backend
         run: cargo check --locked
         working-directory: src-tauri
