@@ -4632,13 +4632,20 @@ impl OrchRegistry {
                 // registration (correct for `list_notifications`, which hands an
                 // agent its own text back) — but THIS command crosses a new
                 // boundary, into the trusted webview, for every agent's note, not
-                // just the reader's own. Nothing in the current renderer is
-                // exploitable (rev-orch, PR #252: it only ever reaches a `title`
-                // DOM property, never `innerHTML`), but that safety is a property
-                // of the consumer, not the boundary — so strip control chars here
-                // with the same `sanitize_gh_text` the fired/expired/failed
-                // notices already use, rather than depend on every future
-                // renderer getting it right too.
+                // just the reader's own. So strip control chars and neutralize the
+                // `[loomux]` marker here with the same `sanitize_gh_text` the
+                // fired/expired/failed notices already use — that closes the
+                // notice/log-forging class this string could otherwise carry.
+                // It does NOT html-escape: an HTML metacharacter payload (e.g. an
+                // `<img onerror=...>`) crosses this call untouched (escaping in a
+                // JSON payload would be the wrong layer anyway — it corrupts the
+                // data for every non-HTML consumer). The thing standing between
+                // an agent's note and script execution is, and must remain, that
+                // the renderer only ever assigns it to a `.title`/`textContent`
+                // DOM PROPERTY, never `innerHTML` (true today — zero `innerHTML`
+                // in this diff, rev-orch PR #252 round 2). Do not relax that
+                // renderer rule on the theory that "the backend sanitizes it" —
+                // it sanitizes a different, narrower thing.
                 "note": notify::sanitize_gh_text(&w.note, notify::NOTICE_FIELD_CAP),
                 "expires_ms": w.deadline_ms,
             }))

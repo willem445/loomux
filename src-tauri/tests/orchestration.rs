@@ -6977,6 +6977,39 @@ fn group_watches_sanitizes_the_agent_supplied_note_crossing_into_the_webview() {
     assert_eq!(note, notify::sanitize_gh_text(evil, notify::NOTICE_FIELD_CAP));
 }
 
+#[test]
+fn group_watches_truncates_a_long_note_to_the_field_cap_while_list_notifications_keeps_it_verbatim() {
+    // rev-tests (PR #252 round 2, non-blocking): the sanitization above also
+    // truncates `note` to `NOTICE_FIELD_CAP` (120) — a byproduct of reusing
+    // `sanitize_gh_text` — while registration accepts up to 500 chars
+    // (`arg_str(...).chars().take(500)`, mcp.rs) and `list_notifications`
+    // returns all 500 verbatim (`watch_json` never caps `note`). So a note
+    // between 120 and 500 chars is now silently shorter in the group view's
+    // tooltip than in the agent's own `list_notifications` read. Untested
+    // before this (the sanitize test's payload was well under 120). Pinning
+    // the asymmetry as a deliberate choice, not a surprise.
+    let (reg, _d, gid, wid) = watchdog_setup(5);
+    let long_note: String = "n".repeat(200);
+    reg.register_notification(&gid, &wid, notify::Condition::PrChecks { pr: 1 }, long_note.clone(), 60).unwrap();
+
+    let listed = reg.list_notifications(&wid);
+    assert_eq!(
+        listed[0]["note"].as_str().unwrap().chars().count(),
+        200,
+        "list_notifications must return the note verbatim, uncapped by NOTICE_FIELD_CAP"
+    );
+
+    let watches = reg.group_watches(&gid);
+    let capped = watches[0]["note"].as_str().unwrap();
+    assert_eq!(
+        capped.chars().count(),
+        notify::NOTICE_FIELD_CAP,
+        "group_watches must truncate to the notice field cap, got {} chars: {capped:?}",
+        capped.chars().count()
+    );
+    assert_eq!(capped, "n".repeat(notify::NOTICE_FIELD_CAP));
+}
+
 // ---------- watchdog × live watches: the #248 stall-notice annotation ----------
 
 #[test]
