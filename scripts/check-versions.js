@@ -94,7 +94,7 @@ function main() {
   if (versions.size > 1) {
     console.error('Version mismatch across release files:\n' + report);
     console.error(
-      '\nAll five version sources (see .claude/skills/release/SKILL.md) must agree. ' +
+      '\nAll seven version fields across six files (see .claude/skills/release/SKILL.md) must agree. ' +
         'Bump every file together, then re-run `npm run check:versions`.',
     );
     process.exitCode = 1;

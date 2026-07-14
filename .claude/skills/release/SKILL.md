@@ -40,10 +40,12 @@ from the tag (`npm version "${GITHUB_REF_NAME#v}"`) — keep it in lockstep
 anyway so the tree reads consistently.
 
 CI has a mechanical backstop for this (#274): the "Check version
-consistency" step (`node scripts/check-versions.js`) fails the build if any
-of these files disagree, so a missed lockfile bump can't merge silently
-again. Run `npm run check:versions` locally before opening the bump PR if
-you want the same check without waiting on CI.
+consistency" step (`node scripts/check-versions.js`) checks all seven
+version fields across these six files (the five above plus
+`npm/package.json`) and fails the build if any disagree, so a missed
+lockfile bump can't merge silently again. Run `npm run check:versions`
+locally before opening the bump PR if you want the same check without
+waiting on CI.
 
 Commit as `chore(release): bump version to X.Y.Z`, PR to `main`, wait for CI,
 and stop — **the human merges** (as always in this repo).
