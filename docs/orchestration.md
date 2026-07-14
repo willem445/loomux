@@ -156,6 +156,17 @@ These deserve their own detail — see:
   edit, delivery outcome, and state write, one row each. A **follow** button
   live-tails new lines.
 
+## Notifications
+
+Agents no longer sit watching a PR's CI. The orchestrator, workers, and reviewers can
+register a background watch — a PR's checks, or a specific GitHub Actions run — and go do
+other work; loomux polls in the background (every 30s) and types a `[loomux] notification
+…` into the registering agent's own pane the moment it resolves, expires, or fails
+repeatedly. A watch is capped (4 per agent / 12 per group) and time-bounded (5–240 min,
+default 60), and it lives only in memory — it does not survive closing loomux, so an agent
+re-lists what it was waiting on after a restart or a `/compact`. Pausing a group freezes a
+watch entirely (no polling, firing, or expiry) until you resume it.
+
 ## Group lifecycle
 
 The orchestrator pane has a lifecycle toggle (`Alt+O` or the group icon) with a

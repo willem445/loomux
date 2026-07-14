@@ -7,6 +7,7 @@
 //! applies to integration-test targets.
 
 use loomux_lib::orchestration::mcp::dispatch;
+use loomux_lib::orchestration::notify;
 use loomux_lib::orchestration::{
     add_trusted_folder, autonomy_budget_exhausted, bracketed_paste, classify_human_input,
     claude_permission_mode, cli_ready, copilot_autopilot_prompt_detected, create_orchestration_group,
@@ -6771,4 +6772,288 @@ fn disk_tick_notifies_once_per_episode_and_skips_paused() {
     reg.pause_group(&g.id).unwrap();
     reg.disk_tick(low);
     assert_eq!(count_low_disk(), 2, "a paused group is skipped, so no new notice");
+}
+
+// ---------- notification backend (#243) ----------
+//
+// No test here shells out to `gh`: `notify_tick(now, &results)` is the seam
+// (the `watchdog_tick` shape), so every test drives it with a synthetic
+// `PollResult` map. Pure predicate/notice-sanitation coverage (the "no
+// checks reported" → Pending regression, the SUCCESS/FAILURE/IN_PROGRESS
+// table, the forged-prefix/newline sanitation) lives inline in
+// `orchestration/notify.rs`'s own `#[cfg(test)]` module — those are pure
+// functions with no registry/Tauri dependency, exactly the `gh.rs` precedent
+// for keeping pure-fn tests out of this integration file.
+
+/// Call `notify_when` through the real MCP dispatch and return the tool's
+/// text (Ok on success, Err on a rejection) — mirrors how an agent actually
+/// reaches this tool, so authz/validation are exercised for real.
+fn register_notify(reg: &OrchRegistry, c: &Caller, args: Value) -> Result<String, String> {
+    let r = dispatch(reg, c, "tools/call", &json!({ "name": "notify_when", "arguments": args })).unwrap();
+    let text = r["content"][0]["text"].as_str().unwrap().to_string();
+    if r["isError"] == true { Err(text) } else { Ok(text) }
+}
+
+/// Pull the watch id (`n-3`) out of `notify_when`'s confirmation text
+/// (`"registered n-3 (PR #241 checks), polled every 30s, …"`).
+fn extract_watch_id(text: &str) -> String {
+    text.split_whitespace().nth(1).unwrap().to_string()
+}
+
+#[test]
+fn notify_register_tick_fires_once_and_delists() {
+    let (reg, _d, _co, cw) = setup_mcp();
+    let text =
+        register_notify(&reg, &cw, json!({ "kind": "pr_checks", "pr": "241", "note": "merge if green" })).unwrap();
+    let id = extract_watch_id(&text);
+
+    let mut results = HashMap::new();
+    results.insert(id.clone(), notify::PollResult::Met { summary: "SUCCESS — all 6 checks passed".into() });
+    assert_eq!(reg.notify_tick(now_ms(), &results), vec![id.clone()], "a Met result must fire exactly once");
+
+    let listed = reg.list_notifications(&cw.agent_id).to_string();
+    assert!(!listed.contains(&id), "a fired watch must be delisted, got: {listed}");
+
+    let log = fs::read_to_string(reg.state_root().join(&cw.group).join("audit.jsonl")).unwrap();
+    assert!(log.contains("notification-fired"), "the fire must be audited, got: {log}");
+    assert!(log.contains("SUCCESS"), "the audit must carry the summary, got: {log}");
+
+    // A second tick with the same result set is a no-op — the watch is gone.
+    assert!(reg.notify_tick(now_ms(), &results).is_empty(), "must not fire twice");
+}
+
+#[test]
+fn notify_pending_does_not_fire_and_stays_listed() {
+    let (reg, _d, _co, cw) = setup_mcp();
+    let text = register_notify(&reg, &cw, json!({ "kind": "pr_checks", "pr": "5" })).unwrap();
+    let id = extract_watch_id(&text);
+
+    let mut results = HashMap::new();
+    results.insert(id.clone(), notify::PollResult::Pending);
+    assert!(reg.notify_tick(now_ms(), &results).is_empty(), "Pending must never fire");
+    assert!(reg.notify_tick(now_ms(), &results).is_empty(), "two Pending ticks in a row still must not fire");
+
+    let listed = reg.list_notifications(&cw.agent_id).to_string();
+    assert!(listed.contains(&id), "a Pending watch must remain listed, got: {listed}");
+}
+
+#[test]
+fn notify_expires_after_ttl_with_injected_now_and_tells_the_owner() {
+    let (reg, _d, _co, cw) = setup_mcp();
+    let text = register_notify(&reg, &cw, json!({ "kind": "pr_checks", "pr": "88", "expires_minutes": 5 })).unwrap();
+    let id = extract_watch_id(&text);
+
+    // 6 minutes later, no poll result for this watch at all (it wasn't due,
+    // or gh returned nothing usable this tick) — expiry is purely
+    // time-based, so this alone must drop it.
+    let future = now_ms() + 6 * 60_000;
+    assert_eq!(reg.notify_tick(future, &HashMap::new()), vec![id.clone()], "must expire past the TTL");
+
+    let listed = reg.list_notifications(&cw.agent_id).to_string();
+    assert!(!listed.contains(&id), "an expired watch must be delisted, got: {listed}");
+
+    let log = fs::read_to_string(reg.state_root().join(&cw.group).join("audit.jsonl")).unwrap();
+    assert!(log.contains("notification-expired"), "expiry must be audited, got: {log}");
+}
+
+#[test]
+fn notify_mark_dead_drops_the_watch_with_no_delivery_attempt() {
+    let (reg, _d, _co, cw) = setup_mcp();
+    let text = register_notify(&reg, &cw, json!({ "kind": "pr_checks", "pr": "1" })).unwrap();
+    let id = extract_watch_id(&text);
+
+    reg.mark_dead(&cw.agent_id, Some(0));
+
+    // Even a Met result for the now-dead agent's watch fires nothing — the
+    // watch was already dropped when the agent died, so notify_tick never
+    // sees it (covers idle-kill / kill_agent / a crash / planner auto-close
+    // identically, since they all funnel through mark_dead).
+    let mut results = HashMap::new();
+    results.insert(id.clone(), notify::PollResult::Met { summary: "SUCCESS".into() });
+    assert!(reg.notify_tick(now_ms(), &results).is_empty(), "a dead agent's watch must never fire");
+
+    let log = fs::read_to_string(reg.state_root().join(&cw.group).join("audit.jsonl")).unwrap();
+    assert!(log.contains("notify-cleanup"), "mark_dead must audit the watch cleanup, got: {log}");
+    assert!(!log.contains("notification-fired"), "no delivery/fire may be attempted, got: {log}");
+}
+
+#[test]
+fn notify_fail_streak_of_three_cancels_but_two_then_success_fires_normally() {
+    let (reg, _d, _co, cw) = setup_mcp();
+    let text = register_notify(&reg, &cw, json!({ "kind": "workflow_run", "run": "555" })).unwrap();
+    let id = extract_watch_id(&text);
+    let mut fail = HashMap::new();
+    fail.insert(id.clone(), notify::PollResult::Failed { why: "gh-not-found".into() });
+
+    assert!(reg.notify_tick(now_ms(), &fail).is_empty(), "one failure must not cancel");
+    assert!(reg.notify_tick(now_ms(), &fail).is_empty(), "two failures must not cancel yet");
+    assert!(reg.list_notifications(&cw.agent_id).to_string().contains(&id), "must survive two failures");
+
+    assert_eq!(reg.notify_tick(now_ms(), &fail), vec![id.clone()], "the third consecutive failure must cancel");
+    let log = fs::read_to_string(reg.state_root().join(&cw.group).join("audit.jsonl")).unwrap();
+    assert!(log.contains("notification-failed"), "the cancellation must be audited, got: {log}");
+    assert!(log.contains("gh-not-found"), "the audit must carry the reason, got: {log}");
+
+    // A fresh watch: two failures then a success resets the streak and fires.
+    let text2 = register_notify(&reg, &cw, json!({ "kind": "workflow_run", "run": "556" })).unwrap();
+    let id2 = extract_watch_id(&text2);
+    let mut fail2 = HashMap::new();
+    fail2.insert(id2.clone(), notify::PollResult::Failed { why: "gh-not-found".into() });
+    reg.notify_tick(now_ms(), &fail2);
+    reg.notify_tick(now_ms(), &fail2);
+    let mut met2 = HashMap::new();
+    met2.insert(id2.clone(), notify::PollResult::Met { summary: "completed — conclusion: success".into() });
+    assert_eq!(
+        reg.notify_tick(now_ms(), &met2),
+        vec![id2],
+        "a success after only two failures must fire normally, not stay half-cancelled"
+    );
+}
+
+#[test]
+fn notify_paused_group_freezes_poll_fire_and_expiry() {
+    let (reg, _d, _co, cw) = setup_mcp();
+    let text = register_notify(&reg, &cw, json!({ "kind": "pr_checks", "pr": "1", "expires_minutes": 5 })).unwrap();
+    let id = extract_watch_id(&text);
+    reg.pause_group(&cw.group).unwrap();
+
+    let mut met = HashMap::new();
+    met.insert(id.clone(), notify::PollResult::Met { summary: "SUCCESS".into() });
+    // Tick well past the deadline WITH a Met result in hand — a paused group
+    // must neither fire (the pane delivery is suppressed anyway) NOR expire
+    // (freeze the TTL clock — a long pause must not silently evaporate every
+    // watch, mirroring the watchdog's paused-latch rule).
+    let far_future = now_ms() + 60 * 60_000;
+    assert!(reg.notify_tick(far_future, &met).is_empty(), "a paused group must not fire or expire");
+    assert!(reg.list_notifications(&cw.agent_id).to_string().contains(&id), "the watch must survive the pause untouched");
+
+    reg.resume_group(&cw.group).unwrap();
+    assert_eq!(reg.notify_tick(far_future, &met), vec![id], "resuming must let the outstanding Met result fire");
+}
+
+#[test]
+fn notify_tools_are_denied_to_a_planner_in_listing_and_dispatch() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let planner = reg.spawn_agent(&g.id, Role::Planner, "plan", "plan issue #7", false, None).unwrap();
+    let cp = reg.resolve_token(&planner.token).unwrap();
+
+    // Cosmetic filter: not even listed.
+    let tools: Vec<String> = dispatch(&reg, &cp, "tools/list", &Value::Null).unwrap()["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap().to_string())
+        .collect();
+    for name in ["notify_when", "list_notifications", "cancel_notification"] {
+        assert!(!tools.contains(&name.to_string()), "a planner must not see {name}");
+    }
+
+    // The real gate: a direct call is denied, not silently accepted, because
+    // the listing filter is cosmetic and the dispatch arm re-checks.
+    let err = register_notify(&reg, &cp, json!({ "kind": "pr_checks", "pr": "1" })).unwrap_err();
+    assert!(err.contains("permission denied"), "got: {err}");
+}
+
+#[test]
+fn cancel_notification_is_owner_scoped_with_no_id_leak() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let w1 = reg.spawn_agent(&g.id, Role::Worker, "w1", "t1", false, None).unwrap();
+    let w2 = reg.spawn_agent(&g.id, Role::Worker, "w2", "t2", false, None).unwrap();
+    let c1 = reg.resolve_token(&w1.token).unwrap();
+    let c2 = reg.resolve_token(&w2.token).unwrap();
+    let text = register_notify(&reg, &c1, json!({ "kind": "pr_checks", "pr": "1" })).unwrap();
+    let id = extract_watch_id(&text);
+
+    // w2 tries to cancel w1's watch. The rejection must echo back exactly
+    // "unknown notification: <id>" — the same shape a genuinely nonexistent
+    // id gets (see below) — never anything that confirms the id exists but
+    // belongs to someone else (e.g. "not yours", "owned by w-1").
+    let cross = dispatch(&reg, &c2, "tools/call", &json!({ "name": "cancel_notification", "arguments": { "id": id } })).unwrap();
+    assert_eq!(cross["isError"], true);
+    let cross_text = cross["content"][0]["text"].as_str().unwrap();
+    assert_eq!(cross_text, format!("unknown notification: {id}"), "must not leak that the id exists, got: {cross_text}");
+
+    // A truly nonexistent id, from the actual owner, hits the exact same
+    // template (only the id itself differs) — the anti-leak property is
+    // that "not yours" and "never existed" are the same wording, never a
+    // distinguishing suffix.
+    let missing = dispatch(&reg, &c1, "tools/call", &json!({ "name": "cancel_notification", "arguments": { "id": "n-999" } })).unwrap();
+    assert_eq!(
+        missing["content"][0]["text"].as_str().unwrap(),
+        "unknown notification: n-999",
+        "a nonexistent id must get the identical template as the cross-owner rejection above"
+    );
+
+    // The true owner can still cancel it.
+    let ok = dispatch(&reg, &c1, "tools/call", &json!({ "name": "cancel_notification", "arguments": { "id": id } })).unwrap();
+    assert_eq!(ok["isError"], false);
+    assert!(!reg.list_notifications(&c1.agent_id).to_string().contains(&id));
+}
+
+#[test]
+fn notify_per_agent_cap_rejects_a_fifth_naming_the_cap() {
+    let (reg, _d, _co, cw) = setup_mcp();
+    for i in 1..=4u32 {
+        register_notify(&reg, &cw, json!({ "kind": "pr_checks", "pr": i.to_string() })).unwrap();
+    }
+    let err = register_notify(&reg, &cw, json!({ "kind": "pr_checks", "pr": "99" })).unwrap_err();
+    assert!(err.contains("guardrail"), "got: {err}");
+    assert!(err.contains(&notify::MAX_WATCHES_PER_AGENT.to_string()), "must name the cap, got: {err}");
+}
+
+#[test]
+fn notify_group_cap_rejects_even_when_the_agent_itself_has_room() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", Guardrails { max_agents: 5, ..rails() }).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let w1 = reg.spawn_agent(&g.id, Role::Worker, "w1", "t", false, None).unwrap();
+    let w2 = reg.spawn_agent(&g.id, Role::Worker, "w2", "t", false, None).unwrap();
+    let w3 = reg.spawn_agent(&g.id, Role::Worker, "w3", "t", false, None).unwrap();
+    let callers = [
+        reg.resolve_token(&orch.token).unwrap(),
+        reg.resolve_token(&w1.token).unwrap(),
+        reg.resolve_token(&w2.token).unwrap(),
+        reg.resolve_token(&w3.token).unwrap(),
+    ];
+    // 4 agents x 3 watches each = 12, the group cap, with every agent still
+    // 1 under its own per-agent cap of 4.
+    let mut n = 0u32;
+    for c in &callers {
+        for _ in 0..3 {
+            n += 1;
+            register_notify(&reg, c, json!({ "kind": "pr_checks", "pr": n.to_string() })).unwrap();
+        }
+    }
+    let err = register_notify(&reg, &callers[0], json!({ "kind": "pr_checks", "pr": "999" })).unwrap_err();
+    assert!(err.contains("guardrail"), "got: {err}");
+    assert!(
+        err.contains(&notify::MAX_WATCHES_PER_GROUP.to_string()),
+        "must name the GROUP cap (the agent itself has room), got: {err}"
+    );
+}
+
+#[test]
+fn notify_rejects_unknown_kind_and_bad_targets_but_clamps_expires_minutes() {
+    let (reg, _d, _co, cw) = setup_mcp();
+
+    // Unrecognized kind: rejected, never defaulted to either real kind.
+    let err = register_notify(&reg, &cw, json!({ "kind": "pr_merged", "pr": "1" })).unwrap_err();
+    assert!(err.contains("unrecognized notification kind"), "got: {err}");
+    assert!(err.contains("pr_merged"), "must echo the bad value, not silently default, got: {err}");
+
+    // A pr value that isn't a number/#n/URL is rejected before a watch is
+    // ever created (never silently coerced to 0 or dropped).
+    let err = register_notify(&reg, &cw, json!({ "kind": "pr_checks", "pr": "abc" })).unwrap_err();
+    assert!(err.contains("cannot parse a PR number"), "got: {err}");
+    let err = register_notify(&reg, &cw, json!({ "kind": "workflow_run", "run": "not-a-run" })).unwrap_err();
+    assert!(err.contains("cannot parse a run id"), "got: {err}");
+
+    // expires_minutes is clamped, not rejected, past the ceiling.
+    let text =
+        register_notify(&reg, &cw, json!({ "kind": "pr_checks", "pr": "1", "expires_minutes": 9999 })).unwrap();
+    assert!(text.contains("expires in 240 min"), "must clamp to the max, got: {text}");
 }
