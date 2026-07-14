@@ -6917,6 +6917,91 @@ fn create_orchestration_group_maps_resume_session_onto_the_workflow_pin() {
     );
 }
 
+// ───────── #255: max_agents recommendation, end to end ─────────
+//
+// The pure derivation (`recommend_capacity`, gate-aware) is pinned in
+// tests/workflow.rs. What these assert is the WIRING: a real `create_group`
+// records it in the `workflow-loaded` audit, and a cap below the minimum is
+// audited — advisory only, never silently rewritten.
+
+#[test]
+fn workflow_loaded_audit_records_the_gate_aware_capacity_recommendation() {
+    let (reg, _d) = test_registry();
+    // `gated_repo` (defined below): 1 worker + 2 reviewers, all-pass over both.
+    // minimum = 2 (gate_need) + 1 (worker slot) = 3; recommended = 1 + 2 = 3.
+    let repo = gated_repo("");
+    let g = reg
+        .create_group(
+            &repo.path().to_string_lossy(),
+            Guardrails { advanced_orchestrator: true, max_agents: 5, ..rails() },
+        )
+        .unwrap();
+    let loaded = reg
+        .audit_log(&g.id)
+        .into_iter()
+        .find(|e| e.action == "workflow-loaded")
+        .expect("a valid workflow load must record workflow-loaded");
+    assert_eq!(loaded.detail["min_agents"], 3, "2 reviewers (all-pass) + 1 worker");
+    assert_eq!(loaded.detail["recommended_agents"], 3, "1 worker + 2 reviewers, no planner block");
+}
+
+#[test]
+fn max_agents_below_the_minimum_is_audited_advisory_only() {
+    let (reg, _d) = test_registry();
+    let repo = gated_repo("");
+    let g = reg
+        .create_group(
+            &repo.path().to_string_lossy(),
+            Guardrails { advanced_orchestrator: true, max_agents: 2, ..rails() },
+        )
+        .unwrap();
+    let warn = reg
+        .audit_log(&g.id)
+        .into_iter()
+        .find(|e| e.action == "max-agents-below-minimum")
+        .expect("max_agents (2) is below the roster's minimum (3) — must be audited");
+    assert_eq!(warn.detail["max_agents"], 2);
+    assert_eq!(warn.detail["minimum"], 3);
+    assert_eq!(warn.detail["recommended"], 3);
+    // Advisory only (#255's explicit constraint): a cap the human set is never
+    // silently rewritten — the warning is the whole feature, not an override.
+    assert_eq!(
+        reg.group(&g.id).unwrap().guardrails.max_agents, 2,
+        "a capacity warning must never rewrite the cap the human set"
+    );
+}
+
+#[test]
+fn max_agents_at_or_above_the_minimum_stays_quiet() {
+    let (reg, _d) = test_registry();
+    // Exactly at the minimum: one review round fits without evicting anyone —
+    // the #255 incident's own numbers (cap == minimum, but < recommended) prove
+    // this boundary is where the warning must go silent, not where it fires.
+    let at_minimum = gated_repo("");
+    let g = reg
+        .create_group(
+            &at_minimum.path().to_string_lossy(),
+            Guardrails { advanced_orchestrator: true, max_agents: 3, ..rails() },
+        )
+        .unwrap();
+    assert!(
+        reg.audit_log(&g.id).iter().all(|e| e.action != "max-agents-below-minimum"),
+        "at the minimum, nothing needs evicting mid-round — must stay quiet"
+    );
+
+    let comfortable = gated_repo("");
+    let g2 = reg
+        .create_group(
+            &comfortable.path().to_string_lossy(),
+            Guardrails { advanced_orchestrator: true, max_agents: 6, ..rails() },
+        )
+        .unwrap();
+    assert!(
+        reg.audit_log(&g2.id).iter().all(|e| e.action != "max-agents-below-minimum"),
+        "comfortably above the minimum too"
+    );
+}
+
 // ───────── review verdicts + the enforced consensus gate (#222 / #197) ─────────
 //
 // The pure gate semantics live in tests/workflow.rs. These drive the whole stack:

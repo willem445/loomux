@@ -71,6 +71,23 @@ export interface WorkflowPreview {
   gates: string[];
   /** The resolved roster. Empty when the file is absent or invalid. */
   blocks: RosterBlock[];
+  /** #255: the structural agent-capacity this roster + its merge gate need, or
+   *  `null` when there's nothing declared to derive one from (the file is
+   *  absent or invalid — the group would run the built-in roster instead). */
+  min_agents: number | null;
+  recommended_agents: number | null;
+}
+
+/** #255: the agent-capacity a declared workflow needs, mirrored from the
+ *  backend's `recommend_capacity` (`orch_workflow_preview` / the
+ *  `workflow-loaded` audit record) so the launcher's warning can never say
+ *  something the engine wouldn't compute the same way. */
+export interface CapacityRecommendation {
+  /** What one review round costs without evicting anything already live: the
+   *  gate's reviewer requirement plus one worker slot. */
+  minimum: number;
+  /** What running every declared tier concurrently costs. */
+  recommended: number;
 }
 
 /** A launcher per-role pick: the CLI and model the form collected for a class. */
@@ -102,6 +119,9 @@ export interface ResolvedRoster {
   errors: string[];
   /** One line for the human, stating what will happen — including the fallback. */
   summary: string;
+  /** #255: non-null only for `declared` — the built-in four have no gate to
+   *  derive a capacity recommendation from. */
+  capacity: CapacityRecommendation | null;
 }
 
 /** The built-in roster the launcher's per-role picks describe: the four classes,
@@ -148,6 +168,7 @@ export function resolveRoster(
         preview?.present === true
           ? `Standard roster — ${preview.path} is present but will not be used.`
           : "Standard roster — orchestrator, worker, reviewer, planner.",
+      capacity: null,
     };
   }
   if (!preview || !preview.present) {
@@ -156,6 +177,7 @@ export function resolveRoster(
       blocks: builtin,
       errors: [],
       summary: `No ${preview?.path ?? ".loomux/workflow.yml"} in this repo — the standard roster will run. Create one to declare your own blocks.`,
+      capacity: null,
     };
   }
   if (!preview.valid) {
@@ -167,6 +189,7 @@ export function resolveRoster(
       // broken file and falls back, precisely so a repo file can never stop a
       // group from launching.
       summary: `${preview.path} has ${preview.errors.length === 1 ? "an error" : `${preview.errors.length} errors`} and will be skipped — the standard roster will run instead.`,
+      capacity: null,
     };
   }
   return {
@@ -176,6 +199,10 @@ export function resolveRoster(
     summary: `${preview.name || preview.path} — ${describeRoster(preview.blocks)}${
       preview.gates.length ? `, gated on ${preview.gates.join(", ")}` : ""
     }.`,
+    capacity:
+      preview.min_agents != null && preview.recommended_agents != null
+        ? { minimum: preview.min_agents, recommended: preview.recommended_agents }
+        : null,
   };
 }
 
@@ -209,4 +236,29 @@ export function describeBlock(b: RosterBlock): string {
  *  four are what they already expect; anything else is a change they should see. */
 export function rosterNeedsReview(r: ResolvedRoster): boolean {
   return r.status !== "builtin";
+}
+
+/** #255: the launcher's advisory — non-null when `maxAgents` would starve this
+ *  roster's structural minimum (the merge gate's reviewer requirement plus one
+ *  worker slot: what a single review round costs without evicting a live
+ *  agent). `null` for a `builtin`/`none`/`invalid` roster (no gate to derive a
+ *  minimum from) and whenever `maxAgents` already covers it — quiet at or
+ *  above, exactly like the backend's own `max-agents-below-minimum` audit
+ *  record.
+ *
+ *  Advisory only: this never touches `maxAgents` itself, it only describes why
+ *  raising it (the #56 on-the-fly cap, or just the number on this form before
+ *  Create) would help. */
+export function capacityWarning(r: ResolvedRoster, maxAgents: number): string | null {
+  if (!r.capacity || maxAgents >= r.capacity.minimum) return null;
+  const { minimum, recommended } = r.capacity;
+  const workers = r.blocks.filter((b) => b.kind === "worker").length;
+  const reviewers = r.blocks.filter((b) => b.kind === "reviewer").length;
+  const reviewerPart = reviewers > 0 ? `${reviewers} reviewer${reviewers > 1 ? "s" : ""}` : "its reviewers";
+  const workerPart = workers > 0 ? " + a worker" : "";
+  return (
+    `This workflow's merge gate needs ${reviewerPart}${workerPart} (minimum ${minimum} live agents) to run ` +
+    `one review round without evicting a live agent — max_agents is ${maxAgents}. Raise it to at least ` +
+    `${minimum}, or ${recommended} to run every declared tier at once.`
+  );
 }

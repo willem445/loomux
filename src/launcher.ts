@@ -37,6 +37,7 @@ import type { OrchestratorConfig, WorkflowPreview } from "./orchestration";
 import { workflowPreview } from "./orchestration";
 import {
   ORCH_ROLES,
+  capacityWarning,
   describeBlock,
   resolveRoster,
   type OrchRole,
@@ -289,6 +290,10 @@ export class WelcomeForm {
   private advancedInput: HTMLInputElement;
   private rosterEl: HTMLElement;
   private editWorkflowBtn: HTMLButtonElement;
+  /** The last roster `refreshRoster` resolved — repainted (no backend re-fetch)
+   *  whenever `maxAgentsInput` changes, so the #255 capacity warning tracks the
+   *  cap live as the human types without waiting on a new preview. */
+  private lastRoster: ResolvedRoster | null = null;
   /** One backend preview per (repo, group CLI), memoized for the form's life. */
   private previews = new Map<string, Promise<WorkflowPreview | null>>();
   /** Monotonic token: a preview that resolves after the human has moved on
@@ -448,6 +453,12 @@ export class WelcomeForm {
     // follows the selected agent CLI.
     this.workersInput = numberInput(2, 0, 6);
     this.maxAgentsInput = numberInput(4, 1, 12);
+    // #255: the cap this input sets is exactly what a declared workflow's
+    // capacity warning is judged against — repaint (no new backend fetch, the
+    // roster itself hasn't changed) on every edit so the warning tracks live.
+    this.maxAgentsInput.addEventListener("input", () => {
+      if (this.lastRoster) this.paintRoster(this.lastRoster, this.advancedInput.checked);
+    });
     // Cost guardrails (0 = off): idle-worker auto-kill timeout and a
     // spawns-per-hour backstop against a runaway orchestrator.
     this.idleKillInput = numberInput(0, 0, 1440);
@@ -766,6 +777,7 @@ export class WelcomeForm {
   private refreshRoster(): void {
     if (this.kind !== "orchestrator") {
       this.rosterEl.replaceChildren();
+      this.lastRoster = null;
       return;
     }
     const advanced = this.advancedInput.checked;
@@ -803,6 +815,7 @@ export class WelcomeForm {
    *  standard roster is what the human already expects, and a table of it would be
    *  noise in the form's default state. */
   private paintRoster(r: ResolvedRoster, advanced: boolean): void {
+    this.lastRoster = r;
     const rows: HTMLElement[] = [];
     const line = (cls: string, text: string): HTMLElement => {
       const el = document.createElement("div");
@@ -822,6 +835,24 @@ export class WelcomeForm {
           id.className = "roster-id";
           id.textContent = b.name && b.name !== b.id ? `${b.id} — ${b.name}` : b.id;
           row.append(id, line("roster-meta", describeBlock(b)));
+          rows.push(row);
+        }
+        // #255: advisory only — this never touches max_agents itself, it just
+        // names the shortfall and offers the fix as a click. Quiet whenever the
+        // cap already covers the workflow's structural minimum.
+        const warning = capacityWarning(r, intVal(this.maxAgentsInput, 4));
+        if (warning) {
+          const row = document.createElement("div");
+          row.className = "roster-capacity-warning";
+          const raise = document.createElement("button");
+          raise.type = "button";
+          raise.className = "dlg-btn";
+          raise.textContent = `Raise to ${r.capacity!.recommended}`;
+          raise.addEventListener("click", () => {
+            this.maxAgentsInput.value = String(r.capacity!.recommended);
+            this.paintRoster(r, advanced);
+          });
+          row.append(line("roster-error", warning), raise);
           rows.push(row);
         }
       }

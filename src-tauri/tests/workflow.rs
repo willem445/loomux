@@ -3253,6 +3253,99 @@ fn threshold_gate_needs_n_passes_and_all_pass_needs_everyone() {
         .satisfied());
 }
 
+// ───────── #255: max_agents recommendation, derived from roster + gate ─────────
+//
+// `recommend_capacity` is pure — pinned here, the same way `gate_need` and
+// `evaluate_merge_gate` are above it. The wiring that records it in the
+// `workflow-loaded` audit and warns below the minimum is exercised end to end
+// in tests/orchestration.rs.
+
+fn block(id: &str, kind: Role) -> workflow::Block {
+    workflow::Block {
+        id: id.into(),
+        name: id.into(),
+        kind,
+        cli: String::new(),
+        model: String::new(),
+        prompt: None,
+        profile: None,
+        allow: vec![],
+    }
+}
+
+#[test]
+fn capacity_minimum_is_gate_aware_not_just_a_reviewer_count() {
+    // The same 5 reviewer blocks under two different gates: #255 explicitly asks
+    // for the minimum to come from the GATE, not the block list — `threshold: 2`
+    // needs far less live-at-once capacity than `all-pass` over the same five.
+    let blocks = vec![
+        block("worker", Role::Worker),
+        block("rev-1", Role::Reviewer),
+        block("rev-2", Role::Reviewer),
+        block("rev-3", Role::Reviewer),
+        block("rev-4", Role::Reviewer),
+        block("rev-5", Role::Reviewer),
+    ];
+    let reviewers = ["rev-1", "rev-2", "rev-3", "rev-4", "rev-5"];
+
+    let threshold = gate(GateRequire::Threshold(2), &reviewers, &[]);
+    let rec = workflow::recommend_capacity(&blocks, Some(&threshold));
+    assert_eq!(rec.minimum, 3, "threshold: 2 + 1 worker");
+    assert_eq!(rec.recommended, 6, "1 worker + 5 reviewers, no planner block");
+
+    let all_pass = gate(GateRequire::AllPass, &reviewers, &[]);
+    let rec = workflow::recommend_capacity(&blocks, Some(&all_pass));
+    assert_eq!(
+        rec.minimum, 6,
+        "all-pass over the same five reviewers needs every one of them live at once"
+    );
+    assert_eq!(rec.recommended, 6, "recommended follows the roster, not the gate — unchanged");
+}
+
+#[test]
+fn capacity_recommended_counts_every_declared_tier_never_the_orchestrator() {
+    // The #255 incident roster: orchestrator, planner, 2 worker tiers, 3
+    // reviewers, all-pass. minimum (3 reviewers + 1 worker = 4) is exactly the
+    // cap that thrashed for two hours — because recommended (every tier live at
+    // once) is 6, not 4. This is the gap the feature exists to surface.
+    let blocks = vec![
+        block("orchestrator", Role::Orchestrator),
+        block("planner", Role::Planner),
+        block("worker-deep", Role::Worker),
+        block("worker-quick", Role::Worker),
+        block("rev-1", Role::Reviewer),
+        block("rev-2", Role::Reviewer),
+        block("rev-3", Role::Reviewer),
+    ];
+    let g = gate(GateRequire::AllPass, &["rev-1", "rev-2", "rev-3"], &[]);
+    let rec = workflow::recommend_capacity(&blocks, Some(&g));
+    assert_eq!(rec.minimum, 4);
+    assert_eq!(
+        rec.recommended, 6,
+        "2 workers + 3 reviewers + 1 planner — the orchestrator is exempt from the cap and never counted"
+    );
+}
+
+#[test]
+fn capacity_with_no_declared_gate_falls_back_to_every_reviewer_block() {
+    let blocks =
+        vec![block("worker", Role::Worker), block("rev-1", Role::Reviewer), block("rev-2", Role::Reviewer)];
+    let rec = workflow::recommend_capacity(&blocks, None);
+    assert_eq!(rec.minimum, 3, "no gate to narrow the requirement: every reviewer, plus a worker");
+    assert_eq!(rec.recommended, 3);
+}
+
+#[test]
+fn capacity_with_no_worker_block_needs_no_worker_slot() {
+    // A review-only workflow (no worker block at all) must not have a phantom
+    // +1 forced into its minimum — there is nothing for that slot to run.
+    let blocks = vec![block("rev-1", Role::Reviewer), block("rev-2", Role::Reviewer)];
+    let g = gate(GateRequire::AllPass, &["rev-1", "rev-2"], &[]);
+    let rec = workflow::recommend_capacity(&blocks, Some(&g));
+    assert_eq!(rec.minimum, 2, "no worker block declared — nothing to add the +1 slot for");
+    assert_eq!(rec.recommended, 2);
+}
+
 #[test]
 fn a_verdict_is_never_guessed_and_an_unreadable_one_is_not_a_pass() {
     use workflow::Verdict;

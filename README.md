@@ -134,6 +134,17 @@ persona. If the file is broken you get **every** validation finding right there,
 group still launches — on the standard roster, never blocked by a file in the repo. **Edit
 workflow…** opens the file in a [workflow pane](#the-workflow-pane) so you can fix it first.
 
+A declared roster and its merge gate have a real **structural minimum agent count**: the
+gate's reviewer requirement (an `all-pass` gate over 3 reviewers needs all 3; a
+`threshold: 2` gate over those same 3 needs only 2) plus one worker, since a review round
+needs something to review. Fall below it and the orchestrator can't run a single review
+round without killing a live agent to free a slot — the launcher checks **Max live agents**
+against that minimum and, if it's short, names the shortfall in the roster preview and
+offers to raise the cap: to the minimum (stops the eviction thrashing) or to the full
+**recommended** count (every declared tier — every worker block, every reviewer block, the
+planner if there is one — live at once, so no tier is ever starved of a slot). This is
+advisory only: loomux never overrides a cap you set, it only tells you what it costs.
+
 What a workflow file can *never* do is grant a capability. `kind` is a closed set of four
 classes, and there is no spelling — no `read_only: false`, no fifth class — that makes a
 block anything it couldn't already be. You can have five reviewers with five prompts and

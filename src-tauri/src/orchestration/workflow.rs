@@ -1162,6 +1162,49 @@ pub fn gate_need(gate: &Gate) -> u32 {
     }
 }
 
+/// The agent-capacity a declared workflow structurally needs (#255) — derived
+/// from its roster and its `merge` gate (if any), so the launcher can warn
+/// before a `max_agents` cap starves the workflow it just loaded rather than
+/// discovering it two hours in as an orchestrator that keeps killing live
+/// agents to make room (the #255 incident: a 3-reviewer `all-pass` gate plus a
+/// two-tier worker roster under a cap of 4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CapacityRecommendation {
+    /// What **one review round costs without evicting anything already
+    /// live**: the gate's reviewer requirement ([`gate_need`], or every
+    /// declared reviewer block when the workflow names no `merge` gate) plus
+    /// one worker slot to have something to review. Below this the
+    /// orchestrator cannot complete a single rework loop without killing a
+    /// live agent to free a slot.
+    pub minimum: u32,
+    /// What running **every declared tier concurrently** costs: every
+    /// distinct worker block, every distinct reviewer block, and one more if
+    /// the workflow declares a planner block. The orchestrator itself is
+    /// exempt from `max_agents` (mcp.rs) and is never counted here.
+    pub recommended: u32,
+}
+
+/// Derive a [`CapacityRecommendation`] from a workflow's blocks and its
+/// `gates.merge` clause (`None` when the workflow declares none).
+///
+/// Gate-aware, per #255's requirement: a roster with 5 reviewer blocks but
+/// `require: threshold: 2` has a different (lower) minimum than one requiring
+/// `all-pass` over the same 5 — [`gate_need`] is exactly that distinction.
+/// With no gate declared there is no narrower requirement to derive, so
+/// `minimum` falls back to every reviewer block the workflow names.
+pub fn recommend_capacity(blocks: &[Block], gate: Option<&Gate>) -> CapacityRecommendation {
+    let workers = blocks.iter().filter(|b| b.kind == Role::Worker).count() as u32;
+    let reviewers = blocks.iter().filter(|b| b.kind == Role::Reviewer).count() as u32;
+    let has_planner = blocks.iter().any(|b| b.kind == Role::Planner);
+
+    let reviewers_needed = gate.map_or(reviewers, gate_need);
+    let worker_slot = u32::from(workers > 0);
+    CapacityRecommendation {
+        minimum: reviewers_needed + worker_slot,
+        recommended: workers + reviewers + u32::from(has_planner),
+    }
+}
+
 /// **The gate decision** (reviewer half; the `also:` conditions are checked in the
 /// shim, which is the only place that can call `gh pr checks`). Pure, so the
 /// semantics are pinned by fast tests and the shell mirror has something to agree

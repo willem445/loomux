@@ -4842,6 +4842,12 @@ impl OrchRegistry {
         // persona under a session they already consented to — the consent moment is
         // the launch, so the launch is what the roster is pinned to. Drift is
         // *audited* below, not applied; to run a changed workflow, launch a group.
+        //
+        // #255: set only on a fresh, valid workflow load — the one moment this
+        // function actually knows the roster's structural agent requirement.
+        // Checked against the resolved `max_agents` once every guardrail
+        // override below (including the resume-cap override) has landed.
+        let mut capacity: Option<workflow::CapacityRecommendation> = None;
         if guardrails.advanced_orchestrator && launch == Launch::Fresh {
             // Three outcomes, and only the first changes anything:
             //   - a valid `.loomux/workflow.yml` → its blocks ARE the roster;
@@ -4856,11 +4862,19 @@ impl OrchRegistry {
             //     the human the same findings *before* they hit Create.
             match workflow::load_workflow(repo) {
                 Ok(Some(wf)) => {
+                    // #255: derived from the roster + the (optional) merge gate
+                    // while we still hold both — recorded here so a run's capacity
+                    // assumptions are reconstructable from the audit log later, and
+                    // checked against the resolved cap below.
+                    let capacity_rec =
+                        workflow::recommend_capacity(&wf.blocks, wf.gates.get("merge"));
                     self.audit(&id, "loomux", "workflow-loaded", json!({
                         "path": workflow::WORKFLOW_PATH,
                         "name": wf.name,
                         "blocks": wf.blocks.iter().map(|b| json!({ "id": b.id, "kind": b.kind })).collect::<Vec<_>>(),
                         "gates": wf.gates.keys().collect::<Vec<_>>(),
+                        "min_agents": capacity_rec.minimum,
+                        "recommended_agents": capacity_rec.recommended,
                     }));
                     // The declared merge gate (#222/#197) becomes the `merge_gate`
                     // spec file the gh shim enforces — or, when the file declares
@@ -4882,6 +4896,7 @@ impl OrchRegistry {
                     // Re-run the roster normalization (model defaults follow each
                     // block's *effective* CLI, which the file may have changed).
                     guardrails = guardrails.clamped();
+                    capacity = Some(capacity_rec);
                 }
                 // No workflow file: no gate. Clears a stale one from a previous
                 // launch, so deleting `.loomux/workflow.yml` restores the pre-#222
@@ -4968,6 +4983,27 @@ impl OrchRegistry {
                 } else {
                     persisted.idle_activity_floor_bytes.clamp(1, MAX_IDLE_ACTIVITY_FLOOR_BYTES)
                 };
+            }
+        }
+        // #255: advisory only — never override a cap the human set. A launcher
+        // warning (surfaced from `orch_workflow_preview`, computed the same way)
+        // is meant to catch this *before* Create; this audit record is the durable
+        // trail for a launch that went ahead under a cap the workflow can't run
+        // its designed roster under — e.g. resumed with a persisted cap the file
+        // has since outgrown.
+        if let Some(rec) = capacity {
+            if guardrails.max_agents < rec.minimum {
+                self.audit(&id, "loomux", "max-agents-below-minimum", json!({
+                    "max_agents": guardrails.max_agents,
+                    "minimum": rec.minimum,
+                    "recommended": rec.recommended,
+                    "note": format!(
+                        "max_agents ({}) is below this workflow's minimum ({}) — its merge \
+                         gate plus a worker can never all be live at once without evicting a \
+                         live agent to make room.",
+                        guardrails.max_agents, rec.minimum,
+                    ),
+                }));
             }
         }
         let info = GroupInfo { id: id.clone(), repo: repo.to_string(), guardrails };
@@ -9928,13 +9964,17 @@ pub fn create_orchestration(
 #[tauri::command]
 pub fn orch_workflow_preview(repo: String, agent_cli: String) -> Value {
     let present = workflow::workflow_file_exists(&repo);
-    let (name, blocks, gates, errors) = match workflow::load_workflow(&repo) {
+    let (name, blocks, gates, errors, capacity) = match workflow::load_workflow(&repo) {
         Ok(Some(wf)) => {
             let gates: Vec<String> = wf.gates.keys().cloned().collect();
-            (wf.name, wf.blocks, gates, Vec::new())
+            // #255: same derivation `create_group_ex` records at load time, so the
+            // launcher's warning and the audit trail can never disagree about what
+            // a launch would compute.
+            let capacity = workflow::recommend_capacity(&wf.blocks, wf.gates.get("merge"));
+            (wf.name, wf.blocks, gates, Vec::new(), Some(capacity))
         }
-        Ok(None) => (String::new(), Vec::new(), Vec::new(), Vec::new()),
-        Err(errors) => (String::new(), Vec::new(), Vec::new(), errors),
+        Ok(None) => (String::new(), Vec::new(), Vec::new(), Vec::new(), None),
+        Err(errors) => (String::new(), Vec::new(), Vec::new(), errors, None),
     };
     // Resolve exactly as a launch would: `clamped()` is what fills in an
     // inherited CLI's default model, guarantees the orchestrator block, and drops
@@ -9955,6 +9995,11 @@ pub fn orch_workflow_preview(repo: String, agent_cli: String) -> Value {
         "name": name,
         "errors": errors,
         "gates": gates,
+        // #255: null when there's no declared workflow to derive from (absent or
+        // invalid file) — the launcher has nothing to warn about in that case,
+        // since the group would run the built-in roster.
+        "min_agents": capacity.map(|c| c.minimum),
+        "recommended_agents": capacity.map(|c| c.recommended),
         "blocks": resolved.iter().map(|b| json!({
             "id": b.id,
             "name": b.name,

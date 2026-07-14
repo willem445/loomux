@@ -1236,6 +1236,14 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   user-select: text; word-break: break-word;
 }
 .roster-note { font-size: 11px; line-height: 1.5; color: var(--text-dim); }
+/* #255: max_agents is below what this workflow's merge gate structurally needs
+   for one review round. Advisory, like `.roster-invalid` — the group still
+   launches — so the "Raise to N" button sits right beside the reason, not
+   behind a separate click. */
+.roster-capacity-warning {
+  display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+}
+.roster-capacity-warning .roster-error { flex: 1 1 auto; border-left-color: #6b4a3a; }
 /* Itemized modal body (#219): the quit confirm lists every unsaved buffer. Each item
    wraps on its own, and a long list scrolls INSIDE the dialog rather than pushing the
    buttons off-screen — a confirm whose confirm button you can't reach is a trap. */
