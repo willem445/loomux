@@ -70,6 +70,42 @@ sha2 = "0.10"
 sha1 = "0.10"
 crc = "3"
 
+# YAML for `<repo>/.loomux/workflow.yml` — the declared agent roster (#222).
+#
+# VETTED AGAINST THE GETRANDOM BAN above. Audit run 2026-07-11; reproduce with:
+#
+#   cargo tree -e normal --target all -p serde_norway
+#     serde_norway → indexmap (→ equivalent, hashbrown), itoa, ryu, serde,
+#                    unsafe-libyaml-norway            (no getrandom anywhere)
+#
+# The three getrandom edges in the lock are UNCHANGED by this — they are the
+# pre-existing ones the note above already enumerates (redox-only via dirs;
+# tauri's own; tauri's uuid/codegen chain). Nothing here adds a fourth. New
+# packages: serde_norway, unsafe-libyaml-norway, ryu (indexmap/hashbrown were
+# already in the lock via tauri).
+#
+# WHY NOT `serde_yaml`: dtolnay archived it (0.9.34 ships as `+deprecated`).
+# `serde_norway` is the maintained fork of the same code — same API, same
+# author lineage, still releasing. `serde_yaml_ng` is the other live fork; both
+# sit on the same libyaml transliteration, so the choice came down to which is
+# more actively maintained.
+#
+# WHY NOT HAND-ROLL, given this repo hand-rolls its MCP JSON-RPC and its
+# `.github/agents` frontmatter skim: those parse formats loomux *defines*.
+# `workflow.yml` is written by hand by users, who will reach for block scalars,
+# flow sequences, anchors and comments. A subset parser would not fail on those
+# — it would MISREAD them, and a misread workflow file silently changes which
+# agent gets which prompt. Better a real parser and a strict validation pass
+# (`workflow::parse_workflow`) that names every problem.
+#
+# ATTACK SURFACE, stated plainly: unsafe-libyaml-norway is an unsafe
+# transliteration of libyaml, and it parses a file that comes from the repo. The
+# repo is one whose source code loomux's agents already read and execute, so this
+# does not cross a trust boundary that wasn't already crossed — but it is why
+# the parser's *output* is treated as untrusted (capability closure, id/persona
+# sanitization) rather than merely its input. See doc/design/workflows.md.
+serde_norway = "0.9.42"
+
 # Vendor-neutral GPU metrics on Windows: PDH performance counters give
 # per-engine utilization + dedicated VRAM usage for any WDDM adapter (AMD,
 # Intel, NVIDIA); DXGI reports total VRAM and the adapter name.

@@ -32,9 +32,25 @@ export const fmNewFolder = (root: string, rel: string, name: string): Promise<st
 /** Create an EMPTY file named `name` inside `rel`. Resolves to the new entry's `rel`.
  *  Refuses to clobber — and, crucially, refuses without truncating: an existing file
  *  keeps its contents. It is not opened afterwards; the user's double-click is what
- *  hands it to their default app. */
+ *  hands it to their default app.
+ *
+ *  That refusal is ATOMIC (`create_new(true)`, filemgr.rs), which makes this the way to CLAIM
+ *  a path you believe is free without a TOCTOU window — the workflow pane (#222) creates
+ *  `.loomux/workflow.yml` through it for exactly that reason, so a workflow that appeared
+ *  since the pane opened can never be overwritten by a scaffold. */
 export const fmNewFile = (root: string, rel: string, name: string): Promise<string> =>
   invoke("fm_new_file", { root, rel, name });
+
+/** The machine-readable code the file-MANAGER backend prefixes onto an error (before the first
+ *  ": "), e.g. `exists`, `invalid-name`, `io`. A DIFFERENT set from the file-editor's
+ *  (`errorCode` in fileapi.ts) — `exists` is one only this backend produces, and collapsing it
+ *  through the other parser would report it as "unknown" and lose the one fact a caller needs.
+ *  Returns "" when the error carries no code. */
+export function fmErrorCode(e: unknown): string {
+  const msg = typeof e === "string" ? e : e instanceof Error ? e.message : String(e ?? "");
+  const idx = msg.indexOf(":");
+  return idx > 0 ? msg.slice(0, idx).trim() : "";
+}
 
 /** Rename the entry at `rel` to `name`, in place. Resolves to its new `rel`.
  *  `name` is one path segment, so this can only re-label — never move. */

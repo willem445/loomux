@@ -7,6 +7,7 @@
 //! applies to integration-test targets.
 
 use loomux_lib::orchestration::mcp::dispatch;
+use loomux_lib::orchestration::workflow;
 use loomux_lib::orchestration::{
     add_trusted_folder, autonomy_budget_exhausted, bracketed_paste, classify_human_input,
     claude_permission_mode, cli_ready, copilot_autopilot_prompt_detected, create_orchestration_group,
@@ -23,7 +24,8 @@ use loomux_lib::orchestration::{
     should_notify_paste_held, should_notify_unconfirmed, single_pane_autopilot_flags,
     spawn_rate_exceeded, spawn_request_expired, strip_ansi, submit_confirmed, submit_sequence,
     unconfirmed_delivery_notice, watchdog_should_notify, worktree_cleanup_targets,
-    AttentionItem, Caller, Delivery, Guardrails, HumanInput, NameSource, OrchRegistry, PasteDecision,
+    AttentionItem, Caller, Delivery, Guardrails, HumanInput, Launch, NameSource, OrchRegistry, PasteDecision,
+    PersonaInject,
     PasteGate, Role, TaskPatch, UsageSnapshot, CLAUDE_UNATTENDED_ALLOW, COPILOT_AUTOPILOT_CONFIRM_KEYS,
     COPILOT_GROUP_AUTOPILOT_FLAGS, COPILOT_UNATTENDED_FLAGS, MAX_ATTACHMENT_BYTES,
     PLANNER_READONLY_NOTE,
@@ -31,7 +33,7 @@ use loomux_lib::orchestration::{
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Wall-clock Unix-ms, mirroring the crate-private `now_ms` — the debounce
@@ -56,19 +58,24 @@ fn kickoff_readiness_waits_for_painted_and_quiet_cli() {
     assert!(cli_ready(4096, s(2), s(3)));
 }
 
+/// The built-in 4-block roster on claude with the historic per-class models —
+/// i.e. exactly what a plain launcher run produces (#222). Every block inherits
+/// `agent_cli` and carries no persona, so nothing reaches a command line that
+/// didn't before.
 fn rails() -> Guardrails {
     Guardrails {
         max_agents: 2,
         agent_cli: "claude".into(),
-        worker_model: "sonnet".into(),
-        reviewer_model: "sonnet".into(),
-        orchestrator_model: "opus".into(),
-        planner_model: "opus".into(),
+        blocks: workflow::default_roster(&[
+            (Role::Orchestrator, "", "opus"),
+            (Role::Worker, "", "sonnet"),
+            (Role::Reviewer, "", "sonnet"),
+            (Role::Planner, "", "opus"),
+        ]),
         auto_ops: false,
         idle_kill_minutes: 0,
         max_spawns_per_hour: 0,
         watchdog_stall_minutes: 0,
-        // Per-role CLIs default to inheriting `agent_cli`.
         ..Guardrails::default()
     }
 }
@@ -177,10 +184,12 @@ fn guardrail_clamps_and_sanitizes() {
     let g = Guardrails {
         max_agents: 99,
         agent_cli: "definitely-not-a-cli".into(),
-        worker_model: "sonnet; rm -rf /".into(),
-        reviewer_model: "".into(),
-        orchestrator_model: "opus".into(),
-        planner_model: "".into(),
+        blocks: workflow::default_roster(&[
+            (Role::Orchestrator, "", "opus"),
+            (Role::Worker, "", "sonnet; rm -rf /"),
+            (Role::Reviewer, "", ""),
+            (Role::Planner, "", ""),
+        ]),
         auto_ops: true,
         idle_kill_minutes: 99999,
         max_spawns_per_hour: 9999,
@@ -193,19 +202,14 @@ fn guardrail_clamps_and_sanitizes() {
     assert_eq!(g.max_spawns_per_hour, 240, "spawn-rate cap clamps to the ceiling");
     assert_eq!(g.watchdog_stall_minutes, 1440, "watchdog stall timeout clamps to 24h");
     assert_eq!(g.agent_cli, "claude", "unknown group CLIs fall back to claude explicitly");
-    assert_eq!(g.worker_model, "sonnetrm-rf", "shell metacharacters must be stripped");
-    assert_eq!(g.reviewer_model, "sonnet", "empty model falls back to default");
-    // Reasoning roles (orchestrator, planner) default to the strong tier on Claude.
-    assert_eq!(g.planner_model, "opus", "empty planner model falls back to the reasoning tier");
-    // Copilot's fallback model is "auto" (it picks the best itself), and a
-    // per-role CLI overrides the group default (issue #4).
+    assert_eq!(g.model_for(Role::Worker), "sonnetrm-rf", "shell metacharacters must be stripped");
+    assert_eq!(g.model_for(Role::Reviewer), "sonnet", "empty model falls back to default");
+    // Reasoning classes (orchestrator, planner) default to the strong tier on Claude.
+    assert_eq!(g.model_for(Role::Planner), "opus", "empty planner model falls back to the reasoning tier");
+    // Copilot's fallback model is "auto" (it picks the best itself).
     let g = Guardrails {
         max_agents: 4,
         agent_cli: "copilot".into(),
-        worker_model: "".into(),
-        reviewer_model: "".into(),
-        orchestrator_model: "".into(),
-        planner_model: "".into(),
         auto_ops: false,
         idle_kill_minutes: 0,
         max_spawns_per_hour: 0,
@@ -213,23 +217,28 @@ fn guardrail_clamps_and_sanitizes() {
         ..Guardrails::default()
     }
     .clamped();
-    assert_eq!(g.worker_model, "auto");
-    assert_eq!(g.orchestrator_model, "auto");
-    assert_eq!(g.planner_model, "auto");
-    // A per-role CLI is honored by `cli_for` (empty roles inherit agent_cli);
-    // its model fallback follows the role's *effective* CLI.
+    assert_eq!(g.model_for(Role::Worker), "auto");
+    assert_eq!(g.model_for(Role::Orchestrator), "auto");
+    assert_eq!(g.model_for(Role::Planner), "auto");
+    assert_eq!(g.blocks.len(), 4, "an empty roster is filled with the built-in 4 blocks");
+    // A per-block CLI overrides the group default (issue #4, now a block field);
+    // the model fallback follows the block's *effective* CLI.
     let g = Guardrails {
         max_agents: 4,
         agent_cli: "copilot".into(),
-        worker_cli: "claude".into(),
-        worker_model: "".into(),
+        blocks: workflow::default_roster(&[
+            (Role::Orchestrator, "", ""),
+            (Role::Worker, "claude", ""),
+            (Role::Reviewer, "", ""),
+            (Role::Planner, "", ""),
+        ]),
         ..Guardrails::default()
     }
     .clamped();
-    assert_eq!(g.cli_for(Role::Worker), "claude", "per-role CLI overrides the group default");
-    assert_eq!(g.cli_for(Role::Reviewer), "copilot", "an empty per-role CLI inherits the group default");
-    assert_eq!(g.worker_model, "sonnet", "worker model fallback follows the worker's claude CLI");
-    assert_eq!(g.reviewer_model, "auto", "reviewer model fallback follows the inherited copilot CLI");
+    assert_eq!(g.cli_for(Role::Worker), "claude", "a block's CLI overrides the group default");
+    assert_eq!(g.cli_for(Role::Reviewer), "copilot", "an empty block CLI inherits the group default");
+    assert_eq!(g.model_for(Role::Worker), "sonnet", "worker model fallback follows the worker block's claude CLI");
+    assert_eq!(g.model_for(Role::Reviewer), "auto", "reviewer model fallback follows the inherited copilot CLI");
 }
 
 // ---------- #56: adjustable max_agents on the fly ----------
@@ -306,7 +315,15 @@ fn max_agents_change_survives_launcher_relaunch() {
     let v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
     assert_eq!(v["guardrails"]["max_agents"].as_u64().unwrap(), 9);
     assert!(v["created_ms"].as_u64().is_some(), "created_ms must survive the patch");
-    assert_eq!(v["guardrails"]["worker_model"], json!("sonnet"), "other guardrails must survive the patch");
+    // The in-place patch must not disturb the block roster (#222) — it is the
+    // group's whole agent identity, and set_max_agents rewrites one integer.
+    let worker = v["guardrails"]["blocks"]
+        .as_array()
+        .expect("the roster must survive the patch")
+        .iter()
+        .find(|b| b["id"] == "worker")
+        .expect("the worker block must survive the patch");
+    assert_eq!(worker["model"], json!("sonnet"), "other guardrails must survive the patch");
     // A fresh registry (app restart) + a real launcher relaunch on the same
     // repo: this drives create_group's actual resume path, not a hand-fed
     // group.json. The launcher hardcodes its default cap (rails() = 2), but the
@@ -762,7 +779,7 @@ fn claude_command_minimizes_init_approvals_without_bypass() {
     let (reg, _d) = test_registry();
     let cfg = Path::new("C:/x/cfg.json");
     let gdir = Path::new("C:/data/group");
-    let cmd = reg.build_agent_command("claude", "sonnet", false, cfg, gdir, Path::new("C:/repo"), None, false, false);
+    let cmd = reg.build_agent_command("claude", "sonnet", false, cfg, gdir, Path::new("C:/repo"), None, false, false, &PersonaInject::default());
     assert!(cmd.contains("--model sonnet"));
     assert!(cmd.contains("--permission-mode acceptEdits"));
     assert!(cmd.contains("--strict-mcp-config"), "workers must not see the user's other MCP servers");
@@ -771,7 +788,7 @@ fn claude_command_minimizes_init_approvals_without_bypass() {
     assert!(cmd.contains("--allowedTools mcp__loomux"),
         "loomux tools must be pre-approved so report/list never prompt");
     assert!(!cmd.contains("Bash(git"), "git is not pre-approved for a non-auto_ops worker");
-    let cmd = reg.build_agent_command("claude", "sonnet", true, cfg, gdir, Path::new("C:/repo"), None, false, false);
+    let cmd = reg.build_agent_command("claude", "sonnet", true, cfg, gdir, Path::new("C:/repo"), None, false, false, &PersonaInject::default());
     assert!(cmd.contains("--permission-mode auto"),
         "the Auto preset must use Claude Code's native auto permission mode");
     assert!(cmd.contains("\"Bash(git *)\"") && cmd.contains("\"Bash(gh *)\""),
@@ -784,7 +801,7 @@ fn claude_command_minimizes_init_approvals_without_bypass() {
     assert!(!cmd.contains("--disallowedTools"), "non-planner agents get no tool denials");
     // A planner (read_only=true) is denied file writes + git commit/push at
     // the CLI level, even under Auto perms — but keeps gh for the plan comment.
-    let plan = reg.build_agent_command("claude", "opus", true, cfg, gdir, Path::new("C:/repo"), None, false, true);
+    let plan = reg.build_agent_command("claude", "opus", true, cfg, gdir, Path::new("C:/repo"), None, false, true, &PersonaInject::default());
     assert!(plan.contains("--disallowedTools"), "planner must deny tools structurally");
     for denied in ["Edit", "Write", "MultiEdit", "NotebookEdit"] {
         assert!(plan.contains(denied), "planner must deny the {denied} tool");
@@ -811,7 +828,7 @@ fn planner_runs_unattended_regardless_of_auto_ops() {
     let cfg = Path::new("C:/x/cfg.json");
     let gdir = Path::new("C:/data/group");
     // auto_ops = FALSE, read_only = TRUE (a planner in a manual-ops group).
-    let plan = reg.build_agent_command("claude", "opus", false, cfg, gdir, Path::new("C:/repo"), None, false, true);
+    let plan = reg.build_agent_command("claude", "opus", false, cfg, gdir, Path::new("C:/repo"), None, false, true, &PersonaInject::default());
     assert!(plan.contains("--permission-mode auto"),
         "a planner runs unattended (Auto perms) even when the group is not auto_ops — else it deadlocks");
     assert!(plan.contains("\"Bash(gh *)\""),
@@ -822,7 +839,7 @@ fn planner_runs_unattended_regardless_of_auto_ops() {
         "writes/commit/push stay denied structurally — Auto perms don't loosen the read-only contract");
     // By contrast a non-auto_ops WORKER (read_only=false) is unchanged: it
     // stays in acceptEdits with no pre-approved git/gh (the human gates ops).
-    let worker = reg.build_agent_command("claude", "sonnet", false, cfg, gdir, Path::new("C:/repo"), None, false, false);
+    let worker = reg.build_agent_command("claude", "sonnet", false, cfg, gdir, Path::new("C:/repo"), None, false, false, &PersonaInject::default());
     assert!(worker.contains("--permission-mode acceptEdits"),
         "a non-auto_ops worker is unaffected: it still gates ops through acceptEdits");
     assert!(!worker.contains("\"Bash(gh *)\""),
@@ -834,7 +851,7 @@ fn copilot_command_uses_copilot_adapter_flags() {
     let (reg, _d) = test_registry();
     let cfg = Path::new("C:/x/cfg.json");
     let gdir = Path::new("C:/data/group");
-    let cmd = reg.build_agent_command("copilot", "auto", true, cfg, gdir, Path::new("C:/repo"), None, false, false);
+    let cmd = reg.build_agent_command("copilot", "auto", true, cfg, gdir, Path::new("C:/repo"), None, false, false, &PersonaInject::default());
     assert!(cmd.starts_with("copilot "), "selected CLI must actually be launched, not claude");
     assert!(
         cmd.contains("--additional-mcp-config \"@C:/x/cfg.json\""),
@@ -858,22 +875,22 @@ fn copilot_command_uses_copilot_adapter_flags() {
     assert!(cmd.contains("--autopilot"),
         "group copilot workers run in true autopilot mode; the kickoff confirms the consent dialog");
     // Conservative preset keeps the explicit allowlist instead.
-    let cmd = reg.build_agent_command("copilot", "auto", false, cfg, gdir, Path::new("C:/repo"), None, false, false);
+    let cmd = reg.build_agent_command("copilot", "auto", false, cfg, gdir, Path::new("C:/repo"), None, false, false, &PersonaInject::default());
     assert!(!cmd.contains("--allow-all-tools") && !cmd.contains("--autopilot"));
     assert!(cmd.contains("--allow-tool \"shell(git:*)\"") && cmd.contains("--allow-tool \"shell(gh:*)\""));
     // Resume reopens a tracked session via --resume; copilot has no
     // pre-assignable id, so a session without resume adds no session flag.
     let sid = "aabbccdd-1122-4334-8556-77889900aabb";
-    let cmd = reg.build_agent_command("copilot", "auto", true, cfg, gdir, Path::new("C:/repo"), Some(sid), true, false);
+    let cmd = reg.build_agent_command("copilot", "auto", true, cfg, gdir, Path::new("C:/repo"), Some(sid), true, false, &PersonaInject::default());
     assert!(cmd.contains(&format!("--resume {sid}")), "copilot resume must pass --resume, got: {cmd}");
-    let cmd = reg.build_agent_command("copilot", "auto", true, cfg, gdir, Path::new("C:/repo"), Some(sid), false, false);
+    let cmd = reg.build_agent_command("copilot", "auto", true, cfg, gdir, Path::new("C:/repo"), Some(sid), false, false, &PersonaInject::default());
     assert!(!cmd.contains("--resume") && !cmd.contains("--session-id"),
         "a fresh copilot spawn cannot pin a session id");
     // A non-planner copilot agent gets no deny-tool flags.
     assert!(!cmd.contains("--deny-tool"), "non-planner copilot agents get no tool denials");
     // A planner (read_only=true) denies writes + git commit/push even under
     // --allow-all-tools (deny wins in Copilot); gh stays reachable.
-    let plan = reg.build_agent_command("copilot", "auto", true, cfg, gdir, Path::new("C:/repo"), None, false, true);
+    let plan = reg.build_agent_command("copilot", "auto", true, cfg, gdir, Path::new("C:/repo"), None, false, true, &PersonaInject::default());
     assert!(plan.contains("--deny-tool \"write\"") && plan.contains("--deny-tool \"edit\""),
         "planner must deny copilot's write/edit tools, got: {plan}");
     assert!(plan.contains("--deny-tool \"shell(git commit)\"") && plan.contains("--deny-tool \"shell(git push)\""),
@@ -892,7 +909,7 @@ fn copilot_planner_runs_unattended_regardless_of_auto_ops() {
     let cfg = Path::new("C:/x/cfg.json");
     let gdir = Path::new("C:/data/group");
     // auto_ops = FALSE, read_only = TRUE (a planner in a manual-ops group).
-    let plan = reg.build_agent_command("copilot", "auto", false, cfg, gdir, Path::new("C:/repo"), None, false, true);
+    let plan = reg.build_agent_command("copilot", "auto", false, cfg, gdir, Path::new("C:/repo"), None, false, true, &PersonaInject::default());
     assert!(plan.contains("--allow-all-tools") && plan.contains("--allow-all-paths"),
         "a non-auto_ops copilot planner must run unattended (all tools/paths), else it deadlocks: {plan}");
     assert!(plan.contains("--autopilot"),
@@ -903,7 +920,7 @@ fn copilot_planner_runs_unattended_regardless_of_auto_ops() {
         "gh stays allowed so the copilot planner can post its plan comment unattended");
     // A non-auto_ops copilot WORKER (read_only=false) is unchanged: it keeps
     // the conservative interactive preset (no allow-all).
-    let worker = reg.build_agent_command("copilot", "auto", false, cfg, gdir, Path::new("C:/repo"), None, false, false);
+    let worker = reg.build_agent_command("copilot", "auto", false, cfg, gdir, Path::new("C:/repo"), None, false, false, &PersonaInject::default());
     assert!(!worker.contains("--allow-all-tools") && !worker.contains("--autopilot"),
         "a non-auto_ops copilot worker stays interactive — only planners run unattended");
 }
@@ -954,7 +971,7 @@ fn single_pane_flags_reuse_the_group_path_atoms() {
 
     // Claude: permission mode + the shared git/gh allowlist constant.
     let group_claude =
-        reg.build_agent_command("claude", "sonnet", true, cfg, gdir, Path::new("C:/repo"), None, false, false);
+        reg.build_agent_command("claude", "sonnet", true, cfg, gdir, Path::new("C:/repo"), None, false, false, &PersonaInject::default());
     let single_claude = single_pane_autopilot_flags("claude");
     assert!(single_claude.contains(&format!("--permission-mode {}", claude_permission_mode(true))));
     assert!(group_claude.contains(&format!("--permission-mode {}", claude_permission_mode(true))));
@@ -964,7 +981,7 @@ fn single_pane_flags_reuse_the_group_path_atoms() {
     // Copilot: single-pane uses the allow-all atom; the group path uses the
     // group-autopilot atom, which is that same allow-all atom PLUS --autopilot.
     let group_copilot =
-        reg.build_agent_command("copilot", "auto", true, cfg, gdir, Path::new("C:/repo"), None, false, false);
+        reg.build_agent_command("copilot", "auto", true, cfg, gdir, Path::new("C:/repo"), None, false, false, &PersonaInject::default());
     let single_copilot = single_pane_autopilot_flags("copilot");
     assert_eq!(single_copilot, COPILOT_UNATTENDED_FLAGS);
     assert!(group_copilot.contains(COPILOT_GROUP_AUTOPILOT_FLAGS),
@@ -1004,8 +1021,8 @@ fn copilot_autopilot_posture_splits_group_from_single_pane() {
     let (reg, _d) = test_registry();
     let cfg = Path::new("C:/x/cfg.json");
     let gdir = Path::new("C:/data/group");
-    let worker = reg.build_agent_command("copilot", "auto", true, cfg, gdir, Path::new("C:/repo"), None, false, false);
-    let planner = reg.build_agent_command("copilot", "auto", false, cfg, gdir, Path::new("C:/repo"), None, false, true);
+    let worker = reg.build_agent_command("copilot", "auto", true, cfg, gdir, Path::new("C:/repo"), None, false, false, &PersonaInject::default());
+    let planner = reg.build_agent_command("copilot", "auto", false, cfg, gdir, Path::new("C:/repo"), None, false, true, &PersonaInject::default());
     assert!(worker.contains("--autopilot") && planner.contains("--autopilot"),
         "group-mode unattended copilot spawns enter true autopilot mode");
 }
@@ -1164,7 +1181,7 @@ fn build_agent_command_full_line_snapshots() {
     let wd = Path::new("C:/repo");
     // signature: (cli, model, auto_ops, cfg, group_dir, workdir, session, resume, read_only)
     let cmd = |cli, model, auto_ops, read_only| {
-        reg.build_agent_command(cli, model, auto_ops, cfg, gdir, wd, None, false, read_only)
+        reg.build_agent_command(cli, model, auto_ops, cfg, gdir, wd, None, false, read_only, &PersonaInject::default())
     };
 
     // Claude worker, auto_ops ON → native Auto mode + git/gh pre-approval.
@@ -1228,21 +1245,28 @@ fn build_agent_command_full_line_snapshots() {
     );
 }
 
-/// Split a shell command line into argv, honoring double quotes (the only
-/// quoting `build_agent_command` emits). `--add-dir "C:/a b"` → two tokens;
-/// `@"C:/x"` → `@C:/x`; `"Bash(git *)"` → one token with its inner space.
+/// Split a shell command line into argv, honoring the two quotings
+/// `build_agent_command` emits. Double quotes wrap paths and tool patterns
+/// (`--add-dir "C:/a b"`, `"Bash(git *)"`, `@"C:/x"` → `@C:/x`); single quotes
+/// wrap the `--agents` JSON payload, whose body is full of double quotes
+/// (#222) — which is exactly why that one is single-quoted, in both PowerShell
+/// and POSIX sh.
 fn shell_tokenize(line: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
-    let mut in_quote = false;
+    let mut quote: Option<char> = None;
     let mut started = false; // distinguishes "" (empty token) from whitespace
     for c in line.chars() {
         match c {
-            '"' => {
-                in_quote = !in_quote;
+            '"' | '\'' if quote.is_none() => {
+                quote = Some(c);
                 started = true;
             }
-            ' ' | '\t' if !in_quote => {
+            _ if quote == Some(c) => {
+                quote = None;
+                started = true;
+            }
+            ' ' | '\t' if quote.is_none() => {
                 if started {
                     out.push(std::mem::take(&mut cur));
                     started = false;
@@ -1270,7 +1294,7 @@ fn build_agent_argv_snapshots() {
     let gdir = Path::new("C:/data/group");
     let wd = Path::new("C:/repo");
     let argv =
-        |cli, model, auto_ops, read_only| reg.build_agent_argv(cli, model, auto_ops, cfg, gdir, wd, None, false, read_only);
+        |cli, model, auto_ops, read_only| reg.build_agent_argv(cli, model, auto_ops, cfg, gdir, wd, None, false, read_only, &PersonaInject::default());
 
     // Claude worker, auto_ops ON. Note the quote-free literal tool tokens.
     assert_eq!(
@@ -1314,23 +1338,45 @@ fn build_agent_argv_matches_command_line() {
     let sid = "11111111-2222-3333-4444-555555555555";
     let sessions: [(Option<&str>, bool); 3] =
         [(None, false), (Some(sid), false), (Some(sid), true)];
+    // The matrix now includes the #222 persona flags. The `--agents` payload is
+    // the only token loomux single-quotes, and it is stuffed with double quotes,
+    // spaces and escapes — so it is by far the most likely place for the two
+    // forms to drift.
+    let personas: [PersonaInject; 4] = [
+        PersonaInject::default(),
+        PersonaInject {
+            claude_agents_json: Some(
+                r#"{"rev-sec":{"description":"Security review","prompt":"Look for authz holes.\nNothing else."}}"#
+                    .to_string(),
+            ),
+            claude_agent: Some("rev-sec".into()),
+            ..PersonaInject::default()
+        },
+        PersonaInject { copilot_agent: Some("repo-worker".into()), ..PersonaInject::default() },
+        PersonaInject {
+            extra_allow: vec!["Bash(make:*)".into(), "mcp__probe".into()],
+            ..PersonaInject::default()
+        },
+    ];
     for cli in ["claude", "copilot", "totally-unknown-cli"] {
         for auto_ops in [false, true] {
             for read_only in [false, true] {
                 for (session, resume) in sessions {
-                    let line = reg.build_agent_command(
-                        cli, "m", auto_ops, cfg, gdir, wd, session, resume, read_only,
-                    );
-                    let argv = reg.build_agent_argv(
-                        cli, "m", auto_ops, cfg, gdir, wd, session, resume, read_only,
-                    );
-                    assert_eq!(
-                        shell_tokenize(&line),
-                        argv,
-                        "argv must equal the tokenized command line for \
-                         cli={cli} auto_ops={auto_ops} read_only={read_only} \
-                         session={session:?} resume={resume}\n  line: {line}"
-                    );
+                    for persona in &personas {
+                        let line = reg.build_agent_command(
+                            cli, "m", auto_ops, cfg, gdir, wd, session, resume, read_only, persona,
+                        );
+                        let argv = reg.build_agent_argv(
+                            cli, "m", auto_ops, cfg, gdir, wd, session, resume, read_only, persona,
+                        );
+                        assert_eq!(
+                            shell_tokenize(&line),
+                            argv,
+                            "argv must equal the tokenized command line for \
+                             cli={cli} auto_ops={auto_ops} read_only={read_only} \
+                             session={session:?} resume={resume} persona={persona:?}\n  line: {line}"
+                        );
+                    }
                 }
             }
         }
@@ -1470,6 +1516,7 @@ fn copilot_group_resumes_a_recorded_session() {
         .spawn_agent_ex(
             &g.id,
             Role::Worker,
+            None,
             "resumed",
             "follow-up",
             false,
@@ -1484,7 +1531,7 @@ fn copilot_group_resumes_a_recorded_session() {
     // A mangled id is rejected rather than silently resuming the wrong one.
     assert!(reg
         .spawn_agent_ex(
-            &g.id, Role::Worker, "bad", "", false, None, None,
+            &g.id, Role::Worker, None, "bad", "", false, None, None,
             Some("../../etc/passwd".into()),
             Some(dir.path().to_string_lossy().into_owned()),
             None,
@@ -1519,11 +1566,11 @@ fn kickoff_prompt_references_instructions_and_task() {
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
     let w = reg.spawn_agent(&g.id, Role::Worker, "fix-auth", "Fix issue #7", false, None).unwrap();
-    let k = reg.kickoff_prompt(&w, &g, "note");
+    let k = reg.kickoff_prompt(&w, &g, "note", None);
     assert!(k.contains("worker.md"));
     assert!(k.contains("Fix issue #7"));
     let idle = reg.spawn_agent(&g.id, Role::Worker, "idle", "", false, None).unwrap();
-    let k = reg.kickoff_prompt(&idle, &g, "");
+    let k = reg.kickoff_prompt(&idle, &g, "", None);
     assert!(k.contains("No task is assigned yet"));
 }
 
@@ -1534,7 +1581,7 @@ fn planner_kickoff_references_planner_instructions() {
     let p = reg
         .spawn_agent(&g.id, Role::Planner, "plan-47", "Plan issue #47", false, None)
         .unwrap();
-    let k = reg.kickoff_prompt(&p, &g, "note");
+    let k = reg.kickoff_prompt(&p, &g, "note", None);
     assert!(k.contains("planner.md"), "planner kickoff must reference its instructions file");
     assert!(k.contains("a planner agent"), "kickoff must name the planner role");
     assert!(k.contains("Plan issue #47"));
@@ -1556,7 +1603,7 @@ fn planner_explores_read_only_and_never_gets_a_worktree() {
     );
     // The planner's spawn-time read-only note (PLANNER_READONLY_NOTE) is threaded
     // verbatim into its kickoff, communicating the no-code/branches/PRs contract.
-    let k = reg.kickoff_prompt(&p, &g, PLANNER_READONLY_NOTE);
+    let k = reg.kickoff_prompt(&p, &g, PLANNER_READONLY_NOTE, None);
     assert!(
         k.contains("never create branches, worktrees, commits, or PRs"),
         "planner kickoff must carry the read-only containment note, got: {k}"
@@ -1581,41 +1628,58 @@ fn planner_counts_toward_the_live_agent_cap() {
 }
 
 #[test]
-fn per_role_cli_is_pinned_at_spawn_and_persisted() {
+fn per_block_cli_is_pinned_at_spawn_and_persisted() {
     let (reg, _d) = test_registry();
-    // Group default is copilot, but the reviewer role overrides to claude (#4).
+    // Group default is copilot, but the reviewer BLOCK overrides to claude
+    // (#4's per-role CLI, now a block field — #222).
     let rails = Guardrails {
         agent_cli: "copilot".into(),
-        reviewer_cli: "claude".into(),
+        blocks: workflow::default_roster(&[
+            (Role::Orchestrator, "", ""),
+            (Role::Worker, "", ""),
+            (Role::Reviewer, "claude", ""),
+            (Role::Planner, "", ""),
+        ]),
         max_agents: 4,
         ..rails()
     };
     let g = reg.create_group("C:/tmp/mixed-repo", rails).unwrap();
-    // Observable per-role effect: claude agents get a pre-assigned session id;
+    // Observable per-block effect: claude agents get a pre-assigned session id;
     // copilot agents mint their own later, so start without one.
     let worker = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
     let reviewer = reg.spawn_agent(&g.id, Role::Reviewer, "rev", "t", false, None).unwrap();
     assert!(worker.session_id.is_none(), "worker inherits the copilot group default (no pre-assigned session)");
-    assert!(reviewer.session_id.is_some(), "reviewer's per-role claude CLI pre-assigns a session id");
-    // The per-role config is persisted additively to group.json.
+    assert!(reviewer.session_id.is_some(), "the reviewer block's claude CLI pre-assigns a session id");
+    // The roster is persisted to group.json as the block array.
     let gj = fs::read_to_string(reg.state_root().join(&g.id).join("group.json")).unwrap();
     let v: Value = serde_json::from_str(&gj).unwrap();
-    assert_eq!(v["guardrails"]["reviewer_cli"], "claude");
     assert_eq!(v["guardrails"]["agent_cli"], "copilot");
-    assert!(v["guardrails"].get("planner_cli").is_some(), "planner_cli must be persisted");
-    assert!(v["guardrails"].get("planner_model").is_some(), "planner_model must be persisted");
+    let blocks = v["guardrails"]["blocks"].as_array().expect("blocks array persisted");
+    let rev = blocks.iter().find(|b| b["id"] == "reviewer").expect("reviewer block persisted");
+    assert_eq!(rev["cli"], "claude");
+    assert_eq!(rev["kind"], "reviewer");
+    assert!(blocks.iter().any(|b| b["id"] == "planner"), "every block is persisted, not just the overridden one");
 }
 
 #[test]
-fn unknown_per_role_cli_is_rejected_at_spawn() {
+fn unknown_block_cli_is_rejected_at_spawn() {
     let (reg, _d) = test_registry();
-    // A hand-edited group.json could pin an unsupported CLI to a role; the
+    // A hand-edited group.json could pin an unsupported CLI to a block; the
     // spawn must reject it rather than silently downgrade (#4).
-    let rails = Guardrails { worker_cli: "aider".into(), max_agents: 4, ..rails() };
+    let rails = Guardrails {
+        blocks: workflow::default_roster(&[
+            (Role::Orchestrator, "", ""),
+            (Role::Worker, "aider", ""),
+            (Role::Reviewer, "", ""),
+            (Role::Planner, "", ""),
+        ]),
+        max_agents: 4,
+        ..rails()
+    };
     let g = reg.create_group("C:/tmp/bad-cli-repo", rails).unwrap();
     let err = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap_err();
-    assert!(err.contains("unsupported agent CLI"), "unknown per-role CLI must be rejected: {err}");
-    // Roles that inherit the (valid) group default still spawn fine.
+    assert!(err.contains("unsupported agent CLI"), "unknown block CLI must be rejected: {err}");
+    // Blocks that inherit the (valid) group default still spawn fine.
     reg.spawn_agent(&g.id, Role::Reviewer, "rev", "t", false, None).unwrap();
 }
 
@@ -1885,10 +1949,10 @@ fn claude_agents_get_preassigned_resumable_sessions() {
     // The launch command pins the id.
     let cfg = Path::new("C:/x/cfg.json");
     let gdir = Path::new("C:/x/g");
-    let cmd = reg.build_agent_command("claude", "sonnet", false, cfg, gdir, Path::new("C:/repo"), Some(&sid), false, false);
+    let cmd = reg.build_agent_command("claude", "sonnet", false, cfg, gdir, Path::new("C:/repo"), Some(&sid), false, false, &PersonaInject::default());
     assert!(cmd.contains(&format!("--session-id {sid}")));
     // Resume uses --resume instead.
-    let cmd = reg.build_agent_command("claude", "sonnet", false, cfg, gdir, Path::new("C:/repo"), Some(&sid), true, false);
+    let cmd = reg.build_agent_command("claude", "sonnet", false, cfg, gdir, Path::new("C:/repo"), Some(&sid), true, false, &PersonaInject::default());
     assert!(cmd.contains(&format!("--resume {sid}")) && !cmd.contains("--session-id"));
 }
 
@@ -1897,12 +1961,12 @@ fn resume_spawn_requires_valid_session_and_existing_cwd() {
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
     let bad_session = reg.spawn_agent_ex(
-        &g.id, Role::Worker, "w", "follow-up", false, None, None,
+        &g.id, Role::Worker, None, "w", "follow-up", false, None, None,
         Some("; rm -rf /".into()), None, None,
     );
     assert!(bad_session.is_err(), "shell-metachar session ids must be rejected");
     let bad_cwd = reg.spawn_agent_ex(
-        &g.id, Role::Worker, "w", "follow-up", false, None, None,
+        &g.id, Role::Worker, None, "w", "follow-up", false, None, None,
         Some("abc-123".into()), Some("C:/definitely/not/a/dir".into()), None,
     );
     assert!(bad_cwd.unwrap_err().contains("cwd"), "resume cwd must exist");
@@ -1910,7 +1974,7 @@ fn resume_spawn_requires_valid_session_and_existing_cwd() {
     let dir = tempfile::tempdir().unwrap();
     let ok = reg
         .spawn_agent_ex(
-            &g.id, Role::Worker, "w", "follow-up", false, None, None,
+            &g.id, Role::Worker, None, "w", "follow-up", false, None, None,
             Some("abc-123".into()), Some(dir.path().to_string_lossy().into_owned()), None,
         )
         .unwrap();
@@ -2612,7 +2676,7 @@ fn orchestrator_session_restores_full_group_with_fresh_mcp_identity() {
     assert!(req.command.contains("--mcp-config"),
         "restore must re-wire MCP identity — the whole point");
     let g = reg.group(&gid).expect("group re-registered in memory");
-    assert_eq!(g.guardrails.worker_model, "sonnet", "guardrails must be restored from group.json");
+    assert_eq!(g.guardrails.model_for(Role::Worker), "sonnet", "the block roster must be restored from group.json");
     // A second restore while live is refused.
     let err = resume_recorded_session(&reg, &orch_sid, None).unwrap_err();
     assert!(err.contains("already"), "got: {err}");
@@ -4961,7 +5025,7 @@ fn auto_merge_toggle_roundtrip_durable_audited_and_in_kickoff() {
     let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
     let entry = reg.agent(&orch.id).unwrap();
     let info = reg.group(&g.id).unwrap();
-    let kickoff = reg.kickoff_prompt(&entry, &info, "");
+    let kickoff = reg.kickoff_prompt(&entry, &info, "", None);
     assert!(kickoff.contains("auto-merge is ENABLED"), "kickoff must surface auto-merge on, got: {kickoff}");
     // No-op re-enable does not re-audit.
     reg.set_auto_merge(&g.id, true).unwrap();
@@ -6193,7 +6257,7 @@ fn spawn_worktree_cuts_from_default_branch_not_primary_head() {
     // An explicit base stacks a worktree on the feature branch deliberately.
     let stacked = reg
         .spawn_agent_ex(
-            &g.id, Role::Worker, "s", "t", true, Some("agent-y".into()),
+            &g.id, Role::Worker, None, "s", "t", true, Some("agent-y".into()),
             Some("docs/stray".into()), None, None, None,
         )
         .unwrap();
@@ -6771,4 +6835,921 @@ fn disk_tick_notifies_once_per_episode_and_skips_paused() {
     reg.pause_group(&g.id).unwrap();
     reg.disk_tick(low);
     assert_eq!(count_low_disk(), 2, "a paused group is skipped, so no new notice");
+}
+
+#[test]
+fn create_orchestration_group_maps_resume_session_onto_the_workflow_pin() {
+    use std::sync::Arc;
+    // #222 rev-11 F2, at the entry point instead of one layer below it.
+    //
+    // `create_group_ex(.., Launch::Resume)` pins the roster, and tests/workflow.rs
+    // asserts that directly. What THIS asserts is the wiring above it — that the two
+    // real callers land on the right side of the switch. `create_orchestration`
+    // passes no resume session (a human at the launcher, who has just been shown the
+    // roster preview: read the file). `resume_orch_session` passes one (a recorded
+    // session being reopened, which is nobody's consent moment: pin the roster).
+    // Swap those two and the unit test still passes while the feature is inverted.
+    let state = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    let repo_path = repo.path().to_string_lossy().replace('\\', "/");
+    let loomux = repo.path().join(".loomux");
+    fs::create_dir_all(&loomux).unwrap();
+    let declare = |id: &str| {
+        fs::write(
+            loomux.join("workflow.yml"),
+            format!("version: 1\nblocks:\n  - id: {id}\n    kind: reviewer\n"),
+        )
+        .unwrap()
+    };
+
+    let reg = Arc::new(OrchRegistry::new(state.path().to_path_buf()));
+    reg.set_port(45999);
+    let advanced = Guardrails { advanced_orchestrator: true, ..rails() };
+
+    // ── launch: no resume session ⇒ Fresh ⇒ the repo's file is read ──
+    declare("rev-approved");
+    let launched =
+        create_orchestration_group(&reg, &repo_path, advanced.clone(), None, None, 0).unwrap();
+    let gid = launched.group_id.clone();
+    assert!(
+        reg.group(&gid).unwrap().guardrails.block("rev-approved").is_some(),
+        "a launch reads the workflow file — this is the roster the human was shown"
+    );
+
+    // The human ends the group, and the repo moves on underneath them: a `git pull`
+    // brings a reviewer block they have never seen.
+    reg.end_group(&gid, false).unwrap();
+    declare("rev-never-seen");
+
+    // ── resume: a session id ⇒ Resume ⇒ the PERSISTED roster stands ──
+    let (persisted_repo, persisted) = reg.load_group_file(&gid).expect("group.json");
+    create_orchestration_group(
+        &reg,
+        &persisted_repo,
+        persisted,
+        Some("11111111-2222-3333-4444-555555555555".into()),
+        Some(&gid),
+        0,
+    )
+    .expect("a resume must not fail");
+
+    let resumed = reg.group(&gid).unwrap().guardrails;
+    assert!(
+        resumed.block("rev-approved").is_some(),
+        "the resumed group keeps the reviewer its human approved"
+    );
+    assert!(
+        resumed.block("rev-never-seen").is_none(),
+        "a block the repo gained AFTER the launch must not join a resumed group through the \
+         real entry point either — nobody consented to it"
+    );
+
+    // ...and a FRESH launch on that same repo does pick the new one up, so the pin is
+    // "a resume doesn't re-read", not "loomux stopped reading the file".
+    let state2 = tempfile::tempdir().unwrap();
+    let reg2 = Arc::new(OrchRegistry::new(state2.path().to_path_buf()));
+    reg2.set_port(45999);
+    let relaunched =
+        create_orchestration_group(&reg2, &repo_path, advanced, None, None, 0).unwrap();
+    assert!(
+        reg2.group(&relaunched.group_id).unwrap().guardrails.block("rev-never-seen").is_some(),
+        "editing the workflow and launching again must pick up the new roster"
+    );
+}
+
+// ───────── review verdicts + the enforced consensus gate (#222 / #197) ─────────
+//
+// The pure gate semantics live in tests/workflow.rs. These drive the whole stack:
+// a repo's `.loomux/workflow.yml` → the `merge_gate` spec file → verdicts recorded
+// through the real MCP dispatch → the real POSIX `gh` shim, executed. Every claim
+// about what the shim refuses is EXECUTED, not asserted against its source text — a
+// substring search over the script still passes if someone hoists a marker check
+// above the gate block while leaving the comments where they are.
+
+/// The revision the reviewers reviewed, and the one the worker pushes afterwards.
+const HEAD: &str = "a3f9c21";
+const NEW_HEAD: &str = "e1c4861d0f0a";
+
+/// A repo whose workflow declares two focused reviewers and an all-pass merge gate.
+/// `gate_extra` is spliced into `gates.merge` (a threshold, an `also:` clause…).
+fn gated_repo(gate_extra: &str) -> tempfile::TempDir {
+    let td = tempfile::tempdir().unwrap();
+    let dir = td.path().join(".loomux");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("workflow.yml"),
+        format!(
+            "version: 1\nname: focused-review\n\
+             blocks:\n\
+             \x20 - id: worker\n    kind: worker\n\
+             \x20 - id: rev-security\n    kind: reviewer\n    prompt: Security only.\n\
+             \x20 - id: rev-tests\n    kind: reviewer\n    prompt: Test quality only.\n\
+             gates:\n  merge:\n    reviewers: [rev-security, rev-tests]\n{gate_extra}"
+        ),
+    )
+    .unwrap();
+    td
+}
+
+/// A gated group whose verdicts bind to `HEAD` — the test seam standing in for
+/// `gh pr view --json headRefOid`, since no test repo is a real GitHub PR.
+///
+/// The **advanced orchestrator is on**, because that is the only way a repo's
+/// workflow — and therefore its gate — is in play at all (#229): a gate exists
+/// exactly when the human turned the file on for that launch.
+/// `a_gate_exists_only_while_the_advanced_orchestrator_is_on` pins the other side.
+fn gated_group(gate_extra: &str) -> (OrchRegistry, tempfile::TempDir, tempfile::TempDir, String) {
+    let (reg, d) = test_registry();
+    reg.set_pr_head_override(Some(HEAD.into()));
+    let repo = gated_repo(gate_extra);
+    let g = reg
+        .create_group(
+            &repo.path().to_string_lossy(),
+            Guardrails { advanced_orchestrator: true, ..rails() },
+        )
+        .unwrap();
+    let id = g.id.clone();
+    (reg, d, repo, id)
+}
+
+/// Spawn a reviewer bound to `block` and return an MCP caller for it.
+fn reviewer_caller(reg: &OrchRegistry, group: &str, block: &str) -> Caller {
+    let a = reg
+        .spawn_agent_ex(group, Role::Reviewer, Some(block.into()), block, "review #7",
+                        false, None, None, None, None, None)
+        .unwrap();
+    assert_eq!(a.block, block, "the agent must carry its block identity");
+    reg.resolve_token(&a.token).unwrap()
+}
+
+fn record(reg: &OrchRegistry, c: &Caller, pr: &str, verdict: &str, summary: &str) -> Value {
+    dispatch(reg, c, "tools/call", &json!({
+        "name": "review_verdict",
+        "arguments": { "pr": pr, "verdict": verdict, "summary": summary },
+    }))
+    .unwrap()
+}
+
+/// `record` for the happy path: fails the test loudly if the tool rejected the call,
+/// so a broken verdict write can never masquerade as a gate that stayed shut.
+fn recorded(reg: &OrchRegistry, c: &Caller, pr: &str, verdict: &str, summary: &str) {
+    let out = record(reg, c, pr, verdict, summary);
+    assert_eq!(out["isError"], false, "review_verdict rejected the call: {out:?}");
+}
+
+/// Is a POSIX `sh` available to execute the real shim? (Git Bash on Windows.)
+fn have_sh() -> bool {
+    std::process::Command::new("sh")
+        .arg("-c").arg("exit 0").status().map(|s| s.success()).unwrap_or(false)
+}
+
+/// Write the REAL generated `gh` shim, baked to call a fake gh that answers
+/// `pr view` (base + number, and `headRefOid` when asked for it) and `pr checks`
+/// (exit `$FAKE_CHECKS`). Returns the shim path; drive it with `merge_with`.
+fn shim_with_fake_gh(bin: &Path) -> PathBuf {
+    let fake = bin.join("fakegh");
+    fs::write(&fake,
+        "#!/bin/sh\n\
+         if [ \"$1\" = \"pr\" ] && [ \"$2\" = \"view\" ]; then\n\
+         \x20 case \"$*\" in *headRefOid*) printf '%s\\n' \"$FAKE_HEAD\"; exit 0 ;; esac\n\
+         \x20 printf '%s\\n' \"${FAKE_BASE:-main} 7\"; exit 0\n\
+         fi\n\
+         if [ \"$1\" = \"repo\" ] && [ \"$2\" = \"view\" ]; then printf 'main\\n'; exit 0; fi\n\
+         if [ \"$1\" = \"pr\" ] && [ \"$2\" = \"checks\" ]; then exit \"${FAKE_CHECKS:-0}\"; fi\n\
+         printf 'MERGED\\n'; exit 0\n").unwrap();
+    let shim = bin.join("gh");
+    fs::write(&shim, gh_shim_sh(&fake.display().to_string())).unwrap();
+    let _ = std::process::Command::new("sh").arg("-c")
+        .arg(format!("chmod +x '{}' '{}'", fake.display(), shim.display())).status();
+    shim
+}
+
+/// Run the real shim: `gh pr merge 7`, with the PR based on `base`, its head at
+/// `head`, and CI exiting `checks` (0 = all green). Returns (allowed, stderr).
+fn merge_with(shim: &Path, group_dir: &Path, base: &str, head: &str, checks: &str) -> (bool, String) {
+    let out = std::process::Command::new("sh")
+        .arg(shim).args(["pr", "merge", "7"])
+        .env("LOOMUX_GROUP_DIR", group_dir)
+        .env("FAKE_BASE", base)
+        .env("FAKE_HEAD", head)
+        .env("FAKE_CHECKS", checks)
+        .output().expect("run shim");
+    (out.status.success(), String::from_utf8_lossy(&out.stderr).into_owned())
+}
+
+/// The common case: default branch, the reviewed head, green CI.
+fn merge(shim: &Path, group_dir: &Path) -> (bool, String) {
+    merge_with(shim, group_dir, "main", HEAD, "0")
+}
+
+#[test]
+fn a_declared_gate_becomes_the_spec_file_the_shim_reads_and_a_deleted_one_is_cleared() {
+    let (reg, d, repo, gid) = gated_group("    also: [ci-green]\n");
+    let gate_file = d.path().join(&gid).join("merge_gate");
+
+    let text = fs::read_to_string(&gate_file).expect("a declared gates.merge must be written out");
+    assert!(text.contains("require all-pass"), "require: omitted defaults to all-pass");
+    assert!(text.contains("reviewer rev-security") && text.contains("reviewer rev-tests"));
+    assert!(text.contains("also ci-green"));
+    let parsed = reg.merge_gate(&gid).expect("and must read back");
+    assert_eq!(parsed.reviewers, vec!["rev-security", "rev-tests"]);
+
+    // The repo deletes its workflow → the gate is CLEARED. A gate the file no longer
+    // declares must not outlive it, or a group would keep enforcing a rule its repo
+    // has walked back. Relaunched with the toggle still ON, so this pins the *file*
+    // being gone rather than the toggle being off (which clears it for its own
+    // reasons — `a_gate_exists_only_while_the_advanced_orchestrator_is_on`).
+    fs::remove_file(repo.path().join(".loomux").join("workflow.yml")).unwrap();
+    let g2 = reg.create_group(&repo.path().to_string_lossy(),
+        Guardrails { advanced_orchestrator: true, ..rails() }).unwrap();
+    assert_eq!(g2.id, gid, "same repo → same group dir");
+    assert!(!gate_file.is_file(), "no workflow file → no gate → the pre-#222 flow, exactly");
+    assert!(reg.merge_gate(&gid).is_none() && !reg.merge_gate_declared(&gid));
+}
+
+#[test]
+fn a_reviewer_a_gate_names_is_told_its_verdict_is_the_gate() {
+    // A gate that nobody knows to satisfy is a gate that hangs forever. The verdict
+    // contract therefore reaches a reviewer through its BLOCK NOTE — which is where
+    // workflow-specific instructions live (#229 keeps the base templates byte-for-byte
+    // pre-#222, and rightly: a group with no workflow has no gate to explain).
+    let (reg, d, _repo, gid) = gated_group("");
+    let note = fs::read_to_string(d.path().join(&gid).join("rev-security.md")).unwrap();
+    assert!(note.contains("review_verdict"), "the named reviewer is taught the tool");
+    assert!(note.contains("rev-security") && note.contains("rev-tests"),
+        "and told who else the gate is waiting on: {note}");
+    assert!(note.contains("stale"), "and that its pass does not survive a re-push");
+    assert!(note.contains("escalate") && note.contains("beats any number of passes"),
+        "and what a blocking verdict does");
+
+    // A group with NO gate says none of it — prose about a tool that gates nothing is
+    // noise in a file agents are meant to actually read.
+    let (reg2, d2) = test_registry();
+    let plain = tempfile::tempdir().unwrap();
+    let g = reg2.create_group(&plain.path().to_string_lossy(), rails()).unwrap();
+    let reviewer = fs::read_to_string(d2.path().join(&g.id).join("reviewer.md")).unwrap();
+    assert!(!reviewer.contains("review_verdict"),
+        "an ungated group's reviewer must not read gate prose that applies to nothing");
+    let _ = &reg; // keep the gated registry alive for the temp dirs above
+}
+
+#[test]
+fn a_gate_exists_only_while_the_advanced_orchestrator_is_on() {
+    // The gate is part of the workflow, so it lives and dies with the switch that
+    // authorizes the workflow (#229). Two directions, both of which would be bugs:
+    //
+    //  - toggle OFF with a gate-declaring file in the repo → NO gate. The default
+    //    experience has to stay byte-for-byte pre-#222 on the merge path too, and a
+    //    file that arrives with a `git clone` must not be able to gate anything the
+    //    human didn't turn on.
+    //  - a gate declared under an earlier ON launch must not OUTLIVE the toggle: the
+    //    same group dir, relaunched with the toggle off, must come back ungated.
+    let (reg, d) = test_registry();
+    let repo = gated_repo("");
+
+    let g = reg.create_group(&repo.path().to_string_lossy(), rails()).unwrap(); // toggle OFF
+    assert!(!reg.merge_gate_declared(&g.id),
+        "a workflow file the human never turned on must not gate anything");
+    let audit = fs::read_to_string(d.path().join(&g.id).join("audit.jsonl")).unwrap();
+    assert!(audit.contains("workflow-ignored"), "and the trail says the file did nothing: {audit}");
+
+    // Turn it on: the gate appears.
+    let on = Guardrails { advanced_orchestrator: true, ..rails() };
+    let g = reg.create_group(&repo.path().to_string_lossy(), on).unwrap();
+    assert!(reg.merge_gate_declared(&g.id));
+
+    // Turn it off again: the gate goes with it, rather than outliving the consent
+    // that created it.
+    let g = reg.create_group(&repo.path().to_string_lossy(), rails()).unwrap();
+    assert!(!reg.merge_gate_declared(&g.id),
+        "a gate must not survive the toggle that authorized it being turned off");
+}
+
+#[test]
+fn a_resumed_group_keeps_the_gate_it_launched_with() {
+    // #229 pins the ROSTER to the launch: a `git pull` between launch and resume must
+    // not swap a delegate's persona under a session the human already consented to.
+    // The gate is pinned by the same rule, and the argument is stronger for it — a
+    // re-read on resume is precisely how a pulled file could *loosen* the gate a
+    // running session is under (drop a reviewer, delete the clause). The launch-time
+    // gate stands; the drift is audited.
+    let (reg, d, repo, gid) = gated_group("");
+    assert_eq!(reg.merge_gate(&gid).unwrap().reviewers, vec!["rev-security", "rev-tests"]);
+
+    // The repo drops a reviewer from the gate…
+    fs::write(repo.path().join(".loomux").join("workflow.yml"),
+        "version: 1\nblocks:\n  - id: rev-security\n    kind: reviewer\n\
+         gates:\n  merge:\n    reviewers: [rev-security]\n").unwrap();
+    // …and the session RESUMES (guardrails from group.json, as the restore path builds them).
+    let (repo_path, persisted) = reg.load_group_file(&gid).expect("group.json");
+    let g = reg.create_group_ex(&repo_path, persisted, Launch::Resume).unwrap();
+    assert_eq!(reg.merge_gate(&g.id).unwrap().reviewers, vec!["rev-security", "rev-tests"],
+        "a resume must not let a pulled workflow file weaken the gate the session is running under");
+    let audit = fs::read_to_string(d.path().join(&gid).join("audit.jsonl")).unwrap();
+    assert!(audit.contains("workflow-changed-since-launch"),
+        "and the human is told the repo has moved on: {audit}");
+}
+
+#[test]
+fn a_broken_workflow_file_keeps_the_last_known_gate_instead_of_failing_open() {
+    // #225's rule is that a broken workflow file is audited and skipped — the roster
+    // falls back to the built-in one so every agent still spawns. A GATE is the
+    // opposite kind of thing: dropping it because the file stopped parsing would
+    // quietly *widen* what the group's agents may do. A syntax error is not consent
+    // to merge unreviewed code.
+    let (reg, d, repo, gid) = gated_group("");
+    let gate_file = d.path().join(&gid).join("merge_gate");
+    assert!(gate_file.is_file());
+
+    fs::write(repo.path().join(".loomux").join("workflow.yml"),
+        "version: 1\nblocks:\n  - id: x\n    kind: nonsense\n").unwrap();
+    // Relaunched with the advanced orchestrator still ON — the human still wants the
+    // repo's workflow; it is the file that broke, not their mind.
+    let g2 = reg.create_group(&repo.path().to_string_lossy(),
+        Guardrails { advanced_orchestrator: true, ..rails() }).unwrap();
+    assert!(gate_file.is_file(), "a broken workflow file must NOT drop the gate it can no longer read");
+    assert_eq!(reg.merge_gate(&g2.id).unwrap().reviewers, vec!["rev-security", "rev-tests"]);
+    let audit = fs::read_to_string(d.path().join(&gid).join("audit.jsonl")).unwrap();
+    assert!(audit.contains("merge-gate-retained"), "and it must say so, loudly: {audit}");
+}
+
+#[test]
+fn a_verdict_is_attributed_bound_to_a_revision_and_survives_a_restart() {
+    let (reg, d, _repo, gid) = gated_group("");
+    {
+        let sec = reviewer_caller(&reg, &gid, "rev-security");
+        let out = record(&reg, &sec, "https://github.com/o/r/pull/7", "pass",
+                         "Checked authz + path handling on the new gate reader. No injection surface.");
+        assert_eq!(out["isError"], false);
+        let text = out["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("PASS") && text.contains("rev-security"), "the tool echoes the record: {text}");
+        assert!(text.contains("rev-tests"), "and tells the reviewer the gate still waits on its peer: {text}");
+    }
+    // A fresh registry over the same state root — the app restarted.
+    let reg = OrchRegistry::new(d.path().to_path_buf());
+    reg.set_port(45999);
+    reg.set_pr_head_override(Some(HEAD.into()));
+    let v = reg.verdicts(&gid, 7);
+    assert_eq!(v.len(), 1);
+    assert_eq!(v[0].block, "rev-security", "attributed to the BLOCK the gate names");
+    assert!(v[0].agent_id.starts_with("rev-"), "and to the agent instance that recorded it");
+    assert_eq!(v[0].verdict, workflow::Verdict::Pass);
+    assert_eq!(v[0].head, HEAD, "and to the REVISION it reviewed");
+    assert!(v[0].summary.contains("No injection surface"), "the summary is readable downstream");
+    assert!(v[0].ts_ms > 0, "and stamped");
+    assert_eq!(reg.verdict_prs(&gid), vec![7]);
+    // The gate reads it back and is still short — the peer never voted.
+    assert!(reg.gate_status_line(&gid, 7).unwrap().contains("rev-tests"));
+}
+
+#[test]
+fn only_a_reviewer_block_can_record_a_verdict() {
+    // The verdict is what opens a merge gate. A worker (or the orchestrator) able to
+    // file its own PASS would make the whole gate decorative — so the refusal is
+    // enforced in the MCP dispatch AND again in the registry next to the write, and
+    // the tool is not even listed for a class that may not call it.
+    let (reg, _d, co, cw) = setup_mcp();
+    for c in [&co, &cw] {
+        let denied = dispatch(&reg, c, "tools/call", &json!({
+            "name": "review_verdict",
+            "arguments": { "pr": "7", "verdict": "pass", "summary": "looks fine to me" },
+        }))
+        .unwrap();
+        assert_eq!(denied["isError"], true, "{:?} must not be able to record a verdict", c.role);
+        let names: Vec<String> = dispatch(&reg, c, "tools/list", &Value::Null).unwrap()["tools"]
+            .as_array().unwrap().iter()
+            .map(|t| t["name"].as_str().unwrap_or("").to_string()).collect();
+        assert!(!names.contains(&"review_verdict".to_string()),
+            "{:?} must not even see the tool", c.role);
+        assert!(names.contains(&"list_verdicts".to_string()),
+            "but everyone can READ verdicts — the orchestrator needs them to decide");
+    }
+    // Straight at the registry, bypassing the dispatch check entirely.
+    assert!(reg.record_verdict(&cw.group, &cw.agent_id, "7", "pass", "sneaking one in").is_err(),
+        "the authorization must not live only in the JSON shim");
+}
+
+#[test]
+fn a_verdict_tool_call_never_panics_on_bad_input() {
+    let (reg, _d, _repo, gid) = gated_group("");
+    let sec = reviewer_caller(&reg, &gid, "rev-security");
+
+    // An unknown verdict word is REJECTED — never coerced toward `pass`. Verdicts are
+    // lowercase-strict, because the shim's shell `case` cannot be anything else.
+    for bad_word in ["approve", "PASS", "lgtm"] {
+        let bad = record(&reg, &sec, "7", bad_word, "lgtm");
+        assert_eq!(bad["isError"], true, "{bad_word:?} must be rejected");
+        assert!(bad["content"][0]["text"].as_str().unwrap().contains("pass, fail, escalate"));
+    }
+    // A PR ref with no number in it.
+    assert_eq!(record(&reg, &sec, "the one about tabs", "pass", "fine")["isError"], true);
+    // An empty summary: the record has to mean something to the human who reads it.
+    assert_eq!(record(&reg, &sec, "7", "pass", "   ")["isError"], true);
+    // Nothing was written by any of that.
+    assert!(reg.verdicts(&gid, 7).is_empty());
+
+    // Re-recording REPLACES a reviewer's own verdict — the fail → fixed → pass loop.
+    assert_eq!(record(&reg, &sec, "#7", "fail", "unbounded read in the parser")["isError"], false);
+    assert_eq!(reg.verdicts(&gid, 7)[0].verdict, workflow::Verdict::Fail);
+    assert_eq!(record(&reg, &sec, "#7", "pass", "fixed in a3f9c21")["isError"], false);
+    let v = reg.verdicts(&gid, 7);
+    assert_eq!(v.len(), 1, "a reviewer has one live verdict per PR, not a pile");
+    assert_eq!(v[0].verdict, workflow::Verdict::Pass);
+}
+
+#[test]
+fn list_verdicts_reports_the_gate_state_the_shim_will_enforce() {
+    let (reg, _d, _repo, gid) = gated_group("");
+    let sec = reviewer_caller(&reg, &gid, "rev-security");
+    let orch = reg.spawn_agent(&gid, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let co = reg.resolve_token(&orch.token).unwrap();
+
+    recorded(&reg, &sec, "7", "escalate", "auth change I will not sign off on — needs a human");
+    let out = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "list_verdicts", "arguments": { "pr": "7" } })).unwrap();
+    let parsed: Value = serde_json::from_str(out["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(parsed[0]["pr"], 7);
+    assert_eq!(parsed[0]["verdicts"][0]["verdict"], "escalate");
+    assert_eq!(parsed[0]["verdicts"][0]["block"], "rev-security");
+    assert_eq!(parsed[0]["verdicts"][0]["head"], HEAD, "the revision reviewed is readable downstream");
+    assert!(parsed[0]["verdicts"][0]["summary"].as_str().unwrap().contains("needs a human"));
+    assert!(parsed[0]["gate"].as_str().unwrap().contains("BLOCKED"),
+        "an escalate blocks the gate, and the orchestrator must be able to see that");
+}
+
+#[test]
+fn the_rust_gate_status_never_reports_satisfied_when_the_shim_would_refuse() {
+    // The two halves of one gate must agree: a status line saying SATISFIED while the
+    // shim refuses the merge is worse than no status line at all. These are the shapes
+    // where they could have diverged.
+    let (reg, d, _repo, gid) = gated_group("");
+    for block in ["rev-security", "rev-tests"] {
+        let c = reviewer_caller(&reg, &gid, block);
+        recorded(&reg, &c, "7", "pass", "fine");
+    }
+    assert!(reg.gate_status_line(&gid, 7).unwrap().starts_with("merge gate for PR #7: SATISFIED"));
+
+    // The worker pushes → both passes go stale, and the status says so.
+    reg.set_pr_head_override(Some(NEW_HEAD.into()));
+    let s = reg.gate_status_line(&gid, 7).unwrap();
+    assert!(s.contains("NOT YET SATISFIED") && s.contains("EARLIER revision"), "{s}");
+
+    // The head can't be resolved at all → refuse, don't fall back to "a pass is a pass".
+    reg.set_pr_head_override(None);
+    let s = reg.gate_status_line(&gid, 7).unwrap();
+    assert!(s.contains("cannot resolve") && s.contains("refused"), "{s}");
+
+    // A gate file that doesn't parse reads as MALFORMED (every merge refused), never as
+    // "no gate declared" — which is exactly what the shim does with it.
+    fs::write(d.path().join(&gid).join("merge_gate"), "require all-pass\nnonsense here\n").unwrap();
+    assert!(reg.merge_gate(&gid).is_none(), "unparseable");
+    assert!(reg.merge_gate_declared(&gid), "but present, so the shim WILL read it");
+    assert!(reg.gate_status_line(&gid, 7).unwrap().contains("MALFORMED"));
+}
+
+#[test]
+fn gh_shim_script_enforces_the_workflow_merge_gate() {
+    // A source-text pin of the shape. Every behavioural claim is EXECUTED below.
+    let sh = gh_shim_sh("C:/Program Files/GitHub CLI/gh.exe");
+    assert!(sh.contains("loomux_block_wf"), "the workflow gate has its own refusal path");
+    assert!(sh.contains("$LOOMUX_GROUP_DIR/merge_gate"), "keyed off the declared-gate spec file");
+    assert!(sh.contains("verdicts/pr-$num/$g_r"), "reads the per-reviewer verdict files for THIS pr");
+    assert!(sh.contains("headRefOid"), "and binds a verdict to the revision it reviewed");
+    assert!(sh.contains("|| [ -n \"$g_k\" ]"),
+        "the read loop must not drop a final line with no trailing newline — a dropped line makes the gate WEAKER");
+    assert!(sh.contains("set -f"), "no pathname expansion over gate-file tokens");
+    assert!(sh.contains("unknown-condition"), "an also: condition this build can't check refuses");
+    assert!(sh.contains("ci-green") && sh.contains("pr checks"), "ci-green is checked with the real gh");
+    assert!(sh.contains("malformed-gate"), "a truncated/hand-edited gate file refuses, not passes");
+    assert!(sh.contains("fail|escalate"), "a blocking verdict is refused");
+    assert!(sh.contains("merge-gate-workflow-blocked") && sh.contains("merge-gate-workflow-ok"),
+        "every workflow-gate decision is audited");
+    assert!(!sh.contains('\r'), "POSIX shim must stay LF-only (a CRLF #!/bin/sh is broken)");
+}
+
+/// The #197/#151 case, executed end to end: a repo's declared gate, verdicts recorded
+/// through the real MCP tool, and the REAL POSIX shim deciding the merge. Skipped (not
+/// failed) where no POSIX `sh` exists.
+#[test]
+fn gh_shim_harness_refuses_the_merge_until_every_named_reviewer_has_passed() {
+    if !have_sh() {
+        eprintln!("SKIP gh_shim_harness_refuses_the_merge_until_every_named_reviewer_has_passed: no POSIX sh");
+        return;
+    }
+    let (reg, d, _repo, gid) = gated_group("    also: [ci-green]\n");
+    let group_dir = d.path().join(&gid);
+    let bin = tempfile::tempdir().unwrap();
+    let shim = shim_with_fake_gh(bin.path());
+
+    // The human gate is held OPEN throughout (a fresh grant before each attempt), so
+    // anything refused below is refused by the WORKFLOW gate — which also proves a
+    // grant cannot buy its way past it.
+    let regrant = || reg.grant_merge(&gid, "7", None, "human").unwrap();
+    regrant();
+
+    // 1) No verdicts at all → refused, naming both reviewers.
+    let (ok, err) = merge(&shim, &group_dir);
+    assert!(!ok, "a gated PR with no recorded verdict must not merge");
+    assert!(err.contains("rev-security") && err.contains("rev-tests"), "and must say who it waits for: {err}");
+
+    // 2) THE #151 CASE: one reviewer passed, the other is still reviewing → refused.
+    let sec = reviewer_caller(&reg, &gid, "rev-security");
+    recorded(&reg, &sec, "7", "pass", "no security defects");
+    regrant();
+    let (ok, err) = merge(&shim, &group_dir);
+    assert!(!ok, "one approval must never merge a PR whose second reviewer is still running");
+    assert!(err.contains("rev-tests") && !err.contains("rev-security"),
+        "the refusal names the OUTSTANDING reviewer only: {err}");
+
+    // 3) The second reviewer FAILS → refused, and no number of passes outvotes it.
+    let tests = reviewer_caller(&reg, &gid, "rev-tests");
+    recorded(&reg, &tests, "7", "fail", "the new tests assert on mocks and cannot fail");
+    regrant();
+    let (ok, err) = merge(&shim, &group_dir);
+    assert!(!ok, "a fail refuses the merge");
+    assert!(err.contains("rev-tests"), "{err}");
+
+    // 4) …and an escalate blocks exactly like a fail (a refusal to decide is not an approval).
+    recorded(&reg, &tests, "7", "escalate", "this needs a human");
+    regrant();
+    assert!(!merge(&shim, &group_dir).0, "an escalate refuses the merge");
+
+    // 5) Both pass → the workflow gate is satisfied and the (granted) merge goes through.
+    recorded(&reg, &tests, "7", "pass", "tests exercise intent now");
+    regrant();
+    let (ok, err) = merge(&shim, &group_dir);
+    assert!(ok, "with every named reviewer passed and CI green, the merge proceeds: {err}");
+
+    // 6) `also: [ci-green]` is real: same verdicts, red CI → refused.
+    regrant();
+    let (ok, err) = merge_with(&shim, &group_dir, "main", HEAD, "1");
+    assert!(!ok, "ci-green must be enforced, not decorative");
+    assert!(err.contains("ci-green"), "{err}");
+
+    // 7) The gate applies to an INTEGRATION-branch merge too — the reviewers reviewed
+    //    *this PR*, and where it lands doesn't change whether they finished. (The human
+    //    gate stays default-branch-only; this one doesn't.)
+    fs::remove_file(group_dir.join("verdicts").join("pr-7").join("rev-tests")).unwrap();
+    let (ok, err) = merge_with(&shim, &group_dir, "feat/integration", HEAD, "0");
+    assert!(!ok, "a declared gate applies wherever the PR lands");
+    assert!(err.contains("rev-tests"), "{err}");
+
+    // 8) A workflow-gate refusal must not BURN the human's one-time grant: the gate
+    //    exits before the grant is ever consumed, so the human doesn't have to
+    //    re-approve a merge that never happened.
+    recorded(&reg, &tests, "7", "pass", "re-reviewed, fine");
+    assert!(group_dir.join("merge_grants").join("pr-7").is_file(),
+        "the grant from the refused merges above must still be unspent");
+
+    // 9) NO GRANT + gate satisfied: the human merge gate still stands on the default
+    //    branch. The workflow gate composes with it — it never replaces it.
+    fs::remove_file(group_dir.join("merge_grants").join("pr-7")).unwrap();
+    let (ok, err) = merge(&shim, &group_dir);
+    assert!(!ok, "satisfying the workflow gate must not open the HUMAN gate");
+    assert!(err.contains("human gate"), "{err}");
+
+    // The audit trail carries both kinds of refusal, distinctly.
+    let audit = fs::read_to_string(group_dir.join("audit.jsonl")).unwrap_or_default();
+    assert!(audit.contains("merge-gate-workflow-blocked"), "workflow-gate refusals are audited");
+    assert!(audit.contains("merge-gate-workflow-ok"), "and so is a satisfied gate");
+    assert!(audit.contains("\"reason\":\"verdict-outstanding\"") && audit.contains("\"reason\":\"verdict-blocks\""),
+        "with the reason, so a human can reconstruct the run: {audit}");
+}
+
+#[test]
+fn gh_shim_harness_refuses_a_merge_that_moved_past_the_reviewed_revision() {
+    if !have_sh() {
+        eprintln!("SKIP gh_shim_harness_refuses_a_merge_that_moved_past_the_reviewed_revision: no POSIX sh");
+        return;
+    }
+    // A verdict binds to a COMMIT, not to a PR number. The failure this closes: both
+    // reviewers pass #7, the worker pushes "fixed lint" and "one more edge case", and
+    // the gate still reads green over commits nobody reviewed — #197's failure class,
+    // satisfied to the letter and violated in spirit. (GitHub dismisses stale approvals
+    // on new commits for exactly this reason.)
+    let (reg, d, _repo, gid) = gated_group("");
+    let group_dir = d.path().join(&gid);
+    let bin = tempfile::tempdir().unwrap();
+    let shim = shim_with_fake_gh(bin.path());
+
+    // The same two reviewer agents throughout — a re-review is the SAME reviewer
+    // looking again, which is exactly what the gate asks of them.
+    let sec = reviewer_caller(&reg, &gid, "rev-security");
+    let tests = reviewer_caller(&reg, &gid, "rev-tests");
+    recorded(&reg, &sec, "7", "pass", "reviewed the head as it stands");
+    recorded(&reg, &tests, "7", "pass", "reviewed the head as it stands");
+    reg.grant_merge(&gid, "7", None, "human").unwrap();
+    assert!(merge(&shim, &group_dir).0, "as reviewed, the merge proceeds");
+
+    // The worker pushes to the PR branch. Nothing about the recorded verdicts changes —
+    // and that is precisely the point: they no longer describe what would merge.
+    reg.grant_merge(&gid, "7", None, "human").unwrap();
+    let (ok, err) = merge_with(&shim, &group_dir, "main", NEW_HEAD, "0");
+    assert!(!ok, "a pass must NOT survive a re-push — that merges code no reviewer saw");
+    assert!(err.contains("rev-security") && err.contains("rev-tests") && err.contains(NEW_HEAD),
+        "the refusal must name the stale reviewers and the revision they must re-review: {err}");
+    // …and say only what is true. Every reviewer here HAS recorded a verdict, so a
+    // refusal that also claims it is waiting on a verdict from nobody sends the
+    // orchestrator looking for a reviewer that isn't missing.
+    assert!(!err.contains("no verdict yet"),
+        "with every verdict stale and none outstanding, the refusal must not dangle an empty \
+         'no verdict yet from reviewer(s)' clause: {err}");
+    assert!(err.contains("EARLIER revision"), "{err}");
+
+    // One reviewer re-reviews the new head: still short (the other is stale).
+    reg.set_pr_head_override(Some(NEW_HEAD.into()));
+    recorded(&reg, &sec, "7", "pass", "re-reviewed the two new commits");
+    reg.grant_merge(&gid, "7", None, "human").unwrap();
+    let (ok, err) = merge_with(&shim, &group_dir, "main", NEW_HEAD, "0");
+    assert!(!ok, "one refreshed pass is not two");
+    assert!(err.contains("rev-tests") && !err.contains("rev-security"), "{err}");
+
+    // Both re-review → satisfied again.
+    recorded(&reg, &tests, "7", "pass", "the new commits are covered");
+    reg.grant_merge(&gid, "7", None, "human").unwrap();
+    assert!(merge_with(&shim, &group_dir, "main", NEW_HEAD, "0").0,
+        "re-reviewing the new head clears the gate");
+
+    // And a head loomux cannot resolve refuses outright, rather than falling back to
+    // "a pass is a pass" — the same fail-safe an undeterminable base already takes.
+    reg.grant_merge(&gid, "7", None, "human").unwrap();
+    let (ok, err) = merge_with(&shim, &group_dir, "main", "", "0");
+    assert!(!ok, "an unresolvable head must refuse");
+    assert!(err.contains("head"), "{err}");
+    let audit = fs::read_to_string(group_dir.join("audit.jsonl")).unwrap_or_default();
+    assert!(audit.contains("unresolved-head"), "audited: {audit}");
+}
+
+#[test]
+fn gh_shim_harness_pins_the_gate_above_every_opening_that_could_merge() {
+    if !have_sh() {
+        eprintln!("SKIP gh_shim_harness_pins_the_gate_above_every_opening_that_could_merge: no POSIX sh");
+        return;
+    }
+    // #197 Scope B is about AUTO-merge: "an auto-merge must be structurally impossible
+    // until every required review verdict is recorded PASS". The grant path proves
+    // nothing about that — so drive the autonomous and dangerous-mode openings through
+    // the REAL shim, with zero verdicts recorded. A source-order assertion would still
+    // pass if someone hoisted a marker check above the gate; this cannot.
+    let (reg, d, _repo, gid) = gated_group("");
+    let group_dir = d.path().join(&gid);
+    let bin = tempfile::tempdir().unwrap();
+    let shim = shim_with_fake_gh(bin.path());
+    let marker = |name: &str, on: bool| {
+        let p = group_dir.join(name);
+        if on { fs::write(&p, b"").unwrap() } else { let _ = fs::remove_file(&p); }
+    };
+
+    // Autonomous auto-merge: the blanket opening. Refused — no verdicts.
+    marker("autonomous", true);
+    marker("auto_merge", true);
+    let (ok, err) = merge(&shim, &group_dir);
+    assert!(!ok, "AUTO-MERGE must not merge past an unsatisfied workflow gate (#197 Scope B)");
+    assert!(err.contains("merge gate"), "{err}");
+
+    // Supervised dangerous mode: the human is present and said "you may merge". Still
+    // refused — the human authorized the *merge*, not the reviews.
+    marker("autonomous", false);
+    marker("auto_merge", false);
+    marker("dangerous_mode", true);
+    let (ok, err) = merge(&shim, &group_dir);
+    assert!(!ok, "supervised dangerous mode must not merge past an unsatisfied workflow gate");
+    assert!(err.contains("merge gate"), "{err}");
+
+    // Satisfy the gate, and the autonomous opening works exactly as it did before — the
+    // workflow gate is an ADDITIONAL condition, not a replacement for what sits below it.
+    marker("dangerous_mode", false);
+    marker("autonomous", true);
+    marker("auto_merge", true);
+    for block in ["rev-security", "rev-tests"] {
+        let c = reviewer_caller(&reg, &gid, block);
+        recorded(&reg, &c, "7", "pass", "reviewed");
+    }
+    assert!(merge(&shim, &group_dir).0, "a satisfied gate hands off to the openings below it");
+}
+
+#[test]
+fn gh_shim_harness_executes_the_threshold_arm() {
+    if !have_sh() {
+        eprintln!("SKIP gh_shim_harness_executes_the_threshold_arm: no POSIX sh");
+        return;
+    }
+    // The pure spec and its shell mirror can only be *known* to agree if both are
+    // executed. Only `evaluate_merge_gate` exercised thresholds; this runs the shell.
+    let (reg, d, _repo, gid) = gated_group("    require: threshold\n    threshold: 1\n");
+    let group_dir = d.path().join(&gid);
+    let bin = tempfile::tempdir().unwrap();
+    let shim = shim_with_fake_gh(bin.path());
+    assert!(fs::read_to_string(group_dir.join("merge_gate")).unwrap().contains("require threshold 1"));
+    reg.grant_merge(&gid, "7", None, "human").unwrap();
+
+    // Zero of one → refused.
+    assert!(!merge(&shim, &group_dir).0, "a threshold gate with no verdicts refuses");
+
+    // One of one → satisfied, WITHOUT waiting for the reviewer the threshold doesn't
+    // need. That asymmetry against all-pass is the whole meaning of `threshold: N`.
+    let sec = reviewer_caller(&reg, &gid, "rev-security");
+    recorded(&reg, &sec, "7", "pass", "enough for a threshold: 1 gate");
+    assert!(merge(&shim, &group_dir).0, "threshold: 1 is met by one pass");
+
+    // …but a blocking verdict from the reviewer it did NOT need still refuses: blockers
+    // beat approvals, whatever the threshold says.
+    let tests = reviewer_caller(&reg, &gid, "rev-tests");
+    recorded(&reg, &tests, "7", "fail", "the tests cannot fail");
+    reg.grant_merge(&gid, "7", None, "human").unwrap();
+    let (ok, err) = merge(&shim, &group_dir);
+    assert!(!ok, "a fail refuses a threshold gate the passes already met");
+    assert!(err.contains("rev-tests"), "{err}");
+
+    // And a stale pass cannot meet the threshold either.
+    fs::remove_file(group_dir.join("verdicts").join("pr-7").join("rev-tests")).unwrap();
+    reg.grant_merge(&gid, "7", None, "human").unwrap();
+    assert!(!merge_with(&shim, &group_dir, "main", NEW_HEAD, "0").0,
+        "a threshold met only by a pass for an older revision must refuse");
+}
+
+#[test]
+fn gh_shim_harness_refuses_a_truncated_or_malformed_gate_file() {
+    if !have_sh() {
+        eprintln!("SKIP gh_shim_harness_refuses_a_truncated_or_malformed_gate_file: no POSIX sh");
+        return;
+    }
+    // A gate file loomux cannot read in full is not a gate it will enforce in part.
+    // The truncation case is the sharp one: POSIX `read` returns non-zero at
+    // EOF-without-newline, so the final line was silently DROPPED — and a dropped
+    // `reviewer`/`also` line makes the gate WEAKER, the one direction this design says
+    // must never happen. (`|| [ -n "$g_k" ]` is the fix; this executes it.)
+    let (reg, d, _repo, gid) = gated_group("");
+    let group_dir = d.path().join(&gid);
+    let gate_file = group_dir.join("merge_gate");
+    let bin = tempfile::tempdir().unwrap();
+    let shim = shim_with_fake_gh(bin.path());
+
+    let sec = reviewer_caller(&reg, &gid, "rev-security");
+    recorded(&reg, &sec, "7", "pass", "fine");    // rev-tests records NOTHING, ever.
+    let regrant = || reg.grant_merge(&gid, "7", None, "human").unwrap();
+
+    // NO TRAILING NEWLINE on the last `reviewer` line.
+    fs::write(&gate_file, "require all-pass\nreviewer rev-security\nreviewer rev-tests").unwrap();
+    regrant();
+    let (ok, err) = merge(&shim, &group_dir);
+    assert!(!ok, "the last line of a gate file must not be dropped — dropping it merges past a reviewer");
+    assert!(err.contains("rev-tests"), "and rev-tests is still the one being waited on: {err}");
+
+    // Same for a condition — the clause must not vanish with the newline.
+    fs::write(&gate_file, "require all-pass\nreviewer rev-security\nalso ci-green").unwrap();
+    regrant();
+    let (ok, err) = merge_with(&shim, &group_dir, "main", HEAD, "1"); // red CI
+    assert!(!ok, "a trailing-newline-less `also` clause must still be enforced");
+    assert!(err.contains("ci-green"), "{err}");
+
+    // A line loomux cannot parse at all: a hand edit, or the `unrepresentable` poison
+    // line it writes rather than silently dropping a token it cannot serialize.
+    let poison = format!("require all-pass\nreviewer rev-security\n{} unusable-reviewer-id\n",
+        workflow::POISON_KEY);
+    for junk in ["require all-pass\nreviewer rev-security\nsomething else\n", poison.as_str()] {
+        fs::write(&gate_file, junk).unwrap();
+        regrant();
+        let (ok, err) = merge(&shim, &group_dir);
+        assert!(!ok, "an unparseable gate-file line must refuse the merge, not be skipped");
+        assert!(err.contains("cannot parse"), "{err}");
+    }
+    let audit = fs::read_to_string(group_dir.join("audit.jsonl")).unwrap_or_default();
+    assert!(audit.contains("malformed-gate"), "audited: {audit}");
+}
+
+#[test]
+fn gh_shim_harness_refuses_a_merge_with_no_group_dir() {
+    if !have_sh() {
+        eprintln!("SKIP gh_shim_harness_refuses_a_merge_with_no_group_dir: no POSIX sh");
+        return;
+    }
+    // `env -u LOOMUX_GROUP_DIR gh pr merge 7` used to slip a NON-default merge past the
+    // workflow gate entirely, with nothing in the audit (there is no audit log without a
+    // group dir). Every agent pane gets LOOMUX_GROUP_DIR and the shimmed PATH together,
+    // and a human's own shell has neither — so an unset variable at the shim is evasion,
+    // not a supported flow, and the human gate already fails closed on this shape for the
+    // default branch. Symmetry is the honest fix.
+    let bin = tempfile::tempdir().unwrap();
+    let shim = shim_with_fake_gh(bin.path());
+    let run = |args: &[&str]| {
+        let out = std::process::Command::new("sh").arg(&shim).args(args)
+            .env_remove("LOOMUX_GROUP_DIR")
+            .env("FAKE_BASE", "feat/integration").env("FAKE_HEAD", HEAD)
+            .output().unwrap();
+        (out.status.success(), String::from_utf8_lossy(&out.stderr).into_owned())
+    };
+    let (ok, err) = run(&["pr", "merge", "7"]);
+    assert!(!ok, "a merge loomux cannot gate must be refused, not waved through");
+    assert!(err.contains("LOOMUX_GROUP_DIR"), "and it must say why: {err}");
+    // Non-merge gh is untouched — the shim stays out of the way of everything else.
+    assert!(run(&["issue", "list"]).0, "only merges are gated; the rest of gh passes through");
+}
+
+#[test]
+fn an_unknown_also_condition_refuses_the_merge_rather_than_passing_it() {
+    if !have_sh() {
+        eprintln!("SKIP an_unknown_also_condition_refuses_the_merge_rather_than_passing_it: no POSIX sh");
+        return;
+    }
+    // A gate is a safety claim. A clause loomux cannot check must not be silently
+    // dropped — that would turn a stricter-looking workflow file into a weaker one.
+    // (`no-live-agents-on-pr` is #197 Scope A's other condition; this build does not
+    // implement it, so it fails closed and says so — see doc/design/workflows.md.)
+    let (reg, d, _repo, gid) = gated_group("    also: [no-live-agents-on-pr]\n");
+    let group_dir = d.path().join(&gid);
+    let bin = tempfile::tempdir().unwrap();
+    let shim = shim_with_fake_gh(bin.path());
+    for block in ["rev-security", "rev-tests"] {
+        let c = reviewer_caller(&reg, &gid, block);
+        recorded(&reg, &c, "7", "pass", "fine");
+    }
+    reg.grant_merge(&gid, "7", None, "human").unwrap();
+
+    let (ok, err) = merge(&shim, &group_dir);
+    assert!(!ok, "every verdict passed, but an uncheckable condition must still refuse");
+    assert!(err.contains("no-live-agents-on-pr") && err.contains("fails closed"),
+        "and it must name the condition and say why: {err}");
+    let audit = fs::read_to_string(group_dir.join("audit.jsonl")).unwrap_or_default();
+    assert!(audit.contains("unknown-condition"), "audited, never silent: {audit}");
+}
+
+#[test]
+fn a_hand_edited_verdict_word_is_read_the_same_way_by_both_halves_of_the_gate() {
+    if !have_sh() {
+        eprintln!("SKIP a_hand_edited_verdict_word_is_read_the_same_way_by_both_halves_of_the_gate: no POSIX sh");
+        return;
+    }
+    // ONE verdict-token definition. The shim's `case "$v" in pass)` is a shell case and
+    // is case-sensitive; `Verdict::parse` is lowercase-strict to match. Had Rust
+    // lowercased, an uppercase `PASS` in a verdict file would read as SATISFIED to the
+    // orchestrator (list_verdicts / gate_status_line) while the shim refused the merge —
+    // the two halves of one gate disagreeing about what a verdict is.
+    let (reg, d, _repo, gid) = gated_group("");
+    let group_dir = d.path().join(&gid);
+    let bin = tempfile::tempdir().unwrap();
+    let shim = shim_with_fake_gh(bin.path());
+
+    let sec = reviewer_caller(&reg, &gid, "rev-security");
+    recorded(&reg, &sec, "7", "pass", "fine");
+    // Hand-write rev-tests' verdict with an uppercase word — the shape a human (or an
+    // agent with a shell) would produce.
+    let vf = group_dir.join("verdicts").join("pr-7").join("rev-tests");
+    fs::write(&vf, format!("PASS\n{HEAD}\n1\nrev-9\nlooks good\n")).unwrap();
+    reg.grant_merge(&gid, "7", None, "human").unwrap();
+
+    let (ok, err) = merge(&shim, &group_dir);
+    assert!(!ok, "an unreadable verdict word is NOT a pass");
+    assert!(err.contains("rev-tests"), "{err}");
+    // And Rust agrees, rather than telling the orchestrator the gate is satisfied.
+    assert!(reg.verdicts(&gid, 7).iter().all(|v| v.block != "rev-tests"),
+        "Rust must not read `PASS` as a verdict either");
+    let status = reg.gate_status_line(&gid, 7).unwrap();
+    assert!(status.contains("NOT YET SATISFIED") && status.contains("rev-tests"),
+        "the two halves of the gate must agree on what a verdict is: {status}");
+
+    // The same agreement, on what the gate SAYS rather than on what a verdict is: an
+    // unrecognized `require` value is MALFORMED to both halves. `all-pass` is the strict
+    // rule, so silently falling back to it would look safe — but the shim would then be
+    // enforcing a rule the file does not state, and the two halves would agree only by
+    // luck. Neither guesses.
+    fs::write(group_dir.join("merge_gate"), "require bogus\nreviewer rev-security\nreviewer rev-tests\n").unwrap();
+    reg.grant_merge(&gid, "7", None, "human").unwrap();
+    let (ok, err) = merge(&shim, &group_dir);
+    assert!(!ok, "an unrecognized require value must refuse the merge, not read as all-pass");
+    assert!(err.contains("bogus") && err.contains("all-pass"),
+        "and must name the value it could not read, and what it does understand: {err}");
+    assert!(reg.merge_gate(&gid).is_none(), "Rust reads the same file as unusable");
+    assert!(reg.gate_status_line(&gid, 7).unwrap().contains("MALFORMED"),
+        "and reports it as MALFORMED — every merge refused — not as 'no gate declared'");
+    let audit = fs::read_to_string(group_dir.join("audit.jsonl")).unwrap_or_default();
+    assert!(audit.contains("malformed-gate"), "audited: {audit}");
+}
+
+#[test]
+fn a_group_with_no_workflow_gate_merges_exactly_as_it_did_before() {
+    if !have_sh() {
+        eprintln!("SKIP a_group_with_no_workflow_gate_merges_exactly_as_it_did_before: no POSIX sh");
+        return;
+    }
+    // The back-compat pin: no workflow file → no `merge_gate` → the shim's new block is
+    // skipped entirely and the human gate behaves exactly as it did before #222. A
+    // one-time grant is still the whole story, and no verdict is needed anywhere.
+    let (reg, d) = test_registry();
+    let plain = tempfile::tempdir().unwrap(); // a repo with no .loomux/workflow.yml
+    let g = reg.create_group(&plain.path().to_string_lossy(), rails()).unwrap();
+    let group_dir = d.path().join(&g.id);
+    assert!(!group_dir.join("merge_gate").is_file(), "no workflow → no gate file at all");
+    let bin = tempfile::tempdir().unwrap();
+    let shim = shim_with_fake_gh(bin.path());
+
+    let (ok, err) = merge(&shim, &group_dir);
+    assert!(!ok, "the human gate still closes an ungranted default-branch merge");
+    assert!(err.contains("human gate") && !err.contains("workflow"),
+        "and it is the HUMAN gate's message, not the workflow gate's: {err}");
+    reg.grant_merge(&g.id, "7", None, "human").unwrap();
+    assert!(merge(&shim, &group_dir).0, "a granted merge goes through with no verdict recorded anywhere");
+    // An integration-branch merge is still ungated by the human gate, as always.
+    assert!(merge_with(&shim, &group_dir, "feat/x", HEAD, "0").0,
+        "and a non-default merge still passes straight through");
 }

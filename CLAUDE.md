@@ -58,7 +58,7 @@ CI) — match the surrounding style instead of reformatting.
 - Backend: unit tests inline under `#[cfg(test)]` only if they don't link the
   full lib; otherwise integration tests (constraint 4). Orchestration logic is
   covered in `src-tauri/tests/orchestration.rs`.
-- `src-tauri/src/orchestration/mod.rs` is ~6k lines — read it selectively
+- `src-tauri/src/orchestration/mod.rs` is ~11k lines — read it selectively
   (grep for the function/struct), not top to bottom.
 - Comments in this codebase explain *why* (design constraints, Windows quirks,
   issue numbers) — keep that density and style.

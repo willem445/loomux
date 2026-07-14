@@ -15,9 +15,11 @@ import { badgeFor, type OrchRole } from "./orchbadge";
 import { isSpawnRequestExpired } from "./spawnexpiry";
 import { sessionIdFromCommand } from "./panerestore";
 import type { AutonomyState } from "./autonomy";
+import type { WorkflowPreview } from "./roster";
 import { showToast } from "./toast";
 
 export type { AutonomyState };
+export type { WorkflowPreview };
 
 export type { OrchRole };
 export { badgeFor, metaForGroup } from "./orchbadge";
@@ -79,6 +81,13 @@ export interface OrchestratorConfig {
    *  parameter, so `launchOrchestrator` applies this via `setAutonomyBudget`
    *  right after the group is created. */
   autonomyBudgetTokens: number;
+  /** The advanced-orchestrator toggle (#222). OFF (the default) = the group
+   *  ignores `<repo>/.loomux/workflow.yml` entirely and runs the four roles above
+   *  — loomux's behavior before workflows existed, unchanged. ON = the repo's
+   *  workflow file is loaded and validated, and ITS blocks are the roster (the
+   *  per-role picks above then apply only as the CLI a block inherits when it
+   *  names none). A launch choice, persisted with the group. */
+  advancedOrchestrator: boolean;
 }
 
 /** One pane that needs the human, from the backend attention scan. `reason`
@@ -464,6 +473,7 @@ export async function launchOrchestrator(
     idleKillMinutes: config.idleKillMinutes,
     maxSpawnsPerHour: config.maxSpawnsPerHour,
     watchdogStallMinutes: config.watchdogStallMinutes,
+    advancedOrchestrator: config.advancedOrchestrator,
   });
   // #83: create_orchestration has no budget parameter (W1's frozen contract), so
   // apply any launcher-collected autonomous budget via the setter now the group
@@ -559,6 +569,10 @@ export interface AgentSummary {
   id: string;
   name: string;
   role: OrchRole;
+  /** The workflow block this agent IS (#222) — equal to `role` for the built-in
+   *  roster, a declared block id (`rev-security`) for a workflow group. Absent on
+   *  a payload from a backend that predates blocks. */
+  block?: string;
   /** Empty for an idle/ready agent. */
   task: string;
   /** Unix-ms this agent last went idle, or null while it has work. */
@@ -602,3 +616,18 @@ export const groupSummary = (groupId: string): Promise<GroupSummary> =>
  *  first. The backend emits `orch-group-ended` so the panes close. */
 export const endGroup = (groupId: string, cleanupWorktrees: boolean): Promise<EndGroupResult> =>
   invoke<EndGroupResult>("orch_end_group", { groupId, cleanupWorktrees });
+
+// ---------- the advanced orchestrator (#222) ----------
+
+/** What turning the advanced orchestrator ON for `repo` would run: the resolved
+ *  roster from `<repo>/.loomux/workflow.yml`, or every validation finding if the
+ *  file is broken (in which case the group still launches, on the built-in
+ *  roster). Read by the launcher before the human hits Create, so they see the
+ *  blocks — and the repo-authored personas — they are enabling.
+ *
+ *  The backend resolves this through the same load-and-clamp path `create_group`
+ *  uses, so the preview cannot drift from the launch. It never rejects: a missing
+ *  or broken file is a described outcome, not an error. `agentCli` is the group's
+ *  default CLI, which a block with no `cli:` of its own inherits. */
+export const workflowPreview = (repo: string, agentCli: string): Promise<WorkflowPreview> =>
+  invoke<WorkflowPreview>("orch_workflow_preview", { repo, agentCli });

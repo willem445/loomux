@@ -14,11 +14,13 @@
 //! pane, and the audit log (`audit.jsonl`) records the full text.
 
 pub mod mcp;
+pub mod profiles;
+pub mod workflow;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -29,10 +31,29 @@ use tauri::{AppHandle, Emitter, Manager};
 
 use crate::obs::LockExt;
 
-const ORCHESTRATOR_TPL: &str = include_str!("templates/orchestrator.md");
-const WORKER_TPL: &str = include_str!("templates/worker.md");
-const REVIEWER_TPL: &str = include_str!("templates/reviewer.md");
-const PLANNER_TPL: &str = include_str!("templates/planner.md");
+// doc-hidden `pub` so the integration tests can reconstruct the pre-#222
+// rendering of a template and assert loomux still writes exactly that when no
+// workflow is active (`the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was`).
+#[doc(hidden)]
+pub const ORCHESTRATOR_TPL: &str = include_str!("templates/orchestrator.md");
+#[doc(hidden)]
+pub const WORKER_TPL: &str = include_str!("templates/worker.md");
+#[doc(hidden)]
+pub const REVIEWER_TPL: &str = include_str!("templates/reviewer.md");
+#[doc(hidden)]
+pub const PLANNER_TPL: &str = include_str!("templates/planner.md");
+/// Workflow-aware fragments (#222), substituted into the role templates above as
+/// `{{WORKFLOW}}` (orchestrator) and `{{BLOCK_NOTE}}` (worker/reviewer/planner).
+///
+/// They are *fragments*, not templates, for one reason: `render_template` is a
+/// dumb `{{KEY}}` replace with no conditionals, and it should stay that way. So
+/// the conditional lives in Rust (`workflow::roster_is_custom`) and the prose
+/// lives in markdown, where the rest of the prose lives and where it can be read
+/// and reviewed as prose. **Both placeholders resolve to the empty string for the
+/// default roster**, and both sit line-final in their templates, so a group with
+/// no workflow gets instruction files that are byte-for-byte the pre-#222 ones.
+const WORKFLOW_TPL: &str = include_str!("templates/workflow.md");
+const BLOCK_TPL: &str = include_str!("templates/block.md");
 
 /// Read-only containment note handed to a planner at spawn time as its kickoff
 /// "branch note". The worktree denial (spawn cwd logic) and the CLI-level
@@ -124,6 +145,15 @@ pub fn dangerous_mode_notice(on: bool, by_autonomous: bool) -> String {
 /// an undeterminable base fails safe (block). Refusals/allows are appended to the
 /// group's `audit.jsonl` in the backend's line format. Everything else `exec`s the
 /// real gh with no extra work.
+///
+/// **Two independent gates live here (#222/#197).** The *human* gate above is one.
+/// The other is the repo's own **workflow merge gate**: when `.loomux/workflow.yml`
+/// declares `gates.merge`, loomux writes a `merge_gate` spec file into the group
+/// dir and the shim refuses the merge until the named reviewers' recorded verdicts
+/// (`verdicts/pr-<N>/<block>`, written by the `review_verdict` MCP tool) satisfy it.
+/// It is checked **first**, so no grant and no autonomous marker can open it — the
+/// `workflow::evaluate_merge_gate` spec is the pure mirror of that decision. With
+/// no `merge_gate` file the shim behaves exactly as it did before #222.
 #[doc(hidden)] // pub so the integration test can pin the security-critical guards
 pub fn gh_shim_sh(real_gh: &str) -> String {
     // Template uses a placeholder (not format!) so the shell's own `$`/`{}` stay
@@ -146,6 +176,15 @@ loomux_audit() { # $1=action $2=detail-json
 loomux_block() { # $1=reason $2=base $3=pr
   printf '%s\n' "loomux: merge to the default branch requires the human gate — enable auto-merge (autonomous mode) or have the human grant this one merge (board Approve). Open the PR and report to the human; do NOT merge." >&2
   loomux_audit "merge-gate-blocked" "{\"reason\":\"$1\",\"base\":\"$2\",\"pr\":\"$3\"}"
+  exit 1
+}
+# The WORKFLOW merge gate (#222/#197), distinct from the human gate above: this is
+# the repo's own `gates.merge` clause, and it is an ADDITIONAL necessary condition —
+# a human grant, autonomous auto-merge and supervised dangerous mode all sit BELOW
+# it and none of them can open it. $1=reason (audit) $2=human-readable detail.
+loomux_block_wf() { # $1=reason $2=detail
+  printf '%s\n' "loomux: this repo's .loomux/workflow.yml declares a merge gate on PR #$num and it is NOT satisfied — $2. The merge is refused. Reviewers record their outcome with the review_verdict MCP tool (pass | fail | escalate); a fail/escalate from ANY named reviewer refuses the merge whatever the others said. Wait for the reviews, or take it to the human — do NOT work around this." >&2
+  loomux_audit "merge-gate-workflow-blocked" "{\"reason\":\"$1\",\"pr\":\"$num\"}"
   exit 1
 }
 loomux_block_release() { # $1=tag $2=action
@@ -378,6 +417,22 @@ if [ "$is_merge" = "0" ]; then
   exec "$REAL_GH" "$@"
 fi
 
+# A MERGE WITH NO GROUP DIR IS A MERGE loomux CANNOT GATE — refuse it. Every agent
+# pane gets `LOOMUX_GROUP_DIR` and the shimmed PATH together (`agent_pane_env`), and
+# a human's own shell never has the shim on PATH at all — so reaching the shim
+# without the variable means it was unset on the way (`env -u LOOMUX_GROUP_DIR gh pr
+# merge …`), which is evasion, not a supported flow. The human gate already fails
+# closed on this shape for a default-branch merge (no markers, no grant → blocked);
+# without this, an unset variable still slipped a NON-default merge past the workflow
+# gate — with nothing in the audit, because there is no audit log to write to.
+# Symmetry is the honest fix. (This closes the cheap shape only: an agent with a
+# shell can still call the real gh by absolute path. See doc/design/workflows.md →
+# "The bypass surface, honestly".)
+if [ -z "$LOOMUX_GROUP_DIR" ]; then
+  printf '%s\n' "loomux: refusing to merge — LOOMUX_GROUP_DIR is not set, so loomux cannot check this merge against the group's gates. Run gh from your agent pane's normal environment; do NOT unset it." >&2
+  exit 1
+fi
+
 # A raw `gh api` merge has no cheaply-resolvable base ref → fail-safe block.
 if [ "$cmd" = "api" ]; then
   loomux_block "api-merge" "(api)" "?"
@@ -396,8 +451,134 @@ default=$("$REAL_GH" repo view $rf --json defaultBranchRef --jq .defaultBranchRe
 if [ -z "$base" ] || [ -z "$default" ]; then
   loomux_block "unverifiable-base" "$base" "$sel"
 fi
+
+# ── THE WORKFLOW MERGE GATE (#222, closing the loomux half of #197) ───────────
+# When the repo declares `gates.merge`, loomux writes a `merge_gate` spec file into
+# the group dir, and every reviewer's `review_verdict` lands in
+# `verdicts/pr-<N>/<block>` with the verdict word (pass|fail|escalate) as line 1.
+#
+# THREE properties, in the order they are enforced:
+#  1. It runs BEFORE the human-grant / autonomous / dangerous-mode openings below,
+#     so none of them can satisfy it. #197 Scope B asks for an auto-merge to be
+#     "structurally impossible until every required review verdict is recorded
+#     PASS"; a gate that a grant could override would not be that.
+#  2. It applies to EVERY merge of the PR, not only to the default branch. The
+#     declared reviewers reviewed *this PR*; where it lands doesn't change whether
+#     they finished. (The human gate below stays default-branch-only — unchanged.)
+#  3. No `merge_gate` file → this whole block is skipped → byte-for-byte the
+#     pre-#222 flow. Every group without a workflow file is in that case.
+if [ -f "$LOOMUX_GROUP_DIR/merge_gate" ]; then
+  gatef="$LOOMUX_GROUP_DIR/merge_gate"
+  # Without a PR number no verdict can be attributed to this merge → fail closed.
+  [ -n "$num" ] || loomux_block_wf "unresolved-pr" "loomux could not resolve the PR number, so it cannot check the recorded verdicts against it"
+  # THE REVISION THIS MERGE WOULD LAND. A verdict binds to a COMMIT, not to a PR
+  # number: without this, two reviewers pass #7, the worker pushes "fixed lint",
+  # and the gate still reads green over code nobody reviewed — #197's failure class,
+  # and the reason GitHub dismisses stale approvals on new commits. Unresolvable →
+  # refuse, the same fail-safe an undeterminable base takes.
+  cur_head=$("$REAL_GH" pr view $rf "$num" --json headRefOid --jq .headRefOid 2>/dev/null)
+  cur_head=$(printf '%s' "$cur_head" | tr '[:upper:]' '[:lower:]')
+  [ -n "$cur_head" ] || loomux_block_wf "unresolved-head" "loomux could not resolve the PR's current head commit, so it cannot tell whether the recorded verdicts reviewed the code that would merge"
+  # No globbing anywhere below: the gate file's tokens are word-split into `for`
+  # loops, and a security shim should not leave the next reader working out whether
+  # a `*` could reach a filename. (loomux never writes one — sanitize_id /
+  # sanitize_condition reject glob characters — so this is belt, not braces.)
+  set -f
+  g_req="all-pass"; g_thr=0; g_revs=""; g_also=""
+  # `|| [ -n "$g_k" ]` is load-bearing: POSIX `read` returns non-zero at EOF, so a
+  # final line with NO trailing newline would otherwise be silently DROPPED — and a
+  # dropped `reviewer`/`also` line makes the gate WEAKER, which is the one direction
+  # this design says must never happen. A truncated gate file is exactly the case
+  # the malformed-gate check below claims to handle.
+  while read -r g_k g_v g_w || [ -n "$g_k" ]; do
+    case "$g_k" in
+      \#*|'')   : ;;   # comment / blank
+      require)  g_req="$g_v"; [ -n "$g_w" ] && g_thr="$g_w" ;;
+      reviewer) [ -n "$g_v" ] && g_revs="$g_revs $g_v" ;;
+      also)     [ -n "$g_v" ] && g_also="$g_also $g_v" ;;
+      # An unrecognized key is NOT skipped. loomux writes an `unrepresentable` line
+      # when it cannot safely serialize a token (rather than dropping the clause),
+      # and a hand edit or a truncation lands here too. Skipping any of them would
+      # silently drop a requirement from a gate.
+      *) loomux_block_wf "malformed-gate" "the merge gate file contains a line loomux cannot parse ('$g_k') — a gate it cannot read in full is not a gate it will enforce in part. Fix .loomux/workflow.yml and relaunch the group" ;;
+    esac
+  done < "$gatef"
+  # A gate naming nobody, or a threshold with no usable number, is a MALFORMED gate
+  # — refuse rather than wave it through. (loomux only ever writes well-formed gate
+  # files; this is the hand-edited/truncated case.)
+  [ -n "$g_revs" ] || loomux_block_wf "malformed-gate" "the declared merge gate names no reviewers"
+  # The gate's RULE, validated up front. An unrecognized `require` is refused, not
+  # quietly read as all-pass: `all-pass` happens to be the strict one today, so the
+  # silent fallback looked safe — but it means the shim would enforce a rule the file
+  # does not state, and the Rust half already calls this file MALFORMED. Two halves of
+  # one gate must agree about what it says, not merely land on the same answer by luck.
+  case "$g_req" in
+    all-pass) : ;;
+    threshold) case "$g_thr" in ''|*[!0-9]*) g_thr=0 ;; esac
+               [ "$g_thr" -ge 1 ] || loomux_block_wf "malformed-gate" "the declared merge gate says require: threshold but carries no usable threshold number" ;;
+    *) loomux_block_wf "malformed-gate" "the merge gate declares an unrecognized require value ('$g_req') — loomux understands 'all-pass' and 'threshold'. A rule it cannot read is not a rule it will guess at" ;;
+  esac
+  g_pass=0; g_out=""; g_bad=""; g_stale=""
+  for g_r in $g_revs; do
+    g_vf="$LOOMUX_GROUP_DIR/verdicts/pr-$num/$g_r"
+    g_v=""; g_vh=""
+    if [ -f "$g_vf" ]; then
+      g_v=$(head -n1 "$g_vf" 2>/dev/null)                  # line 1: the verdict word
+      g_vh=$(head -n2 "$g_vf" 2>/dev/null | tail -n1)      # line 2: the head it reviewed
+    fi
+    case "$g_v" in
+      # A pass counts ONLY for the revision it reviewed. Recorded against an older
+      # head (or against none) → stale: the branch moved, and what that reviewer
+      # approved is not what would merge.
+      pass)          if [ "$g_vh" = "$cur_head" ]; then g_pass=$((g_pass+1)); else g_stale="$g_stale $g_r"; fi ;;
+      # A blocking verdict is revision-INDEPENDENT: "this PR has a defect" does not
+      # stop being true because the author pushed more code. Re-review clears it.
+      fail|escalate) g_bad="$g_bad $g_r" ;;
+      # No verdict recorded — or one this build cannot read (a hand-edited `PASS`,
+      # say), which is NOT a pass. The Rust `Verdict::parse` is lowercase-strict for
+      # exactly this reason: one token definition, and both halves fail closed on it.
+      *)             g_out="$g_out $g_r" ;;
+    esac
+  done
+  # Blockers beat approvals (#197 A.3): one fail/escalate refuses the merge whatever
+  # the others recorded and whatever the threshold says. Checked before any counting.
+  [ -z "$g_bad" ] || loomux_block_wf "verdict-blocks" "reviewer(s)$g_bad recorded a fail/escalate verdict"
+  # Say only what is TRUE: a gate held up purely by stale verdicts must not also claim
+  # it is waiting on a verdict from nobody, and vice versa. A refusal message is the
+  # only thing the agent reading it has to act on.
+  g_why=""
+  [ -n "$g_out" ] && g_why="no verdict yet from reviewer(s)$g_out"
+  if [ -n "$g_stale" ]; then
+    [ -n "$g_why" ] && g_why="$g_why; "
+    g_why="${g_why}reviewer(s)$g_stale passed an EARLIER revision and must re-review"
+  fi
+  case "$g_req" in
+    threshold)
+      [ "$g_pass" -ge "$g_thr" ] || loomux_block_wf "below-threshold" "only $g_pass of the required $g_thr PASS verdicts cover the PR's current head $cur_head — $g_why" ;;
+    *)
+      # all-pass — THE #151 CASE: a reviewer that has not recorded anything (or whose
+      # pass predates the code that would merge) keeps the gate shut, however loudly
+      # the others approved.
+      [ -z "$g_why" ] || loomux_block_wf "verdict-outstanding" "the PR is now at $cur_head — $g_why" ;;
+  esac
+  # `also:` conditions. ci-green is checked against the real gh; anything this build
+  # does not know how to check FAILS CLOSED — a clause loomux silently ignored would
+  # make a stricter-looking workflow file a weaker one, the worst thing a gate can do.
+  for g_c in $g_also; do
+    case "$g_c" in
+      ci-green)
+        if ! "$REAL_GH" pr checks $rf "$num" >/dev/null 2>&1; then
+          loomux_block_wf "ci-not-green" "the gate requires ci-green and 'gh pr checks $num' is not all-green (failing, still running, or no checks reported)"
+        fi ;;
+      *) loomux_block_wf "unknown-condition" "the gate names the condition '$g_c', which this loomux build does not know how to check — an unknown condition fails closed. Remove it from gates.merge.also, or upgrade loomux" ;;
+    esac
+  done
+  set +f
+  loomux_audit "merge-gate-workflow-ok" "{\"pr\":\"$num\",\"require\":\"$g_req\",\"passes\":$g_pass,\"head\":\"$cur_head\"}"
+fi
+
 if [ "$base" != "$default" ]; then
-  exec "$REAL_GH" "$@"   # integration-branch merge — untouched
+  exec "$REAL_GH" "$@"   # integration-branch merge — untouched by the HUMAN gate
 fi
 # base == default: blanket-allowed while autonomous + auto_merge.
 if [ -n "$LOOMUX_GROUP_DIR" ] && [ -f "$LOOMUX_GROUP_DIR/autonomous" ] && [ -f "$LOOMUX_GROUP_DIR/auto_merge" ]; then
@@ -891,6 +1072,30 @@ const COPILOT_SESSION_POLL: Duration = Duration::from_millis(1000);
 /// Give up watching after this long (copilot never initialized, or crashed).
 const COPILOT_SESSION_TIMEOUT: Duration = Duration::from_secs(90);
 
+/// An agent's **capability class** — the closed enum (#222).
+///
+/// Before the block model this enum *was* an agent's identity: it decided the
+/// persona, the template, the model, the CLI and the capabilities all at once.
+/// Now identity is a [`workflow::BlockId`] and this enum carries only the part
+/// that must stay closed: **what an agent is structurally allowed to do**.
+///
+/// That closure is the security spine of #222. Personas are unbounded data
+/// authored in a repo file; capabilities are not. A workflow file *selects* a
+/// class here — it can never define one, and there is no `read_only: false`
+/// escape hatch. So a repo can declare five reviewers with five prompts and five
+/// models, and it cannot make one of them anything but a reviewer: the deny-flags
+/// (`build_agent_command`), the cwd rule (`spawn_agent_ex`) and the MCP tool
+/// scope (`mcp::tool_defs`) all key off this enum, and it has exactly four
+/// values.
+///
+/// What each class *is* varies, and the enum should not be read as promising more
+/// than it enforces: a planner is structurally read-only ([`Role::is_read_only`] —
+/// real CLI-level denials), while a reviewer's "never pushes" is instruction-
+/// backed, as it was before #222. The guarantee is over which posture a block
+/// gets, not that every posture is a sandbox.
+///
+/// The name `Role` survives because ~72 call sites and the persisted wire
+/// format use it; read it as "capability class".
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
@@ -905,7 +1110,10 @@ pub enum Role {
 }
 
 impl Role {
-    fn prefix(self) -> &'static str {
+    /// Agent-id prefix (`w-3`). Reached through [`workflow::Block::prefix`] at
+    /// the spawn sites — a block's prefix is derived from its class so ids stay
+    /// short and the roster/badge conventions that parse them keep working.
+    pub(crate) fn prefix(self) -> &'static str {
         match self {
             Role::Orchestrator => "orch",
             Role::Worker => "w",
@@ -913,7 +1121,10 @@ impl Role {
             Role::Planner => "plan",
         }
     }
-    fn template(self) -> &'static str {
+    /// The built-in role contract template. A block's persona *layers on* this
+    /// (append) or replaces its body (replace) — but never its
+    /// [`mechanics_core`].
+    pub(crate) fn template(self) -> &'static str {
         match self {
             Role::Orchestrator => ORCHESTRATOR_TPL,
             Role::Worker => WORKER_TPL,
@@ -921,7 +1132,7 @@ impl Role {
             Role::Planner => PLANNER_TPL,
         }
     }
-    fn instructions_file(self) -> &'static str {
+    pub(crate) fn instructions_file(self) -> &'static str {
         match self {
             Role::Orchestrator => "orchestrator.md",
             Role::Worker => "worker.md",
@@ -930,13 +1141,149 @@ impl Role {
         }
     }
     /// Lowercase wire/label name (matches the `Serialize` rename).
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Role::Orchestrator => "orchestrator",
             Role::Worker => "worker",
             Role::Reviewer => "reviewer",
             Role::Planner => "planner",
         }
+    }
+    /// The capability that used to be spelled `role == Role::Planner` inline at
+    /// the spawn site. Now it is a *property of the class*, which is what makes
+    /// "a workflow file can never grant a capability" checkable: there is no
+    /// other way to become read-only, and no way to stop being it.
+    pub fn is_read_only(self) -> bool {
+        matches!(self, Role::Planner)
+    }
+}
+
+/// The **non-overridable loomux mechanics core** for a capability class
+/// (harvested from PR #105, issue #51).
+///
+/// A persona in `mode: replace` swaps the role's *personality/policy* body — it
+/// must NOT be able to strip the functional contract that makes the app work
+/// (the loomux MCP tools, the task board, `report()` discipline, the
+/// spawn/review/plan flow, the branch→PR git discipline). loomux always injects
+/// this core, so a replace persona stays functional no matter what its author
+/// left out. In `append` mode the full built-in template already carries these
+/// mechanics, so the core is only *written* when a replace persona has dropped
+/// the built-in body.
+///
+/// This is the extracted, always-on subset of the built-in templates; splitting
+/// every template into `mechanics + body` files is follow-up work.
+pub(crate) fn mechanics_core(kind: Role) -> String {
+    // Shared spine for every delegate; the orchestrator gets its own.
+    let common = "\
+These loomux mechanics are guaranteed by the app and are NOT optional, whatever your \
+persona says:\n\
+- You act through the loomux MCP tools. `report(status, summary)` (status: progress | \
+done | blocked) is your channel to the orchestrator — report `progress` on start, \
+`blocked` when stuck (say what you need), and `done` with the PR URL. \
+`message_orchestrator(text)` is for questions; `list_agents()` / `get_state()` are \
+read-only context. These tools never need approval; use them, don't ask the human to.\n\
+- Git discipline: work only in your assigned workspace; create your branch off the \
+default branch before changing anything; never commit to the default branch; open a PR \
+with `gh` linking the issue. NEVER merge — the human gates merges.\n\
+- One task per session. Follow-ups and review fixes for your own task are yours; a \
+different task means asking for a fresh agent.";
+    match kind {
+        Role::Orchestrator => "\
+These loomux mechanics are guaranteed by the app and are NOT optional, whatever your \
+persona says:\n\
+- You drive the group through the loomux MCP tools: `spawn_agent` (worker | reviewer | \
+planner, optionally naming a workflow `block`), `send_prompt`, `get_output`, \
+`kill_agent`, `focus_agent`, `rename_agent`; the shared task board via `list_tasks` / \
+`upsert_task` / `remove_task`; and durable state via `get_state` / `set_state`. \
+Guardrails (live-agent cap, per-block CLI + model) are enforced by loomux.\n\
+- Maintain the task board: it is the human's view of the work. Record each agent's \
+`session` id on its task so finished work can be resumed for follow-ups instead of \
+cold-started. Never disturb a busy worker with a new task.\n\
+- Drive the flow: plan → spawn workers/reviewers/planners → branch → PR → review → human \
+merge gate. You never merge; you surface work at the gate for the human.\n\
+- Use `report`/`message_orchestrator` semantics from your delegates as their status \
+channel; keep the human oriented with short summaries."
+            .to_string(),
+        // Red-before-green rides in the core for the same reason the reviewer's duties do
+        // (#236): a `mode: replace` worker persona never reads `worker.md`, and "the tests
+        // would catch it" is precisely the claim that is worthless unevidenced — the
+        // orchestrator is told to treat a `done` without the evidence as not done, so every
+        // worker has to have been told to produce it, however its persona was written.
+        Role::Worker => format!(
+            "{common}\n- Deliverable: a branch → commit → PR with the project's tests green. \
+             Add tests that would fail if the feature regressed — and SHOW that they do: run \
+             them against the base branch (without your change) first, confirm they fail for \
+             the expected reason, and put the command and its failure line in the PR \
+             description. A test nobody has seen fail is not evidence of anything. The exemption \
+             (it rides here too, or a replace-persona worker could never legally ship a docs PR or \
+             a revert): a change with NO new testable behavior — docs/prose-only, a revert, a pure \
+             rename/move the suite already pins, a re-blessed golden fixture — owes instead ONE \
+             LINE in the PR naming which of those it is and why, with the existing suite green. An \
+             unstated absence of evidence is not done; anything else evidences the normal way."
+        ),
+        // The verdict tool belongs in the CORE, not only in `reviewer.md` (#222/#197):
+        // a merge gate names *custom* reviewer blocks, and a custom block with a
+        // `mode: replace` persona never sees the built-in reviewer template — this
+        // core is its whole loomux contract. A reviewer that didn't know to record a
+        // verdict would hold the gate shut forever and nobody would know why.
+        //
+        // The findings-classification duty rides here for the same reason (#222): a
+        // replace persona never reads `reviewer.md`, and a `pass` whose summary hides
+        // the findings it left behind is how the gate opens on a change that still
+        // contradicts its own rationale. Keep the two in lockstep.
+        //
+        // So do the review LANES (#236). A persona is free to narrow a reviewer to one
+        // lane — that is the whole point of a focused roster — but the lanes below are the
+        // BASELINE a repo's reviewers must cover between them: a security/dependency/cost
+        // defect that no block was told to look for is one that no verdict will ever
+        // reflect, and the gate cannot tell the difference between "reviewed and clean" and
+        // "never looked at". `reviewer.md` carries the same list; keep them in lockstep.
+        Role::Reviewer => format!(
+            "{common}\n- You review PRs via `gh` (checking out the PR branch locally is fine); \
+             you do NOT create branches or push. Report findings via `report`/`message_orchestrator`.\n\
+             - Review lanes, in priority order: **correctness** (a real defect with a concrete \
+             failure scenario, verified against the code); **security** — the trust boundaries \
+             the change crosses: which inputs are attacker- or agent-controllable (a repo file, \
+             a PR title, an MCP argument, anything off the network) and where they land (a path \
+             segment, a shell line, rendered HTML, a privileged command); **test quality** — do \
+             the tests test intent, or are they tautologies that cannot fail, and is the \
+             red-before-green evidence (the new tests failing on the base branch) actually there \
+             and actually real (neutralize the change and watch a key test go red — a present \
+             claim is still only a claim); **requirement fit** against the issue; **dependency \
+             hygiene** — a new dependency is permanent and the whole repo carries it, so it must \
+             be argued in the PR and must clear the rules the repo's contributor docs state \
+             (a popular package can violate a platform constraint fatally); **algorithmic cost** \
+             at the sizes the code will really see (name the input size that hurts); **docs**. \
+             If your persona narrows you to one lane, stay in it and say so — but a lane nobody \
+             was assigned is a lane nobody reviewed.\n\
+             - Label every finding `blocking` or `non-blocking` — the orchestrator dispositions each \
+             one before the PR merges and cannot do that from unlabelled prose. A finding that \
+             contradicts the change's OWN stated rationale (the guard the issue asked for is \
+             bypassable; the error the PR promised to raise never fires) is not a nit, however small \
+             the fix: say that the change does not do what it claims. A blocking FINDING means your \
+             VERDICT is `fail` (or `escalate`) — never `pass`. The two words are different things: a \
+             finding's label is your severity rating, a verdict is what the gate reads, and a `pass` \
+             carrying a blocking finding is a contradiction the gate cannot see. It opens, on a \
+             change you just said was wrong.\n\
+             - Record your review outcome with `review_verdict(pr, verdict, summary)` — verdict: \
+             pass | fail | escalate. It is durable, attributed STATE (not a notification): when the \
+             repo's workflow declares a merge gate, loomux refuses `gh pr merge` until every reviewer \
+             it names has recorded a `pass`. `fail` and `escalate` each refuse the merge, and one \
+             blocking verdict beats any number of passes — so never record `pass` to be agreeable or \
+             to unblock a queue, and record nothing until you have actually finished reviewing. Your \
+             verdict is bound to the commit you reviewed: if the author pushes more commits your pass \
+             goes stale and the gate reopens until you review the new head and record again.\n\
+             - A `pass` recorded with findings still open (they can only be non-blocking ones — see \
+             above) must SAY so in its summary (\"pass — 2 non-blocking findings, disposition \
+             pending\"). The verdict is the gate's state, and the gate is read by something that will \
+             merge on it: a summary that reads like a clean bill of health is how review feedback gets \
+             dropped at the merge."
+        ),
+        Role::Planner => format!(
+            "{common}\n- You explore the codebase READ-ONLY and write an implementation plan as a \
+             GitHub issue comment, then `report` and exit. You never write code, branches, \
+             worktrees, or PRs (loomux also denies those at the CLI level)."
+        ),
     }
 }
 
@@ -998,25 +1345,67 @@ impl NameSource {
 /// to Claude (explicitly, in `clamped`, never silently at spawn time).
 pub const SUPPORTED_CLIS: [&str; 2] = ["claude", "copilot"];
 
+/// Which kind of start a `create_group` call is (#222).
+///
+/// It exists for exactly one decision — **does the repo's `.loomux/workflow.yml`
+/// get read?** — and the answer is "on a fresh launch, yes; on a resume, no".
+///
+/// The reason is consent, not caching. The roster the advanced orchestrator runs
+/// is repo-authored, and the moment the human agrees to it is the launcher preview
+/// they saw before hitting Create. A resume is not that moment: nobody is being
+/// shown anything. So a `git pull` (or checking out a contributor's branch) between
+/// launch and resume must not be able to hand a resumed group a reviewer, or a
+/// persona, that its human never approved. The roster that comes back is the one in
+/// `group.json` — the one they approved. Drift against the file on disk is audited
+/// (`workflow-changed-since-launch`), never applied.
+///
+/// Note this is *not* the same question as "does `group.json` already exist" — a
+/// human relaunching a group on a repo they have orchestrated before is a fresh
+/// launch, preview and all, and must pick up a workflow file they have just edited.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Launch {
+    /// The human is at the launcher and has seen the roster preview.
+    Fresh,
+    /// A recorded orchestrator session is being reopened (the session browser).
+    Resume,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Guardrails {
     pub max_agents: u32,
     /// Group-default agent CLI ("claude" | "copilot", see `SUPPORTED_CLIS`).
-    /// A per-role CLI below overrides it; an empty per-role CLI inherits this.
+    /// A block's own `cli` overrides it; an empty block `cli` inherits this.
     /// Kept as the group default so old group.json (pre per-role CLI) and the
     /// launcher's single-CLI path both keep working (issue #4).
     pub agent_cli: String,
-    /// Per-role agent CLI overrides (issue #4, mixed agent types). Empty =
-    /// inherit `agent_cli`. Resolved through `cli_for`; validated at spawn.
-    pub orchestrator_cli: String,
-    pub worker_cli: String,
-    pub reviewer_cli: String,
-    pub planner_cli: String,
-    pub worker_model: String,
-    pub reviewer_model: String,
-    pub orchestrator_model: String,
-    /// Model for the planner role (issue #47). Sanitized like the others.
-    pub planner_model: String,
+    /// **The agent roster, as data (#222).** This replaced the eight flat
+    /// per-role fields (`worker_cli`, `reviewer_model`, …): a group's agents are
+    /// now a list of [`workflow::Block`]s, each with its own id, capability
+    /// class (`kind`), CLI, model and persona. Read from
+    /// `<repo>/.loomux/workflow.yml` when the repo declares one; otherwise
+    /// [`workflow::default_roster`] synthesizes today's fixed 4-block roster
+    /// from the launcher's per-role picks, so a repo with no workflow file
+    /// behaves exactly as it did before blocks existed.
+    ///
+    /// Empty is legal only transiently: `clamped()` fills it with the built-in
+    /// roster, so no code downstream has to handle an agent-less group.
+    pub blocks: Vec<workflow::Block>,
+    /// **The advanced-orchestrator toggle (#222).** Off — the default, and what
+    /// every group.json written before this field existed means — is today's
+    /// experience byte for byte: `<repo>/.loomux/workflow.yml` is not read, not
+    /// validated and not obeyed, and `blocks` stays the roster the launcher's
+    /// per-role picks synthesized. On, the repo's workflow file is loaded in
+    /// `create_group` and *its* blocks become the roster.
+    ///
+    /// The toggle exists because a workflow file is repo-authored input that
+    /// arrives with a `git clone`. Letting one take effect merely by being
+    /// present would mean cloning a repo could change which agents a human's
+    /// group runs, with which personas, before they had ever seen the file — so
+    /// the human opts in per launch, having been shown the roster it resolves to.
+    ///
+    /// A *launch* choice, not a live one: it is persisted with the group so a
+    /// resumed orchestration comes back with the roster it was launched with.
+    pub advanced_orchestrator: bool,
     /// Additionally pre-approve `git`/`gh` shell commands for the group's
     /// agents. Never maps to `--dangerously-skip-permissions`: bypass mode
     /// shows a confirm dialog whose default answer is "exit", which the
@@ -1070,16 +1459,63 @@ impl Guardrails {
         if !SUPPORTED_CLIS.contains(&self.agent_cli.as_str()) {
             self.agent_cli = "claude".into();
         }
-        // Model fallbacks depend on the role's *effective* CLI: Copilot picks
-        // its own best model with "auto"; Claude needs a tier.
-        self.orchestrator_model =
-            sanitize_model(&self.orchestrator_model, default_model(self.cli_for(Role::Orchestrator), Role::Orchestrator));
-        self.worker_model =
-            sanitize_model(&self.worker_model, default_model(self.cli_for(Role::Worker), Role::Worker));
-        self.reviewer_model =
-            sanitize_model(&self.reviewer_model, default_model(self.cli_for(Role::Reviewer), Role::Reviewer));
-        self.planner_model =
-            sanitize_model(&self.planner_model, default_model(self.cli_for(Role::Planner), Role::Planner));
+        // An empty roster means "nobody said otherwise" — the launcher's plain
+        // path, a legacy group.json, a `Guardrails::default()`. Fill it with the
+        // built-in 4-block roster so every downstream lookup finds a block.
+        if self.blocks.is_empty() {
+            self.blocks = workflow::builtin_roster(&self.agent_cli);
+        }
+        // ── roster normalization, in order; each step depends on the last ──
+        //
+        // Steps 1-3 are defensive: `parse_workflow` already enforces all of them
+        // and *tells the author which line is wrong*. They are re-enforced here
+        // (silently — there is no author present) because a roster can also arrive
+        // from a hand-edited group.json, which never meets the parser.
+
+        // 1. Ids are shell tokens and file names. An unusable one would mint an
+        //    agent id like `w-` and write `.md`. Fall back to the class name
+        //    rather than dropping the block — a roster with a hole is worse than
+        //    one with a plainly-named block.
+        for b in &mut self.blocks {
+            b.id = workflow::sanitize_id(&b.id).unwrap_or_else(|| b.kind.as_str().to_string());
+        }
+        // 2. The four class names are RESERVED as ids for their own class. An
+        //    `id: planner, kind: reviewer` block would write its contract to
+        //    `reviewer.md` — the real reviewer's file (see
+        //    `workflow::Block::instructions_file`) — and clobber it.
+        self.blocks
+            .retain(|b| workflow::kind_from_str(&b.id).is_none_or(|reserved| reserved == b.kind));
+        // 3. Ids are unique. A duplicate makes `block(id)` resolve to whichever
+        //    came first and leaves the other permanently unreachable.
+        let mut seen: HashSet<String> = HashSet::new();
+        self.blocks.retain(|b| seen.insert(b.id.clone()));
+        // 4. Every group has exactly one orchestrator, and it is structural — it
+        //    is the pane the human talks to. A workflow file that declares only
+        //    the agents it cares about (three reviewers, a worker) must not leave
+        //    the group without one. This is the only block loomux adds on the
+        //    repo's behalf, and it grants nothing the file didn't already have:
+        //    a group with no orchestrator cannot run at all.
+        //
+        //    Step 2 is what makes this safe to prepend — the id `orchestrator` can
+        //    only belong to an orchestrator-kind block, so "no orchestrator kind"
+        //    implies "no `orchestrator` id", and this cannot mint a duplicate.
+        if !self.blocks.iter().any(|b| b.kind == Role::Orchestrator) {
+            let mut roster = workflow::default_roster(&[(Role::Orchestrator, &self.agent_cli, "")]);
+            roster.append(&mut self.blocks);
+            self.blocks = roster;
+        }
+        for b in &mut self.blocks {
+            b.name = workflow::sanitize_display(&b.name);
+            if b.name.is_empty() {
+                b.name = b.id.clone();
+            }
+            // A block CLI is validated at spawn rather than coerced here, so a
+            // genuinely unknown one is rejected loudly instead of silently
+            // downgraded (issue #4). Only the *effective* model is normalized:
+            // Copilot picks its own best model with "auto"; Claude needs a tier.
+            let cli = if b.cli.trim().is_empty() { self.agent_cli.clone() } else { b.cli.clone() };
+            b.model = sanitize_model(&b.model, default_model(&cli, b.kind));
+        }
         self.idle_kill_minutes = self.idle_kill_minutes.min(MAX_IDLE_KILL_MINUTES);
         self.max_spawns_per_hour = self.max_spawns_per_hour.min(MAX_SPAWNS_PER_HOUR);
         self.watchdog_stall_minutes = self.watchdog_stall_minutes.min(MAX_WATCHDOG_STALL_MINUTES);
@@ -1099,38 +1535,53 @@ impl Guardrails {
         self
     }
 
-    /// The agent CLI a role runs: its per-role override when set, else the
-    /// group default `agent_cli`. May return an unsupported value (a per-role
-    /// CLI is not coerced in `clamped`); `spawn_agent` validates it.
+    /// A block by id. The block *is* the agent's identity (#222) — edges,
+    /// gates, `spawn_agent(block:)` and the roster all reference this.
+    pub fn block(&self, id: &str) -> Option<&workflow::Block> {
+        self.blocks.iter().find(|b| b.id == id)
+    }
+
+    /// The **default block for a capability class** — the first block of that
+    /// kind in roster order.
+    ///
+    /// This is the bridge that kept the ~72 `Role::` sites compiling: code that
+    /// used to ask "what CLI does the reviewer run?" now asks "what CLI does the
+    /// *default reviewer block* run?". With the built-in roster there is exactly
+    /// one block per class, so the answer is unchanged. With a custom workflow
+    /// declaring three reviewers, this is the one an orchestrator gets when it
+    /// spawns `kind: reviewer` without naming a block — the others are opt-in by
+    /// id, which is deliberate: a roster must not silently change what a plain
+    /// `spawn_agent(kind: reviewer)` does.
+    pub fn block_for(&self, kind: Role) -> Option<&workflow::Block> {
+        self.blocks.iter().find(|b| b.kind == kind)
+    }
+
+    /// The agent CLI a capability class's default block runs: the block's own
+    /// `cli`, else the group default `agent_cli`. May return an unsupported
+    /// value (a block CLI is not coerced in `clamped`); the spawn paths validate
+    /// it.
     pub fn cli_for(&self, role: Role) -> &str {
-        let per_role = match role {
-            Role::Orchestrator => &self.orchestrator_cli,
-            Role::Worker => &self.worker_cli,
-            Role::Reviewer => &self.reviewer_cli,
-            Role::Planner => &self.planner_cli,
-        };
-        if per_role.trim().is_empty() {
-            &self.agent_cli
-        } else {
-            per_role
+        match self.block_for(role) {
+            Some(b) => workflow::cli_of(b, &self.agent_cli),
+            None => &self.agent_cli,
         }
     }
 
-    /// The pinned model for a role.
+    /// The model the class's default block runs (already normalized by
+    /// `clamped`, so never empty for a roster that went through it).
     pub fn model_for(&self, role: Role) -> &str {
-        match role {
-            Role::Orchestrator => &self.orchestrator_model,
-            Role::Worker => &self.worker_model,
-            Role::Reviewer => &self.reviewer_model,
-            Role::Planner => &self.planner_model,
+        match self.block_for(role) {
+            Some(b) => workflow::model_of(b, &self.agent_cli),
+            None => default_model(&self.agent_cli, role),
         }
     }
 }
 
-/// Default model for a role on a given CLI. Copilot picks its own best model
-/// ("auto"); on Claude the reasoning-heavy roles (orchestrator, planner) get
-/// the strong tier and the executing roles (worker, reviewer) the mid tier.
-fn default_model(cli: &str, role: Role) -> &'static str {
+/// Default model for a capability class on a given CLI. Copilot picks its own
+/// best model ("auto"); on Claude the reasoning-heavy classes (orchestrator,
+/// planner) get the strong tier and the executing ones (worker, reviewer) the
+/// mid tier.
+pub(crate) fn default_model(cli: &str, role: Role) -> &'static str {
     if cli == "copilot" {
         return "auto";
     }
@@ -1908,6 +2359,95 @@ fn sanitize_model(m: &str, fallback: &str) -> String {
     }
 }
 
+/// `sanitize_model` with no fallback: an empty/unusable model stays empty, which
+/// a block reads as "inherit the class default for my CLI" (`workflow::model_of`).
+/// The workflow parser needs this because a block's *effective* CLI isn't known
+/// until the group default is in hand.
+pub(crate) fn sanitize_model_opt(m: &str) -> String {
+    m.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+        .collect()
+}
+
+/// Read the block roster out of a group.json `guardrails` object (#222).
+///
+/// **Back-compat is the whole job here.** A group.json written before the block
+/// model has no `blocks` array — it has the eight flat per-role fields
+/// (`worker_cli`, `reviewer_model`, …). Reconstruct the same four blocks from
+/// those, so a group launched on 0.8.0 rejoins on this build with exactly the
+/// CLIs and models it had. An empty result is fine: `clamped()` fills it with
+/// the built-in roster.
+fn read_blocks(g: &Value) -> Vec<workflow::Block> {
+    let s = |v: &Value, k: &str| v[k].as_str().unwrap_or("").to_string();
+    if let Some(arr) = g["blocks"].as_array() {
+        return arr
+            .iter()
+            .filter_map(|b| {
+                let id = workflow::sanitize_id(&s(b, "id"))?;
+                // An unrecognized kind is DROPPED, never coerced to worker — the
+                // same rule the workflow parser enforces, applied to persisted
+                // state, because a hand-edited group.json is the other way an
+                // unknown kind could reach a spawn.
+                let kind = workflow::kind_from_str(&s(b, "kind"))?;
+                let name = workflow::sanitize_display(&s(b, "name"));
+                Some(workflow::Block {
+                    name: if name.is_empty() { id.clone() } else { name },
+                    id,
+                    kind,
+                    cli: s(b, "cli"),
+                    model: s(b, "model"),
+                    prompt: b["prompt"].as_str().map(workflow::sanitize_persona),
+                    profile: b["profile"].as_str().map(|p| p.trim().to_string()),
+                    allow: b["allow"]
+                        .as_array()
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|x| x.as_str())
+                                .filter_map(profiles::sanitize_allow)
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                })
+            })
+            .collect();
+    }
+    // Legacy shape (pre-#222).
+    let pins = [
+        (Role::Orchestrator, s(g, "orchestrator_cli"), s(g, "orchestrator_model")),
+        (Role::Worker, s(g, "worker_cli"), s(g, "worker_model")),
+        (Role::Reviewer, s(g, "reviewer_cli"), s(g, "reviewer_model")),
+        (Role::Planner, s(g, "planner_cli"), s(g, "planner_model")),
+    ];
+    if pins.iter().all(|(_, cli, model)| cli.is_empty() && model.is_empty()) {
+        return Vec::new(); // not a legacy file either — clamped() supplies the roster
+    }
+    workflow::default_roster(
+        &pins.iter().map(|(k, c, m)| (*k, c.as_str(), m.as_str())).collect::<Vec<_>>(),
+    )
+}
+
+/// Serialize the block roster for group.json. The inverse of [`read_blocks`];
+/// `block_map_round_trips_through_group_json` pins the pair.
+fn blocks_json(blocks: &[workflow::Block]) -> Value {
+    Value::Array(
+        blocks
+            .iter()
+            .map(|b| {
+                json!({
+                    "id": b.id,
+                    "name": b.name,
+                    "kind": b.kind.as_str(),
+                    "cli": b.cli,
+                    "model": b.model,
+                    "prompt": b.prompt,
+                    "profile": b.profile,
+                    "allow": b.allow,
+                })
+            })
+            .collect(),
+    )
+}
+
 #[derive(Clone)]
 pub struct GroupInfo {
     pub id: String,
@@ -1923,6 +2463,13 @@ pub struct AgentEntry {
     /// Who set `name` — the precedence tier for renames (#95r). See
     /// [`NameSource`] and [`OrchRegistry::rename_agent`].
     pub name_source: NameSource,
+    /// The workflow block this agent was spawned from (#222) — its *identity*.
+    /// `worker` for the built-in roster; `rev-security` for a declared block.
+    /// This is what a gate, an edge or a `spawn_agent(block:)` names.
+    pub block: workflow::BlockId,
+    /// The agent's **capability class**, derived from its block's `kind`. Every
+    /// structural guarantee (deny-flags, cwd rule, MCP tool scope) keys off
+    /// this, and it can only ever be one of four values — see [`Role`].
     pub role: Role,
     pub token: String,
     pub status: AgentStatus,
@@ -2059,6 +2606,13 @@ pub struct TaskPatch {
 pub struct AgentRecord {
     pub id: String,
     pub role: String,
+    /// The workflow block this agent was spawned from (#222). Persisted so a
+    /// session rejoin restores the agent's *identity* (its persona, CLI and
+    /// model), not merely its capability class. Additive: a roster row written
+    /// before blocks deserializes to empty, and the rejoin falls back to the
+    /// class's default block.
+    #[serde(default)]
+    pub block: String,
     pub name: String,
     /// Precedence tier of `name` (#95r). Persisted so a session rejoin restores
     /// the human's rename AND its "human beats orchestrator" tier, not just the
@@ -2120,6 +2674,66 @@ pub struct Caller {
     pub role: Role,
 }
 
+/// A workflow block's persona, compiled down to what each agent CLI can
+/// actually consume (#222).
+///
+/// The investigation's load-bearing asymmetry: **Claude takes a persona
+/// inline** (`--agents '<json>' --agent <id>`), so loomux can synthesize one
+/// with zero repo files. **Copilot cannot** — its `--agent` resolves a *name*
+/// against `.github/agents/`, so it can only ever engage a file the user
+/// already wrote. Hence exactly three outcomes, one per row below:
+///
+/// | block persona | claude | copilot |
+/// |---|---|---|
+/// | none | nothing (pre-#222 command, byte for byte) | nothing |
+/// | `prompt:` (inline) | `--agents` + `--agent` | **kickoff-prompt injection** |
+/// | `profile: .github/agents/x.md` | file body → `--agents` + `--agent` | `--agent x` (native) |
+///
+/// A persona-less block passes `PersonaInject::default()` and every field is
+/// `None`/empty, so no flag is added at all. That is the mechanism behind the
+/// "a repo with no workflow file behaves exactly as before" guarantee.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PersonaInject {
+    /// Claude `--agents '<json>'`: the inline block definition. Already
+    /// persona-sanitized and ASCII-escaped, so it is safe inside the
+    /// single-quoted shell token `build_agent_command` wraps it in.
+    pub claude_agents_json: Option<String>,
+    /// Claude `--agent <id>`: activates the block defined above. Always set
+    /// together with `claude_agents_json`.
+    pub claude_agent: Option<String>,
+    /// Copilot `--agent <name>`. Set **only** for a user-authored
+    /// `.github/agents/*.md` — loomux never generates a file there to make this
+    /// flag reachable (see `profiles::is_copilot_native`).
+    pub copilot_agent: Option<String>,
+    /// Extra pre-approved tool patterns from the persona's `allow:`. Widens
+    /// only *within* the capability class: deny rules beat allow rules on both
+    /// CLIs, so this can never re-grant what the block's `kind` denies.
+    pub extra_allow: Vec<String>,
+    /// Persona body for the **kickoff-prompt fallback**: the CLI has no inline
+    /// persona flag and no user-authored file to point at (copilot + an inline
+    /// `prompt:`). Delivered as text in the kickoff, which every CLI reads.
+    pub kickoff: Option<String>,
+}
+
+/// A block's persona after the `prompt:` / `profile:` sources have been
+/// resolved to one body — the shared input to both the CLI flags
+/// ([`PersonaInject`]) and the block's role-instruction file.
+#[derive(Clone, Debug)]
+#[doc(hidden)] // pub for integration tests: they compile a block exactly as spawn does
+pub struct ResolvedPersona {
+    /// The persona body (sanitized for a shell line).
+    pub text: String,
+    /// The handle a native `--agent` flag names.
+    pub name: String,
+    /// One-line description for the `--agents` JSON (Claude requires it).
+    pub description: String,
+    pub mode: profiles::ProfileMode,
+    pub allow: Vec<String>,
+    /// Set when the persona came from a user-authored `.github/agents/*.md`,
+    /// which is the only thing Copilot's native `--agent` can resolve.
+    pub copilot_native: bool,
+}
+
 /// Payload asking the frontend to open a pane for an agent. Also the return
 /// value of `create_orchestration` (the orchestrator's own pane).
 #[derive(Clone, Debug, Serialize)]
@@ -2179,6 +2793,11 @@ pub struct OrchRegistry {
     /// orchestrator is registered — without this, two concurrent launches
     /// on one repo would share an id.
     creation: Mutex<()>,
+    /// Test seam (#222): when set, `pr_head` returns this instead of shelling out
+    /// to `gh pr view --json headRefOid`. The verdict↔revision binding has to be
+    /// exercised through the real MCP dispatch against a repo that isn't on GitHub;
+    /// mirrors `claude_projects_dir`. `None` in the app, always.
+    pr_head_override: Mutex<Option<String>>,
     /// Groups the human has paused: loomux stops delivering prompts/kickoffs
     /// to them so their agents idle out (see `deliver_prompt`). Mirrored to a
     /// `paused` marker file per group so it survives restarts.
@@ -3213,6 +3832,7 @@ impl OrchRegistry {
             last_delivery: Arc::new(Mutex::new(HashMap::new())),
             tasks_lock: Mutex::new(()),
             creation: Mutex::new(()),
+            pr_head_override: Mutex::new(None),
             paused: Mutex::new(HashSet::new()),
             spawn_times: Mutex::new(HashMap::new()),
             self_arc: Mutex::new(Weak::new()),
@@ -3843,6 +4463,7 @@ impl OrchRegistry {
         let record = AgentRecord {
             id: entry.id.clone(),
             role: entry.role.as_str().into(),
+            block: entry.block.clone(),
             name: entry.name.clone(),
             name_source: entry.name_source,
             session: entry.session_id.clone(),
@@ -3991,6 +4612,10 @@ impl OrchRegistry {
                 // The spawn audit predates the name-tier field; backfilled
                 // sessions restore at the default tier (#95r).
                 name_source: NameSource::default(),
+                // Blocks (#222) are recorded in the spawn audit; an audit line
+                // from an older build has none, and the rejoin then falls back
+                // to the class's default block.
+                block: d["block"].as_str().unwrap_or("").to_string(),
                 role,
                 session: Some(session.to_string()),
                 cwd: d["cwd"].as_str().unwrap_or("").to_string(),
@@ -4051,7 +4676,11 @@ impl OrchRegistry {
     }
 
     /// Load a group's persisted identity (repo + guardrails) from group.json.
-    fn load_group_file(&self, group: &str) -> Option<(String, Guardrails)> {
+    ///
+    /// See [`read_blocks`] for how a pre-#222 group.json (flat per-role fields,
+    /// no `blocks` array) is migrated to the block roster on read.
+    #[doc(hidden)] // pub for integration tests (the #222 migration is asserted on this)
+    pub fn load_group_file(&self, group: &str) -> Option<(String, Guardrails)> {
         let v: Value =
             serde_json::from_str(&fs::read_to_string(self.group_dir(group).join("group.json")).ok()?).ok()?;
         let repo = v["repo"].as_str()?.to_string();
@@ -4062,16 +4691,18 @@ impl OrchRegistry {
             Guardrails {
                 max_agents: g["max_agents"].as_u64().unwrap_or(4) as u32,
                 agent_cli: s("agent_cli", "claude"),
-                // Per-role CLIs are additive (issue #4): absent in older
-                // group.json → empty → inherit `agent_cli`.
-                orchestrator_cli: s("orchestrator_cli", ""),
-                worker_cli: s("worker_cli", ""),
-                reviewer_cli: s("reviewer_cli", ""),
-                planner_cli: s("planner_cli", ""),
-                worker_model: s("worker_model", ""),
-                reviewer_model: s("reviewer_model", ""),
-                orchestrator_model: s("orchestrator_model", ""),
-                planner_model: s("planner_model", ""),
+                // The roster (#222). A group.json written by an older loomux has
+                // no `blocks` array — only the eight flat per-role fields — so
+                // rebuild the equivalent 4-block roster from those. That is the
+                // whole migration: a pre-#222 group rejoins with exactly the CLIs
+                // and models it was launched with.
+                blocks: read_blocks(g),
+                // The advanced-orchestrator toggle (#222). Absent → false: a
+                // group launched before the toggle existed ran the built-in
+                // roster, so that is what it rejoins as. This is also what makes
+                // the toggle durable — a resumed orchestration (session browser)
+                // rebuilds its guardrails from here, not from a launcher form.
+                advanced_orchestrator: g["advanced_orchestrator"].as_bool().unwrap_or(false),
                 auto_ops: g["auto_ops"].as_bool().unwrap_or(true),
                 idle_kill_minutes: g["idle_kill_minutes"].as_u64().unwrap_or(0) as u32,
                 max_spawns_per_hour: g["max_spawns_per_hour"].as_u64().unwrap_or(0) as u32,
@@ -4089,10 +4720,79 @@ impl OrchRegistry {
 
     // ---------- groups & agents ----------
 
+    /// Record that a resumed group's pinned roster no longer matches what the
+    /// repo's workflow file now says (#222, rev-11 F2). Audit only — the pinned
+    /// roster is what runs, deliberately.
+    ///
+    /// The comparison is against the roster the file *would resolve to* (same
+    /// `clamped()` a launch applies), not against its raw blocks, so an inherited
+    /// model filled in at launch doesn't read as drift. A file that has since been
+    /// deleted or broken is drift too: the group is running blocks its repo no
+    /// longer declares, which is exactly the thing worth being able to see.
+    fn audit_workflow_drift(&self, id: &str, repo: &str, g: &Guardrails) {
+        let ids = |bs: &[workflow::Block]| -> Vec<String> { bs.iter().map(|b| b.id.clone()).collect() };
+        let (now, note) = match workflow::load_workflow(repo) {
+            Ok(Some(wf)) => {
+                let resolved = Guardrails {
+                    agent_cli: g.agent_cli.clone(),
+                    blocks: wf.blocks,
+                    ..Guardrails::default()
+                }
+                .clamped()
+                .blocks;
+                if resolved == g.blocks {
+                    return; // the file still says what the group is running
+                }
+                // "Appeared" and "changed" are different events to a human reading
+                // the trail, and only one of them means "somebody edited the file
+                // you approved". A group whose running roster is the built-in four
+                // was launched without a workflow in play at all — so the repo has
+                // *gained* one since, and this group is simply not running it.
+                let note = if workflow::roster_is_custom(&g.blocks) {
+                    "the file has changed since this group was launched"
+                } else {
+                    "the repo has gained a workflow file since this group was launched"
+                };
+                (ids(&resolved), note)
+            }
+            Ok(None) if !workflow::roster_is_custom(&g.blocks) => return, // no file, no workflow: nothing to drift from
+            Ok(None) => (Vec::new(), "the file the group was launched from is gone"),
+            Err(_) => (Vec::new(), "the file no longer validates"),
+        };
+        self.audit(id, "loomux", "workflow-changed-since-launch", json!({
+            "path": workflow::WORKFLOW_PATH,
+            "note": note,
+            "running": ids(&g.blocks),
+            "on_disk": now,
+            "action": "keeping the roster this group was launched with — relaunch to pick up the new one",
+        }));
+    }
+
     /// Create (or reattach to) the group for `repo`. State and audit history
     /// persist under the repo-derived group id; guardrails are refreshed from
     /// the new launch.
+    ///
+    /// A **fresh launch** — the human is at the launcher, and has just been shown
+    /// what the advanced orchestrator would run. [`create_group_ex`] is the same
+    /// thing for a resumed orchestrator session, which is a different question.
+    ///
+    /// [`create_group_ex`]: Self::create_group_ex
     pub fn create_group(&self, repo: &str, guardrails: Guardrails) -> Result<GroupInfo, String> {
+        self.create_group_ex(repo, guardrails, Launch::Fresh)
+    }
+
+    /// [`create_group`](Self::create_group), told which kind of start this is.
+    ///
+    /// The distinction only matters for the advanced orchestrator (#222), and it
+    /// matters a lot: **a resumed group runs the roster it was launched with.**
+    /// See [`Launch`].
+    #[doc(hidden)] // pub for integration tests (the resume pin is asserted on this)
+    pub fn create_group_ex(
+        &self,
+        repo: &str,
+        guardrails: Guardrails,
+        launch: Launch,
+    ) -> Result<GroupInfo, String> {
         let mut guardrails = guardrails.clamped();
         // Base id is repo-derived so a relaunch resumes the same state dir —
         // but a repo can host several *concurrent* orchestrations, and those
@@ -4106,6 +4806,120 @@ impl OrchRegistry {
         let dir = self.group_dir(&id);
         fs::create_dir_all(dir.join("configs")).map_err(|e| e.to_string())?;
         let resumed = dir.join("group.json").is_file();
+
+        // The repo's declared roster AND its merge gate (#222), read ONLY when the
+        // human turned the advanced orchestrator on **and this is a fresh launch**.
+        //
+        // With the toggle off — the default — the file is not even opened: this is
+        // the whole promise that the default experience is byte-for-byte what it
+        // was before #222, and the cheapest way to keep that promise is to not have
+        // a code path.
+        //
+        // On a RESUME the file is not read for the roster either, and that is a
+        // consent rule, not an optimization (rev-11 F2). The roster in `group.json`
+        // is the one the human was shown in the launcher preview and approved. A
+        // `git pull` between launch and resume must not be able to swap a delegate's
+        // persona under a session they already consented to — the consent moment is
+        // the launch, so the launch is what the roster is pinned to. Drift is
+        // *audited* below, not applied; to run a changed workflow, launch a group.
+        if guardrails.advanced_orchestrator && launch == Launch::Fresh {
+            // Three outcomes, and only the first changes anything:
+            //   - a valid `.loomux/workflow.yml` → its blocks ARE the roster;
+            //   - no file → the launcher's 4-block roster stands (turning the
+            //     toggle on in a repo that declares nothing is a no-op, not an
+            //     error — it is how you launch before you write the file);
+            //   - a broken file → AUDITED AND SKIPPED. A repo file must never be
+            //     able to stop a group from launching, so a validation failure
+            //     falls back to the default roster rather than erroring out.
+            //     Every problem is recorded, not just the first, so one look at
+            //     the audit log fixes the file in one pass. The launcher shows
+            //     the human the same findings *before* they hit Create.
+            match workflow::load_workflow(repo) {
+                Ok(Some(wf)) => {
+                    self.audit(&id, "loomux", "workflow-loaded", json!({
+                        "path": workflow::WORKFLOW_PATH,
+                        "name": wf.name,
+                        "blocks": wf.blocks.iter().map(|b| json!({ "id": b.id, "kind": b.kind })).collect::<Vec<_>>(),
+                        "gates": wf.gates.keys().collect::<Vec<_>>(),
+                    }));
+                    // The declared merge gate (#222/#197) becomes the `merge_gate`
+                    // spec file the gh shim enforces — or, when the file declares
+                    // none, is cleared, so removing a gate from the workflow really
+                    // removes it.
+                    self.sync_merge_gate(&id, wf.gates.get("merge"));
+                    // `merge` is the only gate loomux enforces. A gate under any other
+                    // name parses (the schema is open) but does nothing — say so, rather
+                    // than letting a `gates: { deploy: … }` clause look enforced.
+                    let unenforced: Vec<&String> =
+                        wf.gates.keys().filter(|k| k.as_str() != "merge").collect();
+                    if !unenforced.is_empty() {
+                        self.audit(&id, "loomux", "workflow-gate-unenforced", json!({
+                            "gates": unenforced,
+                            "note": "only gates.merge is enforced by this build — the rest are inert",
+                        }));
+                    }
+                    guardrails.blocks = wf.blocks;
+                    // Re-run the roster normalization (model defaults follow each
+                    // block's *effective* CLI, which the file may have changed).
+                    guardrails = guardrails.clamped();
+                }
+                // No workflow file: no gate. Clears a stale one from a previous
+                // launch, so deleting `.loomux/workflow.yml` restores the pre-#222
+                // flow exactly.
+                Ok(None) => self.sync_merge_gate(&id, None),
+                Err(errors) => {
+                    self.audit(&id, "loomux", "workflow-invalid", json!({
+                        "path": workflow::WORKFLOW_PATH,
+                        "errors": errors,
+                        "action": "skipped — using the built-in roster",
+                    }));
+                    // A BROKEN workflow file does NOT clear an existing gate. The
+                    // roster can safely fall back to the built-in one — every agent
+                    // still spawns, which is #225's "a repo file must never block a
+                    // launch". A gate is the opposite kind of thing: dropping it
+                    // because the file that declares it stopped parsing would quietly
+                    // *widen* what the group's agents may do, and a syntax error is
+                    // not consent to merge unreviewed code. So the last known gate
+                    // stands, loudly.
+                    if self.merge_gate_path(&id).is_file() {
+                        self.audit(&id, "loomux", "merge-gate-retained", json!({
+                            "reason": "the workflow file is invalid — keeping the last known merge gate rather than failing open",
+                        }));
+                    }
+                }
+            }
+        } else if guardrails.advanced_orchestrator {
+            // A resume. The persisted roster stands — but if the file has moved on
+            // since the launch, the human should be able to SEE that the group they
+            // are looking at is not what their repo now says. Silence here would
+            // make the pin indistinguishable from a stale read.
+            //
+            // **The merge gate is pinned by the same rule, and left untouched here.**
+            // The consent argument applies to it at least as strongly as to the
+            // roster: a `git pull` between launch and resume must not be able to
+            // *loosen* the gate a session is running under (drop a reviewer, remove
+            // the clause entirely) — and re-reading the file is precisely how that
+            // would happen. The gate file written at launch stands; the drift audit
+            // tells the human the repo has moved on.
+            self.audit_workflow_drift(&id, repo, &guardrails);
+        } else {
+            // The toggle is off, so the workflow is not running — and neither is its
+            // gate. Clearing it here is what makes "the default experience is
+            // byte-for-byte pre-#222" true for the *merge path* too, and it is what
+            // stops a gate declared under an earlier advanced launch of this same
+            // group dir from outliving the toggle that authorized it.
+            self.sync_merge_gate(&id, None);
+            if workflow::workflow_file_exists(repo) {
+                // The repo declares a workflow and this group is deliberately not
+                // running it. Say so in the trail: "my workflow file did nothing" is
+                // otherwise a silent, and very confusing, non-event.
+                self.audit(&id, "loomux", "workflow-ignored", json!({
+                    "path": workflow::WORKFLOW_PATH,
+                    "reason": "the advanced orchestrator is off for this group",
+                    "action": "using the built-in roster",
+                }));
+            }
+        }
         // The live-agent cap is adjustable mid-session (`set_max_agents`) and
         // persisted, so it's a durable human choice — like the pause/notify
         // markers re-seeded below. On resume, prefer the persisted cap over the
@@ -4149,14 +4963,14 @@ impl OrchRegistry {
             "guardrails": {
                 "max_agents": info.guardrails.max_agents,
                 "agent_cli": info.guardrails.agent_cli,
-                "orchestrator_cli": info.guardrails.orchestrator_cli,
-                "worker_cli": info.guardrails.worker_cli,
-                "reviewer_cli": info.guardrails.reviewer_cli,
-                "planner_cli": info.guardrails.planner_cli,
-                "worker_model": info.guardrails.worker_model,
-                "reviewer_model": info.guardrails.reviewer_model,
-                "orchestrator_model": info.guardrails.orchestrator_model,
-                "planner_model": info.guardrails.planner_model,
+                // #222: the roster replaces the eight flat per-role fields. The
+                // reader still understands the old shape (`read_blocks`), so a
+                // group.json from 0.8.0 keeps loading; nothing writes it again.
+                "blocks": blocks_json(&info.guardrails.blocks),
+                // #222: whether this group runs the repo's workflow file. Absent
+                // from an older group.json → false on read, which is exactly what
+                // that group was: a built-in roster.
+                "advanced_orchestrator": info.guardrails.advanced_orchestrator,
                 "auto_ops": info.guardrails.auto_ops,
                 "idle_kill_minutes": info.guardrails.idle_kill_minutes,
                 "max_spawns_per_hour": info.guardrails.max_spawns_per_hour,
@@ -4241,7 +5055,7 @@ impl OrchRegistry {
         self.groups.lock_safe().insert(id.clone(), info.clone());
         self.audit(&id, "loomux", if resumed { "group-resume" } else { "group-create" },
             json!({ "repo": repo, "max_agents": info.guardrails.max_agents,
-                    "worker_model": info.guardrails.worker_model }));
+                    "blocks": blocks_json(&info.guardrails.blocks) }));
         Ok(info)
     }
 
@@ -6148,6 +6962,12 @@ impl OrchRegistry {
                 earliest = Some(earliest.map_or(a.started_ms, |e| e.min(a.started_ms)));
                 json!({
                     "id": a.id, "name": a.name, "role": a.role,
+                    // The block this agent IS (#222). Equal to the role for the
+                    // built-in roster, so the group panel shows nothing new for a
+                    // default group — and shows `rev-security` rather than a
+                    // second anonymous "REV" chip for a workflow group, which is
+                    // the whole point of declaring the reviewers separately.
+                    "block": a.block,
                     "task": a.task, "idle_since_ms": a.idle_since_ms,
                     "uptime_ms": now.saturating_sub(a.started_ms),
                 })
@@ -6266,24 +7086,334 @@ impl OrchRegistry {
         }))
     }
 
-    /// Render the role instruction docs into the group dir so kickoff
+    /// The orchestrator's **This repo declares a workflow** section, or `""` for
+    /// the default roster (#222).
+    ///
+    /// It tells the orchestrator the three things the file actually changes about
+    /// its job — spawn by block id rather than by kind, run *every* declared
+    /// reviewer on each PR rather than one, and treat a declared gate as a hard
+    /// precondition — and the one thing it does not: the edges are advisory, and
+    /// the scheduling judgment stays the orchestrator's. See doc/design/workflows.md
+    /// ("Why edges are advisory") for why that asymmetry is the whole design.
+    ///
+    /// `{{MAX_AGENTS}}` is rendered here rather than left to the caller: the
+    /// caller substitutes this text *into* the orchestrator template, and by then
+    /// its own `MAX_AGENTS` pass has already gone by.
+    fn workflow_section(&self, g: &GroupInfo) -> String {
+        if !workflow::roster_is_custom(&g.guardrails.blocks) {
+            return String::new();
+        }
+        let cli = &g.guardrails.agent_cli;
+        let rows: Vec<String> = g
+            .guardrails
+            .blocks
+            .iter()
+            .filter(|b| b.kind != Role::Orchestrator)
+            .map(|b| {
+                format!(
+                    "- **`{id}`** — {name} · {kind} · {cli} · model `{model}`{persona}",
+                    id = b.id,
+                    name = b.name,
+                    kind = b.kind.as_str(),
+                    cli = workflow::cli_of(b, cli),
+                    model = workflow::model_of(b, cli),
+                    persona = if b.has_persona() { " · has a persona" } else { "" },
+                )
+            })
+            .collect();
+        let reviewers: Vec<String> = g
+            .guardrails
+            .blocks
+            .iter()
+            .filter(|b| b.kind == Role::Reviewer)
+            .map(|b| format!("`{}`", b.id))
+            .collect();
+        // Leading blank line, and the fragment's own trailing one trimmed: the
+        // placeholder sits at the END of the preceding sentence in the template
+        // (never on a line of its own), which is exactly what lets the empty case
+        // above leave the file untouched to the byte.
+        format!(
+            "\n\n{}",
+            render_template(
+            WORKFLOW_TPL,
+            &[
+                ("WORKFLOW_PATH", workflow::WORKFLOW_PATH),
+                ("MAX_AGENTS", &g.guardrails.max_agents.to_string()),
+                // A roster can legally declare no reviewer at all (a build-only
+                // workflow). Say that, rather than emitting an empty list and
+                // leaving the sentence dangling.
+                (
+                    "REVIEWERS",
+                    &if reviewers.is_empty() {
+                        "— this workflow declares no reviewer block, so there is nobody to fan out to; \
+                         tell the human if a PR looks like it needs review"
+                            .to_string()
+                    } else {
+                        reviewers.join(", ")
+                    },
+                ),
+                ("BLOCKS", &rows.join("\n")),
+            ],
+            )
+            .trim_end()
+        )
+    }
+
+    /// A delegate's **Your block** section, or `""` when the workflow file did not
+    /// touch this block (#222) — which is every block of the default roster, and
+    /// is why a no-workflow group's `worker.md` is the pre-#222 file to the byte.
+    ///
+    /// Emitted per block, not per group: a plain built-in `worker` block sitting
+    /// in a roster whose *reviewers* are custom has had nothing about its own
+    /// identity changed, and telling it otherwise is noise in a file agents are
+    /// expected to actually read. The one exception is a reviewer with siblings —
+    /// being one of several focused reviewers *is* a change to how it should
+    /// review, so it gets the lane note even with no persona of its own.
+    ///
+    /// Not reached for a `replace`-mode persona: that block's file is the
+    /// non-overridable mechanics core, which makes every point below in its own
+    /// voice, and "everything else in this document still holds" would be
+    /// pointing at a document that isn't there.
+    fn block_note(&self, g: &GroupInfo, b: &workflow::Block) -> String {
+        let reviewers: Vec<&str> = g
+            .guardrails
+            .blocks
+            .iter()
+            .filter(|x| x.kind == Role::Reviewer)
+            .map(|x| x.id.as_str())
+            .collect();
+        let multi_reviewer = b.kind == Role::Reviewer && reviewers.len() > 1;
+        // A reviewer the group's merge gate NAMES is told so, whatever else is true of
+        // it (#222/#197). This has to be part of the early-return test, not just an
+        // extra paragraph: a gate can name a plain built-in `reviewer` block with no
+        // persona and no siblings, and that block would otherwise be the one agent in
+        // the group that never learns its verdict is the thing holding the merge.
+        let gate = self.merge_gate(&g.id).filter(|_| b.kind == Role::Reviewer);
+        let gated = gate.as_ref().is_some_and(|gt| gt.reviewers.iter().any(|r| *r == b.id));
+        if b.is_builtin() && !b.has_persona() && !multi_reviewer && !gated {
+            return String::new();
+        }
+        // `persona_allowed` for the same reason the preview asks it: an orchestrator
+        // block's persona is denied at spawn, so "adopt it" would point at
+        // instructions that never arrive.
+        let persona_note = if b.has_persona() && workflow::persona_allowed(b) {
+            " Your **persona** comes from that file too: it reached you through your CLI's own \
+             custom-agent flag, or — on a CLI that has no inline one — as an addendum in your \
+             kickoff prompt. Adopt it."
+        } else {
+            ""
+        };
+        let lane_note = if multi_reviewer {
+            let others: Vec<String> = reviewers
+                .iter()
+                .filter(|id| **id != b.id)
+                .map(|id| format!("`{id}`"))
+                .collect();
+            format!(
+                "\n\nYou are **one of {n} reviewer blocks** on each PR — the others are {others}. \
+                 Review **only your lane**. The split is deliberate: another block is covering what \
+                 you skip, and duplicating its work costs the human money and buries your own \
+                 findings. A serious defect plainly outside your lane is worth one line, not a \
+                 second review. Say in your report which lane you reviewed and give a clear \
+                 verdict — a merge gate may be waiting on it.",
+                n = reviewers.len(),
+                others = others.join(", "),
+            )
+        } else {
+            String::new()
+        };
+        // The verdict contract, given ONLY to a reviewer a gate actually names — for
+        // everyone else it would be prose about a tool that gates nothing. It is the
+        // one instruction in this file that a merge physically waits on, so it says
+        // what the shim will do rather than asking nicely.
+        let gate_note = match gate.filter(|_| gated) {
+            Some(gt) => {
+                let rule = match gt.require {
+                    workflow::GateRequire::AllPass => format!(
+                        "every one of {} must record a `pass`",
+                        gt.reviewers.iter().map(|r| format!("`{r}`")).collect::<Vec<_>>().join(", ")
+                    ),
+                    workflow::GateRequire::Threshold(n) => format!(
+                        "{n} of {} must record a `pass`",
+                        gt.reviewers.iter().map(|r| format!("`{r}`")).collect::<Vec<_>>().join(", ")
+                    ),
+                };
+                format!(
+                    "\n\n**Your verdict is the merge gate.** This repo's workflow declares a merge \
+                     gate that names you, so `gh pr merge` is **refused** until {rule} — loomux's \
+                     `gh` interceptor enforces it, and nobody can talk it into merging: not the \
+                     orchestrator, not a human grant. Record yours with \
+                     `review_verdict(pr, verdict, summary)` once you have finished reviewing and \
+                     posted your review on the PR:\n\
+                     \n\
+                     - `pass` — reviewed, nothing blocking.\n\
+                     - `fail` — blocking findings. Re-review after the fix and record `pass` to \
+                     clear it (re-recording replaces your earlier verdict).\n\
+                     - `escalate` — you are **not deciding this one**: ambiguous requirement, \
+                     outside what you can judge, a risk you won't sign off on. A human must look.\n\
+                     \n\
+                     `fail` and `escalate` both refuse the merge, and **one blocking verdict beats \
+                     any number of passes** — so never record `pass` to be agreeable, to unblock a \
+                     queue, or because another reviewer already passed. If you have not finished, \
+                     record nothing: an outstanding verdict holds the gate shut, which is exactly \
+                     what it is for.\n\
+                     \n\
+                     **Your verdict is bound to the commit you reviewed.** If anything is pushed to \
+                     the PR afterwards — even a lint fix — your pass goes **stale**, the gate \
+                     reopens, and the merge is refused until you review the new head and record \
+                     again. Expect to be called back after a fix; do not assume an earlier pass \
+                     still covers the PR. `list_verdicts(pr)` shows you where the gate stands."
+                )
+            }
+            None => String::new(),
+        };
+        format!(
+            "\n\n{}",
+            render_template(
+                BLOCK_TPL,
+                &[
+                    ("WORKFLOW_PATH", workflow::WORKFLOW_PATH),
+                    ("BLOCK_ID", &b.id),
+                    ("BLOCK_KIND", b.kind.as_str()),
+                    ("PERSONA_NOTE", persona_note),
+                    ("LANE_NOTE", &lane_note),
+                    ("GATE_NOTE", &gate_note),
+                    // LAST, and this is the same discipline the caller applies to
+                    // `{{BLOCK_NOTE}}` itself: `render_template` walks its list in
+                    // order, so the only var whose value is repo-authored goes in
+                    // when there are no passes left to rescan it. A block named
+                    // `{{LANE_NOTE}}` is inert text, not a second lane note spliced
+                    // into the middle of a sentence (rev-11 F3). `sanitize_display`
+                    // strips braces as well, so this is belt AND braces — the order
+                    // is what protects the template, the sanitizer what protects any
+                    // future template that puts a name somewhere else.
+                    ("BLOCK_NAME", &b.name),
+                ],
+            )
+            .trim_end()
+        )
+    }
+
+    /// Render every block's role-instruction doc into the group dir so kickoff
     /// prompts can reference them by path instead of pasting pages of text.
+    ///
+    /// One file per **block** now, not per role (#222) — `worker.md` for the
+    /// built-in roster (unchanged), `<block-id>.md` for a custom block. All four
+    /// built-in files are always written even when a workflow file has replaced
+    /// the roster, because they are also what a `mode: replace` persona is
+    /// measured against and what a rejoined legacy session may still reference.
     fn write_instruction_files(&self, g: &GroupInfo) -> Result<(), String> {
-        let vars = [
+        let max = g.guardrails.max_agents.to_string();
+        // The orchestrator's workflow section (#222) — EMPTY for the default
+        // roster, which is what keeps every no-workflow group's instruction files
+        // byte-for-byte what they were. `BLOCK_NOTE` is per-block, so the base
+        // vars carry the empty default and `write_block_instructions` overrides
+        // it; without the default here, a class-fallback file written by the loop
+        // below would keep a literal `{{BLOCK_NOTE}}` in its text.
+        let workflow_section = self.workflow_section(g);
+        let vars: Vec<(&str, &str)> = vec![
             ("REPO", g.repo.as_str()),
             ("GROUP_ID", g.id.as_str()),
-            ("MAX_AGENTS", &g.guardrails.max_agents.to_string()),
-            ("WORKER_MODEL", g.guardrails.worker_model.as_str()),
-            ("REVIEWER_MODEL", g.guardrails.reviewer_model.as_str()),
-            ("PLANNER_MODEL", g.guardrails.planner_model.as_str()),
+            ("MAX_AGENTS", max.as_str()),
+            ("WORKER_MODEL", g.guardrails.model_for(Role::Worker)),
+            ("REVIEWER_MODEL", g.guardrails.model_for(Role::Reviewer)),
+            ("PLANNER_MODEL", g.guardrails.model_for(Role::Planner)),
+            ("WORKFLOW", workflow_section.as_str()),
+            ("BLOCK_NOTE", ""),
         ];
-        let vars: Vec<(&str, &str)> = vars.iter().map(|(k, v)| (*k, *v)).collect();
         let dir = self.group_dir(&g.id);
         for role in [Role::Orchestrator, Role::Worker, Role::Reviewer, Role::Planner] {
+            // Skip the classes the roster covers — a block whose id is a class
+            // name owns that class's file (ids are reserved per class, see
+            // `clamped`), and the block loop below writes it persona-aware. For
+            // the default roster that is all four, so this loop writes nothing and
+            // the group dir gets four writes, not eight. The classes it *does*
+            // write are the ones the roster left out: their files still have to
+            // exist, because a legacy session rejoining without a block id falls
+            // back to its class's file (`kickoff_prompt`).
+            if g.guardrails.blocks.iter().any(|b| b.id == role.as_str()) {
+                continue;
+            }
             fs::write(dir.join(role.instructions_file()), render_template(role.template(), &vars))
                 .map_err(|e| e.to_string())?;
         }
+        for b in &g.guardrails.blocks {
+            let persona = self.resolve_persona_or_audit(g, b);
+            self.write_block_instructions(g, b, persona.as_ref(), &vars)?;
+        }
         Ok(())
+    }
+
+    /// [`resolve_persona`](Self::resolve_persona), with the failure policy
+    /// applied: a persona that won't load is **audited and dropped**, never
+    /// fatal. A repo file must not be able to stop an agent from starting, so
+    /// every caller wants this, not the raw `Result`.
+    fn resolve_persona_or_audit(
+        &self,
+        g: &GroupInfo,
+        b: &workflow::Block,
+    ) -> Option<ResolvedPersona> {
+        match self.resolve_persona(g, b) {
+            Ok(p) => p,
+            Err(e) => {
+                self.audit(&g.id, "loomux", "workflow-persona-skipped", json!({
+                    "block": b.id, "profile": b.profile, "error": e,
+                }));
+                None
+            }
+        }
+    }
+
+    /// Write one block's role-instruction file, honoring its persona mode.
+    ///
+    /// - **append** (and no persona): the built-in class template, as before.
+    ///   The persona itself does not go here — it reaches the agent through the
+    ///   CLI's native custom-agent flag (or the kickoff), so this file stays the
+    ///   loomux contract and nothing else.
+    /// - **replace**: [`mechanics_core`] *instead of* the class template. The
+    ///   persona has replaced the role body — but the mechanics (MCP tools, the
+    ///   board, `report()` discipline, branch→PR) are **not overridable**, so
+    ///   loomux writes them itself and the kickoff points the agent at them. A
+    ///   replace persona can change who the agent is; it can never leave it
+    ///   unable to report or unable to open a PR.
+    ///
+    /// `persona` is the block's already-resolved persona — passed in rather than
+    /// re-resolved, so the file this writes and the flags the CLI gets can never
+    /// disagree about a persona that was edited mid-spawn.
+    fn write_block_instructions(
+        &self,
+        g: &GroupInfo,
+        b: &workflow::Block,
+        persona: Option<&ResolvedPersona>,
+        vars: &[(&str, &str)],
+    ) -> Result<(), String> {
+        let replace = persona.is_some_and(|p| p.mode == profiles::ProfileMode::Replace);
+        let body = if replace {
+            format!(
+                "# {} — loomux mechanics (non-overridable)\n\n\
+                 This repo's persona for the `{}` block runs in `mode: replace`: it replaces \
+                 loomux's built-in {} instructions. The mechanics below are NOT part of that \
+                 trade — loomux guarantees them whatever the persona says.\n\n{}\n",
+                b.name,
+                b.id,
+                b.kind.as_str(),
+                mechanics_core(b.kind),
+            )
+        } else {
+            // This block's own `## Your block` section (#222) — empty for a block
+            // the workflow file didn't touch, which is every block of the default
+            // roster. It is appended LAST: `render_template` walks the list in
+            // order, so nothing after it can rescan the note's text, and the note
+            // is the one place a repo-authored string (a block's `name`) reaches a
+            // template. A `{{MAX_AGENTS}}` in a block name stays inert text.
+            let note = self.block_note(g, b);
+            let mut vars: Vec<(&str, &str)> =
+                vars.iter().filter(|(k, _)| *k != "BLOCK_NOTE").copied().collect();
+            vars.push(("BLOCK_NOTE", note.as_str()));
+            render_template(b.kind.template(), &vars)
+        };
+        fs::write(self.group_dir(&g.id).join(b.instructions_file()), body)
+            .map_err(|e| e.to_string())
     }
 
     // ---------- enforced merge gate (#83): gh shim + per-pane env ----------
@@ -6463,6 +7593,304 @@ impl OrchRegistry {
         Ok(())
     }
 
+    // ---------- the workflow merge gate + review verdicts (#222 / #197) ----------
+
+    /// The group-dir spec file the `gh` shim reads to enforce `gates.merge`.
+    /// Absent = no declared gate = the pre-#222 flow, exactly.
+    fn merge_gate_path(&self, group: &str) -> PathBuf {
+        self.group_dir(group).join(workflow::MERGE_GATE_FILE)
+    }
+
+    /// The group's declared merge gate, or `None` if the repo declared none **or
+    /// the gate file is unusable**. Callers must not read `None` as "no gate" when
+    /// the file exists (`merge_gate_declared`) — the shim will read that file and
+    /// refuse on exactly what makes this return `None`. The shim does its own read
+    /// (in shell); this is for the Rust side — reporting gate status back to a
+    /// reviewer that just recorded a verdict, and to the orchestrator that has to
+    /// decide what to do next.
+    pub fn merge_gate(&self, group: &str) -> Option<workflow::Gate> {
+        workflow::parse_gate_file(&fs::read_to_string(self.merge_gate_path(group)).ok()?)
+    }
+
+    /// Whether the group has a gate file at all — the shim's own precondition.
+    pub fn merge_gate_declared(&self, group: &str) -> bool {
+        self.merge_gate_path(group).is_file()
+    }
+
+    /// Bring the group's `merge_gate` file in line with the repo's workflow file,
+    /// called on every group create/resume.
+    ///
+    /// `Some(gate)` writes it; `None` **removes** it — a repo that deletes its
+    /// `gates.merge` clause (or its whole workflow file) must not keep a gate the
+    /// file no longer declares. The one case that is *not* routed here is a
+    /// workflow file that fails to parse: `create_group` leaves an existing gate
+    /// file alone there, because "I can't read your workflow" is not evidence that
+    /// you stopped wanting the gate — see the call site.
+    fn sync_merge_gate(&self, group: &str, gate: Option<&workflow::Gate>) {
+        let path = self.merge_gate_path(group);
+        match gate {
+            Some(g) => {
+                if atomic_write(&path, workflow::gate_file_text(g).as_bytes()).is_ok() {
+                    self.audit(group, "loomux", "merge-gate-declared", json!({
+                        "require": match g.require {
+                            workflow::GateRequire::AllPass => "all-pass".to_string(),
+                            workflow::GateRequire::Threshold(n) => format!("threshold {n}"),
+                        },
+                        "reviewers": g.reviewers,
+                        "also": g.also,
+                        // Say it out loud in the trail: an `also:` condition this
+                        // build can't check refuses every merge (fail closed).
+                        "unsupported_conditions": g.also.iter()
+                            .filter(|c| !workflow::condition_supported(c)).collect::<Vec<_>>(),
+                    }));
+                }
+            }
+            None => {
+                if path.is_file() && remove_marker(&path).is_ok() {
+                    self.audit(group, "loomux", "merge-gate-cleared",
+                        json!({ "reason": "the repo's workflow declares no gates.merge" }));
+                }
+            }
+        }
+    }
+
+    /// Where this group's recorded verdicts for one PR live: one file per reviewer
+    /// block (`verdicts/pr-<N>/<block-id>`). Both segments are loomux-generated —
+    /// `pr` is a parsed number and a block id is sanitized to `[A-Za-z0-9_-]` — so
+    /// neither can walk out of the group dir.
+    fn verdict_dir(&self, group: &str, pr: u64) -> PathBuf {
+        self.group_dir(group).join(workflow::VERDICTS_DIR).join(format!("pr-{pr}"))
+    }
+
+    /// The PR's current head commit, via the **real** gh (the backend's PATH is
+    /// unshimmed, so resolve the binary the same way `write_shim` does rather than
+    /// trusting `PATH`). `None` when gh is absent, unauthenticated, or the repo/PR
+    /// isn't there — which the verdict path records as an *empty* head, i.e. stale,
+    /// never as "unbound, therefore fine".
+    ///
+    /// `pr_head_override` is the test seam (mirroring `claude_projects_dir`): the
+    /// integration tests must be able to record a verdict against a known revision
+    /// without a GitHub repo, and every one of them drives the real MCP dispatch.
+    fn pr_head(&self, repo: &str, pr: u64) -> Option<String> {
+        if let Some(sha) = self.pr_head_override.lock_safe().clone() {
+            return Some(sha);
+        }
+        if !Path::new(repo).is_dir() {
+            return None;
+        }
+        let gh = crate::winpath::resolve_program(
+            "gh",
+            &crate::winpath::launch_path(),
+            &crate::winpath::launch_pathext(),
+        )?;
+        let mut cmd = std::process::Command::new(gh);
+        cmd.current_dir(repo)
+            .args(["pr", "view", &pr.to_string(), "--json", "headRefOid", "--jq", ".headRefOid"]);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW — never flash a console
+        }
+        let out = cmd.output().ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let sha = workflow::sanitize_sha(&String::from_utf8_lossy(&out.stdout));
+        (!sha.is_empty()).then_some(sha)
+    }
+
+    /// Test seam: pretend `gh pr view --json headRefOid` returns this commit for
+    /// every PR. Lets the integration tests bind verdicts to a revision (and then
+    /// move it, to simulate a re-push) without a live GitHub repo.
+    #[doc(hidden)]
+    pub fn set_pr_head_override(&self, sha: Option<String>) {
+        *self.pr_head_override.lock_safe() = sha;
+    }
+
+    /// Record a reviewer's verdict on a PR (the `review_verdict` MCP tool) — the
+    /// durable, attributed state the merge gate reads.
+    ///
+    /// **Only a reviewer-kind block may record one**, re-checked here and not only
+    /// in the MCP dispatch: the verdict is the thing that opens a gate, so the
+    /// authorization belongs next to the write. A worker that could file its own
+    /// PASS would make the gate decorative.
+    ///
+    /// The verdict is bound to the PR's **head commit at record time**, so it
+    /// cannot survive a re-push: the gate compares that against the PR's current
+    /// head and treats a mismatch as outstanding. Without the binding, a `pass` on
+    /// #7 still reads green after the worker pushes two more commits — the gate
+    /// would be satisfied to the letter of #197 and violated in its spirit.
+    ///
+    /// Re-recording replaces that reviewer's verdict (a reviewer that re-reviews
+    /// after a fix upgrades its own `fail` to a `pass`, and a reviewer whose pass
+    /// went stale re-reviews the new head); every write is audited, so the history
+    /// is in the trail even though only the latest verdict gates.
+    pub fn record_verdict(
+        &self,
+        group: &str,
+        agent_id: &str,
+        pr: &str,
+        verdict: &str,
+        summary: &str,
+    ) -> Result<workflow::ReviewVerdict, String> {
+        let a = self.agent(agent_id).ok_or_else(|| format!("unknown agent: {agent_id}"))?;
+        if a.group != group {
+            return Err(format!("unknown agent: {agent_id}")); // never leak other groups' ids
+        }
+        if a.role != Role::Reviewer {
+            return Err(format!(
+                "permission denied: review_verdict records a REVIEW outcome, so only a \
+                 reviewer-kind block may call it — you are block {:?} (kind {}). Use \
+                 report(status, summary) instead.",
+                a.block,
+                a.role.as_str()
+            ));
+        }
+        let num = pr_number(pr)
+            .ok_or_else(|| format!("no PR number found in {pr:?} — pass the number, #n, or the PR URL"))?;
+        let verdict = workflow::Verdict::parse(verdict).ok_or_else(|| {
+            format!("unknown verdict {verdict:?} — must be one of {}", workflow::verdict_names())
+        })?;
+        let summary = workflow::sanitize_summary(summary);
+        if summary.is_empty() {
+            return Err("summary required — one or two lines a human can act on: what you \
+                        reviewed, and what decided the verdict".into());
+        }
+        let block = workflow::sanitize_id(&a.block)
+            .ok_or("this agent's block id is unusable — it cannot be attributed a verdict")?;
+        // The revision this verdict reviewed. Best-effort: an unresolvable head is
+        // stored empty, which the gate reads as stale — so a verdict loomux could
+        // not bind to a commit can never open a gate on its own.
+        let repo = self.group(group).map(|g| g.repo).unwrap_or_default();
+        let head = self.pr_head(&repo, num).unwrap_or_default();
+        let rec = workflow::ReviewVerdict {
+            pr: num,
+            block,
+            agent_id: a.id.clone(),
+            verdict,
+            head,
+            summary,
+            ts_ms: now_ms(),
+        };
+        // Atomic: the shim may read this file at any instant, and a half-written
+        // verdict must never read as a `pass` (the first line is the verdict word).
+        atomic_write(
+            &self.verdict_dir(group, num).join(&rec.block),
+            workflow::verdict_file_text(&rec).as_bytes(),
+        )
+        .map_err(|e| e.to_string())?;
+        self.audit(group, &rec.agent_id, "review-verdict", json!({
+            "pr": num,
+            "block": rec.block,
+            "verdict": rec.verdict.as_str(),
+            "head": rec.head,
+            "summary": rec.summary.chars().take(500).collect::<String>(),
+        }));
+        Ok(rec)
+    }
+
+    /// Every verdict recorded for a PR, by reviewer block (block order).
+    pub fn verdicts(&self, group: &str, pr: u64) -> Vec<workflow::ReviewVerdict> {
+        let mut out: Vec<workflow::ReviewVerdict> = fs::read_dir(self.verdict_dir(group, pr))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| {
+                let block = e.file_name().to_string_lossy().into_owned();
+                let text = fs::read_to_string(e.path()).ok()?;
+                workflow::parse_verdict_file(pr, &block, &text)
+            })
+            .collect();
+        out.sort_by(|a, b| a.block.cmp(&b.block));
+        out
+    }
+
+    /// The verdicts a gate decision reads: reviewer block → its latest record.
+    fn verdict_map(&self, group: &str, pr: u64) -> BTreeMap<String, workflow::ReviewVerdict> {
+        self.verdicts(group, pr).into_iter().map(|v| (v.block.clone(), v)).collect()
+    }
+
+    /// PRs this group has any recorded verdict for (ascending).
+    pub fn verdict_prs(&self, group: &str) -> Vec<u64> {
+        let mut prs: Vec<u64> = fs::read_dir(self.group_dir(group).join(workflow::VERDICTS_DIR))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| e.file_name().to_string_lossy().strip_prefix("pr-")?.parse().ok())
+            .collect();
+        prs.sort_unstable();
+        prs
+    }
+
+    /// One line telling an agent where a PR stands against the declared gate —
+    /// handed back to the reviewer that just voted and delivered to the
+    /// orchestrator, so nobody has to guess whether a merge is now possible.
+    /// `None` when the group declares no gate (then only the human gate applies).
+    ///
+    /// This must agree with the shim, which is the thing that actually refuses the
+    /// merge: it reads the same files, resolves the same head, and fails closed on
+    /// the same shapes. A status line that said SATISFIED while the shim refused
+    /// would be worse than no status line at all.
+    pub fn gate_status_line(&self, group: &str, pr: u64) -> Option<String> {
+        if !self.merge_gate_declared(group) {
+            return None;
+        }
+        // The file exists but doesn't parse: the shim refuses every merge on it
+        // (`malformed-gate`), so say that rather than "no gate".
+        let Some(gate) = self.merge_gate(group) else {
+            return Some(format!(
+                "merge gate for PR #{pr}: the group's merge_gate file is MALFORMED — every merge \
+                 is refused until it is fixed (repair .loomux/workflow.yml and relaunch the group)."
+            ));
+        };
+        let repo = self.group(group).map(|g| g.repo).unwrap_or_default();
+        let head = self.pr_head(&repo, pr);
+        let outcome = workflow::evaluate_merge_gate(&gate, &self.verdict_map(group, pr), head.as_deref());
+        let also = if gate.also.is_empty() {
+            String::new()
+        } else {
+            format!(" Condition(s) checked at merge time: {}.", gate.also.join(", "))
+        };
+        // "still waiting on X (no verdict) / Y (passed an older revision)".
+        let waiting = |outstanding: &[String], stale: &[String]| -> String {
+            let mut parts: Vec<String> = Vec::new();
+            if !outstanding.is_empty() {
+                parts.push(format!("{} (no verdict yet)", outstanding.join(", ")));
+            }
+            if !stale.is_empty() {
+                parts.push(format!(
+                    "{} (passed an EARLIER revision — the branch has moved, so they must re-review)",
+                    stale.join(", ")
+                ));
+            }
+            parts.join("; ")
+        };
+        Some(match outcome {
+            workflow::GateOutcome::Satisfied => format!(
+                "merge gate for PR #{pr}: SATISFIED by the reviewer verdicts ({}) for the current \
+                 revision.{also} The human merge gate still applies on the default branch.",
+                gate.reviewers.join(", ")
+            ),
+            workflow::GateOutcome::Blocked { blocking } => format!(
+                "merge gate for PR #{pr}: BLOCKED — {} recorded a fail/escalate verdict. A \
+                 blocking verdict beats any number of passes; the PR must be fixed and \
+                 re-reviewed.",
+                blocking.join(", ")
+            ),
+            workflow::GateOutcome::Short { passes, need, outstanding, stale } => format!(
+                "merge gate for PR #{pr}: NOT YET SATISFIED — {passes} of {need} required PASS \
+                 verdicts cover the PR's current head; still waiting on {}. `gh pr merge` is \
+                 refused until then.{also}",
+                waiting(&outstanding, &stale)
+            ),
+            workflow::GateOutcome::UnknownRevision => format!(
+                "merge gate for PR #{pr}: loomux cannot resolve the PR's current head commit, so \
+                 it cannot tell whether the recorded verdicts reviewed the code that would merge. \
+                 The merge is refused until it can."
+            ),
+        })
+    }
+
     pub fn resolve_token(&self, token: &str) -> Option<Caller> {
         let id = self.by_token.lock_safe().get(token).cloned()?;
         let agents = self.agents.lock_safe();
@@ -6531,6 +7959,184 @@ impl OrchRegistry {
         Ok(path)
     }
 
+    /// Resolve a block's persona from its `prompt:` (inline) or `profile:` (a
+    /// repo file) — `Ok(None)` when the block declares neither, which is every
+    /// block of the default roster.
+    ///
+    /// A broken `profile:` is an **error the caller audits and swallows**, not a
+    /// failed spawn: a repo file must never be able to stop an agent from
+    /// starting. Re-read on every spawn, so editing a persona applies to the
+    /// next agent without restarting the group.
+    #[doc(hidden)] // pub for integration tests
+    pub fn resolve_persona(
+        &self,
+        group: &GroupInfo,
+        block: &workflow::Block,
+    ) -> Result<Option<ResolvedPersona>, String> {
+        // The orchestrator block is loomux-owned: a repo may pin its cli/model,
+        // never author its persona or pre-approve its tools. `parse_workflow`
+        // rejects that outright and says why — but a hand-edited `group.json`
+        // never meets the parser, so the persona is dropped here too, and audited.
+        //
+        // Neutralizing it *here* (rather than only in `persona_inject`) is what
+        // makes it total: this is the single point both the CLI flags and the
+        // block's instruction file are resolved through, so a `mode: replace`
+        // orchestrator persona cannot rewrite `orchestrator.md` either. See
+        // `parse_workflow` for why the trust root is not a customization surface.
+        if !workflow::persona_allowed(block) && (block.has_persona() || !block.allow.is_empty()) {
+            self.audit(&group.id, "loomux", "workflow-orchestrator-persona-denied", json!({
+                "block": block.id,
+                "prompt": block.prompt.is_some(),
+                "profile": block.profile,
+                "allow": block.allow,
+                "why": "the orchestrator is loomux's trust root — a repo file may not author its \
+                        prompt or pre-approve its tools",
+            }));
+            return Ok(None);
+        }
+        if let Some(rel) = block.profile.as_deref() {
+            let p = profiles::load_block_profile(&group.repo, rel, block.kind)?;
+            let handle = p.copilot_agent.clone().unwrap_or_else(|| p.name.clone());
+            // Copilot's `--agent` resolves names against `.github/agents/`, so
+            // only a persona that actually lives there can use the native flag —
+            // AND the name must resolve back to the file loomux actually read.
+            //
+            // The handle comes from the file's frontmatter `name:`, not from its
+            // path. So `.github/agents/security-review.md` whose frontmatter says
+            // `name: worker` would make loomux emit `--agent worker`, and Copilot
+            // would go and load whichever file declares `name: worker` — the
+            // *worker* persona. loomux would have kind-checked one file and
+            // launched another, with the audit line insisting all was well.
+            //
+            // So: only take the native path when the handle unambiguously names
+            // this file. Otherwise fall back to kickoff injection, which delivers
+            // the persona loomux actually read.
+            let native = profiles::is_copilot_native(rel)
+                && profiles::handle_resolves_to(&group.repo, &handle, rel);
+            if profiles::is_copilot_native(rel) && !native {
+                self.audit(&group.id, "loomux", "copilot-agent-handle-ambiguous", json!({
+                    "block": block.id, "profile": rel, "handle": handle,
+                    "action": "using kickoff injection — `--agent` would resolve to a different file",
+                }));
+            }
+            return Ok(Some(ResolvedPersona {
+                text: workflow::sanitize_persona(&p.instructions),
+                name: handle,
+                description: workflow::sanitize_persona(&p.description),
+                mode: p.mode,
+                allow: p.allow.iter().chain(block.allow.iter()).cloned().collect(),
+                copilot_native: native,
+            }));
+        }
+        if let Some(prompt) = block.prompt.as_deref() {
+            return Ok(Some(ResolvedPersona {
+                text: workflow::sanitize_persona(prompt),
+                name: block.id.clone(),
+                // `sanitize_display` keeps a name readable — it strips control
+                // characters and braces, and nothing else — so it can still
+                // contain an apostrophe, and the description rides into the
+                // single-quoted `--agents` token. Persona-sanitize it too, or a
+                // block named `Bob's review` would close that quote.
+                description: workflow::sanitize_persona(&block.name),
+                // An inline `prompt:` is an addendum to the built-in role
+                // contract. Only a persona FILE can declare `mode: replace` —
+                // replacing loomux's role body is a deliberate, reviewable act,
+                // not something a one-liner in a workflow file falls into.
+                mode: profiles::ProfileMode::Append,
+                allow: block.allow.clone(),
+                copilot_native: false,
+            }));
+        }
+        // No persona, but a block may still carry `allow:` patterns.
+        if !block.allow.is_empty() {
+            return Ok(Some(ResolvedPersona {
+                text: String::new(),
+                name: block.id.clone(),
+                description: workflow::sanitize_persona(&block.name),
+                mode: profiles::ProfileMode::Append,
+                allow: block.allow.clone(),
+                copilot_native: false,
+            }));
+        }
+        Ok(None)
+    }
+
+    /// Compile a resolved persona into the launch flags of `cli` — the table in
+    /// [`PersonaInject`]. `None` in, `PersonaInject::default()` out: no persona,
+    /// no flags, pre-#222 command line.
+    /// Audit a repo-authored `allow:` that was refused because the block's class
+    /// is read-only. Silently dropping it would leave an author wondering why
+    /// their pattern does nothing; honoring it would break capability closure.
+    fn audit_allow_denied(&self, group: &str, block: &workflow::Block, allow: &[String]) {
+        self.audit(group, "loomux", "workflow-allow-denied", json!({
+            "block": block.id,
+            "kind": block.kind.as_str(),
+            "allow": allow,
+            "why": "a read-only capability class may not pre-approve tool patterns — \
+                    an allow pattern could hand it a shell that writes files",
+        }));
+    }
+
+    #[doc(hidden)] // pub for integration tests
+    pub fn persona_inject(
+        &self,
+        group: &str,
+        block: &workflow::Block,
+        cli: &str,
+        persona: Option<&ResolvedPersona>,
+    ) -> PersonaInject {
+        let Some(p) = persona else {
+            return PersonaInject::default();
+        };
+        // CAPABILITY CLOSURE, enforced at the last possible moment (#222).
+        //
+        // `workflow::parse_workflow` already refuses `allow:` on a read-only
+        // block, but that is not the only way a pattern gets here: a
+        // `.github/agents/*.md` persona can carry its own `allow:` frontmatter,
+        // and a hand-edited group.json never sees the parser at all. A read-only
+        // class is read-only by denying a *fixed list* of tools — so an allow
+        // pattern that names something not on that list (`Bash(python *)`,
+        // `Bash(tee *)`, …) would hand a planner a pre-approved shell that writes
+        // files, with no human in its pane to say no.
+        //
+        // Nobody can enumerate every write-capable program. So a read-only block
+        // simply gets no allow patterns, from any source, ever.
+        let allow: Vec<String> = if block.kind.is_read_only() {
+            if !p.allow.is_empty() {
+                self.audit_allow_denied(group, block, &p.allow);
+            }
+            Vec::new()
+        } else {
+            p.allow.clone()
+        };
+        let mut out = PersonaInject { extra_allow: allow, ..Default::default() };
+        if p.text.trim().is_empty() {
+            return out; // allow-only block
+        }
+        if cli == "copilot" {
+            if p.copilot_native {
+                out.copilot_agent = Some(p.name.clone());
+            } else {
+                // No inline persona flag on Copilot and no user-authored file to
+                // name — so the persona travels as text in the kickoff prompt.
+                out.kickoff = Some(p.text.clone());
+            }
+            return out;
+        }
+        // Claude (and the fallback adapter): define the block inline and
+        // activate it. `description` is required by the CLI's schema.
+        let payload = json!({
+            &block.id: {
+                "description": if p.description.trim().is_empty() { block.id.as_str() } else { p.description.trim() },
+                "prompt": p.text,
+            }
+        });
+        out.claude_agents_json =
+            Some(workflow::ascii_escape_json(&serde_json::to_string(&payload).unwrap_or_default()));
+        out.claude_agent = Some(block.id.clone());
+        out
+    }
+
     /// Build an agent's launch command for the group's CLI. Baseline
     /// permissions minimize the approvals needed just to *initialize*: the
     /// group state dir is added as a workspace (so reading the instructions
@@ -6552,6 +8158,16 @@ impl OrchRegistry {
     /// surface; it is deliberately NOT a full sandbox (e.g. `gh pr create` is
     /// left reachable so the plan comment works), so the *complete* read-only
     /// contract still rests partly on the planner's instructions.
+    ///
+    /// `persona` compiles a workflow block's persona down to the CLI's **native**
+    /// custom-agent flag (#222) — see [`PersonaInject`]. A block with no persona
+    /// passes `PersonaInject::default()`, which adds nothing: that is what makes
+    /// a group with no `.loomux/workflow.yml` byte-for-byte identical to
+    /// pre-#222 loomux (pinned by `default_roster_command_lines_match_legacy`).
+    ///
+    /// Ordering matters and is not cosmetic: `extra_allow` must be emitted while
+    /// `--allowedTools` is still the open list, i.e. *before* `--disallowedTools`
+    /// — otherwise the allow patterns would be parsed as *denials*.
     #[allow(clippy::too_many_arguments)]
     #[doc(hidden)] // pub for integration tests
     pub fn build_agent_command(
@@ -6565,6 +8181,7 @@ impl OrchRegistry {
         session: Option<&str>,
         resume: bool,
         read_only: bool,
+        persona: &PersonaInject,
     ) -> String {
         // A planner never mutates and has no human in its pane, so there is
         // nothing for `auto_ops` to gate: it must explore, post its plan
@@ -6625,6 +8242,20 @@ impl OrchRegistry {
                          --deny-tool \"shell(git commit)\" --deny-tool \"shell(git push)\"",
                     );
                 }
+                // Copilot's native custom agent (#222). `--agent <name>` resolves
+                // the name against `.github/agents/` — it CANNOT take an inline
+                // definition, so this is set only when the block's `profile:`
+                // points at a file the *user* authored there. loomux never writes
+                // a generated persona into `.github/agents/` to make this flag
+                // work: that would dirty the user's git tree with files they did
+                // not write. A block with an inline `prompt:` instead reaches
+                // Copilot through the kickoff prompt (`PersonaInject::kickoff`).
+                if let Some(agent) = &persona.copilot_agent {
+                    cmd.push_str(&format!(" --agent {agent}"));
+                }
+                for pat in &persona.extra_allow {
+                    cmd.push_str(&format!(" --allow-tool \"{pat}\""));
+                }
                 cmd
             }
             // "claude" and the explicit fallback for anything unrecognized.
@@ -6657,6 +8288,14 @@ impl OrchRegistry {
                     cmd.push(' ');
                     cmd.push_str(CLAUDE_UNATTENDED_ALLOW);
                 }
+                // Persona `allow:` patterns extend the SAME `--allowedTools`
+                // list, so they must land before `--disallowedTools` opens the
+                // deny list below. They can only widen within the capability
+                // class: on Claude, `--disallowedTools` beats the allow list, so
+                // a planner persona cannot allow itself back into `git commit`.
+                for pat in &persona.extra_allow {
+                    cmd.push_str(&format!(" \"{pat}\""));
+                }
                 if read_only {
                     // Deny the file-editing tools and the git mutation
                     // subcommands outright (--disallowedTools overrides the
@@ -6678,6 +8317,35 @@ impl OrchRegistry {
                         " --disallowedTools Edit Write MultiEdit NotebookEdit \
                          \"Bash(git commit *)\" \"Bash(git push *)\"",
                     );
+                }
+                // Claude's native custom agent (#222). Unlike Copilot, Claude
+                // takes the whole block **inline** — `--agents '<json>'` defines
+                // it, `--agent <id>` activates it — so loomux can hand a
+                // synthesized persona straight to the CLI with zero repo files
+                // and zero trust problem. (This replaces PR #105's
+                // `--append-system-prompt-file`, which predates the flag.)
+                //
+                // The payload rides inside SINGLE quotes. That is the whole
+                // quoting story: in both PowerShell and POSIX sh a single-quoted
+                // string is literal except for `'` itself — which
+                // `workflow::sanitize_persona` has already removed — and
+                // `workflow::ascii_escape_json` has made the payload pure ASCII,
+                // so a non-UTF-8 pane code page cannot mangle it either.
+                //
+                // The shell-string form assumes the fallback shell is PowerShell
+                // (Windows) or sh (POSIX) — the same assumption the copilot branch
+                // above already documents at its `@"` here-string note, and the
+                // one `default_shell()` makes: powershell.exe ships with every
+                // supported Windows build. Bare `cmd.exe` gives `'` no meaning and
+                // would mangle this, but reaching it requires powershell.exe to be
+                // absent from PATH. The primary path is unaffected either way:
+                // direct spawn uses `build_agent_argv`, where the payload is one
+                // literal token and no shell parses it at all.
+                if let Some(json) = &persona.claude_agents_json {
+                    cmd.push_str(&format!(" --agents '{json}'"));
+                }
+                if let Some(agent) = &persona.claude_agent {
+                    cmd.push_str(&format!(" --agent {agent}"));
                 }
                 cmd
             }
@@ -6710,6 +8378,7 @@ impl OrchRegistry {
         session: Option<&str>,
         resume: bool,
         read_only: bool,
+        persona: &PersonaInject,
     ) -> Vec<String> {
         let unattended = auto_ops || read_only;
         let mut a: Vec<String> = Vec::new();
@@ -6756,6 +8425,14 @@ impl OrchRegistry {
                     push(&mut a, "--deny-tool");
                     push(&mut a, "shell(git push)");
                 }
+                if let Some(agent) = &persona.copilot_agent {
+                    push(&mut a, "--agent");
+                    push(&mut a, agent);
+                }
+                for pat in &persona.extra_allow {
+                    push(&mut a, "--allow-tool");
+                    push(&mut a, pat);
+                }
             }
             // "claude" and the explicit fallback for anything unrecognized.
             _ => {
@@ -6787,6 +8464,10 @@ impl OrchRegistry {
                     push(&mut a, "Bash(git *)");
                     push(&mut a, "Bash(gh *)");
                 }
+                // Still inside --allowedTools' value list — before the deny list.
+                for pat in &persona.extra_allow {
+                    push(&mut a, pat);
+                }
                 if read_only {
                     push(&mut a, "--disallowedTools");
                     push(&mut a, "Edit");
@@ -6795,6 +8476,16 @@ impl OrchRegistry {
                     push(&mut a, "NotebookEdit");
                     push(&mut a, "Bash(git commit *)");
                     push(&mut a, "Bash(git push *)");
+                }
+                if let Some(json) = &persona.claude_agents_json {
+                    push(&mut a, "--agents");
+                    // One literal argv token: no shell, so no quoting at all.
+                    // The string form wraps this same payload in single quotes.
+                    push(&mut a, json);
+                }
+                if let Some(agent) = &persona.claude_agent {
+                    push(&mut a, "--agent");
+                    push(&mut a, agent);
                 }
             }
         }
@@ -6813,17 +8504,22 @@ impl OrchRegistry {
         use_worktree: bool,
         branch: Option<String>,
     ) -> Result<AgentEntry, String> {
-        self.spawn_agent_ex(group_id, role, name, task, use_worktree, branch, None, None, None, None)
+        self.spawn_agent_ex(group_id, role, None, name, task, use_worktree, branch, None, None, None, None)
     }
 
-    /// Full spawn: `resume_session` reopens a previous session (follow-ups
-    /// on a finished task) instead of cold-starting; `cwd_override` places
-    /// the pane where that work originally happened (e.g. its worktree).
+    /// Full spawn: `block` names a workflow block explicitly (#222) — that block
+    /// *is* the agent's identity, and its `kind` becomes the capability class,
+    /// so an orchestrator picks `rev-security` rather than "a reviewer". `None`
+    /// takes the default block for `role`, which for the built-in roster is the
+    /// only one. `resume_session` reopens a previous session (follow-ups on a
+    /// finished task) instead of cold-starting; `cwd_override` places the pane
+    /// where that work originally happened (e.g. its worktree).
     #[allow(clippy::too_many_arguments)]
     pub fn spawn_agent_ex(
         &self,
         group_id: &str,
         role: Role,
+        block: Option<String>,
         name: &str,
         task: &str,
         use_worktree: bool,
@@ -6834,6 +8530,41 @@ impl OrchRegistry {
         restore_name_source: Option<NameSource>,
     ) -> Result<AgentEntry, String> {
         let group = self.group(group_id).ok_or("unknown group")?;
+
+        // Identity first: which block is this agent? A named block's `kind` is
+        // authoritative from here on — the capability class comes from the
+        // roster, never from the caller's guess.
+        let named = block.as_deref().map(str::trim).filter(|b| !b.is_empty());
+        let block = match named {
+            Some(id) => group.guardrails.block(id).cloned().ok_or_else(|| {
+                let known: Vec<&str> =
+                    group.guardrails.blocks.iter().map(|b| b.id.as_str()).collect();
+                format!("unknown block {id:?}. Blocks in this group: {}", known.join(", "))
+            })?,
+            None => group.guardrails.block_for(role).cloned().ok_or_else(|| {
+                format!("this group's workflow declares no {} block", role.as_str())
+            })?,
+        };
+        // A workflow file must not be able to hand an agent a second
+        // orchestrator: an orchestrator-kind spawn is exempt from the live-agent
+        // cap and the spawn-rate backstop (both below) and resolves to the
+        // privileged MCP tool set.
+        //
+        // This is the *block* half of that rule. The *kind* half lives in
+        // `mcp::call_tool` ("spawn_agent"), which refuses `kind: orchestrator`
+        // outright — that is the only agent-reachable entry point, and it has to
+        // be the enforcement point because this function's `role ==
+        // Role::Orchestrator` path is still legitimately used to register the
+        // group's own orchestrator in tests. Neither check is redundant: this one
+        // catches `block: "<an orchestrator block>"`, which arrives with
+        // `kind: worker` and would otherwise be promoted by `role = block.kind`.
+        if block.kind == Role::Orchestrator && named.is_some() {
+            return Err(format!(
+                "block {:?} is an orchestrator block — a group has exactly one orchestrator, opened at launch",
+                block.id
+            ));
+        }
+        let role = block.kind;
 
         // Guardrail: live delegate cap (the orchestrator itself is exempt).
         if role != Role::Orchestrator {
@@ -6858,32 +8589,37 @@ impl OrchRegistry {
             self.check_and_record_spawn(group_id, group.guardrails.max_spawns_per_hour)?;
         }
 
-        // Guardrail: the CLI and model are pinned per role at group creation
-        // (issue #4). Reject an unknown per-role CLI at spawn rather than
-        // silently downgrading it — the launcher only offers supported CLIs,
-        // so an unsupported one here means a hand-edited group.json.
-        let cli = group.guardrails.cli_for(role);
+        // Guardrail: the CLI and model are pinned per block (#4, now #222).
+        // Reject an unknown CLI at spawn rather than silently downgrading it —
+        // the launcher only offers supported CLIs and the workflow parser
+        // rejects unknown ones, so an unsupported one here means a hand-edited
+        // group.json.
+        let cli = workflow::cli_of(&block, &group.guardrails.agent_cli);
         if !SUPPORTED_CLIS.contains(&cli) {
             return Err(format!(
-                "guardrail: unsupported agent CLI {cli:?} for role {} — supported: {}",
-                role.as_str(), SUPPORTED_CLIS.join(", ")
+                "guardrail: unsupported agent CLI {cli:?} for block {} — supported: {}",
+                block.id, SUPPORTED_CLIS.join(", ")
             ));
         }
         let cli = cli.to_string();
-        let model = group.guardrails.model_for(role);
+        let model = workflow::model_of(&block, &group.guardrails.agent_cli).to_string();
 
         let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
-        let agent_id = format!("{}-{seq}", role.prefix());
+        let agent_id = format!("{}-{seq}", block.prefix());
         let token = new_token();
         // Name precedence (#95r): a caller-supplied name is the orchestrator's
         // choice; an empty one means "no meaningful name", so we derive the
         // default from the minted id — "worker 2" for `w-2` — which agrees with
         // the pane's "W 2" badge (#75) and the roster id instead of the old
         // per-launch "worker N" counter that drifted from the seq.
+        // The id-derived default now names the BLOCK, not the class (#222) — a
+        // "rev-security 7" pane says which reviewer it is. For the built-in
+        // roster a block's name IS its class name ("worker"), so this is
+        // byte-identical to the pre-block default.
         let (display, derived_source) = {
             let cleaned = sanitize_agent_name(name);
             if cleaned.is_empty() {
-                (format!("{} {seq}", role.as_str()), NameSource::Default)
+                (format!("{} {seq}", block.name), NameSource::Default)
             } else {
                 (cleaned, NameSource::Orchestrator)
             }
@@ -6955,28 +8691,60 @@ impl OrchRegistry {
         if cli == "copilot" {
             pre_trust_copilot_folder(&cwd);
         }
+
+        // The block's persona, compiled to this CLI's native custom-agent flags
+        // (#222). Resolved ONCE, here, and used for both the instruction file and
+        // the launch flags — re-resolving would let a persona edited mid-spawn
+        // produce a file and a command line that disagree. Fresh per spawn, so an
+        // edited persona applies to the next agent without restarting the group.
+        let persona = self.resolve_persona_or_audit(&group, &block);
+        // Refresh the block's instruction file so a `mode: replace` swap (or a
+        // persona edit) is reflected in what the kickoff points at.
+        let max = group.guardrails.max_agents.to_string();
+        let vars: Vec<(&str, &str)> = vec![
+            ("REPO", group.repo.as_str()),
+            ("GROUP_ID", group.id.as_str()),
+            ("MAX_AGENTS", max.as_str()),
+            ("WORKER_MODEL", group.guardrails.model_for(Role::Worker)),
+            ("REVIEWER_MODEL", group.guardrails.model_for(Role::Reviewer)),
+            ("PLANNER_MODEL", group.guardrails.model_for(Role::Planner)),
+        ];
+        // Audited, not swallowed: the kickoff below hands the agent this file's
+        // path as "read your role instructions", so a failed write means an agent
+        // booting against a stale or missing loomux contract. Not fatal (the
+        // previous content is usually still correct), but never silent.
+        if let Err(e) = self.write_block_instructions(&group, &block, persona.as_ref(), &vars) {
+            self.audit(group_id, "loomux", "error", json!({
+                "what": "could not write the block's role-instruction file",
+                "block": block.id, "file": block.instructions_file(), "err": e,
+            }));
+        }
+        let inject = self.persona_inject(group_id, &block, &cli, persona.as_ref());
+
         let cfg = self.write_mcp_config(group_id, &agent_id, &token, &cli)?;
         let command = self.build_agent_command(
             &cli,
-            model,
+            &model,
             group.guardrails.auto_ops,
             &cfg,
             &self.group_dir(group_id),
             Path::new(&cwd),
             session_id.as_deref(),
             resume,
-            role == Role::Planner, // read_only: deny writes/commits at the CLI level
+            role.is_read_only(), // deny writes/commits at the CLI level
+            &inject,
         );
         let argv = self.build_agent_argv(
             &cli,
-            model,
+            &model,
             group.guardrails.auto_ops,
             &cfg,
             &self.group_dir(group_id),
             Path::new(&cwd),
             session_id.as_deref(),
             resume,
-            role == Role::Planner,
+            role.is_read_only(),
+            &inject,
         );
 
         let entry = AgentEntry {
@@ -6984,6 +8752,7 @@ impl OrchRegistry {
             group: group_id.to_string(),
             name: display.clone(),
             name_source,
+            block: block.id.clone(),
             role,
             token: token.clone(),
             status: AgentStatus::Starting,
@@ -7045,6 +8814,17 @@ impl OrchRegistry {
             "agent": agent_id, "role": role, "name": display, "cwd": cwd,
             "cli": cli, "model": model, "worktree": use_worktree, "branch": branch_name, "task": task,
             "base": base, "session": session_id, "resume": resume,
+            // #222: which block this agent is, and how its persona reached the
+            // CLI — so a run stays reproducible after the workflow file changes.
+            "block": block.id,
+            "persona": persona.as_ref().map(|p| json!({
+                "source": if block.profile.is_some() { "profile" } else { "prompt" },
+                "mode": p.mode.as_str(),
+                "delivery": if inject.copilot_agent.is_some() { "copilot --agent" }
+                    else if inject.claude_agent.is_some() { "claude --agents" }
+                    else if inject.kickoff.is_some() { "kickoff" }
+                    else { "none" },
+            })),
         }));
         // Breadcrumb (no prompt/task text): ids + role only.
         crate::obs::breadcrumb(
@@ -7109,7 +8889,8 @@ impl OrchRegistry {
                     let a = self
                         .agent(&agent_id)
                         .ok_or("agent vanished during spawn")?;
-                    let kickoff = self.kickoff_prompt(&a, &group, &branch_note);
+                    let kickoff =
+                        self.kickoff_prompt(&a, &group, &branch_note, inject.kickoff.as_deref());
                     self.deliver_prompt(&agent_id, &kickoff, "loomux", Delivery::FreshKickoff)?;
                 }
                 // Copilot minted a session as it booted; watch for it and bind
@@ -7141,20 +8922,109 @@ impl OrchRegistry {
         }
     }
 
+    /// The first prompt typed into a freshly-booted agent pane.
+    ///
+    /// `persona` is the **kickoff fallback** (#222): the persona body of a block
+    /// whose CLI has no inline custom-agent flag and no user-authored
+    /// `.github/agents` file to name — i.e. Copilot with an inline `prompt:`.
+    /// `None` on Claude (its persona rode in on `--agents`), on a native Copilot
+    /// `--agent`, and for every block of the default roster — which is why a
+    /// group with no workflow file gets the same kickoff text it always did.
     #[doc(hidden)] // pub for integration tests
-    pub fn kickoff_prompt(&self, a: &AgentEntry, g: &GroupInfo, branch_note: &str) -> String {
-        let instructions = self.group_dir(&g.id).join(a.role.instructions_file());
+    pub fn kickoff_prompt(
+        &self,
+        a: &AgentEntry,
+        g: &GroupInfo,
+        branch_note: &str,
+        persona: Option<&str>,
+    ) -> String {
+        // The block's own contract file (`worker.md` for the built-in roster,
+        // `<block-id>.md` for a declared block). Falls back to the class file if
+        // the block is gone from the roster — a rejoined session must still boot.
+        let instructions = self.group_dir(&g.id).join(
+            g.guardrails
+                .block(&a.block)
+                .map(|b| b.instructions_file())
+                .unwrap_or_else(|| a.role.instructions_file().to_string()),
+        );
+        // A persona delivered as text is framed as an ADDENDUM, never as a
+        // replacement for the instructions file: the file is the loomux contract
+        // (and, for a replace-mode persona, the non-overridable mechanics core),
+        // and no repo text may talk an agent out of it.
+        let persona_note = match persona.map(str::trim).filter(|p| !p.is_empty()) {
+            Some(p) => format!(
+                "\n\nThis repo's workflow gives you a persona. Adopt it, but it does not \
+                 override the loomux mechanics in your instructions file above:\n\n{p}\n"
+            ),
+            None => String::new(),
+        };
+        let out = self.kickoff_body(a, g, branch_note, &instructions);
+        format!("{out}{persona_note}")
+    }
+
+    /// The roster paragraph appended to an orchestrator's kickoff when the repo
+    /// declares a workflow (#222). **Empty for the built-in roster** — that is
+    /// what keeps a no-workflow group's kickoff text byte-for-byte what it was.
+    ///
+    /// Only the roster and the gates are declared; the *edges* are advisory and
+    /// deliberately not handed over as a schedule. The orchestrator's judgment
+    /// about what to run when (serialize a sprawling change, parallelize
+    /// independent ones, plan first or go straight to a worker) is the thing
+    /// that makes it good, and a static graph would replace it with something
+    /// dumber. See doc/design/workflows.md.
+    fn roster_note(&self, g: &GroupInfo) -> String {
+        if !workflow::roster_is_custom(&g.guardrails.blocks) {
+            return String::new();
+        }
+        let rows: Vec<String> = g
+            .guardrails
+            .blocks
+            .iter()
+            .filter(|b| b.kind != Role::Orchestrator)
+            .map(|b| {
+                format!(
+                    "  - {} ({}, {}, {}){}",
+                    b.id,
+                    b.kind.as_str(),
+                    workflow::cli_of(b, &g.guardrails.agent_cli),
+                    workflow::model_of(b, &g.guardrails.agent_cli),
+                    if b.has_persona() { " — has a persona" } else { "" },
+                )
+            })
+            .collect();
+        format!(
+            "\nThis repo declares a custom workflow ({path}). Its blocks — pass `block: \"<id>\"` \
+             to spawn_agent to open one (its kind, CLI, model and persona come from the file):\n{rows}\n\
+             The workflow's edges are ADVISORY: they are the declared happy path, not a schedule. \
+             You still decide what to run when.",
+            path = workflow::WORKFLOW_PATH,
+            rows = rows.join("\n"),
+        )
+    }
+
+    fn kickoff_body(
+        &self,
+        a: &AgentEntry,
+        g: &GroupInfo,
+        branch_note: &str,
+        instructions: &Path,
+    ) -> String {
         match a.role {
             Role::Orchestrator => format!(
                 "You are the orchestrator of loomux agent group {gid} for the repository {repo}.\n\
                  First read your role instructions: {ins}\n\
                  Guardrails (enforced by loomux): max {max} live agents, worker model {wm}, reviewer model {rm}, planner model {pm}.\n\
-                 Group config: auto-merge is {automerge}; auto-release is {autorelease}; supervised dangerous mode is {dangerous} (see the merge-gate section of your instructions); autonomous idle-tick mode is {autonomous}.\n\
+                 Group config: auto-merge is {automerge}; auto-release is {autorelease}; supervised dangerous mode is {dangerous} (see the merge-gate section of your instructions); autonomous idle-tick mode is {autonomous}.{roster}\n\
                  Start by calling get_state, run `gh issue list --label agent-managed --state open`, call list_agents, \
                  reconcile them, then give the human a short status summary and wait for direction.",
                 gid = g.id, repo = g.repo, ins = instructions.display(),
-                max = g.guardrails.max_agents, wm = g.guardrails.worker_model,
-                rm = g.guardrails.reviewer_model, pm = g.guardrails.planner_model,
+                max = g.guardrails.max_agents, wm = g.guardrails.model_for(Role::Worker),
+                rm = g.guardrails.model_for(Role::Reviewer), pm = g.guardrails.model_for(Role::Planner),
+                // The declared roster (#222) — the orchestrator cannot spawn a
+                // block it doesn't know exists. Empty for the built-in roster,
+                // so a group with no workflow file gets the kickoff it always
+                // got, to the byte.
+                roster = self.roster_note(g),
                 // Autonomous config the template's conditional sections read (#83).
                 // Live toggles also deliver a mid-session notice; this covers a
                 // fresh boot / resume, where there's no notice to have seen.
@@ -7602,6 +9472,10 @@ impl OrchRegistry {
                 // orchestrator sees what each is working on.
                 let mut o = json!({
                     "id": a.id, "name": a.name, "role": a.role,
+                    // #222: which block this agent is. An orchestrator reading
+                    // its roster needs the identity, not just the class — three
+                    // reviewers all report `role: reviewer`.
+                    "block": a.block,
                     "status": a.status,
                     "session": a.session_id, "cwd": a.cwd,
                     "idle_since_ms": a.idle_since_ms,
@@ -7969,21 +9843,31 @@ pub fn create_orchestration(
     idle_kill_minutes: u32,
     max_spawns_per_hour: u32,
     watchdog_stall_minutes: u32,
+    // The advanced-orchestrator toggle (#222). Off = this group never opens the
+    // repo's `.loomux/workflow.yml` and runs the roster below, exactly as loomux
+    // did before workflows existed.
+    advanced_orchestrator: bool,
 ) -> Result<SpawnRequest, String> {
+    // The launcher still collects one CLI + model per role — that IS the
+    // built-in 4-block roster (#222), just spelled as flat form fields. Convert
+    // it here, at the boundary, so the launcher's wire shape is untouched and
+    // the backend has blocks from this point on. A repo that declares
+    // `.loomux/workflow.yml` overrides this roster in `create_group` — but only
+    // when `advanced_orchestrator` is on.
+    let blocks = workflow::default_roster(&[
+        (Role::Orchestrator, &orchestrator_cli, &orchestrator_model),
+        (Role::Worker, &worker_cli, &worker_model),
+        (Role::Reviewer, &reviewer_cli, &reviewer_model),
+        (Role::Planner, &planner_cli, &planner_model),
+    ]);
     create_orchestration_group(
         reg.inner(),
         &repo,
         Guardrails {
             max_agents,
             agent_cli,
-            orchestrator_cli,
-            worker_cli,
-            reviewer_cli,
-            planner_cli,
-            worker_model,
-            reviewer_model,
-            orchestrator_model,
-            planner_model,
+            blocks,
+            advanced_orchestrator,
             auto_ops,
             idle_kill_minutes,
             max_spawns_per_hour,
@@ -8002,6 +9886,81 @@ pub fn create_orchestration(
         None,
         initial_workers,
     )
+}
+
+/// What turning the **advanced orchestrator** on for `repo` would actually run
+/// (#222) — asked by the launcher *before* the human hits Create, so they see the
+/// roster they are enabling rather than discovering it in four spawned panes.
+///
+/// This is deliberately not a second implementation of the schema. It runs the
+/// same `load_workflow` + `Guardrails::clamped` that `create_group` runs, on a
+/// throwaway `Guardrails`, and reports the resolved blocks — so a preview that
+/// disagrees with the launch is a bug in one shared path, not a drift between two.
+/// (The workflow *pane* validates the file too, in TypeScript, but that pane is an
+/// editor giving live feedback on text; this is the launcher asking the engine.)
+///
+/// `agent_cli` is the group's default CLI, because a block may inherit from it —
+/// the same picker feeds this and the launch.
+///
+/// Never fails: a broken file is `{ valid: false, errors: [...] }` and the group
+/// would fall back to the built-in roster, which is precisely what the launcher
+/// needs to say. Nothing here is persisted and no group is created.
+#[tauri::command]
+pub fn orch_workflow_preview(repo: String, agent_cli: String) -> Value {
+    let present = workflow::workflow_file_exists(&repo);
+    let (name, blocks, gates, errors) = match workflow::load_workflow(&repo) {
+        Ok(Some(wf)) => {
+            let gates: Vec<String> = wf.gates.keys().cloned().collect();
+            (wf.name, wf.blocks, gates, Vec::new())
+        }
+        Ok(None) => (String::new(), Vec::new(), Vec::new(), Vec::new()),
+        Err(errors) => (String::new(), Vec::new(), Vec::new(), errors),
+    };
+    // Resolve exactly as a launch would: `clamped()` is what fills in an
+    // inherited CLI's default model, guarantees the orchestrator block, and drops
+    // a row a hand-edit could have made unreachable. Without it the preview would
+    // show `model: ""` for every block that inherits — i.e. most of them.
+    let resolved = if blocks.is_empty() {
+        Vec::new()
+    } else {
+        Guardrails { agent_cli: agent_cli.clone(), blocks, ..Guardrails::default() }
+            .clamped()
+            .blocks
+    };
+    let agent_cli = if SUPPORTED_CLIS.contains(&agent_cli.as_str()) { agent_cli } else { "claude".into() };
+    json!({
+        "path": workflow::WORKFLOW_PATH,
+        "present": present,
+        "valid": errors.is_empty(),
+        "name": name,
+        "errors": errors,
+        "gates": gates,
+        "blocks": resolved.iter().map(|b| json!({
+            "id": b.id,
+            "name": b.name,
+            "kind": b.kind.as_str(),
+            "cli": workflow::cli_of(b, &agent_cli),
+            "model": workflow::model_of(b, &agent_cli),
+            // What the human is really being asked to consent to: whether this
+            // block carries repo-authored instructions for the agent.
+            //
+            // Asked through the same predicate the SPAWN asks (rev-11's nit): an
+            // orchestrator block's persona is denied at `resolve_persona`, so
+            // reporting one here would advertise instructions that will never
+            // reach an agent. Unreachable from a parsed workflow file, which
+            // rejects it outright — but a preview must not be able to claim what a
+            // launch would drop, whatever produced the block.
+            "persona": if !workflow::persona_allowed(b) {
+                "none"
+            } else if b.profile.is_some() {
+                "profile"
+            } else if b.prompt.is_some() {
+                "prompt"
+            } else {
+                "none"
+            },
+        })).collect::<Vec<_>>(),
+    })
 }
 
 /// Pause a group: loomux stops delivering prompts/kickoffs so its agents
@@ -8242,7 +10201,11 @@ pub fn create_orchestration_group(
         return Err(format!("repository path does not exist: {repo}"));
     }
     let _creation = reg.creation.lock_safe();
-    let group = reg.create_group(repo, guardrails)?;
+    // A resume reopens a recorded orchestrator session; anything else is the human
+    // at the launcher, who has just been shown what the advanced orchestrator would
+    // run. Only the latter reads the repo's workflow file (#222) — see [`Launch`].
+    let launch = if resume_session.is_some() { Launch::Resume } else { Launch::Fresh };
+    let group = reg.create_group_ex(repo, guardrails, launch)?;
     if let Some(want) = expect_group {
         if group.id != want {
             return Err(format!(
@@ -8265,11 +10228,20 @@ fn register_orchestrator_pane(
     resume_session: Option<String>,
     initial_workers: u32,
 ) -> Result<SpawnRequest, String> {
-    let model = group.guardrails.orchestrator_model.clone();
-    // The orchestrator's CLI is per-role too (issue #4). It must be a supported
-    // CLI; the launcher only offers supported ones, so an unknown value here
-    // is a hand-edited group.json.
-    let cli = group.guardrails.cli_for(Role::Orchestrator);
+    // The orchestrator is a block like any other (#222) — it just isn't spawned
+    // through `spawn_agent_ex`, because a group has exactly one and it is minted
+    // at launch. A workflow file may still give it a persona and its own
+    // CLI/model.
+    let block = group
+        .guardrails
+        .block_for(Role::Orchestrator)
+        .cloned()
+        .ok_or("this group's workflow declares no orchestrator block")?;
+    let model = workflow::model_of(&block, &group.guardrails.agent_cli).to_string();
+    // It must be a supported CLI; the launcher only offers supported ones and
+    // the workflow parser rejects unknown ones, so an unknown value here is a
+    // hand-edited group.json.
+    let cli = workflow::cli_of(&block, &group.guardrails.agent_cli);
     if !SUPPORTED_CLIS.contains(&cli) {
         return Err(format!(
             "unsupported orchestrator CLI {cli:?} — supported: {}",
@@ -8297,6 +10269,10 @@ fn register_orchestrator_pane(
                 .map(|root| crate::sessions::copilot_session_ids(&root))
                 .unwrap_or_default()
         });
+    // The orchestrator block's persona, if the workflow file gave it one. A
+    // broken one is audited and dropped, never fatal.
+    let persona = reg.resolve_persona_or_audit(group, &block);
+    let inject = reg.persona_inject(&group.id, &block, &cli, persona.as_ref());
     let command = reg.build_agent_command(
         &cli,
         &model,
@@ -8307,6 +10283,7 @@ fn register_orchestrator_pane(
         session_id.as_deref(),
         resume,
         false, // the orchestrator is never read-only
+        &inject,
     );
     let argv = reg.build_agent_argv(
         &cli,
@@ -8318,6 +10295,7 @@ fn register_orchestrator_pane(
         session_id.as_deref(),
         resume,
         false,
+        &inject,
     );
     let entry = AgentEntry {
         id: agent_id.clone(),
@@ -8327,6 +10305,7 @@ fn register_orchestrator_pane(
         // id-default tier so it never blocks anything (the rename tool targets
         // worker/reviewer panes, not the orchestrator).
         name_source: NameSource::Default,
+        block: block.id.clone(),
         role: Role::Orchestrator,
         token: token.clone(),
         status: AgentStatus::Starting,
@@ -8384,6 +10363,10 @@ fn register_orchestrator_pane(
     reg.pending_binds.lock_safe().insert(agent_id.clone(), tx);
     let reg2 = reg.clone();
     let group2 = group.clone();
+    // Moved into the bind thread: the kickoff-injection fallback for an
+    // orchestrator block whose persona can't ride on a native flag (copilot +
+    // an inline `prompt:`). `None` for the built-in roster.
+    let kickoff_persona = inject.kickoff.clone();
     std::thread::spawn(move || {
         let Ok(pty_id) = rx.recv_timeout(BIND_TIMEOUT) else {
             reg2.pending_binds.lock_safe().remove(&agent_id);
@@ -8406,7 +10389,7 @@ fn register_orchestrator_pane(
             "[loomux] Orchestration restored: your MCP tools, the task board, and the audit log are live again in this session. Re-sync now: list_tasks, list_agents, get_state. Your previous worker panes are gone; resume a task session with spawn_agent(resume_session, cwd) when follow-ups need it. Then give the human a short status summary.".to_string()
         } else {
             match reg2.agent(&agent_id) {
-                Some(a) => reg2.kickoff_prompt(&a, &group2, ""),
+                Some(a) => reg2.kickoff_prompt(&a, &group2, "", kickoff_persona.as_deref()),
                 None => return, // agent reaped before bind; nothing to kick off
             }
         };
@@ -8421,15 +10404,39 @@ fn register_orchestrator_pane(
                 baseline,
             );
         }
-        for _ in 0..initial_workers.min(group2.guardrails.max_agents) {
-            // Empty name → derived from the minted id ("worker 2" for `w-2`),
-            // so the pane title agrees with its "W 2" badge instead of the old
-            // per-launch counter that drifted from the seq (#95r).
-            if let Err(e) = reg2.spawn_agent(&group2.id, Role::Worker, "", "", false, None)
-            {
-                reg2.audit(&group2.id, "loomux", "error",
-                    json!({ "what": "initial worker spawn failed", "err": e }));
-                break;
+        // The launcher's "initial workers" count assumes the group HAS a worker
+        // block. A repo whose `.loomux/workflow.yml` declares only reviewers
+        // (a review-only workflow) has none (#222) — and then every spawn below
+        // would fail with "declares no worker block", the human would get zero
+        // panes, and the only trace would be an audit line they'd have to go
+        // looking for. Say it out loud in the orchestrator's pane instead.
+        let starters = initial_workers.min(group2.guardrails.max_agents);
+        if starters > 0 && group2.guardrails.block_for(Role::Worker).is_none() {
+            reg2.audit(&group2.id, "loomux", "initial-workers-skipped", json!({
+                "requested": starters,
+                "why": "this repo's workflow declares no worker block",
+            }));
+            let _ = reg2.deliver_to_orchestrator(
+                &group2.id,
+                &format!(
+                    "[loomux] the launcher asked for {starters} initial worker(s), but this repo's \
+                     {} declares no worker block — none were opened. Spawn the blocks it does \
+                     declare instead (they are listed above).",
+                    workflow::WORKFLOW_PATH
+                ),
+                "loomux",
+            );
+        } else {
+            for _ in 0..starters {
+                // Empty name → derived from the minted id ("worker 2" for `w-2`),
+                // so the pane title agrees with its "W 2" badge instead of the old
+                // per-launch counter that drifted from the seq (#95r).
+                if let Err(e) = reg2.spawn_agent(&group2.id, Role::Worker, "", "", false, None)
+                {
+                    reg2.audit(&group2.id, "loomux", "error",
+                        json!({ "what": "initial worker spawn failed", "err": e }));
+                    break;
+                }
             }
         }
     });
@@ -8501,11 +10508,18 @@ pub fn resume_recorded_session(
                 .into(),
         );
     }
-    let role = match record.role.as_str() {
-        "reviewer" => Role::Reviewer,
-        "planner" => Role::Planner,
-        _ => Role::Worker,
-    };
+    // #222: an unrecognized role is REJECTED, not silently coerced to worker.
+    // This was the second of the two coercion sites (the other was the MCP
+    // `spawn_agent` kind parser); a persisted role loomux cannot name means the
+    // roster row is corrupt or from a future build, and rejoining it as a worker
+    // would hand it a worktree and write access on nothing but a guess.
+    let role = workflow::kind_from_str(&record.role).ok_or_else(|| {
+        format!(
+            "this session's recorded role {:?} is not a known capability class ({}) — refusing to rejoin it",
+            record.role,
+            workflow::kind_names()
+        )
+    })?;
     // Pull the durable roster row for this session: its cwd (where the work
     // happened) and its name tier — so a human-renamed pane rejoins at the
     // `Human` tier and stays un-clobberable, not silently demoted to
@@ -8520,9 +10534,38 @@ pub fn resume_recorded_session(
     let reg2 = reg.clone();
     let sid = session_id.to_string();
     let (group_id, name) = (record.group_id.clone(), record.agent_name.clone());
+    // Rejoin as the same BLOCK, not just the same class (#222) — a resumed
+    // `rev-security` session must come back with its persona, not as a generic
+    // reviewer. Absent (a roster row from before blocks) → `None` → the class's
+    // default block, which for the built-in roster is the same thing.
+    //
+    // A recorded block that is no longer in the roster (the workflow file renamed
+    // or dropped it since that session ran) degrades to `None` — the class default
+    // — rather than failing the rejoin. Losing the persona is a downgrade; losing
+    // the *session* is data loss, and the human has no other way to reach it.
+    // `spawn_agent_ex` is deliberately strict about an unknown block id, because
+    // for `spawn_agent(block:)` a typo should be an error — so the fallback has to
+    // happen here, where "stale" and "wrong" are distinguishable. (`kickoff_prompt`
+    // already falls back the same way for the instructions path.)
+    let block = matched
+        .as_ref()
+        .map(|r| r.block.clone())
+        .filter(|b| !b.trim().is_empty())
+        .filter(|b| {
+            let known = reg
+                .group(&record.group_id)
+                .is_some_and(|g| g.guardrails.block(b).is_some());
+            if !known {
+                reg.audit(&record.group_id, "loomux", "rejoin-block-missing", json!({
+                    "session": session_id, "block": b,
+                    "action": "rejoining as the default block for its capability class",
+                }));
+            }
+            known
+        });
     std::thread::spawn(move || {
         if let Err(e) = reg2.spawn_agent_ex(
-            &group_id, role, &name, "", false, None, None, Some(sid.clone()), cwd, restore_source,
+            &group_id, role, block, &name, "", false, None, None, Some(sid.clone()), cwd, restore_source,
         ) {
             reg2.audit(&group_id, "loomux", "error",
                 json!({ "what": "session rejoin failed", "session": sid, "err": e.clone() }));

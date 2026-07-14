@@ -180,6 +180,12 @@ fn tool_defs(role: Role) -> Vec<Value> {
         tool("list_tasks",
             "Read the group's task board (JSON array, order = priority). The human sees and edits this same board.",
             json!({}), &[]),
+        tool("list_verdicts",
+            "Read the recorded review verdicts for a PR: which reviewer block recorded what (pass | fail | escalate), when, and its summary — plus, when this repo's .loomux/workflow.yml declares a merge gate, whether that gate is satisfied. This is STATE, not a notification: it is what the loomux gh interceptor reads when it decides whether to allow `gh pr merge`. Omit pr to list every PR with a recorded verdict.",
+            json!({
+                "pr": { "type": "string", "description": "PR number, #n, or URL. Omit to list all PRs with verdicts." },
+            }),
+            &[]),
     ];
     if role == Role::Orchestrator {
         tools.extend([
@@ -187,7 +193,8 @@ fn tool_defs(role: Role) -> Vec<Value> {
                 "Open a new worker, reviewer, or planner agent pane in this group. Guardrails apply: live-agent cap and per-role pinned CLI + model. Set worktree=true for parallel work that must not collide; give branch a meaningful name either way. Empty task spawns an idle agent awaiting prompts. A planner explores the codebase read-only and writes an implementation plan as a GitHub issue comment, then reports and exits. Its read-only contract is enforced structurally where the CLI allows it — it never gets a worktree, and its file-editing tools plus git commit/push are denied at the CLI level — so it cannot edit files or push code; not opening PRs is asked of it in its instructions (gh stays available so it can post the plan comment). For a FOLLOW-UP on a finished task, pass resume_session (from list_agents/the task board) plus cwd (where that work happened) — the pane reopens that conversation with its context instead of cold-starting.",
                 json!({
                     "name": { "type": "string", "description": "Short display name for the pane" },
-                    "kind": { "type": "string", "enum": ["worker", "reviewer", "planner"], "description": "Agent role (default worker)" },
+                    "kind": { "type": "string", "enum": ["worker", "reviewer", "planner"], "description": "Capability class (default worker). An unrecognized value is rejected, never treated as a worker." },
+                    "block": { "type": "string", "description": "Id of a block declared in the repo's .loomux/workflow.yml — e.g. 'rev-security'. The block supplies the persona, CLI, model and capability class (so `kind` is ignored when this is set). Your kickoff lists the blocks this group has; omit it to get the default block for `kind`." },
                     "task": { "type": "string", "description": "Full task brief; empty = idle. With resume_session, this is the follow-up prompt." },
                     "worktree": { "type": "boolean", "description": "Create a dedicated git worktree + branch" },
                     "branch": { "type": "string", "description": "Branch name (default agent/<id>)" },
@@ -255,6 +262,19 @@ fn tool_defs(role: Role) -> Vec<Value> {
                 json!({ "text": { "type": "string" } }), &["text"]),
         ]);
     }
+    // Reviewers only: the verdict is the gate. Listed for the capability class, and
+    // re-checked in `call_tool` — the listing is cosmetic, the dispatch check is the
+    // enforcement (a worker that could file its own PASS would make the gate a prop).
+    if role == Role::Reviewer {
+        tools.push(tool("review_verdict",
+            "Record your REVIEW OUTCOME for a pull request. This is durable, attributed state — not a notification — and when this repo's .loomux/workflow.yml declares a merge gate, it is what loomux's gh interceptor reads before allowing `gh pr merge`. Call it once you have finished reviewing, after posting your review on the PR, and then report() to the orchestrator as usual. verdict: `pass` (reviewed, nothing blocking), `fail` (blocking findings — fix and re-review), `escalate` (you will not decide this one: ambiguous requirement, out of your depth, a risk you won't sign off on — a human must look). fail and escalate BOTH refuse the merge, and one blocking verdict beats any number of passes, so never record `pass` to be agreeable or to unblock the queue. Your verdict is bound to the PR's CURRENT HEAD COMMIT: if the author pushes anything afterwards, your pass goes STALE and the gate reopens until you review the new commits and record again — so review the head as it stands, and expect to be asked again after a fix. Re-recording replaces your own earlier verdict (that is how you upgrade a `fail` to a `pass`, and how you refresh a stale one). The summary must stand on its own for a human reading it a week later: what you reviewed, and what decided the verdict. Verdict words are lowercase.",
+            json!({
+                "pr": { "type": "string", "description": "PR number, #n, or URL — the PR you reviewed." },
+                "verdict": { "type": "string", "enum": ["pass", "fail", "escalate"], "description": "pass | fail | escalate, lowercase. Never guessed: an unrecognized value is rejected." },
+                "summary": { "type": "string", "description": "Why. One or two lines a human can act on." },
+            }),
+            &["pr", "verdict", "summary"]));
+    }
     tools
 }
 
@@ -317,11 +337,45 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
 
         "spawn_agent" => {
             require_orchestrator(caller)?;
-            let kind = match arg_str(args, "kind").unwrap_or("worker") {
-                "reviewer" => Role::Reviewer,
-                "planner" => Role::Planner,
-                _ => Role::Worker,
+            // An unrecognized kind is REJECTED (#222). This used to be
+            // `_ => Role::Worker` — so a typo'd or hallucinated kind silently
+            // became a *worker*, complete with a worktree and write access. A
+            // capability class is the one thing that must never be guessed.
+            let kind = match arg_str(args, "kind") {
+                None => Role::Worker, // documented default
+                Some(k) => super::workflow::kind_from_str(k).ok_or_else(|| {
+                    format!(
+                        "unknown kind {k:?} — must be one of {}",
+                        super::workflow::kind_names()
+                    )
+                })?,
             };
+            // ...but `orchestrator` is a kind loomux *can* name, and this tool is
+            // the one place an agent chooses one. Delegates only.
+            //
+            // This check is load-bearing, and it is easy to lose: before #222 the
+            // `_ => Role::Worker` catch-all above happened to swallow
+            // `kind: "orchestrator"` too, so nothing else ever had to say no.
+            // Making unknown kinds an error removed that accident — and an
+            // orchestrator-kind spawn is exempt from the live-agent cap AND the
+            // spawn-rate backstop (both sit inside `if role != Role::Orchestrator`
+            // in `spawn_agent_ex`) AND resolves to `Caller.role == Orchestrator`,
+            // which is what `require_orchestrator` gates the privileged tools on.
+            // An orchestrator that called `spawn_agent(kind: "orchestrator")` in a
+            // loop would fork-bomb the machine with fully-privileged panes.
+            // The JSON-schema `enum` in `tool_defs` is advertisement; it is never
+            // enforced against the incoming arguments. This is the enforcement.
+            if kind == Role::Orchestrator {
+                return Err(
+                    "kind must be worker | reviewer | planner — a group has exactly one \
+                     orchestrator (you), opened at launch"
+                        .into(),
+                );
+            }
+            // A block names one of the repo's declared personas (#222). Its
+            // `kind` is authoritative when set, so `kind` above is only the
+            // fallback for a plain spawn.
+            let block = arg_str(args, "block").map(str::to_string);
             let task = arg_str(args, "task").unwrap_or("");
             let name = arg_str(args, "name").unwrap_or("");
             let worktree = args.get("worktree").and_then(Value::as_bool).unwrap_or(false);
@@ -330,7 +384,7 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             let resume = arg_str(args, "resume_session").map(str::to_string);
             let cwd = arg_str(args, "cwd").map(str::to_string);
             let resumed = resume.is_some();
-            let a = reg.spawn_agent_ex(&caller.group, kind, name, task, worktree, branch, base, resume, cwd, None)?;
+            let a = reg.spawn_agent_ex(&caller.group, kind, block, name, task, worktree, branch, base, resume, cwd, None)?;
             // Copilot mints its session id a few seconds into boot; loomux
             // binds it to the pane once it appears (visible then in
             // list_agents / the task board).
@@ -340,9 +394,10 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                 .map(|s| format!("Session {s}."))
                 .unwrap_or_else(|| "Session id will appear in list_agents once Copilot initializes.".into());
             Ok(format!(
-                "spawned {} (\"{}\", {:?}){}. {} It will report when ready.",
+                "spawned {} (\"{}\", block {}, {:?}){}. {} It will report when ready.",
                 a.id,
                 a.name,
+                a.block,
                 a.role,
                 if resumed { " resuming its previous session" } else { "" },
                 session,
@@ -434,6 +489,66 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             }
             Ok("reported to orchestrator".into())
         }
+        "review_verdict" => {
+            // Authorization is enforced twice on purpose: here, and again in
+            // `record_verdict` next to the write. A verdict is what opens a merge
+            // gate, so "only a reviewer may record one" must not depend on a single
+            // check in a JSON shim.
+            if caller.role != Role::Reviewer {
+                return Err("permission denied: review_verdict is for reviewer-kind blocks — \
+                            use report(status, summary)".into());
+            }
+            let pr = arg_str(args, "pr").ok_or("pr required")?;
+            let verdict = arg_str(args, "verdict").ok_or("verdict required")?;
+            let summary = arg_str(args, "summary").ok_or("summary required")?;
+            let rec = reg.record_verdict(&caller.group, &caller.agent_id, pr, verdict, summary)?;
+            // A verdict is also news: the orchestrator is the one that decides what
+            // happens next (send the findings back to the worker, ask the human,
+            // merge), and loomux's design norm is that agent→agent traffic arrives
+            // as a VISIBLE prompt in the recipient's pane — never a side channel.
+            let gate = reg.gate_status_line(&caller.group, rec.pr);
+            let _ = reg.deliver_to_orchestrator(
+                &caller.group,
+                &format!(
+                    "[loomux] {} ({}) recorded verdict {} on PR #{}: {}{}",
+                    caller.agent_id,
+                    rec.block,
+                    rec.verdict.as_str().to_uppercase(),
+                    rec.pr,
+                    rec.summary,
+                    gate.as_deref().map(|g| format!("\n[loomux] {g}")).unwrap_or_default(),
+                ),
+                &caller.agent_id,
+            );
+            Ok(format!(
+                "recorded: {} on PR #{} attributed to block {}. {}",
+                rec.verdict.as_str().to_uppercase(),
+                rec.pr,
+                rec.block,
+                gate.unwrap_or_else(|| "This group declares no merge gate, so the verdict is \
+                    recorded for the humans and the orchestrator to read; the human merge gate \
+                    is unchanged.".into()),
+            ))
+        }
+        "list_verdicts" => {
+            let prs = match arg_str(args, "pr") {
+                Some(pr) => vec![super::pr_number(pr)
+                    .ok_or_else(|| format!("no PR number found in {pr:?}"))?],
+                None => reg.verdict_prs(&caller.group),
+            };
+            let out: Vec<Value> = prs
+                .into_iter()
+                .map(|pr| {
+                    json!({
+                        "pr": pr,
+                        "verdicts": reg.verdicts(&caller.group, pr),
+                        "gate": reg.gate_status_line(&caller.group, pr),
+                    })
+                })
+                .collect();
+            Ok(serde_json::to_string(&out).unwrap_or_default())
+        }
+
         "message_orchestrator" => {
             if caller.role == Role::Orchestrator {
                 return Err("you are the orchestrator".into());

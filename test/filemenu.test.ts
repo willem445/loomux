@@ -218,7 +218,16 @@ test("PARITY: a RESULT-sourced target gets the same menu as a LISTING-sourced on
 test("PARITY: the affordances declared results:true are all actually offered on a result", () => {
   // The registry could lie in the other direction — claiming parity it doesn't have. Cross-
   // check it against what the menu really builds for a result-sourced target.
-  const offered = new Set(menuActions(buildContextMenu(fileTarget, WIN, HASH_ALGOS)).map((a) => a.kind));
+  //
+  // The sample is every row SHAPE the menu branches on, not one row: `workflow-pane` (#222)
+  // is offered only on a .yml/.yaml row, so checking a lone .pdf would fail it for being
+  // conditional rather than for lacking parity — and parity here is a claim about the
+  // RESULTS VIEW ("does this work when the row came from Go-to-file?"), never about file
+  // types. Both rows below are result-sourced, which is the thing under test.
+  const rows: OpTarget[] = [fileTarget, { ...fileTarget, rel: "a/flow.yml", name: "flow.yml" }];
+  const offered = new Set(
+    rows.flatMap((t) => menuActions(buildContextMenu(t, WIN, HASH_ALGOS)).map((a) => a.kind))
+  );
   for (const a of ROW_AFFORDANCES) {
     if (!a.results) continue;
     // Some affordances are row CHROME, not commands — the right-click itself, the inline
@@ -308,6 +317,59 @@ test("a FOLDER offers it too, and the label says what it will actually do", () =
   const item = must(menu, "Open folder in editor pane");
   assert.ok(!item.disabled);
   assert.deepEqual(item.action, { kind: "edit-pane", target: dirTarget });
+});
+
+// ---------- open in a workflow pane (#222) ----------
+
+test("a YAML file offers 'Open in workflow pane', bound to that file's path", () => {
+  // The workflow pane reads a .yml as a WORKFLOW — blocks, edges, the merge gate — rather
+  // than as text. Like every other command, the action carries the row's PATH (bound at
+  // menu-open), so it opens the file that was clicked.
+  const yaml: OpTarget = { rel: ".loomux/workflow.yml", name: "workflow.yml", isDir: false, isSymlink: false, from: "listing" };
+  const item = must(buildContextMenu(yaml, WIN, HASH_ALGOS), "Open in workflow pane");
+  assert.ok(!item.disabled);
+  assert.deepEqual(item.action, { kind: "workflow-pane", target: yaml });
+
+  // …and from a Go-to-file RESULT too — a path is a path wherever it was clicked from.
+  const fromResults: OpTarget = { ...yaml, from: "results" };
+  assert.deepEqual(must(buildContextMenu(fromResults, WIN, HASH_ALGOS), "Open in workflow pane").action, {
+    kind: "workflow-pane",
+    target: fromResults,
+  });
+});
+
+test("only a YAML file offers it — no other row can have a workflow in it", () => {
+  // An item that appeared on every file and then told you the file has no workflow in it
+  // would be a menu that wastes a click to say no.
+  assert.equal(find(buildContextMenu(fileTarget, WIN, HASH_ALGOS), "Open in workflow pane"), undefined);
+  assert.equal(find(buildContextMenu(dirTarget, WIN, HASH_ALGOS), "Open in workflow pane"), undefined);
+  const yml: OpTarget = { ...fileTarget, rel: "ci/deploy.yaml", name: "deploy.yaml" };
+  assert.ok(find(buildContextMenu(yml, WIN, HASH_ALGOS), "Open in workflow pane"));
+});
+
+test("a SYMLINK's workflow item is offered but disabled, like every other op on it", () => {
+  // Consistency with the symlink rule: every op is refused (the backend lstats the final
+  // component), and the menu says why rather than offering six items that all end in the
+  // same toast.
+  const link: OpTarget = { rel: "link.yml", name: "link.yml", isDir: false, isSymlink: true, from: "listing" };
+  const item = must(buildContextMenu(link, WIN, HASH_ALGOS), "Open in workflow pane");
+  assert.equal(item.disabled, true);
+  assert.match(item.reason!, /symlink/i);
+});
+
+test("PARITY: the workflow item is declared in ROW_AFFORDANCES", () => {
+  // The generic parity test above walks a .pdf target, where this item correctly does not
+  // appear — so the registry cross-check for it has to be made on a row that CAN offer it,
+  // or the declaration requirement would quietly not apply to the one kind that is
+  // conditional.
+  const yaml: OpTarget = { ...fileTarget, rel: "a.yml", name: "a.yml" };
+  const offered = new Set(menuActions(buildContextMenu(yaml, WIN, HASH_ALGOS)).map((a) => a.kind));
+  assert.ok(offered.has("workflow-pane"));
+  const declared = new Set(ROW_AFFORDANCES.map((a) => a.affordance));
+  for (const kind of offered) {
+    if (kind === "new-folder" || kind === "new-file") continue;
+    assert.ok(declared.has(kind as RowAffordance), `the menu offers "${kind}" but ROW_AFFORDANCES doesn't declare it`);
+  }
 });
 
 // ---------- a delete in flight (#216) ----------

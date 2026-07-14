@@ -20,7 +20,8 @@
 //                 autonomous orchestrator (#83) may idle-tick and spawn a worker
 //                 storm (#78) — so the credit-safety stance stays exactly here.
 //   - Content   → re-open the pane at its recorded root: the file MANAGER (#214),
-//                 the file EDITOR, or the GIT view (#217). No process, no session,
+//                 the file EDITOR, the GIT view (#217), or the WORKFLOW pane (#222).
+//                 No process, no session,
 //                 nothing to resume — they're pure content, so they come straight
 //                 back. Whether the root still exists (and, for git, is still a
 //                 repo) is I/O, which this pure module can't do: each action carries
@@ -120,6 +121,18 @@ export type RestoreAction =
       type: "open-git";
       name: string;
       root: string | null;
+    }
+  | {
+      // A WORKFLOW pane (#222), back over its recorded repo, showing the workflow file it
+      // was showing. Same contract as open-editor — a root plus a path, never a buffer —
+      // and the same probe (is the root still a readable directory?), because the workflow
+      // file itself NOT existing is not a failure: the pane opens on its empty state and
+      // offers to create one. A repo that has been deleted or unmounted is a different
+      // matter, and fails soft to the welcome form in that slot.
+      type: "open-workflow";
+      name: string;
+      root: string | null;
+      file: string | null;
     };
 
 /** True when a recorded agent session id still has a resumable conversation on
@@ -159,6 +172,12 @@ export function planPaneRestore(pane: PersistedPane, resumable?: SessionResumabl
       // unlock that survived a restart would be the one piece of this pane's state
       // that could quietly cost you something.
       return { type: "open-git", name: pane.name, root: pane.cwd };
+    case "workflow":
+      // Same deal (#222): the pane comes back over the repo it was pointed at, on the
+      // workflow file it was editing — re-read from disk. The block SELECTION and the
+      // open tab are view state, not layout: a restored workflow pane opens on its roster
+      // exactly like a freshly opened one.
+      return { type: "open-workflow", name: pane.name, root: pane.cwd, file: pane.file };
     case "agent":
       // Auto-resume when we have a session id AND the hybrid is enabled; else a
       // dormant Start placeholder (no id to resume into, or the flip is off).
