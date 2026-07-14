@@ -552,6 +552,32 @@ export const groupPaused = (groupId: string): Promise<boolean> =>
 export const groupUsage = (groupId: string): Promise<GroupUsage> =>
   invoke<GroupUsage>("orch_group_usage", { groupId });
 
+// ---------- CI watches (#243/#248): the group view's "⏳ waiting on …" indicator ----------
+
+/** One live `notify_when` watch, as surfaced across a whole group's agents —
+ *  the same registry state the `notify_when`/`list_notifications` MCP tools
+ *  read, not a second store. Unlike `list_notifications` (self-scoped by
+ *  design, MCP-callable by an agent), this is read group-wide because it's a
+ *  Tauri command reached only from the trusted webview. */
+export interface GroupWatch {
+  id: string;
+  /** The watching agent's id — lets groupview.ts group rows by agent. */
+  agent: string;
+  /** "pr_checks" | "workflow_run". */
+  kind: string;
+  /** Human label, e.g. "PR #241 checks" / "run 17812". */
+  target: string;
+  /** The agent's own note, verbatim (may be empty). */
+  note: string;
+  /** Absolute Unix-ms deadline. */
+  expires_ms: number;
+}
+
+/** Every live watch for a group's agents, for the group view's per-agent
+ *  indicator. */
+export const groupWatches = (groupId: string): Promise<GroupWatch[]> =>
+  invoke<GroupWatch[]>("orch_group_watches", { groupId });
+
 // ---------- group lifecycle: summary + end-orchestration (#8) ----------
 
 /** One live agent in a group lifecycle summary. */

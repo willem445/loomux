@@ -151,6 +151,7 @@ pub fn run() {
             orchestration::orch_autonomy,
             orchestration::orch_group_usage,
             orchestration::orch_group_summary,
+            orchestration::orch_group_watches,
             orchestration::orch_end_group,
             cliprobe::probe_agent_cli,
             editor::open_in_editor,

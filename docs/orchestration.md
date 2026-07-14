@@ -173,6 +173,15 @@ still live), so it re-lists to recover what it was waiting on; closing loomux dr
 *itself* — the registry is empty on the next launch — so it must be re-registered from
 scratch, not merely re-listed.
 
+**Where you see it.** A watch is visible from *your* side too, not just the agent's. The
+group lifecycle panel (`Alt+O`) shows a **⏳ waiting on PR #241 checks (expires in 43 min)**
+line under any agent holding one — the reason a worker sitting quietly is waiting on CI, not
+stuck. Without it, a correctly-waiting agent and a genuinely hung one look identical until you
+open the audit log; the internal watchdog nudge the orchestrator gets for a silent agent says
+so too, when the silent agent holds a live watch. The audit viewer (`Alt+A`) has a one-line
+sentence for each of a watch's six lifecycle events (registered, fired, expired, failed,
+cancelled, cleaned up on agent exit) instead of raw JSON.
+
 ## Group lifecycle
 
 The orchestrator pane has a lifecycle toggle (`Alt+O` or the group icon) with a
