@@ -196,7 +196,7 @@ edit the workflow from any of them:
   draw an edge, click an edge and **✕** (or `Delete`) to erase it, **+ Block** to add one.
 
 The graph is a second way to *edit the file*, never a second source of truth: every gesture
-goes through the same model and the same canonical formatter as a form edit, so the canvas
+goes through the same model and the same comment-preserving writer as a form edit, so the canvas
 cannot express anything the YAML can't. Two things it will not do, both on purpose. It
 **never invents an id** — creating a block asks you for one, because an id is immutable and
 is what edges and gates reference (the tools that auto-generate `node_1720794829558` produce
@@ -258,12 +258,22 @@ one line of what a workflow is, the roster it is about to write, and a **Create 
 button that scaffolds a real, commented, valid `.loomux/workflow.yml` (today's plan → work
 → review pipeline, gate included) and drops you into the canvas on it.
 
-Editing through the **form or the canvas** rewrites the file from the workflow model, in
-canonical form — which keeps diffs small and the file legible, but **does not preserve
-comments**. So the first save that would do that asks first, naming what it costs ("the comments
-on 60 lines will be dropped"), with Cancel as the default; a file loomux itself wrote is already
-canonical and saves silently. The **YAML tab always saves exactly what you typed**, comments and
-all.
+Editing through the **form or the canvas** rewrites the file from the workflow model — but it
+**preserves comments, blank-line spacing and key order for every part of the file the edit
+didn't touch**: renaming a block, dragging an edge or deleting a node only rewrites the piece
+that changed (that block, or the whole `edges:`/`gates:` section), and reuses the original text
+for everything else. The piece that changed serializes in loomux's canonical form, same as
+always — comment-preserving is the bar for the parts you *didn't* edit, not full fidelity
+everywhere.
+
+The **Format** button is the exception, and it is explicit: it rewrites the *whole* file into
+canonical form in one step — fixed key order, references sorted by the roster, no comments —
+which is occasionally worth doing (cleaning up a hand-edited file) but does cost whatever
+comments the file had. So Format asks first the one time it would actually drop something
+("the comments on 60 lines will be dropped"), with Cancel as the default; a file already in
+canonical form (anything loomux itself wrote) formats silently. The **YAML tab always saves
+exactly what you typed**, comments and all — neither the ordinary save path nor Format touches
+it.
 
 The file is saved through the same hash-guarded path the editor uses, so an agent rewriting
 it under you is a **conflict** you get to resolve, not a silent overwrite — and unsaved
