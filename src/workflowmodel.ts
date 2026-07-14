@@ -310,7 +310,25 @@ class YamlReader {
         this.i = p.i + 1;
         continue;
       }
-      if (p.text.startsWith("-")) break; // a sequence at this level ends the mapping
+      if (p.text.startsWith("-")) {
+        // `mapping(0)` is only ever called once, from `document()` — there is no enclosing
+        // key left to hand this sequence off to (contrast a nested call, where `indent > 0`
+        // and the caller — `afterKey`/`sequence` — is waiting for exactly this handoff).
+        // Breaking silently here would drop everything from this line to EOF with no finding
+        // at all (#270: a hand-edited orphan `-` line truncates the whole rest of the file).
+        // Report it, consume the whole orphan sequence so the rest of the document can still
+        // be read, and keep going — the same "report and skip" shape as the tab and
+        // over-indented-line guards above.
+        if (indent === 0) {
+          this.err(
+            p.i,
+            `unexpected "-" at the top level — a workflow file is a mapping (version:, blocks:, …); this sequence belongs to no key`
+          );
+          this.sequence(indent);
+          continue;
+        }
+        break; // a sequence at this level ends the mapping, handed off to the enclosing key
+      }
       const split = splitKey(p.text);
       if (!split) {
         this.err(p.i, `expected "key: value" but found "${p.text}"`);
