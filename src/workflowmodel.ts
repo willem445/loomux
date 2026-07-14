@@ -909,6 +909,16 @@ function opaqueScalarIndices(seg: readonly string[]): Set<number> {
     const split = splitKey(stripped.trim());
     if (split && BLOCK_SCALAR_HEADER_RE.test(split.rest)) scalarIndent = indentOf(stripped);
   }
+  // A scalar that runs to the very END of `seg` with no dedent line to close it (its governing
+  // key was the LAST field of the LAST item in this segment) leaves `scalarIndent` open through
+  // every trailing blank line — but a block scalar's OWN reader (`blockScalar`, above) already
+  // drops its trailing blank body lines during chomping, so there is nothing structural left for
+  // those blanks to belong to. Un-mark a purely trailing run of them so the ordinary trivia peel
+  // can still separate this item from whatever comes after it, instead of leaving that blank line
+  // stuck as "content" and then getting a SECOND, synthetic one stacked in front of it whenever
+  // the next item is regenerated (round 2's stray-double-blank-line finding).
+  let end = seg.length - 1;
+  while (end >= 0 && seg[end]!.trim() === "") opaque.delete(end--);
   return opaque;
 }
 
@@ -973,6 +983,14 @@ function splitDocument(text: string): SplitDocument | null {
     if (/^[ ]*\t/.test(line) || indentOf(line) !== 0) return null;
     const split = splitKey(stripComment(line).trim());
     if (!split) return null;
+    // An ORPHAN dash sequence — a `- id: …` line at column 0 that is not itself the same-column
+    // continuation of a preceding empty-rest key (that case is handled above, per-entry, via
+    // `sameColumnSeq`) — is not a top-level key at all; `splitKey` only returned one here because
+    // "- id: a" contains a `: ` too. Reading it as a fresh key is exactly the B1 mistake one
+    // level up: the real reader's `mapping()` would have stopped at this line already (filed
+    // separately — the reader silently truncates here instead of raising a finding), so trusting
+    // this scan's own read of it could front-splice roster content or lose it outright. Bail.
+    if (split.key.startsWith("-")) return null;
     const header = [...pendingTrivia, line];
     pendingTrivia = [];
     i++;
@@ -1139,7 +1157,14 @@ export function serializeWorkflowPreserving(w: Workflow, originalText: string): 
   // NEW neighbor at every reuse, which is more machinery than the cosmetic cost justifies here,
   // and the pane's own UI has no "reorder" gesture — this only arises from a hand edit.
   if (!w.blocks.length) {
-    out.push("", "blocks: []");
+    // Same header/content split as `blocks:`'s own non-empty case just below (and edges/gates,
+    // further down): the comment introducing the ROSTER ("# BLOCKS — the agents a run may
+    // use…") is about the section, not about any one block, so it survives the roster being
+    // emptied out too — only the LAST line of the header (the `blocks:`/`blocks: […]` key line
+    // itself) is replaced with the canonical empty form.
+    const blocksEntry = doc.entries.find((e) => e.key === "blocks");
+    if (blocksEntry) out.push(...blocksEntry.header.slice(0, -1), "blocks: []");
+    else out.push("", "blocks: []");
   } else {
     const blocksEntry = doc.entries.find((e) => e.key === "blocks");
     const split = blocksEntry ? splitBlockItems(blocksEntry.content) : null;

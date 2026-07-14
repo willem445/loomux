@@ -781,6 +781,96 @@ blocks:
   assert.deepEqual(parseWorkflow(out).workflow, edited);
 });
 
+test("an ORPHAN column-0 dash sequence (no owning key at all) safely falls back — nothing is lost", () => {
+  // Round 2: the same-column fix above only recognizes a `- …` line as sequence CONTENT when it
+  // directly follows an empty-rest key (`blocks:` with nothing after the colon). A `- id: a`
+  // line with NO such key before it at all — nobody wrote `blocks:` — is an ORPHAN: `splitKey`
+  // still returns a "key" for it (`- id`, since the text contains a `: `), and reading THAT as a
+  // fresh top-level key is the same B1 mistake with no governing key to blame it on. The real
+  // reader's `mapping()` stops here too (filed separately as its own issue: it does so SILENTLY,
+  // with no finding) — so `orig.workflow.blocks` is already empty by the time this scan sees it.
+  const text = `version: 1
+- id: a
+  name: A
+  kind: worker
+  cli: claude
+`;
+  const { workflow: orig } = parseWorkflow(text);
+  assert.equal(orig.blocks.length, 0, "sanity: the real reader never reads this as a roster at all");
+
+  // A block added through the form (`orig` had none) must survive being written back and
+  // reloaded — not get silently swallowed by a scan that trusted the orphan dash as a key.
+  const withBlock = addBlock(orig, newBlock("w", "W"));
+  const out = serializeWorkflowPreserving(withBlock, text);
+  const reloaded = parseWorkflow(out).workflow;
+  assert.deepEqual(reloaded.blocks.map((b) => b.id), ["w"], "the added block must survive a reload");
+});
+
+test("no double blank line when a regenerated item follows one whose scalar ran to the segment's end", () => {
+  // Round 2: a `prompt: |` that is the LAST field of an item, followed by exactly one blank
+  // line before the next item, is ambiguous — the blank line could be trailing content of the
+  // scalar (which the real reader's own chomping would discard) or the ordinary separator
+  // before the next item. `opaqueScalarIndices` used to leave it "stuck" inside the (never
+  // properly closed) scalar for the rest of the segment, so it stayed as unpeelable content of
+  // item `a` — and when item `b` was then regenerated, the synthetic separator this function
+  // always inserts before a regenerated item stacked a SECOND blank line on top of it.
+  const text = `version: 1
+blocks:
+  - id: a
+    name: A
+    kind: worker
+    cli: claude
+    prompt: |
+      line one
+
+  - id: b
+    name: B
+    kind: worker
+    cli: claude
+`;
+  const { workflow } = parseWorkflow(text);
+  const edited = {
+    ...workflow,
+    blocks: workflow.blocks.map((b) => (b.id === "b" ? { ...b, model: "opus" } : b)),
+  };
+  const out = serializeWorkflowPreserving(edited, text);
+  assert.doesNotMatch(out, /\n\n\n/, "at most one blank line between the two items");
+  assert.deepEqual(parseWorkflow(out).workflow, edited);
+});
+
+test("emptying the roster keeps the section's own header comment, not just a bare `blocks: []`", () => {
+  const text = `version: 1
+# BLOCKS — the agents a run may use, closed-set kind:
+blocks:
+  - id: a
+    name: A
+    kind: worker
+    cli: claude
+`;
+  const { workflow } = parseWorkflow(text);
+  const emptied = { ...workflow, blocks: [] };
+  const out = serializeWorkflowPreserving(emptied, text);
+  assert.match(out, /# BLOCKS — the agents a run may use, closed-set kind:/);
+  assert.match(out, /^blocks: \[\]$/m);
+  assert.deepEqual(parseWorkflow(out).workflow, emptied);
+});
+
+test("CRLF line endings are preserved end to end, on every platform (#233 non-blocking #3)", () => {
+  // A 5-line fixture with EXPLICIT `\r\n`, so this is pinned independent of what line ending
+  // the test runner's own checkout happens to have (the dogfood test exercises the real file's
+  // actual bytes, which on a Linux CI runner may be LF even though this repo targets Windows).
+  const text = "version: 1\r\nblocks:\r\n  - id: w\r\n    name: W\r\n    kind: worker\r\n";
+  const { workflow } = parseWorkflow(text);
+
+  assert.equal(serializeWorkflowPreserving(workflow, text), text, "a no-op must reproduce it byte for byte");
+
+  const edited = { ...workflow, blocks: [{ ...workflow.blocks[0]!, cli: "claude" }] };
+  const out = serializeWorkflowPreserving(edited, text);
+  assert.ok(out.includes("\r\n"), "CRLF survives an edit too");
+  assert.ok(!/[^\r]\n/.test(out), "no bare LF snuck in anywhere");
+  assert.deepEqual(parseWorkflow(out).workflow, edited);
+});
+
 // ---------- broken files still open ----------
 
 test("a file that cannot be fully understood still opens, with findings", () => {
