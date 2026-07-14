@@ -26,6 +26,14 @@ jobs:
           node-version: 22
           cache: npm
 
+      # Fast mechanical backstop for release bumps (#274): the five version
+      # fields (package.json, package-lock.json x2, npm/package.json,
+      # tauri.conf.json, Cargo.toml, Cargo.lock) must all agree. v0.8.0
+      # shipped with a stale package-lock.json (#224) because that check was
+      # checklist-only — fail the build on drift instead.
+      - name: Check version consistency
+        run: node scripts/check-versions.js
+
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: swatinem/rust-cache@v2
