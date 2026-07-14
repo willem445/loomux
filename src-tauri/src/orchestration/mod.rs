@@ -1757,6 +1757,27 @@ pub fn watchdog_should_notify(
     now_ms.saturating_sub(silent_since_ms) >= (threshold_min as u64) * 60_000
 }
 
+/// Compose the watchdog stall notice delivered to the orchestrator. Split out
+/// of `watchdog_tick` (the `watch_fired_notice`-style idiom from notify.rs) so
+/// the #248 annotation is unit-testable with a plain bool, no registry/app
+/// needed. `has_live_watch` mirrors `watchdog_tick`'s other injected inputs
+/// (`outputs`): the caller looks it up from the same `watches` map
+/// `notify_tick` already owns (no second store) rather than this function
+/// reaching for it itself. The annotation sits between the stall observation
+/// and the recovery instructions — a correctly-WAITING agent parked on a CI
+/// watch reads differently from a genuinely stuck one, right where the human
+/// decides whether to intervene (issue #248).
+pub fn watchdog_stall_notice(name: &str, id: &str, minutes: u32, has_live_watch: bool) -> String {
+    let watch_note = if has_live_watch {
+        " It has a live CI watch registered — may be deliberately waiting, not stuck."
+    } else {
+        ""
+    };
+    format!(
+        "[loomux] watchdog: agent {name} ({id}) has produced no terminal output and sent no report for {minutes}+ min — it may be stalled or waiting on input.{watch_note} Inspect it with get_output(\"{id}\"); if its kickoff was lost or it is stuck, re-send the task with send_prompt. You will get this notice at most once per stall."
+    )
+}
+
 /// Autonomous mode (#83): whether an idle tick should fire for an orchestrator
 /// that has been output-quiet since `quiet_since_ms`. Pure so the threshold /
 /// latch / per-hour-cap / clock-skew rules are testable without threads or a real
@@ -5353,8 +5374,16 @@ impl OrchRegistry {
     /// anyway, so we must not spend the one-notice budget while paused.
     /// Returns the notified agent ids. Split from the pty read
     /// (`agent_output_totals`) so the stall / anti-nag / pause logic is
-    /// testable with synthetic counters and no threads.
-    pub fn watchdog_tick(&self, now: u64, outputs: &HashMap<String, u64>) -> Vec<String> {
+    /// testable with synthetic counters and no threads. `has_watch` is the set
+    /// of agent ids currently holding a live `notify_when` watch (#248) — an
+    /// injected input like `outputs`, not a lock this function takes itself, so
+    /// it stays testable with a plain `HashSet` and no registry-watches state.
+    pub fn watchdog_tick(
+        &self,
+        now: u64,
+        outputs: &HashMap<String, u64>,
+        has_watch: &HashSet<String>,
+    ) -> Vec<String> {
         let thresholds: HashMap<String, u32> = self
             .groups
             .lock_safe()
@@ -5405,13 +5434,12 @@ impl OrchRegistry {
 
         let mut notified = Vec::new();
         for (id, group, name, minutes) in to_notify {
+            let watching = has_watch.contains(&id);
             self.audit(&group, "loomux", "watchdog-stall",
-                json!({ "agent": id, "name": name, "silent_minutes": minutes }));
+                json!({ "agent": id, "name": name, "silent_minutes": minutes, "has_live_watch": watching }));
             let _ = self.deliver_to_orchestrator(
                 &group,
-                &format!(
-                    "[loomux] watchdog: agent {name} ({id}) has produced no terminal output and sent no report for {minutes}+ min — it may be stalled or waiting on input. Inspect it with get_output(\"{id}\"); if its kickoff was lost or it is stuck, re-send the task with send_prompt. You will get this notice at most once per stall."
-                ),
+                &watchdog_stall_notice(&name, &id, minutes, watching),
                 "loomux",
             );
             notified.push(id);
@@ -5423,7 +5451,11 @@ impl OrchRegistry {
     /// timer by `start_watchdog`.
     pub fn run_watchdog(&self, now: u64) -> Vec<String> {
         let outputs = self.agent_output_totals();
-        self.watchdog_tick(now, &outputs)
+        // Same registry state `notify_tick`/`list_notifications` read (#248) —
+        // no second store. Just the agent ids, not the watches themselves:
+        // `watchdog_tick` only needs to know whether to annotate, not what.
+        let has_watch: HashSet<String> = self.watches.lock_safe().values().map(|w| w.agent.clone()).collect();
+        self.watchdog_tick(now, &outputs, &has_watch)
     }
 
     // ---------- notification backend (#243): register-and-move-on CI/run watches ----------
@@ -5467,13 +5499,15 @@ impl OrchRegistry {
         let now = now_ms();
         let expires_minutes = notify::clamp_expires_minutes(Some(expires_minutes));
         let ttl_ms = expires_minutes as u64 * 60_000;
-        let id = format!("n-{}", self.notify_seq.fetch_add(1, Ordering::Relaxed) + 1);
+        let seq = self.notify_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let id = format!("n-{seq}");
         let watch = notify::Watch {
             id: id.clone(),
             group: group.to_string(),
             agent: agent.to_string(),
             condition,
             note,
+            seq,
             registered_ms: now,
             deadline_ms: now + ttl_ms,
             nominal_ttl_ms: ttl_ms,
@@ -5490,12 +5524,59 @@ impl OrchRegistry {
     }
 
     /// The caller's own live watches (`list_notifications`), oldest-registered
-    /// first.
+    /// first — `(registered_ms, seq)`, so a real-clock tie (two watches
+    /// registered in the same millisecond) breaks deterministically on true
+    /// call order instead of the HashMap's arbitrary iteration order (see
+    /// `Watch::seq`'s doc).
     pub fn list_notifications(&self, agent: &str) -> Value {
         let watches = self.watches.lock_safe();
         let mut mine: Vec<&notify::Watch> = watches.values().filter(|w| w.agent == agent).collect();
-        mine.sort_by_key(|w| w.registered_ms);
+        mine.sort_by_key(|w| (w.registered_ms, w.seq));
         json!(mine.into_iter().map(notify::watch_json).collect::<Vec<_>>())
+    }
+
+    /// Every live watch belonging to any of `group`'s agents — id, agent, kind,
+    /// target, note, expiry — for the group view's per-agent "⏳ waiting on …"
+    /// indicator (#248). Reads the same `watches` map `list_notifications` and
+    /// `notify_tick` do; there is no second store. Unlike `list_notifications`
+    /// (self-scoped by design — it's MCP-callable, so an agent may only ever
+    /// see its own), this is a Tauri command reached only from the trusted
+    /// webview (CLAUDE.md constraint 5), so reading across the whole group's
+    /// roster is fine. Oldest-registered first — `(registered_ms, seq)`,
+    /// matching `list_notifications`'s tie-break.
+    pub fn group_watches(&self, group: &str) -> Value {
+        let watches = self.watches.lock_safe();
+        let mut mine: Vec<&notify::Watch> = watches.values().filter(|w| w.group == group).collect();
+        mine.sort_by_key(|w| (w.registered_ms, w.seq));
+        json!(mine
+            .into_iter()
+            .map(|w| json!({
+                "id": w.id,
+                "agent": w.agent,
+                "kind": w.condition.kind(),
+                "target": w.condition.label(),
+                // `note` is agent-supplied and deliberately unsanitized at
+                // registration (correct for `list_notifications`, which hands an
+                // agent its own text back) — but THIS command crosses a new
+                // boundary, into the trusted webview, for every agent's note, not
+                // just the reader's own. So strip control chars and neutralize the
+                // `[loomux]` marker here with the same `sanitize_gh_text` the
+                // fired/expired/failed notices already use — that closes the
+                // notice/log-forging class this string could otherwise carry.
+                // It does NOT html-escape: an HTML metacharacter payload (e.g. an
+                // `<img onerror=...>`) crosses this call untouched (escaping in a
+                // JSON payload would be the wrong layer anyway — it corrupts the
+                // data for every non-HTML consumer). The thing standing between
+                // an agent's note and script execution is, and must remain, that
+                // the renderer only ever assigns it to a `.title`/`textContent`
+                // DOM PROPERTY, never `innerHTML` (true today — zero `innerHTML`
+                // in this diff, rev-orch PR #252 round 2). Do not relax that
+                // renderer rule on the theory that "the backend sanitizes it" —
+                // it sanitizes a different, narrower thing.
+                "note": notify::sanitize_gh_text(&w.note, notify::NOTICE_FIELD_CAP),
+                "expires_ms": w.deadline_ms,
+            }))
+            .collect::<Vec<_>>())
     }
 
     /// Cancel one of the caller's own watches. Owner-scoped: an id that
@@ -10701,6 +10782,14 @@ pub fn orch_group_summary(reg: tauri::State<Arc<OrchRegistry>>, group_id: String
     reg.group_summary(&group_id)
 }
 
+/// Live watches for a group's agents — the group view's "⏳ waiting on …"
+/// per-agent indicator (#248), fed from the same registry state the
+/// `notify_when`/`list_notifications` MCP tools use.
+#[tauri::command]
+pub fn orch_group_watches(reg: tauri::State<Arc<OrchRegistry>>, group_id: String) -> Value {
+    reg.group_watches(&group_id)
+}
+
 /// End a whole orchestration: kill all its agents and (optionally) remove
 /// their worktrees. Human-initiated, destructive, audited — the frontend
 /// confirms before calling this.
@@ -11688,5 +11777,42 @@ mod max_notice_tests {
         assert_eq!(take_due_max_notices(&mut p, 4_000), vec![("a".to_string(), 4, 2)]);
         assert!(p.contains_key("b"), "b keeps waiting out its own window");
         assert_eq!(take_due_max_notices(&mut p, 6_000), vec![("b".to_string(), 5, 6)]);
+    }
+}
+
+/// #248: the watchdog stall notice must say so when the stalled agent holds a
+/// live CI watch, so it doesn't read identically to a genuinely hung agent.
+#[cfg(test)]
+mod watchdog_stall_notice_tests {
+    use super::*;
+
+    #[test]
+    fn annotates_when_the_agent_has_a_live_watch() {
+        let n = watchdog_stall_notice("w-2", "w-2", 12, true);
+        assert!(n.contains("live CI watch"), "must annotate a watching agent, got: {n}");
+        assert!(n.contains("may be deliberately waiting"), "got: {n}");
+    }
+
+    #[test]
+    fn omits_the_annotation_without_a_live_watch() {
+        // The regression this guards: a plain stalled agent (no watch) must
+        // read exactly as before — no dangling "live CI watch" clause tacked
+        // onto every notice regardless of truth.
+        let n = watchdog_stall_notice("w-2", "w-2", 12, false);
+        assert!(!n.contains("live CI watch"), "must not claim a watch that doesn't exist, got: {n}");
+        assert!(!n.contains("deliberately waiting"), "got: {n}");
+    }
+
+    #[test]
+    fn still_carries_the_core_stall_fields_either_way() {
+        // The annotation must be additive, never displacing the existing
+        // name/id/minutes/get_output instructions the orchestrator relies on.
+        for has_watch in [true, false] {
+            let n = watchdog_stall_notice("w-9", "w-9", 45, has_watch);
+            assert!(n.starts_with("[loomux] watchdog:"), "got: {n}");
+            assert!(n.contains("w-9"), "got: {n}");
+            assert!(n.contains("45+ min"), "got: {n}");
+            assert!(n.contains("get_output(\"w-9\")"), "got: {n}");
+        }
     }
 }

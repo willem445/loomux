@@ -15,6 +15,7 @@ import {
   groupPaused,
   groupSummary,
   groupUsage,
+  groupWatches,
   notifyEnabled,
   pauseGroup,
   resumeGroup,
@@ -31,7 +32,9 @@ import {
   type AutonomyState,
   type GroupSummary,
   type GroupUsage,
+  type GroupWatch,
 } from "./orchestration";
+import { watchLine } from "./watchline";
 import {
   approvalControl,
   autoMergeFromApproval,
@@ -158,6 +161,9 @@ export class GroupView {
 
   private summary: GroupSummary | null = null;
   private usage: GroupUsage | null = null;
+  /** Live CI watches across the group's agents (#248), refreshed on the same
+   *  poll cadence as summary/usage below — no separate timer. */
+  private watches: GroupWatch[] = [];
   private paused = false;
   private notify = false;
   private autonomy: AutonomyState | null = null;
@@ -485,12 +491,13 @@ export class GroupView {
   private async load(): Promise<void> {
     if (this.disposed) return;
     try {
-      [this.summary, this.usage, this.paused, this.notify, this.autonomy] = await Promise.all([
+      [this.summary, this.usage, this.paused, this.notify, this.autonomy, this.watches] = await Promise.all([
         groupSummary(this.groupId),
         groupUsage(this.groupId),
         groupPaused(this.groupId),
         notifyEnabled(this.groupId),
         autonomyState(this.groupId),
+        groupWatches(this.groupId),
       ]);
     } catch (err) {
       this.toast(String(err));
@@ -792,6 +799,7 @@ export class GroupView {
     } else {
       const usageOf = new Map(this.usage?.agents.map((a) => [a.id, a] as const));
       for (const a of s.agents) {
+        const wrap = el("div", "group-agent");
         const row = el("div", "group-row");
         const chip = el("span", `group-role role-${a.role}`, roleLabel(a.role));
         const name = el("span", "group-name", a.name);
@@ -829,7 +837,21 @@ export class GroupView {
           c.title = `source: ${usage.source}${usage.model ? ` · ${usage.model}` : ""} · ${usage.tokens.total} tokens (in ${usage.tokens.input}, out ${usage.tokens.output}, cache +${usage.tokens.cache_creation}/${usage.tokens.cache_read})`;
         }
         row.append(chip, name, ...(block ? [block] : []), state, up, c);
-        this.listEl.append(row);
+        wrap.append(row);
+
+        // "⏳ waiting on …" indicator (#248): a correctly-WAITING agent parked
+        // on a CI watch is otherwise indistinguishable from a hung one — see
+        // the matching watchdog-notice annotation backend-side. One line,
+        // never a layout change; overlay text only.
+        const mine = this.watches.filter((w) => w.agent === a.id);
+        if (mine.length > 0) {
+          const line = el("div", "group-watch-line", watchLine(mine, Date.now()));
+          const notes = mine.map((w) => w.note).filter(Boolean);
+          if (notes.length > 0) line.title = notes.join(" · ");
+          wrap.append(line);
+        }
+
+        this.listEl.append(wrap);
       }
     }
 

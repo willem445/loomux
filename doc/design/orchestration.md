@@ -698,6 +698,12 @@ group's pre-existing desktop-notification toggle already owns (`notify-on`/`noti
 sharing a prefix in the one audit surface a human filters would have made two unrelated
 features indistinguishable there (rev-ui, PR #247).
 
+Human-visible surfacing of a live watch (issue #248, split from this PR because it's a
+frontend feature larger than the backend it surfaces) — the group-view "⏳ waiting on …"
+indicator, the audit's `watch-*` summarize() sentences, and the watchdog's "may be
+deliberately waiting" annotation — reads the exact same `watches` registry state this section
+describes; no second store.
+
 ### Why structured kinds, not a caller-supplied poll command
 
 The obvious generic shape — `notify_when(poll_command, predicate)` — was considered and
