@@ -193,7 +193,7 @@ fn tool_defs(role: Role) -> Vec<Value> {
                 "Open a new worker, reviewer, or planner agent pane in this group. Guardrails apply: live-agent cap and per-role pinned CLI + model. Set worktree=true for parallel work that must not collide; give branch a meaningful name either way. Empty task spawns an idle agent awaiting prompts. A planner explores the codebase read-only and writes an implementation plan as a GitHub issue comment, then reports and exits. Its read-only contract is enforced structurally where the CLI allows it — it never gets a worktree, and its file-editing tools plus git commit/push are denied at the CLI level — so it cannot edit files or push code; not opening PRs is asked of it in its instructions (gh stays available so it can post the plan comment). For a FOLLOW-UP on a finished task, pass resume_session (from list_agents/the task board) plus cwd (where that work happened) — the pane reopens that conversation with its context instead of cold-starting. A resume with no kind/block INHERITS the resumed session's original block (and therefore its persona, model and capability class) from this group's roster — it never re-derives a default from `kind`, so a reviewer resumed bare comes back a reviewer, not a worker. An unrecognized session id with no block is a hard error, never a silent worker spawn. To deliberately re-role a resumed session into a different capability class, pass `block` explicitly — same as any other spawn, and audited the same way (the agent-spawn record always carries block + session + resume).",
                 json!({
                     "name": { "type": "string", "description": "Short display name for the pane" },
-                    "kind": { "type": "string", "enum": ["worker", "reviewer", "planner"], "description": "Capability class (default worker). An unrecognized value is rejected, never treated as a worker." },
+                    "kind": { "type": "string", "enum": ["worker", "reviewer", "planner"], "description": "Capability class (default worker). An unrecognized value is rejected, never treated as a worker. On a resume_session, passing this ALSO defeats block inheritance — same as passing block — and re-derives the default block for that kind instead; omit both to inherit the resumed session's own block." },
                     "block": { "type": "string", "description": "Id of a block declared in the repo's .loomux/workflow.yml — e.g. 'rev-security'. The block supplies the persona, CLI, model and capability class (so `kind` is ignored when this is set). Your kickoff lists the blocks this group has; omit it to get the default block for `kind` — UNLESS resume_session is set, in which case omitting it inherits that session's own original block instead (see resume_session). Set it explicitly on a resume only when you mean to re-role that conversation into a different capability class." },
                     "task": { "type": "string", "description": "Full task brief; empty = idle. With resume_session, this is the follow-up prompt." },
                     "worktree": { "type": "boolean", "description": "Create a dedicated git worktree + branch" },
@@ -375,7 +375,19 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             // A block names one of the repo's declared personas (#222). Its
             // `kind` is authoritative when set, so `kind` above is only the
             // fallback for a plain spawn.
-            let block = arg_str(args, "block").map(str::to_string);
+            //
+            // Normalized the same way `mod.rs`'s own block resolution treats a
+            // named block (trim + empty → absent): an empty-string `block` arg
+            // must be indistinguishable from an omitted one, or
+            // `{"resume_session": .., "block": ""}` would skip the #254
+            // inheritance guard below (which only checks `is_none()`) and fall
+            // straight through to `spawn_agent_ex`, which then discards the
+            // empty id anyway and defaults to `block_for(Worker)` — reproducing
+            // the exact silent re-role this fix exists to close.
+            let block = arg_str(args, "block")
+                .map(str::trim)
+                .filter(|b| !b.is_empty())
+                .map(str::to_string);
             let task = arg_str(args, "task").unwrap_or("");
             let name = arg_str(args, "name").unwrap_or("");
             let worktree = args.get("worktree").and_then(Value::as_bool).unwrap_or(false);
@@ -399,6 +411,11 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             let block = if block.is_none() && arg_str(args, "kind").is_none() {
                 match resume.as_deref() {
                     Some(session_id) => {
+                        // A session can appear more than once (roster + audit
+                        // backfill can both carry it, or it was re-spawned into
+                        // a different block over its lifetime) — the
+                        // last-touched record wins deliberately, since that is
+                        // the agent's most recent identity, not its first one.
                         let owner = reg
                             .merged_records(&caller.group)
                             .into_iter()

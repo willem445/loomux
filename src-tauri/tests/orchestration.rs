@@ -2875,6 +2875,48 @@ fn resume_of_reviewer_session_inherits_reviewer_block_not_default_worker() {
 }
 
 #[test]
+fn resume_with_an_empty_string_block_still_inherits_instead_of_defaulting() {
+    // Round-1 review finding (B1): `arg_str` returns `Some("")` for an
+    // explicit `"block": ""`, which must be indistinguishable from an
+    // omitted `block` — otherwise `{"resume_session": .., "block": ""}`
+    // (kind absent) slips past the `block.is_none()` inheritance guard, and
+    // mod.rs's own block resolution then trims/discards the empty id and
+    // falls back to `block_for(Worker)`: the #254 bug verbatim.
+    let (reg, _d) = test_registry();
+    let repo = tempfile::tempdir().unwrap();
+    let g = reg.create_group(&repo.path().to_string_lossy(), rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let co = reg.resolve_token(&orch.token).unwrap();
+
+    let spawn = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "spawn_agent", "arguments": { "kind": "reviewer", "task": "review PR #7" } }))
+        .unwrap();
+    assert_eq!(spawn["isError"], false, "{spawn:?}");
+    let before = reg.list_agents(&co.group);
+    let rev = before.as_array().unwrap().iter().find(|a| a["role"] == "reviewer").unwrap();
+    let (rev_id, session, cwd, block) = (
+        rev["id"].as_str().unwrap().to_string(),
+        rev["session"].as_str().unwrap().to_string(),
+        rev["cwd"].as_str().unwrap().to_string(),
+        rev["block"].as_str().unwrap().to_string(),
+    );
+    reg.mark_dead(&rev_id, Some(0));
+
+    // Same resume as the bare case, but with an explicit empty-string block.
+    let resumed = dispatch(&reg, &co, "tools/call", &json!({
+        "name": "spawn_agent",
+        "arguments": { "resume_session": session, "cwd": cwd, "task": "round-2", "block": "" },
+    })).unwrap();
+    assert_eq!(resumed["isError"], false, "{resumed:?}");
+    let text = resumed["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("Reviewer"), "empty-string block must not defeat inheritance, got: {text}");
+    assert!(
+        text.contains(&format!("block {block}")),
+        "must keep its ORIGINAL block {block:?}, got: {text}"
+    );
+}
+
+#[test]
 fn resume_of_unknown_session_with_no_block_or_kind_hard_errors() {
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
