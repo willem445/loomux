@@ -39,6 +39,16 @@ keystroke away on any rung, never disturbing the shell underneath.
 - **tmux / zellij / [herdr](https://github.com/ogulcancelik/herdr)** — they
   stop at rungs 1–2. herdr multiplexes your agents; loomux manages your
   agents' work.
+- **Prompt-layer orchestrators
+  ([superpowers](https://github.com/obra/superpowers),
+  [gstack](https://github.com/garrytan/gstack),
+  [oh-my-claudecode](https://github.com/yeachan-heo/oh-my-claudecode),
+  [gsd-pi](https://github.com/open-gsd/gsd-pi))** — pipelines and review
+  gates written as prompts *inside* one agent CLI, which an agent can talk
+  its way past. Loomux enforces from outside the process: a merge gate that
+  mechanically refuses, hard token-budget stops, consent for repo-authored
+  config, whole-group restart resume. Complementary, not competing — install
+  them inside a worker's pane.
 - **IDE-shaped agent platforms** — loomux is still a terminal: lightweight,
   native, opens your IDE instead of embedding one.
 - **Unattended agent fleets** — loomux picks trust over throughput: watch and
