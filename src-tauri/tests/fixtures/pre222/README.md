@@ -30,6 +30,21 @@ so far:
   boundaries, reuse-before-invention, dependencies, public-contract changes and the
   alternatives it considered.
 
+- **#239, the verdict bind** — `reviewer.md` and `orchestrator.md` only (`worker.md` and
+  `planner.md` did not move). Carried forward from #238, which found that the rule every
+  default group had been reading — *"a blocking finding means `--request-changes`, not
+  `--approve`"* — **cannot be obeyed in this repository**: GitHub refuses both flags on a PR
+  opened by your own account, which is every PR here, because a whole group authenticates as
+  one GitHub user. A reviewer that could not `--request-changes` had been given no legal way
+  to say "no", and the only other action the template named was `--approve`. So what a default
+  group's reviewer is now told: the binding record is **the verdict you state** in the review
+  body and repeat in `report(...)` — the channel the orchestrator actually merges on — with
+  `--comment` named as the fallback when GitHub refuses the flag, and a refusal that may never
+  decay into an approval or a softened verdict. The orchestrator is told the same in its
+  disposition step, and its merge gate now says **where the verdict lives** (not GitHub's
+  review state, which stays `COMMENTED` on a same-account PR — an orchestrator that looked
+  there would find no approval to gate on, or would read `COMMENTED` as one).
+
 `the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was` renders
 **these** with the six pre-#222 template variables and asserts that a group launched
 with the advanced orchestrator **off** gets exactly that text. They are the

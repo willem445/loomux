@@ -1232,6 +1232,16 @@ channel; keep the human oriented with short summaries."
         // the findings it left behind is how the gate opens on a change that still
         // contradicts its own rationale. Keep the two in lockstep.
         //
+        // The GitHub-facing half rides here too (#239, carried forward from #238's rev-23
+        // F1). The recorded verdict below is the GATE's record — it exists only for a group
+        // whose workflow declares a gate. The reviewer's other record is the review it POSTS,
+        // and there `--request-changes`/`--approve` are both refused by GitHub on a PR opened
+        // by your own account (the normal case: one group, one GitHub user, who authors the
+        // PRs — every review this repo has received is COMMENTED). A reviewer told only to use
+        // a flag it cannot use improvises, and the only other action it was ever shown is
+        // `--approve`. So the fallback is NAMED, the bind is on the verdict it STATES, and the
+        // refusal may not decay into an approval, a softened verdict, or a `pass`.
+        //
         // So do the review LANES (#236). A persona is free to narrow a reviewer to one
         // lane — that is the whole point of a focused roster — but the lanes below are the
         // BASELINE a repo's reviewers must cover between them: a security/dependency/cost
@@ -1265,6 +1275,16 @@ channel; keep the human oriented with short summaries."
              finding's label is your severity rating, a verdict is what the gate reads, and a `pass` \
              carrying a blocking finding is a contradiction the gate cannot see. It opens, on a \
              change you just said was wrong.\n\
+             - Post the review on the PR itself (`gh pr review <n> --request-changes` / `--approve`), \
+             and state the verdict in the body. GITHUB REFUSES BOTH FLAGS on a PR opened by your own \
+             account — the normal case, since the whole group usually authenticates as one GitHub \
+             user. When it does, post with `--comment` and LEAD THE BODY WITH THE VERDICT in those \
+             words (\"Verdict: changes requested\" / \"Verdict: approve\"). The flag is only the \
+             mechanism: the binding record is the verdict you STATE in the review body and repeat in \
+             your `report(...)` — that is what the orchestrator merges on, and an ungated group has \
+             no other record. A `--request-changes` that GitHub refused is NEVER a reason to \
+             `--approve`, to soften the verdict, or to record a `pass`: the mechanism was \
+             unavailable, the finding was not.\n\
              - Record your review outcome with `review_verdict(pr, verdict, summary)` — verdict: \
              pass | fail | escalate. It is durable, attributed STATE (not a notification): when the \
              repo's workflow declares a merge gate, loomux refuses `gh pr merge` until every reviewer \

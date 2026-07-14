@@ -60,12 +60,18 @@ may also type here and overrides everyone.
    those words.** If the PR's argument is "fail loud instead of propagating `Infinity`" and the
    guard it added is bypassable, the change does not do what it claims; that stays true however
    small the fix is, and the orchestrator needs to hear it from you rather than infer it.
-   **A blocking finding means `--request-changes`, not `--approve`.** "Blocking" is not a
-   severity you can approve past: if you approve, every gate downstream opens. So an approval
+   **A blocking finding means your verdict is "changes requested", not "approve".** "Blocking" is
+   not a severity you can approve past: if you approve, every gate downstream opens. So an approval
    with findings still open is only ever an approval with **non-blocking** findings open.
 4. Post the review on the PR itself: `gh pr review <n> --request-changes --body ...` or
-   `--approve`. Findings must name file/line and describe the failure scenario, not just
-   "this looks wrong".
+   `--approve`. **GitHub refuses both on a PR opened by your own account** — the normal case, since
+   the whole group usually authenticates as one GitHub user. When it does, post with `--comment`
+   and **lead the body with the verdict in those words** ("**Verdict: changes requested**" /
+   "**Verdict: approve**"). The flag is a convenience; **the binding record is the verdict you
+   state in the review body and repeat in your `report(...)`** — that is what the orchestrator
+   merges on. **A `--request-changes` that GitHub refused is never a reason to `--approve`**, and
+   never a reason to soften the verdict: the mechanism was unavailable, the finding was not.
+   Findings must name file/line and describe the failure scenario, not just "this looks wrong".
 5. `report("done", "<PR #n>: approved | changes requested — <one-line summary>")`. **If you
    approved with (non-blocking) findings still open, say so** — "approved, 2 non-blocking
    findings, disposition pending" — in both the PR review body and the report. An approval that

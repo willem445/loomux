@@ -1151,17 +1151,24 @@ fn every_reviewer_hears_the_findings_duty_however_its_persona_was_written() {
         );
     }
 
-    // The label has to BIND to the action, or it is decoration: a reviewer that may call a
-    // finding blocking and approve anyway has reopened the hole the label was added to close
-    // (rev-19 F3) — the gate reads the verdict, never the prose. Each surface says it in its
-    // own vocabulary, and that asymmetry is load-bearing: `reviewer.md` is what an UNGATED
-    // group reads, so it may not mention `review_verdict` at all (see
-    // `a_reviewer_a_gate_names_is_told_its_verdict_is_the_gate`) — it binds to the `gh` action
-    // instead.
+    // The label has to BIND, or it is decoration: a reviewer that may call a finding blocking
+    // and approve anyway has reopened the hole the label was added to close (rev-19 F3). Each
+    // surface binds it in its own vocabulary, and that asymmetry is load-bearing: `reviewer.md`
+    // is what an UNGATED group reads, so it may not mention `review_verdict` at all (see
+    // `a_reviewer_a_gate_names_is_told_its_verdict_is_the_gate`), while the core — all a
+    // `mode: replace` block ever gets — binds the RECORDED verdict the gate reads.
+    //
+    // What it may NOT bind to is the `gh` flag (#239, from #238's rev-23 F1). The old anchor
+    // here was `not `--approve`` — and GitHub refuses BOTH `--request-changes` and `--approve`
+    // on a PR opened by your own account, which is the normal case (one group, one GitHub user,
+    // who authors the PRs: every review this repo has received is COMMENTED). A bind anchored on
+    // an action nobody can take binds nothing, and the only other action the template named was
+    // `--approve` — so the reviewer that could not say "no" was left improvising toward "yes".
+    // The bind is therefore on the verdict the reviewer STATES, and that is what this pins.
     assert!(
-        builtin.contains("not `--approve`"),
-        "reviewer.md must forbid approving past a blocking finding, in the vocabulary an \
-         ungated reviewer actually has (`gh pr review`, not the verdict tool): {builtin}"
+        builtin.contains("your verdict is \"changes requested\", not \"approve\""),
+        "reviewer.md must forbid approving past a blocking finding — bound to the VERDICT it \
+         states (an object it always has), never to a `gh` flag GitHub may refuse: {builtin}"
     );
     assert!(
         !builtin.contains("review_verdict"),
@@ -1172,6 +1179,38 @@ fn every_reviewer_hears_the_findings_duty_however_its_persona_was_written() {
         "mechanics_core(Reviewer) must forbid the `pass` verdict on a blocking finding — the \
          gate opens on the verdict and cannot see the finding: {core}"
     );
+    assert!(
+        core.contains("or to record a `pass`"),
+        "...and the refusal may not decay into a `pass` either: the recorded verdict is the one \
+         surface a gated group's gate actually reads: {core}"
+    );
+
+    // The GitHub-facing half rides the SAME lockstep, and for the same reason the duties above
+    // do (#239): a `mode: replace` reviewer never reads `reviewer.md`, so a fallback named only
+    // there is a fallback that block does not have — and it is the block a repo bothered to
+    // write its own reviewer for. Both surfaces must name the refusal, the `--comment` fallback,
+    // where the binding record lives, and the no-decay rule; drop any of the four on either
+    // surface and that reviewer is back to improvising at exactly the moment it has to say "no".
+    for (surface, doc) in [("mechanics_core(Reviewer)", &core), ("reviewer.md", &builtin)] {
+        let low = flat(doc);
+        for (anchor, why) in [
+            ("on a pr opened by your own account",
+             "the refusal must be NAMED — a reviewer that meets it unwarned improvises, and the \
+              only other action it was ever shown is `--approve`"),
+            ("post with `--comment`",
+             "…and the fallback must be named with it, or being unable to `--request-changes` \
+              leaves it with no legal way to say \"no\""),
+            ("the binding record is the verdict you state",
+             "…and WHERE the bind lives: the verdict stated in the review body and repeated in \
+              `report(...)` is what the orchestrator merges on — the channel that was \
+              unconstrained while the rule guarded a flag nobody could use"),
+            ("never a reason to `--approve`",
+             "…and the refusal may not DECAY: the mechanism was unavailable, the finding was \
+              not, and softening the verdict to fit the mechanism is the original incident"),
+        ] {
+            pinned(surface, &low, anchor, why);
+        }
+    }
 
     // The review LANES ride the same lockstep, and for the same reason (#236 F4). A repo may
     // narrow a reviewer to one lane — that is what a focused roster is for — but a lane no
