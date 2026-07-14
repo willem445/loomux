@@ -12,6 +12,7 @@ import assert from "node:assert/strict";
 import {
   parseWorkflow,
   serializeWorkflow,
+  serializeWorkflowPreserving,
   validateWorkflow,
   analyzeWorkflow,
   formatWorkflowText,
@@ -523,6 +524,351 @@ test("a canvas-authored workflow serializes canonically and stays stable", () =>
   const once = serializeWorkflow(w);
   assert.equal(serializeWorkflow(parseWorkflow(once).workflow), once, "GUI-authored files format like any other");
   assert.deepEqual(analyzeWorkflow(once).findings.filter((f) => f.severity === "error"), []);
+});
+
+// ---------- comment-preserving serialization (#233) ----------
+//
+// `serializeWorkflow` is the FULL rewrite — it never carried comments, and it still doesn't;
+// that is what `formatWorkflowText` and the Format button ask for on purpose. What follows is
+// `serializeWorkflowPreserving`: same model, but handed the ORIGINAL text too, so it can reuse
+// whatever it didn't change instead of reformatting the whole file every time.
+
+const COMMENTED = `# who runs, and why
+version: 1
+name: focused-review
+
+blocks:
+  # the planner goes first
+  - id: planner
+    name: Planner
+    kind: planner
+    cli: claude
+    model: opus
+
+  - id: worker          # opens the PR
+    name: Worker
+    kind: worker
+    cli: claude
+
+# ADVISORY — the declared happy path
+edges:
+  - { from: planner, to: worker }
+
+# ENFORCED — nothing merges without this
+gates:
+  merge:
+    require: all-pass
+    reviewers: [planner]
+`;
+
+test("an untouched file re-serializes to itself, byte for byte", () => {
+  const { workflow } = parseWorkflow(COMMENTED);
+  assert.equal(serializeWorkflowPreserving(workflow, COMMENTED), COMMENTED);
+});
+
+test("editing one block's field keeps every OTHER block's comments, and the section headers", () => {
+  const { workflow } = parseWorkflow(COMMENTED);
+  const edited: Workflow = {
+    ...workflow,
+    blocks: workflow.blocks.map((b) => (b.id === "worker" ? { ...b, model: "opus" } : b)),
+  };
+  const out = serializeWorkflowPreserving(edited, COMMENTED);
+  assert.match(out, /# who runs, and why/, "the file preamble survives");
+  assert.match(out, /# the planner goes first/, "an untouched block's own comment survives");
+  assert.match(out, /# ADVISORY — the declared happy path/, "the edges section header survives");
+  assert.match(out, /# ENFORCED — nothing merges without this/, "the gates section header survives");
+  // The edited block's own trailing comment is the one thing that is allowed to go — it is
+  // the node that changed, and #233's bar is "edited nodes serialize cleanly", not lossless.
+  assert.doesNotMatch(out, /# opens the PR/);
+  assert.deepEqual(parseWorkflow(out).workflow, edited, "and the edit itself must round-trip");
+});
+
+test("a prompt whose own last line looks like a comment survives editing a SIBLING (#233 B2)", () => {
+  // `isSignificantLine` treats a `#`-starting line as trivia to peel — correct for an ACTUAL
+  // comment, wrong for a `|` block scalar's body, where `#` is just a character the prompt
+  // happens to contain. Peeling it as if it were commentary on the NEXT block silently moves it
+  // there; if that next block is the one that gets edited (regenerated canonically), the line
+  // never comes back — the reviewer's exact repro.
+  const text = `version: 1
+blocks:
+  - id: a
+    name: A
+    kind: worker
+    cli: claude
+    prompt: |
+      Do the work.
+      # trailing checklist marker, not a comment
+  - id: b
+    name: B
+    kind: worker
+    cli: claude
+`;
+  const { workflow } = parseWorkflow(text);
+  const promptBefore = workflow.blocks[0]!.prompt;
+  assert.match(promptBefore ?? "", /# trailing checklist marker/, "sanity: the real reader keeps it as content");
+
+  const edited = { ...workflow, blocks: workflow.blocks.map((b) => (b.id === "b" ? { ...b, model: "opus" } : b)) };
+  const out = serializeWorkflowPreserving(edited, text);
+  const reread = parseWorkflow(out).workflow;
+  assert.equal(reread.blocks[0]!.prompt, promptBefore, "block a's prompt — untouched — must survive intact");
+  assert.deepEqual(reread, edited);
+});
+
+test("adding a block regenerates only the new entry — every existing one is untouched text", () => {
+  const { workflow } = parseWorkflow(COMMENTED);
+  const added = addBlock(workflow, newBlock("rev", "Reviewer", "reviewer"));
+  const out = serializeWorkflowPreserving(added, COMMENTED);
+  assert.match(out, /# the planner goes first/);
+  assert.match(out, /# opens the PR/);
+  // Round-tripped through the ordinary parser convention on BOTH sides (a fresh `newBlock()`
+  // has no `extra` key at all; a parsed one always carries `extra: undefined` explicitly —
+  // an unrelated quirk of `readBlock`, not something this test is about).
+  assert.deepEqual(parseWorkflow(out).workflow, parseWorkflow(serializeWorkflow(added)).workflow);
+});
+
+test("removing a block drops only its own segment — the rest, including comments, is untouched", () => {
+  const { workflow } = parseWorkflow(COMMENTED);
+  const removed = removeBlockAt(workflow, workflow.blocks.findIndex((b) => b.id === "worker"));
+  const out = serializeWorkflowPreserving(removed, COMMENTED);
+  assert.match(out, /# the planner goes first/, "the untouched block's comment survives");
+  assert.doesNotMatch(out, /id: worker\b/, "the removed block itself is gone");
+  assert.deepEqual(parseWorkflow(out).workflow, removed);
+  // Its edges and gate seat go with it (removeBlockAt's own contract) — and since the edges/
+  // gates sections themselves changed, THEIR comments are the honest cost of that edit.
+  assert.doesNotMatch(out, /# ADVISORY/);
+});
+
+test("an edge added or removed regenerates the edges CONTENT, but keeps that section's own header comment", () => {
+  // The section header ("# ADVISORY …") introduces the CONCEPT of the edges section, not any
+  // one edge in it — dropping it every time a single edge is rewired cost far more than the
+  // edit itself touched (#233 non-blocking #1). Only the fan-out entries fall back to canonical.
+  const { workflow } = parseWorkflow(COMMENTED);
+  const rewired = connectBlocks(workflow, "worker", "planner");
+  const out = serializeWorkflowPreserving(rewired, COMMENTED);
+  assert.match(out, /# who runs, and why/);
+  assert.match(out, /# the planner goes first/);
+  assert.match(out, /# opens the PR/);
+  assert.match(out, /# ADVISORY — the declared happy path/, "the edges section HEADER survives its own content changing");
+  assert.match(out, /# ENFORCED — nothing merges without this/, "gates is untouched and keeps its header");
+  assert.deepEqual(parseWorkflow(out).workflow, rewired);
+});
+
+test("emptying the edge list entirely omits the section rather than leaving a bare header", () => {
+  const { workflow } = parseWorkflow(COMMENTED);
+  const cleared = { ...workflow, edges: [] };
+  const out = serializeWorkflowPreserving(cleared, COMMENTED);
+  assert.doesNotMatch(out, /^edges:/m, "no edges left — nothing to hang the header on");
+  assert.deepEqual(parseWorkflow(out).workflow, cleared);
+});
+
+test("a name change loses only the front section's own trivia (none here), not the rest", () => {
+  const { workflow } = parseWorkflow(COMMENTED);
+  const renamed = { ...workflow, name: "renamed" };
+  const out = serializeWorkflowPreserving(renamed, COMMENTED);
+  assert.match(out, /# who runs, and why/, "the file preamble is document-level, kept regardless");
+  assert.match(out, /# the planner goes first/);
+  assert.deepEqual(parseWorkflow(out).workflow, renamed);
+});
+
+test("preserving-serializing is idempotent over its own output", () => {
+  const { workflow } = parseWorkflow(COMMENTED);
+  const edited: Workflow = {
+    ...workflow,
+    blocks: workflow.blocks.map((b) => (b.id === "worker" ? { ...b, model: "opus" } : b)),
+  };
+  const once = serializeWorkflowPreserving(edited, COMMENTED);
+  const twice = serializeWorkflowPreserving(edited, once);
+  assert.equal(twice, once);
+});
+
+test("a file from a NEWER loomux (version: 2) is still editable — its comments are not silently eaten (#233 B3)", () => {
+  // `version-unsupported` is an ERROR finding, but the file is still READABLE — the view keeps
+  // the form enabled through it (`syntaxBroken` only cares about `yaml-syntax`/`not-a-mapping`).
+  // Before this fix, `serializeWorkflowPreserving` gated its fallback on `hasErrors` (any error
+  // finding at all), so a version-2 file — the one case the codebase explicitly designs for
+  // surviving an older pane (`extra` pass-through) — silently full-canonicalized on the very
+  // first edit, for a reason the human was never shown.
+  const text = `# a note the file's comments carry
+version: 2
+blocks:
+  - id: a
+    name: A
+    kind: worker
+    cli: claude
+`;
+  const { workflow, findings } = parseWorkflow(text);
+  assert.ok(findings.some((f) => f.code === "version-unsupported"), "sanity: this finding fires");
+
+  const edited = { ...workflow, blocks: [{ ...workflow.blocks[0]!, model: "opus" }] };
+  const out = serializeWorkflowPreserving(edited, text);
+  assert.match(out, /# a note the file's comments carry/, "the comment must not be silently eaten");
+  assert.deepEqual(parseWorkflow(out).workflow, edited);
+});
+
+test("original text that doesn't parse falls back to the ordinary canonical rewrite, never a guess", () => {
+  const w = starterWorkflow();
+  const broken = "version: 1\nblocks:\n\t- id: w\n"; // a tab in the indentation — a syntax finding
+  assert.equal(serializeWorkflowPreserving(w, broken), serializeWorkflow(w));
+});
+
+test("an empty original text still produces a valid file that round-trips", () => {
+  // Empty text has no syntax error (`isUnreadable` is about READABILITY, not about every
+  // finding — #233 B3), so this goes through the ordinary preserving path rather than a
+  // hard-coded "brand new file" shortcut; there is simply nothing to reuse, so every piece
+  // regenerates canonically. What matters is that it's still a correct, round-trip-safe file.
+  const w = starterWorkflow();
+  const out = serializeWorkflowPreserving(w, "");
+  assert.deepEqual(parseWorkflow(out).workflow, parseWorkflow(serializeWorkflow(w)).workflow);
+});
+
+test("a block sequence indented to something other than loomux's own 2 spaces is preserved AT that indent", () => {
+  // #233 non-blocking #2: a regenerated (edited/added) item is emitted at the FILE's own marker
+  // indent, not a hardcoded one — so it never has to choose between corrupting the sequence
+  // (mixing two indents) and reformatting the whole roster just because one field changed.
+  const text = `version: 1
+blocks:
+    - id: w
+      name: W
+      kind: worker
+      cli: claude
+
+    - id: w2
+      name: W2
+      kind: worker
+      cli: claude
+`;
+  const { workflow } = parseWorkflow(text);
+  const edited = {
+    ...workflow,
+    blocks: workflow.blocks.map((b) => (b.id === "w" ? { ...b, model: "opus" } : b)),
+  };
+  const out = serializeWorkflowPreserving(edited, text);
+  assert.deepEqual(parseWorkflow(out).workflow, edited);
+  // The untouched sibling (w2) is reused verbatim at its original indent…
+  assert.match(out, /\n {4}- id: w2\n {6}name: W2\n/);
+  // …and the regenerated one matches that SAME indent, not a hardcoded 2.
+  assert.match(out, /\n {4}- id: w\n {6}name: W\n {6}kind: worker\n {6}cli: claude\n {6}model: opus\n/);
+});
+
+test("a block sequence at column 0 (same indent as `blocks:` itself) is understood, not misread as new keys", () => {
+  // #233 B1: `blocks:` with nothing after it may be followed by its own sequence at the SAME
+  // column — legal YAML the reader (`afterKey`, above) already accepts. A structural scan that
+  // treated each `- id: …` as a bogus new top-level key spliced roster content into `front` and
+  // silently discarded everything after the first misread line on re-parse.
+  const text = `version: 1
+blocks:
+- id: a
+  name: A
+  kind: worker
+  cli: claude
+- id: b
+  name: B
+  kind: worker
+  cli: claude
+`;
+  const { workflow } = parseWorkflow(text);
+  assert.equal(workflow.blocks.length, 2, "sanity: the real reader sees both blocks");
+
+  // A total no-op must reproduce the file exactly — the strongest form of "not destructive".
+  assert.equal(serializeWorkflowPreserving(workflow, text), text);
+
+  // And an edit to one of them must not lose the other, or silently drop the roster.
+  const edited = {
+    ...workflow,
+    blocks: workflow.blocks.map((b) => (b.id === "b" ? { ...b, model: "opus" } : b)),
+  };
+  const out = serializeWorkflowPreserving(edited, text);
+  assert.deepEqual(parseWorkflow(out).workflow, edited);
+});
+
+test("an ORPHAN column-0 dash sequence (no owning key at all) safely falls back — nothing is lost", () => {
+  // Round 2: the same-column fix above only recognizes a `- …` line as sequence CONTENT when it
+  // directly follows an empty-rest key (`blocks:` with nothing after the colon). A `- id: a`
+  // line with NO such key before it at all — nobody wrote `blocks:` — is an ORPHAN: `splitKey`
+  // still returns a "key" for it (`- id`, since the text contains a `: `), and reading THAT as a
+  // fresh top-level key is the same B1 mistake with no governing key to blame it on. The real
+  // reader's `mapping()` stops here too (filed separately as its own issue: it does so SILENTLY,
+  // with no finding) — so `orig.workflow.blocks` is already empty by the time this scan sees it.
+  const text = `version: 1
+- id: a
+  name: A
+  kind: worker
+  cli: claude
+`;
+  const { workflow: orig } = parseWorkflow(text);
+  assert.equal(orig.blocks.length, 0, "sanity: the real reader never reads this as a roster at all");
+
+  // A block added through the form (`orig` had none) must survive being written back and
+  // reloaded — not get silently swallowed by a scan that trusted the orphan dash as a key.
+  const withBlock = addBlock(orig, newBlock("w", "W"));
+  const out = serializeWorkflowPreserving(withBlock, text);
+  const reloaded = parseWorkflow(out).workflow;
+  assert.deepEqual(reloaded.blocks.map((b) => b.id), ["w"], "the added block must survive a reload");
+});
+
+test("no double blank line when a regenerated item follows one whose scalar ran to the segment's end", () => {
+  // Round 2: a `prompt: |` that is the LAST field of an item, followed by exactly one blank
+  // line before the next item, is ambiguous — the blank line could be trailing content of the
+  // scalar (which the real reader's own chomping would discard) or the ordinary separator
+  // before the next item. `opaqueScalarIndices` used to leave it "stuck" inside the (never
+  // properly closed) scalar for the rest of the segment, so it stayed as unpeelable content of
+  // item `a` — and when item `b` was then regenerated, the synthetic separator this function
+  // always inserts before a regenerated item stacked a SECOND blank line on top of it.
+  const text = `version: 1
+blocks:
+  - id: a
+    name: A
+    kind: worker
+    cli: claude
+    prompt: |
+      line one
+
+  - id: b
+    name: B
+    kind: worker
+    cli: claude
+`;
+  const { workflow } = parseWorkflow(text);
+  const edited = {
+    ...workflow,
+    blocks: workflow.blocks.map((b) => (b.id === "b" ? { ...b, model: "opus" } : b)),
+  };
+  const out = serializeWorkflowPreserving(edited, text);
+  assert.doesNotMatch(out, /\n\n\n/, "at most one blank line between the two items");
+  assert.deepEqual(parseWorkflow(out).workflow, edited);
+});
+
+test("emptying the roster keeps the section's own header comment, not just a bare `blocks: []`", () => {
+  const text = `version: 1
+# BLOCKS — the agents a run may use, closed-set kind:
+blocks:
+  - id: a
+    name: A
+    kind: worker
+    cli: claude
+`;
+  const { workflow } = parseWorkflow(text);
+  const emptied = { ...workflow, blocks: [] };
+  const out = serializeWorkflowPreserving(emptied, text);
+  assert.match(out, /# BLOCKS — the agents a run may use, closed-set kind:/);
+  assert.match(out, /^blocks: \[\]$/m);
+  assert.deepEqual(parseWorkflow(out).workflow, emptied);
+});
+
+test("CRLF line endings are preserved end to end, on every platform (#233 non-blocking #3)", () => {
+  // A 5-line fixture with EXPLICIT `\r\n`, so this is pinned independent of what line ending
+  // the test runner's own checkout happens to have (the dogfood test exercises the real file's
+  // actual bytes, which on a Linux CI runner may be LF even though this repo targets Windows).
+  const text = "version: 1\r\nblocks:\r\n  - id: w\r\n    name: W\r\n    kind: worker\r\n";
+  const { workflow } = parseWorkflow(text);
+
+  assert.equal(serializeWorkflowPreserving(workflow, text), text, "a no-op must reproduce it byte for byte");
+
+  const edited = { ...workflow, blocks: [{ ...workflow.blocks[0]!, cli: "claude" }] };
+  const out = serializeWorkflowPreserving(edited, text);
+  assert.ok(out.includes("\r\n"), "CRLF survives an edit too");
+  assert.ok(!/[^\r]\n/.test(out), "no bare LF snuck in anywhere");
+  assert.deepEqual(parseWorkflow(out).workflow, edited);
 });
 
 // ---------- broken files still open ----------

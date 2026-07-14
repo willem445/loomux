@@ -189,6 +189,18 @@ export function hasErrors(findings: readonly Finding[]): boolean {
   return findings.some((f) => f.severity === "error");
 }
 
+/** True only when the text itself couldn't be read as a document at all — a syntax error, or a
+ *  shape so wrong the root isn't even a mapping. This is deliberately NARROWER than `hasErrors`:
+ *  a `version-unsupported` or `gate-bad-threshold` finding means the WORKFLOW is wrong, not that
+ *  the TEXT is unreadable, and the pane's form stays editable through those (see
+ *  `workflowview.ts`'s `syntaxBroken`, which this mirrors exactly on purpose — #233 B3. The two
+ *  must agree: if the view lets a human keep editing a file, `serializeWorkflowPreserving`
+ *  (below) must not treat that same file as too broken to diff against, or the very first edit
+ *  silently falls back to a full canonical rewrite for a reason the human was never shown. */
+export function isUnreadable(findings: readonly Finding[]): boolean {
+  return findings.some((f) => f.code === "yaml-syntax" || f.code === "not-a-mapping");
+}
+
 // ---------- YAML subset: reading ----------
 
 interface RawLine {
@@ -686,53 +698,92 @@ function extraLines(extra: Record<string, YamlValue> | undefined, indent: string
     .map((k) => `${indent}${emitScalar(k)}: ${emitValue(extra[k]!)}`);
 }
 
-/** Render the workflow in canonical form. `parseWorkflow(serializeWorkflow(w)).workflow`
- *  deep-equals `w`, and serializing twice is a no-op — the two properties the file's
- *  legibility rests on, both pinned in test/workflowmodel.test.ts. */
-export function serializeWorkflow(w: Workflow): string {
-  const order = blockOrder(w);
+/** `version:`, `name:` and any top-level unknown keys — the lines every workflow starts
+ *  with. Factored out so the comment-preserving serializer (below) can regenerate just this
+ *  piece when it — and only it — has changed, without duplicating the exact formatting rules. */
+function emitFrontLines(w: Workflow): string[] {
   const out: string[] = [];
   out.push(`version: ${w.version}`);
   if (w.name) out.push(`name: ${emitScalar(w.name)}`);
   out.push(...extraLines(w.extra, ""));
+  return out;
+}
+
+/** One block entry, canonical key order, no leading/trailing blank line. `markerIndent` is
+ *  where the `-` sits — 2 (this build's own convention) by default, but the comment-preserving
+ *  serializer passes whatever indent the SURROUNDING roster already uses (0 for a same-column
+ *  sequence, or whatever else a hand-written file chose), so a regenerated item never mixes a
+ *  different marker indent into a sequence that has to share exactly one (#233 non-blocking #2,
+ *  and see `splitBlockItems`'s own note on why mixing indents is invalid, not just inconsistent). */
+function emitBlockLines(b: WorkflowBlock, markerIndent = 2): string[] {
+  const dash = " ".repeat(markerIndent);
+  const field = " ".repeat(markerIndent + 2);
+  const out: string[] = [];
+  out.push(`${dash}- id: ${emitScalar(b.id)}`);
+  out.push(`${field}name: ${emitScalar(b.name)}`);
+  out.push(`${field}kind: ${emitScalar(b.kind)}`);
+  out.push(`${field}cli: ${emitScalar(b.cli)}`);
+  if (b.model) out.push(`${field}model: ${emitScalar(b.model)}`);
+  if (b.profile !== undefined) out.push(`${field}profile: ${emitScalar(b.profile)}`);
+  out.push(...extraLines(b.extra, field));
+  if (b.prompt !== undefined) out.push(...emitBlockScalar("prompt", b.prompt, field));
+  return out;
+}
+
+/** The `edges:` section, or `[]` (nothing pushed) when there are no edges. */
+function emitEdgesLines(edges: readonly WorkflowEdge[], order: Map<string, number>): string[] {
+  const groups = groupEdges(edges, order);
+  if (!groups.length) return [];
+  const out: string[] = ["edges:"];
+  for (const g of groups) {
+    const to = g.to.length === 1 ? emitScalar(g.to[0]!) : `[${g.to.map(emitScalar).join(", ")}]`;
+    out.push(`  - { from: ${emitScalar(g.from)}, to: ${to} }`);
+  }
+  return out;
+}
+
+/** The `gates:` section, or `[]` (nothing pushed) when there is nothing to gate. */
+function emitGatesLines(w: Workflow, order: Map<string, number>): string[] {
+  const gate = w.gates.merge;
+  if (!gate && !w.gates.extra) return [];
+  const out: string[] = ["gates:"];
+  if (gate) {
+    out.push("  merge:");
+    out.push(`    require: ${emitScalar(gate.require)}`);
+    if (gate.threshold !== undefined) out.push(`    threshold: ${gate.threshold}`);
+    out.push(`    reviewers: [${sortByBlocks(gate.reviewers, order).map(emitScalar).join(", ")}]`);
+    if (gate.also.length) out.push(`    also: [${gate.also.map(emitScalar).join(", ")}]`);
+  }
+  out.push(...extraLines(w.gates.extra, "  "));
+  return out;
+}
+
+/** Render the workflow in canonical form. `parseWorkflow(serializeWorkflow(w)).workflow`
+ *  deep-equals `w`, and serializing twice is a no-op — the two properties the file's
+ *  legibility rests on, both pinned in test/workflowmodel.test.ts.
+ *
+ *  This is the FULL rewrite: fixed key order, no comments, no matter what was there before.
+ *  It is what every form/canvas edit used to go through unconditionally (#233's whole
+ *  complaint) and is now reserved for the explicit **Format** action and for a model that
+ *  has no prior text to diff against (a brand-new file). Everyday edits go through
+ *  `serializeWorkflowPreserving`, below, which reuses this file's own emitters for whatever
+ *  it can't reuse verbatim from the original text. */
+export function serializeWorkflow(w: Workflow): string {
+  const order = blockOrder(w);
+  const out: string[] = [...emitFrontLines(w)];
 
   // An EMPTY roster emits `blocks: []`, not a bare `blocks:` (rev-5 F4). A bare key is
   // YAML `null`, so the pane would re-read its own output as a malformed shape and report a
   // syntax-ish error against text it had just written itself — on top of the honest
   // `no-blocks`. Deleting the last block in the form is the ordinary way to get here.
   out.push("", w.blocks.length ? "blocks:" : "blocks: []");
-  for (const b of w.blocks) {
-    out.push(`  - id: ${emitScalar(b.id)}`);
-    out.push(`    name: ${emitScalar(b.name)}`);
-    out.push(`    kind: ${emitScalar(b.kind)}`);
-    out.push(`    cli: ${emitScalar(b.cli)}`);
-    if (b.model) out.push(`    model: ${emitScalar(b.model)}`);
-    if (b.profile !== undefined) out.push(`    profile: ${emitScalar(b.profile)}`);
-    out.push(...extraLines(b.extra, "    "));
-    if (b.prompt !== undefined) out.push(...emitBlockScalar("prompt", b.prompt, "    "));
-  }
+  for (const b of w.blocks) out.push(...emitBlockLines(b));
 
-  const groups = groupEdges(w.edges, order);
-  if (groups.length) {
-    out.push("", "edges:");
-    for (const g of groups) {
-      const to = g.to.length === 1 ? emitScalar(g.to[0]!) : `[${g.to.map(emitScalar).join(", ")}]`;
-      out.push(`  - { from: ${emitScalar(g.from)}, to: ${to} }`);
-    }
-  }
+  const edgeLines = emitEdgesLines(w.edges, order);
+  if (edgeLines.length) out.push("", ...edgeLines);
 
-  const gate = w.gates.merge;
-  if (gate || w.gates.extra) {
-    out.push("", "gates:");
-    if (gate) {
-      out.push("  merge:");
-      out.push(`    require: ${emitScalar(gate.require)}`);
-      if (gate.threshold !== undefined) out.push(`    threshold: ${gate.threshold}`);
-      out.push(`    reviewers: [${sortByBlocks(gate.reviewers, order).map(emitScalar).join(", ")}]`);
-      if (gate.also.length) out.push(`    also: [${gate.also.map(emitScalar).join(", ")}]`);
-    }
-    out.push(...extraLines(w.gates.extra, "  "));
-  }
+  const gateLines = emitGatesLines(w, order);
+  if (gateLines.length) out.push("", ...gateLines);
 
   return out.join("\n") + "\n";
 }
@@ -778,6 +829,403 @@ function groupEdges(
     from,
     to: sortByBlocks(byFrom.get(from)!, order),
   }));
+}
+
+// ---------- comment-preserving serialization (#233) ----------
+//
+// The bug #233 was filed against: `serializeWorkflow` is a FULL rewrite, and every form or
+// canvas edit called it on the whole workflow, every time — so dragging one edge in a file
+// with 60 comment lines produced a 60-comment-line diff. The interim mitigation (#231, rev-15)
+// was honest about that trade and warned before it happened; this is the real fix.
+//
+// The approach: reuse the ORIGINAL TEXT'S OWN LINES wherever the new model says nothing
+// changed there, and fall back to the canonical emitters (above) only for the piece that
+// actually changed. Correctness rests on one guarantee: a segment of original text is only
+// ever reused when the NEW block/section is `deepEqual` to what parsing THAT SAME original
+// text produced — so splicing it back in can only ever reproduce what was already there.
+// There is no attempt to re-attach a comment to a field that changed underneath it; that is
+// deliberately out of scope (see the module comment at the top of this file) — the bar is
+// "untouched regions keep their comments and formatting", not full-fidelity diffing.
+
+/** Structural equality for the JSON-shaped values this schema is built from (`YamlValue`,
+ *  `WorkflowBlock`, `WorkflowGates`, …). Order-independent for object keys (so `extra` bags
+ *  built from a `Map`/`Object.keys` in a different order still compare equal), order-sensitive
+ *  for arrays (an edge list is a sequence, not a set — see `groupEdges`'s own docblock on why
+ *  ordering there is meaningful). This is the one thing that MUST NOT false-positive: comparing
+ *  "equal" when something actually changed would splice stale text back over a real edit. */
+function deepEqualValue(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) return false;
+  if (Array.isArray(a) || Array.isArray(b)) {
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+    return a.every((v, i) => deepEqualValue(v, b[i]));
+  }
+  const ao = a as Record<string, unknown>;
+  const bo = b as Record<string, unknown>;
+  const ak = Object.keys(ao);
+  const bk = Object.keys(bo);
+  if (ak.length !== bk.length) return false;
+  return ak.every((k) => Object.prototype.hasOwnProperty.call(bo, k) && deepEqualValue(ao[k], bo[k]));
+}
+
+/** A `#` at the start of a line or after whitespace, ignoring one inside a quoted scalar —
+ *  reusing `stripComment`'s own quote-awareness so a `#` inside a string doesn't fool the
+ *  line-is-significant check below. */
+const isSignificantLine = (line: string): boolean => stripComment(line).trim() !== "";
+
+/** The header pattern for a `|`/`>` block scalar — the same one `afterKey` (the real reader,
+ *  above) tests, kept in one place so the two never drift. */
+const BLOCK_SCALAR_HEADER_RE = /^[|>](?:\d[-+]?|[-+]?\d?)$/;
+
+/** Indices into `seg` that fall inside a `|`/`>` block scalar's BODY — content, never trivia,
+ *  no matter what character they start with. #233 B2: a prompt's last line can legitimately be
+ *  `# a checklist item`, and the naive "does it look like a comment" test used for trivia-
+ *  peeling (below) would otherwise steal it onto whatever entry/item comes next — silently, and
+ *  only visible once a SIBLING gets edited and that stolen line never comes back.
+ *
+ *  Scans `seg` from the front exactly once, tracking whether it is currently inside a scalar
+ *  body (`scalarIndent`, the indent of the governing `key: |` line — the body ends at the first
+ *  non-blank line whose indent drops back to that column or shallower, same rule `blockScalar`
+ *  itself uses). Safe to run independently on each already-bounded segment (an entry's
+ *  `content`, or one block item's `raw`): a scalar can never span the boundary between two such
+ *  segments, because its own governing key is always MORE indented than either boundary the
+ *  outer scan looks for (column 0 for a top-level key, `markerIndent` for a block item), so the
+ *  boundary is always found before the scalar could bleed across it. */
+function opaqueScalarIndices(seg: readonly string[]): Set<number> {
+  const opaque = new Set<number>();
+  let scalarIndent: number | null = null;
+  for (let k = 0; k < seg.length; k++) {
+    const line = seg[k]!;
+    if (scalarIndent !== null) {
+      if (line.trim() !== "" && indentOf(line) <= scalarIndent) {
+        scalarIndent = null; // dedented back out — the scalar body ends here, not opaque
+      } else {
+        opaque.add(k);
+        continue;
+      }
+    }
+    if (!isSignificantLine(line)) continue;
+    const stripped = stripComment(line);
+    const split = splitKey(stripped.trim());
+    if (split && BLOCK_SCALAR_HEADER_RE.test(split.rest)) scalarIndent = indentOf(stripped);
+  }
+  // A scalar that runs to the very END of `seg` with no dedent line to close it (its governing
+  // key was the LAST field of the LAST item in this segment) leaves `scalarIndent` open through
+  // every trailing blank line — but a block scalar's OWN reader (`blockScalar`, above) already
+  // drops its trailing blank body lines during chomping, so there is nothing structural left for
+  // those blanks to belong to. Un-mark a purely trailing run of them so the ordinary trivia peel
+  // can still separate this item from whatever comes after it, instead of leaving that blank line
+  // stuck as "content" and then getting a SECOND, synthetic one stacked in front of it whenever
+  // the next item is regenerated (round 2's stray-double-blank-line finding).
+  let end = seg.length - 1;
+  while (end >= 0 && seg[end]!.trim() === "") opaque.delete(end--);
+  return opaque;
+}
+
+/** Pop blank/comment lines off the end of `seg`, INTO `pendingTrivia` (in original order), but
+ *  never a line the scalar scan above marked opaque — see #233 B2. Mutates both arrays. */
+function peelTrailingTrivia(seg: string[], pendingTrivia: string[]): void {
+  const opaque = opaqueScalarIndices(seg);
+  while (seg.length && !opaque.has(seg.length - 1) && !isSignificantLine(seg[seg.length - 1]!)) {
+    pendingTrivia.unshift(seg.pop()!);
+  }
+}
+
+/** One top-level key's own leading trivia (the comment/blank lines that precede it, read as
+ *  "about" that key) plus its full raw text: the key's own line (`header`) and everything
+ *  indented under it (`content`), all as ORIGINAL, UNMODIFIED source lines. */
+interface TopEntry {
+  key: string;
+  /** Trivia lines, then the `key: …` line itself. */
+  header: string[];
+  /** Everything more indented than column 0 that followed the key line, verbatim. */
+  content: string[];
+}
+
+interface SplitDocument {
+  /** Comment/blank lines before the very first top-level key — file-level commentary that
+   *  belongs to no single field, so it is always kept rather than tied to `front`. */
+  preamble: string[];
+  /** One entry per top-level key, in the order the source actually wrote them. */
+  entries: TopEntry[];
+  /** Comment/blank lines dangling after the last top-level key's content, through EOF. */
+  trailer: string[];
+}
+
+/** Is `line` (already known significant) a `-` sequence marker at exactly `indent`? Shared by
+ *  the "same-indent sequence" check below and by `splitBlockItems`'s own item-boundary test. */
+function isDashAt(line: string, indent: number): boolean {
+  const t = stripComment(line).trim();
+  return indentOf(line) === indent && (t === "-" || t.startsWith("- "));
+}
+
+/** Split source text into its top-level keys' raw line ranges, WITHOUT re-parsing their
+ *  values — this only needs to know where each key's text begins and ends so the preserving
+ *  serializer can splice by that boundary. Returns null for any shape this simple scan isn't
+ *  confident about (a document that doesn't open at column 0, for instance) — the caller's
+ *  fallback is `serializeWorkflow`, i.e. today's behavior, never a guess that could corrupt
+ *  the file. */
+function splitDocument(text: string): SplitDocument | null {
+  const lines = text.replace(/^﻿/, "").split(/\r?\n/);
+  const entries: TopEntry[] = [];
+  let pendingTrivia: string[] = [];
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i]!;
+    if (!isSignificantLine(line)) {
+      pendingTrivia.push(line);
+      i++;
+      continue;
+    }
+    // Tabs are never a safe column to reason about (the real reader flags them as a syntax
+    // error rather than a column), and a line that isn't the mapping's `key: value` shape
+    // means this scan doesn't understand the document well enough to splice it safely.
+    if (/^[ ]*\t/.test(line) || indentOf(line) !== 0) return null;
+    const split = splitKey(stripComment(line).trim());
+    if (!split) return null;
+    // An ORPHAN dash sequence — a `- id: …` line at column 0 that is not itself the same-column
+    // continuation of a preceding empty-rest key (that case is handled above, per-entry, via
+    // `sameColumnSeq`) — is not a top-level key at all; `splitKey` only returned one here because
+    // "- id: a" contains a `: ` too. Reading it as a fresh key is exactly the B1 mistake one
+    // level up: the real reader's `mapping()` would have stopped at this line already (filed
+    // separately — the reader silently truncates here instead of raising a finding), so trusting
+    // this scan's own read of it could front-splice roster content or lose it outright. Bail.
+    if (split.key.startsWith("-")) return null;
+    const header = [...pendingTrivia, line];
+    pendingTrivia = [];
+    i++;
+
+    // #233 B1: `blocks:` (etc.) with NOTHING after the colon may be followed by its sequence
+    // at the SAME column (0) — `afterKey` (the real reader, above) accepts this, and a scan
+    // that didn't would read each `- id: …` line as its own bogus top-level key, splicing
+    // roster content into `front` and silently discarding everything from that point on (the
+    // real reader, reading the reconstructed text top-down, hits a `-`-prefixed line where it
+    // expects a key and stops there — the corruption the reviewer found). So: peek past this
+    // key's own trivia for the first significant line, and if it is a same-column dash, this
+    // key's content runs until a line that is neither MORE indented than 0 nor another
+    // same-column dash — i.e. until an actual new key, not merely the next roster entry.
+    let sameColumnSeq = false;
+    if (split.rest === "") {
+      let j = i;
+      while (j < lines.length && !isSignificantLine(lines[j]!)) j++;
+      if (j < lines.length && isDashAt(lines[j]!, 0)) sameColumnSeq = true;
+    }
+
+    const content: string[] = [];
+    while (i < lines.length) {
+      const l = lines[i]!;
+      if (!isSignificantLine(l) || indentOf(l) !== 0) {
+        content.push(l);
+        i++;
+        continue;
+      }
+      if (sameColumnSeq && isDashAt(l, 0)) {
+        content.push(l);
+        i++;
+        continue;
+      }
+      break; // a genuine new top-level key
+    }
+    // The tail of `content` may be blank/comment lines that read as commentary on the NEXT
+    // key, not this one (a section-header comment sitting just above `edges:`, say) — peel
+    // them back off so they travel with whatever comes after instead of this entry. Never a
+    // line inside a block scalar's body, even if it starts with `#` (#233 B2).
+    peelTrailingTrivia(content, pendingTrivia);
+    entries.push({ key: split.key, header, content });
+  }
+  const trailer = pendingTrivia;
+  if (!entries.length) return { preamble: [], entries: [], trailer };
+  // The document's own preamble is the leading trivia of the very first entry — peeled off
+  // into its own bucket so it survives even when that first key's OWN content changes (the
+  // comment at the top of the file is about the whole roster, not specifically about
+  // `version:`).
+  const first = entries[0]!;
+  let k = 0;
+  while (k < first.header.length && !isSignificantLine(first.header[k]!)) k++;
+  const preamble = first.header.slice(0, k);
+  entries[0] = { ...first, header: first.header.slice(k) };
+  return { preamble, entries, trailer };
+}
+
+/** One roster entry's raw source lines (its own leading trivia and everything through its last
+ *  field), and the column its `-` sits at. */
+interface BlockItems {
+  items: string[][];
+  /** The indent every item's `-` was written at — 0 (same-column-as-`blocks:`) or some N>0.
+   *  Whatever it is, a REGENERATED item (below) is emitted at this SAME indent, never a
+   *  hardcoded one — mixing two marker indents in one YAML sequence is invalid, not just
+   *  inconsistent (#233 non-blocking #2). */
+  indent: number;
+}
+
+/** Split a `blocks:` key's content (everything indented under it) into one raw-line segment
+ *  per roster entry, each still carrying its own leading trivia. Returns `[]` items for an
+ *  empty or flow-style (`blocks: []`) roster, and `null` when the shape isn't the plain block
+ *  sequence this scan understands (mixed indentation, a marker column shared with something
+ *  that isn't a fresh item, …) — the caller treats `null` exactly like "nothing to reuse" and
+ *  regenerates every item, at this build's own two-space indent. */
+function splitBlockItems(content: string[]): BlockItems | null {
+  const firstSig = content.findIndex(isSignificantLine);
+  if (firstSig === -1) return { items: [], indent: 2 };
+  const markerIndent = indentOf(content[firstSig]!);
+  const isItemStart = (l: string): boolean => isDashAt(l, markerIndent);
+  if (!isItemStart(content[firstSig]!)) return null;
+
+  const items: string[][] = [];
+  let pending: string[] = [];
+  let i = 0;
+  while (i < content.length) {
+    if (!isSignificantLine(content[i]!)) {
+      pending.push(content[i]!);
+      i++;
+      continue;
+    }
+    if (!isItemStart(content[i]!)) return null;
+    const raw = [...pending, content[i]!];
+    pending = [];
+    i++;
+    while (i < content.length && !(isSignificantLine(content[i]!) && isItemStart(content[i]!))) {
+      raw.push(content[i]!);
+      i++;
+    }
+    peelTrailingTrivia(raw, pending); // never steals a scalar body line (#233 B2)
+    items.push(raw);
+  }
+  return { items, indent: markerIndent };
+}
+
+const TOP_SECTION_KEYS = new Set(["blocks", "edges", "gates"]);
+
+/** Render the workflow the way a form or canvas edit should: reusing the ORIGINAL text's own
+ *  lines — comments, blank-line runs, key order, quoting style, all of it — for every top-level
+ *  piece the edit didn't touch, and falling back to the canonical emitters only for the piece
+ *  that changed.
+ *
+ *  "Piece" is deliberately coarse — `front` (version/name/unknown top keys), each block in the
+ *  roster BY ID, the whole `edges:` section, the whole `gates:` section — not a per-field diff
+ *  within one of them. That is the bar #233 sets (comment-preserving for UNTOUCHED regions;
+ *  "edited nodes serialize cleanly" — i.e. canonically — is enough for the parts that changed),
+ *  and it is also what keeps this tractable against a hand-rolled parser: matching a whole
+ *  block by id and `deepEqualValue` is a much smaller claim than re-attaching a trailing
+ *  comment to the one field it happened to sit next to.
+ *
+ *  Falls back to `serializeWorkflow` (today's full rewrite) whenever `originalText` isn't
+ *  READABLE — `isUnreadable`, the same predicate the view's `syntaxBroken` gates the form on
+ *  (#233 B3), not the broader `hasErrors` (a `version-unsupported` file is still editable here,
+ *  and must not silently lose its comments on the first edit just because *some* finding fired)
+ *  — or when this scan doesn't trust its own read of the top-level shape. Always the SAFE
+ *  direction, never a guess that could reuse text for content it no longer describes.
+ *
+ *  The original text's own line ending is kept for the whole output (CRLF in, CRLF out) —
+ *  `splitDocument` reads via `split(/\r?\n/)`, which strips every `\r`, so every line this
+ *  function handles (reused or freshly generated) is already EOL-free until the final join. */
+export function serializeWorkflowPreserving(w: Workflow, originalText: string): string {
+  const parsedOriginal = parseWorkflow(originalText);
+  if (isUnreadable(parsedOriginal.findings)) return serializeWorkflow(w);
+  const doc = splitDocument(originalText);
+  if (!doc) return serializeWorkflow(w);
+
+  const orig = parsedOriginal.workflow;
+  const order = blockOrder(w);
+  const out: string[] = [...doc.preamble];
+
+  // ---- front: version, name, unknown top-level keys ----
+  const frontEntries = doc.entries.filter((e) => !TOP_SECTION_KEYS.has(e.key));
+  const frontUnchanged =
+    w.version === orig.version && w.name === orig.name && deepEqualValue(w.extra, orig.extra);
+  if (frontUnchanged && frontEntries.length) {
+    for (const e of frontEntries) out.push(...e.header, ...e.content);
+  } else {
+    out.push(...emitFrontLines(w));
+  }
+
+  // ---- blocks, matched by id (the one thing about a block that never changes — see the
+  // module comment at the top of this file) ----
+  //
+  // A reused `header`/`raw` segment already carries whatever blank line originally separated
+  // it from what came before (the scan in `splitDocument`/`splitBlockItems` peels exactly that
+  // trivia onto the FOLLOWING entry/item) — so a synthetic `""` is only ever pushed ahead of a
+  // FRESHLY regenerated line, never ahead of reused text, or every section gains a blank line
+  // it didn't have.
+  //
+  // NOTE (reorder): a block is matched by id, not by position, so its own comment travels WITH
+  // it if the roster gets reordered by hand (in the YAML tab) — a deliberate property, not a
+  // bug. What is NOT preserved across a reorder is the blank-line spacing BETWEEN items: each
+  // item's leading trivia was captured relative to its ORIGINAL neighbor, so after a reorder it
+  // separates a different pair than it used to. The result is still valid YAML and never loses
+  // a comment; it can just look unevenly spaced. Fixing that needs re-deriving spacing from the
+  // NEW neighbor at every reuse, which is more machinery than the cosmetic cost justifies here,
+  // and the pane's own UI has no "reorder" gesture — this only arises from a hand edit.
+  if (!w.blocks.length) {
+    // Same header/content split as `blocks:`'s own non-empty case just below (and edges/gates,
+    // further down): the comment introducing the ROSTER ("# BLOCKS — the agents a run may
+    // use…") is about the section, not about any one block, so it survives the roster being
+    // emptied out too — only the LAST line of the header (the `blocks:`/`blocks: […]` key line
+    // itself) is replaced with the canonical empty form.
+    const blocksEntry = doc.entries.find((e) => e.key === "blocks");
+    if (blocksEntry) out.push(...blocksEntry.header.slice(0, -1), "blocks: []");
+    else out.push("", "blocks: []");
+  } else {
+    const blocksEntry = doc.entries.find((e) => e.key === "blocks");
+    const split = blocksEntry ? splitBlockItems(blocksEntry.content) : null;
+    const reusable = !!split && split.items.length === orig.blocks.length;
+    const targetIndent = split?.indent ?? 2;
+    const origById = new Map<string, { block: WorkflowBlock; raw: string[] }>();
+    if (reusable) {
+      orig.blocks.forEach((b, i) => {
+        if (b.id && !origById.has(b.id)) origById.set(b.id, { block: b, raw: split!.items[i]! });
+      });
+    }
+    // The `blocks:` line and whatever comment introduces the SECTION (not any one block) is
+    // reused whenever we have one to reuse, independent of which items below it changed.
+    if (blocksEntry) out.push(...blocksEntry.header);
+    else out.push("", "blocks:");
+    let firstItem = true;
+    for (const b of w.blocks) {
+      const match = b.id ? origById.get(b.id) : undefined;
+      if (match && deepEqualValue(b, match.block)) {
+        out.push(...match.raw);
+      } else {
+        if (!firstItem) out.push("");
+        out.push(...emitBlockLines(b, targetIndent));
+      }
+      firstItem = false;
+    }
+  }
+
+  // ---- edges: the SECTION HEADER (the `edges:` line and whatever comment introduces it, e.g.
+  // "# ADVISORY — the declared happy path") is reused whenever there is one, independent of
+  // whether the edge list itself changed — the same "header vs. content" split `blocks:` gets,
+  // above. Only the CONTENT (the fan-out entries) falls back to canonical when it changed;
+  // regenerating the whole section including its header (the old behavior) meant deleting one
+  // edge dropped a comment that was never about that edge (#233 non-blocking #1). ----
+  const edgesEntry = doc.entries.find((e) => e.key === "edges");
+  const edgesUnchanged = deepEqualValue(w.edges, orig.edges);
+  if (edgesEntry && (edgesUnchanged || w.edges.length)) {
+    const edgeContent = edgesUnchanged ? edgesEntry.content : emitEdgesLines(w.edges, order).slice(1);
+    out.push(...edgesEntry.header, ...edgeContent);
+  } else {
+    const edgeLines = emitEdgesLines(w.edges, order);
+    if (edgeLines.length) out.push("", ...edgeLines);
+  }
+
+  // ---- gates: same header/content split as edges ----
+  const gatesEntry = doc.entries.find((e) => e.key === "gates");
+  const gatesUnchanged = deepEqualValue(w.gates, orig.gates);
+  const gatesPresent = !!w.gates.merge || !!w.gates.extra;
+  if (gatesEntry && (gatesUnchanged || gatesPresent)) {
+    const gateContent = gatesUnchanged ? gatesEntry.content : emitGatesLines(w, order).slice(1);
+    out.push(...gatesEntry.header, ...gateContent);
+  } else {
+    const gateLines = emitGatesLines(w, order);
+    if (gateLines.length) out.push("", ...gateLines);
+  }
+
+  if (doc.trailer.length) out.push(...doc.trailer);
+
+  const eol = originalText.includes("\r\n") ? "\r\n" : "\n";
+  const text = out.join(eol);
+  return text.endsWith(eol) ? text : text + eol;
 }
 
 // ---------- parse: text → model ----------

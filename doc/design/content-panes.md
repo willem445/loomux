@@ -488,9 +488,9 @@ parser, with a regression test.
 of what a workflow is, the roster the button is about to write, and a **Create workflow** button
 that scaffolds a real, commented, valid file (`scaffoldWorkflowText`) — then lands them in the
 canvas on it. A commented scaffold is how every config-as-code tool worth using introduces
-itself, and it costs one string. (The comments do not survive a canonical re-serialize; that is
-the honest trade of having one canonical shape, and it is why the scaffold is offered at
-*creation* rather than being something the formatter tries to preserve.)
+itself, and it costs one string. (Before #233, an edit's canonical re-serialize dropped these
+comments the moment the human touched the form; now they survive untouched edits the same way
+any hand-written comment does — see below.)
 
 **The graph is now editable**, which reverses v1's read-only decision (§2f/Q6). The reasoning
 behind that decision was *"a canvas that can corrupt the file is worse than no canvas"* — and it
@@ -504,7 +504,7 @@ is answered rather than abandoned:
   Delete             → removeBlockAt()   → takes its edges and its gate seat with it
 ```
 
-Every gesture goes through the pure model and out through the same canonical formatter as
+Every gesture goes through the pure model and out through the same comment-preserving writer as
 everything else, so **the canvas cannot express anything the YAML can't**, cannot write a
 position into the semantic file, and cannot invent an identity. It is a second way to *edit* the
 file, not a second source of truth — which was the whole content of the original objection.
@@ -533,46 +533,109 @@ And the gate is still not a node you can drag or wire. It is not a block — it 
 blocks — and making it draggable would imply it can be rewired, which is the single most
 important thing about it that isn't true.
 
-### Comments, and the save that eats them
+### Comments, and the save that used to eat them (#233)
 
-A form or canvas edit re-serializes the **whole workflow from the model**, and the model does not
-carry comments — it cannot, because it is a workflow, not a document. For a file loomux wrote,
-that costs nothing. For a file a **human** wrote, the comments are frequently the most valuable
-lines in it: this repo's own `.loomux/workflow.yml` is 126 lines of which **60 are comments**
-explaining the roster and the `.github/agents/` convention. One dragged edge and a `Ctrl+S` used
-to take all 60, silently, and hand the human a whole-file diff to discover later.
+v2 shipped with a real cost: a form or canvas edit re-serialized the **whole workflow from the
+model**, every time, and the model did not carry comments. For a file loomux wrote, that cost
+nothing. For a file a **human** wrote, the comments are frequently the most valuable lines in
+it: this repo's own `.loomux/workflow.yml` is 126 lines of which **60 are comments** explaining
+the roster and the `.github/agents/` convention. One dragged edge and a `Ctrl+S` used to take
+all 60, silently, and hand the human a whole-file diff to discover later. #231 (rev-15) shipped
+an honest mitigation — warn once, before the first save that would do it — and named the real
+fix as a follow-up. This is that follow-up.
 
-Three things follow, and the order matters:
+**`serializeWorkflowPreserving(model, previousText)`** (`workflowmodel.ts`) is what `commit()`
+calls now, instead of the fully canonical `serializeWorkflow`. It reuses the ORIGINAL text's own
+lines — comments, blank-line runs, key order, quoting — for every top-level piece the edit
+didn't touch, and falls back to the canonical emitters only for the piece that changed:
 
-1. **The pane says so, once, before it does it.** `rewriteImpact` (pure, in `workflowpane.ts`) is
-   the signal: *are we about to write canonical text over a file that was not canonical?* If so
-   the save asks, naming what is lost ("the comments on 60 lines will be dropped"), with **Cancel
-   as the default** — the only dialog in this pane where the affirmative is not the focused
-   button, because it is the only one asking about work that is not recoverable. Once per file,
-   not once per save: a human who has said "yes, canonicalize it" has said it, and re-asking on
-   every `Ctrl+S` is how you train someone to stop reading the question.
-2. **A file already in canonical form saves silently** — anything loomux itself wrote. A confirm
-   that fires when nothing is at stake is a confirm people click through, and then they click
-   through the one that mattered.
-3. **The YAML tab is unaffected**: it saves exactly what you typed, comments and all. The
-   rewrite is a property of *re-serializing from the model*, not of saving — so the guard keys on
-   the **reformat**, never on the comment count alone. That distinction is not fussiness: a form
-   or canvas save *always* reformats (a commented file is never canonical, and the model always
-   emits canonical text), so a comments-only warning could only ever fire on text the human typed
-   themselves — i.e. it would fire exactly when they had just deleted a comment on purpose, to
-   tell them they were about to delete a comment. A dialog that explains your own keystroke back
-   to you is how a guard becomes noise, and noise is how the guard that matters gets clicked
-   through.
+- **`front`** (`version:`, `name:`, and any top-level keys this build doesn't know) is reused
+  whole when none of them changed.
+- **Each block, matched by `id`** — the one thing about a block that is immutable by the schema's
+  own first rule (§ above) — is reused whole when it `deepEqual`s what parsing the original text
+  produced for that id. An edited block, or a brand-new one, regenerates canonically; every
+  *other* block keeps its own comment, blank-line spacing and field order untouched.
+- **`edges:`** and **`gates:`** each split their SECTION HEADER (the key line and whatever
+  comment introduces it, e.g. "# ADVISORY — the declared happy path") from their CONTENT (the
+  fan-out entries, or the gate itself). The header is reused whenever the section still exists
+  at all, whether or not its content changed; only the content falls back to canonical when it
+  did. Rewiring one edge, then, costs that section's content — not the paragraph explaining what
+  the section is *for*, which review found was the larger share of what a block-roster edit
+  used to cost (a deleted block that also drops its edges and its gate seat used to take the
+  `# ADVISORY` and `# ENFORCED` headers with it; now it doesn't).
 
-**The test used to claim the opposite, and could not fail.** It asserted that a save "does not
-churn the file" while comparing the canonical form against *itself* — never against the bytes on
-disk. It now asserts the truth (the shipped file is **not** canonical; a save rewrites it) and
-then asserts the guard. A test that cannot fail is worse than no test: it is a claim with a green
-tick next to it.
+That granularity — whole section header, whole block by id, not per-field — is the deliberate
+boundary #233 draws: *comment-preserving for the parts an edit didn't touch*, not full-fidelity
+re-attachment of a comment to the one field it happened to sit beside. Re-attaching comments at
+field granularity against a hand-rolled parser is a much larger claim, and the bar the issue
+set — "edited nodes serialize cleanly" — is satisfied by canonical output for the piece that
+changed.
 
-Comment-preserving serialization is the real fix and it is a genuine feature — round-tripping
-comments through a structure the form can still rewrite. It needs its own design and its own
-review, so it is **filed as a follow-up** rather than smuggled in behind a bug fix.
+**Two structural traps review found, both fixed at the scan, not patched at the call site:**
+
+1. **A `blocks:` (or any key) with nothing after the colon may be followed by its sequence at
+   the SAME column** — `- id: a` sitting directly under `blocks:` at indent 0, not indented
+   under it. The real reader (`afterKey`, above) already accepts this; the first version of the
+   splitting scan didn't, and mis-read every `- id: …` line as its own bogus top-level key —
+   which spliced roster content into `front` and, on re-parse, silently discarded everything
+   from that point on (the real reader's top-level `mapping()` treats a `-`-prefixed line at
+   column 0 as "a sequence ends the mapping" and stops). Fixed by teaching the scan the same
+   same-column rule the reader already has.
+2. **A `|`/`>` block scalar's body is content, never trivia — even a line that starts with
+   `#`.** The generic "is this a blank/comment line" test used to decide what trivia to peel
+   onto the next entry doesn't know it's inside a prompt, so a prompt whose own last line reads
+   `# a checklist item` could be silently stolen onto whatever comes next — invisible until that
+   NEXT block is the one edited, at which point the stolen line never comes back. Fixed with a
+   small scalar-tracking pass (`opaqueScalarIndices`) that marks every line inside a governing
+   `key: |`/`key: >`'s body as un-peelable, regardless of what character it starts with.
+
+**Falling back is always the safe direction, and it agrees with the view.** The fallback gates
+on `isUnreadable` — the SAME predicate `workflowview.ts`'s `syntaxBroken` disables the form on
+(a syntax error, or a root that isn't a mapping) — not the broader "any validation finding at
+all". A `version: 2` file (readable, still editable, just not one this build fully supports) is
+not unreadable, and must not silently lose its comments on the very first edit for a reason the
+human was never shown; the two gates drifting apart was itself a defect review caught. Beyond
+that: a `blocks:` sequence indented to something other than 2 spaces is not guessed at by mixing
+that indent with a hardcoded one — a regenerated item is emitted at whatever indent the file's
+OWN sequence already uses (0, 2, 4, whatever — tracked through from the scan), so it is never
+forced to choose between corrupting the sequence and reformatting the whole roster. Only a
+genuinely unfamiliar shape (this scan failing to find a consistent marker at all) falls all the
+way back to `serializeWorkflow`. Never a guess that could splice text over content it no longer
+describes — only ever "reuse this exact text for this exact, unchanged content" or "regenerate
+it cleanly."
+
+**The original file's own line ending survives too** (CRLF in, CRLF out) — the scan reads via
+`split(/\r?\n/)`, which strips every `\r` before any line is touched, so the only place an EOL
+convention matters is the final join, and that join uses whichever one `originalText` actually
+had. `serializeWorkflow` (Format's full rewrite) has no original text to take a convention from
+and still always emits `\n`.
+
+**One known, accepted cosmetic gap: reordering.** A block is matched by `id`, not by position,
+so a reordered block's own comment travels WITH it — a hand-edit in the YAML tab that swaps two
+blocks, followed by an unrelated form edit, keeps both blocks' comments. What does NOT
+travel correctly is the BLANK-LINE spacing between items: each item's leading trivia was
+captured relative to its *original* neighbor, so after a reorder it can separate a different
+pair than it used to. Still valid YAML, never a lost comment — just occasionally uneven spacing.
+Re-deriving spacing from each item's *new* neighbor on every reuse is more machinery than the
+cosmetic cost justifies, and the pane's own UI has no "reorder" gesture (only add/remove/connect)
+— this only arises from a hand edit.
+
+**Format still exists, and it still asks.** The **Format** button is the one place left that
+performs the OLD, fully canonical, comment-dropping rewrite — on purpose, in one step, for a
+human who explicitly wants the whole file canonicalized. `rewriteImpact` (pure, in
+`workflowpane.ts`) still guards it: naming what's lost ("the comments on 60 lines will be
+dropped"), with **Cancel as the default** — the only dialog in this pane where the affirmative
+is not the focused button, because it is the only one asking about work that is not
+recoverable, asked once per file (reset on `load()`). A file already in canonical form formats
+silently. The **YAML tab** remains unaffected either way: it saves exactly what you typed.
+
+**The dogfood pin (`test/workflowdogfood.test.ts`) now asserts the fix, not just the mitigation
+around it**: re-serializing the shipped file with nothing changed reproduces it byte-for-byte,
+and editing one block's `model:` keeps the file preamble, every other block's own comment, and
+both section headers — while `rewriteImpact` over that same edit returns `null`, because it
+never was the whole-file reformat that guard exists for. `serializeWorkflow`'s own full-rewrite
+behavior is still pinned too (that's what Format uses), so both halves of the contract stay
+honest at once.
 
 ### The three questions the view was never allowed to answer
 

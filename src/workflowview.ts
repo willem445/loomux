@@ -30,7 +30,9 @@ import {
   analyzeWorkflow,
   parseWorkflow,
   serializeWorkflow,
+  serializeWorkflowPreserving,
   formatWorkflowText,
+  isUnreadable,
   scaffoldWorkflowText,
   removeBlockAt,
   newBlock,
@@ -241,7 +243,7 @@ export class WorkflowView {
     formatBtn.className = "wf-btn";
     formatBtn.textContent = "Format";
     formatBtn.title = "Rewrite the file in canonical form (fixed key order, references in roster order)";
-    formatBtn.addEventListener("click", () => this.format());
+    formatBtn.addEventListener("click", () => void this.format());
 
     const reloadBtn = document.createElement("button");
     reloadBtn.className = "wf-btn";
@@ -535,7 +537,12 @@ export class WorkflowView {
 
   private async save(): Promise<void> {
     if (!this.root || !this.dirty) return;
-    if (!(await this.confirmRewrite())) return;
+    // No rewrite-impact gate here (#233): every form/canvas edit already went through
+    // `commit()`, which reuses the ORIGINAL text for whatever it didn't touch — so by the
+    // time a save happens, `this.text` is not a blind canonical rewrite of the whole file.
+    // The one operation left that still rewrites wholesale on purpose is Format, and it asks
+    // there, not here.
+    //
     // Saving a file whose YAML doesn't parse is allowed on purpose: it is text, the human
     // may be mid-edit, and a half-finished workflow on disk is recoverable while a lost
     // one is not. The findings strip is what says it isn't runnable yet.
@@ -567,40 +574,38 @@ export class WorkflowView {
     }
   }
 
-  /** Ask ONCE, before the first save that would rewrite a human-authored file into canonical
-   *  form — and only when that rewrite actually costs them something (rev-15 F6).
+  /** Ask ONCE, before the first **Format** that would rewrite a human-authored file into fully
+   *  canonical form — and only when that rewrite actually costs them something (rev-15 F6,
+   *  moved here from every save by #233).
    *
-   *  A form or canvas edit re-serializes the whole workflow from the model, and the model does
-   *  not carry comments. For a file loomux wrote that costs nothing. For a file a HUMAN wrote,
-   *  the comments are often the most valuable lines in it — this repo's own `.loomux/workflow.yml`
-   *  is 126 lines of which 60 are comments explaining the roster and the `.github/agents/`
-   *  convention, and until now one dragged edge would have taken all 60 without a word.
+   *  Before #233, EVERY form or canvas edit re-serialized the whole workflow from the model,
+   *  unconditionally, and the model did not carry comments — so this guarded every `Ctrl+S`.
+   *  Now `commit()` (below) reuses the original text for whatever an edit didn't touch, so an
+   *  ordinary save no longer performs the all-or-nothing rewrite this dialog is about. The one
+   *  place that rewrite still happens ON PURPOSE is the explicit **Format** button — a human
+   *  asking to canonicalize the whole file, comments and all, in one step — and that is the
+   *  only place left that needs to say so first.
    *
-   *  Comment-preserving serialization is the real fix, and it is a feature with its own design.
-   *  Until then the honest thing is not to pretend the loss doesn't happen: say so, once, before
-   *  it does, and let the human decide. A rewrite they consented to is a trade; a rewrite they
-   *  find later in `git diff` is a bug.
-   *
-   *  ONCE per file, not once per save: a human who has said "yes, canonicalize it" has said it
-   *  about that file, and asking again on every Ctrl+S is how you train someone to stop reading
-   *  the question. Reset by `load()`, because that is a different file (or a different version
-   *  of it) and the answer was about the old one.
+   *  ONCE per file, not once per Format press: a human who has said "yes, canonicalize it" has
+   *  said it about that file, and asking again on every press is how you train someone to stop
+   *  reading the question. Reset by `load()`, because that is a different file (or a different
+   *  version of it) and the answer was about the old one.
    *
    *  CANCEL IS THE DEFAULT — the affirmative button is deliberately not the focused one here,
    *  which is the opposite of every other dialog in this pane. Everything else asks about
    *  something recoverable; this asks about work that is not. */
   private rewriteConfirmed = false;
 
-  private async confirmRewrite(): Promise<boolean> {
+  private async confirmFormatRewrite(canonical: string): Promise<boolean> {
     if (this.rewriteConfirmed) return true;
-    const impact = rewriteImpact(this.savedText, this.text, (t) => formatWorkflowText(t) === t);
-    if (!impact) return true; // a faithful save — silent, as it should be
+    const impact = rewriteImpact(this.text, canonical, (t) => formatWorkflowText(t) === t);
+    if (!impact) return true; // a faithful rewrite — silent, as it should be
 
     const ok = await modal<boolean>((resolve) => ({
-      title: "This save rewrites the file",
+      title: "This rewrites the file",
       body: rewriteImpactMessage(impact, this.rel),
       buttons: [
-        { label: "Rewrite and save", value: true, kind: "danger" },
+        { label: "Rewrite and format", value: true, kind: "danger" },
         { label: "Cancel", value: false },
       ],
       onKey: (k) => (k === "Escape" ? resolve(false) : undefined),
@@ -781,29 +786,46 @@ export class WorkflowView {
 
   /** Write the model back into the buffer. EVERY form edit goes through here: the YAML is
    *  the source of truth, so a form edit is not "state the file will catch up with later"
-   *  — it IS a file edit, immediately, in canonical form. */
+   *  — it IS a file edit, immediately.
+   *
+   *  Comment-preserving, not a blind canonical rewrite (#233): `serializeWorkflowPreserving`
+   *  reuses `this.text` — the buffer as it stood a moment ago — for every top-level piece the
+   *  edit didn't touch, and only falls back to the canonical form for the piece that changed.
+   *  That is what makes dragging one edge in a heavily-commented file a one-section diff
+   *  instead of the whole file. */
   private commit(w: Workflow): void {
-    this.setText(serializeWorkflow(w));
+    this.setText(serializeWorkflowPreserving(w, this.text));
   }
 
   private reanalyze(): void {
     this.analysis = analyzeWorkflow(this.text);
   }
 
-  private format(): void {
+  /** The explicit "rewrite this whole file in canonical form" action — the one place left
+   *  that drops comments on purpose, in one step, and the one place that still asks first
+   *  (`confirmFormatRewrite`). Everyday form/canvas edits go through `commit()` instead, which
+   *  preserves comments for whatever they didn't touch. */
+  private async format(): Promise<void> {
     if (this.syntaxBroken()) {
       showToast("Fix the YAML syntax first — formatting a file we can't read would rewrite it wrong.");
       return;
     }
-    this.commit(this.analysis.workflow);
+    const canonical = serializeWorkflow(this.analysis.workflow);
+    if (!(await this.confirmFormatRewrite(canonical))) return;
+    this.setText(canonical);
     this.render();
   }
 
   /** True while the text cannot be read at all. The form is disabled here — see the note
    *  at the top of the file: serializing a half-understood model back over the buffer
-   *  would destroy the broken text the human is trying to fix. */
+   *  would destroy the broken text the human is trying to fix.
+   *
+   *  `isUnreadable` (workflowmodel.ts) is the same predicate `serializeWorkflowPreserving`
+   *  gates its own fallback on (#233 B3) — the two must agree, or a file this view still lets
+   *  the human edit (e.g. `version: 2`, unsupported but readable) would silently full-rewrite
+   *  on its very first edit for a reason never shown here. */
   private syntaxBroken(): boolean {
-    return this.analysis.findings.some((f) => f.code === "yaml-syntax" || f.code === "not-a-mapping");
+    return isUnreadable(this.analysis.findings);
   }
 
   private updateDirty(): void {

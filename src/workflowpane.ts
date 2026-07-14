@@ -100,25 +100,27 @@ export function savePlan(state: { exists: boolean; savedHash: string }): SavePla
     : { kind: "claim-then-write" };
 }
 
-// ---------- what a canonical save is about to destroy ----------
+// ---------- what a canonical rewrite is about to destroy ----------
 
-/** What saving would do to the file that is on disk, when it would do something the human did
- *  not ask for. Null when the save is faithful — which is the common case, and which must stay
- *  silent.
+/** What rewriting the file in FULLY canonical form would cost, when it would do something the
+ *  human did not ask for. Null when the rewrite is faithful — which is the common case, and
+ *  which must stay silent.
  *
- *  THE TRADE THIS EXISTS TO SURFACE. A form or canvas edit re-serializes the whole workflow
- *  through the canonical formatter (that is what keeps the file legible and the diffs small),
- *  and the formatter does not preserve comments — it cannot, because the model it serializes
- *  from does not carry them. For a file loomux itself wrote, that costs nothing. For a file a
- *  HUMAN wrote, the comments are frequently the most valuable lines in it: this repo's own
- *  `.loomux/workflow.yml` is 126 lines of which 60 are comments explaining the roster and the
- *  `.github/agents/` convention, and one dragged edge would have silently taken all 60.
+ *  THE TRADE THIS EXISTS TO SURFACE, and — since #233 — where it still applies. Before #233,
+ *  every form or canvas edit re-serialized the WHOLE workflow through the canonical formatter,
+ *  every time, and the formatter did not preserve comments. Now an ordinary edit goes through
+ *  `serializeWorkflowPreserving` (workflowmodel.ts), which reuses the original text for
+ *  whatever it didn't touch — so this guard no longer needs to fire on every save. What is
+ *  left is the explicit **Format** action: a human asking, in one step, to rewrite the whole
+ *  file into canonical form — fixed key order, no comments, whatever was there before. For a
+ *  file loomux itself wrote that costs nothing. For a file a HUMAN wrote, the comments are
+ *  frequently the most valuable lines in it: this repo's own `.loomux/workflow.yml` is 126
+ *  lines of which 60 are comments explaining the roster and the `.github/agents/` convention —
+ *  and Format would silently take all 60 without this.
  *
- *  Comment-preserving serialization is the real fix and it is a feature with its own design
- *  (round-tripping comments through an AST that the form can still rewrite). Until then, the
- *  honest thing is not to pretend the loss doesn't happen — it is to say so, once, before it
- *  does, and let the human decide. A rewrite they consented to is a trade; a rewrite they
- *  discovered in `git diff` is a bug. */
+ *  So the honest thing is not to pretend the loss doesn't happen — it is to say so, once,
+ *  before it does, and let the human decide. A rewrite they consented to is a trade; a rewrite
+ *  they discovered in `git diff` is a bug. */
 export interface RewriteImpact {
   /** Comment lines the rewrite would drop. */
   droppedComments: number;
@@ -160,12 +162,11 @@ export function rewriteImpact(
 
   // REFORMATTING IS THE WHOLE TRIGGER (rev-15 F7). Warning on dropped comments *alone* looked
   // like belt-and-braces and was in fact the one case the docblock above says must never fire:
-  // a form or canvas save always sets `reformats` (a commented file is never canonical, and the
-  // model always emits canonical text), so the comments-only branch is reachable ONLY from text
-  // the human typed into the YAML tab themselves — i.e. it fired exactly when they had just
-  // deleted a comment on purpose, to tell them they were about to delete a comment. A dialog
-  // that explains your own keystroke back to you is how a guard becomes noise, and noise is how
-  // the guard that matters gets clicked through.
+  // `next` here is always the FULLY canonical form (Format's only caller, since #233 — see
+  // `workflowview.ts`'s `confirmFormatRewrite`), so a comments-only branch would be reachable
+  // only when `disk` was ALSO already canonical, i.e. nothing worth warning about ever reaches
+  // it. A dialog that explains your own keystroke back to you is how a guard becomes noise, and
+  // noise is how the guard that matters gets clicked through.
   if (!reformats) return null;
   return { droppedComments, reformats };
 }
@@ -177,9 +178,9 @@ export function rewriteImpactMessage(impact: RewriteImpact, file: string): strin
   const shape = impact.reformats ? "the file will be rewritten in loomux's canonical form" : "";
   const both = [comments, shape].filter(Boolean).join(", and ");
   return (
-    `Saving ${file} from the form or the canvas re-writes the whole file from the workflow model — ` +
+    `Formatting ${file} re-writes the whole file from the workflow model, in canonical form — ` +
     `so ${both}. The workflow itself is unchanged; the comments and the layout of the text are not recoverable. ` +
-    `(Editing the YAML tab directly saves exactly what you typed.)`
+    `(An ordinary edit through the form or the canvas does not do this — only Format rewrites the whole file.)`
   );
 }
 

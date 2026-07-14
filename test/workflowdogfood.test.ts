@@ -21,11 +21,19 @@ import {
   validateWorkflow,
   deriveGraph,
   serializeWorkflow,
+  serializeWorkflowPreserving,
   formatWorkflowText,
 } from "../src/workflowmodel.ts";
 import { rewriteImpact, rewriteImpactMessage } from "../src/workflowpane.ts";
 
+// The RAW bytes, whatever line ending this checkout actually has — a Windows checkout may have
+// CRLF (`core.autocrlf`). `serializeWorkflowPreserving` keeps the original's own line ending
+// (#233 non-blocking #3), so testing byte-for-byte against THIS is the honest claim regardless
+// of what platform the suite runs on. `serializeWorkflow` (the fully canonical rewrite Format
+// uses) always emits `\n` — no original text to take a convention from — so tests that compare
+// against ITS output use `lfText` instead.
 const text = readFileSync(new URL("../.loomux/workflow.yml", import.meta.url), "utf8");
+const lfText = text.replace(/\r\n/g, "\n");
 
 test("the repo's own workflow opens in the pane with no findings", () => {
   const { workflow, findings: syntax } = parseWorkflow(text);
@@ -109,7 +117,7 @@ test("a canonical save preserves the workflow's MEANING, exactly", () => {
   // What serialization actually guarantees, and all it guarantees: the workflow that comes back
   // is the workflow that went in — every block, persona, edge and gate — and the canonical form
   // is stable, so saving twice is a no-op.
-  const { workflow } = parseWorkflow(text);
+  const { workflow } = parseWorkflow(lfText);
   const saved = serializeWorkflow(workflow);
   const reread = parseWorkflow(saved);
 
@@ -118,28 +126,23 @@ test("a canonical save preserves the workflow's MEANING, exactly", () => {
   assert.equal(serializeWorkflow(reread.workflow), saved, "…and saving it twice must be a no-op");
 });
 
-test("a canonical save REWRITES this file — and the pane says so before it does", () => {
-  // The honest version of what this test used to claim (rev-15 F6). The old one asserted that a
-  // save "does not churn the file" — but it compared the canonical form against ITSELF and never
-  // against the bytes on disk, so it could not fail, and the property it was named after is
-  // FALSE: the shipped workflow is not canonical. It is deliberately-committed documentation —
-  // the comments explain the roster and the .github/agents/ convention — and a canonical
-  // re-serialize drops every one of them.
-  //
-  // So this asserts the truth instead, and then asserts the guard that makes the truth
-  // survivable: the pane warns, once, before the first save that would do it.
-  const { workflow } = parseWorkflow(text);
+test("the EXPLICIT Format action still rewrites this file wholesale — and still warns first", () => {
+  // `serializeWorkflow` (what the Format button uses) is still a full, comment-dropping
+  // rewrite on purpose — see its own docblock. The shipped file is deliberately-committed
+  // documentation (60+ comment lines explaining the roster and the `.github/agents/`
+  // convention), so asking for the fully canonical form still costs something, and the pane
+  // still says so before it happens (`rewriteImpact`, used from the Format action since #233 —
+  // see `workflowview.ts`'s `confirmFormatRewrite`).
+  const { workflow } = parseWorkflow(lfText);
   const canonical = serializeWorkflow(workflow);
 
-  assert.notEqual(canonical, text, "the shipped file is NOT in canonical form — it has comments");
+  assert.notEqual(canonical, lfText, "the shipped file is NOT in canonical form — it has comments");
 
-  const commentsOnDisk = text.split(/\r?\n/).filter((l) => /^\s*#/.test(l)).length;
+  const commentsOnDisk = lfText.split(/\r?\n/).filter((l) => /^\s*#/.test(l)).length;
   assert.ok(commentsOnDisk > 20, `the file's comments are load-bearing (${commentsOnDisk} lines)`);
 
-  // The guard: a form or canvas edit re-serializes, and the human is told what that costs BEFORE
-  // it happens — not left to find it in `git diff`.
-  const impact = rewriteImpact(text, canonical, (t) => formatWorkflowText(t) === t);
-  assert.ok(impact, "saving canonical text over this file must raise a warning");
+  const impact = rewriteImpact(lfText, canonical, (t) => formatWorkflowText(t) === t);
+  assert.ok(impact, "an explicit Format over this file must raise a warning");
   assert.ok(impact.reformats, "…it is a whole-file rewrite");
   assert.ok(
     impact.droppedComments >= 20,
@@ -148,12 +151,51 @@ test("a canonical save REWRITES this file — and the pane says so before it doe
   assert.match(rewriteImpactMessage(impact, ".loomux/workflow.yml"), /comments on \d+ lines/);
 
   // And the case that must stay SILENT: a file loomux itself wrote is already canonical, so
-  // saving it costs nothing and asks nothing.
+  // formatting it costs nothing and asks nothing.
   assert.equal(rewriteImpact(canonical, canonical, (t) => formatWorkflowText(t) === t), null);
 });
 
-// Comment-preserving serialization would make this whole trade go away, and it is a real
-// feature — the comments in this very file are the argument for it. It needs its own design and
-// its own review, so it is filed as a follow-up rather than smuggled in here. Until it lands,
-// the contract is: the YAML tab saves exactly what you type; the form and the canvas rewrite the
-// file, and say so first.
+// ---------- and now an ordinary form/canvas edit does NOT eat the comments (#233) ----------
+//
+// This is the pin the rest of #233's tests build on: an actual save through the pane calls
+// `serializeWorkflowPreserving(model, previousBufferText)`, not `serializeWorkflow`. The two
+// tests above and below together are the whole story — Format still asks, because it is still
+// a deliberate full rewrite; an ordinary edit through the form or canvas no longer needs to.
+
+test("re-serializing this file with NOTHING changed reproduces it exactly", () => {
+  const { workflow } = parseWorkflow(text);
+  assert.equal(serializeWorkflowPreserving(workflow, text), text);
+});
+
+test("editing one block's model keeps every other block's comments — and the section headers", () => {
+  const { workflow } = parseWorkflow(text);
+  const edited = {
+    ...workflow,
+    blocks: workflow.blocks.map((b) => (b.id === "worker-quick" ? { ...b, model: "opus" } : b)),
+  };
+  const out = serializeWorkflowPreserving(edited, text);
+
+  assert.deepEqual(parseWorkflow(out).workflow, edited, "the edit itself round-trips");
+
+  // The file header, the untouched blocks' own comments, and both section headers survive —
+  // only the roster in general was touched, not edges or gates, and not the OTHER blocks.
+  assert.match(out, /loomux's own agent workflow/, "the file preamble survives");
+  assert.match(out, /The orchestrator is loomux's trust root/, "an untouched block's comment survives");
+  assert.match(out, /the two worker tiers/, "the comment on the untouched sibling worker survives");
+  assert.match(out, /three focused reviewers, one per real review lane/, "the reviewers' comment survives");
+  assert.match(out, /^edges:/m, "the edges section is untouched");
+  assert.match(out, /^# ADVISORY/m, "…and keeps its own header comment");
+  assert.match(out, /^# ENFORCED/m, "the gates section keeps its header comment too");
+
+  const commentLines = out.split("\n").filter((l) => /^\s*#/.test(l)).length;
+  const originalCommentLines = text.split("\n").filter((l) => /^\s*#/.test(l)).length;
+  assert.ok(
+    commentLines >= originalCommentLines - 1,
+    `a one-field edit must not cost more than its own block's comment (had ${originalCommentLines}, now ${commentLines})`
+  );
+
+  // The rewrite-impact guard (Format's guard, not save's — see the test above) would not even
+  // fire for this: it isn't a whole-file canonical rewrite, just one changed field.
+  const impact = rewriteImpact(text, out, (t) => formatWorkflowText(t) === t);
+  assert.equal(impact, null, "an ordinary field edit is not the reformat Format's guard exists for");
+});
