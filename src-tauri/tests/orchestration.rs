@@ -6865,18 +6865,20 @@ fn list_notifications_is_oldest_registered_first() {
     // `list_notifications`" and the group view relies on it for its
     // soonest-first display), so pin the order both consumers depend on.
     let (reg, _d, _co, cw) = setup_mcp();
-    // `registered_ms` comes from the real wall clock (`register_notification`
-    // calls `now_ms()` internally — it isn't injectable), so three registrations
-    // back to back could tie on a coarse clock; a small real sleep between them
-    // guarantees distinct timestamps, matching how registrations are actually
-    // spaced in production (an agent doesn't register three watches in the same
-    // millisecond).
+    // Deliberately NO sleeps between registrations (a prior version of this
+    // test used `std::thread::sleep`s to force distinct `registered_ms`
+    // values — that went red in CI: on a fast runner two of the three still
+    // land in the same real millisecond, and with a `registered_ms`-only sort
+    // key a tie falls back to the input vec's order, which comes from HashMap
+    // iteration — arbitrary and randomized per process. Registering all three
+    // back to back, with no artificial spacing, is what actually exercises
+    // that tie: `registered_ms` for all three is very likely identical here,
+    // so this only passes if the `(registered_ms, seq)` tie-break in
+    // `list_notifications` is doing real work (see `Watch::seq`'s doc).
     let t1 = register_notify(&reg, &cw, json!({ "kind": "pr_checks", "pr": "1" })).unwrap();
     let id1 = extract_watch_id(&t1);
-    std::thread::sleep(Duration::from_millis(2));
     let t2 = register_notify(&reg, &cw, json!({ "kind": "pr_checks", "pr": "2" })).unwrap();
     let id2 = extract_watch_id(&t2);
-    std::thread::sleep(Duration::from_millis(2));
     let t3 = register_notify(&reg, &cw, json!({ "kind": "pr_checks", "pr": "3" })).unwrap();
     let id3 = extract_watch_id(&t3);
 
@@ -6906,6 +6908,12 @@ fn group_watches_lists_every_agents_live_watch_for_the_group_view() {
     assert_eq!(list.len(), 2, "must surface both agents' watches, got: {watches}");
 
     // Oldest-registered first (id1 before id2), matching `list_notifications`.
+    // This is the CI-flaky assertion that reddened on ubuntu (fast runner: both
+    // registrations landed in the same `registered_ms` millisecond, and a
+    // registered_ms-only sort tie-broke on HashMap iteration order — arbitrary
+    // and randomized per process). `group_watches`' sort now tie-breaks on
+    // `Watch::seq` (a strictly monotonic registration counter), which makes
+    // this deterministic without adding a sleep — see that field's doc.
     assert_eq!(list[0]["id"], id1);
     assert_eq!(list[0]["agent"], cw.agent_id);
     assert_eq!(list[0]["kind"], "pr_checks");

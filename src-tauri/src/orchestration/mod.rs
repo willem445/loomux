@@ -4578,13 +4578,15 @@ impl OrchRegistry {
         let now = now_ms();
         let expires_minutes = notify::clamp_expires_minutes(Some(expires_minutes));
         let ttl_ms = expires_minutes as u64 * 60_000;
-        let id = format!("n-{}", self.notify_seq.fetch_add(1, Ordering::Relaxed) + 1);
+        let seq = self.notify_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let id = format!("n-{seq}");
         let watch = notify::Watch {
             id: id.clone(),
             group: group.to_string(),
             agent: agent.to_string(),
             condition,
             note,
+            seq,
             registered_ms: now,
             deadline_ms: now + ttl_ms,
             nominal_ttl_ms: ttl_ms,
@@ -4601,11 +4603,14 @@ impl OrchRegistry {
     }
 
     /// The caller's own live watches (`list_notifications`), oldest-registered
-    /// first.
+    /// first — `(registered_ms, seq)`, so a real-clock tie (two watches
+    /// registered in the same millisecond) breaks deterministically on true
+    /// call order instead of the HashMap's arbitrary iteration order (see
+    /// `Watch::seq`'s doc).
     pub fn list_notifications(&self, agent: &str) -> Value {
         let watches = self.watches.lock_safe();
         let mut mine: Vec<&notify::Watch> = watches.values().filter(|w| w.agent == agent).collect();
-        mine.sort_by_key(|w| w.registered_ms);
+        mine.sort_by_key(|w| (w.registered_ms, w.seq));
         json!(mine.into_iter().map(notify::watch_json).collect::<Vec<_>>())
     }
 
@@ -4616,11 +4621,12 @@ impl OrchRegistry {
     /// (self-scoped by design — it's MCP-callable, so an agent may only ever
     /// see its own), this is a Tauri command reached only from the trusted
     /// webview (CLAUDE.md constraint 5), so reading across the whole group's
-    /// roster is fine. Oldest-registered first, matching `list_notifications`.
+    /// roster is fine. Oldest-registered first — `(registered_ms, seq)`,
+    /// matching `list_notifications`'s tie-break.
     pub fn group_watches(&self, group: &str) -> Value {
         let watches = self.watches.lock_safe();
         let mut mine: Vec<&notify::Watch> = watches.values().filter(|w| w.group == group).collect();
-        mine.sort_by_key(|w| w.registered_ms);
+        mine.sort_by_key(|w| (w.registered_ms, w.seq));
         json!(mine
             .into_iter()
             .map(|w| json!({

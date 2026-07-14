@@ -103,6 +103,19 @@ pub struct Watch {
     /// registration — only at the point it enters a notice — so
     /// `list_notifications` still shows the agent its own text verbatim.
     pub note: String,
+    /// Monotonic registration sequence number (the same counter `id`'s `n-N`
+    /// suffix is built from) — a **strictly increasing**, tie-free ordering
+    /// key. `registered_ms` alone can tie: two watches registered within the
+    /// same real millisecond (routine on a fast CI runner, or two agents
+    /// registering concurrently) sort ambiguously on `registered_ms` because
+    /// the input vec they're sorted from is already in HashMap-iteration
+    /// order — arbitrary, and randomized per process. `register_notification`
+    /// holds the `watches` lock for its entire body, so registrations are
+    /// fully serialized and `seq` (assigned right before `registered_ms` in
+    /// that same critical section) can never tie. `list_notifications` and
+    /// `group_watches` sort by `(registered_ms, seq)` so ties break
+    /// deterministically in true call order, not a HashMap's mood.
+    pub seq: u32,
     pub registered_ms: u64,
     /// Absolute wall-clock deadline. **Mutated** by `notify_tick`'s pause
     /// freeze (extended by however long the group was paused), so this is
@@ -655,6 +668,7 @@ mod tests {
             agent: format!("agent-of-{group}"),
             condition: Condition::PrChecks { pr: 1 },
             note: String::new(),
+            seq: 0,
             registered_ms: 0,
             deadline_ms: u64::MAX,
             nominal_ttl_ms: 0,
