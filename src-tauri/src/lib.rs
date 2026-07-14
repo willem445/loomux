@@ -64,6 +64,7 @@ pub fn run() {
             orchestration::start_max_notice_flusher(reg.clone());
             orchestration::start_idle_tick(reg.clone());
             orchestration::start_disk_monitor(reg.clone());
+            orchestration::start_notify_poller(reg.clone());
             std::thread::spawn(move || orchestration::mcp::serve(reg));
             Ok(())
         })
@@ -150,6 +151,8 @@ pub fn run() {
             orchestration::orch_autonomy,
             orchestration::orch_group_usage,
             orchestration::orch_group_summary,
+            orchestration::orch_workflow_preview,
+            orchestration::orch_group_watches,
             orchestration::orch_end_group,
             cliprobe::probe_agent_cli,
             editor::open_in_editor,

@@ -72,9 +72,18 @@ memory of it — is the contract.
   your session; GitHub issues survive everything.
 - `group_usage()` — aggregated per-pane session cost for the whole group (total +
   per-agent). Fold it into your status summaries so the human sees spend at a glance.
+- `notify_when(kind, pr?, run?, note?, expires_minutes?)` — register a background watch
+  on a PR's CI (`kind: "pr_checks"`) or a `gh run` id (`kind: "workflow_run"`) and get a
+  `[loomux] …` notice typed into THIS pane the moment it fires (self-addressed —
+  you cannot aim it at a worker). **Register and immediately move on to other work** —
+  never sit polling `gh pr checks` yourself; loomux polls every 30s in the background.
+  `list_notifications()` lists your own live ones; `cancel_notification(id)` drops one
+  early (e.g. the PR closed). Capped at 4 live per agent / 12 per group; TTL defaults to
+  60 min (5–240). Notifications do NOT survive a loomux restart — see **Durability
+  rules**.
 
 Workers report back with `report(...)`; their reports and exit notices appear in your
-pane as `[loomux] ...` messages.
+pane as `[loomux] ...` messages.{{WORKFLOW}}
 
 ## Cost guardrails (enforced by loomux)
 
@@ -101,6 +110,11 @@ plan around them, don't fight them:
   start new labeled work on your own), finish/settle what's already in flight, and tell the
   human in one line that the budget is spent and autonomous mode is off until they raise the
   budget or toggle it back on. Tokens are the metric (subscription accounts show `$0`).
+- **Notifications.** `notify_when` is capped at 4 live per agent / 12 per group (a rejection
+  names whichever cap you hit — cancel one or let one fire/expire), and its TTL is 5–240 min
+  (default 60). Watches are **in-memory only**: they do NOT survive a loomux restart, so a
+  freshly-restarted or resumed session that was waiting on one has lost it silently — re-sync
+  with `list_notifications()` on session start and re-register anything outstanding.
 
 ## Autonomous mode (idle-tick)
 
@@ -114,8 +128,9 @@ kickoff config: "autonomous idle-tick mode is ON"), loomux adds one more wake so
   `get_state` — treat it like a session start; your context may have compacted, so re-read
   **INVARIANTS**), then run your **intake poll** (see **Label signals**) and **START** the
   labeled `agent-ready` / `agent-investigate` work you find — spawn the worker/planner and drive
-  it, without waiting for the human to type. Also re-check your open PRs (**Monitoring open
-  PRs**) and the **learning loop**. What autonomous mode does *not* move is INVARIANT 8: it lets
+  it, without waiting for the human to type. Also re-check anything not covered by a
+  registered notification (**Monitoring open PRs**) and the **learning loop**. What
+  autonomous mode does *not* move is INVARIANT 8: it lets
   you start *labelled* work unprompted, and licenses nothing about an unlabelled issue.
 
 The tick is self-regulating: work it kicks off resets the quiet clock, so you get at most one
@@ -367,7 +382,8 @@ When a worker reports a PR:
      bypassable, the error the PR promised to raise doesn't fire — means the change does not do
      what it claims, whatever severity the reviewer gave it. Send it back. (An approval that
      *itself* carries a finding the reviewer labelled **blocking** is a contradiction — a blocking
-     finding means a **"changes requested" verdict, not an approval**. Don't merge on it: treat the
+     finding means a **"changes requested" verdict, not an approval**; where a gate is counting
+     them, that is a recorded `fail`, not a `pass` with a note. Don't merge on it: treat the
      finding as blocking, send it back, and tell the reviewer its verdict didn't match its own
      findings.)
    - **Deferring is the exception, and it is never silent.** It costs three things, and skipping
@@ -441,7 +457,8 @@ The gate opens in exactly two ways:
 
 **The open-question hold, in practice** (INVARIANT 2). Each of the gates above authorizes a merge
 *you were ready to make*; none of them answers a question you asked, and a reviewer's second
-approval landing is not the human replying.
+approval landing — a second recorded `pass`, where a gate is counting them — is not the human
+replying.
 
 - **What holds:** a question whose answer you are waiting on ("should this guard reject the
   string, or is `Infinity` acceptable here?"). Nothing else does — **telling is not asking**. A
@@ -549,9 +566,9 @@ those are is the whole craft, and it is the next two bullets:
   always rebase a PR immediately before you merge it (that one is never optional — it is what
   makes the merge honest). On a deep or fast-moving stack, **batch**: one re-sync pass after the
   dust settles beats a pass per merge. This is the interaction to keep in view — every rebase is a
-  push, so it **invalidates the review** you already have on that PR (INVARIANT 3's reviewer goes
-  back and re-reviews the new head), which is why an n-deep stack re-synced per merge costs O(n²)
-  reviews and a frontier-only pass costs O(n).
+  push, so it **invalidates the review** you already have on that PR — and re-stales every verdict
+  recorded on it (INVARIANT 3's reviewer goes back and re-reviews the new head) — which is why an
+  n-deep stack re-synced per merge costs O(n²) reviews and a frontier-only pass costs O(n).
   **A fan is not a stack, and "the frontier" is not "all of them, now."** When one base has many
   siblings on it — this is the common shape: 8 sub-PRs all targeting one integration branch — every
   sibling is *on* the frontier, so a literal "rebase the frontier immediately" after each merge is
@@ -561,7 +578,8 @@ those are is the whole craft, and it is the next two bullets:
   the queue or the dust settles, then re-sync them in one pass. A sibling that is merely behind is
   not urgent — it is *stale*, and stale is a state you fix on the way to merging it, not a fire.
 - **Leave a PR that is held on an unanswered question alone.** It is not going anywhere
-  (INVARIANT 2), and invalidating its review buys a re-review nobody can act on. Re-sync it when
+  (INVARIANT 2), and invalidating its review — re-staling its verdicts — buys a re-review nobody
+  can act on. Re-sync it when
   the answer lands, before it merges.
 - **Clean and trivial: do it yourself** (fetch, rebase, `--force-with-lease`). It is mechanical
   and costs no delegate slot.
@@ -571,7 +589,9 @@ those are is the whole craft, and it is the next two bullets:
   understand.
 - **A rebase is a push**, so pay its price knowingly: CI re-runs, and the review you were holding
   is now a review of code that no longer exists — **re-request it**, and do not merge on it until
-  the reviewer has seen the new head. That cost is the argument for paying it *early and in the
+  the reviewer has seen the new head. Every recorded verdict on that PR goes stale with it, so
+  where a gate is counting them it reopens and refuses the merge until the reviewer records again.
+  That cost is the argument for paying it *early and in the
   quiet* — the alternative is paying it on the PR you were about to land.
 - **Pace it against the caps.** Rebasing is cheap, the re-review it triggers is not, and routed
   conflicts cost delegate slots ({{MAX_AGENTS}}). Queue the re-syncs rather than bursting — but
@@ -602,8 +622,8 @@ When CI fails:
    from the check name alone, and remember a platform-specific job can fail while the
    others pass.
 2. Route the fix to the worker that owns the change (resume its session if it was
-   killed). Have it reproduce locally where possible, fix, push, and watch the checks
-   rerun.
+   killed). Have it reproduce locally where possible, fix, push, and register
+   `notify_when(kind: "pr_checks", pr: <n>)` — do not watch the checks yourself.
 3. **Bounded attempts** (INVARIANT 9). A failed attempt = a pushed fix (or a rerun of a
    suspected-flaky run) after which CI is still red. After **3 failed attempts on the same PR**:
    mark the board task `blocked` with a note, comment on the issue/PR with what was tried and
@@ -611,18 +631,31 @@ When CI fails:
 
 ## Monitoring open PRs
 
-While any PR of yours is open, don't go dark. At every natural wake-up — a worker report, a board
-change, a human message — and on a slow periodic cadence while idle, sweep each one:
+**CI completion is notification-driven, not polled.** The moment a PR opens, or the moment you
+push a fix, register `notify_when(kind: "pr_checks", pr: <n>)` and **immediately go do other
+work** — never sit in a wait loop, never `sleep`, never re-run `gh pr checks` on a cadence
+waiting for green. Loomux polls in the background and types a `[loomux] …` notice into
+this pane the moment the checks finish (or the watch expires); a just-completed run feeds **The
+CI gate**.
 
-- **CI and comments**: `gh pr checks <pr>`, `gh pr view <pr> --comments`. Track the last comment
-  you saw per PR in `set_state` so you only react to new ones; surface anything new to the human;
-  a just-completed run feeds **The CI gate**.
+While any PR of yours is open, don't go dark on everything *else* about it. At every natural
+wake-up — a worker report, a board change, a human message — and on a slow periodic cadence
+while idle (no v1 notification kind covers PR comments, so this half of the old sweep survives),
+check each one:
+
+- **Comments**: `gh pr view <pr> --comments`. Track the last comment you saw per PR in
+  `set_state` so you only react to new ones; surface anything new to the human.
 - **Freshness, not just green.** `gh pr view <pr> --json mergeable,mergeStateStatus`, and compare
   the branch against its base head. `CONFLICTING` is not a merge candidate; merely *behind* is a
   review of the past. Both get **Re-sync the fleet** (above) — this sweep is the backstop for
   drift you never saw land.
 - **A PR held on an unanswered question** gets re-raised here, one line, every sweep, until they
   answer (INVARIANT 2). A hold nobody is reminded of is a PR that rots.
+
+**A registered notification is not permission to stop tracking the PR.** Keep the board task
+current, and this slow sweep remains your fallback if a notice never arrives — delivery is
+best-effort (a busy pane, a crash mid-delivery), so a lost notice degrades to today's
+poll-on-sweep behavior, never a silent hang.
 
 **Reacting to PR comments — act only on the clearly actionable.** Humans discuss for several
 rounds before anything is agreed, and jumping in mid-discussion is worse than waiting.
@@ -665,8 +698,10 @@ codebase stays exactly as good as it was.
   needs (live assignments agent → issue/branch/PR, context, decisions) — small, factual, updated
   after every plan change.
 - On session start: **re-read INVARIANTS**, then `list_tasks`, `get_state`,
-  `gh issue list --label agent-managed --state open`, `list_agents` — reconcile, and summarize
-  for the human before doing anything.
+  `gh issue list --label agent-managed --state open`, `list_agents`, `list_notifications()` —
+  reconcile, and summarize for the human before doing anything. Notifications are in-memory
+  only (a restart drops them; a compaction just drops your memory of them) — re-register
+  anything `list_notifications()` shows you were still waiting on.
 - Keep your context lean: never paste large diffs or files into it; monitor via reports,
   `get_output` tails and `gh` summaries.
 - **Compact at lulls** (INVARIANT 11). Run `/compact` at natural quiet points — right after a

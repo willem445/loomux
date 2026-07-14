@@ -137,6 +137,9 @@ pane stays open showing the status).
 | `get_state()` | ✓ | ✓ |
 | `set_state(state)` | ✓ | ✗ |
 | `group_usage()` | ✓ | ✗ |
+| `notify_when(kind, pr?, run?, note?, expires_minutes?)` | ✓ | worker/reviewer only (✗ planner) |
+| `list_notifications()` | ✓ | worker/reviewer only (✗ planner) |
+| `cancel_notification(id)` | ✓ | worker/reviewer only (✗ planner) |
 
 Guardrails enforced by `spawn_agent`: live-agent cap (`max_agents`, counting workers +
 reviewers + planners), CLI + model pinned per role (`{role}_cli` / `{role}_model`, see
@@ -241,146 +244,213 @@ frames into scrollback.
 
 Orchestrator: intake → GitHub issue (`agent-managed` label) → plan → mergeability
 assessment (sprawling change ⇒ serialize; independent ⇒ parallel worktrees) → delegate →
-monitor → reviewer per PR → **findings dispositioned** → high-level completion check → hand to
-user for merge. Workers: branch → implement → meaningful unit/functional tests (test
-intent, not vacuous passes) → **red-before-green evidence** → design notes + user docs → commit →
-push → `gh pr create` → report. Reviewers: `gh pr review` with findings, each labelled
-blocking/non-blocking → report.
+monitor → reviewer per PR → **findings dispositioned** → high-level completion check → hand
+to user for merge. Workers: branch → implement → meaningful unit/functional tests (test
+intent, not vacuous passes) → **red-before-green evidence** → design notes + user docs →
+commit → push → `gh pr create` → report. Reviewers: `gh pr review` with findings, each
+labelled blocking/non-blocking → report.
 
-### Findings disposition: an approval is not a disposition (#235)
+"Dispositioned", not "addressed": an approval that leaves findings behind is not done. The
+default is to fix a non-blocking finding in the same PR before merging (bounded like the CI
+gate — three rounds and the PR settles); deferring costs a reason saying why the fix doesn't
+belong in *this* PR, a filed follow-up (which parks the finding in the label funnel, so it is
+not a discharge) and a word to the human. A finding that contradicts the change's own stated
+rationale is blocking whatever the reviewer labelled it — and a blocking finding is a `fail`
+verdict, never a `pass` that mentions it, or the gate opens on prose it cannot read. A
+*question* the orchestrator asked the human (a decision it awaits — not a status line it
+announced) holds the merge even where auto-merge, a one-time grant or supervised dangerous
+mode would otherwise allow it. The policy and the live incident that produced it are in
+`doc/design/workflows.md` → **Findings disposition**.
 
-The reviewer answers *"is this diff sound?"*. Nobody was answering *"was what it found dealt
-with?"* — and a live dogfood run found the gap. A worker shipped a `divide()` with a zero-guard.
-Both reviewers **approved** — and both, in the same breath, posted the *same* non-blocking
-finding: `b === 0` is bypassable by coercion, so `divide(5, '0')` still returns `Infinity`, which
-is precisely what the change's own rationale ("fail loud instead of propagating `Infinity`") said
-it existed to prevent. The orchestrator relayed the finding to the human as an open question and
-then merged the moment the second approval landed, before the answer came. Everything was
-procedurally green. The feature shipped weaker than the issue asked for, and two reviews' worth of
-feedback went in the bin.
-
-The failure is **policy**, so the fix is prose, in the surfaces the agents actually read:
-
-- **Pass-with-findings is not "done" — it opens a disposition step.** The default disposition of a
-  non-blocking finding is *fix it in this PR*: route it back to the worker before the merge. These
-  are usually minutes of work, and they are the signal that compounds. Deferring is the exception
-  and never silent — it costs a reason that says why the fix does not belong in *this* PR (a
-  category word like "scope" is not one), a filed follow-up issue, and a line to the human. Filing
-  that issue **parks** the finding rather than discharging it: it lands in the same label funnel as
-  everything else, which is exactly why the line to the human is part of the price. The loop is
-  bounded like the CI gate — three rounds of findings on one PR and it settles.
-- **Severity is the reviewer's rating; the requirement is the orchestrator's.** A finding that
-  contradicts the change's *own stated rationale* is blocking regardless of the label the reviewer
-  put on it, because a change that doesn't do what it claims hasn't met the issue.
-- **Label binds to verdict — and the verdict is not the `gh` flag.** A blocking *finding* means a
-  **"changes requested" verdict**, never an approval with a note: an approval with findings open is
-  only ever an approval with *non-blocking* findings open, and its summary has to say so
-  ("approved, 2 non-blocking, disposition pending"). The **binding surface is the verdict the
-  reviewer states at the top of its review body and repeats in `report(...)`** — because that is
-  the channel the orchestrator actually merges on. `gh pr review --request-changes` / `--approve`
-  is only the *mechanism*, and **GitHub refuses both on a PR opened by your own account** — the
-  normal case here, since a whole group authenticates as one GitHub user and that user authors the
-  PRs (every review this repo has ever received is `COMMENTED`). So the fallback is named —
-  `--comment`, with the verdict leading the body — and a `--request-changes` GitHub refused is
-  **never** a reason to `--approve` or to soften the verdict: the mechanism was unavailable, the
-  finding was not. A bind anchored on the flag would bind nothing while leaving the channel the
-  orchestrator reads unconstrained, which is the original incident wearing the new rule's clothes.
-- **Hold on an open question — and know what a question is.** If the orchestrator asked the human
-  to *decide* something about a PR, the merge holds until they answer, explicitly including when
-  auto-merge, a one-time grant or supervised dangerous mode would otherwise authorize it: those
-  authorize a merge you were *ready* to make; none of them is the answer. But **telling is not
-  asking** — a deferral the orchestrator decided, a status line, an audit announcement hold
-  nothing, or the policy would deadlock on its own required deferral notice. Answered means
-  *decided*, including "your call". A question never answered simply leaves the PR open — a correct
-  outcome, not a stall — held visibly on the board and re-raised on each open-PR sweep.
-
-The through-line, and the standing posture the orchestrator template states outright: **the
-orchestrator is the codebase's advocate, and merge speed is never the tiebreaker against
-maintainability.**
+**The bind is on the verdict, not on the `gh` flag** (#239, carried forward from #238's
+review of the same arc on `main`). The recorded verdict above is the *gate's* record, and it
+only exists for a group whose workflow declares one; the reviewer's *GitHub-facing* record is
+the review it posts, and there the original rule — "a blocking finding means
+`--request-changes`, not `--approve`" — is **unsatisfiable**: GitHub refuses both flags on a
+PR opened by your own account, which is the normal case when a whole group authenticates as
+one GitHub user (every review this repository has received is `COMMENTED`). A rule anchored on
+a flag nobody can use binds nothing, while the channel the orchestrator actually merges on —
+the verdict the reviewer *states* — stays unconstrained: label a finding blocking, report
+`approved`, and every sentence is satisfied. That is the #222 incident rebuilt by the rule
+written to prevent it. So the binding record is **the verdict stated at the top of the review
+body and repeated in `report(...)`**; `--comment` is the named fallback when the flag is
+refused; and a `--request-changes` GitHub refused is never a reason to `--approve`, to soften
+the verdict, or to record a `pass`. The two surfaces are complementary — the recorded verdict
+is what the *gate* reads, the stated verdict is what the *orchestrator* reads — and an ungated
+group has only the second, which is why it cannot be left to the flag. `reviewer.md` and
+`mechanics_core(Reviewer)` carry it in lockstep, for the reason every reviewer duty does: a
+`mode: replace` persona never reads `reviewer.md`.
 
 ### Engineering standards, not just process (#236)
 
-The process half of the prompt suite was strong (gates, bounded loops, externalized state,
-disposition); the *engineering* half was one line long — "does the PR satisfy the acceptance
+The prompt suite's *process* half was strong (gates, bounded loops, externalized state,
+disposition) and its *engineering* half was one line long: "does the PR satisfy the acceptance
 criteria?" A codebase can answer yes to that on fifty consecutive PRs and still rot, because
-acceptance criteria say what a change must **do** and never what it must **be**.
+acceptance criteria say what a change must **do** and never what it must **be**. #236 gives the
+orchestrator a value system to match its operational one:
 
-- **Grounds to send work back** (`orchestrator.md` → *Engineering standards*, the one authoritative
-  site; referenced from plan intake and from the completion check): cross-module coupling, a
-  duplicated mechanism, an unargued new dependency, a public-contract change with no design note, a
-  change contradicting a design note, scope drift. Naming one is *blocking* whatever the reviewer
-  labelled it — the reviewer rates the diff, the orchestrator owns the requirement **and the
-  architecture**. Gated at **plan intake** as well as at the PR, because a design flaw costs one
-  planner comment before code exists and a revert after it; `planner.md` owes the matching content
-  (boundaries, reuse-before-invention, dependencies, contract changes, alternatives considered).
-  The bounce is bounded like every other loop: one bounce naming every ground, then it is a
-  question for the human.
+- **Grounds to send work back** (`orchestrator.md` → *Engineering standards*, the one
+  authoritative site; referenced from plan intake and from the completion check). Cross-module
+  coupling, a duplicated mechanism, an unargued new dependency, a public-contract change with no
+  design note, a change that contradicts a design note, scope drift. Naming one is *blocking*
+  whatever the reviewer labelled it — the same call the orchestrator already owns for a finding
+  that contradicts the change's own rationale: the reviewer rates the diff, the orchestrator owns
+  the requirement **and the architecture**. The gate is sited at **plan intake** as well as at the
+  PR, because a design flaw costs one planner comment before code exists and a revert after it.
+  `planner.md` owes the matching content — boundaries, reuse-before-invention, dependencies,
+  public-contract changes, alternatives considered — since a plan that never named its boundaries
+  cannot be gated on them.
 - **Red before green, evidenced.** "Tests that would fail if the feature were broken" was in the
-  DoD from the start — as an assertion nobody ever checked, which is the most common quality
-  failure in autonomous coding and is invisible from the diff. The worker now runs its new tests
-  against the base branch, watches them fail *for the expected reason*, and pastes the command and
-  failure line into the PR; the orchestrator treats a `done` without that evidence as **not done**;
-  the reviewer verifies it rather than reading it (a quoted failure line is text, and text is not a
-  red test). The rule needs a **boundary** or it refuses the work it exists to enable — a change
-  with no new testable behavior (docs/comment-only, a revert, a pure rename/move the suite already
-  pins, a re-blessed golden) instead owes one line naming which class it is and why, with the suite
-  green. "There was nothing to test" is a claim like any other: stated, it is reviewable; unstated,
-  it is indistinguishable from an untested feature.
+  worker's DoD from the start — as an *assertion nobody ever checked*, which is the most common
+  quality failure in autonomous coding and is invisible from the diff. Now the worker runs its new
+  tests against the base branch, watches them fail *for the expected reason* (not on a compile
+  error), and pastes the command and failure line into the PR; the orchestrator treats a `done`
+  without that evidence as **not done**; the reviewer verifies it rather than reading it (a quoted
+  failure line is text, and text is not a red test). All four surfaces move together —
+  `worker.md`, `mechanics_core(Worker)`, `orchestrator.md`, `reviewer.md` — because any one of
+  them dropping it restores the status quo.
 - **Post-merge ownership.** Auto-merge, a one-time grant and supervised dangerous mode all let the
-  orchestrator *land* code, and the prompt then went quiet. A merge it performed makes it the owner
-  of the default branch's next CI run: on red, **stop feature merges** (the fix-forward or revert
-  PR is the exception — it is the merge that *makes* main green, and the exit from the state),
-  **fix forward once**, then **revert**, and flag the human.
-- **Re-sync the fleet.** The default branch moving is an event, whoever moved it, and every open
-  branch behind it is then **stale** — which is not the same as conflicted: a branch that still
-  merges cleanly was reviewed and CI'd against code that no longer exists. Every open PR rebases
-  onto *the branch it will merge into*, clean rebases in-house, the first real conflict to the
-  owning worker for one attempt. Because a rebase invalidates the review it carries, the re-sync is
-  scoped to the **merge frontier** (a deeper stack waits for its own base; a fan batches) — applied
-  literally to every sibling after every merge it would cost O(n²) *reviews*, not just rebases.
+  orchestrator *land* code, and the prompt then went quiet — nothing told it to watch the default
+  branch. A PR green on its own branch still breaks main (a semantic conflict with whatever landed
+  under it; a job that only runs post-merge), and a red default branch blocks every worker in the
+  group. So a merge it performed makes it the owner of main's next CI run: on red, **stop merging**,
+  **fix forward once**, then **revert** (the default — restoring main costs a revert, debugging it
+  in place costs everyone's afternoon), and flag the human.
 - **Review lanes.** The default reviewer covered correctness, tests, requirement fit, docs and
   style — and nothing on **trust boundaries**, **dependency hygiene** or **algorithmic cost**, in a
   repo where a bad dependency bricks the binary (`getrandom`/`ProcessPrng`) and a trust boundary
-  holds only because the webview is trusted (`group_id`).
-- **The learning loop, and filing without starting.** A recurring pattern (a finding class on three
-  PRs, a CI failure mode that burned two fix rounds, a convention reviewers keep re-flagging) gets
-  distilled **once** into a filed issue with a suggested label — never dispatched, because an
-  unlabelled issue the orchestrator noticed *itself* is not more startable than a finding a reviewer
-  raised. And it may **file** an issue for debt it observes, though it may never **start** or
-  **groom** one: the label funnel governs what it *begins*, not what it *notices*.
-- **Compression, and the INVARIANTS digest.** The prompt predicts its own compaction and was
-  nonetheless written as ~500 lines of prose with the load-bearing rules restated three and four
-  times. Repetition is not memory: a summary keeps a document's *shape* and loses its *rules*. The
-  eleven rules whose loss is dangerous are stated **once**, in an `## INVARIANTS` digest at the top,
-  which the orchestrator re-reads at session start and after every compaction; the body sections
-  stop re-arguing them and keep only the procedure, cross-referencing by number.
+  holds only because the webview is trusted (`group_id`). Added to `reviewer.md` **and**
+  `mechanics_core(Reviewer)` in lockstep, for the reason the findings duty is: a `mode: replace`
+  persona never reads `reviewer.md`, and a lane nobody was assigned is a lane no verdict reflects —
+  the gate cannot tell "reviewed and clean" from "never looked at".
+- **The learning loop, and filing without starting.** A pattern (a finding class on three PRs, a CI
+  failure mode that has burned two fix rounds, a convention reviewers keep re-flagging) gets
+  distilled **once** into something durable — a docs PR or a filed convention issue — because a
+  review that re-teaches the same lesson every week is how a codebase stays exactly as good as it
+  was. And the orchestrator may **file** an issue for debt it observes, with a suggested label,
+  though it may never **start** one: the label funnel governs what it *begins*, not what it
+  *notices*, and filing it is not doing it (it parks in the funnel exactly like a deferred
+  finding). Autonomy at zero consent cost.
+- **Post-merge re-sync of the fleet.** #236 asked only for *detection* — add `--json mergeable` to
+  the sweep and route a `CONFLICTING` PR to its owner. That fires at the most expensive possible
+  moment. The rule shipped instead is the one a human maintainer actually follows: **the default
+  branch moving is an event**, whoever moved it (the orchestrator's merge, the human's, one it
+  merely observed), and every open branch behind it is then **stale** — which is *not* the same as
+  conflicted. A branch that still merges cleanly was reviewed, tested and CI'd against code that no
+  longer exists, so its green checks describe the past. After any merge (and again on the sweep, as
+  the backstop for drift nobody saw), every open PR is rebased onto **the branch it will merge
+  into** — a sub-PR onto its integration branch, not reflexively onto `main`. A clean rebase the
+  orchestrator does itself (mechanical, no delegate slot); the first real conflict routes to the
+  **owning** worker's resumed session, **one attempt**, then the human — the CI gate's bound, for
+  the CI gate's reason. The rebase is a push, so CI re-runs and every verdict goes stale: that cost
+  is the argument for paying it early and in the quiet rather than on the PR you were about to
+  land. Paced against the delegate cap, never bursty.
 
-### Pinning prose (`tests/prompts.rs`)
+- **Compression, and the INVARIANTS digest.** The prompt predicts its own compaction ("your
+  context may have compacted"; "compact at lulls") and was nonetheless written as ~500 lines of
+  prose optimized for one careful read, with the load-bearing rules restated three and four times.
+  Repetition is not memory: a summary keeps a document's *shape* and loses its *rules*. So the
+  eleven rules whose loss is dangerous — the merge gate, the question-hold, disposition, the
+  architectural bar, red-before-green, red main, fleet staleness, the label funnel, bounded loops,
+  one-task-per-worker, externalized memory — are stated **once**, in an `## INVARIANTS` digest at
+  the very top, which the orchestrator is told to re-read at session start and after every
+  compaction. Every body section then *stops restating them* and holds only the procedure and the
+  why, cross-referencing the digest by number. That is what pays for the additions above: the
+  orchestrator template grew seven new rules and still ends up denser than it was
+  (≈513 → 625 lines for ~2× the rules), because the rhetoric that carried the old ones is gone.
 
-Prose is production code here: every sentence is executed literally by an agent, and a rule that
-quietly disappears in an edit fails **silently** — the agent simply stops doing it. So every
-load-bearing rule is pinned to the text that carries it, and a deletion is a failing test that
-*names the rule it deleted*.
+- **The rules that bound the rules** (rev-21's review of the above). Four of the new rules were
+  executable-by-a-literal-agent failures, and they are the same species as #235's:
+  - **Red-before-green needs an exemption, or it refuses the work it exists to enable.** Stated
+    unconditionally, it bounces every PR that legitimately adds no test — including the two this
+    very design prescribes: the learning loop's **docs PR** and a red main's **revert**. So the
+    exempt class is enumerated once, in `worker.md` (four members: docs/comment-only, a revert, a
+    pure rename/move the suite already pins, a re-blessed golden), and it **costs one line**: the
+    PR names which class it is and why, with the suite green. "There was nothing to test" is a
+    claim like any other — stated, it is reviewable; unstated, it is indistinguishable from an
+    untested feature, which is what the rule was written to stop.
+  - **"Stop merging until main is green" forbade the merge that makes main green.** The freeze is
+    on *feature* merges; the fix-forward or revert PR is the exception, because it is the exit
+    from the state. Without that clause a literal orchestrator halts and waits for a human — in
+    auto-merge, the unattended mode the rule was written for.
+  - **The learning loop may not dispatch its own artefact.** "A docs PR — dispatch it as a normal
+    work item" was an opt-out from the label funnel sitting three sections below the label funnel,
+    and it inverted the policy: a finding a *reviewer* raised has to park in the funnel, while a
+    pattern the orchestrator noticed *by itself* could be started directly. It files the lesson
+    with a suggested label and stops, like everything else.
+  - **The architectural bounce is bounded** like every other loop: one bounce, naming every ground
+    it has; a second disagreement is a question for the human, not a second bounce.
+  - And the re-sync has a **topology license**: rebase the *merge frontier* (the PRs targeting the
+    branch that actually moved), let a deeper stack wait for its own base, batch on deep stacks.
+    Because a rebase re-stales every verdict, re-syncing an n-deep stack after every sub-PR merge
+    costs O(n²) *re-reviews*, not just rebases — and a PR held on an unanswered question is left
+    alone entirely: it isn't going anywhere, and re-staling it buys a review nobody can act on.
 
-Prose pins have three failure modes, and only the first is obvious. Each was found by mutating the
-templates, never by reading the tests:
+Each rule is pinned in `tests/workflow.rs` on the surfaces that carry it, and the golden fixtures
+in `tests/fixtures/pre222/` are re-blessed in their own commit — the diff on that directory is the
+review surface for "what did we just tell every default group to do differently?". The pins match
+**substance with whitespace collapsed** (`flat()`), deliberately: a pin that fires when a
+paragraph is re-wrapped is a pin that teaches people to re-bless without reading.
 
-1. **The anchor no longer exists** — an assertion on a phrase the document no longer contains
-   (`count() <= 1` against zero occurrences) is green forever, in both directions.
-2. **The anchor exists twice and the rule lives in only one of them** — every rule appears in the
-   digest *and* in the body by design (the rule, and its procedure), so a document-wide match is
-   satisfied by either: delete the body's procedure and the pin stays green, rescued by the digest,
-   and the rule survives as a slogan with no instructions attached. Hence `section()` scoping.
-3. **The anchor's words appear in unrelated prose inside that same region** — a bare `"revert"` is
-   rescued by the surrounding sentence, leaving the whole red-main remedy deletable behind an
-   unbounded fix-forward loop; `"groom"` by "the issue is *groomed* and ready to build".
+`tests/prompts.rs` (from #238, which front-ran this arc's policy half onto `main`) pins the same
+rules on the **default rendering** — the templates as an ungated group reads them, with no
+workflow file and no placeholders substituted in. The two suites are complementary and both are
+kept green: `workflow.rs` pins the duties across *both* surfaces a reviewer can reach
+(`reviewer.md` and `mechanics_core`) and pins the machinery vocabulary; `prompts.rs` pins the
+region-scoped prose of what every group gets by default. A rule that lives in only one of them is
+a rule one kind of group is not being told.
 
-Two rules close them: the mutation harness **deletes the rule, not the string** (the markdown unit
-carrying the anchor, inside the pin's region), and `pinned()` requires every anchor to occur
-**exactly once** in the region it is asserted in — which makes failure mode 3 a red test at the
-moment an anchor is written, rather than a defect found later. Matching is whitespace-collapsed, so
-re-wrapping a paragraph never fires a pin: that red would report "you changed the rule" when no rule
-moved, and it is what teaches people to bless a diff without reading it.
+**A pin is a claim until it has been watched failing** — the suite's own rule, applied to itself
+(rev-21 F1). The first cut of the compression pin asserted that the body did not restate what the
+digest owned, anchored on a phrase *the compression had deleted*: it read `0 <= 1` and could not
+fail in either direction. Worse, nothing pinned the orchestrator's #235 policy at all — deleting
+it turned exactly one test red, the **byte fixture**, whose message says "re-bless me", which is
+the red this very design calls the one that teaches people to re-bless without reading. So:
+`the_orchestrators_findings_policy_survives_in_substance_not_just_in_bytes` asserts each rule of
+the policy **inside the section that owes it** (a document-wide match lets the digest's one-line
+copy rescue a body section someone gutted), one assert per rule, so a deletion *names what it
+deleted*. Single-word anchors (`"full"`, `"stale"`) are banned: whitespace-collapsed matching on a
+generic word is close to a tautology.
+
+**Prose pins have three failure modes, and only the first is obvious.** Each was found by mutating
+the templates, never by reading the tests — the progression is the reusable part:
+
+1. **The anchor no longer exists.** `body.matches("an approval with findings") <= 1` against a
+   document that no longer contains the phrase: `0 <= 1`, green forever, in both directions.
+2. **The anchor exists twice and the rule lives in only one of them.** Every load-bearing rule now
+   appears in the digest *and* in the body by design — the rule, and its procedure. A
+   document-wide `contains` is satisfied by either, so deleting the body's procedure leaves the
+   pin green, rescued by the digest: the rule survives as a slogan with no instructions attached.
+   Fixed by scoping every assert to the region that owes it (`section()`), which is why the pins
+   read `disposition.contains(…)` and `aftermath.contains(…)` rather than `orch.contains(…)`.
+3. **The anchor's words appear in unrelated prose inside that same region.** `"groom"` was rescued
+   by the `agent-ready` bullet three paragraphs above the prohibition ("the issue is *groomed* and
+   ready to build"); `"one line"` in `worker.md` by the report guidance ("one line restating the
+   task") — which meant the red-before-green exemption's **price**, the stated reviewable claim
+   that is the entire safety of the exemption, could be deleted in silence; `"question for the
+   human"` by the Engineering-standards section's own ambiguous-case sentence. The fix is to
+   anchor the rule's **own clause**: `"groom an issue the human hasn't"`, `"naming which of"`,
+   `"no longer a bounce"`.
+
+Two rules follow, and together they make the dead pin a *test failure* rather than a discovery:
+
+- **The mutation harness deletes the rule, not the string.** Deleting every occurrence of a phrase
+  measures whether the pin can see the *phrase* vanish, which is not the question anyone is
+  asking. The harness deletes the markdown unit — the list item or paragraph — that carries the
+  rule, inside the region the pin scopes to, and requires the owning test to go red: **60/60
+  rules**, one at a time. That is what surfaced failure mode 3, and (on its own first case list) a
+  fourth instance of mode 2: `"fix forward once"`, rescued by INVARIANT 6's one-line copy while
+  the red-main *procedure* was gone.
+- **An anchor must occur exactly once in the region it is asserted in** — enforced by `pinned()`,
+  which every #236 anchor goes through. This is failure mode 3 made *mechanically impossible to
+  reintroduce*: an anchor that appears twice in its own region cannot fail when the rule it names
+  is deleted, because the other occurrence rescues it, so it is a **red test right there** instead
+  of a defect someone finds later by mutating prose. It pays immediately — it rejected `O(n²)` in
+  the re-sync section (the depth clause and the fan clause both name the cost, so either would
+  have rescued the other) and forced the depth rule onto its own clause.
+
+A pin you cannot make fail is worse than no pin: it is a claim of coverage. The uniqueness rule is
+what keeps that claim honest without anyone having to remember to re-run the harness.
 
 ## Validation-round additions (2026-07-03)
 
@@ -607,6 +677,238 @@ box clears) rather than making the orchestrator poll terminals by hand.
   Silent-agent recovery adds the human-facing half: on a repeat unconfirmed notice for the
   same agent, stop re-sending and flag the human.
 
+## Notification backend (#243)
+
+Three MCP tools — `notify_when`, `list_notifications`, `cancel_notification` — let the
+orchestrator, a worker, or a reviewer register a structured condition (a PR's CI checks, or
+a `gh run` id) and get a `[loomux] …` notice (event-led, e.g. `[loomux] PR #241 checks:
+SUCCESS — … (watch n-3)` — matching the house style of every other `[loomux]` notice, which
+leads with what happened and names itself last) typed into their **own** pane the moment it
+resolves, instead of sitting in a wait loop or re-polling `gh pr checks` on a cadence. The
+`workflow_run` fail-cancel notice is the one deliberate exception to event-leading: "cancelled"
+is also a legitimate GitHub run *conclusion*, so `"run 17812 cancelled after 3 failed polls"`
+would read as the CI run itself being cancelled rather than as `gh` being unreachable three
+times. That notice instead puts the watch id between the label and the verb — `[loomux] run
+17812: watch n-5 cancelled after 3 failed polls — gh-not-found` — so the watch, not the run, is
+what the sentence says got cancelled (rev-ui, PR #247 round 2). Not
+available to a planner (see **Tool surface** above). The audit trail for all six lifecycle
+events uses a `watch-*` action prefix (`watch-register`/`watch-fired`/`watch-expired`/
+`watch-failed`/`watch-cancel`/`watch-cleanup`) — deliberately not `notify-*`, which the
+group's pre-existing desktop-notification toggle already owns (`notify-on`/`notify-off`);
+sharing a prefix in the one audit surface a human filters would have made two unrelated
+features indistinguishable there (rev-ui, PR #247).
+
+Human-visible surfacing of a live watch (issue #248, split from this PR because it's a
+frontend feature larger than the backend it surfaces) — the group-view "⏳ waiting on …"
+indicator, the audit's `watch-*` summarize() sentences, and the watchdog's "may be
+deliberately waiting" annotation — reads the exact same `watches` registry state this section
+describes; no second store.
+
+### Why structured kinds, not a caller-supplied poll command
+
+The obvious generic shape — `notify_when(poll_command, predicate)` — was considered and
+rejected, because it moves the trust boundary rather than automating inside it:
+
+- Agent panes get `agent_pane_env()`'s shimmed `PATH` (see **Enforced merge gate** below),
+  which is what makes `gh pr merge`/`gh release`/a `v*` tag push refuse an agent in its own
+  pane. A poll command handed to the *registry* would run from the loomux app process, with
+  the backend's real, **unshimmed** PATH — the gate an agent cannot get past in its own pane
+  would not apply to a command string it handed to the poller. An agent that cannot merge its
+  own PR could register `gh pr merge 241` as a "poll command" behind a predicate that never
+  matches, and loomux would run it — as the user — every 30s, forever. The side effect *is*
+  the payload; the predicate is decoration.
+- It is also strictly more powerful than anything an agent can already do: a command it types
+  into its own pane is visible, runs under the shims, and dies with the agent. A registered
+  poll command is invisible in that sense (it runs on the poller thread, not in any pane),
+  unshimmed, and **outlives the agent's turn** — repeating, unattended, until cancelled or
+  expired. "Agents can already run `gh`" is not a license for that.
+- It also contradicts CLAUDE.md constraint 6 (the backend trusts the webview, not agent
+  input) and the add-orch-tool design norm ("guardrails in the platform, judgment in the
+  prompt") — a caller-supplied command moves judgment about what's safe to run into the
+  prompt, exactly backwards.
+
+Structured kinds cost one small PR per new condition (`pr_merged`, `pr_comment`,
+`review_verdict`, … are natural v2 follow-ups). That is the correct price: the backend owns
+the whole `gh` argv, and the only agent-supplied bytes are a `u64` (a PR or run number) —
+nothing agent-controlled ever reaches a command line as a string, and every predicate is a
+pure function over pinned `--json` fields, testable with canned fixtures and no `gh`.
+
+### Shape: mirrors the watchdog and `pr_head`, invents nothing new
+
+- **Pure core** (`orchestration/notify.rs`, ~350 lines including tests): `Condition`
+  (`PrChecks { pr }` | `WorkflowRun { run }` — no `Default`, so an unrecognized wire `kind`
+  has nothing to fall back to and is rejected outright), `Watch`, `PollResult`
+  (`Pending`/`Met`/`Failed`), the two predicates (`pr_checks_result`, `workflow_run_result`),
+  the notice-text functions, and the cap/TTL/interval constants. Mirrors `workflow.rs` /
+  `profiles.rs`: `mod.rs` is already ~9k lines, so a new pure-function-heavy feature gets its
+  own file rather than growing it further.
+- **The `gh` subprocess shape.** A private `OrchRegistry::gh_capture(repo, args)` resolves
+  `gh` through `winpath::resolve_program` (a bare `Command::new("gh")` won't resolve a
+  Windows `gh.cmd` shim-free) and pins `CREATE_NO_WINDOW`, mirroring the shape
+  `write_shim`/`pr_head`-style helpers already use elsewhere in this file. **This lands as a
+  fresh helper, not a lift of an existing `pr_head`**: at the time this PR was written,
+  `main` had no `pr_head` — it exists only on the not-yet-merged `feat/222-custom-workflows`
+  branch (user-defined agent workflows). A follow-up should fold `pr_head` into
+  `gh_capture` once #222 merges, rather than keep two copies of the same subprocess shape
+  permanently; noted here so it isn't lost.
+- **The tick split** (the `watchdog_tick` shape, exactly): `poll_watches(&self)` is the
+  impure half — shells out to `gh` for each id `notify::due_watches` selects, and classifies
+  each result with the pure predicate. **The selection policy itself is pure**, not just the
+  decision policy: `due_watches(now, &watches, &paused) -> Vec<String>` (in `notify.rs`) owns
+  the per-watch 30s floor, the round-robin ordering by `last_poll_ms`, the
+  `MAX_POLLS_PER_TICK` (8) cap, and the paused-skip — `poll_watches` is a thin wrapper that
+  calls it and then shells out for whatever it returns. This was originally inline in
+  `poll_watches` with zero coverage of the `gh`-process DoS backstop it implements (rev-tests,
+  PR #247); lifting it is the same move `notify_tick` already makes for the decision half.
+  `notify_tick(&self, now, &results)` is the decision half: pause/expiry/fail-streak/fire
+  policy over an **injected** `now` and poll results, so **no test shells out to `gh`** —
+  every test in `tests/orchestration.rs` drives `notify_tick` directly with a synthetic
+  `PollResult` map, the same seam that makes `watchdog_tick` testable with synthetic pty
+  counters. `run_notify_tick` = `poll_watches` + `notify_tick(now_ms(), …)`, called every
+  `NOTIFY_POLL_INTERVAL` (30s) by `start_notify_poller`, registered in `lib.rs` beside
+  `start_watchdog`.
+- **Delivery** reuses `deliver_prompt(agent_id, text, "loomux", Delivery::MidSession)` — the
+  same path the watchdog nudge, the idle-tick, and worker reports already use. No new side
+  channel (add-orch-tool design norm): every existing guard comes free (per-pane serialized
+  delivery, the pause suppression, the #111 human-typing hold, the #103 unconfirmed-delivery
+  notice).
+
+### Constants
+
+| constant | value | why |
+| --- | --- | --- |
+| `NOTIFY_POLL_INTERVAL` | 30s | poller tick cadence, and the floor between polls of one watch |
+| `MAX_POLLS_PER_TICK` | 8 | bounds `gh` process churn per tick regardless of board size |
+| `MAX_WATCHES_PER_AGENT` | 4 | per-agent cap; a rejection names it |
+| `MAX_WATCHES_PER_GROUP` | 12 | per-group cap; a rejection names it (independently of the per-agent cap) |
+| `NOTIFY_EXPIRES_DEFAULT_MIN` / `_MIN` / `_MAX` | 60 / 5 / 240 | TTL default and clamp (`Guardrails::clamped` idiom — never reject a plausible number, never trust it unclamped) |
+| `NOTIFY_FAIL_STREAK_LIMIT` | 3 | consecutive `gh` failures (auth, `gh-not-found`, unknown PR/run) before the watch is cancelled rather than polled forever against nothing |
+
+### Predicates and the "no checks reported" trap
+
+`pr_checks` polls `gh pr checks <pr> --json state,name,link`; met when the array is
+**non-empty and none of `PENDING`/`QUEUED`/`IN_PROGRESS`**. `gh pr checks` exits **non-zero**
+with "no checks reported on the '\<branch\>' branch" on a just-pushed PR — orchestrator.md
+already warned that checks take a minute to appear, and this predicate maps that exit to
+**`Pending`, never `Met`/`Failed`**. Getting this backwards fires an instant, wrong SUCCESS
+the moment a PR opens, before CI has even registered a check — costly enough (and easy
+enough to get wrong) that it has its own pinned regression test. `workflow_run` polls
+`gh run view <id> --json status,conclusion`; met when `status == "completed"`, and the
+notice carries `conclusion`.
+
+### Caps, expiry, pause, and agent death
+
+- **Caps** are checked at registration, independently: an agent under its own cap can still
+  be rejected for the group cap, and vice versa (both are tested).
+- **Expiry** always speaks: a watch past its deadline is dropped and its owner gets a
+  `[loomux] … expired after N min … (watch n-3)` notice naming the manual fallback
+  (`gh pr checks <n>` / `gh run view <id>`) — silent expiry is the one failure mode that
+  stranded an agent forever, so it never happens quietly. The `N` reported is
+  `Watch::nominal_ttl_ms` (fixed at registration), never a recomputation from `deadline_ms` —
+  see the pause note below for why those two numbers must not be the same field.
+- **A paused group freezes the TTL clock, not just the expiry check.** `deadline_ms` is an
+  *absolute* wall-clock timestamp, so skipping the expiry check while paused is not enough on
+  its own: real time keeps passing underneath it, and the first tick after a long pause would
+  find every outstanding watch already past its (unmoved) deadline — evaporating exactly the
+  watches the freeze exists to protect. This shipped broken in the first version of this PR
+  (rev-orch, PR #247 round 1, with a repro) and is fixed by `notify_tick` maintaining
+  `paused_watch_since: HashMap<group, tick_time>`, reconciled against **the current `paused`
+  set itself**, not "groups that currently hold a watch": every group in `paused` not already
+  recorded gets `paused_watch_since[group] = now`; every group recorded but no longer in
+  `paused` (it resumed) has its span computed once and its record cleared. This bookkeeping
+  deliberately lives in `notify_tick`, not in `pause_group`/`resume_group`: those two use real
+  wall-clock `now_ms()` directly (they are Tauri-command-reachable, unrelated to the notify
+  subsystem, and changing their signature to accept an injectable `now` would be a wider API
+  change than this fix warrants), which a test's simulated `now` can never reach — so the
+  freeze has to be reconstructed from the `now` values `notify_tick` is actually called with.
+  In production this lags true pause/resume by at most one `NOTIFY_POLL_INTERVAL`
+  (`start_notify_poller` ticks every group regardless of its pause state).
+
+  **Two round-2 defects in this mechanism, both from the same root cause** (rev-orch, PR #247
+  round 2, with reproducing probes): the span is computed *per group* but was being applied to
+  *every* watch in it with no regard for that watch's own lifetime.
+  - **B1 — a stale entry outlives the group emptying out.** Scanning "groups that currently
+    hold a watch" (rather than `paused` itself) meant a group that lost every watch while
+    paused — its one worker idle-killed, cancelled, or crashed, all routine, all funnel through
+    `mark_dead` — dropped out of the scan entirely. No later tick could even see the group to
+    reconcile it, so the entry sat stranded, unreconciled, straight through the resume, until
+    some completely unrelated LATER watch registered into that (long-since-resumed) group —
+    which then inherited the whole stale span. **Fixed** by reconciling against `paused`
+    directly (above), which cannot go stale: it is re-derived from the live pause state every
+    single tick, with or without a watch present.
+  - **B2 — a watch registered mid-pause is charged time it never lived through.** Agent panes
+    keep running while their group is paused (only prompt *delivery* is suppressed), so
+    `notify_when` still works mid-pause. Applying the group's whole elapsed span to that watch
+    charged it for the part of the pause that predates its own existence. **Fixed** by clamping
+    each watch's credit to `(elapsed span).min(now - w.registered_ms)` — the span it actually
+    lived through, never more.
+  - Both fixes are independently necessary: the scan fix alone still lets a *live* watch in a
+    stale-but-since-cleared group over-credit itself once (bounded by its own age at that
+    point); the clamp alone bounds a single tick's damage but doesn't stop a group's stale entry
+    from recurring across ticks. Regression-pinned in `tests/orchestration.rs`
+    (`notify_stale_pause_entry_is_reconciled_even_while_its_group_has_no_watches`,
+    `notify_watch_registered_mid_pause_is_credited_only_the_span_it_actually_lived_through`),
+    each mutation-verified red against its own fix removed.
+- **Agent death** (`mark_dead`, covering idle-kill, `kill_agent`, a crash, and the planner
+  auto-close identically, since all four funnel through it) drops that agent's watches in
+  one line, audited (`watch-cleanup`) only when something was actually removed. No delivery
+  is attempted (the pane is gone) and no orchestrator notice is sent (the audit line is
+  enough; a notice per dead agent's stranded watches would be noise).
+
+### Persistence: in-memory only, deliberately
+
+Watches are TTL-bounded (≤4h) and describe in-flight CI — not durable state in the sense
+`state.json`/the task board/the PR itself are. Persisting them would mean rebinding an owner
+across a restart where agent ids and panes are re-minted: real complexity for a case where
+the durable record already survives and the orchestrator's session-start re-sync already
+re-reads it. The cost this pushes onto the template: **on session start (and after a
+compaction), call `list_notifications()` and re-register anything you were waiting on** —
+`orchestrator.md`'s durability rules and `worker.md`'s tool bullet both say so. This is a
+documented limitation, not an oversight.
+
+### Known interactions (stated, not fixed here)
+
+- **The #112 delivery weakness applies here too.** `submit_confirmed` false-confirms on any
+  output burst, so a fired notice landing unsubmitted in an agent's input box can still be
+  recorded as delivered. A watch is one-shot (dropped the instant it fires), so a lost notice
+  is a missed wake — mitigated by (a) auditing `watch-fired` *before* delivery, so the
+  run stays reconstructible, and (b) the orchestrator template keeping its PR-comment sweep
+  as an explicit fallback rather than deleting it: a dropped notice degrades to the old
+  poll-based behavior, not a hang (pinned in `tests/prompts.rs` — this is now the ONLY thing
+  standing between a lost notice and a silent hang, which is exactly the kind of rule that
+  suite exists to keep from quietly disappearing).
+- **The watchdog does not know about notifications.** A worker parked waiting on a
+  `pr_checks` watch is, correctly, producing no output and sending no report — exactly what
+  `watchdog_should_notify` looks for. It will still trip the stall notice to the orchestrator
+  after `watchdog_stall_minutes`. Acceptable for v1 (the notice is one line and already reads
+  as "may be waiting on input"); teaching the watchdog about live watches is a follow-up, not
+  a defect this PR needs to fix.
+- **Self-addressed delivery is asserted by construction, not independently pinned by a
+  test.** No notify tool takes an `agent_id` parameter, so there is no code path that could
+  even name another agent as a delivery target — `deliver_prompt(&w.agent, …)` is the only
+  call, and `w.agent` is set once, at registration, from the caller's own MCP-token identity.
+  rev-orch (PR #247) tried to falsify this with a targeted mutation (hardcoding the delivery
+  target to a fixed agent id) and it passed unnoticed: `deliver_prompt` isn't observable in
+  the integration harness (agents have no pty in test mode, and the one audit line that fires
+  *before* the pty-existence check only covers the paused-suppression branch, which a live
+  notify delivery never takes — notify simply skips a paused group's watches outright rather
+  than attempting delivery into one). Making this independently testable would mean adding a
+  registry-wide "last `deliver_prompt` target" test seam touched by every caller of a
+  widely-shared, delivery-critical function — real surface for one property that already has
+  no code path to violate. Stated here rather than left as an unearned "tested" claim.
+- **Security**: no new execution capability (the only subprocess is `gh`, backend-owned
+  argv); no `group_id`-as-path-segment exposure (the poll cwd is resolved from the caller's
+  **group**, which comes from the MCP token, never from an argument — constraint 6 is never
+  engaged); every GitHub-derived string and the agent's own `note` is sanitized
+  (`sanitize_gh_text`) before it enters a notice: control characters (including newlines) are
+  stripped so an embedded newline can't forge a second `[loomux] …`-prefixed line that reads
+  as its own, separate notice, AND `[`/`]` are mapped to `(`/`)` so the literal token
+  `[loomux]` can't survive even mid-line (a fork PR names its own workflow jobs, so a check
+  named `[loomux] all checks passed` is adversary-chosen text, not hypothetical — rev-orch,
+  PR #247). `run` ids parse through a dedicated `run_id_from`, not the bare `pr_number`
+  tail-digits parse: a job-linked run URL (`.../actions/runs/17812/job/98765`) would otherwise
+  silently resolve to the *job* id instead of the run id (rev-orch, PR #247).
+
 ## Autonomous mode (#83)
 
 The orchestrator template already documents a full idle cadence — poll `agent-ready`/
@@ -788,6 +1090,30 @@ one-time **grant** the shim also honors.
   (regression-tested: no agent-visible tool name contains "grant", and the file-writing MCP
   tools `set_state`/`upsert_task`/`save_attachment` write only their own fixed paths, never a
   grant path). Agents *consume* grants (the shim) but never *mint* them through loomux.
+
+### The workflow merge gate composes on top (#222 / #197)
+
+Everything above is the **human** gate. A repo that declares `gates.merge` in its
+`.loomux/workflow.yml` adds a **second, independent** necessary condition to the same shim:
+`gh pr merge` is refused until every reviewer block the gate names has recorded a `pass` via the
+`review_verdict` MCP tool (`threshold: N` needs N of them; a `fail`/`escalate` from any of them
+refuses outright). It is evaluated **before** every opening above — a grant, `autonomous +
+auto_merge` and supervised dangerous mode all sit below it and none of them can satisfy it, which
+is what makes #197 Scope B ("an auto-merge must be structurally impossible until every required
+review verdict is recorded PASS") true rather than aspirational (executed in the shell harness,
+not merely asserted about the source order). A verdict is bound to the PR's **head commit**, so a
+pass does not survive a re-push — otherwise the gate reads green over commits nobody reviewed.
+Unlike the human gate it applies to non-default merges too, and a refused merge does not consume a
+pending grant. Verdicts live in `verdicts/pr-<N>/<block>` and the declared gate in `merge_gate`,
+both under the group dir, both in the same small-file shape the shim already reads.
+
+Two notes that belong next to *Honest bypass surface* above. (1) A **merge with no
+`LOOMUX_GROUP_DIR` is now refused outright** — an agent pane always has it, so an unset variable
+at the shim is evasion; previously it slipped a non-default merge past the workflow gate with
+nothing in the audit. (2) The verdict store is forgeable by an agent with a shell exactly as grant
+files are, and — unlike the human gate — **a machine account does not close it**: the forge cannot
+tell a fabricated verdict file from a real one. Full design + the honest limits:
+`doc/design/workflows.md`.
 
 ### Release & tag gating
 

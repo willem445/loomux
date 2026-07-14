@@ -42,17 +42,25 @@ export type RestorePref = "ask" | "restore" | "fresh";
  *  orchestration pane (orchestrator / worker / reviewer) so restore keeps the
  *  whole group DORMANT and lets the group-resume path revive it.
  *
- *  "files" (#214), "editor" and "git" (#217) are the PTY-less CONTENT panes. None
- *  needs a new persisted field: the kind's root — the folder a tree/listing is
- *  rooted at, the repo a git view is pointed at — rides in the existing `cwd`,
- *  exactly as `role` rode into the schema for orch panes. Decode is shape-driven,
- *  so old files (which simply never carry these leaves) are unaffected and
- *  SCHEMA_VERSION stays at 2. */
-export type PersistedPaneKind = "terminal" | "agent" | "orch" | "files" | "editor" | "git";
+ *  "files" (#214), "editor" and "git" (#217) and "workflow" (#222) are the PTY-less
+ *  CONTENT panes. None needs a new persisted field: the kind's root — the folder a
+ *  tree/listing is rooted at, the repo a git view or a workflow pane is pointed at —
+ *  rides in the existing `cwd`, exactly as `role` rode into the schema for orch panes,
+ *  and the workflow pane's file rides in the `file` field the editor already added.
+ *  Decode is shape-driven, so old files (which simply never carry these leaves) are
+ *  unaffected and SCHEMA_VERSION stays at 2. */
+export type PersistedPaneKind =
+  | "terminal"
+  | "agent"
+  | "orch"
+  | "files"
+  | "editor"
+  | "git"
+  | "workflow";
 
 /** The PTY-less content kinds, in one place — what `cwd` means for them is a ROOT,
  *  not a shell's directory. */
-const CONTENT_KINDS: readonly PersistedPaneKind[] = ["files", "editor", "git"];
+const CONTENT_KINDS: readonly PersistedPaneKind[] = ["files", "editor", "git", "workflow"];
 
 /** One pane at a layout leaf, reduced to what restore needs. Never the live
  *  PTY/buffer — those are deliberately not captured (cost/#78 process-storm and
@@ -86,8 +94,12 @@ export interface PersistedPane {
    *  A pane opened on a file is titled after it, so without this a restore would show a
    *  bare tree under a title naming a file it isn't showing. The content is re-read from
    *  disk; unsaved edits are deliberately NOT persisted (see doc/design/content-panes.md
-   *  — the close guard's whole point is that the human was asked). Null for every other
-   *  kind, and absent from any snapshot written before #217. */
+   *  — the close guard's whole point is that the human was asked).
+   *
+   *  A WORKFLOW pane (#222) rides the same field for the same reason: the workflow file
+   *  it is editing (`.loomux/workflow.yml` by default, or whichever YAML it was opened
+   *  on from the file browser). Null for every other kind, and absent from any snapshot
+   *  written before #217. */
   file: string | null;
 }
 

@@ -27,15 +27,21 @@
 use loomux_lib::orchestration::{Guardrails, OrchRegistry};
 use std::fs;
 
+/// Guardrails for the group this suite is about: the **default** one — no workflow file, the
+/// advanced orchestrator off. That is deliberate and it is the whole scope of this file.
+///
+/// #222 replaced the flat per-role model fields these rails used to set with a `blocks` roster,
+/// and it added the toggle: with `advanced_orchestrator: false`, `{{WORKFLOW}}`/`{{BLOCK_NOTE}}`
+/// render empty and the agent reads the templates as every group that never opted in reads them.
+/// So this suite pins what the *default* is told, and `workflow.rs` pins what a *gated* group and
+/// a `mode: replace` persona are told (`mechanics_core`). A rule in only one of them is a rule
+/// one kind of group is not being told — see `doc/design/orchestration.md`.
 fn rails() -> Guardrails {
     Guardrails {
         max_agents: 2,
         agent_cli: "claude".into(),
-        worker_model: "sonnet".into(),
-        reviewer_model: "sonnet".into(),
-        orchestrator_model: "opus".into(),
-        planner_model: "opus".into(),
         auto_ops: false,
+        advanced_orchestrator: false,
         idle_kill_minutes: 0,
         max_spawns_per_hour: 0,
         watchdog_stall_minutes: 0,
@@ -472,6 +478,34 @@ fn every_open_branch_is_re_synced_after_the_default_branch_moves() {
     pinned(at, resync, "held on an unanswered question alone",
         "…and a PR held on an unanswered question is not going anywhere: rebasing it invalidates a \
          review nobody can act on");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Notifications (#243): the PR sweep is now the fallback for a lost notice, not the primary path
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn a_lost_notification_degrades_to_the_old_poll_on_sweep_fallback_not_a_silent_hang() {
+    // #243 pulled `gh pr checks` out of the orchestrator's own PR sweep and replaced it with a
+    // background notification the orchestrator registers and then ignores until it fires. That
+    // delivery is best-effort (#112 — a fired notice can land unsubmitted and still be recorded as
+    // delivered), so what stands between a LOST notice and an orchestrator that silently never
+    // hears its CI finished is exactly one paragraph: the sweep survives, explicitly, as the
+    // fallback. By this suite's own philosophy (a rule that quietly disappears in a future edit
+    // fails silently and invisibly), a safety net that is the ONLY thing between "best-effort" and
+    // "silent hang" cannot be left to survive on vibes through the next prose edit.
+    let orch = instructions("orchestrator.md");
+    let o = flat(&orch);
+    let sweep = section(&o, "## monitoring open prs", "## the learning loop");
+
+    pinned("the open-PR sweep", sweep, "not permission to stop tracking the pr",
+        "a registered notification must NOT read as license to stop tracking the PR on the board/ \
+         sweep — the notification is a convenience layered on top of ownership, not a replacement \
+         for it");
+    pinned("the open-PR sweep", sweep, "degrades to today's poll-on-sweep behavior",
+        "…and the sweep must be named EXPLICITLY as the fallback: since delivery is best-effort \
+         (#112), deleting this sentence turns a lost notice into a silent hang with nothing left to \
+         catch it");
 }
 
 // ---------------------------------------------------------------------------------------------

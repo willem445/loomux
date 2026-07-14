@@ -145,6 +145,40 @@ test("a rootless editor/git record surfaces null for the caller to fail soft on"
   });
 });
 
+// ---------- workflow (#222) ----------
+
+test("a workflow pane reopens over its repo, on the workflow file it was editing", () => {
+  // The file rides the same field the editor's does (a PATH, never a buffer), so a pane
+  // opened on a NON-default workflow (from the browser's "Open in workflow pane") comes
+  // back on that one rather than silently on `.loomux/workflow.yml`.
+  assert.deepEqual(
+    planPaneRestore(
+      pane({ paneKind: "workflow", name: "workflow.yml", cwd: "C:/Projects/loomux", file: ".loomux/workflow.yml" })
+    ),
+    {
+      type: "open-workflow",
+      name: "workflow.yml",
+      root: "C:/Projects/loomux",
+      file: ".loomux/workflow.yml",
+    }
+  );
+  // No file recorded → null, and the caller opens the repo's default. Not an error.
+  assert.deepEqual(planPaneRestore(pane({ paneKind: "workflow", name: "w", cwd: "/repo" })), {
+    type: "open-workflow",
+    name: "w",
+    root: "/repo",
+    file: null,
+  });
+  // A stray session id must not send a viewer down an agent path (same rule as its siblings).
+  assert.equal(
+    planPaneRestore(
+      pane({ paneKind: "workflow", name: "w", cwd: "/repo", sessionId: "abc", command: "claude" }),
+      () => true
+    ).type,
+    "open-workflow"
+  );
+});
+
 test("an orchestration pane ALWAYS restores dormant — never auto-resumed", () => {
   // The one credit/process-storm-sensitive case (#83/#78): a group is only ever
   // revived by the human via resumeOrchSession, so restore must not spawn it.

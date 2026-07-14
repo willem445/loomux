@@ -22,6 +22,28 @@
 
 * { box-sizing: border-box; }
 
+/* `hidden` MEANS HIDDEN — app-wide, and not negotiable by a later `display:` rule (#222).
+ *
+ * The UA stylesheet's `[hidden] { display: none }` sits in the USER-AGENT origin, and EVERY
+ * author declaration outranks it — specificity never enters into it, origin decides first. So any
+ * rule in this file that hands a toggled element a `display` (`.wf-body { display: flex }`)
+ * silently defeats `el.hidden = true`: the element stays on screen, and the code that "hid" it
+ * has no way to find out.
+ *
+ * That is not a hypothetical. It is the live bug this rule exists for: the workflow pane's three
+ * MUTUALLY EXCLUSIVE surfaces (error, start, body) are each `display: flex`, so `hidden` did
+ * nothing and the pane rendered all three at once — a "Can't read .loomux/workflow.yml" banner
+ * sitting over a workflow that had loaded and validated perfectly well, and beside it a live
+ * "Create workflow" button, which duly scaffolded straight over that workflow. The pane's surface
+ * rules (workflowpane.ts) were correct the whole time; they just had no effect on the screen.
+ *
+ * `!important`, rather than another per-class `[hidden]` companion — this file had nine of those,
+ * added one bug at a time, and the workflow pane's seven elements are what it cost to keep
+ * discovering the trap by hand. An author-origin `[hidden]` has the same specificity as any single
+ * class, so without `!important` the winner is decided by SOURCE ORDER: by whether the next person
+ * to add a `display:` rule happens to add it below this line. Correctness must not turn on that. */
+[hidden] { display: none !important; }
+
 html, body {
   margin: 0;
   height: 100%;
@@ -1184,6 +1206,44 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 }
 .dlg-error.visible { display: block; }
 .dlg-hint { font-size: 11px; line-height: 1.5; color: var(--text-dim); }
+/* The advanced-orchestrator roster preview (#222): what the group WILL run, shown
+   before it runs. Quiet by default (one line for the standard roster), and only
+   really present once the toggle is on — this is a consent surface, not a feature
+   advertisement. It scrolls internally so a 12-block workflow can't push Create
+   off-screen. */
+.roster-preview {
+  display: flex; flex-direction: column; gap: 4px;
+  margin-top: 6px; max-height: 260px; overflow-y: auto;
+}
+.roster-preview:empty { display: none; }
+.roster-summary { font-size: 11.5px; line-height: 1.5; color: var(--text-dim); }
+/* A DECLARED roster is the one thing here the human has to actually read. */
+.roster-declared { color: var(--text); }
+/* An invalid file is a warning, never a blocker: the group still launches on the
+   standard roster, so this must not read like a failure. */
+.roster-invalid { color: #e0af68; }
+.roster-block {
+  display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+  padding: 3px 8px; border-radius: 6px;
+  background: rgba(255, 255, 255, 0.03);
+  font-size: 11.5px;
+}
+.roster-id { font-weight: 600; color: var(--text); }
+.roster-meta { color: var(--text-dim); font-size: 11px; }
+.roster-error {
+  font-size: 11px; line-height: 1.45; color: #f7a2b2;
+  padding-left: 8px; border-left: 2px solid #55303a;
+  user-select: text; word-break: break-word;
+}
+.roster-note { font-size: 11px; line-height: 1.5; color: var(--text-dim); }
+/* #255: max_agents is below what this workflow's merge gate structurally needs
+   for one review round. Advisory, like `.roster-invalid` — the group still
+   launches — so the "Raise to N" button sits right beside the reason, not
+   behind a separate click. */
+.roster-capacity-warning {
+  display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+}
+.roster-capacity-warning .roster-error { flex: 1 1 auto; border-left-color: #6b4a3a; }
 /* Itemized modal body (#219): the quit confirm lists every unsaved buffer. Each item
    wraps on its own, and a long list scrolls INSIDE the dialog rather than pushing the
    buttons off-screen — a confirm whose confirm button you can't reach is a trap. */
@@ -1967,9 +2027,18 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   border: 2px solid var(--bg-app); background-clip: padding-box;
 }
 .group-empty { padding: 22px 16px; color: var(--text-dim); line-height: 1.5; }
+/* .group-agent wraps one roster row + its optional watch-line (#248) so the
+   border-bottom separates AGENTS, not the row from its own watch line. */
+.group-agent { border-bottom: 1px solid rgba(255, 255, 255, 0.03); }
 .group-row {
   display: flex; align-items: baseline; gap: 9px; min-height: 24px;
-  padding: 3px 12px; border-bottom: 1px solid rgba(255, 255, 255, 0.03);
+  padding: 3px 12px;
+}
+/* "⏳ waiting on …" (#248): text only, indented under the name column (role
+   chip 34px + 9px gap) so it reads as a note on that agent, not a new row. */
+.group-watch-line {
+  padding: 0 12px 4px 47px; font-size: 10px; color: var(--text-dim);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .group-role {
   flex: none; width: 34px; text-align: center;
@@ -1979,6 +2048,18 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .group-role.role-orchestrator { background: rgba(122, 162, 247, 0.16); color: #a7bff8; }
 .group-role.role-worker { background: rgba(158, 206, 106, 0.16); color: #b4e878; }
 .group-role.role-reviewer { background: rgba(187, 154, 247, 0.16); color: #cbb2fb; }
+/* Planner (#47) — the row this table never gained, so a planner fell through to
+   the neutral base color while its chip also read "AGENT" (#222 §2a). */
+.group-role.role-planner { background: rgba(224, 175, 104, 0.16); color: #e6c08a; }
+/* The workflow block an agent IS (#222). Only rendered when it differs from the
+   role — i.e. never for the built-in roster. */
+.group-block {
+  flex: none; max-width: 96px;
+  font-size: 9.5px; font-family: "Cascadia Mono", Consolas, monospace;
+  color: var(--text-dim); background: var(--panel-2);
+  border-radius: 4px; padding: 1px 5px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 .group-name {
   flex: 1; min-width: 0; color: var(--text);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
@@ -2600,3 +2681,231 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   border-color: rgba(122, 162, 247, 0.6); background: rgba(122, 162, 247, 0.22);
 }
 .restore-splash-btn.primary:hover { background: rgba(122, 162, 247, 0.34); }
+
+/* ---------- the workflow pane (#222) ---------- */
+/* `.loomux/workflow.yml` as a surface: the roster + property form (which WRITES the
+   YAML), the raw YAML, and a READ-ONLY derived graph. Three views, one buffer. The
+   advisory/enforced distinction is carried in the styling on purpose — an edge the
+   orchestrator may reorder and a gate that physically blocks a merge must not look
+   alike. */
+.wf {
+  flex: 1; min-height: 0; min-width: 0;
+  display: flex; flex-direction: column;
+  background: var(--bg-app); font-size: 13px; outline: none;
+}
+
+.wf-head {
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 8px; border-bottom: 1px solid var(--border);
+  background: var(--panel);
+}
+.wf-path { color: var(--text); font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; }
+.wf-dirty { color: var(--accent); font-size: 10px; }
+.wf-spacer { flex: 1; }
+.wf-status { font-size: 11.5px; }
+.wf-status.wf-ok { color: #9ece6a; }
+.wf-status.wf-warning { color: #e0af68; }
+.wf-status.wf-error { color: var(--danger); }
+
+.wf-btn {
+  padding: 3px 10px; border-radius: 6px; cursor: pointer;
+  border: 1px solid var(--border); background: var(--panel-2); color: var(--text);
+  font-size: 12px;
+}
+.wf-btn:hover:not(:disabled) { background: #262633; }
+.wf-btn:disabled { opacity: 0.45; cursor: default; }
+.wf-btn-primary { border-color: var(--accent-dim); background: rgba(122, 162, 247, 0.2); }
+.wf-btn-danger { border-color: rgba(247, 118, 142, 0.5); color: var(--danger); align-self: flex-start; }
+
+/* The START surface (v2). A repo with no workflow is the NORMAL beginning of every repo, so
+   this is a front door, not an apology — and a front door is a doorway, not a hall. It sits at
+   the TOP of the pane rather than centred in a screenful of nothing: the old empty state spent
+   a whole pane on two sentences, which is what the human called out. */
+.wf-start {
+  flex: none; display: flex; flex-direction: column; gap: 10px;
+  padding: 18px 20px; border-bottom: 1px solid var(--border);
+  background: var(--panel);
+}
+.wf-start-head { display: flex; align-items: baseline; gap: 10px; }
+.wf-start-title { font-size: 14px; font-weight: 650; color: var(--text); }
+.wf-start-path {
+  font-size: 11.5px; color: var(--text-dim);
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+}
+.wf-start-body { font-size: 12.5px; color: var(--text-dim); line-height: 1.6; max-width: 74ch; }
+.wf-start-row { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+/* The roster the button is about to write — cheaper than a paragraph, and it is the thing they
+   actually want to know before they press it. */
+.wf-start-preview { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.wf-chip {
+  padding: 2px 9px; border-radius: 999px; font-size: 11.5px;
+  border: 1px solid var(--border); background: var(--panel-2); color: var(--text);
+}
+.wf-chip-planner { border-color: #7dcfff; }
+.wf-chip-worker { border-color: #9ece6a; }
+.wf-chip-reviewer { border-color: #bb9af7; }
+.wf-start-gate { font-size: 11.5px; color: #e0af68; }
+
+.wf-body { flex: 1; min-height: 0; display: flex; }
+
+/* The roster: the workflow, every block, the gate — one column, one click each. */
+.wf-roster {
+  width: 210px; flex: none; overflow: auto;
+  border-right: 1px solid var(--border); background: var(--panel);
+  display: flex; flex-direction: column; padding: 6px;
+}
+.wf-roster-head {
+  font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.06em;
+  color: var(--text-dim); padding: 8px 6px 4px;
+}
+.wf-row {
+  display: flex; align-items: center; gap: 6px; text-align: left;
+  padding: 6px 8px; border-radius: 6px; cursor: pointer;
+  border: 1px solid transparent; background: transparent; color: var(--text);
+  font-size: 12.5px; width: 100%;
+}
+.wf-row:hover { background: var(--panel-2); }
+.wf-row.active { background: var(--accent-glow); border-color: var(--accent-dim); }
+.wf-row-main { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wf-row-sub { color: var(--text-dim); font-size: 11px; }
+.wf-row-bad { color: var(--danger); font-weight: 700; }
+.wf-add {
+  margin: 4px 0 0; padding: 5px 8px; border-radius: 6px; cursor: pointer;
+  border: 1px dashed var(--border); background: transparent; color: var(--text-dim);
+  font-size: 12px; text-align: left;
+}
+.wf-add:hover:not(:disabled) { color: var(--text); border-color: var(--accent-dim); }
+.wf-add:disabled { opacity: 0.4; cursor: default; }
+
+.wf-panel { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.wf-tabs { display: flex; gap: 2px; padding: 6px 8px 0; border-bottom: 1px solid var(--border); }
+.wf-tab {
+  padding: 5px 12px; cursor: pointer; font-size: 12.5px;
+  border: 1px solid transparent; border-bottom: none; border-radius: 6px 6px 0 0;
+  background: transparent; color: var(--text-dim);
+}
+.wf-tab:hover { color: var(--text); }
+.wf-tab.active {
+  color: var(--text); background: var(--panel-2);
+  border-color: var(--border); margin-bottom: -1px;
+}
+
+.wf-form, .wf-yaml, .wf-graph { flex: 1; min-height: 0; overflow: auto; }
+.wf-fields { display: flex; flex-direction: column; gap: 14px; padding: 14px 16px; max-width: 680px; }
+.wf-form-title { margin: 0; font-size: 14px; font-weight: 650; color: var(--text); }
+.wf-field { display: flex; flex-direction: column; gap: 4px; }
+.wf-label { font-size: 11.5px; color: var(--text-dim); }
+.wf-hint { font-size: 11px; color: var(--text-dim); line-height: 1.5; }
+.wf-note {
+  margin: 0; font-size: 11.5px; color: var(--text-dim); line-height: 1.6;
+  border-left: 2px solid var(--border); padding-left: 10px;
+}
+.wf-input {
+  padding: 5px 8px; border-radius: 6px; font-size: 12.5px;
+  border: 1px solid var(--border); background: var(--panel-2); color: var(--text);
+}
+.wf-input:disabled { opacity: 0.6; }
+.wf-textarea {
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  line-height: 1.5; resize: vertical;
+}
+.wf-checks { display: flex; flex-direction: column; gap: 4px; }
+.wf-check { display: flex; align-items: center; gap: 7px; cursor: pointer; font-size: 12.5px; }
+.wf-check-label.wf-bad { color: var(--danger); }
+.wf-blocked {
+  margin: 16px; padding: 12px 14px; border-radius: 8px; line-height: 1.6;
+  border: 1px solid rgba(247, 118, 142, 0.4); background: rgba(247, 118, 142, 0.08);
+  color: var(--text); font-size: 12.5px;
+}
+
+/* The raw YAML. A plain textarea, not the CodeMirror editor: this buffer is a few dozen
+   lines of a closed schema, and the findings strip below already carries the diagnostics
+   an editor gutter would. */
+.wf-yaml { display: flex; }
+.wf-yaml-area {
+  flex: 1; border: none; outline: none; resize: none; padding: 12px 14px;
+  background: var(--bg-term); color: var(--text);
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 12.5px; line-height: 1.55; tab-size: 2;
+}
+
+/* The CANVAS (v2 — it edits the file now). Everything it can do goes through the pure model
+   and out through the canonical formatter, so it is a second way to edit the workflow, never a
+   second source of truth. Positions are the one thing it owns, and they live in a different
+   file entirely (.loomux/workflow.layout.json). */
+.wf-graph { display: flex; flex-direction: column; }
+.wf-graph-bar {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  padding: 6px 10px; border-bottom: 1px solid var(--border-soft);
+}
+.wf-graph-hint { font-size: 11px; color: var(--text-dim); }
+.wf-graph-bar .wf-legend { margin-left: auto; border: none; padding: 0; }
+.wf-graph-scroll { flex: 1; overflow: auto; padding: 8px; }
+.wf-graph-svg { display: block; touch-action: none; user-select: none; }
+
+/* A node you can pick up. The cursor is the affordance — a box that moves under the pointer
+   without ever having said it could is a box people don't try to move. */
+.wf-node-g { cursor: grab; }
+.wf-node-g.selected .wf-node { stroke-width: 2; filter: drop-shadow(0 0 6px var(--accent-glow)); }
+.wf-node-g:active { cursor: grabbing; }
+/* The port you drag an edge FROM. Drawn, because a gesture nobody can see is a gesture nobody
+   performs; it grows on hover so the 12px hit radius is honest about where it is. */
+.wf-port { fill: var(--panel); stroke: #6b7394; stroke-width: 1.5; }
+.wf-port-out { cursor: crosshair; }
+.wf-node-g:hover .wf-port-out { fill: var(--accent); stroke: var(--accent); r: 6; }
+.wf-port-in { fill: #6b7394; stroke: none; }
+.wf-node { fill: var(--panel-2); stroke: var(--border); stroke-width: 1; }
+.wf-node-orchestrator { stroke: var(--accent); }
+.wf-node-worker { stroke: #9ece6a; }
+.wf-node-reviewer { stroke: #bb9af7; }
+.wf-node-planner { stroke: #7dcfff; }
+.wf-node-unknown, .wf-node-ghost { stroke: var(--danger); stroke-dasharray: 4 3; }
+.wf-node-title { fill: var(--text); font-size: 12.5px; font-weight: 600; }
+.wf-node-sub { fill: var(--text-dim); font-size: 11px; }
+/* ADVISORY: a plain solid arrow. It declares intent; the orchestrator still schedules. */
+.wf-edge { fill: none; stroke: #6b7394; stroke-width: 1.5; }
+.wf-edge-broken { stroke: var(--danger); stroke-dasharray: 3 3; }
+/* The edge being dragged out of a port — not yet a fact about the workflow, and drawn like it. */
+.wf-edge-draft { stroke: var(--accent); stroke-dasharray: 4 4; pointer-events: none; }
+.wf-edge-g .wf-edge { transition: stroke 0.1s var(--ease); }
+.wf-edge-g:hover .wf-edge, .wf-edge-g.selected .wf-edge { stroke: var(--accent); stroke-width: 2.5; }
+/* The ✕ that erases an edge: hidden until you mean it (hover, or the edge is selected), so the
+   canvas isn't a field of delete buttons. It sits on the CURVE's midpoint — see edgeMidpoint. */
+.wf-edge-del { opacity: 0; cursor: pointer; transition: opacity 0.1s var(--ease); }
+.wf-edge-g:hover .wf-edge-del, .wf-edge-g.selected .wf-edge-del { opacity: 1; }
+.wf-edge-del circle { fill: var(--panel-2); stroke: var(--danger); stroke-width: 1.5; }
+.wf-edge-del-x { fill: var(--danger); font-size: 11px; font-weight: 700; pointer-events: none; }
+/* ENFORCED: amber and dashed, into a gate box shaped nothing like a block. The two are
+   drawn differently because only ONE of them can stop a merge. */
+.wf-edge-gate { stroke: #e0af68; stroke-dasharray: 5 4; }
+.wf-gate-box { fill: rgba(224, 175, 104, 0.08); stroke: #e0af68; stroke-width: 1.5; stroke-dasharray: 5 4; }
+.wf-gate-title { fill: #e0af68; font-size: 12.5px; font-weight: 650; }
+.wf-gate-sub { fill: var(--text-dim); font-size: 11px; }
+.wf-legend { display: flex; gap: 16px; padding: 6px 12px; border-top: 1px solid var(--border-soft); }
+.wf-legend-item { font-size: 11px; color: var(--text-dim); }
+.wf-legend-gate { color: #e0af68; }
+
+/* The pre-run validation pass, always visible: what is wrong, and WHERE. Click one and
+   it takes you to the block (or the line) it is about. */
+.wf-findings {
+  flex: none; max-height: 132px; overflow: auto;
+  border-top: 1px solid var(--border); background: var(--panel);
+  display: flex; flex-direction: column;
+}
+.wf-finding {
+  display: flex; gap: 8px; align-items: baseline; text-align: left; width: 100%;
+  padding: 5px 12px; font-size: 12px; line-height: 1.45;
+  border: none; background: transparent; color: var(--text); cursor: pointer;
+}
+button.wf-finding:hover { background: var(--panel-2); }
+.wf-finding-where {
+  flex: none; min-width: 76px; color: var(--text-dim); font-size: 11px;
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+}
+.wf-finding.wf-error .wf-finding-msg { color: var(--danger); }
+.wf-finding.wf-warning .wf-finding-msg { color: #e0af68; }
+.wf-finding.wf-ok { color: var(--text-dim); cursor: default; }
+.wf-inline-findings { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 4px; }
+.wf-inline-findings .wf-finding { display: list-item; padding: 0; cursor: default; }
+.wf-inline-findings .wf-error { color: var(--danger); }
+.wf-inline-findings .wf-warning { color: #e0af68; }

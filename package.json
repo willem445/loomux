@@ -1,12 +1,13 @@
 {
   "name": "loomux",
   "private": true,
-  "version": "0.8.0",
+  "version": "0.9.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "test": "node --test \"test/**/*.test.ts\"",
+    "check:versions": "node scripts/check-versions.js",
     "preview": "vite preview",
     "tauri": "tauri"
   },

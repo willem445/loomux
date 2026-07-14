@@ -99,6 +99,10 @@ export interface FileExplorerHost {
    *  with nothing open (`file: null`). The explorer can't reach the grid, so it asks;
    *  this pane stays exactly where it was. */
   onOpenEditorPane?(req: { root: string; file: string | null }): void;
+  /** "Open in workflow pane" (#222): open a WORKFLOW pane beside this one, rooted at
+   *  `root`, on the clicked YAML (`file`, root-relative). Same contract as its editor
+   *  sibling — the explorer can't reach the grid, so it asks, and stays where it was. */
+  onOpenWorkflowPane?(req: { root: string; file: string }): void;
 }
 
 /** Cap on rendered Go-to-file results — same reasoning as the editor's: a jump list
@@ -1009,6 +1013,9 @@ export class FileExplorerView {
       case "edit-pane":
         this.openInEditorPane(a.target);
         return;
+      case "workflow-pane":
+        this.openInWorkflowPane(a.target);
+        return;
       case "rename":
         this.beginRenameOn(a.target);
         return;
@@ -1044,6 +1051,15 @@ export class FileExplorerView {
     this.host.onOpenEditorPane?.(
       target.isDir ? { root: joinRoot(root, target.rel), file: null } : { root, file: target.rel }
     );
+  }
+
+  /** "Open in workflow pane" (#222): a workflow pane beside this one, rooted where the
+   *  browser is rooted, on the clicked YAML. Only reachable from a .yml/.yaml row (the
+   *  menu doesn't offer it elsewhere), and — like its editor sibling — it does not move
+   *  the browser: opening a file elsewhere is not a reason to move the list you opened it
+   *  from. */
+  private openInWorkflowPane(target: OpTarget): void {
+    this.host.onOpenWorkflowPane?.({ root: this.host.getRoot(), file: target.rel });
   }
 
   private async openWithTarget(target: OpTarget): Promise<void> {

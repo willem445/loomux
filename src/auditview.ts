@@ -6,14 +6,9 @@
 // audit.jsonl), so the viewer never has to know about it.
 
 import { invoke } from "@tauri-apps/api/core";
+import { asObject, str, summarize, type AuditEntry } from "./auditsummary";
 
-export interface AuditEntry {
-  ts_ms: number;
-  actor: string;
-  action: string;
-  // detail is per-action JSON; the viewer renders it generically.
-  detail: unknown;
-}
+export type { AuditEntry };
 
 /** How often live-follow re-polls the backend. */
 const FOLLOW_MS = 1500;
@@ -42,15 +37,6 @@ const fmtTime = (ms: number): string =>
     second: "2-digit",
   });
 
-/** A detail object as a plain record, or null when it isn't one. */
-function asObject(v: unknown): Record<string, unknown> | null {
-  return v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : null;
-}
-
-function str(v: unknown): string | undefined {
-  return typeof v === "string" ? v : undefined;
-}
-
 /** Agent ids an entry references (for the agent filter). An entry is "about"
  *  an agent if its detail names one via agent / to / from. */
 function entryAgents(e: AuditEntry): string[] {
@@ -62,53 +48,6 @@ function entryAgents(e: AuditEntry): string[] {
     if (v) out.push(v);
   }
   return out;
-}
-
-/** Short one-line summary per action. Falls back to compact detail JSON so an
- *  unknown/new action is never opaque. */
-function summarize(e: AuditEntry): string {
-  const d = asObject(e.detail) ?? {};
-  const firstLine = (s: string): string => {
-    const line = s.split("\n", 1)[0];
-    return line.length > 160 ? line.slice(0, 160) + "…" : line;
-  };
-  switch (e.action) {
-    case "prompt":
-      return `→ ${str(d.to) ?? "?"}: ${firstLine(str(d.text) ?? "")}`;
-    case "prompt-typed":
-      return `→ ${str(d.to) ?? "?"} delivered (waited ${str(d.waited_ms) ?? d.waited_ms ?? "?"}ms)`;
-    case "prompt-failed":
-      return `→ ${str(d.to) ?? "?"} failed: ${str(d.reason) ?? ""}`;
-    case "submit-retries-skipped":
-      return `→ ${str(d.to) ?? "?"}: ${str(d.reason) ?? "retries skipped"}`;
-    case "agent-spawn":
-      return `${str(d.agent) ?? "?"} (${str(d.role) ?? "?"})${d.task ? ` — ${firstLine(str(d.task) ?? "")}` : ""}`;
-    case "agent-bind":
-      return `${str(d.agent) ?? "?"} bound to pty ${d.pty ?? "?"}`;
-    case "task-upsert": {
-      const id = str(d.id) ?? "";
-      const title = str(d.title) ?? "";
-      const status = str(d.status) ?? "";
-      return `${id} "${title}"${status ? ` → ${status}` : ""}`;
-    }
-    case "task-delete":
-      return `deleted ${str(d.id) ?? ""}`;
-    case "task-reorder":
-      return "reordered task board";
-    case "group-create":
-    case "group-resume":
-      return `${str(d.repo) ?? ""} (max ${d.max_agents ?? "?"})`;
-    case "state-write":
-      return `state.json (${d.bytes ?? "?"} bytes)`;
-    default: {
-      const compact = JSON.stringify(e.detail ?? {});
-      return compact === "{}" || compact === "null"
-        ? ""
-        : compact.length > 200
-          ? compact.slice(0, 200) + "…"
-          : compact;
-    }
-  }
 }
 
 /** The full expandable body: prompt/task text verbatim first (the reason this

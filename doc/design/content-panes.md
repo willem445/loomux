@@ -1,4 +1,4 @@
-# Content panes: the editor and the git view as pane kinds (#217)
+# Content panes: the editor and the git view as pane kinds (#217), and the workflow pane (#222)
 
 A **content pane** is a pane that *is* a surface rather than a process. No shell,
 no CLI, no PTY — the pane's content is a view, permanently.
@@ -7,6 +7,11 @@ no CLI, no PTY — the pane's content is a view, permanently.
 actually asks for most: `editor` (the #174 tree + code editor + #207 search) and
 `git` (the #208 git view). Both surfaces already existed as **overlays** inside a
 terminal pane, behind `Alt+F` and `Alt+G`.
+
+#222 adds a fourth, `workflow` — the first with no overlay ancestor and the first whose
+subject is loomux itself: the repo's `.loomux/workflow.yml`. Its own section is below;
+everything in this note up to it applies to it unchanged, which is the point of the kind
+being a kind.
 
 **What "the overlays are unchanged" means, exactly** — because it is exact for one of
 them and deliberately not for the other:
@@ -332,6 +337,434 @@ refreshes on **open**, after **its own actions**, and on the **↻ button**: exp
 safe rather than implicit and destructive. (Auto-refresh on external repo changes would
 need the backend git watch, which is keyed by PTY id — and a git pane has no PTY.)
 
+## The workflow pane (#222)
+
+A fourth content kind, and the first one whose subject is loomux itself: `.loomux/workflow.yml`
+— the repo's **agent workflow**. Which blocks a run may use (a planner, a worker, three
+focused reviewers), what each is (prompt / profile, model, agent CLI), the **edges** between
+them, and the **merge gate**. Committed, so it is shared with everyone who clones the repo
+(the #51 requirement, restated by the human on #222).
+
+It is a pane and not an overlay for the same reason the git view is: it is a **station**,
+not a look. You keep it open beside the orchestrator while you tune the roster.
+
+### The file is the source of truth — the GUI is a view over it
+
+This is the whole design, and it is a decision with a body count behind it. **OpenAI's Agent
+Builder — the flagship GUI-canvas-as-source-of-truth — shipped in Oct 2025 and is being shut
+down in Nov 2026, with the migration path being *back to code*.** Meanwhile LangGraph Studio,
+Temporal's UI and GitLab's CI editor all deliberately make the GUI a **debugger/visualiser
+over a text-defined graph** — Studio cannot edit topology at all. Kestra states the rule we
+follow outright: *"even if you use the UI to modify a workflow, the platform is still
+generating and updating the YAML definition under the hood."*
+
+So the pane holds ONE buffer — the YAML — and three views over it:
+
+```
+  roster + property form   an edit here SERIALIZES the model back over the buffer
+  raw YAML (textarea)      an edit here RE-READS the model from the buffer
+  derived graph            READ-ONLY. It cannot write. It cannot corrupt the file.
+```
+
+`workflowmodel.ts` is the pure half (parse → validate → derive → serialize) and holds every
+rule; `workflowview.ts` is DOM. That split is the house convention (`taskboard` ↔ `tasksview`)
+and it is what lets the validation pass — the part that actually earns the feature — be
+unit-tested without simulating a DOM.
+
+**The one rule the sync has to obey: while the YAML does not PARSE, the form is disabled.**
+A form edit serializes the model back over the buffer, so serializing a model we only half
+understood would silently destroy the broken text the human is in the middle of fixing. A
+syntax error therefore disables the form and says why (the YAML tab and the findings strip
+stay live, which is where the fix happens). Every *other* kind of breakage — an unknown kind,
+a dangling edge — still renders, as a stub with a finding, because **a block you cannot see is
+a block you cannot repair**; refusing to open a file you can't fully understand is ComfyUI's
+#1 import-failure class.
+
+### Advisory edges, enforced gates — and they must not look alike
+
+An **edge is advisory**: it declares the intended path. The orchestrator still schedules, and
+that is deliberate (#222 §2g) — its mergeability judgment is the thing that makes it good, and
+a static DAG would re-encode that as conditional sprawl. A **gate is enforced**: the backend
+refuses `gh pr merge` until every reviewer it names has recorded a PASS.
+
+One of those two can stop a merge and the other cannot, so the graph draws them differently:
+a solid arrow into a block, versus a dashed amber connector into a dashed gate box that is not
+shaped like a block at all. A picture that rendered them identically would be a picture that
+lies about which half of the file has teeth.
+
+### What the validation pass is for
+
+Every workflow tool surveyed for #222 skipped this. Flowise, Langflow and Dify all discover a
+dangling reference at RUN time; Dify will happily *publish* a workflow whose node isn't even
+installed. The pass is pure, cheap, and it is the difference between "your workflow failed
+after spawning two agents" and "block `rev-perf` doesn't exist — the merge gate names it":
+
+| Finding | Why it can't wait for a run |
+| --- | --- |
+| unknown `kind` | A workflow may define any *persona*; it may never define a *capability*. `kind` picks one of the four closed classes and inherits its structural guarantees. |
+| unknown `cli` | loomux can only spawn what it can spawn. |
+| duplicate / malformed `id` | The id is the identity. Two blocks sharing one makes every edge naming it ambiguous. |
+| edge to a nonexistent block | The dangling-reference class Dify ships. |
+| gate names a nonexistent block, or one that isn't a reviewer | **A gate that could never open.** Only a reviewer records a verdict. |
+| threshold > reviewers | Same thing, arithmetically. |
+| isolated / unreachable block | A *warning*, not an error — edges are advisory, so this is a workflow that still runs. It is just almost certainly a fan-out you forgot to wire. |
+
+A cycle is **not** a finding: worker ⇄ reviewer is the rework loop, and it is how loomux
+actually works. What *is* a finding is a graph with nowhere to start.
+
+### Two rules the file keeps, both earned from someone else's scar
+
+- **`id` is the identity; `name` is display only.** n8n keys its graph by the node's *display
+  name*, so a rename silently breaks every edge and expression pointing at it — a bug class its
+  own maintainer calls *"far from perfect."* Here the id is immutable once created (the form
+  disables the field and says why), and a rename touches nothing else.
+- **No coordinates in the semantic file.** Dify, ComfyUI and Langflow all embed x/y, so nudging
+  a node churns the logic diff. The graph here is *derived* (layered by longest path from the
+  entry blocks), so there is no layout to store at all — and if one is ever drawn by hand, it
+  goes in `.loomux/workflow.layout.json`, never in the workflow.
+
+The **canonical formatter** follows from the same concern: fixed key order per block, edges
+grouped by source, references ordered by the roster — so a save produces a legible `git diff`
+rather than a reshuffle. Blocks keep their *authored* order, which is the one place a stable
+sort would do harm: the roster reads top-to-bottom, and re-sorting it on every save would churn
+the very diff the formatter exists to keep readable. Unknown keys (from a file written by a
+newer loomux) are preserved verbatim across the round-trip — an older pane must not silently
+strip a field the user's backend depends on.
+
+**One emitter, quoting for the strictest context.** The formatter serves both block context
+(`name: …`) and *flow* context (`reviewers: [a, b]`, an unknown key's array), and in flow
+context `, [ ] { }` are structural. The emitter therefore quotes any value containing one,
+even where block context wouldn't need it. This is not fastidiousness: with the flow
+characters left out, an `allow: ["Bash(gh pr view --json title,body)"]` re-read as *two*
+entries and a `tools: ["fmt{x}"]` re-read as `null` — on an ordinary form edit, because every
+form edit re-serializes the file. A quote that wasn't strictly necessary costs a character; a
+quote that was missing costs the user's data. (Found in review, rev-5 F1.)
+
+**`authored_with:`** — an optional top-level key naming the loomux that *created* the file
+(§4's "record the loomux version that authored it", the Langflow `last_tested_version`
+lesson). Written exactly once, when the pane creates a new workflow; on an existing file it
+rides the unknown-key bag and round-trips verbatim. Deliberately *not* restamped on every
+save: it records who authored the workflow, not who last looked at it, and a version line that
+churned on every model-name tweak would be noise in a file whose whole point is a readable
+history. **Sub-PR 1: this key is optional and pass-through — a validator should tolerate it,
+not require it.**
+
+### v2: the canvas edits the file (and the empty state was lying)
+
+The human demoed v1 and asked for three things. Two were bugs wearing a UX complaint, and one
+reversed a decision — which is what a demo is *for*.
+
+**The empty state was lying, twice.** It said *"No workflow in this repo yet"* for a repo that
+had one, and it offered to create a file it could not create. Two independent causes, both
+reproduced against the backend before either was touched:
+
+1. **Every read failure was treated as "there is no file".** Only `not-found` means that. The
+   ordinary way for a Windows user to produce a workflow file is from PowerShell — whose `>`
+   and `Out-File` write **UTF-16**, which is not valid UTF-8, which the backend correctly
+   reports as `binary`. That landed in the empty state behind a toast that had already gone,
+   and then invited the human to *create a starter over the top of a file the pane had refused
+   to show them*. There are now two states: **start** (there is no file — a front door) and
+   **error** (the file is there and we can't read it — which says why, offers Retry, and offers
+   nothing that writes).
+2. **The create path could never have worked.** `ft_write_file` writes atomically (temp file +
+   rename) and does **not** create parent directories, so writing `.loomux/workflow.yml` into a
+   repo with no `.loomux/` — i.e. every repo that has never had a workflow, which is precisely
+   the repo the create button exists for — failed with a raw io error. The pane now ensures the
+   directory first, via `fm_new_folder` (#214's "New folder" — no new backend command; an
+   "already exists" failure *is* the success case, so it is swallowed and the write is left to
+   be the thing that reports a real problem).
+
+   Between the two, the pane both mis-reported an existing workflow as absent **and** could not
+   create the one it offered to create — which is exactly what "it says there's no workflow even
+   though there is one" feels like from the outside.
+
+A third, found while fixing them: a **BOM** made a perfectly good file look broken. The reader
+took U+FEFF as part of the first key, so `version: 1` arrived as a key named `﻿version` and the
+pane reported `version-missing` against a file the human could see was correct — and the
+character is invisible, so nothing in the error could have led them to it. Stripped in the pure
+parser, with a regression test.
+
+**The start surface** replaces the page of nothing: a strip at the top of the pane with one line
+of what a workflow is, the roster the button is about to write, and a **Create workflow** button
+that scaffolds a real, commented, valid file (`scaffoldWorkflowText`) — then lands them in the
+canvas on it. A commented scaffold is how every config-as-code tool worth using introduces
+itself, and it costs one string. (Before #233, an edit's canonical re-serialize dropped these
+comments the moment the human touched the form; now they survive untouched edits the same way
+any hand-written comment does — see below.)
+
+**The graph is now editable**, which reverses v1's read-only decision (§2f/Q6). The reasoning
+behind that decision was *"a canvas that can corrupt the file is worse than no canvas"* — and it
+is answered rather than abandoned:
+
+```
+  drag a node        → .loomux/workflow.layout.json          (never the workflow)
+  drag port → node   → connectBlocks()   → canonical YAML    (the pure model, same as a form edit)
+  click edge, ✕      → disconnectBlocks() → canonical YAML
+  + Block            → asks for the ID   → addBlock()
+  Delete             → removeBlockAt()   → takes its edges and its gate seat with it
+```
+
+Every gesture goes through the pure model and out through the same comment-preserving writer as
+everything else, so **the canvas cannot express anything the YAML can't**, cannot write a
+position into the semantic file, and cannot invent an identity. It is a second way to *edit* the
+file, not a second source of truth — which was the whole content of the original objection.
+
+Three commitments the canvas keeps, each because someone else broke it:
+
+- **It asks for the id.** Dify mints `node_1720794829558`; n8n keys its graph by the *display
+  name*, so a rename silently breaks every edge pointing at it. Here the id is asked for once,
+  validated as you type (a malformed or duplicate id cannot be confirmed at all, so it never
+  becomes a finding to decode later), and immutable thereafter. The name stays display-only.
+- **Positions are a different file.** `workflowlayout.ts` owns `.loomux/workflow.layout.json` —
+  keyed by block id, which is only safe *because* ids are immutable; pruned on save, so a
+  deleted block doesn't leave a coordinate behind forever; and treated as disposable, because
+  nothing in it is anyone's work. A layout that is missing or corrupt is **recomputed**, never
+  reported: a broken `workflow.yml` is a problem the human must see, a broken layout is a picture
+  we can redraw. A drag is therefore *not* unsaved work and does not gate a close — a dialog
+  asking whether to save the fact that you nudged a box is a dialog that teaches people to click
+  through dialogs.
+- **The geometry is pure.** Hit-testing, edge routing and placement are arithmetic, so they are
+  in `workflowlayout.ts` with `test/workflowlayout.test.ts` around them, DOM-free — the alternative
+  is validating a canvas by dragging things and squinting. The DOM layer is left with nothing to
+  get wrong but the wiring. (The edge hit-tolerance is why an edge is clickable at all: it is a
+  1.5px line, and nobody hits that.)
+
+And the gate is still not a node you can drag or wire. It is not a block — it is a *rule about*
+blocks — and making it draggable would imply it can be rewired, which is the single most
+important thing about it that isn't true.
+
+### Comments, and the save that used to eat them (#233)
+
+v2 shipped with a real cost: a form or canvas edit re-serialized the **whole workflow from the
+model**, every time, and the model did not carry comments. For a file loomux wrote, that cost
+nothing. For a file a **human** wrote, the comments are frequently the most valuable lines in
+it: this repo's own `.loomux/workflow.yml` is 126 lines of which **60 are comments** explaining
+the roster and the `.github/agents/` convention. One dragged edge and a `Ctrl+S` used to take
+all 60, silently, and hand the human a whole-file diff to discover later. #231 (rev-15) shipped
+an honest mitigation — warn once, before the first save that would do it — and named the real
+fix as a follow-up. This is that follow-up.
+
+**`serializeWorkflowPreserving(model, previousText)`** (`workflowmodel.ts`) is what `commit()`
+calls now, instead of the fully canonical `serializeWorkflow`. It reuses the ORIGINAL text's own
+lines — comments, blank-line runs, key order, quoting — for every top-level piece the edit
+didn't touch, and falls back to the canonical emitters only for the piece that changed:
+
+- **`front`** (`version:`, `name:`, and any top-level keys this build doesn't know) is reused
+  whole when none of them changed.
+- **Each block, matched by `id`** — the one thing about a block that is immutable by the schema's
+  own first rule (§ above) — is reused whole when it `deepEqual`s what parsing the original text
+  produced for that id. An edited block, or a brand-new one, regenerates canonically; every
+  *other* block keeps its own comment, blank-line spacing and field order untouched.
+- **`edges:`** and **`gates:`** each split their SECTION HEADER (the key line and whatever
+  comment introduces it, e.g. "# ADVISORY — the declared happy path") from their CONTENT (the
+  fan-out entries, or the gate itself). The header is reused whenever the section still exists
+  at all, whether or not its content changed; only the content falls back to canonical when it
+  did. Rewiring one edge, then, costs that section's content — not the paragraph explaining what
+  the section is *for*, which review found was the larger share of what a block-roster edit
+  used to cost (a deleted block that also drops its edges and its gate seat used to take the
+  `# ADVISORY` and `# ENFORCED` headers with it; now it doesn't).
+
+That granularity — whole section header, whole block by id, not per-field — is the deliberate
+boundary #233 draws: *comment-preserving for the parts an edit didn't touch*, not full-fidelity
+re-attachment of a comment to the one field it happened to sit beside. Re-attaching comments at
+field granularity against a hand-rolled parser is a much larger claim, and the bar the issue
+set — "edited nodes serialize cleanly" — is satisfied by canonical output for the piece that
+changed.
+
+**Two structural traps review found, both fixed at the scan, not patched at the call site:**
+
+1. **A `blocks:` (or any key) with nothing after the colon may be followed by its sequence at
+   the SAME column** — `- id: a` sitting directly under `blocks:` at indent 0, not indented
+   under it. The real reader (`afterKey`, above) already accepts this; the first version of the
+   splitting scan didn't, and mis-read every `- id: …` line as its own bogus top-level key —
+   which spliced roster content into `front` and, on re-parse, silently discarded everything
+   from that point on (the real reader's top-level `mapping()` treated a `-`-prefixed line at
+   column 0 as "a sequence ends the mapping" and stopped, with no finding — fixed separately,
+   #270: `mapping(0)` is only ever called once, with no enclosing key to hand a sequence off
+   to, so it now reports a `yaml-syntax` finding and consumes the orphan sequence instead of
+   silently dropping the rest of the file). Fixed here by teaching the scan the same
+   same-column rule the reader already has.
+2. **A `|`/`>` block scalar's body is content, never trivia — even a line that starts with
+   `#`.** The generic "is this a blank/comment line" test used to decide what trivia to peel
+   onto the next entry doesn't know it's inside a prompt, so a prompt whose own last line reads
+   `# a checklist item` could be silently stolen onto whatever comes next — invisible until that
+   NEXT block is the one edited, at which point the stolen line never comes back. Fixed with a
+   small scalar-tracking pass (`opaqueScalarIndices`) that marks every line inside a governing
+   `key: |`/`key: >`'s body as un-peelable, regardless of what character it starts with.
+
+**Falling back is always the safe direction, and it agrees with the view.** The fallback gates
+on `isUnreadable` — the SAME predicate `workflowview.ts`'s `syntaxBroken` disables the form on
+(a syntax error, or a root that isn't a mapping) — not the broader "any validation finding at
+all". A `version: 2` file (readable, still editable, just not one this build fully supports) is
+not unreadable, and must not silently lose its comments on the very first edit for a reason the
+human was never shown; the two gates drifting apart was itself a defect review caught. Beyond
+that: a `blocks:` sequence indented to something other than 2 spaces is not guessed at by mixing
+that indent with a hardcoded one — a regenerated item is emitted at whatever indent the file's
+OWN sequence already uses (0, 2, 4, whatever — tracked through from the scan), so it is never
+forced to choose between corrupting the sequence and reformatting the whole roster. Only a
+genuinely unfamiliar shape (this scan failing to find a consistent marker at all) falls all the
+way back to `serializeWorkflow`. Never a guess that could splice text over content it no longer
+describes — only ever "reuse this exact text for this exact, unchanged content" or "regenerate
+it cleanly."
+
+**The original file's own line ending survives too** (CRLF in, CRLF out) — the scan reads via
+`split(/\r?\n/)`, which strips every `\r` before any line is touched, so the only place an EOL
+convention matters is the final join, and that join uses whichever one `originalText` actually
+had. `serializeWorkflow` (Format's full rewrite) has no original text to take a convention from
+and still always emits `\n`.
+
+**One known, accepted cosmetic gap: reordering.** A block is matched by `id`, not by position,
+so a reordered block's own comment travels WITH it — a hand-edit in the YAML tab that swaps two
+blocks, followed by an unrelated form edit, keeps both blocks' comments. What does NOT
+travel correctly is the BLANK-LINE spacing between items: each item's leading trivia was
+captured relative to its *original* neighbor, so after a reorder it can separate a different
+pair than it used to. Still valid YAML, never a lost comment — just occasionally uneven spacing.
+Re-deriving spacing from each item's *new* neighbor on every reuse is more machinery than the
+cosmetic cost justifies, and the pane's own UI has no "reorder" gesture (only add/remove/connect)
+— this only arises from a hand edit.
+
+**Format still exists, and it still asks.** The **Format** button is the one place left that
+performs the OLD, fully canonical, comment-dropping rewrite — on purpose, in one step, for a
+human who explicitly wants the whole file canonicalized. `rewriteImpact` (pure, in
+`workflowpane.ts`) still guards it: naming what's lost ("the comments on 60 lines will be
+dropped"), with **Cancel as the default** — the only dialog in this pane where the affirmative
+is not the focused button, because it is the only one asking about work that is not
+recoverable, asked once per file (reset on `load()`). A file already in canonical form formats
+silently. The **YAML tab** remains unaffected either way: it saves exactly what you typed.
+
+**The dogfood pin (`test/workflowdogfood.test.ts`) now asserts the fix, not just the mitigation
+around it**: re-serializing the shipped file with nothing changed reproduces it byte-for-byte,
+and editing one block's `model:` keeps the file preamble, every other block's own comment, and
+both section headers — while `rewriteImpact` over that same edit returns `null`, because it
+never was the whole-file reformat that guard exists for. `serializeWorkflow`'s own full-rewrite
+behavior is still pinned too (that's what Format uses), so both halves of the contract stay
+honest at once.
+
+### The three questions the view was never allowed to answer
+
+Review found the v2 pane getting three things wrong, and they had the same shape: the *view* was
+deciding something that is a **rule**. Rules live in `workflowpane.ts` now — pure, tested, stated
+once — the same move `dirtystate.ts` makes for the editor.
+
+| The rule | What the view did instead |
+| --- | --- |
+| `paneSurface` — which surface to show | Showed *"no workflow in this repo yet"* for a file that was **there** and merely unreadable, and then offered to create one **over the top of it**. |
+| `savePlan` — how a save may write | A **create** wrote with a null expected hash, which the backend reads as *write unconditionally*. A workflow that arrived while the pane sat on its start surface (an agent wrote one, a `git pull` brought one in) was **destroyed**, with a green "Saved" toast. |
+| `layoutPruneIds` — what the layout may forget | Pruned the layout file against the **unsaved buffer**, so deleting a block (without saving) and then dragging another one wrote the deletion to disk *before the human had made it*. |
+
+The save fix is the one worth naming: a create now **claims the path atomically** with
+`fm_new_file` (which is `create_new(true)` — "create, but only if it isn't there", one syscall,
+no TOCTOU window) and then writes against the claimed file's own hash. So even the sliver between
+the claim and the write is an ordinary conflict-guarded write, and the *only* code path left that
+can overwrite a workflow is a human answering **Overwrite** in the conflict dialog — which is an
+answer to a question, not a save plan. `src-tauri/tests/workflowfile.rs` pins both halves of why
+that works, at the layer where the behaviour lives.
+
+And one more, in the module whose whole job is to be the hostile-input-proof half of the canvas:
+a block whose id is **`constructor`** is a perfectly legal workflow (the validator reports zero
+findings), but `positions["constructor"]` on a plain object literal returns the *inherited* `Object`
+function — truthy, so the canvas read `{x: undefined, y: undefined}` off it, and `NaN` reached the
+SVG's width and height. The canvas did not render, for a valid file, keyed by an id that can never
+be changed. The position table now has **no prototype** and is read through `Object.hasOwn`.
+Tightening the +Block dialog would not have fixed it: an id can arrive from a hand edit, the YAML
+tab, or an agent, and none of those pass through a dialog. Fix the lookup, not the instance.
+
+### The rules were right and the screen disagreed: `hidden` doesn't hide
+
+Everything above was true, tested, and shipped — and the pane still failed in the demo, in three
+ways at once. It rendered its **three mutually exclusive surfaces simultaneously**: a *"Can't read
+.loomux/workflow.yml"* banner, the *"Start a workflow"* front door, **and** the workflow itself,
+loaded, in the roster, badged **valid**. It said it could not read a file it had plainly just read.
+And pressing **Create workflow** — the button from the start surface, sitting live on top of a
+loaded workflow — scaffolded straight over it. Exactly the data-loss class the claim-then-write
+fix above was written to close.
+
+They are one bug, and it is not in any of the rules. `render()` picks one surface with
+`paneSurface` and sets `hidden` on the other two, correctly. **`hidden` was doing nothing.** The
+UA stylesheet's `[hidden] { display: none }` lives in the *user-agent origin*, and every author
+declaration outranks it — origin is decided before specificity is ever consulted. The pane's
+surfaces are `.wf-start`, `.wf-body`, `.wf-findings`, all `display: flex`. So the attribute was set,
+and the element stayed on screen, and the code that "hid" it had no way to find out.
+
+Read the three symptoms again with that in hand and they collapse into it:
+
+- **All three surfaces at once** — none of them was ever hidden.
+- **"Can't read .loomux/workflow.yml"** — the *static title* of an error surface that had never
+  been shown and never been hidden. The read never failed. There was no error. (The detail line
+  under it was blank, which is the tell: `errorTextEl` is set from `loadError`, and `loadError`
+  was `null`.)
+- **Create overwrote the workflow** — the button was visible over a loaded workflow, so it was
+  pressable, so it was pressed. And *every guard below it worked*: the pane had read the file and
+  held its hash, so `savePlan` returned an ordinary `guarded-write`, the hash **matched** (nothing
+  else had touched the file), and the backend wrote what it was told. Claim-then-write never armed,
+  because claim-then-write is what happens when the pane believes there is **no file** — and here
+  it knew there was one. There was no missing refusal downstream. The button should not have been
+  pressable.
+
+The attractive theory was a **root/cwd mismatch** — the read probe resolving one root, the write
+another. It is wrong, and `src-tauri/tests/workflowfile.rs` now contains the experiment that killed
+it: the process cwd pointed at a decoy repo of identical layout, the root in every spelling Windows
+hands over (backslashes, trailing separator) against the frontend's forward-slash `rel`. Read and
+write resolve the same absolute file, every time. A successful read *proves* the probe worked — the
+pane could not have shown a valid workflow otherwise — which is the deduction that ends the theory:
+a "Can't read" banner over a file that read fine cannot be a read failure.
+
+**Two fixes, and only one of them is in the pane.**
+
+`[hidden] { display: none !important; }`, once, at the top of `styles.css`. `!important` and not
+another per-class `[hidden]` companion — the file had **nine** of those, added one bug at a time,
+and the workflow pane's seven elements are what it cost to keep rediscovering the trap by hand. An
+author-origin `[hidden]` carries the same specificity as any single class, so without `!important`
+the winner is decided by **source order**: by whether the next person to write `display:` happens to
+write it below that line.
+
+It is app-wide because the bug is, and **two elements outside the pane were already living with
+it** — both silently ignoring their own `hidden` since the day they were written, and both now
+behaving as their code always said they did:
+
+- **`.group-auto-meter`** — the group view's budget meter, whose own comment reads `Off ⇒ hidden`.
+  It never hid; with autonomy off it sat there as an empty shell.
+- **`.tab-close`** — the tab bar's ✕, which `tabbar.ts` hides on a single tab (`never zero tabs`).
+  Visible, it was a **dead control**: `requestClose` floors at `count <= 1` and returns, so clicking
+  it did nothing. The never-zero-tabs floor is enforced in the handler and does not depend on this,
+  so restoring the ✕'s intended invisibility changes what you *see*, not what can happen.
+
+`test/hiddenrule.test.ts` guards the fix in the two places it can be attacked. An important
+declaration beats every normal one regardless of selector, so the *only* thing that can out-rank the
+guard is **another important `display`** — which the test forbids outright, reading every declaration
+in the file whatever its selector (a `display: flex !important` hung on a descendant selector would
+otherwise defeat the guard invisibly). The second half models the cascade over the compound
+selectors that actually carry `display` here and asserts the invariant itself: *if the code hides an
+element, the element goes away*.
+
+So the next `display: flex` on a toggled class is simply **harmless** — the guard outranks it, the
+suite stays green, and nothing needs to be said to whoever wrote it. That is the point of fixing this
+in the cascade rather than element by element. What fails a test is **weakening the guard** or adding
+**a second important `display`** — which are the only two ways this bug can come back.
+
+And `createAllowed` (`workflowpane.ts`): a create is permitted on the **start surface and nowhere
+else** — the same single decision that draws the button — and `scaffold()` refuses if it is called
+anywhere else. Because the start surface is *by definition* "no file, empty buffer", every create it
+permits is a `claim-then-write`; the two rules cannot drift apart into a create that overwrites. The
+lesson is the one the CSS taught: **visibility is not a safety property.** The pane's defence
+against scaffolding over a workflow was that the button was *supposed to be invisible*, and a
+stylesheet was all it took to make that false.
+
+### The rest is the pattern #217 already set
+
+The workflow file rides in the persisted `file` field the editor pane added; `cwd` carries the
+repo. Restore probes the ROOT (`ftRootIsDir`) and deliberately not the file: a repo whose
+`.loomux/workflow.yml` doesn't exist is not a broken pane, it is a pane with nothing in it yet
+— and it opens on an empty state offering to create one. Reads and writes go through the same
+hash-guarded `ftReadFile`/`ftWriteFile` the editor uses, so an **agent rewriting the workflow
+it is running under** is a conflict the human resolves, not a silent overwrite. And the view
+implements the same `dirty` / `canDiscard()` / `bufferReport()` contract the editor does, so
+every guard above — pane close, tab close, app quit, a dead process — covers it by joining one
+list (`Pane.unsavedHolder()`) rather than by four more remembered call sites.
+
+No backend commands were added: `ft_read_file` / `ft_write_file` already took a root and a
+relative path, and the workflow file is just a file.
+
 ## Not agents
 
 `tabcounts` keys the agent count on **kind**, not on `live`. All three content kinds
@@ -356,6 +789,18 @@ construction, not by remembering.
 | `dirtystate.ts` (#219) | `dirtyBuffers` / `quitDecision` / `dirtyBufferLines` (who is holding what, and may we quit), `keepOpenOnExit` (does a dead pane stay, and why), `discardEdits` (discard means discard) — all pure, all node:tested |
 | `pty.ts` / `main.ts` (#219) | `guardAppClose` (the Tauri close hook, kept on the one Tauri seam) + the quit guard and its awaited `flushTabs` |
 | `orchestration.ts` (#219) | group-end keeps a pane holding unsaved edits, and says so |
+| `workflowmodel.ts` (#222) | the pure half: the YAML subset, the schema, the canonical formatter, the pre-run validation pass, the derived graph — all node:tested |
+| `workflowview.ts` (#222) | the DOM: roster + property form, raw YAML, the **editable canvas**, findings strip, save/conflict, the start + error surfaces — and the same `dirty` / `canDiscard` / `bufferReport` contract the editor has |
+| `workflowlayout.ts` (#222 v2) | the canvas's pure half: `.loomux/workflow.layout.json`, placement, hit-testing, edge routing — all DOM-free, all node:tested |
+| `modal.ts` (#222 v2) | `promptModal` — one line of text, validated on every keystroke (the affirm button is disabled while the id is bad), so a new block can be ASKED for its id instead of being given a generated one |
+| `workflowpane.ts` (#222 v2) | the pane's pure DECISIONS — which surface it shows, how a save is allowed to write, what the layout file may forget. Three rules the view used to hold itself, and got wrong. Plus `createAllowed` (#222 live fix): a create is permitted on the **start surface and nowhere else**, so it can never be reached over a workflow that is already there |
+| `styles.css` → `[hidden] { display: none !important; }` (#222 live fix) | app-wide, one line: an author `display:` rule out-ranks the UA's `[hidden]` **by origin**, so `el.hidden = true` was silently ignored on all seven of the workflow pane's toggled elements — the pane drew its three exclusive surfaces at once, and the "Create workflow" button sat live over a loaded workflow. It also un-breaks the two elements *outside* the pane that had the same defect: the group view's budget meter (`Off ⇒ hidden`) and the tab bar's ✕ on a single tab (`never zero tabs`) |
+| `test/hiddenrule.test.ts` (#222 live fix) | two halves of one guarantee: **the guard is the only important `display` in the stylesheet** (read off every declaration, any selector — an important `display` is the *only* thing that can out-rank `[hidden]`), and **hiding an element hides it** (the cascade, modelled over the compound selectors that carry `display` here) |
+| `src-tauri/tests/workflowfile.rs` (#222 v2) | pins the two backend facts the create path rests on: a null-hash write clobbers (why a create must never use one), and `new_file` refuses atomically without truncating (why claiming the path fixes it) |
+| `filemenu.ts` / `fileexplorer.ts` / `fileexplorermodel.ts` (#222) | the `workflow-pane` row affordance — declared, and offered only on a `.yml`/`.yaml` row |
+| `launcher.ts` (#222) | the `Workflow` kind in the welcome form's picker (one option, one plan, one probe — the same directory probe files/editor use) |
 
-No backend changes: `ft_list_dir` and `git_repo_root` already take a root, and both
-new panes are built from commands that existed. `Cargo.lock` is untouched.
+No backend changes: `ft_list_dir` and `git_repo_root` already take a root, and all
+three earlier panes are built from commands that existed. The workflow pane (#222) adds
+none either — `ft_read_file` / `ft_write_file` already take a root and a relative path,
+hash-guard included, and a workflow file is just a file. `Cargo.lock` is untouched.

@@ -25,19 +25,32 @@
 // git work tree for git — which is why the probe stays in the form and only the
 // "a path was given" rule lives here.
 
-export type PaneKind = "agent" | "orchestrator" | "terminal" | "files" | "editor" | "git";
+// #222 adds a FOURTH content kind: `workflow` — the pane that makes
+// `.loomux/workflow.yml` (the user-defined agent workflow: blocks, edges, gates)
+// configurable. Its one input is the REPO the workflow file lives in, so it validates
+// exactly like its three siblings: the path is mandatory here, and whether it is a
+// readable directory is I/O the form probes.
+
+export type PaneKind =
+  | "agent"
+  | "orchestrator"
+  | "terminal"
+  | "files"
+  | "editor"
+  | "git"
+  | "workflow";
 export type ShellKind = "powershell" | "gitbash" | "cmd";
 
 const AGENT_MIN = 1;
 const AGENT_MAX = 8;
 
-/** The PTY-less CONTENT kinds (#214 files, #217 editor + git): a pane that IS a
- *  surface rather than a process. They spawn nothing, pick no CLI, and take exactly
+/** The PTY-less CONTENT kinds (#214 files, #217 editor + git, #222 workflow): a pane that
+ *  IS a surface rather than a process. They spawn nothing, pick no CLI, and take exactly
  *  one input — the folder / repo they are rooted at — which is why the welcome form
  *  can hide every other field off this one predicate instead of listing the kinds at
- *  each site (and forgetting one when a fourth arrives). */
+ *  each site (and forgetting one when a fifth arrives). */
 export function isContentKind(kind: PaneKind): boolean {
-  return kind === "files" || kind === "editor" || kind === "git";
+  return kind === "files" || kind === "editor" || kind === "git" || kind === "workflow";
 }
 
 export interface PaneSetupInput {
@@ -117,21 +130,39 @@ export interface GitPlan {
   root: string;
   name: string;
 }
+/** A WORKFLOW pane (#222): `.loomux/workflow.yml` — the repo's agent workflow (blocks,
+ *  advisory edges, enforced gates) — as an editable surface. `root` is the repo the file
+ *  lives in; the pane derives the path from it, so the kind still takes exactly ONE input
+ *  like its three siblings. A repo with no workflow file yet is not an error: the pane
+ *  opens on an empty state that offers to create one. */
+export interface WorkflowPlan {
+  kind: "workflow";
+  root: string;
+  name: string;
+}
 export type PaneSetupPlan =
   | TerminalPlan
   | AgentPlan
   | OrchestratorPlan
   | FilesPlan
   | EditorPlan
-  | GitPlan;
+  | GitPlan
+  | WorkflowPlan;
 
 /** The per-kind halves of the content-pane rule: what to call the missing path in
  *  the error, and what to fall back to when the human names the pane nothing. The
  *  RULE itself (the path is mandatory) is one branch below, not three. */
-const CONTENT_SETUP: Record<"files" | "editor" | "git", { missing: string; fallbackName: string }> = {
+const CONTENT_SETUP: Record<
+  "files" | "editor" | "git" | "workflow",
+  { missing: string; fallbackName: string }
+> = {
   files: { missing: "The file explorer needs a folder — pick one first.", fallbackName: "files" },
   editor: { missing: "The file editor needs a folder — pick one first.", fallbackName: "editor" },
   git: { missing: "The git view needs a repository — pick one first.", fallbackName: "git" },
+  workflow: {
+    missing: "The workflow pane needs a repository — pick one first.",
+    fallbackName: "workflow",
+  },
 };
 
 /** Which field to focus when validation fails, so the form can surface it. */
@@ -281,14 +312,14 @@ export function planPaneSetup(input: PaneSetupInput): PaneSetupResult {
     return { ok: true, plan: { kind: "orchestrator", repo } };
   }
 
-  // The three CONTENT kinds (#214 files, #217 editor + git). ONE rule, because they
-  // have one: the path is mandatory. Unlike a terminal, "" can't fall back to home —
+  // The CONTENT kinds (#214 files, #217 editor + git, #222 workflow). ONE rule, because
+  // they have one: the path is mandatory. Unlike a terminal, "" can't fall back to home —
   // a file tree over the whole home directory is never what the user meant, a rootless
   // content pane has no content at all, and "home" is not a repo. What differs per kind
   // is only the wording (CONTENT_SETUP), and whether the path is REAL — a directory? a
   // work tree? — which is I/O the form probes, not a rule this module can decide.
   if (isContentKind(input.kind)) {
-    const kind = input.kind as "files" | "editor" | "git";
+    const kind = input.kind as "files" | "editor" | "git" | "workflow";
     const setup = CONTENT_SETUP[kind];
     if (!repo) return { ok: false, error: setup.missing, focus: "repo" };
     const name = input.name.trim() || pathTail(repo) || setup.fallbackName;
