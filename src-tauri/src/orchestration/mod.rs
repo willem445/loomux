@@ -4842,6 +4842,12 @@ impl OrchRegistry {
         // persona under a session they already consented to — the consent moment is
         // the launch, so the launch is what the roster is pinned to. Drift is
         // *audited* below, not applied; to run a changed workflow, launch a group.
+        //
+        // #255: set only on a fresh, valid workflow load — the one moment this
+        // function actually knows the roster's structural agent requirement.
+        // Checked against the resolved `max_agents` once every guardrail
+        // override below (including the resume-cap override) has landed.
+        let mut capacity: Option<workflow::CapacityRecommendation> = None;
         if guardrails.advanced_orchestrator && launch == Launch::Fresh {
             // Three outcomes, and only the first changes anything:
             //   - a valid `.loomux/workflow.yml` → its blocks ARE the roster;
@@ -4856,11 +4862,20 @@ impl OrchRegistry {
             //     the human the same findings *before* they hit Create.
             match workflow::load_workflow(repo) {
                 Ok(Some(wf)) => {
+                    // #255: derived from the roster + the (optional) merge gate
+                    // while we still hold both — recorded here so a run's capacity
+                    // assumptions are reconstructable from the audit log later, and
+                    // checked against the resolved cap below.
+                    let capacity_rec =
+                        workflow::recommend_capacity(&wf.blocks, wf.gates.get("merge"));
                     self.audit(&id, "loomux", "workflow-loaded", json!({
                         "path": workflow::WORKFLOW_PATH,
                         "name": wf.name,
                         "blocks": wf.blocks.iter().map(|b| json!({ "id": b.id, "kind": b.kind })).collect::<Vec<_>>(),
                         "gates": wf.gates.keys().collect::<Vec<_>>(),
+                        "min_agents": capacity_rec.minimum,
+                        "recommended_agents": capacity_rec.recommended,
+                        "reviewers_needed": capacity_rec.reviewers_needed,
                     }));
                     // The declared merge gate (#222/#197) becomes the `merge_gate`
                     // spec file the gh shim enforces — or, when the file declares
@@ -4882,6 +4897,7 @@ impl OrchRegistry {
                     // Re-run the roster normalization (model defaults follow each
                     // block's *effective* CLI, which the file may have changed).
                     guardrails = guardrails.clamped();
+                    capacity = Some(capacity_rec);
                 }
                 // No workflow file: no gate. Clears a stale one from a previous
                 // launch, so deleting `.loomux/workflow.yml` restores the pre-#222
@@ -4922,6 +4938,27 @@ impl OrchRegistry {
             // would happen. The gate file written at launch stands; the drift audit
             // tells the human the repo has moved on.
             self.audit_workflow_drift(&id, repo, &guardrails);
+            // #255 (rev-1 B2 / rev-2 non-blocking #1): the roster and gate are
+            // PINNED on a resume, not re-read — but they still describe a real
+            // structural minimum, and a resumed session can outgrow it exactly as
+            // a fresh one can (a human lowers the live cap mid-run, or just never
+            // raised it to begin with). `guardrails.blocks` is already the
+            // persisted, clamped roster; the gate file on disk is the one the
+            // original launch wrote and this branch deliberately never touches —
+            // both are exactly what the pinned session is running under, so
+            // deriving from them here (rather than skipping the check because
+            // "the file wasn't re-read") is correct, not a re-read.
+            //
+            // Gated on `roster_is_custom`: this whole feature is about a DECLARED
+            // workflow's structural need, and a group with no workflow file has
+            // none to derive — its Fresh launch (the `Ok(None)` arm above) leaves
+            // `capacity` at `None` for exactly that reason. Without this check a
+            // resumed built-in-roster group (advanced toggle on, no `workflow.yml`)
+            // would get capacity audits its own fresh launch never emitted, and the
+            // note would say "this workflow's minimum" about a group that has none.
+            if workflow::roster_is_custom(&guardrails.blocks) {
+                capacity = Some(workflow::recommend_capacity(&guardrails.blocks, self.merge_gate(&id).as_ref()));
+            }
         } else {
             // The toggle is off, so the workflow is not running — and neither is its
             // gate. Clearing it here is what makes "the default experience is
@@ -4968,6 +5005,56 @@ impl OrchRegistry {
                 } else {
                     persisted.idle_activity_floor_bytes.clamp(1, MAX_IDLE_ACTIVITY_FLOOR_BYTES)
                 };
+            }
+        }
+        // #255: advisory only — never override a cap the human set. A launcher
+        // warning (surfaced from `orch_workflow_preview`, computed the same way)
+        // is meant to catch this *before* Create; these audit records are the
+        // durable trail for a launch that went ahead anyway — e.g. resumed with a
+        // persisted cap the file has since outgrown.
+        //
+        // Two tiers, per rev-1 B2 of the #255 review: the incident this issue was
+        // filed from ran at `max_agents == minimum` (4) against a `recommended` of
+        // 6 — i.e. exactly the boundary the single-tier check above was silent on.
+        // A cap can be too low in two different ways and they are not the same
+        // problem: below `minimum`, the orchestrator cannot even complete one
+        // review round without evicting something live (hard — it actively
+        // thrashes); at-or-above `minimum` but below `recommended`, every review
+        // round completes, but named tiers (a second worker lane, extra
+        // reviewers, the planner) can never be live *alongside* one (soft — it
+        // just never runs the roster it was handed).
+        if let Some(rec) = capacity {
+            if guardrails.max_agents < rec.minimum {
+                self.audit(&id, "loomux", "max-agents-below-minimum", json!({
+                    "max_agents": guardrails.max_agents,
+                    "minimum": rec.minimum,
+                    "recommended": rec.recommended,
+                    "note": format!(
+                        "max_agents ({}) is below this workflow's minimum ({}) — its merge \
+                         gate plus a worker can never all be live at once without evicting a \
+                         live agent to make room.",
+                        guardrails.max_agents, rec.minimum,
+                    ),
+                }));
+            } else if guardrails.max_agents < rec.recommended {
+                let extras = workflow::extra_tiers(&guardrails.blocks, rec.reviewers_needed);
+                self.audit(&id, "loomux", "max-agents-below-recommended", json!({
+                    "max_agents": guardrails.max_agents,
+                    "minimum": rec.minimum,
+                    "recommended": rec.recommended,
+                    "extra_tiers": extras,
+                    "note": format!(
+                        "max_agents ({}) covers one review round (minimum {}) but not this \
+                         workflow's full roster (recommended {}) — {} can never be live \
+                         alongside a review round.",
+                        guardrails.max_agents, rec.minimum, rec.recommended,
+                        if extras.is_empty() {
+                            "some of its declared tiers".to_string()
+                        } else {
+                            workflow::join_with_and(&extras)
+                        },
+                    ),
+                }));
             }
         }
         let info = GroupInfo { id: id.clone(), repo: repo.to_string(), guardrails };
@@ -9928,13 +10015,17 @@ pub fn create_orchestration(
 #[tauri::command]
 pub fn orch_workflow_preview(repo: String, agent_cli: String) -> Value {
     let present = workflow::workflow_file_exists(&repo);
-    let (name, blocks, gates, errors) = match workflow::load_workflow(&repo) {
+    let (name, blocks, gates, errors, capacity) = match workflow::load_workflow(&repo) {
         Ok(Some(wf)) => {
             let gates: Vec<String> = wf.gates.keys().cloned().collect();
-            (wf.name, wf.blocks, gates, Vec::new())
+            // #255: same derivation `create_group_ex` records at load time, so the
+            // launcher's warning and the audit trail can never disagree about what
+            // a launch would compute.
+            let capacity = workflow::recommend_capacity(&wf.blocks, wf.gates.get("merge"));
+            (wf.name, wf.blocks, gates, Vec::new(), Some(capacity))
         }
-        Ok(None) => (String::new(), Vec::new(), Vec::new(), Vec::new()),
-        Err(errors) => (String::new(), Vec::new(), Vec::new(), errors),
+        Ok(None) => (String::new(), Vec::new(), Vec::new(), Vec::new(), None),
+        Err(errors) => (String::new(), Vec::new(), Vec::new(), errors, None),
     };
     // Resolve exactly as a launch would: `clamped()` is what fills in an
     // inherited CLI's default model, guarantees the orchestrator block, and drops
@@ -9948,6 +10039,11 @@ pub fn orch_workflow_preview(repo: String, agent_cli: String) -> Value {
             .blocks
     };
     let agent_cli = if SUPPORTED_CLIS.contains(&agent_cli.as_str()) { agent_cli } else { "claude".into() };
+    // #255 (rev-1 B1): computed from the RESOLVED blocks so it can never disagree
+    // with the roster table below — and handed to the frontend pre-computed so
+    // `roster.ts` never has to recount reviewer blocks to describe a number that
+    // came from the gate (that conflation was rev-1's finding).
+    let extra_tiers = capacity.map(|c| workflow::extra_tiers(&resolved, c.reviewers_needed));
     json!({
         "path": workflow::WORKFLOW_PATH,
         "present": present,
@@ -9955,6 +10051,13 @@ pub fn orch_workflow_preview(repo: String, agent_cli: String) -> Value {
         "name": name,
         "errors": errors,
         "gates": gates,
+        // #255: null when there's no declared workflow to derive from (absent or
+        // invalid file) — the launcher has nothing to warn about in that case,
+        // since the group would run the built-in roster.
+        "min_agents": capacity.map(|c| c.minimum),
+        "recommended_agents": capacity.map(|c| c.recommended),
+        "reviewers_needed": capacity.map(|c| c.reviewers_needed),
+        "extra_tiers": extra_tiers,
         "blocks": resolved.iter().map(|b| json!({
             "id": b.id,
             "name": b.name,

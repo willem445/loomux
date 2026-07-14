@@ -7124,6 +7124,283 @@ fn create_orchestration_group_maps_resume_session_onto_the_workflow_pin() {
     );
 }
 
+// ───────── #255: max_agents recommendation, end to end ─────────
+//
+// The pure derivation (`recommend_capacity`, gate-aware) is pinned in
+// tests/workflow.rs. What these assert is the WIRING: a real `create_group`
+// records it in the `workflow-loaded` audit, and a cap below the minimum is
+// audited — advisory only, never silently rewritten.
+
+#[test]
+fn workflow_loaded_audit_records_the_gate_aware_capacity_recommendation() {
+    let (reg, _d) = test_registry();
+    // `gated_repo` (defined below): 1 worker + 2 reviewers, all-pass over both.
+    // minimum = 2 (gate_need) + 1 (worker slot) = 3; recommended = 1 + 2 = 3.
+    let repo = gated_repo("");
+    let g = reg
+        .create_group(
+            &repo.path().to_string_lossy(),
+            Guardrails { advanced_orchestrator: true, max_agents: 5, ..rails() },
+        )
+        .unwrap();
+    let loaded = reg
+        .audit_log(&g.id)
+        .into_iter()
+        .find(|e| e.action == "workflow-loaded")
+        .expect("a valid workflow load must record workflow-loaded");
+    assert_eq!(loaded.detail["min_agents"], 3, "2 reviewers (all-pass) + 1 worker");
+    assert_eq!(loaded.detail["recommended_agents"], 3, "1 worker + 2 reviewers, no planner block");
+    assert_eq!(loaded.detail["reviewers_needed"], 2, "the gate's own requirement");
+}
+
+#[test]
+fn max_agents_below_the_minimum_is_audited_advisory_only() {
+    let (reg, _d) = test_registry();
+    let repo = gated_repo("");
+    let g = reg
+        .create_group(
+            &repo.path().to_string_lossy(),
+            Guardrails { advanced_orchestrator: true, max_agents: 2, ..rails() },
+        )
+        .unwrap();
+    let warn = reg
+        .audit_log(&g.id)
+        .into_iter()
+        .find(|e| e.action == "max-agents-below-minimum")
+        .expect("max_agents (2) is below the roster's minimum (3) — must be audited");
+    assert_eq!(warn.detail["max_agents"], 2);
+    assert_eq!(warn.detail["minimum"], 3);
+    assert_eq!(warn.detail["recommended"], 3);
+    // Advisory only (#255's explicit constraint): a cap the human set is never
+    // silently rewritten — the warning is the whole feature, not an override.
+    assert_eq!(
+        reg.group(&g.id).unwrap().guardrails.max_agents, 2,
+        "a capacity warning must never rewrite the cap the human set"
+    );
+}
+
+#[test]
+fn max_agents_at_or_above_the_minimum_stays_quiet() {
+    let (reg, _d) = test_registry();
+    // `gated_repo` has no planner and a single worker tier, so its minimum and
+    // recommended are the SAME number (3) — the soft tier below has nothing to
+    // fire on either, which is exactly what makes this the right fixture for
+    // pinning "nothing needs evicting mid-round → both tiers silent".
+    let at_minimum = gated_repo("");
+    let g = reg
+        .create_group(
+            &at_minimum.path().to_string_lossy(),
+            Guardrails { advanced_orchestrator: true, max_agents: 3, ..rails() },
+        )
+        .unwrap();
+    assert!(
+        reg.audit_log(&g.id)
+            .iter()
+            .all(|e| e.action != "max-agents-below-minimum" && e.action != "max-agents-below-recommended"),
+        "at the minimum, nothing needs evicting mid-round — must stay quiet"
+    );
+
+    let comfortable = gated_repo("");
+    let g2 = reg
+        .create_group(
+            &comfortable.path().to_string_lossy(),
+            Guardrails { advanced_orchestrator: true, max_agents: 6, ..rails() },
+        )
+        .unwrap();
+    assert!(
+        reg.audit_log(&g2.id)
+            .iter()
+            .all(|e| e.action != "max-agents-below-minimum" && e.action != "max-agents-below-recommended"),
+        "comfortably above the minimum too"
+    );
+}
+
+/// The #255 incident roster itself: a planner, 2 worker tiers, 3 reviewers,
+/// all-pass over the 3. minimum = 3 (gate_need) + 1 (worker slot) = 4;
+/// recommended = 2 workers + 3 reviewers + 1 planner = 6 — the two diverge,
+/// which is exactly the gap the soft-warning tier exists to name.
+fn incident_repo() -> tempfile::TempDir {
+    let td = tempfile::tempdir().unwrap();
+    let dir = td.path().join(".loomux");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("workflow.yml"),
+        "version: 1\nname: two-tier-review\n\
+         blocks:\n\
+         \x20 - id: planner\n    kind: planner\n\
+         \x20 - id: worker-deep\n    kind: worker\n\
+         \x20 - id: worker-quick\n    kind: worker\n\
+         \x20 - id: rev-1\n    kind: reviewer\n\
+         \x20 - id: rev-2\n    kind: reviewer\n\
+         \x20 - id: rev-3\n    kind: reviewer\n\
+         gates:\n  merge:\n    reviewers: [rev-1, rev-2, rev-3]\n",
+    )
+    .unwrap();
+    td
+}
+
+#[test]
+fn max_agents_at_the_minimum_but_below_recommended_gets_the_soft_warning() {
+    // The #255 incident's own numbers: cap 4 == minimum 4 < recommended 6. This
+    // is exactly the run that thrashed for two hours, and rev-1 of this PR's
+    // review caught that the single-tier (below-minimum) check was silent on
+    // it — the soft tier exists to catch precisely this boundary.
+    let (reg, _d) = test_registry();
+    let repo = incident_repo();
+    let g = reg
+        .create_group(
+            &repo.path().to_string_lossy(),
+            Guardrails { advanced_orchestrator: true, max_agents: 4, ..rails() },
+        )
+        .unwrap();
+    assert!(
+        reg.audit_log(&g.id).iter().all(|e| e.action != "max-agents-below-minimum"),
+        "at the minimum, one review round still fits — no HARD warning"
+    );
+    let warn = reg
+        .audit_log(&g.id)
+        .into_iter()
+        .find(|e| e.action == "max-agents-below-recommended")
+        .expect("cap (4) covers one review round but not the full roster (6) — must be audited");
+    assert_eq!(warn.detail["max_agents"], 4);
+    assert_eq!(warn.detail["minimum"], 4);
+    assert_eq!(warn.detail["recommended"], 6);
+    let extras: Vec<String> = warn.detail["extra_tiers"]
+        .as_array()
+        .expect("extra_tiers must be an array")
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        extras,
+        vec!["1 more worker tier".to_string(), "the planner".to_string()],
+        "the second worker tier and the planner are exactly what recommended adds over minimum"
+    );
+    let note = warn.detail["note"].as_str().unwrap();
+    assert!(note.contains("1 more worker tier") && note.contains("the planner"));
+    // Advisory only — never silently rewritten.
+    assert_eq!(reg.group(&g.id).unwrap().guardrails.max_agents, 4);
+}
+
+#[test]
+fn max_agents_at_the_recommended_count_is_fully_quiet() {
+    let (reg, _d) = test_registry();
+    let repo = incident_repo();
+    let g = reg
+        .create_group(
+            &repo.path().to_string_lossy(),
+            Guardrails { advanced_orchestrator: true, max_agents: 6, ..rails() },
+        )
+        .unwrap();
+    assert!(
+        reg.audit_log(&g.id)
+            .iter()
+            .all(|e| e.action != "max-agents-below-minimum" && e.action != "max-agents-below-recommended"),
+        "at the recommended count, every declared tier fits — fully quiet"
+    );
+}
+
+#[test]
+fn a_resumed_session_re_checks_the_pinned_roster_against_the_live_cap_too() {
+    use std::sync::Arc;
+    // rev-1 NB6: the roster/gate are pinned on resume (not re-read from the
+    // repo) — but they still describe a real structural minimum, and a resume
+    // must not silently skip the check just because the file wasn't re-read.
+    let state = tempfile::tempdir().unwrap();
+    let repo = gated_repo(""); // 1 worker + 2 reviewers, all-pass: minimum 3
+    let reg = Arc::new(OrchRegistry::new(state.path().to_path_buf()));
+    reg.set_port(45999);
+    let launched = create_orchestration_group(
+        &reg,
+        &repo.path().to_string_lossy(),
+        Guardrails { advanced_orchestrator: true, max_agents: 5, ..rails() },
+        None,
+        None,
+        0,
+    )
+    .unwrap();
+    let gid = launched.group_id.clone();
+
+    // The human lowers the live cap (#56) below the pinned roster's minimum...
+    reg.set_max_agents(&gid, 2, "human").unwrap();
+    // ...ends the session, and later reopens it from the session browser: a
+    // RESUME, not a fresh launch — the repo's workflow file is not re-read.
+    reg.end_group(&gid, false).unwrap();
+    let (persisted_repo, persisted) = reg.load_group_file(&gid).expect("group.json");
+    assert_eq!(persisted.max_agents, 2, "the lowered cap was persisted");
+    create_orchestration_group(
+        &reg,
+        &persisted_repo,
+        persisted,
+        Some("11111111-2222-3333-4444-555555555555".into()),
+        Some(&gid),
+        0,
+    )
+    .expect("a resume must not fail");
+
+    let warn = reg
+        .audit_log(&gid)
+        .into_iter()
+        .filter(|e| e.action == "max-agents-below-minimum")
+        .last()
+        .expect("the resume must re-check the pinned roster against the live cap, not skip it");
+    assert_eq!(warn.detail["max_agents"], 2);
+    assert_eq!(warn.detail["minimum"], 3);
+}
+
+#[test]
+fn a_resumed_group_with_no_declared_workflow_gets_no_capacity_audit_either() {
+    use std::sync::Arc;
+    // rev-2 non-blocking #1: this feature is about a DECLARED workflow's
+    // structural need. A fresh launch with the advanced toggle on but no
+    // `.loomux/workflow.yml` audits nothing at all — the `Ok(None)` arm never
+    // computes a `CapacityRecommendation`, so there's nothing to check the cap
+    // against. A resume of that same group must land in exactly the same
+    // silence, not start auditing the built-in roster's own (accidental)
+    // numbers just because the resume branch has blocks and a gate lookup to
+    // feed `recommend_capacity` with.
+    let state = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap(); // no .loomux directory at all
+    let reg = Arc::new(OrchRegistry::new(state.path().to_path_buf()));
+    reg.set_port(45999);
+    let launched = create_orchestration_group(
+        &reg,
+        &repo.path().to_string_lossy(),
+        Guardrails { advanced_orchestrator: true, max_agents: 2, ..rails() },
+        None,
+        None,
+        0,
+    )
+    .unwrap();
+    let gid = launched.group_id.clone();
+    assert!(
+        reg.audit_log(&gid)
+            .iter()
+            .all(|e| e.action != "max-agents-below-minimum" && e.action != "max-agents-below-recommended"),
+        "a fresh launch with no workflow file has nothing to derive a capacity recommendation from"
+    );
+
+    reg.end_group(&gid, false).unwrap();
+    let (persisted_repo, persisted) = reg.load_group_file(&gid).expect("group.json");
+    create_orchestration_group(
+        &reg,
+        &persisted_repo,
+        persisted,
+        Some("11111111-2222-3333-4444-555555555555".into()),
+        Some(&gid),
+        0,
+    )
+    .expect("a resume must not fail");
+
+    assert!(
+        reg.audit_log(&gid)
+            .iter()
+            .all(|e| e.action != "max-agents-below-minimum" && e.action != "max-agents-below-recommended"),
+        "the resume must not audit a capacity requirement the built-in roster never had — its own \
+         fresh launch stayed silent, and roster_is_custom() must gate the resume the same way"
+    );
+}
+
 // ───────── review verdicts + the enforced consensus gate (#222 / #197) ─────────
 //
 // The pure gate semantics live in tests/workflow.rs. These drive the whole stack:

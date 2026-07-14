@@ -1162,6 +1162,122 @@ pub fn gate_need(gate: &Gate) -> u32 {
     }
 }
 
+/// The agent-capacity a declared workflow structurally needs (#255) — derived
+/// from its roster and its `merge` gate (if any), so the launcher can warn
+/// before a `max_agents` cap starves the workflow it just loaded rather than
+/// discovering it two hours in as an orchestrator that keeps killing live
+/// agents to make room (the #255 incident: a 3-reviewer `all-pass` gate plus a
+/// two-tier worker roster under a cap of 4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CapacityRecommendation {
+    /// What **one review round costs without evicting anything already
+    /// live**: [`reviewers_needed`](Self::reviewers_needed) plus one worker
+    /// slot to have something to review. Below this the orchestrator cannot
+    /// complete a single rework loop without killing a live agent to free a
+    /// slot.
+    pub minimum: u32,
+    /// What running **every declared tier concurrently** costs: every
+    /// distinct worker block, every distinct reviewer block, and one more if
+    /// the workflow declares a planner block. The orchestrator itself is
+    /// exempt from `max_agents` (mcp.rs) and is never counted here.
+    ///
+    /// A workflow with two planner blocks still adds only one slot here — a
+    /// repo declares a *second* planner to give it an alternate persona (a
+    /// different model, a narrower prompt), not to run two plan-first phases
+    /// at once; the orchestrator only ever has one active planning phase, so
+    /// unlike workers/reviewers (genuinely fanned out for parallel lanes) a
+    /// planner count would overstate what concurrency the roster needs. This
+    /// also matches #255's literal spec: "+1 if a planner block exists".
+    pub recommended: u32,
+    /// The gate's reviewer requirement folded into `minimum` — [`gate_need`],
+    /// or every declared reviewer block when the workflow names no `merge`
+    /// gate. Kept as its own field (rather than making a caller subtract the
+    /// worker slot back out of `minimum`, or recount reviewer *blocks*) so
+    /// anything describing *why* `minimum` is what it is reads this instead of
+    /// re-deriving a gate-derived number from the block list — conflating the
+    /// two was exactly the bug rev-1 of #255's review caught in `roster.ts`'s
+    /// warning text.
+    pub reviewers_needed: u32,
+}
+
+/// Derive a [`CapacityRecommendation`] from a workflow's blocks and its
+/// `gates.merge` clause (`None` when the workflow declares none).
+///
+/// Gate-aware, per #255's requirement: a roster with 5 reviewer blocks but
+/// `require: threshold: 2` has a different (lower) minimum than one requiring
+/// `all-pass` over the same 5 — [`gate_need`] is exactly that distinction.
+///
+/// With no gate declared, nothing *enforces* every reviewer block being live
+/// at once — but nothing else tells loomux which subset would be, either, so
+/// `minimum` conservatively falls back to every reviewer block the workflow
+/// names. That is deliberately the erring-flag-not-erring-silent side: this
+/// feature exists because a starved roster surfaced as nothing more than "a
+/// slow run" (#255's incident), so a gateless roster warning at a cap that
+/// merely *might* be enough is the safer of the two wrong answers.
+pub fn recommend_capacity(blocks: &[Block], gate: Option<&Gate>) -> CapacityRecommendation {
+    let workers = blocks.iter().filter(|b| b.kind == Role::Worker).count() as u32;
+    let reviewers = blocks.iter().filter(|b| b.kind == Role::Reviewer).count() as u32;
+    let has_planner = blocks.iter().any(|b| b.kind == Role::Planner);
+
+    let reviewers_needed = gate.map_or(reviewers, gate_need);
+    let worker_slot = u32::from(workers > 0);
+    CapacityRecommendation {
+        minimum: reviewers_needed + worker_slot,
+        recommended: workers + reviewers + u32::from(has_planner),
+        reviewers_needed,
+    }
+}
+
+/// Which declared tiers `recommended` adds beyond `minimum` — i.e. what a cap
+/// sitting at-or-above `minimum` but below `recommended` can never keep live
+/// alongside a review round (#255's soft-warning tier). Each entry is a short
+/// noun phrase (`"the planner"`, `"1 more worker tier"`) meant to be joined
+/// into a sentence, not a standalone description.
+///
+/// Takes the same `reviewers_needed` [`recommend_capacity`] computed, rather
+/// than re-deriving it from `gate`, so this can never disagree with the
+/// `minimum` it is describing the excess over.
+pub fn extra_tiers(blocks: &[Block], reviewers_needed: u32) -> Vec<String> {
+    let workers = blocks.iter().filter(|b| b.kind == Role::Worker).count() as u32;
+    let reviewers = blocks.iter().filter(|b| b.kind == Role::Reviewer).count() as u32;
+    let has_planner = blocks.iter().any(|b| b.kind == Role::Planner);
+
+    let mut out = Vec::new();
+    // `minimum` budgets exactly one worker slot regardless of how many worker
+    // blocks are declared — every worker tier beyond the first is "extra".
+    let extra_workers = workers.saturating_sub(1);
+    if extra_workers > 0 {
+        out.push(format!("{extra_workers} more worker tier{}", if extra_workers > 1 { "s" } else { "" }));
+    }
+    // `minimum` only budgets the gate's requirement — every reviewer block
+    // beyond that (an all-pass gate naming a subset, or extra unnamed ones)
+    // is "extra".
+    let extra_reviewers = reviewers.saturating_sub(reviewers_needed);
+    if extra_reviewers > 0 {
+        out.push(format!("{extra_reviewers} more reviewer{}", if extra_reviewers > 1 { "s" } else { "" }));
+    }
+    if has_planner {
+        out.push("the planner".to_string());
+    }
+    out
+}
+
+/// English-join a short list of noun phrases: `"a"`, `"a and b"`, `"a, b, and
+/// c"`. Used to turn [`extra_tiers`]'s list into one clause of a warning
+/// sentence — pulled out so the audit note and the launcher's message build
+/// the same phrase instead of each hand-rolling their own `.join(...)`.
+pub fn join_with_and(parts: &[String]) -> String {
+    match parts {
+        [] => String::new(),
+        [a] => a.clone(),
+        [a, b] => format!("{a} and {b}"),
+        _ => {
+            let (last, rest) = parts.split_last().expect("non-empty, matched above");
+            format!("{}, and {last}", rest.join(", "))
+        }
+    }
+}
+
 /// **The gate decision** (reviewer half; the `also:` conditions are checked in the
 /// shim, which is the only place that can call `gh pr checks`). Pure, so the
 /// semantics are pinned by fast tests and the shell mirror has something to agree
