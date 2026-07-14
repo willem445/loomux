@@ -1,6 +1,6 @@
 ---
 name: release
-description: Cut a loomux release — version bump across all four files (including Cargo.lock), bump PR, human-gated tag, CI publish, release notes, and npm trusted-publishing verification.
+description: Cut a loomux release — version bump across all five files (including Cargo.lock and package-lock.json), bump PR, human-gated tag, CI publish, release notes, and npm trusted-publishing verification.
 ---
 
 # Cutting a loomux release
@@ -14,21 +14,26 @@ GitHub release, and then publishes the `loomux-desktop` npm launcher.
 commit — re-running a failed job re-runs the old workflow. This bit us in
 v0.7.1: fixing the publish step required moving the tag (see step 5).
 
-## 1. Bump the version — four files, in one PR
+## 1. Bump the version — five files, in one PR
 
-The version lives in **four** places that must stay in lockstep:
+The version lives in **five** places that must stay in lockstep:
 
 | File | Field |
 | --- | --- |
 | `package.json` | `version` |
+| `package-lock.json` | `version` (both top-level and `packages[""].version`) |
 | `src-tauri/tauri.conf.json` | `version` |
 | `src-tauri/Cargo.toml` | `[package] version` |
 | `src-tauri/Cargo.lock` | the `loomux` package entry |
 
-**Cargo.lock is the one that gets missed** (it happened: the 0.5.0 bump PR
-#89 needed follow-up #90). After editing Cargo.toml, run plain `cargo check`
-in `src-tauri/` to regenerate the lock, then `cargo check --locked` to prove
-it's consistent, and commit the lock change.
+**The lockfiles are what get missed** (Cargo.lock: the 0.5.0 bump PR #89
+needed follow-up #90; package-lock.json: the 0.8.0 bump PR #220 needed
+follow-up #224). After editing Cargo.toml, run plain `cargo check` in
+`src-tauri/` to regenerate the lock, then `cargo check --locked` to prove
+it's consistent, and commit the lock change. After editing the root
+`package.json`, run `npm install --package-lock-only` to regenerate
+`package-lock.json` — verify the diff touches only the version fields (no
+dependency churn) before committing it.
 
 `npm/package.json` also carries the version, but the publish job overwrites it
 from the tag (`npm version "${GITHUB_REF_NAME#v}"`) — keep it in lockstep
