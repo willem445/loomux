@@ -37,10 +37,38 @@ A task is done when ALL of these hold:
    feature were broken or regressed — not vacuous assertions written to pass. Exercise
    the behavior the issue asks for, including at least one edge/failure case. Run the
    project's existing test suite and keep it green.
-3. Docs updated: user-facing documentation for user-visible changes, plus a short design
+3. **Red before green — evidence, not assertion.** A test nobody has seen fail is a decoration,
+   and "these tests would catch it" is the easiest sentence in software to write. So watch them
+   fail first: run your new tests against the code *without* your change (check out the base
+   branch, or stash the implementation and keep the tests) and confirm they fail **for the reason
+   you expect** — not on a compile error, which masks behavior rather than testing it. Put the
+   evidence in the **PR description** and your `done` report: the command, the failure line it
+   printed, and the same command passing on your branch. If a new test can't be made to fail,
+   either it isn't testing your change or your change isn't doing anything — find out which
+   before you ship it.
+
+   **What the evidence is owed for — and the exemption.** Every change to *behavior* adds a test,
+   and that test owes the evidence. A change whose intent carries **no new testable behavior** owes
+   something else, and there are exactly four of them:
+   - **docs- or comment-only** (prose, a design note, a README section);
+   - **a revert** to a known-good state;
+   - **a pure rename/move** whose behavior the existing suite already pins;
+   - **a re-blessed golden/snapshot fixture**, where the deliberate change *is* the fixture.
+
+   For those, put **one line in the PR** naming which of the four it is, why no new test exists,
+   and the existing suite green. That line is the evidence: "there was nothing to test" is a claim
+   like any other — stated, it is reviewable; unstated, the PR is **not done**. Anything outside
+   those four evidences the normal way, and a change that *feels* untestable but isn't on the list
+   is a change you haven't found the test for yet.
+4. Docs updated: user-facing documentation for user-visible changes, plus a short design
    note (in the repo's docs convention) for non-obvious architecture decisions.
-4. Code matches the repo's existing style and conventions.
-5. PR is open, issue linked, and you have `report`ed `done` with the PR URL.
+5. Code matches the repo's existing style, conventions, and **stated constraints**. Read the
+   contributor docs (`CLAUDE.md` / `AGENTS.md` / `CONTRIBUTING.md`) and the design notes before
+   you add a **dependency**, change a **public contract** (a command signature, a wire shape, a
+   file format, a persisted schema), duplicate a mechanism the repo already has, or reach across
+   a module boundary. Each of those needs its argument *in the PR* — and a contract change needs
+   a design note — because that is the bar the orchestrator sends work back on, plan or PR.
+6. PR is open, issue linked, and you have `report`ed `done` with the PR URL.
 
 ## Review findings
 
