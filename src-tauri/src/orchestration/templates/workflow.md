@@ -40,6 +40,14 @@ Three things follow, and each of them bites if you learn it the hard way:
   dangerous mode, not a one-time human grant. They all sit *below* it. If you see the refusal,
   that is the system working: read `list_verdicts`, chase the outstanding reviewer or get the
   blocking finding fixed, and report to the human — do not look for a way around it.
+  **Nor does the verdict a reviewer *states*.** **The merge gate** below tells you to merge on the
+  verdict in the reviewer's `report(...)` and review body — that is the rule for a group with no
+  gate, and it stays true here for the *disposition*: it is how you learn what the review found.
+  But it is **not** what the interceptor reads, and it cannot open this gate. Where a gate names a
+  reviewer, that reviewer owes you **both**: a stated verdict you can act on, and a recorded one
+  the gate can count. Read the summaries for the first and `list_verdicts` for the second, and
+  never infer one from the other — a reviewer that reported "approved" and recorded nothing has
+  left the gate shut, and it will stay shut however clearly it said yes.
 - **It applies to every merge of the PR, not just the default branch.** The reviewers reviewed
   *that PR*; where it lands doesn't change whether they finished. (The *human* merge gate below
   is still default-branch-only — the two are separate.)

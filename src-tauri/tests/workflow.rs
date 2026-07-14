@@ -1191,6 +1191,27 @@ fn every_reviewer_hears_the_findings_duty_however_its_persona_was_written() {
     // write its own reviewer for. Both surfaces must name the refusal, the `--comment` fallback,
     // where the binding record lives, and the no-decay rule; drop any of the four on either
     // surface and that reviewer is back to improvising at exactly the moment it has to say "no".
+    //
+    // These pins match the WHOLE document (`flat(doc)`), with no `section()` scoping — which is
+    // the thing `section()` exists to stop, so here is why it is safe *on these two surfaces
+    // specifically*, and why you must not copy the pattern (rev-29 F3):
+    //
+    // Document-wide matching goes bad when a rule appears TWICE by design — once as a slogan
+    // (a digest) and once as its procedure — because then deleting the procedure leaves the pin
+    // green, rescued by the slogan. Neither surface here has a digest: `reviewer.md` is a flat
+    // ~76-line procedure, and `mechanics_core` is a single generated string. Each rule occurs
+    // exactly once, so the region and the document ARE the same thing, and scoping would be a
+    // no-op that only invites a stale section marker.
+    //
+    // What makes that checkable rather than merely believed is `pinned()`'s exactly-once
+    // assertion: if either surface ever grows a second occurrence of an anchor — a digest, a
+    // summary, a quoted example — the pin does not silently stop pinning, it goes LOUDLY RED and
+    // says so. The uniqueness check is the guard; the absence of a digest is only why it passes.
+    //
+    // So: do NOT lift this loop onto `orchestrator.md`. That document opens with an INVARIANTS
+    // digest, which is precisely the second occurrence — a document-wide match there is satisfied
+    // by the digest alone and its body procedure can be gutted in silence. Its pins are
+    // `section()`-scoped for that reason, and they must stay that way.
     for (surface, doc) in [("mechanics_core(Reviewer)", &core), ("reviewer.md", &builtin)] {
         let low = flat(doc);
         for (anchor, why) in [
@@ -2522,6 +2543,38 @@ fn the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was() {
             !written.contains("declares a workflow") && !written.contains("## Your block"),
             "{file} leaked workflow prose into a group that has no workflow"
         );
+    }
+}
+
+#[test]
+fn the_default_rendering_never_names_the_gate_machinery(
+) {
+    // rev-29 F1, named. The byte-golden above already fails when gate vocabulary reaches a
+    // default group — but it fails as "re-bless me", which is the one red this design calls
+    // the red that teaches people to bless a diff without reading it. So the RULE gets its own
+    // test, which fails by saying what you did.
+    //
+    // The leak it catches is the mild form of the species this whole arc keeps killing: prose
+    // naming a mechanism the reader does not have. `review_verdict`, `list_verdicts` and the
+    // merge gate are the ADVANCED orchestrator's; a default group has no workflow file, no gate
+    // and no verdict tool, so an orchestrator told to "read `list_verdicts`" is being sent after
+    // something that does not exist for it. Conditional framing ("where a workflow declares a
+    // gate…") does not save it — that is an invitation to go looking, and the fragment behind
+    // `{{WORKFLOW}}` exists precisely so gate-only readers are the only ones who ever see it.
+    let (reg, _d) = test_registry();
+    let repo = Repo::new().workflow(FOCUSED_REVIEW); // declared, and ignored: the toggle is off
+    let g = reg.create_group(&repo.path(), plain_rails()).unwrap();
+
+    for (file, _) in PRE222 {
+        let text = instructions_lf(&reg, &g.id, file);
+        for token in ["review_verdict", "list_verdicts", "gates.merge", "workflow.yml"] {
+            assert!(
+                !text.contains(token),
+                "{file} names `{token}` in the DEFAULT rendering — a group with no workflow file \
+                 has no gate and no verdict tool, so this sends it after a mechanism it does not \
+                 have. Gate vocabulary belongs in templates/workflow.md, behind {{{{WORKFLOW}}}}."
+            );
+        }
     }
 }
 
