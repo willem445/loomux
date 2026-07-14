@@ -2807,6 +2807,213 @@ fn spawn_agent_mcp_accepts_planner_kind() {
     assert!(planner, "spawned planner must appear on the roster");
 }
 
+// ───────── #254: a block-less resume must inherit its identity, not guess it ─────────
+//
+// Root cause was three individually-reasonable defaults composing into a silent
+// role change: mcp.rs defaulted an absent `kind` to worker, mod.rs's `block_for`
+// then picked the *default* block for that (wrong) role, and `block_for` itself
+// picks the first block of a kind in file order. Together: resume a reviewer
+// with no `block` and it comes back a worker running `worker-deep` — wrong
+// model, wrong persona, and (since `review_verdict` is reviewer-only) unable to
+// ever record its verdict, with no error anywhere.
+
+#[test]
+fn resume_of_reviewer_session_inherits_reviewer_block_not_default_worker() {
+    let (reg, _d) = test_registry();
+    let repo = tempfile::tempdir().unwrap(); // a real cwd — the resume path checks it exists
+    let g = reg.create_group(&repo.path().to_string_lossy(), rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let co = reg.resolve_token(&orch.token).unwrap();
+
+    // A reviewer is spawned and then killed (mirrors the real incident: the
+    // orchestrator killed a live reviewer pane and now wants it back).
+    let spawn = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "spawn_agent", "arguments": { "kind": "reviewer", "task": "review PR #7" } }))
+        .unwrap();
+    assert_eq!(spawn["isError"], false, "{spawn:?}");
+    let before = reg.list_agents(&co.group);
+    let rev = before.as_array().unwrap().iter().find(|a| a["role"] == "reviewer").unwrap();
+    let (rev_id, session, cwd, block) = (
+        rev["id"].as_str().unwrap().to_string(),
+        rev["session"].as_str().unwrap().to_string(),
+        rev["cwd"].as_str().unwrap().to_string(),
+        rev["block"].as_str().unwrap().to_string(),
+    );
+    reg.mark_dead(&rev_id, Some(0));
+
+    // The orchestrator resumes it exactly as the tool description instructs
+    // for a follow-up: resume_session + cwd, NEITHER kind NOR block.
+    let resumed = dispatch(&reg, &co, "tools/call", &json!({
+        "name": "spawn_agent",
+        "arguments": { "resume_session": session, "cwd": cwd, "task": "round-2 fix pushed" },
+    })).unwrap();
+    assert_eq!(resumed["isError"], false, "block-less resume must succeed: {resumed:?}");
+    let text = resumed["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("Reviewer"), "resumed agent must stay a REVIEWER, got: {text}");
+    assert!(
+        text.contains(&format!("block {block}")),
+        "resumed agent must keep its ORIGINAL block {block:?}, got: {text}"
+    );
+
+    // The proof that matters: the resumed agent can still record a verdict —
+    // a bare-defaulted worker would be structurally denied this tool.
+    let cr = reg.resolve_token(
+        &reg.list_agents(&co.group)
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["session"] == json!(session) && a["status"] != json!("dead"))
+            .and_then(|a| reg.agent(a["id"].as_str().unwrap()))
+            .unwrap()
+            .token,
+    ).unwrap();
+    let verdict = dispatch(&reg, &cr, "tools/call", &json!({
+        "name": "review_verdict",
+        "arguments": { "pr": "#7", "verdict": "pass", "summary": "looks good" },
+    })).unwrap();
+    assert_eq!(verdict["isError"], false, "resumed reviewer must still be able to record a verdict: {verdict:?}");
+}
+
+#[test]
+fn resume_with_an_empty_string_block_still_inherits_instead_of_defaulting() {
+    // Round-1 review finding (B1): `arg_str` returns `Some("")` for an
+    // explicit `"block": ""`, which must be indistinguishable from an
+    // omitted `block` — otherwise `{"resume_session": .., "block": ""}`
+    // (kind absent) slips past the `block.is_none()` inheritance guard, and
+    // mod.rs's own block resolution then trims/discards the empty id and
+    // falls back to `block_for(Worker)`: the #254 bug verbatim.
+    let (reg, _d) = test_registry();
+    let repo = tempfile::tempdir().unwrap();
+    let g = reg.create_group(&repo.path().to_string_lossy(), rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let co = reg.resolve_token(&orch.token).unwrap();
+
+    let spawn = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "spawn_agent", "arguments": { "kind": "reviewer", "task": "review PR #7" } }))
+        .unwrap();
+    assert_eq!(spawn["isError"], false, "{spawn:?}");
+    let before = reg.list_agents(&co.group);
+    let rev = before.as_array().unwrap().iter().find(|a| a["role"] == "reviewer").unwrap();
+    let (rev_id, session, cwd, block) = (
+        rev["id"].as_str().unwrap().to_string(),
+        rev["session"].as_str().unwrap().to_string(),
+        rev["cwd"].as_str().unwrap().to_string(),
+        rev["block"].as_str().unwrap().to_string(),
+    );
+    reg.mark_dead(&rev_id, Some(0));
+
+    // Same resume as the bare case, but with an explicit empty-string block.
+    let resumed = dispatch(&reg, &co, "tools/call", &json!({
+        "name": "spawn_agent",
+        "arguments": { "resume_session": session, "cwd": cwd, "task": "round-2", "block": "" },
+    })).unwrap();
+    assert_eq!(resumed["isError"], false, "{resumed:?}");
+    let text = resumed["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("Reviewer"), "empty-string block must not defeat inheritance, got: {text}");
+    assert!(
+        text.contains(&format!("block {block}")),
+        "must keep its ORIGINAL block {block:?}, got: {text}"
+    );
+}
+
+#[test]
+fn resume_of_unknown_session_with_no_block_or_kind_hard_errors() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let co = reg.resolve_token(&orch.token).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+
+    let r = dispatch(&reg, &co, "tools/call", &json!({
+        "name": "spawn_agent",
+        "arguments": {
+            "resume_session": "00000000-0000-4000-8000-000000000000",
+            "cwd": dir.path().to_string_lossy(),
+            "task": "follow-up",
+        },
+    })).unwrap();
+    assert_eq!(r["isError"], true, "an unrecorded session with no block must never silently default: {r:?}");
+    let text = r["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("unknown session"), "error must name the problem, got: {text}");
+
+    // And no agent must have been spawned as a side effect of the failed call.
+    let agents = reg.list_agents(&co.group);
+    assert!(
+        agents.as_array().unwrap().iter().all(|a| a["role"] != "worker"),
+        "a failed resume must not have spawned a default worker: {agents}"
+    );
+}
+
+#[test]
+fn resume_of_worker_session_keeps_its_original_block_not_the_roster_default() {
+    // A custom workflow with TWO worker blocks, `worker-deep` declared first —
+    // `block_for(Worker)` (mod.rs) picks the first block of a kind in file
+    // order, so this is the exact trap the issue names: a naive fix that
+    // re-derives "the worker default" for a bare resume would silently
+    // relabel a `worker-fast` session as `worker-deep`.
+    let td = tempfile::tempdir().unwrap();
+    let loomux = td.path().join(".loomux");
+    fs::create_dir_all(&loomux).unwrap();
+    fs::write(
+        loomux.join("workflow.yml"),
+        "version: 1\nname: multi-worker\nblocks:\n\
+         \x20 - id: worker-deep\n    kind: worker\n\
+         \x20 - id: worker-fast\n    kind: worker\n",
+    )
+    .unwrap();
+
+    let (reg, _d) = test_registry();
+    let g = reg
+        .create_group(
+            &td.path().to_string_lossy(),
+            Guardrails { advanced_orchestrator: true, ..rails() },
+        )
+        .unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let co = reg.resolve_token(&orch.token).unwrap();
+
+    // Confirm the trap is live: the roster's file-order default really is
+    // worker-deep, not worker-fast.
+    assert_eq!(
+        reg.group(&g.id).unwrap().guardrails.block_for(Role::Worker).unwrap().id,
+        "worker-deep",
+        "test setup must reproduce the file-order default the issue names"
+    );
+
+    // Spawn explicitly under the SECOND block, worker-fast, then kill it.
+    let spawn = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "spawn_agent", "arguments": { "block": "worker-fast", "task": "fix #9" } }))
+        .unwrap();
+    assert_eq!(spawn["isError"], false, "{spawn:?}");
+    let before = reg.list_agents(&co.group);
+    let w = before.as_array().unwrap().iter().find(|a| a["block"] == "worker-fast").unwrap();
+    let (wid, session, cwd) = (
+        w["id"].as_str().unwrap().to_string(),
+        w["session"].as_str().unwrap().to_string(),
+        w["cwd"].as_str().unwrap().to_string(),
+    );
+    reg.mark_dead(&wid, Some(0));
+
+    // A block-less, kind-less resume must keep worker-fast — NOT fall back to
+    // the roster's file-order default, worker-deep.
+    let resumed = dispatch(&reg, &co, "tools/call", &json!({
+        "name": "spawn_agent",
+        "arguments": { "resume_session": session, "cwd": cwd, "task": "follow-up" },
+    })).unwrap();
+    assert_eq!(resumed["isError"], false, "{resumed:?}");
+    let after = reg.list_agents(&co.group);
+    let resumed_agent = after
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["session"] == json!(session) && a["status"] != json!("dead"))
+        .unwrap();
+    assert_eq!(
+        resumed_agent["block"], "worker-fast",
+        "resume must keep the ORIGINAL block, not the roster's file-order default: {after}"
+    );
+}
+
 #[test]
 fn cross_group_targets_are_invisible() {
     let (reg, _d, co, _cw) = setup_mcp();
