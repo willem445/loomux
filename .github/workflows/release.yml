@@ -109,8 +109,12 @@ jobs:
           # (EPUBLISHCONFLICT), which still happens post-#221 on a
           # Re-run-all-jobs, or a mispointed run whose builds complete
           # before it's cancelled. Skip instead of failing a good run red.
-          if npm view "loomux-desktop@$VERSION" version >/dev/null 2>&1; then
-            echo "loomux-desktop@$VERSION already published — nothing to do"
+          # PKG is read from package.json (not hardcoded) so a future
+          # rename/scoping can't have this guard silently querying the
+          # old name and no-op'ing a real publish.
+          PKG=$(node -p "require('./package.json').name")
+          if npm view "$PKG@$VERSION" version >/dev/null 2>&1; then
+            echo "$PKG@$VERSION already published — nothing to do"
             exit 0
           fi
           npm publish --access public
