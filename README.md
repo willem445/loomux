@@ -68,51 +68,6 @@ no global mode:
 | **File editor** | The file tree + code editor above, as a **pane** rather than an overlay, rooted at a folder you pick. |
 | **Git** | The git view — graph, status, diffs, staging, worktree switching — as a **pane**, over a repo you pick. |
 
-The last three are **content panes**: a pane that *is* a surface rather than a
-process. They spawn nothing, split/dock/drag/maximize like any other pane, come
-back at the same root on session restore, and — because they are viewers, not
-agents — never count toward a tab's agent badge.
-
-A **file editor** pane and a **git** pane are the `Alt+F` and `Alt+G` overlays
-promoted to first-class panes: park the editor beside your agent instead of
-toggling it in and out, or keep a git graph open in a split while the agent works.
-The overlays are still there for a quick look inside a terminal pane; the panes are
-for when you want the surface *to stay*. The `Alt+G` overlay is untouched; the `Alt+F`
-one gains the same unsaved-edits protection the pane has, which it always should have
-had. Because an editor holds real unsaved buffers, **nothing throws them away without
-asking**: closing the pane (header ✕, dock chip, or `Ctrl+Shift+W`), closing its **tab**,
-re-rooting the editor elsewhere, and **quitting loomux** all ask first — and a pane whose
-process dies (or whose orchestration group ends) *keeps* its unsaved buffer instead of
-taking it to the grave. See the [design note](doc/design/content-panes.md).
-
-From a **file explorer** pane, right-click a file → **Open in file editor pane**
-opens an editor pane beside it, rooted where the browser is rooted, with that file
-open. (Right-clicking a *folder* offers **Open folder in editor pane**, rooted at
-that folder.) The browser stays exactly where it was.
-
-A **file explorer** pane is loomux's Windows-Explorer equivalent: browse folders
-(breadcrumb, Up, double-click to descend), and **double-click a file to open it in
-whatever application your OS associates with that extension** — a `.png` opens in
-your image viewer, a `.pdf` in your PDF reader. Loomux does not open it. You also
-get **new file**, **new folder**, **rename** (`F2`) and **delete** (`Del`; to the
-**Recycle Bin** on Windows, and off the UI thread — a huge folder doesn't freeze the
-window while it goes), a **right-click menu** (open with…, reveal in your OS file
-manager, hash), a short **SHA-256** per file computed off-thread, and a fast **Go to
-file** name search that jumps anywhere under the root. It splits, docks, maximizes and restores like any other pane, and comes back
-at the same folder on session restore — but it is *not* an agent, so it never
-counts toward a tab's agent badge. See the [design note](doc/design/files-pane.md).
-
-This is deliberately **not** the in-app editor: that is the `Alt+F` overlay above,
-unchanged, and it remains the right tool for a quick look or a one-line fix. The
-explorer is the one for "get this file into the app that owns it".
-
-The **Go to file** box matches file *names*, never contents. The backend
-enumerates the root's paths once, off-thread; every keystroke then filters that
-cached list in memory, so typing costs zero I/O. Matching is substring with
-space-separated terms AND-ed across the path (`pane rest` → `src/panerestore.ts`);
-`↑`/`↓` pick, `Enter` opens it in its default app, `Esc` clears. (The same box is
-also in the `Alt+F` editor, where `Enter` opens the file *in the editor* instead.)
-
 ![sample](sample.jpg)
 
 ## Install
