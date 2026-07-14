@@ -67,20 +67,49 @@ jobs:
             - **Linux**: `*.AppImage` (portable), `*.deb`, or `*.rpm`
 
             Or use the one-liner installers in the README.
-          releaseDraft: false
+          # Draft, not public: build is a matrix (4 legs uploading assets
+          # separately) and any leg can fail after others have already
+          # uploaded. A non-draft release is visible as `latest` the moment
+          # it's created, so a partial-failure run would leave a public
+          # release missing assets that install.sh/install.ps1 resolve and
+          # 404 on. `promote` (below) is the only step allowed to flip this
+          # public, and only after every leg has succeeded (#275).
+          releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}
 
+  # Flips the draft release from `build` to public — the only place `latest`
+  # is allowed to start resolving to this release. Runs only if every build
+  # matrix leg succeeded (`needs: build` + fail-fast:false means a single
+  # failed leg fails the `build` job and skips this one, leaving the release
+  # stuck in draft rather than public-and-incomplete) (#275).
+  promote:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Publish the draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # $GITHUB_REF_NAME/$GITHUB_REPOSITORY (default env vars), not
+        # ${{ }} template substitution, so a crafted tag name can't inject
+        # into the shell command — same convention as VERSION below.
+        run: gh release edit "$GITHUB_REF_NAME" --draft=false --repo "$GITHUB_REPOSITORY"
+
   # Publish the tiny npm launcher (`npx loomux-desktop`). It just downloads
-  # the release asset built above, but must wait for `build` to finish and
-  # upload the installers first — otherwise it can publish a launcher that
-  # points at assets that never appear, or (if `build` is cancelled/retried)
-  # collide with a later publish of the same version (#221).
+  # the release asset built above, but must wait for `promote` (not just
+  # `build`) — GitHub does not serve assets off a draft release to anonymous
+  # downloads, so a launcher published while the release is still a draft
+  # would 404 for every user until someone flips it public by hand (#275).
+  # Waiting on `promote` also transitively waits on `build` (#221): a launcher
+  # can't publish pointing at assets that never appear, or collide with a
+  # later publish of the same version on a cancelled/retried run.
   # Auth is npm "trusted publishing" (OIDC): the job mints an id-token that
   # npm exchanges for publish rights — no NPM_TOKEN secret involved. Requires
   # npm >= 11.5.1 (Node 22 bundles an older one, hence the upgrade step).
   publish-npm:
-    needs: build
+    needs: promote
     runs-on: ubuntu-latest
     permissions:
       id-token: write
@@ -92,13 +121,14 @@ jobs:
           node-version: 22
           registry-url: https://registry.npmjs.org
       - name: Upgrade npm for trusted publishing
-        # ^11, not @latest: needs >= 11.5.1 for OIDC trusted publishing, and
         # npm 12.0.0 shipped without its sigstore bundle, breaking provenance
         # publish with MODULE_NOT_FOUND (v0.7.1 failed twice; upstream
-        # npm/cli#9722). The range tracks 11.x patches automatically while
-        # skipping the broken 12 line. Move to ^12/@latest via #186 once the
-        # upstream fix is verified.
-        run: npm install -g npm@^11 && npm --version
+        # npm/cli#9722). Fixed by npm/cli#9740, released in npm 12.0.1
+        # (2026-07-10) — verified by extracting npm-12.0.1.tgz from the
+        # registry and confirming node_modules/sigstore is bundled again.
+        # ^12.0.1 (not @latest) pins past the broken 12.0.0 specifically
+        # while still tracking future 12.x patches (#186).
+        run: npm install -g npm@^12.0.1 && npm --version
       - name: Publish launcher to npm
         working-directory: npm
         run: |
