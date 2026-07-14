@@ -32,6 +32,7 @@ import {
   serializeWorkflow,
   serializeWorkflowPreserving,
   formatWorkflowText,
+  isUnreadable,
   scaffoldWorkflowText,
   removeBlockAt,
   newBlock,
@@ -817,9 +818,14 @@ export class WorkflowView {
 
   /** True while the text cannot be read at all. The form is disabled here — see the note
    *  at the top of the file: serializing a half-understood model back over the buffer
-   *  would destroy the broken text the human is trying to fix. */
+   *  would destroy the broken text the human is trying to fix.
+   *
+   *  `isUnreadable` (workflowmodel.ts) is the same predicate `serializeWorkflowPreserving`
+   *  gates its own fallback on (#233 B3) — the two must agree, or a file this view still lets
+   *  the human edit (e.g. `version: 2`, unsupported but readable) would silently full-rewrite
+   *  on its very first edit for a reason never shown here. */
   private syntaxBroken(): boolean {
-    return this.analysis.findings.some((f) => f.code === "yaml-syntax" || f.code === "not-a-mapping");
+    return isUnreadable(this.analysis.findings);
   }
 
   private updateDirty(): void {

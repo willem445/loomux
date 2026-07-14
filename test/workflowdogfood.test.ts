@@ -26,15 +26,14 @@ import {
 } from "../src/workflowmodel.ts";
 import { rewriteImpact, rewriteImpactMessage } from "../src/workflowpane.ts";
 
-// Normalized to `\n` because a Windows checkout of this repo may have CRLF line endings
-// (`core.autocrlf`) — a checkout artifact, not something either serializer is responsible
-// for preserving. Both serializers always emit `\n` (see `serializeWorkflow`'s own `.join`),
-// so comparing against the CRLF bytes on disk would fail for a reason that has nothing to do
-// with this file.
-const text = readFileSync(new URL("../.loomux/workflow.yml", import.meta.url), "utf8").replace(
-  /\r\n/g,
-  "\n"
-);
+// The RAW bytes, whatever line ending this checkout actually has — a Windows checkout may have
+// CRLF (`core.autocrlf`). `serializeWorkflowPreserving` keeps the original's own line ending
+// (#233 non-blocking #3), so testing byte-for-byte against THIS is the honest claim regardless
+// of what platform the suite runs on. `serializeWorkflow` (the fully canonical rewrite Format
+// uses) always emits `\n` — no original text to take a convention from — so tests that compare
+// against ITS output use `lfText` instead.
+const text = readFileSync(new URL("../.loomux/workflow.yml", import.meta.url), "utf8");
+const lfText = text.replace(/\r\n/g, "\n");
 
 test("the repo's own workflow opens in the pane with no findings", () => {
   const { workflow, findings: syntax } = parseWorkflow(text);
@@ -118,7 +117,7 @@ test("a canonical save preserves the workflow's MEANING, exactly", () => {
   // What serialization actually guarantees, and all it guarantees: the workflow that comes back
   // is the workflow that went in — every block, persona, edge and gate — and the canonical form
   // is stable, so saving twice is a no-op.
-  const { workflow } = parseWorkflow(text);
+  const { workflow } = parseWorkflow(lfText);
   const saved = serializeWorkflow(workflow);
   const reread = parseWorkflow(saved);
 
@@ -134,15 +133,15 @@ test("the EXPLICIT Format action still rewrites this file wholesale — and stil
   // convention), so asking for the fully canonical form still costs something, and the pane
   // still says so before it happens (`rewriteImpact`, used from the Format action since #233 —
   // see `workflowview.ts`'s `confirmFormatRewrite`).
-  const { workflow } = parseWorkflow(text);
+  const { workflow } = parseWorkflow(lfText);
   const canonical = serializeWorkflow(workflow);
 
-  assert.notEqual(canonical, text, "the shipped file is NOT in canonical form — it has comments");
+  assert.notEqual(canonical, lfText, "the shipped file is NOT in canonical form — it has comments");
 
-  const commentsOnDisk = text.split(/\r?\n/).filter((l) => /^\s*#/.test(l)).length;
+  const commentsOnDisk = lfText.split(/\r?\n/).filter((l) => /^\s*#/.test(l)).length;
   assert.ok(commentsOnDisk > 20, `the file's comments are load-bearing (${commentsOnDisk} lines)`);
 
-  const impact = rewriteImpact(text, canonical, (t) => formatWorkflowText(t) === t);
+  const impact = rewriteImpact(lfText, canonical, (t) => formatWorkflowText(t) === t);
   assert.ok(impact, "an explicit Format over this file must raise a warning");
   assert.ok(impact.reformats, "…it is a whole-file rewrite");
   assert.ok(
