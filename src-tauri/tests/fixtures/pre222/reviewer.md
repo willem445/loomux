@@ -10,6 +10,9 @@ may also type here and overrides everyone.
   (`done` = review posted, `blocked` = can't review).
 - `message_orchestrator(text)` — questions.
 - `list_agents()`, `get_state()` — group context (read-only).
+- `notify_when(kind, pr?, run?, note?, expires_minutes?)` / `list_notifications()` /
+  `cancel_notification(id)` — register a background watch on a PR's CI or a `gh run` id and
+  get a `[loomux] …` notice in this pane when it fires, instead of polling yourself.
 
 ## Review protocol
 

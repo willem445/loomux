@@ -7,6 +7,7 @@
 //! applies to integration-test targets.
 
 use loomux_lib::orchestration::mcp::dispatch;
+use loomux_lib::orchestration::notify;
 use loomux_lib::orchestration::workflow;
 use loomux_lib::orchestration::{
     add_trusted_folder, autonomy_budget_exhausted, bracketed_paste, classify_human_input,
@@ -3655,12 +3656,12 @@ fn watchdog_flags_a_silent_worker_once_per_stall() {
     let (reg, _d, gid, wid) = watchdog_setup(5);
     let no_output = HashMap::new();
     // Long past the stall window with no output and no report → one notice.
-    assert_eq!(reg.watchdog_tick(FAR, &no_output), vec![wid.clone()],
+    assert_eq!(reg.watchdog_tick(FAR, &no_output, &HashSet::new()), vec![wid.clone()],
         "a silent working agent must be flagged");
     let log = fs::read_to_string(reg.state_root().join(&gid).join("audit.jsonl")).unwrap();
     assert!(log.contains("watchdog-stall"), "the stall must be audited, got: {log}");
     // Anti-nag: still silent, but already notified for this same stall.
-    assert!(reg.watchdog_tick(FAR + 60_000, &no_output).is_empty(),
+    assert!(reg.watchdog_tick(FAR + 60_000, &no_output, &HashSet::new()).is_empty(),
         "must not nag twice for one uninterrupted stall");
 }
 
@@ -3668,14 +3669,14 @@ fn watchdog_flags_a_silent_worker_once_per_stall() {
 fn watchdog_stall_resets_when_the_agent_produces_output() {
     let (reg, _d, _gid, wid) = watchdog_setup(5);
     let empty = HashMap::new();
-    assert_eq!(reg.watchdog_tick(FAR, &empty), vec![wid.clone()]);
+    assert_eq!(reg.watchdog_tick(FAR, &empty, &HashSet::new()), vec![wid.clone()]);
     // The CLI emits output: a grown pty counter is activity — clock and latch
     // both reset, and this very tick must not also flag a stall.
     let grew: HashMap<String, u64> = [(wid.clone(), 1024u64)].into_iter().collect();
-    assert!(reg.watchdog_tick(FAR, &grew).is_empty(), "output growth is activity, not a stall");
+    assert!(reg.watchdog_tick(FAR, &grew, &HashSet::new()).is_empty(), "output growth is activity, not a stall");
     // No further growth; a whole fresh window elapses → a brand-new notice.
     let later = FAR + 5 * 60_000 + 1;
-    assert_eq!(reg.watchdog_tick(later, &grew), vec![wid.clone()],
+    assert_eq!(reg.watchdog_tick(later, &grew, &HashSet::new()), vec![wid.clone()],
         "a new stall after activity earns a new notice");
 }
 
@@ -3683,7 +3684,7 @@ fn watchdog_stall_resets_when_the_agent_produces_output() {
 fn watchdog_ignores_idle_dead_and_disabled_agents() {
     // A 0 stall window disables the watchdog for the whole group.
     let (off, _d0, _g0, _w0) = watchdog_setup(0);
-    assert!(off.watchdog_tick(FAR, &HashMap::new()).is_empty(),
+    assert!(off.watchdog_tick(FAR, &HashMap::new(), &HashSet::new()).is_empty(),
         "stall window 0 disables the watchdog");
     // With the guardrail on, idle and dead agents are still out of scope: idle
     // is the reaper's concern, and a dead/reaped pane must never be nudged.
@@ -3693,7 +3694,7 @@ fn watchdog_ignores_idle_dead_and_disabled_agents() {
     reg.spawn_agent(&g.id, Role::Worker, "idle", "", false, None).unwrap();
     let dead = reg.spawn_agent(&g.id, Role::Worker, "dead", "work", false, None).unwrap();
     reg.mark_dead(&dead.id, Some(1));
-    let flagged = reg.watchdog_tick(FAR, &HashMap::new());
+    let flagged = reg.watchdog_tick(FAR, &HashMap::new(), &HashSet::new());
     assert!(flagged.is_empty(),
         "neither an idle nor a dead agent may be watchdog-flagged, got: {flagged:?}");
 }
@@ -3702,13 +3703,13 @@ fn watchdog_ignores_idle_dead_and_disabled_agents() {
 fn watchdog_stays_quiet_for_a_paused_group() {
     let (reg, _d, gid, wid) = watchdog_setup(5);
     reg.pause_group(&gid).unwrap();
-    assert!(reg.watchdog_tick(FAR, &HashMap::new()).is_empty(),
+    assert!(reg.watchdog_tick(FAR, &HashMap::new(), &HashSet::new()).is_empty(),
         "a paused group's agents idle out on purpose — no watchdog notices");
     // Crucially, the one-notice budget must be intact: pausing must not have
     // burned the latch, so on resume the outstanding stall still earns its
     // first notice.
     reg.resume_group(&gid).unwrap();
-    assert_eq!(reg.watchdog_tick(FAR, &HashMap::new()), vec![wid.clone()],
+    assert_eq!(reg.watchdog_tick(FAR, &HashMap::new(), &HashSet::new()), vec![wid.clone()],
         "resuming an unattended stall must still earn its first notice");
 }
 
@@ -3720,18 +3721,18 @@ fn watchdog_stall_resets_when_the_agent_reports_or_messages() {
     let w = reg.spawn_agent(&g.id, Role::Worker, "w", "work", false, None).unwrap();
     let cw = reg.resolve_token(&w.token).unwrap();
     // Stalled and flagged (anti-nag latch now set).
-    assert_eq!(reg.watchdog_tick(FAR, &HashMap::new()), vec![w.id.clone()]);
+    assert_eq!(reg.watchdog_tick(FAR, &HashMap::new(), &HashSet::new()), vec![w.id.clone()]);
     // A progress report is a sign of life: it clears the latch (via re-idle
     // bookkeeping), so a later silence re-notifies. If the latch had NOT been
     // cleared this tick would be empty — that's the discriminator.
     let _ = dispatch(&reg, &cw, "tools/call",
         &json!({ "name": "report", "arguments": { "status": "progress", "summary": "still going" } }));
-    assert_eq!(reg.watchdog_tick(FAR + 60_000, &HashMap::new()), vec![w.id.clone()],
+    assert_eq!(reg.watchdog_tick(FAR + 60_000, &HashMap::new(), &HashSet::new()), vec![w.id.clone()],
         "a report must reset the stall, then a later silence re-notifies");
     // A free-form message likewise counts as activity and clears the latch.
     let _ = dispatch(&reg, &cw, "tools/call",
         &json!({ "name": "message_orchestrator", "arguments": { "text": "checking in" } }));
-    assert_eq!(reg.watchdog_tick(FAR + 120_000, &HashMap::new()), vec![w.id.clone()],
+    assert_eq!(reg.watchdog_tick(FAR + 120_000, &HashMap::new(), &HashSet::new()), vec![w.id.clone()],
         "a message must also reset the stall, then a later silence re-notifies");
 }
 
@@ -8236,4 +8237,712 @@ fn a_group_with_no_workflow_gate_merges_exactly_as_it_did_before() {
     // An integration-branch merge is still ungated by the human gate, as always.
     assert!(merge_with(&shim, &group_dir, "feat/x", HEAD, "0").0,
         "and a non-default merge still passes straight through");
+}
+
+// ---------- notification backend (#243) ----------
+//
+// No test here shells out to `gh`: `notify_tick(now, &results)` is the seam
+// (the `watchdog_tick` shape), so every test drives it with a synthetic
+// `PollResult` map. Pure predicate/notice-sanitation coverage (the "no
+// checks reported" → Pending regression, the SUCCESS/FAILURE/IN_PROGRESS
+// table, the forged-prefix/newline sanitation) lives inline in
+// `orchestration/notify.rs`'s own `#[cfg(test)]` module — those are pure
+// functions with no registry/Tauri dependency, exactly the `gh.rs` precedent
+// for keeping pure-fn tests out of this integration file.
+
+/// Call `notify_when` through the real MCP dispatch and return the tool's
+/// text (Ok on success, Err on a rejection) — mirrors how an agent actually
+/// reaches this tool, so authz/validation are exercised for real.
+fn register_notify(reg: &OrchRegistry, c: &Caller, args: Value) -> Result<String, String> {
+    let r = dispatch(reg, c, "tools/call", &json!({ "name": "notify_when", "arguments": args })).unwrap();
+    let text = r["content"][0]["text"].as_str().unwrap().to_string();
+    if r["isError"] == true { Err(text) } else { Ok(text) }
+}
+
+/// Pull the watch id (`n-3`) out of `notify_when`'s confirmation text
+/// (`"registered n-3 (PR #241 checks), polled every 30s, …"`).
+fn extract_watch_id(text: &str) -> String {
+    text.split_whitespace().nth(1).unwrap().to_string()
+}
+
+#[test]
+fn notify_register_tick_fires_once_and_delists() {
+    let (reg, _d, _co, cw) = setup_mcp();
+    let text =
+        register_notify(&reg, &cw, json!({ "kind": "pr_checks", "pr": "241", "note": "merge if green" })).unwrap();
+    let id = extract_watch_id(&text);
+
+    let mut results = HashMap::new();
+    results.insert(id.clone(), notify::PollResult::Met { summary: "SUCCESS — all 6 checks passed".into() });
+    assert_eq!(reg.notify_tick(now_ms(), &results), vec![id.clone()], "a Met result must fire exactly once");
+
+    let listed = reg.list_notifications(&cw.agent_id).to_string();
+    assert!(!listed.contains(&id), "a fired watch must be delisted, got: {listed}");
+
+    let log = fs::read_to_string(reg.state_root().join(&cw.group).join("audit.jsonl")).unwrap();
+    assert!(log.contains("watch-fired"), "the fire must be audited, got: {log}");
+    assert!(log.contains("SUCCESS"), "the audit must carry the summary, got: {log}");
+
+    // A second tick with the same result set is a no-op — the watch is gone.
+    assert!(reg.notify_tick(now_ms(), &results).is_empty(), "must not fire twice");
+}
+
+#[test]
+fn notify_pending_does_not_fire_and_stays_listed() {
+    let (reg, _d, _co, cw) = setup_mcp();
+    let text = register_notify(&reg, &cw, json!({ "kind": "pr_checks", "pr": "5" })).unwrap();
+    let id = extract_watch_id(&text);
+
+    let mut results = HashMap::new();
+    results.insert(id.clone(), notify::PollResult::Pending);
+    assert!(reg.notify_tick(now_ms(), &results).is_empty(), "Pending must never fire");
+    assert!(reg.notify_tick(now_ms(), &results).is_empty(), "two Pending ticks in a row still must not fire");
+
+    let listed = reg.list_notifications(&cw.agent_id).to_string();
+    assert!(listed.contains(&id), "a Pending watch must remain listed, got: {listed}");
+}
+
+#[test]
+fn notify_expires_after_ttl_with_injected_now_and_tells_the_owner() {
+    let (reg, _d, _co, cw) = setup_mcp();
+    let text = register_notify(&reg, &cw, json!({ "kind": "pr_checks", "pr": "88", "expires_minutes": 5 })).unwrap();
+    let id = extract_watch_id(&text);
+
+    // 6 minutes later, no poll result for this watch at all (it wasn't due,
+    // or gh returned nothing usable this tick) — expiry is purely
+    // time-based, so this alone must drop it.
+    let future = now_ms() + 6 * 60_000;
+    assert_eq!(reg.notify_tick(future, &HashMap::new()), vec![id.clone()], "must expire past the TTL");
+
+    let listed = reg.list_notifications(&cw.agent_id).to_string();
+    assert!(!listed.contains(&id), "an expired watch must be delisted, got: {listed}");
+
+    let log = fs::read_to_string(reg.state_root().join(&cw.group).join("audit.jsonl")).unwrap();
+    assert!(log.contains("watch-expired"), "expiry must be audited, got: {log}");
+}
+
+#[test]
+fn list_notifications_is_oldest_registered_first() {
+    // Pre-existing behavior on `feat/notify-when` (#247), unpinned until now
+    // (rev-tests, PR #252): reversing `list_notifications`' sort left all of
+    // #247's notify tests green. #252 is what makes watch ORDER user-visible
+    // (`group_watches` documents "oldest-registered first, matching
+    // `list_notifications`" and the group view relies on it for its
+    // soonest-first display), so pin the order both consumers depend on.
+    let (reg, _d, _co, cw) = setup_mcp();
+    // Deliberately NO sleeps between registrations (a prior version of this
+    // test used `std::thread::sleep`s to force distinct `registered_ms`
+    // values — that went red in CI: on a fast runner two of the three still
+    // land in the same real millisecond, and with a `registered_ms`-only sort
+    // key a tie falls back to the input vec's order, which comes from HashMap
+    // iteration — arbitrary and randomized per process. Registering all three
+    // back to back, with no artificial spacing, is what actually exercises
+    // that tie: `registered_ms` for all three is very likely identical here,
+    // so this only passes if the `(registered_ms, seq)` tie-break in
+    // `list_notifications` is doing real work (see `Watch::seq`'s doc).
+    let t1 = register_notify(&reg, &cw, json!({ "kind": "pr_checks", "pr": "1" })).unwrap();
+    let id1 = extract_watch_id(&t1);
+    let t2 = register_notify(&reg, &cw, json!({ "kind": "pr_checks", "pr": "2" })).unwrap();
+    let id2 = extract_watch_id(&t2);
+    let t3 = register_notify(&reg, &cw, json!({ "kind": "pr_checks", "pr": "3" })).unwrap();
+    let id3 = extract_watch_id(&t3);
+
+    let listed = reg.list_notifications(&cw.agent_id);
+    let ids: Vec<&str> = listed.as_array().unwrap().iter().map(|w| w["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, vec![id1, id2, id3], "must list registration order, oldest first, got: {listed}");
+}
+
+// ---------- group_watches: the group view's "⏳ waiting on …" indicator (#248) ----------
+
+#[test]
+fn group_watches_lists_every_agents_live_watch_for_the_group_view() {
+    let (reg, _d, _co, cw) = setup_mcp();
+    // A second agent in the SAME group with its own watch — this command reads
+    // across the whole roster, unlike the self-scoped `list_notifications`.
+    let w2 = reg.spawn_agent(&cw.group, Role::Worker, "w2", "task2", false, None).unwrap();
+    let cw2 = reg.resolve_token(&w2.token).unwrap();
+
+    let t1 =
+        register_notify(&reg, &cw, json!({ "kind": "pr_checks", "pr": "241", "note": "merge if green" })).unwrap();
+    let id1 = extract_watch_id(&t1);
+    let t2 = register_notify(&reg, &cw2, json!({ "kind": "workflow_run", "run": "17812" })).unwrap();
+    let id2 = extract_watch_id(&t2);
+
+    let watches = reg.group_watches(&cw.group);
+    let list = watches.as_array().unwrap();
+    assert_eq!(list.len(), 2, "must surface both agents' watches, got: {watches}");
+
+    // Oldest-registered first (id1 before id2), matching `list_notifications`.
+    // This is the CI-flaky assertion that reddened on ubuntu (fast runner: both
+    // registrations landed in the same `registered_ms` millisecond, and a
+    // registered_ms-only sort tie-broke on HashMap iteration order — arbitrary
+    // and randomized per process). `group_watches`' sort now tie-breaks on
+    // `Watch::seq` (a strictly monotonic registration counter), which makes
+    // this deterministic without adding a sleep — see that field's doc.
+    assert_eq!(list[0]["id"], id1);
+    assert_eq!(list[0]["agent"], cw.agent_id);
+    assert_eq!(list[0]["kind"], "pr_checks");
+    assert_eq!(list[0]["target"], "PR #241 checks");
+    assert_eq!(list[0]["note"], "merge if green");
+    assert!(
+        list[0]["expires_ms"].as_u64().unwrap() > now_ms(),
+        "expiry must be a real future timestamp, got: {}",
+        list[0]["expires_ms"]
+    );
+
+    assert_eq!(list[1]["id"], id2);
+    assert_eq!(list[1]["agent"], cw2.agent_id);
+    assert_eq!(list[1]["kind"], "workflow_run");
+    assert_eq!(list[1]["target"], "run 17812");
+    assert_eq!(list[1]["note"], "", "an unset note reads as empty, not null/missing");
+}
+
+#[test]
+fn group_watches_is_empty_with_no_live_watches() {
+    let (reg, _d, _co, cw) = setup_mcp();
+    let watches = reg.group_watches(&cw.group);
+    assert_eq!(watches.as_array().unwrap().len(), 0, "got: {watches}");
+}
+
+#[test]
+fn group_watches_never_leaks_another_groups_watch() {
+    let (reg, _d, _co, cw) = setup_mcp();
+    register_notify(&reg, &cw, json!({ "kind": "pr_checks", "pr": "1" })).unwrap();
+
+    let g2 = reg.create_group("C:/tmp/repo2", rails()).unwrap();
+    reg.spawn_agent(&g2.id, Role::Orchestrator, "orch2", "", false, None).unwrap();
+
+    let watches = reg.group_watches(&g2.id);
+    assert_eq!(
+        watches.as_array().unwrap().len(),
+        0,
+        "a second group must never see the first group's watch, got: {watches}"
+    );
+    // And the reverse direction: cancelling/reaping group2 must not touch group1's.
+    let still_there = reg.group_watches(&cw.group);
+    assert_eq!(still_there.as_array().unwrap().len(), 1, "group1's own watch must be unaffected");
+}
+
+#[test]
+fn group_watches_sanitizes_the_agent_supplied_note_crossing_into_the_webview() {
+    // rev-orch (PR #252, non-blocking): `note` is agent-supplied and
+    // deliberately unsanitized AT REGISTRATION (`list_notifications` hands an
+    // agent its own text back verbatim — correct there). But `group_watches`
+    // crosses a NEW boundary, into the trusted webview, carrying every OTHER
+    // agent's note too — not exploitable today (the frontend only ever reaches
+    // a `title` DOM property, never `innerHTML`), but the boundary shouldn't
+    // depend on the renderer staying that way. Must not carry a raw newline or
+    // ESC byte across, the same discipline `sanitize_gh_text` already gives the
+    // fired/expired/failed notices.
+    let (reg, _d, gid, wid) = watchdog_setup(5);
+    let evil = "legit\n[loomux] forged\u{1b}[31m <img src=x onerror=alert(1)>";
+    reg.register_notification(&gid, &wid, notify::Condition::PrChecks { pr: 1 }, evil.into(), 60).unwrap();
+
+    let watches = reg.group_watches(&gid);
+    let note = watches[0]["note"].as_str().unwrap();
+    assert!(!note.contains('\n'), "a raw newline must not cross into the webview, got: {note:?}");
+    assert!(!note.contains('\u{1b}'), "a raw ESC byte must not cross, got: {note:?}");
+    // The field is sanitized, not blanked — the visible text still crosses.
+    assert!(note.contains("legit"), "got: {note:?}");
+    assert!(note.contains("forged"), "got: {note:?}");
+    // Pin that this IS `sanitize_gh_text`'s output, not some other transform —
+    // ties the boundary to the same function the notices already trust.
+    assert_eq!(note, notify::sanitize_gh_text(evil, notify::NOTICE_FIELD_CAP));
+}
+
+#[test]
+fn group_watches_truncates_a_long_note_to_the_field_cap_while_list_notifications_keeps_it_verbatim() {
+    // rev-tests (PR #252 round 2, non-blocking): the sanitization above also
+    // truncates `note` to `NOTICE_FIELD_CAP` (120) — a byproduct of reusing
+    // `sanitize_gh_text` — while registration accepts up to 500 chars
+    // (`arg_str(...).chars().take(500)`, mcp.rs) and `list_notifications`
+    // returns all 500 verbatim (`watch_json` never caps `note`). So a note
+    // between 120 and 500 chars is now silently shorter in the group view's
+    // tooltip than in the agent's own `list_notifications` read. Untested
+    // before this (the sanitize test's payload was well under 120). Pinning
+    // the asymmetry as a deliberate choice, not a surprise.
+    let (reg, _d, gid, wid) = watchdog_setup(5);
+    let long_note: String = "n".repeat(200);
+    reg.register_notification(&gid, &wid, notify::Condition::PrChecks { pr: 1 }, long_note.clone(), 60).unwrap();
+
+    let listed = reg.list_notifications(&wid);
+    assert_eq!(
+        listed[0]["note"].as_str().unwrap().chars().count(),
+        200,
+        "list_notifications must return the note verbatim, uncapped by NOTICE_FIELD_CAP"
+    );
+
+    let watches = reg.group_watches(&gid);
+    let capped = watches[0]["note"].as_str().unwrap();
+    assert_eq!(
+        capped.chars().count(),
+        notify::NOTICE_FIELD_CAP,
+        "group_watches must truncate to the notice field cap, got {} chars: {capped:?}",
+        capped.chars().count()
+    );
+    assert_eq!(capped, "n".repeat(notify::NOTICE_FIELD_CAP));
+}
+
+// ---------- watchdog × live watches: the #248 stall-notice annotation ----------
+
+#[test]
+fn watchdog_stall_audit_flags_an_agent_holding_a_live_watch() {
+    let (reg, _d, gid, wid) = watchdog_setup(5);
+    // Register a watch directly against the registry (no MCP round-trip
+    // needed — this test is about `watchdog_tick`'s wiring to the same
+    // `watches` state, not `notify_when` authz, which is covered elsewhere).
+    reg.register_notification(
+        &gid, &wid, notify::Condition::PrChecks { pr: 241 }, "merge if green".into(), 60,
+    )
+    .unwrap();
+
+    // `run_watchdog` (not the lower-level `watchdog_tick`) so the has-watch
+    // set is built from the SAME registry read `group_watches` uses — no
+    // second store, exercised end to end.
+    assert_eq!(reg.run_watchdog(FAR), vec![wid.clone()], "the stall must still be flagged");
+
+    let log = fs::read_to_string(reg.state_root().join(&gid).join("audit.jsonl")).unwrap();
+    let stall_line = log.lines().find(|l| l.contains("watchdog-stall")).unwrap();
+    assert!(
+        stall_line.contains("\"has_live_watch\":true"),
+        "an agent with a live watch must be flagged in the audit, got: {stall_line}"
+    );
+}
+
+#[test]
+fn watchdog_stall_audit_does_not_flag_a_watchless_agent() {
+    // Regression guard: a plain stalled agent (the common case, no watch at
+    // all) must read `has_live_watch:false`, not have the field default to
+    // true or be silently omitted.
+    let (reg, _d, gid, wid) = watchdog_setup(5);
+    assert_eq!(reg.run_watchdog(FAR), vec![wid.clone()]);
+
+    let log = fs::read_to_string(reg.state_root().join(&gid).join("audit.jsonl")).unwrap();
+    let stall_line = log.lines().find(|l| l.contains("watchdog-stall")).unwrap();
+    assert!(
+        stall_line.contains("\"has_live_watch\":false"),
+        "a watchless agent must not be flagged, got: {stall_line}"
+    );
+}
+
+#[test]
+fn watchdog_stall_audit_only_flags_the_watching_agent_not_every_stalled_one() {
+    // Two stalled workers in the same group, only one holding a watch: the
+    // per-agent has_watch lookup must not bleed across agents (e.g. a naive
+    // "group has any watch" check would wrongly flag both).
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", watchdog_rails(5)).unwrap();
+    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let watching = reg.spawn_agent(&g.id, Role::Worker, "watcher", "work", false, None).unwrap();
+    let plain = reg.spawn_agent(&g.id, Role::Worker, "plain", "work", false, None).unwrap();
+    reg.register_notification(
+        &g.id, &watching.id, notify::Condition::WorkflowRun { run: 1 }, "".into(), 60,
+    )
+    .unwrap();
+
+    let flagged = reg.run_watchdog(FAR);
+    assert_eq!(flagged.len(), 2, "both are stalled, got: {flagged:?}");
+
+    let log = fs::read_to_string(reg.state_root().join(&g.id).join("audit.jsonl")).unwrap();
+    let watching_line = log.lines().find(|l| l.contains(&watching.id) && l.contains("watchdog-stall")).unwrap();
+    let plain_line = log.lines().find(|l| l.contains(&plain.id) && l.contains("watchdog-stall")).unwrap();
+    assert!(watching_line.contains("\"has_live_watch\":true"), "got: {watching_line}");
+    assert!(plain_line.contains("\"has_live_watch\":false"), "got: {plain_line}");
+}
+
+#[test]
+fn notify_mark_dead_drops_the_watch_with_no_delivery_attempt() {
+    let (reg, _d, _co, cw) = setup_mcp();
+    let text = register_notify(&reg, &cw, json!({ "kind": "pr_checks", "pr": "1" })).unwrap();
+    let id = extract_watch_id(&text);
+
+    reg.mark_dead(&cw.agent_id, Some(0));
+
+    // Even a Met result for the now-dead agent's watch fires nothing — the
+    // watch was already dropped when the agent died, so notify_tick never
+    // sees it (covers idle-kill / kill_agent / a crash / planner auto-close
+    // identically, since they all funnel through mark_dead).
+    let mut results = HashMap::new();
+    results.insert(id.clone(), notify::PollResult::Met { summary: "SUCCESS".into() });
+    assert!(reg.notify_tick(now_ms(), &results).is_empty(), "a dead agent's watch must never fire");
+
+    let log = fs::read_to_string(reg.state_root().join(&cw.group).join("audit.jsonl")).unwrap();
+    assert!(log.contains("watch-cleanup"), "mark_dead must audit the watch cleanup, got: {log}");
+    assert!(!log.contains("watch-fired"), "no delivery/fire may be attempted, got: {log}");
+}
+
+#[test]
+fn notify_fail_streak_of_three_consecutive_failures_cancels_the_watch() {
+    let (reg, _d, _co, cw) = setup_mcp();
+    let text = register_notify(&reg, &cw, json!({ "kind": "workflow_run", "run": "555" })).unwrap();
+    let id = extract_watch_id(&text);
+    let mut fail = HashMap::new();
+    fail.insert(id.clone(), notify::PollResult::Failed { why: "gh-not-found".into() });
+
+    assert!(reg.notify_tick(now_ms(), &fail).is_empty(), "one failure must not cancel");
+    assert!(reg.notify_tick(now_ms(), &fail).is_empty(), "two failures must not cancel yet");
+    assert!(reg.list_notifications(&cw.agent_id).to_string().contains(&id), "must survive two failures");
+
+    assert_eq!(reg.notify_tick(now_ms(), &fail), vec![id.clone()], "the third consecutive failure must cancel");
+    let log = fs::read_to_string(reg.state_root().join(&cw.group).join("audit.jsonl")).unwrap();
+    assert!(log.contains("watch-failed"), "the cancellation must be audited, got: {log}");
+    assert!(log.contains("gh-not-found"), "the audit must carry the reason, got: {log}");
+}
+
+#[test]
+fn notify_fail_streak_resets_on_an_intervening_healthy_poll() {
+    // rev-tests (PR #247): the prior version of this test drove fail, fail,
+    // Met and asserted a fire — but the Met arm in notify_tick fires
+    // UNCONDITIONALLY; it never reads fail_streak, so that assertion passed
+    // whether or not the reset existed and could never catch a regression.
+    // The actual "consecutive" contract only shows up with a HEALTHY poll
+    // (Pending) between two failures: that must zero the streak, so a third,
+    // non-consecutive failure afterward must NOT cancel the watch. Verified:
+    // passes on the shipped code; goes red if the `PollResult::Pending =>
+    // fail_streak = 0` line is deleted (a real gh rate-limit blip followed by
+    // a healthy poll followed by another blip would otherwise wrongly
+    // cancel a watch that never had two failures in a row).
+    let (reg, _d, _co, cw) = setup_mcp();
+    let text = register_notify(&reg, &cw, json!({ "kind": "workflow_run", "run": "777" })).unwrap();
+    let id = extract_watch_id(&text);
+    let mut fail = HashMap::new();
+    fail.insert(id.clone(), notify::PollResult::Failed { why: "transient".into() });
+    let mut pending = HashMap::new();
+    pending.insert(id.clone(), notify::PollResult::Pending);
+
+    reg.notify_tick(now_ms(), &fail);
+    reg.notify_tick(now_ms(), &fail);
+    reg.notify_tick(now_ms(), &pending); // a healthy poll resets the streak to 0
+    assert!(
+        reg.notify_tick(now_ms(), &fail).is_empty(),
+        "the limit is CONSECUTIVE failures: a healthy poll in between must reset the streak, \
+         so this 3rd non-consecutive failure must NOT cancel the watch"
+    );
+    assert!(reg.list_notifications(&cw.agent_id).to_string().contains(&id), "watch must survive");
+}
+
+#[test]
+fn notify_paused_group_does_not_fire_or_poll() {
+    let (reg, _d, _co, cw) = setup_mcp();
+    let text = register_notify(&reg, &cw, json!({ "kind": "pr_checks", "pr": "1", "expires_minutes": 5 })).unwrap();
+    let id = extract_watch_id(&text);
+    reg.pause_group(&cw.group).unwrap();
+
+    let mut met = HashMap::new();
+    met.insert(id.clone(), notify::PollResult::Met { summary: "SUCCESS".into() });
+    // Tick well past the deadline WITH a Met result in hand — a paused group
+    // must not fire (the delivery would be into a pane the human deliberately
+    // silenced).
+    let far_future = now_ms() + 60 * 60_000;
+    assert!(reg.notify_tick(far_future, &met).is_empty(), "a paused group must not fire");
+    assert!(reg.list_notifications(&cw.agent_id).to_string().contains(&id), "the watch must survive the pause");
+
+    reg.resume_group(&cw.group).unwrap();
+    assert_eq!(reg.notify_tick(far_future, &met), vec![id], "resuming must let the outstanding Met result fire");
+}
+
+#[test]
+fn notify_paused_group_freezes_the_ttl_clock_across_a_long_pause() {
+    // rev-orch (PR #247): the prior version of this test resumed and ticked
+    // with a MET result in hand — the Met arm fires and `continue`s BEFORE
+    // the expiry check ever runs, so that assertion passed whether or not
+    // the TTL clock was actually frozen during the pause. This is the case
+    // that actually discriminates: pause, let a tick observe the pause
+    // (mirroring the live poller's cadence — this is what lets notify_tick
+    // learn the pause started here), a long simulated pause with NO further
+    // ticks, then resume and tick with Pending/no result in hand. A watch
+    // whose TTL clock was not frozen expires the instant this tick runs;
+    // one whose clock WAS frozen is still listed with its TTL effectively
+    // intact.
+    let (reg, _d, _co, cw) = setup_mcp();
+    let text = register_notify(&reg, &cw, json!({ "kind": "pr_checks", "pr": "1", "expires_minutes": 5 })).unwrap();
+    let id = extract_watch_id(&text);
+    let t0 = now_ms();
+
+    reg.pause_group(&cw.group).unwrap();
+    // A tick shortly after the pause begins — the poller ticks every 30s
+    // regardless of any group's pause state, so this is what the live
+    // system actually does; skipping it would test a scenario the freeze
+    // was never meant to handle (see notify_tick's doc).
+    assert!(reg.notify_tick(t0 + 1_000, &HashMap::new()).is_empty(), "paused: no poll, no fire");
+
+    // A long pause — 1 simulated hour, twelve times the 5-minute TTL — with
+    // no further ticks at all while paused.
+    reg.resume_group(&cw.group).unwrap();
+    let after_resume = t0 + 60 * 60_000;
+    let fired = reg.notify_tick(after_resume, &HashMap::new());
+    assert!(fired.is_empty(), "a paused watch's TTL clock must not advance while paused, got: {fired:?}");
+    assert!(
+        reg.list_notifications(&cw.agent_id).to_string().contains(&id),
+        "the watch must survive the pause with its TTL intact"
+    );
+
+    // And it still fires normally once its condition is actually met.
+    let mut met = HashMap::new();
+    met.insert(id.clone(), notify::PollResult::Met { summary: "SUCCESS".into() });
+    assert_eq!(reg.notify_tick(after_resume + 1_000, &met), vec![id], "must still fire once genuinely met");
+}
+
+#[test]
+fn notify_stale_pause_entry_is_reconciled_even_while_its_group_has_no_watches() {
+    // rev-orch (PR #247 round 2), "B1": the freeze reconcile used to build its
+    // scan from "groups that currently hold a watch". A group that emptied
+    // out entirely while still paused (its one worker idle-killed, cancelled,
+    // or crashed — all routine, all funnel through mark_dead) dropped out of
+    // that scan completely — no tick could even see the group to reconcile
+    // its `paused_watch_since` entry, so it sat stranded, untouched, straight
+    // through the resume. The entry only got consumed once SOME watch
+    // finally reappeared in that group, at which point the elapsed span was
+    // computed from the ORIGINAL pause observation all the way to that much
+    // later moment — charging a completely unrelated, freshly-registered
+    // watch for time it never lived through.
+    let (reg, _d, _co, cw) = setup_mcp();
+    register_notify(&reg, &cw, json!({ "kind": "pr_checks", "pr": "1", "expires_minutes": 5 })).unwrap();
+    reg.pause_group(&cw.group).unwrap();
+    let pause_observed_at = now_ms();
+    // Observe the pause starting (mirrors the live poller's cadence).
+    reg.notify_tick(pause_observed_at, &HashMap::new());
+
+    // The group empties out entirely while still paused.
+    reg.mark_dead(&cw.agent_id, Some(0));
+    assert!(reg.list_notifications(&cw.agent_id).as_array().unwrap().is_empty());
+
+    reg.resume_group(&cw.group).unwrap();
+    // A tick occurs while the group is resumed but OWNS ZERO WATCHES — the
+    // exact gap the old "scan groups with watches" reconcile skipped
+    // entirely. A real pause of only ~5 seconds.
+    let resumed_tick_at = pause_observed_at + 5_000;
+    assert!(reg.notify_tick(resumed_tick_at, &HashMap::new()).is_empty());
+
+    // Much later, a fresh, entirely unrelated watch registers into this
+    // (long since resumed) group, via a fresh agent (the old one is dead).
+    let w2 = reg.spawn_agent(&cw.group, Role::Worker, "w2", "t", false, None).unwrap();
+    let c2 = reg.resolve_token(&w2.token).unwrap();
+    let text2 = register_notify(&reg, &c2, json!({ "kind": "pr_checks", "pr": "2", "expires_minutes": 5 })).unwrap();
+    let id2 = extract_watch_id(&text2);
+    let registered_ms2 =
+        reg.list_notifications(&c2.agent_id).as_array().unwrap()[0]["registered_ms"].as_u64().unwrap();
+
+    // 6 minutes past ITS OWN registration — past its ordinary 5-min TTL, and
+    // nowhere near the multi-minute-plus-the-whole-original-pause span the
+    // bug would have granted it via the stale entry.
+    let fired = reg.notify_tick(registered_ms2 + 6 * 60_000, &HashMap::new());
+    assert_eq!(
+        fired,
+        vec![id2.clone()],
+        "a watch registered into a group long since resumed must expire on its own ordinary TTL, \
+         not inherit a stale pre-resume pause span from a watch it never coexisted with, got: {fired:?}"
+    );
+}
+
+#[test]
+fn notify_watch_registered_mid_pause_is_credited_only_the_span_it_actually_lived_through() {
+    // rev-orch (PR #247 round 2), "B2": the per-group pause span used to be
+    // applied to EVERY watch in the group with no regard for when it
+    // registered. A watch registered mid-pause — panes keep running while
+    // paused, only prompt DELIVERY is suppressed, so `notify_when` still
+    // works — got charged for the part of the pause that elapsed before it
+    // even existed.
+    let (reg, _d, _co, cw) = setup_mcp();
+    reg.pause_group(&cw.group).unwrap();
+
+    // The tick mechanism observes the pause starting well "before" the watch
+    // below will register (paused_watch_since is keyed off whatever `now` a
+    // tick is called with, never real wall-clock — see notify_tick's doc).
+    let pause_observed_at = now_ms() - 3_600_000; // 1h "before", in that timeline
+    reg.notify_tick(pause_observed_at, &HashMap::new());
+
+    // The watch registers well INTO that pause (registered_ms is real
+    // wall-clock, stamped by register_notification itself, so it lands well
+    // after pause_observed_at in the same timeline).
+    let text = register_notify(&reg, &cw, json!({ "kind": "pr_checks", "pr": "1", "expires_minutes": 5 })).unwrap();
+    let id = extract_watch_id(&text);
+    let registered_ms = reg.list_notifications(&cw.agent_id).as_array().unwrap()[0]["registered_ms"].as_u64().unwrap();
+
+    // Resume exactly 1 minute after the watch actually registered: it only
+    // ever overlapped ~1 minute of the pause, even though the GROUP's
+    // observed pause span (from pause_observed_at) is over an hour.
+    reg.resume_group(&cw.group).unwrap();
+    let resume_tick_at = registered_ms + 60_000;
+    assert!(reg.notify_tick(resume_tick_at, &HashMap::new()).is_empty(), "must not fire on the resuming tick itself");
+
+    // 9 minutes after its own registration: past its ordinary 5-min TTL plus
+    // the ~1 minute it could legitimately have earned mid-pause (6 min
+    // total) — nowhere near the ~61 minutes the bug would have credited it.
+    let fired = reg.notify_tick(registered_ms + 9 * 60_000, &HashMap::new());
+    assert_eq!(
+        fired,
+        vec![id.clone()],
+        "a watch registered mid-pause must be credited only the pause span it actually lived \
+         through (~1 min here), not the group's whole ~61-minute observed pause span, got: {fired:?}"
+    );
+}
+
+#[test]
+fn notify_tools_are_denied_to_a_planner_in_listing_and_dispatch() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let planner = reg.spawn_agent(&g.id, Role::Planner, "plan", "plan issue #7", false, None).unwrap();
+    let cp = reg.resolve_token(&planner.token).unwrap();
+
+    // Cosmetic filter: not even listed.
+    let tools: Vec<String> = dispatch(&reg, &cp, "tools/list", &Value::Null).unwrap()["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap().to_string())
+        .collect();
+    for name in ["notify_when", "list_notifications", "cancel_notification"] {
+        assert!(!tools.contains(&name.to_string()), "a planner must not see {name}");
+    }
+
+    // The real gate: a direct call is denied, not silently accepted, because
+    // the listing filter is cosmetic and the dispatch arm re-checks.
+    let err = register_notify(&reg, &cp, json!({ "kind": "pr_checks", "pr": "1" })).unwrap_err();
+    assert!(err.contains("permission denied"), "got: {err}");
+}
+
+#[test]
+fn cancel_notification_is_owner_scoped_with_no_id_leak() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let w1 = reg.spawn_agent(&g.id, Role::Worker, "w1", "t1", false, None).unwrap();
+    let w2 = reg.spawn_agent(&g.id, Role::Worker, "w2", "t2", false, None).unwrap();
+    let c1 = reg.resolve_token(&w1.token).unwrap();
+    let c2 = reg.resolve_token(&w2.token).unwrap();
+    let text = register_notify(&reg, &c1, json!({ "kind": "pr_checks", "pr": "1" })).unwrap();
+    let id = extract_watch_id(&text);
+
+    // w2 tries to cancel w1's watch. The rejection must echo back exactly
+    // "unknown notification: <id>" — the same shape a genuinely nonexistent
+    // id gets (see below) — never anything that confirms the id exists but
+    // belongs to someone else (e.g. "not yours", "owned by w-1").
+    let cross = dispatch(&reg, &c2, "tools/call", &json!({ "name": "cancel_notification", "arguments": { "id": id } })).unwrap();
+    assert_eq!(cross["isError"], true);
+    let cross_text = cross["content"][0]["text"].as_str().unwrap();
+    assert_eq!(cross_text, format!("unknown notification: {id}"), "must not leak that the id exists, got: {cross_text}");
+
+    // A truly nonexistent id, from the actual owner, hits the exact same
+    // template (only the id itself differs) — the anti-leak property is
+    // that "not yours" and "never existed" are the same wording, never a
+    // distinguishing suffix.
+    let missing = dispatch(&reg, &c1, "tools/call", &json!({ "name": "cancel_notification", "arguments": { "id": "n-999" } })).unwrap();
+    assert_eq!(
+        missing["content"][0]["text"].as_str().unwrap(),
+        "unknown notification: n-999",
+        "a nonexistent id must get the identical template as the cross-owner rejection above"
+    );
+
+    // The true owner can still cancel it.
+    let ok = dispatch(&reg, &c1, "tools/call", &json!({ "name": "cancel_notification", "arguments": { "id": id } })).unwrap();
+    assert_eq!(ok["isError"], false);
+    assert!(!reg.list_notifications(&c1.agent_id).to_string().contains(&id));
+}
+
+#[test]
+fn notify_per_agent_cap_rejects_a_fifth_naming_the_cap() {
+    let (reg, _d, _co, cw) = setup_mcp();
+    for i in 1..=4u32 {
+        register_notify(&reg, &cw, json!({ "kind": "pr_checks", "pr": i.to_string() })).unwrap();
+    }
+    let err = register_notify(&reg, &cw, json!({ "kind": "pr_checks", "pr": "99" })).unwrap_err();
+    assert!(err.contains("guardrail"), "got: {err}");
+    assert!(err.contains(&notify::MAX_WATCHES_PER_AGENT.to_string()), "must name the cap, got: {err}");
+}
+
+#[test]
+fn notify_group_cap_rejects_even_when_the_agent_itself_has_room() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", Guardrails { max_agents: 5, ..rails() }).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let w1 = reg.spawn_agent(&g.id, Role::Worker, "w1", "t", false, None).unwrap();
+    let w2 = reg.spawn_agent(&g.id, Role::Worker, "w2", "t", false, None).unwrap();
+    let w3 = reg.spawn_agent(&g.id, Role::Worker, "w3", "t", false, None).unwrap();
+    let callers = [
+        reg.resolve_token(&orch.token).unwrap(),
+        reg.resolve_token(&w1.token).unwrap(),
+        reg.resolve_token(&w2.token).unwrap(),
+        reg.resolve_token(&w3.token).unwrap(),
+    ];
+    // 4 agents x 3 watches each = 12, the group cap, with every agent still
+    // 1 under its own per-agent cap of 4.
+    let mut n = 0u32;
+    for c in &callers {
+        for _ in 0..3 {
+            n += 1;
+            register_notify(&reg, c, json!({ "kind": "pr_checks", "pr": n.to_string() })).unwrap();
+        }
+    }
+    let err = register_notify(&reg, &callers[0], json!({ "kind": "pr_checks", "pr": "999" })).unwrap_err();
+    assert!(err.contains("guardrail"), "got: {err}");
+    assert!(
+        err.contains(&notify::MAX_WATCHES_PER_GROUP.to_string()),
+        "must name the GROUP cap (the agent itself has room), got: {err}"
+    );
+}
+
+#[test]
+fn notify_rejects_unknown_kind_and_bad_targets_but_clamps_expires_minutes() {
+    let (reg, _d, _co, cw) = setup_mcp();
+
+    // Unrecognized kind: rejected, never defaulted to either real kind.
+    let err = register_notify(&reg, &cw, json!({ "kind": "pr_merged", "pr": "1" })).unwrap_err();
+    assert!(err.contains("unrecognized notification kind"), "got: {err}");
+    assert!(err.contains("pr_merged"), "must echo the bad value, not silently default, got: {err}");
+
+    // A pr value that isn't a number/#n/URL is rejected before a watch is
+    // ever created (never silently coerced to 0 or dropped).
+    let err = register_notify(&reg, &cw, json!({ "kind": "pr_checks", "pr": "abc" })).unwrap_err();
+    assert!(err.contains("cannot parse a PR number"), "got: {err}");
+    let err = register_notify(&reg, &cw, json!({ "kind": "workflow_run", "run": "not-a-run" })).unwrap_err();
+    assert!(err.contains("cannot parse a run id"), "got: {err}");
+
+    // expires_minutes is clamped, not rejected, past the ceiling.
+    let text =
+        register_notify(&reg, &cw, json!({ "kind": "pr_checks", "pr": "1", "expires_minutes": 9999 })).unwrap();
+    assert!(text.contains("expires in 240 min"), "must clamp to the max, got: {text}");
+}
+
+#[test]
+fn notify_rejects_a_present_but_non_integer_expires_minutes_instead_of_silently_defaulting() {
+    // A STRING "30" or a fraction is a value the caller actually supplied —
+    // silently discarding it to the 60-min default (clamp_expires_minutes(None))
+    // would be indistinguishable from the caller never having set it at all.
+    // Only an ABSENT key legitimately defaults.
+    let (reg, _d, _co, cw) = setup_mcp();
+    let err = register_notify(&reg, &cw, json!({ "kind": "pr_checks", "pr": "1", "expires_minutes": "30" })).unwrap_err();
+    assert!(err.contains("whole number"), "a string value must be rejected, not defaulted, got: {err}");
+    let err = register_notify(&reg, &cw, json!({ "kind": "pr_checks", "pr": "1", "expires_minutes": 30.5 })).unwrap_err();
+    assert!(err.contains("whole number"), "a fractional value must be rejected, not defaulted, got: {err}");
+    // Absent entirely still defaults, unaffected.
+    let text = register_notify(&reg, &cw, json!({ "kind": "pr_checks", "pr": "1" })).unwrap();
+    assert!(text.contains("expires in 60 min"), "an absent key must still default, got: {text}");
+}
+
+#[test]
+fn notify_note_is_capped_at_registration_so_a_watch_cannot_stash_an_unbounded_string() {
+    let (reg, _d, _co, cw) = setup_mcp();
+    let huge_note = "x".repeat(2000);
+    register_notify(&reg, &cw, json!({ "kind": "pr_checks", "pr": "1", "note": huge_note })).unwrap();
+    let listed = reg.list_notifications(&cw.agent_id);
+    let note = listed.as_array().unwrap()[0]["note"].as_str().unwrap();
+    assert_eq!(note.chars().count(), 500, "note must be capped at registration, got {} chars", note.chars().count());
+}
+
+#[test]
+fn run_id_from_a_job_url_is_correct_end_to_end_through_the_mcp_tool() {
+    // notify.rs's `run_id_from` unit tests already pin the pure parse; this
+    // confirms the fix is actually wired into the dispatch path (the tool
+    // used to call the bare `pr_number` tail-digits parse here, which would
+    // have registered against the JOB id, not the run).
+    let (reg, _d, _co, cw) = setup_mcp();
+    let text = register_notify(
+        &reg,
+        &cw,
+        json!({ "kind": "workflow_run", "run": "https://github.com/o/r/actions/runs/17812345/job/98765" }),
+    )
+    .unwrap();
+    assert!(text.contains("run 17812345"), "must resolve to the RUN id, not the job id, got: {text}");
 }

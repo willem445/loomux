@@ -187,6 +187,32 @@ fn tool_defs(role: Role) -> Vec<Value> {
             }),
             &[]),
     ];
+    // Notification backend (#243): self-addressed — there is no `agent_id`
+    // parameter, and a notice can only ever land in the caller's own pane, so
+    // this belongs in the shared tier, not the orchestrator-only one. Denied
+    // to a planner: its pane closes the instant it reports `done` (#203), and
+    // a watch that outlives its owner is garbage. `call_tool` re-checks this
+    // (`require_not_planner`) — this filter is cosmetic, not the gate.
+    if role != Role::Planner {
+        tools.extend([
+            tool("notify_when",
+                "Register a background watch on a CI/run condition and get a [loomux] notice IN THIS PANE the moment it fires — never another agent's. Register and immediately go do other work; do not sleep or re-poll `gh pr checks`/`gh run view` yourself, loomux polls every 30s. kind: \"pr_checks\" (a PR's checks reach SUCCESS/FAILURE — pass pr) or \"workflow_run\" (a specific `gh run` id completes — pass run). expires_minutes defaults to 60, clamped to 5-240. Capped at 4 live per agent / 12 per group; cancel one with cancel_notification or let it fire/expire to free a slot.",
+                json!({
+                    "kind": { "type": "string", "enum": ["pr_checks", "workflow_run"], "description": "Unrecognized values are rejected, never defaulted" },
+                    "pr": { "type": "string", "description": "PR number, #n, or URL — required for pr_checks" },
+                    "run": { "type": "string", "description": "gh run id (number or run URL) — required for workflow_run" },
+                    "note": { "type": "string", "description": "Echoed back in the notice so you remember what to do when it fires, e.g. \"merge if green, else route back to w-2\"" },
+                    "expires_minutes": { "type": "integer", "description": "default 60, clamped to 5-240" },
+                }),
+                &["kind"]),
+            tool("list_notifications",
+                "List your OWN live notifications (id, kind, target, note, registered/expiry times), read fresh from the live registry. A loomux restart empties the registry, so a watch is gone and must be re-registered from scratch; a /compact only drops YOUR memory of it — the watch is still live, and this call recovers what it was. Call it on session start and after a /compact, and re-register anything a restart actually lost.",
+                json!({}), &[]),
+            tool("cancel_notification",
+                "Cancel one of your own live notifications by id (e.g. because the PR it watched got closed).",
+                json!({ "id": { "type": "string" } }), &["id"]),
+        ]);
+    }
     if role == Role::Orchestrator {
         tools.extend([
             tool("spawn_agent",
@@ -283,6 +309,20 @@ fn require_orchestrator(caller: &Caller) -> Result<(), String> {
         Ok(())
     } else {
         Err("permission denied: this tool is orchestrator-only".into())
+    }
+}
+
+/// The notification tools' gate (#243): denied to a planner. `tool_defs`'s
+/// role filter already keeps a planner from *seeing* these tools; this is the
+/// real check — the listing is cosmetic, not security (a planner could still
+/// try the call name directly).
+fn require_not_planner(caller: &Caller) -> Result<(), String> {
+    if caller.role == Role::Planner {
+        Err("permission denied: planners cannot register notifications — a planner's pane \
+             closes the moment it reports done (#203), and a watch that outlives its owner \
+             is garbage".into())
+    } else {
+        Ok(())
     }
 }
 
@@ -524,6 +564,74 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             let state = arg_str(args, "state").ok_or("state required")?;
             reg.set_state(&caller.group, state)?;
             Ok("state saved".into())
+        }
+
+        "notify_when" => {
+            require_not_planner(caller)?;
+            let kind = arg_str(args, "kind").ok_or("kind required")?;
+            let condition = match kind {
+                "pr_checks" => {
+                    let raw = arg_str(args, "pr").ok_or("pr required for pr_checks")?;
+                    let pr = super::pr_number(raw)
+                        .ok_or_else(|| format!("cannot parse a PR number from {raw:?}"))?;
+                    super::notify::Condition::PrChecks { pr }
+                }
+                "workflow_run" => {
+                    let raw = arg_str(args, "run").ok_or("run required for workflow_run")?;
+                    // `run_id_from`, not the bare `pr_number` tail-digits parse:
+                    // a run URL can carry a trailing `/job/<id>` segment whose
+                    // digits are a DIFFERENT number (the job id), which
+                    // `pr_number` would silently return instead.
+                    let run = super::notify::run_id_from(raw)
+                        .ok_or_else(|| format!("cannot parse a run id from {raw:?}"))?;
+                    super::notify::Condition::WorkflowRun { run }
+                }
+                // Unrecognized kind is REJECTED, never defaulted (the
+                // spawn_agent kind lesson, #222) — there is no sensible
+                // fallback condition to silently watch instead.
+                other => {
+                    return Err(format!(
+                        "unrecognized notification kind: {other:?} (must be pr_checks or workflow_run)"
+                    ))
+                }
+            };
+            // Capped (well above `NOTICE_FIELD_CAP`, which trims it again at
+            // notice time) so an agent can't stash an unbounded string in a
+            // watch that lives up to 4h — a cheap bound, not a security
+            // boundary (the note is sanitized separately before it ever
+            // enters a notice).
+            let note: String = arg_str(args, "note").unwrap_or("").chars().take(500).collect();
+            // Present-but-not-a-whole-number (a JSON string, a fraction) is
+            // REJECTED, not silently discarded to the default: the caller
+            // did supply a value, and clamp_expires_minutes(None) would
+            // otherwise turn "30" or 30.5 into a mysterious 60 with no
+            // signal anything was wrong. Absent entirely is the one case
+            // that legitimately defaults.
+            let expires_minutes = match args.get("expires_minutes") {
+                None => super::notify::clamp_expires_minutes(None),
+                Some(v) => match v.as_u64() {
+                    Some(n) => super::notify::clamp_expires_minutes(Some(n as u32)),
+                    None => {
+                        return Err(format!("expires_minutes must be a whole number of minutes, got: {v}"))
+                    }
+                },
+            };
+            let w = reg.register_notification(&caller.group, &caller.agent_id, condition, note, expires_minutes)?;
+            Ok(format!(
+                "registered {} ({}), polled every 30s, expires in {expires_minutes} min. \
+                 You will get a [loomux] notice in this pane when it completes — do other work until then.",
+                w.id, w.condition.label(),
+            ))
+        }
+        "list_notifications" => {
+            require_not_planner(caller)?;
+            Ok(reg.list_notifications(&caller.agent_id).to_string())
+        }
+        "cancel_notification" => {
+            require_not_planner(caller)?;
+            let id = arg_str(args, "id").ok_or("id required")?;
+            reg.cancel_notification(&caller.agent_id, id)?;
+            Ok(format!("cancelled {id}"))
         }
 
         "report" => {

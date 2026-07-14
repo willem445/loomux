@@ -2027,9 +2027,18 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   border: 2px solid var(--bg-app); background-clip: padding-box;
 }
 .group-empty { padding: 22px 16px; color: var(--text-dim); line-height: 1.5; }
+/* .group-agent wraps one roster row + its optional watch-line (#248) so the
+   border-bottom separates AGENTS, not the row from its own watch line. */
+.group-agent { border-bottom: 1px solid rgba(255, 255, 255, 0.03); }
 .group-row {
   display: flex; align-items: baseline; gap: 9px; min-height: 24px;
-  padding: 3px 12px; border-bottom: 1px solid rgba(255, 255, 255, 0.03);
+  padding: 3px 12px;
+}
+/* "⏳ waiting on …" (#248): text only, indented under the name column (role
+   chip 34px + 9px gap) so it reads as a note on that agent, not a new row. */
+.group-watch-line {
+  padding: 0 12px 4px 47px; font-size: 10px; color: var(--text-dim);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .group-role {
   flex: none; width: 34px; text-align: center;
