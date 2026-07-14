@@ -1,6 +1,6 @@
 # Loomux
 
-A dead simple terminal multiplexer for AI agent management without all the bloat.
+A multiplexer for AI agent management with best in class orchestration!
 
 [![CI](https://github.com/willem445/loomux/actions/workflows/ci.yml/badge.svg)](https://github.com/willem445/loomux/actions/workflows/ci.yml)
 [![Docs](https://img.shields.io/badge/docs-github%20pages-blue)](https://willem445.github.io/loomux/)
@@ -15,6 +15,8 @@ instant matrix splits, nameable panes, a native session browser that restores
 Claude Code and GitHub Copilot CLI sessions straight into a pane, and a built-in
 **orchestrator/worker** workflow for running a fleet of AI agents you gatekeep
 only at review and merge.
+
+![sample](sample.jpg)
 
 ### Meets you where you are
 
@@ -54,16 +56,6 @@ keystroke away on any rung, never disturbing the shell underneath.
 - **Unattended agent fleets** — loomux picks trust over throughput: watch and
   steer any agent mid-task, and the human keeps the merge button.
 
-Every pane also carries an in-app **file editor** (`Alt+F`): a lazy file tree
-with extension icons, a CodeMirror code editor with per-language highlighting,
-and project-wide search-and-replace — floating over the terminal so the shell
-below is never disturbed. Available everywhere, plain terminals included. Search
-runs off the UI thread and streams results as it finds them, so it never freezes
-on a big repo (a new keystroke or `Esc` cancels the in-flight search); it
-respects `.gitignore` by default, with an **Ignored files** toggle to include
-git-ignored paths (node_modules, build output). See the
-[design note](doc/design/fileedit.md).
-
 ### Pane kinds
 
 Every pane starts on the welcome screen and declares what it becomes — there is
@@ -77,8 +69,6 @@ no global mode:
 | **File explorer** | A native-style **file manager** rooted at a folder you pick — no terminal underneath, no process, ever. |
 | **File editor** | The file tree + code editor above, as a **pane** rather than an overlay, rooted at a folder you pick. |
 | **Git** | The git view — graph, status, diffs, staging, worktree switching — as a **pane**, over a repo you pick. |
-
-![sample](sample.jpg)
 
 ## Install
 
