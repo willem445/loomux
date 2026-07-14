@@ -27,15 +27,21 @@
 use loomux_lib::orchestration::{Guardrails, OrchRegistry};
 use std::fs;
 
+/// Guardrails for the group this suite is about: the **default** one — no workflow file, the
+/// advanced orchestrator off. That is deliberate and it is the whole scope of this file.
+///
+/// #222 replaced the flat per-role model fields these rails used to set with a `blocks` roster,
+/// and it added the toggle: with `advanced_orchestrator: false`, `{{WORKFLOW}}`/`{{BLOCK_NOTE}}`
+/// render empty and the agent reads the templates as every group that never opted in reads them.
+/// So this suite pins what the *default* is told, and `workflow.rs` pins what a *gated* group and
+/// a `mode: replace` persona are told (`mechanics_core`). A rule in only one of them is a rule
+/// one kind of group is not being told — see `doc/design/orchestration.md`.
 fn rails() -> Guardrails {
     Guardrails {
         max_agents: 2,
         agent_cli: "claude".into(),
-        worker_model: "sonnet".into(),
-        reviewer_model: "sonnet".into(),
-        orchestrator_model: "opus".into(),
-        planner_model: "opus".into(),
         auto_ops: false,
+        advanced_orchestrator: false,
         idle_kill_minutes: 0,
         max_spawns_per_hour: 0,
         watchdog_stall_minutes: 0,
