@@ -137,6 +137,9 @@ pane stays open showing the status).
 | `get_state()` | ✓ | ✓ |
 | `set_state(state)` | ✓ | ✗ |
 | `group_usage()` | ✓ | ✗ |
+| `notify_when(kind, pr?, run?, note?, expires_minutes?)` | ✓ | worker/reviewer only (✗ planner) |
+| `list_notifications()` | ✓ | worker/reviewer only (✗ planner) |
+| `cancel_notification(id)` | ✓ | worker/reviewer only (✗ planner) |
 
 Guardrails enforced by `spawn_agent`: live-agent cap (`max_agents`, counting workers +
 reviewers + planners), CLI + model pinned per role (`{role}_cli` / `{role}_model`, see
@@ -673,6 +676,157 @@ box clears) rather than making the orchestrator poll terminals by hand.
   delivery is suppressed there anyway, so we don't spend the notice). The template's
   Silent-agent recovery adds the human-facing half: on a repeat unconfirmed notice for the
   same agent, stop re-sending and flag the human.
+
+## Notification backend (#243)
+
+Three MCP tools — `notify_when`, `list_notifications`, `cancel_notification` — let the
+orchestrator, a worker, or a reviewer register a structured condition (a PR's CI checks, or
+a `gh run` id) and get a `[loomux] notification …` typed into their **own** pane the moment
+it resolves, instead of sitting in a wait loop or re-polling `gh pr checks` on a cadence.
+Not available to a planner (see **Tool surface** above).
+
+### Why structured kinds, not a caller-supplied poll command
+
+The obvious generic shape — `notify_when(poll_command, predicate)` — was considered and
+rejected, because it moves the trust boundary rather than automating inside it:
+
+- Agent panes get `agent_pane_env()`'s shimmed `PATH` (see **Enforced merge gate** below),
+  which is what makes `gh pr merge`/`gh release`/a `v*` tag push refuse an agent in its own
+  pane. A poll command handed to the *registry* would run from the loomux app process, with
+  the backend's real, **unshimmed** PATH — the gate an agent cannot get past in its own pane
+  would not apply to a command string it handed to the poller. An agent that cannot merge its
+  own PR could register `gh pr merge 241` as a "poll command" behind a predicate that never
+  matches, and loomux would run it — as the user — every 30s, forever. The side effect *is*
+  the payload; the predicate is decoration.
+- It is also strictly more powerful than anything an agent can already do: a command it types
+  into its own pane is visible, runs under the shims, and dies with the agent. A registered
+  poll command is invisible in that sense (it runs on the poller thread, not in any pane),
+  unshimmed, and **outlives the agent's turn** — repeating, unattended, until cancelled or
+  expired. "Agents can already run `gh`" is not a license for that.
+- It also contradicts CLAUDE.md constraint 6 (the backend trusts the webview, not agent
+  input) and the add-orch-tool design norm ("guardrails in the platform, judgment in the
+  prompt") — a caller-supplied command moves judgment about what's safe to run into the
+  prompt, exactly backwards.
+
+Structured kinds cost one small PR per new condition (`pr_merged`, `pr_comment`,
+`review_verdict`, … are natural v2 follow-ups). That is the correct price: the backend owns
+the whole `gh` argv, and the only agent-supplied bytes are a `u64` (a PR or run number) —
+nothing agent-controlled ever reaches a command line as a string, and every predicate is a
+pure function over pinned `--json` fields, testable with canned fixtures and no `gh`.
+
+### Shape: mirrors the watchdog and `pr_head`, invents nothing new
+
+- **Pure core** (`orchestration/notify.rs`, ~350 lines including tests): `Condition`
+  (`PrChecks { pr }` | `WorkflowRun { run }` — no `Default`, so an unrecognized wire `kind`
+  has nothing to fall back to and is rejected outright), `Watch`, `PollResult`
+  (`Pending`/`Met`/`Failed`), the two predicates (`pr_checks_result`, `workflow_run_result`),
+  the notice-text functions, and the cap/TTL/interval constants. Mirrors `workflow.rs` /
+  `profiles.rs`: `mod.rs` is already ~9k lines, so a new pure-function-heavy feature gets its
+  own file rather than growing it further.
+- **The `gh` subprocess shape.** A private `OrchRegistry::gh_capture(repo, args)` resolves
+  `gh` through `winpath::resolve_program` (a bare `Command::new("gh")` won't resolve a
+  Windows `gh.cmd` shim-free) and pins `CREATE_NO_WINDOW`, mirroring the shape
+  `write_shim`/`pr_head`-style helpers already use elsewhere in this file. **This lands as a
+  fresh helper, not a lift of an existing `pr_head`**: at the time this PR was written,
+  `main` had no `pr_head` — it exists only on the not-yet-merged `feat/222-custom-workflows`
+  branch (user-defined agent workflows). A follow-up should fold `pr_head` into
+  `gh_capture` once #222 merges, rather than keep two copies of the same subprocess shape
+  permanently; noted here so it isn't lost.
+- **The tick split** (the `watchdog_tick` shape, exactly): `poll_watches(&self)` is the
+  impure half — shells out to `gh` for at most `MAX_POLLS_PER_TICK` (8) due watches per
+  tick, round-robin by `last_poll_ms` so a full board can't burst-spawn `gh` processes, and
+  classifies each with the pure predicate. `notify_tick(&self, now, &results)` is the
+  decision half: pause/expiry/fail-streak/fire policy over an **injected** `now` and poll
+  results, so **no test shells out to `gh`** — every test in `tests/orchestration.rs` drives
+  `notify_tick` directly with a synthetic `PollResult` map, the same seam that makes
+  `watchdog_tick` testable with synthetic pty counters. `run_notify_tick` = `poll_watches` +
+  `notify_tick(now_ms(), …)`, called every `NOTIFY_POLL_INTERVAL` (30s) by
+  `start_notify_poller`, registered in `lib.rs` beside `start_watchdog`.
+- **Delivery** reuses `deliver_prompt(agent_id, text, "loomux", Delivery::MidSession)` — the
+  same path the watchdog nudge, the idle-tick, and worker reports already use. No new side
+  channel (add-orch-tool design norm): every existing guard comes free (per-pane serialized
+  delivery, the pause suppression, the #111 human-typing hold, the #103 unconfirmed-delivery
+  notice).
+
+### Constants
+
+| constant | value | why |
+| --- | --- | --- |
+| `NOTIFY_POLL_INTERVAL` | 30s | poller tick cadence, and the floor between polls of one watch |
+| `MAX_POLLS_PER_TICK` | 8 | bounds `gh` process churn per tick regardless of board size |
+| `MAX_WATCHES_PER_AGENT` | 4 | per-agent cap; a rejection names it |
+| `MAX_WATCHES_PER_GROUP` | 12 | per-group cap; a rejection names it (independently of the per-agent cap) |
+| `NOTIFY_EXPIRES_DEFAULT_MIN` / `_MIN` / `_MAX` | 60 / 5 / 240 | TTL default and clamp (`Guardrails::clamped` idiom — never reject a plausible number, never trust it unclamped) |
+| `NOTIFY_FAIL_STREAK_LIMIT` | 3 | consecutive `gh` failures (auth, `gh-not-found`, unknown PR/run) before the watch is cancelled rather than polled forever against nothing |
+
+### Predicates and the "no checks reported" trap
+
+`pr_checks` polls `gh pr checks <pr> --json state,name,link`; met when the array is
+**non-empty and none of `PENDING`/`QUEUED`/`IN_PROGRESS`**. `gh pr checks` exits **non-zero**
+with "no checks reported on the '\<branch\>' branch" on a just-pushed PR — orchestrator.md
+already warned that checks take a minute to appear, and this predicate maps that exit to
+**`Pending`, never `Met`/`Failed`**. Getting this backwards fires an instant, wrong SUCCESS
+the moment a PR opens, before CI has even registered a check — costly enough (and easy
+enough to get wrong) that it has its own pinned regression test. `workflow_run` polls
+`gh run view <id> --json status,conclusion`; met when `status == "completed"`, and the
+notice carries `conclusion`.
+
+### Caps, expiry, pause, and agent death
+
+- **Caps** are checked at registration, independently: an agent under its own cap can still
+  be rejected for the group cap, and vice versa (both are tested).
+- **Expiry** always speaks: a watch past its deadline is dropped and its owner gets a
+  `[loomux] notification … expired after N min …` notice naming the manual fallback
+  (`gh pr checks <n>` / `gh run view <id>`) — silent expiry is the one failure mode that
+  stranded an agent forever, so it never happens quietly.
+- **A paused group freezes completely**: no poll, no fire, and — the subtle half, mirroring
+  the watchdog's paused-latch rule — **no expiry either**. Extending the freeze to the TTL
+  clock means a multi-hour pause does not silently evaporate every outstanding watch; on
+  resume, an expired-while-paused watch still gets its notice (or fires, if its condition
+  had already resolved).
+- **Agent death** (`mark_dead`, covering idle-kill, `kill_agent`, a crash, and the planner
+  auto-close identically, since all four funnel through it) drops that agent's watches in
+  one line, audited (`notify-cleanup`) only when something was actually removed. No delivery
+  is attempted (the pane is gone) and no orchestrator notice is sent (the audit line is
+  enough; a notice per dead agent's stranded watches would be noise).
+
+### Persistence: in-memory only, deliberately
+
+Watches are TTL-bounded (≤4h) and describe in-flight CI — not durable state in the sense
+`state.json`/the task board/the PR itself are. Persisting them would mean rebinding an owner
+across a restart where agent ids and panes are re-minted: real complexity for a case where
+the durable record already survives and the orchestrator's session-start re-sync already
+re-reads it. The cost this pushes onto the template: **on session start (and after a
+compaction), call `list_notifications()` and re-register anything you were waiting on** —
+`orchestrator.md`'s durability rules and `worker.md`'s tool bullet both say so. This is a
+documented limitation, not an oversight.
+
+### Known interactions (stated, not fixed here)
+
+- **The #112 delivery weakness applies here too.** `submit_confirmed` false-confirms on any
+  output burst, so a fired notice landing unsubmitted in an agent's input box can still be
+  recorded as delivered. A watch is one-shot (dropped the instant it fires), so a lost notice
+  is a missed wake — mitigated by (a) auditing `notification-fired` *before* delivery, so the
+  run stays reconstructible, and (b) the orchestrator template keeping its PR-comment sweep
+  as an explicit fallback rather than deleting it: a dropped notice degrades to the old
+  poll-based behavior, not a hang.
+- **The watchdog does not know about notifications.** A worker parked waiting on a
+  `pr_checks` watch is, correctly, producing no output and sending no report — exactly what
+  `watchdog_should_notify` looks for. It will still trip the stall notice to the orchestrator
+  after `watchdog_stall_minutes`. Acceptable for v1 (the notice is one line and already reads
+  as "may be waiting on input"); teaching the watchdog about live watches is a follow-up, not
+  a defect this PR needs to fix.
+- **Security**: no new execution capability (the only subprocess is `gh`, backend-owned
+  argv); no `group_id`-as-path-segment exposure (the poll cwd is resolved from the caller's
+  **group**, which comes from the MCP token, never from an argument — constraint 6 is never
+  engaged); self-addressed only (no `agent_id` parameter, so this can never be used to inject
+  into another agent's pane — `send_prompt`, orchestrator-only, remains the sole cross-pane
+  write); every GitHub-derived string and the agent's own `note` is sanitized
+  (`sanitize_gh_text` — strip control characters including newlines, cap the length) before
+  it enters a notice, because a check name is attacker-influenceable (a fork PR names its own
+  workflow jobs) and the notice is pasted into a live CLI pane — an unsanitized embedded
+  newline could forge a second `[loomux] …`-prefixed line that reads as a second, legitimate
+  notice.
 
 ## Autonomous mode (#83)
 

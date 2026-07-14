@@ -14,6 +14,7 @@
 //! pane, and the audit log (`audit.jsonl`) records the full text.
 
 pub mod mcp;
+pub mod notify;
 pub mod profiles;
 pub mod workflow;
 
@@ -2902,6 +2903,15 @@ pub struct OrchRegistry {
     /// otherwise emit a breadcrumb per poll and flood out the crash-forensics
     /// history it shares the file with. Report only when the count *changes*.
     audit_skips_notified: Mutex<HashMap<String, usize>>,
+    /// Notification backend (#243): registered self-addressed CI/run watches,
+    /// keyed by watch id. Same lifetime class as the `attn_*` maps —
+    /// per-live-agent, in-memory only (see `notify.rs`'s module doc and the
+    /// design note's persistence rationale).
+    watches: Mutex<HashMap<String, notify::Watch>>,
+    /// Watch id sequence (`n-1`, `n-2`, …) — an `AtomicU32` like every other
+    /// id this registry mints, so no `getrandom`-pulling crate is needed
+    /// (CLAUDE.md constraint 2).
+    notify_seq: AtomicU32,
 }
 
 fn now_ms() -> u64 {
@@ -3870,6 +3880,8 @@ impl OrchRegistry {
             claude_projects_dir: Mutex::new(None),
             low_disk_notified: Mutex::new(false),
             audit_skips_notified: Mutex::new(HashMap::new()),
+            watches: Mutex::new(HashMap::new()),
+            notify_seq: AtomicU32::new(0),
         }
     }
 
@@ -5402,6 +5414,310 @@ impl OrchRegistry {
     pub fn run_watchdog(&self, now: u64) -> Vec<String> {
         let outputs = self.agent_output_totals();
         self.watchdog_tick(now, &outputs)
+    }
+
+    // ---------- notification backend (#243): register-and-move-on CI/run watches ----------
+    //
+    // Mirrors the watchdog's split exactly: `poll_watches` is the impure half
+    // (shells out to `gh`, one process per due watch), `notify_tick` is the
+    // decision half (pause/expiry/fail-streak/fire policy over an injected
+    // `now` + poll results, so no test needs `gh`), and `run_notify_tick` glues
+    // them for the live background thread (`start_notify_poller`).
+
+    /// Register a new watch for `agent` in `group`. Rejects over-cap (naming
+    /// the cap that was hit, mirroring the `spawn_agent` guardrail wording);
+    /// `kind`/target parsing and validation happen in `mcp.rs` before this is
+    /// called — an unrecognized kind never reaches here; there is nothing to
+    /// default it to.
+    pub fn register_notification(
+        &self,
+        group: &str,
+        agent: &str,
+        condition: notify::Condition,
+        note: String,
+        expires_minutes: u32,
+    ) -> Result<notify::Watch, String> {
+        let mut watches = self.watches.lock_safe();
+        let per_agent = watches.values().filter(|w| w.agent == agent).count();
+        if per_agent >= notify::MAX_WATCHES_PER_AGENT {
+            return Err(format!(
+                "guardrail: {agent} already has {per_agent} live notifications (max {}). \
+                 cancel_notification one first, or let one fire/expire.",
+                notify::MAX_WATCHES_PER_AGENT
+            ));
+        }
+        let per_group = watches.values().filter(|w| w.group == group).count();
+        if per_group >= notify::MAX_WATCHES_PER_GROUP {
+            return Err(format!(
+                "guardrail: this group already has {per_group} live notifications (max {}). \
+                 cancel_notification one first, or let one fire/expire.",
+                notify::MAX_WATCHES_PER_GROUP
+            ));
+        }
+        let now = now_ms();
+        let expires_minutes = notify::clamp_expires_minutes(Some(expires_minutes));
+        let id = format!("n-{}", self.notify_seq.fetch_add(1, Ordering::Relaxed) + 1);
+        let watch = notify::Watch {
+            id: id.clone(),
+            group: group.to_string(),
+            agent: agent.to_string(),
+            condition,
+            note,
+            registered_ms: now,
+            deadline_ms: now + expires_minutes as u64 * 60_000,
+            last_poll_ms: 0,
+            fail_streak: 0,
+        };
+        watches.insert(id, watch.clone());
+        drop(watches);
+        self.audit(group, agent, "notify-register", json!({
+            "id": watch.id, "kind": watch.condition.kind(), "target": watch.condition.label(),
+            "expires_minutes": expires_minutes,
+        }));
+        Ok(watch)
+    }
+
+    /// The caller's own live watches (`list_notifications`), oldest-registered
+    /// first.
+    pub fn list_notifications(&self, agent: &str) -> Value {
+        let watches = self.watches.lock_safe();
+        let mut mine: Vec<&notify::Watch> = watches.values().filter(|w| w.agent == agent).collect();
+        mine.sort_by_key(|w| w.registered_ms);
+        json!(mine.into_iter().map(notify::watch_json).collect::<Vec<_>>())
+    }
+
+    /// Cancel one of the caller's own watches. Owner-scoped: an id that
+    /// exists but belongs to someone else reads identically to an id that
+    /// doesn't exist at all — the `require_in_group` anti-leak wording, so a
+    /// cross-owner probe can't distinguish "not yours" from "never existed".
+    pub fn cancel_notification(&self, agent: &str, id: &str) -> Result<(), String> {
+        let mut watches = self.watches.lock_safe();
+        if !watches.get(id).is_some_and(|w| w.agent == agent) {
+            return Err(format!("unknown notification: {id}"));
+        }
+        let w = watches.remove(id).expect("checked present above");
+        drop(watches);
+        self.audit(&w.group, agent, "notify-cancel", json!({ "id": id }));
+        Ok(())
+    }
+
+    /// Drop every watch belonging to `agent_id` (called from `mark_dead`: the
+    /// pane a fired notice would land in is gone). Audits once, only if
+    /// something was actually removed, so a routine mark_dead with no
+    /// outstanding watches doesn't add audit noise.
+    fn cleanup_agent_watches(&self, agent_id: &str, group: &str) {
+        let removed: Vec<String> = {
+            let mut watches = self.watches.lock_safe();
+            let ids: Vec<String> =
+                watches.iter().filter(|(_, w)| w.agent == agent_id).map(|(id, _)| id.clone()).collect();
+            for id in &ids {
+                watches.remove(id);
+            }
+            ids
+        };
+        if !removed.is_empty() {
+            self.audit(group, "loomux", "notify-cleanup", json!({ "agent": agent_id, "ids": removed }));
+        }
+    }
+
+    /// Shell out to `gh` in `repo` and capture stdout on success / stderr on
+    /// failure. Resolves the binary through `winpath::resolve_program` (a bare
+    /// `Command::new("gh")` won't resolve a Windows `gh.cmd` shim-free — see
+    /// `write_shim`'s note, and the same resolution `pr_head`-shaped helpers
+    /// elsewhere in this file use) and pins `CREATE_NO_WINDOW` so no console
+    /// flashes on a Windows host. This is the only place the notify poller
+    /// spawns a process, and the argv is always backend-built from a `u64`
+    /// (see `notify::Condition`) — never caller text — so nothing
+    /// agent-controlled ever reaches a command line. `repo` comes from the
+    /// caller's group (resolved server-side), never from an argument, so
+    /// constraint 6 (group_id as a trusted path segment) is never engaged
+    /// here either.
+    ///
+    /// NB: this is a fresh helper, not a lift of an existing `pr_head` — at
+    /// the time this landed, `main` had no `pr_head` (it exists only on the
+    /// not-yet-merged #222 branch). Once #222 merges, a follow-up should fold
+    /// `pr_head` into this shared helper rather than keep two copies of the
+    /// same subprocess shape.
+    fn gh_capture(&self, repo: &str, args: &[&str]) -> Result<String, String> {
+        if !Path::new(repo).is_dir() {
+            return Err(format!("no such directory: {repo}"));
+        }
+        let Some(program) = crate::winpath::resolve_program(
+            "gh",
+            &crate::winpath::launch_path(),
+            &crate::winpath::launch_pathext(),
+        ) else {
+            return Err("gh-not-found".to_string());
+        };
+        let mut cmd = std::process::Command::new(program);
+        cmd.current_dir(repo)
+            .args(args)
+            .env("NO_COLOR", "1")
+            .env("GH_PAGER", "")
+            .env("GH_PROMPT_DISABLED", "1");
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        }
+        let out = cmd.output().map_err(|e| e.to_string())?;
+        if out.status.success() {
+            Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        } else {
+            let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            if err.is_empty() { Err(format!("gh exited with {}", out.status)) } else { Err(err) }
+        }
+    }
+
+    /// Impure half of one notify tick: pick up to `MAX_POLLS_PER_TICK` due
+    /// watches — round-robin by `last_poll_ms`, so a never-/oldest-polled
+    /// watch goes first — shell out to `gh` for each, and classify with the
+    /// pure predicates. A **paused** group's watches are skipped here too
+    /// (never mind classifying a result `notify_tick` will ignore anyway —
+    /// don't even spend the `gh` process on it).
+    fn poll_watches(&self) -> HashMap<String, notify::PollResult> {
+        let now = now_ms();
+        let paused = self.paused.lock_safe().clone();
+        let interval_ms = notify::NOTIFY_POLL_INTERVAL.as_millis() as u64;
+        let mut due: Vec<notify::Watch> = {
+            let watches = self.watches.lock_safe();
+            watches
+                .values()
+                .filter(|w| !paused.contains(&w.group))
+                .filter(|w| now.saturating_sub(w.last_poll_ms) >= interval_ms)
+                .cloned()
+                .collect()
+        };
+        due.sort_by_key(|w| w.last_poll_ms);
+        due.truncate(notify::MAX_POLLS_PER_TICK);
+
+        let mut results = HashMap::new();
+        for w in &due {
+            let Some(repo) = self.group(&w.group).map(|g| g.repo) else { continue };
+            let raw = match &w.condition {
+                notify::Condition::PrChecks { pr } => {
+                    self.gh_capture(&repo, &["pr", "checks", &pr.to_string(), "--json", "state,name,link"])
+                }
+                notify::Condition::WorkflowRun { run } => {
+                    self.gh_capture(&repo, &["run", "view", &run.to_string(), "--json", "status,conclusion"])
+                }
+            };
+            let raw_ref: Result<&str, &str> = match &raw {
+                Ok(s) => Ok(s.as_str()),
+                Err(e) => Err(e.as_str()),
+            };
+            results.insert(w.id.clone(), notify::condition_poll_result(&w.condition, raw_ref));
+        }
+
+        // Stamp last_poll_ms for everything that actually got a `gh` result
+        // this tick (not merely everything `due`: a watch whose group
+        // vanished from under it — unreachable today, since groups are never
+        // removed from the registry, but cheap to keep correct — was
+        // `continue`d above and must not be credited with a poll it never
+        // got), so the round-robin ordering advances even for watches that
+        // stayed Pending.
+        if !results.is_empty() {
+            let mut watches = self.watches.lock_safe();
+            for id in results.keys() {
+                if let Some(live) = watches.get_mut(id) {
+                    live.last_poll_ms = now;
+                }
+            }
+        }
+        results
+    }
+
+    /// Pure-shaped decision half (the `watchdog_tick` shape): given this
+    /// tick's poll `results` (only watches actually polled this tick appear —
+    /// a watch not yet due, or skipped because its group is paused, is simply
+    /// absent, and this tick leaves it untouched), apply pause/expiry/
+    /// fail-streak/fire policy to every registered watch, deliver the
+    /// resulting notices, and return the ids that fired (met, expired, or
+    /// failure-cancelled). No `gh` call anywhere in this function — every
+    /// test drives it with a synthetic `results` map.
+    pub fn notify_tick(&self, now: u64, results: &HashMap<String, notify::PollResult>) -> Vec<String> {
+        enum Fate {
+            Fire(String),
+            Expire,
+            FailCancel(String),
+        }
+        let paused = self.paused.lock_safe().clone();
+
+        // Decide fates under the watches lock; deliver after releasing it —
+        // delivery can block on a busy pane's per-pane delivery lock.
+        let mut acted: Vec<(notify::Watch, Fate)> = Vec::new();
+        {
+            let mut watches = self.watches.lock_safe();
+            let mut to_remove: Vec<String> = Vec::new();
+            for (id, w) in watches.iter_mut() {
+                // Paused: frozen solid — no poll (already true in
+                // `poll_watches`), no fire, and crucially no expiry either,
+                // so a long pause doesn't silently evaporate every watch.
+                if paused.contains(&w.group) {
+                    continue;
+                }
+                match results.get(id) {
+                    Some(notify::PollResult::Met { summary }) => {
+                        acted.push((w.clone(), Fate::Fire(summary.clone())));
+                        to_remove.push(id.clone());
+                        continue;
+                    }
+                    Some(notify::PollResult::Failed { why }) => {
+                        w.fail_streak += 1;
+                        if w.fail_streak >= notify::NOTIFY_FAIL_STREAK_LIMIT {
+                            acted.push((w.clone(), Fate::FailCancel(why.clone())));
+                            to_remove.push(id.clone());
+                            continue;
+                        }
+                    }
+                    Some(notify::PollResult::Pending) => {
+                        w.fail_streak = 0; // any successful poll resets the streak
+                    }
+                    None => {} // not due this tick — leave fail_streak alone
+                }
+                if notify::watch_expired(w.deadline_ms, now) {
+                    acted.push((w.clone(), Fate::Expire));
+                    to_remove.push(id.clone());
+                }
+            }
+            for id in &to_remove {
+                watches.remove(id);
+            }
+        }
+
+        let mut fired = Vec::new();
+        for (w, fate) in acted {
+            let (action, text) = match &fate {
+                Fate::Fire(summary) => (
+                    "notification-fired",
+                    notify::watch_fired_notice(&w.id, &w.condition, summary, &w.note),
+                ),
+                Fate::Expire => {
+                    let minutes = w.deadline_ms.saturating_sub(w.registered_ms) / 60_000;
+                    (
+                        "notification-expired",
+                        notify::watch_expired_notice(&w.id, &w.condition, minutes as u32),
+                    )
+                }
+                Fate::FailCancel(why) => (
+                    "notification-failed",
+                    notify::watch_failed_notice(&w.id, &w.condition, why),
+                ),
+            };
+            self.audit(&w.group, "loomux", action, json!({
+                "id": w.id, "kind": w.condition.kind(), "agent": w.agent, "text": text,
+            }));
+            let _ = self.deliver_prompt(&w.agent, &text, "loomux", Delivery::MidSession);
+            fired.push(w.id.clone());
+        }
+        fired
+    }
+
+    /// One full notify cycle: poll due watches, then apply tick policy.
+    /// Called on a timer by `start_notify_poller`.
+    pub fn run_notify_tick(&self) -> Vec<String> {
+        let results = self.poll_watches();
+        self.notify_tick(now_ms(), &results)
     }
 
     // ---------- autonomous mode (#83): idle-tick + budget enforcement ----------
@@ -9752,6 +10068,10 @@ impl OrchRegistry {
         self.attn_quiet.lock_safe().remove(agent_id);
         self.attn_waiting_ack.lock_safe().remove(agent_id);
         self.attn_emitted.lock_safe().remove(agent_id);
+        // Notification backend (#243): a dead agent's watches are garbage —
+        // the pane they'd fire into is gone — covering idle-kill, kill_agent,
+        // a crash, and planner auto-close identically (they all funnel here).
+        self.cleanup_agent_watches(agent_id, &snapshot.group);
         let _ = fs::remove_file(
             self.group_dir(&snapshot.group).join("configs").join(format!("{agent_id}.json")),
         );
@@ -9849,6 +10169,20 @@ pub fn start_watchdog(reg: Arc<OrchRegistry>) {
     std::thread::spawn(move || loop {
         std::thread::sleep(WATCHDOG_INTERVAL);
         reg.run_watchdog(now_ms());
+    });
+}
+
+/// Background loop for the notification backend (#243): every
+/// `notify::NOTIFY_POLL_INTERVAL` it polls due watches (`gh pr checks` / `gh
+/// run view`, backend-owned argv only — see `gh_capture`) and delivers a
+/// `[loomux] notification …` into the registering agent's own pane the
+/// moment its condition is met, its TTL expires, or it fails
+/// `notify::NOTIFY_FAIL_STREAK_LIMIT` polls running. Started once at app
+/// setup, beside `start_watchdog`.
+pub fn start_notify_poller(reg: Arc<OrchRegistry>) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(notify::NOTIFY_POLL_INTERVAL);
+        reg.run_notify_tick();
     });
 }
 

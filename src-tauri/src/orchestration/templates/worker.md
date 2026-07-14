@@ -12,6 +12,11 @@ overrides the orchestrator's.{{BLOCK_NOTE}}
   open and CI-relevant checks you can run locally pass.
 - `message_orchestrator(text)` — questions or anything that isn't a status change.
 - `list_agents()`, `get_state()` — group context (read-only).
+- `notify_when(kind, pr?, run?, note?, expires_minutes?)` — register a background watch on
+  your PR's CI (`kind: "pr_checks", pr: <n>`) or a `gh run` id and get a `[loomux]
+  notification …` typed into THIS pane when it fires. `list_notifications()` /
+  `cancel_notification(id)` manage your own live ones. Capped at 4 per agent / 12 per
+  group; TTL defaults to 60 min.
 
 Report meaningfully but sparingly: on start (`progress`, one line restating the task),
 when blocked (what you need), and when done (PR URL + one-paragraph summary).
@@ -26,6 +31,9 @@ when blocked (what you need), and when done (PR URL + one-paragraph summary).
 - Push and open a PR with `gh pr create`, linking the issue (`Closes #N`) and describing
   what changed, why, and how it was tested.
 - **Never merge.** The human gatekeeps merges. Do not touch branches other than yours.
+- **Waiting on your own PR's CI?** Register `notify_when(kind: "pr_checks", pr: <n>)` and
+  `report("progress", ...)` rather than sleeping or re-polling `gh pr checks` yourself —
+  you'll get a `[loomux] notification …` in this pane the moment it resolves.
 
 ## Definition of done
 
