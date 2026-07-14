@@ -2273,6 +2273,15 @@ pub struct OrchRegistry {
     /// id this registry mints, so no `getrandom`-pulling crate is needed
     /// (CLAUDE.md constraint 2).
     notify_seq: AtomicU32,
+    /// Notification backend (#243): per-group "we last saw this group as
+    /// paused at tick-time T" bookkeeping, used by `notify_tick` to freeze
+    /// the TTL clock across a pause. A group appears here only while
+    /// currently believed paused by the tick mechanism; the entry is removed
+    /// (after crediting every one of its watches with the elapsed span) the
+    /// first tick that observes it unpaused. See `notify_tick`'s doc for why
+    /// this can't simply live on `pause_group`/`resume_group` (they use real
+    /// wall-clock time, which isn't the `now` a test injects).
+    paused_watch_since: Mutex<HashMap<String, u64>>,
 }
 
 fn now_ms() -> u64 {
@@ -3242,6 +3251,7 @@ impl OrchRegistry {
             audit_skips_notified: Mutex::new(HashMap::new()),
             watches: Mutex::new(HashMap::new()),
             notify_seq: AtomicU32::new(0),
+            paused_watch_since: Mutex::new(HashMap::new()),
         }
     }
 
@@ -4535,6 +4545,7 @@ impl OrchRegistry {
         }
         let now = now_ms();
         let expires_minutes = notify::clamp_expires_minutes(Some(expires_minutes));
+        let ttl_ms = expires_minutes as u64 * 60_000;
         let id = format!("n-{}", self.notify_seq.fetch_add(1, Ordering::Relaxed) + 1);
         let watch = notify::Watch {
             id: id.clone(),
@@ -4543,13 +4554,14 @@ impl OrchRegistry {
             condition,
             note,
             registered_ms: now,
-            deadline_ms: now + expires_minutes as u64 * 60_000,
+            deadline_ms: now + ttl_ms,
+            nominal_ttl_ms: ttl_ms,
             last_poll_ms: 0,
             fail_streak: 0,
         };
         watches.insert(id, watch.clone());
         drop(watches);
-        self.audit(group, agent, "notify-register", json!({
+        self.audit(group, agent, "watch-register", json!({
             "id": watch.id, "kind": watch.condition.kind(), "target": watch.condition.label(),
             "expires_minutes": expires_minutes,
         }));
@@ -4576,7 +4588,7 @@ impl OrchRegistry {
         }
         let w = watches.remove(id).expect("checked present above");
         drop(watches);
-        self.audit(&w.group, agent, "notify-cancel", json!({ "id": id }));
+        self.audit(&w.group, agent, "watch-cancel", json!({ "id": id }));
         Ok(())
     }
 
@@ -4595,7 +4607,7 @@ impl OrchRegistry {
             ids
         };
         if !removed.is_empty() {
-            self.audit(group, "loomux", "notify-cleanup", json!({ "agent": agent_id, "ids": removed }));
+            self.audit(group, "loomux", "watch-cleanup", json!({ "agent": agent_id, "ids": removed }));
         }
     }
 
@@ -4648,27 +4660,21 @@ impl OrchRegistry {
         }
     }
 
-    /// Impure half of one notify tick: pick up to `MAX_POLLS_PER_TICK` due
-    /// watches — round-robin by `last_poll_ms`, so a never-/oldest-polled
-    /// watch goes first — shell out to `gh` for each, and classify with the
-    /// pure predicates. A **paused** group's watches are skipped here too
-    /// (never mind classifying a result `notify_tick` will ignore anyway —
-    /// don't even spend the `gh` process on it).
+    /// Impure half of one notify tick: pick due watches via the pure
+    /// `notify::due_watches` selection policy (the per-tick cap, the
+    /// per-watch floor, round-robin ordering, and the paused-skip are all
+    /// tested there with no `gh`), shell out to `gh` for each, and classify
+    /// with the pure predicates.
     fn poll_watches(&self) -> HashMap<String, notify::PollResult> {
         let now = now_ms();
         let paused = self.paused.lock_safe().clone();
-        let interval_ms = notify::NOTIFY_POLL_INTERVAL.as_millis() as u64;
-        let mut due: Vec<notify::Watch> = {
+        let due: Vec<notify::Watch> = {
             let watches = self.watches.lock_safe();
-            watches
-                .values()
-                .filter(|w| !paused.contains(&w.group))
-                .filter(|w| now.saturating_sub(w.last_poll_ms) >= interval_ms)
-                .cloned()
+            notify::due_watches(now, &watches, &paused)
+                .into_iter()
+                .filter_map(|id| watches.get(&id).cloned())
                 .collect()
         };
-        due.sort_by_key(|w| w.last_poll_ms);
-        due.truncate(notify::MAX_POLLS_PER_TICK);
 
         let mut results = HashMap::new();
         for w in &due {
@@ -4714,6 +4720,31 @@ impl OrchRegistry {
     /// resulting notices, and return the ids that fired (met, expired, or
     /// failure-cancelled). No `gh` call anywhere in this function — every
     /// test drives it with a synthetic `results` map.
+    ///
+    /// **Freezing the TTL clock across a pause.** `deadline_ms` is an
+    /// absolute wall-clock timestamp, so merely *skipping the expiry check*
+    /// while paused is not enough: real time keeps passing underneath it, and
+    /// the first tick after a long pause would find every outstanding watch
+    /// already past its deadline — evaporating exactly the watches the
+    /// freeze exists to protect. So this tick first reconciles
+    /// `paused_watch_since`, a per-group "we last saw this paused starting at
+    /// tick-time T" record built entirely from the `now` values this function
+    /// is called with (never real wall-clock — `pause_group`/`resume_group`
+    /// use `now_ms()` directly and aren't reachable from a test's simulated
+    /// clock, so the bookkeeping has to live here instead, driven by the
+    /// ticks that actually observe the pause):
+    /// - A group newly observed paused (not already recorded) gets
+    ///   `paused_watch_since[group] = now` — the earliest a paused group can
+    ///   be caught is the very next tick, and `start_notify_poller` ticks
+    ///   every `NOTIFY_POLL_INTERVAL` regardless of any group's pause state,
+    ///   so this lags true pause-start by at most one poll interval.
+    /// - A group recorded as paused that is NOT paused any more (it resumed)
+    ///   gets every one of its watches' `deadline_ms` pushed forward by
+    ///   `now - paused_watch_since[group]` — the whole elapsed span, applied
+    ///   once — and the record is cleared, ready for a future pause/resume
+    ///   cycle. `nominal_ttl_ms` (fixed at registration) is what the expiry
+    ///   notice reports, precisely so this mutation of `deadline_ms` never
+    ///   corrupts the "expired after N min" figure shown to the agent.
     pub fn notify_tick(&self, now: u64, results: &HashMap<String, notify::PollResult>) -> Vec<String> {
         enum Fate {
             Fire(String),
@@ -4722,6 +4753,20 @@ impl OrchRegistry {
         }
         let paused = self.paused.lock_safe().clone();
 
+        let groups: HashSet<String> = self.watches.lock_safe().values().map(|w| w.group.clone()).collect();
+        let extend_by: HashMap<String, u64> = {
+            let mut since = self.paused_watch_since.lock_safe();
+            let mut extend = HashMap::new();
+            for g in groups {
+                if paused.contains(&g) {
+                    since.entry(g).or_insert(now);
+                } else if let Some(started) = since.remove(&g) {
+                    extend.insert(g, now.saturating_sub(started));
+                }
+            }
+            extend
+        };
+
         // Decide fates under the watches lock; deliver after releasing it —
         // delivery can block on a busy pane's per-pane delivery lock.
         let mut acted: Vec<(notify::Watch, Fate)> = Vec::new();
@@ -4729,9 +4774,13 @@ impl OrchRegistry {
             let mut watches = self.watches.lock_safe();
             let mut to_remove: Vec<String> = Vec::new();
             for (id, w) in watches.iter_mut() {
+                if let Some(extra) = extend_by.get(&w.group) {
+                    w.deadline_ms = w.deadline_ms.saturating_add(*extra);
+                }
                 // Paused: frozen solid — no poll (already true in
-                // `poll_watches`), no fire, and crucially no expiry either,
-                // so a long pause doesn't silently evaporate every watch.
+                // `poll_watches`), no fire, and (via the extension above,
+                // applied on the resuming tick) no expiry either — a long
+                // pause doesn't silently evaporate every watch.
                 if paused.contains(&w.group) {
                     continue;
                 }
@@ -4768,18 +4817,18 @@ impl OrchRegistry {
         for (w, fate) in acted {
             let (action, text) = match &fate {
                 Fate::Fire(summary) => (
-                    "notification-fired",
+                    "watch-fired",
                     notify::watch_fired_notice(&w.id, &w.condition, summary, &w.note),
                 ),
                 Fate::Expire => {
-                    let minutes = w.deadline_ms.saturating_sub(w.registered_ms) / 60_000;
+                    let minutes = w.nominal_ttl_ms / 60_000;
                     (
-                        "notification-expired",
+                        "watch-expired",
                         notify::watch_expired_notice(&w.id, &w.condition, minutes as u32),
                     )
                 }
                 Fate::FailCancel(why) => (
-                    "notification-failed",
+                    "watch-failed",
                     notify::watch_failed_notice(&w.id, &w.condition, why),
                 ),
             };

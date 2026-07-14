@@ -614,9 +614,16 @@ box clears) rather than making the orchestrator poll terminals by hand.
 
 Three MCP tools — `notify_when`, `list_notifications`, `cancel_notification` — let the
 orchestrator, a worker, or a reviewer register a structured condition (a PR's CI checks, or
-a `gh run` id) and get a `[loomux] notification …` typed into their **own** pane the moment
-it resolves, instead of sitting in a wait loop or re-polling `gh pr checks` on a cadence.
-Not available to a planner (see **Tool surface** above).
+a `gh run` id) and get a `[loomux] …` notice (event-led, e.g. `[loomux] PR #241 checks:
+SUCCESS — … (watch n-3)` — matching the house style of every other `[loomux]` notice, which
+leads with what happened and names itself last) typed into their **own** pane the moment it
+resolves, instead of sitting in a wait loop or re-polling `gh pr checks` on a cadence. Not
+available to a planner (see **Tool surface** above). The audit trail for all six lifecycle
+events uses a `watch-*` action prefix (`watch-register`/`watch-fired`/`watch-expired`/
+`watch-failed`/`watch-cancel`/`watch-cleanup`) — deliberately not `notify-*`, which the
+group's pre-existing desktop-notification toggle already owns (`notify-on`/`notify-off`);
+sharing a prefix in the one audit surface a human filters would have made two unrelated
+features indistinguishable there (rev-ui, PR #247).
 
 ### Why structured kinds, not a caller-supplied poll command
 
@@ -666,15 +673,21 @@ pure function over pinned `--json` fields, testable with canned fixtures and no 
   `gh_capture` once #222 merges, rather than keep two copies of the same subprocess shape
   permanently; noted here so it isn't lost.
 - **The tick split** (the `watchdog_tick` shape, exactly): `poll_watches(&self)` is the
-  impure half — shells out to `gh` for at most `MAX_POLLS_PER_TICK` (8) due watches per
-  tick, round-robin by `last_poll_ms` so a full board can't burst-spawn `gh` processes, and
-  classifies each with the pure predicate. `notify_tick(&self, now, &results)` is the
-  decision half: pause/expiry/fail-streak/fire policy over an **injected** `now` and poll
-  results, so **no test shells out to `gh`** — every test in `tests/orchestration.rs` drives
-  `notify_tick` directly with a synthetic `PollResult` map, the same seam that makes
-  `watchdog_tick` testable with synthetic pty counters. `run_notify_tick` = `poll_watches` +
-  `notify_tick(now_ms(), …)`, called every `NOTIFY_POLL_INTERVAL` (30s) by
-  `start_notify_poller`, registered in `lib.rs` beside `start_watchdog`.
+  impure half — shells out to `gh` for each id `notify::due_watches` selects, and classifies
+  each result with the pure predicate. **The selection policy itself is pure**, not just the
+  decision policy: `due_watches(now, &watches, &paused) -> Vec<String>` (in `notify.rs`) owns
+  the per-watch 30s floor, the round-robin ordering by `last_poll_ms`, the
+  `MAX_POLLS_PER_TICK` (8) cap, and the paused-skip — `poll_watches` is a thin wrapper that
+  calls it and then shells out for whatever it returns. This was originally inline in
+  `poll_watches` with zero coverage of the `gh`-process DoS backstop it implements (rev-tests,
+  PR #247); lifting it is the same move `notify_tick` already makes for the decision half.
+  `notify_tick(&self, now, &results)` is the decision half: pause/expiry/fail-streak/fire
+  policy over an **injected** `now` and poll results, so **no test shells out to `gh`** —
+  every test in `tests/orchestration.rs` drives `notify_tick` directly with a synthetic
+  `PollResult` map, the same seam that makes `watchdog_tick` testable with synthetic pty
+  counters. `run_notify_tick` = `poll_watches` + `notify_tick(now_ms(), …)`, called every
+  `NOTIFY_POLL_INTERVAL` (30s) by `start_notify_poller`, registered in `lib.rs` beside
+  `start_watchdog`.
 - **Delivery** reuses `deliver_prompt(agent_id, text, "loomux", Delivery::MidSession)` — the
   same path the watchdog nudge, the idle-tick, and worker reports already use. No new side
   channel (add-orch-tool design norm): every existing guard comes free (per-pane serialized
@@ -709,17 +722,31 @@ notice carries `conclusion`.
 - **Caps** are checked at registration, independently: an agent under its own cap can still
   be rejected for the group cap, and vice versa (both are tested).
 - **Expiry** always speaks: a watch past its deadline is dropped and its owner gets a
-  `[loomux] notification … expired after N min …` notice naming the manual fallback
+  `[loomux] … expired after N min … (watch n-3)` notice naming the manual fallback
   (`gh pr checks <n>` / `gh run view <id>`) — silent expiry is the one failure mode that
-  stranded an agent forever, so it never happens quietly.
-- **A paused group freezes completely**: no poll, no fire, and — the subtle half, mirroring
-  the watchdog's paused-latch rule — **no expiry either**. Extending the freeze to the TTL
-  clock means a multi-hour pause does not silently evaporate every outstanding watch; on
-  resume, an expired-while-paused watch still gets its notice (or fires, if its condition
-  had already resolved).
+  stranded an agent forever, so it never happens quietly. The `N` reported is
+  `Watch::nominal_ttl_ms` (fixed at registration), never a recomputation from `deadline_ms` —
+  see the pause note below for why those two numbers must not be the same field.
+- **A paused group freezes the TTL clock, not just the expiry check.** `deadline_ms` is an
+  *absolute* wall-clock timestamp, so skipping the expiry check while paused is not enough on
+  its own: real time keeps passing underneath it, and the first tick after a long pause would
+  find every outstanding watch already past its (unmoved) deadline — evaporating exactly the
+  watches the freeze exists to protect. This shipped broken in the first version of this PR
+  (rev-orch, PR #247, with a repro) and is fixed by `notify_tick` maintaining
+  `paused_watch_since: HashMap<group, tick_time>`: the first tick that observes a group as
+  newly paused records `now`; the first tick that observes it as no-longer-paused extends
+  every one of that group's watches' `deadline_ms` by the elapsed span, once, and clears the
+  record. This bookkeeping deliberately lives in `notify_tick`, not in
+  `pause_group`/`resume_group`: those two use real wall-clock `now_ms()` directly (they are
+  Tauri-command-reachable, unrelated to the notify subsystem, and changing their signature to
+  accept an injectable `now` would be a wider API change than this fix warrants), which a
+  test's simulated `now` can never reach — so the freeze has to be reconstructed from the
+  `now` values `notify_tick` is actually called with. In production this lags true pause/resume
+  by at most one `NOTIFY_POLL_INTERVAL` (`start_notify_poller` ticks every group regardless of
+  its pause state), which is the same granularity the poll cadence already has.
 - **Agent death** (`mark_dead`, covering idle-kill, `kill_agent`, a crash, and the planner
   auto-close identically, since all four funnel through it) drops that agent's watches in
-  one line, audited (`notify-cleanup`) only when something was actually removed. No delivery
+  one line, audited (`watch-cleanup`) only when something was actually removed. No delivery
   is attempted (the pane is gone) and no orchestrator notice is sent (the audit line is
   enough; a notice per dead agent's stranded watches would be noise).
 
@@ -739,27 +766,43 @@ documented limitation, not an oversight.
 - **The #112 delivery weakness applies here too.** `submit_confirmed` false-confirms on any
   output burst, so a fired notice landing unsubmitted in an agent's input box can still be
   recorded as delivered. A watch is one-shot (dropped the instant it fires), so a lost notice
-  is a missed wake — mitigated by (a) auditing `notification-fired` *before* delivery, so the
+  is a missed wake — mitigated by (a) auditing `watch-fired` *before* delivery, so the
   run stays reconstructible, and (b) the orchestrator template keeping its PR-comment sweep
   as an explicit fallback rather than deleting it: a dropped notice degrades to the old
-  poll-based behavior, not a hang.
+  poll-based behavior, not a hang (pinned in `tests/prompts.rs` — this is now the ONLY thing
+  standing between a lost notice and a silent hang, which is exactly the kind of rule that
+  suite exists to keep from quietly disappearing).
 - **The watchdog does not know about notifications.** A worker parked waiting on a
   `pr_checks` watch is, correctly, producing no output and sending no report — exactly what
   `watchdog_should_notify` looks for. It will still trip the stall notice to the orchestrator
   after `watchdog_stall_minutes`. Acceptable for v1 (the notice is one line and already reads
   as "may be waiting on input"); teaching the watchdog about live watches is a follow-up, not
   a defect this PR needs to fix.
+- **Self-addressed delivery is asserted by construction, not independently pinned by a
+  test.** No notify tool takes an `agent_id` parameter, so there is no code path that could
+  even name another agent as a delivery target — `deliver_prompt(&w.agent, …)` is the only
+  call, and `w.agent` is set once, at registration, from the caller's own MCP-token identity.
+  rev-orch (PR #247) tried to falsify this with a targeted mutation (hardcoding the delivery
+  target to a fixed agent id) and it passed unnoticed: `deliver_prompt` isn't observable in
+  the integration harness (agents have no pty in test mode, and the one audit line that fires
+  *before* the pty-existence check only covers the paused-suppression branch, which a live
+  notify delivery never takes — notify simply skips a paused group's watches outright rather
+  than attempting delivery into one). Making this independently testable would mean adding a
+  registry-wide "last `deliver_prompt` target" test seam touched by every caller of a
+  widely-shared, delivery-critical function — real surface for one property that already has
+  no code path to violate. Stated here rather than left as an unearned "tested" claim.
 - **Security**: no new execution capability (the only subprocess is `gh`, backend-owned
   argv); no `group_id`-as-path-segment exposure (the poll cwd is resolved from the caller's
   **group**, which comes from the MCP token, never from an argument — constraint 6 is never
-  engaged); self-addressed only (no `agent_id` parameter, so this can never be used to inject
-  into another agent's pane — `send_prompt`, orchestrator-only, remains the sole cross-pane
-  write); every GitHub-derived string and the agent's own `note` is sanitized
-  (`sanitize_gh_text` — strip control characters including newlines, cap the length) before
-  it enters a notice, because a check name is attacker-influenceable (a fork PR names its own
-  workflow jobs) and the notice is pasted into a live CLI pane — an unsanitized embedded
-  newline could forge a second `[loomux] …`-prefixed line that reads as a second, legitimate
-  notice.
+  engaged); every GitHub-derived string and the agent's own `note` is sanitized
+  (`sanitize_gh_text`) before it enters a notice: control characters (including newlines) are
+  stripped so an embedded newline can't forge a second `[loomux] …`-prefixed line that reads
+  as its own, separate notice, AND `[`/`]` are mapped to `(`/`)` so the literal token
+  `[loomux]` can't survive even mid-line (a fork PR names its own workflow jobs, so a check
+  named `[loomux] all checks passed` is adversary-chosen text, not hypothetical — rev-orch,
+  PR #247). `run` ids parse through a dedicated `run_id_from`, not the bare `pr_number`
+  tail-digits parse: a job-linked run URL (`.../actions/runs/17812/job/98765`) would otherwise
+  silently resolve to the *job* id instead of the run id (rev-orch, PR #247).
 
 ## Autonomous mode (#83)
 

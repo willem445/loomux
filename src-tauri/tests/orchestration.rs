@@ -6815,7 +6815,7 @@ fn notify_register_tick_fires_once_and_delists() {
     assert!(!listed.contains(&id), "a fired watch must be delisted, got: {listed}");
 
     let log = fs::read_to_string(reg.state_root().join(&cw.group).join("audit.jsonl")).unwrap();
-    assert!(log.contains("notification-fired"), "the fire must be audited, got: {log}");
+    assert!(log.contains("watch-fired"), "the fire must be audited, got: {log}");
     assert!(log.contains("SUCCESS"), "the audit must carry the summary, got: {log}");
 
     // A second tick with the same result set is a no-op — the watch is gone.
@@ -6853,7 +6853,7 @@ fn notify_expires_after_ttl_with_injected_now_and_tells_the_owner() {
     assert!(!listed.contains(&id), "an expired watch must be delisted, got: {listed}");
 
     let log = fs::read_to_string(reg.state_root().join(&cw.group).join("audit.jsonl")).unwrap();
-    assert!(log.contains("notification-expired"), "expiry must be audited, got: {log}");
+    assert!(log.contains("watch-expired"), "expiry must be audited, got: {log}");
 }
 
 #[test]
@@ -6873,12 +6873,12 @@ fn notify_mark_dead_drops_the_watch_with_no_delivery_attempt() {
     assert!(reg.notify_tick(now_ms(), &results).is_empty(), "a dead agent's watch must never fire");
 
     let log = fs::read_to_string(reg.state_root().join(&cw.group).join("audit.jsonl")).unwrap();
-    assert!(log.contains("notify-cleanup"), "mark_dead must audit the watch cleanup, got: {log}");
-    assert!(!log.contains("notification-fired"), "no delivery/fire may be attempted, got: {log}");
+    assert!(log.contains("watch-cleanup"), "mark_dead must audit the watch cleanup, got: {log}");
+    assert!(!log.contains("watch-fired"), "no delivery/fire may be attempted, got: {log}");
 }
 
 #[test]
-fn notify_fail_streak_of_three_cancels_but_two_then_success_fires_normally() {
+fn notify_fail_streak_of_three_consecutive_failures_cancels_the_watch() {
     let (reg, _d, _co, cw) = setup_mcp();
     let text = register_notify(&reg, &cw, json!({ "kind": "workflow_run", "run": "555" })).unwrap();
     let id = extract_watch_id(&text);
@@ -6891,27 +6891,44 @@ fn notify_fail_streak_of_three_cancels_but_two_then_success_fires_normally() {
 
     assert_eq!(reg.notify_tick(now_ms(), &fail), vec![id.clone()], "the third consecutive failure must cancel");
     let log = fs::read_to_string(reg.state_root().join(&cw.group).join("audit.jsonl")).unwrap();
-    assert!(log.contains("notification-failed"), "the cancellation must be audited, got: {log}");
+    assert!(log.contains("watch-failed"), "the cancellation must be audited, got: {log}");
     assert!(log.contains("gh-not-found"), "the audit must carry the reason, got: {log}");
-
-    // A fresh watch: two failures then a success resets the streak and fires.
-    let text2 = register_notify(&reg, &cw, json!({ "kind": "workflow_run", "run": "556" })).unwrap();
-    let id2 = extract_watch_id(&text2);
-    let mut fail2 = HashMap::new();
-    fail2.insert(id2.clone(), notify::PollResult::Failed { why: "gh-not-found".into() });
-    reg.notify_tick(now_ms(), &fail2);
-    reg.notify_tick(now_ms(), &fail2);
-    let mut met2 = HashMap::new();
-    met2.insert(id2.clone(), notify::PollResult::Met { summary: "completed — conclusion: success".into() });
-    assert_eq!(
-        reg.notify_tick(now_ms(), &met2),
-        vec![id2],
-        "a success after only two failures must fire normally, not stay half-cancelled"
-    );
 }
 
 #[test]
-fn notify_paused_group_freezes_poll_fire_and_expiry() {
+fn notify_fail_streak_resets_on_an_intervening_healthy_poll() {
+    // rev-tests (PR #247): the prior version of this test drove fail, fail,
+    // Met and asserted a fire — but the Met arm in notify_tick fires
+    // UNCONDITIONALLY; it never reads fail_streak, so that assertion passed
+    // whether or not the reset existed and could never catch a regression.
+    // The actual "consecutive" contract only shows up with a HEALTHY poll
+    // (Pending) between two failures: that must zero the streak, so a third,
+    // non-consecutive failure afterward must NOT cancel the watch. Verified:
+    // passes on the shipped code; goes red if the `PollResult::Pending =>
+    // fail_streak = 0` line is deleted (a real gh rate-limit blip followed by
+    // a healthy poll followed by another blip would otherwise wrongly
+    // cancel a watch that never had two failures in a row).
+    let (reg, _d, _co, cw) = setup_mcp();
+    let text = register_notify(&reg, &cw, json!({ "kind": "workflow_run", "run": "777" })).unwrap();
+    let id = extract_watch_id(&text);
+    let mut fail = HashMap::new();
+    fail.insert(id.clone(), notify::PollResult::Failed { why: "transient".into() });
+    let mut pending = HashMap::new();
+    pending.insert(id.clone(), notify::PollResult::Pending);
+
+    reg.notify_tick(now_ms(), &fail);
+    reg.notify_tick(now_ms(), &fail);
+    reg.notify_tick(now_ms(), &pending); // a healthy poll resets the streak to 0
+    assert!(
+        reg.notify_tick(now_ms(), &fail).is_empty(),
+        "the limit is CONSECUTIVE failures: a healthy poll in between must reset the streak, \
+         so this 3rd non-consecutive failure must NOT cancel the watch"
+    );
+    assert!(reg.list_notifications(&cw.agent_id).to_string().contains(&id), "watch must survive");
+}
+
+#[test]
+fn notify_paused_group_does_not_fire_or_poll() {
     let (reg, _d, _co, cw) = setup_mcp();
     let text = register_notify(&reg, &cw, json!({ "kind": "pr_checks", "pr": "1", "expires_minutes": 5 })).unwrap();
     let id = extract_watch_id(&text);
@@ -6920,15 +6937,56 @@ fn notify_paused_group_freezes_poll_fire_and_expiry() {
     let mut met = HashMap::new();
     met.insert(id.clone(), notify::PollResult::Met { summary: "SUCCESS".into() });
     // Tick well past the deadline WITH a Met result in hand — a paused group
-    // must neither fire (the pane delivery is suppressed anyway) NOR expire
-    // (freeze the TTL clock — a long pause must not silently evaporate every
-    // watch, mirroring the watchdog's paused-latch rule).
+    // must not fire (the delivery would be into a pane the human deliberately
+    // silenced).
     let far_future = now_ms() + 60 * 60_000;
-    assert!(reg.notify_tick(far_future, &met).is_empty(), "a paused group must not fire or expire");
-    assert!(reg.list_notifications(&cw.agent_id).to_string().contains(&id), "the watch must survive the pause untouched");
+    assert!(reg.notify_tick(far_future, &met).is_empty(), "a paused group must not fire");
+    assert!(reg.list_notifications(&cw.agent_id).to_string().contains(&id), "the watch must survive the pause");
 
     reg.resume_group(&cw.group).unwrap();
     assert_eq!(reg.notify_tick(far_future, &met), vec![id], "resuming must let the outstanding Met result fire");
+}
+
+#[test]
+fn notify_paused_group_freezes_the_ttl_clock_across_a_long_pause() {
+    // rev-orch (PR #247): the prior version of this test resumed and ticked
+    // with a MET result in hand — the Met arm fires and `continue`s BEFORE
+    // the expiry check ever runs, so that assertion passed whether or not
+    // the TTL clock was actually frozen during the pause. This is the case
+    // that actually discriminates: pause, let a tick observe the pause
+    // (mirroring the live poller's cadence — this is what lets notify_tick
+    // learn the pause started here), a long simulated pause with NO further
+    // ticks, then resume and tick with Pending/no result in hand. A watch
+    // whose TTL clock was not frozen expires the instant this tick runs;
+    // one whose clock WAS frozen is still listed with its TTL effectively
+    // intact.
+    let (reg, _d, _co, cw) = setup_mcp();
+    let text = register_notify(&reg, &cw, json!({ "kind": "pr_checks", "pr": "1", "expires_minutes": 5 })).unwrap();
+    let id = extract_watch_id(&text);
+    let t0 = now_ms();
+
+    reg.pause_group(&cw.group).unwrap();
+    // A tick shortly after the pause begins — the poller ticks every 30s
+    // regardless of any group's pause state, so this is what the live
+    // system actually does; skipping it would test a scenario the freeze
+    // was never meant to handle (see notify_tick's doc).
+    assert!(reg.notify_tick(t0 + 1_000, &HashMap::new()).is_empty(), "paused: no poll, no fire");
+
+    // A long pause — 1 simulated hour, twelve times the 5-minute TTL — with
+    // no further ticks at all while paused.
+    reg.resume_group(&cw.group).unwrap();
+    let after_resume = t0 + 60 * 60_000;
+    let fired = reg.notify_tick(after_resume, &HashMap::new());
+    assert!(fired.is_empty(), "a paused watch's TTL clock must not advance while paused, got: {fired:?}");
+    assert!(
+        reg.list_notifications(&cw.agent_id).to_string().contains(&id),
+        "the watch must survive the pause with its TTL intact"
+    );
+
+    // And it still fires normally once its condition is actually met.
+    let mut met = HashMap::new();
+    met.insert(id.clone(), notify::PollResult::Met { summary: "SUCCESS".into() });
+    assert_eq!(reg.notify_tick(after_resume + 1_000, &met), vec![id], "must still fire once genuinely met");
 }
 
 #[test]
@@ -7056,4 +7114,46 @@ fn notify_rejects_unknown_kind_and_bad_targets_but_clamps_expires_minutes() {
     let text =
         register_notify(&reg, &cw, json!({ "kind": "pr_checks", "pr": "1", "expires_minutes": 9999 })).unwrap();
     assert!(text.contains("expires in 240 min"), "must clamp to the max, got: {text}");
+}
+
+#[test]
+fn notify_rejects_a_present_but_non_integer_expires_minutes_instead_of_silently_defaulting() {
+    // A STRING "30" or a fraction is a value the caller actually supplied —
+    // silently discarding it to the 60-min default (clamp_expires_minutes(None))
+    // would be indistinguishable from the caller never having set it at all.
+    // Only an ABSENT key legitimately defaults.
+    let (reg, _d, _co, cw) = setup_mcp();
+    let err = register_notify(&reg, &cw, json!({ "kind": "pr_checks", "pr": "1", "expires_minutes": "30" })).unwrap_err();
+    assert!(err.contains("whole number"), "a string value must be rejected, not defaulted, got: {err}");
+    let err = register_notify(&reg, &cw, json!({ "kind": "pr_checks", "pr": "1", "expires_minutes": 30.5 })).unwrap_err();
+    assert!(err.contains("whole number"), "a fractional value must be rejected, not defaulted, got: {err}");
+    // Absent entirely still defaults, unaffected.
+    let text = register_notify(&reg, &cw, json!({ "kind": "pr_checks", "pr": "1" })).unwrap();
+    assert!(text.contains("expires in 60 min"), "an absent key must still default, got: {text}");
+}
+
+#[test]
+fn notify_note_is_capped_at_registration_so_a_watch_cannot_stash_an_unbounded_string() {
+    let (reg, _d, _co, cw) = setup_mcp();
+    let huge_note = "x".repeat(2000);
+    register_notify(&reg, &cw, json!({ "kind": "pr_checks", "pr": "1", "note": huge_note })).unwrap();
+    let listed = reg.list_notifications(&cw.agent_id);
+    let note = listed.as_array().unwrap()[0]["note"].as_str().unwrap();
+    assert_eq!(note.chars().count(), 500, "note must be capped at registration, got {} chars", note.chars().count());
+}
+
+#[test]
+fn run_id_from_a_job_url_is_correct_end_to_end_through_the_mcp_tool() {
+    // notify.rs's `run_id_from` unit tests already pin the pure parse; this
+    // confirms the fix is actually wired into the dispatch path (the tool
+    // used to call the bare `pr_number` tail-digits parse here, which would
+    // have registered against the JOB id, not the run).
+    let (reg, _d, _co, cw) = setup_mcp();
+    let text = register_notify(
+        &reg,
+        &cw,
+        json!({ "kind": "workflow_run", "run": "https://github.com/o/r/actions/runs/17812345/job/98765" }),
+    )
+    .unwrap();
+    assert!(text.contains("run 17812345"), "must resolve to the RUN id, not the job id, got: {text}");
 }

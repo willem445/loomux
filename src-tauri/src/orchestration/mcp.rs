@@ -200,7 +200,7 @@ fn tool_defs(role: Role) -> Vec<Value> {
                 }),
                 &["kind"]),
             tool("list_notifications",
-                "List your OWN live notifications (id, kind, target, note, registered/expiry times). Notifications do not survive a loomux restart, and this is your only memory of what you registered — call it on session start and after a /compact, and re-register anything you were still waiting on.",
+                "List your OWN live notifications (id, kind, target, note, registered/expiry times), read fresh from the live registry. A loomux restart empties the registry, so a watch is gone and must be re-registered from scratch; a /compact only drops YOUR memory of it — the watch is still live, and this call recovers what it was. Call it on session start and after a /compact, and re-register anything a restart actually lost.",
                 json!({}), &[]),
             tool("cancel_notification",
                 "Cancel one of your own live notifications by id (e.g. because the PR it watched got closed).",
@@ -454,7 +454,11 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                 }
                 "workflow_run" => {
                     let raw = arg_str(args, "run").ok_or("run required for workflow_run")?;
-                    let run = super::pr_number(raw)
+                    // `run_id_from`, not the bare `pr_number` tail-digits parse:
+                    // a run URL can carry a trailing `/job/<id>` segment whose
+                    // digits are a DIFFERENT number (the job id), which
+                    // `pr_number` would silently return instead.
+                    let run = super::notify::run_id_from(raw)
                         .ok_or_else(|| format!("cannot parse a run id from {raw:?}"))?;
                     super::notify::Condition::WorkflowRun { run }
                 }
@@ -473,8 +477,21 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             // boundary (the note is sanitized separately before it ever
             // enters a notice).
             let note: String = arg_str(args, "note").unwrap_or("").chars().take(500).collect();
-            let requested = args.get("expires_minutes").and_then(Value::as_u64).map(|n| n as u32);
-            let expires_minutes = super::notify::clamp_expires_minutes(requested);
+            // Present-but-not-a-whole-number (a JSON string, a fraction) is
+            // REJECTED, not silently discarded to the default: the caller
+            // did supply a value, and clamp_expires_minutes(None) would
+            // otherwise turn "30" or 30.5 into a mysterious 60 with no
+            // signal anything was wrong. Absent entirely is the one case
+            // that legitimately defaults.
+            let expires_minutes = match args.get("expires_minutes") {
+                None => super::notify::clamp_expires_minutes(None),
+                Some(v) => match v.as_u64() {
+                    Some(n) => super::notify::clamp_expires_minutes(Some(n as u32)),
+                    None => {
+                        return Err(format!("expires_minutes must be a whole number of minutes, got: {v}"))
+                    }
+                },
+            };
             let w = reg.register_notification(&caller.group, &caller.agent_id, condition, note, expires_minutes)?;
             Ok(format!(
                 "registered {} ({}), polled every 30s, expires in {expires_minutes} min. \
