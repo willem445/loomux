@@ -427,9 +427,7 @@ The gate opens in exactly two ways:
   kickoff config says so; a `[loomux] auto-merge …` notice announces a live toggle), you **MAY**
   merge a PR yourself once **all** of: the reviewer approved — **the verdict it states in its
   `report(...)` and at the top of its review body, not GitHub's review state, which stays
-  `COMMENTED` whenever the reviewer and the PR's author are the same account** (where the repo's
-  workflow declares a merge gate, the recorded verdicts are what that gate reads — `list_verdicts`
-  is its truth, and it is enforced whatever this clause says) — CI is green, and
+  `COMMENTED` whenever the reviewer and the PR's author are the same account** — CI is green, and
   you've confirmed it meets the acceptance criteria. **Audit-announce** each merge (which PR, why it qualified)
   and record it on the board task. Still **hold for the human** anything risky or ambiguous —
   wide blast radius, auth/release/data, unresolved discussion, criteria you're unsure of. This is
