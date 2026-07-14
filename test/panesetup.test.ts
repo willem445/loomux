@@ -171,6 +171,34 @@ test("a git pane plans a root + name, and nothing else", () => {
   assert.deepEqual(res.plan, { kind: "git", root: "/repo/x", name: "x" });
 });
 
+// ---------- workflow (#222) ----------
+
+test("a workflow pane needs a repository, and plans a root + name and nothing else", () => {
+  // Same one rule as its three siblings, for the same reason: `.loomux/workflow.yml` is a
+  // file IN a repo, so a rootless workflow pane has no workflow to show. What it must NOT
+  // do is demand the FILE exist — a repo without one is the normal starting point, and the
+  // pane offers to create it (see the launcher's probe, which stops at the directory).
+  const missing = planPaneSetup(input({ kind: "workflow", repo: "  " }));
+  assert.ok(!missing.ok && missing.focus === "repo");
+  assert.match(missing.ok ? "" : missing.error, /repositor/i);
+
+  const res = planPaneSetup(input({ kind: "workflow", repo: " C:/Projects/loomux ", name: " flow " }));
+  assert.ok(res.ok);
+  assert.deepEqual(res.plan, { kind: "workflow", root: "C:/Projects/loomux", name: "flow" });
+});
+
+test("every content kind is a content kind — the predicate the form hides fields off", () => {
+  // The form hides its CLI / count / worktree / autopilot / shell fields off this ONE
+  // predicate rather than listing the kinds at each site. A kind missing from it would
+  // silently render an agent's fields on a pane that can never spawn a process.
+  for (const kind of ["files", "editor", "git", "workflow"] as const) {
+    assert.equal(isContentKind(kind), true, `${kind} must be a content kind`);
+  }
+  for (const kind of ["agent", "orchestrator", "terminal"] as const) {
+    assert.equal(isContentKind(kind), false);
+  }
+});
+
 test("both new kinds default their name to the root's own short name", () => {
   const editor = planPaneSetup(input({ kind: "editor", repo: "C:\\Projects\\loomux\\", name: "" }));
   assert.ok(editor.ok && editor.plan.kind === "editor");

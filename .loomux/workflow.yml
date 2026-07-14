@@ -1,0 +1,125 @@
+# loomux's own agent workflow (#222) — the repo dogfoods its own feature.
+#
+# Turn the **advanced orchestrator** on in the launcher and this file *is* the
+# roster: two worker tiers and three focused reviewers, instead of the built-in
+# one-worker/one-reviewer pair. With the toggle off, this file is not even opened.
+#
+# Each block's persona is a file in `.github/agents/`, which is Copilot's own
+# custom-agent convention — so a `cli: copilot` block loads it natively
+# (`copilot --agent rev-orch`), and a `cli: claude` block gets the same text
+# compiled into `claude --agents '<json>' --agent rev-orch`. One set of personas,
+# both CLIs. Flip any `cli:` below and the persona follows.
+#
+# The `model:` on a block is the ONE source of truth for what that block runs — it
+# is deliberately not repeated in the persona files, because two spellings of a
+# pinned model is exactly the drift this feature exists to remove.
+
+version: 1
+name: loomux
+
+blocks:
+  # The orchestrator is loomux's trust root: a repo file may pin its cli/model and
+  # nothing else (no prompt:, no profile:, no allow:). That is a parse error, on
+  # purpose — see doc/design/workflows.md.
+  - id: orchestrator
+    name: Orchestrator
+    kind: orchestrator
+    cli: claude
+    model: opus
+
+  - id: planner
+    name: Planner
+    kind: planner
+    cli: claude
+    model: opus
+
+  # ── the two worker tiers ────────────────────────────────────────────────────
+  # The orchestrator routes on these descriptions. Deep first: it is the default
+  # for a bare `spawn_agent(kind: "worker")`, and a wrong-tier deep worker costs
+  # tokens while a wrong-tier quick worker costs a bad diff.
+
+  - id: worker-deep
+    name: Deep worker
+    kind: worker
+    cli: claude
+    model: opus
+    profile: .github/agents/worker-deep.md
+
+  - id: worker-quick
+    name: Quick worker
+    kind: worker
+    cli: claude
+    model: haiku
+    profile: .github/agents/worker-quick.md
+
+  # ── three focused reviewers, one per real review lane ───────────────────────
+  # Each reviews ONLY its lane and stays out of the others'. rev-orch runs the
+  # strong tier: it holds the security surface (gate/shim, capability closure, the
+  # group_id trust boundary) where a missed defect is not a nit.
+  #
+  # ALL THREE run on EVERY PR — including a one-line typo fix from worker-quick, and
+  # the merge gate below needs all three verdicts, so this is not a lane you can skip
+  # to save a spawn. A reviewer whose lane the PR does not touch reads the diff, says
+  # so, and records `pass` in one turn; that abstention is cheap, and the alternative
+  # (letting the orchestrator decide which lanes a diff "really" touches) is how a
+  # backend change that arrived disguised as a docs PR goes unreviewed.
+
+  - id: rev-orch
+    name: Backend review
+    kind: reviewer
+    cli: claude
+    model: opus
+    profile: .github/agents/rev-orch.md
+
+  - id: rev-ui
+    name: Frontend review
+    kind: reviewer
+    cli: claude
+    model: sonnet
+    profile: .github/agents/rev-ui.md
+
+  - id: rev-tests
+    name: Test-quality review
+    kind: reviewer
+    cli: claude
+    model: sonnet
+    profile: .github/agents/rev-tests.md
+
+# ADVISORY — the declared happy path, not a schedule. loomux does not walk these;
+# the orchestrator still decides what to serialize, what to parallelize across
+# worktrees, and when to plan first. The rework loop (reviewer findings → back to
+# the worker that wrote the PR → re-review of the new head) is left unwritten for
+# the same reason: it is the orchestrator's loop to run, not an edge to execute.
+edges:
+  - { from: orchestrator, to: [planner, worker-deep, worker-quick] }
+  - { from: planner, to: [worker-deep, worker-quick] }
+  - { from: worker-deep, to: [rev-orch, rev-ui, rev-tests] }
+  - { from: worker-quick, to: [rev-orch, rev-ui, rev-tests] }
+
+# ENFORCED — the gh shim refuses `gh pr merge` until this is satisfied, whatever
+# an agent believes about its own approval (that is what #151 taught).
+#
+# WHY all-pass AND NOT `threshold: 2` — read this before "loosening" it (rev-14 F1):
+# the reviewers above are LANE-SCOPED, and a reviewer whose lane a PR doesn't touch
+# is told to record a `pass` immediately ("outside my lane") rather than to stay
+# silent. To the gate an abstention is indistinguishable from an approval — it counts
+# a `pass`, not a lane. So on a backend-only PR, `rev-ui` and `rev-tests` can abstain
+# in seconds and satisfy `threshold: 2` **while `rev-orch` — the only reviewer whose
+# lane it actually is, and the slowest by construction, because its persona tells it
+# to reproduce findings and run the suite — is still working.** The gate would open on
+# two agents that said in as many words that they had not reviewed the change.
+#
+# all-pass costs nothing to fix that: the orchestrator is already told to run EVERY
+# reviewer block on every PR, and the out-of-lane ones pass immediately, so the same
+# three verdicts are recorded either way. What all-pass buys is the guarantee that the
+# in-lane reviewer is one of them. (`threshold: N` is the right tool when reviewers are
+# INTERCHANGEABLE — "any 2 of these 5" — which is exactly what a lane-scoped roster is
+# not. Its other use, tolerating a dead reviewer, is a job for the human, not the gate.)
+#
+# A `fail` or `escalate` from any reviewer refuses the merge whatever the others
+# recorded (blockers beat approvals), and every pass dies the moment the branch moves.
+gates:
+  merge:
+    require: all-pass
+    reviewers: [rev-orch, rev-ui, rev-tests]
+    also: [ci-green]
