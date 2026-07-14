@@ -92,12 +92,22 @@ export interface WorkflowPreview {
   extra_tiers: string[] | null;
 }
 
-/** The launcher's own hard ceiling on `max_agents` (`numberInput(4, 1, 12)`
- *  below) — mirrors `MAX_AGENTS_CEILING` in `src-tauri/src/orchestration/mod.rs`.
- *  Kept as one named constant, rather than the `12` the form field already
- *  hardcoded, so the capacity advisory below can reason about "the most this
- *  cap could ever reach" instead of silently assuming the recommendation
- *  always fits under whatever the input's `max` happens to be. */
+/** The launcher's own hard ceiling on `max_agents` (`numberInput(4, 1,
+ *  MAX_AGENTS_CEILING)` in launcher.ts) — mirrors the backend's
+ *  `const MAX_AGENTS_CEILING: u32 = 12;` in
+ *  `src-tauri/src/orchestration/mod.rs` (not `pub`, so it can't be imported —
+ *  this is a deliberate duplicate, not a shared source). Kept as one named
+ *  constant, rather than the bare `12` the form field used to hardcode, so the
+ *  capacity advisory below can reason about "the most this cap could ever
+ *  reach" instead of silently assuming the recommendation always fits under
+ *  whatever the input's `max` happens to be.
+ *
+ *  **Keep in sync with the Rust constant by hand** — nothing at the type
+ *  level enforces it. `test/roster.test.ts`'s
+ *  `"MAX_AGENTS_CEILING mirrors the Rust source it's duplicated from"` reads
+ *  `mod.rs`'s literal and fails loudly the day the two disagree; if that
+ *  constant's declaration ever moves or is reworded, update the regex there
+ *  too. */
 export const MAX_AGENTS_CEILING = 12;
 
 /** #255: the agent-capacity a declared workflow needs, mirrored from the
@@ -327,11 +337,22 @@ export function capacityWarning(r: ResolvedRoster, maxAgents: number): string | 
       : "";
 
   if (maxAgents < minimum) {
-    return (
+    const base =
       `This workflow's merge gate needs ${reviewerPart}${workerPart} (minimum ${minimum} live agents) to run ` +
-      `one review round without evicting a live agent — max_agents is ${maxAgents}. Raise it to at least ` +
-      `${minimum}, or ${target} to run every declared tier at once${overCeiling}.`
-    );
+      `one review round without evicting a live agent — max_agents is ${maxAgents}.`;
+    // Exotic (a gate needing 13+ reviewers), but real: when even the ceiling
+    // can't reach `minimum`, "raise to N to run every declared tier at once"
+    // is false twice over — N wouldn't even cover one review round, so
+    // raising to it would leave this very warning lit. Say the wall plainly
+    // instead of offering a fix that doesn't land (rev-2 non-blocking #2).
+    if (target < minimum) {
+      return (
+        `${base} This workflow's minimum itself (${minimum}) is above loomux's ${MAX_AGENTS_CEILING}-agent ` +
+        `limit — ${MAX_AGENTS_CEILING} is the highest max_agents can go, and even that will not cover one ` +
+        `full review round without evictions.`
+      );
+    }
+    return `${base} Raise it to at least ${minimum}, or ${target} to run every declared tier at once${overCeiling}.`;
   }
   const extras = extraTiers.length ? joinWithAnd(extraTiers) : "some of its declared tiers";
   return (

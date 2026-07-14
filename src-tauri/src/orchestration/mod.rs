@@ -4938,16 +4938,27 @@ impl OrchRegistry {
             // would happen. The gate file written at launch stands; the drift audit
             // tells the human the repo has moved on.
             self.audit_workflow_drift(&id, repo, &guardrails);
-            // #255 (rev-1 B2): the roster and gate are PINNED on a resume, not
-            // re-read — but they still describe a real structural minimum, and a
-            // resumed session can outgrow it exactly as a fresh one can (a human
-            // lowers the live cap mid-run, or just never raised it to begin with).
-            // `guardrails.blocks` is already the persisted, clamped roster; the gate
-            // file on disk is the one the original launch wrote and this branch
-            // deliberately never touches — both are exactly what the pinned session
-            // is running under, so deriving from them here (rather than skipping the
-            // check because "the file wasn't re-read") is correct, not a re-read.
-            capacity = Some(workflow::recommend_capacity(&guardrails.blocks, self.merge_gate(&id).as_ref()));
+            // #255 (rev-1 B2 / rev-2 non-blocking #1): the roster and gate are
+            // PINNED on a resume, not re-read — but they still describe a real
+            // structural minimum, and a resumed session can outgrow it exactly as
+            // a fresh one can (a human lowers the live cap mid-run, or just never
+            // raised it to begin with). `guardrails.blocks` is already the
+            // persisted, clamped roster; the gate file on disk is the one the
+            // original launch wrote and this branch deliberately never touches —
+            // both are exactly what the pinned session is running under, so
+            // deriving from them here (rather than skipping the check because
+            // "the file wasn't re-read") is correct, not a re-read.
+            //
+            // Gated on `roster_is_custom`: this whole feature is about a DECLARED
+            // workflow's structural need, and a group with no workflow file has
+            // none to derive — its Fresh launch (the `Ok(None)` arm above) leaves
+            // `capacity` at `None` for exactly that reason. Without this check a
+            // resumed built-in-roster group (advanced toggle on, no `workflow.yml`)
+            // would get capacity audits its own fresh launch never emitted, and the
+            // note would say "this workflow's minimum" about a group that has none.
+            if workflow::roster_is_custom(&guardrails.blocks) {
+                capacity = Some(workflow::recommend_capacity(&guardrails.blocks, self.merge_gate(&id).as_ref()));
+            }
         } else {
             // The toggle is off, so the workflow is not running — and neither is its
             // gate. Clearing it here is what makes "the default experience is

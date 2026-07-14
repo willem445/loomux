@@ -7141,6 +7141,59 @@ fn a_resumed_session_re_checks_the_pinned_roster_against_the_live_cap_too() {
     assert_eq!(warn.detail["minimum"], 3);
 }
 
+#[test]
+fn a_resumed_group_with_no_declared_workflow_gets_no_capacity_audit_either() {
+    use std::sync::Arc;
+    // rev-2 non-blocking #1: this feature is about a DECLARED workflow's
+    // structural need. A fresh launch with the advanced toggle on but no
+    // `.loomux/workflow.yml` audits nothing at all — the `Ok(None)` arm never
+    // computes a `CapacityRecommendation`, so there's nothing to check the cap
+    // against. A resume of that same group must land in exactly the same
+    // silence, not start auditing the built-in roster's own (accidental)
+    // numbers just because the resume branch has blocks and a gate lookup to
+    // feed `recommend_capacity` with.
+    let state = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap(); // no .loomux directory at all
+    let reg = Arc::new(OrchRegistry::new(state.path().to_path_buf()));
+    reg.set_port(45999);
+    let launched = create_orchestration_group(
+        &reg,
+        &repo.path().to_string_lossy(),
+        Guardrails { advanced_orchestrator: true, max_agents: 2, ..rails() },
+        None,
+        None,
+        0,
+    )
+    .unwrap();
+    let gid = launched.group_id.clone();
+    assert!(
+        reg.audit_log(&gid)
+            .iter()
+            .all(|e| e.action != "max-agents-below-minimum" && e.action != "max-agents-below-recommended"),
+        "a fresh launch with no workflow file has nothing to derive a capacity recommendation from"
+    );
+
+    reg.end_group(&gid, false).unwrap();
+    let (persisted_repo, persisted) = reg.load_group_file(&gid).expect("group.json");
+    create_orchestration_group(
+        &reg,
+        &persisted_repo,
+        persisted,
+        Some("11111111-2222-3333-4444-555555555555".into()),
+        Some(&gid),
+        0,
+    )
+    .expect("a resume must not fail");
+
+    assert!(
+        reg.audit_log(&gid)
+            .iter()
+            .all(|e| e.action != "max-agents-below-minimum" && e.action != "max-agents-below-recommended"),
+        "the resume must not audit a capacity requirement the built-in roster never had — its own \
+         fresh launch stayed silent, and roster_is_custom() must gate the resume the same way"
+    );
+}
+
 // ───────── review verdicts + the enforced consensus gate (#222 / #197) ─────────
 //
 // The pure gate semantics live in tests/workflow.rs. These drive the whole stack:

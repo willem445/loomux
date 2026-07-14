@@ -12,6 +12,9 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
 import {
   MAX_AGENTS_CEILING,
   ORCH_ROLES,
@@ -295,6 +298,64 @@ test("#255 rev-1 NB2: the raise target never exceeds MAX_AGENTS_CEILING", () => 
   const underCeiling = resolveRoster(true, DECLARED_WITH_PLANNER, PICKS, "claude");
   assert.equal(capacityRaiseTarget(underCeiling), 6);
   assert.doesNotMatch(capacityWarning(underCeiling, 3)!, /ceiling|as high as this cap can go/);
+});
+
+test("#255 rev-2 non-blocking #2: when even the ceiling can't reach the minimum, no false clause", () => {
+  // Exotic (a gate needing 14 reviewers), but real: minimum (15) itself is
+  // above MAX_AGENTS_CEILING (12), so `capacityRaiseTarget` clamps to 12 —
+  // which doesn't even cover ONE review round, let alone "every declared tier
+  // at once". The old wording offered exactly that false clause, so raising
+  // to the button's own number left the hard warning lit.
+  const wayOverCeiling = preview({
+    gates: ["merge"],
+    blocks: [
+      block({ id: "worker", kind: "worker" }),
+      ...Array.from({ length: 14 }, (_, i) => block({ id: `rev-${i}`, kind: "reviewer" })),
+    ],
+    min_agents: 15,
+    recommended_agents: 15,
+    reviewers_needed: 14,
+    extra_tiers: [],
+  });
+  const r = resolveRoster(true, wayOverCeiling, PICKS, "claude");
+  assert.equal(capacityRaiseTarget(r), MAX_AGENTS_CEILING, "clamped, same as any over-ceiling roster");
+
+  const msg = capacityWarning(r, 4);
+  assert.ok(msg, "max_agents (4) is nowhere near this roster's minimum (15)");
+  assert.match(msg!, /minimum itself \(15\) is above loomux's 12-agent limit/);
+  assert.doesNotMatch(
+    msg!,
+    /or 12 to run every declared tier at once/,
+    "12 doesn't reach the minimum, let alone the full roster — must never claim it does"
+  );
+  assert.doesNotMatch(
+    msg!,
+    /Raise it to at least 15/,
+    "no actionable 'raise to X' framing when nothing raisable clears the warning"
+  );
+
+  // Raising max_agents to the offered ceiling must not read as a fix here —
+  // capacityWarning(r, 12) still returns the same "wall" message, not null and
+  // not the ordinary hard-tier phrasing.
+  const atCeiling = capacityWarning(r, MAX_AGENTS_CEILING);
+  assert.ok(atCeiling, "12 < minimum (15) — still below it, the warning must not go quiet");
+  assert.match(atCeiling!, /minimum itself \(15\) is above loomux's 12-agent limit/);
+});
+
+test("#255 rev-2 non-blocking #3: MAX_AGENTS_CEILING mirrors the Rust source it's duplicated from", () => {
+  // roster.ts's copy exists only because the launcher needs to reason about
+  // the ceiling before Create ever calls the backend — nothing at the type
+  // level ties the two together, so read the Rust literal back and fail
+  // loudly the day someone changes one without the other, rather than
+  // trusting a comment to catch the drift.
+  const here = dirname(fileURLToPath(import.meta.url));
+  const rustSrc = readFileSync(
+    join(here, "..", "src-tauri", "src", "orchestration", "mod.rs"),
+    "utf8"
+  );
+  const declared = rustSrc.match(/const MAX_AGENTS_CEILING: u32 = (\d+);/);
+  assert.ok(declared, "mod.rs's MAX_AGENTS_CEILING declaration must match this exact pattern — update it here too if that line's wording changes");
+  assert.equal(MAX_AGENTS_CEILING, Number(declared![1]), "roster.ts's copy has drifted from the Rust source");
 });
 
 test("joinWithAnd reads like English at every list length", () => {
