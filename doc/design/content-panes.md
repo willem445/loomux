@@ -578,8 +578,11 @@ changed.
    under it. The real reader (`afterKey`, above) already accepts this; the first version of the
    splitting scan didn't, and mis-read every `- id: …` line as its own bogus top-level key —
    which spliced roster content into `front` and, on re-parse, silently discarded everything
-   from that point on (the real reader's top-level `mapping()` treats a `-`-prefixed line at
-   column 0 as "a sequence ends the mapping" and stops). Fixed by teaching the scan the same
+   from that point on (the real reader's top-level `mapping()` treated a `-`-prefixed line at
+   column 0 as "a sequence ends the mapping" and stopped, with no finding — fixed separately,
+   #270: `mapping(0)` is only ever called once, with no enclosing key to hand a sequence off
+   to, so it now reports a `yaml-syntax` finding and consumes the orphan sequence instead of
+   silently dropping the rest of the file). Fixed here by teaching the scan the same
    same-column rule the reader already has.
 2. **A `|`/`>` block scalar's body is content, never trivia — even a line that starts with
    `#`.** The generic "is this a blank/comment line" test used to decide what trivia to peel

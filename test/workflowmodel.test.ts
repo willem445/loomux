@@ -903,6 +903,44 @@ blocks:
   assert.equal(workflow.blocks.length, 1, "the rest of the file still loads");
 });
 
+test("an unexpected top-level `-` is a finding, not a silent truncation (#270)", () => {
+  // The reader used to treat ANY `-`-prefixed line as "a sequence at this level ends the
+  // mapping" — correct when handing a same-indent sequence off to an enclosing key, but
+  // `mapping(0)` (called once, from `document()`) has no enclosing key to hand off to. It
+  // just stopped, silently, and everything from that line to EOF vanished with zero findings.
+  const { workflow, findings } = analyzeWorkflow(`version: 1
+- id: a
+  name: A
+  kind: worker
+  cli: claude
+`);
+  const syntax = findings.find((f) => f.code === "yaml-syntax");
+  assert.ok(syntax, "an orphan top-level dash must report as a finding");
+  assert.equal(syntax!.line, 2, "and it must say WHICH line");
+  assert.equal(workflow.blocks.length, 0, "there was no `blocks:` key at all — nothing to read");
+});
+
+test("a top-level `blocks:` roster is still read after an orphan `-` line earlier in the file", () => {
+  // The reader recovers: it consumes the whole orphan sequence (reporting it once) and keeps
+  // reading the rest of the document as a mapping, rather than treating the entire remainder
+  // as lost.
+  const { workflow, findings } = analyzeWorkflow(`version: 1
+- id: orphan
+  name: Orphan
+blocks:
+  - id: w
+    name: W
+    kind: worker
+    cli: claude
+`);
+  assert.ok(findings.find((f) => f.code === "yaml-syntax"));
+  assert.deepEqual(
+    workflow.blocks.map((b) => b.id),
+    ["w"],
+    "the real roster after the orphan line is still read, not dropped too"
+  );
+});
+
 test("an empty file is a workflow with nothing in it, not an error page", () => {
   const { findings, workflow } = analyzeWorkflow("");
   assert.equal(workflow.blocks.length, 0);
