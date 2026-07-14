@@ -156,16 +156,22 @@ These deserve their own detail — see:
   edit, delivery outcome, and state write, one row each. A **follow** button
   live-tails new lines.
 
-## Notifications
+## CI watches (agent notifications)
 
-Agents no longer sit watching a PR's CI. The orchestrator, workers, and reviewers can
-register a background watch — a PR's checks, or a specific GitHub Actions run — and go do
-other work; loomux polls in the background (every 30s) and types a `[loomux] notification
-…` into the registering agent's own pane the moment it resolves, expires, or fails
-repeatedly. A watch is capped (4 per agent / 12 per group) and time-bounded (5–240 min,
-default 60), and it lives only in memory — it does not survive closing loomux, so an agent
-re-lists what it was waiting on after a restart or a `/compact`. Pausing a group freezes a
-watch entirely (no polling, firing, or expiry) until you resume it.
+Distinct from the 🔔 desktop-notification toggle above — that raises a toast for *you*; this
+notice goes to the *agent*, typed into its own pane. Agents no longer sit watching a PR's CI:
+the orchestrator, workers, and reviewers can register a background watch — a PR's checks, or
+a specific GitHub Actions run — and go do other work; loomux polls in the background (every
+30s) and types a `[loomux] PR #241 checks: SUCCESS — … (watch n-3)`-style notice into the
+registering agent's own pane the moment it resolves, expires, or fails repeatedly. A watch is
+capped (4 per agent / 12 per group) and time-bounded (5–240 min, default 60). Pausing a group
+freezes a watch entirely (no polling, firing, or expiry) until you resume it.
+
+Watches live only in memory, and the two ways an agent loses track of one are different:
+a `/compact` drops the agent's *memory* of a watch (the watch itself is still registered and
+still live), so it re-lists to recover what it was waiting on; closing loomux drops the watch
+*itself* — the registry is empty on the next launch — so it must be re-registered from
+scratch, not merely re-listed.
 
 ## Group lifecycle
 
