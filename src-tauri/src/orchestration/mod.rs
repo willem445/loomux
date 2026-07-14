@@ -4628,7 +4628,18 @@ impl OrchRegistry {
                 "agent": w.agent,
                 "kind": w.condition.kind(),
                 "target": w.condition.label(),
-                "note": w.note,
+                // `note` is agent-supplied and deliberately unsanitized at
+                // registration (correct for `list_notifications`, which hands an
+                // agent its own text back) — but THIS command crosses a new
+                // boundary, into the trusted webview, for every agent's note, not
+                // just the reader's own. Nothing in the current renderer is
+                // exploitable (rev-orch, PR #252: it only ever reaches a `title`
+                // DOM property, never `innerHTML`), but that safety is a property
+                // of the consumer, not the boundary — so strip control chars here
+                // with the same `sanitize_gh_text` the fired/expired/failed
+                // notices already use, rather than depend on every future
+                // renderer getting it right too.
+                "note": notify::sanitize_gh_text(&w.note, notify::NOTICE_FIELD_CAP),
                 "expires_ms": w.deadline_ms,
             }))
             .collect::<Vec<_>>())

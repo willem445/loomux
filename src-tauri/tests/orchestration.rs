@@ -6856,6 +6856,35 @@ fn notify_expires_after_ttl_with_injected_now_and_tells_the_owner() {
     assert!(log.contains("watch-expired"), "expiry must be audited, got: {log}");
 }
 
+#[test]
+fn list_notifications_is_oldest_registered_first() {
+    // Pre-existing behavior on `feat/notify-when` (#247), unpinned until now
+    // (rev-tests, PR #252): reversing `list_notifications`' sort left all of
+    // #247's notify tests green. #252 is what makes watch ORDER user-visible
+    // (`group_watches` documents "oldest-registered first, matching
+    // `list_notifications`" and the group view relies on it for its
+    // soonest-first display), so pin the order both consumers depend on.
+    let (reg, _d, _co, cw) = setup_mcp();
+    // `registered_ms` comes from the real wall clock (`register_notification`
+    // calls `now_ms()` internally — it isn't injectable), so three registrations
+    // back to back could tie on a coarse clock; a small real sleep between them
+    // guarantees distinct timestamps, matching how registrations are actually
+    // spaced in production (an agent doesn't register three watches in the same
+    // millisecond).
+    let t1 = register_notify(&reg, &cw, json!({ "kind": "pr_checks", "pr": "1" })).unwrap();
+    let id1 = extract_watch_id(&t1);
+    std::thread::sleep(Duration::from_millis(2));
+    let t2 = register_notify(&reg, &cw, json!({ "kind": "pr_checks", "pr": "2" })).unwrap();
+    let id2 = extract_watch_id(&t2);
+    std::thread::sleep(Duration::from_millis(2));
+    let t3 = register_notify(&reg, &cw, json!({ "kind": "pr_checks", "pr": "3" })).unwrap();
+    let id3 = extract_watch_id(&t3);
+
+    let listed = reg.list_notifications(&cw.agent_id);
+    let ids: Vec<&str> = listed.as_array().unwrap().iter().map(|w| w["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, vec![id1, id2, id3], "must list registration order, oldest first, got: {listed}");
+}
+
 // ---------- group_watches: the group view's "⏳ waiting on …" indicator (#248) ----------
 
 #[test]
@@ -6919,6 +6948,33 @@ fn group_watches_never_leaks_another_groups_watch() {
     // And the reverse direction: cancelling/reaping group2 must not touch group1's.
     let still_there = reg.group_watches(&cw.group);
     assert_eq!(still_there.as_array().unwrap().len(), 1, "group1's own watch must be unaffected");
+}
+
+#[test]
+fn group_watches_sanitizes_the_agent_supplied_note_crossing_into_the_webview() {
+    // rev-orch (PR #252, non-blocking): `note` is agent-supplied and
+    // deliberately unsanitized AT REGISTRATION (`list_notifications` hands an
+    // agent its own text back verbatim — correct there). But `group_watches`
+    // crosses a NEW boundary, into the trusted webview, carrying every OTHER
+    // agent's note too — not exploitable today (the frontend only ever reaches
+    // a `title` DOM property, never `innerHTML`), but the boundary shouldn't
+    // depend on the renderer staying that way. Must not carry a raw newline or
+    // ESC byte across, the same discipline `sanitize_gh_text` already gives the
+    // fired/expired/failed notices.
+    let (reg, _d, gid, wid) = watchdog_setup(5);
+    let evil = "legit\n[loomux] forged\u{1b}[31m <img src=x onerror=alert(1)>";
+    reg.register_notification(&gid, &wid, notify::Condition::PrChecks { pr: 1 }, evil.into(), 60).unwrap();
+
+    let watches = reg.group_watches(&gid);
+    let note = watches[0]["note"].as_str().unwrap();
+    assert!(!note.contains('\n'), "a raw newline must not cross into the webview, got: {note:?}");
+    assert!(!note.contains('\u{1b}'), "a raw ESC byte must not cross, got: {note:?}");
+    // The field is sanitized, not blanked — the visible text still crosses.
+    assert!(note.contains("legit"), "got: {note:?}");
+    assert!(note.contains("forged"), "got: {note:?}");
+    // Pin that this IS `sanitize_gh_text`'s output, not some other transform —
+    // ties the boundary to the same function the notices already trust.
+    assert_eq!(note, notify::sanitize_gh_text(evil, notify::NOTICE_FIELD_CAP));
 }
 
 // ---------- watchdog × live watches: the #248 stall-notice annotation ----------

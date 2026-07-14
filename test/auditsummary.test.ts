@@ -25,8 +25,12 @@ test("watch-register names the target, its TTL, and the watch id", () => {
 });
 
 test("watch-cancel names the cancelled watch id", () => {
+  // Exact-equality, not /n-3/: the raw-JSON fallback for this entry
+  // (`{"id":"n-3"}`) also matches /n-3/, so a substring match can't tell
+  // "renders the sentence" apart from "dumps raw JSON at the user" — the
+  // exact #248 bug this file exists to catch (rev-tests, PR #252).
   const s = summarize(entry("watch-cancel", { id: "n-3" }));
-  assert.match(s, /n-3/);
+  assert.equal(s, "cancelled watch n-3");
 });
 
 test("watch-cleanup names the agent and every dropped watch id", () => {
