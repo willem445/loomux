@@ -15,9 +15,11 @@ use loomux_lib::orchestration::{
     hold_until_quiet, idle_output_is_activity, idle_should_kill, idle_tick_should_fire,
     low_disk_notice, low_disk_transition, max_agents_notice, pr_number, release_gate_decision,
     GhGate, GitTagPush,
-    normalize_remote_web_base, parse_audit_lines, parse_session_cost, paste_held_notice,
+    normalize_remote_web_base, parse_audit_lines, parse_audit_lines_counted, parse_session_cost,
+    paste_held_notice,
     prompt_wait_detected, resolve_paste_gate, resolve_ref_url, rotate_audit_if_needed,
-    sanitize_attachment_ext, should_confirm_copilot_autopilot, should_flush_before_paste,
+    sanitize_attachment_ext, set_rotate_check_pause_for_test, should_confirm_copilot_autopilot,
+    should_flush_before_paste,
     should_notify_paste_held, should_notify_unconfirmed, single_pane_autopilot_flags,
     spawn_rate_exceeded, spawn_request_expired, strip_ansi, submit_confirmed, submit_sequence,
     unconfirmed_delivery_notice, watchdog_should_notify, worktree_cleanup_targets,
@@ -2269,6 +2271,23 @@ not json at all
 }
 
 #[test]
+fn parse_audit_lines_counts_what_it_skips() {
+    // A real torn log: two whole records, one spliced pair (the #240 signature),
+    // one blank line. Silence about the spliced line is what kept the corruption
+    // invisible — the count is the fix (the viewer path breadcrumbs it).
+    let text = "\
+{\"ts_ms\":1,\"actor\":\"loomux\",\"action\":\"group-create\",\"detail\":{}}
+{{\"\"actionaction\"\":\"\"agent-exitagent-exit\"\"
+
+{\"ts_ms\":2,\"actor\":\"w-1\",\"action\":\"agent-exit\",\"detail\":{}}";
+    let (entries, skipped) = parse_audit_lines_counted(text);
+    assert_eq!(entries.len(), 2, "the whole records still parse — a torn log must not blank the viewer");
+    assert_eq!(skipped, 1, "the spliced line is counted; the blank line is not");
+    // The convenience wrapper stays the plain entry list.
+    assert_eq!(parse_audit_lines(text).len(), 2);
+}
+
+#[test]
 fn audit_log_reads_both_generations_oldest_first() {
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
@@ -2293,6 +2312,206 @@ fn audit_log_reads_both_generations_oldest_first() {
 fn audit_log_of_unknown_group_is_empty() {
     let (reg, _d) = test_registry();
     assert!(reg.audit_log("no-such-group").is_empty());
+}
+
+/// A detail payload the size of a real one (agent-exit records carry summaries,
+/// prompt records carry whole prompts). Fat details are what made #240 visible:
+/// the wider the record, the wider the window for two writers to interleave.
+fn fat_detail(thread: usize, seq: usize) -> Value {
+    json!({ "thread": thread, "seq": seq, "summary": "x".repeat(4096) })
+}
+
+/// Every non-blank line of `text` must parse as JSON; returns the entries.
+/// Panics with a truncated sample of the first bad line — the #240 signature is
+/// character-level interleaving (`{{""actionaction""::…`), which is far easier
+/// to recognize from the raw line than from a parse error.
+fn assert_all_lines_parse(text: &str) -> Vec<Value> {
+    let mut out = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<Value>(line) {
+            Ok(v) => out.push(v),
+            Err(e) => panic!(
+                "audit line {i} is corrupt ({e}); every append must land as one whole line.\n\
+                 first 160 bytes: {sample}",
+                sample = line.chars().take(160).collect::<String>()
+            ),
+        }
+    }
+    out
+}
+
+/// #240: concurrent `audit` calls (mass agent-exit at shutdown, background
+/// delivery threads) must each land as one whole line. The old writer
+/// `Display`-formatted the record straight onto the file handle, which emits
+/// many small writes per record — `O_APPEND` is atomic per *syscall*, so the
+/// records interleaved token by token and the log became unparseable.
+#[test]
+fn concurrent_audit_appends_land_as_whole_lines() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    const THREADS: usize = 8;
+    const PER_THREAD: usize = 40;
+
+    std::thread::scope(|s| {
+        for t in 0..THREADS {
+            let reg = &reg;
+            let gid = g.id.as_str();
+            s.spawn(move || {
+                for i in 0..PER_THREAD {
+                    reg.audit(gid, &format!("w-{t}"), "agent-exit", fat_detail(t, i));
+                }
+            });
+        }
+    });
+
+    let text = fs::read_to_string(reg.state_root().join(&g.id).join("audit.jsonl")).unwrap();
+    let entries = assert_all_lines_parse(&text);
+    let exits = entries.iter().filter(|v| v["action"] == "agent-exit").count();
+    assert_eq!(exits, THREADS * PER_THREAD, "every concurrent append must survive as one record");
+}
+
+/// #240: rotation renames the live log out from under concurrent appenders.
+/// Contract: one rotation loses nothing — the appends that raced it are split
+/// across the two generations (the viewer reads both), and none is corrupt.
+/// Only *one* generation is kept, so a second rotation discarding the first is
+/// the documented cap behavior, not a bug — this test rotates exactly once.
+#[test]
+fn audit_rotation_racing_appends_loses_no_lines() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let gdir = reg.state_root().join(&g.id);
+    const THREADS: usize = 6;
+    const PER_THREAD: usize = 30;
+    // Roughly a third of the total bytes the appenders will write, so the
+    // rename lands mid-stream rather than before or after the burst.
+    const ROTATE_CAP: u64 = 60 * 1024;
+
+    let appending = std::sync::atomic::AtomicBool::new(true);
+    std::thread::scope(|s| {
+        let appenders: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let reg = &reg;
+                let gid = g.id.as_str();
+                s.spawn(move || {
+                    for i in 0..PER_THREAD {
+                        reg.audit(gid, &format!("w-{t}"), "agent-exit", fat_detail(t, i));
+                    }
+                })
+            })
+            .collect();
+        let gdir = &gdir;
+        let appending = &appending;
+        s.spawn(move || {
+            // Rotate once, as soon as the log crosses the cap. Stop at the first
+            // rotation (a second would drop the first generation) and give up if
+            // the appenders finish without ever crossing it.
+            while appending.load(std::sync::atomic::Ordering::Relaxed) {
+                rotate_audit_if_needed(gdir, ROTATE_CAP);
+                if gdir.join("audit.1.jsonl").is_file() {
+                    return;
+                }
+                std::thread::yield_now();
+            }
+        });
+        for h in appenders {
+            h.join().unwrap();
+        }
+        appending.store(false, std::sync::atomic::Ordering::Relaxed);
+    });
+
+    assert!(
+        gdir.join("audit.1.jsonl").is_file(),
+        "the rotator must have fired mid-burst, or this test proves nothing"
+    );
+    let mut text = String::new();
+    for name in ["audit.1.jsonl", "audit.jsonl"] {
+        if let Ok(t) = fs::read_to_string(gdir.join(name)) {
+            text.push_str(&t);
+            if !text.ends_with('\n') {
+                text.push('\n');
+            }
+        }
+    }
+    let entries = assert_all_lines_parse(&text);
+    let exits = entries.iter().filter(|v| v["action"] == "agent-exit").count();
+    assert_eq!(
+        exits,
+        THREADS * PER_THREAD,
+        "a single rotation must not lose appends — they split across the two generations"
+    );
+}
+
+/// #240, the other half — the one the single `write_all` does NOT fix, so it
+/// needs its own reproducer rather than an argument.
+///
+/// Rotation is check-then-rename. Two threads that both read a past-the-cap size
+/// before either renames will BOTH rename: the first retires the full log to
+/// `audit.1.jsonl`, appenders start refilling a fresh `audit.jsonl`, and then the
+/// second — acting on its now-stale size check — renames that fresh, nearly-empty
+/// log over `audit.1.jsonl`, discarding the generation the first just retained
+/// (8 MB of history, in production). `AUDIT_LOCK` closes the window by making
+/// check+rename atomic.
+///
+/// The window is a few instructions wide, so the test widens it through the
+/// `set_rotate_check_pause_for_test` seam and staggers the two rotators: A
+/// renames early, appenders write into the fresh log, B renames late. Without the
+/// lock B's rename lands on a refilled log and the seeded generation is gone —
+/// verified red (see the PR). With it, B's check runs *after* A's rename, sees a
+/// log under the cap, and declines to rotate.
+#[test]
+fn concurrent_rotations_keep_the_retained_generation() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let gdir = reg.state_root().join(&g.id);
+    const SEEDED: usize = 50;
+    // Staggered pauses, so the second rotator's rename lands well after the
+    // first's — with appenders writing in between. Equal pauses would let both
+    // renames fire within microseconds of each other, and the race could hide.
+    const PAUSES_MS: [u64; 2] = [150, 600];
+
+    for i in 0..SEEDED {
+        reg.audit(&g.id, "w-0", "seeded", fat_detail(0, i));
+    }
+    let seeded_bytes = fs::metadata(gdir.join("audit.jsonl")).unwrap().len();
+    // Past the cap for the seeded log (so both rotators' checks say "rotate"),
+    // but far above anything the appenders below can add — a *legitimate* second
+    // rotation would be the documented cap behavior, not the bug under test.
+    let cap = seeded_bytes / 2;
+
+    std::thread::scope(|s| {
+        for pause in PAUSES_MS {
+            let gdir = &gdir;
+            s.spawn(move || {
+                set_rotate_check_pause_for_test(Duration::from_millis(pause));
+                rotate_audit_if_needed(gdir, cap);
+            });
+        }
+        // Appenders refill the fresh log across the whole rotation window — this
+        // is what gives a stale-check rotator something to clobber with. Small
+        // details on purpose: they must not push the fresh log past `cap`.
+        for t in 1..3 {
+            let reg = &reg;
+            let gid = g.id.as_str();
+            s.spawn(move || {
+                for i in 0..15 {
+                    reg.audit(gid, &format!("w-{t}"), "agent-exit", json!({ "seq": i }));
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            });
+        }
+    });
+
+    let rotated = fs::read_to_string(gdir.join("audit.1.jsonl")).unwrap();
+    let kept = assert_all_lines_parse(&rotated);
+    let seeded = kept.iter().filter(|v| v["action"] == "seeded").count();
+    assert_eq!(
+        seeded, SEEDED,
+        "the retained generation must survive a rotation stampede — a second, stale-check rename \
+         would move the refilled log over it and discard every seeded record"
+    );
 }
 
 // ---------- durable roster & orchestration restore ----------

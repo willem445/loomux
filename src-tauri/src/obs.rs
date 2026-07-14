@@ -17,7 +17,10 @@
 //!    names the newest crash log.
 //!
 //! Rotation mirrors the orchestration audit log (`rotate_audit_if_needed`): one
-//! kept generation, size-triggered, lock-free `O_APPEND` writes. A crash that
+//! kept generation, size-triggered, single-write `O_APPEND` lines. Breadcrumb
+//! writes stay lock-free — unlike the audit log they carry no rotation/append
+//! ordering contract, and a line that races a rollover lands in the rotated
+//! generation rather than being lost. A crash that
 //! aborts the process without unwinding (stack overflow, an FFI access
 //! violation, `abort()`) never runs the hook — see `doc/design/crash-observability.md`.
 
@@ -133,12 +136,20 @@ fn breadcrumb_in(dir: &Path, event: &str, detail: &str) {
         &dir.join("breadcrumbs.1.log"),
         BREADCRUMB_ROTATE_BYTES,
     );
+    // Build the whole line first and emit it with ONE `write_all`: `O_APPEND` is
+    // atomic per write syscall, and a `writeln!` with several arguments emits one
+    // write per fragment — which is precisely how the audit log ended up with
+    // records spliced into each other (#240). Breadcrumbs are written from every
+    // pane thread, so the same race lives here. (`write_all` loops on a short
+    // write, so this is one syscall *in practice* — regular files don't
+    // short-write at these sizes — rather than by contract; see `append_audit`.)
+    let line = format!("{} {} {}\n", stamp(now_ms()), event, detail);
     if let Ok(mut f) = fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(dir.join("breadcrumbs.log"))
     {
-        let _ = writeln!(f, "{} {} {}", stamp(now_ms()), event, detail);
+        let _ = f.write_all(line.as_bytes());
     }
 }
 
