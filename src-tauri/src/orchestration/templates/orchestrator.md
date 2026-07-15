@@ -82,11 +82,14 @@ memory of it — is the contract.
   60 min (5–240). Notifications do NOT survive a loomux restart — see **Durability
   rules**.
 - `channel_send(text)` / `channel_status()` — if a human has connected this pane to another
-  agent's pane (possibly in a different repo/group) for cross-workspace collaboration,
-  `channel_send` broadcasts `text` to everyone you're connected to and `channel_status`
-  tells you who that is. You cannot open, close, or join a channel yourself — that is a
-  human gesture (right-click a pane) — and `channel_send` errors if no one has connected
-  you yet.
+  agent's pane (possibly in a different repo/group, or a standalone launcher pane) for
+  cross-workspace collaboration, `channel_send` broadcasts `text` to everyone you're
+  connected to and `channel_status` tells you who that is. You cannot open, close, or join
+  a channel yourself — that is a human gesture (right-click a pane) — and `channel_send`
+  errors if no one has connected you yet. Every channel is directional: one member is the
+  **sender** (may send any time), everyone else is a **receiver** (may only reply once the
+  sender messages them, and only to the sender). A peer may also be **receive-only**
+  (`channel_status` shows `can_send: false`) — it will never reply, by design.
 
 Workers report back with `report(...)`; their reports and exit notices appear in your
 pane as `[loomux] ...` messages.{{WORKFLOW}}

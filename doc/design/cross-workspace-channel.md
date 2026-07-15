@@ -1,7 +1,10 @@
 # Design: cross-workspace communication channels (#271)
 
-Status: backend implemented (W1, PR #285, merged into this feature branch); the
-human-facing connect UI (W2, this section) stacks on top and is implemented below.
+Status: backend implemented (W1, PR #285); the human-facing connect UI (W2) stacks on
+top (both merged into this feature branch). **W3 (this revision)** adds standalone-pane
+membership and a directional (sender/receiver) model — see the two sections near the end
+of this document; they supersede the "standalone launcher panes" scope-out below and
+revise the undirected `channel_send`/`connect_agents` contract W1 shipped.
 
 ## Problem
 
@@ -39,15 +42,24 @@ wires them up. The wrapper functions and the event payload shape are already def
 
 Out of v1 entirely, each with a reason (unchanged from the issue's plan):
 
-- **Standalone launcher panes** (not part of an orchestration group) have no MCP identity —
-  `write_mcp_config` only runs for group agents. v1 covers every orchestration-group role,
-  which is the issue's actual "two related repos" use case.
+- ~~**Standalone launcher panes** (not part of an orchestration group) have no MCP
+  identity — `write_mcp_config` only runs for group agents.~~ **Superseded by W3** (see
+  "W3: standalone panes as first-class members" below) — the human's two follow-up hard
+  requirements (any pane can connect; sender/receiver direction) required lifting this
+  exclusion. Kept here, struck through, so the historical "why v1 didn't do this" reasoning
+  stays visible instead of silently vanishing.
 - **Cross-OS-process channels.** Single-window/single-process app; nothing to bridge. A
   broker-file extension point is the natural follow-up if loomux ever goes multi-process.
 - **Persistence across an app restart.** In-memory only, the `watches` (#243) precedent —
-  see **Persistence** below.
+  see **Persistence** below. Unaffected by W3: a solo pane's identity is exactly as
+  ephemeral as an orchestration agent's.
 - **A pull-based `channel_read()` inbox.** Rejected: breaks the "visible prompt" delivery
   principle, adds polling, and the pane transcript already is the inbox.
+- **Per-CLI full-membership seams for codex/gemini/opencode** (W3): their own MCP
+  mechanisms are repo/user config files (`~/.codex/config.toml`, `.gemini/settings.json`,
+  `opencode.json`), not a `--mcp-config`-style spawn flag — a genuine per-CLI integration,
+  not a channel-feature change. Those panes ship delivery-only in W3; the seam is tracked
+  as a follow-up issue (referenced in the capability matrix below).
 
 ## The trust boundary (constraint 6) — the crux of this feature
 
@@ -287,3 +299,186 @@ arm and confirming its pin reddens against the raw-JSON fallback, not a silent p
 same discipline the existing watch-* pins established, PR #252). DOM wiring (the
 `contextmenu` listener on the pane header, `setConnected`/`setPendingConnect`, the dock/tab
 mirrors) is validated by hand — see the PR description's checklist.
+
+## W3: standalone panes as first-class members
+
+*Folds in the human's follow-up hard requirement: any agent pane — orchestrator, worker,
+reviewer, or a plain standalone launcher pane — can be a channel member, not just
+orchestration-group roles.*
+
+**The core consequence.** Delivery is hard-keyed to an `AgentEntry` with a `pty_id`
+(`deliver_prompt: self.agent(id)?; a.pty_id.ok_or("agent has no terminal yet")?`), so
+*every* channel member — full or delivery-only — needs one. The only thing that varies is
+whether it *also* holds a **token**: a token is what lets a pane call `channel_send`; no
+token means receive-only. The channel core (`Channel`/`ChannelMember`/`connect_agents`/
+`channel_send`) does not move — it stays exactly the graph a human builds and an agent
+reads/broadcasts against.
+
+**Identity — a reserved pseudo-group + `Role::Solo`.** A backend-minted, fixed constant
+`SOLO_GROUP = "__solo__"` (never produced by `group_id_for_repo`, which always emits
+`{slug}-{8hex}` — constraint 6's path-segment safety holds by provenance), registered
+lazily (`OrchRegistry::ensure_solo_group`) the first time a solo pane is created, with repo
+label `"(standalone)"`. Each standalone pane is `AgentEntry{id: "solo-N", group:
+"__solo__", role: Role::Solo, ...}`. **`Role::Solo`'s entire MCP surface is `channel_send` +
+`channel_status`, full stop** — `mcp.rs::tool_defs` early-returns those two for it before
+touching any other tier, and `call_tool` gates it a second time at the very top of dispatch
+(`caller.role == Role::Solo && !matches!(name, "channel_send" | "channel_status")` →
+denied) so a future tool addition can never silently leak onto a solo token. This is the
+direct, one-line answer to "a solo token must carry zero group-scoped power": it is
+neither listed nor dispatchable for anything else (pinned in
+`solo_role_tool_surface_is_exactly_channel_send_and_channel_status` and
+`solo_role_cannot_dispatch_any_group_scoped_tool`, `tests/orchestration.rs`).
+
+*Rejected alternatives:* pane/pty-id-keyed membership (a second key scheme — forces
+`ChannelMember` into an enum, branches every channel method, rewrites the just-approved
+#285 core for no gain); reusing `Role::Worker` (its tool surface — `report`,
+`list_agents`, `get_state`, `list_tasks` — all imply a group with an orchestrator/board/
+state a solo pane doesn't have; a dedicated two-tool role is the honest scoping).
+
+**MCP injection at spawn — per-CLI seam.** loomux cannot inject an MCP server into an
+already-*running* CLI, but it fully controls a *newly launching* pane's command line.
+Human-only Tauri commands (constraint 5), mirroring the orchestration group's spawn round
+trip but launcher-initiated with no orchestrator involved:
+
+- **`orch_solo_prepare(cli, cwd, name) -> {agent_id, mcp_args, delivery_only}`** —
+  lazily ensures `__solo__`, mints `solo-N`. For claude/copilot (`SUPPORTED_CLIS`, the only
+  CLIs with a config seam today) it writes the config via the **existing**
+  `write_mcp_config(__solo__, solo-N, token, cli)` and returns the exact per-CLI flag
+  string built in Rust (claude: `--mcp-config "<cfg>" --strict-mcp-config --allowedTools
+  mcp__loomux`; copilot: `--additional-mcp-config "@<cfg>" --allow-tool loomux`) — one
+  place per-CLI knowledge lives, next to `write_mcp_config`. For any other CLI it mints NO
+  token and returns `delivery_only: true, mcp_args: ""` — the `AgentEntry` still exists.
+- **`orch_solo_bind(agent_id, pty_id)`** — binds the pty (mirrors `bind_agent`, but direct
+  bookkeeping rather than the async rendezvous `spawn_agent_ex` blocks on, since
+  `solo_prepare` already returned synchronously): sets `pty_id`, `status: Running`, and
+  registers `by_pty[pty_id] = agent_id` so the **existing** pty-exit path (`by_pty ->
+  mark_dead -> cleanup_agent_channel`) tears the member down on pane close with **no new
+  teardown code**.
+
+The launcher (`src/launcher.ts`) calls `orch_solo_prepare` eagerly for every newly-spawning
+agent pane, but **only when `cli` is claude or copilot** — every other CLI stays lazy,
+minting nothing at launch time, so a codex/gemini/opencode/custom pane incurs no
+`__solo__` identity nobody asked for. `src/main.ts` binds the pty right after each pane
+opens.
+
+**Already-running / pre-feature panes — adopt-on-connect.** loomux owns the pty for any
+live pane today, so inbound delivery works regardless of when the pane was launched;
+refusing to connect a pane the human is looking at, when delivery would work fine, is the
+worse UX than the alternative. **`orch_solo_adopt(pty_id, name, cwd) -> {agent_id}`**
+registers a delivery-only `AgentEntry` (no token) and binds the pty — idempotent by pty, so
+re-adopting the same pane returns its existing id rather than minting a second one.
+`src/orchestration.ts`'s `showPaneConnectMenu` calls this on the first Connect gesture
+against any **agent** pane (`pane.isAgentPane`, never a shell/content pane — those stay
+`NOT_CAPABLE_REASON`) that has no channel identity yet.
+
+**Delivery-only asymmetric membership is coherent, and represented honestly everywhere.**
+An adopted or non-seam-CLI member needs an `AgentEntry`+pty (to be a `deliver_prompt`
+target) but no token:
+
+- `channel_status`'s peers and `channel_members_json` (mod.rs) carry both `can_send`
+  (momentary: has a token AND currently holds the reply credit/is the sender) and
+  `delivery_only` (structural: has a token at all) — two different facts a receive-only
+  chip needs told apart from a plain receiver simply out of credit right now.
+  `OrchRegistry::agent_has_token` is the single source of truth both read.
+  - The member itself sees NO MCP tools at all (its token is empty, so it never even
+    resolves a `Caller` — `resolve_token` returns `None` for an empty/absent token,
+    pinned directly), so it never sees a `channel_send` it structurally can't use.
+  - `src/pane.ts`'s channel chip renders a distinct dashed `.receive-only` CSS variant for
+    `deliveryOnly`, separate from the solid chip a normal receiver gets between messages.
+
+**Per-CLI capability matrix (what ships in W3):**
+
+| CLI | membership | how |
+|---|---|---|
+| claude, copilot | full (token, `channel_send`) | `orch_solo_prepare` injects MCP flags at spawn |
+| codex, gemini, opencode | delivery-only | no spawn-flag seam today — tracked in [#288](https://github.com/willem445/loomux/issues/288) |
+| custom launcher command | delivery-only, permanently | no CLI identity to target a config format at |
+| any pane adopted via Connect (`orch_solo_adopt`) | delivery-only | never gets a token, regardless of its actual CLI |
+
+## W3: directional (sender/receiver) channel model
+
+*Folds in the human's second follow-up hard requirement: two agents in a channel must not
+be able to talk over each other. This is the one place W3 revises #285's already-approved
+`channel_send`/`connect_agents` contract — flagged, not silently retro-edited into #285.*
+
+Every channel is now **directed**: exactly one **sender** (the client that initiates) and
+one-or-more **receivers** — a star topology, never optional.
+
+**Data model (smallest sound extension, additive fields on #285's structs).**
+`Channel.sender: String` (the sender's `agent_id` — the single source of truth for "who
+drives", and the one-sender-per-channel invariant lives here) and `ChannelMember.may_reply:
+bool` (a per-receiver reply credit, ignored for the sender — the request/response gate).
+
+**Where direction is designated: at gesture COMPLETION, with an explicit arrow — not
+implicit gesture order.** By completion both endpoints are known, so the choice is
+meaningful and the human confirms who drives before committing, killing the "connected
+them backwards" error class an implicit "armed = sender" rule would invite. The completion
+menu (`src/panemenu.ts::buildPaneMenu`) offers, for a FRESH two-party connect, two explicit
+items: `Connect: {armed} → sends to → {this}` and `Connect: {this} → sends to → {armed}` —
+either disabled with a reason if that side has no token (a delivery-only pane can never be
+the sender). For a JOIN onto a channel that already has a sender, only the compatible item
+shows: `Join as receiver — driven by {sender}`. `orch_channel_connect` gained a
+`sender_agent` parameter carrying this choice through to `OrchRegistry::connect_agents`,
+which validates it (must be one of the two panes, must hold a token) and — on a join —
+requires it to equal the existing channel's sender, rejecting a mismatched designation the
+same way `set_sender` rejects one (`"this channel already has a sender — swap it first"`).
+
+**What the roles mean at the tool layer: request/response.** A receiver that could never
+answer would be useless; a receiver that could initiate re-creates the talk-over problem
+this whole addendum exists to close.
+
+- **Sender** — `channel_send` any time; **broadcasts** to every receiver, and each
+  delivery sets that receiver's `may_reply = true`.
+- **Receiver** — `channel_send` is **reply-only**: permitted only while `may_reply` is
+  true (else `"you can only reply after the sender messages you"`), delivers **only to the
+  sender**, and consumes the credit. A receiver never reaches another receiver — B4's star
+  topology, enforced structurally in `OrchRegistry::channel_send` (mod.rs), not left to
+  prompt etiquette.
+
+*Rejected alternative:* "a receiver may always reply, no credit" — one field simpler, but a
+chatty receiver could then interrupt the sender unsolicited; the human explicitly wanted
+request/response, so the credit stays. Advisory-etiquette-only was rejected outright — a
+guardrail belongs in code, not a prompt, per this codebase's norms.
+
+**Mutable direction — human-only, no reconnect needed.** `orch_channel_set_sender(channel_id,
+new_sender_agent)` reassigns `Channel.sender` (validated: member + token), **clears every
+member's `may_reply`** (a swap invalidates in-flight "you may reply" state — the new sender
+starts clean), notifies both roles' panes, and audits `channel-direction`
+`{channel_id, from_sender, to_sender, by:"human"}`. Menu affordance: "Make this pane the
+sender" on a token-holding receiver (`src/panemenu.ts`), never on the sender itself, never
+on a delivery-only pane.
+
+**Losing the sender collapses the whole channel — additive to #285's below-2-members
+teardown.** A star with no hub leaves receivers that can never initiate and can never reach
+each other; `OrchRegistry::disconnect_agent` now closes the channel when
+`remaining.len() < 2 OR the disconnecting agent WAS the sender`, even with two-or-more
+receivers left. No automatic promotion — that would bypass the human-only swap rule; a
+human re-designates and (if wanted) reconnects.
+
+**Honest representation everywhere.** `channel_status`, `channel_list`, `channel_for_pane`,
+and the `orch-channel` event all carry `sender` plus, per member, `direction`
+(`"sender"|"receiver"`) and `can_send` — computed by the one shared
+`OrchRegistry::channel_members_json` helper so the four surfaces can never drift apart.
+`channel_status` additionally reports the CALLER's own current `can_send` (sender: always
+true; receiver: true only while holding the credit) so an agent can check before calling
+`channel_send` and hitting the credit error. The pane header chip
+(`src/pane.ts::setConnected`) renders a direction arrow (▲ sender / ▼ receiver) alongside
+the existing channel color/number.
+
+**Composition with standalone panes — one rule.** Sender requires a token, full stop:
+**sender** (must hold a token: an orchestration agent, or a claude/copilot solo pane) may
+broadcast any time; **full receiver** (token) may reply under the credit; **delivery-only
+receiver** (no token — an adopted pane, or a codex/gemini/opencode/custom solo pane)
+receives only, never replies — exactly the "a delivery-only standalone member is naturally
+a receiver" shape the human asked for. Enforced identically at `connect_agents` (mint/join
+time) and `set_sender` (swap time) via the same `token.is_empty()` check, each pinned by a
+dedicated red-before-green test (`delivery_only_solo_pane_receives_but_can_never_send_or_
+become_sender`, `set_sender_rejects_a_delivery_only_candidate_and_leaves_the_sender_
+unchanged`).
+
+**Revision to #285, stated plainly.** `channel_send` changed from unconditional broadcast
+to role-aware (sender broadcasts, receiver replies-only-to-sender); `connect_agents` gained
+a required `sender_agent` parameter. W1's `tests/orchestration.rs` channel tests are
+updated **in place** to the new signature/semantics (every `connect_agents` call site now
+names a sender); this is a deliberate, flagged contract revision on a stacked follow-up PR,
+not a retro-edit of #285's merged commit.
