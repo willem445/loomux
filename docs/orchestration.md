@@ -225,14 +225,18 @@ reply credit, so both sides start clean under the new direction.
 **Standalone panes.** A plain **Agent** pane (opened outside an orchestration group) can
 join a channel too, not just orchestrator/worker/reviewer panes. Launching a fresh
 **claude** or **copilot** agent pane wires it up automatically — nothing to do, it just
-shows up as a normal Connect target. Any other CLI (codex, gemini, opencode, a custom
-command), or a pane you launched before this feature existed, becomes connectable the first
-time you right-click it: it joins as a **receive-only** member (a dashed variant of the
-chip, instead of solid) — it can never be the sender, and its direction is always ▼. This
-is a structural fact, not a bug: those CLIs have no way for loomux to hand them a
-channel-send capability today (tracked as a follow-up), and an already-running pane can't
-be handed one either without restarting it. A receive-only pane still gets every message
-the sender sends it — it just can't talk back.
+shows up as a normal Connect target — as long as the launcher's **Channel tools** checkbox
+is on (it defaults on; turn it off if you'd rather a fresh pane not carry a live channel
+token until you actually connect it — the checkbox only appears for claude/copilot, since
+it's the only pair this applies to). Any other CLI (codex, gemini, opencode, a custom
+command), a claude/copilot pane launched with the checkbox off, or a pane you launched
+before this feature existed, becomes connectable the first time you right-click it: it
+joins as a **receive-only** member (a dashed variant of the chip, instead of solid) — it
+can never be the sender, and its direction is always ▼. This is a structural fact, not a
+bug: those CLIs have no way for loomux to hand them a channel-send capability today
+(tracked as a follow-up), and an already-running pane can't be handed one either without
+restarting it. A receive-only pane still gets every message the sender sends it — it just
+can't talk back.
 
 **Multi-party.** A channel can have more than two members: right-click a free (not yet
 connected) THIRD pane's **Connect…**, then right-click an already-connected pane's

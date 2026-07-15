@@ -361,6 +361,26 @@ minting nothing at launch time, so a codex/gemini/opencode/custom pane incurs no
 `__solo__` identity nobody asked for. `src/main.ts` binds the pty right after each pane
 opens.
 
+**Channel tools toggle (PR #289 review round 2, N1).** Even scoped to claude/copilot,
+unconditional eager minting is a broader live-token surface than "channels" strictly needs
+— a token confers no group-scoped power (independently re-verified in review), but it's
+still a real MCP identity sitting in `by_token` for a pane that may never be connected.
+Two shapes were on the table: prepare **lazily** (mint at connect/bind time instead of
+launch time) or gate the eager mint **behind an explicit setting**. Lazy-at-connect isn't
+actually viable for full membership: claude/copilot's MCP flags must be on the command
+line the process boots with, and by the time a human right-clicks Connect on an
+already-running pane it's too late to hand it new flags (the "you cannot inject an MCP
+server into an already-running CLI" constraint that motivates the whole adopt-on-connect
+design). So the launcher gained a persisted **"Channel tools"** checkbox (`src/agents.ts`'s
+`getChannelTools`/`setChannelTools`, the identical default-ON/explicit-"0"-off shape as the
+existing autopilot toggle), shown only for claude/copilot, checked once at launch — no
+prompt at launch (a persisted default) and no prompt mid-connect either way. Default ON:
+the addendum's stated contract is "claude/copilot = full membership at spawn," and turning
+the toggle off doesn't lose the pane's connectability, only its head start — an
+unminted claude/copilot pane simply falls through to the same delivery-only
+adopt-on-connect path every other CLI already uses, indistinguishable in the UI from a
+codex/gemini pane until upgraded.
+
 **Already-running / pre-feature panes — adopt-on-connect.** loomux owns the pty for any
 live pane today, so inbound delivery works regardless of when the pane was launched;
 refusing to connect a pane the human is looking at, when delivery would work fine, is the
@@ -418,10 +438,20 @@ items: `Connect: {armed} → sends to → {this}` and `Connect: {this} → sends
 either disabled with a reason if that side has no token (a delivery-only pane can never be
 the sender). For a JOIN onto a channel that already has a sender, only the compatible item
 shows: `Join as receiver — driven by {sender}`. `orch_channel_connect` gained a
-`sender_agent` parameter carrying this choice through to `OrchRegistry::connect_agents`,
-which validates it (must be one of the two panes, must hold a token) and — on a join —
-requires it to equal the existing channel's sender, rejecting a mismatched designation the
-same way `set_sender` rejects one (`"this channel already has a sender — swap it first"`).
+`sender_agent` parameter carrying this choice through to `OrchRegistry::connect_agents` —
+whose meaning depends on which case applies (review round 2, B1: conflating the two broke
+every join that completes on a receiver rather than the sender). For a **fresh mint**,
+`sender_agent` **designates** the new sender and must be one of the two named panes (and
+must hold a token). For a **join**, the channel's sender already exists;
+`sender_agent` only **confirms** who that is, and is deliberately allowed to be neither of
+the two panes this call names — the completion gesture can land on any existing member
+(the sender itself, or a plain receiver), and the true sender is often a third pane
+entirely (e.g. a newcomer completing onto a receiver in a 4+-member star). Requiring the
+confirmation to equal `Channel.sender` — never requiring it to be one of the two call
+arguments — is what makes B4's "a join can never reassign the sender" invariant hold while
+still letting the human complete the gesture on any member, rejecting a mismatched
+confirmation the same way `set_sender` rejects one
+(`"this channel already has a sender — swap it first"`).
 
 **What the roles mean at the tool layer: request/response.** A receiver that could never
 answer would be useless; a receiver that could initiate re-creates the talk-over problem
