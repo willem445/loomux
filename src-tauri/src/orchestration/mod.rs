@@ -231,12 +231,16 @@ loomux_grant_claim() { # $1=grantfile
 # known: consume it (rm) on success, or restore it to the original grant path
 # on failure so a retry can still use it. Shared by the merge gate and the
 # release gate (#303) — one settle mechanism, not two copies. $1=original
-# grantfile $2=claimed file $3=the real gh's exit code.
-loomux_grant_settle() { # $1=grantfile $2=claimed $3=exit-code
+# grantfile $2=claimed file $3=the real gh's exit code $4=audit label to emit
+# on restore (optional — #315 review: a restore was silent in the audit; the
+# merge gate still passes nothing here and stays silent, only the release
+# gate's callers pass "release-gate-restored").
+loomux_grant_settle() { # $1=grantfile $2=claimed $3=exit-code $4=restore-audit-label
   if [ "$3" -eq 0 ]; then
     rm -f "$2"   # succeeded — the one-time grant is spent
   else
     mv "$2" "$1" 2>/dev/null   # failed — restore for a retry
+    [ -n "$4" ] && loomux_audit "$4" "{\"grant\":\"$1\"}"
   fi
 }
 # The SINGLE release-gate decision (#83/#196): every release-publishing shape —
@@ -311,7 +315,7 @@ if [ "$cmd" = "release" ]; then
         # claim — #303, same reasoning as the merge grant's fix (#256).
         "$REAL_GH" "$@"
         rc=$?
-        loomux_grant_settle "$_rg_gf" "$_grant_claimed" "$rc"
+        loomux_grant_settle "$_rg_gf" "$_grant_claimed" "$rc" "release-gate-restored"
         exit "$rc"
       fi
       exec "$REAL_GH" "$@" ;;
@@ -454,7 +458,7 @@ if [ "$cmd" = "api" ]; then
       # claim — #303, same reasoning as the merge grant's fix (#256).
       "$REAL_GH" "$@"
       rc=$?
-      loomux_grant_settle "$_rg_gf" "$_grant_claimed" "$rc"
+      loomux_grant_settle "$_rg_gf" "$_grant_claimed" "$rc" "release-gate-restored"
       exit "$rc"
     fi
     exec "$REAL_GH" "$@"
@@ -755,12 +759,15 @@ loomux_grant_claim() { # $1=grantfile
 }
 # Finish a claim made by loomux_grant_claim, once the real push's exit status
 # is known: consume it (rm) on success, or restore it to the original grant
-# path on failure so a retry can still use it.
-loomux_grant_settle() { # $1=grantfile $2=claimed $3=exit-code
+# path on failure so a retry can still use it. $4=audit label to emit on
+# restore (optional — #315 review: a restore was silent in the audit; the
+# caller below passes "release-gate-restored").
+loomux_grant_settle() { # $1=grantfile $2=claimed $3=exit-code $4=restore-audit-label
   if [ "$3" -eq 0 ]; then
     rm -f "$2"   # succeeded — the one-time grant is spent
   else
     mv "$2" "$1" 2>/dev/null   # failed — restore for a retry
+    [ -n "$4" ] && loomux_audit "$4" "{\"grant\":\"$1\"}"
   fi
 }
 
@@ -837,7 +844,7 @@ if [ -n "$gf" ] && loomux_grant_claim "$gf"; then
   loomux_audit "release-gate-granted" "{\"tag\":\"$tag\",\"action\":\"push\"}"
   "$REAL_GIT" "$@"
   rc=$?
-  loomux_grant_settle "$gf" "$_grant_claimed" "$rc"
+  loomux_grant_settle "$gf" "$_grant_claimed" "$rc" "release-gate-restored"
   exit "$rc"
 fi
 loomux_block_release "$tag" "push"

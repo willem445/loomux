@@ -5159,6 +5159,11 @@ fn git_shim_harness_a_tag_push_that_fails_does_not_burn_the_one_time_grant() {
     assert!(!run("1"), "a failed push must fail (surface git's refusal)");
     assert!(grant_path("v1.2.3").exists(), "a failed push must NOT consume the grant — this is the #315 bug");
     assert!(!grant_path("v1.2.3.claimed").exists(), "no orphaned .claimed file after a resolved failure");
+    // #315 review NB2: the restore was silent in the audit — a failed push
+    // must leave a trace that the grant was handed back for retry, not just
+    // consume-or-not silence.
+    let audit = std::fs::read_to_string(group.join("audit.jsonl")).unwrap_or_default();
+    assert!(audit.contains("release-gate-restored"), "a restored grant must be audited, got: {audit}");
 
     // The SAME grant authorizes a retry, and a successful push DOES consume it.
     assert!(run("0"), "retry with the still-usable grant must succeed");
@@ -5180,6 +5185,37 @@ fn git_shim_harness_a_tag_push_that_fails_does_not_burn_the_one_time_grant() {
     std::fs::create_dir_all(group.join("release_grants")).unwrap();
     std::fs::write(group.join("release_grants/v1.2.3.claimed"), b"99999999999\n1\n").unwrap();
     assert!(!run("0"), "an orphaned .claimed file with no live grant must not authorize a push");
+}
+
+/// Extract a named shell function's body — everything from the line after its
+/// `name() {` header through the matching top-level `}` — out of a generated
+/// shim script. `loomux_grant_claim`/`loomux_grant_settle` are straight-line
+/// and `case`/`esac` shell (no brace-using constructs), so a plain "next line
+/// that is exactly `}`" scan is exact here, not a heuristic.
+fn extract_shell_fn(script: &str, name: &str) -> String {
+    let marker = format!("{name}() {{");
+    let start = script.find(&marker).unwrap_or_else(|| panic!("{name} not found in script"));
+    let body_start = start + script[start..].find('\n').unwrap() + 1;
+    let rest = &script[body_start..];
+    let end = rest.find("\n}\n").unwrap_or_else(|| panic!("{name} has no closing brace"));
+    rest[..end].to_string()
+}
+
+#[test]
+fn gh_and_git_shim_grant_claim_settle_fragments_stay_byte_identical() {
+    // #315 review NB1: loomux_grant_claim/loomux_grant_settle are inlined
+    // separately in the gh shim and the git shim (the git shim is a separate
+    // generated script with no shared shell lib) — nothing pins the two
+    // copies to the same mechanics. A one-sided edit to either fragment (a
+    // claim race fixed in one shim but not the other, an audit event added
+    // to one and not the other, …) must go red here, not drift silently.
+    let gh = gh_shim_sh("C:/Program Files/GitHub CLI/gh.exe");
+    let git = git_shim_sh("C:/Program Files/Git/cmd/git.exe");
+    for f in ["loomux_grant_claim", "loomux_grant_settle"] {
+        let a = extract_shell_fn(&gh, f);
+        let b = extract_shell_fn(&git, f);
+        assert_eq!(a, b, "{f} has drifted between the gh shim and the git shim");
+    }
 }
 
 #[test]
