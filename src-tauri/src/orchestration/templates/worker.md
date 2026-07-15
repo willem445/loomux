@@ -53,17 +53,18 @@ when blocked (what you need), and when done (PR URL + one-paragraph summary).
 
 ## Loop until green
 
-Before you open the PR, run build, typecheck, and the test suite as a loop — fix,
-rerun, fix, rerun — until every one of them is green in the same pass. A single green
-run right after a fix doesn't confirm the fix didn't break something else; rerun the
-whole suite, not just the test you touched.
+Push early and open the PR as a **draft**, before the change is finished — that is
+how you get CI at all now (see the `ci-validate` skill; agent workers don't run
+`cargo check`/`cargo test`/`npm run build`/`npm test` on the host). Loop by pushing
+fixes and reading `gh pr checks` until every platform in the matrix is green, then
+`gh pr ready`. A single green run right after a fix doesn't confirm the fix didn't
+break something else — reread the whole matrix, not just the check you were chasing.
 
-**Never silently yield a partial result.** Opening a PR with a known-red check, a
-skipped test, or an unconfirmed fix just moves your fix-rerun loop onto the
-orchestrator's **CI gate**, at the cost of a review round nobody needed. If you
-genuinely cannot reach green after a real attempt, `report("blocked", …)` naming
-what's still red and what you tried, and say the same on the issue — that beats a PR
-that looks done and isn't.
+**Never silently yield a partial result.** Marking the PR ready, or reporting `done`,
+while CI is red just moves your fix-rerun loop onto the orchestrator's **CI gate**, at
+the cost of a review round nobody needed. If you genuinely cannot reach green after a
+real attempt, `report("blocked", …)` naming what's still red and what you tried, and
+say the same on the issue — that beats a PR that looks done and isn't.
 
 ## Definition of done
 

@@ -49,20 +49,22 @@ and costs the human a debugging session later.
    watch it fail for the reason you expect, and paste that command + failure line into the PR
    body beside the passing run. It costs a minute, and it is the difference between a test and a
    decoration.
-3. **Run the suites, and loop until every one is green.** `cargo check --locked` /
-   `cargo test --locked` in `src-tauri/`, `npm test`, `npm run build` — fix, rerun,
-   repeat, then paste the counts. Never open a PR carrying a red check or a check you
-   haven't rerun since your last fix. If you can't get to green after a real attempt,
-   that's not a quick fix anymore — `report("blocked", …)` with what's still red and
-   what you tried, and say the same on the issue, rather than opening a PR that looks
-   done. Never spawn a real agent CLI — it burns the human's paid credits, and no
-   test in this repo does it.
+3. **Loop on CI until every check is green, not on the host.** Push early and open
+   the PR as a **draft**, linking the issue (`Closes #N`) — `gh pr create --draft`
+   (see the `ci-validate` skill; don't run `cargo check`/`cargo test`/`npm test`/`npm
+   run build` locally). Read `gh pr checks`, push fixes, repeat until the whole
+   matrix passes, and paste the result. Never mark a PR ready carrying a red check or
+   one you haven't rechecked since your last fix. If you can't get to green after a
+   real attempt, that's not a quick fix anymore — `report("blocked", …)` with what's
+   still red and what you tried, and say the same on the issue, rather than marking
+   the PR ready. Never spawn a real agent CLI — it burns the human's paid credits,
+   and no test in this repo does it.
 4. **Update the doc the change touches** — the README section for user-visible
    behaviour. If it needs a *new* design note, that is a sign the task was not
    quick: escalate.
-5. **Open the PR and stop.** `gh pr create`, `Closes #N`, say what changed and how
-   it was tested. Then `report("done", …)` with the URL. **You never merge** — the
-   human gates every merge.
+5. **Mark the PR ready and stop.** `gh pr ready` on the draft from step 3, with the
+   description saying what changed and how it was validated. Then `report("done",
+   …)` with the URL. **You never merge** — the human gates every merge.
 
 ## Hard constraints — they apply to small diffs exactly as much as to large ones
 
