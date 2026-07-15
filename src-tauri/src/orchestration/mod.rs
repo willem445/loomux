@@ -5262,51 +5262,11 @@ impl OrchRegistry {
         // warning (surfaced from `orch_workflow_preview`, computed the same way)
         // is meant to catch this *before* Create; these audit records are the
         // durable trail for a launch that went ahead anyway — e.g. resumed with a
-        // persisted cap the file has since outgrown.
-        //
-        // Two tiers, per rev-1 B2 of the #255 review: the incident this issue was
-        // filed from ran at `max_agents == minimum` (4) against a `recommended` of
-        // 6 — i.e. exactly the boundary the single-tier check above was silent on.
-        // A cap can be too low in two different ways and they are not the same
-        // problem: below `minimum`, the orchestrator cannot even complete one
-        // review round without evicting something live (hard — it actively
-        // thrashes); at-or-above `minimum` but below `recommended`, every review
-        // round completes, but named tiers (a second worker lane, extra
-        // reviewers, the planner) can never be live *alongside* one (soft — it
-        // just never runs the roster it was handed).
-        if let Some(rec) = capacity {
-            if guardrails.max_agents < rec.minimum {
-                self.audit(&id, "loomux", "max-agents-below-minimum", json!({
-                    "max_agents": guardrails.max_agents,
-                    "minimum": rec.minimum,
-                    "recommended": rec.recommended,
-                    "note": format!(
-                        "max_agents ({}) is below this workflow's minimum ({}) — its merge \
-                         gate plus a worker can never all be live at once without evicting a \
-                         live agent to make room.",
-                        guardrails.max_agents, rec.minimum,
-                    ),
-                }));
-            } else if guardrails.max_agents < rec.recommended {
-                let extras = workflow::extra_tiers(&guardrails.blocks, rec.reviewers_needed);
-                self.audit(&id, "loomux", "max-agents-below-recommended", json!({
-                    "max_agents": guardrails.max_agents,
-                    "minimum": rec.minimum,
-                    "recommended": rec.recommended,
-                    "extra_tiers": extras,
-                    "note": format!(
-                        "max_agents ({}) covers one review round (minimum {}) but not this \
-                         workflow's full roster (recommended {}) — {} can never be live \
-                         alongside a review round.",
-                        guardrails.max_agents, rec.minimum, rec.recommended,
-                        if extras.is_empty() {
-                            "some of its declared tiers".to_string()
-                        } else {
-                            workflow::join_with_and(&extras)
-                        },
-                    ),
-                }));
-            }
+        // persisted cap the file has since outgrown. #259: `set_max_agents` runs
+        // the identical check on every live lowering of the cap, via
+        // `audit_capacity_shortfall` below.
+        if let Some(rec) = &capacity {
+            self.audit_capacity_shortfall(&id, &guardrails.blocks, guardrails.max_agents, rec);
         }
         let info = GroupInfo { id: id.clone(), repo: repo.to_string(), guardrails };
         // Atomic replace: group.json is identity-critical (a truncated file
@@ -7037,6 +6997,58 @@ impl OrchRegistry {
         }
     }
 
+    /// #255/#259: emit the same advisory `max-agents-below-minimum` /
+    /// `max-agents-below-recommended` audit record regardless of which path
+    /// found the cap too low for a workflow's derived [`workflow::CapacityRecommendation`]
+    /// — launch/resume (`create_group`, once, at `workflow-loaded`/on resume) or
+    /// the live stepper (`set_max_agents`, every time a human lowers the cap).
+    /// Same two-tier logic, same audit shape, so the trail reads the same no
+    /// matter which path wrote it: below `minimum`, the roster's merge gate
+    /// plus a worker can never all be live at once (hard — it actively
+    /// thrashes); at-or-above `minimum` but below `recommended`, every review
+    /// round completes but named tiers can never run alongside one (soft).
+    /// Advisory only — never refuses or clamps `max_agents`.
+    fn audit_capacity_shortfall(
+        &self,
+        group: &str,
+        blocks: &[workflow::Block],
+        max_agents: u32,
+        rec: &workflow::CapacityRecommendation,
+    ) {
+        if max_agents < rec.minimum {
+            self.audit(group, "loomux", "max-agents-below-minimum", json!({
+                "max_agents": max_agents,
+                "minimum": rec.minimum,
+                "recommended": rec.recommended,
+                "note": format!(
+                    "max_agents ({}) is below this workflow's minimum ({}) — its merge \
+                     gate plus a worker can never all be live at once without evicting a \
+                     live agent to make room.",
+                    max_agents, rec.minimum,
+                ),
+            }));
+        } else if max_agents < rec.recommended {
+            let extras = workflow::extra_tiers(blocks, rec.reviewers_needed);
+            self.audit(group, "loomux", "max-agents-below-recommended", json!({
+                "max_agents": max_agents,
+                "minimum": rec.minimum,
+                "recommended": rec.recommended,
+                "extra_tiers": extras,
+                "note": format!(
+                    "max_agents ({}) covers one review round (minimum {}) but not this \
+                     workflow's full roster (recommended {}) — {} can never be live \
+                     alongside a review round.",
+                    max_agents, rec.minimum, rec.recommended,
+                    if extras.is_empty() {
+                        "some of its declared tiers".to_string()
+                    } else {
+                        workflow::join_with_and(&extras)
+                    },
+                ),
+            }));
+        }
+    }
+
     /// Adjust a live group's max live-agent cap on the fly. Bounds are the
     /// launcher's `1..=MAX_AGENTS_CEILING`. The new value is written to the
     /// in-memory guardrail (which `spawn_agent` reads fresh on every spawn, so
@@ -7052,7 +7064,8 @@ impl OrchRegistry {
         if !(1..=MAX_AGENTS_CEILING).contains(&n) {
             return Err(format!("max agents must be between 1 and {MAX_AGENTS_CEILING}"));
         }
-        let old = self.group(group).ok_or("unknown group")?.guardrails.max_agents;
+        let info = self.group(group).ok_or("unknown group")?;
+        let old = info.guardrails.max_agents;
         if n == old {
             return Ok(n);
         }
@@ -7066,6 +7079,19 @@ impl OrchRegistry {
             .guardrails
             .max_agents = n;
         self.audit(group, actor, "max-agents-set", json!({ "from": old, "to": n }));
+        // #259: `set_max_agents` is the live-cap stepper's backend — the same
+        // knob a workflow's pinned capacity recommendation (#255) is checked
+        // against once at launch/resume. A human lowering the cap mid-session
+        // below the roster's structural minimum is exactly the thrash #255
+        // exists to warn about; without this, that warning goes silent the
+        // moment a session outgrows it live instead of at launch/resume.
+        // Gated the same way the launch/resume path gates `capacity` (mod.rs
+        // `create_group`): only a declared, custom workflow has a structural
+        // minimum to re-check against.
+        if info.guardrails.advanced_orchestrator && workflow::roster_is_custom(&info.guardrails.blocks) {
+            let rec = workflow::recommend_capacity(&info.guardrails.blocks, self.merge_gate(group).as_ref());
+            self.audit_capacity_shortfall(group, &info.guardrails.blocks, n, &rec);
+        }
         // The orchestrator's kickoff prompt already rendered the old
         // {{MAX_AGENTS}} into static text; it needs the new ceiling to re-plan.
         // But rapid-clicking the stepper (4→3→2) would otherwise fire a notice

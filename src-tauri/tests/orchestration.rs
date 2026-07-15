@@ -7750,6 +7750,80 @@ fn max_agents_at_the_recommended_count_is_fully_quiet() {
 }
 
 #[test]
+fn set_max_agents_re_checks_the_pinned_roster_minimum_live_not_just_on_resume() {
+    // #259: before this fix, `set_max_agents` wrote the new cap and audited
+    // only `max-agents-set` — it never compared the new cap against the
+    // group's pinned CapacityRecommendation (#255). A human lowering the live
+    // cap below the roster's minimum produced no notice at all until the
+    // *next resume* happened to re-check it (see the test just below, which
+    // covers the resume path). This test drives the live stepper directly.
+    let (reg, _d) = test_registry();
+    let repo = gated_repo(""); // 1 worker + 2 reviewers, all-pass: minimum 3
+    let g = reg
+        .create_group(
+            &repo.path().to_string_lossy(),
+            Guardrails { advanced_orchestrator: true, max_agents: 5, ..rails() },
+        )
+        .unwrap();
+    assert!(
+        reg.audit_log(&g.id).iter().all(|e| e.action != "max-agents-below-minimum"),
+        "launched comfortably above the minimum — must start quiet"
+    );
+
+    reg.set_max_agents(&g.id, 2, "human").unwrap();
+
+    let warn = reg
+        .audit_log(&g.id)
+        .into_iter()
+        .find(|e| e.action == "max-agents-below-minimum")
+        .expect("lowering the live cap below the roster's minimum must be audited immediately");
+    assert_eq!(warn.detail["max_agents"], 2);
+    assert_eq!(warn.detail["minimum"], 3);
+    // Advisory only, same as the launch-time contract: the lowered cap still
+    // takes effect — a capacity warning must never rewrite it.
+    assert_eq!(reg.group(&g.id).unwrap().guardrails.max_agents, 2);
+}
+
+#[test]
+fn set_max_agents_stays_quiet_without_advanced_orchestrator_or_a_custom_roster() {
+    // The live re-check must be gated exactly like the launch/resume path
+    // gates `capacity` (mod.rs `create_group`): only a declared, custom
+    // workflow has a structural minimum to re-check the live cap against.
+    let (reg, _d) = test_registry();
+    let repo = gated_repo("");
+
+    // Advanced orchestrator off: the workflow file is never read, so there is
+    // no pinned roster to derive a minimum from.
+    let off = reg
+        .create_group(&repo.path().to_string_lossy(), Guardrails { max_agents: 5, ..rails() })
+        .unwrap();
+    reg.set_max_agents(&off.id, 1, "human").unwrap();
+    assert!(
+        reg.audit_log(&off.id)
+            .iter()
+            .all(|e| e.action != "max-agents-below-minimum" && e.action != "max-agents-below-recommended"),
+        "advanced_orchestrator off has no pinned roster to re-check the live cap against"
+    );
+
+    // Advanced orchestrator on, but no `.loomux/workflow.yml` at all — the
+    // built-in default roster, which never had a structural minimum either.
+    let no_file = tempfile::tempdir().unwrap();
+    let built_in = reg
+        .create_group(
+            &no_file.path().to_string_lossy(),
+            Guardrails { advanced_orchestrator: true, max_agents: 5, ..rails() },
+        )
+        .unwrap();
+    reg.set_max_agents(&built_in.id, 1, "human").unwrap();
+    assert!(
+        reg.audit_log(&built_in.id)
+            .iter()
+            .all(|e| e.action != "max-agents-below-minimum" && e.action != "max-agents-below-recommended"),
+        "the built-in roster (no workflow file) has no capacity recommendation to re-check against"
+    );
+}
+
+#[test]
 fn a_resumed_session_re_checks_the_pinned_roster_against_the_live_cap_too() {
     use std::sync::Arc;
     // rev-1 NB6: the roster/gate are pinned on resume (not re-read from the
