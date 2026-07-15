@@ -66,9 +66,25 @@ git push origin vX.Y.Z
 
 ## 3. Watch the workflow
 
-`gh run list --workflow release.yml` then watch the run — four build jobs
-(matrix) and `publish-npm`.
+`gh run list --workflow release.yml` then watch the run — `create-release`,
+four `build` matrix legs, `promote`, and `publish-npm`, in that dependency
+order.
 
+- `create-release` creates the draft release once and hands its id to every
+  `build` leg (`releaseId` input) and to `promote`. This closed #282: legs
+  used to independently look up-or-create the release, which raced (~3% per
+  upstream tauri-apps/tauri-action#914) into two drafts for one tag when legs
+  started near-simultaneously. It hit v0.9.0's first live run for real — 5/9
+  assets went public, 4 were stranded on a stray draft recovered by hand.
+  `create-release` is also idempotent: if a release for the tag already
+  exists (e.g. a "Re-run all jobs" after a partial failure), it reuses that
+  release's id instead of spawning a second draft.
+- `promote` verifies the release's own **asset count** (expects 9) before
+  flipping it public, and refuses — leaving the release in draft — if short.
+  If `promote` fails with "Only N/9 assets" in the logs, don't just re-run
+  it: check `gh api repos/OWNER/REPO/releases` for a stray duplicate release
+  on the same tag first. If it's a genuinely missing/failed matrix leg
+  instead, re-run that leg, then re-run `promote`.
 - npm auth is **trusted publishing (OIDC)** — no `NPM_TOKEN` secret exists; if
   publish fails with an *auth* error, the fix is in npm's trusted-publisher
   config for the repo, not in secrets.
