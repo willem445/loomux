@@ -8953,8 +8953,8 @@ fn a_hard_killed_holder_leaks_no_slot_the_reaper_reclaims_it() {
     write_fake_and_shim(
         &fake,
         &format!(
-            "#!/bin/sh\n: > \"{}/$2.started\"\nsleep 5\nexit 0\n",
-            markers.display()
+            "#!/bin/sh\nprintf '%s' \"$$\" > \"{m}/$2.realpid\"\n: > \"{m}/$2.started\"\nsleep 5\nexit 0\n",
+            m = markers.display()
         ),
         &shim,
         "build",
@@ -8976,11 +8976,21 @@ fn a_hard_killed_holder_leaks_no_slot_the_reaper_reclaims_it() {
     wait_for_file(&markers.join("holder.started"), Duration::from_secs(20));
     let slot = group_dir.join("resource_slots").join("heavy-build").join("slot.1");
     assert!(slot.is_dir(), "the holder must have actually acquired the (only) slot");
+    // TEMP diagnostic: does the pid THIS RUST PROCESS spawned (and is about to
+    // kill) match what the shim itself recorded as its own "$$" AND the "$$"
+    // seen by the fake-build script it then ran (a SEPARATE child process)?
+    eprintln!(
+        "DEBUG rust holder.id()={} shim_recorded_pid={:?} fakebuild_own_pid={:?}",
+        holder.id(),
+        fs::read_to_string(slot.join("pid")),
+        fs::read_to_string(markers.join("holder.realpid")),
+    );
 
     // Hard kill: SIGKILL on unix, TerminateProcess on Windows — the shim's
     // `trap … EXIT INT TERM HUP` CANNOT run for either.
     holder.kill().expect("hard-kill the holder");
     let _ = holder.wait(); // reap it — also makes its death observable to the reaper
+    eprintln!("DEBUG rust holder.wait() completed at {:?}", std::time::Instant::now());
 
     let second = std::process::Command::new("sh")
         .arg(&shim)
