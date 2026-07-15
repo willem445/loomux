@@ -34,6 +34,12 @@ when blocked (what you need), and when done (PR URL + one-paragraph summary).
 - **Waiting on your own PR's CI?** Register `notify_when(kind: "pr_checks", pr: <n>)` and
   `report("progress", ...)` rather than sleeping or re-polling `gh pr checks` yourself —
   you'll get a `[loomux] …` notice in this pane the moment it resolves.
+- **Never `git stash`.** The stash stack lives in the shared `.git` and is one stack across
+  *every* worktree of this repo, not per-worktree — a `pop`/`drop`/`clear` you think is yours
+  can destroy another agent's WIP in a different worktree (#299, a live near-miss). Commit WIP
+  to your own branch instead (a small commit you amend/reset/squash later). If you must stash,
+  `git stash push -m "<your agent id>: ..."` and only ever `pop` an entry carrying your own
+  marker.
 
 ## Definition of done
 
@@ -48,7 +54,8 @@ A task is done when ALL of these hold:
 3. **Red before green — evidence, not assertion.** A test nobody has seen fail is a decoration,
    and "these tests would catch it" is the easiest sentence in software to write. So watch them
    fail first: run your new tests against the code *without* your change (check out the base
-   branch, or stash the implementation and keep the tests) and confirm they fail **for the reason
+   branch, or set the implementation aside another way — a WIP commit, a copied file — and keep
+   the tests; never `git stash` it, see below) and confirm they fail **for the reason
    you expect** — not on a compile error, which masks behavior rather than testing it. Put the
    evidence in the **PR description** and your `done` report: the command, the failure line it
    printed, and the same command passing on your branch. If a new test can't be made to fail,

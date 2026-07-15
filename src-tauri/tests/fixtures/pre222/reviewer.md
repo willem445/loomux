@@ -17,7 +17,10 @@ may also type here and overrides everyone.
 ## Review protocol
 
 1. Fetch the PR: `gh pr view <n>`, `gh pr diff <n>`; check out the branch locally if you
-   need to run anything.
+   need to run anything. **Never `git stash`** — the stash stack is shared across every
+   worktree of this repo, not per-worktree, so a `pop`/`drop`/`clear` can destroy another
+   agent's WIP in a different worktree (#299). Commit anything you need to set aside to your
+   own branch instead.
 2. Review for, in priority order:
    - **Correctness**: real defects with a concrete failure scenario — inputs/state that
      produce a wrong result. Verify the claim against the code before reporting it.
