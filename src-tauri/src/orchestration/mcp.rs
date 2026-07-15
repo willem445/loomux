@@ -229,7 +229,7 @@ fn tool_defs(role: Role) -> Vec<Value> {
                     "worktree": { "type": "boolean", "description": "Create a dedicated git worktree + branch" },
                     "branch": { "type": "string", "description": "Branch name (default agent/<id>)" },
                     "base": { "type": "string", "description": "Start-point for the worktree branch (default: the repo's default branch, fetched fresh from origin). Pass a feature branch (e.g. 'feat/x' or 'origin/feat/x') to deliberately stack this worktree on top of it. Ignored without worktree=true. When 'branch' already exists, that branch is checked out as-is (its history stands on its own) — but if it does NOT descend from the requested base, the spawn fails loudly (#227) rather than silently handing back a wrong-base worktree." },
-                    "resume_session": { "type": "string", "description": "Session id to resume instead of starting fresh" },
+                    "resume_session": { "type": "string", "description": "Session id to resume instead of starting fresh. A truncated id resolves if it's an unambiguous prefix of exactly one session in THIS group's roster; ambiguous or unknown prefixes fail with the matching candidates (never picked silently)." },
                     "cwd": { "type": "string", "description": "Existing directory to run in (required with resume_session; use the original workspace)" },
                 }),
                 &["task"]),
@@ -442,7 +442,15 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             let worktree = args.get("worktree").and_then(Value::as_bool).unwrap_or(false);
             let branch = arg_str(args, "branch").map(str::to_string);
             let base = arg_str(args, "base").map(str::to_string);
-            let resume = arg_str(args, "resume_session").map(str::to_string);
+            // #190: a hand-copied or logged session id is commonly a truncated
+            // prefix (Claude Code ids are full UUIDs); resolve it against this
+            // group's OWN roster before anything below treats it as the final
+            // id — the block-inheritance lookup just below and the actual
+            // resume in `spawn_agent_ex` must agree on the same full id.
+            let resume = match arg_str(args, "resume_session") {
+                Some(raw) => Some(super::resolve_session_ref(&reg.merged_records(&caller.group), raw)?),
+                None => None,
+            };
             let cwd = arg_str(args, "cwd").map(str::to_string);
             let resumed = resume.is_some();
             // #254: a resume that names NEITHER `kind` NOR `block` inherits the

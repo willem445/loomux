@@ -26,7 +26,7 @@ use loomux_lib::orchestration::{
     spawn_rate_exceeded, spawn_request_expired, strip_ansi, submit_confirmed, submit_sequence,
     cap_task_notes, task_summary,
     unconfirmed_delivery_notice, watchdog_should_notify, worktree_cleanup_targets,
-    AttentionItem, Caller, Delivery, Guardrails, HumanInput, Launch, NameSource, OrchRegistry, PasteDecision,
+    AgentRecord, AttentionItem, Caller, Delivery, Guardrails, HumanInput, Launch, NameSource, OrchRegistry, PasteDecision,
     PersonaInject, Task, TaskNote,
     PasteGate, Role, TaskPatch, UsageSnapshot, CLAUDE_UNATTENDED_ALLOW, COPILOT_AUTOPILOT_CONFIRM_KEYS,
     COPILOT_GROUP_AUTOPILOT_FLAGS, COPILOT_UNATTENDED_FLAGS, MAX_ATTACHMENT_BYTES,
@@ -3164,6 +3164,127 @@ fn resume_of_worker_session_keeps_its_original_block_not_the_roster_default() {
         resumed_agent["block"], "worker-fast",
         "resume must keep the ORIGINAL block, not the roster's file-order default: {after}"
     );
+}
+
+// ---------- #190: resume_session prefix resolution ----------
+
+/// Write a synthetic roster (`agents.json`) directly, bypassing spawn/kill —
+/// the prefix-resolution tests need FULL session ids that share a chosen
+/// prefix, which real (randomly-minted) session ids can't be made to do.
+fn write_roster(reg: &OrchRegistry, group: &str, sessions: &[&str]) {
+    let records: Vec<AgentRecord> = sessions
+        .iter()
+        .enumerate()
+        .map(|(i, s)| AgentRecord {
+            id: format!("w-{i}"),
+            role: "worker".into(),
+            block: "worker".into(),
+            name: format!("worker {i}"),
+            name_source: NameSource::default(),
+            session: Some(s.to_string()),
+            cwd: ".".into(),
+            status: "dead".into(),
+            updated_ms: 0,
+        })
+        .collect();
+    fs::write(
+        reg.state_root().join(group).join("agents.json"),
+        serde_json::to_string(&records).unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn resume_session_unique_prefix_resolves_to_the_full_id() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let co = reg.resolve_token(&orch.token).unwrap();
+    let full = "e3bc3b80-1111-4111-8111-111111111111";
+    write_roster(&reg, &g.id, &[full]);
+    let dir = tempfile::tempdir().unwrap();
+
+    // Only the 8-char prefix a human would have copied/logged — issue #190's
+    // exact scenario — with an explicit kind so block-inheritance isn't in play.
+    let r = dispatch(&reg, &co, "tools/call", &json!({
+        "name": "spawn_agent",
+        "arguments": {
+            "kind": "worker",
+            "resume_session": "e3bc3b80",
+            "cwd": dir.path().to_string_lossy(),
+            "task": "follow-up",
+        },
+    })).unwrap();
+    assert_eq!(r["isError"], false, "a unique prefix must resolve, got: {r:?}");
+
+    // The spawned agent must be resumed under the FULL id, not the truncated
+    // prefix verbatim — proof the resolution actually substituted it, since
+    // `sanitize_session` alone would happily accept the bare 8-char string too.
+    let agents = reg.list_agents(&co.group);
+    let resumed = agents.as_array().unwrap().iter().find(|a| a["role"] == "worker").unwrap();
+    assert_eq!(
+        resumed["session"], json!(full),
+        "resumed agent must carry the resolved FULL session id, got: {agents}"
+    );
+}
+
+#[test]
+fn resume_session_ambiguous_prefix_fails_and_lists_candidates() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let co = reg.resolve_token(&orch.token).unwrap();
+    let (a, b) = (
+        "abc12345-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        "abc12345-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    );
+    write_roster(&reg, &g.id, &[a, b]);
+    let dir = tempfile::tempdir().unwrap();
+
+    let r = dispatch(&reg, &co, "tools/call", &json!({
+        "name": "spawn_agent",
+        "arguments": {
+            "kind": "worker",
+            "resume_session": "abc12345",
+            "cwd": dir.path().to_string_lossy(),
+            "task": "follow-up",
+        },
+    })).unwrap();
+    assert_eq!(r["isError"], true, "an ambiguous prefix must never silently pick one: {r:?}");
+    let text = r["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("ambiguous"), "error must say it's ambiguous, got: {text}");
+    assert!(text.contains(a) && text.contains(b), "error must list every candidate, got: {text}");
+
+    // And no agent must have been spawned as a side effect of the failed call.
+    let agents = reg.list_agents(&co.group);
+    assert!(
+        agents.as_array().unwrap().iter().all(|ag| ag["role"] != "worker"),
+        "an ambiguous resume must not have spawned anything: {agents}"
+    );
+}
+
+#[test]
+fn resume_session_unknown_prefix_is_distinguished_from_ambiguous() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let co = reg.resolve_token(&orch.token).unwrap();
+    write_roster(&reg, &g.id, &["e3bc3b80-1111-4111-8111-111111111111"]);
+    let dir = tempfile::tempdir().unwrap();
+
+    let r = dispatch(&reg, &co, "tools/call", &json!({
+        "name": "spawn_agent",
+        "arguments": {
+            "kind": "worker",
+            "resume_session": "deadbeef",
+            "cwd": dir.path().to_string_lossy(),
+            "task": "follow-up",
+        },
+    })).unwrap();
+    assert_eq!(r["isError"], true, "a never-seen prefix must fail, got: {r:?}");
+    let text = r["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("unknown session"), "error must name it as unknown, got: {text}");
+    assert!(!text.contains("ambiguous"), "unknown and ambiguous must be distinguishable, got: {text}");
 }
 
 #[test]
