@@ -32,7 +32,8 @@ With the guard active, agent workers get local execution back **at their own
 discretion** (#331): fast local iteration — a single-file test, an
 incremental `cargo check`, a quick `tsc` pass — capped at `-j 4`; anything
 needing full-matrix proof or red-before-green evidence still goes to CI,
-which remains the sole authority for the CI gate. See the `ci-validate`
+which remains the sole authority for the CI gate. If the guard is not active
+(any precondition unmet), the hard ban still applies. See the `ci-validate`
 skill for the full decision rule, the guard-active precondition to check
 before assuming this discretion applies, and the draft-PR-early CI flow.
 

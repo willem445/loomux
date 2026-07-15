@@ -62,8 +62,10 @@ can't starve the guard's own slot accounting or the host:
 - **CPU-heavy test suites additionally take `-- --test-threads=4`** — a
   separate cap on the **test run's own** thread count, e.g. `cargo test -j 4
   -- --test-threads=4`.
-- **npm/tsc need no flag** — they're single-process (`npm run build`, `npm
-  test`, `node --test test/layout.test.ts`).
+- **npm/tsc need no flag.** `npm run build`/`tsc` is single-process. `npm
+  test`/`node --test` actually parallelizes across test *files* — but the
+  guard caps the whole invocation regardless of its internal concurrency, so
+  there's no equivalent of `--test-threads` to add here either way.
 
 ## The Cargo.lock exception (still applies regardless of the guard)
 
