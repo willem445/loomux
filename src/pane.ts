@@ -50,6 +50,7 @@ import { AuditView } from "./auditview";
 import { GroupView } from "./groupview";
 import { clampOverlayHeight, OVERLAY_MIN_H } from "./overlaysize";
 import {
+  exitDiagnosticLine,
   keepOpenOnExit,
   type ExitInfo,
   type KeepOpenReason,
@@ -360,6 +361,11 @@ export class Pane implements VoiceTargetPane {
   private dockSyncListener: (() => void) | null = null;
   /** True for agent/command panes (vs plain shells). */
   private launchedCommand = false;
+  /** Whether this pane's pty has emitted a single byte since it spawned.
+   *  Distinguishes a crash-with-real-output from one that died silently
+   *  before printing anything — the DOA-revival signature (#281/#280) — so
+   *  the exit banner (and #280's auto-close) can tell them apart. */
+  private receivedOutput = false;
   /** Spawn inputs retained for the session-restore layout snapshot (#194): how
    *  this pane was launched, so `capture()` can serialize it. Record-only —
    *  never read back to drive the live PTY. */
@@ -776,7 +782,10 @@ export class Pane implements VoiceTargetPane {
       // Reconcile: if the pane was resized while the spawn was in flight,
       // the debounced fit will notice the size drifted and resend once.
       this.applyFit();
-      attachOutput(ptyId, (bytes) => this.term.write(bytes));
+      attachOutput(ptyId, (bytes) => {
+        this.receivedOutput ||= bytes.length > 0;
+        this.term.write(bytes);
+      });
       // React to repo changes made outside this pane's shell (#36): the
       // backend watch is pointed at the repo on each cwd report below.
       attachGitWatch(ptyId, () => this.onExternalGitChange());
@@ -1964,6 +1973,13 @@ export class Pane implements VoiceTargetPane {
       );
     }
     this.setName(`${this.name} · exited`);
+    // A crash that never produced a single byte (#281) reads as a bare exit
+    // code with nothing to go on -- say so explicitly rather than leaving
+    // the human to guess whether this ever even started.
+    if (reason === "output") {
+      const diag = exitDiagnosticLine(this.receivedOutput);
+      if (diag) this.term.writeln(`\r\n[90m${diag}[0m`);
+    }
   }
 
   /** What this pane is holding, for the app-quit guard's enumeration (#219): its editor's

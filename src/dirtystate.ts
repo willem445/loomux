@@ -191,3 +191,20 @@ export function keepOpenOnExit(state: {
   if (state.hasUnsavedWork) return "unsaved";
   return null;
 }
+
+/** The extra line a crashed pane's exit banner shows when its process never
+ *  produced a single byte of output before dying (#281) — the resumed-CLI-
+ *  boots-and-immediately-exits signature that a bare "process exited (code N)"
+ *  gives no way to diagnose. `null` when the process DID produce output (a
+ *  real crash mid-work reads fine as-is) or when the exit wasn't a crash at
+ *  all (`keepOpenOnExit` already filters that; this only makes sense for a
+ *  pane kept open for reason `"output"`). Pure so the distinction — the actual
+ *  behavior change — is unit-testable without a live pty/terminal. */
+export function exitDiagnosticLine(receivedOutput: boolean): string | null {
+  if (receivedOutput) return null;
+  return (
+    "[loomux] produced no output before exiting — it likely died before printing " +
+    "anything at all (a missing/corrupt session, a rejected resume flag, or a gone " +
+    "working directory are the usual causes)"
+  );
+}

@@ -12,6 +12,7 @@ use loomux_lib::orchestration::workflow;
 use loomux_lib::orchestration::{
     add_trusted_folder, autonomy_budget_exhausted, bracketed_paste, classify_human_input,
     claude_permission_mode, cli_ready, copilot_autopilot_prompt_detected, create_orchestration_group,
+    exit_diagnostic, resolve_output_text,
     gh_gate_decision, gh_is_merge_invocation, gh_positionals, gh_release_action, gh_repo_flag,
     gh_shim_sh, git_shim_sh, git_tag_push, grant_segment, grant_unexpired, hold_for_human_input,
     hold_until_quiet, idle_output_is_activity, idle_should_kill, idle_tick_should_fire,
@@ -691,6 +692,65 @@ fn unconfirmed_notice_text_names_the_agent_and_the_recovery_move() {
     // Points the orchestrator at the recovery move from the template.
     assert!(msg.contains("get_output"), "notice must point at reading the pane: {msg}");
     assert!(msg.contains("re-send"), "notice must point at re-sending: {msg}");
+}
+
+// ---------- #281: surfacing a silent early exit ----------
+
+#[test]
+fn exit_diagnostic_names_the_silent_death_when_nothing_was_ever_printed() {
+    // The #281 signature: a resumed CLI that exits before printing a single
+    // byte. A bare exit code can't distinguish this from "did real work, then
+    // failed" — the notice must say so explicitly.
+    let msg = exit_diagnostic("", 0);
+    assert!(msg.contains("no output"), "must name the zero-output case: {msg}");
+    assert!(
+        msg.contains("session") || msg.contains("cwd") || msg.contains("flag"),
+        "must suggest plausible causes so the orchestrator has somewhere to look: {msg}"
+    );
+}
+
+#[test]
+fn exit_diagnostic_shows_the_tail_when_the_process_actually_produced_output() {
+    // A crash mid-work is a different failure than a silent DOA death — the
+    // notice must carry what the CLI actually printed, not the zero-output
+    // wording, and must never invent content that wasn't captured.
+    let msg = exit_diagnostic("Error: something broke\npanic at line 9", 42);
+    assert!(!msg.contains("no output"), "must not claim silence when bytes were produced: {msg}");
+    assert!(msg.contains("something broke"), "must carry the real captured output: {msg}");
+}
+
+#[test]
+fn exit_diagnostic_snippet_is_bounded_not_the_whole_captured_tail() {
+    // A saturated ring can be large; the orchestrator notice is a diagnostic
+    // hint, not a full transcript dump.
+    let huge = "x".repeat(10_000);
+    let msg = exit_diagnostic(&huge, 10_000);
+    assert!(msg.len() < 1000, "snippet must be bounded, got {} chars", msg.len());
+}
+
+#[test]
+fn agent_output_tail_prefers_live_output_but_falls_back_to_the_captured_exit_tail() {
+    // Live output (the pty is still alive) always wins over whatever was
+    // captured at a PAST exit.
+    assert_eq!(
+        resolve_output_text(Some("live text".to_string()), Some("stale exit tail")).unwrap(),
+        "live text"
+    );
+    // The live pty is gone (the agent exited) — #281's fallback answers with
+    // what was captured at exit time instead of failing outright.
+    assert_eq!(
+        resolve_output_text(None, Some("captured at exit")).unwrap(),
+        "captured at exit"
+    );
+    // Nothing live AND nothing captured (a plain pane, or one that exited
+    // before #281 shipped) — the original "terminal already closed" error,
+    // not a fabricated answer.
+    let err = resolve_output_text(None, None).unwrap_err();
+    assert!(err.contains("already closed"), "must keep the original error, got: {err}");
+    // An empty captured tail is the same as nothing captured — never "answer"
+    // with an empty string as if that were meaningful output.
+    let err = resolve_output_text(None, Some("")).unwrap_err();
+    assert!(err.contains("already closed"), "empty capture must not be treated as an answer: {err}");
 }
 
 #[test]

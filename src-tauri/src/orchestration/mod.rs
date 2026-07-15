@@ -2607,6 +2607,12 @@ pub struct AgentEntry {
     /// `last_progress_ms` above double as the idle-tick output counter / quiet
     /// clock for the orchestrator, which the watchdog never touches.
     pub idle_tick_notified: bool,
+    /// Rolling output tail captured at exit (#281), stripped of ANSI. The live
+    /// pty's own ring is gone the instant it's reaped, which turned "why did a
+    /// resumed session die silently" into a bare exit code with no way to ask
+    /// for more — `agent_output_tail` falls back to this once the pty itself is
+    /// gone. `None` until the agent exits (or for one still running).
+    pub last_exit_tail: Option<String>,
 }
 
 /// One pane that needs the human, pushed to the frontend as an `orch-attention`
@@ -3527,6 +3533,52 @@ fn render_template(tpl: &str, vars: &[(&str, &str)]) -> String {
         out = out.replace(&format!("{{{{{k}}}}}"), v);
     }
     out
+}
+
+/// Last `n` bytes of `s`, cut on a char boundary (never mid-UTF8) — a short
+/// diagnostic snippet for an exit notice, never the whole captured tail.
+fn tail_snippet(s: &str, n: usize) -> &str {
+    if s.len() <= n {
+        return s;
+    }
+    let start = s.len() - n;
+    let boundary = (start..=s.len()).find(|&i| s.is_char_boundary(i)).unwrap_or(s.len());
+    &s[boundary..]
+}
+
+/// The diagnostic clause `on_pty_exit` puts in its orchestrator notice (#281):
+/// a bare exit code can't distinguish "produced real output, then failed" from
+/// "died before printing a single byte" (the resume-CLI-boots-and-immediately-
+/// dies signature this issue is about) — `total_bytes == 0` names that case
+/// explicitly instead of leaving the orchestrator to guess. Factored out as a
+/// pure function (no pty/app handle needed) so it's directly unit-testable.
+pub fn exit_diagnostic(tail: &str, total_bytes: u64) -> String {
+    if total_bytes == 0 {
+        "produced no output before exiting — it likely died before the CLI printed \
+         anything at all (a missing/corrupt session file, a rejected resume flag, or \
+         a gone cwd are the usual causes)"
+            .to_string()
+    } else {
+        format!("last output before it died: {:?}", tail_snippet(tail, 400))
+    }
+}
+
+/// What `agent_output_tail` returns given whatever the live pty produced (if
+/// still alive) and whatever was captured at exit (#281). Factored out as a
+/// pure function so the fallback — the actual behavior change — is directly
+/// unit-testable without a live pty/app handle, which `agent_output_tail`
+/// itself can't be driven with in a unit test.
+pub fn resolve_output_text(live: Option<String>, last_exit_tail: Option<&str>) -> Result<String, String> {
+    if let Some(t) = live {
+        return Ok(t);
+    }
+    match last_exit_tail {
+        Some(t) if !t.is_empty() => Ok(t.to_string()),
+        // The live pty is already gone (the agent exited) and nothing was
+        // captured at exit time either — the pre-#281 behavior, kept as the
+        // last resort rather than inventing content that was never seen.
+        _ => Err("terminal already closed".to_string()),
+    }
 }
 
 /// Strip ANSI escape sequences (CSI, OSC, two-byte ESC) and carriage
@@ -9407,6 +9459,7 @@ impl OrchRegistry {
             last_output_total: 0,
             watchdog_notified: false,
             idle_tick_notified: false,
+            last_exit_tail: None,
         };
         {
             // Re-check the cap under the same lock as the insert: the early
@@ -10134,8 +10187,8 @@ impl OrchRegistry {
         let pty_id = a.pty_id.ok_or("agent has no terminal")?;
         let app = self.app.lock_safe().clone().ok_or("no app handle")?;
         let ptys = app.state::<crate::pty::PtyManager>();
-        let raw = ptys.output_tail(pty_id).ok_or("terminal already closed")?;
-        let text = strip_ansi(&raw);
+        let live = ptys.output_tail(pty_id).map(|raw| strip_ansi(&raw));
+        let text = resolve_output_text(live, a.last_exit_tail.as_deref())?;
         let all: Vec<&str> = text.lines().collect();
         let n = lines.clamp(1, 500);
         let start = all.len().saturating_sub(n);
@@ -10313,18 +10366,34 @@ impl OrchRegistry {
 
     /// Called from the pty waiter thread when any pty exits. No-op for ptys
     /// that aren't orchestration agents.
-    pub fn on_pty_exit(&self, pty_id: u32, exit_code: Option<u32>) {
+    /// `tail` is the pty's captured output at the moment it exited (ANSI
+    /// stripped), `total_bytes` the monotonic byte count it ever produced —
+    /// both read off the *removed* pty handle in `pty.rs`, since the live
+    /// ring is gone the instant this runs. `total_bytes == 0` is the #281
+    /// signature: a resumed CLI that exited before printing a single byte,
+    /// which a bare exit code can't be told apart from "it did real work and
+    /// then failed" — the orchestrator's notice below says which happened.
+    pub fn on_pty_exit(&self, pty_id: u32, exit_code: Option<u32>, tail: &str, total_bytes: u64) {
         let agent_id = match self.by_pty.lock_safe().get(&pty_id).cloned() {
             Some(id) => id,
             None => return,
         };
+        let started_ms = self.agent(&agent_id).map(|a| a.started_ms).unwrap_or(0);
+        if !tail.is_empty() {
+            if let Some(a) = self.agents.lock_safe().get_mut(&agent_id) {
+                a.last_exit_tail = Some(tail.to_string());
+            }
+        }
         if let Some(a) = self.mark_dead(&agent_id, exit_code) {
             if a.role != Role::Orchestrator {
+                let elapsed_ms = now_ms().saturating_sub(started_ms);
+                let cause = exit_diagnostic(tail, total_bytes);
                 let _ = self.deliver_to_orchestrator(
                     &a.group,
                     &format!(
-                        "[loomux] agent {} ({}) exited (code {:?}). Update your plan and state accordingly.",
-                        a.name, a.id, exit_code
+                        "[loomux] agent {} ({}) exited (code {exit_code:?}) {elapsed_ms}ms after \
+                         spawn — {cause}. Update your plan and state accordingly.",
+                        a.name, a.id,
                     ),
                     "loomux",
                 );
@@ -11001,6 +11070,7 @@ fn register_orchestrator_pane(
         last_output_total: 0,
         watchdog_notified: false,
         idle_tick_notified: false,
+        last_exit_tail: None,
     };
     reg.agents.lock_safe().insert(agent_id.clone(), entry.clone());
     reg.by_token.lock_safe().insert(token, agent_id.clone());
