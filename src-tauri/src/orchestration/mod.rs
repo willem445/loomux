@@ -1055,12 +1055,27 @@ loomux_pid_alive() {
       ''|*[!0-9]*) : ;;
       *)
         if command -v tasklist >/dev/null 2>&1; then
-          tasklist //FI "PID eq $wp" 2>/dev/null | grep -q "[^0-9]$wp[^0-9]" && return 0 || return 1
+          if tasklist //FI "PID eq $wp" 2>/dev/null | grep -q "[^0-9]$wp[^0-9]"; then
+            [ -n "$LOOMUX_TEST_DEBUG" ] && echo "loomux_pid_alive($p): proc-exists, winpid=$wp, tasklist=ALIVE" >&2
+            return 0
+          else
+            [ -n "$LOOMUX_TEST_DEBUG" ] && echo "loomux_pid_alive($p): proc-exists, winpid=$wp, tasklist=DEAD" >&2
+            return 1
+          fi
         fi ;;
     esac
   fi
-  [ -d "/proc/$p" ] && return 0
-  kill -0 "$p" 2>/dev/null
+  if [ -d "/proc/$p" ]; then
+    [ -n "$LOOMUX_TEST_DEBUG" ] && echo "loomux_pid_alive($p): no winpid mapping, /proc/$p exists -> ALIVE" >&2
+    return 0
+  fi
+  if kill -0 "$p" 2>/dev/null; then
+    [ -n "$LOOMUX_TEST_DEBUG" ] && echo "loomux_pid_alive($p): fallback kill -0 -> ALIVE" >&2
+    return 0
+  else
+    [ -n "$LOOMUX_TEST_DEBUG" ] && echo "loomux_pid_alive($p): fallback kill -0 -> DEAD" >&2
+    return 1
+  fi
 }
 
 SLOT_PATH=""
@@ -1069,10 +1084,12 @@ loomux_try_acquire() {
   while [ "$i" -le "$MATCH_N" ]; do
     cand="$slot_root/slot.$i"
     if mkdir "$cand" 2>/dev/null; then
+      [ -n "$LOOMUX_TEST_DEBUG" ] && echo "loomux_try_acquire: fresh mkdir $cand OK" >&2
       printf '%s\n' "$$" > "$cand/pid" 2>/dev/null || true
       SLOT_PATH="$cand"
       return 0
     fi
+    [ -n "$LOOMUX_TEST_DEBUG" ] && echo "loomux_try_acquire: mkdir $cand busy, checking holder pid" >&2
     # Occupied — reap if the recorded holder's pid is dead (a slot orphaned by
     # a hard kill: mkdir claims do not self-release the way an flock'd fd
     # would). RENAME the stale dir out of the way rather than `rm -rf` then
@@ -1086,16 +1103,24 @@ loomux_try_acquire() {
     # that was never itself just removed. It also makes the reap itself an
     # atomic claim: only one racing contender's `mv` can succeed.
     hp=$(cat "$cand/pid" 2>/dev/null)
+    [ -n "$LOOMUX_TEST_DEBUG" ] && echo "loomux_try_acquire: holder pid file says hp=[$hp]" >&2
     if [ -n "$hp" ] && ! loomux_pid_alive "$hp"; then
+      [ -n "$LOOMUX_TEST_DEBUG" ] && echo "loomux_try_acquire: hp=$hp is DEAD, attempting reap" >&2
       stale="$cand.stale.$$"
       if mv "$cand" "$stale" 2>/dev/null; then
+        [ -n "$LOOMUX_TEST_DEBUG" ] && echo "loomux_try_acquire: mv $cand -> $stale OK" >&2
         rm -rf "$stale" 2>/dev/null &
         if mkdir "$cand" 2>/dev/null; then
+          [ -n "$LOOMUX_TEST_DEBUG" ] && echo "loomux_try_acquire: reap mkdir $cand OK" >&2
           printf '%s\n' "$$" > "$cand/pid" 2>/dev/null || true
           SLOT_PATH="$cand"
           loomux_audit "resource-guard-reaped" "{\"class\":\"$MATCH_CLASS\",\"slot\":$i,\"stale_pid\":\"$hp\"}"
           return 0
+        else
+          [ -n "$LOOMUX_TEST_DEBUG" ] && echo "loomux_try_acquire: reap mkdir $cand FAILED after successful mv" >&2
         fi
+      else
+        [ -n "$LOOMUX_TEST_DEBUG" ] && echo "loomux_try_acquire: mv $cand -> $stale FAILED" >&2
       fi
     fi
     i=$((i + 1))

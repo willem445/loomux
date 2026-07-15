@@ -8966,6 +8966,7 @@ fn a_hard_killed_holder_leaks_no_slot_the_reaper_reclaims_it() {
         .arg("go")
         .arg("holder")
         .env("LOOMUX_GROUP_DIR", &group_dir)
+        .env("LOOMUX_TEST_DEBUG", "1") // TEMP: diagnosing a Windows-CI-only reap delay; strip before merge
         .spawn()
         .unwrap();
     // A generous bound: a cold sh.exe spawn under loaded CI (many parallel
@@ -8986,6 +8987,7 @@ fn a_hard_killed_holder_leaks_no_slot_the_reaper_reclaims_it() {
         .arg("go")
         .arg("second")
         .env("LOOMUX_GROUP_DIR", &group_dir)
+        .env("LOOMUX_TEST_DEBUG", "1") // TEMP: diagnosing a Windows-CI-only reap delay; strip before merge
         .spawn()
         .unwrap();
     wait_for_file(&markers.join("second.started"), Duration::from_secs(20));
