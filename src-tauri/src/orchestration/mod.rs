@@ -13095,6 +13095,13 @@ pub fn resume_recorded_session(
                 group_id,
                 role,
                 group_live,
+                // Signature-only fallback (no roster row, no audit line to
+                // read): none of #1's metadata is derivable, so it's honestly
+                // absent rather than guessed.
+                task: String::new(),
+                branch: None,
+                repo: None,
+                pr: None,
             })
         })
         .ok_or("this session is not part of a recorded orchestration")?;
