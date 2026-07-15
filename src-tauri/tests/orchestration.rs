@@ -9005,10 +9005,41 @@ fn connect_mints_a_channel_and_audits_both_groups() {
             .into_iter()
             .find(|e| e.action == "channel-connect")
             .unwrap_or_else(|| panic!("{g} must carry a channel-connect record"));
-        assert_eq!(connect.detail["channel_id"], ch["channel_id"]);
+        // The audit record and the `orch-channel` event key the id
+        // `channel_id` on purpose (matching `OrchChannelEvent`); the
+        // command's OWN return value keys it `id` (see the shape-parity
+        // test below) — these are deliberately different fields, not a typo.
+        assert_eq!(connect.detail["channel_id"], ch["id"]);
     }
     assert_eq!(channel_status(&reg, &c1)["connected"], json!(true));
     assert_eq!(channel_status(&reg, &c1)["peers"][0]["agent_id"], json!(c2.agent_id));
+}
+
+#[test]
+fn connect_list_and_for_pane_all_return_the_same_channel_shape() {
+    // rev-7 (PR #285 round 1, blocking): `connect_agents` used to return
+    // `{channel_id, members}` while `channel_list`/`channel_for_pane` return
+    // `{id, created_ms, members}` — the shape the frontend's `OrchChannel`
+    // type declares. `invoke<OrchChannel>` casts silently at the IPC
+    // boundary, so a UI reading `ch.id` off `channelConnect`'s result got
+    // `undefined` at runtime with no compile-time signal. Pin that all three
+    // commands agree on the SAME keys, so that drift can't reappear unnoticed.
+    let (reg, _d, g1, g2, c1, c2) = two_group_setup();
+    let connected = reg.connect_agents(&g1, &c1.agent_id, &g2, &c2.agent_id).unwrap();
+    let listed = reg.channel_list().as_array().unwrap()[0].clone();
+    let for_pane = reg.channel_for_pane(&g1, &c1.agent_id);
+
+    for (label, ch) in [("connect", &connected), ("list", &listed), ("for_pane", &for_pane)] {
+        assert!(ch["id"].is_string(), "{label} must key the channel id as `id`, got: {ch}");
+        assert!(!ch.as_object().unwrap().contains_key("channel_id"),
+            "{label}'s return value must never carry `channel_id` — that key is reserved for \
+             the channel-connect audit record and the orch-channel event, got: {ch}");
+        assert_eq!(ch["id"], connected["id"], "{label} must report the SAME id connect minted");
+        assert_eq!(
+            ch["members"].as_array().unwrap().len(), 2,
+            "{label} must report the same membership, got: {ch}"
+        );
+    }
 }
 
 #[test]
@@ -9123,12 +9154,12 @@ fn one_channel_per_pane_invariant() {
     let w3 = reg.spawn_agent(&g3.id, Role::Worker, "w3", "t3", false, None).unwrap();
 
     let ch1 = reg.connect_agents(&g1, &c1.agent_id, &g2, &c2.agent_id).unwrap();
-    let chan_id = ch1["channel_id"].as_str().unwrap().to_string();
+    let chan_id = ch1["id"].as_str().unwrap().to_string();
 
     // A free pane connecting onto an already-connected one JOINS that
     // channel (multi-party) rather than minting a second one.
     let joined = reg.connect_agents(&g1, &c1.agent_id, &g3.id, &w3.id).unwrap();
-    assert_eq!(joined["channel_id"], json!(chan_id));
+    assert_eq!(joined["id"], json!(chan_id));
     assert_eq!(joined["members"].as_array().unwrap().len(), 3);
     assert_eq!(reg.channel_for_pane(&g3.id, &w3.id)["id"], json!(chan_id));
 
@@ -9138,7 +9169,7 @@ fn one_channel_per_pane_invariant() {
     let g5 = reg.create_group("C:/tmp/repo-e", rails()).unwrap();
     let w4b = reg.spawn_agent(&g5.id, Role::Worker, "w4b", "t", false, None).unwrap();
     let ch2 = reg.connect_agents(&g4.id, &w4a.id, &g5.id, &w4b.id).unwrap();
-    assert_ne!(ch2["channel_id"], json!(chan_id));
+    assert_ne!(ch2["id"], json!(chan_id));
 
     // w3 (already in chan_id) connecting to a pane already in the OTHER
     // channel must be rejected — that would silently bridge the two.
@@ -9146,7 +9177,7 @@ fn one_channel_per_pane_invariant() {
     assert!(err.contains("already connected"), "got: {err}");
     // w3's membership is unaffected by the rejected attempt.
     assert_eq!(reg.channel_for_pane(&g3.id, &w3.id)["id"], json!(chan_id));
-    assert_eq!(reg.channel_for_pane(&g4.id, &w4a.id)["id"], ch2["channel_id"]);
+    assert_eq!(reg.channel_for_pane(&g4.id, &w4a.id)["id"], ch2["id"]);
 }
 
 #[test]
