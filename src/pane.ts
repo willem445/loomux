@@ -39,6 +39,7 @@ import { createOrderedWriter } from "./ptywrite";
 import { showToast } from "./toast";
 import { isAppShortcut } from "./shortcuts";
 import { attentionPresentation } from "./attention";
+import { heldPresentation } from "./heldbadge";
 import { makeRenameCommit } from "./panerename";
 import { shouldResizePty } from "./panefit";
 import { swapEditor } from "./domutil";
@@ -409,6 +410,15 @@ export class Pane implements VoiceTargetPane {
   private attnChip: HTMLButtonElement;
   private attentionReason: string | null = null;
   private attentionDetail: string | null = null;
+  /** "delivery held" chip in the header (#246): the moment loomux is
+   *  withholding an outbound prompt to this pane because it believes the
+   *  human's own input occupies the CLI's box. Hidden until the backend
+   *  flags a hold in progress; cleared by its own paired event, never a
+   *  frontend timer. Purely informational — unlike attnChip, clicking it
+   *  does nothing to acknowledge/clear (only the backend resolving the hold
+   *  does). */
+  private heldChip: HTMLElement;
+  private heldReason: string | null = null;
   /** Cross-workspace channel chip (#271): shown when this pane is a live channel
    *  member. Clicking it disconnects — the "easy close from the indicator itself"
    *  requirement — separate from the pane-menu Disconnect item, same destination. */
@@ -501,6 +511,13 @@ export class Pane implements VoiceTargetPane {
       this.acknowledgeAttention();
     });
     header.appendChild(this.attnChip);
+
+    // "Delivery held" chip (#246): purely informational, no click handler —
+    // the hold only clears when the backend resolves it.
+    this.heldChip = document.createElement("span");
+    this.heldChip.className = "pane-held";
+    this.heldChip.hidden = true;
+    header.appendChild(this.heldChip);
 
     // Cross-workspace channel chip (#271): shown only while this pane is a live
     // channel member. Clicking it disconnects directly — the "easy close from the
@@ -1392,6 +1409,28 @@ export class Pane implements VoiceTargetPane {
     // A minimized pane's element is detached, so its header chip is invisible;
     // the listener lets the grid mirror this state onto the dock chip.
     this.dockSyncListener?.();
+  }
+
+  /** Flag (or clear) that loomux is currently withholding a prompt delivery
+   *  to this pane because it believes the human's own input occupies the
+   *  CLI's box (#246) — driven by the backend's paired
+   *  orch-delivery-held / orch-delivery-held-cleared events. Idempotent on
+   *  the reason, same as `setAttention`. `null` clears the badge. Header
+   *  chrome only: this never touches the pane's size, so the no-PTY-resize
+   *  invariant holds trivially. */
+  setHeld(reason: string | null, detail?: string): void {
+    if (reason === this.heldReason) return;
+    this.heldReason = reason;
+    if (!reason) {
+      this.heldChip.hidden = true;
+      delete this.heldChip.dataset.reason;
+    } else {
+      const { label } = heldPresentation(reason);
+      this.heldChip.textContent = label;
+      this.heldChip.title = detail ?? "Prompt delivery paused — human input occupies this pane's box";
+      this.heldChip.dataset.reason = reason;
+      this.heldChip.hidden = false;
+    }
   }
 
   /** Mark (or clear) this pane's cross-workspace channel membership (#271): a

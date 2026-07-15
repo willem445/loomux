@@ -498,6 +498,20 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   .pane-attn { animation: none; }
 }
 
+/* ---------- delivery-held badge (#246) ---------- */
+/* Loomux is currently withholding an outbound prompt because it believes the
+   human's own input occupies this pane's CLI box. Distinct from .pane-attn
+   (which flags a pane the human should look AT): this flags a pane loomux is
+   NOT writing to right now, so it gets its own muted (non-pulsing, no hover
+   affordance — nothing to click) treatment rather than competing visually
+   with the attention chip when both happen to be present. */
+.pane-held {
+  flex: none;
+  font-size: 9px; font-weight: 700; letter-spacing: 0.4px;
+  border: 1px solid #3d4a63; border-radius: 4px; padding: 1.5px 6px;
+  color: #8aa2c8; background: rgba(122, 162, 247, 0.12);
+}
+
 /* ---------- cross-workspace channels (#271) ---------- */
 /* The connect gesture's three visual states, each independent (so they never fight
    the grouped/attention box-shadow stripes above): an ARMED pane (right-clicked,

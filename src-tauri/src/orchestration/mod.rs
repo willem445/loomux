@@ -4417,6 +4417,63 @@ fn wait_for_box_clear(ptys: &crate::pty::PtyManager, pty_id: u32) -> PasteDecisi
     )
 }
 
+/// Why a prompt delivery is currently being held for human input (#246): the
+/// UI-facing counterpart to the audit-log holds above. `Typing` is
+/// `wait_for_user_quiet`'s "human is actively typing" hold (#43); `BoxOccupied`
+/// is `wait_for_box_clear`'s "an unsubmitted line sits in the box" hold (#111,
+/// backed by `box_occupancy_delta`/#171). Two reasons because they read
+/// differently to a human watching the pane — one is "wait, I'm still typing",
+/// the other is "wait, I left something in the box" — even though both boil
+/// down to "loomux won't paste over you".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeldReason {
+    Typing,
+    BoxOccupied,
+}
+
+impl HeldReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HeldReason::Typing => "typing",
+            HeldReason::BoxOccupied => "box-occupied",
+        }
+    }
+}
+
+/// Human-readable "what's held and why" line for a delivery-held badge/toast
+/// (#246). Pure so the copy is unit-testable; callers pair it with
+/// `delivery_held_event`'s payload.
+pub fn delivery_held_detail(agent_id: &str, reason: HeldReason) -> String {
+    match reason {
+        HeldReason::Typing => format!(
+            "Prompt delivery to {agent_id} is paused — you're typing in this pane."
+        ),
+        HeldReason::BoxOccupied => format!(
+            "Prompt delivery to {agent_id} is paused — submit or clear the text in this pane's box to continue."
+        ),
+    }
+}
+
+/// Build the `orch-delivery-held` event payload (#246): pushed the moment a
+/// delivery to `agent_id` starts waiting on human input in `pty_id`'s box.
+/// Pure so the shape is unit-testable without a harness that can capture an
+/// actually-emitted Tauri event (see `channel_connected_event`'s doc for why
+/// this codebase always factors payload construction out this way).
+pub fn delivery_held_event(agent_id: &str, group: &str, pty_id: u32, reason: HeldReason) -> Value {
+    json!({
+        "agent_id": agent_id, "group": group, "pty_id": pty_id,
+        "reason": reason.as_str(), "detail": delivery_held_detail(agent_id, reason),
+    })
+}
+
+/// Build the `orch-delivery-held-cleared` event payload (#246): pushed the
+/// instant a hold resolves, whether the prompt then delivered or the delivery
+/// aborted — either way nothing is held on `pty_id` anymore, so the frontend
+/// badge for it drops.
+pub fn delivery_held_cleared_event(pty_id: u32) -> Value {
+    json!({ "pty_id": pty_id })
+}
+
 /// Whether an unconfirmed delivery should raise a one-shot notice to the group's
 /// orchestrator so it can close the loop (#103). Fires only for a delivery to a
 /// NON-orchestrator agent whose submit went unconfirmed: the prompt may be
@@ -11295,6 +11352,20 @@ impl OrchRegistry {
             let _guard = lock.lock_safe();
             let ptys = app.state::<crate::pty::PtyManager>();
 
+            // Delivery-held badge plumbing (#246): fired around each blocking
+            // human-input hold below so a pane-header badge can appear the
+            // instant a hold starts and drop the instant it resolves. Each
+            // call site first checks (with zero elapsed hold) whether it's
+            // ABOUT to block, so the badge only shows for holds that actually
+            // happen, never for the common no-op case where the box was
+            // already clear.
+            let emit_held = |reason: HeldReason| {
+                let _ = app.emit("orch-delivery-held", delivery_held_event(&agent, &group, pty_id, reason));
+            };
+            let emit_held_cleared = || {
+                let _ = app.emit("orch-delivery-held-cleared", delivery_held_cleared_event(pty_id));
+            };
+
             let start = std::time::Instant::now();
             if wait_ready {
                 let mut last_len = 0usize;
@@ -11334,11 +11405,21 @@ impl OrchRegistry {
             // directly in this pane, hold the paste until they go quiet so a
             // report can't land inside their half-typed line. Capped so a long
             // compose session can't starve the queue.
+            let will_hold_typing_prepaste = should_hold_for_user(
+                ptys.last_user_input_ms(pty_id).unwrap_or(0), now_ms(),
+                Duration::ZERO, USER_QUIET_HOLD, USER_QUIET_MAX_HOLD,
+            );
+            if will_hold_typing_prepaste {
+                emit_held(HeldReason::Typing);
+            }
             if let Some(held_ms) = wait_for_user_quiet(&ptys, pty_id) {
                 append_audit(&root, &group, "loomux", "delivery-held-for-user", json!({
                     "to": agent, "stage": "pre-paste", "held_ms": held_ms,
                     "capped": held_ms >= USER_QUIET_MAX_HOLD.as_millis() as u64,
                 }));
+            }
+            if will_hold_typing_prepaste {
+                emit_held_cleared();
             }
 
             // Stranded-text flush (#81/#84): if the PREVIOUS delivery to this
@@ -11367,7 +11448,15 @@ impl OrchRegistry {
             // `/model` + task-text collision). So hold for the box to clear
             // (they submit or clear it); if it never does, abort WITHOUT pasting
             // and nudge the orchestrator to re-send once the pane is clear.
-            match wait_for_box_clear(&ptys, pty_id) {
+            let will_hold_box = ptys.input_pending(pty_id).unwrap_or(false);
+            if will_hold_box {
+                emit_held(HeldReason::BoxOccupied);
+            }
+            let paste_decision = wait_for_box_clear(&ptys, pty_id);
+            if will_hold_box {
+                emit_held_cleared();
+            }
+            match paste_decision {
                 PasteDecision::Paste { held_ms } if held_ms > 0 => {
                     append_audit(&root, &group, "loomux", "delivery-held-for-input", json!({
                         "to": agent, "held_ms": held_ms, "outcome": "cleared",
@@ -11461,11 +11550,21 @@ impl OrchRegistry {
             // Re-check right before the first Enter: the human may have
             // started typing during the quiet-wait above, and a blind Enter
             // would submit their line. Hold again until they're quiet (#43).
+            let will_hold_typing_preenter = should_hold_for_user(
+                ptys.last_user_input_ms(pty_id).unwrap_or(0), now_ms(),
+                Duration::ZERO, USER_QUIET_HOLD, USER_QUIET_MAX_HOLD,
+            );
+            if will_hold_typing_preenter {
+                emit_held(HeldReason::Typing);
+            }
             if let Some(held_ms) = wait_for_user_quiet(&ptys, pty_id) {
                 append_audit(&root, &group, "loomux", "delivery-held-for-user", json!({
                     "to": agent, "stage": "pre-enter", "held_ms": held_ms,
                     "capped": held_ms >= USER_QUIET_MAX_HOLD.as_millis() as u64,
                 }));
+            }
+            if will_hold_typing_preenter {
+                emit_held_cleared();
             }
             let submit_sent_ms = now_ms();
             // Baseline just before the first Enter, so the confirmation window

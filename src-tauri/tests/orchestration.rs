@@ -14,6 +14,7 @@ use loomux_lib::orchestration::{
     channel_connected_event, channel_disconnected_event, channel_message_text,
     channel_updated_event, classify_human_input,
     claude_permission_mode, cli_ready, copilot_autopilot_prompt_detected, create_orchestration_group,
+    delivery_held_cleared_event, delivery_held_detail, delivery_held_event,
     exit_cause, exit_diagnostic, resolve_output_text,
     gh_gate_decision, gh_is_merge_invocation, gh_positionals, gh_release_action, gh_repo_flag,
     gh_shim_sh, git_shim_sh, git_tag_push, grant_segment, grant_unexpired, hold_for_human_input,
@@ -29,7 +30,7 @@ use loomux_lib::orchestration::{
     spawn_rate_exceeded, spawn_request_expired, strip_ansi, submit_confirmed, submit_sequence,
     cap_task_notes, task_summary,
     unconfirmed_delivery_notice, watchdog_should_notify, worktree_cleanup_targets,
-    AgentRecord, AttentionItem, Caller, Delivery, Guardrails, HumanInput, Launch, NameSource, OrchRegistry, PasteDecision,
+    AgentRecord, AttentionItem, Caller, Delivery, Guardrails, HeldReason, HumanInput, Launch, NameSource, OrchRegistry, PasteDecision,
     PersonaInject, Task, TaskNote,
     PasteGate, Role, TaskPatch, UsageSnapshot, CLAUDE_UNATTENDED_ALLOW, COPILOT_AUTOPILOT_CONFIRM_KEYS,
     COPILOT_GROUP_AUTOPILOT_FLAGS, COPILOT_UNATTENDED_FLAGS, MAX_ATTACHMENT_BYTES,
@@ -10053,6 +10054,37 @@ fn orch_channel_event_payloads_all_carry_the_channels_display_number() {
 
     let updated = channel_updated_event("chan-9", "w-1", 4, members);
     assert_eq!(updated["display_number"], json!(4), "got: {updated}");
+}
+
+#[test]
+fn delivery_held_event_names_the_pane_and_the_reason() {
+    // #246: the pane-header badge needs enough in the payload to say WHAT is
+    // held (the pty/agent) and WHY (the reason + a human-readable detail),
+    // and the two reasons must produce genuinely different copy — a badge
+    // that always said "held" with no distinction would fail the issue's
+    // "naming what's held and why" bar just as much as no badge at all.
+    let typing = delivery_held_event("w-1", "g-1", 7, HeldReason::Typing);
+    assert_eq!(typing["agent_id"], json!("w-1"), "got: {typing}");
+    assert_eq!(typing["group"], json!("g-1"), "got: {typing}");
+    assert_eq!(typing["pty_id"], json!(7), "got: {typing}");
+    assert_eq!(typing["reason"], json!("typing"), "got: {typing}");
+    assert!(typing["detail"].as_str().unwrap().contains("w-1"), "got: {typing}");
+
+    let occupied = delivery_held_event("w-1", "g-1", 7, HeldReason::BoxOccupied);
+    assert_eq!(occupied["reason"], json!("box-occupied"), "got: {occupied}");
+    assert_ne!(
+        delivery_held_detail("w-1", HeldReason::Typing),
+        delivery_held_detail("w-1", HeldReason::BoxOccupied),
+        "the two hold reasons must read differently to a human watching the pane"
+    );
+}
+
+#[test]
+fn delivery_held_cleared_event_carries_the_pty_the_badge_was_shown_on() {
+    // The frontend clears a pane's badge by pty_id alone (#246) — no agent_id
+    // needed since the badge was already keyed by pty when it was raised.
+    let cleared = delivery_held_cleared_event(7);
+    assert_eq!(cleared["pty_id"], json!(7), "got: {cleared}");
 }
 
 // ---------- display_number: reflects what's ACTUALLY connected (#271 follow-up) ----------

@@ -20,6 +20,7 @@ import { showToast } from "./toast";
 import { showContextMenu } from "./contextmenu";
 import { buildPaneMenu, type PaneConnectState, type PaneMenuAction, type PendingConnect } from "./panemenu";
 import { reduceConnect, channelBadge, dropIfStale } from "./channel";
+import type { HeldReason } from "./heldbadge";
 
 export type { AutonomyState };
 export type { WorkflowPreview };
@@ -104,6 +105,18 @@ export interface AttentionItem {
   role: OrchRole | null;
   pty_id: number | null;
   reason: string;
+  detail: string;
+}
+
+/** Loomux is currently withholding an outbound prompt delivery to this pane
+ *  because it believes the human's own input occupies the CLI's input box
+ *  (#246). Distinct from `AttentionItem`: attention flags a pane the human
+ *  should look AT; this flags a pane loomux is NOT writing to right now. */
+export interface DeliveryHeldEvent {
+  agent_id: string;
+  group: string;
+  pty_id: number;
+  reason: HeldReason;
   detail: string;
 }
 
@@ -389,6 +402,17 @@ export function initOrchestration(wiring: OrchWiring): void {
   // panes keyed only by pty (#40), not just orchestration agents.
   void listen<AttentionItem[]>("orch-attention", ({ payload }) => {
     wiring.applyAttention(payload);
+  });
+  // Delivery-held badge (#246): the moment loomux starts withholding a prompt
+  // because the pane's box looks human-occupied, badge it right there in the
+  // header — naming what's held (the reason) and clearing the instant the
+  // backend resolves the hold (delivered or aborted), via its own paired
+  // event rather than a frontend timer racing the backend's actual cap.
+  void listen<DeliveryHeldEvent>("orch-delivery-held", ({ payload }) => {
+    wiring.findByPty(payload.pty_id)?.setHeld(payload.reason, payload.detail);
+  });
+  void listen<{ pty_id: number }>("orch-delivery-held-cleared", ({ payload }) => {
+    wiring.findByPty(payload.pty_id)?.setHeld(null);
   });
   // End-orchestration: the backend has already killed the group's agents, so
   // close their (now-dead) panes across every tab rather than leaving a screen
