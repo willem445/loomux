@@ -5349,6 +5349,62 @@ fn compact_nudge_minutes_and_roles_are_configurable_persisted_and_audited() {
         "live-set roles survive restart");
 }
 
+#[test]
+fn compact_nudge_roles_are_canonicalized_to_lowercase_on_set() {
+    // rev-24 review: `kind_from_str` validates a role name case-insensitively
+    // but does not normalize it, so a mixed-case name would persist as-typed
+    // and then never match `compact_nudge_role_allowed`'s lowercase
+    // comparison — silently disabling the very role it was meant to enable.
+    let (reg, _d, gid, _oid) = compact_nudge_setup(0);
+    let applied =
+        reg.set_compact_nudge_roles(&gid, vec!["Orchestrator".into(), "WORKER".into()]).unwrap();
+    assert_eq!(applied, vec!["orchestrator".to_string(), "worker".to_string()],
+        "mixed-case role names must be canonicalized, not stored as-typed");
+    assert!(compact_nudge_role_allowed(Role::Worker, &applied),
+        "a canonicalized role must actually match the gate it configures");
+    // `clamped()` applies the same canonicalization to a hand-edited/persisted list.
+    let g = Guardrails { compact_nudge_roles: vec!["Orchestrator".into()], ..rails() }.clamped();
+    assert_eq!(g.compact_nudge_roles, vec!["orchestrator".to_string()]);
+}
+
+#[test]
+fn compact_nudge_and_idle_tick_both_rearm_in_the_combined_configuration() {
+    // rev-24 review: the primary configuration the feature is FOR — autonomous
+    // idle-tick AND compact-nudge both watching the same orchestrator — was
+    // never exercised together. An earlier revision had both ticks rebaseline
+    // the SAME pty-output counter, so whichever tick polled a burst first
+    // consumed it and the other's activity detection (and, transitively, its
+    // own anti-nag latch) never saw it: compact-nudge fired at most once per
+    // pane lifetime. This drives BOTH ticks across one burst and pins that
+    // BOTH independently re-arm afterward.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", compact_rails(5, &["orchestrator"])).unwrap();
+    let o = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    reg.set_autonomous(&g.id, true).unwrap();
+    let empty = HashMap::new();
+
+    // Both earn their first fire off the initial (spawn-time) quiet clock.
+    assert_eq!(reg.idle_tick_tick(FAR, &empty, &empty), vec![o.id.clone()], "idle-tick's first tick");
+    assert_eq!(reg.compact_nudge_tick(FAR, &empty), vec![o.id.clone()], "compact-nudge's first nudge");
+
+    // A real burst: idle-tick observes it first (mirrors `lib.rs`'s setup
+    // order — `start_idle_tick` is registered before `start_compact_nudge`).
+    let grew: HashMap<String, u64> = [(o.id.clone(), 100_000u64)].into_iter().collect();
+    assert!(reg.idle_tick_tick(FAR, &grew, &empty).is_empty(), "idle-tick sees the burst, no re-fire this tick");
+    assert!(reg.compact_nudge_tick(FAR, &grew).is_empty(),
+        "compact-nudge independently sees the SAME burst — not idle-tick's leftovers");
+
+    // A fresh quiet window after the burst (both windows default to 5 min) —
+    // BOTH must earn a second fire. Under the shared-counter bug this is the
+    // genuine red: compact-nudge's latch was never cleared by the burst above
+    // (idle-tick had already rebaselined the shared counter to the same
+    // value), so it stayed latched and never fired again.
+    let later = FAR + 5 * 60_000 + 1;
+    assert_eq!(reg.idle_tick_tick(later, &grew, &empty), vec![o.id.clone()], "idle-tick re-arms after the burst");
+    assert_eq!(reg.compact_nudge_tick(later, &grew), vec![o.id.clone()],
+        "compact-nudge must ALSO re-arm after the burst, independently of idle-tick");
+}
+
 // ---------- enforced merge gate (#83) ----------
 
 fn s(v: &str) -> String { v.to_string() }
