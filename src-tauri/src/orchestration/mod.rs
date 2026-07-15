@@ -205,6 +205,38 @@ loomux_grant_ok() { # $1=grantfile
   rm -f "$gf"
   [ "$now" -lt "$exp" ]
 }
+# #256: CLAIM a one-time grant without spending it yet — the merge gate below
+# must consume the grant only when the gated `gh pr merge` actually SUCCEEDS
+# (live incident: a grant burned on a draft PR that GitHub refused to merge,
+# leaving the PR unmerged and the human having to re-Approve). An expired
+# grant is still deleted here (never usable, no reason to keep it around).
+# A live grant is instead handed off via `mv` to a `.claimed` sibling — a
+# RENAME, which POSIX guarantees atomic — so exactly one caller can ever win
+# it: two concurrent claimants both see the file present, but only one `mv`
+# succeeds (the loser's source is already gone, so its `mv` fails and it
+# falls through to `return 1`, same as "no grant"). Sets `_grant_claimed` to
+# the claimed path on success for the caller to finish (consume on success,
+# restore on failure) below. If the process dies between claiming and
+# resolving, the original grant file stays gone and the orphaned `.claimed`
+# file is never consulted again — a crash requires a fresh grant rather than
+# risking a second use, the failure mode #256 asks for.
+loomux_grant_claim() { # $1=grantfile
+  gf="$1"
+  [ -f "$gf" ] || return 1
+  exp=$(head -n1 "$gf" 2>/dev/null)
+  case "$exp" in ''|*[!0-9]*) exp=0 ;; esac
+  now=$(date +%s 2>/dev/null); [ -z "$now" ] && now=0
+  if [ "$now" -ge "$exp" ]; then
+    rm -f "$gf"
+    return 1
+  fi
+  claimed="$gf.claimed"
+  if mv "$gf" "$claimed" 2>/dev/null; then
+    _grant_claimed="$claimed"
+    return 0
+  fi
+  return 1   # lost the race to another concurrent claimant
+}
 # The SINGLE release-gate decision (#83/#196): every release-publishing shape —
 # `gh release create|edit|delete` AND the raw `gh api`/graphql equivalents (create
 # a v* tag ref, create/edit/delete a release, graphql *Release mutation) — routes
@@ -599,11 +631,25 @@ if [ -n "$LOOMUX_GROUP_DIR" ] && [ -f "$LOOMUX_GROUP_DIR/dangerous_mode" ] && [ 
   exec "$REAL_GH" "$@"
 fi
 # Otherwise: a one-time human grant for THIS pr authorizes exactly one merge.
+# #256: CLAIM the grant (see loomux_grant_claim) and only spend it once the
+# real merge has actually gone through — a merge GitHub refuses (draft,
+# branch protection, a just-gone-stale head, a transient API error) must
+# leave the grant usable for a retry, not burn it on a merge that never
+# happened. This is why the exec above (blanket/dangerous) never needed this:
+# those openings aren't a one-time resource, so nothing to protect on failure.
 gf=""
 [ -n "$LOOMUX_GROUP_DIR" ] && [ -n "$num" ] && gf="$LOOMUX_GROUP_DIR/merge_grants/pr-$num"
-if [ -n "$gf" ] && loomux_grant_ok "$gf"; then
+_grant_claimed=""
+if [ -n "$gf" ] && loomux_grant_claim "$gf"; then
   loomux_audit "merge-gate-granted" "{\"base\":\"$default\",\"pr\":\"$num\"}"
-  exec "$REAL_GH" "$@"
+  "$REAL_GH" "$@"
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    rm -f "$_grant_claimed"   # merge succeeded — the one-time grant is spent
+  else
+    mv "$_grant_claimed" "$gf" 2>/dev/null   # merge failed — restore for a retry
+  fi
+  exit "$rc"
 fi
 loomux_block "gate-closed" "$default" "$num"
 "#;

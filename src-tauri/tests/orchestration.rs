@@ -4512,6 +4512,88 @@ fn gh_shim_harness_granted_merge_with_dash_r_repo_is_allowed_not_blocked_as_unve
         "repo view must be called without -R/--repo, log: {logged}");
 }
 
+/// A fake `gh` whose `pr merge` exits `$FAKE_MERGE_EXIT` (default 0/success) —
+/// lets a test simulate GitHub refusing the merge (draft PR, branch
+/// protection, …) while `pr view`/`repo view` resolve normally.
+fn write_fake_gh_with_merge_exit(root: &std::path::Path, log: &std::path::Path) -> std::path::PathBuf {
+    let p = root.join("fakegh_merge_exit");
+    std::fs::write(&p, format!(
+        "#!/bin/sh\n\
+         echo \"ARGS: $*\" >> \"{log}\"\n\
+         if [ \"$1\" = \"pr\" ] && [ \"$2\" = \"view\" ]; then printf '%s %s\\n' \"$FAKE_BASE\" \"$FAKE_NUM\"; exit 0; fi\n\
+         if [ \"$1\" = \"repo\" ] && [ \"$2\" = \"view\" ]; then printf '%s\\n' \"$FAKE_DEFAULT\"; exit 0; fi\n\
+         if [ \"$1\" = \"pr\" ] && [ \"$2\" = \"merge\" ]; then exit \"${{FAKE_MERGE_EXIT:-0}}\"; fi\n\
+         printf 'MERGED\\n'; exit 0\n",
+        log = log.display()
+    )).unwrap();
+    p
+}
+
+#[test]
+fn gh_shim_harness_a_merge_that_fails_at_github_does_not_burn_the_one_time_grant() {
+    // #256 live incident: a granted `gh pr merge` was let through, GitHub
+    // refused it (draft PR), and the interceptor had already deleted the
+    // grant on interception — the human had to re-Approve. Proven against
+    // the REAL generated shim: a merge that exits non-zero must leave the
+    // grant usable for a retry; only a merge that exits 0 may consume it.
+    use std::process::Command;
+    if Command::new("sh").arg("-c").arg("exit 0").status().map(|s| !s.success()).unwrap_or(true) {
+        eprintln!("SKIP gh_shim_harness_a_merge_that_fails_at_github…: no POSIX sh");
+        return;
+    }
+    let td = tempfile::tempdir().unwrap();
+    let root = td.path();
+    let group = root.join("group");
+    std::fs::create_dir_all(&group).unwrap();
+    let log = root.join("gh.log");
+    let fake = write_fake_gh_with_merge_exit(root, &log);
+    let shim = root.join("gh");
+    std::fs::write(&shim, gh_shim_sh(&fake.display().to_string())).unwrap();
+    let _ = Command::new("sh").arg("-c").arg(format!("chmod +x '{}' '{}'", fake.display(), shim.display())).status();
+
+    let run = |num: &str, merge_exit: &str| -> bool {
+        Command::new("sh").arg(&shim).args(["pr", "merge", num])
+            .env("LOOMUX_GROUP_DIR", &group)
+            .env("FAKE_BASE", "main").env("FAKE_DEFAULT", "main").env("FAKE_NUM", num)
+            .env("FAKE_MERGE_EXIT", merge_exit)
+            .status().unwrap().success()
+    };
+    let write_grant = |name: &str| {
+        let d = group.join("merge_grants");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join(name), b"99999999999\n1\n").unwrap();
+    };
+    let grant_path = |name: &str| group.join("merge_grants").join(name);
+
+    // A merge GitHub refuses (draft PR, say) must NOT consume the grant.
+    write_grant("pr-5");
+    assert!(!run("5", "1"), "a failed merge must fail (surface GitHub's refusal)");
+    assert!(grant_path("pr-5").exists(), "a failed merge must NOT consume the grant — this is the #256 bug");
+    assert!(!grant_path("pr-5.claimed").exists(), "no orphaned .claimed file after a resolved failure");
+
+    // The SAME grant authorizes the retry once the PR is fixed (e.g. `gh pr
+    // ready`) and the merge actually succeeds — then it IS consumed.
+    assert!(run("5", "0"), "retry with the still-usable grant must succeed");
+    assert!(!grant_path("pr-5").exists(), "a successful merge consumes the grant");
+    assert!(!grant_path("pr-5.claimed").exists(), "no orphaned .claimed file after a resolved success");
+
+    // The now-consumed grant cannot authorize a second merge.
+    assert!(!run("5", "0"), "a consumed grant must not authorize another merge");
+
+    // Expired grants are still cleaned up (never claimed, never left behind).
+    std::fs::write(group.join("merge_grants/pr-9"), b"1\n1\n").unwrap();
+    assert!(!run("9", "0"), "expired grant → blocked");
+    assert!(!grant_path("pr-9").exists(), "expired grant is cleaned up, not left claimable");
+
+    // Crash-between semantics: a `.claimed` file with no matching grant (as
+    // if the process died between claim and resolve) must NOT be treated as
+    // a usable grant by a later attempt — the bare grant file is gone, so
+    // the next merge sees "no grant" and fails closed, requiring a fresh one.
+    std::fs::create_dir_all(group.join("merge_grants")).unwrap();
+    std::fs::write(group.join("merge_grants/pr-13.claimed"), b"99999999999\n1\n").unwrap();
+    assert!(!run("13", "0"), "an orphaned .claimed file with no live grant must not authorize a merge");
+}
+
 #[test]
 fn git_shim_harness_gates_tag_pushes() {
     use std::process::Command;
