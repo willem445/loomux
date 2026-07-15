@@ -796,6 +796,17 @@ enough to get wrong) that it has its own pinned regression test. `workflow_run` 
 `gh run view <id> --json status,conclusion`; met when `status == "completed"`, and the
 notice carries `conclusion`.
 
+Among the terminal (non-pending) rows, `SUCCESS`, `SKIPPED`, and `NEUTRAL` all count as
+**non-failing** — GitHub's own branch protection ignores `SKIPPED`/`NEUTRAL` when deciding
+mergeability, and a condition-gated job (e.g. a `deploy` step that only runs on `push`)
+reports `SKIPPED` on every PR event, not `SUCCESS`. Treating anything-not-`SUCCESS` as
+failing (the original implementation) fired a false "FAILURE — N of M checks failed" the
+moment the release-pipeline change added such a job to every PR run (rev-orch, #290). Any
+other terminal state — including one `gh` hasn't documented yet — stays classified as
+failing: an unrecognized conclusion must never silently read as passing. When every check is
+non-failing but at least one was skipped, the summary keeps the skip visible rather than
+folding it into a bare "all passed" (`SUCCESS — 4 of 5 checks passed (1 skipped)`).
+
 ### Caps, expiry, pause, and agent death
 
 - **Caps** are checked at registration, independently: an agent under its own cap can still

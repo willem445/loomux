@@ -222,6 +222,21 @@ fn check_is_pending(state: &str) -> bool {
     matches!(state, "PENDING" | "QUEUED" | "IN_PROGRESS")
 }
 
+/// GitHub check-conclusion semantics: `SKIPPED` and `NEUTRAL` are non-failing
+/// terminal states — a condition-gated job (e.g. a `deploy` step that only
+/// runs on `push`) reports `SKIPPED` on every PR event, and branch protection
+/// itself ignores `SKIPPED`/`NEUTRAL` rows when deciding mergeability. Before
+/// this, anything not literally `SUCCESS` counted as failing, so those rows
+/// produced a false "FAILURE — N of M checks failed" the moment the
+/// release-pipeline change (#272/#275) added a condition-gated job to every
+/// PR run (#290). Any other completed state — `FAILURE`, `ERROR`,
+/// `CANCELLED`, `TIMED_OUT`, `ACTION_REQUIRED`, `STARTUP_FAILURE`, or a state
+/// `gh` hasn't documented yet — stays classified as failing: an unrecognized
+/// conclusion must never silently read as passing.
+fn check_is_failing(state: &str) -> bool {
+    !matches!(state, "SUCCESS" | "SKIPPED" | "NEUTRAL")
+}
+
 /// Classify a `pr_checks` poll from the raw `gh` result: `Ok(json)` on a
 /// successful `gh pr checks --json state,name,link`, `Err(stderr)` on a
 /// non-zero exit. A **just-pushed PR** makes `gh pr checks` exit non-zero
@@ -248,9 +263,21 @@ pub fn pr_checks_result(raw: Result<&str, &str>) -> PollResult {
         return PollResult::Pending;
     }
     let failing: Vec<&str> =
-        checks.iter().filter(|c| c.state != "SUCCESS").map(|c| c.name.as_str()).collect();
+        checks.iter().filter(|c| check_is_failing(&c.state)).map(|c| c.name.as_str()).collect();
     if failing.is_empty() {
-        PollResult::Met { summary: format!("SUCCESS — all {} checks passed", checks.len()) }
+        // Skips stay visible without being an alarm: "all N passed" when
+        // every check ran and succeeded, "(K skipped)" when some didn't run.
+        let skipped = checks.iter().filter(|c| matches!(c.state.as_str(), "SKIPPED" | "NEUTRAL")).count();
+        let summary = if skipped == 0 {
+            format!("SUCCESS — all {} checks passed", checks.len())
+        } else {
+            format!(
+                "SUCCESS — {} of {} checks passed ({skipped} skipped)",
+                checks.len() - skipped,
+                checks.len()
+            )
+        };
+        PollResult::Met { summary }
     } else {
         PollResult::Met {
             summary: format!(
@@ -458,6 +485,75 @@ mod tests {
                 assert!(summary.contains("FAILURE"), "got: {summary}");
                 assert!(summary.contains("build (windows-latest)"), "must name the failing check: {summary}");
                 assert!(!summary.contains("build (ubuntu-latest)"), "must not name the passing check: {summary}");
+            }
+            other => panic!("expected Met, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pr_checks_skipped_row_does_not_flip_success_to_failure() {
+        // The #290 regression: a condition-gated job (e.g. `deploy` on a PR
+        // event) reports SKIPPED, not SUCCESS — that must stay a pass, with
+        // the skip surfaced (not silently dropped) in the summary.
+        let json = r#"[
+            {"name":"build (windows-latest)","state":"SUCCESS","link":"https://x"},
+            {"name":"build (ubuntu-latest)","state":"SUCCESS","link":"https://x"},
+            {"name":"deploy","state":"SKIPPED","link":"https://x"}
+        ]"#;
+        match pr_checks_result(Ok(json)) {
+            PollResult::Met { summary } => {
+                assert!(summary.starts_with("SUCCESS"), "got: {summary}");
+                assert!(summary.contains("skipped"), "skip should stay visible: {summary}");
+            }
+            other => panic!("expected Met, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pr_checks_skipped_alongside_real_failure_names_only_the_failure() {
+        // SKIPPED must not be swept into the failing list just because a
+        // sibling check genuinely failed.
+        let json = r#"[
+            {"name":"deploy","state":"SKIPPED","link":"https://x"},
+            {"name":"build (windows-latest)","state":"FAILURE","link":"https://x"}
+        ]"#;
+        match pr_checks_result(Ok(json)) {
+            PollResult::Met { summary } => {
+                assert!(summary.contains("FAILURE"), "got: {summary}");
+                assert!(summary.contains("build (windows-latest)"), "must name the failing check: {summary}");
+                assert!(!summary.contains("deploy"), "skipped check must not be listed as failing: {summary}");
+            }
+            other => panic!("expected Met, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pr_checks_neutral_treated_like_skipped() {
+        let json = r#"[
+            {"name":"build","state":"SUCCESS","link":"https://x"},
+            {"name":"lint (advisory)","state":"NEUTRAL","link":"https://x"}
+        ]"#;
+        match pr_checks_result(Ok(json)) {
+            PollResult::Met { summary } => {
+                assert!(summary.starts_with("SUCCESS"), "got: {summary}");
+                assert!(summary.contains("skipped"), "NEUTRAL should count toward the skip note: {summary}");
+            }
+            other => panic!("expected Met, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pr_checks_unknown_completed_state_is_conservatively_failing() {
+        // A `gh`-reported conclusion this code doesn't recognize yet must
+        // never read as passing — stay conservative and call it a failure.
+        let json = r#"[
+            {"name":"build","state":"SUCCESS","link":"https://x"},
+            {"name":"mystery-job","state":"SOME_NEW_STATE","link":"https://x"}
+        ]"#;
+        match pr_checks_result(Ok(json)) {
+            PollResult::Met { summary } => {
+                assert!(summary.contains("FAILURE"), "got: {summary}");
+                assert!(summary.contains("mystery-job"), "must name the unknown-state check: {summary}");
             }
             other => panic!("expected Met, got {other:?}"),
         }
