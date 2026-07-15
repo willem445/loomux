@@ -61,13 +61,16 @@ import {
   AGENTS,
   addRecentRepo,
   getAutopilot,
+  getChannelTools,
   getCustomCommand,
   getDefaultAgent,
   getRecentRepos,
   setAutopilot,
+  setChannelTools,
   setCustomCommand,
   setDefaultAgent,
 } from "./agents";
+import { soloPrepare } from "./orchestration";
 
 export interface AgentLaunchSpec {
   name: string;
@@ -78,6 +81,14 @@ export interface AgentLaunchSpec {
    *  CLI (Claude) and passed to the pane so its layout snapshot can `--resume`
    *  the exact session on restore. Absent for best-effort CLIs / custom commands. */
   sessionId?: string;
+  /** #271 W3 addendum, part A2: this pane's channel-scoped identity, minted
+   *  BEFORE spawn via `orch_solo_prepare` — eagerly, but ONLY for claude/copilot
+   *  (the CLIs with an MCP config seam; `command` above already carries the
+   *  appended flags). Absent for every other CLI: those stay lazy, adopted only
+   *  on the pane's first Connect gesture (`orch_solo_adopt`), so a codex/gemini/
+   *  custom launch incurs no `__solo__` identity nobody asked for. Also absent
+   *  if the mint itself failed — best-effort, never blocks the launch. */
+  channelAgent?: { agentId: string; canSend: boolean };
 }
 
 /** What a submitted welcome form resolves to — the caller (main.ts) spawns the
@@ -267,6 +278,11 @@ export class WelcomeForm {
   // flags. Default ON, persisted (#101).
   private autopilotField: HTMLElement;
   private autopilotInput: HTMLInputElement;
+  // Channel tools toggle (agent kind, claude/copilot only): eagerly mint a
+  // channel-scoped MCP identity at launch. Default ON, persisted (#271 W3
+  // addendum / PR #289 review round 2, N1).
+  private channelToolsField: HTMLElement;
+  private channelToolsInput: HTMLInputElement;
   // Orchestrator guardrails.
   private orchFields: HTMLElement;
   private workersInput: HTMLInputElement;
@@ -360,6 +376,7 @@ export class WelcomeForm {
       this.customField.hidden = this.agentSel.value !== "custom" || this.kind === "orchestrator";
       this.applyOrchCli();
       this.applyAutopilot();
+      this.applyChannelTools();
       this.updateName();
     });
     this.agentField = field("Agent", this.agentSel);
@@ -449,6 +466,24 @@ export class WelcomeForm {
     this.autopilotField = document.createElement("div");
     this.autopilotField.className = "dlg-field";
     this.autopilotField.appendChild(autopilotLabel);
+
+    // Channel tools toggle (#271 W3 addendum, part A2 / PR #289 review round
+    // 2, N1): whether a claude/copilot agent pane eagerly mints a
+    // channel-scoped MCP token at launch. Default ON (`getChannelTools`),
+    // shown only for claude/copilot — every other CLI has no spawn-flag
+    // config seam and stays lazy (adopt-on-connect) regardless of this
+    // toggle, so showing it there would promise something loomux can't do.
+    this.channelToolsInput = document.createElement("input");
+    this.channelToolsInput.type = "checkbox";
+    this.channelToolsInput.className = "dlg-check";
+    const channelToolsLabel = document.createElement("label");
+    channelToolsLabel.className = "dlg-toggle";
+    const channelToolsText = document.createElement("span");
+    channelToolsText.textContent = "Channel tools — connectable to other panes as soon as it starts";
+    channelToolsLabel.append(this.channelToolsInput, channelToolsText);
+    this.channelToolsField = document.createElement("div");
+    this.channelToolsField.className = "dlg-field";
+    this.channelToolsField.appendChild(channelToolsLabel);
 
     // Orchestrator guardrails: enforced by the backend; the form only collects
     // them. Models are pinned per role at group creation; the suggestion list
@@ -597,6 +632,7 @@ export class WelcomeForm {
       this.repoField,
       this.worktreeField,
       this.autopilotField,
+      this.channelToolsField,
       this.orchFields,
       this.nameField,
       this.errorEl,
@@ -627,6 +663,7 @@ export class WelcomeForm {
       })
     );
     this.autopilotInput.checked = getAutopilot();
+    this.channelToolsInput.checked = getChannelTools();
     this.applyKind();
   }
 
@@ -666,8 +703,20 @@ export class WelcomeForm {
               : "Repository or folder — empty for home";
     this.applyOrchCli();
     this.applyAutopilot();
+    this.applyChannelTools();
     this.updateName();
     this.refreshRoster();
+  }
+
+  /** Show the channel-tools toggle only where it applies — agent kind,
+   *  claude/copilot specifically (the only CLIs with an MCP config seam to
+   *  eagerly mint into; every other CLI stays lazy regardless of this
+   *  toggle, so offering it there would promise a capability loomux can't
+   *  deliver). Purely synchronous, unlike `applyAutopilot` — no backend
+   *  lookup needed, `SUPPORTED_CLIS` is a fixed two-CLI list. */
+  private applyChannelTools(): void {
+    this.channelToolsField.hidden =
+      this.kind !== "agent" || (this.agentSel.value !== "claude" && this.agentSel.value !== "copilot");
   }
 
   /** Show the autopilot toggle only where it applies — agent kind, a non-custom
@@ -1229,6 +1278,13 @@ export class WelcomeForm {
       if (flags) command = `${command} ${flags}`;
     }
 
+    // Channel tools (#271 W3 addendum, part A2 / PR #289 review round 2, N1):
+    // persisted the same way autopilot is, regardless of whether this launch
+    // is even a claude/copilot one — the checkbox's value is the human's
+    // standing preference for the NEXT time it applies.
+    const channelToolsEnabled = this.channelToolsInput.checked;
+    setChannelTools(channelToolsEnabled);
+
     this.setBusy(true, "Creating worktree…");
     this.hideError();
     try {
@@ -1259,11 +1315,36 @@ export class WelcomeForm {
           sessionId = crypto.randomUUID();
           cmd = `${command} --session-id ${sessionId}`;
         }
+        const name = plan.count > 1 ? `${plan.baseName} ${i}` : plan.baseName;
+        // #271 W3 addendum, part A2: mint a channel-scoped identity BEFORE this
+        // pane boots — only for claude/copilot (the CLIs with an MCP config
+        // seam), only for agent panes (this loop never runs for terminal/
+        // content submissions), and only when the human hasn't turned the
+        // channel-tools toggle off (PR #289 review round 2, N1 — eager minting
+        // for every claude/copilot launch is a broader live-token surface than
+        // "channels" needs; the toggle lets it be opted out of, default ON to
+        // match the addendum's stated "full membership at spawn" contract).
+        // Every other CLI stays lazy regardless: it gets no identity here and
+        // is adopted as a delivery-only member only if/when the human actually
+        // connects it (`orch_solo_adopt`), so a codex/gemini/custom launch
+        // mints nothing nobody asked for. Best-effort: a failed mint must
+        // never block the launch.
+        let channelAgent: { agentId: string; canSend: boolean } | undefined;
+        if (!plan.isCustom && channelToolsEnabled && (program === "claude" || program === "copilot")) {
+          try {
+            const prepared = await soloPrepare(program, cwd ?? "", name);
+            if (prepared.mcp_args) cmd = `${cmd} ${prepared.mcp_args}`;
+            channelAgent = { agentId: prepared.agent_id, canSend: !prepared.delivery_only };
+          } catch {
+            /* best-effort — falls back to lazy adopt-on-connect */
+          }
+        }
         specs.push({
-          name: plan.count > 1 ? `${plan.baseName} ${i}` : plan.baseName,
+          name,
           cwd,
           command: cmd,
           sessionId,
+          channelAgent,
         });
       }
       setDefaultAgent(plan.isCustom ? "custom" : this.agentSel.value);

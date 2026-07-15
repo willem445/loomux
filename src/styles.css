@@ -358,6 +358,10 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
               box-shadow 0.15s var(--ease);
 }
 .dock-chip.plain { border-left-color: var(--accent-dim); }
+/* Cross-workspace channel (#271): a right-edge accent independent of the group
+   color on the left, so a docked connected pane stays identifiable while
+   minimized — mirrors the header's `.pane.connected` outline. */
+.dock-chip.connected { border-right: 3px solid var(--connect-color, var(--accent)); }
 .dock-chip:hover {
   background: #232330;
   box-shadow: 0 0 12px var(--accent-glow);
@@ -492,6 +496,49 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 }
 @media (prefers-reduced-motion: reduce) {
   .pane-attn { animation: none; }
+}
+
+/* ---------- cross-workspace channels (#271) ---------- */
+/* The connect gesture's three visual states, each independent (so they never fight
+   the grouped/attention box-shadow stripes above): an ARMED pane (right-clicked,
+   waiting for its peer) gets a pulsing dashed outline; a CONNECTED pane gets a
+   steady outline in its channel's own color, plus the chip itself — solid
+   background like .pane-badge, so two concurrently-active channels (different
+   `--connect-color`) read as visually distinct sets of panes even before you
+   read the chip's number. */
+.pane-channel {
+  flex: none; cursor: pointer;
+  font-size: 8.5px; font-weight: 700; letter-spacing: 0.8px;
+  border-radius: 4px; padding: 1.5px 6px;
+  color: #10131f;
+  background: var(--connect-color, var(--accent));
+}
+.pane-channel:hover { filter: brightness(1.15); }
+/* #271 W3 addendum, part C: the chip's arrow (▲ sender / ▼ receiver) rides in its
+   textContent (pane.ts's setConnected) — dashed border here is the honest
+   "receive-only" variant for a delivery-only member (no token, ever), visually
+   distinct from a plain receiver simply out of credit (which stays solid — it WILL
+   be able to reply). */
+.pane-channel.receive-only {
+  background: transparent;
+  border: 1.5px dashed var(--connect-color, var(--accent));
+  color: var(--connect-color, var(--accent));
+}
+.pane.connected .pane-header {
+  outline: 1px solid var(--connect-color, var(--accent));
+  outline-offset: -1px;
+}
+.pane.connect-pending .pane-header {
+  outline: 2px dashed var(--accent);
+  outline-offset: -2px;
+  animation: connect-armed-pulse 1.2s ease-in-out infinite;
+}
+@keyframes connect-armed-pulse {
+  0%, 100% { outline-color: transparent; }
+  50% { outline-color: var(--accent); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .pane.connect-pending .pane-header { animation: none; }
 }
 
 /* ---------- pane metadata (folder · branch) ---------- */
@@ -2622,6 +2669,15 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .tab-orch.live { color: #9ece6a; background: rgba(158, 206, 106, 0.14); }
 .tab-orch.dormant { color: var(--text-dim); background: rgba(255, 255, 255, 0.05); }
 .tab.active .tab-orch.dormant { color: var(--text); }
+
+/* Cross-workspace channel dot (#271): a pane in this tab is connected — visible
+   even while the tab is hidden/background, since the per-pane header chip alone
+   only shows once you switch to it. Same chip look as .tab-orch.live. */
+.tab-channel {
+  flex: none; font-size: 9.5px; font-weight: 600; letter-spacing: 0.4px;
+  padding: 0 4px; border-radius: 4px; line-height: 1.7;
+  color: #7dcfff; background: rgba(125, 207, 255, 0.14);
+}
 
 /* Dormant restore placeholder: a PTY-less pane showing a Start/Resume card. Same
    inert-content-over-the-pane treatment as the welcome surface, so nothing

@@ -169,9 +169,31 @@ fn tool(name: &str, description: &str, props: Value, required: &[&str]) -> Value
     })
 }
 
+/// `channel_send`/`channel_status` tool defs, shared by the standard tier
+/// (below) and `Role::Solo`'s standalone two-tool surface — one definition,
+/// so the two listings can never drift apart.
+fn channel_tool_defs() -> [Value; 2] {
+    [
+        tool("channel_send",
+            "Send a message to everyone you're currently connected to in your cross-workspace channel (a human connects panes together; you cannot). It is typed as a visible prompt into each peer's pane, prefixed with your identity so they know it's from you. Directional: the channel's SENDER may call this any time and it broadcasts to every receiver; a RECEIVER may call this only after the sender has messaged it (a one-time reply credit) and it goes to the sender ONLY, never another receiver. Errors if you aren't connected to anyone, or (as a receiver) haven't been messaged yet — check with channel_status().",
+            json!({ "text": { "type": "string", "description": "The message to send. Sanitized before delivery: control characters are stripped and you cannot forge a [loomux] system notice." } }),
+            &["text"]),
+        tool("channel_status",
+            "Check whether you're connected to a cross-workspace channel: the sender's agent id, who else is in it (agent id, role, name, repo, direction, whether each can currently talk back), and whether YOU can currently channel_send (always true if you're the sender; true for a receiver only while it holds the reply credit). Read-only.",
+            json!({}), &[]),
+    ]
+}
+
 /// The tool surface is role-filtered so workers never even see privileged
 /// tools; `call_tool` re-checks anyway (listing is cosmetic, not security).
 fn tool_defs(role: Role) -> Vec<Value> {
+    // A standalone pane's ENTIRE surface, full stop (#271 W3 addendum, part
+    // A1): a solo token must confer zero group-scoped power. Returned here,
+    // before any of the tiers below, so no future addition to the shared or
+    // orchestrator/delegate tiers can ever silently leak onto it.
+    if role == Role::Solo {
+        return channel_tool_defs().to_vec();
+    }
     let mut tools = vec![
         tool("list_agents", "List the agents in your orchestration group with role, status, and task.",
             json!({}), &[]),
@@ -211,7 +233,17 @@ fn tool_defs(role: Role) -> Vec<Value> {
             tool("cancel_notification",
                 "Cancel one of your own live notifications by id (e.g. because the PR it watched got closed).",
                 json!({ "id": { "type": "string" } }), &["id"]),
+            // Cross-workspace channels (#271): a HUMAN connects your pane to
+            // another agent's pane (possibly in a different orchestration
+            // group/repo, or a standalone launcher pane) via a context-menu
+            // gesture — there is no tool here to open, close, or join a
+            // channel yourself. Once connected, these two tools are your
+            // whole surface. Denied to a planner for the same #203 reason as
+            // the notification tools — `call_tool`'s `require_not_planner`
+            // re-checks this listing. Shared with `Role::Solo`'s standalone
+            // surface (`channel_tool_defs`) so the two listings never drift.
         ]);
+        tools.extend(channel_tool_defs());
     }
     if role == Role::Orchestrator {
         tools.extend([
@@ -341,6 +373,19 @@ fn arg_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
 }
 
 fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> Result<String, String> {
+    // A standalone pane's token carries zero group-scoped power (#271 W3
+    // addendum, part A1/concern 5) — `channel_send`/`channel_status` are its
+    // WHOLE surface. Gated ONCE, here, rather than per-arm: an arm added
+    // below later without its own role check (several already have none —
+    // `list_agents`/`get_state`/`list_tasks`/`list_verdicts` trust
+    // `tool_defs`'s listing alone) would otherwise silently grant a solo
+    // token access to it. `tool_defs(Role::Solo)`'s two-tool listing is the
+    // cosmetic half of this same #243-style double-gate; this is the real one.
+    if caller.role == Role::Solo && !matches!(name, "channel_send" | "channel_status") {
+        return Err("permission denied: a standalone pane's token can only channel_send / \
+                     channel_status — it carries no group-scoped power"
+            .into());
+    }
     match name {
         "list_agents" => Ok(reg.list_agents(&caller.group).to_string()),
         "get_state" => Ok(reg.get_state(&caller.group)),
@@ -632,6 +677,16 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             let id = arg_str(args, "id").ok_or("id required")?;
             reg.cancel_notification(&caller.agent_id, id)?;
             Ok(format!("cancelled {id}"))
+        }
+
+        "channel_send" => {
+            require_not_planner(caller)?;
+            let text = arg_str(args, "text").ok_or("text required")?;
+            reg.channel_send(caller, text)
+        }
+        "channel_status" => {
+            require_not_planner(caller)?;
+            Ok(reg.channel_status(caller).to_string())
         }
 
         "report" => {

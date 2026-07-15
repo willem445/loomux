@@ -17,6 +17,16 @@ overrides the orchestrator's.{{BLOCK_NOTE}}
   typed into THIS pane when it fires. `list_notifications()` /
   `cancel_notification(id)` manage your own live ones. Capped at 4 per agent / 12 per
   group; TTL defaults to 60 min.
+- `channel_send(text)` / `channel_status()` — if a human has connected this pane to another
+  agent's pane (possibly in a different repo/group, or a standalone launcher pane) for
+  cross-workspace collaboration, `channel_send` broadcasts a message to everyone you're
+  connected to and `channel_status` tells you who that is. A human sets up (and tears down)
+  the connection — you cannot open, close, or join a channel yourself; if you aren't
+  connected, `channel_send` just errors. Every channel is directional: the human names one
+  member the **sender** at connect time. If that's you, send any time; if you're a
+  **receiver**, `channel_send` is reply-only — it works once the sender has messaged you,
+  and goes to the sender only, never another receiver. A peer may be **receive-only**
+  (`channel_status` shows `can_send: false` for it) — it will never reply, by design.
 
 Report meaningfully but sparingly: on start (`progress`, one line restating the task),
 when blocked (what you need), and when done (PR URL + one-paragraph summary).

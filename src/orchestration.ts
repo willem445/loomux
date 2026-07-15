@@ -17,6 +17,9 @@ import { sessionIdFromCommand } from "./panerestore";
 import type { AutonomyState } from "./autonomy";
 import type { WorkflowPreview } from "./roster";
 import { showToast } from "./toast";
+import { showContextMenu } from "./contextmenu";
+import { buildPaneMenu, type PaneConnectState, type PaneMenuAction, type PendingConnect } from "./panemenu";
+import { reduceConnect, channelBadge, dropIfStale } from "./channel";
 
 export type { AutonomyState };
 export type { WorkflowPreview };
@@ -274,6 +277,9 @@ async function openAgentPane(
     // Report the pty so the backend can unblock the spawner and type the kickoff.
     try {
       await invoke("bind_agent", { agentId: req.agent_id, ptyId: pane.ptyId });
+      // Rehydrate a channel chip that predates this pane (#271: a rejoin/respawn
+      // while its channel is still live in the registry) — see hydratePaneChannel.
+      void hydratePaneChannel(pane, req.group_id, req.agent_id);
     } catch {
       // Late bind (#106): the backend's bind wait timed out and removed the
       // pending bind, so this rejects ("no pending bind for agent …"). Handle it
@@ -315,6 +321,12 @@ export interface OrchWiring {
   /** Apply an attention scan across all tabs: badge each pane by its pty AND
    *  badge the tab-bar entry of any tab that owns a needs-attention pty. */
   applyAttention(items: AttentionItem[]): void;
+  /** Force a tab-strip re-render (#271): channel membership is derived live from
+   *  each pane's state (tabcounts.ts), not tracked in a maintained per-tab map the
+   *  way attention is, so there is no setter that already triggers one. Called
+   *  after every `orch-channel` event so the tab-strip dot doesn't wait for the
+   *  next 4s status poll. */
+  refreshTabBar(): void;
 }
 
 /** Wire backend→frontend orchestration events. Call once at startup,
@@ -411,6 +423,218 @@ export function initOrchestration(wiring: OrchWiring): void {
       );
     }
   });
+  // Cross-workspace channel membership (#271): the backend pushes the current
+  // membership on every connect/join/disconnect/teardown. Matched across ALL
+  // tabs by agent id — the SAME cross-tab match `orch-spawn-cancelled` above
+  // uses — since agent ids are globally unique in the registry (orchbadge.ts).
+  void listen<OrchChannelEvent>("orch-channel", ({ payload }) => {
+    applyChannelEvent(payload, wiring);
+  });
+}
+
+/** Apply one `orch-channel` event across every open pane in every tab.
+ *
+ *  - `connected`: `members` is the channel's FULL current membership (a fresh
+ *    2-party channel, or a third pane joining an existing one) — set/refresh the
+ *    chip on every matching pane.
+ *  - `disconnected`: `members` is who's left (still active) — refresh their
+ *    chips (a departed peer changes the tooltip) and clear the pane named in
+ *    `agent`.
+ *  - `closed`: membership dropped below 2, so the backend tore the WHOLE channel
+ *    down — `members` (0 or 1 stranded leftover) plus `agent` (the disconnector)
+ *    are both cleared; there is no "still active" set. */
+function applyChannelEvent(payload: OrchChannelEvent, wiring: OrchWiring): void {
+  const activeIds = payload.kind === "closed" ? new Set<string>() : new Set(payload.members.map((m) => m.agent_id));
+  const clearIds = new Set<string>();
+  if (payload.agent) clearIds.add(payload.agent);
+  if (payload.kind === "closed") for (const m of payload.members) clearIds.add(m.agent_id);
+
+  for (const grid of wiring.allGrids()) {
+    for (const pane of grid.allPanes()) {
+      // #271 W3 addendum: a standalone pane's channel agent id lives on the
+      // dedicated `channelAgent` carrier, not `orchAgentId` — check both.
+      const agentId = pane.orchAgentId ?? pane.channelAgentAgentId;
+      if (!agentId) continue;
+      if (activeIds.has(agentId)) {
+        pane.setConnected(channelBadge(payload.channel_id, payload.display_number, payload.members, agentId));
+      } else if (clearIds.has(agentId)) {
+        pane.setConnected(null);
+      }
+    }
+  }
+  if (payload.kind === "closed" && payload.agent) {
+    showToast(`Channel ${payload.channel_id} closed — a peer disconnected.`, "info");
+  } else if (payload.kind === "updated") {
+    showToast(`Channel ${payload.channel_id}'s sender changed to ${payload.sender ?? "?"}.`, "info");
+  }
+  wiring.refreshTabBar();
+}
+
+// ---------- pane connect-menu wiring (#271, human-only OPT-IN gesture) ----------
+//
+// There is at most one armed connect source live at a time, globally, across every
+// tab — module-level state, mirroring `cancelledSpawns` above (also DOM/backend
+// glue state that doesn't belong in a pure module). `reduceConnect` (channel.ts) is
+// the pure state-transition function; this is just the DOM/backend shell around it:
+// build the menu, dispatch the fired action, make the backend call, toast errors.
+
+let pendingConnect: PendingConnect | null = null;
+let pendingPane: Pane | null = null;
+
+function paneConnectState(pane: Pane): PaneConnectState {
+  // #271 W3 addendum: an orchestration-group pane's identity always wins when
+  // present; a standalone pane's channel identity lives on the SEPARATE
+  // `channelAgent` carrier (never `orchGroup`/`orchAgent` — that would light
+  // up the full orchestration chrome for a plain standalone pane). Every
+  // orchestration-group agent (orchestrator/worker/reviewer/planner) is
+  // minted with a token at spawn, so it can always be the sender; a
+  // standalone pane's `canSend` reflects whatever `orch_solo_prepare`/
+  // `orch_solo_adopt` actually gave it.
+  const group = pane.orchGroupId ?? pane.channelAgentGroupId;
+  const agentId = pane.orchAgentId ?? pane.channelAgentAgentId;
+  const role = pane.orchRole ?? pane.channelAgentRole;
+  const canSend = pane.orchGroupId !== null ? true : pane.channelAgentCanSend;
+  const badge = pane.channelBadge;
+  return {
+    group,
+    agentId,
+    name: pane.name,
+    role,
+    channelId: pane.channelId,
+    canSend,
+    senderId: badge?.senderId ?? null,
+    senderName: badge?.senderName ?? null,
+  };
+}
+
+function setPending(next: PendingConnect | null, source: Pane | null): void {
+  pendingPane?.setPendingConnect(false);
+  pendingConnect = next;
+  pendingPane = next ? source : null;
+  pendingPane?.setPendingConnect(true);
+}
+
+/** Drop a stale armed source (review finding #286-1) before it can render a
+ *  menu label naming a pane that's gone. `channel.ts`'s `dropIfStale` is the
+ *  pure decision (unit-tested: alive → unchanged, dead → null); this is just
+ *  the DOM shell supplying the one fact it can't observe itself
+ *  (`Pane.isDisposed`) and applying the result. */
+function dropStalePending(): void {
+  if (pendingPane && dropIfStale(pendingConnect, !pendingPane.isDisposed) === null) {
+    setPending(null, null);
+  }
+}
+
+/** The reserved standalone pseudo-group id — mirrors mod.rs's `SOLO_GROUP`
+ *  constant (#271 W3 addendum, part A1). */
+export const SOLO_GROUP = "__solo__";
+
+/** Adopt-on-connect (#271 W3 addendum, part A3): on the FIRST Connect gesture
+ *  against an agent pane with no channel identity yet — launched before this
+ *  feature, or on a CLI the launcher didn't eagerly mint one for — register it
+ *  as a delivery-only member so it stops hitting `NOT_CAPABLE_REASON`. A no-op
+ *  for a pane that already has an identity (orchestration OR channelAgent), and
+ *  for a shell/content pane (`!pane.isAgentPane`) — those stay not-capable, per
+ *  the addendum's Worker-split note. Best-effort: a failed adopt just leaves the
+ *  menu showing `NOT_CAPABLE_REASON` this time, retried on the next right-click. */
+async function adoptIfEligible(pane: Pane): Promise<void> {
+  if (pane.orchGroupId || pane.channelAgentAgentId) return;
+  if (!pane.isAgentPane || pane.ptyId === null) return;
+  try {
+    const { agent_id } = await soloAdopt(pane.ptyId, pane.name, pane.workdir ?? "");
+    // Adopted panes are ALWAYS delivery-only (soloAdopt mints no token) — see
+    // `OrchRegistry::solo_adopt`.
+    pane.setChannelAgent({ group: SOLO_GROUP, agentId: agent_id, role: "solo", canSend: false });
+  } catch {
+    /* best-effort — falls back to NOT_CAPABLE this time */
+  }
+}
+
+/** Right-click on a pane header (#271): show the Connect/Disconnect menu built
+ *  from this pane's current state and the (global, cross-tab) armed connect
+ *  source. Wired from `PaneEvents.onPaneContextMenu`. */
+export async function showPaneConnectMenu(pane: Pane, x: number, y: number): Promise<void> {
+  dropStalePending();
+  await adoptIfEligible(pane);
+  const items = buildPaneMenu(paneConnectState(pane), pendingConnect);
+  showContextMenu(x, y, items, (action) => void handlePaneMenuAction(action, pane));
+}
+
+/** The pane's own channel chip was clicked (#271's one-click "easy close").
+ *  Wired from `PaneEvents.onDisconnectChannel`. */
+export function disconnectPaneChannel(pane: Pane): void {
+  const group = pane.orchGroupId ?? pane.channelAgentGroupId;
+  const agentId = pane.orchAgentId ?? pane.channelAgentAgentId;
+  if (!group || !agentId) return;
+  const state = paneConnectState(pane);
+  void handlePaneMenuAction(
+    { kind: "disconnect", pane: { group, agentId, name: pane.name, canSend: state.canSend, senderId: state.senderId, senderName: state.senderName, channelId: state.channelId } },
+    pane
+  );
+}
+
+/** Esc cancels an in-progress connect gesture from anywhere — a no-op if
+ *  nothing is armed. Wired from main.ts's global keydown handler. */
+export function cancelPendingConnect(): void {
+  if (!pendingConnect) return;
+  setPending(null, null);
+}
+
+async function handlePaneMenuAction(action: PaneMenuAction, pane: Pane): Promise<void> {
+  const { pending, effect } = reduceConnect(action, pendingConnect);
+  // Only "connect-arm" legitimately introduces a NEW pending source pane — every
+  // other action either leaves `pending` exactly as it was (a disconnect of some
+  // UNRELATED pane while a different one is armed elsewhere: `pane` here is the
+  // disconnect target, not the armed pane, so it must never become `pendingPane`)
+  // or clears it to null (cancel, complete, or a disconnect that WAS the armed
+  // source). Passing `pane` in the unchanged case would move the pulsing "armed"
+  // outline onto the wrong pane.
+  if (action.kind === "connect-arm") setPending(pending, pane);
+  else if (pending === null) setPending(null, null);
+  switch (effect.kind) {
+    case "none":
+      if (action.kind === "connect-arm") {
+        showToast(`Connecting ${action.source.name}… right-click another pane to complete, Esc to cancel.`, "info");
+      } else if (action.kind === "connect-cancel") {
+        showToast("Connect cancelled.", "info");
+      }
+      return;
+    case "connect":
+      try {
+        await channelConnect(effect.from.group, effect.from.agentId, effect.to.group, effect.to.agentId, effect.senderAgent);
+      } catch (err) {
+        showToast(`Connect failed: ${String(err)}`, "error");
+      }
+      return;
+    case "disconnect":
+      try {
+        await channelDisconnect(effect.group, effect.agentId);
+      } catch (err) {
+        showToast(`Disconnect failed: ${String(err)}`, "error");
+      }
+      return;
+    case "set-sender":
+      try {
+        await channelSetSender(effect.channelId, effect.newSenderAgent);
+      } catch (err) {
+        showToast(`Making this pane the sender failed: ${String(err)}`, "error");
+      }
+      return;
+  }
+}
+
+/** Best-effort rehydration of a pane's channel chip right after it (re)opens
+ *  (#271): `orch-channel` only fires on live mutations, but the channel itself
+ *  can predate this pane's open — a mid-run rejoin/respawn while its channel is
+ *  still live in the registry. A failed read is not worth surfacing to the
+ *  human; the chip simply stays off until the next mutation event. */
+async function hydratePaneChannel(pane: Pane, group: string, agentId: string): Promise<void> {
+  try {
+    const ch = await channelForPane(group, agentId);
+    if (ch) pane.setConnected(channelBadge(ch.id, ch.display_number, ch.members, agentId));
+  } catch {
+    /* best-effort */
+  }
 }
 
 /** A recorded session's orchestration identity (backend roster). */
@@ -657,3 +881,160 @@ export const endGroup = (groupId: string, cleanupWorktrees: boolean): Promise<En
  *  default CLI, which a block with no `cli:` of its own inherits. */
 export const workflowPreview = (repo: string, agentCli: string): Promise<WorkflowPreview> =>
   invoke<WorkflowPreview>("orch_workflow_preview", { repo, agentCli });
+
+// ---------- cross-workspace channels (#271): human-only connect/disconnect ----------
+//
+// A channel is a human-connected set of two-or-more agent panes, possibly in
+// different orchestration groups/tabs. The connect/disconnect gesture and
+// every membership mutation are Tauri commands only — there is deliberately
+// no MCP tool an agent can call to open/close/join one (CLAUDE.md constraint
+// 5/6). An agent's only surface is the `channel_send`/`channel_status` MCP
+// tools, which broadcast/read against the membership graph a human built.
+//
+// This module exposes the typed command wrappers and the `orch-channel`
+// event payload shape; wiring them into pane chrome (the connect menu, the
+// header chip, the `orch-channel` listener) is the UI slice's job.
+
+/** One member of a channel, as the backend resolves it — cached name/role so
+ *  a rendered chip/roster doesn't need a second agent lookup. `direction`/
+ *  `can_send`/`delivery_only` are the #271 W3 addendum's directional fields
+ *  (part B7/A4). */
+export interface ChannelMember {
+  group: string;
+  agent_id: string;
+  name: string;
+  role: OrchRole | "solo";
+  direction: "sender" | "receiver";
+  can_send: boolean;
+  delivery_only: boolean;
+}
+
+/** A live cross-workspace channel (backend `Channel`). */
+export interface OrchChannel {
+  id: string;
+  created_ms?: number;
+  sender: string;
+  /** The pane chip's number (mod.rs's `Channel.display_number`) — the lowest
+   *  positive integer not used by any other live channel, NOT `id`'s numeric
+   *  suffix (#271 follow-up: the suffix never stops climbing, even across a
+   *  disconnect — see channel.ts's `channelColor` doc). */
+  display_number: number;
+  members: ChannelMember[];
+}
+
+/** Connect two agent panes (possibly in different groups) into a channel.
+ *  Human-only. Per the backend's join rules: both free mints a new channel;
+ *  one free + one already-connected joins the free pane into that channel
+ *  (multi-party); both already connected to different channels is rejected.
+ *
+ *  `senderAgent` (#271 W3 addendum, part B) means something different for a
+ *  MINT than a JOIN (review round 2, B1 — this ambiguity was the bug):
+ *  - **Fresh mint** (neither pane connected): `senderAgent` DESIGNATES the
+ *    new channel's sender — must be `fromAgent` or `toAgent`, and that pane
+ *    must hold a channel token (a delivery-only pane can never be the
+ *    sender).
+ *  - **Join** (either pane already connected): the channel's sender already
+ *    exists; `senderAgent` only CONFIRMS who that is, and is very often
+ *    neither `fromAgent` nor `toAgent` — the completion gesture can land on
+ *    ANY existing member (the sender, or a plain receiver), and the true
+ *    sender may be a third pane entirely. Pass the target channel's actual
+ *    current sender (`PaneIdentity.senderId`), not either connect-call
+ *    argument.
+ *
+ *  Returns the resulting channel. */
+export const channelConnect = (
+  fromGroup: string,
+  fromAgent: string,
+  toGroup: string,
+  toAgent: string,
+  senderAgent: string,
+): Promise<OrchChannel> =>
+  invoke<OrchChannel>("orch_channel_connect", { fromGroup, fromAgent, toGroup, toAgent, senderAgent });
+
+/** Result of disconnecting one pane from its channel. */
+export interface ChannelDisconnectResult {
+  channel_id: string;
+  /** True if membership dropped below 2 — OR the disconnected pane was the
+   *  channel's sender (#271 W3 addendum, part B: a star topology has exactly
+   *  one hub) — and the whole channel was torn down. */
+  closed: boolean;
+  remaining: number;
+}
+
+/** Disconnect one agent pane from its channel. Human-only; tears the channel
+ *  down (and strands/notifies any remaining member) if this drops it below
+ *  2 members, or if the disconnected pane was the sender. */
+export const channelDisconnect = (group: string, agent: string): Promise<ChannelDisconnectResult> =>
+  invoke<ChannelDisconnectResult>("orch_channel_disconnect", { group, agent });
+
+/** Every live channel, for cross-tab indicators on tab switch. */
+export const channelList = (): Promise<OrchChannel[]> => invoke<OrchChannel[]>("orch_channel_list", {});
+
+/** The channel one pane belongs to, or null — for a single pane's header
+ *  chip on tab switch / reconnect. */
+export const channelForPane = (group: string, agent: string): Promise<OrchChannel | null> =>
+  invoke<OrchChannel | null>("orch_channel_for_pane", { group, agent });
+
+/** Reassign a channel's sender without reconnecting (#271 W3 addendum, part
+ *  B5). Human-only; `newSenderAgent` must already be a member and hold a
+ *  token. Clears every member's reply credit and notifies both roles. */
+export const channelSetSender = (channelId: string, newSenderAgent: string): Promise<OrchChannel> =>
+  invoke<OrchChannel>("orch_channel_set_sender", { channelId, newSenderAgent });
+
+/** Payload of the `orch-channel` event, emitted by the backend on every
+ *  connect/disconnect/teardown/sender-swap so cross-tab UI (chips, dock
+ *  mirror, tab-strip dot) can update without polling. */
+export interface OrchChannelEvent {
+  kind: "connected" | "disconnected" | "closed" | "updated";
+  channel_id: string;
+  /** Present on disconnected/closed: the pane that left. */
+  agent?: string;
+  /** Present on connected/updated: the channel's current sender. */
+  sender?: string;
+  /** The chip number (mod.rs's `Channel.display_number`) — present on every
+   *  kind, including `closed` (captured before teardown), so a `connected`/
+   *  `disconnected`/`updated` handler always has it on hand without a second
+   *  lookup. */
+  display_number: number;
+  /** Current membership after the change (empty on `closed`). */
+  members: ChannelMember[];
+}
+
+// ---------- standalone panes (#271 W3 addendum, part A) ----------
+//
+// A standalone (launcher) pane has no orchestration group. These mint/bind/
+// adopt a channel-scoped MCP identity for it — human-only Tauri commands,
+// reached from the launcher's agent-pane spawn path (`solo_prepare`/
+// `solo_bind`) or the pane-menu Connect gesture against a pane with none yet
+// (`solo_adopt`). See `OrchRegistry::solo_prepare`/`solo_bind`/`solo_adopt`.
+
+/** What `orch_solo_prepare` returns: the minted agent id, the exact per-CLI
+ *  flag string to append to the launched command line (empty for a
+ *  delivery-only CLI), and whether this pane ended up delivery-only (no
+ *  config seam for its CLI — codex/gemini/opencode/custom today). */
+export interface SoloPrepared {
+  agent_id: string;
+  mcp_args: string;
+  delivery_only: boolean;
+}
+
+/** Mint a channel-scoped identity for a newly-launching standalone pane
+ *  BEFORE it boots, so `mcp_args` can be appended to its command line. Call
+ *  once per new agent pane, from the launcher's spawn path — never for
+ *  terminal/content panes (#271 W3 addendum: "gate eager solo-prepare to
+ *  agent panes only"). */
+export const soloPrepare = (cli: string, cwd: string, name: string): Promise<SoloPrepared> =>
+  invoke<SoloPrepared>("orch_solo_prepare", { cli, cwd, name });
+
+/** Bind a just-spawned solo pane's pty to the `AgentEntry` `soloPrepare`
+ *  created. Call right after `spawnPty` resolves, mirroring the
+ *  orchestration group's `bind_agent` round trip. */
+export const soloBind = (agentId: string, ptyId: number): Promise<void> =>
+  invoke("orch_solo_bind", { agentId, ptyId });
+
+/** Adopt an already-running pane (no channel identity yet — launched before
+ *  this feature, or on a CLI the human didn't opt into channel tools for) as
+ *  a delivery-only member, on its first Connect gesture. Idempotent by pty:
+ *  re-adopting an already-adopted pty returns its existing agent id. */
+export const soloAdopt = (ptyId: number, name: string, cwd: string): Promise<{ agent_id: string }> =>
+  invoke<{ agent_id: string }>("orch_solo_adopt", { ptyId, name, cwd });

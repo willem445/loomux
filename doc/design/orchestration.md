@@ -140,6 +140,8 @@ pane stays open showing the status).
 | `notify_when(kind, pr?, run?, note?, expires_minutes?)` | ✓ | worker/reviewer only (✗ planner) |
 | `list_notifications()` | ✓ | worker/reviewer only (✗ planner) |
 | `cancel_notification(id)` | ✓ | worker/reviewer only (✗ planner) |
+| `channel_send(text)` | ✓ | orchestrator/worker/reviewer (✗ planner) |
+| `channel_status()` | ✓ | orchestrator/worker/reviewer (✗ planner) |
 
 Guardrails enforced by `spawn_agent`: live-agent cap (`max_agents`, counting workers +
 reviewers + planners), CLI + model pinned per role (`{role}_cli` / `{role}_model`, see
@@ -919,6 +921,25 @@ documented limitation, not an oversight.
   PR #247). `run` ids parse through a dedicated `run_id_from`, not the bare `pr_number`
   tail-digits parse: a job-linked run URL (`.../actions/runs/17812/job/98765`) would otherwise
   silently resolve to the *job* id instead of the run id (rev-orch, PR #247).
+
+## Cross-workspace communication channels (#271)
+
+Full design in `doc/design/cross-workspace-channel.md`; summarized here for the tool-surface
+table's context. Two MCP tools, `channel_send(text)` / `channel_status()`, let an
+orchestrator/worker/reviewer (not a planner — the same #243 exclusion) broadcast to and read
+who's on the other end of a human-connected **channel**: a set of two-or-more agent panes,
+possibly in **different orchestration groups** (a "workspace" is a project tab; loomux is one
+process/one registry, so "cross-workspace" is cross-group inside it, not cross-process).
+Connection itself is human-only — two Tauri commands
+(`orch_channel_connect`/`orch_channel_disconnect`), never an MCP tool — so the trust boundary
+constraint 6 usually protects (an agent cannot see another group) is relaxed only along edges
+a human explicitly drew, and an agent can never widen it: `channel_send` takes no
+group/agent-id argument, only `text`, sanitized with the same `sanitize_gh_text` (#243) every
+other crossing-text boundary uses, with the sender identity built by loomux, never the agent.
+State (`channels`/`agent_channel` maps) and delivery mirror `watches` exactly — in-memory
+only, same `deliver_prompt(..., MidSession)` path, same audit-then-best-effort-deliver shape.
+This PR ships the backend + MCP surface + typed frontend command wrappers; the pane
+context-menu connect gesture and cross-tab chip UI are a stacked follow-up.
 
 ## Autonomous mode (#83)
 

@@ -27,6 +27,10 @@ export interface TabPaneInfo {
    *  content pane has no process at all; it reports `live: true` because it is
    *  fully functional content, and the count ignores its kind regardless. */
   live: boolean;
+  /** The cross-workspace channel (#271) this pane currently belongs to, or
+   *  null/absent. Only ever set on an agent/orch pane — content and terminal
+   *  panes have no MCP identity to join a channel with. */
+  connectedChannel?: string | null;
 }
 
 /** What the tab strip renders for one tab. */
@@ -43,6 +47,12 @@ export interface TabCounts {
    *  carries a dormant orch restore placeholder → the static ORCH marker. Never
    *  set at the same time as `liveOrch` (a live group wins). */
   dormantOrch: boolean;
+  /** Distinct cross-workspace channels (#271) any pane in this tab currently
+   *  belongs to — the tab-strip dot's count, so a tab spanning two separate
+   *  channels shows "2" rather than collapsing to one indicator. A hidden tab's
+   *  connected pane is otherwise invisible until you switch to it (its header
+   *  chip is the per-pane indicator; this is the cross-tab one). */
+  connectedChannels: number;
 }
 
 /** Count a tab's live agents and classify its orchestration state.
@@ -56,6 +66,7 @@ export function tabCounts(panes: readonly TabPaneInfo[], groupBound: boolean): T
   let agents = 0;
   let liveOrch = false;
   let dormantOrchPane = false;
+  const channelIds = new Set<string>();
   for (const p of panes) {
     if (p.kind === "agent") {
       if (p.live) agents++;
@@ -67,10 +78,11 @@ export function tabCounts(panes: readonly TabPaneInfo[], groupBound: boolean): T
         dormantOrchPane = true;
       }
     }
+    if (p.connectedChannel) channelIds.add(p.connectedChannel);
   }
   // Static ORCH marker: a bound-but-not-live group, or a dormant orch placeholder
   // in the layout. Suppressed the moment any orch pane is live — then the live
   // icon speaks for the tab instead.
   const dormantOrch = !liveOrch && (groupBound || dormantOrchPane);
-  return { agents, liveOrch, dormantOrch };
+  return { agents, liveOrch, dormantOrch, connectedChannels: channelIds.size };
 }

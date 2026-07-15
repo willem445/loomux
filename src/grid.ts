@@ -726,6 +726,19 @@ export class Grid {
       chip.classList.toggle("urgent", attn.urgent);
       chip.title = attn.title;
 
+      // Cross-workspace channel membership (#271): a docked pane's header chip
+      // is out of the DOM, so mirror it here too — else minimizing a connected
+      // pane looks like it silently disconnected. Attention (above) wins the
+      // tooltip when both are present; it's the more urgent ask.
+      const channel = pane.channelBadge;
+      if (channel) {
+        chip.classList.add("connected");
+        chip.style.setProperty("--connect-color", channel.color);
+        if (!attn.needsAttention) {
+          chip.title = `${channel.label} — connected to ${channel.peers.join(", ") || "…"}. Click to restore.`;
+        }
+      }
+
       const name = document.createElement("span");
       name.className = "dock-chip-name";
       name.textContent = pane.name;

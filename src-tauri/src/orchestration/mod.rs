@@ -1108,6 +1108,15 @@ pub enum Role {
     /// exits. A planner NEVER writes code, branches, or PRs. It counts as a
     /// delegate against the live-agent cap, like a worker/reviewer.
     Planner,
+    /// A standalone (non-orchestration) pane given a channel-scoped MCP
+    /// identity (#271 W3 addendum, part A). Its whole purpose is
+    /// `tool_defs`/`call_tool` returning/dispatching exactly `channel_send` +
+    /// `channel_status` — no group, no board, no delegates, zero group-scoped
+    /// power. Lives in the reserved `__solo__` pseudo-group. Never counts
+    /// against a live-agent cap (there is none for `__solo__`) and never
+    /// traverses `spawn_agent_ex`/`build_agent_command` — it has no block, no
+    /// persona, no role template.
+    Solo,
 }
 
 impl Role {
@@ -1120,6 +1129,10 @@ impl Role {
             Role::Worker => "w",
             Role::Reviewer => "rev",
             Role::Planner => "plan",
+            // Solo panes mint their id as `solo-N` directly (see
+            // `OrchRegistry::solo_prepare`), never through `block.prefix()` —
+            // they have no block. Never reached in practice.
+            Role::Solo => "solo",
         }
     }
     /// The built-in role contract template. A block's persona *layers on* this
@@ -1131,6 +1144,12 @@ impl Role {
             Role::Worker => WORKER_TPL,
             Role::Reviewer => REVIEWER_TPL,
             Role::Planner => PLANNER_TPL,
+            // Solo panes never receive a kickoff prompt and have no role
+            // template — an arbitrary human-launched CLI, not a loomux
+            // persona (#271 W3 addendum). Never reached: `kickoff_body`
+            // (the only caller of a role's template machinery) is never
+            // invoked for `Role::Solo`.
+            Role::Solo => unreachable!("solo panes have no role template"),
         }
     }
     pub(crate) fn instructions_file(self) -> &'static str {
@@ -1139,15 +1158,20 @@ impl Role {
             Role::Worker => "worker.md",
             Role::Reviewer => "reviewer.md",
             Role::Planner => "planner.md",
+            Role::Solo => unreachable!("solo panes have no instructions file"),
         }
     }
-    /// Lowercase wire/label name (matches the `Serialize` rename).
+    /// Lowercase wire/label name (matches the `Serialize` rename). Unlike
+    /// `template`/`instructions_file`, this one IS reached for a solo member
+    /// — `channel_member_label` formats it into the identity line every
+    /// channel message/notice carries.
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Role::Orchestrator => "orchestrator",
             Role::Worker => "worker",
             Role::Reviewer => "reviewer",
             Role::Planner => "planner",
+            Role::Solo => "solo",
         }
     }
     /// The capability that used to be spelled `role == Role::Planner` inline at
@@ -1305,6 +1329,9 @@ channel; keep the human oriented with short summaries."
              GitHub issue comment, then `report` and exit. You never write code, branches, \
              worktrees, or PRs (loomux also denies those at the CLI level)."
         ),
+        // A solo pane never gets a kickoff/persona — it's an arbitrary
+        // human-launched CLI, not a loomux delegate. Never reached.
+        Role::Solo => unreachable!("solo panes have no mechanics core — they receive no kickoff"),
     }
 }
 
@@ -1365,6 +1392,14 @@ impl NameSource {
 /// `build_agent_command` + `write_mcp_config`; anything unknown falls back
 /// to Claude (explicitly, in `clamped`, never silently at spawn time).
 pub const SUPPORTED_CLIS: [&str; 2] = ["claude", "copilot"];
+
+/// Reserved, backend-minted pseudo-group id for standalone (non-orchestration)
+/// panes given a channel-scoped MCP identity (#271 W3 addendum, part A).
+/// Never produced by `group_id_for_repo` (which always emits `{slug}-{8hex}`)
+/// — a fixed constant, so CLAUDE.md constraint 6's path-segment safety holds
+/// by provenance exactly like every other group id. Registered lazily
+/// (`OrchRegistry::ensure_solo_group`) the first time a solo pane is created.
+pub const SOLO_GROUP: &str = "__solo__";
 
 /// Which kind of start a `create_group` call is (#222).
 ///
@@ -1609,6 +1644,9 @@ pub(crate) fn default_model(cli: &str, role: Role) -> &'static str {
     match role {
         Role::Orchestrator | Role::Planner => "opus",
         Role::Worker | Role::Reviewer => "sonnet",
+        // A solo pane's model is whatever the human picked in the launcher —
+        // loomux never spawns or models it. Never reached.
+        Role::Solo => unreachable!("solo panes are never spawned through the model-resolution path"),
     }
 }
 
@@ -2555,6 +2593,15 @@ pub struct AgentEntry {
     /// `last_progress_ms` above double as the idle-tick output counter / quiet
     /// clock for the orchestrator, which the watchdog never touches.
     pub idle_tick_notified: bool,
+    /// The actual agent CLI a **solo** pane (`role == Role::Solo`) is
+    /// running, e.g. `"codex"`/`"gemini"` — the group-guardrails CLI
+    /// resolution (`Guardrails::cli_for`) that every orchestration-group
+    /// agent's delivery/usage code paths use cannot answer this for a solo
+    /// pane, since `__solo__` is one shared group across panes running
+    /// arbitrary, possibly-different CLIs. `None` for every non-solo agent
+    /// (its CLI always comes from its block). See
+    /// `OrchRegistry::cli_for_agent`, the single read site.
+    pub solo_cli: Option<String>,
 }
 
 /// One pane that needs the human, pushed to the frontend as an `orch-attention`
@@ -2947,6 +2994,69 @@ pub struct OrchRegistry {
     /// this can't simply live on `pause_group`/`resume_group` (they use real
     /// wall-clock time, which isn't the `now` a test injects).
     paused_watch_since: Mutex<HashMap<String, u64>>,
+    /// Cross-workspace channels (#271): human-connected sets of two-or-more
+    /// agent panes that may span different groups, keyed by channel id. Same
+    /// lifetime class as `watches` — in-memory only, no persistence across a
+    /// restart (see the design note's persistence rationale). One OS
+    /// process / one registry means "cross-workspace" is just shared state
+    /// here, not a second transport.
+    channels: Mutex<HashMap<String, Channel>>,
+    /// agent id -> channel id, the enforcement point for "a pane is in at
+    /// most ONE channel at a time" (the justified invariant — see the design
+    /// note's Membership section) and an O(1) lookup for `channel_status`
+    /// and `channel_send`.
+    agent_channel: Mutex<HashMap<String, String>>,
+    /// Channel id sequence (`chan-1`, `chan-2`, …) — an `AtomicU32` like
+    /// every other id this registry mints, so no `getrandom`-pulling crate
+    /// is needed (CLAUDE.md constraint 2).
+    channel_seq: AtomicU32,
+}
+
+/// One member of a [`Channel`]: which group/agent pane is connected. Cached
+/// `name`/`role` so `channel_status` and the connect/disconnect notices don't
+/// need a second `agent()` lookup for a peer that may since have died.
+#[derive(Clone, Debug)]
+pub struct ChannelMember {
+    pub group: String,
+    pub agent_id: String,
+    pub name: String,
+    pub role: Role,
+    /// Directional model (#271 W3 addendum, part B): a per-receiver reply
+    /// credit. Ignored for the member named `Channel.sender`. Set true by
+    /// the sender's `channel_send` (one credit per receiver per broadcast),
+    /// consumed the moment that receiver replies — a receiver may never
+    /// speak twice for one sender message, and never to another receiver.
+    pub may_reply: bool,
+}
+
+/// A cross-workspace communication channel (#271): a human-connected session
+/// of two-or-more agent panes, possibly in different groups. Mirrors
+/// `notify::Watch`'s lifetime class — in-memory only, see the module-level
+/// doc on `channels`.
+#[derive(Clone, Debug)]
+pub struct Channel {
+    pub id: String,
+    pub members: Vec<ChannelMember>,
+    pub created_ms: u64,
+    /// Directional model (#271 W3 addendum, part B): the single member
+    /// (`agent_id`) that may broadcast at will. Every other member is a
+    /// receiver, bound to reply-only-to-sender via `ChannelMember.may_reply`.
+    /// Designated at connect time (human, explicit arrow) and swappable only
+    /// via `OrchRegistry::set_sender` (human-only, audited `channel-direction`).
+    pub sender: String,
+    /// The UI-facing channel number (#271 follow-up, PR #285 live-testing
+    /// feedback): the lowest positive integer not currently used by any
+    /// OTHER live channel, assigned once at mint time and then immutable for
+    /// this channel's lifetime. Deliberately NOT `id`'s numeric suffix — `id`
+    /// (`chan-N`) is minted from `channel_seq`, a monotonic counter that must
+    /// never reuse a value (an audit record for `chan-1` must never become
+    /// ambiguous with a later, unrelated `chan-1`), so after chan-1 closes
+    /// the NEXT channel is still `chan-2` even though nothing numbered "1" is
+    /// active. `display_number` is the thing the pane chip actually shows —
+    /// it frees up "1" the moment chan-1 closes, so the chip always reflects
+    /// how many channels are ACTUALLY connected right now, not how many have
+    /// ever existed. See `OrchRegistry::next_display_number`.
+    pub display_number: u32,
 }
 
 fn now_ms() -> u64 {
@@ -3880,6 +3990,56 @@ pub fn paste_held_notice(agent_id: &str) -> String {
     )
 }
 
+/// The `[loomux] channel <id> - <sender>: <text>` line loomux prefixes to a
+/// `channel_send` delivery (#271). `chan_id` and `sender_label` are
+/// backend-built (see `OrchRegistry::channel_member_label`) — never
+/// agent-supplied — and `sanitized_text` must already have passed
+/// `notify::sanitize_gh_text` before it reaches here, so a peer can never
+/// forge who a message is from or inject a second `[loomux] …` line. Pure so
+/// the shape is unit-testable without a registry.
+pub fn channel_message_text(chan_id: &str, sender_label: &str, sanitized_text: &str) -> String {
+    format!("[loomux] channel {chan_id} - {sender_label}: {sanitized_text}")
+}
+
+/// Build the `orch-channel` event's "connected" payload (fresh mint or a
+/// third pane joining) — pure, so `display_number`'s presence is pinned
+/// directly (#271 follow-up review finding: this codebase has no harness for
+/// capturing an actually-emitted Tauri event — `self.app` is `None` in every
+/// test registry, so `app.emit(...)` never fires — the payload construction
+/// is factored out here instead, and both the real call site and the test
+/// call the SAME function, so drift between them is structurally impossible).
+pub fn channel_connected_event(chan_id: &str, sender: &str, display_number: u32, members: Vec<Value>) -> Value {
+    json!({
+        "kind": "connected", "channel_id": chan_id, "sender": sender,
+        "display_number": display_number, "members": members,
+    })
+}
+
+/// Build the `orch-channel` event's "disconnected"/"closed" payload — same
+/// pure-extraction rationale as `channel_connected_event`.
+pub fn channel_disconnected_event(
+    closed: bool,
+    chan_id: &str,
+    agent: &str,
+    display_number: u32,
+    members: Vec<Value>,
+) -> Value {
+    json!({
+        "kind": if closed { "closed" } else { "disconnected" },
+        "channel_id": chan_id, "agent": agent,
+        "display_number": display_number, "members": members,
+    })
+}
+
+/// Build the `orch-channel` event's "updated" payload (a `set_sender` swap)
+/// — same pure-extraction rationale as `channel_connected_event`.
+pub fn channel_updated_event(chan_id: &str, sender: &str, display_number: u32, members: Vec<Value>) -> Value {
+    json!({
+        "kind": "updated", "channel_id": chan_id, "sender": sender,
+        "display_number": display_number, "members": members,
+    })
+}
+
 impl OrchRegistry {
     pub fn new(root: PathBuf) -> Self {
         let _ = fs::create_dir_all(&root);
@@ -3918,6 +4078,9 @@ impl OrchRegistry {
             watches: Mutex::new(HashMap::new()),
             notify_seq: AtomicU32::new(0),
             paused_watch_since: Mutex::new(HashMap::new()),
+            channels: Mutex::new(HashMap::new()),
+            agent_channel: Mutex::new(HashMap::new()),
+            channel_seq: AtomicU32::new(0),
         }
     }
 
@@ -5884,6 +6047,840 @@ impl OrchRegistry {
         self.notify_tick(now_ms(), &results)
     }
 
+    // ---------- cross-workspace channels (#271): human-connected agent-pane sessions ----------
+    //
+    // A "workspace" is a project tab, and each tab owns at most one
+    // orchestration group — so "cross-workspace" is cross-group inside this
+    // one process, one registry (`doc/design/cross-workspace-channel.md`).
+    // A channel is shared in-memory state, mirroring `watches`; a message is
+    // delivered through the SAME `deliver_prompt` visible-prompt path every
+    // other agent-to-pane delivery uses (`report`, `send_prompt`, a fired
+    // watch notice) — no new transport, no polling.
+    //
+    // The trust boundary: connect/disconnect are human-only, reached ONLY
+    // from Tauri commands (CLAUDE.md constraint 5) — no MCP tool ever
+    // mutates membership. `channel_send` (MCP, agent-facing) takes ONLY
+    // `text`; the caller's peers are resolved from the membership graph a
+    // human built, so an agent can reach exactly the panes a human connected
+    // it to and nothing else — the membership graph IS the capability
+    // (constraint 6). Every crossing text is scrubbed with
+    // `notify::sanitize_gh_text` before it ever reaches a peer's pane, and
+    // the identity line prefixed to it is built by loomux from the CALLER's
+    // own backend-resolved identity, never from agent-supplied text — a peer
+    // cannot forge who a message is from.
+
+    /// Cap on one `channel_send` message before/at sanitization — generous
+    /// enough for a real cross-workspace status update, small enough that an
+    /// agent can't stash an unbounded blob in a single call.
+    const CHANNEL_TEXT_CAP: usize = 2000;
+
+    /// Build the identity line loomux prefixes to every crossing message and
+    /// every connect notice — name, role, and repo, so whoever reads either
+    /// pane knows who's on the other end and which workspace they're in.
+    /// Built entirely from backend-resolved state, never agent-supplied text,
+    /// so it can never be forged by a peer. Sanitized with the same
+    /// `sanitize_gh_text` `text` gets: `m.name` is capped but not
+    /// bracket-neutralized at the source (`sanitize_agent_name` keeps
+    /// `[`/`]`), and an orchestrator-set name is not `channel_send`-callable
+    /// text — low risk, not a forgery — but this keeps the design note's
+    /// "can never be forged" literally true of the whole delivered line, not
+    /// just the caller-supplied part of it.
+    fn channel_member_label(&self, m: &ChannelMember) -> String {
+        let repo = self.group(&m.group).map(|g| g.repo).unwrap_or_default();
+        notify::sanitize_gh_text(&format!("{} ({}, {repo})", m.name, m.role.as_str()), 200)
+    }
+
+    /// Whether `agent_id` holds an MCP token — the sole gate on the sender
+    /// role (#271 W3 addendum, part B6: "sender requires a token"). An
+    /// unresolvable agent (dead/vanished) reads as no-token, never a panic.
+    fn agent_has_token(&self, agent_id: &str) -> bool {
+        self.agent(agent_id).is_some_and(|a| !a.token.is_empty())
+    }
+
+    /// `members`, plus (given the channel's `sender_id`) each member's
+    /// directional standing:
+    /// - `direction` ("sender"|"receiver").
+    /// - `can_send`: whether it may `channel_send` RIGHT NOW — always true
+    ///   for the sender; for a receiver, only while it holds the reply
+    ///   credit AND has a token.
+    /// - `delivery_only`: the STRUCTURAL fact (no token, full stop) rather
+    ///   than the momentary one — a delivery-only member's `can_send` is
+    ///   always false, but so is a normal receiver's between messages, and
+    ///   the UI (#271 W3 addendum's A4 "represented honestly everywhere")
+    ///   needs to tell "will never be able to reply" (permanent) apart from
+    ///   "can't reply yet" (temporary) — the "receive-only" chip variant vs.
+    ///   the plain receiver one.
+    fn channel_members_json(&self, sender_id: &str, members: &[ChannelMember]) -> Vec<Value> {
+        members
+            .iter()
+            .map(|m| {
+                let is_sender = m.agent_id == sender_id;
+                let has_token = self.agent_has_token(&m.agent_id);
+                let can_send = is_sender || (m.may_reply && has_token);
+                json!({
+                    "group": m.group, "agent_id": m.agent_id, "name": m.name, "role": m.role,
+                    "direction": if is_sender { "sender" } else { "receiver" },
+                    "can_send": can_send,
+                    "delivery_only": !has_token,
+                })
+            })
+            .collect()
+    }
+
+    /// Lowest positive integer not currently used as a `display_number` by
+    /// any live channel (#271 follow-up) — chan-1 closing frees up "1" for
+    /// the next mint; with actives `{1, 3}` the next mint gets `2`, not `4`.
+    /// Called while holding `channels`'s lock (the caller already does, to
+    /// insert the new `Channel`), so this can't race a concurrent mint into
+    /// picking the same number twice. O(n log n) over currently-live
+    /// channels — a human-driven count, never large enough to matter.
+    fn next_display_number(channels: &HashMap<String, Channel>) -> u32 {
+        let mut used: Vec<u32> = channels.values().map(|c| c.display_number).collect();
+        used.sort_unstable();
+        let mut candidate = 1;
+        for n in used {
+            if n == candidate {
+                candidate += 1;
+            } else if n > candidate {
+                break;
+            }
+        }
+        candidate
+    }
+
+    /// Human-only (CLAUDE.md constraint 5 — called from a Tauri command,
+    /// never reachable from MCP): connect two agent panes into a channel.
+    /// - both free → mints a new channel with both as members.
+    /// - one free, one already connected → the free pane JOINS the connected
+    ///   pane's channel (multi-party): "a pane talking to two peers" is a
+    ///   3-member channel, not a pane in two channels.
+    /// - both already connected to the SAME channel → idempotent no-op.
+    /// - both already connected to DIFFERENT channels → rejected: joining
+    ///   would silently bridge two otherwise-isolated sessions through the
+    ///   shared pane — exactly the uncontrolled cross-talk this feature
+    ///   exists to bound (the one-channel-per-pane invariant, see the design
+    ///   note's Membership section).
+    /// Rejects planners (a planner's pane closes the instant it reports done,
+    /// #203 — a member that can vanish mid-session is a liability) and
+    /// dead/unknown/stale agent references.
+    ///
+    /// `sender_agent` (#271 W3 addendum, part B) means something different
+    /// depending on whether this is a MINT or a JOIN — review round 2's B1
+    /// finding was exactly this ambiguity, so it is spelled out fully here:
+    ///
+    /// - **MINT** (neither `from_agent` nor `to_agent` is already
+    ///   connected): `sender_agent` **designates** the new channel's sender.
+    ///   It must be one of the two named panes, and that pane must hold a
+    ///   token (a delivery-only pane can never be the sender).
+    /// - **JOIN** (either side is already connected): the channel's sender
+    ///   already exists. `sender_agent` here does not designate anything —
+    ///   it **confirms** who that already-fixed sender is. The confirmed
+    ///   party is frequently **neither** `from_agent` nor `to_agent`: the
+    ///   completion gesture can land on any member of the existing channel,
+    ///   including a plain receiver, in which case the true sender is a
+    ///   third identity not named by this call at all (e.g. a 4-member star
+    ///   where a newcomer completes onto a receiver — the sender is the
+    ///   fourth pane). Requiring the confirmation to equal
+    ///   `Channel.sender` — never requiring it to be `from_agent`/
+    ///   `to_agent` — is what makes B4's "a join can never reassign the
+    ///   sender" invariant hold while still letting the human complete the
+    ///   gesture on ANY existing member, not only the sender itself.
+    pub fn connect_agents(
+        &self,
+        from_group: &str,
+        from_agent: &str,
+        to_group: &str,
+        to_agent: &str,
+        sender_agent: &str,
+    ) -> Result<Value, String> {
+        if from_agent == to_agent {
+            return Err("cannot connect a pane to itself".into());
+        }
+        let a = self.agent(from_agent).ok_or("unknown agent: from_agent")?;
+        let b = self.agent(to_agent).ok_or("unknown agent: to_agent")?;
+        if a.group != from_group || b.group != to_group {
+            return Err("stale pane reference — reload and try again".into());
+        }
+        if a.status == AgentStatus::Dead || b.status == AgentStatus::Dead {
+            return Err("cannot connect a dead pane".into());
+        }
+        if a.role == Role::Planner || b.role == Role::Planner {
+            return Err("a planner's pane closes the instant it reports done (#203) — \
+                         planners can never join a channel"
+                .into());
+        }
+
+        let mut channels = self.channels.lock_safe();
+        let mut agent_channel = self.agent_channel.lock_safe();
+        let a_chan = agent_channel.get(from_agent).cloned();
+        let b_chan = agent_channel.get(to_agent).cloned();
+
+        // A JOIN (one or both sides already connected) must agree with the
+        // existing channel's sender — the star topology has exactly one hub,
+        // and a second designation here is the same conflict `set_sender`
+        // guards against, just reached through connect instead of a swap.
+        // Deliberately does NOT require `sender_agent` to be `from_agent`/
+        // `to_agent` — see the doc comment above.
+        let require_matching_sender = |channels: &HashMap<String, Channel>, existing: &str| -> Result<(), String> {
+            let ch = channels.get(existing).expect("agent_channel/channels must agree");
+            if ch.sender != sender_agent {
+                return Err(format!(
+                    "channel {existing} already has a sender ({}) — swap it first (set_sender) \
+                     before connecting with a different one",
+                    ch.sender
+                ));
+            }
+            Ok(())
+        };
+
+        let chan_id = match (a_chan, b_chan) {
+            (Some(x), Some(y)) if x == y => {
+                require_matching_sender(&channels, &x)?;
+                x // already connected to each other
+            }
+            (Some(_), Some(_)) => {
+                drop(agent_channel);
+                drop(channels);
+                return Err(
+                    "both panes are already connected — to different channels; \
+                     disconnect one first"
+                        .into(),
+                );
+            }
+            (Some(existing), None) => {
+                require_matching_sender(&channels, &existing)?;
+                let ch = channels.get_mut(&existing).expect("agent_channel/channels must agree");
+                ch.members.push(ChannelMember {
+                    group: b.group.clone(),
+                    agent_id: b.id.clone(),
+                    name: b.name.clone(),
+                    role: b.role,
+                    may_reply: false,
+                });
+                agent_channel.insert(to_agent.to_string(), existing.clone());
+                existing
+            }
+            (None, Some(existing)) => {
+                require_matching_sender(&channels, &existing)?;
+                let ch = channels.get_mut(&existing).expect("agent_channel/channels must agree");
+                ch.members.push(ChannelMember {
+                    group: a.group.clone(),
+                    agent_id: a.id.clone(),
+                    name: a.name.clone(),
+                    role: a.role,
+                    may_reply: false,
+                });
+                agent_channel.insert(from_agent.to_string(), existing.clone());
+                existing
+            }
+            (None, None) => {
+                // MINT ONLY: here — and only here — `sender_agent` must
+                // actually be one of the two named panes, and must hold a
+                // token. A join never reaches this arm.
+                if sender_agent != from_agent && sender_agent != to_agent {
+                    drop(agent_channel);
+                    drop(channels);
+                    return Err("sender_agent must be one of the two connected panes".into());
+                }
+                let designated = if sender_agent == from_agent { &a } else { &b };
+                if designated.token.is_empty() {
+                    drop(agent_channel);
+                    drop(channels);
+                    return Err("a receive-only pane can't be the sender — it has no token".into());
+                }
+                let seq = self.channel_seq.fetch_add(1, Ordering::Relaxed) + 1;
+                let id = format!("chan-{seq}");
+                let display_number = Self::next_display_number(&channels);
+                let ch = Channel {
+                    id: id.clone(),
+                    created_ms: now_ms(),
+                    sender: sender_agent.to_string(),
+                    display_number,
+                    members: vec![
+                        ChannelMember {
+                            group: a.group.clone(),
+                            agent_id: a.id.clone(),
+                            name: a.name.clone(),
+                            role: a.role,
+                            may_reply: false,
+                        },
+                        ChannelMember {
+                            group: b.group.clone(),
+                            agent_id: b.id.clone(),
+                            name: b.name.clone(),
+                            role: b.role,
+                            may_reply: false,
+                        },
+                    ],
+                };
+                channels.insert(id.clone(), ch);
+                agent_channel.insert(from_agent.to_string(), id.clone());
+                agent_channel.insert(to_agent.to_string(), id.clone());
+                id
+            }
+        };
+        let ch = channels.get(&chan_id).expect("just inserted/updated").clone();
+        drop(agent_channel);
+        drop(channels);
+
+        let member_json = self.channel_members_json(&ch.sender, &ch.members);
+        self.audit(&a.group, "human", "channel-connect",
+            json!({ "channel_id": ch.id, "members": member_json, "sender": ch.sender }));
+        if b.group != a.group {
+            self.audit(&b.group, "human", "channel-connect",
+                json!({ "channel_id": ch.id, "members": member_json, "sender": ch.sender }));
+        }
+        if let Some(app) = self.app.lock_safe().clone() {
+            let _ = app.emit(
+                "orch-channel",
+                channel_connected_event(&ch.id, &ch.sender, ch.display_number, member_json.clone()),
+            );
+        }
+        let a_label = self.channel_member_label(&ChannelMember {
+            group: a.group.clone(),
+            agent_id: a.id.clone(),
+            name: a.name.clone(),
+            role: a.role,
+            may_reply: false,
+        });
+        let b_label = self.channel_member_label(&ChannelMember {
+            group: b.group.clone(),
+            agent_id: b.id.clone(),
+            name: b.name.clone(),
+            role: b.role,
+            may_reply: false,
+        });
+        let direction_note = |am_i_sender: bool, peer_label: &str| -> String {
+            if am_i_sender {
+                format!(
+                    "[loomux] connected to {peer_label} in channel {} — you are the SENDER: use \
+                     channel_send(text) any time to reach them; channel_status() lists everyone \
+                     connected.",
+                    ch.id
+                )
+            } else {
+                format!(
+                    "[loomux] connected to {peer_label} in channel {} — you are a RECEIVER: \
+                     channel_send(text) works once {peer_label} messages you (reply-only); \
+                     channel_status() lists everyone connected.",
+                    ch.id
+                )
+            }
+        };
+        let _ = self.deliver_prompt(&a.id, &direction_note(ch.sender == a.id, &b_label), "loomux", Delivery::MidSession);
+        let _ = self.deliver_prompt(&b.id, &direction_note(ch.sender == b.id, &a_label), "loomux", Delivery::MidSession);
+
+        // Same shape as `channel_list`/`channel_for_pane` (`id`, `created_ms`,
+        // `members`) — the frozen `OrchChannel` contract the UI slice builds
+        // against. This is the command's RETURN VALUE, distinct from the
+        // `channel-connect` audit record and the `orch-channel` event above,
+        // both of which key the id `channel_id` on purpose (matching
+        // `ChannelDisconnectResult`/`OrchChannelEvent`) — only this value
+        // must match `OrchChannel`.
+        Ok(json!({
+            "id": ch.id, "created_ms": ch.created_ms, "sender": ch.sender,
+            "display_number": ch.display_number, "members": member_json,
+        }))
+    }
+
+    /// Human-only (constraint 5): remove `agent` from its channel. If
+    /// membership drops below 2, OR `agent` was the channel's sender, the
+    /// channel is torn down entirely and every stranded remaining member is
+    /// notified and audited. The sender-loss case is additive to #285: a
+    /// star topology has exactly one hub — losing it leaves receivers that
+    /// can never initiate and each other that can never be reached (B4:
+    /// receiver→receiver is never allowed), so the channel is as dead as a
+    /// 1-member one. There is no automatic promotion; a human must
+    /// `set_sender` and (if desired) reconnect.
+    pub fn disconnect_agent(&self, group: &str, agent: &str) -> Result<Value, String> {
+        let mut channels = self.channels.lock_safe();
+        let mut agent_channel = self.agent_channel.lock_safe();
+        let chan_id = agent_channel
+            .remove(agent)
+            .ok_or_else(|| format!("{agent} is not connected to any channel"))?;
+        let ch = channels.get_mut(&chan_id).expect("agent_channel/channels must agree");
+        let sender = ch.sender.clone();
+        let display_number = ch.display_number;
+        let lost_sender = sender == agent;
+        ch.members.retain(|m| m.agent_id != agent);
+        let remaining = ch.members.clone();
+        let closed = remaining.len() < 2 || lost_sender;
+        if closed {
+            for m in &remaining {
+                agent_channel.remove(&m.agent_id);
+            }
+            channels.remove(&chan_id);
+        }
+        drop(agent_channel);
+        drop(channels);
+
+        self.audit(
+            group,
+            "human",
+            "channel-disconnect",
+            json!({ "channel_id": chan_id, "agent": agent, "remaining": remaining.len() }),
+        );
+        if let Some(app) = self.app.lock_safe().clone() {
+            let _ = app.emit(
+                "orch-channel",
+                // `sender` is the channel's sender BEFORE this removal —
+                // still correct here: the still-open branch (`!closed`)
+                // is only reached when `agent` was a receiver, i.e. the
+                // sender is unchanged and still among `remaining`.
+                channel_disconnected_event(
+                    closed, &chan_id, agent, display_number,
+                    self.channel_members_json(&sender, &remaining),
+                ),
+            );
+        }
+        if closed {
+            let reason = if lost_sender {
+                "the sender you were connected to disconnected — a channel needs a sender"
+            } else {
+                "the peer you were connected to disconnected"
+            };
+            for m in &remaining {
+                if m.group != group {
+                    self.audit(
+                        &m.group,
+                        "human",
+                        "channel-disconnect",
+                        json!({ "channel_id": chan_id, "agent": agent, "remaining": 0 }),
+                    );
+                }
+                let _ = self.deliver_prompt(
+                    &m.agent_id,
+                    &format!("[loomux] channel {chan_id} closed — {reason}."),
+                    "loomux",
+                    Delivery::MidSession,
+                );
+            }
+        }
+        Ok(json!({ "channel_id": chan_id, "closed": closed, "remaining": remaining.len() }))
+    }
+
+    /// Drop `agent_id` from its channel on death (`mark_dead` covers
+    /// idle-kill, `kill_agent`, a crash, and planner auto-close identically)
+    /// — the pane a channel message would land in is gone. Reuses
+    /// `disconnect_agent`'s teardown-below-2 logic so a channel down to one
+    /// live member closes exactly as it would from a human disconnect.
+    fn cleanup_agent_channel(&self, agent_id: &str, group: &str) {
+        if self.agent_channel.lock_safe().contains_key(agent_id) {
+            let _ = self.disconnect_agent(group, agent_id);
+        }
+    }
+
+    /// Agent-facing (`channel_send` MCP tool, denied to planners —
+    /// `require_not_planner` in mcp.rs): directional per #271 W3 addendum
+    /// part B. The channel's **sender** may call this any time; it
+    /// broadcasts to every OTHER member and grants each of them one reply
+    /// credit (`may_reply = true`). Every other member (a **receiver**) may
+    /// call this only when it currently holds that credit — delivering
+    /// **solely to the sender** and consuming the credit — never to another
+    /// receiver (B3/B4: request/response, star topology). The caller
+    /// supplies ONLY text; the target(s) come exclusively from the
+    /// membership graph plus the direction rule above (constraint 6). Errors
+    /// if the caller isn't connected, or is a receiver with no credit.
+    pub fn channel_send(&self, caller: &Caller, text: &str) -> Result<String, String> {
+        let chan_id = self
+            .agent_channel
+            .lock_safe()
+            .get(&caller.agent_id)
+            .cloned()
+            .ok_or("you are not connected to any channel — ask a human to connect this pane first")?;
+
+        // Resolve targets AND, for a receiver, consume the reply credit —
+        // all under one lock so a concurrent sender broadcast can't race the
+        // credit check.
+        let (targets, is_sender): (Vec<ChannelMember>, bool) = {
+            let mut channels = self.channels.lock_safe();
+            let ch = channels.get_mut(&chan_id).ok_or("channel no longer exists")?;
+            if ch.sender == caller.agent_id {
+                for m in ch.members.iter_mut().filter(|m| m.agent_id != caller.agent_id) {
+                    m.may_reply = true;
+                }
+                let targets = ch.members.iter().filter(|m| m.agent_id != caller.agent_id).cloned().collect();
+                (targets, true)
+            } else {
+                match ch.members.iter().find(|m| m.agent_id == caller.agent_id).map(|m| m.may_reply) {
+                    None => return Err("channel no longer exists".into()),
+                    Some(false) => {
+                        return Err(
+                            "you can only reply after the sender messages you — a receiver may \
+                             never initiate, only answer (and only the sender, never another \
+                             receiver)"
+                                .into(),
+                        )
+                    }
+                    Some(true) => {}
+                }
+                if let Some(m) = ch.members.iter_mut().find(|m| m.agent_id == caller.agent_id) {
+                    m.may_reply = false; // consume the credit
+                }
+                let target = ch
+                    .members
+                    .iter()
+                    .find(|m| m.agent_id == ch.sender)
+                    .cloned()
+                    .ok_or("channel no longer exists")?;
+                (vec![target], false)
+            }
+        };
+
+        let me = self.agent(&caller.agent_id).ok_or("unknown agent")?;
+        let sender_label = self.channel_member_label(&ChannelMember {
+            group: me.group.clone(),
+            agent_id: me.id.clone(),
+            name: me.name.clone(),
+            role: me.role,
+            may_reply: false,
+        });
+        let sanitized = notify::sanitize_gh_text(text, Self::CHANNEL_TEXT_CAP);
+        let message = channel_message_text(&chan_id, &sender_label, &sanitized);
+
+        for peer in &targets {
+            self.audit(
+                &peer.group,
+                &caller.agent_id,
+                "channel-message",
+                json!({ "channel_id": chan_id, "from": caller.agent_id, "to": peer.agent_id, "text": sanitized }),
+            );
+            if peer.group != caller.group {
+                self.audit(
+                    &caller.group,
+                    &caller.agent_id,
+                    "channel-message",
+                    json!({ "channel_id": chan_id, "from": caller.agent_id, "to": peer.agent_id, "text": sanitized }),
+                );
+            }
+            let _ = self.deliver_prompt(&peer.agent_id, &message, "loomux", Delivery::MidSession);
+        }
+        Ok(if is_sender {
+            format!("sent to {} peer(s) in {chan_id}", targets.len())
+        } else {
+            format!("replied to the sender in {chan_id}")
+        })
+    }
+
+    /// Agent-facing (`channel_status` MCP tool, denied to planners): who the
+    /// caller is connected to, the channel's sender, and — per peer — its
+    /// `direction`/`can_send` (#271 W3 addendum A4: "a full peer sees
+    /// exactly who can talk back"). Also reports the CALLER's own current
+    /// `can_send` (true if it's the sender; if a receiver, true only while
+    /// it holds the reply credit) — otherwise a receiver has no way to check
+    /// before calling `channel_send` and hitting the credit error. Never
+    /// mutates.
+    pub fn channel_status(&self, caller: &Caller) -> Value {
+        let chan_id = self.agent_channel.lock_safe().get(&caller.agent_id).cloned();
+        let Some(chan_id) = chan_id else {
+            return json!({ "connected": false, "channel_id": null, "peers": [] });
+        };
+        let ch = self.channels.lock_safe().get(&chan_id).cloned();
+        let Some(ch) = ch else {
+            return json!({ "connected": false, "channel_id": null, "peers": [] });
+        };
+        let my_can_send = ch.sender == caller.agent_id
+            || ch.members.iter().any(|m| m.agent_id == caller.agent_id && m.may_reply);
+        let peers: Vec<Value> = ch
+            .members
+            .iter()
+            .filter(|m| m.agent_id != caller.agent_id)
+            .map(|m| {
+                let is_sender = m.agent_id == ch.sender;
+                let has_token = self.agent_has_token(&m.agent_id);
+                let can_send = is_sender || (m.may_reply && has_token);
+                json!({
+                    "agent_id": m.agent_id, "role": m.role, "name": m.name,
+                    "repo": self.group(&m.group).map(|g| g.repo).unwrap_or_default(),
+                    "direction": if is_sender { "sender" } else { "receiver" },
+                    "can_send": can_send,
+                    "delivery_only": !has_token,
+                })
+            })
+            .collect();
+        json!({
+            "connected": true, "channel_id": chan_id, "sender": ch.sender,
+            "display_number": ch.display_number, "can_send": my_can_send, "peers": peers,
+        })
+    }
+
+    /// Every live channel — id, created time, sender, members — for the
+    /// frontend's cross-tab indicators (tab switch, reconnect). Tauri-only
+    /// (trusted webview); an agent only ever sees its own via `channel_status`.
+    pub fn channel_list(&self) -> Value {
+        let channels = self.channels.lock_safe();
+        let mut list: Vec<&Channel> = channels.values().collect();
+        list.sort_by_key(|c| c.created_ms);
+        json!(list
+            .iter()
+            .map(|c| json!({
+                "id": c.id,
+                "created_ms": c.created_ms,
+                "sender": c.sender,
+                "display_number": c.display_number,
+                "members": self.channel_members_json(&c.sender, &c.members),
+            }))
+            .collect::<Vec<_>>())
+    }
+
+    /// The channel `agent` (in `group`) belongs to, or `null`. Tauri-only,
+    /// for a single pane's header chip. `group` is checked against the
+    /// agent's actual group so a stale frontend reference reads as
+    /// disconnected rather than leaking another pane's channel.
+    pub fn channel_for_pane(&self, group: &str, agent: &str) -> Value {
+        match self.agent(agent) {
+            Some(a) if a.group == group => {}
+            _ => return Value::Null,
+        }
+        let Some(chan_id) = self.agent_channel.lock_safe().get(agent).cloned() else {
+            return Value::Null;
+        };
+        let ch = self.channels.lock_safe().get(&chan_id).cloned();
+        match ch {
+            Some(c) => json!({
+                "id": c.id, "sender": c.sender, "display_number": c.display_number,
+                "members": self.channel_members_json(&c.sender, &c.members),
+            }),
+            None => Value::Null,
+        }
+    }
+
+    /// Human-only (constraint 5): reassign a channel's sender without
+    /// reconnecting (#271 W3 addendum, part B5). `new_sender_agent` must
+    /// already be a member AND hold a token — a delivery-only member can
+    /// never become sender, the same rule `connect_agents` enforces at
+    /// mint/join time. Clears every member's reply credit (a swap
+    /// invalidates in-flight "you may reply" state — the new sender starts
+    /// clean) and notifies every member of its new role. Audited
+    /// `channel-direction` in every distinct member group.
+    pub fn set_sender(&self, channel_id: &str, new_sender_agent: &str) -> Result<Value, String> {
+        let candidate = self.agent(new_sender_agent).ok_or("unknown agent: new_sender_agent")?;
+        if candidate.token.is_empty() {
+            return Err("a receive-only pane can't be the sender — it has no token".into());
+        }
+        let (from_sender, ch_clone) = {
+            let mut channels = self.channels.lock_safe();
+            let ch = channels.get_mut(channel_id).ok_or("unknown channel")?;
+            if !ch.members.iter().any(|m| m.agent_id == new_sender_agent) {
+                return Err("new sender must already be a member of this channel".into());
+            }
+            let from_sender = std::mem::replace(&mut ch.sender, new_sender_agent.to_string());
+            for m in ch.members.iter_mut() {
+                m.may_reply = false;
+            }
+            (from_sender, ch.clone())
+        };
+
+        let mut audited_groups = HashSet::new();
+        for m in &ch_clone.members {
+            if audited_groups.insert(m.group.clone()) {
+                self.audit(
+                    &m.group,
+                    "human",
+                    "channel-direction",
+                    json!({ "channel_id": channel_id, "from_sender": from_sender, "to_sender": new_sender_agent }),
+                );
+            }
+        }
+        let member_json = self.channel_members_json(new_sender_agent, &ch_clone.members);
+        if let Some(app) = self.app.lock_safe().clone() {
+            let _ = app.emit(
+                "orch-channel",
+                channel_updated_event(channel_id, new_sender_agent, ch_clone.display_number, member_json.clone()),
+            );
+        }
+        for m in &ch_clone.members {
+            let note = if m.agent_id == new_sender_agent {
+                "[loomux] you are now the SENDER of this channel — you may channel_send to \
+                 everyone connected, any time."
+            } else {
+                "[loomux] the sender of this channel changed — you are now a RECEIVER: \
+                 channel_send works once the new sender messages you (reply-only)."
+            };
+            let _ = self.deliver_prompt(&m.agent_id, note, "loomux", Delivery::MidSession);
+        }
+        Ok(json!({
+            "id": channel_id, "sender": new_sender_agent,
+            "display_number": ch_clone.display_number, "members": member_json,
+        }))
+    }
+
+    // ---------- standalone panes (#271 W3 addendum, part A) ----------
+    //
+    // A standalone (launcher) pane has no orchestration group and, before
+    // this, no MCP identity at all. To make one a first-class channel member
+    // it needs exactly what any channel member needs: an `AgentEntry` with a
+    // `pty_id` (delivery is hard-keyed to that), and — only if it's meant to
+    // `channel_send` — a token + MCP config. Everything below mints that
+    // identity directly, bypassing `spawn_agent_ex`/`build_agent_command`
+    // entirely (no block, no persona, no kickoff, no guardrail cap): these
+    // are human-only Tauri commands (constraint 5), reached from the
+    // launcher's pane-spawn path or the pane-menu Connect gesture, never
+    // from MCP.
+
+    /// Lazily register the reserved standalone pseudo-group the first time a
+    /// solo pane is created. Idempotent. Minimal `GroupInfo` — no workflow,
+    /// no merge gate, no per-role roster: solo panes never traverse the
+    /// block machinery, so there is nothing else to configure.
+    fn ensure_solo_group(&self) {
+        if self.groups.lock_safe().contains_key(SOLO_GROUP) {
+            return;
+        }
+        let _ = fs::create_dir_all(self.group_dir(SOLO_GROUP).join("configs"));
+        let info = GroupInfo {
+            id: SOLO_GROUP.to_string(),
+            repo: "(standalone)".to_string(),
+            guardrails: Guardrails::default().clamped(),
+        };
+        self.groups.lock_safe().insert(SOLO_GROUP.to_string(), info);
+    }
+
+    /// Human-only (the launcher's agent-pane spawn path, constraint 5): mint
+    /// a channel-scoped identity for a newly-launching standalone pane
+    /// BEFORE it boots, so the MCP flags can be appended to its command line
+    /// (you cannot inject an MCP server into an already-running CLI). `cli`
+    /// is the CLI the human picked. For claude/copilot — the only CLIs with
+    /// an MCP-config flag seam today (`SUPPORTED_CLIS`) — this writes the
+    /// same per-agent config `write_mcp_config` gives an orchestration-group
+    /// agent and mints a real token: the pane is a FULL member, able to
+    /// `channel_send`. For any other CLI (no seam: codex/gemini/opencode/
+    /// custom — their own MCP mechanisms are repo/user config files, a
+    /// separate per-CLI follow-up, not a spawn-time flag) this mints NO
+    /// token — the `AgentEntry` still exists (so the pane CAN be a
+    /// `deliver_prompt` target once connected), but it is delivery-only from
+    /// birth, exactly like an adopted already-running pane (`solo_adopt`).
+    /// Returns `{agent_id, mcp_args, delivery_only}` — `mcp_args` is the
+    /// exact per-CLI flag string to append to the launched command line
+    /// (empty for a delivery-only CLI).
+    pub fn solo_prepare(&self, cli: &str, cwd: &str, name: &str) -> Result<Value, String> {
+        self.ensure_solo_group();
+        let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
+        let agent_id = format!("solo-{seq}");
+        let display = sanitize_agent_name(name);
+        let display = if display.is_empty() { agent_id.clone() } else { display };
+
+        let has_seam = SUPPORTED_CLIS.contains(&cli);
+        let (token, mcp_args) = if has_seam {
+            let token = new_token();
+            let cfg = self.write_mcp_config(SOLO_GROUP, &agent_id, &token, cli)?;
+            let args = match cli {
+                "claude" => format!(
+                    "--mcp-config \"{}\" --strict-mcp-config --allowedTools mcp__loomux",
+                    cfg.display()
+                ),
+                "copilot" => format!(
+                    "--additional-mcp-config \"@{}\" --allow-tool loomux",
+                    cfg.display()
+                ),
+                _ => unreachable!("has_seam is only true for SUPPORTED_CLIS"),
+            };
+            (token, args)
+        } else {
+            (String::new(), String::new())
+        };
+        let delivery_only = token.is_empty();
+
+        let entry = AgentEntry {
+            id: agent_id.clone(),
+            group: SOLO_GROUP.to_string(),
+            name: display,
+            name_source: NameSource::Default,
+            block: "solo".to_string(),
+            role: Role::Solo,
+            token: token.clone(),
+            status: AgentStatus::Starting,
+            pty_id: None,
+            task: String::new(),
+            session_id: None,
+            cwd: cwd.to_string(),
+            idle_since_ms: None,
+            started_ms: now_ms(),
+            last_progress_ms: now_ms(),
+            last_output_total: 0,
+            watchdog_notified: false,
+            idle_tick_notified: false,
+            solo_cli: Some(cli.to_string()),
+        };
+        self.agents.lock_safe().insert(agent_id.clone(), entry);
+        if !token.is_empty() {
+            self.by_token.lock_safe().insert(token, agent_id.clone());
+        }
+        self.audit(
+            SOLO_GROUP,
+            "human",
+            "solo-prepare",
+            json!({ "agent": agent_id, "cli": cli, "delivery_only": delivery_only }),
+        );
+        Ok(json!({ "agent_id": agent_id, "mcp_args": mcp_args, "delivery_only": delivery_only }))
+    }
+
+    /// Human-only: bind the pty a newly-spawned solo pane's launcher just
+    /// opened to the `AgentEntry` `solo_prepare` created. Unlike `bind` (the
+    /// channel-based rendezvous a `spawn_agent_ex` call blocks on),
+    /// `solo_prepare` already returned synchronously with no spawner thread
+    /// waiting — this is direct bookkeeping, not a wakeup. Registers
+    /// `by_pty[pty_id] = agent_id` so the EXISTING pty-exit path
+    /// (`by_pty` → `mark_dead` → `cleanup_agent_channel`) tears the member
+    /// down on pane close with no new teardown code.
+    pub fn solo_bind(&self, agent_id: &str, pty_id: u32) -> Result<(), String> {
+        {
+            let mut agents = self.agents.lock_safe();
+            let a = agents.get_mut(agent_id).ok_or("unknown agent")?;
+            if a.role != Role::Solo {
+                return Err("solo_bind is only for standalone panes".into());
+            }
+            a.pty_id = Some(pty_id);
+            a.status = AgentStatus::Running;
+        }
+        self.by_pty.lock_safe().insert(pty_id, agent_id.to_string());
+        Ok(())
+    }
+
+    /// Human-only, reached from the pane-menu Connect gesture (part A3): on
+    /// the first Connect against a pane with no channel identity — launched
+    /// before this feature existed, or simply never `solo_prepare`d —
+    /// register it as a delivery-only member: an `AgentEntry` with NO token
+    /// (it can never `channel_send`), bound to its already-running pty.
+    /// loomux already owns the pty, so inbound delivery works today; this
+    /// makes that pane a legitimate **receiver** rather than refusing the
+    /// connect outright. Idempotent by pty: re-adopting an already-adopted
+    /// pty returns its existing agent id instead of minting a second one.
+    pub fn solo_adopt(&self, pty_id: u32, name: &str, cwd: &str) -> Result<Value, String> {
+        if let Some(existing) = self.by_pty.lock_safe().get(&pty_id).cloned() {
+            return Ok(json!({ "agent_id": existing }));
+        }
+        self.ensure_solo_group();
+        let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
+        let agent_id = format!("solo-{seq}");
+        let display = sanitize_agent_name(name);
+        let display = if display.is_empty() { agent_id.clone() } else { display };
+        let entry = AgentEntry {
+            id: agent_id.clone(),
+            group: SOLO_GROUP.to_string(),
+            name: display,
+            name_source: NameSource::Default,
+            block: "solo".to_string(),
+            role: Role::Solo,
+            token: String::new(), // delivery-only, by construction: never a channel_send caller
+            status: AgentStatus::Running,
+            pty_id: Some(pty_id),
+            task: String::new(),
+            session_id: None,
+            cwd: cwd.to_string(),
+            idle_since_ms: None,
+            started_ms: now_ms(),
+            last_progress_ms: now_ms(),
+            last_output_total: 0,
+            watchdog_notified: false,
+            idle_tick_notified: false,
+            solo_cli: None, // unknown for an adopted pane; cli_for_agent falls back to "claude"
+        };
+        self.agents.lock_safe().insert(agent_id.clone(), entry);
+        self.by_pty.lock_safe().insert(pty_id, agent_id.clone());
+        self.audit(SOLO_GROUP, "human", "solo-adopt", json!({ "agent": agent_id, "pty_id": pty_id }));
+        Ok(json!({ "agent_id": agent_id }))
+    }
+
     // ---------- autonomous mode (#83): idle-tick + budget enforcement ----------
 
     /// Read every live orchestrator pane's output counter and last human-keystroke
@@ -7545,6 +8542,10 @@ impl OrchRegistry {
                     Role::Worker => worker += 1,
                     Role::Reviewer => reviewer += 1,
                     Role::Planner => planner += 1,
+                    // A solo pane never belongs to a real orchestration
+                    // group's summary — it lives in `__solo__` — but the
+                    // match must stay exhaustive.
+                    Role::Solo => {}
                 }
                 earliest = Some(earliest.map_or(a.started_ms, |e| e.min(a.started_ms)));
                 json!({
@@ -8492,6 +9493,23 @@ impl OrchRegistry {
         self.agents.lock_safe().get(id).cloned()
     }
 
+    /// Which agent CLI to assume for delivery/usage bookkeeping. For every
+    /// orchestration-group agent this is the group's per-block resolution
+    /// (`Guardrails::cli_for`) exactly as before; a **solo** pane instead
+    /// carries its own CLI directly (`AgentEntry.solo_cli`), since `__solo__`
+    /// is one shared group across panes that may be running different CLIs —
+    /// a group-level lookup can't answer this for them. Falls back to
+    /// `"claude"` only when neither source has an answer (should not happen
+    /// for a live agent).
+    fn cli_for_agent(&self, a: &AgentEntry) -> String {
+        if let Some(cli) = &a.solo_cli {
+            return cli.clone();
+        }
+        self.group(&a.group)
+            .map(|g| g.guardrails.cli_for(a.role).to_string())
+            .unwrap_or_else(|| "claude".to_string())
+    }
+
     fn live_delegate_count(&self, group: &str) -> u32 {
         self.agents
             .lock_safe()
@@ -9355,6 +10373,7 @@ impl OrchRegistry {
             last_output_total: 0,
             watchdog_notified: false,
             idle_tick_notified: false,
+            solo_cli: None,
         };
         {
             // Re-check the cap under the same lock as the insert: the early
@@ -9633,6 +10652,9 @@ impl OrchRegistry {
                     format!("{head}\nYour task:\n{}", a.task)
                 }
             }
+            // A solo pane never gets a kickoff (see `Role::template`'s doc) —
+            // `spawn_agent_ex`/`kickoff_prompt` are never called for one.
+            Role::Solo => unreachable!("solo panes never receive a kickoff"),
         }
     }
 
@@ -9690,10 +10712,7 @@ impl OrchRegistry {
         // bare CR on an unfocused pane, so its sequence prefixes a focus-in
         // report (#98). Resolved here — through the same per-role `cli_for` the
         // registry already uses — so the delivery thread carries the right bytes.
-        let cli = self
-            .group(&a.group)
-            .map(|g| g.guardrails.cli_for(a.role).to_string())
-            .unwrap_or_else(|| "claude".to_string());
+        let cli = self.cli_for_agent(&a);
         let submit = submit_sequence(&cli);
         let lock = self
             .delivery
@@ -10236,6 +11255,11 @@ impl OrchRegistry {
         // the pane they'd fire into is gone — covering idle-kill, kill_agent,
         // a crash, and planner auto-close identically (they all funnel here).
         self.cleanup_agent_watches(agent_id, &snapshot.group);
+        // Cross-workspace channels (#271): a dead agent's channel membership
+        // is garbage the same way — the pane a peer's `channel_send` would
+        // land in is gone. Tears the channel down (and notifies the
+        // stranded peer) if this drops it below 2 members.
+        self.cleanup_agent_channel(agent_id, &snapshot.group);
         let _ = fs::remove_file(
             self.group_dir(&snapshot.group).join("configs").join(format!("{agent_id}.json")),
         );
@@ -10250,10 +11274,7 @@ impl OrchRegistry {
         // recycled/killed agent still counts toward the group's lifetime total
         // (issue #42). The transcript remains readable after exit; the
         // statusline does not, but token usage is the source we rely on.
-        let cli = self
-            .group(&snapshot.group)
-            .map(|g| g.guardrails.cli_for(snapshot.role).to_string())
-            .unwrap_or_else(|| "claude".to_string());
+        let cli = self.cli_for_agent(&snapshot);
         let usage = self.compute_usage_snapshot(&snapshot, &cli);
         self.upsert_usage_snapshot(&snapshot.group, usage);
         Some(snapshot)
@@ -10795,6 +11816,104 @@ pub fn orch_group_watches(reg: tauri::State<Arc<OrchRegistry>>, group_id: String
     reg.group_watches(&group_id)
 }
 
+// ---------- cross-workspace channels (#271): human-only connect/disconnect ----------
+//
+// The connect gesture (pane header context menu) and every membership
+// mutation live ONLY here — Tauri commands reached exclusively by the
+// trusted webview (CLAUDE.md constraint 5). There is deliberately no MCP
+// tool that opens/closes/joins a channel; `channel_send`/`channel_status`
+// (mcp.rs) are the only agent-facing surface, and both are read/broadcast
+// against a membership graph an agent can never edit.
+
+/// Connect two agent panes (possibly in different groups) into a channel.
+/// Human-only. See `OrchRegistry::connect_agents` for the join/mint/reject
+/// rules.
+#[tauri::command]
+pub fn orch_channel_connect(
+    reg: tauri::State<Arc<OrchRegistry>>,
+    from_group: String,
+    from_agent: String,
+    to_group: String,
+    to_agent: String,
+    sender_agent: String,
+) -> Result<Value, String> {
+    reg.connect_agents(&from_group, &from_agent, &to_group, &to_agent, &sender_agent)
+}
+
+/// Disconnect one agent pane from its channel. Human-only; tears the
+/// channel down if this drops it below 2 members, or if the disconnected
+/// pane was the channel's sender (#271 W3 addendum, part B — a star
+/// topology has exactly one hub).
+#[tauri::command]
+pub fn orch_channel_disconnect(
+    reg: tauri::State<Arc<OrchRegistry>>,
+    group: String,
+    agent: String,
+) -> Result<Value, String> {
+    reg.disconnect_agent(&group, &agent)
+}
+
+/// Every live channel, for the frontend's cross-tab indicators.
+#[tauri::command]
+pub fn orch_channel_list(reg: tauri::State<Arc<OrchRegistry>>) -> Value {
+    reg.channel_list()
+}
+
+/// The channel one pane belongs to, or `null` — for a single pane's header
+/// chip on tab switch / reconnect.
+#[tauri::command]
+pub fn orch_channel_for_pane(reg: tauri::State<Arc<OrchRegistry>>, group: String, agent: String) -> Value {
+    reg.channel_for_pane(&group, &agent)
+}
+
+/// Human-only: reassign a channel's sender without reconnecting (#271 W3
+/// addendum, part B5). See `OrchRegistry::set_sender` for the validation
+/// (member + token) and side effects (credits cleared, both panes notified,
+/// `channel-direction` audited).
+#[tauri::command]
+pub fn orch_channel_set_sender(
+    reg: tauri::State<Arc<OrchRegistry>>,
+    channel_id: String,
+    new_sender_agent: String,
+) -> Result<Value, String> {
+    reg.set_sender(&channel_id, &new_sender_agent)
+}
+
+// ---------- standalone panes (#271 W3 addendum, part A): human-only, from
+// the launcher's agent-pane spawn path or the pane-menu Connect gesture.
+
+/// Mint a channel-scoped identity for a newly-launching standalone pane
+/// BEFORE it boots. See `OrchRegistry::solo_prepare`.
+#[tauri::command]
+pub fn orch_solo_prepare(
+    reg: tauri::State<Arc<OrchRegistry>>,
+    cli: String,
+    cwd: String,
+    name: String,
+) -> Result<Value, String> {
+    reg.solo_prepare(&cli, &cwd, &name)
+}
+
+/// Bind a just-spawned solo pane's pty to the `AgentEntry` `orch_solo_prepare`
+/// created. See `OrchRegistry::solo_bind`.
+#[tauri::command]
+pub fn orch_solo_bind(reg: tauri::State<Arc<OrchRegistry>>, agent_id: String, pty_id: u32) -> Result<(), String> {
+    reg.solo_bind(&agent_id, pty_id)
+}
+
+/// Adopt an already-running pane (no channel identity yet) as a
+/// delivery-only member on its first Connect gesture. See
+/// `OrchRegistry::solo_adopt`.
+#[tauri::command]
+pub fn orch_solo_adopt(
+    reg: tauri::State<Arc<OrchRegistry>>,
+    pty_id: u32,
+    name: String,
+    cwd: String,
+) -> Result<Value, String> {
+    reg.solo_adopt(pty_id, &name, &cwd)
+}
+
 /// End a whole orchestration: kill all its agents and (optionally) remove
 /// their worktrees. Human-initiated, destructive, audited — the frontend
 /// confirms before calling this.
@@ -10949,6 +12068,7 @@ fn register_orchestrator_pane(
         last_output_total: 0,
         watchdog_notified: false,
         idle_tick_notified: false,
+        solo_cli: None,
     };
     reg.agents.lock_safe().insert(agent_id.clone(), entry.clone());
     reg.by_token.lock_safe().insert(token, agent_id.clone());
