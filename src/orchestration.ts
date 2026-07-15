@@ -451,7 +451,9 @@ function applyChannelEvent(payload: OrchChannelEvent, wiring: OrchWiring): void 
 
   for (const grid of wiring.allGrids()) {
     for (const pane of grid.allPanes()) {
-      const agentId = pane.orchAgentId;
+      // #271 W3 addendum: a standalone pane's channel agent id lives on the
+      // dedicated `channelAgent` carrier, not `orchAgentId` — check both.
+      const agentId = pane.orchAgentId ?? pane.channelAgentAgentId;
       if (!agentId) continue;
       if (activeIds.has(agentId)) {
         pane.setConnected(channelBadge(payload.channel_id, payload.members, agentId));
@@ -462,6 +464,8 @@ function applyChannelEvent(payload: OrchChannelEvent, wiring: OrchWiring): void 
   }
   if (payload.kind === "closed" && payload.agent) {
     showToast(`Channel ${payload.channel_id} closed — a peer disconnected.`, "info");
+  } else if (payload.kind === "updated") {
+    showToast(`Channel ${payload.channel_id}'s sender changed to ${payload.sender ?? "?"}.`, "info");
   }
   wiring.refreshTabBar();
 }
@@ -478,12 +482,28 @@ let pendingConnect: PendingConnect | null = null;
 let pendingPane: Pane | null = null;
 
 function paneConnectState(pane: Pane): PaneConnectState {
+  // #271 W3 addendum: an orchestration-group pane's identity always wins when
+  // present; a standalone pane's channel identity lives on the SEPARATE
+  // `channelAgent` carrier (never `orchGroup`/`orchAgent` — that would light
+  // up the full orchestration chrome for a plain standalone pane). Every
+  // orchestration-group agent (orchestrator/worker/reviewer/planner) is
+  // minted with a token at spawn, so it can always be the sender; a
+  // standalone pane's `canSend` reflects whatever `orch_solo_prepare`/
+  // `orch_solo_adopt` actually gave it.
+  const group = pane.orchGroupId ?? pane.channelAgentGroupId;
+  const agentId = pane.orchAgentId ?? pane.channelAgentAgentId;
+  const role = pane.orchRole ?? pane.channelAgentRole;
+  const canSend = pane.orchGroupId !== null ? true : pane.channelAgentCanSend;
+  const badge = pane.channelBadge;
   return {
-    group: pane.orchGroupId,
-    agentId: pane.orchAgentId,
+    group,
+    agentId,
     name: pane.name,
-    role: pane.orchRole,
+    role,
     channelId: pane.channelId,
+    canSend,
+    senderId: badge?.senderId ?? null,
+    senderName: badge?.senderName ?? null,
   };
 }
 
@@ -505,11 +525,37 @@ function dropStalePending(): void {
   }
 }
 
+/** The reserved standalone pseudo-group id — mirrors mod.rs's `SOLO_GROUP`
+ *  constant (#271 W3 addendum, part A1). */
+export const SOLO_GROUP = "__solo__";
+
+/** Adopt-on-connect (#271 W3 addendum, part A3): on the FIRST Connect gesture
+ *  against an agent pane with no channel identity yet — launched before this
+ *  feature, or on a CLI the launcher didn't eagerly mint one for — register it
+ *  as a delivery-only member so it stops hitting `NOT_CAPABLE_REASON`. A no-op
+ *  for a pane that already has an identity (orchestration OR channelAgent), and
+ *  for a shell/content pane (`!pane.isAgentPane`) — those stay not-capable, per
+ *  the addendum's Worker-split note. Best-effort: a failed adopt just leaves the
+ *  menu showing `NOT_CAPABLE_REASON` this time, retried on the next right-click. */
+async function adoptIfEligible(pane: Pane): Promise<void> {
+  if (pane.orchGroupId || pane.channelAgentAgentId) return;
+  if (!pane.isAgentPane || pane.ptyId === null) return;
+  try {
+    const { agent_id } = await soloAdopt(pane.ptyId, pane.name, pane.workdir ?? "");
+    // Adopted panes are ALWAYS delivery-only (soloAdopt mints no token) — see
+    // `OrchRegistry::solo_adopt`.
+    pane.setChannelAgent({ group: SOLO_GROUP, agentId: agent_id, role: "solo", canSend: false });
+  } catch {
+    /* best-effort — falls back to NOT_CAPABLE this time */
+  }
+}
+
 /** Right-click on a pane header (#271): show the Connect/Disconnect menu built
  *  from this pane's current state and the (global, cross-tab) armed connect
  *  source. Wired from `PaneEvents.onPaneContextMenu`. */
-export function showPaneConnectMenu(pane: Pane, x: number, y: number): void {
+export async function showPaneConnectMenu(pane: Pane, x: number, y: number): Promise<void> {
   dropStalePending();
+  await adoptIfEligible(pane);
   const items = buildPaneMenu(paneConnectState(pane), pendingConnect);
   showContextMenu(x, y, items, (action) => void handlePaneMenuAction(action, pane));
 }
@@ -517,9 +563,14 @@ export function showPaneConnectMenu(pane: Pane, x: number, y: number): void {
 /** The pane's own channel chip was clicked (#271's one-click "easy close").
  *  Wired from `PaneEvents.onDisconnectChannel`. */
 export function disconnectPaneChannel(pane: Pane): void {
-  const id = pane.orchGroupId && pane.orchAgentId ? { group: pane.orchGroupId, agentId: pane.orchAgentId } : null;
-  if (!id) return;
-  void handlePaneMenuAction({ kind: "disconnect", pane: { ...id, name: pane.name } }, pane);
+  const group = pane.orchGroupId ?? pane.channelAgentGroupId;
+  const agentId = pane.orchAgentId ?? pane.channelAgentAgentId;
+  if (!group || !agentId) return;
+  const state = paneConnectState(pane);
+  void handlePaneMenuAction(
+    { kind: "disconnect", pane: { group, agentId, name: pane.name, canSend: state.canSend, senderId: state.senderId, senderName: state.senderName, channelId: state.channelId } },
+    pane
+  );
 }
 
 /** Esc cancels an in-progress connect gesture from anywhere — a no-op if
@@ -550,7 +601,7 @@ async function handlePaneMenuAction(action: PaneMenuAction, pane: Pane): Promise
       return;
     case "connect":
       try {
-        await channelConnect(effect.from.group, effect.from.agentId, effect.to.group, effect.to.agentId);
+        await channelConnect(effect.from.group, effect.from.agentId, effect.to.group, effect.to.agentId, effect.senderAgent);
       } catch (err) {
         showToast(`Connect failed: ${String(err)}`, "error");
       }
@@ -560,6 +611,13 @@ async function handlePaneMenuAction(action: PaneMenuAction, pane: Pane): Promise
         await channelDisconnect(effect.group, effect.agentId);
       } catch (err) {
         showToast(`Disconnect failed: ${String(err)}`, "error");
+      }
+      return;
+    case "set-sender":
+      try {
+        await channelSetSender(effect.channelId, effect.newSenderAgent);
+      } catch (err) {
+        showToast(`Making this pane the sender failed: ${String(err)}`, "error");
       }
       return;
   }
@@ -838,18 +896,24 @@ export const workflowPreview = (repo: string, agentCli: string): Promise<Workflo
 // header chip, the `orch-channel` listener) is the UI slice's job.
 
 /** One member of a channel, as the backend resolves it — cached name/role so
- *  a rendered chip/roster doesn't need a second agent lookup. */
+ *  a rendered chip/roster doesn't need a second agent lookup. `direction`/
+ *  `can_send`/`delivery_only` are the #271 W3 addendum's directional fields
+ *  (part B7/A4). */
 export interface ChannelMember {
   group: string;
   agent_id: string;
   name: string;
-  role: OrchRole;
+  role: OrchRole | "solo";
+  direction: "sender" | "receiver";
+  can_send: boolean;
+  delivery_only: boolean;
 }
 
 /** A live cross-workspace channel (backend `Channel`). */
 export interface OrchChannel {
   id: string;
   created_ms?: number;
+  sender: string;
   members: ChannelMember[];
 }
 
@@ -857,26 +921,44 @@ export interface OrchChannel {
  *  Human-only. Per the backend's join rules: both free mints a new channel;
  *  one free + one already-connected joins the free pane into that channel
  *  (multi-party); both already connected to different channels is rejected.
+ *
+ *  `senderAgent` (#271 W3 addendum, part B) means something different for a
+ *  MINT than a JOIN (review round 2, B1 — this ambiguity was the bug):
+ *  - **Fresh mint** (neither pane connected): `senderAgent` DESIGNATES the
+ *    new channel's sender — must be `fromAgent` or `toAgent`, and that pane
+ *    must hold a channel token (a delivery-only pane can never be the
+ *    sender).
+ *  - **Join** (either pane already connected): the channel's sender already
+ *    exists; `senderAgent` only CONFIRMS who that is, and is very often
+ *    neither `fromAgent` nor `toAgent` — the completion gesture can land on
+ *    ANY existing member (the sender, or a plain receiver), and the true
+ *    sender may be a third pane entirely. Pass the target channel's actual
+ *    current sender (`PaneIdentity.senderId`), not either connect-call
+ *    argument.
+ *
  *  Returns the resulting channel. */
 export const channelConnect = (
   fromGroup: string,
   fromAgent: string,
   toGroup: string,
   toAgent: string,
+  senderAgent: string,
 ): Promise<OrchChannel> =>
-  invoke<OrchChannel>("orch_channel_connect", { fromGroup, fromAgent, toGroup, toAgent });
+  invoke<OrchChannel>("orch_channel_connect", { fromGroup, fromAgent, toGroup, toAgent, senderAgent });
 
 /** Result of disconnecting one pane from its channel. */
 export interface ChannelDisconnectResult {
   channel_id: string;
-  /** True if membership dropped below 2 and the whole channel was torn down. */
+  /** True if membership dropped below 2 — OR the disconnected pane was the
+   *  channel's sender (#271 W3 addendum, part B: a star topology has exactly
+   *  one hub) — and the whole channel was torn down. */
   closed: boolean;
   remaining: number;
 }
 
 /** Disconnect one agent pane from its channel. Human-only; tears the channel
  *  down (and strands/notifies any remaining member) if this drops it below
- *  2 members. */
+ *  2 members, or if the disconnected pane was the sender. */
 export const channelDisconnect = (group: string, agent: string): Promise<ChannelDisconnectResult> =>
   invoke<ChannelDisconnectResult>("orch_channel_disconnect", { group, agent });
 
@@ -888,14 +970,61 @@ export const channelList = (): Promise<OrchChannel[]> => invoke<OrchChannel[]>("
 export const channelForPane = (group: string, agent: string): Promise<OrchChannel | null> =>
   invoke<OrchChannel | null>("orch_channel_for_pane", { group, agent });
 
+/** Reassign a channel's sender without reconnecting (#271 W3 addendum, part
+ *  B5). Human-only; `newSenderAgent` must already be a member and hold a
+ *  token. Clears every member's reply credit and notifies both roles. */
+export const channelSetSender = (channelId: string, newSenderAgent: string): Promise<OrchChannel> =>
+  invoke<OrchChannel>("orch_channel_set_sender", { channelId, newSenderAgent });
+
 /** Payload of the `orch-channel` event, emitted by the backend on every
- *  connect/disconnect/teardown so cross-tab UI (chips, dock mirror, tab-strip
- *  dot) can update without polling. */
+ *  connect/disconnect/teardown/sender-swap so cross-tab UI (chips, dock
+ *  mirror, tab-strip dot) can update without polling. */
 export interface OrchChannelEvent {
-  kind: "connected" | "disconnected" | "closed";
+  kind: "connected" | "disconnected" | "closed" | "updated";
   channel_id: string;
   /** Present on disconnected/closed: the pane that left. */
   agent?: string;
+  /** Present on connected/updated: the channel's current sender. */
+  sender?: string;
   /** Current membership after the change (empty on `closed`). */
   members: ChannelMember[];
 }
+
+// ---------- standalone panes (#271 W3 addendum, part A) ----------
+//
+// A standalone (launcher) pane has no orchestration group. These mint/bind/
+// adopt a channel-scoped MCP identity for it — human-only Tauri commands,
+// reached from the launcher's agent-pane spawn path (`solo_prepare`/
+// `solo_bind`) or the pane-menu Connect gesture against a pane with none yet
+// (`solo_adopt`). See `OrchRegistry::solo_prepare`/`solo_bind`/`solo_adopt`.
+
+/** What `orch_solo_prepare` returns: the minted agent id, the exact per-CLI
+ *  flag string to append to the launched command line (empty for a
+ *  delivery-only CLI), and whether this pane ended up delivery-only (no
+ *  config seam for its CLI — codex/gemini/opencode/custom today). */
+export interface SoloPrepared {
+  agent_id: string;
+  mcp_args: string;
+  delivery_only: boolean;
+}
+
+/** Mint a channel-scoped identity for a newly-launching standalone pane
+ *  BEFORE it boots, so `mcp_args` can be appended to its command line. Call
+ *  once per new agent pane, from the launcher's spawn path — never for
+ *  terminal/content panes (#271 W3 addendum: "gate eager solo-prepare to
+ *  agent panes only"). */
+export const soloPrepare = (cli: string, cwd: string, name: string): Promise<SoloPrepared> =>
+  invoke<SoloPrepared>("orch_solo_prepare", { cli, cwd, name });
+
+/** Bind a just-spawned solo pane's pty to the `AgentEntry` `soloPrepare`
+ *  created. Call right after `spawnPty` resolves, mirroring the
+ *  orchestration group's `bind_agent` round trip. */
+export const soloBind = (agentId: string, ptyId: number): Promise<void> =>
+  invoke("orch_solo_bind", { agentId, ptyId });
+
+/** Adopt an already-running pane (no channel identity yet — launched before
+ *  this feature, or on a CLI the human didn't opt into channel tools for) as
+ *  a delivery-only member, on its first Connect gesture. Idempotent by pty:
+ *  re-adopting an already-adopted pty returns its existing agent id. */
+export const soloAdopt = (ptyId: number, name: string, cwd: string): Promise<{ agent_id: string }> =>
+  invoke<{ agent_id: string }>("orch_solo_adopt", { ptyId, name, cwd });
