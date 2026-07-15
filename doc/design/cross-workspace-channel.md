@@ -1,7 +1,7 @@
 # Design: cross-workspace communication channels (#271)
 
-Status: backend implemented (this PR); the human-facing connect UI (pane context menu,
-header chip, cross-tab indicators) stacks on top in a follow-up PR against this branch.
+Status: backend implemented (W1, PR #285, merged into this feature branch); the
+human-facing connect UI (W2, this section) stacks on top and is implemented below.
 
 ## Problem
 
@@ -202,3 +202,88 @@ concurrent workers in this repo's worktrees use.
   `group_id`-as-path-segment exposure (channel ids are backend-minted and never used as a
   path); the membership graph is the sole capability boundary, and it can only be edited from
   the trusted webview.
+
+## UI implementation (W2)
+
+Builds entirely on W1's frozen contract (`ChannelMember`/`OrchChannel`/`OrchChannelEvent`,
+the four `orch_channel_*` commands, the `orch-channel` event) — no backend changes in this
+slice, aside from d2a0a44's pre-existing review fix (`orch_channel_connect`'s return shape,
+already reflected in the contract this PR builds against).
+
+**The gesture, in code.** Two new pure, DOM-free modules (node:test, no DOM simulation —
+CLAUDE.md convention):
+
+- `src/panemenu.ts` — `buildPaneMenu(pane, pending)`: the menu SHAPE for a pane's current
+  state (free / connected / planner / non-capable) crossed with the global pending-arm
+  state. Arming is only ever offered on a FREE pane; an ALREADY-CONNECTED pane is still a
+  valid completion target for a pending arm elsewhere — that asymmetry is how a free third
+  pane joins an existing channel (multi-party), matching `connect_agents`' join rules
+  without the frontend needing to special-case it.
+- `src/channel.ts` — `reduceConnect(action, pending)`: the pure state-transition function
+  (arm/complete/cancel/self-click) plus the per-channel color/number/chip derivation.
+  Channel ids are backend-minted `chan-N` (a monotonic counter), so — unlike
+  `orchbadge.ts`'s per-group palette (arbitrary ids, needs an insertion-order cache) — a
+  channel's color/number is a pure function of its own id: no cache, nothing to reset
+  between tests.
+
+**Where the state actually lives.** There is at most one armed connect source live at a
+time, globally, across every tab — a module-level `pending`/`pendingPane` pair in
+`orchestration.ts`, mirroring how `cancelledSpawns` already lives there (DOM/backend glue
+state that doesn't belong in a pure module). `reduceConnect` is the pure core;
+`handlePaneMenuAction` is the thin shell that calls it, makes the resulting backend call
+(`channelConnect`/`channelDisconnect`), and toasts on failure.
+
+**`contextmenu.ts` made generic.** It was already commented "deliberately generic … so a
+second caller can reuse it" but wasn't literally generic yet (hardcoded to filemenu.ts's
+`MenuAction`). Changed `MenuItem`/`showContextMenu`/`buildLevel` to `MenuItem<A>`/
+`showContextMenu<A>`/`buildLevel<A>`; filemenu.ts's own `MenuItem`/`MenuAction` types are
+untouched and satisfy `MenuItem<MenuAction>` structurally, so `fileexplorer.ts`'s existing
+call site needed no change. contextmenu.ts itself carries no test (DOM wiring, validated by
+hand per CLAUDE.md), so this had no test-visible blast radius.
+
+**Indicators.** `Pane.setConnected(info | null)` mirrors `setBadge`/`setAttention`: a
+`.pane-channel` chip (solid background in the channel's color, like `.pane-badge`) before
+the title, plus a `.pane.connected` outline — deliberately `outline`, not another
+`box-shadow` layer, so it composes with the existing `.grouped`/`.needs-attention`
+box-shadow stripes without a combinatorial CSS explosion. An armed (pending-source) pane
+gets a separate pulsing dashed outline (`.connect-pending`), satisfying the "visible
+pending state" requirement without a transient toast being the only cue — a toast fires
+once at arm time for the immediate confirmation, but the outline persists until the
+gesture resolves. All of this is header/chip chrome only — never a PTY resize (constraint
+1; see `groupview.ts`'s watch-line precedent).
+
+Cross-tab: the `orch-channel` listener (added to the existing `initOrchestration`) matches
+each event's members against every pane in every grid by `orchAgentId` — the same
+cross-tab match `orch-spawn-cancelled` already uses, valid because agent ids are globally
+unique in the registry (orchbadge.ts's `agentSeq` comment). A minimized pane's chip mirrors
+to its dock chip (`Pane.channelBadge` getter, read in `grid.ts`'s `renderDock`, exactly
+paralleling `pane.attention`/`dockChipAttention`). A tab holding a connected pane gets a
+small `⇄` dot on the tab strip even while hidden — implemented for free by extending
+`tabcounts.ts`'s already-deterministic `TabPaneInfo`/`TabCounts` (a `connectedChannel`
+field, counted into `connectedChannels`) rather than adding a second event-driven map
+alongside `TabManager`'s existing `attn`; `TabManager.touch()` forces the one re-render a
+channel-only mutation wouldn't otherwise trigger (the existing 4s status poll only
+re-renders on agent/cost/paused deltas).
+
+**Rehydration.** `orch-channel` only fires on live mutations, so a pane that reopens (a
+respawn/rejoin) while its channel is still live in the registry needs a separate read:
+`openAgentPane` calls `channelForPane(group, agent)` right after a successful `bind_agent`
+and sets the chip if one comes back. Best-effort (a failed read just leaves the chip off
+until the next mutation) — not worth surfacing to the human.
+
+**Easy close, unambiguously.** Disconnect is reachable two ways — the pane menu's
+`Disconnect` item, and a single click on the chip itself (`Pane.onDisconnectChannel`) —
+both routed through the same `handlePaneMenuAction({kind: "disconnect", …})` path, so
+there is exactly one disconnect behavior, not two to keep in sync. There is no separate
+"leave vs. close" choice for the human to make: a channel is structurally never left with
+one member (the backend tears it down below 2), so disconnecting IS closing once only two
+remain, and the audit sentence (`auditsummary.ts`) says which happened.
+
+**Tests.** `test/panemenu.test.ts` and `test/channel.test.ts` pin the menu shape across
+every pane/pending state and the reducer's four transitions; `test/auditsummary.test.ts`
+gained three new exact-equality pins (`channel-connect`/`channel-message`/
+`channel-disconnect`) mutation-verified by hand (temporarily deleting each `summarize()`
+arm and confirming its pin reddens against the raw-JSON fallback, not a silent pass — the
+same discipline the existing watch-* pins established, PR #252). DOM wiring (the
+`contextmenu` listener on the pane header, `setConnected`/`setPendingConnect`, the dock/tab
+mirrors) is validated by hand — see the PR description's checklist.

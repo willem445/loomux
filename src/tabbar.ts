@@ -257,6 +257,21 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
         orch.title = "Dormant orchestration group — open the tab and Resume it";
         tab.appendChild(orch);
       }
+      // Cross-workspace channel dot (#271): a pane in this tab is connected, so
+      // a hidden/background tab still surfaces it — the per-pane header chip
+      // alone only shows once you switch to the tab. The count (not just a
+      // boolean) distinguishes one channel from the multi-channel case the
+      // whole feature exists to make legible.
+      if (counts.connectedChannels > 0) {
+        const chan = document.createElement("span");
+        chan.className = "tab-channel";
+        chan.textContent = counts.connectedChannels > 1 ? `⇄${counts.connectedChannels}` : "⇄";
+        chan.title =
+          counts.connectedChannels === 1
+            ? `A pane in "${ws.name}" is connected to a cross-workspace channel`
+            : `Panes in "${ws.name}" are connected to ${counts.connectedChannels} cross-workspace channels`;
+        tab.appendChild(chan);
+      }
       if (st?.paused) {
         const pause = document.createElement("span");
         pause.className = "tab-paused";

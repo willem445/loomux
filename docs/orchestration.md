@@ -182,6 +182,54 @@ so too, when the silent agent holds a live watch. The audit viewer (`Alt+A`) has
 sentence for each of a watch's six lifecycle events (registered, fired, expired, failed,
 cancelled, cleaned up on agent exit) instead of raw JSON.
 
+## Cross-workspace channels
+
+Every orchestration group is isolated by design — one group's agents never see another's
+context. Sometimes you want a narrow, explicit exception: two related repos open in
+different tabs (a library and its consumer, a backend and its frontend), and you want one
+agent to tell another "the API changed" or "I'm blocked on your PR" without relaying the
+message through you. A **channel** is that exception, and it is opt-in every time: **only
+you** can open or close one. No agent can ever connect, join, or disconnect a channel
+itself.
+
+**Connecting.** Right-click an orchestrator, worker, or reviewer pane's header and choose
+**Connect…** — the pane arms (its header outlines with a pulsing dashed border) and waits
+for its peer. Right-click a *second* pane, in the same tab or a different one, and choose
+**Connect here** to complete it. Right-click the armed pane again, or press **Esc**, to
+cancel before completing it. Once connected, both panes show a small colored, numbered chip
+(**⇄1**, **⇄2**, …) before their title — the color and number are the SAME on every member
+of one channel, so with several channels active at once you can tell at a glance which
+panes belong together. The chip mirrors to a docked pane's minimized chip too, and a
+background tab holding a connected pane gets its own small dot on the tab strip, so a
+channel spanning a hidden tab is never invisible.
+
+**Sending.** Once connected, either side's agent can call `channel_send(text)` to broadcast
+to every other member — it lands as a typed `[loomux] channel chan-N - <name> (<role>,
+<repo>): <text>` message in each peer's own pane, the same visible-prompt delivery every
+other agent-to-pane message already uses. `channel_status()` tells an agent who it's
+currently connected to. Both tools are denied to planners (like the CI-watch tools above)
+since a planner's pane closes the instant it reports done.
+
+**Multi-party.** A channel can have more than two members: right-click a free (not yet
+connected) THIRD pane's **Connect…**, then right-click an already-connected pane's
+**Connect here** — the new pane joins that channel rather than starting a second one. A
+pane can only ever belong to **one** channel at a time; connecting an already-connected
+pane to a *different* channel is rejected (disconnect it first) — that limit is what keeps
+the chip unambiguous and keeps two channels from silently bridging through a shared pane.
+
+**Disconnecting.** Two equally-easy ways: the pane's context menu **Disconnect** item, or a
+single click on the channel chip itself. Either removes just that one pane. If that drops
+the channel below two members, the whole channel closes and the remaining pane is notified
+— there's no "leave vs. close" ambiguity to weigh, because a channel is never left with only
+one member.
+
+**Limits (v1).** Channels are **in-memory only** — closing loomux drops every channel;
+after a restart, reconnect the panes you want linked. **Standalone launcher panes** (a "New
+agent pane" opened outside an orchestration group) can't join one — they carry no MCP
+identity to reach `channel_send`/`channel_status` with; every orchestrator/worker/reviewer
+pane in a group can. And a pane holds **at most one channel** at a time (see Multi-party,
+above).
+
 ## Group lifecycle
 
 The orchestrator pane has a lifecycle toggle (`Alt+O` or the group icon) with a

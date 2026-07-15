@@ -17,6 +17,9 @@ import { sessionIdFromCommand } from "./panerestore";
 import type { AutonomyState } from "./autonomy";
 import type { WorkflowPreview } from "./roster";
 import { showToast } from "./toast";
+import { showContextMenu } from "./contextmenu";
+import { buildPaneMenu, type PaneConnectState, type PaneMenuAction, type PendingConnect } from "./panemenu";
+import { reduceConnect, channelBadge, dropIfStale } from "./channel";
 
 export type { AutonomyState };
 export type { WorkflowPreview };
@@ -274,6 +277,9 @@ async function openAgentPane(
     // Report the pty so the backend can unblock the spawner and type the kickoff.
     try {
       await invoke("bind_agent", { agentId: req.agent_id, ptyId: pane.ptyId });
+      // Rehydrate a channel chip that predates this pane (#271: a rejoin/respawn
+      // while its channel is still live in the registry) — see hydratePaneChannel.
+      void hydratePaneChannel(pane, req.group_id, req.agent_id);
     } catch {
       // Late bind (#106): the backend's bind wait timed out and removed the
       // pending bind, so this rejects ("no pending bind for agent …"). Handle it
@@ -315,6 +321,12 @@ export interface OrchWiring {
   /** Apply an attention scan across all tabs: badge each pane by its pty AND
    *  badge the tab-bar entry of any tab that owns a needs-attention pty. */
   applyAttention(items: AttentionItem[]): void;
+  /** Force a tab-strip re-render (#271): channel membership is derived live from
+   *  each pane's state (tabcounts.ts), not tracked in a maintained per-tab map the
+   *  way attention is, so there is no setter that already triggers one. Called
+   *  after every `orch-channel` event so the tab-strip dot doesn't wait for the
+   *  next 4s status poll. */
+  refreshTabBar(): void;
 }
 
 /** Wire backend→frontend orchestration events. Call once at startup,
@@ -411,6 +423,160 @@ export function initOrchestration(wiring: OrchWiring): void {
       );
     }
   });
+  // Cross-workspace channel membership (#271): the backend pushes the current
+  // membership on every connect/join/disconnect/teardown. Matched across ALL
+  // tabs by agent id — the SAME cross-tab match `orch-spawn-cancelled` above
+  // uses — since agent ids are globally unique in the registry (orchbadge.ts).
+  void listen<OrchChannelEvent>("orch-channel", ({ payload }) => {
+    applyChannelEvent(payload, wiring);
+  });
+}
+
+/** Apply one `orch-channel` event across every open pane in every tab.
+ *
+ *  - `connected`: `members` is the channel's FULL current membership (a fresh
+ *    2-party channel, or a third pane joining an existing one) — set/refresh the
+ *    chip on every matching pane.
+ *  - `disconnected`: `members` is who's left (still active) — refresh their
+ *    chips (a departed peer changes the tooltip) and clear the pane named in
+ *    `agent`.
+ *  - `closed`: membership dropped below 2, so the backend tore the WHOLE channel
+ *    down — `members` (0 or 1 stranded leftover) plus `agent` (the disconnector)
+ *    are both cleared; there is no "still active" set. */
+function applyChannelEvent(payload: OrchChannelEvent, wiring: OrchWiring): void {
+  const activeIds = payload.kind === "closed" ? new Set<string>() : new Set(payload.members.map((m) => m.agent_id));
+  const clearIds = new Set<string>();
+  if (payload.agent) clearIds.add(payload.agent);
+  if (payload.kind === "closed") for (const m of payload.members) clearIds.add(m.agent_id);
+
+  for (const grid of wiring.allGrids()) {
+    for (const pane of grid.allPanes()) {
+      const agentId = pane.orchAgentId;
+      if (!agentId) continue;
+      if (activeIds.has(agentId)) {
+        pane.setConnected(channelBadge(payload.channel_id, payload.members, agentId));
+      } else if (clearIds.has(agentId)) {
+        pane.setConnected(null);
+      }
+    }
+  }
+  if (payload.kind === "closed" && payload.agent) {
+    showToast(`Channel ${payload.channel_id} closed — a peer disconnected.`, "info");
+  }
+  wiring.refreshTabBar();
+}
+
+// ---------- pane connect-menu wiring (#271, human-only OPT-IN gesture) ----------
+//
+// There is at most one armed connect source live at a time, globally, across every
+// tab — module-level state, mirroring `cancelledSpawns` above (also DOM/backend
+// glue state that doesn't belong in a pure module). `reduceConnect` (channel.ts) is
+// the pure state-transition function; this is just the DOM/backend shell around it:
+// build the menu, dispatch the fired action, make the backend call, toast errors.
+
+let pendingConnect: PendingConnect | null = null;
+let pendingPane: Pane | null = null;
+
+function paneConnectState(pane: Pane): PaneConnectState {
+  return {
+    group: pane.orchGroupId,
+    agentId: pane.orchAgentId,
+    name: pane.name,
+    role: pane.orchRole,
+    channelId: pane.channelId,
+  };
+}
+
+function setPending(next: PendingConnect | null, source: Pane | null): void {
+  pendingPane?.setPendingConnect(false);
+  pendingConnect = next;
+  pendingPane = next ? source : null;
+  pendingPane?.setPendingConnect(true);
+}
+
+/** Drop a stale armed source (review finding #286-1) before it can render a
+ *  menu label naming a pane that's gone. `channel.ts`'s `dropIfStale` is the
+ *  pure decision (unit-tested: alive → unchanged, dead → null); this is just
+ *  the DOM shell supplying the one fact it can't observe itself
+ *  (`Pane.isDisposed`) and applying the result. */
+function dropStalePending(): void {
+  if (pendingPane && dropIfStale(pendingConnect, !pendingPane.isDisposed) === null) {
+    setPending(null, null);
+  }
+}
+
+/** Right-click on a pane header (#271): show the Connect/Disconnect menu built
+ *  from this pane's current state and the (global, cross-tab) armed connect
+ *  source. Wired from `PaneEvents.onPaneContextMenu`. */
+export function showPaneConnectMenu(pane: Pane, x: number, y: number): void {
+  dropStalePending();
+  const items = buildPaneMenu(paneConnectState(pane), pendingConnect);
+  showContextMenu(x, y, items, (action) => void handlePaneMenuAction(action, pane));
+}
+
+/** The pane's own channel chip was clicked (#271's one-click "easy close").
+ *  Wired from `PaneEvents.onDisconnectChannel`. */
+export function disconnectPaneChannel(pane: Pane): void {
+  const id = pane.orchGroupId && pane.orchAgentId ? { group: pane.orchGroupId, agentId: pane.orchAgentId } : null;
+  if (!id) return;
+  void handlePaneMenuAction({ kind: "disconnect", pane: { ...id, name: pane.name } }, pane);
+}
+
+/** Esc cancels an in-progress connect gesture from anywhere — a no-op if
+ *  nothing is armed. Wired from main.ts's global keydown handler. */
+export function cancelPendingConnect(): void {
+  if (!pendingConnect) return;
+  setPending(null, null);
+}
+
+async function handlePaneMenuAction(action: PaneMenuAction, pane: Pane): Promise<void> {
+  const { pending, effect } = reduceConnect(action, pendingConnect);
+  // Only "connect-arm" legitimately introduces a NEW pending source pane — every
+  // other action either leaves `pending` exactly as it was (a disconnect of some
+  // UNRELATED pane while a different one is armed elsewhere: `pane` here is the
+  // disconnect target, not the armed pane, so it must never become `pendingPane`)
+  // or clears it to null (cancel, complete, or a disconnect that WAS the armed
+  // source). Passing `pane` in the unchanged case would move the pulsing "armed"
+  // outline onto the wrong pane.
+  if (action.kind === "connect-arm") setPending(pending, pane);
+  else if (pending === null) setPending(null, null);
+  switch (effect.kind) {
+    case "none":
+      if (action.kind === "connect-arm") {
+        showToast(`Connecting ${action.source.name}… right-click another pane to complete, Esc to cancel.`, "info");
+      } else if (action.kind === "connect-cancel") {
+        showToast("Connect cancelled.", "info");
+      }
+      return;
+    case "connect":
+      try {
+        await channelConnect(effect.from.group, effect.from.agentId, effect.to.group, effect.to.agentId);
+      } catch (err) {
+        showToast(`Connect failed: ${String(err)}`, "error");
+      }
+      return;
+    case "disconnect":
+      try {
+        await channelDisconnect(effect.group, effect.agentId);
+      } catch (err) {
+        showToast(`Disconnect failed: ${String(err)}`, "error");
+      }
+      return;
+  }
+}
+
+/** Best-effort rehydration of a pane's channel chip right after it (re)opens
+ *  (#271): `orch-channel` only fires on live mutations, but the channel itself
+ *  can predate this pane's open — a mid-run rejoin/respawn while its channel is
+ *  still live in the registry. A failed read is not worth surfacing to the
+ *  human; the chip simply stays off until the next mutation event. */
+async function hydratePaneChannel(pane: Pane, group: string, agentId: string): Promise<void> {
+  try {
+    const ch = await channelForPane(group, agentId);
+    if (ch) pane.setConnected(channelBadge(ch.id, ch.members, agentId));
+  } catch {
+    /* best-effort */
+  }
 }
 
 /** A recorded session's orchestration identity (backend roster). */

@@ -4,7 +4,11 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { tabCounts, type TabPaneInfo } from "../src/tabcounts.ts";
 
-const p = (kind: TabPaneInfo["kind"], live = true): TabPaneInfo => ({ kind, live });
+const p = (kind: TabPaneInfo["kind"], live = true, connectedChannel: string | null = null): TabPaneInfo => ({
+  kind,
+  live,
+  connectedChannel,
+});
 
 test("counts only LIVE agent panes — terminals and welcome/dormant panes add nothing", () => {
   const c = tabCounts([p("agent"), p("agent"), p("terminal"), p("agent", false)], false);
@@ -29,6 +33,7 @@ test("a tab of nothing but file explorers reports no agents and no orch markers"
     agents: 0,
     liveOrch: false,
     dormantOrch: false,
+    connectedChannels: 0,
   });
 });
 
@@ -46,12 +51,13 @@ test("editor and git panes are NOT agents either — same rule, same reason (#21
     agents: 0,
     liveOrch: false,
     dormantOrch: false,
+    connectedChannels: 0,
   });
 });
 
 test("an empty tab (only a welcome pane) counts zero and shows no markers", () => {
   const c = tabCounts([p("terminal", false)], false);
-  assert.deepEqual(c, { agents: 0, liveOrch: false, dormantOrch: false });
+  assert.deepEqual(c, { agents: 0, liveOrch: false, dormantOrch: false, connectedChannels: 0 });
 });
 
 test("live orchestration panes count as agents AND flag the live-orch icon", () => {
@@ -93,4 +99,31 @@ test("a plain (no group) tab of agents never shows an orch marker", () => {
   assert.equal(c.agents, 2);
   assert.equal(c.liveOrch, false);
   assert.equal(c.dormantOrch, false);
+});
+
+// ---------- cross-workspace channels (#271): the tab-strip dot ----------
+
+test("a tab with no connected panes reports zero connected channels", () => {
+  const c = tabCounts([p("agent"), p("orch")], true);
+  assert.equal(c.connectedChannels, 0);
+});
+
+test("one connected pane counts as one channel", () => {
+  const c = tabCounts([p("agent", true, "chan-1"), p("terminal")], false);
+  assert.equal(c.connectedChannels, 1);
+});
+
+test("two panes in the SAME channel still count as one — distinct channels, not connected panes", () => {
+  const c = tabCounts([p("agent", true, "chan-1"), p("orch", true, "chan-1")], true);
+  assert.equal(c.connectedChannels, 1);
+});
+
+test("panes in two DIFFERENT channels count as two — the multi-channel case the dot exists for", () => {
+  const c = tabCounts([p("agent", true, "chan-1"), p("agent", true, "chan-2")], false);
+  assert.equal(c.connectedChannels, 2);
+});
+
+test("a content/terminal pane's connectedChannel (always null) never inflates the count", () => {
+  const c = tabCounts([p("files"), p("editor"), p("git"), p("terminal")], false);
+  assert.equal(c.connectedChannels, 0);
 });
