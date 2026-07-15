@@ -3803,7 +3803,11 @@ pub enum HumanInput {
     /// The line was submitted (Enter) or explicitly cleared — the box is empty.
     Submit,
     /// Navigation/editing that neither adds visible text nor submits (arrows,
-    /// backspace, bare escape sequences) — box occupancy is unchanged.
+    /// backspace, bare escape sequences) — box occupancy is unchanged **by
+    /// this coarse read**. Backspace/DEL does in fact remove a character;
+    /// `box_occupancy_delta` (#171) is the finer-grained sibling that tracks
+    /// that, for callers that need to notice a typed line getting backspaced
+    /// all the way back out rather than submitted.
     Neutral,
 }
 
@@ -3826,10 +3830,15 @@ pub enum HumanInput {
 /// - Otherwise (arrows, backspace, lone escape sequences) → `Neutral`.
 ///
 /// Erring toward `Content`/`Neutral` on ambiguous input keeps the guard biased
-/// to the safe hold: a real sitting line is never misread as empty. Residual
-/// clears that leave the flag stuck (bounded by the 60s abort) — Esc-to-clear,
-/// Ctrl-W/Ctrl-K, backspace-to-empty, and soft-newline editors — need true
-/// box-occupancy detection, which is issue #112.
+/// to the safe hold: a real sitting line is never misread as empty. This
+/// three-way read alone can't recognize a line that was typed and then fully
+/// backspaced back out (every backspace reads as `Neutral`, individually
+/// indistinguishable from an arrow key) — that was issue #171: the box read
+/// as occupied forever, holding every subsequent delivery until the 60s abort.
+/// `write_pty` closes that gap by pairing this call with `box_occupancy_delta`,
+/// which *does* count backspace/DEL as a removal. Other residual clears that
+/// leave the flag stuck — Esc-to-clear, Ctrl-W/Ctrl-K, and soft-newline
+/// editors — still need true box-occupancy detection and remain open.
 pub fn classify_human_input(data: &str) -> HumanInput {
     // Bracketed paste: the text lands in the box unsubmitted regardless of any
     // newline it contains, so never read it as a submit.
@@ -3859,8 +3868,8 @@ pub fn classify_human_input(data: &str) -> HumanInput {
 const BRACKETED_PASTE_START: &str = "\u{1b}[200~";
 const BRACKETED_PASTE_END: &str = "\u{1b}[201~";
 
-/// Whether `s` contains a graphic character once terminal escape sequences are
-/// skipped — the test for "this write put visible text in the box". Skips CSI
+/// Shared walk over a human write, skipping terminal escape sequences, that
+/// backs both `input_has_printable` and `box_occupancy_delta`. Skips CSI
 /// (`ESC [ … final`, e.g. arrow keys, bracketed-paste markers) AND the string
 /// sequences a terminal emits in *reply* to a program's query — OSC (`ESC ]`)
 /// and DCS/SOS/PM/APC (`ESC P`/`X`/`^`/`_`) — plus other short `ESC`-led
@@ -3874,9 +3883,18 @@ const BRACKETED_PASTE_END: &str = "\u{1b}[201~";
 /// wedging `input_pending` true and stalling the fresh-copilot kickoff paste in
 /// the #111 box-clear hold (up to its 60s abort) — the "prompt never delivered"
 /// symptom. Claude Code issues no such query, so only copilot tripped it.
-fn input_has_printable(s: &str) -> bool {
+///
+/// Returns `(has_printable, occupancy_delta)`: the first is "did this write
+/// put visible text in the box at all" (`input_has_printable`'s job); the
+/// second is the signed change to box occupancy — printable bytes add one,
+/// backspace/DEL (`\x08`/`\x7f`) removes one (#171) — that
+/// `box_occupancy_delta` exposes so a run of backspaces emptying a typed line
+/// is recognized even though no single write in the run looks like a submit.
+fn scan_box_units(s: &str) -> (bool, i32) {
     let b = s.as_bytes();
     let mut i = 0;
+    let mut printable = false;
+    let mut delta: i32 = 0;
     while i < b.len() {
         if b[i] == 0x1b {
             i += 1;
@@ -3914,13 +3932,47 @@ fn input_has_printable(s: &str) -> bool {
             }
             continue;
         }
+        // Backspace / DEL: one character removed from the box (#171).
+        if b[i] == 0x08 || b[i] == 0x7f {
+            delta -= 1;
+            i += 1;
+            continue;
+        }
         // Printable ASCII (space..~) or any UTF-8 multibyte lead/continuation.
         if (0x20..0x7f).contains(&b[i]) || b[i] >= 0x80 {
-            return true;
+            printable = true;
+            delta += 1;
+            i += 1;
+            continue;
         }
-        i += 1; // C0 control (tab, backspace/DEL handled below, etc.)
+        i += 1; // other C0 control (tab, etc.)
     }
-    false
+    (printable, delta)
+}
+
+/// Whether `s` contains a graphic character once terminal escape sequences are
+/// skipped — the test for "this write put visible text in the box". See
+/// `scan_box_units` for what's skipped and why.
+fn input_has_printable(s: &str) -> bool {
+    scan_box_units(s).0
+}
+
+/// The signed change to box occupancy from a single human write: `+1` per
+/// printable/graphic unit, `-1` per backspace/DEL, `0` for anything else
+/// (arrows, bare escape sequences, an OSC/DCS query-reply echo — #179). Used
+/// alongside `classify_human_input` to track real occupancy rather than a
+/// bare pending/not flag: `write_pty` applies this to a running per-pane
+/// counter (clamped at zero) so a typed line that gets fully backspaced out
+/// reads back to empty even though no single write in the run looks like a
+/// submit (#171) — `classify_human_input`'s `Submit` still resets the
+/// counter directly to zero, which is exact where it applies (Enter,
+/// Ctrl-U, Ctrl-C).
+///
+/// Only backspace/DEL is counted as removal: Ctrl-W (delete word), Ctrl-K
+/// (kill to end) and Esc-to-clear editors still net `0` here — full
+/// box-occupancy tracking for those remains open (see `classify_human_input`).
+pub fn box_occupancy_delta(s: &str) -> i32 {
+    scan_box_units(s).1
 }
 
 /// One tick of the pre-paste human-input hold (#111): given whether a human's

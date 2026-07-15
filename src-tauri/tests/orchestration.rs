@@ -10,7 +10,7 @@ use loomux_lib::orchestration::mcp::dispatch;
 use loomux_lib::orchestration::notify;
 use loomux_lib::orchestration::workflow;
 use loomux_lib::orchestration::{
-    add_trusted_folder, autonomy_budget_exhausted, bracketed_paste, classify_human_input,
+    add_trusted_folder, autonomy_budget_exhausted, bracketed_paste, box_occupancy_delta, classify_human_input,
     claude_permission_mode, cli_ready, copilot_autopilot_prompt_detected, create_orchestration_group,
     gh_gate_decision, gh_is_merge_invocation, gh_positionals, gh_release_action, gh_repo_flag,
     gh_shim_sh, git_shim_sh, git_tag_push, grant_segment, grant_unexpired, hold_for_human_input,
@@ -7212,6 +7212,84 @@ fn sub_floor_submit_does_not_wedge_future_deliveries() {
     // The flag those submits leave (false) drives an immediate paste — no wedge.
     let out = hold_for_human_input(|| false, Duration::from_secs(60), HB_POLL);
     assert_eq!(out, PasteDecision::Paste { held_ms: 0 });
+}
+
+#[test]
+fn box_occupancy_delta_counts_typed_characters_and_backspaces() {
+    // #171: the counter half of occupancy tracking. Printable content adds,
+    // backspace/DEL removes, everything else nets zero.
+    assert_eq!(box_occupancy_delta("a"), 1);
+    assert_eq!(box_occupancy_delta("hello"), 5);
+    assert_eq!(box_occupancy_delta("\u{7f}"), -1, "DEL removes one character");
+    assert_eq!(box_occupancy_delta("\u{08}"), -1, "BS removes one character too");
+    assert_eq!(box_occupancy_delta("\u{7f}\u{7f}\u{7f}"), -3, "three backspaces in one write");
+    // Arrows and other CSI sequences are pure navigation — no occupancy change.
+    assert_eq!(box_occupancy_delta("\u{1b}[C"), 0); // right arrow
+    assert_eq!(box_occupancy_delta("\u{1b}[A"), 0); // up arrow
+    assert_eq!(box_occupancy_delta(""), 0);
+    // A bracketed paste's markers are CSI-shaped and skipped; only the pasted
+    // text itself counts.
+    assert_eq!(box_occupancy_delta("\u{1b}[200~hi\u{1b}[201~"), 2);
+
+    // #179 regression guard: a terminal query-reply echo must never read as a
+    // removal OR an addition, exactly like it must never read as Content.
+    assert_eq!(box_occupancy_delta("\x1b]11;rgb:0d0d/1111/1717\x07"), 0);
+    assert_eq!(box_occupancy_delta("\x1bP>|xterm(370)\x1b\\"), 0);
+}
+
+#[test]
+fn backspacing_a_typed_line_all_the_way_out_reads_the_box_as_empty_again() {
+    // #171: the incident this issue reports — start typing, backspace back out,
+    // and (before this fix) `input_pending` stayed stuck true because every
+    // individual backspace classified as `Neutral`, indistinguishable from an
+    // arrow key. A subsequent delivery then held for the full 60s and aborted
+    // instead of pasting into a pane whose box was, in fact, empty — "blocks
+    // the loomux prompts" from the human's report.
+    //
+    // This models write_pty's fixed logic exactly (pty.rs): `Submit` resets the
+    // counter to zero directly; everything else applies `box_occupancy_delta`,
+    // clamped at zero. `xterm.js` delivers one write per keystroke, so three
+    // typed characters and three backspaces arrive as six separate writes.
+    use std::sync::atomic::Ordering;
+    let counter = std::sync::atomic::AtomicI64::new(0);
+    let feed = |data: &str| {
+        match classify_human_input(data) {
+            HumanInput::Submit => counter.store(0, Ordering::Relaxed),
+            HumanInput::Content | HumanInput::Neutral => {
+                let delta = box_occupancy_delta(data);
+                if delta != 0 {
+                    let cur = counter.load(Ordering::Relaxed);
+                    counter.store((cur + delta as i64).max(0), Ordering::Relaxed);
+                }
+            }
+        }
+    };
+    let pending = || counter.load(Ordering::Relaxed) > 0;
+
+    // Human starts typing "abc" — box occupied.
+    feed("a");
+    feed("b");
+    feed("c");
+    assert!(pending(), "typed content must occupy the box");
+    // ...then backspaces it all out, one keystroke at a time.
+    feed("\u{7f}");
+    feed("\u{7f}");
+    assert!(pending(), "two of three characters backspaced — still occupied");
+    feed("\u{7f}");
+    assert!(!pending(), "the box is empty again once every typed character is backspaced out");
+
+    // A delivery landing right after must paste immediately, not hold for 60s.
+    let out = hold_for_human_input(pending, Duration::from_secs(60), HB_POLL);
+    assert_eq!(out, PasteDecision::Paste { held_ms: 0 });
+
+    // Over-backspacing an already-empty box must never go negative and get
+    // "stuck occupied" on the next keystroke because of a lingering negative
+    // counter absorbing it.
+    feed("\u{7f}");
+    feed("\u{7f}");
+    assert!(!pending(), "backspacing past empty must clamp at zero, not go negative");
+    feed("x");
+    assert!(pending(), "a fresh keystroke after clamped-empty occupies the box normally");
 }
 
 // ---------- #133: atomic durable writes ----------
