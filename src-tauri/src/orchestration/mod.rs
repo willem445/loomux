@@ -1577,6 +1577,17 @@ pub struct Guardrails {
     /// `set_idle_activity_floor` so a chattier CLI whose idle repaints exceed the
     /// default has a runtime remedy (rev-59). See `idle_output_is_activity`.
     pub idle_activity_floor_bytes: u64,
+    /// Resource-guard slot count overrides, keyed by class name (#318). The
+    /// repo's `.loomux/workflow.yml` `resources:` block says WHAT to guard and
+    /// requests a slot count via `max:`; this is the machine/group side of HOW
+    /// MANY — an 8-core laptop and a 32-core workstation want different
+    /// answers, and a repo file (untrusted, PR-authored) must never be able to
+    /// raise the count a human configured for their own machine. A class name
+    /// absent from this map simply keeps the repo's own `max:` — see
+    /// [`workflow::effective_slots`], the merge this map feeds. Persisted in
+    /// group.json under `guardrails.resource_guard_limits`; clamped in
+    /// [`clamped`](Self::clamped).
+    pub resource_guard_limits: BTreeMap<String, u32>,
 }
 
 impl Guardrails {
@@ -1650,6 +1661,11 @@ impl Guardrails {
         self.idle_kill_minutes = self.idle_kill_minutes.min(MAX_IDLE_KILL_MINUTES);
         self.max_spawns_per_hour = self.max_spawns_per_hour.min(MAX_SPAWNS_PER_HOUR);
         self.watchdog_stall_minutes = self.watchdog_stall_minutes.min(MAX_WATCHDOG_STALL_MINUTES);
+        // #318: same ceiling a repo's own `max:` is held to (`MAX_RESOURCE_GUARD_SLOTS`)
+        // — a machine override is not a loophole around the same sanity bound.
+        for n in self.resource_guard_limits.values_mut() {
+            *n = (*n).clamp(1, workflow::MAX_RESOURCE_GUARD_SLOTS);
+        }
         // 0 = unset → default (not "off"); then floor at 1 so ticking never
         // silently stops while autonomous — the marker is the on/off switch.
         if self.idle_tick_minutes == 0 {
@@ -2606,6 +2622,23 @@ fn blocks_json(blocks: &[workflow::Block]) -> Value {
             })
             .collect(),
     )
+}
+
+/// Read `guardrails.resource_guard_limits` out of a group.json object (#318).
+/// A hand-edited group.json is untrusted the same way a workflow file is, so
+/// each key is re-sanitized with [`workflow::sanitize_id`] rather than trusted
+/// verbatim; an unusable key is dropped (degrade, not deny — same direction as
+/// [`workflow::parse_resource_guard_file`]). Absent → empty map, the "no
+/// override, use the repo's own max" default.
+fn read_resource_guard_limits(g: &Value) -> BTreeMap<String, u32> {
+    g["resource_guard_limits"]
+        .as_object()
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| Some((workflow::sanitize_id(k)?, v.as_u64()? as u32)))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 #[derive(Clone)]
@@ -5364,6 +5397,9 @@ impl OrchRegistry {
                 idle_tick_minutes: g["idle_tick_minutes"].as_u64().unwrap_or(0) as u32,
                 // Idle-tick activity floor (#83): absent → 0 → clamped() → default.
                 idle_activity_floor_bytes: g["idle_activity_floor_bytes"].as_u64().unwrap_or(0),
+                // #318: absent (older group.json, or nobody has set an override
+                // yet) → empty map → every class runs at the repo's own `max:`.
+                resource_guard_limits: read_resource_guard_limits(g),
             },
         ))
     }
@@ -5503,6 +5539,7 @@ impl OrchRegistry {
                         "name": wf.name,
                         "blocks": wf.blocks.iter().map(|b| json!({ "id": b.id, "kind": b.kind })).collect::<Vec<_>>(),
                         "gates": wf.gates.keys().collect::<Vec<_>>(),
+                        "resource_classes": wf.resources.iter().map(|c| &c.name).collect::<Vec<_>>(),
                         "min_agents": capacity_rec.minimum,
                         "recommended_agents": capacity_rec.recommended,
                         "reviewers_needed": capacity_rec.reviewers_needed,
@@ -5512,6 +5549,12 @@ impl OrchRegistry {
                     // none, is cleared, so removing a gate from the workflow really
                     // removes it.
                     self.sync_merge_gate(&id, wf.gates.get("merge"));
+                    // #318: same trigger, same fresh-launch/advanced-orchestrator
+                    // gating — the repo's `resources:` becomes the compiled
+                    // `resource_guards` spec file. `guardrails.resource_guard_limits`
+                    // is the group/machine override map a repo's own `max:` may only
+                    // be lowered by, never raised past.
+                    self.sync_resource_guards(&id, &wf.resources, &guardrails.resource_guard_limits);
                     // `merge` is the only gate loomux enforces. A gate under any other
                     // name parses (the schema is open) but does nothing — say so, rather
                     // than letting a `gates: { deploy: … }` clause look enforced.
@@ -5529,10 +5572,13 @@ impl OrchRegistry {
                     guardrails = guardrails.clamped();
                     capacity = Some(capacity_rec);
                 }
-                // No workflow file: no gate. Clears a stale one from a previous
-                // launch, so deleting `.loomux/workflow.yml` restores the pre-#222
-                // flow exactly.
-                Ok(None) => self.sync_merge_gate(&id, None),
+                // No workflow file: no gate, no resource guards. Clears any stale
+                // ones from a previous launch, so deleting `.loomux/workflow.yml`
+                // restores the pre-#222/pre-#318 flow exactly.
+                Ok(None) => {
+                    self.sync_merge_gate(&id, None);
+                    self.sync_resource_guards(&id, &[], &guardrails.resource_guard_limits);
+                }
                 Err(errors) => {
                     self.audit(&id, "loomux", "workflow-invalid", json!({
                         "path": workflow::WORKFLOW_PATH,
@@ -5552,6 +5598,15 @@ impl OrchRegistry {
                             "reason": "the workflow file is invalid — keeping the last known merge gate rather than failing open",
                         }));
                     }
+                    // #318: same call pattern — a syntax error is not evidence the
+                    // human wants the resource guard gone either, so an existing
+                    // `resource_guards` file is likewise left untouched (not
+                    // re-synced) rather than cleared.
+                    if self.resource_guard_path(&id).is_file() {
+                        self.audit(&id, "loomux", "resource-guards-retained", json!({
+                            "reason": "the workflow file is invalid — keeping the last known resource guards rather than clearing them",
+                        }));
+                    }
                 }
             }
         } else if guardrails.advanced_orchestrator {
@@ -5567,6 +5622,11 @@ impl OrchRegistry {
             // the clause entirely) — and re-reading the file is precisely how that
             // would happen. The gate file written at launch stands; the drift audit
             // tells the human the repo has moved on.
+            //
+            // #318: resource guards are pinned the same way, for a sturdier reason
+            // than consent — a slot pool's shape (class names, count) must not
+            // change out from under agents that may be holding a slot in it right
+            // now. `sync_resource_guards` is simply never called on this branch.
             self.audit_workflow_drift(&id, repo, &guardrails);
             // #255 (rev-1 B2 / rev-2 non-blocking #1): the roster and gate are
             // PINNED on a resume, not re-read — but they still describe a real
@@ -5596,6 +5656,9 @@ impl OrchRegistry {
             // stops a gate declared under an earlier advanced launch of this same
             // group dir from outliving the toggle that authorized it.
             self.sync_merge_gate(&id, None);
+            // #318: same rule for resource guards — a workflow file a human never
+            // opted into must not throttle anything either.
+            self.sync_resource_guards(&id, &[], &guardrails.resource_guard_limits);
             if workflow::workflow_file_exists(repo) {
                 // The repo declares a workflow and this group is deliberately not
                 // running it. Say so in the trail: "my workflow file did nothing" is
@@ -5675,6 +5738,10 @@ impl OrchRegistry {
                 "autonomy_budget_tokens": info.guardrails.autonomy_budget_tokens,
                 "idle_tick_minutes": info.guardrails.idle_tick_minutes,
                 "idle_activity_floor_bytes": info.guardrails.idle_activity_floor_bytes,
+                // #318: machine/group overrides for resource-guard slot counts.
+                // Absent from an older group.json → empty map on read, which is
+                // exactly what that group was: every class at the repo's own max.
+                "resource_guard_limits": info.guardrails.resource_guard_limits,
             },
         }))
         .unwrap();
@@ -9689,6 +9756,65 @@ impl OrchRegistry {
         }
     }
 
+    // ---------- resource guards (#318) ----------
+
+    /// The group-dir spec file a resource-guard shim will read (sub-PR 2) to
+    /// throttle a guarded command class. Absent = no declared guards — see
+    /// [`workflow::RESOURCE_GUARD_FILE`].
+    fn resource_guard_path(&self, group: &str) -> PathBuf {
+        self.group_dir(group).join(workflow::RESOURCE_GUARD_FILE)
+    }
+
+    /// The group's compiled resource guards, or an empty `Vec` if the repo
+    /// declared none **or the file is unusable** — unlike the merge gate, there
+    /// is no third state to distinguish here: a resource guard that cannot be
+    /// read guards nothing, which is the same safe direction an absent file
+    /// already means (restrict-only — see [`workflow::parse_resource_guard_file`]).
+    pub fn resource_guards(&self, group: &str) -> Vec<workflow::ResourceClass> {
+        fs::read_to_string(self.resource_guard_path(group))
+            .map(|text| workflow::parse_resource_guard_file(&text))
+            .unwrap_or_default()
+    }
+
+    /// Bring the group's `resource_guards` file in line with the repo's
+    /// workflow file, called on every group create/resume alongside
+    /// [`sync_merge_gate`](Self::sync_merge_gate) — same trigger, same
+    /// advanced-orchestrator/fresh-launch gating at the call site, same
+    /// "a broken workflow file retains the last known state" rule. The
+    /// difference from the merge gate is only in which direction a corrupt or
+    /// cleared file is safe: an empty `classes` **removes** the file (no
+    /// guards is always safe for a restrict-only mechanism), and there is no
+    /// "retain because dropping would widen access" case to distinguish,
+    /// though the call site still leaves an existing file alone on a workflow
+    /// parse error, matching the gate for consistency.
+    fn sync_resource_guards(
+        &self,
+        group: &str,
+        classes: &[workflow::ResourceClass],
+        overrides: &BTreeMap<String, u32>,
+    ) {
+        let path = self.resource_guard_path(group);
+        if classes.is_empty() {
+            if path.is_file() && remove_marker(&path).is_ok() {
+                self.audit(group, "loomux", "resource-guards-cleared",
+                    json!({ "reason": "the repo's workflow declares no resources.concurrency" }));
+            }
+            return;
+        }
+        let text = workflow::resource_guard_file_text(classes, overrides);
+        if atomic_write(&path, text.as_bytes()).is_ok() {
+            self.audit(group, "loomux", "resource-guards-declared", json!({
+                "classes": classes.iter().map(|c| json!({
+                    "name": c.name,
+                    "max": c.max,
+                    "effective_slots": workflow::effective_slots(c, overrides),
+                    "timeout_minutes": c.timeout_minutes,
+                    "commands": c.commands.len(),
+                })).collect::<Vec<_>>(),
+            }));
+        }
+    }
+
     /// Where this group's recorded verdicts for one PR live: one file per reviewer
     /// block (`verdicts/pr-<N>/<block-id>`). Both segments are loomux-generated —
     /// `pr` is a parsed number and a block id is sanitized to `[A-Za-z0-9_-]` — so
@@ -11987,6 +12113,10 @@ pub fn create_orchestration(
             // #83: 0 → clamped() applies DEFAULT_IDLE_ACTIVITY_FLOOR_BYTES; live-settable
             // via orch_set_idle_activity_floor.
             idle_activity_floor_bytes: 0,
+            // #318: no per-class override at launch — every guarded class runs at
+            // the repo's own `max:` until a launcher knob exists to set these
+            // (follow-up; config-file-only for now).
+            resource_guard_limits: BTreeMap::new(),
         },
         None,
         None,

@@ -50,6 +50,19 @@
 //! write access, so it is a hard validation error that drops the file. (The
 //! pre-#222 code did exactly that coercion in two places; both are gone.)
 //!
+//! # Resource guards (#318)
+//!
+//! `resources:` is a **different kind of thing** from `blocks`/`edges`/`gates`
+//! and deliberately sits outside the capability-closure rule above: it can
+//! only ever *delay* a command, never grant one. A repo names command
+//! patterns it wants throttled (`cargo build`, `npm run build`, …) and how
+//! many may run at once are willing to share a slot pool (the `class`); the
+//! *count* of slots is a machine/group guardrail (mirroring `max_agents`),
+//! never something the repo file itself can raise — see
+//! `Guardrails::resource_guard_limits`. Parsed and validated here; compiled
+//! into the `resource_guards` spec file a PATH shim reads (sub-PR 2, #318)
+//! the same way `gates.merge` becomes [`MERGE_GATE_FILE`].
+//!
 //! # Schema
 //!
 //! ```yaml
@@ -79,6 +92,15 @@
 //!   merge:
 //!     require: all-pass    # or: threshold: 2
 //!     reviewers: [rev-security]
+//!
+//! resources:                # RESTRICT-ONLY (#318) — see above. Optional.
+//!   concurrency:
+//!     - class: heavy-build   # a semaphore name; every command below shares its pool
+//!       max: 2               # requested slot count — a group guardrail may only LOWER this
+//!       timeout_minutes: 30  # after this a queued command runs anyway (fail-open)
+//!       commands:
+//!         - { program: cargo, args: [build] }  # leading positional args; flags ignored
+//!         - { program: cargo, args: [test] }
 //! ```
 //!
 //! `id` is immutable and human-meaningful and `name` is display-only on
@@ -210,6 +232,33 @@ pub struct Gate {
     pub also: Vec<String>,
 }
 
+/// One guarded command pattern inside a [`ResourceClass`]: a program name and
+/// the leading positional arguments that must prefix-match an invocation's own
+/// positionals (flags skipped) for it to count — see [`guard_class_for`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GuardCommand {
+    pub program: String,
+    pub args: Vec<String>,
+}
+
+/// A named resource-guard semaphore: **RESTRICT-ONLY** (#318, see the module
+/// doc). `commands` sharing one `class` contend for the same `max` slots — the
+/// CPU a `cargo build` and a `cargo test` compete for is one resource, not two.
+/// `max` is what the repo *requests*; the slot count a shim actually enforces
+/// is `effective_slots`, which a group/machine guardrail may only lower, never
+/// raise (`Guardrails::resource_guard_limits`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResourceClass {
+    pub name: String,
+    pub max: u32,
+    /// Minutes a queued command waits before it runs anyway. A resource guard
+    /// is a throughput optimization, not a security boundary — progress beats
+    /// deadlock, so this fails OPEN (see `sync_resource_guards`'s shim-side
+    /// counterpart in #318 sub-PR 2), unlike a merge gate's fail-closed.
+    pub timeout_minutes: u32,
+    pub commands: Vec<GuardCommand>,
+}
+
 /// A parsed, validated workflow.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Workflow {
@@ -225,6 +274,10 @@ pub struct Workflow {
     pub blocks: Vec<Block>,
     pub edges: Vec<Edge>,
     pub gates: BTreeMap<String, Gate>,
+    /// `resources:` (#318) — see the module doc's *Resource guards* section.
+    /// Deliberately outside the capability-closure rule: every entry here can
+    /// only delay a command, never grant one.
+    pub resources: Vec<ResourceClass>,
 }
 
 impl Workflow {
@@ -276,6 +329,22 @@ pub fn builtin_roster(agent_cli: &str) -> Vec<Block> {
 /// Longest block id. It becomes a file name (`<id>.md`) and an agent-id suffix,
 /// and nothing legible needs more.
 pub const MAX_ID_CHARS: usize = 48;
+
+/// Hard ceiling on a resource-guard class's slot count, repo- OR
+/// machine-declared (#318). Keeps a typo'd `max: 999999` from becoming an
+/// unbounded semaphore; `MAX_AGENTS_CEILING`'s `12` is the precedent this
+/// mirrors, sized a bit looser since a guard slot is far cheaper than a whole
+/// agent.
+pub const MAX_RESOURCE_GUARD_SLOTS: u32 = 32;
+
+/// `timeout_minutes:` default when a class omits it — long enough that a
+/// legitimately busy pool rarely trips it, short enough that a stuck queue
+/// resolves within a working session.
+pub const DEFAULT_RESOURCE_GUARD_TIMEOUT_MINUTES: u32 = 30;
+
+/// Hard ceiling on `timeout_minutes:`. A guard that can wait "forever" before
+/// fail-opening is not a guard a repo can reason about.
+pub const MAX_RESOURCE_GUARD_TIMEOUT_MINUTES: u32 = 24 * 60;
 
 /// Block ids reach the shell (a `--agent <id>` flag, a `--agents` JSON key) and
 /// the filesystem (`<id>.md` in the group dir). Keep them to a conservative
@@ -448,6 +517,12 @@ struct RawWorkflow {
     edges: Vec<RawEdge>,
     #[serde(default)]
     gates: BTreeMap<String, RawGate>,
+    /// `resources:` (#318). Optional; lives in the same file as `blocks`/`gates`
+    /// so it inherits the same advanced-orchestrator-toggle gating at the
+    /// `create_group_ex` call site — a repo file a human never opted into must
+    /// not throttle anything, same as it must not grant anything.
+    #[serde(default)]
+    resources: RawResources,
 }
 
 #[derive(Deserialize)]
@@ -487,6 +562,37 @@ struct RawGate {
     reviewers: Vec<String>,
     #[serde(default)]
     also: Vec<String>,
+}
+
+/// Wire form of the whole `resources:` block (#318). A struct (not a bare
+/// `Vec`) even though it has one field today, matching `gates:`'s shape —
+/// leaves room for a future sibling key (`resources.disk:`, say) without
+/// breaking every existing file's indentation.
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RawResources {
+    #[serde(default)]
+    concurrency: Vec<RawConcurrencyClass>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawConcurrencyClass {
+    class: String,
+    #[serde(default)]
+    max: Option<u32>,
+    #[serde(default)]
+    timeout_minutes: Option<u32>,
+    #[serde(default)]
+    commands: Vec<RawGuardCommand>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawGuardCommand {
+    program: String,
+    #[serde(default)]
+    args: Vec<String>,
 }
 
 /// `to: worker` and `to: [rev-a, rev-b]` are both legal — a fan-out reads
@@ -843,6 +949,108 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
         );
     }
 
+    // `resources:` (#318) — see the module doc's *Resource guards* section.
+    // RESTRICT-ONLY: nothing validated here ever widens what a block may do, so
+    // this loop deliberately does not touch `blocks`/`known`/the capability
+    // checks above it. Same shape as the `gates` loop: every problem is
+    // collected, a bad item is skipped (`continue`) rather than aborting the
+    // whole pass, and every string token is sanitized with reject-not-rewrite
+    // semantics before it can reach the shell-word-split spec file
+    // (`resource_guard_file_text`).
+    let mut resources: Vec<ResourceClass> = Vec::new();
+    let mut seen_classes: BTreeSet<String> = BTreeSet::new();
+    for (i, rc) in raw.resources.concurrency.iter().enumerate() {
+        let Some(name) = sanitize_id(&rc.class) else {
+            errs.push(format!(
+                "resources.concurrency[{i}]: class {:?} has no usable characters (allowed: letters, digits, '-', '_')",
+                rc.class
+            ));
+            continue;
+        };
+        if name != rc.class.trim() {
+            errs.push(format!(
+                "resources.concurrency[{i}]: class {:?} contains characters that are not allowed (letters, digits, '-', '_')",
+                rc.class
+            ));
+            continue;
+        }
+        if !seen_classes.insert(name.clone()) {
+            errs.push(format!("resources.concurrency[{i}]: duplicate class {name:?}"));
+            continue;
+        }
+        let max = match rc.max {
+            Some(n) if (1..=MAX_RESOURCE_GUARD_SLOTS).contains(&n) => n,
+            Some(n) => {
+                errs.push(format!(
+                    "resources.concurrency[{i}] ({name}): max {n} must be between 1 and {MAX_RESOURCE_GUARD_SLOTS}"
+                ));
+                continue;
+            }
+            None => {
+                errs.push(format!("resources.concurrency[{i}] ({name}): max is required"));
+                continue;
+            }
+        };
+        let timeout_minutes = match rc.timeout_minutes {
+            Some(n) if (1..=MAX_RESOURCE_GUARD_TIMEOUT_MINUTES).contains(&n) => n,
+            Some(n) => {
+                errs.push(format!(
+                    "resources.concurrency[{i}] ({name}): timeout_minutes {n} must be between 1 and {MAX_RESOURCE_GUARD_TIMEOUT_MINUTES}"
+                ));
+                continue;
+            }
+            None => DEFAULT_RESOURCE_GUARD_TIMEOUT_MINUTES,
+        };
+        let mut bad = false;
+        let mut commands: Vec<GuardCommand> = Vec::new();
+        for (j, rcmd) in rc.commands.iter().enumerate() {
+            let Some(program) = sanitize_id(&rcmd.program) else {
+                errs.push(format!(
+                    "resources.concurrency[{i}] ({name}).commands[{j}]: program {:?} has no usable characters (allowed: letters, digits, '-', '_')",
+                    rcmd.program
+                ));
+                bad = true;
+                continue;
+            };
+            if program != rcmd.program.trim() {
+                errs.push(format!(
+                    "resources.concurrency[{i}] ({name}).commands[{j}]: program {:?} contains characters that are not allowed (letters, digits, '-', '_')",
+                    rcmd.program
+                ));
+                bad = true;
+                continue;
+            }
+            let mut args: Vec<String> = Vec::new();
+            let mut arg_bad = false;
+            for (k, a) in rcmd.args.iter().enumerate() {
+                match sanitize_id(a) {
+                    Some(clean) if clean == a.trim() => args.push(clean),
+                    _ => {
+                        errs.push(format!(
+                            "resources.concurrency[{i}] ({name}).commands[{j}].args[{k}]: {a:?} is not a usable token (allowed: letters, digits, '-', '_')"
+                        ));
+                        arg_bad = true;
+                    }
+                }
+            }
+            if arg_bad {
+                bad = true;
+                continue;
+            }
+            commands.push(GuardCommand { program, args });
+        }
+        if rc.commands.is_empty() {
+            errs.push(format!(
+                "resources.concurrency[{i}] ({name}): no commands — a class with no commands guards nothing"
+            ));
+            bad = true;
+        }
+        if bad {
+            continue;
+        }
+        resources.push(ResourceClass { name, max, timeout_minutes, commands });
+    }
+
     if !errs.is_empty() {
         return Err(errs);
     }
@@ -853,6 +1061,7 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
         blocks,
         edges,
         gates,
+        resources,
     })
 }
 
@@ -1462,4 +1671,219 @@ pub fn parse_gate_file(text: &str) -> Option<Gate> {
         }
     }
     (!reviewers.is_empty()).then_some(Gate { require, reviewers, also })
+}
+
+// ── resource guards: matcher + spec file (#318) ────────────────────────────
+//
+// The shim that will hold/release slots (sub-PR 2) is a shell script that
+// cannot afford a YAML/JSON parser; it reads a compiled, line-oriented spec
+// file the same way the `gh` shim reads `MERGE_GATE_FILE`. `guard_class_for`
+// is the Rust mirror of the decision the shim's shell scanner makes, kept
+// pure and tested here so both sides can be pinned to agree — the same
+// contract `gh_positionals`/`gh_gate_decision` establish for the merge gate.
+
+/// Group-dir file holding the compiled resource guards, written from the
+/// repo's `.loomux/workflow.yml` at group create/resume. **Absent = no
+/// guards**, which is what makes a repo declaring no `resources:` block (or no
+/// workflow file at all) behave exactly as it did before #318 — there is no
+/// "restrict nothing" case to distinguish from "the file doesn't exist",
+/// unlike the merge gate's `merge_gate_declared`/`merge_gate` split.
+pub const RESOURCE_GUARD_FILE: &str = "resource_guards";
+
+/// Strip a directory prefix and a Windows executable extension so `program:
+/// cargo` matches an invocation of `C:\...\cargo.EXE` or `/usr/bin/cargo`
+/// equally — "paths to the same program" is a real edge case: a guard an agent
+/// can dodge by spelling out an absolute path is not much of a guard. This is
+/// the SAME honest limit the module doc states for `gh`/`git` shims: it raises
+/// the floor, it is not a sandbox (an absolute path still bypasses the PATH
+/// shim entirely — that half of the bypass is unfixable at this layer).
+fn program_basename(program: &str) -> String {
+    let base = program.rsplit(['/', '\\']).next().unwrap_or(program);
+    let lower = base.to_ascii_lowercase();
+    for ext in [".exe", ".cmd", ".bat", ".com"] {
+        if let Some(stripped) = lower.strip_suffix(ext) {
+            return stripped.to_string();
+        }
+    }
+    lower
+}
+
+/// Whether `argv` (a real invocation, excluding the program name itself)
+/// matches one of `classes`' guarded command patterns — the pure decision the
+/// shim's compiled shell mirror must agree with.
+///
+/// Matching semantics (per the module doc's schema comment): the program
+/// matches by [`program_basename`] (so a full path matches the same as a bare
+/// name), and a guard's `args` must be a PREFIX of the invocation's own
+/// *positional* tokens — anything starting with `-` is a flag and is skipped,
+/// never consumed as a positional, exactly like the generic `rest.iter()
+/// .filter(|t| !t.starts_with('-'))` scanner already used for a git push
+/// remote/refspec scan. Tokens are compared verbatim: this is argv (already
+/// shell-parsed by the OS), never a raw command line, so a literal quote
+/// character inside a token (`"build"` arriving as the 7-character string
+/// `"build"`, say, from a caller that mis-split its own input) is simply a
+/// token that does not equal `build` — there is no second, "unquoting" pass.
+pub fn guard_class_for<'a>(
+    classes: &'a [ResourceClass],
+    program: &str,
+    argv: &[String],
+) -> Option<&'a ResourceClass> {
+    // #318 TEMP STUB — deliberately inert for the test-red evidence commit
+    // (orchestrator request: prove the matcher tests fail for real, not just on
+    // a compile error). Reverted in the very next commit.
+    let _ = (classes, program, argv);
+    return None;
+    #[allow(unreachable_code)]
+    let want = program_basename(program);
+    let positionals: Vec<&str> =
+        argv.iter().map(String::as_str).filter(|t| !t.starts_with('-')).collect();
+    classes.iter().find(|class| {
+        class.commands.iter().any(|cmd| {
+            program_basename(&cmd.program) == want
+                && positionals.len() >= cmd.args.len()
+                && cmd.args.iter().zip(positionals.iter()).all(|(a, b)| a == b)
+        })
+    })
+}
+
+/// The slot count this build will actually enforce for `class`: the repo's
+/// requested `max`, capped by a group/machine override if the human set one
+/// for this class name. **A repo can only LOWER this, never raise it** — see
+/// `ResourceClass::max`'s doc and `Guardrails::resource_guard_limits`. No
+/// override for this class → the repo's own (already ceiling-clamped) `max`
+/// stands unchanged.
+pub fn effective_slots(class: &ResourceClass, overrides: &BTreeMap<String, u32>) -> u32 {
+    match overrides.get(&class.name) {
+        Some(&n) => class.max.min(n.max(1)),
+        None => class.max,
+    }
+}
+
+/// Serialize compiled resource guards for [`RESOURCE_GUARD_FILE`].
+///
+/// Line-oriented `key value...`, the same reason [`gate_file_text`] is: the
+/// reader is a POSIX `while read` loop with no parser. **Unlike the merge
+/// gate, an unrepresentable token DEGRADES rather than poisons.** The merge
+/// gate is a security spine that must fail closed on corruption (dropping a
+/// requirement would silently widen what an agent may merge); a resource
+/// guard is restrict-only — it throttles a command class, never grants
+/// anything — so the equivalent failure is "this class stops being guarded",
+/// which is a throughput regression, not a security one. A class or command
+/// whose tokens don't survive re-sanitization (belt-and-braces; `parse_workflow`
+/// already guarantees clean tokens reach here) is simply omitted, and a class
+/// left with zero usable commands is dropped entirely — it would guard
+/// nothing anyway.
+pub fn resource_guard_file_text(classes: &[ResourceClass], overrides: &BTreeMap<String, u32>) -> String {
+    let mut out = String::from(
+        "# loomux resource guard — generated from .loomux/workflow.yml (#318). Do not edit.\n",
+    );
+    for class in classes {
+        let Some(name) = sanitize_id(&class.name).filter(|c| *c == class.name) else { continue };
+        let mut command_lines: Vec<String> = Vec::new();
+        for cmd in &class.commands {
+            let Some(program) = sanitize_id(&cmd.program).filter(|p| *p == cmd.program) else { continue };
+            let mut arg_tokens: Vec<String> = Vec::with_capacity(cmd.args.len());
+            let mut ok = true;
+            for a in &cmd.args {
+                match sanitize_id(a).filter(|clean| clean == a) {
+                    Some(clean) => arg_tokens.push(clean),
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if !ok {
+                continue; // a bad arg drops the whole command — never a silently truncated prefix
+            }
+            let mut line = format!("command {name} {program}");
+            for a in &arg_tokens {
+                line.push(' ');
+                line.push_str(a);
+            }
+            line.push('\n');
+            command_lines.push(line);
+        }
+        if command_lines.is_empty() {
+            continue; // no usable commands — this class would guard nothing
+        }
+        let n = effective_slots(class, overrides);
+        out.push_str(&format!("class {name} {n} {}\n", class.timeout_minutes));
+        for line in command_lines {
+            out.push_str(&line);
+        }
+    }
+    out
+}
+
+/// Read [`RESOURCE_GUARD_FILE`] back into compiled [`ResourceClass`]es — the
+/// inverse of [`resource_guard_file_text`], used by the Rust side (reporting,
+/// tests); the shim does its own read, in shell.
+///
+/// **Degrade, not deny (see [`resource_guard_file_text`]).** An unrecognized
+/// line, an unparseable number, a `command` naming a class that was never
+/// declared — each is simply skipped rather than invalidating the whole file,
+/// and a class left with no usable commands is dropped. The worst a malformed
+/// file can do here is guard LESS than the repo declared, never more: the
+/// opposite failure direction from [`parse_gate_file`], because this file
+/// restricts rather than grants.
+pub fn parse_resource_guard_file(text: &str) -> Vec<ResourceClass> {
+    let mut classes: Vec<ResourceClass> = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let toks: Vec<&str> = line.split_whitespace().collect();
+        match toks.first().copied() {
+            Some("class") => {
+                if toks.len() != 4 {
+                    continue;
+                }
+                let Some(name) = sanitize_id(toks[1]) else { continue };
+                let Ok(max) = toks[2].parse::<u32>() else { continue };
+                if max < 1 {
+                    continue;
+                }
+                let Ok(timeout_minutes) = toks[3].parse::<u32>() else { continue };
+                if timeout_minutes < 1 {
+                    continue;
+                }
+                if classes.iter().any(|c| c.name == name) {
+                    continue; // duplicate declaration — keep the first, degrade the rest
+                }
+                classes.push(ResourceClass { name, max, timeout_minutes, commands: Vec::new() });
+            }
+            Some("command") => {
+                if toks.len() < 3 {
+                    continue;
+                }
+                let Some(class_name) = sanitize_id(toks[1]) else { continue };
+                let Some(program) = sanitize_id(toks[2]) else { continue };
+                let mut args: Vec<String> = Vec::new();
+                let mut ok = true;
+                for a in &toks[3..] {
+                    match sanitize_id(a) {
+                        Some(clean) => args.push(clean),
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if !ok {
+                    continue; // a bad token drops the whole command — never truncated
+                }
+                if let Some(class) = classes.iter_mut().find(|c| c.name == class_name) {
+                    class.commands.push(GuardCommand { program, args });
+                }
+                // A `command` naming an undeclared class is dropped silently: the
+                // spec file is generated, so this only happens on a corrupted or
+                // hand-edited file, and dropping is the safe (degrade) direction.
+            }
+            _ => continue,
+        }
+    }
+    classes.retain(|c| !c.commands.is_empty());
+    classes
 }
