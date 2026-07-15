@@ -193,33 +193,23 @@ loomux_block_release() { # $1=tag $2=action
   loomux_audit "release-gate-blocked" "{\"tag\":\"$1\",\"action\":\"$2\"}"
   exit 1
 }
-# Consume a one-time grant file: delete it (one use only) and return 0 iff it was
-# present AND unexpired (expiry = unix seconds on line 1). Expired grants are
-# cleaned up too. Reading is atomic on the writer side (see atomic_write).
-loomux_grant_ok() { # $1=grantfile
-  gf="$1"
-  [ -f "$gf" ] || return 1
-  exp=$(head -n1 "$gf" 2>/dev/null)
-  case "$exp" in ''|*[!0-9]*) exp=0 ;; esac
-  now=$(date +%s 2>/dev/null); [ -z "$now" ] && now=0
-  rm -f "$gf"
-  [ "$now" -lt "$exp" ]
-}
-# #256: CLAIM a one-time grant without spending it yet — the merge gate below
-# must consume the grant only when the gated `gh pr merge` actually SUCCEEDS
-# (live incident: a grant burned on a draft PR that GitHub refused to merge,
-# leaving the PR unmerged and the human having to re-Approve). An expired
-# grant is still deleted here (never usable, no reason to keep it around).
-# A live grant is instead handed off via `mv` to a `.claimed` sibling — a
-# RENAME, which POSIX guarantees atomic — so exactly one caller can ever win
-# it: two concurrent claimants both see the file present, but only one `mv`
-# succeeds (the loser's source is already gone, so its `mv` fails and it
-# falls through to `return 1`, same as "no grant"). Sets `_grant_claimed` to
-# the claimed path on success for the caller to finish (consume on success,
-# restore on failure) below. If the process dies between claiming and
-# resolving, the original grant file stays gone and the orphaned `.claimed`
-# file is never consulted again — a crash requires a fresh grant rather than
-# risking a second use, the failure mode #256 asks for.
+# #256/#303: CLAIM a one-time grant without spending it yet — a gated command
+# (merge OR release/tag publish) must consume its grant only when the real
+# `gh` call it authorizes actually SUCCEEDS (live incident: a merge grant
+# burned on a draft PR that GitHub refused to merge, leaving the PR unmerged
+# and the human having to re-Approve; #303 is the same bug class for release
+# grants). An expired grant is still deleted here (never usable, no reason to
+# keep it around). A live grant is instead handed off via `mv` to a
+# `.claimed` sibling — a RENAME, which POSIX guarantees atomic — so exactly
+# one caller can ever win it: two concurrent claimants both see the file
+# present, but only one `mv` succeeds (the loser's source is already gone, so
+# its `mv` fails and it falls through to `return 1`, same as "no grant").
+# Sets `_grant_claimed` to the claimed path on success; the caller runs the
+# real gh and finishes with `loomux_grant_settle` below (consume on success,
+# restore on failure). If the process dies between claiming and settling, the
+# original grant file stays gone and the orphaned `.claimed` file is never
+# consulted again — a crash requires a fresh grant rather than risking a
+# second use, the failure mode #256 asks for.
 loomux_grant_claim() { # $1=grantfile
   gf="$1"
   [ -f "$gf" ] || return 1
@@ -237,6 +227,18 @@ loomux_grant_claim() { # $1=grantfile
   fi
   return 1   # lost the race to another concurrent claimant
 }
+# Finish a claim made by loomux_grant_claim, once the real gh's exit status is
+# known: consume it (rm) on success, or restore it to the original grant path
+# on failure so a retry can still use it. Shared by the merge gate and the
+# release gate (#303) — one settle mechanism, not two copies. $1=original
+# grantfile $2=claimed file $3=the real gh's exit code.
+loomux_grant_settle() { # $1=grantfile $2=claimed $3=exit-code
+  if [ "$3" -eq 0 ]; then
+    rm -f "$2"   # succeeded — the one-time grant is spent
+  else
+    mv "$2" "$1" 2>/dev/null   # failed — restore for a retry
+  fi
+}
 # The SINGLE release-gate decision (#83/#196): every release-publishing shape —
 # `gh release create|edit|delete` AND the raw `gh api`/graphql equivalents (create
 # a v* tag ref, create/edit/delete a release, graphql *Release mutation) — routes
@@ -244,10 +246,18 @@ loomux_grant_claim() { # $1=grantfile
 # by autonomous+auto_release (blanket, not grant-consumed), supervised dangerous
 # mode (human present, not autonomous), or a valid one-time per-tag grant; else
 # fail-safe block. $1=tag ("" when not cheaply resolvable — then only the blanket
-# markers can allow), $2=action label. Returns 0 to allow (caller execs the real
-# gh); blocks with a message + exit 1 (never returns) otherwise.
+# markers can allow), $2=action label. Returns 0 to allow; blocks with a message
+# + exit 1 (never returns) otherwise. On a GRANT-backed allow this only CLAIMS
+# the grant (#303, same fix as #256's merge grant) — it sets `_grant_claimed`
+# (the claimed path) and `_rg_gf` (the original grant path) and leaves spending
+# it to the caller: run the real gh, then `loomux_grant_settle "$_rg_gf"
+# "$_grant_claimed" "$rc"`. On a blanket allow (autonomous+auto_release or
+# dangerous mode) `_grant_claimed` is left empty — those aren't a one-time
+# resource, so the caller can `exec` the real gh directly with nothing to
+# settle.
 loomux_release_gate() { # $1=tag $2=action
   _tag="$1"; _action="$2"
+  _grant_claimed=""
   if [ -n "$LOOMUX_GROUP_DIR" ] && [ -f "$LOOMUX_GROUP_DIR/autonomous" ] && [ -f "$LOOMUX_GROUP_DIR/auto_release" ]; then
     loomux_audit "release-gate-allowed" "{\"tag\":\"$_tag\",\"action\":\"$_action\"}"; return 0
   fi
@@ -255,9 +265,9 @@ loomux_release_gate() { # $1=tag $2=action
     loomux_audit "release-gate-dangerous" "{\"tag\":\"$_tag\",\"action\":\"$_action\"}"; return 0
   fi
   _safe=$(printf '%s' "$_tag" | tr -c 'A-Za-z0-9._-' '_')
-  _gf=""
-  [ -n "$LOOMUX_GROUP_DIR" ] && [ -n "$_safe" ] && _gf="$LOOMUX_GROUP_DIR/release_grants/$_safe"
-  if [ -n "$_gf" ] && loomux_grant_ok "$_gf"; then
+  _rg_gf=""
+  [ -n "$LOOMUX_GROUP_DIR" ] && [ -n "$_safe" ] && _rg_gf="$LOOMUX_GROUP_DIR/release_grants/$_safe"
+  if [ -n "$_rg_gf" ] && loomux_grant_claim "$_rg_gf"; then
     loomux_audit "release-gate-granted" "{\"tag\":\"$_tag\",\"action\":\"$_action\"}"; return 0
   fi
   loomux_block_release "$_tag" "$_action"
@@ -296,6 +306,14 @@ if [ "$cmd" = "release" ]; then
   case "$sub" in
     create|edit|delete)
       loomux_release_gate "$sel" "$sub"   # allow (return) or block (exit); tag = $sel
+      if [ -n "$_grant_claimed" ]; then
+        # Grant-backed allow: run (not exec) so the exit status can settle the
+        # claim — #303, same reasoning as the merge grant's fix (#256).
+        "$REAL_GH" "$@"
+        rc=$?
+        loomux_grant_settle "$_rg_gf" "$_grant_claimed" "$rc"
+        exit "$rc"
+      fi
       exec "$REAL_GH" "$@" ;;
     *) exec "$REAL_GH" "$@" ;;
   esac
@@ -431,6 +449,14 @@ if [ "$cmd" = "api" ]; then
   fi
   if [ "$is_rel" = "1" ]; then
     loomux_release_gate "$rtag" "api"   # allow (return) or block (exit)
+    if [ -n "$_grant_claimed" ]; then
+      # Grant-backed allow: run (not exec) so the exit status can settle the
+      # claim — #303, same reasoning as the merge grant's fix (#256).
+      "$REAL_GH" "$@"
+      rc=$?
+      loomux_grant_settle "$_rg_gf" "$_grant_claimed" "$rc"
+      exit "$rc"
+    fi
     exec "$REAL_GH" "$@"
   fi
 fi
@@ -644,11 +670,7 @@ if [ -n "$gf" ] && loomux_grant_claim "$gf"; then
   loomux_audit "merge-gate-granted" "{\"base\":\"$default\",\"pr\":\"$num\"}"
   "$REAL_GH" "$@"
   rc=$?
-  if [ "$rc" -eq 0 ]; then
-    rm -f "$_grant_claimed"   # merge succeeded — the one-time grant is spent
-  else
-    mv "$_grant_claimed" "$gf" 2>/dev/null   # merge failed — restore for a retry
-  fi
+  loomux_grant_settle "$gf" "$_grant_claimed" "$rc"
   exit "$rc"
 fi
 loomux_block "gate-closed" "$default" "$num"

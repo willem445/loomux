@@ -4739,6 +4739,85 @@ fn gh_shim_harness_a_merge_that_fails_at_github_does_not_burn_the_one_time_grant
     assert!(!run("13", "0"), "an orphaned .claimed file with no live grant must not authorize a merge");
 }
 
+/// A fake `gh` whose `release` subcommand exits `$FAKE_RELEASE_EXIT` (default
+/// 0/success) — lets a test simulate GitHub refusing a release publish (tag
+/// already exists, a transient API error, …).
+fn write_fake_gh_with_release_exit(root: &std::path::Path, log: &std::path::Path) -> std::path::PathBuf {
+    let p = root.join("fakegh_release_exit");
+    std::fs::write(&p, format!(
+        "#!/bin/sh\n\
+         echo \"ARGS: $*\" >> \"{log}\"\n\
+         if [ \"$1\" = \"release\" ]; then exit \"${{FAKE_RELEASE_EXIT:-0}}\"; fi\n\
+         printf 'PUBLISHED\\n'; exit 0\n",
+        log = log.display()
+    )).unwrap();
+    p
+}
+
+#[test]
+fn gh_shim_harness_a_release_publish_that_fails_at_github_does_not_burn_the_one_time_grant() {
+    // #303 (same bug class as #256): a granted `gh release create` was let
+    // through, GitHub refused it (tag already exists, a transient API error,
+    // …), and the interceptor had already deleted the release grant on
+    // interception — the human would have had to re-grant. Proven against the
+    // REAL generated shim: a publish that exits non-zero must leave the grant
+    // usable for a retry; only a publish that exits 0 may consume it.
+    use std::process::Command;
+    if Command::new("sh").arg("-c").arg("exit 0").status().map(|s| !s.success()).unwrap_or(true) {
+        eprintln!("SKIP gh_shim_harness_a_release_publish_that_fails…: no POSIX sh");
+        return;
+    }
+    let td = tempfile::tempdir().unwrap();
+    let root = td.path();
+    let group = root.join("group");
+    std::fs::create_dir_all(&group).unwrap();
+    let log = root.join("gh.log");
+    let fake = write_fake_gh_with_release_exit(root, &log);
+    let shim = root.join("gh");
+    std::fs::write(&shim, gh_shim_sh(&fake.display().to_string())).unwrap();
+    let _ = Command::new("sh").arg("-c").arg(format!("chmod +x '{}' '{}'", fake.display(), shim.display())).status();
+
+    let run = |tag: &str, release_exit: &str| -> bool {
+        Command::new("sh").arg(&shim).args(["release", "create", tag])
+            .env("LOOMUX_GROUP_DIR", &group)
+            .env("FAKE_RELEASE_EXIT", release_exit)
+            .status().unwrap().success()
+    };
+    let write_grant = |name: &str| {
+        let d = group.join("release_grants");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join(name), b"99999999999\n1\n").unwrap();
+    };
+    let grant_path = |name: &str| group.join("release_grants").join(name);
+
+    // A publish GitHub refuses must NOT consume the grant.
+    write_grant("v1.2.3");
+    assert!(!run("v1.2.3", "1"), "a failed publish must fail (surface GitHub's refusal)");
+    assert!(grant_path("v1.2.3").exists(), "a failed publish must NOT consume the grant — this is the #303 bug");
+    assert!(!grant_path("v1.2.3.claimed").exists(), "no orphaned .claimed file after a resolved failure");
+
+    // The SAME grant authorizes a retry, and a successful publish DOES consume it.
+    assert!(run("v1.2.3", "0"), "retry with the still-usable grant must succeed");
+    assert!(!grant_path("v1.2.3").exists(), "a successful publish consumes the grant");
+    assert!(!grant_path("v1.2.3.claimed").exists(), "no orphaned .claimed file after a resolved success");
+
+    // The now-consumed grant cannot authorize a second publish.
+    assert!(!run("v1.2.3", "0"), "a consumed grant must not authorize another publish");
+
+    // Expired grants are still cleaned up (never claimed, never left behind).
+    std::fs::write(group.join("release_grants/v9.9.9"), b"1\n1\n").unwrap();
+    assert!(!run("v9.9.9", "0"), "expired grant → blocked");
+    assert!(!grant_path("v9.9.9").exists(), "expired grant is cleaned up, not left claimable");
+
+    // Crash-between semantics: an orphaned `.claimed` file with no matching
+    // grant (as if the process died between claim and settle) must NOT
+    // authorize a publish — the bare grant file is gone, so the next publish
+    // sees "no grant" and fails closed, requiring a fresh one.
+    std::fs::create_dir_all(group.join("release_grants")).unwrap();
+    std::fs::write(group.join("release_grants/v13.0.0.claimed"), b"99999999999\n1\n").unwrap();
+    assert!(!run("v13.0.0", "0"), "an orphaned .claimed file with no live grant must not authorize a publish");
+}
+
 #[test]
 fn git_shim_harness_gates_tag_pushes() {
     use std::process::Command;

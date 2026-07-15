@@ -1085,9 +1085,21 @@ one-time **grant** the shim also honors.
 - **Grant files.** A grant is a small file under the group dir the shim consults:
   `merge_grants/pr-<N>` (a default-branch merge of PR N) or `release_grants/<tag>` (a
   release/tag publish). Line 1 is a unix-seconds **expiry** (`GRANT_TTL_SECS` = 30 min); the
-  shim treats the grant as valid iff the file exists and now < expiry, and **consumes it**
-  (`rm`) on use — one action only. Files are written with `atomic_write` (temp + rename, temp
-  name = pid + `GRANT_SEQ`, no getrandom) so the shim can never read a half-written grant.
+  shim treats the grant as valid iff the file exists and now < expiry. Files are written with
+  `atomic_write` (temp + rename, temp name = pid + `GRANT_SEQ`, no getrandom) so the shim can
+  never read a half-written grant.
+- **Claim, then settle on the real outcome (#256/#303).** A grant is not spent on
+  interception — it is **claimed** (`loomux_grant_claim`: an atomic `mv` to a `.claimed`
+  sibling, so a concurrent claimant loses the race outright rather than double-spending) and
+  only **settled** (`loomux_grant_settle`) once the real `gh` call it authorizes has actually
+  run: consumed (`rm`) on exit 0, restored to the original path on any other exit so a retry
+  can still use it. A merge or release/tag publish GitHub itself refuses (draft PR, branch
+  protection, a stale head, a transient API error, a tag that already exists) must not burn
+  the human's one-time grant — live incidents for both the merge grant (#256, PR #226) and the
+  release grant (#303) hinged on exactly this. If the shim process dies between claim and
+  settle, the original grant file stays gone and the orphaned `.claimed` file is never
+  consulted again — a crash requires a fresh grant, never a second use. Both gates share this
+  one mechanism (not two copies).
 - **Decision.** `gh_gate_decision` gains a `grant_valid` input: a default-branch merge is
   allowed by `(autonomous && auto_merge)` **OR** a valid grant for *that* PR (`AllowGrant`,
   consumed). The shim resolves the PR **number** via the real gh (`--json baseRefName,number`)
