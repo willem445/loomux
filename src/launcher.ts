@@ -89,6 +89,11 @@ export interface AgentLaunchSpec {
    *  custom launch incurs no `__solo__` identity nobody asked for. Also absent
    *  if the mint itself failed — best-effort, never blocks the launch. */
   channelAgent?: { agentId: string; canSend: boolean };
+  /** Extra environment for the pane's process (#244 Tier B): hermes takes its
+   *  MCP wiring from `HERMES_HOME`, an env var, rather than a command-line
+   *  flag — `soloPrepare`'s `env` field, threaded straight through. Absent for
+   *  every CLI whose MCP seam (if any) rides entirely on `command` above. */
+  env?: [string, string][];
 }
 
 /** What a submitted welcome form resolves to — the caller (main.ts) spawns the
@@ -129,7 +134,30 @@ const ORCH_CLIS: OrchCli[] = [
     models: ["auto", "claude-sonnet-4.6", "claude-haiku-4.5", "gpt-5.2", "gpt-5.3-codex"],
     defaults: { orchestrator: "auto", worker: "auto", reviewer: "auto", planner: "auto" },
   },
+  {
+    id: "hermes",
+    // Hermes model ids are provider-prefixed (`anthropic/claude-sonnet-4.6`)
+    // and its --help doesn't enumerate them, so "auto" (--provider auto — see
+    // build_agent_command's hermes arm) is the only value known safe without
+    // an install; the ModelPicker's "custom…" escape hatch covers a specific id.
+    // `defaults.planner` is unreachable — hermes is excluded from the planner
+    // role (`applyRoleModels`/the roleControls CLI select below) since it has
+    // no per-tool deny flag to enforce a read-only contract (#244 Tier B) —
+    // kept here only because `Record<OrchRole, string>` requires every key.
+    models: ["auto"],
+    defaults: { orchestrator: "auto", worker: "auto", reviewer: "auto", planner: "auto" },
+  },
 ];
+
+/** Agent-pane CLIs with a channel MCP seam (#271 W3 addendum + #244 Tier B):
+ *  `orch_solo_prepare` can mint a real token for these, so they can be a
+ *  channel's sender, not just a delivery-only receiver. claude/copilot ride
+ *  the seam via a command-line flag (`mcp_args`); hermes via an env var
+ *  (`env`, `HERMES_HOME`) — see `SoloPrepared`. Every other CLI stays lazy,
+ *  adopted delivery-only only on first Connect (`orch_solo_adopt`).
+ *  Single source of truth for `applyChannelTools`'s visibility and the
+ *  spawn-time `soloPrepare` gate below, so they can't drift. */
+const CHANNEL_SEAM_CLIS = ["claude", "copilot", "hermes"];
 
 const basename = (p: string): string => p.split(/[\\/]/).filter(Boolean).pop() ?? "";
 
@@ -519,7 +547,12 @@ export class WelcomeForm {
     // …) and model; changing a role's CLI re-populates its model list from that
     // CLI's suggestions (issue #4).
     this.roleControls = ORCH_ROLES.map(({ key }) => {
-      const cli = select(ORCH_CLIS.map((c) => [c.id, c.id]));
+      // Hermes has no per-tool deny flag, so it can't enforce a planner's
+      // read-only contract at the CLI level — excluded from that role's
+      // options outright (mirrors the backend rejection in
+      // `parse_workflow`/`spawn_agent_ex`, #244 Tier B).
+      const clis = key === "planner" ? ORCH_CLIS.filter((c) => c.id !== "hermes") : ORCH_CLIS;
+      const cli = select(clis.map((c) => [c.id, c.id]));
       const model = new ModelPicker();
       cli.addEventListener("change", () => {
         this.applyRoleModels(key);
@@ -709,14 +742,14 @@ export class WelcomeForm {
   }
 
   /** Show the channel-tools toggle only where it applies — agent kind,
-   *  claude/copilot specifically (the only CLIs with an MCP config seam to
-   *  eagerly mint into; every other CLI stays lazy regardless of this
+   *  `CHANNEL_SEAM_CLIS` specifically (the only CLIs with an MCP config seam
+   *  to eagerly mint into; every other CLI stays lazy regardless of this
    *  toggle, so offering it there would promise a capability loomux can't
    *  deliver). Purely synchronous, unlike `applyAutopilot` — no backend
-   *  lookup needed, `SUPPORTED_CLIS` is a fixed two-CLI list. */
+   *  lookup needed, `CHANNEL_SEAM_CLIS` is a fixed list. */
   private applyChannelTools(): void {
     this.channelToolsField.hidden =
-      this.kind !== "agent" || (this.agentSel.value !== "claude" && this.agentSel.value !== "copilot");
+      this.kind !== "agent" || !CHANNEL_SEAM_CLIS.includes(this.agentSel.value);
   }
 
   /** Show the autopilot toggle only where it applies — agent kind, a non-custom
@@ -1316,25 +1349,29 @@ export class WelcomeForm {
           cmd = `${command} --session-id ${sessionId}`;
         }
         const name = plan.count > 1 ? `${plan.baseName} ${i}` : plan.baseName;
-        // #271 W3 addendum, part A2: mint a channel-scoped identity BEFORE this
-        // pane boots — only for claude/copilot (the CLIs with an MCP config
-        // seam), only for agent panes (this loop never runs for terminal/
-        // content submissions), and only when the human hasn't turned the
-        // channel-tools toggle off (PR #289 review round 2, N1 — eager minting
-        // for every claude/copilot launch is a broader live-token surface than
-        // "channels" needs; the toggle lets it be opted out of, default ON to
-        // match the addendum's stated "full membership at spawn" contract).
-        // Every other CLI stays lazy regardless: it gets no identity here and
-        // is adopted as a delivery-only member only if/when the human actually
-        // connects it (`orch_solo_adopt`), so a codex/gemini/custom launch
-        // mints nothing nobody asked for. Best-effort: a failed mint must
-        // never block the launch.
+        // #271 W3 addendum, part A2 (+ #244 Tier B): mint a channel-scoped
+        // identity BEFORE this pane boots — only for `CHANNEL_SEAM_CLIS` (the
+        // CLIs with an MCP config seam), only for agent panes (this loop never
+        // runs for terminal/content submissions), and only when the human
+        // hasn't turned the channel-tools toggle off (PR #289 review round 2,
+        // N1 — eager minting for every seam-CLI launch is a broader live-token
+        // surface than "channels" needs; the toggle lets it be opted out of,
+        // default ON to match the addendum's stated "full membership at spawn"
+        // contract). Every other CLI stays lazy regardless: it gets no
+        // identity here and is adopted as a delivery-only member only if/when
+        // the human actually connects it (`orch_solo_adopt`), so a
+        // codex/gemini/custom launch mints nothing nobody asked for.
+        // Best-effort: a failed mint must never block the launch.
         let channelAgent: { agentId: string; canSend: boolean } | undefined;
-        if (!plan.isCustom && channelToolsEnabled && (program === "claude" || program === "copilot")) {
+        let env: [string, string][] | undefined;
+        if (!plan.isCustom && channelToolsEnabled && CHANNEL_SEAM_CLIS.includes(program)) {
           try {
             const prepared = await soloPrepare(program, cwd ?? "", name);
             if (prepared.mcp_args) cmd = `${cmd} ${prepared.mcp_args}`;
             channelAgent = { agentId: prepared.agent_id, canSend: !prepared.delivery_only };
+            // Hermes's MCP wiring rides HERMES_HOME (an env var), not a flag
+            // on `cmd` — see `SoloPrepared.env`.
+            if (prepared.env.length) env = prepared.env;
           } catch {
             /* best-effort — falls back to lazy adopt-on-connect */
           }
@@ -1342,6 +1379,7 @@ export class WelcomeForm {
         specs.push({
           name,
           cwd,
+          env,
           command: cmd,
           sessionId,
           channelAgent,

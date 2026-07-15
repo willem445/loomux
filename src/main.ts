@@ -964,6 +964,7 @@ async function handleWelcomeSubmit(
     command: first.command,
     sessionId: first.sessionId,
     channelAgent: channelAgentFor(first),
+    env: first.env,
   });
   await bindSoloIfNeeded(pane, first);
   reapIfExited(ws, pane);
@@ -981,6 +982,7 @@ async function handleWelcomeSubmit(
         command: spec.command,
         sessionId: spec.sessionId,
         channelAgent: channelAgentFor(spec),
+        env: spec.env,
       },
       eventsFor(ws),
       d,

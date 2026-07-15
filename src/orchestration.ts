@@ -1009,13 +1009,17 @@ export interface OrchChannelEvent {
 // (`solo_adopt`). See `OrchRegistry::solo_prepare`/`solo_bind`/`solo_adopt`.
 
 /** What `orch_solo_prepare` returns: the minted agent id, the exact per-CLI
- *  flag string to append to the launched command line (empty for a
- *  delivery-only CLI), and whether this pane ended up delivery-only (no
- *  config seam for its CLI — codex/gemini/opencode/custom today). */
+ *  flag string to append to the launched command line (empty for hermes —
+ *  see `env` — and for a delivery-only CLI), whether this pane ended up
+ *  delivery-only (no config seam for its CLI — codex/gemini/opencode/custom
+ *  today), and extra environment to set on the pane's process (empty except
+ *  for hermes, which takes its MCP wiring from `HERMES_HOME` rather than a
+ *  flag — #244 Tier B). */
 export interface SoloPrepared {
   agent_id: string;
   mcp_args: string;
   delivery_only: boolean;
+  env: [string, string][];
 }
 
 /** Mint a channel-scoped identity for a newly-launching standalone pane

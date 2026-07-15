@@ -609,6 +609,21 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
             ));
             continue;
         }
+        // Hermes has no documented per-tool deny flag, so a planner's
+        // read-only contract can't be enforced at the CLI level for it (#244
+        // Tier B). Caught here for an explicit `cli: hermes`, so the launcher's
+        // workflow preview shows the error immediately; a block that instead
+        // INHERITS hermes from the group default (empty `cli:`) is caught later,
+        // at spawn (`OrchRegistry::spawn_agent_ex`), once the group's default is
+        // known.
+        if kind == Role::Planner && cli == "hermes" {
+            errs.push(format!(
+                "blocks[{i}] ({id}): a planner block cannot use cli: hermes — hermes has no \
+                 per-tool deny mechanism, so a planner's read-only contract can't be enforced at \
+                 the CLI level. Use claude or copilot."
+            ));
+            continue;
+        }
         if rb.prompt.is_some() && rb.profile.is_some() {
             errs.push(format!(
                 "blocks[{i}] ({id}): set either prompt: (inline persona) or profile: (a persona file), not both"

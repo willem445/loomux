@@ -1466,7 +1466,14 @@ impl NameSource {
 /// Which agent CLI a group runs. Each needs an adapter in
 /// `build_agent_command` + `write_mcp_config`; anything unknown falls back
 /// to Claude (explicitly, in `clamped`, never silently at spawn time).
-pub const SUPPORTED_CLIS: [&str; 2] = ["claude", "copilot"];
+///
+/// Hermes (#244 Tier B) is the odd one out: it takes MCP wiring from a
+/// `config.yaml` under `HERMES_HOME` (an env var), not a `--mcp-config`-style
+/// flag — see `write_mcp_config`'s hermes branch. It is also excluded from
+/// the `planner` role specifically (`spawn_agent_ex`, `workflow::parse_workflow`):
+/// Hermes has no documented per-tool deny flag, so a planner's read-only
+/// contract can't be enforced at the CLI level the way it is for claude/copilot.
+pub const SUPPORTED_CLIS: [&str; 3] = ["claude", "copilot", "hermes"];
 
 /// Reserved, backend-minted pseudo-group id for standalone (non-orchestration)
 /// panes given a channel-scoped MCP identity (#271 W3 addendum, part A).
@@ -1708,12 +1715,14 @@ impl Guardrails {
     }
 }
 
-/// Default model for a capability class on a given CLI. Copilot picks its own
-/// best model ("auto"); on Claude the reasoning-heavy classes (orchestrator,
-/// planner) get the strong tier and the executing ones (worker, reviewer) the
-/// mid tier.
+/// Default model for a capability class on a given CLI. Copilot and Hermes
+/// pick their own best model/provider ("auto" — for Hermes this becomes
+/// `--provider auto` in `build_agent_command`, since its `--model` flag takes
+/// a provider-prefixed id, not "auto"); on Claude the reasoning-heavy classes
+/// (orchestrator, planner) get the strong tier and the executing ones
+/// (worker, reviewer) the mid tier.
 pub(crate) fn default_model(cli: &str, role: Role) -> &'static str {
-    if cli == "copilot" {
+    if cli == "copilot" || cli == "hermes" {
         return "auto";
     }
     match role {
@@ -7116,21 +7125,25 @@ impl OrchRegistry {
 
     /// Human-only (the launcher's agent-pane spawn path, constraint 5): mint
     /// a channel-scoped identity for a newly-launching standalone pane
-    /// BEFORE it boots, so the MCP flags can be appended to its command line
+    /// BEFORE it boots, so the MCP wiring can be attached to its launch
     /// (you cannot inject an MCP server into an already-running CLI). `cli`
-    /// is the CLI the human picked. For claude/copilot — the only CLIs with
-    /// an MCP-config flag seam today (`SUPPORTED_CLIS`) — this writes the
-    /// same per-agent config `write_mcp_config` gives an orchestration-group
-    /// agent and mints a real token: the pane is a FULL member, able to
-    /// `channel_send`. For any other CLI (no seam: codex/gemini/opencode/
-    /// custom — their own MCP mechanisms are repo/user config files, a
-    /// separate per-CLI follow-up, not a spawn-time flag) this mints NO
-    /// token — the `AgentEntry` still exists (so the pane CAN be a
-    /// `deliver_prompt` target once connected), but it is delivery-only from
-    /// birth, exactly like an adopted already-running pane (`solo_adopt`).
-    /// Returns `{agent_id, mcp_args, delivery_only}` — `mcp_args` is the
+    /// is the CLI the human picked. For claude/copilot/hermes — the CLIs with
+    /// an MCP-config seam today (`SUPPORTED_CLIS`) — this writes the same
+    /// per-agent config `write_mcp_config` gives an orchestration-group agent
+    /// and mints a real token: the pane is a FULL member, able to
+    /// `channel_send`. Claude/copilot's seam is a command-line flag
+    /// (`mcp_args`); Hermes's is an env var (`env`) pointed at its
+    /// `HERMES_HOME` — see `write_mcp_config`'s hermes branch. For any other
+    /// CLI (no seam: codex/gemini/opencode/custom — their own MCP mechanisms
+    /// are repo/user config files, a separate per-CLI follow-up, not a
+    /// spawn-time flag or env var) this mints NO token — the `AgentEntry`
+    /// still exists (so the pane CAN be a `deliver_prompt` target once
+    /// connected), but it is delivery-only from birth, exactly like an
+    /// adopted already-running pane (`solo_adopt`).
+    /// Returns `{agent_id, mcp_args, delivery_only, env}` — `mcp_args` is the
     /// exact per-CLI flag string to append to the launched command line
-    /// (empty for a delivery-only CLI).
+    /// (empty for hermes and for a delivery-only CLI); `env` is extra
+    /// environment to set on the pane's process (empty except for hermes).
     pub fn solo_prepare(&self, cli: &str, cwd: &str, name: &str) -> Result<Value, String> {
         self.ensure_solo_group();
         let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
@@ -7139,23 +7152,29 @@ impl OrchRegistry {
         let display = if display.is_empty() { agent_id.clone() } else { display };
 
         let has_seam = SUPPORTED_CLIS.contains(&cli);
-        let (token, mcp_args) = if has_seam {
+        let (token, mcp_args, env) = if has_seam {
             let token = new_token();
             let cfg = self.write_mcp_config(SOLO_GROUP, &agent_id, &token, cli)?;
-            let args = match cli {
-                "claude" => format!(
-                    "--mcp-config \"{}\" --strict-mcp-config --allowedTools mcp__loomux",
-                    cfg.display()
+            let (args, env) = match cli {
+                "claude" => (
+                    format!(
+                        "--mcp-config \"{}\" --strict-mcp-config --allowedTools mcp__loomux",
+                        cfg.display()
+                    ),
+                    Vec::new(),
                 ),
-                "copilot" => format!(
-                    "--additional-mcp-config \"@{}\" --allow-tool loomux",
-                    cfg.display()
+                "copilot" => (
+                    format!("--additional-mcp-config \"@{}\" --allow-tool loomux", cfg.display()),
+                    Vec::new(),
                 ),
+                "hermes" => {
+                    (String::new(), vec![("HERMES_HOME".to_string(), cfg.display().to_string())])
+                }
                 _ => unreachable!("has_seam is only true for SUPPORTED_CLIS"),
             };
-            (token, args)
+            (token, args, env)
         } else {
-            (String::new(), String::new())
+            (String::new(), String::new(), Vec::new())
         };
         let delivery_only = token.is_empty();
 
@@ -7191,7 +7210,7 @@ impl OrchRegistry {
             "solo-prepare",
             json!({ "agent": agent_id, "cli": cli, "delivery_only": delivery_only }),
         );
-        Ok(json!({ "agent_id": agent_id, "mcp_args": mcp_args, "delivery_only": delivery_only }))
+        Ok(json!({ "agent_id": agent_id, "mcp_args": mcp_args, "delivery_only": delivery_only, "env": env }))
     }
 
     /// Human-only: bind the pty a newly-spawned solo pane's launcher just
@@ -9982,8 +10001,20 @@ impl OrchRegistry {
     }
 
     /// Write the per-agent MCP config the agent CLI connects with. Claude
-    /// and Copilot share the same core schema; Copilot additionally expects
-    /// a `tools` allowlist inside the server entry.
+    /// and Copilot share the same core schema (JSON `mcpServers`, passed on
+    /// the command line via a flag) — Copilot additionally expects a `tools`
+    /// allowlist inside the server entry. Hermes is structurally different: it
+    /// has no per-invocation MCP flag at all and instead reads `mcp_servers:`
+    /// (YAML, snake_case) from `config.yaml` under its `HERMES_HOME` directory
+    /// — schema verified against the docs, not guessed:
+    /// https://github.com/NousResearch/hermes-agent/blob/main/website/docs/reference/mcp-config-reference.md
+    ///
+    /// For Hermes this returns the **HERMES_HOME directory**, not a config file
+    /// path — the caller sets that as the `HERMES_HOME` env var on the pane's
+    /// process (there is no flag to hand it). Each agent gets its own isolated
+    /// HERMES_HOME (under the group's `configs/`, alongside the claude/copilot
+    /// JSON files) so its config.yaml carries only that agent's own token — no
+    /// shared `~/.hermes/config.yaml`, no cross-agent token reuse.
     fn write_mcp_config(
         &self,
         group: &str,
@@ -9994,6 +10025,19 @@ impl OrchRegistry {
         let port = self.port();
         if port == 0 {
             return Err("loomux MCP server is not running".into());
+        }
+        if cli == "hermes" {
+            let home = self.group_dir(group).join("configs").join(format!("{agent_id}-hermes-home"));
+            fs::create_dir_all(&home).map_err(|e| e.to_string())?;
+            // Hand-formatted YAML (no serde_yaml dependency, CLAUDE.md
+            // constraint 2/style — the payload is one server block). `token`
+            // is `new_token()`'s output (32 lowercase hex chars), so it needs
+            // no YAML escaping, but is quoted anyway for defense in depth.
+            let yaml = format!(
+                "mcp_servers:\n  loomux:\n    url: \"http://127.0.0.1:{port}/mcp\"\n    headers:\n      X-Loomux-Agent: \"{token}\"\n    enabled: true\n"
+            );
+            fs::write(home.join("config.yaml"), yaml).map_err(|e| e.to_string())?;
+            return Ok(home);
         }
         let mut server = json!({
             "type": "http",
@@ -10175,6 +10219,14 @@ impl OrchRegistry {
             }
             return out;
         }
+        if cli == "hermes" {
+            // No native custom-agent flag documented for Hermes (no
+            // --agents/--agent equivalent — cli-commands.md), so the persona
+            // travels as kickoff text, exactly like Copilot's non-native
+            // fallback above.
+            out.kickoff = Some(p.text.clone());
+            return out;
+        }
         // Claude (and the fallback adapter): define the block inline and
         // activate it. `description` is required by the CLI's schema.
         let payload = json!({
@@ -10308,6 +10360,48 @@ impl OrchRegistry {
                 for pat in &persona.extra_allow {
                     cmd.push_str(&format!(" --allow-tool \"{pat}\""));
                 }
+                cmd
+            }
+            "hermes" => {
+                // Interactive session, not `-q`/`-z` one-shot (those exit).
+                // Working dir is already the PTY cwd, so Hermes reads the
+                // repo's AGENTS.md/CLAUDE.md for free — no flag needed
+                // (context-files.md).
+                let mut cmd = "hermes chat".to_string();
+                // `--model` takes a provider-prefixed model id
+                // (`anthropic/claude-sonnet-4.6`), not "auto" — `--provider
+                // auto` is the separate flag that lets Hermes pick
+                // (cli-commands.md). `default_model("hermes", _)` returns
+                // "auto" for exactly this reason.
+                if model == "auto" {
+                    cmd.push_str(" --provider auto");
+                } else {
+                    cmd.push_str(&format!(" --model {model}"));
+                }
+                if unattended {
+                    // "Bypass dangerous-command approval prompts", no
+                    // documented startup consent dialog (cli-commands.md) —
+                    // same atom `single_pane_autopilot_flags` uses.
+                    cmd.push_str(" --yolo");
+                }
+                // No MCP flag: the loomux server is wired via `HERMES_HOME`
+                // (env var, set alongside this command — see
+                // `agent_pane_env`'s caller), not a CLI argument — `cfg` is
+                // unused here (it's the HERMES_HOME dir `write_mcp_config`
+                // returned, not a flag value).
+                //
+                // No session/resume flag: Hermes session ids are
+                // Hermes-assigned at runtime, not pre-mintable
+                // (sessions.md) — same "untracked" posture as Copilot.
+                //
+                // No persona/allow flags: no native custom-agent flag
+                // (`persona_inject`'s hermes arm routes personas through the
+                // kickoff prompt instead), and no per-tool allow/deny flag is
+                // documented, so `persona.extra_allow` has nothing to attach
+                // to. This is also why a `read_only` (planner) block on
+                // Hermes is rejected upstream in `spawn_agent_ex` rather than
+                // enforced here — there's no CLI-level deny mechanism to
+                // build.
                 cmd
             }
             // "claude" and the explicit fallback for anything unrecognized.
@@ -10486,6 +10580,20 @@ impl OrchRegistry {
                     push(&mut a, pat);
                 }
             }
+            "hermes" => {
+                push(&mut a, "hermes");
+                push(&mut a, "chat");
+                if model == "auto" {
+                    push(&mut a, "--provider");
+                    push(&mut a, "auto");
+                } else {
+                    push(&mut a, "--model");
+                    push(&mut a, model);
+                }
+                if unattended {
+                    push(&mut a, "--yolo");
+                }
+            }
             // "claude" and the explicit fallback for anything unrecognized.
             _ => {
                 push(&mut a, "claude");
@@ -10651,6 +10759,24 @@ impl OrchRegistry {
             return Err(format!(
                 "guardrail: unsupported agent CLI {cli:?} for block {} — supported: {}",
                 block.id, SUPPORTED_CLIS.join(", ")
+            ));
+        }
+        // Hermes has no documented per-tool deny flag (unlike claude's
+        // --disallowedTools / copilot's --deny-tool), so a planner's
+        // read-only contract cannot be enforced at the CLI level for it —
+        // it would rest on instructions alone, with no human in the pane to
+        // catch a slip. Rejected outright rather than silently accepted
+        // weaker (#244 Tier B). This is the resolved-cli check, so it also
+        // catches a block that INHERITS hermes from the group default (no
+        // explicit `cli:`) — `workflow::parse_workflow` separately rejects
+        // an explicit `cli: hermes` on a planner block at parse time, for
+        // earlier feedback in the launcher's workflow preview.
+        if role == Role::Planner && cli == "hermes" {
+            return Err(format!(
+                "block {:?} is a planner on hermes — hermes has no per-tool deny mechanism, so a \
+                 planner's read-only contract can't be enforced at the CLI level. Use claude or \
+                 copilot for planner blocks.",
+                block.id
             ));
         }
         let cli = cli.to_string();
@@ -10853,7 +10979,11 @@ impl OrchRegistry {
                             .map(|a| (a.id.clone(), a.role.as_str(), a.idle_since_ms.is_some()))
                             .collect(),
                     );
+                    // `cfg` is a file for claude/copilot, a directory (HERMES_HOME)
+                    // for hermes (`write_mcp_config`'s hermes branch) — try both so
+                    // a race-lost spawn never leaks either shape of per-agent config.
                     let _ = fs::remove_file(&cfg);
+                    let _ = fs::remove_dir_all(&cfg);
                     return Err(format!(
                         "guardrail: {live} live agents already (max {}). Reuse an idle agent or kill one first. Live delegates: {roster}.",
                         group.guardrails.max_agents
@@ -10897,8 +11027,17 @@ impl OrchRegistry {
             deadline_ms: now_ms() + BIND_TIMEOUT.as_millis() as u64,
             argv,
             // Agent pane: inject the gh-shim PATH + LOOMUX_GROUP_DIR so the merge
-            // gate is enforced structurally (#83).
-            env: self.agent_pane_env(group_id),
+            // gate is enforced structurally (#83). Hermes additionally gets
+            // HERMES_HOME pointed at the per-agent dir `write_mcp_config` just
+            // wrote — that's how it picks up the loomux MCP server (#244 Tier B;
+            // no CLI flag for it, see `write_mcp_config`'s hermes branch).
+            env: {
+                let mut env = self.agent_pane_env(group_id);
+                if cli == "hermes" {
+                    env.push(("HERMES_HOME".to_string(), cfg.display().to_string()));
+                }
+                env
+            },
         };
 
         let app = self.app.lock_safe().clone();
@@ -11708,9 +11847,13 @@ impl OrchRegistry {
         // land in is gone. Tears the channel down (and notifies the
         // stranded peer) if this drops it below 2 members.
         self.cleanup_agent_channel(agent_id, &snapshot.group);
-        let _ = fs::remove_file(
-            self.group_dir(&snapshot.group).join("configs").join(format!("{agent_id}.json")),
-        );
+        let configs = self.group_dir(&snapshot.group).join("configs");
+        let _ = fs::remove_file(configs.join(format!("{agent_id}.json")));
+        // Hermes's per-agent config is a directory (HERMES_HOME), not a file
+        // (`write_mcp_config`'s hermes branch) — never reused across agents, so
+        // it's torn down here alongside the JSON config every other CLI gets.
+        // Harmless no-op for a non-hermes agent (the dir never existed).
+        let _ = fs::remove_dir_all(configs.join(format!("{agent_id}-hermes-home")));
         self.audit(&snapshot.group, "loomux", "agent-exit",
             json!({ "agent": agent_id, "exit_code": exit_code }));
         crate::obs::breadcrumb(
@@ -12569,8 +12712,15 @@ fn register_orchestrator_pane(
         deadline_ms: now_ms() + BIND_TIMEOUT.as_millis() as u64,
         argv,
         // The orchestrator is the pane the incident implicated — inject the
-        // gh-shim env so its merge gate is enforced too (#83).
-        env: reg.agent_pane_env(&group.id),
+        // gh-shim env so its merge gate is enforced too (#83). Same
+        // HERMES_HOME addition as the delegate spawn path above.
+        env: {
+            let mut env = reg.agent_pane_env(&group.id);
+            if cli == "hermes" {
+                env.push(("HERMES_HOME".to_string(), cfg.display().to_string()));
+            }
+            env
+        },
     };
 
     crate::obs::breadcrumb(
