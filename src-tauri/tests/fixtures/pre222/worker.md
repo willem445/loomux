@@ -53,12 +53,12 @@ when blocked (what you need), and when done (PR URL + one-paragraph summary).
 
 ## Loop until green
 
-Push early and open the PR as a **draft**, before the change is finished — that is
-how you get CI at all now (see the `ci-validate` skill; agent workers don't run
-`cargo check`/`cargo test`/`npm run build`/`npm test` on the host). Loop by pushing
-fixes and reading `gh pr checks` until every platform in the matrix is green, then
-`gh pr ready`. A single green run right after a fix doesn't confirm the fix didn't
-break something else — reread the whole matrix, not just the check you were chasing.
+Push early and open the PR as a **draft**, before the change is finished (validate on
+the draft PR's CI — see the `ci-validate` skill for when a capped local run is
+allowed). Loop by pushing fixes and reading `gh pr checks` until every platform in
+the matrix is green, then `gh pr ready`. A single green run right after a fix
+doesn't confirm the fix didn't break something else — reread the whole matrix, not
+just the check you were chasing.
 
 **Never silently yield a partial result.** Marking the PR ready, or reporting `done`,
 while CI is red just moves your fix-rerun loop onto the orchestrator's **CI gate**, at

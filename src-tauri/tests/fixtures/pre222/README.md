@@ -52,12 +52,21 @@ so far:
   worker genuinely cannot reach green after a real attempt, it reports `blocked` and
   says so on the issue instead of marking the PR ready. Pairs with the
   orchestrator's existing **CI gate** (unchanged here) — this is the worker-side half
-  that keeps that gate a formality instead of a fix loop it inherits. Re-blessed a
-  second time in the same PR (rev-10's delta review): the section originally told
-  workers to loop with local `cargo`/`npm` commands before opening the PR, which
-  #321's same-day, group-wide ban on local builds (`ci-validate`, #320) made
-  unfollowable — the loop is now framed on the draft PR's own CI, per that skill,
-  with the local-command instructions dropped entirely.
+  that keeps that gate a formality instead of a fix loop it inherits. Re-blessed
+  twice more in the same PR:
+
+  - **rev-10's delta review**: the section originally told workers to loop with
+    local `cargo`/`npm` commands before opening the PR, which #321's interim,
+    group-wide ban on local builds (`ci-validate`, #320) made unfollowable — the
+    loop was reframed onto the draft PR's own CI, per that skill, with the
+    local-command instructions dropped entirely.
+  - **rev-30's delta review**: #321 was itself repurposed mid-flight from that
+    interim hard ban into a guard-plus-discretion model — a per-class concurrency
+    guard (#318/#322) caps local build/test concurrency instead of forbidding it
+    outright, so a capped local run is allowed once the guard is confirmed active.
+    The absolute "agent workers don't run `cargo`/`npm` on the host" parentheticals
+    softened into a deferral to the `ci-validate` skill for when that applies —
+    the draft-PR/loop-until-green/blocked-report shape underneath is unchanged.
 
 `the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was` renders
 **these** with the six pre-#222 template variables and asserts that a group launched
