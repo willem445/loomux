@@ -1075,12 +1075,26 @@ loomux_try_acquire() {
     fi
     # Occupied — reap if the recorded holder's pid is dead (a slot orphaned by
     # a hard kill: mkdir claims do not self-release the way an flock'd fd
-    # would). One reap attempt per contender per loop pass is plenty; the next
-    # waiter (or this one, next iteration) tries again.
+    # would).
     hp=$(cat "$cand/pid" 2>/dev/null)
     if [ -n "$hp" ] && ! loomux_pid_alive "$hp"; then
       rm -rf "$cand" 2>/dev/null
-      if mkdir "$cand" 2>/dev/null; then
+      # A just-deleted directory can transiently refuse an immediate recreate
+      # under the same name (observed on windows-latest CI: NTFS/AV settling
+      # after `rm -rf`, not a design flaw) — retry the recreate a few times
+      # rather than falling through to `i+1` and letting a LATER, unrelated
+      # `mkdir` call at the top of this loop claim it silently un-audited.
+      claimed=1
+      attempt=0
+      while [ "$attempt" -lt 5 ]; do
+        if mkdir "$cand" 2>/dev/null; then
+          claimed=0
+          break
+        fi
+        attempt=$((attempt + 1))
+        sleep 1
+      done
+      if [ "$claimed" -eq 0 ]; then
         printf '%s\n' "$$" > "$cand/pid" 2>/dev/null || true
         SLOT_PATH="$cand"
         loomux_audit "resource-guard-reaped" "{\"class\":\"$MATCH_CLASS\",\"slot\":$i,\"stale_pid\":\"$hp\"}"
