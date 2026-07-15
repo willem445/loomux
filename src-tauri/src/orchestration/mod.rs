@@ -1075,30 +1075,27 @@ loomux_try_acquire() {
     fi
     # Occupied — reap if the recorded holder's pid is dead (a slot orphaned by
     # a hard kill: mkdir claims do not self-release the way an flock'd fd
-    # would).
+    # would). RENAME the stale dir out of the way rather than `rm -rf` then
+    # `mkdir` the SAME name back — observed on windows-latest CI: recreating a
+    # directory immediately under a name just deleted can stay refused for
+    # several seconds (NTFS/AV settling), which silently starved this branch
+    # (mkdir kept failing until a LATER, unrelated top-of-loop `mkdir` call —
+    # once the delete finally settled — claimed the now-empty name without
+    # ever going through this reap branch, so it ran un-audited). `mv` is a
+    # rename, not a delete+recreate, so the fresh `mkdir` below targets a name
+    # that was never itself just removed. It also makes the reap itself an
+    # atomic claim: only one racing contender's `mv` can succeed.
     hp=$(cat "$cand/pid" 2>/dev/null)
     if [ -n "$hp" ] && ! loomux_pid_alive "$hp"; then
-      rm -rf "$cand" 2>/dev/null
-      # A just-deleted directory can transiently refuse an immediate recreate
-      # under the same name (observed on windows-latest CI: NTFS/AV settling
-      # after `rm -rf`, not a design flaw) — retry the recreate a few times
-      # rather than falling through to `i+1` and letting a LATER, unrelated
-      # `mkdir` call at the top of this loop claim it silently un-audited.
-      claimed=1
-      attempt=0
-      while [ "$attempt" -lt 5 ]; do
+      stale="$cand.stale.$$"
+      if mv "$cand" "$stale" 2>/dev/null; then
+        rm -rf "$stale" 2>/dev/null &
         if mkdir "$cand" 2>/dev/null; then
-          claimed=0
-          break
+          printf '%s\n' "$$" > "$cand/pid" 2>/dev/null || true
+          SLOT_PATH="$cand"
+          loomux_audit "resource-guard-reaped" "{\"class\":\"$MATCH_CLASS\",\"slot\":$i,\"stale_pid\":\"$hp\"}"
+          return 0
         fi
-        attempt=$((attempt + 1))
-        sleep 1
-      done
-      if [ "$claimed" -eq 0 ]; then
-        printf '%s\n' "$$" > "$cand/pid" 2>/dev/null || true
-        SLOT_PATH="$cand"
-        loomux_audit "resource-guard-reaped" "{\"class\":\"$MATCH_CLASS\",\"slot\":$i,\"stale_pid\":\"$hp\"}"
-        return 0
       fi
     fi
     i=$((i + 1))
