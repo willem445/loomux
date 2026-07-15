@@ -2680,6 +2680,33 @@ pub fn task_summary(t: &Task) -> TaskSummary {
 /// copy the board keeps live.
 const MAX_TASK_NOTES: usize = 20;
 
+/// The `author` a `cap_task_notes` placeholder note is stamped with — never
+/// produced by a human/agent note (`upsert_task`'s `actor` is always an
+/// agent id or `"human"`), so it doubles as the marker `notes_represented`
+/// uses to recognize a placeholder that itself gets swept into a LATER
+/// collapse.
+const NOTE_COLLAPSE_AUTHOR: &str = "loomux";
+
+/// How many original notes one live `TaskNote` stands for: 1 for an ordinary
+/// note, or the count embedded in a `cap_task_notes` placeholder's own text
+/// (parsed back out). `cap_task_notes` runs once PER APPEND (`upsert_task`
+/// calls it after every single note push), so a placeholder from an earlier
+/// round routinely gets swept into a later one — without this, re-collapsing
+/// it would count it as "1 note" and the reported total would reset every
+/// round instead of accumulating (review finding on #245: the live count
+/// stayed at the single round's drop size — e.g. "2" — no matter how many
+/// notes had actually rolled off over the task's lifetime).
+fn notes_represented(note: &TaskNote) -> usize {
+    if note.author != NOTE_COLLAPSE_AUTHOR {
+        return 1;
+    }
+    note.text
+        .strip_prefix('[')
+        .and_then(|s| s.split_whitespace().next())
+        .and_then(|n| n.parse::<usize>().ok())
+        .unwrap_or(1)
+}
+
 /// Cap a task's live note history (#245): once `notes` exceeds `max`, collapse
 /// the oldest excess into one placeholder note (so the board still shows
 /// *something* happened, not silence) and keep the newest `max - 1` verbatim.
@@ -2687,21 +2714,37 @@ const MAX_TASK_NOTES: usize = 20;
 /// everything" — a live-tunable knob set to 0 must not read as "delete all
 /// history". Pure so the collapse boundary is unit-testable without a
 /// registry.
+///
+/// The placeholder does NOT claim the dropped text is durably retrievable:
+/// `audit.jsonl` rotation (#240) keeps only one backup generation, so for
+/// exactly the long-running groups this cap targets, the original note text
+/// can rotate out from under a placeholder that promised otherwise. It says
+/// only what's actually true — the notes were dropped from the live board,
+/// and their text was audited at creation, subject to that rotation.
 pub fn cap_task_notes(mut notes: Vec<TaskNote>, max: usize) -> Vec<TaskNote> {
     if max == 0 || notes.len() <= max {
         return notes;
     }
     let drop_count = notes.len() - (max - 1);
     let dropped: Vec<TaskNote> = notes.drain(..drop_count).collect();
+    // Sum, not `drop_count`: a placeholder among the dropped notes (this is
+    // itself a re-collapse) represents more than the one slot it occupies.
+    let collapsed_count: usize = dropped.iter().map(notes_represented).sum();
+    // The oldest note's own ts_ms is already the right lower bound even when
+    // it's a placeholder: it was stamped with ITS earliest represented ts_ms
+    // when created, below, so that value carries forward unchanged through
+    // any number of later re-collapses.
     let first_ts = dropped.first().map(|n| n.ts_ms).unwrap_or(0);
     let last_ts = dropped.last().map(|n| n.ts_ms).unwrap_or(0);
     let mut out = Vec::with_capacity(notes.len() + 1);
     out.push(TaskNote {
         ts_ms: first_ts,
-        author: "loomux".to_string(),
+        author: NOTE_COLLAPSE_AUTHOR.to_string(),
         text: format!(
-            "[{drop_count} earlier note{} collapsed to keep the board readable — full text in this group's audit.jsonl, ts {first_ts}..{last_ts}]",
-            if drop_count == 1 { "" } else { "s" }
+            "[{collapsed_count} earlier note{} collapsed to keep the board readable — \
+             text was recorded in this group's audit.jsonl at creation (subject to rotation on a \
+             long-running group), ts {first_ts}..{last_ts}]",
+            if collapsed_count == 1 { "" } else { "s" }
         ),
     });
     out.extend(notes);

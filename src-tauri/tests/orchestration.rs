@@ -1828,6 +1828,33 @@ fn cap_task_notes_zero_means_uncapped() {
 }
 
 #[test]
+fn cap_task_notes_placeholder_count_accumulates_across_repeated_collapses() {
+    // Review finding on #245: cap_task_notes runs once PER APPEND in the real
+    // path (upsert_task calls it after every single note push), not once over
+    // a big batch — so a placeholder from an earlier round routinely gets
+    // swept into a later collapse. The reported count must accumulate the
+    // TRUE total dropped over the task's lifetime, not reset to "how many
+    // this round" (which, at steady state one-at-a-time, was always the same
+    // small number no matter how much history had actually rolled off).
+    let mut notes: Vec<TaskNote> = Vec::new();
+    for i in 1..=30u64 {
+        notes.push(note(i, &format!("note-{i}")));
+        notes = cap_task_notes(notes, 20);
+    }
+    assert_eq!(notes.len(), 20);
+    assert!(
+        notes[0].text.contains("11 earlier notes collapsed"),
+        "the true cumulative count (11 notes rolled off across repeated collapses) must survive, \
+         not reset every round: {}",
+        notes[0].text
+    );
+    assert_eq!(notes[0].ts_ms, 1, "the oldest timestamp is still the very first note ever dropped");
+    // The newest max-1 real notes are kept verbatim regardless.
+    assert_eq!(notes[1].text, "note-12");
+    assert_eq!(notes.last().unwrap().text, "note-30");
+}
+
+#[test]
 fn upsert_task_caps_live_note_history_as_notes_accumulate() {
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();

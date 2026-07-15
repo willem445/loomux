@@ -160,8 +160,10 @@ can add, edit, annotate, reorder, and delete tasks; loomux notifies you when the
   (mergeability call, why something is blocked, review outcomes). Only the newest notes
   stay on the task verbatim (older ones collapse into one placeholder note once a task
   accumulates a lot of history) — `list_tasks()` doesn't even send note text, only a
-  `note_count`, so a group that runs for weeks stays readable; the full text of every
-  note you ever wrote is still in this group's audit log regardless.
+  `note_count`, so a group that runs for weeks stays readable. A dropped note's text was
+  audited when it was written (this group's audit log), but that log rotates on a
+  long-running group, so treat old notes as GONE from live state, not guaranteed
+  retrievable — don't rely on digging one back out.
 
 ## Prototype → Proceed (demo-gated features)
 
