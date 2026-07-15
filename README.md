@@ -102,7 +102,7 @@ Builds are unsigned for now — on macOS, if the app is reported as damaged, run
 
 - [Getting started](https://willem445.github.io/loomux/getting-started) — install, first launch, first agent pane
 - [Core concepts](https://willem445.github.io/loomux/core-concepts) — panes, the split grid, and the shortcut table
-- [Orchestration guide](https://willem445.github.io/loomux/orchestration) — agent groups, the task board, the label workflow
+- [Orchestration guide](https://willem445.github.io/loomux/orchestration) — agent groups, the task board, the label workflow, cross-workspace channels
 - [Autonomous & supervised modes](https://willem445.github.io/loomux/autonomous-mode) — idle-tick autonomy, token budget, auto-merge/release, dangerous mode
 - Feature pages — [git view](https://willem445.github.io/loomux/features/git-view), [GitHub issues](https://willem445.github.io/loomux/features/github-issues), [voice prompts](https://willem445.github.io/loomux/features/voice-prompts), [steering](https://willem445.github.io/loomux/features/steering)
 - [Troubleshooting](https://willem445.github.io/loomux/troubleshooting) — whisper DLLs, `gh` auth, mic permission, disk
@@ -181,14 +181,16 @@ src/
   sessions.ts       session browser sidebar
   launcher.ts       in-pane welcome / pane-setup form (Agent / Orchestrator / Terminal / File-explorer / File-editor / Git kind picker)
   panesetup.ts      pure kind-selection + validation core for the welcome screen (DOM-free, unit-tested)
-  orchestration.ts  frontend half of agent groups (panes, badges, focus)
+  orchestration.ts  frontend half of agent groups (panes, badges, focus); also the human-only cross-workspace channel commands + `orch-channel` event routing (#271)
   shortcuts.ts      app-level keybindings (single source of truth)
   fileapi.ts        typed bridge to fileedit.rs (per-feature wrapper, like git.ts)
   fileedit.ts       the file editor (#174): tree + code editor + "Go to file" name search + content search/replace. Two hosts: the Alt+F overlay, and an editor PANE (#217, `embedded`) (DOM wiring)
   fileexplorer.ts   the file MANAGER a files pane hosts (#214): browse, open-with-default-app, new file/folder, rename, delete, context menu, SHA-256 column, Go to file (DOM wiring)
   fileexplorermodel.ts pure file-manager core: listing order, rooted navigation, breadcrumb, formatting, inline-edit validation, op-target binding (DOM-free, unit-tested)
   filemenu.ts       pure context-menu model: what appears, what it acts on (target bound at menu-open) (DOM-free, unit-tested)
-  contextmenu.ts    generic context-menu renderer: placement, submenus, Esc/click-away (DOM wiring)
+  contextmenu.ts    generic context-menu renderer, `MenuItem<A>`: placement, submenus, Esc/click-away (DOM wiring)
+  panemenu.ts       pure pane-header connect-menu model (#271): Connect/Connect-here/Cancel/Disconnect per pane + pending-arm state (DOM-free, unit-tested)
+  channel.ts        pure connect-gesture reducer (arm/complete/cancel) + per-channel color/number chip derivation (#271) (DOM-free, unit-tested)
   filehashmodel.ts  pure hashing policy: auto-hash threshold, digest cache keying (path+size+mtime), formatting (DOM-free, unit-tested)
   filemgr.ts        typed bridge to filemgr.rs + filehash.rs (per-feature wrapper, like fileapi.ts)
   filematch.ts      pure file-NAME matching + ranking for "Go to file" (#214, DOM-free, unit-tested)
