@@ -3044,6 +3044,19 @@ pub struct Channel {
     /// Designated at connect time (human, explicit arrow) and swappable only
     /// via `OrchRegistry::set_sender` (human-only, audited `channel-direction`).
     pub sender: String,
+    /// The UI-facing channel number (#271 follow-up, PR #285 live-testing
+    /// feedback): the lowest positive integer not currently used by any
+    /// OTHER live channel, assigned once at mint time and then immutable for
+    /// this channel's lifetime. Deliberately NOT `id`'s numeric suffix — `id`
+    /// (`chan-N`) is minted from `channel_seq`, a monotonic counter that must
+    /// never reuse a value (an audit record for `chan-1` must never become
+    /// ambiguous with a later, unrelated `chan-1`), so after chan-1 closes
+    /// the NEXT channel is still `chan-2` even though nothing numbered "1" is
+    /// active. `display_number` is the thing the pane chip actually shows —
+    /// it frees up "1" the moment chan-1 closes, so the chip always reflects
+    /// how many channels are ACTUALLY connected right now, not how many have
+    /// ever existed. See `OrchRegistry::next_display_number`.
+    pub display_number: u32,
 }
 
 fn now_ms() -> u64 {
@@ -6075,6 +6088,27 @@ impl OrchRegistry {
             .collect()
     }
 
+    /// Lowest positive integer not currently used as a `display_number` by
+    /// any live channel (#271 follow-up) — chan-1 closing frees up "1" for
+    /// the next mint; with actives `{1, 3}` the next mint gets `2`, not `4`.
+    /// Called while holding `channels`'s lock (the caller already does, to
+    /// insert the new `Channel`), so this can't race a concurrent mint into
+    /// picking the same number twice. O(n log n) over currently-live
+    /// channels — a human-driven count, never large enough to matter.
+    fn next_display_number(channels: &HashMap<String, Channel>) -> u32 {
+        let mut used: Vec<u32> = channels.values().map(|c| c.display_number).collect();
+        used.sort_unstable();
+        let mut candidate = 1;
+        for n in used {
+            if n == candidate {
+                candidate += 1;
+            } else if n > candidate {
+                break;
+            }
+        }
+        candidate
+    }
+
     /// Human-only (CLAUDE.md constraint 5 — called from a Tauri command,
     /// never reachable from MCP): connect two agent panes into a channel.
     /// - both free → mints a new channel with both as members.
@@ -6217,10 +6251,12 @@ impl OrchRegistry {
                 }
                 let seq = self.channel_seq.fetch_add(1, Ordering::Relaxed) + 1;
                 let id = format!("chan-{seq}");
+                let display_number = Self::next_display_number(&channels);
                 let ch = Channel {
                     id: id.clone(),
                     created_ms: now_ms(),
                     sender: sender_agent.to_string(),
+                    display_number,
                     members: vec![
                         ChannelMember {
                             group: a.group.clone(),
@@ -6258,7 +6294,10 @@ impl OrchRegistry {
         if let Some(app) = self.app.lock_safe().clone() {
             let _ = app.emit(
                 "orch-channel",
-                json!({ "kind": "connected", "channel_id": ch.id, "sender": ch.sender, "members": member_json }),
+                json!({
+                    "kind": "connected", "channel_id": ch.id, "sender": ch.sender,
+                    "display_number": ch.display_number, "members": member_json,
+                }),
             );
         }
         let a_label = self.channel_member_label(&ChannelMember {
@@ -6302,7 +6341,10 @@ impl OrchRegistry {
         // both of which key the id `channel_id` on purpose (matching
         // `ChannelDisconnectResult`/`OrchChannelEvent`) — only this value
         // must match `OrchChannel`.
-        Ok(json!({ "id": ch.id, "created_ms": ch.created_ms, "sender": ch.sender, "members": member_json }))
+        Ok(json!({
+            "id": ch.id, "created_ms": ch.created_ms, "sender": ch.sender,
+            "display_number": ch.display_number, "members": member_json,
+        }))
     }
 
     /// Human-only (constraint 5): remove `agent` from its channel. If
@@ -6322,6 +6364,7 @@ impl OrchRegistry {
             .ok_or_else(|| format!("{agent} is not connected to any channel"))?;
         let ch = channels.get_mut(&chan_id).expect("agent_channel/channels must agree");
         let sender = ch.sender.clone();
+        let display_number = ch.display_number;
         let lost_sender = sender == agent;
         ch.members.retain(|m| m.agent_id != agent);
         let remaining = ch.members.clone();
@@ -6351,6 +6394,7 @@ impl OrchRegistry {
                     // still correct here: the still-open branch (`!closed`)
                     // is only reached when `agent` was a receiver, i.e. the
                     // sender is unchanged and still among `remaining`.
+                    "display_number": display_number,
                     "members": self.channel_members_json(&sender, &remaining),
                 }),
             );
@@ -6522,7 +6566,7 @@ impl OrchRegistry {
             .collect();
         json!({
             "connected": true, "channel_id": chan_id, "sender": ch.sender,
-            "can_send": my_can_send, "peers": peers,
+            "display_number": ch.display_number, "can_send": my_can_send, "peers": peers,
         })
     }
 
@@ -6539,6 +6583,7 @@ impl OrchRegistry {
                 "id": c.id,
                 "created_ms": c.created_ms,
                 "sender": c.sender,
+                "display_number": c.display_number,
                 "members": self.channel_members_json(&c.sender, &c.members),
             }))
             .collect::<Vec<_>>())
@@ -6559,7 +6604,7 @@ impl OrchRegistry {
         let ch = self.channels.lock_safe().get(&chan_id).cloned();
         match ch {
             Some(c) => json!({
-                "id": c.id, "sender": c.sender,
+                "id": c.id, "sender": c.sender, "display_number": c.display_number,
                 "members": self.channel_members_json(&c.sender, &c.members),
             }),
             None => Value::Null,
@@ -6609,7 +6654,8 @@ impl OrchRegistry {
                 "orch-channel",
                 json!({
                     "kind": "updated", "channel_id": channel_id,
-                    "sender": new_sender_agent, "members": member_json,
+                    "sender": new_sender_agent, "display_number": ch_clone.display_number,
+                    "members": member_json,
                 }),
             );
         }
@@ -6623,7 +6669,10 @@ impl OrchRegistry {
             };
             let _ = self.deliver_prompt(&m.agent_id, note, "loomux", Delivery::MidSession);
         }
-        Ok(json!({ "id": channel_id, "sender": new_sender_agent, "members": member_json }))
+        Ok(json!({
+            "id": channel_id, "sender": new_sender_agent,
+            "display_number": ch_clone.display_number, "members": member_json,
+        }))
     }
 
     // ---------- standalone panes (#271 W3 addendum, part A) ----------
