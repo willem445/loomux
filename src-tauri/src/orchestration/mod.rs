@@ -1045,7 +1045,6 @@ loomux_pid_alive() {
 
 SLOT_PATH=""
 loomux_try_acquire() {
-  return 0   # XXX #318 W2 INERT STUB — test-red evidence, reverted next commit
   i=1
   while [ "$i" -le "$MATCH_N" ]; do
     cand="$slot_root/slot.$i"
