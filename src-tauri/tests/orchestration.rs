@@ -8968,7 +8968,11 @@ fn a_hard_killed_holder_leaks_no_slot_the_reaper_reclaims_it() {
         .env("LOOMUX_GROUP_DIR", &group_dir)
         .spawn()
         .unwrap();
-    wait_for_file(&markers.join("holder.started"), Duration::from_secs(5));
+    // A generous bound: a cold sh.exe spawn under loaded CI (many parallel
+    // test-threads each spawning their own shims) can take real wall-clock
+    // time that a fixed-cargo-build-worth-of-headroom accounts for; this is
+    // proving out a reaper, not a latency budget.
+    wait_for_file(&markers.join("holder.started"), Duration::from_secs(20));
     let slot = group_dir.join("resource_slots").join("heavy-build").join("slot.1");
     assert!(slot.is_dir(), "the holder must have actually acquired the (only) slot");
 
@@ -8984,7 +8988,7 @@ fn a_hard_killed_holder_leaks_no_slot_the_reaper_reclaims_it() {
         .env("LOOMUX_GROUP_DIR", &group_dir)
         .spawn()
         .unwrap();
-    wait_for_file(&markers.join("second.started"), Duration::from_secs(5));
+    wait_for_file(&markers.join("second.started"), Duration::from_secs(20));
     // `second` is now itself holding the reclaimed slot mid-sleep — kill it too
     // rather than waiting out its sleep; the assertions below don't need it to finish.
     let mut second = second;
@@ -9008,10 +9012,17 @@ fn five_concurrent_callers_never_exceed_two_slots_at_once() {
     let log = root.join("build.log");
     let fake = root.join("fakebuild");
     let shim = root.join("build");
+    // Whole-second `date +%s` — NOT `%s%3N`: that's a GNU date extension, and
+    // BSD/macOS `date` doesn't understand `%N`, so it prints the literal
+    // characters instead of milliseconds (e.g. "17841281443N"), which broke
+    // this test's own log parsing on macOS (`i64` parse failure silently
+    // dropped every event — a bug in this TEST script, not in the shim, which
+    // never uses %N for anything load-bearing). `sleep 2` keeps waves
+    // separated well past 1-second granularity.
     write_fake_and_shim(
         &fake,
         &format!(
-            "#!/bin/sh\nprintf 'start %s\\n' \"$(date +%s%3N)\" >> \"{log}\"\nsleep 1\nprintf 'end %s\\n' \"$(date +%s%3N)\" >> \"{log}\"\nexit 0\n",
+            "#!/bin/sh\nprintf 'start %s\\n' \"$(date +%s)\" >> \"{log}\"\nsleep 2\nprintf 'end %s\\n' \"$(date +%s)\" >> \"{log}\"\nexit 0\n",
             log = log.display()
         ),
         &shim,

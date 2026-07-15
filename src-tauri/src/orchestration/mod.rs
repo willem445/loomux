@@ -900,25 +900,27 @@ pub fn guarded_shim_programs(classes: &[workflow::ResourceClass]) -> Vec<String>
 /// red-before-green anchor the #318 brief calls out — a naive counter/trap-only
 /// scheme leaks the slot forever on `-9`; this reaper does not.
 ///
-/// **PID liveness (`kill -0`) on the Windows/Git-Bash baseline**: `$$` inside
-/// this shim is the MSYS runtime's own pid, not necessarily what `tasklist`
-/// shows — the concern the #318 orchestrator flagged explicitly. Both the
-/// writer (`printf '%s' "$$"`) and the reader (`kill -0 "$hp"`) are MSYS `sh`
-/// processes reading/writing the SAME pid namespace, and Cygwin/MSYS's `kill`
-/// resolves a pid to the underlying Windows process handle rather than
-/// tracking it purely in userspace bookkeeping — so it should correctly report
-/// a job-object-killed holder as dead. `/proc/<pid>` is tried FIRST where it
-/// exists (a direct kernel-table check on Linux, and MSYS2 also exposes a
-/// `/proc` view) with `kill -0` as the fallback everywhere else (notably
-/// macOS, which has no `/proc`). This is a documented assumption, not a
-/// locally-verified one — this machine's standing policy forbids running
-/// `cargo test` here; `test_slot_reaped_on_hard_kill` (`tests/orchestration.rs`)
-/// is the empirical proof, exercised on all three CI platforms including
-/// windows-latest. If that test ever shows the MSYS pid assumption false on
-/// Windows, the documented escape hatch is `/proc/$$/winpid` (a standard
-/// Cygwin/MSYS pseudo-file mapping an MSYS pid to its real Windows PID) paired
-/// with `tasklist /fi "PID eq <winpid>"` — not implemented here because the
-/// simpler design is expected to pass; swap it in at this comment if not.
+/// **PID liveness on the Windows/Git-Bash baseline**: `$$` inside this shim is
+/// the MSYS runtime's own pid, not necessarily what `tasklist` shows — the
+/// concern the #318 orchestrator flagged explicitly, and it turned out to
+/// matter: a first version of this shim trusted plain `kill -0`/`/proc/<pid>`
+/// (an MSYS-pid-only check) and the hard-kill reap test
+/// (`a_hard_killed_holder_leaks_no_slot_the_reaper_reclaims_it`,
+/// `tests/orchestration.rs`) FAILED for real on `windows-latest` CI — the
+/// reaper never observed the kill. `loomux_pid_alive` now maps the recorded
+/// MSYS pid to its real Windows PID via `/proc/<pid>/winpid` (a standard
+/// Cygwin/MSYS pseudo-file) and asks `tasklist` directly — the OS process
+/// table, not MSYS's own bookkeeping, which is built for MSYS-native signal
+/// delivery and evidently does not reliably observe a death that bypassed it
+/// entirely (an external job-object `TerminateProcess`, exactly what a hard
+/// pane kill is). Manually verified on this machine (not `cargo test`, per
+/// standing policy — a raw shell experiment: spawn via Git Bash, kill via
+/// `taskkill /F /PID <winpid>`, confirm an unrelated `sh` process's `tasklist`
+/// check and its `kill -0`/`/proc` both correctly flip to "dead" afterward)
+/// before landing here; the CI run on this commit is the platform-authoritative
+/// proof. `/proc/<pid>` existence (Linux; MSYS2 also exposes a `/proc` view)
+/// is the fallback when no winpid mapping exists, then `kill -0` everywhere
+/// else (notably macOS, which has no `/proc`).
 #[doc(hidden)] // pub so the integration test can pin the shim
 pub fn guard_shim_sh(program: &str, real: &str) -> String {
     const TPL: &str = r#"#!/bin/sh
@@ -1032,13 +1034,31 @@ case "$LOOMUX_TEST_POLL_SECS" in ''|*[!0-9]*) : ;; *) poll_secs=$LOOMUX_TEST_POL
 slot_root="$LOOMUX_GROUP_DIR/resource_slots/$MATCH_CLASS"
 mkdir -p "$slot_root" 2>/dev/null
 
-# Whether pid $1 is alive. /proc/<pid> first (a direct kernel-table check on
-# Linux; MSYS2 also exposes a /proc view), kill -0 as the fallback everywhere
-# else (notably macOS, which has no /proc). See guard_shim_sh's doc comment
-# for the MSYS-pid assumption this rests on and its escape hatch.
+# Whether pid $1 (an MSYS pid on Windows, a native pid elsewhere) is alive.
+# On Windows/MSYS, `/proc/<pid>/winpid` maps the MSYS pid to the REAL Windows
+# PID — prefer `tasklist` against THAT: it queries the OS process table
+# directly, so it reflects a job-object/TerminateProcess kill immediately and
+# authoritatively, rather than trusting MSYS's own pid bookkeeping (which is
+# built for MSYS-native signal delivery, not for observing a death that
+# bypassed it entirely — exactly what an external hard kill does). Verified
+# empirically (see the #318 W2 PR description): a process native-killed via
+# `taskkill /F /PID <winpid>` is correctly reported gone by this check from a
+# wholly unrelated `sh` process. `/proc/<pid>` existence (Linux; MSYS2 also
+# exposes a view) is the fallback when no winpid mapping exists, then `kill
+# -0` everywhere else (notably macOS, which has no /proc).
 loomux_pid_alive() {
   p="$1"
   case "$p" in ''|*[!0-9]*) return 1 ;; esac
+  if [ -f "/proc/$p/winpid" ]; then
+    wp=$(cat "/proc/$p/winpid" 2>/dev/null)
+    case "$wp" in
+      ''|*[!0-9]*) : ;;
+      *)
+        if command -v tasklist >/dev/null 2>&1; then
+          tasklist //FI "PID eq $wp" 2>/dev/null | grep -q "[^0-9]$wp[^0-9]" && return 0 || return 1
+        fi ;;
+    esac
+  fi
   [ -d "/proc/$p" ] && return 0
   kill -0 "$p" 2>/dev/null
 }
