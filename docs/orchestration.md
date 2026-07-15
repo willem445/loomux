@@ -402,6 +402,22 @@ Enforced by loomux, not the model:
 - the permission mode fixed at group creation (native auto mode or acceptEdits —
   never bypass).
 
+### Compact-nudge
+
+The orchestrator pane lives for the whole session and every turn re-reads its entire
+history — it's typically the biggest token consumer in a group. Loomux can drive Claude
+Code's own `/compact` for it at a natural lull: once an eligible pane has been idle at its
+input prompt (the same output-quiet signal the watchdog and idle-tick already read — never
+mid-turn) past a configured window, loomux pastes `/compact` for it exactly like any other
+prompt delivery — no PTY resize, no new agent capability — and it never overwrites text
+you're mid-typing (a held nudge is silently skipped, not queued; it just tries again at the
+next natural lull).
+
+Off by default. A group opts in with a quiet-window (minutes) and, optionally, which roles
+are eligible — the orchestrator only, by default, since workers are short-lived and rarely
+worth compacting. `/compact` is a Claude Code built-in, so the nudge only ever fires for
+Claude Code panes.
+
 ## Persistence & restart
 
 Each group keeps durable state under

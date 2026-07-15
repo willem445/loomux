@@ -13,7 +13,8 @@ use loomux_lib::orchestration::{
     add_trusted_folder, autonomy_budget_exhausted, bracketed_paste, box_occupancy_delta,
     channel_connected_event, channel_disconnected_event, channel_message_text,
     channel_updated_event, classify_human_input,
-    claude_permission_mode, cli_ready, copilot_autopilot_prompt_detected, create_orchestration_group,
+    claude_permission_mode, cli_ready, compact_nudge_cli_supported, compact_nudge_notice,
+    compact_nudge_role_allowed, copilot_autopilot_prompt_detected, create_orchestration_group,
     delivery_held_cleared_event, delivery_held_detail, delivery_held_event,
     exit_cause, exit_diagnostic, resolve_output_text,
     gh_gate_decision, gh_is_merge_invocation, gh_positionals, gh_release_action, gh_repo_flag,
@@ -5123,6 +5124,229 @@ fn idle_tick_status_reports_paused_with_no_countdown() {
     let s = reg.autonomy_state(&gid);
     assert_eq!(s["tick_status"], "counting_down", "resume restores the live countdown");
     assert!(s["eligible_in_secs"].as_u64().is_some());
+}
+
+// ---------- compact-nudge: periodic /compact at natural lulls (#287) ----------
+
+/// Guardrails on Claude with compact-nudge set to `minutes` (0 = off) for the
+/// given `roles` (lowercase `Role::as_str()` names), other fields mirroring
+/// `rails()`.
+fn compact_rails(minutes: u32, roles: &[&str]) -> Guardrails {
+    Guardrails {
+        compact_nudge_minutes: minutes,
+        compact_nudge_roles: roles.iter().map(|s| s.to_string()).collect(),
+        ..rails()
+    }
+}
+
+/// Group with a live (Running, headless) orchestrator and compact-nudge
+/// enabled for `minutes` on the default (orchestrator-only) role set. Returns
+/// (reg, tempdir, group id, orchestrator id).
+fn compact_nudge_setup(minutes: u32) -> (OrchRegistry, tempfile::TempDir, String, String) {
+    let (reg, dir) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", compact_rails(minutes, &["orchestrator"])).unwrap();
+    let o = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    (reg, dir, g.id, o.id)
+}
+
+#[test]
+fn compact_nudge_role_gate_defaults_to_orchestrator_only() {
+    let default_roles = vec!["orchestrator".to_string()];
+    assert!(compact_nudge_role_allowed(Role::Orchestrator, &default_roles));
+    assert!(!compact_nudge_role_allowed(Role::Worker, &default_roles),
+        "workers are short-lived — not eligible unless explicitly configured");
+    assert!(!compact_nudge_role_allowed(Role::Reviewer, &default_roles));
+    assert!(!compact_nudge_role_allowed(Role::Planner, &default_roles));
+    // Config-selectable: a group that opts a worker in gets exactly that.
+    let widened = vec!["orchestrator".to_string(), "worker".to_string()];
+    assert!(compact_nudge_role_allowed(Role::Worker, &widened));
+    assert!(!compact_nudge_role_allowed(Role::Reviewer, &widened));
+}
+
+#[test]
+fn compact_nudge_cli_gate_is_claude_only() {
+    // `/compact` is a Claude Code built-in; no other supported CLI has an
+    // equivalent, so the nudge must never fire for them.
+    assert!(compact_nudge_cli_supported("claude"));
+    assert!(!compact_nudge_cli_supported("copilot"));
+    assert!(!compact_nudge_cli_supported("codex"));
+    assert!(!compact_nudge_cli_supported(""));
+}
+
+#[test]
+fn compact_nudge_notice_names_the_resync_ritual() {
+    let n = compact_nudge_notice();
+    assert!(n.starts_with("[loomux]"));
+    assert!(n.contains("list_tasks") && n.contains("get_state") && n.contains("list_agents"),
+        "the optional follow-up must point at the same re-sync ritual the templates teach, got: {n}");
+}
+
+#[test]
+fn compact_nudge_defaults_off_and_orchestrator_only_and_zero_survives_clamping() {
+    // The conservative shipped default: off, and — if ever turned on without an
+    // explicit role list — orchestrator-only.
+    let g = Guardrails::default().clamped();
+    assert_eq!(g.compact_nudge_minutes, 0, "off by default");
+    assert_eq!(g.compact_nudge_roles, vec!["orchestrator".to_string()]);
+    // Unlike `idle_tick_minutes`, 0 here is a real "off", not "unset → default"
+    // (there is no separate on/off marker) — clamped() must never float it up.
+    let g = Guardrails { compact_nudge_minutes: 0, ..rails() }.clamped();
+    assert_eq!(g.compact_nudge_minutes, 0);
+    let g = Guardrails { compact_nudge_minutes: 99_999, ..rails() }.clamped();
+    assert_eq!(g.compact_nudge_minutes, 1440, "clamps to the 24h ceiling");
+    // Unrecognized role names are dropped and duplicates deduped; an all-bogus
+    // list falls back to orchestrator-only rather than disabling every role.
+    let g = Guardrails {
+        compact_nudge_roles: vec!["bogus".into(), "worker".into(), "worker".into()],
+        ..rails()
+    }
+    .clamped();
+    assert_eq!(g.compact_nudge_roles, vec!["worker".to_string()]);
+    let g = Guardrails { compact_nudge_roles: vec!["bogus".into()], ..rails() }.clamped();
+    assert_eq!(g.compact_nudge_roles, vec!["orchestrator".to_string()]);
+}
+
+#[test]
+fn compact_nudge_off_by_default_never_fires() {
+    let (reg, _d, gid, _oid) = compact_nudge_setup(0);
+    let empty = HashMap::new();
+    assert!(reg.compact_nudge_tick(FAR, &empty).is_empty(),
+        "compact_nudge_minutes 0 must never fire, no matter how long the pane is quiet");
+    assert_eq!(audit_count(&reg, &gid, "compact-nudge"), 0);
+}
+
+#[test]
+fn compact_nudge_fires_once_per_window_and_rearms_on_output() {
+    let (reg, _d, gid, oid) = compact_nudge_setup(20);
+    let empty = HashMap::new();
+    // Idle-at-prompt (output-quiet) far past the window → exactly one nudge,
+    // audited, delivered via the same idleness signal idle-tick reads.
+    assert_eq!(reg.compact_nudge_tick(FAR, &empty), vec![oid.clone()],
+        "an eligible pane quiet past the window must be nudged");
+    assert_eq!(audit_count(&reg, &gid, "compact-nudge"), 1, "the nudge must be audited once");
+    // Rate limit: still quiet, already latched → no second nudge in the same
+    // window (this is also the "held is skipped, not queued" property at the
+    // tick layer — there is no retry loop, just the one-shot latch).
+    assert!(reg.compact_nudge_tick(FAR + 60_000, &empty).is_empty(), "one nudge per quiet window");
+    // The pane produces real output (mid-turn / busy): clock + latch both
+    // reset, and this very tick can't also fire — "never mid-turn" pinned
+    // directly against the tick's own fire decision.
+    let grew: HashMap<String, u64> = [(oid.clone(), 4096u64)].into_iter().collect();
+    assert!(reg.compact_nudge_tick(FAR, &grew).is_empty(), "output growth is activity, not idle-at-prompt");
+    // No further growth; a whole fresh window elapses → a brand-new nudge.
+    assert_eq!(reg.compact_nudge_tick(FAR + 20 * 60_000 + 1, &grew), vec![oid.clone()],
+        "a new quiet window after activity earns a new nudge");
+    assert_eq!(audit_count(&reg, &gid, "compact-nudge"), 2);
+}
+
+#[test]
+fn compact_nudge_ignores_subfloor_repaint_growth() {
+    // Same repaint-vs-real-turn discrimination idle-tick uses (shared
+    // `idle_activity_floor_bytes` guardrail, shared `idle_output_is_activity`):
+    // a statusline/spinner frame must not indefinitely defer the nudge.
+    let (reg, _d, _gid, oid) = compact_nudge_setup(5);
+    let m = |total: u64| -> HashMap<String, u64> { [(oid.clone(), total)].into_iter().collect() };
+    assert!(reg.compact_nudge_tick(1_000, &m(500)).is_empty(), "an early sub-floor repaint is not a tick");
+    assert_eq!(reg.compact_nudge_tick(FAR, &m(900)), vec![oid.clone()],
+        "sub-floor creep never resets the clock, so the window still elapses");
+}
+
+#[test]
+fn compact_nudge_skips_a_role_not_in_the_eligible_set() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", compact_rails(20, &["orchestrator"])).unwrap();
+    let o = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "work", false, None).unwrap();
+    let empty = HashMap::new();
+    let nudged = reg.compact_nudge_tick(FAR, &empty);
+    assert_eq!(nudged, vec![o.id.clone()], "only the configured (orchestrator) role is eligible");
+    assert!(!nudged.contains(&w.id), "a worker must never be nudged with the default role set");
+}
+
+#[test]
+fn compact_nudge_skips_a_cli_with_no_compact_equivalent() {
+    let (reg, _d) = test_registry();
+    let non_claude_rails = Guardrails {
+        agent_cli: "copilot".into(),
+        compact_nudge_minutes: 20,
+        compact_nudge_roles: vec!["orchestrator".into()],
+        ..rails()
+    };
+    let g = reg.create_group("C:/tmp/repo", non_claude_rails).unwrap();
+    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let empty = HashMap::new();
+    assert!(reg.compact_nudge_tick(FAR, &empty).is_empty(),
+        "/compact has no copilot equivalent — the nudge must never fire for it");
+    assert_eq!(audit_count(&reg, &g.id, "compact-nudge"), 0);
+}
+
+#[test]
+fn compact_nudge_skips_a_paused_group_preserving_the_latch() {
+    let (reg, _d, gid, oid) = compact_nudge_setup(20);
+    let empty = HashMap::new();
+    reg.pause_group(&gid).unwrap();
+    assert!(reg.compact_nudge_tick(FAR, &empty).is_empty(), "a paused group is never nudged");
+    assert_eq!(audit_count(&reg, &gid, "compact-nudge"), 0);
+    // The one-shot latch/rate budget must be intact: pausing must not have
+    // burned it, so on resume the outstanding quiet window still earns its
+    // first nudge.
+    reg.resume_group(&gid).unwrap();
+    assert_eq!(reg.compact_nudge_tick(FAR, &empty), vec![oid.clone()],
+        "resuming a still-idle eligible pane earns its first nudge");
+}
+
+#[test]
+fn compact_nudge_rate_limit_holds_under_the_per_hour_cap() {
+    let (reg, _d, gid, oid) = compact_nudge_setup(5); // 5-minute quiet window
+    let m = |t: u64| -> HashMap<String, u64> { [(oid.clone(), t)].into_iter().collect() };
+    let none = HashMap::new();
+    let win = 5 * 60_000u64;
+    let mut t = FAR;
+    // The per-hour cap is 4: drive four full fire/reset cycles, each needing
+    // the latch cleared (a real burst) then a full window of quiet.
+    for i in 0u64..4 {
+        assert_eq!(reg.compact_nudge_tick(t, &none), vec![oid.clone()], "nudge {i} under the cap");
+        t += 1_000;
+        assert!(reg.compact_nudge_tick(t, &m(1_000_000 + i * 200_000)).is_empty(), "burst {i} resets the latch");
+        t += win + 1;
+    }
+    assert_eq!(audit_count(&reg, &gid, "compact-nudge"), 4);
+    // Latch is clear and the quiet window has fully elapsed again — the ONLY
+    // thing standing between here and a fifth nudge is the per-hour cap.
+    assert!(reg.compact_nudge_tick(t, &none).is_empty(),
+        "the per-hour cap must hold even though the quiet window elapsed again");
+    assert_eq!(audit_count(&reg, &gid, "compact-nudge"), 4, "cap must not be exceeded");
+}
+
+#[test]
+fn compact_nudge_minutes_and_roles_are_configurable_persisted_and_audited() {
+    let (reg, dir, gid, _oid) = compact_nudge_setup(0);
+    assert_eq!(reg.group(&gid).unwrap().guardrails.compact_nudge_minutes, 0, "off at launch");
+    assert_eq!(reg.set_compact_nudge_minutes(&gid, 15).unwrap(), 15);
+    assert_eq!(reg.group(&gid).unwrap().guardrails.compact_nudge_minutes, 15);
+    assert_eq!(audit_count(&reg, &gid, "compact-nudge-minutes-set"), 1);
+    assert_eq!(reg.set_compact_nudge_minutes(&gid, 99_999).unwrap(), 1440, "clamps to the ceiling");
+    assert_eq!(reg.set_compact_nudge_minutes(&gid, 0).unwrap(), 0, "0 stays off, never floored to a default");
+    assert!(reg.set_compact_nudge_minutes("no-such-group", 5).is_err());
+    reg.set_compact_nudge_minutes(&gid, 15).unwrap();
+
+    let roles = reg.set_compact_nudge_roles(&gid, vec!["orchestrator".into(), "worker".into()]).unwrap();
+    assert_eq!(roles, vec!["orchestrator".to_string(), "worker".to_string()]);
+    assert_eq!(reg.group(&gid).unwrap().guardrails.compact_nudge_roles, roles);
+    assert_eq!(audit_count(&reg, &gid, "compact-nudge-roles-set"), 1);
+    // Unrecognized entries dropped; an empty result falls back to orchestrator-only.
+    assert_eq!(reg.set_compact_nudge_roles(&gid, vec!["bogus".into()]).unwrap(), vec!["orchestrator".to_string()]);
+    assert!(reg.set_compact_nudge_roles("no-such-group", vec![]).is_err());
+
+    reg.set_compact_nudge_roles(&gid, vec!["orchestrator".into(), "worker".into()]).unwrap();
+    // Persisted across restart (live-set values win over the launch default).
+    let reg2 = OrchRegistry::new(dir.path().to_path_buf());
+    reg2.set_port(45999);
+    reg2.create_group("C:/tmp/repo", rails()).unwrap();
+    let persisted = &reg2.group(&gid).unwrap().guardrails;
+    assert_eq!(persisted.compact_nudge_minutes, 15, "a live-set window survives restart");
+    assert_eq!(persisted.compact_nudge_roles, vec!["orchestrator".to_string(), "worker".to_string()],
+        "live-set roles survive restart");
 }
 
 // ---------- enforced merge gate (#83) ----------

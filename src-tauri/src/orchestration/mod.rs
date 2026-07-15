@@ -132,6 +132,17 @@ pub fn workflow_mode_notice(on: bool, name: &str, gate: Option<&workflow::Gate>)
     )
 }
 
+/// The optional post-compact notice (#287): delivered right after loomux pastes
+/// `/compact` for an eligible pane, so a persona that predates (or diverges
+/// from) the built-in re-sync ritual still knows to re-ground itself. The
+/// orchestrator template already teaches `list_tasks` + `get_state` +
+/// `list_agents` after any compaction, so this is belt-and-suspenders, not
+/// load-bearing — kept in one place so the wording can't drift from what the
+/// template documents.
+pub fn compact_nudge_notice() -> &'static str {
+    "[loomux] context compacted — re-sync before acting (list_tasks, get_state, list_agents)"
+}
+
 /// One-line notice delivered to the orchestrator when the auto-merge gate is
 /// toggled mid-session (#83), so it learns the new merge policy without waiting to
 /// re-read its kickoff config.
@@ -1105,6 +1116,14 @@ const MAX_IDLE_ACTIVITY_FLOOR_BYTES: u64 = 1024 * 1024;
 /// the tick source. With a minutes-scale quiet gate the latch already bounds this
 /// near ~one per window; the cap catches any pathological re-arm. 0 would disable it.
 const MAX_IDLE_TICKS_PER_HOUR: u32 = 6;
+/// Compact-nudge (#287): upper bound on `compact_nudge_minutes` (24h); 0 is
+/// "off", not clamped away — see `Guardrails::clamped`.
+const MAX_COMPACT_NUDGE_MINUTES: u32 = 1440;
+/// Compact-nudge (#287): hard backstop on `/compact` nudges delivered per
+/// rolling hour, independent of the one-shot latch — same role as
+/// `MAX_IDLE_TICKS_PER_HOUR` for the idle tick, reused via the same
+/// `idle_tick_should_fire` gate (see `compact_nudge_tick`).
+const MAX_COMPACT_NUDGES_PER_HOUR: u32 = 4;
 /// How often the attention scan recomputes which panes need the human
 /// (idle-with-prompt detection; report/gate signals are event-driven and
 /// picked up on the next tick).
@@ -1771,6 +1790,23 @@ pub struct Guardrails {
     /// `set_idle_activity_floor` so a chattier CLI whose idle repaints exceed the
     /// default has a runtime remedy (rev-59). See `idle_output_is_activity`.
     pub idle_activity_floor_bytes: u64,
+    /// Compact-nudge (#287): how long an eligible pane must be idle at its input
+    /// prompt (output-quiet, the SAME clock `idle_tick_minutes` reads — see
+    /// `compact_nudge_tick`) before loomux pastes `/compact` for it. Unlike
+    /// `idle_tick_minutes`, 0 here means the feature is OFF — there is no
+    /// separate on/off marker for compact-nudge, so this single field is both
+    /// the switch and the interval, mirroring `watchdog_stall_minutes` /
+    /// `idle_kill_minutes`. Persisted in group.json, live-settable via
+    /// `set_compact_nudge_minutes`. Conservative default: off.
+    pub compact_nudge_minutes: u32,
+    /// Compact-nudge (#287): which capability classes are eligible for the
+    /// automatic `/compact` nudge, as lowercase role names (`Role::as_str`).
+    /// `clamped()` drops unrecognized entries and falls back to
+    /// `["orchestrator"]` if that leaves it empty — workers/reviewers are
+    /// short-lived, so the orchestrator (the one pane whose lifetime cache-read
+    /// volume this feature exists to cut) is the sane default. Persisted in
+    /// group.json, live-settable via `set_compact_nudge_roles`.
+    pub compact_nudge_roles: Vec<String>,
 }
 
 impl Guardrails {
@@ -1857,6 +1893,18 @@ impl Guardrails {
         }
         self.idle_activity_floor_bytes =
             self.idle_activity_floor_bytes.clamp(1, MAX_IDLE_ACTIVITY_FLOOR_BYTES);
+        // Compact-nudge (#287): 0 stays 0 (off) — only cap a too-large value.
+        self.compact_nudge_minutes = self.compact_nudge_minutes.min(MAX_COMPACT_NUDGE_MINUTES);
+        // Unrecognized role names (typos, a stale/future value) are dropped
+        // rather than rejected — a hand-edited group.json with a bad entry
+        // should not crash the group, just silently not grant that role
+        // eligibility. Sorted + deduped for a stable persisted/reported shape.
+        self.compact_nudge_roles.retain(|r| workflow::kind_from_str(r).is_some());
+        self.compact_nudge_roles.sort();
+        self.compact_nudge_roles.dedup();
+        if self.compact_nudge_roles.is_empty() {
+            self.compact_nudge_roles = vec![Role::Orchestrator.as_str().to_string()];
+        }
         self
     }
 
@@ -2189,6 +2237,25 @@ pub fn idle_tick_should_fire(
 /// activity; sub-floor growth is noise and leaves the quiet clock running.
 pub fn idle_output_is_activity(prev_total: u64, cur_total: u64, floor: u64) -> bool {
     cur_total.saturating_sub(prev_total) >= floor
+}
+
+/// Compact-nudge (#287): whether `role`'s capability class is one of the
+/// group's configured eligible roles for the automatic `/compact` nudge. Pure
+/// so role gating is testable without a registry. `allowed_roles` is
+/// `Guardrails::compact_nudge_roles` after `clamped()` (lowercase
+/// `Role::as_str()` names; never empty for a group that went through it).
+pub fn compact_nudge_role_allowed(role: Role, allowed_roles: &[String]) -> bool {
+    allowed_roles.iter().any(|r| r == role.as_str())
+}
+
+/// Compact-nudge (#287): whether `cli` has a `/compact` equivalent loomux can
+/// drive the same way (a bare pane write + CR). `/compact` is a Claude Code
+/// built-in; no other supported CLI (copilot, codex, gemini, …) exposes one,
+/// so the nudge is gated to exactly this CLI rather than typing a junk slash
+/// command into an agent that doesn't understand it. Pure so the gate is
+/// testable without a registry; `cli` comes from `Guardrails::cli_for`.
+pub fn compact_nudge_cli_supported(cli: &str) -> bool {
+    cli == "claude"
 }
 
 /// Autonomous mode (#83): whether autonomous-era spend has crossed the group's
@@ -2932,6 +2999,13 @@ pub struct AgentEntry {
     /// `last_progress_ms` above double as the idle-tick output counter / quiet
     /// clock for the orchestrator, which the watchdog never touches.
     pub idle_tick_notified: bool,
+    /// Compact-nudge (#287) anti-nag latch, meaningful only for a role in the
+    /// group's `compact_nudge_roles`: set once `/compact` has been pasted for
+    /// the current quiet window, cleared when the pane produces real output
+    /// again. Shares the SAME quiet clock as `idle_tick_notified`
+    /// (`last_progress_ms`/`last_output_total` above) — deliberately the same
+    /// idleness signal, not a second one. See `compact_nudge_tick`.
+    pub compact_nudge_notified: bool,
     /// The actual agent CLI a **solo** pane (`role == Role::Solo`) is
     /// running, e.g. `"codex"`/`"gemini"` — the group-guardrails CLI
     /// resolution (`Guardrails::cli_for`) that every orchestration-group
@@ -3484,6 +3558,10 @@ pub struct OrchRegistry {
     /// for the `MAX_IDLE_TICKS_PER_HOUR` backstop; pruned to the trailing hour on
     /// each check. The runaway analogue of `spawn_times`.
     idle_tick_times: Mutex<HashMap<String, Vec<u64>>>,
+    /// Compact-nudge (#287): per-group `/compact` nudge delivery timestamps
+    /// (Unix-ms) for the `MAX_COMPACT_NUDGES_PER_HOUR` backstop; pruned to the
+    /// trailing hour on each check. Mirrors `idle_tick_times`.
+    compact_nudge_times: Mutex<HashMap<String, Vec<u64>>>,
     /// Debounced cap-change notices (#79): group → its pending, not-yet-
     /// delivered `PendingMaxNotice`. `set_max_agents` folds rapid stepper
     /// clicks in here (persist/enforce/audit stay per-click); the
@@ -4878,6 +4956,7 @@ impl OrchRegistry {
             dangerous_groups: Mutex::new(HashSet::new()),
             spawn_expanded_groups: Mutex::new(HashSet::new()),
             idle_tick_times: Mutex::new(HashMap::new()),
+            compact_nudge_times: Mutex::new(HashMap::new()),
             pending_max_notice: Mutex::new(HashMap::new()),
             claude_projects_dir: Mutex::new(None),
             low_disk_notified: Mutex::new(false),
@@ -5917,6 +5996,13 @@ impl OrchRegistry {
                 idle_tick_minutes: g["idle_tick_minutes"].as_u64().unwrap_or(0) as u32,
                 // Idle-tick activity floor (#83): absent → 0 → clamped() → default.
                 idle_activity_floor_bytes: g["idle_activity_floor_bytes"].as_u64().unwrap_or(0),
+                // Compact-nudge (#287): absent → 0 → off, exactly the conservative
+                // default a group.json written before this field existed means.
+                compact_nudge_minutes: g["compact_nudge_minutes"].as_u64().unwrap_or(0) as u32,
+                compact_nudge_roles: g["compact_nudge_roles"]
+                    .as_array()
+                    .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                    .unwrap_or_default(),
             },
         ))
     }
@@ -6188,6 +6274,24 @@ impl OrchRegistry {
                 } else {
                     persisted.idle_activity_floor_bytes.clamp(1, MAX_IDLE_ACTIVITY_FLOOR_BYTES)
                 };
+                // Compact-nudge (#287) is likewise live-adjustable and persisted;
+                // 0 is a real "off" here (not "unset"), so just re-cap it.
+                guardrails.compact_nudge_minutes =
+                    persisted.compact_nudge_minutes.min(MAX_COMPACT_NUDGE_MINUTES);
+                // Re-run the same role normalization `clamped()` applies (this
+                // overwrite lands after that top-of-fn call, straight from a
+                // raw disk read that never went through it).
+                let mut roles: Vec<String> = persisted
+                    .compact_nudge_roles
+                    .into_iter()
+                    .filter(|r| workflow::kind_from_str(r).is_some())
+                    .collect();
+                roles.sort();
+                roles.dedup();
+                if roles.is_empty() {
+                    roles = vec![Role::Orchestrator.as_str().to_string()];
+                }
+                guardrails.compact_nudge_roles = roles;
             }
         }
         // #255: advisory only — never override a cap the human set. A launcher
@@ -6228,6 +6332,8 @@ impl OrchRegistry {
                 "autonomy_budget_tokens": info.guardrails.autonomy_budget_tokens,
                 "idle_tick_minutes": info.guardrails.idle_tick_minutes,
                 "idle_activity_floor_bytes": info.guardrails.idle_activity_floor_bytes,
+                "compact_nudge_minutes": info.guardrails.compact_nudge_minutes,
+                "compact_nudge_roles": info.guardrails.compact_nudge_roles,
             },
         }))
         .unwrap();
@@ -7778,6 +7884,7 @@ impl OrchRegistry {
             last_output_total: 0,
             watchdog_notified: false,
             idle_tick_notified: false,
+            compact_nudge_notified: false,
             solo_cli: Some(cli.to_string()),
             last_exit_tail: None,
         };
@@ -7887,6 +7994,7 @@ impl OrchRegistry {
             last_output_total: 0,
             watchdog_notified: false,
             idle_tick_notified: false,
+            compact_nudge_notified: false,
             solo_cli: None, // unknown for an adopted pane; cli_for_agent falls back to "claude"
             last_exit_tail: None,
         };
@@ -8102,6 +8210,122 @@ impl OrchRegistry {
         self.enforce_autonomy_budgets(now);
         let (outputs, inputs) = self.orchestrator_activity();
         self.idle_tick_tick(now, &outputs, &inputs)
+    }
+
+    // ---------- compact-nudge (#287): periodic `/compact` at natural lulls ----------
+
+    /// One compact-nudge pass. For each **non-paused** group's running agent
+    /// whose role is in that group's `compact_nudge_roles` and whose CLI
+    /// supports `/compact` (`compact_nudge_cli_supported`), fold in the latest
+    /// pty output counter using the group's `idle_activity_floor_bytes` —
+    /// meaningful growth (a real turn, not idle repaint noise) resets the
+    /// quiet clock and the one-shot latch. This deliberately reads and writes
+    /// the SAME `last_progress_ms`/`last_output_total` fields `idle_tick_tick`
+    /// does (guardrail #1: reuse the idleness signal, don't invent a second
+    /// one) — the two ticks partition cleanly by role in the built-in
+    /// configuration (idle-tick only ever touches the orchestrator while
+    /// autonomous; compact-nudge defaults to the orchestrator too), and even
+    /// where they overlap the bookkeeping is idempotent (both derive the same
+    /// timestamp from the same pty counter).
+    ///
+    /// An eligible pane quiet past its group's `compact_nudge_minutes`, not
+    /// already latched, and under `MAX_COMPACT_NUDGES_PER_HOUR` (reusing
+    /// `idle_tick_should_fire`'s gate — the identical shape, not a copy with a
+    /// new name) gets `/compact` typed through `deliver_prompt`'s normal
+    /// delivery path (`Delivery::MidSession`: a pane write of `/compact` + CR,
+    /// no PTY resize, no new agent capability), immediately followed by the
+    /// optional re-sync notice (`compact_nudge_notice`) — the per-pty delivery
+    /// mutex `deliver_prompt` already takes serializes the two so the notice
+    /// can't paste ahead of the compact submission.
+    ///
+    /// `deliver_prompt` owns never clobbering a human's unsubmitted line
+    /// (#111/#171/#246): if the pane's input box is occupied, it holds up to
+    /// the shipped cap and then silently aborts — a held compact is skipped,
+    /// not queued, exactly like any other delivery to the orchestrator (no
+    /// notice, since a notice about a delivery to the orchestrator would
+    /// itself be a delivery to the orchestrator).
+    ///
+    /// `compact_nudge_minutes` 0 disables the group entirely (the conservative
+    /// default). Paused groups are skipped wholesale — same reasoning as
+    /// `watchdog_tick`/`idle_tick_tick`. Returns the nudged agent ids. Split
+    /// from the pty read (`agent_output_totals`) so the gate/latch/cap/pause
+    /// logic is testable with synthetic counters — the `watchdog_tick` shape.
+    pub fn compact_nudge_tick(&self, now: u64, outputs: &HashMap<String, u64>) -> Vec<String> {
+        let paused = self.paused.lock_safe().clone();
+        // Snapshot per-group guardrails (Clone) rather than per-agent CLI
+        // lookups while holding the agents lock — `Guardrails::cli_for` needs
+        // the whole roster, and `cli_for_agent` would re-lock `self.groups`.
+        let groups: HashMap<String, Guardrails> = self
+            .groups
+            .lock_safe()
+            .iter()
+            .map(|(id, g)| (id.clone(), g.guardrails.clone()))
+            .collect();
+        let tick_times = self.compact_nudge_times.lock_safe().clone();
+
+        let mut to_fire: Vec<(String, String)> = Vec::new();
+        {
+            let mut agents = self.agents.lock_safe();
+            for a in agents.values_mut() {
+                let Some(g) = groups.get(&a.group) else { continue };
+                if a.status != AgentStatus::Running
+                    || !compact_nudge_role_allowed(a.role, &g.compact_nudge_roles)
+                    || !compact_nudge_cli_supported(g.cli_for(a.role))
+                {
+                    continue;
+                }
+                if let Some(&cur) = outputs.get(&a.id) {
+                    let meaningful =
+                        idle_output_is_activity(a.last_output_total, cur, g.idle_activity_floor_bytes);
+                    a.last_output_total = cur; // rebaseline every observation
+                    if meaningful {
+                        a.last_progress_ms = now;
+                        a.compact_nudge_notified = false;
+                        continue;
+                    }
+                }
+                // A paused group's agents are deliberately quiet; never nudge
+                // and never burn the one-shot latch or the per-hour budget.
+                if paused.contains(&a.group) {
+                    continue;
+                }
+                let times = tick_times.get(&a.group).map(Vec::as_slice).unwrap_or(&[]);
+                if false /* TEMP inert seam: red-CI-evidence commit (#287) */ && idle_tick_should_fire(
+                    a.last_progress_ms,
+                    now,
+                    g.compact_nudge_minutes,
+                    a.compact_nudge_notified,
+                    times,
+                    MAX_COMPACT_NUDGES_PER_HOUR,
+                ) {
+                    a.compact_nudge_notified = true;
+                    to_fire.push((a.id.clone(), a.group.clone()));
+                }
+            }
+        }
+
+        let mut nudged = Vec::new();
+        for (id, group) in to_fire {
+            {
+                let mut tt = self.compact_nudge_times.lock_safe();
+                let v = tt.entry(group.clone()).or_default();
+                v.push(now);
+                v.retain(|&t| now.saturating_sub(t) < SPAWN_RATE_WINDOW_MS);
+            }
+            self.audit(&group, "loomux", "compact-nudge", json!({ "agent": id }));
+            let _ = self.deliver_prompt(&id, "/compact", "loomux", Delivery::MidSession);
+            let _ = self.deliver_prompt(&id, compact_nudge_notice(), "loomux", Delivery::MidSession);
+            nudged.push(id);
+        }
+        nudged
+    }
+
+    /// One full compact-nudge cycle: read pty counters, then tick. Called on a
+    /// timer by `start_compact_nudge`; `now` injected so tests drive it
+    /// deterministically.
+    pub fn run_compact_nudge(&self, now: u64) -> Vec<String> {
+        let outputs = self.agent_output_totals();
+        self.compact_nudge_tick(now, &outputs)
     }
 
     // ---------- attention routing: surface which pane needs the human ----------
@@ -8689,10 +8913,19 @@ impl OrchRegistry {
     }
 
     /// Additive crash-safe patch of a single numeric `guardrails.<key>` in
-    /// group.json (preserves every other field; temp-file + atomic rename, the
-    /// `persist_max_agents` pattern). The shared body behind the live-settable
-    /// numeric guardrails (budget, activity floor).
+    /// group.json. The shared body behind the live-settable numeric
+    /// guardrails (budget, activity floor). Thin wrapper over
+    /// `persist_guardrail_json`.
     fn persist_guardrail_u64(&self, group: &str, key: &str, value: u64) -> Result<(), String> {
+        self.persist_guardrail_json(group, key, json!(value))
+    }
+
+    /// Additive crash-safe patch of a single arbitrary-JSON `guardrails.<key>`
+    /// in group.json (preserves every other field; temp-file + atomic rename,
+    /// the `persist_max_agents` pattern). `persist_guardrail_u64` covers the
+    /// numeric guardrails; this is the general form, needed for
+    /// `compact_nudge_roles` (a string array, not a number).
+    fn persist_guardrail_json(&self, group: &str, key: &str, value: Value) -> Result<(), String> {
         let dir = self.group_dir(group);
         let path = dir.join("group.json");
         let mut v: Value = serde_json::from_str(&fs::read_to_string(&path).map_err(|e| e.to_string())?)
@@ -8700,7 +8933,7 @@ impl OrchRegistry {
         let obj = v.as_object_mut().ok_or("group.json root is not a JSON object")?;
         match obj.get_mut("guardrails").and_then(Value::as_object_mut) {
             Some(guard) => {
-                guard.insert(key.into(), json!(value));
+                guard.insert(key.into(), value);
             }
             None => {
                 obj.insert("guardrails".into(), json!({ key: value }));
@@ -8714,6 +8947,70 @@ impl OrchRegistry {
             let _ = fs::remove_file(&tmp);
         }
         Ok(())
+    }
+
+    /// Set a live group's compact-nudge quiet window in minutes on the fly
+    /// (#287). 0 disables the feature entirely — unlike
+    /// `set_idle_tick_minutes`, 0 is a legitimate value here (there is no
+    /// separate on/off marker for compact-nudge), so it is only capped at the
+    /// max, never floored to a default. Written to the in-memory guardrail
+    /// (the compact-nudge loop reads it fresh each pass) and persisted, then
+    /// audited. Returns the applied (clamped) value.
+    pub fn set_compact_nudge_minutes(&self, group: &str, minutes: u32) -> Result<u32, String> {
+        let applied = minutes.min(MAX_COMPACT_NUDGE_MINUTES);
+        let old = self
+            .group(group)
+            .ok_or("unknown group")?
+            .guardrails
+            .compact_nudge_minutes;
+        if applied == old {
+            return Ok(applied);
+        }
+        self.persist_guardrail_u64(group, "compact_nudge_minutes", applied as u64)?;
+        self.groups
+            .lock_safe()
+            .get_mut(group)
+            .ok_or("unknown group")?
+            .guardrails
+            .compact_nudge_minutes = applied;
+        self.audit(group, "human", "compact-nudge-minutes-set",
+            json!({ "from": old, "to": applied }));
+        Ok(applied)
+    }
+
+    /// Set a live group's compact-nudge eligible roles on the fly (#287).
+    /// Unrecognized role names are dropped and the result deduped/sorted —
+    /// `Guardrails::clamped`'s rule, reapplied here since a live setter
+    /// bypasses `clamped()`; an empty result falls back to `["orchestrator"]`
+    /// rather than silently disabling every role. Persisted + audited.
+    /// Returns the applied set.
+    pub fn set_compact_nudge_roles(&self, group: &str, roles: Vec<String>) -> Result<Vec<String>, String> {
+        let mut applied: Vec<String> =
+            roles.into_iter().filter(|r| workflow::kind_from_str(r).is_some()).collect();
+        applied.sort();
+        applied.dedup();
+        if applied.is_empty() {
+            applied = vec![Role::Orchestrator.as_str().to_string()];
+        }
+        let old = self
+            .group(group)
+            .ok_or("unknown group")?
+            .guardrails
+            .compact_nudge_roles
+            .clone();
+        if applied == old {
+            return Ok(applied);
+        }
+        self.persist_guardrail_json(group, "compact_nudge_roles", json!(applied))?;
+        self.groups
+            .lock_safe()
+            .get_mut(group)
+            .ok_or("unknown group")?
+            .guardrails
+            .compact_nudge_roles = applied.clone();
+        self.audit(group, "human", "compact-nudge-roles-set",
+            json!({ "from": old, "to": &applied }));
+        Ok(applied)
     }
 
     /// The group's lifetime usage-token total (live + historical snapshots), the
@@ -11846,6 +12143,7 @@ impl OrchRegistry {
             last_output_total: 0,
             watchdog_notified: false,
             idle_tick_notified: false,
+            compact_nudge_notified: false,
             solo_cli: None,
             last_exit_tail: None,
         };
@@ -12986,6 +13284,22 @@ pub fn start_idle_tick(reg: Arc<OrchRegistry>) {
     });
 }
 
+/// Background loop for compact-nudge (#287): every `IDLE_TICK_INTERVAL` it
+/// pastes `/compact` for any eligible pane (default: the orchestrator, on
+/// Claude Code) that has gone output-quiet past its group's
+/// `compact_nudge_minutes` — the same idleness signal `idle_tick_tick`
+/// reads, not a second one. Off by default (`compact_nudge_minutes == 0`);
+/// non-Claude CLIs and paused groups are skipped inside `run_compact_nudge` /
+/// `compact_nudge_tick`. Reuses `IDLE_TICK_INTERVAL`'s cadence — a 60s wake is
+/// cheap and plenty precise for a minutes-scale quiet gate. Started once at
+/// app setup.
+pub fn start_compact_nudge(reg: Arc<OrchRegistry>) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(IDLE_TICK_INTERVAL);
+        reg.run_compact_nudge(now_ms());
+    });
+}
+
 /// Free bytes on the disk that hosts `path`: the mounted volume whose mount
 /// point is the longest prefix of `path`. `None` if no volume matches (or the
 /// listing is empty), so the caller no-ops rather than guessing.
@@ -13107,6 +13421,10 @@ pub fn create_orchestration(
             // #83: 0 → clamped() applies DEFAULT_IDLE_ACTIVITY_FLOOR_BYTES; live-settable
             // via orch_set_idle_activity_floor.
             idle_activity_floor_bytes: 0,
+            // #287: off at launch (the conservative default); live-settable via
+            // orch_set_compact_nudge_minutes/orch_set_compact_nudge_roles.
+            compact_nudge_minutes: 0,
+            compact_nudge_roles: Vec::new(),
         },
         None,
         None,
@@ -13415,6 +13733,29 @@ pub fn orch_set_idle_activity_floor(
     bytes: u64,
 ) -> Result<u64, String> {
     reg.set_idle_activity_floor(&group_id, bytes)
+}
+
+/// Set a group's compact-nudge quiet window in minutes (#287; 0 = off,
+/// clamped to the max; durable, audited). Returns the applied value.
+#[tauri::command]
+pub fn orch_set_compact_nudge_minutes(
+    reg: tauri::State<Arc<OrchRegistry>>,
+    group_id: String,
+    minutes: u32,
+) -> Result<u32, String> {
+    reg.set_compact_nudge_minutes(&group_id, minutes)
+}
+
+/// Set a group's compact-nudge eligible roles (#287; unrecognized names
+/// dropped, empty falls back to `["orchestrator"]`; durable, audited).
+/// Returns the applied set.
+#[tauri::command]
+pub fn orch_set_compact_nudge_roles(
+    reg: tauri::State<Arc<OrchRegistry>>,
+    group_id: String,
+    roles: Vec<String>,
+) -> Result<Vec<String>, String> {
+    reg.set_compact_nudge_roles(&group_id, roles)
 }
 
 /// The group's autonomous-mode state for the panel: toggles, budget, anchor, and
@@ -13729,6 +14070,7 @@ fn register_orchestrator_pane(
         last_output_total: 0,
         watchdog_notified: false,
         idle_tick_notified: false,
+        compact_nudge_notified: false,
         solo_cli: None,
         last_exit_tail: None,
     };

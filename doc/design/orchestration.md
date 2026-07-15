@@ -1225,6 +1225,84 @@ the two cost/safety controls the unattended-spend risk demands.
   Spawns a tick induces still count against `max_spawns_per_hour`. The human's pause/off-switch
   is instant.
 
+## Compact-nudge (#287)
+
+The orchestrator pane lives for the whole session and every turn re-reads its entire
+history, so its lifetime cache-read volume dwarfs every worker's — observed live during
+the #271/#244 arc, where a manual `/compact` at a lull reclaimed the base cleanly and the
+templates' existing post-compact re-sync convention (`list_tasks` + `get_state` +
+`list_agents`) picked the conversation back up without loss. Loomux already knows when a
+pane is genuinely idle; this automates picking the moment instead of waiting for the
+human to type `/compact` by hand or the CLI's own emergency auto-compact at the context
+limit.
+
+- **Scope note.** The issue's three follow-up comments propose a considerably larger
+  design — an agent-initiated `request_compact()` MCP tool (the agent calls it as the last
+  action of its turn; loomux fires the actual paste once the pane goes idle, rather than an
+  immediate mid-turn write), a pre-compact offload checklist, a context-usage % threshold
+  with escalating nudges, and mandatory post-compact re-injection of the orchestrator's
+  kickoff instructions. This build is scoped to the **original issue body's proposal and
+  guardrails only** — a loomux-timed heuristic nudge, no new agent capability. The comment-
+  driven extensions are filed as a follow-up, #328, rather than silently dropped.
+- **Reuses the SAME idleness signal as the watchdog and idle-tick, not a second one.**
+  `compact_nudge_tick` folds pty output growth into `AgentEntry.last_progress_ms` /
+  `last_output_total` using the identical debounce `idle_tick_tick` uses for the
+  orchestrator (`idle_output_is_activity` against the group's existing
+  `idle_activity_floor_bytes` guardrail — a real turn resets the quiet clock, a
+  sub-floor statusline repaint does not). It does not invent a text-pattern "is this pane
+  at its input prompt" detector; "idle at the input prompt" is read the same way the rest
+  of the orchestration backend already reads it — sustained output silence, not a busy CLI
+  mid-render. The fire decision itself reuses `idle_tick_should_fire` verbatim (the
+  threshold/latch/per-hour-cap shape `watchdog_tick` established and `idle_tick_tick`
+  reused first) rather than a hand-rolled copy, so a new guardrail concept gets the SAME
+  gate, not a similar-looking one. The two ticks partition cleanly in the built-in
+  configuration (idle-tick only ever runs for an autonomous group's orchestrator;
+  compact-nudge defaults to the orchestrator too) and even where a group opts a wider role
+  set in, the shared bookkeeping is idempotent — both derive the same timestamp from the
+  same pty counter, so there is nothing to reconcile between them.
+- **Delivery is a plain `deliver_prompt` call, nothing bespoke.** `compact_nudge_tick`
+  pastes `/compact` + CR to an eligible pane through the exact same delivery path every
+  other prompt uses (`Delivery::MidSession` — no PTY resize, per the hard constraint),
+  followed by the optional `[loomux] context compacted — re-sync before acting` notice.
+  This means the existing human-input paste guard (#111/#171/#246) governs it for free: if
+  the pane's input box holds an unsubmitted human line, `deliver_prompt` holds up to its
+  shipped cap and then aborts without pasting — a held compact is simply **skipped, not
+  queued**. Nothing in `compact_nudge_tick` retries it; the one-shot latch just leaves it
+  latched until the pane produces real output on its own, and the next natural quiet window
+  gets its own fresh chance. The per-pty delivery mutex `deliver_prompt` takes serializes
+  the `/compact` paste and the follow-up notice, so the notice can't land ahead of the
+  compact submission.
+- **Config: a `Guardrails` field, not a marker file or `.loomux/workflow.yml`.** Two knobs
+  were on the table. A marker file (mirroring `notify`/`pause`/`autonomous`) is the
+  established shape for a bare on/off toggle, but compact-nudge needs an interval too, and
+  autonomous mode's own precedent for "toggle + interval" is two mechanisms working
+  together (the `autonomous` marker plus the separate `idle_tick_minutes` guardrail) —
+  overkill for a feature with no other behavior the toggle needs to gate.
+  `.loomux/workflow.yml` was ruled out entirely: it has no scalar-guardrail schema (only
+  blocks/edges/gates), it is repo-authored content that only takes effect when a group opts
+  into `advanced_orchestrator`, and it is validated by a much heavier parser
+  (`parse_workflow`) built for a different kind of config. The closest precedent is a
+  single numeric `Guardrails` field where `0` means off — exactly the shape
+  `watchdog_stall_minutes` and `idle_kill_minutes` already use, persisted straight in
+  `group.json`, no separate marker. `compact_nudge_minutes` follows that: `0` (the shipped
+  default) disables the feature outright; unlike `idle_tick_minutes`, `0` is never floated
+  up to a default, since there is no other marker doing the on/off job.
+  `compact_nudge_roles` (role names, default `["orchestrator"]`) rides the same
+  `Guardrails`/`group.json` path and is live-settable the same way `idle_tick_minutes` is
+  (`set_compact_nudge_minutes` / `set_compact_nudge_roles`, `orch_set_compact_nudge_minutes`
+  / `orch_set_compact_nudge_roles`, mirroring `orch_set_idle_tick_minutes`).
+- **Per-CLI gate.** `/compact` is a Claude Code built-in with no equivalent on the other
+  supported CLIs, so `compact_nudge_cli_supported` gates the nudge to `Guardrails::cli_for`
+  resolving to `"claude"` for the eligible agent's role — an unsupported CLI is silently
+  excluded rather than typing a slash command it won't understand.
+- **Not built here (deferred, filed as a follow-up issue).** The agent-initiated
+  `request_compact()` tool, the pre-compact offload-checklist enforcement, the
+  context-usage-percent escalation ladder, and mandatory kickoff re-injection after every
+  compaction (agent-triggered, threshold-triggered, or a human typing `/compact` by hand).
+  All four need real design work of their own (a new MCP tool surface, a way to detect "did
+  compaction just finish" from pane output, a context-usage estimate with no clean
+  per-CLI signal) that the loomux-timed heuristic nudge doesn't.
+
 ## Enforced merge gate (#83)
 
 Template guidance is not a security boundary. A live incident proved it: an orchestrator merged

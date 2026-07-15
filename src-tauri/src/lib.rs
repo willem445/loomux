@@ -64,6 +64,7 @@ pub fn run() {
             orchestration::start_attention(reg.clone());
             orchestration::start_max_notice_flusher(reg.clone());
             orchestration::start_idle_tick(reg.clone());
+            orchestration::start_compact_nudge(reg.clone());
             orchestration::start_disk_monitor(reg.clone());
             orchestration::start_notify_poller(reg.clone());
             std::thread::spawn(move || orchestration::mcp::serve(reg));
@@ -151,6 +152,8 @@ pub fn run() {
             orchestration::orch_set_autonomy_budget,
             orchestration::orch_set_idle_tick_minutes,
             orchestration::orch_set_idle_activity_floor,
+            orchestration::orch_set_compact_nudge_minutes,
+            orchestration::orch_set_compact_nudge_roles,
             orchestration::orch_autonomy,
             orchestration::orch_group_usage,
             orchestration::orch_group_summary,
