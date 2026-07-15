@@ -41,11 +41,14 @@ pub const LESSONS_BYTE_CAP: usize = 4096;
 /// same way a missing file does — this function has no notion of "malformed
 /// content" because there is no schema for content to violate; the byte cap
 /// below is the only transformation ever applied.
-pub fn load_lessons_note(_repo: &str) -> Option<String> {
-    // TODO(#268 red-evidence stub): always None — replaced by the real
-    // read-and-cap implementation in the next commit, so CI records this
-    // commit's test run as red for the intended reason before the green one.
-    None
+pub fn load_lessons_note(repo: &str) -> Option<String> {
+    let path = Path::new(repo).join(LESSONS_PATH);
+    let text = std::fs::read_to_string(&path).ok()?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(cap(trimmed))
 }
 
 /// Cap `text` to its last `LESSONS_BYTE_CAP` bytes, cut forward to the next
