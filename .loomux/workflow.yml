@@ -17,6 +17,43 @@
 version: 1
 name: loomux
 
+# RESTRICT-ONLY (#318) — see doc/design/resource-guard.md. Throttles the exact
+# commands that caused the incident this feature exists for: enough concurrent
+# workers running `cargo build`/`npm test` at once to make the machine unusable
+# mid-orchestration-run. Each `max:` here is a REQUEST — a machine/group-side
+# `guardrails.resource_guard_limits` override may only lower it, never raise it.
+# (Placed here, before `blocks:`, rather than at the end of the file: the
+# pane's preserving-serializer treats any top-level key it doesn't know about
+# — this one included — the same way it treats `version`/`name`, always
+# emitting it ahead of `blocks:`/`edges:`/`gates:` on a re-save. Writing it
+# anywhere else would make a no-op pane save silently reorder the file.)
+resources:
+  concurrency:
+    # cargo build/check/test all compete for the same CPU + the same target/
+    # incremental-build lock, so one shared pool, not three.
+    - class: rust-build
+      max: 2
+      timeout_minutes: 30
+      commands:
+        - { program: cargo, args: [build] }
+        - { program: cargo, args: [check] }
+        - { program: cargo, args: [test] }
+    # npm run build / npm test on the Node toolchain. `node --test <file>`
+    # (the "one frontend test file" command in CLAUDE.md) is the same CPU cost
+    # under a different program name — but the matcher only ever compares
+    # POSITIONAL tokens with flags skipped (see guard_class_for's doc comment),
+    # so a flag-only distinguisher like `--test` can never appear in a matched
+    # prefix. The only expressible guard for it is bare `node` (no args, i.e.
+    # every `node` invocation) rather than `node --test` specifically — an
+    # honest schema limit, not an oversight.
+    - class: node-build
+      max: 2
+      timeout_minutes: 30
+      commands:
+        - { program: npm, args: [run, build] }
+        - { program: npm, args: [test] }
+        - { program: node, args: [] }
+
 blocks:
   # The orchestrator is loomux's trust root: a repo file may pin its cli/model and
   # nothing else (no prompt:, no profile:, no allow:). That is a parse error, on

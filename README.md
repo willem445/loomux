@@ -31,7 +31,9 @@ Every rung is a complete tool on its own — climb when you're ready:
    guardrails host-enforced, no agent ever merges.
 4. **Custom agent workflows** — commit `.loomux/workflow.yml` and your repo
    declares its own roster and merge gate: five focused reviewers, five
-   prompts, five models.
+   prompts, five models. It can also declare **resource guards** — throttle
+   CPU-bound commands like `cargo build` to N concurrent workers, so a fleet
+   doesn't melt the machine building at once.
 
 Plus a git view, file editor, file explorer, and voice prompts — one
 keystroke away on any rung, never disturbing the shell underneath.
@@ -153,7 +155,7 @@ src-tauri/src/
   pty.rs            PTY lifecycle (spawn/write/resize/kill) + output streaming; per-kind Terminal shells (PowerShell/cmd/Git Bash, #194) + Git Bash discovery
   sessions.rs       agent session discovery (one scan_* fn per agent source)
   orchestration/    agent groups: registry, guardrails, MCP server, audit
-    workflow.rs     the block model (#222): a repo's agent roster as data — `<repo>/.loomux/workflow.yml` parse + validation. A block's id is the agent's identity; `kind` is its CAPABILITY CLASS, and stays a closed 4-variant enum, so a repo file can declare five reviewers with five prompts but can never grant one write access. Also the ENFORCED merge gate (#222/#197): reviewer-attributed verdicts (pass | fail | escalate) as durable state, and the pure gate decision the `gh` shim mirrors — `gh pr merge` is refused until every reviewer the gate names has recorded a pass, and no human grant or autonomous marker can open it. See doc/design/workflows.md
+    workflow.rs     the block model (#222): a repo's agent roster as data — `<repo>/.loomux/workflow.yml` parse + validation. A block's id is the agent's identity; `kind` is its CAPABILITY CLASS, and stays a closed 4-variant enum, so a repo file can declare five reviewers with five prompts but can never grant one write access. Also the ENFORCED merge gate (#222/#197): reviewer-attributed verdicts (pass | fail | escalate) as durable state, and the pure gate decision the `gh` shim mirrors — `gh pr merge` is refused until every reviewer the gate names has recorded a pass, and no human grant or autonomous marker can open it. See doc/design/workflows.md. Also RESTRICT-ONLY resource guards (#318): an optional `resources:` block names CPU-bound command patterns (`cargo build`, `npm run build`, …) that share a slot pool of N concurrent runs, enforced by a dynamically-generated PATH shim per guarded program — a repo can request N but a machine/group override (`guardrails.resource_guard_limits`) may only lower it, never raise it. See doc/design/resource-guard.md
     profiles.rs     repo-authored personas from `.github/agents/*.md` (#51, harvested from PR #105): append/replace modes with a non-overridable loomux mechanics core. Compiled to each CLI's native custom-agent flag — `claude --agents` (inline) / `copilot --agent` (a user-authored file only)
   obs.rs            crash observability: panic hook, breadcrumb log, unclean-exit notice
   voice.rs          voice prompts (#58): mic capture (cpal) -> local whisper.cpp subprocess
