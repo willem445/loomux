@@ -915,6 +915,30 @@ pub fn guarded_shim_programs(classes: &[workflow::ResourceClass]) -> Vec<String>
 /// existence (Linux; MSYS2 also exposes a `/proc` view) is the fallback when
 /// no winpid mapping exists, then `kill -0` everywhere
 /// else (notably macOS, which has no `/proc`).
+///
+/// **A process TREE holds at most one slot per class (re-entrancy).** A
+/// guarded program can spawn ANOTHER guarded program of the SAME class as a
+/// child — `npm test`/`npm run build` spawning `node` is a real instance of
+/// this, since the child inherits the shimmed PATH (`agent_pane_env`). Without
+/// re-entrancy, the outer `npm` holds a slot and the inner `node` then takes a
+/// SECOND slot from the same pool: effective concurrency is roughly halved,
+/// and at `max: 1` (a sanctioned machine override — the exact case
+/// `Guardrails::resource_guard_limits` exists for) the inner call waits on a
+/// slot its own parent holds, self-deadlocking every time until
+/// `timeout_minutes` fails it open. Fixed structurally, not by config: once a
+/// shim acquires a slot for class `X` it exports
+/// `LOOMUX_RESGUARD_HELD_<X>=<slot path>` (the class name folded through `tr`
+/// into a valid env-var suffix — `[A-Za-z0-9_-]` in, `[A-Z0-9_]` out) before
+/// running the real command; a guard shim invoked while its own class's
+/// marker is already present in the environment passes straight through
+/// (`exec`, no acquisition, audited `resource-guard-reentrant`) instead of
+/// contending for a second slot. This is a property of the SUBTREE, not of
+/// one specific ancestor: any descendant, however many guarded-program layers
+/// deep, inherits the same exported marker. A child that explicitly clears
+/// the marker before re-invoking a guarded program of the same class simply
+/// re-acquires like a fresh, unrelated caller — accepted, since that only
+/// degrades to ordinary queuing (or briefly over-subscribes by one), never to
+/// a leaked slot or a widened capability.
 #[doc(hidden)] // pub so the integration test can pin the shim
 pub fn guard_shim_sh(program: &str, real: &str) -> String {
     const TPL: &str = r#"#!/bin/sh
@@ -1011,6 +1035,13 @@ fi
 case "$MATCH_N" in ''|*[!0-9]*) exec "$REAL" "$@" ;; esac
 case "$MATCH_TIMEOUT" in ''|*[!0-9]*) exec "$REAL" "$@" ;; esac
 
+# XXX #318 B1 RED-EVIDENCE PLACEHOLDER: the per-class re-entrancy check lands
+# in the next commit. class_var/held_var are still computed here (harmlessly
+# unused) so the marker-export line later in this file doesn't reference an
+# undefined variable while this placeholder is in place.
+class_var=$(printf '%s' "$MATCH_CLASS" | tr 'a-z-' 'A-Z_')
+held_var="LOOMUX_RESGUARD_HELD_$class_var"
+
 # Test-only seams (NEVER set outside an integration test): workflow.rs's
 # timeout_minutes: has a 1-minute floor by design (a guard that can wait
 # "forever" before fail-opening is not one a repo can reason about) and the
@@ -1040,6 +1071,15 @@ mkdir -p "$slot_root" 2>/dev/null
 # wholly unrelated `sh` process. `/proc/<pid>` existence (Linux; MSYS2 also
 # exposes a view) is the fallback when no winpid mapping exists, then `kill
 # -0` everywhere else (notably macOS, which has no /proc).
+#
+# The direction that matters if this is ever wrong: a false "dead" verdict
+# for a still-LIVE holder over-subscribes the pool by one (bounded — `mkdir`
+# is still atomic, so at most one extra reaper wins, and the true holder's own
+# EXIT trap simply no-ops when it finds its SLOT_PATH already renamed away).
+# A false "alive" verdict for an actually-dead holder only DELAYS a reap to
+# the timeout_minutes fail-open backstop. Both directions degrade throughput
+# or momentarily over-subscribe; neither leaks a slot forever or grants a
+# capability — consistent with this whole feature's restrict-only posture.
 loomux_pid_alive() {
   p="$1"
   case "$p" in ''|*[!0-9]*) return 1 ;; esac
@@ -1063,6 +1103,14 @@ loomux_try_acquire() {
   while [ "$i" -le "$MATCH_N" ]; do
     cand="$slot_root/slot.$i"
     if mkdir "$cand" 2>/dev/null; then
+      # Best-effort: if this write ever fails (e.g. a transient I/O error
+      # right after the mkdir), a later hard-kill of THIS holder leaves an
+      # empty pid file. loomux_pid_alive is only ever consulted when `hp` is
+      # non-empty (see below), so an empty pid file is correctly read as
+      # "unknown holder" and skipped rather than falsely reaped — the slot
+      # then just leaks until this holder's own normal release, or the next
+      # contender's timeout_minutes fail-open. Extremely rare (a write to a
+      # directory this same process just created) and never a false reap.
       printf '%s\n' "$$" > "$cand/pid" 2>/dev/null || true
       SLOT_PATH="$cand"
       return 0
@@ -1136,6 +1184,10 @@ loomux_release() {
 trap 'loomux_release' EXIT INT TERM HUP
 
 loomux_audit "resource-guard-acquired" "{\"class\":\"$MATCH_CLASS\",\"waited_secs\":$elapsed}"
+# Mark this class held for the whole subtree the real command spawns (see the
+# re-entrancy check above) — exported, so every descendant process inherits
+# it regardless of how many guarded-program layers it spawns through.
+eval "export $held_var=\"\$SLOT_PATH\""
 "$REAL" "$@"
 rc=$?
 loomux_release

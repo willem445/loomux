@@ -8717,11 +8717,117 @@ fn guard_shim_script_pins_the_four_audit_actions() {
         "resource-guard-waiting",
         "resource-guard-timeout",
         "resource-guard-reaped",
+        "resource-guard-reentrant",
     ] {
         assert!(sh.contains(action), "missing audit action {action}, mirroring the merge-gate style");
     }
     assert!(sh.contains("trap 'loomux_release' EXIT INT TERM HUP"), "release on every trappable exit");
     assert!(sh.contains("loomux_pid_alive"), "stale-holder reaper for the one path trap can't cover");
+    assert!(sh.contains("LOOMUX_RESGUARD_HELD_"), "the per-class re-entrancy marker prefix");
+}
+
+#[test]
+fn a_nested_guarded_command_of_the_same_class_does_not_self_deadlock() {
+    // rev-8 B1 (#318): a process TREE must hold at most one slot per class.
+    // Without re-entrancy, an outer guarded command whose real work spawns
+    // ANOTHER guarded command of the SAME class (npm -> node in this repo's
+    // own dogfood config, see .loomux/workflow.yml's node-build class) takes
+    // a SECOND slot from the pool it already occupies. At max=1 — a
+    // sanctioned machine override (Guardrails::resource_guard_limits) — the
+    // inner call then waits on a slot its own parent holds: every run
+    // self-deadlocks until timeout_minutes fails it open. This is the
+    // red-before-green anchor for B1: on a pre-fix shim this test's
+    // `no_wait`/`no_timeout` assertions fail (it only "succeeds" by fail-open,
+    // slowly, after LOOMUX_TEST_TIMEOUT_SECS) — see the PR's evidence section
+    // for the recorded red run.
+    if !have_sh() {
+        eprintln!("SKIP a_nested_guarded_command_of_the_same_class_does_not_self_deadlock: no POSIX sh");
+        return;
+    }
+    let td = tempfile::tempdir().unwrap();
+    let root = td.path();
+    let group_dir = root.join("group");
+    fs::create_dir_all(&group_dir).unwrap();
+    let outer_started = root.join("outer.started");
+    let inner_started = root.join("inner.started");
+
+    let inner_fake = root.join("fakeinner");
+    let inner_shim = root.join("inner");
+    write_fake_and_shim(
+        &inner_fake,
+        &format!("#!/bin/sh\n: > \"{}\"\nexit 0\n", inner_started.display()),
+        &inner_shim,
+        "inner",
+    );
+
+    // The outer's REAL work invokes the inner GUARD SHIM directly — standing
+    // in for what a real npm->node PATH resolution does when both shims are
+    // on PATH (agent_pane_env prepends the shim dir for the whole pane, and
+    // every descendant inherits it).
+    let outer_fake = root.join("fakeouter");
+    let outer_shim = root.join("outer");
+    write_fake_and_shim(
+        &outer_fake,
+        &format!(
+            "#!/bin/sh\n: > \"{}\"\n\"{}\" go\nexit $?\n",
+            outer_started.display(),
+            inner_shim.display()
+        ),
+        &outer_shim,
+        "outer",
+    );
+
+    // ONE class, max=1, guarding BOTH programs — the exact shape that
+    // self-deadlocks without re-entrancy.
+    let classes = vec![workflow::ResourceClass {
+        name: "shared".into(),
+        max: 1,
+        timeout_minutes: 1,
+        commands: vec![
+            workflow::GuardCommand { program: "outer".into(), args: vec!["go".into()] },
+            workflow::GuardCommand { program: "inner".into(), args: vec!["go".into()] },
+        ],
+    }];
+    let text = workflow::resource_guard_file_text(&classes, &BTreeMap::new());
+    fs::write(group_dir.join("resource_guards"), text).unwrap();
+
+    let start = std::time::Instant::now();
+    let out = std::process::Command::new("sh")
+        .arg(&outer_shim)
+        .arg("go")
+        .env("LOOMUX_GROUP_DIR", &group_dir)
+        // Bounds a PRE-FIX (no re-entrancy) run to a couple of seconds instead
+        // of the real 1-minute timeout_minutes floor — the test still proves
+        // its point either way, just doesn't hang CI for a minute doing it.
+        .env("LOOMUX_TEST_TIMEOUT_SECS", "2")
+        .env("LOOMUX_TEST_POLL_SECS", "1")
+        .output()
+        .unwrap();
+    let elapsed = start.elapsed();
+
+    assert!(out.status.success(), "the outer call must succeed: {out:?}");
+    assert!(outer_started.is_file(), "the outer real command must have run");
+    assert!(inner_started.is_file(), "the nested inner real command must have run too");
+
+    let audit = fs::read_to_string(group_dir.join("audit.jsonl")).unwrap_or_default();
+    assert!(audit.contains("resource-guard-reentrant"), "the inner call's pass-through must be audited: {audit}");
+    assert_eq!(
+        audit.matches("resource-guard-acquired").count(), 1,
+        "only the OUTER call may ever acquire class 'shared' — the inner must never contend for a second slot: {audit}"
+    );
+    assert!(
+        !audit.contains("resource-guard-waiting"),
+        "no wait may ever happen — that IS the self-deadlock this test guards against: {audit}"
+    );
+    assert!(
+        !audit.contains("resource-guard-timeout"),
+        "must succeed via re-entrancy, never by limping through to the timeout fail-open: {audit}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(1500),
+        "must complete near-instantly (well under the 2s test timeout) — a slow pass here means it \
+         raced the fail-open instead of using re-entrancy: {elapsed:?}"
+    );
 }
 
 #[test]
@@ -9048,7 +9154,12 @@ fn five_concurrent_callers_never_exceed_two_slots_at_once() {
         }
     }
     assert_eq!(events.iter().filter(|(_, d)| *d == 1).count(), 5, "all 5 must eventually run: {text}");
-    events.sort_by_key(|e| e.0);
+    // Sort by (ts, delta), not just ts: whole-second `date +%s` timestamps can
+    // tie when an `end` and a `start` land in the same second, and -1 < 1
+    // naturally orders the end first — the correct reading (a slot freeing up
+    // before the next start claims it), not an artifact that could otherwise
+    // momentarily overcount an overlap that never physically happened.
+    events.sort_by_key(|e| (e.0, e.1));
     let (mut cur, mut peak) = (0, 0);
     for (_, d) in events {
         cur += d;

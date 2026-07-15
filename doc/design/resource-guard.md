@@ -169,6 +169,55 @@ afterward. `/proc/<pid>` existence is the fallback where no winpid mapping
 exists (Linux; MSYS2 also exposes a `/proc` view), then `kill -0` everywhere
 else — notably macOS, which has no `/proc` at all.
 
+## Re-entrancy: a process tree holds at most one slot per class
+
+A guarded program can spawn *another* guarded program of the same class as a
+child. This repo's own dogfood config does exactly that: `npm test`/`npm run
+build` spawn `node` (via `node_modules/.bin` shims for `tsc`/`vite`, and
+directly for `node --test`), and the child inherits the shimmed `PATH`
+(`agent_pane_env` prepends it for the whole pane, and every descendant process
+inherits its parent's environment). Without re-entrancy, the outer `npm`
+holds a `node-build` slot and the inner `node` invocation then takes a
+*second* slot from the same two-slot pool — effective concurrency for one
+logical `npm test` run is 1, not 2, and at `max: 1` (a sanctioned machine
+override — the exact case `Guardrails::resource_guard_limits` exists for) the
+inner call waits on a slot its own parent already holds, self-deadlocking
+every single run until `timeout_minutes` fails it open. A review of this PR
+caught it: CI never exercises it (the shim only runs in agent panes, never in
+GitHub Actions), so a config bug of this shape is invisible to the green
+checkmark.
+
+The fix is structural, in the shim, not a config workaround — a config fix
+(splitting `npm` and `node` into separate classes, say) would only patch this
+one repo's file and leave the same trap for the next repo that guards a
+program which spawns another guarded program. Once a shim acquires a slot for
+class `X` it exports `LOOMUX_RESGUARD_HELD_<X>=<slot path>` (the class name
+folded through `tr` into a valid env-var suffix) before running the real
+command; a guard shim invoked while its own class's marker is already present
+passes straight through — no acquisition, audited `resource-guard-reentrant`
+— instead of contending for a second slot. This is a property of the whole
+subtree, not of one specific parent: any descendant, however many
+guarded-program layers deep (`make` → `cc` → some guarded linker wrapper,
+say), inherits the same exported marker and re-entrs for free.
+
+**The honest caveat**: a child that explicitly clears or overrides the marker
+before re-invoking a guarded program of the same class simply re-acquires
+like a fresh, unrelated caller. That's accepted rather than defended against —
+it degrades to ordinary queuing (or, worst case, briefly over-subscribes the
+pool by one), never to a leaked slot or a widened capability, which is the
+same "delay, never deny, never worse than restrict-only" posture this whole
+feature already commits to everywhere else.
+
+With re-entrancy in place, this repo's dogfood config keeps `npm`/`node` in
+one combined `node-build` class rather than splitting them: the combined pool
+is now safe at any `max:` including 1, and dogfooding a real, unmodified
+`npm test` run is the one exercise of the re-entrancy path that isn't
+synthetic — the integration suite pins the mechanism directly
+(`a_nested_guarded_command_of_the_same_class_does_not_self_deadlock`), but
+having the repo's own build actually walk through it on every CI run (via
+`cargo test`/local dev, not GitHub Actions, which never touches the shim) is
+free additional confidence.
+
 ### What the CI history actually says
 
 The integration test asserting "a stale slot from a dead pid is reaped and
@@ -261,9 +310,17 @@ because the word "guard" is in both.
 `.loomux/workflow.yml` at the repo root guards its own real offenders from the
 incident: `cargo build`, `cargo check`, `cargo test` (one `rust-build` class —
 they all contend for the same CPU, the same reasoning `heavy-build` above
-gives for `cargo build`/`cargo test`), and `npm run build`, `npm test`,
-`node --test` (a second `node-build` class, same logic on the frontend
-toolchain). Two classes, not one, because the Rust and Node toolchains don't
-actually compete for the same cache/incremental-build state the way `cargo
-build` and `cargo test` do with each other — there's no reason to serialize a
-`cargo check` behind an `npm test`.
+gives for `cargo build`/`cargo test`), and `npm run build`, `npm test`, and
+bare `node` (a second `node-build` class, same logic on the frontend
+toolchain). The third command is *every* `node` invocation, not specifically
+`node --test`: the matcher only ever compares positional tokens with flags
+skipped (`guard_class_for`'s doc comment), so a flag-only distinguisher like
+`--test` can never appear in a matched prefix — the only expressible guard for
+"the CPU cost `node --test` represents" is bare `node` with no args, an honest
+schema limit rather than an oversight. That breadth is also exactly why this
+class needs the re-entrancy mechanism above: `npm test`/`npm run build`
+*themselves* spawn `node` as a child. Two classes, not one shared with Rust,
+because the Rust and Node toolchains don't actually compete for the same
+cache/incremental-build state the way `cargo build` and `cargo test` do with
+each other — there's no reason to serialize a `cargo check` behind an
+`npm test`.
