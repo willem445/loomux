@@ -921,11 +921,22 @@ export interface OrchChannel {
  *  Human-only. Per the backend's join rules: both free mints a new channel;
  *  one free + one already-connected joins the free pane into that channel
  *  (multi-party); both already connected to different channels is rejected.
- *  `senderAgent` (#271 W3 addendum, part B) is the explicit direction choice
- *  made at completion — must be `fromAgent` or `toAgent`, and must hold a
- *  channel token (a delivery-only pane can never be the sender). On a join,
- *  it must equal the target channel's existing sender. Returns the
- *  resulting channel. */
+ *
+ *  `senderAgent` (#271 W3 addendum, part B) means something different for a
+ *  MINT than a JOIN (review round 2, B1 — this ambiguity was the bug):
+ *  - **Fresh mint** (neither pane connected): `senderAgent` DESIGNATES the
+ *    new channel's sender — must be `fromAgent` or `toAgent`, and that pane
+ *    must hold a channel token (a delivery-only pane can never be the
+ *    sender).
+ *  - **Join** (either pane already connected): the channel's sender already
+ *    exists; `senderAgent` only CONFIRMS who that is, and is very often
+ *    neither `fromAgent` nor `toAgent` — the completion gesture can land on
+ *    ANY existing member (the sender, or a plain receiver), and the true
+ *    sender may be a third pane entirely. Pass the target channel's actual
+ *    current sender (`PaneIdentity.senderId`), not either connect-call
+ *    argument.
+ *
+ *  Returns the resulting channel. */
 export const channelConnect = (
   fromGroup: string,
   fromAgent: string,

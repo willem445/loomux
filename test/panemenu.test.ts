@@ -91,11 +91,24 @@ test("a delivery-only side of a fresh connect is disabled as sender, with a reas
   assert.equal(asThisSender?.disabled, undefined, "the OTHER pane (has a token) is still offered as sender");
 });
 
-test("completing onto a pane already in a channel with a sender offers ONLY ONE completion item — join-as-receiver, driven by that sender", () => {
-  // The target is itself a plain RECEIVER of its own channel (senderId "w-9" !==
-  // its own agentId "w-1"), so it also legitimately offers Disconnect + "Make
-  // this pane the sender" — independent of the join/complete state. The join
-  // rule only constrains the COMPLETION item: exactly one, not two directional
+test("completing onto a RECEIVER of an already-driven channel offers ONLY ONE completion item — join-as-receiver, driven by the channel's actual sender (PR #289 review round 2, B1)", () => {
+  // The completion TARGET here is itself a plain RECEIVER of its own channel
+  // (senderId "w-9" !== its own agentId "w-1") — the exact shape the review
+  // reproduced as broken: completing the gesture on a receiver, not the
+  // sender. `senderAgent` in the resulting action is "w-9" (the channel's
+  // real sender, a THIRD party neither pending's "orch-1" nor target's own
+  // "w-1") — this is not a leftover implementation detail, it's the fix:
+  // `connect_agents` now treats a join's `sender_agent` as a CONFIRMATION of
+  // the existing sender, never a requirement that it be one of the two
+  // panes this call names. Verified end-to-end against the real backend by
+  // `join_completing_on_a_receiver_pane_succeeds_and_keeps_the_existing_sender`
+  // (tests/orchestration.rs) — before the fix that integration test failed
+  // with exactly the error this menu action used to trigger
+  // ("sender_agent must be one of the two connected panes").
+  //
+  // The target also legitimately offers Disconnect + "Make this pane the
+  // sender" — independent of the join/complete state above. The join rule
+  // only constrains the COMPLETION item: exactly one, not two directional
   // choices, since the channel's sender is already fixed.
   const pending = pendingFrom(); // a free armed pane
   const target = free({ channelId: "chan-1", senderId: "w-9", senderName: "w-9" });
@@ -104,6 +117,20 @@ test("completing onto a pane already in a channel with a sender offers ONLY ONE 
   assert.equal(completions.length, 1, "a join onto an already-driven channel offers only one completion item");
   assert.match(completions[0].label, /driven by w-9/);
   if (completions[0].action?.kind === "connect-complete") assert.equal(completions[0].action.senderAgent, "w-9");
+});
+
+test("completing directly onto the SENDER of an already-driven channel also offers exactly one join item, naming that same sender", () => {
+  // The symmetric, already-working case: here the completion target IS the
+  // channel's sender (senderId === its own agentId), so senderAgent in the
+  // resulting action equals target's own id — a degenerate case of the same
+  // rule the test above pins for a receiver target.
+  const pending = pendingFrom();
+  const target = free({ channelId: "chan-1", senderId: "w-1", senderName: "w-1" }); // target IS the sender
+  const items = buildPaneMenu(target, pending);
+  const completions = items.filter((i) => i.action?.kind === "connect-complete");
+  assert.equal(completions.length, 1);
+  assert.match(completions[0].label, /driven by w-1/);
+  if (completions[0].action?.kind === "connect-complete") assert.equal(completions[0].action.senderAgent, "w-1");
 });
 
 test("an ALREADY-CONNECTED pane (with a resolved sender) is still a valid completion target — how a third pane joins (multi-party)", () => {

@@ -9501,6 +9501,111 @@ fn direction_star_topology_broadcast_credit_and_reply_only_to_sender_never_anoth
     assert!(replied2.contains("replied"), "got: {replied2}");
 }
 
+// ---------- join sender semantics (review round 2, B1) ----------
+//
+// `sender_agent` means something different for a MINT (neither side
+// connected: it designates the new channel's sender, and must be one of the
+// two named panes) than for a JOIN (either side already connected: the
+// channel's sender already exists, and `sender_agent` only CONFIRMS who that
+// is — it is very often neither of the two panes in THIS call, e.g. a third
+// party sender in a bigger star). The completion gesture can land on EITHER
+// endpoint of a join — the sender or a plain receiver — and must succeed
+// either way, always leaving the channel's existing sender untouched.
+
+#[test]
+fn fresh_connect_sender_can_be_either_named_pane_regardless_of_from_to_order() {
+    // The gesture's from/to order (which pane you armed vs. completed on)
+    // must not constrain which of the two ends up driving a fresh mint.
+    let (reg, _d, g1, g2, c1, c2) = two_group_setup();
+    let ch = reg.connect_agents(&g1, &c1.agent_id, &g2, &c2.agent_id, &c2.agent_id).unwrap();
+    assert_eq!(ch["sender"], json!(c2.agent_id), "sender_agent == to_agent must be honored, not just == from_agent");
+}
+
+#[test]
+fn join_completing_on_the_sender_pane_succeeds() {
+    // The already-working case, pinned explicitly for symmetry with the
+    // receiver-completion test below.
+    let (reg, _d, g1, g2, c1, c2) = two_group_setup();
+    reg.connect_agents(&g1, &c1.agent_id, &g2, &c2.agent_id, &c1.agent_id).unwrap();
+    let g3 = reg.create_group("C:/tmp/repo-c", rails()).unwrap();
+    let x = reg.spawn_agent(&g3.id, Role::Worker, "x", "t", false, None).unwrap();
+
+    // Newcomer x joins by completing directly ONTO the sender c1.
+    let joined = reg.connect_agents(&g3.id, &x.id, &g1, &c1.agent_id, &c1.agent_id).unwrap();
+    assert_eq!(joined["members"].as_array().unwrap().len(), 3);
+    assert_eq!(joined["sender"], json!(c1.agent_id));
+}
+
+#[test]
+fn join_completing_on_a_receiver_pane_succeeds_and_keeps_the_existing_sender() {
+    // Reviewer's exact repro (PR #289 review round 2, B1): a live star with
+    // sender S and receiver R1; a free newcomer X joins by completing on R1
+    // — a RECEIVER, not the sender. Before the fix this returned
+    // Err("sender_agent must be one of the two connected panes") because S
+    // (the confirmed sender) is neither X nor R1, the two panes THIS call
+    // names.
+    let (reg, _d) = test_registry();
+    let g1 = reg.create_group("C:/tmp/repo-s", rails()).unwrap();
+    let g2 = reg.create_group("C:/tmp/repo-r1", rails()).unwrap();
+    let g3 = reg.create_group("C:/tmp/repo-x", rails()).unwrap();
+    let s = reg.spawn_agent(&g1.id, Role::Worker, "s", "t", false, None).unwrap();
+    let r1 = reg.spawn_agent(&g2.id, Role::Worker, "r1", "t", false, None).unwrap();
+    let x = reg.spawn_agent(&g3.id, Role::Worker, "x", "t", false, None).unwrap();
+
+    reg.connect_agents(&g1.id, &s.id, &g2.id, &r1.id, &s.id).unwrap();
+
+    // Arm X, complete on R1 (the receiver) — exactly the UI's
+    // `channelConnect(from=X, to=R1, senderAgent=S)` call.
+    let joined = reg
+        .connect_agents(&g3.id, &x.id, &g2.id, &r1.id, &s.id)
+        .unwrap_or_else(|e| panic!("join completing on a receiver pane must succeed, got: {e}"));
+    assert_eq!(joined["sender"], json!(s.id), "the existing sender must be unchanged by the join");
+    let members: Vec<String> = joined["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["agent_id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(members.len(), 3, "got: {members:?}");
+    assert!(members.contains(&x.id), "the newcomer must have joined, got: {members:?}");
+
+    // X joined as a RECEIVER — it holds no reply credit yet.
+    let cx = reg.resolve_token(&x.token).unwrap();
+    let err = channel_send(&reg, &cx, "hi").unwrap_err();
+    assert!(err.contains("only reply after the sender"), "got: {err}");
+}
+
+#[test]
+fn a_join_can_never_reassign_an_existing_channels_sender() {
+    // B4's invariant, stated as its own test: whatever `sender_agent` a join
+    // names, if it doesn't match the channel's ACTUAL current sender, the
+    // join is rejected outright — never silently reassigns, and never
+    // partially applies.
+    let (reg, _d) = test_registry();
+    let g1 = reg.create_group("C:/tmp/repo-s", rails()).unwrap();
+    let g2 = reg.create_group("C:/tmp/repo-r1", rails()).unwrap();
+    let g3 = reg.create_group("C:/tmp/repo-x", rails()).unwrap();
+    let s = reg.spawn_agent(&g1.id, Role::Worker, "s", "t", false, None).unwrap();
+    let r1 = reg.spawn_agent(&g2.id, Role::Worker, "r1", "t", false, None).unwrap();
+    let x = reg.spawn_agent(&g3.id, Role::Worker, "x", "t", false, None).unwrap();
+    reg.connect_agents(&g1.id, &s.id, &g2.id, &r1.id, &s.id).unwrap();
+
+    // Naming the newcomer itself as sender on a join must fail — a newcomer
+    // can only ever join as a receiver (B4).
+    let err = reg.connect_agents(&g3.id, &x.id, &g2.id, &r1.id, &x.id).unwrap_err();
+    assert!(err.contains("already has a sender"), "got: {err}");
+
+    // Naming the receiver R1 (a member, but not the sender) must also fail.
+    let err2 = reg.connect_agents(&g3.id, &x.id, &g2.id, &r1.id, &r1.id).unwrap_err();
+    assert!(err2.contains("already has a sender"), "got: {err2}");
+
+    // Neither rejected attempt changed anything: still a 2-member channel,
+    // sender still S, X still unconnected.
+    assert_eq!(reg.channel_for_pane(&g1.id, &s.id)["members"].as_array().unwrap().len(), 2);
+    assert_eq!(reg.channel_for_pane(&g1.id, &s.id)["sender"], json!(s.id));
+    assert!(reg.channel_for_pane(&g3.id, &x.id).is_null());
+}
+
 #[test]
 fn set_sender_swaps_clears_credits_and_is_audited_in_every_member_group() {
     let (reg, _d, g1, g2, c1, c2) = two_group_setup();

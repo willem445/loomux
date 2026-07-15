@@ -6086,13 +6086,27 @@ impl OrchRegistry {
     /// #203 — a member that can vanish mid-session is a liability) and
     /// dead/unknown/stale agent references.
     ///
-    /// `sender_agent` (#271 W3 addendum, part B): the directional model's
-    /// designation, chosen at gesture COMPLETION with an explicit arrow —
-    /// must name `from_agent` or `to_agent` and must hold a token (a
-    /// delivery-only pane can never be the sender). On a JOIN it must equal
-    /// the already-connected channel's existing sender — a channel has
-    /// exactly one, and picking a different one here is "designating a
-    /// second sender", rejected the same as it is in `set_sender`.
+    /// `sender_agent` (#271 W3 addendum, part B) means something different
+    /// depending on whether this is a MINT or a JOIN — review round 2's B1
+    /// finding was exactly this ambiguity, so it is spelled out fully here:
+    ///
+    /// - **MINT** (neither `from_agent` nor `to_agent` is already
+    ///   connected): `sender_agent` **designates** the new channel's sender.
+    ///   It must be one of the two named panes, and that pane must hold a
+    ///   token (a delivery-only pane can never be the sender).
+    /// - **JOIN** (either side is already connected): the channel's sender
+    ///   already exists. `sender_agent` here does not designate anything —
+    ///   it **confirms** who that already-fixed sender is. The confirmed
+    ///   party is frequently **neither** `from_agent` nor `to_agent`: the
+    ///   completion gesture can land on any member of the existing channel,
+    ///   including a plain receiver, in which case the true sender is a
+    ///   third identity not named by this call at all (e.g. a 4-member star
+    ///   where a newcomer completes onto a receiver — the sender is the
+    ///   fourth pane). Requiring the confirmation to equal
+    ///   `Channel.sender` — never requiring it to be `from_agent`/
+    ///   `to_agent` — is what makes B4's "a join can never reassign the
+    ///   sender" invariant hold while still letting the human complete the
+    ///   gesture on ANY existing member, not only the sender itself.
     pub fn connect_agents(
         &self,
         from_group: &str,
@@ -6117,13 +6131,6 @@ impl OrchRegistry {
                          planners can never join a channel"
                 .into());
         }
-        if sender_agent != from_agent && sender_agent != to_agent {
-            return Err("sender_agent must be one of the two connected panes".into());
-        }
-        let designated = if sender_agent == from_agent { &a } else { &b };
-        if designated.token.is_empty() {
-            return Err("a receive-only pane can't be the sender — it has no token".into());
-        }
 
         let mut channels = self.channels.lock_safe();
         let mut agent_channel = self.agent_channel.lock_safe();
@@ -6134,6 +6141,8 @@ impl OrchRegistry {
         // existing channel's sender — the star topology has exactly one hub,
         // and a second designation here is the same conflict `set_sender`
         // guards against, just reached through connect instead of a swap.
+        // Deliberately does NOT require `sender_agent` to be `from_agent`/
+        // `to_agent` — see the doc comment above.
         let require_matching_sender = |channels: &HashMap<String, Channel>, existing: &str| -> Result<(), String> {
             let ch = channels.get(existing).expect("agent_channel/channels must agree");
             if ch.sender != sender_agent {
@@ -6187,6 +6196,20 @@ impl OrchRegistry {
                 existing
             }
             (None, None) => {
+                // MINT ONLY: here — and only here — `sender_agent` must
+                // actually be one of the two named panes, and must hold a
+                // token. A join never reaches this arm.
+                if sender_agent != from_agent && sender_agent != to_agent {
+                    drop(agent_channel);
+                    drop(channels);
+                    return Err("sender_agent must be one of the two connected panes".into());
+                }
+                let designated = if sender_agent == from_agent { &a } else { &b };
+                if designated.token.is_empty() {
+                    drop(agent_channel);
+                    drop(channels);
+                    return Err("a receive-only pane can't be the sender — it has no token".into());
+                }
                 let seq = self.channel_seq.fetch_add(1, Ordering::Relaxed) + 1;
                 let id = format!("chan-{seq}");
                 let ch = Channel {
