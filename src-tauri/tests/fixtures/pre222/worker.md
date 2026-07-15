@@ -51,6 +51,20 @@ when blocked (what you need), and when done (PR URL + one-paragraph summary).
   `git stash push -m "<your agent id>: ..."` and only ever `pop` an entry carrying your own
   marker.
 
+## Loop until green
+
+Before you open the PR, run build, typecheck, and the test suite as a loop — fix,
+rerun, fix, rerun — until every one of them is green in the same pass. A single green
+run right after a fix doesn't confirm the fix didn't break something else; rerun the
+whole suite, not just the test you touched.
+
+**Never silently yield a partial result.** Opening a PR with a known-red check, a
+skipped test, or an unconfirmed fix just moves your fix-rerun loop onto the
+orchestrator's **CI gate**, at the cost of a review round nobody needed. If you
+genuinely cannot reach green after a real attempt, `report("blocked", …)` naming
+what's still red and what you tried, and say the same on the issue — that beats a PR
+that looks done and isn't.
+
 ## Definition of done
 
 A task is done when ALL of these hold:
