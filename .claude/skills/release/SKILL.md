@@ -118,7 +118,26 @@ real notes after the assets are up:
   "damaged app" / Windows SmartScreen note — expected, not a regression).
 - Scale to the release: hotfixes get "The fix" up top and a short "Also in
   this release".
-- Apply with a here-string piped to `gh release edit vX.Y.Z --notes-file -`.
+- **Apply notes to the canonical `release_id` (from `create-release`'s job
+  output), never by tag lookup.** Find it in the release run's logs — the
+  `create-release` job logs "Created release `<id>` for vX.Y.Z" (or
+  "Reusing existing release `<id>`..."), and `promote`'s "Verify asset
+  count" step logs the same id again. Apply with:
+  ```sh
+  gh api -X PATCH repos/OWNER/REPO/releases/RELEASE_ID -F body=@notes.md
+  ```
+  **Why not `gh release edit vX.Y.Z --notes-file -`:** that resolves the
+  release by tag, and a tag-based lookup is exactly the ambiguity that let
+  v0.9.0's incident go wrong (#282) — two draft releases existed for the
+  same tag, and only pinning every operation to the one true `release_id`
+  (not the tag) keeps assets, promotion, *and* notes from ever drifting onto
+  the wrong one. `create-release`'s idempotence guard and the concurrency
+  group make a stray duplicate far less likely now, but "never by tag" costs
+  nothing and closes the class of bug for good.
+  - `promote` also warns (non-fatally, right before it flips the release
+    public) if the release body is still empty at that point, so a
+    notes-less publish is loud in the run log instead of silently going out
+    with just the generic download blurb.
 
 ## 5. Verify — the release isn't done until all of these pass
 

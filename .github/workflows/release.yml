@@ -195,6 +195,23 @@ jobs:
             exit 1
           fi
 
+      - name: Warn if release notes are empty
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # Non-fatal by design: a notes-less body isn't a reason to block a
+        # complete, correctly-counted release from going public — it's a
+        # human forgetting step 4 (SKILL.md), which happens after promote.
+        # This just makes that loud instead of silent, since the whole point
+        # of #282 is that release-quality problems (missing assets, and now
+        # missing notes) should surface in the run log, not get discovered
+        # after the fact.
+        run: |
+          set -euo pipefail
+          body=$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" --jq '.body // ""')
+          if [ -z "$(printf '%s' "$body" | tr -d '[:space:]')" ]; then
+            echo "::warning::Release $GITHUB_REF_NAME (id $RELEASE_ID) has an empty body — promoting anyway. Write real release notes (SKILL.md step 4) targeting this exact release id before announcing."
+          fi
+
       - name: Publish the draft release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
