@@ -6563,6 +6563,60 @@ fn spawn_worktree_cuts_from_default_branch_not_primary_head() {
     );
 }
 
+#[test]
+fn spawn_worktree_fails_loudly_when_existing_branch_diverges_from_base() {
+    // #227: `base` was silently ignored whenever the requested `branch` name
+    // collided with a leftover local branch — `git_worktree_add`'s
+    // already-exists fallback checked that branch out as-is, regardless of
+    // whether its history had anything to do with `base`. A spawn hitting
+    // that collision must now fail loudly (naming both shas) instead of
+    // handing back a worker whose worktree is silently cut from the wrong
+    // history.
+    let git = |dir: &Path, args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "")
+            .env("GIT_CONFIG_SYSTEM", "")
+            .output()
+            .expect("git must be installed for this test");
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    };
+
+    let repo = tempfile::tempdir().unwrap();
+    git(repo.path(), &["init", "-q"]);
+    git(repo.path(), &["symbolic-ref", "HEAD", "refs/heads/main"]);
+    git(repo.path(), &["config", "user.email", "t@t"]);
+    git(repo.path(), &["config", "user.name", "t"]);
+    fs::write(repo.path().join("f.txt"), "root").unwrap();
+    git(repo.path(), &["add", "-A"]);
+    git(repo.path(), &["commit", "-qm", "root"]);
+
+    // The desired base: a feature branch with its own commit.
+    git(repo.path(), &["checkout", "-q", "-b", "feat/base"]);
+    fs::write(repo.path().join("feat.txt"), "feat").unwrap();
+    git(repo.path(), &["add", "-A"]);
+    git(repo.path(), &["commit", "-qm", "feature work"]);
+    git(repo.path(), &["checkout", "-q", "main"]);
+
+    // A stale leftover branch sharing the name a new spawn will request —
+    // cut from main, never touching feat/base.
+    git(repo.path(), &["branch", "stacked/leftover", "main"]);
+
+    let repo_path = repo.path().to_string_lossy().replace('\\', "/");
+    let (reg, _d) = test_registry();
+    let g = reg.create_group(&repo_path, rails()).unwrap();
+
+    let err = reg
+        .spawn_agent_ex(
+            &g.id, Role::Worker, None, "w", "t", true, Some("stacked/leftover".into()),
+            Some("feat/base".into()), None, None, None,
+        )
+        .unwrap_err();
+    assert!(err.contains("stacked/leftover"), "should name the branch: {err}");
+    assert!(err.contains("feat/base"), "should name the requested base: {err}");
+}
+
 // ---------- #43: compose-strip steering + human-typing hold backstop ----------
 
 #[test]
