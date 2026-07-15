@@ -24,9 +24,10 @@ use loomux_lib::orchestration::{
     should_flush_before_paste,
     should_notify_paste_held, should_notify_unconfirmed, single_pane_autopilot_flags,
     spawn_rate_exceeded, spawn_request_expired, strip_ansi, submit_confirmed, submit_sequence,
+    cap_task_notes, task_summary,
     unconfirmed_delivery_notice, watchdog_should_notify, worktree_cleanup_targets,
     AttentionItem, Caller, Delivery, Guardrails, HumanInput, Launch, NameSource, OrchRegistry, PasteDecision,
-    PersonaInject,
+    PersonaInject, Task, TaskNote,
     PasteGate, Role, TaskPatch, UsageSnapshot, CLAUDE_UNATTENDED_ALLOW, COPILOT_AUTOPILOT_CONFIRM_KEYS,
     COPILOT_GROUP_AUTOPILOT_FLAGS, COPILOT_UNATTENDED_FLAGS, MAX_ATTACHMENT_BYTES,
     PLANNER_READONLY_NOTE,
@@ -1758,6 +1759,130 @@ fn task_lifecycle_create_edit_note_delete() {
     assert!(reg.delete_task(&g.id, "human", &t.id).is_err());
 }
 
+// ---------- #245: compact list_tasks + note cap ----------
+
+fn note(ts_ms: u64, text: &str) -> TaskNote {
+    TaskNote { ts_ms, author: "orch".into(), text: text.into() }
+}
+
+#[test]
+fn task_summary_drops_notes_but_counts_them() {
+    let t = Task {
+        id: "t-1".into(),
+        title: "Fix parser".into(),
+        status: "in-progress".into(),
+        issue: Some("#7".into()),
+        pr: None,
+        assignee: Some("w-2".into()),
+        session: Some("sess-1".into()),
+        notes: vec![note(1, "a"), note(2, "b"), note(3, "c")],
+        updated_ms: 42,
+    };
+    let s = task_summary(&t);
+    assert_eq!(s.id, "t-1");
+    assert_eq!(s.title, "Fix parser");
+    assert_eq!(s.status, "in-progress");
+    assert_eq!(s.issue.as_deref(), Some("#7"));
+    assert_eq!(s.assignee.as_deref(), Some("w-2"));
+    assert_eq!(s.session.as_deref(), Some("sess-1"));
+    assert_eq!(s.updated_ms, 42);
+    assert_eq!(s.note_count, 3, "every note counts, even though the text is dropped");
+    // The summary must serialize with no notes field at all — a caller reading
+    // raw JSON (as an MCP client does) must never see note text.
+    let v = serde_json::to_value(&s).unwrap();
+    assert!(v.get("notes").is_none(), "TaskSummary must not carry a notes field");
+}
+
+#[test]
+fn cap_task_notes_leaves_under_cap_history_untouched() {
+    let notes = vec![note(1, "a"), note(2, "b"), note(3, "c")];
+    let capped = cap_task_notes(notes.clone(), 20);
+    assert_eq!(capped.len(), 3);
+    assert_eq!(capped[0].text, "a", "no collapse below the cap");
+}
+
+#[test]
+fn cap_task_notes_collapses_oldest_excess_into_one_placeholder() {
+    // 25 notes capped at 5: keep the newest 4 verbatim + 1 placeholder = 5.
+    let notes: Vec<TaskNote> = (1..=25).map(|i| note(i, &format!("note-{i}"))).collect();
+    let capped = cap_task_notes(notes, 5);
+    assert_eq!(capped.len(), 5, "collapsed history stays at exactly the cap");
+    assert!(
+        capped[0].text.contains("21 earlier notes collapsed"),
+        "the placeholder names how many it swallowed: {}",
+        capped[0].text
+    );
+    assert_eq!(capped[0].ts_ms, 1, "the placeholder is timestamped at the oldest note it swallowed");
+    // The newest 4 real notes survive verbatim, oldest-of-the-kept first.
+    assert_eq!(capped[1].text, "note-22");
+    assert_eq!(capped[2].text, "note-23");
+    assert_eq!(capped[3].text, "note-24");
+    assert_eq!(capped[4].text, "note-25");
+}
+
+#[test]
+fn cap_task_notes_zero_means_uncapped() {
+    let notes: Vec<TaskNote> = (1..=25).map(|i| note(i, &format!("note-{i}"))).collect();
+    let capped = cap_task_notes(notes.clone(), 0);
+    assert_eq!(capped.len(), 25, "max=0 must not be read as \"drop everything\"");
+}
+
+#[test]
+fn cap_task_notes_placeholder_count_accumulates_across_repeated_collapses() {
+    // Review finding on #245: cap_task_notes runs once PER APPEND in the real
+    // path (upsert_task calls it after every single note push), not once over
+    // a big batch — so a placeholder from an earlier round routinely gets
+    // swept into a later collapse. The reported count must accumulate the
+    // TRUE total dropped over the task's lifetime, not reset to "how many
+    // this round" (which, at steady state one-at-a-time, was always the same
+    // small number no matter how much history had actually rolled off).
+    let mut notes: Vec<TaskNote> = Vec::new();
+    for i in 1..=30u64 {
+        notes.push(note(i, &format!("note-{i}")));
+        notes = cap_task_notes(notes, 20);
+    }
+    assert_eq!(notes.len(), 20);
+    assert!(
+        notes[0].text.contains("11 earlier notes collapsed"),
+        "the true cumulative count (11 notes rolled off across repeated collapses) must survive, \
+         not reset every round: {}",
+        notes[0].text
+    );
+    assert_eq!(notes[0].ts_ms, 1, "the oldest timestamp is still the very first note ever dropped");
+    // The newest max-1 real notes are kept verbatim regardless.
+    assert_eq!(notes[1].text, "note-12");
+    assert_eq!(notes.last().unwrap().text, "note-30");
+}
+
+#[test]
+fn upsert_task_caps_live_note_history_as_notes_accumulate() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let mut t = reg.upsert_task(&g.id, "orch", None, patch(Some("Long-running task"), None, None)).unwrap();
+    for i in 0..30 {
+        t = reg
+            .upsert_task(&g.id, "orch", Some(&t.id), patch(None, None, Some(&format!("update {i}"))))
+            .unwrap();
+    }
+    assert_eq!(t.notes.len(), 20, "live notes stay capped even after 30 appends");
+    assert!(
+        t.notes[0].text.contains("collapsed"),
+        "the oldest surviving entry is the collapse placeholder: {}",
+        t.notes[0].text
+    );
+    // The newest note is always exactly what was just appended.
+    assert_eq!(t.notes.last().unwrap().text, "update 29");
+    // list_tasks (task_summaries) never carries this text at all.
+    let summaries = reg.task_summaries(&g.id);
+    let s = summaries.iter().find(|s| s.id == t.id).unwrap();
+    assert_eq!(s.note_count, 20);
+    let v = serde_json::to_value(&summaries).unwrap();
+    assert!(!v.to_string().contains("update 29"), "no note text leaks into the compact summaries");
+    // get_task still returns the full (capped) history.
+    let full = reg.get_task(&g.id, &t.id).unwrap();
+    assert_eq!(full.notes.len(), 20);
+}
+
 #[test]
 fn delete_done_removes_only_done_and_notifies_once() {
     // #120: the board's "delete all done" clears every done task in one action,
@@ -1914,11 +2039,31 @@ fn task_tools_are_role_gated_but_listing_is_shared() {
         &json!({ "name": "upsert_task", "arguments": { "title": "Fix parser", "status": "in-progress", "issue": "#7" } }))
         .unwrap();
     assert_eq!(ok["isError"], false);
+    let id = ok["content"][0]["text"].as_str().unwrap().split_whitespace().next().unwrap().to_string();
+    dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "upsert_task", "arguments": { "id": id, "note": "reviewer flagged an edge case in the parser" } }))
+        .unwrap();
+
     let listed = dispatch(&reg, &cw, "tools/call",
         &json!({ "name": "list_tasks", "arguments": {} })).unwrap();
     let text = listed["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("Fix parser") && text.contains("#7"),
         "workers must be able to read the board");
+    // #245: list_tasks must return compact rows — no notes array, note_count instead.
+    assert!(!text.contains("edge case"), "note text must not appear in the compact list_tasks view: {text}");
+    assert!(!text.contains("\"notes\""), "compact rows must not carry a notes field: {text}");
+    assert!(text.contains("note_count"), "compact rows surface a note_count: {text}");
+
+    // get_task fetches the full record, including the note.
+    let detail = dispatch(&reg, &cw, "tools/call",
+        &json!({ "name": "get_task", "arguments": { "id": id } })).unwrap();
+    let dtext = detail["content"][0]["text"].as_str().unwrap();
+    assert!(dtext.contains("edge case"), "get_task returns the full note text: {dtext}");
+
+    // Unknown id is a clean error, not a panic.
+    let missing = dispatch(&reg, &cw, "tools/call",
+        &json!({ "name": "get_task", "arguments": { "id": "t-999" } })).unwrap();
+    assert_eq!(missing["isError"], true);
 }
 
 #[test]

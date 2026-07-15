@@ -1246,8 +1246,9 @@ These loomux mechanics are guaranteed by the app and are NOT optional, whatever 
 persona says:\n\
 - You drive the group through the loomux MCP tools: `spawn_agent` (worker | reviewer | \
 planner, optionally naming a workflow `block`), `send_prompt`, `get_output`, \
-`kill_agent`, `focus_agent`, `rename_agent`; the shared task board via `list_tasks` / \
-`upsert_task` / `remove_task`; and durable state via `get_state` / `set_state`. \
+`kill_agent`, `focus_agent`, `rename_agent`; the shared task board via `list_tasks` \
+(compact rows) / `get_task` (one task's full notes) / `upsert_task` / `remove_task`; \
+and durable state via `get_state` / `set_state`. \
 Guardrails (live-agent cap, per-block CLI + model) are enforced by loomux.\n\
 - Maintain the task board: it is the human's view of the work. Record each agent's \
 `session` id on its task so finished work can be resumed for follow-ups instead of \
@@ -2684,6 +2685,122 @@ pub struct Task {
     pub notes: Vec<TaskNote>,
     #[serde(default)]
     pub updated_ms: u64,
+}
+
+/// Compact task-board row (#245): every `Task` field EXCEPT the notes array,
+/// replaced by a `note_count` so a caller can tell "has history worth a
+/// `get_task`" from "brand new" without paying for the notes payload. This is
+/// what `list_tasks` returns — a live board hit **228,577 chars for 70
+/// tasks**, almost entirely from accumulated note text, and blew MCP result
+/// limits so the orchestrator could not read its own board. The human's board
+/// UI is unaffected: it reads `tasks.json` (full `Task`s) via `orch_tasks`,
+/// a separate path from the MCP `list_tasks` tool this feeds.
+#[derive(Clone, Debug, Serialize)]
+pub struct TaskSummary {
+    pub id: String,
+    pub title: String,
+    pub status: String,
+    pub issue: Option<String>,
+    pub pr: Option<String>,
+    pub assignee: Option<String>,
+    pub session: Option<String>,
+    pub updated_ms: u64,
+    pub note_count: usize,
+}
+
+/// Project a full `Task` down to its `list_tasks` row (#245). Pure so the
+/// field mapping is unit-testable without a registry.
+pub fn task_summary(t: &Task) -> TaskSummary {
+    TaskSummary {
+        id: t.id.clone(),
+        title: t.title.clone(),
+        status: t.status.clone(),
+        issue: t.issue.clone(),
+        pr: t.pr.clone(),
+        assignee: t.assignee.clone(),
+        session: t.session.clone(),
+        updated_ms: t.updated_ms,
+        note_count: t.notes.len(),
+    }
+}
+
+/// Max notes kept verbatim on a task's LIVE copy (#245) — beyond this, the
+/// oldest excess collapses into one placeholder note so `tasks.json` (and
+/// therefore `get_task`) stays bounded even for a task with weeks of
+/// back-and-forth. Nothing is actually lost: every note append is already
+/// durably recorded in `audit.jsonl` (`task-upsert`), so this only trims the
+/// copy the board keeps live.
+const MAX_TASK_NOTES: usize = 20;
+
+/// The `author` a `cap_task_notes` placeholder note is stamped with — never
+/// produced by a human/agent note (`upsert_task`'s `actor` is always an
+/// agent id or `"human"`), so it doubles as the marker `notes_represented`
+/// uses to recognize a placeholder that itself gets swept into a LATER
+/// collapse.
+const NOTE_COLLAPSE_AUTHOR: &str = "loomux";
+
+/// How many original notes one live `TaskNote` stands for: 1 for an ordinary
+/// note, or the count embedded in a `cap_task_notes` placeholder's own text
+/// (parsed back out). `cap_task_notes` runs once PER APPEND (`upsert_task`
+/// calls it after every single note push), so a placeholder from an earlier
+/// round routinely gets swept into a later one — without this, re-collapsing
+/// it would count it as "1 note" and the reported total would reset every
+/// round instead of accumulating (review finding on #245: the live count
+/// stayed at the single round's drop size — e.g. "2" — no matter how many
+/// notes had actually rolled off over the task's lifetime).
+fn notes_represented(note: &TaskNote) -> usize {
+    if note.author != NOTE_COLLAPSE_AUTHOR {
+        return 1;
+    }
+    note.text
+        .strip_prefix('[')
+        .and_then(|s| s.split_whitespace().next())
+        .and_then(|n| n.parse::<usize>().ok())
+        .unwrap_or(1)
+}
+
+/// Cap a task's live note history (#245): once `notes` exceeds `max`, collapse
+/// the oldest excess into one placeholder note (so the board still shows
+/// *something* happened, not silence) and keep the newest `max - 1` verbatim.
+/// `max == 0` is treated as "no cap" (never fires) rather than "drop
+/// everything" — a live-tunable knob set to 0 must not read as "delete all
+/// history". Pure so the collapse boundary is unit-testable without a
+/// registry.
+///
+/// The placeholder does NOT claim the dropped text is durably retrievable:
+/// `audit.jsonl` rotation (#240) keeps only one backup generation, so for
+/// exactly the long-running groups this cap targets, the original note text
+/// can rotate out from under a placeholder that promised otherwise. It says
+/// only what's actually true — the notes were dropped from the live board,
+/// and their text was audited at creation, subject to that rotation.
+pub fn cap_task_notes(mut notes: Vec<TaskNote>, max: usize) -> Vec<TaskNote> {
+    if max == 0 || notes.len() <= max {
+        return notes;
+    }
+    let drop_count = notes.len() - (max - 1);
+    let dropped: Vec<TaskNote> = notes.drain(..drop_count).collect();
+    // Sum, not `drop_count`: a placeholder among the dropped notes (this is
+    // itself a re-collapse) represents more than the one slot it occupies.
+    let collapsed_count: usize = dropped.iter().map(notes_represented).sum();
+    // The oldest note's own ts_ms is already the right lower bound even when
+    // it's a placeholder: it was stamped with ITS earliest represented ts_ms
+    // when created, below, so that value carries forward unchanged through
+    // any number of later re-collapses.
+    let first_ts = dropped.first().map(|n| n.ts_ms).unwrap_or(0);
+    let last_ts = dropped.last().map(|n| n.ts_ms).unwrap_or(0);
+    let mut out = Vec::with_capacity(notes.len() + 1);
+    out.push(TaskNote {
+        ts_ms: first_ts,
+        author: NOTE_COLLAPSE_AUTHOR.to_string(),
+        text: format!(
+            "[{collapsed_count} earlier note{} collapsed to keep the board readable — \
+             text was recorded in this group's audit.jsonl at creation (subject to rotation on a \
+             long-running group), ts {first_ts}..{last_ts}]",
+            if collapsed_count == 1 { "" } else { "s" }
+        ),
+    });
+    out.extend(notes);
+    out
 }
 
 /// Field edits for `upsert_task`; `None` leaves a field untouched.
@@ -4150,6 +4267,17 @@ impl OrchRegistry {
             .unwrap_or_default()
     }
 
+    /// Compact rows for the MCP `list_tasks` tool (#245) — see `TaskSummary`.
+    pub fn task_summaries(&self, group: &str) -> Vec<TaskSummary> {
+        self.tasks(group).iter().map(task_summary).collect()
+    }
+
+    /// One full task (including its capped note history) by id — the detail
+    /// view `list_tasks`'s compact rows point at (#245).
+    pub fn get_task(&self, group: &str, id: &str) -> Option<Task> {
+        self.tasks(group).into_iter().find(|t| t.id == id)
+    }
+
     fn write_tasks(&self, group: &str, tasks: &[Task]) -> Result<(), String> {
         let dir = self.group_dir(group);
         fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -4246,6 +4374,7 @@ impl OrchRegistry {
             let text = text.trim().to_string();
             if !text.is_empty() {
                 task.notes.push(TaskNote { ts_ms: now_ms(), author: actor.to_string(), text });
+                task.notes = cap_task_notes(std::mem::take(&mut task.notes), MAX_TASK_NOTES);
             }
         }
         task.updated_ms = now_ms();
