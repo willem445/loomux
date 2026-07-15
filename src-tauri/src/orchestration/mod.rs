@@ -1035,12 +1035,30 @@ fi
 case "$MATCH_N" in ''|*[!0-9]*) exec "$REAL" "$@" ;; esac
 case "$MATCH_TIMEOUT" in ''|*[!0-9]*) exec "$REAL" "$@" ;; esac
 
-# XXX #318 B1 RED-EVIDENCE PLACEHOLDER: the per-class re-entrancy check lands
-# in the next commit. class_var/held_var are still computed here (harmlessly
-# unused) so the marker-export line later in this file doesn't reference an
-# undefined variable while this placeholder is in place.
+# Per-class re-entrancy: a process TREE holds at most one slot per class.
+# Without this, a guarded program that spawns ANOTHER guarded program of the
+# SAME class (npm -> node is a real case: `npm test`/`npm run build` spawn
+# `node` as a child, and the child inherits the shimmed PATH) takes a SECOND
+# slot from the pool it is already occupying — halving effective concurrency,
+# and at max=1 (a sanctioned machine override) self-deadlocking every time
+# until timeout_minutes fails it open. `class_var` folds MATCH_CLASS's
+# sanitize_id-clean alphabet ([A-Za-z0-9_-]) into a valid env var name (`tr`
+# maps a-z->A-Z and -->_ in one pass over an equal-length set; digits,
+# underscores and existing caps already survive it unchanged). `eval` reads a
+# DYNAMICALLY named variable — POSIX sh has no `${!name}` indirection — which
+# is safe here specifically because class_var can only ever contain
+# `[A-Z0-9_]` after the tr, never a shell metacharacter.
 class_var=$(printf '%s' "$MATCH_CLASS" | tr 'a-z-' 'A-Z_')
 held_var="LOOMUX_RESGUARD_HELD_$class_var"
+eval "held_val=\$$held_var"
+if [ -n "$held_val" ]; then
+  # A child that strips/clears the marker before re-invoking a guarded
+  # program of the same class would simply re-acquire like a fresh caller —
+  # accepted: it degrades to ordinary queuing (or, worst case, one slot over
+  # subscribed while it holds both), never to a leak or a security issue.
+  loomux_audit "resource-guard-reentrant" "{\"class\":\"$MATCH_CLASS\",\"held\":\"$held_val\"}"
+  exec "$REAL" "$@"
+fi
 
 # Test-only seams (NEVER set outside an integration test): workflow.rs's
 # timeout_minutes: has a 1-minute floor by design (a guard that can wait
