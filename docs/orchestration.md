@@ -64,7 +64,11 @@ orchestrator:
 - decides worktree-vs-branch per task by mergeability — a worktree branch is cut
   from the repo's default branch (fetched fresh from origin), never from whatever
   the primary checkout happens to sit on, so parallel work starts from a clean
-  base without a manual rebase;
+  base without a manual rebase. **`git stash` is repo-wide, not per-worktree** —
+  the stash stack lives in the shared `.git`, so agents in separate worktrees of
+  the same group share one stack and a `pop`/`drop`/`clear` by one can destroy
+  another's WIP; role templates tell agents to commit WIP to their own branch
+  instead of stashing;
 - delegates via tools that *type prompts into the worker's CLI* — you see every
   instruction verbatim in the pane, can steer any agent by typing yourself, and
   everything lands in the audit log.
