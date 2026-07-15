@@ -13,6 +13,7 @@ import {
   quitDecision,
   exitDiagnosticLine,
   keepOpenOnExit,
+  isDoaRevival,
   withDeadline,
   QUIT_FLUSH_TIMEOUT_MS,
   type PaneBufferReport,
@@ -193,6 +194,52 @@ test("exitDiagnosticLine: names the DOA-silent-death case, but only when nothing
   // A crash that produced real output reads fine as the plain "process exited"
   // banner — inventing a diagnostic here would just be noise.
   assert.equal(exitDiagnosticLine(true), null);
+});
+
+// ---------- a DOA orchestration-delegate revival auto-closes (#280) ----------
+
+test("isDoaRevival: a delegate crash with NO output at all is closed, not kept open", () => {
+  assert.equal(
+    isDoaRevival({ orchRole: "worker", keep: "output", receivedOutput: false }),
+    true
+  );
+  assert.equal(
+    isDoaRevival({ orchRole: "reviewer", keep: "output", receivedOutput: false }),
+    true
+  );
+  assert.equal(
+    isDoaRevival({ orchRole: "planner", keep: "output", receivedOutput: false }),
+    true
+  );
+});
+
+test("isDoaRevival: a delegate crash that DID produce output is a real crash — stays open", () => {
+  // #281 already told the human/orchestrator why via the exit diagnostic AND
+  // the pane's own output; if there IS output, it's the original "kept open
+  // to read" case, not clutter.
+  assert.equal(
+    isDoaRevival({ orchRole: "worker", keep: "output", receivedOutput: true }),
+    false
+  );
+});
+
+test("isDoaRevival: the orchestrator's own pane is never auto-closed out from under the human", () => {
+  assert.equal(
+    isDoaRevival({ orchRole: "orchestrator", keep: "output", receivedOutput: false }),
+    false
+  );
+});
+
+test("isDoaRevival: a plain (non-orchestration) pane keeps the original crash-stays-open behavior", () => {
+  assert.equal(isDoaRevival({ orchRole: null, keep: "output", receivedOutput: false }), false);
+});
+
+test("isDoaRevival: never overrides the UNSAVED reason (#219) — only 'output' is in scope", () => {
+  assert.equal(
+    isDoaRevival({ orchRole: "worker", keep: "unsaved", receivedOutput: false }),
+    false
+  );
+  assert.equal(isDoaRevival({ orchRole: "worker", keep: null, receivedOutput: false }), false);
 });
 
 // ---------- the quit path's final save must not be able to wedge the app (#219) ----------

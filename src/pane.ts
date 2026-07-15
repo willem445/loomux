@@ -1720,6 +1720,13 @@ export class Pane implements VoiceTargetPane {
     return this.orchRoleName;
   }
 
+  /** Whether this pane's process has emitted a single byte since it spawned
+   *  (#280/#281) — a crashed pane that never did is a DOA revival, not a
+   *  crash worth keeping open to read. */
+  get hasReceivedOutput(): boolean {
+    return this.receivedOutput;
+  }
+
   /** Capture this pane as a serializable record for the persisted layout (#194).
    *  Reads only the retained launch inputs plus the live cwd — no geometry, no
    *  PTY — so it is safe under the no-resize invariant and works even on a hidden

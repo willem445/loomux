@@ -24,9 +24,11 @@ import {
   dirtyBuffers,
   dirtyBufferLines,
   quitDecision,
+  isDoaRevival,
   withDeadline,
   QUIT_FLUSH_TIMEOUT_MS,
   type DirtyBuffer,
+  type KeepOpenReason,
 } from "./dirtystate";
 import { matchShortcut } from "./shortcuts";
 import { ftRootIsDir } from "./fileapi";
@@ -974,17 +976,30 @@ const openPane = (dir: "row" | "column" = "row", relativeTo?: Pane): void => {
   openWelcomeIn(tabs.activeWorkspace, dir, relativeTo);
 };
 
+/** Dispose or keep a just-dead pane per `keepOpenOnExit`, with one override
+ *  (#280): a DOA orchestration-delegate revival — a worker/reviewer/planner
+ *  pane that crashed having produced no output at all — is closed with a
+ *  brief toast instead of left open with nothing to read. The generic
+ *  "output" rule exists to protect a real crash's output; there is none here. */
+function closeOrKeep(ws: Workspace, pane: Pane, exit: PtyExit, keep: KeepOpenReason | null): void {
+  if (isDoaRevival({ orchRole: pane.orchRole, keep, receivedOutput: pane.hasReceivedOutput })) {
+    showToast(`${pane.name} exited before producing any output — closed`, "info");
+    ws.grid.closePane(pane, false);
+    return;
+  }
+  if (keep) {
+    pane.notifyExited(exit.exit_code, keep);
+    onGridChanged(); // a kept-open pane is now dead → drop it from the live count
+  } else ws.grid.closePane(pane, false);
+}
+
 function reapIfExited(ws: Workspace, pane: Pane): void {
   if (pane.ptyId === null) return;
   const exit = earlyExits.get(pane.ptyId);
   if (!exit) return;
   earlyExits.delete(pane.ptyId);
   if (tryResumeFallback(pane, exit)) return; // resume failed → fresh respawn in place
-  const keep = pane.keepOpenOnExit(exit);
-  if (keep) {
-    pane.notifyExited(exit.exit_code, keep);
-    onGridChanged(); // a kept-open pane is now dead → drop it from the live count
-  } else ws.grid.closePane(pane, false);
+  closeOrKeep(ws, pane, exit, pane.keepOpenOnExit(exit));
 }
 
 const sessions = new SessionBrowser(
@@ -1053,11 +1068,7 @@ void onPtyExit((exit) => {
   }
   const { ws, pane } = found;
   if (tryResumeFallback(pane, exit)) return; // resume failed → fresh respawn in place
-  const keep = pane.keepOpenOnExit(exit);
-  if (keep) {
-    pane.notifyExited(exit.exit_code, keep);
-    onGridChanged(); // dead-but-kept-open → update the live agent count
-  } else ws.grid.closePane(pane, false);
+  closeOrKeep(ws, pane, exit, pane.keepOpenOnExit(exit));
 });
 
 // ---------- app quit: the last place unsaved work can be lost (#219) ----------

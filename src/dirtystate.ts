@@ -208,3 +208,32 @@ export function exitDiagnosticLine(receivedOutput: boolean): string | null {
     "working directory are the usual causes)"
   );
 }
+
+/** A DOA orchestration-delegate revival (#280): a worker/reviewer/planner pane
+ *  whose process crashed having produced literally no output. `keepOpenOnExit`'s
+ *  "output" reason exists so a human can read a crash — but there is nothing
+ *  to read here, so keeping the pane open is pure clutter, not a safeguard.
+ *
+ *  Scoped narrowly on purpose:
+ *   - only overrides an "output" keep — an "unsaved" keep (#219) is untouched,
+ *     since THAT reason has nothing to do with the process at all;
+ *   - only a DELEGATE pane (`orchRole` is a role other than "orchestrator") —
+ *     the orchestrator's own pane is the human's active workspace, never
+ *     auto-closed out from under them;
+ *   - never a plain (non-orchestration) command pane — a human directly
+ *     running a CLI that crashes silently still gets the original "kept open
+ *     to read" behavior, since there is no orchestrator to have already
+ *     explained the failure elsewhere (#281's exit-diagnostic notice covers
+ *     exactly the orchestration case this targets). */
+export function isDoaRevival(state: {
+  orchRole: string | null;
+  keep: KeepOpenReason | null;
+  receivedOutput: boolean;
+}): boolean {
+  return (
+    state.keep === "output" &&
+    state.orchRole !== null &&
+    state.orchRole !== "orchestrator" &&
+    !state.receivedOutput
+  );
+}
