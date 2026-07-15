@@ -36,7 +36,7 @@ use loomux_lib::orchestration::{
     PLANNER_READONLY_NOTE, SOLO_GROUP,
 };
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -8493,6 +8493,154 @@ fn a_broken_workflow_file_keeps_the_last_known_gate_instead_of_failing_open() {
     assert_eq!(reg.merge_gate(&g2.id).unwrap().reviewers, vec!["rev-security", "rev-tests"]);
     let audit = fs::read_to_string(d.path().join(&gid).join("audit.jsonl")).unwrap();
     assert!(audit.contains("merge-gate-retained"), "and it must say so, loudly: {audit}");
+}
+
+// ═════════════════════ #318: resource guards, wired end to end ═══════════
+//
+// The compile step (`resource_guard_file_text`/`parse_resource_guard_file`,
+// `effective_slots`) is pinned in tests/workflow.rs; these pin `sync_resource_guards`
+// actually running at the right `create_group_ex` lifecycle points, mirroring the
+// merge-gate wiring tests immediately above — same trigger, same
+// advanced-orchestrator/fresh-launch gating, same "retained on a broken file" rule.
+// No shim runs here (that's #318 sub-PR 2): only the compiled spec file on disk.
+
+/// A repo declaring one guarded class (`heavy-build`, max 2) and, optionally, a
+/// worker block plus whatever extra YAML the caller appends.
+fn resource_guarded_repo(extra: &str) -> tempfile::TempDir {
+    let td = tempfile::tempdir().unwrap();
+    let dir = td.path().join(".loomux");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("workflow.yml"),
+        format!(
+            "version: 1\nname: guarded\n\
+             blocks:\n  - id: worker\n    kind: worker\n\
+             resources:\n  concurrency:\n\
+             \x20   - class: heavy-build\n      max: 2\n      timeout_minutes: 15\n      commands:\n        - {{ program: cargo, args: [build] }}\n{extra}"
+        ),
+    )
+    .unwrap();
+    td
+}
+
+#[test]
+fn a_declared_resource_class_becomes_the_spec_file_and_a_deleted_one_is_cleared() {
+    let (reg, d) = test_registry();
+    let repo = resource_guarded_repo("");
+    let on = Guardrails { advanced_orchestrator: true, ..rails() };
+    let g = reg.create_group(&repo.path().to_string_lossy(), on.clone()).unwrap();
+    let gid = g.id.clone();
+    let spec_file = d.path().join(&gid).join("resource_guards");
+
+    let text = fs::read_to_string(&spec_file).expect("a declared resources.concurrency must be written out");
+    assert!(text.contains("class heavy-build 2 15"), "N and timeout land in the compiled spec: {text}");
+    assert!(text.contains("command heavy-build cargo build"));
+    let parsed = reg.resource_guards(&gid);
+    assert_eq!(parsed.len(), 1);
+    assert_eq!(parsed[0].name, "heavy-build");
+
+    // The repo deletes its workflow → the guards are CLEARED, same rule the merge
+    // gate follows: a spec file a repo no longer declares must not outlive it.
+    fs::remove_file(repo.path().join(".loomux").join("workflow.yml")).unwrap();
+    let g2 = reg.create_group(&repo.path().to_string_lossy(), on).unwrap();
+    assert_eq!(g2.id, gid, "same repo → same group dir");
+    assert!(!spec_file.is_file(), "no workflow file → no resource guards → the pre-#318 flow, exactly");
+    assert!(reg.resource_guards(&gid).is_empty());
+}
+
+#[test]
+fn resource_guards_exist_only_while_the_advanced_orchestrator_is_on() {
+    let (reg, _d) = test_registry();
+    let repo = resource_guarded_repo("");
+
+    let g = reg.create_group(&repo.path().to_string_lossy(), rails()).unwrap(); // toggle OFF
+    assert!(
+        reg.resource_guards(&g.id).is_empty(),
+        "a workflow file the human never turned on must not throttle anything"
+    );
+
+    let on = Guardrails { advanced_orchestrator: true, ..rails() };
+    let g = reg.create_group(&repo.path().to_string_lossy(), on).unwrap();
+    assert!(!reg.resource_guards(&g.id).is_empty(), "turning it on makes the guards appear");
+
+    let g = reg.create_group(&repo.path().to_string_lossy(), rails()).unwrap(); // toggle OFF again
+    assert!(
+        reg.resource_guards(&g.id).is_empty(),
+        "guards must not survive the toggle that authorized them being turned off"
+    );
+}
+
+#[test]
+fn a_resumed_group_keeps_the_resource_guards_it_launched_with() {
+    // Pinning the slot pool's SHAPE on resume matters more here than it does for
+    // the merge gate's consent argument: an agent may be holding a slot in the
+    // pool right now, and a `git pull` must not be able to change the pool out
+    // from under it.
+    let (reg, _d) = test_registry();
+    let repo = resource_guarded_repo("");
+    let on = Guardrails { advanced_orchestrator: true, ..rails() };
+    let g = reg.create_group(&repo.path().to_string_lossy(), on).unwrap();
+    let gid = g.id.clone();
+    assert_eq!(reg.resource_guards(&gid)[0].max, 2);
+
+    // The repo lowers max: 2 -> 1...
+    fs::write(
+        repo.path().join(".loomux").join("workflow.yml"),
+        "version: 1\nblocks:\n  - id: worker\n    kind: worker\n\
+         resources:\n  concurrency:\n    - class: heavy-build\n      max: 1\n      commands:\n        - { program: cargo, args: [build] }\n",
+    )
+    .unwrap();
+    // ...and the session RESUMES (guardrails from group.json, as the restore path builds them).
+    let (repo_path, persisted) = reg.load_group_file(&gid).expect("group.json");
+    let g2 = reg.create_group_ex(&repo_path, persisted, Launch::Resume).unwrap();
+    assert_eq!(
+        reg.resource_guards(&g2.id)[0].max, 2,
+        "a resume must not let a pulled workflow file change the slot pool a session is running under"
+    );
+}
+
+#[test]
+fn a_broken_workflow_file_keeps_the_last_known_resource_guards_instead_of_clearing_them() {
+    let (reg, d) = test_registry();
+    let repo = resource_guarded_repo("");
+    let on = Guardrails { advanced_orchestrator: true, ..rails() };
+    let g = reg.create_group(&repo.path().to_string_lossy(), on.clone()).unwrap();
+    let spec_file = d.path().join(&g.id).join("resource_guards");
+    assert!(spec_file.is_file());
+
+    fs::write(repo.path().join(".loomux").join("workflow.yml"),
+        "version: 1\nblocks:\n  - id: x\n    kind: nonsense\n").unwrap();
+    // Relaunched with the advanced orchestrator still ON — it is the file that
+    // broke, not the human's mind about wanting the guard.
+    let g2 = reg.create_group(&repo.path().to_string_lossy(), on).unwrap();
+    assert!(spec_file.is_file(), "a broken workflow file must NOT drop the resource guards it can no longer read");
+    assert_eq!(g2.id, g.id);
+    let audit = fs::read_to_string(d.path().join(&g.id).join("audit.jsonl")).unwrap();
+    assert!(audit.contains("resource-guards-retained"), "and it must say so, loudly: {audit}");
+}
+
+#[test]
+fn a_machine_resource_guard_limit_lowers_the_spec_file_slot_count_but_never_raises_it() {
+    let (reg, _d) = test_registry();
+    let repo = resource_guarded_repo(""); // repo requests max: 2
+
+    let mut lower = BTreeMap::new();
+    lower.insert("heavy-build".to_string(), 1);
+    let g = reg.create_group(&repo.path().to_string_lossy(), Guardrails {
+        advanced_orchestrator: true, resource_guard_limits: lower, ..rails()
+    }).unwrap();
+    assert_eq!(reg.resource_guards(&g.id)[0].max, 1, "the machine override lowers the compiled slot count");
+
+    let mut raise = BTreeMap::new();
+    raise.insert("heavy-build".to_string(), 99);
+    let g2 = reg.create_group(&repo.path().to_string_lossy(), Guardrails {
+        advanced_orchestrator: true, resource_guard_limits: raise, ..rails()
+    }).unwrap();
+    assert_eq!(
+        reg.resource_guards(&g2.id)[0].max, 2,
+        "a machine override must never RAISE the repo's own max: — a repo file says WHAT, \
+         the machine says HOW MANY, and the machine can only tighten"
+    );
 }
 
 #[test]

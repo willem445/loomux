@@ -23,6 +23,7 @@ use loomux_lib::orchestration::{
     Caller, Guardrails, Launch, OrchRegistry, PersonaInject, Role,
 };
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -3783,4 +3784,408 @@ fn the_builtin_roster_still_honors_the_launchers_per_role_models() {
     assert!(!worker.contains("--agent"), "and a toggle-off group has no personas: {worker}");
     let (reviewer, _, _) = compile(&reg, &g, "reviewer");
     assert!(reviewer.contains("--model haiku"), "the launcher's reviewer pick decides: {reviewer}");
+}
+
+// ═════════════════════ #318: resource guards ═════════════════════════════
+//
+// `resources:` (config/parse), `guard_class_for` (the pure matcher) and the
+// `resource_guards` spec file (compile + degrade-on-corruption) — the W1
+// slice of #318. The shim that actually holds/releases a slot is a later
+// phase; nothing here executes a real command.
+
+const RESOURCES_SKETCH: &str = r#"
+version: 1
+name: guarded
+
+blocks:
+  - id: worker
+    kind: worker
+
+resources:
+  concurrency:
+    - class: heavy-build
+      max: 2
+      timeout_minutes: 15
+      commands:
+        - { program: cargo, args: [build] }
+        - { program: cargo, args: [test] }
+        - { program: npm, args: [run, build] }
+"#;
+
+fn guard_class(name: &str) -> workflow::ResourceClass {
+    workflow::ResourceClass {
+        name: name.into(),
+        max: 2,
+        timeout_minutes: 30,
+        commands: vec![
+            workflow::GuardCommand { program: "cargo".into(), args: vec!["build".into()] },
+            workflow::GuardCommand { program: "npm".into(), args: vec!["run".into(), "build".into()] },
+        ],
+    }
+}
+
+#[test]
+fn resources_block_parses_and_shares_a_pool_across_commands() {
+    let wf = workflow::parse_workflow(RESOURCES_SKETCH).expect("the schema sketch must parse");
+    assert_eq!(wf.resources.len(), 1);
+    let class = &wf.resources[0];
+    assert_eq!(class.name, "heavy-build");
+    assert_eq!(class.max, 2);
+    assert_eq!(class.timeout_minutes, 15);
+    assert_eq!(class.commands.len(), 3, "cargo build, cargo test AND npm run build share one pool");
+    assert_eq!(class.commands[0].program, "cargo");
+    assert_eq!(class.commands[0].args, vec!["build"]);
+    assert_eq!(class.commands[2].program, "npm");
+    assert_eq!(class.commands[2].args, vec!["run", "build"]);
+}
+
+#[test]
+fn resources_omitting_timeout_minutes_takes_the_default() {
+    let wf = workflow::parse_workflow(
+        "version: 1\nblocks:\n  - id: worker\n    kind: worker\n\
+         resources:\n  concurrency:\n    - class: x\n      max: 1\n      commands:\n        - { program: make }\n",
+    )
+    .unwrap();
+    assert_eq!(wf.resources[0].timeout_minutes, workflow::DEFAULT_RESOURCE_GUARD_TIMEOUT_MINUTES);
+    assert_eq!(wf.resources[0].commands[0].args, Vec::<String>::new(), "args: is optional too");
+}
+
+#[test]
+fn resources_is_restrict_only_and_never_touches_the_capability_closure() {
+    // The whole point of #318's design: a `resources:` block cannot add, remove
+    // or alter a single block/edge/gate. Parse the same roster with and without
+    // a resources: block attached and assert the capability-relevant output is
+    // byte-for-byte identical.
+    let with = workflow::parse_workflow(RESOURCES_SKETCH).unwrap();
+    let without = workflow::parse_workflow(
+        "version: 1\nname: guarded\nblocks:\n  - id: worker\n    kind: worker\n",
+    )
+    .unwrap();
+    assert_eq!(with.blocks, without.blocks);
+    assert_eq!(with.edges, without.edges);
+    assert_eq!(with.gates, without.gates);
+    assert!(!with.resources.is_empty() && without.resources.is_empty(), "only `resources` differs");
+}
+
+#[test]
+fn resources_max_is_required_and_bounded() {
+    let missing = workflow::parse_workflow(
+        "version: 1\nblocks:\n  - id: worker\n    kind: worker\n\
+         resources:\n  concurrency:\n    - class: x\n      commands:\n        - { program: make }\n",
+    )
+    .unwrap_err();
+    assert!(missing.iter().any(|e| e.contains("max is required")), "{missing:?}");
+
+    let zero = workflow::parse_workflow(
+        "version: 1\nblocks:\n  - id: worker\n    kind: worker\n\
+         resources:\n  concurrency:\n    - class: x\n      max: 0\n      commands:\n        - { program: make }\n",
+    )
+    .unwrap_err();
+    assert!(zero.iter().any(|e| e.contains("max 0 must be between 1 and")), "{zero:?}");
+
+    let too_big = workflow::parse_workflow(&format!(
+        "version: 1\nblocks:\n  - id: worker\n    kind: worker\n\
+         resources:\n  concurrency:\n    - class: x\n      max: {}\n      commands:\n        - {{ program: make }}\n",
+        workflow::MAX_RESOURCE_GUARD_SLOTS + 1
+    ))
+    .unwrap_err();
+    assert!(
+        too_big.iter().any(|e| e.contains("must be between 1 and") && e.contains(&workflow::MAX_RESOURCE_GUARD_SLOTS.to_string())),
+        "a repo file must not be able to mint an unbounded semaphore: {too_big:?}"
+    );
+}
+
+#[test]
+fn resources_timeout_minutes_is_bounded() {
+    let too_big = workflow::parse_workflow(&format!(
+        "version: 1\nblocks:\n  - id: worker\n    kind: worker\n\
+         resources:\n  concurrency:\n    - class: x\n      max: 1\n      timeout_minutes: {}\n      commands:\n        - {{ program: make }}\n",
+        workflow::MAX_RESOURCE_GUARD_TIMEOUT_MINUTES + 1
+    ))
+    .unwrap_err();
+    assert!(too_big.iter().any(|e| e.contains("timeout_minutes") && e.contains("must be between")), "{too_big:?}");
+}
+
+#[test]
+fn resources_class_and_program_ids_are_rejected_not_rewritten() {
+    // Same reject-not-rewrite contract `sanitize_id` gives block ids: an author
+    // who wrote `heavy build` must not end up guarding a class silently renamed
+    // `heavybuild` that nothing else can reference.
+    let bad_class = workflow::parse_workflow(
+        "version: 1\nblocks:\n  - id: worker\n    kind: worker\n\
+         resources:\n  concurrency:\n    - class: \"heavy build\"\n      max: 1\n      commands:\n        - { program: make }\n",
+    )
+    .unwrap_err();
+    assert!(
+        bad_class.iter().any(|e| e.contains("class") && e.contains("not allowed")),
+        "{bad_class:?}"
+    );
+
+    let bad_program = workflow::parse_workflow(
+        "version: 1\nblocks:\n  - id: worker\n    kind: worker\n\
+         resources:\n  concurrency:\n    - class: x\n      max: 1\n      commands:\n        - { program: \"my make\" }\n",
+    )
+    .unwrap_err();
+    assert!(
+        bad_program.iter().any(|e| e.contains("program") && e.contains("not allowed")),
+        "{bad_program:?}"
+    );
+
+    let bad_arg = workflow::parse_workflow(
+        "version: 1\nblocks:\n  - id: worker\n    kind: worker\n\
+         resources:\n  concurrency:\n    - class: x\n      max: 1\n      commands:\n        - { program: cargo, args: [\"bu ild\"] }\n",
+    )
+    .unwrap_err();
+    assert!(
+        bad_arg.iter().any(|e| e.contains("args[0]") && e.contains("not a usable token")),
+        "{bad_arg:?}"
+    );
+}
+
+#[test]
+fn resources_duplicate_class_and_empty_commands_are_rejected() {
+    let dup = workflow::parse_workflow(
+        "version: 1\nblocks:\n  - id: worker\n    kind: worker\n\
+         resources:\n  concurrency:\n\
+         \x20   - class: x\n      max: 1\n      commands:\n        - { program: make }\n\
+         \x20   - class: x\n      max: 2\n      commands:\n        - { program: cargo }\n",
+    )
+    .unwrap_err();
+    assert!(dup.iter().any(|e| e.contains("duplicate class")), "{dup:?}");
+
+    let empty = workflow::parse_workflow(
+        "version: 1\nblocks:\n  - id: worker\n    kind: worker\n\
+         resources:\n  concurrency:\n    - class: x\n      max: 1\n      commands: []\n",
+    )
+    .unwrap_err();
+    assert!(
+        empty.iter().any(|e| e.contains("no commands") && e.contains("guards nothing")),
+        "{empty:?}"
+    );
+}
+
+#[test]
+fn resources_reports_every_problem_not_just_the_first() {
+    // Three DIFFERENT classes, three DIFFERENT problems — the point being that a
+    // human fixing the file sees every mistake in one pass, not one-at-a-time.
+    let errs = workflow::parse_workflow(
+        "version: 1\nblocks:\n  - id: worker\n    kind: worker\n\
+         resources:\n  concurrency:\n\
+         \x20   - class: no-max\n      commands:\n        - { program: make }\n\
+         \x20   - class: zero-max\n      max: 0\n      commands:\n        - { program: make }\n\
+         \x20   - class: empty\n      max: 1\n      commands: []\n",
+    )
+    .unwrap_err();
+    assert!(errs.len() >= 3, "max-missing, max-0 AND no-commands must all surface: {errs:?}");
+    assert!(errs.iter().any(|e| e.contains("no-max") && e.contains("max is required")), "{errs:?}");
+    assert!(errs.iter().any(|e| e.contains("zero-max") && e.contains("must be between")), "{errs:?}");
+    assert!(errs.iter().any(|e| e.contains("empty") && e.contains("no commands")), "{errs:?}");
+}
+
+#[test]
+fn resources_deny_unknown_fields_catches_a_typo() {
+    let errs = workflow::parse_workflow(
+        "version: 1\nblocks:\n  - id: worker\n    kind: worker\n\
+         resources:\n  concurrency:\n    - class: x\n      max: 1\n      commnads: []\n",
+    )
+    .unwrap_err();
+    assert_eq!(errs.len(), 1, "a typo'd key is a parse error, not a silently ignored field: {errs:?}");
+}
+
+// ───────────────────────── guard_class_for: the matcher ─────────────────────
+
+#[test]
+fn guard_class_for_matches_program_and_arg_prefix_flags_skipped() {
+    let classes = vec![guard_class("heavy-build")];
+    let cargo_build = vec!["build".to_string(), "--release".to_string()];
+    assert_eq!(
+        workflow::guard_class_for(&classes, "cargo", &cargo_build).map(|c| c.name.as_str()),
+        Some("heavy-build"),
+        "flags after the guarded positional must not break the match"
+    );
+
+    // A flag BEFORE the positional is skipped too — the positional scan mirrors
+    // the generic `rest.iter().filter(|t| !t.starts_with('-'))` remote/refspec
+    // scanner already used for git push detection.
+    let flag_first = vec!["--verbose".to_string(), "build".to_string()];
+    assert!(workflow::guard_class_for(&classes, "cargo", &flag_first).is_some());
+
+    // `cargo test` is NOT in this class's commands (only `cargo build` is, in
+    // this fixture) — must not match.
+    let cargo_test = vec!["test".to_string()];
+    assert!(workflow::guard_class_for(&classes, "cargo", &cargo_test).is_none());
+
+    // Too few positionals to satisfy a 2-token pattern (`npm run build`).
+    let npm_run_only = vec!["run".to_string()];
+    assert!(workflow::guard_class_for(&classes, "npm", &npm_run_only).is_none());
+    let npm_run_build = vec!["run".to_string(), "build".to_string()];
+    assert!(workflow::guard_class_for(&classes, "npm", &npm_run_build).is_some());
+
+    // A DIFFERENT program entirely.
+    let unrelated = vec!["build".to_string()];
+    assert!(workflow::guard_class_for(&classes, "make", &unrelated).is_none());
+}
+
+#[test]
+fn guard_class_for_matches_the_same_program_by_a_different_path() {
+    let classes = vec![guard_class("heavy-build")];
+    let build = vec!["build".to_string()];
+    for full_path in [
+        "cargo",
+        "/usr/bin/cargo",
+        "/usr/bin/cargo.exe",
+        r"C:\Users\me\.cargo\bin\cargo.EXE",
+        r"C:\tools\cargo.CMD",
+    ] {
+        assert!(
+            workflow::guard_class_for(&classes, full_path, &build).is_some(),
+            "{full_path:?} must match the same as a bare `cargo`"
+        );
+    }
+    // A genuinely different program that merely SHARES A SUBSTRING must not match.
+    assert!(workflow::guard_class_for(&classes, "cargo-watch", &build).is_none());
+    assert!(workflow::guard_class_for(&classes, "mycargo", &build).is_none());
+}
+
+#[test]
+fn guard_class_for_compares_argv_tokens_verbatim_no_unquoting() {
+    // argv is already shell-parsed by the OS by the time it reaches this
+    // function — there is no second "strip the quotes" pass. A token that
+    // arrives carrying literal quote characters (e.g. a caller that mis-split
+    // its own input) is simply a token that isn't `build`.
+    let classes = vec![guard_class("heavy-build")];
+    let quoted = vec![r#""build""#.to_string()];
+    assert!(
+        workflow::guard_class_for(&classes, "cargo", &quoted).is_none(),
+        "a literally-quoted token must not silently match its unquoted form"
+    );
+    let plain = vec!["build".to_string()];
+    assert!(workflow::guard_class_for(&classes, "cargo", &plain).is_some());
+}
+
+#[test]
+fn guard_class_for_finds_the_right_class_among_several() {
+    let classes = vec![
+        workflow::ResourceClass {
+            name: "heavy-build".into(),
+            max: 2,
+            timeout_minutes: 30,
+            commands: vec![workflow::GuardCommand { program: "cargo".into(), args: vec!["build".into()] }],
+        },
+        workflow::ResourceClass {
+            name: "heavy-test".into(),
+            max: 1,
+            timeout_minutes: 30,
+            commands: vec![workflow::GuardCommand { program: "cargo".into(), args: vec!["test".into()] }],
+        },
+    ];
+    assert_eq!(
+        workflow::guard_class_for(&classes, "cargo", &["test".to_string()]).map(|c| c.name.as_str()),
+        Some("heavy-test")
+    );
+    assert_eq!(
+        workflow::guard_class_for(&classes, "cargo", &["build".to_string()]).map(|c| c.name.as_str()),
+        Some("heavy-build")
+    );
+}
+
+// ───────────────────────── effective_slots: repo vs machine ─────────────────
+
+#[test]
+fn effective_slots_a_repo_can_lower_its_own_request_never_raise_the_machine_cap() {
+    let class = guard_class("heavy-build"); // max: 2
+
+    // No override at all: the repo's own request stands.
+    assert_eq!(workflow::effective_slots(&class, &BTreeMap::new()), 2);
+
+    // A machine override LOWER than the repo's request wins.
+    let mut lower = BTreeMap::new();
+    lower.insert("heavy-build".to_string(), 1);
+    assert_eq!(workflow::effective_slots(&class, &lower), 1);
+
+    // A machine override HIGHER than the repo's request does NOT raise it — the
+    // repo's `max:` is itself a ceiling the machine may only tighten.
+    let mut higher = BTreeMap::new();
+    higher.insert("heavy-build".to_string(), 99);
+    assert_eq!(workflow::effective_slots(&class, &higher), 2, "a repo file must not be able to widen its own cap via a machine override either way — min() of the two, always");
+
+    // An override for a DIFFERENT class name does not touch this one.
+    let mut other = BTreeMap::new();
+    other.insert("some-other-class".to_string(), 1);
+    assert_eq!(workflow::effective_slots(&class, &other), 2);
+}
+
+// ───────────────────────── the resource_guards spec file ────────────────────
+
+#[test]
+fn resource_guard_file_round_trips_and_bakes_in_effective_slots() {
+    let classes = vec![guard_class("heavy-build")];
+    let mut overrides = BTreeMap::new();
+    overrides.insert("heavy-build".to_string(), 1); // lower the repo's max: 2 to 1
+
+    let text = workflow::resource_guard_file_text(&classes, &overrides);
+    assert!(text.contains("class heavy-build 1 30\n"), "the OVERRIDE-applied N lands in the file: {text}");
+    assert!(text.contains("command heavy-build cargo build\n"));
+    assert!(text.contains("command heavy-build npm run build\n"));
+    for line in text.lines().filter(|l| !l.starts_with('#')) {
+        assert!(
+            line.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ' ')),
+            "every token the shim word-splits must be shell-inert: {line:?}"
+        );
+    }
+
+    let parsed = workflow::parse_resource_guard_file(&text);
+    assert_eq!(parsed.len(), 1);
+    assert_eq!(parsed[0].name, "heavy-build");
+    assert_eq!(parsed[0].max, 1, "the file carries the EFFECTIVE slot count, not the repo's raw max:");
+    assert_eq!(parsed[0].timeout_minutes, 30);
+    assert_eq!(parsed[0].commands.len(), 2);
+}
+
+#[test]
+fn resource_guard_file_no_classes_is_the_empty_no_op_file() {
+    let text = workflow::resource_guard_file_text(&[], &BTreeMap::new());
+    assert!(workflow::parse_resource_guard_file(&text).is_empty());
+}
+
+#[test]
+fn resource_guard_file_degrades_instead_of_denying_on_corruption() {
+    // The OPPOSITE failure direction from the merge gate (`parse_gate_file`
+    // returns `None` — refuse everything — on any unrecognized line). A resource
+    // guard is restrict-only, so the safe failure is "guard less than declared",
+    // never "guard more" and never "the whole file becomes unusable".
+    let hand_edited = "class heavy-build 2 30\n\
+         command heavy-build cargo build\n\
+         nonsense truncated line\n\
+         command heavy-build npm run build\n";
+    let classes = workflow::parse_resource_guard_file(hand_edited);
+    assert_eq!(classes.len(), 1, "the unrecognized line is skipped, not fatal to the whole file");
+    assert_eq!(classes[0].commands.len(), 2, "and both well-formed command lines around it still land");
+
+    // A `command` naming a class that was never declared (a hand-edit, a
+    // truncated write) is dropped rather than crashing the read.
+    let orphan_command = "command nobody cargo build\n";
+    assert!(workflow::parse_resource_guard_file(orphan_command).is_empty());
+
+    // A class whose only command line is malformed is left with ZERO usable
+    // commands and is therefore dropped entirely — it would guard nothing.
+    // (A program token of pure punctuation sanitizes to nothing — `sanitize_id`
+    // STRIPS disallowed characters rather than rejecting a token outright, so
+    // this has to leave zero usable characters behind, not merely an odd one.)
+    let all_bad = "class heavy-build 2 30\ncommand heavy-build \"\n";
+    assert!(workflow::parse_resource_guard_file(all_bad).is_empty());
+
+    // Duplicate `class` declarations: keep the first, degrade the repeat rather
+    // than erroring the whole file (this file is generated, never hand-authored,
+    // so a duplicate only happens on a corrupted read).
+    let dup = "class x 2 30\ncommand x cargo build\nclass x 5 5\ncommand x cargo build\n";
+    let parsed = workflow::parse_resource_guard_file(dup);
+    assert_eq!(parsed.len(), 1);
+    assert_eq!(parsed[0].max, 2, "the first declaration wins");
+
+    // Totally empty / comment-only / garbage text is simply zero guards — the
+    // same safe state as the file not existing at all.
+    assert!(workflow::parse_resource_guard_file("").is_empty());
+    assert!(workflow::parse_resource_guard_file("# nothing here\n").is_empty());
+    assert!(workflow::parse_resource_guard_file("garbage\nmore garbage\n").is_empty());
 }
