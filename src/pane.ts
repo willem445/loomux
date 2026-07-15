@@ -1401,6 +1401,18 @@ export class Pane implements VoiceTargetPane {
     this.el.classList.toggle("connect-pending", pending);
   }
 
+  /** Has `dispose()` already run? (#271 review finding 1.) Orchestration.ts's
+   *  module-level "armed connect source" reference has no dispose hook of its
+   *  own — it's a plain `Pane` object reference, so a closed pane doesn't
+   *  un-arm itself — so the connect-menu wiring checks this lazily, on the
+   *  next menu-open, rather than needing a new close callback. Deliberately
+   *  NOT `!this.el.isConnected`: a MINIMIZED (docked) pane also detaches its
+   *  `.el` from the DOM while very much still alive and a valid connect
+   *  target, so DOM attachment can't stand in for "this pane still exists". */
+  get isDisposed(): boolean {
+    return this.disposed;
+  }
+
   /** Current needs-attention state, or null. Lets the grid render an equivalent
    *  badge on the dock chip while this pane is minimized (its header is out of
    *  the DOM). */

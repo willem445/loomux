@@ -41,6 +41,22 @@ export function reduceConnect(
   }
 }
 
+/** Drop the pending arm if its source pane is no longer alive (#286 review
+ *  finding 1): the armed pane can close — or its agent can die, kept open only
+ *  as an exit banner — mid-gesture, and `pending` is a plain identity value
+ *  with no dispose hook of its own to un-arm it. `isAlive` is supplied by the
+ *  caller (orchestration.ts, from `Pane.isDisposed`) since a pane's liveness
+ *  isn't something a DOM-free module can observe itself; this only decides
+ *  what the result SHOULD be once that fact is known. Called lazily on the
+ *  next menu-open rather than wired to a close callback — the backend would
+ *  reject a completion against a dead agent either way (ids are never
+ *  reused), so the only real bug was the stale "pairs with `<dead name>`"
+ *  label, and the very next right-click, anywhere, is exactly when that label
+ *  would next be shown. */
+export function dropIfStale(pending: PendingConnect | null, isAlive: boolean): PendingConnect | null {
+  return pending && !isAlive ? null : pending;
+}
+
 // ---------- per-channel color/number chip (#271: distinguish concurrent channels) ----------
 
 // Reuses orchbadge.ts's GROUP_COLORS palette values (kept as a separate literal here,

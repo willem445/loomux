@@ -19,7 +19,7 @@ import type { WorkflowPreview } from "./roster";
 import { showToast } from "./toast";
 import { showContextMenu } from "./contextmenu";
 import { buildPaneMenu, type PaneConnectState, type PaneMenuAction, type PendingConnect } from "./panemenu";
-import { reduceConnect, channelBadge } from "./channel";
+import { reduceConnect, channelBadge, dropIfStale } from "./channel";
 
 export type { AutonomyState };
 export type { WorkflowPreview };
@@ -494,10 +494,22 @@ function setPending(next: PendingConnect | null, source: Pane | null): void {
   pendingPane?.setPendingConnect(true);
 }
 
+/** Drop a stale armed source (review finding #286-1) before it can render a
+ *  menu label naming a pane that's gone. `channel.ts`'s `dropIfStale` is the
+ *  pure decision (unit-tested: alive → unchanged, dead → null); this is just
+ *  the DOM shell supplying the one fact it can't observe itself
+ *  (`Pane.isDisposed`) and applying the result. */
+function dropStalePending(): void {
+  if (pendingPane && dropIfStale(pendingConnect, !pendingPane.isDisposed) === null) {
+    setPending(null, null);
+  }
+}
+
 /** Right-click on a pane header (#271): show the Connect/Disconnect menu built
  *  from this pane's current state and the (global, cross-tab) armed connect
  *  source. Wired from `PaneEvents.onPaneContextMenu`. */
 export function showPaneConnectMenu(pane: Pane, x: number, y: number): void {
+  dropStalePending();
   const items = buildPaneMenu(paneConnectState(pane), pendingConnect);
   showContextMenu(x, y, items, (action) => void handlePaneMenuAction(action, pane));
 }

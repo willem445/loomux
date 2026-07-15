@@ -3,7 +3,7 @@
 // deterministic (cache-free) channel color/number derivation.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { reduceConnect, channelNumber, channelColor, channelChipLabel, channelBadge } from "../src/channel.ts";
+import { reduceConnect, channelNumber, channelColor, channelChipLabel, channelBadge, dropIfStale } from "../src/channel.ts";
 import type { PendingConnect } from "../src/panemenu.ts";
 
 const A: PendingConnect = { group: "g1", agentId: "w-1", name: "w-1" };
@@ -37,6 +37,24 @@ test("disconnecting the ARMED pane itself also cancels the gesture — nothing l
   const { pending, effect } = reduceConnect({ kind: "disconnect", pane: A }, A);
   assert.equal(pending, null);
   assert.deepEqual(effect, { kind: "disconnect", group: A.group, agentId: A.agentId });
+});
+
+// ---------- stale-armed-source cleanup (#286 review finding 1) ----------
+// The armed pane can close (or its agent can die) mid-gesture with no dispose
+// hook of its own to un-arm it — dropIfStale is the pure decision the DOM shell
+// (orchestration.ts's dropStalePending) applies on the next menu-open.
+
+test("a still-alive armed source is left completely unchanged", () => {
+  assert.equal(dropIfStale(A, true), A);
+});
+
+test("a dead armed source is dropped to null", () => {
+  assert.equal(dropIfStale(A, false), null);
+});
+
+test("no armed source (already null) stays null regardless of liveness", () => {
+  assert.equal(dropIfStale(null, false), null);
+  assert.equal(dropIfStale(null, true), null);
 });
 
 // ---------- per-channel color/number (distinguishing concurrent channels) ----------
