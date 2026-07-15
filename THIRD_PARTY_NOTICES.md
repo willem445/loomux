@@ -33,10 +33,15 @@ Applies under the same opt-in condition as the runtime above.
 
 Bundled in the Windows installer for clean terminal-resize behavior.
 
-- Upstream: https://github.com/microsoft/terminal (built via
-  https://github.com/wezterm/wezterm/tree/main/assets/windows/conhost)
-- Bundled files: `conpty.dll`, `OpenConsole.exe`
-  (`src-tauri/resources/conhost/`)
-- License: MIT. Provenance notes in `src-tauri/resources/conhost/README.md`.
-- Shipping the upstream `LICENSE` text alongside these binaries is still open:
-  issue #2. This file is the project-wide notice that issue asks for.
+- Upstream: https://github.com/microsoft/terminal, version `1.22.250204002`
+  (win10 x64), via the `Microsoft.Windows.Console.ConPTY` NuGet package built
+  by microsoft/terminal's own release pipeline
+- Vendored from wezterm commit
+  [`4accc376f341`](https://github.com/wezterm/wezterm/commit/4accc376f3411f2cbf4f92ca46f79f7bc47688a1)
+  ("update bundled conpty build", 2025-02-08)
+- Bundled files: `conpty.dll`, `OpenConsole.exe`, `LICENSE`
+  (`src-tauri/resources/conhost/`) — the `resources/conhost/*` glob in
+  `tauri.conf.json` ships all three in every installer
+- License: MIT (Copyright (c) Microsoft Corporation), full text in
+  `src-tauri/resources/conhost/LICENSE`. Provenance notes in
+  `src-tauri/resources/conhost/README.md`.
