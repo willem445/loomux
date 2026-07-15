@@ -73,6 +73,16 @@ jobs:
             const existing = releases.find((r) => r.tag_name === tag)
             if (existing) {
               core.info(`Reusing existing release ${existing.id} for ${tag} (draft=${existing.draft}, prerelease=${existing.prerelease})`)
+              // Re-assert prerelease on reuse (e.g. a "Re-run all jobs" that
+              // finds the draft this job already made): only patches when
+              // it disagrees with the tag, so a stable tag's reuse path
+              // never issues this call — the invariant is otherwise
+              // load-bearing on promote's make_latest=false alone, which is
+              // one job removed from where the flag is actually set.
+              if (existing.prerelease !== isPrerelease) {
+                core.info(`Re-asserting prerelease=${isPrerelease} on release ${existing.id} for ${tag} (was ${existing.prerelease})`)
+                await github.rest.repos.updateRelease({ owner, repo, release_id: existing.id, prerelease: isPrerelease })
+              }
               return existing.id
             }
 
