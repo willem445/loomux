@@ -10,7 +10,8 @@ use loomux_lib::orchestration::mcp::dispatch;
 use loomux_lib::orchestration::notify;
 use loomux_lib::orchestration::workflow;
 use loomux_lib::orchestration::{
-    add_trusted_folder, autonomy_budget_exhausted, bracketed_paste, channel_message_text,
+    add_trusted_folder, autonomy_budget_exhausted, bracketed_paste, channel_connected_event,
+    channel_disconnected_event, channel_message_text, channel_updated_event,
     classify_human_input,
     claude_permission_mode, cli_ready, copilot_autopilot_prompt_detected, create_orchestration_group,
     gh_gate_decision, gh_is_merge_invocation, gh_positionals, gh_release_action, gh_repo_flag,
@@ -9055,6 +9056,45 @@ fn connect_list_and_for_pane_all_return_the_same_channel_shape() {
             "{label} must report the SAME display_number connect minted"
         );
     }
+
+    // #271 follow-up review finding: the shape-parity coverage above pinned
+    // connect/list/for_pane (and a separate test pins channel_status) but
+    // NOT `set_sender`'s return — a swap must report the unchanged
+    // display_number, never recompute or drop it.
+    let swapped = reg.set_sender(connected["id"].as_str().unwrap(), &c2.agent_id).unwrap();
+    assert_eq!(
+        swapped["display_number"], connected["display_number"],
+        "set_sender's return must report the SAME display_number connect minted, got {swapped}"
+    );
+}
+
+#[test]
+fn orch_channel_event_payloads_all_carry_the_channels_display_number() {
+    // #271 follow-up review finding: the surfaces pinned above are all
+    // ordinary function returns, easy to assert on directly. The THREE
+    // `orch-channel` event shapes (connected / disconnected-or-closed /
+    // updated) are the remaining surface — but this codebase has no harness
+    // for capturing an ACTUALLY emitted Tauri event (`self.app` is `None` in
+    // every test registry, so `app.emit(...)` never fires here). The
+    // payload-building functions (`channel_connected_event`/
+    // `channel_disconnected_event`/`channel_updated_event`) are factored out
+    // as pure functions for exactly this reason — the real call sites in
+    // `connect_agents`/`disconnect_agent`/`set_sender` call the SAME
+    // functions pinned here, so drift between "what's tested" and "what's
+    // emitted" is structurally impossible, not just asserted.
+    let members = vec![json!({ "agent_id": "w-1" }), json!({ "agent_id": "w-2" })];
+
+    let connected = channel_connected_event("chan-9", "w-1", 4, members.clone());
+    assert_eq!(connected["display_number"], json!(4), "got: {connected}");
+
+    let disconnected = channel_disconnected_event(false, "chan-9", "w-2", 4, members.clone());
+    assert_eq!(disconnected["display_number"], json!(4), "got: {disconnected}");
+
+    let closed = channel_disconnected_event(true, "chan-9", "w-2", 4, members.clone());
+    assert_eq!(closed["display_number"], json!(4), "got: {closed}");
+
+    let updated = channel_updated_event("chan-9", "w-1", 4, members);
+    assert_eq!(updated["display_number"], json!(4), "got: {updated}");
 }
 
 // ---------- display_number: reflects what's ACTUALLY connected (#271 follow-up) ----------

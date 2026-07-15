@@ -4001,6 +4001,45 @@ pub fn channel_message_text(chan_id: &str, sender_label: &str, sanitized_text: &
     format!("[loomux] channel {chan_id} - {sender_label}: {sanitized_text}")
 }
 
+/// Build the `orch-channel` event's "connected" payload (fresh mint or a
+/// third pane joining) — pure, so `display_number`'s presence is pinned
+/// directly (#271 follow-up review finding: this codebase has no harness for
+/// capturing an actually-emitted Tauri event — `self.app` is `None` in every
+/// test registry, so `app.emit(...)` never fires — the payload construction
+/// is factored out here instead, and both the real call site and the test
+/// call the SAME function, so drift between them is structurally impossible).
+pub fn channel_connected_event(chan_id: &str, sender: &str, display_number: u32, members: Vec<Value>) -> Value {
+    json!({
+        "kind": "connected", "channel_id": chan_id, "sender": sender,
+        "display_number": display_number, "members": members,
+    })
+}
+
+/// Build the `orch-channel` event's "disconnected"/"closed" payload — same
+/// pure-extraction rationale as `channel_connected_event`.
+pub fn channel_disconnected_event(
+    closed: bool,
+    chan_id: &str,
+    agent: &str,
+    display_number: u32,
+    members: Vec<Value>,
+) -> Value {
+    json!({
+        "kind": if closed { "closed" } else { "disconnected" },
+        "channel_id": chan_id, "agent": agent,
+        "display_number": display_number, "members": members,
+    })
+}
+
+/// Build the `orch-channel` event's "updated" payload (a `set_sender` swap)
+/// — same pure-extraction rationale as `channel_connected_event`.
+pub fn channel_updated_event(chan_id: &str, sender: &str, display_number: u32, members: Vec<Value>) -> Value {
+    json!({
+        "kind": "updated", "channel_id": chan_id, "sender": sender,
+        "display_number": display_number, "members": members,
+    })
+}
+
 impl OrchRegistry {
     pub fn new(root: PathBuf) -> Self {
         let _ = fs::create_dir_all(&root);
@@ -6294,10 +6333,7 @@ impl OrchRegistry {
         if let Some(app) = self.app.lock_safe().clone() {
             let _ = app.emit(
                 "orch-channel",
-                json!({
-                    "kind": "connected", "channel_id": ch.id, "sender": ch.sender,
-                    "display_number": ch.display_number, "members": member_json,
-                }),
+                channel_connected_event(&ch.id, &ch.sender, ch.display_number, member_json.clone()),
             );
         }
         let a_label = self.channel_member_label(&ChannelMember {
@@ -6387,16 +6423,14 @@ impl OrchRegistry {
         if let Some(app) = self.app.lock_safe().clone() {
             let _ = app.emit(
                 "orch-channel",
-                json!({
-                    "kind": if closed { "closed" } else { "disconnected" },
-                    "channel_id": chan_id, "agent": agent,
-                    // `sender` is the channel's sender BEFORE this removal —
-                    // still correct here: the still-open branch (`!closed`)
-                    // is only reached when `agent` was a receiver, i.e. the
-                    // sender is unchanged and still among `remaining`.
-                    "display_number": display_number,
-                    "members": self.channel_members_json(&sender, &remaining),
-                }),
+                // `sender` is the channel's sender BEFORE this removal —
+                // still correct here: the still-open branch (`!closed`)
+                // is only reached when `agent` was a receiver, i.e. the
+                // sender is unchanged and still among `remaining`.
+                channel_disconnected_event(
+                    closed, &chan_id, agent, display_number,
+                    self.channel_members_json(&sender, &remaining),
+                ),
             );
         }
         if closed {
@@ -6652,11 +6686,7 @@ impl OrchRegistry {
         if let Some(app) = self.app.lock_safe().clone() {
             let _ = app.emit(
                 "orch-channel",
-                json!({
-                    "kind": "updated", "channel_id": channel_id,
-                    "sender": new_sender_agent, "display_number": ch_clone.display_number,
-                    "members": member_json,
-                }),
+                channel_updated_event(channel_id, new_sender_agent, ch_clone.display_number, member_json.clone()),
             );
         }
         for m in &ch_clone.members {
