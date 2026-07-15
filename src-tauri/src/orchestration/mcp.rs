@@ -228,7 +228,7 @@ fn tool_defs(role: Role) -> Vec<Value> {
                     "task": { "type": "string", "description": "Full task brief; empty = idle. With resume_session, this is the follow-up prompt." },
                     "worktree": { "type": "boolean", "description": "Create a dedicated git worktree + branch" },
                     "branch": { "type": "string", "description": "Branch name (default agent/<id>)" },
-                    "base": { "type": "string", "description": "Start-point for the worktree branch (default: the repo's default branch, fetched fresh from origin). Pass a feature branch (e.g. 'feat/x' or 'origin/feat/x') to deliberately stack this worktree on top of it. Ignored without worktree=true, and ignored when 'branch' already exists (the existing branch is checked out as-is)." },
+                    "base": { "type": "string", "description": "Start-point for the worktree branch (default: the repo's default branch, fetched fresh from origin). Pass a feature branch (e.g. 'feat/x' or 'origin/feat/x') to deliberately stack this worktree on top of it. Ignored without worktree=true. When 'branch' already exists, that branch is checked out as-is (its history stands on its own) — but if it does NOT descend from the requested base, the spawn fails loudly (#227) rather than silently handing back a wrong-base worktree." },
                     "resume_session": { "type": "string", "description": "Session id to resume instead of starting fresh" },
                     "cwd": { "type": "string", "description": "Existing directory to run in (required with resume_session; use the original workspace)" },
                 }),
