@@ -16,7 +16,8 @@ use loomux_lib::orchestration::{
     claude_permission_mode, cli_ready, copilot_autopilot_prompt_detected, create_orchestration_group,
     exit_cause, exit_diagnostic, resolve_output_text,
     gh_gate_decision, gh_is_merge_invocation, gh_positionals, gh_release_action, gh_repo_flag,
-    gh_shim_sh, git_shim_sh, git_tag_push, grant_segment, grant_unexpired, hold_for_human_input,
+    gh_shim_sh, git_shim_sh, git_tag_push, grant_segment, grant_unexpired, guard_shim_sh,
+    guarded_shim_programs, hold_for_human_input,
     hold_until_quiet, idle_output_is_activity, idle_should_kill, idle_tick_should_fire,
     low_disk_notice, low_disk_transition, max_agents_notice, pr_number, release_gate_decision,
     GhGate, GitTagPush,
@@ -8641,6 +8642,418 @@ fn a_machine_resource_guard_limit_lowers_the_spec_file_slot_count_but_never_rais
         "a machine override must never RAISE the repo's own max: — a repo file says WHAT, \
          the machine says HOW MANY, and the machine can only tighten"
     );
+}
+
+// ═════════════════ #318 sub-PR 2: the resource-guard SHIM ══════════════════
+//
+// W1 (above) pins the compile step; these run the REAL POSIX shim end-to-end
+// against a fake guarded command (never a real agent CLI / toolchain — see
+// CLAUDE.md constraint 3) the same way `gh_shim_shell_harness_executes_the_gate`
+// runs the real `gh` shim. Skipped (not failed) when no POSIX `sh` is available.
+
+/// Write a fake "real" program at `path` with `body` as its `#!/bin/sh` script,
+/// then a matching resource-guard shim (`guard_shim_sh`) at `shim_path`
+/// impersonating `program`, chmod'ing both executable (unix + Git-Bash/MSYS
+/// view). Mirrors `gh_shim_shell_harness_executes_the_gate`'s fake-gh setup.
+fn write_fake_and_shim(fake_path: &Path, body: &str, shim_path: &Path, program: &str) {
+    use std::process::Command;
+    fs::write(fake_path, body).unwrap();
+    fs::write(shim_path, guard_shim_sh(program, &fake_path.display().to_string())).unwrap();
+    let _ = Command::new("sh").arg("-c")
+        .arg(format!("chmod +x '{}' '{}'", fake_path.display(), shim_path.display()))
+        .status();
+}
+
+/// Poll for `path` to exist, up to `timeout`. Panics on timeout — used to wait
+/// for a fake command's "I started running" marker without a fixed sleep.
+fn wait_for_file(path: &Path, timeout: Duration) {
+    let start = std::time::Instant::now();
+    while !path.is_file() {
+        assert!(start.elapsed() < timeout, "timed out waiting for {}", path.display());
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// A one-class, one-command compiled spec, written the same way
+/// `sync_resource_guards` writes it (through the real `resource_guard_file_text`,
+/// not a hand-rolled string) — so a format drift there would show up here too.
+fn write_guard_spec(
+    group_dir: &Path,
+    class: &str,
+    max: u32,
+    timeout_minutes: u32,
+    program: &str,
+    args: &[&str],
+) {
+    let classes = vec![workflow::ResourceClass {
+        name: class.to_string(),
+        max,
+        timeout_minutes,
+        commands: vec![workflow::GuardCommand {
+            program: program.to_string(),
+            args: args.iter().map(|a| a.to_string()).collect(),
+        }],
+    }];
+    let text = workflow::resource_guard_file_text(&classes, &BTreeMap::new());
+    fs::write(group_dir.join("resource_guards"), text).unwrap();
+}
+
+#[test]
+fn guarded_shim_programs_dedupes_sorts_and_excludes_gh_and_git() {
+    let classes = vec![workflow::ResourceClass {
+        name: "a".into(),
+        max: 1,
+        timeout_minutes: 1,
+        commands: vec![
+            workflow::GuardCommand { program: "cargo".into(), args: vec!["build".into()] },
+            workflow::GuardCommand { program: "cargo".into(), args: vec!["test".into()] },
+            workflow::GuardCommand { program: "gh".into(), args: vec![] },
+            workflow::GuardCommand { program: "GIT".into(), args: vec![] },
+            workflow::GuardCommand { program: "npm".into(), args: vec!["run".into()] },
+        ],
+    }];
+    assert_eq!(
+        guarded_shim_programs(&classes),
+        vec!["cargo".to_string(), "npm".to_string()],
+        "deduped, sorted, and gh/git (any case) excluded — they already carry the #83 shim"
+    );
+}
+
+#[test]
+fn guard_shim_script_pins_the_four_audit_actions() {
+    let sh = guard_shim_sh("cargo", "/usr/bin/cargo");
+    for action in [
+        "resource-guard-acquired",
+        "resource-guard-waiting",
+        "resource-guard-timeout",
+        "resource-guard-reaped",
+    ] {
+        assert!(sh.contains(action), "missing audit action {action}, mirroring the merge-gate style");
+    }
+    assert!(sh.contains("trap 'loomux_release' EXIT INT TERM HUP"), "release on every trappable exit");
+    assert!(sh.contains("loomux_pid_alive"), "stale-holder reaper for the one path trap can't cover");
+}
+
+#[test]
+fn unmatched_program_or_args_pass_through_with_zero_slot_activity() {
+    if !have_sh() {
+        eprintln!("SKIP unmatched_program_or_args_pass_through_with_zero_slot_activity: no POSIX sh");
+        return;
+    }
+    let td = tempfile::tempdir().unwrap();
+    let root = td.path();
+    let group_dir = root.join("group");
+    fs::create_dir_all(&group_dir).unwrap();
+    let ran = root.join("ran");
+    let fake = root.join("fakebuild");
+    let shim = root.join("build");
+    write_fake_and_shim(
+        &fake,
+        &format!("#!/bin/sh\n: > \"{}\"\nexit 0\n", ran.display()),
+        &shim,
+        "build",
+    );
+    // Spec guards ONLY `build go` — an invocation with a different positional
+    // must exec immediately, taking no slot.
+    write_guard_spec(&group_dir, "heavy-build", 1, 5, "build", &["go"]);
+
+    let status = std::process::Command::new("sh")
+        .arg(&shim)
+        .arg("check")
+        .env("LOOMUX_GROUP_DIR", &group_dir)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    assert!(ran.is_file(), "the real program still ran");
+    assert!(
+        !group_dir.join("resource_slots").join("heavy-build").exists(),
+        "an unmatched invocation must take no slot"
+    );
+    let audit = fs::read_to_string(group_dir.join("audit.jsonl")).unwrap_or_default();
+    assert!(!audit.contains("resource-guard"), "and must not even be audited: {audit}");
+}
+
+#[test]
+fn no_spec_file_is_pre_318_passthrough() {
+    if !have_sh() {
+        eprintln!("SKIP no_spec_file_is_pre_318_passthrough: no POSIX sh");
+        return;
+    }
+    let td = tempfile::tempdir().unwrap();
+    let root = td.path();
+    let group_dir = root.join("group"); // deliberately never created
+    let ran = root.join("ran");
+    let fake = root.join("fakebuild");
+    let shim = root.join("build");
+    write_fake_and_shim(&fake, &format!("#!/bin/sh\n: > \"{}\"\nexit 0\n", ran.display()), &shim, "build");
+
+    let status = std::process::Command::new("sh")
+        .arg(&shim)
+        .arg("go")
+        .env("LOOMUX_GROUP_DIR", &group_dir)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    assert!(ran.is_file(), "no resources: block anywhere -> byte-for-byte pre-#318 passthrough");
+}
+
+#[test]
+fn slot_directory_is_removed_after_a_normal_exit() {
+    if !have_sh() {
+        eprintln!("SKIP slot_directory_is_removed_after_a_normal_exit: no POSIX sh");
+        return;
+    }
+    let td = tempfile::tempdir().unwrap();
+    let root = td.path();
+    let group_dir = root.join("group");
+    fs::create_dir_all(&group_dir).unwrap();
+    let fake = root.join("fakebuild");
+    let shim = root.join("build");
+    write_fake_and_shim(&fake, "#!/bin/sh\nexit 0\n", &shim, "build");
+    write_guard_spec(&group_dir, "heavy-build", 1, 5, "build", &["go"]);
+
+    let status = std::process::Command::new("sh")
+        .arg(&shim)
+        .arg("go")
+        .env("LOOMUX_GROUP_DIR", &group_dir)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let slot = group_dir.join("resource_slots").join("heavy-build").join("slot.1");
+    assert!(!slot.exists(), "a normal exit must release the slot, not leak it");
+    let audit = fs::read_to_string(group_dir.join("audit.jsonl")).unwrap_or_default();
+    assert!(audit.contains("resource-guard-acquired"), "the acquire itself is audited: {audit}");
+}
+
+#[test]
+fn a_third_concurrent_caller_waits_visibly_then_succeeds() {
+    if !have_sh() {
+        eprintln!("SKIP a_third_concurrent_caller_waits_visibly_then_succeeds: no POSIX sh");
+        return;
+    }
+    let td = tempfile::tempdir().unwrap();
+    let root = td.path();
+    let group_dir = root.join("group");
+    fs::create_dir_all(&group_dir).unwrap();
+    let fake = root.join("fakebuild");
+    let shim = root.join("build");
+    // Holds the slot for ~2s, long enough for a 3rd caller's fast heartbeat to fire
+    // and for the poll to observe the release afterward.
+    write_fake_and_shim(&fake, "#!/bin/sh\nsleep 2\nexit 0\n", &shim, "build");
+    write_guard_spec(&group_dir, "heavy-build", 2, 5, "build", &["go"]);
+
+    let spawn = || {
+        std::process::Command::new("sh")
+            .arg(&shim)
+            .arg("go")
+            .env("LOOMUX_GROUP_DIR", &group_dir)
+            .env("LOOMUX_TEST_HEARTBEAT_SECS", "1")
+            .env("LOOMUX_TEST_POLL_SECS", "1")
+            .spawn()
+            .unwrap()
+    };
+    let h1 = spawn();
+    let h2 = spawn();
+    // Give the two holders a moment's head start so the 3rd genuinely contends.
+    std::thread::sleep(Duration::from_millis(300));
+    let out3 = std::process::Command::new("sh")
+        .arg(&shim)
+        .arg("go")
+        .env("LOOMUX_GROUP_DIR", &group_dir)
+        .env("LOOMUX_TEST_HEARTBEAT_SECS", "1")
+        .env("LOOMUX_TEST_POLL_SECS", "1")
+        .output()
+        .unwrap();
+
+    for mut h in [h1, h2] {
+        assert!(h.wait().unwrap().success());
+    }
+    assert!(out3.status.success(), "the 3rd caller must WAIT then SUCCEED, never error");
+    let stderr3 = String::from_utf8_lossy(&out3.stderr);
+    assert!(stderr3.contains("loomux: waiting for a 'heavy-build' slot"), "visible pane line: {stderr3}");
+    let audit = fs::read_to_string(group_dir.join("audit.jsonl")).unwrap_or_default();
+    assert!(audit.contains("resource-guard-waiting"), "and the wait is audited: {audit}");
+}
+
+#[test]
+fn a_queued_caller_fails_open_on_timeout_and_audits_it() {
+    if !have_sh() {
+        eprintln!("SKIP a_queued_caller_fails_open_on_timeout_and_audits_it: no POSIX sh");
+        return;
+    }
+    let td = tempfile::tempdir().unwrap();
+    let root = td.path();
+    let group_dir = root.join("group");
+    fs::create_dir_all(&group_dir).unwrap();
+    let ran2 = root.join("ran2");
+    let fake = root.join("fakebuild");
+    let shim = root.join("build");
+    // $1 is always "go" (the matched positional) for both callers; $2 is the
+    // distinguishing marker so the holder and the timed-out caller can be told
+    // apart. The holder parks well past the 2nd caller's timeout.
+    write_fake_and_shim(
+        &fake,
+        &format!(
+            "#!/bin/sh\nif [ \"$2\" = \"second\" ]; then : > \"{}\"; exit 0; fi\nsleep 5\nexit 0\n",
+            ran2.display()
+        ),
+        &shim,
+        "build",
+    );
+    write_guard_spec(&group_dir, "heavy-build", 1, 1, "build", &["go"]);
+
+    let mut holder = std::process::Command::new("sh")
+        .arg(&shim)
+        .arg("go")
+        .arg("holder")
+        .env("LOOMUX_GROUP_DIR", &group_dir)
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(300)); // let the holder actually acquire first
+
+    let out = std::process::Command::new("sh")
+        .arg(&shim)
+        .arg("go")
+        .arg("second")
+        .env("LOOMUX_GROUP_DIR", &group_dir)
+        .env("LOOMUX_TEST_TIMEOUT_SECS", "1")
+        .env("LOOMUX_TEST_POLL_SECS", "1")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "fail-OPEN: a timed-out queued command must still run, never error");
+    assert!(ran2.is_file(), "and the real program must have actually executed, not merely 'succeeded'");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("timed out — running anyway"), "visible fail-open notice: {stderr}");
+    let audit = fs::read_to_string(group_dir.join("audit.jsonl")).unwrap_or_default();
+    assert!(audit.contains("resource-guard-timeout"), "fail-open is audited: {audit}");
+
+    assert!(holder.wait().unwrap().success());
+}
+
+#[test]
+fn a_hard_killed_holder_leaks_no_slot_the_reaper_reclaims_it() {
+    // The red-before-green anchor (#318 brief): on a naive counter/trap-only
+    // scheme this test fails (the slot leaks forever on -9 / TerminateProcess).
+    if !have_sh() {
+        eprintln!("SKIP a_hard_killed_holder_leaks_no_slot_the_reaper_reclaims_it: no POSIX sh");
+        return;
+    }
+    let td = tempfile::tempdir().unwrap();
+    let root = td.path();
+    let group_dir = root.join("group");
+    fs::create_dir_all(&group_dir).unwrap();
+    let markers = root.join("markers");
+    fs::create_dir_all(&markers).unwrap();
+    let fake = root.join("fakebuild");
+    let shim = root.join("build");
+    // $1 is always "go" (the matched positional); $2 ("holder"/"second") names
+    // the marker so the two callers are distinguishable. Touches the marker
+    // immediately, then sleeps — long enough to hard-kill mid-hold, short
+    // enough not to linger past the test.
+    write_fake_and_shim(
+        &fake,
+        &format!(
+            "#!/bin/sh\n: > \"{}/$2.started\"\nsleep 5\nexit 0\n",
+            markers.display()
+        ),
+        &shim,
+        "build",
+    );
+    write_guard_spec(&group_dir, "heavy-build", 1, 5, "build", &["go"]);
+
+    let mut holder = std::process::Command::new("sh")
+        .arg(&shim)
+        .arg("go")
+        .arg("holder")
+        .env("LOOMUX_GROUP_DIR", &group_dir)
+        .spawn()
+        .unwrap();
+    wait_for_file(&markers.join("holder.started"), Duration::from_secs(5));
+    let slot = group_dir.join("resource_slots").join("heavy-build").join("slot.1");
+    assert!(slot.is_dir(), "the holder must have actually acquired the (only) slot");
+
+    // Hard kill: SIGKILL on unix, TerminateProcess on Windows — the shim's
+    // `trap … EXIT INT TERM HUP` CANNOT run for either.
+    holder.kill().expect("hard-kill the holder");
+    let _ = holder.wait(); // reap it — also makes its death observable to the reaper
+
+    let second = std::process::Command::new("sh")
+        .arg(&shim)
+        .arg("go")
+        .arg("second")
+        .env("LOOMUX_GROUP_DIR", &group_dir)
+        .spawn()
+        .unwrap();
+    wait_for_file(&markers.join("second.started"), Duration::from_secs(5));
+    // `second` is now itself holding the reclaimed slot mid-sleep — kill it too
+    // rather than waiting out its sleep; the assertions below don't need it to finish.
+    let mut second = second;
+    let _ = second.kill();
+    let _ = second.wait();
+
+    let audit = fs::read_to_string(group_dir.join("audit.jsonl")).unwrap_or_default();
+    assert!(audit.contains("resource-guard-reaped"), "the reap must be audited: {audit}");
+}
+
+#[test]
+fn five_concurrent_callers_never_exceed_two_slots_at_once() {
+    if !have_sh() {
+        eprintln!("SKIP five_concurrent_callers_never_exceed_two_slots_at_once: no POSIX sh");
+        return;
+    }
+    let td = tempfile::tempdir().unwrap();
+    let root = td.path();
+    let group_dir = root.join("group");
+    fs::create_dir_all(&group_dir).unwrap();
+    let log = root.join("build.log");
+    let fake = root.join("fakebuild");
+    let shim = root.join("build");
+    write_fake_and_shim(
+        &fake,
+        &format!(
+            "#!/bin/sh\nprintf 'start %s\\n' \"$(date +%s%3N)\" >> \"{log}\"\nsleep 1\nprintf 'end %s\\n' \"$(date +%s%3N)\" >> \"{log}\"\nexit 0\n",
+            log = log.display()
+        ),
+        &shim,
+        "build",
+    );
+    write_guard_spec(&group_dir, "heavy-build", 2, 5, "build", &["go"]);
+
+    let mut children: Vec<std::process::Child> = (0..5)
+        .map(|_| {
+            std::process::Command::new("sh")
+                .arg(&shim)
+                .arg("go")
+                .env("LOOMUX_GROUP_DIR", &group_dir)
+                .env("LOOMUX_TEST_POLL_SECS", "1")
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    for c in &mut children {
+        assert!(c.wait().unwrap().success());
+    }
+
+    let text = fs::read_to_string(&log).unwrap_or_default();
+    let mut events: Vec<(i64, i32)> = Vec::new();
+    for line in text.lines() {
+        let mut it = line.split_whitespace();
+        let (Some(kind), Some(ts)) = (it.next(), it.next()) else { continue };
+        let Ok(ts) = ts.parse::<i64>() else { continue };
+        match kind {
+            "start" => events.push((ts, 1)),
+            "end" => events.push((ts, -1)),
+            _ => {}
+        }
+    }
+    assert_eq!(events.iter().filter(|(_, d)| *d == 1).count(), 5, "all 5 must eventually run: {text}");
+    events.sort_by_key(|e| e.0);
+    let (mut cur, mut peak) = (0, 0);
+    for (_, d) in events {
+        cur += d;
+        peak = peak.max(cur);
+    }
+    assert!(peak <= 2, "never more than 2 concurrent, saw {peak} overlapping — log:\n{text}");
 }
 
 #[test]
