@@ -211,6 +211,21 @@ fn tool_defs(role: Role) -> Vec<Value> {
             tool("cancel_notification",
                 "Cancel one of your own live notifications by id (e.g. because the PR it watched got closed).",
                 json!({ "id": { "type": "string" } }), &["id"]),
+            // Cross-workspace channels (#271): a HUMAN connects your pane to
+            // another agent's pane (possibly in a different orchestration
+            // group/repo) via a context-menu gesture — there is no tool here
+            // to open, close, or join a channel yourself. Once connected,
+            // these two tools are your whole surface: send text to whoever
+            // you're connected to, and check who that is. Denied to a
+            // planner for the same #203 reason as the notification tools —
+            // `call_tool`'s `require_not_planner` re-checks this listing.
+            tool("channel_send",
+                "Send a message to everyone you're currently connected to in your cross-workspace channel (a human connects panes together; you cannot). It is typed as a visible prompt into each peer's pane, prefixed with your identity so they know it's from you. Errors if you aren't connected to anyone — check with channel_status() or ask a human to connect you.",
+                json!({ "text": { "type": "string", "description": "The message to send. Sanitized before delivery: control characters are stripped and you cannot forge a [loomux] system notice." } }),
+                &["text"]),
+            tool("channel_status",
+                "Check whether you're connected to a cross-workspace channel and, if so, who else is in it (agent id, role, name, repo). Read-only.",
+                json!({}), &[]),
         ]);
     }
     if role == Role::Orchestrator {
@@ -632,6 +647,16 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             let id = arg_str(args, "id").ok_or("id required")?;
             reg.cancel_notification(&caller.agent_id, id)?;
             Ok(format!("cancelled {id}"))
+        }
+
+        "channel_send" => {
+            require_not_planner(caller)?;
+            let text = arg_str(args, "text").ok_or("text required")?;
+            reg.channel_send(caller, text)
+        }
+        "channel_status" => {
+            require_not_planner(caller)?;
+            Ok(reg.channel_status(caller).to_string())
         }
 
         "report" => {

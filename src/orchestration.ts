@@ -657,3 +657,79 @@ export const endGroup = (groupId: string, cleanupWorktrees: boolean): Promise<En
  *  default CLI, which a block with no `cli:` of its own inherits. */
 export const workflowPreview = (repo: string, agentCli: string): Promise<WorkflowPreview> =>
   invoke<WorkflowPreview>("orch_workflow_preview", { repo, agentCli });
+
+// ---------- cross-workspace channels (#271): human-only connect/disconnect ----------
+//
+// A channel is a human-connected set of two-or-more agent panes, possibly in
+// different orchestration groups/tabs. The connect/disconnect gesture and
+// every membership mutation are Tauri commands only — there is deliberately
+// no MCP tool an agent can call to open/close/join one (CLAUDE.md constraint
+// 5/6). An agent's only surface is the `channel_send`/`channel_status` MCP
+// tools, which broadcast/read against the membership graph a human built.
+//
+// This module exposes the typed command wrappers and the `orch-channel`
+// event payload shape; wiring them into pane chrome (the connect menu, the
+// header chip, the `orch-channel` listener) is the UI slice's job.
+
+/** One member of a channel, as the backend resolves it — cached name/role so
+ *  a rendered chip/roster doesn't need a second agent lookup. */
+export interface ChannelMember {
+  group: string;
+  agent_id: string;
+  name: string;
+  role: OrchRole;
+}
+
+/** A live cross-workspace channel (backend `Channel`). */
+export interface OrchChannel {
+  id: string;
+  created_ms?: number;
+  members: ChannelMember[];
+}
+
+/** Connect two agent panes (possibly in different groups) into a channel.
+ *  Human-only. Per the backend's join rules: both free mints a new channel;
+ *  one free + one already-connected joins the free pane into that channel
+ *  (multi-party); both already connected to different channels is rejected.
+ *  Returns the resulting channel. */
+export const channelConnect = (
+  fromGroup: string,
+  fromAgent: string,
+  toGroup: string,
+  toAgent: string,
+): Promise<OrchChannel> =>
+  invoke<OrchChannel>("orch_channel_connect", { fromGroup, fromAgent, toGroup, toAgent });
+
+/** Result of disconnecting one pane from its channel. */
+export interface ChannelDisconnectResult {
+  channel_id: string;
+  /** True if membership dropped below 2 and the whole channel was torn down. */
+  closed: boolean;
+  remaining: number;
+}
+
+/** Disconnect one agent pane from its channel. Human-only; tears the channel
+ *  down (and strands/notifies any remaining member) if this drops it below
+ *  2 members. */
+export const channelDisconnect = (group: string, agent: string): Promise<ChannelDisconnectResult> =>
+  invoke<ChannelDisconnectResult>("orch_channel_disconnect", { group, agent });
+
+/** Every live channel, for cross-tab indicators on tab switch. */
+export const channelList = (): Promise<OrchChannel[]> => invoke<OrchChannel[]>("orch_channel_list", {});
+
+/** The channel one pane belongs to, or null — for a single pane's header
+ *  chip on tab switch / reconnect. */
+export const channelForPane = (group: string, agent: string): Promise<OrchChannel | null> =>
+  invoke<OrchChannel | null>("orch_channel_for_pane", { group, agent });
+
+/** Payload of the `orch-channel` event, emitted by the backend on every
+ *  connect/disconnect/teardown so cross-tab UI (chips, dock mirror, tab-strip
+ *  dot) can update without polling. */
+export interface OrchChannelEvent {
+  kind: "connected" | "disconnected" | "closed";
+  channel_id: string;
+  /** Present on disconnected/closed: the pane that left. */
+  agent?: string;
+  /** Current membership after the change (empty on `closed`). */
+  members: ChannelMember[];
+}
