@@ -19,9 +19,10 @@ free**. Two independent failures fell out of that one condition:
    5–7 GB each. A day of orchestrated work left ~10 worktrees ≈ 50 GB of
    duplicate build caches, with nothing bounding or reclaiming them.
 
-This note covers the fix for both: make durable writes atomic (#133), and stop
-worktrees from each paying a fresh multi-GB build cache, plus a backstop that
-warns before the disk hits zero (#134).
+This note covers the fix for both: make durable writes atomic (#133), plus a
+backstop that warns before the disk hits zero (#134). (A shared build cache
+once addressed the per-worktree cost too, but it corrupted concurrent builds
+and special-cased cargo, so it was removed — #263.)
 
 ## Part 1 — atomic durable writes (#133)
 
