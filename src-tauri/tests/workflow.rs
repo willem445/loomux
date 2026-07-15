@@ -221,6 +221,19 @@ fn validation_catches_the_dangling_references_every_other_tool_ships_with() {
     .unwrap_err();
     assert!(errs.iter().any(|e| e.contains("could never pass")), "{errs:?}");
 
+    // A reviewer named twice in the same gate: undetected, this would inflate
+    // `gate_need`/`recommend_capacity`'s minimum and let one PASS count twice
+    // toward a `threshold: N` gate (#259). Rejected, consistent with a
+    // duplicate block id, rather than silently deduped.
+    let errs = workflow::parse_workflow(
+        "version: 1\nblocks:\n  - id: r\n    kind: reviewer\ngates:\n  merge:\n    reviewers: [r, r]\n",
+    )
+    .unwrap_err();
+    assert!(
+        errs.iter().any(|e| e.contains("named more than once") && e.contains('r')),
+        "{errs:?}"
+    );
+
     // Duplicate ids: edges/gates would reference an ambiguous target.
     let errs = workflow::parse_workflow(
         "version: 1\nblocks:\n  - id: w\n    kind: worker\n  - id: w\n    kind: reviewer\n",
