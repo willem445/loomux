@@ -34,7 +34,7 @@ import { gitRepoRoot } from "./git";
 import { voiceController } from "./voicecontrol";
 import { initStatusBar } from "./statusbar";
 import { initHintBar } from "./hintbar";
-import { WelcomeForm, type WelcomeResult } from "./launcher";
+import { WelcomeForm, type WelcomeResult, type AgentLaunchSpec } from "./launcher";
 import {
   initOrchestration,
   launchOrchestrator,
@@ -43,6 +43,8 @@ import {
   showPaneConnectMenu,
   disconnectPaneChannel,
   cancelPendingConnect,
+  soloBind,
+  SOLO_GROUP,
   type OrchWiring,
   type OrchTarget,
   type OrchestratorConfig,
@@ -179,7 +181,7 @@ function eventsFor(ws: Workspace): PaneEvents {
     onRecordChanged: () => onGridChanged(),
     // The connect gesture (#271): the pane can't build its own menu (needs the
     // cross-tab armed-connect state + backend wrappers), so it asks its host.
-    onPaneContextMenu: (pane, x, y) => showPaneConnectMenu(pane, x, y),
+    onPaneContextMenu: (pane, x, y) => void showPaneConnectMenu(pane, x, y),
     // One-click disconnect from the channel chip itself (the "easy close"
     // requirement) — same destination as the pane menu's Disconnect item.
     onDisconnectChannel: (pane) => disconnectPaneChannel(pane),
@@ -959,7 +961,9 @@ async function handleWelcomeSubmit(
     cwd: first.cwd,
     command: first.command,
     sessionId: first.sessionId,
+    channelAgent: channelAgentFor(first),
   });
+  await bindSoloIfNeeded(pane, first);
   reapIfExited(ws, pane);
   // The first agent converted the setup pane in place — notify so the counter
   // reflects it immediately, not only after the fan-out (#194 P4 HIGH-1). The
@@ -969,14 +973,45 @@ async function handleWelcomeSubmit(
   let d: "row" | "column" = "column";
   for (const spec of rest) {
     const p = await ws.grid.openPane(
-      { name: spec.name, cwd: spec.cwd, command: spec.command, sessionId: spec.sessionId },
+      {
+        name: spec.name,
+        cwd: spec.cwd,
+        command: spec.command,
+        sessionId: spec.sessionId,
+        channelAgent: channelAgentFor(spec),
+      },
       eventsFor(ws),
       d,
       prev
     );
+    await bindSoloIfNeeded(p, spec);
     reapIfExited(ws, p);
     prev = p;
     d = d === "row" ? "column" : "row";
+  }
+}
+
+/** Build a freshly-launched agent pane's `channelAgent` carrier from its
+ *  launch spec, or `undefined` if the launcher didn't mint one (a CLI with no
+ *  MCP config seam — codex/gemini/opencode/custom — stays lazy, adopted only
+ *  on first Connect). See `AgentLaunchSpec.channelAgent`. */
+function channelAgentFor(spec: AgentLaunchSpec) {
+  return spec.channelAgent
+    ? { group: SOLO_GROUP, agentId: spec.channelAgent.agentId, role: "solo", canSend: spec.channelAgent.canSend }
+    : undefined;
+}
+
+/** Bind the just-spawned pane's pty to the `AgentEntry` `orch_solo_prepare`
+ *  minted for it (#271 W3 addendum, part A2) — the launcher's counterpart to
+ *  the orchestration group's `bind_agent` round trip. Best-effort: a failed
+ *  bind just leaves the pane without a live channel identity, same as any
+ *  other mint failure. */
+async function bindSoloIfNeeded(pane: Pane, spec: AgentLaunchSpec): Promise<void> {
+  if (!spec.channelAgent || pane.ptyId === null) return;
+  try {
+    await soloBind(spec.channelAgent.agentId, pane.ptyId);
+  } catch {
+    /* best-effort — the pane just won't be channel-connectable until adopted */
   }
 }
 

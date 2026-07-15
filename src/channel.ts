@@ -13,15 +13,23 @@ import type { PaneChannelBadge } from "./pane";
 
 export type ConnectEffect =
   | { kind: "none" }
-  | { kind: "connect"; from: PendingConnect; to: PendingConnect }
-  | { kind: "disconnect"; group: string; agentId: string };
+  /** `senderAgent` (#271 W3 addendum, part B2) is the explicit direction choice made
+   *  at completion — always `from.agentId` or `to.agentId` (or, on a join, whichever
+   *  agent already drives that channel), never inferred from gesture order. */
+  | { kind: "connect"; from: PendingConnect; to: PendingConnect; senderAgent: string }
+  | { kind: "disconnect"; group: string; agentId: string }
+  /** Human-only sender swap (B5): reassign an already-live channel's sender without
+   *  reconnecting. */
+  | { kind: "set-sender"; channelId: string; newSenderAgent: string };
 
 /** One fired pane-menu action → the next pending-arm state, plus what to actually do.
  *  `connect-arm` and `connect-cancel` only change the pending state (arming is a pure
  *  UI gesture — no backend call until a SECOND pane completes it). `connect-complete`
- *  clears pending and hands back the `connect` effect; `disconnect` hands back the
- *  `disconnect` effect and ALSO clears pending if the disconnected pane happened to be
- *  the armed source (there is nothing left to complete against). */
+ *  clears pending and hands back the `connect` effect (with its direction); `disconnect`
+ *  hands back the `disconnect` effect and ALSO clears pending if the disconnected pane
+ *  happened to be the armed source (there is nothing left to complete against);
+ *  `set-sender` doesn't touch the pending-arm state at all — it's a mutation on an
+ *  already-live channel, orthogonal to the connect gesture. */
 export function reduceConnect(
   action: PaneMenuAction,
   pending: PendingConnect | null
@@ -32,11 +40,21 @@ export function reduceConnect(
     case "connect-cancel":
       return { pending: null, effect: { kind: "none" } };
     case "connect-complete":
-      return { pending: null, effect: { kind: "connect", from: action.from, to: action.to } };
+      return {
+        pending: null,
+        effect: { kind: "connect", from: action.from, to: action.to, senderAgent: action.senderAgent },
+      };
     case "disconnect":
       return {
         pending: pending && pending.agentId === action.pane.agentId ? null : pending,
         effect: { kind: "disconnect", group: action.pane.group, agentId: action.pane.agentId },
+      };
+    case "set-sender":
+      return {
+        pending,
+        effect: action.pane.channelId
+          ? { kind: "set-sender", channelId: action.pane.channelId, newSenderAgent: action.pane.agentId }
+          : { kind: "none" },
       };
   }
 }
@@ -88,19 +106,43 @@ export function channelChipLabel(channelId: string): string {
   return `⇄${channelNumber(channelId)}`;
 }
 
+/** One entry in a channel's member list, as the backend's `channel_members_json`
+ *  serializes it (mod.rs) — `direction`/`can_send`/`delivery_only` are the #271 W3
+ *  addendum's directional fields (part B7/A4). */
+export interface ChannelBadgeMember {
+  agent_id: string;
+  name: string;
+  direction?: "sender" | "receiver";
+  can_send?: boolean;
+  delivery_only?: boolean;
+}
+
 /** Build the pane header's channel badge (pane.ts's `setConnected` input) from a
  *  channel id and its member list, for whichever member `selfAgentId` is — used both
  *  by the live `orch-channel` event handler and by the on-open rehydration read
- *  (`channelForPane`), so the two paths can't render the chip differently. */
+ *  (`channelForPane`), so the two paths can't render the chip differently.
+ *
+ *  `direction`/`canSend`/`deliveryOnly` describe THIS pane (`selfAgentId`'s own entry),
+ *  not the peers — they drive the chip's arrow (outward for sender, inward for
+ *  receiver) and the "receive-only" variant (#271 W3 addendum, part C). Default to a
+ *  receiver with no send capability if `selfAgentId` isn't found in `members` (should
+ *  not happen for a live channel — a defensive fallback, not a real UI state). */
 export function channelBadge(
   channelId: string,
-  members: readonly { agent_id: string; name: string }[],
+  members: readonly ChannelBadgeMember[],
   selfAgentId: string
 ): PaneChannelBadge {
+  const me = members.find((m) => m.agent_id === selfAgentId);
+  const senderMember = members.find((m) => m.direction === "sender");
   return {
     channelId,
     color: channelColor(channelId),
     label: channelChipLabel(channelId),
     peers: members.filter((m) => m.agent_id !== selfAgentId).map((m) => m.name),
+    direction: me?.direction ?? "receiver",
+    canSend: me?.can_send ?? false,
+    deliveryOnly: me?.delivery_only ?? true,
+    senderId: senderMember?.agent_id ?? null,
+    senderName: senderMember?.name ?? null,
   };
 }

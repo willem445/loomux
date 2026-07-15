@@ -68,6 +68,7 @@ import {
   setCustomCommand,
   setDefaultAgent,
 } from "./agents";
+import { soloPrepare } from "./orchestration";
 
 export interface AgentLaunchSpec {
   name: string;
@@ -78,6 +79,14 @@ export interface AgentLaunchSpec {
    *  CLI (Claude) and passed to the pane so its layout snapshot can `--resume`
    *  the exact session on restore. Absent for best-effort CLIs / custom commands. */
   sessionId?: string;
+  /** #271 W3 addendum, part A2: this pane's channel-scoped identity, minted
+   *  BEFORE spawn via `orch_solo_prepare` — eagerly, but ONLY for claude/copilot
+   *  (the CLIs with an MCP config seam; `command` above already carries the
+   *  appended flags). Absent for every other CLI: those stay lazy, adopted only
+   *  on the pane's first Connect gesture (`orch_solo_adopt`), so a codex/gemini/
+   *  custom launch incurs no `__solo__` identity nobody asked for. Also absent
+   *  if the mint itself failed — best-effort, never blocks the launch. */
+  channelAgent?: { agentId: string; canSend: boolean };
 }
 
 /** What a submitted welcome form resolves to — the caller (main.ts) spawns the
@@ -1259,11 +1268,31 @@ export class WelcomeForm {
           sessionId = crypto.randomUUID();
           cmd = `${command} --session-id ${sessionId}`;
         }
+        const name = plan.count > 1 ? `${plan.baseName} ${i}` : plan.baseName;
+        // #271 W3 addendum, part A2: mint a channel-scoped identity BEFORE this
+        // pane boots — only for claude/copilot (the CLIs with an MCP config
+        // seam), and only for agent panes (this loop never runs for terminal/
+        // content submissions). Every other CLI stays lazy: it gets no identity
+        // here and is adopted as a delivery-only member only if/when the human
+        // actually connects it (`orch_solo_adopt`), so a codex/gemini/custom
+        // launch mints nothing nobody asked for. Best-effort: a failed mint
+        // must never block the launch.
+        let channelAgent: { agentId: string; canSend: boolean } | undefined;
+        if (!plan.isCustom && (program === "claude" || program === "copilot")) {
+          try {
+            const prepared = await soloPrepare(program, cwd ?? "", name);
+            if (prepared.mcp_args) cmd = `${cmd} ${prepared.mcp_args}`;
+            channelAgent = { agentId: prepared.agent_id, canSend: !prepared.delivery_only };
+          } catch {
+            /* best-effort — falls back to lazy adopt-on-connect */
+          }
+        }
         specs.push({
-          name: plan.count > 1 ? `${plan.baseName} ${i}` : plan.baseName,
+          name,
           cwd,
           command: cmd,
           sessionId,
+          channelAgent,
         });
       }
       setDefaultAgent(plan.isCustom ? "custom" : this.agentSel.value);

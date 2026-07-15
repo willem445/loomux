@@ -161,6 +161,22 @@ export interface PaneChannelBadge {
   label: string;
   /** Other members' display names, for the chip's tooltip. */
   peers: string[];
+  /** THIS pane's direction in the channel (#271 W3 addendum, part C): drives the
+   *  chip's arrow — outward (▲) for the sender, inward (▼) for a receiver. */
+  direction: "sender" | "receiver";
+  /** Whether this pane can currently `channel_send` — always true for the
+   *  sender; for a receiver, true only while it holds the reply credit. */
+  canSend: boolean;
+  /** True for a delivery-only member (no token, ever) — the "receive-only"
+   *  chip variant, distinct from a full receiver simply out of credit right
+   *  now (which still reads as a plain receiver — it WILL be able to reply). */
+  deliveryOnly: boolean;
+  /** The channel's current sender — agent id/name — or null if unresolved.
+   *  Used by panemenu.ts's join-compatibility rule ("Join as receiver —
+   *  driven by {sender}") and by `orchestration.ts` to fill
+   *  `PaneConnectState.senderId`/`senderName`. */
+  senderId: string | null;
+  senderName: string | null;
 }
 
 export interface PaneOptions {
@@ -184,6 +200,15 @@ export interface PaneOptions {
   orchRole?: string;
   /** Agent id, for attention acks (clearing a "needs attention" badge). */
   orchAgent?: string;
+  /** A STANDALONE pane's channel-scoped MCP identity (#271 W3 addendum, parts
+   *  A/C): set by the launcher after `orch_solo_prepare`/`orch_solo_bind` for a
+   *  newly-spawned pane. Deliberately NOT `orchGroup`/`orchRole`/`orchAgent` —
+   *  those gate the full orchestration chrome (task board, audit button, group
+   *  badge, steering strip), which a plain standalone pane must never show just
+   *  because it can now join a channel. A pane with no identity at spawn time
+   *  (launched before this feature, or adopted later) gets one via
+   *  `setChannelAgent` post-construction instead. */
+  channelAgent?: { group: string; agentId: string; role: string; canSend: boolean };
   /** Open without stealing keyboard focus (issue #117): an orchestrator-driven
    *  spawn must not yank the cursor from the pane the human is typing in. The
    *  human-initiated paths leave this unset (focus the new pane); only the
@@ -349,6 +374,12 @@ export class Pane implements VoiceTargetPane {
   private orchGroup: string | null = null;
   private orchRoleName: string | null = null;
   private orchAgent: string | null = null;
+  /** Standalone pane's channel-scoped identity (#271 W3 addendum) — a carrier
+   *  DELIBERATELY separate from orchGroup/orchAgent/orchRoleName (those gate
+   *  the full orchestration chrome; a plain standalone pane must never show
+   *  it just because it can now join a channel). Set at construction
+   *  (`opts.channelAgent`) or later via `setChannelAgent` (adopt-on-connect). */
+  private channelAgentInfo: { group: string; agentId: string; role: string; canSend: boolean } | null = null;
   /** Loomux-owned steering strip docked under orchestrator panes (#43): the
    *  human types here and loomux enqueues it through the same serialized
    *  delivery path as worker reports, so the pane's stdin has one writer. */
@@ -742,6 +773,7 @@ export class Pane implements VoiceTargetPane {
     this.agentSessionId = opts.sessionId ?? null;
     if (opts.badge) this.setBadge(opts.badge);
     if (opts.orchAgent) this.orchAgent = opts.orchAgent;
+    if (opts.channelAgent) this.channelAgentInfo = opts.channelAgent;
     if (opts.orchGroup) {
       this.orchGroup = opts.orchGroup;
       this.orchRoleName = opts.orchRole ?? null;
@@ -1356,7 +1388,12 @@ export class Pane implements VoiceTargetPane {
   /** Mark (or clear) this pane's cross-workspace channel membership (#271): a
    *  colored/numbered chip before the title plus a `--connect-color` accent, so
    *  panes on either end of a channel — and a third pane joined into it — read as
-   *  one connected set even across tabs. `null` clears it (disconnect/teardown). */
+   *  one connected set even across tabs. `null` clears it (disconnect/teardown).
+   *
+   *  #271 W3 addendum, part C: the chip also carries a DIRECTION arrow — ▲
+   *  (outward) for the sender, ▼ (inward) for a receiver — and a distinct
+   *  `receive-only` CSS variant for a delivery-only member (no token, ever),
+   *  so the direction and the honest capability both read at a glance. */
   setConnected(info: PaneChannelBadge | null): void {
     this.channelInfo = info;
     if (!info) {
@@ -1364,12 +1401,24 @@ export class Pane implements VoiceTargetPane {
       this.el.classList.remove("connected");
       this.el.style.removeProperty("--connect-color");
       delete this.channelChip.dataset.channel;
+      delete this.channelChip.dataset.direction;
+      this.channelChip.classList.remove("receive-only");
     } else {
-      this.channelChip.textContent = info.label;
+      const arrow = info.direction === "sender" ? "▲" : "▼";
+      this.channelChip.textContent = `${arrow} ${info.label}`;
+      const capability = info.deliveryOnly
+        ? "receive-only — it has no channel token"
+        : info.direction === "sender"
+          ? "you are the SENDER — you may message anyone connected, any time"
+          : info.canSend
+            ? "you are a RECEIVER with a reply credit — you may answer the sender now"
+            : "you are a RECEIVER — you may answer once the sender messages you";
       this.channelChip.title = `Channel ${info.channelId} — connected to ${
         info.peers.join(", ") || "…"
-      }. Click to disconnect.`;
+      } (${capability}). Click to disconnect.`;
       this.channelChip.dataset.channel = info.channelId;
+      this.channelChip.dataset.direction = info.direction;
+      this.channelChip.classList.toggle("receive-only", info.deliveryOnly);
       this.channelChip.hidden = false;
       this.el.classList.add("connected");
       this.el.style.setProperty("--connect-color", info.color);
@@ -1822,6 +1871,43 @@ export class Pane implements VoiceTargetPane {
    *  the orchestrator's own pane apart from its workers/reviewers. */
   get orchRole(): string | null {
     return this.orchRoleName;
+  }
+
+  /** Bind (or clear) this pane's standalone channel identity after
+   *  construction (#271 W3 addendum, part A3) — used by the Connect
+   *  gesture's adopt-on-connect path (`orch_solo_adopt`) for a pane that had
+   *  none at spawn time (launched before this feature, or on a CLI the human
+   *  didn't opt into channel tools for at launch). Never touches
+   *  orchGroup/orchAgent/orchRoleName — this carrier stays deliberately
+   *  separate so a plain standalone pane never lights up the orchestration
+   *  chrome. */
+  setChannelAgent(info: { group: string; agentId: string; role: string; canSend: boolean } | null): void {
+    this.channelAgentInfo = info;
+  }
+
+  get channelAgentGroupId(): string | null {
+    return this.channelAgentInfo?.group ?? null;
+  }
+
+  get channelAgentAgentId(): string | null {
+    return this.channelAgentInfo?.agentId ?? null;
+  }
+
+  get channelAgentRole(): string | null {
+    return this.channelAgentInfo?.role ?? null;
+  }
+
+  get channelAgentCanSend(): boolean {
+    return this.channelAgentInfo?.canSend ?? false;
+  }
+
+  /** Whether this pane was launched with a command (an agent CLI), as
+   *  opposed to a plain interactive shell — the same distinction
+   *  `liveKind()` makes internally. #271 W3 addendum, part A3: the
+   *  adopt-on-connect gesture is offered for agent panes with no channel
+   *  identity yet; a plain terminal stays not-capable regardless. */
+  get isAgentPane(): boolean {
+    return this.launchedCommand;
   }
 
   /** Capture this pane as a serializable record for the persisted layout (#194).

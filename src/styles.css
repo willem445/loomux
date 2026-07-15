@@ -514,6 +514,16 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   background: var(--connect-color, var(--accent));
 }
 .pane-channel:hover { filter: brightness(1.15); }
+/* #271 W3 addendum, part C: the chip's arrow (▲ sender / ▼ receiver) rides in its
+   textContent (pane.ts's setConnected) — dashed border here is the honest
+   "receive-only" variant for a delivery-only member (no token, ever), visually
+   distinct from a plain receiver simply out of credit (which stays solid — it WILL
+   be able to reply). */
+.pane-channel.receive-only {
+  background: transparent;
+  border: 1.5px dashed var(--connect-color, var(--accent));
+  color: var(--connect-color, var(--accent));
+}
 .pane.connected .pane-header {
   outline: 1px solid var(--connect-color, var(--accent));
   outline-offset: -1px;
