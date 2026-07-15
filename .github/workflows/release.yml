@@ -7,6 +7,26 @@ on:
 permissions:
   contents: write
 
+# Serializes runs of the SAME tag. `create-release`'s idempotence check
+# (look up a release for this tag, reuse if found) closes the per-leg race
+# within one run, but two separate RUNS of this workflow for the same tag
+# (a tag force-moved and re-pushed while the first run is still in flight,
+# or a manual re-trigger) could still both pass that lookup before either
+# has created the release — a cross-run TOCTOU version of the same #282
+# race. Queuing the second run behind the first removes the race instead of
+# re-checking harder.
+#
+# cancel-in-progress is deliberately false: cancelling a release run
+# mid-flight can leave a build matrix half-uploaded or a draft promoted
+# without npm published, and a cancelled run's partial state is exactly
+# what #282's race exploited. Queuing (not cancelling) means the first run
+# always finishes cleanly before the second starts, so the second run's
+# create-release lookup finds a fully-formed release (or none at all) —
+# never one still being written to.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   # Creates the draft release ONCE and hands every build leg its id via
   # `releaseId` (tauri-action supports uploading to an existing release).
