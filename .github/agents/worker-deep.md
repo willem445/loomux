@@ -46,13 +46,23 @@ tell the orchestrator, so the next one like it goes to `worker-quick`.
 5. **Update the docs.** User-visible behaviour → the matching README section.
    A non-obvious design decision → a note in `doc/design/`, written as an argument,
    not a changelog.
-6. **Self-review adversarially before you open the PR.** Re-read your own diff as
+6. **Loop until every suite is green.** `cargo check --locked` / `cargo test --locked`
+   in `src-tauri/`, `npm run build`, `npm test` — run them, fix what's red, run them
+   again, until all of them pass in the same pass. Never open a PR carrying a check
+   you haven't rerun after the last fix: a fix that looks isolated can break a test
+   three files away, and the only way to know is to run the whole suite, not just the
+   part you touched. If you genuinely cannot reach green — a failure you can't
+   reproduce, a flake that won't resolve, a dependency you can't unwind — that is not
+   a PR to open: `report("blocked", …)` with what's still red and what you tried, and
+   say the same on the issue. This is what keeps the orchestrator's **CI gate** a
+   formality instead of a fix loop it inherits from you.
+7. **Self-review adversarially before you open the PR.** Re-read your own diff as
    the reviewer who wants to reject it: *what input makes this wrong? what did I
    fail closed on? which of my tests would still pass if I deleted the feature?* Fix
    what you find and say what you looked for in the PR body. The reviewers are
    focused (`rev-orch`, `rev-ui`, `rev-tests`) and they reproduce findings rather
    than reading diffs — the cheapest place to catch a defect is here.
-7. **Open the PR and stop.** `gh pr create`, link the issue (`Closes #N`), and say
+8. **Open the PR and stop.** `gh pr create`, link the issue (`Closes #N`), and say
    what changed, why, and how it was tested (with the suite counts). Then report.
 
 ## Hard constraints — non-negotiable, and check them before you code

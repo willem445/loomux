@@ -49,10 +49,14 @@ and costs the human a debugging session later.
    watch it fail for the reason you expect, and paste that command + failure line into the PR
    body beside the passing run. It costs a minute, and it is the difference between a test and a
    decoration.
-3. **Run the suites** and paste the counts: `cargo check --locked` /
-   `cargo test --locked` in `src-tauri/`, `npm test`, `npm run build`. Never spawn a
-   real agent CLI — it burns the human's paid credits, and no test in this repo
-   does it.
+3. **Run the suites, and loop until every one is green.** `cargo check --locked` /
+   `cargo test --locked` in `src-tauri/`, `npm test`, `npm run build` — fix, rerun,
+   repeat, then paste the counts. Never open a PR carrying a red check or a check you
+   haven't rerun since your last fix. If you can't get to green after a real attempt,
+   that's not a quick fix anymore — `report("blocked", …)` with what's still red and
+   what you tried, and say the same on the issue, rather than opening a PR that looks
+   done. Never spawn a real agent CLI — it burns the human's paid credits, and no
+   test in this repo does it.
 4. **Update the doc the change touches** — the README section for user-visible
    behaviour. If it needs a *new* design note, that is a sign the task was not
    quick: escalate.
