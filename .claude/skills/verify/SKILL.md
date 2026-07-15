@@ -12,6 +12,10 @@ manual checklist for the rest.
 
 ## Always run (both halves — a change to one often breaks the other's assumptions)
 
+Agent workers: don't run these locally — follow `.claude/skills/ci-validate`
+instead and let `ci.yml` run them on GitHub's runners. The commands below are
+for the human running this skill by hand.
+
 ```sh
 npm run build                 # tsc --noEmit typecheck + Vite bundle
 npm test                      # frontend unit tests (Node 22 built-in runner)

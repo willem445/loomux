@@ -27,6 +27,28 @@ File edits, `git` operations (status/diff/add/commit/push/log), and reading a
 single file to check its contents. None of these spawn a compiler or test
 runner.
 
+The sweep is deliberate, no size exception: even a sub-second single-file
+run — `node --test test/layout.test.ts`, `cargo test --locked --test
+orchestration <name_filter>` — goes to CI like everything else. "It's fast"
+isn't the line; "does it spawn a compiler or test runner" is.
+
+## Exception: regenerating Cargo.lock for a release bump
+
+The one local command this skill still allows: `cargo update --workspace` in
+`src-tauri/`, when the `release` skill has just bumped the version in
+`Cargo.toml`. CI's `cargo check --locked` only *verifies* the lock is
+consistent — `--locked` makes it fail rather than write anything back, so a
+stale lock can never self-heal from CI. Something has to regenerate the
+lockfile before it can be committed and pushed.
+
+`cargo update --workspace` is dependency resolution scoped to the
+workspace's own members — it re-reads the manifests and rewrites the lock,
+but never invokes `rustc`, so it doesn't count as a build. Prefer it over
+`cargo check` for this step (the release skill used to recommend `cargo
+check`, which does invoke the compiler front end). Don't also run `cargo
+check --locked` locally afterward to "prove it's consistent" — that's what
+the bump PR's own CI run is for.
+
 ## Workflow
 
 1. **Commit and push early.** As soon as there's one coherent commit — it
