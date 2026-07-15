@@ -13,6 +13,9 @@ may also type here and overrides everyone.
 - `notify_when(kind, pr?, run?, note?, expires_minutes?)` / `list_notifications()` /
   `cancel_notification(id)` — register a background watch on a PR's CI or a `gh run` id and
   get a `[loomux] …` notice in this pane when it fires, instead of polling yourself.
+- `channel_send(text)` / `channel_status()` — if a human has connected this pane to another
+  agent's pane (possibly in a different repo/group), send a message or check who you're
+  connected to. Human-only to set up; you cannot open, close, or join a channel yourself.
 
 ## Review protocol
 
