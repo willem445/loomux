@@ -5967,10 +5967,16 @@ impl OrchRegistry {
     /// every connect notice — name, role, and repo, so whoever reads either
     /// pane knows who's on the other end and which workspace they're in.
     /// Built entirely from backend-resolved state, never agent-supplied text,
-    /// so it can never be forged by a peer.
+    /// so it can never be forged by a peer. Sanitized with the same
+    /// `sanitize_gh_text` `text` gets: `m.name` is capped but not
+    /// bracket-neutralized at the source (`sanitize_agent_name` keeps
+    /// `[`/`]`), and an orchestrator-set name is not `channel_send`-callable
+    /// text — low risk, not a forgery — but this keeps the design note's
+    /// "can never be forged" literally true of the whole delivered line, not
+    /// just the caller-supplied part of it.
     fn channel_member_label(&self, m: &ChannelMember) -> String {
         let repo = self.group(&m.group).map(|g| g.repo).unwrap_or_default();
-        format!("{} ({}, {repo})", m.name, m.role.as_str())
+        notify::sanitize_gh_text(&format!("{} ({}, {repo})", m.name, m.role.as_str()), 200)
     }
 
     fn channel_members_json(members: &[ChannelMember]) -> Vec<Value> {
@@ -6132,7 +6138,14 @@ impl OrchRegistry {
             Delivery::MidSession,
         );
 
-        Ok(json!({ "channel_id": ch.id, "members": member_json }))
+        // Same shape as `channel_list`/`channel_for_pane` (`id`, `created_ms`,
+        // `members`) — the frozen `OrchChannel` contract the UI slice builds
+        // against. This is the command's RETURN VALUE, distinct from the
+        // `channel-connect` audit record and the `orch-channel` event above,
+        // both of which key the id `channel_id` on purpose (matching
+        // `ChannelDisconnectResult`/`OrchChannelEvent`) — only this value
+        // must match `OrchChannel`.
+        Ok(json!({ "id": ch.id, "created_ms": ch.created_ms, "members": member_json }))
     }
 
     /// Human-only (constraint 5): remove `agent` from its channel. If

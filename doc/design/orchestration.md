@@ -140,8 +140,8 @@ pane stays open showing the status).
 | `notify_when(kind, pr?, run?, note?, expires_minutes?)` | ✓ | worker/reviewer only (✗ planner) |
 | `list_notifications()` | ✓ | worker/reviewer only (✗ planner) |
 | `cancel_notification(id)` | ✓ | worker/reviewer only (✗ planner) |
-| `channel_send(text)` | ✓ | worker/reviewer only (✗ planner) |
-| `channel_status()` | ✓ | worker/reviewer only (✗ planner) |
+| `channel_send(text)` | ✓ | orchestrator/worker/reviewer (✗ planner) |
+| `channel_status()` | ✓ | orchestrator/worker/reviewer (✗ planner) |
 
 Guardrails enforced by `spawn_agent`: live-agent cap (`max_agents`, counting workers +
 reviewers + planners), CLI + model pinned per role (`{role}_cli` / `{role}_model`, see
