@@ -12,14 +12,20 @@ test("delivers writes in FIFO order even when an early send resolves last", asyn
   // First send is the slowest: if writes ran concurrently, "A" would land
   // last. The chain must still deliver A, B, C in order.
   const delays: Record<string, number> = { A: 30, B: 5, C: 1 };
+  // Wait on the observable condition (all three delivered) rather than a
+  // fixed sleep: under load, real timers can run well past a guessed
+  // duration and the test would assert before "C" ever lands (#232).
+  let done: () => void;
+  const allDelivered = new Promise<void>((r) => (done = r));
   w.ready(async (data) => {
     await wait(delays[data] ?? 0);
     seen.push(data);
+    if (seen.length === 3) done();
   });
   w.write("A");
   w.write("B");
   w.write("C");
-  await wait(80);
+  await allDelivered;
   assert.deepEqual(seen, ["A", "B", "C"]);
 });
 
