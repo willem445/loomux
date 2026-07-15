@@ -200,15 +200,15 @@ test("exitDiagnosticLine: names the DOA-silent-death case, but only when nothing
 
 test("isDoaRevival: a delegate crash with NO output at all is closed, not kept open", () => {
   assert.equal(
-    isDoaRevival({ orchRole: "worker", keep: "output", receivedOutput: false }),
+    isDoaRevival({ orchRole: "worker", keep: "output", receivedOutput: false, hasUnsavedWork: false }),
     true
   );
   assert.equal(
-    isDoaRevival({ orchRole: "reviewer", keep: "output", receivedOutput: false }),
+    isDoaRevival({ orchRole: "reviewer", keep: "output", receivedOutput: false, hasUnsavedWork: false }),
     true
   );
   assert.equal(
-    isDoaRevival({ orchRole: "planner", keep: "output", receivedOutput: false }),
+    isDoaRevival({ orchRole: "planner", keep: "output", receivedOutput: false, hasUnsavedWork: false }),
     true
   );
 });
@@ -218,28 +218,47 @@ test("isDoaRevival: a delegate crash that DID produce output is a real crash —
   // the pane's own output; if there IS output, it's the original "kept open
   // to read" case, not clutter.
   assert.equal(
-    isDoaRevival({ orchRole: "worker", keep: "output", receivedOutput: true }),
+    isDoaRevival({ orchRole: "worker", keep: "output", receivedOutput: true, hasUnsavedWork: false }),
     false
   );
 });
 
 test("isDoaRevival: the orchestrator's own pane is never auto-closed out from under the human", () => {
   assert.equal(
-    isDoaRevival({ orchRole: "orchestrator", keep: "output", receivedOutput: false }),
+    isDoaRevival({ orchRole: "orchestrator", keep: "output", receivedOutput: false, hasUnsavedWork: false }),
     false
   );
 });
 
 test("isDoaRevival: a plain (non-orchestration) pane keeps the original crash-stays-open behavior", () => {
-  assert.equal(isDoaRevival({ orchRole: null, keep: "output", receivedOutput: false }), false);
+  assert.equal(
+    isDoaRevival({ orchRole: null, keep: "output", receivedOutput: false, hasUnsavedWork: false }),
+    false
+  );
 });
 
 test("isDoaRevival: never overrides the UNSAVED reason (#219) — only 'output' is in scope", () => {
   assert.equal(
-    isDoaRevival({ orchRole: "worker", keep: "unsaved", receivedOutput: false }),
+    isDoaRevival({ orchRole: "worker", keep: "unsaved", receivedOutput: false, hasUnsavedWork: false }),
     false
   );
-  assert.equal(isDoaRevival({ orchRole: "worker", keep: null, receivedOutput: false }), false);
+  assert.equal(
+    isDoaRevival({ orchRole: "worker", keep: null, receivedOutput: false, hasUnsavedWork: false }),
+    false
+  );
+});
+
+test("isDoaRevival: a DOA crash that ALSO holds an unsaved Alt+F buffer is NEVER auto-closed (#219)", () => {
+  // The bug: keepOpenOnExit labels a crash "output" even when hasUnsavedWork is
+  // true (the dead process is the louder fact, so it wins the LABEL) — but the
+  // unsaved buffer is still there. isDoaRevival must not read "output" as proof
+  // there's nothing to protect; it has to ask about the buffer directly, or an
+  // AUTOMATIC teardown silently destroys work the human never agreed to lose.
+  assert.equal(
+    isDoaRevival({ orchRole: "worker", keep: "output", receivedOutput: false, hasUnsavedWork: true }),
+    false,
+    "a DOA revival with an unsaved buffer must stay open, not auto-close"
+  );
 });
 
 // ---------- the quit path's final save must not be able to wedge the app (#219) ----------

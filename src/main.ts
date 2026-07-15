@@ -982,8 +982,23 @@ const openPane = (dir: "row" | "column" = "row", relativeTo?: Pane): void => {
  *  brief toast instead of left open with nothing to read. The generic
  *  "output" rule exists to protect a real crash's output; there is none here. */
 function closeOrKeep(ws: Workspace, pane: Pane, exit: PtyExit, keep: KeepOpenReason | null): void {
-  if (isDoaRevival({ orchRole: pane.orchRole, keep, receivedOutput: pane.hasReceivedOutput })) {
-    showToast(`${pane.name} exited before producing any output — closed`, "info");
+  if (
+    isDoaRevival({
+      orchRole: pane.orchRole,
+      keep,
+      receivedOutput: pane.hasReceivedOutput,
+      hasUnsavedWork: pane.hasUnsavedWork(),
+    })
+  ) {
+    // The auto-close skips notifyExited, so the in-pane [loomux] diagnostic
+    // (#281) never gets written here — the toast is the only pointer the
+    // human gets, so it has to say WHERE the actual evidence lives (the
+    // orchestrator's own pane got the same exit notice; the audit log is
+    // durable) rather than just announcing that something was closed.
+    showToast(
+      `${pane.name} exited before producing any output — closed (see the orchestrator's pane or the audit log for why)`,
+      "info"
+    );
     ws.grid.closePane(pane, false);
     return;
   }
