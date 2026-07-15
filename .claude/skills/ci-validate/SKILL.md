@@ -1,55 +1,90 @@
 ---
 name: ci-validate
-description: How agent workers validate a loomux change via GitHub Actions instead of local cargo/npm builds — push early, open a draft PR, read CI results, iterate. Use this in place of running cargo check/test or npm run build/test on the host.
+description: How agent workers decide between a capped local build/test and CI for a loomux change — local iteration under the resource guard vs. CI as the sole proof authority — plus the draft-PR-early flow for reading CI results.
 ---
 
-# Validating a change via CI, not local builds
+# Local iteration vs. CI proof
 
-`.github/workflows/ci.yml` runs on every PR: `cargo check --locked`, `cargo test
---locked`, `npm run build` (typecheck + bundle), and `npm test` — each across
-ubuntu/windows/macos. That's the same coverage the `verify` skill's "Always
-run" block describes for a human running it locally. Agent workers get it for
-free from GitHub's runners and must use that instead of running it on the
-host (#320): a hard-kill was caused by every worker in a group running `cargo
-build` at once and exhausting the host.
+Lineage: #318 was the incident (every worker running `cargo build` at once
+exhausted the host) → #320 was the interim response (a hard ban on any local
+build/test) → #322 built the actual fix, a per-class concurrency guard that
+caps how many CPU-heavy commands of the same kind can run at once and makes
+extra callers wait instead of stacking → #331 replaces the hard ban with the
+discretion model below now that the guard exists to make local execution
+safe again.
 
-**Rule of thumb: if it spawns a compiler or test runner, it goes to CI.**
+## Precondition — confirm the guard is actually active
 
-## The trap
+The discretion model below only applies once **all three** hold:
 
-`npm run build` runs `tsc --noEmit` as its first step — that's a build, not a
-free typecheck. Don't run `tsc --noEmit` locally either, standalone or via
-`npm run build`. The only way to typecheck is to let CI do it.
+1. **PR #322 is merged into `main`.**
+2. **Your group/session was (re)started after that merge.** Shims are
+   generated per spawn from the compiled guard spec — a pane opened before
+   the merge landed has no guard wired into its `PATH`, guard or no guard in
+   the codebase.
+3. **The human has set a nonzero `guardrails.resource_guard_limits` slot
+   count** for the class you're about to run (`rust-build` covers `cargo
+   build`/`check`/`test`; `node-build` covers `npm run build`/`npm
+   test`/bare `node`, per this repo's own dogfooded
+   `.loomux/workflow.yml`). This is a per-machine override the human sets in
+   Guardrails, not something visible from the repo alone — ask if you're not
+   sure it's set.
 
-## What stays OK locally
+If any of the three doesn't hold, you have no concurrency cap protecting the
+host — treat local builds/tests as still banned and go straight to "The CI
+path" below until it does.
 
-File edits, `git` operations (status/diff/add/commit/push/log), and reading a
-single file to check its contents. None of these spawn a compiler or test
-runner.
+## The decision rule
 
-The sweep is deliberate, no size exception: even a sub-second single-file
-run — `node --test test/layout.test.ts`, `cargo test --locked --test
-orchestration <name_filter>` — goes to CI like everything else. "It's fast"
-isn't the line; "does it spawn a compiler or test runner" is.
+> Would running it locally be faster or easier — a single-file test, an
+> incremental `cargo check`, a quick `tsc` pass? **Do it locally**, capped
+> (below) — the guard queues concurrent CPU-heavy callers of the same class
+> rather than letting them stack.
+>
+> Do you need full-matrix proof — the merge-gate green, red-before-green
+> evidence for a PR? **That's CI's job, always.** Local green is iteration
+> speed. It is never proof.
 
-## Exception: regenerating Cargo.lock for a release bump
+CI remains the sole authority for the CI gate. A worker citing a local run
+as "the suite passes" in a PR description or a `done` report is citing the
+wrong evidence — cite the PR's CI run instead (see "Definition of validated"
+below).
 
-The one local command this skill still allows: `cargo update --workspace` in
-`src-tauri/`, when the `release` skill has just bumped the version in
-`Cargo.toml`. CI's `cargo check --locked` only *verifies* the lock is
-consistent — `--locked` makes it fail rather than write anything back, so a
-stale lock can never self-heal from CI. Something has to regenerate the
-lockfile before it can be committed and pushed.
+## Running locally, capped
+
+Once the precondition holds, cap every local build/test invocation so it
+can't starve the guard's own slot accounting or the host:
+
+- **Always `-j 4` for agent local builds** (human directive): `cargo
+  build -j 4`, `cargo check -j 4`, `cargo test -j 4`. Or set it once per
+  session with `export CARGO_BUILD_JOBS=4` instead of repeating the flag.
+  `-j` caps the **compile phase's** parallelism.
+- **CPU-heavy test suites additionally take `-- --test-threads=4`** — a
+  separate cap on the **test run's own** thread count, e.g. `cargo test -j 4
+  -- --test-threads=4`.
+- **npm/tsc need no flag** — they're single-process (`npm run build`, `npm
+  test`, `node --test test/layout.test.ts`).
+
+## The Cargo.lock exception (still applies regardless of the guard)
+
+One local command was always allowed even under the old hard ban and stays
+exactly as it was: `cargo update --workspace` in `src-tauri/`, when the
+`release` skill has just bumped the version in `Cargo.toml`. CI's `cargo
+check --locked` only *verifies* the lock is consistent — `--locked` makes it
+fail rather than write anything back, so a stale lock can never self-heal
+from CI. Something has to regenerate the lockfile before it can be committed
+and pushed.
 
 `cargo update --workspace` is dependency resolution scoped to the
 workspace's own members — it re-reads the manifests and rewrites the lock,
-but never invokes `rustc`, so it doesn't count as a build. Prefer it over
-`cargo check` for this step (the release skill used to recommend `cargo
-check`, which does invoke the compiler front end). Don't also run `cargo
-check --locked` locally afterward to "prove it's consistent" — that's what
-the bump PR's own CI run is for.
+but never invokes `rustc`. Prefer it over `cargo check` for this step. Don't
+also run `cargo check --locked` locally afterward to "prove it's
+consistent" — that's what the bump PR's own CI run is for.
 
-## Workflow
+## The CI path — draft-PR-early flow
+
+For anything that needs full-matrix proof (or if the precondition above
+doesn't hold yet):
 
 1. **Commit and push early.** As soon as there's one coherent commit — it
    doesn't need to be the finished change — push the branch.
@@ -73,11 +108,9 @@ the bump PR's own CI run is for.
    loomux polls on your behalf and types a `[loomux] …` notice into your pane
    when the checks resolve. If `notify_when` isn't available in this
    environment, poll `gh pr checks <pr>` yourself at a slow cadence —
-   **60 seconds or slower, never a tight loop** — the same host-overload
-   failure mode this skill exists to avoid applies to polling too, just
-   spread over time instead of concentrated at once.
-5. **Iterate by pushing fixes**, not by re-running anything locally. Edit,
-   commit, push; CI re-runs automatically.
+   **60 seconds or slower, never a tight loop.**
+5. **Iterate by pushing fixes.** Local iteration (capped, per above) is fine
+   between pushes — it just isn't the thing you cite as passing.
 6. **Mark the PR ready once green:**
    ```sh
    gh pr ready <pr>
@@ -86,5 +119,5 @@ the bump PR's own CI run is for.
 ## Definition of validated
 
 The PR's checks are green on all three platforms. That — not a local `cargo
-test --locked` — is the evidence a worker cites for "the suite passes" in a
-PR description or a `done` report.
+test` run, capped or not — is the evidence a worker cites for "the suite
+passes" in a PR description or a `done` report.

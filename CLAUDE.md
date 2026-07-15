@@ -20,15 +20,21 @@ designs live in `doc/design/`.
 There is no lint/format gate (no eslint/prettier; rustfmt is not enforced in
 CI) — match the surrounding style instead of reformatting.
 
-### Agent workers: validate via CI, not locally
+### Agent workers: local vs. CI is a discretion call, not a ban
 
-The Commands table above is for humans. Agent workers must **not** run
-`cargo check`/`cargo test`/`npm run build`/`npm test` (or anything else that
-spawns a compiler or test runner) on the host by default — push the branch,
-open a draft PR, and let `.github/workflows/ci.yml` build and test on
-GitHub's runners instead. Use the `ci-validate` skill for the full workflow.
-This is a hard rule, not a preference: a hard-kill was caused by every worker
-in a group running `cargo build` at once and exhausting the host (#320).
+The Commands table above is for humans. For agent workers, whether a command
+runs locally or on CI depends on the resource guard: a hard-kill from every
+worker running `cargo build` at once (#320) was answered first with an
+interim hard ban on any local build/test, then properly fixed by a per-class
+concurrency guard (#318, shipped in #322) that caps how many CPU-heavy
+commands of the same kind can run at once instead of letting them stack.
+With the guard active, agent workers get local execution back **at their own
+discretion** (#331): fast local iteration — a single-file test, an
+incremental `cargo check`, a quick `tsc` pass — capped at `-j 4`; anything
+needing full-matrix proof or red-before-green evidence still goes to CI,
+which remains the sole authority for the CI gate. See the `ci-validate`
+skill for the full decision rule, the guard-active precondition to check
+before assuming this discretion applies, and the draft-PR-early CI flow.
 
 ## Hard constraints — check before coding
 
