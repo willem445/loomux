@@ -613,6 +613,26 @@ alongside the task board and #7's cost figures.
 - **Composes with pause (#7).** Ending works regardless of pause (delivery suppression
   doesn't block a kill), and it clears the group's `paused` flag and marker file, so a
   later relaunch on the same repo id starts clean instead of silently resuming paused.
+- **Spawn docking, on by default (#260).** New worker/reviewer/planner panes open
+  straight into the minimize dock instead of expanding into the split tree, so a burst
+  of delegate spawns doesn't crowd the orchestrator pane out of focus — reusing #46's
+  existing minimize/restore plumbing (`Grid.minimize`) rather than a new "open into the
+  dock" path, so a freshly-docked pane behaves exactly like one a human folded by hand a
+  moment after it opened (including the "never dock the grid's last visible pane" guard).
+  A per-group **Auto-dock** toggle in the panel (mirrors the Notify toggle's shape:
+  `spawn_expanded`/`set_spawn_expanded`, durable `spawn_expanded` marker, `orch_spawn_expanded`/
+  `orch_set_spawn_expanded` commands) opts back into the pre-#260 always-expand behavior.
+  The pure `spawn_opens_minimized(role, group_opted_expanded)` decision — `false` for the
+  orchestrator unconditionally, `true` for every other role unless the group opted out —
+  is called from both `SpawnRequest` construction sites (the orchestrator's own spawn and
+  every delegate spawn), so the exemption can't drift between them. The orchestrator's own
+  pane and any human-initiated open (launching an orchestrator, resuming an orchestrator
+  session from the browser) are unaffected — those never go through `spawn_agent_ex`'s
+  delegate path. One consequence worth knowing: a human manually resuming a single
+  worker/reviewer session from the session browser *does* go through that same
+  `spawn_agent_ex` path (`resume_recorded_session`'s worker/reviewer branch), so it
+  inherits the docked default too — intentional, not an oversight; the Auto-dock toggle is
+  the escape hatch for anyone who wants those to open expanded again.
 
 ## Stalled-agent watchdog (#10)
 
