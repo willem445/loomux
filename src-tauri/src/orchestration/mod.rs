@@ -21,7 +21,7 @@ pub mod workflow;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::cell::Cell;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -822,6 +822,323 @@ fn git_shim_cmd(real_git: &str) -> String {
          for %%S in (sh.exe) do set \"LOOMUX_SH=%%~$PATH:S\"\r\n\
          if defined LOOMUX_SH (\r\n\
          \x20 \"%LOOMUX_SH%\" \"%~dp0git\" %*\r\n\
+         ) else (\r\n\
+         \x20 \"{real_bs}\" %*\r\n\
+         )\r\n\
+         exit /b %errorlevel%\r\n"
+    )
+}
+
+/// Distinct program names a compiled `resource_guards` spec names as guarded —
+/// the DYNAMIC set `OrchRegistry::ensure_shims` must shadow, unlike the fixed
+/// `gh`/`git` pair (#318). Pure and sorted (`BTreeSet`) so the
+/// shim-writing order is deterministic and this is unit-testable without I/O,
+/// same split as `guard_class_for` vs `sync_resource_guards`.
+///
+/// `gh` and `git` are deliberately EXCLUDED: they already carry the
+/// merge/release-gate shim (#83), which has many `exec "$REAL_GH" "$@"` exit
+/// points scattered through security-critical logic — folding resource-guard
+/// enforcement into all of them risks that gate for a shape nobody asked for.
+/// Guarding `gh`/`git` as a CPU-bound build command is not a supported use of
+/// `resources:` (see the module doc's schema examples in `workflow.rs`, all of
+/// which name build tools — `cargo`/`npm`/`make`); a repo that names `gh` or
+/// `git` in a guarded command simply gets no additional shim for it, same as
+/// naming an uninstalled program.
+#[doc(hidden)] // pub so the integration test can pin the dynamic shim set
+pub fn guarded_shim_programs(classes: &[workflow::ResourceClass]) -> Vec<String> {
+    let mut set: BTreeSet<String> = BTreeSet::new();
+    for class in classes {
+        for cmd in &class.commands {
+            let lower = cmd.program.to_ascii_lowercase();
+            if lower == "gh" || lower == "git" {
+                continue;
+            }
+            set.insert(cmd.program.clone());
+        }
+    }
+    set.into_iter().collect()
+}
+
+/// The POSIX resource-guard shim (#318 sub-PR 2): shadows one repo-named
+/// CPU-bound program (`cargo`, `npm`, `make`, …one shim per distinct program,
+/// see [`guarded_shim_programs`]) and, when an invocation matches a guarded
+/// command pattern, serializes it through a slot pool before running the real
+/// binary. **RESTRICT-ONLY** — the module doc's `resources:` contract: this
+/// can delay a command, never grant one, and a slot that cannot be acquired
+/// within `timeout_minutes` runs anyway (fail-OPEN) rather than blocking
+/// forever — progress beats deadlock, this is a throughput backstop, not a
+/// security gate the way the merge gate is.
+///
+/// Reads the compiled `resource_guards` spec file the group dir the same way
+/// the `gh` shim reads `merge_gate` — line-oriented, a `while read` loop, no
+/// parser (`workflow::resource_guard_file_text`'s format doc is authoritative).
+/// **The matching scan below MUST stay in lockstep with
+/// [`workflow::guard_class_for`]**: program identity is the literal name this
+/// shim was generated for (`PROGRAM_NAME`, baked in at generation time — the
+/// shim file's own name already IS the basename match, so no path/extension
+/// stripping is needed here, unlike the Rust side's `program_basename`, which
+/// has to cope with an arbitrary caller-supplied `program` string); a guarded
+/// command's args must PREFIX the invocation's own positional tokens with
+/// flags (`-*`) skipped, compared verbatim (no unquoting); the FIRST class (in
+/// the file's declaration order — the same order `classes.iter().find` walks)
+/// with any matching command wins. A top-to-bottom scan of `command` lines
+/// preserves "first class in order" for free, because `resource_guard_file_text`
+/// always writes a class's `command` lines contiguously right after its own
+/// `class` line.
+///
+/// Slot mechanics are **mkdir + a PID file**, not `flock`: the Windows 10
+/// Git-Bash baseline this project targets ships no `flock(1)` (confirmed on
+/// the target machine — see the accepted #318 plan), so mkdir's POSIX atomic-
+/// claim guarantee is the PRIMARY mechanism, not a fallback. A slot does NOT
+/// auto-release on a hard kill (unlike an flock'd fd, closing on any process
+/// death) — release is therefore two-layered: a `trap … EXIT INT TERM HUP`
+/// removes the slot dir on every exit path a shell CAN trap, and a **stale-PID
+/// reaper** (`loomux_pid_alive`) is the backstop for the one path it can't
+/// (`SIGKILL` / Windows `TerminateProcess`, which is exactly what this
+/// project's job-object pane teardown uses): the NEXT contender to try that
+/// slot number finds a dead holder's PID and reclaims it. This is the
+/// red-before-green anchor the #318 brief calls out — a naive counter/trap-only
+/// scheme leaks the slot forever on `-9`; this reaper does not.
+///
+/// **PID liveness (`kill -0`) on the Windows/Git-Bash baseline**: `$$` inside
+/// this shim is the MSYS runtime's own pid, not necessarily what `tasklist`
+/// shows — the concern the #318 orchestrator flagged explicitly. Both the
+/// writer (`printf '%s' "$$"`) and the reader (`kill -0 "$hp"`) are MSYS `sh`
+/// processes reading/writing the SAME pid namespace, and Cygwin/MSYS's `kill`
+/// resolves a pid to the underlying Windows process handle rather than
+/// tracking it purely in userspace bookkeeping — so it should correctly report
+/// a job-object-killed holder as dead. `/proc/<pid>` is tried FIRST where it
+/// exists (a direct kernel-table check on Linux, and MSYS2 also exposes a
+/// `/proc` view) with `kill -0` as the fallback everywhere else (notably
+/// macOS, which has no `/proc`). This is a documented assumption, not a
+/// locally-verified one — this machine's standing policy forbids running
+/// `cargo test` here; `test_slot_reaped_on_hard_kill` (`tests/orchestration.rs`)
+/// is the empirical proof, exercised on all three CI platforms including
+/// windows-latest. If that test ever shows the MSYS pid assumption false on
+/// Windows, the documented escape hatch is `/proc/$$/winpid` (a standard
+/// Cygwin/MSYS pseudo-file mapping an MSYS pid to its real Windows PID) paired
+/// with `tasklist /fi "PID eq <winpid>"` — not implemented here because the
+/// simpler design is expected to pass; swap it in at this comment if not.
+#[doc(hidden)] // pub so the integration test can pin the shim
+pub fn guard_shim_sh(program: &str, real: &str) -> String {
+    const TPL: &str = r#"#!/bin/sh
+# loomux resource-guard shim (#318) — restrict-only: delay, never deny.
+# Generated by loomux; do not edit. Guards invocations of: __PROGRAM__
+REAL="__REAL__"
+PROGRAM_NAME="__PROGRAM__"
+
+loomux_audit() { # $1=action $2=detail-json
+  ts=$(date +%s%3N 2>/dev/null); [ -z "$ts" ] && ts=0
+  if [ -n "$LOOMUX_GROUP_DIR" ]; then
+    printf '{"ts_ms":%s,"actor":"resource-guard-shim","action":"%s","detail":%s}\n' "$ts" "$1" "$2" \
+      >> "$LOOMUX_GROUP_DIR/audit.jsonl" 2>/dev/null || true
+  fi
+}
+
+# No group dir, or no compiled spec → nothing to enforce (byte-for-byte the
+# pre-#318 flow; also the fast path for a group with no `resources:` block).
+if [ -z "$LOOMUX_GROUP_DIR" ] || [ ! -f "$LOOMUX_GROUP_DIR/resource_guards" ]; then
+  exec "$REAL" "$@"
+fi
+specf="$LOOMUX_GROUP_DIR/resource_guards"
+
+# Capture flags-skipped positionals into POS1..POS10 — a realistic bound for a
+# guarded command's leading-positional prefix (`build`, `run build`, …; see
+# guard_class_for's doc). A configured prefix LONGER than this safely fails TO
+# NO-MATCH, never to over-match: the same degrade-not-deny direction
+# resource_guard_file_text already commits this whole feature to, so an
+# absurd prefix just stops being enforceable rather than becoming a false
+# positive that guards something it shouldn't.
+POS1=""; POS2=""; POS3=""; POS4=""; POS5=""
+POS6=""; POS7=""; POS8=""; POS9=""; POS10=""; POS_N=0
+for _tok in "$@"; do
+  case "$_tok" in
+    -*) continue ;;
+  esac
+  POS_N=$((POS_N + 1))
+  case "$POS_N" in
+    1) POS1=$_tok ;; 2) POS2=$_tok ;; 3) POS3=$_tok ;; 4) POS4=$_tok ;; 5) POS5=$_tok ;;
+    6) POS6=$_tok ;; 7) POS7=$_tok ;; 8) POS8=$_tok ;; 9) POS9=$_tok ;; 10) POS10=$_tok ;;
+    *) : ;;
+  esac
+done
+
+# No globbing while word-splitting spec-file tokens below (loomux only ever
+# writes sanitize_id-clean tokens — no glob chars possible — but a hand edit
+# reaches this file too; belt, not braces, same posture gh_shim_sh takes).
+set -f
+cc_name=""; cc_max=""; cc_timeout=""
+MATCH_CLASS=""; MATCH_N=""; MATCH_TIMEOUT=""
+# `read -r k a b c`: a `class` line is exactly 4 fields (k a b c land exactly);
+# a `command` line is `command <class> <program> <args...>` — c absorbs EVERY
+# remaining field verbatim (POSIX read's last-var behavior), still safe to
+# word-split below since every arg token is sanitize_id-clean (no spaces).
+# `|| [ -n "$k" ]` — see gh_shim_sh's note: without it a final line with no
+# trailing newline is silently dropped, which here would just under-guard
+# (degrade-not-deny), but there is no reason to take even that hit.
+while read -r k a b c || [ -n "$k" ]; do
+  case "$k" in
+    \#*|'') continue ;;
+    class) cc_name=$a; cc_max=$b; cc_timeout=$c ;;
+    command)
+      [ -n "$MATCH_CLASS" ] && continue   # first match already found — drain harmlessly
+      [ "$a" = "$cc_name" ] || continue   # orphaned from a class — degrade (skip)
+      [ "$b" = "$PROGRAM_NAME" ] || continue
+      ok=1; pk=0
+      for _p in $c; do
+        pk=$((pk + 1))
+        case "$pk" in
+          1) [ "$_p" = "$POS1" ] || ok=0 ;;
+          2) [ "$_p" = "$POS2" ] || ok=0 ;;
+          3) [ "$_p" = "$POS3" ] || ok=0 ;;
+          4) [ "$_p" = "$POS4" ] || ok=0 ;;
+          5) [ "$_p" = "$POS5" ] || ok=0 ;;
+          6) [ "$_p" = "$POS6" ] || ok=0 ;;
+          7) [ "$_p" = "$POS7" ] || ok=0 ;;
+          8) [ "$_p" = "$POS8" ] || ok=0 ;;
+          9) [ "$_p" = "$POS9" ] || ok=0 ;;
+          10) [ "$_p" = "$POS10" ] || ok=0 ;;
+          *) ok=0 ;;
+        esac
+        [ "$ok" = "1" ] || break
+      done
+      [ "$ok" = "1" ] && { MATCH_CLASS=$cc_name; MATCH_N=$cc_max; MATCH_TIMEOUT=$cc_timeout; }
+      ;;
+    *) : ;;   # unrecognized key — degrade (skip), same direction parse_resource_guard_file takes
+  esac
+done < "$specf"
+set +f
+
+if [ -z "$MATCH_CLASS" ]; then
+  exec "$REAL" "$@"   # no matching guarded command — zero added latency
+fi
+case "$MATCH_N" in ''|*[!0-9]*) exec "$REAL" "$@" ;; esac
+case "$MATCH_TIMEOUT" in ''|*[!0-9]*) exec "$REAL" "$@" ;; esac
+
+# Test-only seams (NEVER set outside an integration test): workflow.rs's
+# timeout_minutes: has a 1-minute floor by design (a guard that can wait
+# "forever" before fail-opening is not one a repo can reason about) and the
+# heartbeat/poll cadence below is tuned for a real work session, not a test —
+# both are far too coarse for `test_timeout_fails_open_and_audits` /
+# `test_waiting_heartbeat_line` to exercise without a multi-minute real wait.
+# Absent (the always case in production), each falls back to the real value.
+timeout_secs=$((MATCH_TIMEOUT * 60))
+case "$LOOMUX_TEST_TIMEOUT_SECS" in ''|*[!0-9]*) : ;; *) timeout_secs=$LOOMUX_TEST_TIMEOUT_SECS ;; esac
+heartbeat_secs=30
+case "$LOOMUX_TEST_HEARTBEAT_SECS" in ''|*[!0-9]*) : ;; *) heartbeat_secs=$LOOMUX_TEST_HEARTBEAT_SECS ;; esac
+poll_secs=2
+case "$LOOMUX_TEST_POLL_SECS" in ''|*[!0-9]*) : ;; *) poll_secs=$LOOMUX_TEST_POLL_SECS ;; esac
+
+slot_root="$LOOMUX_GROUP_DIR/resource_slots/$MATCH_CLASS"
+mkdir -p "$slot_root" 2>/dev/null
+
+# Whether pid $1 is alive. /proc/<pid> first (a direct kernel-table check on
+# Linux; MSYS2 also exposes a /proc view), kill -0 as the fallback everywhere
+# else (notably macOS, which has no /proc). See guard_shim_sh's doc comment
+# for the MSYS-pid assumption this rests on and its escape hatch.
+loomux_pid_alive() {
+  p="$1"
+  case "$p" in ''|*[!0-9]*) return 1 ;; esac
+  [ -d "/proc/$p" ] && return 0
+  kill -0 "$p" 2>/dev/null
+}
+
+SLOT_PATH=""
+loomux_try_acquire() {
+  return 0   # XXX #318 W2 INERT STUB — test-red evidence, reverted next commit
+  i=1
+  while [ "$i" -le "$MATCH_N" ]; do
+    cand="$slot_root/slot.$i"
+    if mkdir "$cand" 2>/dev/null; then
+      printf '%s\n' "$$" > "$cand/pid" 2>/dev/null || true
+      SLOT_PATH="$cand"
+      return 0
+    fi
+    # Occupied — reap if the recorded holder's pid is dead (a slot orphaned by
+    # a hard kill: mkdir claims do not self-release the way an flock'd fd
+    # would). One reap attempt per contender per loop pass is plenty; the next
+    # waiter (or this one, next iteration) tries again.
+    hp=$(cat "$cand/pid" 2>/dev/null)
+    if [ -n "$hp" ] && ! loomux_pid_alive "$hp"; then
+      rm -rf "$cand" 2>/dev/null
+      if mkdir "$cand" 2>/dev/null; then
+        printf '%s\n' "$$" > "$cand/pid" 2>/dev/null || true
+        SLOT_PATH="$cand"
+        loomux_audit "resource-guard-reaped" "{\"class\":\"$MATCH_CLASS\",\"slot\":$i,\"stale_pid\":\"$hp\"}"
+        return 0
+      fi
+    fi
+    i=$((i + 1))
+  done
+  return 1
+}
+
+start_ts=$(date +%s 2>/dev/null); [ -z "$start_ts" ] && start_ts=0
+last_heartbeat=$start_ts
+elapsed=0
+
+while :; do
+  if loomux_try_acquire; then
+    break
+  fi
+  now=$(date +%s 2>/dev/null); [ -z "$now" ] && now=$start_ts
+  elapsed=$((now - start_ts))
+  if [ "$elapsed" -ge "$timeout_secs" ]; then
+    loomux_audit "resource-guard-timeout" "{\"class\":\"$MATCH_CLASS\",\"waited_secs\":$elapsed,\"max\":$MATCH_N}"
+    printf '%s\n' "loomux: waited ${elapsed}s for a '$MATCH_CLASS' slot ($MATCH_N busy) and timed out — running anyway (fail-open; a resource guard is a throughput optimization, not a security boundary)." >&2
+    exec "$REAL" "$@"
+  fi
+  if [ "$((now - last_heartbeat))" -ge "$heartbeat_secs" ]; then
+    busy=0; j=1
+    while [ "$j" -le "$MATCH_N" ]; do
+      [ -d "$slot_root/slot.$j" ] && busy=$((busy + 1))
+      j=$((j + 1))
+    done
+    # Visible pane output AND the watchdog heartbeat: a legitimately-queued
+    # worker keeps producing terminal output, so it never trips
+    # watchdog_stall_minutes just for waiting its turn.
+    printf '%s\n' "loomux: waiting for a '$MATCH_CLASS' slot ($busy/$MATCH_N busy, waited ${elapsed}s)..." >&2
+    loomux_audit "resource-guard-waiting" "{\"class\":\"$MATCH_CLASS\",\"waited_secs\":$elapsed,\"busy\":$busy,\"max\":$MATCH_N}"
+    last_heartbeat=$now
+  fi
+  sleep "$poll_secs"
+done
+
+# Release on every exit path a shell CAN trap (normal exit, INT, TERM, HUP).
+# The one path it CANNOT (SIGKILL / Windows TerminateProcess) is covered by
+# loomux_pid_alive's reaper above, not by this trap — that is the whole reason
+# the reaper exists. rm -rf on an already-cleared SLOT_PATH is a safe no-op,
+# so this may fire twice (once explicitly below, once via EXIT) without harm.
+loomux_release() {
+  [ -n "$SLOT_PATH" ] && rm -rf "$SLOT_PATH" 2>/dev/null
+  SLOT_PATH=""
+}
+trap 'loomux_release' EXIT INT TERM HUP
+
+loomux_audit "resource-guard-acquired" "{\"class\":\"$MATCH_CLASS\",\"waited_secs\":$elapsed}"
+"$REAL" "$@"
+rc=$?
+loomux_release
+exit "$rc"
+"#;
+    // Normalize to LF (see gh_shim_sh) — a CRLF POSIX script is broken.
+    TPL.replace("__PROGRAM__", program).replace("__REAL__", real).replace("\r\n", "\n")
+}
+
+/// The Windows `<program>.cmd` delegator for a resource-guard shim: same shape
+/// as `gh_shim_cmd`/`git_shim_cmd` — delegate to the POSIX shim via `sh`, or run
+/// the real program when no `sh` is on PATH (documented bypass: Git Bash, which
+/// ships `sh`, is present wherever Claude Code runs its Bash tool, the primary
+/// interception point).
+fn guard_shim_cmd(program: &str, real: &str) -> String {
+    let real_bs = real.replace('/', "\\");
+    format!(
+        "@echo off\r\n\
+         rem loomux resource-guard shim (#318) — delegate to the POSIX shim; run real {program} if no sh.\r\n\
+         setlocal\r\n\
+         for %%S in (sh.exe) do set \"LOOMUX_SH=%%~$PATH:S\"\r\n\
+         if defined LOOMUX_SH (\r\n\
+         \x20 \"%LOOMUX_SH%\" \"%~dp0{program}\" %*\r\n\
          ) else (\r\n\
          \x20 \"{real_bs}\" %*\r\n\
          )\r\n\
@@ -9572,26 +9889,41 @@ impl OrchRegistry {
         true
     }
 
-    /// Write (idempotently) the `gh` + `git` shim scripts and return the shim dir,
-    /// or `None` when neither real binary is installed. Cheap (a few small file
-    /// writes); called per spawn so a freshly-installed gh/git is picked up by the
-    /// next pane.
-    fn ensure_shims(&self) -> Option<PathBuf> {
+    /// Write (idempotently) the `gh` + `git` shim scripts, PLUS one resource-guard
+    /// shim per distinct program the group's compiled `resource_guards` spec names
+    /// (`guarded_shim_programs` — a DYNAMIC set, unlike the fixed gh/git pair;
+    /// #318), and return the shim dir, or `None` when nothing at all was written
+    /// (no gh, no git, no guarded program installed). Cheap (a few small file
+    /// writes); called per spawn so a freshly-installed gh/git/guarded program — or
+    /// a freshly-declared `resources:` class — is picked up by the next pane.
+    fn ensure_shims(&self, group: &str) -> Option<PathBuf> {
         let dir = self.shim_dir();
         if fs::create_dir_all(&dir).is_err() {
             return None;
         }
         let gh = self.write_shim(&dir, "gh", gh_shim_sh, gh_shim_cmd);
         let git = self.write_shim(&dir, "git", git_shim_sh, git_shim_cmd);
-        (gh || git).then_some(dir)
+        let mut any = gh || git;
+        for program in guarded_shim_programs(&self.resource_guards(group)) {
+            let (p_sh, p_cmd) = (program.clone(), program.clone());
+            let ok = self.write_shim(
+                &dir,
+                &program,
+                move |real: &str| guard_shim_sh(&p_sh, real),
+                move |real: &str| guard_shim_cmd(&p_cmd, real),
+            );
+            any = ok || any;
+        }
+        any.then_some(dir)
     }
 
     /// The extra environment injected into an *agent* pane (never a human's plain
-    /// shell): the gh + git shims prepended to PATH so the merge/release gates are
-    /// enforced, and `LOOMUX_GROUP_DIR` so the shim finds this group's
-    /// markers/grants. Empty when neither gh nor git is installed (nothing to gate).
+    /// shell): the gh + git shims (plus any resource-guard shims — #318) prepended
+    /// to PATH so the merge/release/resource gates are enforced, and
+    /// `LOOMUX_GROUP_DIR` so the shims find this group's markers/grants/spec files.
+    /// Empty when nothing was installed to shim (nothing to gate).
     fn agent_pane_env(&self, group: &str) -> Vec<(String, String)> {
-        let Some(shim) = self.ensure_shims() else {
+        let Some(shim) = self.ensure_shims(group) else {
             return Vec::new();
         };
         let sep = if cfg!(windows) { ';' } else { ':' };
