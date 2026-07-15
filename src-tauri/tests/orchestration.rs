@@ -4435,6 +4435,83 @@ fn gh_shim_harness_grant_authorizes_one_merge_and_releases_are_gated() {
     assert!(!run(&["release", "create", "v4.0.1"], "0"), "dangerous is ignored while autonomous → release blocked");
 }
 
+/// A fake `gh` that mirrors the REAL `gh`'s split behavior the #294 bug hinged on:
+/// `pr view` accepts `-R`, but `repo view` rejects it exactly like the real CLI
+/// ("unknown shorthand flag: 'R' in -R") — any `-R`/`--repo` token reaching `repo
+/// view` here fails, so this only passes if the shim stops forwarding `$rf` to it.
+fn write_fake_gh_rejecting_dash_r_on_repo_view(root: &std::path::Path, log: &std::path::Path) -> std::path::PathBuf {
+    let p = root.join("fakegh_norepo_r");
+    std::fs::write(&p, format!(
+        "#!/bin/sh\n\
+         echo \"ARGS: $*\" >> \"{log}\"\n\
+         if [ \"$1\" = \"pr\" ] && [ \"$2\" = \"view\" ]; then printf '%s %s\\n' \"$FAKE_BASE\" \"$FAKE_NUM\"; exit 0; fi\n\
+         if [ \"$1\" = \"repo\" ] && [ \"$2\" = \"view\" ]; then\n\
+         \x20 shift 2\n\
+         \x20 for a in \"$@\"; do case \"$a\" in -R|--repo|-R?*|--repo=*) printf 'unknown shorthand flag: '\\''R'\\'' in -R\\n' >&2; exit 1 ;; esac; done\n\
+         \x20 printf '%s\\n' \"$FAKE_DEFAULT\"; exit 0\n\
+         fi\n\
+         printf 'MERGED\\n'; exit 0\n",
+        log = log.display()
+    )).unwrap();
+    p
+}
+
+#[test]
+fn gh_shim_harness_granted_merge_with_dash_r_repo_is_allowed_not_blocked_as_unverifiable_base() {
+    // #294 live incident: a granted `gh pr merge N -R owner/repo` blocked as
+    // "unverifiable-base" because the shim forwarded -R to `gh repo view`, which
+    // rejects it. Proven against the REAL generated shim + a fake gh that rejects
+    // -R on `repo view` exactly like the real CLI (see helper above) — this test
+    // fails on the pre-fix shim (default-branch lookup comes back empty → block)
+    // and passes once `repo view` is called with the repo positionally.
+    use std::process::Command;
+    if Command::new("sh").arg("-c").arg("exit 0").status().map(|s| !s.success()).unwrap_or(true) {
+        eprintln!("SKIP gh_shim_harness_granted_merge_with_dash_r…: no POSIX sh");
+        return;
+    }
+    let td = tempfile::tempdir().unwrap();
+    let root = td.path();
+    let group = root.join("group");
+    std::fs::create_dir_all(&group).unwrap();
+    let log = root.join("gh.log");
+    let fake = write_fake_gh_rejecting_dash_r_on_repo_view(root, &log);
+    let shim = root.join("gh");
+    std::fs::write(&shim, gh_shim_sh(&fake.display().to_string())).unwrap();
+    let _ = Command::new("sh").arg("-c").arg(format!("chmod +x '{}' '{}'", fake.display(), shim.display())).status();
+
+    let run = |argv: &[&str], num: &str| -> (bool, String) {
+        let out = Command::new("sh").arg(&shim).args(argv)
+            .env("LOOMUX_GROUP_DIR", &group)
+            .env("FAKE_BASE", "main").env("FAKE_DEFAULT", "main").env("FAKE_NUM", num)
+            .output().unwrap();
+        (out.status.success(), String::from_utf8_lossy(&out.stderr).into_owned())
+    };
+    let write_grant = |name: &str| {
+        let d = group.join("merge_grants");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join(name), b"99999999999\n1\n").unwrap();
+    };
+
+    // A granted -R merge for an UNRELATED pr (no grant for pr-12) still blocks —
+    // and a different PR's grant is untouched by that blocked attempt (the other
+    // saving grace #294 calls out: a block never consumes a grant it didn't use).
+    write_grant("pr-11");
+    let (ok, err) = run(&["pr", "merge", "12", "-R", "owner/repo"], "12");
+    assert!(!ok, "no grant for pr-12 → still blocked even with -R");
+    assert!(err.contains("human gate"), "refusal message, got: {err}");
+    assert!(group.join("merge_grants/pr-11").exists(), "an unrelated blocked -R attempt must not consume pr-11's grant");
+
+    // The granted -R merge is now allowed — this is the line the #294 bug broke.
+    let (ok, err) = run(&["pr", "merge", "11", "-R", "owner/repo"], "11");
+    assert!(ok, "granted -R merge must be allowed, got stderr: {err}");
+    assert!(!group.join("merge_grants/pr-11").exists(), "the used grant is consumed");
+
+    // repo view was in fact invoked WITHOUT -R (proving the fix, not just luck).
+    let logged = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(logged.lines().any(|l| l.contains("repo view") && !l.contains("-R") && !l.contains("--repo")),
+        "repo view must be called without -R/--repo, log: {logged}");
+}
+
 #[test]
 fn git_shim_harness_gates_tag_pushes() {
     use std::process::Command;
@@ -4532,7 +4609,12 @@ fn gh_shim_script_bakes_real_gh_and_enforces_the_guards() {
     // caller's -R/--repo when resolving base + default branch.
     assert!(sh.contains("--repo") && sh.contains("-R"), "recognizes -R/--repo global flag");
     assert!(sh.contains("rf=\"-R $repo\""), "passes the caller's repo through to the lookups");
-    assert!(sh.contains("pr view $rf") && sh.contains("repo view $rf"), "both lookups honor -R");
+    // #294: `pr view` accepts -R, but `gh repo view` takes the repo POSITIONALLY —
+    // passing `-R` there is a hard `gh` error, not a no-op. Pin the two lookups use
+    // DIFFERENT forms so this regression can't come back silently.
+    assert!(sh.contains("pr view $rf"), "pr view honors -R");
+    assert!(sh.contains("repo view $repo") && !sh.contains("repo view $rf"),
+        "repo view takes the repo positionally, never via $rf (-R)");
 }
 
 #[test]

@@ -447,7 +447,13 @@ rf=""
 info=$("$REAL_GH" pr view $rf $sel --json baseRefName,number --jq '.baseRefName+" "+(.number|tostring)' 2>/dev/null)
 base=${info%% *}
 num=${info##* }
-default=$("$REAL_GH" repo view $rf --json defaultBranchRef --jq .defaultBranchRef.name 2>/dev/null)
+# #294: `gh repo view` takes the repo as a POSITIONAL arg, not -R/--repo (unlike
+# `pr view` above) — `gh repo view -R o/r` errors "unknown shorthand flag: 'R' in
+# -R". Passing $rf here silently broke every -R-qualified merge: this lookup came
+# back empty, so the block below fired as "unverifiable-base" even with a valid
+# grant sitting in merge_grants/ (the grant is never consumed by a blocked
+# attempt, and the block is otherwise fail-safe — both preserved by this fix).
+default=$("$REAL_GH" repo view $repo --json defaultBranchRef --jq .defaultBranchRef.name 2>/dev/null)
 
 if [ -z "$base" ] || [ -z "$default" ]; then
   loomux_block "unverifiable-base" "$base" "$sel"
