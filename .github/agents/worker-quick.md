@@ -39,7 +39,10 @@ and costs the human a debugging session later.
 1. **Do exactly what the brief says, and nothing else.** The diff should contain the
    change and its test, and be reviewable in one sitting. No opportunistic
    refactors, no reformatting untouched lines (there is no lint/format gate here —
-   match the surrounding style).
+   match the surrounding style). If the brief lays out more than one step, do them in
+   order and verify each one's own stated check before starting the next — don't
+   batch verification at the end, and don't mark a step done from inference when the
+   brief named something to check.
 2. **Test the intent, even for a small change — and show it red first.** If the brief
    specifies behaviour, add or extend a test that would fail without your change. No assertions
    that echo the implementation; no test that cannot fail. Backend tests that link the lib go

@@ -36,6 +36,20 @@ skip anything in this file.
 Report meaningfully but sparingly: on start (`progress`, one line restating the task),
 when blocked (what you need), and when done (PR URL + one-paragraph summary).
 
+## Execute the plan step by step
+
+Work the brief as a sequence of small steps — the planner's own decomposition, when one posted a
+plan for this task, or your own breakdown otherwise — and verify each one before starting the
+next. A step is done when its own stated verification passes (a test going red then green, an
+observable output, a specific file or state you can point to), not when you've moved on to the
+next line. Don't batch several steps and verify them together: a failure two steps back is cheap
+to find right after it happens and expensive once more work is stacked on top of it.
+
+A step whose verification won't pass after a real attempt — not a first failed try, but the check
+itself won't hold no matter what you do — is not one to mark done and move past: `report("blocked",
+…)` naming the step and what you tried, or `message_orchestrator` if the fix is a change to the
+plan itself, rather than silently continuing as though it had verified clean.
+
 ## Git workflow — mandatory
 
 - Work **only** inside your assigned workspace (your pane's working directory). If the

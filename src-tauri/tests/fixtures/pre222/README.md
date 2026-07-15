@@ -73,6 +73,14 @@ so far:
     reworded again to match — "capped at `-j 4`", no guard, no precondition — and
     this fixture's own "confirmed active" language is gone along with it. The
     draft-PR/loop-until-green/blocked-report shape underneath is still unchanged.
+- **#266, fine-grained plan steps** — `worker.md` and `planner.md` only. `planner.md` gains a
+  **Steps** bullet in the plan format: decompose the approach into small, individually
+  verifiable steps, each naming its own verification (a test going red then green, an
+  observable output, a specific file or state), sized so a worker can complete and verify one
+  before starting the next. `worker.md` gains an **Execute the plan step by step** section:
+  work the brief's steps one at a time, verify each against its own stated check before moving
+  on, and treat a step whose verification won't pass after a real attempt as something to
+  report rather than quietly skip past.
 
 `the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was` renders
 **these** with the six pre-#222 template variables and asserts that a group launched
