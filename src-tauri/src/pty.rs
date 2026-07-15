@@ -904,15 +904,28 @@ pub fn spawn_pty(
     let expected_exits = state.expected_exits.clone();
     std::thread::spawn(move || {
         let status = child.wait();
-        ptys.lock_safe().remove(&id);
+        // Snapshot the removed handle's output BEFORE it's dropped (#281): the
+        // instant this pty leaves the live map, its ring is gone — before this,
+        // a caller asking "why did this die" even a moment later got nothing
+        // ("terminal already closed"), which is exactly what made a resumed
+        // CLI's silent exit-1 opaque. Reading it off the removed handle itself
+        // (not the live map) means it survives the removal.
+        let removed = ptys.lock_safe().remove(&id);
+        let (tail, total) = match &removed {
+            Some(h) => {
+                let buf = h.output.lock_safe();
+                (crate::orchestration::strip_ansi(&buf.ring.iter().copied().collect::<Vec<u8>>()), buf.total)
+            }
+            None => (String::new(), 0),
+        };
         let expected = expected_exits.lock_safe().remove(&id);
         let exit_code = status.ok().map(|s| s.exit_code());
         crate::obs::breadcrumb(
             "pty-exit",
-            &format!("id={id} code={exit_code:?} expected={expected}"),
+            &format!("id={id} code={exit_code:?} expected={expected} bytes={total}"),
         );
         if let Some(reg) = app.try_state::<Arc<crate::orchestration::OrchRegistry>>() {
-            reg.on_pty_exit(id, exit_code);
+            reg.on_pty_exit(id, exit_code, &tail, total, expected);
         }
         let _ = app.emit("pty-exit", ExitPayload { id, exit_code, expected });
     });

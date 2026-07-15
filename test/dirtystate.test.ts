@@ -11,6 +11,7 @@ import {
   dirtyBuffers,
   dirtyBufferLines,
   quitDecision,
+  exitDiagnosticLine,
   keepOpenOnExit,
   withDeadline,
   QUIT_FLUSH_TIMEOUT_MS,
@@ -180,6 +181,18 @@ test("keepOpenOnExit: a crash AND a dirty buffer reports the crash — the banne
     keepOpenOnExit({ launchedCommand: true, exit: exited(1), hasUnsavedWork: true }),
     "output"
   );
+});
+
+test("exitDiagnosticLine: names the DOA-silent-death case, but only when nothing was ever printed (#281)", () => {
+  assert.equal(
+    exitDiagnosticLine(false),
+    "[loomux] produced no output before exiting — it likely died before printing " +
+      "anything at all (a missing/corrupt session, a rejected resume flag, or a gone " +
+      "working directory are the usual causes)"
+  );
+  // A crash that produced real output reads fine as the plain "process exited"
+  // banner — inventing a diagnostic here would just be noise.
+  assert.equal(exitDiagnosticLine(true), null);
 });
 
 // ---------- the quit path's final save must not be able to wedge the app (#219) ----------
