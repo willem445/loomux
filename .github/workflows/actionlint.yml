@@ -1,0 +1,37 @@
+name: Actionlint
+
+# Lints .github/workflows/*.yml with actionlint — catches workflow-syntax and
+# job-graph mistakes mechanically (the kind of mistake #221 was about) before
+# they merge. Believed wired once already but never actually was (#276).
+#
+# Path-scoped like docs.yml so PRs that don't touch workflows don't pay for
+# it. The binary is downloaded from a pinned release tag and checksum-verified
+# (no `@latest` action, no floating version) — bump both VERSION and
+# SHA256 together to upgrade.
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/**"
+
+permissions:
+  contents: read
+
+jobs:
+  actionlint:
+    runs-on: ubuntu-latest
+    env:
+      VERSION: "1.7.12"
+      SHA256: "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install actionlint (pinned, checksum-verified)
+        run: |
+          set -euo pipefail
+          curl -sSLO "https://github.com/rhysd/actionlint/releases/download/v${VERSION}/actionlint_${VERSION}_linux_amd64.tar.gz"
+          echo "${SHA256}  actionlint_${VERSION}_linux_amd64.tar.gz" | sha256sum -c -
+          tar xzf "actionlint_${VERSION}_linux_amd64.tar.gz" actionlint
+
+      - name: Run actionlint
+        run: ./actionlint -color
