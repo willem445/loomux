@@ -202,9 +202,12 @@ before completing it. Once connected, both panes show a small colored, numbered 
 (**⇄1**, **⇄2**, …) before their title, plus a direction arrow (**▲** for the sender, **▼**
 for a receiver) — the color and number are the SAME on every member of one channel, so with
 several channels active at once you can tell at a glance which panes belong together, and
-who's driving each one. The chip mirrors to a docked pane's minimized chip too, and a
-background tab holding a connected pane gets its own small dot on the tab strip, so a
-channel spanning a hidden tab is never invisible.
+who's driving each one. The number reflects what's **currently** connected, not a running
+count: if **⇄1** disconnects, the next channel you connect gets **⇄1** again rather than
+counting up forever — the number always matches how many channels are actually active right
+now. The chip mirrors to a docked pane's minimized chip too, and a background tab holding a
+connected pane gets its own small dot on the tab strip, so a channel spanning a hidden tab is
+never invisible.
 
 **Sender and receiver.** A channel is directional: one member is the **sender**, everyone
 else is a **receiver**. The sender's `channel_send(text)` broadcasts to every receiver, any

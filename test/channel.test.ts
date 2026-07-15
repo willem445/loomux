@@ -4,7 +4,7 @@
 // color/number derivation, plus the directional channel badge.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { reduceConnect, channelNumber, channelColor, channelChipLabel, channelBadge, dropIfStale } from "../src/channel.ts";
+import { reduceConnect, channelColor, channelChipLabel, channelBadge, dropIfStale } from "../src/channel.ts";
 import type { PendingConnect } from "../src/panemenu.ts";
 
 const A: PendingConnect = { group: "g1", agentId: "w-1", name: "w-1", canSend: true, senderId: null, senderName: null, channelId: null };
@@ -77,31 +77,35 @@ test("no armed source (already null) stays null regardless of liveness", () => {
 });
 
 // ---------- per-channel color/number (distinguishing concurrent channels) ----------
+//
+// #271 follow-up (PR #285 live-testing feedback): the chip's number/color derive
+// from the backend-assigned `displayNumber` (mod.rs's `Channel.display_number`),
+// NOT the channel id's `chan-N` suffix — that suffix is a monotonic counter that
+// never stops climbing, even across a disconnect, so it kept showing "⇄2" for the
+// only active channel right after chan-1 (the actual "⇄1") closed.
 
-test("channelNumber reads the backend-minted numeric suffix", () => {
-  assert.equal(channelNumber("chan-1"), 1);
-  assert.equal(channelNumber("chan-42"), 42);
+test("channelColor and channelChipLabel are pure functions of the display number — same input, same output, no cache", () => {
+  assert.equal(channelColor(3), channelColor(3));
+  assert.equal(channelChipLabel(3), "⇄3");
 });
 
-test("a malformed channel id degrades to 0 rather than throwing — decoration, not a crash", () => {
-  assert.equal(channelNumber("not-a-channel"), 0);
-  assert.equal(channelNumber(""), 0);
+test("two DIFFERENT display numbers get visually distinct chip labels — the multi-channel requirement", () => {
+  assert.notEqual(channelChipLabel(1), channelChipLabel(2));
 });
 
-test("channelColor and channelChipLabel are pure functions of the id — same id, same output, no cache", () => {
-  assert.equal(channelColor("chan-3"), channelColor("chan-3"));
-  assert.equal(channelChipLabel("chan-3"), "⇄3");
-});
-
-test("two DIFFERENT channels get visually distinct chip labels — the multi-channel requirement", () => {
-  assert.notEqual(channelChipLabel("chan-1"), channelChipLabel("chan-2"));
-});
-
-test("the color palette wraps rather than throwing once channel numbers exceed the palette size", () => {
+test("the color palette wraps rather than throwing once display numbers exceed the palette size", () => {
   // Must not throw, and must still return a defined color string.
-  const c = channelColor("chan-999");
+  const c = channelColor(999);
   assert.equal(typeof c, "string");
   assert.ok(c.length > 0);
+});
+
+test("two distinct active channels (distinct display numbers) get distinct colors and labels", () => {
+  // The reuse the backend performs (chan-1 closes, chan-3 mints as display 1)
+  // must never leave two LIVE channels sharing a chip — this pins that two
+  // different `displayNumber`s the frontend is handed always render distinctly.
+  assert.notEqual(channelColor(1), channelColor(2));
+  assert.notEqual(channelChipLabel(1), channelChipLabel(2));
 });
 
 test("channelBadge excludes the caller's own id from the peers list", () => {
@@ -110,10 +114,19 @@ test("channelBadge excludes the caller's own id from the peers list", () => {
     { agent_id: "rev-3", name: "rev-3", direction: "receiver" as const, can_send: false, delivery_only: false },
     { agent_id: "orch-1", name: "orch-1", direction: "receiver" as const, can_send: false, delivery_only: false },
   ];
-  const badge = channelBadge("chan-2", members, "rev-3");
+  const badge = channelBadge("chan-2", 2, members, "rev-3");
   assert.deepEqual(badge.peers, ["w-1", "orch-1"]);
   assert.equal(badge.channelId, "chan-2");
   assert.equal(badge.label, "⇄2");
+});
+
+test("channelBadge's label/color come from displayNumber, NOT the channel id's numeric suffix", () => {
+  // chan-7 (a high, ever-climbing id) reused down to display number 1 — the
+  // chip must read "⇄1", never "⇄7".
+  const members = [{ agent_id: "w-1", name: "w-1", direction: "sender" as const, can_send: true, delivery_only: false }];
+  const badge = channelBadge("chan-7", 1, members, "someone-else");
+  assert.equal(badge.label, "⇄1");
+  assert.equal(badge.color, channelColor(1));
 });
 
 // ---------- directional badge fields (#271 W3 addendum, part C) ----------
@@ -123,7 +136,7 @@ test("the sender's own badge reads direction:sender, canSend:true, deliveryOnly:
     { agent_id: "w-1", name: "w-1", direction: "sender" as const, can_send: true, delivery_only: false },
     { agent_id: "rev-3", name: "rev-3", direction: "receiver" as const, can_send: false, delivery_only: false },
   ];
-  const badge = channelBadge("chan-2", members, "w-1");
+  const badge = channelBadge("chan-2", 2, members, "w-1");
   assert.equal(badge.direction, "sender");
   assert.equal(badge.canSend, true);
   assert.equal(badge.deliveryOnly, false);
@@ -136,7 +149,7 @@ test("a receiver out of credit reads direction:receiver, canSend:false, but deli
     { agent_id: "w-1", name: "w-1", direction: "sender" as const, can_send: true, delivery_only: false },
     { agent_id: "rev-3", name: "rev-3", direction: "receiver" as const, can_send: false, delivery_only: false },
   ];
-  const badge = channelBadge("chan-2", members, "rev-3");
+  const badge = channelBadge("chan-2", 2, members, "rev-3");
   assert.equal(badge.direction, "receiver");
   assert.equal(badge.canSend, false);
   assert.equal(badge.deliveryOnly, false);
@@ -148,14 +161,14 @@ test("a delivery-only receiver reads deliveryOnly:true regardless of any momenta
     { agent_id: "w-1", name: "w-1", direction: "sender" as const, can_send: true, delivery_only: false },
     { agent_id: "solo-2", name: "solo codex", direction: "receiver" as const, can_send: false, delivery_only: true },
   ];
-  const badge = channelBadge("chan-2", members, "solo-2");
+  const badge = channelBadge("chan-2", 2, members, "solo-2");
   assert.equal(badge.deliveryOnly, true);
   assert.equal(badge.canSend, false);
 });
 
 test("channelBadge falls back to a receive-only receiver if selfAgentId isn't found (defensive, should not happen live)", () => {
   const members = [{ agent_id: "w-1", name: "w-1", direction: "sender" as const, can_send: true, delivery_only: false }];
-  const badge = channelBadge("chan-2", members, "ghost-9");
+  const badge = channelBadge("chan-2", 2, members, "ghost-9");
   assert.equal(badge.direction, "receiver");
   assert.equal(badge.canSend, false);
   assert.equal(badge.deliveryOnly, true);

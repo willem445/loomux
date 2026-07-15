@@ -10,7 +10,8 @@ use loomux_lib::orchestration::mcp::dispatch;
 use loomux_lib::orchestration::notify;
 use loomux_lib::orchestration::workflow;
 use loomux_lib::orchestration::{
-    add_trusted_folder, autonomy_budget_exhausted, bracketed_paste, channel_message_text,
+    add_trusted_folder, autonomy_budget_exhausted, bracketed_paste, channel_connected_event,
+    channel_disconnected_event, channel_message_text, channel_updated_event,
     classify_human_input,
     claude_permission_mode, cli_ready, copilot_autopilot_prompt_detected, create_orchestration_group,
     gh_gate_decision, gh_is_merge_invocation, gh_positionals, gh_release_action, gh_repo_flag,
@@ -9019,6 +9020,7 @@ fn connect_mints_a_channel_and_audits_both_groups() {
     }
     assert_eq!(channel_status(&reg, &c1)["connected"], json!(true));
     assert_eq!(channel_status(&reg, &c1)["peers"][0]["agent_id"], json!(c2.agent_id));
+    assert_eq!(channel_status(&reg, &c1)["display_number"], json!(1));
 }
 
 #[test]
@@ -9045,7 +9047,126 @@ fn connect_list_and_for_pane_all_return_the_same_channel_shape() {
             ch["members"].as_array().unwrap().len(), 2,
             "{label} must report the same membership, got: {ch}"
         );
+        // #271 follow-up: `display_number` must be present and IDENTICAL
+        // across all three surfaces — same drift risk `id` already guards
+        // against, just for the chip-facing number instead of the audit id.
+        assert!(ch["display_number"].is_number(), "{label} must carry a numeric display_number, got: {ch}");
+        assert_eq!(
+            ch["display_number"], connected["display_number"],
+            "{label} must report the SAME display_number connect minted"
+        );
     }
+
+    // #271 follow-up review finding: the shape-parity coverage above pinned
+    // connect/list/for_pane (and a separate test pins channel_status) but
+    // NOT `set_sender`'s return — a swap must report the unchanged
+    // display_number, never recompute or drop it.
+    let swapped = reg.set_sender(connected["id"].as_str().unwrap(), &c2.agent_id).unwrap();
+    assert_eq!(
+        swapped["display_number"], connected["display_number"],
+        "set_sender's return must report the SAME display_number connect minted, got {swapped}"
+    );
+}
+
+#[test]
+fn orch_channel_event_payloads_all_carry_the_channels_display_number() {
+    // #271 follow-up review finding: the surfaces pinned above are all
+    // ordinary function returns, easy to assert on directly. The THREE
+    // `orch-channel` event shapes (connected / disconnected-or-closed /
+    // updated) are the remaining surface — but this codebase has no harness
+    // for capturing an ACTUALLY emitted Tauri event (`self.app` is `None` in
+    // every test registry, so `app.emit(...)` never fires here). The
+    // payload-building functions (`channel_connected_event`/
+    // `channel_disconnected_event`/`channel_updated_event`) are factored out
+    // as pure functions for exactly this reason — the real call sites in
+    // `connect_agents`/`disconnect_agent`/`set_sender` call the SAME
+    // functions pinned here, so drift between "what's tested" and "what's
+    // emitted" is structurally impossible, not just asserted.
+    let members = vec![json!({ "agent_id": "w-1" }), json!({ "agent_id": "w-2" })];
+
+    let connected = channel_connected_event("chan-9", "w-1", 4, members.clone());
+    assert_eq!(connected["display_number"], json!(4), "got: {connected}");
+
+    let disconnected = channel_disconnected_event(false, "chan-9", "w-2", 4, members.clone());
+    assert_eq!(disconnected["display_number"], json!(4), "got: {disconnected}");
+
+    let closed = channel_disconnected_event(true, "chan-9", "w-2", 4, members.clone());
+    assert_eq!(closed["display_number"], json!(4), "got: {closed}");
+
+    let updated = channel_updated_event("chan-9", "w-1", 4, members);
+    assert_eq!(updated["display_number"], json!(4), "got: {updated}");
+}
+
+// ---------- display_number: reflects what's ACTUALLY connected (#271 follow-up) ----------
+//
+// PR #285 live-testing feedback: the chip number always incremented, even
+// across a disconnect — because it was derived from `id`'s ever-increasing
+// `chan-N` suffix. `display_number` is a SEPARATE field: the lowest positive
+// integer not used by any other currently-live channel, freed the instant
+// its channel closes. `id` stays monotonic (audit trail unambiguity);
+// `display_number` is what the human actually sees on the pane chip.
+
+/// Connect a fresh pair of agents in two new groups, returning the minted
+/// channel. Each call spins up its own groups/agents (channels tie one pane
+/// to at most one channel), mirroring `two_concurrent_channels_never_cross`.
+fn connect_fresh_pair(reg: &OrchRegistry, tag: &str) -> Value {
+    let g_a = reg.create_group(&format!("C:/tmp/repo-{tag}-a"), rails()).unwrap();
+    let g_b = reg.create_group(&format!("C:/tmp/repo-{tag}-b"), rails()).unwrap();
+    let a = reg.spawn_agent(&g_a.id, Role::Worker, &format!("w-{tag}-a"), "t", false, None).unwrap();
+    let b = reg.spawn_agent(&g_b.id, Role::Worker, &format!("w-{tag}-b"), "t", false, None).unwrap();
+    reg.connect_agents(&g_a.id, &a.id, &g_b.id, &b.id, &a.id).unwrap()
+}
+
+#[test]
+fn display_number_is_reused_after_the_channel_closes() {
+    let (reg, _d, g1, g2, c1, c2) = two_group_setup();
+    let ch1 = reg.connect_agents(&g1, &c1.agent_id, &g2, &c2.agent_id, &c1.agent_id).unwrap();
+    assert_eq!(ch1["display_number"], json!(1));
+
+    let result = reg.disconnect_agent(&g1, &c1.agent_id).unwrap();
+    assert_eq!(result["closed"], json!(true));
+
+    let ch2 = connect_fresh_pair(&reg, "reuse");
+    assert_ne!(ch2["id"], ch1["id"], "the immutable chan-N id must never be reused");
+    assert_eq!(ch2["display_number"], json!(1), "the freed display number must be reused, got {ch2}");
+}
+
+#[test]
+fn interleaved_actives_get_the_lowest_gap() {
+    let (reg, _d, g1, g2, c1, c2) = two_group_setup();
+    let ch1 = reg.connect_agents(&g1, &c1.agent_id, &g2, &c2.agent_id, &c1.agent_id).unwrap();
+    let ch2 = connect_fresh_pair(&reg, "gap2");
+    let ch3 = connect_fresh_pair(&reg, "gap3");
+    assert_eq!(ch1["display_number"], json!(1));
+    assert_eq!(ch2["display_number"], json!(2));
+    assert_eq!(ch3["display_number"], json!(3));
+
+    // Close the MIDDLE channel — actives are now {1, 3}, so the next mint
+    // must fill the gap at 2, not append at 4.
+    let ch2_id = ch2["id"].as_str().unwrap();
+    let member = ch2["members"][0]["agent_id"].as_str().unwrap();
+    let member_group = ch2["members"][0]["group"].as_str().unwrap();
+    reg.disconnect_agent(member_group, member).unwrap();
+    assert!(reg.channel_for_pane(member_group, member).is_null());
+    let _ = ch2_id;
+
+    let ch4 = connect_fresh_pair(&reg, "gap4");
+    assert_eq!(ch4["display_number"], json!(2), "the lowest gap in {{1, 3}} must be filled, got {ch4}");
+    assert_eq!(ch1["display_number"], reg.channel_for_pane(&g1, &c1.agent_id)["display_number"]);
+    assert_eq!(ch3["display_number"], json!(3), "an untouched channel's display_number must be stable");
+}
+
+#[test]
+fn concurrent_channels_never_share_a_display_number() {
+    let (reg, _d, g1, g2, c1, c2) = two_group_setup();
+    let ch1 = reg.connect_agents(&g1, &c1.agent_id, &g2, &c2.agent_id, &c1.agent_id).unwrap();
+    let ch2 = connect_fresh_pair(&reg, "distinct2");
+    let ch3 = connect_fresh_pair(&reg, "distinct3");
+
+    let mut numbers: Vec<u64> = [&ch1, &ch2, &ch3].iter().map(|c| c["display_number"].as_u64().unwrap()).collect();
+    numbers.sort_unstable();
+    numbers.dedup();
+    assert_eq!(numbers.len(), 3, "every concurrently-live channel must have a DISTINCT display_number");
 }
 
 #[test]

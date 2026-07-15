@@ -121,8 +121,11 @@ only from the trusted webview (constraint 5), never MCP tools. There is no `chan
     agent_channel: Mutex<HashMap<String, String>>    // agent_id -> chan_id (the invariant)
     channel_seq: AtomicU32                            // chan-1, chan-2, ...
 
-    struct Channel { id: String, members: Vec<ChannelMember>, created_ms: u64 }
-    struct ChannelMember { group: String, agent_id: String, name: String, role: Role }
+    struct Channel { id: String, members: Vec<ChannelMember>, created_ms: u64, sender: String, display_number: u32 }
+    struct ChannelMember { group: String, agent_id: String, name: String, role: Role, may_reply: bool }
+
+(`sender`/`may_reply` are the W3 directional addendum below; `display_number` is the
+display-number follow-up at the end of this doc.)
 
 `name`/`role` are cached on the member at connect/join time (not re-looked-up per read) so
 `channel_status`/notices still work sensibly if a member's agent entry later changes.
@@ -145,9 +148,10 @@ Both denied to a planner (`require_not_planner`, the exact function #243 added):
 `orch_channel_connect(from_group, from_agent, to_group, to_agent)`,
 `orch_channel_disconnect(group, agent)`, `orch_channel_list()`,
 `orch_channel_for_pane(group, agent)`. Connect/disconnect emit an `orch-channel` event
-(`{kind: "connected"|"disconnected"|"closed", channel_id, members}`) so cross-tab UI can
-update without polling — payload shape frozen in `src/orchestration.ts`'s
-`OrchChannelEvent`, consumed by the follow-up UI PR.
+(`{kind: "connected"|"disconnected"|"closed", channel_id, display_number, members}`) so
+cross-tab UI can update without polling — payload shape frozen in `src/orchestration.ts`'s
+`OrchChannelEvent`, consumed by the follow-up UI PR. (`display_number` added by the
+display-number follow-up at the end of this doc — W1 originally shipped without it.)
 
 ## Audit records
 
@@ -512,3 +516,42 @@ a required `sender_agent` parameter. W1's `tests/orchestration.rs` channel tests
 updated **in place** to the new signature/semantics (every `connect_agents` call site now
 names a sender); this is a deliberate, flagged contract revision on a stacked follow-up PR,
 not a retro-edit of #285's merged commit.
+
+## Follow-up: `display_number` (PR #285 live-testing feedback)
+
+**The bug.** The pane chip's number/color were a pure function of `id` (`chan-N`,
+`channel_seq`'s monotonic `AtomicU32`). `channel_seq` correctly never reuses a value — an
+audit record for `chan-1` must never become ambiguous with a later, unrelated `chan-1` — but
+that means `id`'s numeric suffix keeps climbing even as channels close. A human live-testing
+#285 connected a pair (chip `⇄1`), disconnected it, then connected a fresh pair: the new
+channel was `chan-2`, so the ONLY active channel read `⇄2` — the chip no longer represented
+what was actually connected, just how many channels had ever existed.
+
+**The fix.** `Channel` gains a second, independent field: `display_number: u32`, assigned
+once at mint time by `OrchRegistry::next_display_number` — the lowest positive integer NOT
+currently used by any other live channel. `chan-1` closing frees `"1"` for the very next
+mint; with actives `{1, 3}`, the next mint fills the gap at `2`, not `4`. `id` stays exactly
+as before (monotonic, immutable, the audit key); `display_number` is immutable for a given
+channel's lifetime too, but reassignable — as a value — the moment a DIFFERENT channel
+closes and something mints into the freed slot.
+
+**Exposed everywhere the frontend learns about a channel**, so the four surfaces can't
+drift apart the same way W3's `sender`/`direction` fields don't (`channel_members_json`'s
+discipline, applied here as a sibling field alongside it rather than inside it, since
+`display_number` is per-channel, not per-member): `connect_agents`'s return, `channel_list`,
+`channel_for_pane`, `channel_status`, `set_sender`'s return, and every `orch-channel` event
+(`connected`/`disconnected`/`closed`/`updated` — captured into a local before
+`disconnect_agent` tears the `Channel` down, so the closing event still carries it).
+
+**Frontend.** `channel.ts`'s `channelColor`/`channelChipLabel` now take the display number
+directly instead of parsing it out of the id; `channelBadge` takes `channelId` (still shown
+nowhere but kept for correlation) and `displayNumber` as separate parameters — never
+re-derives one from the other. Restart hydration (`channelForPane`) round-trips the
+backend's `display_number` rather than recomputing anything client-side, since it is state,
+not a pure function of `id` any more.
+
+**Audit sentences are unaffected.** `auditsummary.ts`'s `channel-connect`/
+`channel-disconnect`/`channel-direction` arms render the immutable `channel_id` (`chan-N`)
+they always have — that id is exactly what makes two disconnect records for the "same
+numbered" channel unambiguous, which is the whole reason `id` and `display_number` are two
+fields instead of one.
