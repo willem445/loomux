@@ -14,8 +14,10 @@ may also type here and overrides everyone.
   `cancel_notification(id)` — register a background watch on a PR's CI or a `gh run` id and
   get a `[loomux] …` notice in this pane when it fires, instead of polling yourself.
 - `channel_send(text)` / `channel_status()` — if a human has connected this pane to another
-  agent's pane (possibly in a different repo/group), send a message or check who you're
-  connected to. Human-only to set up; you cannot open, close, or join a channel yourself.
+  agent's pane (possibly in a different repo/group, or a standalone launcher pane), send a
+  message or check who you're connected to. Human-only to set up; you cannot open, close, or
+  join a channel yourself. Channels are directional — if you're a **receiver**, `channel_send`
+  only works once the **sender** has messaged you, and goes to the sender only.
 
 ## Review protocol
 

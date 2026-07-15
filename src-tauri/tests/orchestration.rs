@@ -30,7 +30,7 @@ use loomux_lib::orchestration::{
     PersonaInject,
     PasteGate, Role, TaskPatch, UsageSnapshot, CLAUDE_UNATTENDED_ALLOW, COPILOT_AUTOPILOT_CONFIRM_KEYS,
     COPILOT_GROUP_AUTOPILOT_FLAGS, COPILOT_UNATTENDED_FLAGS, MAX_ATTACHMENT_BYTES,
-    PLANNER_READONLY_NOTE,
+    PLANNER_READONLY_NOTE, SOLO_GROUP,
 };
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -8996,7 +8996,7 @@ fn channel_message_text_carries_a_backend_built_sender_line() {
 #[test]
 fn connect_mints_a_channel_and_audits_both_groups() {
     let (reg, _d, g1, g2, c1, c2) = two_group_setup();
-    let ch = reg.connect_agents(&g1, &c1.agent_id, &g2, &c2.agent_id).unwrap();
+    let ch = reg.connect_agents(&g1, &c1.agent_id, &g2, &c2.agent_id, &c1.agent_id).unwrap();
     assert_eq!(ch["members"].as_array().unwrap().len(), 2);
 
     for g in [&g1, &g2] {
@@ -9025,7 +9025,7 @@ fn connect_list_and_for_pane_all_return_the_same_channel_shape() {
     // `undefined` at runtime with no compile-time signal. Pin that all three
     // commands agree on the SAME keys, so that drift can't reappear unnoticed.
     let (reg, _d, g1, g2, c1, c2) = two_group_setup();
-    let connected = reg.connect_agents(&g1, &c1.agent_id, &g2, &c2.agent_id).unwrap();
+    let connected = reg.connect_agents(&g1, &c1.agent_id, &g2, &c2.agent_id, &c1.agent_id).unwrap();
     let listed = reg.channel_list().as_array().unwrap()[0].clone();
     let for_pane = reg.channel_for_pane(&g1, &c1.agent_id);
 
@@ -9045,7 +9045,7 @@ fn connect_list_and_for_pane_all_return_the_same_channel_shape() {
 #[test]
 fn channel_send_delivers_to_a_cross_group_peer_with_sender_line_and_sanitizes_a_hostile_payload() {
     let (reg, _d, g1, g2, c1, c2) = two_group_setup();
-    reg.connect_agents(&g1, &c1.agent_id, &g2, &c2.agent_id).unwrap();
+    reg.connect_agents(&g1, &c1.agent_id, &g2, &c2.agent_id, &c1.agent_id).unwrap();
 
     // A hostile payload: an embedded newline attempting to forge a SECOND
     // `[loomux] …` line, plus a literal `[loomux]` marker mid-text, plus a
@@ -9141,7 +9141,7 @@ fn connect_agents_rejects_a_planner_on_either_side() {
     let planner = reg.spawn_agent(&g1.id, Role::Planner, "p", "plan #1", false, None).unwrap();
     let worker = reg.spawn_agent(&g2.id, Role::Worker, "w", "t", false, None).unwrap();
 
-    let err = reg.connect_agents(&g1.id, &planner.id, &g2.id, &worker.id).unwrap_err();
+    let err = reg.connect_agents(&g1.id, &planner.id, &g2.id, &worker.id, &planner.id).unwrap_err();
     assert!(err.contains("planner"), "got: {err}");
     assert!(reg.channel_for_pane(&g1.id, &planner.id).is_null());
     assert!(reg.channel_for_pane(&g2.id, &worker.id).is_null());
@@ -9153,12 +9153,12 @@ fn one_channel_per_pane_invariant() {
     let g3 = reg.create_group("C:/tmp/repo-c", rails()).unwrap();
     let w3 = reg.spawn_agent(&g3.id, Role::Worker, "w3", "t3", false, None).unwrap();
 
-    let ch1 = reg.connect_agents(&g1, &c1.agent_id, &g2, &c2.agent_id).unwrap();
+    let ch1 = reg.connect_agents(&g1, &c1.agent_id, &g2, &c2.agent_id, &c1.agent_id).unwrap();
     let chan_id = ch1["id"].as_str().unwrap().to_string();
 
     // A free pane connecting onto an already-connected one JOINS that
     // channel (multi-party) rather than minting a second one.
-    let joined = reg.connect_agents(&g1, &c1.agent_id, &g3.id, &w3.id).unwrap();
+    let joined = reg.connect_agents(&g1, &c1.agent_id, &g3.id, &w3.id, &c1.agent_id).unwrap();
     assert_eq!(joined["id"], json!(chan_id));
     assert_eq!(joined["members"].as_array().unwrap().len(), 3);
     assert_eq!(reg.channel_for_pane(&g3.id, &w3.id)["id"], json!(chan_id));
@@ -9168,12 +9168,12 @@ fn one_channel_per_pane_invariant() {
     let w4a = reg.spawn_agent(&g4.id, Role::Worker, "w4a", "t", false, None).unwrap();
     let g5 = reg.create_group("C:/tmp/repo-e", rails()).unwrap();
     let w4b = reg.spawn_agent(&g5.id, Role::Worker, "w4b", "t", false, None).unwrap();
-    let ch2 = reg.connect_agents(&g4.id, &w4a.id, &g5.id, &w4b.id).unwrap();
+    let ch2 = reg.connect_agents(&g4.id, &w4a.id, &g5.id, &w4b.id, &w4a.id).unwrap();
     assert_ne!(ch2["id"], json!(chan_id));
 
     // w3 (already in chan_id) connecting to a pane already in the OTHER
     // channel must be rejected — that would silently bridge the two.
-    let err = reg.connect_agents(&g3.id, &w3.id, &g4.id, &w4a.id).unwrap_err();
+    let err = reg.connect_agents(&g3.id, &w3.id, &g4.id, &w4a.id, &w3.id).unwrap_err();
     assert!(err.contains("already connected"), "got: {err}");
     // w3's membership is unaffected by the rejected attempt.
     assert_eq!(reg.channel_for_pane(&g3.id, &w3.id)["id"], json!(chan_id));
@@ -9183,7 +9183,7 @@ fn one_channel_per_pane_invariant() {
 #[test]
 fn disconnect_stops_delivery_and_strands_the_peer() {
     let (reg, _d, g1, g2, c1, c2) = two_group_setup();
-    reg.connect_agents(&g1, &c1.agent_id, &g2, &c2.agent_id).unwrap();
+    reg.connect_agents(&g1, &c1.agent_id, &g2, &c2.agent_id, &c1.agent_id).unwrap();
     channel_send(&reg, &c1, "before").unwrap();
     let before_count =
         reg.audit_log(&g2).iter().filter(|e| e.action == "channel-message").count();
@@ -9211,8 +9211,8 @@ fn three_member_channel_fans_out_to_both_other_peers() {
     let w3 = reg.spawn_agent(&g3.id, Role::Worker, "w3", "t3", false, None).unwrap();
     let c3 = reg.resolve_token(&w3.token).unwrap();
 
-    reg.connect_agents(&g1, &c1.agent_id, &g2, &c2.agent_id).unwrap();
-    reg.connect_agents(&g1, &c1.agent_id, &g3.id, &c3.agent_id).unwrap();
+    reg.connect_agents(&g1, &c1.agent_id, &g2, &c2.agent_id, &c1.agent_id).unwrap();
+    reg.connect_agents(&g1, &c1.agent_id, &g3.id, &c3.agent_id, &c1.agent_id).unwrap();
 
     let sent = channel_send(&reg, &c1, "hello all").unwrap();
     assert!(sent.contains("2 peer"), "got: {sent}");
@@ -9242,8 +9242,8 @@ fn two_concurrent_channels_never_cross() {
     let c3 = reg.resolve_token(&w3.token).unwrap();
     let c4 = reg.resolve_token(&w4.token).unwrap();
 
-    reg.connect_agents(&g1, &c1.agent_id, &g2, &c2.agent_id).unwrap();
-    reg.connect_agents(&g3.id, &c3.agent_id, &g4.id, &c4.agent_id).unwrap();
+    reg.connect_agents(&g1, &c1.agent_id, &g2, &c2.agent_id, &c1.agent_id).unwrap();
+    reg.connect_agents(&g3.id, &c3.agent_id, &g4.id, &c4.agent_id, &c3.agent_id).unwrap();
 
     channel_send(&reg, &c1, "chan1 only").unwrap();
 
@@ -9257,8 +9257,436 @@ fn two_concurrent_channels_never_cross() {
 #[test]
 fn a_dead_agents_channel_is_torn_down_and_the_peer_notified() {
     let (reg, _d, g1, g2, c1, c2) = two_group_setup();
-    reg.connect_agents(&g1, &c1.agent_id, &g2, &c2.agent_id).unwrap();
+    reg.connect_agents(&g1, &c1.agent_id, &g2, &c2.agent_id, &c1.agent_id).unwrap();
     reg.mark_dead(&c1.agent_id, Some(0));
     assert_eq!(channel_status(&reg, &c2)["connected"], json!(false));
     assert!(reg.audit_log(&g2).iter().any(|e| e.action == "channel-disconnect"));
+}
+
+// ---------- standalone panes + directional model (#271 W3 addendum) ----------
+//
+// Solo panes are faked exactly as orchestration-group agents are elsewhere in
+// this file: `solo_prepare`/`solo_bind` mint an `AgentEntry` and bind it to a
+// plain integer "pty id" (mirroring `reg.bind(&id, N)` above) — no real CLI,
+// no real pty (CLAUDE.md constraint 3).
+
+/// Mint a solo pane's identity (`solo_prepare`) and bind it to a fake pty
+/// (`solo_bind`), mirroring the launcher round trip. Returns `(agent_id,
+/// token)` — `token` is empty for a delivery-only CLI (no config seam).
+fn spawn_solo(reg: &OrchRegistry, cli: &str, pty_id: u32) -> (String, String) {
+    let prepared = reg.solo_prepare(cli, "C:/tmp/solo", "solo pane").unwrap();
+    let agent_id = prepared["agent_id"].as_str().unwrap().to_string();
+    reg.solo_bind(&agent_id, pty_id).unwrap();
+    let token = reg.agent(&agent_id).unwrap().token;
+    (agent_id, token)
+}
+
+#[test]
+fn solo_group_is_registered_lazily_with_a_standalone_label() {
+    let (reg, _d) = test_registry();
+    assert!(reg.group(SOLO_GROUP).is_none(), "must not exist before any solo pane");
+    reg.solo_prepare("claude", "C:/tmp/x", "x").unwrap();
+    let info = reg.group(SOLO_GROUP).unwrap();
+    assert_eq!(info.repo, "(standalone)");
+}
+
+#[test]
+fn solo_prepare_builds_the_exact_per_cli_flag_strings_and_delivery_only_falls_back_cleanly() {
+    let (reg, _d) = test_registry();
+    let claude = reg.solo_prepare("claude", "C:/tmp/solo", "c").unwrap();
+    assert_eq!(claude["delivery_only"], json!(false));
+    let args = claude["mcp_args"].as_str().unwrap();
+    assert!(args.contains("--mcp-config \""), "got: {args}");
+    assert!(args.contains("--strict-mcp-config"), "got: {args}");
+    assert!(args.contains("--allowedTools mcp__loomux"), "got: {args}");
+
+    let copilot = reg.solo_prepare("copilot", "C:/tmp/solo", "cp").unwrap();
+    assert_eq!(copilot["delivery_only"], json!(false));
+    let cargs = copilot["mcp_args"].as_str().unwrap();
+    assert!(cargs.contains("--additional-mcp-config \"@"), "got: {cargs}");
+    assert!(cargs.contains("--allow-tool loomux"), "got: {cargs}");
+
+    // No config seam today (A2): AgentEntry still exists (a valid
+    // deliver_prompt target once connected), but no token is ever minted.
+    for cli in ["codex", "gemini", "opencode", "custom"] {
+        let prepared = reg.solo_prepare(cli, "C:/tmp/solo", "x").unwrap();
+        assert_eq!(prepared["delivery_only"], json!(true), "{cli} has no config seam");
+        assert_eq!(prepared["mcp_args"], json!(""), "{cli} must get no flags");
+        let id = prepared["agent_id"].as_str().unwrap();
+        assert!(reg.agent(id).is_some());
+        assert!(reg.agent(id).unwrap().token.is_empty());
+    }
+}
+
+#[test]
+fn solo_adopt_registers_a_delivery_only_member_and_is_idempotent_by_pty() {
+    let (reg, _d) = test_registry();
+    let first = reg.solo_adopt(1001, "already running", "C:/tmp/x").unwrap();
+    let id1 = first["agent_id"].as_str().unwrap().to_string();
+    assert!(reg.agent(&id1).unwrap().token.is_empty(), "an adopted pane must never get a token");
+    assert_eq!(reg.agent(&id1).unwrap().role, Role::Solo);
+
+    let second = reg.solo_adopt(1001, "already running", "C:/tmp/x").unwrap();
+    assert_eq!(second["agent_id"], json!(id1), "re-adopting the same pty must not mint a second identity");
+}
+
+#[test]
+fn solo_role_tool_surface_is_exactly_channel_send_and_channel_status() {
+    let (reg, _d) = test_registry();
+    let (_agent_id, token) = spawn_solo(&reg, "claude", 501);
+    let caller = reg.resolve_token(&token).unwrap();
+    assert_eq!(caller.role, Role::Solo);
+    assert_eq!(caller.group, SOLO_GROUP);
+
+    let tools: Vec<String> = dispatch(&reg, &caller, "tools/list", &Value::Null).unwrap()["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        tools,
+        vec!["channel_send".to_string(), "channel_status".to_string()],
+        "a solo token's tool listing must be EXACTLY these two, got: {tools:?}"
+    );
+}
+
+#[test]
+fn solo_role_cannot_dispatch_any_group_scoped_tool() {
+    // Pins concern-5: a solo token carries zero group-scoped power, even for
+    // tool names it never sees listed — the listing is cosmetic; this is the
+    // real per-arm gate (mcp.rs's single `Role::Solo` guard atop `call_tool`).
+    let (reg, _d) = test_registry();
+    let (_agent_id, token) = spawn_solo(&reg, "claude", 502);
+    let caller = reg.resolve_token(&token).unwrap();
+    for (name, args) in [
+        ("spawn_agent", json!({ "task": "x" })),
+        ("send_prompt", json!({ "agent_id": "w-1", "text": "hi" })),
+        ("report", json!({ "status": "progress", "summary": "x" })),
+        ("list_agents", json!({})),
+        ("get_state", json!({})),
+        ("list_tasks", json!({})),
+        ("message_orchestrator", json!({ "text": "hi" })),
+        ("notify_when", json!({ "kind": "pr_checks", "pr": "1" })),
+    ] {
+        let r =
+            dispatch(&reg, &caller, "tools/call", &json!({ "name": name, "arguments": args })).unwrap();
+        assert_eq!(r["isError"], true, "{name} must be denied to a solo caller");
+        let text = r["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("permission denied"), "{name} got: {text}");
+    }
+}
+
+#[test]
+fn solo_pane_connects_across_tiers_and_channel_send_works_both_directions_under_credit() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let cw = reg.resolve_token(&w.token).unwrap();
+    let (solo_id, solo_token) = spawn_solo(&reg, "claude", 601);
+    let cs = reg.resolve_token(&solo_token).unwrap();
+
+    // The worker is the designated sender.
+    reg.connect_agents(&g.id, &w.id, SOLO_GROUP, &solo_id, &w.id).unwrap();
+    let sent = channel_send(&reg, &cw, "hello solo").unwrap();
+    assert!(sent.contains("1 peer"), "got: {sent}");
+    assert!(reg
+        .audit_log(SOLO_GROUP)
+        .iter()
+        .any(|e| e.action == "channel-message" && e.detail["to"] == json!(solo_id)));
+    assert!(reg
+        .audit_log(&g.id)
+        .iter()
+        .any(|e| e.action == "channel-message" && e.detail["to"] == json!(solo_id)));
+
+    // The solo pane now holds a reply credit — it may answer the sender.
+    let replied = channel_send(&reg, &cs, "thanks").unwrap();
+    assert!(replied.contains("replied"), "got: {replied}");
+    assert!(reg
+        .audit_log(&g.id)
+        .iter()
+        .any(|e| e.action == "channel-message" && e.detail["from"] == json!(solo_id) && e.detail["to"] == json!(w.id)));
+}
+
+#[test]
+fn delivery_only_solo_pane_receives_but_can_never_send_or_become_sender() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let cw = reg.resolve_token(&w.token).unwrap();
+
+    // codex has no MCP-config seam today -> delivery-only, no token minted.
+    let prepared = reg.solo_prepare("codex", "C:/tmp/solo", "solo codex").unwrap();
+    assert_eq!(prepared["delivery_only"], json!(true));
+    let solo_id = prepared["agent_id"].as_str().unwrap().to_string();
+    reg.solo_bind(&solo_id, 701).unwrap();
+    assert!(reg.agent(&solo_id).unwrap().token.is_empty());
+    // No token was ever minted, so there is nothing to resolve — the MCP
+    // layer's `handle()` rejects the request at -32000 before dispatch ever
+    // sees a Caller; this is the load-bearing fact that pins.
+    assert!(reg.resolve_token("").is_none(), "an empty token must never resolve to a caller");
+
+    // Designating it as sender at connect time is rejected outright.
+    let err = reg.connect_agents(&g.id, &w.id, SOLO_GROUP, &solo_id, &solo_id).unwrap_err();
+    assert!(err.contains("no token"), "got: {err}");
+    assert!(reg.channel_for_pane(&g.id, &w.id).is_null(), "a rejected connect must not create a channel");
+
+    // Connect for real, worker as sender — the delivery-only pane is a receiver.
+    reg.connect_agents(&g.id, &w.id, SOLO_GROUP, &solo_id, &w.id).unwrap();
+    channel_send(&reg, &cw, "for the delivery-only pane").unwrap();
+    assert!(reg
+        .audit_log(SOLO_GROUP)
+        .iter()
+        .any(|e| e.action == "channel-message" && e.detail["to"] == json!(solo_id)));
+
+    let status = channel_status(&reg, &cw);
+    let peer = &status["peers"][0];
+    assert_eq!(peer["agent_id"], json!(solo_id));
+    assert_eq!(
+        peer["can_send"],
+        json!(false),
+        "a delivery-only peer must read can_send:false even after receiving a reply credit, got: {status}"
+    );
+    assert_eq!(
+        peer["delivery_only"],
+        json!(true),
+        "delivery_only is the STRUCTURAL (no token) fact, distinct from can_send's momentary one — \
+         the UI needs it to render a permanent receive-only chip rather than a plain out-of-credit \
+         receiver, got: {status}"
+    );
+}
+
+#[test]
+fn direction_star_topology_broadcast_credit_and_reply_only_to_sender_never_another_receiver() {
+    let (reg, _d) = test_registry();
+    let g1 = reg.create_group("C:/tmp/repo-a", rails()).unwrap();
+    let g2 = reg.create_group("C:/tmp/repo-b", rails()).unwrap();
+    let g3 = reg.create_group("C:/tmp/repo-c", rails()).unwrap();
+    let sender = reg.spawn_agent(&g1.id, Role::Worker, "s", "t", false, None).unwrap();
+    let r1 = reg.spawn_agent(&g2.id, Role::Worker, "r1", "t", false, None).unwrap();
+    let r2 = reg.spawn_agent(&g3.id, Role::Worker, "r2", "t", false, None).unwrap();
+    let cs = reg.resolve_token(&sender.token).unwrap();
+    let cr1 = reg.resolve_token(&r1.token).unwrap();
+    let cr2 = reg.resolve_token(&r2.token).unwrap();
+
+    reg.connect_agents(&g1.id, &sender.id, &g2.id, &r1.id, &sender.id).unwrap();
+    reg.connect_agents(&g1.id, &sender.id, &g3.id, &r2.id, &sender.id).unwrap();
+
+    // Before any sender message, a receiver may not initiate.
+    let err = channel_send(&reg, &cr1, "can I go first?").unwrap_err();
+    assert!(err.contains("only reply after the sender"), "got: {err}");
+
+    // Sender broadcasts -> both receivers get a one-shot reply credit.
+    let sent = channel_send(&reg, &cs, "status check").unwrap();
+    assert!(sent.contains("2 peer"), "got: {sent}");
+
+    // r1 replies -> reaches the SENDER only, never r2 (receiver->receiver is
+    // never allowed, B4).
+    let replied = channel_send(&reg, &cr1, "all green").unwrap();
+    assert!(replied.contains("replied"), "got: {replied}");
+    assert!(reg.audit_log(&g1.id).iter().any(
+        |e| e.action == "channel-message" && e.detail["from"] == json!(r1.id) && e.detail["to"] == json!(sender.id)
+    ));
+    assert!(
+        !reg.audit_log(&g3.id).iter().any(|e| e.action == "channel-message" && e.detail["from"] == json!(r1.id)),
+        "a receiver's reply must never reach another receiver"
+    );
+
+    // r1's credit is spent -> a second reply (no new sender message) is rejected.
+    let err2 = channel_send(&reg, &cr1, "again?").unwrap_err();
+    assert!(err2.contains("only reply after the sender"), "got: {err2}");
+
+    // r2 still holds its own untouched credit from the original broadcast.
+    let replied2 = channel_send(&reg, &cr2, "green here too").unwrap();
+    assert!(replied2.contains("replied"), "got: {replied2}");
+}
+
+// ---------- join sender semantics (review round 2, B1) ----------
+//
+// `sender_agent` means something different for a MINT (neither side
+// connected: it designates the new channel's sender, and must be one of the
+// two named panes) than for a JOIN (either side already connected: the
+// channel's sender already exists, and `sender_agent` only CONFIRMS who that
+// is — it is very often neither of the two panes in THIS call, e.g. a third
+// party sender in a bigger star). The completion gesture can land on EITHER
+// endpoint of a join — the sender or a plain receiver — and must succeed
+// either way, always leaving the channel's existing sender untouched.
+
+#[test]
+fn fresh_connect_sender_can_be_either_named_pane_regardless_of_from_to_order() {
+    // The gesture's from/to order (which pane you armed vs. completed on)
+    // must not constrain which of the two ends up driving a fresh mint.
+    let (reg, _d, g1, g2, c1, c2) = two_group_setup();
+    let ch = reg.connect_agents(&g1, &c1.agent_id, &g2, &c2.agent_id, &c2.agent_id).unwrap();
+    assert_eq!(ch["sender"], json!(c2.agent_id), "sender_agent == to_agent must be honored, not just == from_agent");
+}
+
+#[test]
+fn join_completing_on_the_sender_pane_succeeds() {
+    // The already-working case, pinned explicitly for symmetry with the
+    // receiver-completion test below.
+    let (reg, _d, g1, g2, c1, c2) = two_group_setup();
+    reg.connect_agents(&g1, &c1.agent_id, &g2, &c2.agent_id, &c1.agent_id).unwrap();
+    let g3 = reg.create_group("C:/tmp/repo-c", rails()).unwrap();
+    let x = reg.spawn_agent(&g3.id, Role::Worker, "x", "t", false, None).unwrap();
+
+    // Newcomer x joins by completing directly ONTO the sender c1.
+    let joined = reg.connect_agents(&g3.id, &x.id, &g1, &c1.agent_id, &c1.agent_id).unwrap();
+    assert_eq!(joined["members"].as_array().unwrap().len(), 3);
+    assert_eq!(joined["sender"], json!(c1.agent_id));
+}
+
+#[test]
+fn join_completing_on_a_receiver_pane_succeeds_and_keeps_the_existing_sender() {
+    // Reviewer's exact repro (PR #289 review round 2, B1): a live star with
+    // sender S and receiver R1; a free newcomer X joins by completing on R1
+    // — a RECEIVER, not the sender. Before the fix this returned
+    // Err("sender_agent must be one of the two connected panes") because S
+    // (the confirmed sender) is neither X nor R1, the two panes THIS call
+    // names.
+    let (reg, _d) = test_registry();
+    let g1 = reg.create_group("C:/tmp/repo-s", rails()).unwrap();
+    let g2 = reg.create_group("C:/tmp/repo-r1", rails()).unwrap();
+    let g3 = reg.create_group("C:/tmp/repo-x", rails()).unwrap();
+    let s = reg.spawn_agent(&g1.id, Role::Worker, "s", "t", false, None).unwrap();
+    let r1 = reg.spawn_agent(&g2.id, Role::Worker, "r1", "t", false, None).unwrap();
+    let x = reg.spawn_agent(&g3.id, Role::Worker, "x", "t", false, None).unwrap();
+
+    reg.connect_agents(&g1.id, &s.id, &g2.id, &r1.id, &s.id).unwrap();
+
+    // Arm X, complete on R1 (the receiver) — exactly the UI's
+    // `channelConnect(from=X, to=R1, senderAgent=S)` call.
+    let joined = reg
+        .connect_agents(&g3.id, &x.id, &g2.id, &r1.id, &s.id)
+        .unwrap_or_else(|e| panic!("join completing on a receiver pane must succeed, got: {e}"));
+    assert_eq!(joined["sender"], json!(s.id), "the existing sender must be unchanged by the join");
+    let members: Vec<String> = joined["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["agent_id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(members.len(), 3, "got: {members:?}");
+    assert!(members.contains(&x.id), "the newcomer must have joined, got: {members:?}");
+
+    // X joined as a RECEIVER — it holds no reply credit yet.
+    let cx = reg.resolve_token(&x.token).unwrap();
+    let err = channel_send(&reg, &cx, "hi").unwrap_err();
+    assert!(err.contains("only reply after the sender"), "got: {err}");
+}
+
+#[test]
+fn a_join_can_never_reassign_an_existing_channels_sender() {
+    // B4's invariant, stated as its own test: whatever `sender_agent` a join
+    // names, if it doesn't match the channel's ACTUAL current sender, the
+    // join is rejected outright — never silently reassigns, and never
+    // partially applies.
+    let (reg, _d) = test_registry();
+    let g1 = reg.create_group("C:/tmp/repo-s", rails()).unwrap();
+    let g2 = reg.create_group("C:/tmp/repo-r1", rails()).unwrap();
+    let g3 = reg.create_group("C:/tmp/repo-x", rails()).unwrap();
+    let s = reg.spawn_agent(&g1.id, Role::Worker, "s", "t", false, None).unwrap();
+    let r1 = reg.spawn_agent(&g2.id, Role::Worker, "r1", "t", false, None).unwrap();
+    let x = reg.spawn_agent(&g3.id, Role::Worker, "x", "t", false, None).unwrap();
+    reg.connect_agents(&g1.id, &s.id, &g2.id, &r1.id, &s.id).unwrap();
+
+    // Naming the newcomer itself as sender on a join must fail — a newcomer
+    // can only ever join as a receiver (B4).
+    let err = reg.connect_agents(&g3.id, &x.id, &g2.id, &r1.id, &x.id).unwrap_err();
+    assert!(err.contains("already has a sender"), "got: {err}");
+
+    // Naming the receiver R1 (a member, but not the sender) must also fail.
+    let err2 = reg.connect_agents(&g3.id, &x.id, &g2.id, &r1.id, &r1.id).unwrap_err();
+    assert!(err2.contains("already has a sender"), "got: {err2}");
+
+    // Neither rejected attempt changed anything: still a 2-member channel,
+    // sender still S, X still unconnected.
+    assert_eq!(reg.channel_for_pane(&g1.id, &s.id)["members"].as_array().unwrap().len(), 2);
+    assert_eq!(reg.channel_for_pane(&g1.id, &s.id)["sender"], json!(s.id));
+    assert!(reg.channel_for_pane(&g3.id, &x.id).is_null());
+}
+
+#[test]
+fn set_sender_swaps_clears_credits_and_is_audited_in_every_member_group() {
+    let (reg, _d, g1, g2, c1, c2) = two_group_setup();
+    let ch = reg.connect_agents(&g1, &c1.agent_id, &g2, &c2.agent_id, &c1.agent_id).unwrap();
+    let chan_id = ch["id"].as_str().unwrap().to_string();
+
+    // c1 (sender) messages c2, granting it a reply credit.
+    channel_send(&reg, &c1, "hi").unwrap();
+    assert_eq!(channel_status(&reg, &c2)["can_send"], json!(true));
+
+    let swapped = reg.set_sender(&chan_id, &c2.agent_id).unwrap();
+    assert_eq!(swapped["sender"], json!(c2.agent_id));
+
+    // c1 is now a plain receiver with no credit yet — the swap must have
+    // cleared it, not carried it over.
+    assert_eq!(channel_status(&reg, &c1)["can_send"], json!(false));
+    let err = channel_send(&reg, &c1, "wait, what?").unwrap_err();
+    assert!(err.contains("only reply after the sender"), "got: {err}");
+
+    for g in [&g1, &g2] {
+        assert!(reg.audit_log(g).iter().any(|e| e.action == "channel-direction"
+            && e.detail["from_sender"] == json!(c1.agent_id)
+            && e.detail["to_sender"] == json!(c2.agent_id)));
+    }
+}
+
+#[test]
+fn set_sender_rejects_a_delivery_only_candidate_and_leaves_the_sender_unchanged() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let prepared = reg.solo_prepare("codex", "C:/tmp/solo", "solo").unwrap();
+    let solo_id = prepared["agent_id"].as_str().unwrap().to_string();
+    reg.solo_bind(&solo_id, 802).unwrap();
+    let ch = reg.connect_agents(&g.id, &w.id, SOLO_GROUP, &solo_id, &w.id).unwrap();
+    let chan_id = ch["id"].as_str().unwrap().to_string();
+
+    let err = reg.set_sender(&chan_id, &solo_id).unwrap_err();
+    assert!(err.contains("no token"), "got: {err}");
+    assert_eq!(
+        reg.channel_for_pane(&g.id, &w.id)["sender"],
+        json!(w.id),
+        "sender must be unchanged after a rejected swap"
+    );
+}
+
+#[test]
+fn disconnecting_the_sender_of_a_three_member_channel_closes_it_for_everyone() {
+    // Additive to #285: losing the hub of a star topology leaves receivers
+    // that can never initiate and can never reach each other (B4) — as dead
+    // as a 1-member channel, even though membership never drops below 2.
+    let (reg, _d) = test_registry();
+    let g1 = reg.create_group("C:/tmp/repo-a", rails()).unwrap();
+    let g2 = reg.create_group("C:/tmp/repo-b", rails()).unwrap();
+    let g3 = reg.create_group("C:/tmp/repo-c", rails()).unwrap();
+    let sender = reg.spawn_agent(&g1.id, Role::Worker, "s", "t", false, None).unwrap();
+    let r1 = reg.spawn_agent(&g2.id, Role::Worker, "r1", "t", false, None).unwrap();
+    let r2 = reg.spawn_agent(&g3.id, Role::Worker, "r2", "t", false, None).unwrap();
+    reg.connect_agents(&g1.id, &sender.id, &g2.id, &r1.id, &sender.id).unwrap();
+    reg.connect_agents(&g1.id, &sender.id, &g3.id, &r2.id, &sender.id).unwrap();
+
+    let result = reg.disconnect_agent(&g1.id, &sender.id).unwrap();
+    assert_eq!(result["closed"], json!(true), "losing the sender must close the channel even with 2 receivers left");
+    assert!(reg.channel_for_pane(&g2.id, &r1.id).is_null());
+    assert!(reg.channel_for_pane(&g3.id, &r2.id).is_null());
+    assert!(reg.audit_log(&g2.id).iter().any(|e| e.action == "channel-disconnect"));
+    assert!(reg.audit_log(&g3.id).iter().any(|e| e.action == "channel-disconnect"));
+}
+
+#[test]
+fn mark_dead_of_a_solo_pane_tears_the_channel_down_via_the_pty_exit_path() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let cw = reg.resolve_token(&w.token).unwrap();
+    let (solo_id, _token) = spawn_solo(&reg, "claude", 901);
+    reg.connect_agents(&g.id, &w.id, SOLO_GROUP, &solo_id, &w.id).unwrap();
+
+    // `mark_dead` is what the real `by_pty -> mark_dead` pty-exit path funnels
+    // into (constraint 3: no real pty exit to trigger here).
+    reg.mark_dead(&solo_id, None);
+    assert_eq!(channel_status(&reg, &cw)["connected"], json!(false));
+    assert!(reg.audit_log(&g.id).iter().any(|e| e.action == "channel-disconnect"));
 }

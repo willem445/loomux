@@ -100,6 +100,10 @@ export function summarize(e: AuditEntry): string {
           : `${remainingNum} member${remainingNum === 1 ? "" : "s"} remaining`;
       return `${str(d.agent) ?? "?"} disconnected from channel ${str(d.channel_id) ?? "?"} — ${note}`;
     }
+    // Human-only sender swap (#271 W3 addendum, part B5) — same actor convention as
+    // channel-connect/-disconnect above ("human").
+    case "channel-direction":
+      return `channel ${str(d.channel_id) ?? "?"}: sender changed from ${str(d.from_sender) ?? "?"} to ${str(d.to_sender) ?? "?"}`;
     default: {
       const compact = JSON.stringify(e.detail ?? {});
       return compact === "{}" || compact === "null"

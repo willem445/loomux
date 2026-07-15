@@ -24,6 +24,7 @@ const KEY_DEFAULT = "loomux.defaultAgent";
 const KEY_CUSTOM = "loomux.customAgentCommand";
 const KEY_REPOS = "loomux.recentRepos";
 const KEY_AUTOPILOT = "loomux.singlePaneAutopilot";
+const KEY_CHANNEL_TOOLS = "loomux.soloChannelTools";
 const MAX_RECENT_REPOS = 8;
 
 // One-time cleanup (#194): the removed agents-mode toggle left this key behind in
@@ -47,6 +48,27 @@ export const autopilotFromStored = (v: string | null): boolean => v !== "0";
 export const getAutopilot = (): boolean => autopilotFromStored(localStorage.getItem(KEY_AUTOPILOT));
 export const setAutopilot = (on: boolean): void =>
   localStorage.setItem(KEY_AUTOPILOT, on ? "1" : "0");
+
+/** Interpret a persisted channel-tools value. Default ON, same shape as
+ *  `autopilotFromStored` — see `getChannelTools`. */
+export const channelToolsFromStored = (v: string | null): boolean => v !== "0";
+
+/** Standalone channel tools toggle (#271 W3 addendum, part A2 / PR #289
+ *  review round 2, N1): whether launching a claude/copilot Agent pane
+ *  eagerly mints it a channel-scoped MCP token (`orch_solo_prepare`) so it's
+ *  a full member from the moment it boots. Defaults ON — the addendum's
+ *  stated contract is "claude/copilot = full membership at spawn," and an
+ *  eagerly-minted token confers no group-scoped power (Role::Solo's
+ *  two-tool surface, independently re-verified in review). Turning it OFF
+ *  trades that zero-friction default for a smaller live-token surface: a
+ *  pane launched with it off starts with no channel identity at all and
+ *  becomes a **delivery-only** member on its first Connect gesture instead
+ *  (the same adopt-on-connect path every other CLI already uses) — never a
+ *  prompt at launch or mid-connect either way, just a persisted preference,
+ *  like autopilot above. */
+export const getChannelTools = (): boolean => channelToolsFromStored(localStorage.getItem(KEY_CHANNEL_TOOLS));
+export const setChannelTools = (on: boolean): void =>
+  localStorage.setItem(KEY_CHANNEL_TOOLS, on ? "1" : "0");
 
 /** The agent preselected in the launcher; updated on every launch. */
 export function getDefaultAgent(): AgentDef {

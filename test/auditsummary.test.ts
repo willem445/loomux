@@ -144,3 +144,10 @@ test("channel-disconnect uses singular wording for exactly one member remaining"
   // remaining.len() < 2`), so this reads as "closed", not "1 member remaining".
   assert.equal(s, "w-1 disconnected from channel chan-3 — channel closed");
 });
+
+test("channel-direction (#271 W3 addendum) names the channel and the sender swap, exactly", () => {
+  const s = summarize(
+    entry("channel-direction", { channel_id: "chan-3", from_sender: "w-1", to_sender: "rev-2" }, "human")
+  );
+  assert.equal(s, "channel chan-3: sender changed from w-1 to rev-2");
+});
