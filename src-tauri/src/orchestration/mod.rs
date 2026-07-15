@@ -902,24 +902,18 @@ pub fn guarded_shim_programs(classes: &[workflow::ResourceClass]) -> Vec<String>
 ///
 /// **PID liveness on the Windows/Git-Bash baseline**: `$$` inside this shim is
 /// the MSYS runtime's own pid, not necessarily what `tasklist` shows — the
-/// concern the #318 orchestrator flagged explicitly, and it turned out to
-/// matter: a first version of this shim trusted plain `kill -0`/`/proc/<pid>`
-/// (an MSYS-pid-only check) and the hard-kill reap test
-/// (`a_hard_killed_holder_leaks_no_slot_the_reaper_reclaims_it`,
-/// `tests/orchestration.rs`) FAILED for real on `windows-latest` CI — the
-/// reaper never observed the kill. `loomux_pid_alive` now maps the recorded
-/// MSYS pid to its real Windows PID via `/proc/<pid>/winpid` (a standard
-/// Cygwin/MSYS pseudo-file) and asks `tasklist` directly — the OS process
-/// table, not MSYS's own bookkeeping, which is built for MSYS-native signal
-/// delivery and evidently does not reliably observe a death that bypassed it
-/// entirely (an external job-object `TerminateProcess`, exactly what a hard
-/// pane kill is). Manually verified on this machine (not `cargo test`, per
-/// standing policy — a raw shell experiment: spawn via Git Bash, kill via
-/// `taskkill /F /PID <winpid>`, confirm an unrelated `sh` process's `tasklist`
-/// check and its `kill -0`/`/proc` both correctly flip to "dead" afterward)
-/// before landing here; the CI run on this commit is the platform-authoritative
-/// proof. `/proc/<pid>` existence (Linux; MSYS2 also exposes a `/proc` view)
-/// is the fallback when no winpid mapping exists, then `kill -0` everywhere
+/// concern the #318 orchestrator flagged explicitly. `loomux_pid_alive` maps
+/// the recorded MSYS pid to its real Windows PID via `/proc/<pid>/winpid` (a
+/// standard Cygwin/MSYS pseudo-file) and asks `tasklist` directly — the OS
+/// process table, rather than trusting MSYS's own signal-delivery bookkeeping
+/// to reflect a death that bypassed it entirely (an external job-object
+/// `TerminateProcess`, exactly what a hard pane kill is). Manually verified on
+/// this machine (not `cargo test`, per standing policy — a raw shell
+/// experiment: spawn via Git Bash, kill via `taskkill /F /PID <winpid>`,
+/// confirm an unrelated `sh` process's `tasklist` check and its
+/// `kill -0`/`/proc` both correctly flip to "dead" afterward). `/proc/<pid>`
+/// existence (Linux; MSYS2 also exposes a `/proc` view) is the fallback when
+/// no winpid mapping exists, then `kill -0` everywhere
 /// else (notably macOS, which has no `/proc`).
 #[doc(hidden)] // pub so the integration test can pin the shim
 pub fn guard_shim_sh(program: &str, real: &str) -> String {
@@ -1055,27 +1049,12 @@ loomux_pid_alive() {
       ''|*[!0-9]*) : ;;
       *)
         if command -v tasklist >/dev/null 2>&1; then
-          if tasklist //FI "PID eq $wp" 2>/dev/null | grep -q "[^0-9]$wp[^0-9]"; then
-            [ -n "$LOOMUX_TEST_DEBUG" ] && echo "loomux_pid_alive($p): proc-exists, winpid=$wp, tasklist=ALIVE" >&2
-            return 0
-          else
-            [ -n "$LOOMUX_TEST_DEBUG" ] && echo "loomux_pid_alive($p): proc-exists, winpid=$wp, tasklist=DEAD" >&2
-            return 1
-          fi
+          tasklist //FI "PID eq $wp" 2>/dev/null | grep -q "[^0-9]$wp[^0-9]" && return 0 || return 1
         fi ;;
     esac
   fi
-  if [ -d "/proc/$p" ]; then
-    [ -n "$LOOMUX_TEST_DEBUG" ] && echo "loomux_pid_alive($p): no winpid mapping, /proc/$p exists -> ALIVE" >&2
-    return 0
-  fi
-  if kill -0 "$p" 2>/dev/null; then
-    [ -n "$LOOMUX_TEST_DEBUG" ] && echo "loomux_pid_alive($p): fallback kill -0 -> ALIVE" >&2
-    return 0
-  else
-    [ -n "$LOOMUX_TEST_DEBUG" ] && echo "loomux_pid_alive($p): fallback kill -0 -> DEAD" >&2
-    return 1
-  fi
+  [ -d "/proc/$p" ] && return 0
+  kill -0 "$p" 2>/dev/null
 }
 
 SLOT_PATH=""
@@ -1084,43 +1063,29 @@ loomux_try_acquire() {
   while [ "$i" -le "$MATCH_N" ]; do
     cand="$slot_root/slot.$i"
     if mkdir "$cand" 2>/dev/null; then
-      [ -n "$LOOMUX_TEST_DEBUG" ] && echo "loomux_try_acquire: fresh mkdir $cand OK" >&2
       printf '%s\n' "$$" > "$cand/pid" 2>/dev/null || true
       SLOT_PATH="$cand"
       return 0
     fi
-    [ -n "$LOOMUX_TEST_DEBUG" ] && echo "loomux_try_acquire: mkdir $cand busy, checking holder pid" >&2
     # Occupied — reap if the recorded holder's pid is dead (a slot orphaned by
     # a hard kill: mkdir claims do not self-release the way an flock'd fd
     # would). RENAME the stale dir out of the way rather than `rm -rf` then
-    # `mkdir` the SAME name back — observed on windows-latest CI: recreating a
-    # directory immediately under a name just deleted can stay refused for
-    # several seconds (NTFS/AV settling), which silently starved this branch
-    # (mkdir kept failing until a LATER, unrelated top-of-loop `mkdir` call —
-    # once the delete finally settled — claimed the now-empty name without
-    # ever going through this reap branch, so it ran un-audited). `mv` is a
-    # rename, not a delete+recreate, so the fresh `mkdir` below targets a name
-    # that was never itself just removed. It also makes the reap itself an
-    # atomic claim: only one racing contender's `mv` can succeed.
+    # `mkdir` the SAME name back — a delete-then-recreate-same-name can stay
+    # transiently refused on some filesystems; `mv` is a rename, so the fresh
+    # `mkdir` below targets a name that was never itself just removed. It also
+    # makes the reap itself an atomic claim: only one racing contender's `mv`
+    # of a given source can succeed.
     hp=$(cat "$cand/pid" 2>/dev/null)
-    [ -n "$LOOMUX_TEST_DEBUG" ] && echo "loomux_try_acquire: holder pid file says hp=[$hp]" >&2
     if [ -n "$hp" ] && ! loomux_pid_alive "$hp"; then
-      [ -n "$LOOMUX_TEST_DEBUG" ] && echo "loomux_try_acquire: hp=$hp is DEAD, attempting reap" >&2
       stale="$cand.stale.$$"
       if mv "$cand" "$stale" 2>/dev/null; then
-        [ -n "$LOOMUX_TEST_DEBUG" ] && echo "loomux_try_acquire: mv $cand -> $stale OK" >&2
         rm -rf "$stale" 2>/dev/null &
         if mkdir "$cand" 2>/dev/null; then
-          [ -n "$LOOMUX_TEST_DEBUG" ] && echo "loomux_try_acquire: reap mkdir $cand OK" >&2
           printf '%s\n' "$$" > "$cand/pid" 2>/dev/null || true
           SLOT_PATH="$cand"
           loomux_audit "resource-guard-reaped" "{\"class\":\"$MATCH_CLASS\",\"slot\":$i,\"stale_pid\":\"$hp\"}"
           return 0
-        else
-          [ -n "$LOOMUX_TEST_DEBUG" ] && echo "loomux_try_acquire: reap mkdir $cand FAILED after successful mv" >&2
         fi
-      else
-        [ -n "$LOOMUX_TEST_DEBUG" ] && echo "loomux_try_acquire: mv $cand -> $stale FAILED" >&2
       fi
     fi
     i=$((i + 1))

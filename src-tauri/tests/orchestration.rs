@@ -8664,16 +8664,6 @@ fn write_fake_and_shim(fake_path: &Path, body: &str, shim_path: &Path, program: 
         .status();
 }
 
-/// Poll for `path` to exist, up to `timeout`. Panics on timeout — used to wait
-/// for a fake command's "I started running" marker without a fixed sleep.
-fn wait_for_file(path: &Path, timeout: Duration) {
-    let start = std::time::Instant::now();
-    while !path.is_file() {
-        assert!(start.elapsed() < timeout, "timed out waiting for {}", path.display());
-        std::thread::sleep(Duration::from_millis(50));
-    }
-}
-
 /// A one-class, one-command compiled spec, written the same way
 /// `sync_resource_guards` writes it (through the real `resource_guard_file_text`,
 /// not a hand-rolled string) — so a format drift there would show up here too.
@@ -8931,81 +8921,69 @@ fn a_queued_caller_fails_open_on_timeout_and_audits_it() {
 }
 
 #[test]
-fn a_hard_killed_holder_leaks_no_slot_the_reaper_reclaims_it() {
+fn a_stale_slot_from_a_dead_pid_is_reaped_and_acquired() {
     // The red-before-green anchor (#318 brief): on a naive counter/trap-only
-    // scheme this test fails (the slot leaks forever on -9 / TerminateProcess).
+    // scheme this test fails (the slot leaks forever once its holder is gone).
+    //
+    // This deliberately does NOT hard-kill a real holder process. An earlier
+    // version did (spawn a holder, `Child::kill()` it, spawn a second caller,
+    // assert it reaps) and it was unreliable on windows-latest CI: Rust's
+    // `Child::kill()` on Windows is `TerminateProcess` on the DIRECT child
+    // only — the shim process dies, but the fake guarded command it had
+    // already spawned as ITS OWN child (a separate process) is not part of
+    // that kill, survives as an orphan, and exits naturally on its own
+    // schedule. So the "leaked slot held by a dead pid" condition this test
+    // needs never reliably existed to begin with — no amount of hardening the
+    // reap mechanism itself could fix a test that wasn't creating the
+    // condition it asserted. (A real pane hard-kill DOES tear down the whole
+    // process tree via a Windows job object — see
+    // `doc/design/job-object-teardown.md` — so the shim's reap logic is
+    // exercised for real there; it just can't be constructed this way in a
+    // portable, deterministic integration test.)
+    //
+    // Instead: fabricate the stale slot directly. `mkdir` it, run a trivial
+    // throwaway process to completion (via the exact same `printf '%s' "$$"`
+    // idiom the shim itself uses, so the recorded pid has the same shape a
+    // real holder would leave — an MSYS pid on Windows, a native pid
+    // elsewhere) so its pid is GUARANTEED dead by the time we look at it, and
+    // record that pid as the slot's holder. Then run ONE guarded acquirer and
+    // assert it reaps the stale slot and acquires. This exercises the reap
+    // path exactly, with zero kill-timing or process-tree dependence,
+    // identically on every platform.
     if !have_sh() {
-        eprintln!("SKIP a_hard_killed_holder_leaks_no_slot_the_reaper_reclaims_it: no POSIX sh");
+        eprintln!("SKIP a_stale_slot_from_a_dead_pid_is_reaped_and_acquired: no POSIX sh");
         return;
     }
     let td = tempfile::tempdir().unwrap();
     let root = td.path();
     let group_dir = root.join("group");
     fs::create_dir_all(&group_dir).unwrap();
-    let markers = root.join("markers");
-    fs::create_dir_all(&markers).unwrap();
+    let ran = root.join("ran");
     let fake = root.join("fakebuild");
     let shim = root.join("build");
-    // $1 is always "go" (the matched positional); $2 ("holder"/"second") names
-    // the marker so the two callers are distinguishable. Touches the marker
-    // immediately, then sleeps — long enough to hard-kill mid-hold, short
-    // enough not to linger past the test.
-    write_fake_and_shim(
-        &fake,
-        &format!(
-            "#!/bin/sh\nprintf '%s' \"$$\" > \"{m}/$2.realpid\"\n: > \"{m}/$2.started\"\nsleep 5\nexit 0\n",
-            m = markers.display()
-        ),
-        &shim,
-        "build",
-    );
+    write_fake_and_shim(&fake, &format!("#!/bin/sh\n: > \"{}\"\nexit 0\n", ran.display()), &shim, "build");
     write_guard_spec(&group_dir, "heavy-build", 1, 5, "build", &["go"]);
 
-    let mut holder = std::process::Command::new("sh")
+    let slot_dir = group_dir.join("resource_slots").join("heavy-build").join("slot.1");
+    fs::create_dir_all(&slot_dir).unwrap();
+    let pid_file = slot_dir.join("pid");
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("printf '%s' \"$$\" > '{}'", pid_file.display()))
+        .status()
+        .unwrap();
+    assert!(status.success(), "the throwaway pid-recording process must exit cleanly first");
+    // `status()` already blocked until that process fully exited — its pid,
+    // now sitting in the slot's pid file, is definitely dead.
+
+    let out = std::process::Command::new("sh")
         .arg(&shim)
         .arg("go")
-        .arg("holder")
         .env("LOOMUX_GROUP_DIR", &group_dir)
-        .env("LOOMUX_TEST_DEBUG", "1") // TEMP: diagnosing a Windows-CI-only reap delay; strip before merge
-        .spawn()
+        .output()
         .unwrap();
-    // A generous bound: a cold sh.exe spawn under loaded CI (many parallel
-    // test-threads each spawning their own shims) can take real wall-clock
-    // time that a fixed-cargo-build-worth-of-headroom accounts for; this is
-    // proving out a reaper, not a latency budget.
-    wait_for_file(&markers.join("holder.started"), Duration::from_secs(20));
-    let slot = group_dir.join("resource_slots").join("heavy-build").join("slot.1");
-    assert!(slot.is_dir(), "the holder must have actually acquired the (only) slot");
-    // TEMP diagnostic: does the pid THIS RUST PROCESS spawned (and is about to
-    // kill) match what the shim itself recorded as its own "$$" AND the "$$"
-    // seen by the fake-build script it then ran (a SEPARATE child process)?
-    eprintln!(
-        "DEBUG rust holder.id()={} shim_recorded_pid={:?} fakebuild_own_pid={:?}",
-        holder.id(),
-        fs::read_to_string(slot.join("pid")),
-        fs::read_to_string(markers.join("holder.realpid")),
-    );
-
-    // Hard kill: SIGKILL on unix, TerminateProcess on Windows — the shim's
-    // `trap … EXIT INT TERM HUP` CANNOT run for either.
-    holder.kill().expect("hard-kill the holder");
-    let _ = holder.wait(); // reap it — also makes its death observable to the reaper
-    eprintln!("DEBUG rust holder.wait() completed at {:?}", std::time::Instant::now());
-
-    let second = std::process::Command::new("sh")
-        .arg(&shim)
-        .arg("go")
-        .arg("second")
-        .env("LOOMUX_GROUP_DIR", &group_dir)
-        .env("LOOMUX_TEST_DEBUG", "1") // TEMP: diagnosing a Windows-CI-only reap delay; strip before merge
-        .spawn()
-        .unwrap();
-    wait_for_file(&markers.join("second.started"), Duration::from_secs(20));
-    // `second` is now itself holding the reclaimed slot mid-sleep — kill it too
-    // rather than waiting out its sleep; the assertions below don't need it to finish.
-    let mut second = second;
-    let _ = second.kill();
-    let _ = second.wait();
+    assert!(out.status.success(), "must reap the stale slot and acquire, not error");
+    assert!(ran.is_file(), "and actually run the real guarded command");
 
     let audit = fs::read_to_string(group_dir.join("audit.jsonl")).unwrap_or_default();
     assert!(audit.contains("resource-guard-reaped"), "the reap must be audited: {audit}");
