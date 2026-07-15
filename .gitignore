@@ -1,10 +1,6 @@
 node_modules/
 dist/
 src-tauri/target/
-# Shared cargo build cache for agent worktrees (#134): CARGO_TARGET_DIR points
-# every git-worktree pane here so they dedup one build cache instead of each
-# growing its own 5–7 GB target/. Lives at the main repo root.
-.loomux-target/
 src-tauri/gen/schemas/
 *.log
 .claude/worktrees/

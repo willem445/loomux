@@ -200,8 +200,8 @@ directly for connect/disconnect (Tauri-command-backed, exactly like `pause_group
 mirrors how `notify.rs`'s notice-text functions are unit tested. The sanitization pin was
 mutation-verified by hand (temporarily bypassing `sanitize_gh_text` in `channel_send` and
 confirming the hostile-payload test fails for the expected reason) under an isolated
-`CARGO_TARGET_DIR`, so it never shares — or corrupts — the shared incremental build other
-concurrent workers in this repo's worktrees use.
+`CARGO_TARGET_DIR`, so it never collides with concurrent workers' own builds in this repo's
+worktrees.
 
 ## Known interactions (stated, not fixed here)
 
