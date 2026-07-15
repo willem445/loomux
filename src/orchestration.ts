@@ -685,13 +685,30 @@ async function hydratePaneChannel(pane: Pane, group: string, agentId: string): P
   }
 }
 
-/** A recorded session's orchestration identity (backend roster). */
+/** A recorded session's orchestration identity (backend roster). Fields
+ *  below `group_live` are #1's session-browser metadata — absent/empty on a
+ *  roster row that predates them, never fabricated (see sessions.ts). */
 export interface SessionRoleInfo {
   session_id: string;
   group_id: string;
   role: string;
   agent_name: string;
   group_live: boolean;
+  /** The task/brief this agent was spawned or resumed with — doubles as its
+   *  "description/goal" (#1). Empty for a legacy row or the orchestrator
+   *  (which has no assigned task). */
+  task: string;
+  /** The git branch this agent's work is associated with, when it has one.
+   *  `null` for the orchestrator, a reviewer with no worktree, or a legacy
+   *  row loomux can't attribute a branch to safely. */
+  branch: string | null;
+  /** The group's repo path, resolved from its group.json. `null` only if
+   *  that file is unreadable. */
+  repo: string | null;
+  /** The PR this agent's work is now attached to, per the task board —
+   *  resolved live, so it can be set well after this session ended. `null`
+   *  when no board task references this session (yet). */
+  pr: string | null;
 }
 
 export const orchSessionRoles = (): Promise<SessionRoleInfo[]> =>

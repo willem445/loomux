@@ -2724,6 +2724,12 @@ pub struct AgentEntry {
     /// Working directory the pane runs in; resume must reuse it so the
     /// resumed session's file operations land where the work happened.
     pub cwd: String,
+    /// The git branch this agent's work is actually associated with (#1):
+    /// `Some` for a dedicated worktree spawn and for a shared-repo Worker
+    /// told to create it, `None` for the orchestrator/reviewer(no worktree)/
+    /// planner, none of which have a "their own branch" the way a Worker
+    /// does. Persisted so the session browser can show it without guessing.
+    pub branch: Option<String>,
     /// Unix-ms this worker/reviewer became idle (spawned without a task, or
     /// reported done/blocked); `None` while it has work or for the
     /// orchestrator. The idle reaper (`idle_kill_minutes`) reads this.
@@ -2996,6 +3002,19 @@ pub struct AgentRecord {
     pub cwd: String,
     pub status: String,
     pub updated_ms: u64,
+    /// The task/brief text this agent was spawned or resumed with (#1,
+    /// session browser metadata — doubles as the session's "description/goal"
+    /// the human sees, since loomux does not track those as separate fields
+    /// from the assigned work). Additive: a roster row written before this
+    /// field existed deserializes to empty, which the browser renders as "no
+    /// recorded task" rather than fabricating one.
+    #[serde(default)]
+    pub task: String,
+    /// The git branch this agent's work is associated with, when it has one
+    /// (#1). See `AgentEntry::branch` for exactly when this is `Some`.
+    /// Additive: absent on a pre-#1 roster row.
+    #[serde(default)]
+    pub branch: Option<String>,
 }
 
 /// Durable per-agent usage snapshot (`usage.json` per group). Keyed by the CLI
@@ -3037,6 +3056,30 @@ pub struct SessionRole {
     pub agent_name: String,
     /// Whether that group currently has live agents in this app instance.
     pub group_live: bool,
+    /// The task/brief this agent was spawned or resumed with (#1). Empty for
+    /// a roster row predating the field, or an orchestrator (which has none)
+    /// — the browser shows "no recorded task" rather than fabricating one.
+    #[serde(default)]
+    pub task: String,
+    /// The git branch this agent's work is associated with, when it has one
+    /// (#1). See `AgentEntry::branch`.
+    #[serde(default)]
+    pub branch: Option<String>,
+    /// The group's repo path (#1), resolved from `group.json`. `None` only
+    /// when that file is missing/unreadable — session_roles already requires
+    /// it to exist to enumerate the group at all, so this is normally always
+    /// `Some`; kept `Option` rather than an empty-string default so the
+    /// browser can tell "unknown" from "repo is an empty string" (never
+    /// actually reachable, but honest about what a read failure means).
+    #[serde(default)]
+    pub repo: Option<String>,
+    /// The PR this agent's work is now attached to, when the task board
+    /// records one for a task carrying this session (#1) — resolved live at
+    /// read time (not persisted on the roster row) so it reflects the PR's
+    /// CURRENT value even after the session itself has ended. `None` when no
+    /// board task references this session, or it has no `pr` set yet.
+    #[serde(default)]
+    pub pr: Option<String>,
 }
 
 /// Identity resolved from an MCP request's token header.
@@ -5277,6 +5320,8 @@ impl OrchRegistry {
             cwd: entry.cwd.clone(),
             status: status.to_string(),
             updated_ms: now_ms(),
+            task: entry.task.clone(),
+            branch: entry.branch.clone(),
         };
         // Match by (id, session): agent ids restart at 1 every app run, so
         // a bare-id match would overwrite a previous run's record and lose
@@ -5410,6 +5455,17 @@ impl OrchRegistry {
             let d = &v["detail"];
             let Some(session) = d["session"].as_str() else { continue };
             let role = d["role"].as_str().unwrap_or("worker").to_string();
+            // Mirror `spawn_agent_ex`'s persisted_branch rule (#1): the spawn
+            // audit always records a `branch` value (even a fallback name for
+            // roles that never use one), so only trust it where that role
+            // could actually have a real branch — a worker (worktree or
+            // shared-repo), or a reviewer that got a worktree.
+            let worktree = d["worktree"].as_bool().unwrap_or(false);
+            let branch = (role == "worker" || (role == "reviewer" && worktree))
+                .then(|| d["branch"].as_str())
+                .flatten()
+                .map(String::from);
+            let task = d["task"].as_str().unwrap_or("").to_string();
             let record = AgentRecord {
                 id: d["agent"].as_str().unwrap_or("").to_string(),
                 name: d["name"]
@@ -5429,6 +5485,8 @@ impl OrchRegistry {
                 // The audit alone can't tell liveness; group_live covers it.
                 status: "unknown".into(),
                 updated_ms: v["ts_ms"].as_u64().unwrap_or(0),
+                task,
+                branch,
             };
             match out.iter_mut().find(|r| r.id == record.id && r.session == record.session) {
                 Some(r) => *r = record,
@@ -5467,14 +5525,30 @@ impl OrchRegistry {
                 continue;
             }
             let live = self.group_is_live(&group_id);
+            // Resolved once per group (#1), not per session: the repo for the
+            // "repo/branch" identity, and the board's session→pr map so a PR
+            // set AFTER a session ended (or by a different agent entirely)
+            // still surfaces against it. Best-effort — an unreadable
+            // group.json degrades to `repo: None`, never a fabricated guess.
+            let repo = self.load_group_file(&group_id).map(|(repo, _)| repo);
+            let pr_by_session: HashMap<String, String> = self
+                .tasks(&group_id)
+                .into_iter()
+                .filter_map(|t| Some((t.session?, t.pr?)))
+                .collect();
             for r in self.merged_records(&group_id) {
                 if let Some(session) = r.session {
+                    let pr = pr_by_session.get(&session).cloned();
                     out.push(SessionRole {
                         session_id: session,
                         group_id: group_id.clone(),
                         role: r.role,
                         agent_name: r.name,
                         group_live: live,
+                        task: r.task,
+                        branch: r.branch,
+                        repo: repo.clone(),
+                        pr,
                     });
                 }
             }
@@ -7334,6 +7408,7 @@ impl OrchRegistry {
             task: String::new(),
             session_id: None,
             cwd: cwd.to_string(),
+            branch: None, // solo panes aren't part of the multi-agent worktree/branch model
             idle_since_ms: None,
             started_ms: now_ms(),
             last_progress_ms: now_ms(),
@@ -7409,6 +7484,7 @@ impl OrchRegistry {
             task: String::new(),
             session_id: None,
             cwd: cwd.to_string(),
+            branch: None, // solo panes aren't part of the multi-agent worktree/branch model
             idle_since_ms: None,
             started_ms: now_ms(),
             last_progress_ms: now_ms(),
@@ -10901,32 +10977,40 @@ impl OrchRegistry {
         // the audit record (#204).
         let base = base.map(|b| b.trim().to_string()).filter(|b| !b.is_empty());
         let cwd_override = cwd_override.map(|c| c.trim().to_string()).filter(|c| !c.is_empty());
-        let (cwd, branch_note) = if let Some(c) = cwd_override {
+        // The third element is the branch to PERSIST on the entry (#1, session
+        // browser metadata): `Some` only where `branch_name` is an actual
+        // commitment this agent is working against — a cut worktree, or a
+        // shared-repo Worker explicitly told to create it — `None` for the
+        // orchestrator/reviewer(no worktree)/planner, which never have "their
+        // own branch" the way a Worker does (showing `branch_name`'s
+        // `agent/<id>` fallback for those would be a fabricated detail, not a
+        // recorded fact).
+        let (cwd, branch_note, persisted_branch) = if let Some(c) = cwd_override {
             if !Path::new(&c).is_dir() {
                 return Err(format!("cwd does not exist: {c}"));
             }
-            (c, String::new())
+            (c, String::new(), None)
         } else if use_worktree && role != Role::Orchestrator && role != Role::Planner {
             // Cut the branch from the default branch (or an explicit `base`),
             // never the primary checkout's incidental HEAD (#204).
             let wt = crate::git::git_worktree_add(group.repo.clone(), branch_name.clone(), base.clone())?;
             (wt.clone(), format!(
                 "Your working directory is a dedicated git worktree at {wt} already checked out on branch '{branch_name}'."
-            ))
+            ), Some(branch_name.clone()))
         } else if role == Role::Orchestrator {
-            (group.repo.clone(), String::new())
+            (group.repo.clone(), String::new(), None)
         } else if role == Role::Reviewer {
-            (group.repo.clone(), "You review; you do not create branches or push. Inspect PRs via gh (checking out the PR branch locally is fine).".to_string())
+            (group.repo.clone(), "You review; you do not create branches or push. Inspect PRs via gh (checking out the PR branch locally is fine).".to_string(), None)
         } else if role == Role::Planner {
             // Planners explore read-only in the repo itself and never branch,
             // worktree, commit, or PR — so a worktree is never created for
             // them even if `use_worktree` was set (the CLI-level write/commit
             // denials in `build_agent_command` back this note structurally).
-            (group.repo.clone(), PLANNER_READONLY_NOTE.to_string())
+            (group.repo.clone(), PLANNER_READONLY_NOTE.to_string(), None)
         } else {
             (group.repo.clone(), format!(
                 "Work in the repo itself; create branch '{branch_name}' off the default branch before changing anything. Never commit to the default branch."
-            ))
+            ), Some(branch_name.clone()))
         };
 
         if cli == "copilot" {
@@ -11001,6 +11085,7 @@ impl OrchRegistry {
             task: task.to_string(),
             session_id: session_id.clone(),
             cwd: cwd.clone(),
+            branch: persisted_branch.clone(),
             // An agent spawned without a task starts the idle clock; one
             // given work does not (the orchestrator is exempt regardless).
             idle_since_ms: (role != Role::Orchestrator && task.trim().is_empty()).then(now_ms),
@@ -12840,6 +12925,7 @@ fn register_orchestrator_pane(
         task: String::new(),
         session_id,
         cwd: group.repo.clone(),
+        branch: None, // the orchestrator works on the repo's own checkout, not a branch
         idle_since_ms: None, // the orchestrator is never idle-reaped
         started_ms: now_ms(),
         last_progress_ms: now_ms(), // watchdog ignores the orchestrator; the

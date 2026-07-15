@@ -4,6 +4,7 @@
 
 import { listSessions, type SessionInfo } from "./pty";
 import type { SessionRoleInfo } from "./orchestration";
+import { taskSummary, repoBranchLine, prLabel } from "./sessionmeta";
 
 const ROLE_CHIPS: Record<string, string> = {
   orchestrator: "ORCH",
@@ -82,12 +83,19 @@ export class SessionBrowser {
     const recorded = this.roles.get(session.id);
     if (recorded) return recorded;
     if (session.orch_role && session.orch_group) {
+      // Transcript-signature fallback (a session predating the durable
+      // roster): none of #1's metadata is derivable from the signature
+      // alone, so it's honestly absent rather than guessed.
       return {
         session_id: session.id,
         group_id: session.orch_group,
         role: session.orch_role,
         agent_name: "",
         group_live: false,
+        task: "",
+        branch: null,
+        repo: null,
+        pr: null,
       };
     }
     return undefined;
@@ -154,6 +162,38 @@ export class SessionBrowser {
         top.insertBefore(chip, title);
       }
 
+      // PR chip (#1): "when known" per the issue, so it's absent rather than
+      // blank until the board records one for this session's task.
+      const pr = prLabel(role);
+      if (pr) {
+        const prChip = document.createElement("span");
+        prChip.className = "session-badge session-pr";
+        prChip.textContent = pr;
+        prChip.title = `Pull request ${pr}`;
+        top.appendChild(prChip);
+      }
+
+      // Task/goal line (#1): the brief this session's agent was spawned or
+      // resumed with — hidden entirely rather than shown empty for a legacy
+      // session or the orchestrator (which has no assigned task).
+      const goal = taskSummary(role);
+      const goalEl = goal ? document.createElement("div") : null;
+      if (goalEl) {
+        goalEl.className = "session-goal";
+        goalEl.textContent = goal;
+        goalEl.title = goal!;
+      }
+
+      // Repo/branch identity (#1): shown only when at least one is recorded,
+      // never a fabricated placeholder for a legacy session or a role (the
+      // orchestrator) that never has a branch.
+      const identity = repoBranchLine(role);
+      const identityEl = identity ? document.createElement("div") : null;
+      if (identityEl) {
+        identityEl.className = "session-identity";
+        identityEl.textContent = identity;
+      }
+
       const meta = document.createElement("div");
       meta.className = "session-meta";
       const cwd = document.createElement("span");
@@ -164,7 +204,10 @@ export class SessionBrowser {
       when.textContent = timeAgo(s.modified_ms);
       meta.append(cwd, when);
 
-      item.append(top, meta);
+      item.append(top);
+      if (goalEl) item.append(goalEl);
+      if (identityEl) item.append(identityEl);
+      item.append(meta);
       item.addEventListener("click", () => this.onRestore(s));
       this.listEl.appendChild(item);
     }
