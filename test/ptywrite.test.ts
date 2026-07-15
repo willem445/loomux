@@ -6,6 +6,21 @@ import { createOrderedWriter, chunkForPty, PTY_WRITE_CHUNK } from "../src/ptywri
 
 const wait = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
+/** A `Promise.race` backstop against a condition-wait that could otherwise
+ *  hang forever if the condition never becomes true — not a return to
+ *  wall-clock guessing: the race still waits on the real condition first,
+ *  this just bounds how long a genuine regression gets to hang the suite
+ *  before the assertion below gets to run and fail with an actual diff
+ *  (#232 review). `cancel()` clears the underlying timer on the happy path
+ *  so a passing test doesn't hold the process open for the full `ms`.  */
+function timeoutAfter(ms: number): { promise: Promise<void>; cancel: () => void } {
+  let id: ReturnType<typeof setTimeout>;
+  const promise = new Promise<void>((r) => {
+    id = setTimeout(r, ms);
+  });
+  return { promise, cancel: () => clearTimeout(id) };
+}
+
 test("delivers writes in FIFO order even when an early send resolves last", async () => {
   const seen: string[] = [];
   const w = createOrderedWriter();
@@ -25,7 +40,11 @@ test("delivers writes in FIFO order even when an early send resolves last", asyn
   w.write("A");
   w.write("B");
   w.write("C");
-  await allDelivered;
+  // Generous (5s vs. ~36ms of real work): a dropped write now fails fast
+  // with an assertion diff instead of hanging the suite indefinitely.
+  const backstop = timeoutAfter(5000);
+  await Promise.race([allDelivered, backstop.promise]);
+  backstop.cancel();
   assert.deepEqual(seen, ["A", "B", "C"]);
 });
 
