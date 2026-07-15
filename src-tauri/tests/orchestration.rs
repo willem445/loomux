@@ -4617,6 +4617,11 @@ fn git_shim_script_bakes_real_git_and_gates_tag_push() {
     assert!(sh.contains("refs/tags/"), "detects explicit tag refs");
     assert!(sh.contains("release_grants/"), "gates on a release grant");
     assert!(sh.contains("release-gate-blocked"), "audits refusals");
+    // #315: the grant is CLAIMED (atomic mv to .claimed) before the real push
+    // runs, and SETTLED (consumed on success, restored on failure) after —
+    // not deleted up front on interception (the #256/#303 bug class).
+    assert!(sh.contains("loomux_grant_claim") && sh.contains("loomux_grant_settle"),
+        "tag-push grant uses the shared claim/settle mechanics, not burn-on-interception");
     assert!(!sh.contains("\r"), "the POSIX git shim must be LF-only");
 }
 
@@ -5094,6 +5099,87 @@ fn git_shim_harness_gates_tag_pushes() {
     // No-op while autonomous.
     std::fs::write(group.join("autonomous"), b"").unwrap();
     assert!(!run(&["push", "origin", "refs/tags/v6.0.1"], ""), "dangerous ignored while autonomous → tag push blocked");
+}
+
+/// A fake `git` whose `push` exits `$FAKE_PUSH_EXIT` (default 0/success) and
+/// whose `rev-parse` still confirms `$FAKE_TAG` as a real tag — lets a test
+/// simulate git/GitHub refusing a tag push (network, remote hook, protected
+/// ref, …) independently of the shim's tag-detection logic.
+fn write_fake_git_with_push_exit(root: &std::path::Path) -> std::path::PathBuf {
+    let p = root.join("fakegit_push_exit");
+    std::fs::write(&p,
+        "#!/bin/sh\n\
+         if [ \"$1\" = \"rev-parse\" ]; then\n\
+           for a in \"$@\"; do case \"$a\" in refs/tags/*) [ \"$a\" = \"refs/tags/$FAKE_TAG\" ] && exit 0 ;; esac; done\n\
+           exit 1\n\
+         fi\n\
+         exit \"${FAKE_PUSH_EXIT:-0}\"\n").unwrap();
+    p
+}
+
+#[test]
+fn git_shim_harness_a_tag_push_that_fails_does_not_burn_the_one_time_grant() {
+    // #315 (same bug class as #256/#303): the tag-push grant was consumed on
+    // interception, before the real `git push` ran — a push git/GitHub
+    // refuses (network, remote hook, protected ref, …) burned the one-time
+    // grant on a push that never landed, leaving the human to re-grant.
+    // Proven against the REAL generated shim: a push that exits non-zero must
+    // leave the grant usable for a retry; only a push that exits 0 may
+    // consume it.
+    use std::process::Command;
+    if Command::new("sh").arg("-c").arg("exit 0").status().map(|s| !s.success()).unwrap_or(true) {
+        eprintln!("SKIP git_shim_harness_a_tag_push_that_fails…: no POSIX sh");
+        return;
+    }
+    let td = tempfile::tempdir().unwrap();
+    let root = td.path();
+    let group = root.join("group");
+    std::fs::create_dir_all(&group).unwrap();
+    let fake = write_fake_git_with_push_exit(root);
+    let shim = root.join("git");
+    std::fs::write(&shim, git_shim_sh(&fake.display().to_string())).unwrap();
+    let _ = Command::new("sh").arg("-c").arg(format!("chmod +x '{}' '{}'", fake.display(), shim.display())).status();
+
+    let run = |push_exit: &str| -> bool {
+        Command::new("sh").arg(&shim).args(["push", "origin", "refs/tags/v1.2.3"])
+            .env("LOOMUX_GROUP_DIR", &group)
+            .env("FAKE_TAG", "v1.2.3")
+            .env("FAKE_PUSH_EXIT", push_exit)
+            .status().unwrap().success()
+    };
+    let write_grant = |name: &str| {
+        let d = group.join("release_grants");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join(name), b"99999999999\n1\n").unwrap();
+    };
+    let grant_path = |name: &str| group.join("release_grants").join(name);
+
+    // A push git/GitHub refuses must NOT consume the grant.
+    write_grant("v1.2.3");
+    assert!(!run("1"), "a failed push must fail (surface git's refusal)");
+    assert!(grant_path("v1.2.3").exists(), "a failed push must NOT consume the grant — this is the #315 bug");
+    assert!(!grant_path("v1.2.3.claimed").exists(), "no orphaned .claimed file after a resolved failure");
+
+    // The SAME grant authorizes a retry, and a successful push DOES consume it.
+    assert!(run("0"), "retry with the still-usable grant must succeed");
+    assert!(!grant_path("v1.2.3").exists(), "a successful push consumes the grant");
+    assert!(!grant_path("v1.2.3.claimed").exists(), "no orphaned .claimed file after a resolved success");
+
+    // The now-consumed grant cannot authorize a second push.
+    assert!(!run("0"), "a consumed grant must not authorize another push");
+
+    // Expired grants are still cleaned up (never claimed, never left behind).
+    std::fs::write(group.join("release_grants/v1.2.3"), b"1\n1\n").unwrap();
+    assert!(!run("0"), "expired grant → blocked");
+    assert!(!grant_path("v1.2.3").exists(), "expired grant is cleaned up, not left claimable");
+
+    // Crash-between semantics: an orphaned `.claimed` file with no matching
+    // grant (as if the process died between claim and settle) must NOT
+    // authorize a push — the bare grant file is gone, so the next push sees
+    // "no grant" and fails closed, requiring a fresh one.
+    std::fs::create_dir_all(group.join("release_grants")).unwrap();
+    std::fs::write(group.join("release_grants/v1.2.3.claimed"), b"99999999999\n1\n").unwrap();
+    assert!(!run("0"), "an orphaned .claimed file with no live grant must not authorize a push");
 }
 
 #[test]
