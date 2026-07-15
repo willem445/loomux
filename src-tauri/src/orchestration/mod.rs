@@ -3345,6 +3345,57 @@ fn sanitize_session(s: &str) -> Option<String> {
         .then(|| t.to_string())
 }
 
+/// A Claude Code session id's full length: `8-4-4-4-12` hex hyphenated (see
+/// `new_session_uuid`). Below this, `resolve_session_ref` treats the input as a
+/// truncated prefix rather than a (possibly external/unrecorded) full id.
+const FULL_SESSION_ID_LEN: usize = 36;
+
+/// Resolve a caller-supplied `resume_session` value to the one full session id
+/// it names (#190). A hand-copied or logged session id is naturally truncated
+/// (8 hex chars is what humans and terminals show), and Claude Code session ids
+/// are full UUIDs — before this, a truncated id just failed to resolve with no
+/// indication of why. An exact match against this group's roster wins outright,
+/// whatever its length. Otherwise, an input that is already full-length is
+/// passed through unchanged — it may be a genuine session this group never
+/// recorded (a resume with an explicit `kind`/`block` has always allowed that;
+/// #190 is only about *truncated* ids, which can never be "the real thing" on
+/// their own). Only a SHORTER input is treated as a prefix to resolve: zero
+/// matches is a plain "unknown session" (never seen it, in full or part), two
+/// or more is "ambiguous" and lists every candidate so the caller can pick —
+/// this must never silently choose one.
+///
+/// `records` is always this caller's OWN group roster (`merged_records(caller.group)`)
+/// — a prefix is matched only against sessions this group already knows about, so
+/// it can never resolve to (or even see) another group's session, and nothing here
+/// touches the filesystem, so there is no path-traversal surface (CLAUDE.md #6).
+fn resolve_session_ref(records: &[AgentRecord], input: &str) -> Result<String, String> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Err("resume_session must not be empty".into());
+    }
+    if records.iter().any(|r| r.session.as_deref() == Some(input)) {
+        return Ok(input.to_string());
+    }
+    if input.len() >= FULL_SESSION_ID_LEN {
+        return Ok(input.to_string());
+    }
+    let mut matches: Vec<&str> =
+        records.iter().filter_map(|r| r.session.as_deref()).filter(|s| s.starts_with(input)).collect();
+    matches.sort_unstable();
+    matches.dedup();
+    match matches.as_slice() {
+        [] => Err(format!(
+            "unknown session {input:?} — no session in this group's roster matches that id or prefix"
+        )),
+        [one] => Ok(one.to_string()),
+        many => Err(format!(
+            "ambiguous session prefix {input:?} — matches {} sessions, resolve with a longer prefix or the full id: {}",
+            many.len(),
+            many.join(", "),
+        )),
+    }
+}
+
 /// Normalize a caller-supplied pane name (#95r): trim, drop control characters
 /// (so a pasted name can't smuggle newlines/escape codes into the pane title or
 /// the roster JSON), and cap the length. Not a security boundary — the title is
