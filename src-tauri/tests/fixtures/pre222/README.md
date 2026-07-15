@@ -46,13 +46,18 @@ so far:
   there would find no approval to gate on, or would read `COMMENTED` as one).
 
 - **#264, loop until green** — `worker.md` only. A new **Loop until green** section
-  between the git workflow and the definition of done: iterate build, typecheck and
-  the test suite until all three are green in the same pass, and never open a PR
-  carrying a known-red check or an unconfirmed fix. If a worker genuinely cannot
-  reach green after a real attempt, it reports `blocked` and says so on the issue
-  instead of opening a PR that looks done. Pairs with the orchestrator's existing
-  **CI gate** (unchanged here) — this is the worker-side half that keeps that gate a
-  formality instead of a fix loop it inherits.
+  between the git workflow and the definition of done: open the PR as a draft early
+  and loop by pushing fixes until `gh pr checks` is green on every platform, then
+  `gh pr ready` — never mark a PR ready, or report `done`, while CI is red. If a
+  worker genuinely cannot reach green after a real attempt, it reports `blocked` and
+  says so on the issue instead of marking the PR ready. Pairs with the
+  orchestrator's existing **CI gate** (unchanged here) — this is the worker-side half
+  that keeps that gate a formality instead of a fix loop it inherits. Re-blessed a
+  second time in the same PR (rev-10's delta review): the section originally told
+  workers to loop with local `cargo`/`npm` commands before opening the PR, which
+  #321's same-day, group-wide ban on local builds (`ci-validate`, #320) made
+  unfollowable — the loop is now framed on the draft PR's own CI, per that skill,
+  with the local-command instructions dropped entirely.
 
 `the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was` renders
 **these** with the six pre-#222 template variables and asserts that a group launched
