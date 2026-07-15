@@ -8290,7 +8290,7 @@ impl OrchRegistry {
                     continue;
                 }
                 let times = tick_times.get(&a.group).map(Vec::as_slice).unwrap_or(&[]);
-                if false /* TEMP inert seam: red-CI-evidence commit (#287) */ && idle_tick_should_fire(
+                if idle_tick_should_fire(
                     a.last_progress_ms,
                     now,
                     g.compact_nudge_minutes,
