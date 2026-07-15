@@ -208,6 +208,20 @@ pool by one), never to a leaked slot or a widened capability, which is the
 same "delay, never deny, never worse than restrict-only" posture this whole
 feature already commits to everywhere else.
 
+**The marker fold is many-to-one, so collisions are rejected at parse.**
+`tr 'a-z-' 'A-Z_'` doesn't distinguish case or `-` vs `_`, so `node-build` and
+`node_build` (or any case variant) fold to the identical
+`LOOMUX_RESGUARD_HELD_NODE_BUILD` key. Two classes that share a folded key
+would silently share one marker at runtime — a shim invocation of one class
+wrongly read as re-entrant for the other, under-guarding it in a way no test
+or CI run would surface (rev-8 N5). `workflow::parse_workflow` rejects this at
+config time instead: alongside the existing exact-duplicate-class check, it
+folds every class name through the same `tr`-equivalent
+(`resource_guard_marker_key`) and reports a finding — naming both colliding
+classes and the shared marker — the moment two distinct names collide. Fixed
+at parse deliberately, not in the shim: a loud, reviewable finding when the
+file is authored beats a shim that quietly does the wrong thing at runtime.
+
 With re-entrancy in place, this repo's dogfood config keeps `npm`/`node` in
 one combined `node-build` class rather than splitting them: the combined pool
 is now safe at any `max:` including 1, and dogfooding a real, unmodified

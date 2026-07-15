@@ -3983,6 +3983,44 @@ fn resources_reports_every_problem_not_just_the_first() {
 }
 
 #[test]
+fn resources_rejects_classes_that_collide_on_the_shims_reentrancy_marker() {
+    // rev-8 N5 (#318): guard_shim_sh folds a class name into an env-var
+    // suffix via `tr 'a-z-' 'A-Z_'` (uppercase, '-' -> '_') for its
+    // re-entrancy marker — a MANY-TO-ONE fold. `node-build` and `Node_Build`
+    // are DIFFERENT class names (seen_classes' exact-duplicate check does not
+    // fire — this is not `resources_duplicate_class_and_empty_commands_are_
+    // rejected`'s case) but fold to the SAME `LOOMUX_RESGUARD_HELD_NODE_BUILD`
+    // marker, so two real classes would silently share one shim marker at
+    // runtime — one class's shim invocation would be wrongly treated as
+    // re-entrant for the other, under-guarding it. Caught here at parse
+    // instead: a loud, reviewable finding, not a subtle runtime effect.
+    let errs = workflow::parse_workflow(
+        "version: 1\nblocks:\n  - id: worker\n    kind: worker\n\
+         resources:\n  concurrency:\n\
+         \x20   - class: node-build\n      max: 1\n      commands:\n        - { program: npm }\n\
+         \x20   - class: Node_Build\n      max: 1\n      commands:\n        - { program: node }\n",
+    )
+    .unwrap_err();
+    assert!(
+        errs.iter().any(|e| {
+            e.contains("Node_Build") && e.contains("node-build") && e.contains("LOOMUX_RESGUARD_HELD_NODE_BUILD")
+        }),
+        "must name both colliding classes and the shared marker: {errs:?}"
+    );
+
+    // The negative case: two classes with genuinely DIFFERENT folded keys
+    // must parse clean — this isn't a "no two classes ever" rule.
+    let ok = workflow::parse_workflow(
+        "version: 1\nblocks:\n  - id: worker\n    kind: worker\n\
+         resources:\n  concurrency:\n\
+         \x20   - class: node-build\n      max: 1\n      commands:\n        - { program: npm }\n\
+         \x20   - class: rust-build\n      max: 1\n      commands:\n        - { program: cargo }\n",
+    )
+    .unwrap();
+    assert_eq!(ok.resources.len(), 2, "genuinely distinct marker keys must not collide");
+}
+
+#[test]
 fn resources_deny_unknown_fields_catches_a_typo() {
     let errs = workflow::parse_workflow(
         "version: 1\nblocks:\n  - id: worker\n    kind: worker\n\

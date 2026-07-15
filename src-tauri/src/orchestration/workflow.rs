@@ -959,6 +959,18 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
     // (`resource_guard_file_text`).
     let mut resources: Vec<ResourceClass> = Vec::new();
     let mut seen_classes: BTreeSet<String> = BTreeSet::new();
+    // rev-8 N5 (#318): the shim's re-entrancy marker folds a class name into
+    // an env-var suffix via `tr 'a-z-' 'A-Z_'` — a MANY-TO-ONE map (case and
+    // '-'/'_' are indistinguishable in the folded key). Two classes that
+    // differ only by case or by '-' vs '_' (`node-build` / `node_build`)
+    // would share one `LOOMUX_RESGUARD_HELD_*` marker, so a shim invocation of
+    // ONE class would be silently treated as re-entrant for the OTHER —
+    // under-guarding it. `seen_classes` above only catches an EXACT repeat;
+    // this catches a same-marker collision between two otherwise-distinct
+    // names. Caught here, at parse, rather than left to a subtle runtime
+    // effect: a loud, reviewable finding beats a shim that quietly does the
+    // wrong thing for a config a human is unlikely to notice is ambiguous.
+    let mut seen_marker_keys: BTreeMap<String, String> = BTreeMap::new();
     for (i, rc) in raw.resources.concurrency.iter().enumerate() {
         let Some(name) = sanitize_id(&rc.class) else {
             errs.push(format!(
@@ -978,6 +990,16 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
             errs.push(format!("resources.concurrency[{i}]: duplicate class {name:?}"));
             continue;
         }
+        let marker_key = resource_guard_marker_key(&name);
+        if let Some(other) = seen_marker_keys.get(&marker_key) {
+            errs.push(format!(
+                "resources.concurrency[{i}]: class {name:?} folds to the same re-entrancy marker \
+                 (LOOMUX_RESGUARD_HELD_{marker_key}) as class {other:?} — the shim's env-var marker \
+                 does not distinguish case or '-' vs '_', so rename one of them"
+            ));
+            continue;
+        }
+        seen_marker_keys.insert(marker_key, name.clone());
         let max = match rc.max {
             Some(n) if (1..=MAX_RESOURCE_GUARD_SLOTS).contains(&n) => n,
             Some(n) => {
@@ -1689,6 +1711,19 @@ pub fn parse_gate_file(text: &str) -> Option<Gate> {
 /// "restrict nothing" case to distinguish from "the file doesn't exist",
 /// unlike the merge gate's `merge_gate_declared`/`merge_gate` split.
 pub const RESOURCE_GUARD_FILE: &str = "resource_guards";
+
+/// Fold a class name into the shim's re-entrancy env-var suffix — the Rust
+/// mirror of `guard_shim_sh`'s `tr 'a-z-' 'A-Z_'` (uppercase, `-` -> `_`),
+/// kept in lockstep the same way `program_basename`/`guard_class_for` are
+/// kept in lockstep with the shell scanner. **Deliberately many-to-one**:
+/// `node-build` and `node_build` (or any case variant) fold to the same
+/// `NODE_BUILD` key, because the shim's own fold is many-to-one — this
+/// function exists so `parse_workflow` can detect that collision at parse
+/// time (rev-8 N5, #318) rather than let two classes silently share one
+/// `LOOMUX_RESGUARD_HELD_*` marker at runtime.
+fn resource_guard_marker_key(class: &str) -> String {
+    class.chars().map(|c| if c == '-' { '_' } else { c.to_ascii_uppercase() }).collect()
+}
 
 /// Strip a directory prefix and a Windows executable extension so `program:
 /// cargo` matches an invocation of `C:\...\cargo.EXE` or `/usr/bin/cargo`
