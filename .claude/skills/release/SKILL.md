@@ -1,6 +1,6 @@
 ---
 name: release
-description: Cut a loomux release — version bump across all five files (including Cargo.lock and package-lock.json), bump PR, human-gated tag, CI publish, release notes, and npm trusted-publishing verification.
+description: Cut a loomux release — version bump across all five files (including Cargo.lock and package-lock.json), bump PR, human-gated tag, CI publish, release notes, and npm trusted-publishing verification. Covers stable and beta/RC (pre-release) tags.
 ---
 
 # Cutting a loomux release
@@ -162,3 +162,35 @@ workflow change:
    ```
 3. The workflow re-runs from the fixed commit; installers rebuild identically
    and re-attach to the existing release, and hand-written notes survive.
+
+## 6. Beta / RC (pre-release) tags
+
+A tag with a hyphenated suffix — `vX.Y.Z-beta`, `vX.Y.Z-rc1`, anything
+`contains(tag, '-')` — is a pre-release. `release.yml` detects this from the
+tag string alone (no separate input); every job downstream re-checks the
+same `contains(github.ref_name, '-')` condition, so nothing extra needs
+setting up beyond pushing the right tag.
+
+What's different from a stable release:
+
+- **No MSI.** WiX rejects a non-numeric pre-release version identifier
+  ("optional pre-release identifier in app version must be numeric-only ...
+  for msi target"), so the Windows build leg passes `--bundles nsis` to
+  `tauri build` for these tags — NSIS only, MSI skipped. The asset count
+  `promote` checks for is **8**, not 9 (stable minus the `.msi`).
+- **`prerelease: true`** on the GitHub release, set at creation and never
+  flipped back.
+- **`make_latest: false`** when `promote` publishes it — a beta must never
+  become the release GitHub's `latest` API resolves, since the README's
+  `install.sh` / `install.ps1` one-liners resolve `latest` and must keep
+  landing users on the newest **stable** build.
+- **`publish-npm` doesn't run at all** (job-level `if`) — the npm launcher
+  (`npx loomux-desktop`) stays pinned to the latest stable version; there's
+  no npm-side "prerelease" concept to keep a beta installable-but-not-default,
+  so the simplest correct behavior is not publishing it.
+- Release notes still apply to the canonical `release_id` exactly as in step
+  4 — pre-release doesn't change how or where notes get written, only the
+  content (skip mentioning the `.msi` download).
+
+Stable tags (no hyphen) are unaffected by any of the above — same asset
+count (9), same `make_latest` (default `true`), same npm publish.

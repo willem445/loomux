@@ -61,11 +61,18 @@ jobs:
             const owner = context.repo.owner
             const repo = context.repo.repo
             const tag = process.env.GITHUB_REF_NAME
+            // Beta/RC tags (e.g. v0.10.0-beta) carry a hyphenated
+            // pre-release identifier; stable tags (vX.Y.Z) don't. This one
+            // check drives every prerelease-aware branch downstream (build's
+            // bundle selection, promote's asset count + make_latest, and
+            // publish-npm's skip) — see the `contains(github.ref_name, '-')`
+            // checks in those jobs, which must agree with this definition.
+            const isPrerelease = tag.includes("-")
 
             const { data: releases } = await github.rest.repos.listReleases({ owner, repo })
             const existing = releases.find((r) => r.tag_name === tag)
             if (existing) {
-              core.info(`Reusing existing release ${existing.id} for ${tag} (draft=${existing.draft})`)
+              core.info(`Reusing existing release ${existing.id} for ${tag} (draft=${existing.draft}, prerelease=${existing.prerelease})`)
               return existing.id
             }
 
@@ -77,7 +84,7 @@ jobs:
               body: [
                 "Download the asset for your platform below.",
                 "",
-                "- **Windows**: `*-setup.exe` (installer) or `*.msi`",
+                "- **Windows**: `*-setup.exe` (installer)" + (isPrerelease ? "" : " or `*.msi`"),
                 "- **macOS**: `*_aarch64.dmg` (Apple Silicon) or `*_x64.dmg` (Intel) — unsigned; if macOS reports the app as damaged, run `xattr -cr /Applications/Loomux.app`",
                 "- **Linux**: `*.AppImage` (portable), `*.deb`, or `*.rpm`",
                 "",
@@ -92,9 +99,14 @@ jobs:
               // allowed to flip this public, and only after every leg has
               // succeeded AND the asset count checks out (#275, #282).
               draft: true,
-              prerelease: false,
+              // Beta tags are marked prerelease so GitHub itself labels them
+              // and excludes them from the repo's "Releases" latest-tag
+              // badge; `promote` separately keeps make_latest off for these
+              // so `latest` (which install.sh/install.ps1 resolve) keeps
+              // pointing at the newest stable release.
+              prerelease: isPrerelease,
             })
-            core.info(`Created release ${data.id} for ${tag}`)
+            core.info(`Created release ${data.id} for ${tag} (prerelease=${isPrerelease})`)
             return data.id
 
   build:
@@ -155,7 +167,18 @@ jobs:
           # releaseId is set.
           releaseId: ${{ needs.create-release.outputs.release_id }}
           tagName: ${{ github.ref_name }}
-          args: ${{ matrix.args }}
+          # Beta/RC tags (hyphenated, e.g. v0.10.0-beta) restrict the
+          # Windows leg to NSIS only. WiX rejects non-numeric pre-release
+          # version identifiers ("optional pre-release identifier in app
+          # version must be numeric-only ... for msi target"), so an MSI
+          # bundle attempt fails the whole leg for a beta tag. `--bundles`
+          # is a `tauri build` flag (passed through by tauri-action's `args`
+          # input) whose short names include every target, not just Linux's
+          # deb/rpm/appimage — "nsis" and "msi" are valid values too
+          # (tauri-bundler's PackageType::from_short_name). Stable tags
+          # (no hyphen) fall through to matrix.args unchanged — byte-
+          # identical to the pre-beta workflow.
+          args: ${{ ((matrix.platform == 'windows-latest') && contains(github.ref_name, '-')) && '--bundles nsis' || matrix.args }}
 
   # Flips the draft release from `build` to public — the only place `latest`
   # is allowed to start resolving to this release. Runs only if every build
@@ -177,21 +200,32 @@ jobs:
       contents: write
     env:
       RELEASE_ID: ${{ needs.create-release.outputs.release_id }}
-      # Expected count: setup.exe + msi (Windows) + 2 dmg (macOS) +
+      # Stable count: setup.exe + msi (Windows) + 2 dmg (macOS) +
       # AppImage + deb + rpm (Linux) + 2 app.tar.gz (macOS updater
       # bundles) = 9. Keep in lockstep with the SKILL.md release doc's
       # asset checklist if the matrix ever changes.
-      EXPECTED_ASSETS: 9
+      EXPECTED_ASSETS_STABLE: 9
+      # Beta count: same as stable minus the Windows .msi, which the build
+      # job skips for hyphenated (prerelease) tags — see the `--bundles
+      # nsis` comment on the `build` job. 9 - 1 = 8. Deliberately a second
+      # explicit constant rather than "9 - 1" computed inline, so both
+      # counts stay readable at a glance.
+      EXPECTED_ASSETS_BETA: 8
     steps:
       - name: Verify asset count before promoting
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+            expected="$EXPECTED_ASSETS_BETA"
+          else
+            expected="$EXPECTED_ASSETS_STABLE"
+          fi
           count=$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets" --jq 'length')
-          echo "Release $GITHUB_REF_NAME (id $RELEASE_ID) has $count/$EXPECTED_ASSETS assets"
-          if [ "$count" -lt "$EXPECTED_ASSETS" ]; then
-            echo "::error::Only $count/$EXPECTED_ASSETS assets on release $GITHUB_REF_NAME (id $RELEASE_ID) — refusing to promote. Staying draft; check for a stray duplicate release for this tag before retrying."
+          echo "Release $GITHUB_REF_NAME (id $RELEASE_ID) has $count/$expected assets"
+          if [ "$count" -lt "$expected" ]; then
+            echo "::error::Only $count/$expected assets on release $GITHUB_REF_NAME (id $RELEASE_ID) — refusing to promote. Staying draft; check for a stray duplicate release for this tag before retrying."
             exit 1
           fi
 
@@ -215,14 +249,27 @@ jobs:
       - name: Publish the draft release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        # $GITHUB_REPOSITORY (default env var), not ${{ }} template
-        # substitution, so a crafted tag/repo value can't inject into the
-        # shell command — same convention as VERSION in publish-npm below.
-        # Targets the release by RELEASE_ID (from create-release), not a
-        # tag-based `gh release edit <tag>` lookup — the whole point of
-        # #282 is that tag-based lookup is what let a stray duplicate slip
-        # through undetected.
-        run: gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" -f draft=false
+        # $GITHUB_REPOSITORY / $GITHUB_REF_NAME (default env vars), not
+        # ${{ }} template substitution, so a crafted tag/repo value can't
+        # inject into the shell command — same convention as VERSION in
+        # publish-npm below. Targets the release by RELEASE_ID (from
+        # create-release), not a tag-based `gh release edit <tag>` lookup —
+        # the whole point of #282 is that tag-based lookup is what let a
+        # stray duplicate slip through undetected.
+        #
+        # make_latest=false for beta/RC (hyphenated) tags: GitHub's `latest`
+        # release pointer is what the README's install.sh/install.ps1
+        # one-liners resolve, and a beta going out must not steal that
+        # pointer from the newest stable release. Stable tags keep
+        # make_latest=true (GitHub's own default) — byte-identical to the
+        # pre-beta workflow.
+        run: |
+          set -euo pipefail
+          make_latest=true
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+            make_latest=false
+          fi
+          gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" -f draft=false -f make_latest="$make_latest"
 
   # Publish the tiny npm launcher (`npx loomux-desktop`). It just downloads
   # the release asset built above, but must wait for `promote` (not just
@@ -235,8 +282,14 @@ jobs:
   # Auth is npm "trusted publishing" (OIDC): the job mints an id-token that
   # npm exchanges for publish rights — no NPM_TOKEN secret involved. Requires
   # npm >= 11.5.1 (Node 22 bundles an older one, hence the upgrade step).
+  # Skipped entirely for beta/RC (hyphenated) tags: the npm launcher
+  # (`npx loomux-desktop`) stays pinned to the latest stable release rather
+  # than ever resolving a beta build. There's no npm equivalent of GitHub's
+  # prerelease/make_latest flags to keep a beta version installed-but-not-
+  # default, so the simplest correct behavior is not publishing it at all.
   publish-npm:
     needs: promote
+    if: ${{ !contains(github.ref_name, '-') }}
     runs-on: ubuntu-latest
     permissions:
       id-token: write
