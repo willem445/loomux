@@ -3886,10 +3886,11 @@ const BRACKETED_PASTE_END: &str = "\u{1b}[201~";
 ///
 /// Returns `(has_printable, occupancy_delta)`: the first is "did this write
 /// put visible text in the box at all" (`input_has_printable`'s job); the
-/// second is the signed change to box occupancy — printable bytes add one,
-/// backspace/DEL (`\x08`/`\x7f`) removes one (#171) — that
-/// `box_occupancy_delta` exposes so a run of backspaces emptying a typed line
-/// is recognized even though no single write in the run looks like a submit.
+/// second is the signed change to box occupancy — one Unicode CHARACTER
+/// added counts `+1` regardless of its UTF-8 byte width, backspace/DEL
+/// (`\x08`/`\x7f`) removes `1` (#171) — that `box_occupancy_delta` exposes so
+/// a run of backspaces emptying a typed line is recognized even though no
+/// single write in the run looks like a submit.
 fn scan_box_units(s: &str) -> (bool, i32) {
     let b = s.as_bytes();
     let mut i = 0;
@@ -3938,11 +3939,26 @@ fn scan_box_units(s: &str) -> (bool, i32) {
             i += 1;
             continue;
         }
-        // Printable ASCII (space..~) or any UTF-8 multibyte lead/continuation.
-        if (0x20..0x7f).contains(&b[i]) || b[i] >= 0x80 {
+        // Printable ASCII, or a UTF-8 multibyte LEAD byte (0xC0..=0xFF): count
+        // one occupancy unit per character, not per byte. A 3-byte CJK
+        // character or a 4-byte emoji is still exactly one keystroke and one
+        // backspace, so counting raw bytes here (+3/+4 on type, -1 on the one
+        // backspace that removes it) over-counted occupancy for any non-ASCII
+        // typer and reproduced #171's exact stuck-occupied symptom for them —
+        // the counter never gets back to `<= 0` because the single removal
+        // can't cancel a multi-byte addition. Continuation bytes (0x80..=0xBF)
+        // are still consumed (and still mark the write as printable) but add
+        // no further delta — they're part of the character its lead byte
+        // already counted.
+        if (0x20..0x7f).contains(&b[i]) || b[i] >= 0xc0 {
             printable = true;
             delta += 1;
             i += 1;
+            continue;
+        }
+        if b[i] >= 0x80 {
+            printable = true;
+            i += 1; // continuation byte — already counted via its lead byte
             continue;
         }
         i += 1; // other C0 control (tab, etc.)
@@ -3958,19 +3974,36 @@ fn input_has_printable(s: &str) -> bool {
 }
 
 /// The signed change to box occupancy from a single human write: `+1` per
-/// printable/graphic unit, `-1` per backspace/DEL, `0` for anything else
-/// (arrows, bare escape sequences, an OSC/DCS query-reply echo — #179). Used
-/// alongside `classify_human_input` to track real occupancy rather than a
-/// bare pending/not flag: `write_pty` applies this to a running per-pane
-/// counter (clamped at zero) so a typed line that gets fully backspaced out
-/// reads back to empty even though no single write in the run looks like a
-/// submit (#171) — `classify_human_input`'s `Submit` still resets the
-/// counter directly to zero, which is exact where it applies (Enter,
-/// Ctrl-U, Ctrl-C).
+/// Unicode CHARACTER (a UTF-8 lead byte, not a raw byte — a 3-byte CJK
+/// character or a 4-byte emoji is one keystroke, so it counts as one, not
+/// three or four), `-1` per backspace/DEL, `0` for anything else (arrows,
+/// bare escape sequences, an OSC/DCS query-reply echo — #179). Used alongside
+/// `classify_human_input` to track real occupancy rather than a bare
+/// pending/not flag: `write_pty` applies this to a running per-pane counter
+/// (clamped at zero) so a typed line that gets fully backspaced out reads
+/// back to empty even though no single write in the run looks like a submit
+/// (#171) — `classify_human_input`'s `Submit` still resets the counter
+/// directly to zero, which is exact where it applies (Enter, Ctrl-U,
+/// Ctrl-C).
 ///
-/// Only backspace/DEL is counted as removal: Ctrl-W (delete word), Ctrl-K
-/// (kill to end) and Esc-to-clear editors still net `0` here — full
-/// box-occupancy tracking for those remains open (see `classify_human_input`).
+/// Counting by character rather than by byte matters for correctness, not
+/// just cosmetics: byte-counting added 3/4 for one CJK/emoji character typed
+/// but only subtracted 1 for the single backspace that removes it, so the
+/// counter never returned to zero and a non-ASCII typer hit this exact
+/// stuck-occupied symptom (a prior revision of this fix had that bug).
+///
+/// The counter is deliberately biased to never UNDER-count real occupancy
+/// (never read `0`/empty while a human's line is in fact still sitting in the
+/// box — that's the clobber hazard the whole #111 guard exists to prevent).
+/// It may OVER-count, and that direction is safe: if some CLI's line editor
+/// ever deletes more than one character for a single backspace/DEL byte (a
+/// multi-codepoint grapheme cluster, say), this still only subtracts `1`,
+/// leaving the counter higher than the box's real contents — worst case, a
+/// delivery holds a little longer than strictly necessary before pasting,
+/// never earlier. Only backspace/DEL is counted as removal at all: Ctrl-W
+/// (delete word), Ctrl-K (kill to end) and Esc-to-clear editors still net `0`
+/// here — full box-occupancy tracking for those remains open (see
+/// `classify_human_input`).
 pub fn box_occupancy_delta(s: &str) -> i32 {
     scan_box_units(s).1
 }

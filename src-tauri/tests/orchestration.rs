@@ -7238,6 +7238,71 @@ fn box_occupancy_delta_counts_typed_characters_and_backspaces() {
 }
 
 #[test]
+fn box_occupancy_delta_counts_multibyte_characters_not_bytes() {
+    // #171 review follow-up: counting raw UTF-8 BYTES over-counted non-ASCII
+    // input — a 3-byte CJK character or 4-byte emoji added 3/4 to the
+    // counter for one keystroke, but the single backspace that deletes it
+    // only ever subtracts 1 (backspace/DEL is always a single control byte,
+    // regardless of what it deletes). That mismatch reproduced #171's exact
+    // stuck-occupied symptom for anyone typing non-ASCII: the counter could
+    // never get back down to zero by backspacing alone.
+    //
+    // "日" (U+65E5) is a 3-byte UTF-8 sequence — one character, one keystroke.
+    assert_eq!(box_occupancy_delta("日"), 1, "one CJK character is one occupancy unit, not 3 bytes");
+    // "😀" (U+1F600) is a 4-byte UTF-8 sequence — same story.
+    assert_eq!(box_occupancy_delta("😀"), 1, "one emoji is one occupancy unit, not 4 bytes");
+    // A run of each, plus a mix, still counts one per character.
+    assert_eq!(box_occupancy_delta("日本語"), 3);
+    assert_eq!(box_occupancy_delta("a日😀b"), 4);
+}
+
+#[test]
+fn backspacing_a_cjk_or_emoji_character_reads_the_box_as_empty_again() {
+    // #171 review follow-up, the end-to-end version of the byte-vs-character
+    // fix: type one non-ASCII character, backspace it once, and the box must
+    // read empty — exactly like the all-ASCII case just above. Before the
+    // byte-vs-character fix this got stuck (delta +3 for "日", only -1 for
+    // the one backspace, net +2 forever).
+    use std::sync::atomic::Ordering;
+    let counter = std::sync::atomic::AtomicI64::new(0);
+    let feed = |data: &str| {
+        match classify_human_input(data) {
+            HumanInput::Submit => counter.store(0, Ordering::Relaxed),
+            HumanInput::Content | HumanInput::Neutral => {
+                let delta = box_occupancy_delta(data);
+                if delta != 0 {
+                    let cur = counter.load(Ordering::Relaxed);
+                    counter.store((cur + delta as i64).max(0), Ordering::Relaxed);
+                }
+            }
+        }
+    };
+    let pending = || counter.load(Ordering::Relaxed) > 0;
+
+    // A CJK IME commit typically arrives as one write per composed character.
+    feed("日");
+    assert!(pending(), "a typed CJK character must occupy the box");
+    feed("\u{7f}");
+    assert!(!pending(), "backspacing the one character out must read the box as empty again");
+
+    // Same story for an emoji (4-byte UTF-8).
+    feed("😀");
+    assert!(pending());
+    feed("\u{7f}");
+    assert!(!pending(), "backspacing the one emoji out must read the box as empty again");
+
+    // A mixed multi-character line backspaced out character-by-character.
+    feed("a日😀b");
+    assert!(pending());
+    feed("\u{7f}");
+    feed("\u{7f}");
+    feed("\u{7f}");
+    assert!(pending(), "three of four characters backspaced — still occupied");
+    feed("\u{7f}");
+    assert!(!pending(), "the fourth backspace empties a 4-character mixed-width line");
+}
+
+#[test]
 fn backspacing_a_typed_line_all_the_way_out_reads_the_box_as_empty_again() {
     // #171: the incident this issue reports — start typing, backspace back out,
     // and (before this fix) `input_pending` stayed stuck true because every
