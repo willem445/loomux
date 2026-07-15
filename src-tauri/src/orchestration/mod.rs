@@ -1898,13 +1898,9 @@ impl Guardrails {
         // Unrecognized role names (typos, a stale/future value) are dropped
         // rather than rejected — a hand-edited group.json with a bad entry
         // should not crash the group, just silently not grant that role
-        // eligibility. Sorted + deduped for a stable persisted/reported shape.
-        self.compact_nudge_roles.retain(|r| workflow::kind_from_str(r).is_some());
-        self.compact_nudge_roles.sort();
-        self.compact_nudge_roles.dedup();
-        if self.compact_nudge_roles.is_empty() {
-            self.compact_nudge_roles = vec![Role::Orchestrator.as_str().to_string()];
-        }
+        // eligibility. See `canonicalize_compact_nudge_roles` for why survivors
+        // are also case-normalized, not just filtered.
+        self.compact_nudge_roles = canonicalize_compact_nudge_roles(self.compact_nudge_roles);
         self
     }
 
@@ -2246,6 +2242,30 @@ pub fn idle_output_is_activity(prev_total: u64, cur_total: u64, floor: u64) -> b
 /// `Role::as_str()` names; never empty for a group that went through it).
 pub fn compact_nudge_role_allowed(role: Role, allowed_roles: &[String]) -> bool {
     allowed_roles.iter().any(|r| r == role.as_str())
+}
+
+/// Canonicalize a compact-nudge role list (rev-24 review fix): drop
+/// unrecognized entries and normalize every survivor to `Role::as_str()`'s
+/// lowercase wire name. `workflow::kind_from_str` validates case-
+/// insensitively but does not normalize — keeping the as-typed string (e.g.
+/// `"Orchestrator"`) let it persist and pass validation, yet
+/// `compact_nudge_role_allowed`'s lowercase comparison would then never match
+/// it, silently disabling the role. Sorted + deduped for a stable
+/// persisted/reported shape; an all-unrecognized/empty result falls back to
+/// `["orchestrator"]` rather than disabling every role. Shared by
+/// `Guardrails::clamped`, the `resumed` re-normalization in
+/// `create_group_ex`, and `set_compact_nudge_roles` so the rule lives once.
+fn canonicalize_compact_nudge_roles(roles: Vec<String>) -> Vec<String> {
+    let mut out: Vec<String> = roles
+        .into_iter()
+        .filter_map(|r| workflow::kind_from_str(&r).map(|k| k.as_str().to_string()))
+        .collect();
+    out.sort();
+    out.dedup();
+    if out.is_empty() {
+        out = vec![Role::Orchestrator.as_str().to_string()];
+    }
+    out
 }
 
 /// Compact-nudge (#287): whether `cli` has a `/compact` equivalent loomux can
@@ -2985,9 +3005,18 @@ pub struct AgentEntry {
     /// Seeded at spawn and whenever work is (re)assigned. See
     /// `watchdog_should_notify`.
     pub last_progress_ms: u64,
-    /// Watchdog: last observed value of the pane's monotonic pty output
-    /// counter, so a tick can tell whether the CLI has emitted anything since
-    /// the previous one even when the output ring is saturated.
+    /// Watchdog/idle-tick: last observed value of the pane's monotonic pty
+    /// output counter, so a tick can tell whether the CLI has emitted anything
+    /// since the previous one even when the output ring is saturated. Exclusive
+    /// to watchdog (non-orchestrator working agents) and idle-tick (the
+    /// orchestrator in an autonomous group) — the two never watch the same
+    /// agent (partitioned by role), so sharing this baseline between them is
+    /// safe. Compact-nudge does NOT use this field — see
+    /// `compact_nudge_last_output_total`; the two CAN watch the same agent
+    /// (default: the orchestrator), and an earlier revision shared this field
+    /// between them, which meant whichever tick polled first each cycle
+    /// rebaselined it and starved the other's activity detection (rev-24
+    /// review finding) — hence the separate baseline.
     pub last_output_total: u64,
     /// Watchdog anti-nag latch: set once a stall notice has been delivered for
     /// the current stall, cleared when the agent produces output/reports again.
@@ -3002,10 +3031,25 @@ pub struct AgentEntry {
     /// Compact-nudge (#287) anti-nag latch, meaningful only for a role in the
     /// group's `compact_nudge_roles`: set once `/compact` has been pasted for
     /// the current quiet window, cleared when the pane produces real output
-    /// again. Shares the SAME quiet clock as `idle_tick_notified`
-    /// (`last_progress_ms`/`last_output_total` above) — deliberately the same
-    /// idleness signal, not a second one. See `compact_nudge_tick`.
+    /// again (per compact-nudge's OWN observation — see
+    /// `compact_nudge_last_output_total`). `last_progress_ms` above is still
+    /// the shared quiet clock both idle-tick and compact-nudge read/advance —
+    /// deliberately the same idleness signal, not a second one — but each
+    /// tick now detects "did real growth happen" from its own baseline before
+    /// touching it, so one tick's poll can no longer consume the growth out
+    /// from under the other. See `compact_nudge_tick`.
     pub compact_nudge_notified: bool,
+    /// Compact-nudge's OWN baseline pty output-total, independent of
+    /// `last_output_total` (rev-24 review fix). Idle-tick and compact-nudge can
+    /// both be watching the SAME agent (default config: both target the
+    /// orchestrator), unlike watchdog/idle-tick which never overlap — so they
+    /// cannot share one rebaselined counter without whichever tick polls first
+    /// each cycle consuming the growth and starving the other's activity
+    /// detection (and, transitively, its anti-nag latch, which never clears
+    /// again). Each tick keeping its own last-seen snapshot of the same
+    /// monotonic pty counter is the standard fix for two independent readers
+    /// of one counter — a Kafka-consumer-offset shape, not a new signal.
+    pub compact_nudge_last_output_total: u64,
     /// The actual agent CLI a **solo** pane (`role == Role::Solo`) is
     /// running, e.g. `"codex"`/`"gemini"` — the group-guardrails CLI
     /// resolution (`Guardrails::cli_for`) that every orchestration-group
@@ -6281,17 +6325,7 @@ impl OrchRegistry {
                 // Re-run the same role normalization `clamped()` applies (this
                 // overwrite lands after that top-of-fn call, straight from a
                 // raw disk read that never went through it).
-                let mut roles: Vec<String> = persisted
-                    .compact_nudge_roles
-                    .into_iter()
-                    .filter(|r| workflow::kind_from_str(r).is_some())
-                    .collect();
-                roles.sort();
-                roles.dedup();
-                if roles.is_empty() {
-                    roles = vec![Role::Orchestrator.as_str().to_string()];
-                }
-                guardrails.compact_nudge_roles = roles;
+                guardrails.compact_nudge_roles = canonicalize_compact_nudge_roles(persisted.compact_nudge_roles);
             }
         }
         // #255: advisory only — never override a cap the human set. A launcher
@@ -7885,6 +7919,7 @@ impl OrchRegistry {
             watchdog_notified: false,
             idle_tick_notified: false,
             compact_nudge_notified: false,
+            compact_nudge_last_output_total: 0,
             solo_cli: Some(cli.to_string()),
             last_exit_tail: None,
         };
@@ -7995,6 +8030,7 @@ impl OrchRegistry {
             watchdog_notified: false,
             idle_tick_notified: false,
             compact_nudge_notified: false,
+            compact_nudge_last_output_total: 0,
             solo_cli: None, // unknown for an adopted pane; cli_for_agent falls back to "claude"
             last_exit_tail: None,
         };
@@ -8219,14 +8255,28 @@ impl OrchRegistry {
     /// supports `/compact` (`compact_nudge_cli_supported`), fold in the latest
     /// pty output counter using the group's `idle_activity_floor_bytes` —
     /// meaningful growth (a real turn, not idle repaint noise) resets the
-    /// quiet clock and the one-shot latch. This deliberately reads and writes
-    /// the SAME `last_progress_ms`/`last_output_total` fields `idle_tick_tick`
-    /// does (guardrail #1: reuse the idleness signal, don't invent a second
-    /// one) — the two ticks partition cleanly by role in the built-in
-    /// configuration (idle-tick only ever touches the orchestrator while
-    /// autonomous; compact-nudge defaults to the orchestrator too), and even
-    /// where they overlap the bookkeeping is idempotent (both derive the same
-    /// timestamp from the same pty counter).
+    /// quiet clock and this tick's own one-shot latch.
+    ///
+    /// This deliberately reads the SAME quiet-clock concept `idle_tick_tick`
+    /// reads (guardrail #1: reuse the idleness signal, don't invent a second
+    /// one) — but rebaselines against its OWN `compact_nudge_last_output_total`,
+    /// not `idle_tick_tick`'s `last_output_total` (rev-24 review finding: idle-
+    /// tick and compact-nudge can both be watching the SAME agent — default
+    /// config targets the orchestrator for both — and an earlier revision
+    /// shared one rebaselined counter between them, so whichever tick polled
+    /// first each cycle consumed the growth and the other's `idle_output_is_
+    /// activity` check permanently saw a zero delta: its latch, once set,
+    /// could never clear again). Each tick keeping its own last-seen baseline
+    /// on the same monotonic pty counter is the standard fix for two
+    /// independent readers of one counter (a consumer-offset shape), not a
+    /// second idleness mechanism — both still derive activity from the exact
+    /// same source (the pty's `output_total`) via the exact same rule
+    /// (`idle_output_is_activity` against the group's `idle_activity_floor_
+    /// bytes`). `last_progress_ms` itself stays shared and is safe for both
+    /// to advance: each writes it only after independently confirming real
+    /// growth from its own baseline, so a write here can only move the quiet
+    /// clock's timestamp closer to the truth, never corrupt the other tick's
+    /// next comparison.
     ///
     /// An eligible pane quiet past its group's `compact_nudge_minutes`, not
     /// already latched, and under `MAX_COMPACT_NUDGES_PER_HOUR` (reusing
@@ -8275,9 +8325,15 @@ impl OrchRegistry {
                     continue;
                 }
                 if let Some(&cur) = outputs.get(&a.id) {
-                    let meaningful =
-                        idle_output_is_activity(a.last_output_total, cur, g.idle_activity_floor_bytes);
-                    a.last_output_total = cur; // rebaseline every observation
+                    // Own baseline (`compact_nudge_last_output_total`, not
+                    // idle-tick's `last_output_total`) — see the fn doc for why
+                    // sharing the rebaselined counter with idle-tick was the bug.
+                    let meaningful = idle_output_is_activity(
+                        a.compact_nudge_last_output_total,
+                        cur,
+                        g.idle_activity_floor_bytes,
+                    );
+                    a.compact_nudge_last_output_total = cur; // rebaseline every observation
                     if meaningful {
                         a.last_progress_ms = now;
                         a.compact_nudge_notified = false;
@@ -8979,19 +9035,12 @@ impl OrchRegistry {
     }
 
     /// Set a live group's compact-nudge eligible roles on the fly (#287).
-    /// Unrecognized role names are dropped and the result deduped/sorted —
-    /// `Guardrails::clamped`'s rule, reapplied here since a live setter
-    /// bypasses `clamped()`; an empty result falls back to `["orchestrator"]`
-    /// rather than silently disabling every role. Persisted + audited.
-    /// Returns the applied set.
+    /// Canonicalized via `canonicalize_compact_nudge_roles` (drops unrecognized
+    /// entries, case-normalizes survivors, dedupes/sorts, falls back to
+    /// `["orchestrator"]` if empty) since a live setter bypasses `clamped()`.
+    /// Persisted + audited. Returns the applied set.
     pub fn set_compact_nudge_roles(&self, group: &str, roles: Vec<String>) -> Result<Vec<String>, String> {
-        let mut applied: Vec<String> =
-            roles.into_iter().filter(|r| workflow::kind_from_str(r).is_some()).collect();
-        applied.sort();
-        applied.dedup();
-        if applied.is_empty() {
-            applied = vec![Role::Orchestrator.as_str().to_string()];
-        }
+        let applied = canonicalize_compact_nudge_roles(roles);
         let old = self
             .group(group)
             .ok_or("unknown group")?
@@ -12144,6 +12193,7 @@ impl OrchRegistry {
             watchdog_notified: false,
             idle_tick_notified: false,
             compact_nudge_notified: false,
+            compact_nudge_last_output_total: 0,
             solo_cli: None,
             last_exit_tail: None,
         };
@@ -14071,6 +14121,7 @@ fn register_orchestrator_pane(
         watchdog_notified: false,
         idle_tick_notified: false,
         compact_nudge_notified: false,
+        compact_nudge_last_output_total: 0,
         solo_cli: None,
         last_exit_tail: None,
     };

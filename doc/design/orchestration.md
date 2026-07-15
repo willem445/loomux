@@ -1245,21 +1245,44 @@ limit.
   guardrails only** — a loomux-timed heuristic nudge, no new agent capability. The comment-
   driven extensions are filed as a follow-up, #328, rather than silently dropped.
 - **Reuses the SAME idleness signal as the watchdog and idle-tick, not a second one.**
-  `compact_nudge_tick` folds pty output growth into `AgentEntry.last_progress_ms` /
-  `last_output_total` using the identical debounce `idle_tick_tick` uses for the
-  orchestrator (`idle_output_is_activity` against the group's existing
-  `idle_activity_floor_bytes` guardrail — a real turn resets the quiet clock, a
-  sub-floor statusline repaint does not). It does not invent a text-pattern "is this pane
-  at its input prompt" detector; "idle at the input prompt" is read the same way the rest
-  of the orchestration backend already reads it — sustained output silence, not a busy CLI
-  mid-render. The fire decision itself reuses `idle_tick_should_fire` verbatim (the
-  threshold/latch/per-hour-cap shape `watchdog_tick` established and `idle_tick_tick`
-  reused first) rather than a hand-rolled copy, so a new guardrail concept gets the SAME
-  gate, not a similar-looking one. The two ticks partition cleanly in the built-in
-  configuration (idle-tick only ever runs for an autonomous group's orchestrator;
-  compact-nudge defaults to the orchestrator too) and even where a group opts a wider role
-  set in, the shared bookkeeping is idempotent — both derive the same timestamp from the
-  same pty counter, so there is nothing to reconcile between them.
+  `compact_nudge_tick` folds pty output growth into `AgentEntry.last_progress_ms` using
+  the identical debounce `idle_tick_tick` uses for the orchestrator
+  (`idle_output_is_activity` against the group's existing `idle_activity_floor_bytes`
+  guardrail — a real turn resets the quiet clock, a sub-floor statusline repaint does
+  not). It does not invent a text-pattern "is this pane at its input prompt" detector;
+  "idle at the input prompt" is read the same way the rest of the orchestration backend
+  already reads it — sustained output silence, not a busy CLI mid-render. The fire
+  decision itself reuses `idle_tick_should_fire` verbatim (the threshold/latch/per-hour-
+  cap shape `watchdog_tick` established and `idle_tick_tick` reused first) rather than a
+  hand-rolled copy, so a new guardrail concept gets the SAME gate, not a similar-looking
+  one.
+  **Two readers of one counter need two baselines (rev-24 review finding).** Watchdog and
+  idle-tick never watch the same agent (watchdog explicitly skips the orchestrator;
+  idle-tick only ever touches an autonomous group's orchestrator), so those two sharing
+  `AgentEntry.last_output_total` as their rebaseline counter is safe — there is only ever
+  one reader of it at a time. Idle-tick and compact-nudge are different: in the
+  autonomous-plus-compact-nudge configuration the feature exists for, they CAN both be
+  watching the same orchestrator. An earlier revision had `compact_nudge_tick` rebaseline
+  the SAME `last_output_total` idle-tick uses, on every observation regardless of whether
+  growth was meaningful. Whichever background loop's 60s tick happened to poll the pty
+  first each cycle consumed the growth (rebaselined the counter to the current value);
+  the other tick's `idle_output_is_activity` check then always saw a zero delta against
+  an already-caught-up baseline, so it could never observe fresh growth again — its own
+  anti-nag latch, once set, never cleared. Depending on which background loop happened to
+  win the race consistently, that meant compact-nudge firing at most once per pane
+  lifetime, or idle-tick silently starving, in exactly the combined configuration the
+  feature is for. The fix: `AgentEntry.compact_nudge_last_output_total` is compact-nudge's
+  OWN baseline, entirely separate from idle-tick's `last_output_total` — the standard shape
+  for two independent consumers polling one monotonic counter (each keeps its own
+  last-seen offset, like independent Kafka consumer groups over one log), not a new
+  idleness signal: both ticks still derive "was there real growth" from the exact same
+  pty `output_total` counter via the exact same `idle_output_is_activity` rule and the
+  exact same `idle_activity_floor_bytes` guardrail. `last_progress_ms` — the actual quiet-
+  clock timestamp both ticks' fire decisions read — stays a single shared field and is
+  safe for both to write: each only advances it after independently confirming real growth
+  from its OWN baseline, so a write from either tick can only move the timestamp closer to
+  the true last-activity time, never invalidate the other tick's next comparison (which
+  reads a different field entirely).
 - **Delivery is a plain `deliver_prompt` call, nothing bespoke.** `compact_nudge_tick`
   pastes `/compact` + CR to an eligible pane through the exact same delivery path every
   other prompt uses (`Delivery::MidSession` — no PTY resize, per the hard constraint),
