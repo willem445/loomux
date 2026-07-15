@@ -83,27 +83,27 @@ export function dropIfStale(pending: PendingConnect | null, isAlive: boolean): P
 // importing would suggest a coupling that doesn't exist).
 const CHANNEL_COLORS = ["#7aa2f7", "#9ece6a", "#e0af68", "#bb9af7", "#7dcfff", "#f7768e"];
 
-/** Channel ids are backend-minted `chan-N` (mod.rs's `channel_seq`, a monotonic
- *  `AtomicU32`, never reused) — so, unlike orchbadge.ts's per-group colors (arbitrary
- *  ids, needing an insertion-order cache), a channel's color/number is a pure function
- *  of its OWN id: no cache, no reset-between-tests seam needed. Falls back to 0 for a
- *  malformed id (a payload from a future backend shape) rather than throwing — a
- *  channel chip is decoration, never worth crashing the pane header over. */
-export function channelNumber(channelId: string): number {
-  const m = /^chan-(\d+)$/.exec(channelId);
-  return m ? parseInt(m[1], 10) : 0;
-}
-
-export function channelColor(channelId: string): string {
-  return CHANNEL_COLORS[channelNumber(channelId) % CHANNEL_COLORS.length];
+/** The chip's number/color are a pure function of the backend-assigned
+ *  `displayNumber` (mod.rs's `Channel.display_number`) — NOT the channel id's
+ *  `chan-N` suffix. `id` is minted from a monotonic counter that never reuses
+ *  a value (so audit history stays unambiguous), which means it keeps
+ *  climbing even as channels close — a human live-testing PR #285 saw the
+ *  chip read "⇄2" for the ONLY active channel, right after chan-1 (still
+ *  "⇄1" a moment earlier) disconnected. `displayNumber` is a SEPARATE
+ *  backend-minted field: the lowest positive integer not used by any other
+ *  currently-live channel, so it's freed the instant its channel closes and
+ *  the chip always reflects what's ACTUALLY connected. Still a pure function
+ *  (no cache, no reset-between-tests seam) — just of a different input. */
+export function channelColor(displayNumber: number): string {
+  return CHANNEL_COLORS[displayNumber % CHANNEL_COLORS.length];
 }
 
 /** The pane header chip's text for a channel — short enough to sit before the title
  *  without crowding the role badge, and numbered (not just colored) so the indicator
  *  still disambiguates concurrent channels for a human who can't easily tell two
  *  similar accent colors apart. */
-export function channelChipLabel(channelId: string): string {
-  return `⇄${channelNumber(channelId)}`;
+export function channelChipLabel(displayNumber: number): string {
+  return `⇄${displayNumber}`;
 }
 
 /** One entry in a channel's member list, as the backend's `channel_members_json`
@@ -118,9 +118,14 @@ export interface ChannelBadgeMember {
 }
 
 /** Build the pane header's channel badge (pane.ts's `setConnected` input) from a
- *  channel id and its member list, for whichever member `selfAgentId` is — used both
- *  by the live `orch-channel` event handler and by the on-open rehydration read
- *  (`channelForPane`), so the two paths can't render the chip differently.
+ *  channel id, its backend-assigned display number, and its member list, for
+ *  whichever member `selfAgentId` is — used both by the live `orch-channel` event
+ *  handler and by the on-open rehydration read (`channelForPane`), so the two paths
+ *  can't render the chip differently. `displayNumber` MUST come from the backend
+ *  (restart hydration re-shows the same number the channel was minted with — it's
+ *  state, not something the frontend recomputes) — never derived from `channelId`
+ *  here, since `id` and the display number are deliberately different numbers (see
+ *  `channelColor`'s doc).
  *
  *  `direction`/`canSend`/`deliveryOnly` describe THIS pane (`selfAgentId`'s own entry),
  *  not the peers — they drive the chip's arrow (outward for sender, inward for
@@ -129,6 +134,7 @@ export interface ChannelBadgeMember {
  *  not happen for a live channel — a defensive fallback, not a real UI state). */
 export function channelBadge(
   channelId: string,
+  displayNumber: number,
   members: readonly ChannelBadgeMember[],
   selfAgentId: string
 ): PaneChannelBadge {
@@ -136,8 +142,8 @@ export function channelBadge(
   const senderMember = members.find((m) => m.direction === "sender");
   return {
     channelId,
-    color: channelColor(channelId),
-    label: channelChipLabel(channelId),
+    color: channelColor(displayNumber),
+    label: channelChipLabel(displayNumber),
     peers: members.filter((m) => m.agent_id !== selfAgentId).map((m) => m.name),
     direction: me?.direction ?? "receiver",
     canSend: me?.can_send ?? false,

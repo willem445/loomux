@@ -456,7 +456,7 @@ function applyChannelEvent(payload: OrchChannelEvent, wiring: OrchWiring): void 
       const agentId = pane.orchAgentId ?? pane.channelAgentAgentId;
       if (!agentId) continue;
       if (activeIds.has(agentId)) {
-        pane.setConnected(channelBadge(payload.channel_id, payload.members, agentId));
+        pane.setConnected(channelBadge(payload.channel_id, payload.display_number, payload.members, agentId));
       } else if (clearIds.has(agentId)) {
         pane.setConnected(null);
       }
@@ -631,7 +631,7 @@ async function handlePaneMenuAction(action: PaneMenuAction, pane: Pane): Promise
 async function hydratePaneChannel(pane: Pane, group: string, agentId: string): Promise<void> {
   try {
     const ch = await channelForPane(group, agentId);
-    if (ch) pane.setConnected(channelBadge(ch.id, ch.members, agentId));
+    if (ch) pane.setConnected(channelBadge(ch.id, ch.display_number, ch.members, agentId));
   } catch {
     /* best-effort */
   }
@@ -914,6 +914,11 @@ export interface OrchChannel {
   id: string;
   created_ms?: number;
   sender: string;
+  /** The pane chip's number (mod.rs's `Channel.display_number`) — the lowest
+   *  positive integer not used by any other live channel, NOT `id`'s numeric
+   *  suffix (#271 follow-up: the suffix never stops climbing, even across a
+   *  disconnect — see channel.ts's `channelColor` doc). */
+  display_number: number;
   members: ChannelMember[];
 }
 
@@ -986,6 +991,11 @@ export interface OrchChannelEvent {
   agent?: string;
   /** Present on connected/updated: the channel's current sender. */
   sender?: string;
+  /** The chip number (mod.rs's `Channel.display_number`) — present on every
+   *  kind, including `closed` (captured before teardown), so a `connected`/
+   *  `disconnected`/`updated` handler always has it on hand without a second
+   *  lookup. */
+  display_number: number;
   /** Current membership after the change (empty on `closed`). */
   members: ChannelMember[];
 }
