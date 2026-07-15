@@ -12,7 +12,7 @@ use loomux_lib::orchestration::workflow;
 use loomux_lib::orchestration::{
     add_trusted_folder, autonomy_budget_exhausted, bracketed_paste, classify_human_input,
     claude_permission_mode, cli_ready, copilot_autopilot_prompt_detected, create_orchestration_group,
-    exit_diagnostic, resolve_output_text,
+    exit_cause, exit_diagnostic, resolve_output_text,
     gh_gate_decision, gh_is_merge_invocation, gh_positionals, gh_release_action, gh_repo_flag,
     gh_shim_sh, git_shim_sh, git_tag_push, grant_segment, grant_unexpired, hold_for_human_input,
     hold_until_quiet, idle_output_is_activity, idle_should_kill, idle_tick_should_fire,
@@ -726,6 +726,27 @@ fn exit_diagnostic_snippet_is_bounded_not_the_whole_captured_tail() {
     let huge = "x".repeat(10_000);
     let msg = exit_diagnostic(&huge, 10_000);
     assert!(msg.len() < 1000, "snippet must be bounded, got {} chars", msg.len());
+}
+
+#[test]
+fn exit_cause_never_misdiagnoses_an_expected_kill_of_a_productive_agent() {
+    // The bug: `PtyManager::kill` (pty.rs) removes the pty handle from the
+    // live map BEFORE the waiter thread can snapshot it, so an idle-kill or
+    // kill_agent of a delegate that produced plenty of real output STILL
+    // arrives here with tail="" and total_bytes==0 — indistinguishable, by
+    // the numbers alone, from a genuine silent death. `expected` is the only
+    // thing that tells them apart, and it must win: an expected exit is never
+    // reported as "produced no output" / "missing/corrupt session", however
+    // little the (unreliable, in this case) tail/total say was captured.
+    let msg = exit_cause(true, "", 0);
+    assert!(!msg.contains("no output"), "an expected kill must never be misdiagnosed: {msg}");
+    assert!(!msg.contains("corrupt"), "must not blame a corrupt session on a deliberate stop: {msg}");
+    assert!(msg.contains("stopped"), "must say loomux stopped it, got: {msg}");
+
+    // An UNEXPECTED exit with the exact same (tail="", total=0) numbers is the
+    // real #281 signature and must still get the full diagnostic.
+    let msg = exit_cause(false, "", 0);
+    assert!(msg.contains("no output"), "an unexpected silent exit must still be diagnosed: {msg}");
 }
 
 #[test]

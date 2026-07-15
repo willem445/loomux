@@ -3548,18 +3548,46 @@ fn tail_snippet(s: &str, n: usize) -> &str {
 
 /// The diagnostic clause `on_pty_exit` puts in its orchestrator notice (#281):
 /// a bare exit code can't distinguish "produced real output, then failed" from
-/// "died before printing a single byte" (the resume-CLI-boots-and-immediately-
-/// dies signature this issue is about) — `total_bytes == 0` names that case
-/// explicitly instead of leaving the orchestrator to guess. Factored out as a
-/// pure function (no pty/app handle needed) so it's directly unit-testable.
+/// "exited before printing a single byte" (the resume-CLI-boots-and-
+/// immediately-exits signature this issue is about) — `total_bytes == 0` names
+/// that case explicitly instead of leaving the orchestrator to guess. Only
+/// ever called for an exit loomux did NOT itself cause (see `on_pty_exit`'s
+/// `expected` guard), but still covers a clean, voluntary exit_code 0 that
+/// happened to produce nothing — so the wording says "exited", never "died"
+/// or "crashed", which would misname a graceful (if unhelpfully silent) stop
+/// as a failure. Factored out as a pure function (no pty/app handle needed)
+/// so it's directly unit-testable.
 pub fn exit_diagnostic(tail: &str, total_bytes: u64) -> String {
     if total_bytes == 0 {
-        "produced no output before exiting — it likely died before the CLI printed \
+        "produced no output before exiting — it likely exited before the CLI printed \
          anything at all (a missing/corrupt session file, a rejected resume flag, or \
          a gone cwd are the usual causes)"
             .to_string()
     } else {
-        format!("last output before it died: {:?}", tail_snippet(tail, 400))
+        format!("last output before it exited: {:?}", tail_snippet(tail, 400))
+    }
+}
+
+/// The `cause` clause `on_pty_exit` puts in its notice — `exit_diagnostic`,
+/// gated behind whether loomux itself caused this exit.
+///
+/// This gate exists because `PtyManager::kill` (pty.rs) removes the pty
+/// handle from its live map BEFORE the waiter thread ever gets to snapshot
+/// its output, so an `expected` exit (kill_agent, idle-kill, a pane close)
+/// always arrives here with `tail == ""` and `total_bytes == 0` — REGARDLESS
+/// of how much real work the agent actually did. Feeding that straight into
+/// `exit_diagnostic` would misdiagnose a productive delegate the orchestrator
+/// deliberately stopped as having silently died before printing anything,
+/// pointing it at a corrupt session file or a bad resume flag that was never
+/// the issue. The diagnostic is only meaningful for an exit loomux did NOT
+/// cause; an expected one gets a plain, honest "loomux stopped it" instead.
+/// Pure so this gate — the actual fix — is directly unit-testable without the
+/// live pty/bind machinery `on_pty_exit` itself needs.
+pub fn exit_cause(expected: bool, tail: &str, total_bytes: u64) -> String {
+    if expected {
+        "loomux stopped it (kill or idle-timeout) — not a crash".to_string()
+    } else {
+        exit_diagnostic(tail, total_bytes)
     }
 }
 
@@ -10373,7 +10401,23 @@ impl OrchRegistry {
     /// signature: a resumed CLI that exited before printing a single byte,
     /// which a bare exit code can't be told apart from "it did real work and
     /// then failed" — the orchestrator's notice below says which happened.
-    pub fn on_pty_exit(&self, pty_id: u32, exit_code: Option<u32>, tail: &str, total_bytes: u64) {
+    /// `expected` is true when loomux itself initiated this exit (kill_agent,
+    /// idle-kill, pane close) — see `PtyManager::kill`, which removes the pty
+    /// handle from the live map BEFORE this ever runs, so `tail`/`total_bytes`
+    /// are always empty/zero on an expected exit regardless of how much real
+    /// output the agent produced. Without this flag, a productive delegate
+    /// that the orchestrator deliberately stopped would get the exact same
+    /// "produced no output before exiting" misdiagnosis as a genuine silent
+    /// death — the diagnostic is only meaningful for an exit loomux did NOT
+    /// cause, so an expected one skips it entirely.
+    pub fn on_pty_exit(
+        &self,
+        pty_id: u32,
+        exit_code: Option<u32>,
+        tail: &str,
+        total_bytes: u64,
+        expected: bool,
+    ) {
         let agent_id = match self.by_pty.lock_safe().get(&pty_id).cloned() {
             Some(id) => id,
             None => return,
@@ -10387,7 +10431,7 @@ impl OrchRegistry {
         if let Some(a) = self.mark_dead(&agent_id, exit_code) {
             if a.role != Role::Orchestrator {
                 let elapsed_ms = now_ms().saturating_sub(started_ms);
-                let cause = exit_diagnostic(tail, total_bytes);
+                let cause = exit_cause(expected, tail, total_bytes);
                 let _ = self.deliver_to_orchestrator(
                     &a.group,
                     &format!(

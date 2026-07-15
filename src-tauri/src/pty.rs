@@ -925,7 +925,7 @@ pub fn spawn_pty(
             &format!("id={id} code={exit_code:?} expected={expected} bytes={total}"),
         );
         if let Some(reg) = app.try_state::<Arc<crate::orchestration::OrchRegistry>>() {
-            reg.on_pty_exit(id, exit_code, &tail, total);
+            reg.on_pty_exit(id, exit_code, &tail, total, expected);
         }
         let _ = app.emit("pty-exit", ExitPayload { id, exit_code, expected });
     });
