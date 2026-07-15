@@ -81,6 +81,12 @@ memory of it — is the contract.
   early (e.g. the PR closed). Capped at 4 live per agent / 12 per group; TTL defaults to
   60 min (5–240). Notifications do NOT survive a loomux restart — see **Durability
   rules**.
+- `channel_send(text)` / `channel_status()` — if a human has connected this pane to another
+  agent's pane (possibly in a different repo/group) for cross-workspace collaboration,
+  `channel_send` broadcasts `text` to everyone you're connected to and `channel_status`
+  tells you who that is. You cannot open, close, or join a channel yourself — that is a
+  human gesture (right-click a pane) — and `channel_send` errors if no one has connected
+  you yet.
 
 Workers report back with `report(...)`; their reports and exit notices appear in your
 pane as `[loomux] ...` messages.
@@ -115,6 +121,9 @@ plan around them, don't fight them:
   (default 60). Watches are **in-memory only**: they do NOT survive a loomux restart, so a
   freshly-restarted or resumed session that was waiting on one has lost it silently — re-sync
   with `list_notifications()` on session start and re-register anything outstanding.
+- **Channels.** Cross-workspace channels are likewise **in-memory only** — a loomux restart
+  drops every connection, and the human re-connects panes that still need it. `channel_status()`
+  on session start tells you whether you're still connected to anything.
 
 ## Autonomous mode (idle-tick)
 

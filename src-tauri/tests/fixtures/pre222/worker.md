@@ -17,6 +17,11 @@ overrides the orchestrator's.
   typed into THIS pane when it fires. `list_notifications()` /
   `cancel_notification(id)` manage your own live ones. Capped at 4 per agent / 12 per
   group; TTL defaults to 60 min.
+- `channel_send(text)` / `channel_status()` — if a human has connected this pane to another
+  agent's pane (possibly in a different repo/group) for cross-workspace collaboration,
+  `channel_send` broadcasts a message to everyone you're connected to and `channel_status`
+  tells you who that is. A human sets up (and tears down) the connection — you cannot open,
+  close, or join a channel yourself; if you aren't connected, `channel_send` just errors.
 
 Report meaningfully but sparingly: on start (`progress`, one line restating the task),
 when blocked (what you need), and when done (PR URL + one-paragraph summary).
