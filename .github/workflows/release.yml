@@ -7,8 +7,98 @@ on:
 permissions:
   contents: write
 
+# Serializes runs of the SAME tag. `create-release`'s idempotence check
+# (look up a release for this tag, reuse if found) closes the per-leg race
+# within one run, but two separate RUNS of this workflow for the same tag
+# (a tag force-moved and re-pushed while the first run is still in flight,
+# or a manual re-trigger) could still both pass that lookup before either
+# has created the release — a cross-run TOCTOU version of the same #282
+# race. Queuing the second run behind the first removes the race instead of
+# re-checking harder.
+#
+# cancel-in-progress is deliberately false: cancelling a release run
+# mid-flight can leave a build matrix half-uploaded or a draft promoted
+# without npm published, and a cancelled run's partial state is exactly
+# what #282's race exploited. Queuing (not cancelling) means the first run
+# always finishes cleanly before the second starts, so the second run's
+# create-release lookup finds a fully-formed release (or none at all) —
+# never one still being written to.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
+  # Creates the draft release ONCE and hands every build leg its id via
+  # `releaseId` (tauri-action supports uploading to an existing release).
+  # Previously each matrix leg independently ran tauri-action's own
+  # listReleases-or-create lookup, which upstream tauri-apps/tauri-action#914
+  # documents as racy (~3%) when legs start near-simultaneously — two legs
+  # can each fail to find a release and each create one, leaving two drafts
+  # for the same tag. `promote` (below) only knows how to flip ONE release
+  # public, so the other draft's assets are silently stranded. This is not
+  # theoretical: it hit v0.9.0's first live run (run 29375160820) — 5/9
+  # assets went public, 4 were stranded on a stray draft that had to be
+  # recovered by hand (#282).
+  #
+  # Idempotent by construction: if a release for this tag already exists
+  # (e.g. a human clicked "Re-run all jobs" after a partial failure, so this
+  # job runs again against a tag whose draft `create-release` already made),
+  # reuse it instead of creating a second one. This closes the other half of
+  # #282 — the old per-leg lookup regressed on exactly this case, spawning a
+  # fresh duplicate draft on every re-run.
+  create-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      release_id: ${{ steps.create-release.outputs.result }}
+    steps:
+      - name: Create or reuse the draft release
+        id: create-release
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner
+            const repo = context.repo.repo
+            const tag = process.env.GITHUB_REF_NAME
+
+            const { data: releases } = await github.rest.repos.listReleases({ owner, repo })
+            const existing = releases.find((r) => r.tag_name === tag)
+            if (existing) {
+              core.info(`Reusing existing release ${existing.id} for ${tag} (draft=${existing.draft})`)
+              return existing.id
+            }
+
+            const { data } = await github.rest.repos.createRelease({
+              owner,
+              repo,
+              tag_name: tag,
+              name: `Loomux ${tag}`,
+              body: [
+                "Download the asset for your platform below.",
+                "",
+                "- **Windows**: `*-setup.exe` (installer) or `*.msi`",
+                "- **macOS**: `*_aarch64.dmg` (Apple Silicon) or `*_x64.dmg` (Intel) — unsigned; if macOS reports the app as damaged, run `xattr -cr /Applications/Loomux.app`",
+                "- **Linux**: `*.AppImage` (portable), `*.deb`, or `*.rpm`",
+                "",
+                "Or use the one-liner installers in the README.",
+              ].join("\n"),
+              // Draft, not public: build is a matrix (4 legs uploading assets
+              // separately) and any leg can fail after others have already
+              // uploaded. A non-draft release is visible as `latest` the
+              // moment it's created, so a partial-failure run would leave a
+              // public release missing assets that install.sh/install.ps1
+              // resolve and 404 on. `promote` (below) is the only step
+              // allowed to flip this public, and only after every leg has
+              // succeeded AND the asset count checks out (#275, #282).
+              draft: true,
+              prerelease: false,
+            })
+            core.info(`Created release ${data.id} for ${tag}`)
+            return data.id
+
   build:
+    needs: create-release
     strategy:
       fail-fast: false
       matrix:
@@ -57,45 +147,82 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
+          # Targeting the release `create-release` already made, not
+          # tagName/releaseDraft lookup — eliminates the per-leg race
+          # entirely (#282). tagName is still passed so a future updater
+          # config gets a tag-scoped latest.json instead of the
+          # releases/latest/download fallback tauri-action uses when only
+          # releaseId is set.
+          releaseId: ${{ needs.create-release.outputs.release_id }}
           tagName: ${{ github.ref_name }}
-          releaseName: "Loomux ${{ github.ref_name }}"
-          releaseBody: |
-            Download the asset for your platform below.
-
-            - **Windows**: `*-setup.exe` (installer) or `*.msi`
-            - **macOS**: `*_aarch64.dmg` (Apple Silicon) or `*_x64.dmg` (Intel) — unsigned; if macOS reports the app as damaged, run `xattr -cr /Applications/Loomux.app`
-            - **Linux**: `*.AppImage` (portable), `*.deb`, or `*.rpm`
-
-            Or use the one-liner installers in the README.
-          # Draft, not public: build is a matrix (4 legs uploading assets
-          # separately) and any leg can fail after others have already
-          # uploaded. A non-draft release is visible as `latest` the moment
-          # it's created, so a partial-failure run would leave a public
-          # release missing assets that install.sh/install.ps1 resolve and
-          # 404 on. `promote` (below) is the only step allowed to flip this
-          # public, and only after every leg has succeeded (#275).
-          releaseDraft: true
-          prerelease: false
           args: ${{ matrix.args }}
 
   # Flips the draft release from `build` to public — the only place `latest`
   # is allowed to start resolving to this release. Runs only if every build
   # matrix leg succeeded (`needs: build` + fail-fast:false means a single
   # failed leg fails the `build` job and skips this one, leaving the release
-  # stuck in draft rather than public-and-incomplete) (#275).
+  # stuck in draft rather than public-and-incomplete) (#275) — AND only if
+  # the release's own asset count matches the expected platform matrix.
+  # `needs: build` succeeding is necessary but not sufficient: the v0.9.0
+  # incident (#282) had `build` conclude 'success' while two legs had
+  # attached their assets to a stray duplicate draft instead of this one, so
+  # trusting the job graph alone let a 5/9-asset release go public. Counting
+  # assets on the exact release id (not a tag-based lookup, which is the
+  # same ambiguity that caused the incident) catches that even if a
+  # duplicate draft somehow reappears.
   promote:
-    needs: build
+    needs: [create-release, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      RELEASE_ID: ${{ needs.create-release.outputs.release_id }}
+      # Expected count: setup.exe + msi (Windows) + 2 dmg (macOS) +
+      # AppImage + deb + rpm (Linux) + 2 app.tar.gz (macOS updater
+      # bundles) = 9. Keep in lockstep with the SKILL.md release doc's
+      # asset checklist if the matrix ever changes.
+      EXPECTED_ASSETS: 9
     steps:
+      - name: Verify asset count before promoting
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          count=$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets" --jq 'length')
+          echo "Release $GITHUB_REF_NAME (id $RELEASE_ID) has $count/$EXPECTED_ASSETS assets"
+          if [ "$count" -lt "$EXPECTED_ASSETS" ]; then
+            echo "::error::Only $count/$EXPECTED_ASSETS assets on release $GITHUB_REF_NAME (id $RELEASE_ID) — refusing to promote. Staying draft; check for a stray duplicate release for this tag before retrying."
+            exit 1
+          fi
+
+      - name: Warn if release notes are empty
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # Non-fatal by design: a notes-less body isn't a reason to block a
+        # complete, correctly-counted release from going public — it's a
+        # human forgetting step 4 (SKILL.md), which happens after promote.
+        # This just makes that loud instead of silent, since the whole point
+        # of #282 is that release-quality problems (missing assets, and now
+        # missing notes) should surface in the run log, not get discovered
+        # after the fact.
+        run: |
+          set -euo pipefail
+          body=$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" --jq '.body // ""')
+          if [ -z "$(printf '%s' "$body" | tr -d '[:space:]')" ]; then
+            echo "::warning::Release $GITHUB_REF_NAME (id $RELEASE_ID) has an empty body — promoting anyway. Write real release notes (SKILL.md step 4) targeting this exact release id before announcing."
+          fi
+
       - name: Publish the draft release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        # $GITHUB_REF_NAME/$GITHUB_REPOSITORY (default env vars), not
-        # ${{ }} template substitution, so a crafted tag name can't inject
-        # into the shell command — same convention as VERSION below.
-        run: gh release edit "$GITHUB_REF_NAME" --draft=false --repo "$GITHUB_REPOSITORY"
+        # $GITHUB_REPOSITORY (default env var), not ${{ }} template
+        # substitution, so a crafted tag/repo value can't inject into the
+        # shell command — same convention as VERSION in publish-npm below.
+        # Targets the release by RELEASE_ID (from create-release), not a
+        # tag-based `gh release edit <tag>` lookup — the whole point of
+        # #282 is that tag-based lookup is what let a stray duplicate slip
+        # through undetected.
+        run: gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" -f draft=false
 
   # Publish the tiny npm launcher (`npx loomux-desktop`). It just downloads
   # the release asset built above, but must wait for `promote` (not just

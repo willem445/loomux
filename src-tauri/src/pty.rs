@@ -128,14 +128,20 @@ pub struct PtyHandle {
     /// `None` when job creation failed (fail-soft) — pre-#78 behavior.
     #[cfg(target_os = "windows")]
     _job: Option<JobHandle>,
-    /// Whether a human's typed line is currently sitting UNSUBMITTED in this
-    /// pane's input box (#111). Tracked from the *content* of each human write,
-    /// not from output bytes: printable input sets it (the box now holds a line),
-    /// an Enter / line-clear resets it (the line was submitted or cleared). This
-    /// positive submit/clear signal is what lets prompt delivery hold a paste off
-    /// a human's half-written line without wedging on an already-submitted one —
-    /// output-byte heuristics can't tell a keystroke's echo from a submit burst.
-    input_pending: Arc<std::sync::atomic::AtomicBool>,
+    /// How many characters are currently sitting UNSUBMITTED in this pane's
+    /// input box (#111, refined by #171). Tracked from the *content* of each
+    /// human write, not from output bytes: printable input adds to the count,
+    /// backspace/DEL removes from it (clamped at zero), and an Enter /
+    /// line-clear resets it straight to zero. `input_pending()` reads this as
+    /// `> 0`. Counting rather than a bare flag is what lets a typed-then-fully-
+    /// backspaced line read back to empty — a flag set true by the first
+    /// keystroke has no signal short of Submit to ever flip back, which used to
+    /// leave prompt delivery holding a paste off an already-empty box for the
+    /// full 60s abort (#171). This positive submit/clear signal is what lets
+    /// prompt delivery hold a paste off a human's half-written line without
+    /// wedging on an already-submitted one — output-byte heuristics can't tell
+    /// a keystroke's echo from a submit burst.
+    input_box_len: Arc<std::sync::atomic::AtomicI64>,
     /// The interactive shell this pane *effectively* spawned (#194 P2) — after
     /// any discovery-miss fallback, not the requested kind. Recorded so the
     /// folder-picker `cd` (`change_dir`) emits the pane's own shell syntax — cmd,
@@ -200,7 +206,7 @@ impl PtyManager {
     /// before pasting so it never merge-submits a human's half-written line.
     pub fn input_pending(&self, id: u32) -> Option<bool> {
         let ptys = self.ptys.lock_safe();
-        Some(ptys.get(&id)?.input_pending.load(Ordering::Relaxed))
+        Some(ptys.get(&id)?.input_box_len.load(Ordering::Relaxed) > 0)
     }
 
     /// Monotonic count of bytes this pty has ever produced.
@@ -856,7 +862,7 @@ pub fn spawn_pty(
             user_input_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(target_os = "windows")]
             _job: job,
-            input_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            input_box_len: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             // Record what actually spawned, not what was requested, so the
             // folder-picker cd is truthful even after a discovery-miss fallback.
             shell_kind: effective_shell_kind(kind),
@@ -904,15 +910,28 @@ pub fn spawn_pty(
     let expected_exits = state.expected_exits.clone();
     std::thread::spawn(move || {
         let status = child.wait();
-        ptys.lock_safe().remove(&id);
+        // Snapshot the removed handle's output BEFORE it's dropped (#281): the
+        // instant this pty leaves the live map, its ring is gone — before this,
+        // a caller asking "why did this die" even a moment later got nothing
+        // ("terminal already closed"), which is exactly what made a resumed
+        // CLI's silent exit-1 opaque. Reading it off the removed handle itself
+        // (not the live map) means it survives the removal.
+        let removed = ptys.lock_safe().remove(&id);
+        let (tail, total) = match &removed {
+            Some(h) => {
+                let buf = h.output.lock_safe();
+                (crate::orchestration::strip_ansi(&buf.ring.iter().copied().collect::<Vec<u8>>()), buf.total)
+            }
+            None => (String::new(), 0),
+        };
         let expected = expected_exits.lock_safe().remove(&id);
         let exit_code = status.ok().map(|s| s.exit_code());
         crate::obs::breadcrumb(
             "pty-exit",
-            &format!("id={id} code={exit_code:?} expected={expected}"),
+            &format!("id={id} code={exit_code:?} expected={expected} bytes={total}"),
         );
         if let Some(reg) = app.try_state::<Arc<crate::orchestration::OrchRegistry>>() {
-            reg.on_pty_exit(id, exit_code);
+            reg.on_pty_exit(id, exit_code, &tail, total, expected);
         }
         let _ = app.emit("pty-exit", ExitPayload { id, exit_code, expected });
     });
@@ -971,13 +990,21 @@ pub fn write_pty(state: State<PtyManager>, id: u32, data: String) -> Result<(), 
             .unwrap_or(0),
         Ordering::Relaxed,
     );
-    // Track box occupancy from the keystroke's CONTENT (#111): printable input
-    // leaves a line sitting in the box; an Enter / line-clear empties it. Neutral
-    // edits (arrows, backspace, bare escape sequences) leave occupancy unchanged.
+    // Track box occupancy from the keystroke's CONTENT (#111): an Enter /
+    // line-clear empties the box outright; everything else (typed text,
+    // pastes, backspace/DEL) adjusts a running character count instead of a
+    // bare flag, so a line backspaced all the way back out reads as empty
+    // again rather than staying stuck "pending" until the 60s hold aborts a
+    // delivery (#171).
     match crate::orchestration::classify_human_input(&data) {
-        crate::orchestration::HumanInput::Content => pty.input_pending.store(true, Ordering::Relaxed),
-        crate::orchestration::HumanInput::Submit => pty.input_pending.store(false, Ordering::Relaxed),
-        crate::orchestration::HumanInput::Neutral => {}
+        crate::orchestration::HumanInput::Submit => pty.input_box_len.store(0, Ordering::Relaxed),
+        crate::orchestration::HumanInput::Content | crate::orchestration::HumanInput::Neutral => {
+            let delta = crate::orchestration::box_occupancy_delta(&data);
+            if delta != 0 {
+                let cur = pty.input_box_len.load(Ordering::Relaxed);
+                pty.input_box_len.store((cur + delta as i64).max(0), Ordering::Relaxed);
+            }
+        }
     }
     pty.writer
         .write_all(data.as_bytes())

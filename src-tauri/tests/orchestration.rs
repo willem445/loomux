@@ -10,10 +10,11 @@ use loomux_lib::orchestration::mcp::dispatch;
 use loomux_lib::orchestration::notify;
 use loomux_lib::orchestration::workflow;
 use loomux_lib::orchestration::{
-    add_trusted_folder, autonomy_budget_exhausted, bracketed_paste, channel_connected_event,
-    channel_disconnected_event, channel_message_text, channel_updated_event,
-    classify_human_input,
+    add_trusted_folder, autonomy_budget_exhausted, bracketed_paste, box_occupancy_delta,
+    channel_connected_event, channel_disconnected_event, channel_message_text,
+    channel_updated_event, classify_human_input,
     claude_permission_mode, cli_ready, copilot_autopilot_prompt_detected, create_orchestration_group,
+    exit_cause, exit_diagnostic, resolve_output_text,
     gh_gate_decision, gh_is_merge_invocation, gh_positionals, gh_release_action, gh_repo_flag,
     gh_shim_sh, git_shim_sh, git_tag_push, grant_segment, grant_unexpired, hold_for_human_input,
     hold_until_quiet, idle_output_is_activity, idle_should_kill, idle_tick_should_fire,
@@ -26,9 +27,10 @@ use loomux_lib::orchestration::{
     should_flush_before_paste,
     should_notify_paste_held, should_notify_unconfirmed, single_pane_autopilot_flags,
     spawn_rate_exceeded, spawn_request_expired, strip_ansi, submit_confirmed, submit_sequence,
+    cap_task_notes, task_summary,
     unconfirmed_delivery_notice, watchdog_should_notify, worktree_cleanup_targets,
-    AttentionItem, Caller, Delivery, Guardrails, HumanInput, Launch, NameSource, OrchRegistry, PasteDecision,
-    PersonaInject,
+    AgentRecord, AttentionItem, Caller, Delivery, Guardrails, HumanInput, Launch, NameSource, OrchRegistry, PasteDecision,
+    PersonaInject, Task, TaskNote,
     PasteGate, Role, TaskPatch, UsageSnapshot, CLAUDE_UNATTENDED_ALLOW, COPILOT_AUTOPILOT_CONFIRM_KEYS,
     COPILOT_GROUP_AUTOPILOT_FLAGS, COPILOT_UNATTENDED_FLAGS, MAX_ATTACHMENT_BYTES,
     PLANNER_READONLY_NOTE, SOLO_GROUP,
@@ -693,6 +695,86 @@ fn unconfirmed_notice_text_names_the_agent_and_the_recovery_move() {
     // Points the orchestrator at the recovery move from the template.
     assert!(msg.contains("get_output"), "notice must point at reading the pane: {msg}");
     assert!(msg.contains("re-send"), "notice must point at re-sending: {msg}");
+}
+
+// ---------- #281: surfacing a silent early exit ----------
+
+#[test]
+fn exit_diagnostic_names_the_silent_death_when_nothing_was_ever_printed() {
+    // The #281 signature: a resumed CLI that exits before printing a single
+    // byte. A bare exit code can't distinguish this from "did real work, then
+    // failed" — the notice must say so explicitly.
+    let msg = exit_diagnostic("", 0);
+    assert!(msg.contains("no output"), "must name the zero-output case: {msg}");
+    assert!(
+        msg.contains("session") || msg.contains("cwd") || msg.contains("flag"),
+        "must suggest plausible causes so the orchestrator has somewhere to look: {msg}"
+    );
+}
+
+#[test]
+fn exit_diagnostic_shows_the_tail_when_the_process_actually_produced_output() {
+    // A crash mid-work is a different failure than a silent DOA death — the
+    // notice must carry what the CLI actually printed, not the zero-output
+    // wording, and must never invent content that wasn't captured.
+    let msg = exit_diagnostic("Error: something broke\npanic at line 9", 42);
+    assert!(!msg.contains("no output"), "must not claim silence when bytes were produced: {msg}");
+    assert!(msg.contains("something broke"), "must carry the real captured output: {msg}");
+}
+
+#[test]
+fn exit_diagnostic_snippet_is_bounded_not_the_whole_captured_tail() {
+    // A saturated ring can be large; the orchestrator notice is a diagnostic
+    // hint, not a full transcript dump.
+    let huge = "x".repeat(10_000);
+    let msg = exit_diagnostic(&huge, 10_000);
+    assert!(msg.len() < 1000, "snippet must be bounded, got {} chars", msg.len());
+}
+
+#[test]
+fn exit_cause_never_misdiagnoses_an_expected_kill_of_a_productive_agent() {
+    // The bug: `PtyManager::kill` (pty.rs) removes the pty handle from the
+    // live map BEFORE the waiter thread can snapshot it, so an idle-kill or
+    // kill_agent of a delegate that produced plenty of real output STILL
+    // arrives here with tail="" and total_bytes==0 — indistinguishable, by
+    // the numbers alone, from a genuine silent death. `expected` is the only
+    // thing that tells them apart, and it must win: an expected exit is never
+    // reported as "produced no output" / "missing/corrupt session", however
+    // little the (unreliable, in this case) tail/total say was captured.
+    let msg = exit_cause(true, "", 0);
+    assert!(!msg.contains("no output"), "an expected kill must never be misdiagnosed: {msg}");
+    assert!(!msg.contains("corrupt"), "must not blame a corrupt session on a deliberate stop: {msg}");
+    assert!(msg.contains("stopped"), "must say loomux stopped it, got: {msg}");
+
+    // An UNEXPECTED exit with the exact same (tail="", total=0) numbers is the
+    // real #281 signature and must still get the full diagnostic.
+    let msg = exit_cause(false, "", 0);
+    assert!(msg.contains("no output"), "an unexpected silent exit must still be diagnosed: {msg}");
+}
+
+#[test]
+fn agent_output_tail_prefers_live_output_but_falls_back_to_the_captured_exit_tail() {
+    // Live output (the pty is still alive) always wins over whatever was
+    // captured at a PAST exit.
+    assert_eq!(
+        resolve_output_text(Some("live text".to_string()), Some("stale exit tail")).unwrap(),
+        "live text"
+    );
+    // The live pty is gone (the agent exited) — #281's fallback answers with
+    // what was captured at exit time instead of failing outright.
+    assert_eq!(
+        resolve_output_text(None, Some("captured at exit")).unwrap(),
+        "captured at exit"
+    );
+    // Nothing live AND nothing captured (a plain pane, or one that exited
+    // before #281 shipped) — the original "terminal already closed" error,
+    // not a fabricated answer.
+    let err = resolve_output_text(None, None).unwrap_err();
+    assert!(err.contains("already closed"), "must keep the original error, got: {err}");
+    // An empty captured tail is the same as nothing captured — never "answer"
+    // with an empty string as if that were meaningful output.
+    let err = resolve_output_text(None, Some("")).unwrap_err();
+    assert!(err.contains("already closed"), "empty capture must not be treated as an answer: {err}");
 }
 
 #[test]
@@ -1760,6 +1842,130 @@ fn task_lifecycle_create_edit_note_delete() {
     assert!(reg.delete_task(&g.id, "human", &t.id).is_err());
 }
 
+// ---------- #245: compact list_tasks + note cap ----------
+
+fn note(ts_ms: u64, text: &str) -> TaskNote {
+    TaskNote { ts_ms, author: "orch".into(), text: text.into() }
+}
+
+#[test]
+fn task_summary_drops_notes_but_counts_them() {
+    let t = Task {
+        id: "t-1".into(),
+        title: "Fix parser".into(),
+        status: "in-progress".into(),
+        issue: Some("#7".into()),
+        pr: None,
+        assignee: Some("w-2".into()),
+        session: Some("sess-1".into()),
+        notes: vec![note(1, "a"), note(2, "b"), note(3, "c")],
+        updated_ms: 42,
+    };
+    let s = task_summary(&t);
+    assert_eq!(s.id, "t-1");
+    assert_eq!(s.title, "Fix parser");
+    assert_eq!(s.status, "in-progress");
+    assert_eq!(s.issue.as_deref(), Some("#7"));
+    assert_eq!(s.assignee.as_deref(), Some("w-2"));
+    assert_eq!(s.session.as_deref(), Some("sess-1"));
+    assert_eq!(s.updated_ms, 42);
+    assert_eq!(s.note_count, 3, "every note counts, even though the text is dropped");
+    // The summary must serialize with no notes field at all — a caller reading
+    // raw JSON (as an MCP client does) must never see note text.
+    let v = serde_json::to_value(&s).unwrap();
+    assert!(v.get("notes").is_none(), "TaskSummary must not carry a notes field");
+}
+
+#[test]
+fn cap_task_notes_leaves_under_cap_history_untouched() {
+    let notes = vec![note(1, "a"), note(2, "b"), note(3, "c")];
+    let capped = cap_task_notes(notes.clone(), 20);
+    assert_eq!(capped.len(), 3);
+    assert_eq!(capped[0].text, "a", "no collapse below the cap");
+}
+
+#[test]
+fn cap_task_notes_collapses_oldest_excess_into_one_placeholder() {
+    // 25 notes capped at 5: keep the newest 4 verbatim + 1 placeholder = 5.
+    let notes: Vec<TaskNote> = (1..=25).map(|i| note(i, &format!("note-{i}"))).collect();
+    let capped = cap_task_notes(notes, 5);
+    assert_eq!(capped.len(), 5, "collapsed history stays at exactly the cap");
+    assert!(
+        capped[0].text.contains("21 earlier notes collapsed"),
+        "the placeholder names how many it swallowed: {}",
+        capped[0].text
+    );
+    assert_eq!(capped[0].ts_ms, 1, "the placeholder is timestamped at the oldest note it swallowed");
+    // The newest 4 real notes survive verbatim, oldest-of-the-kept first.
+    assert_eq!(capped[1].text, "note-22");
+    assert_eq!(capped[2].text, "note-23");
+    assert_eq!(capped[3].text, "note-24");
+    assert_eq!(capped[4].text, "note-25");
+}
+
+#[test]
+fn cap_task_notes_zero_means_uncapped() {
+    let notes: Vec<TaskNote> = (1..=25).map(|i| note(i, &format!("note-{i}"))).collect();
+    let capped = cap_task_notes(notes.clone(), 0);
+    assert_eq!(capped.len(), 25, "max=0 must not be read as \"drop everything\"");
+}
+
+#[test]
+fn cap_task_notes_placeholder_count_accumulates_across_repeated_collapses() {
+    // Review finding on #245: cap_task_notes runs once PER APPEND in the real
+    // path (upsert_task calls it after every single note push), not once over
+    // a big batch — so a placeholder from an earlier round routinely gets
+    // swept into a later collapse. The reported count must accumulate the
+    // TRUE total dropped over the task's lifetime, not reset to "how many
+    // this round" (which, at steady state one-at-a-time, was always the same
+    // small number no matter how much history had actually rolled off).
+    let mut notes: Vec<TaskNote> = Vec::new();
+    for i in 1..=30u64 {
+        notes.push(note(i, &format!("note-{i}")));
+        notes = cap_task_notes(notes, 20);
+    }
+    assert_eq!(notes.len(), 20);
+    assert!(
+        notes[0].text.contains("11 earlier notes collapsed"),
+        "the true cumulative count (11 notes rolled off across repeated collapses) must survive, \
+         not reset every round: {}",
+        notes[0].text
+    );
+    assert_eq!(notes[0].ts_ms, 1, "the oldest timestamp is still the very first note ever dropped");
+    // The newest max-1 real notes are kept verbatim regardless.
+    assert_eq!(notes[1].text, "note-12");
+    assert_eq!(notes.last().unwrap().text, "note-30");
+}
+
+#[test]
+fn upsert_task_caps_live_note_history_as_notes_accumulate() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let mut t = reg.upsert_task(&g.id, "orch", None, patch(Some("Long-running task"), None, None)).unwrap();
+    for i in 0..30 {
+        t = reg
+            .upsert_task(&g.id, "orch", Some(&t.id), patch(None, None, Some(&format!("update {i}"))))
+            .unwrap();
+    }
+    assert_eq!(t.notes.len(), 20, "live notes stay capped even after 30 appends");
+    assert!(
+        t.notes[0].text.contains("collapsed"),
+        "the oldest surviving entry is the collapse placeholder: {}",
+        t.notes[0].text
+    );
+    // The newest note is always exactly what was just appended.
+    assert_eq!(t.notes.last().unwrap().text, "update 29");
+    // list_tasks (task_summaries) never carries this text at all.
+    let summaries = reg.task_summaries(&g.id);
+    let s = summaries.iter().find(|s| s.id == t.id).unwrap();
+    assert_eq!(s.note_count, 20);
+    let v = serde_json::to_value(&summaries).unwrap();
+    assert!(!v.to_string().contains("update 29"), "no note text leaks into the compact summaries");
+    // get_task still returns the full (capped) history.
+    let full = reg.get_task(&g.id, &t.id).unwrap();
+    assert_eq!(full.notes.len(), 20);
+}
+
 #[test]
 fn delete_done_removes_only_done_and_notifies_once() {
     // #120: the board's "delete all done" clears every done task in one action,
@@ -1916,11 +2122,31 @@ fn task_tools_are_role_gated_but_listing_is_shared() {
         &json!({ "name": "upsert_task", "arguments": { "title": "Fix parser", "status": "in-progress", "issue": "#7" } }))
         .unwrap();
     assert_eq!(ok["isError"], false);
+    let id = ok["content"][0]["text"].as_str().unwrap().split_whitespace().next().unwrap().to_string();
+    dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "upsert_task", "arguments": { "id": id, "note": "reviewer flagged an edge case in the parser" } }))
+        .unwrap();
+
     let listed = dispatch(&reg, &cw, "tools/call",
         &json!({ "name": "list_tasks", "arguments": {} })).unwrap();
     let text = listed["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("Fix parser") && text.contains("#7"),
         "workers must be able to read the board");
+    // #245: list_tasks must return compact rows — no notes array, note_count instead.
+    assert!(!text.contains("edge case"), "note text must not appear in the compact list_tasks view: {text}");
+    assert!(!text.contains("\"notes\""), "compact rows must not carry a notes field: {text}");
+    assert!(text.contains("note_count"), "compact rows surface a note_count: {text}");
+
+    // get_task fetches the full record, including the note.
+    let detail = dispatch(&reg, &cw, "tools/call",
+        &json!({ "name": "get_task", "arguments": { "id": id } })).unwrap();
+    let dtext = detail["content"][0]["text"].as_str().unwrap();
+    assert!(dtext.contains("edge case"), "get_task returns the full note text: {dtext}");
+
+    // Unknown id is a clean error, not a panic.
+    let missing = dispatch(&reg, &cw, "tools/call",
+        &json!({ "name": "get_task", "arguments": { "id": "t-999" } })).unwrap();
+    assert_eq!(missing["isError"], true);
 }
 
 #[test]
@@ -3021,6 +3247,127 @@ fn resume_of_worker_session_keeps_its_original_block_not_the_roster_default() {
         resumed_agent["block"], "worker-fast",
         "resume must keep the ORIGINAL block, not the roster's file-order default: {after}"
     );
+}
+
+// ---------- #190: resume_session prefix resolution ----------
+
+/// Write a synthetic roster (`agents.json`) directly, bypassing spawn/kill —
+/// the prefix-resolution tests need FULL session ids that share a chosen
+/// prefix, which real (randomly-minted) session ids can't be made to do.
+fn write_roster(reg: &OrchRegistry, group: &str, sessions: &[&str]) {
+    let records: Vec<AgentRecord> = sessions
+        .iter()
+        .enumerate()
+        .map(|(i, s)| AgentRecord {
+            id: format!("w-{i}"),
+            role: "worker".into(),
+            block: "worker".into(),
+            name: format!("worker {i}"),
+            name_source: NameSource::default(),
+            session: Some(s.to_string()),
+            cwd: ".".into(),
+            status: "dead".into(),
+            updated_ms: 0,
+        })
+        .collect();
+    fs::write(
+        reg.state_root().join(group).join("agents.json"),
+        serde_json::to_string(&records).unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn resume_session_unique_prefix_resolves_to_the_full_id() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let co = reg.resolve_token(&orch.token).unwrap();
+    let full = "e3bc3b80-1111-4111-8111-111111111111";
+    write_roster(&reg, &g.id, &[full]);
+    let dir = tempfile::tempdir().unwrap();
+
+    // Only the 8-char prefix a human would have copied/logged — issue #190's
+    // exact scenario — with an explicit kind so block-inheritance isn't in play.
+    let r = dispatch(&reg, &co, "tools/call", &json!({
+        "name": "spawn_agent",
+        "arguments": {
+            "kind": "worker",
+            "resume_session": "e3bc3b80",
+            "cwd": dir.path().to_string_lossy(),
+            "task": "follow-up",
+        },
+    })).unwrap();
+    assert_eq!(r["isError"], false, "a unique prefix must resolve, got: {r:?}");
+
+    // The spawned agent must be resumed under the FULL id, not the truncated
+    // prefix verbatim — proof the resolution actually substituted it, since
+    // `sanitize_session` alone would happily accept the bare 8-char string too.
+    let agents = reg.list_agents(&co.group);
+    let resumed = agents.as_array().unwrap().iter().find(|a| a["role"] == "worker").unwrap();
+    assert_eq!(
+        resumed["session"], json!(full),
+        "resumed agent must carry the resolved FULL session id, got: {agents}"
+    );
+}
+
+#[test]
+fn resume_session_ambiguous_prefix_fails_and_lists_candidates() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let co = reg.resolve_token(&orch.token).unwrap();
+    let (a, b) = (
+        "abc12345-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        "abc12345-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    );
+    write_roster(&reg, &g.id, &[a, b]);
+    let dir = tempfile::tempdir().unwrap();
+
+    let r = dispatch(&reg, &co, "tools/call", &json!({
+        "name": "spawn_agent",
+        "arguments": {
+            "kind": "worker",
+            "resume_session": "abc12345",
+            "cwd": dir.path().to_string_lossy(),
+            "task": "follow-up",
+        },
+    })).unwrap();
+    assert_eq!(r["isError"], true, "an ambiguous prefix must never silently pick one: {r:?}");
+    let text = r["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("ambiguous"), "error must say it's ambiguous, got: {text}");
+    assert!(text.contains(a) && text.contains(b), "error must list every candidate, got: {text}");
+
+    // And no agent must have been spawned as a side effect of the failed call.
+    let agents = reg.list_agents(&co.group);
+    assert!(
+        agents.as_array().unwrap().iter().all(|ag| ag["role"] != "worker"),
+        "an ambiguous resume must not have spawned anything: {agents}"
+    );
+}
+
+#[test]
+fn resume_session_unknown_prefix_is_distinguished_from_ambiguous() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let co = reg.resolve_token(&orch.token).unwrap();
+    write_roster(&reg, &g.id, &["e3bc3b80-1111-4111-8111-111111111111"]);
+    let dir = tempfile::tempdir().unwrap();
+
+    let r = dispatch(&reg, &co, "tools/call", &json!({
+        "name": "spawn_agent",
+        "arguments": {
+            "kind": "worker",
+            "resume_session": "deadbeef",
+            "cwd": dir.path().to_string_lossy(),
+            "task": "follow-up",
+        },
+    })).unwrap();
+    assert_eq!(r["isError"], true, "a never-seen prefix must fail, got: {r:?}");
+    let text = r["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("unknown session"), "error must name it as unknown, got: {text}");
+    assert!(!text.contains("ambiguous"), "unknown and ambiguous must be distinguishable, got: {text}");
 }
 
 #[test]
@@ -4437,6 +4784,244 @@ fn gh_shim_harness_grant_authorizes_one_merge_and_releases_are_gated() {
     assert!(!run(&["release", "create", "v4.0.1"], "0"), "dangerous is ignored while autonomous → release blocked");
 }
 
+/// A fake `gh` that mirrors the REAL `gh`'s split behavior the #294 bug hinged on:
+/// `pr view` accepts `-R`, but `repo view` rejects it exactly like the real CLI
+/// ("unknown shorthand flag: 'R' in -R") — any `-R`/`--repo` token reaching `repo
+/// view` here fails, so this only passes if the shim stops forwarding `$rf` to it.
+fn write_fake_gh_rejecting_dash_r_on_repo_view(root: &std::path::Path, log: &std::path::Path) -> std::path::PathBuf {
+    let p = root.join("fakegh_norepo_r");
+    std::fs::write(&p, format!(
+        "#!/bin/sh\n\
+         echo \"ARGS: $*\" >> \"{log}\"\n\
+         if [ \"$1\" = \"pr\" ] && [ \"$2\" = \"view\" ]; then printf '%s %s\\n' \"$FAKE_BASE\" \"$FAKE_NUM\"; exit 0; fi\n\
+         if [ \"$1\" = \"repo\" ] && [ \"$2\" = \"view\" ]; then\n\
+         \x20 shift 2\n\
+         \x20 for a in \"$@\"; do case \"$a\" in -R|--repo|-R?*|--repo=*) printf 'unknown shorthand flag: '\\''R'\\'' in -R\\n' >&2; exit 1 ;; esac; done\n\
+         \x20 printf '%s\\n' \"$FAKE_DEFAULT\"; exit 0\n\
+         fi\n\
+         printf 'MERGED\\n'; exit 0\n",
+        log = log.display()
+    )).unwrap();
+    p
+}
+
+#[test]
+fn gh_shim_harness_granted_merge_with_dash_r_repo_is_allowed_not_blocked_as_unverifiable_base() {
+    // #294 live incident: a granted `gh pr merge N -R owner/repo` blocked as
+    // "unverifiable-base" because the shim forwarded -R to `gh repo view`, which
+    // rejects it. Proven against the REAL generated shim + a fake gh that rejects
+    // -R on `repo view` exactly like the real CLI (see helper above) — this test
+    // fails on the pre-fix shim (default-branch lookup comes back empty → block)
+    // and passes once `repo view` is called with the repo positionally.
+    use std::process::Command;
+    if Command::new("sh").arg("-c").arg("exit 0").status().map(|s| !s.success()).unwrap_or(true) {
+        eprintln!("SKIP gh_shim_harness_granted_merge_with_dash_r…: no POSIX sh");
+        return;
+    }
+    let td = tempfile::tempdir().unwrap();
+    let root = td.path();
+    let group = root.join("group");
+    std::fs::create_dir_all(&group).unwrap();
+    let log = root.join("gh.log");
+    let fake = write_fake_gh_rejecting_dash_r_on_repo_view(root, &log);
+    let shim = root.join("gh");
+    std::fs::write(&shim, gh_shim_sh(&fake.display().to_string())).unwrap();
+    let _ = Command::new("sh").arg("-c").arg(format!("chmod +x '{}' '{}'", fake.display(), shim.display())).status();
+
+    let run = |argv: &[&str], num: &str| -> (bool, String) {
+        let out = Command::new("sh").arg(&shim).args(argv)
+            .env("LOOMUX_GROUP_DIR", &group)
+            .env("FAKE_BASE", "main").env("FAKE_DEFAULT", "main").env("FAKE_NUM", num)
+            .output().unwrap();
+        (out.status.success(), String::from_utf8_lossy(&out.stderr).into_owned())
+    };
+    let write_grant = |name: &str| {
+        let d = group.join("merge_grants");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join(name), b"99999999999\n1\n").unwrap();
+    };
+
+    // A granted -R merge for an UNRELATED pr (no grant for pr-12) still blocks —
+    // and a different PR's grant is untouched by that blocked attempt (the other
+    // saving grace #294 calls out: a block never consumes a grant it didn't use).
+    write_grant("pr-11");
+    let (ok, err) = run(&["pr", "merge", "12", "-R", "owner/repo"], "12");
+    assert!(!ok, "no grant for pr-12 → still blocked even with -R");
+    assert!(err.contains("human gate"), "refusal message, got: {err}");
+    assert!(group.join("merge_grants/pr-11").exists(), "an unrelated blocked -R attempt must not consume pr-11's grant");
+
+    // The granted -R merge is now allowed — this is the line the #294 bug broke.
+    let (ok, err) = run(&["pr", "merge", "11", "-R", "owner/repo"], "11");
+    assert!(ok, "granted -R merge must be allowed, got stderr: {err}");
+    assert!(!group.join("merge_grants/pr-11").exists(), "the used grant is consumed");
+
+    // repo view was in fact invoked WITHOUT -R (proving the fix, not just luck).
+    let logged = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(logged.lines().any(|l| l.contains("repo view") && !l.contains("-R") && !l.contains("--repo")),
+        "repo view must be called without -R/--repo, log: {logged}");
+}
+
+/// A fake `gh` whose `pr merge` exits `$FAKE_MERGE_EXIT` (default 0/success) —
+/// lets a test simulate GitHub refusing the merge (draft PR, branch
+/// protection, …) while `pr view`/`repo view` resolve normally.
+fn write_fake_gh_with_merge_exit(root: &std::path::Path, log: &std::path::Path) -> std::path::PathBuf {
+    let p = root.join("fakegh_merge_exit");
+    std::fs::write(&p, format!(
+        "#!/bin/sh\n\
+         echo \"ARGS: $*\" >> \"{log}\"\n\
+         if [ \"$1\" = \"pr\" ] && [ \"$2\" = \"view\" ]; then printf '%s %s\\n' \"$FAKE_BASE\" \"$FAKE_NUM\"; exit 0; fi\n\
+         if [ \"$1\" = \"repo\" ] && [ \"$2\" = \"view\" ]; then printf '%s\\n' \"$FAKE_DEFAULT\"; exit 0; fi\n\
+         if [ \"$1\" = \"pr\" ] && [ \"$2\" = \"merge\" ]; then exit \"${{FAKE_MERGE_EXIT:-0}}\"; fi\n\
+         printf 'MERGED\\n'; exit 0\n",
+        log = log.display()
+    )).unwrap();
+    p
+}
+
+#[test]
+fn gh_shim_harness_a_merge_that_fails_at_github_does_not_burn_the_one_time_grant() {
+    // #256 live incident: a granted `gh pr merge` was let through, GitHub
+    // refused it (draft PR), and the interceptor had already deleted the
+    // grant on interception — the human had to re-Approve. Proven against
+    // the REAL generated shim: a merge that exits non-zero must leave the
+    // grant usable for a retry; only a merge that exits 0 may consume it.
+    use std::process::Command;
+    if Command::new("sh").arg("-c").arg("exit 0").status().map(|s| !s.success()).unwrap_or(true) {
+        eprintln!("SKIP gh_shim_harness_a_merge_that_fails_at_github…: no POSIX sh");
+        return;
+    }
+    let td = tempfile::tempdir().unwrap();
+    let root = td.path();
+    let group = root.join("group");
+    std::fs::create_dir_all(&group).unwrap();
+    let log = root.join("gh.log");
+    let fake = write_fake_gh_with_merge_exit(root, &log);
+    let shim = root.join("gh");
+    std::fs::write(&shim, gh_shim_sh(&fake.display().to_string())).unwrap();
+    let _ = Command::new("sh").arg("-c").arg(format!("chmod +x '{}' '{}'", fake.display(), shim.display())).status();
+
+    let run = |num: &str, merge_exit: &str| -> bool {
+        Command::new("sh").arg(&shim).args(["pr", "merge", num])
+            .env("LOOMUX_GROUP_DIR", &group)
+            .env("FAKE_BASE", "main").env("FAKE_DEFAULT", "main").env("FAKE_NUM", num)
+            .env("FAKE_MERGE_EXIT", merge_exit)
+            .status().unwrap().success()
+    };
+    let write_grant = |name: &str| {
+        let d = group.join("merge_grants");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join(name), b"99999999999\n1\n").unwrap();
+    };
+    let grant_path = |name: &str| group.join("merge_grants").join(name);
+
+    // A merge GitHub refuses (draft PR, say) must NOT consume the grant.
+    write_grant("pr-5");
+    assert!(!run("5", "1"), "a failed merge must fail (surface GitHub's refusal)");
+    assert!(grant_path("pr-5").exists(), "a failed merge must NOT consume the grant — this is the #256 bug");
+    assert!(!grant_path("pr-5.claimed").exists(), "no orphaned .claimed file after a resolved failure");
+
+    // The SAME grant authorizes the retry once the PR is fixed (e.g. `gh pr
+    // ready`) and the merge actually succeeds — then it IS consumed.
+    assert!(run("5", "0"), "retry with the still-usable grant must succeed");
+    assert!(!grant_path("pr-5").exists(), "a successful merge consumes the grant");
+    assert!(!grant_path("pr-5.claimed").exists(), "no orphaned .claimed file after a resolved success");
+
+    // The now-consumed grant cannot authorize a second merge.
+    assert!(!run("5", "0"), "a consumed grant must not authorize another merge");
+
+    // Expired grants are still cleaned up (never claimed, never left behind).
+    std::fs::write(group.join("merge_grants/pr-9"), b"1\n1\n").unwrap();
+    assert!(!run("9", "0"), "expired grant → blocked");
+    assert!(!grant_path("pr-9").exists(), "expired grant is cleaned up, not left claimable");
+
+    // Crash-between semantics: a `.claimed` file with no matching grant (as
+    // if the process died between claim and resolve) must NOT be treated as
+    // a usable grant by a later attempt — the bare grant file is gone, so
+    // the next merge sees "no grant" and fails closed, requiring a fresh one.
+    std::fs::create_dir_all(group.join("merge_grants")).unwrap();
+    std::fs::write(group.join("merge_grants/pr-13.claimed"), b"99999999999\n1\n").unwrap();
+    assert!(!run("13", "0"), "an orphaned .claimed file with no live grant must not authorize a merge");
+}
+
+/// A fake `gh` whose `release` subcommand exits `$FAKE_RELEASE_EXIT` (default
+/// 0/success) — lets a test simulate GitHub refusing a release publish (tag
+/// already exists, a transient API error, …).
+fn write_fake_gh_with_release_exit(root: &std::path::Path, log: &std::path::Path) -> std::path::PathBuf {
+    let p = root.join("fakegh_release_exit");
+    std::fs::write(&p, format!(
+        "#!/bin/sh\n\
+         echo \"ARGS: $*\" >> \"{log}\"\n\
+         if [ \"$1\" = \"release\" ]; then exit \"${{FAKE_RELEASE_EXIT:-0}}\"; fi\n\
+         printf 'PUBLISHED\\n'; exit 0\n",
+        log = log.display()
+    )).unwrap();
+    p
+}
+
+#[test]
+fn gh_shim_harness_a_release_publish_that_fails_at_github_does_not_burn_the_one_time_grant() {
+    // #303 (same bug class as #256): a granted `gh release create` was let
+    // through, GitHub refused it (tag already exists, a transient API error,
+    // …), and the interceptor had already deleted the release grant on
+    // interception — the human would have had to re-grant. Proven against the
+    // REAL generated shim: a publish that exits non-zero must leave the grant
+    // usable for a retry; only a publish that exits 0 may consume it.
+    use std::process::Command;
+    if Command::new("sh").arg("-c").arg("exit 0").status().map(|s| !s.success()).unwrap_or(true) {
+        eprintln!("SKIP gh_shim_harness_a_release_publish_that_fails…: no POSIX sh");
+        return;
+    }
+    let td = tempfile::tempdir().unwrap();
+    let root = td.path();
+    let group = root.join("group");
+    std::fs::create_dir_all(&group).unwrap();
+    let log = root.join("gh.log");
+    let fake = write_fake_gh_with_release_exit(root, &log);
+    let shim = root.join("gh");
+    std::fs::write(&shim, gh_shim_sh(&fake.display().to_string())).unwrap();
+    let _ = Command::new("sh").arg("-c").arg(format!("chmod +x '{}' '{}'", fake.display(), shim.display())).status();
+
+    let run = |tag: &str, release_exit: &str| -> bool {
+        Command::new("sh").arg(&shim).args(["release", "create", tag])
+            .env("LOOMUX_GROUP_DIR", &group)
+            .env("FAKE_RELEASE_EXIT", release_exit)
+            .status().unwrap().success()
+    };
+    let write_grant = |name: &str| {
+        let d = group.join("release_grants");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join(name), b"99999999999\n1\n").unwrap();
+    };
+    let grant_path = |name: &str| group.join("release_grants").join(name);
+
+    // A publish GitHub refuses must NOT consume the grant.
+    write_grant("v1.2.3");
+    assert!(!run("v1.2.3", "1"), "a failed publish must fail (surface GitHub's refusal)");
+    assert!(grant_path("v1.2.3").exists(), "a failed publish must NOT consume the grant — this is the #303 bug");
+    assert!(!grant_path("v1.2.3.claimed").exists(), "no orphaned .claimed file after a resolved failure");
+
+    // The SAME grant authorizes a retry, and a successful publish DOES consume it.
+    assert!(run("v1.2.3", "0"), "retry with the still-usable grant must succeed");
+    assert!(!grant_path("v1.2.3").exists(), "a successful publish consumes the grant");
+    assert!(!grant_path("v1.2.3.claimed").exists(), "no orphaned .claimed file after a resolved success");
+
+    // The now-consumed grant cannot authorize a second publish.
+    assert!(!run("v1.2.3", "0"), "a consumed grant must not authorize another publish");
+
+    // Expired grants are still cleaned up (never claimed, never left behind).
+    std::fs::write(group.join("release_grants/v9.9.9"), b"1\n1\n").unwrap();
+    assert!(!run("v9.9.9", "0"), "expired grant → blocked");
+    assert!(!grant_path("v9.9.9").exists(), "expired grant is cleaned up, not left claimable");
+
+    // Crash-between semantics: an orphaned `.claimed` file with no matching
+    // grant (as if the process died between claim and settle) must NOT
+    // authorize a publish — the bare grant file is gone, so the next publish
+    // sees "no grant" and fails closed, requiring a fresh one.
+    std::fs::create_dir_all(group.join("release_grants")).unwrap();
+    std::fs::write(group.join("release_grants/v13.0.0.claimed"), b"99999999999\n1\n").unwrap();
+    assert!(!run("v13.0.0", "0"), "an orphaned .claimed file with no live grant must not authorize a publish");
+}
+
 #[test]
 fn git_shim_harness_gates_tag_pushes() {
     use std::process::Command;
@@ -4534,7 +5119,12 @@ fn gh_shim_script_bakes_real_gh_and_enforces_the_guards() {
     // caller's -R/--repo when resolving base + default branch.
     assert!(sh.contains("--repo") && sh.contains("-R"), "recognizes -R/--repo global flag");
     assert!(sh.contains("rf=\"-R $repo\""), "passes the caller's repo through to the lookups");
-    assert!(sh.contains("pr view $rf") && sh.contains("repo view $rf"), "both lookups honor -R");
+    // #294: `pr view` accepts -R, but `gh repo view` takes the repo POSITIONALLY —
+    // passing `-R` there is a hard `gh` error, not a no-op. Pin the two lookups use
+    // DIFFERENT forms so this regression can't come back silently.
+    assert!(sh.contains("pr view $rf"), "pr view honors -R");
+    assert!(sh.contains("repo view $repo") && !sh.contains("repo view $rf"),
+        "repo view takes the repo positionally, never via $rf (-R)");
 }
 
 #[test]
@@ -6483,6 +7073,60 @@ fn spawn_worktree_cuts_from_default_branch_not_primary_head() {
     );
 }
 
+#[test]
+fn spawn_worktree_fails_loudly_when_existing_branch_diverges_from_base() {
+    // #227: `base` was silently ignored whenever the requested `branch` name
+    // collided with a leftover local branch — `git_worktree_add`'s
+    // already-exists fallback checked that branch out as-is, regardless of
+    // whether its history had anything to do with `base`. A spawn hitting
+    // that collision must now fail loudly (naming both shas) instead of
+    // handing back a worker whose worktree is silently cut from the wrong
+    // history.
+    let git = |dir: &Path, args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "")
+            .env("GIT_CONFIG_SYSTEM", "")
+            .output()
+            .expect("git must be installed for this test");
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    };
+
+    let repo = tempfile::tempdir().unwrap();
+    git(repo.path(), &["init", "-q"]);
+    git(repo.path(), &["symbolic-ref", "HEAD", "refs/heads/main"]);
+    git(repo.path(), &["config", "user.email", "t@t"]);
+    git(repo.path(), &["config", "user.name", "t"]);
+    fs::write(repo.path().join("f.txt"), "root").unwrap();
+    git(repo.path(), &["add", "-A"]);
+    git(repo.path(), &["commit", "-qm", "root"]);
+
+    // The desired base: a feature branch with its own commit.
+    git(repo.path(), &["checkout", "-q", "-b", "feat/base"]);
+    fs::write(repo.path().join("feat.txt"), "feat").unwrap();
+    git(repo.path(), &["add", "-A"]);
+    git(repo.path(), &["commit", "-qm", "feature work"]);
+    git(repo.path(), &["checkout", "-q", "main"]);
+
+    // A stale leftover branch sharing the name a new spawn will request —
+    // cut from main, never touching feat/base.
+    git(repo.path(), &["branch", "stacked/leftover", "main"]);
+
+    let repo_path = repo.path().to_string_lossy().replace('\\', "/");
+    let (reg, _d) = test_registry();
+    let g = reg.create_group(&repo_path, rails()).unwrap();
+
+    let err = reg
+        .spawn_agent_ex(
+            &g.id, Role::Worker, None, "w", "t", true, Some("stacked/leftover".into()),
+            Some("feat/base".into()), None, None, None,
+        )
+        .unwrap_err();
+    assert!(err.contains("stacked/leftover"), "should name the branch: {err}");
+    assert!(err.contains("feat/base"), "should name the requested base: {err}");
+}
+
 // ---------- #43: compose-strip steering + human-typing hold backstop ----------
 
 #[test]
@@ -6907,6 +7551,149 @@ fn sub_floor_submit_does_not_wedge_future_deliveries() {
     assert_eq!(out, PasteDecision::Paste { held_ms: 0 });
 }
 
+#[test]
+fn box_occupancy_delta_counts_typed_characters_and_backspaces() {
+    // #171: the counter half of occupancy tracking. Printable content adds,
+    // backspace/DEL removes, everything else nets zero.
+    assert_eq!(box_occupancy_delta("a"), 1);
+    assert_eq!(box_occupancy_delta("hello"), 5);
+    assert_eq!(box_occupancy_delta("\u{7f}"), -1, "DEL removes one character");
+    assert_eq!(box_occupancy_delta("\u{08}"), -1, "BS removes one character too");
+    assert_eq!(box_occupancy_delta("\u{7f}\u{7f}\u{7f}"), -3, "three backspaces in one write");
+    // Arrows and other CSI sequences are pure navigation — no occupancy change.
+    assert_eq!(box_occupancy_delta("\u{1b}[C"), 0); // right arrow
+    assert_eq!(box_occupancy_delta("\u{1b}[A"), 0); // up arrow
+    assert_eq!(box_occupancy_delta(""), 0);
+    // A bracketed paste's markers are CSI-shaped and skipped; only the pasted
+    // text itself counts.
+    assert_eq!(box_occupancy_delta("\u{1b}[200~hi\u{1b}[201~"), 2);
+
+    // #179 regression guard: a terminal query-reply echo must never read as a
+    // removal OR an addition, exactly like it must never read as Content.
+    assert_eq!(box_occupancy_delta("\x1b]11;rgb:0d0d/1111/1717\x07"), 0);
+    assert_eq!(box_occupancy_delta("\x1bP>|xterm(370)\x1b\\"), 0);
+}
+
+#[test]
+fn box_occupancy_delta_counts_multibyte_characters_not_bytes() {
+    // #171 review follow-up: counting raw UTF-8 BYTES over-counted non-ASCII
+    // input — a 3-byte CJK character or 4-byte emoji added 3/4 to the
+    // counter for one keystroke, but the single backspace that deletes it
+    // only ever subtracts 1 (backspace/DEL is always a single control byte,
+    // regardless of what it deletes). That mismatch reproduced #171's exact
+    // stuck-occupied symptom for anyone typing non-ASCII: the counter could
+    // never get back down to zero by backspacing alone.
+    //
+    // "日" (U+65E5) is a 3-byte UTF-8 sequence — one character, one keystroke.
+    assert_eq!(box_occupancy_delta("日"), 1, "one CJK character is one occupancy unit, not 3 bytes");
+    // "😀" (U+1F600) is a 4-byte UTF-8 sequence — same story.
+    assert_eq!(box_occupancy_delta("😀"), 1, "one emoji is one occupancy unit, not 4 bytes");
+    // A run of each, plus a mix, still counts one per character.
+    assert_eq!(box_occupancy_delta("日本語"), 3);
+    assert_eq!(box_occupancy_delta("a日😀b"), 4);
+}
+
+#[test]
+fn backspacing_a_cjk_or_emoji_character_reads_the_box_as_empty_again() {
+    // #171 review follow-up, the end-to-end version of the byte-vs-character
+    // fix: type one non-ASCII character, backspace it once, and the box must
+    // read empty — exactly like the all-ASCII case just above. Before the
+    // byte-vs-character fix this got stuck (delta +3 for "日", only -1 for
+    // the one backspace, net +2 forever).
+    use std::sync::atomic::Ordering;
+    let counter = std::sync::atomic::AtomicI64::new(0);
+    let feed = |data: &str| {
+        match classify_human_input(data) {
+            HumanInput::Submit => counter.store(0, Ordering::Relaxed),
+            HumanInput::Content | HumanInput::Neutral => {
+                let delta = box_occupancy_delta(data);
+                if delta != 0 {
+                    let cur = counter.load(Ordering::Relaxed);
+                    counter.store((cur + delta as i64).max(0), Ordering::Relaxed);
+                }
+            }
+        }
+    };
+    let pending = || counter.load(Ordering::Relaxed) > 0;
+
+    // A CJK IME commit typically arrives as one write per composed character.
+    feed("日");
+    assert!(pending(), "a typed CJK character must occupy the box");
+    feed("\u{7f}");
+    assert!(!pending(), "backspacing the one character out must read the box as empty again");
+
+    // Same story for an emoji (4-byte UTF-8).
+    feed("😀");
+    assert!(pending());
+    feed("\u{7f}");
+    assert!(!pending(), "backspacing the one emoji out must read the box as empty again");
+
+    // A mixed multi-character line backspaced out character-by-character.
+    feed("a日😀b");
+    assert!(pending());
+    feed("\u{7f}");
+    feed("\u{7f}");
+    feed("\u{7f}");
+    assert!(pending(), "three of four characters backspaced — still occupied");
+    feed("\u{7f}");
+    assert!(!pending(), "the fourth backspace empties a 4-character mixed-width line");
+}
+
+#[test]
+fn backspacing_a_typed_line_all_the_way_out_reads_the_box_as_empty_again() {
+    // #171: the incident this issue reports — start typing, backspace back out,
+    // and (before this fix) `input_pending` stayed stuck true because every
+    // individual backspace classified as `Neutral`, indistinguishable from an
+    // arrow key. A subsequent delivery then held for the full 60s and aborted
+    // instead of pasting into a pane whose box was, in fact, empty — "blocks
+    // the loomux prompts" from the human's report.
+    //
+    // This models write_pty's fixed logic exactly (pty.rs): `Submit` resets the
+    // counter to zero directly; everything else applies `box_occupancy_delta`,
+    // clamped at zero. `xterm.js` delivers one write per keystroke, so three
+    // typed characters and three backspaces arrive as six separate writes.
+    use std::sync::atomic::Ordering;
+    let counter = std::sync::atomic::AtomicI64::new(0);
+    let feed = |data: &str| {
+        match classify_human_input(data) {
+            HumanInput::Submit => counter.store(0, Ordering::Relaxed),
+            HumanInput::Content | HumanInput::Neutral => {
+                let delta = box_occupancy_delta(data);
+                if delta != 0 {
+                    let cur = counter.load(Ordering::Relaxed);
+                    counter.store((cur + delta as i64).max(0), Ordering::Relaxed);
+                }
+            }
+        }
+    };
+    let pending = || counter.load(Ordering::Relaxed) > 0;
+
+    // Human starts typing "abc" — box occupied.
+    feed("a");
+    feed("b");
+    feed("c");
+    assert!(pending(), "typed content must occupy the box");
+    // ...then backspaces it all out, one keystroke at a time.
+    feed("\u{7f}");
+    feed("\u{7f}");
+    assert!(pending(), "two of three characters backspaced — still occupied");
+    feed("\u{7f}");
+    assert!(!pending(), "the box is empty again once every typed character is backspaced out");
+
+    // A delivery landing right after must paste immediately, not hold for 60s.
+    let out = hold_for_human_input(pending, Duration::from_secs(60), HB_POLL);
+    assert_eq!(out, PasteDecision::Paste { held_ms: 0 });
+
+    // Over-backspacing an already-empty box must never go negative and get
+    // "stuck occupied" on the next keystroke because of a lingering negative
+    // counter absorbing it.
+    feed("\u{7f}");
+    feed("\u{7f}");
+    assert!(!pending(), "backspacing past empty must clamp at zero, not go negative");
+    feed("x");
+    assert!(pending(), "a fresh keystroke after clamped-empty occupies the box normally");
+}
+
 // ---------- #133: atomic durable writes ----------
 
 #[test]
@@ -7306,6 +8093,80 @@ fn max_agents_at_the_recommended_count_is_fully_quiet() {
             .iter()
             .all(|e| e.action != "max-agents-below-minimum" && e.action != "max-agents-below-recommended"),
         "at the recommended count, every declared tier fits — fully quiet"
+    );
+}
+
+#[test]
+fn set_max_agents_re_checks_the_pinned_roster_minimum_live_not_just_on_resume() {
+    // #259: before this fix, `set_max_agents` wrote the new cap and audited
+    // only `max-agents-set` — it never compared the new cap against the
+    // group's pinned CapacityRecommendation (#255). A human lowering the live
+    // cap below the roster's minimum produced no notice at all until the
+    // *next resume* happened to re-check it (see the test just below, which
+    // covers the resume path). This test drives the live stepper directly.
+    let (reg, _d) = test_registry();
+    let repo = gated_repo(""); // 1 worker + 2 reviewers, all-pass: minimum 3
+    let g = reg
+        .create_group(
+            &repo.path().to_string_lossy(),
+            Guardrails { advanced_orchestrator: true, max_agents: 5, ..rails() },
+        )
+        .unwrap();
+    assert!(
+        reg.audit_log(&g.id).iter().all(|e| e.action != "max-agents-below-minimum"),
+        "launched comfortably above the minimum — must start quiet"
+    );
+
+    reg.set_max_agents(&g.id, 2, "human").unwrap();
+
+    let warn = reg
+        .audit_log(&g.id)
+        .into_iter()
+        .find(|e| e.action == "max-agents-below-minimum")
+        .expect("lowering the live cap below the roster's minimum must be audited immediately");
+    assert_eq!(warn.detail["max_agents"], 2);
+    assert_eq!(warn.detail["minimum"], 3);
+    // Advisory only, same as the launch-time contract: the lowered cap still
+    // takes effect — a capacity warning must never rewrite it.
+    assert_eq!(reg.group(&g.id).unwrap().guardrails.max_agents, 2);
+}
+
+#[test]
+fn set_max_agents_stays_quiet_without_advanced_orchestrator_or_a_custom_roster() {
+    // The live re-check must be gated exactly like the launch/resume path
+    // gates `capacity` (mod.rs `create_group`): only a declared, custom
+    // workflow has a structural minimum to re-check the live cap against.
+    let (reg, _d) = test_registry();
+    let repo = gated_repo("");
+
+    // Advanced orchestrator off: the workflow file is never read, so there is
+    // no pinned roster to derive a minimum from.
+    let off = reg
+        .create_group(&repo.path().to_string_lossy(), Guardrails { max_agents: 5, ..rails() })
+        .unwrap();
+    reg.set_max_agents(&off.id, 1, "human").unwrap();
+    assert!(
+        reg.audit_log(&off.id)
+            .iter()
+            .all(|e| e.action != "max-agents-below-minimum" && e.action != "max-agents-below-recommended"),
+        "advanced_orchestrator off has no pinned roster to re-check the live cap against"
+    );
+
+    // Advanced orchestrator on, but no `.loomux/workflow.yml` at all — the
+    // built-in default roster, which never had a structural minimum either.
+    let no_file = tempfile::tempdir().unwrap();
+    let built_in = reg
+        .create_group(
+            &no_file.path().to_string_lossy(),
+            Guardrails { advanced_orchestrator: true, max_agents: 5, ..rails() },
+        )
+        .unwrap();
+    reg.set_max_agents(&built_in.id, 1, "human").unwrap();
+    assert!(
+        reg.audit_log(&built_in.id)
+            .iter()
+            .all(|e| e.action != "max-agents-below-minimum" && e.action != "max-agents-below-recommended"),
+        "the built-in roster (no workflow file) has no capacity recommendation to re-check against"
     );
 }
 

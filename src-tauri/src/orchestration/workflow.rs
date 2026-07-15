@@ -758,10 +758,28 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
             }
         };
         let mut bad = false;
+        // A gate's reviewer list is a set, not a sequence: `evaluate_merge_gate`
+        // (below) walks it once per verdict lookup, so a name listed twice would
+        // let that reviewer's single PASS count twice toward a `threshold: N`
+        // gate — a gate-integrity gap, not a cosmetic one — and `gate_need`
+        // would inflate the derived minimum the same way block-id duplicates
+        // would. Rejected here, consistent with how a duplicate block id is
+        // handled above, rather than silently deduped: a repo author who wrote
+        // the same name twice most likely meant a different one, and silently
+        // dropping the duplicate would hide that typo instead of surfacing it.
+        let mut seen_reviewers: BTreeSet<String> = BTreeSet::new();
         for r in &rg.reviewers {
-            match blocks.iter().find(|b| b.id == r.trim()) {
+            let rname = r.trim();
+            if !seen_reviewers.insert(rname.to_string()) {
+                errs.push(format!(
+                    "gates.{name}: reviewer {rname:?} is named more than once — name each reviewer once"
+                ));
+                bad = true;
+                continue;
+            }
+            match blocks.iter().find(|b| b.id == rname) {
                 None => {
-                    errs.push(format!("gates.{name}: reviewer {:?} names no block", r.trim()));
+                    errs.push(format!("gates.{name}: reviewer {rname:?} names no block"));
                     bad = true;
                 }
                 // A gate reads reviewer verdicts. Naming a worker would make it
