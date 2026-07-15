@@ -167,6 +167,7 @@ src-tauri/src/
 src/
   pty.ts            typed bridge to the backend (invoke + event bus)
   pane.ts           one pane: xterm instance + header UI -- or, for a CONTENT pane, a PTY-less surface: file manager (#214), file editor or git view (#217)
+  heldbadge.ts      pure delivery-held badge presentation mapping (#246): reason -> header-chip label, for the moment loomux is withholding a prompt because it believes the pane's box is human-occupied (DOM-free, unit-tested)
   grid.ts           split-tree layout, dividers, focus, drag/maximize/minimize
   layout.ts         pure drag-reorder geometry (unit-tested, DOM-free)
   tabs.ts           project tabs (#63): TabManager -- tab list, active tab, routing (DOM-free)
