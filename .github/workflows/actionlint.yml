@@ -1,0 +1,51 @@
+name: Actionlint
+
+# Lints .github/workflows/*.yml with actionlint — catches workflow-syntax and
+# job-graph mistakes mechanically (the kind of mistake #221 was about) before
+# they merge. Believed wired once already but never actually was (#276).
+#
+# Path-scoped like docs.yml so PRs that don't touch workflows don't pay for
+# it. The binary is downloaded from a pinned release tag and checksum-verified
+# (no `@latest` action, no floating version) — bump both VERSION and
+# SHA256 together to upgrade.
+#
+# IF YOU EVER WIRE THIS UP AS A REQUIRED STATUS CHECK (branch protection):
+# don't, as-is — this job is path-filtered, so a PR that doesn't touch
+# .github/workflows/** never runs it, and GitHub Actions leaves a job that
+# never ran in "pending" rather than "skipped" for the purposes of a
+# required check. A required-but-never-runs job blocks merge on every PR
+# forever. If you want this enforced as required, either (a) add a trivial
+# no-op companion job with the same name that runs on the *inverse* path
+# filter (paths-ignore) and always succeeds, so the check name always
+# reports something, or (b) drop the path filter entirely and let it run
+# (and no-op fast) on every PR.
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/**"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/**"
+
+permissions:
+  contents: read
+
+jobs:
+  actionlint:
+    runs-on: ubuntu-latest
+    env:
+      VERSION: "1.7.12"
+      SHA256: "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install actionlint (pinned, checksum-verified)
+        run: |
+          set -euo pipefail
+          curl -sSLO "https://github.com/rhysd/actionlint/releases/download/v${VERSION}/actionlint_${VERSION}_linux_amd64.tar.gz"
+          echo "${SHA256}  actionlint_${VERSION}_linux_amd64.tar.gz" | sha256sum -c -
+          tar xzf "actionlint_${VERSION}_linux_amd64.tar.gz" actionlint
+
+      - name: Run actionlint
+        run: ./actionlint -color

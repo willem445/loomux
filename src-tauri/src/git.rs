@@ -691,20 +691,54 @@ pub fn git_worktree_add(repo: String, name: String, base: Option<String>) -> Res
         }
         None => default_base_ref(&repo)?,
     };
+    // Resolved to a concrete commit up front: the post-creation check below
+    // (#227) needs a fixed target to compare against, and an unresolvable
+    // base now fails here with a clear message instead of whatever
+    // `worktree add` would print.
+    let base_sha = run_git(&repo, &["rev-parse", "--verify", &start_point])
+        .map_err(|e| format!("cannot resolve base {start_point:?}: {e}"))?
+        .trim()
+        .to_string();
 
     if let Err(e) = run_git(
         &repo,
         &["worktree", "add", "--no-track", "-b", &name, &dest_str, &start_point],
     ) {
         // `-b` refuses when the branch already exists; check that branch out
-        // into the new worktree instead (its history already exists, so the
-        // start-point is moot). Still a single command — no detached window.
+        // into the new worktree instead. Still a single command — no detached
+        // window. Whether that branch's history actually belongs anywhere
+        // near `base` is not decided here (#227: it used to be handed back
+        // unchecked, silently ignoring `base` whenever a stale or reused
+        // branch shared the name) — the ancestry check below decides that.
         if e.contains("already exists") {
             run_git(&repo, &["worktree", "add", &dest_str, &name])?;
         } else {
             return Err(e);
         }
     }
+
+    // #227: verify the worktree we just created actually descends from the
+    // requested base, regardless of which path above produced it. A mismatch
+    // means the branch was cut from (or already sat on) the wrong history —
+    // fail loudly with both shas instead of handing back a worktree that
+    // silently wastes an entire worker round. This can only trip in the
+    // already-exists fallback above: the fresh `-b` path always cuts exactly
+    // from `start_point`, so it's trivially its own ancestor.
+    let head_sha = match run_git(&dest_str, &["rev-parse", "HEAD"]) {
+        Ok(s) => s.trim().to_string(),
+        Err(e) => {
+            let _ = git_worktree_remove(&repo, &dest_str);
+            return Err(format!("worktree {name:?} created but its HEAD could not be resolved: {e}"));
+        }
+    };
+    if run_git(&repo, &["merge-base", "--is-ancestor", &base_sha, &head_sha]).is_err() {
+        let _ = git_worktree_remove(&repo, &dest_str);
+        return Err(format!(
+            "worktree {name:?} does not descend from requested base {start_point:?} \
+             (base {base_sha}, resulting HEAD {head_sha}) — refusing to hand out a wrong-base worktree"
+        ));
+    }
+
     Ok(dest_str)
 }
 
@@ -1553,6 +1587,73 @@ mod tests {
         assert!(
             Path::new(&wt).join("trunk.txt").exists(),
             "must cut from the repaired default branch (trunk) via set-head"
+        );
+    }
+
+    #[test]
+    fn worktree_add_refuses_stale_existing_branch_that_diverges_from_base() {
+        // #227: `-b` refuses when `name` already exists, so the code falls
+        // back to checking that branch out as-is — silently ignoring `base`
+        // whenever a stale leftover branch (from an earlier aborted spawn, or
+        // a reused branch name) happens to share the requested name. This is
+        // the "base only honored on the first spawn per branch name" suspect
+        // named in the issue.
+        let repo = new_repo();
+        let d = repo.path();
+        let root = commit(d, "f.txt", "root\n", "root");
+
+        // The desired base: a feature branch with its own commit.
+        setup_git(d, &["checkout", "-q", "-b", "feat/base"]);
+        commit(d, "feat.txt", "feat\n", "feature work");
+        setup_git(d, &["checkout", "-q", "main"]);
+
+        // A stale local branch sharing the name a new spawn will request —
+        // cut from root, never touching feat/base.
+        setup_git(d, &["branch", "agent/x", &root]);
+
+        let err = git_worktree_add(p(d), "agent/x".into(), Some("feat/base".into()))
+            .expect_err("agent/x does not descend from feat/base — must fail loudly");
+        assert!(err.contains("agent/x"), "error should name the branch: {err}");
+        assert!(err.contains("feat/base"), "error should name the requested base: {err}");
+
+        // No half-created worktree left behind.
+        assert!(
+            !git_worktree_list(p(d)).unwrap().contains("agent/x"),
+            "a rejected spawn must not leave a wrong-base worktree behind"
+        );
+    }
+
+    #[test]
+    fn worktree_add_reuses_existing_branch_that_already_descends_from_base() {
+        // The legitimate case the fallback exists for: a branch was already
+        // cut from (or beyond) the requested base — e.g. its worktree
+        // directory was removed but the branch kept. Reuse must still
+        // succeed, not be treated as a base mismatch.
+        let repo = new_repo();
+        let d = repo.path();
+        commit(d, "f.txt", "root\n", "root");
+        setup_git(d, &["checkout", "-q", "-b", "feat/base"]);
+        commit(d, "feat.txt", "feat\n", "feature work");
+
+        setup_git(d, &["checkout", "-q", "-b", "agent/x"]);
+        commit(d, "extra.txt", "extra\n", "agent's own commit");
+        setup_git(d, &["checkout", "-q", "main"]);
+
+        let wt = git_worktree_add(p(d), "agent/x".into(), Some("feat/base".into())).unwrap();
+        assert!(Path::new(&wt).join("extra.txt").exists());
+        assert!(Path::new(&wt).join("feat.txt").exists());
+    }
+
+    #[test]
+    fn worktree_add_fails_loudly_on_unresolvable_base() {
+        let repo = new_repo();
+        let d = repo.path();
+        commit(d, "f.txt", "a\n", "A");
+        let err = git_worktree_add(p(d), "agent-w".into(), Some("origin/nope".into())).unwrap_err();
+        assert!(!err.is_empty());
+        assert!(
+            !git_worktree_list(p(d)).unwrap().contains("agent-w"),
+            "an unresolvable base must not leave a worktree behind"
         );
     }
 }

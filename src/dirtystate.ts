@@ -191,3 +191,59 @@ export function keepOpenOnExit(state: {
   if (state.hasUnsavedWork) return "unsaved";
   return null;
 }
+
+/** The extra line a crashed pane's exit banner shows when its process never
+ *  produced a single byte of output before dying (#281) — the resumed-CLI-
+ *  boots-and-immediately-exits signature that a bare "process exited (code N)"
+ *  gives no way to diagnose. `null` when the process DID produce output (a
+ *  real crash mid-work reads fine as-is) or when the exit wasn't a crash at
+ *  all (`keepOpenOnExit` already filters that; this only makes sense for a
+ *  pane kept open for reason `"output"`). Pure so the distinction — the actual
+ *  behavior change — is unit-testable without a live pty/terminal. */
+export function exitDiagnosticLine(receivedOutput: boolean): string | null {
+  if (receivedOutput) return null;
+  return (
+    "[loomux] produced no output before exiting — it likely died before printing " +
+    "anything at all (a missing/corrupt session, a rejected resume flag, or a gone " +
+    "working directory are the usual causes)"
+  );
+}
+
+/** A DOA orchestration-delegate revival (#280): a worker/reviewer/planner pane
+ *  whose process crashed having produced literally no output. `keepOpenOnExit`'s
+ *  "output" reason exists so a human can read a crash — but there is nothing
+ *  to read here, so keeping the pane open is pure clutter, not a safeguard.
+ *
+ *  Scoped narrowly on purpose:
+ *   - only overrides an "output" keep — an "unsaved" keep (#219) is untouched,
+ *     since THAT reason has nothing to do with the process at all;
+ *   - `hasUnsavedWork` must ALSO be false, even though `keep === "output"`
+ *     already implies it might be true: `keepOpenOnExit` labels a crash
+ *     co-occurring with a dirty Alt+F buffer as `"output"` too (the dead
+ *     process is the louder fact), so `keep` alone can't tell "nothing to
+ *     protect" from "an unsaved buffer is riding along with this crash". This
+ *     function must never let #280's auto-close reach past #219's guard: an
+ *     AUTOMATIC teardown may never destroy work the human never agreed to
+ *     lose, and closing here would do exactly that with no prompt at all;
+ *   - only a DELEGATE pane (`orchRole` is a role other than "orchestrator") —
+ *     the orchestrator's own pane is the human's active workspace, never
+ *     auto-closed out from under them;
+ *   - never a plain (non-orchestration) command pane — a human directly
+ *     running a CLI that crashes silently still gets the original "kept open
+ *     to read" behavior, since there is no orchestrator to have already
+ *     explained the failure elsewhere (#281's exit-diagnostic notice covers
+ *     exactly the orchestration case this targets). */
+export function isDoaRevival(state: {
+  orchRole: string | null;
+  keep: KeepOpenReason | null;
+  receivedOutput: boolean;
+  hasUnsavedWork: boolean;
+}): boolean {
+  return (
+    state.keep === "output" &&
+    state.orchRole !== null &&
+    state.orchRole !== "orchestrator" &&
+    !state.receivedOutput &&
+    !state.hasUnsavedWork
+  );
+}

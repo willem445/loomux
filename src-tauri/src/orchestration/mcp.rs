@@ -200,8 +200,12 @@ fn tool_defs(role: Role) -> Vec<Value> {
         tool("get_state", "Read the group's durable orchestration state (JSON string). Survives sessions.",
             json!({}), &[]),
         tool("list_tasks",
-            "Read the group's task board (JSON array, order = priority). The human sees and edits this same board.",
+            "Read the group's task board (JSON array, order = priority) as COMPACT rows: id, title, status, issue, pr, assignee, session, updated_ms, note_count — NO note text. The human sees and edits the full board (with notes) beside your pane. Use note_count to tell whether a task has history worth pulling, then call get_task(id) for that task's full notes.",
             json!({}), &[]),
+        tool("get_task",
+            "Read ONE task's full record, including its note history (capped: only the newest notes are kept verbatim, older ones collapse into one placeholder — the full text of every note is always in this group's audit log regardless). Use this after list_tasks's compact row shows a note_count worth reading.",
+            json!({ "id": { "type": "string", "description": "Task id, e.g. t-3" } }),
+            &["id"]),
         tool("list_verdicts",
             "Read the recorded review verdicts for a PR: which reviewer block recorded what (pass | fail | escalate), when, and its summary — plus, when this repo's .loomux/workflow.yml declares a merge gate, whether that gate is satisfied. This is STATE, not a notification: it is what the loomux gh interceptor reads when it decides whether to allow `gh pr merge`. Omit pr to list every PR with a recorded verdict.",
             json!({
@@ -256,8 +260,8 @@ fn tool_defs(role: Role) -> Vec<Value> {
                     "task": { "type": "string", "description": "Full task brief; empty = idle. With resume_session, this is the follow-up prompt." },
                     "worktree": { "type": "boolean", "description": "Create a dedicated git worktree + branch" },
                     "branch": { "type": "string", "description": "Branch name (default agent/<id>)" },
-                    "base": { "type": "string", "description": "Start-point for the worktree branch (default: the repo's default branch, fetched fresh from origin). Pass a feature branch (e.g. 'feat/x' or 'origin/feat/x') to deliberately stack this worktree on top of it. Ignored without worktree=true, and ignored when 'branch' already exists (the existing branch is checked out as-is)." },
-                    "resume_session": { "type": "string", "description": "Session id to resume instead of starting fresh" },
+                    "base": { "type": "string", "description": "Start-point for the worktree branch (default: the repo's default branch, fetched fresh from origin). Pass a feature branch (e.g. 'feat/x' or 'origin/feat/x') to deliberately stack this worktree on top of it. Ignored without worktree=true. When 'branch' already exists, that branch is checked out as-is (its history stands on its own) — but if it does NOT descend from the requested base, the spawn fails loudly (#227) rather than silently handing back a wrong-base worktree." },
+                    "resume_session": { "type": "string", "description": "Session id to resume instead of starting fresh. A truncated id resolves if it's an unambiguous prefix of exactly one session in THIS group's roster; ambiguous or unknown prefixes fail with the matching candidates (never picked silently)." },
                     "cwd": { "type": "string", "description": "Existing directory to run in (required with resume_session; use the original workspace)" },
                 }),
                 &["task"]),
@@ -389,7 +393,12 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
     match name {
         "list_agents" => Ok(reg.list_agents(&caller.group).to_string()),
         "get_state" => Ok(reg.get_state(&caller.group)),
-        "list_tasks" => Ok(serde_json::to_string(&reg.tasks(&caller.group)).unwrap_or_default()),
+        "list_tasks" => Ok(serde_json::to_string(&reg.task_summaries(&caller.group)).unwrap_or_default()),
+        "get_task" => {
+            let id = arg_str(args, "id").ok_or("id required")?;
+            let task = reg.get_task(&caller.group, id).ok_or_else(|| format!("unknown task: {id}"))?;
+            Ok(serde_json::to_string(&task).unwrap_or_default())
+        }
 
         "upsert_task" => {
             require_orchestrator(caller)?;
@@ -478,7 +487,15 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             let worktree = args.get("worktree").and_then(Value::as_bool).unwrap_or(false);
             let branch = arg_str(args, "branch").map(str::to_string);
             let base = arg_str(args, "base").map(str::to_string);
-            let resume = arg_str(args, "resume_session").map(str::to_string);
+            // #190: a hand-copied or logged session id is commonly a truncated
+            // prefix (Claude Code ids are full UUIDs); resolve it against this
+            // group's OWN roster before anything below treats it as the final
+            // id — the block-inheritance lookup just below and the actual
+            // resume in `spawn_agent_ex` must agree on the same full id.
+            let resume = match arg_str(args, "resume_session") {
+                Some(raw) => Some(super::resolve_session_ref(&reg.merged_records(&caller.group), raw)?),
+                None => None,
+            };
             let cwd = arg_str(args, "cwd").map(str::to_string);
             let resumed = resume.is_some();
             // #254: a resume that names NEITHER `kind` NOR `block` inherits the

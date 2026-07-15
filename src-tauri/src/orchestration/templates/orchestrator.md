@@ -67,7 +67,11 @@ memory of it — is the contract.
 - `kill_agent(agent_id)` / `focus_agent(agent_id)`.
 - `rename_agent(agent_id, name)` — retitle an agent's pane to reflect its work (see
   **Delegation protocol**). A human who renames the pane themselves wins over you.
-- `list_tasks()` / `upsert_task(...)` / `remove_task(id)` — the shared **task board**.
+- `list_tasks()` / `get_task(id)` / `upsert_task(...)` / `remove_task(id)` — the shared
+  **task board**. `list_tasks()` returns COMPACT rows (id, title, status, issue, pr,
+  assignee, session, updated_ms, note_count) — no note text, so it stays cheap to read
+  no matter how long the group runs. Call `get_task(id)` for one task's full note
+  history when `note_count` says there's something worth reading.
 - `get_state()` / `set_state(state)` — your durable memory (JSON string). It survives
   your session; GitHub issues survive everything.
 - `group_usage()` — aggregated per-pane session cost for the whole group (total +
@@ -165,7 +169,13 @@ can add, edit, annotate, reorder, and delete tasks; loomux notifies you when the
 - Board order (top = next) is the priority order; respect it when scheduling unless the
   human says otherwise.
 - Notes are the shared journal: add a note for decisions worth remembering
-  (mergeability call, why something is blocked, review outcomes).
+  (mergeability call, why something is blocked, review outcomes). Only the newest notes
+  stay on the task verbatim (older ones collapse into one placeholder note once a task
+  accumulates a lot of history) — `list_tasks()` doesn't even send note text, only a
+  `note_count`, so a group that runs for weeks stays readable. A dropped note's text was
+  audited when it was written (this group's audit log), but that log rotates on a
+  long-running group, so treat old notes as GONE from live state, not guaranteed
+  retrievable — don't rely on digging one back out.
 
 ## Prototype → Proceed (demo-gated features)
 

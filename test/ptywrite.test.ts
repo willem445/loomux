@@ -6,20 +6,45 @@ import { createOrderedWriter, chunkForPty, PTY_WRITE_CHUNK } from "../src/ptywri
 
 const wait = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
+/** A `Promise.race` backstop against a condition-wait that could otherwise
+ *  hang forever if the condition never becomes true — not a return to
+ *  wall-clock guessing: the race still waits on the real condition first,
+ *  this just bounds how long a genuine regression gets to hang the suite
+ *  before the assertion below gets to run and fail with an actual diff
+ *  (#232 review). `cancel()` clears the underlying timer on the happy path
+ *  so a passing test doesn't hold the process open for the full `ms`.  */
+function timeoutAfter(ms: number): { promise: Promise<void>; cancel: () => void } {
+  let id: ReturnType<typeof setTimeout>;
+  const promise = new Promise<void>((r) => {
+    id = setTimeout(r, ms);
+  });
+  return { promise, cancel: () => clearTimeout(id) };
+}
+
 test("delivers writes in FIFO order even when an early send resolves last", async () => {
   const seen: string[] = [];
   const w = createOrderedWriter();
   // First send is the slowest: if writes ran concurrently, "A" would land
   // last. The chain must still deliver A, B, C in order.
   const delays: Record<string, number> = { A: 30, B: 5, C: 1 };
+  // Wait on the observable condition (all three delivered) rather than a
+  // fixed sleep: under load, real timers can run well past a guessed
+  // duration and the test would assert before "C" ever lands (#232).
+  let done: () => void;
+  const allDelivered = new Promise<void>((r) => (done = r));
   w.ready(async (data) => {
     await wait(delays[data] ?? 0);
     seen.push(data);
+    if (seen.length === 3) done();
   });
   w.write("A");
   w.write("B");
   w.write("C");
-  await wait(80);
+  // Generous (5s vs. ~36ms of real work): a dropped write now fails fast
+  // with an assertion diff instead of hanging the suite indefinitely.
+  const backstop = timeoutAfter(5000);
+  await Promise.race([allDelivered, backstop.promise]);
+  backstop.cancel();
   assert.deepEqual(seen, ["A", "B", "C"]);
 });
 

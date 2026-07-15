@@ -193,17 +193,51 @@ loomux_block_release() { # $1=tag $2=action
   loomux_audit "release-gate-blocked" "{\"tag\":\"$1\",\"action\":\"$2\"}"
   exit 1
 }
-# Consume a one-time grant file: delete it (one use only) and return 0 iff it was
-# present AND unexpired (expiry = unix seconds on line 1). Expired grants are
-# cleaned up too. Reading is atomic on the writer side (see atomic_write).
-loomux_grant_ok() { # $1=grantfile
+# #256/#303: CLAIM a one-time grant without spending it yet — a gated command
+# (merge OR release/tag publish) must consume its grant only when the real
+# `gh` call it authorizes actually SUCCEEDS (live incident: a merge grant
+# burned on a draft PR that GitHub refused to merge, leaving the PR unmerged
+# and the human having to re-Approve; #303 is the same bug class for release
+# grants). An expired grant is still deleted here (never usable, no reason to
+# keep it around). A live grant is instead handed off via `mv` to a
+# `.claimed` sibling — a RENAME, which POSIX guarantees atomic — so exactly
+# one caller can ever win it: two concurrent claimants both see the file
+# present, but only one `mv` succeeds (the loser's source is already gone, so
+# its `mv` fails and it falls through to `return 1`, same as "no grant").
+# Sets `_grant_claimed` to the claimed path on success; the caller runs the
+# real gh and finishes with `loomux_grant_settle` below (consume on success,
+# restore on failure). If the process dies between claiming and settling, the
+# original grant file stays gone and the orphaned `.claimed` file is never
+# consulted again — a crash requires a fresh grant rather than risking a
+# second use, the failure mode #256 asks for.
+loomux_grant_claim() { # $1=grantfile
   gf="$1"
   [ -f "$gf" ] || return 1
   exp=$(head -n1 "$gf" 2>/dev/null)
   case "$exp" in ''|*[!0-9]*) exp=0 ;; esac
   now=$(date +%s 2>/dev/null); [ -z "$now" ] && now=0
-  rm -f "$gf"
-  [ "$now" -lt "$exp" ]
+  if [ "$now" -ge "$exp" ]; then
+    rm -f "$gf"
+    return 1
+  fi
+  claimed="$gf.claimed"
+  if mv "$gf" "$claimed" 2>/dev/null; then
+    _grant_claimed="$claimed"
+    return 0
+  fi
+  return 1   # lost the race to another concurrent claimant
+}
+# Finish a claim made by loomux_grant_claim, once the real gh's exit status is
+# known: consume it (rm) on success, or restore it to the original grant path
+# on failure so a retry can still use it. Shared by the merge gate and the
+# release gate (#303) — one settle mechanism, not two copies. $1=original
+# grantfile $2=claimed file $3=the real gh's exit code.
+loomux_grant_settle() { # $1=grantfile $2=claimed $3=exit-code
+  if [ "$3" -eq 0 ]; then
+    rm -f "$2"   # succeeded — the one-time grant is spent
+  else
+    mv "$2" "$1" 2>/dev/null   # failed — restore for a retry
+  fi
 }
 # The SINGLE release-gate decision (#83/#196): every release-publishing shape —
 # `gh release create|edit|delete` AND the raw `gh api`/graphql equivalents (create
@@ -212,10 +246,18 @@ loomux_grant_ok() { # $1=grantfile
 # by autonomous+auto_release (blanket, not grant-consumed), supervised dangerous
 # mode (human present, not autonomous), or a valid one-time per-tag grant; else
 # fail-safe block. $1=tag ("" when not cheaply resolvable — then only the blanket
-# markers can allow), $2=action label. Returns 0 to allow (caller execs the real
-# gh); blocks with a message + exit 1 (never returns) otherwise.
+# markers can allow), $2=action label. Returns 0 to allow; blocks with a message
+# + exit 1 (never returns) otherwise. On a GRANT-backed allow this only CLAIMS
+# the grant (#303, same fix as #256's merge grant) — it sets `_grant_claimed`
+# (the claimed path) and `_rg_gf` (the original grant path) and leaves spending
+# it to the caller: run the real gh, then `loomux_grant_settle "$_rg_gf"
+# "$_grant_claimed" "$rc"`. On a blanket allow (autonomous+auto_release or
+# dangerous mode) `_grant_claimed` is left empty — those aren't a one-time
+# resource, so the caller can `exec` the real gh directly with nothing to
+# settle.
 loomux_release_gate() { # $1=tag $2=action
   _tag="$1"; _action="$2"
+  _grant_claimed=""
   if [ -n "$LOOMUX_GROUP_DIR" ] && [ -f "$LOOMUX_GROUP_DIR/autonomous" ] && [ -f "$LOOMUX_GROUP_DIR/auto_release" ]; then
     loomux_audit "release-gate-allowed" "{\"tag\":\"$_tag\",\"action\":\"$_action\"}"; return 0
   fi
@@ -223,9 +265,9 @@ loomux_release_gate() { # $1=tag $2=action
     loomux_audit "release-gate-dangerous" "{\"tag\":\"$_tag\",\"action\":\"$_action\"}"; return 0
   fi
   _safe=$(printf '%s' "$_tag" | tr -c 'A-Za-z0-9._-' '_')
-  _gf=""
-  [ -n "$LOOMUX_GROUP_DIR" ] && [ -n "$_safe" ] && _gf="$LOOMUX_GROUP_DIR/release_grants/$_safe"
-  if [ -n "$_gf" ] && loomux_grant_ok "$_gf"; then
+  _rg_gf=""
+  [ -n "$LOOMUX_GROUP_DIR" ] && [ -n "$_safe" ] && _rg_gf="$LOOMUX_GROUP_DIR/release_grants/$_safe"
+  if [ -n "$_rg_gf" ] && loomux_grant_claim "$_rg_gf"; then
     loomux_audit "release-gate-granted" "{\"tag\":\"$_tag\",\"action\":\"$_action\"}"; return 0
   fi
   loomux_block_release "$_tag" "$_action"
@@ -264,6 +306,14 @@ if [ "$cmd" = "release" ]; then
   case "$sub" in
     create|edit|delete)
       loomux_release_gate "$sel" "$sub"   # allow (return) or block (exit); tag = $sel
+      if [ -n "$_grant_claimed" ]; then
+        # Grant-backed allow: run (not exec) so the exit status can settle the
+        # claim — #303, same reasoning as the merge grant's fix (#256).
+        "$REAL_GH" "$@"
+        rc=$?
+        loomux_grant_settle "$_rg_gf" "$_grant_claimed" "$rc"
+        exit "$rc"
+      fi
       exec "$REAL_GH" "$@" ;;
     *) exec "$REAL_GH" "$@" ;;
   esac
@@ -399,6 +449,14 @@ if [ "$cmd" = "api" ]; then
   fi
   if [ "$is_rel" = "1" ]; then
     loomux_release_gate "$rtag" "api"   # allow (return) or block (exit)
+    if [ -n "$_grant_claimed" ]; then
+      # Grant-backed allow: run (not exec) so the exit status can settle the
+      # claim — #303, same reasoning as the merge grant's fix (#256).
+      "$REAL_GH" "$@"
+      rc=$?
+      loomux_grant_settle "$_rg_gf" "$_grant_claimed" "$rc"
+      exit "$rc"
+    fi
     exec "$REAL_GH" "$@"
   fi
 fi
@@ -447,7 +505,13 @@ rf=""
 info=$("$REAL_GH" pr view $rf $sel --json baseRefName,number --jq '.baseRefName+" "+(.number|tostring)' 2>/dev/null)
 base=${info%% *}
 num=${info##* }
-default=$("$REAL_GH" repo view $rf --json defaultBranchRef --jq .defaultBranchRef.name 2>/dev/null)
+# #294: `gh repo view` takes the repo as a POSITIONAL arg, not -R/--repo (unlike
+# `pr view` above) — `gh repo view -R o/r` errors "unknown shorthand flag: 'R' in
+# -R". Passing $rf here silently broke every -R-qualified merge: this lookup came
+# back empty, so the block below fired as "unverifiable-base" even with a valid
+# grant sitting in merge_grants/ (the grant is never consumed by a blocked
+# attempt, and the block is otherwise fail-safe — both preserved by this fix).
+default=$("$REAL_GH" repo view $repo --json defaultBranchRef --jq .defaultBranchRef.name 2>/dev/null)
 
 if [ -z "$base" ] || [ -z "$default" ]; then
   loomux_block "unverifiable-base" "$base" "$sel"
@@ -593,11 +657,21 @@ if [ -n "$LOOMUX_GROUP_DIR" ] && [ -f "$LOOMUX_GROUP_DIR/dangerous_mode" ] && [ 
   exec "$REAL_GH" "$@"
 fi
 # Otherwise: a one-time human grant for THIS pr authorizes exactly one merge.
+# #256: CLAIM the grant (see loomux_grant_claim) and only spend it once the
+# real merge has actually gone through — a merge GitHub refuses (draft,
+# branch protection, a just-gone-stale head, a transient API error) must
+# leave the grant usable for a retry, not burn it on a merge that never
+# happened. This is why the exec above (blanket/dangerous) never needed this:
+# those openings aren't a one-time resource, so nothing to protect on failure.
 gf=""
 [ -n "$LOOMUX_GROUP_DIR" ] && [ -n "$num" ] && gf="$LOOMUX_GROUP_DIR/merge_grants/pr-$num"
-if [ -n "$gf" ] && loomux_grant_ok "$gf"; then
+_grant_claimed=""
+if [ -n "$gf" ] && loomux_grant_claim "$gf"; then
   loomux_audit "merge-gate-granted" "{\"base\":\"$default\",\"pr\":\"$num\"}"
-  exec "$REAL_GH" "$@"
+  "$REAL_GH" "$@"
+  rc=$?
+  loomux_grant_settle "$gf" "$_grant_claimed" "$rc"
+  exit "$rc"
 fi
 loomux_block "gate-closed" "$default" "$num"
 "#;
@@ -1218,8 +1292,9 @@ These loomux mechanics are guaranteed by the app and are NOT optional, whatever 
 persona says:\n\
 - You drive the group through the loomux MCP tools: `spawn_agent` (worker | reviewer | \
 planner, optionally naming a workflow `block`), `send_prompt`, `get_output`, \
-`kill_agent`, `focus_agent`, `rename_agent`; the shared task board via `list_tasks` / \
-`upsert_task` / `remove_task`; and durable state via `get_state` / `set_state`. \
+`kill_agent`, `focus_agent`, `rename_agent`; the shared task board via `list_tasks` \
+(compact rows) / `get_task` (one task's full notes) / `upsert_task` / `remove_task`; \
+and durable state via `get_state` / `set_state`. \
 Guardrails (live-agent cap, per-block CLI + model) are enforced by loomux.\n\
 - Maintain the task board: it is the human's view of the work. Record each agent's \
 `session` id on its task so finished work can be resumed for follow-ups instead of \
@@ -2602,6 +2677,12 @@ pub struct AgentEntry {
     /// (its CLI always comes from its block). See
     /// `OrchRegistry::cli_for_agent`, the single read site.
     pub solo_cli: Option<String>,
+    /// Rolling output tail captured at exit (#281), stripped of ANSI. The live
+    /// pty's own ring is gone the instant it's reaped, which turned "why did a
+    /// resumed session die silently" into a bare exit code with no way to ask
+    /// for more — `agent_output_tail` falls back to this once the pty itself is
+    /// gone. `None` until the agent exits (or for one still running).
+    pub last_exit_tail: Option<String>,
 }
 
 /// One pane that needs the human, pushed to the frontend as an `orch-attention`
@@ -2679,6 +2760,122 @@ pub struct Task {
     pub notes: Vec<TaskNote>,
     #[serde(default)]
     pub updated_ms: u64,
+}
+
+/// Compact task-board row (#245): every `Task` field EXCEPT the notes array,
+/// replaced by a `note_count` so a caller can tell "has history worth a
+/// `get_task`" from "brand new" without paying for the notes payload. This is
+/// what `list_tasks` returns — a live board hit **228,577 chars for 70
+/// tasks**, almost entirely from accumulated note text, and blew MCP result
+/// limits so the orchestrator could not read its own board. The human's board
+/// UI is unaffected: it reads `tasks.json` (full `Task`s) via `orch_tasks`,
+/// a separate path from the MCP `list_tasks` tool this feeds.
+#[derive(Clone, Debug, Serialize)]
+pub struct TaskSummary {
+    pub id: String,
+    pub title: String,
+    pub status: String,
+    pub issue: Option<String>,
+    pub pr: Option<String>,
+    pub assignee: Option<String>,
+    pub session: Option<String>,
+    pub updated_ms: u64,
+    pub note_count: usize,
+}
+
+/// Project a full `Task` down to its `list_tasks` row (#245). Pure so the
+/// field mapping is unit-testable without a registry.
+pub fn task_summary(t: &Task) -> TaskSummary {
+    TaskSummary {
+        id: t.id.clone(),
+        title: t.title.clone(),
+        status: t.status.clone(),
+        issue: t.issue.clone(),
+        pr: t.pr.clone(),
+        assignee: t.assignee.clone(),
+        session: t.session.clone(),
+        updated_ms: t.updated_ms,
+        note_count: t.notes.len(),
+    }
+}
+
+/// Max notes kept verbatim on a task's LIVE copy (#245) — beyond this, the
+/// oldest excess collapses into one placeholder note so `tasks.json` (and
+/// therefore `get_task`) stays bounded even for a task with weeks of
+/// back-and-forth. Nothing is actually lost: every note append is already
+/// durably recorded in `audit.jsonl` (`task-upsert`), so this only trims the
+/// copy the board keeps live.
+const MAX_TASK_NOTES: usize = 20;
+
+/// The `author` a `cap_task_notes` placeholder note is stamped with — never
+/// produced by a human/agent note (`upsert_task`'s `actor` is always an
+/// agent id or `"human"`), so it doubles as the marker `notes_represented`
+/// uses to recognize a placeholder that itself gets swept into a LATER
+/// collapse.
+const NOTE_COLLAPSE_AUTHOR: &str = "loomux";
+
+/// How many original notes one live `TaskNote` stands for: 1 for an ordinary
+/// note, or the count embedded in a `cap_task_notes` placeholder's own text
+/// (parsed back out). `cap_task_notes` runs once PER APPEND (`upsert_task`
+/// calls it after every single note push), so a placeholder from an earlier
+/// round routinely gets swept into a later one — without this, re-collapsing
+/// it would count it as "1 note" and the reported total would reset every
+/// round instead of accumulating (review finding on #245: the live count
+/// stayed at the single round's drop size — e.g. "2" — no matter how many
+/// notes had actually rolled off over the task's lifetime).
+fn notes_represented(note: &TaskNote) -> usize {
+    if note.author != NOTE_COLLAPSE_AUTHOR {
+        return 1;
+    }
+    note.text
+        .strip_prefix('[')
+        .and_then(|s| s.split_whitespace().next())
+        .and_then(|n| n.parse::<usize>().ok())
+        .unwrap_or(1)
+}
+
+/// Cap a task's live note history (#245): once `notes` exceeds `max`, collapse
+/// the oldest excess into one placeholder note (so the board still shows
+/// *something* happened, not silence) and keep the newest `max - 1` verbatim.
+/// `max == 0` is treated as "no cap" (never fires) rather than "drop
+/// everything" — a live-tunable knob set to 0 must not read as "delete all
+/// history". Pure so the collapse boundary is unit-testable without a
+/// registry.
+///
+/// The placeholder does NOT claim the dropped text is durably retrievable:
+/// `audit.jsonl` rotation (#240) keeps only one backup generation, so for
+/// exactly the long-running groups this cap targets, the original note text
+/// can rotate out from under a placeholder that promised otherwise. It says
+/// only what's actually true — the notes were dropped from the live board,
+/// and their text was audited at creation, subject to that rotation.
+pub fn cap_task_notes(mut notes: Vec<TaskNote>, max: usize) -> Vec<TaskNote> {
+    if max == 0 || notes.len() <= max {
+        return notes;
+    }
+    let drop_count = notes.len() - (max - 1);
+    let dropped: Vec<TaskNote> = notes.drain(..drop_count).collect();
+    // Sum, not `drop_count`: a placeholder among the dropped notes (this is
+    // itself a re-collapse) represents more than the one slot it occupies.
+    let collapsed_count: usize = dropped.iter().map(notes_represented).sum();
+    // The oldest note's own ts_ms is already the right lower bound even when
+    // it's a placeholder: it was stamped with ITS earliest represented ts_ms
+    // when created, below, so that value carries forward unchanged through
+    // any number of later re-collapses.
+    let first_ts = dropped.first().map(|n| n.ts_ms).unwrap_or(0);
+    let last_ts = dropped.last().map(|n| n.ts_ms).unwrap_or(0);
+    let mut out = Vec::with_capacity(notes.len() + 1);
+    out.push(TaskNote {
+        ts_ms: first_ts,
+        author: NOTE_COLLAPSE_AUTHOR.to_string(),
+        text: format!(
+            "[{collapsed_count} earlier note{} collapsed to keep the board readable — \
+             text was recorded in this group's audit.jsonl at creation (subject to rotation on a \
+             long-running group), ts {first_ts}..{last_ts}]",
+            if collapsed_count == 1 { "" } else { "s" }
+        ),
+    });
+    out.extend(notes);
+    out
 }
 
 /// Field edits for `upsert_task`; `None` leaves a field untouched.
@@ -3264,6 +3461,57 @@ fn sanitize_session(s: &str) -> Option<String> {
         .then(|| t.to_string())
 }
 
+/// A Claude Code session id's full length: `8-4-4-4-12` hex hyphenated (see
+/// `new_session_uuid`). Below this, `resolve_session_ref` treats the input as a
+/// truncated prefix rather than a (possibly external/unrecorded) full id.
+const FULL_SESSION_ID_LEN: usize = 36;
+
+/// Resolve a caller-supplied `resume_session` value to the one full session id
+/// it names (#190). A hand-copied or logged session id is naturally truncated
+/// (8 hex chars is what humans and terminals show), and Claude Code session ids
+/// are full UUIDs — before this, a truncated id just failed to resolve with no
+/// indication of why. An exact match against this group's roster wins outright,
+/// whatever its length. Otherwise, an input that is already full-length is
+/// passed through unchanged — it may be a genuine session this group never
+/// recorded (a resume with an explicit `kind`/`block` has always allowed that;
+/// #190 is only about *truncated* ids, which can never be "the real thing" on
+/// their own). Only a SHORTER input is treated as a prefix to resolve: zero
+/// matches is a plain "unknown session" (never seen it, in full or part), two
+/// or more is "ambiguous" and lists every candidate so the caller can pick —
+/// this must never silently choose one.
+///
+/// `records` is always this caller's OWN group roster (`merged_records(caller.group)`)
+/// — a prefix is matched only against sessions this group already knows about, so
+/// it can never resolve to (or even see) another group's session, and nothing here
+/// touches the filesystem, so there is no path-traversal surface (CLAUDE.md #6).
+fn resolve_session_ref(records: &[AgentRecord], input: &str) -> Result<String, String> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Err("resume_session must not be empty".into());
+    }
+    if records.iter().any(|r| r.session.as_deref() == Some(input)) {
+        return Ok(input.to_string());
+    }
+    if input.len() >= FULL_SESSION_ID_LEN {
+        return Ok(input.to_string());
+    }
+    let mut matches: Vec<&str> =
+        records.iter().filter_map(|r| r.session.as_deref()).filter(|s| s.starts_with(input)).collect();
+    matches.sort_unstable();
+    matches.dedup();
+    match matches.as_slice() {
+        [] => Err(format!(
+            "unknown session {input:?} — no session in this group's roster matches that id or prefix"
+        )),
+        [one] => Ok(one.to_string()),
+        many => Err(format!(
+            "ambiguous session prefix {input:?} — matches {} sessions, resolve with a longer prefix or the full id: {}",
+            many.len(),
+            many.join(", "),
+        )),
+    }
+}
+
 /// Normalize a caller-supplied pane name (#95r): trim, drop control characters
 /// (so a pasted name can't smuggle newlines/escape codes into the pane title or
 /// the roster JSON), and cap the length. Not a security boundary — the title is
@@ -3587,6 +3835,80 @@ fn render_template(tpl: &str, vars: &[(&str, &str)]) -> String {
     out
 }
 
+/// Last `n` bytes of `s`, cut on a char boundary (never mid-UTF8) — a short
+/// diagnostic snippet for an exit notice, never the whole captured tail.
+fn tail_snippet(s: &str, n: usize) -> &str {
+    if s.len() <= n {
+        return s;
+    }
+    let start = s.len() - n;
+    let boundary = (start..=s.len()).find(|&i| s.is_char_boundary(i)).unwrap_or(s.len());
+    &s[boundary..]
+}
+
+/// The diagnostic clause `on_pty_exit` puts in its orchestrator notice (#281):
+/// a bare exit code can't distinguish "produced real output, then failed" from
+/// "exited before printing a single byte" (the resume-CLI-boots-and-
+/// immediately-exits signature this issue is about) — `total_bytes == 0` names
+/// that case explicitly instead of leaving the orchestrator to guess. Only
+/// ever called for an exit loomux did NOT itself cause (see `on_pty_exit`'s
+/// `expected` guard), but still covers a clean, voluntary exit_code 0 that
+/// happened to produce nothing — so the wording says "exited", never "died"
+/// or "crashed", which would misname a graceful (if unhelpfully silent) stop
+/// as a failure. Factored out as a pure function (no pty/app handle needed)
+/// so it's directly unit-testable.
+pub fn exit_diagnostic(tail: &str, total_bytes: u64) -> String {
+    if total_bytes == 0 {
+        "produced no output before exiting — it likely exited before the CLI printed \
+         anything at all (a missing/corrupt session file, a rejected resume flag, or \
+         a gone cwd are the usual causes)"
+            .to_string()
+    } else {
+        format!("last output before it exited: {:?}", tail_snippet(tail, 400))
+    }
+}
+
+/// The `cause` clause `on_pty_exit` puts in its notice — `exit_diagnostic`,
+/// gated behind whether loomux itself caused this exit.
+///
+/// This gate exists because `PtyManager::kill` (pty.rs) removes the pty
+/// handle from its live map BEFORE the waiter thread ever gets to snapshot
+/// its output, so an `expected` exit (kill_agent, idle-kill, a pane close)
+/// always arrives here with `tail == ""` and `total_bytes == 0` — REGARDLESS
+/// of how much real work the agent actually did. Feeding that straight into
+/// `exit_diagnostic` would misdiagnose a productive delegate the orchestrator
+/// deliberately stopped as having silently died before printing anything,
+/// pointing it at a corrupt session file or a bad resume flag that was never
+/// the issue. The diagnostic is only meaningful for an exit loomux did NOT
+/// cause; an expected one gets a plain, honest "loomux stopped it" instead.
+/// Pure so this gate — the actual fix — is directly unit-testable without the
+/// live pty/bind machinery `on_pty_exit` itself needs.
+pub fn exit_cause(expected: bool, tail: &str, total_bytes: u64) -> String {
+    if expected {
+        "loomux stopped it (kill or idle-timeout) — not a crash".to_string()
+    } else {
+        exit_diagnostic(tail, total_bytes)
+    }
+}
+
+/// What `agent_output_tail` returns given whatever the live pty produced (if
+/// still alive) and whatever was captured at exit (#281). Factored out as a
+/// pure function so the fallback — the actual behavior change — is directly
+/// unit-testable without a live pty/app handle, which `agent_output_tail`
+/// itself can't be driven with in a unit test.
+pub fn resolve_output_text(live: Option<String>, last_exit_tail: Option<&str>) -> Result<String, String> {
+    if let Some(t) = live {
+        return Ok(t);
+    }
+    match last_exit_tail {
+        Some(t) if !t.is_empty() => Ok(t.to_string()),
+        // The live pty is already gone (the agent exited) and nothing was
+        // captured at exit time either — the pre-#281 behavior, kept as the
+        // last resort rather than inventing content that was never seen.
+        _ => Err("terminal already closed".to_string()),
+    }
+}
+
 /// Strip ANSI escape sequences (CSI, OSC, two-byte ESC) and carriage
 /// returns so `get_output` returns readable text from raw terminal bytes.
 pub fn strip_ansi(bytes: &[u8]) -> String {
@@ -3744,7 +4066,11 @@ pub enum HumanInput {
     /// The line was submitted (Enter) or explicitly cleared — the box is empty.
     Submit,
     /// Navigation/editing that neither adds visible text nor submits (arrows,
-    /// backspace, bare escape sequences) — box occupancy is unchanged.
+    /// backspace, bare escape sequences) — box occupancy is unchanged **by
+    /// this coarse read**. Backspace/DEL does in fact remove a character;
+    /// `box_occupancy_delta` (#171) is the finer-grained sibling that tracks
+    /// that, for callers that need to notice a typed line getting backspaced
+    /// all the way back out rather than submitted.
     Neutral,
 }
 
@@ -3767,10 +4093,15 @@ pub enum HumanInput {
 /// - Otherwise (arrows, backspace, lone escape sequences) → `Neutral`.
 ///
 /// Erring toward `Content`/`Neutral` on ambiguous input keeps the guard biased
-/// to the safe hold: a real sitting line is never misread as empty. Residual
-/// clears that leave the flag stuck (bounded by the 60s abort) — Esc-to-clear,
-/// Ctrl-W/Ctrl-K, backspace-to-empty, and soft-newline editors — need true
-/// box-occupancy detection, which is issue #112.
+/// to the safe hold: a real sitting line is never misread as empty. This
+/// three-way read alone can't recognize a line that was typed and then fully
+/// backspaced back out (every backspace reads as `Neutral`, individually
+/// indistinguishable from an arrow key) — that was issue #171: the box read
+/// as occupied forever, holding every subsequent delivery until the 60s abort.
+/// `write_pty` closes that gap by pairing this call with `box_occupancy_delta`,
+/// which *does* count backspace/DEL as a removal. Other residual clears that
+/// leave the flag stuck — Esc-to-clear, Ctrl-W/Ctrl-K, and soft-newline
+/// editors — still need true box-occupancy detection and remain open.
 pub fn classify_human_input(data: &str) -> HumanInput {
     // Bracketed paste: the text lands in the box unsubmitted regardless of any
     // newline it contains, so never read it as a submit.
@@ -3800,8 +4131,8 @@ pub fn classify_human_input(data: &str) -> HumanInput {
 const BRACKETED_PASTE_START: &str = "\u{1b}[200~";
 const BRACKETED_PASTE_END: &str = "\u{1b}[201~";
 
-/// Whether `s` contains a graphic character once terminal escape sequences are
-/// skipped — the test for "this write put visible text in the box". Skips CSI
+/// Shared walk over a human write, skipping terminal escape sequences, that
+/// backs both `input_has_printable` and `box_occupancy_delta`. Skips CSI
 /// (`ESC [ … final`, e.g. arrow keys, bracketed-paste markers) AND the string
 /// sequences a terminal emits in *reply* to a program's query — OSC (`ESC ]`)
 /// and DCS/SOS/PM/APC (`ESC P`/`X`/`^`/`_`) — plus other short `ESC`-led
@@ -3815,9 +4146,19 @@ const BRACKETED_PASTE_END: &str = "\u{1b}[201~";
 /// wedging `input_pending` true and stalling the fresh-copilot kickoff paste in
 /// the #111 box-clear hold (up to its 60s abort) — the "prompt never delivered"
 /// symptom. Claude Code issues no such query, so only copilot tripped it.
-fn input_has_printable(s: &str) -> bool {
+///
+/// Returns `(has_printable, occupancy_delta)`: the first is "did this write
+/// put visible text in the box at all" (`input_has_printable`'s job); the
+/// second is the signed change to box occupancy — one Unicode CHARACTER
+/// added counts `+1` regardless of its UTF-8 byte width, backspace/DEL
+/// (`\x08`/`\x7f`) removes `1` (#171) — that `box_occupancy_delta` exposes so
+/// a run of backspaces emptying a typed line is recognized even though no
+/// single write in the run looks like a submit.
+fn scan_box_units(s: &str) -> (bool, i32) {
     let b = s.as_bytes();
     let mut i = 0;
+    let mut printable = false;
+    let mut delta: i32 = 0;
     while i < b.len() {
         if b[i] == 0x1b {
             i += 1;
@@ -3855,13 +4196,79 @@ fn input_has_printable(s: &str) -> bool {
             }
             continue;
         }
-        // Printable ASCII (space..~) or any UTF-8 multibyte lead/continuation.
-        if (0x20..0x7f).contains(&b[i]) || b[i] >= 0x80 {
-            return true;
+        // Backspace / DEL: one character removed from the box (#171).
+        if b[i] == 0x08 || b[i] == 0x7f {
+            delta -= 1;
+            i += 1;
+            continue;
         }
-        i += 1; // C0 control (tab, backspace/DEL handled below, etc.)
+        // Printable ASCII, or a UTF-8 multibyte LEAD byte (0xC0..=0xFF): count
+        // one occupancy unit per character, not per byte. A 3-byte CJK
+        // character or a 4-byte emoji is still exactly one keystroke and one
+        // backspace, so counting raw bytes here (+3/+4 on type, -1 on the one
+        // backspace that removes it) over-counted occupancy for any non-ASCII
+        // typer and reproduced #171's exact stuck-occupied symptom for them —
+        // the counter never gets back to `<= 0` because the single removal
+        // can't cancel a multi-byte addition. Continuation bytes (0x80..=0xBF)
+        // are still consumed (and still mark the write as printable) but add
+        // no further delta — they're part of the character its lead byte
+        // already counted.
+        if (0x20..0x7f).contains(&b[i]) || b[i] >= 0xc0 {
+            printable = true;
+            delta += 1;
+            i += 1;
+            continue;
+        }
+        if b[i] >= 0x80 {
+            printable = true;
+            i += 1; // continuation byte — already counted via its lead byte
+            continue;
+        }
+        i += 1; // other C0 control (tab, etc.)
     }
-    false
+    (printable, delta)
+}
+
+/// Whether `s` contains a graphic character once terminal escape sequences are
+/// skipped — the test for "this write put visible text in the box". See
+/// `scan_box_units` for what's skipped and why.
+fn input_has_printable(s: &str) -> bool {
+    scan_box_units(s).0
+}
+
+/// The signed change to box occupancy from a single human write: `+1` per
+/// Unicode CHARACTER (a UTF-8 lead byte, not a raw byte — a 3-byte CJK
+/// character or a 4-byte emoji is one keystroke, so it counts as one, not
+/// three or four), `-1` per backspace/DEL, `0` for anything else (arrows,
+/// bare escape sequences, an OSC/DCS query-reply echo — #179). Used alongside
+/// `classify_human_input` to track real occupancy rather than a bare
+/// pending/not flag: `write_pty` applies this to a running per-pane counter
+/// (clamped at zero) so a typed line that gets fully backspaced out reads
+/// back to empty even though no single write in the run looks like a submit
+/// (#171) — `classify_human_input`'s `Submit` still resets the counter
+/// directly to zero, which is exact where it applies (Enter, Ctrl-U,
+/// Ctrl-C).
+///
+/// Counting by character rather than by byte matters for correctness, not
+/// just cosmetics: byte-counting added 3/4 for one CJK/emoji character typed
+/// but only subtracted 1 for the single backspace that removes it, so the
+/// counter never returned to zero and a non-ASCII typer hit this exact
+/// stuck-occupied symptom (a prior revision of this fix had that bug).
+///
+/// The counter is deliberately biased to never UNDER-count real occupancy
+/// (never read `0`/empty while a human's line is in fact still sitting in the
+/// box — that's the clobber hazard the whole #111 guard exists to prevent).
+/// It may OVER-count, and that direction is safe: if some CLI's line editor
+/// ever deletes more than one character for a single backspace/DEL byte (a
+/// multi-codepoint grapheme cluster, say), this still only subtracts `1`,
+/// leaving the counter higher than the box's real contents — worst case, a
+/// delivery holds a little longer than strictly necessary before pasting,
+/// never earlier. Only backspace/DEL is counted as removal at all: Ctrl-W
+/// (delete word), Ctrl-K (kill to end) and Esc-to-clear editors still net `0`
+/// here — full box-occupancy tracking for those remains open (see
+/// `classify_human_input`).
+pub fn box_occupancy_delta(s: &str) -> i32 {
+    scan_box_units(s).1
 }
 
 /// One tick of the pre-paste human-input hold (#111): given whether a human's
@@ -4261,6 +4668,17 @@ impl OrchRegistry {
             .unwrap_or_default()
     }
 
+    /// Compact rows for the MCP `list_tasks` tool (#245) — see `TaskSummary`.
+    pub fn task_summaries(&self, group: &str) -> Vec<TaskSummary> {
+        self.tasks(group).iter().map(task_summary).collect()
+    }
+
+    /// One full task (including its capped note history) by id — the detail
+    /// view `list_tasks`'s compact rows point at (#245).
+    pub fn get_task(&self, group: &str, id: &str) -> Option<Task> {
+        self.tasks(group).into_iter().find(|t| t.id == id)
+    }
+
     fn write_tasks(&self, group: &str, tasks: &[Task]) -> Result<(), String> {
         let dir = self.group_dir(group);
         fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -4357,6 +4775,7 @@ impl OrchRegistry {
             let text = text.trim().to_string();
             if !text.is_empty() {
                 task.notes.push(TaskNote { ts_ms: now_ms(), author: actor.to_string(), text });
+                task.notes = cap_task_notes(std::mem::take(&mut task.notes), MAX_TASK_NOTES);
             }
         }
         task.updated_ms = now_ms();
@@ -5222,51 +5641,11 @@ impl OrchRegistry {
         // warning (surfaced from `orch_workflow_preview`, computed the same way)
         // is meant to catch this *before* Create; these audit records are the
         // durable trail for a launch that went ahead anyway — e.g. resumed with a
-        // persisted cap the file has since outgrown.
-        //
-        // Two tiers, per rev-1 B2 of the #255 review: the incident this issue was
-        // filed from ran at `max_agents == minimum` (4) against a `recommended` of
-        // 6 — i.e. exactly the boundary the single-tier check above was silent on.
-        // A cap can be too low in two different ways and they are not the same
-        // problem: below `minimum`, the orchestrator cannot even complete one
-        // review round without evicting something live (hard — it actively
-        // thrashes); at-or-above `minimum` but below `recommended`, every review
-        // round completes, but named tiers (a second worker lane, extra
-        // reviewers, the planner) can never be live *alongside* one (soft — it
-        // just never runs the roster it was handed).
-        if let Some(rec) = capacity {
-            if guardrails.max_agents < rec.minimum {
-                self.audit(&id, "loomux", "max-agents-below-minimum", json!({
-                    "max_agents": guardrails.max_agents,
-                    "minimum": rec.minimum,
-                    "recommended": rec.recommended,
-                    "note": format!(
-                        "max_agents ({}) is below this workflow's minimum ({}) — its merge \
-                         gate plus a worker can never all be live at once without evicting a \
-                         live agent to make room.",
-                        guardrails.max_agents, rec.minimum,
-                    ),
-                }));
-            } else if guardrails.max_agents < rec.recommended {
-                let extras = workflow::extra_tiers(&guardrails.blocks, rec.reviewers_needed);
-                self.audit(&id, "loomux", "max-agents-below-recommended", json!({
-                    "max_agents": guardrails.max_agents,
-                    "minimum": rec.minimum,
-                    "recommended": rec.recommended,
-                    "extra_tiers": extras,
-                    "note": format!(
-                        "max_agents ({}) covers one review round (minimum {}) but not this \
-                         workflow's full roster (recommended {}) — {} can never be live \
-                         alongside a review round.",
-                        guardrails.max_agents, rec.minimum, rec.recommended,
-                        if extras.is_empty() {
-                            "some of its declared tiers".to_string()
-                        } else {
-                            workflow::join_with_and(&extras)
-                        },
-                    ),
-                }));
-            }
+        // persisted cap the file has since outgrown. #259: `set_max_agents` runs
+        // the identical check on every live lowering of the cap, via
+        // `audit_capacity_shortfall` below.
+        if let Some(rec) = &capacity {
+            self.audit_capacity_shortfall(&id, &guardrails.blocks, guardrails.max_agents, rec);
         }
         let info = GroupInfo { id: id.clone(), repo: repo.to_string(), guardrails };
         // Atomic replace: group.json is identity-critical (a truncated file
@@ -7831,6 +8210,58 @@ impl OrchRegistry {
         }
     }
 
+    /// #255/#259: emit the same advisory `max-agents-below-minimum` /
+    /// `max-agents-below-recommended` audit record regardless of which path
+    /// found the cap too low for a workflow's derived [`workflow::CapacityRecommendation`]
+    /// — launch/resume (`create_group`, once, at `workflow-loaded`/on resume) or
+    /// the live stepper (`set_max_agents`, every time a human lowers the cap).
+    /// Same two-tier logic, same audit shape, so the trail reads the same no
+    /// matter which path wrote it: below `minimum`, the roster's merge gate
+    /// plus a worker can never all be live at once (hard — it actively
+    /// thrashes); at-or-above `minimum` but below `recommended`, every review
+    /// round completes but named tiers can never run alongside one (soft).
+    /// Advisory only — never refuses or clamps `max_agents`.
+    fn audit_capacity_shortfall(
+        &self,
+        group: &str,
+        blocks: &[workflow::Block],
+        max_agents: u32,
+        rec: &workflow::CapacityRecommendation,
+    ) {
+        if max_agents < rec.minimum {
+            self.audit(group, "loomux", "max-agents-below-minimum", json!({
+                "max_agents": max_agents,
+                "minimum": rec.minimum,
+                "recommended": rec.recommended,
+                "note": format!(
+                    "max_agents ({}) is below this workflow's minimum ({}) — its merge \
+                     gate plus a worker can never all be live at once without evicting a \
+                     live agent to make room.",
+                    max_agents, rec.minimum,
+                ),
+            }));
+        } else if max_agents < rec.recommended {
+            let extras = workflow::extra_tiers(blocks, rec.reviewers_needed);
+            self.audit(group, "loomux", "max-agents-below-recommended", json!({
+                "max_agents": max_agents,
+                "minimum": rec.minimum,
+                "recommended": rec.recommended,
+                "extra_tiers": extras,
+                "note": format!(
+                    "max_agents ({}) covers one review round (minimum {}) but not this \
+                     workflow's full roster (recommended {}) — {} can never be live \
+                     alongside a review round.",
+                    max_agents, rec.minimum, rec.recommended,
+                    if extras.is_empty() {
+                        "some of its declared tiers".to_string()
+                    } else {
+                        workflow::join_with_and(&extras)
+                    },
+                ),
+            }));
+        }
+    }
+
     /// Adjust a live group's max live-agent cap on the fly. Bounds are the
     /// launcher's `1..=MAX_AGENTS_CEILING`. The new value is written to the
     /// in-memory guardrail (which `spawn_agent` reads fresh on every spawn, so
@@ -7846,7 +8277,8 @@ impl OrchRegistry {
         if !(1..=MAX_AGENTS_CEILING).contains(&n) {
             return Err(format!("max agents must be between 1 and {MAX_AGENTS_CEILING}"));
         }
-        let old = self.group(group).ok_or("unknown group")?.guardrails.max_agents;
+        let info = self.group(group).ok_or("unknown group")?;
+        let old = info.guardrails.max_agents;
         if n == old {
             return Ok(n);
         }
@@ -7860,6 +8292,19 @@ impl OrchRegistry {
             .guardrails
             .max_agents = n;
         self.audit(group, actor, "max-agents-set", json!({ "from": old, "to": n }));
+        // #259: `set_max_agents` is the live-cap stepper's backend — the same
+        // knob a workflow's pinned capacity recommendation (#255) is checked
+        // against once at launch/resume. A human lowering the cap mid-session
+        // below the roster's structural minimum is exactly the thrash #255
+        // exists to warn about; without this, that warning goes silent the
+        // moment a session outgrows it live instead of at launch/resume.
+        // Gated the same way the launch/resume path gates `capacity` (mod.rs
+        // `create_group`): only a declared, custom workflow has a structural
+        // minimum to re-check against.
+        if info.guardrails.advanced_orchestrator && workflow::roster_is_custom(&info.guardrails.blocks) {
+            let rec = workflow::recommend_capacity(&info.guardrails.blocks, self.merge_gate(group).as_ref());
+            self.audit_capacity_shortfall(group, &info.guardrails.blocks, n, &rec);
+        }
         // The orchestrator's kickoff prompt already rendered the old
         // {{MAX_AGENTS}} into static text; it needs the new ceiling to re-plan.
         // But rapid-clicking the stepper (4→3→2) would otherwise fire a notice
@@ -10374,6 +10819,7 @@ impl OrchRegistry {
             watchdog_notified: false,
             idle_tick_notified: false,
             solo_cli: None,
+            last_exit_tail: None,
         };
         {
             // Re-check the cap under the same lock as the insert: the early
@@ -11101,8 +11547,8 @@ impl OrchRegistry {
         let pty_id = a.pty_id.ok_or("agent has no terminal")?;
         let app = self.app.lock_safe().clone().ok_or("no app handle")?;
         let ptys = app.state::<crate::pty::PtyManager>();
-        let raw = ptys.output_tail(pty_id).ok_or("terminal already closed")?;
-        let text = strip_ansi(&raw);
+        let live = ptys.output_tail(pty_id).map(|raw| strip_ansi(&raw));
+        let text = resolve_output_text(live, a.last_exit_tail.as_deref())?;
         let all: Vec<&str> = text.lines().collect();
         let n = lines.clamp(1, 500);
         let start = all.len().saturating_sub(n);
@@ -11282,18 +11728,50 @@ impl OrchRegistry {
 
     /// Called from the pty waiter thread when any pty exits. No-op for ptys
     /// that aren't orchestration agents.
-    pub fn on_pty_exit(&self, pty_id: u32, exit_code: Option<u32>) {
+    /// `tail` is the pty's captured output at the moment it exited (ANSI
+    /// stripped), `total_bytes` the monotonic byte count it ever produced —
+    /// both read off the *removed* pty handle in `pty.rs`, since the live
+    /// ring is gone the instant this runs. `total_bytes == 0` is the #281
+    /// signature: a resumed CLI that exited before printing a single byte,
+    /// which a bare exit code can't be told apart from "it did real work and
+    /// then failed" — the orchestrator's notice below says which happened.
+    /// `expected` is true when loomux itself initiated this exit (kill_agent,
+    /// idle-kill, pane close) — see `PtyManager::kill`, which removes the pty
+    /// handle from the live map BEFORE this ever runs, so `tail`/`total_bytes`
+    /// are always empty/zero on an expected exit regardless of how much real
+    /// output the agent produced. Without this flag, a productive delegate
+    /// that the orchestrator deliberately stopped would get the exact same
+    /// "produced no output before exiting" misdiagnosis as a genuine silent
+    /// death — the diagnostic is only meaningful for an exit loomux did NOT
+    /// cause, so an expected one skips it entirely.
+    pub fn on_pty_exit(
+        &self,
+        pty_id: u32,
+        exit_code: Option<u32>,
+        tail: &str,
+        total_bytes: u64,
+        expected: bool,
+    ) {
         let agent_id = match self.by_pty.lock_safe().get(&pty_id).cloned() {
             Some(id) => id,
             None => return,
         };
+        let started_ms = self.agent(&agent_id).map(|a| a.started_ms).unwrap_or(0);
+        if !tail.is_empty() {
+            if let Some(a) = self.agents.lock_safe().get_mut(&agent_id) {
+                a.last_exit_tail = Some(tail.to_string());
+            }
+        }
         if let Some(a) = self.mark_dead(&agent_id, exit_code) {
             if a.role != Role::Orchestrator {
+                let elapsed_ms = now_ms().saturating_sub(started_ms);
+                let cause = exit_cause(expected, tail, total_bytes);
                 let _ = self.deliver_to_orchestrator(
                     &a.group,
                     &format!(
-                        "[loomux] agent {} ({}) exited (code {:?}). Update your plan and state accordingly.",
-                        a.name, a.id, exit_code
+                        "[loomux] agent {} ({}) exited (code {exit_code:?}) {elapsed_ms}ms after \
+                         spawn — {cause}. Update your plan and state accordingly.",
+                        a.name, a.id,
                     ),
                     "loomux",
                 );
@@ -12069,6 +12547,7 @@ fn register_orchestrator_pane(
         watchdog_notified: false,
         idle_tick_notified: false,
         solo_cli: None,
+        last_exit_tail: None,
     };
     reg.agents.lock_safe().insert(agent_id.clone(), entry.clone());
     reg.by_token.lock_safe().insert(token, agent_id.clone());
