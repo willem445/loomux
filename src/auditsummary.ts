@@ -78,6 +78,28 @@ export function summarize(e: AuditEntry): string {
     case "watch-expired":
     case "watch-failed":
       return `→ ${str(d.agent) ?? "?"}: ${firstLine(str(d.text) ?? "")}`;
+    // Cross-workspace channels (#271): connect/disconnect are human-initiated (actor
+    // "human", mirroring the watch-register/-cancel pattern above); channel-message is
+    // agent-initiated. Written to BOTH endpoints' group logs, so each side's timeline
+    // reads the same sentence for the same event.
+    case "channel-connect": {
+      const members = Array.isArray(d.members) ? (d.members as Record<string, unknown>[]) : [];
+      const names = members.map((m) => `${str(m.name) ?? "?"} (${str(m.role) ?? "?"})`);
+      return `connected ${names.join(" ↔ ") || "?"} — channel ${str(d.channel_id) ?? "?"}`;
+    }
+    case "channel-message":
+      return `${str(d.from) ?? "?"} → ${str(d.to) ?? "?"} (channel ${str(d.channel_id) ?? "?"}): ${firstLine(str(d.text) ?? "")}`;
+    case "channel-disconnect": {
+      // `remaining` is a bare count, not a `closed` flag (mod.rs's disconnect_agent
+      // never writes one) — the backend tears the whole channel down once membership
+      // drops below 2, so remaining < 2 in THIS record is what "closed" means here.
+      const remainingNum = typeof d.remaining === "number" ? d.remaining : Number(d.remaining ?? NaN);
+      const note =
+        remainingNum < 2
+          ? "channel closed"
+          : `${remainingNum} member${remainingNum === 1 ? "" : "s"} remaining`;
+      return `${str(d.agent) ?? "?"} disconnected from channel ${str(d.channel_id) ?? "?"} — ${note}`;
+    }
     default: {
       const compact = JSON.stringify(e.detail ?? {});
       return compact === "{}" || compact === "null"

@@ -308,4 +308,13 @@ export class TabManager<T extends ManagedWorkspace> {
   private emit(): void {
     for (const fn of this.listeners) fn();
   }
+
+  /** Force a tab-bar re-render for state that lives OUTSIDE TabManager — cross-
+   *  workspace channel membership (#271) is derived live from `ws.paneInfos()`
+   *  (tabcounts.ts), not tracked here the way `attn` is, so there is no setter to
+   *  trigger the usual `emit()`. The `orch-channel` event handler calls this after
+   *  updating pane state so the tab-strip dot doesn't wait for the next 4s poll. */
+  touch(): void {
+    this.emit();
+  }
 }

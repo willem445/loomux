@@ -1,11 +1,31 @@
 // A small context-menu renderer (#214). DOM wiring only — WHAT the menu contains, and
-// what it acts on, is decided by the pure `filemenu.ts` and passed in here already
-// built. This file knows about pixels, focus and dismissal, and nothing else.
+// what it acts on, is decided by a pure model module (filemenu.ts, panemenu.ts) and
+// passed in here already built. This file knows about pixels, focus and dismissal, and
+// nothing else.
 //
-// Deliberately generic (it takes `MenuItem[]`), so a second caller can reuse it without
-// growing a second implementation of "keep it on screen, dismiss it on Esc".
+// Generic over the action type (`MenuItem<A>`/`showContextMenu<A>`) so a second caller
+// (panemenu.ts, #271) can reuse it without growing a second implementation of "keep it
+// on screen, dismiss it on Esc" — this is the reuse the original header comment invited
+// but the type wasn't yet generic enough for; filemenu.ts's own `MenuItem`/`MenuAction`
+// stay as they are and satisfy `MenuItem<MenuAction>` structurally, so that caller is
+// unaffected.
 
-import type { MenuAction, MenuItem } from "./filemenu";
+/** Generic menu-item shape shared by every context menu in the app. `A` is the
+ *  caller's own action union (filemenu.ts's `MenuAction`, panemenu.ts's
+ *  `PaneMenuAction`, …) — this module only ever moves it around, never inspects it. */
+export interface MenuItem<A> {
+  label: string;
+  /** Absent on a separator or a submenu parent. */
+  action?: A;
+  /** A submenu (Hash →, New →). */
+  children?: MenuItem<A>[];
+  separator?: boolean;
+  /** Disabled items are shown greyed with `reason` as a tooltip — an item that is
+   *  *inapplicable* stays visible (so the menu doesn't reshuffle under the cursor),
+   *  while an item that is *unsupported on this OS* is omitted entirely. */
+  disabled?: boolean;
+  reason?: string;
+}
 
 /** The one menu that can be open. A second `showContextMenu` closes the first — you can
  *  never end up with two, which is otherwise the classic way a stale menu survives and
@@ -26,11 +46,11 @@ export function closeContextMenu(): void {
  *  focused one, and a submenu opens on `:focus-within` — so tabbing INTO one opens it. Esc
  *  closes. Arrow-key navigation is NOT implemented; the doc used to claim it was, which is
  *  the sort of comment that costs someone an afternoon. If it's wanted, it goes here. */
-export function showContextMenu(
+export function showContextMenu<A>(
   x: number,
   y: number,
-  items: MenuItem[],
-  onAction: (action: MenuAction) => void
+  items: MenuItem<A>[],
+  onAction: (action: A) => void
 ): void {
   closeContextMenu(); // never two at once
 
@@ -46,7 +66,7 @@ export function showContextMenu(
     root.remove();
   };
 
-  const fire = (action: MenuAction) => {
+  const fire = (action: A) => {
     dispose(); // close FIRST, so an action that opens a dialog isn't behind the menu
     onAction(action);
   };
@@ -86,7 +106,7 @@ export function showContextMenu(
 }
 
 /** One level of the menu (the top level, or a submenu panel). */
-function buildLevel(items: MenuItem[], fire: (a: MenuAction) => void): HTMLElement {
+function buildLevel<A>(items: MenuItem<A>[], fire: (a: A) => void): HTMLElement {
   const list = document.createElement("div");
   list.className = "ctxmenu-level";
 

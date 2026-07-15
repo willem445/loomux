@@ -148,6 +148,21 @@ export interface PaneBadge {
   title?: string;
 }
 
+/** What `setConnected` needs to render the cross-workspace channel chip/accent
+ *  (#271). Built by channel.ts's `channelBadge` from the live `OrchChannel`/
+ *  `orch-channel` payload — pane.ts stays a pure renderer of it, same division as
+ *  `setBadge`/`PaneBadge` above. */
+export interface PaneChannelBadge {
+  channelId: string;
+  /** Per-channel accent, so two concurrently-active channels read as visually
+   *  distinct sets of panes (channel.ts's `channelColor`). */
+  color: string;
+  /** Short chip text, e.g. "⇄2" (channel.ts's `channelChipLabel`). */
+  label: string;
+  /** Other members' display names, for the chip's tooltip. */
+  peers: string[];
+}
+
 export interface PaneOptions {
   name?: string;
   cwd?: string;
@@ -270,6 +285,14 @@ export interface PaneEvents {
   /** Open a WORKFLOW pane beside `pane` (#222) — the file browser's "Open in workflow
    *  pane" on a YAML row. Same shape, same reason, as `onOpenEditorPane`. */
   onOpenWorkflowPane: (pane: Pane, opts: { name: string; root: string; file: string }) => void;
+  /** Right-click on the pane header (#271): the pane can't build/show its own connect
+   *  menu — that needs the cross-tab armed-connect state and the backend wrappers,
+   *  neither of which a Pane knows about — so, like `onOpenEditorPane`, it asks its
+   *  host. `x`/`y` are viewport coords for `showContextMenu`. */
+  onPaneContextMenu: (pane: Pane, x: number, y: number) => void;
+  /** The pane's own channel chip was clicked (#271's "easy close" requirement: a
+   *  one-click disconnect from the indicator itself, not just the menu). */
+  onDisconnectChannel: (pane: Pane) => void;
 }
 
 export class Pane implements VoiceTargetPane {
@@ -354,6 +377,11 @@ export class Pane implements VoiceTargetPane {
   private attnChip: HTMLButtonElement;
   private attentionReason: string | null = null;
   private attentionDetail: string | null = null;
+  /** Cross-workspace channel chip (#271): shown when this pane is a live channel
+   *  member. Clicking it disconnects — the "easy close from the indicator itself"
+   *  requirement — separate from the pane-menu Disconnect item, same destination. */
+  private channelChip: HTMLButtonElement;
+  private channelInfo: PaneChannelBadge | null = null;
   /** Notified when something the dock chip shows changes (attention state or
    *  the pane name); the grid uses it to keep a minimized pane's chip in sync,
    *  since a docked pane's header is out of the DOM (#6, #95r). */
@@ -436,6 +464,31 @@ export class Pane implements VoiceTargetPane {
       this.acknowledgeAttention();
     });
     header.appendChild(this.attnChip);
+
+    // Cross-workspace channel chip (#271): shown only while this pane is a live
+    // channel member. Clicking it disconnects directly — the "easy close from the
+    // indicator itself" requirement, distinct from (but going to the same place
+    // as) the pane-menu's Disconnect item.
+    this.channelChip = document.createElement("button");
+    this.channelChip.className = "pane-channel";
+    this.channelChip.hidden = true;
+    this.channelChip.addEventListener("click", (e) => {
+      e.stopPropagation();
+      this.events.onDisconnectChannel(this);
+    });
+    header.appendChild(this.channelChip);
+
+    // The connect gesture (#271): right-click anywhere on the header shows the
+    // Connect/Disconnect menu. Buttons that already have their own contextmenu
+    // handling (the editor button, below) call stopPropagation in theirs, so this
+    // never double-fires for them. The pane itself can't build the menu — that
+    // needs the cross-tab armed-connect state and the backend wrappers — so, like
+    // `onOpenEditorPane`, it asks its host.
+    header.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      this.events.onPaneContextMenu(this, (e as MouseEvent).clientX, (e as MouseEvent).clientY);
+    });
 
     // Live metadata: current folder + git branch, reported by the shell.
     // The folder chip picks a folder to cd into; the branch chip opens the
@@ -1300,6 +1353,54 @@ export class Pane implements VoiceTargetPane {
     this.dockSyncListener?.();
   }
 
+  /** Mark (or clear) this pane's cross-workspace channel membership (#271): a
+   *  colored/numbered chip before the title plus a `--connect-color` accent, so
+   *  panes on either end of a channel — and a third pane joined into it — read as
+   *  one connected set even across tabs. `null` clears it (disconnect/teardown). */
+  setConnected(info: PaneChannelBadge | null): void {
+    this.channelInfo = info;
+    if (!info) {
+      this.channelChip.hidden = true;
+      this.el.classList.remove("connected");
+      this.el.style.removeProperty("--connect-color");
+      delete this.channelChip.dataset.channel;
+    } else {
+      this.channelChip.textContent = info.label;
+      this.channelChip.title = `Channel ${info.channelId} — connected to ${
+        info.peers.join(", ") || "…"
+      }. Click to disconnect.`;
+      this.channelChip.dataset.channel = info.channelId;
+      this.channelChip.hidden = false;
+      this.el.classList.add("connected");
+      this.el.style.setProperty("--connect-color", info.color);
+    }
+    // A minimized pane's element is detached; mirror to the dock chip (#95r's
+    // precedent, same listener setAttention/setName already use).
+    this.dockSyncListener?.();
+  }
+
+  /** The channel this pane currently belongs to, or null — panemenu.ts's
+   *  `PaneConnectState.channelId` reads this to decide Connect vs. Disconnect. */
+  get channelId(): string | null {
+    return this.channelInfo?.channelId ?? null;
+  }
+
+  /** Current channel badge, or null — lets the grid render an equivalent
+   *  indicator on the dock chip while this pane is minimized, mirroring the
+   *  `attention` getter just above. */
+  get channelBadge(): PaneChannelBadge | null {
+    return this.channelInfo;
+  }
+
+  /** Toggle the "armed connect source" visual (#271's "visible pending state"
+   *  requirement) — the persistent cue that THIS pane is what a right-click
+   *  elsewhere will complete a channel against, until it's completed or
+   *  cancelled (self-click or Esc). Never touches the channel chip itself: a
+   *  free pane being armed has no channel yet. */
+  setPendingConnect(pending: boolean): void {
+    this.el.classList.toggle("connect-pending", pending);
+  }
+
   /** Current needs-attention state, or null. Lets the grid render an equivalent
    *  badge on the dock chip while this pane is minimized (its header is out of
    *  the DOM). */
@@ -1785,7 +1886,7 @@ export class Pane implements VoiceTargetPane {
     // fully functional the moment it exists.
     if (this.contentKind !== null) return { kind: this.contentKind, live: true };
     const kind = this.liveKind();
-    return { kind, live: this.ptyId !== null && !this.exited };
+    return { kind, live: this.ptyId !== null && !this.exited, connectedChannel: this.channelId };
   }
 
   /** Whichever overlay (git / tasks / audit / group) is currently covering

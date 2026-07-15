@@ -40,6 +40,9 @@ import {
   launchOrchestrator,
   orchSessionRoles,
   resumeOrchSession,
+  showPaneConnectMenu,
+  disconnectPaneChannel,
+  cancelPendingConnect,
   type OrchWiring,
   type OrchTarget,
   type OrchestratorConfig,
@@ -174,6 +177,12 @@ function eventsFor(ws: Workspace): PaneEvents {
     // A content pane re-rooted, or a pane was renamed: the persisted layout is stale
     // but no grid event fired, so nothing else would save it (#214).
     onRecordChanged: () => onGridChanged(),
+    // The connect gesture (#271): the pane can't build its own menu (needs the
+    // cross-tab armed-connect state + backend wrappers), so it asks its host.
+    onPaneContextMenu: (pane, x, y) => showPaneConnectMenu(pane, x, y),
+    // One-click disconnect from the channel chip itself (the "easy close"
+    // requirement) — same destination as the pane menu's Disconnect item.
+    onDisconnectChannel: (pane) => disconnectPaneChannel(pane),
   };
 }
 
@@ -274,6 +283,9 @@ const orchWiring: OrchWiring = {
     found.pane.focus();
   },
   applyAttention,
+  refreshTabBar(): void {
+    tabs.touch();
+  },
 };
 
 // ---------- project tabs: persistence (#63) ----------
@@ -1257,6 +1269,14 @@ window.addEventListener("contextmenu", (e) => {
 // WebView2 can come up without keyboard focus; make sure the active
 // terminal reclaims it whenever the window is (re)focused.
 window.addEventListener("focus", () => activeGrid().activePane?.focus());
+
+// Esc cancels an in-progress connect gesture (#271) from anywhere — deliberately
+// NOT preventDefault/stopPropagation: cancelPendingConnect() is a no-op when
+// nothing is armed, so this must never compete with contextmenu.ts's own Esc (menu
+// dismissal), a rename input's Esc, or an overlay's Esc for the same keystroke.
+window.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") cancelPendingConnect();
+});
 
 // Stamp the running app version into the brand badge (single source of
 // truth: tauri.conf.json). Non-fatal — the badge just stays blank if the
