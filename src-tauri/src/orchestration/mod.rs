@@ -1912,6 +1912,22 @@ pub fn spawn_request_expired(deadline_ms: u64, now_ms: u64) -> bool {
     deadline_ms != 0 && now_ms > deadline_ms
 }
 
+/// Whether a spawned pane should open docked/minimized instead of expanded
+/// into the visible split tree (#260): true for every delegate role
+/// (worker/reviewer/planner), UNLESS the group opted back into the pre-#260
+/// "always expand" behavior (`group_opted_expanded`, backed by the durable
+/// `spawn_expanded` marker — see `OrchRegistry::set_spawn_expanded`). The
+/// orchestrator's own pane is NEVER minimized — it's the human's anchor into
+/// the group, and a hidden orchestrator pane would defeat the whole point of
+/// keeping it in focus — so this reads `false` for it regardless of the
+/// group setting. Pure so the decision is unit-testable without a registry;
+/// both `SpawnRequest` construction sites (`spawn_agent_ex` for delegates,
+/// `create_orchestration_group` for the orchestrator) call this SAME
+/// function, so the "orchestrator is exempt" rule can't drift between them.
+pub fn spawn_opens_minimized(role: Role, group_opted_expanded: bool) -> bool {
+    role != Role::Orchestrator && !group_opted_expanded
+}
+
 /// Whether the spawn-rate guardrail should reject the next spawn: true when
 /// at least `limit` spawns already fall inside the trailing `window_ms`.
 /// Pure so the sliding-window arithmetic is testable; `limit` 0 = unlimited.
@@ -3119,6 +3135,12 @@ pub struct SpawnRequest {
     /// plain human shell, so the human's own terminals are untouched.
     #[serde(default)]
     pub env: Vec<(String, String)>,
+    /// Whether the frontend should open this pane straight into the dock
+    /// (#260) instead of the visible split tree, so a burst of delegate
+    /// spawns doesn't crowd the orchestrator pane out of focus. Always
+    /// `false` for the orchestrator's own pane — see `spawn_opens_minimized`.
+    #[serde(default)]
+    pub minimized: bool,
 }
 
 pub struct OrchRegistry {
@@ -3214,6 +3236,15 @@ pub struct OrchRegistry {
     /// rejected while autonomous. Durable `dangerous_mode` marker; the gate's single
     /// decision point allows a privileged action via `(dangerous && !autonomous)`.
     dangerous_groups: Mutex<HashSet<String>>,
+    /// Groups that opted BACK OUT of the #260 default (delegate panes open
+    /// docked/minimized so a burst of spawns doesn't crowd the orchestrator
+    /// out of focus) and want every spawned pane to open expanded into the
+    /// split tree, matching pre-#260 behavior. Default OFF (absent) = the new
+    /// minimize-on-spawn default applies; presence is the opt-out, so this
+    /// set's *meaning* is inverted from `notify_groups`/`autonomous_groups`
+    /// (there, presence enables a default-off feature; here, presence
+    /// disables a default-on one). Durable `spawn_expanded` marker file.
+    spawn_expanded_groups: Mutex<HashSet<String>>,
     /// Autonomous mode (#83): per-group idle-tick delivery timestamps (Unix-ms)
     /// for the `MAX_IDLE_TICKS_PER_HOUR` backstop; pruned to the trailing hour on
     /// each check. The runaway analogue of `spawn_times`.
@@ -4602,6 +4633,7 @@ impl OrchRegistry {
             auto_merge_groups: Mutex::new(HashSet::new()),
             auto_release_groups: Mutex::new(HashSet::new()),
             dangerous_groups: Mutex::new(HashSet::new()),
+            spawn_expanded_groups: Mutex::new(HashSet::new()),
             idle_tick_times: Mutex::new(HashMap::new()),
             pending_max_notice: Mutex::new(HashMap::new()),
             claude_projects_dir: Mutex::new(None),
@@ -5813,6 +5845,11 @@ impl OrchRegistry {
         // Desktop-notification opt-in is likewise a durable per-group choice.
         if dir.join("notify").is_file() {
             self.notify_groups.lock_safe().insert(id.clone());
+        }
+        // The #260 minimize-on-spawn opt-OUT is likewise a durable per-group
+        // choice, re-seeded the same way.
+        if dir.join("spawn_expanded").is_file() {
+            self.spawn_expanded_groups.lock_safe().insert(id.clone());
         }
         // Autonomous mode (#83) and the auto-merge gate are durable per-group
         // choices too; re-seed them so a resumed group keeps ticking (and its
@@ -7656,6 +7693,33 @@ impl OrchRegistry {
         } else if set.remove(group) {
             let _ = fs::remove_file(dir.join("notify"));
             self.audit(group, "human", "notify-off", json!({}));
+        }
+        Ok(())
+    }
+
+    /// Whether this group has opted OUT of the #260 minimize-on-spawn default
+    /// (i.e. wants delegate panes to keep opening expanded, the pre-#260
+    /// behavior). Feeds `spawn_opens_minimized` at each delegate spawn.
+    pub fn spawn_expanded(&self, group: &str) -> bool {
+        self.spawn_expanded_groups.lock_safe().contains(group)
+    }
+
+    /// Opt a group in/out of the #260 minimize-on-spawn default, durably (a
+    /// `spawn_expanded` marker file, mirroring `notify`) so the choice survives
+    /// restarts. `on=true` means "expand every spawn like before #260";
+    /// `on=false` (the default) restores the minimize-on-spawn behavior.
+    pub fn set_spawn_expanded(&self, group: &str, on: bool) -> Result<(), String> {
+        let dir = self.group_dir(group);
+        let mut set = self.spawn_expanded_groups.lock_safe();
+        if on {
+            if set.insert(group.to_string()) {
+                fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+                let _ = fs::write(dir.join("spawn_expanded"), b"");
+                self.audit(group, "human", "spawn-expanded-on", json!({}));
+            }
+        } else if set.remove(group) {
+            let _ = fs::remove_file(dir.join("spawn_expanded"));
+            self.audit(group, "human", "spawn-expanded-off", json!({}));
         }
         Ok(())
     }
@@ -11024,6 +11088,9 @@ impl OrchRegistry {
             // Agent pane: inject the gh-shim PATH + LOOMUX_GROUP_DIR so the merge
             // gate is enforced structurally (#83).
             env: self.agent_pane_env(group_id),
+            // #260: delegate panes open docked by default so a burst of spawns
+            // doesn't crowd the orchestrator pane out of focus.
+            minimized: spawn_opens_minimized(role, self.spawn_expanded(group_id)),
         };
 
         let app = self.app.lock_safe().clone();
@@ -12350,6 +12417,24 @@ pub fn orch_set_notify(
     reg.set_notify(&group_id, enabled)
 }
 
+/// Whether this group has opted OUT of the #260 minimize-on-spawn default
+/// (toggle button state — the panel shows the OPT-IN sense, "auto-dock", so
+/// the frontend negates this: see `spawnExpanded` in orchestration.ts).
+#[tauri::command]
+pub fn orch_spawn_expanded(reg: tauri::State<Arc<OrchRegistry>>, group_id: String) -> bool {
+    reg.spawn_expanded(&group_id)
+}
+
+/// Opt a group in/out of the #260 minimize-on-spawn default (durable, per-group).
+#[tauri::command]
+pub fn orch_set_spawn_expanded(
+    reg: tauri::State<Arc<OrchRegistry>>,
+    group_id: String,
+    expanded: bool,
+) -> Result<(), String> {
+    reg.set_spawn_expanded(&group_id, expanded)
+}
+
 /// Change a live group's max live-agent cap (durable, bounds-checked, audited).
 /// Takes effect on the next spawn; lowering it below the current live count
 /// blocks new spawns until attrition rather than killing anyone. Returns the
@@ -12785,6 +12870,10 @@ fn register_orchestrator_pane(
         // The orchestrator is the pane the incident implicated — inject the
         // gh-shim env so its merge gate is enforced too (#83).
         env: reg.agent_pane_env(&group.id),
+        // The orchestrator's own pane is never minimized (#260) — see
+        // `spawn_opens_minimized`, called here too so both `SpawnRequest` sites
+        // agree on the rule structurally, not by two independently-written `false`s.
+        minimized: spawn_opens_minimized(Role::Orchestrator, reg.spawn_expanded(&group.id)),
     };
 
     crate::obs::breadcrumb(

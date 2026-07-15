@@ -49,6 +49,12 @@ export interface OrchSpawnRequest {
    *  the merge gate on agent panes. `[key, value]` pairs; absent on an older
    *  backend or for panes with nothing extra to inject. */
   env?: [string, string][];
+  /** Open this pane straight into the dock instead of the visible split tree
+   *  (#260) — backend-computed from role + the group's `spawn_expanded`
+   *  setting (see `spawn_opens_minimized`): true for delegate roles by
+   *  default, always false for the orchestrator's own pane. Absent/falsy on
+   *  an older backend, which preserves the pre-#260 always-expand behavior. */
+  minimized?: boolean;
 }
 
 /** Launcher-collected group settings; guardrails are enforced backend-side. */
@@ -132,6 +138,16 @@ export const notifyEnabled = (groupId: string): Promise<boolean> =>
 /** Enable/disable desktop notifications for a group (durable, per-group). */
 export const setNotify = (groupId: string, enabled: boolean): Promise<void> =>
   invoke("orch_set_notify", { groupId, enabled });
+
+/** Whether this group has opted OUT of the #260 minimize-on-spawn default
+ *  (delegate panes open expanded, like before #260, instead of docked). */
+export const spawnExpanded = (groupId: string): Promise<boolean> =>
+  invoke<boolean>("orch_spawn_expanded", { groupId });
+
+/** Opt a group in/out of the #260 minimize-on-spawn default (durable,
+ *  per-group). `expanded=true` restores the pre-#260 always-expand behavior. */
+export const setSpawnExpanded = (groupId: string, expanded: boolean): Promise<void> =>
+  invoke("orch_set_spawn_expanded", { groupId, expanded });
 
 /** Change a group's max live-agent cap on the fly (bounds-checked backend-side,
  *  durable, audited). Resolves to the applied value; rejects with the backend
@@ -287,6 +303,14 @@ async function openAgentPane(
       discardStalePane(grid, pane);
       return;
     }
+    // Dock it straight away (#260): the backend already decided this pane
+    // should open minimized (a delegate role, group hasn't opted out) — reuse
+    // the existing minimize/dock plumbing (#46) rather than a parallel
+    // "open into the dock" path, so this behaves exactly like a human folding
+    // the pane by hand a moment after it opened. `grid.minimize` refuses to
+    // dock the grid's last visible pane, so this is a no-op in that edge case
+    // rather than ever leaving the grid empty.
+    if (req.minimized) grid.minimize(pane);
     // Report the pty so the backend can unblock the spawner and type the kickoff.
     try {
       await invoke("bind_agent", { agentId: req.agent_id, ptyId: pane.ptyId });

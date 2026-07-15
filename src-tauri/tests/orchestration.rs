@@ -27,6 +27,7 @@ use loomux_lib::orchestration::{
     sanitize_attachment_ext, set_rotate_check_pause_for_test, should_confirm_copilot_autopilot,
     should_flush_before_paste,
     should_notify_paste_held, should_notify_unconfirmed, single_pane_autopilot_flags,
+    spawn_opens_minimized,
     spawn_rate_exceeded, spawn_request_expired, strip_ansi, submit_confirmed, submit_sequence,
     cap_task_notes, task_summary,
     unconfirmed_delivery_notice, watchdog_should_notify, worktree_cleanup_targets,
@@ -6780,6 +6781,45 @@ fn notify_optin_is_durable_across_restart() {
     // Turning it off removes the marker.
     reg2.set_notify(&gid, false).unwrap();
     assert!(!reg2.notify_enabled(&gid));
+}
+
+#[test]
+fn spawn_opens_minimized_exempts_only_the_orchestrator() {
+    // #260: every delegate role docks by default...
+    for role in [Role::Worker, Role::Reviewer, Role::Planner] {
+        assert!(spawn_opens_minimized(role, false), "{role:?} should dock by default");
+        assert!(!spawn_opens_minimized(role, true), "{role:?} must expand once the group opts out");
+    }
+    // ...but the orchestrator's own pane never does, even if a caller somehow
+    // passed `group_opted_expanded=false` for it (the exemption is unconditional,
+    // not just "expanded happens to be the group default").
+    assert!(!spawn_opens_minimized(Role::Orchestrator, false));
+    assert!(!spawn_opens_minimized(Role::Orchestrator, true));
+}
+
+#[test]
+fn spawn_expanded_optout_is_durable_across_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let gid;
+    {
+        let reg = OrchRegistry::new(dir.path().to_path_buf());
+        reg.set_port(46001);
+        let g = reg.create_group("C:/tmp/repo-spawn-expanded", watchdog_rails(0)).unwrap();
+        gid = g.id.clone();
+        assert!(!reg.spawn_expanded(&gid), "minimize-on-spawn is the default — nothing opted out yet");
+        reg.set_spawn_expanded(&gid, true).unwrap();
+        assert!(reg.spawn_expanded(&gid));
+    }
+    // A fresh registry over the same root re-seeds the opt-out from the marker.
+    let reg2 = OrchRegistry::new(dir.path().to_path_buf());
+    reg2.set_port(46001);
+    let g2 = reg2.create_group("C:/tmp/repo-spawn-expanded", watchdog_rails(0)).unwrap();
+    assert_eq!(g2.id, gid);
+    assert!(reg2.spawn_expanded(&gid), "the expand-instead-of-dock opt-out must survive a restart");
+
+    // Turning it back off (re-enabling minimize-on-spawn) removes the marker.
+    reg2.set_spawn_expanded(&gid, false).unwrap();
+    assert!(!reg2.spawn_expanded(&gid));
 }
 
 #[test]
