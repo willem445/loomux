@@ -20,6 +20,16 @@ designs live in `doc/design/`.
 There is no lint/format gate (no eslint/prettier; rustfmt is not enforced in
 CI) — match the surrounding style instead of reformatting.
 
+### Agent workers: validate via CI, not locally
+
+The Commands table above is for humans. Agent workers must **not** run
+`cargo check`/`cargo test`/`npm run build`/`npm test` (or anything else that
+spawns a compiler or test runner) on the host by default — push the branch,
+open a draft PR, and let `.github/workflows/ci.yml` build and test on
+GitHub's runners instead. Use the `ci-validate` skill for the full workflow.
+This is a hard rule, not a preference: a hard-kill was caused by every worker
+in a group running `cargo build` at once and exhausting the host (#320).
+
 ## Hard constraints — check before coding
 
 1. **Never resize the PTY for a UI feature.** Git view, task board, audit

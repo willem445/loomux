@@ -249,8 +249,9 @@ assessment (sprawling change ⇒ serialize; independent ⇒ parallel worktrees) 
 monitor → reviewer per PR → **findings dispositioned** → high-level completion check → hand
 to user for merge. Workers: branch → implement → meaningful unit/functional tests (test
 intent, not vacuous passes) → **red-before-green evidence** → design notes + user docs →
-commit → push → `gh pr create` → report. Reviewers: `gh pr review` with findings, each
-labelled blocking/non-blocking → report.
+commit → push → `gh pr create` → report. Workers validate via CI, not local
+builds — see the `ci-validate` skill (#320). Reviewers: `gh pr review` with
+findings, each labelled blocking/non-blocking → report.
 
 "Dispositioned", not "addressed": an approval that leaves findings behind is not done. The
 default is to fix a non-blocking finding in the same PR before merging (bounded like the CI
