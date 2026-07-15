@@ -7179,6 +7179,7 @@ impl OrchRegistry {
             watchdog_notified: false,
             idle_tick_notified: false,
             solo_cli: Some(cli.to_string()),
+            last_exit_tail: None,
         };
         self.agents.lock_safe().insert(agent_id.clone(), entry);
         if !token.is_empty() {
@@ -7253,6 +7254,7 @@ impl OrchRegistry {
             watchdog_notified: false,
             idle_tick_notified: false,
             solo_cli: None, // unknown for an adopted pane; cli_for_agent falls back to "claude"
+            last_exit_tail: None,
         };
         self.agents.lock_safe().insert(agent_id.clone(), entry);
         self.by_pty.lock_safe().insert(pty_id, agent_id.clone());
