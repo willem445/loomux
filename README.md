@@ -63,7 +63,7 @@ no global mode:
 
 | Kind | What it is |
 | --- | --- |
-| **Agent** | A coding-agent CLI (Claude, Copilot, Codex, OpenCode, Gemini CLI, Hermes, or a custom command), optionally fanned out to *N* panes each in its own git worktree. |
+| **Agent** | A coding-agent CLI (Claude, Copilot, Codex, OpenCode, Gemini CLI, Hermes, Ante, or a custom command), optionally fanned out to *N* panes each in its own git worktree. |
 | **Orchestrator + workers** | An orchestrator plus idle workers in their own project tab, with guardrails. |
 | **Terminal** | A plain shell: PowerShell, Command Prompt, or Git Bash. |
 | **File explorer** | A native-style **file manager** rooted at a folder you pick — no terminal underneath, no process, ever. |

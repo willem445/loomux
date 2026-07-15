@@ -1790,6 +1790,16 @@ pub fn claude_permission_mode(unattended: bool) -> &'static str {
 /// Returns an empty string for CLIs with no known unattended flag surface
 /// (codex/opencode/gemini/custom): the toggle is a no-op there rather than
 /// inventing flags that may not exist.
+///
+/// Ante (#292) is launcher-only here, same Tier-A shape as Hermes (#284):
+/// this function and the `AGENTS` catalog entry (`src/agents.ts`) are the only
+/// changes. `SUPPORTED_CLIS`, `build_agent_command`, and `write_mcp_config`
+/// deliberately do NOT gain an ante arm — Ante's MCP servers are configured
+/// exclusively via `~/.ante/settings.json` (no `--mcp-config`-equivalent CLI
+/// flag exists per docs), so adding "ante" to `SUPPORTED_CLIS` would make
+/// `solo_prepare`'s `has_seam` true with no flag string to build, hitting its
+/// `unreachable!` arm. Ante stays a delivery-only channel member (never in
+/// `SUPPORTED_CLIS` → `has_seam` is false), exactly like codex/gemini/opencode.
 pub fn single_pane_autopilot_flags(program: &str) -> String {
     match program.trim().to_lowercase().as_str() {
         "claude" => format!(
@@ -1802,6 +1812,19 @@ pub fn single_pane_autopilot_flags(program: &str) -> String {
         // single-pane launch. cli-commands.md:
         // https://github.com/NousResearch/hermes-agent/blob/main/website/docs/reference/cli-commands.md
         "hermes" => "--yolo".to_string(),
+        // Ante: yolo permission mode runs "all tools execute automatically
+        // without rule evaluation or prompts" (docs/configuration/permission.mdx);
+        // usage/approvals.mdx confirms it's an all-or-nothing bypass with no
+        // documented startup dialog, same shape as Hermes's --yolo above.
+        // https://github.com/AntigmaLabs/ante-preview/blob/main/docs-site/docs/configuration/permission.mdx
+        // https://github.com/AntigmaLabs/ante-preview/blob/main/docs-site/docs/usage/approvals.mdx
+        //
+        // NOTE (#292): Ante is documented "macOS and Linux only" (README) — no
+        // Windows binary ships in any release. This arm is correct-per-docs but
+        // unreachable on loomux's Windows-only target until Ante ships Windows
+        // support (or a WSL bridge is built as a follow-up); wired now so the
+        // launcher entry (src/agents.ts) doesn't silently no-op the toggle.
+        "ante" => "--yolo".to_string(),
         _ => String::new(),
     }
 }
