@@ -1,6 +1,7 @@
 # Design: durable writes + disk hygiene
 
-Status: implemented (issues #133, #134, #240).
+Status: implemented (issues #133, #134, #240); the #134 shared build cache
+described below was **removed** by #263 — see that section for why.
 
 ## Problem
 
@@ -18,9 +19,10 @@ free**. Two independent failures fell out of that one condition:
    5–7 GB each. A day of orchestrated work left ~10 worktrees ≈ 50 GB of
    duplicate build caches, with nothing bounding or reclaiming them.
 
-This note covers the fix for both: make durable writes atomic (#133), and stop
-worktrees from each paying a fresh multi-GB build cache, plus a backstop that
-warns before the disk hits zero (#134).
+This note covers the fix for both: make durable writes atomic (#133), plus a
+backstop that warns before the disk hits zero (#134). (A shared build cache
+once addressed the per-worktree cost too, but it corrupted concurrent builds
+and special-cased cargo, so it was removed — #263.)
 
 ## Part 1 — atomic durable writes (#133)
 
@@ -158,36 +160,42 @@ torn lines forever. Unreadable lines are still skipped
 already claimed "one `O_APPEND` write, atomic per line"); it now builds the line
 and writes it once.
 
-## Part 2 — disk hygiene (#134)
+## Part 2 — disk hygiene (#134, shared cache removed by #263)
 
-### Shared worktree build cache
+### Shared worktree build cache — removed (#263)
 
-Agent worktrees are created under
-`<repo-parent>/<repo-name>-worktrees/<name>` (see `git_worktree_add`) — same
-drive as the main checkout. A pane whose cwd is a **linked git worktree** now
-gets `CARGO_TARGET_DIR` pointed at `<main-repo-root>/.loomux-target`, so every
-worktree shares one build cache instead of each growing its own 5–7 GB
-`target/`. The near-dedup is the biggest disk win, and later workers get warm
-builds.
+`#134` added a mechanism that pointed `CARGO_TARGET_DIR` at
+`<main-repo-root>/.loomux-target` for any pane whose cwd was a **linked git
+worktree**, so worktrees would share one build cache instead of each growing
+its own 5–7 GB `target/`. The injection lived in `pty.rs::apply_pane_env`, with
+worktree-ness detected purely from the filesystem (a linked worktree's `.git`
+is a *file* whose `commondir` resolves to the main repo's `.git`) and
+`LOOMUX_NO_SHARED_TARGET` as a one-env-var rollback.
 
-The injection lives in `pty.rs::apply_pane_env` — the one place every pane's
-child environment is assembled (both the #78 direct-CLI spawn and the shell
-wrapper), so the #110 direct-spawn path is covered without any frontend change.
-Worktree-ness is detected purely from the filesystem — a linked worktree's
-`.git` is a *file* (`gitdir: …`) whose `commondir` resolves to the main repo's
-`.git` — so **the main checkout keeps its own `target/`** (its `.git` is a
-directory → `None`). An operator-set `CARGO_TARGET_DIR` is respected (not
-overridden), and `LOOMUX_NO_SHARED_TARGET` is a one-env-var rollback.
+**Removed entirely in #263**, for two independent reasons:
 
-`.loomux-target/` is gitignored in the main repo.
+1. **Concurrency corruption, not just contention.** The design doc originally
+   accepted that concurrent `cargo` invocations against one target dir would
+   *serialize* on cargo's target-dir lock. Live use proved a worse failure
+   mode: concurrent `cargo check` runs from stacked worktrees **collided on
+   shared build-script outputs** in `.loomux-target` (os error 32 file lock on
+   `OpenConsole.exe`, exit 101) — the shared dir doesn't just make concurrent
+   builds wait, it makes them corrupt each other.
+2. **Toolchain-specific product code.** `CARGO_TARGET_DIR` is a name only
+   cargo recognizes; the whole mechanism silently no-ops for every non-Rust
+   repo. loomux's convention is to stay toolchain-agnostic rather than special-
+   case one toolchain in product code — see the paused #263 investigation
+   comment on the issue for the fuller alternatives analysis (a generic
+   cache-budget engine, measure-and-warn, orphaned-scratch-dir cleanup) that a
+   future design review can pick back up if disk pressure returns.
 
-**Tradeoff (documented honestly):** concurrent `cargo` invocations against one
-target dir **serialize on cargo's target-dir lock** — a second build blocks
-until the first releases. This is acceptable here: workers mostly build at
-distinct times, and `--locked` keeps inputs consistent so the shared cache stays
-valid across worktrees. The alternative (per-worktree caches) is what filled the
-disk. If serialization ever bites, the rollback env var restores per-worktree
-`target/`.
+Per-worktree `target/` dirs (the pre-#134, and now current, default) are the
+correct behavior going forward. Disk usage is the operator's trade to manage —
+via a repo- or machine-level cleanup cron, an operator-set `CARGO_TARGET_DIR`
+pointed at a self-managed location (still respected, never overridden by
+loomux), or simply accepting the per-worktree cost. The 42–52 GB
+`.loomux-target` directory from the #263 incident is orphaned by this removal
+and safe to delete by hand; loomux does not delete it automatically.
 
 ### Low-disk backstop
 
@@ -213,9 +221,10 @@ The latch/hysteresis (`low_disk_transition`) and the free-bytes read
 (`free_disk_bytes`) are split so the transition logic is unit-testable without a
 real disk; `disk_tick(free)` takes injected free-bytes for the same reason.
 
-This is a **backstop**, not the fix — the shared cache is the structural cure.
-Option 2 from the issue (auto-reclaim merged/idle worktrees) is mostly
-orchestrator discipline and is left to the orchestrator/human for now.
+This backstop stands alone now that #263 removed the shared cache — it is the
+only structural mitigation left, not a second layer behind one. Option 2 from
+the issue (auto-reclaim merged/idle worktrees) is mostly orchestrator
+discipline and is left to the orchestrator/human for now.
 
 ## Tests
 
@@ -226,8 +235,10 @@ orchestrator discipline and is left to the orchestrator/human for now.
   directory write not file perms, so this injection is Windows-specific.
 - `durable_writes_round_trip`: happy-path round-trip for `tasks.json` /
   `state.json` — atomicity didn't change semantics.
-- `worktree_cwd_maps_to_shared_target_dir`: a fixture worktree tree maps to
-  `<root>/.loomux-target`; a real checkout maps to `None`.
+- `worktree_pane_env_never_injects_cargo_target_dir` (#263): a fixture linked-
+  worktree tree, spawned through `apply_pane_env`, must carry no
+  loomux-computed `CARGO_TARGET_DIR`; an operator-set value passes through
+  untouched.
 - `low_disk_transition_latches_once_with_hysteresis`,
   `low_disk_notice_reports_free_space`,
   `disk_tick_notifies_once_per_episode_and_skips_paused`: the latch, message,

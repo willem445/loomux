@@ -70,8 +70,7 @@ frontend can branch without parsing prose (`errorCode` in `fileapi.ts`).
 
 **Path safety** (`safe_resolve` → `lexical_normalize` + within-root check +
 `ensure_no_symlink`): we deliberately do **not** `fs::canonicalize` (it returns a
-`\\?\`-verbatim path Windows toolchains mishandle — the same reason
-`pty::lexical_normalize` avoids it). Because we don't canonicalize, a symlinked
+`\\?\`-verbatim path Windows toolchains mishandle). Because we don't canonicalize, a symlinked
 component is the one remaining way a lexically-in-root path could redirect
 outside, so we walk each component below the root with `symlink_metadata` and
 refuse any symlink.

@@ -587,62 +587,6 @@ fn try_direct_command(argv: &[String]) -> Option<CommandBuilder> {
     Some(cmd)
 }
 
-/// Resolve `.`/`..` in a path lexically, without touching the filesystem. Kept
-/// off `fs::canonicalize` on purpose: that returns a `\\?\`-verbatim path on
-/// Windows, which some toolchains mishandle in env vars. Inputs here are real
-/// absolute paths, so a lexical fold is sufficient and deterministic (testable).
-fn lexical_normalize(p: &Path) -> PathBuf {
-    let mut out = Vec::new();
-    for comp in p.components() {
-        match comp {
-            std::path::Component::ParentDir => {
-                out.pop();
-            }
-            std::path::Component::CurDir => {}
-            other => out.push(other),
-        }
-    }
-    out.iter().collect()
-}
-
-/// If `cwd` is a **linked git worktree**, return the shared per-repo cargo
-/// target dir to point `CARGO_TARGET_DIR` at — `<main-repo-root>/.loomux-target`
-/// — so every agent worktree reuses ONE build cache instead of each paying a
-/// fresh 5–7 GB `target/` (#134). Returns `None` for a normal checkout (whose
-/// `.git` is a directory), so the main repo keeps its own `target/`.
-///
-/// Pure filesystem inspection — no `git` subprocess: a linked worktree's `.git`
-/// is a *file* `gitdir: <main>/.git/worktrees/<id>`; that dir's `commondir`
-/// resolves to the main repo's `.git`, whose parent is the shared root. Kept
-/// pure so the mapping is unit-testable against a fixture tree.
-#[doc(hidden)] // pub for the worktree-target integration test
-pub fn shared_worktree_target_dir(cwd: &Path) -> Option<PathBuf> {
-    // Opt-out escape hatch, mirroring LOOMUX_NO_DIRECT_SPAWN: a one-env-var
-    // rollback if the shared cache ever misbehaves (a worktree then builds its
-    // own target/ as before).
-    if std::env::var_os("LOOMUX_NO_SHARED_TARGET").is_some() {
-        return None;
-    }
-    let dot_git = cwd.join(".git");
-    if !std::fs::metadata(&dot_git).ok()?.is_file() {
-        return None; // real checkout (dir) or no repo → keep the normal target/
-    }
-    let text = std::fs::read_to_string(&dot_git).ok()?;
-    let gitdir = text.lines().find_map(|l| l.strip_prefix("gitdir:"))?.trim();
-    let worktree_gitdir = PathBuf::from(gitdir);
-    let commondir = std::fs::read_to_string(worktree_gitdir.join("commondir")).ok()?;
-    let commondir = commondir.trim();
-    let common = if Path::new(commondir).is_absolute() {
-        PathBuf::from(commondir)
-    } else {
-        worktree_gitdir.join(commondir)
-    };
-    // `common` is the main repo's `.git`; its parent is the repo root.
-    let root = lexical_normalize(&common);
-    let root = root.parent()?;
-    Some(root.join(".loomux-target"))
-}
-
 /// Apply the shared per-pane cwd + environment (cwd, TERM/COLORTERM, fresh
 /// PATH) to a `CommandBuilder` regardless of whether it is a direct spawn or a
 /// shell wrapper.
@@ -653,16 +597,6 @@ fn apply_pane_env(mut cmd: CommandBuilder, cwd: Option<&str>) -> CommandBuilder 
         .or_else(|| dirs::home_dir().map(|h| h.to_string_lossy().into_owned()));
     if let Some(dir) = dir.as_deref() {
         cmd.cwd(dir);
-        // #134: a pane whose cwd is a git worktree shares one cargo build cache
-        // across all worktrees instead of each growing its own 5–7 GB target/.
-        // Only linked worktrees get this; the main checkout keeps target/.
-        // Respect an operator-set CARGO_TARGET_DIR (don't override a deliberate
-        // choice).
-        if std::env::var_os("CARGO_TARGET_DIR").is_none() {
-            if let Some(target) = shared_worktree_target_dir(Path::new(dir)) {
-                cmd.env("CARGO_TARGET_DIR", target);
-            }
-        }
     }
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
@@ -1191,8 +1125,9 @@ mod tests {
         cmd.get_argv()[0].to_string_lossy().into_owned()
     }
 
-    /// Serializes the two tests that mutate the process-global
-    /// `LOOMUX_NO_DIRECT_SPAWN` so they can't race each other's reads.
+    /// Serializes the tests that mutate process-global env vars
+    /// (`LOOMUX_NO_DIRECT_SPAWN`, `CARGO_TARGET_DIR`) so they can't race each
+    /// other's reads.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// The whole direct-vs-shell decision (issue #78), sequenced in one test so
@@ -1441,5 +1376,49 @@ mod tests {
         // so this exercises the parent walk.
         let here = std::env::current_dir().unwrap();
         assert!(git_branch(&here).is_some());
+    }
+
+    #[test]
+    fn worktree_pane_env_never_injects_cargo_target_dir() {
+        // #263: loomux used to point CARGO_TARGET_DIR at a shared
+        // `<main-repo-root>/.loomux-target` for every linked-worktree pane
+        // (#134). Removed: concurrent cargo runs in stacked worktrees collided
+        // on the shared build-script outputs (os error 32 on OpenConsole.exe,
+        // exit 101) and the mechanism was cargo-specific product code besides.
+        // A pane's env must now carry CARGO_TARGET_DIR only if the operator set
+        // one process-wide themselves — loomux must never compute or set it.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Build the same linked-worktree fixture shape the old shared-target
+        // resolver keyed off: a `.git` FILE (not dir) whose gitdir/commondir
+        // resolve back to a main checkout.
+        let root = tempfile::tempdir().unwrap();
+        let main = root.path().join("myrepo");
+        let wt_gitdir = main.join(".git").join("worktrees").join("feat");
+        std::fs::create_dir_all(&wt_gitdir).unwrap();
+        std::fs::write(wt_gitdir.join("commondir"), "../..\n").unwrap();
+        let wt = root.path().join("myrepo-worktrees").join("feat");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join(".git"), format!("gitdir: {}\n", wt_gitdir.display())).unwrap();
+        let wt_str = wt.to_string_lossy().into_owned();
+
+        std::env::remove_var("CARGO_TARGET_DIR");
+        let cmd = apply_pane_env(CommandBuilder::new("cmd"), Some(wt_str.as_str()));
+        assert!(
+            cmd.get_env("CARGO_TARGET_DIR").is_none(),
+            "loomux must not inject CARGO_TARGET_DIR for a worktree pane, got {:?}",
+            cmd.get_env("CARGO_TARGET_DIR")
+        );
+
+        // An operator-set CARGO_TARGET_DIR passes through untouched — loomux
+        // must never override or clear a deliberate operator choice.
+        std::env::set_var("CARGO_TARGET_DIR", r"C:\operator-chosen-target");
+        let cmd = apply_pane_env(CommandBuilder::new("cmd"), Some(wt_str.as_str()));
+        assert_eq!(
+            cmd.get_env("CARGO_TARGET_DIR"),
+            Some(std::ffi::OsStr::new(r"C:\operator-chosen-target")),
+            "an operator-set CARGO_TARGET_DIR must pass through unmodified"
+        );
+        std::env::remove_var("CARGO_TARGET_DIR");
     }
 }

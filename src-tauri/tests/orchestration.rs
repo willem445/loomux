@@ -7748,38 +7748,6 @@ fn failed_task_write_leaves_board_intact() {
     fs::set_permissions(&board, perms).unwrap();
 }
 
-// ---------- #134: shared worktree target cache ----------
-
-#[test]
-fn worktree_cwd_maps_to_shared_target_dir() {
-    // #134: a pane whose cwd is a linked git worktree gets CARGO_TARGET_DIR at
-    // <main-repo-root>/.loomux-target (one shared build cache); a normal
-    // checkout gets None and keeps its own target/. Build the minimal
-    // git-worktree shape on disk and assert the mapping.
-    use loomux_lib::pty::shared_worktree_target_dir;
-    let root = tempfile::tempdir().unwrap();
-    let main = root.path().join("myrepo");
-    let wt_gitdir = main.join(".git").join("worktrees").join("feat");
-    fs::create_dir_all(&wt_gitdir).unwrap();
-    // git writes commondir as "../.." relative to the worktree's gitdir.
-    fs::write(wt_gitdir.join("commondir"), "../..\n").unwrap();
-
-    // The worktree checkout: a `.git` FILE pointing at its gitdir.
-    let wt = root.path().join("myrepo-worktrees").join("feat");
-    fs::create_dir_all(&wt).unwrap();
-    fs::write(wt.join(".git"), format!("gitdir: {}\n", wt_gitdir.display())).unwrap();
-
-    let target = shared_worktree_target_dir(&wt).expect("worktree cwd maps to a shared target");
-    assert_eq!(target, main.join(".loomux-target"));
-
-    // The main checkout (a real `.git` directory) is never redirected.
-    fs::create_dir_all(main.join(".git")).unwrap();
-    assert!(
-        shared_worktree_target_dir(&main).is_none(),
-        "the main checkout keeps its own target/"
-    );
-}
-
 // ---------- #134: low-disk backstop ----------
 
 #[test]

@@ -8,9 +8,8 @@
 //!
 //!   * absolute `rel` is rejected;
 //!   * `.`/`..` are folded lexically (never `fs::canonicalize`, which yields a
-//!     `\\?\`-verbatim path some Windows toolchains mishandle — same reason
-//!     `pty::lexical_normalize` avoids it) and the result must stay inside the
-//!     normalized `root`;
+//!     `\\?\`-verbatim path some Windows toolchains mishandle) and the result
+//!     must stay inside the normalized `root`;
 //!   * we refuse to traverse, read, or write *through* a symlinked component,
 //!     since not canonicalizing means a symlink could otherwise redirect a
 //!     lexically-in-root path to somewhere outside it.
@@ -188,10 +187,9 @@ pub(crate) fn err(code: &str, msg: impl AsRef<str>) -> String {
 
 // ---------- path safety ----------
 
-/// Resolve `.`/`..` lexically, without touching the filesystem. A private copy
-/// of `pty::lexical_normalize` (that one is module-private, and the helper is
-/// already duplicated per module in this codebase — house style). Verbatim/UNC
-/// prefixes and the root are preserved; only `.`/`..` are folded.
+/// Resolve `.`/`..` lexically, without touching the filesystem. Verbatim/UNC
+/// prefixes and the root are preserved; only `.`/`..` are folded. This helper
+/// is intentionally duplicated per module in this codebase — house style.
 fn lexical_normalize(p: &Path) -> PathBuf {
     let mut out = Vec::new();
     for comp in p.components() {
