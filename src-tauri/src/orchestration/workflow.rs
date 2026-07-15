@@ -1728,12 +1728,6 @@ pub fn guard_class_for<'a>(
     program: &str,
     argv: &[String],
 ) -> Option<&'a ResourceClass> {
-    // #318 TEMP STUB — deliberately inert for the test-red evidence commit
-    // (orchestrator request: prove the matcher tests fail for real, not just on
-    // a compile error). Reverted in the very next commit.
-    let _ = (classes, program, argv);
-    return None;
-    #[allow(unreachable_code)]
     let want = program_basename(program);
     let positionals: Vec<&str> =
         argv.iter().map(String::as_str).filter(|t| !t.starts_with('-')).collect();
