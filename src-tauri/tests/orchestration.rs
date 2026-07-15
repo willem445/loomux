@@ -9447,6 +9447,13 @@ fn delivery_only_solo_pane_receives_but_can_never_send_or_become_sender() {
         json!(false),
         "a delivery-only peer must read can_send:false even after receiving a reply credit, got: {status}"
     );
+    assert_eq!(
+        peer["delivery_only"],
+        json!(true),
+        "delivery_only is the STRUCTURAL (no token) fact, distinct from can_send's momentary one — \
+         the UI needs it to render a permanent receive-only chip rather than a plain out-of-credit \
+         receiver, got: {status}"
+    );
 }
 
 #[test]

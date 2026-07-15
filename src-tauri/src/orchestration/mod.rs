@@ -6041,21 +6041,30 @@ impl OrchRegistry {
     }
 
     /// `members`, plus (given the channel's `sender_id`) each member's
-    /// directional standing — `direction` ("sender"|"receiver") and
-    /// `can_send` (always true for the sender; for a receiver, whether it
-    /// currently holds the reply credit OR — the #271 W3 addendum's A4
-    /// "represented honestly everywhere" — actually holds a token at all,
-    /// since a delivery-only member can never send regardless of credit).
+    /// directional standing:
+    /// - `direction` ("sender"|"receiver").
+    /// - `can_send`: whether it may `channel_send` RIGHT NOW — always true
+    ///   for the sender; for a receiver, only while it holds the reply
+    ///   credit AND has a token.
+    /// - `delivery_only`: the STRUCTURAL fact (no token, full stop) rather
+    ///   than the momentary one — a delivery-only member's `can_send` is
+    ///   always false, but so is a normal receiver's between messages, and
+    ///   the UI (#271 W3 addendum's A4 "represented honestly everywhere")
+    ///   needs to tell "will never be able to reply" (permanent) apart from
+    ///   "can't reply yet" (temporary) — the "receive-only" chip variant vs.
+    ///   the plain receiver one.
     fn channel_members_json(&self, sender_id: &str, members: &[ChannelMember]) -> Vec<Value> {
         members
             .iter()
             .map(|m| {
                 let is_sender = m.agent_id == sender_id;
-                let can_send = is_sender || (m.may_reply && self.agent_has_token(&m.agent_id));
+                let has_token = self.agent_has_token(&m.agent_id);
+                let can_send = is_sender || (m.may_reply && has_token);
                 json!({
                     "group": m.group, "agent_id": m.agent_id, "name": m.name, "role": m.role,
                     "direction": if is_sender { "sender" } else { "receiver" },
                     "can_send": can_send,
+                    "delivery_only": !has_token,
                 })
             })
             .collect()
@@ -6472,12 +6481,14 @@ impl OrchRegistry {
             .filter(|m| m.agent_id != caller.agent_id)
             .map(|m| {
                 let is_sender = m.agent_id == ch.sender;
-                let can_send = is_sender || (m.may_reply && self.agent_has_token(&m.agent_id));
+                let has_token = self.agent_has_token(&m.agent_id);
+                let can_send = is_sender || (m.may_reply && has_token);
                 json!({
                     "agent_id": m.agent_id, "role": m.role, "name": m.name,
                     "repo": self.group(&m.group).map(|g| g.repo).unwrap_or_default(),
                     "direction": if is_sender { "sender" } else { "receiver" },
                     "can_send": can_send,
+                    "delivery_only": !has_token,
                 })
             })
             .collect();
