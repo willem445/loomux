@@ -178,8 +178,12 @@ fn tool_defs(role: Role) -> Vec<Value> {
         tool("get_state", "Read the group's durable orchestration state (JSON string). Survives sessions.",
             json!({}), &[]),
         tool("list_tasks",
-            "Read the group's task board (JSON array, order = priority). The human sees and edits this same board.",
+            "Read the group's task board (JSON array, order = priority) as COMPACT rows: id, title, status, issue, pr, assignee, session, updated_ms, note_count — NO note text. The human sees and edits the full board (with notes) beside your pane. Use note_count to tell whether a task has history worth pulling, then call get_task(id) for that task's full notes.",
             json!({}), &[]),
+        tool("get_task",
+            "Read ONE task's full record, including its note history (capped: only the newest notes are kept verbatim, older ones collapse into one placeholder — the full text of every note is always in this group's audit log regardless). Use this after list_tasks's compact row shows a note_count worth reading.",
+            json!({ "id": { "type": "string", "description": "Task id, e.g. t-3" } }),
+            &["id"]),
         tool("list_verdicts",
             "Read the recorded review verdicts for a PR: which reviewer block recorded what (pass | fail | escalate), when, and its summary — plus, when this repo's .loomux/workflow.yml declares a merge gate, whether that gate is satisfied. This is STATE, not a notification: it is what the loomux gh interceptor reads when it decides whether to allow `gh pr merge`. Omit pr to list every PR with a recorded verdict.",
             json!({
@@ -344,7 +348,12 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
     match name {
         "list_agents" => Ok(reg.list_agents(&caller.group).to_string()),
         "get_state" => Ok(reg.get_state(&caller.group)),
-        "list_tasks" => Ok(serde_json::to_string(&reg.tasks(&caller.group)).unwrap_or_default()),
+        "list_tasks" => Ok(serde_json::to_string(&reg.task_summaries(&caller.group)).unwrap_or_default()),
+        "get_task" => {
+            let id = arg_str(args, "id").ok_or("id required")?;
+            let task = reg.get_task(&caller.group, id).ok_or_else(|| format!("unknown task: {id}"))?;
+            Ok(serde_json::to_string(&task).unwrap_or_default())
+        }
 
         "upsert_task" => {
             require_orchestrator(caller)?;
