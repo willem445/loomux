@@ -1442,4 +1442,48 @@ mod tests {
         let here = std::env::current_dir().unwrap();
         assert!(git_branch(&here).is_some());
     }
+
+    #[test]
+    fn worktree_pane_env_never_injects_cargo_target_dir() {
+        // #263: loomux used to point CARGO_TARGET_DIR at a shared
+        // `<main-repo-root>/.loomux-target` for every linked-worktree pane
+        // (#134). Removed: concurrent cargo runs in stacked worktrees collided
+        // on the shared build-script outputs (os error 32 on OpenConsole.exe,
+        // exit 101) and the mechanism was cargo-specific product code besides.
+        // A pane's env must now carry CARGO_TARGET_DIR only if the operator set
+        // one process-wide themselves — loomux must never compute or set it.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Build the same linked-worktree fixture shape the old shared-target
+        // resolver keyed off: a `.git` FILE (not dir) whose gitdir/commondir
+        // resolve back to a main checkout.
+        let root = tempfile::tempdir().unwrap();
+        let main = root.path().join("myrepo");
+        let wt_gitdir = main.join(".git").join("worktrees").join("feat");
+        std::fs::create_dir_all(&wt_gitdir).unwrap();
+        std::fs::write(wt_gitdir.join("commondir"), "../..\n").unwrap();
+        let wt = root.path().join("myrepo-worktrees").join("feat");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join(".git"), format!("gitdir: {}\n", wt_gitdir.display())).unwrap();
+        let wt_str = wt.to_string_lossy().into_owned();
+
+        std::env::remove_var("CARGO_TARGET_DIR");
+        let cmd = apply_pane_env(CommandBuilder::new("cmd"), Some(wt_str.as_str()));
+        assert!(
+            cmd.get_env("CARGO_TARGET_DIR").is_none(),
+            "loomux must not inject CARGO_TARGET_DIR for a worktree pane, got {:?}",
+            cmd.get_env("CARGO_TARGET_DIR")
+        );
+
+        // An operator-set CARGO_TARGET_DIR passes through untouched — loomux
+        // must never override or clear a deliberate operator choice.
+        std::env::set_var("CARGO_TARGET_DIR", r"C:\operator-chosen-target");
+        let cmd = apply_pane_env(CommandBuilder::new("cmd"), Some(wt_str.as_str()));
+        assert_eq!(
+            cmd.get_env("CARGO_TARGET_DIR"),
+            Some(std::ffi::OsStr::new(r"C:\operator-chosen-target")),
+            "an operator-set CARGO_TARGET_DIR must pass through unmodified"
+        );
+        std::env::remove_var("CARGO_TARGET_DIR");
+    }
 }
