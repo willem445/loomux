@@ -11,6 +11,7 @@ mod winpath;
 mod metrics;
 mod obs;
 pub mod orchestration; // pub: integration smoke test links through it
+pub mod pluginbroker; // pub: the #360 Slice C trust-core integration test links its pure fns
 pub mod plugins; // pub: the pane-plugins integration test links its pure fns (#360 Slice B)
 pub mod pty; // pub: Job-Object integration test links `assign_kill_on_close_job`
 mod sessions;
@@ -43,6 +44,9 @@ pub fn run() {
         // Pane plugins (#360 Slice B): serves each installed plugin's own
         // assets, jailed to its folder, with the CSP header the design note
         // requires on every response — see plugins::plugin_protocol_handler.
+        // Slice C's WebviewWindow points at the URLs this handler serves
+        // (plugin://localhost/<id>/...) rather than registering a second
+        // handler — Tauri allows exactly one per scheme.
         .register_uri_scheme_protocol("plugin", plugins::plugin_protocol_handler)
         .manage(startup_notice)
         .manage(pty::PtyManager::default())
@@ -197,12 +201,20 @@ pub fn run() {
             voice::voice_start,
             voice::voice_stop,
             voice::voice_cancel,
+            pluginbroker::plugin_open_window,
+            pluginbroker::plugin_broker_request,
+            pluginbroker::plugin_broker_open_channel,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {
                 obs::breadcrumb("shutdown", "window destroyed");
-                let state: tauri::State<pty::PtyManager> = window.app_handle().state();
-                state.kill_all();
+                pluginbroker::on_window_destroyed(window.label());
+                // Only the main window owns PTYs; a plugin window closing
+                // must not kill every agent pane's process.
+                if window.label() == "main" {
+                    let state: tauri::State<pty::PtyManager> = window.app_handle().state();
+                    state.kill_all();
+                }
                 // Record a clean exit last, so a crash during teardown still
                 // leaves the sentinel for the next launch to report.
                 obs::mark_clean_exit();

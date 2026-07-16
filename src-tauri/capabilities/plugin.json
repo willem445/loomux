@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "plugin",
+  "description": "#360 Slice C: the real capability every plugin WebviewWindow is bound to. `windows: [\"plugin-*\"]` matches every window pluginbroker::plugin_open_window creates (label scheme `plugin-<id>-<seq>`). Grants exactly the plugin-broker permission set — the two broker commands (plugin_broker_request, plugin_broker_open_channel) and nothing else in the app's command surface. This is the real, populated sibling of plugin-zero-template.json (#363) — that file stays literally empty as the base template and the tests/acl_manifest.rs zero-grant proof; this one is what a shipped plugin window actually gets. Widening this beyond \"plugin-broker\" (and never to \"main-ui\") is a reviewed contract change — see doc/design/pane-plugins.md's capability model.",
+  "windows": ["plugin-*"],
+  "permissions": ["plugin-broker"]
+}

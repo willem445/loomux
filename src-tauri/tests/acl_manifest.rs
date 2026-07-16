@@ -1,31 +1,40 @@
-//! ACL coherence + denial tests (#363).
+//! ACL coherence + denial tests (#363, extended by #360 Slice C).
 //!
 //! This is the CI guard the #363 plan calls "the single most important
 //! deliverable": the app manifest flip (`build.rs`) makes every command
 //! without an explicit grant silently unreachable for every window,
 //! including `main`. These tests turn that silent failure into a red test:
 //!
-//!   - `generate_handler_matches_app_commands` / `app_commands_len_is_122`:
+//!   - `generate_handler_matches_app_commands` / `app_commands_len_is_125`:
 //!     `src/lib.rs`'s `generate_handler!` and `command_manifest::APP_COMMANDS`
 //!     are the two hand-maintained lists this migration depends on staying
 //!     identical; this diffs them directly out of the `lib.rs` source rather
-//!     than trusting a hand count. (120 at #363's landing; +2 for #360 Slice
-//!     B's `list_plugins`/`install_plugin`.)
-//!   - `main_has_all_120_and_zero_permission_denies_dangerous_spread`: builds
+//!     than trusting a hand count. The count was 120 at #363, grew to 122
+//!     with #360 Slice B's `list_plugins`/`install_plugin`, and grew again to
+//!     125 with #360 Slice C's own three broker commands (`plugin_open_window`,
+//!     `plugin_broker_request`, `plugin_broker_open_channel`).
+//!   - `main_has_all_125_and_zero_permission_denies_dangerous_spread`: builds
 //!     a real (headless) `tauri::test` mock app using the app's *actual*
 //!     `capabilities/`/`permissions/` on disk (via the same `generate_context!`
 //!     `build.rs` already feeds — not a reimplementation of ACL resolution),
-//!     invokes every registered command against the `main` window label, and invokes
+//!     invokes all 125 commands against the `main` window label, and invokes
 //!     a representative dangerous spread + a benign control against the
 //!     `plugin-zero-template` window label (see
 //!     `capabilities/plugin-zero-template.json`). This is both the coherence
 //!     test's A2 (every command reachable to main) and the plan's B
 //!     (zero-permission denial), proven against the real resolver.
+//!   - `plugin_capability_grants_only_broker_commands`: the #360 Slice C
+//!     addition — proves a `plugin-*`-labeled window (bound to
+//!     `capabilities/plugin.json`) can reach exactly the two broker commands
+//!     and nothing else, including the dangerous spread and the benign
+//!     control that `main` gets and the zero-permission template doesn't.
 //!
 //! Red-before-green (cited in the PR): dropping `orch_grant_merge` from
 //! `permissions/sets/orch-control.toml` makes
-//! `main_has_all_120_and_zero_permission_denies_dangerous_spread` fail with
-//! `main is missing a grant for: ["orch_grant_merge"]`.
+//! `main_has_all_125_and_zero_permission_denies_dangerous_spread` fail with
+//! `main is missing a grant for: ["orch_grant_merge"]`. Dropping
+//! `allow-plugin-broker-request` from `permissions/sets/plugin-broker.toml`
+//! makes `plugin_capability_grants_only_broker_commands` fail the same way.
 
 // Stub commands: same bare identifiers as the real commands in
 // `src/command_manifest.rs` / `src/lib.rs`'s `generate_handler!`, but
@@ -82,6 +91,7 @@ stub_commands!(
     take_startup_notice,
     load_ui_tabs, save_ui_tabs,
     voice_start, voice_stop, voice_cancel,
+    plugin_open_window, plugin_broker_request, plugin_broker_open_channel,
 );
 
 // Tauri's "local origin" custom-protocol scheme differs by platform (WebView2
@@ -155,18 +165,19 @@ fn generate_handler_matches_app_commands() {
 }
 
 #[test]
-fn app_commands_len_is_122() {
+fn app_commands_len_is_125() {
     assert_eq!(
         loomux_lib::command_manifest::APP_COMMANDS.len(),
-        122,
-        "APP_COMMANDS drifted from the audited count of 120 (#363) + 2 (#360 Slice B's \
-         list_plugins/install_plugin) — if this is an intentional addition/removal, update the \
-         count here (and the #363 plan's inventory table, if that's the drift)"
+        125,
+        "APP_COMMANDS drifted from the audited count of 125 (120 at #363 + 2 for #360 Slice B's \
+         list_plugins/install_plugin + 3 for #360 Slice C's pluginbroker commands) — if this is \
+         an intentional addition/removal, update the count here (and the relevant issue's \
+         inventory, if that's the drift)"
     );
 }
 
 #[test]
-fn main_has_all_120_and_zero_permission_denies_dangerous_spread() {
+fn main_has_all_125_and_zero_permission_denies_dangerous_spread() {
     // Catches drift in *this test file* before it can mask a real gap: the
     // stub list above must match APP_COMMANDS exactly.
     let mut stub_names: Vec<&str> = STUB_COMMAND_NAMES.to_vec();
@@ -244,4 +255,45 @@ fn main_has_all_120_and_zero_permission_denies_dangerous_spread() {
         "main should still allow the benign control {BENIGN_CONTROL} — if this fails, the deny \
          above is not per-label, it's global, and proves nothing"
     );
+}
+
+/// #360 Slice C: a real plugin window's capability (`capabilities/plugin.json`,
+/// `windows: ["plugin-*"]`) grants exactly the two broker commands and nothing
+/// else — proven against the same real resolver as the test above, against a
+/// window label a real plugin window would actually get
+/// (`pluginbroker::next_window_label` produces `plugin-<id>-<seq>`).
+#[test]
+fn plugin_capability_grants_only_broker_commands() {
+    let app = build_app();
+    let plugin_window = tauri::WebviewWindowBuilder::new(&app, "plugin-demo-0", Default::default())
+        .build()
+        .expect("failed to build the 'plugin-demo-0' mock webview");
+
+    for &cmd in &["plugin_broker_request", "plugin_broker_open_channel"] {
+        assert!(
+            invoke(&plugin_window, cmd).is_ok(),
+            "a plugin-* window must be granted {cmd} — check capabilities/plugin.json and \
+             permissions/sets/plugin-broker.toml"
+        );
+    }
+
+    // A plugin cannot open another plugin window (main-only), cannot reach
+    // the dangerous spread, and doesn't even get the benign control — a
+    // curated two-command grant, not main-ui, not zero-permission.
+    const MUST_BE_DENIED: &[&str] = &[
+        "plugin_open_window",
+        "orch_grant_merge",
+        "git_push",
+        "ft_write_file",
+        "spawn_pty",
+        "open_in_editor",
+        "pty_backend_info",
+    ];
+    for &cmd in MUST_BE_DENIED {
+        assert!(
+            invoke(&plugin_window, cmd).is_err(),
+            "a plugin-* window should be DENIED {cmd}, but it was allowed — the plugin capability \
+             must never widen past the two broker commands"
+        );
+    }
 }

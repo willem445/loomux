@@ -1,6 +1,6 @@
 [[set]]
 identifier = "misc"
-description = "Ungrouped single-module commands: session listing, agent CLI probing, external editor launch, file hashing, startup notice, durable UI tab state, voice capture."
+description = "Ungrouped single-module commands: session listing, agent CLI probing, external editor launch, file hashing, startup notice, durable UI tab state, voice capture, opening a plugin's isolated window."
 permissions = [
     "allow-list-sessions",
     "allow-probe-agent-cli",
@@ -12,4 +12,7 @@ permissions = [
     "allow-voice-start",
     "allow-voice-stop",
     "allow-voice-cancel",
+    # main-only (#360 Slice C): opens a plugin's isolated WebviewWindow. Never
+    # granted to a plugin-* window itself — see permissions/sets/plugin-broker.toml.
+    "allow-plugin-open-window",
 ]
