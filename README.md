@@ -32,7 +32,9 @@ Every rung is a complete tool on its own — climb when you're ready:
    across groups via a committed `.loomux/lessons.md`, not just this run.
 4. **Custom agent workflows** — commit `.loomux/workflow.yml` and your repo
    declares its own roster and merge gate: five focused reviewers, five
-   prompts, five models.
+   prompts, five models. The active workflow, its roster, and its armed merge
+   gate are always visible in the group's lifecycle panel, and the toggle that
+   turns it on is a live control — flip it mid-session, no relaunch needed.
 
 Plus a git view, file editor, file explorer, and voice prompts — one
 keystroke away on any rung, never disturbing the shell underneath.

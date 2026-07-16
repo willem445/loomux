@@ -52,6 +52,14 @@ blocks:
     model: haiku
     profile: .github/agents/worker-quick.md
 
+  # Consider one reviewer block on a different CLI/model than the worker — a
+  # second model tends to catch a different class of defect than the one that
+  # already wrote (and is primed to defend) the diff. All three reviewers below
+  # currently run `cli: claude`; flipping one to `cli: copilot` would need
+  # Copilot installed for whoever runs this group, so it's left as a
+  # deliberate human choice rather than done here (#267). See "A nudge toward
+  # cross-model review" in doc/design/workflows.md.
+  #
   # ── three focused reviewers, one per real review lane ───────────────────────
   # Each reviews ONLY its lane and stays out of the others'. rev-orch runs the
   # strong tier: it holds the security surface (gate/shim, capability closure, the
