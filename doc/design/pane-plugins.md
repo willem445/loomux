@@ -208,7 +208,7 @@ until a human deliberately reviews and ships a fifth.
 
 | Capability | Grants | Backed by | Notes |
 | --- | --- | --- | --- |
-| `panel` | Render into the pane's content box; receive host→frame `resize` and `theme` events. | Nothing IPC-shaped — host-side DOM/postMessage events only. | Implicit: every plugin gets this merely by existing as a pane. Not declared in the manifest's `capabilities` array (there is nothing to opt into). |
+| `panel` | Render into the pane's content box. | Nothing IPC-shaped — a plain hosted window/frame, no broker method behind it. | Implicit: every plugin gets this merely by existing as a pane. Not declared in the manifest's `capabilities` array (there is nothing to opt into). **Host→frame `resize` and `theme` events were planned for this row but are NOT implemented in v1** — the envelope reserves the event names (see Broker contract, below) but nothing sends them; a plugin gets no live signal of pane size or app theme today. Tracked as [#378](https://github.com/willem445/loomux/issues/378), a required follow-up, not a silent gap — a plugin author relying on either event will see nothing arrive. |
 | `storage` | A namespaced per-plugin key/value store for view state (window position, last-selected tab, etc). | `uistate.rs`, new keys namespaced by `pluginId` so one plugin can never read or overwrite another's storage. | No cross-plugin read. No shared bucket. |
 | `fs.read` | Read files **under the pane's own root only** — path-jailed, no exceptions. | The existing `ft_read_file` command plus `fileedit.rs`'s server-side path choke point, with the pane's root as the jail boundary. | Rejected at manifest-validation time on a `rootless: true` plugin (no root to jail to). No directory listing beyond what `ft_read_file`'s existing surface already permits. |
 | `metrics.system` | Subscribe (`metrics.subscribe`/`metrics.unsubscribe`) to a read-only stream of system + per-process resource stats (CPU/RAM). | `procmetrics.rs` (Slice E) — a plain Rust module, not a `#[tauri::command]`; the only way to reach it is through the broker's `metrics.subscribe`/`metrics.unsubscribe` methods, per this note's "never exposed to a plugin except through this one broker capability." | Curated payload — name, pid, cpu%, rss. No cmdline, no paths, no environment. Bounded: capped at 32 processes/tick (`procmetrics::MAX_PROCESSES`), sorted by CPU desc; poll interval clamped to 1–10s (`procmetrics::clamp_interval_ms`) regardless of what a plugin requests — a plugin cannot turn this into an unthrottled process-table dump or a tight polling loop. Pane attribution (mapping a build-child process to the agent pane that spawned it, via the per-pane kill-on-close Job Object `pty.rs` already holds) was scoped for this slice but deferred as a follow-up — see the Slice E note below. |
@@ -228,16 +228,46 @@ there is no code path to find a bug in, because there is no code path.
 | System reach | Nothing beyond the three capabilities above. | Call `invoke` or reach any of the ~117 app commands directly; spawn or write to a PTY; touch git or `gh`; mint or read an orchestration/merge grant; steer or inject input into an agent pane. |
 | Network | Nothing. | Phone home, load a remote resource, or otherwise reach the network — enforced by a restrictive CSP header served on every `plugin://` response, **not** by the iframe `sandbox` attribute alone (which does not restrict network egress). See **Content-Security-Policy on plugin content**, under Isolation. |
 
-### Grant is a human decision, made once, at install
+### Grant, in v1: auto-granted from the closed enum, not a human decision yet
 
-The manifest *declares* the capabilities a plugin wants; it does not
-self-grant them. Approving them is the same kind of one-time, human-in-the
--loop decision installing any extension in any other tool already is — shown
-at install time, not re-asked on every launch. Widening what any single
-capability *means* (e.g. turning `fs.read` into `fs.write`, or adding a new
-capability class entirely) is exactly the kind of change flagged in the
-plan's decision list as needing its own threat review before it ships — this
-note is not pre-approving that expansion, only the four rows above.
+**Status update — this section previously described install-time human
+approval as decided; it wasn't, and the implementation was never changed to
+match. Correcting the record:** v1 **auto-grants** whatever subset of the
+closed enum a manifest declares and passes validation on — `install_plugin`
+(Slice B, `plugins.rs`) copies the folder once the manifest parses and every
+declared capability string is in the enum; there is no approval prompt, no
+install-time UI step, and no per-capability human decision anywhere in the
+code path. The manifest's declared `capabilities` array **is** the grant, the
+moment install succeeds.
+
+This is narrower than it sounds, not a hidden hole: the enum itself is
+closed and reviewed once, here, and every row in it is already bounded on the
+implementation side — `fs.read` is jailed to the pane's own root, `storage`
+is namespaced per `pluginId`, `metrics.system` is curated and capped
+(`procmetrics::MAX_PROCESSES`, `clamp_interval_ms`), and `panel` grants
+nothing IPC-shaped at all. Auto-granting a member of *this* enum is not the
+same risk as an open permission model would be — but it is still a human
+installing a plugin without being shown, or asked to confirm, which of these
+four the manifest is asking for, which is what "grant is a human decision"
+promised and did not deliver.
+
+**Install-time capability approval is deferred to
+[#377](https://github.com/willem445/loomux/issues/377), and is a REQUIRED
+blocker** — before v1 ships to general availability, and before
+[#375](https://github.com/willem445/loomux/issues/375)'s native-sidecar work
+(which would widen what a plugin can reach and makes an un-reviewed grant a
+materially bigger problem than it is today). Shipping without #377 in the
+interim is acceptable only because of the bound above: the v1 enum has no
+write, no git/gh/PTY/orchestration reach, jailed `fs.read`, namespaced
+`storage`, and a curated, bounded `metrics.system` — a plugin auto-granted
+its full declared set still cannot reach anything this note's threat table
+(above) lists as "Cannot." That acceptability argument does not extend past
+v1's enum; widening what any single capability *means* (e.g. turning
+`fs.read` into `fs.write`, or adding a new capability class entirely) is
+exactly the kind of change flagged in the plan's decision list as needing its
+own threat review before it ships — this note is not pre-approving that
+expansion, only the four rows above, and #377 is what makes even *those*
+four a human's decision rather than the manifest author's.
 
 ## The broker contract
 
@@ -285,6 +315,10 @@ interface PluginEvent {
 }
 ```
 
+`resize`/`theme` are names this envelope reserves, not events v1 sends —
+only `metrics.tick` (Slice E) is actually pushed today. See the `panel`
+row above and [#378](https://github.com/willem445/loomux/issues/378).
+
 ### Per-message capability + version check
 
 Every `PluginRequest` the broker receives is checked, in this order, before
@@ -303,7 +337,9 @@ any handler runs:
 2. **`apiVersion` check** — the method exists at the plugin's declared
    `apiVersion`. If not: `error.code = "unsupported-version"`.
 3. **Capability check** — the method's owning capability is in the set the
-   manifest declared **and the human approved at install**. If not:
+   manifest declared (v1: auto-granted at install on successful validation —
+   see "Grant, in v1" above and [#377](https://github.com/willem445/loomux/issues/377)
+   for the human-approval step this will gain). If not:
    `error.code = "capability-denied"`.
 4. **Params validation** — malformed params (wrong shape, a path escaping
    the jail root, an unknown method name) get `error.code = "bad-request"`.
@@ -326,8 +362,8 @@ A denied or malformed request always gets a `PluginResponse` with
 thrown exception that could crash the plugin's frame in a way that looks like
 a host bug rather than a permission boundary. A plugin author debugging
 "why doesn't `fs.read` work" sees `capability-denied` and knows exactly what
-to add to their manifest (and that the human then has to approve it) — the
-error surface is part of the contract, not an implementation detail.
+to add to their manifest — the error surface is part of the contract, not an
+implementation detail.
 
 ## Isolation
 
@@ -452,8 +488,9 @@ therefore uses Tauri's own IPC as the transport:
   envelope's logical shape (`id`/`apiVersion`/`method`/`params` in,
   `ok`/`result`/`error` out) is preserved exactly; only the wire mechanism
   changed.
-- **Host → plugin (unsolicited events — resize/theme/metrics ticks):** a
-  `tauri::ipc::Channel<PluginEventWire>`, opened once via
+- **Host → plugin (unsolicited events — reserved for resize/theme, shipped
+  for metrics ticks; see [#378](https://github.com/willem445/loomux/issues/378)):**
+  a `tauri::ipc::Channel<PluginEventWire>`, opened once via
   `plugin_broker_open_channel`. This is deliberate, not incidental: granting
   a plugin window the app's general `core:event:allow-listen` permission
   would let it call `listen()` for *any* event name emitted anywhere in the

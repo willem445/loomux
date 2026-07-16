@@ -92,10 +92,16 @@ command, and the network (see CSP, below). The broker has no handler
 function for any of these — there's no code path to find a bug in, because
 there is no code path.
 
-**Capabilities are a human decision, made once, at install.** Declaring one
-in your manifest is a request; the human approves (or doesn't) when they
-install your plugin. Nothing in the protocol lets a plugin widen its own
-grant after that.
+**Capabilities are auto-granted in v1, not yet a reviewed human decision.**
+Declaring a capability in your manifest and passing validation is enough —
+installing copies the folder and every declared capability is live
+immediately, with no approval prompt shown along the way. Nothing in the
+protocol lets a plugin widen its own grant after install, but nothing today
+shows the human what they're granting either; an install-time approval step
+is planned ([#377](https://github.com/willem445/loomux/issues/377)) and is a
+required blocker before general availability. In the meantime this is
+bounded by the enum itself — the four rows above are all a manifest can ever
+ask for, and none of them reach a write, git/gh/PTY, or the network.
 
 ## Talking to the broker
 
