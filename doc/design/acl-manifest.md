@@ -139,8 +139,10 @@ breaks main" into "CI is red." Three tests:
    (string search + bracket match, not a hand count) and diffs them against
    `command_manifest::APP_COMMANDS`. Fails if a command is registered in one
    list but not the other.
-2. **`app_commands_len_is_120`** — a drift tripwire against the count this
-   design and the #363 plan both cite.
+2. **`app_commands_len_is_122`** (`app_commands_len_is_120` at this design's
+   original landing) — a drift tripwire against the count this design and the
+   #363 plan cite; bumped to 122 by #360 Slice B's `list_plugins`/
+   `install_plugin`.
 3. **`main_has_all_120_and_zero_permission_denies_dangerous_spread`** — the
    one that matters most. It builds a real (headless) `tauri::test` mock app
    — `tauri::test::mock_builder()` + `.build(tauri::generate_context!())` —

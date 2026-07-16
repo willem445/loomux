@@ -5,16 +5,18 @@
 //! without an explicit grant silently unreachable for every window,
 //! including `main`. These tests turn that silent failure into a red test:
 //!
-//!   - `generate_handler_matches_app_commands` / `app_commands_len_is_121`:
+//!   - `generate_handler_matches_app_commands` / `app_commands_len_is_123`:
 //!     `src/lib.rs`'s `generate_handler!` and `command_manifest::APP_COMMANDS`
 //!     are the two hand-maintained lists this migration depends on staying
 //!     identical; this diffs them directly out of the `lib.rs` source rather
-//!     than trusting a hand count.
+//!     than trusting a hand count. (120 at #363's landing; +1 for
+//!     `orch_confirm_solo_copilot_autopilot` (#364/#365); +2 for #360 Slice
+//!     B's `list_plugins`/`install_plugin`.)
 //!   - `main_has_all_120_and_zero_permission_denies_dangerous_spread`: builds
 //!     a real (headless) `tauri::test` mock app using the app's *actual*
 //!     `capabilities/`/`permissions/` on disk (via the same `generate_context!`
 //!     `build.rs` already feeds — not a reimplementation of ACL resolution),
-//!     invokes all 120 commands against the `main` window label, and invokes
+//!     invokes every registered command against the `main` window label, and invokes
 //!     a representative dangerous spread + a benign control against the
 //!     `plugin-zero-template` window label (see
 //!     `capabilities/plugin-zero-template.json`). This is both the coherence
@@ -77,6 +79,7 @@ stub_commands!(
     fm_list, fm_new_folder, fm_new_file, fm_rename, fm_delete_start, fm_capabilities, fm_open, fm_open_with,
     fm_reveal,
     fm_hash_start,
+    list_plugins, install_plugin,
     take_startup_notice,
     load_ui_tabs, save_ui_tabs,
     voice_start, voice_stop, voice_cancel,
@@ -153,13 +156,14 @@ fn generate_handler_matches_app_commands() {
 }
 
 #[test]
-fn app_commands_len_is_121() {
+fn app_commands_len_is_123() {
     assert_eq!(
         loomux_lib::command_manifest::APP_COMMANDS.len(),
-        121,
-        "APP_COMMANDS drifted from the expected count of 121 (120 per the #363 plan's audited \
-         count, +1 for orch_confirm_solo_copilot_autopilot added in #364) — if this is an \
-         intentional addition/removal, update this tripwire's count too"
+        123,
+        "APP_COMMANDS drifted from the expected count of 123 (120 per the #363 plan's audited \
+         count, +1 for orch_confirm_solo_copilot_autopilot added in #364, +2 for #360 Slice B's \
+         list_plugins/install_plugin) — if this is an intentional addition/removal, update this \
+         tripwire's count too"
     );
 }
 
@@ -202,8 +206,22 @@ fn main_has_all_120_and_zero_permission_denies_dangerous_spread() {
 
     // --- Denial (plan §5B): representative dangerous spread + benign control,
     // proven against the zero-permission template, exactly the spread the
-    // #360 Phase-0.5 spike's Check 1 table validated. ---
-    const DANGEROUS_SPREAD: &[&str] = &["orch_grant_merge", "git_push", "ft_write_file", "spawn_pty", "open_in_editor"];
+    // #360 Phase-0.5 spike's Check 1 table validated. `list_plugins`/
+    // `install_plugin` (#360 Slice B) are appended per rev-60 finding B: they
+    // were already denied here by construction (zero grants = zero commands,
+    // same as the benign control), but pinning them explicitly guards against
+    // a future curated-subset plugin capability (Slice C) accidentally
+    // widening to include plugin management itself — a plugin pane must
+    // never be able to enumerate or install plugins. ---
+    const DANGEROUS_SPREAD: &[&str] = &[
+        "orch_grant_merge",
+        "git_push",
+        "ft_write_file",
+        "spawn_pty",
+        "open_in_editor",
+        "list_plugins",
+        "install_plugin",
+    ];
     const BENIGN_CONTROL: &str = "pty_backend_info";
 
     for &cmd in DANGEROUS_SPREAD {

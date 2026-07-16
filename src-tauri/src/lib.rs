@@ -11,6 +11,7 @@ mod winpath;
 mod metrics;
 mod obs;
 pub mod orchestration; // pub: integration smoke test links through it
+pub mod plugins; // pub: the pane-plugins integration test links its pure fns (#360 Slice B)
 pub mod pty; // pub: Job-Object integration test links `assign_kill_on_close_job`
 mod sessions;
 mod uistate; // durable UI state (project tabs, #63) — atomic tabs.json store
@@ -39,6 +40,10 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        // Pane plugins (#360 Slice B): serves each installed plugin's own
+        // assets, jailed to its folder, with the CSP header the design note
+        // requires on every response — see plugins::plugin_protocol_handler.
+        .register_uri_scheme_protocol("plugin", plugins::plugin_protocol_handler)
         .manage(startup_notice)
         .manage(pty::PtyManager::default())
         .manage(voice::VoiceState::default())
@@ -185,6 +190,8 @@ pub fn run() {
             filemgr::fm_open_with,
             filemgr::fm_reveal,
             filehash::fm_hash_start,
+            plugins::list_plugins,
+            plugins::install_plugin,
             obs::take_startup_notice,
             uistate::load_ui_tabs,
             uistate::save_ui_tabs,

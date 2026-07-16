@@ -163,7 +163,8 @@ src-tauri/src/
   fileedit.rs       file-editor overlay (#174): lazy tree, read/write (atomic + hash conflict), streaming gitignore-aware search/replace (#207) + path-only name enumeration (#214); server-side path safety
   filemgr.rs        file-MANAGER pane (#214): list, new file/folder, rename, delete-to-Recycle-Bin, open-with-default-app, open-with chooser, reveal-in-OS-file-manager; reuses fileedit's path choke point. Shell APIs come from the `windows` dep we already have (ShellExecuteW + SHFileOperationW)
   filehash.rs       file hashing (#214): SHA-256/512, SHA-1, CRC-32/16/8 — streamed off-thread on a worker (never the main thread), cancellable via the #207 registry
-  command_manifest.rs  single source of truth for the ACL manifest's 120 app-command names (#363) — shared by build.rs (include!, feeds the app manifest) and lib.rs (feeds tests/acl_manifest.rs, the coherence guard). See doc/design/acl-manifest.md
+  plugins.rs        pane-plugins backend host (#360 Slice B): plugin.json manifest parsing/validation against the closed contract in doc/design/pane-plugins.md (reject-with-reason, never a partial accept); local-folder discovery + install (copy-only, no build/fetch) under `<app-data>/loomux/plugins/<id>/`; the `plugin://` scheme handler, jailed per-plugin (never resolves outside a plugin's own folder) and carrying the design note's CSP header on every response. `list_plugins`/`install_plugin` commands; the sandboxed-frame broker (Slice C) and the `"plugin"` pane kind (Slice D) build on top of this
+  command_manifest.rs  single source of truth for the ACL manifest's app-command names (120 at #363's landing, 122 with #360 Slice B's plugins) — shared by build.rs (include!, feeds the app manifest) and lib.rs (feeds tests/acl_manifest.rs, the coherence guard). See doc/design/acl-manifest.md
   lib.rs            Tauri wiring
 src-tauri/
   capabilities/     ACL grants (#363): default.json grants `main` every command via the `main-ui` permission set; plugin-zero-template.json is the zero-grant template a future #360 plugin webview binds to
@@ -201,6 +202,7 @@ src/
   channel.ts        pure connect-gesture reducer (arm/complete/cancel/set-sender) + per-channel color/number/direction chip derivation (#271) (DOM-free, unit-tested)
   filehashmodel.ts  pure hashing policy: auto-hash threshold, digest cache keying (path+size+mtime), formatting (DOM-free, unit-tested)
   filemgr.ts        typed bridge to filemgr.rs + filehash.rs (per-feature wrapper, like fileapi.ts)
+  pluginhost.ts     typed bridge to plugins.rs (#360 Slice B, per-feature wrapper like fileapi.ts): list installed plugins, install one from a local folder
   filematch.ts      pure file-NAME matching + ranking for "Go to file" (#214, DOM-free, unit-tested)
   modal.ts          the shared confirm/choice dialog (used by the editor and the file manager)
   filetreemodel.ts  pure lazy-tree model: sort/merge/flatten (DOM-free, unit-tested)

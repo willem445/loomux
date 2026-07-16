@@ -144,6 +144,9 @@ pub const APP_COMMANDS: &[&str] = &[
     "fm_reveal",
     // filehash (1)
     "fm_hash_start",
+    // plugins (2, #360 Slice B)
+    "list_plugins",
+    "install_plugin",
     // obs (1)
     "take_startup_notice",
     // uistate (2)
