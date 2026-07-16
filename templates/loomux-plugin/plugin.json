@@ -1,0 +1,9 @@
+{
+  "id": "hello-world-template",
+  "name": "Hello world (template)",
+  "version": "0.1.0",
+  "apiVersion": 1,
+  "entry": "index.html",
+  "capabilities": ["panel", "storage"],
+  "rootless": true
+}
