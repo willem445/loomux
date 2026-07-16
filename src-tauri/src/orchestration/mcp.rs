@@ -337,6 +337,22 @@ fn tool_defs(role: Role) -> Vec<Value> {
             }),
             &["pr", "verdict", "summary"]));
     }
+    // Worker-only for now (#250/#324 slice B): the plan's eventual gate is
+    // "role_hint == process", but `role_hint` is slice A's field (parallel,
+    // not yet landed) and this tool is read-only over data already scoped to
+    // the caller's own group — coarse worker-wide exposure is deliberate and
+    // harmless until slice D tightens it. See the matching note on the
+    // `call_tool` arm, which is the real (re-checked) gate.
+    if role == Role::Worker {
+        tools.push(tool("session_digest",
+            "Read a FINISHED session's transcript, reduced to friction windows: the wall, the attempts, and the fix — never the raw transcript. Deterministic, no LLM in this step; each window names its signature (tool_error | near_duplicate_command | test_red_to_green | reverted_edit) plus the event range and a short summary. Also returns three anchors: initial_prompt (what the worker was asked), final_diff_ref (its PR/branch, if known), outcome (its task status, if known). Pass exactly ONE of task, agent, or pr to identify the session — the agent need not still be alive; this reads its recorded transcript cold. Use this instead of resuming or re-reading a worker's own session: the point is a fresh, cold read of the record, not the worker narrating itself.",
+            json!({
+                "task": { "type": "string", "description": "Task id, e.g. t-3" },
+                "agent": { "type": "string", "description": "Agent id, e.g. w-2" },
+                "pr": { "type": "string", "description": "PR number, #n, or URL" },
+            }),
+            &[]));
+    }
     tools
 }
 
@@ -796,6 +812,40 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                 })
                 .collect();
             Ok(serde_json::to_string(&out).unwrap_or_default())
+        }
+
+        // Worker-only for now — see the matching note on this tool's
+        // `tool_defs` entry. The listing already hides this from
+        // non-workers; this is the real, re-checked gate.
+        "session_digest" => {
+            if caller.role != Role::Worker {
+                return Err("permission denied: session_digest is for worker-kind blocks".into());
+            }
+            let task = arg_str(args, "task");
+            let agent = arg_str(args, "agent");
+            let pr = arg_str(args, "pr");
+            let provided = [task.is_some(), agent.is_some(), pr.is_some()].into_iter().filter(|b| *b).count();
+            if provided != 1 {
+                return Err("exactly one of task, agent, or pr is required".into());
+            }
+            let lookup = if let Some(t) = task {
+                super::DigestLookup::Task(t.to_string())
+            } else if let Some(a) = agent {
+                // Group-scoped by construction: `merged_records(&caller.group)`
+                // only ever contains this group's rows, so an id from another
+                // group is simply absent — same "unknown agent" shape
+                // `require_in_group` gives a live target, without needing a
+                // live `AgentEntry` (this tool must also find DEAD agents —
+                // see `OrchRegistry::session_digest`'s doc comment).
+                if !reg.merged_records(&caller.group).iter().any(|r| r.id == a) {
+                    return Err(format!("unknown agent: {a}"));
+                }
+                super::DigestLookup::Agent(a.to_string())
+            } else {
+                super::DigestLookup::Pr(pr.unwrap().to_string())
+            };
+            let digest = reg.session_digest(&caller.group, lookup)?;
+            Ok(serde_json::to_string(&digest).unwrap_or_default())
         }
 
         "message_orchestrator" => {

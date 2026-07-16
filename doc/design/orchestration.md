@@ -142,6 +142,20 @@ pane stays open showing the status).
 | `cancel_notification(id)` | ✓ | worker/reviewer only (✗ planner) |
 | `channel_send(text)` | ✓ | orchestrator/worker/reviewer (✗ planner) |
 | `channel_status()` | ✓ | orchestrator/worker/reviewer (✗ planner) |
+| `session_digest(task? \| agent? \| pr?)` | ✗ | worker only (✗ reviewer, ✗ planner) |
+
+`session_digest` (#250/#324 slice B) reads a session's transcript — Claude
+`.jsonl` or Copilot `session-state`, normalized to one event shape — and
+reduces it, deterministically and without an LLM, to friction windows (a
+failing tool call and its recovery, a near-duplicate command re-run, a test
+red-to-green, a reverted edit) plus three anchors (initial prompt, final
+diff/PR ref, task outcome). It never returns the raw transcript. The target
+session need not still be alive: it is meant to be read cold, after the
+worker that produced it is gone — see `OrchRegistry::session_digest` in
+`orchestration/mod.rs` and `orchestration/digest.rs`. Gated to worker-kind
+callers for now; the plan's eventual gate is `role_hint == process` (#250/#324
+slice A's `Block.role_hint` field, landing separately) — read-only, so this
+coarser interim exposure is deliberate.
 
 Guardrails enforced by `spawn_agent`: live-agent cap (`max_agents`, counting workers +
 reviewers + planners), CLI + model pinned per role (`{role}_cli` / `{role}_model`, see
