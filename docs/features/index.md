@@ -26,3 +26,6 @@ return to the shell.
 - **[Session browser & editor launch](session-browser.html)** — restore past agent
   sessions into a pane (`Ctrl+Shift+P`) and open a pane's folder in your editor
   (`Alt+E`).
+- **[Pane plugins](pane-plugins.html)** — write your own pane with the plugin
+  template and SDK: the manifest, the capability-gated broker API, the
+  sandbox rules, and how to install and open one.

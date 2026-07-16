@@ -71,7 +71,7 @@ no global mode:
 | **File editor** | The file tree + code editor above, as a **pane** rather than an overlay, rooted at a folder you pick. |
 | **Git** | The git view — graph, status, diffs, staging, worktree switching — as a **pane**, over a repo you pick. |
 | **Workflow** | The repo's agent workflow — which blocks a run may use, the path between them, the gate that must pass before a merge — as an editable **pane** over `.loomux/workflow.yml`. |
-| **Plugin** | An installed pane plugin, picked from the ones on your machine and hosted in its own sandboxed window — no shell access, no filesystem beyond a jailed root it declares, no orchestration reach. See [pane plugins](doc/design/pane-plugins.md). |
+| **Plugin** | An installed pane plugin, picked from the ones on your machine and hosted in its own sandboxed window — no shell access, no filesystem beyond a jailed root it declares, no orchestration reach. See the [design note](doc/design/pane-plugins.md) for how the sandbox works, or the [authoring guide](https://willem445.github.io/loomux/features/pane-plugins) and [`templates/loomux-plugin/`](templates/loomux-plugin/) to write your own. |
 
 ## Install
 
@@ -106,7 +106,7 @@ Builds are unsigned for now — on macOS, if the app is reported as damaged, run
 - [Core concepts](https://willem445.github.io/loomux/core-concepts) — panes, the split grid, and the shortcut table
 - [Orchestration guide](https://willem445.github.io/loomux/orchestration) — agent groups, the task board, the label workflow, cross-workspace channels
 - [Autonomous & supervised modes](https://willem445.github.io/loomux/autonomous-mode) — idle-tick autonomy, token budget, auto-merge/release, dangerous mode
-- Feature pages — [git view](https://willem445.github.io/loomux/features/git-view), [GitHub issues](https://willem445.github.io/loomux/features/github-issues), [voice prompts](https://willem445.github.io/loomux/features/voice-prompts), [steering](https://willem445.github.io/loomux/features/steering)
+- Feature pages — [git view](https://willem445.github.io/loomux/features/git-view), [GitHub issues](https://willem445.github.io/loomux/features/github-issues), [voice prompts](https://willem445.github.io/loomux/features/voice-prompts), [steering](https://willem445.github.io/loomux/features/steering), [pane plugins](https://willem445.github.io/loomux/features/pane-plugins)
 - [Troubleshooting](https://willem445.github.io/loomux/troubleshooting) — whisper DLLs, `gh` auth, mic permission, disk
 
 The site is built from Markdown under [`docs/`](docs/) and published on each
