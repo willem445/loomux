@@ -232,12 +232,16 @@ loomux_grant_claim() { # $1=grantfile
 # known: consume it (rm) on success, or restore it to the original grant path
 # on failure so a retry can still use it. Shared by the merge gate and the
 # release gate (#303) — one settle mechanism, not two copies. $1=original
-# grantfile $2=claimed file $3=the real gh's exit code.
-loomux_grant_settle() { # $1=grantfile $2=claimed $3=exit-code
+# grantfile $2=claimed file $3=the real gh's exit code $4=audit label to emit
+# on restore (optional — #315 review: a restore was silent in the audit; the
+# merge gate still passes nothing here and stays silent, only the release
+# gate's callers pass "release-gate-restored").
+loomux_grant_settle() { # $1=grantfile $2=claimed $3=exit-code $4=restore-audit-label
   if [ "$3" -eq 0 ]; then
     rm -f "$2"   # succeeded — the one-time grant is spent
   else
     mv "$2" "$1" 2>/dev/null   # failed — restore for a retry
+    [ -n "$4" ] && loomux_audit "$4" "{\"grant\":\"$1\"}"
   fi
 }
 # The SINGLE release-gate decision (#83/#196): every release-publishing shape —
@@ -312,7 +316,7 @@ if [ "$cmd" = "release" ]; then
         # claim — #303, same reasoning as the merge grant's fix (#256).
         "$REAL_GH" "$@"
         rc=$?
-        loomux_grant_settle "$_rg_gf" "$_grant_claimed" "$rc"
+        loomux_grant_settle "$_rg_gf" "$_grant_claimed" "$rc" "release-gate-restored"
         exit "$rc"
       fi
       exec "$REAL_GH" "$@" ;;
@@ -455,7 +459,7 @@ if [ "$cmd" = "api" ]; then
       # claim — #303, same reasoning as the merge grant's fix (#256).
       "$REAL_GH" "$@"
       rc=$?
-      loomux_grant_settle "$_rg_gf" "$_grant_claimed" "$rc"
+      loomux_grant_settle "$_rg_gf" "$_grant_claimed" "$rc" "release-gate-restored"
       exit "$rc"
     fi
     exec "$REAL_GH" "$@"
@@ -728,14 +732,44 @@ loomux_block_release() { # $1=tag $2=action
   loomux_audit "release-gate-blocked" "{\"tag\":\"$1\",\"action\":\"$2\"}"
   exit 1
 }
-loomux_grant_ok() { # $1=grantfile
+# #256/#303/#315: CLAIM a one-time grant without spending it yet — see the gh
+# shim's loomux_grant_claim for the full rationale (same mechanics, inlined
+# here since this is a separate generated script with no shared shell lib).
+# An expired grant is deleted outright (never usable). A live grant is handed
+# off via `mv` to a `.claimed` sibling — an atomic POSIX rename — so exactly
+# one caller can ever win it. Sets `_grant_claimed` on success; the caller
+# runs the real git push and finishes with `loomux_grant_settle` (consume on
+# success, restore on failure) so a rejected push (network, remote hook,
+# protected ref) doesn't burn a grant that never actually published anything.
+loomux_grant_claim() { # $1=grantfile
   gf="$1"
   [ -f "$gf" ] || return 1
   exp=$(head -n1 "$gf" 2>/dev/null)
   case "$exp" in ''|*[!0-9]*) exp=0 ;; esac
   now=$(date +%s 2>/dev/null); [ -z "$now" ] && now=0
-  rm -f "$gf"
-  [ "$now" -lt "$exp" ]
+  if [ "$now" -ge "$exp" ]; then
+    rm -f "$gf"
+    return 1
+  fi
+  claimed="$gf.claimed"
+  if mv "$gf" "$claimed" 2>/dev/null; then
+    _grant_claimed="$claimed"
+    return 0
+  fi
+  return 1   # lost the race to another concurrent claimant
+}
+# Finish a claim made by loomux_grant_claim, once the real push's exit status
+# is known: consume it (rm) on success, or restore it to the original grant
+# path on failure so a retry can still use it. $4=audit label to emit on
+# restore (optional — #315 review: a restore was silent in the audit; the
+# caller below passes "release-gate-restored").
+loomux_grant_settle() { # $1=grantfile $2=claimed $3=exit-code $4=restore-audit-label
+  if [ "$3" -eq 0 ]; then
+    rm -f "$2"   # succeeded — the one-time grant is spent
+  else
+    mv "$2" "$1" 2>/dev/null   # failed — restore for a retry
+    [ -n "$4" ] && loomux_audit "$4" "{\"grant\":\"$1\"}"
+  fi
 }
 
 # Find the git subcommand, skipping value-taking globals. Non-push → exec now.
@@ -798,13 +832,21 @@ if [ -n "$LOOMUX_GROUP_DIR" ] && [ -f "$LOOMUX_GROUP_DIR/dangerous_mode" ] && [ 
   loomux_audit "release-gate-dangerous" "{\"tag\":\"$tag\",\"action\":\"push\"}"
   exec "$REAL_GIT" "$@"
 fi
-# Otherwise a one-time per-tag grant authorizes exactly this tag push.
+# Otherwise a one-time per-tag grant authorizes exactly this tag push. #315:
+# CLAIM the grant and only spend it once the real push actually succeeds — a
+# push git/GitHub refuses (network, remote hook, protected ref) must leave
+# the grant usable for a retry, not burn it on a push that never landed
+# (same fix as #256's merge grant / #303's release grant).
 safe=$(printf '%s' "$tag" | tr -c 'A-Za-z0-9._-' '_')
 gf=""
 [ -n "$LOOMUX_GROUP_DIR" ] && [ -n "$safe" ] && gf="$LOOMUX_GROUP_DIR/release_grants/$safe"
-if [ -n "$gf" ] && loomux_grant_ok "$gf"; then
+_grant_claimed=""
+if [ -n "$gf" ] && loomux_grant_claim "$gf"; then
   loomux_audit "release-gate-granted" "{\"tag\":\"$tag\",\"action\":\"push\"}"
-  exec "$REAL_GIT" "$@"
+  "$REAL_GIT" "$@"
+  rc=$?
+  loomux_grant_settle "$gf" "$_grant_claimed" "$rc" "release-gate-restored"
+  exit "$rc"
 fi
 loomux_block_release "$tag" "push"
 "#;
