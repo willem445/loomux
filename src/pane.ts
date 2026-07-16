@@ -1817,6 +1817,10 @@ export class Pane implements VoiceTargetPane {
         // Content grew (e.g. the suspended banner appeared) — re-clamp so the
         // footer never slides under overflow:hidden (#83 rev-58).
         onResize: () => this.reclampGroupOverlay(),
+        // The orchestrator pane's cwd IS the group's repo (create_orchestration
+        // opens it there) — the workflow toggle's ON-confirm preview reads it
+        // live rather than snapshotting at open time (#316).
+        getRepo: () => this.cwdRaw,
       });
       this.groupOverlay = document.createElement("div");
       this.groupOverlay.className = "git-overlay";

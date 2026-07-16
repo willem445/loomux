@@ -150,11 +150,18 @@ Board controls:
   status and Approve disappears with it, so a reopened item can never keep
   showing a stale "approve" affordance for feedback you already sent back. Note
   that Approve is *your* merge gate, not the repo's — if a [custom
-  workflow](#custom-agent-workflows) has its own merge gate armed and
-  unsatisfied, Approve is relabeled up front (e.g. "Approve (won't merge — gate
-  needs rev-orch/rev-ui/rev-tests)") so you know before you click, and the
-  tooltip names your options: run the missing reviewers, toggle the workflow
-  off, or merge via the GitHub UI directly.
+  workflow](#custom-agent-workflows) has its own merge gate armed, Approve is
+  relabeled up front whenever the item carries a PR (e.g. "Approve (won't merge
+  — gate needs rev-orch/rev-ui/rev-tests)") so you know before you click, and
+  the tooltip names your options: run the missing reviewers, toggle the
+  workflow off, or merge via the GitHub UI directly. The relabel keys on "does
+  this item carry a PR at all," not that PR's target branch — a stacked
+  sub-PR merging into an integration branch (not the gated default branch)
+  gets the same warning as one merging straight to `main`. Deliberately
+  conservative: the board only knows a task's PR number, not its base ref, and
+  narrowing that would mean either a live `gh pr view` per row or a new field
+  on the task record — worth doing if this proves noisy in practice, not
+  assumed cheap today.
 - **▶ Proceed** on a `prototype` item (a demo-gated deliverable awaiting your
   verdict) promotes it: two-click confirm flips it to `in-progress`, records
   your decision, and prompts the orchestrator to take the prototype to a full
@@ -377,8 +384,13 @@ different class of defect than the one already primed on its own output.
 Worth considering for any reviewer-heavy workflow; loomux's own dogfood
 `.loomux/workflow.yml` notes the same above its reviewer blocks.
 
-*(Screenshots of the lifecycle panel's workflow row and live toggle to follow
-once that UI lands.)*
+Turning it on live shows the same resolved-roster confirm (name, blocks, any
+declared gate) the launcher's own preview shows at launch time; turning it off
+confirms that future spawns fall back to the built-in roster on your default
+CLI (per-role CLI overrides picked at launch aren't separately retained,
+so an off→on→off round trip doesn't restore them — a rare enough path that a
+deterministic rebuild from the default CLI beat persisting a second roster
+just for it).
 
 ## Guardrails
 
