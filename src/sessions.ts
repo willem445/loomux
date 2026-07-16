@@ -4,6 +4,8 @@
 
 import { listSessions, type SessionInfo } from "./pty";
 import type { SessionRoleInfo } from "./orchestration";
+import { taskSummary, repoBranchLine, prLabel } from "./sessionmeta";
+import { RefreshGate } from "./refreshgate";
 
 const ROLE_CHIPS: Record<string, string> = {
   orchestrator: "ORCH",
@@ -27,6 +29,12 @@ export class SessionBrowser {
   private searchEl: HTMLInputElement;
   private sessions: SessionInfo[] = [];
   private roles = new Map<string, SessionRoleInfo>();
+  /** Single-flight guard (rev-9 review): the boot-time prefetch and a human
+   *  opening the sidebar before it resolves must not run two concurrent
+   *  `listSessions()` + `loadRoles()` scans — the exact I/O the prefetch
+   *  exists to front-load, doubled. Same mechanism IssuesView uses for its
+   *  refresh loop; reused rather than a second de-dup scheme. */
+  private refreshGate = new RefreshGate();
 
   constructor(
     private el: HTMLElement,
@@ -82,25 +90,42 @@ export class SessionBrowser {
     const recorded = this.roles.get(session.id);
     if (recorded) return recorded;
     if (session.orch_role && session.orch_group) {
+      // Transcript-signature fallback (a session predating the durable
+      // roster): none of #1's metadata is derivable from the signature
+      // alone, so it's honestly absent rather than guessed.
       return {
         session_id: session.id,
         group_id: session.orch_group,
         role: session.orch_role,
         agent_name: "",
         group_live: false,
+        task: "",
+        branch: null,
+        repo: null,
+        pr: null,
       };
     }
     return undefined;
   }
 
   async refresh(): Promise<void> {
-    const [sessions, roles] = await Promise.all([
-      listSessions(),
-      this.loadRoles?.().catch(() => []) ?? Promise.resolve([]),
-    ]);
-    this.sessions = sessions;
-    this.roles = new Map(roles.map((r) => [r.session_id, r]));
-    this.render();
+    // Single-flight, loss-safe (rev-9 review, mirrors IssuesView.refresh):
+    // a call arriving while one is already in flight (the boot prefetch
+    // racing a human's click, or a rapid double-toggle) is coalesced into
+    // one trailing re-run rather than starting a second concurrent scan —
+    // any number of dropped calls still end in exactly one fresh fetch.
+    if (!this.refreshGate.begin()) return;
+    try {
+      const [sessions, roles] = await Promise.all([
+        listSessions(),
+        this.loadRoles?.().catch(() => []) ?? Promise.resolve([]),
+      ]);
+      this.sessions = sessions;
+      this.roles = new Map(roles.map((r) => [r.session_id, r]));
+      this.render();
+    } finally {
+      if (this.refreshGate.end()) void this.refresh();
+    }
   }
 
   private render(): void {
@@ -154,6 +179,38 @@ export class SessionBrowser {
         top.insertBefore(chip, title);
       }
 
+      // PR chip (#1): "when known" per the issue, so it's absent rather than
+      // blank until the board records one for this session's task.
+      const pr = prLabel(role);
+      if (pr) {
+        const prChip = document.createElement("span");
+        prChip.className = "session-badge session-pr";
+        prChip.textContent = pr;
+        prChip.title = `Pull request ${pr}`;
+        top.appendChild(prChip);
+      }
+
+      // Task/goal line (#1): the brief this session's agent was spawned or
+      // resumed with — hidden entirely rather than shown empty for a legacy
+      // session or the orchestrator (which has no assigned task).
+      const goal = taskSummary(role);
+      const goalEl = goal ? document.createElement("div") : null;
+      if (goalEl) {
+        goalEl.className = "session-goal";
+        goalEl.textContent = goal;
+        goalEl.title = goal!;
+      }
+
+      // Repo/branch identity (#1): shown only when at least one is recorded,
+      // never a fabricated placeholder for a legacy session or a role (the
+      // orchestrator) that never has a branch.
+      const identity = repoBranchLine(role);
+      const identityEl = identity ? document.createElement("div") : null;
+      if (identityEl) {
+        identityEl.className = "session-identity";
+        identityEl.textContent = identity;
+      }
+
       const meta = document.createElement("div");
       meta.className = "session-meta";
       const cwd = document.createElement("span");
@@ -164,7 +221,10 @@ export class SessionBrowser {
       when.textContent = timeAgo(s.modified_ms);
       meta.append(cwd, when);
 
-      item.append(top, meta);
+      item.append(top);
+      if (goalEl) item.append(goalEl);
+      if (identityEl) item.append(identityEl);
+      item.append(meta);
       item.addEventListener("click", () => this.onRestore(s));
       this.listEl.appendChild(item);
     }

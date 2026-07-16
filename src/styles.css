@@ -474,14 +474,19 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 /* ---------- attention routing: "needs attention" badge (#6) ---------- */
 /* A pane the backend attention scan flagged (idle-with-prompt, a worker report,
    or a task at a human merge gate). The chip names the reason; the header edge
-   pulses amber so a pane needing you stands out across a wall of terminals. */
-.pane-attn {
-  flex: none; cursor: pointer;
+   pulses amber so a pane needing you stands out across a wall of terminals.
+   Shares its base look + pulse with .pane-held (#246, delivery-held badge,
+   below) — one shared rule rather than two copies of the same color values —
+   since both are this app's "amber = needs your attention" convention;
+   .pane-attn adds its own click affordance on top. */
+.pane-attn, .pane-held {
+  flex: none;
   font-size: 9px; font-weight: 700; letter-spacing: 0.4px;
   border: 1px solid #6a5230; border-radius: 4px; padding: 1.5px 6px;
   color: #f2c66a; background: rgba(224, 175, 104, 0.16);
   animation: attn-pulse 1.6s ease-in-out infinite;
 }
+.pane-attn { cursor: pointer; }
 .pane-attn:hover { background: rgba(224, 175, 104, 0.28); color: #ffd886; }
 /* Blocked is the most urgent — tint it red rather than amber. */
 .pane-attn[data-reason="blocked"] {
@@ -495,8 +500,20 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   50% { box-shadow: 0 0 8px 1px rgba(224, 175, 104, 0.5); }
 }
 @media (prefers-reduced-motion: reduce) {
-  .pane-attn { animation: none; }
+  .pane-attn, .pane-held { animation: none; }
 }
+
+/* ---------- delivery-held badge (#246) ---------- */
+/* Loomux is currently withholding an outbound prompt because it believes the
+   human's own input occupies this pane's CLI box. Distinct from .pane-attn
+   (which flags a pane the human should look AT): this flags a pane loomux is
+   NOT writing to right now — a live-test report found the original muted,
+   non-pulsing treatment too easy to miss, so it now pulses (base look +
+   animation shared with .pane-attn above) rather than inventing a second
+   "needs attention" visual language; reserving red for actual error states
+   elsewhere in the UI, per the human's own preference. Still no hover
+   affordance — nothing to click here, unlike .pane-attn — see the shared
+   `.pane-attn, .pane-held` rule above for its actual declarations. */
 
 /* ---------- cross-workspace channels (#271) ---------- */
 /* The connect gesture's three visual states, each independent (so they never fight
@@ -829,8 +846,25 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .session-badge.orch-role.orchestrator { background: #2a2440; color: #c7a9ff; }
 .session-badge.orch-role.worker { background: #1e2a3c; color: #8db0ff; }
 .session-badge.orch-role.reviewer { background: #203527; color: #b4e878; }
+/* #1: the PR chip, shown only once the task board records one for this
+   session's work — a distinct accent from the role chips so it reads as
+   "external reference", not another identity badge. */
+.session-badge.session-pr { background: #2a1f38; color: #d9a6ff; }
 .session-title {
   flex: 1; min-width: 0; font-size: 12.5px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+/* #1: the task/goal this session's agent was spawned or resumed with —
+   truncated by sessionmeta.ts, so a single line with ellipsis overflow is
+   enough here; the full text is in the title attribute. */
+.session-goal {
+  margin-top: 3px; padding-left: 2px; font-size: 11.5px; color: var(--text);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+/* #1: repo/branch identity — visually quieter than the goal line since it's
+   secondary context, matching .session-meta's muted tone. */
+.session-identity {
+  margin-top: 2px; padding-left: 2px; font-size: 11px; color: var(--text-dim);
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .session-meta {

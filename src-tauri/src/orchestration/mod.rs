@@ -1912,6 +1912,22 @@ pub fn spawn_request_expired(deadline_ms: u64, now_ms: u64) -> bool {
     deadline_ms != 0 && now_ms > deadline_ms
 }
 
+/// Whether a spawned pane should open docked/minimized instead of expanded
+/// into the visible split tree (#260): true for every delegate role
+/// (worker/reviewer/planner), UNLESS the group opted back into the pre-#260
+/// "always expand" behavior (`group_opted_expanded`, backed by the durable
+/// `spawn_expanded` marker — see `OrchRegistry::set_spawn_expanded`). The
+/// orchestrator's own pane is NEVER minimized — it's the human's anchor into
+/// the group, and a hidden orchestrator pane would defeat the whole point of
+/// keeping it in focus — so this reads `false` for it regardless of the
+/// group setting. Pure so the decision is unit-testable without a registry;
+/// both `SpawnRequest` construction sites (`spawn_agent_ex` for delegates,
+/// `create_orchestration_group` for the orchestrator) call this SAME
+/// function, so the "orchestrator is exempt" rule can't drift between them.
+pub fn spawn_opens_minimized(role: Role, group_opted_expanded: bool) -> bool {
+    role != Role::Orchestrator && !group_opted_expanded
+}
+
 /// Whether the spawn-rate guardrail should reject the next spawn: true when
 /// at least `limit` spawns already fall inside the trailing `window_ms`.
 /// Pure so the sliding-window arithmetic is testable; `limit` 0 = unlimited.
@@ -2708,6 +2724,12 @@ pub struct AgentEntry {
     /// Working directory the pane runs in; resume must reuse it so the
     /// resumed session's file operations land where the work happened.
     pub cwd: String,
+    /// The git branch this agent's work is actually associated with (#1):
+    /// `Some` for a dedicated worktree spawn and for a shared-repo Worker
+    /// told to create it, `None` for the orchestrator/reviewer(no worktree)/
+    /// planner, none of which have a "their own branch" the way a Worker
+    /// does. Persisted so the session browser can show it without guessing.
+    pub branch: Option<String>,
     /// Unix-ms this worker/reviewer became idle (spawned without a task, or
     /// reported done/blocked); `None` while it has work or for the
     /// orchestrator. The idle reaper (`idle_kill_minutes`) reads this.
@@ -2980,6 +3002,19 @@ pub struct AgentRecord {
     pub cwd: String,
     pub status: String,
     pub updated_ms: u64,
+    /// The task/brief text this agent was spawned or resumed with (#1,
+    /// session browser metadata — doubles as the session's "description/goal"
+    /// the human sees, since loomux does not track those as separate fields
+    /// from the assigned work). Additive: a roster row written before this
+    /// field existed deserializes to empty, which the browser renders as "no
+    /// recorded task" rather than fabricating one.
+    #[serde(default)]
+    pub task: String,
+    /// The git branch this agent's work is associated with, when it has one
+    /// (#1). See `AgentEntry::branch` for exactly when this is `Some`.
+    /// Additive: absent on a pre-#1 roster row.
+    #[serde(default)]
+    pub branch: Option<String>,
 }
 
 /// Durable per-agent usage snapshot (`usage.json` per group). Keyed by the CLI
@@ -3021,6 +3056,30 @@ pub struct SessionRole {
     pub agent_name: String,
     /// Whether that group currently has live agents in this app instance.
     pub group_live: bool,
+    /// The task/brief this agent was spawned or resumed with (#1). Empty for
+    /// a roster row predating the field, or an orchestrator (which has none)
+    /// — the browser shows "no recorded task" rather than fabricating one.
+    #[serde(default)]
+    pub task: String,
+    /// The git branch this agent's work is associated with, when it has one
+    /// (#1). See `AgentEntry::branch`.
+    #[serde(default)]
+    pub branch: Option<String>,
+    /// The group's repo path (#1), resolved from `group.json`. `None` only
+    /// when that file is missing/unreadable — session_roles already requires
+    /// it to exist to enumerate the group at all, so this is normally always
+    /// `Some`; kept `Option` rather than an empty-string default so the
+    /// browser can tell "unknown" from "repo is an empty string" (never
+    /// actually reachable, but honest about what a read failure means).
+    #[serde(default)]
+    pub repo: Option<String>,
+    /// The PR this agent's work is now attached to, when the task board
+    /// records one for a task carrying this session (#1) — resolved live at
+    /// read time (not persisted on the roster row) so it reflects the PR's
+    /// CURRENT value even after the session itself has ended. `None` when no
+    /// board task references this session, or it has no `pr` set yet.
+    #[serde(default)]
+    pub pr: Option<String>,
 }
 
 /// Identity resolved from an MCP request's token header.
@@ -3119,6 +3178,12 @@ pub struct SpawnRequest {
     /// plain human shell, so the human's own terminals are untouched.
     #[serde(default)]
     pub env: Vec<(String, String)>,
+    /// Whether the frontend should open this pane straight into the dock
+    /// (#260) instead of the visible split tree, so a burst of delegate
+    /// spawns doesn't crowd the orchestrator pane out of focus. Always
+    /// `false` for the orchestrator's own pane — see `spawn_opens_minimized`.
+    #[serde(default)]
+    pub minimized: bool,
 }
 
 pub struct OrchRegistry {
@@ -3214,6 +3279,15 @@ pub struct OrchRegistry {
     /// rejected while autonomous. Durable `dangerous_mode` marker; the gate's single
     /// decision point allows a privileged action via `(dangerous && !autonomous)`.
     dangerous_groups: Mutex<HashSet<String>>,
+    /// Groups that opted BACK OUT of the #260 default (delegate panes open
+    /// docked/minimized so a burst of spawns doesn't crowd the orchestrator
+    /// out of focus) and want every spawned pane to open expanded into the
+    /// split tree, matching pre-#260 behavior. Default OFF (absent) = the new
+    /// minimize-on-spawn default applies; presence is the opt-out, so this
+    /// set's *meaning* is inverted from `notify_groups`/`autonomous_groups`
+    /// (there, presence enables a default-off feature; here, presence
+    /// disables a default-on one). Durable `spawn_expanded` marker file.
+    spawn_expanded_groups: Mutex<HashSet<String>>,
     /// Autonomous mode (#83): per-group idle-tick delivery timestamps (Unix-ms)
     /// for the `MAX_IDLE_TICKS_PER_HOUR` backstop; pruned to the trailing hour on
     /// each check. The runaway analogue of `spawn_times`.
@@ -4417,6 +4491,63 @@ fn wait_for_box_clear(ptys: &crate::pty::PtyManager, pty_id: u32) -> PasteDecisi
     )
 }
 
+/// Why a prompt delivery is currently being held for human input (#246): the
+/// UI-facing counterpart to the audit-log holds above. `Typing` is
+/// `wait_for_user_quiet`'s "human is actively typing" hold (#43); `BoxOccupied`
+/// is `wait_for_box_clear`'s "an unsubmitted line sits in the box" hold (#111,
+/// backed by `box_occupancy_delta`/#171). Two reasons because they read
+/// differently to a human watching the pane — one is "wait, I'm still typing",
+/// the other is "wait, I left something in the box" — even though both boil
+/// down to "loomux won't paste over you".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeldReason {
+    Typing,
+    BoxOccupied,
+}
+
+impl HeldReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HeldReason::Typing => "typing",
+            HeldReason::BoxOccupied => "box-occupied",
+        }
+    }
+}
+
+/// Human-readable "what's held and why" line for a delivery-held badge/toast
+/// (#246). Pure so the copy is unit-testable; callers pair it with
+/// `delivery_held_event`'s payload.
+pub fn delivery_held_detail(agent_id: &str, reason: HeldReason) -> String {
+    match reason {
+        HeldReason::Typing => format!(
+            "Prompt delivery to {agent_id} is paused — you're typing in this pane."
+        ),
+        HeldReason::BoxOccupied => format!(
+            "Prompt delivery to {agent_id} is paused — submit or clear the text in this pane's box to continue."
+        ),
+    }
+}
+
+/// Build the `orch-delivery-held` event payload (#246): pushed the moment a
+/// delivery to `agent_id` starts waiting on human input in `pty_id`'s box.
+/// Pure so the shape is unit-testable without a harness that can capture an
+/// actually-emitted Tauri event (see `channel_connected_event`'s doc for why
+/// this codebase always factors payload construction out this way).
+pub fn delivery_held_event(agent_id: &str, group: &str, pty_id: u32, reason: HeldReason) -> Value {
+    json!({
+        "agent_id": agent_id, "group": group, "pty_id": pty_id,
+        "reason": reason.as_str(), "detail": delivery_held_detail(agent_id, reason),
+    })
+}
+
+/// Build the `orch-delivery-held-cleared` event payload (#246): pushed the
+/// instant a hold resolves, whether the prompt then delivered or the delivery
+/// aborted — either way nothing is held on `pty_id` anymore, so the frontend
+/// badge for it drops.
+pub fn delivery_held_cleared_event(pty_id: u32) -> Value {
+    json!({ "pty_id": pty_id })
+}
+
 /// Whether an unconfirmed delivery should raise a one-shot notice to the group's
 /// orchestrator so it can close the loop (#103). Fires only for a delivery to a
 /// NON-orchestrator agent whose submit went unconfirmed: the prompt may be
@@ -4545,6 +4676,7 @@ impl OrchRegistry {
             auto_merge_groups: Mutex::new(HashSet::new()),
             auto_release_groups: Mutex::new(HashSet::new()),
             dangerous_groups: Mutex::new(HashSet::new()),
+            spawn_expanded_groups: Mutex::new(HashSet::new()),
             idle_tick_times: Mutex::new(HashMap::new()),
             pending_max_notice: Mutex::new(HashMap::new()),
             claude_projects_dir: Mutex::new(None),
@@ -5188,6 +5320,8 @@ impl OrchRegistry {
             cwd: entry.cwd.clone(),
             status: status.to_string(),
             updated_ms: now_ms(),
+            task: entry.task.clone(),
+            branch: entry.branch.clone(),
         };
         // Match by (id, session): agent ids restart at 1 every app run, so
         // a bare-id match would overwrite a previous run's record and lose
@@ -5321,6 +5455,17 @@ impl OrchRegistry {
             let d = &v["detail"];
             let Some(session) = d["session"].as_str() else { continue };
             let role = d["role"].as_str().unwrap_or("worker").to_string();
+            // Mirror `spawn_agent_ex`'s persisted_branch rule (#1): the spawn
+            // audit always records a `branch` value (even a fallback name for
+            // roles that never use one), so only trust it where that role
+            // could actually have a real branch — a worker (worktree or
+            // shared-repo), or a reviewer that got a worktree.
+            let worktree = d["worktree"].as_bool().unwrap_or(false);
+            let branch = (role == "worker" || (role == "reviewer" && worktree))
+                .then(|| d["branch"].as_str())
+                .flatten()
+                .map(String::from);
+            let task = d["task"].as_str().unwrap_or("").to_string();
             let record = AgentRecord {
                 id: d["agent"].as_str().unwrap_or("").to_string(),
                 name: d["name"]
@@ -5340,6 +5485,8 @@ impl OrchRegistry {
                 // The audit alone can't tell liveness; group_live covers it.
                 status: "unknown".into(),
                 updated_ms: v["ts_ms"].as_u64().unwrap_or(0),
+                task,
+                branch,
             };
             match out.iter_mut().find(|r| r.id == record.id && r.session == record.session) {
                 Some(r) => *r = record,
@@ -5378,14 +5525,30 @@ impl OrchRegistry {
                 continue;
             }
             let live = self.group_is_live(&group_id);
+            // Resolved once per group (#1), not per session: the repo for the
+            // "repo/branch" identity, and the board's session→pr map so a PR
+            // set AFTER a session ended (or by a different agent entirely)
+            // still surfaces against it. Best-effort — an unreadable
+            // group.json degrades to `repo: None`, never a fabricated guess.
+            let repo = self.load_group_file(&group_id).map(|(repo, _)| repo);
+            let pr_by_session: HashMap<String, String> = self
+                .tasks(&group_id)
+                .into_iter()
+                .filter_map(|t| Some((t.session?, t.pr?)))
+                .collect();
             for r in self.merged_records(&group_id) {
                 if let Some(session) = r.session {
+                    let pr = pr_by_session.get(&session).cloned();
                     out.push(SessionRole {
                         session_id: session,
                         group_id: group_id.clone(),
                         role: r.role,
                         agent_name: r.name,
                         group_live: live,
+                        task: r.task,
+                        branch: r.branch,
+                        repo: repo.clone(),
+                        pr,
                     });
                 }
             }
@@ -5756,6 +5919,11 @@ impl OrchRegistry {
         // Desktop-notification opt-in is likewise a durable per-group choice.
         if dir.join("notify").is_file() {
             self.notify_groups.lock_safe().insert(id.clone());
+        }
+        // The #260 minimize-on-spawn opt-OUT is likewise a durable per-group
+        // choice, re-seeded the same way.
+        if dir.join("spawn_expanded").is_file() {
+            self.spawn_expanded_groups.lock_safe().insert(id.clone());
         }
         // Autonomous mode (#83) and the auto-merge gate are durable per-group
         // choices too; re-seed them so a resumed group keeps ticking (and its
@@ -7240,6 +7408,7 @@ impl OrchRegistry {
             task: String::new(),
             session_id: None,
             cwd: cwd.to_string(),
+            branch: None, // solo panes aren't part of the multi-agent worktree/branch model
             idle_since_ms: None,
             started_ms: now_ms(),
             last_progress_ms: now_ms(),
@@ -7315,6 +7484,7 @@ impl OrchRegistry {
             task: String::new(),
             session_id: None,
             cwd: cwd.to_string(),
+            branch: None, // solo panes aren't part of the multi-agent worktree/branch model
             idle_since_ms: None,
             started_ms: now_ms(),
             last_progress_ms: now_ms(),
@@ -7599,6 +7769,33 @@ impl OrchRegistry {
         } else if set.remove(group) {
             let _ = fs::remove_file(dir.join("notify"));
             self.audit(group, "human", "notify-off", json!({}));
+        }
+        Ok(())
+    }
+
+    /// Whether this group has opted OUT of the #260 minimize-on-spawn default
+    /// (i.e. wants delegate panes to keep opening expanded, the pre-#260
+    /// behavior). Feeds `spawn_opens_minimized` at each delegate spawn.
+    pub fn spawn_expanded(&self, group: &str) -> bool {
+        self.spawn_expanded_groups.lock_safe().contains(group)
+    }
+
+    /// Opt a group in/out of the #260 minimize-on-spawn default, durably (a
+    /// `spawn_expanded` marker file, mirroring `notify`) so the choice survives
+    /// restarts. `on=true` means "expand every spawn like before #260";
+    /// `on=false` (the default) restores the minimize-on-spawn behavior.
+    pub fn set_spawn_expanded(&self, group: &str, on: bool) -> Result<(), String> {
+        let dir = self.group_dir(group);
+        let mut set = self.spawn_expanded_groups.lock_safe();
+        if on {
+            if set.insert(group.to_string()) {
+                fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+                let _ = fs::write(dir.join("spawn_expanded"), b"");
+                self.audit(group, "human", "spawn-expanded-on", json!({}));
+            }
+        } else if set.remove(group) {
+            let _ = fs::remove_file(dir.join("spawn_expanded"));
+            self.audit(group, "human", "spawn-expanded-off", json!({}));
         }
         Ok(())
     }
@@ -10780,32 +10977,40 @@ impl OrchRegistry {
         // the audit record (#204).
         let base = base.map(|b| b.trim().to_string()).filter(|b| !b.is_empty());
         let cwd_override = cwd_override.map(|c| c.trim().to_string()).filter(|c| !c.is_empty());
-        let (cwd, branch_note) = if let Some(c) = cwd_override {
+        // The third element is the branch to PERSIST on the entry (#1, session
+        // browser metadata): `Some` only where `branch_name` is an actual
+        // commitment this agent is working against — a cut worktree, or a
+        // shared-repo Worker explicitly told to create it — `None` for the
+        // orchestrator/reviewer(no worktree)/planner, which never have "their
+        // own branch" the way a Worker does (showing `branch_name`'s
+        // `agent/<id>` fallback for those would be a fabricated detail, not a
+        // recorded fact).
+        let (cwd, branch_note, persisted_branch) = if let Some(c) = cwd_override {
             if !Path::new(&c).is_dir() {
                 return Err(format!("cwd does not exist: {c}"));
             }
-            (c, String::new())
+            (c, String::new(), None)
         } else if use_worktree && role != Role::Orchestrator && role != Role::Planner {
             // Cut the branch from the default branch (or an explicit `base`),
             // never the primary checkout's incidental HEAD (#204).
             let wt = crate::git::git_worktree_add(group.repo.clone(), branch_name.clone(), base.clone())?;
             (wt.clone(), format!(
                 "Your working directory is a dedicated git worktree at {wt} already checked out on branch '{branch_name}'."
-            ))
+            ), Some(branch_name.clone()))
         } else if role == Role::Orchestrator {
-            (group.repo.clone(), String::new())
+            (group.repo.clone(), String::new(), None)
         } else if role == Role::Reviewer {
-            (group.repo.clone(), "You review; you do not create branches or push. Inspect PRs via gh (checking out the PR branch locally is fine).".to_string())
+            (group.repo.clone(), "You review; you do not create branches or push. Inspect PRs via gh (checking out the PR branch locally is fine).".to_string(), None)
         } else if role == Role::Planner {
             // Planners explore read-only in the repo itself and never branch,
             // worktree, commit, or PR — so a worktree is never created for
             // them even if `use_worktree` was set (the CLI-level write/commit
             // denials in `build_agent_command` back this note structurally).
-            (group.repo.clone(), PLANNER_READONLY_NOTE.to_string())
+            (group.repo.clone(), PLANNER_READONLY_NOTE.to_string(), None)
         } else {
             (group.repo.clone(), format!(
                 "Work in the repo itself; create branch '{branch_name}' off the default branch before changing anything. Never commit to the default branch."
-            ))
+            ), Some(branch_name.clone()))
         };
 
         if cli == "copilot" {
@@ -10880,6 +11085,7 @@ impl OrchRegistry {
             task: task.to_string(),
             session_id: session_id.clone(),
             cwd: cwd.clone(),
+            branch: persisted_branch.clone(),
             // An agent spawned without a task starts the idle clock; one
             // given work does not (the orchestrator is exempt regardless).
             idle_since_ms: (role != Role::Orchestrator && task.trim().is_empty()).then(now_ms),
@@ -10967,6 +11173,9 @@ impl OrchRegistry {
             // Agent pane: inject the gh-shim PATH + LOOMUX_GROUP_DIR so the merge
             // gate is enforced structurally (#83).
             env: self.agent_pane_env(group_id),
+            // #260: delegate panes open docked by default so a burst of spawns
+            // doesn't crowd the orchestrator pane out of focus.
+            minimized: spawn_opens_minimized(role, self.spawn_expanded(group_id)),
         };
 
         let app = self.app.lock_safe().clone();
@@ -11295,6 +11504,20 @@ impl OrchRegistry {
             let _guard = lock.lock_safe();
             let ptys = app.state::<crate::pty::PtyManager>();
 
+            // Delivery-held badge plumbing (#246): fired around each blocking
+            // human-input hold below so a pane-header badge can appear the
+            // instant a hold starts and drop the instant it resolves. Each
+            // call site first checks (with zero elapsed hold) whether it's
+            // ABOUT to block, so the badge only shows for holds that actually
+            // happen, never for the common no-op case where the box was
+            // already clear.
+            let emit_held = |reason: HeldReason| {
+                let _ = app.emit("orch-delivery-held", delivery_held_event(&agent, &group, pty_id, reason));
+            };
+            let emit_held_cleared = || {
+                let _ = app.emit("orch-delivery-held-cleared", delivery_held_cleared_event(pty_id));
+            };
+
             let start = std::time::Instant::now();
             if wait_ready {
                 let mut last_len = 0usize;
@@ -11334,11 +11557,21 @@ impl OrchRegistry {
             // directly in this pane, hold the paste until they go quiet so a
             // report can't land inside their half-typed line. Capped so a long
             // compose session can't starve the queue.
+            let will_hold_typing_prepaste = should_hold_for_user(
+                ptys.last_user_input_ms(pty_id).unwrap_or(0), now_ms(),
+                Duration::ZERO, USER_QUIET_HOLD, USER_QUIET_MAX_HOLD,
+            );
+            if will_hold_typing_prepaste {
+                emit_held(HeldReason::Typing);
+            }
             if let Some(held_ms) = wait_for_user_quiet(&ptys, pty_id) {
                 append_audit(&root, &group, "loomux", "delivery-held-for-user", json!({
                     "to": agent, "stage": "pre-paste", "held_ms": held_ms,
                     "capped": held_ms >= USER_QUIET_MAX_HOLD.as_millis() as u64,
                 }));
+            }
+            if will_hold_typing_prepaste {
+                emit_held_cleared();
             }
 
             // Stranded-text flush (#81/#84): if the PREVIOUS delivery to this
@@ -11367,7 +11600,15 @@ impl OrchRegistry {
             // `/model` + task-text collision). So hold for the box to clear
             // (they submit or clear it); if it never does, abort WITHOUT pasting
             // and nudge the orchestrator to re-send once the pane is clear.
-            match wait_for_box_clear(&ptys, pty_id) {
+            let will_hold_box = ptys.input_pending(pty_id).unwrap_or(false);
+            if will_hold_box {
+                emit_held(HeldReason::BoxOccupied);
+            }
+            let paste_decision = wait_for_box_clear(&ptys, pty_id);
+            if will_hold_box {
+                emit_held_cleared();
+            }
+            match paste_decision {
                 PasteDecision::Paste { held_ms } if held_ms > 0 => {
                     append_audit(&root, &group, "loomux", "delivery-held-for-input", json!({
                         "to": agent, "held_ms": held_ms, "outcome": "cleared",
@@ -11461,11 +11702,21 @@ impl OrchRegistry {
             // Re-check right before the first Enter: the human may have
             // started typing during the quiet-wait above, and a blind Enter
             // would submit their line. Hold again until they're quiet (#43).
+            let will_hold_typing_preenter = should_hold_for_user(
+                ptys.last_user_input_ms(pty_id).unwrap_or(0), now_ms(),
+                Duration::ZERO, USER_QUIET_HOLD, USER_QUIET_MAX_HOLD,
+            );
+            if will_hold_typing_preenter {
+                emit_held(HeldReason::Typing);
+            }
             if let Some(held_ms) = wait_for_user_quiet(&ptys, pty_id) {
                 append_audit(&root, &group, "loomux", "delivery-held-for-user", json!({
                     "to": agent, "stage": "pre-enter", "held_ms": held_ms,
                     "capped": held_ms >= USER_QUIET_MAX_HOLD.as_millis() as u64,
                 }));
+            }
+            if will_hold_typing_preenter {
+                emit_held_cleared();
             }
             let submit_sent_ms = now_ms();
             // Baseline just before the first Enter, so the confirmation window
@@ -12251,6 +12502,24 @@ pub fn orch_set_notify(
     reg.set_notify(&group_id, enabled)
 }
 
+/// Whether this group has opted OUT of the #260 minimize-on-spawn default
+/// (toggle button state — the panel shows the OPT-IN sense, "auto-dock", so
+/// the frontend negates this: see `spawnExpanded` in orchestration.ts).
+#[tauri::command]
+pub fn orch_spawn_expanded(reg: tauri::State<Arc<OrchRegistry>>, group_id: String) -> bool {
+    reg.spawn_expanded(&group_id)
+}
+
+/// Opt a group in/out of the #260 minimize-on-spawn default (durable, per-group).
+#[tauri::command]
+pub fn orch_set_spawn_expanded(
+    reg: tauri::State<Arc<OrchRegistry>>,
+    group_id: String,
+    expanded: bool,
+) -> Result<(), String> {
+    reg.set_spawn_expanded(&group_id, expanded)
+}
+
 /// Change a live group's max live-agent cap (durable, bounds-checked, audited).
 /// Takes effect on the next spawn; lowering it below the current live count
 /// blocks new spawns until attrition rather than killing anyone. Returns the
@@ -12656,6 +12925,7 @@ fn register_orchestrator_pane(
         task: String::new(),
         session_id,
         cwd: group.repo.clone(),
+        branch: None, // the orchestrator works on the repo's own checkout, not a branch
         idle_since_ms: None, // the orchestrator is never idle-reaped
         started_ms: now_ms(),
         last_progress_ms: now_ms(), // watchdog ignores the orchestrator; the
@@ -12686,6 +12956,10 @@ fn register_orchestrator_pane(
         // The orchestrator is the pane the incident implicated — inject the
         // gh-shim env so its merge gate is enforced too (#83).
         env: reg.agent_pane_env(&group.id),
+        // The orchestrator's own pane is never minimized (#260) — see
+        // `spawn_opens_minimized`, called here too so both `SpawnRequest` sites
+        // agree on the rule structurally, not by two independently-written `false`s.
+        minimized: spawn_opens_minimized(Role::Orchestrator, reg.spawn_expanded(&group.id)),
     };
 
     crate::obs::breadcrumb(
@@ -12821,6 +13095,13 @@ pub fn resume_recorded_session(
                 group_id,
                 role,
                 group_live,
+                // Signature-only fallback (no roster row, no audit line to
+                // read): none of #1's metadata is derivable, so it's honestly
+                // absent rather than guessed.
+                task: String::new(),
+                branch: None,
+                repo: None,
+                pr: None,
             })
         })
         .ok_or("this session is not part of a recorded orchestration")?;

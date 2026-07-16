@@ -1072,6 +1072,21 @@ const sessions = new SessionBrowser(
   orchSessionRoles
 );
 
+// Prefetch the session list in the background at boot (live-test feedback:
+// the first click into the sidebar felt slow because nothing had been
+// fetched yet — scanning ~/.claude/projects + ~/.copilot/session-state and
+// resolving each orchestration session's roster/board metadata is real I/O,
+// none of it started until that first click). `refresh()` populates and
+// renders into the (still-hidden) sidebar DOM regardless of visibility, so
+// by the time the human opens it the list is already there; `toggle()`
+// still re-refreshes on open for freshness, but with the fetch already warm
+// that's no longer the FIRST load. Best-effort — a failure here just means
+// the sidebar's own refresh path (open, or the ↻ button) covers it instead,
+// same as it always has.
+void sessions.refresh().catch(() => {
+  /* best-effort warm-up; never block or fail boot on it */
+});
+
 async function restoreSession(s: SessionInfo): Promise<void> {
   // Recorded orchestration sessions restore into their group — MCP identity,
   // badges, and task board included — instead of a powerless plain `--resume`.

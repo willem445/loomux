@@ -20,6 +20,7 @@ import { showToast } from "./toast";
 import { showContextMenu } from "./contextmenu";
 import { buildPaneMenu, type PaneConnectState, type PaneMenuAction, type PendingConnect } from "./panemenu";
 import { reduceConnect, channelBadge, dropIfStale } from "./channel";
+import type { HeldReason } from "./heldbadge";
 
 export type { AutonomyState };
 export type { WorkflowPreview };
@@ -48,6 +49,12 @@ export interface OrchSpawnRequest {
    *  the merge gate on agent panes. `[key, value]` pairs; absent on an older
    *  backend or for panes with nothing extra to inject. */
   env?: [string, string][];
+  /** Open this pane straight into the dock instead of the visible split tree
+   *  (#260) — backend-computed from role + the group's `spawn_expanded`
+   *  setting (see `spawn_opens_minimized`): true for delegate roles by
+   *  default, always false for the orchestrator's own pane. Absent/falsy on
+   *  an older backend, which preserves the pre-#260 always-expand behavior. */
+  minimized?: boolean;
 }
 
 /** Launcher-collected group settings; guardrails are enforced backend-side. */
@@ -107,6 +114,18 @@ export interface AttentionItem {
   detail: string;
 }
 
+/** Loomux is currently withholding an outbound prompt delivery to this pane
+ *  because it believes the human's own input occupies the CLI's input box
+ *  (#246). Distinct from `AttentionItem`: attention flags a pane the human
+ *  should look AT; this flags a pane loomux is NOT writing to right now. */
+export interface DeliveryHeldEvent {
+  agent_id: string;
+  group: string;
+  pty_id: number;
+  reason: HeldReason;
+  detail: string;
+}
+
 /** The human focused/handled an attention-badged pane: clear its latched
  *  report backend-side so the badge drops. */
 export const ackAttention = (agentId: string): Promise<void> =>
@@ -119,6 +138,16 @@ export const notifyEnabled = (groupId: string): Promise<boolean> =>
 /** Enable/disable desktop notifications for a group (durable, per-group). */
 export const setNotify = (groupId: string, enabled: boolean): Promise<void> =>
   invoke("orch_set_notify", { groupId, enabled });
+
+/** Whether this group has opted OUT of the #260 minimize-on-spawn default
+ *  (delegate panes open expanded, like before #260, instead of docked). */
+export const spawnExpanded = (groupId: string): Promise<boolean> =>
+  invoke<boolean>("orch_spawn_expanded", { groupId });
+
+/** Opt a group in/out of the #260 minimize-on-spawn default (durable,
+ *  per-group). `expanded=true` restores the pre-#260 always-expand behavior. */
+export const setSpawnExpanded = (groupId: string, expanded: boolean): Promise<void> =>
+  invoke("orch_set_spawn_expanded", { groupId, expanded });
 
 /** Change a group's max live-agent cap on the fly (bounds-checked backend-side,
  *  durable, audited). Resolves to the applied value; rejects with the backend
@@ -274,6 +303,14 @@ async function openAgentPane(
       discardStalePane(grid, pane);
       return;
     }
+    // Dock it straight away (#260): the backend already decided this pane
+    // should open minimized (a delegate role, group hasn't opted out) — reuse
+    // the existing minimize/dock plumbing (#46) rather than a parallel
+    // "open into the dock" path, so this behaves exactly like a human folding
+    // the pane by hand a moment after it opened. `grid.minimize` refuses to
+    // dock the grid's last visible pane, so this is a no-op in that edge case
+    // rather than ever leaving the grid empty.
+    if (req.minimized) grid.minimize(pane);
     // Report the pty so the backend can unblock the spawner and type the kickoff.
     try {
       await invoke("bind_agent", { agentId: req.agent_id, ptyId: pane.ptyId });
@@ -389,6 +426,17 @@ export function initOrchestration(wiring: OrchWiring): void {
   // panes keyed only by pty (#40), not just orchestration agents.
   void listen<AttentionItem[]>("orch-attention", ({ payload }) => {
     wiring.applyAttention(payload);
+  });
+  // Delivery-held badge (#246): the moment loomux starts withholding a prompt
+  // because the pane's box looks human-occupied, badge it right there in the
+  // header — naming what's held (the reason) and clearing the instant the
+  // backend resolves the hold (delivered or aborted), via its own paired
+  // event rather than a frontend timer racing the backend's actual cap.
+  void listen<DeliveryHeldEvent>("orch-delivery-held", ({ payload }) => {
+    wiring.findByPty(payload.pty_id)?.setHeld(payload.reason, payload.detail);
+  });
+  void listen<{ pty_id: number }>("orch-delivery-held-cleared", ({ payload }) => {
+    wiring.findByPty(payload.pty_id)?.setHeld(null);
   });
   // End-orchestration: the backend has already killed the group's agents, so
   // close their (now-dead) panes across every tab rather than leaving a screen
@@ -637,13 +685,30 @@ async function hydratePaneChannel(pane: Pane, group: string, agentId: string): P
   }
 }
 
-/** A recorded session's orchestration identity (backend roster). */
+/** A recorded session's orchestration identity (backend roster). Fields
+ *  below `group_live` are #1's session-browser metadata — absent/empty on a
+ *  roster row that predates them, never fabricated (see sessions.ts). */
 export interface SessionRoleInfo {
   session_id: string;
   group_id: string;
   role: string;
   agent_name: string;
   group_live: boolean;
+  /** The task/brief this agent was spawned or resumed with — doubles as its
+   *  "description/goal" (#1). Empty for a legacy row or the orchestrator
+   *  (which has no assigned task). */
+  task: string;
+  /** The git branch this agent's work is associated with, when it has one.
+   *  `null` for the orchestrator, a reviewer with no worktree, or a legacy
+   *  row loomux can't attribute a branch to safely. */
+  branch: string | null;
+  /** The group's repo path, resolved from its group.json. `null` only if
+   *  that file is unreadable. */
+  repo: string | null;
+  /** The PR this agent's work is now attached to, per the task board —
+   *  resolved live, so it can be set well after this session ended. `null`
+   *  when no board task references this session (yet). */
+  pr: string | null;
 }
 
 export const orchSessionRoles = (): Promise<SessionRoleInfo[]> =>

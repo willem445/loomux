@@ -29,6 +29,8 @@ import {
   setIdleTickMinutes,
   setMaxAgents,
   setNotify,
+  setSpawnExpanded,
+  spawnExpanded,
   type AutonomyState,
   type GroupSummary,
   type GroupUsage,
@@ -153,6 +155,10 @@ export class GroupView {
   private releaseArmTimer: number | undefined;
   private pauseBtn: HTMLButtonElement;
   private notifyBtn: HTMLButtonElement;
+  /** #260: toggles whether newly spawned worker/reviewer/planner panes open
+   *  docked to the minimize tray (the default) or expanded into the split
+   *  tree (the pre-#260 behavior) — backend-persisted per group. */
+  private dockBtn: HTMLButtonElement;
   private foldBtn: HTMLButtonElement | null = null;
   private endBtn: HTMLButtonElement;
   private cleanupChk: HTMLInputElement;
@@ -166,6 +172,9 @@ export class GroupView {
   private watches: GroupWatch[] = [];
   private paused = false;
   private notify = false;
+  /** #260: true once the group opted OUT of the minimize-on-spawn default
+   *  (i.e. wants panes to keep opening expanded, like before #260). */
+  private spawnExpandedFlag = false;
   private autonomy: AutonomyState | null = null;
   private pollTimer: number | undefined;
   private disposed = false;
@@ -435,6 +444,17 @@ export class GroupView {
     this.notifyBtn = el("button", "group-btn", "🔔 Notify") as HTMLButtonElement;
     this.notifyBtn.addEventListener("click", () => void this.toggleNotify());
 
+    // Auto-dock toggle (#260): whether newly spawned delegate panes open
+    // minimized to the tray (default) or expanded into the split tree.
+    // No icon glyph — 🗕 (U+1F5D5 SCREEN) was tried first, but it's an
+    // obscure Supplementary-Plane pictograph outside the widely-supported
+    // "RGI" emoji set; Windows' Segoe UI Emoji doesn't cover it and the
+    // fallback glyph reads as a stray underscore before the label (live-test
+    // report). Plain text instead, matching the Fold-panes button just below
+    // (also iconless) rather than gambling on another emoji's font coverage.
+    this.dockBtn = el("button", "group-btn", "Auto-dock") as HTMLButtonElement;
+    this.dockBtn.addEventListener("click", () => void this.toggleSpawnExpanded());
+
     // Fold-group toggle (#46), mirroring the orchestrator header button:
     // minimize every worker/reviewer pane to the dock at once, or restore them.
     if (opts.onToggleMinimize) {
@@ -456,7 +476,7 @@ export class GroupView {
     this.endBtn.addEventListener("click", () => void this.onEndClick());
     endWrap.append(cleanupLbl, this.endBtn);
 
-    foot.append(this.pauseBtn, this.notifyBtn);
+    foot.append(this.pauseBtn, this.notifyBtn, this.dockBtn);
     if (this.foldBtn) foot.append(this.foldBtn);
     foot.append(endWrap);
 
@@ -491,14 +511,16 @@ export class GroupView {
   private async load(): Promise<void> {
     if (this.disposed) return;
     try {
-      [this.summary, this.usage, this.paused, this.notify, this.autonomy, this.watches] = await Promise.all([
-        groupSummary(this.groupId),
-        groupUsage(this.groupId),
-        groupPaused(this.groupId),
-        notifyEnabled(this.groupId),
-        autonomyState(this.groupId),
-        groupWatches(this.groupId),
-      ]);
+      [this.summary, this.usage, this.paused, this.notify, this.spawnExpandedFlag, this.autonomy, this.watches] =
+        await Promise.all([
+          groupSummary(this.groupId),
+          groupUsage(this.groupId),
+          groupPaused(this.groupId),
+          notifyEnabled(this.groupId),
+          spawnExpanded(this.groupId),
+          autonomyState(this.groupId),
+          groupWatches(this.groupId),
+        ]);
     } catch (err) {
       this.toast(String(err));
       return;
@@ -548,6 +570,16 @@ export class GroupView {
   private async toggleNotify(): Promise<void> {
     try {
       await setNotify(this.groupId, !this.notify);
+    } catch (err) {
+      this.toast(String(err));
+    }
+    await this.load();
+  }
+
+  /** Flip the #260 minimize-on-spawn default for this group. */
+  private async toggleSpawnExpanded(): Promise<void> {
+    try {
+      await setSpawnExpanded(this.groupId, !this.spawnExpandedFlag);
     } catch (err) {
       this.toast(String(err));
     }
@@ -869,6 +901,15 @@ export class GroupView {
     this.notifyBtn.title = this.notify
       ? "Desktop toasts are on for this group — click to turn off"
       : "Turn on OS toasts for reports and idle-with-prompt panes in this group";
+
+    // Reflect the #260 minimize-on-spawn setting on its toggle (positive
+    // sense: "on" means new panes auto-dock, i.e. spawnExpandedFlag is false).
+    const autoDock = !this.spawnExpandedFlag;
+    this.dockBtn.textContent = autoDock ? "Auto-dock" : "Auto-dock: off";
+    this.dockBtn.classList.toggle("on", autoDock);
+    this.dockBtn.title = autoDock
+      ? "New worker/reviewer/planner panes open minimized to the dock — click to have them open expanded instead"
+      : "New panes open expanded (pre-#260 behavior) — click to auto-dock them again";
 
     this.renderAutonomy();
 

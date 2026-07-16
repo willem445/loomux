@@ -14,6 +14,7 @@ use loomux_lib::orchestration::{
     channel_connected_event, channel_disconnected_event, channel_message_text,
     channel_updated_event, classify_human_input,
     claude_permission_mode, cli_ready, copilot_autopilot_prompt_detected, create_orchestration_group,
+    delivery_held_cleared_event, delivery_held_detail, delivery_held_event,
     exit_cause, exit_diagnostic, resolve_output_text,
     gh_gate_decision, gh_is_merge_invocation, gh_positionals, gh_release_action, gh_repo_flag,
     gh_shim_sh, git_shim_sh, git_tag_push, grant_segment, grant_unexpired, hold_for_human_input,
@@ -26,10 +27,11 @@ use loomux_lib::orchestration::{
     sanitize_attachment_ext, set_rotate_check_pause_for_test, should_confirm_copilot_autopilot,
     should_flush_before_paste,
     should_notify_paste_held, should_notify_unconfirmed, single_pane_autopilot_flags,
+    spawn_opens_minimized,
     spawn_rate_exceeded, spawn_request_expired, strip_ansi, submit_confirmed, submit_sequence,
     cap_task_notes, task_summary,
     unconfirmed_delivery_notice, watchdog_should_notify, worktree_cleanup_targets,
-    AgentRecord, AttentionItem, Caller, Delivery, Guardrails, HumanInput, Launch, NameSource, OrchRegistry, PasteDecision,
+    AgentRecord, AttentionItem, Caller, Delivery, Guardrails, HeldReason, HumanInput, Launch, NameSource, OrchRegistry, PasteDecision,
     PersonaInject, Task, TaskNote,
     PasteGate, Role, TaskPatch, UsageSnapshot, CLAUDE_UNATTENDED_ALLOW, COPILOT_AUTOPILOT_CONFIRM_KEYS,
     COPILOT_GROUP_AUTOPILOT_FLAGS, COPILOT_UNATTENDED_FLAGS, MAX_ATTACHMENT_BYTES,
@@ -2556,6 +2558,95 @@ fn audit_rotates_at_cap_and_backfill_reads_both_generations() {
 }
 
 #[test]
+fn session_roles_surfaces_task_branch_repo_and_pr_for_the_session_browser() {
+    // #1: name/description/goal (the task text), repo, branch, and PR should
+    // all be resolvable for the session browser off what orchestration
+    // already tracks — no new user input required.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo-1", rails()).unwrap();
+    let w = reg
+        .spawn_agent(&g.id, Role::Worker, "builder", "implement the thing", false, Some("feat/thing".into()))
+        .unwrap();
+    let sid = w.session_id.clone().unwrap();
+
+    // No task references this session yet — pr is None, everything else is
+    // already resolvable from the roster + group.json alone.
+    let before = reg.session_roles().into_iter().find(|r| r.session_id == sid).unwrap();
+    assert_eq!(before.task, "implement the thing");
+    assert_eq!(before.branch.as_deref(), Some("feat/thing"));
+    assert_eq!(before.repo.as_deref(), Some("C:/tmp/repo-1"));
+    assert_eq!(before.pr, None, "no board task references this session yet");
+
+    // The orchestrator later opens a PR for this worker's task and records it
+    // on the board, keyed by session — session_roles must pick it up live,
+    // not just at spawn time.
+    let t = reg.upsert_task(&g.id, "orch-1", None, patch(Some("build feature"), None, None)).unwrap();
+    reg.upsert_task(
+        &g.id,
+        "orch-1",
+        Some(&t.id),
+        TaskPatch { session: Some(sid.clone()), pr: Some("42".into()), ..Default::default() },
+    )
+    .unwrap();
+
+    let after = reg.session_roles().into_iter().find(|r| r.session_id == sid).unwrap();
+    assert_eq!(after.pr.as_deref(), Some("42"));
+    // The rest is unaffected by the board edit.
+    assert_eq!(after.task, "implement the thing");
+    assert_eq!(after.branch.as_deref(), Some("feat/thing"));
+}
+
+#[test]
+fn session_roles_never_fabricates_a_branch_for_roles_that_do_not_have_one() {
+    // #1's "no fabrication" bar: the orchestrator (and a reviewer that never
+    // got a worktree) must read as having no branch, not the internal
+    // `agent/<id>` placeholder name every spawn computes regardless of role.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo-2", rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let rev = reg.spawn_agent(&g.id, Role::Reviewer, "rev", "review PR #9", false, None).unwrap();
+
+    let roles = reg.session_roles();
+    let orch_role = roles.iter().find(|r| r.session_id == orch.session_id.clone().unwrap()).unwrap();
+    let rev_role = roles.iter().find(|r| r.session_id == rev.session_id.clone().unwrap()).unwrap();
+    assert_eq!(orch_role.branch, None, "the orchestrator works on the repo's own checkout, not a branch");
+    assert_eq!(rev_role.branch, None, "a reviewer with no worktree never had a branch of its own");
+    assert_eq!(rev_role.task, "review PR #9", "task text still surfaces even though branch does not");
+}
+
+#[test]
+fn session_roles_backfills_task_and_branch_from_the_spawn_audit_for_pre_roster_groups() {
+    // Graceful degrade (#1): a group whose agents.json predates this feature
+    // (or predates the roster entirely — the records_from_audit fallback)
+    // still surfaces task/branch by reading the spawn audit line directly,
+    // applying the SAME role-gated rule live spawns use so a legacy
+    // orchestrator row still never fabricates a branch.
+    let dir = tempfile::tempdir().unwrap();
+    let reg = OrchRegistry::new(dir.path().to_path_buf());
+    reg.set_port(46011);
+    let g = reg.create_group("C:/tmp/repo-legacy", rails()).unwrap();
+    let gdir = reg.state_root().join(&g.id);
+    let line = serde_json::json!({
+        "ts_ms": 5, "actor": "loomux", "action": "agent-spawn",
+        "detail": {
+            "agent": "w-9", "role": "worker", "name": "legacy-worker",
+            "cwd": "C:/tmp/repo-legacy", "worktree": false,
+            "branch": "agent/w-9", "task": "fix the old bug",
+            "session": "11111111-2222-4333-8444-555555555555",
+        }
+    });
+    fs::write(gdir.join("audit.jsonl"), format!("{line}\n")).unwrap();
+
+    let role = reg
+        .session_roles()
+        .into_iter()
+        .find(|r| r.session_id == "11111111-2222-4333-8444-555555555555")
+        .expect("backfilled from the audit line alone, no agents.json");
+    assert_eq!(role.task, "fix the old bug");
+    assert_eq!(role.branch.as_deref(), Some("agent/w-9"), "a worker's branch is trusted from the audit");
+}
+
+#[test]
 fn parse_audit_lines_is_ordered_and_skips_malformed() {
     let text = "\
 {\"ts_ms\":1,\"actor\":\"loomux\",\"action\":\"group-create\",\"detail\":{\"repo\":\"r\"}}
@@ -3275,6 +3366,8 @@ fn write_roster(reg: &OrchRegistry, group: &str, sessions: &[&str]) {
             cwd: ".".into(),
             status: "dead".into(),
             updated_ms: 0,
+            task: String::new(),
+            branch: None,
         })
         .collect();
     fs::write(
@@ -6782,6 +6875,45 @@ fn notify_optin_is_durable_across_restart() {
 }
 
 #[test]
+fn spawn_opens_minimized_exempts_only_the_orchestrator() {
+    // #260: every delegate role docks by default...
+    for role in [Role::Worker, Role::Reviewer, Role::Planner] {
+        assert!(spawn_opens_minimized(role, false), "{role:?} should dock by default");
+        assert!(!spawn_opens_minimized(role, true), "{role:?} must expand once the group opts out");
+    }
+    // ...but the orchestrator's own pane never does, even if a caller somehow
+    // passed `group_opted_expanded=false` for it (the exemption is unconditional,
+    // not just "expanded happens to be the group default").
+    assert!(!spawn_opens_minimized(Role::Orchestrator, false));
+    assert!(!spawn_opens_minimized(Role::Orchestrator, true));
+}
+
+#[test]
+fn spawn_expanded_optout_is_durable_across_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let gid;
+    {
+        let reg = OrchRegistry::new(dir.path().to_path_buf());
+        reg.set_port(46001);
+        let g = reg.create_group("C:/tmp/repo-spawn-expanded", watchdog_rails(0)).unwrap();
+        gid = g.id.clone();
+        assert!(!reg.spawn_expanded(&gid), "minimize-on-spawn is the default — nothing opted out yet");
+        reg.set_spawn_expanded(&gid, true).unwrap();
+        assert!(reg.spawn_expanded(&gid));
+    }
+    // A fresh registry over the same root re-seeds the opt-out from the marker.
+    let reg2 = OrchRegistry::new(dir.path().to_path_buf());
+    reg2.set_port(46001);
+    let g2 = reg2.create_group("C:/tmp/repo-spawn-expanded", watchdog_rails(0)).unwrap();
+    assert_eq!(g2.id, gid);
+    assert!(reg2.spawn_expanded(&gid), "the expand-instead-of-dock opt-out must survive a restart");
+
+    // Turning it back off (re-enabling minimize-on-spawn) removes the marker.
+    reg2.set_spawn_expanded(&gid, false).unwrap();
+    assert!(!reg2.spawn_expanded(&gid));
+}
+
+#[test]
 fn group_usage_summarizes_agents_with_null_cost_without_panes() {
     let (reg, _d, _co, _cw) = setup_mcp();
     let usage = reg.group_usage(&_co.group);
@@ -10053,6 +10185,37 @@ fn orch_channel_event_payloads_all_carry_the_channels_display_number() {
 
     let updated = channel_updated_event("chan-9", "w-1", 4, members);
     assert_eq!(updated["display_number"], json!(4), "got: {updated}");
+}
+
+#[test]
+fn delivery_held_event_names_the_pane_and_the_reason() {
+    // #246: the pane-header badge needs enough in the payload to say WHAT is
+    // held (the pty/agent) and WHY (the reason + a human-readable detail),
+    // and the two reasons must produce genuinely different copy — a badge
+    // that always said "held" with no distinction would fail the issue's
+    // "naming what's held and why" bar just as much as no badge at all.
+    let typing = delivery_held_event("w-1", "g-1", 7, HeldReason::Typing);
+    assert_eq!(typing["agent_id"], json!("w-1"), "got: {typing}");
+    assert_eq!(typing["group"], json!("g-1"), "got: {typing}");
+    assert_eq!(typing["pty_id"], json!(7), "got: {typing}");
+    assert_eq!(typing["reason"], json!("typing"), "got: {typing}");
+    assert!(typing["detail"].as_str().unwrap().contains("w-1"), "got: {typing}");
+
+    let occupied = delivery_held_event("w-1", "g-1", 7, HeldReason::BoxOccupied);
+    assert_eq!(occupied["reason"], json!("box-occupied"), "got: {occupied}");
+    assert_ne!(
+        delivery_held_detail("w-1", HeldReason::Typing),
+        delivery_held_detail("w-1", HeldReason::BoxOccupied),
+        "the two hold reasons must read differently to a human watching the pane"
+    );
+}
+
+#[test]
+fn delivery_held_cleared_event_carries_the_pty_the_badge_was_shown_on() {
+    // The frontend clears a pane's badge by pty_id alone (#246) — no agent_id
+    // needed since the badge was already keyed by pty when it was raised.
+    let cleared = delivery_held_cleared_event(7);
+    assert_eq!(cleared["pty_id"], json!(7), "got: {cleared}");
 }
 
 // ---------- display_number: reflects what's ACTUALLY connected (#271 follow-up) ----------
