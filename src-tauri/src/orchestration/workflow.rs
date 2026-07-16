@@ -1248,6 +1248,26 @@ pub fn gate_need(gate: &Gate) -> u32 {
     }
 }
 
+/// Reviewer ids a gate names that the given roster cannot actually spawn — either
+/// no block carries that id, or it exists under a different capability class
+/// (`kind` != reviewer). A gate's reviewers are validated against a workflow
+/// file's OWN blocks at parse time ([`parse_workflow`]), but the roster a live
+/// group spawns from can diverge from the file that armed its gate: a broken or
+/// absent `.loomux/workflow.yml` on a fresh launch keeps the group's last-known
+/// gate but resets `blocks` to [`default_roster`] (see `create_group`'s
+/// `merge-gate-retained` branch, and the live incident behind #316 — a gate
+/// naming `rev-orch`/`rev-ui`/`rev-tests` with the running registry offering only
+/// the built-in four, so `spawn_agent(block: "rev-orch")` failed with "unknown
+/// block" and the gate could never be satisfied from inside that session). Pure,
+/// so both the arm-time refusal and a live status read share one rule.
+pub fn gate_missing_blocks(gate: &Gate, blocks: &[Block]) -> Vec<BlockId> {
+    gate.reviewers
+        .iter()
+        .filter(|id| !blocks.iter().any(|b| &b.id == *id && b.kind == Role::Reviewer))
+        .cloned()
+        .collect()
+}
+
 /// The agent-capacity a declared workflow structurally needs (#255) — derived
 /// from its roster and its `merge` gate (if any), so the launcher can warn
 /// before a `max_agents` cap starves the workflow it just loaded rather than

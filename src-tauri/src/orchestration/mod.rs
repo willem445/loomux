@@ -89,6 +89,49 @@ pub fn idle_tick_notice() -> String {
         .to_string()
 }
 
+/// The three ways forward when a workflow merge gate refuses a merge (#316,
+/// scope point 3 — a human "Approve" grant never opens THIS gate, #197/#222, so
+/// a refusal must never leave the exit unnamed). Shared, word-for-word, between
+/// the Rust-side gate status (`gate_status_line`) and the shim's own refusal
+/// (`gh_shim_sh`'s `loomux_block_wf` — duplicated there since a shell template
+/// can't call into this constant, but kept in sync with it) so a human sees the
+/// identical three exits wherever the refusal surfaces.
+const GATE_REFUSAL_EXITS: &str = "Three ways forward: (1) get the named reviewer(s) to run and \
+     record a verdict, (2) have the human turn workflow mode off for this session (clears the \
+     gate), or (3) merge this PR from the GitHub UI, which is not gated.";
+
+/// One-line notice delivered to the orchestrator when the advanced-orchestrator
+/// (workflow-mode) toggle changes LIVE mid-session (#316), so it re-plans its
+/// spawn/review strategy without waiting to re-read its kickoff config. `on`
+/// carries the resolved workflow's name and its merge gate (if it declares
+/// one); off has neither — the built-in roster and no gate, by construction.
+pub fn workflow_mode_notice(on: bool, name: &str, gate: Option<&workflow::Gate>) -> String {
+    if !on {
+        return "[loomux] workflow mode changed: built-in roster, no merge gate — re-plan your \
+                spawn/review strategy."
+            .to_string();
+    }
+    let gate_clause = match gate {
+        Some(g) => {
+            let require = match g.require {
+                workflow::GateRequire::AllPass => "all of".to_string(),
+                workflow::GateRequire::Threshold(n) => format!("{n} of"),
+            };
+            let mut clause =
+                format!("merge gate requires {require} [{}]", g.reviewers.join(", "));
+            if !g.also.is_empty() {
+                clause.push_str(&format!(" · {}", g.also.join(", ")));
+            }
+            clause
+        }
+        None => "no merge gate declared".to_string(),
+    };
+    format!(
+        "[loomux] workflow mode changed: '{name}' active, {gate_clause} — re-plan your \
+         spawn/review strategy."
+    )
+}
+
 /// One-line notice delivered to the orchestrator when the auto-merge gate is
 /// toggled mid-session (#83), so it learns the new merge policy without waiting to
 /// re-read its kickoff config.
@@ -186,7 +229,7 @@ loomux_block() { # $1=reason $2=base $3=pr
 # a human grant, autonomous auto-merge and supervised dangerous mode all sit BELOW
 # it and none of them can open it. $1=reason (audit) $2=human-readable detail.
 loomux_block_wf() { # $1=reason $2=detail
-  printf '%s\n' "loomux: this repo's .loomux/workflow.yml declares a merge gate on PR #$num and it is NOT satisfied — $2. The merge is refused. Reviewers record their outcome with the review_verdict MCP tool (pass | fail | escalate); a fail/escalate from ANY named reviewer refuses the merge whatever the others said. Wait for the reviews, or take it to the human — do NOT work around this." >&2
+  printf '%s\n' "loomux: this repo's .loomux/workflow.yml declares a merge gate on PR #$num and it is NOT satisfied — $2. The merge is refused. Reviewers record their outcome with the review_verdict MCP tool (pass | fail | escalate); a fail/escalate from ANY named reviewer refuses the merge whatever the others said. Wait for the reviews, or take it to the human — do NOT work around this. Three ways forward: (1) get the named reviewer(s) to run and record a verdict, (2) have the human turn workflow mode off for this session (clears the gate), or (3) merge this PR from the GitHub UI, which is not gated." >&2
   loomux_audit "merge-gate-workflow-blocked" "{\"reason\":\"$1\",\"pr\":\"$num\"}"
   exit 1
 }
@@ -8972,6 +9015,236 @@ impl OrchRegistry {
         Ok(())
     }
 
+    /// Rewrite `guardrails.advanced_orchestrator` and `guardrails.blocks` in
+    /// group.json in place, preserving every other stored field — the same
+    /// crash-safe, additive patch `persist_max_agents` uses (#316's live
+    /// counterpart to the launch-time-only toggle). The two fields are patched
+    /// together in one atomic write because they change together on a live
+    /// toggle (a new roster arms a new gate; toggle-off restores the built-in
+    /// one) — a caller not changing the roster passes back its own current
+    /// `blocks`, which round-trips byte-for-byte, so the field is effectively
+    /// preserved on a flag-only change.
+    fn persist_advanced_orchestrator(
+        &self,
+        group: &str,
+        on: bool,
+        blocks: &[workflow::Block],
+    ) -> Result<(), String> {
+        let dir = self.group_dir(group);
+        let path = dir.join("group.json");
+        let mut v: Value = serde_json::from_str(&fs::read_to_string(&path).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+        // Guard the indexing so a corrupt-but-valid-JSON file (e.g. a `null`
+        // root) fails soft instead of panicking on assignment.
+        let obj = v.as_object_mut().ok_or("group.json root is not a JSON object")?;
+        match obj.get_mut("guardrails").and_then(Value::as_object_mut) {
+            Some(guard) => {
+                guard.insert("advanced_orchestrator".into(), json!(on));
+                guard.insert("blocks".into(), blocks_json(blocks));
+            }
+            None => {
+                obj.insert("guardrails".into(), json!({
+                    "advanced_orchestrator": on,
+                    "blocks": blocks_json(blocks),
+                }));
+            }
+        }
+        // Crash-safe write: group.json is identity-critical — a half-written
+        // file breaks the rejoin path ("group.json is missing") — so never
+        // expose a truncated version (#133).
+        let body = serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?;
+        atomic_write(&path, body.as_bytes()).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Live setter for the advanced-orchestrator toggle (#316), modeled EXACTLY
+    /// on `set_max_agents`/`set_autonomous`: persist-first group.json patch,
+    /// in-memory swap, audit, and a `[loomux] workflow mode changed …` notice to
+    /// the orchestrator via the existing `deliver_to_orchestrator` — no new
+    /// delivery path. Unlike the launch-time-only toggle this field started as
+    /// (#222), this is now a LIVE property of the running session.
+    ///
+    /// Turning it ON arms the merge gate via the identical `load_workflow` +
+    /// `sync_merge_gate` sequence a fresh launch runs (`create_group`'s `Fresh`
+    /// arm); turning it OFF clears the gate and restores the built-in roster.
+    /// The gate is scoped to the CURRENT SESSION, not to any one PR's
+    /// provenance — see `doc/design/workflows.md`, "a gate lives and dies with
+    /// the toggle that authorized it" — so toggling OFF opens even a PR built
+    /// earlier under workflow mode, and toggling back ON re-arms it.
+    ///
+    /// **ON refuses** rather than arming anything when the repo declares no
+    /// workflow file at all (`Ok(None)` — nothing for a *live* toggle to switch
+    /// into; unlike a launch, where "no file" is a legitimate no-op) or when the
+    /// file is broken (`Err`) — don't arm a gate for a roster that could not be
+    /// resolved. **ON with a gate naming reviewers the resolved roster cannot
+    /// spawn arms anyway** (never silently widens by dropping the gate — the
+    /// same fail-loud rule `merge-gate-retained` exists for) but reports
+    /// `satisfiable: false` and audits `merge-gate-unsatisfiable` (#316's second
+    /// stance: never silently arm a gate this session cannot satisfy).
+    ///
+    /// **Live delegates already spawned are NOT re-personaed.** The roster swap
+    /// applies only to FUTURE spawns — the consent model says a delegate's
+    /// persona may never change under a human who already approved it, and
+    /// while a live toggle IS a fresh consent moment (the human sees the roster
+    /// and clicks), that consent only covers agents spawned *after* it.
+    ///
+    /// Returns the resulting [`Self::workflow_status`] — the same shape
+    /// `orch_workflow_status` reads, so the toggle's own confirm and a later
+    /// status poll can never disagree.
+    pub fn set_advanced_orchestrator(&self, group: &str, on: bool, actor: &str) -> Result<Value, String> {
+        let info = self.group(group).ok_or("unknown group")?;
+        if on == info.guardrails.advanced_orchestrator {
+            return Ok(self.workflow_status(group));
+        }
+
+        let mut guardrails = info.guardrails.clone();
+        let mut gate: Option<workflow::Gate> = None;
+        let mut name = String::new();
+        // Captured at load time, emitted only once the persist below actually
+        // succeeds (rev-24 N2) — auditing "workflow-loaded" before the write
+        // that makes it stick would leave a stray audit line claiming a load
+        // that never took effect if `persist_advanced_orchestrator` then fails.
+        let mut loaded_audit: Option<Value> = None;
+
+        if on {
+            match workflow::load_workflow(&info.repo) {
+                Ok(Some(wf)) => {
+                    loaded_audit = Some(json!({
+                        "path": workflow::WORKFLOW_PATH,
+                        "name": wf.name,
+                        "blocks": wf.blocks.iter().map(|b| json!({ "id": b.id, "kind": b.kind })).collect::<Vec<_>>(),
+                        "gates": wf.gates.keys().collect::<Vec<_>>(),
+                    }));
+                    name = wf.name.clone();
+                    gate = wf.gates.get("merge").cloned();
+                    guardrails.blocks = wf.blocks;
+                    guardrails = guardrails.clamped();
+                }
+                Ok(None) => {
+                    return Err(format!(
+                        "{} declares no {} — there is nothing for a live workflow-mode toggle to arm. \
+                         Add the file, or leave the toggle off.",
+                        info.repo,
+                        workflow::WORKFLOW_PATH
+                    ));
+                }
+                Err(errors) => {
+                    return Err(format!(
+                        "{}'s {} is invalid, so the workflow-mode toggle refuses to arm a roster it \
+                         could not load: {}",
+                        info.repo,
+                        workflow::WORKFLOW_PATH,
+                        errors.join("; ")
+                    ));
+                }
+            }
+        } else {
+            // Toggle-OFF roster restore: rebuild the built-in four-block roster
+            // from the group's default agent_cli — `clamped()` on an empty
+            // roster does exactly this. Per-role CLI overrides chosen at launch
+            // are not separately persisted today, so this restores the
+            // default-CLI roster, not necessarily the group's original one.
+            guardrails.blocks = Vec::new();
+            guardrails = guardrails.clamped();
+        }
+        guardrails.advanced_orchestrator = on;
+
+        // Persist first: a failed disk write must leave the in-memory
+        // roster/flag (what enforcement reads) unchanged, so the two never
+        // disagree — same discipline as `set_max_agents`.
+        self.persist_advanced_orchestrator(group, on, &guardrails.blocks)?;
+        {
+            let mut groups = self.groups.lock_safe();
+            let g = groups.get_mut(group).ok_or("unknown group")?;
+            g.guardrails.blocks = guardrails.blocks.clone();
+            g.guardrails.advanced_orchestrator = on;
+        }
+        // Only now that the persist succeeded — see `loaded_audit`'s doc above.
+        if let Some(detail) = loaded_audit {
+            self.audit(group, "loomux", "workflow-loaded", detail);
+        }
+
+        // Arm/clear the merge gate through the SAME path a fresh launch runs
+        // (`sync_merge_gate`): `Some` writes the spec file the shim reads,
+        // `None` removes it. On OFF, `gate` is still `None` here, so this
+        // clears whatever was armed.
+        self.sync_merge_gate(group, gate.as_ref());
+        if let Some(g) = &gate {
+            let missing = workflow::gate_missing_blocks(g, &guardrails.blocks);
+            if !missing.is_empty() {
+                self.audit(group, "loomux", "merge-gate-unsatisfiable", json!({
+                    "missing_blocks": missing,
+                    "reason": "the resolved roster cannot spawn every reviewer this gate names",
+                }));
+            }
+        }
+
+        self.audit(
+            group,
+            actor,
+            if on { "advanced-orchestrator-on" } else { "advanced-orchestrator-off" },
+            json!({}),
+        );
+        let _ =
+            self.deliver_to_orchestrator(group, &workflow_mode_notice(on, &name, gate.as_ref()), "loomux");
+
+        Ok(self.workflow_status(group))
+    }
+
+    /// The group's current workflow-mode status (#316) — the single derivation
+    /// both `orch_workflow_status` and `set_advanced_orchestrator`'s return
+    /// value use, so the lifecycle UI and the toggle's own confirm can never
+    /// disagree.
+    ///
+    /// `blocks` and `gate` are read from the group's PERSISTED/in-memory state
+    /// (the roster + the synced `merge_gate` spec file) — pinned at
+    /// launch/toggle and never silently re-read from the repo's workflow file,
+    /// the same consent rule `create_group`'s resume arm documents. `name` is a
+    /// live, best-effort, DISPLAY-ONLY read of the repo's current workflow file
+    /// (like `orch_workflow_preview`) — cosmetic, never a source of enforcement.
+    /// `gate.satisfiable`/`missing_blocks` are recomputed fresh against the
+    /// CURRENT roster on every call, never cached from whenever the gate was
+    /// armed, so a roster that later regains (or loses) a named reviewer shows
+    /// up on the very next read without another toggle.
+    #[doc(hidden)] // pub for integration tests
+    pub fn workflow_status(&self, group: &str) -> Value {
+        let info = self.group(group);
+        let guardrails = info.as_ref().map(|g| g.guardrails.clone()).unwrap_or_default();
+        let name = if guardrails.advanced_orchestrator {
+            info.as_ref()
+                .and_then(|g| workflow::load_workflow(&g.repo).ok().flatten())
+                .map(|wf| wf.name)
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let gate = self.merge_gate(group).map(|g| {
+            let missing = workflow::gate_missing_blocks(&g, &guardrails.blocks);
+            json!({
+                "require": match g.require {
+                    workflow::GateRequire::AllPass => "all-pass".to_string(),
+                    workflow::GateRequire::Threshold(n) => format!("threshold {n}"),
+                },
+                "reviewers": g.reviewers,
+                "also": g.also,
+                "satisfiable": missing.is_empty(),
+                "missing_blocks": missing,
+            })
+        });
+        json!({
+            "advanced": guardrails.advanced_orchestrator,
+            "name": name,
+            "blocks": guardrails.blocks.iter().map(|b| json!({
+                "id": b.id,
+                "kind": b.kind.as_str(),
+                "cli": b.cli,
+                "model": b.model,
+                "persona": b.has_persona(),
+            })).collect::<Vec<_>>(),
+            "gate": gate,
+        })
+    }
+
     /// Deliver any debounced cap-change notice whose quiet window has elapsed
     /// (#79). Called on a timer by `start_max_notice_flusher`; `now` is injected
     /// so tests drive the coalescing deterministically without sleeping out the
@@ -10591,7 +10864,8 @@ impl OrchRegistry {
         let Some(gate) = self.merge_gate(group) else {
             return Some(format!(
                 "merge gate for PR #{pr}: the group's merge_gate file is MALFORMED — every merge \
-                 is refused until it is fixed (repair .loomux/workflow.yml and relaunch the group)."
+                 is refused until it is fixed (repair .loomux/workflow.yml and relaunch the group). \
+                 {GATE_REFUSAL_EXITS}"
             ));
         };
         let repo = self.group(group).map(|g| g.repo).unwrap_or_default();
@@ -10625,19 +10899,19 @@ impl OrchRegistry {
             workflow::GateOutcome::Blocked { blocking } => format!(
                 "merge gate for PR #{pr}: BLOCKED — {} recorded a fail/escalate verdict. A \
                  blocking verdict beats any number of passes; the PR must be fixed and \
-                 re-reviewed.",
+                 re-reviewed. {GATE_REFUSAL_EXITS}",
                 blocking.join(", ")
             ),
             workflow::GateOutcome::Short { passes, need, outstanding, stale } => format!(
                 "merge gate for PR #{pr}: NOT YET SATISFIED — {passes} of {need} required PASS \
                  verdicts cover the PR's current head; still waiting on {}. `gh pr merge` is \
-                 refused until then.{also}",
+                 refused until then.{also} {GATE_REFUSAL_EXITS}",
                 waiting(&outstanding, &stale)
             ),
             workflow::GateOutcome::UnknownRevision => format!(
                 "merge gate for PR #{pr}: loomux cannot resolve the PR's current head commit, so \
                  it cannot tell whether the recorded verdicts reviewed the code that would merge. \
-                 The merge is refused until it can."
+                 The merge is refused until it can. {GATE_REFUSAL_EXITS}"
             ),
         })
     }
@@ -13162,6 +13436,33 @@ pub fn orch_group_summary(reg: tauri::State<Arc<OrchRegistry>>, group_id: String
 #[tauri::command]
 pub fn orch_group_watches(reg: tauri::State<Arc<OrchRegistry>>, group_id: String) -> Value {
     reg.group_watches(&group_id)
+}
+
+/// LIVE advanced-orchestrator toggle (#316), reached from the groupview button
+/// (Slice C) — human action, not agent-triggered. Arms/clears the merge gate and
+/// swaps the roster for FUTURE spawns; see `OrchRegistry::set_advanced_orchestrator`
+/// for the full contract (refusals, satisfiability, the consent boundary on live
+/// delegates). Returns the resulting workflow status — the same shape
+/// `orch_workflow_status` reads.
+#[tauri::command]
+pub fn orch_set_advanced_orchestrator(
+    reg: tauri::State<Arc<OrchRegistry>>,
+    group_id: String,
+    on: bool,
+) -> Result<Value, String> {
+    reg.set_advanced_orchestrator(&group_id, on, "human")
+}
+
+/// The group's current workflow-mode status for the lifecycle UI (Slice C):
+/// whether advanced-orchestrator is on, the resolved roster, and the armed merge
+/// gate (with a freshly-recomputed `satisfiable`/`missing_blocks`, #316's
+/// satisfiability guarantee) — `{ advanced, name, blocks: [{id,kind,cli,model,
+/// persona}], gate: {require,reviewers,also,satisfiable,missing_blocks} | null }`.
+/// A slower, separate read from `orch_group_summary` (polled hot) — fetched on
+/// group open/refresh and after the toggle notice, like `orch_group_watches`.
+#[tauri::command]
+pub fn orch_workflow_status(reg: tauri::State<Arc<OrchRegistry>>, group_id: String) -> Value {
+    reg.workflow_status(&group_id)
 }
 
 // ---------- cross-workspace channels (#271): human-only connect/disconnect ----------
