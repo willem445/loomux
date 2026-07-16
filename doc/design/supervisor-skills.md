@@ -1,12 +1,11 @@
 # Supervisor/advisor agent + skills feedback loop
 
 Issues #250 (advisor/supervisor) and #324 (skills feedback loop), converged
-into one aggregate design on `feat/250-324-supervisor-skills`. This note is a
-**stub**: it covers only the foundation slice (A) that landed first — the
-`role_hint` block field and the decision it rests on. The later slices
-(session digest, personas/templates, process-pro wiring, the optional
-push-nudge) extend this note in place as they land; see the plan comment on
-issue #250 for the full breakdown.
+into one aggregate design on `feat/250-324-supervisor-skills`. This note
+covers the foundation slice (A, the `role_hint` field) and the persona/
+template slice (C) that render off it. The remaining slices (session digest,
+process-pro wiring, the optional push-nudge) extend this note in place as
+they land; see the plan comment on issue #250 for the full breakdown.
 
 ## The decision: new *blocks*, not new *Roles*
 
@@ -92,20 +91,67 @@ so the consent moment can name it.
   declares it. The launcher roster preview is the consent moment — no new
   global switch.
 
+## Personas + template fragments (slice C)
+
+Two default personas, both `mode: replace` (no `model:` — the block pins it,
+per the module docs in `profiles.rs`):
+
+- **`.github/agents/advisor.md`** — read-only, consulted on demand. Reports
+  advice via `report("done", ...)` and exits; never merges, spawns, or
+  records a verdict.
+- **`.github/agents/process.md`** — reviews one finished session cold via the
+  `session_digest` MCP tool (referenced by name; stable regardless of slice
+  B's internals), filters findings through "would a fresh worker on a
+  different task hit the same wall?", and categorizes each durable learning
+  into the four destinations from the table below. Opens a normal PR and
+  stops — the same human merge gate as any other worker.
+
+Neither file is loaded automatically by `role_hint` — a block still opts in
+via `profile: .github/agents/advisor.md` in `workflow.yml`, exactly like any
+other persona. `role_hint` drives three things *independent of which persona
+file (if any) a block uses*:
+
+1. **`mechanics_core(kind, role_hint)`** — the non-overridable core a `mode:
+   replace` persona always gets now carries a role_hint-keyed addendum: an
+   advisor-hinted planner still hears "you hold NO authority… you never
+   merge, spawn, or record a verdict" even if its own replace persona forgot
+   to say so; a process-hinted worker still hears "that PR rides the same
+   human merge gate… you never merge it." Mirrors how the reviewer's verdict
+   duty already rides in the core so a replace persona can't drop it.
+2. **`ADVISOR_NOTE` / `PROCESS_NOTE`** (`templates/workflow.md`, rendered into
+   the orchestrator's `{{WORKFLOW}}`) — line-final fragments, present only
+   when the roster declares the matching `role_hint`, teaching the
+   orchestrator how to spawn a consult (`spawn_agent(block: "<id>", task:
+   "<question>")`) or a post-merge process-pro run.
+3. **`ADVISOR_CONSULT_NOTE`** (`templates/worker.md`) — a line-final fragment
+   telling every worker it can `message_orchestrator` to request a consult
+   when the roster declares an advisor block; a worker cannot spawn the
+   advisor itself.
+
+All three are byte-empty when the hint they key on is absent — a golden test
+(`advisor_and_process_prose_stays_silent_unless_a_block_declares_the_hint`)
+pins that a fully custom roster with no `role_hint` block renders no mention
+of "consult" or "process-pro" anywhere, and the existing
+`tests/fixtures/pre222/*` byte-golden needed no re-bless: the rendered text
+for a hint-free group is unchanged. The one thing that *did* need updating
+was the placement-pin test itself (`worker.md` now chains two placeholders,
+`{{BLOCK_NOTE}}{{ADVISOR_CONSULT_NOTE}}`, on the one line the old single-key
+check didn't anticipate — the same chaining `block.md`'s `PERSONA_NOTE`/
+`LANE_NOTE`/`GATE_NOTE` already relies on).
+
 ## Slices (see the plan comment on #250 for the full breakdown)
 
-- **A — role_hint foundation** (this note's current scope): the field, its
-  parse-time validation, the capability-closure proof, and the launcher
-  preview/roster chip. Landed first; everything else rebases onto it.
+- **A — role_hint foundation**: the field, its parse-time validation, the
+  capability-closure proof, and the launcher preview/roster chip. Landed
+  first; everything else rebases onto it.
 - **B — session digest** (parallel with A): the `session_digest` MCP tool and
   the friction-window extractor that normalizes Claude/Copilot transcripts.
-- **C — personas/templates**: `.github/agents/advisor.md` /
-  `.github/agents/process.md`, the workflow-conditional prose in
-  `templates/orchestrator.md`/`worker.md`, and the `mechanics_core` addendum
-  keyed off `role_hint`.
-- **D — process-pro wiring**: the orchestrator prose that spawns a `process`
-  block after a merge, and the end-to-end demo of a proposed skills/lessons
-  PR.
+- **C — personas/templates** (this note's newest scope, above): the default
+  advisor/process personas, the workflow-conditional prose, and the
+  `mechanics_core` addendum keyed off `role_hint`.
+- **D — process-pro wiring**: the end-to-end demo of a merge triggering a
+  process-pro spawn and a proposed skills/lessons PR, plus confirming the
+  `gh` shim refuses a merge from that pane.
 - **E — supervisor push-nudge** (optional): a deterministic, LLM-free
   audit-tail watcher that nudges the orchestrator toward a consult on a
   friction signature.
@@ -117,9 +163,22 @@ injected at orchestrator kickoff, with no auto-extraction and no retrospective
 agent ("a human or an agent edits the file like any other"). #324's
 process-pro is the agent #268 anticipated: it extends the substrate, it does
 not replace or duplicate it. It categorizes a learning and routes it to the
-destination that already exists for that shape (a one-off quirk to
-`lessons.md`, a reusable procedure to `.claude/skills/<name>/SKILL.md`, an
-always-true rule to `CLAUDE.md`/`AGENTS.md`, a persona tweak to
-`.github/agents/<block>.md`) — always via a normal, human-gated PR. The full
-routing table and the "would a fresh worker on a different task hit the same
-wall?" durability test land with slice D.
+destination that already exists for that shape, always via a normal,
+human-gated PR — there is no loomux "skills injection" runtime to feed; every
+destination below is loaded natively by the tool that reads it:
+
+| Learning shape | Destination | Loaded by |
+|---|---|---|
+| One-off repo quirk, prose | append `.loomux/lessons.md` | loomux, injected at orchestrator kickoff (#268) |
+| Reusable, invokable procedure | new `.claude/skills/<name>/SKILL.md` | the Claude CLI, natively |
+| Always-true rule / convention | patch `CLAUDE.md` / `AGENTS.md` | Claude / Copilot, natively |
+| Persona / lane tweak | patch `.github/agents/<block>.md` | the block that references it |
+
+`.loomux/lessons.md` is a small rolling buffer (capped, oldest-drop) with no
+structure and nothing invokable — right for a one-line quirk, wrong for a
+growing procedure or a rule that must never age out. This table (and the
+"would a fresh worker on a different task hit the same wall?" durability
+filter) already ships as `.github/agents/process.md`'s own prose (slice C);
+what slice D adds is the end-to-end run — an actual merge triggering a
+process-pro spawn, reading real GitHub ground truth, and opening a real
+skills/lessons PR.
