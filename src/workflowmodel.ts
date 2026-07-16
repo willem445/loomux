@@ -66,10 +66,16 @@ export type RoleHint = (typeof ROLE_HINTS)[number];
 
 /** The capability class a role_hint REQUIRES, or `undefined` for an unrecognized
  *  value — the caller turns that into a `role-hint-unknown` finding, the same
- *  "reject, never coerce" shape `isBlockKind` uses for `kind`. */
+ *  "reject, never coerce" shape `isBlockKind` uses for `kind`.
+ *
+ *  Trims and lowercases before comparing, to match the backend's
+ *  `role_hint_requires` (`raw.trim().to_ascii_lowercase()`, workflow.rs) — a file
+ *  with `role_hint: Advisor` parses clean on the real engine, and this pane's
+ *  pre-run validation pass must not disagree and flag it as unknown. */
 export function roleHintRequires(hint: string): BlockKind | undefined {
-  if (hint === "advisor") return "planner";
-  if (hint === "process") return "worker";
+  const h = hint.trim().toLowerCase();
+  if (h === "advisor") return "planner";
+  if (h === "process") return "worker";
   return undefined;
 }
 
