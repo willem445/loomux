@@ -740,3 +740,7 @@ are stated, without drifting from what was actually agreed:
   the contract above; if it needs a capability, method, or event this note
   doesn't already grant, that is this note being wrong, not a shortcut to
   take silently — it comes back here for a reviewed addition.
+
+A bundled example plugin (the resource monitor) lives at
+`src-tauri/resources/plugins/resource-monitor/` and ships already installed
+(#360 Slice F).
