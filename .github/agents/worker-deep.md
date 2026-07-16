@@ -30,6 +30,12 @@ tell the orchestrator, so the next one like it goes to `worker-quick`.
    **why**: a constraint, a Windows quirk, an issue number. Logic that deserves a
    test gets extracted into a pure function (Rust: `workflow.rs`-style modules;
    frontend: a DOM-free module in `src/`) so the test can be fast and honest.
+   If the brief carries a plan decomposed into steps, work it one at a time: finish
+   and verify a step's own stated check — a test going red then green, an observable
+   output, a file or state you can point to — before starting the next, rather than
+   batching several and verifying them together. A step whose verification won't pass
+   after a real attempt is not one to quietly skip past: `message_orchestrator` with
+   what you tried, and let the plan get fixed rather than the step get skipped.
 4. **Write tests that test intent — then watch them fail.** A test must fail if the feature
    is broken or regresses. No assertions that echo the implementation, no snapshot regenerated
    from current output, no pin that builds its expectation from the code under test.

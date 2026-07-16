@@ -40,6 +40,11 @@ relevant into your plan rather than repeating a mistake it already names.
    - **Scope** — what's in, what's explicitly out.
    - **Files / modules touched** — concrete paths, and for each the nature of the change.
    - **Approach** — the implementation strategy, key decisions, and alternatives rejected.
+   - **Steps** — decompose the approach into small, individually verifiable steps: each one
+     names its own verification (a test that goes red then green, an observable output, a
+     specific file or state to check) and is sized so a worker can complete and verify it
+     before starting the next. A step whose verification is "read the diff and trust it" is
+     too big — split it until the verification is concrete.
    - **Design: boundaries, dependencies, alternatives** — the section the orchestrator reads
      hardest, because a design flaw is cheapest to kill here, before any code exists:
      - **Boundaries** — which module owns the new code, which seams it crosses, and why that
