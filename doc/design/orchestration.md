@@ -1738,6 +1738,29 @@ Two related additions: a **planner** role, and **per-role** agent CLI + model.
       the human's report was that this assumption is false (the dialog does reappear, or
       autopilot isn't restored), so a resumed kickoff now confirms exactly like a fresh boot
       does.
+
+    - **Accepted tradeoff: the solo watcher's wider false-positive window (#364 review, N1).**
+      The group path's confirm only ever watches for `AUTOPILOT_DIALOG_WAIT` (12s), starting
+      right after loomux's own deterministic kickoff Enter — a narrow window with almost no
+      chance of a stray match. The solo watcher (`confirm_solo_copilot_autopilot`) instead polls
+      the HUMAN's live terminal for up to `SOLO_AUTOPILOT_DIALOG_WAIT` (10 minutes) after spawn,
+      because the dialog-triggering submit is the human's own first message and there is no
+      lower bound on how long that takes. For the whole 10 minutes, ANY output in that pane that
+      happens to contain both `copilot_autopilot_prompt_detected` anchor substrings (case-
+      insensitively: "enable autopilot mode" and "enable all permissions" — e.g. the human
+      pastes prose describing the dialog, or an agent reply happens to quote both phrases) would
+      trigger loomux to inject an unsolicited `Enter` into that pane. This is a strictly wider
+      false-positive blast radius than the group path ever had, and it is an **accepted cost**
+      of AC#1 (a single pane must not launch into true autopilot mode with nothing able to
+      answer its dialog) — not an oversight. The detector itself (`copilot_autopilot_prompt_detected`)
+      is deliberately NOT being tightened in response: it cannot be re-validated against a live
+      Copilot build in an agent session (CLAUDE.md constraint 3), and a tighter match that
+      starts *missing* the real dialog is strictly worse than an occasional spurious Enter — a
+      missed dialog leaves the pane silently stuck at "Continue with limited permissions"
+      instead of true autopilot, while a spurious Enter is at most a wasted keystroke the human
+      notices and can redo. Human live-validation for this PR should include watching for a
+      spurious Enter landing in the solo pane during the watch window, not just confirming the
+      real dialog gets answered.
     Previously a planner in a **non-auto_ops** group got the interactive preset (`acceptEdits`
     with no git/gh allowlist on Claude; plain interactive mode with no allow-all on Copilot),
     so its very first `gh`/explore call would have prompted into the void — a latent deadlock
