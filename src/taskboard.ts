@@ -74,16 +74,52 @@ export function doneCount(tasks: readonly HasStatus[]): number {
   return tasks.reduce((n, t) => (t.status === DONE_STATUS ? n + 1 : n), 0);
 }
 
-/** The row-level accent a task's status gets on the board (#339): `queued`
- *  is deliberately un-accented (nothing to highlight, it's waiting its turn)
- *  and the human-gated statuses already get `isAwaitingHuman`'s amber — this
- *  covers the two left uncovered. `in-progress`/`review` pick up the exact
- *  accent color their own status pill already uses, so the row itself reads
- *  as "currently moving" at a glance instead of only the small pill text;
- *  `done` dims a settled task out of the way so it recedes behind what's
- *  still active. Returns the status verbatim (it doubles as the CSS
- *  modifier the caller appends), or null for no extra treatment. */
-export function taskRowAccentClass(status: string): "in-progress" | "review" | "done" | null {
-  if (status === "in-progress" || status === "review" || status === DONE_STATUS) return status;
+/** Statuses where an assignee is actually doing something right now, as
+ *  opposed to `queued` (nothing assigned yet) or the human-gated statuses
+ *  `isAwaitingHuman` already covers. */
+const WORKING_STATUSES = new Set(["in-progress", "review"]);
+
+/** The board's single source of truth for "is this task actually being
+ *  worked on right now" (#339 refinement). The first cut of this highlight
+ *  keyed off status alone, and a human live-testing it found the exact gap
+ *  that leaves: an old assignee chip left over from a killed, resumed, or
+ *  reassigned session read as indistinguishable from a live agent currently
+ *  at the keyboard. So a working-status task is `"active"` ONLY when its
+ *  assignee is in the caller's live-agent set (from the group's own agent
+ *  roster, e.g. `groupSummary()`'s `agents` list) — otherwise it's `"idle"`:
+ *  assigned, working-status, but nobody is actually there, which must never
+ *  be visually confused with real active work. `done` always reads as
+ *  settled regardless of assignee/liveness. Everything else (queued, and the
+ *  human-gated statuses `isAwaitingHuman` covers) is untouched here — `null`. */
+export type TaskActivity = "active" | "idle" | "done" | null;
+export function taskActivityState(
+  status: string,
+  assignee: string | null | undefined,
+  liveAgentIds: ReadonlySet<string>
+): TaskActivity {
+  if (status === DONE_STATUS) return "done";
+  if (WORKING_STATUSES.has(status)) {
+    return assignee && liveAgentIds.has(assignee) ? "active" : "idle";
+  }
   return null;
+}
+
+/** The status a task moves to when changes are requested on it (#339
+ *  refinement): back to a working state, never left sitting at `pr`/
+ *  `human-testing` where the merge-gate Approve button would still show
+ *  despite a human having just asked for changes — the board must not imply
+ *  reopened work is ready. Reusing `in-progress` (rather than inventing a
+ *  distinct sub-state) keeps this a plain status transition: `canApprove`
+ *  below already excludes it, so nothing else has to remember to hide the
+ *  button separately. */
+export const REQUEST_CHANGES_STATUS = "in-progress";
+
+/** Whether the board's merge-gate actions (Approve & allow merge / Changes)
+ *  should show for a task's current status (#339 refinement — pins what was
+ *  previously an inline condition in tasksview.ts). Only `pr`/`human-testing`
+ *  are the human's actual decision points; once a status moves off either
+ *  (whether via `REQUEST_CHANGES_STATUS` above or a fresh review cycle
+ *  landing), the gate closes on its own. */
+export function canApprove(status: string): boolean {
+  return status === "pr" || status === "human-testing";
 }

@@ -144,8 +144,11 @@ Board controls:
 - **Merge gate** — when an item reaches `pr` or `human-testing` (the point where
   only you can decide), the board shows **✓ Approve** (marks it done and tells
   the orchestrator to merge) and **✎ Changes** (opens a box for your findings,
-  records them, and routes them back to a worker). Both land as a message in the
-  orchestrator pane, exactly as if you'd typed it.
+  records them, and reopens the task — see below). Both land as a message in the
+  orchestrator pane, exactly as if you'd typed it. **Approve only ever shows for
+  `pr`/`human-testing`**: once you request changes, the task returns to a working
+  status and Approve disappears with it, so a reopened item can never keep
+  showing a stale "approve" affordance for feedback you already sent back.
 - **▶ Proceed** on a `prototype` item (a demo-gated deliverable awaiting your
   verdict) promotes it: two-click confirm flips it to `in-progress`, records
   your decision, and prompts the orchestrator to take the prototype to a full
@@ -154,11 +157,24 @@ Board controls:
 - **🗑 selected (N)** deletes exactly the rows you tick, by id, in one action.
 
 Items that only you can advance (`pr`, `human-testing`, `blocked`) are
-highlighted so what's waiting on you stands out; `in-progress` and `review`
-items get their own accent (matching the status pill's color) so currently
-active work is legible at a glance, and `done` items dim so they recede behind
-what's still moving. The assignee chip (the agent id currently on a task) has
-its own tint too, distinct from the neutral issue/PR/session chips.
+highlighted so what's waiting on you stands out. A working-status item
+(`in-progress`/`review`) is one of two things, and the board makes the
+difference unmistakable rather than subtle:
+
+- **Active** — its assignee is an agent that's actually live right now. The row
+  gets a bold, glowing, gently pulsing treatment and a **"● ACTIVE — \<agent
+  id\>"** badge — the first thing your eye should land on. This is deliberately
+  the loudest state on the board.
+- **Idle** — the status still says `in-progress`/`review`, but the assignee
+  isn't a currently-live agent (its pane was killed, or it's an older session).
+  The row reads as muted, not active — an idle/stalled assignment can never be
+  confused with real live work.
+
+The assignee chip itself carries the same distinction: a **live** agent gets its
+own blue tint, while a **history** chip (an assignee that isn't currently live)
+reads dimmed and in italics — so an old assignee on a done, reopened, or stalled
+task never looks like the same agent is still sitting there. `done` items dim
+further still, receding behind whatever's still active.
 
 ## Steering, attention, and audit
 

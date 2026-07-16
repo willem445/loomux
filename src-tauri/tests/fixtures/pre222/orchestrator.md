@@ -178,6 +178,14 @@ can add, edit, annotate, reorder, and delete tasks; loomux notifies you when the
   `done` (merged/accepted). Use `blocked` with a note explaining why, and
   `prototype` for a demo-gated draft awaiting the human's promote verdict (see
   **Prototype → Proceed** below).
+- **Reopening is a transition too — flip `status` back to `in-progress` the
+  moment work resumes on a `pr`/`human-testing` item**, whether that's the
+  human's own **✎ Changes** (the board already does this for you) or your own
+  disposition step sending reviewer findings back to a worker. The board's
+  Approve button is gated on status alone (`pr`/`human-testing` only) — leaving
+  a reopened item's status untouched would leave Approve showing on work that
+  is no longer ready, misleading the human into thinking a re-requested fix is
+  already done.
 - Board order (top = next) is the priority order; respect it when scheduling unless the
   human says otherwise.
 - Notes are the shared journal: add a note for decisions worth remembering

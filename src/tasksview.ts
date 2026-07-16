@@ -8,8 +8,17 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { swapIfConnected } from "./domutil";
-import { canProceed, doneCount, isAwaitingHuman, retainExisting, STATUSES, taskRowAccentClass } from "./taskboard";
-import { approveTask } from "./orchestration";
+import {
+  canApprove,
+  canProceed,
+  doneCount,
+  isAwaitingHuman,
+  REQUEST_CHANGES_STATUS,
+  retainExisting,
+  STATUSES,
+  taskActivityState,
+} from "./taskboard";
+import { approveTask, groupSummary } from "./orchestration";
 import { normalizeComment } from "./autonomy";
 
 export interface OrchTaskNote {
@@ -51,6 +60,12 @@ export class TasksView {
   private toastEl: HTMLElement;
   private toastTimer: number | undefined;
   private tasks: OrchTask[] = [];
+  /** Ids of the group's currently-live agents (#339 refinement) — an
+   *  assignee not in this set reads as history, not active work, however
+   *  recently its task was touched. Refreshed alongside `tasks`; best-effort
+   *  (an empty set just means everything reads as idle until the next
+   *  successful refresh, never a broken board). */
+  private liveAgentIds = new Set<string>();
   /** Task ids with their notes section expanded (survives re-renders). */
   private expanded = new Set<string>();
   /** Task ids the human has ticked for batch delete. Frontend-only, so it's
@@ -183,6 +198,15 @@ export class TasksView {
     } catch (err) {
       this.toast(String(err));
       return;
+    }
+    try {
+      const summary = await groupSummary(this.groupId);
+      this.liveAgentIds = new Set(summary.agents.map((a) => a.id));
+    } catch {
+      // Best-effort enrichment, not core data: the board still renders on
+      // the tasks alone, just with every assignee reading as history until
+      // the next successful refresh — never a broken board over this.
+      this.liveAgentIds = new Set();
     }
     // Drop any ticked rows that vanished from the board (orchestrator edit,
     // another delete) so the "delete selected" count can't outlive its rows.
@@ -363,8 +387,13 @@ export class TasksView {
         return;
       }
       close();
+      // Record the findings, then reopen the task as working (#339
+      // refinement) — state honesty: the board must never keep showing the
+      // Approve button on a task that just had changes requested on it.
       void this.mutate(
-        invoke("orch_request_changes", { groupId: this.groupId, id: t.id, findings })
+        invoke("orch_request_changes", { groupId: this.groupId, id: t.id, findings }).then(() =>
+          invoke("orch_upsert_task", { groupId: this.groupId, id: t.id, status: REQUEST_CHANGES_STATUS })
+        )
       );
     };
     cancel.addEventListener("click", close);
@@ -398,8 +427,8 @@ export class TasksView {
   private renderTask(t: OrchTask, index: number): HTMLElement {
     const row = el("div", "task-row");
     if (isAwaitingHuman(t.status)) row.classList.add("awaiting-human");
-    const accent = taskRowAccentClass(t.status);
-    if (accent) row.classList.add(`task-row-${accent}`);
+    const activity = taskActivityState(t.status, t.assignee, this.liveAgentIds);
+    if (activity) row.classList.add(`task-row-${activity}`);
 
     // Multi-select: tick to add the row to the batch-delete set. A checkbox
     // (over ctrl/shift-click) keeps the affordance discoverable — the human
@@ -436,6 +465,12 @@ export class TasksView {
 
     const main = el("div", "task-main");
     const top = el("div", "task-top");
+    // The first thing the eye should land on: unmistakable, not just a tint.
+    if (activity === "active") {
+      const badge = el("span", "task-active-badge", `● ACTIVE — ${t.assignee}`);
+      badge.title = `${t.assignee} is actively working on this right now`;
+      top.appendChild(badge);
+    }
     top.appendChild(el("span", "task-id", t.id));
 
     const status = document.createElement("select");
@@ -487,19 +522,23 @@ export class TasksView {
     for (const [cls, label, kind] of [
       ["issue", t.issue, "issue"],
       ["pr", t.pr, "pr"],
-      ["agent", t.assignee, null],
     ] as const) {
       if (!label) continue;
-      if (kind) {
-        const chip = el("button", `task-chip ${cls} link`, label) as HTMLButtonElement;
-        chip.title = `Open ${kind === "issue" ? "issue" : "PR"} ${label} in browser`;
-        chip.addEventListener("click", () => this.openRef(kind, label));
-        top.appendChild(chip);
-      } else {
-        const chip = el("span", `task-chip ${cls}`, label);
-        chip.title = "Assigned agent";
-        top.appendChild(chip);
-      }
+      const chip = el("button", `task-chip ${cls} link`, label) as HTMLButtonElement;
+      chip.title = `Open ${kind === "issue" ? "issue" : "PR"} ${label} in browser`;
+      chip.addEventListener("click", () => this.openRef(kind, label));
+      top.appendChild(chip);
+    }
+    // The assignee chip is LIVE or HISTORY (#339 refinement) — an old
+    // assignee from a killed/resumed/reassigned session must read as past,
+    // never blend in as if the same agent were still sitting there.
+    if (t.assignee) {
+      const isLive = this.liveAgentIds.has(t.assignee);
+      const chip = el("span", `task-chip agent ${isLive ? "live" : "history"}`, t.assignee);
+      chip.title = isLive
+        ? "Currently live agent"
+        : "Assigned in a past session — this agent is not currently live";
+      top.appendChild(chip);
     }
     if (t.session) {
       const chip = el("span", "task-chip session", `⟲ ${t.session.slice(0, 8)}`);
@@ -528,7 +567,10 @@ export class TasksView {
 
     // Merge-gate actions: the human's approve / request-changes touchpoints,
     // shown only where they belong — on items awaiting the merge decision.
-    if (t.status === "pr" || t.status === "human-testing") {
+    // Once changes are requested (see requestChanges below), the status
+    // moves off pr/human-testing and canApprove goes false on its own — a
+    // reopened task can never keep showing a stale Approve button.
+    if (canApprove(t.status)) {
       const approve = el(
         "button",
         "task-btn approve",

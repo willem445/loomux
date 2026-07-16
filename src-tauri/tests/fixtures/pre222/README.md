@@ -110,6 +110,13 @@ so far:
   convention for inspecting the PR's actual code locally, since a bare `gh pr checkout <n>` grabs
   the branch by name and collides with whichever other worktree already holds it.
 
+- **#339 refinement, reopening state honesty** — `orchestrator.md` only. A new bullet in **The
+  task board** section: reopening a `pr`/`human-testing` item (routing reviewer findings back to
+  a worker) must flip `status` back to `in-progress` the same moment, not just eventually — the
+  board's Approve button is gated on status alone, so leaving a reopened item's status untouched
+  leaves Approve showing on work that is no longer ready. Pairs with the board itself now doing
+  this automatically for the human's own **✎ Changes** action.
+
 `the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was` renders
 **these** with the six pre-#222 template variables and asserts that a group launched
 with the advanced orchestrator **off** gets exactly that text. They are the
