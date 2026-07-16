@@ -688,20 +688,58 @@ loomux_block "gate-closed" "$default" "$num"
 }
 
 /// The Windows `gh.cmd` wrapper: delegates to the POSIX shim (single source of
-/// gate logic) via `sh`, or runs the real gh when no `sh` is on PATH (a documented
-/// bypass). `real_gh` is forward-slashed but valid for `CreateProcess`.
-fn gh_shim_cmd(real_gh: &str) -> String {
-    let real_bs = real_gh.replace('/', "\\");
+/// gate logic) via an ABSOLUTE `sh.exe` path baked in at shim-write time (#335),
+/// or runs the real gh — loudly audited as degraded, never a silent bypass —
+/// when no `sh` could be found anywhere on the machine. `real_gh` is
+/// forward-slashed but valid for `CreateProcess`.
+#[doc(hidden)] // pub so the integration test can pin the security-critical routing
+pub fn gh_shim_cmd(real_gh: &str, sh_path: Option<&str>) -> String {
+    shim_cmd_delegator("gh", &real_gh.replace('/', "\\"), sh_path)
+}
+
+/// Shared `.cmd` delegator shape for the `gh`/`git` interceptor shims (#83,
+/// #335). `sh_path`, when `Some`, is the ABSOLUTE `sh.exe` path resolved at
+/// shim-write time from `sh`'s actual install location (see
+/// `winpath::resolve_sh`) — baking it in means the delegator never depends on
+/// the *invoking* shell's PATH containing `sh.exe` (a default Git for Windows
+/// install leaves `usr\bin` off PATH, which silently defeated the gate for
+/// any PowerShell/cmd invocation before #335). `sh_path` is `None` only when
+/// shim-write time genuinely found no `sh` anywhere on the machine
+/// (`OrchRegistry::ensure_shims`) — that fallback to the real binary is
+/// audited loudly (`gate-degraded-no-sh`) rather than silently skipping the
+/// gate.
+fn shim_cmd_delegator(program: &str, real_bs: &str, sh_path: Option<&str>) -> String {
+    let set_sh = match sh_path {
+        Some(p) => format!("set \"LOOMUX_SH={}\"\r\n", p.replace('/', "\\")),
+        None => String::new(),
+    };
+    // `goto`, not a nested `if (...) exit /b %errorlevel%` — inside a
+    // parenthesized block cmd.exe expands `%errorlevel%` once at PARSE time
+    // (before the guarded command even runs), so a naive `if defined
+    // LOOMUX_SH ( "%LOOMUX_SH%" ... & exit /b %errorlevel% )` would always
+    // exit with the *pre-block* errorlevel — silently turning a gate refusal
+    // (real exit 1) back into success. `exit /b %errorlevel%` on its own
+    // top-level line, outside any parens, expands fresh at execution time.
     format!(
         "@echo off\r\n\
-         rem loomux gh shim (#83) — delegate to the POSIX shim; run real gh if no sh.\r\n\
+         rem loomux {program} shim (#83) — delegate to the POSIX shim using an\r\n\
+         rem absolute sh path baked in at shim-write time (#335): the invoking\r\n\
+         rem shell's PATH may not include sh.exe, so this no longer re-resolves\r\n\
+         rem sh at invocation time.\r\n\
          setlocal\r\n\
-         for %%S in (sh.exe) do set \"LOOMUX_SH=%%~$PATH:S\"\r\n\
-         if defined LOOMUX_SH (\r\n\
-         \x20 \"%LOOMUX_SH%\" \"%~dp0gh\" %*\r\n\
-         ) else (\r\n\
-         \x20 \"{real_bs}\" %*\r\n\
+         {set_sh}\
+         if not defined LOOMUX_SH goto :loomux_no_sh\r\n\
+         \"%LOOMUX_SH%\" \"%~dp0{program}\" %*\r\n\
+         exit /b %errorlevel%\r\n\
+         \r\n\
+         :loomux_no_sh\r\n\
+         rem #335: no sh was found when this shim was generated — the merge/\r\n\
+         rem release gate is DEGRADED for this call (falling straight through\r\n\
+         rem to the real binary). Audit it loudly; never bypass silently.\r\n\
+         if defined LOOMUX_GROUP_DIR (\r\n\
+         \x20 >>\"%LOOMUX_GROUP_DIR%\\audit.jsonl\" echo {{\"ts_ms\":0,\"actor\":\"{program}-shim-cmd\",\"action\":\"gate-degraded-no-sh\",\"detail\":{{}}}} 2>nul\r\n\
          )\r\n\
+         \"{real_bs}\" %*\r\n\
          exit /b %errorlevel%\r\n"
     )
 }
@@ -854,22 +892,12 @@ loomux_block_release "$tag" "push"
     TPL.replace("__REAL_GIT__", real_git).replace("\r\n", "\n")
 }
 
-/// The Windows `git.cmd` wrapper: delegates to the POSIX git shim via `sh`, or runs
-/// the real git when no `sh` is on PATH (documented bypass). Same shape as gh.cmd.
-fn git_shim_cmd(real_git: &str) -> String {
-    let real_bs = real_git.replace('/', "\\");
-    format!(
-        "@echo off\r\n\
-         rem loomux git shim (#83) — delegate to the POSIX shim; run real git if no sh.\r\n\
-         setlocal\r\n\
-         for %%S in (sh.exe) do set \"LOOMUX_SH=%%~$PATH:S\"\r\n\
-         if defined LOOMUX_SH (\r\n\
-         \x20 \"%LOOMUX_SH%\" \"%~dp0git\" %*\r\n\
-         ) else (\r\n\
-         \x20 \"{real_bs}\" %*\r\n\
-         )\r\n\
-         exit /b %errorlevel%\r\n"
-    )
+/// The Windows `git.cmd` wrapper: delegates to the POSIX git shim via an
+/// ABSOLUTE `sh.exe` path baked in at shim-write time (#335), same shape and
+/// same degraded-fallback audit as `gh_shim_cmd`.
+#[doc(hidden)] // pub so the integration test can pin the security-critical routing
+pub fn git_shim_cmd(real_git: &str, sh_path: Option<&str>) -> String {
+    shim_cmd_delegator("git", &real_git.replace('/', "\\"), sh_path)
 }
 
 /// The notice delivered once when an autonomous group's token budget is exhausted
@@ -9733,13 +9761,18 @@ impl OrchRegistry {
     /// resolving the real binary and baking its absolute path in so the shim never
     /// re-resolves to itself. No-op returning `false` when the real program isn't
     /// installed (nothing to intercept). `sh` builds the POSIX body from the
-    /// forward-slashed real path; `cmd` builds the `.cmd` delegator.
+    /// forward-slashed real path; `cmd` builds the `.cmd` delegator. `sh_path` is
+    /// the absolute `sh.exe` path (#335, resolved once by the caller — see
+    /// `ensure_shims`) baked into the `.cmd` delegator; `None` means no `sh` was
+    /// found anywhere on the machine, in which case `cmd` renders a delegator that
+    /// audits the degraded gate before falling through to the real binary.
     fn write_shim(
         &self,
         dir: &Path,
         program: &str,
         sh: impl Fn(&str) -> String,
-        cmd: impl Fn(&str) -> String,
+        cmd: impl Fn(&str, Option<&str>) -> String,
+        sh_path: Option<&str>,
     ) -> bool {
         let Some(real) = crate::winpath::resolve_program(
             program,
@@ -9762,10 +9795,9 @@ impl OrchRegistry {
         {
             // cmd/pwsh panes resolve `<program>` to `<program>.cmd` (`.PS1` isn't
             // on the default PATHEXT). It delegates to the POSIX shim so the gate
-            // logic lives in one place; without `sh` it runs the real program (a
-            // documented bypass — Git Bash, which ships `sh`, is present wherever
-            // Claude Code runs its Bash tool, the primary interception point).
-            let _ = fs::write(dir.join(format!("{program}.cmd")), cmd(&real_fwd).as_bytes());
+            // logic lives in one place, via the absolute `sh_path` resolved at
+            // shim-write time (#335) rather than the invoking shell's PATH.
+            let _ = fs::write(dir.join(format!("{program}.cmd")), cmd(&real_fwd, sh_path).as_bytes());
         }
         true
     }
@@ -9779,8 +9811,30 @@ impl OrchRegistry {
         if fs::create_dir_all(&dir).is_err() {
             return None;
         }
-        let gh = self.write_shim(&dir, "gh", gh_shim_sh, gh_shim_cmd);
-        let git = self.write_shim(&dir, "git", git_shim_sh, git_shim_cmd);
+        // #335: resolve an absolute `sh.exe` ONCE, from git's own install layout
+        // (not the invoking shell's PATH — see `winpath::resolve_sh`), and bake it
+        // into both `.cmd` delegators. `None` when no `sh` exists anywhere on the
+        // machine; the delegator then audits the degraded gate on every fallback
+        // rather than bypassing it silently.
+        #[cfg(target_os = "windows")]
+        let sh_path: Option<String> = crate::winpath::resolve_program(
+            "git",
+            &crate::winpath::launch_path(),
+            &crate::winpath::launch_pathext(),
+        )
+        .and_then(|git| {
+            crate::winpath::resolve_sh(
+                &git,
+                &crate::winpath::launch_path(),
+                &crate::winpath::launch_pathext(),
+            )
+        })
+        .map(|p| p.to_string_lossy().replace('\\', "/"));
+        #[cfg(not(target_os = "windows"))]
+        let sh_path: Option<String> = None;
+
+        let gh = self.write_shim(&dir, "gh", gh_shim_sh, gh_shim_cmd, sh_path.as_deref());
+        let git = self.write_shim(&dir, "git", git_shim_sh, git_shim_cmd, sh_path.as_deref());
         (gh || git).then_some(dir)
     }
 

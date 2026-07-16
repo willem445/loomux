@@ -154,6 +154,31 @@ pub fn resolve_program(program: &str, path_env: &str, pathext: &str) -> Option<P
     None
 }
 
+/// Resolve `sh.exe` from the *install layout* of a resolved `git.exe`, not the
+/// invoking process's PATH (#335). A default Git for Windows install puts
+/// `git.exe` on PATH (via `cmd\` or `mingw64\bin\`) but leaves `usr\bin\`
+/// (where `sh.exe` actually lives) off it — a shim that re-resolved `sh` from
+/// PATH at invocation time would silently miss it from a PowerShell/cmd pane
+/// and fall through to the real binary, skipping the gh/git merge+release
+/// gate entirely. Walk a few ancestor levels of `git.exe`'s directory and
+/// probe the install-layout shapes Git for Windows ships (`sh.exe` beside
+/// `git.exe`, or under a `bin\` or `usr\bin\` sibling), then fall back to a
+/// plain PATH lookup as a last resort (covers e.g. a standalone MSYS2 `sh`).
+pub fn resolve_sh(git_exe: &Path, path_env: &str, pathext: &str) -> Option<PathBuf> {
+    let mut dir = git_exe.parent().map(Path::to_path_buf);
+    for _ in 0..3 {
+        let Some(d) = dir else { break };
+        for rel in ["sh.exe", "usr/bin/sh.exe", "bin/sh.exe"] {
+            let cand = d.join(rel);
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+        dir = d.parent().map(Path::to_path_buf);
+    }
+    resolve_program("sh", path_env, pathext)
+}
+
 /// Whether `path` can be handed straight to `CreateProcess` (portable-pty's
 /// `CommandBuilder`) as the pty child, versus needing a shell interpreter.
 ///
@@ -255,6 +280,72 @@ mod tests {
     fn resolve_missing_bare_command_is_none() {
         let tmp = tempfile::tempdir().unwrap();
         assert!(resolve_program("no_such_cli_xyz", tmp.path().to_str().unwrap(), ".EXE").is_none());
+    }
+
+    /// #335: the "installed via `cmd\`" layout — PATH carries
+    /// `<root>\cmd\git.exe`, and `sh.exe` lives under `<root>\usr\bin\`, off
+    /// PATH. Must be found from git's own location, not the caller's PATH.
+    #[test]
+    fn resolve_sh_finds_usr_bin_sibling_of_cmd_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let git = tmp.path().join("cmd").join("git.exe");
+        fs::create_dir_all(git.parent().unwrap()).unwrap();
+        fs::write(&git, b"git").unwrap();
+        let sh = tmp.path().join("usr").join("bin").join("sh.exe");
+        fs::create_dir_all(sh.parent().unwrap()).unwrap();
+        fs::write(&sh, b"sh").unwrap();
+        assert_eq!(resolve_sh(&git, "", "").unwrap(), sh);
+    }
+
+    /// #335: the "installed via `mingw64\bin\`" layout — `usr\bin\sh.exe` is
+    /// two ancestor levels up from `git.exe`'s directory, not one.
+    #[test]
+    fn resolve_sh_finds_usr_bin_sibling_of_mingw64_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let git = tmp.path().join("mingw64").join("bin").join("git.exe");
+        fs::create_dir_all(git.parent().unwrap()).unwrap();
+        fs::write(&git, b"git").unwrap();
+        let sh = tmp.path().join("usr").join("bin").join("sh.exe");
+        fs::create_dir_all(sh.parent().unwrap()).unwrap();
+        fs::write(&sh, b"sh").unwrap();
+        assert_eq!(resolve_sh(&git, "", "").unwrap(), sh);
+    }
+
+    /// #335: Git for Windows also ships a copy of `sh.exe` directly in `bin\`,
+    /// alongside `git.exe` itself when git.exe is resolved from `bin\`.
+    #[test]
+    fn resolve_sh_finds_sh_beside_git_exe() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("bin");
+        fs::create_dir_all(&dir).unwrap();
+        let git = dir.join("git.exe");
+        fs::write(&git, b"git").unwrap();
+        let sh = dir.join("sh.exe");
+        fs::write(&sh, b"sh").unwrap();
+        assert_eq!(resolve_sh(&git, "", "").unwrap(), sh);
+    }
+
+    /// #335: when git's install layout has no `sh.exe` anywhere nearby, fall
+    /// back to a plain PATH lookup rather than giving up immediately.
+    #[test]
+    fn resolve_sh_falls_back_to_path_lookup() {
+        let git_dir = tempfile::tempdir().unwrap();
+        let git = git_dir.path().join("git.exe");
+        fs::write(&git, b"git").unwrap();
+        let path_dir = tempfile::tempdir().unwrap();
+        let sh = path_dir.path().join("sh.exe");
+        fs::write(&sh, b"sh").unwrap();
+        assert_eq!(resolve_sh(&git, path_dir.path().to_str().unwrap(), ".exe").unwrap(), sh);
+    }
+
+    /// #335: no sibling and nothing on PATH — the caller must treat this as
+    /// "no sh available" and audit the degraded gate rather than crash.
+    #[test]
+    fn resolve_sh_is_none_when_nothing_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let git = tmp.path().join("git.exe");
+        fs::write(&git, b"git").unwrap();
+        assert!(resolve_sh(&git, "", ".EXE").is_none());
     }
 
     #[test]
