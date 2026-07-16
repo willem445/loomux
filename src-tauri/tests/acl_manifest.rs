@@ -19,10 +19,13 @@
 //!     `build.rs` already feeds — not a reimplementation of ACL resolution),
 //!     invokes all 125 commands against the `main` window label, and invokes
 //!     a representative dangerous spread + a benign control against the
-//!     `plugin-zero-template` window label (see
-//!     `capabilities/plugin-zero-template.json`). This is both the coherence
-//!     test's A2 (every command reachable to main) and the plan's B
-//!     (zero-permission denial), proven against the real resolver.
+//!     `untrusted-probe-0` window label (see
+//!     `capabilities/plugin-zero-template.json` — the label is deliberately
+//!     NOT `plugin-*`-shaped, rev-65 NB-1, so it can't pick up
+//!     `capabilities/plugin.json`'s broker grant and stays genuinely
+//!     zero-permission). This is both the coherence test's A2 (every command
+//!     reachable to main) and the plan's B (zero-permission denial), proven
+//!     against the real resolver.
 //!   - `plugin_capability_grants_only_broker_commands`: the #360 Slice C
 //!     addition — proves a `plugin-*`-labeled window (bound to
 //!     `capabilities/plugin.json`) can reach exactly the two broker commands
@@ -195,10 +198,14 @@ fn main_has_all_125_and_zero_permission_denies_dangerous_spread() {
         .build()
         .expect("failed to build the 'main' mock webview");
     // Bound to capabilities/plugin-zero-template.json ("permissions": []) —
-    // the #360 Slice C template; see that file's doc comment.
-    let plugin = tauri::WebviewWindowBuilder::new(&app, "plugin-zero-template", Default::default())
+    // the #360 Slice C template; see that file's doc comment. Label is
+    // deliberately NOT "plugin-*"-shaped (rev-65 NB-1): capabilities/plugin.json
+    // binds that glob to the plugin-broker grant, so a label matching it would
+    // no longer be a genuinely zero-grant probe — it would silently pick up
+    // the two broker commands, diluting exactly the proof this test exists for.
+    let zero_probe = tauri::WebviewWindowBuilder::new(&app, "untrusted-probe-0", Default::default())
         .build()
-        .expect("failed to build the 'plugin-zero-template' mock webview");
+        .expect("failed to build the 'untrusted-probe-0' mock webview");
 
     // --- Coherence (plan §5A2): every registered command must reach main. ---
     let denied_for_main: Vec<&str> = STUB_COMMAND_NAMES
@@ -234,10 +241,10 @@ fn main_has_all_125_and_zero_permission_denies_dangerous_spread() {
     const BENIGN_CONTROL: &str = "pty_backend_info";
 
     for &cmd in DANGEROUS_SPREAD {
-        let res = invoke(&plugin, cmd);
+        let res = invoke(&zero_probe, cmd);
         assert!(
             res.is_err(),
-            "zero-permission window ('plugin-zero-template') should be DENIED {cmd}, got {res:?} — \
+            "zero-permission window ('untrusted-probe-0') should be DENIED {cmd}, got {res:?} — \
              the #360 Slice C zero-grant template must not leak a dangerous command"
         );
     }
@@ -247,7 +254,7 @@ fn main_has_all_125_and_zero_permission_denies_dangerous_spread() {
     // per-label ACL check, not a broken IPC pipe that would deny everything
     // globally (which would make the dangerous-spread denials meaningless).
     assert!(
-        invoke(&plugin, BENIGN_CONTROL).is_err(),
+        invoke(&zero_probe, BENIGN_CONTROL).is_err(),
         "zero-permission window should deny the benign control {BENIGN_CONTROL} too"
     );
     assert!(

@@ -532,11 +532,14 @@ pub struct OpenPluginWindowRequest {
     pub height: f64,
 }
 
-/// Registers a plugin session (capabilities/root) under `label`, so
-/// [`plugin_broker_request`] can find it. Split out from the
-/// `#[tauri::command]` in `lib.rs`-adjacent wiring so it's callable without a
-/// live `WebviewWindowBuilder` from tests.
-pub fn register_session(label: String, req: &OpenPluginWindowRequest) -> Result<(), String> {
+/// Every check that can fail on an [`OpenPluginWindowRequest`] — an unknown
+/// capability string, or an `apiVersion` this build doesn't speak — run once,
+/// here, and called by [`plugin_open_window`] *before* building the
+/// `WebviewWindow` (rev-65 NB-2 on #369) specifically so a bad request never
+/// gets as far as creating a real OS window that then has nothing registered
+/// for it (fail-closed either way — no session means the broker denies
+/// everything — but this way there's no stranded window to clean up at all).
+fn validate_open_request(req: &OpenPluginWindowRequest) -> Result<Vec<Capability>, String> {
     if !is_valid_plugin_id(&req.plugin_id) {
         return Err(format!(
             "invalid plugin id `{}`: must be 1-64 ascii alphanumeric/-/_ characters",
@@ -554,18 +557,7 @@ pub fn register_session(label: String, req: &OpenPluginWindowRequest) -> Result<
             req.api_version, BROKER_API_VERSION
         ));
     }
-    with_sessions(|m| {
-        m.insert(
-            label,
-            PluginSession {
-                plugin_id: req.plugin_id.clone(),
-                root: req.root.clone(),
-                granted,
-                api_version: req.api_version,
-            },
-        );
-    });
-    Ok(())
+    Ok(granted)
 }
 
 /// Look up the registered session for a `plugin-*` window label — the one
@@ -584,16 +576,17 @@ pub fn plugin_open_window(
     app: tauri::AppHandle,
     req: OpenPluginWindowRequest,
 ) -> Result<String, String> {
-    if !is_valid_plugin_id(&req.plugin_id) {
-        return Err(format!(
-            "invalid plugin id `{}`: must be 1-64 ascii alphanumeric/-/_ characters",
-            req.plugin_id
-        ));
-    }
-    let label = next_window_label(&req.plugin_id);
+    // Every fallible check runs BEFORE the window is built (rev-65 NB-2 on
+    // #369): building first and validating after would leave a stranded,
+    // inert window on screen if e.g. `apiVersion` were rejected — fail-closed
+    // either way (no session means the broker denies everything), but
+    // validating first means a bad request never creates a real OS window at
+    // all, rather than one that has to be cleaned up.
+    let granted = validate_open_request(&req)?;
     let url = build_plugin_url(&req.plugin_id, &req.entry)?;
-    let plugin_id_for_nav = req.plugin_id.clone();
 
+    let label = next_window_label(&req.plugin_id);
+    let plugin_id_for_nav = req.plugin_id.clone();
     tauri::WebviewWindowBuilder::new(&app, &label, tauri::WebviewUrl::External(url))
         .title(&req.title)
         .inner_size(req.width, req.height)
@@ -601,7 +594,19 @@ pub fn plugin_open_window(
         .build()
         .map_err(|e| e.to_string())?;
 
-    register_session(label.clone(), &req)?;
+    // Nothing below this point can fail: `granted`/`api_version` were already
+    // validated above, so this is a plain insert, not a second fallible check.
+    with_sessions(|m| {
+        m.insert(
+            label.clone(),
+            PluginSession {
+                plugin_id: req.plugin_id.clone(),
+                root: req.root.clone(),
+                granted,
+                api_version: req.api_version,
+            },
+        );
+    });
     Ok(label)
 }
 
@@ -762,5 +767,29 @@ mod tests {
         assert_eq!(url.scheme(), "plugin");
         assert_eq!(url.host_str(), Some("localhost"));
         assert_eq!(url.path(), "/demo/index.html");
+    }
+
+    fn open_request(capabilities: Vec<&str>, api_version: u32) -> OpenPluginWindowRequest {
+        OpenPluginWindowRequest {
+            plugin_id: "demo".into(),
+            entry: "index.html".into(),
+            root: None,
+            capabilities: capabilities.into_iter().map(String::from).collect(),
+            api_version,
+            title: "t".into(),
+            width: 1.0,
+            height: 1.0,
+        }
+    }
+
+    #[test]
+    fn validate_open_request_rejects_bad_input_before_any_window_would_be_built() {
+        // rev-65 NB-2 on #369: plugin_open_window calls this — and only this —
+        // before touching WebviewWindowBuilder, so a request like this one
+        // (the exact `apiVersion: 999` example from the finding) never gets
+        // as far as creating a real OS window.
+        assert!(validate_open_request(&open_request(vec!["not-a-real-capability"], 1)).is_err());
+        assert!(validate_open_request(&open_request(vec![], 999)).is_err());
+        assert!(validate_open_request(&open_request(vec!["storage"], 1)).is_ok());
     }
 }
