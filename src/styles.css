@@ -1821,6 +1821,11 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 }
 .task-btn.approve { color: #b4e878; }
 .task-btn.approve:hover { background: rgba(158, 206, 106, 0.16); border-color: #3d5a2c; }
+/* #316: an Approve that can't possibly merge under the armed workflow gate —
+   still clickable (it's the human's own gate regardless of the repo's), just
+   not colored like one that will actually merge. */
+.task-btn.approve.gated { color: #e0af68; }
+.task-btn.approve.gated:hover { background: rgba(224, 175, 104, 0.16); border-color: #55452c; }
 .task-btn.changes { color: #e0af68; }
 .task-btn.changes:hover { background: rgba(224, 175, 104, 0.16); border-color: #55452c; }
 .task-btn.start { color: #7dcfff; }
@@ -1845,6 +1850,7 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 }
 .tasks-dialog-title { font-weight: 600; font-size: 12px; }
 .tasks-dialog-note { font-size: 10.5px; line-height: 1.4; color: var(--text-dim); }
+.tasks-dialog-note.gate-warn { color: #e0af68; }
 .tasks-dialog-text { resize: vertical; min-height: 66px; line-height: 1.4; }
 
 .task-notes { padding: 3px 4px 5px 26px; }
@@ -1994,6 +2000,22 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .group-max-err { color: var(--danger); font-size: 10px; }
 .group-cost { color: var(--text-dim); font-size: 11px; }
 .group-cost-live { color: var(--text-dim); font-size: 10px; opacity: 0.75; }
+
+/* -- workflow-mode chrome (#316): active workflow + armed merge gate -- */
+.group-workflow-row {
+  display: flex; flex-direction: column; gap: 4px; flex: none;
+  padding: 6px 12px; border-bottom: 1px solid var(--border-soft);
+}
+.group-workflow-line { color: var(--text-dim); font-size: 11px; line-height: 1.4; }
+/* Loud — this is the "gate names a reviewer this session can't spawn, merges
+   WILL bounce" case (#316's satisfiability guarantee), not a soft hint. */
+.group-workflow-warn {
+  font-size: 10.5px; line-height: 1.4; color: #f7768e;
+  background: rgba(247, 118, 142, 0.12);
+  border: 1px solid rgba(247, 118, 142, 0.35); border-radius: 5px;
+  padding: 5px 8px;
+}
+.group-workflow-warn[hidden] { display: none; }
 
 /* -- autonomous mode (#83) -- two dense rows, matching the max-agents row. */
 .group-autorow {

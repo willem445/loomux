@@ -9,8 +9,9 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { swapIfConnected } from "./domutil";
 import { canProceed, doneCount, isAwaitingHuman, retainExisting, STATUSES } from "./taskboard";
-import { approveTask } from "./orchestration";
+import { approveTask, workflowStatus, type WorkflowStatus } from "./orchestration";
 import { normalizeComment } from "./autonomy";
+import { approveWillMerge, gateExitsMessage } from "./workflowstatus";
 
 export interface OrchTaskNote {
   ts_ms: number;
@@ -51,6 +52,12 @@ export class TasksView {
   private toastEl: HTMLElement;
   private toastTimer: number | undefined;
   private tasks: OrchTask[] = [];
+  /** The group's live workflow-mode status (#316), for the gate-aware Approve
+   *  label below — refetched alongside `tasks` on every board refresh. `null`
+   *  before the first successful read, or if that read fails; either way
+   *  `approveWillMerge` treats it as "no gate known" (Approve reads plain)
+   *  rather than guessing a warning it can't back up. */
+  private workflow: WorkflowStatus | null = null;
   /** Task ids with their notes section expanded (survives re-renders). */
   private expanded = new Set<string>();
   /** Task ids the human has ticked for batch delete. Frontend-only, so it's
@@ -184,6 +191,10 @@ export class TasksView {
       this.toast(String(err));
       return;
     }
+    // Best-effort: the gate-aware Approve label (#316) is an enrichment, not
+    // the board's primary data — a failed read must not toast-error the whole
+    // board (tasks above already succeeded), it just leaves Approve unlabeled.
+    this.workflow = await workflowStatus(this.groupId).catch(() => null);
     // Drop any ticked rows that vanished from the board (orchestrator edit,
     // another delete) so the "delete selected" count can't outlive its rows.
     this.selected = retainExisting(this.selected, this.tasks);
@@ -287,6 +298,14 @@ export class TasksView {
               "authorized. Add optional instructions, or leave empty to just approve."
       )
     );
+    // #316: a human Approve grant is never what opens a workflow-gated merge
+    // (#197/#222) — say so again here, not just on the button label, since a
+    // human who clicked through to this dialog is the one about to act on it.
+    const gate = this.workflow ? approveWillMerge(this.workflow, t) : { ok: true };
+    if (!gate.ok && gate.reason) {
+      const sentence = gate.reason[0].toUpperCase() + gate.reason.slice(1);
+      box.append(el("div", "tasks-dialog-note gate-warn", `${sentence}. ${gateExitsMessage()}`));
+    }
 
     const ta = document.createElement("textarea");
     ta.className = "dlg-input tasks-dialog-text";
@@ -527,16 +546,27 @@ export class TasksView {
     // Merge-gate actions: the human's approve / request-changes touchpoints,
     // shown only where they belong — on items awaiting the merge decision.
     if (t.status === "pr" || t.status === "human-testing") {
+      // #316: an Approve that CANNOT succeed under an armed workflow gate says
+      // so up front — the button stays clickable (the grant/note still get
+      // recorded, and Approve is the human's own gate regardless — see
+      // approveWithComment's dialog note), it just never claims a merge that
+      // won't happen. `this.workflow === null` (read failed, or hasn't landed
+      // yet) reads as "no gate known", the same conservative default the
+      // no-PR case already had.
+      const gate = this.workflow ? approveWillMerge(this.workflow, t) : { ok: true };
       const approve = el(
         "button",
         "task-btn approve",
-        t.pr ? "✓ Approve & allow merge" : "✓ Approve"
+        gate.ok ? (t.pr ? "✓ Approve & allow merge" : "✓ Approve") : `✓ Approve (${gate.reason})`
       ) as HTMLButtonElement;
-      approve.title = t.pr
-        ? "Authorize the merge: write a one-time grant for this PR and tell the orchestrator to merge " +
-          "(optionally with instructions). The grant is single-use and expires in ~30 min."
-        : "Approve: mark this item done and tell the orchestrator (optionally with instructions). " +
-          "No PR is linked, so no merge is authorized.";
+      approve.title = gate.ok
+        ? t.pr
+          ? "Authorize the merge: write a one-time grant for this PR and tell the orchestrator to merge " +
+            "(optionally with instructions). The grant is single-use and expires in ~30 min."
+          : "Approve: mark this item done and tell the orchestrator (optionally with instructions). " +
+            "No PR is linked, so no merge is authorized."
+        : `This still records your grant/note, but the workflow merge gate will refuse the merge. ${gateExitsMessage()}`;
+      if (!gate.ok) approve.classList.add("gated");
       approve.addEventListener("click", () => this.approveWithComment(t));
       const changes = el("button", "task-btn changes", "✎ Changes") as HTMLButtonElement;
       changes.title = "Request changes — send findings back to the orchestrator";
