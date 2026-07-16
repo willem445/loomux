@@ -12,6 +12,13 @@ manual checklist for the rest.
 
 ## Always run (both halves — a change to one often breaks the other's assumptions)
 
+Agent workers: whether these run locally or on `ci.yml` follows
+`.claude/skills/ci-validate`'s scope/duration line, not an automatic "run it"
+— quick/local iteration is fine capped at `-j 4` (`-- --test-threads=4` too,
+for `cargo test`), but full-suite validation still goes to CI, which is the
+sole authority for the CI gate regardless of what ran locally. The commands
+below are unconstrained for the human running this skill by hand.
+
 ```sh
 npm run build                 # tsc --noEmit typecheck + Vite bundle
 npm test                      # frontend unit tests (Node 22 built-in runner)

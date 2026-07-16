@@ -28,10 +28,14 @@ The version lives in **five** places that must stay in lockstep:
 
 **The lockfiles are what get missed** (Cargo.lock: the 0.5.0 bump PR #89
 needed follow-up #90; package-lock.json: the 0.8.0 bump PR #220 needed
-follow-up #224). After editing Cargo.toml, run plain `cargo check` in
-`src-tauri/` to regenerate the lock, then `cargo check --locked` to prove
-it's consistent, and commit the lock change. After editing the root
-`package.json`, run `npm install --package-lock-only` to regenerate
+follow-up #224). After editing Cargo.toml, run `cargo update --workspace` in
+`src-tauri/` to regenerate the lock — this is dependency resolution scoped to
+the workspace's own members, not a build: it doesn't invoke `rustc`, so it's
+the one exception the `ci-validate` skill carves out for agent workers (see
+that skill's "The Cargo.lock exception" section). Commit the lock
+change and let the bump PR's own CI run (below) prove `cargo check --locked`
+is consistent — don't also run `cargo check --locked` locally. After editing
+the root `package.json`, run `npm install --package-lock-only` to regenerate
 `package-lock.json` — verify the diff touches only the version fields (no
 dependency churn) before committing it.
 
