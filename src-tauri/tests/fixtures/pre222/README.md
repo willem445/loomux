@@ -61,12 +61,18 @@ so far:
     loop was reframed onto the draft PR's own CI, per that skill, with the
     local-command instructions dropped entirely.
   - **rev-30's delta review**: #321 was itself repurposed mid-flight from that
-    interim hard ban into a guard-plus-discretion model — a per-class concurrency
-    guard (#318/#322) caps local build/test concurrency instead of forbidding it
-    outright, so a capped local run is allowed once the guard is confirmed active.
-    The absolute "agent workers don't run `cargo`/`npm` on the host" parentheticals
-    softened into a deferral to the `ci-validate` skill for when that applies —
-    the draft-PR/loop-until-green/blocked-report shape underneath is unchanged.
+    interim hard ban toward a per-class concurrency guard (#318/#322) that would
+    have gated local runs on the guard being confirmed active. The absolute
+    "agent workers don't run `cargo`/`npm` on the host" parentheticals softened
+    into a deferral to the `ci-validate` skill for when that applied.
+  - **rev-3's delta review**: the guard (#322) was shelved before merging — its
+    shim only caught Bash-tool invocations, not PowerShell/cmd, so the coverage
+    wasn't worth the complexity. #321's current head drops the guard precondition
+    entirely: quick local iteration is *unconditionally* fine, capped at `-j 4`;
+    only full/longer-running validation defers to CI. The parentheticals were
+    reworded again to match — "capped at `-j 4`", no guard, no precondition — and
+    this fixture's own "confirmed active" language is gone along with it. The
+    draft-PR/loop-until-green/blocked-report shape underneath is still unchanged.
 
 `the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was` renders
 **these** with the six pre-#222 template variables and asserts that a group launched
