@@ -1236,14 +1236,15 @@ pane is genuinely idle; this automates picking the moment instead of waiting for
 human to type `/compact` by hand or the CLI's own emergency auto-compact at the context
 limit.
 
-- **Scope note.** The issue's three follow-up comments propose a considerably larger
-  design — an agent-initiated `request_compact()` MCP tool (the agent calls it as the last
-  action of its turn; loomux fires the actual paste once the pane goes idle, rather than an
-  immediate mid-turn write), a pre-compact offload checklist, a context-usage % threshold
-  with escalating nudges, and mandatory post-compact re-injection of the orchestrator's
-  kickoff instructions. This build is scoped to the **original issue body's proposal and
-  guardrails only** — a loomux-timed heuristic nudge, no new agent capability. The comment-
-  driven extensions are filed as a follow-up, #328, rather than silently dropped.
+- **Scope.** #287 shipped the loomux-timed heuristic nudge on its own — the original issue
+  body's proposal and guardrails, no new agent capability. #328 (filed as a follow-up so the
+  comment-driven refinements weren't silently dropped) then pulled the whole discussion back
+  into this same PR per a standing directive: mid-flight refinement requests fold into the
+  active PR by default rather than deferring. What follows describes the result as ONE
+  system, not two bolted together — the heuristic timer is now the **fallback** path, and
+  agent-initiated `request_compact()` is the **primary** one, with the offload checklist,
+  context-escalation, and mandatory re-injection layered on top of the exact same
+  quiet-clock/delivery/latch machinery #287 already established.
 - **Reuses the SAME idleness signal as the watchdog and idle-tick, not a second one.**
   `compact_nudge_tick` folds pty output growth into `AgentEntry.last_progress_ms` using
   the identical debounce `idle_tick_tick` uses for the orchestrator
@@ -1318,13 +1319,85 @@ limit.
   supported CLIs, so `compact_nudge_cli_supported` gates the nudge to `Guardrails::cli_for`
   resolving to `"claude"` for the eligible agent's role — an unsupported CLI is silently
   excluded rather than typing a slash command it won't understand.
-- **Not built here (deferred, filed as a follow-up issue).** The agent-initiated
-  `request_compact()` tool, the pre-compact offload-checklist enforcement, the
-  context-usage-percent escalation ladder, and mandatory kickoff re-injection after every
-  compaction (agent-triggered, threshold-triggered, or a human typing `/compact` by hand).
-  All four need real design work of their own (a new MCP tool surface, a way to detect "did
-  compaction just finish" from pane output, a context-usage estimate with no clean
-  per-CLI signal) that the loomux-timed heuristic nudge doesn't.
+- **`request_compact` (#328): agent-initiated, self-scoped, no new trust surface beyond a
+  one-bit flag.** An MCP tool (shared tier — every non-solo role, not orchestrator-only) that
+  sets `AgentEntry.compact_requested` on the CALLING agent's own entry, resolved from its MCP
+  token exactly the way `report`/`message_orchestrator` self-scope — no `group_id`-as-path-
+  segment, no cross-pane power, the same discipline every other orchestration command is held
+  to. It does NOT write `/compact` immediately: the agent calls it mid-turn (as its LAST
+  action), so an immediate pty write would land as a queued message into an active turn.
+  Firing waits for `compact_nudge_tick`'s next observation of the pane genuinely quiet
+  (`compact_request_should_fire` — no minutes-threshold wait, since the request itself is the
+  trigger, but still gated by the shared per-hour cap and the per-CLI check). Because the
+  request is self-initiated, it deliberately bypasses `compact_nudge_roles` — a worker can
+  request its own compact even though it isn't in the group's heuristic-eligible role set;
+  role-gating is a policy about which panes loomux nudges *unprompted*, not about who may ask
+  for themselves. An unsupported CLI returns a clear error and sets nothing, rather than
+  flagging a request that can never fire.
+- **Pre-compact offload checklist: a soft warning, never a block.** `request_compact`'s
+  response string carries `compact_checklist_warning` when the calling orchestrator's
+  `AgentEntry.last_state_write_ms` (stamped by the `set_state` MCP handler — self-scoped sign
+  of life, same pattern as everything else here) is stale past
+  `SET_STATE_RECENCY_WINDOW_MS`. The tool call always succeeds regardless — this is advisory
+  text riding the return value, not a gate, matching the issue's explicit "warn, never block."
+  Meaningless for non-orchestrator callers (`set_state` isn't even available to them), so it's
+  silently omitted for those.
+- **Context-usage escalation: an exact transcript-recorded figure, not a byte proxy.** The
+  issue offered two options — Claude Code's own status-line/JSON hook if a clean signal
+  exists, else approximate from pane bytes. Neither was quite right: loomux doesn't invoke
+  Claude Code's status-line hook at all today (the existing `parse_session_cost` only scrapes
+  *rendered pane text*, and only as cost tracking's own last-resort fallback — see
+  `doc/design/group-cost-tracking.md`), and a byte-count proxy would be a second, cruder
+  guess sitting next to a feature that already reads the CLI's own transcript for tokens.
+  `usage::latest_context_tokens` reads the SAME transcript `group_usage` already reads
+  (`~/.claude/projects/<cwd>/<session>.jsonl`), but asks a different question: not the
+  cumulative sum across the whole session (that's `parse_claude_transcript`, for
+  billing), but the LATEST assistant message's `input_tokens + cache_creation_input_tokens +
+  cache_read_input_tokens` — the size of what was actually sent as context for the most
+  recent turn. Self-correcting after a compact (the next turn's figure drops right back
+  down), and exact where it applies — the honest gap is the ASSUMED context window
+  (`CLAUDE_CONTEXT_WINDOW_TOKENS = 200_000`, since loomux has no signal for which tier a
+  session is on); erring toward the smaller window is the safe direction, since it can only
+  make the escalation arrive a little early, never late. `compact_context_threshold_percent`
+  (0 = off, the default) gates it entirely.
+  Crossing the threshold fires `compact_escalation_notice` ONCE (an anti-nag latch, cleared
+  once usage drops back under threshold — e.g. after a compact lands) and gives the agent
+  that same tick to self-request. Only on a LATER tick, still over threshold and still not
+  self-requested, does loomux set `compact_requested` on the agent's behalf — deliberately
+  split across two ticks rather than done together, so the fallback request can never race
+  the notice that's supposed to warn about it first (same-tick would mean `/compact` could
+  already be firing by the time the notice's own delivery goes out).
+- **Mandatory post-compact re-injection, detected once, reused by all three trigger paths.**
+  The hardest of the issue's four "needs real design work" callouts was reliably detecting
+  "compaction just finished" from pane output. The answer turned out to already exist:
+  `compact_nudge_tick`'s own busy/quiet detector (the same `idle_output_is_activity` check
+  that drives the quiet clock) IS a compaction-completion detector once a pane is marked
+  `compact_pending` — busy (real output growth while pending, `compact_seen_busy`) then quiet
+  again resolves it, with no parsing of Claude's own completion text required. All three
+  trigger paths converge on the identical `compact_pending` flag: a loomux-initiated fire
+  (heuristic or requested) sets it directly; a human typing `/compact` manually is detected
+  via `human_typed_compact_detected` scanning the pane's own ANSI-stripped output tail for a
+  standalone `/compact` token (the terminal echoes typed input like any other line) — gated
+  by `MANUAL_COMPACT_DETECT_WINDOW_MS` against the pane's `last_user_input_ms` so the tail's
+  bounded ring buffer can't replay an ALREADY-handled compact and re-trigger detection.
+  Resolution delivers `compact_reinjection_notice`, which embeds the pane's ACTUAL kickoff
+  instructions file — read back verbatim from the durable file `write_instruction_files`
+  already writes at spawn, not a pointer telling the agent to go re-read it (the issue's
+  explicit preference: no reliance on the agent locating a file). This supersedes #287's
+  optional immediate post-paste notice entirely — sending both would be redundant, and the
+  immediate version risked landing while compaction was still running; the mandatory version
+  only ever fires once compaction is actually observed to be done.
+- **Template.** The orchestrator persona's existing "Compact at lulls" invariant (predating
+  even #287 — it used to tell the orchestrator to type `/compact` itself) is rewritten to
+  call `request_compact()` as the primary mechanism, name the offload checklist as a
+  precondition, and drop the old "treat the next turn like a session start" instruction now
+  that loomux's own mandatory re-injection does that automatically.
+- **Scope trim, stated rather than silently dropped.** The issue floats a config knob
+  choosing between "pointer" and "full re-injection," defaulting to full for orchestrators.
+  Only full re-injection is built — it is both the stated default AND the recommended,
+  more-robust option (no reliance on the agent finding a file), so a second mode whose whole
+  purpose is being the less-recommended alternative wasn't worth the added config surface
+  here. Revisit if a real need for the pointer mode shows up.
 
 ## Enforced merge gate (#83)
 

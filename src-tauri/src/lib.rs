@@ -154,6 +154,7 @@ pub fn run() {
             orchestration::orch_set_idle_activity_floor,
             orchestration::orch_set_compact_nudge_minutes,
             orchestration::orch_set_compact_nudge_roles,
+            orchestration::orch_set_compact_context_threshold,
             orchestration::orch_autonomy,
             orchestration::orch_group_usage,
             orchestration::orch_group_summary,

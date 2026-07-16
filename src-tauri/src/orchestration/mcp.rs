@@ -214,6 +214,9 @@ fn tool_defs(role: Role, role_hint: Option<&str>) -> Vec<Value> {
                 "pr": { "type": "string", "description": "PR number, #n, or URL. Omit to list all PRs with verdicts." },
             }),
             &[]),
+        tool("request_compact",
+            "Call this as the LAST action of a turn, at a natural lull (a feature just merged, before pulling new work, going idle on an external wait) — never mid-task. It does NOT compact you right now: it flags THIS pane so loomux pastes /compact for you the moment you go idle at your input prompt, same as it would on its own timer, just sooner and on your judgment instead of a heuristic. Self-scoped: it can only ever affect the pane that calls it. Claude-Code-only — errors clearly on any other CLI rather than typing a command it won't understand. Before calling this, offload everything you'll need after the summary: reconcile the task board, call set_state with anything mid-decision, and push plan/progress context living only in this conversation to the relevant GitHub issues/PRs — the post-compact re-sync (list_tasks + get_state + list_agents, plus a mandatory re-grounding in your role instructions) restores only what was made durable first.",
+            json!({}), &[]),
     ];
     // Notification backend (#243): self-addressed — there is no `agent_id`
     // parameter, and a notice can only ever land in the caller's own pane, so
@@ -764,8 +767,13 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             require_orchestrator(caller)?;
             let state = arg_str(args, "state").ok_or("state required")?;
             reg.set_state(&caller.group, state)?;
+            // Self-scoped sign-of-life for request_compact's offload-checklist
+            // warning (#328) — see AgentEntry.last_state_write_ms.
+            reg.note_state_write(&caller.agent_id);
             Ok("state saved".into())
         }
+
+        "request_compact" => reg.request_compact(&caller.agent_id),
 
         "notify_when" => {
             require_not_planner(caller)?;

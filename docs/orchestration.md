@@ -418,6 +418,20 @@ are eligible — the orchestrator only, by default, since workers are short-live
 worth compacting. `/compact` is a Claude Code built-in, so the nudge only ever fires for
 Claude Code panes.
 
+**The orchestrator can also ask for it directly.** `request_compact()` is the primary
+mechanism — the timed nudge above is the fallback for personas that never call it. The
+orchestrator (or any agent) calls it as the LAST action of a turn, at a natural lull; loomux
+pastes `/compact` the moment the pane actually goes idle, not immediately (a mid-turn write
+would land as a queued message). Before calling it, the persona is expected to offload
+durable state (task board, `set_state`, relevant GitHub issues/PRs) — the tool warns, but
+never blocks, if that looks skipped. If a group sets a context-usage threshold (percent of
+the model's context window), crossing it delivers a `[loomux] context at NN% …` notice; if
+the agent still hasn't asked by the next check, loomux requests one on its behalf rather than
+letting the CLI hit its own emergency auto-compact with no offload. Whichever way a compact
+gets triggered — the timed nudge, a direct request, the threshold fallback, or the human
+typing `/compact` by hand — once it's done, loomux re-grounds the pane in its full role
+instructions (not just a pointer to go re-read them) and prompts it to re-sync live state.
+
 ## Persistence & restart
 
 Each group keeps durable state under

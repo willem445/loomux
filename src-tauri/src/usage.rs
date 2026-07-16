@@ -195,6 +195,45 @@ pub fn parse_claude_transcript(text: &str) -> SessionUsage {
     }
 }
 
+/// Approximate current context-window usage from a Claude Code transcript
+/// (#328): the LATEST assistant message's `input_tokens +
+/// cache_creation_input_tokens + cache_read_input_tokens` — the size of
+/// everything sent as context for that turn. This is a materially different
+/// question from `parse_claude_transcript`'s cumulative totals (which sum
+/// every turn's input across the WHOLE session, for cost/billing purposes);
+/// the context window's current fullness is what the MOST RECENT turn sent,
+/// not the running lifetime sum. Self-correcting after a compaction — the
+/// next turn's input tokens drop back down, exactly reflecting the freshly
+/// summarized context. `output_tokens` is excluded: it's what the turn
+/// PRODUCED, not what was IN context going in. `None` if no real (non-
+/// synthetic) assistant `usage` line is found. Exact (an API-reported figure
+/// from the CLI's own transcript), not a byte-count proxy — see
+/// `doc/design/orchestration.md`'s Compact-nudge section for why this beats
+/// inventing one.
+pub fn latest_context_tokens(text: &str) -> Option<u64> {
+    for line in text.lines().rev() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+        if v.get("type").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        let Some(msg) = v.get("message") else { continue };
+        let Some(usage) = msg.get("usage") else { continue };
+        let model = msg.get("model").and_then(Value::as_str).unwrap_or("");
+        if model.is_empty() || model == "<synthetic>" {
+            continue; // not a real turn's context
+        }
+        let input = u64_field(usage, "input_tokens");
+        let cache_creation = u64_field(usage, "cache_creation_input_tokens");
+        let cache_read = u64_field(usage, "cache_read_input_tokens");
+        return Some(input + cache_creation + cache_read);
+    }
+    None
+}
+
 // ---------------------------------------------------------------------------
 // Transcript location
 // ---------------------------------------------------------------------------
@@ -247,6 +286,21 @@ pub fn claude_session_usage_in(root: &Path, session_id: &str) -> Option<SessionU
         text.push('\n');
     }
     Some(parse_claude_transcript(&text))
+}
+
+/// Read a Claude session's CURRENT context-window usage (#328) — see
+/// `latest_context_tokens` — from a transcript under an explicit projects
+/// `root`. `None` when the transcript can't be found/opened or carries no
+/// real assistant turn yet.
+pub fn claude_context_tokens_in(root: &Path, session_id: &str) -> Option<u64> {
+    let path = claude_transcript_path(root, session_id)?;
+    let file = fs::File::open(&path).ok()?;
+    let mut text = String::new();
+    for line in BufReader::new(file).lines().map_while(Result::ok) {
+        text.push_str(&line);
+        text.push('\n');
+    }
+    latest_context_tokens(&text)
 }
 
 #[cfg(test)]
@@ -348,5 +402,56 @@ mod tests {
         assert!(price_for("claude-haiku-4-5").is_some());
         assert!(price_for("claude-fable-5").is_some());
         assert!(price_for("gpt-4o").is_none());
+    }
+
+    // ---------- latest_context_tokens (#328) ----------
+
+    #[test]
+    fn latest_context_tokens_reads_the_last_real_turn_not_the_cumulative_sum() {
+        // The whole point of this fn vs `parse_claude_transcript`: context
+        // fullness is what the MOST RECENT turn sent, not the running total
+        // across the session.
+        let text = [
+            line("t1", "claude-sonnet-5", 50_000, 500, 0, 0),
+            line("t2", "claude-sonnet-5", 80_000, 500, 0, 20_000),
+        ]
+        .join("\n");
+        // Cumulative sum (what parse_claude_transcript reports) would be
+        // 130_000 input tokens; the LATEST turn's context is 80_000 + 20_000
+        // (cache read) = 100_000, a materially different figure.
+        assert_eq!(latest_context_tokens(&text), Some(100_000));
+        let cumulative = parse_claude_transcript(&text);
+        assert_eq!(cumulative.tokens.input_tokens, 130_000, "sanity: cumulative really does differ");
+    }
+
+    #[test]
+    fn latest_context_tokens_self_corrects_after_a_compact() {
+        // A compact's next turn sends far less context — the figure must
+        // reflect that drop, not stay pinned to the pre-compact peak.
+        let text = [
+            line("before", "claude-sonnet-5", 180_000, 500, 0, 0),
+            line("after-compact", "claude-sonnet-5", 8_000, 500, 0, 0),
+        ]
+        .join("\n");
+        assert_eq!(latest_context_tokens(&text), Some(8_000));
+    }
+
+    #[test]
+    fn latest_context_tokens_skips_synthetic_and_non_assistant_lines() {
+        let text = [
+            r#"{"type":"summary","summary":"a title"}"#.to_string(),
+            line("real", "claude-sonnet-5", 42_000, 100, 0, 1_000),
+            // A trailing synthetic line (no real usage) must not be read as
+            // "the latest turn" and mask the real one before it.
+            line("synth", "<synthetic>", 999_999, 1, 0, 0),
+        ]
+        .join("\n");
+        assert_eq!(latest_context_tokens(&text), Some(43_000));
+    }
+
+    #[test]
+    fn latest_context_tokens_none_when_no_real_turn_exists() {
+        assert_eq!(latest_context_tokens(""), None);
+        assert_eq!(latest_context_tokens("not json\n{\"type\":\"user\"}"), None);
     }
 }
