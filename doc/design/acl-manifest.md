@@ -139,11 +139,12 @@ breaks main" into "CI is red." Three tests:
    (string search + bracket match, not a hand count) and diffs them against
    `command_manifest::APP_COMMANDS`. Fails if a command is registered in one
    list but not the other.
-2. **`app_commands_len_is_122`** (`app_commands_len_is_120` at this design's
+2. **`app_commands_len_is_125`** (`app_commands_len_is_120` at this design's
    original landing) — a drift tripwire against the count this design and the
    #363 plan cite; bumped to 122 by #360 Slice B's `list_plugins`/
-   `install_plugin`.
-3. **`main_has_all_120_and_zero_permission_denies_dangerous_spread`** — the
+   `install_plugin`, then to 125 by #360 Slice C's own three broker commands
+   (see the addendum below).
+3. **`main_has_all_125_and_zero_permission_denies_dangerous_spread`** — the
    one that matters most. It builds a real (headless) `tauri::test` mock app
    — `tauri::test::mock_builder()` + `.build(tauri::generate_context!())` —
    using the app's **actual on-disk `capabilities/`/`permissions/`**, the
@@ -215,17 +216,26 @@ change; the ACL command codegen runs on the build host, not in the shipped
 binary, and produces no random-id generation (permission identifiers derive
 from command names).
 
-## Update (#360 Slice C): 120 → 123 commands
+## Update (#360 Slices B and C): 120 → 122 → 125 commands
 
-The command count this note and `tests/acl_manifest.rs` cite grew from 120 to
-123 when Slice C (the pane-plugins trust core, `doc/design/pane-plugins.md`)
-added its own three commands — `plugin_open_window`, `plugin_broker_request`,
-`plugin_broker_open_channel`. `main` is granted all three (the "registered
-means main may call it" rule above applies unchanged); the latter two are
-also — and *only* — granted to a new `capabilities/plugin.json`
-(`windows: ["plugin-*"]`) via a new `permissions/sets/plugin-broker.toml` set,
-the first real (non-template) consumer of the zero-permission pattern this
-note's "zero-permission template" section anticipated. `plugin_open_window`
-is main-only (folded into the `misc` set) — a plugin window must never be
-able to open another plugin window itself. See `pane-plugins.md`'s Isolation
-section for the full trust-core design this made possible.
+The command count this note and `tests/acl_manifest.rs` cite grew twice past
+its #363 landing of 120:
+
+- **#360 Slice B** (backend host, `plugins.rs`) added `list_plugins` and
+  `install_plugin` (122 total) — both main-only, folded into a new
+  `permissions/sets/plugins.toml` set aggregated into `main-ui`.
+- **#360 Slice C** (the trust core, `pluginbroker.rs`) added its own three
+  commands (125 total) — `plugin_open_window`, `plugin_broker_request`,
+  `plugin_broker_open_channel`. `main` is granted all three (the "registered
+  means main may call it" rule above applies unchanged); the latter two are
+  also — and *only* — granted to a new `capabilities/plugin.json`
+  (`windows: ["plugin-*"]`) via a new `permissions/sets/plugin-broker.toml`
+  set, the first real (non-template) consumer of the zero-permission pattern
+  this note's "zero-permission template" section anticipated.
+  `plugin_open_window` is main-only (folded into the `misc` set) — a plugin
+  window must never be able to open another plugin window itself.
+
+Both slices' commands are otherwise ordinary entries in `APP_COMMANDS` and
+`generate_handler!`, subject to the same all-or-nothing flip as every other
+command. See `pane-plugins.md`'s Isolation section for the full trust-core
+design Slice C's grant makes possible.

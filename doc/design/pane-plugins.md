@@ -478,33 +478,42 @@ therefore uses Tauri's own IPC as the transport:
 A `WebviewWindow` has no `sandbox=""` attribute equivalent — none of the
 iframe sandbox tokens (`allow-forms`, `allow-top-navigation`, etc.) exist for
 a top-level webview window. Found empirically by the Phase-0.5 spike, and
-mitigated in Slice C's implementation:
+mitigated across Slices B and C:
 
 - **Unrestricted self-navigation.** `location.href = 'https://example.com/'`
   fully navigated the spike's plugin window to a real external page — nothing
-  stopped it. **Mitigation:** every plugin `WebviewWindowBuilder` is
-  constructed with `.on_navigation(...)`, locked to a pure predicate that
-  allows only the plugin's own `plugin://<id>/…` origin (on Windows, where a
-  custom scheme resolves as `http://<scheme>.localhost/<path>`, `<id>` is
-  checked as the first path segment rather than the host) and denies
-  everything else — another plugin's origin included, so one plugin's window
-  can't even navigate itself into impersonating a different plugin's origin.
+  stopped it. **Mitigation (Slice C):** every plugin `WebviewWindowBuilder`
+  is constructed with `.on_navigation(...)`, locked to a pure predicate that
+  allows only the plugin's own `plugin://localhost/<id>/…` address space —
+  the same one Slice B's scheme handler serves (see the `plugin://` scheme
+  bullet below); the authority is fixed (`localhost`, or `plugin.localhost`
+  on Windows) and `<id>` is checked as the first path segment, never the
+  host — and denies everything else, another plugin's own otherwise-valid
+  address included, so one plugin's window can't even navigate itself into
+  impersonating a different plugin.
 - **Network egress is not blocked by CSP alone; the app's global CSP is
   `null` anyway.** Tauri's CSP is one `tauri.conf.json` setting, not
   configurable per-`WebviewWindow` through the public builder API. The real
   lever — as this note's CSP subsection already specified before Option B was
-  chosen — is the `Content-Security-Policy` header the `plugin://` scheme
-  handler stamps on every response it returns, `connect-src 'none'` included.
-  Slice C's handler does this on **every** response, success or denial alike,
-  so a rejected request can't be distinguished from an allowed one by a
-  missing header.
+  chosen — is the `Content-Security-Policy` header Slice B's `plugin://`
+  scheme handler (`plugins::plugin_protocol_handler`) stamps on every
+  response it returns, `connect-src 'none'` included (hardened further with
+  `form-action 'none'`/`base-uri 'none'` — sandbox tokens alone don't stop a
+  form submission or a `<base>`-tag rewrite either). It does this on
+  **every** response, success or denial alike, so a rejected request can't
+  be distinguished from an allowed one by a missing header.
 - **Same-origin storage/messaging rendezvous is a real hazard the `plugin://`
   origin must actually prevent**, not an iframe-specific concern: two
   plugins (or a plugin and `main`) sharing one origin would share
   `localStorage`/`BroadcastChannel`/`SharedWorker` with each other. This is
   why the `storage` capability is namespaced by `pluginId` **host-side**
   (Slice C's broker, not origin isolation) rather than relying on each
-  plugin's `plugin://<id>` origin to keep them apart on its own.
+  plugin's `plugin://` origin to keep them apart on its own.
+- **Plugin-provided text is untrusted, regardless of transport.** A
+  manifest's `name` (and any other author-chosen string) is third-party text
+  loomux never audits — it must be treated as data everywhere it's
+  surfaced (a window title, a future pane-tab label in Slice D), never
+  interpolated into HTML or any other markup a renderer would parse.
 
 ## Install / discovery
 
@@ -615,32 +624,32 @@ are stated, without drifting from what was actually agreed:
 
 ## What later slices owe this note
 
-- **Slice B** (backend host) implements manifest parsing/validation —
-  reject-with-reason on any manifest violation, path-traversal-proof by
-  construction, never a partial accept — and install/discovery, then calls
-  the `plugin_open_window` command Slice C already built with the validated
-  result (`pluginId`/`entry`/`root`/`capabilities`/`apiVersion`, see
-  `pluginbroker::OpenPluginWindowRequest`). Slice C already implements the
-  `plugin://` scheme handler itself, jailed per-plugin-root and carrying the
-  CSP header the **Content-Security-Policy on plugin content** section
-  specifies on every response — Slice B does not reimplement that handler;
-  it only needs to hand `plugin_open_window` a root that resolves the way
-  that handler (and `fs.read`) expect. Omitting the CSP header would not be
-  a smaller version of this slice — it would silently falsify the threat
-  table's network row — but that risk is now closed inside Slice C's own
-  code, not deferred to Slice B's discipline.
+- **Slice B** (backend host — **done**, `plugins.rs`) implements manifest
+  parsing/validation (reject-with-reason on any manifest violation,
+  path-traversal-proof by construction, never a partial accept),
+  local-folder discovery/install under `plugins_root_dir()`, and **owns the
+  one registered `plugin://` scheme handler**
+  (`plugins::plugin_protocol_handler`, wired in `lib.rs`) — jailed
+  per-plugin-folder and carrying the CSP header the
+  **Content-Security-Policy on plugin content** section specifies on every
+  response, success or denial alike, hardened past this note's floor with
+  `form-action 'none'`/`base-uri 'none'`. Tauri allows exactly one handler
+  per registered scheme, so Slice C's `WebviewWindow` points at the URLs
+  this handler serves (`plugin://localhost/<id>/<entry>`,
+  `pluginbroker::build_plugin_url`) rather than registering a second one.
+  `list_plugins`/`install_plugin` are main-only commands (`permissions/sets/plugins.toml`).
 - **Slice C** (the broker, the trust core — **done**, this note's Isolation
   section records the decided design) ran the Phase-0/Phase-0.5 spikes;
   implemented the envelope contract, the capability/apiVersion check as one
   pure function (`pluginbroker::check_request` / `pluginprotocol.ts`'s
-  `checkCapability`) plus the command wiring around it; the `plugin_open_window`
-  command, its `on_navigation` lock, and the `plugin://` scheme handler with
-  its CSP header; forwards nothing to raw `invoke` from within a plugin
-  window, ever — a plugin's capability grants exactly two commands
-  (`capabilities/plugin.json`, `permissions/sets/plugin-broker.toml`). The
-  `metrics.system` capability is gated but its data handler is a stub pending
-  Slice E's `sys_processes`-shaped backend — the check is real, the numbers
-  aren't yet.
+  `checkCapability`) plus the command wiring around it; `plugin_open_window`
+  (which builds the `WebviewWindow` pointed at Slice B's `plugin://` address
+  space and installs the `on_navigation` lock); forwards nothing to raw
+  `invoke` from within a plugin window, ever — a plugin's capability grants
+  exactly two commands (`capabilities/plugin.json`,
+  `permissions/sets/plugin-broker.toml`). The `metrics.system` capability is
+  gated but its data handler is a stub pending Slice E's `sys_processes`-shaped
+  backend — the check is real, the numbers aren't yet.
 - **Slice D** (the `"plugin"` kind) adds exactly one member to each closed
   union this note describes as inheriting the content-pane mechanism, adds
   `pluginId` to `PersistedPane`, and implements the restore fail-soft
