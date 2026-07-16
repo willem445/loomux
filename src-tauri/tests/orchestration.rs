@@ -5566,6 +5566,44 @@ fn compact_nudge_tick_escalation_latch_clears_once_back_under_threshold() {
 }
 
 #[test]
+fn compact_nudge_tick_never_fires_a_second_compact_while_the_first_is_still_pending() {
+    // rev-12 review: neither the context-escalation fallback nor the final
+    // fire decision checked `compact_pending`, so a still-over-threshold
+    // context% reading on the tick right after a fallback-triggered fire —
+    // before the pane has visibly gone busy from loomux's point of view, so
+    // it still reads quiet — re-armed `compact_requested` (reset to false
+    // when the first /compact fired) and typed a SECOND `/compact` into a
+    // pane whose first compact hadn't resolved yet.
+    let (reg, _d, gid, oid) = compact_nudge_setup(9999); // heuristic effectively unreachable
+    reg.set_compact_context_threshold(&gid, 80).unwrap();
+    let empty = HashMap::new();
+    let over: HashMap<String, u32> = [(oid.clone(), 90u32)].into_iter().collect();
+
+    // Tick 1: first crossing — notice only, no fire.
+    assert!(reg.compact_nudge_tick(1, &empty, &HashMap::new(), &over).is_empty());
+    assert_eq!(audit_count(&reg, &gid, "compact-escalation"), 1);
+    assert!(!reg.agent(&oid).unwrap().compact_pending);
+
+    // Tick 2: still over threshold, notice already latched — the legitimate
+    // fallback fires the FIRST compact.
+    let nudged = reg.compact_nudge_tick(2, &empty, &HashMap::new(), &over);
+    assert_eq!(nudged, vec![oid.clone()], "the fallback's first fire is expected");
+    assert!(reg.agent(&oid).unwrap().compact_pending, "now pending — unresolved");
+    assert_eq!(audit_count(&reg, &gid, "compact-nudge"), 1);
+
+    // Tick 3: STILL over threshold (a stale/unchanged reading — the compact
+    // from tick 2 hasn't produced visible output yet, so the pane still
+    // reads quiet). This is exactly the window the bug lived in. Must NOT
+    // fire a second /compact, and must not even re-notify or re-arm.
+    let nudged2 = reg.compact_nudge_tick(3, &empty, &HashMap::new(), &over);
+    assert!(nudged2.is_empty(), "must not fire a second /compact while the first is still pending");
+    assert_eq!(audit_count(&reg, &gid, "compact-nudge"), 1, "still just the one fire");
+    assert_eq!(audit_count(&reg, &gid, "compact-escalation"), 1, "no re-notify while pending either");
+    assert!(!reg.agent(&oid).unwrap().compact_requested,
+        "compact_requested must not be silently re-armed by escalation while pending");
+}
+
+#[test]
 fn compact_nudge_tick_detects_a_manually_typed_compact_and_reinjects_after_it_finishes() {
     let (reg, _d, gid, oid) = compact_nudge_setup(0); // heuristic off — isolate manual detection
     let signals: HashMap<String, (String, u64)> =
