@@ -210,7 +210,10 @@ pub fn default_claude_projects_root() -> Option<PathBuf> {
 /// folders for `<session-id>.jsonl`. Claude encodes the cwd into the folder
 /// name, so the file could be under any of them; a direct scan avoids
 /// re-deriving that encoding. `None` if no transcript exists yet.
-fn claude_transcript_path(root: &Path, session_id: &str) -> Option<PathBuf> {
+///
+/// `pub(crate)`: `orchestration::digest` reuses this resolver rather than
+/// re-deriving the same project-folder scan (#250/#324 slice B).
+pub(crate) fn claude_transcript_path(root: &Path, session_id: &str) -> Option<PathBuf> {
     let name = format!("{session_id}.jsonl");
     let projects = fs::read_dir(root).ok()?;
     for project in projects.flatten() {

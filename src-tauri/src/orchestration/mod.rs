@@ -13,6 +13,7 @@
 //! human sees every prompt exactly as if they had written it, can steer any
 //! pane, and the audit log (`audit.jsonl`) records the full text.
 
+pub mod digest;
 pub mod lessons;
 pub mod mcp;
 pub mod notify;
@@ -24,7 +25,7 @@ use serde_json::{json, Value};
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
-use std::io::Write as _;
+use std::io::{BufRead as _, BufReader, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, Weak};
@@ -2977,6 +2978,16 @@ pub fn cap_task_notes(mut notes: Vec<TaskNote>, max: usize) -> Vec<TaskNote> {
     out
 }
 
+/// How a `session_digest` call identifies the session to read (#250/#324
+/// slice B) — exactly one of a task id, an agent id, or a PR ref/number.
+/// `Pr` is sugar: it resolves to the task carrying that PR and re-dispatches
+/// as `Task`.
+pub enum DigestLookup {
+    Task(String),
+    Agent(String),
+    Pr(String),
+}
+
 /// Field edits for `upsert_task`; `None` leaves a field untouched.
 #[derive(Default)]
 pub struct TaskPatch {
@@ -4888,6 +4899,128 @@ impl OrchRegistry {
     /// view `list_tasks`'s compact rows point at (#245).
     pub fn get_task(&self, group: &str, id: &str) -> Option<Task> {
         self.tasks(group).into_iter().find(|t| t.id == id)
+    }
+
+    // ---------- session digest (#250/#324 slice B) ----------
+
+    /// Resolve a session's normalized transcript and reduce it to friction
+    /// windows + anchors — the shared backend behind the `session_digest` MCP
+    /// tool. Looks up the caller's group only (`merged_records`/`get_task`/
+    /// `tasks` are all group-scoped already), so a task/agent/pr id from
+    /// another group simply isn't found — same "unknown X" shape
+    /// `require_in_group` uses, no separate cross-group check needed.
+    ///
+    /// `merged_records` (not `agent()`) is used deliberately: this tool's
+    /// whole point is reading a session *after* it finished, when the worker
+    /// is very often already dead/reaped — a live-only lookup would return
+    /// "unknown agent" for the exact case the process-pro persona spawns
+    /// into (#324: "spawned at merge-gate resolution").
+    pub fn session_digest(&self, group: &str, lookup: DigestLookup) -> Result<digest::SessionDigest, String> {
+        let (session_id, cli, final_diff_ref, outcome, title) = match lookup {
+            DigestLookup::Agent(agent_id) => {
+                let rec = self
+                    .merged_records(group)
+                    .into_iter()
+                    .filter(|r| r.id == agent_id)
+                    .max_by_key(|r| r.updated_ms)
+                    .ok_or_else(|| format!("unknown agent: {agent_id}"))?;
+                let session_id = rec
+                    .session
+                    .clone()
+                    .ok_or_else(|| format!("agent {agent_id} has no recorded session transcript"))?;
+                let cli = self.cli_for_record(group, &rec);
+                (session_id, cli, rec.branch.clone(), None, Some(rec.task.clone()))
+            }
+            DigestLookup::Task(task_id) => {
+                let task = self.get_task(group, &task_id).ok_or_else(|| format!("unknown task: {task_id}"))?;
+                let session_id = task
+                    .session
+                    .clone()
+                    .ok_or_else(|| format!("task {task_id} has no recorded session"))?;
+                let cli = task
+                    .assignee
+                    .as_deref()
+                    .and_then(|aid| {
+                        self.merged_records(group).into_iter().filter(|r| r.id == aid).max_by_key(|r| r.updated_ms)
+                    })
+                    .map(|rec| self.cli_for_record(group, &rec))
+                    .unwrap_or_else(|| "claude".to_string());
+                (session_id, cli, task.pr.clone(), Some(task.status.clone()), Some(task.title.clone()))
+            }
+            DigestLookup::Pr(pr) => {
+                let want = pr_number(&pr).ok_or_else(|| format!("no PR number found in {pr:?}"))?;
+                let task = self
+                    .tasks(group)
+                    .into_iter()
+                    .find(|t| t.pr.as_deref().and_then(pr_number) == Some(want))
+                    .ok_or_else(|| format!("no task found for PR {pr}"))?;
+                return self.session_digest(group, DigestLookup::Task(task.id));
+            }
+        };
+        let events = self.read_session_transcript_events(&cli, &session_id)?;
+        Ok(digest::build_digest(&events, final_diff_ref, outcome, title))
+    }
+
+    /// The CLI a roster row's block/role resolves to, dead-agent-safe (unlike
+    /// `cli_for_agent`, which needs a live `AgentEntry`). Mirrors its
+    /// fallback: unresolvable role/group both fall back to `"claude"`.
+    fn cli_for_record(&self, group: &str, rec: &AgentRecord) -> String {
+        let role = workflow::kind_from_str(&rec.role).unwrap_or(Role::Worker);
+        self.group(group).map(|g| g.guardrails.cli_for(role).to_string()).unwrap_or_else(|| "claude".to_string())
+    }
+
+    /// Read+parse a session's transcript into normalized digest events.
+    /// Claude: resolved via the same `claude_projects_dir` test seam
+    /// `group_usage` uses. Copilot: `session-state/<id>/` carries no
+    /// per-turn transcript today (see `digest::parse_copilot_session_events`'s
+    /// doc) — best-effort from what's on disk, never an error just because
+    /// the richer files are absent.
+    ///
+    /// `session_id` reaches a filesystem path join below on both branches.
+    /// It's usually system-assigned (Claude's own session uuid), but
+    /// `Task.session` can be set by an agent through `upsert_task`'s
+    /// free-form `session` field — reject anything that isn't a plain path
+    /// component before it ever reaches `Path::join` (review finding NB4,
+    /// #250/#324 slice B follow-up).
+    fn read_session_transcript_events(&self, cli: &str, session_id: &str) -> Result<Vec<digest::TranscriptEvent>, String> {
+        if !digest::is_safe_session_id(session_id) {
+            return Err(format!("invalid session id: {session_id:?}"));
+        }
+        match cli {
+            "claude" => {
+                let root = self
+                    .claude_projects_dir
+                    .lock_safe()
+                    .clone()
+                    .or_else(crate::usage::default_claude_projects_root)
+                    .ok_or("cannot resolve the Claude projects root")?;
+                let path = crate::usage::claude_transcript_path(&root, session_id)
+                    .ok_or_else(|| format!("no Claude transcript found for session {session_id}"))?;
+                // Line-by-line via BufReader, not `fs::read_to_string` (review
+                // finding NB3): mirrors `usage::claude_session_usage_in`. A
+                // transcript is append-only and can be read mid-write — one
+                // malformed byte sequence on a line-in-progress fails
+                // `read_to_string`'s whole-file UTF-8 validation outright,
+                // where `BufReader::lines().map_while(Result::ok)` keeps
+                // everything read up to that point instead.
+                let file = fs::File::open(&path).map_err(|e| e.to_string())?;
+                let mut text = String::new();
+                for line in BufReader::new(file).lines().map_while(Result::ok) {
+                    text.push_str(&line);
+                    text.push('\n');
+                }
+                Ok(digest::parse_claude_transcript_events(&text))
+            }
+            "copilot" => {
+                let root = crate::sessions::copilot_session_state_root()
+                    .ok_or("cannot resolve the Copilot session-state root")?;
+                let dir = root.join(session_id);
+                let workspace = fs::read_to_string(dir.join("workspace.yaml")).unwrap_or_default();
+                let checkpoints = fs::read_to_string(dir.join("checkpoints").join("index.md")).unwrap_or_default();
+                Ok(digest::parse_copilot_session_events(&workspace, &checkpoints))
+            }
+            other => Err(format!("session_digest does not support agent CLI {other:?}")),
+        }
     }
 
     fn write_tasks(&self, group: &str, tasks: &[Task]) -> Result<(), String> {

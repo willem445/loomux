@@ -7030,6 +7030,188 @@ fn mark_dead_captures_usage_from_transcript() {
     assert_eq!(usage["lifetime_cost_basis"], "estimated");
 }
 
+// ---------- session_digest (#250/#324 slice B) ----------
+//
+// The `role_hint == process` gate the plan names is slice A's field
+// (`Block.role_hint`), landing in parallel — not yet on this branch. These
+// tests exercise the interim gate this slice actually ships: worker-kind
+// callers only (read-only tool, so this coarse exposure is deliberate and
+// documented — see the `tool_defs`/`call_tool` comments on `session_digest`).
+
+#[test]
+fn session_digest_returns_friction_windows_for_a_finished_worker() {
+    let proj = tempfile::tempdir().unwrap();
+    let (reg, _d) = test_registry();
+    reg.set_claude_projects_dir(proj.path().to_path_buf());
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let worker = reg.spawn_agent(&g.id, Role::Worker, "w", "fix the flaky test", false, None).unwrap();
+    let sid = worker.session_id.clone().unwrap();
+
+    let encoded = proj.path().join("C--tmp-repo");
+    fs::create_dir_all(&encoded).unwrap();
+    let transcript = format!(
+        "{}\n{}\n{}\n{}\n{}\n",
+        json!({"type":"user","timestamp":"2026-07-15T10:00:00.000Z",
+            "message":{"role":"user","content":"fix the flaky test"}}),
+        json!({"type":"assistant","timestamp":"2026-07-15T10:00:01.000Z","message":{"role":"assistant",
+            "content":[{"type":"tool_use","id":"c1","name":"Bash","input":{"command":"npm test"}}]}}),
+        json!({"type":"user","timestamp":"2026-07-15T10:00:02.000Z","message":{"role":"user",
+            "content":[{"type":"tool_result","tool_use_id":"c1","is_error":true,"content":"npm: command not found"}]}}),
+        json!({"type":"assistant","timestamp":"2026-07-15T10:00:03.000Z","message":{"role":"assistant",
+            "content":[{"type":"tool_use","id":"c2","name":"Bash","input":{"command":"pnpm test"}}]}}),
+        json!({"type":"user","timestamp":"2026-07-15T10:00:04.000Z","message":{"role":"user",
+            "content":[{"type":"tool_result","tool_use_id":"c2","is_error":false,"content":"1 passing"}]}}),
+    );
+    fs::write(encoded.join(format!("{sid}.jsonl")), transcript).unwrap();
+
+    // A separate worker plays the process-pro reading it cold, after the
+    // worker that did the work is reaped — mirroring "spawned at merge-gate
+    // resolution" (#324): session_digest must still find a dead agent's
+    // recorded session, not just a live one.
+    let proc = reg.spawn_agent(&g.id, Role::Worker, "proc", "", false, None).unwrap();
+    let cp = reg.resolve_token(&proc.token).unwrap();
+    reg.mark_dead(&worker.id, Some(0));
+
+    let r = dispatch(&reg, &cp, "tools/call",
+        &json!({ "name": "session_digest", "arguments": { "agent": worker.id } })).unwrap();
+    assert_eq!(r["isError"], false, "{r}");
+    let digest: Value = serde_json::from_str(r["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(digest["initial_prompt"], "fix the flaky test");
+    let windows = digest["windows"].as_array().unwrap();
+    assert!(!windows.is_empty(), "expected at least one friction window, got {digest}");
+    assert!(
+        windows.iter().any(|w| w["signature"] == "tool_error"),
+        "expected a tool_error window, got {digest}"
+    );
+}
+
+#[test]
+fn session_digest_resolves_via_task_id_and_via_pr_number() {
+    let proj = tempfile::tempdir().unwrap();
+    let (reg, _d) = test_registry();
+    reg.set_claude_projects_dir(proj.path().to_path_buf());
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let co = reg.resolve_token(&orch.token).unwrap();
+    let worker = reg.spawn_agent(&g.id, Role::Worker, "w", "fix the flaky test", false, None).unwrap();
+    let sid = worker.session_id.clone().unwrap();
+
+    let encoded = proj.path().join("C--tmp-repo");
+    fs::create_dir_all(&encoded).unwrap();
+    fs::write(
+        encoded.join(format!("{sid}.jsonl")),
+        format!(
+            "{}\n",
+            json!({"type":"user","timestamp":"2026-07-15T10:00:00.000Z",
+                "message":{"role":"user","content":"fix the flaky test"}}),
+        ),
+    )
+    .unwrap();
+
+    // The orchestrator files the task the way it would once the worker
+    // reports done and opens a PR.
+    let up = dispatch(&reg, &co, "tools/call", &json!({
+        "name": "upsert_task",
+        "arguments": {
+            "title": "flaky test", "status": "pr", "pr": "#42",
+            "assignee": worker.id, "session": sid,
+        },
+    })).unwrap();
+    assert_eq!(up["isError"], false, "{up}");
+    let task_id = reg.task_summaries(&g.id)[0].id.clone();
+
+    let proc = reg.spawn_agent(&g.id, Role::Worker, "proc", "", false, None).unwrap();
+    let cp = reg.resolve_token(&proc.token).unwrap();
+
+    let by_task = dispatch(&reg, &cp, "tools/call",
+        &json!({ "name": "session_digest", "arguments": { "task": task_id } })).unwrap();
+    assert_eq!(by_task["isError"], false, "{by_task}");
+    let digest: Value = serde_json::from_str(by_task["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(digest["initial_prompt"], "fix the flaky test");
+    assert_eq!(digest["final_diff_ref"], "#42");
+    assert_eq!(digest["outcome"], "pr");
+
+    // `pr` is sugar for looking up the same task by its PR number.
+    let by_pr = dispatch(&reg, &cp, "tools/call",
+        &json!({ "name": "session_digest", "arguments": { "pr": "42" } })).unwrap();
+    assert_eq!(by_pr["isError"], false, "{by_pr}");
+    let digest2: Value = serde_json::from_str(by_pr["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(digest2["initial_prompt"], "fix the flaky test");
+}
+
+#[test]
+fn session_digest_denied_to_non_worker_roles() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let reviewer = reg.spawn_agent(&g.id, Role::Reviewer, "rev", "", false, None).unwrap();
+    let planner = reg.spawn_agent(&g.id, Role::Planner, "pln", "", false, None).unwrap();
+    for entry in [&orch, &reviewer, &planner] {
+        let caller = reg.resolve_token(&entry.token).unwrap();
+        let r = dispatch(&reg, &caller, "tools/call",
+            &json!({ "name": "session_digest", "arguments": { "agent": "whatever" } })).unwrap();
+        assert_eq!(r["isError"], true, "{:?} must be denied session_digest", entry.role);
+    }
+}
+
+#[test]
+fn session_digest_cross_group_agent_is_unknown_not_leaked() {
+    let (reg, _d) = test_registry();
+    let g1 = reg.create_group("C:/tmp/repo1", rails()).unwrap();
+    let g2 = reg.create_group("C:/tmp/repo2", rails()).unwrap();
+    let w1 = reg.spawn_agent(&g1.id, Role::Worker, "w", "task", false, None).unwrap();
+    let w2 = reg.spawn_agent(&g2.id, Role::Worker, "w", "task", false, None).unwrap();
+    let c1 = reg.resolve_token(&w1.token).unwrap();
+
+    let r = dispatch(&reg, &c1, "tools/call",
+        &json!({ "name": "session_digest", "arguments": { "agent": w2.id.clone() } })).unwrap();
+    assert_eq!(r["isError"], true);
+    let text = r["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("unknown agent"));
+    assert!(!text.contains(&g2.id), "must not leak the foreign group's id: {text}");
+}
+
+#[test]
+fn session_digest_requires_exactly_one_identifier() {
+    let (reg, _d, _co, cw) = setup_mcp();
+    let none = dispatch(&reg, &cw, "tools/call",
+        &json!({ "name": "session_digest", "arguments": {} })).unwrap();
+    assert_eq!(none["isError"], true);
+    assert!(none["content"][0]["text"].as_str().unwrap().contains("exactly one"));
+
+    let both = dispatch(&reg, &cw, "tools/call",
+        &json!({ "name": "session_digest", "arguments": { "agent": "w-1", "pr": "1" } })).unwrap();
+    assert_eq!(both["isError"], true);
+    assert!(both["content"][0]["text"].as_str().unwrap().contains("exactly one"));
+}
+
+/// Review finding NB4: `Task.session` is agent-settable via `upsert_task`,
+/// and it reaches a filesystem path join — a `..`/separator-laden value must
+/// be rejected before that join, end to end through the real MCP tool, not
+/// just at the pure `is_safe_session_id` unit level.
+#[test]
+fn session_digest_rejects_a_path_traversal_session_id() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let co = reg.resolve_token(&orch.token).unwrap();
+    let worker = reg.spawn_agent(&g.id, Role::Worker, "w", "task", false, None).unwrap();
+
+    let up = dispatch(&reg, &co, "tools/call", &json!({
+        "name": "upsert_task",
+        "arguments": { "title": "t", "assignee": worker.id, "session": "../../../../etc/passwd" },
+    })).unwrap();
+    assert_eq!(up["isError"], false, "{up}");
+    let task_id = reg.task_summaries(&g.id)[0].id.clone();
+
+    let proc = reg.spawn_agent(&g.id, Role::Worker, "proc", "", false, None).unwrap();
+    let cp = reg.resolve_token(&proc.token).unwrap();
+    let r = dispatch(&reg, &cp, "tools/call",
+        &json!({ "name": "session_digest", "arguments": { "task": task_id } })).unwrap();
+    assert_eq!(r["isError"], true);
+    assert!(r["content"][0]["text"].as_str().unwrap().contains("invalid session id"), "{r}");
+}
+
 #[test]
 fn usage_json_write_is_atomic_and_leaves_no_temp() {
     let (reg, _d) = test_registry();
