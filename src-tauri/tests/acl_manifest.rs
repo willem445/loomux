@@ -82,6 +82,17 @@ stub_commands!(
     voice_start, voice_stop, voice_cancel,
 );
 
+// Tauri's "local origin" custom-protocol scheme differs by platform (WebView2
+// needs an http(s) scheme, WKWebView/webkit2gtk accept a bare custom scheme):
+// `http://tauri.localhost` on Windows/Android, `tauri://localhost` elsewhere
+// (see `Webview::is_local_url` upstream). Using the Windows-only form here
+// made every invoke resolve as a *remote* origin on Linux/macOS, which
+// denies every command regardless of any grant — caught by CI (#363).
+#[cfg(any(windows, target_os = "android"))]
+const LOCAL_ORIGIN_URL: &str = "http://tauri.localhost";
+#[cfg(not(any(windows, target_os = "android")))]
+const LOCAL_ORIGIN_URL: &str = "tauri://localhost";
+
 fn invoke(
     webview: &tauri::WebviewWindow<tauri::test::MockRuntime>,
     cmd: &str,
@@ -92,7 +103,7 @@ fn invoke(
             cmd: cmd.into(),
             callback: tauri::ipc::CallbackFn(0),
             error: tauri::ipc::CallbackFn(1),
-            url: "http://tauri.localhost".parse().unwrap(),
+            url: LOCAL_ORIGIN_URL.parse().unwrap(),
             body: tauri::ipc::InvokeBody::default(),
             headers: Default::default(),
             invoke_key: tauri::test::INVOKE_KEY.to_string(),
