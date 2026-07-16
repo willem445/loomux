@@ -28,7 +28,8 @@ Every rung is a complete tool on its own — climb when you're ready:
    when a CLI needs you, resume Claude Code / Copilot sessions into a pane.
 3. **Agent orchestration, native** — a planning agent delegates GitHub issues
    to worker and reviewer panes. Every prompt visible, every action audited,
-   guardrails host-enforced, no agent ever merges.
+   guardrails host-enforced, no agent ever merges. Hard-won lessons persist
+   across groups via a committed `.loomux/lessons.md`, not just this run.
 4. **Custom agent workflows** — commit `.loomux/workflow.yml` and your repo
    declares its own roster and merge gate: five focused reviewers, five
    prompts, five models.
@@ -154,6 +155,7 @@ src-tauri/src/
   sessions.rs       agent session discovery (one scan_* fn per agent source)
   orchestration/    agent groups: registry, guardrails, MCP server, audit
     workflow.rs     the block model (#222): a repo's agent roster as data — `<repo>/.loomux/workflow.yml` parse + validation. A block's id is the agent's identity; `kind` is its CAPABILITY CLASS, and stays a closed 4-variant enum, so a repo file can declare five reviewers with five prompts but can never grant one write access. Also the ENFORCED merge gate (#222/#197): reviewer-attributed verdicts (pass | fail | escalate) as durable state, and the pure gate decision the `gh` shim mirrors — `gh pr merge` is refused until every reviewer the gate names has recorded a pass, and no human grant or autonomous marker can open it. See doc/design/workflows.md
+    lessons.rs      durable per-repo lessons (#268): `<repo>/.loomux/lessons.md`, a plain-Markdown convention file (no schema, no MCP write tool — edited and reviewed like any other file) read-and-capped into the orchestrator's kickoff only. Hard byte cap with oldest-drop truncation, wrapped in a data-not-instructions provenance framing (#189) — never grounds to bypass the merge gate. See doc/design/lessons.md
     profiles.rs     repo-authored personas from `.github/agents/*.md` (#51, harvested from PR #105): append/replace modes with a non-overridable loomux mechanics core. Compiled to each CLI's native custom-agent flag — `claude --agents` (inline) / `copilot --agent` (a user-authored file only)
   obs.rs            crash observability: panic hook, breadcrumb log, unclean-exit notice
   voice.rs          voice prompts (#58): mic capture (cpal) -> local whisper.cpp subprocess
