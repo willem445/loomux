@@ -1294,13 +1294,17 @@ OR a valid grant. No new parallel checks — `gh_gate_decision` / `release_gate_
   determined agent with shell access *can* still: (1) call gh/git by its **absolute path**,
   skipping `PATH`; (2) use a **raw REST/GraphQL** merge/release shape the cheap match doesn't
   catch (unusual `gh api`, a direct `curl` with a token, a library) — or a git remote helper /
-  bare `v*` tag push under `-C otherdir` the confirm can't see; (3) run in a **cmd/pwsh** pane
-  with no `sh` on `PATH` (the `.cmd` fallback runs the real binary); (4) define a **`gh`/`git`
-  alias** re-invoking the real binary; (5) **forge a grant file** directly (`echo … >
-  $LOOMUX_GROUP_DIR/merge_grants/pr-N`) — the grant dir is on disk under the agent's own uid, so
-  its *existence* isn't cryptographically unforgeable; the "human-only" boundary is that no
-  loomux surface (MCP) mints one, not that the filesystem forbids it. All the same class as
-  absolute-path gh. Catching every shape needs sandboxing or network egress control, out of
+  bare `v*` tag push under `-C otherdir` the confirm can't see; (3) run on a machine with **no
+  `sh` anywhere at all** — not merely off `PATH` (`#335` closed that broader hole: the `.cmd`
+  delegator bakes in an absolute `sh.exe` path resolved from `git.exe`'s own install layout at
+  shim-write time, so a PowerShell/cmd pane on a normal Git-for-Windows install routes through
+  the gate exactly like Bash does; only a machine genuinely missing `sh` falls through to the
+  real binary, and that fallback is itself audited, `gate-degraded-no-sh`, never silent); (4)
+  define a **`gh`/`git` alias** re-invoking the real binary; (5) **forge a grant file** directly
+  (`echo … > $LOOMUX_GROUP_DIR/merge_grants/pr-N`) — the grant dir is on disk under the agent's
+  own uid, so its *existence* isn't cryptographically unforgeable; the "human-only" boundary is
+  that no loomux surface (MCP) mints one, not that the filesystem forbids it. All the same class
+  as absolute-path gh. Catching every shape needs sandboxing or network egress control, out of
   scope. **The gold-standard closing layer is a machine account**: give agents a GitHub token
   whose account has *no merge permission on the default branch and no release/tag-push rights*
   (branch protection + tag protection requiring a human/CODEOWNER). Then no client-side evasion

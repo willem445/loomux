@@ -17,7 +17,7 @@ use loomux_lib::orchestration::{
     delivery_held_cleared_event, delivery_held_detail, delivery_held_event,
     exit_cause, exit_diagnostic, resolve_output_text,
     gh_gate_decision, gh_is_merge_invocation, gh_positionals, gh_release_action, gh_repo_flag,
-    gh_shim_sh, git_shim_sh, git_tag_push, grant_segment, grant_unexpired, hold_for_human_input,
+    gh_shim_cmd, gh_shim_sh, git_shim_cmd, git_shim_sh, git_tag_push, grant_segment, grant_unexpired, hold_for_human_input,
     hold_until_quiet, idle_output_is_activity, idle_should_kill, idle_tick_should_fire,
     low_disk_notice, low_disk_transition, max_agents_notice, pr_number, release_gate_decision,
     GhGate, GitTagPush,
@@ -10989,4 +10989,253 @@ fn mark_dead_of_a_solo_pane_tears_the_channel_down_via_the_pty_exit_path() {
     reg.mark_dead(&solo_id, None);
     assert_eq!(channel_status(&reg, &cw)["connected"], json!(false));
     assert!(reg.audit_log(&g.id).iter().any(|e| e.action == "channel-disconnect"));
+}
+
+// ---------- #335: .cmd shim delegator bakes in an absolute sh path ----------
+//
+// CI cannot exercise an agent pane, so these tests target the generated
+// artifact directly (as #335's own test-strategy note asks): render the
+// `.cmd` delegator, invoke it with a PATH that carries none of sh.exe's
+// directory (the exact PowerShell/cmd shape reported live), and assert the
+// gate still fires — or, if sh genuinely can't be resolved, that the
+// degraded-gate audit event fires instead of a silent bypass.
+
+/// `where sh.exe`'s first hit, or `None` — used only to find an absolute path
+/// to feed into `gh_shim_cmd` as the pre-resolved `sh_path` (mirroring what
+/// `OrchRegistry::ensure_shims` would have baked in via `winpath::resolve_sh`
+/// at shim-write time). Not a claim about the *test process's* own PATH.
+#[cfg(windows)]
+fn locate_sh_exe() -> Option<String> {
+    let out = std::process::Command::new("where").arg("sh.exe").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .next()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+#[cfg(windows)]
+#[test]
+fn gh_cmd_shim_still_gates_a_merge_when_sh_is_stripped_from_the_invoking_path() {
+    // The live bug (#335): a default Git for Windows install puts git.exe on
+    // PATH but NOT sh.exe (`usr\bin` is off PATH) — a PowerShell/cmd
+    // invocation of gh.cmd used to `for %%S in (sh.exe) do set LOOMUX_SH=...`
+    // against the *invoking* shell's PATH, find nothing, and silently exec
+    // the real gh with no gate and no audit. The fix bakes an ABSOLUTE
+    // sh.exe path into the .cmd at shim-write time; this proves the
+    // delegator still routes through the POSIX gate even when the invoking
+    // process's PATH carries no trace of sh.exe's directory at all.
+    use std::process::Command;
+    let Some(sh_abs) = locate_sh_exe() else {
+        eprintln!("SKIP gh_cmd_shim_still_gates_a_merge…: no sh.exe found via `where`");
+        return;
+    };
+
+    let td = tempfile::tempdir().unwrap();
+    let root = td.path();
+    let group = root.join("group");
+    fs::create_dir_all(&group).unwrap();
+    let log = root.join("gh.log");
+    let fake = write_fake_gh(root, &log);
+    let shim_dir = root.join("shim");
+    fs::create_dir_all(&shim_dir).unwrap();
+
+    // The same POSIX gh shim the `sh`-invoked harness tests already exercise.
+    fs::write(shim_dir.join("gh"), gh_shim_sh(&fake.display().to_string())).unwrap();
+    // The Windows delegator, with the absolute sh path baked in (#335's fix) —
+    // exactly what `ensure_shims`/`write_shim` would have resolved via
+    // `winpath::resolve_sh` from git.exe's own install layout.
+    fs::write(
+        shim_dir.join("gh.cmd"),
+        gh_shim_cmd(&fake.display().to_string(), Some(&sh_abs.replace('\\', "/"))),
+    )
+    .unwrap();
+
+    // A PATH with no trace of sh.exe's directory — the exact PowerShell/cmd
+    // scenario #335 reports. Only bare Windows system dirs, so cmd.exe's own
+    // built-ins still resolve — never the shim dir, never any Git install dir.
+    let stripped_path = r"C:\Windows\System32;C:\Windows";
+
+    let status = Command::new(shim_dir.join("gh.cmd"))
+        .args(["pr", "merge", "5"])
+        .env("PATH", stripped_path)
+        .env("LOOMUX_GROUP_DIR", &group)
+        .env("FAKE_BASE", "main")
+        .env("FAKE_DEFAULT", "main")
+        .env("FAKE_NUM", "5")
+        .status()
+        .unwrap();
+
+    assert!(
+        !status.success(),
+        "the merge must still be BLOCKED (no grant, no markers) even with sh stripped from the \
+         invoking PATH — a bypass would exit 0"
+    );
+    let audit = fs::read_to_string(group.join("audit.jsonl")).unwrap_or_default();
+    assert!(
+        audit.contains("merge-gate-blocked"),
+        "must route through the real POSIX gate logic (not just fail some other way), got audit: {audit}"
+    );
+    let gh_log = fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        !gh_log.contains("FAKE-GH-RAN"),
+        "must never fall through to running gh unrestricted (the args-consuming fallback branch \
+         in the fake gh stub), got log: {gh_log}"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn git_cmd_shim_still_gates_a_tag_push_when_sh_is_stripped_from_the_invoking_path() {
+    // Same shape as the gh test above, for the git shim's release-gate path
+    // (`git push` of a `v*` tag, #83): #335's bug and fix are identical
+    // across both `.cmd` delegators, since they share `shim_cmd_delegator`.
+    use std::process::Command;
+    let Some(sh_abs) = locate_sh_exe() else {
+        eprintln!("SKIP git_cmd_shim_still_gates_a_tag_push…: no sh.exe found via `where`");
+        return;
+    };
+
+    let td = tempfile::tempdir().unwrap();
+    let root = td.path();
+    let group = root.join("group");
+    fs::create_dir_all(&group).unwrap();
+    let fake = root.join("fakegit");
+    fs::write(
+        &fake,
+        "#!/bin/sh\n\
+         if [ \"$1\" = \"rev-parse\" ]; then exit 1; fi\n\
+         printf 'FAKE-GIT-RAN\\n'; exit 0\n",
+    )
+    .unwrap();
+    let shim_dir = root.join("shim");
+    fs::create_dir_all(&shim_dir).unwrap();
+    fs::write(shim_dir.join("git"), git_shim_sh(&fake.display().to_string())).unwrap();
+    fs::write(
+        shim_dir.join("git.cmd"),
+        git_shim_cmd(&fake.display().to_string(), Some(&sh_abs.replace('\\', "/"))),
+    )
+    .unwrap();
+
+    let stripped_path = r"C:\Windows\System32;C:\Windows";
+    let status = Command::new(shim_dir.join("git.cmd"))
+        .args(["push", "origin", "refs/tags/v1.2.3"])
+        .env("PATH", stripped_path)
+        .env("LOOMUX_GROUP_DIR", &group)
+        .status()
+        .unwrap();
+
+    assert!(
+        !status.success(),
+        "the tag push must still be BLOCKED (no grant) even with sh stripped from the invoking PATH"
+    );
+    let audit = fs::read_to_string(group.join("audit.jsonl")).unwrap_or_default();
+    assert!(audit.contains("release-gate-blocked"), "must route through the real gate logic, got audit: {audit}");
+}
+
+#[cfg(windows)]
+#[test]
+fn gh_cmd_shim_audits_loudly_instead_of_silently_bypassing_when_no_sh_is_resolvable() {
+    // #335's other half: if shim-write time genuinely cannot find `sh`
+    // anywhere on the machine, the fallback to the real binary must be LOUD
+    // (an audit event saying the gate is degraded), never a silent bypass.
+    // `sh_path: None` is exactly the shape `ensure_shims` bakes in for that
+    // case.
+    use std::process::Command;
+    let td = tempfile::tempdir().unwrap();
+    let root = td.path();
+    let group = root.join("group");
+    fs::create_dir_all(&group).unwrap();
+    let log = root.join("gh.log");
+
+    // A real-binary stand-in that `cmd.exe` can execute directly (no `sh`
+    // involved at all in this branch) — a minimal batch stub.
+    let fake_bat = root.join("fakegh.cmd");
+    fs::write(&fake_bat, format!("@echo off\r\necho FAKE-GH-RAN>>\"{}\"\r\nexit /b 0\r\n", log.display()))
+        .unwrap();
+
+    let shim_dir = root.join("shim");
+    fs::create_dir_all(&shim_dir).unwrap();
+    fs::write(shim_dir.join("gh.cmd"), gh_shim_cmd(&fake_bat.display().to_string(), None)).unwrap();
+
+    let status = Command::new(shim_dir.join("gh.cmd"))
+        .args(["pr", "merge", "5"])
+        .env("LOOMUX_GROUP_DIR", &group)
+        .status()
+        .unwrap();
+
+    assert!(status.success(), "the degraded fallback still runs the real binary, so this exits 0");
+    let gh_log = fs::read_to_string(&log).unwrap_or_default();
+    assert!(gh_log.contains("FAKE-GH-RAN"), "the real binary must have actually run: {gh_log}");
+    let audit = fs::read_to_string(group.join("audit.jsonl")).unwrap_or_default();
+    assert!(
+        audit.contains("gate-degraded-no-sh"),
+        "a fallback with no sh resolvable must be audited LOUDLY, not silent — got audit: {audit:?}"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn gh_cmd_shim_ignores_an_inherited_loomux_sh_in_the_degraded_no_sh_case() {
+    // rev-10 review finding on #335: `setlocal` makes the .cmd's OWN variable
+    // changes revertible, but it does NOT clear a `LOOMUX_SH` the invoking
+    // shell already exported. Before the fix, the degraded (`sh_path: None`)
+    // template never `set` LOOMUX_SH at all — so an inherited value (stray
+    // env, or an adversarial agent priming its own shell) would satisfy `if
+    // not defined LOOMUX_SH` and route through THAT untrusted binary instead
+    // of taking the audited degraded-fallback branch, defeating the "never a
+    // silent bypass" guarantee for exactly the case this delegator exists to
+    // protect. The fix unconditionally clears LOOMUX_SH before the check;
+    // this pins it by simulating the attack: an inherited LOOMUX_SH pointing
+    // at a stand-in binary that must NEVER run.
+    use std::process::Command;
+    let td = tempfile::tempdir().unwrap();
+    let root = td.path();
+    let group = root.join("group");
+    fs::create_dir_all(&group).unwrap();
+    let log = root.join("gh.log");
+
+    let fake_bat = root.join("fakegh.cmd");
+    fs::write(&fake_bat, format!("@echo off\r\necho FAKE-GH-RAN>>\"{}\"\r\nexit /b 0\r\n", log.display()))
+        .unwrap();
+
+    // A stand-in for a hijacked/inherited "sh.exe" — if the .cmd ever invokes
+    // it, that alone proves the inherited variable shadowed the baked-in
+    // (empty) resolution.
+    let malicious_log = root.join("malicious.log");
+    let malicious = root.join("malicious_sh.cmd");
+    fs::write(
+        &malicious,
+        format!("@echo off\r\necho MALICIOUS-SH-RAN>>\"{}\"\r\nexit /b 0\r\n", malicious_log.display()),
+    )
+    .unwrap();
+
+    let shim_dir = root.join("shim");
+    fs::create_dir_all(&shim_dir).unwrap();
+    // sh_path: None — shim-write time found no sh anywhere on the machine.
+    fs::write(shim_dir.join("gh.cmd"), gh_shim_cmd(&fake_bat.display().to_string(), None)).unwrap();
+
+    let status = Command::new(shim_dir.join("gh.cmd"))
+        .args(["pr", "merge", "5"])
+        .env("LOOMUX_GROUP_DIR", &group)
+        .env("LOOMUX_SH", &malicious) // simulates an inherited/adversarial value
+        .status()
+        .unwrap();
+
+    assert!(status.success(), "the degraded fallback still runs the real binary, so this exits 0");
+    assert!(
+        !malicious_log.exists(),
+        "an inherited LOOMUX_SH must NEVER be trusted when shim-write time resolved no sh — the \
+         malicious stand-in must not have run"
+    );
+    let gh_log = fs::read_to_string(&log).unwrap_or_default();
+    assert!(gh_log.contains("FAKE-GH-RAN"), "the real binary must have run via the degraded fallback: {gh_log}");
+    let audit = fs::read_to_string(group.join("audit.jsonl")).unwrap_or_default();
+    assert!(
+        audit.contains("gate-degraded-no-sh"),
+        "the degraded fallback must still be audited even with an inherited LOOMUX_SH present — got audit: {audit:?}"
+    );
 }
