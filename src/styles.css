@@ -474,14 +474,19 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 /* ---------- attention routing: "needs attention" badge (#6) ---------- */
 /* A pane the backend attention scan flagged (idle-with-prompt, a worker report,
    or a task at a human merge gate). The chip names the reason; the header edge
-   pulses amber so a pane needing you stands out across a wall of terminals. */
-.pane-attn {
-  flex: none; cursor: pointer;
+   pulses amber so a pane needing you stands out across a wall of terminals.
+   Shares its base look + pulse with .pane-held (#246, delivery-held badge,
+   below) — one shared rule rather than two copies of the same color values —
+   since both are this app's "amber = needs your attention" convention;
+   .pane-attn adds its own click affordance on top. */
+.pane-attn, .pane-held {
+  flex: none;
   font-size: 9px; font-weight: 700; letter-spacing: 0.4px;
   border: 1px solid #6a5230; border-radius: 4px; padding: 1.5px 6px;
   color: #f2c66a; background: rgba(224, 175, 104, 0.16);
   animation: attn-pulse 1.6s ease-in-out infinite;
 }
+.pane-attn { cursor: pointer; }
 .pane-attn:hover { background: rgba(224, 175, 104, 0.28); color: #ffd886; }
 /* Blocked is the most urgent — tint it red rather than amber. */
 .pane-attn[data-reason="blocked"] {
@@ -495,7 +500,7 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   50% { box-shadow: 0 0 8px 1px rgba(224, 175, 104, 0.5); }
 }
 @media (prefers-reduced-motion: reduce) {
-  .pane-attn { animation: none; }
+  .pane-attn, .pane-held { animation: none; }
 }
 
 /* ---------- delivery-held badge (#246) ---------- */
@@ -503,21 +508,12 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
    human's own input occupies this pane's CLI box. Distinct from .pane-attn
    (which flags a pane the human should look AT): this flags a pane loomux is
    NOT writing to right now — a live-test report found the original muted,
-   non-pulsing treatment too easy to miss, so it now pulses using the SAME
-   amber warning color/animation shape as .pane-attn (this app's one existing
-   "needs your attention" convention) rather than inventing a second one;
-   reserving red for actual error states elsewhere in the UI, per the human's
-   own preference. Still no hover affordance — nothing to click here. */
-.pane-held {
-  flex: none;
-  font-size: 9px; font-weight: 700; letter-spacing: 0.4px;
-  border: 1px solid #6a5230; border-radius: 4px; padding: 1.5px 6px;
-  color: #f2c66a; background: rgba(224, 175, 104, 0.16);
-  animation: attn-pulse 1.6s ease-in-out infinite;
-}
-@media (prefers-reduced-motion: reduce) {
-  .pane-held { animation: none; }
-}
+   non-pulsing treatment too easy to miss, so it now pulses (base look +
+   animation shared with .pane-attn above) rather than inventing a second
+   "needs attention" visual language; reserving red for actual error states
+   elsewhere in the UI, per the human's own preference. Still no hover
+   affordance — nothing to click here, unlike .pane-attn — see the shared
+   `.pane-attn, .pane-held` rule above for its actual declarations. */
 
 /* ---------- cross-workspace channels (#271) ---------- */
 /* The connect gesture's three visual states, each independent (so they never fight
