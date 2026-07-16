@@ -144,7 +144,13 @@ await client.request("storage.set", { key: "greeting", value: "hi" });
 
 // Unsolicited events:
 const unsubscribe = client.onEvent("metrics.tick", (snapshot) => {
-  console.log(snapshot.cpuPercent, snapshot.processes);
+  // Field names are the Rust payload's own — `procmetrics::MetricsSnapshot`/
+  // `ProcessSample` are plain `#[derive(Serialize)]` structs with no
+  // camelCase rename, so the wire shape is snake_case throughout.
+  console.log(snapshot.cpu_percent, snapshot.mem_used_bytes, snapshot.mem_total_bytes);
+  for (const proc of snapshot.processes) {
+    console.log(proc.pid, proc.name, proc.cpu_percent, proc.rss_bytes);
+  }
 });
 await client.request("metrics.subscribe", { intervalMs: 2000 });
 // later: unsubscribe(); await client.request("metrics.unsubscribe");
