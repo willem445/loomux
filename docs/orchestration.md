@@ -148,7 +148,13 @@ Board controls:
   orchestrator pane, exactly as if you'd typed it. **Approve only ever shows for
   `pr`/`human-testing`**: once you request changes, the task returns to a working
   status and Approve disappears with it, so a reopened item can never keep
-  showing a stale "approve" affordance for feedback you already sent back.
+  showing a stale "approve" affordance for feedback you already sent back. Note
+  that Approve is *your* merge gate, not the repo's — if a [custom
+  workflow](#custom-agent-workflows) has its own merge gate armed and
+  unsatisfied, Approve is relabeled up front (e.g. "Approve (won't merge — gate
+  needs rev-orch/rev-ui/rev-tests)") so you know before you click, and the
+  tooltip names your options: run the missing reviewers, toggle the workflow
+  off, or merge via the GitHub UI directly.
 - **▶ Proceed** on a `prototype` item (a demo-gated deliverable awaiting your
   verdict) promotes it: two-click confirm flips it to `in-progress`, records
   your decision, and prompts the orchestrator to take the prototype to a full
@@ -317,6 +323,62 @@ agent's state, and running session cost with a group total. From here you can:
   anyone — it just blocks new spawns until attrition brings the count back under.
 - **Fold panes** — the same group-wide minimize/restore as the orchestrator
   header, for reclaiming screen space.
+- **Workflow row** — when the repo has a [custom agent workflow](#custom-agent-workflows)
+  active, this panel names it, lists its roster, and shows the armed merge gate
+  in one line (e.g. "loomux · 6 blocks · merges to main require: rev-orch +
+  rev-ui + rev-tests · all-pass · ci-green") — so you know whether an Approve
+  can actually succeed before you click it, not after it bounces. If the gate
+  names reviewers the current roster can't spawn, the row warns loudly instead.
+- **Advanced-orchestrator toggle** — flip a repo's custom workflow on or off
+  live, no relaunch: the merge gate and the roster for future spawns update
+  immediately, and the orchestrator's pane gets a `[loomux] workflow mode
+  changed: …` notice so it can adjust its spawn/review strategy mid-session.
+  Agents already running keep the role they were spawned under; only new
+  spawns pick up the swapped roster.
+
+## Custom agent workflows
+
+By default a group runs the built-in four-role roster — one orchestrator,
+worker, reviewer, and planner, each on the CLI/model you picked at launch. A
+repo can commit `<repo>/.loomux/workflow.yml` and declare its own instead: any
+number of named blocks, each with its own capability class (orchestrator,
+worker, reviewer, or planner), CLI, model, and persona, plus a **merge gate**
+naming which reviewer blocks must record a `pass` verdict — enforced
+mechanically by the `gh` shim — before `gh pr merge` can succeed. See
+[`doc/design/workflows.md`](https://github.com/willem445/loomux/blob/main/doc/design/workflows.md)
+for the full design.
+
+**Opt-in, every time.** A workflow file arrives with a `git clone` — the
+**advanced orchestrator** toggle is what makes a repo's workflow take effect;
+off (the default), the file is never even opened. Turning it on, at launch or
+live (see *Group lifecycle*, above), shows you the resolved roster — every
+block, its CLI/model, and which ones carry a repo-authored persona — before
+anything spawns.
+
+**The gate belongs to the session, not to a PR's history.** Toggling the
+workflow off ungates every merge from that session onward, including a PR
+opened earlier while the workflow was on — a gate that outlived the toggle
+that armed it would be exactly the kind of surprise this feature exists to
+prevent. A human Approve grant still never opens the workflow gate by itself
+(see *The task board*, above); toggling the workflow off is what actually
+clears it.
+
+**loomux never silently arms a gate it can't satisfy.** If a workflow's merge
+gate names reviewer blocks the currently-running roster can't actually spawn —
+most commonly a broken or missing `workflow.yml` on a relaunch — loomux
+doesn't drop the gate to keep merges flowing; it arms the gate anyway and
+shows a loud warning in the lifecycle panel, so the mismatch is something you
+see rather than something a bounced merge makes you go find.
+
+**Reviewer diversity across models.** A block's `cli`/`model` are set
+per-block, so nothing stops a reviewer lane from running on a different
+CLI/model than the one that wrote the code — a second model tends to catch a
+different class of defect than the one already primed on its own output.
+Worth considering for any reviewer-heavy workflow; loomux's own dogfood
+`.loomux/workflow.yml` notes the same above its reviewer blocks.
+
+*(Screenshots of the lifecycle panel's workflow row and live toggle to follow
+once that UI lands.)*
 
 ## Guardrails
 
