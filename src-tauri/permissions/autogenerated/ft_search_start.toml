@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-ft-search-start"
+description = "Enables the ft_search_start command without any pre-configured scope."
+commands.allow = ["ft_search_start"]
+
+[[permission]]
+identifier = "deny-ft-search-start"
+description = "Denies the ft_search_start command without any pre-configured scope."
+commands.deny = ["ft_search_start"]

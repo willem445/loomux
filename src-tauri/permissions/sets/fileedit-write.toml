@@ -1,0 +1,7 @@
+[[set]]
+identifier = "fileedit-write"
+description = "Mutating file-editor operations: write a file, find-and-replace."
+permissions = [
+    "allow-ft-write-file",
+    "allow-ft-replace",
+]

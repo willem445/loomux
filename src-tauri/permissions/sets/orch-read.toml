@@ -1,0 +1,19 @@
+[[set]]
+identifier = "orch-read"
+description = "Read-only orchestration queries: tasks, audit log, session roles, autonomy/usage/summary, workflow preview, channel list, notification/spawn state."
+permissions = [
+    "allow-agent-autopilot-flags",
+    "allow-orch-tasks",
+    "allow-orch-audit",
+    "allow-orch-session-roles",
+    "allow-orch-group-paused",
+    "allow-orch-notify-enabled",
+    "allow-orch-spawn-expanded",
+    "allow-orch-autonomy",
+    "allow-orch-group-usage",
+    "allow-orch-group-summary",
+    "allow-orch-workflow-preview",
+    "allow-orch-group-watches",
+    "allow-orch-channel-list",
+    "allow-orch-channel-for-pane",
+]

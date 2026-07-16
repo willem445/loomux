@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-orch-workflow-preview"
+description = "Enables the orch_workflow_preview command without any pre-configured scope."
+commands.allow = ["orch_workflow_preview"]
+
+[[permission]]
+identifier = "deny-orch-workflow-preview"
+description = "Denies the orch_workflow_preview command without any pre-configured scope."
+commands.deny = ["orch_workflow_preview"]

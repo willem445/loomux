@@ -1,0 +1,10 @@
+[[set]]
+identifier = "pty-control"
+description = "PTY session control: spawn, write, resize, kill terminals, change directory."
+permissions = [
+    "allow-spawn-pty",
+    "allow-write-pty",
+    "allow-kill-pty",
+    "allow-change-dir",
+    "allow-resize-pty",
+]

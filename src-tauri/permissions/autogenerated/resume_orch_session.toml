@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-resume-orch-session"
+description = "Enables the resume_orch_session command without any pre-configured scope."
+commands.allow = ["resume_orch_session"]
+
+[[permission]]
+identifier = "deny-resume-orch-session"
+description = "Denies the resume_orch_session command without any pre-configured scope."
+commands.deny = ["resume_orch_session"]

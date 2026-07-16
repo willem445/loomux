@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-orch-save-attachment"
+description = "Enables the orch_save_attachment command without any pre-configured scope."
+commands.allow = ["orch_save_attachment"]
+
+[[permission]]
+identifier = "deny-orch-save-attachment"
+description = "Denies the orch_save_attachment command without any pre-configured scope."
+commands.deny = ["orch_save_attachment"]

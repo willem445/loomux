@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-pty-backend-info"
+description = "Enables the pty_backend_info command without any pre-configured scope."
+commands.allow = ["pty_backend_info"]
+
+[[permission]]
+identifier = "deny-pty-backend-info"
+description = "Denies the pty_backend_info command without any pre-configured scope."
+commands.deny = ["pty_backend_info"]

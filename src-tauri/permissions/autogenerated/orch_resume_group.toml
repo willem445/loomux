@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-orch-resume-group"
+description = "Enables the orch_resume_group command without any pre-configured scope."
+commands.allow = ["orch_resume_group"]
+
+[[permission]]
+identifier = "deny-orch-resume-group"
+description = "Denies the orch_resume_group command without any pre-configured scope."
+commands.deny = ["orch_resume_group"]

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-orch-delete-tasks"
+description = "Enables the orch_delete_tasks command without any pre-configured scope."
+commands.allow = ["orch_delete_tasks"]
+
+[[permission]]
+identifier = "deny-orch-delete-tasks"
+description = "Denies the orch_delete_tasks command without any pre-configured scope."
+commands.deny = ["orch_delete_tasks"]

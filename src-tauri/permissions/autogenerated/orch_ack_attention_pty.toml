@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-orch-ack-attention-pty"
+description = "Enables the orch_ack_attention_pty command without any pre-configured scope."
+commands.allow = ["orch_ack_attention_pty"]
+
+[[permission]]
+identifier = "deny-orch-ack-attention-pty"
+description = "Denies the orch_ack_attention_pty command without any pre-configured scope."
+commands.deny = ["orch_ack_attention_pty"]

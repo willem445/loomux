@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-fm-rename"
+description = "Enables the fm_rename command without any pre-configured scope."
+commands.allow = ["fm_rename"]
+
+[[permission]]
+identifier = "deny-fm-rename"
+description = "Denies the fm_rename command without any pre-configured scope."
+commands.deny = ["fm_rename"]

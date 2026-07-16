@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-orch-proceed-task"
+description = "Enables the orch_proceed_task command without any pre-configured scope."
+commands.allow = ["orch_proceed_task"]
+
+[[permission]]
+identifier = "deny-orch-proceed-task"
+description = "Denies the orch_proceed_task command without any pre-configured scope."
+commands.deny = ["orch_proceed_task"]

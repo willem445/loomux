@@ -1,0 +1,7 @@
+[[set]]
+identifier = "gitwatch"
+description = "Register/unregister a pane's repo for external checkout/commit/stage polling."
+permissions = [
+    "allow-git-watch",
+    "allow-git-unwatch",
+]

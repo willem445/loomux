@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-orch-solo-prepare"
+description = "Enables the orch_solo_prepare command without any pre-configured scope."
+commands.allow = ["orch_solo_prepare"]
+
+[[permission]]
+identifier = "deny-orch-solo-prepare"
+description = "Denies the orch_solo_prepare command without any pre-configured scope."
+commands.deny = ["orch_solo_prepare"]

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-dir-info"
+description = "Enables the dir_info command without any pre-configured scope."
+commands.allow = ["dir_info"]
+
+[[permission]]
+identifier = "deny-dir-info"
+description = "Denies the dir_info command without any pre-configured scope."
+commands.deny = ["dir_info"]

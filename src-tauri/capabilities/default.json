@@ -2,6 +2,13 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Capabilities for the main window",
-  "windows": ["main"],
-  "permissions": ["core:default", "dialog:allow-open", "core:window:allow-destroy"]
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "core:default",
+    "dialog:allow-open",
+    "core:window:allow-destroy",
+    "main-ui"
+  ]
 }

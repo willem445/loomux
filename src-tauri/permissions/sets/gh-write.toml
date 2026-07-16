@@ -1,0 +1,9 @@
+[[set]]
+identifier = "gh-write"
+description = "Mutating GitHub CLI operations: create issues, set labels, comment on issues/PRs."
+permissions = [
+    "allow-gh-issue-create",
+    "allow-gh-issue-set-labels",
+    "allow-gh-issue-comment",
+    "allow-gh-pr-comment",
+]

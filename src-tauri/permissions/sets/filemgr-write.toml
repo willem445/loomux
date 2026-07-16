@@ -1,0 +1,12 @@
+[[set]]
+identifier = "filemgr-write"
+description = "Mutating file-manager operations: create/rename/delete/open files and folders."
+permissions = [
+    "allow-fm-new-folder",
+    "allow-fm-new-file",
+    "allow-fm-rename",
+    "allow-fm-delete-start",
+    "allow-fm-open",
+    "allow-fm-open-with",
+    "allow-fm-reveal",
+]

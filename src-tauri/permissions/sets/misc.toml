@@ -1,0 +1,15 @@
+[[set]]
+identifier = "misc"
+description = "Ungrouped single-module commands: session listing, agent CLI probing, external editor launch, file hashing, startup notice, durable UI tab state, voice capture."
+permissions = [
+    "allow-list-sessions",
+    "allow-probe-agent-cli",
+    "allow-open-in-editor",
+    "allow-fm-hash-start",
+    "allow-take-startup-notice",
+    "allow-load-ui-tabs",
+    "allow-save-ui-tabs",
+    "allow-voice-start",
+    "allow-voice-stop",
+    "allow-voice-cancel",
+]

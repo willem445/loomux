@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-orch-group-summary"
+description = "Enables the orch_group_summary command without any pre-configured scope."
+commands.allow = ["orch_group_summary"]
+
+[[permission]]
+identifier = "deny-orch-group-summary"
+description = "Denies the orch_group_summary command without any pre-configured scope."
+commands.deny = ["orch_group_summary"]

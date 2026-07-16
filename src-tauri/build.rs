@@ -1,7 +1,30 @@
+// Single source of truth for the 120 app command names (#363); shared with
+// `lib.rs` via `mod command_manifest` so the ACL coherence test can diff
+// this exact list against `generate_handler!` and `capabilities/default.json`.
+// `build.rs` can't depend on the compiled lib, so it's pulled in with
+// `include!` instead of `use loomux::command_manifest`.
+include!("src/command_manifest.rs");
+
 fn main() {
     copy_sideloaded_conhost();
     embed_test_manifest();
-    tauri_build::build()
+    // Opts loomux into Tauri's ACL system by giving the app's own commands a
+    // real manifest (`has_app_acl_manifest` flips true). Without this,
+    // `is_local_url` alone exempts every app command from ACL for every
+    // window regardless of capability grants — capability-based per-window
+    // command denial does nothing (see the #360 Phase-0.5 spike findings,
+    // https://github.com/willem445/loomux/issues/360#issuecomment-4992837152,
+    // and doc/design/acl-manifest.md).
+    //
+    // This flip is all-or-nothing: from this line on, every command in
+    // APP_COMMANDS that isn't explicitly granted in `capabilities/` is
+    // denied for *every* window, main included. `tests/acl_manifest.rs` is
+    // the CI guard that keeps main's grant coverage complete (#363).
+    tauri_build::try_build(
+        tauri_build::Attributes::new()
+            .app_manifest(tauri_build::AppManifest::new().commands(APP_COMMANDS)),
+    )
+    .expect("failed to build app ACL manifest");
 }
 
 /// Test executables link the same UI stack as the app (comctl32 v6 imports

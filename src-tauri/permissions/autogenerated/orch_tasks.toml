@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-orch-tasks"
+description = "Enables the orch_tasks command without any pre-configured scope."
+commands.allow = ["orch_tasks"]
+
+[[permission]]
+identifier = "deny-orch-tasks"
+description = "Denies the orch_tasks command without any pre-configured scope."
+commands.deny = ["orch_tasks"]

@@ -1,0 +1,7 @@
+[[set]]
+identifier = "filemgr-read"
+description = "Read-only file-manager queries: directory listing, capability probe."
+permissions = [
+    "allow-fm-list",
+    "allow-fm-capabilities",
+]

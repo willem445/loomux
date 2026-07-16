@@ -1,0 +1,19 @@
+[[set]]
+identifier = "main-ui"
+description = "Aggregates every module permission set (#363) — everything the trusted main webview needs across all 120 app commands. main is the only trusted webview, so it gets the full aggregate; a future plugin/non-main webview gets zero (see capabilities/plugin-zero-template.json) or a curated subset of the module sets below, never this aggregate."
+permissions = [
+    "pty-read",
+    "pty-control",
+    "git-read",
+    "git-write",
+    "gh-read",
+    "gh-write",
+    "gitwatch",
+    "orch-read",
+    "orch-control",
+    "fileedit-read",
+    "fileedit-write",
+    "filemgr-read",
+    "filemgr-write",
+    "misc",
+]

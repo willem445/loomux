@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-orch-session-roles"
+description = "Enables the orch_session_roles command without any pre-configured scope."
+commands.allow = ["orch_session_roles"]
+
+[[permission]]
+identifier = "deny-orch-session-roles"
+description = "Denies the orch_session_roles command without any pre-configured scope."
+commands.deny = ["orch_session_roles"]

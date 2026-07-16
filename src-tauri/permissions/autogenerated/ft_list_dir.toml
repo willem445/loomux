@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-ft-list-dir"
+description = "Enables the ft_list_dir command without any pre-configured scope."
+commands.allow = ["ft_list_dir"]
+
+[[permission]]
+identifier = "deny-ft-list-dir"
+description = "Denies the ft_list_dir command without any pre-configured scope."
+commands.deny = ["ft_list_dir"]

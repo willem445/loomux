@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-ft-files-start"
+description = "Enables the ft_files_start command without any pre-configured scope."
+commands.allow = ["ft_files_start"]
+
+[[permission]]
+identifier = "deny-ft-files-start"
+description = "Denies the ft_files_start command without any pre-configured scope."
+commands.deny = ["ft_files_start"]

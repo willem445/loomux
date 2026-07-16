@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-fm-open-with"
+description = "Enables the fm_open_with command without any pre-configured scope."
+commands.allow = ["fm_open_with"]
+
+[[permission]]
+identifier = "deny-fm-open-with"
+description = "Denies the fm_open_with command without any pre-configured scope."
+commands.deny = ["fm_open_with"]
