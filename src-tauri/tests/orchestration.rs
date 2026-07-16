@@ -11221,6 +11221,14 @@ fn advanced_orchestrator_toggle_fails_soft_on_corrupt_group_file() {
     let err = reg.set_advanced_orchestrator(&g.id, true, "human").unwrap_err();
     assert!(err.contains("not a JSON object"), "non-object root must fail soft, got: {err}");
     assert!(!reg.merge_gate_declared(&g.id), "a failed persist must never arm a gate");
+    // rev-24 N2: `load_workflow` succeeded here (the repo carries a valid
+    // workflow.yml) before the persist failed on the corrupt group.json — the
+    // "workflow-loaded" audit must not have been written for a load that never
+    // stuck, or the trail would claim a state change that didn't happen.
+    assert!(
+        !reg.audit_log(&g.id).iter().any(|e| e.action == "workflow-loaded"),
+        "a failed persist must not leave a stray workflow-loaded audit line"
+    );
 }
 
 #[test]

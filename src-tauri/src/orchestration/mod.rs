@@ -8747,11 +8747,16 @@ impl OrchRegistry {
         let mut guardrails = info.guardrails.clone();
         let mut gate: Option<workflow::Gate> = None;
         let mut name = String::new();
+        // Captured at load time, emitted only once the persist below actually
+        // succeeds (rev-24 N2) — auditing "workflow-loaded" before the write
+        // that makes it stick would leave a stray audit line claiming a load
+        // that never took effect if `persist_advanced_orchestrator` then fails.
+        let mut loaded_audit: Option<Value> = None;
 
         if on {
             match workflow::load_workflow(&info.repo) {
                 Ok(Some(wf)) => {
-                    self.audit(group, "loomux", "workflow-loaded", json!({
+                    loaded_audit = Some(json!({
                         "path": workflow::WORKFLOW_PATH,
                         "name": wf.name,
                         "blocks": wf.blocks.iter().map(|b| json!({ "id": b.id, "kind": b.kind })).collect::<Vec<_>>(),
@@ -8800,6 +8805,10 @@ impl OrchRegistry {
             let g = groups.get_mut(group).ok_or("unknown group")?;
             g.guardrails.blocks = guardrails.blocks.clone();
             g.guardrails.advanced_orchestrator = on;
+        }
+        // Only now that the persist succeeded — see `loaded_audit`'s doc above.
+        if let Some(detail) = loaded_audit {
+            self.audit(group, "loomux", "workflow-loaded", detail);
         }
 
         // Arm/clear the merge gate through the SAME path a fresh launch runs
