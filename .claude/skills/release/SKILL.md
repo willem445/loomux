@@ -32,8 +32,7 @@ follow-up #224). After editing Cargo.toml, run `cargo update --workspace` in
 `src-tauri/` to regenerate the lock — this is dependency resolution scoped to
 the workspace's own members, not a build: it doesn't invoke `rustc`, so it's
 the one exception the `ci-validate` skill carves out for agent workers (see
-that skill's "The Cargo.lock exception (still applies regardless of the
-guard)" section). Commit the lock
+that skill's "The Cargo.lock exception" section). Commit the lock
 change and let the bump PR's own CI run (below) prove `cargo check --locked`
 is consistent — don't also run `cargo check --locked` locally. After editing
 the root `package.json`, run `npm install --package-lock-only` to regenerate

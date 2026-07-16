@@ -249,9 +249,9 @@ assessment (sprawling change ⇒ serialize; independent ⇒ parallel worktrees) 
 monitor → reviewer per PR → **findings dispositioned** → high-level completion check → hand
 to user for merge. Workers: branch → implement → meaningful unit/functional tests (test
 intent, not vacuous passes) → **red-before-green evidence** → design notes + user docs →
-commit → push → `gh pr create` → report. Workers pick local vs. CI validation
-per the resource guard's discretion rule — see the `ci-validate` skill
-(#318/#320/#331) — but CI stays the sole authority for the CI gate.
+commit → push → `gh pr create` → report. Workers keep quick local iteration
+capped at `-j 4` and defer full/longer-running validation to CI — see the
+`ci-validate` skill (#320) — CI stays the sole authority for the CI gate.
 Reviewers: `gh pr review` with findings, each labelled blocking/non-blocking →
 report.
 

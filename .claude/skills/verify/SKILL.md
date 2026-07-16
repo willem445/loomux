@@ -12,12 +12,12 @@ manual checklist for the rest.
 
 ## Always run (both halves — a change to one often breaks the other's assumptions)
 
-Agent workers: whether these run locally or on `ci.yml` is a discretion call
-under the resource guard, not an automatic "run it" — follow
-`.claude/skills/ci-validate`'s decision rule, and cap any local `cargo`
-invocation at `-j 4` (`-- --test-threads=4` too, for `cargo test`). CI is
-still the sole authority for the CI gate regardless of what ran locally. The
-commands below are unconstrained for the human running this skill by hand.
+Agent workers: whether these run locally or on `ci.yml` follows
+`.claude/skills/ci-validate`'s scope/duration line, not an automatic "run it"
+— quick/local iteration is fine capped at `-j 4` (`-- --test-threads=4` too,
+for `cargo test`), but full-suite validation still goes to CI, which is the
+sole authority for the CI gate regardless of what ran locally. The commands
+below are unconstrained for the human running this skill by hand.
 
 ```sh
 npm run build                 # tsc --noEmit typecheck + Vite bundle
