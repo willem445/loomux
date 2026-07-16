@@ -154,6 +154,8 @@ pub fn run() {
             orchestration::orch_group_usage,
             orchestration::orch_group_summary,
             orchestration::orch_workflow_preview,
+            orchestration::orch_set_advanced_orchestrator,
+            orchestration::orch_workflow_status,
             orchestration::orch_group_watches,
             orchestration::orch_end_group,
             orchestration::orch_channel_connect,

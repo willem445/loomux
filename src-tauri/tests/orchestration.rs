@@ -20,6 +20,7 @@ use loomux_lib::orchestration::{
     gh_shim_sh, git_shim_sh, git_tag_push, grant_segment, grant_unexpired, hold_for_human_input,
     hold_until_quiet, idle_output_is_activity, idle_should_kill, idle_tick_should_fire,
     low_disk_notice, low_disk_transition, max_agents_notice, pr_number, release_gate_decision,
+    workflow_mode_notice,
     GhGate, GitTagPush,
     normalize_remote_web_base, parse_audit_lines, parse_audit_lines_counted, parse_session_cost,
     paste_held_notice,
@@ -489,6 +490,46 @@ fn max_agents_notice_reads_naturally() {
     assert_eq!(
         max_agents_notice(4, 2),
         "[loomux] max live agents changed 4→2 — re-plan accordingly"
+    );
+}
+
+#[test]
+fn workflow_mode_notice_reads_naturally() {
+    let all_pass_gate = workflow::Gate {
+        require: workflow::GateRequire::AllPass,
+        reviewers: vec!["rev-orch".into(), "rev-ui".into(), "rev-tests".into()],
+        also: vec!["ci-green".into()],
+    };
+    assert_eq!(
+        workflow_mode_notice(true, "loomux", Some(&all_pass_gate)),
+        "[loomux] workflow mode changed: 'loomux' active, merge gate requires all of \
+         [rev-orch, rev-ui, rev-tests] · ci-green — re-plan your spawn/review strategy."
+    );
+    let threshold_gate = workflow::Gate {
+        require: workflow::GateRequire::Threshold(2),
+        reviewers: vec!["a".into(), "b".into(), "c".into()],
+        also: vec![],
+    };
+    assert_eq!(
+        workflow_mode_notice(true, "focused-review", Some(&threshold_gate)),
+        "[loomux] workflow mode changed: 'focused-review' active, merge gate requires 2 of \
+         [a, b, c] — re-plan your spawn/review strategy."
+    );
+    assert_eq!(
+        workflow_mode_notice(true, "loomux", None),
+        "[loomux] workflow mode changed: 'loomux' active, no merge gate declared — re-plan \
+         your spawn/review strategy."
+    );
+    assert_eq!(
+        workflow_mode_notice(false, "loomux", None),
+        "[loomux] workflow mode changed: built-in roster, no merge gate — re-plan your \
+         spawn/review strategy."
+    );
+    // `off` ignores whatever gate/name it is (mis)called with — off has neither,
+    // by construction, whatever the caller passes.
+    assert_eq!(
+        workflow_mode_notice(false, "loomux", Some(&all_pass_gate)),
+        workflow_mode_notice(false, "", None)
     );
 }
 
@@ -8876,18 +8917,29 @@ fn the_rust_gate_status_never_reports_satisfied_when_the_shim_would_refuse() {
     reg.set_pr_head_override(Some(NEW_HEAD.into()));
     let s = reg.gate_status_line(&gid, 7).unwrap();
     assert!(s.contains("NOT YET SATISFIED") && s.contains("EARLIER revision"), "{s}");
+    // #316: every REFUSAL the Rust side reports names the three exits too — not
+    // just the shim's own stderr — so the task board / groupview surfaces (which
+    // read this, not the shell) can show the same way out.
+    assert!(
+        s.contains("get the named reviewer") && s.contains("turn workflow mode off")
+            && s.contains("merge this PR from the GitHub UI"),
+        "a NOT YET SATISFIED status must name the three exits: {s}"
+    );
 
     // The head can't be resolved at all → refuse, don't fall back to "a pass is a pass".
     reg.set_pr_head_override(None);
     let s = reg.gate_status_line(&gid, 7).unwrap();
     assert!(s.contains("cannot resolve") && s.contains("refused"), "{s}");
+    assert!(s.contains("turn workflow mode off"), "an UnknownRevision refusal must name the exits too: {s}");
 
     // A gate file that doesn't parse reads as MALFORMED (every merge refused), never as
     // "no gate declared" — which is exactly what the shim does with it.
     fs::write(d.path().join(&gid).join("merge_gate"), "require all-pass\nnonsense here\n").unwrap();
     assert!(reg.merge_gate(&gid).is_none(), "unparseable");
     assert!(reg.merge_gate_declared(&gid), "but present, so the shim WILL read it");
-    assert!(reg.gate_status_line(&gid, 7).unwrap().contains("MALFORMED"));
+    let s = reg.gate_status_line(&gid, 7).unwrap();
+    assert!(s.contains("MALFORMED"));
+    assert!(s.contains("turn workflow mode off"), "a MALFORMED refusal must name the exits too: {s}");
 }
 
 #[test]
@@ -8908,6 +8960,15 @@ fn gh_shim_script_enforces_the_workflow_merge_gate() {
     assert!(sh.contains("merge-gate-workflow-blocked") && sh.contains("merge-gate-workflow-ok"),
         "every workflow-gate decision is audited");
     assert!(!sh.contains('\r'), "POSIX shim must stay LF-only (a CRLF #!/bin/sh is broken)");
+    // #316: a refusal must never leave the way out unnamed — a human "Approve"
+    // grant never opens THIS gate (#197/#222), so the refusal itself has to
+    // carry the exits.
+    assert!(
+        sh.contains("get the named reviewer")
+            && sh.contains("turn workflow mode off")
+            && sh.contains("merge this PR from the GitHub UI"),
+        "the workflow-gate refusal must name all three exits: run the reviewers, toggle off, or the GitHub UI"
+    );
 }
 
 /// The #197/#151 case, executed end to end: a repo's declared gate, verdicts recorded
@@ -8934,6 +8995,15 @@ fn gh_shim_harness_refuses_the_merge_until_every_named_reviewer_has_passed() {
     let (ok, err) = merge(&shim, &group_dir);
     assert!(!ok, "a gated PR with no recorded verdict must not merge");
     assert!(err.contains("rev-security") && err.contains("rev-tests"), "and must say who it waits for: {err}");
+    // #316: the REAL refusal text (not just the shim's source) names all three
+    // exits — a human "Approve" grant never opens this gate, so the refusal
+    // itself must say what does.
+    assert!(
+        err.contains("get the named reviewer")
+            && err.contains("turn workflow mode off")
+            && err.contains("merge this PR from the GitHub UI"),
+        "the executed refusal must name all three exits: {err}"
+    );
 
     // 2) THE #151 CASE: one reviewer passed, the other is still reviewing → refused.
     let sec = reviewer_caller(&reg, &gid, "rev-security");
@@ -10937,4 +11007,318 @@ fn mark_dead_of_a_solo_pane_tears_the_channel_down_via_the_pty_exit_path() {
     reg.mark_dead(&solo_id, None);
     assert_eq!(channel_status(&reg, &cw)["connected"], json!(false));
     assert!(reg.audit_log(&g.id).iter().any(|e| e.action == "channel-disconnect"));
+}
+
+// ───────── #316: the LIVE advanced-orchestrator toggle ─────────
+//
+// `set_advanced_orchestrator` is modeled EXACTLY on `set_max_agents`/
+// `set_autonomous`: persist-first, in-memory swap, audit, notice. What's new
+// versus the launch-time-only toggle (#222) is that flipping it now arms or
+// clears the merge gate LIVE, via the identical `load_workflow` +
+// `sync_merge_gate` sequence a fresh launch runs — and never silently arms a
+// gate the running roster cannot satisfy (the incident behind #316).
+
+/// A repo whose workflow declares a worker tier under an id (`worker-deep`)
+/// the BUILT-IN roster does not carry — so a delegate spawned under the
+/// built-in `worker` block before the toggle has an identity the custom
+/// roster does not reuse, making "did the toggle re-persona a live agent" and
+/// "does a new spawn use the new roster" both directly observable.
+fn tiered_workflow_repo() -> tempfile::TempDir {
+    let td = tempfile::tempdir().unwrap();
+    let dir = td.path().join(".loomux");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("workflow.yml"),
+        "version: 1\nname: focused-review\n\
+         blocks:\n\
+         \x20 - id: worker-deep\n    kind: worker\n\
+         \x20 - id: rev-security\n    kind: reviewer\n    prompt: Security only.\n\
+         \x20 - id: rev-tests\n    kind: reviewer\n    prompt: Test quality only.\n\
+         gates:\n  merge:\n    reviewers: [rev-security, rev-tests]\n",
+    )
+    .unwrap();
+    td
+}
+
+/// A `.loomux/workflow.yml` that fails to parse — an unknown block kind, which
+/// `parse_workflow` rejects outright rather than coercing (workflow.rs's
+/// capability-closure rule: an unrecognized `kind` must never become a worker).
+fn broken_workflow_repo() -> tempfile::TempDir {
+    let td = tempfile::tempdir().unwrap();
+    let dir = td.path().join(".loomux");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("workflow.yml"),
+        "version: 1\nname: broken\nblocks:\n  - id: mystery\n    kind: wizard\n",
+    )
+    .unwrap();
+    td
+}
+
+#[test]
+fn advanced_orchestrator_toggle_on_arms_the_gate_swaps_blocks_and_notifies() {
+    let (reg, _d) = test_registry();
+    let repo = gated_repo("");
+    let g = reg.create_group(&repo.path().to_string_lossy(), rails()).unwrap();
+    assert!(!g.guardrails.advanced_orchestrator, "the group launches plain");
+    assert!(!reg.merge_gate_declared(&g.id), "no gate before the toggle");
+
+    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    reg.pause_group(&g.id).unwrap();
+
+    let status = reg.set_advanced_orchestrator(&g.id, true, "human").unwrap();
+    assert_eq!(status["advanced"], json!(true));
+    assert_eq!(status["name"], json!("focused-review"));
+
+    let g2 = reg.group(&g.id).unwrap();
+    assert!(g2.guardrails.advanced_orchestrator);
+    let ids: Vec<&str> = g2.guardrails.blocks.iter().map(|b| b.id.as_str()).collect();
+    assert!(
+        ids.contains(&"rev-security") && ids.contains(&"rev-tests"),
+        "the repo's roster must replace the built-in one: {ids:?}"
+    );
+
+    assert!(reg.merge_gate_declared(&g.id), "the gate file must be written");
+    let gate = reg.merge_gate(&g.id).unwrap();
+    assert_eq!(gate.reviewers, vec!["rev-security".to_string(), "rev-tests".to_string()]);
+    assert_eq!(status["gate"]["satisfiable"], json!(true));
+    assert_eq!(status["gate"]["missing_blocks"], json!(Vec::<String>::new()));
+
+    let entries = reg.audit_log(&g.id);
+    assert!(entries.iter().any(|e| e.action == "advanced-orchestrator-on"));
+    assert!(entries.iter().any(|e| e.action == "workflow-loaded"));
+    assert!(entries.iter().any(|e| e.action == "merge-gate-declared"));
+    let notice = entries
+        .iter()
+        .find(|e| {
+            e.action == "prompt-suppressed-paused"
+                && e.detail["text"].as_str().unwrap_or("").contains("workflow mode changed")
+        })
+        .unwrap_or_else(|| panic!("the orchestrator must receive the toggle notice: {entries:?}"));
+    assert!(notice.detail["text"].as_str().unwrap().contains("'focused-review' active"));
+}
+
+#[test]
+fn advanced_orchestrator_toggle_off_clears_the_gate_and_restores_builtin_roster() {
+    let (reg, _d) = test_registry();
+    let repo = gated_repo("");
+    let g = reg
+        .create_group(&repo.path().to_string_lossy(), Guardrails { advanced_orchestrator: true, ..rails() })
+        .unwrap();
+    assert!(reg.merge_gate_declared(&g.id), "the launch arms the gate");
+
+    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    reg.pause_group(&g.id).unwrap();
+
+    let status = reg.set_advanced_orchestrator(&g.id, false, "human").unwrap();
+    assert_eq!(status["advanced"], json!(false));
+    assert_eq!(status["gate"], Value::Null);
+
+    assert!(!reg.merge_gate_declared(&g.id), "the gate file must be removed");
+    let g2 = reg.group(&g.id).unwrap();
+    assert!(!g2.guardrails.advanced_orchestrator);
+    let ids: Vec<&str> = g2.guardrails.blocks.iter().map(|b| b.id.as_str()).collect();
+    assert_eq!(ids.len(), 4, "restored to the built-in four: {ids:?}");
+    for want in ["orchestrator", "worker", "reviewer", "planner"] {
+        assert!(ids.contains(&want), "{want} missing from the restored roster: {ids:?}");
+    }
+
+    let entries = reg.audit_log(&g.id);
+    assert!(entries.iter().any(|e| e.action == "advanced-orchestrator-off"));
+    assert!(entries.iter().any(|e| e.action == "merge-gate-cleared"));
+    assert!(entries.iter().any(|e| {
+        e.action == "prompt-suppressed-paused"
+            && e.detail["text"].as_str().unwrap_or("").contains("built-in roster, no merge gate")
+    }));
+}
+
+#[test]
+fn advanced_orchestrator_toggle_on_refuses_when_the_repo_declares_no_workflow_file() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/no-workflow-repo", rails()).unwrap();
+    let err = reg.set_advanced_orchestrator(&g.id, true, "human").unwrap_err();
+    assert!(err.contains("workflow.yml"), "the refusal must say why: {err}");
+    let g2 = reg.group(&g.id).unwrap();
+    assert!(!g2.guardrails.advanced_orchestrator, "a refused toggle must not flip the flag");
+    assert!(!reg.merge_gate_declared(&g.id), "and must not arm a gate");
+}
+
+#[test]
+fn advanced_orchestrator_toggle_on_refuses_on_a_broken_workflow_file() {
+    let (reg, _d) = test_registry();
+    let repo = broken_workflow_repo();
+    let g = reg.create_group(&repo.path().to_string_lossy(), rails()).unwrap();
+    let err = reg.set_advanced_orchestrator(&g.id, true, "human").unwrap_err();
+    assert!(err.contains("workflow.yml"), "{err}");
+    let g2 = reg.group(&g.id).unwrap();
+    assert!(!g2.guardrails.advanced_orchestrator);
+    assert_eq!(
+        g2.guardrails.blocks.len(),
+        4,
+        "a broken file must arm nothing — the built-in roster stands untouched: {:?}",
+        g2.guardrails.blocks
+    );
+    assert!(!reg.merge_gate_declared(&g.id));
+}
+
+#[test]
+fn advanced_orchestrator_toggle_persists_and_preserves_other_guardrails() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = gated_repo("");
+    let repo_path = repo.path().to_string_lossy().to_string();
+    let gid;
+    let path;
+    {
+        let reg = OrchRegistry::new(dir.path().to_path_buf());
+        reg.set_port(45999);
+        let g = reg.create_group(&repo_path, Guardrails { max_agents: 5, ..rails() }).unwrap();
+        gid = g.id.clone();
+        path = reg.state_root().join(&g.id).join("group.json");
+        reg.set_advanced_orchestrator(&g.id, true, "human").unwrap();
+    }
+    let v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(v["guardrails"]["advanced_orchestrator"], json!(true));
+    assert_eq!(v["guardrails"]["max_agents"], json!(5), "unrelated guardrails must survive the patch");
+    assert!(v["created_ms"].as_u64().is_some(), "created_ms must survive the patch");
+    let blocks = v["guardrails"]["blocks"].as_array().unwrap();
+    assert!(blocks.iter().any(|b| b["id"] == "rev-security"), "the new roster must be persisted: {blocks:?}");
+    assert!(blocks.iter().any(|b| b["id"] == "rev-tests"));
+
+    // A resumed session (session browser) rebuilds its guardrails from
+    // `load_group_file` — the real production path — and rejoins with
+    // `Launch::Resume`. The toggle and the roster/gate it produced must survive
+    // that rejoin: `advanced_orchestrator` is a launch-time input, not something
+    // `create_group_ex` self-heals from disk the way it does `max_agents`, so
+    // the caller (here, the real `load_group_file`) must carry it forward.
+    let reg = OrchRegistry::new(dir.path().to_path_buf());
+    reg.set_port(45999);
+    let (repo2, loaded) = reg.load_group_file(&gid).expect("group.json must still load");
+    assert!(loaded.advanced_orchestrator, "the persisted flag must read back true");
+    let g = reg.create_group_ex(&repo2, loaded, Launch::Resume).unwrap();
+    assert_eq!(g.id, gid, "resume reattaches the same group");
+    assert!(g.guardrails.advanced_orchestrator, "the toggle survives a restart");
+    assert!(g.guardrails.blocks.iter().any(|b| b.id == "rev-security"), "resume keeps the persisted roster");
+    assert!(reg.merge_gate_declared(&gid), "resume keeps the armed gate file");
+}
+
+#[test]
+fn advanced_orchestrator_toggle_is_a_noop_when_already_at_target() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    reg.set_advanced_orchestrator(&g.id, false, "human").unwrap();
+    let log = fs::read_to_string(reg.state_root().join(&g.id).join("audit.jsonl")).unwrap_or_default();
+    assert!(!log.contains("advanced-orchestrator"), "already-off must not audit a no-op toggle");
+}
+
+#[test]
+fn advanced_orchestrator_toggle_fails_soft_on_corrupt_group_file() {
+    let (reg, _d) = test_registry();
+    let repo = gated_repo("");
+    let g = reg.create_group(&repo.path().to_string_lossy(), rails()).unwrap();
+    // A valid-JSON but non-object root (e.g. from corruption) must error rather
+    // than panic on the in-place field assignment.
+    fs::write(reg.state_root().join(&g.id).join("group.json"), "null").unwrap();
+    let err = reg.set_advanced_orchestrator(&g.id, true, "human").unwrap_err();
+    assert!(err.contains("not a JSON object"), "non-object root must fail soft, got: {err}");
+    assert!(!reg.merge_gate_declared(&g.id), "a failed persist must never arm a gate");
+    // rev-24 N2: `load_workflow` succeeded here (the repo carries a valid
+    // workflow.yml) before the persist failed on the corrupt group.json — the
+    // "workflow-loaded" audit must not have been written for a load that never
+    // stuck, or the trail would claim a state change that didn't happen.
+    assert!(
+        !reg.audit_log(&g.id).iter().any(|e| e.action == "workflow-loaded"),
+        "a failed persist must not leave a stray workflow-loaded audit line"
+    );
+}
+
+#[test]
+fn advanced_orchestrator_toggle_never_reidentifies_a_live_delegate() {
+    let (reg, _d) = test_registry();
+    let repo = tiered_workflow_repo();
+    let g = reg.create_group(&repo.path().to_string_lossy(), rails()).unwrap();
+    // Spawned under the BUILT-IN roster, before the toggle.
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w1", "t", false, None).unwrap();
+    assert_eq!(w.block, "worker");
+
+    reg.set_advanced_orchestrator(&g.id, true, "human").unwrap();
+
+    // The live delegate keeps its original block identity — the roster swap
+    // never re-personas an agent a human already consented to.
+    assert_eq!(
+        reg.agent(&w.id).unwrap().block, "worker",
+        "a toggle must not retro-swap a live delegate's persona"
+    );
+
+    // The custom roster no longer HAS a "worker" id at all — the swap applies
+    // to FUTURE spawns only: a new default-block worker resolves to the new tier.
+    let w2 = reg.spawn_agent(&g.id, Role::Worker, "w2", "t", false, None).unwrap();
+    assert_eq!(w2.block, "worker-deep", "a spawn after the toggle must use the NEW roster");
+    assert!(
+        reg.spawn_agent_ex(
+            &g.id, Role::Worker, Some("worker".into()), "w3", "t", false, None, None, None, None, None
+        )
+        .is_err(),
+        "the built-in 'worker' block id must be gone from the roster after the toggle"
+    );
+}
+
+#[test]
+fn workflow_status_recomputes_satisfiability_live_against_drifted_gate_state() {
+    // The #316 incident, reproduced directly: a group's persisted `merge_gate`
+    // file names reviewers the CURRENT roster cannot spawn — group.json and the
+    // gate file came from different moments (whatever produced the drift: a
+    // relaunch that reset the roster but kept the last-known gate, a hand-edit,
+    // anything). `workflow_status` must recompute satisfiability fresh against
+    // the roster that is ACTUALLY running, every time — never trust a cached
+    // flag from whenever the gate was armed — and say so loudly rather than
+    // report SATISFIED while the shim would refuse every merge.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap(); // built-in 4-block roster
+    fs::write(
+        reg.state_root().join(&g.id).join("merge_gate"),
+        "require all-pass\nreviewer rev-orch\nreviewer rev-ui\nreviewer rev-tests\n",
+    )
+    .unwrap();
+
+    let status = reg.workflow_status(&g.id);
+    assert_eq!(
+        status["gate"]["satisfiable"], json!(false),
+        "the built-in roster can spawn none of the three named reviewers: {status}"
+    );
+    let missing: Vec<String> = status["gate"]["missing_blocks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(missing, vec!["rev-orch", "rev-ui", "rev-tests"]);
+}
+
+#[test]
+fn workflow_status_shapes_differ_for_a_workflow_group_and_a_builtin_group() {
+    let (reg, _d) = test_registry();
+    let repo = gated_repo("");
+    let g = reg.create_group(&repo.path().to_string_lossy(), rails()).unwrap();
+
+    let off = reg.workflow_status(&g.id);
+    assert_eq!(off["advanced"], json!(false));
+    assert_eq!(off["gate"], Value::Null);
+    assert_eq!(off["blocks"].as_array().unwrap().len(), 4, "the built-in roster: {off}");
+
+    reg.set_advanced_orchestrator(&g.id, true, "human").unwrap();
+    let on = reg.workflow_status(&g.id);
+    assert_eq!(on["advanced"], json!(true));
+    assert_eq!(on["name"], json!("focused-review"));
+    assert!(on["gate"].is_object());
+    assert_eq!(on["gate"]["satisfiable"], json!(true));
+    let on_blocks: Vec<&str> =
+        on["blocks"].as_array().unwrap().iter().map(|b| b["id"].as_str().unwrap()).collect();
+    assert!(on_blocks.contains(&"rev-security") && on_blocks.contains(&"rev-tests"));
+    for b in on["blocks"].as_array().unwrap() {
+        assert!(
+            b.get("kind").is_some() && b.get("cli").is_some() && b.get("model").is_some()
+                && b.get("persona").is_some(),
+            "every block in the wire shape must carry id/kind/cli/model/persona: {b}"
+        );
+    }
 }
