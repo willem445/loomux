@@ -4023,9 +4023,17 @@ fn the_repos_own_workflow_file_parses_clean_against_the_real_parser() {
 
     assert_eq!(
         wf.blocks.iter().map(|b| b.id.as_str()).collect::<Vec<_>>(),
-        ["orchestrator", "planner", "worker-deep", "worker-quick", "rev-orch", "rev-ui", "rev-tests"],
+        [
+            "orchestrator", "planner", "worker-deep", "worker-quick", "rev-orch", "rev-ui",
+            "rev-tests", "advisor", "process",
+        ],
         "ids are what edges, gates and spawn_agent(block:) reference — a rename here breaks the gate"
     );
+
+    // advisor/process (#250, #324): role_hint pairs with the kind it requires — the
+    // demo file is the one place this pairing rule is exercised against the real parser.
+    assert_eq!(wf.block("advisor").map(|b| (b.kind, b.role_hint.as_deref())), Some((Role::Planner, Some("advisor"))));
+    assert_eq!(wf.block("process").map(|b| (b.kind, b.role_hint.as_deref())), Some((Role::Worker, Some("process"))));
 
     for b in &wf.blocks {
         let Some(rel) = b.profile.as_deref() else { continue };
@@ -4034,7 +4042,12 @@ fn the_repos_own_workflow_file_parses_clean_against_the_real_parser() {
         // reviewer persona from being pointed at by a worker block (and vice versa).
         let p = profiles::load_block_profile(&repo, rel, b.kind)
             .unwrap_or_else(|e| panic!("{}: {e}", b.id));
-        assert_eq!(p.mode, ProfileMode::Append, "{}: a repo persona layers on loomux's contract", b.id);
+        // A role-hinted persona (advisor/process) is `mode: replace` — the role_hint-keyed
+        // addendum in `mechanics_core` rides the mechanics core regardless (slice C), so a
+        // replace persona still can't drop the read-only/human-merge-gate invariant. Every
+        // other repo persona here is `mode: append`, layering onto loomux's default contract.
+        let expected_mode = if b.role_hint.is_some() { ProfileMode::Replace } else { ProfileMode::Append };
+        assert_eq!(p.mode, expected_mode, "{}: unexpected persona mode", b.id);
         // Written in Copilot's own convention, so flipping a block to `cli: copilot`
         // gets the NATIVE `--agent <name>` rather than a kickoff paste — which is only
         // true if the handle resolves back, unambiguously, to the file we just read.
