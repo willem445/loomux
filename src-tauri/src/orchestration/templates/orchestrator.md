@@ -658,7 +658,10 @@ push a fix, register `notify_when(kind: "pr_checks", pr: <n>)` and **immediately
 work** — never sit in a wait loop, never `sleep`, never re-run `gh pr checks` on a cadence
 waiting for green. Loomux polls in the background and types a `[loomux] …` notice into
 this pane the moment the checks finish (or the watch expires); a just-completed run feeds **The
-CI gate**.
+CI gate**. A PR that goes `CONFLICTING` never gets check-suites at all — GitHub has no clean
+merge ref to run them against — so the watch resolves immediately with a distinct "is
+CONFLICTING" notice instead of silently sitting there toward expiry; treat it as the PR needing a
+rebase (**Re-sync the fleet**), not as CI still running.
 
 While any PR of yours is open, don't go dark on everything *else* about it. At every natural
 wake-up — a worker report, a board change, a human message — and on a slow periodic cadence
