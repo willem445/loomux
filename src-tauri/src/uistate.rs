@@ -55,6 +55,14 @@ fn tabs_path() -> PathBuf {
     state_dir().join("tabs.json")
 }
 
+/// `<user data dir>/loomux/plugins/storage` — one JSON blob per plugin id,
+/// the `storage` broker capability's backing store (#360 Slice C,
+/// `pluginbroker.rs`). Shares this module's atomic-write/quarantine
+/// discipline rather than reimplementing it a second time.
+pub(crate) fn plugin_storage_dir() -> PathBuf {
+    state_dir().join("plugins").join("storage")
+}
+
 /// Atomically write `contents` to `path`: create the parent dir, write a unique
 /// sibling temp file, **fsync it**, then rename it over the target. This mirrors
 /// the canonical `orchestration::atomic_write` (#133/#161) — the fsync is the

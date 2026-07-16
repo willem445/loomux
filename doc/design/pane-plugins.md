@@ -331,7 +331,26 @@ error surface is part of the contract, not an implementation detail.
 
 ## Isolation
 
-### Recommended model: sandboxed opaque-origin iframe
+**Status: DECIDED (Option B — child `WebviewWindow`).** The Phase-0/Phase-0.5
+spikes this section originally gated on have both run. Phase-0 (branch
+`spike/360-sandbox-proof`) found the sandboxed opaque-origin iframe **leaks**:
+the frame's own global gets a full, working `__TAURI_INTERNALS__` despite
+`sandbox="allow-scripts"` with no `allow-same-origin` (full findings:
+[#360 comment](https://github.com/willem445/loomux/issues/360#issuecomment-4992640640)).
+Phase-0.5 then proved the fallback below — a child `WebviewWindow` bound to a
+dedicated capability — **holds**, but only once loomux opts its own commands
+into Tauri's ACL system at all (full findings:
+[#360 comment](https://github.com/willem445/loomux/issues/360#issuecomment-4992837152)).
+That prerequisite is no longer a gap: #363/#366 shipped it (see
+`doc/design/acl-manifest.md`) — `src-tauri/build.rs` now builds a real app ACL
+manifest, `capabilities/plugin-zero-template.json` is the proven zero-grant
+base, and Slice C (this section's implementation) adds the real, populated
+`capabilities/plugin.json` a shipped plugin window is bound to. The sections
+below are written in the past tense where they describe what was *decided*
+and in the present tense where they describe what Slice C *built* — nothing
+here is provisional anymore.
+
+### Rejected: sandboxed opaque-origin iframe
 
 A plugin's `entry` HTML is rendered inside an `<iframe sandbox="allow-scripts">`
 — **deliberately without `allow-same-origin`** — served from a `plugin://`
@@ -346,6 +365,21 @@ This is the same model VS Code's own webview extensions use (sandboxed
 iframe, `postMessage`, no Node/host access) — a proven pattern at exactly
 this scale (view-level plugin code, not a service), not a novel design being
 tried for the first time here.
+
+**Rejected outcome (Phase-0, recorded for the historical record — do not
+build this):** the assumption above does not hold on this repo's Tauri
+2.11.5 / WebView2 / Windows 10 baseline. The sandboxed iframe's own global
+gets a fully working `__TAURI_INTERNALS__` — `invoke` function, invoke key,
+IPC pattern, all present — despite `sandbox="allow-scripts"` with no
+`allow-same-origin`. The opaque origin still correctly blocks the frame from
+*reflecting into* `window.top` (SOP does what SOP does), it just doesn't stop
+the frame getting its own copy of the internals wry/Tauri inject regardless
+of origin. A real `invoke("pty_backend_info")` from inside the sandboxed
+frame reached Tauri's IPC handler and was rejected only by an accidental
+`Url::parse("null")` parse failure on the opaque `Origin` header
+(`tauri-2.11.5/src/ipc/protocol.rs:496`) — not a deliberate boundary, and not
+one to build a trust model on. Full route-by-route evidence:
+[#360 comment](https://github.com/willem445/loomux/issues/360#issuecomment-4992640640).
 
 ### Content-Security-Policy on plugin content
 
@@ -376,58 +410,110 @@ home" row in the threat table above, even if the frame's sandbox/isolation
 is otherwise perfect — the two mechanisms are independent, and this note
 requires both.
 
-### One genuine unknown, and how a flip changes one section, not this whole note
+### Decided: child `WebviewWindow` with scoped capabilities (Option B)
 
-Everything above assumes Tauri does not inject `__TAURI_INTERNALS__` into
-child frames of an opaque origin inside its own WebView2 host — a reasonable
-assumption (it is exactly what the same-origin policy is for), but not yet
-*proven* against this specific Tauri/WebView2 build. That proof is a Phase-0
-spike, running in parallel with this slice (branch `spike/360-sandbox-proof`,
-Slice C's gating step): a throwaway frame that attempts
-`window.top.__TAURI_INTERNALS__.invoke(...)` and `import("@tauri-apps/api")`
-from inside the sandboxed opaque-origin frame, and must fail both.
+Each plugin gets its own Tauri `WebviewWindow`, positioned and sized to
+overlay the pane's content box (Slice D's job — out of this slice's scope),
+bound to `capabilities/plugin.json` (`windows: ["plugin-*"]`), which grants
+**exactly** the `plugin-broker` permission set — two commands,
+`plugin_broker_request` and `plugin_broker_open_channel` — and nothing else
+in the app's command surface. This holds *only* because #363/#366 gave
+loomux a real app ACL manifest first (`doc/design/acl-manifest.md`); without
+that prerequisite, a zero/curated-permission capability on a secondary window
+is inert, for the same root cause the iframe leaked by (see the Phase-0.5
+findings linked above). The broker contract, envelope shape, and capability
+enum from the sections above are all unchanged by this choice — none of them
+depend on iframe-specific mechanics (an opaque `"null"` origin, `sandbox`
+semantics); they depend on "the plugin's code cannot reach `invoke` and
+cannot reach the host DOM," which Option B satisfies by a different, and in
+practice more auditable, mechanism: a real, named, per-window ACL deny
+instead of an opaque-origin same-origin-policy wall.
 
-**This section is written so the spike's outcome only ever edits this one
-section:**
-
-- **If the spike confirms isolation holds** (the expected, recommended
-  outcome): nothing else in this note changes. The broker, the capability
-  enum, the manifest, the CSP contract above, and the install story are all
-  agnostic to *which* isolation primitive hosts the frame — they only depend
-  on "the plugin's code cannot reach `invoke` and cannot reach the host DOM,"
-  which either primitive satisfies.
-- **If the spike finds a leak** (Tauri injects into all frames regardless of
-  origin): the isolation primitive flips to the fallback below. Every other
-  section of this note — manifest, capability enum, broker envelope, the CSP
-  contract, install/discovery — is unchanged, because none of them depends on
-  iframe-specific mechanics (an opaque `"null"` origin, `sandbox` semantics);
-  they depend on "the plugin's sandboxed frame" and "the response the
-  `plugin://` handler returns," both of which the fallback still provides.
-  The one place that *does* read as iframe-specific — the origin discussion
-  in Install/discovery's `plugin://` bullet — is written below to call that
-  out explicitly, so a flip edits nothing there either.
-
-### Fallback: child `WebviewWindow` with scoped capabilities
-
-If the spike shows the opaque-origin iframe cannot be trusted in this
-WebView2 build, each plugin instead gets its own Tauri `WebviewWindow`,
-positioned and sized to overlay the pane's content box, with its **Tauri
-capability set scoped to grant nothing** (no app commands, no plugin
-permissions beyond what rendering needs). The broker, envelope shape,
-capability enum, and per-message checks above are unchanged — only the
-transport between "plugin code" and "the broker's `postMessage` listener"
-changes from an iframe boundary to a separate-webview boundary. This is
-heavier (a real OS-level window per plugin pane, its own lifecycle to manage
-inside a pane box that can split/dock/drag) and is why it is the fallback
-and not the plan of record — but it is a real, available option specifically
-*because* the broker contract above was designed not to assume which
-primitive hosts it.
-
-Two more options were weighed and rejected outright, not gated on the spike:
-a separate OS process per plugin (right isolation, wrong scale — plugins are
+Two more options were weighed and rejected outright, not gated on a spike: a
+separate OS process per plugin (right isolation, wrong scale — plugins are
 view code, not services) and no isolation at all / manual review (the exact
 thing this whole note exists to refuse — every one of the ~117 commands
 reachable, including a merge grant).
+
+**Transport: `invoke` + `Channel`, not literal `postMessage`.** The envelope
+shapes above (`PluginRequest`/`PluginResponse`/`PluginEvent`) were specified
+before Option B was chosen, and describe a `postMessage` bridge — correct for
+the rejected iframe model, where `event.source === frame.contentWindow` is a
+live, comparable JS reference. A child `WebviewWindow` is a separate
+top-level browsing context: `window.opener` is `null` (confirmed by the
+Phase-0.5 spike — Tauri creates secondary windows independently, not via
+`window.open()`), so there is no JS reference between it and `main` at all,
+and nothing for a literal `postMessage` to target. Slice C's broker
+therefore uses Tauri's own IPC as the transport:
+
+- **Plugin → host (request/response):** the plugin calls
+  `invoke("plugin_broker_request", { request })`; the command *is* the
+  request/response round trip — no second envelope hop needed. The
+  envelope's logical shape (`id`/`apiVersion`/`method`/`params` in,
+  `ok`/`result`/`error` out) is preserved exactly; only the wire mechanism
+  changed.
+- **Host → plugin (unsolicited events — resize/theme/metrics ticks):** a
+  `tauri::ipc::Channel<PluginEventWire>`, opened once via
+  `plugin_broker_open_channel`. This is deliberate, not incidental: granting
+  a plugin window the app's general `core:event:allow-listen` permission
+  would let it call `listen()` for *any* event name emitted anywhere in the
+  app — including e.g. `pty-output`, which broadcasts every pane's terminal
+  output on one shared event, per `pty.ts`'s own docstring — since Tauri's
+  permission gates whether `listen()` may be called at all, not which event
+  names it may hear. A `Channel` has no such surface: it is scoped to the one
+  invocation that created it, so a plugin can receive only what the broker
+  explicitly pushes to *its own* channel.
+- **Identity (step 1 of the per-message check):** structural rather than a
+  runtime comparison. Only a window matching `capabilities/plugin.json`'s
+  `windows: ["plugin-*"]` pattern can reach `plugin_broker_request` at all —
+  enforced by Tauri's ACL resolver before the broker's own code runs — and
+  the broker then looks up that exact window's registered session by its
+  label (unforgeable — Tauri, not the plugin, assigns and reports it via the
+  command's injected `Window` parameter). This is at least as strong as the
+  iframe model's `event.source` check, and it's the same mechanism that
+  makes the zero-permission template's denial real in the first place.
+
+### Residual capabilities a `WebviewWindow` has that a sandboxed iframe wouldn't, and their mitigations
+
+A `WebviewWindow` has no `sandbox=""` attribute equivalent — none of the
+iframe sandbox tokens (`allow-forms`, `allow-top-navigation`, etc.) exist for
+a top-level webview window. Found empirically by the Phase-0.5 spike, and
+mitigated across Slices B and C:
+
+- **Unrestricted self-navigation.** `location.href = 'https://example.com/'`
+  fully navigated the spike's plugin window to a real external page — nothing
+  stopped it. **Mitigation (Slice C):** every plugin `WebviewWindowBuilder`
+  is constructed with `.on_navigation(...)`, locked to a pure predicate that
+  allows only the plugin's own `plugin://localhost/<id>/…` address space —
+  the same one Slice B's scheme handler serves (see the `plugin://` scheme
+  bullet below); the authority is fixed (`localhost`, or `plugin.localhost`
+  on Windows) and `<id>` is checked as the first path segment, never the
+  host — and denies everything else, another plugin's own otherwise-valid
+  address included, so one plugin's window can't even navigate itself into
+  impersonating a different plugin.
+- **Network egress is not blocked by CSP alone; the app's global CSP is
+  `null` anyway.** Tauri's CSP is one `tauri.conf.json` setting, not
+  configurable per-`WebviewWindow` through the public builder API. The real
+  lever — as this note's CSP subsection already specified before Option B was
+  chosen — is the `Content-Security-Policy` header Slice B's `plugin://`
+  scheme handler (`plugins::plugin_protocol_handler`) stamps on every
+  response it returns, `connect-src 'none'` included (hardened further with
+  `form-action 'none'`/`base-uri 'none'` — sandbox tokens alone don't stop a
+  form submission or a `<base>`-tag rewrite either). It does this on
+  **every** response, success or denial alike, so a rejected request can't
+  be distinguished from an allowed one by a missing header.
+- **Same-origin storage/messaging rendezvous is a real hazard the `plugin://`
+  origin must actually prevent**, not an iframe-specific concern: two
+  plugins (or a plugin and `main`) sharing one origin would share
+  `localStorage`/`BroadcastChannel`/`SharedWorker` with each other. This is
+  why the `storage` capability is namespaced by `pluginId` **host-side**
+  (Slice C's broker, not origin isolation) rather than relying on each
+  plugin's `plugin://` origin to keep them apart on its own.
+- **Plugin-provided text is untrusted, regardless of transport.** A
+  manifest's `name` (and any other author-chosen string) is third-party text
+  loomux never audits — it must be treated as data everywhere it's
+  surfaced (a window title, a future pane-tab label in Slice D), never
+  interpolated into HTML or any other markup a renderer would parse.
 
 ## Install / discovery
 
@@ -538,17 +624,32 @@ are stated, without drifting from what was actually agreed:
 
 ## What later slices owe this note
 
-- **Slice B** (backend host) implements manifest parsing/validation and the
-  `plugin://` scheme exactly as specified above — reject-with-reason on any
-  manifest violation, path-traversal-proof by construction, never a partial
-  accept, and every scheme response carrying the CSP header the
-  **Content-Security-Policy on plugin content** section specifies. Omitting
-  that header is not a smaller version of this slice — it silently falsifies
-  the threat table's network row.
-- **Slice C** (the broker, the trust core) runs the Phase-0 spike first;
-  implements the envelope shapes and the four-step per-message check as one
-  pure function plus DOM wiring around it; forwards nothing to `invoke`,
-  ever.
+- **Slice B** (backend host — **done**, `plugins.rs`) implements manifest
+  parsing/validation (reject-with-reason on any manifest violation,
+  path-traversal-proof by construction, never a partial accept),
+  local-folder discovery/install under `plugins_root_dir()`, and **owns the
+  one registered `plugin://` scheme handler**
+  (`plugins::plugin_protocol_handler`, wired in `lib.rs`) — jailed
+  per-plugin-folder and carrying the CSP header the
+  **Content-Security-Policy on plugin content** section specifies on every
+  response, success or denial alike, hardened past this note's floor with
+  `form-action 'none'`/`base-uri 'none'`. Tauri allows exactly one handler
+  per registered scheme, so Slice C's `WebviewWindow` points at the URLs
+  this handler serves (`plugin://localhost/<id>/<entry>`,
+  `pluginbroker::build_plugin_url`) rather than registering a second one.
+  `list_plugins`/`install_plugin` are main-only commands (`permissions/sets/plugins.toml`).
+- **Slice C** (the broker, the trust core — **done**, this note's Isolation
+  section records the decided design) ran the Phase-0/Phase-0.5 spikes;
+  implemented the envelope contract, the capability/apiVersion check as one
+  pure function (`pluginbroker::check_request` / `pluginprotocol.ts`'s
+  `checkCapability`) plus the command wiring around it; `plugin_open_window`
+  (which builds the `WebviewWindow` pointed at Slice B's `plugin://` address
+  space and installs the `on_navigation` lock); forwards nothing to raw
+  `invoke` from within a plugin window, ever — a plugin's capability grants
+  exactly two commands (`capabilities/plugin.json`,
+  `permissions/sets/plugin-broker.toml`). The `metrics.system` capability is
+  gated but its data handler is a stub pending Slice E's `sys_processes`-shaped
+  backend — the check is real, the numbers aren't yet.
 - **Slice D** (the `"plugin"` kind) adds exactly one member to each closed
   union this note describes as inheriting the content-pane mechanism, adds
   `pluginId` to `PersistedPane`, and implements the restore fail-soft
