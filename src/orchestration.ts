@@ -947,6 +947,68 @@ export const endGroup = (groupId: string, cleanupWorktrees: boolean): Promise<En
 export const workflowPreview = (repo: string, agentCli: string): Promise<WorkflowPreview> =>
   invoke<WorkflowPreview>("orch_workflow_preview", { repo, agentCli });
 
+// ---------- workflow-mode status (#316): live toggle + armed-gate visibility ----------
+//
+// Unlike `workflowPreview` above (a launch-time-only "what would this run"
+// read), these describe the group's CURRENT, LIVE state: whether
+// advanced-orchestrator is on right now, the roster it actually swapped to,
+// and the merge gate armed for this session. Slice C's lifecycle chrome and
+// toggle button are the only intended callers.
+
+/** One block in the group's LIVE roster, as `orch_workflow_status` reports it.
+ *  Mirrors `RosterBlock` (roster.ts) but `persona` is collapsed to a plain
+ *  bool here — the live status doesn't distinguish prompt- vs profile-backed
+ *  personas the way a launch-time preview does. */
+export interface WorkflowStatusBlock {
+  id: string;
+  kind: OrchRole;
+  cli: string;
+  model: string;
+  persona: boolean;
+}
+
+/** The armed merge gate, as `orch_workflow_status` reports it. `satisfiable`/
+ *  `missing_blocks` are recomputed against the CURRENT roster on every read
+ *  (never cached from whenever the gate was armed), so they can change
+ *  between polls without another toggle. `require` is `"all-pass"` or
+ *  `"threshold N"`, exactly as the backend's `GateRequire` formats it. */
+export interface WorkflowGateStatus {
+  require: string;
+  reviewers: string[];
+  also: string[];
+  satisfiable: boolean;
+  missing_blocks: string[];
+}
+
+/** The group's current workflow-mode status — the single shape both
+ *  `orch_workflow_status` and `orch_set_advanced_orchestrator`'s return use,
+ *  so the lifecycle chrome and the toggle's own confirm can never disagree.
+ *  `gate` is `null` whenever `advanced` is off, or on but the repo's workflow
+ *  declares no `merge` gate. */
+export interface WorkflowStatus {
+  advanced: boolean;
+  name: string;
+  blocks: WorkflowStatusBlock[];
+  gate: WorkflowGateStatus | null;
+}
+
+/** The group's live workflow-mode status for the lifecycle UI (Slice C). A
+ *  slower, separate read from `groupSummary` (polled hot) — fetch on group
+ *  open/refresh and after the toggle notice, like `groupWatches`. */
+export const workflowStatus = (groupId: string): Promise<WorkflowStatus> =>
+  invoke<WorkflowStatus>("orch_workflow_status", { groupId });
+
+/** LIVE advanced-orchestrator toggle (#316), reached from the groupview
+ *  button (Slice C) — human action, not agent-triggered. Arms/clears the
+ *  merge gate and swaps the roster for FUTURE spawns only; agents already
+ *  live keep the block they were spawned under. Rejects (with a message
+ *  naming why) when turning ON in a repo that declares no workflow file, or
+ *  whose file is broken — a live toggle refuses to arm a roster it could not
+ *  resolve. Resolves to the same shape a following `workflowStatus` read
+ *  would return. */
+export const setAdvancedOrchestrator = (groupId: string, on: boolean): Promise<WorkflowStatus> =>
+  invoke<WorkflowStatus>("orch_set_advanced_orchestrator", { groupId, on });
+
 // ---------- cross-workspace channels (#271): human-only connect/disconnect ----------
 //
 // A channel is a human-connected set of two-or-more agent panes, possibly in
