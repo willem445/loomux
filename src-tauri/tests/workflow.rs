@@ -572,6 +572,126 @@ fn role_hint_grants_no_capability_to_its_block() {
     );
 }
 
+// ───────── role_hint drives persona/template selection (slice C, #250/#324) ──
+
+#[test]
+fn replace_mode_advisor_and_process_personas_still_get_their_role_hint_mechanics() {
+    // Mirrors `replace_mode_persona_still_gets_the_mechanics_core`: a `mode: replace`
+    // persona swaps the role BODY, never the non-overridable mechanics. For a
+    // role-hinted block that now includes the "no authority" (advisor) / "propose,
+    // never dispose" (process) invariants — a repo's own advisor/process persona
+    // that forgets to say so must not thereby let the agent believe it has one.
+    let (reg, _d) = test_registry();
+    let repo = Repo::new()
+        .workflow(
+            "version: 1\nblocks:\n\
+             \x20 - id: advisor\n    kind: planner\n    role_hint: advisor\n    profile: .github/agents/adv.agent.md\n\
+             \x20 - id: proc\n    kind: worker\n    role_hint: process\n    profile: .github/agents/proc.agent.md\n",
+        )
+        .agent_file(
+            "adv.agent.md",
+            "---\nname: adv\nmode: replace\ndescription: Custom advisor.\n---\nBe blunt about it.",
+        )
+        .agent_file(
+            "proc.agent.md",
+            "---\nname: proc\nmode: replace\ndescription: Custom process.\n---\nBe thorough about it.",
+        );
+    let g = reg.create_group(&repo.path(), rails()).unwrap();
+
+    let advisor_doc = instructions_lf(&reg, &g.id, "advisor.md");
+    assert!(advisor_doc.contains("NOT optional"), "the mechanics core must be written: {advisor_doc}");
+    assert!(advisor_doc.contains("report(status, summary)"), "{advisor_doc}");
+    assert!(
+        advisor_doc.contains("NO authority"),
+        "a replace advisor persona must still be told it has no authority: {advisor_doc}"
+    );
+    assert!(
+        advisor_doc.contains("never merge, spawn, or record a verdict"),
+        "{advisor_doc}"
+    );
+    assert!(
+        !advisor_doc.contains("Be blunt about it"),
+        "the persona body belongs on the CLI's persona flag, not in the loomux contract file: {advisor_doc}"
+    );
+
+    let proc_doc = instructions_lf(&reg, &g.id, "proc.md");
+    assert!(proc_doc.contains("NOT optional"), "{proc_doc}");
+    assert!(proc_doc.contains("NEVER merge"), "the base worker mechanics still apply too: {proc_doc}");
+    assert!(proc_doc.contains("propose it as a normal PR"), "{proc_doc}");
+    assert!(proc_doc.contains("you never merge it"), "{proc_doc}");
+    assert!(
+        !proc_doc.contains("Be thorough about it"),
+        "the persona body belongs on the CLI's persona flag, not in the loomux contract file: {proc_doc}"
+    );
+
+    // A plain replace persona (no role_hint) must NOT pick up either addendum —
+    // proves the selection is keyed on role_hint, not merely on `mode: replace`.
+    let (reg2, _d2) = test_registry();
+    let repo2 = Repo::new()
+        .workflow("version: 1\nblocks:\n  - id: spike\n    kind: worker\n    profile: .github/agents/spike.agent.md\n")
+        .agent_file(
+            "spike.agent.md",
+            "---\nname: spike\nmode: replace\ndescription: Throwaway spike runner.\n---\nMove fast.",
+        );
+    let g2 = reg2.create_group(&repo2.path(), rails()).unwrap();
+    let spike_doc = instructions_lf(&reg2, &g2.id, "spike.md");
+    assert!(
+        !spike_doc.contains("propose it as a normal PR") && !spike_doc.contains("NO authority"),
+        "a plain replace persona with no role_hint must not get either addendum: {spike_doc}"
+    );
+}
+
+#[test]
+fn advisor_and_process_prose_stays_silent_unless_a_block_declares_the_hint() {
+    // rev-29 F1 discipline, extended to role_hint: prose naming a mechanism the
+    // reader does not have is worse than no prose. A fully custom roster with NO
+    // role_hint block must not mention consulting an advisor or a process-pro
+    // anywhere — the mechanism does not exist for this group.
+    let (reg, _d) = test_registry();
+    let repo = Repo::new().workflow(FOCUSED_REVIEW); // custom roster, no role_hint
+    let g = reg.create_group(&repo.path(), rails()).unwrap();
+
+    for file in ["orchestrator.md", "worker.md", "rev-security.md", "rev-tests.md", "planner.md"] {
+        let doc = instructions_lf(&reg, &g.id, file);
+        let flat = doc.to_lowercase();
+        assert!(!flat.contains("consult"), "{file} leaked an advisor mechanism nobody declared: {doc}");
+        assert!(!flat.contains("process-pro"), "{file} leaked a process-pro mechanism nobody declared: {doc}");
+        assert!(!doc.contains("{{"), "{file} has an unsubstituted variable: {doc}");
+    }
+}
+
+#[test]
+fn advisor_and_process_notes_render_exactly_once_when_declared_and_line_final() {
+    // Mirrors `a_workflow_group_is_told_to_spawn_by_block_and_fan_out_to_every_reviewer`'s
+    // placement pin: the fragment must be line-final (its own blank-line-prefixed
+    // paragraph, not a run-on sentence), and must appear exactly once so a future edit
+    // that duplicates the placeholder is caught here rather than shipped.
+    let (reg, _d) = test_registry();
+    let repo = Repo::new().workflow(
+        "version: 1\nblocks:\n\
+         \x20 - id: worker\n    kind: worker\n\
+         \x20 - id: advisor\n    kind: planner\n    role_hint: advisor\n\
+         \x20 - id: proc\n    kind: worker\n    role_hint: process\n",
+    );
+    let g = reg.create_group(&repo.path(), rails()).unwrap();
+
+    let orch = instructions_lf(&reg, &g.id, "orchestrator.md");
+    assert!(!orch.contains("{{"), "{orch}");
+    assert_eq!(orch.matches("Consulting the advisor").count(), 1, "{orch}");
+    assert_eq!(orch.matches("process-pro reviews finished sessions").count(), 1, "{orch}");
+    assert!(orch.contains("spawn_agent(block: \"advisor\""), "{orch}");
+    assert!(orch.contains("spawn_agent(block: \"proc\""), "{orch}");
+    assert!(
+        orch.contains("workaround in your head.\n\n**Consulting the advisor.**"),
+        "the fragment must bring its own blank line, not land mid-paragraph: {orch}"
+    );
+
+    let worker = instructions_lf(&reg, &g.id, "worker.md");
+    assert!(!worker.contains("{{"), "{worker}");
+    assert_eq!(worker.matches("ask it to consult the advisor").count(), 1, "{worker}");
+    assert!(worker.contains("(`advisor`)"), "{worker}");
+}
+
 #[test]
 fn gate_require_and_threshold_disagreeing_is_a_named_error() {
     // `require: all-pass` with a `threshold:` is a contradiction. Say so, rather
@@ -2544,10 +2664,15 @@ const PRE222: [(&str, &str); 4] = [
     ("planner.md", include_str!("fixtures/pre222/planner.md")),
 ];
 
-/// The live templates, with the placeholder each must carry.
+/// The live templates, with the placeholder(s) each must carry — a single string,
+/// even where (like `worker.md`, #250/#324) two placeholders chain on one line:
+/// `{{BLOCK_NOTE}}{{ADVISOR_CONSULT_NOTE}}` is one contiguous run, so it is one
+/// "key" for both the exactly-once check and the golden-fixture diff below (the
+/// same chaining `block.md`'s `{{PERSONA_NOTE}}{{LANE_NOTE}}{{GATE_NOTE}}` already
+/// relies on, just now also covered by this pin).
 const LIVE: [(&str, &str, &str); 4] = [
     ("orchestrator.md", loomux_lib::orchestration::ORCHESTRATOR_TPL, "{{WORKFLOW}}"),
-    ("worker.md", loomux_lib::orchestration::WORKER_TPL, "{{BLOCK_NOTE}}"),
+    ("worker.md", loomux_lib::orchestration::WORKER_TPL, "{{BLOCK_NOTE}}{{ADVISOR_CONSULT_NOTE}}"),
     ("reviewer.md", loomux_lib::orchestration::REVIEWER_TPL, "{{BLOCK_NOTE}}"),
     ("planner.md", loomux_lib::orchestration::PLANNER_TPL, "{{BLOCK_NOTE}}"),
 ];
