@@ -35,7 +35,7 @@ use loomux_lib::orchestration::{
     PersonaInject, Task, TaskNote,
     PasteGate, Role, TaskPatch, UsageSnapshot, CLAUDE_UNATTENDED_ALLOW, COPILOT_AUTOPILOT_CONFIRM_KEYS,
     COPILOT_GROUP_AUTOPILOT_FLAGS, COPILOT_UNATTENDED_FLAGS, MAX_ATTACHMENT_BYTES,
-    PLANNER_READONLY_NOTE, SOLO_GROUP,
+    PLANNER_READONLY_NOTE, SOLO_GROUP, AUTOPILOT_DIALOG_WAIT, SOLO_AUTOPILOT_DIALOG_WAIT,
 };
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -1027,13 +1027,16 @@ fn single_pane_autopilot_flags_per_cli() {
     assert!(!claude.contains("--dangerously-skip-permissions"),
         "autopilot must never use bypass mode");
 
-    // Copilot: all tools + all paths pre-approved, but NOT --autopilot (which
-    // opens a blocking startup confirm dialog — #101 human report).
+    // Copilot: all tools + all paths pre-approved, PLUS --autopilot (#364) —
+    // single panes now enter true autopilot mode too, same as the group path.
+    // The resulting consent dialog is answered by a dedicated solo watcher
+    // (`confirm_solo_copilot_autopilot`), not left unattended.
     let copilot = single_pane_autopilot_flags("copilot");
     assert!(copilot.contains("--allow-all-tools") && copilot.contains("--allow-all-paths"),
         "copilot autopilot must pass its unattended flags, got: {copilot}");
-    assert!(!copilot.contains("--autopilot"),
-        "copilot autopilot must NOT use --autopilot (interactive confirm on startup): {copilot}");
+    assert!(copilot.contains("--autopilot"),
+        "copilot autopilot must now use --autopilot (#364) — the checkbox should mean true autopilot \
+         mode on single panes too, not just allow-all: {copilot}");
 
     // Hermes: --yolo bypasses dangerous-command approval prompts, and docs
     // show no startup consent dialog (unlike copilot's --autopilot).
@@ -1078,17 +1081,19 @@ fn single_pane_flags_reuse_the_group_path_atoms() {
     assert!(single_claude.contains(CLAUDE_UNATTENDED_ALLOW) && group_claude.contains(CLAUDE_UNATTENDED_ALLOW),
         "both paths must use the shared CLAUDE_UNATTENDED_ALLOW constant");
 
-    // Copilot: single-pane uses the allow-all atom; the group path uses the
-    // group-autopilot atom, which is that same allow-all atom PLUS --autopilot.
+    // Copilot (#364): single-pane and group now share the SAME posture — both
+    // enter true autopilot mode, so single_pane_autopilot_flags reuses the
+    // group constant directly rather than inventing a divergent string.
     let group_copilot =
         reg.build_agent_command("copilot", "auto", true, cfg, gdir, Path::new("C:/repo"), None, false, false, &PersonaInject::default());
     let single_copilot = single_pane_autopilot_flags("copilot");
-    assert_eq!(single_copilot, COPILOT_UNATTENDED_FLAGS);
+    assert_eq!(single_copilot, COPILOT_GROUP_AUTOPILOT_FLAGS,
+        "single-pane copilot must reuse the group autopilot atom verbatim, not a divergent string");
     assert!(group_copilot.contains(COPILOT_GROUP_AUTOPILOT_FLAGS),
         "the group path must use the shared COPILOT_GROUP_AUTOPILOT_FLAGS constant");
-    // The two posture atoms can't drift: group == "--autopilot " + single.
+    // The atoms still can't drift apart: group == "--autopilot " + allow-all.
     assert_eq!(COPILOT_GROUP_AUTOPILOT_FLAGS, format!("--autopilot {COPILOT_UNATTENDED_FLAGS}"),
-        "the group autopilot atom must be the single-pane allow-all atom plus --autopilot");
+        "the group autopilot atom must be the allow-all atom plus --autopilot");
 }
 
 #[test]
@@ -1098,24 +1103,24 @@ fn claude_permission_mode_maps_unattended() {
 }
 
 #[test]
-fn copilot_autopilot_posture_splits_group_from_single_pane() {
-    // The #101 split: group copilot agents run in TRUE autopilot mode
-    // (--autopilot, for the autonomy system-prompt framing) because a
-    // loomux-managed worker is unattended and the kickoff path answers the
-    // resulting "Enable autopilot mode" dialog for it. A single-pane copilot
-    // agent has a human at the keyboard, so it stays dialog-free (allow-all,
-    // no --autopilot). Both give full tool pre-approval.
+fn copilot_single_pane_now_shares_the_group_autopilot_posture() {
+    // #364: single-pane and group copilot agents now enter the SAME true
+    // autopilot mode (--autopilot, for both the autonomy system-prompt framing
+    // AND so the checkbox actually means autopilot on a single pane). The
+    // resulting "Enable autopilot mode" dialog is answered on both paths — the
+    // group path's kickoff delivery, and a dedicated solo watcher for single
+    // panes (`OrchRegistry::confirm_solo_copilot_autopilot`), since a solo pane
+    // never receives a programmatic kickoff to hang the confirm off of.
     assert!(COPILOT_GROUP_AUTOPILOT_FLAGS.contains("--autopilot"),
         "group posture enters autopilot mode");
-    assert!(!COPILOT_UNATTENDED_FLAGS.contains("--autopilot"),
-        "single-pane posture stays dialog-free — a human is present");
     assert!(COPILOT_UNATTENDED_FLAGS.contains("--allow-all-tools")
         && COPILOT_GROUP_AUTOPILOT_FLAGS.contains("--allow-all-tools"),
         "both postures pre-approve all tools");
 
-    // Single-pane path: no --autopilot.
-    assert!(!single_pane_autopilot_flags("copilot").contains("--autopilot"),
-        "single-pane copilot must not pass --autopilot (no dialog with a human present)");
+    // Single-pane path: --autopilot now included, verbatim the group constant.
+    assert!(single_pane_autopilot_flags("copilot").contains("--autopilot"),
+        "single-pane copilot must now pass --autopilot when the checkbox is on (#364)");
+    assert_eq!(single_pane_autopilot_flags("copilot"), COPILOT_GROUP_AUTOPILOT_FLAGS);
 
     // Group spawn path: unattended worker + planner both get --autopilot.
     let (reg, _d) = test_registry();
@@ -1179,17 +1184,19 @@ fn copilot_autopilot_prompt_is_detected_only_on_the_real_dialog() {
 }
 
 #[test]
-fn autopilot_confirm_gates_to_a_fresh_copilot_boot() {
-    // rev-41: the confirm (and its up-to-12s fail-soft watch) must run ONLY on a
-    // fresh boot of an unattended copilot agent — the one time the "Enable
-    // autopilot mode" dialog appears. Resume restores the consent from the
-    // session log (no dialog) and mid-session deliveries are past boot, so both
-    // must skip it or they'd burn the fail-soft wait on every follow-up.
-    // Fresh + unattended + copilot → confirm.
+fn autopilot_confirm_gates_to_a_kickoff_of_an_unattended_copilot() {
+    // #364: the confirm (and its fail-soft watch) must run on EVERY kickoff of
+    // an unattended copilot agent — fresh boot AND resume both show (or must
+    // re-show) the "Enable autopilot mode" dialog; only a mid-session delivery
+    // (long past boot, no kickoff at all) skips it. `is_kickoff=true` stands in
+    // for either Delivery::FreshKickoff or Delivery::ResumeKickoff here — see
+    // `delivery_confirms_autopilot_dialog_on_both_fresh_and_resumed_kickoffs`
+    // for the enum-level mapping that used to get this wrong (resume was
+    // wired to skip it entirely).
     assert!(should_confirm_copilot_autopilot("copilot", true, true));
-    // Resume / mid-session (fresh_boot=false) → never, even for copilot.
+    // Mid-session (is_kickoff=false) → never, even for copilot.
     assert!(!should_confirm_copilot_autopilot("copilot", true, false),
-        "resume/mid-session must skip the confirm — the dialog is fresh-boot-only");
+        "a mid-session delivery must skip the confirm — it's long past boot, no dialog to catch");
     // Attended copilot (no --autopilot passed) shows no dialog → never.
     assert!(!should_confirm_copilot_autopilot("copilot", false, true),
         "an attended copilot agent has no --autopilot, so no dialog to confirm");
@@ -1199,15 +1206,60 @@ fn autopilot_confirm_gates_to_a_fresh_copilot_boot() {
 }
 
 #[test]
+fn delivery_confirms_autopilot_dialog_on_both_fresh_and_resumed_kickoffs() {
+    // #364 root cause: the gate used to be wired off `Delivery::is_fresh_boot`
+    // (FreshKickoff only), so a RESUMED copilot session never got its "Enable
+    // autopilot mode" dialog answered — the human's report that resume leaves
+    // the dialog unanswered (or autopilot unrestored). Both kickoff deliveries
+    // must confirm; only a mid-session delivery (already past boot) must not.
+    assert!(Delivery::FreshKickoff.confirms_autopilot_dialog());
+    assert!(Delivery::ResumeKickoff.confirms_autopilot_dialog(),
+        "#364: a resumed copilot kickoff must also answer the autopilot consent dialog");
+    assert!(!Delivery::MidSession.confirms_autopilot_dialog());
+}
+
+#[test]
+fn solo_autopilot_wait_is_far_more_generous_than_the_group_path() {
+    // #364: the group path's 12s wait is tuned to loomux's OWN kickoff Enter —
+    // the dialog-triggering submit lands within milliseconds of the watch
+    // starting. A solo pane's dialog-triggering submit is the HUMAN's own
+    // first message, with no lower bound on how long that takes, so the solo
+    // watcher needs a far more generous window or it will just miss the human
+    // every time.
+    assert!(SOLO_AUTOPILOT_DIALOG_WAIT > AUTOPILOT_DIALOG_WAIT,
+        "solo must wait meaningfully longer than the group path's near-instant-Enter window");
+}
+
+#[test]
+fn confirm_solo_copilot_autopilot_gates_on_cli_before_touching_the_app_handle() {
+    // #364: a solo pane's autopilot watcher must re-check `cli` itself rather
+    // than blindly trusting the caller — a non-copilot pane must no-op WITHOUT
+    // even reaching for the app handle (so a claude/hermes/etc. solo launch
+    // never pays for or risks a watcher it has no business starting).
+    let (reg, _d) = test_registry();
+    assert_eq!(reg.confirm_solo_copilot_autopilot(1, "claude"), Ok(()),
+        "a non-copilot cli must no-op cleanly, never touching the (here, unset) app handle");
+    assert_eq!(reg.confirm_solo_copilot_autopilot(1, "hermes"), Ok(()));
+
+    // A copilot pane clears the gate and DOES try to act — proven here by the
+    // fact that it goes on to need the app handle, which this test registry
+    // never sets, so it surfaces that error instead of silently no-opping.
+    let err = reg.confirm_solo_copilot_autopilot(1, "copilot").unwrap_err();
+    assert!(err.contains("no app handle"),
+        "a copilot cli must clear the gate and attempt to start the watcher: {err}");
+}
+
+#[test]
 fn autopilot_confirm_and_stranded_flush_never_both_fire_on_a_fresh_boot() {
     // #99/#179 interaction: the autopilot confirm (Enter on the consent dialog)
     // now runs AFTER the kickoff submit, while #99's stranded-text flush (an
     // Enter to clear a previous prompt still in the box) runs before the paste.
-    // Neither can fire on a fresh boot without the other being a no-op: the
-    // confirm runs only on a *fresh boot*, and a freshly booted pane has no prior
-    // delivery, so the flush's own guard (`should_flush_before_paste(None, _)`)
-    // is false. This pins that composition — if either guard's contract changes,
-    // this fails.
+    // Neither can fire on a fresh boot without the other being a no-op: on a
+    // freshly booted pane there is no prior delivery, so the flush's own guard
+    // (`should_flush_before_paste(None, _)`) is false, regardless of whether the
+    // confirm itself gates on fresh-boot-only or (post-#364) fresh-or-resume.
+    // This pins that composition — if either guard's contract changes, this
+    // fails.
     // Fresh boot ⇒ confirm may run …
     assert!(should_confirm_copilot_autopilot("copilot", true, true));
     // … but the flush cannot: no previous delivery to key off (prev = None).
