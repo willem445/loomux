@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-spike-open-plugin-window"
+description = "Enables the spike_open_plugin_window command without any pre-configured scope."
+commands.allow = ["spike_open_plugin_window"]
+
+[[permission]]
+identifier = "deny-spike-open-plugin-window"
+description = "Denies the spike_open_plugin_window command without any pre-configured scope."
+commands.deny = ["spike_open_plugin_window"]

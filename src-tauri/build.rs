@@ -1,7 +1,23 @@
 fn main() {
     copy_sideloaded_conhost();
     embed_test_manifest();
-    tauri_build::build()
+    // #360 Phase-0.5 spike only (spike/360-sandbox-proof, never merged): flips
+    // `has_app_acl_manifest` on by giving the app's own commands a real ACL
+    // manifest, which is required for capability-based per-window command
+    // denial to do anything at all (see the phase-0.5 findings comment on
+    // #360 — without this, `is_local_url` alone lets any local-origin window
+    // bypass ACL for app commands regardless of its capability grants).
+    tauri_build::try_build(
+        tauri_build::Attributes::new().app_manifest(tauri_build::AppManifest::new().commands(&[
+            "pty_backend_info",
+            "orch_grant_merge",
+            "git_push",
+            "ft_write_file",
+            "spawn_pty",
+            "spike_open_plugin_window",
+        ])),
+    )
+    .expect("spike app_manifest build failed")
 }
 
 /// Test executables link the same UI stack as the app (comctl32 v6 imports

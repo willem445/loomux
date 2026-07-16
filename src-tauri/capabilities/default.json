@@ -3,5 +3,15 @@
   "identifier": "default",
   "description": "Capabilities for the main window",
   "windows": ["main"],
-  "permissions": ["core:default", "dialog:allow-open", "core:window:allow-destroy"]
+  "permissions": [
+    "core:default",
+    "dialog:allow-open",
+    "core:window:allow-destroy",
+    "allow-pty-backend-info",
+    "allow-orch-grant-merge",
+    "allow-git-push",
+    "allow-ft-write-file",
+    "allow-spawn-pty",
+    "allow-spike-open-plugin-window"
+  ]
 }

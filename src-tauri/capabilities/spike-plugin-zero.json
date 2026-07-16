@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "spike-plugin-zero",
+  "description": "Phase-0.5 spike (#360): deliberately empty capability bound to the 'spike-plugin' WebviewWindow label — proves the trust core's zero-grant model for Option B. Never merged; spike/360-sandbox-proof reference only.",
+  "windows": ["spike-plugin"],
+  "permissions": []
+}

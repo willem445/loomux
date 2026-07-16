@@ -12,6 +12,7 @@ mod obs;
 pub mod orchestration; // pub: integration smoke test links through it
 pub mod pty; // pub: Job-Object integration test links `assign_kill_on_close_job`
 mod sessions;
+mod spike_phase05; // #360 Phase-0.5 spike only — throwaway, never merged past spike/360-sandbox-proof
 mod uistate; // durable UI state (project tabs, #63) — atomic tabs.json store
 pub mod usage; // pub: exercised by orchestration integration tests
 pub mod voice; // voice-prompt prototype (#58); pub: pure helpers are unit-tested
@@ -189,6 +190,7 @@ pub fn run() {
             voice::voice_start,
             voice::voice_stop,
             voice::voice_cancel,
+            spike_phase05::spike_open_plugin_window,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {

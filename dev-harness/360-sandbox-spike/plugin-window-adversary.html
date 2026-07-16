@@ -1,0 +1,99 @@
+<!doctype html>
+<!--
+  Phase-0.5 spike for #360 — throwaway, does not ship. Loaded as the TOP-LEVEL
+  document of a dedicated child WebviewWindow (label "spike-plugin"), bound via
+  capabilities/spike-plugin-zero.json to a capability with an EMPTY
+  permissions array. This is Option B's proposed trust core: no iframe
+  sandboxing trick, just "this window's label has zero ACL grants."
+
+  Everything below runs as trusted, unsandboxed JS in its own window — the
+  question is not "can this code run" (of course it can, it's the window's own
+  page) but "does invoke() on real backend commands actually get denied by the
+  capability system for THIS window label."
+-->
+<html>
+<head><title>Phase-0.5 spike: plugin window</title></head>
+<body>
+<script>
+(async function () {
+  const results = [];
+  function log(route, outcome, detail) {
+    results.push({ route, outcome, detail: detail === undefined ? "" : String(detail) });
+  }
+
+  log("has-tauri-internals", typeof window.__TAURI_INTERNALS__ !== "undefined" ? "present-expected" : "MISSING", typeof window.__TAURI_INTERNALS__);
+
+  async function tryInvoke(cmd, payload) {
+    try {
+      const r = await window.__TAURI_INTERNALS__.invoke(cmd, payload || {});
+      log(`invoke(${cmd})`, "LEAK-INVOKE-SUCCEEDED", JSON.stringify(r));
+    } catch (e) {
+      log(`invoke(${cmd})`, "denied", e && e.message ? e.message : String(e));
+    }
+  }
+
+  // Representative spread: a merge-gate command, a write, a spawn, a network
+  // op, and a benign read — every one of these must be denied for this
+  // window if Option B's capability model actually works.
+  await tryInvoke("orch_grant_merge", { group: "spike", pr: 1 });
+  await tryInvoke("git_push", { path: ".", remote: "origin", branch: "spike" });
+  await tryInvoke("ft_write_file", { path: "spike-phase05-proof.txt", content: "leaked" });
+  await tryInvoke("spawn_pty", {});
+  await tryInvoke("pty_backend_info", {});
+
+  // Same escape-route battery as Phase-0's iframe harness, run here as the
+  // window's own top-level context instead of a sandboxed subframe.
+  try {
+    if (window.ipc && typeof window.ipc.postMessage === "function") {
+      log("window.ipc", "present-expected-not-itself-a-leak", "postMessage fn present");
+    } else {
+      log("window.ipc", "absent");
+    }
+  } catch (e) { log("window.ipc", "threw", e.message); }
+
+  fetch("http://ipc.localhost/pty_backend_info", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "Tauri-Callback": "0", "Tauri-Error": "0" },
+    body: "{}"
+  }).then((r) => r.text().then((body) => log("raw-fetch(ipc.localhost)", "reached-network-layer status=" + r.status, body.slice(0, 200))))
+    .catch((e) => log("raw-fetch(ipc.localhost)", "fetch-failed", e.message));
+
+  // Check 2: is there any reachable reference back to the main window? Tauri
+  // creates secondary WebviewWindows independently, not via window.open(), so
+  // this should be null — a separate WebviewWindow is a separate top-level
+  // browsing context/WebView2 controller, not a subframe of anything.
+  log("window.opener", window.opener ? "unexpected-present" : "absent-as-expected", String(window.opener));
+
+  // Residual-capability checks (not Tauri IPC — plain web platform capability
+  // this window still has, since a WebviewWindow has no sandbox="" attribute
+  // equivalent to lock these down the way an iframe can).
+  try {
+    const bc = new BroadcastChannel("spike-cross-window-probe");
+    bc.onmessage = (e) => log("broadcastchannel-cross-window", "rendezvous-happened", JSON.stringify(e.data));
+    bc.postMessage({ from: "spike-plugin", ts: "probe" });
+    log("broadcastchannel-cross-window", "sent-listening-1500ms (same-origin as main: localhost:1420 in THIS spike setup)");
+  } catch (e) { log("broadcastchannel-cross-window", "threw", e.message); }
+
+  try {
+    localStorage.setItem("spike-phase05-storage-probe", "written-from-plugin-window");
+    log("localstorage-write", "succeeded (same-origin storage is shared with main in THIS spike setup)");
+  } catch (e) { log("localstorage-write", "threw", e.message); }
+
+  fetch("https://example.com/")
+    .then((r) => log("network-egress(example.com)", "reached-network-layer status=" + r.status))
+    .catch((e) => log("network-egress(example.com)", "blocked-or-failed", e.message));
+
+  await new Promise((r) => setTimeout(r, 3000));
+  window.__spikeResults__ = results;
+
+  // Deliberately NOT run automatically: a separate, explicit nav-test hook so
+  // the harness can read __spikeResults__ before anything navigates this
+  // window away. Call window.__spikeTriggerNav__() from the CDP driver to
+  // test whether this window can freely self-navigate to an external origin.
+  window.__spikeTriggerNav__ = function () {
+    location.href = "https://example.com/";
+  };
+})();
+</script>
+</body>
+</html>

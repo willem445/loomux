@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-orch-grant-merge"
+description = "Enables the orch_grant_merge command without any pre-configured scope."
+commands.allow = ["orch_grant_merge"]
+
+[[permission]]
+identifier = "deny-orch-grant-merge"
+description = "Denies the orch_grant_merge command without any pre-configured scope."
+commands.deny = ["orch_grant_merge"]
