@@ -172,6 +172,14 @@ tempfile = { version = "3", default-features = false }
 # The Job-Object integration test (issue #78) opens a real ConPTY exactly the
 # way spawn_pty does; portable-pty is already in the main tree (getrandom-free).
 portable-pty = "0.9"
+# ACL coherence test (#363): the "test" feature is a pure code-gate (empty
+# feature deps, see tauri's Cargo.toml) that unlocks `tauri::test`'s
+# MockRuntime + IPC harness, letting tests/acl_manifest.rs exercise the
+# REAL resolved capability graph (our actual capabilities/permissions on
+# disk, via the same generate_context! build.rs already feeds) headlessly.
+# Dev-only: cargo's per-target feature unification keeps this out of the
+# shipped binary. No new crate — tauri is already a normal dependency.
+tauri = { version = "2", features = ["test"] }
 
 [profile.release]
 lto = true
