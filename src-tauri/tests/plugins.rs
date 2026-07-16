@@ -14,7 +14,8 @@
 //! folder.
 
 use loomux_lib::plugins::{
-    build_asset_response, discover_installed, install_plugin_from, parse_manifest, resolve_plugin_asset, PLUGIN_CSP,
+    build_asset_response, discover_installed, install_plugin_from, parse_manifest, resolve_plugin_asset,
+    seed_bundled_example_plugin, BUNDLED_EXAMPLE_PLUGIN_ID, PLUGIN_CSP,
 };
 use std::fs;
 use std::path::Path;
@@ -543,4 +544,65 @@ fn install_missing_source_is_not_found() {
     let plugins_root = tempfile::tempdir().unwrap();
     let e = install_plugin_from(Path::new("this-path-does-not-exist-anywhere"), plugins_root.path()).unwrap_err();
     assert_eq!(err_code(&e), "not-found", "got: {e}");
+}
+
+// ---------- bundled example seeding (#360 Slice F) ----------
+
+#[test]
+fn seed_bundled_example_plugin_installs_on_first_boot() {
+    let resource_dir = tempfile::tempdir().unwrap();
+    let plugins_root = tempfile::tempdir().unwrap();
+    write_plugin_folder(
+        &resource_dir.path().join("plugins"),
+        BUNDLED_EXAMPLE_PLUGIN_ID,
+        &manifest_json(BUNDLED_EXAMPLE_PLUGIN_ID, "index.html", 1, &["panel", "metrics.system"], true),
+        &[("index.html", "<h1>resource monitor</h1>")],
+    );
+
+    seed_bundled_example_plugin(resource_dir.path(), plugins_root.path());
+
+    let found = discover_installed(plugins_root.path());
+    assert_eq!(found.len(), 1, "expected the bundled example to be installed, got: {found:?}");
+    assert_eq!(found[0].id, BUNDLED_EXAMPLE_PLUGIN_ID);
+}
+
+#[test]
+fn seed_bundled_example_plugin_never_overwrites_an_already_installed_copy() {
+    // A human who customized (or is mid-uninstall of) the bundled example
+    // must not have it silently reseeded/reset on the next boot.
+    let resource_dir = tempfile::tempdir().unwrap();
+    let plugins_root = tempfile::tempdir().unwrap();
+    write_plugin_folder(
+        &resource_dir.path().join("plugins"),
+        BUNDLED_EXAMPLE_PLUGIN_ID,
+        &manifest_json(BUNDLED_EXAMPLE_PLUGIN_ID, "index.html", 1, &["panel", "metrics.system"], true),
+        &[("index.html", "<h1>bundled build</h1>")],
+    );
+    write_plugin_folder(
+        plugins_root.path(),
+        BUNDLED_EXAMPLE_PLUGIN_ID,
+        &manifest_json(BUNDLED_EXAMPLE_PLUGIN_ID, "index.html", 1, &["panel"], true),
+        &[("index.html", "<h1>human-customized</h1>"), ("marker.txt", "do not touch")],
+    );
+
+    seed_bundled_example_plugin(resource_dir.path(), plugins_root.path());
+
+    let installed_entry = plugins_root.path().join(BUNDLED_EXAMPLE_PLUGIN_ID).join("index.html");
+    assert_eq!(
+        fs::read_to_string(installed_entry).unwrap(),
+        "<h1>human-customized</h1>",
+        "an already-installed copy must never be reseeded/overwritten"
+    );
+    assert!(plugins_root.path().join(BUNDLED_EXAMPLE_PLUGIN_ID).join("marker.txt").is_file());
+}
+
+#[test]
+fn seed_bundled_example_plugin_is_best_effort_when_the_resource_dir_has_nothing_to_seed() {
+    // A `cargo test` (or a build where the resource wasn't unpacked) must not
+    // panic or otherwise disrupt startup — the app just runs without the
+    // example pre-installed.
+    let resource_dir = tempfile::tempdir().unwrap();
+    let plugins_root = tempfile::tempdir().unwrap();
+    seed_bundled_example_plugin(resource_dir.path(), plugins_root.path());
+    assert!(!plugins_root.path().join(BUNDLED_EXAMPLE_PLUGIN_ID).exists());
 }

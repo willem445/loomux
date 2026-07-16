@@ -548,6 +548,48 @@ pub fn plugin_protocol_handler(
         })
 }
 
+// ---------- bundled first-party example (#360 Slice F) ----------
+
+/// The id of the one first-party example plugin loomux ships — the resource
+/// monitor at `src-tauri/resources/plugins/resource-monitor/`
+/// (`doc/design/pane-plugins.md`'s Open Decision #4: shipped **already
+/// installed**, not merely bundled-but-requiring-the-picker, so the demo
+/// works with zero setup). A single constant, not a registry: v1 ships
+/// exactly one bundled example; a second one is a deliberate future addition,
+/// not a case this needs to generalize for today.
+pub const BUNDLED_EXAMPLE_PLUGIN_ID: &str = "resource-monitor";
+
+/// Seed the bundled example plugin into `plugins_root` from wherever this
+/// build's Tauri resources were unpacked (`resource_dir/plugins/<id>`, the
+/// destination `tauri.conf.json`'s `bundle.resources` entry for this plugin
+/// maps to). Called once, from `lib.rs`'s `.setup()`, on every boot —
+/// `resource_dir`/`plugins_root` are both injected so this is testable
+/// against tempdirs without a running Tauri app.
+///
+/// **Never overwrites an already-installed folder.** The bundled copy is
+/// seeded once, the first time `plugins_root/<id>` is missing; a human who
+/// customizes the installed copy, upgrades it, or deletes it to "uninstall"
+/// the example keeps that choice across every later restart — reseeding on
+/// every boot would silently undo an uninstall, which is not what "ships
+/// already installed" is asking for.
+pub fn seed_bundled_example_plugin(resource_dir: &Path, plugins_root: &Path) {
+    let dest = plugins_root.join(BUNDLED_EXAMPLE_PLUGIN_ID);
+    if dest.exists() {
+        return;
+    }
+    let source = resource_dir.join("plugins").join(BUNDLED_EXAMPLE_PLUGIN_ID);
+    if let Err(e) = install_plugin_from(&source, plugins_root) {
+        // Best-effort: a missing/corrupt bundled resource must not block
+        // startup — the human still has a working app, just without the
+        // example pre-installed. Loud enough to find in the crash log, never
+        // a dialog blocking the rest of boot.
+        crate::obs::breadcrumb(
+            "plugins",
+            &format!("failed to seed bundled example plugin `{BUNDLED_EXAMPLE_PLUGIN_ID}`: {e}"),
+        );
+    }
+}
+
 // ---------- tauri commands ----------
 //
 // Thin wrappers: all logic lives in the `pub fn`s above so the integration

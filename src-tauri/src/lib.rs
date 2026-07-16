@@ -58,6 +58,16 @@ pub fn run() {
             orchestration::OrchRegistry::default_root(),
         )))
         .setup(|app| {
+            // Seed the bundled resource-monitor example plugin (#360 Slice F)
+            // on first boot — ships already installed, per the design note's
+            // Open Decision #4, so the demo works with no manual install
+            // step. Best-effort: a resource dir that can't be resolved (e.g.
+            // `cargo test` without a bundle) just means the example doesn't
+            // pre-install, never a startup failure.
+            match app.path().resource_dir() {
+                Ok(resource_dir) => plugins::seed_bundled_example_plugin(&resource_dir, &plugins::plugins_root_dir()),
+                Err(e) => obs::breadcrumb("plugins", &format!("resource dir unavailable, skipping bundled plugin seed: {e}")),
+            }
             // Start streaming CPU/mem/GPU snapshots to the status bar.
             metrics::start(app.handle().clone());
             // Poll open panes' repos for external checkout/commit/stage (#36).
