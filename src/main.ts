@@ -67,6 +67,8 @@ import {
 } from "./panerestore";
 import { showRestoreSplash } from "./restoresplash";
 import { planGroupResume } from "./groupresume";
+import { listPlugins } from "./pluginhost";
+import { resolvePluginPaneManifest } from "./pluginpaneview";
 
 // Surface unexpected errors as a visible banner instead of a silently
 // broken UI — a user-facing "crash" should always come with a message.
@@ -529,6 +531,7 @@ async function openActionPane(
         sessionId: null,
         role: null,
         file: null,
+        pluginId: null,
       };
       let pane: Pane;
       const content = dormantCard(
@@ -629,6 +632,31 @@ async function openActionPane(
       );
       return openWelcomeIn(ws, dir, anchor);
     }
+    case "open-plugin": {
+      // A plugin pane (#360 Slice D) comes back by looking up its recorded pluginId
+      // against the CURRENT installed set — never a snapshot of the manifest as it
+      // was when captured, since a reinstall/upgrade between sessions can change the
+      // plugin's own root/entry/capabilities and the pane must follow that, not a
+      // stale one. No recorded id, or the plugin no longer installed, both fail soft
+      // to the welcome form in this one slot with a toast — never a crash, never a
+      // silently dropped pane (doc/design/pane-plugins.md, "What later slices owe
+      // this note").
+      const manifests = a.pluginId ? await listPlugins().catch(() => []) : [];
+      const found = a.pluginId ? manifests.find((m) => m.id === a.pluginId) : undefined;
+      if (!found) {
+        showToast(
+          `Plugin pane "${a.name}": ${a.pluginId ? `"${a.pluginId}" is no longer installed` : "no plugin was recorded"}. Pick one to reopen it.`,
+          "info"
+        );
+        return openWelcomeIn(ws, dir, anchor);
+      }
+      return ws.grid.openContentPane(
+        events,
+        { kind: "plugin", name: a.name, plugin: await resolvePluginPaneManifest(found), background: true },
+        dir,
+        anchor
+      );
+    }
     case "dormant-group": {
       // The one credit/process-storm-sensitive case: keep the WHOLE group dormant.
       // The Resume button revives it via resumeOrchSession — the only path that
@@ -645,6 +673,7 @@ async function openActionPane(
         sessionId: a.sessionId,
         role: a.role,
         file: null,
+        pluginId: null,
       };
       const content = dormantCard(
         "Resume group",
@@ -927,6 +956,15 @@ async function handleWelcomeSubmit(
     pane.startContent({ kind: result.kind, name: result.name, root: result.root });
     // Converted in place — no grid open/close fired, so notify explicitly (this is
     // what re-renders the tab strip and re-persists the layout), same as terminal.
+    onGridChanged();
+    return;
+  }
+
+  if (result.kind === "plugin") {
+    // Same in-place conversion as its four siblings — synchronous, no PTY — except
+    // there's no root to pass: the form already resolved the CURRENT manifest
+    // (list_plugins, re-probed right before firing) into what startContent needs.
+    pane.startContent({ kind: "plugin", name: result.name, plugin: result.manifest });
     onGridChanged();
     return;
   }

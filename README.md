@@ -71,6 +71,7 @@ no global mode:
 | **File editor** | The file tree + code editor above, as a **pane** rather than an overlay, rooted at a folder you pick. |
 | **Git** | The git view — graph, status, diffs, staging, worktree switching — as a **pane**, over a repo you pick. |
 | **Workflow** | The repo's agent workflow — which blocks a run may use, the path between them, the gate that must pass before a merge — as an editable **pane** over `.loomux/workflow.yml`. |
+| **Plugin** | An installed pane plugin, picked from the ones on your machine and hosted in its own sandboxed window — no shell access, no filesystem beyond a jailed root it declares, no orchestration reach. See [pane plugins](doc/design/pane-plugins.md). |
 
 ## Install
 

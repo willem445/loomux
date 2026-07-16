@@ -15,13 +15,14 @@
  *  (kind + whether it has a running PTY); welcome/dormant panes report
  *  `live: false` so they add nothing to the agent count. */
 export interface TabPaneInfo {
-  /** "files" (#214), "editor" and "git" (#217) and "workflow" (#222) are the PTY-less
-   *  CONTENT panes. None is an agent, and none ever will be, so — like a terminal — they
-   *  contribute nothing to the count below, no matter what `live` says. The count
-   *  keys off the KIND, not off `live`: a viewer that is fully functional (and so
-   *  honestly reports live) must not thereby claim to be a running agent. The workflow
-   *  pane is the sharpest case of that: it is ABOUT agents without being one. */
-  kind: "terminal" | "agent" | "orch" | "files" | "editor" | "git" | "workflow";
+  /** "files" (#214), "editor" and "git" (#217), "workflow" (#222), and "plugin" (#360
+   *  Slice D) are the PTY-less CONTENT panes. None is an agent, and none ever will be,
+   *  so — like a terminal — they contribute nothing to the count below, no matter what
+   *  `live` says. The count keys off the KIND, not off `live`: a viewer that is fully
+   *  functional (and so honestly reports live) must not thereby claim to be a running
+   *  agent. The workflow pane is the sharpest case of that: it is ABOUT agents without
+   *  being one — a plugin pane is a close second, hosting arbitrary third-party UI. */
+  kind: "terminal" | "agent" | "orch" | "files" | "editor" | "git" | "workflow" | "plugin";
   /** True when the pane has a running PTY — a live terminal/agent. False for a
    *  setup (welcome) pane or a dormant restore placeholder (no process yet). A
    *  content pane has no process at all; it reports `live: true` because it is
