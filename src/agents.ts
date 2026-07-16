@@ -18,6 +18,7 @@ export const AGENTS: AgentDef[] = [
   { id: "opencode", label: "OpenCode", command: "opencode" },
   { id: "gemini", label: "Gemini CLI", command: "gemini" },
   { id: "hermes", label: "Hermes", command: "hermes" },
+  { id: "ante", label: "Ante", command: "ante" },
   { id: "custom", label: "Custom…", command: "" },
 ];
 

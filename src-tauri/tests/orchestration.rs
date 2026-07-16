@@ -1038,10 +1038,17 @@ fn single_pane_autopilot_flags_per_cli() {
     let hermes = single_pane_autopilot_flags("hermes");
     assert_eq!(hermes, "--yolo", "hermes autopilot must pass --yolo, got: {hermes}");
 
+    // Ante: --yolo executes all tools automatically, no rule evaluation or
+    // prompts (docs: configuration/permission.mdx, usage/approvals.mdx) — same
+    // shape as Hermes's --yolo, no documented startup dialog either.
+    let ante = single_pane_autopilot_flags("ante");
+    assert_eq!(ante, "--yolo", "ante autopilot must pass --yolo, got: {ante}");
+
     // Case-insensitive on the program name.
     assert_eq!(single_pane_autopilot_flags("Claude"), claude);
     assert_eq!(single_pane_autopilot_flags("COPILOT"), copilot);
     assert_eq!(single_pane_autopilot_flags("Hermes"), hermes);
+    assert_eq!(single_pane_autopilot_flags("Ante"), ante);
 
     // CLIs with no known unattended surface get no flags (the toggle is inert),
     // rather than inventing flags that may not exist.
