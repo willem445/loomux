@@ -3320,6 +3320,112 @@ fn spawn_agent_mcp_resume_ignores_the_worker_worktree_guard() {
     assert_eq!(out["isError"], false, "a resume must not trip the worker worktree guard: {out:?}");
 }
 
+// ───────── rev-13 finding on #345: a cwd-less worker resume must not land in the main clone ─────────
+
+#[test]
+fn spawn_agent_mcp_resume_with_no_cwd_inherits_the_recorded_workspace() {
+    // The seam: a worker RESUME that omits `cwd` used to fall straight through
+    // to spawn_agent_ex's main-clone default. It must instead inherit the
+    // session's recorded workspace from the roster, same as #254 does for the
+    // block identity.
+    let repo = real_repo();
+    let (reg, _d) = test_registry();
+    let g = reg.create_group(&repo.path().to_string_lossy(), rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let co = reg.resolve_token(&orch.token).unwrap();
+
+    // Fresh worker spawn via the MCP tool: worktree defaults on (#338), so its
+    // recorded cwd is a real dedicated worktree, never the main clone.
+    let spawn = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "spawn_agent", "arguments": { "task": "t", "branch": "feat/x" } }))
+        .unwrap();
+    assert_eq!(spawn["isError"], false, "{spawn:?}");
+    let before = reg.list_agents(&g.id);
+    let w = before.as_array().unwrap().iter().find(|a| a["role"] == "worker").unwrap().clone();
+    let (session, original_cwd) = (
+        w["session"].as_str().unwrap().to_string(),
+        w["cwd"].as_str().unwrap().to_string(),
+    );
+    assert_ne!(Path::new(&original_cwd), repo.path(), "test setup sanity: must start outside the main clone");
+    reg.mark_dead(w["id"].as_str().unwrap(), Some(0));
+
+    // Resume with NO cwd at all.
+    let resumed = dispatch(&reg, &co, "tools/call", &json!({
+        "name": "spawn_agent",
+        "arguments": { "kind": "worker", "resume_session": session, "task": "follow-up" },
+    })).unwrap();
+    assert_eq!(resumed["isError"], false, "{resumed:?}");
+    let after = reg.list_agents(&g.id);
+    let resumed_agent = after
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["session"] == json!(session) && a["status"] != json!("dead"))
+        .unwrap();
+    assert_eq!(
+        resumed_agent["cwd"], json!(original_cwd),
+        "a cwd-less resume must inherit the session's recorded workspace: {after}"
+    );
+}
+
+#[test]
+fn spawn_agent_mcp_rejects_a_worker_resume_with_no_cwd_and_no_recorded_workspace() {
+    let repo = real_repo();
+    let (reg, _d) = test_registry();
+    let g = reg.create_group(&repo.path().to_string_lossy(), rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let co = reg.resolve_token(&orch.token).unwrap();
+
+    // A full-length session id this group's roster has never heard of —
+    // `resolve_session_ref` accepts a full id verbatim (#190), so there is no
+    // roster record and therefore no recorded workspace to inherit. Explicit
+    // `kind` so the #254 block-inheritance path's OWN "unknown session" error
+    // (a different message) isn't what fires here.
+    let out = dispatch(&reg, &co, "tools/call", &json!({
+        "name": "spawn_agent",
+        "arguments": {
+            "kind": "worker",
+            "resume_session": "11111111-1111-4111-8111-111111111111",
+            "task": "follow-up",
+        },
+    })).unwrap();
+    assert_eq!(
+        out["isError"], true,
+        "a worker resume with no cwd and nothing recorded must be rejected, not fall back to \
+         the main clone: {out:?}"
+    );
+    let text = out["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("#338"), "error must cite the guardrail, got: {text}");
+    assert!(
+        reg.list_agents(&g.id).as_array().unwrap().iter().all(|a| a["role"] != "worker"),
+        "a rejected resume must not have spawned a worker as a side effect"
+    );
+}
+
+#[test]
+fn spawn_agent_mcp_reviewer_resume_with_no_cwd_and_no_recorded_workspace_is_unaffected() {
+    // Reviewers/planners keep today's behavior: no recorded workspace and no
+    // cwd just falls through to their existing per-role default (the main
+    // clone) — the #338 worker guard doesn't apply to them.
+    let (reg, _d, co, _cw) = setup_mcp();
+
+    let out = dispatch(&reg, &co, "tools/call", &json!({
+        "name": "spawn_agent",
+        "arguments": {
+            "kind": "reviewer",
+            "resume_session": "22222222-2222-4222-8222-222222222222",
+            "task": "follow-up",
+        },
+    })).unwrap();
+    assert_eq!(out["isError"], false, "a reviewer resume is unaffected by the #338 worker guard: {out:?}");
+    let agents = reg.list_agents(&co.group);
+    let reviewer = agents.as_array().unwrap().iter().find(|a| a["role"] == "reviewer").unwrap();
+    assert_eq!(
+        reviewer["cwd"], json!("C:/tmp/repo"),
+        "reviewer falls through to the main clone as before: {reviewer}"
+    );
+}
+
 #[test]
 fn spawn_agent_mcp_accepts_planner_kind() {
     let (reg, _d, co, _cw) = setup_mcp();
