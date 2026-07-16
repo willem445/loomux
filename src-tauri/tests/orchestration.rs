@@ -11124,3 +11124,66 @@ fn gh_cmd_shim_audits_loudly_instead_of_silently_bypassing_when_no_sh_is_resolva
         "a fallback with no sh resolvable must be audited LOUDLY, not silent — got audit: {audit:?}"
     );
 }
+
+#[cfg(windows)]
+#[test]
+fn gh_cmd_shim_ignores_an_inherited_loomux_sh_in_the_degraded_no_sh_case() {
+    // rev-10 review finding on #335: `setlocal` makes the .cmd's OWN variable
+    // changes revertible, but it does NOT clear a `LOOMUX_SH` the invoking
+    // shell already exported. Before the fix, the degraded (`sh_path: None`)
+    // template never `set` LOOMUX_SH at all — so an inherited value (stray
+    // env, or an adversarial agent priming its own shell) would satisfy `if
+    // not defined LOOMUX_SH` and route through THAT untrusted binary instead
+    // of taking the audited degraded-fallback branch, defeating the "never a
+    // silent bypass" guarantee for exactly the case this delegator exists to
+    // protect. The fix unconditionally clears LOOMUX_SH before the check;
+    // this pins it by simulating the attack: an inherited LOOMUX_SH pointing
+    // at a stand-in binary that must NEVER run.
+    use std::process::Command;
+    let td = tempfile::tempdir().unwrap();
+    let root = td.path();
+    let group = root.join("group");
+    fs::create_dir_all(&group).unwrap();
+    let log = root.join("gh.log");
+
+    let fake_bat = root.join("fakegh.cmd");
+    fs::write(&fake_bat, format!("@echo off\r\necho FAKE-GH-RAN>>\"{}\"\r\nexit /b 0\r\n", log.display()))
+        .unwrap();
+
+    // A stand-in for a hijacked/inherited "sh.exe" — if the .cmd ever invokes
+    // it, that alone proves the inherited variable shadowed the baked-in
+    // (empty) resolution.
+    let malicious_log = root.join("malicious.log");
+    let malicious = root.join("malicious_sh.cmd");
+    fs::write(
+        &malicious,
+        format!("@echo off\r\necho MALICIOUS-SH-RAN>>\"{}\"\r\nexit /b 0\r\n", malicious_log.display()),
+    )
+    .unwrap();
+
+    let shim_dir = root.join("shim");
+    fs::create_dir_all(&shim_dir).unwrap();
+    // sh_path: None — shim-write time found no sh anywhere on the machine.
+    fs::write(shim_dir.join("gh.cmd"), gh_shim_cmd(&fake_bat.display().to_string(), None)).unwrap();
+
+    let status = Command::new(shim_dir.join("gh.cmd"))
+        .args(["pr", "merge", "5"])
+        .env("LOOMUX_GROUP_DIR", &group)
+        .env("LOOMUX_SH", &malicious) // simulates an inherited/adversarial value
+        .status()
+        .unwrap();
+
+    assert!(status.success(), "the degraded fallback still runs the real binary, so this exits 0");
+    assert!(
+        !malicious_log.exists(),
+        "an inherited LOOMUX_SH must NEVER be trusted when shim-write time resolved no sh — the \
+         malicious stand-in must not have run"
+    );
+    let gh_log = fs::read_to_string(&log).unwrap_or_default();
+    assert!(gh_log.contains("FAKE-GH-RAN"), "the real binary must have run via the degraded fallback: {gh_log}");
+    let audit = fs::read_to_string(group.join("audit.jsonl")).unwrap_or_default();
+    assert!(
+        audit.contains("gate-degraded-no-sh"),
+        "the degraded fallback must still be audited even with an inherited LOOMUX_SH present — got audit: {audit:?}"
+    );
+}

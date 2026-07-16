@@ -720,6 +720,17 @@ fn shim_cmd_delegator(program: &str, real_bs: &str, sh_path: Option<&str>) -> St
     // exit with the *pre-block* errorlevel — silently turning a gate refusal
     // (real exit 1) back into success. `exit /b %errorlevel%` on its own
     // top-level line, outside any parens, expands fresh at execution time.
+    //
+    // The unconditional `set "LOOMUX_SH="` below is load-bearing (review on
+    // #335): `setlocal` only makes changes *revertible*, it does not clear
+    // variables the invoking shell already exported. Without clearing it
+    // first, an INHERITED `LOOMUX_SH` (accidental or adversarial) would
+    // satisfy `if not defined LOOMUX_SH` in the degraded (no `sh` resolved)
+    // case and route through whatever binary that variable named — an
+    // untrusted substitute for the baked-in path, defeating the very
+    // "never a silent bypass" guarantee this delegator exists for. Clearing
+    // first means only the `set` line this function itself emits (when
+    // `sh_path` is `Some`) can ever populate it.
     format!(
         "@echo off\r\n\
          rem loomux {program} shim (#83) — delegate to the POSIX shim using an\r\n\
@@ -727,6 +738,7 @@ fn shim_cmd_delegator(program: &str, real_bs: &str, sh_path: Option<&str>) -> St
          rem shell's PATH may not include sh.exe, so this no longer re-resolves\r\n\
          rem sh at invocation time.\r\n\
          setlocal\r\n\
+         set \"LOOMUX_SH=\"\r\n\
          {set_sh}\
          if not defined LOOMUX_SH goto :loomux_no_sh\r\n\
          \"%LOOMUX_SH%\" \"%~dp0{program}\" %*\r\n\
