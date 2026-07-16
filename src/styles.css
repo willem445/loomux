@@ -1010,6 +1010,24 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
    its inner dividers clamp against its OWN live size (its ResizeObserver), never against
    a terminal. The overlay path (.git-overlay) is untouched. */
 
+/* ---------- the plugin pane (#360 Slice D) ---------- */
+/* Unlike its siblings this box hosts NO real content of its own — the plugin's UI lives
+   in a separate isolated WebviewWindow that PluginPaneView continuously repositions to
+   sit exactly over this element (see pluginpaneview.ts). What's styled here is only the
+   fallback text shown before that window is up, or if opening it failed — the design
+   note's "empty/error state, not a crash". */
+.pane-plugin {
+  flex: 1; min-height: 0; min-width: 0;
+  display: flex; align-items: center; justify-content: center;
+}
+.pane-plugin-status {
+  color: var(--text-dim);
+  font-size: 13px;
+  text-align: center;
+  padding: 0 16px;
+}
+.pane-plugin-status.pane-plugin-error { color: var(--danger); }
+
 /* ---------- the file manager (#214) ---------- */
 /* Explorer/Finder-equivalent: toolbar + breadcrumb, a Go-to-file box, and a
    listing whose rows open with the OS default app on double-click. Deliberately

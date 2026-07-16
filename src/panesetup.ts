@@ -31,6 +31,15 @@
 // exactly like its three siblings: the path is mandatory here, and whether it is a
 // readable directory is I/O the form probes.
 
+// #360 Slice D adds a FIFTH content kind: `plugin` — an installed pane plugin (see
+// doc/design/pane-plugins.md), hosted in its own isolated WebviewWindow (Slice C).
+// It breaks the "one input is a path" pattern its four siblings share: a plugin
+// pane's identity is WHICH PLUGIN, not a folder or repo, so its one input is a
+// `pluginId` chosen from the installed set (`list_plugins`) rather than a typed
+// path. It is still a content kind — no CLI, no shell, no PTY — so it joins
+// `isContentKind` the same way; only its OWN validation branch differs from the
+// shared "the path is mandatory" rule below.
+
 export type PaneKind =
   | "agent"
   | "orchestrator"
@@ -38,19 +47,27 @@ export type PaneKind =
   | "files"
   | "editor"
   | "git"
-  | "workflow";
+  | "workflow"
+  | "plugin";
 export type ShellKind = "powershell" | "gitbash" | "cmd";
 
 const AGENT_MIN = 1;
 const AGENT_MAX = 8;
 
-/** The PTY-less CONTENT kinds (#214 files, #217 editor + git, #222 workflow): a pane that
- *  IS a surface rather than a process. They spawn nothing, pick no CLI, and take exactly
- *  one input — the folder / repo they are rooted at — which is why the welcome form
- *  can hide every other field off this one predicate instead of listing the kinds at
- *  each site (and forgetting one when a fifth arrives). */
+/** The PTY-less CONTENT kinds (#214 files, #217 editor + git, #222 workflow, #360 Slice
+ *  D plugin): a pane that IS a surface rather than a process. They spawn nothing, pick
+ *  no CLI, and take exactly one input each — a folder/repo for the first four, an
+ *  installed plugin's id for the fifth — which is why the welcome form can hide every
+ *  other field off this one predicate instead of listing the kinds at each site (and
+ *  forgetting one when a sixth arrives). */
 export function isContentKind(kind: PaneKind): boolean {
-  return kind === "files" || kind === "editor" || kind === "git" || kind === "workflow";
+  return (
+    kind === "files" ||
+    kind === "editor" ||
+    kind === "git" ||
+    kind === "workflow" ||
+    kind === "plugin"
+  );
 }
 
 export interface PaneSetupInput {
@@ -75,6 +92,9 @@ export interface PaneSetupInput {
   autopilot: boolean;
   /** Selected shell kind (terminal kind). */
   shellKind: ShellKind;
+  /** Installed plugin chosen in the picker (plugin kind, #360 Slice D); "" until
+   *  one is picked (or when no plugin is installed). Ignored by every other kind. */
+  pluginId: string;
 }
 
 export interface TerminalPlan {
@@ -140,6 +160,15 @@ export interface WorkflowPlan {
   root: string;
   name: string;
 }
+/** A PLUGIN pane (#360 Slice D): an installed plugin, hosted in its own isolated
+ *  WebviewWindow (Slice C). Unlike its four content-kind siblings, its one input
+ *  is not a path — `pluginId` names WHICH plugin, chosen from `list_plugins`
+ *  (Slice B) — so it carries no `root` at all. */
+export interface PluginPlan {
+  kind: "plugin";
+  pluginId: string;
+  name: string;
+}
 export type PaneSetupPlan =
   | TerminalPlan
   | AgentPlan
@@ -147,11 +176,15 @@ export type PaneSetupPlan =
   | FilesPlan
   | EditorPlan
   | GitPlan
-  | WorkflowPlan;
+  | WorkflowPlan
+  | PluginPlan;
 
 /** The per-kind halves of the content-pane rule: what to call the missing path in
  *  the error, and what to fall back to when the human names the pane nothing. The
- *  RULE itself (the path is mandatory) is one branch below, not three. */
+ *  RULE itself (the path is mandatory) is one branch below, not three. Plugin is
+ *  NOT here — its one input is a pluginId, not a path, so it gets its own branch
+ *  in planPaneSetup rather than forcing "pluginId" through wording meant for a
+ *  folder/repo. */
 const CONTENT_SETUP: Record<
   "files" | "editor" | "git" | "workflow",
   { missing: string; fallbackName: string }
@@ -166,7 +199,7 @@ const CONTENT_SETUP: Record<
 };
 
 /** Which field to focus when validation fails, so the form can surface it. */
-export type PaneSetupFocus = "repo" | "custom" | "count";
+export type PaneSetupFocus = "repo" | "custom" | "count" | "plugin";
 
 export type PaneSetupResult =
   | { ok: true; plan: PaneSetupPlan }
@@ -310,6 +343,20 @@ export function planPaneSetup(input: PaneSetupInput): PaneSetupResult {
       };
     }
     return { ok: true, plan: { kind: "orchestrator", repo } };
+  }
+
+  // PLUGIN (#360 Slice D): the one content kind whose input isn't a path. A pluginId
+  // must have been picked from the installed set; there is no "reality" probe left for
+  // the form to run afterward (unlike its siblings) because picking FROM list_plugins is
+  // itself the proof the plugin exists — the only way it can go stale between here and
+  // open is an uninstall racing the submit, which the caller re-checks for real.
+  if (input.kind === "plugin") {
+    const pluginId = input.pluginId.trim();
+    if (!pluginId) {
+      return { ok: false, error: "Pick an installed plugin first.", focus: "plugin" };
+    }
+    const name = input.name.trim() || pluginId;
+    return { ok: true, plan: { kind: "plugin", pluginId, name } };
   }
 
   // The CONTENT kinds (#214 files, #217 editor + git, #222 workflow). ONE rule, because

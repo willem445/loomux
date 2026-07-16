@@ -62,6 +62,7 @@ import { FileEditView } from "./fileedit";
 import { FileExplorerView } from "./fileexplorer";
 import { WorkflowView } from "./workflowview";
 import { WORKFLOW_FILE } from "./workflowmodel";
+import { PluginPaneView, type PluginPaneManifest } from "./pluginpaneview";
 import type { PersistedPane, PersistedPaneKind } from "./tabstore";
 import type { TabPaneInfo } from "./tabcounts";
 
@@ -226,19 +227,21 @@ export interface PaneOptions {
 }
 
 /** The PTY-less CONTENT pane kinds. A pane of one of these kinds IS a surface —
- *  a file manager (#214), the file editor, the git view (#217), or the workflow
- *  builder (#222) — rather than a process. They share every pane mechanic (split,
- *  dock, drag, maximize, restore) and differ only in which view fills the content box. */
-export type ContentPaneKind = "files" | "editor" | "git" | "workflow";
+ *  a file manager (#214), the file editor, the git view (#217), the workflow
+ *  builder (#222), or an installed pane plugin (#360 Slice D) — rather than a
+ *  process. They share every pane mechanic (split, dock, drag, maximize, restore)
+ *  and differ only in which view fills the content box. */
+export type ContentPaneKind = "files" | "editor" | "git" | "workflow" | "plugin";
 
 /** What to CALL each content kind when a message has to name it ("the git view isn't
- *  available in a workflow pane"). A table rather than a ternary chain, so a fifth kind
+ *  available in a workflow pane"). A table rather than a ternary chain, so a sixth kind
  *  is a row and not a nested conditional nobody re-reads. */
 const CONTENT_KIND_LABEL: Record<ContentPaneKind, string> = {
   files: "file explorer",
   editor: "file editor",
   git: "git",
   workflow: "workflow",
+  plugin: "plugin",
 };
 
 /** What a content pane needs: which surface, the root it is pointed at, and a name.
@@ -250,8 +253,10 @@ export interface ContentPaneOptions {
   /** Absolute path the surface is rooted at: the folder a manager lists / an editor
    *  trees, or a directory inside the repo a git view shows. Validated for real by
    *  the caller before we get here — `ftRootIsDir` for files/editor, `gitRepoRoot`
-   *  for git — so this never builds a pane around a root that isn't what it claims. */
-  root: string;
+   *  for git — so this never builds a pane around a root that isn't what it claims.
+   *  Absent for the PLUGIN kind (#360 Slice D): a plugin pane's identity is WHICH
+   *  plugin (`plugin.pluginId` below), not a path — see `doc/design/pane-plugins.md`. */
+  root?: string;
   /** EDITOR kind: a root-relative file to open immediately. Set by the file browser's
    *  "Open in file editor pane" (#217); absent from the welcome flow, which opens the
    *  editor on its tree with nothing selected.
@@ -260,6 +265,11 @@ export interface ContentPaneOptions {
    *  `.loomux/workflow.yml` when absent — the welcome flow's case — and is set when the
    *  browser opens a *different* YAML as a workflow. */
   file?: string;
+  /** PLUGIN kind only (#360 Slice D): the installed plugin's CURRENT manifest,
+   *  resolved by the caller from `list_plugins` at open time (never persisted —
+   *  only `pluginId` is; see tabstore.ts's `PersistedPane.pluginId` doc comment).
+   *  Required when `kind === "plugin"`, absent otherwise. */
+  plugin?: PluginPaneManifest;
   /** Open without stealing keyboard focus (same contract as PaneOptions). */
   background?: boolean;
 }
@@ -477,6 +487,12 @@ export class Pane implements VoiceTargetPane {
   private editorPaneView: FileEditView | null = null;
   private gitPaneView: GitView | null = null;
   private workflowPaneView: WorkflowView | null = null;
+  private pluginPaneView: PluginPaneView | null = null;
+  /** A PLUGIN pane's (#360 Slice D) persisted identity — the installed plugin's
+   *  manifest `id`. Unlike the other content kinds' root, this rides in its own
+   *  `PersistedPane.pluginId` field, not `cwd` (tabstore.ts) — so it's tracked
+   *  separately from `contentRoot`, which a plugin pane leaves null. */
+  private pluginId: string | null = null;
   /** True once the pane's process has exited but the pane was kept open to show
    *  its output (notifyExited). The counter must not count a dead agent as live
    *  (#194 P4 LOW-7). */
@@ -1012,7 +1028,14 @@ export class Pane implements VoiceTargetPane {
     this.el.classList.add("is-content");
     this.contentKind = opts.kind;
     this.contentFile = opts.file ?? null;
-    this.setContentRoot(opts.root);
+    // A PLUGIN pane (#360 Slice D) has no root — its identity is `opts.plugin.pluginId`,
+    // tracked separately below — so this is the one content kind that skips
+    // setContentRoot entirely rather than rooting itself at an empty string.
+    if (opts.root !== undefined) this.setContentRoot(opts.root);
+    this.pluginId = opts.plugin?.pluginId ?? null;
+    // Untrusted display text (the manifest's `name`, opts.plugin.displayName): routed
+    // through setName exactly like every other pane title, which assigns via
+    // `textContent` (never innerHTML) — so it can never be interpolated as markup.
     this.setName(opts.name);
 
     const view = this.buildContentView(opts);
@@ -1089,6 +1112,16 @@ export class Pane implements VoiceTargetPane {
         onRootChanged: adoptRoot,
       });
       return this.editorPaneView;
+    }
+
+    if (opts.kind === "plugin") {
+      // A plugin pane's identity is immutable for its lifetime (like a workflow
+      // block's id) — no re-root affordance, so `adoptRoot` doesn't apply here.
+      // `opts.plugin` is required by ContentPaneOptions' own doc comment for this
+      // kind; the caller (launcher.ts / main.ts) always resolves it before calling
+      // startContent, same as it resolves `root` for real for the other kinds.
+      this.pluginPaneView = new PluginPaneView({ manifest: opts.plugin! });
+      return this.pluginPaneView;
     }
 
     if (opts.kind === "workflow") {
@@ -2002,6 +2035,9 @@ export class Pane implements VoiceTargetPane {
           : kind === "workflow"
             ? this.workflowPaneView?.openPathRel ?? null
             : null,
+      // A PLUGIN pane's (#360 Slice D) identity — see tabstore.ts's PersistedPane.pluginId
+      // doc comment for why this is its own field rather than riding in `cwd`.
+      pluginId: kind === "plugin" ? this.pluginId : null,
     };
   }
 
@@ -2715,6 +2751,7 @@ export class Pane implements VoiceTargetPane {
     this.editorPaneView?.dispose();
     this.gitPaneView?.dispose();
     this.workflowPaneView?.dispose();
+    this.pluginPaneView?.dispose();
     if (this.ptyId !== null) {
       detachOutput(this.ptyId);
       detachGitWatch(this.ptyId);

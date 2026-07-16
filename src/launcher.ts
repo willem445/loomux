@@ -57,6 +57,8 @@ import {
 } from "./panesetup";
 import { discoverGitBash } from "./pty";
 import { ftRootIsDir } from "./fileapi";
+import { listPlugins, type PluginManifest } from "./pluginhost";
+import { resolvePluginPaneManifest, type PluginPaneManifest } from "./pluginpaneview";
 import {
   AGENTS,
   addRecentRepo,
@@ -109,7 +111,12 @@ export type WelcomeResult =
   /** A workflow pane (#222): `root` is the repo whose `.loomux/workflow.yml` the pane
    *  edits — a confirmed directory, like files/editor. The workflow FILE is not probed:
    *  a repo without one is the normal starting point, and the pane offers to create it. */
-  | { kind: "workflow"; name: string; root: string };
+  | { kind: "workflow"; name: string; root: string }
+  /** A plugin pane (#360 Slice D): `manifest` is the CHOSEN plugin's manifest,
+   *  re-fetched from `list_plugins` right before this fired — the form's own
+   *  "is it still real" probe, same job `ftRootIsDir`/`gitRepoRoot` do for the
+   *  path-rooted kinds, just against the installed set instead of the filesystem. */
+  | { kind: "plugin"; name: string; manifest: PluginPaneManifest };
 
 interface OrchCli {
   id: string;
@@ -274,6 +281,17 @@ export class WelcomeForm {
   private worktreeInput: HTMLInputElement;
   private nameField: HTMLElement;
   private nameInput: HTMLInputElement;
+  // Plugin picker (#360 Slice D): the installed set, fetched once and memoized for
+  // the form's life — list_plugins is a local-folder scan, cheap, but there's no
+  // reason to re-hit it on every kind-select toggle. `pluginManifests` mirrors
+  // whatever the select currently offers, so submit() can look the CHOSEN one up
+  // without a second round trip for the common case (still re-probed for real —
+  // see submit()).
+  private pluginField: HTMLElement;
+  private pluginSel: HTMLSelectElement;
+  private pluginHint: HTMLElement;
+  private pluginManifests: PluginManifest[] = [];
+  private pluginsPromise: Promise<PluginManifest[]> | null = null;
   // Autopilot toggle (agent kind): launch with the CLI's unattended "allow all"
   // flags. Default ON, persisted (#101).
   private autopilotField: HTMLElement;
@@ -361,6 +379,7 @@ export class WelcomeForm {
       ["editor", "File editor — tree + code editor, rooted at a folder"],
       ["git", "Git — graph, status, diffs and worktrees for a repo"],
       ["workflow", "Workflow — agent blocks, edges and merge gates for a repo"],
+      ["plugin", "Plugin — an installed pane plugin"],
     ]);
     this.kindSel.addEventListener("change", () => this.applyKind());
 
@@ -442,6 +461,21 @@ export class WelcomeForm {
     this.worktreeInput.spellcheck = false;
     this.worktreeInput.addEventListener("input", () => this.updateName());
     this.worktreeField = field("Worktree", this.worktreeInput, "optional, creates branch + folder");
+
+    // Plugin picker (#360 Slice D): the ONE input a plugin pane takes — WHICH
+    // installed plugin, not a path — so it's its own field rather than repurposing
+    // the repo/folder input its four content-kind siblings share. Options are
+    // populated from `list_plugins` (loadPlugins) the first time the kind is
+    // selected; the label is the manifest's `name` — UNTRUSTED third-party text —
+    // rendered via `option.textContent` only (select()'s own convention), never
+    // built into markup.
+    this.pluginSel = document.createElement("select");
+    this.pluginSel.className = "dlg-select";
+    this.pluginSel.addEventListener("change", () => this.updateName());
+    this.pluginHint = document.createElement("div");
+    this.pluginHint.className = "dlg-error";
+    this.pluginField = field("Plugin", this.pluginSel);
+    this.pluginField.appendChild(this.pluginHint);
 
     this.nameInput = document.createElement("input");
     this.nameInput.className = "dlg-input";
@@ -631,6 +665,7 @@ export class WelcomeForm {
       this.shellField,
       this.repoField,
       this.worktreeField,
+      this.pluginField,
       this.autopilotField,
       this.channelToolsField,
       this.orchFields,
@@ -677,14 +712,19 @@ export class WelcomeForm {
     const agent = k === "agent";
     const orch = k === "orchestrator";
     const term = k === "terminal";
+    const plugin = k === "plugin";
     const content = isContentKind(k);
     // A content pane picks no CLI and spawns nothing: its ONLY input is the folder /
-    // repo (plus a name), so every other field is out (#214, #217).
+    // repo (plus a name), so every other field is out (#214, #217). Plugin (#360
+    // Slice D) is a content kind too, but its one input is WHICH plugin, not a
+    // path — so it swaps the repo/folder field for its own picker instead.
     this.agentField.hidden = term || content; // agent + orchestrator both pick a CLI
     this.customField.hidden = !agent || this.agentSel.value !== "custom";
     this.countField.hidden = !agent;
     this.shellField.hidden = !term;
     this.worktreeField.hidden = !agent; // workers get worktrees on demand
+    this.repoField.hidden = plugin;
+    this.pluginField.hidden = !plugin;
     this.autopilotField.hidden = !agent;
     this.orchFields.hidden = !orch;
     this.nameField.hidden = orch; // orchestrator names its panes from the roles
@@ -701,11 +741,58 @@ export class WelcomeForm {
             : k === "workflow"
               ? "Repository whose workflow to edit — required"
               : "Repository or folder — empty for home";
+    if (plugin) void this.loadPlugins();
     this.applyOrchCli();
     this.applyAutopilot();
     this.applyChannelTools();
     this.updateName();
     this.refreshRoster();
+  }
+
+  /** Fetch the installed plugin set once and populate the picker (#360 Slice D).
+   *  Memoized for the form's life — list_plugins is a cheap local-folder scan, but
+   *  there's no reason to re-hit it every time the kind toggles back to "plugin";
+   *  submit() re-probes for real regardless, so staleness here only ever costs an
+   *  inline bounce, never a bad open. */
+  private loadPlugins(): Promise<PluginManifest[]> {
+    if (!this.pluginsPromise) {
+      this.pluginsPromise = listPlugins().catch((): PluginManifest[] => []);
+      void this.pluginsPromise.then((manifests) => {
+        if (this.kind !== "plugin") return; // the human moved on while this resolved
+        this.pluginManifests = manifests;
+        this.paintPlugins();
+      });
+    }
+    return this.pluginsPromise;
+  }
+
+  /** Render the installed set into the picker, or an inline "none installed" state
+   *  when there's nothing to choose (empty selects can't be submitted meaningfully,
+   *  and a blank dropdown with no explanation reads as broken rather than "you
+   *  haven't installed one yet"). */
+  private paintPlugins(): void {
+    if (this.pluginManifests.length === 0) {
+      this.pluginSel.replaceChildren();
+      this.pluginSel.disabled = true;
+      this.pluginHint.textContent =
+        "No plugins installed — copy one into the plugins folder to see it here.";
+      this.pluginHint.classList.add("visible");
+      return;
+    }
+    this.pluginSel.disabled = false;
+    this.pluginHint.classList.remove("visible");
+    const current = this.pluginSel.value;
+    this.pluginSel.replaceChildren(
+      ...this.pluginManifests.map((m) => {
+        const opt = document.createElement("option");
+        opt.value = m.id;
+        // Untrusted text (the manifest's `name`) — textContent only, never innerHTML.
+        opt.textContent = m.name;
+        return opt;
+      })
+    );
+    if (this.pluginManifests.some((m) => m.id === current)) this.pluginSel.value = current;
+    this.updateName();
   }
 
   /** Show the channel-tools toggle only where it applies — agent kind,
@@ -1024,6 +1111,17 @@ export class WelcomeForm {
    *  `shell · where` for a terminal, the folder/repo's own name for a content pane. */
   private updateName(): void {
     if (this.nameDirty) return;
+    if (this.kind === "plugin") {
+      // The chosen plugin's OWN display name is the useful title — same reasoning
+      // as the other content kinds' "the root's short name IS the title", just
+      // keyed off the picker's selection instead of a typed path. Untrusted text,
+      // but this only ever reaches `nameInput.value` (an <input>'s VALUE, not
+      // markup) and then Pane.setName's `textContent` once the pane opens — never
+      // interpolated as HTML at any point in the chain.
+      const chosen = this.pluginManifests.find((m) => m.id === this.pluginSel.value);
+      this.nameInput.value = chosen?.name || this.pluginSel.value || "plugin";
+      return;
+    }
     const where =
       this.worktreeInput.value.trim() || basename(this.repoInput.value.trim()) || "home";
     if (isContentKind(this.kind)) {
@@ -1105,6 +1203,7 @@ export class WelcomeForm {
       name: this.nameInput.value,
       autopilot: this.autopilotInput.checked,
       shellKind: this.shellSel.value as ShellKind,
+      pluginId: this.pluginSel.disabled ? "" : this.pluginSel.value,
     };
   }
 
@@ -1193,6 +1292,26 @@ export class WelcomeForm {
       // worktree, `--show-toplevel` is that worktree, which is exactly the pane the
       // human asked for.
       this.fire({ kind: "git", name: plan.name, root: plan.root });
+      return;
+    }
+
+    if (plan.kind === "plugin") {
+      // Re-probe for real, right before firing — the same "picking from the list is
+      // proof it exists, but the list could have gone stale in the meantime" caveat
+      // planPaneSetup's own comment names. A plugin uninstalled between the picker
+      // populating and Create being clicked bounces back to the field with a message,
+      // exactly like a folder that vanished between typing it and submitting.
+      this.setBusy(true, "Opening…");
+      const manifests = await listPlugins().catch((): PluginManifest[] => []);
+      const found = manifests.find((m) => m.id === plan.pluginId);
+      if (!found) {
+        this.showError(`Plugin "${plan.pluginId}" is no longer installed.`);
+        this.pluginSel.focus();
+        this.setBusy(false);
+        this.latch.release();
+        return;
+      }
+      this.fire({ kind: "plugin", name: plan.name, manifest: await resolvePluginPaneManifest(found) });
       return;
     }
 

@@ -48,7 +48,16 @@ export type RestorePref = "ask" | "restore" | "fresh";
  *  rides in the existing `cwd`, exactly as `role` rode into the schema for orch panes,
  *  and the workflow pane's file rides in the `file` field the editor already added.
  *  Decode is shape-driven, so old files (which simply never carry these leaves) are
- *  unaffected and SCHEMA_VERSION stays at 2. */
+ *  unaffected and SCHEMA_VERSION stays at 2.
+ *
+ *  "plugin" (#360 Slice D) is a fifth CONTENT pane, and the first whose identity
+ *  ISN'T a path — it's WHICH plugin. `cwd` has no meaning for it (a plugin pane
+ *  has no folder/repo root of its own; the plugin's own install root, if any, is
+ *  re-derived live from its CURRENT manifest on restore, never persisted — a
+ *  plugin can be reinstalled at a different path between sessions and the pane
+ *  must follow it, not a stale snapshot). So this is the one content kind that
+ *  DOES need a new field: `pluginId` below, additive like every other #194 field
+ *  (an old snapshot simply never contains a "plugin" leaf). */
 export type PersistedPaneKind =
   | "terminal"
   | "agent"
@@ -56,11 +65,12 @@ export type PersistedPaneKind =
   | "files"
   | "editor"
   | "git"
-  | "workflow";
+  | "workflow"
+  | "plugin";
 
 /** The PTY-less content kinds, in one place — what `cwd` means for them is a ROOT,
- *  not a shell's directory. */
-const CONTENT_KINDS: readonly PersistedPaneKind[] = ["files", "editor", "git", "workflow"];
+ *  not a shell's directory (except "plugin", which uses neither — see `pluginId`). */
+const CONTENT_KINDS: readonly PersistedPaneKind[] = ["files", "editor", "git", "workflow", "plugin"];
 
 /** One pane at a layout leaf, reduced to what restore needs. Never the live
  *  PTY/buffer — those are deliberately not captured (cost/#78 process-storm and
@@ -101,6 +111,15 @@ export interface PersistedPane {
    *  on from the file browser). Null for every other kind, and absent from any snapshot
    *  written before #217. */
   file: string | null;
+  /** A PLUGIN pane's (#360 Slice D) identity: the manifest `id` of the installed
+   *  plugin it hosts. This is the one content kind whose root doesn't fit `cwd` —
+   *  see the PersistedPaneKind doc comment — so it gets its own field, additive
+   *  like `file` was for #217: absent from any snapshot written before Slice D,
+   *  and null for every other pane kind. A `pluginId` naming a plugin that has
+   *  since been uninstalled is not a decode failure — decode doesn't (and can't)
+   *  check installation state, that's I/O — it fails soft on RESTORE instead
+   *  (panerestore.ts's open-plugin action / main.ts's probe). */
+  pluginId: string | null;
 }
 
 /** A tab's pane layout: the split tree with PersistedPane leaves. Mirrors grid's
@@ -192,6 +211,7 @@ function decodePane(v: unknown): PersistedPane | null {
     sessionId: typeof r.sessionId === "string" ? r.sessionId : null,
     role: typeof r.role === "string" ? r.role : null,
     file: typeof r.file === "string" ? r.file : null,
+    pluginId: typeof r.pluginId === "string" ? r.pluginId : null,
   };
 }
 
