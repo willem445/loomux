@@ -98,6 +98,18 @@ so far:
   of your own (`<repo>-worktrees/orch-staging`, reused across mechanical work) — never in the
   main clone, which is the human's environment.
 
+- **#359, extend the worktree requirement to reviewers** — `orchestrator.md` and `reviewer.md`.
+  Live incident: two reviewers (rev-36, rev-38) collided in the shared main clone — one checked
+  branches out and restored `main` while the other was mid-review on a different branch, knocking
+  it off its checkout. `spawn_agent`'s worktree default/reject guard (#338) now covers reviewers
+  exactly like workers: `worktree` defaults on and `worktree: false` is rejected for either.
+  `orchestrator.md`'s `spawn_agent` bullet states the guarantee for both roles and the incident
+  it closes. `reviewer.md`'s **Review protocol** step 1 explains the worktree is scratch space cut
+  from the default branch, not a checkout of the PR under review (that branch may already be
+  checked out in the worker's own worktree) — and gives the `gh pr checkout <n> --detach`
+  convention for inspecting the PR's actual code locally, since a bare `gh pr checkout <n>` grabs
+  the branch by name and collides with whichever other worktree already holds it.
+
 `the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was` renders
 **these** with the six pre-#222 template variables and asserts that a group launched
 with the advanced orchestrator **off** gets exactly that text. They are the

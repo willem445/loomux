@@ -2695,10 +2695,12 @@ fn mcp_spawn_rejects_an_unknown_kind_instead_of_making_it_a_worker() {
 #[test]
 fn mcp_spawn_can_name_a_block_and_the_block_decides_the_class() {
     let (reg, _d) = test_registry();
+    // git_init(): the reviewer spawns below go through the MCP tool, and a
+    // reviewer spawn's worktree now defaults on too (#359).
     let repo = Repo::new().workflow(FOCUSED_REVIEW).agent_file(
         "worker.md",
         "---\ndescription: repo worker\n---\nBranch first.",
-    );
+    ).git_init();
     let g = reg.create_group(&repo.path(), rails()).unwrap();
     let caller = orch_caller(&reg, &g.id);
     let call = |args: Value| {

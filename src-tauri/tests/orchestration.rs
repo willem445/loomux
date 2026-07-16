@@ -3269,25 +3269,12 @@ fn spawn_agent_mcp_rejects_explicit_worktree_false_for_a_worker() {
 }
 
 #[test]
-fn spawn_agent_mcp_reviewer_and_planner_are_unaffected_by_the_worker_worktree_default() {
-    // #338 only forces a worktree for workers. A reviewer's default (no
-    // worktree, works in the main clone via `gh`) and a planner's structural
-    // "never a worktree" both survive untouched — and neither role errors on
-    // an explicit `worktree: false`. A generous cap: this spawns a reviewer
-    // AND a planner alongside the orchestrator, which `rails()`'s cap of 2
-    // wouldn't fit.
-    let (reg, _d) = test_registry();
-    let g = reg.create_group("C:/tmp/repo", Guardrails { max_agents: 5, ..rails() }).unwrap();
-    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
-    let co = reg.resolve_token(&orch.token).unwrap();
-
-    let rev = dispatch(&reg, &co, "tools/call",
-        &json!({ "name": "spawn_agent", "arguments": { "kind": "reviewer", "task": "review #1", "worktree": false } }))
-        .unwrap();
-    assert_eq!(rev["isError"], false, "{rev:?}");
-    let agents = reg.list_agents(&co.group);
-    let reviewer = agents.as_array().unwrap().iter().find(|a| a["role"] == "reviewer").unwrap();
-    assert_eq!(reviewer["cwd"], json!("C:/tmp/repo"), "reviewer must default to the main clone: {reviewer}");
+fn spawn_agent_mcp_planner_is_unaffected_by_the_worktree_default() {
+    // #338/#359 force a worktree for workers and reviewers; a planner's
+    // structural "never a worktree" survives untouched — it doesn't error on
+    // an explicit `worktree: false` either, since it never reaches the guard
+    // (only Worker/Reviewer do, per `needs_dedicated_workspace`).
+    let (reg, _d, co, _cw) = setup_mcp();
 
     let plan = dispatch(&reg, &co, "tools/call",
         &json!({ "name": "spawn_agent", "arguments": { "kind": "planner", "task": "plan #1", "worktree": false } }))
@@ -3296,6 +3283,161 @@ fn spawn_agent_mcp_reviewer_and_planner_are_unaffected_by_the_worker_worktree_de
     let agents = reg.list_agents(&co.group);
     let planner = agents.as_array().unwrap().iter().find(|a| a["role"] == "planner").unwrap();
     assert_eq!(planner["cwd"], json!("C:/tmp/repo"), "planner must never get a worktree: {planner}");
+}
+
+#[test]
+fn spawn_agent_mcp_reviewer_defaults_to_a_worktree() {
+    // #359: extending #338's worker guarantee to reviewers — a reviewer
+    // spawned via the MCP tool with no `worktree` argument must still land in
+    // a dedicated worktree, never the main clone (the rev-36/rev-38 incident:
+    // two reviewers, or a reviewer and the orchestrator's own git traffic,
+    // contending on the shared clone's checkout state).
+    let repo = real_repo();
+    let (reg, _d) = test_registry();
+    let g = reg.create_group(&repo.path().to_string_lossy(), rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let co = reg.resolve_token(&orch.token).unwrap();
+
+    let out = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "spawn_agent", "arguments": { "kind": "reviewer", "task": "review #1" } }))
+        .unwrap();
+    assert_eq!(out["isError"], false, "{out:?}");
+    let agents = reg.list_agents(&g.id);
+    let reviewer = agents.as_array().unwrap().iter().find(|a| a["role"] == "reviewer").unwrap();
+    let cwd = reviewer["cwd"].as_str().unwrap();
+    assert_ne!(
+        Path::new(cwd), repo.path(),
+        "a reviewer must not run in the main clone by default: {reviewer}"
+    );
+    assert!(Path::new(cwd).is_dir(), "the worktree directory must actually exist: {cwd}");
+}
+
+#[test]
+fn spawn_agent_mcp_rejects_explicit_worktree_false_for_a_reviewer() {
+    let repo = real_repo();
+    let (reg, _d) = test_registry();
+    let g = reg.create_group(&repo.path().to_string_lossy(), rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let co = reg.resolve_token(&orch.token).unwrap();
+
+    let out = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "spawn_agent", "arguments": { "kind": "reviewer", "task": "t", "worktree": false } }))
+        .unwrap();
+    assert_eq!(
+        out["isError"], true,
+        "an explicit worktree=false for a reviewer must be rejected, not silently coerced: {out:?}"
+    );
+    let text = out["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("#359"), "error must cite the guardrail, got: {text}");
+    assert!(
+        reg.list_agents(&g.id).as_array().unwrap().iter().all(|a| a["role"] != "reviewer"),
+        "a rejected spawn must not have created a reviewer as a side effect"
+    );
+}
+
+#[test]
+fn spawn_agent_mcp_rejects_cwd_on_a_fresh_reviewer_spawn() {
+    let repo = real_repo();
+    let (reg, _d) = test_registry();
+    let g = reg.create_group(&repo.path().to_string_lossy(), rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let co = reg.resolve_token(&orch.token).unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+
+    let out = dispatch(&reg, &co, "tools/call", &json!({
+        "name": "spawn_agent",
+        "arguments": { "kind": "reviewer", "task": "t", "cwd": elsewhere.path().to_string_lossy() },
+    })).unwrap();
+    assert_eq!(
+        out["isError"], true,
+        "a fresh reviewer spawn with an explicit cwd must be rejected, not silently honored: {out:?}"
+    );
+    assert!(out["content"][0]["text"].as_str().unwrap().contains("#359"));
+}
+
+#[test]
+fn spawn_agent_mcp_reviewer_resume_with_no_cwd_inherits_or_rejects_like_a_worker() {
+    // #359: the resume-side half of the reviewer guarantee mirrors the
+    // worker one exactly — inherit the recorded workspace when one exists,
+    // reject when nothing is recorded, never fall back to the main clone.
+    let repo = real_repo();
+    let (reg, _d) = test_registry();
+    let g = reg.create_group(&repo.path().to_string_lossy(), rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let co = reg.resolve_token(&orch.token).unwrap();
+
+    let spawn = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "spawn_agent", "arguments": { "kind": "reviewer", "task": "t" } }))
+        .unwrap();
+    assert_eq!(spawn["isError"], false, "{spawn:?}");
+    let before = reg.list_agents(&g.id);
+    let rev = before.as_array().unwrap().iter().find(|a| a["role"] == "reviewer").unwrap().clone();
+    let (session, original_cwd) = (
+        rev["session"].as_str().unwrap().to_string(),
+        rev["cwd"].as_str().unwrap().to_string(),
+    );
+    reg.mark_dead(rev["id"].as_str().unwrap(), Some(0));
+
+    let resumed = dispatch(&reg, &co, "tools/call", &json!({
+        "name": "spawn_agent",
+        "arguments": { "kind": "reviewer", "resume_session": session, "task": "follow-up" },
+    })).unwrap();
+    assert_eq!(resumed["isError"], false, "{resumed:?}");
+    let after = reg.list_agents(&g.id);
+    let resumed_agent = after.as_array().unwrap().iter()
+        .find(|a| a["session"] == json!(session) && a["status"] != json!("dead")).unwrap();
+    assert_eq!(
+        resumed_agent["cwd"], json!(original_cwd),
+        "a cwd-less reviewer resume must inherit the session's recorded workspace: {after}"
+    );
+
+    // No recorded workspace at all: rejected, not a main-clone fall-back.
+    let out = dispatch(&reg, &co, "tools/call", &json!({
+        "name": "spawn_agent",
+        "arguments": {
+            "kind": "reviewer",
+            "resume_session": "33333333-3333-4333-8333-333333333333",
+            "task": "follow-up",
+        },
+    })).unwrap();
+    assert_eq!(out["isError"], true, "{out:?}");
+    assert!(out["content"][0]["text"].as_str().unwrap().contains("#359"));
+}
+
+#[test]
+fn spawn_agent_mcp_two_concurrent_reviewers_get_distinct_worktrees_not_the_main_clone() {
+    // Direct regression pin for the #359 incident: rev-36 and rev-38 both in
+    // the SAME main clone at once, one restoring `main` out from under the
+    // other's mid-review checkout. Two reviewers spawned into one group must
+    // land in two DIFFERENT directories, neither of which is the main clone.
+    let repo = real_repo();
+    let (reg, _d) = test_registry();
+    let g = reg.create_group(&repo.path().to_string_lossy(), Guardrails { max_agents: 5, ..rails() }).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let co = reg.resolve_token(&orch.token).unwrap();
+
+    let a = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "spawn_agent", "arguments": { "task": "review PR #355", "kind": "reviewer", "branch": "rev-a" } }))
+        .unwrap();
+    assert_eq!(a["isError"], false, "{a:?}");
+    let b = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "spawn_agent", "arguments": { "task": "review PR #358", "kind": "reviewer", "branch": "rev-b" } }))
+        .unwrap();
+    assert_eq!(b["isError"], false, "{b:?}");
+
+    let agents = reg.list_agents(&g.id);
+    let cwds: Vec<&str> = agents.as_array().unwrap().iter()
+        .filter(|x| x["role"] == "reviewer")
+        .map(|x| x["cwd"].as_str().unwrap())
+        .collect();
+    assert_eq!(cwds.len(), 2, "both reviewers must be on the roster: {agents}");
+    assert_ne!(cwds[0], cwds[1], "concurrent reviewers must not share a workspace: {agents}");
+    for cwd in &cwds {
+        assert_ne!(
+            Path::new(cwd), repo.path(),
+            "no reviewer may be in the main clone, the #359 incident verbatim: {agents}"
+        );
+    }
 }
 
 #[test]
@@ -3402,30 +3544,6 @@ fn spawn_agent_mcp_rejects_a_worker_resume_with_no_cwd_and_no_recorded_workspace
     );
 }
 
-#[test]
-fn spawn_agent_mcp_reviewer_resume_with_no_cwd_and_no_recorded_workspace_is_unaffected() {
-    // Reviewers/planners keep today's behavior: no recorded workspace and no
-    // cwd just falls through to their existing per-role default (the main
-    // clone) — the #338 worker guard doesn't apply to them.
-    let (reg, _d, co, _cw) = setup_mcp();
-
-    let out = dispatch(&reg, &co, "tools/call", &json!({
-        "name": "spawn_agent",
-        "arguments": {
-            "kind": "reviewer",
-            "resume_session": "22222222-2222-4222-8222-222222222222",
-            "task": "follow-up",
-        },
-    })).unwrap();
-    assert_eq!(out["isError"], false, "a reviewer resume is unaffected by the #338 worker guard: {out:?}");
-    let agents = reg.list_agents(&co.group);
-    let reviewer = agents.as_array().unwrap().iter().find(|a| a["role"] == "reviewer").unwrap();
-    assert_eq!(
-        reviewer["cwd"], json!("C:/tmp/repo"),
-        "reviewer falls through to the main clone as before: {reviewer}"
-    );
-}
-
 // ───────── follow-up finding: a FRESH worker spawn's cwd is the other half of the #338 door ─────────
 
 #[test]
@@ -3474,23 +3592,24 @@ fn spawn_agent_mcp_rejects_cwd_on_a_fresh_worker_spawn() {
 }
 
 #[test]
-fn spawn_agent_mcp_fresh_reviewer_spawn_with_cwd_is_unaffected() {
-    // Reviewers/planners are unchanged: a fresh spawn's explicit cwd is still
-    // honored as a raw override for them, exactly as before.
+fn spawn_agent_mcp_planner_fresh_spawn_with_cwd_is_unaffected() {
+    // A planner is the only role left unaffected by the fresh-spawn cwd
+    // guard — it never gets a worktree under any circumstance, so an
+    // explicit cwd is still honored as a raw override for it, unchanged.
     let (reg, _d, co, _cw) = setup_mcp();
     let elsewhere = tempfile::tempdir().unwrap();
     let elsewhere_path = elsewhere.path().to_string_lossy().to_string();
 
     let out = dispatch(&reg, &co, "tools/call", &json!({
         "name": "spawn_agent",
-        "arguments": { "kind": "reviewer", "task": "review #1", "cwd": elsewhere_path },
+        "arguments": { "kind": "planner", "task": "plan #1", "cwd": elsewhere_path },
     })).unwrap();
-    assert_eq!(out["isError"], false, "a fresh reviewer spawn with cwd is unaffected: {out:?}");
+    assert_eq!(out["isError"], false, "a fresh planner spawn with cwd is unaffected: {out:?}");
     let agents = reg.list_agents(&co.group);
-    let reviewer = agents.as_array().unwrap().iter().find(|a| a["role"] == "reviewer").unwrap();
+    let planner = agents.as_array().unwrap().iter().find(|a| a["role"] == "planner").unwrap();
     assert_eq!(
-        reviewer["cwd"], json!(elsewhere_path),
-        "reviewer's explicit cwd is honored as-is, unchanged: {reviewer}"
+        planner["cwd"], json!(elsewhere_path),
+        "planner's explicit cwd is honored as-is, unchanged: {planner}"
     );
 }
 
@@ -3529,7 +3648,9 @@ fn spawn_agent_mcp_accepts_planner_kind() {
 #[test]
 fn resume_of_reviewer_session_inherits_reviewer_block_not_default_worker() {
     let (reg, _d) = test_registry();
-    let repo = tempfile::tempdir().unwrap(); // a real cwd — the resume path checks it exists
+    // A real repo: the fresh reviewer spawn below goes through the MCP tool,
+    // and a reviewer spawn's worktree now defaults on too (#359).
+    let repo = real_repo();
     let g = reg.create_group(&repo.path().to_string_lossy(), rails()).unwrap();
     let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
     let co = reg.resolve_token(&orch.token).unwrap();
@@ -3592,7 +3713,9 @@ fn resume_with_an_empty_string_block_still_inherits_instead_of_defaulting() {
     // mod.rs's own block resolution then trims/discards the empty id and
     // falls back to `block_for(Worker)`: the #254 bug verbatim.
     let (reg, _d) = test_registry();
-    let repo = tempfile::tempdir().unwrap();
+    // A real repo: the fresh reviewer spawn below goes through the MCP tool,
+    // and a reviewer spawn's worktree now defaults on too (#359).
+    let repo = real_repo();
     let g = reg.create_group(&repo.path().to_string_lossy(), rails()).unwrap();
     let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
     let co = reg.resolve_token(&orch.token).unwrap();

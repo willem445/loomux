@@ -192,7 +192,7 @@ invariant so the fix itself cannot introduce a detached-HEAD window.
 codebase read-only and writes a structured implementation plan as a GitHub issue comment,
 then reports and exits; it never writes code, branches, worktrees, or PRs.
 
-### Worker worktree is mandatory (#338)
+### Worker (and, since #359, reviewer) worktrees are mandatory (#338)
 
 Before this, `worktree` defaulted to `false`: a worker spawned with no explicit `worktree:
 true` worked directly in the group's primary clone — the same checkout the human uses. That
@@ -224,10 +224,10 @@ The guard reads the **effective role** (the named block's `kind` when one is giv
 back to the `kind` argument otherwise — the same precedence `spawn_agent_ex` itself applies),
 not just the `kind` argument, so a worker-kind `block` is covered exactly like the bare
 `kind: "worker"` default; naming an *unknown* block is left to `spawn_agent_ex`'s own "unknown
-block" error rather than pre-empted by this guard. Reviewers and planners are untouched — a
-reviewer's default stays `false` (it inspects PRs via `gh` in the main clone; passing
-`worktree: true` for one is still allowed, unchanged), and a planner never gets a worktree
-under any `worktree` value, per its existing read-only contract.
+block" error rather than pre-empted by this guard (`needs_dedicated_workspace` in `mcp.rs` is
+the one place that decides which roles this covers — originally just `Role::Worker`, extended
+to `Role::Reviewer` by #359 below). A planner is untouched — it never gets a worktree under
+any `worktree` value, per its existing read-only contract.
 
 **Guarding `worktree` alone left two more doors into the main clone open, both found on review
 of the #338 PR itself — `cwd` bypasses the flag entirely, on either entry point:**
@@ -238,27 +238,26 @@ of the #338 PR itself — `cwd` bypasses the flag entirely, on either entry poin
   all, bypassed the worktree guard completely: `worktree`'s own value never even matters once
   `cwd` is set. The tool description had called `cwd` "ignored without resume_session" — true
   of nothing in the code, just unenforced prose. Fixed by rejecting an explicit `cwd` on a
-  fresh worker spawn (or worker-kind block), same style and the same `#338` wording as an
-  explicit `worktree: false` — checked *before* the `worktree: false` check even runs, since an
-  explicit `cwd` makes that check moot regardless of what `worktree` says. Reviewers and
-  planners are unaffected: a fresh spawn's `cwd` is still honored for them as a raw override,
-  unchanged.
+  fresh worker (now: worker-or-reviewer) spawn or block, same style and the same `#338` wording
+  as an explicit `worktree: false` — checked *before* the `worktree: false` check even runs,
+  since an explicit `cwd` makes that check moot regardless of what `worktree` says. A planner is
+  unaffected: a fresh spawn's `cwd` is still honored for it as a raw override, unchanged.
 - **A resume's omitted `cwd` (rev-13's finding).** `cwd` is documented as "required with
   resume_session", but nothing enforced that either — a resume with `resume_session` set and
   `cwd` omitted fell straight through into `spawn_agent_ex`'s per-role default (`cwd_override`
-  is `None`, and `worktree` itself defaults `false` for a resume), which for a worker is the
-  primary clone. Fixed by mirroring #254's own block inheritance, deliberately, rather than
-  inventing a second mechanism: a resume that omits `cwd` now inherits the session's recorded
-  workspace from this group's roster (the same last-touched-record lookup, `owner` in
-  `mcp.rs`, shared with the block-inheritance code so the two agree on which record is
-  authoritative instead of running independent lookups that could drift). If nothing is
-  recorded for that session and the effective role is worker, the spawn is rejected — same
-  style and the same `#338` guardrail wording again — rather than guessing a workspace or
-  falling back to the clone. Reviewers and planners are unaffected here too: an omitted `cwd`
-  with nothing recorded still falls through to their existing per-role default, unchanged.
+  is `None`, and `worktree` itself defaults `false` for a resume), which for a worker (or,
+  since #359, a reviewer) is the primary clone. Fixed by mirroring #254's own block inheritance,
+  deliberately, rather than inventing a second mechanism: a resume that omits `cwd` now inherits
+  the session's recorded workspace from this group's roster (the same last-touched-record
+  lookup, `owner` in `mcp.rs`, shared with the block-inheritance code so the two agree on which
+  record is authoritative instead of running independent lookups that could drift). If nothing
+  is recorded for that session and the effective role needs a dedicated workspace, the spawn is
+  rejected — same style and the same `#338` guardrail wording again — rather than guessing a
+  workspace or falling back to the clone. A planner is unaffected here too: an omitted `cwd`
+  with nothing recorded still falls through to its existing per-role default, unchanged.
 
-Between the three guards, `cwd` and `worktree` together can no longer land a worker in the
-primary clone on either a fresh spawn or a resume, however the two arguments are combined.
+Between the three guards, `cwd` and `worktree` together can no longer land a worker or reviewer
+in the primary clone on either a fresh spawn or a resume, however the two arguments are combined.
 
 **The orchestrator's own mechanical work** (a rebase, a conflict fix, cutting a revert branch)
 still sometimes needs a checkout outside a worker's own worktree — and now that a worker
@@ -270,6 +269,56 @@ still around, otherwise cut a `git worktree add <repo>-worktrees/orch-staging <b
 staging worktree (same `<repo>-worktrees/` layout `git_worktree_add` already uses for
 workers) and reuse that one directory across mechanical work by checking out a different
 branch inside it, rather than a fresh worktree per rebase.
+
+### Extending the worktree guarantee to reviewers (#359)
+
+#338 fixed the worker half of "the main clone is the human's environment" and deliberately left
+reviewers on it — a reviewer is read-only with respect to the repo's *content* (it never edits
+files or pushes), but it is not read-only with respect to the clone's *checkout state*: `gh pr
+diff`/`gh pr view` need no checkout, but a reviewer that wants to run tests locally has always
+been told "checking out the PR branch locally is fine" — in the shared main clone, the same one
+every other reviewer and the orchestrator's own `git fetch`/rebase traffic uses. That was a live
+incident, not a hypothetical: in one session, rev-36 (delta-reviewing a PR) checked branches out
+in the main clone and restored it to the default branch when done, while rev-38 (aggregate-
+reviewing a different PR) was mid-review in the *same* clone — rev-38 got switched off its
+branch mid-review and had to re-verify against `origin` refs from scratch to finish (issue #359).
+
+Three shapes were on the table (the issue named them): extend the worktree default to reviewers
+(symmetric with #338); checkout-free review guidance (`gh pr diff`/`git diff origin/A...origin/B`
+only — rev-38's own recovery path, and it works, but a reviewer that wants to run tests locally
+still needs a checkout *somewhere*); or a hybrid (checkout-free by default, worktree only when a
+review brief asks for local test runs). **The human picked the first, explicitly, in the issue's
+own comment: "Extend worktree requirement... orchestrator/workers should not touch the main
+checkout as this is the humans."** Simple and symmetric — a reviewer is now covered by the exact
+same mechanism as a worker (`needs_dedicated_workspace` in `mcp.rs` now matches
+`Role::Worker | Role::Reviewer`; every one of the three guards above — worktree default/reject,
+fresh-spawn cwd reject, resume cwd inherit-or-reject — applies to a reviewer identically), rather
+than adding a second, checkout-free code path that would need its own set of guards and its own
+drift risk against the worker one. It also matches the session's own evidence: reviewers in
+practice run tests locally far more often than not (every reviewer in the incident's session
+did), so a checkout-free default would have merely relocated the conflict to whenever a reviewer
+*did* need one.
+
+**A reviewer's worktree cannot simply check out the PR's own branch, though — that is the one
+piece #338's worker mechanism doesn't hand over for free.** `git_worktree_add` cuts a *new*
+branch off the default branch (`agent/<id>`-shaped, same as a worker's) — sensible scratch space,
+but the PR under review is a *different* branch, almost always already checked out somewhere
+else (the worker's own worktree, if it's still around). Git refuses to check out the same branch
+in two worktrees at once, so a reviewer that ran a bare `gh pr checkout <n>` — which checks out
+the PR branch *by name*, creating or moving a local branch to track it — would collide with
+whatever else already has it, reproducing a narrower version of the exact incident this fix
+exists to close. The fix is a **detached-HEAD checkout**, not a new mechanism: `gh pr checkout
+<n> --detach` fetches the PR's head commit and checks it out with no branch name attached, so it
+can never collide with anything, in any worktree, ever — multiple worktrees can even sit at the
+*same* detached commit simultaneously. This is documented, not code-enforced (there is no MCP
+tool wrapping `git`/`gh` checkout subcommands, so nothing can force which flavor a reviewer
+runs) — `reviewer.md`'s **Review protocol** step 1 states it as the convention, and the
+worktree's own kickoff note (`spawn_agent_ex` in `mod.rs`, role-aware for a reviewer) repeats it
+at spawn time so it survives even a fast first read. A reviewer's read-only-with-respect-to-push
+convention is unaffected either way: it was never CLI-level-enforced to begin with (only a
+planner's `is_read_only()` denies `git commit`/`git push` at the tool level) — it is, and
+remains, taught in `reviewer.md`, and a dedicated worktree changes nothing about that; it only
+gives the reviewer a workspace of its own to sit in while it does what it already does.
 
 ### Pane naming & rename precedence (#95r)
 

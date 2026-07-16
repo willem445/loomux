@@ -11453,9 +11453,28 @@ impl OrchRegistry {
             // Cut the branch from the default branch (or an explicit `base`),
             // never the primary checkout's incidental HEAD (#204).
             let wt = crate::git::git_worktree_add(group.repo.clone(), branch_name.clone(), base.clone())?;
-            (wt.clone(), format!(
-                "Your working directory is a dedicated git worktree at {wt} already checked out on branch '{branch_name}'."
-            ), Some(branch_name.clone()))
+            // #359: a reviewer's worktree is scratch space, not a checkout of
+            // the PR it's reviewing — that branch may already be checked out
+            // in the worker's own worktree, and git refuses the same branch
+            // in two worktrees at once. `gh pr checkout --detach` sidesteps
+            // that: a detached HEAD never collides with anything.
+            let note = if role == Role::Reviewer {
+                format!(
+                    "Your working directory is a dedicated git worktree at {wt}, cut fresh from \
+                     the default branch — its own branch '{branch_name}' is just scratch space, \
+                     never the PR's own branch (which may already be checked out in the worker's \
+                     worktree). You review; you do not create branches or push. To inspect the \
+                     PR's actual code locally (e.g. to run tests), `gh pr checkout <n> --detach` \
+                     — never a bare `gh pr checkout <n>`, which grabs the PR branch by NAME and \
+                     collides with any other worktree (the worker's, or another reviewer's) that \
+                     already has it checked out."
+                )
+            } else {
+                format!(
+                    "Your working directory is a dedicated git worktree at {wt} already checked out on branch '{branch_name}'."
+                )
+            };
+            (wt.clone(), note, Some(branch_name.clone()))
         } else if role == Role::Orchestrator {
             (group.repo.clone(), String::new(), None)
         } else if role == Role::Reviewer {

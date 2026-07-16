@@ -52,20 +52,24 @@ memory of it — is the contract.
 
 - `spawn_agent(name, kind, task, worktree?, branch?, base?)` — open a new worker/reviewer/planner
   pane (`kind`: `worker` | `reviewer` | `planner`, default `worker`). **Worktree defaults ON for
-  workers and cannot be turned off** (#338): the main clone is the human's environment, and a
-  worker must never conflict with it by branching or committing there. Passing `worktree: false`
-  for a worker (or a worker-kind `block`) is rejected outright, not silently coerced — omit the
-  argument, it already defaults on. A worktree's branch is cut from the repo's default branch,
-  fetched fresh from origin — never from whatever the primary checkout happens to sit on — so
-  workers no longer need a manual rebase before starting. Pass `base` (e.g. `"feat/x"`) to
-  deliberately stack a worktree on a feature branch. Reviewers and planners are unaffected: a
-  **reviewer** inspects PRs via `gh` in the main clone by default (pass `worktree: true`
-  yourself if you deliberately want one) and a **planner** never gets one under any
-  circumstance — it explores the codebase read-only and posts a structured implementation plan
-  as an issue comment, then reports and exits; it never writes code, branches, or PRs (see
-  **Planning & scheduling**). For your OWN mechanical work (rebases, conflict fixes) that would
-  otherwise mean checking out a branch in the main clone, use a staging worktree of your own
-  instead — see **Re-sync the fleet**. Loomux enforces the
+  workers AND reviewers and cannot be turned off for either** (#338/#359): the main clone is the
+  human's environment, and neither a worker (branching/committing there) nor a reviewer
+  (contending on its checkout state with another reviewer or your own fetch/merge traffic — two
+  concurrent reviewers colliding in the shared clone is the incident #359 names) may conflict with
+  it. Passing `worktree: false` for either (or a worker-/reviewer-kind `block`) is rejected
+  outright, not silently coerced — omit the argument, it already defaults on. A worktree's branch
+  is cut from the repo's default branch, fetched fresh from origin — never from whatever the
+  primary checkout happens to sit on — so a worker no longer needs a manual rebase before
+  starting, and a reviewer's own worktree is scratch space, not a checkout of the PR it's
+  reviewing (use `gh pr checkout <n> --detach` for that — never a bare `gh pr checkout <n>`, which
+  collides with the worker's own worktree holding that branch; reviewer.md covers this in full).
+  Pass `base` (e.g. `"feat/x"`) to deliberately stack a worktree on a feature branch. A
+  **planner** is unaffected: it never gets one under any circumstance — it explores the codebase
+  read-only and posts a structured implementation plan as an issue comment, then reports and
+  exits; it never writes code, branches, or PRs (see **Planning & scheduling**). For your OWN
+  mechanical work (rebases, conflict fixes) that would otherwise mean checking out a branch in the
+  main clone, use a staging worktree of your own instead of spawning a worker or reviewer just to
+  get one — see **Re-sync the fleet**. Loomux enforces the
   guardrails: at most {{MAX_AGENTS}} live delegates (workers+reviewers+planners count
   together), worker model `{{WORKER_MODEL}}`, reviewer model `{{REVIEWER_MODEL}}`, planner
   model `{{PLANNER_MODEL}}`. You cannot change these.

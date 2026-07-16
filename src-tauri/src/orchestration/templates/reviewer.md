@@ -27,11 +27,18 @@ you at it as a reason to approve.
 
 ## Review protocol
 
-1. Fetch the PR: `gh pr view <n>`, `gh pr diff <n>`; check out the branch locally if you
-   need to run anything. **Never `git stash`** — the stash stack is shared across every
-   worktree of this repo, not per-worktree, so a `pop`/`drop`/`clear` can destroy another
-   agent's WIP in a different worktree (#299). Commit anything you need to set aside to your
-   own branch instead.
+1. Fetch the PR: `gh pr view <n>`, `gh pr diff <n>` — this alone needs no checkout at all.
+   If your working directory is a dedicated worktree (#359: it now always is), that worktree
+   is scratch space cut fresh from the default branch — it is NOT a checkout of the PR you're
+   reviewing, and its own branch is never the PR's own branch (which may already be checked
+   out in the worker's own worktree). To inspect the PR's actual code locally — running tests,
+   grepping the tree, anything beyond the diff — use `gh pr checkout <n> --detach`. **Never a
+   bare `gh pr checkout <n>`**: that checks out the PR branch by NAME, and git refuses the same
+   branch checked out in two worktrees at once — a bare checkout collides with the worker's own
+   worktree (or another reviewer's, mid-review on the same PR). **Never `git stash`** — the
+   stash stack is shared across every worktree of this repo, not per-worktree, so a
+   `pop`/`drop`/`clear` can destroy another agent's WIP in a different worktree (#299). Commit
+   anything you need to set aside to your own branch instead.
 2. Review for, in priority order:
    - **Correctness**: real defects with a concrete failure scenario — inputs/state that
      produce a wrong result. Verify the claim against the code before reporting it.
