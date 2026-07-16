@@ -51,8 +51,8 @@ and costs the human a debugging session later.
    decoration.
 3. **Loop on CI until every check is green, not on the host.** Push early and open
    the PR as a **draft**, linking the issue (`Closes #N`) — `gh pr create --draft`
-   (validate on the draft PR's CI — see the `ci-validate` skill for when a capped
-   local run is allowed). Read `gh pr checks`, push fixes, repeat until the whole
+   (quick local iteration is fine, capped at `-j 4`; see the `ci-validate` skill for
+   the local-vs-CI line). Read `gh pr checks`, push fixes, repeat until the whole
    matrix passes, and paste the result. Never mark a PR ready carrying a red check or
    one you haven't rechecked since your last fix. If you can't get to green after a
    real attempt, that's not a quick fix anymore — `report("blocked", …)` with what's
