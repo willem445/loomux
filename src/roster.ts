@@ -51,6 +51,12 @@ export interface RosterBlock {
   cli: string;
   model: string;
   persona: BlockPersona;
+  /** OPTIONAL, INERT persona/template marker (#250/#324) — `"advisor"` |
+   *  `"process"` | absent. Backend-resolved, so it is never a value the
+   *  backend's own `role_hint_requires` wouldn't accept: capability still
+   *  keys off `kind` alone, this only ever drives {@link describeBlock}'s
+   *  cosmetic chip. */
+  role_hint?: string | null;
 }
 
 /** The backend's read of `<repo>/.loomux/workflow.yml` (`orch_workflow_preview`).
@@ -262,10 +268,22 @@ export function describeRoster(blocks: readonly RosterBlock[]): string {
   return parts.length ? parts.join(", ") : "no delegates";
 }
 
+/** Uppercase badge text for a resolved block's `role_hint` (#250/#324) —
+ *  cosmetic only, the launcher-preview mirror of the backend's
+ *  `role_hint_requires`. Never widens the roster row's meaning: a block with
+ *  `role_hint: "advisor"` is a planner first, badged ADVISOR second. Anything
+ *  the backend wouldn't itself resolve renders no chip at all, rather than
+ *  guessing at a label for a value that could never legitimately reach here. */
+function roleHintChip(hint: string | null | undefined): string | null {
+  return hint === "advisor" || hint === "process" ? hint.toUpperCase() : null;
+}
+
 /** The one-line description of a block for the roster table: what it is and what
  *  it will run. A persona is called out because it is the part the human is
  *  really being asked to consent to — repo-authored text that becomes an agent's
- *  instructions. */
+ *  instructions. The role_hint chip (if any) is the OTHER thing worth a glance:
+ *  which block is the advisor/process one, at the moment the human consents to
+ *  it existing at all. */
 export function describeBlock(b: RosterBlock): string {
   const persona =
     b.persona === "profile"
@@ -273,7 +291,8 @@ export function describeBlock(b: RosterBlock): string {
       : b.persona === "prompt"
         ? " · repo persona"
         : "";
-  return `${b.kind} · ${b.cli} · ${b.model || "default model"}${persona}`;
+  const chip = roleHintChip(b.role_hint);
+  return `${b.kind} · ${b.cli} · ${b.model || "default model"}${persona}${chip ? ` · ${chip}` : ""}`;
 }
 
 /** Whether the roster is worth showing the human before they launch. The built-in

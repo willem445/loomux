@@ -54,6 +54,25 @@ export function isWorkflowCli(v: string): v is WorkflowCli {
   return (WORKFLOW_CLIS as readonly string[]).includes(v);
 }
 
+/** The two role hints a block may declare (#250/#324) — an OPTIONAL, INERT
+ *  persona/template/badge marker, never a capability: `kind` alone still decides
+ *  deny-flags, cwd rule and MCP tool scope. Mirrors the backend's
+ *  `role_hint_requires` (workflow.rs) so this pane's pre-run pass agrees with what
+ *  the real parser would say. Each hint REQUIRES a specific `kind` — `advisor`
+ *  needs `planner`, `process` needs `worker` — so a workflow can't spell a
+ *  combination nothing downstream would honor. */
+export const ROLE_HINTS = ["advisor", "process"] as const;
+export type RoleHint = (typeof ROLE_HINTS)[number];
+
+/** The capability class a role_hint REQUIRES, or `undefined` for an unrecognized
+ *  value — the caller turns that into a `role-hint-unknown` finding, the same
+ *  "reject, never coerce" shape `isBlockKind` uses for `kind`. */
+export function roleHintRequires(hint: string): BlockKind | undefined {
+  if (hint === "advisor") return "planner";
+  if (hint === "process") return "worker";
+  return undefined;
+}
+
 /** The schema version this build reads and writes. */
 export const WORKFLOW_VERSION = 1;
 
@@ -105,6 +124,11 @@ export interface WorkflowBlock {
   /** Persona file — compiled to `copilot --agent <name>` against `.github/agents/`.
    *  Mutually exclusive with `prompt` (a block with both is a finding). */
   profile?: string;
+  /** OPTIONAL, INERT persona/template marker (#250/#324) — one of {@link ROLE_HINTS},
+   *  or anything else (a finding + a stub, same as an unrecognized `kind`). Requires
+   *  its matching `kind` (see {@link roleHintRequires}); absent is today's behavior,
+   *  byte for byte. */
+  role_hint?: string;
   /** Keys this build doesn't know, preserved verbatim across a round-trip. */
   extra?: Record<string, YamlValue>;
 }
@@ -161,6 +185,8 @@ export type FindingCode =
   | "unknown-kind"
   | "unknown-cli"
   | "prompt-and-profile"
+  | "role-hint-unknown"
+  | "role-hint-wrong-kind"
   | "edge-not-a-mapping"
   | "edge-unknown-block"
   | "edge-self"
@@ -740,6 +766,7 @@ function emitBlockLines(b: WorkflowBlock, markerIndent = 2): string[] {
   out.push(`${dash}- id: ${emitScalar(b.id)}`);
   out.push(`${field}name: ${emitScalar(b.name)}`);
   out.push(`${field}kind: ${emitScalar(b.kind)}`);
+  if (b.role_hint !== undefined) out.push(`${field}role_hint: ${emitScalar(b.role_hint)}`);
   out.push(`${field}cli: ${emitScalar(b.cli)}`);
   if (b.model) out.push(`${field}model: ${emitScalar(b.model)}`);
   if (b.profile !== undefined) out.push(`${field}profile: ${emitScalar(b.profile)}`);
@@ -1260,7 +1287,7 @@ const asString = (v: YamlValue): string | null =>
   typeof v === "string" ? v : typeof v === "number" || typeof v === "boolean" ? String(v) : null;
 
 const KNOWN_TOP = new Set(["version", "name", "blocks", "edges", "gates"]);
-const KNOWN_BLOCK = new Set(["id", "name", "kind", "cli", "model", "prompt", "profile"]);
+const KNOWN_BLOCK = new Set(["id", "name", "kind", "cli", "model", "prompt", "profile", "role_hint"]);
 const KNOWN_GATE = new Set(["merge"]);
 
 function collectExtra(
@@ -1390,6 +1417,7 @@ function readBlock(raw: YamlValue, index: number, findings: Finding[]): Workflow
   };
   if (r.prompt !== undefined) block.prompt = asString(r.prompt) ?? "";
   if (r.profile !== undefined) block.profile = asString(r.profile) ?? "";
+  if (r.role_hint !== undefined) block.role_hint = asString(r.role_hint) ?? "";
   return block;
 }
 
@@ -1523,6 +1551,24 @@ export function validateWorkflow(w: Workflow): Finding[] {
         message: `Block "${where}" declares both a prompt and a profile — pick one. (An inline prompt compiles to the CLI's native inline agent; a profile points at a file the CLI loads by name.)`,
         blockId: b.id,
       });
+    }
+    if (b.role_hint !== undefined) {
+      const required = roleHintRequires(b.role_hint);
+      if (!required) {
+        findings.push({
+          severity: "error",
+          code: "role-hint-unknown",
+          message: `Block "${where}" has role_hint "${b.role_hint}", which is not one of ${ROLE_HINTS.join(", ")}.`,
+          blockId: b.id,
+        });
+      } else if (required !== b.kind) {
+        findings.push({
+          severity: "error",
+          code: "role-hint-wrong-kind",
+          message: `Block "${where}" has role_hint "${b.role_hint}", which requires kind: ${required} (this block is kind: "${b.kind}").`,
+          blockId: b.id,
+        });
+      }
     }
   }
 
