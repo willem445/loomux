@@ -687,6 +687,20 @@ are stated, without drifting from what was actually agreed:
   `permissions/sets/plugin-broker.toml`). The `metrics.system` capability is
   gated but its data handler is a stub pending Slice E's `sys_processes`-shaped
   backend — the check is real, the numbers aren't yet.
+
+  **`plugin_open_window` must stay an `async fn`.** A live bug found on
+  #380's merge gate: as a synchronous command it hit the documented Tauri/wry
+  Windows deadlock (`WebviewWindowBuilder::new`'s own rustdoc, wry#583) — a
+  sync command runs inline on the same WebView2 UI thread that dispatched the
+  IPC call, and `.build()` then can't get that same thread to service the
+  window-creation round trip it needs, so the whole app hangs (blank plugin
+  window, frozen main window, nothing closable). `async fn` moves the command
+  body onto the async-runtime threadpool instead, leaving the UI thread free
+  to answer. This isn't testable against `tauri::test::MockRuntime` (its
+  `WebviewWindow`/`AppHandle` only implement `CommandArg` for the real `Wry`
+  runtime — confirmed by trying) or without a live Windows GUI, so it has no
+  automated regression test; don't revert this to a plain `fn` without
+  re-reading wry#583 first.
 - **Slice D** (the `"plugin"` kind — **done**) adds exactly one member to
   each closed union this note describes as inheriting the content-pane
   mechanism (`PaneKind`/`isContentKind` in `panesetup.ts`, `PersistedPaneKind`/
