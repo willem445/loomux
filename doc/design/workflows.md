@@ -469,6 +469,53 @@ group-exists would make editing your workflow file appear to do nothing, forever
 a worse bug than the one being fixed. `relaunching_after_editing_the_workflow_picks_up_the_new_file`
 pins that half.
 
+### Going live: the toggle mid-session (#316)
+
+Everything above was launch-time-only: flipping the toggle meant ending the
+group and relaunching, which throws away the orchestrator's context along with
+its pane. #316 makes the toggle a **live** control — a groupview button, not
+just a launcher checkbox — and the case for it is the same consent story as
+the toggle itself: a human who is *already looking at the roster* (the
+groupview chrome the toggle now shows, per **Surfacing the workflow**, below)
+can consent to a change the same way the launcher preview does, without
+needing to tear the group down first.
+
+The live setter is not a new mechanism — it is modeled on the two setters that
+already do exactly this shape: `set_max_agents` (validate → persist-first via
+an in-place `group.json` patch → update the in-memory guardrail → audit →
+deliver a `[loomux] …` notice) and `set_autonomous` (same shape, also
+notice-delivering). Turning the toggle **on** re-runs the identical
+`load_workflow` → `sync_merge_gate` → `Guardrails::clamped()` sequence a fresh
+launch already runs — not a second loader — and swaps `guardrails.blocks` for
+*future* spawns only. Turning it **off** clears `merge_gate` and rebuilds the
+built-in four-block roster from the group's default CLI and per-role model
+picks (`workflow::default_roster`), which is also not new work: it's the same
+converter the launcher already uses.
+
+**Why a live delegate's persona never changes underneath it.** *A resumed
+group runs the roster it was launched with*, above, forbids retroactively
+re-personaing a running session because a resume is not a consent moment.
+Flipping the toggle live **is** one — the human clicks it while seeing the
+roster — but that only licenses a decision about the *future*: new spawns use
+the new roster; an agent already spawned keeps the block identity — and
+persona — it was spawned under. Swapping a live delegate's identity out from
+under a conversation it's mid-turn on is a different, larger claim (the human
+consented to a roster change, not to becoming a different agent mid-task) and
+is deliberately out of scope here.
+
+**The notice.** Both directions call the existing `deliver_to_orchestrator`
+path — the same one `set_max_agents`/`set_autonomous` already use, not a new
+delivery mechanism — with a `[loomux] workflow mode changed: …` line naming
+the new state (workflow name and the armed gate, or "built-in roster, no merge
+gate") so the orchestrator can revise its spawn/review strategy mid-session
+instead of discovering the change on a bounced merge.
+
+> **TODO (aggregate assembly):** the exact notice string, the refusal-message
+> wording below, and the satisfiability audit key are Slice A's to finalize
+> (`src-tauri/src/orchestration/mod.rs`, `workflow.rs`). This note describes the
+> behavior the plan commits to; reconcile the quoted strings against Slice A's
+> landed implementation before this lands on `main`.
+
 ### Three secondary outcomes
 
 Each chosen so the launcher never has to invent a failure the engine doesn't have:
@@ -906,6 +953,82 @@ one because the file that declares it stopped parsing would quietly *widen* what
 the group's agents may do, and a syntax error is not consent to merge unreviewed
 code.
 
+### The gate is a property of the session, not the PR (#316)
+
+The rule above ("a gate lives and dies with the toggle that authorized it") was
+written against a launch-time-only toggle. #316 makes the toggle live, which
+raises a question the launch-time version never had to answer: what governs a
+PR whose gate was armed under one toggle state, if the toggle moves before that
+PR merges?
+
+**Position taken: the gate is a property of the CURRENT SESSION, not the PR's
+provenance.** Toggle off mid-session ⇒ the gate is off for every merge that
+session attempts from then on, including a PR opened earlier while the
+workflow was active. Toggle on ⇒ the gate is on, for every PR, regardless of
+which toggle state it was opened under. This is not a new rule invented for
+#316 — it is the *same* rule this section already states ("a gate lives and
+dies with the toggle"), just confirmed to hold when the toggle moves live
+instead of only at launch/resume.
+
+The alternative — a gate that travels with the PR's provenance, so a PR opened
+under a gated workflow stays gated even after the human turns the workflow off
+— is the one that produces the surprise this feature exists to remove: "I don't
+want to be surprised when I go to merge an item created in a custom workflow
+and get rejected when I'm in a normal workflow." A provenance-carried gate is
+exactly that surprise. A session-scoped gate, paired with the roster/gate
+chrome always visible in the lifecycle UI (see the README's *Workflow
+visibility* section), means the human always knows which rule is live before
+they click Approve — session-scoped is simpler *and* is the unsurprising
+answer.
+
+One thing this does **not** change: a human "Approve" grant still never opens
+the workflow gate on its own (#197/#222 — a grant is the *human* merge gate,
+not the reviewer-consensus gate). A grant plus the workflow toggled off is what
+lets the merge through; a grant against a still-armed gate still refuses.
+
+**The refusal names three exits.** When a workflow-gated merge is refused,
+telling the human only "blocked" repeats tonight's failure — the refusal has to
+say what to do next, everywhere it can appear (the shim's refusal message, the
+task board's Approve control, the groupview workflow row):
+
+1. run the named reviewer blocks so the missing verdicts exist;
+2. toggle the workflow off (session-scoped, so it takes effect immediately);
+3. merge through the GitHub UI directly — the shim only gates `gh`/local `git`
+   push-to-merge paths, not GitHub's own merge button.
+
+> **TODO (aggregate assembly):** the literal refusal text (shim message +
+> board tooltip copy) is Slice A/C's to write. This section states the
+> requirement — three exits, always named — for the doc; reconcile against the
+> shipped strings before merging to `main`.
+
+### loomux never silently arms a gate the roster can't satisfy (#316)
+
+Tonight's incident (see the plan comment on #316) was not a gate bug — it was
+a **roster** bug wearing a gate's clothes. A group relaunched with the toggle
+on, but with a broken or absent `.loomux/workflow.yml`: the *retained-gate*
+rule above (correctly) kept the last-known gate naming `rev-orch`/`rev-ui`/
+`rev-tests`, but the roster fell back to the built-in four blocks
+(orchestrator/worker/reviewer/planner) — none of which can satisfy
+`spawn_agent(block: "rev-orch")`. The gate was armed for reviewers the running
+session structurally cannot spawn: unsatisfiable by construction, not by bad
+luck, and nothing said so until a merge bounced hours into the session.
+
+**The fix is a pure satisfiability check at every point a gate is armed** —
+toggle-on, launch, and resume alike — not only a load-time nicety: does every
+`reviewers:` name in the gate resolve to a block in the *current* roster with
+`kind: reviewer`? If not, loomux does **not** silently widen its own promise by
+dropping the gate (that would repeat the exact fail-open the retained-gate rule
+exists to prevent) — it arms the gate anyway, marks it `satisfiable: false`,
+and surfaces the mismatch loudly: an audit line naming the missing blocks, and
+a chip in the lifecycle UI a human sees *before* the first merge attempt,
+not after. Silence is what turned tonight's bug into an hours-long
+half-workflow state; a loud, wrong-looking gate is recoverable in one glance.
+
+> **TODO (aggregate assembly):** the pure check's name (the plan sketches
+> `workflow::gate_missing_blocks(gate, blocks) -> Vec<BlockId>`) and the exact
+> audit key are Slice A's. Reconcile this section's wording against what
+> actually lands before assembling the aggregate PR.
+
 ### Where the reviewer learns about it
 
 Nowhere in the base templates — and that is deliberate. A group with no workflow has
@@ -981,6 +1104,28 @@ Three things about it are decisions rather than filler:
   ("any 2 of these 5 senior people"), and a lane-scoped roster is the opposite of
   interchangeable. Its other use — tolerating a dead reviewer — is a job for the human,
   not for the gate.
+
+### A nudge toward cross-model review (#267 stage 1)
+
+All three of loomux's own reviewers run `cli: claude` today — the lane split buys
+overlapping-vs-*unique* findings across security/frontend/test-quality concerns, but
+every lane is still read by the same underlying model family. A cross-tool review of
+prompt-layer orchestrators (gstack, see the README's *Why loomux over…* comparison)
+makes the case that a **second model** catches a different class of defect than the
+one that wrote the code, independent of which lane it's reviewing — the workflow
+schema can already express "reviewer block on a different CLI/model than the worker"
+(`cli:`/`model:` are per-block, not per-workflow), it's just that nothing recommended
+doing so. `.loomux/workflow.yml` now carries a comment above its `blocks:` reviewers
+suggesting exactly that.
+
+Deliberately **not done here**: flipping one of loomux's own reviewers to
+`cli: copilot` in this file. That would change what the human's own live dogfood
+session actually runs — it needs Copilot installed, and it changes this repo's
+gate behavior for everyone, not just the reader of a doc. That's a one-line human
+call (edit one `cli:` field in `.loomux/workflow.yml`), not something a docs PR
+should assume on their behalf. Widening `SUPPORTED_CLIS` beyond claude/copilot
+(gemini/codex adapters, for genuine reviewer diversity beyond the two CLIs loomux
+already drives) is tracked separately as #267 stage 2.
 
 The persona files deliberately carry **no `model:`**. Copilot would read one (it is its
 key), loomux would not (the block's `model:` is its single source of truth), and two
