@@ -214,3 +214,18 @@ confirms no `getrandom` crate enters the dependency graph as a result of this
 change; the ACL command codegen runs on the build host, not in the shipped
 binary, and produces no random-id generation (permission identifiers derive
 from command names).
+
+## Update (#360 Slice C): 120 → 123 commands
+
+The command count this note and `tests/acl_manifest.rs` cite grew from 120 to
+123 when Slice C (the pane-plugins trust core, `doc/design/pane-plugins.md`)
+added its own three commands — `plugin_open_window`, `plugin_broker_request`,
+`plugin_broker_open_channel`. `main` is granted all three (the "registered
+means main may call it" rule above applies unchanged); the latter two are
+also — and *only* — granted to a new `capabilities/plugin.json`
+(`windows: ["plugin-*"]`) via a new `permissions/sets/plugin-broker.toml` set,
+the first real (non-template) consumer of the zero-permission pattern this
+note's "zero-permission template" section anticipated. `plugin_open_window`
+is main-only (folded into the `misc` set) — a plugin window must never be
+able to open another plugin window itself. See `pane-plugins.md`'s Isolation
+section for the full trust-core design this made possible.
