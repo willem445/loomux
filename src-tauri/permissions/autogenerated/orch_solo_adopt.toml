@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-orch-solo-adopt"
+description = "Enables the orch_solo_adopt command without any pre-configured scope."
+commands.allow = ["orch_solo_adopt"]
+
+[[permission]]
+identifier = "deny-orch-solo-adopt"
+description = "Denies the orch_solo_adopt command without any pre-configured scope."
+commands.deny = ["orch_solo_adopt"]

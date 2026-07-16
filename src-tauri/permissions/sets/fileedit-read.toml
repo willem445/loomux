@@ -1,0 +1,10 @@
+[[set]]
+identifier = "fileedit-read"
+description = "Read-only file-editor queries: read file, list dir, search/list-files jobs."
+permissions = [
+    "allow-ft-read-file",
+    "allow-ft-list-dir",
+    "allow-ft-search-start",
+    "allow-ft-search-cancel",
+    "allow-ft-files-start",
+]

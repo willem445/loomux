@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-gh-issue-create"
+description = "Enables the gh_issue_create command without any pre-configured scope."
+commands.allow = ["gh_issue_create"]
+
+[[permission]]
+identifier = "deny-gh-issue-create"
+description = "Denies the gh_issue_create command without any pre-configured scope."
+commands.deny = ["gh_issue_create"]

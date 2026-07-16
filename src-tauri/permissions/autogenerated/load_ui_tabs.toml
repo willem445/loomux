@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-load-ui-tabs"
+description = "Enables the load_ui_tabs command without any pre-configured scope."
+commands.allow = ["load_ui_tabs"]
+
+[[permission]]
+identifier = "deny-load-ui-tabs"
+description = "Denies the load_ui_tabs command without any pre-configured scope."
+commands.deny = ["load_ui_tabs"]

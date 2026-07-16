@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-probe-agent-cli"
+description = "Enables the probe_agent_cli command without any pre-configured scope."
+commands.allow = ["probe_agent_cli"]
+
+[[permission]]
+identifier = "deny-probe-agent-cli"
+description = "Denies the probe_agent_cli command without any pre-configured scope."
+commands.deny = ["probe_agent_cli"]

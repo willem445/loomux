@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-bind-agent"
+description = "Enables the bind_agent command without any pre-configured scope."
+commands.allow = ["bind_agent"]
+
+[[permission]]
+identifier = "deny-bind-agent"
+description = "Denies the bind_agent command without any pre-configured scope."
+commands.deny = ["bind_agent"]

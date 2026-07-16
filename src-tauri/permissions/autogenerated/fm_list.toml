@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-fm-list"
+description = "Enables the fm_list command without any pre-configured scope."
+commands.allow = ["fm_list"]
+
+[[permission]]
+identifier = "deny-fm-list"
+description = "Denies the fm_list command without any pre-configured scope."
+commands.deny = ["fm_list"]

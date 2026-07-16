@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-save-ui-tabs"
+description = "Enables the save_ui_tabs command without any pre-configured scope."
+commands.allow = ["save_ui_tabs"]
+
+[[permission]]
+identifier = "deny-save-ui-tabs"
+description = "Denies the save_ui_tabs command without any pre-configured scope."
+commands.deny = ["save_ui_tabs"]

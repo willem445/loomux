@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-orch-grant-release"
+description = "Enables the orch_grant_release command without any pre-configured scope."
+commands.allow = ["orch_grant_release"]
+
+[[permission]]
+identifier = "deny-orch-grant-release"
+description = "Denies the orch_grant_release command without any pre-configured scope."
+commands.deny = ["orch_grant_release"]

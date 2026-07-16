@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-orch-agent-renamed"
+description = "Enables the orch_agent_renamed command without any pre-configured scope."
+commands.allow = ["orch_agent_renamed"]
+
+[[permission]]
+identifier = "deny-orch-agent-renamed"
+description = "Denies the orch_agent_renamed command without any pre-configured scope."
+commands.deny = ["orch_agent_renamed"]

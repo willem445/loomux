@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-git-merge"
+description = "Enables the git_merge command without any pre-configured scope."
+commands.allow = ["git_merge"]
+
+[[permission]]
+identifier = "deny-git-merge"
+description = "Denies the git_merge command without any pre-configured scope."
+commands.deny = ["git_merge"]

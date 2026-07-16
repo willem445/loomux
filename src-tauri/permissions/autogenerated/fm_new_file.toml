@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-fm-new-file"
+description = "Enables the fm_new_file command without any pre-configured scope."
+commands.allow = ["fm_new_file"]
+
+[[permission]]
+identifier = "deny-fm-new-file"
+description = "Denies the fm_new_file command without any pre-configured scope."
+commands.deny = ["fm_new_file"]

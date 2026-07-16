@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-orch-request-changes"
+description = "Enables the orch_request_changes command without any pre-configured scope."
+commands.allow = ["orch_request_changes"]
+
+[[permission]]
+identifier = "deny-orch-request-changes"
+description = "Denies the orch_request_changes command without any pre-configured scope."
+commands.deny = ["orch_request_changes"]

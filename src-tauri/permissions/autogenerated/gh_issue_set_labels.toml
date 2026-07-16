@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-gh-issue-set-labels"
+description = "Enables the gh_issue_set_labels command without any pre-configured scope."
+commands.allow = ["gh_issue_set_labels"]
+
+[[permission]]
+identifier = "deny-gh-issue-set-labels"
+description = "Denies the gh_issue_set_labels command without any pre-configured scope."
+commands.deny = ["gh_issue_set_labels"]

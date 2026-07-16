@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-git-worktree-add"
+description = "Enables the git_worktree_add command without any pre-configured scope."
+commands.allow = ["git_worktree_add"]
+
+[[permission]]
+identifier = "deny-git-worktree-add"
+description = "Denies the git_worktree_add command without any pre-configured scope."
+commands.deny = ["git_worktree_add"]

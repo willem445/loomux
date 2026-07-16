@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-fm-capabilities"
+description = "Enables the fm_capabilities command without any pre-configured scope."
+commands.allow = ["fm_capabilities"]
+
+[[permission]]
+identifier = "deny-fm-capabilities"
+description = "Denies the fm_capabilities command without any pre-configured scope."
+commands.deny = ["fm_capabilities"]

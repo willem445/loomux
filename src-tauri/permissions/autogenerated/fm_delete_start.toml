@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-fm-delete-start"
+description = "Enables the fm_delete_start command without any pre-configured scope."
+commands.allow = ["fm_delete_start"]
+
+[[permission]]
+identifier = "deny-fm-delete-start"
+description = "Denies the fm_delete_start command without any pre-configured scope."
+commands.deny = ["fm_delete_start"]

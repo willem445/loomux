@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-git-worktree-list"
+description = "Enables the git_worktree_list command without any pre-configured scope."
+commands.allow = ["git_worktree_list"]
+
+[[permission]]
+identifier = "deny-git-worktree-list"
+description = "Denies the git_worktree_list command without any pre-configured scope."
+commands.deny = ["git_worktree_list"]

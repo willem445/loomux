@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-orch-channel-list"
+description = "Enables the orch_channel_list command without any pre-configured scope."
+commands.allow = ["orch_channel_list"]
+
+[[permission]]
+identifier = "deny-orch-channel-list"
+description = "Denies the orch_channel_list command without any pre-configured scope."
+commands.deny = ["orch_channel_list"]

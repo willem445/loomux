@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-gh-issue-comment"
+description = "Enables the gh_issue_comment command without any pre-configured scope."
+commands.allow = ["gh_issue_comment"]
+
+[[permission]]
+identifier = "deny-gh-issue-comment"
+description = "Denies the gh_issue_comment command without any pre-configured scope."
+commands.deny = ["gh_issue_comment"]

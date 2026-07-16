@@ -1,0 +1,11 @@
+[[set]]
+identifier = "git-read"
+description = "Read-only git queries: repo root, log, status, diff, branches, worktree list."
+permissions = [
+    "allow-git-repo-root",
+    "allow-git-log",
+    "allow-git-status",
+    "allow-git-diff",
+    "allow-git-branches",
+    "allow-git-worktree-list",
+]

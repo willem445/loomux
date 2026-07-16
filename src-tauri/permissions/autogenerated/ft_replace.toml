@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-ft-replace"
+description = "Enables the ft_replace command without any pre-configured scope."
+commands.allow = ["ft_replace"]
+
+[[permission]]
+identifier = "deny-ft-replace"
+description = "Denies the ft_replace command without any pre-configured scope."
+commands.deny = ["ft_replace"]

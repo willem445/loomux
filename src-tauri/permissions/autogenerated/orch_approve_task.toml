@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-orch-approve-task"
+description = "Enables the orch_approve_task command without any pre-configured scope."
+commands.allow = ["orch_approve_task"]
+
+[[permission]]
+identifier = "deny-orch-approve-task"
+description = "Denies the orch_approve_task command without any pre-configured scope."
+commands.deny = ["orch_approve_task"]

@@ -1,0 +1,10 @@
+[[set]]
+identifier = "gh-read"
+description = "Read-only GitHub CLI queries: auth status, issue/PR list and view."
+permissions = [
+    "allow-gh-auth-status",
+    "allow-gh-issue-list",
+    "allow-gh-issue-view",
+    "allow-gh-pr-list",
+    "allow-gh-pr-view",
+]

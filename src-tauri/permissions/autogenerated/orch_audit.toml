@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-orch-audit"
+description = "Enables the orch_audit command without any pre-configured scope."
+commands.allow = ["orch_audit"]
+
+[[permission]]
+identifier = "deny-orch-audit"
+description = "Denies the orch_audit command without any pre-configured scope."
+commands.deny = ["orch_audit"]

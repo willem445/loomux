@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-orch-channel-for-pane"
+description = "Enables the orch_channel_for_pane command without any pre-configured scope."
+commands.allow = ["orch_channel_for_pane"]
+
+[[permission]]
+identifier = "deny-orch-channel-for-pane"
+description = "Denies the orch_channel_for_pane command without any pre-configured scope."
+commands.deny = ["orch_channel_for_pane"]

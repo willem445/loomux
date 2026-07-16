@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-take-startup-notice"
+description = "Enables the take_startup_notice command without any pre-configured scope."
+commands.allow = ["take_startup_notice"]
+
+[[permission]]
+identifier = "deny-take-startup-notice"
+description = "Denies the take_startup_notice command without any pre-configured scope."
+commands.deny = ["take_startup_notice"]

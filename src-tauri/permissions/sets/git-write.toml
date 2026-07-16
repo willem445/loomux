@@ -1,0 +1,21 @@
+[[set]]
+identifier = "git-write"
+description = "Mutating git operations: commit, stage, checkout, discard, fetch, push, pull, merge, rebase, tag, branch/worktree creation, cherry-pick, revert."
+permissions = [
+    "allow-git-commit-files",
+    "allow-git-stage",
+    "allow-git-unstage",
+    "allow-git-commit",
+    "allow-git-checkout",
+    "allow-git-discard",
+    "allow-git-worktree-add",
+    "allow-git-fetch",
+    "allow-git-push",
+    "allow-git-pull",
+    "allow-git-tag",
+    "allow-git-branch-create",
+    "allow-git-cherry-pick",
+    "allow-git-revert",
+    "allow-git-merge",
+    "allow-git-rebase",
+]

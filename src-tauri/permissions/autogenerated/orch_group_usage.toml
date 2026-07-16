@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-orch-group-usage"
+description = "Enables the orch_group_usage command without any pre-configured scope."
+commands.allow = ["orch_group_usage"]
+
+[[permission]]
+identifier = "deny-orch-group-usage"
+description = "Denies the orch_group_usage command without any pre-configured scope."
+commands.deny = ["orch_group_usage"]

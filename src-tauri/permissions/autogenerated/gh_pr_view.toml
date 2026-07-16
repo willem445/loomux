@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-gh-pr-view"
+description = "Enables the gh_pr_view command without any pre-configured scope."
+commands.allow = ["gh_pr_view"]
+
+[[permission]]
+identifier = "deny-gh-pr-view"
+description = "Denies the gh_pr_view command without any pre-configured scope."
+commands.deny = ["gh_pr_view"]

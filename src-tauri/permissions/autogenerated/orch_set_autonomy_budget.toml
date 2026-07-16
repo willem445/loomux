@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-orch-set-autonomy-budget"
+description = "Enables the orch_set_autonomy_budget command without any pre-configured scope."
+commands.allow = ["orch_set_autonomy_budget"]
+
+[[permission]]
+identifier = "deny-orch-set-autonomy-budget"
+description = "Denies the orch_set_autonomy_budget command without any pre-configured scope."
+commands.deny = ["orch_set_autonomy_budget"]

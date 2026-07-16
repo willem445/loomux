@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-orch-upsert-task"
+description = "Enables the orch_upsert_task command without any pre-configured scope."
+commands.allow = ["orch_upsert_task"]
+
+[[permission]]
+identifier = "deny-orch-upsert-task"
+description = "Denies the orch_upsert_task command without any pre-configured scope."
+commands.deny = ["orch_upsert_task"]

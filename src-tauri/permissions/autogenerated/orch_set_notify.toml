@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-orch-set-notify"
+description = "Enables the orch_set_notify command without any pre-configured scope."
+commands.allow = ["orch_set_notify"]
+
+[[permission]]
+identifier = "deny-orch-set-notify"
+description = "Denies the orch_set_notify command without any pre-configured scope."
+commands.deny = ["orch_set_notify"]

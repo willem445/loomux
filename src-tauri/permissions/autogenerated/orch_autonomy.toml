@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-orch-autonomy"
+description = "Enables the orch_autonomy command without any pre-configured scope."
+commands.allow = ["orch_autonomy"]
+
+[[permission]]
+identifier = "deny-orch-autonomy"
+description = "Denies the orch_autonomy command without any pre-configured scope."
+commands.deny = ["orch_autonomy"]

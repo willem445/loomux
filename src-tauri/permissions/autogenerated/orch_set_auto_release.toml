@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-orch-set-auto-release"
+description = "Enables the orch_set_auto_release command without any pre-configured scope."
+commands.allow = ["orch_set_auto_release"]
+
+[[permission]]
+identifier = "deny-orch-set-auto-release"
+description = "Denies the orch_set_auto_release command without any pre-configured scope."
+commands.deny = ["orch_set_auto_release"]

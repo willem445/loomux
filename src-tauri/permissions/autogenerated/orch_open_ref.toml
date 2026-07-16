@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-orch-open-ref"
+description = "Enables the orch_open_ref command without any pre-configured scope."
+commands.allow = ["orch_open_ref"]
+
+[[permission]]
+identifier = "deny-orch-open-ref"
+description = "Denies the orch_open_ref command without any pre-configured scope."
+commands.deny = ["orch_open_ref"]

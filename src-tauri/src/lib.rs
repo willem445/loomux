@@ -1,4 +1,5 @@
 mod cliprobe;
+pub mod command_manifest; // pub: the ACL coherence integration test links APP_COMMANDS (#363)
 mod editor;
 pub mod fileedit; // pub: the file-editor integration test links its pure fns (#174)
 pub mod filehash; // pub: the hashing integration test links its pure fns (#214)

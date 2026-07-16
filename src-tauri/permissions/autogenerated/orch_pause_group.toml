@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-orch-pause-group"
+description = "Enables the orch_pause_group command without any pre-configured scope."
+commands.allow = ["orch_pause_group"]
+
+[[permission]]
+identifier = "deny-orch-pause-group"
+description = "Denies the orch_pause_group command without any pre-configured scope."
+commands.deny = ["orch_pause_group"]
