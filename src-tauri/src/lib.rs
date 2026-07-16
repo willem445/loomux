@@ -12,6 +12,7 @@ mod metrics;
 mod obs;
 pub mod orchestration; // pub: integration smoke test links through it
 pub mod pluginbroker; // pub: the #360 Slice C trust-core integration test links its pure fns
+mod procmetrics; // the metrics.system data source (#360 Slice E) — dispatched from pluginbroker only
 pub mod plugins; // pub: the pane-plugins integration test links its pure fns (#360 Slice B)
 pub mod pty; // pub: Job-Object integration test links `assign_kill_on_close_job`
 mod sessions;
@@ -209,6 +210,7 @@ pub fn run() {
             if let tauri::WindowEvent::Destroyed = event {
                 obs::breadcrumb("shutdown", "window destroyed");
                 pluginbroker::on_window_destroyed(window.label());
+                procmetrics::on_window_destroyed(window.label());
                 // Only the main window owns PTYs; a plugin window closing
                 // must not kill every agent pane's process.
                 if window.label() == "main" {

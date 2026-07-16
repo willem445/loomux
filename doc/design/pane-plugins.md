@@ -211,7 +211,7 @@ until a human deliberately reviews and ships a fifth.
 | `panel` | Render into the pane's content box; receive host→frame `resize` and `theme` events. | Nothing IPC-shaped — host-side DOM/postMessage events only. | Implicit: every plugin gets this merely by existing as a pane. Not declared in the manifest's `capabilities` array (there is nothing to opt into). |
 | `storage` | A namespaced per-plugin key/value store for view state (window position, last-selected tab, etc). | `uistate.rs`, new keys namespaced by `pluginId` so one plugin can never read or overwrite another's storage. | No cross-plugin read. No shared bucket. |
 | `fs.read` | Read files **under the pane's own root only** — path-jailed, no exceptions. | The existing `ft_read_file` command plus `fileedit.rs`'s server-side path choke point, with the pane's root as the jail boundary. | Rejected at manifest-validation time on a `rootless: true` plugin (no root to jail to). No directory listing beyond what `ft_read_file`'s existing surface already permits. |
-| `metrics.system` | Subscribe to a read-only stream of system + per-process resource stats (CPU/RAM), attributed to panes where the backend can do so. | A new `sys_processes`-style command (Slice E), never exposed to a plugin except through this one broker capability. | Curated payload — name, pid, cpu%, rss. No cmdline, no paths, no environment. |
+| `metrics.system` | Subscribe (`metrics.subscribe`/`metrics.unsubscribe`) to a read-only stream of system + per-process resource stats (CPU/RAM). | `procmetrics.rs` (Slice E) — a plain Rust module, not a `#[tauri::command]`; the only way to reach it is through the broker's `metrics.subscribe`/`metrics.unsubscribe` methods, per this note's "never exposed to a plugin except through this one broker capability." | Curated payload — name, pid, cpu%, rss. No cmdline, no paths, no environment. Bounded: capped at 32 processes/tick (`procmetrics::MAX_PROCESSES`), sorted by CPU desc; poll interval clamped to 1–10s (`procmetrics::clamp_interval_ms`) regardless of what a plugin requests — a plugin cannot turn this into an unthrottled process-table dump or a tight polling loop. Pane attribution (mapping a build-child process to the agent pane that spawned it, via the per-pane kill-on-close Job Object `pty.rs` already holds) was scoped for this slice but deferred as a follow-up — see the Slice E note below. |
 
 **Deliberately absent from the enum, so unreachable by construction, not by
 policy a plugin could talk its way around:** any filesystem **write**, git,
@@ -657,9 +657,24 @@ are stated, without drifting from what was actually agreed:
   installed fails soft to the welcome form with a toast, in that one slot,
   the same way an uninstalled git repo already does — it does not throw, and
   it does not silently drop the pane from the layout on the next save.
-- **Slice E** (metrics) exposes `sys_processes`-shaped data **only** through
-  the `metrics.system` broker handler — never as a command a plugin (or any
-  other webview script) could `invoke` directly.
+- **Slice E** (metrics — **done**, `procmetrics.rs`) exposes `sys_processes`
+  -shaped data **only** through the `metrics.system` broker handler — never as
+  a command a plugin (or any other webview script) could `invoke` directly.
+  `metrics.subscribe` starts a background poll thread, keyed by the plugin
+  window's label, that pushes a curated, bounded `metrics.tick` `PluginEvent`
+  over the channel `plugin_broker_open_channel` opened; `metrics.unsubscribe`
+  (and the window-destroyed hook) stops it. Bounding is two pure, unit-tested
+  functions — `shape_processes` (sort by CPU desc, cap at `MAX_PROCESSES`) and
+  `clamp_interval_ms` (floor/ceiling on the poll cadence a plugin can request)
+  — so the DoS-shaped concern in this note's threat table has a concrete,
+  tested answer rather than being merely intended. **Deferred, not shipped:**
+  attributing a build-child process to the agent pane that spawned it, via
+  `QueryInformationJobObject` on the per-pane kill-on-close Job Object
+  `pty.rs`'s `assign_kill_on_close_job` already creates (issue #78). Wiring
+  that through means exposing pane-to-job-handle lookup out of `pty.rs`'s
+  `PtyManager` and threading a pane/group identity into the metrics payload —
+  more than the contained addition this slice's brief allowed for scope; a
+  plain per-process snapshot ships now, pane attribution is a follow-up.
 - **Slice F** (the example plugin) and **Slice G** (template/SDK) are the
   first real consumers of the contract above; if either needs a capability,
   method, or event this note doesn't already grant, that is this note being
