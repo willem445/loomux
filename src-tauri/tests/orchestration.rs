@@ -3426,6 +3426,74 @@ fn spawn_agent_mcp_reviewer_resume_with_no_cwd_and_no_recorded_workspace_is_unaf
     );
 }
 
+// ───────── follow-up finding: a FRESH worker spawn's cwd is the other half of the #338 door ─────────
+
+#[test]
+fn spawn_agent_mcp_rejects_cwd_on_a_fresh_worker_spawn() {
+    // No resume_session at all — `cwd` on a fresh spawn is `spawn_agent_ex`'s
+    // `cwd_override`, which wins over `worktree` unconditionally, so this is
+    // just as complete a bypass of the dedicated-worktree guarantee as
+    // `worktree: false` would be.
+    let repo = real_repo();
+    let (reg, _d) = test_registry();
+    let g = reg.create_group(&repo.path().to_string_lossy(), rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let co = reg.resolve_token(&orch.token).unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+
+    let out = dispatch(&reg, &co, "tools/call", &json!({
+        "name": "spawn_agent",
+        "arguments": { "task": "t", "cwd": elsewhere.path().to_string_lossy() },
+    })).unwrap();
+    assert_eq!(
+        out["isError"], true,
+        "a fresh worker spawn with an explicit cwd must be rejected, not silently honored: {out:?}"
+    );
+    let text = out["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("#338"), "error must cite the guardrail, got: {text}");
+    assert!(
+        reg.list_agents(&g.id).as_array().unwrap().iter().all(|a| a["role"] != "worker"),
+        "a rejected spawn must not have created a worker as a side effect"
+    );
+
+    // Still rejected even paired with worktree:true — an explicit cwd is the
+    // problem regardless of what worktree says, since cwd_override wins over
+    // it either way.
+    let out = dispatch(&reg, &co, "tools/call", &json!({
+        "name": "spawn_agent",
+        "arguments": { "task": "t", "cwd": elsewhere.path().to_string_lossy(), "worktree": true },
+    })).unwrap();
+    assert_eq!(out["isError"], true, "worktree:true must not excuse an explicit cwd either: {out:?}");
+
+    // Naming the built-in worker block explicitly is covered the same way.
+    let out = dispatch(&reg, &co, "tools/call", &json!({
+        "name": "spawn_agent",
+        "arguments": { "block": "worker", "task": "t", "cwd": elsewhere.path().to_string_lossy() },
+    })).unwrap();
+    assert_eq!(out["isError"], true, "a worker-kind BLOCK must be covered too: {out:?}");
+}
+
+#[test]
+fn spawn_agent_mcp_fresh_reviewer_spawn_with_cwd_is_unaffected() {
+    // Reviewers/planners are unchanged: a fresh spawn's explicit cwd is still
+    // honored as a raw override for them, exactly as before.
+    let (reg, _d, co, _cw) = setup_mcp();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let elsewhere_path = elsewhere.path().to_string_lossy().to_string();
+
+    let out = dispatch(&reg, &co, "tools/call", &json!({
+        "name": "spawn_agent",
+        "arguments": { "kind": "reviewer", "task": "review #1", "cwd": elsewhere_path },
+    })).unwrap();
+    assert_eq!(out["isError"], false, "a fresh reviewer spawn with cwd is unaffected: {out:?}");
+    let agents = reg.list_agents(&co.group);
+    let reviewer = agents.as_array().unwrap().iter().find(|a| a["role"] == "reviewer").unwrap();
+    assert_eq!(
+        reviewer["cwd"], json!(elsewhere_path),
+        "reviewer's explicit cwd is honored as-is, unchanged: {reviewer}"
+    );
+}
+
 #[test]
 fn spawn_agent_mcp_accepts_planner_kind() {
     let (reg, _d, co, _cw) = setup_mcp();

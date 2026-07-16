@@ -224,29 +224,41 @@ The guard reads the **effective role** (the named block's `kind` when one is giv
 back to the `kind` argument otherwise — the same precedence `spawn_agent_ex` itself applies),
 not just the `kind` argument, so a worker-kind `block` is covered exactly like the bare
 `kind: "worker"` default; naming an *unknown* block is left to `spawn_agent_ex`'s own "unknown
-block" error rather than pre-empted by this guard. A **resume** (`resume_session` + `cwd`) is
-exempt from the *worktree flag* entirely: `spawn_agent_ex`'s `cwd_override` branch governs the
-workspace whenever `cwd` is given, regardless of `worktree`, so gating on the flag there would
-only reject a value that can't do anything. Reviewers and planners are untouched — a reviewer's
-default stays `false` (it inspects PRs via `gh` in the main clone; passing `worktree: true` for
-one is still allowed, unchanged), and a planner never gets a worktree under any `worktree`
-value, per its existing read-only contract.
+block" error rather than pre-empted by this guard. Reviewers and planners are untouched — a
+reviewer's default stays `false` (it inspects PRs via `gh` in the main clone; passing
+`worktree: true` for one is still allowed, unchanged), and a planner never gets a worktree
+under any `worktree` value, per its existing read-only contract.
 
-**A resume that omits `cwd` entirely is a second way into the same seam (rev-13's review
-finding on the #338 PR itself).** `cwd` is documented as "required with resume_session", but
-nothing enforced that — a resume with `resume_session` set and `cwd` omitted fell straight
-through every branch above (`cwd_override` is `None`, `worktree` defaults `false` for a
-resume) into `spawn_agent_ex`'s per-role default, which for a worker is the primary clone. The
-worktree guard closed the *fresh-spawn* half of "a worker never runs in the main clone"; this
-closed the *resume* half. The fix mirrors #254's own block inheritance, deliberately, rather
-than inventing a second mechanism: a resume that omits `cwd` now inherits the session's
-recorded workspace from this group's roster (the same last-touched-record lookup, `owner` in
-`mcp.rs`, shared with the block-inheritance code so the two agree on which record is
-authoritative instead of running independent lookups that could drift). If nothing is recorded
-for that session and the effective role is worker, the spawn is rejected — same style and the
-same `#338` guardrail wording as an explicit `worktree: false` — rather than guessing a
-workspace or falling back to the clone. Reviewers and planners are unaffected: an omitted `cwd`
-with nothing recorded still falls through to their existing per-role default, unchanged.
+**Guarding `worktree` alone left two more doors into the main clone open, both found on review
+of the #338 PR itself — `cwd` bypasses the flag entirely, on either entry point:**
+
+- **A fresh spawn's explicit `cwd` (a follow-up review finding on the same PR).** `spawn_agent_ex`'s `cwd_override`
+  branch wins over `worktree` unconditionally — that's what makes `cwd` useful for a resume,
+  but it means a plain `spawn_agent(kind: "worker", cwd: "<anywhere>")`, no `resume_session` at
+  all, bypassed the worktree guard completely: `worktree`'s own value never even matters once
+  `cwd` is set. The tool description had called `cwd` "ignored without resume_session" — true
+  of nothing in the code, just unenforced prose. Fixed by rejecting an explicit `cwd` on a
+  fresh worker spawn (or worker-kind block), same style and the same `#338` wording as an
+  explicit `worktree: false` — checked *before* the `worktree: false` check even runs, since an
+  explicit `cwd` makes that check moot regardless of what `worktree` says. Reviewers and
+  planners are unaffected: a fresh spawn's `cwd` is still honored for them as a raw override,
+  unchanged.
+- **A resume's omitted `cwd` (rev-13's finding).** `cwd` is documented as "required with
+  resume_session", but nothing enforced that either — a resume with `resume_session` set and
+  `cwd` omitted fell straight through into `spawn_agent_ex`'s per-role default (`cwd_override`
+  is `None`, and `worktree` itself defaults `false` for a resume), which for a worker is the
+  primary clone. Fixed by mirroring #254's own block inheritance, deliberately, rather than
+  inventing a second mechanism: a resume that omits `cwd` now inherits the session's recorded
+  workspace from this group's roster (the same last-touched-record lookup, `owner` in
+  `mcp.rs`, shared with the block-inheritance code so the two agree on which record is
+  authoritative instead of running independent lookups that could drift). If nothing is
+  recorded for that session and the effective role is worker, the spawn is rejected — same
+  style and the same `#338` guardrail wording again — rather than guessing a workspace or
+  falling back to the clone. Reviewers and planners are unaffected here too: an omitted `cwd`
+  with nothing recorded still falls through to their existing per-role default, unchanged.
+
+Between the three guards, `cwd` and `worktree` together can no longer land a worker in the
+primary clone on either a fresh spawn or a resume, however the two arguments are combined.
 
 **The orchestrator's own mechanical work** (a rebase, a conflict fix, cutting a revert branch)
 still sometimes needs a checkout outside a worker's own worktree — and now that a worker
