@@ -54,9 +54,8 @@ CI) — match the surrounding style instead of reformatting.
    here" as repo config, the way the resource guard's `resources:` block does)
    and no operator-setup assumptions (paths, core counts, installed tools). A
    behavior that only makes sense for developing loomux itself belongs in
-   `.loomux/` config or the dev docs, not the product. Precedents: the shared
-   `CARGO_TARGET_DIR` cache was removed for violating this (#263); the
-   resource guard takes its command patterns from `workflow.yml` (#318).
+   `.loomux/` config or the dev docs, not the product. Precedent: the shared
+   `CARGO_TARGET_DIR` cache was removed for violating this (#263).
 
 ## Code conventions
 
@@ -72,6 +71,17 @@ CI) — match the surrounding style instead of reformatting.
 - Comments in this codebase explain *why* (design constraints, Windows quirks,
   issue numbers) — keep that density and style.
 - Write tests that test intent, not implementation echoes.
+
+## Refinements & scope increases from the user
+
+Default: when the user asks for a refinement or feature addition on work already in
+progress (an open PR, an active branch), **fold it into the active PR** rather than
+deferring it to a follow-up issue. This is different from an agent inventing extra scope
+mid-diff — that's still a review ground to bounce ("scope drift... split it"). Here the
+user is the one increasing scope, deliberately, because they thought of the right shape
+while watching the work land — that's a refinement, not drift. Only defer to a separate
+issue when the user explicitly says to ("later", "follow-up issue", "separate PR"). Don't
+narrow their ask back down to the original ticket on your own judgment.
 
 ## Git & GitHub workflow
 
