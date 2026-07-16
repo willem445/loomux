@@ -27,6 +27,7 @@ const pane = (over: Partial<PersistedPane>): PersistedPane => ({
   role: null,
   sessionId: null,
   file: null,
+  pluginId: null,
   ...over,
 });
 
@@ -177,6 +178,34 @@ test("a workflow pane reopens over its repo, on the workflow file it was editing
     ).type,
     "open-workflow"
   );
+});
+
+// ---------- plugin (#360 Slice D) ----------
+
+test("a plugin pane restores by pluginId — no root, no file, nothing to re-read from disk", () => {
+  assert.deepEqual(
+    planPaneRestore(pane({ paneKind: "plugin", name: "Resource monitor", pluginId: "resource-monitor" })),
+    { type: "open-plugin", name: "Resource monitor", pluginId: "resource-monitor" }
+  );
+});
+
+test("a plugin record with no recorded id surfaces null for the caller to fail soft on", () => {
+  // Same contract as the other content kinds' null-root case: whether the plugin
+  // still EXISTS is I/O (list_plugins) this pure module can't do, so a missing id
+  // is handed to the caller as null rather than invented here.
+  assert.deepEqual(planPaneRestore(pane({ paneKind: "plugin", name: "plugin", pluginId: null })), {
+    type: "open-plugin",
+    name: "plugin",
+    pluginId: null,
+  });
+});
+
+test("a stray session id on a plugin record must not send it down an agent path", () => {
+  const action = planPaneRestore(
+    pane({ paneKind: "plugin", name: "p", pluginId: "demo", sessionId: "abc-123", command: "claude" }),
+    () => true
+  );
+  assert.equal(action.type, "open-plugin");
 });
 
 test("an orchestration pane ALWAYS restores dormant — never auto-resumed", () => {

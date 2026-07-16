@@ -133,6 +133,20 @@ export type RestoreAction =
       name: string;
       root: string | null;
       file: string | null;
+    }
+  | {
+      // A PLUGIN pane (#360 Slice D), back over the plugin it was hosting. Nothing to
+      // spawn or resume — but unlike its siblings the probe here isn't "does a path
+      // still exist", it's "is this plugin still INSTALLED" (list_plugins, I/O the caller
+      // runs — this module stays pure). `pluginId` may be null (a record written without
+      // one, or malformed input decoded to null) or name a plugin that's since been
+      // uninstalled; either fails soft to the welcome form in that one slot with a toast,
+      // exactly like a vanished folder or a repo that's no longer a git work tree — never
+      // a crash, never a silently dropped pane (doc/design/pane-plugins.md, "What later
+      // slices owe this note").
+      type: "open-plugin";
+      name: string;
+      pluginId: string | null;
     };
 
 /** True when a recorded agent session id still has a resumable conversation on
@@ -178,6 +192,13 @@ export function planPaneRestore(pane: PersistedPane, resumable?: SessionResumabl
       // open tab are view state, not layout: a restored workflow pane opens on its roster
       // exactly like a freshly opened one.
       return { type: "open-workflow", name: pane.name, root: pane.cwd, file: pane.file };
+    case "plugin":
+      // #360 Slice D: nothing to re-read from disk here (a plugin pane has no root/file),
+      // just the plugin id to look up against the CURRENT installed set. The caller
+      // resolves the manifest fresh (list_plugins) — never the manifest as it was when
+      // this pane was captured, since a plugin's own root/entry/capabilities can change
+      // across a reinstall between sessions.
+      return { type: "open-plugin", name: pane.name, pluginId: pane.pluginId };
     case "agent":
       // Auto-resume when we have a session id AND the hybrid is enabled; else a
       // dormant Start placeholder (no id to resume into, or the flip is off).

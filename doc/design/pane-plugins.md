@@ -650,13 +650,65 @@ are stated, without drifting from what was actually agreed:
   `permissions/sets/plugin-broker.toml`). The `metrics.system` capability is
   gated but its data handler is a stub pending Slice E's `sys_processes`-shaped
   backend — the check is real, the numbers aren't yet.
-- **Slice D** (the `"plugin"` kind) adds exactly one member to each closed
-  union this note describes as inheriting the content-pane mechanism, adds
-  `pluginId` to `PersistedPane`, and implements the restore fail-soft
-  behavior this note assumes: a pane naming a `pluginId` that is no longer
-  installed fails soft to the welcome form with a toast, in that one slot,
-  the same way an uninstalled git repo already does — it does not throw, and
-  it does not silently drop the pane from the layout on the next save.
+- **Slice D** (the `"plugin"` kind — **done**) adds exactly one member to
+  each closed union this note describes as inheriting the content-pane
+  mechanism (`PaneKind`/`isContentKind` in `panesetup.ts`, `PersistedPaneKind`/
+  `CONTENT_KINDS` in `tabstore.ts`, `ContentPaneKind`/`buildContentView` in
+  `pane.ts`, the restore switch in `panerestore.ts`), adds `pluginId` to
+  `PersistedPane` (additive, no schema bump — the same move `file` was for
+  #217), and implements the restore fail-soft behavior this note assumes: a
+  pane naming a `pluginId` that is no longer installed fails soft to the
+  welcome form with a toast, in that one slot, the same way an uninstalled
+  git repo already does — it does not throw, and it does not silently drop
+  the pane from the layout on the next save.
+
+  **Hosting the window.** A plugin pane hosts NO DOM content of its own —
+  Slice C's `plugin_open_window` builds a separate top-level `WebviewWindow`,
+  not a node this pane's content box could contain. `PluginPaneView`
+  (`pluginpaneview.ts`) is the one place that positions and resizes that OS
+  window to sit exactly over the pane's `.pane-content` box, on every layout
+  change that could move it — a divider drag, a split, a tab switch, a
+  maximize elsewhere, the MAIN window itself moving or resizing — via a
+  `ResizeObserver` on its own content box plus `onMoved`/`onResized`
+  listeners on the main window. It hides the plugin window the moment that
+  box collapses to zero size (`pluginwindow.ts`'s `pluginWindowShouldShow`) —
+  the SAME zero-size signal `applyFit()` already uses to skip a PTY resize on
+  a hidden pane, reused here for a hidden *window* — rather than wiring a
+  bespoke hook into each of dock/tab-hide/maximize separately, and closes it
+  on pane dispose. The screen-space arithmetic (`pluginOverlayRect`) is pure
+  and DOM-free (`test/pluginwindow.test.ts`); the Tauri/DOM wiring around it
+  is hand-validated, per this repo's convention for DOM wiring.
+
+  **The one gap Slice B left for this slice to close.** `list_plugins`
+  echoes a manifest's `id`/`name`/`entry`/`capabilities`/`apiVersion`/
+  `rootless` but never an absolute install path — nothing needed one until
+  `plugin_open_window`'s `root` (for `fs.read`'s jail). Slice D resolves it
+  client-side (`resolvePluginRoot` in `pluginpaneview.ts`) by joining Tauri's
+  own `dataDir()` with `loomux/plugins/<id>` — the exact formula this note's
+  own "Install / discovery" section publishes as the install-location
+  contract, computed via Tauri's base-directory resolver rather than
+  reimplementing `plugins_root_dir()`'s OS-path logic a second time. If the
+  install location decision (open decision 2, above) changes, this is the
+  one place that has to follow it.
+
+  **Untrusted text.** A plugin manifest's `name` reaches this slice in three
+  places — the pane's tab label, the plugin picker's option text, and the
+  `plugin_open_window` `title` passed straight to the OS window chrome (never
+  parsed as markup on that side either, per `pluginbroker.rs`'s own doc
+  comment). All three go through `textContent`/`.value` assignment only,
+  never `innerHTML` or template interpolation — the DOM auto-escapes, so
+  there's no separate "escaping" step to get wrong.
+
+  **Known, accepted gaps** (documented rather than engineered around — this
+  repo's own precedent for a real-but-cosmetic limitation, see
+  `content-panes.md`'s "one known, accepted cosmetic gap"): a freshly-opened
+  plugin window can flash at Tauri's default placement for one frame before
+  the first reposition lands; z-order relative to the main window (context
+  menus, toasts, modals) is whatever the OS window manager gives a plain
+  top-level window, not fought with a focus/always-on-top dance; and
+  multi-monitor DPI assumes the plugin window stays on the same display as
+  the pane hosting it (nothing stops a human dragging it elsewhere, which has
+  no reason to be a gesture this feature supports).
 - **Slice E** (metrics — **done**, `procmetrics.rs`) exposes `sys_processes`
   -shaped data **only** through the `metrics.system` broker handler — never as
   a command a plugin (or any other webview script) could `invoke` directly.
