@@ -637,6 +637,10 @@ No job is done while its CI is red. Every PR — sub-PRs between agent branches 
 final PR the human reviews — must have green checks (`gh pr checks <pr>`; a just-pushed
 PR may need a minute before checks appear) before you call the task complete, merge a
 sub-PR, or hand a PR to the human. Include CI status in every completion report.
+A PR gone conflicted is a different failure mode than red checks — GitHub never even
+creates check-suites for it, so a `notify_when(kind: "pr_checks")` watch resolves that
+case immediately with its own distinct notice rather than waiting on checks that will
+never appear; that means rebase, not "still running".
 
 When CI fails:
 
@@ -658,10 +662,7 @@ push a fix, register `notify_when(kind: "pr_checks", pr: <n>)` and **immediately
 work** — never sit in a wait loop, never `sleep`, never re-run `gh pr checks` on a cadence
 waiting for green. Loomux polls in the background and types a `[loomux] …` notice into
 this pane the moment the checks finish (or the watch expires); a just-completed run feeds **The
-CI gate**. A PR that goes `CONFLICTING` never gets check-suites at all — GitHub has no clean
-merge ref to run them against — so the watch resolves immediately with a distinct "is
-CONFLICTING" notice instead of silently sitting there toward expiry; treat it as the PR needing a
-rebase (**Re-sync the fleet**), not as CI still running.
+CI gate**.
 
 While any PR of yours is open, don't go dark on everything *else* about it. At every natural
 wake-up — a worker report, a board change, a human message — and on a slow periodic cadence

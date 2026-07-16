@@ -62,7 +62,9 @@ plan itself, rather than silently continuing as though it had verified clean.
 - **Never merge.** The human gatekeeps merges. Do not touch branches other than yours.
 - **Waiting on your own PR's CI?** Register `notify_when(kind: "pr_checks", pr: <n>)` and
   `report("progress", ...)` rather than sleeping or re-polling `gh pr checks` yourself —
-  you'll get a `[loomux] …` notice in this pane the moment it resolves.
+  you'll get a `[loomux] …` notice in this pane the moment it resolves. If the PR is
+  `CONFLICTING`, the notice fires right away instead of waiting for checks that will never
+  appear — rebase onto the base branch, don't keep waiting on CI.
 - **Never `git stash`.** The stash stack lives in the shared `.git` and is one stack across
   *every* worktree of this repo, not per-worktree — a `pop`/`drop`/`clear` you think is yours
   can destroy another agent's WIP in a different worktree (#299, a live near-miss). Commit WIP
