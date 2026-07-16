@@ -727,8 +727,16 @@ are stated, without drifting from what was actually agreed:
   `PtyManager` and threading a pane/group identity into the metrics payload —
   more than the contained addition this slice's brief allowed for scope; a
   plain per-process snapshot ships now, pane attribution is a follow-up.
-- **Slice F** (the example plugin) and **Slice G** (template/SDK) are the
-  first real consumers of the contract above; if either needs a capability,
-  method, or event this note doesn't already grant, that is this note being
-  wrong, not a shortcut to take silently — it comes back here for a
-  reviewed addition.
+- **Slice G** (template/SDK/authoring guide — **done**,
+  `templates/loomux-plugin/`, `docs/features/pane-plugins.md`) needed no
+  addition to the contract above: the template's manifest declares only
+  `panel`/`storage` (rootless, so no `fs.read`), and its "hello world" is one
+  `storage.get`/`storage.set` round trip. The client SDK
+  (`templates/loomux-plugin/sdk/plugin-sdk.js`) is a thin, dependency-free
+  wrapper around the two broker commands, not a new capability or method —
+  it exists because a plugin has no build step to `npm install
+  @tauri-apps/api` through, not because the wire contract needed widening.
+- **Slice F** (the example plugin) is the first real *runtime* consumer of
+  the contract above; if it needs a capability, method, or event this note
+  doesn't already grant, that is this note being wrong, not a shortcut to
+  take silently — it comes back here for a reviewed addition.
