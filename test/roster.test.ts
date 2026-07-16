@@ -450,6 +450,27 @@ test("a block's one-line description leads with what the human is consenting to"
   assert.equal(describeBlock(block({ id: "w", kind: "worker", model: "" })), "worker · claude · default model");
 });
 
+test("a role_hint block gets an ADVISOR/PROCESS chip (#250/#324)", () => {
+  assert.equal(
+    describeBlock(block({ id: "advisor", kind: "planner", role_hint: "advisor" })),
+    "planner · claude · sonnet · ADVISOR"
+  );
+  assert.equal(
+    describeBlock(block({ id: "proc", kind: "worker", role_hint: "process" })),
+    "worker · claude · sonnet · PROCESS"
+  );
+  // The chip stacks after the persona note, never replaces it — both are things
+  // the human is consenting to, independently.
+  assert.equal(
+    describeBlock(
+      block({ id: "advisor", kind: "planner", persona: "prompt", role_hint: "advisor" })
+    ),
+    "planner · claude · sonnet · repo persona · ADVISOR"
+  );
+  // No hint, no chip — today's behavior, byte for byte.
+  assert.equal(describeBlock(block({ id: "w", kind: "worker" })), "worker · claude · sonnet");
+});
+
 test("the roster description counts delegates, not the orchestrator", () => {
   // Every group has exactly one orchestrator and it is not a choice the roster
   // makes, so counting it would just pad every line with the same "1 orchestrator".

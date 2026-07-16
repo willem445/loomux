@@ -2649,6 +2649,16 @@ fn read_blocks(g: &Value) -> Vec<workflow::Block> {
                                 .collect()
                         })
                         .unwrap_or_default(),
+                    // Defense in depth, same shape as `kind` just above: a
+                    // hand-edited group.json never meets `parse_workflow`, so a
+                    // role_hint whose kind no longer matches (the file was
+                    // edited to change one but not the other) is dropped
+                    // silently here rather than resurrected — there is no
+                    // human to show a parse error to at this layer.
+                    role_hint: b["role_hint"].as_str().and_then(|raw| {
+                        let hint = raw.trim().to_ascii_lowercase();
+                        (workflow::role_hint_requires(&hint) == Some(kind)).then_some(hint)
+                    }),
                 })
             })
             .collect();
@@ -2684,6 +2694,7 @@ fn blocks_json(blocks: &[workflow::Block]) -> Value {
                     "prompt": b.prompt,
                     "profile": b.profile,
                     "allow": b.allow,
+                    "role_hint": b.role_hint,
                 })
             })
             .collect(),
@@ -12429,6 +12440,10 @@ pub fn orch_workflow_preview(repo: String, agent_cli: String) -> Value {
             "kind": b.kind.as_str(),
             "cli": workflow::cli_of(b, &agent_cli),
             "model": workflow::model_of(b, &agent_cli),
+            // #250/#324: surfaced so the launcher preview can badge an
+            // advisor/process block — cosmetic only, never a capability (see
+            // `workflow::Block::role_hint`).
+            "role_hint": b.role_hint,
             // What the human is really being asked to consent to: whether this
             // block carries repo-authored instructions for the agent.
             //

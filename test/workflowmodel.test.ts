@@ -1053,6 +1053,49 @@ test("a block declaring both a prompt and a profile is ambiguous", () => {
   assert.ok(has(validateWorkflow(w), "prompt-and-profile"));
 });
 
+test("role_hint requires its matching capability class (#250/#324)", () => {
+  // advisor -> planner, process -> worker. Mirrors the backend's
+  // `role_hint_requires` (workflow.rs) so this pane's pre-run pass never
+  // disagrees with what the real parser would say.
+  const advisorOk = starterWorkflow();
+  advisorOk.blocks[0]!.role_hint = "advisor"; // blocks[0] is the planner
+  assert.deepEqual(codes(validateWorkflow(advisorOk)), []);
+
+  const processOk = starterWorkflow();
+  processOk.blocks[1]!.role_hint = "process"; // blocks[1] is the worker
+  assert.deepEqual(codes(validateWorkflow(processOk)), []);
+
+  // The mismatched pairing is a NAMED finding, not a silent no-op.
+  const mismatched = starterWorkflow();
+  mismatched.blocks[1]!.role_hint = "advisor"; // worker, not planner
+  const f = validateWorkflow(mismatched);
+  assert.ok(has(f, "role-hint-wrong-kind"));
+  assert.equal(f.find((x) => x.code === "role-hint-wrong-kind")!.blockId, "worker");
+
+  const mismatched2 = starterWorkflow();
+  mismatched2.blocks[0]!.role_hint = "process"; // planner, not worker
+  assert.ok(has(validateWorkflow(mismatched2), "role-hint-wrong-kind"));
+
+  // An unrecognized value is its own finding, never coerced to the nearest hint.
+  const bogus = starterWorkflow();
+  bogus.blocks[0]!.role_hint = "supervisor";
+  assert.ok(has(validateWorkflow(bogus), "role-hint-unknown"));
+
+  // Absent is clean — today's behavior, byte for byte.
+  assert.deepEqual(codes(validateWorkflow(starterWorkflow())), []);
+});
+
+test("role_hint round-trips through serialize/parse unchanged", () => {
+  const w = starterWorkflow();
+  w.blocks[0]!.role_hint = "advisor";
+  const reread = parseWorkflow(serializeWorkflow(w)).workflow;
+  assert.equal(reread.blocks[0]!.role_hint, "advisor");
+  // ...and a block that never declared one stays undefined, not "".
+  assert.equal(reread.blocks[1]!.role_hint, undefined);
+  // Formatting twice is still a no-op with the field present.
+  assert.equal(serializeWorkflow(reread), serializeWorkflow(w));
+});
+
 test("a block nothing wires up is a warning, not a hard error", () => {
   const w = starterWorkflow();
   w.blocks.push({ id: "rev-perf", name: "Perf", kind: "reviewer", cli: "claude", model: "" });

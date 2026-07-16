@@ -72,6 +72,12 @@
 //!     prompt: |            # -> claude --agents '{...}' --agent rev-security
 //!       Review ONLY for security defects: injection, authz, secrets.
 //!
+//!   - id: advisor            # role_hint: OPTIONAL, INERT (#250/#324) — picks
+//!     kind: planner           # only a persona addendum/template/badge; the
+//!     role_hint: advisor      # capability is `kind` alone, always. advisor
+//!                             # requires kind: planner, process requires
+//!                             # kind: worker — anything else is a parse error.
+//!
 //! edges:                   # ADVISORY: the declared happy path. The
 //!   - { from: worker, to: [rev-security] }   # orchestrator still schedules.
 //!
@@ -137,6 +143,16 @@ pub struct Block {
     /// Sanitized; may never re-grant what the capability class denies (deny
     /// rules beat allow rules on both CLIs).
     pub allow: Vec<String>,
+    /// An optional, INERT persona/template marker (`advisor` | `process`,
+    /// #250/#324) — never a capability. `parse_workflow` requires it to
+    /// pair with a specific `kind` (`advisor` needs `planner`, `process`
+    /// needs `worker`; see [`role_hint_requires`]) so a workflow file cannot
+    /// spell a combination nothing downstream will honor. Everything that
+    /// keys capability — `kind.is_read_only()`, `mcp::tool_defs`, the CLI
+    /// deny-flags — reads `kind` alone; `role_hint` selects only a persona
+    /// addendum, a template fragment and a roster badge (#250/#324 slice C).
+    /// `None` is today's behavior, byte for byte.
+    pub role_hint: Option<String>,
 }
 
 impl Block {
@@ -256,6 +272,7 @@ pub fn default_roster(pins: &[(Role, &str, &str)]) -> Vec<Block> {
             prompt: None,
             profile: None,
             allow: Vec::new(),
+            role_hint: None,
         })
         .collect()
 }
@@ -467,6 +484,8 @@ struct RawBlock {
     profile: Option<String>,
     #[serde(default)]
     allow: Vec<String>,
+    #[serde(default)]
+    role_hint: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -524,6 +543,24 @@ pub fn kind_from_str(s: &str) -> Option<Role> {
 /// The kinds a workflow file may name, for error messages.
 pub fn kind_names() -> String {
     "orchestrator, worker, reviewer, planner".to_string()
+}
+
+/// The capability class a `role_hint` REQUIRES — `None` for anything
+/// unrecognized, the same "reject, never coerce" shape as [`kind_from_str`].
+/// This is the whole enforcement of "role_hint is inert w.r.t. capability":
+/// it only ever narrows which *existing* kind a hint may sit on, never
+/// widens what that kind can do.
+pub fn role_hint_requires(hint: &str) -> Option<Role> {
+    match hint.trim().to_ascii_lowercase().as_str() {
+        "advisor" => Some(Role::Planner),
+        "process" => Some(Role::Worker),
+        _ => None,
+    }
+}
+
+/// The role hints a workflow file may name, for error messages.
+pub fn role_hint_names() -> String {
+    "advisor, process".to_string()
 }
 
 // ── parse + validate ────────────────────────────────────────────────────────
@@ -687,6 +724,36 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
             ));
             continue;
         }
+        // role_hint (#250/#324) is a persona/template MARKER, never a
+        // capability — it selects only which addendum/template fragment/badge
+        // a block gets, and `resolve_persona`/`mcp::tool_defs`/the CLI
+        // deny-flags all key off `kind` alone, never this field. What IS
+        // enforced here is that a hint can only sit on the kind it is
+        // meaningless without: an unrecognized value, or one paired with the
+        // wrong kind, is a loud parse error — never coerced, never silently
+        // dropped, the same shape `kind_from_str` itself enforces.
+        let role_hint = match rb.role_hint.as_deref() {
+            None => None,
+            Some(raw) => {
+                let hint = raw.trim().to_ascii_lowercase();
+                let Some(required) = role_hint_requires(&hint) else {
+                    errs.push(format!(
+                        "blocks[{i}] ({id}): unknown role_hint {raw:?} — must be one of {}",
+                        role_hint_names()
+                    ));
+                    continue;
+                };
+                if required != kind {
+                    errs.push(format!(
+                        "blocks[{i}] ({id}): role_hint {hint:?} requires kind: {} (this block is kind: {})",
+                        required.as_str(),
+                        kind.as_str()
+                    ));
+                    continue;
+                }
+                Some(hint)
+            }
+        };
         let name = sanitize_display(&rb.name);
         blocks.push(Block {
             name: if name.is_empty() { id.clone() } else { name },
@@ -697,6 +764,7 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
             prompt: rb.prompt.as_deref().map(sanitize_persona).filter(|s| !s.trim().is_empty()),
             profile: rb.profile.as_ref().map(|p| p.trim().to_string()),
             allow: rb.allow.iter().filter_map(|a| super::profiles::sanitize_allow(a)).collect(),
+            role_hint,
         });
     }
 
