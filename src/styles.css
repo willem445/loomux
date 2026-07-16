@@ -502,14 +502,21 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 /* Loomux is currently withholding an outbound prompt because it believes the
    human's own input occupies this pane's CLI box. Distinct from .pane-attn
    (which flags a pane the human should look AT): this flags a pane loomux is
-   NOT writing to right now, so it gets its own muted (non-pulsing, no hover
-   affordance — nothing to click) treatment rather than competing visually
-   with the attention chip when both happen to be present. */
+   NOT writing to right now — a live-test report found the original muted,
+   non-pulsing treatment too easy to miss, so it now pulses using the SAME
+   amber warning color/animation shape as .pane-attn (this app's one existing
+   "needs your attention" convention) rather than inventing a second one;
+   reserving red for actual error states elsewhere in the UI, per the human's
+   own preference. Still no hover affordance — nothing to click here. */
 .pane-held {
   flex: none;
   font-size: 9px; font-weight: 700; letter-spacing: 0.4px;
-  border: 1px solid #3d4a63; border-radius: 4px; padding: 1.5px 6px;
-  color: #8aa2c8; background: rgba(122, 162, 247, 0.12);
+  border: 1px solid #6a5230; border-radius: 4px; padding: 1.5px 6px;
+  color: #f2c66a; background: rgba(224, 175, 104, 0.16);
+  animation: attn-pulse 1.6s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .pane-held { animation: none; }
 }
 
 /* ---------- cross-workspace channels (#271) ---------- */
