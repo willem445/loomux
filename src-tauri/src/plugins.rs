@@ -531,19 +531,27 @@ pub fn plugin_protocol_handler(
 ) -> tauri::http::Response<Vec<u8>> {
     let path = request.uri().path().to_string();
     let resp = build_asset_response(&plugins_root_dir(), &path);
-    crate::obs::breadcrumb(
-        "plugins",
-        &format!(
-            "plugin:// request path={} -> status={}{}",
-            path,
-            resp.status,
-            if resp.status == 200 {
-                String::new()
-            } else {
-                format!(" body={}", String::from_utf8_lossy(&resp.body))
-            }
-        ),
-    );
+    // Debug-only: this fires on EVERY asset request a plugin page makes (its
+    // HTML, every script/style/image it loads), unlike the once-per-window-open
+    // breadcrumbs elsewhere in this module — logging it unconditionally would
+    // flood the shared, fixed-size breadcrumb ring in a release build the
+    // moment a human opens a plugin pane, evicting the crash-sentinel context
+    // that ring exists for (rev-81 finding on #383).
+    if cfg!(debug_assertions) {
+        crate::obs::breadcrumb(
+            "plugins",
+            &format!(
+                "plugin:// request path={} -> status={}{}",
+                path,
+                resp.status,
+                if resp.status == 200 {
+                    String::new()
+                } else {
+                    format!(" body={}", String::from_utf8_lossy(&resp.body))
+                }
+            ),
+        );
+    }
     tauri::http::Response::builder()
         .status(resp.status)
         .header(tauri::http::header::CONTENT_TYPE, resp.content_type)
