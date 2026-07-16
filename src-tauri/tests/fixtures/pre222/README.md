@@ -81,6 +81,15 @@ so far:
   work the brief's steps one at a time, verify each against its own stated check before moving
   on, and treat a step whose verification won't pass after a real attempt as something to
   report rather than quietly skip past.
+- **#328, `request_compact` as the primary compact mechanism** — `orchestrator.md` only.
+  The pre-existing "Compact at lulls" invariant used to tell the orchestrator to type
+  `/compact` itself and then manually treat the next turn like a session start. It now
+  calls `request_compact()` as the last action of a turn instead (loomux pastes `/compact`
+  once the pane is actually idle, never mid-turn), names the pre-compact offload checklist
+  as a precondition (`request_compact` warns, never blocks, if it looks skipped), and drops
+  the manual re-sync instruction now that loomux's own mandatory post-compact re-injection
+  does that automatically. It also tells the orchestrator what a `[loomux] context at NN% …`
+  escalation notice means.
 
 - **#337, CONFLICTING never gets checks** — `orchestrator.md` and `worker.md` only. A
   `notify_when(kind: "pr_checks")` watch now resolves the moment its PR goes
