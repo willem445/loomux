@@ -529,7 +529,21 @@ pub fn plugin_protocol_handler(
     _ctx: tauri::UriSchemeContext<'_, tauri::Wry>,
     request: tauri::http::Request<Vec<u8>>,
 ) -> tauri::http::Response<Vec<u8>> {
-    let resp = build_asset_response(&plugins_root_dir(), request.uri().path());
+    let path = request.uri().path().to_string();
+    let resp = build_asset_response(&plugins_root_dir(), &path);
+    crate::obs::breadcrumb(
+        "plugins",
+        &format!(
+            "plugin:// request path={} -> status={}{}",
+            path,
+            resp.status,
+            if resp.status == 200 {
+                String::new()
+            } else {
+                format!(" body={}", String::from_utf8_lossy(&resp.body))
+            }
+        ),
+    );
     tauri::http::Response::builder()
         .status(resp.status)
         .header(tauri::http::header::CONTENT_TYPE, resp.content_type)
@@ -574,19 +588,39 @@ pub const BUNDLED_EXAMPLE_PLUGIN_ID: &str = "resource-monitor";
 /// already installed" is asking for.
 pub fn seed_bundled_example_plugin(resource_dir: &Path, plugins_root: &Path) {
     let dest = plugins_root.join(BUNDLED_EXAMPLE_PLUGIN_ID);
-    if dest.exists() {
-        return;
-    }
     let source = resource_dir.join("plugins").join(BUNDLED_EXAMPLE_PLUGIN_ID);
-    if let Err(e) = install_plugin_from(&source, plugins_root) {
-        // Best-effort: a missing/corrupt bundled resource must not block
-        // startup — the human still has a working app, just without the
-        // example pre-installed. Loud enough to find in the crash log, never
-        // a dialog blocking the rest of boot.
+    crate::obs::breadcrumb(
+        "plugins",
+        &format!(
+            "seed_bundled_example_plugin: resource_dir={} source={} source_exists={} dest_exists={}",
+            resource_dir.display(),
+            source.display(),
+            source.is_dir(),
+            dest.is_dir()
+        ),
+    );
+    if dest.exists() {
         crate::obs::breadcrumb(
             "plugins",
-            &format!("failed to seed bundled example plugin `{BUNDLED_EXAMPLE_PLUGIN_ID}`: {e}"),
+            &format!("seed_bundled_example_plugin: `{BUNDLED_EXAMPLE_PLUGIN_ID}` already installed, skipping"),
         );
+        return;
+    }
+    match install_plugin_from(&source, plugins_root) {
+        Ok(_) => crate::obs::breadcrumb(
+            "plugins",
+            &format!("seed_bundled_example_plugin: installed `{BUNDLED_EXAMPLE_PLUGIN_ID}` ok"),
+        ),
+        Err(e) => {
+            // Best-effort: a missing/corrupt bundled resource must not block
+            // startup — the human still has a working app, just without the
+            // example pre-installed. Loud enough to find in the crash log, never
+            // a dialog blocking the rest of boot.
+            crate::obs::breadcrumb(
+                "plugins",
+                &format!("failed to seed bundled example plugin `{BUNDLED_EXAMPLE_PLUGIN_ID}`: {e}"),
+            );
+        }
     }
 }
 

@@ -578,8 +578,21 @@ pub fn session_for_window(label: &str) -> Option<PluginSession> {
     with_sessions(|m| m.get(label).cloned())
 }
 
+/// **Must stay `async fn`** — this is the documented Tauri/wry Windows
+/// footgun (wry#583, cited verbatim on `WebviewWindowBuilder::new`'s own
+/// rustdoc: "this function deadlocks when used in a synchronous command...
+/// use async commands ... when creating windows"). A non-async
+/// `#[tauri::command]` runs its body inline on the same WebView2/UI thread
+/// that dispatched the IPC call; `WebviewWindowBuilder::build()` then has to
+/// round-trip a request back onto that SAME thread to actually create the
+/// window, which can never be serviced because the thread is still blocked
+/// inside this call — the whole app hangs (the plugin window paints nothing,
+/// its close button and devtools/right-click never respond, and the main
+/// window freezes too, since it's the same UI thread). Marking this `async`
+/// makes Tauri dispatch the command body onto the async-runtime threadpool
+/// instead, so `.build()`'s main-thread round trip has somewhere to land.
 #[tauri::command]
-pub fn plugin_open_window(
+pub async fn plugin_open_window(
     app: tauri::AppHandle,
     req: OpenPluginWindowRequest,
 ) -> Result<String, String> {
@@ -594,10 +607,31 @@ pub fn plugin_open_window(
 
     let label = next_window_label(&req.plugin_id);
     let plugin_id_for_nav = req.plugin_id.clone();
+    crate::obs::breadcrumb(
+        "pluginbroker",
+        &format!("plugin_open_window: label={label} url={url}"),
+    );
     tauri::WebviewWindowBuilder::new(&app, &label, tauri::WebviewUrl::External(url))
         .title(&req.title)
         .inner_size(req.width, req.height)
-        .on_navigation(move |url| is_navigation_allowed(&plugin_id_for_nav, url))
+        // Devtools/right-click-Inspect for a sandboxed plugin window: only
+        // ever in a debug build. The `devtools` Cargo feature this crate does
+        // NOT enable (see Cargo.toml) already makes this a structural no-op
+        // in release regardless of the bool here — explicit anyway so the
+        // intent isn't left to an implicit default.
+        .devtools(cfg!(debug_assertions))
+        .on_navigation(move |nav_url| {
+            let allowed = is_navigation_allowed(&plugin_id_for_nav, nav_url);
+            crate::obs::breadcrumb(
+                "pluginbroker",
+                &format!(
+                    "plugin_open_window: navigation {} -> {}",
+                    nav_url,
+                    if allowed { "allow" } else { "deny" }
+                ),
+            );
+            allowed
+        })
         .build()
         .map_err(|e| e.to_string())?;
 
