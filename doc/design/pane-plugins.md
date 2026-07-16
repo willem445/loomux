@@ -1,0 +1,459 @@
+# Pane plugins: the public contract (#360, Slice A)
+
+*Contract-first. This note ships before any plugin code, and every later slice
+(B backend host, C broker, D the `"plugin"` kind, E metrics, F the example
+plugin, G template/SDK) builds against exactly what is written here — not
+against whatever felt convenient while implementing. A change to the manifest
+schema, the capability enum, or the broker envelope after this note lands is a
+contract change and needs its own review, the same as any other public
+contract in this repo (`AGENTS.md`/CLAUDE.md's definition-of-done rule 5).*
+
+## Why this exists
+
+The human asked for user-installable custom panes (#360): "everyone has their
+own requirements for their own development workflow… I want my tool to
+support whatever they need in front of them." The naive version of that ask —
+let a repo or a user drop in a script that becomes a pane — is a straight
+line to the thing this codebase has spent its whole life refusing to be. A
+pane plugin is third-party code the human did not audit, running inside the
+same process as an orchestrator that can grant merges, push to remotes, and
+write to disk. So the shape of this feature is set entirely by one question:
+**what can a plugin reach, and what stops it reaching anything else?** That
+question is answered once, here, and every other slice inherits the answer
+rather than re-deriving it.
+
+## The trust problem, stated exactly
+
+Loomux's whole identity is "visible prompts, audit log, host-enforced
+guardrails, never bypass ever" (`doc/marketing-research.md`). Two facts about
+the current webview make that identity fragile the moment arbitrary code runs
+inside it:
+
+- **Every `#[tauri::command]` is reachable by any script in the webview.**
+  At the time of this audit the app registers roughly **117** commands in one
+  `generate_handler!` (`src-tauri/src/lib.rs`) — the exact count moves as
+  commands are added; what matters is that **none is individually
+  permission-gated**. Tauri's capability system gates *plugin* commands
+  (dialog, window, …), not app-defined ones. A script with access to
+  `window.__TAURI_INTERNALS__` can call `orch_grant_merge`, `git_push`,
+  `ft_write_file`, `spawn_pty` — anything — with no capability check between
+  it and the command.
+- **`tauri.conf.json`'s `csp` is `null`.** No script/connect/frame-source
+  restriction exists anywhere in the app today. `withGlobalTauri` is off, but
+  `@tauri-apps/api`'s `invoke` reaches the same injected internals from any
+  same-origin script.
+
+Today this is safe because of an axiom stated outright in CLAUDE.md
+(constraints 5 and 6): **the webview is trusted**, because everything that
+runs in it is code the human installed loomux to run. A pane plugin breaks
+that axiom on purpose — it is code from someone else, loaded because the
+human wanted a feature, not because they audited it. The instant plugin code
+shares an origin with `__TAURI_INTERNALS__`, "the webview is trusted" stops
+being true, and every guardrail built on top of it (the merge gate included)
+stops meaning anything.
+
+**The merge gate specifically does not help here.** The `gh pr merge` PATH
+shim (#196/#335) intercepts an agent's own *subprocess* call to the real `gh`
+binary. It has nothing to do with IPC: a script calling `orch_grant_merge` or
+`git_push` over `invoke` never touches a subprocess, so it never touches the
+shim. Grant files are documented as reachable "ONLY through Tauri
+commands… agents never mint them" — that promise assumes the only things
+minting them are loomux's own trusted frontend modules. An unsandboxed
+plugin is exactly the kind of code that promise was never written to survive.
+
+**Conclusion:** a pane plugin that runs as same-origin JS has the same reach
+as loomux's own frontend — all ~117 commands, no exceptions. Isolation is not
+a hardening pass on top of the feature. It **is** the feature; everything
+else in this note exists to give a plugin a box it cannot climb out of.
+
+## One new content kind, not a second pane system
+
+The repo already has the mechanism this needs: a **content pane** (#214,
+generalized in #217/#222, see `doc/design/content-panes.md`) is a PTY-less
+pane whose content is a view — `startContent()` builds it, `PersistedPane`
+captures it, `planPaneRestore` restores it, `tabcounts` excludes it from the
+agent counter by kind. `files`, `editor`, `git`, and `workflow` are four
+instances of one mechanism, not four mechanisms.
+
+A plugin pane is a **fifth instance of the same mechanism**: one new content
+kind, `"plugin"`. It is not a parallel pane system, and it does not get its
+own split/dock/drag/maximize/restore/counting logic — it inherits all of
+that by joining the same closed unions the other four kinds already sit in
+(`PaneKind`/`isContentKind` in `panesetup.ts`, `PersistedPaneKind`/
+`CONTENT_KINDS` in `tabstore.ts`, the `buildContentView` dispatch in
+`pane.ts`, the restore switch in `panerestore.ts`). Slice D is the only slice
+that touches those shared sites, and it touches them the same small,
+contained way #217 and #222 each added one kind before.
+
+**Identity: `pluginId`.** A content pane's persisted identity today is
+carried in the `cwd`/`file` fields it already has (a root, an open path) —
+there was never a reason to add a schema field for `files`/`editor`/`git`,
+because "which folder" and "which file" are both paths. A plugin pane's
+identity is not a path — it is *which plugin* — so `PersistedPane` gains one
+new field: `pluginId: string | null`. This is additive to the existing
+persisted-layout schema (`tabstore.ts`), not a version bump: content panes
+have never bumped `SCHEMA_VERSION` for a new field, because `decodePane` is
+shape-driven and tolerates an absent field as `null` on an older snapshot.
+The same tolerance has to hold in reverse for plugins specifically, because a
+plugin can be *uninstalled between sessions* in a way a folder or a repo
+generally isn't — see **Restore and fail-soft** below.
+
+`pluginId` is the string in the manifest's `id` field (below) — author-chosen,
+stable, and the only thing an edge case (a rename, a re-install, a version
+bump) is allowed to key on.
+
+## The plugin manifest
+
+A plugin is a folder containing `plugin.json` plus its own assets. The
+manifest is the plugin's declaration to loomux of what it is, what version of
+the contract it speaks, and what it is asking permission to touch. It is
+**not** a place a plugin can expand its own reach — see the capability model
+below for why that is load-bearing, not incidental.
+
+```jsonc
+{
+  "id": "resource-monitor",        // REQUIRED. Stable identity — see below.
+  "name": "Resource monitor",      // REQUIRED. Display name only, may change freely.
+  "version": "1.0.0",              // REQUIRED. The PLUGIN's own semver, author's concern.
+  "apiVersion": 1,                 // REQUIRED. Which broker contract this plugin speaks — see Versioning.
+  "entry": "index.html",           // REQUIRED. Relative path inside the plugin folder; served over plugin://.
+  "capabilities": ["panel", "metrics.system"], // REQUIRED, may be []. Subset of the closed enum — see below.
+  "rootless": true                 // OPTIONAL, default false. See "Rootless plugins".
+}
+```
+
+**`id` is the identity; `name` is display only** — the exact rule
+`doc/design/content-panes.md` states for workflow blocks and that design
+document's own precedent in `orchestration/workflow.rs` states for blocks
+generally: *n8n keys its graph by a node's display name, so a rename silently
+breaks every reference to it.* Here, `id` is what `pluginId` persists, what
+the `plugin://` origin is keyed by (below), and what "is this plugin still
+installed" is checked against on restore. It is chosen once by the plugin
+author and is not intended to change across the plugin's own versions.
+`name` can be retitled in any release without touching a single persisted
+pane.
+
+**Required fields fail closed.** A manifest missing `id`, `version`,
+`apiVersion`, `entry`, or `capabilities`, or naming an `entry` that resolves
+outside the plugin's own folder, or declaring a capability string outside the
+closed enum, is **rejected** at discovery/install time with a reason — never
+partially accepted, never coerced to a default. This mirrors the workflow
+model's "an unknown `kind` is a hard validation error, never coerced"
+(`orchestration/workflow.rs`): guessing what an invalid declaration *meant*
+is exactly the wrong instinct for a file that is, by definition, untrusted
+input.
+
+**Versioning (`apiVersion`).** `apiVersion` is a small integer, bumped only
+when the broker's method/event contract changes in a way that isn't
+backward-compatible. It is not the plugin's own `version` (that one is the
+author's release number and loomux never inspects it). The broker refuses to
+load a plugin whose `apiVersion` exceeds what the running loomux build
+implements (a newer plugin on an older loomux), and refuses individual
+broker methods that were introduced after a plugin's declared `apiVersion` (a
+plugin correctly declaring an older contract doesn't get offered a newer
+method it never asked for and may not expect). Both refusals are visible to
+the plugin as an error on the broker call, not a silent no-op. The enum below
+plus the method/event set Slice C implements *is* the wire contract for
+`apiVersion: 1`; widening it is a new `apiVersion`, not an edit to this one.
+
+**Rootless plugins.** Most content panes are rooted at a folder the human
+picks (a directory for `files`/`editor`, a repo for `git`). A plugin whose
+subject isn't a filesystem location at all — the bundled resource monitor
+being the motivating case, Slice F — sets `rootless: true` so the install/new
+-pane picker skips asking for a root and skips the `ftRootIsDir`-style
+existence probe on restore entirely. A rootless plugin's `fs.read` capability
+(if declared) is simply unavailable — there is no root to jail reads to, so
+the broker's `fs.read` handler has nothing to serve and the manifest
+combination `rootless: true` + `fs.read` is rejected at validation, not
+silently ignored.
+
+## The capability model
+
+### Why closed, not extensible — the precedent this mirrors exactly
+
+This is not a new pattern for the repo. The workflow-block `kind` field
+(`orchestration/workflow.rs`, `doc/design/workflows.md`, #222) already solved
+this exact problem for a different kind of untrusted input — a workflow YAML
+file a human puts in a repo, that any contributor can edit, that an
+`auto_ops` group runs unattended with nobody approving individual tool calls.
+Its rule, quoted directly because a plugin manifest is the same shape of
+problem:
+
+> **A workflow file can never grant a capability.** `kind` *selects* from the
+> closed enum; there is no `read_only: false` escape hatch, no `allow_write`,
+> no way to spell a fifth capability class.
+
+A plugin manifest is a repo- or human-installed file authored by someone the
+human is choosing to trust *for this one plugin, at this one grant of
+capabilities* — no different in kind from a workflow file being authored by
+"whoever opened a PR against the repo." The same rule applies verbatim:
+**`capabilities` selects from a closed enum; it cannot invent a new one, and
+there is no field anywhere in the manifest or the broker protocol that widens
+what an entry in the enum grants.** If a plugin needs something the enum
+doesn't cover, the enum is wrong and gets a deliberate, reviewed addition —
+never a per-plugin escape hatch.
+
+**Why closed instead of an open/scriptable permission system:** an extensible
+model (arbitrary IPC method names a plugin can request, or a manifest field
+that maps to a raw command name) reduces the review surface to "does this
+one plugin's ask look reasonable" — exactly the reasoning that let 117
+ungated commands accumulate in the first place. A closed enum means the
+question is answered **once, for all plugins, in this file**: the full set
+of things a plugin can ever be capable of is the four rows below, forever,
+until a human deliberately reviews and ships a fifth.
+
+### The v1 enum
+
+| Capability | Grants | Backed by | Notes |
+| --- | --- | --- | --- |
+| `panel` | Render into the pane's content box; receive host→frame `resize` and `theme` events. | Nothing IPC-shaped — host-side DOM/postMessage events only. | Implicit: every plugin gets this merely by existing as a pane. Not declared in the manifest's `capabilities` array (there is nothing to opt into). |
+| `storage` | A namespaced per-plugin key/value store for view state (window position, last-selected tab, etc). | `uistate.rs`, new keys namespaced by `pluginId` so one plugin can never read or overwrite another's storage. | No cross-plugin read. No shared bucket. |
+| `fs.read` | Read files **under the pane's own root only** — path-jailed, no exceptions. | The existing `ft_read_file` command plus `fileedit.rs`'s server-side path choke point, with the pane's root as the jail boundary. | Rejected at manifest-validation time on a `rootless: true` plugin (no root to jail to). No directory listing beyond what `ft_read_file`'s existing surface already permits. |
+| `metrics.system` | Subscribe to a read-only stream of system + per-process resource stats (CPU/RAM), attributed to panes where the backend can do so. | A new `sys_processes`-style command (Slice E), never exposed to a plugin except through this one broker capability. | Curated payload — name, pid, cpu%, rss. No cmdline, no paths, no environment. |
+
+**Deliberately absent from the enum, so unreachable by construction, not by
+policy a plugin could talk its way around:** any filesystem **write**, git,
+`gh`, PTY spawn or write, any orchestration/grant command, network access of
+any kind. The broker (Slice C) has **no handler function** for any of these —
+there is no code path to find a bug in, because there is no code path.
+
+### What a plugin can and cannot do (v1), stated as the threat table
+
+| | Can | Cannot |
+| --- | --- | --- |
+| Rendering | Draw arbitrary DOM/canvas in its own pane box; burn CPU inside its own sandboxed frame. | Read or manipulate the host DOM outside its own frame. |
+| Data | Read files under its own declared root (`fs.read`); persist its own namespaced view state (`storage`); read a read-only system-metrics stream (`metrics.system`). | Write **any** file; read another plugin's storage; read outside its own root; read process command lines/paths beyond name+pid+stats. |
+| System reach | Nothing beyond the three capabilities above. | Call `invoke` or reach any of the ~117 app commands directly; spawn or write to a PTY; touch git or `gh`; mint or read an orchestration/merge grant; steer or inject input into an agent pane. |
+| Network | Nothing. | Phone home, load a remote resource, or otherwise reach the network — enforced by the per-frame CSP (`connect-src 'none'`, see Isolation). |
+
+### Grant is a human decision, made once, at install
+
+The manifest *declares* the capabilities a plugin wants; it does not
+self-grant them. Approving them is the same kind of one-time, human-in-the
+-loop decision installing any extension in any other tool already is — shown
+at install time, not re-asked on every launch. Widening what any single
+capability *means* (e.g. turning `fs.read` into `fs.write`, or adding a new
+capability class entirely) is exactly the kind of change flagged in the
+plan's decision list as needing its own threat review before it ships — this
+note is not pre-approving that expansion, only the four rows above.
+
+## The broker contract
+
+**A plugin never calls `invoke`, and never sees `@tauri-apps/api` or
+`window.__TAURI_INTERNALS__`.** Its only channel to the host is
+`postMessage`, and its only handler on the other end is a **broker** —
+hand-written host-side code with one function per allowed operation, never a
+generic relay onto Tauri's command surface. "Never raw `invoke`" is the
+sentence the whole isolation section (below) exists to make true structurally,
+not just by convention: even if a plugin's sandbox were somehow bypassed,
+the broker itself has no method that forwards to `invoke`, so there is a
+second, independent wall behind the first.
+
+### Envelope shape
+
+Every message crossing the `postMessage` boundary, either direction, is one
+of three envelope shapes, each carrying the `apiVersion` the plugin declared
+so the broker can apply the right method/permission set without a second
+handshake:
+
+```ts
+// plugin -> host, expects a reply
+interface PluginRequest {
+  type: "request";
+  id: string;           // correlates the response; plugin-chosen, opaque to the host
+  apiVersion: number;
+  method: string;       // e.g. "storage.get", "fs.read", "metrics.subscribe"
+  params: unknown;
+}
+
+// host -> plugin, replying to a request
+interface PluginResponse {
+  type: "response";
+  id: string;            // echoes the request's id
+  ok: boolean;
+  result?: unknown;      // present when ok
+  error?: { code: string; message: string }; // present when !ok
+}
+
+// host -> plugin, unsolicited (resize, theme, a metrics tick, …)
+interface PluginEvent {
+  type: "event";
+  event: string;         // e.g. "resize", "theme", "metrics.tick"
+  payload: unknown;
+}
+```
+
+### Per-message capability + version check
+
+Every `PluginRequest` the broker receives is checked, in this order, before
+any handler runs:
+
+1. **Origin check** — `event.source === frame.contentWindow` for a frame the
+   broker itself created, and the message's origin matches that frame's
+   opaque origin. A message from anywhere else is dropped, not answered.
+2. **`apiVersion` check** — the method exists at the plugin's declared
+   `apiVersion`. If not: `error.code = "unsupported-version"`.
+3. **Capability check** — the method's owning capability is in the set the
+   manifest declared **and the human approved at install**. If not:
+   `error.code = "capability-denied"`.
+4. **Params validation** — malformed params (wrong shape, a path escaping
+   the jail root, an unknown method name) get `error.code = "bad-request"`.
+
+Only after all four pass does the broker's hand-written handler for that
+method run and produce `result`. This is the pure decision the plan calls out
+by name — "is method M allowed for granted capabilities C at apiVersion V" —
+and it is implemented once, as a pure function the DOM wiring calls, so the
+rule cannot be quietly re-implemented (or forgotten) at a second call site.
+The same house move as `dirtystate.closeDecision` and `workflowpane.ts`'s
+`paneSurface`/`savePlan`: **the rule lives in one pure place; the view only
+calls it.**
+
+### Error surface
+
+A denied or malformed request always gets a `PluginResponse` with
+`ok: false` and a stable `error.code` (`unsupported-version`,
+`capability-denied`, `bad-request`, or a handler-specific code such as
+`not-found` for `fs.read`) — never a silently dropped message, and never a
+thrown exception that could crash the plugin's frame in a way that looks like
+a host bug rather than a permission boundary. A plugin author debugging
+"why doesn't `fs.read` work" sees `capability-denied` and knows exactly what
+to add to their manifest (and that the human then has to approve it) — the
+error surface is part of the contract, not an implementation detail.
+
+## Isolation
+
+### Recommended model: sandboxed opaque-origin iframe
+
+A plugin's `entry` HTML is rendered inside an `<iframe sandbox="allow-scripts">`
+— **deliberately without `allow-same-origin`** — served from a `plugin://`
+URI scheme (see Install/discovery). Omitting `allow-same-origin` is the whole
+mechanism: it forces the frame onto a **unique opaque origin**, which the
+same-origin policy uses to block the frame from reaching `window.top`'s
+`__TAURI_INTERNALS__`, the host's DOM, or the host's storage — regardless of
+what URL scheme served the frame's content. The frame's only channel out is
+`postMessage`, to a broker that is the only thing listening.
+
+This is the same model VS Code's own webview extensions use (sandboxed
+iframe, `postMessage`, no Node/host access) — a proven pattern at exactly
+this scale (view-level plugin code, not a service), not a novel design being
+tried for the first time here.
+
+### One genuine unknown, and how a flip changes one section, not this whole note
+
+Everything above assumes Tauri does not inject `__TAURI_INTERNALS__` into
+child frames of an opaque origin inside its own WebView2 host — a reasonable
+assumption (it is exactly what the same-origin policy is for), but not yet
+*proven* against this specific Tauri/WebView2 build. That proof is a Phase-0
+spike, running in parallel with this slice (branch `spike/360-sandbox-proof`,
+Slice C's gating step): a throwaway frame that attempts
+`window.top.__TAURI_INTERNALS__.invoke(...)` and `import("@tauri-apps/api")`
+from inside the sandboxed opaque-origin frame, and must fail both.
+
+**This section is written so the spike's outcome only ever edits this one
+section:**
+
+- **If the spike confirms isolation holds** (the expected, recommended
+  outcome): nothing else in this note changes. The broker, the capability
+  enum, the manifest, and the install story are all agnostic to *which*
+  isolation primitive hosts the frame — they only depend on "the plugin's
+  code cannot reach `invoke` and cannot reach the host DOM," which either
+  primitive satisfies.
+- **If the spike finds a leak** (Tauri injects into all frames regardless of
+  origin): the isolation primitive flips to the fallback below. Every other
+  section of this note — manifest, capability enum, broker envelope,
+  install/discovery — is unchanged, because none of them names the iframe
+  specifically; they name "the plugin's sandboxed frame," which the fallback
+  still provides.
+
+### Fallback: child `WebviewWindow` with scoped capabilities
+
+If the spike shows the opaque-origin iframe cannot be trusted in this
+WebView2 build, each plugin instead gets its own Tauri `WebviewWindow`,
+positioned and sized to overlay the pane's content box, with its **Tauri
+capability set scoped to grant nothing** (no app commands, no plugin
+permissions beyond what rendering needs). The broker, envelope shape,
+capability enum, and per-message checks above are unchanged — only the
+transport between "plugin code" and "the broker's `postMessage` listener"
+changes from an iframe boundary to a separate-webview boundary. This is
+heavier (a real OS-level window per plugin pane, its own lifecycle to manage
+inside a pane box that can split/dock/drag) and is why it is the fallback
+and not the plan of record — but it is a real, available option specifically
+*because* the broker contract above was designed not to assume which
+primitive hosts it.
+
+Two more options were weighed and rejected outright, not gated on the spike:
+a separate OS process per plugin (right isolation, wrong scale — plugins are
+view code, not services) and no isolation at all / manual review (the exact
+thing this whole note exists to refuse — every one of the ~117 commands
+reachable, including a merge grant).
+
+## Install / discovery
+
+- **Install location:** `<app-data>/loomux/plugins/<id>/`, one folder per
+  plugin, scanned on boot. A folder is a plugin if it contains a `plugin.json`
+  that passes manifest validation; a folder that doesn't is skipped, not
+  treated as an error that blocks discovery of the others (the same
+  "one bad entry doesn't take down the rest" posture the workflow model's
+  audited-and-skipped failure policy uses).
+- **Install action:** an in-app **Install plugin…** picker that copies a
+  chosen folder into the plugins directory. "Install" means exactly that copy
+  — there is no build step, no compilation, no fetch from anywhere. A source
+  folder whose manifest fails validation is rejected with the specific
+  reason (missing field, unknown capability, bad `apiVersion`, an `entry`
+  that resolves outside the folder); nothing is copied on a rejection. A
+  source that would itself try to escape the plugins directory (a manifest
+  or path crafted to write outside `<id>/`) is refused the same way
+  `fileedit.rs`'s path choke point refuses any other traversal attempt.
+- **The `plugin://` scheme:** each installed plugin is served from
+  `plugin://<id>/...`, resolving strictly inside that plugin's own folder —
+  the same server-side path-validation discipline the rest of the app already
+  applies to file access (canonicalize, reject anything that escapes). This
+  is also what gives each plugin its own opaque origin under the iframe model
+  above: two plugins never share an origin, so `storage` and any future
+  origin-scoped browser API can never bleed between them.
+- **No remote marketplace in v1.** Discovery is local-folder-scan only; there
+  is no in-app browse/search/download of plugins from anywhere. Getting a
+  plugin onto the machine is entirely the human's own act (copy a folder,
+  or use the picker to copy one in) — nothing in loomux fetches plugin code
+  from the network on its own.
+
+## v1 non-goals (verbatim from the plan)
+
+Copied here so this note stays the single place both the scope and its edges
+are stated, without drifting from what was actually agreed:
+
+> Remote plugin **marketplace/registry** and in-app browse/download; plugin
+> **auto-update**; **signed/notarized** plugins; plugins that **write** files
+> or reach **git/gh/PTY/orchestration/grant** commands (the capability enum
+> simply omits them); **plugin-to-plugin** messaging; plugins contributing
+> **non-pane UI** (menu items, toolbar buttons, command palette, keybindings);
+> **production hot-reload** (dev-mode reload only); **mac/Linux packaging** of
+> the install/asset story (design for portability, build and validate
+> Windows). Each is a deliberate follow-up, not an oversight — v1 proves the
+> sandbox + capability contract with one real consumer.
+
+## What later slices owe this note
+
+- **Slice B** (backend host) implements manifest parsing/validation and the
+  `plugin://` scheme exactly as specified above — reject-with-reason on any
+  manifest violation, path-traversal-proof by construction, never a partial
+  accept.
+- **Slice C** (the broker, the trust core) runs the Phase-0 spike first;
+  implements the envelope shapes and the four-step per-message check as one
+  pure function plus DOM wiring around it; forwards nothing to `invoke`,
+  ever.
+- **Slice D** (the `"plugin"` kind) adds exactly one member to each closed
+  union this note describes as inheriting the content-pane mechanism, adds
+  `pluginId` to `PersistedPane`, and implements the restore fail-soft
+  behavior this note assumes: a pane naming a `pluginId` that is no longer
+  installed fails soft to the welcome form with a toast, in that one slot,
+  the same way an uninstalled git repo already does — it does not throw, and
+  it does not silently drop the pane from the layout on the next save.
+- **Slice E** (metrics) exposes `sys_processes`-shaped data **only** through
+  the `metrics.system` broker handler — never as a command a plugin (or any
+  other webview script) could `invoke` directly.
+- **Slice F** (the example plugin) and **Slice G** (template/SDK) are the
+  first real consumers of the contract above; if either needs a capability,
+  method, or event this note doesn't already grant, that is this note being
+  wrong, not a shortcut to take silently — it comes back here for a
+  reviewed addition.
