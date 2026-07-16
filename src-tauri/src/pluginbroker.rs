@@ -298,14 +298,17 @@ fn wire_err_from_fileedit(e: String) -> PluginErrorWire {
     }
 }
 
-/// `metrics.system` capability: gated here, served by Slice E's
+/// `metrics.system` capability: gated here, served by `procmetrics`'s
 /// `sys_processes`-shaped backend (design note — "never exposed to a plugin
-/// except through this one broker capability"). Slice E hasn't landed yet;
-/// the capability check above is real, the data handler is not.
+/// except through this one broker capability"). `metrics.subscribe`/
+/// `metrics.unsubscribe` are the only methods `method_spec` maps to this
+/// capability, so this fallback should be unreachable in practice — it exists
+/// as a defensive default should the method table ever widen without this
+/// match arm being updated to match.
 fn metrics_not_implemented(method: &str) -> PluginErrorWire {
     PluginErrorWire {
         code: "not-implemented".into(),
-        message: format!("`{method}` awaits Slice E's metrics backend"),
+        message: format!("`{method}` has no handler wired for the metrics.system capability"),
     }
 }
 
@@ -435,11 +438,11 @@ pub fn plugin_broker_request(
             result: None,
             error: Some(e),
         },
-        Ok(cap) => dispatch(&session, cap, &request),
+        Ok(cap) => dispatch(&label, &session, cap, &request),
     }
 }
 
-fn dispatch(session: &PluginSession, cap: Capability, req: &PluginRequestWire) -> PluginResponseWire {
+fn dispatch(label: &str, session: &PluginSession, cap: Capability, req: &PluginRequestWire) -> PluginResponseWire {
     let storage_dir = crate::uistate::plugin_storage_dir();
     let result = match (cap, req.method.as_str()) {
         (Capability::Storage, "storage.get") => storage_get(&storage_dir, &session.plugin_id, &req.params),
@@ -451,6 +454,10 @@ fn dispatch(session: &PluginSession, cap: Capability, req: &PluginRequestWire) -
                 message: "plugin has no fs root (rootless plugin)".into(),
             }),
         },
+        (Capability::MetricsSystem, "metrics.subscribe") => {
+            crate::procmetrics::subscribe(label, &req.params)
+        }
+        (Capability::MetricsSystem, "metrics.unsubscribe") => crate::procmetrics::unsubscribe(label),
         (Capability::MetricsSystem, method) => Err(metrics_not_implemented(method)),
         _ => Err(bad_request("method/capability mismatch")),
     };
@@ -680,6 +687,56 @@ mod tests {
         let r = req("storage.get", 1, Value::Null);
         let err = check_request(&granted, 0, &r).unwrap_err();
         assert_eq!(err.code, "unsupported-version");
+    }
+
+    #[test]
+    fn check_request_denies_metrics_subscribe_without_capability() {
+        // #360 Slice E: confirms wiring in the real data handler did not
+        // weaken Slice C's gate — a session that never granted
+        // `metrics.system` must still be denied `metrics.subscribe`.
+        let granted = vec![Capability::Storage, Capability::FsRead];
+        let r = req("metrics.subscribe", 1, Value::Null);
+        let err = check_request(&granted, 1, &r).unwrap_err();
+        assert_eq!(err.code, "capability-denied");
+    }
+
+    #[test]
+    fn check_request_denies_metrics_unsubscribe_without_capability() {
+        let granted: Vec<Capability> = vec![];
+        let r = req("metrics.unsubscribe", 1, Value::Null);
+        let err = check_request(&granted, 1, &r).unwrap_err();
+        assert_eq!(err.code, "capability-denied");
+    }
+
+    #[test]
+    fn dispatch_metrics_subscribe_is_wired_to_real_data_not_a_stub() {
+        // Before #360 Slice E, this match arm returned `not-implemented`
+        // unconditionally, even for a session that legitimately holds
+        // `metrics.system`. This is the red-before-green for the wiring: on
+        // the pre-Slice-E stub this asserts `resp.ok == false` with code
+        // `not-implemented`; after wiring in `procmetrics`, a granted session
+        // gets a real ack instead.
+        let session = PluginSession {
+            plugin_id: "demo".into(),
+            root: None,
+            granted: vec![Capability::MetricsSystem],
+            api_version: 1,
+        };
+        let label = "test-dispatch-metrics-subscribe";
+
+        let sub = req("metrics.subscribe", 1, Value::Null);
+        let resp = dispatch(label, &session, Capability::MetricsSystem, &sub);
+        assert!(
+            resp.ok,
+            "expected metrics.subscribe to succeed for a granted session, got {:?}",
+            resp.error
+        );
+        assert!(resp.error.is_none());
+
+        // Clean up the background poll thread `subscribe` starts.
+        let unsub = req("metrics.unsubscribe", 1, Value::Null);
+        let resp2 = dispatch(label, &session, Capability::MetricsSystem, &unsub);
+        assert!(resp2.ok);
     }
 
     #[test]
