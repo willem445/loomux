@@ -332,9 +332,10 @@ agent's state, and running session cost with a group total. From here you can:
   header, for reclaiming screen space.
 - **Workflow row** — when the repo has a [custom agent workflow](#custom-agent-workflows)
   active, this panel names it, lists its roster, and shows the armed merge gate
-  in one line (e.g. "loomux · 6 blocks · merges to main require: rev-orch +
-  rev-ui + rev-tests · all-pass · ci-green") — so you know whether an Approve
-  can actually succeed before you click it, not after it bounces. If the gate
+  in one line (e.g. "loomux · 6 blocks · merges to the default branch require:
+  rev-orch + rev-ui + rev-tests · all-pass · ci-green") — so you know whether
+  an Approve can actually succeed before you click it, not after it bounces.
+  If the gate
   names reviewers the current roster can't spawn, the row warns loudly instead.
 - **Advanced-orchestrator toggle** — flip a repo's custom workflow on or off
   live, no relaunch: the merge gate and the roster for future spawns update

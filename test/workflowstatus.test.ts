@@ -11,7 +11,6 @@ import assert from "node:assert/strict";
 import {
   approveWillMerge,
   gateExitsMessage,
-  gateReviewers,
   gateSatisfiabilityWarning,
   gateSummaryLine,
   workflowModeLabel,
@@ -54,13 +53,16 @@ test("gateSummaryLine: no gate armed is null, not an empty sentence", () => {
 test("gateSummaryLine: reviewers + all-pass + also-conditions, in the demo's own wording", () => {
   assert.equal(
     gateSummaryLine(status()),
-    "merges to main require: rev-orch + rev-ui + rev-tests · all-pass · ci-green"
+    "merges to the default branch require: rev-orch + rev-ui + rev-tests · all-pass · ci-green"
   );
 });
 
 test("gateSummaryLine: a threshold requirement reads as a pass count, not the raw wire string", () => {
   const line = gateSummaryLine(status({ gate: gate({ require: "threshold 2", also: [] }) }));
-  assert.equal(line, "merges to main require: rev-orch + rev-ui + rev-tests · at least 2 pass");
+  assert.equal(
+    line,
+    "merges to the default branch require: rev-orch + rev-ui + rev-tests · at least 2 pass"
+  );
 });
 
 test("gateSatisfiabilityWarning: satisfiable gate is quiet", () => {
@@ -113,12 +115,4 @@ test("approveWillMerge: an unsatisfiable gate gets its own distinct reason, not 
   const result = approveWillMerge(s, { pr: "42" });
   assert.equal(result.ok, false);
   assert.match(result.reason ?? "", /gate unsatisfiable from this session/);
-});
-
-test("gateReviewers: empty when no gate is armed", () => {
-  assert.deepEqual(gateReviewers(status({ gate: null })), []);
-});
-
-test("gateReviewers: the gate's full named list, satisfiable or not", () => {
-  assert.deepEqual(gateReviewers(status()), ["rev-orch", "rev-ui", "rev-tests"]);
 });

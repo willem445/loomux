@@ -25,14 +25,16 @@ const requireLabel = (require: string): string => {
   return m ? `at least ${m[1]} pass` : require;
 };
 
-/** "merges to main require: rev-orch + rev-ui + rev-tests · all-pass ·
- *  ci-green" — `null` when no gate is armed, so a caller can omit the row
- *  entirely rather than render an empty sentence. */
+/** "merges to the default branch require: rev-orch + rev-ui + rev-tests ·
+ *  all-pass · ci-green" — `null` when no gate is armed, so a caller can omit
+ *  the row entirely rather than render an empty sentence. "Default branch",
+ *  not "main": loomux is a generic tool and repos may default to
+ *  master/trunk (CLAUDE.md hard constraint 8). */
 export function gateSummaryLine(status: WorkflowStatus): string | null {
   const gate = status.gate;
   if (!gate) return null;
   const clauses = [gate.reviewers.join(" + "), requireLabel(gate.require), ...gate.also];
-  return `merges to main require: ${clauses.join(" · ")}`;
+  return `merges to the default branch require: ${clauses.join(" · ")}`;
 }
 
 /** The loud warning for a gate this session cannot satisfy (#316's
@@ -75,14 +77,6 @@ export function approveWillMerge(
     return { ok: false, reason: "gate unsatisfiable from this session — merges will bounce" };
   }
   return { ok: false, reason: `won't merge — gate needs ${gate.reviewers.join("/")}` };
-}
-
-/** Every reviewer block id the gate is still waiting on, for a compact
- *  "waiting on: rev-ui, rev-tests" chip. Distinct from `missing_blocks`
- *  (satisfiability — blocks the roster can't even spawn): this is every
- *  named reviewer, satisfiable or not. `[]` when there's no gate. */
-export function gateReviewers(status: WorkflowStatus): string[] {
-  return status.gate?.reviewers ?? [];
 }
 
 export type { WorkflowGateStatus, WorkflowStatus };
