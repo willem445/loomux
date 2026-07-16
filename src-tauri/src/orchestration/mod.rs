@@ -3152,6 +3152,12 @@ pub struct Caller {
     pub agent_id: String,
     pub group: String,
     pub role: Role,
+    /// The spawning block's `role_hint` (#250/#324) — `advisor` | `process` |
+    /// `None`. Inert everywhere except `session_digest`'s dispatch gate (the
+    /// slice D binding rider tightening slice B's interim worker-wide gate
+    /// to `role_hint == process`); every other capability check keys off
+    /// `role` alone, per the closure argument `role_hint` was built on.
+    pub role_hint: Option<String>,
 }
 
 /// A workflow block's persona, compiled down to what each agent CLI can
@@ -10421,12 +10427,20 @@ impl OrchRegistry {
 
     pub fn resolve_token(&self, token: &str) -> Option<Caller> {
         let id = self.by_token.lock_safe().get(token).cloned()?;
-        let agents = self.agents.lock_safe();
-        let a = agents.get(&id)?;
-        if a.status == AgentStatus::Dead {
-            return None;
-        }
-        Some(Caller { agent_id: a.id.clone(), group: a.group.clone(), role: a.role })
+        let a = {
+            let agents = self.agents.lock_safe();
+            let a = agents.get(&id)?;
+            if a.status == AgentStatus::Dead {
+                return None;
+            }
+            a.clone()
+        };
+        // Dropped the `agents` lock before taking `groups` — resolving the
+        // spawning block's role_hint needs both, and locking them together
+        // would pin a lock order no other call site promises to respect.
+        let role_hint = self.group(&a.group)
+            .and_then(|g| g.guardrails.block(&a.block).and_then(|b| b.role_hint.clone()));
+        Some(Caller { agent_id: a.id, group: a.group, role: a.role, role_hint })
     }
 
     pub fn agent(&self, id: &str) -> Option<AgentEntry> {

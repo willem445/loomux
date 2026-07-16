@@ -3632,6 +3632,45 @@ fn closing_a_completed_planner_is_idempotent() {
 }
 
 #[test]
+fn advisor_hinted_planner_auto_closes_on_report_done() {
+    // #250/#324 slice D: the advisor is planner-kind (#203's "one plan → one
+    // report → exit" contract), and role_hint is capability-inert — so
+    // `close_completed_planner`'s role gate (keyed on `Role::Planner` alone,
+    // never on block id or role_hint) already covers an advisor-hinted block
+    // for free. This pins that claim directly: no idle pane, no standing
+    // consult process, exactly the #203 precedent the plan cites.
+    let (reg, _d) = test_registry();
+    let mut g_rails = rails();
+    g_rails.blocks.push(workflow::Block {
+        id: "advisor".into(),
+        name: "advisor".into(),
+        kind: Role::Planner,
+        cli: String::new(),
+        model: String::new(),
+        prompt: None,
+        profile: None,
+        allow: vec![],
+        role_hint: Some("advisor".into()),
+    });
+    let g = reg.create_group("C:/tmp/repo", g_rails).unwrap();
+    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let advisor = reg
+        .spawn_agent_ex(&g.id, Role::Planner, Some("advisor".into()), "adv",
+                        "is the worker stuck on X or Y?", false, None, None, None, None, None)
+        .unwrap();
+    reg.pause_group(&g.id).unwrap();
+    let ca = reg.resolve_token(&advisor.token).unwrap();
+
+    let r = dispatch(&reg, &ca, "tools/call",
+        &json!({ "name": "report", "arguments": { "status": "done", "summary": "go with X" } })).unwrap();
+    assert_eq!(r["isError"], false, "the advisor's done report must succeed");
+
+    let dead = reg.list_agents(&g.id).as_array().unwrap().iter()
+        .any(|a| a["id"] == json!(advisor.id) && a["status"] == json!("dead"));
+    assert!(dead, "an advisor-hinted block's done report must auto-close its pane, same as any planner (#203)");
+}
+
+#[test]
 fn spawn_cap_rejection_lists_the_delegate_roster() {
     // #203: when spawn is refused at the delegate cap, the guardrail message
     // must name who holds the slots (id, role, idle vs working) so the
@@ -5620,6 +5659,68 @@ fn gh_shim_shell_harness_executes_the_gate() {
 }
 
 #[test]
+fn gh_shim_allows_pr_create_and_blocks_merge_for_the_process_pane() {
+    // #250/#324 slice D item 2: the process-pro is worker-kind, so it gets
+    // the exact same PATH-injected gh/git shim as any worker — role_hint is
+    // capability-inert (the closure proof lives in
+    // `role_hint_grants_no_capability_to_its_block`, workflow.rs), and the
+    // shim script itself has no concept of role_hint at all. This pins the
+    // specific claim the plan's demo depends on: the process-pro's `gh pr
+    // create` passes through untouched, and `gh pr merge` on the default
+    // branch is refused absent a human grant/marker — exactly like any other
+    // worker pane. The process-pro proposes, it never disposes.
+    use std::process::Command;
+    if Command::new("sh").arg("-c").arg("exit 0").status().map(|s| !s.success()).unwrap_or(true) {
+        eprintln!("SKIP gh_shim_allows_pr_create_and_blocks_merge_for_the_process_pane: no POSIX sh available");
+        return;
+    }
+    let td = tempfile::tempdir().unwrap();
+    let root = td.path();
+    let group_dir = root.join("group");
+    std::fs::create_dir_all(&group_dir).unwrap();
+    let log = root.join("fake_gh.log");
+
+    let fake = root.join("fakegh");
+    std::fs::write(&fake, format!(
+        "#!/bin/sh\n\
+         echo \"ARGS: $*\" >> \"{log}\"\n\
+         if [ \"$1\" = \"pr\" ] && [ \"$2\" = \"view\" ]; then printf '%s\\n' \"$FAKE_BASE\"; exit 0; fi\n\
+         if [ \"$1\" = \"repo\" ] && [ \"$2\" = \"view\" ]; then printf '%s\\n' \"$FAKE_DEFAULT\"; exit 0; fi\n\
+         printf 'FAKE-GH-RAN\\n'; exit 0\n",
+        log = log.display()
+    )).unwrap();
+    let shim = root.join("gh");
+    std::fs::write(&shim, gh_shim_sh(&fake.display().to_string())).unwrap();
+    let _ = Command::new("sh").arg("-c")
+        .arg(format!("chmod +x '{}' '{}'", fake.display(), shim.display())).status();
+
+    let run = |argv: &[&str]| -> (bool, String) {
+        let out = Command::new("sh")
+            .arg(&shim)
+            .args(argv)
+            .env("LOOMUX_GROUP_DIR", &group_dir)
+            .env("FAKE_BASE", "main")
+            .env("FAKE_DEFAULT", "main")
+            .output()
+            .expect("run shim");
+        (out.status.success(), String::from_utf8_lossy(&out.stderr).into_owned())
+    };
+
+    // No autonomous/auto_merge markers, no grant: the process-pro's own PR
+    // still passes create untouched...
+    let (ok, _e) = run(&["pr", "create", "--title", "propose a lesson", "--body", "x"]);
+    assert!(ok, "gh pr create must pass through the shim");
+    let logged = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(logged.contains("pr create"), "the real gh must have run pr create, log: {logged}");
+
+    // ...but a merge onto the default branch is refused, exactly the human
+    // gate every other worker's PR rides.
+    let (ok, err) = run(&["pr", "merge", "1"]);
+    assert!(!ok, "gh pr merge on the default branch must be refused for the process pane");
+    assert!(err.contains("human gate"), "refusal must explain why, got: {err}");
+}
+
+#[test]
 fn gh_shim_script_gates_raw_api_release_shapes() {
     // #196: the raw `gh api`/graphql release surface must route through the SAME
     // single release-gate decision as `gh release …` — pinned in the shim text.
@@ -7030,20 +7131,48 @@ fn mark_dead_captures_usage_from_transcript() {
     assert_eq!(usage["lifetime_cost_basis"], "estimated");
 }
 
-// ---------- session_digest (#250/#324 slice B) ----------
+// ---------- session_digest (#250/#324 slice B, gate tightened in slice D) ----------
 //
-// The `role_hint == process` gate the plan names is slice A's field
-// (`Block.role_hint`), landing in parallel — not yet on this branch. These
-// tests exercise the interim gate this slice actually ships: worker-kind
-// callers only (read-only tool, so this coarse exposure is deliberate and
-// documented — see the `tool_defs`/`call_tool` comments on `session_digest`).
+// Slice B shipped an interim worker-kind-wide gate (role_hint hadn't landed
+// yet). Slice D's binding rider tightens it to `role_hint == process` — these
+// tests spawn their process-pro caller against a declared `process`-hinted
+// block via `process_caller`/`rails_with_process_block`, not a plain worker.
+
+/// The default 4-block roster plus one extra `proc` block, `kind: worker`
+/// with `role_hint: process` — the process-pro's own identity, distinct from
+/// the plain `worker` block. Mirrors how `rails()` builds the default roster.
+fn rails_with_process_block() -> Guardrails {
+    let mut g = rails();
+    g.blocks.push(workflow::Block {
+        id: "proc".into(),
+        name: "process-pro".into(),
+        kind: Role::Worker,
+        cli: String::new(),
+        model: String::new(),
+        prompt: None,
+        profile: None,
+        allow: vec![],
+        role_hint: Some("process".into()),
+    });
+    g
+}
+
+/// Spawn an agent against the `proc` (`role_hint: process`) block declared by
+/// [`rails_with_process_block`] and return its MCP caller.
+fn process_caller(reg: &OrchRegistry, group: &str) -> Caller {
+    let a = reg
+        .spawn_agent_ex(group, Role::Worker, Some("proc".into()), "proc", "",
+                        false, None, None, None, None, None)
+        .unwrap();
+    reg.resolve_token(&a.token).unwrap()
+}
 
 #[test]
 fn session_digest_returns_friction_windows_for_a_finished_worker() {
     let proj = tempfile::tempdir().unwrap();
     let (reg, _d) = test_registry();
     reg.set_claude_projects_dir(proj.path().to_path_buf());
-    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let g = reg.create_group("C:/tmp/repo", rails_with_process_block()).unwrap();
     let worker = reg.spawn_agent(&g.id, Role::Worker, "w", "fix the flaky test", false, None).unwrap();
     let sid = worker.session_id.clone().unwrap();
 
@@ -7064,13 +7193,20 @@ fn session_digest_returns_friction_windows_for_a_finished_worker() {
     );
     fs::write(encoded.join(format!("{sid}.jsonl")), transcript).unwrap();
 
-    // A separate worker plays the process-pro reading it cold, after the
-    // worker that did the work is reaped — mirroring "spawned at merge-gate
-    // resolution" (#324): session_digest must still find a dead agent's
-    // recorded session, not just a live one.
-    let proc = reg.spawn_agent(&g.id, Role::Worker, "proc", "", false, None).unwrap();
-    let cp = reg.resolve_token(&proc.token).unwrap();
+    // A separate process-hinted worker plays the process-pro reading it cold,
+    // after the worker that did the work is reaped — mirroring "spawned at
+    // merge-gate resolution" (#324): session_digest must still find a dead
+    // agent's recorded session, not just a live one.
+    let cp = process_caller(&reg, &g.id);
     reg.mark_dead(&worker.id, Some(0));
+
+    // The listing agrees with the dispatch gate: a process-hinted worker DOES
+    // see the tool (the plain-worker negative case is pinned separately by
+    // `session_digest_denied_to_a_plain_worker_without_the_process_hint`).
+    let tools = dispatch(&reg, &cp, "tools/list", &json!({})).unwrap();
+    let names: Vec<&str> =
+        tools["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+    assert!(names.contains(&"session_digest"), "a process-hinted worker must see the tool: {names:?}");
 
     let r = dispatch(&reg, &cp, "tools/call",
         &json!({ "name": "session_digest", "arguments": { "agent": worker.id } })).unwrap();
@@ -7090,7 +7226,7 @@ fn session_digest_resolves_via_task_id_and_via_pr_number() {
     let proj = tempfile::tempdir().unwrap();
     let (reg, _d) = test_registry();
     reg.set_claude_projects_dir(proj.path().to_path_buf());
-    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let g = reg.create_group("C:/tmp/repo", rails_with_process_block()).unwrap();
     let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
     let co = reg.resolve_token(&orch.token).unwrap();
     let worker = reg.spawn_agent(&g.id, Role::Worker, "w", "fix the flaky test", false, None).unwrap();
@@ -7120,8 +7256,7 @@ fn session_digest_resolves_via_task_id_and_via_pr_number() {
     assert_eq!(up["isError"], false, "{up}");
     let task_id = reg.task_summaries(&g.id)[0].id.clone();
 
-    let proc = reg.spawn_agent(&g.id, Role::Worker, "proc", "", false, None).unwrap();
-    let cp = reg.resolve_token(&proc.token).unwrap();
+    let cp = process_caller(&reg, &g.id);
 
     let by_task = dispatch(&reg, &cp, "tools/call",
         &json!({ "name": "session_digest", "arguments": { "task": task_id } })).unwrap();
@@ -7155,13 +7290,33 @@ fn session_digest_denied_to_non_worker_roles() {
 }
 
 #[test]
+fn session_digest_denied_to_a_plain_worker_without_the_process_hint() {
+    // The slice D binding rider: slice B's interim gate was worker-kind-wide;
+    // this tightens it to `role_hint == process` now that role_hint (slice A)
+    // has landed on this branch. A plain `worker` block — no hint — is a
+    // worker like any other, and must be refused exactly like a
+    // reviewer/planner/orchestrator, not waved through on kind alone.
+    let (reg, _d, _co, cw) = setup_mcp();
+    let r = dispatch(&reg, &cw, "tools/call",
+        &json!({ "name": "session_digest", "arguments": { "agent": "whatever" } })).unwrap();
+    assert_eq!(r["isError"], true, "a plain worker with no role_hint must be denied session_digest");
+    let text = r["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("process"), "the refusal should name the required hint: {text}");
+    // The listing agrees with the dispatch gate: a plain worker never even
+    // sees the tool (cosmetic, but must not disagree with the real check).
+    let tools = dispatch(&reg, &cw, "tools/list", &json!({})).unwrap();
+    let names: Vec<&str> =
+        tools["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+    assert!(!names.contains(&"session_digest"), "a plain worker must not even see the tool: {names:?}");
+}
+
+#[test]
 fn session_digest_cross_group_agent_is_unknown_not_leaked() {
     let (reg, _d) = test_registry();
-    let g1 = reg.create_group("C:/tmp/repo1", rails()).unwrap();
+    let g1 = reg.create_group("C:/tmp/repo1", rails_with_process_block()).unwrap();
     let g2 = reg.create_group("C:/tmp/repo2", rails()).unwrap();
-    let w1 = reg.spawn_agent(&g1.id, Role::Worker, "w", "task", false, None).unwrap();
     let w2 = reg.spawn_agent(&g2.id, Role::Worker, "w", "task", false, None).unwrap();
-    let c1 = reg.resolve_token(&w1.token).unwrap();
+    let c1 = process_caller(&reg, &g1.id);
 
     let r = dispatch(&reg, &c1, "tools/call",
         &json!({ "name": "session_digest", "arguments": { "agent": w2.id.clone() } })).unwrap();
@@ -7173,13 +7328,15 @@ fn session_digest_cross_group_agent_is_unknown_not_leaked() {
 
 #[test]
 fn session_digest_requires_exactly_one_identifier() {
-    let (reg, _d, _co, cw) = setup_mcp();
-    let none = dispatch(&reg, &cw, "tools/call",
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails_with_process_block()).unwrap();
+    let cp = process_caller(&reg, &g.id);
+    let none = dispatch(&reg, &cp, "tools/call",
         &json!({ "name": "session_digest", "arguments": {} })).unwrap();
     assert_eq!(none["isError"], true);
     assert!(none["content"][0]["text"].as_str().unwrap().contains("exactly one"));
 
-    let both = dispatch(&reg, &cw, "tools/call",
+    let both = dispatch(&reg, &cp, "tools/call",
         &json!({ "name": "session_digest", "arguments": { "agent": "w-1", "pr": "1" } })).unwrap();
     assert_eq!(both["isError"], true);
     assert!(both["content"][0]["text"].as_str().unwrap().contains("exactly one"));
@@ -7192,7 +7349,7 @@ fn session_digest_requires_exactly_one_identifier() {
 #[test]
 fn session_digest_rejects_a_path_traversal_session_id() {
     let (reg, _d) = test_registry();
-    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let g = reg.create_group("C:/tmp/repo", rails_with_process_block()).unwrap();
     let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
     let co = reg.resolve_token(&orch.token).unwrap();
     let worker = reg.spawn_agent(&g.id, Role::Worker, "w", "task", false, None).unwrap();
@@ -7204,8 +7361,7 @@ fn session_digest_rejects_a_path_traversal_session_id() {
     assert_eq!(up["isError"], false, "{up}");
     let task_id = reg.task_summaries(&g.id)[0].id.clone();
 
-    let proc = reg.spawn_agent(&g.id, Role::Worker, "proc", "", false, None).unwrap();
-    let cp = reg.resolve_token(&proc.token).unwrap();
+    let cp = process_caller(&reg, &g.id);
     let r = dispatch(&reg, &cp, "tools/call",
         &json!({ "name": "session_digest", "arguments": { "task": task_id } })).unwrap();
     assert_eq!(r["isError"], true);
