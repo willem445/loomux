@@ -13,7 +13,9 @@
 //! silent coercion, and asset serving never resolves outside a plugin's own
 //! folder.
 
-use loomux_lib::plugins::{discover_installed, install_plugin_from, parse_manifest, resolve_plugin_asset};
+use loomux_lib::plugins::{
+    build_asset_response, discover_installed, install_plugin_from, parse_manifest, resolve_plugin_asset, PLUGIN_CSP,
+};
 use std::fs;
 use std::path::Path;
 
@@ -184,6 +186,36 @@ fn malformed_json_is_rejected_not_panicking() {
     assert_eq!(err_code(&e), "invalid-json", "got: {e}");
 }
 
+#[test]
+fn oversized_manifest_string_fields_are_rejected() {
+    // rev-60 finding C: an abusive manifest can't carry unbounded strings.
+    let base = serde_json::json!({
+        "id": "p",
+        "name": "P",
+        "version": "1.0.0",
+        "apiVersion": 1,
+        "entry": "index.html",
+        "capabilities": [],
+    });
+    let oversized: Vec<(&str, String)> = vec![
+        ("id", "a".repeat(129)),
+        ("name", "a".repeat(201)),
+        ("version", "a".repeat(65)),
+        ("entry", format!("{}.html", "a".repeat(512))),
+    ];
+    for (field, value) in oversized {
+        let mut v = base.as_object().unwrap().clone();
+        v.insert(field.to_string(), serde_json::Value::String(value));
+        let raw = serde_json::Value::Object(v).to_string();
+        let e = parse_manifest(&raw).unwrap_err();
+        assert_eq!(
+            err_code(&e),
+            "invalid-manifest",
+            "an oversized `{field}` should fail closed, got: {e}"
+        );
+    }
+}
+
 // ---------- discovery ----------
 
 #[test]
@@ -240,6 +272,57 @@ fn discovery_on_missing_directory_returns_empty_not_error() {
     let root = tempfile::tempdir().unwrap();
     let missing = root.path().join("does-not-exist");
     assert!(discover_installed(&missing).is_empty());
+}
+
+// ---------- CSP — the network-egress-denial contract (rev-60 finding A) ----------
+
+#[test]
+fn plugin_csp_denies_network_egress_and_further_embedding_and_navigation() {
+    // Pins the exact directives the design note's "Content-Security-Policy on
+    // plugin content" section requires, plus the reviewer-requested hardening
+    // (form-action/base-uri) — so a future edit that loosens any one of them
+    // (e.g. `connect-src 'none'` -> `connect-src *`) fails this test directly,
+    // not just "the response still has *a* CSP header".
+    for directive in [
+        "connect-src 'none'",
+        "frame-src 'none'",
+        "object-src 'none'",
+        "form-action 'none'",
+        "base-uri 'none'",
+    ] {
+        assert!(
+            PLUGIN_CSP.contains(directive),
+            "PLUGIN_CSP must contain `{directive}`, got: {PLUGIN_CSP}"
+        );
+    }
+}
+
+#[test]
+fn every_plugin_response_carries_the_csp_header_on_success_and_on_error() {
+    // rev-60 finding A: nothing pinned that plugin_protocol_handler/
+    // build_asset_response actually attach PLUGIN_CSP on every branch — a
+    // future refactor could drop it on just the success (or just the error)
+    // path with no red test to catch it.
+    let root = tempfile::tempdir().unwrap();
+    write_plugin_folder(
+        root.path(),
+        "widget",
+        &manifest_json("widget", "index.html", 1, &[], false),
+        &[("index.html", "<h1>widget</h1>")],
+    );
+
+    let ok = build_asset_response(root.path(), "/widget/index.html");
+    assert_eq!(ok.status, 200);
+    assert_eq!(ok.csp, PLUGIN_CSP, "a successful asset response must still carry the CSP");
+    assert_eq!(ok.body, b"<h1>widget</h1>");
+
+    let missing = build_asset_response(root.path(), "/nope/index.html");
+    assert_eq!(missing.status, 404);
+    assert_eq!(
+        missing.csp, PLUGIN_CSP,
+        "an error response (404) must carry the CSP just as much as a success — omitting it \
+         on any branch silently falsifies the 'cannot phone home' guarantee"
+    );
 }
 
 // ---------- plugin:// asset resolution — the traversal-rejection contract ----------

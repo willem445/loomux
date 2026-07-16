@@ -52,10 +52,26 @@ pub const ALLOWED_CAPABILITIES: &[&str] = &["panel", "storage", "fs.read", "metr
 /// Served on every `plugin://` response (`doc/design/pane-plugins.md`
 /// "Content-Security-Policy on plugin content"): no network egress
 /// whatsoever, assets limited to the plugin's own bundle, no further
-/// frame/object embedding.
+/// frame/object embedding. `form-action`/`base-uri` are reviewer-requested
+/// hardening beyond the design note's "at minimum" floor: `sandbox` tokens
+/// alone don't stop a form submission or a `<base>`-tag rewrite of relative
+/// URLs, so both are pinned closed here too, on the served-content side of
+/// the guarantee (Slice C's `sandbox` attribute is the other, independent
+/// half — see the module doc comment).
 pub const PLUGIN_CSP: &str = "default-src 'self' plugin:; script-src 'self' plugin:; \
      img-src 'self' plugin:; style-src 'self' plugin:; connect-src 'none'; \
-     frame-src 'none'; object-src 'none'";
+     frame-src 'none'; object-src 'none'; form-action 'none'; base-uri 'none'";
+
+/// Length caps on untrusted manifest string fields — an abusive manifest
+/// can't carry an unbounded `id`/`name`/`version`/`entry` string. Generous
+/// enough for any real plugin (a slug id, a display name, a semver string, a
+/// relative asset path) and small enough to bound the cost of holding and
+/// echoing one back over IPC. Reject-with-reason past the cap, same as any
+/// other manifest violation — never silently truncated.
+const MAX_ID_LEN: usize = 128;
+const MAX_NAME_LEN: usize = 200;
+const MAX_VERSION_LEN: usize = 64;
+const MAX_ENTRY_LEN: usize = 512;
 
 /// A validated `plugin.json`. Every field here has already passed the
 /// required-fields-fail-closed / closed-capability-enum / versioning rules in
@@ -89,10 +105,16 @@ fn is_single_segment(id: &str) -> bool {
     matches!(comps.next(), Some(Component::Normal(_))) && comps.next().is_none()
 }
 
-fn require_str(v: &Value, field: &str) -> Result<String, String> {
+fn require_str(v: &Value, field: &str, max_len: usize) -> Result<String, String> {
     match v.get(field) {
-        Some(Value::String(s)) if !s.is_empty() => Ok(s.clone()),
-        Some(Value::String(_)) => Err(err("invalid-manifest", format!("`{field}` must not be empty"))),
+        Some(Value::String(s)) if s.is_empty() => {
+            Err(err("invalid-manifest", format!("`{field}` must not be empty")))
+        }
+        Some(Value::String(s)) if s.len() > max_len => Err(err(
+            "invalid-manifest",
+            format!("`{field}` exceeds the {max_len}-byte limit"),
+        )),
+        Some(Value::String(s)) => Ok(s.clone()),
         Some(_) => Err(err("invalid-manifest", format!("`{field}` must be a string"))),
         None => Err(err("invalid-manifest", format!("missing required field `{field}`"))),
     }
@@ -167,17 +189,17 @@ pub fn parse_manifest(raw: &str) -> Result<PluginManifest, String> {
         return Err(err("invalid-manifest", "manifest root must be a JSON object"));
     }
 
-    let id = require_str(&v, "id")?;
+    let id = require_str(&v, "id", MAX_ID_LEN)?;
     if !is_single_segment(&id) {
         return Err(err(
             "invalid-manifest",
             format!("`id` must be a single path segment (no separators or `..`): {id}"),
         ));
     }
-    let name = require_str(&v, "name")?;
-    let version = require_str(&v, "version")?;
+    let name = require_str(&v, "name", MAX_NAME_LEN)?;
+    let version = require_str(&v, "version", MAX_VERSION_LEN)?;
     let api_version = require_api_version(&v)?;
-    let entry = require_str(&v, "entry")?;
+    let entry = require_str(&v, "entry", MAX_ENTRY_LEN)?;
     validate_entry_syntax(&entry)?;
     let capabilities = require_capabilities(&v)?;
     let rootless = optional_bool(&v, "rootless", false)?;
@@ -461,33 +483,69 @@ pub fn resolve_plugin_asset(plugins_root: &Path, request_path: &str) -> Result<(
     Ok((bytes, guess_mime(&asset_path)))
 }
 
-fn plain_response(status: tauri::http::StatusCode, body: &str) -> tauri::http::Response<Vec<u8>> {
-    tauri::http::Response::builder()
-        .status(status)
-        .header(tauri::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
-        .header(tauri::http::header::CONTENT_SECURITY_POLICY, PLUGIN_CSP)
-        .body(body.as_bytes().to_vec())
-        .unwrap_or_else(|_| tauri::http::Response::new(Vec::new()))
+/// A `plugin://` response, independent of any Tauri runtime type. Pulling the
+/// status/content-type/CSP/body decision out of `tauri::http` types means a
+/// plain `#[test]` can pin that `PLUGIN_CSP` rides on every outcome —
+/// including an error response — without needing a `UriSchemeContext`, which
+/// only a running app can construct. `plugin_protocol_handler` below is the
+/// thin, untested-by-necessity conversion of this into a real
+/// `tauri::http::Response`.
+pub struct AssetResponse {
+    pub status: u16,
+    pub content_type: String,
+    pub csp: String,
+    pub body: Vec<u8>,
+}
+
+/// Resolve a `plugin://` request into the exact response it gets: bytes +
+/// MIME on success, a stable error string on failure — either way carrying
+/// `PLUGIN_CSP`, so a future refactor that drops the header on one branch
+/// (the design note's fear: "silently falsifies the threat table's network
+/// row") shows up as a failing assertion here, not a silent regression.
+pub fn build_asset_response(plugins_root: &Path, request_path: &str) -> AssetResponse {
+    match resolve_plugin_asset(plugins_root, request_path) {
+        Ok((bytes, mime)) => AssetResponse {
+            status: 200,
+            content_type: mime.to_string(),
+            csp: PLUGIN_CSP.to_string(),
+            body: bytes,
+        },
+        Err(e) => AssetResponse {
+            status: 404,
+            content_type: "text/plain; charset=utf-8".to_string(),
+            csp: PLUGIN_CSP.to_string(),
+            body: e.into_bytes(),
+        },
+    }
 }
 
 /// The `plugin://` scheme handler registered on the `Builder` in `lib.rs`.
-/// Every response — success or error — carries `PLUGIN_CSP`; see the module
-/// doc comment for why that isn't optional. This is the seam Slice C attaches
-/// its broker/sandboxed-frame wiring to; nothing here forwards to `invoke` or
-/// grants a plugin anything beyond its own folder's bytes.
+/// All of the actual decision-making lives in `build_asset_response` (pure,
+/// tested); this is only the conversion into a real `tauri::http::Response`.
+/// This is the seam Slice C attaches its broker/sandboxed-frame wiring to;
+/// nothing here forwards to `invoke` or grants a plugin anything beyond its
+/// own folder's bytes.
 pub fn plugin_protocol_handler(
     _ctx: tauri::UriSchemeContext<'_, tauri::Wry>,
     request: tauri::http::Request<Vec<u8>>,
 ) -> tauri::http::Response<Vec<u8>> {
-    match resolve_plugin_asset(&plugins_root_dir(), request.uri().path()) {
-        Ok((bytes, mime)) => tauri::http::Response::builder()
-            .status(tauri::http::StatusCode::OK)
-            .header(tauri::http::header::CONTENT_TYPE, mime)
-            .header(tauri::http::header::CONTENT_SECURITY_POLICY, PLUGIN_CSP)
-            .body(bytes)
-            .unwrap_or_else(|_| plain_response(tauri::http::StatusCode::INTERNAL_SERVER_ERROR, "response build failed")),
-        Err(e) => plain_response(tauri::http::StatusCode::NOT_FOUND, &e),
-    }
+    let resp = build_asset_response(&plugins_root_dir(), request.uri().path());
+    tauri::http::Response::builder()
+        .status(resp.status)
+        .header(tauri::http::header::CONTENT_TYPE, resp.content_type)
+        .header(tauri::http::header::CONTENT_SECURITY_POLICY, resp.csp.clone())
+        .body(resp.body)
+        .unwrap_or_else(|_| {
+            // Defensive only — reaching this means Response::builder itself
+            // rejected a header/status this module constructed, which none of
+            // the fixed inputs above should ever trigger. Still carries the
+            // CSP: no response path, however unreachable, skips it.
+            tauri::http::Response::builder()
+                .status(tauri::http::StatusCode::INTERNAL_SERVER_ERROR)
+                .header(tauri::http::header::CONTENT_SECURITY_POLICY, resp.csp)
+                .body(Vec::new())
+                .unwrap_or_else(|_| tauri::http::Response::new(Vec::new()))
+        })
 }
 
 // ---------- tauri commands ----------

@@ -204,8 +204,22 @@ fn main_has_all_120_and_zero_permission_denies_dangerous_spread() {
 
     // --- Denial (plan §5B): representative dangerous spread + benign control,
     // proven against the zero-permission template, exactly the spread the
-    // #360 Phase-0.5 spike's Check 1 table validated. ---
-    const DANGEROUS_SPREAD: &[&str] = &["orch_grant_merge", "git_push", "ft_write_file", "spawn_pty", "open_in_editor"];
+    // #360 Phase-0.5 spike's Check 1 table validated. `list_plugins`/
+    // `install_plugin` (#360 Slice B) are appended per rev-60 finding B: they
+    // were already denied here by construction (zero grants = zero commands,
+    // same as the benign control), but pinning them explicitly guards against
+    // a future curated-subset plugin capability (Slice C) accidentally
+    // widening to include plugin management itself — a plugin pane must
+    // never be able to enumerate or install plugins. ---
+    const DANGEROUS_SPREAD: &[&str] = &[
+        "orch_grant_merge",
+        "git_push",
+        "ft_write_file",
+        "spawn_pty",
+        "open_in_editor",
+        "list_plugins",
+        "install_plugin",
+    ];
     const BENIGN_CONTROL: &str = "pty_backend_info";
 
     for &cmd in DANGEROUS_SPREAD {
