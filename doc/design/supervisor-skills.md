@@ -2,10 +2,10 @@
 
 Issues #250 (advisor/supervisor) and #324 (skills feedback loop), converged
 into one aggregate design on `feat/250-324-supervisor-skills`. This note
-covers the foundation slice (A, the `role_hint` field) and the persona/
-template slice (C) that render off it. The remaining slices (session digest,
-process-pro wiring, the optional push-nudge) extend this note in place as
-they land; see the plan comment on issue #250 for the full breakdown.
+covers the foundation slice (A, the `role_hint` field), the persona/template
+slice (C) that renders off it, and the end-to-end wiring slice (D). The
+optional push-nudge (slice E) extends this note in place if it lands; see the
+plan comment on issue #250 for the full breakdown.
 
 ## The decision: new *blocks*, not new *Roles*
 
@@ -139,6 +139,50 @@ was the placement-pin test itself (`worker.md` now chains two placeholders,
 check didn't anticipate — the same chaining `block.md`'s `PERSONA_NOTE`/
 `LANE_NOTE`/`GATE_NOTE` already relies on).
 
+## End-to-end wiring + the session_digest gate rider (slice D)
+
+Slice D closes the loop both #250 and #324 opened, without adding a new
+delivery mechanism — every agent-facing text still rides `report`/
+`message_orchestrator` → `deliver_to_orchestrator`, or a real `gh pr create`
+through the shim (add-orch-tool's "visible prompts" norm, and a task
+constraint). Three confirmations and one tightening:
+
+- **Advisor consult: spawn → advise via `report` → auto-close.**
+  `close_completed_planner` (#203) keys its auto-close purely on `a.role ==
+  Role::Planner` — never on block id or `role_hint` — so an advisor-hinted
+  block already gets the exact "one question → one `report("done", ...)` →
+  pane closes, slot freed" lifecycle for free; nothing to build. Pinned by
+  `advisor_hinted_planner_auto_closes_on_report_done`
+  (`src-tauri/tests/orchestration.rs`): no idle pane, no standing consult
+  process, whatever the roster's persona says.
+- **Process-pro: `gh pr create` passes, `gh pr merge` is refused.** The
+  process-pro is worker-kind, so it rides the exact same PATH-injected gh/git
+  shim as any worker — the shim script has no concept of `role_hint` at all.
+  Pinned by `gh_shim_allows_pr_create_and_blocks_merge_for_the_process_pane`:
+  its own proposed-skills PR opens cleanly; merging onto the default branch
+  without a human grant/marker is refused, the same human gate every other
+  worker's PR rides.
+- **Dedup before proposing.** `.github/agents/process.md` (slice C) already
+  instructs reading `.loomux/lessons.md` + `.claude/skills/` (plus
+  `CLAUDE.md`/`AGENTS.md` and `.github/agents/*.md`) before proposing, so a
+  learning patches something stale or is genuinely new — never a fifth copy.
+  No new backend; pinned as a persona-doc assertion,
+  `the_shipped_process_persona_dedups_against_committed_destinations_before_proposing`.
+- **Binding rider: `session_digest`'s gate tightens to `role_hint ==
+  process`.** Slice B shipped an interim worker-kind-wide gate because
+  `role_hint` (slice A) was still landing in parallel; slice D tightens it
+  now that role_hint is on the branch. `Caller` gained a `role_hint` field,
+  resolved fresh on every `resolve_token` call from the caller's spawning
+  block (so a workflow-file edit takes effect on the agent's next tool call,
+  not just at spawn); both `tool_defs`'s listing and `call_tool`'s dispatch
+  arm for `session_digest` now require `role == Worker && role_hint ==
+  Some("process")`. A plain `worker` block is refused exactly like a
+  reviewer/planner/orchestrator — pinned by
+  `session_digest_denied_to_a_plain_worker_without_the_process_hint` (and the
+  positive case, that a process-hinted worker still sees and can call the
+  tool, by the updated `session_digest_*` tests using the new
+  `rails_with_process_block`/`process_caller` test helpers).
+
 ## Slices (see the plan comment on #250 for the full breakdown)
 
 - **A — role_hint foundation**: the field, its parse-time validation, the
@@ -146,12 +190,15 @@ check didn't anticipate — the same chaining `block.md`'s `PERSONA_NOTE`/
   first; everything else rebases onto it.
 - **B — session digest** (parallel with A): the `session_digest` MCP tool and
   the friction-window extractor that normalizes Claude/Copilot transcripts.
-- **C — personas/templates** (this note's newest scope, above): the default
-  advisor/process personas, the workflow-conditional prose, and the
-  `mechanics_core` addendum keyed off `role_hint`.
-- **D — process-pro wiring**: the end-to-end demo of a merge triggering a
-  process-pro spawn and a proposed skills/lessons PR, plus confirming the
-  `gh` shim refuses a merge from that pane.
+  Shipped with an interim worker-kind-wide gate (role_hint hadn't landed
+  yet); tightened to `role_hint == process` by D's binding rider.
+- **C — personas/templates** (above): the default advisor/process personas,
+  the workflow-conditional prose, and the `mechanics_core` addendum keyed off
+  `role_hint`.
+- **D — process-pro + advisor wiring** (above): the advisor's spawn →
+  advise → auto-close lifecycle, confirming the `gh` shim's create-passes/
+  merge-refused behavior for the process pane, the dedup persona-doc
+  assertion, and the `session_digest` gate rider.
 - **E — supervisor push-nudge** (optional): a deterministic, LLM-free
   audit-tail watcher that nudges the orchestrator toward a consult on a
   friction signature.

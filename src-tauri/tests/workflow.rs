@@ -706,6 +706,32 @@ fn the_shipped_process_persona_treats_session_digest_windows_as_untrusted_data()
 }
 
 #[test]
+fn the_shipped_process_persona_dedups_against_committed_destinations_before_proposing() {
+    // #250/#324 slice D item 3: the process-pro must read what's already
+    // committed — `.loomux/lessons.md`, `.claude/skills/`, and the other
+    // destinations from its own categorization table — before it proposes
+    // anything, so it patches something stale or writes something new,
+    // never a fifth copy of a lesson already recorded (plan §2, "Dedup
+    // before you propose"). No new backend for this — it is entirely a
+    // persona-doc instruction, pinned here on the real shipped file.
+    let repo = repo_root();
+    let process_doc =
+        fs::read_to_string(Path::new(&repo).join(".github/agents/process.md")).unwrap();
+    assert!(
+        process_doc.to_lowercase().contains("dedup"),
+        "process.md must instruct deduping before proposing: {process_doc}"
+    );
+    assert!(
+        process_doc.contains(".loomux/lessons.md") && process_doc.contains(".claude/skills/"),
+        "the dedup instruction must name the actual committed destinations to check: {process_doc}"
+    );
+    assert!(
+        process_doc.contains("never a fifth copy"),
+        "must say plainly why dedup matters, not just to do it: {process_doc}"
+    );
+}
+
+#[test]
 fn advisor_and_process_prose_stays_silent_unless_a_block_declares_the_hint() {
     // rev-29 F1 discipline, extended to role_hint: prose naming a mechanism the
     // reader does not have is worse than no prose. A fully custom roster with NO
@@ -2470,7 +2496,7 @@ fn a_writing_class_keeps_its_allow_patterns_before_the_deny_list() {
 
 fn orch_caller(reg: &OrchRegistry, group: &str) -> Caller {
     let o = reg.spawn_agent(group, Role::Orchestrator, "orch", "", false, None).unwrap();
-    Caller { agent_id: o.id, group: group.to_string(), role: Role::Orchestrator }
+    Caller { agent_id: o.id, group: group.to_string(), role: Role::Orchestrator, role_hint: None }
 }
 
 #[test]

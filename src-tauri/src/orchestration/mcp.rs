@@ -133,7 +133,7 @@ pub fn dispatch(
             }))
         }
         "ping" => Ok(json!({})),
-        "tools/list" => Ok(json!({ "tools": tool_defs(caller.role) })),
+        "tools/list" => Ok(json!({ "tools": tool_defs(caller.role, caller.role_hint.as_deref()) })),
         "tools/call" => {
             let name = params.get("name").and_then(Value::as_str).unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
@@ -186,7 +186,9 @@ fn channel_tool_defs() -> [Value; 2] {
 
 /// The tool surface is role-filtered so workers never even see privileged
 /// tools; `call_tool` re-checks anyway (listing is cosmetic, not security).
-fn tool_defs(role: Role) -> Vec<Value> {
+/// `role_hint` additionally scopes `session_digest` to `process`-hinted
+/// worker blocks (#250/#324 slice D) — every other tool ignores it.
+fn tool_defs(role: Role, role_hint: Option<&str>) -> Vec<Value> {
     // A standalone pane's ENTIRE surface, full stop (#271 W3 addendum, part
     // A1): a solo token must confer zero group-scoped power. Returned here,
     // before any of the tiers below, so no future addition to the shared or
@@ -337,15 +339,15 @@ fn tool_defs(role: Role) -> Vec<Value> {
             }),
             &["pr", "verdict", "summary"]));
     }
-    // Worker-only for now (#250/#324 slice B): the plan's eventual gate is
-    // "role_hint == process", but `role_hint` is slice A's field (parallel,
-    // not yet landed) and this tool is read-only over data already scoped to
-    // the caller's own group — coarse worker-wide exposure is deliberate and
-    // harmless until slice D tightens it. See the matching note on the
-    // `call_tool` arm, which is the real (re-checked) gate.
-    if role == Role::Worker {
+    // `process`-hinted worker blocks only (#250/#324 slice D binding rider):
+    // slice B shipped this gated to worker-kind generally, since `role_hint`
+    // (slice A) was still landing in parallel; now that it's on this branch,
+    // the tool is scoped to its actual owner, the process-pro. See the
+    // matching note on the `call_tool` arm, which is the real (re-checked)
+    // gate — this listing is cosmetic.
+    if role == Role::Worker && role_hint == Some("process") {
         tools.push(tool("session_digest",
-            "Read a FINISHED session's transcript, reduced to friction windows: the wall, the attempts, and the fix — never the raw transcript. Deterministic, no LLM in this step; each window names its signature (tool_error | near_duplicate_command | test_red_to_green | reverted_edit) plus the event range and a short summary. Also returns three anchors: initial_prompt (what the worker was asked), final_diff_ref (its PR/branch, if known), outcome (its task status, if known). windows is capped (oldest dropped first) — check dropped_windows to see if any were cut. Pass exactly ONE of task, agent, or pr to identify the session — the agent need not still be alive; this reads its recorded transcript cold. Use this instead of resuming or re-reading a worker's own session: the point is a fresh, cold read of the record, not the worker narrating itself.",
+            "Read a FINISHED session's transcript, reduced to friction windows: the wall, the attempts, and the fix — never the raw transcript. Deterministic, no LLM in this step; each window names its signature (tool_error | near_duplicate_command | test_red_to_green | reverted_edit) plus the event range and a short summary. Also returns three anchors: initial_prompt (what the worker was asked), final_diff_ref (its PR/branch, if known), outcome (its task status, if known). windows is capped (oldest dropped first) — check dropped_windows to see if any were cut. Pass exactly ONE of task, agent, or pr to identify the session — the agent need not still be alive; this reads its recorded transcript cold. Use this instead of resuming or re-reading a worker's own session: the point is a fresh, cold read of the record, not the worker narrating itself. Restricted to process-hinted blocks — this is the process-pro's tool, not a general worker one.",
             json!({
                 "task": { "type": "string", "description": "Task id, e.g. t-3" },
                 "agent": { "type": "string", "description": "Agent id, e.g. w-2" },
@@ -814,12 +816,12 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             Ok(serde_json::to_string(&out).unwrap_or_default())
         }
 
-        // Worker-only for now — see the matching note on this tool's
-        // `tool_defs` entry. The listing already hides this from
-        // non-workers; this is the real, re-checked gate.
+        // `process`-hinted worker blocks only — see the matching note on this
+        // tool's `tool_defs` entry. The listing already hides this from
+        // everyone else; this is the real, re-checked gate.
         "session_digest" => {
-            if caller.role != Role::Worker {
-                return Err("permission denied: session_digest is for worker-kind blocks".into());
+            if caller.role != Role::Worker || caller.role_hint.as_deref() != Some("process") {
+                return Err("permission denied: session_digest is for process-hinted worker blocks".into());
             }
             let task = arg_str(args, "task");
             let agent = arg_str(args, "agent");
