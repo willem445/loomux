@@ -283,7 +283,15 @@ fn plugin_csp_denies_network_egress_and_further_embedding_and_navigation() {
     // (form-action/base-uri) — so a future edit that loosens any one of them
     // (e.g. `connect-src 'none'` -> `connect-src *`) fails this test directly,
     // not just "the response still has *a* CSP header".
-    for directive in [
+    //
+    // #360 Slice C reconcile note: split into individual `;`-separated
+    // directives and require an EXACT match, not `str::contains` — a bare
+    // `.contains("connect-src 'none'")` would still pass against a silently
+    // *loosened* `connect-src 'none' https://evil.com`, since that whole
+    // string still contains the substring being checked for. Exact-directive
+    // equality closes that gap.
+    let directives: Vec<&str> = PLUGIN_CSP.split(';').map(str::trim).collect();
+    for expected in [
         "connect-src 'none'",
         "frame-src 'none'",
         "object-src 'none'",
@@ -291,8 +299,9 @@ fn plugin_csp_denies_network_egress_and_further_embedding_and_navigation() {
         "base-uri 'none'",
     ] {
         assert!(
-            PLUGIN_CSP.contains(directive),
-            "PLUGIN_CSP must contain `{directive}`, got: {PLUGIN_CSP}"
+            directives.contains(&expected),
+            "PLUGIN_CSP must have the exact directive `{expected}` — not merely contain it as a \
+             substring of a looser, appended one — got: {PLUGIN_CSP}"
         );
     }
 }

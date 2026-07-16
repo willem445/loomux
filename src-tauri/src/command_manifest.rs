@@ -156,4 +156,10 @@ pub const APP_COMMANDS: &[&str] = &[
     "voice_start",
     "voice_stop",
     "voice_cancel",
+    // pluginbroker (3) — #360 Slice C. plugin_open_window is main-only
+    // (granted via the "misc" set); the other two are the ONLY commands a
+    // plugin-* window's capability grants (permissions/sets/plugin-broker.toml).
+    "plugin_open_window",
+    "plugin_broker_request",
+    "plugin_broker_open_channel",
 ];

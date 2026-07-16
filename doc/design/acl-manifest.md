@@ -106,7 +106,7 @@ The `*-read` / `*-write`/`-control` split exists so a future curated
 non-main capability (see below) can be handed a read-only half of a module
 without also handing it that module's mutations.
 
-### The zero-permission template — what a future plugin window gets
+### The zero-permission template — the base a real plugin capability grew from
 
 `capabilities/plugin-zero-template.json` is the artifact #360 Slice C (pane
 plugins) depends on — it reuses the shape the Phase-0.5 spike proved holds
@@ -115,19 +115,26 @@ plugins) depends on — it reuses the shape the Phase-0.5 spike proved holds
 ```json
 {
   "identifier": "plugin-zero-template",
-  "windows": ["plugin-zero-template"],
+  "windows": ["untrusted-probe-0"],
   "permissions": []
 }
 ```
 
-A future plugin/non-main webview starts with **nothing**. To use it: copy the
-file, rename `identifier`, and point `windows`/`webviews` at the real plugin
-window's label. If that window ever needs specific commands, grant a curated
-subset of the module sets above (never `main-ui` — that would defeat the
-isolation this file exists to provide). The placeholder label
-`plugin-zero-template` is never a real window in the shipped app, so this
-exact file is inert in production; `tests/acl_manifest.rs` opens a mock
-window with that label specifically to prove the deny is real.
+This file itself stays permanently zero-permission — it is the
+`tests/acl_manifest.rs` proof fixture, not what a shipped plugin window
+binds to. `capabilities/plugin.json` (`windows: ["plugin-*"]`,
+`permissions: ["plugin-broker"]`) is the real, populated capability Slice C
+built from this template for actual plugin windows (see
+`pane-plugins.md`'s Isolation section). The template's mock label
+(`untrusted-probe-0`) is chosen deliberately to **not** match the `plugin-*`
+glob `capabilities/plugin.json` binds (rev-65 NB-1 on #369): a label
+matching that glob would also pick up the plugin-broker grant, silently
+diluting this file's zero-grant proof into "a broker-only window denies
+these commands" rather than "a genuinely zero-grant window denies these
+commands." Neither this label nor `plugin-zero-template` itself is ever a
+real window in the shipped app, so the file is inert in production;
+`tests/acl_manifest.rs` opens a mock window with the mock label specifically
+to prove the deny is real.
 
 ## The coherence test — the actual safety net
 
@@ -139,11 +146,12 @@ breaks main" into "CI is red." Three tests:
    (string search + bracket match, not a hand count) and diffs them against
    `command_manifest::APP_COMMANDS`. Fails if a command is registered in one
    list but not the other.
-2. **`app_commands_len_is_122`** (`app_commands_len_is_120` at this design's
+2. **`app_commands_len_is_125`** (`app_commands_len_is_120` at this design's
    original landing) — a drift tripwire against the count this design and the
    #363 plan cite; bumped to 122 by #360 Slice B's `list_plugins`/
-   `install_plugin`.
-3. **`main_has_all_120_and_zero_permission_denies_dangerous_spread`** — the
+   `install_plugin`, then to 125 by #360 Slice C's own three broker commands
+   (see the addendum below).
+3. **`main_has_all_125_and_zero_permission_denies_dangerous_spread`** — the
    one that matters most. It builds a real (headless) `tauri::test` mock app
    — `tauri::test::mock_builder()` + `.build(tauri::generate_context!())` —
    using the app's **actual on-disk `capabilities/`/`permissions/`**, the
@@ -155,7 +163,7 @@ breaks main" into "CI is red." Three tests:
    asserts none are denied, then invokes the plan's representative dangerous
    spread (`orch_grant_merge`, `git_push`, `ft_write_file`, `spawn_pty`,
    `open_in_editor`) plus a benign control (`pty_backend_info`) against the
-   `plugin-zero-template` window label and asserts the spread **and** the
+   `untrusted-probe-0` window label and asserts the spread **and** the
    control are denied there — while the same control stays allowed for
    `main`, proving the denial is a genuine per-label ACL check and not a
    globally broken IPC pipe that would make the dangerous-spread denials
@@ -214,3 +222,27 @@ confirms no `getrandom` crate enters the dependency graph as a result of this
 change; the ACL command codegen runs on the build host, not in the shipped
 binary, and produces no random-id generation (permission identifiers derive
 from command names).
+
+## Update (#360 Slices B and C): 120 → 122 → 125 commands
+
+The command count this note and `tests/acl_manifest.rs` cite grew twice past
+its #363 landing of 120:
+
+- **#360 Slice B** (backend host, `plugins.rs`) added `list_plugins` and
+  `install_plugin` (122 total) — both main-only, folded into a new
+  `permissions/sets/plugins.toml` set aggregated into `main-ui`.
+- **#360 Slice C** (the trust core, `pluginbroker.rs`) added its own three
+  commands (125 total) — `plugin_open_window`, `plugin_broker_request`,
+  `plugin_broker_open_channel`. `main` is granted all three (the "registered
+  means main may call it" rule above applies unchanged); the latter two are
+  also — and *only* — granted to a new `capabilities/plugin.json`
+  (`windows: ["plugin-*"]`) via a new `permissions/sets/plugin-broker.toml`
+  set, the first real (non-template) consumer of the zero-permission pattern
+  this note's "zero-permission template" section anticipated.
+  `plugin_open_window` is main-only (folded into the `misc` set) — a plugin
+  window must never be able to open another plugin window itself.
+
+Both slices' commands are otherwise ordinary entries in `APP_COMMANDS` and
+`generate_handler!`, subject to the same all-or-nothing flip as every other
+command. See `pane-plugins.md`'s Isolation section for the full trust-core
+design Slice C's grant makes possible.

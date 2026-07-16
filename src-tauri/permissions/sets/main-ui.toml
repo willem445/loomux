@@ -1,6 +1,6 @@
 [[set]]
 identifier = "main-ui"
-description = "Aggregates every module permission set (#363) — everything the trusted main webview needs across every app command (120 at #363's landing, +2 for #360 Slice B's plugins set). main is the only trusted webview, so it gets the full aggregate; a future plugin/non-main webview gets zero (see capabilities/plugin-zero-template.json) or a curated subset of the module sets below, never this aggregate."
+description = "Aggregates every module permission set (#363, extended by #360 Slices B and C) — everything the trusted main webview needs across all 125 app commands (120 at #363's landing, +2 for Slice B's plugins set, +3 for Slice C's pluginbroker set). main is the only trusted webview, so it gets the full aggregate; a plugin/non-main webview gets zero (see capabilities/plugin-zero-template.json) or the curated plugin-broker set (see capabilities/plugin.json), never this aggregate."
 permissions = [
     "pty-read",
     "pty-control",
@@ -17,4 +17,5 @@ permissions = [
     "filemgr-write",
     "misc",
     "plugins",
+    "plugin-broker",
 ]
