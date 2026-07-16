@@ -30,6 +30,7 @@ import {
   hasErrors,
   BLOCK_KINDS,
   WORKFLOW_VERSION,
+  roleHintRequires,
   type Workflow,
   type Finding,
   type FindingCode,
@@ -1083,6 +1084,25 @@ test("role_hint requires its matching capability class (#250/#324)", () => {
 
   // Absent is clean — today's behavior, byte for byte.
   assert.deepEqual(codes(validateWorkflow(starterWorkflow())), []);
+});
+
+test("role_hint case handling matches the backend's lowercasing (#250/#324 rider)", () => {
+  // `role_hint_requires` (workflow.rs) trims and lowercases before comparing, so
+  // `role_hint: Advisor` parses clean on the real engine. This pane's pre-run pass
+  // must agree, or it flags a file the real parser accepts as broken.
+  assert.equal(roleHintRequires("Advisor"), "planner");
+  assert.equal(roleHintRequires("ADVISOR"), "planner");
+  assert.equal(roleHintRequires(" process "), "worker");
+  assert.equal(roleHintRequires("Process"), "worker");
+  assert.equal(roleHintRequires("supervisor"), undefined, "still rejected, never coerced");
+
+  const w = starterWorkflow();
+  w.blocks[0]!.role_hint = "Advisor"; // blocks[0] is the planner
+  assert.deepEqual(
+    codes(validateWorkflow(w)),
+    [],
+    "a capitalized role_hint the real parser accepts must not be flagged as unknown here"
+  );
 });
 
 test("role_hint round-trips through serialize/parse unchanged", () => {
