@@ -8634,24 +8634,40 @@ impl OrchRegistry {
                 // time the fire-check below runs in this SAME tick, and
                 // `/compact` would land ahead of — or interleaved with — the
                 // escalation notice that's supposed to warn about it first).
-                if let Some(&percent) = context_percents.get(&a.id) {
-                    if percent < g.compact_context_threshold_percent
-                        || g.compact_context_threshold_percent == 0
-                    {
-                        a.compact_escalation_notified = false;
-                    } else if compact_escalation_should_fire(
-                        percent,
-                        g.compact_context_threshold_percent,
-                        a.compact_escalation_notified,
-                    ) {
-                        a.compact_escalation_notified = true;
-                        to_escalate.push((a.id.clone(), a.group.clone(), percent));
-                    } else if !a.compact_requested {
-                        // Still over threshold on a later tick, notice
-                        // already delivered, agent still hasn't asked —
-                        // request on its behalf. Silent: the notice already
-                        // told it what would happen.
-                        a.compact_requested = true;
+                //
+                // Gated on `!a.compact_pending` (rev-12 review finding):
+                // without this, a still-over-threshold reading on the tick
+                // right after a fallback-triggered fire — before the pane has
+                // visibly gone busy from loomux's point of view, so
+                // `currently_quiet` is still `true` — re-armed
+                // `compact_requested` (reset to `false` when the first
+                // `/compact` fired) and the fire-check below would type a
+                // SECOND `/compact` into a pane whose first compact hadn't
+                // resolved yet. A compact already in flight is reason enough
+                // to hold off on both re-notifying and re-arming; the
+                // existing quiet-clock resolution above already clears
+                // `compact_pending` the moment the first one is actually
+                // done, at which point escalation resumes normally.
+                if !a.compact_pending {
+                    if let Some(&percent) = context_percents.get(&a.id) {
+                        if percent < g.compact_context_threshold_percent
+                            || g.compact_context_threshold_percent == 0
+                        {
+                            a.compact_escalation_notified = false;
+                        } else if compact_escalation_should_fire(
+                            percent,
+                            g.compact_context_threshold_percent,
+                            a.compact_escalation_notified,
+                        ) {
+                            a.compact_escalation_notified = true;
+                            to_escalate.push((a.id.clone(), a.group.clone(), percent));
+                        } else if !a.compact_requested {
+                            // Still over threshold on a later tick, notice
+                            // already delivered, agent still hasn't asked —
+                            // request on its behalf. Silent: the notice already
+                            // told it what would happen.
+                            a.compact_requested = true;
+                        }
                     }
                 }
 
@@ -8672,7 +8688,15 @@ impl OrchRegistry {
                 // CLI-gated (checked above) and rate-limited (shared budget).
                 let requested_fires = a.compact_requested
                     && compact_request_should_fire(currently_quiet, times, now, MAX_COMPACT_NUDGES_PER_HOUR);
-                if heuristic_fires || requested_fires {
+                // `!a.compact_pending` (rev-12 review finding): this is the
+                // one place that actually types `/compact`, so it is the
+                // authoritative choke point — a compact already pending for
+                // this pane must never get a second one queued behind it,
+                // regardless of how `heuristic_fires`/`requested_fires` got
+                // set. A `request_compact` call that lands while already
+                // pending is not lost: `compact_requested` just stays set and
+                // is honored on a LATER tick, once `compact_pending` clears.
+                if !a.compact_pending && (heuristic_fires || requested_fires) {
                     a.compact_nudge_notified = true;
                     a.compact_requested = false;
                     a.compact_pending = true;
@@ -8797,6 +8821,17 @@ impl OrchRegistry {
     /// a request that can never fire. For an orchestrator caller, appends
     /// `compact_checklist_warning`'s soft nudge (never a block — the call
     /// always succeeds) if `set_state` hasn't landed recently.
+    ///
+    /// Deliberately does NOT check `compact_pending` itself (rev-12 review
+    /// asked this be verified for consistency with `compact_nudge_tick`'s
+    /// pending gate): a call landing while a compact is already in flight for
+    /// this pane is not an error and not lost — `compact_requested` just sits
+    /// set, and `compact_nudge_tick`'s fire-check (the ONE place that
+    /// actually types `/compact`, and the sole authoritative gate on
+    /// `compact_pending`) honors it on a later tick once the in-flight
+    /// compact resolves, rather than firing a second one concurrently. The
+    /// response says so rather than implying "at your next idle moment" is
+    /// necessarily the very next one.
     pub fn request_compact(&self, agent_id: &str) -> Result<String, String> {
         let a = self.agent(agent_id).ok_or("unknown agent")?;
         let cli = self.cli_for_agent(&a);
@@ -8812,9 +8847,14 @@ impl OrchRegistry {
         let warning = (a.role == Role::Orchestrator)
             .then(|| compact_checklist_warning(a.last_state_write_ms, now_ms(), SET_STATE_RECENCY_WINDOW_MS))
             .flatten();
+        let when = if a.compact_pending {
+            "queued — a compact is already in flight for this pane; yours will fire once it resolves"
+        } else {
+            "will fire at your next idle moment"
+        };
         Ok(match warning {
-            Some(w) => format!("compact requested — will fire at your next idle moment ({w})"),
-            None => "compact requested — will fire at your next idle moment".to_string(),
+            Some(w) => format!("compact requested — {when} ({w})"),
+            None => format!("compact requested — {when}"),
         })
     }
 
