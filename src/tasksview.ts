@@ -8,7 +8,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { swapIfConnected } from "./domutil";
-import { canProceed, doneCount, isAwaitingHuman, retainExisting, STATUSES } from "./taskboard";
+import { canProceed, doneCount, isAwaitingHuman, retainExisting, STATUSES, taskRowAccentClass } from "./taskboard";
 import { approveTask } from "./orchestration";
 import { normalizeComment } from "./autonomy";
 
@@ -398,6 +398,8 @@ export class TasksView {
   private renderTask(t: OrchTask, index: number): HTMLElement {
     const row = el("div", "task-row");
     if (isAwaitingHuman(t.status)) row.classList.add("awaiting-human");
+    const accent = taskRowAccentClass(t.status);
+    if (accent) row.classList.add(`task-row-${accent}`);
 
     // Multi-select: tick to add the row to the batch-delete set. A checkbox
     // (over ctrl/shift-click) keeps the affordance discoverable — the human

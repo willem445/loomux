@@ -148,7 +148,11 @@ Board controls:
 - **🗑 selected (N)** deletes exactly the rows you tick, by id, in one action.
 
 Items that only you can advance (`pr`, `human-testing`, `blocked`) are
-highlighted so what's waiting on you stands out.
+highlighted so what's waiting on you stands out; `in-progress` and `review`
+items get their own accent (matching the status pill's color) so currently
+active work is legible at a glance, and `done` items dim so they recede behind
+what's still moving. The assignee chip (the agent id currently on a task) has
+its own tint too, distinct from the neutral issue/PR/session chips.
 
 ## Steering, attention, and audit
 

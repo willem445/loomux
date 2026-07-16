@@ -1759,6 +1759,22 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   background: rgba(224, 175, 104, 0.07);
 }
 .task-row.awaiting-human:hover { background: rgba(224, 175, 104, 0.12); }
+/* Currently-worked tasks (#339): the same left-accent + wash pattern as
+   awaiting-human, above, in the status pill's own color — so what's actively
+   moving is legible at a glance, not just in the small pill text. */
+.task-row.task-row-in-progress {
+  box-shadow: inset 3px 0 0 #7aa2f7;
+  background: rgba(122, 162, 247, 0.06);
+}
+.task-row.task-row-in-progress:hover { background: rgba(122, 162, 247, 0.11); }
+.task-row.task-row-review {
+  box-shadow: inset 3px 0 0 #bb9af7;
+  background: rgba(187, 154, 247, 0.06);
+}
+.task-row.task-row-review:hover { background: rgba(187, 154, 247, 0.11); }
+/* Done tasks recede instead of competing with what's still active. */
+.task-row.task-row-done { opacity: 0.55; }
+.task-row.task-row-done:hover { opacity: 0.85; }
 /* Multi-select tick box — nudged down to line up with the row's first line. */
 .task-select { flex: none; margin: 3px 0 0; cursor: pointer; accent-color: var(--danger); }
 .task-order { display: flex; flex-direction: column; flex: none; }
@@ -1806,6 +1822,13 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   max-width: 130px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .task-chip.session { font-family: "Cascadia Mono", Consolas, monospace; }
+/* The assigned agent (#339): its own tint, distinct from the neutral gray of
+   issue/session chips, so "who's on it" reads at a glance instead of blending
+   into the row's other metadata. */
+.task-chip.agent {
+  font-family: "Cascadia Mono", Consolas, monospace;
+  background: rgba(122, 162, 247, 0.14); color: #a7bff8; font-weight: 600;
+}
 /* Clickable issue/PR refs (open in browser). */
 .task-chip.link {
   border: none; font: inherit; font-size: 9.5px; cursor: pointer;

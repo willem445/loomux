@@ -11,6 +11,7 @@ import {
   PROTOTYPE_STATUS,
   retainExisting,
   STATUSES,
+  taskRowAccentClass,
 } from "../src/taskboard.ts";
 
 test("counts only tasks in the exact `done` status", () => {
@@ -96,4 +97,30 @@ test("a prototype is highlighted as awaiting the human", () => {
   assert.equal(isAwaitingHuman("in-progress"), false);
   assert.equal(isAwaitingHuman("review"), false);
   assert.equal(isAwaitingHuman("done"), false);
+});
+
+// --- row-level activity accent (#339: highlight currently active work) ---
+
+test("in-progress and review get their own row accent", () => {
+  assert.equal(taskRowAccentClass("in-progress"), "in-progress");
+  assert.equal(taskRowAccentClass("review"), "review");
+});
+
+test("done gets the settled/dim accent", () => {
+  assert.equal(taskRowAccentClass("done"), "done");
+});
+
+test("queued and the human-gated statuses get no extra row accent", () => {
+  // queued has nothing to highlight yet; pr/human-testing/blocked/prototype
+  // already get isAwaitingHuman's own amber treatment, so this stays null
+  // rather than layering a second, competing accent on the same row.
+  for (const s of ["queued", "pr", "human-testing", "blocked", "prototype"]) {
+    assert.equal(taskRowAccentClass(s), null, `${s} must not get an activity accent`);
+  }
+});
+
+test("row accent does not match look-alike statuses", () => {
+  assert.equal(taskRowAccentClass("in-progress-ish"), null);
+  assert.equal(taskRowAccentClass("predone"), null);
+  assert.equal(taskRowAccentClass(""), null);
 });

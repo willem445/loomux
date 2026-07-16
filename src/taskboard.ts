@@ -73,3 +73,17 @@ export const DONE_STATUS = "done";
 export function doneCount(tasks: readonly HasStatus[]): number {
   return tasks.reduce((n, t) => (t.status === DONE_STATUS ? n + 1 : n), 0);
 }
+
+/** The row-level accent a task's status gets on the board (#339): `queued`
+ *  is deliberately un-accented (nothing to highlight, it's waiting its turn)
+ *  and the human-gated statuses already get `isAwaitingHuman`'s amber — this
+ *  covers the two left uncovered. `in-progress`/`review` pick up the exact
+ *  accent color their own status pill already uses, so the row itself reads
+ *  as "currently moving" at a glance instead of only the small pill text;
+ *  `done` dims a settled task out of the way so it recedes behind what's
+ *  still active. Returns the status verbatim (it doubles as the CSS
+ *  modifier the caller appends), or null for no extra treatment. */
+export function taskRowAccentClass(status: string): "in-progress" | "review" | "done" | null {
+  if (status === "in-progress" || status === "review" || status === DONE_STATUS) return status;
+  return null;
+}
