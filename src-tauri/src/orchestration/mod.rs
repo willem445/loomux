@@ -8591,8 +8591,7 @@ impl OrchRegistry {
                 // Compaction-completion: busy (compaction ran/rendered) then
                 // quiet again while pending — resolve regardless of pause
                 // state (a pause must not strand a pane mid-compact forever).
-                if false // TEMP seam: red-CI-evidence commit (#328)
-                    && a.compact_pending && currently_quiet && a.compact_seen_busy {
+                if a.compact_pending && currently_quiet && a.compact_seen_busy {
                     a.compact_pending = false;
                     a.compact_seen_busy = false;
                     let instructions = self.group_dir(&a.group).join(
@@ -8616,8 +8615,7 @@ impl OrchRegistry {
                 // gate matters).
                 if !a.compact_pending {
                     if let Some((tail, last_input_ms)) = manual_signals.get(&a.id) {
-                        if false // TEMP seam: red-CI-evidence commit (#328)
-                            && now.saturating_sub(*last_input_ms) < MANUAL_COMPACT_DETECT_WINDOW_MS
+                        if now.saturating_sub(*last_input_ms) < MANUAL_COMPACT_DETECT_WINDOW_MS
                             && human_typed_compact_detected(tail)
                         {
                             a.compact_pending = true;
@@ -8636,8 +8634,6 @@ impl OrchRegistry {
                 // time the fire-check below runs in this SAME tick, and
                 // `/compact` would land ahead of — or interleaved with — the
                 // escalation notice that's supposed to warn about it first).
-                let escalation_seam_enabled = false; // TEMP seam: red-CI-evidence commit (#328)
-                if escalation_seam_enabled {
                 if let Some(&percent) = context_percents.get(&a.id) {
                     if percent < g.compact_context_threshold_percent
                         || g.compact_context_threshold_percent == 0
@@ -8658,7 +8654,6 @@ impl OrchRegistry {
                         a.compact_requested = true;
                     }
                 }
-                } // end TEMP seam: red-CI-evidence commit (#328)
 
                 let times = tick_times.get(&a.group).map(Vec::as_slice).unwrap_or(&[]);
                 // Heuristic (role-gated, minutes-threshold) fallback fire.
@@ -8675,8 +8670,7 @@ impl OrchRegistry {
                 // by escalation above) fire — no role gate (self-initiated),
                 // no minutes threshold (the request IS the trigger), still
                 // CLI-gated (checked above) and rate-limited (shared budget).
-                let requested_fires = false // TEMP seam: red-CI-evidence commit (#328)
-                    && a.compact_requested
+                let requested_fires = a.compact_requested
                     && compact_request_should_fire(currently_quiet, times, now, MAX_COMPACT_NUDGES_PER_HOUR);
                 if heuristic_fires || requested_fires {
                     a.compact_nudge_notified = true;
@@ -8806,7 +8800,7 @@ impl OrchRegistry {
     pub fn request_compact(&self, agent_id: &str) -> Result<String, String> {
         let a = self.agent(agent_id).ok_or("unknown agent")?;
         let cli = self.cli_for_agent(&a);
-        if true || !compact_nudge_cli_supported(&cli) { // TEMP seam: red-CI-evidence commit (#328)
+        if !compact_nudge_cli_supported(&cli) {
             return Err(format!(
                 "/compact has no equivalent on {cli} — request_compact is Claude-Code-only"
             ));
