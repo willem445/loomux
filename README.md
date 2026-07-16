@@ -64,7 +64,7 @@ no global mode:
 
 | Kind | What it is |
 | --- | --- |
-| **Agent** | A coding-agent CLI (Claude, Copilot, Codex, OpenCode, Gemini CLI, Hermes, Ante — macOS/Linux hosts only, Antigma ships no Windows binary — or a custom command), optionally fanned out to *N* panes each in its own git worktree. |
+| **Agent** | A coding-agent CLI (Claude, Copilot, Codex, OpenCode, Gemini CLI, Hermes, Ante — macOS/Linux hosts only, Antigma ships no Windows binary — or a custom command), optionally fanned out to *N* panes each in its own git worktree. The **Autopilot** checkbox pre-approves all tools/paths so the pane never stalls on a permission prompt; for Copilot this now means the same *true autopilot mode* an orchestration worker gets, not just allow-all — a background watcher answers the resulting "Enable autopilot mode" dialog for you. |
 | **Orchestrator + workers** | An orchestrator plus idle workers in their own project tab, with guardrails. |
 | **Terminal** | A plain shell: PowerShell, Command Prompt, or Git Bash. |
 | **File explorer** | A native-style **file manager** rooted at a folder you pick — no terminal underneath, no process, ever. |

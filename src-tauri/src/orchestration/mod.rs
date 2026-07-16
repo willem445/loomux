@@ -1117,8 +1117,19 @@ const READY_POLL: Duration = Duration::from_millis(250);
 // the first submit, which both enables autopilot and lets the just-submitted
 // brief proceed. Fail-soft: if the dialog never appears, delivery proceeds.
 /// How long to watch for the consent dialog after the kickoff submit before
-/// giving up and letting the submit retries carry on.
-const AUTOPILOT_DIALOG_WAIT: Duration = Duration::from_secs(12);
+/// giving up and letting the submit retries carry on. Tuned to the GROUP
+/// path, where the dialog-triggering submit is loomux's own kickoff Enter —
+/// fired within milliseconds of this watch starting.
+#[doc(hidden)] // pub for integration tests
+pub const AUTOPILOT_DIALOG_WAIT: Duration = Duration::from_secs(12);
+/// How long a SOLO pane's watcher watches for the consent dialog (#364) before
+/// giving up. Far longer than [`AUTOPILOT_DIALOG_WAIT`] because the
+/// dialog-triggering submit here is the HUMAN's own first message — there is
+/// no programmatic Enter to key the wait off, so it must tolerate however long
+/// a person takes to read a freshly booted pane and type into it, not just the
+/// group path's near-instant follow-through.
+#[doc(hidden)] // pub for integration tests
+pub const SOLO_AUTOPILOT_DIALOG_WAIT: Duration = Duration::from_secs(600);
 /// Poll interval while watching for the consent dialog.
 const AUTOPILOT_DIALOG_POLL: Duration = Duration::from_millis(250);
 /// Pause after answering so the TUI dismisses the dialog and repaints / starts
@@ -1775,38 +1786,40 @@ pub(crate) fn default_model(cli: &str, role: Role) -> &'static str {
 // launcher (`single_pane_autopilot_flags`, exposed as the `agent_autopilot_flags`
 // Tauri command) build from these atoms, so the two paths can't drift (#101).
 
-/// Copilot's *single-pane* unattended flags: pre-approve all tools and all
-/// paths so the agent runs without per-tool / path-verification confirmation.
-///
-/// Deliberately NOT `--autopilot` here. That flag boots Copilot into its
-/// *autopilot mode*, which opens a blocking interactive "Enable autopilot mode"
-/// dialog on startup (Enable all permissions / Continue with limited / Cancel —
-/// verified in the CLI bundle's `showAutopilotConfirmation` path). A single-pane
-/// agent has a **human at the keyboard**, so interactive framing is correct and
-/// no one wants a startup dialog they didn't ask for; `--allow-all-tools` is
-/// Copilot's documented non-interactive enabler and carries no dialog.
-///
-/// The **group** spawn path uses [`COPILOT_GROUP_AUTOPILOT_FLAGS`] instead —
-/// see there for why managed workers DO want true autopilot mode.
+/// Copilot's base "allow all" atom: pre-approve all tools and all paths so the
+/// agent runs without per-tool / path-verification confirmation. Combined with
+/// `--autopilot` to build [`COPILOT_GROUP_AUTOPILOT_FLAGS`] — kept as its own
+/// constant purely so the two flag strings are built from one shared atom
+/// instead of two independently-typed literals that could drift apart.
 pub const COPILOT_UNATTENDED_FLAGS: &str = "--allow-all-tools --allow-all-paths";
 
-/// Copilot's *group-spawn* unattended flags: [`COPILOT_UNATTENDED_FLAGS`] plus
-/// `--autopilot`, which puts a loomux-managed worker/planner into true autopilot
-/// mode. Autopilot mode is not just the idle auto-continue loop — it injects an
-/// autonomy directive into the model's system prompt ("persist autonomously …
-/// continue executing without waiting for user input … the user may not even be
-/// present"), which is exactly right for an unattended, loomux-driven agent.
+/// Copilot's unattended-autopilot flags: [`COPILOT_UNATTENDED_FLAGS`] plus
+/// `--autopilot`, which puts an agent into true autopilot mode. Autopilot mode
+/// is not just the idle auto-continue loop — it injects an autonomy directive
+/// into the model's system prompt ("persist autonomously … continue executing
+/// without waiting for user input … the user may not even be present"), which
+/// is exactly right for an unattended agent.
 ///
-/// `--autopilot` triggers the "Enable autopilot mode" consent dialog at startup.
-/// That is SAFE on the group path (and only there) because the kickoff delivery
-/// deterministically answers it — [`copilot_autopilot_prompt_detected`] +
-/// `deliver_prompt`'s confirm step press Enter on the default "Enable all
-/// permissions" BEFORE the brief is pasted, so the brief can never collide with
-/// the dialog. The human's loomux-level "auto-ops" choice IS the consent.
+/// Used by BOTH the group spawn path and, since #364, the single-pane launcher
+/// (`single_pane_autopilot_flags`) — a single-pane copilot agent with the
+/// Autopilot checkbox on now enters the same true autopilot mode a group
+/// worker does, not just allow-all. (An earlier version of this flag kept the
+/// single pane on allow-all-only, reasoning a human at the keyboard didn't need
+/// true autopilot framing — the human's report on #364 was that the checkbox
+/// should mean autopilot on single panes too.)
 ///
-/// Kept as a derived-but-pinned constant (a `..._reuses_single_pane_atom` test
-/// asserts it equals `--autopilot ` + [`COPILOT_UNATTENDED_FLAGS`]) so the two
-/// posture strings can't drift apart.
+/// `--autopilot` triggers the "Enable autopilot mode" consent dialog at
+/// startup (on the human's own first submit for a single pane, since it gets
+/// no programmatic kickoff — see `Role::Solo`'s "never receives a kickoff"
+/// doc). That dialog is answered deterministically on both paths:
+/// [`copilot_autopilot_prompt_detected`] + `deliver_prompt`'s confirm step for
+/// group kickoffs, and `OrchRegistry::confirm_solo_copilot_autopilot` (started
+/// right after spawn) for single panes — so neither path leaves a human
+/// staring at an unanswered blocking dialog.
+///
+/// Kept as a derived-but-pinned constant (`single_pane_flags_reuse_the_group_path_atoms`
+/// asserts it equals `--autopilot ` + [`COPILOT_UNATTENDED_FLAGS`]) so the atoms
+/// can't drift apart.
 pub const COPILOT_GROUP_AUTOPILOT_FLAGS: &str = "--autopilot --allow-all-tools --allow-all-paths";
 
 /// git + gh pre-approval appended to Claude's `--allowedTools` for an unattended
@@ -1849,7 +1862,15 @@ pub fn single_pane_autopilot_flags(program: &str) -> String {
             "--permission-mode {} --allowedTools {CLAUDE_UNATTENDED_ALLOW}",
             claude_permission_mode(true)
         ),
-        "copilot" => COPILOT_UNATTENDED_FLAGS.to_string(),
+        // #364: a single-pane copilot agent now enters the SAME true autopilot
+        // mode as a group agent — reuses COPILOT_GROUP_AUTOPILOT_FLAGS verbatim
+        // rather than inventing a divergent string, so the two postures can't
+        // drift apart. The resulting "Enable autopilot mode" dialog (triggered
+        // by the human's own first submit, since a solo pane gets no
+        // programmatic kickoff) is answered by a dedicated watcher —
+        // `OrchRegistry::confirm_solo_copilot_autopilot`, started right after
+        // spawn — not left for the human to stare at unanswered.
+        "copilot" => COPILOT_GROUP_AUTOPILOT_FLAGS.to_string(),
         // Hermes: "Bypass dangerous-command approval prompts", and docs show no
         // startup consent dialog (unlike copilot's --autopilot) — safe for a
         // single-pane launch. cli-commands.md:
@@ -2486,13 +2507,15 @@ pub enum Delivery {
     /// for the CLI to paint, and — for an autopilot copilot agent — answer the
     /// "Enable autopilot mode" consent dialog before pasting.
     FreshKickoff,
-    /// First prompt to a *resumed* pane: still wait for the CLI to paint, but a
-    /// resume restores allow-all/autopilot from the session event log, so the
-    /// consent dialog does not reappear — skip the confirm (and its fail-soft
-    /// wait) rather than watch for a dialog that will never show.
+    /// First prompt to a *resumed* pane: still wait for the CLI to paint AND
+    /// (#364) still answer the autopilot consent dialog. Resume was assumed to
+    /// restore allow-all/autopilot from the session event log so the dialog
+    /// would never reappear — the human's #364 report is that this assumption
+    /// is false (the dialog does reappear, or autopilot isn't restored), so
+    /// this delivery confirms exactly like `FreshKickoff` does.
     ResumeKickoff,
     /// A mid-session delivery to an already-running pane (a follow-up / steer):
-    /// no readiness wait, no dialog.
+    /// no readiness wait, no dialog — long past boot, nothing to confirm.
     MidSession,
 }
 
@@ -2502,21 +2525,23 @@ impl Delivery {
     fn wait_ready(self) -> bool {
         matches!(self, Delivery::FreshKickoff | Delivery::ResumeKickoff)
     }
-    /// Whether this delivery follows a fresh CLI boot (the only time copilot
-    /// shows its autopilot consent dialog).
-    fn is_fresh_boot(self) -> bool {
-        matches!(self, Delivery::FreshKickoff)
+    /// Whether this delivery should watch for and answer copilot's "Enable
+    /// autopilot mode" consent dialog (#364): true for EITHER kickoff — a
+    /// fresh boot or a resume — since both can show the dialog; false
+    /// mid-session, which is long past boot and has nothing to confirm.
+    pub fn confirms_autopilot_dialog(self) -> bool {
+        matches!(self, Delivery::FreshKickoff | Delivery::ResumeKickoff)
     }
 }
 
 /// Whether a delivery should attempt the copilot autopilot-consent confirm.
-/// Only a *fresh boot* of an *unattended copilot* agent shows the "Enable
-/// autopilot mode" dialog — resume restores the consent from the session log,
-/// and mid-session deliveries are long past boot — so both of those skip the
+/// A *kickoff* (fresh boot OR resume, #364) of an *unattended copilot* agent
+/// can show the "Enable autopilot mode" dialog — a mid-session delivery is
+/// long past boot and never shows it — so only mid-session skips the
 /// (fail-soft, up to `AUTOPILOT_DIALOG_WAIT`) watch. Pure so the gate is
 /// unit-testable without a live pty.
-pub fn should_confirm_copilot_autopilot(cli: &str, unattended: bool, fresh_boot: bool) -> bool {
-    fresh_boot && unattended && cli == "copilot"
+pub fn should_confirm_copilot_autopilot(cli: &str, unattended: bool, is_kickoff: bool) -> bool {
+    is_kickoff && unattended && cli == "copilot"
 }
 
 /// Distinct agent working directories to remove when a group is torn down
@@ -3519,18 +3544,25 @@ fn wait_for_user_quiet(ptys: &crate::pty::PtyManager, pty_id: u32) -> Option<u64
     )
 }
 
-/// For a freshly spawned group copilot pane (launched with `--autopilot`): watch
-/// for the "Enable autopilot mode" consent dialog and answer it (Enter selects
-/// the default "Enable all permissions"). Copilot 1.0.69 opens this dialog in
-/// response to the FIRST message submit, not at boot (#179), so the caller runs
-/// this right AFTER the kickoff Enter — selecting the default both enables
-/// autopilot and lets the just-submitted brief proceed (the pending message is
-/// not discarded). Fail-soft: returns `false` without acting if the dialog does
-/// not appear within `AUTOPILOT_DIALOG_WAIT` (e.g. copilot changed the flow, or
-/// consent was already recorded), and the caller's submit retries carry on.
+/// For a copilot pane launched with `--autopilot` (group OR, since #364,
+/// single-pane): watch for the "Enable autopilot mode" consent dialog and
+/// answer it (Enter selects the default "Enable all permissions"). Copilot
+/// 1.0.69 opens this dialog in response to the FIRST message submit, not at
+/// boot (#179) — a group kickoff runs this right AFTER loomux's own kickoff
+/// Enter, so selecting the default both enables autopilot and lets the
+/// just-submitted brief proceed (the pending message is not discarded); a
+/// solo pane has no programmatic kickoff, so `confirm_solo_copilot_autopilot`
+/// just watches from spawn for whenever the HUMAN's own first submit triggers
+/// it. Fail-soft: returns `false` without acting if the dialog does not appear
+/// within `max_wait` (e.g. copilot changed the flow, consent was already
+/// recorded, or — solo path — the human never got that far), and the caller's
+/// own retries/no-op carry on.
 ///
-/// Returns `true` iff it detected and answered the dialog. Times/keys come from
-/// module constants so the wiring is testable; the pure recognizer is
+/// Returns `true` iff it detected and answered the dialog. `max_wait` differs
+/// by caller (a short fail-soft window after loomux's own deterministic Enter
+/// for the group path vs. `SOLO_AUTOPILOT_DIALOG_WAIT`'s much longer,
+/// human-paced window for solo); poll interval and keys come from module
+/// constants so the wiring is testable, and the pure recognizer is
 /// [`copilot_autopilot_prompt_detected`].
 fn confirm_copilot_autopilot_dialog(
     ptys: &crate::pty::PtyManager,
@@ -3538,9 +3570,10 @@ fn confirm_copilot_autopilot_dialog(
     root: &Path,
     group: &str,
     agent: &str,
+    max_wait: Duration,
 ) -> bool {
     let start = std::time::Instant::now();
-    while start.elapsed() < AUTOPILOT_DIALOG_WAIT {
+    while start.elapsed() < max_wait {
         let Some(out) = ptys.output_tail(pty_id) else {
             return false; // terminal closed — let the caller's own checks report
         };
@@ -7450,6 +7483,39 @@ impl OrchRegistry {
             a.status = AgentStatus::Running;
         }
         self.by_pty.lock_safe().insert(pty_id, agent_id.to_string());
+        Ok(())
+    }
+
+    /// Human-only: start a background watch for copilot's "Enable autopilot
+    /// mode" consent dialog on a just-spawned SOLO pane (#364). A single-pane
+    /// copilot agent now launches with `--autopilot` whenever the launcher's
+    /// Autopilot checkbox is on (see `single_pane_autopilot_flags`), so it
+    /// WILL show this dialog — but unlike a group agent, a solo pane never
+    /// gets a programmatic kickoff to hang the confirm off of (`Role::Solo`
+    /// "never receives a kickoff": the human types their own first message,
+    /// and THAT submit is what triggers the dialog). This spawns the SAME
+    /// fail-soft watcher the group kickoff path uses
+    /// ([`confirm_copilot_autopilot_dialog`]), just started at spawn time
+    /// instead of after a loomux-sent Enter, and with
+    /// [`SOLO_AUTOPILOT_DIALOG_WAIT`]'s much longer, human-paced window.
+    ///
+    /// `cli` is re-checked here via [`should_confirm_copilot_autopilot`]
+    /// (not just trusted from the caller) so a non-copilot pane, or one
+    /// launched with the checkbox off, can never start a watcher that writes
+    /// unsolicited bytes into a human's terminal. Best-effort: a missing app
+    /// handle or an already-gone pane just means nothing watches this pane,
+    /// the same failure mode as any other best-effort mint in this file — the
+    /// caller (the launcher, right after pty spawn) never blocks on it.
+    pub fn confirm_solo_copilot_autopilot(&self, pty_id: u32, cli: &str) -> Result<(), String> {
+        if !should_confirm_copilot_autopilot(cli, true, true) {
+            return Ok(());
+        }
+        let app = self.app.lock_safe().clone().ok_or("no app handle")?;
+        let root = self.root.clone();
+        std::thread::spawn(move || {
+            let ptys = app.state::<crate::pty::PtyManager>();
+            confirm_copilot_autopilot_dialog(&ptys, pty_id, &root, SOLO_GROUP, "solo", SOLO_AUTOPILOT_DIALOG_WAIT);
+        });
         Ok(())
     }
 
@@ -11461,19 +11527,20 @@ impl OrchRegistry {
         let app = self.app.lock_safe().clone().ok_or("no app handle")?;
         self.audit(&a.group, from, "prompt", json!({ "to": agent_id, "text": text }));
 
-        // A freshly *booted* group copilot agent is launched with `--autopilot`,
-        // so it opens the "Enable autopilot mode" consent dialog; the worker
-        // thread answers it before pasting the brief. Only a fresh boot shows it
-        // (resume restores the consent from the session log; mid-session is past
-        // boot), and only an unattended copilot agent passes --autopilot — so
-        // the confirm (and its fail-soft wait) is gated to exactly that case.
+        // A booted group copilot agent is launched with `--autopilot`, so it
+        // opens the "Enable autopilot mode" consent dialog; the worker thread
+        // answers it before pasting the brief. Both kickoff deliveries can show
+        // it — a fresh boot AND (#364) a resume, which does NOT reliably
+        // restore the consent as previously assumed — while mid-session is long
+        // past boot, and only an unattended copilot agent passes --autopilot —
+        // so the confirm (and its fail-soft wait) is gated to exactly those cases.
         let confirm_autopilot = {
             let groups = self.groups.lock_safe();
             groups.get(&a.group).is_some_and(|g| {
                 should_confirm_copilot_autopilot(
                     g.guardrails.cli_for(a.role),
                     g.guardrails.auto_ops || a.role == Role::Planner,
-                    delivery.is_fresh_boot(),
+                    delivery.confirms_autopilot_dialog(),
                 )
             })
         };
@@ -11729,12 +11796,13 @@ impl OrchRegistry {
             // submit (not at boot). Answer it now — Enter selects the default
             // "Enable all permissions", which enables autopilot AND lets the brief
             // we just submitted proceed (verified live: the pending message is not
-            // discarded). Gated to a fresh unattended copilot boot; fail-soft, so
-            // if the dialog never shows (already consented, flow changed) delivery
-            // just continues to the retries. Must run before the confirm window so
-            // the dialog's Enter has landed before we judge whether the turn began.
+            // discarded). Gated to a kickoff (fresh OR resumed, #364) of an
+            // unattended copilot boot; fail-soft, so if the dialog never shows
+            // (already consented, flow changed) delivery just continues to the
+            // retries. Must run before the confirm window so the dialog's Enter
+            // has landed before we judge whether the turn began.
             if confirm_autopilot {
-                confirm_copilot_autopilot_dialog(&ptys, pty_id, &root, &group, &agent);
+                confirm_copilot_autopilot_dialog(&ptys, pty_id, &root, &group, &agent, AUTOPILOT_DIALOG_WAIT);
             }
 
             // Confirm the submit landed: watch for the output burst of the box
@@ -12763,6 +12831,17 @@ pub fn orch_solo_prepare(
 #[tauri::command]
 pub fn orch_solo_bind(reg: tauri::State<Arc<OrchRegistry>>, agent_id: String, pty_id: u32) -> Result<(), String> {
     reg.solo_bind(&agent_id, pty_id)
+}
+
+/// Start the solo-pane copilot autopilot consent watcher (#364). See
+/// `OrchRegistry::confirm_solo_copilot_autopilot`.
+#[tauri::command]
+pub fn orch_confirm_solo_copilot_autopilot(
+    reg: tauri::State<Arc<OrchRegistry>>,
+    pty_id: u32,
+    cli: String,
+) -> Result<(), String> {
+    reg.confirm_solo_copilot_autopilot(pty_id, &cli)
 }
 
 /// Adopt an already-running pane (no channel identity yet) as a

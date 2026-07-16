@@ -1697,11 +1697,21 @@ Two related additions: a **planner** role, and **per-role** agent CLI + model.
       interactive framing — it will describe itself as interactive and may pause to ask. For an
       unattended, loomux-driven worker that autonomy directive is exactly what we want, so the
       **group** copilot posture is `--autopilot --allow-all-tools --allow-all-paths`
-      (`COPILOT_GROUP_AUTOPILOT_FLAGS`). The **single-pane** posture stays
-      `--allow-all-tools --allow-all-paths` (`COPILOT_UNATTENDED_FLAGS`, no `--autopilot`): a
-      human is at that pane, interactive framing is correct, and no one wants an unbidden
-      startup dialog. The two atoms are pinned to differ only by `--autopilot` (a test asserts
-      `GROUP == "--autopilot " + single`).
+      (`COPILOT_GROUP_AUTOPILOT_FLAGS`).
+      **#364 update:** the **single-pane** posture used to stay
+      `--allow-all-tools --allow-all-paths` (`COPILOT_UNATTENDED_FLAGS`, no `--autopilot`) on
+      the reasoning that a human at the pane doesn't need autopilot framing — but the human's
+      report was that the launcher's Autopilot checkbox should mean true autopilot mode on a
+      single pane too, same as a group worker. So `single_pane_autopilot_flags("copilot")` now
+      returns `COPILOT_GROUP_AUTOPILOT_FLAGS` verbatim (not a divergent string — same atom, no
+      drift). Since a solo pane never receives a programmatic kickoff (`Role::Solo` "never
+      receives a kickoff" — the human types their own first message), nothing in the group
+      path's `deliver_prompt` confirm exists to answer the resulting dialog for it; a dedicated
+      `OrchRegistry::confirm_solo_copilot_autopilot` watcher is started right after the pane's
+      pty spawns (`orch_confirm_solo_copilot_autopilot`, independent of channel-tools/`soloBind`)
+      and runs the SAME `confirm_copilot_autopilot_dialog` primitive with a far longer,
+      human-paced wait (`SOLO_AUTOPILOT_DIALOG_WAIT`, 10 minutes, vs. the group path's
+      `AUTOPILOT_DIALOG_WAIT`, 12 seconds tuned to loomux's own near-instant kickoff Enter).
 
     - **Answering the consent dialog deterministically.** `--autopilot` makes Copilot open its
       "Enable autopilot mode" dialog at startup (menu: *Enable all permissions (recommended)* /
@@ -1719,10 +1729,38 @@ Two related additions: a **planner** role, and **per-role** agent CLI + model.
       `AUTOPILOT_DIALOG_WAIT` (Copilot changed the flow, or consent was pre-recorded), the
       confirm is a no-op and delivery proceeds. The human's group-level auto-ops choice is the
       consent — loomux is answering a dialog on behalf of an operator who already opted in.
-      The confirm is gated to a **fresh boot** (the `Delivery::FreshKickoff` classification →
-      `should_confirm_copilot_autopilot`): a **resume** restores allow-all/autopilot from
-      Copilot's session event log so no dialog reappears, and mid-session follow-ups/steers are
-      long past boot — both skip the watch rather than eat its fail-soft wait on every delivery.
+      The confirm is gated to a **kickoff** (`Delivery::FreshKickoff` OR, since **#364**,
+      `Delivery::ResumeKickoff` → `Delivery::confirms_autopilot_dialog` →
+      `should_confirm_copilot_autopilot`): mid-session follow-ups/steers are long past boot and
+      skip the watch rather than eat its fail-soft wait on every delivery. **#364 correction:**
+      resume used to skip the confirm too, on the assumption that a resume restores
+      allow-all/autopilot from Copilot's session event log so the dialog would never reappear —
+      the human's report was that this assumption is false (the dialog does reappear, or
+      autopilot isn't restored), so a resumed kickoff now confirms exactly like a fresh boot
+      does.
+
+    - **Accepted tradeoff: the solo watcher's wider false-positive window (#364 review, N1).**
+      The group path's confirm only ever watches for `AUTOPILOT_DIALOG_WAIT` (12s), starting
+      right after loomux's own deterministic kickoff Enter — a narrow window with almost no
+      chance of a stray match. The solo watcher (`confirm_solo_copilot_autopilot`) instead polls
+      the HUMAN's live terminal for up to `SOLO_AUTOPILOT_DIALOG_WAIT` (10 minutes) after spawn,
+      because the dialog-triggering submit is the human's own first message and there is no
+      lower bound on how long that takes. For the whole 10 minutes, ANY output in that pane that
+      happens to contain both `copilot_autopilot_prompt_detected` anchor substrings (case-
+      insensitively: "enable autopilot mode" and "enable all permissions" — e.g. the human
+      pastes prose describing the dialog, or an agent reply happens to quote both phrases) would
+      trigger loomux to inject an unsolicited `Enter` into that pane. This is a strictly wider
+      false-positive blast radius than the group path ever had, and it is an **accepted cost**
+      of AC#1 (a single pane must not launch into true autopilot mode with nothing able to
+      answer its dialog) — not an oversight. The detector itself (`copilot_autopilot_prompt_detected`)
+      is deliberately NOT being tightened in response: it cannot be re-validated against a live
+      Copilot build in an agent session (CLAUDE.md constraint 3), and a tighter match that
+      starts *missing* the real dialog is strictly worse than an occasional spurious Enter — a
+      missed dialog leaves the pane silently stuck at "Continue with limited permissions"
+      instead of true autopilot, while a spurious Enter is at most a wasted keystroke the human
+      notices and can redo. Human live-validation for this PR should include watching for a
+      spurious Enter landing in the solo pane during the watch window, not just confirming the
+      real dialog gets answered.
     Previously a planner in a **non-auto_ops** group got the interactive preset (`acceptEdits`
     with no git/gh allowlist on Claude; plain interactive mode with no allow-all on Copilot),
     so its very first `gh`/explore call would have prompted into the void — a latent deadlock

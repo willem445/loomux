@@ -46,6 +46,7 @@ import {
   disconnectPaneChannel,
   cancelPendingConnect,
   soloBind,
+  confirmSoloCopilotAutopilot,
   SOLO_GROUP,
   type OrchWiring,
   type OrchTarget,
@@ -966,6 +967,7 @@ async function handleWelcomeSubmit(
     channelAgent: channelAgentFor(first),
   });
   await bindSoloIfNeeded(pane, first);
+  watchCopilotAutopilotIfNeeded(pane, first);
   reapIfExited(ws, pane);
   // The first agent converted the setup pane in place — notify so the counter
   // reflects it immediately, not only after the fan-out (#194 P4 HIGH-1). The
@@ -987,6 +989,7 @@ async function handleWelcomeSubmit(
       prev
     );
     await bindSoloIfNeeded(p, spec);
+    watchCopilotAutopilotIfNeeded(p, spec);
     reapIfExited(ws, p);
     prev = p;
     d = d === "row" ? "column" : "row";
@@ -1015,6 +1018,20 @@ async function bindSoloIfNeeded(pane: Pane, spec: AgentLaunchSpec): Promise<void
   } catch {
     /* best-effort — the pane just won't be channel-connectable until adopted */
   }
+}
+
+/** Start the solo-pane copilot autopilot consent watcher (#364) for a
+ *  just-spawned pane, fire-and-forget. Deliberately independent of
+ *  `bindSoloIfNeeded`/`channelAgent` above — the "Enable autopilot mode"
+ *  dialog must be answered whenever `--autopilot` is actually on the command
+ *  line, regardless of whether channel tools happen to be enabled. Best-effort:
+ *  a failed call just leaves the pane's own first submit to hit an unanswered
+ *  dialog, no worse than before this fix existed. */
+function watchCopilotAutopilotIfNeeded(pane: Pane, spec: AgentLaunchSpec): void {
+  if (!spec.watchCopilotAutopilot || pane.ptyId === null) return;
+  void confirmSoloCopilotAutopilot(pane.ptyId, "copilot").catch(() => {
+    /* best-effort — see doc comment above */
+  });
 }
 
 /** Open a welcome pane in the active tab — the entry point the toolbar/shortcuts

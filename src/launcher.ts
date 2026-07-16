@@ -89,6 +89,13 @@ export interface AgentLaunchSpec {
    *  custom launch incurs no `__solo__` identity nobody asked for. Also absent
    *  if the mint itself failed — best-effort, never blocks the launch. */
   channelAgent?: { agentId: string; canSend: boolean };
+  /** #364: true when this pane is a copilot agent launched with `--autopilot`
+   *  (the Autopilot checkbox was on). Copilot opens its blocking "Enable
+   *  autopilot mode" dialog on the pane's first message submit — for a solo
+   *  pane that's the HUMAN's own first Enter, not a loomux kickoff, so nothing
+   *  would otherwise answer it. Independent of `channelAgent`/channel tools:
+   *  the dialog must be answered regardless of whether channel tools are on. */
+  watchCopilotAutopilot?: boolean;
 }
 
 /** What a submitted welcome form resolves to — the caller (main.ts) spawns the
@@ -1345,6 +1352,10 @@ export class WelcomeForm {
           command: cmd,
           sessionId,
           channelAgent,
+          // #364: independent of channelAgent/channelToolsEnabled above — the
+          // dialog must be answered whenever --autopilot is actually on the
+          // command line, regardless of whether channel tools are enabled.
+          watchCopilotAutopilot: !plan.isCustom && plan.autopilot && program === "copilot",
         });
       }
       setDefaultAgent(plan.isCustom ? "custom" : this.agentSel.value);
