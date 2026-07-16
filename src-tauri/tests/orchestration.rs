@@ -7185,6 +7185,33 @@ fn session_digest_requires_exactly_one_identifier() {
     assert!(both["content"][0]["text"].as_str().unwrap().contains("exactly one"));
 }
 
+/// Review finding NB4: `Task.session` is agent-settable via `upsert_task`,
+/// and it reaches a filesystem path join — a `..`/separator-laden value must
+/// be rejected before that join, end to end through the real MCP tool, not
+/// just at the pure `is_safe_session_id` unit level.
+#[test]
+fn session_digest_rejects_a_path_traversal_session_id() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let co = reg.resolve_token(&orch.token).unwrap();
+    let worker = reg.spawn_agent(&g.id, Role::Worker, "w", "task", false, None).unwrap();
+
+    let up = dispatch(&reg, &co, "tools/call", &json!({
+        "name": "upsert_task",
+        "arguments": { "title": "t", "assignee": worker.id, "session": "../../../../etc/passwd" },
+    })).unwrap();
+    assert_eq!(up["isError"], false, "{up}");
+    let task_id = reg.task_summaries(&g.id)[0].id.clone();
+
+    let proc = reg.spawn_agent(&g.id, Role::Worker, "proc", "", false, None).unwrap();
+    let cp = reg.resolve_token(&proc.token).unwrap();
+    let r = dispatch(&reg, &cp, "tools/call",
+        &json!({ "name": "session_digest", "arguments": { "task": task_id } })).unwrap();
+    assert_eq!(r["isError"], true);
+    assert!(r["content"][0]["text"].as_str().unwrap().contains("invalid session id"), "{r}");
+}
+
 #[test]
 fn usage_json_write_is_atomic_and_leaves_no_temp() {
     let (reg, _d) = test_registry();

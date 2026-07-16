@@ -42,6 +42,22 @@ pub enum EventKind {
         /// Edit/Write-like tools carry the touched path here
         /// (`input.file_path`); drives reverted-edit detection.
         file_path: Option<String>,
+        /// The `Edit` tool's `input.old_string`/`input.new_string`, when
+        /// present — the exact text a call replaced and what replaced it.
+        /// Reverted-edit detection needs this: "same file touched twice" is
+        /// too loose (two unrelated edits to one file aren't friction); "the
+        /// second edit's old_string is the first edit's new_string" is cheap,
+        /// deterministic evidence the second call is undoing or overwriting
+        /// what the first one just wrote. `Write`/`MultiEdit` calls don't
+        /// populate these (different input shape), so they never trigger the
+        /// signature — conservative under-detection beats a noisy one.
+        /// Truncated like every other text field here (`TEXT_CAP`), so two
+        /// very long, genuinely-different strings sharing a common prefix
+        /// could in principle compare equal after truncation — accepted for
+        /// the same reason the rest of this module truncates: an
+        /// approximate mechanical signal, not a byte-exact diff.
+        old_string: Option<String>,
+        new_string: Option<String>,
         /// Short display string for a window's summary text — the command
         /// if there is one, else a truncated compact form of the input.
         summary: String,
@@ -135,13 +151,21 @@ fn push_claude_block(events: &mut Vec<TranscriptEvent>, role: &str, ts_ms: Optio
                 .and_then(|i| i.get("file_path"))
                 .and_then(Value::as_str)
                 .map(str::to_string);
+            let old_string = input
+                .and_then(|i| i.get("old_string"))
+                .and_then(Value::as_str)
+                .map(|s| truncate(s, TEXT_CAP));
+            let new_string = input
+                .and_then(|i| i.get("new_string"))
+                .and_then(Value::as_str)
+                .map(|s| truncate(s, TEXT_CAP));
             let summary = command
                 .clone()
                 .or_else(|| file_path.clone())
                 .unwrap_or_else(|| truncate(&input.map(Value::to_string).unwrap_or_default(), 120));
             events.push(TranscriptEvent {
                 role: role.to_string(),
-                kind: EventKind::ToolCall { id, name, command, file_path, summary: truncate(&summary, 120) },
+                kind: EventKind::ToolCall { id, name, command, file_path, old_string, new_string, summary: truncate(&summary, 120) },
                 ts_ms,
             });
         }
@@ -280,8 +304,12 @@ pub enum FrictionSignature {
     NearDuplicateCommand,
     /// (c) a test invocation that failed, followed later by one that passed.
     TestRedToGreen,
-    /// (d) an edit/write to a file, followed later by another edit/write to
-    /// the same file (an overwrite or revert-and-redo).
+    /// (d) an `Edit` call whose `new_string` a LATER `Edit` call to the same
+    /// file names as its own `old_string` — i.e. the second edit operates on
+    /// exactly the text the first one just wrote (undoing it, or replacing
+    /// it with something else). Tighter than "same file touched twice" on
+    /// purpose (review finding NB2, #250/#324 slice B): two unrelated edits
+    /// landing in one file are routine, not friction.
     RevertedEdit,
 }
 
@@ -404,25 +432,40 @@ fn detect_test_red_to_green(events: &[TranscriptEvent]) -> Vec<FrictionWindow> {
     windows
 }
 
-/// (d) an edit/write tool touches the same file twice (in the tool-call
-/// stream — other files' edits in between don't break adjacency).
+/// "Evidence of restoration" (review finding NB2) — cheap and deterministic,
+/// no file access: the second edit's `old_string` is exactly the first
+/// edit's `new_string`, so the second call operates on the exact text the
+/// first one just introduced. Not "some other edit happened to land in the
+/// same file" — the original, false-positive-heavy check this replaces.
+fn edit_overlaps(first_new: Option<&str>, second_old: Option<&str>) -> bool {
+    matches!((first_new, second_old), (Some(a), Some(b)) if !a.is_empty() && a == b)
+}
+
+/// (d) an `Edit` call's `new_string` overlaps a LATER same-file `Edit`
+/// call's `old_string` (in the tool-call stream — other files' edits in
+/// between don't break adjacency). `Write`/`MultiEdit` calls carry no
+/// `old_string`/`new_string` (see the field doc on `EventKind::ToolCall`),
+/// so they never match here — this signature only fires where the evidence
+/// is cheaply checkable, never on a same-file guess.
 fn detect_reverted_edits(events: &[TranscriptEvent]) -> Vec<FrictionWindow> {
-    let edits: Vec<(usize, &str)> = events
+    let edits: Vec<(usize, &str, Option<&str>, Option<&str>)> = events
         .iter()
         .enumerate()
         .filter_map(|(i, e)| match &e.kind {
-            EventKind::ToolCall { name, file_path: Some(fp), .. } if is_edit_tool(name) => Some((i, fp.as_str())),
+            EventKind::ToolCall { name, file_path: Some(fp), old_string, new_string, .. } if is_edit_tool(name) => {
+                Some((i, fp.as_str(), old_string.as_deref(), new_string.as_deref()))
+            }
             _ => None,
         })
         .collect();
     edits
         .windows(2)
-        .filter(|w| w[0].1 == w[1].1)
+        .filter(|w| w[0].1 == w[1].1 && edit_overlaps(w[0].3, w[1].2))
         .map(|w| FrictionWindow {
             signature: FrictionSignature::RevertedEdit,
             start: w[0].0,
             end: w[1].0,
-            summary: format!("{} edited again shortly after", w[0].1),
+            summary: format!("{} edited again, touching the exact text the previous edit wrote", w[0].1),
         })
         .collect()
 }
@@ -447,6 +490,41 @@ pub fn extract_friction_windows(events: &[TranscriptEvent]) -> Vec<FrictionWindo
 // Session digest — friction windows + cheap anchors
 // ---------------------------------------------------------------------------
 
+/// Cap on the number of friction windows a `SessionDigest` carries (review
+/// finding NB1): per-window text is already capped (`TEXT_CAP`/120 chars),
+/// but the WINDOW COUNT was not — a long, flailing session could still emit
+/// hundreds of them into an agent's context, exactly what this module exists
+/// to avoid. A generous handful; see `cap_windows`.
+const MAX_WINDOWS: usize = 20;
+
+/// Keep the `max` most RECENT windows (highest `start`, i.e. closest to
+/// however the session ended — the freshest friction is the most likely to
+/// still matter) and report how many older ones were dropped, so a consumer
+/// can tell "a clean session" from "a truncated digest" instead of silently
+/// losing the tail. Windows are re-sorted chronologically on the way out —
+/// only the SELECTION is recency-biased, not the order a reader sees them in.
+fn cap_windows(mut windows: Vec<FrictionWindow>, max: usize) -> (Vec<FrictionWindow>, usize) {
+    if windows.len() <= max {
+        return (windows, 0);
+    }
+    windows.sort_by_key(|w| w.start);
+    let dropped = windows.len() - max;
+    let kept = windows.split_off(dropped);
+    (kept, dropped)
+}
+
+/// `session_id` is usually system-assigned (Claude's own session uuid), but
+/// `Task.session` can be set by an agent through `upsert_task`'s free-form
+/// `session` field, and it reaches a filesystem path join in
+/// `OrchRegistry::read_session_transcript_events`. Reject anything that
+/// isn't a plain path component before that ever happens (review finding
+/// NB4) — defense in depth: the join target is always under a fixed root
+/// (`~/.claude/projects/*` or `~/.copilot/session-state`), but a `..` or a
+/// separator in the id could still walk it outside that root.
+pub fn is_safe_session_id(id: &str) -> bool {
+    !id.is_empty() && !id.contains(['/', '\\']) && id != "." && id != ".."
+}
+
 /// The reduced signal handed to an agent (process-pro) in place of a raw
 /// transcript: the friction windows plus three anchors — what the worker was
 /// asked to do, what its work resolved to, and how that turned out. The last
@@ -459,6 +537,10 @@ pub struct SessionDigest {
     pub final_diff_ref: Option<String>,
     pub outcome: Option<String>,
     pub windows: Vec<FrictionWindow>,
+    /// How many older windows `cap_windows` cut to stay under `MAX_WINDOWS`
+    /// — 0 for an uncapped digest. Always present, never silent (review
+    /// finding NB1): a consumer can tell a clean session from a truncated one.
+    pub dropped_windows: usize,
 }
 
 /// Build a digest from a normalized event stream. `final_diff_ref`/`outcome`
@@ -479,7 +561,8 @@ pub fn build_digest(
             _ => None,
         })
         .or(initial_prompt_fallback);
-    SessionDigest { initial_prompt, final_diff_ref, outcome, windows: extract_friction_windows(events) }
+    let (windows, dropped_windows) = cap_windows(extract_friction_windows(events), MAX_WINDOWS);
+    SessionDigest { initial_prompt, final_diff_ref, outcome, windows, dropped_windows }
 }
 
 #[cfg(test)]
@@ -564,7 +647,27 @@ mod tests {
                 name: name.into(),
                 command: command.map(str::to_string),
                 file_path: file_path.map(str::to_string),
+                old_string: None,
+                new_string: None,
                 summary: command.or(file_path).unwrap_or_default().into(),
+            },
+            ts_ms: None,
+        }
+    }
+
+    /// An `Edit`-tool call carrying `old_string`/`new_string` — the shape
+    /// `detect_reverted_edits` actually needs evidence from.
+    fn edit_call(id: &str, file_path: &str, old_string: &str, new_string: &str) -> TranscriptEvent {
+        TranscriptEvent {
+            role: "assistant".into(),
+            kind: EventKind::ToolCall {
+                id: id.into(),
+                name: "Edit".into(),
+                command: None,
+                file_path: Some(file_path.into()),
+                old_string: Some(old_string.into()),
+                new_string: Some(new_string.into()),
+                summary: file_path.into(),
             },
             ts_ms: None,
         }
@@ -616,16 +719,49 @@ mod tests {
     }
 
     #[test]
-    fn signature_d_reverted_edit_same_file_touched_twice() {
+    fn signature_d_reverted_edit_requires_evidence_of_restoration() {
         let events = vec![
-            tool_call(0, "t1", "Edit", None, Some("src/foo.rs")),
+            edit_call("t1", "src/foo.rs", "let x = 1;", "let x = 2;"),
             tool_result("t1", false, "ok"),
-            tool_call(2, "t2", "Edit", None, Some("src/foo.rs")),
+            // t2's old_string is exactly t1's new_string: it's undoing t1.
+            edit_call("t2", "src/foo.rs", "let x = 2;", "let x = 1;"),
             tool_result("t2", false, "ok"),
         ];
         let windows = extract_friction_windows(&events);
         let w = windows.iter().find(|w| w.signature == FrictionSignature::RevertedEdit).expect("a RevertedEdit window");
         assert_eq!((w.start, w.end), (0, 2));
+    }
+
+    /// Review finding NB2: the original check fired on ANY two edits to the
+    /// same file, which is routine incremental work, not friction.
+    #[test]
+    fn signature_d_ignores_unrelated_edits_to_the_same_file() {
+        let events = vec![
+            edit_call("t1", "src/foo.rs", "fn a() {}", "fn a() { println!(\"a\"); }"),
+            tool_result("t1", false, "ok"),
+            edit_call("t2", "src/foo.rs", "fn b() {}", "fn b() { println!(\"b\"); }"),
+            tool_result("t2", false, "ok"),
+        ];
+        let windows = extract_friction_windows(&events);
+        assert!(
+            !windows.iter().any(|w| w.signature == FrictionSignature::RevertedEdit),
+            "unrelated edits to the same file must not be flagged: {windows:?}"
+        );
+    }
+
+    /// `Write`/`MultiEdit` calls carry no old_string/new_string, so two
+    /// same-file `Write`s never trigger the signature either — conservative
+    /// under-detection where the evidence isn't cheaply available.
+    #[test]
+    fn signature_d_ignores_same_file_writes_with_no_old_new_evidence() {
+        let events = vec![
+            tool_call(0, "t1", "Write", None, Some("src/foo.rs")),
+            tool_result("t1", false, "ok"),
+            tool_call(2, "t2", "Write", None, Some("src/foo.rs")),
+            tool_result("t2", false, "ok"),
+        ];
+        let windows = extract_friction_windows(&events);
+        assert!(!windows.iter().any(|w| w.signature == FrictionSignature::RevertedEdit));
     }
 
     #[test]
@@ -635,6 +771,58 @@ mod tests {
             tool_result("t1", false, "ok"),
         ];
         assert!(extract_friction_windows(&events).is_empty());
+    }
+
+    // ---- window count cap (review finding NB1) ----
+
+    #[test]
+    fn build_digest_caps_windows_and_reports_how_many_were_dropped() {
+        let total_pairs = MAX_WINDOWS + 5;
+        let mut events = Vec::new();
+        for i in 0..total_pairs {
+            // Distinct tool name per pair so signature (a)'s "next success
+            // for the SAME tool" search can't accidentally bridge pairs.
+            let name = format!("Tool{i}");
+            events.push(tool_call(0, &format!("{i}a"), &name, Some("run"), None));
+            events.push(tool_result(&format!("{i}a"), true, "boom"));
+            events.push(tool_call(0, &format!("{i}b"), &name, Some("run"), None));
+            events.push(tool_result(&format!("{i}b"), false, "ok"));
+        }
+        let digest = build_digest(&events, None, None, None);
+        assert_eq!(digest.windows.len(), MAX_WINDOWS);
+        assert_eq!(digest.dropped_windows, 5);
+        // The oldest 5 pairs were dropped; the kept windows start at pair 5's
+        // failing call (index 5*4 = 20) — recency-biased selection, still
+        // returned in chronological order.
+        assert_eq!(digest.windows[0].start, 20);
+        assert_eq!(digest.windows.last().unwrap().start, 4 * (total_pairs - 1));
+    }
+
+    #[test]
+    fn build_digest_does_not_report_a_drop_when_under_the_cap() {
+        let events = vec![
+            tool_call(0, "t1", "Bash", Some("cargo build"), None),
+            tool_result("t1", true, "boom"),
+        ];
+        let digest = build_digest(&events, None, None, None);
+        assert_eq!(digest.dropped_windows, 0);
+    }
+
+    // ---- session id path-safety guard (review finding NB4) ----
+
+    #[test]
+    fn safe_session_ids_are_accepted() {
+        assert!(is_safe_session_id("64f4d4f6-5201-4da9-8ed9-e0827ffae7df"));
+    }
+
+    #[test]
+    fn session_ids_with_path_separators_or_traversal_are_rejected() {
+        assert!(!is_safe_session_id("../../../../etc/passwd"));
+        assert!(!is_safe_session_id("a/b"));
+        assert!(!is_safe_session_id("a\\b"));
+        assert!(!is_safe_session_id(".."));
+        assert!(!is_safe_session_id("."));
+        assert!(!is_safe_session_id(""));
     }
 
     // ---- build_digest anchors ----

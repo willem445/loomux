@@ -25,7 +25,7 @@ use serde_json::{json, Value};
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
-use std::io::Write as _;
+use std::io::{BufRead as _, BufReader, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, Weak};
@@ -4964,7 +4964,17 @@ impl OrchRegistry {
     /// per-turn transcript today (see `digest::parse_copilot_session_events`'s
     /// doc) — best-effort from what's on disk, never an error just because
     /// the richer files are absent.
+    ///
+    /// `session_id` reaches a filesystem path join below on both branches.
+    /// It's usually system-assigned (Claude's own session uuid), but
+    /// `Task.session` can be set by an agent through `upsert_task`'s
+    /// free-form `session` field — reject anything that isn't a plain path
+    /// component before it ever reaches `Path::join` (review finding NB4,
+    /// #250/#324 slice B follow-up).
     fn read_session_transcript_events(&self, cli: &str, session_id: &str) -> Result<Vec<digest::TranscriptEvent>, String> {
+        if !digest::is_safe_session_id(session_id) {
+            return Err(format!("invalid session id: {session_id:?}"));
+        }
         match cli {
             "claude" => {
                 let root = self
@@ -4975,7 +4985,19 @@ impl OrchRegistry {
                     .ok_or("cannot resolve the Claude projects root")?;
                 let path = crate::usage::claude_transcript_path(&root, session_id)
                     .ok_or_else(|| format!("no Claude transcript found for session {session_id}"))?;
-                let text = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+                // Line-by-line via BufReader, not `fs::read_to_string` (review
+                // finding NB3): mirrors `usage::claude_session_usage_in`. A
+                // transcript is append-only and can be read mid-write — one
+                // malformed byte sequence on a line-in-progress fails
+                // `read_to_string`'s whole-file UTF-8 validation outright,
+                // where `BufReader::lines().map_while(Result::ok)` keeps
+                // everything read up to that point instead.
+                let file = fs::File::open(&path).map_err(|e| e.to_string())?;
+                let mut text = String::new();
+                for line in BufReader::new(file).lines().map_while(Result::ok) {
+                    text.push_str(&line);
+                    text.push('\n');
+                }
                 Ok(digest::parse_claude_transcript_events(&text))
             }
             "copilot" => {
