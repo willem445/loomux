@@ -9438,6 +9438,40 @@ fn notify_register_tick_fires_once_and_delists() {
 }
 
 #[test]
+fn notify_conflicting_fires_distinct_notice_promptly_and_delists() {
+    // #337: a PR that goes CONFLICTING must fire an immediately actionable,
+    // distinct notice — never the standard SUCCESS/FAILURE summary — and
+    // resolve the watch right away, not wait toward the TTL every other
+    // pr_checks watch gets.
+    let (reg, _d, _co, cw) = setup_mcp();
+    let text = register_notify(&reg, &cw, json!({ "kind": "pr_checks", "pr": "329", "expires_minutes": 60 }))
+        .unwrap();
+    let id = extract_watch_id(&text);
+
+    let mut results = HashMap::new();
+    results.insert(id.clone(), notify::PollResult::Conflicting);
+    // Tick immediately (well within the 60-minute TTL) — a standard Met/Failure
+    // wait would never fire here; this must resolve without any expiry.
+    assert_eq!(
+        reg.notify_tick(now_ms(), &results),
+        vec![id.clone()],
+        "a Conflicting result must fire immediately, not wait for expiry"
+    );
+
+    let listed = reg.list_notifications(&cw.agent_id).to_string();
+    assert!(!listed.contains(&id), "a conflicting watch must be delisted, got: {listed}");
+
+    let log = fs::read_to_string(reg.state_root().join(&cw.group).join("audit.jsonl")).unwrap();
+    assert!(log.contains("watch-conflicting"), "the conflict must be audited distinctly, got: {log}");
+    assert!(!log.contains("watch-fired"), "must not be recorded as a standard fire, got: {log}");
+    assert!(log.contains("PR #329 is CONFLICTING"), "the notice must name the PR and the conflict, got: {log}");
+    assert!(log.contains("rebased"), "the notice must be immediately actionable, got: {log}");
+
+    // A second tick with the same result set is a no-op — the watch is gone.
+    assert!(reg.notify_tick(now_ms(), &results).is_empty(), "must not fire twice");
+}
+
+#[test]
 fn notify_pending_does_not_fire_and_stays_listed() {
     let (reg, _d, _co, cw) = setup_mcp();
     let text = register_notify(&reg, &cw, json!({ "kind": "pr_checks", "pr": "5" })).unwrap();

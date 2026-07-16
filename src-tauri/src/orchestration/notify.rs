@@ -150,6 +150,17 @@ pub enum PollResult {
     /// `gh` itself failed (not found, unauthenticated, unknown PR/run) —
     /// distinct from a merely-not-ready condition.
     Failed { why: String },
+    /// A `PrChecks` watch whose PR has gone `mergeStateStatus: CONFLICTING`
+    /// (#337). GitHub structurally never creates a check-suite for a
+    /// conflicted PR — no clean merge ref to run `pull_request`-triggered
+    /// workflows against — so `gh pr checks` would sit at "no checks
+    /// reported" (Pending, above) forever, and the watch would silently poll
+    /// toward expiry with nothing ever going to resolve it. Terminal like
+    /// `Met`, but distinct from it so `notify_tick` fires a different notice
+    /// (naming the conflict, not a SUCCESS/FAILURE summary) and distinct from
+    /// `Failed` so it never counts toward the `gh`-outage fail-streak. Never
+    /// produced for `WorkflowRun` — there is no PR to be conflicting about.
+    Conflicting,
 }
 
 /// Clamp a caller-supplied `expires_minutes` into range, defaulting when
@@ -290,6 +301,42 @@ pub fn pr_checks_result(raw: Result<&str, &str>) -> PollResult {
     }
 }
 
+/// One `gh pr view <pr> --json mergeStateStatus` response.
+#[derive(Deserialize)]
+struct RawPrMergeability {
+    #[serde(rename = "mergeStateStatus")]
+    merge_state_status: String,
+}
+
+/// Classify a `gh pr view <pr> --json mergeStateStatus` poll — run BEFORE
+/// `gh pr checks` for every `PrChecks` watch (#337) so a conflicted PR is
+/// caught before its checks poll ever has a chance to just sit at "no checks
+/// reported" toward expiry. `UNKNOWN` is GitHub's own "still computing
+/// mergeability" state — transient, not a signal, so it reads as `Pending`
+/// exactly like every other non-conflicting status (`CLEAN`, `BEHIND`,
+/// `BLOCKED`, `DIRTY`, `DRAFT`, `HAS_HOOKS`, `UNSTABLE`, or anything `gh`
+/// hasn't documented yet) and the caller falls through to the normal checks
+/// poll. Only the literal `CONFLICTING` short-circuits. A `gh` failure or
+/// unparseable response is also `Pending` here — this call is a pre-check,
+/// not the watch's real condition, so a transient hiccup on THIS call must
+/// never block or fail the watch; the caller simply proceeds to `gh pr
+/// checks` as if this call hadn't run.
+pub fn pr_mergeability_result(raw: Result<&str, &str>) -> PollResult {
+    let json = match raw {
+        Err(_) => return PollResult::Pending,
+        Ok(j) => j,
+    };
+    let parsed: RawPrMergeability = match serde_json::from_str(json) {
+        Ok(p) => p,
+        Err(_) => return PollResult::Pending,
+    };
+    if parsed.merge_state_status.eq_ignore_ascii_case("CONFLICTING") {
+        PollResult::Conflicting
+    } else {
+        PollResult::Pending
+    }
+}
+
 /// `gh run view <id> --json status,conclusion`.
 #[derive(Deserialize)]
 struct RawRun {
@@ -392,6 +439,17 @@ pub fn watch_fired_notice(id: &str, condition: &Condition, summary: &str, note: 
     }
     msg.push_str(&format!(" (watch {id})"));
     truncate_notice(&msg)
+}
+
+/// The notice delivered when a `PrChecks` watch's PR goes `CONFLICTING`
+/// (#337) — immediately actionable and distinct from `watch_fired_notice`'s
+/// SUCCESS/FAILURE summary, since there is no check result to report, only a
+/// PR that structurally cannot get one until it's rebased. Event-led, watch
+/// id trailing — see `watch_fired_notice`'s doc for why.
+pub fn watch_conflicting_notice(id: &str, pr: u64) -> String {
+    truncate_notice(&format!(
+        "[loomux] PR #{pr} is CONFLICTING — checks cannot run until it's rebased (watch {id})"
+    ))
 }
 
 /// The notice delivered when a watch's TTL elapses without completing.
@@ -586,6 +644,58 @@ mod tests {
             PollResult::Failed { why } => assert_eq!(why, "authentication failed"),
             other => panic!("expected Failed, got {other:?}"),
         }
+    }
+
+    // ---------- pr_mergeability_result (#337) ----------
+
+    #[test]
+    fn pr_mergeability_conflicting_short_circuits() {
+        let json = r#"{"mergeStateStatus":"CONFLICTING"}"#;
+        assert_eq!(pr_mergeability_result(Ok(json)), PollResult::Conflicting);
+    }
+
+    #[test]
+    fn pr_mergeability_conflicting_is_case_insensitive() {
+        let json = r#"{"mergeStateStatus":"conflicting"}"#;
+        assert_eq!(pr_mergeability_result(Ok(json)), PollResult::Conflicting);
+    }
+
+    #[test]
+    fn pr_mergeability_unknown_is_pending_not_conflicting() {
+        // UNKNOWN is GitHub's own transient "still computing mergeability"
+        // state — the regression this issue calls out by name: treating it
+        // as conflicting would misfire on every freshly-opened or
+        // just-pushed PR before GitHub has finished the computation.
+        let json = r#"{"mergeStateStatus":"UNKNOWN"}"#;
+        assert_eq!(pr_mergeability_result(Ok(json)), PollResult::Pending);
+    }
+
+    #[test]
+    fn pr_mergeability_clean_and_other_known_states_are_pending() {
+        for state in ["CLEAN", "BEHIND", "BLOCKED", "DIRTY", "DRAFT", "HAS_HOOKS", "UNSTABLE"] {
+            let json = format!(r#"{{"mergeStateStatus":"{state}"}}"#);
+            assert_eq!(pr_mergeability_result(Ok(&json)), PollResult::Pending, "state {state} must not conflict");
+        }
+    }
+
+    #[test]
+    fn pr_mergeability_gh_failure_or_bad_json_falls_through_to_pending() {
+        // This call is a pre-check ahead of the real `gh pr checks` poll — a
+        // transient hiccup on THIS call must never fail or stall the watch,
+        // just let the caller proceed to the checks poll as usual.
+        assert_eq!(pr_mergeability_result(Err("authentication failed")), PollResult::Pending);
+        assert_eq!(pr_mergeability_result(Ok("not json")), PollResult::Pending);
+        assert_eq!(pr_mergeability_result(Ok("{}")), PollResult::Pending);
+    }
+
+    // ---------- watch_conflicting_notice (#337) ----------
+
+    #[test]
+    fn conflicting_notice_is_immediately_actionable_and_names_the_pr() {
+        let n = watch_conflicting_notice("n-7", 329);
+        assert!(n.starts_with("[loomux] PR #329 is CONFLICTING"), "must lead with the event, got: {n}");
+        assert!(n.contains("rebased"), "must name the actionable fix, got: {n}");
+        assert!(n.ends_with("(watch n-7)"), "the watch id trails as a suffix, got: {n}");
     }
 
     #[test]

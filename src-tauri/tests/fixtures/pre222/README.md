@@ -82,6 +82,13 @@ so far:
   on, and treat a step whose verification won't pass after a real attempt as something to
   report rather than quietly skip past.
 
+- **#337, CONFLICTING never gets checks** — `orchestrator.md` and `worker.md` only. A
+  `notify_when(kind: "pr_checks")` watch now resolves the moment its PR goes
+  `CONFLICTING`, with its own distinct notice, instead of polling `gh pr checks` toward
+  expiry against a PR GitHub will never create a check-suite for. `orchestrator.md`'s
+  **The CI gate** section and `worker.md`'s "waiting on your own PR's CI" bullet both
+  gain a one-line pointer to that behavior.
+
 `the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was` renders
 **these** with the six pre-#222 template variables and asserts that a group launched
 with the advanced orchestrator **off** gets exactly that text. They are the

@@ -637,6 +637,10 @@ No job is done while its CI is red. Every PR — sub-PRs between agent branches 
 final PR the human reviews — must have green checks (`gh pr checks <pr>`; a just-pushed
 PR may need a minute before checks appear) before you call the task complete, merge a
 sub-PR, or hand a PR to the human. Include CI status in every completion report.
+A PR gone conflicted is a different failure mode than red checks — GitHub never even
+creates check-suites for it, so a `notify_when(kind: "pr_checks")` watch resolves that
+case immediately with its own distinct notice rather than waiting on checks that will
+never appear; that means rebase, not "still running".
 
 When CI fails:
 

@@ -6537,19 +6537,42 @@ impl OrchRegistry {
         let mut results = HashMap::new();
         for w in &due {
             let Some(repo) = self.group(&w.group).map(|g| g.repo) else { continue };
-            let raw = match &w.condition {
+            let poll_result = match &w.condition {
                 notify::Condition::PrChecks { pr } => {
-                    self.gh_capture(&repo, &["pr", "checks", &pr.to_string(), "--json", "state,name,link"])
+                    // #337: check mergeability BEFORE checks. A conflicted PR
+                    // never gets a check-suite at all (no clean merge ref for
+                    // GitHub to run `pull_request`-triggered workflows
+                    // against), so `gh pr checks` would just sit at "no
+                    // checks reported" (Pending) every tick until expiry —
+                    // this pre-check turns that silent dead end into an
+                    // immediate, distinct notice instead.
+                    let mergeability =
+                        self.gh_capture(&repo, &["pr", "view", &pr.to_string(), "--json", "mergeStateStatus"]);
+                    let mergeability_ref: Result<&str, &str> = match &mergeability {
+                        Ok(s) => Ok(s.as_str()),
+                        Err(e) => Err(e.as_str()),
+                    };
+                    if notify::pr_mergeability_result(mergeability_ref) == notify::PollResult::Conflicting {
+                        notify::PollResult::Conflicting
+                    } else {
+                        let raw = self.gh_capture(&repo, &["pr", "checks", &pr.to_string(), "--json", "state,name,link"]);
+                        let raw_ref: Result<&str, &str> = match &raw {
+                            Ok(s) => Ok(s.as_str()),
+                            Err(e) => Err(e.as_str()),
+                        };
+                        notify::condition_poll_result(&w.condition, raw_ref)
+                    }
                 }
                 notify::Condition::WorkflowRun { run } => {
-                    self.gh_capture(&repo, &["run", "view", &run.to_string(), "--json", "status,conclusion"])
+                    let raw = self.gh_capture(&repo, &["run", "view", &run.to_string(), "--json", "status,conclusion"]);
+                    let raw_ref: Result<&str, &str> = match &raw {
+                        Ok(s) => Ok(s.as_str()),
+                        Err(e) => Err(e.as_str()),
+                    };
+                    notify::condition_poll_result(&w.condition, raw_ref)
                 }
             };
-            let raw_ref: Result<&str, &str> = match &raw {
-                Ok(s) => Ok(s.as_str()),
-                Err(e) => Err(e.as_str()),
-            };
-            results.insert(w.id.clone(), notify::condition_poll_result(&w.condition, raw_ref));
+            results.insert(w.id.clone(), poll_result);
         }
 
         // Stamp last_poll_ms for everything that actually got a `gh` result
@@ -6617,6 +6640,10 @@ impl OrchRegistry {
             Fire(String),
             Expire,
             FailCancel(String),
+            /// #337: the PR went CONFLICTING — terminal like `Fire`, but
+            /// carries no summary since there is no check result, only the
+            /// PR number the distinct notice names.
+            Conflicting(u64),
         }
         let paused = self.paused.lock_safe().clone();
 
@@ -6677,6 +6704,16 @@ impl OrchRegistry {
                         to_remove.push(id.clone());
                         continue;
                     }
+                    Some(notify::PollResult::Conflicting) => {
+                        // Terminal — resolve now, never wait toward expiry
+                        // for checks that structurally will never appear.
+                        let notify::Condition::PrChecks { pr } = &w.condition else {
+                            continue; // unreachable: only produced for PrChecks watches
+                        };
+                        acted.push((w.clone(), Fate::Conflicting(*pr)));
+                        to_remove.push(id.clone());
+                        continue;
+                    }
                     Some(notify::PollResult::Failed { why }) => {
                         w.fail_streak += 1;
                         if w.fail_streak >= notify::NOTIFY_FAIL_STREAK_LIMIT {
@@ -6706,6 +6743,10 @@ impl OrchRegistry {
                 Fate::Fire(summary) => (
                     "watch-fired",
                     notify::watch_fired_notice(&w.id, &w.condition, summary, &w.note),
+                ),
+                Fate::Conflicting(pr) => (
+                    "watch-conflicting",
+                    notify::watch_conflicting_notice(&w.id, *pr),
                 ),
                 Fate::Expire => {
                     let minutes = w.nominal_ttl_ms / 60_000;

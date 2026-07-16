@@ -90,7 +90,11 @@ iteration:
    loomux polls on your behalf and types a `[loomux] …` notice into your pane
    when the checks resolve. If `notify_when` isn't available in this
    environment, poll `gh pr checks <pr>` yourself at a slow cadence —
-   **60 seconds or slower, never a tight loop.**
+   **60 seconds or slower, never a tight loop.** A PR that goes `CONFLICTING`
+   never gets checks at all — GitHub creates no check-suite with no clean
+   merge ref to run against — so the watch resolves right away with a
+   distinct "is CONFLICTING" notice instead of hanging toward expiry; that
+   means rebase, not "still waiting on CI".
 5. **Iterate by pushing fixes.** Quick local iteration (capped, per above) is
    fine between pushes — it just isn't the thing you cite as passing.
 6. **Mark the PR ready once green:**
