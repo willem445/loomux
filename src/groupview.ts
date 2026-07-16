@@ -446,7 +446,13 @@ export class GroupView {
 
     // Auto-dock toggle (#260): whether newly spawned delegate panes open
     // minimized to the tray (default) or expanded into the split tree.
-    this.dockBtn = el("button", "group-btn", "🗕 Auto-dock") as HTMLButtonElement;
+    // No icon glyph — 🗕 (U+1F5D5 SCREEN) was tried first, but it's an
+    // obscure Supplementary-Plane pictograph outside the widely-supported
+    // "RGI" emoji set; Windows' Segoe UI Emoji doesn't cover it and the
+    // fallback glyph reads as a stray underscore before the label (live-test
+    // report). Plain text instead, matching the Fold-panes button just below
+    // (also iconless) rather than gambling on another emoji's font coverage.
+    this.dockBtn = el("button", "group-btn", "Auto-dock") as HTMLButtonElement;
     this.dockBtn.addEventListener("click", () => void this.toggleSpawnExpanded());
 
     // Fold-group toggle (#46), mirroring the orchestrator header button:
@@ -899,7 +905,7 @@ export class GroupView {
     // Reflect the #260 minimize-on-spawn setting on its toggle (positive
     // sense: "on" means new panes auto-dock, i.e. spawnExpandedFlag is false).
     const autoDock = !this.spawnExpandedFlag;
-    this.dockBtn.textContent = autoDock ? "🗕 Auto-dock" : "🗕 Auto-dock: off";
+    this.dockBtn.textContent = autoDock ? "Auto-dock" : "Auto-dock: off";
     this.dockBtn.classList.toggle("on", autoDock);
     this.dockBtn.title = autoDock
       ? "New worker/reviewer/planner panes open minimized to the dock — click to have them open expanded instead"
