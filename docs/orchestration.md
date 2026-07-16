@@ -61,14 +61,21 @@ its own identity token (`--strict-mcp-config`, so workers see nothing else). The
 orchestrator:
 
 - plans work as GitHub issues, labeling ones it owns **`agent-managed`**;
-- decides worktree-vs-branch per task by mergeability — a worktree branch is cut
-  from the repo's default branch (fetched fresh from origin), never from whatever
-  the primary checkout happens to sit on, so parallel work starts from a clean
-  base without a manual rebase. **`git stash` is repo-wide, not per-worktree** —
-  the stash stack lives in the shared `.git`, so agents in separate worktrees of
-  the same group share one stack and a `pop`/`drop`/`clear` by one can destroy
-  another's WIP; role templates tell agents to commit WIP to their own branch
-  instead of stashing;
+- **every worker spawn gets its own dedicated git worktree — always.** Your main
+  clone is *your* environment, so a worker never branches or commits there: its
+  worktree branch is cut from the repo's default branch (fetched fresh from
+  origin), never from whatever the primary checkout happens to sit on, so
+  parallel work starts from a clean base without a manual rebase. The
+  orchestrator cannot spawn a worker into the main clone even if it tried — the
+  MCP tool rejects it outright. (Reviewers and planners are unaffected: a
+  reviewer inspects PRs from the main clone via `gh`, and a planner never gets a
+  worktree at all — see below. For its own mechanical git work, like a rebase
+  or conflict fix with no worker worktree still around, the orchestrator uses a
+  **staging worktree of its own**, kept separate from your clone the same way.)
+  **`git stash` is repo-wide, not per-worktree** — the stash stack lives in the
+  shared `.git`, so agents in separate worktrees of the same group share one
+  stack and a `pop`/`drop`/`clear` by one can destroy another's WIP; role
+  templates tell agents to commit WIP to their own branch instead of stashing;
 - delegates via tools that *type prompts into the worker's CLI* — you see every
   instruction verbatim in the pane, can steer any agent by typing yourself, and
   everything lands in the audit log.

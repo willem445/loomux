@@ -71,6 +71,27 @@ impl Repo {
         fs::write(dir.join(name), body).unwrap();
         self
     }
+    /// A minimal real git repo (one commit on the default branch). Needed by
+    /// #338 tests: a worker spawn's worktree now defaults on at the MCP
+    /// surface, so a test that spawns a worker through `spawn_agent` (rather
+    /// than the direct Rust API) needs real git under this repo to succeed.
+    fn git_init(self) -> Self {
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .current_dir(self.0.path())
+                .args(args)
+                .output()
+                .expect("git must be installed for this test");
+            assert!(ok.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&ok.stderr));
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        fs::write(self.0.path().join("f.txt"), "hi").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "init"]);
+        self
+    }
 }
 
 // ───────────────────────── schema: parse + validate ─────────────────────────
@@ -2645,7 +2666,7 @@ fn orch_caller(reg: &OrchRegistry, group: &str) -> Caller {
 #[test]
 fn mcp_spawn_rejects_an_unknown_kind_instead_of_making_it_a_worker() {
     let (reg, _d) = test_registry();
-    let repo = Repo::new();
+    let repo = Repo::new().git_init(); // the "documented default" spawn below is a worker (#338)
     let g = reg.create_group(&repo.path(), rails()).unwrap();
     let caller = orch_caller(&reg, &g.id);
 
@@ -2732,7 +2753,7 @@ fn mcp_spawn_refuses_kind_orchestrator() {
     // fully-privileged panes. The tool's JSON-schema `enum` is advertisement; it
     // is never enforced against incoming args. This is the enforcement.
     let (reg, _d) = test_registry();
-    let repo = Repo::new();
+    let repo = Repo::new().git_init(); // the loop below spawns a real worker (#338)
     let g = reg.create_group(&repo.path(), rails()).unwrap();
     let caller = orch_caller(&reg, &g.id);
     let before = reg.list_agents(&g.id).as_array().unwrap().len();

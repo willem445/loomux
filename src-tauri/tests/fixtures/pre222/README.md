@@ -89,6 +89,15 @@ so far:
   **The CI gate** section and `worker.md`'s "waiting on your own PR's CI" bullet both
   gain a one-line pointer to that behavior.
 
+- **#338, explicit worktree requirement** — `orchestrator.md` only. `spawn_agent`'s tool
+  description and the **Planning & scheduling** section both drop "a plain branch in the repo
+  (`worktree: false`) is fine" — a worker spawn now always cuts a dedicated worktree and
+  cannot turn it off; there is no more shared-repo option to describe. **Re-sync the fleet**'s
+  "clean and trivial: do it yourself" bullet gains the mechanical-work convention: do the
+  checkout in the PR's own worker worktree if it still exists, otherwise in a staging worktree
+  of your own (`<repo>-worktrees/orch-staging`, reused across mechanical work) — never in the
+  main clone, which is the human's environment.
+
 `the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was` renders
 **these** with the six pre-#222 template variables and asserts that a group launched
 with the advanced orchestrator **off** gets exactly that text. They are the

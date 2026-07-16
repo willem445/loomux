@@ -163,7 +163,8 @@ Guardrails enforced by `spawn_agent`: live-agent cap (`max_agents`, counting wor
 reviewers + planners), CLI + model pinned per role (`{role}_cli` / `{role}_model`, see
 **Plan agent + mixed agent types** below), permission mode fixed at group creation
 (`acceptEdits` default; full-auto opt-in). Worktree creation reuses `git_worktree_add`
-(never for a planner — it is read-only).
+(never for a planner — it is read-only). `worktree` now defaults **on** for a worker spawn
+and cannot be turned off (see **Worker worktree is mandatory** below).
 
 ### Worktree base branch (#204)
 
@@ -190,6 +191,57 @@ invariant so the fix itself cannot introduce a detached-HEAD window.
 `kind` is `worker` (default), `reviewer`, or `planner`. A **planner** explores the
 codebase read-only and writes a structured implementation plan as a GitHub issue comment,
 then reports and exits; it never writes code, branches, worktrees, or PRs.
+
+### Worker worktree is mandatory (#338)
+
+Before this, `worktree` defaulted to `false`: a worker spawned with no explicit `worktree:
+true` worked directly in the group's primary clone — the same checkout the human uses. That
+was fine as long as the orchestrator happened to choose a worktree for anything that could
+collide with the human (in practice it almost always did), but "almost always" is prose, not
+a guarantee, and the whole point of the primary clone is that it's the *human's* environment:
+they may have it open in an editor, mid-rebase, or running the dev server, and a worker
+`checkout`/commit/push landing there under them is a real, live conflict, not a hypothetical.
+
+**The fix is mechanism, not a stronger recommendation in the templates.** `worktree` for a
+worker now defaults to `true`, and — this is the part that had to be a deliberate choice,
+not just a default flip — **passing `worktree: false` for a worker (or a worker-kind
+`block`) is a hard error**, enforced in `mcp.rs`'s `spawn_agent` dispatch, not a silent
+coercion to `true`. Two shapes were on the table:
+
+- **Reject the explicit `false`** (chosen). Consistent with this file's own precedent
+  (#222: an unrecognized `kind` is REJECTED, never silently coerced to `worker`) and with
+  the repo-wide convention of failing loud on a request that contradicts a hard constraint,
+  rather than quietly doing something else. An orchestrator that explicitly asks for
+  `worktree: false` on a worker has a wrong mental model of the guarantee, and coercing it
+  would hide that from the very system prompt (`spawn_agent`'s tool description, and
+  `orchestrator.md`) that is supposed to teach it the guarantee exists.
+- **Coerce + warn** (rejected). Cheaper for a caller that doesn't care, but it means the
+  tool's return value carries a warning an LLM caller may not weight as strongly as an error,
+  and it re-opens exactly the failure mode #338 exists to close: a caller believing it got
+  what it asked for. A hard error is unambiguous in a way a coerced-and-logged success is not.
+
+The guard reads the **effective role** (the named block's `kind` when one is given, falling
+back to the `kind` argument otherwise — the same precedence `spawn_agent_ex` itself applies),
+not just the `kind` argument, so a worker-kind `block` is covered exactly like the bare
+`kind: "worker"` default; naming an *unknown* block is left to `spawn_agent_ex`'s own "unknown
+block" error rather than pre-empted by this guard. A **resume** (`resume_session` + `cwd`) is
+exempt entirely: `spawn_agent_ex`'s `cwd_override` branch governs the workspace whenever `cwd`
+is given, regardless of `worktree`, so gating on the flag there would only reject a value that
+can't do anything. Reviewers and planners are untouched — a reviewer's default stays `false`
+(it inspects PRs via `gh` in the main clone; passing `worktree: true` for one is still
+allowed, unchanged), and a planner never gets a worktree under any `worktree` value, per its
+existing read-only contract.
+
+**The orchestrator's own mechanical work** (a rebase, a conflict fix, cutting a revert branch)
+still sometimes needs a checkout outside a worker's own worktree — and now that a worker
+worktree is guaranteed, doing that work in the primary clone would recreate the exact conflict
+this issue closes, just from the orchestrator's side instead of a worker's. There's no new
+tool for this (the ask was "keep it minimal"): `orchestrator.md`'s **Re-sync the fleet**
+section now documents the convention directly — reuse the PR's own worker worktree if it's
+still around, otherwise cut a `git worktree add <repo>-worktrees/orch-staging <branch>`
+staging worktree (same `<repo>-worktrees/` layout `git_worktree_add` already uses for
+workers) and reuse that one directory across mechanical work by checking out a different
+branch inside it, rather than a fresh worktree per rebase.
 
 ### Pane naming & rename precedence (#95r)
 
