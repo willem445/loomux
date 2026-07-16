@@ -1,0 +1,11 @@
+{"type":"mode","mode":"default","sessionId":"fixture-session-1"}
+{"type":"user","cwd":"C:/Projects/loomux","timestamp":"2026-07-15T10:00:00.000Z","message":{"role":"user","content":"the orchestration test suite is flaky, please fix it"}}
+{"type":"assistant","timestamp":"2026-07-15T10:00:05.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Let me run the suite first."},{"type":"tool_use","id":"call-1","name":"Bash","input":{"command":"npm test","description":"run the frontend suite"}}]}}
+{"type":"user","timestamp":"2026-07-15T10:00:07.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call-1","is_error":true,"content":"npm ERR! this project uses pnpm, not npm"}]}}
+{"type":"assistant","timestamp":"2026-07-15T10:00:10.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"call-2","name":"Bash","input":{"command":"pnpm test","description":"run the frontend suite with the right package manager"}}]}}
+{"type":"user","timestamp":"2026-07-15T10:00:14.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call-2","is_error":false,"content":"1 failing: layout.test.ts"}]}}
+{"type":"assistant","timestamp":"2026-07-15T10:00:20.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"call-3","name":"Edit","input":{"file_path":"src/layout.ts","old_string":"a","new_string":"b"}}]}}
+{"type":"user","timestamp":"2026-07-15T10:00:21.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call-3","is_error":false,"content":"edited"}]}}
+{"type":"assistant","timestamp":"2026-07-15T10:00:25.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"call-4","name":"Bash","input":{"command":"pnpm test","description":"re-run after the fix"}}]}}
+{"type":"user","timestamp":"2026-07-15T10:00:30.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call-4","is_error":false,"content":"all tests passing"}]}}
+{"type":"assistant","timestamp":"2026-07-15T10:00:32.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Fixed: layout.test.ts assumed npm; this repo uses pnpm."}]}}
