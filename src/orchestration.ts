@@ -1103,3 +1103,13 @@ export const soloBind = (agentId: string, ptyId: number): Promise<void> =>
  *  re-adopting an already-adopted pty returns its existing agent id. */
 export const soloAdopt = (ptyId: number, name: string, cwd: string): Promise<{ agent_id: string }> =>
   invoke<{ agent_id: string }>("orch_solo_adopt", { ptyId, name, cwd });
+
+/** Start the solo-pane copilot autopilot consent watcher (#364): a copilot
+ *  pane launched with `--autopilot` opens a blocking "Enable autopilot mode"
+ *  dialog on its first message submit, and for a solo pane that's the human's
+ *  own first Enter — nothing else would answer it. Call right after
+ *  `spawnPty` resolves, whenever the pane is copilot AND the Autopilot
+ *  checkbox was on (`AgentLaunchSpec.watchCopilotAutopilot`), independent of
+ *  whether a channel identity (`soloBind`) was also minted for it. */
+export const confirmSoloCopilotAutopilot = (ptyId: number, cli: string): Promise<void> =>
+  invoke("orch_confirm_solo_copilot_autopilot", { ptyId, cli });
