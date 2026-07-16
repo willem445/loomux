@@ -127,8 +127,10 @@ below for why that is load-bearing, not incidental.
 document's own precedent in `orchestration/workflow.rs` states for blocks
 generally: *n8n keys its graph by a node's display name, so a rename silently
 breaks every reference to it.* Here, `id` is what `pluginId` persists, what
-the `plugin://` origin is keyed by (below), and what "is this plugin still
-installed" is checked against on restore. It is chosen once by the plugin
+the `plugin://` scheme's per-plugin folder jail is keyed by (below — its
+*address space*, not necessarily a distinguishable browser origin; see
+Install/discovery), and what "is this plugin still installed" is checked
+against on restore. It is chosen once by the plugin
 author and is not intended to change across the plugin's own versions.
 `name` can be retitled in any release without touching a single persisted
 pane.
@@ -224,7 +226,7 @@ there is no code path to find a bug in, because there is no code path.
 | Rendering | Draw arbitrary DOM/canvas in its own pane box; burn CPU inside its own sandboxed frame. | Read or manipulate the host DOM outside its own frame. |
 | Data | Read files under its own declared root (`fs.read`); persist its own namespaced view state (`storage`); read a read-only system-metrics stream (`metrics.system`). | Write **any** file; read another plugin's storage; read outside its own root; read process command lines/paths beyond name+pid+stats. |
 | System reach | Nothing beyond the three capabilities above. | Call `invoke` or reach any of the ~117 app commands directly; spawn or write to a PTY; touch git or `gh`; mint or read an orchestration/merge grant; steer or inject input into an agent pane. |
-| Network | Nothing. | Phone home, load a remote resource, or otherwise reach the network — enforced by the per-frame CSP (`connect-src 'none'`, see Isolation). |
+| Network | Nothing. | Phone home, load a remote resource, or otherwise reach the network — enforced by a restrictive CSP header served on every `plugin://` response, **not** by the iframe `sandbox` attribute alone (which does not restrict network egress). See **Content-Security-Policy on plugin content**, under Isolation. |
 
 ### Grant is a human decision, made once, at install
 
@@ -288,9 +290,16 @@ interface PluginEvent {
 Every `PluginRequest` the broker receives is checked, in this order, before
 any handler runs:
 
-1. **Origin check** — `event.source === frame.contentWindow` for a frame the
-   broker itself created, and the message's origin matches that frame's
-   opaque origin. A message from anywhere else is dropped, not answered.
+1. **Identity check** — `event.source === frame.contentWindow`, compared
+   against the specific frame object the broker created for that plugin
+   pane. This window-reference identity is the security-bearing check, **not**
+   an origin-string comparison: under the recommended sandboxed-iframe model
+   (below), every plugin's frame reports `event.origin === "null"` — the
+   opaque origin `sandbox="allow-scripts"` without `allow-same-origin`
+   produces — so origin strings cannot and do not distinguish one plugin's
+   frame from another's. Only the live window reference can. A message whose
+   `source` isn't the exact frame object the broker is listening for is
+   dropped, not answered, regardless of what `origin` it claims.
 2. **`apiVersion` check** — the method exists at the plugin's declared
    `apiVersion`. If not: `error.code = "unsupported-version"`.
 3. **Capability check** — the method's owning capability is in the set the
@@ -338,6 +347,35 @@ iframe, `postMessage`, no Node/host access) — a proven pattern at exactly
 this scale (view-level plugin code, not a service), not a novel design being
 tried for the first time here.
 
+### Content-Security-Policy on plugin content
+
+`sandbox="allow-scripts"` stops DOM/storage/IPC reach — it does **not** stop
+network egress. A sandboxed frame with no CSP can still `fetch()` an
+arbitrary host, load a remote `<img>`/`<script>`, or open a `WebSocket`;
+sandboxing and network isolation are two separate guarantees, and only a CSP
+served *with the plugin's content* provides the second one. So this is part
+of the contract, not a Slice B implementation detail left to chance: **every
+response the `plugin://` scheme handler returns MUST carry a restrictive
+`Content-Security-Policy` header**, at minimum
+
+- `connect-src 'none'` — no `fetch`/`XHR`/`WebSocket`/`EventSource` to
+  anywhere, including loopback;
+- `default-src`, `script-src`, `img-src`, and `style-src` bounded to
+  `'self'`/`plugin:` — a plugin loads its own bundled assets and nothing
+  remote;
+- `frame-src 'none'` and `object-src 'none'` — a plugin cannot embed a
+  further frame or object to route around the policy.
+
+This header is a property of **what is served**, not of the container
+serving it — it rides on the HTTP-shaped response the scheme handler returns
+for every asset request, so it applies unchanged whichever isolation
+primitive ends up hosting the frame (the recommended iframe or the
+`WebviewWindow` fallback below). A Slice B implementation that serves
+`plugin://` assets without this header silently falsifies the "cannot phone
+home" row in the threat table above, even if the frame's sandbox/isolation
+is otherwise perfect — the two mechanisms are independent, and this note
+requires both.
+
 ### One genuine unknown, and how a flip changes one section, not this whole note
 
 Everything above assumes Tauri does not inject `__TAURI_INTERNALS__` into
@@ -354,16 +392,20 @@ section:**
 
 - **If the spike confirms isolation holds** (the expected, recommended
   outcome): nothing else in this note changes. The broker, the capability
-  enum, the manifest, and the install story are all agnostic to *which*
-  isolation primitive hosts the frame — they only depend on "the plugin's
-  code cannot reach `invoke` and cannot reach the host DOM," which either
-  primitive satisfies.
+  enum, the manifest, the CSP contract above, and the install story are all
+  agnostic to *which* isolation primitive hosts the frame — they only depend
+  on "the plugin's code cannot reach `invoke` and cannot reach the host DOM,"
+  which either primitive satisfies.
 - **If the spike finds a leak** (Tauri injects into all frames regardless of
   origin): the isolation primitive flips to the fallback below. Every other
-  section of this note — manifest, capability enum, broker envelope,
-  install/discovery — is unchanged, because none of them names the iframe
-  specifically; they name "the plugin's sandboxed frame," which the fallback
-  still provides.
+  section of this note — manifest, capability enum, broker envelope, the CSP
+  contract, install/discovery — is unchanged, because none of them depends on
+  iframe-specific mechanics (an opaque `"null"` origin, `sandbox` semantics);
+  they depend on "the plugin's sandboxed frame" and "the response the
+  `plugin://` handler returns," both of which the fallback still provides.
+  The one place that *does* read as iframe-specific — the origin discussion
+  in Install/discovery's `plugin://` bullet — is written below to call that
+  out explicitly, so a flip edits nothing there either.
 
 ### Fallback: child `WebviewWindow` with scoped capabilities
 
@@ -389,12 +431,20 @@ reachable, including a merge grant).
 
 ## Install / discovery
 
-- **Install location:** `<app-data>/loomux/plugins/<id>/`, one folder per
-  plugin, scanned on boot. A folder is a plugin if it contains a `plugin.json`
-  that passes manifest validation; a folder that doesn't is skipped, not
-  treated as an error that blocks discovery of the others (the same
-  "one bad entry doesn't take down the rest" posture the workflow model's
-  audited-and-skipped failure policy uses).
+- **Install location (recommended — see Open decisions, below):**
+  `<app-data>/loomux/plugins/<id>/`, one folder per plugin, scanned on boot.
+  This is the recommendation the rest of this section is written against, not
+  a settled decision: the plan flags a repo-scoped `.loomux/plugins/`
+  (git-shared, exactly like `.loomux/workflow.yml`) as a live alternative for
+  a team that wants its plugin roster to travel with the repo rather than the
+  machine, and leaves picking one (or supporting both) to the human. A folder
+  is a plugin if it contains a `plugin.json` that passes manifest validation;
+  a folder that doesn't is skipped, not treated as an error that blocks
+  discovery of the others (the same "one bad entry doesn't take down the
+  rest" posture the workflow model's audited-and-skipped failure policy
+  uses). The install action, the `plugin://` scheme, and the no-marketplace
+  stance below are all agnostic to which location (or both) is ultimately
+  chosen.
 - **Install action:** an in-app **Install plugin…** picker that copies a
   chosen folder into the plugins directory. "Install" means exactly that copy
   — there is no build step, no compilation, no fetch from anywhere. A source
@@ -408,14 +458,68 @@ reachable, including a merge grant).
   `plugin://<id>/...`, resolving strictly inside that plugin's own folder —
   the same server-side path-validation discipline the rest of the app already
   applies to file access (canonicalize, reject anything that escapes). This
-  is also what gives each plugin its own opaque origin under the iframe model
-  above: two plugins never share an origin, so `storage` and any future
-  origin-scoped browser API can never bleed between them.
+  gives every plugin its own **address space for asset serving** (one
+  plugin's `entry` can never resolve into another's folder) and is the
+  request the CSP header above rides on. It does **not** by itself give each
+  plugin a distinguishable *browser origin* under the recommended
+  sandboxed-iframe model: every such frame's opaque origin serializes to the
+  same string, `"null"`, regardless of which `id` served it (see the identity
+  check in the Broker contract, above). Two plugins never bleed into each
+  other's `storage` because the broker namespaces storage keys by `pluginId`
+  host-side (the capability table, above) — not because of origin isolation.
+  (Under the `WebviewWindow` fallback, `plugin://<id>` **does** become each
+  window's own real, distinguishable origin — one more reason this note
+  leans its guarantees on the CSP and the folder jail, not on origin
+  comparison, so the two isolation models stay behaviorally equivalent from
+  a plugin author's perspective.)
 - **No remote marketplace in v1.** Discovery is local-folder-scan only; there
   is no in-app browse/search/download of plugins from anywhere. Getting a
   plugin onto the machine is entirely the human's own act (copy a folder,
   or use the picker to copy one in) — nothing in loomux fetches plugin code
   from the network on its own.
+
+## Open decisions (pending human veto)
+
+The plan closes with five decisions it names explicitly as the human's call,
+not this note's to settle. Recording them here, together, is deliberate: two
+of them (isolation model, capability breadth) are already threaded through
+the sections above as gated/flagged, but presenting only those two risks
+reading the other three as quietly decided. None of the five is closed by
+this note — a veto on any one is a targeted edit to the section(s) it names,
+not a rewrite of the contract:
+
+1. **Isolation model.** *Recommended:* the sandboxed opaque-origin iframe
+   (Isolation, above), pending the Phase-0 spike. *On veto or spike failure:*
+   the child `WebviewWindow` fallback, already specified above as a full
+   alternative. *Must not ship regardless:* no isolation at all — a plugin
+   with unsandboxed reach to all ~117 commands, which this whole note exists
+   to refuse.
+2. **Install location.** *Recommended:* `<app-data>/loomux/plugins/<id>/`,
+   scanned on boot (Install/discovery, above). *Live alternative:* a
+   repo-scoped `.loomux/plugins/`, committed and git-shared exactly like
+   `.loomux/workflow.yml` — the natural choice if "a team standardizes on
+   the same plugin roster" matters more than "a plugin follows me across
+   repos." The plan leaves picking one (or supporting both) to the human;
+   this note does not foreclose it.
+3. **API surface breadth.** The v1 capability enum (`panel`, `storage`,
+   `fs.read`, `metrics.system`) is deliberately narrow — no writes, no
+   git/gh/PTY/orchestration reach. Widening what an existing capability means
+   (e.g. `fs.read` → `fs.write`) or adding a new capability class is a
+   per-capability decision with its own threat review; this note pre-approves
+   none of that, only the four rows as written.
+4. **Bundling the example plugin as installed-by-default.** Slice F's
+   resource monitor is planned to ship already installed, so the demo works
+   without a manual install step — which also means a default plugin holds
+   `metrics.system` from first run. The alternative is shipping it
+   *uninstalled* (bundled in the app but requiring the same Install action as
+   any third-party plugin). Confirm the turnkey default is actually wanted
+   before Slice F ships it that way.
+5. **Deferring the pane-kind registry refactor.** This note's design adds
+   `"plugin"` to the existing closed unions (One new content kind, above) and
+   deliberately does not collapse the four built-in kinds into a general
+   registry first. That is the right scope for v1 — confirm the deferral is
+   acceptable rather than assumed, since a future registry refactor would
+   revisit every union site this note lists.
 
 ## v1 non-goals (verbatim from the plan)
 
@@ -437,7 +541,10 @@ are stated, without drifting from what was actually agreed:
 - **Slice B** (backend host) implements manifest parsing/validation and the
   `plugin://` scheme exactly as specified above — reject-with-reason on any
   manifest violation, path-traversal-proof by construction, never a partial
-  accept.
+  accept, and every scheme response carrying the CSP header the
+  **Content-Security-Policy on plugin content** section specifies. Omitting
+  that header is not a smaller version of this slice — it silently falsifies
+  the threat table's network row.
 - **Slice C** (the broker, the trust core) runs the Phase-0 spike first;
   implements the envelope shapes and the four-step per-message check as one
   pure function plus DOM wiring around it; forwards nothing to `invoke`,
