@@ -476,9 +476,9 @@ group and relaunching, which throws away the orchestrator's context along with
 its pane. #316 makes the toggle a **live** control — a groupview button, not
 just a launcher checkbox — and the case for it is the same consent story as
 the toggle itself: a human who is *already looking at the roster* (the
-groupview chrome the toggle now shows, per **Surfacing the workflow**, below)
-can consent to a change the same way the launcher preview does, without
-needing to tear the group down first.
+groupview chrome the toggle now shows — see `docs/orchestration.md`'s
+*Custom agent workflows* section) can consent to a change the same way the
+launcher preview does, without needing to tear the group down first.
 
 The live setter is not a new mechanism — it is modeled on the two setters that
 already do exactly this shape: `set_max_agents` (validate → persist-first via
@@ -510,11 +510,14 @@ the new state (workflow name and the armed gate, or "built-in roster, no merge
 gate") so the orchestrator can revise its spawn/review strategy mid-session
 instead of discovering the change on a bounced merge.
 
-> **TODO (aggregate assembly):** the exact notice string, the refusal-message
-> wording below, and the satisfiability audit key are Slice A's to finalize
-> (`src-tauri/src/orchestration/mod.rs`, `workflow.rs`). This note describes the
-> behavior the plan commits to; reconcile the quoted strings against Slice A's
-> landed implementation before this lands on `main`.
+The notice is `workflow_mode_notice`'s literal text
+(`src-tauri/src/orchestration/mod.rs`): off reads `"[loomux] workflow mode
+changed: built-in roster, no merge gate — re-plan your spawn/review
+strategy."`; on reads `"[loomux] workflow mode changed: '<name>' active,
+<gate clause> — re-plan your spawn/review strategy."`, where `<gate clause>`
+is `merge gate requires all of|N of [<reviewers>]` plus a ` · `-joined
+`also:` list when the gate declares one, or `no merge gate declared` when it
+doesn't.
 
 ### Three secondary outcomes
 
@@ -976,9 +979,9 @@ under a gated workflow stays gated even after the human turns the workflow off
 want to be surprised when I go to merge an item created in a custom workflow
 and get rejected when I'm in a normal workflow." A provenance-carried gate is
 exactly that surprise. A session-scoped gate, paired with the roster/gate
-chrome always visible in the lifecycle UI (see the README's *Workflow
-visibility* section), means the human always knows which rule is live before
-they click Approve — session-scoped is simpler *and* is the unsurprising
+chrome always visible in the lifecycle UI (see `docs/orchestration.md`'s
+*Custom agent workflows* section), means the human always knows which rule
+is live before they click Approve — session-scoped is simpler *and* is the unsurprising
 answer.
 
 One thing this does **not** change: a human "Approve" grant still never opens
@@ -996,10 +999,14 @@ task board's Approve control, the groupview workflow row):
 3. merge through the GitHub UI directly — the shim only gates `gh`/local `git`
    push-to-merge paths, not GitHub's own merge button.
 
-> **TODO (aggregate assembly):** the literal refusal text (shim message +
-> board tooltip copy) is Slice A/C's to write. This section states the
-> requirement — three exits, always named — for the doc; reconcile against the
-> shipped strings before merging to `main`.
+The shipped text: the shim and the Rust-side status line share
+`GATE_REFUSAL_EXITS` (`src-tauri/src/orchestration/mod.rs`) verbatim —
+`"Three ways forward: (1) get the named reviewer(s) to run and record a
+verdict, (2) have the human turn workflow mode off for this session (clears
+the gate), or (3) merge this PR from the GitHub UI, which is not gated."`
+The board tooltip is its own wording of the same three exits —
+`gateExitsMessage()` (`src/workflowstatus.ts`) — since a shell string and a
+TypeScript string can't share one constant.
 
 ### loomux never silently arms a gate the roster can't satisfy (#316)
 
@@ -1024,10 +1031,9 @@ a chip in the lifecycle UI a human sees *before* the first merge attempt,
 not after. Silence is what turned tonight's bug into an hours-long
 half-workflow state; a loud, wrong-looking gate is recoverable in one glance.
 
-> **TODO (aggregate assembly):** the pure check's name (the plan sketches
-> `workflow::gate_missing_blocks(gate, blocks) -> Vec<BlockId>`) and the exact
-> audit key are Slice A's. Reconcile this section's wording against what
-> actually lands before assembling the aggregate PR.
+The pure check landed exactly as sketched —
+`workflow::gate_missing_blocks(gate: &Gate, blocks: &[Block]) -> Vec<BlockId>`
+— and the audit key it feeds is `merge-gate-unsatisfiable`.
 
 ### Where the reviewer learns about it
 
