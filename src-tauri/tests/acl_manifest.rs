@@ -5,7 +5,7 @@
 //! without an explicit grant silently unreachable for every window,
 //! including `main`. These tests turn that silent failure into a red test:
 //!
-//!   - `generate_handler_matches_app_commands` / `app_commands_len_is_120`:
+//!   - `generate_handler_matches_app_commands` / `app_commands_len_is_121`:
 //!     `src/lib.rs`'s `generate_handler!` and `command_manifest::APP_COMMANDS`
 //!     are the two hand-maintained lists this migration depends on staying
 //!     identical; this diffs them directly out of the `lib.rs` source rather
@@ -70,7 +70,7 @@ stub_commands!(
     orch_set_idle_activity_floor, orch_autonomy, orch_group_usage, orch_group_summary,
     orch_workflow_preview, orch_group_watches, orch_end_group, orch_channel_connect,
     orch_channel_disconnect, orch_channel_list, orch_channel_for_pane, orch_channel_set_sender,
-    orch_solo_prepare, orch_solo_bind, orch_solo_adopt,
+    orch_solo_prepare, orch_solo_bind, orch_confirm_solo_copilot_autopilot, orch_solo_adopt,
     probe_agent_cli,
     open_in_editor,
     ft_list_dir, ft_read_file, ft_write_file, ft_search_start, ft_search_cancel, ft_files_start, ft_replace,
@@ -153,12 +153,13 @@ fn generate_handler_matches_app_commands() {
 }
 
 #[test]
-fn app_commands_len_is_120() {
+fn app_commands_len_is_121() {
     assert_eq!(
         loomux_lib::command_manifest::APP_COMMANDS.len(),
-        120,
-        "APP_COMMANDS drifted from the #363 plan's audited count of 120 — if this is an \
-         intentional addition/removal, update the plan's inventory table too (issue comment on #363)"
+        121,
+        "APP_COMMANDS drifted from the expected count of 121 (120 per the #363 plan's audited \
+         count, +1 for orch_confirm_solo_copilot_autopilot added in #364) — if this is an \
+         intentional addition/removal, update this tripwire's count too"
     );
 }
 

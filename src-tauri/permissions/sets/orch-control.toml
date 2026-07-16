@@ -40,5 +40,6 @@ permissions = [
     "allow-orch-channel-set-sender",
     "allow-orch-solo-prepare",
     "allow-orch-solo-bind",
+    "allow-orch-confirm-solo-copilot-autopilot",
     "allow-orch-solo-adopt",
 ]
