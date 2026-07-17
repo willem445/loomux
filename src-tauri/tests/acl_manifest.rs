@@ -47,11 +47,17 @@
 //!     failure at the moment of the mistake, only a working exploit later.
 //!     This test builds a real `main` window, `add_child`s a second webview
 //!     labeled like a real plugin (`plugin-*`), and proves against the app's
-//!     *actual* on-disk capabilities that the child is denied a `main-ui`
-//!     command while `main`'s own webview keeps it — i.e. it tests the real
-//!     shipped `default.json`/`plugin.json`, not a simulated ACL config, so a
-//!     future `windows: ["main"]` regression fails THIS test immediately, not
-//!     silently.
+//!     *actual* on-disk capabilities that the child is denied EVERY ONE of
+//!     the 127 app commands except its own curated plugin-broker grant, while
+//!     `main`'s own webview keeps every command — i.e. it tests the real
+//!     shipped `default.json`/`plugin.json`, not a simulated ACL config, and
+//!     it is deliberately a comprehensive sweep rather than a single-command
+//!     canary (rev-89 NB-2): a canary on one command (the test's original
+//!     shape, `pty_backend_info` only) only catches a `windows`-scoped leak
+//!     on THAT command — a future capability that windows-scopes some OTHER
+//!     app command would slip past a canary silently. Looping every command
+//!     makes this guard catch the whole CLASS of mistake, not just the one
+//!     instance of it the spike happened to find.
 //!
 //! Red-before-green (cited in the PR): dropping `orch_grant_merge` from
 //! `permissions/sets/orch-control.toml` makes
@@ -62,9 +68,13 @@
 //! Reverting `capabilities/default.json`'s `"webviews": ["main"]` back to
 //! `"windows": ["main"]` makes
 //! `webview_scope_guard_denies_windows_scoped_leak_to_child_webview` fail
-//! with `zero-permission-labeled child webview embedded in main should be
-//! DENIED pty_backend_info, got Ok(...) — the windows-scoped-grant leak the
-//! #360 multiwebview spike found is back`.
+//! with `child webview embedded in main leaked: [...127 commands...] — some
+//! capability is granting an app command via windows: scope`. Adding a NEW,
+//! otherwise-unrelated `windows`-scoped grant of a single different command
+//! (e.g. a throwaway capability granting `orch_grant_merge` via
+//! `windows: ["main"]`) makes the same test fail the same way, listing just
+//! that one command — proving the guard catches the mistake class, not only
+//! the specific `default.json` leak the spike originally found.
 
 // Stub commands: same bare identifiers as the real commands in
 // `src/command_manifest.rs` / `src/lib.rs`'s `generate_handler!`, but
@@ -404,24 +414,55 @@ fn webview_scope_guard_denies_windows_scoped_leak_to_child_webview() {
          own — this is exactly the ambiguity `windows`-scoped grants exploit"
     );
 
+    // Comprehensive, not a single canary: every one of the 127 app commands must
+    // be denied to the child webview EXCEPT the two the plugin capability
+    // legitimately grants. A single-command probe (the original shape of this
+    // test, `pty_backend_info` only) only catches a `windows`-scoped leak on
+    // THAT one command — a future capability that windows-scopes some OTHER
+    // command (say, a new main-only command added without checking this file)
+    // would slip past it entirely. Looping every command instead makes this
+    // guard catch the whole CLASS of mistake ("any windows-scoped app-command
+    // grant leaks to a child webview"), proven against the real resolved ACL
+    // (not a re-implementation of set-expansion logic), so it's blind to WHICH
+    // capability file or WHICH command the mistake shows up in.
+    const PLUGIN_ALLOWED: &[&str] = &["plugin_broker_request", "plugin_broker_open_channel"];
+    let leaked: Vec<&str> = loomux_lib::command_manifest::APP_COMMANDS
+        .iter()
+        .copied()
+        .filter(|cmd| !PLUGIN_ALLOWED.contains(cmd))
+        .filter(|&cmd| invoke_webview(&child, cmd).is_ok())
+        .collect();
     assert!(
-        invoke_webview(&child, "pty_backend_info").is_err(),
-        "zero-permission-labeled child webview embedded in main should be DENIED \
-         pty_backend_info, got Ok(...) — the windows-scoped-grant leak the #360 multiwebview \
-         spike found is back: capabilities/default.json must scope main's grant via `webviews`, \
-         not `windows`"
+        leaked.is_empty(),
+        "child webview embedded in main leaked: {leaked:?} — some capability is granting an \
+         app command via `windows:` scope instead of `webviews:` scope, which (per \
+         Capability::windows's own doc comment) leaks to EVERY child webview of that window \
+         regardless of the child's own label. The #360 multiwebview spike found this leak on \
+         `capabilities/default.json`'s main grant specifically, but this guard is deliberately \
+         not scoped to that one file or that one command."
     );
+
+    // main's own webview must be UNAFFECTED by the webviews-scoping fix — every
+    // app command still reachable. If this fails, the leak-denial above isn't a
+    // real per-webview boundary, it's a broken pipe, and proves nothing.
+    let denied_for_main: Vec<&str> = loomux_lib::command_manifest::APP_COMMANDS
+        .iter()
+        .filter(|&&cmd| invoke(&main, cmd).is_err())
+        .copied()
+        .collect();
     assert!(
-        invoke(&main, "pty_backend_info").is_ok(),
-        "main's own webview should still get pty_backend_info — if this fails too, the child's \
-         denial above is not a real per-webview boundary, it's a broken pipe, and proves nothing"
+        denied_for_main.is_empty(),
+        "main is missing a grant for: {denied_for_main:?} — the webviews-scoping fix must not \
+         narrow main's own coverage, only stop it leaking to embedded children"
     );
 
     // The child still gets exactly its curated plugin-broker grant — the fix
     // (`webviews`-scoping) isn't a blanket deny, it's a real per-label check.
-    assert!(
-        invoke_webview(&child, "plugin_broker_request").is_ok(),
-        "the child webview's own plugin-* capability grant should still work after the \
-         webviews-scoping fix"
-    );
+    for &cmd in PLUGIN_ALLOWED {
+        assert!(
+            invoke_webview(&child, cmd).is_ok(),
+            "the child webview's own plugin-* capability grant should still work after the \
+             webviews-scoping fix ({cmd})"
+        );
+    }
 }
