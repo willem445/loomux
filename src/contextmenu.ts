@@ -9,13 +9,6 @@
 // but the type wasn't yet generic enough for; filemenu.ts's own `MenuItem`/`MenuAction`
 // stay as they are and satisfy `MenuItem<MenuAction>` structurally, so that caller is
 // unaffected.
-//
-// Registers with the shared overlay registry (overlaystate.ts) for as long as a menu is
-// open (#391, folded into #380) — a plugin pane's native child webview swallows both
-// paint and pointer events under a DOM overlay, so a menu opened over one would
-// otherwise render behind it and be unclickable.
-
-import { overlayState } from "./overlaystate";
 
 /** Generic menu-item shape shared by every context menu in the app. `A` is the
  *  caller's own action union (filemenu.ts's `MenuAction`, panemenu.ts's
@@ -65,12 +58,10 @@ export function showContextMenu<A>(
   root.className = "ctxmenu";
   root.tabIndex = -1;
 
-  const closeOverlaySlot = overlayState.open();
   const cleanups: (() => void)[] = [];
   const dispose = () => {
     if (openMenu?.el !== root) return;
     openMenu = null;
-    closeOverlaySlot();
     for (const fn of cleanups) fn();
     root.remove();
   };

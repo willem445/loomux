@@ -72,16 +72,7 @@ export function pluginWebviewRect(rect: ElementRect): PluginWebviewRect {
  *  wiring a bespoke hook into every one of those (dock, tab-switch,
  *  maximize-elsewhere all mutate the DOM differently), the plugin pane reuses
  *  the SAME zero-size signal `applyFit()` already uses to skip a PTY resize
- *  on a hidden pane — one predicate, one meaning, wherever it's read.
- *
- *  `overlayOpen` (#391, folded into #380): a plugin's child webview always
- *  paints ABOVE `main`'s own DOM content within its bounds and swallows
- *  pointer events there — a loomux overlay (the sessions browser, a modal, a
- *  context menu, …) opening over the pane's screen region does NOT zero its
- *  rect (the pane itself is still laid out normally underneath), so the
- *  rect-only check above can't see it. `overlayOpen` is the shared registry's
- *  `isOpen` (overlaystate.ts) threaded in by the caller — true forces a hide
- *  regardless of geometry, false defers to the rect exactly as before. */
-export function pluginWindowShouldShow(rect: ElementRect, overlayOpen: boolean): boolean {
-  return rect.width > 0 && rect.height > 0 && !overlayOpen;
+ *  on a hidden pane — one predicate, one meaning, wherever it's read. */
+export function pluginWindowShouldShow(rect: ElementRect): boolean {
+  return rect.width > 0 && rect.height > 0;
 }

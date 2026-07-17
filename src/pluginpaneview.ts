@@ -35,14 +35,7 @@
 //     replaces, rather than adds to, the overlay-window design's OWN z-order
 //     gap — that design fought the OS window manager for focus/z-order against
 //     `main` itself, which no longer applies now that the plugin isn't a
-//     separate top-level window.) STILL A GAP FOR CONTENT THAT ISN'T HTML/CSS
-//     at all (a native OS tooltip, say) — but for every loomux-authored DOM
-//     overlay, #391 closes it: this view hides itself immediately (below,
-//     `overlayState.subscribe`) whenever the shared registry (overlaystate.ts)
-//     says one is open, reusing the exact `pluginWindowShouldShow`/hide path a
-//     pane visibility change already uses. The residual risk is a FUTURE
-//     overlay that opens without registering with it — that overlay's opener
-//     owes the `overlayState.open()`/closer pair, not this view.
+//     separate top-level window.)
 //   - Multi-monitor DPI: NOT a gap in this design — unlike the overlay-window
 //     design (absolute screen coordinates, needing `main`'s own scale factor to
 //     translate), `Window::add_child` positions relative to `main`'s own client
@@ -54,7 +47,6 @@ import { dataDir, join } from "@tauri-apps/api/path";
 import { openPluginWindow, closePluginWindow, type PluginCapability } from "./pluginbroker";
 import { pluginErrorCode, pluginErrorMessage, type PluginManifest } from "./pluginhost";
 import { pluginWebviewRect, pluginWindowShouldShow } from "./pluginwindow";
-import { overlayState } from "./overlaystate";
 
 /** What a plugin pane needs to open its window — the CURRENT manifest's fields
  *  `plugin_open_window` (Slice C) takes, resolved by the caller (the welcome form
@@ -172,11 +164,6 @@ export class PluginPaneView {
    *  otherwise flicker the webview back to a stale position after it had
    *  already caught up. */
   private repositionSeq = 0;
-  /** Unsubscribe from the shared overlay registry (overlaystate.ts, #391) —
-   *  set in `show()`, released in `dispose()`. Null before `show()` runs and
-   *  after `dispose()` has (idempotency guard: `dispose()` can run more than
-   *  once via the `disposed` flag below, but must only unsubscribe once). */
-  private overlayUnsub: (() => void) | null = null;
 
   constructor(host: PluginPaneHost) {
     this.manifest = host.manifest;
@@ -203,13 +190,6 @@ export class PluginPaneView {
    *  ResizeObserver below already watches directly. */
   show(): void {
     this.resizeObs.observe(this.el);
-    // #391 (folded into #380): a loomux DOM overlay opening over this pane's
-    // screen region doesn't change `el`'s rect at all — nothing else here
-    // would notice it — so `reposition()` is re-run on every open/close edge
-    // of the shared registry, immediately (no waiting on an unrelated resize
-    // to happen to fire later), reusing the SAME hide/show transition below
-    // rather than a second mechanism.
-    this.overlayUnsub = overlayState.subscribe(() => void this.reposition());
     void this.open();
   }
 
@@ -281,7 +261,7 @@ export class PluginPaneView {
     if (!this.ready || !this.pluginWebview || this.disposed) return;
     const seq = ++this.repositionSeq;
     const rect = this.el.getBoundingClientRect();
-    if (!pluginWindowShouldShow(rect, overlayState.isOpen)) {
+    if (!pluginWindowShouldShow(rect)) {
       if (this.shown) {
         this.shown = false;
         await this.pluginWebview.hide().catch(() => {});
@@ -308,8 +288,6 @@ export class PluginPaneView {
     if (this.disposed) return;
     this.disposed = true;
     this.resizeObs.disconnect();
-    this.overlayUnsub?.();
-    this.overlayUnsub = null;
     if (this.windowLabel) void closeWebviewByLabel(this.windowLabel);
   }
 }

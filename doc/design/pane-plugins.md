@@ -830,38 +830,6 @@ are stated, without drifting from what was actually agreed:
   design's absolute-screen-coordinate positioning is exactly what the
   `add_child` pivot exists to eliminate — see the multiwebview spike's
   findings comment on #360).
-
-  **#391 amendment (folded into #380's review): the z-order gap's
-  functional half is closed, its cosmetic half only for tracked overlays.**
-  The z-order gap above has two consequences — a plugin pane visually
-  bleeding through a DOM overlay (cosmetic), and that overlay's controls
-  being unclickable underneath it (functional, and the more serious of the
-  two). Both are now closed for every overlay this codebase itself opens:
-  `src/overlaystate.ts` is a small shared "how many overlays are open right
-  now" registry, and every DOM overlay call site (the sessions browser
-  sidebar, `modal.ts`/`promptModal`, `editor.ts`'s hand-rolled config
-  dialog, `contextmenu.ts`, `gitview.ts`'s and `tabbar.ts`'s own hand-rolled
-  menus/preview/palette popovers, and `pane.ts`'s six in-pane overlay
-  toggles) registers on open and releases on close. `PluginPaneView`
-  subscribes and re-runs `reposition()` — the SAME hide/show transition a
-  pane-visibility change already drives, via `pluginwindow.ts`'s
-  `pluginWindowShouldShow`, now also parameterized on `overlayState.isOpen`
-  — the instant the registry's open/closed edge flips, not on whatever
-  unrelated layout recalc happened to run next (the human-visible bug this
-  closes: opening the sessions sidebar over a plugin pane used to leave the
-  plugin painted on top for a few seconds). The residual gap is narrow but
-  real: a NATIVE overlay this app doesn't author as DOM (an OS tooltip, a
-  native file-picker dialog) still isn't covered by CSS z-index and never
-  will be, and a FUTURE DOM overlay that opens without registering with
-  `overlayState` reintroduces both halves of the original gap for itself.
-  Not every DOM overlay IS registered, deliberately — `overlaystate.ts`'s own
-  header comment keeps the current, authoritative list of what's wired versus
-  excluded and why (e.g. `toast.ts`'s notifications: small and
-  non-interactive, and — since the registry is a single GLOBAL "is anything
-  open" flag rather than per-region — wiring one would hide a plugin pane
-  entirely for the toast's whole lifetime even when it doesn't visually
-  overlap that pane, a worse trade than the brief cosmetic bleed it would
-  "fix").
 - **Slice E** (metrics — **done**, `procmetrics.rs`) exposes `sys_processes`
   -shaped data **only** through the `metrics.system` broker handler — never as
   a command a plugin (or any other webview script) could `invoke` directly.
