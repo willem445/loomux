@@ -59,3 +59,27 @@ export function openPluginWindow(req: OpenPluginWindowRequest): Promise<string> 
 export function closePluginWindow(label: string): Promise<void> {
   return invoke<void>("plugin_close_window", { label });
 }
+
+/** One rect to exclude from the plugin's own webview — pane-local logical
+ *  pixels, matching `pluginregion::OcclusionRect` on the wire (field-for-field
+ *  the same shape `pluginocclusion.ts`'s `ExcludeRect` computes). */
+export interface OcclusionRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+/** Clips the plugin child webview's own HWND (`pluginregion::plugin_set_occlusion`
+ *  — #391, folded into #380; see that command's module doc comment for the
+ *  full native z-order mechanism) to exclude whatever DOM overlay rects
+ *  currently cover this pane, so `main`'s own overlay renders over the
+ *  plugin and stays interactive there while the plugin still shows through
+ *  everywhere else. `pluginpaneview.ts` calls this every time the set of
+ *  covering overlays could have changed. Fire-and-forget from the caller's
+ *  side is fine (it's a best-effort visual sync, not app state), but this
+ *  returns the promise so a caller that wants to sequence it (avoiding a
+ *  stale reposition clobbering a newer one) still can. */
+export function setPluginOcclusion(label: string, exclude: OcclusionRect[]): Promise<void> {
+  return invoke<void>("plugin_set_occlusion", { label, exclude });
+}

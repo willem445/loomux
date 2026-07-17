@@ -27,26 +27,35 @@
 //     way a `visible()` flag would) — far smaller than the overlay-window
 //     design's equivalent gap (that one flashed at a full default size), but not
 //     fully eliminated.
-//   - Z-order versus `main`'s OWN DOM content (context menus, tooltips, modals
-//     implemented as HTML/CSS): a child webview is a native surface compositing
-//     above `main`'s web content within its own bounds, and does not respect
-//     CSS z-index — a DOM overlay that visually overlaps the plugin pane's
-//     screen region will render BEHIND the plugin's native content. (This
-//     replaces, rather than adds to, the overlay-window design's OWN z-order
-//     gap — that design fought the OS window manager for focus/z-order against
-//     `main` itself, which no longer applies now that the plugin isn't a
-//     separate top-level window.)
 //   - Multi-monitor DPI: NOT a gap in this design — unlike the overlay-window
 //     design (absolute screen coordinates, needing `main`'s own scale factor to
 //     translate), `Window::add_child` positions relative to `main`'s own client
 //     area, so there is no cross-monitor scale-factor math to get wrong at all.
+//
+// Z-order versus `main`'s OWN DOM content (context menus, tooltips, modals
+// implemented as HTML/CSS) was a gap here (a child webview is a native
+// surface compositing above `main`'s web content within its own bounds, and
+// does not respect CSS z-index) — CLOSED on Windows by #391 (folded into this
+// slice, `src-tauri/src/pluginregion.rs`): every time this view repositions,
+// it also re-clips the plugin's own HWND (`setPluginOcclusion`, below) to
+// punch a hole for whatever DOM overlay rects currently cover this pane
+// (`overlaystate.ts`'s live registry + `pluginocclusion.ts`'s pure
+// intersect/translate math), so `main`'s overlay renders over the plugin and
+// stays interactive there, while the plugin still shows through everywhere
+// else — not a global hide (the reverted PR #392's band-aid), a real
+// per-region clip. See `pluginregion.rs`'s module doc comment for why
+// WebView2 composition hosting was rejected as the mechanism and for the
+// residual macOS/Linux gap this fix does NOT close (documented there, not
+// silently dropped).
 
 import { Webview } from "@tauri-apps/api/webview";
 import { LogicalPosition, LogicalSize } from "@tauri-apps/api/dpi";
 import { dataDir, join } from "@tauri-apps/api/path";
-import { openPluginWindow, closePluginWindow, type PluginCapability } from "./pluginbroker";
+import { openPluginWindow, closePluginWindow, setPluginOcclusion, type PluginCapability } from "./pluginbroker";
 import { pluginErrorCode, pluginErrorMessage, type PluginManifest } from "./pluginhost";
 import { pluginWebviewRect, pluginWindowShouldShow } from "./pluginwindow";
+import { computeExcludeRects } from "./pluginocclusion";
+import { overlayState } from "./overlaystate";
 
 /** What a plugin pane needs to open its window — the CURRENT manifest's fields
  *  `plugin_open_window` (Slice C) takes, resolved by the caller (the welcome form
@@ -164,6 +173,14 @@ export class PluginPaneView {
    *  otherwise flicker the webview back to a stale position after it had
    *  already caught up. */
   private repositionSeq = 0;
+  /** Unsubscribe from the shared overlay registry (overlaystate.ts, #391) —
+   *  set in `show()`, released in `dispose()`. Null before `show()` runs and
+   *  after `dispose()` has (idempotency guard: `dispose()` can run more than
+   *  once via the `disposed` flag below, but must only unsubscribe once). */
+  private overlayUnsub: (() => void) | null = null;
+  /** Bound so `removeEventListener` in `dispose()` matches the exact function
+   *  reference `addEventListener` in `show()` registered. */
+  private readonly onWindowResize = () => void this.reposition();
 
   constructor(host: PluginPaneHost) {
     this.manifest = host.manifest;
@@ -182,14 +199,29 @@ export class PluginPaneView {
 
   /** Open the plugin's child webview and start tracking this pane's box. Safe to
    *  call only once `el` is attached to the document (startContent's "ATTACH,
-   *  THEN show" contract) — the first `reposition()` reads a real layout. Unlike
-   *  the overlay-window design this replaces, there is no main-window move/resize
-   *  listener here at all: `Window::add_child` positions the webview relative to
-   *  the main window's OWN client area, so a window move changes nothing, and a
-   *  window resize only matters insofar as it resizes `el` itself — which the
-   *  ResizeObserver below already watches directly. */
+   *  THEN show" contract) — the first `reposition()` reads a real layout.
+   *  `Window::add_child` positions the webview relative to the main window's
+   *  OWN client area, so a window move changes nothing for the webview's own
+   *  position/size, and a window resize only matters to THAT insofar as it
+   *  resizes `el` itself — which the ResizeObserver below already watches
+   *  directly, same as before #391. The `window.resize` listener added here
+   *  is for a DIFFERENT reason (#391, folded into this slice): an open DOM
+   *  overlay that's docked to the window edge (the sessions sidebar) can move
+   *  when the window resizes WITHOUT `el` itself changing size — the overlay
+   *  registry has no way to know that on its own, so this view re-runs
+   *  `reposition()` (which recomputes occlusion every time, below) on every
+   *  window resize to catch it. */
   show(): void {
     this.resizeObs.observe(this.el);
+    // #391 (folded into #380): a loomux DOM overlay opening/closing over this
+    // pane's screen region doesn't change `el`'s own rect at all — nothing
+    // else here would notice it — so `reposition()` (which recomputes and
+    // re-sends occlusion every call, below) is re-run on every open/close
+    // edge of the shared registry, immediately, and again on every window
+    // resize (see this method's own doc comment) to catch a docked overlay
+    // moving without `el` itself resizing.
+    this.overlayUnsub = overlayState.subscribe(() => void this.reposition());
+    window.addEventListener("resize", this.onWindowResize);
     void this.open();
   }
 
@@ -249,14 +281,18 @@ export class PluginPaneView {
   }
 
   /** Recompute this pane's on-screen box and move/resize/show/hide the plugin's
-   *  child webview to match. Called on every layout change that could move `el`
-   *  — a divider drag, a split, a tab switch, a maximize elsewhere — via the
-   *  ResizeObserver registered in `show()`. A no-op until `open()` has a webview
-   *  to move (`ready`). No screen-coordinate/scale-factor math: `el`'s
-   *  `getBoundingClientRect()` is already in the exact coordinate space
-   *  `Webview.setPosition`/`setSize` expect (relative to the main window's own
-   *  client area — see pluginwindow.ts's module doc comment), so this is
-   *  strictly simpler than the overlay-window design it replaces. */
+   *  child webview to match — and, since #391 (folded into #380), re-clip its
+   *  native occlusion (below) so it stays correct across every one of the
+   *  same triggers. Called on every layout change that could move `el` — a
+   *  divider drag, a split, a tab switch, a maximize elsewhere — via the
+   *  ResizeObserver registered in `show()`, plus every open/close edge of the
+   *  shared overlay registry and every window resize (also wired in `show()`).
+   *  A no-op until `open()` has a webview to move (`ready`). No screen-
+   *  coordinate/scale-factor math: `el`'s `getBoundingClientRect()` is already
+   *  in the exact coordinate space `Webview.setPosition`/`setSize` expect
+   *  (relative to the main window's own client area — see pluginwindow.ts's
+   *  module doc comment), so this is strictly simpler than the overlay-window
+   *  design it replaces. */
   private async reposition(): Promise<void> {
     if (!this.ready || !this.pluginWebview || this.disposed) return;
     const seq = ++this.repositionSeq;
@@ -278,6 +314,15 @@ export class PluginPaneView {
         this.shown = true;
         await this.pluginWebview.show();
       }
+      // #391 (folded into #380): punch holes in the plugin's own HWND for
+      // whatever DOM overlay currently covers this pane's freshly-read `rect`
+      // — see pluginregion.rs's module doc comment for the native mechanism.
+      // Best-effort, same posture as the position/size calls above: a stale
+      // or racing call is dropped by the seq check, not retried.
+      if (this.windowLabel && seq === this.repositionSeq && !this.disposed) {
+        const exclude = computeExcludeRects(rect, overlayState.currentRects());
+        await setPluginOcclusion(this.windowLabel, exclude).catch(() => {});
+      }
     } catch {
       // Best-effort: a reposition racing pane teardown (webview already closing)
       // must not throw into the ResizeObserver callback.
@@ -288,6 +333,9 @@ export class PluginPaneView {
     if (this.disposed) return;
     this.disposed = true;
     this.resizeObs.disconnect();
+    window.removeEventListener("resize", this.onWindowResize);
+    this.overlayUnsub?.();
+    this.overlayUnsub = null;
     if (this.windowLabel) void closeWebviewByLabel(this.windowLabel);
   }
 }

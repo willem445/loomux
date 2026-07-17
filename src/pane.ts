@@ -50,6 +50,7 @@ import { TasksView } from "./tasksview";
 import { AuditView } from "./auditview";
 import { GroupView } from "./groupview";
 import { clampOverlayHeight, OVERLAY_MIN_H } from "./overlaysize";
+import { overlayState } from "./overlaystate";
 import {
   exitDiagnosticLine,
   keepOpenOnExit,
@@ -378,6 +379,12 @@ export class Pane implements VoiceTargetPane {
   private fileEditView: FileEditView | null = null;
   private fileEditOverlay: HTMLElement | null = null;
   private fileEditBtn: HTMLButtonElement;
+  /** Closer for the shared overlay registry (#391, folded into #380). One
+   *  slot shared across all six toggles above: each of their "open" branches
+   *  already closes every sibling overlay first (they're mutually exclusive
+   *  within a pane), so at most one of these six ever holds the slot at a
+   *  time. */
+  private overlaySlotClose: (() => void) | null = null;
   /** Fold-group toggle (orchestrator panes only, #46): minimizes every
    *  worker/reviewer pane in the group to the dock, or restores them all. */
   private groupMinBtn: HTMLButtonElement;
@@ -1655,6 +1662,8 @@ export class Pane implements VoiceTargetPane {
       if (this.gitView.visible) {
         this.gitView.hide();
         this.gitOverlay!.hidden = true;
+        this.overlaySlotClose?.();
+        this.overlaySlotClose = null;
         this.updateTermShift();
         this.focus();
       } else {
@@ -1668,6 +1677,7 @@ export class Pane implements VoiceTargetPane {
         const strip = Math.max(140, Math.round(this.el.clientHeight * 0.35));
         this.gitOverlay!.style.height = `${this.overlayClamp(this.termEl.clientHeight - strip)}px`;
         this.gitOverlay!.hidden = false;
+        this.overlaySlotClose = overlayState.open(() => this.gitOverlay!.getBoundingClientRect());
         this.gitView.show();
         this.updateTermShift();
       }
@@ -1676,6 +1686,8 @@ export class Pane implements VoiceTargetPane {
       // let the error surface (global handler shows a banner).
       this.gitView?.hide();
       if (this.gitOverlay) this.gitOverlay.hidden = true;
+      this.overlaySlotClose?.();
+      this.overlaySlotClose = null;
       this.termEl.style.transform = "";
       throw err;
     }
@@ -1761,6 +1773,8 @@ export class Pane implements VoiceTargetPane {
     if (this.issuesView.visible) {
       this.issuesView.hide();
       this.issuesOverlay!.hidden = true;
+      this.overlaySlotClose?.();
+      this.overlaySlotClose = null;
       this.updateTermShift();
       this.focus();
     } else {
@@ -1772,6 +1786,7 @@ export class Pane implements VoiceTargetPane {
       const strip = Math.max(140, Math.round(this.el.clientHeight * 0.35));
       this.issuesOverlay!.style.height = `${this.overlayClamp(this.termEl.clientHeight - strip)}px`;
       this.issuesOverlay!.hidden = false;
+      this.overlaySlotClose = overlayState.open(() => this.issuesOverlay!.getBoundingClientRect());
       this.issuesView.show();
       this.updateTermShift();
     }
@@ -1791,6 +1806,8 @@ export class Pane implements VoiceTargetPane {
     }
     if (!this.tasksOverlay!.hidden) {
       this.tasksOverlay!.hidden = true;
+      this.overlaySlotClose?.();
+      this.overlaySlotClose = null;
       this.updateTermShift();
       this.focus();
     } else {
@@ -1802,6 +1819,7 @@ export class Pane implements VoiceTargetPane {
       const strip = Math.max(140, Math.round(this.el.clientHeight * 0.35));
       this.tasksOverlay!.style.height = `${this.overlayClamp(this.termEl.clientHeight - strip)}px`;
       this.tasksOverlay!.hidden = false;
+      this.overlaySlotClose = overlayState.open(() => this.tasksOverlay!.getBoundingClientRect());
       this.tasksView.show();
       this.updateTermShift();
     }
@@ -1822,6 +1840,8 @@ export class Pane implements VoiceTargetPane {
     }
     if (!this.auditOverlay!.hidden) {
       this.auditOverlay!.hidden = true;
+      this.overlaySlotClose?.();
+      this.overlaySlotClose = null;
       this.updateTermShift();
       this.focus();
     } else {
@@ -1833,6 +1853,7 @@ export class Pane implements VoiceTargetPane {
       const strip = Math.max(140, Math.round(this.el.clientHeight * 0.35));
       this.auditOverlay!.style.height = `${this.overlayClamp(this.termEl.clientHeight - strip)}px`;
       this.auditOverlay!.hidden = false;
+      this.overlaySlotClose = overlayState.open(() => this.auditOverlay!.getBoundingClientRect());
       this.auditView.show();
       this.updateTermShift();
     }
@@ -1862,6 +1883,8 @@ export class Pane implements VoiceTargetPane {
     }
     if (!this.groupOverlay!.hidden) {
       this.groupOverlay!.hidden = true;
+      this.overlaySlotClose?.();
+      this.overlaySlotClose = null;
       this.updateTermShift();
       this.focus();
     } else {
@@ -1873,6 +1896,7 @@ export class Pane implements VoiceTargetPane {
       const strip = Math.max(140, Math.round(this.el.clientHeight * 0.35));
       this.groupOverlay!.style.height = `${this.overlayClamp(this.termEl.clientHeight - strip, this.groupFloor())}px`;
       this.groupOverlay!.hidden = false;
+      this.overlaySlotClose = overlayState.open(() => this.groupOverlay!.getBoundingClientRect());
       this.groupView.show();
       this.updateTermShift();
     }
@@ -1911,6 +1935,8 @@ export class Pane implements VoiceTargetPane {
     if (this.fileEditView.visible) {
       this.fileEditView.hide();
       this.fileEditOverlay!.hidden = true;
+      this.overlaySlotClose?.();
+      this.overlaySlotClose = null;
       this.updateTermShift();
       this.focus();
     } else {
@@ -1922,6 +1948,7 @@ export class Pane implements VoiceTargetPane {
       const strip = Math.max(140, Math.round(this.el.clientHeight * 0.35));
       this.fileEditOverlay!.style.height = `${this.overlayClamp(this.termEl.clientHeight - strip)}px`;
       this.fileEditOverlay!.hidden = false;
+      this.overlaySlotClose = overlayState.open(() => this.fileEditOverlay!.getBoundingClientRect());
       this.fileEditView.show();
       this.updateTermShift();
     }
@@ -2740,6 +2767,11 @@ export class Pane implements VoiceTargetPane {
     voiceController.notifyPaneDisposed(this);
     this.voiceIndicator?.remove();
     this.clearAttachments(); // revoke any lingering thumbnail object URLs
+    // Release the overlay-registry slot (#391) if this pane is torn down
+    // while one of its own overlays was still open — otherwise a plugin pane
+    // elsewhere would keep this overlay's rect excluded forever.
+    this.overlaySlotClose?.();
+    this.overlaySlotClose = null;
     this.gitView?.dispose();
     this.issuesView?.dispose();
     this.tasksView?.dispose();
