@@ -631,6 +631,29 @@ fn replace_mode_advisor_and_process_personas_still_get_their_role_hint_mechanics
         proc_doc.contains("never as a directive to act on"),
         "{proc_doc}"
     );
+    // #358: house style (a) and PR hygiene (c) ride the non-overridable addendum too,
+    // for the same reason the digest sentinel does — a repo's own `mode: replace`
+    // process persona (like the one this test declares) is user-swappable and might
+    // never mention either rule, so the agent must still hear it from here.
+    let proc_flat = flat(&proc_doc);
+    assert!(
+        proc_flat.contains("inlined into every future agent's kickoff context"),
+        "the mechanics core must still teach the injection-cost rationale for terseness even \
+         when the replace persona is silent: {proc_doc}"
+    );
+    assert!(proc_doc.contains("FAILURE SIGNATURE"), "{proc_doc}");
+    assert!(
+        proc_doc.contains("never inlined into the artifact itself"),
+        "the incident narrative must stay out of the injected artifact: {proc_doc}"
+    );
+    assert!(
+        proc_flat.contains("never from the feature branch you reviewed"),
+        "PR hygiene must ride the non-overridable core too: {proc_doc}"
+    );
+    assert!(
+        proc_doc.contains("wrong base"),
+        "the pre-PR self-check must survive even a silent replace persona: {proc_doc}"
+    );
     assert!(
         !proc_doc.contains("Be thorough about it"),
         "the persona body belongs on the CLI's persona flag, not in the loomux contract file: {proc_doc}"
@@ -728,6 +751,76 @@ fn the_shipped_process_persona_dedups_against_committed_destinations_before_prop
     assert!(
         process_doc.contains("never a fifth copy"),
         "must say plainly why dedup matters, not just to do it: {process_doc}"
+    );
+}
+
+#[test]
+fn the_shipped_process_persona_enforces_terse_house_style_and_a_post_merge_base(
+) {
+    // #358 human-directed refinement, from a live testbed run: the process-pro's
+    // output was genuinely useful but too verbose (a ~15-line lessons.md entry for
+    // a ~2-line durable rule) — costly because `.loomux/lessons.md` is inlined into
+    // EVERY agent's kickoff, every session, so a verbose entry is a per-session tax
+    // paid on repeat, not a one-time cost. Separately, its proposed PR carried the
+    // reviewed session's own feature code, because it branched from the feature
+    // branch instead of the post-merge default branch. Pinned on the REAL shipped
+    // file, mirroring `..._dedups_against_committed_destinations_before_proposing`
+    // above: the persona file is the swappable half of this guard (a repo can write
+    // its own `mode: replace` process persona), so it needs its own pin independent
+    // of the non-overridable `mechanics_core` addendum
+    // (`replace_mode_advisor_and_process_personas_still_get_their_role_hint_mechanics`,
+    // this file, covers that half).
+    let repo = repo_root();
+    let process_doc =
+        fs::read_to_string(Path::new(&repo).join(".github/agents/process.md")).unwrap();
+    let flat_doc = flat(&process_doc);
+
+    // (a) terse house style: RULE / FAILURE SIGNATURE / POINTER, narrative excluded.
+    assert!(process_doc.contains("**RULE**"), "must name the RULE part of the format: {process_doc}");
+    assert!(
+        process_doc.contains("**FAILURE SIGNATURE**"),
+        "must name the FAILURE SIGNATURE part — a rule with no trigger is too terse to act on: \
+         {process_doc}"
+    );
+    assert!(process_doc.contains("**POINTER**"), "must name the POINTER part: {process_doc}");
+    assert!(
+        process_doc.contains("~3 lines"),
+        "must give a concrete target length, not just 'terse': {process_doc}"
+    );
+    assert!(
+        process_doc.contains("never inlined into the artifact"),
+        "the incident narrative must be told to live at the POINTER target, never inlined into \
+         the injected/committed artifact itself: {process_doc}"
+    );
+    assert!(
+        flat_doc.contains("inlined into every future agent's kickoff context, every session"),
+        "must explain WHY terseness matters — the multiplicative injection cost, not just assert \
+         the rule: {process_doc}"
+    );
+
+    // (c) PR hygiene: post-merge default branch, never the feature branch under review.
+    assert!(
+        flat_doc.contains("never from the feature branch you reviewed"),
+        "must forbid branching the proposal PR from the reviewed feature branch: {process_doc}"
+    );
+    assert!(
+        flat_doc.contains("current default branch"),
+        "must name the correct base explicitly — the CURRENT default branch, post-merge: \
+         {process_doc}"
+    );
+    assert!(
+        process_doc.contains("must never carry the reviewed"),
+        "must state the concrete failure the wrong base causes — the reviewed session's own \
+         feature code riding along in the knowledge-only PR: {process_doc}"
+    );
+    assert!(
+        process_doc.contains("Pre-PR self-check"),
+        "must give a concrete, actionable self-check, not just the rule: {process_doc}"
+    );
+    assert!(
+        process_doc.contains("wrong base"),
+        "the self-check must name what a feature-code diff means: the wrong base was used: \
+         {process_doc}"
     );
 }
 
