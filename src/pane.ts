@@ -495,6 +495,12 @@ export class Pane implements VoiceTargetPane {
   private gitPaneView: GitView | null = null;
   private workflowPaneView: WorkflowView | null = null;
   private pluginPaneView: PluginPaneView | null = null;
+  /** The SAME object one of the five view fields above holds — `buildContentView`'s
+   *  return value, stashed once so `notifyMoved` (below) has one place to forward
+   *  to instead of an `?? ?? ?? ?? ??` chain over every kind (`unsavedHolder`'s
+   *  three-way chain is fine at three; this is five). Null for a terminal pane
+   *  (no content view at all) — `notifyMoved` is correctly a no-op there. */
+  private contentView: { el: HTMLElement; show(): void; notifyMoved?(): void } | null = null;
   /** A PLUGIN pane's (#360 Slice D) persisted identity — the installed plugin's
    *  manifest `id`. Unlike the other content kinds' root, this rides in its own
    *  `PersistedPane.pluginId` field, not `cwd` (tabstore.ts) — so it's tracked
@@ -1046,6 +1052,7 @@ export class Pane implements VoiceTargetPane {
     this.setName(opts.name);
 
     const view = this.buildContentView(opts);
+    this.contentView = view;
     const wrap = document.createElement("div");
     wrap.className = "pane-content";
     wrap.appendChild(view.el);
@@ -1064,7 +1071,9 @@ export class Pane implements VoiceTargetPane {
 
   /** Construct the view a content pane hosts (not shown yet — see startContent). Split
    *  out so the per-kind wiring reads as three cases, not one branching block. */
-  private buildContentView(opts: ContentPaneOptions): { el: HTMLElement; show(): void } {
+  private buildContentView(
+    opts: ContentPaneOptions
+  ): { el: HTMLElement; show(): void; notifyMoved?(): void } {
     // Re-rooting from a view's own folder picker re-roots the PANE, so the persisted
     // record follows and a restore reopens what was actually on screen.
     //
@@ -2316,6 +2325,21 @@ export class Pane implements VoiceTargetPane {
     this.el.classList.toggle("maximized", on);
     this.maximizeBtn.textContent = on ? "⤡" : "⤢";
     this.maximizeBtn.title = on ? "Restore (Ctrl+Shift+M)" : "Maximize (Ctrl+Shift+M)";
+  }
+
+  /** Tell this pane's content view its element moved to a new slot WITHOUT a
+   *  size change (#380) — `Grid`'s `syncMovedPanes` backstop calls this for
+   *  every pane `layout.ts`'s `isPositionOnlyMove` catches after a drag-reorder
+   *  swap or any other position-only relocation, the one case a content view's
+   *  own `ResizeObserver`/window-`resize` triggers never fire for (both are
+   *  size-only signals). A no-op for a terminal pane (`contentView` is null —
+   *  there is no content view, and this is deliberately NOT wired into
+   *  `applyFit`, so it can never touch the ConPTY) and for any content kind
+   *  that doesn't implement `notifyMoved` (only `PluginPaneView` currently
+   *  needs it — it's the only content view whose "content" isn't a DOM
+   *  descendant `el`'s own layout keeps in sync for free). */
+  notifyMoved(): void {
+    this.contentView?.notifyMoved?.();
   }
 
   /** Group accent color, if this pane carries an orchestration badge — used to

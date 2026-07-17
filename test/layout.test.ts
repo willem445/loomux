@@ -7,6 +7,7 @@ import {
   dropZoneFor,
   indicatorFor,
   zoneToPlacement,
+  isPositionOnlyMove,
   DEFAULT_EDGE_RATIO,
   type DropZone,
 } from "../src/layout.ts";
@@ -73,4 +74,46 @@ test("zone maps to the expected split placement", () => {
   assert.deepEqual(zoneToPlacement("top"), { dir: "column", before: true });
   assert.deepEqual(zoneToPlacement("bottom"), { dir: "column", before: false });
   assert.equal(zoneToPlacement("center"), null);
+});
+
+// #380: a drag-reorder swap moves a pane's element to a new screen position
+// without resizing it — the one case a content view's own ResizeObserver
+// never fires for. Grid.syncMovedPanes snapshots each pane's box before/after
+// every tree mutation and calls this to decide which ones need an explicit
+// notifyMoved() poke.
+test("a same-size relocation is a position-only move", () => {
+  // The exact swap() shape: two equal-width slots trade places.
+  const before = { left: 0, top: 0, width: 400, height: 300 };
+  const after = { left: 400, top: 0, width: 400, height: 300 };
+  assert.equal(isPositionOnlyMove(before, after), true);
+});
+
+test("a genuine resize is NOT a position-only move — no double-notify", () => {
+  // moveToEdge's usual shape: the pane lands in a new slot at a different size
+  // (a real restructure). Its own ResizeObserver already re-syncs it, so this
+  // must say false or the content view gets poked twice for the same event.
+  const before = { left: 0, top: 0, width: 400, height: 300 };
+  const after = { left: 0, top: 0, width: 267, height: 300 };
+  assert.equal(isPositionOnlyMove(before, after), false);
+});
+
+test("no change at all is not a move", () => {
+  const box = { left: 10, top: 10, width: 400, height: 300 };
+  assert.equal(isPositionOnlyMove(box, box), false);
+});
+
+test("a pane with no on-screen box after the move is excluded", () => {
+  // Still docked / still hidden — nothing visible to re-sync into.
+  const before = { left: 0, top: 0, width: 0, height: 0 };
+  const after = { left: 0, top: 0, width: 0, height: 0 };
+  assert.equal(isPositionOnlyMove(before, after), false);
+  // Moved AND landed zero-sized (a hidden tab) — still nothing to re-sync.
+  const movedButHidden = { left: 400, top: 0, width: 0, height: 0 };
+  assert.equal(isPositionOnlyMove(before, movedButHidden), false);
+});
+
+test("a position AND size change together is a resize, not position-only", () => {
+  const before = { left: 0, top: 0, width: 400, height: 300 };
+  const after = { left: 400, top: 100, width: 200, height: 150 };
+  assert.equal(isPositionOnlyMove(before, after), false);
 });

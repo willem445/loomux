@@ -329,6 +329,19 @@ export class PluginPaneView {
     }
   }
 
+  /** `Pane.notifyMoved()`'s forward target (#380): re-run the position/size/
+   *  occlusion sync after this pane's element relocated to a new slot WITHOUT
+   *  a size change — a drag-reorder swap, or any other position-only move
+   *  `Grid`'s `syncMovedPanes` backstop catches. `reposition()`'s own three
+   *  triggers (the `ResizeObserver` on `el`, the overlay subscription, the
+   *  window `resize` listener) all miss this case: none of them fire on a
+   *  same-size DOM move, which is exactly why the child webview was left
+   *  painted at its pre-swap screen position, over whatever pane is there
+   *  now, while this pane's own box went blank. */
+  notifyMoved(): void {
+    void this.reposition();
+  }
+
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
