@@ -5,12 +5,15 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  canApprove,
   canProceed,
   doneCount,
   isAwaitingHuman,
   PROTOTYPE_STATUS,
+  REQUEST_CHANGES_STATUS,
   retainExisting,
   STATUSES,
+  taskActivityState,
 } from "../src/taskboard.ts";
 
 test("counts only tasks in the exact `done` status", () => {
@@ -96,4 +99,81 @@ test("a prototype is highlighted as awaiting the human", () => {
   assert.equal(isAwaitingHuman("in-progress"), false);
   assert.equal(isAwaitingHuman("review"), false);
   assert.equal(isAwaitingHuman("done"), false);
+});
+
+// --- task activity state (#339, refined: active requires a LIVE agent) ---
+//
+// The first cut of this highlight keyed off status alone. A human live-
+// testing it found the exact gap that leaves: an assignee chip left over
+// from a killed/resumed/reassigned session read as indistinguishable from a
+// live agent actually at the keyboard. taskActivityState is the single
+// source of truth this pins: a working-status task is ACTIVE only when its
+// assignee is in the live-agent set, otherwise it's IDLE — assigned, working
+// status, but nobody is actually there.
+
+test("in-progress/review with a LIVE assignee is active", () => {
+  const live = new Set(["w-2"]);
+  assert.equal(taskActivityState("in-progress", "w-2", live), "active");
+  assert.equal(taskActivityState("review", "rev-1", new Set(["rev-1"])), "active");
+});
+
+test("in-progress/review with an assignee that is NOT live is idle, not active", () => {
+  // The human's exact complaint: an old assignee on a reopened/stalled task
+  // must never masquerade as active work.
+  const live = new Set(["w-9"]);
+  assert.equal(taskActivityState("in-progress", "w-2", live), "idle");
+  assert.equal(taskActivityState("review", "rev-1", new Set()), "idle");
+});
+
+test("in-progress/review with no assignee at all is idle, not active", () => {
+  assert.equal(taskActivityState("in-progress", null, new Set(["w-2"])), "idle");
+  assert.equal(taskActivityState("review", undefined, new Set(["w-2"])), "idle");
+  assert.equal(taskActivityState("in-progress", "", new Set(["w-2"])), "idle");
+});
+
+test("done is always done, regardless of assignee or liveness", () => {
+  assert.equal(taskActivityState("done", "w-2", new Set(["w-2"])), "done");
+  assert.equal(taskActivityState("done", null, new Set()), "done");
+});
+
+test("queued and the human-gated statuses get no activity state", () => {
+  // queued has nothing to highlight yet; pr/human-testing/blocked/prototype
+  // already get isAwaitingHuman's own amber treatment, so this stays null
+  // rather than layering a second, competing treatment on the same row.
+  for (const s of ["queued", "pr", "human-testing", "blocked", "prototype"]) {
+    assert.equal(taskActivityState(s, "w-2", new Set(["w-2"])), null, `${s} must get no activity state`);
+  }
+});
+
+test("activity state does not match look-alike statuses", () => {
+  const live = new Set(["w-2"]);
+  assert.equal(taskActivityState("in-progress-ish", "w-2", live), null);
+  assert.equal(taskActivityState("predone", "w-2", live), null);
+  assert.equal(taskActivityState("", "w-2", live), null);
+});
+
+// --- merge-gate Approve visibility + request-changes reopening (#339) ---
+
+test("Approve shows only for pr/human-testing", () => {
+  assert.equal(canApprove("pr"), true);
+  assert.equal(canApprove("human-testing"), true);
+  for (const s of STATUSES) {
+    if (s === "pr" || s === "human-testing") continue;
+    assert.equal(canApprove(s), false, `${s} must not show Approve`);
+  }
+});
+
+test("Approve gate does not match look-alike statuses", () => {
+  assert.equal(canApprove("pr-ish"), false);
+  assert.equal(canApprove("human-testing-done"), false);
+  assert.equal(canApprove(""), false);
+});
+
+test("request-changes reopens to a status Approve does not show for", () => {
+  // The state-honesty guarantee, pinned directly: whatever status a
+  // request-changes reopen lands on, Approve must not show for it — a
+  // reopened task can never keep displaying a stale Approve button.
+  assert.equal(canApprove(REQUEST_CHANGES_STATUS), false);
+  // And it's a real, pickable status, not a made-up one the picker lacks.
+  assert.ok(STATUSES.includes(REQUEST_CHANGES_STATUS as (typeof STATUSES)[number]));
 });

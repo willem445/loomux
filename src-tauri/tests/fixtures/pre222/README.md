@@ -89,6 +89,34 @@ so far:
   **The CI gate** section and `worker.md`'s "waiting on your own PR's CI" bullet both
   gain a one-line pointer to that behavior.
 
+- **#338, explicit worktree requirement** — `orchestrator.md` only. `spawn_agent`'s tool
+  description and the **Planning & scheduling** section both drop "a plain branch in the repo
+  (`worktree: false`) is fine" — a worker spawn now always cuts a dedicated worktree and
+  cannot turn it off; there is no more shared-repo option to describe. **Re-sync the fleet**'s
+  "clean and trivial: do it yourself" bullet gains the mechanical-work convention: do the
+  checkout in the PR's own worker worktree if it still exists, otherwise in a staging worktree
+  of your own (`<repo>-worktrees/orch-staging`, reused across mechanical work) — never in the
+  main clone, which is the human's environment.
+
+- **#359, extend the worktree requirement to reviewers** — `orchestrator.md` and `reviewer.md`.
+  Live incident: two reviewers (rev-36, rev-38) collided in the shared main clone — one checked
+  branches out and restored `main` while the other was mid-review on a different branch, knocking
+  it off its checkout. `spawn_agent`'s worktree default/reject guard (#338) now covers reviewers
+  exactly like workers: `worktree` defaults on and `worktree: false` is rejected for either.
+  `orchestrator.md`'s `spawn_agent` bullet states the guarantee for both roles and the incident
+  it closes. `reviewer.md`'s **Review protocol** step 1 explains the worktree is scratch space cut
+  from the default branch, not a checkout of the PR under review (that branch may already be
+  checked out in the worker's own worktree) — and gives the `gh pr checkout <n> --detach`
+  convention for inspecting the PR's actual code locally, since a bare `gh pr checkout <n>` grabs
+  the branch by name and collides with whichever other worktree already holds it.
+
+- **#339 refinement, reopening state honesty** — `orchestrator.md` only. A new bullet in **The
+  task board** section: reopening a `pr`/`human-testing` item (routing reviewer findings back to
+  a worker) must flip `status` back to `in-progress` the same moment, not just eventually — the
+  board's Approve button is gated on status alone, so leaving a reopened item's status untouched
+  leaves Approve showing on work that is no longer ready. Pairs with the board itself now doing
+  this automatically for the human's own **✎ Changes** action.
+
 `the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was` renders
 **these** with the six pre-#222 template variables and asserts that a group launched
 with the advanced orchestrator **off** gets exactly that text. They are the

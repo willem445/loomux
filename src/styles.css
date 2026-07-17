@@ -1759,6 +1759,48 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   background: rgba(224, 175, 104, 0.07);
 }
 .task-row.awaiting-human:hover { background: rgba(224, 175, 104, 0.12); }
+/* Active vs idle vs done (#339 refinement): a working-status task is ACTIVE
+   only when its assignee is a currently-live agent — the human's own
+   complaint was that an old assignee chip on a stalled/reopened task read as
+   indistinguishable from real live work. ACTIVE gets the strongest possible
+   treatment (glow + pulse + bold) so it's the first thing the eye lands on;
+   IDLE (working status, no live agent behind it) recedes instead of
+   competing with it; DONE recedes furthest. */
+.task-row.task-row-active {
+  box-shadow: inset 4px 0 0 #7aa2f7, 0 0 10px 1px rgba(122, 162, 247, 0.25);
+  background: rgba(122, 162, 247, 0.09);
+  animation: task-active-pulse 1.6s ease-in-out infinite;
+  font-weight: 600;
+}
+.task-row.task-row-active:hover { background: rgba(122, 162, 247, 0.16); }
+@keyframes task-active-pulse {
+  0%, 100% { box-shadow: inset 4px 0 0 #7aa2f7, 0 0 0 0 rgba(122, 162, 247, 0); }
+  50% { box-shadow: inset 4px 0 0 #7aa2f7, 0 0 10px 2px rgba(122, 162, 247, 0.55); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .task-row.task-row-active, .task-active-badge { animation: none; }
+}
+/* "● ACTIVE — <agent id>" — reuses .pane-attn's pulse shape/timing (styles.css
+   attn-pulse) recolored to the in-progress blue so it never gets mistaken for
+   the amber "needs YOUR attention" signal that same shape means elsewhere. */
+.task-active-badge {
+  flex: none; font-size: 9.5px; font-weight: 700; letter-spacing: 0.3px;
+  border-radius: 4px; padding: 1.5px 7px; color: #dce8ff;
+  background: rgba(122, 162, 247, 0.35); border: 1px solid rgba(122, 162, 247, 0.65);
+  animation: task-active-pulse-badge 1.6s ease-in-out infinite;
+}
+@keyframes task-active-pulse-badge {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(122, 162, 247, 0); }
+  50% { box-shadow: 0 0 8px 1px rgba(122, 162, 247, 0.6); }
+}
+.task-row.task-row-idle {
+  opacity: 0.72;
+  box-shadow: inset 3px 0 0 rgba(224, 175, 104, 0.3);
+}
+.task-row.task-row-idle:hover { opacity: 0.88; }
+/* Done tasks recede instead of competing with what's still active. */
+.task-row.task-row-done { opacity: 0.55; }
+.task-row.task-row-done:hover { opacity: 0.85; }
 /* Multi-select tick box — nudged down to line up with the row's first line. */
 .task-select { flex: none; margin: 3px 0 0; cursor: pointer; accent-color: var(--danger); }
 .task-order { display: flex; flex-direction: column; flex: none; }
@@ -1806,6 +1848,18 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   max-width: 130px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .task-chip.session { font-family: "Cascadia Mono", Consolas, monospace; }
+/* The assigned agent (#339, refined): LIVE vs HISTORY are visually distinct
+   so an old assignee on a done/reopened/stalled task can never read as
+   current work — the human's exact complaint about the first cut of this. */
+.task-chip.agent {
+  font-family: "Cascadia Mono", Consolas, monospace;
+}
+.task-chip.agent.live {
+  background: rgba(122, 162, 247, 0.14); color: #a7bff8; font-weight: 600;
+}
+.task-chip.agent.history {
+  background: var(--panel-2); color: var(--text-dim); font-style: italic; opacity: 0.7;
+}
 /* Clickable issue/PR refs (open in browser). */
 .task-chip.link {
   border: none; font: inherit; font-size: 9.5px; cursor: pointer;

@@ -61,14 +61,27 @@ its own identity token (`--strict-mcp-config`, so workers see nothing else). The
 orchestrator:
 
 - plans work as GitHub issues, labeling ones it owns **`agent-managed`**;
-- decides worktree-vs-branch per task by mergeability — a worktree branch is cut
-  from the repo's default branch (fetched fresh from origin), never from whatever
-  the primary checkout happens to sit on, so parallel work starts from a clean
-  base without a manual rebase. **`git stash` is repo-wide, not per-worktree** —
-  the stash stack lives in the shared `.git`, so agents in separate worktrees of
-  the same group share one stack and a `pop`/`drop`/`clear` by one can destroy
-  another's WIP; role templates tell agents to commit WIP to their own branch
-  instead of stashing;
+- **every worker AND reviewer spawn gets its own dedicated git worktree — always.**
+  Your main clone is *your* environment, so neither ever branches, commits, or
+  checks anything out there: a worker's worktree branch is cut from the repo's
+  default branch (fetched fresh from origin), never from whatever the primary
+  checkout happens to sit on, so parallel work starts from a clean base without
+  a manual rebase; a reviewer's own worktree is the same kind of clean scratch
+  space, kept separate so two reviewers (or a reviewer and the orchestrator's
+  own git traffic) never contend on the same checkout — a live incident that
+  used to happen before this. A reviewer's worktree isn't a checkout of the PR
+  it's reviewing (that branch may already be checked out elsewhere); it fetches
+  the PR's code in **detached-HEAD** mode when it needs to run something
+  locally, which never collides with anything. The orchestrator cannot spawn
+  either into the main clone even if it tried — the MCP tool rejects it
+  outright. (A planner is unaffected: it never gets a worktree at all — see
+  below. For its own mechanical git work, like a rebase or conflict fix with no
+  worker worktree still around, the orchestrator uses a **staging worktree of
+  its own**, kept separate from your clone the same way.)
+  **`git stash` is repo-wide, not per-worktree** — the stash stack lives in the
+  shared `.git`, so agents in separate worktrees of the same group share one
+  stack and a `pop`/`drop`/`clear` by one can destroy another's WIP; role
+  templates tell agents to commit WIP to their own branch instead of stashing;
 - delegates via tools that *type prompts into the worker's CLI* — you see every
   instruction verbatim in the pane, can steer any agent by typing yourself, and
   everything lands in the audit log.
@@ -131,8 +144,11 @@ Board controls:
 - **Merge gate** — when an item reaches `pr` or `human-testing` (the point where
   only you can decide), the board shows **✓ Approve** (marks it done and tells
   the orchestrator to merge) and **✎ Changes** (opens a box for your findings,
-  records them, and routes them back to a worker). Both land as a message in the
-  orchestrator pane, exactly as if you'd typed it.
+  records them, and reopens the task — see below). Both land as a message in the
+  orchestrator pane, exactly as if you'd typed it. **Approve only ever shows for
+  `pr`/`human-testing`**: once you request changes, the task returns to a working
+  status and Approve disappears with it, so a reopened item can never keep
+  showing a stale "approve" affordance for feedback you already sent back.
 - **▶ Proceed** on a `prototype` item (a demo-gated deliverable awaiting your
   verdict) promotes it: two-click confirm flips it to `in-progress`, records
   your decision, and prompts the orchestrator to take the prototype to a full
@@ -141,7 +157,24 @@ Board controls:
 - **🗑 selected (N)** deletes exactly the rows you tick, by id, in one action.
 
 Items that only you can advance (`pr`, `human-testing`, `blocked`) are
-highlighted so what's waiting on you stands out.
+highlighted so what's waiting on you stands out. A working-status item
+(`in-progress`/`review`) is one of two things, and the board makes the
+difference unmistakable rather than subtle:
+
+- **Active** — its assignee is an agent that's actually live right now. The row
+  gets a bold, glowing, gently pulsing treatment and a **"● ACTIVE — \<agent
+  id\>"** badge — the first thing your eye should land on. This is deliberately
+  the loudest state on the board.
+- **Idle** — the status still says `in-progress`/`review`, but the assignee
+  isn't a currently-live agent (its pane was killed, or it's an older session).
+  The row reads as muted, not active — an idle/stalled assignment can never be
+  confused with real live work.
+
+The assignee chip itself carries the same distinction: a **live** agent gets its
+own blue tint, while a **history** chip (an assignee that isn't currently live)
+reads dimmed and in italics — so an old assignee on a done, reopened, or stalled
+task never looks like the same agent is still sitting there. `done` items dim
+further still, receding behind whatever's still active.
 
 ## Steering, attention, and audit
 
