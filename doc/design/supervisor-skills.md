@@ -125,22 +125,56 @@ file (if any) a block uses*:
    the orchestrator's `{{WORKFLOW}}`) — line-final fragments, present only
    when the roster declares the matching `role_hint`, teaching the
    orchestrator how to spawn a consult (`spawn_agent(block: "<id>", task:
-   "<question>")`) or a post-merge process-pro run.
+   "<question>")`). `PROCESS_NOTE` is description-only (#358 fold-in, below):
+   it says the group *has* a process-pro and points at the post-merge
+   routine, but the actionable spawn instruction does not live here anymore.
 3. **`ADVISOR_CONSULT_NOTE`** (`templates/worker.md`) — a line-final fragment
    telling every worker it can `message_orchestrator` to request a consult
    when the roster declares an advisor block; a worker cannot spawn the
    advisor itself.
+4. **`POST_MERGE_WORKFLOW_HOOK`** (`templates/orchestrator.md`, #358 fold-in)
+   — a line-final fragment appended to the base **"Re-sync the fleet — every
+   open branch, after every merge"** section, present only when the roster
+   declares a `process` block. This is where the ACTIONABLE process-pro
+   trigger lives, not `{{WORKFLOW}}`. The bug it fixes: the original trigger
+   was `PROCESS_NOTE`'s spawn instruction sitting near the top of
+   `orchestrator.md`, in the tools/mechanics area, disconnected from the
+   post-merge routine the orchestrator actually runs. An orchestrator reads
+   "spawn a process-pro after a merge" once, far from where any post-merge
+   step executes, and — live-observed in the human's testbed, 2026-07-16 —
+   reliably skips it when the **human** merges, which is the default flow
+   (the human merge gate). `POST_MERGE_WORKFLOW_HOOK` moves the spawn
+   instruction into the checklist itself (right after "schedule the next
+   item," the routine's last step) and names the human-merge case
+   explicitly, mirroring the section's own INVARIANT 7 ("whoever moved it:
+   your merge, the human's, or a PR you merely watched land"). `PROCESS_NOTE`
+   keeps only the short description so the two fragments don't disagree —
+   one actionable trigger, in the place that actually runs.
 
-All three are byte-empty when the hint they key on is absent — a golden test
-(`advisor_and_process_prose_stays_silent_unless_a_block_declares_the_hint`)
-pins that a fully custom roster with no `role_hint` block renders no mention
-of "consult" or "process-pro" anywhere, and the existing
+   This is still a **prompt-level** fix: it relies on the orchestrator LLM
+   reading and executing its own post-merge routine, same as every other
+   INVARIANT in this document. A human merge doesn't run through any
+   loomux-owned code path at all, so there is no hook to catch it from the
+   host side today. A fully reliable, event-driven version — loomux itself
+   detecting a merge (by any means) and nudging the orchestrator pane
+   directly, independent of whether it re-reads its own instructions — is
+   tracked in #388.
+
+All four are byte-empty when the hint they key on is absent — a golden test
+(`advisor_and_process_prose_stays_silent_unless_a_block_declares_the_hint`,
+plus `a_default_groups_post_merge_routine_names_no_process_pro` for the new
+hook specifically) pins that a fully custom roster with no `role_hint` block
+renders no mention of "consult" or "process-pro" anywhere, and the existing
 `tests/fixtures/pre222/*` byte-golden needed no re-bless: the rendered text
-for a hint-free group is unchanged. The one thing that *did* need updating
-was the placement-pin test itself (`worker.md` now chains two placeholders,
-`{{BLOCK_NOTE}}{{ADVISOR_CONSULT_NOTE}}`, on the one line the old single-key
-check didn't anticipate — the same chaining `block.md`'s `PERSONA_NOTE`/
-`LANE_NOTE`/`GATE_NOTE` already relies on).
+for a hint-free group is unchanged. The placement-pin test
+(`a_workflow_placeholder_must_sit_at_the_end_of_a_line_it_shares`) now checks
+**multiple** keys per file rather than one — `orchestrator.md` carries both
+`{{WORKFLOW}}` near the top and `{{POST_MERGE_WORKFLOW_HOOK}}` far below it in
+the post-merge routine, so the golden-fixture diff strips each key in turn
+instead of assuming a file adds at most one placeholder (the same chaining
+`worker.md`'s `{{BLOCK_NOTE}}{{ADVISOR_CONSULT_NOTE}}` and `block.md`'s
+`PERSONA_NOTE`/`LANE_NOTE`/`GATE_NOTE` already relies on, generalized from
+"one contiguous run" to "several independent keys in one file").
 
 ## session_digest's untrusted-digest guard (rev-26)
 

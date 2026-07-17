@@ -861,18 +861,68 @@ fn advisor_and_process_notes_render_exactly_once_when_declared_and_line_final() 
     let orch = instructions_lf(&reg, &g.id, "orchestrator.md");
     assert!(!orch.contains("{{"), "{orch}");
     assert_eq!(orch.matches("Consulting the advisor").count(), 1, "{orch}");
-    assert_eq!(orch.matches("process-pro reviews finished sessions").count(), 1, "{orch}");
+    // The top {{WORKFLOW}} note (#358 fold-in) is description-only now — the
+    // actionable spawn instruction moved to the post-merge hook below, so there is
+    // exactly one `spawn_agent(block: "proc"` in the whole document, not two.
+    assert_eq!(orch.matches("You have a process-pro").count(), 1, "{orch}");
+    assert_eq!(orch.matches("spawn_agent(block: \"proc\"").count(), 1, "{orch}");
     assert!(orch.contains("spawn_agent(block: \"advisor\""), "{orch}");
-    assert!(orch.contains("spawn_agent(block: \"proc\""), "{orch}");
     assert!(
         orch.contains("workaround in your head.\n\n**Consulting the advisor.**"),
         "the fragment must bring its own blank line, not land mid-paragraph: {orch}"
+    );
+    // The actionable trigger lives in the post-merge routine (#358 fold-in), not the
+    // top note, and it names the human-merge case explicitly — that's the one a
+    // human-driven merge gate reliably skipped before this fix.
+    assert_eq!(orch.matches("Also spawn the process-pro").count(), 1, "{orch}");
+    let orch_flat = orch.to_lowercase();
+    let post_merge = section(&orch_flat, "re-sync the fleet", "### you are the codebase");
+    assert!(
+        post_merge.contains("also spawn the process-pro"),
+        "the post-merge routine must carry the actionable trigger: {post_merge}"
+    );
+    assert!(
+        post_merge.contains("including one the human performed"),
+        "the post-merge trigger must name the human-merge case explicitly — that's the one a \
+         human merge gate was silently skipping: {post_merge}"
+    );
+    assert!(
+        orch.contains("schedule the next item.\n\n**Also spawn the process-pro.**"),
+        "the hook must bring its own blank line at the end of the post-merge checklist's last \
+         sentence, not land mid-paragraph: {orch}"
     );
 
     let worker = instructions_lf(&reg, &g.id, "worker.md");
     assert!(!worker.contains("{{"), "{worker}");
     assert_eq!(worker.matches("ask it to consult the advisor").count(), 1, "{worker}");
     assert!(worker.contains("(`advisor`)"), "{worker}");
+}
+
+#[test]
+fn a_default_groups_post_merge_routine_names_no_process_pro() {
+    // #358 fold-in, the other half of the pin above: `{{POST_MERGE_WORKFLOW_HOOK}}`
+    // sits inside the base "Re-sync the fleet" section that EVERY group reads,
+    // including one with no `process` role_hint (or no workflow file at all) — so
+    // its silence discipline gets its own direct check on the section, not just the
+    // whole-document sweep `advisor_and_process_prose_stays_silent_unless_a_block_
+    // declares_the_hint` already does.
+    let (reg, _d) = test_registry();
+    let repo = Repo::new(); // no workflow file — the true default
+    let g = reg.create_group(&repo.path(), plain_rails()).unwrap();
+
+    let orch = instructions_lf(&reg, &g.id, "orchestrator.md");
+    assert!(!orch.contains("{{"), "{orch}");
+    let orch_flat = orch.to_lowercase();
+    let post_merge = section(&orch_flat, "re-sync the fleet", "### you are the codebase");
+    assert!(
+        !post_merge.contains("process-pro"),
+        "a default group's post-merge routine must not mention the process-pro: {post_merge}"
+    );
+    assert!(
+        orch.contains("schedule the next item.\n\n### You are the codebase's advocate"),
+        "the empty hook must leave the checklist's last sentence exactly where it was, byte for \
+         byte, with no stray blank line: {orch}"
+    );
 }
 
 #[test]
@@ -2847,17 +2897,29 @@ const PRE222: [(&str, &str); 4] = [
     ("planner.md", include_str!("fixtures/pre222/planner.md")),
 ];
 
-/// The live templates, with the placeholder(s) each must carry — a single string,
-/// even where (like `worker.md`, #250/#324) two placeholders chain on one line:
-/// `{{BLOCK_NOTE}}{{ADVISOR_CONSULT_NOTE}}` is one contiguous run, so it is one
-/// "key" for both the exactly-once check and the golden-fixture diff below (the
-/// same chaining `block.md`'s `{{PERSONA_NOTE}}{{LANE_NOTE}}{{GATE_NOTE}}` already
-/// relies on, just now also covered by this pin).
-const LIVE: [(&str, &str, &str); 4] = [
-    ("orchestrator.md", loomux_lib::orchestration::ORCHESTRATOR_TPL, "{{WORKFLOW}}"),
-    ("worker.md", loomux_lib::orchestration::WORKER_TPL, "{{BLOCK_NOTE}}{{ADVISOR_CONSULT_NOTE}}"),
-    ("reviewer.md", loomux_lib::orchestration::REVIEWER_TPL, "{{BLOCK_NOTE}}"),
-    ("planner.md", loomux_lib::orchestration::PLANNER_TPL, "{{BLOCK_NOTE}}"),
+/// The live templates, with the placeholder(s) each must carry. Each element of the
+/// key slice is checked independently for the exactly-once / line-final invariants
+/// below and then stripped in turn for the golden-fixture diff — this is how two
+/// placeholders that sit far apart in the same file (`orchestrator.md`'s
+/// `{{WORKFLOW}}` near the top and `{{POST_MERGE_WORKFLOW_HOOK}}` in its post-merge
+/// routine, #358 fold-in) are both covered without pretending they're one run. Where
+/// two placeholders chain on one line instead (`worker.md`, #250/#324:
+/// `{{BLOCK_NOTE}}{{ADVISOR_CONSULT_NOTE}}`), they stay a single contiguous-string key
+/// — same reasoning `block.md`'s `{{PERSONA_NOTE}}{{LANE_NOTE}}{{GATE_NOTE}}` already
+/// relies on.
+const LIVE: [(&str, &str, &[&str]); 4] = [
+    (
+        "orchestrator.md",
+        loomux_lib::orchestration::ORCHESTRATOR_TPL,
+        &["{{WORKFLOW}}", "{{POST_MERGE_WORKFLOW_HOOK}}"],
+    ),
+    (
+        "worker.md",
+        loomux_lib::orchestration::WORKER_TPL,
+        &["{{BLOCK_NOTE}}{{ADVISOR_CONSULT_NOTE}}"],
+    ),
+    ("reviewer.md", loomux_lib::orchestration::REVIEWER_TPL, &["{{BLOCK_NOTE}}"]),
+    ("planner.md", loomux_lib::orchestration::PLANNER_TPL, &["{{BLOCK_NOTE}}"]),
 ];
 
 /// Render a template with the six variables `render_template` had before #222 —
@@ -3089,31 +3151,37 @@ fn a_workflow_placeholder_must_sit_at_the_end_of_a_line_it_shares() {
     // behind, so every default group's instructions grow a stray gap. It is a
     // one-character mistake to make (hitting Enter before `{{WORKFLOW}}` to keep a
     // line under 90 columns) and it silently changes a file 100% of groups read.
-    for (file, tpl, key) in LIVE {
+    for (file, tpl, keys) in LIVE {
         let t = lf(tpl);
-        assert_eq!(t.matches(key).count(), 1, "{file}: {key} must appear exactly once");
-        let at = t.find(key).unwrap();
-        assert!(
-            t[..at].chars().last() != Some('\n'),
-            "{file}: {key} must sit at the END of the preceding sentence, not on a line of \
-             its own — an empty substitution would leave a stray blank line behind, and every \
-             default group would read a file loomux never used to write"
-        );
-        assert_eq!(
-            t[at + key.len()..].chars().next(),
-            Some('\n'),
-            "{file}: nothing may follow {key} on its line — the fragment brings its own \
-             trailing text, and anything here would be glued onto the end of it"
-        );
+        for key in keys {
+            assert_eq!(t.matches(key).count(), 1, "{file}: {key} must appear exactly once");
+            let at = t.find(key).unwrap();
+            assert!(
+                t[..at].chars().last() != Some('\n'),
+                "{file}: {key} must sit at the END of the preceding sentence, not on a line of \
+                 its own — an empty substitution would leave a stray blank line behind, and every \
+                 default group would read a file loomux never used to write"
+            );
+            assert_eq!(
+                t[at + key.len()..].chars().next(),
+                Some('\n'),
+                "{file}: nothing may follow {key} on its line — the fragment brings its own \
+                 trailing text, and anything here would be glued onto the end of it"
+            );
+        }
     }
-    // ...and the placeholder is the ONLY thing the live templates added. Belt to the
+    // ...and the placeholders are the ONLY thing the live templates added. Belt to the
     // golden fixture's braces: it makes "the fixture is stale" and "someone edited a
     // template" distinguishable at a glance.
-    for ((file, golden), (_, live, key)) in PRE222.iter().zip(LIVE.iter()) {
+    for ((file, golden), (_, live, keys)) in PRE222.iter().zip(LIVE.iter()) {
+        let mut stripped = lf(live);
+        for key in *keys {
+            stripped = stripped.replace(key, "");
+        }
         assert_eq!(
-            lf(live).replace(key, ""),
+            stripped,
             lf(golden),
-            "{file}: the live template differs from its blessed golden by more than {key}"
+            "{file}: the live template differs from its blessed golden by more than {keys:?}"
         );
     }
 }
