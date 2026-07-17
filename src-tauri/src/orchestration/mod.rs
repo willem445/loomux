@@ -9622,14 +9622,21 @@ impl OrchRegistry {
             ),
             None => String::new(),
         };
+        // Description only — the ACTIONABLE spawn trigger lives in
+        // `post_merge_workflow_hook` below, inside the post-merge routine itself
+        // (#358 fold-in). Two spawn instructions this far apart in the same document
+        // read as a double-trigger the moment they drift, and this is the one place
+        // that was drifting: the orchestrator read "spawn a process-pro after a
+        // merge" up here, disconnected from where it actually executes its
+        // post-merge steps, and reliably skipped it on a human merge (the default
+        // flow) because nothing in the routine it runs ever said to.
         let process_note = match role_hint_block(&g.guardrails.blocks, "process") {
             Some(b) => format!(
-                "\n\n**The process-pro reviews finished sessions.** `{id}` mines a merged \
-                 PR's session into proposed skills/lessons — spawn it once after a merge: \
-                 `spawn_agent(block: \"{id}\", task: \"<the merged PR / session to \
-                 review>\")`. It reads the session cold, proposes what it found as a normal \
-                 PR, and stops there: that PR rides the same human merge gate as any other, \
-                 and it never merges it.",
+                "\n\n**You have a process-pro.** `{id}` mines a merged PR's session into \
+                 proposed skills/lessons — it reads the session cold, proposes what it found \
+                 as a normal PR, and stops there: that PR rides the same human merge gate as \
+                 any other, and it never merges it. Your post-merge routine (**Re-sync the \
+                 fleet**) is what spawns it.",
                 id = b.id,
             ),
             None => String::new(),
@@ -9858,6 +9865,28 @@ impl OrchRegistry {
             ),
             None => String::new(),
         };
+        // The ACTIONABLE process-pro trigger (#358 fold-in) — lives inside the base
+        // "Re-sync the fleet" post-merge routine, not the top `{{WORKFLOW}}` note
+        // (`process_note`, above), so the orchestrator reads it as part of the
+        // checklist it actually runs after a merge instead of a disconnected mention
+        // near the top it can drift away from. Empty for every group with no
+        // `process` role_hint — including every default (no-workflow) group — which
+        // is what keeps the post-merge routine byte-identical there (same silence
+        // discipline as `advisor_consult_note` above and `PROCESS_NOTE` in
+        // `workflow.md`). Names the human-merge case explicitly: that's the one a
+        // human merge gate — the default flow — was reliably skipping, because the
+        // old top-of-file trigger never ran as part of any post-merge step at all.
+        // A fully reliable, host-side version of this same nudge is tracked in #388.
+        let post_merge_workflow_hook = match role_hint_block(&g.guardrails.blocks, "process") {
+            Some(b) => format!(
+                "\n\n**Also spawn the process-pro.** After any merge — including one the \
+                 human performed — `spawn_agent(block: \"{id}\", task: \"<the merged PR / \
+                 session to review>\")` sends `{id}` to mine that session into proposed \
+                 skills/lessons.",
+                id = b.id,
+            ),
+            None => String::new(),
+        };
         let vars: Vec<(&str, &str)> = vec![
             ("REPO", g.repo.as_str()),
             ("GROUP_ID", g.id.as_str()),
@@ -9867,6 +9896,7 @@ impl OrchRegistry {
             ("PLANNER_MODEL", g.guardrails.model_for(Role::Planner)),
             ("WORKFLOW", workflow_section.as_str()),
             ("ADVISOR_CONSULT_NOTE", advisor_consult_note.as_str()),
+            ("POST_MERGE_WORKFLOW_HOOK", post_merge_workflow_hook.as_str()),
             ("BLOCK_NOTE", ""),
         ];
         let dir = self.group_dir(&g.id);
