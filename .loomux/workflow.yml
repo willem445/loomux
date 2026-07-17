@@ -1,8 +1,9 @@
 # loomux's own agent workflow (#222) — the repo dogfoods its own feature.
 #
 # Turn the **advanced orchestrator** on in the launcher and this file *is* the
-# roster: two worker tiers and three focused reviewers, instead of the built-in
-# one-worker/one-reviewer pair. With the toggle off, this file is not even opened.
+# roster: two worker tiers, three focused reviewers, an on-demand advisor, and
+# a post-merge process-pro, instead of the built-in one-worker/one-reviewer
+# pair. With the toggle off, this file is not even opened.
 #
 # Each block's persona is a file in `.github/agents/`, which is Copilot's own
 # custom-agent convention — so a `cli: copilot` block loads it natively
@@ -85,13 +86,53 @@ blocks:
     model: sonnet
     profile: .github/agents/rev-tests.md
 
+  # ── advisor + process-pro: spawned on demand, not part of the fixed per-PR
+  # fan-out above (#250, #324) ─────────────────────────────────────────────────
+  # `role_hint` is cosmetic — it only selects the persona addendum, the
+  # workflow-prose fragment, and the ADVISOR/PROCESS badge; it can never widen
+  # what a block may do, because capability keys exclusively off `kind` (see
+  # doc/design/supervisor-skills.md — the closure proof this field ships with).
+  #
+  # advisor is planner-kind: read-only, exactly like `planner` above. The
+  # orchestrator spawns it only when stuck on a specific question; it reports
+  # advice and the pane auto-closes the moment it does — never held open
+  # waiting for the next question, so it never occupies a standing delegate
+  # slot.
+  #
+  # process is worker-kind: it opens a normal PR proposing a lessons/skill
+  # update and stops there, riding the exact same human merge gate as
+  # worker-deep or worker-quick above — it never merges anything, including
+  # its own PR. The orchestrator spawns it once, after a PR from this roster
+  # merges, to mine that session cold via `session_digest`.
+
+  - id: advisor
+    name: Advisor
+    kind: planner
+    cli: claude
+    model: opus
+    profile: .github/agents/advisor.md
+    role_hint: advisor
+
+  - id: process
+    name: Process-pro
+    kind: worker
+    cli: claude
+    model: sonnet
+    profile: .github/agents/process.md
+    role_hint: process
+
 # ADVISORY — the declared happy path, not a schedule. loomux does not walk these;
 # the orchestrator still decides what to serialize, what to parallelize across
 # worktrees, and when to plan first. The rework loop (reviewer findings → back to
 # the worker that wrote the PR → re-review of the new head) is left unwritten for
 # the same reason: it is the orchestrator's loop to run, not an edge to execute.
+#
+# advisor/process are spawned on demand (a stuck worker, a merged PR), not on the
+# fixed per-PR fan-out — they're folded into the orchestrator's own edge line below
+# only so the pane's graph doesn't flag them isolated/unreachable; see the comment
+# on the blocks themselves for when each actually runs.
 edges:
-  - { from: orchestrator, to: [planner, worker-deep, worker-quick] }
+  - { from: orchestrator, to: [planner, worker-deep, worker-quick, advisor, process] }
   - { from: planner, to: [worker-deep, worker-quick] }
   - { from: worker-deep, to: [rev-orch, rev-ui, rev-tests] }
   - { from: worker-quick, to: [rev-orch, rev-ui, rev-tests] }

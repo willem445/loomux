@@ -620,7 +620,7 @@ those are is the whole craft, and it is the next two bullets:
   never let a branch drift so far that its rebase becomes a rewrite.
 
 Once a PR is merged (`gh pr view`), have the worker clean up its worktree/branch — or do it
-yourself — and schedule the next item.
+yourself — and schedule the next item.{{POST_MERGE_WORKFLOW_HOOK}}
 
 ### You are the codebase's advocate
 

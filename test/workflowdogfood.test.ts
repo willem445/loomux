@@ -53,19 +53,28 @@ test("the roster is the one the repo means to run", () => {
   // renamed *id* must, because it breaks the gate.
   assert.deepEqual(
     workflow.blocks.map((b) => b.id),
-    ["orchestrator", "planner", "worker-deep", "worker-quick", "rev-orch", "rev-ui", "rev-tests"]
+    ["orchestrator", "planner", "worker-deep", "worker-quick", "rev-orch", "rev-ui", "rev-tests", "advisor", "process"]
   );
   // Two worker tiers, and the deep one FIRST: the first block of a class is what a
   // bare `spawn_agent(kind: "worker")` resolves to, and the safe default for an
-  // unrouted task is the model that can handle ambiguity.
-  const workers = workflow.blocks.filter((b) => b.kind === "worker");
+  // unrouted task is the model that can handle ambiguity. `process` is worker-kind
+  // too (#324) but role_hint-gated, so it is excluded from this default-tier pin.
+  const tiers = workflow.blocks.filter((b) => b.kind === "worker" && !b.role_hint);
   assert.deepEqual(
-    workers.map((b) => [b.id, b.model]),
+    tiers.map((b) => [b.id, b.model]),
     [
       ["worker-deep", "opus"],
       ["worker-quick", "haiku"],
     ],
     "the tiers are the demo: a deep worker on the strong model, a quick one on the cheap one"
+  );
+  // advisor/process (#250, #324): role_hint pairs with the kind it requires — this
+  // demo file is the one place that pairing rule actually gets exercised end to end.
+  const advisor = workflow.blocks.find((b) => b.id === "advisor");
+  const processPro = workflow.blocks.find((b) => b.id === "process");
+  assert.deepEqual(
+    [advisor?.kind, advisor?.role_hint, processPro?.kind, processPro?.role_hint],
+    ["planner", "advisor", "worker", "process"]
   );
   // Every delegate carries a repo-authored persona, and it is a FILE in
   // `.github/agents/` — the copilot-native convention — so a block flipped to
@@ -75,7 +84,7 @@ test("the roster is the one the repo means to run", () => {
       assert.equal(b.profile, undefined, "the trust root may never carry a repo persona");
       continue;
     }
-    if (b.kind === "planner") continue; // loomux's own planner contract is enough
+    if (b.kind === "planner" && !b.profile) continue; // the bare planner: loomux's own contract is enough
     assert.match(b.profile ?? "", /^\.github\/agents\/[a-z-]+\.md$/, `${b.id} needs a persona file`);
     assert.equal(b.prompt, undefined, `${b.id}: a persona file and an inline prompt are exclusive`);
   }

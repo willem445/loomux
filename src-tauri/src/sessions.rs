@@ -215,7 +215,11 @@ fn scan_claude(out: &mut Vec<SessionInfo>) {
 
 /// Minimal single-level YAML field lookup — enough for workspace.yaml
 /// without pulling in a YAML dependency.
-fn yaml_field(text: &str, key: &str) -> Option<String> {
+///
+/// `pub(crate)`: `orchestration::digest` reuses this to read a Copilot
+/// session's title out of `workspace.yaml` rather than re-deriving the same
+/// lookup (#250/#324 slice B).
+pub(crate) fn yaml_field(text: &str, key: &str) -> Option<String> {
     let prefix = format!("{key}:");
     text.lines().find_map(|l| {
         l.strip_prefix(&prefix)
