@@ -407,6 +407,34 @@ here is provisional anymore.
 > `webview_scope_guard_denies_windows_scoped_leak_to_child_webview` is the CI
 > guard against ever reintroducing `windows`-scoping here.
 
+> **Amendment (#380, iframe re-verdict — spike 2):** the `add_child` decision
+> above was re-checked against an iframe with two candidate mitigations for
+> the Phase-0 leak, since a native child webview carries its own real cost (no
+> DOM z-index, the geometry-sync class of bug this PR fixes). Neither holds on
+> this repo's Tauri 2.11.5 / wry 0.55.1 baseline: **M1**
+> (`for_main_frame_only` scoping the IPC handler to the top frame) still
+> leaked live — wry registers the custom-protocol/IPC handler per `WebView`,
+> not per frame, so a child frame's `invoke` reaches it exactly as before.
+> **M2** (a `document-start` init script scrubbing `__TAURI_INTERNALS__`
+> before the plugin's own script runs) loses the race — wry's own internals
+> injection is *itself* a `document-start` script, and injection order between
+> two `document-start` scripts on the same frame is unspecified, so the scrub
+> sometimes runs first (leak closed) and sometimes second (nothing left to
+> scrub, but too late regardless since the plugin's inline script can already
+> have run by then). Separately, an iframe has no webview label of its own to
+> scope a capability to (`Capability::windows`/`webviews` both key off the
+> **hosting webview**, `main`), so it inherits `main`'s entire ACL grant
+> wholesale — the broker's curated permission set becomes decoration, not a
+> boundary. A residual remote-origin loopback path this spike surfaced (a
+> `plugin://` response served with a stale/absent CSP being reachable via a
+> `main`-origin `fetch` a leaked-internals frame could issue) is tracked
+> separately in [#395](https://github.com/willem445/loomux/issues/395), not
+> folded into this decision. **Decision: `add_child` stays.** The
+> geometry-sync gaps it carries (a moved pane's child webview not
+> repositioning, #380) are ordinary bugs with an ordinary fix — not a
+> trust-boundary defect — whereas the iframe's leak is load-bearing and,
+> per M1/M2 above, has no mitigation that holds on this baseline.
+
 ### Rejected: sandboxed opaque-origin iframe
 
 A plugin's `entry` HTML is rendered inside an `<iframe sandbox="allow-scripts">`
