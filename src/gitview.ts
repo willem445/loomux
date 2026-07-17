@@ -58,6 +58,7 @@ import {
   clampPaneSize,
   parseStoredSize,
 } from "./gitlayout";
+import { overlayState } from "./overlaystate";
 
 /** What the hosting pane provides. TWO hosts (#217):
  *
@@ -129,11 +130,17 @@ interface MenuItem {
 }
 
 let activeMenu: HTMLElement | null = null;
+/** Closer for the shared overlay registry (#391, folded into #380) — this
+ *  menu is a hand-rolled DOM overlay independent of contextmenu.ts's, so it
+ *  registers itself rather than inheriting that module's. */
+let activeMenuOverlayClose: (() => void) | null = null;
 
 function closeMenu(): void {
   if (!activeMenu) return;
   activeMenu.remove();
   activeMenu = null;
+  activeMenuOverlayClose?.();
+  activeMenuOverlayClose = null;
   window.removeEventListener("pointerdown", onMenuPointer, true);
   window.removeEventListener("keydown", onMenuKey, true);
   window.removeEventListener("resize", closeMenu);
@@ -176,6 +183,7 @@ function showMenu(x: number, y: number, items: MenuItem[]): void {
   menu.style.top = `${Math.max(4, Math.min(y, window.innerHeight - r.height - 6))}px`;
   menu.style.visibility = "visible";
   activeMenu = menu;
+  activeMenuOverlayClose = overlayState.open();
   // Defer so the opening click doesn't immediately dismiss it.
   setTimeout(() => {
     if (!activeMenu) return;
