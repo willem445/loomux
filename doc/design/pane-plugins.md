@@ -854,6 +854,14 @@ are stated, without drifting from what was actually agreed:
   native file-picker dialog) still isn't covered by CSS z-index and never
   will be, and a FUTURE DOM overlay that opens without registering with
   `overlayState` reintroduces both halves of the original gap for itself.
+  Not every DOM overlay IS registered, deliberately — `overlaystate.ts`'s own
+  header comment keeps the current, authoritative list of what's wired versus
+  excluded and why (e.g. `toast.ts`'s notifications: small and
+  non-interactive, and — since the registry is a single GLOBAL "is anything
+  open" flag rather than per-region — wiring one would hide a plugin pane
+  entirely for the toast's whole lifetime even when it doesn't visually
+  overlap that pane, a worse trade than the brief cosmetic bleed it would
+  "fix").
 - **Slice E** (metrics — **done**, `procmetrics.rs`) exposes `sys_processes`
   -shaped data **only** through the `metrics.system` broker handler — never as
   a command a plugin (or any other webview script) could `invoke` directly.

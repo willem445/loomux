@@ -22,6 +22,39 @@
 // isolated instance rather than sharing hidden module state — the same reason
 // refreshgate.ts is a class. Production code imports the one shared
 // `overlayState` instance below.
+//
+// EVERY covering DOM overlay in this codebase is either wired into this
+// registry or deliberately excluded below — the point of listing exclusions
+// explicitly is that a reviewer (or a future contributor adding a new
+// overlay) can check "is this one already covered?" without re-deriving the
+// reasoning from scratch. Wired: sessions.ts's SessionBrowser (the sidebar
+// the #391 bug was reported through), modal.ts's `modal()`/`promptModal()`,
+// editor.ts's `editorConfigDialog`, contextmenu.ts's `showContextMenu`,
+// gitview.ts's and tabbar.ts's own hand-rolled menus/preview/palette
+// popovers, and pane.ts's six in-pane overlay toggles.
+//
+// Deliberately excluded (#391 rev-97):
+//   - restoresplash.ts's boot splash — shown before any pane (let alone a
+//     plugin pane) exists; structurally cannot overlap one.
+//   - launcher.ts's welcome form — it IS a pane's own persistent content
+//     ("closed by closing the pane itself"), not a dismissable overlay that
+//     opens over OTHER content the way everything else on this list is.
+//   - tasksview.ts's nested approve/request-changes dialogs — `position:
+//     absolute` bounded by the already-registered tasks overlay's own box
+//     (a Pane's `toggleTasksView`, above); opening one doesn't add coverage
+//     the tasks overlay itself hasn't already registered.
+//   - grid.ts's drag-drop ghost/indicator — transient, drag-gesture-only,
+//     follows the cursor rather than covering a fixed region for any
+//     meaningful duration.
+//   - toast.ts's `showToast` — small, bottom-center, non-interactive
+//     (click-only-to-dismiss or auto-dismisses; no functional dead-click to
+//     fix, unlike a modal/menu). NOT wired despite being a real covering
+//     overlay: this registry is GLOBAL (any overlay open hides EVERY plugin
+//     webview in the app), so wiring a toast would hide a plugin pane
+//     entirely for the toast's ~5s lifetime even when the toast doesn't
+//     visually overlap that pane at all — trading a brief, narrow,
+//     bottom-edge cosmetic bleed for making the whole plugin vanish on every
+//     notification. That trade is worse than the bug it would "fix".
 
 export type OverlayCloser = () => void;
 
