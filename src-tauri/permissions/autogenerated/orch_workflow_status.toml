@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-orch-workflow-status"
+description = "Enables the orch_workflow_status command without any pre-configured scope."
+commands.allow = ["orch_workflow_status"]
+
+[[permission]]
+identifier = "deny-orch-workflow-status"
+description = "Denies the orch_workflow_status command without any pre-configured scope."
+commands.deny = ["orch_workflow_status"]

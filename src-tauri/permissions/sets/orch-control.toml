@@ -34,6 +34,7 @@ permissions = [
     "allow-orch-set-autonomy-budget",
     "allow-orch-set-idle-tick-minutes",
     "allow-orch-set-idle-activity-floor",
+    "allow-orch-set-advanced-orchestrator",
     "allow-orch-end-group",
     "allow-orch-channel-connect",
     "allow-orch-channel-disconnect",
