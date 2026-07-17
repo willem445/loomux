@@ -162,4 +162,6 @@ pub const APP_COMMANDS: &[&str] = &[
     "plugin_open_window",
     "plugin_broker_request",
     "plugin_broker_open_channel",
+    // SPIKE (#360, multiwebview) — throwaway, see spike_multiwebview.rs.
+    "spike_open_child_webview",
 ];

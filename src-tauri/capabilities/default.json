@@ -9,6 +9,7 @@
     "core:default",
     "dialog:allow-open",
     "core:window:allow-destroy",
-    "main-ui"
+    "main-ui",
+    "allow-spike-open-child-webview"
   ]
 }

@@ -16,6 +16,10 @@ mod procmetrics; // the metrics.system data source (#360 Slice E) — dispatched
 pub mod plugins; // pub: the pane-plugins integration test links its pure fns (#360 Slice B)
 pub mod pty; // pub: Job-Object integration test links `assign_kill_on_close_job`
 mod sessions;
+// SPIKE (#360): throwaway multiwebview-embedding spike — see the module doc
+// comment and dev-harness/360-multiwebview-spike/. Never merged past this
+// spike; remove before the real Slice D hosting change ships.
+mod spike_multiwebview;
 mod uistate; // durable UI state (project tabs, #63) — atomic tabs.json store
 pub mod usage; // pub: exercised by orchestration integration tests
 pub mod voice; // voice-prompt prototype (#58); pub: pure helpers are unit-tested
@@ -216,6 +220,7 @@ pub fn run() {
             pluginbroker::plugin_open_window,
             pluginbroker::plugin_broker_request,
             pluginbroker::plugin_broker_open_channel,
+            spike_multiwebview::spike_open_child_webview,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {
