@@ -164,4 +164,9 @@ pub const APP_COMMANDS: &[&str] = &[
     "plugin_close_window",
     "plugin_broker_request",
     "plugin_broker_open_channel",
+    // pluginregion (1) — #391, folded into #380. Main-only (granted via the
+    // "misc" set, same as plugin_open_window/plugin_close_window): clips the
+    // plugin child webview's own HWND to exclude whatever DOM overlay rects
+    // currently cover its pane. Never granted to a plugin-* webview itself.
+    "plugin_set_occlusion",
 ];

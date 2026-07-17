@@ -12,6 +12,7 @@ mod metrics;
 mod obs;
 pub mod orchestration; // pub: integration smoke test links through it
 pub mod pluginbroker; // pub: the #360 Slice C trust-core integration test links its pure fns
+mod pluginregion; // per-overlay occlusion for the plugin child webview (#391, folded into #380)
 mod procmetrics; // the metrics.system data source (#360 Slice E) — dispatched from pluginbroker only
 pub mod plugins; // pub: the pane-plugins integration test links its pure fns (#360 Slice B)
 pub mod pty; // pub: Job-Object integration test links `assign_kill_on_close_job`
@@ -218,6 +219,7 @@ pub fn run() {
             pluginbroker::plugin_close_window,
             pluginbroker::plugin_broker_request,
             pluginbroker::plugin_broker_open_channel,
+            pluginregion::plugin_set_occlusion,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {

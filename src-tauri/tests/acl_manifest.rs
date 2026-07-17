@@ -5,7 +5,7 @@
 //! without an explicit grant silently unreachable for every window,
 //! including `main`. These tests turn that silent failure into a red test:
 //!
-//!   - `generate_handler_matches_app_commands` / `app_commands_len_is_127`:
+//!   - `generate_handler_matches_app_commands` / `app_commands_len_is_128`:
 //!     `src/lib.rs`'s `generate_handler!` and `command_manifest::APP_COMMANDS`
 //!     are the two hand-maintained lists this migration depends on staying
 //!     identical; this diffs them directly out of the `lib.rs` source rather
@@ -13,16 +13,18 @@
 //!     with `orch_confirm_solo_copilot_autopilot` (#364/#365), grew to 123
 //!     with #360 Slice B's `list_plugins`/`install_plugin`, grew to 126 with
 //!     #360 Slice C's three broker commands (`plugin_open_window`,
-//!     `plugin_broker_request`, `plugin_broker_open_channel`), and grew again
-//!     to 127 with #360 Slice D's `plugin_close_window` (the child-webview
+//!     `plugin_broker_request`, `plugin_broker_open_channel`), grew to 127
+//!     with #360 Slice D's `plugin_close_window` (the child-webview
 //!     embedding's explicit-close command — see `pluginbroker.rs`'s module
 //!     doc comment on why a child webview has no `WindowEvent::Destroyed` to
-//!     hook cleanup onto instead).
-//!   - `main_has_all_127_and_zero_permission_denies_dangerous_spread`: builds
+//!     hook cleanup onto instead), and grew again to 128 with #391's
+//!     `plugin_set_occlusion` (folded into #380 — see `pluginregion.rs`'s
+//!     module doc comment for the native z-order fix this command drives).
+//!   - `main_has_all_128_and_zero_permission_denies_dangerous_spread`: builds
 //!     a real (headless) `tauri::test` mock app using the app's *actual*
 //!     `capabilities/`/`permissions/` on disk (via the same `generate_context!`
 //!     `build.rs` already feeds — not a reimplementation of ACL resolution),
-//!     invokes all 127 commands against the `main` webview label, and invokes
+//!     invokes all 128 commands against the `main` webview label, and invokes
 //!     a representative dangerous spread + a benign control against the
 //!     `untrusted-probe-0` window label (see
 //!     `capabilities/plugin-zero-template.json` — the label is deliberately
@@ -48,7 +50,7 @@
 //!     This test builds a real `main` window, `add_child`s a second webview
 //!     labeled like a real plugin (`plugin-*`), and proves against the app's
 //!     *actual* on-disk capabilities that the child is denied EVERY ONE of
-//!     the 127 app commands except its own curated plugin-broker grant, while
+//!     the 128 app commands except its own curated plugin-broker grant, while
 //!     `main`'s own webview keeps every command — i.e. it tests the real
 //!     shipped `default.json`/`plugin.json`, not a simulated ACL config, and
 //!     it is deliberately a comprehensive sweep rather than a single-command
@@ -61,14 +63,14 @@
 //!
 //! Red-before-green (cited in the PR): dropping `orch_grant_merge` from
 //! `permissions/sets/orch-control.toml` makes
-//! `main_has_all_127_and_zero_permission_denies_dangerous_spread` fail with
+//! `main_has_all_128_and_zero_permission_denies_dangerous_spread` fail with
 //! `main is missing a grant for: ["orch_grant_merge"]`. Dropping
 //! `allow-plugin-broker-request` from `permissions/sets/plugin-broker.toml`
 //! makes `plugin_capability_grants_only_broker_commands` fail the same way.
 //! Reverting `capabilities/default.json`'s `"webviews": ["main"]` back to
 //! `"windows": ["main"]` makes
 //! `webview_scope_guard_denies_windows_scoped_leak_to_child_webview` fail
-//! with `child webview embedded in main leaked: [...127 commands...] — some
+//! with `child webview embedded in main leaked: [...128 commands...] — some
 //! capability is granting an app command via windows: scope`. Adding a NEW,
 //! otherwise-unrelated `windows`-scoped grant of a single different command
 //! (e.g. a throwaway capability granting `orch_grant_merge` via
@@ -132,6 +134,7 @@ stub_commands!(
     load_ui_tabs, save_ui_tabs,
     voice_start, voice_stop, voice_cancel,
     plugin_open_window, plugin_close_window, plugin_broker_request, plugin_broker_open_channel,
+    plugin_set_occlusion,
 );
 
 // Tauri's "local origin" custom-protocol scheme differs by platform (WebView2
@@ -230,20 +233,21 @@ fn generate_handler_matches_app_commands() {
 }
 
 #[test]
-fn app_commands_len_is_127() {
+fn app_commands_len_is_128() {
     assert_eq!(
         loomux_lib::command_manifest::APP_COMMANDS.len(),
-        127,
-        "APP_COMMANDS drifted from the audited count of 127 (120 at #363 + 1 for \
+        128,
+        "APP_COMMANDS drifted from the audited count of 128 (120 at #363 + 1 for \
          orch_confirm_solo_copilot_autopilot (#364/#365) + 2 for #360 Slice B's \
          list_plugins/install_plugin + 3 for #360 Slice C's pluginbroker commands + 1 for #360 \
-         Slice D's plugin_close_window) — if this is an intentional addition/removal, update the \
-         count here (and the relevant issue's inventory, if that's the drift)"
+         Slice D's plugin_close_window + 1 for #391's plugin_set_occlusion, folded into #380) — \
+         if this is an intentional addition/removal, update the count here (and the relevant \
+         issue's inventory, if that's the drift)"
     );
 }
 
 #[test]
-fn main_has_all_127_and_zero_permission_denies_dangerous_spread() {
+fn main_has_all_128_and_zero_permission_denies_dangerous_spread() {
     // Catches drift in *this test file* before it can mask a real gap: the
     // stub list above must match APP_COMMANDS exactly.
     let mut stub_names: Vec<&str> = STUB_COMMAND_NAMES.to_vec();
@@ -359,6 +363,7 @@ fn plugin_capability_grants_only_broker_commands() {
     const MUST_BE_DENIED: &[&str] = &[
         "plugin_open_window",
         "plugin_close_window",
+        "plugin_set_occlusion",
         "orch_grant_merge",
         "git_push",
         "ft_write_file",

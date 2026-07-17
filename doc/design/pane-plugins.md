@@ -815,21 +815,78 @@ are stated, without drifting from what was actually agreed:
   frame at a degenerate 1x1 size before the first `reposition()` call hides
   it (smaller than the original design's equivalent gap, which flashed at a
   full default size in the wrong place, but not fully eliminated — `add_child`
-  has no `visible: false` builder option); z-order versus `main`'s OWN DOM
-  content (context menus, tooltips, modals implemented as HTML/CSS) is a
-  NEW-shaped gap — a child webview is a native surface compositing above
-  `main`'s web content within its own bounds and does not respect CSS
-  z-index, so a DOM overlay that visually overlaps the plugin pane's screen
-  region renders BEHIND the plugin's native content (this REPLACES, not
-  adds to, the original design's z-order gap, which fought the OS window
-  manager for focus/z-order against `main` itself — arguably worse, since it
-  depended on unpredictable OS window-manager behavior rather than a fixed,
-  well-understood compositing order). Multi-monitor DPI is no longer a gap
-  at all: `add_child` positions relative to `main`'s own client area, so
+  has no `visible: false` builder option). Multi-monitor DPI is no longer a
+  gap at all: `add_child` positions relative to `main`'s own client area, so
   there is no cross-monitor scale-factor math to get wrong (the original
   design's absolute-screen-coordinate positioning is exactly what the
   `add_child` pivot exists to eliminate — see the multiwebview spike's
-  findings comment on #360).
+  findings comment on #360). Z-order versus `main`'s OWN DOM content was a
+  gap here too — **CLOSED on Windows by the #391 amendment below.**
+- **#391 amendment (folded into #380, `fix/360-native-zorder` — corrected
+  root-cause fix superseding the reverted global-hide band-aid, PR #392,
+  reverted at d3333b3):** the z-order gap above had a real functional half,
+  not just a cosmetic one — a DOM overlay (the sessions sidebar, a modal, a
+  context menu) opened over a plugin pane wasn't just rendered behind the
+  plugin's native content, it was also unclickable underneath it, because a
+  Win32 `WS_CHILD` window (what `add_child` creates) always both paints above
+  and swallows every pointer event over its own rect, unconditionally — there
+  is no z-index knob for that, and `main`'s own DOM overlays are painted BY
+  `main`'s one webview surface, not as separate OS surfaces, so whichever is
+  "on top" wins for the whole overlapping rect.
+
+  **Spike: WebView2 composition hosting, rejected.** WebView2 has a
+  windowless "composition" mode (`ICoreWebView2CompositionController`,
+  backed by `Windows.UI.Composition`/DirectComposition) that would let a
+  webview's content be placed as a visual in a host-owned compositor tree
+  instead of a native child `HWND`. The underlying COM surface is already in
+  `webview2-com`'s own bindings, but `wry` 0.55.1's Windows backend never
+  calls into it — it hardcodes the windowed `CreateCoreWebView2Controller`
+  path unconditionally, so this is unreachable through Tauri's public API
+  without forking `wry`. That fork would not even solve the problem, though:
+  composition-hosting the PLUGIN alone only changes whether its visual sits
+  above or below `main`'s ENTIRE webview surface as one opaque unit — it
+  still can't interleave with content `main` paints INSIDE its own single
+  surface without ALSO composition-hosting `main` end-to-end (a full rewrite
+  of Tauri's Windows windowing backend, affecting every window in the app,
+  still needing the host to drive per-region hit-test routing itself since
+  WebView2 doesn't do this automatically for windowless content — the same
+  computation the fix below does anyway, just wrapped in DirectComposition).
+  Full findings: `src-tauri/src/pluginregion.rs`'s module doc comment.
+
+  **The fix: region-clip the plugin's own HWND.** The same technique
+  browsers used for windowed-plugin/DOM coexistence (NPAPI/ActiveX windowed
+  plugins had this identical problem). Tauri v2's STABLE `Webview::with_webview`
+  API (not `unstable`/multiwebview) hands back the real
+  `ICoreWebView2Controller`; `ICoreWebView2Controller::ParentWindow` returns
+  exactly the container `HWND` `wry` created for that one embedded webview.
+  `pluginregion::plugin_set_occlusion` (main-only, mirroring
+  `plugin_open_window`/`plugin_close_window`'s grant) calls `SetWindowRgn` on
+  that `HWND` to exclude the rects of every DOM overlay currently covering the
+  pane (`overlaystate.ts`'s live per-overlay-rect registry +
+  `pluginocclusion.ts`'s pure intersect/translate math, called from
+  `pluginpaneview.ts`'s `reposition()` on every overlay open/close, window
+  resize, and pane layout change). Both paint AND hit-test fall through to
+  `main` in the excluded rects — a real per-region clip, not a global hide.
+  ACL isolation is untouched: this only affects OS-level `HWND`
+  painting/hit-testing, never the webview's label, capability resolution, or
+  the broker's session state — `tests/acl_manifest.rs`'s guards are
+  unaffected. No `wry` fork, no new crate: `windows` was already a
+  dependency (a second, differently-versioned copy is aliased in as
+  `windows061` specifically for this interop boundary — see `Cargo.toml`'s
+  comment on why).
+
+  **Cross-platform delta, stated honestly.** Windows-only. The same root
+  cause applies on macOS/Linux (`add_child`'s child webview is a peer
+  `NSView`/`GtkWidget` there too, and `main`'s overlays are painted inside
+  `main`'s own single surface exactly the same way), but a region-clip
+  equivalent (`CALayer` masking on macOS, GDK shape/input regions on GTK)
+  needs separate, platform-specific native code this PR does not add:
+  unverified native GUI code for a platform this workspace cannot build or
+  interactively test, and CI's macOS/Ubuntu builds don't exercise the
+  overlay-over-plugin scenario either, so a from-scratch implementation would
+  ship unverified by construction. This is a documented gap, not a silent
+  one — the pre-#391 bleed is unchanged there, not regressed, and is a
+  candidate follow-up issue.
 - **Slice E** (metrics — **done**, `procmetrics.rs`) exposes `sys_processes`
   -shaped data **only** through the `metrics.system` broker handler — never as
   a command a plugin (or any other webview script) could `invoke` directly.
