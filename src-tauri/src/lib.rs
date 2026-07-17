@@ -16,10 +16,6 @@ mod procmetrics; // the metrics.system data source (#360 Slice E) — dispatched
 pub mod plugins; // pub: the pane-plugins integration test links its pure fns (#360 Slice B)
 pub mod pty; // pub: Job-Object integration test links `assign_kill_on_close_job`
 mod sessions;
-// SPIKE (#360): throwaway multiwebview-embedding spike — see the module doc
-// comment and dev-harness/360-multiwebview-spike/. Never merged past this
-// spike; remove before the real Slice D hosting change ships.
-mod spike_multiwebview;
 mod uistate; // durable UI state (project tabs, #63) — atomic tabs.json store
 pub mod usage; // pub: exercised by orchestration integration tests
 pub mod voice; // voice-prompt prototype (#58); pub: pure helpers are unit-tested
@@ -49,9 +45,10 @@ pub fn run() {
         // Pane plugins (#360 Slice B): serves each installed plugin's own
         // assets, jailed to its folder, with the CSP header the design note
         // requires on every response — see plugins::plugin_protocol_handler.
-        // Slice C's WebviewWindow points at the URLs this handler serves
-        // (plugin://localhost/<id>/...) rather than registering a second
-        // handler — Tauri allows exactly one per scheme.
+        // Slice C's plugin_open_window points the plugin's child webview at
+        // the URLs this handler serves (plugin://localhost/<id>/...) rather
+        // than registering a second handler — Tauri allows exactly one per
+        // scheme.
         .register_uri_scheme_protocol("plugin", plugins::plugin_protocol_handler)
         .manage(startup_notice)
         .manage(pty::PtyManager::default())
@@ -218,21 +215,19 @@ pub fn run() {
             voice::voice_stop,
             voice::voice_cancel,
             pluginbroker::plugin_open_window,
+            pluginbroker::plugin_close_window,
             pluginbroker::plugin_broker_request,
             pluginbroker::plugin_broker_open_channel,
-            spike_multiwebview::spike_open_child_webview,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {
+                // The only top-level window left is "main" itself (#360 Slice
+                // D: a plugin is a child webview of main, not its own window,
+                // and never fires this event — see pluginbroker's module doc
+                // comment; its cleanup runs from plugin_close_window instead).
                 obs::breadcrumb("shutdown", "window destroyed");
-                pluginbroker::on_window_destroyed(window.label());
-                procmetrics::on_window_destroyed(window.label());
-                // Only the main window owns PTYs; a plugin window closing
-                // must not kill every agent pane's process.
-                if window.label() == "main" {
-                    let state: tauri::State<pty::PtyManager> = window.app_handle().state();
-                    state.kill_all();
-                }
+                let state: tauri::State<pty::PtyManager> = window.app_handle().state();
+                state.kill_all();
                 // Record a clean exit last, so a crash during teardown still
                 // leaves the sentinel for the next launch to report.
                 obs::mark_clean_exit();

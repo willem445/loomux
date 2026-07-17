@@ -5,8 +5,8 @@
 // touches Tauri IPC or the DOM. Mirrors src-tauri/src/pluginbroker.rs's
 // envelope types and `check_request` one-for-one so both halves of the
 // contract stay provably in sync. Also importable, unmodified, by a future
-// plugin SDK (Slice G) that runs *inside* a plugin's own isolated
-// WebviewWindow — that code is not part of loomux's own build, so the
+// plugin SDK (Slice G) that runs *inside* a plugin's own isolated child
+// webview — that code is not part of loomux's own build, so the
 // authoritative enforcement is (and must stay) the Rust side; this module
 // exists so a mismatch between what a plugin sends and what the broker
 // checks is a type error, not a runtime surprise.
@@ -89,7 +89,7 @@ export function parsePluginRequest(raw: unknown): PluginRequest | null {
 
 /** The pure decision the design note calls out by name: "is method M allowed
  *  for granted capabilities C at apiVersion V" — steps 2 and 3 of the
- *  per-message check (step 1, identity, is structural for the WebviewWindow
+ *  per-message check (step 1, identity, is structural for the child-webview
  *  transport — see `pluginbroker.rs`'s module doc comment; step 4, params
  *  validation, is method-specific and happens after this returns `null`).
  *  Lives once, here; any DOM/command wiring only calls it. */

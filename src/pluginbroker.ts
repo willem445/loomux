@@ -19,7 +19,12 @@ export { parsePluginRequest, checkCapability, errorResponse, okResponse, isPathW
 
 /** The output of Slice B's manifest validation, not a manifest parser of its
  *  own — see `pluginbroker::OpenPluginWindowRequest` on the Rust side, which
- *  this mirrors field-for-field (camelCase over the wire). */
+ *  this mirrors field-for-field (camelCase over the wire). `x`/`y`/`width`/
+ *  `height` are logical pixels relative to the MAIN window's own client area
+ *  (`Window::add_child`'s own coordinate space — see pluginwindow.ts's
+ *  module doc comment) — no `title` field: #360 Slice D embeds the plugin as
+ *  a child webview (no OS window chrome to title), replacing the earlier
+ *  overlay-window design. */
 export interface OpenPluginWindowRequest {
   pluginId: string;
   /** Relative path inside the plugin's own folder, served over `plugin://`. */
@@ -29,17 +34,28 @@ export interface OpenPluginWindowRequest {
   /** The manifest's declared capabilities, subset of the closed enum. */
   capabilities: PluginCapability[];
   apiVersion: number;
-  title: string;
+  x: number;
+  y: number;
   width: number;
   height: number;
 }
 
-/** Opens a plugin's isolated `WebviewWindow`, bound to the curated
- *  `plugin-broker` capability (never `main-ui`). The only sanctioned way for
- *  `main`'s trusted frontend to do this — no other module may `invoke`
- *  `plugin_open_window` directly (CLAUDE.md constraint 5). Returns the new
- *  window's label. Slice D calls this from the `"plugin"` pane kind's
- *  `startContent()`; nothing does yet. */
+/** Embeds a plugin's isolated child webview into the main window
+ *  (`Window::add_child`), bound to the curated `plugin-broker` capability
+ *  (never `main-ui`). The only sanctioned way for `main`'s trusted frontend
+ *  to do this — no other module may `invoke` `plugin_open_window` directly
+ *  (CLAUDE.md constraint 5). Returns the new webview's label.
+ *  `pluginpaneview.ts`'s `open()` calls this. */
 export function openPluginWindow(req: OpenPluginWindowRequest): Promise<string> {
   return invoke<string>("plugin_open_window", { req });
+}
+
+/** Closes a plugin's child webview and releases its broker-side session
+ *  state (`pluginbroker::plugin_close_window` — see that command's doc
+ *  comment for why an explicit close call is needed at all: a child webview
+ *  never fires `WindowEvent::Destroyed`, unlike a real top-level window).
+ *  `pluginpaneview.ts`'s `dispose()` calls this fire-and-forget, mirroring
+ *  the existing `killPty(...).catch(() => {})` teardown posture. */
+export function closePluginWindow(label: string): Promise<void> {
+  return invoke<void>("plugin_close_window", { label });
 }

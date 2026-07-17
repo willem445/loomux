@@ -195,11 +195,13 @@ pub fn unsubscribe(label: &str) -> Result<Value, PluginErrorWire> {
     Ok(Value::Null)
 }
 
-/// Cleanup hook, called from `lib.rs`'s `on_window_event(Destroyed)` handler
-/// alongside `pluginbroker::on_window_destroyed` — a closed plugin window's
-/// poll thread stops on its own next tick rather than pushing forever into a
-/// dead channel.
-pub fn on_window_destroyed(label: &str) {
+/// Cleanup hook, called from `pluginbroker::plugin_close_window` alongside
+/// `pluginbroker::on_plugin_webview_closed` — a plugin child webview has no
+/// `WindowEvent::Destroyed` for `lib.rs` to observe (see pluginbroker's
+/// module doc comment), so this runs on the frontend's explicit close
+/// instead: a closed plugin's poll thread stops on its own next tick rather
+/// than pushing forever into a dead channel.
+pub fn on_plugin_webview_closed(label: &str) {
     stop_subscription(label);
 }
 
