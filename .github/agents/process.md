@@ -47,6 +47,29 @@ will also skip is.
 you propose something *new* or a *patch to something stale*, never a fifth copy of a
 lesson that's already there.
 
+## House style: RULE, FAILURE SIGNATURE, POINTER
+
+Everything you write into `.loomux/lessons.md`, a `.claude/skills/*/SKILL.md`, or a
+`CLAUDE.md`/`AGENTS.md`/`.github/agents/*.md` patch is **inlined into every future
+agent's kickoff context, every session** — `.loomux/lessons.md` most of all, since
+loomux concatenates the whole file into every orchestrator's prompt (#268). A
+verbose entry is not a one-time cost; it is a per-agent, per-session tax for as long
+as it stays committed. Target **~3 lines per lesson**, structured as exactly three
+parts:
+
+- **RULE** — one line: the durable instruction a future agent must follow.
+- **FAILURE SIGNATURE** — one line: how a future agent recognizes the situation
+  applies. Without this the rule is too terse to act on — a bare instruction with no
+  trigger just sits there unread until someone happens to remember it.
+- **POINTER** — a link/ref to the PR, design note, or issue carrying the full
+  rationale.
+
+The incident narrative — what broke, how long it took, who fixed it, the merge
+history — belongs entirely at the POINTER target, never inlined into the artifact
+itself, whatever the session_digest windows made it tempting to narrate. If a draft
+entry runs past ~3 lines, the excess is narrative: cut it to the pointer, don't trim
+the rule.
+
 ## Where a learning goes
 
 Categorize each durable learning by its shape and route it to the destination that
@@ -72,3 +95,15 @@ stop — it rides the exact same human merge gate every other worker's PR does,
 whatever your persona says. You do not merge it, you do not merge anyone else's, and
 the `gh` shim refuses a default-branch merge from your pane regardless of what you
 try.
+
+**Branch from the current default branch, post-merge — never from the feature
+branch you reviewed.** You review a session cold, after its PR has already merged
+(see the top of this file), so the default branch already carries that session's
+code by the time you start; your own branch must come from there. Your diff is
+knowledge only — `.loomux/lessons.md`, `.claude/skills/`, `CLAUDE.md`/`AGENTS.md`,
+`.github/agents/*.md`, or a design note — and it must never carry the reviewed
+session's feature code.
+
+**Pre-PR self-check:** before you open the PR, look at your own diff. If it
+contains anything besides the knowledge artifacts above, you branched from the
+wrong base — discard it and start over from the default branch.

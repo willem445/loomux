@@ -240,6 +240,52 @@ constraint). Three confirmations and one tightening:
   tool, by the updated `session_digest_*` tests using the new
   `rails_with_process_block`/`process_caller` test helpers).
 
+## House style + PR hygiene refinements (#358)
+
+A live testbed run surfaced two problems with output that was otherwise
+genuinely useful (a real "this repo has no CI" lesson, export-visibility and
+testing conventions): the proposed `.loomux/lessons.md` entry ran ~15 lines
+for a ~2-line durable rule, and the proposed PR carried the reviewed
+session's own feature code because the process-pro had branched its proposal
+from the feature branch under review instead of the post-merge default
+branch.
+
+**Verbosity is a multiplicative cost, not a one-time one.** `.loomux/lessons.md`
+is concatenated whole into every orchestrator's kickoff, every session (#268)
+— a 15-line entry is 15 lines every future session pays for, forever, not
+once. `.github/agents/process.md` now mandates a fixed three-part shape for
+anything the process-pro writes into an injected/committed artifact
+(`.loomux/lessons.md`, a skill, `CLAUDE.md`/`AGENTS.md`, a persona patch):
+**RULE** (the durable instruction, one line), **FAILURE SIGNATURE** (how a
+future agent recognizes it applies, one line — without this the rule is too
+terse to act on), **POINTER** (a link to the PR/design note carrying the full
+rationale). The incident narrative lives at the pointer target, never
+inlined. Target ~3 lines per lesson.
+
+**A process-pro branches from the wrong ref if it branches from the reviewed
+PR.** It reviews cold, after that PR has already merged (unchanged from slice
+C), so the default branch already carries the reviewed session's code by the
+time it starts — its own proposal branch has to come from there, or its diff
+inherits the feature code it was only supposed to comment on.
+`.github/agents/process.md` now states the base explicitly and gives a
+concrete pre-PR self-check: a diff that contains anything besides the
+knowledge artifacts above means the wrong base was used.
+
+Both rules ride twice, for the same reason the untrusted-digest guard above
+does: non-overridably in the `role_hint == process` `mechanics_core` addendum
+(so a repo's own `mode: replace` persona can't silently drop either rule),
+and in the shipped default `.github/agents/process.md` (so a repo author
+reading the default sees them too). Pinned independently in
+`src-tauri/tests/workflow.rs`:
+`the_shipped_process_persona_enforces_terse_house_style_and_a_post_merge_base`
+and the extended
+`replace_mode_advisor_and_process_personas_still_get_their_role_hint_mechanics`.
+No re-bless: this is entirely `role_hint`-addendum and persona-doc prose,
+outside the toggle-off `PRE222` byte-goldens (which pin the four *default*
+role templates, not a role_hint block's own instructions file) —
+`the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was`
+stays green unchanged.
+
 ## Slices (see the plan comment on #250 for the full breakdown)
 
 - **A — role_hint foundation**: the field, its parse-time validation, the
