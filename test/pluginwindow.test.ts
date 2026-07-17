@@ -27,12 +27,29 @@ test("width/height are floored at 1px — never zero or negative", () => {
 });
 
 test("shouldShow is false the moment either dimension collapses to zero", () => {
-  assert.equal(pluginWindowShouldShow({ left: 0, top: 0, width: 640, height: 480 }), true);
-  assert.equal(pluginWindowShouldShow({ left: 0, top: 0, width: 0, height: 480 }), false);
-  assert.equal(pluginWindowShouldShow({ left: 0, top: 0, width: 640, height: 0 }), false);
-  assert.equal(pluginWindowShouldShow({ left: 0, top: 0, width: 0, height: 0 }), false);
+  assert.equal(pluginWindowShouldShow({ left: 0, top: 0, width: 640, height: 480 }, false), true);
+  assert.equal(pluginWindowShouldShow({ left: 0, top: 0, width: 0, height: 480 }, false), false);
+  assert.equal(pluginWindowShouldShow({ left: 0, top: 0, width: 640, height: 0 }, false), false);
+  assert.equal(pluginWindowShouldShow({ left: 0, top: 0, width: 0, height: 0 }, false), false);
 });
 
 test("shouldShow ignores position — a pane scrolled off-screen is still shown, just repositioned", () => {
-  assert.equal(pluginWindowShouldShow({ left: -5000, top: -5000, width: 100, height: 100 }), true);
+  assert.equal(pluginWindowShouldShow({ left: -5000, top: -5000, width: 100, height: 100 }, false), true);
+});
+
+// #391 (folded into #380): an overlay opening over an otherwise-visible plugin
+// pane doesn't touch its rect at all, so the hide has to come from a second
+// signal threaded through explicitly.
+test("shouldShow is false while an overlay is open, even with a perfectly valid rect", () => {
+  assert.equal(pluginWindowShouldShow({ left: 0, top: 0, width: 640, height: 480 }, true), false);
+});
+
+test("shouldShow returns to the rect's own answer once the overlay closes", () => {
+  const rect = { left: 0, top: 0, width: 640, height: 480 };
+  assert.equal(pluginWindowShouldShow(rect, true), false);
+  assert.equal(pluginWindowShouldShow(rect, false), true);
+});
+
+test("overlayOpen doesn't mask an already-zero rect (nothing to hide twice, but never true)", () => {
+  assert.equal(pluginWindowShouldShow({ left: 0, top: 0, width: 0, height: 0 }, true), false);
 });

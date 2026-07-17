@@ -1,11 +1,18 @@
 // Session browser sidebar: lists resumable Claude Code and Copilot CLI
 // sessions discovered by the backend; clicking one restores it into a
 // new pane.
+//
+// Registers with the shared overlay registry (overlaystate.ts) while open
+// (#391, folded into #380): this is the sidebar the human hit the plugin
+// z-order bug through live — opening it over a plugin pane used to leave the
+// plugin's native webview painted on top for a few seconds, until an
+// unrelated layout recalc happened to hide it.
 
 import { listSessions, type SessionInfo } from "./pty";
 import type { SessionRoleInfo } from "./orchestration";
 import { taskSummary, repoBranchLine, prLabel } from "./sessionmeta";
 import { RefreshGate } from "./refreshgate";
+import { overlayState } from "./overlaystate";
 
 const ROLE_CHIPS: Record<string, string> = {
   orchestrator: "ORCH",
@@ -35,6 +42,11 @@ export class SessionBrowser {
    *  exists to front-load, doubled. Same mechanism IssuesView uses for its
    *  refresh loop; reused rather than a second de-dup scheme. */
   private refreshGate = new RefreshGate();
+  /** Closer for the shared overlay registry (#391, folded into #380) — set
+   *  while the sidebar is visible, so any plugin pane it happens to cover
+   *  hides immediately instead of bleeding through until an unrelated layout
+   *  recalc hides it. Null while hidden. */
+  private overlayClose: (() => void) | null = null;
 
   constructor(
     private el: HTMLElement,
@@ -75,13 +87,19 @@ export class SessionBrowser {
   toggle(): void {
     this.el.classList.toggle("hidden");
     if (this.visible) {
+      this.overlayClose ??= overlayState.open();
       void this.refresh();
       this.searchEl.focus();
+    } else {
+      this.overlayClose?.();
+      this.overlayClose = null;
     }
   }
 
   hide(): void {
     this.el.classList.add("hidden");
+    this.overlayClose?.();
+    this.overlayClose = null;
   }
 
   /** Orchestration identity for a session, merging the durable roster with
