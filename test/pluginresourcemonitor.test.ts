@@ -3,7 +3,7 @@
 // `window`/`document`), so this exercises the exact module the plugin's
 // `main.js` imports at `plugin://localhost/resource-monitor/format.js` — the
 // plugin's own DOM/broker wiring is hand-validated (it runs inside a
-// sandboxed `plugin-*` WebviewWindow CI has no way to drive). Run with
+// sandboxed `plugin-*` child webview CI has no way to drive). Run with
 // `npm test`.
 import { test } from "node:test";
 import assert from "node:assert/strict";

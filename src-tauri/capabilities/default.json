@@ -1,14 +1,18 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Capabilities for the main window",
-  "windows": [
+  "description": "Capabilities for the main window's own webview. #360 Slice D: scoped to `webviews`, NOT `windows` — main now hosts plugin child webviews (Window::add_child), and Capability::windows's own doc comment (tauri-utils) says a windows-scoped grant applies to EVERY webview of that window regardless of `webviews`, which would hand a plugin child webview this entire grant (confirmed live in the #360 multiwebview spike, fix/360-plugin-embed commit e337c95). `webviews: [\"main\"]` matches only the main window's own initial webview (whose label is \"main\" by Tauri's convention for a single-webview window at creation), never a `plugin-*`-labeled child. tests/acl_manifest.rs's `webview_scope_guard_denies_windows_scoped_leak_to_child_webview` is the CI guard against ever reintroducing `windows` here.",
+  "webviews": [
     "main"
   ],
   "permissions": [
     "core:default",
     "dialog:allow-open",
     "core:window:allow-destroy",
-    "main-ui"
+    "main-ui",
+    "core:webview:allow-set-webview-position",
+    "core:webview:allow-set-webview-size",
+    "core:webview:allow-webview-hide",
+    "core:webview:allow-webview-show"
   ]
 }

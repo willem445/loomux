@@ -386,6 +386,27 @@ below are written in the past tense where they describe what was *decided*
 and in the present tense where they describe what Slice C *built* — nothing
 here is provisional anymore.
 
+> **Amendment (#360 Slice D pivot, `fix/360-plugin-embed` commit e337c95):**
+> Slice D's *hosting* mechanism changed after this section was written —
+> `WebviewWindow` as a **separate top-level OS window** shipped first (a live
+> bug: it rendered as a floating, fully-decorated window instead of embedded
+> pane content) and was then replaced with `Window::add_child` (Tauri's
+> multiwebview API, the `unstable` feature): the plugin is now a **child
+> webview embedded directly in the `main` window**, a real native region of
+> the pane, not a second window. This section's *trust-core* reasoning below
+> is otherwise unaffected — the same broker, the same capability/apiVersion
+> check, the same "no live JS reference between plugin and `main`" property —
+> **except for one load-bearing correction the multiwebview spike found**
+> (findings comment on #360): a capability scoped via `windows: [...]` grants
+> *every webview of that window*, `webviews` field notwithstanding (Tauri's
+> own `Capability::windows` doc comment). Since `add_child` attaches the
+> plugin to the *existing* `main` window, `capabilities/plugin.json` and
+> `capabilities/default.json`'s own `main` grant are now `webviews`-scoped,
+> not `windows`-scoped — every place below that says `windows: ["plugin-*"]`
+> should be read as `webviews: ["plugin-*"]`. `tests/acl_manifest.rs`'s
+> `webview_scope_guard_denies_windows_scoped_leak_to_child_webview` is the CI
+> guard against ever reintroducing `windows`-scoping here.
+
 ### Rejected: sandboxed opaque-origin iframe
 
 A plugin's `entry` HTML is rendered inside an `<iframe sandbox="allow-scripts">`
@@ -446,11 +467,13 @@ home" row in the threat table above, even if the frame's sandbox/isolation
 is otherwise perfect — the two mechanisms are independent, and this note
 requires both.
 
-### Decided: child `WebviewWindow` with scoped capabilities (Option B)
+### Decided: child webview with scoped capabilities (Option B)
 
-Each plugin gets its own Tauri `WebviewWindow`, positioned and sized to
-overlay the pane's content box (Slice D's job — out of this slice's scope),
-bound to `capabilities/plugin.json` (`windows: ["plugin-*"]`), which grants
+Each plugin gets its own isolated `Webview`, embedded directly into the
+`main` window via `Window::add_child` and positioned/sized over the pane's
+content box (Slice D's job — out of this slice's scope; see the amendment
+above for why this is `add_child`, not a separate `WebviewWindow`), bound to
+`capabilities/plugin.json` (`webviews: ["plugin-*"]`), which grants
 **exactly** the `plugin-broker` permission set — two commands,
 `plugin_broker_request` and `plugin_broker_open_channel` — and nothing else
 in the app's command surface. This holds *only* because #363/#366 gave
@@ -475,10 +498,12 @@ reachable, including a merge grant).
 shapes above (`PluginRequest`/`PluginResponse`/`PluginEvent`) were specified
 before Option B was chosen, and describe a `postMessage` bridge — correct for
 the rejected iframe model, where `event.source === frame.contentWindow` is a
-live, comparable JS reference. A child `WebviewWindow` is a separate
-top-level browsing context: `window.opener` is `null` (confirmed by the
-Phase-0.5 spike — Tauri creates secondary windows independently, not via
-`window.open()`), so there is no JS reference between it and `main` at all,
+live, comparable JS reference. A plugin's child webview is a separate
+top-level browsing context from `main`'s own document (confirmed originally
+against the `WebviewWindow` fallback, Phase-0.5, and again against
+`add_child` embedding, the multiwebview spike): `window.opener` is `null`
+either way — Tauri creates every plugin webview independently, never via
+`window.open()` — so there is no JS reference between it and `main` at all,
 and nothing for a literal `postMessage` to target. Slice C's broker
 therefore uses Tauri's own IPC as the transport:
 
@@ -501,36 +526,41 @@ therefore uses Tauri's own IPC as the transport:
   invocation that created it, so a plugin can receive only what the broker
   explicitly pushes to *its own* channel.
 - **Identity (step 1 of the per-message check):** structural rather than a
-  runtime comparison. Only a window matching `capabilities/plugin.json`'s
-  `windows: ["plugin-*"]` pattern can reach `plugin_broker_request` at all —
+  runtime comparison. Only a webview matching `capabilities/plugin.json`'s
+  `webviews: ["plugin-*"]` pattern can reach `plugin_broker_request` at all —
   enforced by Tauri's ACL resolver before the broker's own code runs — and
-  the broker then looks up that exact window's registered session by its
+  the broker then looks up that exact webview's registered session by its
   label (unforgeable — Tauri, not the plugin, assigns and reports it via the
-  command's injected `Window` parameter). This is at least as strong as the
-  iframe model's `event.source` check, and it's the same mechanism that
-  makes the zero-permission template's denial real in the first place.
+  command's injected `Webview` parameter). Note this checks the WEBVIEW
+  label, not the window label: under `add_child` embedding every plugin
+  shares `main`'s window label, so `windows`-scoping here would defeat the
+  identity check entirely (the amendment above). This is at least as strong
+  as the iframe model's `event.source` check, and it's the same mechanism
+  that makes the zero-permission template's denial real in the first place.
 
-### Residual capabilities a `WebviewWindow` has that a sandboxed iframe wouldn't, and their mitigations
+### Residual capabilities a plugin child webview has that a sandboxed iframe wouldn't, and their mitigations
 
-A `WebviewWindow` has no `sandbox=""` attribute equivalent — none of the
-iframe sandbox tokens (`allow-forms`, `allow-top-navigation`, etc.) exist for
+A plugin's child webview has no `sandbox=""` attribute equivalent — none of
+the iframe sandbox tokens (`allow-forms`, `allow-top-navigation`, etc.) exist for
 a top-level webview window. Found empirically by the Phase-0.5 spike, and
 mitigated across Slices B and C:
 
 - **Unrestricted self-navigation.** `location.href = 'https://example.com/'`
-  fully navigated the spike's plugin window to a real external page — nothing
-  stopped it. **Mitigation (Slice C):** every plugin `WebviewWindowBuilder`
-  is constructed with `.on_navigation(...)`, locked to a pure predicate that
-  allows only the plugin's own `plugin://localhost/<id>/…` address space —
-  the same one Slice B's scheme handler serves (see the `plugin://` scheme
-  bullet below); the authority is fixed (`localhost`, or `plugin.localhost`
-  on Windows) and `<id>` is checked as the first path segment, never the
-  host — and denies everything else, another plugin's own otherwise-valid
-  address included, so one plugin's window can't even navigate itself into
-  impersonating a different plugin.
+  fully navigated the spike's plugin webview to a real external page —
+  nothing stopped it. **Mitigation (Slice C):** every plugin
+  `WebviewBuilder` (originally `WebviewWindowBuilder`, unchanged by the
+  Slice D `add_child` pivot — see the amendment above) is constructed with
+  `.on_navigation(...)`, locked to a pure predicate that allows only the
+  plugin's own `plugin://localhost/<id>/…` address space — the same one
+  Slice B's scheme handler serves (see the `plugin://` scheme bullet below);
+  the authority is fixed (`localhost`, or `plugin.localhost` on Windows) and
+  `<id>` is checked as the first path segment, never the host — and denies
+  everything else, another plugin's own otherwise-valid address included, so
+  one plugin's webview can't even navigate itself into impersonating a
+  different plugin.
 - **Network egress is not blocked by CSP alone; the app's global CSP is
   `null` anyway.** Tauri's CSP is one `tauri.conf.json` setting, not
-  configurable per-`WebviewWindow` through the public builder API. The real
+  configurable per-webview through the public builder API. The real
   lever — as this note's CSP subsection already specified before Option B was
   chosen — is the `Content-Security-Policy` header Slice B's `plugin://`
   scheme handler (`plugins::plugin_protocol_handler`) stamps on every
@@ -549,8 +579,11 @@ mitigated across Slices B and C:
 - **Plugin-provided text is untrusted, regardless of transport.** A
   manifest's `name` (and any other author-chosen string) is third-party text
   loomux never audits — it must be treated as data everywhere it's
-  surfaced (a window title, a future pane-tab label in Slice D), never
-  interpolated into HTML or any other markup a renderer would parse.
+  surfaced (the pane's tab label, the plugin picker's option text), never
+  interpolated into HTML or any other markup a renderer would parse. (Slice D
+  originally also passed it as a `WebviewWindow`'s OS window-chrome title;
+  the `add_child` pivot has no window chrome to title, so that surface no
+  longer exists — see the amendment above and Slice D's own notes below.)
 
 ## Install / discovery
 
@@ -671,18 +704,19 @@ are stated, without drifting from what was actually agreed:
   **Content-Security-Policy on plugin content** section specifies on every
   response, success or denial alike, hardened past this note's floor with
   `form-action 'none'`/`base-uri 'none'`. Tauri allows exactly one handler
-  per registered scheme, so Slice C's `WebviewWindow` points at the URLs
-  this handler serves (`plugin://localhost/<id>/<entry>`,
-  `pluginbroker::build_plugin_url`) rather than registering a second one.
-  `list_plugins`/`install_plugin` are main-only commands (`permissions/sets/plugins.toml`).
+  per registered scheme, so Slice C's `plugin_open_window` points the plugin's
+  child webview at the URLs this handler serves
+  (`plugin://localhost/<id>/<entry>`, `pluginbroker::build_plugin_url`)
+  rather than registering a second one. `list_plugins`/`install_plugin` are
+  main-only commands (`permissions/sets/plugins.toml`).
 - **Slice C** (the broker, the trust core — **done**, this note's Isolation
   section records the decided design) ran the Phase-0/Phase-0.5 spikes;
   implemented the envelope contract, the capability/apiVersion check as one
   pure function (`pluginbroker::check_request` / `pluginprotocol.ts`'s
   `checkCapability`) plus the command wiring around it; `plugin_open_window`
-  (which builds the `WebviewWindow` pointed at Slice B's `plugin://` address
+  (which embeds a child webview pointed at Slice B's `plugin://` address
   space and installs the `on_navigation` lock); forwards nothing to raw
-  `invoke` from within a plugin window, ever — a plugin's capability grants
+  `invoke` from within a plugin webview, ever — a plugin's capability grants
   exactly two commands (`capabilities/plugin.json`,
   `permissions/sets/plugin-broker.toml`). The `metrics.system` capability is
   gated but its data handler is a stub pending Slice E's `sys_processes`-shaped
@@ -694,13 +728,21 @@ are stated, without drifting from what was actually agreed:
   sync command runs inline on the same WebView2 UI thread that dispatched the
   IPC call, and `.build()` then can't get that same thread to service the
   window-creation round trip it needs, so the whole app hangs (blank plugin
-  window, frozen main window, nothing closable). `async fn` moves the command
-  body onto the async-runtime threadpool instead, leaving the UI thread free
-  to answer. This isn't testable against `tauri::test::MockRuntime` (its
-  `WebviewWindow`/`AppHandle` only implement `CommandArg` for the real `Wry`
-  runtime — confirmed by trying) or without a live Windows GUI, so it has no
-  automated regression test; don't revert this to a plain `fn` without
-  re-reading wry#583 first.
+  surface, frozen main window, nothing closable). `async fn` moves the
+  command body onto the async-runtime threadpool instead, leaving the UI
+  thread free to answer. **Unchanged by the Slice D `add_child` pivot** (the
+  amendment above): `WebviewBuilder::new`'s own rustdoc carries the identical
+  warning, and `Window::add_child` itself blocks on the same main-thread
+  round trip `WebviewWindowBuilder::build()` did — confirmed from
+  `tauri-2.11.5/src/window/mod.rs`'s own source, not just by analogy. This
+  isn't testable against `tauri::test::MockRuntime` for the deadlock itself
+  (the mock runtime's dispatcher doesn't block the way a real WebView2 UI
+  thread does) or without a live Windows GUI, so it has no automated
+  regression test for the DEADLOCK specifically; don't revert this to a
+  plain `fn` without re-reading wry#583 first. (The ACL-isolation
+  consequence of `add_child` — `windows` vs `webviews` scoping — IS
+  automated: `tests/acl_manifest.rs`'s
+  `webview_scope_guard_denies_windows_scoped_leak_to_child_webview`.)
 - **Slice D** (the `"plugin"` kind — **done**) adds exactly one member to
   each closed union this note describes as inheriting the content-pane
   mechanism (`PaneKind`/`isContentKind` in `panesetup.ts`, `PersistedPaneKind`/
@@ -713,22 +755,34 @@ are stated, without drifting from what was actually agreed:
   git repo already does — it does not throw, and it does not silently drop
   the pane from the layout on the next save.
 
-  **Hosting the window.** A plugin pane hosts NO DOM content of its own —
-  Slice C's `plugin_open_window` builds a separate top-level `WebviewWindow`,
-  not a node this pane's content box could contain. `PluginPaneView`
-  (`pluginpaneview.ts`) is the one place that positions and resizes that OS
-  window to sit exactly over the pane's `.pane-content` box, on every layout
-  change that could move it — a divider drag, a split, a tab switch, a
-  maximize elsewhere, the MAIN window itself moving or resizing — via a
-  `ResizeObserver` on its own content box plus `onMoved`/`onResized`
-  listeners on the main window. It hides the plugin window the moment that
-  box collapses to zero size (`pluginwindow.ts`'s `pluginWindowShouldShow`) —
-  the SAME zero-size signal `applyFit()` already uses to skip a PTY resize on
-  a hidden pane, reused here for a hidden *window* — rather than wiring a
-  bespoke hook into each of dock/tab-hide/maximize separately, and closes it
-  on pane dispose. The screen-space arithmetic (`pluginOverlayRect`) is pure
-  and DOM-free (`test/pluginwindow.test.ts`); the Tauri/DOM wiring around it
-  is hand-validated, per this repo's convention for DOM wiring.
+  **Hosting the webview (rewritten by the `add_child` pivot — see the
+  amendment above).** A plugin pane hosts NO DOM content of its own — Slice
+  C's `plugin_open_window` embeds a child `Webview` directly into the `main`
+  window via `Window::add_child`, not a node this pane's content box could
+  contain. `PluginPaneView` (`pluginpaneview.ts`) is the one place that
+  positions and resizes that child webview to sit exactly over the pane's
+  `.pane-content` box, on every layout change that could move it — a divider
+  drag, a split, a tab switch, a maximize elsewhere — via a `ResizeObserver`
+  on its own content box. Unlike the original `WebviewWindow` design, there
+  is no `onMoved`/`onResized` listener on the main window at all: `add_child`
+  positions the webview relative to `main`'s OWN client area (not absolute
+  screen coordinates), so a window move changes nothing, and a window resize
+  only matters insofar as it resizes the pane's own box — which the
+  `ResizeObserver` already watches directly. It hides the plugin webview the
+  moment that box collapses to zero size (`pluginwindow.ts`'s
+  `pluginWindowShouldShow`) — the SAME zero-size signal `applyFit()` already
+  uses to skip a PTY resize on a hidden pane, reused here for a hidden
+  *webview* — rather than wiring a bespoke hook into each of
+  dock/tab-hide/maximize separately, and closes it (`plugin_close_window` —
+  a child webview never fires `WindowEvent::Destroyed`, so an explicit close
+  command replaces the window-destroyed cleanup hook the original design
+  used) on pane dispose. The geometry (`pluginWebviewRect`) is pure and
+  DOM-free (`test/pluginwindow.test.ts`), and simpler than the original
+  design's `pluginOverlayRect`: no main-window origin/scale-factor
+  translation, since the pane's own `getBoundingClientRect()` is already in
+  the exact coordinate space `Webview.setPosition`/`setSize` expect. The
+  Tauri/DOM wiring around it is hand-validated, per this repo's convention
+  for DOM wiring.
 
   **The one gap Slice B left for this slice to close.** `list_plugins`
   echoes a manifest's `id`/`name`/`entry`/`capabilities`/`apiVersion`/
@@ -742,31 +796,49 @@ are stated, without drifting from what was actually agreed:
   install location decision (open decision 2, above) changes, this is the
   one place that has to follow it.
 
-  **Untrusted text.** A plugin manifest's `name` reaches this slice in three
-  places — the pane's tab label, the plugin picker's option text, and the
-  `plugin_open_window` `title` passed straight to the OS window chrome (never
-  parsed as markup on that side either, per `pluginbroker.rs`'s own doc
-  comment). All three go through `textContent`/`.value` assignment only,
-  never `innerHTML` or template interpolation — the DOM auto-escapes, so
-  there's no separate "escaping" step to get wrong.
+  **Untrusted text.** A plugin manifest's `name` reaches this slice in two
+  places — the pane's tab label and the plugin picker's option text. (A
+  third, earlier surface — the `plugin_open_window` `title` passed to the
+  `WebviewWindow`'s OS window chrome — no longer exists: the `add_child`
+  pivot embeds the plugin with no window chrome to title, so
+  `OpenPluginWindowRequest` dropped the field entirely rather than leaving it
+  unused.) Both remaining surfaces go through `textContent`/`.value`
+  assignment only, never `innerHTML` or template interpolation — the DOM
+  auto-escapes, so there's no separate "escaping" step to get wrong.
 
   **Known, accepted gaps** (documented rather than engineered around — this
   repo's own precedent for a real-but-cosmetic limitation, see
-  `content-panes.md`'s "one known, accepted cosmetic gap"): a freshly-opened
-  plugin window can flash at Tauri's default placement for one frame before
-  the first reposition lands; z-order relative to the main window (context
-  menus, toasts, modals) is whatever the OS window manager gives a plain
-  top-level window, not fought with a focus/always-on-top dance; and
-  multi-monitor DPI assumes the plugin window stays on the same display as
-  the pane hosting it (nothing stops a human dragging it elsewhere, which has
-  no reason to be a gesture this feature supports).
+  `content-panes.md`'s "one known, accepted cosmetic gap"; rewritten by the
+  `add_child` pivot, which removes one gap entirely and changes the shape of
+  another — see the amendment above): a freshly-opened plugin webview that
+  starts hidden (opened into a currently-invisible pane) may render for one
+  frame at a degenerate 1x1 size before the first `reposition()` call hides
+  it (smaller than the original design's equivalent gap, which flashed at a
+  full default size in the wrong place, but not fully eliminated — `add_child`
+  has no `visible: false` builder option); z-order versus `main`'s OWN DOM
+  content (context menus, tooltips, modals implemented as HTML/CSS) is a
+  NEW-shaped gap — a child webview is a native surface compositing above
+  `main`'s web content within its own bounds and does not respect CSS
+  z-index, so a DOM overlay that visually overlaps the plugin pane's screen
+  region renders BEHIND the plugin's native content (this REPLACES, not
+  adds to, the original design's z-order gap, which fought the OS window
+  manager for focus/z-order against `main` itself — arguably worse, since it
+  depended on unpredictable OS window-manager behavior rather than a fixed,
+  well-understood compositing order). Multi-monitor DPI is no longer a gap
+  at all: `add_child` positions relative to `main`'s own client area, so
+  there is no cross-monitor scale-factor math to get wrong (the original
+  design's absolute-screen-coordinate positioning is exactly what the
+  `add_child` pivot exists to eliminate — see the multiwebview spike's
+  findings comment on #360).
 - **Slice E** (metrics — **done**, `procmetrics.rs`) exposes `sys_processes`
   -shaped data **only** through the `metrics.system` broker handler — never as
   a command a plugin (or any other webview script) could `invoke` directly.
   `metrics.subscribe` starts a background poll thread, keyed by the plugin
-  window's label, that pushes a curated, bounded `metrics.tick` `PluginEvent`
+  webview's label, that pushes a curated, bounded `metrics.tick` `PluginEvent`
   over the channel `plugin_broker_open_channel` opened; `metrics.unsubscribe`
-  (and the window-destroyed hook) stops it. Bounding is two pure, unit-tested
+  (and `plugin_close_window`'s cleanup, since a child webview never fires
+  `WindowEvent::Destroyed` — see Slice D's notes above) stops it. Bounding is
+  two pure, unit-tested
   functions — `shape_processes` (sort by CPU desc, cap at `MAX_PROCESSES`) and
   `clamp_interval_ms` (floor/ceiling on the poll cadence a plugin can request)
   — so the DoS-shaped concern in this note's threat table has a concrete,

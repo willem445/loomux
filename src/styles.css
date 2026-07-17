@@ -1012,10 +1012,11 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 
 /* ---------- the plugin pane (#360 Slice D) ---------- */
 /* Unlike its siblings this box hosts NO real content of its own — the plugin's UI lives
-   in a separate isolated WebviewWindow that PluginPaneView continuously repositions to
-   sit exactly over this element (see pluginpaneview.ts). What's styled here is only the
-   fallback text shown before that window is up, or if opening it failed — the design
-   note's "empty/error state, not a crash". */
+   in an isolated child webview, embedded directly into the main window (Window::add_child)
+   and continuously repositioned by PluginPaneView to sit exactly over this element (see
+   pluginpaneview.ts). What's styled here is only the fallback text shown before that
+   webview is up, or if opening it failed — the design note's "empty/error state, not a
+   crash". */
 .pane-plugin {
   flex: 1; min-height: 0; min-width: 0;
   display: flex; align-items: center; justify-content: center;

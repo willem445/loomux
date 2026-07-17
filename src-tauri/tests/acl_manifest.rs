@@ -1,24 +1,28 @@
-//! ACL coherence + denial tests (#363, extended by #360 Slice C).
+//! ACL coherence + denial tests (#363, extended by #360 Slice C/D).
 //!
 //! This is the CI guard the #363 plan calls "the single most important
 //! deliverable": the app manifest flip (`build.rs`) makes every command
 //! without an explicit grant silently unreachable for every window,
 //! including `main`. These tests turn that silent failure into a red test:
 //!
-//!   - `generate_handler_matches_app_commands` / `app_commands_len_is_126`:
+//!   - `generate_handler_matches_app_commands` / `app_commands_len_is_127`:
 //!     `src/lib.rs`'s `generate_handler!` and `command_manifest::APP_COMMANDS`
 //!     are the two hand-maintained lists this migration depends on staying
 //!     identical; this diffs them directly out of the `lib.rs` source rather
 //!     than trusting a hand count. The count was 120 at #363, grew to 121
 //!     with `orch_confirm_solo_copilot_autopilot` (#364/#365), grew to 123
-//!     with #360 Slice B's `list_plugins`/`install_plugin`, and grew again to
-//!     126 with #360 Slice C's own three broker commands (`plugin_open_window`,
-//!     `plugin_broker_request`, `plugin_broker_open_channel`).
-//!   - `main_has_all_126_and_zero_permission_denies_dangerous_spread`: builds
+//!     with #360 Slice B's `list_plugins`/`install_plugin`, grew to 126 with
+//!     #360 Slice C's three broker commands (`plugin_open_window`,
+//!     `plugin_broker_request`, `plugin_broker_open_channel`), and grew again
+//!     to 127 with #360 Slice D's `plugin_close_window` (the child-webview
+//!     embedding's explicit-close command — see `pluginbroker.rs`'s module
+//!     doc comment on why a child webview has no `WindowEvent::Destroyed` to
+//!     hook cleanup onto instead).
+//!   - `main_has_all_127_and_zero_permission_denies_dangerous_spread`: builds
 //!     a real (headless) `tauri::test` mock app using the app's *actual*
 //!     `capabilities/`/`permissions/` on disk (via the same `generate_context!`
 //!     `build.rs` already feeds — not a reimplementation of ACL resolution),
-//!     invokes all 125 commands against the `main` window label, and invokes
+//!     invokes all 127 commands against the `main` webview label, and invokes
 //!     a representative dangerous spread + a benign control against the
 //!     `untrusted-probe-0` window label (see
 //!     `capabilities/plugin-zero-template.json` — the label is deliberately
@@ -28,17 +32,49 @@
 //!     reachable to main) and the plan's B (zero-permission denial), proven
 //!     against the real resolver.
 //!   - `plugin_capability_grants_only_broker_commands`: the #360 Slice C
-//!     addition — proves a `plugin-*`-labeled window (bound to
+//!     addition — proves a `plugin-*`-labeled webview (bound to
 //!     `capabilities/plugin.json`) can reach exactly the two broker commands
 //!     and nothing else, including the dangerous spread and the benign
 //!     control that `main` gets and the zero-permission template doesn't.
+//!   - `webview_scope_guard_denies_windows_scoped_leak_to_child_webview`: the
+//!     #360 Slice D addition — the CI guard for the isolation prerequisite
+//!     the multiwebview-embedding spike found (findings comment on #360,
+//!     `fix/360-plugin-embed` commit e337c95): a `windows`-scoped grant on
+//!     `main` (Tauri's own documented behavior — `Capability::windows`'s doc
+//!     comment says it applies to "all the webviews of that window,
+//!     regardless of the value of `webviews`") would silently hand a plugin's
+//!     embedded child webview `main`'s ENTIRE command surface, with no test
+//!     failure at the moment of the mistake, only a working exploit later.
+//!     This test builds a real `main` window, `add_child`s a second webview
+//!     labeled like a real plugin (`plugin-*`), and proves against the app's
+//!     *actual* on-disk capabilities that the child is denied EVERY ONE of
+//!     the 127 app commands except its own curated plugin-broker grant, while
+//!     `main`'s own webview keeps every command — i.e. it tests the real
+//!     shipped `default.json`/`plugin.json`, not a simulated ACL config, and
+//!     it is deliberately a comprehensive sweep rather than a single-command
+//!     canary (rev-89 NB-2): a canary on one command (the test's original
+//!     shape, `pty_backend_info` only) only catches a `windows`-scoped leak
+//!     on THAT command — a future capability that windows-scopes some OTHER
+//!     app command would slip past a canary silently. Looping every command
+//!     makes this guard catch the whole CLASS of mistake, not just the one
+//!     instance of it the spike happened to find.
 //!
 //! Red-before-green (cited in the PR): dropping `orch_grant_merge` from
 //! `permissions/sets/orch-control.toml` makes
-//! `main_has_all_125_and_zero_permission_denies_dangerous_spread` fail with
+//! `main_has_all_127_and_zero_permission_denies_dangerous_spread` fail with
 //! `main is missing a grant for: ["orch_grant_merge"]`. Dropping
 //! `allow-plugin-broker-request` from `permissions/sets/plugin-broker.toml`
 //! makes `plugin_capability_grants_only_broker_commands` fail the same way.
+//! Reverting `capabilities/default.json`'s `"webviews": ["main"]` back to
+//! `"windows": ["main"]` makes
+//! `webview_scope_guard_denies_windows_scoped_leak_to_child_webview` fail
+//! with `child webview embedded in main leaked: [...127 commands...] — some
+//! capability is granting an app command via windows: scope`. Adding a NEW,
+//! otherwise-unrelated `windows`-scoped grant of a single different command
+//! (e.g. a throwaway capability granting `orch_grant_merge` via
+//! `windows: ["main"]`) makes the same test fail the same way, listing just
+//! that one command — proving the guard catches the mistake class, not only
+//! the specific `default.json` leak the spike originally found.
 
 // Stub commands: same bare identifiers as the real commands in
 // `src/command_manifest.rs` / `src/lib.rs`'s `generate_handler!`, but
@@ -95,7 +131,7 @@ stub_commands!(
     take_startup_notice,
     load_ui_tabs, save_ui_tabs,
     voice_start, voice_stop, voice_cancel,
-    plugin_open_window, plugin_broker_request, plugin_broker_open_channel,
+    plugin_open_window, plugin_close_window, plugin_broker_request, plugin_broker_open_channel,
 );
 
 // Tauri's "local origin" custom-protocol scheme differs by platform (WebView2
@@ -109,22 +145,47 @@ const LOCAL_ORIGIN_URL: &str = "http://tauri.localhost";
 #[cfg(not(any(windows, target_os = "android")))]
 const LOCAL_ORIGIN_URL: &str = "tauri://localhost";
 
+fn invoke_request(cmd: &str) -> tauri::webview::InvokeRequest {
+    tauri::webview::InvokeRequest {
+        cmd: cmd.into(),
+        callback: tauri::ipc::CallbackFn(0),
+        error: tauri::ipc::CallbackFn(1),
+        url: LOCAL_ORIGIN_URL.parse().unwrap(),
+        body: tauri::ipc::InvokeBody::default(),
+        headers: Default::default(),
+        invoke_key: tauri::test::INVOKE_KEY.to_string(),
+    }
+}
+
 fn invoke(
     webview: &tauri::WebviewWindow<tauri::test::MockRuntime>,
     cmd: &str,
 ) -> Result<tauri::ipc::InvokeResponseBody, serde_json::Value> {
-    tauri::test::get_ipc_response(
-        webview,
-        tauri::webview::InvokeRequest {
-            cmd: cmd.into(),
-            callback: tauri::ipc::CallbackFn(0),
-            error: tauri::ipc::CallbackFn(1),
-            url: LOCAL_ORIGIN_URL.parse().unwrap(),
-            body: tauri::ipc::InvokeBody::default(),
-            headers: Default::default(),
-            invoke_key: tauri::test::INVOKE_KEY.to_string(),
-        },
-    )
+    tauri::test::get_ipc_response(webview, invoke_request(cmd))
+}
+
+/// Same as [`invoke`], but for a plain `Webview` that ISN'T a `WebviewWindow`
+/// — a real `add_child`-embedded plugin child webview, per #360 Slice D
+/// (`webview_scope_guard_denies_windows_scoped_leak_to_child_webview`, below).
+/// `Webview<R>` has no `AsRef<Webview<R>>` impl for `tauri::test::get_ipc_response`'s
+/// generic bound to land on (only `WebviewWindow` does), so this calls the
+/// same underlying `Webview::on_message` directly instead of going through
+/// that helper.
+fn invoke_webview(
+    webview: &tauri::Webview<tauri::test::MockRuntime>,
+    cmd: &str,
+) -> Result<tauri::ipc::InvokeResponseBody, serde_json::Value> {
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    webview.clone().on_message(
+        invoke_request(cmd),
+        Box::new(move |_window, _cmd, response, _callback, _error| {
+            tx.send(response).unwrap();
+        }),
+    );
+    match rx.recv().expect("failed to receive result from command") {
+        tauri::ipc::InvokeResponse::Ok(b) => Ok(b),
+        tauri::ipc::InvokeResponse::Err(tauri::ipc::InvokeError(v)) => Err(v),
+    }
 }
 
 /// Parses the bare command names out of `tauri::generate_handler![...]` in
@@ -169,20 +230,20 @@ fn generate_handler_matches_app_commands() {
 }
 
 #[test]
-fn app_commands_len_is_126() {
+fn app_commands_len_is_127() {
     assert_eq!(
         loomux_lib::command_manifest::APP_COMMANDS.len(),
-        126,
-        "APP_COMMANDS drifted from the audited count of 126 (120 at #363 + 1 for \
+        127,
+        "APP_COMMANDS drifted from the audited count of 127 (120 at #363 + 1 for \
          orch_confirm_solo_copilot_autopilot (#364/#365) + 2 for #360 Slice B's \
-         list_plugins/install_plugin + 3 for #360 Slice C's pluginbroker commands) — if this is \
-         an intentional addition/removal, update the count here (and the relevant issue's \
-         inventory, if that's the drift)"
+         list_plugins/install_plugin + 3 for #360 Slice C's pluginbroker commands + 1 for #360 \
+         Slice D's plugin_close_window) — if this is an intentional addition/removal, update the \
+         count here (and the relevant issue's inventory, if that's the drift)"
     );
 }
 
 #[test]
-fn main_has_all_126_and_zero_permission_denies_dangerous_spread() {
+fn main_has_all_127_and_zero_permission_denies_dangerous_spread() {
     // Catches drift in *this test file* before it can mask a real gap: the
     // stub list above must match APP_COMMANDS exactly.
     let mut stub_names: Vec<&str> = STUB_COMMAND_NAMES.to_vec();
@@ -267,10 +328,16 @@ fn main_has_all_126_and_zero_permission_denies_dangerous_spread() {
 }
 
 /// #360 Slice C: a real plugin window's capability (`capabilities/plugin.json`,
-/// `windows: ["plugin-*"]`) grants exactly the two broker commands and nothing
-/// else — proven against the same real resolver as the test above, against a
-/// window label a real plugin window would actually get
-/// (`pluginbroker::next_window_label` produces `plugin-<id>-<seq>`).
+/// `webviews: ["plugin-*"]`) grants exactly the two broker commands and
+/// nothing else — proven against the same real resolver as the test above,
+/// against a webview label a real plugin child webview would actually get
+/// (`pluginbroker::next_window_label` produces `plugin-<id>-<seq>`). Built as
+/// a `WebviewWindow` (window label == webview label == "plugin-demo-0") for
+/// simplicity — since `plugin.json` is `webviews`-scoped, the check is on the
+/// webview label regardless of whether that label's window is a real
+/// top-level window (as here) or a child of `main` (the real #360 Slice D
+/// shape, exercised by `webview_scope_guard_denies_windows_scoped_leak_to_child_webview`
+/// below).
 #[test]
 fn plugin_capability_grants_only_broker_commands() {
     let app = build_app();
@@ -286,11 +353,12 @@ fn plugin_capability_grants_only_broker_commands() {
         );
     }
 
-    // A plugin cannot open another plugin window (main-only), cannot reach
-    // the dangerous spread, and doesn't even get the benign control — a
-    // curated two-command grant, not main-ui, not zero-permission.
+    // A plugin cannot open or close another plugin webview (main-only),
+    // cannot reach the dangerous spread, and doesn't even get the benign
+    // control — a curated two-command grant, not main-ui, not zero-permission.
     const MUST_BE_DENIED: &[&str] = &[
         "plugin_open_window",
+        "plugin_close_window",
         "orch_grant_merge",
         "git_push",
         "ft_write_file",
@@ -303,6 +371,98 @@ fn plugin_capability_grants_only_broker_commands() {
             invoke(&plugin_window, cmd).is_err(),
             "a plugin-* window should be DENIED {cmd}, but it was allowed — the plugin capability \
              must never widen past the two broker commands"
+        );
+    }
+}
+
+/// #360 Slice D: the isolation prerequisite the multiwebview-embedding spike
+/// found (findings comment on #360, `fix/360-plugin-embed` commit e337c95) —
+/// see this file's module doc comment for the full rationale. Builds a real
+/// `main` window, embeds a SECOND webview into it via `Window::add_child`
+/// (exactly `pluginbroker::plugin_open_window`'s own shape) labeled like a
+/// real plugin (`plugin-demo-0`), and proves — against the app's *actual*
+/// on-disk `capabilities/`, not a simulated config — that the embedded child
+/// is denied a `main-ui` command while `main`'s own webview keeps it. This is
+/// the CI guard: reverting `capabilities/default.json`'s `webviews: ["main"]`
+/// back to `windows: ["main"]` makes this test fail (see this file's module
+/// doc comment for the exact failure message — verified red-before-green).
+#[test]
+fn webview_scope_guard_denies_windows_scoped_leak_to_child_webview() {
+    let app = build_app();
+    let main = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+        .build()
+        .expect("failed to build the 'main' mock webview");
+
+    // The same shape `plugin_open_window` itself uses: `add_child` on main's
+    // own `Window`, obtained via `AsRef<Webview<_>>::as_ref` + `Webview::window()`
+    // — no separate top-level window is created, so this is a genuine
+    // child-of-main scenario, not a relabeled WebviewWindow.
+    let main_window =
+        AsRef::<tauri::Webview<tauri::test::MockRuntime>>::as_ref(&main).window();
+    let child = main_window
+        .add_child(
+            tauri::webview::WebviewBuilder::new("plugin-demo-0", Default::default()),
+            tauri::LogicalPosition::new(0.0, 0.0),
+            tauri::LogicalSize::new(1.0, 1.0),
+        )
+        .expect("failed to add the 'plugin-demo-0' child webview to main");
+
+    assert_eq!(
+        child.window().label(),
+        "main",
+        "sanity check: a child webview's WINDOW label must be its parent's (\"main\"), never its \
+         own — this is exactly the ambiguity `windows`-scoped grants exploit"
+    );
+
+    // Comprehensive, not a single canary: every one of the 127 app commands must
+    // be denied to the child webview EXCEPT the two the plugin capability
+    // legitimately grants. A single-command probe (the original shape of this
+    // test, `pty_backend_info` only) only catches a `windows`-scoped leak on
+    // THAT one command — a future capability that windows-scopes some OTHER
+    // command (say, a new main-only command added without checking this file)
+    // would slip past it entirely. Looping every command instead makes this
+    // guard catch the whole CLASS of mistake ("any windows-scoped app-command
+    // grant leaks to a child webview"), proven against the real resolved ACL
+    // (not a re-implementation of set-expansion logic), so it's blind to WHICH
+    // capability file or WHICH command the mistake shows up in.
+    const PLUGIN_ALLOWED: &[&str] = &["plugin_broker_request", "plugin_broker_open_channel"];
+    let leaked: Vec<&str> = loomux_lib::command_manifest::APP_COMMANDS
+        .iter()
+        .copied()
+        .filter(|cmd| !PLUGIN_ALLOWED.contains(cmd))
+        .filter(|&cmd| invoke_webview(&child, cmd).is_ok())
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "child webview embedded in main leaked: {leaked:?} — some capability is granting an \
+         app command via `windows:` scope instead of `webviews:` scope, which (per \
+         Capability::windows's own doc comment) leaks to EVERY child webview of that window \
+         regardless of the child's own label. The #360 multiwebview spike found this leak on \
+         `capabilities/default.json`'s main grant specifically, but this guard is deliberately \
+         not scoped to that one file or that one command."
+    );
+
+    // main's own webview must be UNAFFECTED by the webviews-scoping fix — every
+    // app command still reachable. If this fails, the leak-denial above isn't a
+    // real per-webview boundary, it's a broken pipe, and proves nothing.
+    let denied_for_main: Vec<&str> = loomux_lib::command_manifest::APP_COMMANDS
+        .iter()
+        .filter(|&&cmd| invoke(&main, cmd).is_err())
+        .copied()
+        .collect();
+    assert!(
+        denied_for_main.is_empty(),
+        "main is missing a grant for: {denied_for_main:?} — the webviews-scoping fix must not \
+         narrow main's own coverage, only stop it leaking to embedded children"
+    );
+
+    // The child still gets exactly its curated plugin-broker grant — the fix
+    // (`webviews`-scoping) isn't a blanket deny, it's a real per-label check.
+    for &cmd in PLUGIN_ALLOWED {
+        assert!(
+            invoke_webview(&child, cmd).is_ok(),
+            "the child webview's own plugin-* capability grant should still work after the \
+             webviews-scoping fix ({cmd})"
         );
     }
 }

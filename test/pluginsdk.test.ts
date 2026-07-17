@@ -3,7 +3,7 @@
 // window at all, and createPluginClient takes its Tauri `internals` object as
 // an injected dependency (real plugin code omits it and falls back to
 // `window.__TAURI_INTERNALS__` — see the module doc comment) so the request/
-// event wiring is testable without a live WebviewWindow.
+// event wiring is testable without a live child webview.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {

@@ -2,25 +2,47 @@
 //! `doc/design/pane-plugins.md`'s Isolation section and the Phase-0/Phase-0.5
 //! spike findings on #360).
 //!
-//! A plugin's isolated `WebviewWindow` never calls raw `invoke`. Its capability
-//! (`windows: ["plugin-*"]` in `capabilities/plugin.json`) grants it exactly
+//! **Slice D hosting (this module's [`plugin_open_window`]):** a plugin runs
+//! in a child `Webview` embedded in the `main` window via `Window::add_child`
+//! (the multiwebview API, `unstable` feature) — a real embedded pane, not a
+//! separate top-level OS window (the #360 multiwebview spike,
+//! `fix/360-plugin-embed` commit e337c95, and the follow-up findings comment
+//! on #360). A child webview never calls raw `invoke`. Its capability
+//! (`webviews: ["plugin-*"]` in `capabilities/plugin.json`) grants it exactly
 //! two commands — [`plugin_broker_request`] and [`plugin_broker_open_channel`]
 //! — and nothing else in the app's ~120+ command surface. Those two commands
 //! *are* the broker: every other function in this module is the pure decision
 //! logic and capability-scoped handlers they call.
 //!
+//! **Why `webviews`, not `windows`, in `capabilities/plugin.json` (and
+//! `capabilities/default.json`'s own `main` grant):** `add_child` attaches
+//! the plugin's webview to the *existing* `main` window, so its window label
+//! is always `"main"` — never `plugin-*`. Tauri's ACL resolver grants a
+//! command if EITHER the requesting webview's own label matches a
+//! capability's `webviews` patterns OR its window's label matches `windows`
+//! patterns (`tauri-utils::acl::capability::Capability`'s own doc comment:
+//! a `windows`-scoped grant "will be enabled on all the webviews of that
+//! window, regardless of the value of `webviews`"). A `windows: ["main"]`
+//! grant — this repo's pre-Slice-D `default.json` — would therefore hand a
+//! plugin's embedded child webview `main`'s entire command surface. Both
+//! `default.json` and `plugin.json` are `webviews`-scoped for exactly this
+//! reason; `tests/acl_manifest.rs`'s
+//! `webview_scope_guard_denies_windows_scoped_leak_to_child_webview` is the
+//! CI guard against ever reintroducing a `windows`-scoped grant here.
+//!
 //! **Why `invoke` instead of literal `postMessage`, unlike the design note's
-//! iframe-era wording:** a child `WebviewWindow` is a separate top-level
-//! browsing context — `window.opener` is `null` (confirmed by the Phase-0.5
-//! spike) and there is no live JS window reference between it and `main` at
-//! all, so a literal `window.postMessage` bridge (the iframe model's
-//! transport) has nothing to target. Tauri's own IPC channel to these two
-//! ACL-gated commands *is* the postMessage-equivalent boundary for Option B:
-//! it replaces the iframe model's `event.source === frame.contentWindow`
-//! identity check with something structurally equivalent — the window label
-//! + capability system enforced by Tauri's resolver, checked before this
-//! module's code ever runs. Host→plugin pushes (the `PluginEvent` direction:
-//! resize/theme/metrics ticks) ride a `tauri::ipc::Channel`, opened once via
+//! iframe-era wording:** a child webview is a separate top-level browsing
+//! context from `main`'s own document — `window.opener` is `null` (confirmed
+//! by the Phase-0.5 spike, and again by the multiwebview spike) and there is
+//! no live JS window reference between it and `main` at all, so a literal
+//! `window.postMessage` bridge (the iframe model's transport) has nothing to
+//! target. Tauri's own IPC channel to these two ACL-gated commands *is* the
+//! postMessage-equivalent boundary for Option B: it replaces the iframe
+//! model's `event.source === frame.contentWindow` identity check with
+//! something structurally equivalent — the webview label + capability system
+//! enforced by Tauri's resolver, checked before this module's code ever
+//! runs. Host→plugin pushes (the `PluginEvent` direction: resize/theme/
+//! metrics ticks) ride a `tauri::ipc::Channel`, opened once via
 //! `plugin_broker_open_channel` — this sidesteps the app's global `listen()`
 //! surface deliberately: a plugin granted `core:event:allow-listen` could
 //! listen for *any* event name emitted anywhere in the app (e.g. `pty-output`,
@@ -32,10 +54,10 @@
 //! The four-step per-message check from the design note becomes, in this
 //! transport:
 //!
-//! 1. **Identity** — enforced structurally: only a window matching
-//!    `capabilities/plugin.json`'s `windows: ["plugin-*"]` pattern can reach
+//! 1. **Identity** — enforced structurally: only a webview matching
+//!    `capabilities/plugin.json`'s `webviews: ["plugin-*"]` pattern can reach
 //!    [`plugin_broker_request`] at all, and this module then looks up that
-//!    window's own registered [`PluginSession`] by its (unforgeable) label.
+//!    webview's own registered [`PluginSession`] by its (unforgeable) label.
 //! 2. **`apiVersion` check** — [`check_request`].
 //! 3. **Capability check** — [`check_request`].
 //! 4. **Params validation** — the per-method handlers below
@@ -47,10 +69,17 @@
 //! **The `plugin://` scheme itself belongs to `plugins.rs` (#360 Slice B),
 //! not this module.** Tauri allows exactly one handler per registered
 //! scheme; `lib.rs` registers `plugins::plugin_protocol_handler` only.
-//! [`plugin_open_window`] points its `WebviewWindow` at the URLs that handler
+//! [`plugin_open_window`] points its child `Webview` at the URLs that handler
 //! serves (`plugin://localhost/<id>/<entry>` — see [`build_plugin_url`]) and
 //! [`is_navigation_allowed`] locks navigation to that same address space;
 //! neither resolves or serves an asset itself.
+//!
+//! **No `WindowEvent::Destroyed` for a child webview.** Unlike a top-level
+//! window, a webview embedded via `add_child` never fires an OS-level
+//! destroyed event Tauri can observe — [`plugin_close_window`] is the
+//! explicit command the frontend calls on pane teardown instead (mirroring
+//! this codebase's existing `killPty` pattern: `pluginpaneview.ts`'s
+//! `dispose()` calls it fire-and-forget, the same posture as PTY teardown).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -329,11 +358,12 @@ pub fn is_valid_plugin_id(id: &str) -> bool {
 
 // ---------- navigation lock (spike residual-capability finding #1) ----------
 
-/// A `WebviewWindow` has no `sandbox=""` equivalent, so nothing stops it
-/// self-navigating to a remote origin the way an `allow-top-navigation`-less
+/// A plugin's child webview has no `sandbox=""` equivalent, so nothing stops
+/// it self-navigating to a remote origin the way an `allow-top-navigation`-less
 /// iframe would be stopped (Phase-0.5 spike finding: `location.href =
-/// 'https://example.com/'` succeeded completely). This is the mitigation:
-/// `WebviewWindowBuilder::on_navigation` is wired to this pure predicate,
+/// 'https://example.com/'` succeeded completely, confirmed unchanged for
+/// `add_child` embedding by the multiwebview spike). This is the mitigation:
+/// `WebviewBuilder::on_navigation` is wired to this pure predicate,
 /// which allows only the plugin's own address space under
 /// `plugins::plugin_protocol_handler` (#360 Slice B) — `plugin://localhost/<id>/…`
 /// on the wire, rewritten by wry to `http://plugin.localhost/<id>/…` on
@@ -387,7 +417,7 @@ fn with_channels<R>(f: impl FnOnce(&mut HashMap<String, tauri::ipc::Channel<Plug
     f(guard.get_or_insert_with(HashMap::new))
 }
 
-/// Sanitized, unique-per-open window label: `plugin-<id>-<seq>`. Not a
+/// Sanitized, unique-per-open child-webview label: `plugin-<id>-<seq>`. Not a
 /// security token (uniqueness only), so a plain atomic counter is correct
 /// here per this crate's getrandom ban — see `Cargo.toml`.
 fn next_window_label(plugin_id: &str) -> String {
@@ -395,9 +425,11 @@ fn next_window_label(plugin_id: &str) -> String {
     format!("plugin-{plugin_id}-{seq}")
 }
 
-/// Cleanup hook called from `lib.rs`'s `on_window_event(Destroyed)` handler —
-/// mirrors the existing PTY-kill-on-close pattern for plugin windows.
-pub fn on_window_destroyed(label: &str) {
+/// Cleanup hook called from [`plugin_close_window`] — a child webview has no
+/// `WindowEvent::Destroyed` for `lib.rs` to observe (see the module doc
+/// comment), so this runs on the frontend's explicit close instead of a
+/// window-lifecycle event. Mirrors the existing PTY-kill-on-close pattern.
+pub fn on_plugin_webview_closed(label: &str) {
     with_sessions(|m| m.remove(label));
     with_channels(|m| m.remove(label));
 }
@@ -405,18 +437,22 @@ pub fn on_window_destroyed(label: &str) {
 // ---------- tauri commands ----------
 //
 // These two are the ONLY commands `capabilities/plugin.json` grants to a
-// `plugin-*` window (see `permissions/sets/plugin-broker.toml`). Neither ever
-// returns a Tauri-level `Err` for a plugin-side mistake — a denied or
-// malformed request is always a `PluginResponseWire { ok: false, .. }`, per
-// the design note's error-surface contract ("never a thrown exception that
-// could crash the plugin's frame").
+// `plugin-*`-labeled webview (see `permissions/sets/plugin-broker.toml`).
+// Both take `tauri::Webview`, not `tauri::WebviewWindow` — a plugin's child
+// webview is not itself a top-level window (`Webview::is_webview_window()`
+// is false for it), so `WebviewWindow`'s `CommandArg` impl would reject the
+// call outright. Neither command ever returns a Tauri-level `Err` for a
+// plugin-side mistake — a denied or malformed request is always a
+// `PluginResponseWire { ok: false, .. }`, per the design note's
+// error-surface contract ("never a thrown exception that could crash the
+// plugin's frame").
 
 #[tauri::command]
 pub fn plugin_broker_request(
-    window: tauri::WebviewWindow,
+    webview: tauri::Webview,
     request: PluginRequestWire,
 ) -> PluginResponseWire {
-    let label = window.label().to_string();
+    let label = webview.label().to_string();
     let session = match session_for_window(&label) {
         Some(s) => s,
         None => {
@@ -479,17 +515,17 @@ fn dispatch(label: &str, session: &PluginSession, cap: Capability, req: &PluginR
 
 #[tauri::command]
 pub fn plugin_broker_open_channel(
-    window: tauri::WebviewWindow,
+    webview: tauri::Webview,
     channel: tauri::ipc::Channel<PluginEventWire>,
 ) {
-    let label = window.label().to_string();
+    let label = webview.label().to_string();
     with_channels(|m| {
         m.insert(label, channel);
     });
 }
 
 /// Push an unsolicited `PluginEvent` (resize/theme/metrics tick) to a plugin
-/// window that has opened its channel. Silently a no-op if it hasn't (or has
+/// webview that has opened its channel. Silently a no-op if it hasn't (or has
 /// already closed) — the same fire-and-forget posture `GitWatcher`'s change
 /// notifications use for a pane that may no longer be listening. Slice D/E
 /// call sites, not this slice.
@@ -527,14 +563,19 @@ pub struct OpenPluginWindowRequest {
     /// in depth; never trust a caller's validation as the only check).
     pub capabilities: Vec<String>,
     pub api_version: u32,
-    /// The plugin manifest's own `name` field — display-only, and **untrusted
-    /// text** (an arbitrary third-party plugin author's choice, not audited
-    /// by loomux — see the design note's manifest section). Passed straight
-    /// to `WebviewWindowBuilder::title`, an OS window-chrome string, never
-    /// HTML — but any future surface (Slice D's pane tab label included) that
-    /// renders this string into the DOM must escape it, never interpolate it
-    /// as markup.
-    pub title: String,
+    /// The pane's own content-box position/size at open time, in logical
+    /// pixels RELATIVE TO THE MAIN WINDOW'S OWN CLIENT AREA — `Window::add_child`
+    /// positions a child webview against its parent window directly (standard
+    /// Win32 child-window semantics), not in absolute screen coordinates, so
+    /// unlike the overlay-window design this replaces there is no
+    /// scale-factor/`innerPosition()` translation needed here or on the
+    /// frontend (`pluginpaneview.ts`'s `reposition()`, which corrects
+    /// `x`/`y`/`width`/`height` again immediately after open via the
+    /// frontend's own `Webview.setPosition`/`setSize` — this is just the
+    /// best-effort initial box, same role the old `width`/`height` played for
+    /// `WebviewWindowBuilder::inner_size`).
+    pub x: f64,
+    pub y: f64,
     pub width: f64,
     pub height: f64,
 }
@@ -567,9 +608,9 @@ fn validate_open_request(req: &OpenPluginWindowRequest) -> Result<Vec<Capability
     Ok(granted)
 }
 
-/// Look up the registered session for a `plugin-*` window label — the one
+/// Look up the registered session for a `plugin-*` webview label — the one
 /// thing [`plugin_broker_request`] needs to know which capabilities/apiVersion
-/// to check a request against. Keyed by the window label Tauri itself
+/// to check a request against. Keyed by the webview label Tauri itself
 /// guarantees unique, not by plugin id (`plugins.rs`'s `plugin://` asset
 /// resolution is entirely independent of this registry — it resolves
 /// straight from `plugins::plugins_root_dir()`, not from anything Slice C
@@ -579,29 +620,31 @@ pub fn session_for_window(label: &str) -> Option<PluginSession> {
 }
 
 /// **Must stay `async fn`** — this is the documented Tauri/wry Windows
-/// footgun (wry#583, cited verbatim on `WebviewWindowBuilder::new`'s own
-/// rustdoc: "this function deadlocks when used in a synchronous command...
-/// use async commands ... when creating windows"). A non-async
-/// `#[tauri::command]` runs its body inline on the same WebView2/UI thread
-/// that dispatched the IPC call; `WebviewWindowBuilder::build()` then has to
-/// round-trip a request back onto that SAME thread to actually create the
-/// window, which can never be serviced because the thread is still blocked
-/// inside this call — the whole app hangs (the plugin window paints nothing,
-/// its close button and devtools/right-click never respond, and the main
-/// window freezes too, since it's the same UI thread). Marking this `async`
-/// makes Tauri dispatch the command body onto the async-runtime threadpool
-/// instead, so `.build()`'s main-thread round trip has somewhere to land.
+/// footgun (wry#583), which applies identically to `add_child`: both
+/// `WebviewWindowBuilder::new` and the plain `WebviewBuilder::new` this
+/// function now uses carry the same rustdoc warning verbatim ("this function
+/// deadlocks when used in a synchronous command or event handlers... use
+/// `async` commands"), because `Window::add_child` itself blocks on a
+/// `channel::recv()` round-trip to the main thread
+/// (`tauri::window::Window::add_child`'s own body) — the identical shape
+/// `WebviewWindowBuilder::build()` has. A non-async `#[tauri::command]` runs
+/// its body inline on the same WebView2/UI thread that dispatched the IPC
+/// call; the round-trip then has nowhere to land and the whole app hangs
+/// (the plugin surface paints nothing, and the main window freezes too,
+/// since it's the same UI thread). Marking this `async` makes Tauri dispatch
+/// the command body onto the async-runtime threadpool instead.
 #[tauri::command]
 pub async fn plugin_open_window(
-    app: tauri::AppHandle,
+    window: tauri::Window,
     req: OpenPluginWindowRequest,
 ) -> Result<String, String> {
-    // Every fallible check runs BEFORE the window is built (rev-65 NB-2 on
-    // #369): building first and validating after would leave a stranded,
-    // inert window on screen if e.g. `apiVersion` were rejected — fail-closed
-    // either way (no session means the broker denies everything), but
-    // validating first means a bad request never creates a real OS window at
-    // all, rather than one that has to be cleaned up.
+    // Every fallible check runs BEFORE the webview is built (rev-65 NB-2 on
+    // #369, carried over from the WebviewWindow design): building first and
+    // validating after would leave a stranded, inert webview on screen if
+    // e.g. `apiVersion` were rejected — fail-closed either way (no session
+    // means the broker denies everything), but validating first means a bad
+    // request never creates a real child webview at all, rather than one
+    // that has to be cleaned up.
     let granted = validate_open_request(&req)?;
     let url = build_plugin_url(&req.plugin_id, &req.entry)?;
 
@@ -611,10 +654,8 @@ pub async fn plugin_open_window(
         "pluginbroker",
         &format!("plugin_open_window: label={label} url={url}"),
     );
-    tauri::WebviewWindowBuilder::new(&app, &label, tauri::WebviewUrl::External(url))
-        .title(&req.title)
-        .inner_size(req.width, req.height)
-        // Devtools/right-click-Inspect for a sandboxed plugin window: only
+    let builder = tauri::webview::WebviewBuilder::new(&label, tauri::WebviewUrl::External(url))
+        // Devtools/right-click-Inspect for a sandboxed plugin webview: only
         // ever in a debug build. The `devtools` Cargo feature this crate does
         // NOT enable (see Cargo.toml) already makes this a structural no-op
         // in release regardless of the bool here — explicit anyway so the
@@ -631,8 +672,19 @@ pub async fn plugin_open_window(
                 ),
             );
             allowed
-        })
-        .build()
+        });
+    // `window` is the CALLING webview's own window — always "main", since
+    // only main's capability grants this command (permissions/sets/misc.toml)
+    // — so this embeds the child directly into main with no window lookup.
+    // Position/size are relative to main's own client area (add_child's own
+    // contract), matching `req.x`/`req.y`/`req.width`/`req.height`'s doc
+    // comment on `OpenPluginWindowRequest`.
+    window
+        .add_child(
+            builder,
+            tauri::LogicalPosition::new(req.x, req.y),
+            tauri::LogicalSize::new(req.width, req.height),
+        )
         .map_err(|e| e.to_string())?;
 
     // Nothing below this point can fail: `granted`/`api_version` were already
@@ -649,6 +701,31 @@ pub async fn plugin_open_window(
         );
     });
     Ok(label)
+}
+
+/// Explicit close for a plugin's child webview, called by `pluginpaneview.ts`
+/// `dispose()` (fire-and-forget, mirroring the existing `killPty(...).catch(()
+/// => {})` posture) — a child webview never fires `WindowEvent::Destroyed`
+/// for `lib.rs` to hook cleanup onto the way a real top-level window closing
+/// would (see this module's doc comment), so this command IS that hook:
+/// closes the underlying webview AND releases the [`PluginSession`]/broker
+/// channel/procmetrics-poll-thread state [`on_plugin_webview_closed`] and
+/// `procmetrics::on_plugin_webview_closed` own. `label` is validated against
+/// the `plugin-*` shape before touching anything — main is fully trusted
+/// already, so this isn't a security boundary, just a guard against a stray
+/// bug in main's own JS closing something that isn't a plugin webview (e.g.
+/// "main" itself).
+#[tauri::command]
+pub fn plugin_close_window(app: tauri::AppHandle, label: String) -> Result<(), String> {
+    if !label.starts_with("plugin-") {
+        return Err(format!("refusing to close non-plugin webview label: {label}"));
+    }
+    if let Some(webview) = tauri::Manager::get_webview(&app, &label) {
+        webview.close().map_err(|e| e.to_string())?;
+    }
+    on_plugin_webview_closed(&label);
+    crate::procmetrics::on_plugin_webview_closed(&label);
+    Ok(())
 }
 
 /// Builds the `plugin://localhost/<id>/<entry>` URL a plugin window loads —
@@ -867,7 +944,8 @@ mod tests {
             root: None,
             capabilities: capabilities.into_iter().map(String::from).collect(),
             api_version,
-            title: "t".into(),
+            x: 0.0,
+            y: 0.0,
             width: 1.0,
             height: 1.0,
         }
@@ -876,9 +954,9 @@ mod tests {
     #[test]
     fn validate_open_request_rejects_bad_input_before_any_window_would_be_built() {
         // rev-65 NB-2 on #369: plugin_open_window calls this — and only this —
-        // before touching WebviewWindowBuilder, so a request like this one
-        // (the exact `apiVersion: 999` example from the finding) never gets
-        // as far as creating a real OS window.
+        // before touching the child webview builder, so a request like this
+        // one (the exact `apiVersion: 999` example from the finding) never
+        // gets as far as creating a real embedded webview.
         assert!(validate_open_request(&open_request(vec!["not-a-real-capability"], 1)).is_err());
         assert!(validate_open_request(&open_request(vec![], 999)).is_err());
         assert!(validate_open_request(&open_request(vec!["storage"], 1)).is_ok());

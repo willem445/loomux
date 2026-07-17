@@ -12,7 +12,15 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+# "unstable" reaches Window::add_child (multiwebview), which #360 Slice D
+# uses to host a plugin as a real embedded child webview of the main window
+# instead of a separate WebviewWindow — see doc/design/pane-plugins.md and
+# the findings comment on #360 (spike: fix/360-plugin-embed commit e337c95).
+# Adds zero new crates: tauri-runtime-wry's own `unstable = []` is a pure
+# cfg-gate (confirmed via `cargo tree -e features` before/after enabling it),
+# so this does not affect the getrandom/ProcessPrng constraint this file's
+# getrandom note (below) already tracks.
+tauri = { version = "2", features = ["unstable"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 portable-pty = "0.9"

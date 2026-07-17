@@ -32,7 +32,8 @@
 // readable directory is I/O the form probes.
 
 // #360 Slice D adds a FIFTH content kind: `plugin` — an installed pane plugin (see
-// doc/design/pane-plugins.md), hosted in its own isolated WebviewWindow (Slice C).
+// doc/design/pane-plugins.md), hosted in its own isolated child webview, embedded
+// directly in the pane via Window::add_child (Slice C).
 // It breaks the "one input is a path" pattern its four siblings share: a plugin
 // pane's identity is WHICH PLUGIN, not a folder or repo, so its one input is a
 // `pluginId` chosen from the installed set (`list_plugins`) rather than a typed
@@ -161,7 +162,8 @@ export interface WorkflowPlan {
   name: string;
 }
 /** A PLUGIN pane (#360 Slice D): an installed plugin, hosted in its own isolated
- *  WebviewWindow (Slice C). Unlike its four content-kind siblings, its one input
+ *  child webview, embedded directly in the pane (Slice C). Unlike its four
+ *  content-kind siblings, its one input
  *  is not a path — `pluginId` names WHICH plugin, chosen from `list_plugins`
  *  (Slice B) — so it carries no `root` at all. */
 export interface PluginPlan {
