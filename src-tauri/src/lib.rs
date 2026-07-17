@@ -17,6 +17,9 @@ mod procmetrics; // the metrics.system data source (#360 Slice E) — dispatched
 pub mod plugins; // pub: the pane-plugins integration test links its pure fns (#360 Slice B)
 pub mod pty; // pub: Job-Object integration test links `assign_kill_on_close_job`
 mod sessions;
+// SPIKE-ONLY (spike/360-iframe-isolation-proof, #360 iframe isolation proof)
+// — delete this module and its wiring before any real feature work lands.
+mod spike_iframe;
 mod uistate; // durable UI state (project tabs, #63) — atomic tabs.json store
 pub mod usage; // pub: exercised by orchestration integration tests
 pub mod voice; // voice-prompt prototype (#58); pub: pure helpers are unit-tested
@@ -89,6 +92,9 @@ pub fn run() {
             orchestration::start_disk_monitor(reg.clone());
             orchestration::start_notify_poller(reg.clone());
             std::thread::spawn(move || orchestration::mcp::serve(reg));
+            // SPIKE-ONLY (spike/360-iframe-isolation-proof) — no-ops unless
+            // LOOMUX_SPIKE_IFRAME_TEST is set. Delete before real feature work.
+            spike_iframe::maybe_open(app)?;
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -220,6 +226,10 @@ pub fn run() {
             pluginbroker::plugin_broker_request,
             pluginbroker::plugin_broker_open_channel,
             pluginregion::plugin_set_occlusion,
+            // SPIKE-ONLY (spike/360-iframe-isolation-proof) — remove with
+            // spike_iframe.rs before any real feature work lands.
+            spike_iframe::spike_probe_marker,
+            spike_iframe::spike_report_probe,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {

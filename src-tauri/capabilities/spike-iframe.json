@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "spike-iframe",
+  "description": "SPIKE-ONLY (spike/360-iframe-isolation-proof, #360 iframe isolation proof). Grants the throwaway harness window's own webview (label \"spike-iframe-test\") exactly the two spike probe commands. Delete this file before any real feature work lands on this branch.",
+  "webviews": ["spike-iframe-test"],
+  "permissions": ["allow-spike-probe-marker", "allow-spike-report-probe"]
+}

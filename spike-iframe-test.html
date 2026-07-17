@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>SPIKE: iframe isolation proof (#360)</title>
+    <style>
+      body {
+        font-family: -apple-system, Segoe UI, sans-serif;
+        padding: 1rem;
+        background: #111;
+        color: #eee;
+      }
+      #banner {
+        font-size: 1.3rem;
+        font-weight: bold;
+        padding: 1rem;
+        border-radius: 8px;
+        margin-bottom: 1rem;
+      }
+      .pending {
+        background: #333;
+        color: #ccc;
+      }
+      .pass {
+        background: #163;
+        color: #9f9;
+      }
+      .fail {
+        background: #611;
+        color: #f99;
+      }
+      pre {
+        background: #000;
+        padding: 1rem;
+        overflow: auto;
+        max-height: 45vh;
+        white-space: pre-wrap;
+      }
+      iframe {
+        width: 100%;
+        height: 250px;
+        border: 1px solid #555;
+        background: #fff;
+      }
+      h2 {
+        font-size: 0.95rem;
+        color: #999;
+        margin-top: 1.5rem;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="banner" class="pending">Running probe…</div>
+    <pre id="out">(waiting for the plugin frame's self-probe to post back…)</pre>
+    <h2>Plugin iframe under test (sandbox="allow-scripts", no allow-same-origin)</h2>
+    <iframe
+      id="plugin-frame"
+      sandbox="allow-scripts"
+      src="http://plugin.localhost/resource-monitor/index.html"
+    ></iframe>
+    <script>
+      const out = document.getElementById("out");
+      const banner = document.getElementById("banner");
+
+      function render(result) {
+        out.textContent = JSON.stringify(result, null, 2);
+        const m1Leaked = result.frame.m1MarkerLeaked === true;
+        const m2InvokeReached =
+          result.frame.invokeAttempt && result.frame.invokeAttempt.ok === true;
+        const hostOk = result.hostInvokeOk === true;
+
+        if (!hostOk) {
+          banner.className = "fail";
+          banner.textContent =
+            "INCONCLUSIVE — host page's own invoke() did not succeed; check devtools console.";
+          return;
+        }
+
+        if (m1Leaked || m2InvokeReached) {
+          banner.className = "fail";
+          let msg = "FAIL — ";
+          if (m1Leaked) msg += "Mitigation 1 (main-frame-only init script) LEAKED into the plugin iframe. ";
+          if (m2InvokeReached) msg += "Mitigation 2 (document-start scrub) did NOT stop invoke() from reaching the backend.";
+          banner.textContent = msg;
+        } else {
+          banner.className = "pass";
+          banner.textContent =
+            "PASS — no main-frame-only leak, invoke() from the plugin frame was blocked, and host IPC still works.";
+        }
+      }
+
+      window.addEventListener("message", async (event) => {
+        const data = event.data;
+        if (!data || data.kind !== "spike-iframe-probe") return;
+
+        const frameReport = data.report;
+        let hostInvokeOk = false;
+        let hostInvokeResult = null;
+        try {
+          hostInvokeResult = await window.__TAURI_INTERNALS__.invoke(
+            "spike_probe_marker",
+            { caller: "host-main-frame" }
+          );
+          hostInvokeOk = true;
+        } catch (e) {
+          hostInvokeResult = String(e);
+        }
+
+        const combined = { frame: frameReport, hostInvokeOk, hostInvokeResult };
+        render(combined);
+
+        try {
+          await window.__TAURI_INTERNALS__.invoke("spike_report_probe", {
+            payload: combined,
+          });
+        } catch (e) {
+          console.error("failed to report combined probe result to backend", e);
+        }
+      });
+    </script>
+  </body>
+</html>

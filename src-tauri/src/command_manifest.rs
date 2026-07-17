@@ -169,4 +169,10 @@ pub const APP_COMMANDS: &[&str] = &[
     // plugin child webview's own HWND to exclude whatever DOM overlay rects
     // currently cover its pane. Never granted to a plugin-* webview itself.
     "plugin_set_occlusion",
+    // SPIKE-ONLY (spike/360-iframe-isolation-proof, #360 iframe isolation
+    // proof) — spike_iframe.rs. Delete these two along with that module,
+    // capabilities/spike-iframe.json, and spike-iframe-test.html before any
+    // real feature work lands on this branch.
+    "spike_probe_marker",
+    "spike_report_probe",
 ];
