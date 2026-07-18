@@ -208,6 +208,39 @@ export class Grid {
     return pane;
   }
 
+  /** Open a pane that starts life ALREADY docked (#387: spawn-minimized flash).
+   *  The old path — `openPane` (which lands the pane in a real, full-size tree
+   *  slot) followed by a `minimize()` call once the PTY finished spawning — held
+   *  that visible slot for the whole async spawn round-trip, so the pane painted
+   *  at least one full-size frame before folding into the dock. This one never
+   *  creates a leaf for the pane at all: it goes straight into `minimizedPanes`
+   *  and the dock chip is the only thing that ever renders. `pane.el` stays
+   *  detached (the same end state `minimize()` leaves a docked pane in), so
+   *  `fit()` inside `pane.start()` finds a zero-size container and leaves xterm at
+   *  its construction default (80x24) rather than sizing — and resizing the PTY —
+   *  to a layout slot the human never sees. `restore()` still does the one real
+   *  fit, when the pane actually becomes visible.
+   *
+   *  Mirrors `minimize()`'s own "never leave the grid empty" rule: with no
+   *  visible pane yet there is nothing to dock behind, so this falls back to a
+   *  normal (visible) open — the same no-op-and-show-it-anyway `minimize()`
+   *  itself would produce in that edge case. */
+  async openPaneMinimized(
+    opts: PaneOptions,
+    events: PaneEvents,
+    dir: Dir = "row",
+    relativeTo?: Pane
+  ): Promise<Pane> {
+    if (!this.root) return this.openPane(opts, events, dir, relativeTo);
+    const pane = new Pane(events);
+    this.minimizedPanes.push(pane);
+    pane.setDockSyncListener(() => this.renderDock());
+    this.renderDock();
+    await pane.start(opts, false); // never takes focus — it's never shown
+    this.onChange();
+    return pane;
+  }
+
   /** Land a pane in "setup" state (#194): placed in the grid like any pane but
    *  with NO PTY — it shows the welcome/pane-setup form (`formEl`) until the user
    *  submits, at which point the caller converts it via `pane.startFromWelcome`.
