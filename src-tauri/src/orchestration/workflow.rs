@@ -226,6 +226,152 @@ pub struct Gate {
     pub also: Vec<String>,
 }
 
+// ── intake: source + label vocabulary (#382 P1) ────────────────────────────
+//
+// Where autonomous work comes from and what its label vocabulary is called —
+// the missing sibling of `gates:` ("what gates it" beside "where it comes
+// from"). Inert vocabulary + an adapter choice from a fixed set, the same
+// capability-closure argument as `blocks:` above: `intake:` can never grant a
+// capability, and there is deliberately **no spelling that can disable the
+// human merge gate** — that lives in the `gh` shim, keyed to group markers,
+// and is not reachable from this file at all. `deny_unknown_fields` on
+// `RawIntake`/`RawIntakeLabels` (below) makes a `human_gate: false`-style key
+// a hard parse error by construction, not a line this schema has to
+// specifically recognize and reject.
+
+/// Where intake work comes from. A workflow file *selects* one of these; it
+/// can never define a new one — same "reject, never coerce" posture as
+/// [`kind_from_str`].
+///
+/// `Board` and `None` are **schema-reserved, not wired**: the #382 plan ships
+/// the `github-labels` adapter fully in this slice and designs the other two
+/// into the schema now so the config contract never churns, but their runtime
+/// (a non-`gh` poll source, tracker-agnostic loop prose) is a follow-on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IntakeSource {
+    /// Poll `gh issue list`, match label strings client-side. Today's only
+    /// wired behavior, and the built-in default.
+    GithubLabels,
+    /// The loomux task board is the queue. Schema-reserved (Phase B).
+    Board,
+    /// No autonomous intake at all — idle-tick still runs its other chores
+    /// (PR-sweep, lost-notification backstop) but never polls for labelled
+    /// work. Schema-reserved (Phase B); valid to declare today even though
+    /// nothing yet reads it, since P4 wires the consumers.
+    None,
+}
+
+impl IntakeSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            IntakeSource::GithubLabels => "github-labels",
+            IntakeSource::Board => "board",
+            IntakeSource::None => "none",
+        }
+    }
+}
+
+impl Default for IntakeSource {
+    fn default() -> Self {
+        IntakeSource::GithubLabels
+    }
+}
+
+/// Parse an `intake.source:` value. Trimmed empty string maps to the built-in
+/// default (`github-labels`) — matching the plan's `source: github-labels
+/// (default)` schema comment, and letting a repo override just the labels
+/// without repeating a source it already means. Anything else unrecognized is
+/// `None`, which the caller turns into a hard, allowed-set-naming error —
+/// never coerced, the same shape [`kind_from_str`] enforces.
+pub fn intake_source_from_str(s: &str) -> Option<IntakeSource> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "" | "github-labels" => Some(IntakeSource::GithubLabels),
+        "board" => Some(IntakeSource::Board),
+        "none" => Some(IntakeSource::None),
+        _ => None,
+    }
+}
+
+/// The intake sources a workflow file may name, for error messages.
+pub fn intake_source_names() -> String {
+    "github-labels, board, none".to_string()
+}
+
+/// The resolved intake policy: **one source of truth**, always present (the
+/// built-in default when a repo declares nothing, or declares only part of
+/// it), persisted in `group.json` beside `blocks` and read by every consumer
+/// that needs "what counts as intake" — the template renderer, `gh.rs`'s
+/// label allow-list, `idle_tick_notice()`, and the #332 host poller (P2-P4,
+/// separate PRs; this struct is the shared contract they all read).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IntakeProfile {
+    pub source: IntakeSource,
+    /// "Build this." The real repo label spelling in the built-in profile.
+    pub ready: String,
+    /// "Look, don't build."
+    pub investigate: String,
+    /// "Mine" — ownership marker.
+    pub owned: String,
+    /// Demo-gated. Optional in the sense that a repo may omit it (falls back
+    /// to the built-in default) — every label field works this way, see
+    /// [`sanitize_intake_label`].
+    pub prototype: String,
+}
+
+impl Default for IntakeProfile {
+    fn default() -> Self {
+        builtin_intake_profile()
+    }
+}
+
+/// The built-in `github-labels` profile — a checked-in, independent value,
+/// not derived from anything else. This is the plan's dodge for the golden
+/// self-reference trap (P2): the byte-golden fixture and this const are two
+/// separate things that can each move, so a golden test comparing a live
+/// render against frozen bytes catches either one drifting, instead of a
+/// render-against-itself tautology.
+///
+/// Reproduces today's vocabulary exactly (`agent-ready` /
+/// `agent-investigation` / `agent-managed` / `agent-prototype`) — the labels
+/// this repo's own `orchestrator.md` prose and `gh.rs`'s `ALLOWED_LABELS`
+/// hardcode today, pre-#382.
+pub fn builtin_intake_profile() -> IntakeProfile {
+    IntakeProfile {
+        source: IntakeSource::GithubLabels,
+        ready: "agent-ready".to_string(),
+        investigate: "agent-investigation".to_string(),
+        owned: "agent-managed".to_string(),
+        prototype: "agent-prototype".to_string(),
+    }
+}
+
+/// A single `intake.labels.<field>:` value. Sanitized like a block id
+/// ([`sanitize_id`]) — the same conservative alphabet, because a label string
+/// eventually reaches a `gh issue list --label` argument and a template
+/// substitution. **Rejected, not rewritten**, matching every other
+/// user-authored identifier in this file: an author who wrote a label with a
+/// space must see an error, not a silently different string their own repo's
+/// labels no longer match.
+///
+/// Empty (omitted) is not a rejection — it falls back to `fallback` (the
+/// built-in default for that field), which is what lets a repo override
+/// `intake.labels.ready:` alone and inherit the other three.
+fn sanitize_intake_label(field: &str, raw_val: &str, fallback: &str, errs: &mut Vec<String>) -> String {
+    let v = raw_val.trim();
+    if v.is_empty() {
+        return fallback.to_string();
+    }
+    match sanitize_id(v) {
+        Some(clean) if clean == v => clean,
+        _ => {
+            errs.push(format!(
+                "intake.labels.{field}: {v:?} is not a usable label (letters, digits, '-', '_')"
+            ));
+            fallback.to_string()
+        }
+    }
+}
+
 /// A parsed, validated workflow.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Workflow {
@@ -241,6 +387,10 @@ pub struct Workflow {
     pub blocks: Vec<Block>,
     pub edges: Vec<Edge>,
     pub gates: BTreeMap<String, Gate>,
+    /// Intake source + label vocabulary (#382 P1). Always resolved — the
+    /// built-in default when the file declares no `intake:` block at all, or
+    /// only part of one.
+    pub intake: IntakeProfile,
 }
 
 impl Workflow {
@@ -465,6 +615,37 @@ struct RawWorkflow {
     edges: Vec<RawEdge>,
     #[serde(default)]
     gates: BTreeMap<String, RawGate>,
+    /// Intake source + label vocabulary (#382 P1). `None` when the file
+    /// declares no `intake:` block — resolved to [`builtin_intake_profile`]
+    /// entirely. **No `human_gate:`/disable-spelling key exists on this type
+    /// or `RawIntakeLabels`** — `deny_unknown_fields` turns any attempt at one
+    /// into a hard parse error rather than an ignored line. This is the whole
+    /// enforcement of the CRITICAL invariant: the human merge gate is not
+    /// reachable from this schema at all.
+    #[serde(default)]
+    intake: Option<RawIntake>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawIntake {
+    #[serde(default)]
+    source: String,
+    #[serde(default)]
+    labels: RawIntakeLabels,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RawIntakeLabels {
+    #[serde(default)]
+    ready: String,
+    #[serde(default)]
+    investigate: String,
+    #[serde(default)]
+    owned: String,
+    #[serde(default)]
+    prototype: String,
 }
 
 #[derive(Deserialize)]
@@ -911,6 +1092,46 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
         );
     }
 
+    // Intake source + label vocabulary (#382 P1). `None` (no `intake:` block
+    // at all) resolves straight to the built-in default; a declared block
+    // resolves field by field, each label falling back to its built-in value
+    // when omitted (`sanitize_intake_label`) so a repo can override one label
+    // without repeating the rest.
+    let default_intake = builtin_intake_profile();
+    let intake = match &raw.intake {
+        None => default_intake,
+        Some(ri) => {
+            let source = match intake_source_from_str(&ri.source) {
+                Some(s) => s,
+                None => {
+                    errs.push(format!(
+                        "intake.source: unknown source {:?} — must be one of {}",
+                        ri.source,
+                        intake_source_names()
+                    ));
+                    IntakeSource::GithubLabels
+                }
+            };
+            IntakeProfile {
+                source,
+                ready: sanitize_intake_label("ready", &ri.labels.ready, &default_intake.ready, &mut errs),
+                investigate: sanitize_intake_label(
+                    "investigate",
+                    &ri.labels.investigate,
+                    &default_intake.investigate,
+                    &mut errs,
+                ),
+                owned: sanitize_intake_label("owned", &ri.labels.owned, &default_intake.owned, &mut errs),
+                prototype: sanitize_intake_label(
+                    "prototype",
+                    &ri.labels.prototype,
+                    &default_intake.prototype,
+                    &mut errs,
+                ),
+            }
+        }
+    };
+
     if !errs.is_empty() {
         return Err(errs);
     }
@@ -921,6 +1142,7 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
         blocks,
         edges,
         gates,
+        intake,
     })
 }
 
