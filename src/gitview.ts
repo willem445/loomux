@@ -670,6 +670,16 @@ export class GitView {
     return s.staged.length + s.unstaged.length + s.untracked.length;
   }
 
+  /** Display label for the working-row dirty badge: the exact count, or a
+   *  "N+" form when the untracked list was capped (#399) — the true count of
+   *  untracked files can be far higher than what `dirtyCount()` sums, so the
+   *  badge must say so rather than quietly showing a number that looks exact
+   *  but isn't. */
+  private dirtyCountLabel(): string {
+    const dirty = this.dirtyCount();
+    return this.status?.untracked_truncated ? `${dirty}+` : String(dirty);
+  }
+
   /** Run a mutating git action, surface errors, refresh either way. */
   private async act(fn: () => Promise<void>): Promise<void> {
     try {
@@ -1094,7 +1104,7 @@ export class GitView {
           : `Uncommitted changes`
       );
       row.append(dot, label);
-      if (dirty > 0) row.appendChild(el("span", "git-count", String(dirty)));
+      if (dirty > 0) row.appendChild(el("span", "git-count", this.dirtyCountLabel()));
       row.addEventListener("click", () => this.select({ kind: "working" }));
       this.graphListEl.appendChild(row);
     }
@@ -1230,7 +1240,7 @@ export class GitView {
       this.changesEl.appendChild(
         el(
           "div",
-          "git-readonly-note",
+          "git-changes-note",
           `Showing the first ${s.untracked.length.toLocaleString()} untracked files — narrow with .gitignore to see the rest.`
         )
       );
@@ -1240,7 +1250,7 @@ export class GitView {
       this.changesEl.appendChild(
         el(
           "div",
-          "git-readonly-note",
+          "git-changes-note",
           "Read-only worktree — unlock (🔒 in the header) to stage, commit, or discard."
         )
       );

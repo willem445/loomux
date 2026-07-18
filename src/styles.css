@@ -2262,7 +2262,10 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .git-head-lock:hover { background: rgba(224, 175, 104, 0.14); }
 .git-head-lock.unlocked { color: #f7768e; border-color: #f7768e; }
 .git-head-lock.unlocked:hover { background: rgba(247, 118, 142, 0.14); }
-.git-readonly-note {
+/* Shared by every inline note appended to the changes strip — read-only
+   worktree, untracked-list truncation, … — so a new note reuses the class
+   named for what it visually IS rather than borrowing an unrelated one. */
+.git-changes-note {
   flex: none; padding: 8px 12px; font-size: 11px; font-style: italic;
   color: #e0af68; border-top: 1px solid var(--border-soft);
 }
