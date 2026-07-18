@@ -45,6 +45,11 @@ export interface GitStatus {
   staged: FileEntry[];
   unstaged: FileEntry[];
   untracked: string[];
+  /** True when `untracked` was cut off at the backend's cap (#399) — an
+   *  unbounded, often un-gitignored pile of loose files (a build output dir,
+   *  `node_modules` before `.gitignore` catches it) is truncated rather than
+   *  handed to the view whole. */
+  untracked_truncated: boolean;
 }
 
 export type DiffMode = "worktree" | "staged" | "commit" | "untracked";

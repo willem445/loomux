@@ -1223,6 +1223,19 @@ export class GitView {
       })
     );
 
+    if (s.untracked_truncated) {
+      // #399: an unbounded untracked pile (a build dir, node_modules before
+      // .gitignore catches it) is capped backend-side rather than rendered one
+      // DOM row per file — never silently, so this says so.
+      this.changesEl.appendChild(
+        el(
+          "div",
+          "git-readonly-note",
+          `Showing the first ${s.untracked.length.toLocaleString()} untracked files — narrow with .gitignore to see the rest.`
+        )
+      );
+    }
+
     if (!rw) {
       this.changesEl.appendChild(
         el(
