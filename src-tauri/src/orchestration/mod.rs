@@ -6913,8 +6913,18 @@ impl OrchRegistry {
     /// longer declares, which is exactly the thing worth being able to see.
     fn audit_workflow_drift(&self, id: &str, repo: &str, g: &Guardrails) {
         let ids = |bs: &[workflow::Block]| -> Vec<String> { bs.iter().map(|b| b.id.clone()).collect() };
-        let (now, note) = match workflow::load_workflow(repo) {
+        // #382 NB2: intake drifts independently of the roster — a repo can
+        // rename its label vocabulary without touching a single block, and
+        // that must be as visible as a roster change. `roster_is_custom(&g.
+        // blocks)` alone still gates every arm below correctly even though it
+        // only inspects blocks: `blocks` and `intake` are ALWAYS resolved
+        // together, from the same `wf`, in the same `Launch::Fresh` branch
+        // (`create_group_ex`) — a group's roster is custom iff its intake
+        // profile could be too, so there is no case where blocks reads
+        // "built-in" while intake is quietly running something declared.
+        let (now, now_intake, note) = match workflow::load_workflow(repo) {
             Ok(Some(wf)) => {
+                let resolved_intake = wf.intake.clone();
                 let resolved = Guardrails {
                     agent_cli: g.agent_cli.clone(),
                     blocks: wf.blocks,
@@ -6922,8 +6932,8 @@ impl OrchRegistry {
                 }
                 .clamped()
                 .blocks;
-                if resolved == g.blocks {
-                    return; // the file still says what the group is running
+                if resolved == g.blocks && resolved_intake == g.intake {
+                    return; // the file still says what the group is running — roster AND intake
                 }
                 // "Appeared" and "changed" are different events to a human reading
                 // the trail, and only one of them means "somebody edited the file
@@ -6935,17 +6945,22 @@ impl OrchRegistry {
                 } else {
                     "the repo has gained a workflow file since this group was launched"
                 };
-                (ids(&resolved), note)
+                (ids(&resolved), Some(resolved_intake), note)
             }
             Ok(None) if !workflow::roster_is_custom(&g.blocks) => return, // no file, no workflow: nothing to drift from
-            Ok(None) => (Vec::new(), "the file the group was launched from is gone"),
-            Err(_) => (Vec::new(), "the file no longer validates"),
+            Ok(None) => (Vec::new(), None, "the file the group was launched from is gone"),
+            Err(_) => (Vec::new(), None, "the file no longer validates"),
         };
         self.audit(id, "loomux", "workflow-changed-since-launch", json!({
             "path": workflow::WORKFLOW_PATH,
             "note": note,
             "running": ids(&g.blocks),
             "on_disk": now,
+            // Mirrors `running`/`on_disk` for the intake profile — null
+            // `intake_on_disk` means the file is gone/broken, same as an
+            // empty `on_disk` for blocks in those arms.
+            "intake_running": intake_json(&g.intake),
+            "intake_on_disk": now_intake.as_ref().map(intake_json),
             "action": "keeping the roster this group was launched with — relaunch to pick up the new one",
         }));
     }

@@ -1773,3 +1773,65 @@ pub fn parse_gate_file(text: &str) -> Option<Gate> {
     }
     (!reviewers.is_empty()).then_some(Gate { require, reviewers, also })
 }
+
+// ── schema field-inventory pin (#382 P1 rev-26 NB1) ─────────────────────────
+//
+// Pure logic, no windowing/PTY code touched — safe as an inline unit test
+// (constraint 4: only tests that link the FULL LIB in a way that needs the
+// comctl32-v6 manifest have to be integration tests; this needs neither the
+// registry nor the manifest, see e.g. `winpath.rs`/`cliprobe.rs` for the same
+// call).
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **Field-inventory pin, not a runtime one.** The three `human_gate`
+    /// denial tests in `tests/workflow.rs` catch a field *renamed* onto the
+    /// reserved spelling — they would flip from red to a passing rejection if
+    /// someone tried it. They do NOT catch a field *added* under a different,
+    /// still gate-shaped name (`auto_merge:`, `skip_review:`, …): that field
+    /// would pass every existing test, because nothing previously asserted
+    /// the SET of fields these types accept, only that a few specific
+    /// spellings are absent from it.
+    ///
+    /// This closes that gap at compile time instead of runtime: each
+    /// destructure below names every field the type has right now and binds
+    /// it to `_`, with no `..` to swallow the rest. Rust's exhaustive
+    /// struct-pattern rule means a field ADDED to `RawWorkflow`, `RawIntake`
+    /// or `RawIntakeLabels` without being named here is a **compile error**,
+    /// not a silently passing test.
+    ///
+    /// NEW FIELD ADDED TO THE INTAKE SCHEMA — confirm it cannot weaken the
+    /// human gate, then update this inventory (name the field in the
+    /// matching destructure below and re-run this test to prove it still
+    /// compiles).
+    #[test]
+    fn intake_schema_field_inventory_is_exhaustively_named() {
+        fn raw_workflow_fields(v: RawWorkflow) {
+            let RawWorkflow {
+                version: _,
+                name: _,
+                authored_with: _,
+                blocks: _,
+                edges: _,
+                gates: _,
+                intake: _,
+            } = v;
+        }
+        fn raw_intake_fields(v: RawIntake) {
+            let RawIntake { source: _, labels: _ } = v;
+        }
+        fn raw_intake_labels_fields(v: RawIntakeLabels) {
+            let RawIntakeLabels { ready: _, investigate: _, owned: _, prototype: _ } = v;
+        }
+        // Referenced, never called — the compiler still type-checks (and
+        // therefore exhaustiveness-checks) every function body above whether
+        // or not it runs. This line only exists to avoid a dead-code warning.
+        let _ = (
+            raw_workflow_fields as fn(RawWorkflow),
+            raw_intake_fields as fn(RawIntake),
+            raw_intake_labels_fields as fn(RawIntakeLabels),
+        );
+    }
+}

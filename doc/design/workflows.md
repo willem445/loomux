@@ -1285,6 +1285,33 @@ Absent `intake` in an old `group.json` (one written before this field
 existed) resolves to the built-in default on read — the same migration
 guarantee `#[serde(default)]` gives `blocks`.
 
+The resume-drift audit (`audit_workflow_drift`) compares intake alongside the
+roster, not just the roster: a repo can rename its label vocabulary without
+touching a single block, and that must be as visible in the trail as a roster
+edit is. A `workflow-changed-since-launch` audit entry now carries
+`intake_running`/`intake_on_disk` beside `running`/`on_disk`, and fires on an
+intake-only edit even when the pinned roster is untouched
+(`intake_only_drift_is_audited_even_when_the_roster_is_unchanged`).
+
+### A field can never be added to the intake schema unnoticed
+
+The three `human_gate` denial tests (above) pin that a handful of specific
+spellings are absent from `intake:`'s vocabulary. They do not, by themselves,
+guard against a *new*, differently-named, gate-shaped field being added later
+(`auto_merge:`, `skip_review:`, …) — that field would pass every existing
+test, because nothing asserted the *set* of fields these types accept, only
+that a few reserved spellings are missing from it.
+
+`workflow.rs` closes that gap with a compile-time pin
+(`intake_schema_field_inventory_is_exhaustively_named`): an exhaustive
+struct-pattern destructure over `RawWorkflow`, `RawIntake` and
+`RawIntakeLabels`, naming every field each type has today with no `..` to
+swallow the rest. Rust's exhaustiveness rule turns a field added to any of
+the three without being named in the matching destructure into a **compile
+error**, not a silently passing test — forcing whoever adds the field to
+look at this file and confirm, in the same PR, that it cannot weaken the
+human gate before the inventory can be updated to accept it.
+
 ## Still to come
 
 - **`no-live-agents-on-pr`** (#197 Scope A.1) — "no agent tied to this PR is still
