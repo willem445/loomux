@@ -19,7 +19,10 @@
 //!     doc comment on why a child webview has no `WindowEvent::Destroyed` to
 //!     hook cleanup onto instead), and grew again to 128 with #391's
 //!     `plugin_set_occlusion` (folded into #380 — see `pluginregion.rs`'s
-//!     module doc comment for the native z-order fix this command drives).
+//!     module doc comment for the native z-order fix this command drives),
+//!     later renamed/extended in place to `plugin_set_frame` (still 128 —
+//!     a replacement, not an addition — by the #380 sessions-occlusion fix,
+//!     which folds webview bounds into the same atomic command).
 //!   - `main_has_all_128_and_zero_permission_denies_dangerous_spread`: builds
 //!     a real (headless) `tauri::test` mock app using the app's *actual*
 //!     `capabilities/`/`permissions/` on disk (via the same `generate_context!`
@@ -134,7 +137,7 @@ stub_commands!(
     load_ui_tabs, save_ui_tabs,
     voice_start, voice_stop, voice_cancel,
     plugin_open_window, plugin_close_window, plugin_broker_request, plugin_broker_open_channel,
-    plugin_set_occlusion,
+    plugin_set_frame,
 );
 
 // Tauri's "local origin" custom-protocol scheme differs by platform (WebView2
@@ -240,7 +243,8 @@ fn app_commands_len_is_128() {
         "APP_COMMANDS drifted from the audited count of 128 (120 at #363 + 1 for \
          orch_confirm_solo_copilot_autopilot (#364/#365) + 2 for #360 Slice B's \
          list_plugins/install_plugin + 3 for #360 Slice C's pluginbroker commands + 1 for #360 \
-         Slice D's plugin_close_window + 1 for #391's plugin_set_occlusion, folded into #380) — \
+         Slice D's plugin_close_window + 1 for #391's plugin_set_occlusion, folded into #380, \
+         later renamed/extended in place to plugin_set_frame by the #380 sessions-occlusion fix) — \
          if this is an intentional addition/removal, update the count here (and the relevant \
          issue's inventory, if that's the drift)"
     );
@@ -363,7 +367,7 @@ fn plugin_capability_grants_only_broker_commands() {
     const MUST_BE_DENIED: &[&str] = &[
         "plugin_open_window",
         "plugin_close_window",
-        "plugin_set_occlusion",
+        "plugin_set_frame",
         "orch_grant_merge",
         "git_push",
         "ft_write_file",

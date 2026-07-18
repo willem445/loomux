@@ -10,8 +10,6 @@
     "dialog:allow-open",
     "core:window:allow-destroy",
     "main-ui",
-    "core:webview:allow-set-webview-position",
-    "core:webview:allow-set-webview-size",
     "core:webview:allow-webview-hide",
     "core:webview:allow-webview-show"
   ]

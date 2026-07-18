@@ -66,10 +66,16 @@ import type { ElementRect } from "./pluginwindow";
 
 export type OverlayCloser = () => void;
 
+/** Why `subscribe()`'s callback fired — passed through so a subscriber that
+ *  cares (PluginPaneView, for its breadcrumb's trigger-source label) doesn't
+ *  have to guess; one a subscriber doesn't care about (the pre-#380 shape)
+ *  can simply ignore the argument. */
+export type OverlayChangeReason = "open" | "close" | "poke";
+
 export class OverlayRegistry {
   private overlays = new Map<number, () => ElementRect | null>();
   private nextId = 0;
-  private listeners = new Set<() => void>();
+  private listeners = new Set<(reason: OverlayChangeReason) => void>();
 
   /** Register that one overlay instance just opened, tracked by a live rect
    *  getter — called fresh every time `currentRects()` runs, never cached, so
@@ -83,13 +89,13 @@ export class OverlayRegistry {
   open(getRect: () => ElementRect | null): OverlayCloser {
     const id = this.nextId++;
     this.overlays.set(id, getRect);
-    this.notify();
+    this.notify("open");
     let closed = false;
     return () => {
       if (closed) return;
       closed = true;
       this.overlays.delete(id);
-      this.notify();
+      this.notify("close");
     };
   }
 
@@ -120,7 +126,7 @@ export class OverlayRegistry {
    *  and not just from `open()`/the closer — `poke()` below fires it too) —
    *  a PluginPaneView subscriber only needs "something might have changed,
    *  recompute", so any edge is enough. Returns an unsubscribe. */
-  subscribe(fn: () => void): () => void {
+  subscribe(fn: (reason: OverlayChangeReason) => void): () => void {
     this.listeners.add(fn);
     return () => {
       this.listeners.delete(fn);
@@ -131,11 +137,11 @@ export class OverlayRegistry {
    *  whose overlay can resize/move WHILE open (a `ResizeObserver` on its own
    *  element, say) calls this instead of re-opening a new slot. */
   poke(): void {
-    this.notify();
+    this.notify("poke");
   }
 
-  private notify(): void {
-    for (const fn of this.listeners) fn();
+  private notify(reason: OverlayChangeReason): void {
+    for (const fn of this.listeners) fn(reason);
   }
 }
 
