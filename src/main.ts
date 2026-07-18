@@ -377,7 +377,7 @@ function hasRestorableContent(saved: PersistedTabs | null): boolean {
  *  button — the whole group is revived only by the human via resumeOrchSession, so
  *  nothing here spawns a group (the no-double-spawn contract). Group→tab bindings
  *  survive so a later resume/rejoin still routes into the right tab. */
-async function restoreSessionTabs(saved: PersistedTabs, resumable: SessionResumable): Promise<void> {
+async function restoreSessionTabs(saved: PersistedTabs, resumable?: SessionResumable): Promise<void> {
   // Track the tabs WE create so activeIndex resolves against them, not against
   // tabs.tabs — the pre-splash seed tab sits at index 0 and would offset it (BUG-2).
   const restored: Workspace[] = [];
@@ -402,7 +402,7 @@ async function restoreSessionTabs(saved: PersistedTabs, resumable: SessionResuma
 async function rebuildLayout(
   ws: Workspace,
   layout: PersistedLayoutNode,
-  resumable: SessionResumable
+  resumable?: SessionResumable
 ): Promise<void> {
   const steps = planLayoutRestore(layout, resumable);
   const panes: Pane[] = [];
@@ -428,7 +428,7 @@ async function rebuildLayout(
 async function restoreDocked(
   ws: Workspace,
   docked: PersistedPane[],
-  resumable: SessionResumable
+  resumable?: SessionResumable
 ): Promise<void> {
   for (const record of docked) {
     const pane = await openActionPane(ws, planPaneRestore(record, resumable));
@@ -1449,22 +1449,24 @@ void (async () => {
   await ensureOutputRouter();
 
   if (outcome === "restore" && saved) {
-    // Which recorded agent sessions still have a resumable conversation on disk:
-    // listSessions() lists exactly the sessions that HAVE a transcript, so an id
-    // absent here (a never-prompted / deleted session) restores FRESH instead of a
-    // doomed --resume (BUG-1). Best-effort — on failure, assume resumable and let
-    // the runtime backstop catch a resume that fails anyway.
-    let resumableIds = new Set<string>();
-    try {
-      resumableIds = new Set((await listSessions()).map((s) => s.id));
-    } catch {
-      /* keep the empty set's caller-friendly default below */
-    }
-    const seenAny = resumableIds.size > 0;
-    // If the list came back empty (or errored), don't force every agent fresh —
-    // fall back to "assume resumable" and lean on the runtime backstop.
-    const resumable: SessionResumable = (sid) => (seenAny ? resumableIds.has(sid) : true);
-    await restoreSessionTabs(saved, resumable);
+    // Restore no longer waits on a session-resumability precheck (#342). It used
+    // to: listSessions() lists exactly the recorded sessions that still have a
+    // transcript, so an id absent from it (never prompted / deleted) could
+    // restore FRESH instead of attempting a doomed `--resume` (BUG-1). But that
+    // list comes from a full scan of EVERY historical Claude/Copilot session file
+    // on disk — on a machine with a long orchestration history (many past
+    // projects, each accumulating session transcripts) that scan can itself take
+    // seconds, and it gated opening even the first restored pane. `sessions.ts`'s
+    // own sidebar prefetch (below, unawaited) already runs the identical scan in
+    // the background, so nothing stops needing it — restoring just stops
+    // BLOCKING on it. Every pane restores optimistically assuming its recorded
+    // session id is resumable (`resumable` omitted → planPaneRestore's own
+    // documented default), and the existing runtime backstop (tryResumeFallback,
+    // BUG-1) already handles the one case that assumption gets wrong: a
+    // `--resume` against a missing transcript exits immediately, and that pane
+    // alone respawns fresh in place — instead of every OTHER pane's restore
+    // waiting on a full-history scan to rule that out up front.
+    await restoreSessionTabs(saved);
     // Drop the pre-splash seed now that the saved tabs (and their active tab) exist.
     if (tabs.count > 1) tabs.closeTab(seed.id);
   }

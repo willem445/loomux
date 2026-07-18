@@ -337,14 +337,40 @@ fn scan_copilot(out: &mut Vec<SessionInfo>) {
     }
 }
 
-#[tauri::command]
-pub fn list_sessions() -> Vec<SessionInfo> {
+/// Full scan of every recorded Claude/Copilot session file on disk. Real,
+/// unbounded-by-count I/O (issue #342): a machine with a long orchestration
+/// history can accumulate thousands of `.claude/projects/**/*.jsonl` files
+/// across every past project, and each one costs an open + up to 60 lines
+/// read. A breadcrumb records how long this took and how many files it found,
+/// so a slow-startup report has an actual number to point at instead of "it
+/// felt slow" — this is the scan `main.ts`'s boot restore used to await
+/// before it would open a single pane.
+fn list_sessions_sync() -> Vec<SessionInfo> {
+    let start = std::time::Instant::now();
     let mut sessions = Vec::new();
     scan_claude(&mut sessions);
     scan_copilot(&mut sessions);
+    let found = sessions.len();
     sessions.sort_by(|a, b| b.modified_ms.cmp(&a.modified_ms));
     sessions.truncate(300);
+    crate::obs::breadcrumb(
+        "startup",
+        &format!("list_sessions: {found} session file(s) scanned in {:?}", start.elapsed()),
+    );
     sessions
+}
+
+/// Tauri dispatches a *synchronous* `#[tauri::command]` by calling it directly
+/// on the webview main thread (see the identical note in `git.rs`, issue
+/// #207/#399) — so the full disk scan above ran on the UI thread every time
+/// this was invoked. Off-thread via `spawn_blocking`; a panicked scan degrades
+/// to an empty list rather than propagating, matching every existing caller's
+/// already-tolerant "best-effort, assume resumable on failure" handling.
+#[tauri::command]
+pub async fn list_sessions() -> Vec<SessionInfo> {
+    tauri::async_runtime::spawn_blocking(list_sessions_sync)
+        .await
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
