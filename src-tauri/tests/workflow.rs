@@ -4177,6 +4177,60 @@ fn an_also_condition_this_build_cannot_check_is_not_silently_ignored() {
     assert_eq!(wf.gates["merge"].also, vec!["no-live-agents-on-pr"]);
 }
 
+// ───────── #316: gate satisfiability against the LIVE roster ─────────
+//
+// A gate's reviewer names are validated against the workflow file's OWN blocks at
+// parse time (`the_repos_own_workflow_file_parses_clean_against_the_real_parser`
+// below) — but the roster a group actually SPAWNS FROM can diverge from that: a
+// broken/absent workflow.yml on a fresh launch keeps the group's last-known merge
+// gate but resets `blocks` to the built-in four (mod.rs `create_group`'s
+// `merge-gate-retained` branch). The live incident behind #316: the gate named
+// rev-orch/rev-ui/rev-tests, the registry offered only the built-in four, and
+// `spawn_agent(block: "rev-orch")` failed with "unknown block" — the gate was
+// unsatisfiable from inside the very session that armed it. `gate_missing_blocks`
+// is the pure check that catches this at every arm point, independent of *why*
+// the roster and the gate diverged.
+
+#[test]
+fn gate_missing_blocks_finds_every_reviewer_the_roster_cannot_spawn() {
+    let g = gate(GateRequire::AllPass, &["rev-orch", "rev-ui", "rev-tests"], &[]);
+    let builtin = workflow::builtin_roster("claude");
+    assert_eq!(
+        workflow::gate_missing_blocks(&g, &builtin),
+        vec!["rev-orch".to_string(), "rev-ui".to_string(), "rev-tests".to_string()],
+        "the built-in four-block roster can spawn none of the three named reviewers"
+    );
+}
+
+#[test]
+fn gate_missing_blocks_is_empty_against_the_roster_that_actually_declares_them() {
+    let repo = repo_root();
+    let wf = match workflow::load_workflow(&repo) {
+        Ok(Some(wf)) => wf,
+        other => panic!("loomux must ship its own parseable {}: {other:?}", workflow::WORKFLOW_PATH),
+    };
+    let gate = wf.gates.get("merge").unwrap();
+    assert_eq!(
+        workflow::gate_missing_blocks(gate, &wf.blocks),
+        Vec::<String>::new(),
+        "loomux's own dogfood roster declares every reviewer its own gate names"
+    );
+}
+
+#[test]
+fn gate_missing_blocks_reports_a_block_named_by_id_but_not_kind_reviewer() {
+    // A workflow edited so `rev-tests` now belongs to a worker block: the gate
+    // still names it, but no reviewer will ever answer to it — reported exactly
+    // like an absent block, not silently matched by id alone.
+    let g = gate(GateRequire::AllPass, &["rev-tests"], &[]);
+    let blocks = vec![block("worker", Role::Worker), block("rev-tests", Role::Worker)];
+    assert_eq!(
+        workflow::gate_missing_blocks(&g, &blocks),
+        vec!["rev-tests".to_string()],
+        "an id that exists under the wrong kind is still unsatisfiable — kind must match, not just id"
+    );
+}
+
 // ────────── loomux's own workflow, and what a block's model: is worth ─────────
 //
 // The repo dogfoods the feature (#222): `.loomux/workflow.yml` at the root declares

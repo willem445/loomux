@@ -20,6 +20,7 @@ import {
   pauseGroup,
   resumeGroup,
   grantRelease,
+  setAdvancedOrchestrator,
   setAutoMerge,
   setAutoRelease,
   setAutonomous,
@@ -31,10 +32,13 @@ import {
   setNotify,
   setSpawnExpanded,
   spawnExpanded,
+  workflowPreview,
+  workflowStatus,
   type AutonomyState,
   type GroupSummary,
   type GroupUsage,
   type GroupWatch,
+  type WorkflowStatus,
 } from "./orchestration";
 import { watchLine } from "./watchline";
 import {
@@ -48,7 +52,10 @@ import {
   normalizeComment,
   tickStatusLabel,
 } from "./autonomy";
+import { gateSatisfiabilityWarning, gateSummaryLine, workflowModeLabel } from "./workflowstatus";
 import { roleLabel } from "./orchbadge";
+import { getDefaultAgent } from "./agents";
+import { confirmModal } from "./modal";
 
 /** Hard bounds on the live-agent cap, mirroring the launcher's input range and
  *  the backend's `MAX_AGENTS_CEILING`. The backend re-validates; these only
@@ -155,6 +162,14 @@ export class GroupView {
   private releaseArmTimer: number | undefined;
   private pauseBtn: HTMLButtonElement;
   private notifyBtn: HTMLButtonElement;
+  // Workflow-mode chrome (#316): active workflow + armed gate, and the live
+  // advanced-orchestrator toggle.
+  private workflowRow: HTMLElement;
+  private workflowLineEl: HTMLElement;
+  private workflowWarnEl: HTMLElement;
+  private workflowToggleBtn: HTMLButtonElement;
+  private workflow: WorkflowStatus | null = null;
+  private workflowBusy = false;
   /** #260: toggles whether newly spawned worker/reviewer/planner panes open
    *  docked to the minimize tray (the default) or expanded into the split
    *  tree (the pre-#260 behavior) — backend-persisted per group. */
@@ -187,12 +202,23 @@ export class GroupView {
    *  suspended banner appeared), so the host can re-apply the overlay height
    *  clamp and keep every control on-screen. */
   private onResize?: () => void;
+  private getRepo?: () => string | null;
 
   constructor(
     private groupId: string,
-    opts: { onClose: () => void; onToggleMinimize?: () => void; onResize?: () => void }
+    opts: {
+      onClose: () => void;
+      onToggleMinimize?: () => void;
+      onResize?: () => void;
+      /** The group's repo path (its orchestrator pane's cwd), for the
+       *  workflow-toggle confirm's roster preview. `undefined`/`null` just
+       *  degrades that preview to a generic description — the toggle itself
+       *  doesn't need it (the backend resolves the repo from the group). */
+      getRepo?: () => string | null;
+    }
   ) {
     this.onResize = opts.onResize;
+    this.getRepo = opts.getRepo;
     this.el = el("div", "group-view");
 
     const head = el("div", "group-head");
@@ -238,6 +264,18 @@ export class GroupView {
     this.maxNoteEl = el("span", "group-max-note");
     this.maxErrEl = el("span", "group-max-err");
     maxRow.append(maxCtl, this.maxNoteEl, this.maxErrEl);
+
+    // Workflow-mode chrome (#316): whether this group is on the built-in
+    // roster or a repo-declared custom workflow, and the merge gate armed for
+    // THIS session — named here, next to the roster/cap controls, so it's
+    // visible before an Approve or a merge ever bounces off it (see the task
+    // board's own gate-aware Approve label, tasksview.ts). The toggle itself
+    // lives in the button row below, next to Pause/Notify.
+    this.workflowRow = el("div", "group-workflow-row");
+    this.workflowLineEl = el("span", "group-workflow-line");
+    this.workflowWarnEl = el("div", "group-workflow-warn");
+    this.workflowWarnEl.hidden = true;
+    this.workflowRow.append(this.workflowLineEl, this.workflowWarnEl);
 
     this.listEl = el("div", "group-list");
 
@@ -444,6 +482,12 @@ export class GroupView {
     this.notifyBtn = el("button", "group-btn", "🔔 Notify") as HTMLButtonElement;
     this.notifyBtn.addEventListener("click", () => void this.toggleNotify());
 
+    // LIVE advanced-orchestrator toggle (#316): flips the workflow row above.
+    // A human action, confirmed via modal (the consent moment) before it
+    // actually arms/clears the gate and swaps the roster for future spawns.
+    this.workflowToggleBtn = el("button", "group-btn", "Workflow: off") as HTMLButtonElement;
+    this.workflowToggleBtn.addEventListener("click", () => void this.toggleWorkflow());
+
     // Auto-dock toggle (#260): whether newly spawned delegate panes open
     // minimized to the tray (default) or expanded into the split tree.
     // No icon glyph — 🗕 (U+1F5D5 SCREEN) was tried first, but it's an
@@ -476,14 +520,24 @@ export class GroupView {
     this.endBtn.addEventListener("click", () => void this.onEndClick());
     endWrap.append(cleanupLbl, this.endBtn);
 
-    foot.append(this.pauseBtn, this.notifyBtn, this.dockBtn);
+    foot.append(this.pauseBtn, this.notifyBtn, this.workflowToggleBtn, this.dockBtn);
     if (this.foldBtn) foot.append(this.foldBtn);
     foot.append(endWrap);
 
     this.toastEl = el("div", "git-toast");
     this.toastEl.hidden = true;
 
-    this.el.append(head, this.summaryEl, maxRow, autoRow, releaseRow, this.listEl, foot, this.toastEl);
+    this.el.append(
+      head,
+      this.summaryEl,
+      maxRow,
+      this.workflowRow,
+      autoRow,
+      releaseRow,
+      this.listEl,
+      foot,
+      this.toastEl
+    );
   }
 
   /** Called by the pane whenever the overlay is (re)opened. */
@@ -511,16 +565,25 @@ export class GroupView {
   private async load(): Promise<void> {
     if (this.disposed) return;
     try {
-      [this.summary, this.usage, this.paused, this.notify, this.spawnExpandedFlag, this.autonomy, this.watches] =
-        await Promise.all([
-          groupSummary(this.groupId),
-          groupUsage(this.groupId),
-          groupPaused(this.groupId),
-          notifyEnabled(this.groupId),
-          spawnExpanded(this.groupId),
-          autonomyState(this.groupId),
-          groupWatches(this.groupId),
-        ]);
+      [
+        this.summary,
+        this.usage,
+        this.paused,
+        this.notify,
+        this.spawnExpandedFlag,
+        this.autonomy,
+        this.watches,
+        this.workflow,
+      ] = await Promise.all([
+        groupSummary(this.groupId),
+        groupUsage(this.groupId),
+        groupPaused(this.groupId),
+        notifyEnabled(this.groupId),
+        spawnExpanded(this.groupId),
+        autonomyState(this.groupId),
+        groupWatches(this.groupId),
+        workflowStatus(this.groupId),
+      ]);
     } catch (err) {
       this.toast(String(err));
       return;
@@ -536,6 +599,71 @@ export class GroupView {
       this.toast(String(err));
     }
     await this.load();
+  }
+
+  /** LIVE advanced-orchestrator toggle (#316). A confirm modal is the consent
+   *  moment (the human sees the resolved roster/gate — or the toggle-off
+   *  restore note — before it takes effect); the actual arm/clear + roster
+   *  swap happens backend-side in `setAdvancedOrchestrator`. Refusals (e.g. a
+   *  broken workflow.yml) surface as a toast, same as every other control
+   *  here. */
+  private async toggleWorkflow(): Promise<void> {
+    if (this.workflowBusy) return;
+    const turningOn = !(this.workflow?.advanced ?? false);
+    const body = turningOn
+      ? await this.previewWorkflowOnBody()
+      : "Clears the armed merge gate and returns future spawns to the built-in roster on your " +
+        "default CLI (per-role CLI overrides from launch aren't preserved). Agents already " +
+        "running keep the block they were spawned under.";
+    const ok = await confirmModal(
+      turningOn ? "Turn on workflow mode?" : "Turn off workflow mode?",
+      body,
+      turningOn ? "Turn on" : "Turn off"
+    );
+    if (!ok) return;
+    this.workflowBusy = true;
+    try {
+      await setAdvancedOrchestrator(this.groupId, turningOn);
+    } catch (err) {
+      this.toast(String(err));
+    }
+    this.workflowBusy = false;
+    await this.load();
+  }
+
+  /** What turning workflow mode ON would resolve to, for the confirm modal —
+   *  a best-effort preview (`workflowPreview`), not the authoritative read
+   *  (the toggle's own backend call re-resolves for real; this can only
+   *  degrade to a generic description, never block the toggle). Uses the
+   *  launcher's own last-picked default CLI as the preview's `agentCli`: the
+   *  group's actual default isn't separately retained today (same reason
+   *  toggle-off can't restore per-role CLI overrides — see the confirm body
+   *  above), so this is the same stand-in the launcher itself falls back to. */
+  private async previewWorkflowOnBody(): Promise<string> {
+    const repo = this.getRepo?.() ?? null;
+    if (!repo) {
+      return (
+        "Switches future spawns to this repo's declared workflow (.loomux/workflow.yml) and " +
+        "arms any merge gate it declares. Agents already running keep their current block."
+      );
+    }
+    const preview = await workflowPreview(repo, getDefaultAgent().id).catch(() => null);
+    if (!preview || !preview.present) {
+      return `No .loomux/workflow.yml found at ${repo} — turning workflow mode on will be refused.`;
+    }
+    if (!preview.valid) {
+      return (
+        `${preview.path} is present but invalid — turning workflow mode on will be refused:\n` +
+        preview.errors.join("\n")
+      );
+    }
+    const blocks = preview.blocks.map((b) => `${b.id} (${b.kind}, ${b.cli})`).join(", ");
+    const gate = preview.gates.length ? ` Declares gate(s): ${preview.gates.join(", ")}.` : "";
+    return (
+      `"${preview.name || preview.path}" — ${preview.blocks.length} block` +
+      `${preview.blocks.length === 1 ? "" : "s"}: ${blocks}.${gate} Agents already running keep ` +
+      "their current block; future spawns use this roster."
+    );
   }
 
   /** Step the cap by ±1 from the current backend value. */
@@ -912,10 +1040,42 @@ export class GroupView {
       : "New panes open expanded (pre-#260 behavior) — click to auto-dock them again";
 
     this.renderAutonomy();
+    this.renderWorkflow();
 
     // Content height may have changed (roster size, suspended banner) — let the
     // host re-clamp the overlay so no control is pushed under overflow:hidden.
     this.onResize?.();
+  }
+
+  /** Workflow-mode chrome (#316): name + roster size + armed gate in one
+   *  line (`workflowModeLabel`/`gateSummaryLine`, workflowstatus.ts — never
+   *  re-derived here), a loud warning when the gate names reviewers this
+   *  session can't spawn, and the toggle button's on/off state. `null` only
+   *  before the first successful `load()`. */
+  private renderWorkflow(): void {
+    const w = this.workflow;
+    this.workflowRow.hidden = !w;
+    if (!w) return;
+
+    const bits = [workflowModeLabel(w)];
+    if (w.advanced) bits.push(`${w.blocks.length} block${w.blocks.length === 1 ? "" : "s"}`);
+    const gateLine = gateSummaryLine(w);
+    if (gateLine) bits.push(gateLine);
+    this.workflowLineEl.textContent = bits.join(" · ");
+    this.workflowLineEl.title = w.advanced
+      ? "This group is running a repo-declared custom workflow (.loomux/workflow.yml)."
+      : "This group is running the built-in roster (orchestrator/worker/reviewer/planner).";
+
+    const warn = gateSatisfiabilityWarning(w);
+    this.workflowWarnEl.hidden = warn === null;
+    this.workflowWarnEl.textContent = warn ?? "";
+
+    this.workflowToggleBtn.disabled = this.workflowBusy;
+    this.workflowToggleBtn.textContent = w.advanced ? "Workflow: on" : "Workflow: off";
+    this.workflowToggleBtn.classList.toggle("on", w.advanced);
+    this.workflowToggleBtn.title = w.advanced
+      ? "Turn off workflow mode — clears the merge gate and returns future spawns to the built-in roster"
+      : "Turn on workflow mode — arms this repo's declared merge gate and swaps future spawns to its roster";
   }
 
   /** The minimum overlay-content height at which every fixed control row renders

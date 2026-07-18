@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-orch-set-advanced-orchestrator"
+description = "Enables the orch_set_advanced_orchestrator command without any pre-configured scope."
+commands.allow = ["orch_set_advanced_orchestrator"]
+
+[[permission]]
+identifier = "deny-orch-set-advanced-orchestrator"
+description = "Denies the orch_set_advanced_orchestrator command without any pre-configured scope."
+commands.deny = ["orch_set_advanced_orchestrator"]

@@ -34,7 +34,10 @@ Every rung is a complete tool on its own — climb when you're ready:
    declares its own roster and merge gate: five focused reviewers, five
    prompts, five models — plus an on-demand advisor the orchestrator
    consults when stuck, and a process-pro that mines a finished session into
-   a proposed skills/lessons PR, never auto-merged.
+   a proposed skills/lessons PR, never auto-merged. The active workflow, its
+   roster, and its armed merge gate are always visible in the group's
+   lifecycle panel, and the toggle that turns it on is a live control — flip
+   it mid-session, no relaunch needed.
 
 Plus a git view, file editor, file explorer, and voice prompts — one
 keystroke away on any rung, never disturbing the shell underneath.
