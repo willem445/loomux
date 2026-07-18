@@ -151,9 +151,11 @@ pub const APP_COMMANDS: &[&str] = &[
     "fm_hash_start",
     // obs (1)
     "take_startup_notice",
-    // uistate (2)
+    // uistate (4)
     "load_ui_tabs",
     "save_ui_tabs",
+    "load_settings",
+    "save_settings",
     // voice (3)
     "voice_start",
     "voice_stop",

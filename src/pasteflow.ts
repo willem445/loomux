@@ -7,11 +7,20 @@
 // insert next char" readline binding) and swallowed every clipboard-read
 // failure with `.catch(() => {})`. Users hit plain Ctrl+V from muscle memory
 // and got nothing, with no way to tell "wrong key" from "clipboard blocked"
-// apart. The fix: plain Ctrl+V pastes too (quoted-insert is a readline corner
-// most users have never touched; every other terminal emulator in the app's
-// target audience already binds it), and a genuine read failure is a menu
-// item / keystroke that visibly does nothing rather than silently nothing —
-// see clipboard.ts's readClipboard, which pane.ts surfaces via showToast.
+// apart. The fix: a genuine read failure is a menu item / keystroke that
+// visibly does nothing rather than silently nothing — see clipboard.ts's
+// readClipboard, which pane.ts surfaces via showToast — and plain Ctrl+V
+// pastes TOO, but only when `pasteOnPlainCtrlV` opts in (default true;
+// see settings.ts). It is not a free win: it costs vim's VISUAL BLOCK mode,
+// readline's quoted-insert, and any TUI/agent CLI that wants the raw key —
+// review of #370 found the first cost (vim) undocumented and the "every
+// terminal emulator already binds it" justification for eating it overstated
+// (Windows Terminal does by default; gnome-terminal, iTerm2, kitty, and
+// alacritty default to Ctrl+Shift+V precisely to leave plain Ctrl+V for the
+// program in the pane). A setting, not an unconditional interception, is the
+// same call `Alt+V` made from the other direction (#155, shortcuts.ts) —
+// loomux stopped intercepting it once it was shown to steal a key an agent
+// pane needed; Ctrl+V gets the option instead of the same unconditional grab.
 
 // `import type` only — it erases at compile time, so node:test's strip-only
 // TS loader never has to resolve it as a module (a VALUE import of another
@@ -24,13 +33,29 @@ import type { MenuItem } from "./contextmenu";
 export interface PasteKeyEvent {
   ctrlKey: boolean;
   shiftKey: boolean;
+  altKey: boolean;
   code: string;
 }
 
-/** Is this keydown a terminal paste? Ctrl+V (added by #370) or the original
- *  Ctrl+Shift+V (kept — some users' muscle memory is the other way). */
-export function isPasteKey(e: PasteKeyEvent): boolean {
-  return e.ctrlKey && e.code === "KeyV";
+/** Is this keydown a terminal paste? Ctrl+Shift+V always is (the original,
+ *  unconditional binding — kept). Plain Ctrl+V is a paste only when
+ *  `plainCtrlVPastes` is true — the #370 review's blocking finding: binding
+ *  it unconditionally silently steals Ctrl+V from vim's VISUAL BLOCK mode,
+ *  readline's quoted-insert, and any TUI/agent CLI that wants the raw key
+ *  (the exact failure mode `Alt+V` was deliberately left alone for, #155 —
+ *  shortcuts.ts). `settings.ts`'s `pasteOnPlainCtrlV` (default true) is the
+ *  opt-out; pane.ts reads it and passes the current value in here on every
+ *  keydown rather than this module reading global state, so it stays pure
+ *  and testable without a settings singleton.
+ *
+ *  `!e.altKey` guards a keyboard-layout collision the plain-Ctrl+V case
+ *  introduced: on layouts where AltGr (= Ctrl+Alt) + V types a character,
+ *  Ctrl+Alt+V would otherwise be swallowed as a paste instead of reaching
+ *  the shell as that character. The original Ctrl+Shift+V binding never had
+ *  this problem (AltGr doesn't hold Shift), so gate the whole match on it. */
+export function isPasteKey(e: PasteKeyEvent, plainCtrlVPastes: boolean): boolean {
+  if (e.altKey || !e.ctrlKey || e.code !== "KeyV") return false;
+  return e.shiftKey || plainCtrlVPastes;
 }
 
 /** Is this keydown the terminal's copy gesture? Ctrl+Shift+C only — plain
