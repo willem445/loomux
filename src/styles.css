@@ -2197,6 +2197,16 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   padding: 0 12px 4px 47px; font-size: 10px; color: var(--text-dim);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
+/* Compact-nudge status line (PR #329 round 6) — same indent/shape as the
+   watch-line above, only rendered while there's a real arm/reinjection/lost
+   outcome to narrate (see `compactionStatusLabel`). Reuses this app's
+   "amber = needs your attention" convention (#6, .pane-attn/.pane-held)
+   rather than the neutral watch-line color — a warmer tint without being
+   alarm-red. */
+.group-compaction-line {
+  padding: 0 12px 4px 47px; font-size: 10px; color: #f2c66a;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 .group-role {
   flex: none; width: 34px; text-align: center;
   font-size: 9px; font-weight: 700; border-radius: 4px; padding: 1px 0;
@@ -2227,6 +2237,14 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   font-size: 10px; color: var(--text-dim); min-width: 42px; text-align: right;
 }
 .group-agent-cost { min-width: 96px; }
+/* Compact-nudge context-window usage (PR #329 round 6) — same family as
+   uptime/cost (monospace, dim, right-aligned), a small always-on badge next
+   to them rather than its own line, since it's shown for nearly every
+   Claude agent, not just an exceptional case. */
+.group-context {
+  flex: none; font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 10px; color: var(--text-dim); min-width: 88px; text-align: right;
+}
 .group-actions {
   display: flex; align-items: center; gap: 10px; flex: none;
   padding: 8px 12px; border-top: 1px solid var(--border-soft);

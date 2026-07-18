@@ -53,6 +53,7 @@ import {
   tickStatusLabel,
 } from "./autonomy";
 import { gateSatisfiabilityWarning, gateSummaryLine, workflowModeLabel } from "./workflowstatus";
+import { compactionStatusLabel, compactionStatusTitle, contextUsageLabel } from "./compactionstatus";
 import { roleLabel } from "./orchbadge";
 import { getDefaultAgent } from "./agents";
 import { confirmModal } from "./modal";
@@ -996,7 +997,13 @@ export class GroupView {
         if (usage) {
           c.title = `source: ${usage.source}${usage.model ? ` · ${usage.model}` : ""} · ${usage.tokens.total} tokens (in ${usage.tokens.input}, out ${usage.tokens.output}, cache +${usage.tokens.cache_creation}/${usage.tokens.cache_read})`;
         }
-        row.append(chip, name, ...(block ? [block] : []), state, up, c);
+        // Compact-nudge (PR #329 round 6): current context-window usage,
+        // shown whenever a reading exists — the whole point of this UI is
+        // live demo feedback, not just alerting once something's wrong.
+        const ctxLabel = contextUsageLabel(a.context);
+        const ctx = ctxLabel ? el("span", "group-context", ctxLabel) : null;
+
+        row.append(chip, name, ...(block ? [block] : []), state, up, c, ...(ctx ? [ctx] : []));
         wrap.append(row);
 
         // "⏳ waiting on …" indicator (#248): a correctly-WAITING agent parked
@@ -1008,6 +1015,19 @@ export class GroupView {
           const line = el("div", "group-watch-line", watchLine(mine, Date.now()));
           const notes = mine.map((w) => w.note).filter(Boolean);
           if (notes.length > 0) line.title = notes.join(" · ");
+          wrap.append(line);
+        }
+
+        // Compact-nudge status line (PR #329 round 6): only rendered while
+        // there's something worth a human's attention (an arm, an in-flight
+        // reinjection, or a recent lost outcome) — `"none"` omits the row
+        // entirely, same "no layout change for the common case" shape as the
+        // watch-line above.
+        const compactionLabel = compactionStatusLabel(a.compaction);
+        if (compactionLabel) {
+          const line = el("div", "group-compaction-line", compactionLabel);
+          const title = compactionStatusTitle(a.compaction);
+          if (title) line.title = title;
           wrap.append(line);
         }
 

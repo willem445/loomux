@@ -1739,6 +1739,56 @@ clear-on-decision behavior). All prior reinjection tests were updated to supply 
 `DeliveryConfirmation` before asserting final resolution; `compact_nudge_tick_never_loops_when_
 the_false_signal_repeats_every_cycle` (D4) stays pinned at zero, unaffected.
 
+### #410 (round 6): the arm-pending timeout, and a request-starvation fix alongside it
+
+A third re-demo hit a new symptom: `request_compact` answered "a compact is already in flight for
+this pane" for 10+ minutes.
+
+**Forensics.** `audit.jsonl` around the incident shows the resumed session got a fresh
+`AgentEntry` (a new id, `orch-1` — `self.seq` is an in-memory-only counter, and `AgentRecord`, the
+persisted per-agent roster row, has no `compact_*` fields at all, so no compaction state survives
+a restart; this rules out a stale arm carried over from an earlier round or app session). Within
+about a minute of resume, something armed `compact_pending` on this fresh entry with no visible
+audit trail (arming is silent by design — only resolution audits) — almost certainly an inference
+arm, given the session's accumulated size across many testing rounds. Three `compact-pending-
+discarded` audits followed, 2-3 minutes apart, each showing an unchanged token reading: D4 held —
+this was never a reinjection loop, every cycle resolved correctly. But the user's queued
+`request_compact` never got a chance to fire during any of it.
+
+**Root cause: same-tick re-arm racing a queued request.** On the exact tick a discard clears
+`compact_pending`, an inference arm can re-satisfy its OWN condition on that SAME tick — manual
+detection in particular has no `!currently_quiet` requirement (unlike the banner detector), only
+a recency + tail-match check, so it can re-arm immediately after a same-tick discard if the human
+was still typing nearby (which the audit trail shows was happening). In the OLD per-agent
+iteration order, manual/banner detection ran BEFORE the heuristic/requested-fire check, so a
+same-tick re-arm would close the gate before the already-queued, deterministic `request_compact`
+ever got a turn — repeatedly, for as long as the inference condition kept recurring.
+
+**Fix 1 — reorder: the loomux-initiated fire-check now runs FIRST**, immediately after the
+pause-check, before manual detection, banner detection, and escalation. A queued request is
+deterministic and already-decided; an inference arm is a guess. Giving the deterministic check
+first refusal means a fresh discard always lets a queued request through before any inference arm
+can reclaim the pane that same tick. One side effect: escalation's own "set `compact_requested` on
+the agent's behalf" auto-request (previously read by the fire-check in the same tick) now takes
+one additional tick to fire — harmless, since the escalation-notice split above only ever needed
+"not the same tick as the notice," never "the very next tick" specifically.
+
+**Fix 2 — `ARM_PENDING_TIMEOUT_MS` (5 minutes, symmetric to `REINJECT_CONFIRM_TIMEOUT_MS`)**: a
+`compact_pending` arm that never reaches a busy-then-quiet resolution at all (a stalled agent, a
+compaction that never actually starts) is now force-abandoned — audited (`compact-arm-timeout`),
+latch released — rather than wedging the state machine forever. `AgentEntry.compact_pending_
+armed_ms` tracks when the CURRENT arm started (set at all three arm sites, cleared on any
+resolution — discard, handoff into the reinjection-confirmation phase, or this timeout itself).
+Checked BEFORE the `currently_quiet` gate, since a stuck arm might never go quiet at all.
+
+Regression coverage: `compact_nudge_tick_lets_a_queued_request_win_the_race_against_a_same_tick_
+inference_rearm` pins the actual root cause (verified red-before-green by temporarily reverting
+the arm-site ordering). `compact_nudge_tick_times_out_a_stuck_arm_that_never_reaches_a_busy_then_
+quiet_resolution` and `compact_nudge_tick_arms_cleanly_via_request_compact_after_an_arm_timeout`
+cover the arm-pending-timeout contract (verified red-before-green against a neutered timeout
+check). Two pre-existing escalation tests were updated for the one-tick delay the reorder
+introduces.
+
 ## Enforced merge gate (#83)
 
 Template guidance is not a security boundary. A live incident proved it: an orchestrator merged

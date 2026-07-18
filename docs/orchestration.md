@@ -452,6 +452,15 @@ already done or no longer relevant. The ledger lives at
 `<data dir>/loomux/orchestration/<group>/ledger-<agent-id>.log` — a plain, human-readable
 file, one entry per line, that a human can open directly.
 
+**Lifecycle panel.** The group lifecycle panel (`Alt+O`) shows each Claude agent's current
+context-window usage (tokens + percent) next to its uptime and cost, and — only when there's
+something worth a glance — its compact-nudge phase: armed (waiting to observe the pane go
+busy), awaiting evidence (busy observed, waiting on quiet to resolve), re-grounding (a
+reinjection is in flight, with its attempt count), or a recent lost outcome (an arm or
+delivery that didn't resolve in time and was released rather than left stuck). An idle agent
+with nothing pending shows neither line — this narrates the same state machine described
+above, not a separate status.
+
 ## Persistence & restart
 
 Each group keeps durable state under

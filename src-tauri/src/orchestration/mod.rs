@@ -1124,6 +1124,12 @@ const REINJECT_CONFIRM_TIMEOUT_MS: u64 = 5 * 60 * 1000;
 /// reinjection stuck past `REINJECT_CONFIRM_TIMEOUT_MS` — see `AgentEntry::
 /// compact_reinject_attempts`'s doc for why this must never be unbounded.
 const MAX_REINJECT_ATTEMPTS: u32 = 3;
+/// Production bug fix (#410, PR #329 round 6): how long a `compact_pending`
+/// arm is given to reach a busy-then-quiet resolution (confirm or discard)
+/// before the resolver forces an abandon — symmetric to `REINJECT_CONFIRM_
+/// TIMEOUT_MS`'s bound on the delivery-confirmation phase. See `AgentEntry::
+/// compact_pending_armed_ms`'s doc for the live incident this closes.
+const ARM_PENDING_TIMEOUT_MS: u64 = 5 * 60 * 1000;
 /// Compact-nudge (#328): upper bound on `compact_context_threshold_percent`;
 /// 0 is "off" (see `Guardrails::clamped`), 100 = only at total exhaustion
 /// (effectively disabled in practice, since the CLI's own emergency
@@ -2454,6 +2460,71 @@ pub fn inferred_compaction_confirmed(
     }
 }
 
+/// Lifecycle-panel surfacing (PR #329 round 6): how long a lost-outcome
+/// (`CompactionStatus::Abandoned`) stays visible after the fact — an old one
+/// would read as a current problem long after the agent moved on.
+const COMPACTION_STATUS_RECENT_WINDOW_MS: u64 = 10 * 60 * 1000;
+
+/// Compact-nudge (PR #329 round 6, lifecycle UI): the compaction state-
+/// machine phase to surface per agent. Serializes as `{"status": "armed",
+/// "trusted": true}` etc. (`tag = "status"`) — the group lifecycle panel's
+/// wire shape.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum CompactionStatus {
+    /// No arm, no in-flight reinjection, no recent lost outcome.
+    None,
+    /// `compact_pending`, not yet observed busy. `trusted` distinguishes the
+    /// loomux-initiated arm (heuristic/`request_compact`) from an inference
+    /// arm (banner/manual detection) — the former skips confirmation, the
+    /// latter needs evidence before it can resolve to a reinjection.
+    Armed { trusted: bool },
+    /// `compact_pending`, busy observed — waiting on quiet to attempt a
+    /// confirm/discard resolution.
+    AwaitingEvidence { trusted: bool },
+    /// A reinjection has been decided and is waiting on its delivery to
+    /// confirm (or its next bounded retry) — see `compact_reinject_
+    /// attempted_ms`'s doc. `attempt` is 1-indexed, bounded by `max_attempts`
+    /// (`MAX_REINJECT_ATTEMPTS`).
+    Reinjecting { attempt: u32, max_attempts: u32 },
+    /// A lost terminal outcome (`arm-timeout` or `reinjection-abandoned`)
+    /// within `COMPACTION_STATUS_RECENT_WINDOW_MS` of now — worth a human's
+    /// attention, but only briefly.
+    Abandoned { reason: String, since_ms: u64 },
+}
+
+/// Pure derivation of `CompactionStatus` from already-tracked `AgentEntry`
+/// fields — narrates the real state machine, never a parallel vocabulary.
+/// Split out (rather than inlined in `group_summary`) so the phase logic is
+/// synthetic-input testable without a registry.
+pub fn compaction_status(
+    compact_pending: bool,
+    compact_pending_trusted: bool,
+    compact_seen_busy: bool,
+    reinject_attempted_ms: Option<u64>,
+    reinject_attempts: u32,
+    last_lost_reason: Option<&str>,
+    last_lost_ms: Option<u64>,
+    now: u64,
+) -> CompactionStatus {
+    if reinject_attempted_ms.is_some() {
+        return CompactionStatus::Reinjecting { attempt: reinject_attempts, max_attempts: MAX_REINJECT_ATTEMPTS };
+    }
+    if compact_pending {
+        return if compact_seen_busy {
+            CompactionStatus::AwaitingEvidence { trusted: compact_pending_trusted }
+        } else {
+            CompactionStatus::Armed { trusted: compact_pending_trusted }
+        };
+    }
+    if let (Some(reason), Some(ms)) = (last_lost_reason, last_lost_ms) {
+        if now.saturating_sub(ms) < COMPACTION_STATUS_RECENT_WINDOW_MS {
+            return CompactionStatus::Abandoned { reason: reason.to_string(), since_ms: ms };
+        }
+    }
+    CompactionStatus::None
+}
+
 /// Compact-nudge (#328): whether context usage has crossed the group's
 /// escalation threshold and escalation hasn't already been latched for this
 /// window. `threshold_percent` 0 disables escalation entirely (purely
@@ -3578,6 +3649,48 @@ pub struct AgentEntry {
     /// machine so no future compaction can ever arm again for this agent.
     /// Reset to `0` whenever no reinjection is in flight.
     pub compact_reinject_attempts: u32,
+    /// Production bug fix (#410, PR #329 round 6): Unix-ms the CURRENT
+    /// `compact_pending` arm started (set at each of the three arm sites,
+    /// cleared on any resolution — discard, handoff into the reinjection-
+    /// confirmation phase, or this field's own timeout). Live evidence (a
+    /// user demo, testbed group `loomux-testbed-cc077f09`) showed a
+    /// `request_compact` call answered "a compact is already in flight for
+    /// this pane" for 10+ minutes: an inference arm (almost certainly the
+    /// auto-compact banner, given the session's accumulated size across many
+    /// testing rounds) kept re-arming and correctly resolving to a DISCARD
+    /// each time (D4 held — no reinjection loop), but the repeated cycling
+    /// meant `compact_pending` was essentially never open long enough for
+    /// the user's queued request to win the race (closed by the arm-site
+    /// reorder below) or, in the more literal #410 scenario, an arm that
+    /// simply never reaches a busy-then-quiet observation at all (a stalled
+    /// agent, or a compaction that never actually starts) stays pending
+    /// forever with no bound. This field lets the resolver force an
+    /// abandon — audited, latch released — once an arm has been open past
+    /// `ARM_PENDING_TIMEOUT_MS`, symmetric to `compact_reinject_attempted_
+    /// ms`'s bound on the delivery-confirmation phase.
+    pub compact_pending_armed_ms: Option<u64>,
+    /// Lifecycle-panel surfacing (PR #329 round 6): the reason the most
+    /// recent "something was lost" terminal outcome fired — `"arm-timeout"`
+    /// (#410) or `"reinjection-abandoned"` (a stuck delivery past its retry
+    /// budget) — paired with `compact_last_lost_ms`. Distinct from an
+    /// ordinary discard (a harmless false-positive, not worth lingering
+    /// visibility for): these two ARE worth surfacing to a human watching
+    /// the lifecycle panel, but only briefly (see `compaction_status`'s
+    /// recency window) — an old one would be misleading noise long after
+    /// the agent moved on.
+    pub compact_last_lost_reason: Option<String>,
+    /// Unix-ms `compact_last_lost_reason` was set. See its doc.
+    pub compact_last_lost_ms: Option<u64>,
+    /// Lifecycle-panel surfacing (PR #329 round 6): the last context-token
+    /// reading `compact_nudge_tick` observed for this agent (from `usage::
+    /// compaction_signal_in`, the SAME bounded tail-read the compact-nudge
+    /// background tick already does every `IDLE_TICK_INTERVAL` — this just
+    /// caches its result so `group_summary` can surface it on the UI's own,
+    /// much more frequent poll cadence WITHOUT an extra transcript read per
+    /// poll). `None` until the first successful reading; never cleared once
+    /// set (a transient read miss keeps the last-known value rather than
+    /// blanking the display).
+    pub last_context_tokens: Option<u64>,
     /// Compact-nudge (#328): Unix-ms this agent's `set_state` call was last
     /// observed (0 = never). Self-scoped, stamped by the `set_state` MCP
     /// handler on the CALLING agent's own entry — meaningful only for the
@@ -8518,6 +8631,10 @@ impl OrchRegistry {
             compact_pending_trusted: false,
             compact_reinject_attempted_ms: None,
             compact_reinject_attempts: 0,
+            compact_pending_armed_ms: None,
+            compact_last_lost_reason: None,
+            compact_last_lost_ms: None,
+            last_context_tokens: None,
             last_state_write_ms: 0,
             compact_escalation_notified: false,
             solo_cli: Some(cli.to_string()),
@@ -8639,6 +8756,10 @@ impl OrchRegistry {
             compact_pending_trusted: false,
             compact_reinject_attempted_ms: None,
             compact_reinject_attempts: 0,
+            compact_pending_armed_ms: None,
+            compact_last_lost_reason: None,
+            compact_last_lost_ms: None,
+            last_context_tokens: None,
             last_state_write_ms: 0,
             compact_escalation_notified: false,
             solo_cli: None, // unknown for an adopted pane; cli_for_agent falls back to "claude"
@@ -8994,12 +9115,28 @@ impl OrchRegistry {
         // machine), but this must be visible: it's a genuinely lost
         // re-grounding, not a harmless discard.
         let mut to_abandon: Vec<(String, String, u32)> = Vec::new();
+        // #410 (round 6): an arm forced open past `ARM_PENDING_TIMEOUT_MS`
+        // without ever reaching a busy-then-quiet resolution — audited
+        // distinctly from `to_abandon` (which is specifically a stuck
+        // reinjection DELIVERY, past the arm phase).
+        let mut to_arm_timeout: Vec<(String, String)> = Vec::new();
         {
             let mut agents = self.agents.lock_safe();
             for a in agents.values_mut() {
                 let Some(g) = groups.get(&a.group) else { continue };
                 if a.status != AgentStatus::Running || !compact_nudge_cli_supported(g.cli_for(a.role)) {
                     continue;
+                }
+
+                // Lifecycle-panel surfacing (PR #329 round 6): cache this
+                // tick's context-token reading (if any) so `group_summary`
+                // can surface it without its own transcript read — see
+                // `last_context_tokens`'s doc. Every agent in this loop
+                // already cleared the CLI-support gate above, so every
+                // reading here is for an agent the panel would want to show
+                // usage for anyway.
+                if let Some(&tokens) = context_tokens.get(&a.id) {
+                    a.last_context_tokens = Some(tokens);
                 }
 
                 // Rebaseline / meaningful-growth detection — own baseline
@@ -9074,12 +9211,39 @@ impl OrchRegistry {
                             a.compact_pending = false;
                             a.compact_reinject_attempted_ms = None;
                             a.compact_reinject_attempts = 0;
+                            a.compact_last_lost_reason = Some("reinjection-abandoned".to_string());
+                            a.compact_last_lost_ms = Some(now);
                         }
                     }
                     // else: still within the timeout, a delivery may be
                     // legitimately in flight (a long human-typing hold) —
                     // wait, don't re-fire yet.
-                } else if a.compact_pending && currently_quiet {
+                } else if a.compact_pending {
+                    // Production bug fix (#410, PR #329 round 6): an arm that
+                    // never reaches a busy-then-quiet resolution — a stalled
+                    // agent, a compaction that never actually starts, or (the
+                    // live incident this closes) a rapid discard/re-arm cycle
+                    // that never leaves `compact_pending` open long enough
+                    // for a queued `request_compact` to win the race — must
+                    // not wedge the state machine forever. Checked BEFORE the
+                    // `currently_quiet` gate below (unlike the delivery-
+                    // confirmation phase's timeout, which only matters once
+                    // already resolved, a stuck ARM might never go quiet at
+                    // all, so this bound cannot wait for that).
+                    let armed_too_long = a
+                        .compact_pending_armed_ms
+                        .is_some_and(|armed_ms| now.saturating_sub(armed_ms) >= ARM_PENDING_TIMEOUT_MS);
+                    if armed_too_long {
+                        to_arm_timeout.push((a.id.clone(), a.group.clone()));
+                        a.compact_pending = false;
+                        a.compact_seen_busy = false;
+                        a.compact_pending_baseline_tokens = None;
+                        a.compact_pending_baseline_marker_count = None;
+                        a.compact_pending_trusted = false;
+                        a.compact_pending_armed_ms = None;
+                        a.compact_last_lost_reason = Some("arm-timeout".to_string());
+                        a.compact_last_lost_ms = Some(now);
+                    } else if currently_quiet {
                     // Compaction-completion: busy (compaction ran/rendered)
                     // then quiet again while pending — resolve regardless of
                     // pause state (a pause must not strand a pane mid-compact
@@ -9177,6 +9341,7 @@ impl OrchRegistry {
                             a.compact_pending_baseline_marker_count = None;
                             a.compact_pending_trusted = false;
                             a.compact_seen_busy = false;
+                            a.compact_pending_armed_ms = None;
                             a.compact_reinject_attempts = 1;
                             a.compact_reinject_attempted_ms = Some(now);
                             let instructions = self.group_dir(&a.group).join(
@@ -9192,8 +9357,10 @@ impl OrchRegistry {
                             a.compact_pending_baseline_tokens = None;
                             a.compact_pending_baseline_marker_count = None;
                             a.compact_pending_trusted = false;
+                            a.compact_pending_armed_ms = None;
                             to_discard.push((a.id.clone(), a.group.clone(), baseline_tokens, current_tokens));
                         }
+                    }
                     }
                 }
 
@@ -9202,6 +9369,67 @@ impl OrchRegistry {
                 // burn the one-shot latch or the per-hour budget.
                 if paused.contains(&a.group) {
                     continue;
+                }
+
+                // #410 (round 6): the loomux-initiated (heuristic/requested)
+                // fire-check runs FIRST among the four arm sites — moved up
+                // from after manual/banner detection/escalation. Live
+                // evidence (the incident `ARM_PENDING_TIMEOUT_MS` above also
+                // closes) showed a queued `request_compact` starved for 10+
+                // minutes: a discard just above can clear `compact_pending`
+                // on this SAME tick, and — in the OLD order — an inference
+                // arm re-satisfying its own condition on this same tick (a
+                // recurring banner mention, an ongoing conversation) would
+                // re-arm `compact_pending` before this check ever ran,
+                // repeatedly starving the EXPLICIT, already-queued request
+                // of the brief window it needs. Running this deterministic,
+                // already-decided check first means a fresh discard always
+                // gives a queued request first refusal, before any inference
+                // arm gets a chance to re-claim the pane this same tick.
+                let times = tick_times.get(&a.group).map(Vec::as_slice).unwrap_or(&[]);
+                // Heuristic (role-gated, minutes-threshold) fallback fire.
+                let heuristic_fires = compact_nudge_role_allowed(a.role, &g.compact_nudge_roles)
+                    && idle_tick_should_fire(
+                        a.last_progress_ms,
+                        now,
+                        g.compact_nudge_minutes,
+                        a.compact_nudge_notified,
+                        times,
+                        MAX_COMPACT_NUDGES_PER_HOUR,
+                    );
+                // Agent-requested (via `request_compact`, or set on its
+                // behalf by escalation BELOW, one tick later than before this
+                // round's reorder — see the reorder note above) fire — no
+                // role gate (self-initiated), no minutes threshold (the
+                // request IS the trigger), still CLI-gated (checked above)
+                // and rate-limited (shared budget).
+                let requested_fires = a.compact_requested
+                    && compact_request_should_fire(currently_quiet, times, now, MAX_COMPACT_NUDGES_PER_HOUR);
+                // `!a.compact_pending` (rev-12 review finding): this is the
+                // one place that actually types `/compact`, so it is the
+                // authoritative choke point — a compact already pending for
+                // this pane must never get a second one queued behind it,
+                // regardless of how `heuristic_fires`/`requested_fires` got
+                // set. A `request_compact` call that lands while already
+                // pending is not lost: `compact_requested` just stays set and
+                // is honored on a LATER tick, once `compact_pending` clears.
+                if !a.compact_pending && (heuristic_fires || requested_fires) {
+                    a.compact_nudge_notified = true;
+                    a.compact_requested = false;
+                    a.compact_pending = true;
+                    a.compact_seen_busy = false;
+                    a.compact_pending_baseline_tokens = context_tokens.get(&a.id).copied();
+                    a.compact_pending_baseline_marker_count = context_boundary_counts.get(&a.id).copied();
+                    // Loomux-initiated arm (rev-42 delta): THIS is the arm
+                    // that pastes `/compact` itself below — loomux has
+                    // positive knowledge the command was submitted, so
+                    // busy-then-quiet is sufficient on its own; trusted arms
+                    // skip `inferred_compaction_confirmed` entirely (see the
+                    // resolver's doc for why a hard gate here deadlocks the
+                    // primary path).
+                    a.compact_pending_trusted = true;
+                    a.compact_pending_armed_ms = Some(now);
+                    to_fire.push((a.id.clone(), a.group.clone()));
                 }
 
                 // Manual `/compact` detection (only while nothing is already
@@ -9222,6 +9450,7 @@ impl OrchRegistry {
                             a.compact_pending_baseline_marker_count =
                                 context_boundary_counts.get(&a.id).copied();
                             a.compact_pending_trusted = false;
+                            a.compact_pending_armed_ms = Some(now);
                         }
                     }
                 }
@@ -9263,6 +9492,7 @@ impl OrchRegistry {
                             a.compact_pending_baseline_marker_count =
                                 context_boundary_counts.get(&a.id).copied();
                             a.compact_pending_trusted = false;
+                            a.compact_pending_armed_ms = Some(now);
                         }
                     }
                 }
@@ -9271,12 +9501,20 @@ impl OrchRegistry {
                 // under threshold (e.g. after a compact lands). The notice
                 // fires ALONE on the crossing tick — giving the agent this
                 // tick to self-request before loomux falls back on its
-                // behalf on a LATER tick still over threshold (so the
-                // fallback request never races the notice: without this
-                // split, `compact_requested` would already be true by the
-                // time the fire-check below runs in this SAME tick, and
-                // `/compact` would land ahead of — or interleaved with — the
-                // escalation notice that's supposed to warn about it first).
+                // behalf on a LATER tick still over threshold, so the
+                // fallback request never races the notice with an
+                // interleaved `/compact`.
+                //
+                // #410 (round 6): the fire-check that consumes `compact_
+                // requested` now runs ABOVE this block (moved up to fix the
+                // request-starvation incident — see its own comment), so a
+                // `compact_requested` set HERE can no longer be read by the
+                // SAME tick's fire-check at all — it is always honored on a
+                // LATER tick, one full tick later than the escalation-notice
+                // split above already intended. Harmless: the notice-then-
+                // fallback shape this comment describes only ever needed
+                // "not the same tick as the notice," never "the very next
+                // tick" specifically.
                 //
                 // Gated on `!a.compact_pending` (rev-12 review finding):
                 // without this, a still-over-threshold reading on the tick
@@ -9284,7 +9522,7 @@ impl OrchRegistry {
                 // visibly gone busy from loomux's point of view, so
                 // `currently_quiet` is still `true` — re-armed
                 // `compact_requested` (reset to `false` when the first
-                // `/compact` fired) and the fire-check below would type a
+                // `/compact` fired) and the fire-check above would type a
                 // SECOND `/compact` into a pane whose first compact hadn't
                 // resolved yet. A compact already in flight is reason enough
                 // to hold off on both re-notifying and re-arming; the
@@ -9314,48 +9552,6 @@ impl OrchRegistry {
                     }
                 }
 
-                let times = tick_times.get(&a.group).map(Vec::as_slice).unwrap_or(&[]);
-                // Heuristic (role-gated, minutes-threshold) fallback fire.
-                let heuristic_fires = compact_nudge_role_allowed(a.role, &g.compact_nudge_roles)
-                    && idle_tick_should_fire(
-                        a.last_progress_ms,
-                        now,
-                        g.compact_nudge_minutes,
-                        a.compact_nudge_notified,
-                        times,
-                        MAX_COMPACT_NUDGES_PER_HOUR,
-                    );
-                // Agent-requested (via `request_compact`, or set on its behalf
-                // by escalation above) fire — no role gate (self-initiated),
-                // no minutes threshold (the request IS the trigger), still
-                // CLI-gated (checked above) and rate-limited (shared budget).
-                let requested_fires = a.compact_requested
-                    && compact_request_should_fire(currently_quiet, times, now, MAX_COMPACT_NUDGES_PER_HOUR);
-                // `!a.compact_pending` (rev-12 review finding): this is the
-                // one place that actually types `/compact`, so it is the
-                // authoritative choke point — a compact already pending for
-                // this pane must never get a second one queued behind it,
-                // regardless of how `heuristic_fires`/`requested_fires` got
-                // set. A `request_compact` call that lands while already
-                // pending is not lost: `compact_requested` just stays set and
-                // is honored on a LATER tick, once `compact_pending` clears.
-                if !a.compact_pending && (heuristic_fires || requested_fires) {
-                    a.compact_nudge_notified = true;
-                    a.compact_requested = false;
-                    a.compact_pending = true;
-                    a.compact_seen_busy = false;
-                    a.compact_pending_baseline_tokens = context_tokens.get(&a.id).copied();
-                    a.compact_pending_baseline_marker_count = context_boundary_counts.get(&a.id).copied();
-                    // Loomux-initiated arm (rev-42 delta): THIS is the arm
-                    // that pastes `/compact` itself below — loomux has
-                    // positive knowledge the command was submitted, so
-                    // busy-then-quiet is sufficient on its own; trusted arms
-                    // skip `inferred_compaction_confirmed` entirely (see the
-                    // resolver's doc for why a hard gate here deadlocks the
-                    // primary path).
-                    a.compact_pending_trusted = true;
-                    to_fire.push((a.id.clone(), a.group.clone()));
-                }
             }
         }
 
@@ -9406,6 +9602,12 @@ impl OrchRegistry {
         }
         for (id, group, attempts) in to_abandon {
             self.audit(&group, "loomux", "compact-reinjection-abandoned", json!({ "agent": id, "attempts": attempts }));
+        }
+        for (id, group) in to_arm_timeout {
+            self.audit(&group, "loomux", "compact-arm-timeout", json!({
+                "agent": id,
+                "reason": "arm never reached a busy-then-quiet resolution within ARM_PENDING_TIMEOUT_MS",
+            }));
         }
         nudged
     }
@@ -11590,6 +11792,26 @@ impl OrchRegistry {
                     "block": a.block,
                     "task": a.task, "idle_since_ms": a.idle_since_ms,
                     "uptime_ms": now.saturating_sub(a.started_ms),
+                    // Lifecycle-panel surfacing (PR #329 round 6): live
+                    // compaction-state-machine phase + last-known context
+                    // usage, straight from tracked state — no extra
+                    // transcript read per poll (see `last_context_tokens`'s
+                    // doc).
+                    "compaction": compaction_status(
+                        a.compact_pending,
+                        a.compact_pending_trusted,
+                        a.compact_seen_busy,
+                        a.compact_reinject_attempted_ms,
+                        a.compact_reinject_attempts,
+                        a.compact_last_lost_reason.as_deref(),
+                        a.compact_last_lost_ms,
+                        now,
+                    ),
+                    "context": {
+                        "tokens": a.last_context_tokens,
+                        "percent": a.last_context_tokens
+                            .map(|t| context_percent_used(t, CLAUDE_CONTEXT_WINDOW_TOKENS)),
+                    },
                 })
             })
             .collect();
@@ -13550,6 +13772,10 @@ impl OrchRegistry {
             compact_pending_trusted: false,
             compact_reinject_attempted_ms: None,
             compact_reinject_attempts: 0,
+            compact_pending_armed_ms: None,
+            compact_last_lost_reason: None,
+            compact_last_lost_ms: None,
+            last_context_tokens: None,
             last_state_write_ms: 0,
             compact_escalation_notified: false,
             solo_cli: None,
@@ -15501,6 +15727,10 @@ fn register_orchestrator_pane(
         compact_pending_trusted: false,
         compact_reinject_attempted_ms: None,
         compact_reinject_attempts: 0,
+        compact_pending_armed_ms: None,
+        compact_last_lost_reason: None,
+        compact_last_lost_ms: None,
+        last_context_tokens: None,
         last_state_write_ms: 0,
         compact_escalation_notified: false,
         solo_cli: None,
