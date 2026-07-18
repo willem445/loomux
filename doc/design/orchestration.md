@@ -1430,6 +1430,22 @@ survives it even when nothing warned anyone first.
   atomicity rule but needs none of its `AUDIT_LOCK` rotation machinery: a ledger file has
   exactly one writer (its own owning agent) and no rotation, so there is no rotate-vs-append
   race to guard against in the first place.
+  **Sanitized in append mode, capped on every write (review N1/N2).** Append-mode `text`
+  runs through `notify::sanitize_gh_text` — the exact function `channel_send` already puts
+  untrusted text through — before it's written: strips control characters (an embedded `\n`
+  would otherwise split one call into several physical lines, breaking the one-line-per-entry
+  model `directive_ledger_embed` and the file format both assume) and neutralizes `[`/`]` (so
+  a line can never start with a forged `[loomux]` marker once re-embedded verbatim into the
+  re-grounding notice). Judged low severity — the ledger is self-authored and self-scoped, so
+  an agent can only ever spoof itself, unlike `channel_send`'s cross-pane trust boundary —
+  but free to close the same way. `replace` writes its `text` verbatim, unsanitized by
+  design: it's the curation path, expected to carry the agent's own prior (already-sanitized)
+  entries copied back in, not fresh untrusted input. Separately, the STORED file is capped at
+  `DIRECTIVE_LEDGER_MAX_BYTES` (64KB) via `ledger_capped` after every write, append or
+  replace: over cap, oldest entries drop first (line boundary), never silently — a non-zero
+  drop is audited (`ledger-trimmed`) and named in `note_directive`'s response string.
+  Curation via `replace: true` stays the primary, deliberate mechanism; this is only the
+  backstop for a session that never uses it.
 - **Embedded in the SAME re-injection notice, size-capped with a stated truncation.**
   `compact_reinjection_notice` gained a second parameter — the ledger section, produced by
   `directive_ledger_embed(ledger, cap_bytes, ledger_path)` — folded in after the
@@ -1461,22 +1477,46 @@ survives it even when nothing warned anyone first.
   change. The exact string is a documented assumption, not a guarantee this repo controls:
   if the detector stops firing, re-verifying it against a current Claude Code build is the
   first thing to check.
-  **The recency gate is `!currently_quiet`, not a duration window, and that was a design
-  correction made during this same PR.** The first draft gated detection on a
-  `MANUAL_COMPACT_DETECT_WINDOW_MS`-style duration compared against
-  `AgentEntry.last_progress_ms`, mirroring `human_typed_compact_detected`'s guard against a
-  stale tail. That mirror doesn't hold: `last_progress_ms` is *rewritten to `now`* by this
-  same tick's own growth check whenever the pane is busy for ANY reason, so a window
+
+  **Two rounds of false-positive fixes, both worth recording — the second was found in
+  review, not by the author.**
+
+  *Round 1 (recency, fixed before review): `!currently_quiet`, not a duration window.* The
+  first draft gated detection on a `MANUAL_COMPACT_DETECT_WINDOW_MS`-style duration compared
+  against `AgentEntry.last_progress_ms`, mirroring `human_typed_compact_detected`'s guard
+  against a stale tail. That mirror doesn't hold: `last_progress_ms` is *rewritten to `now`*
+  by this same tick's own growth check whenever the pane is busy for ANY reason, so a window
   compared against it reads as "fresh" on every busy tick regardless of why the tail
   contains the banner text — it would have passed even for banner text left over from a
-  compact that resolved an hour ago, on the next unrelated busy tick. The fix: gate on
-  `!currently_quiet` — this tick's OWN observed growth, not a timestamp — so a banner is
-  only trusted the instant real new output is seen alongside it, never inferred from a
-  stale tail on a tick with no growth at all. Still best-effort and tolerant of the tail's
-  bounded ring, same as every other detector here: it cannot prove the fresh growth and the
-  banner text are the same event, only that something changed just now. `compact_seen_busy`
-  is set `true` at the same moment (not left for a later tick), since the banner match itself
-  IS the busy signal, caught mid-compaction rather than inferred after the fact.
+  compact that resolved an hour ago, on the next unrelated busy tick. Fixed to gate on
+  `!currently_quiet` instead — this tick's OWN observed growth, not a timestamp.
+
+  *Round 2 (position, fixed in review — B1): a growth gate alone does not close the mention
+  case, because the mention IS the growth.* `!currently_quiet` closes the STALE-banner
+  re-trigger, but a reviewer caught the sharper failure it does nothing for: a busy pane
+  that PRINTS or DISCUSSES the banner text (a `gh pr diff` hunk, a grep result, a rust
+  string literal in a code listing, the model streaming a sentence about this very feature
+  — this repo's own source contains the string) satisfies `!currently_quiet` by the mention
+  being rendered. The growth and the banner text are the *same event* in that case — the
+  strongest possible false correlation, not a rare coincidence — and no recency/growth check
+  can ever tell it apart from the real thing. What can: **position**. The real spinner
+  renders as the live status line, continuously redrawn in place, with nothing after it
+  until compaction finishes. A quoted mention sits in scrolled content with other lines
+  following it almost always (the diff continues, the file continues, the sentence has more
+  sentences after it). So `auto_compact_banner_detected` now checks only the tail's LAST
+  non-blank line, never the full tail — a mention buried in scrollback can no longer surface
+  regardless of how much growth accompanies it.
+
+  This is a real reduction in surface, not a perfect one, and the doc says so rather than
+  overclaiming: the accepted residual risk is a mention that happens to BE the exact last
+  line of output at the instant a tick reads the pane (a streamed reply that ends its turn
+  naming the string, with nothing rendered yet after it). Closing that fully would need
+  either a structural signal from the CLI itself (see the #397 note below) or a second-tick
+  confirmation before latching — judged not worth the added state for how narrow the
+  remaining window is; if it stops holding in practice, that confirmation tick is the next
+  move, not a broader substring match. `compact_seen_busy` is still set `true` at the moment
+  of detection (not left for a later tick), since the banner match itself IS the busy
+  signal, caught mid-compaction rather than inferred after the fact.
 - **What this does not build.** #397 (filed as a follow-up, not built here) proposes a
   claude-CLI-tier `PreCompact` hook that shapes Claude Code's OWN compaction summary so
   directives survive *inside* it verbatim — a structurally different, more elegant fix than

@@ -1164,6 +1164,21 @@ const MANUAL_COMPACT_DETECT_WINDOW_MS: u64 = 3 * 60_000; // 3x IDLE_TICK_INTERVA
 /// (most recent entries) survives a cut, never the head, because the newest
 /// directives are the ones most likely to still be live.
 const DIRECTIVE_LEDGER_EMBED_CAP_BYTES: usize = 2048;
+/// Directive ledger (#329 review, N2): hard cap on the LEDGER FILE itself —
+/// distinct from `DIRECTIVE_LEDGER_EMBED_CAP_BYTES`, which only bounds what
+/// gets pasted into a reinjection notice. Without this, an agent that notes
+/// liberally and never curates (`replace: true`) grows the file (and the
+/// full-file `fs::read_to_string` every reinjection does) without bound.
+/// Generous relative to one line per human directive — curation via
+/// `replace` stays the primary, deliberate mechanism; this is only the
+/// backstop for a session that never uses it. See `ledger_capped`.
+const DIRECTIVE_LEDGER_MAX_BYTES: usize = 64 * 1024;
+/// Directive ledger (#329 review, N1): max characters kept from a single
+/// `note_directive` append-mode entry after sanitization — mirrors
+/// `OrchRegistry::CHANNEL_TEXT_CAP`'s role for `channel_send` (a directive is
+/// closer to a message than to a terse notification field, hence this and
+/// not the smaller `notify::NOTICE_FIELD_CAP`).
+const DIRECTIVE_ENTRY_MAX_CHARS: usize = 2000;
 /// How often the attention scan recomputes which panes need the human
 /// (idle-with-prompt detection; report/gate signals are event-driven and
 /// picked up on the next tick).
@@ -2466,11 +2481,44 @@ fn auto_compact_banner_substrings(cli: &str) -> &'static [&'static str] {
 /// every mid-session human directive gone, because loomux never learned a
 /// compact had happened at all, so the mandatory post-compact re-injection
 /// (#328) never fired. Pure so the substring match is testable without a
-/// registry; the caller (`compact_nudge_tick`) applies the recency gate
-/// against the pane's own last-observed-growth timestamp, mirroring
-/// `human_typed_compact_detected`'s recency gate on human input.
+/// registry; the caller (`compact_nudge_tick`) additionally requires fresh
+/// growth on this exact tick (`!currently_quiet`) before trusting a match.
+///
+/// **Position-anchored, not a bare substring scan (rev review B1 fix).** The
+/// first version matched the substring ANYWHERE in the tail, which a `!
+/// currently_quiet` growth gate does not close: a busy pane that merely
+/// PRINTS or DISCUSSES the banner text (a `gh pr diff` hunk, a grep result, a
+/// rust string literal in a code listing, the model streaming a sentence
+/// about this very feature — this repo's own source contains the string) IS
+/// the growth that satisfies the gate, so the mention and the trigger are the
+/// same event; a recency/growth check can never tell them apart. What CAN:
+/// the real spinner renders as the live status line — the very last thing on
+/// screen while it runs, continuously redrawn in place, with nothing after it
+/// until compaction finishes. A quoted mention sits in scrolled content with
+/// other lines following it in the same read (the diff continues, the file
+/// continues, the sentence has more sentences after it) almost always. So
+/// only the tail's LAST non-blank line is checked, never the full tail.
+///
+/// This is a real reduction in false-positive surface, not a perfect one:
+/// the residual, accepted risk is a mention that happens to be the exact
+/// last line of output at the instant this tick reads the pane (e.g. a
+/// streamed reply that ends its turn on a sentence naming the string, with
+/// nothing rendered yet after it). That case is not defended against here —
+/// doing so would need either a structural signal from the CLI itself (see
+/// `doc/design/orchestration.md`'s note on #397's `PreCompact` hook) or a
+/// second-tick confirmation before latching, which was judged not worth the
+/// added state for how narrow the remaining window is. If this assumption
+/// stops holding in practice, that added confirmation tick is the next move,
+/// not a broader substring match.
 pub fn auto_compact_banner_detected(cli: &str, tail: &str) -> bool {
-    auto_compact_banner_substrings(cli).iter().any(|s| tail.contains(s))
+    let subs = auto_compact_banner_substrings(cli);
+    if subs.is_empty() {
+        return false;
+    }
+    let Some(last_line) = tail.lines().rev().find(|l| !l.trim().is_empty()) else {
+        return false;
+    };
+    subs.iter().any(|s| last_line.contains(s))
 }
 
 /// Directive ledger (#329 expansion): the ledger section embedded verbatim in
@@ -2511,6 +2559,40 @@ pub fn directive_ledger_embed(ledger: &str, cap_bytes: usize, ledger_path: &str)
     } else {
         format!("Your directive ledger:\n{body}")
     })
+}
+
+/// Directive ledger (#329 review, N2): trim the STORED ledger file to
+/// `cap_bytes`, dropping the OLDEST entries (line boundary, never mid-entry)
+/// — the backstop for an agent that notes liberally and never curates via
+/// `replace: true`. Returns `(retained_content, dropped_entry_count)`;
+/// `dropped == 0` means `ledger` already fit and is returned unchanged (not
+/// re-serialized, so a no-op call never even rewrites the file). Unlike
+/// `directive_ledger_embed` (which keeps the tail for a one-off notice and
+/// leaves the file untouched), this one's output IS the new file — so unlike
+/// that function it never force-keeps an over-cap single entry: a ledger
+/// that's over cap after keeping only its newest line is left at just that
+/// line, however large, since there's nothing older left to drop and
+/// truncating an entry's own text is not this function's job.
+pub fn ledger_capped(ledger: &str, cap_bytes: usize) -> (String, usize) {
+    if ledger.len() <= cap_bytes {
+        return (ledger.to_string(), 0);
+    }
+    let lines: Vec<&str> = ledger.lines().collect();
+    let mut tail: Vec<&str> = Vec::new();
+    let mut used = 0usize;
+    for line in lines.iter().rev() {
+        let line_len = line.len() + 1;
+        if used + line_len > cap_bytes && !tail.is_empty() {
+            break;
+        }
+        used += line_len;
+        tail.push(line);
+    }
+    tail.reverse();
+    let dropped = lines.len() - tail.len();
+    let mut body = tail.join("\n");
+    body.push('\n');
+    (body, dropped)
 }
 
 /// The mandatory post-compact re-grounding prompt (#328, extended #329),
@@ -9086,9 +9168,30 @@ impl OrchRegistry {
     /// ever to the calling agent's own judgment on a later `replace`.
     ///
     /// Each append is stamped with `now_ms()` for a human skimming the file
-    /// directly (matching `audit.jsonl`'s `ts_ms` convention); `replace`
-    /// writes `text` verbatim; a replacement without a trailing newline gets
-    /// one added, so a later append can never land glued onto its last line.
+    /// directly (matching `audit.jsonl`'s `ts_ms` convention). Append-mode
+    /// `text` is sanitized with `notify::sanitize_gh_text` (rev review N1) —
+    /// the exact function `channel_send` already runs untrusted text through
+    /// — before it's written: strips control characters (so an embedded `\n`
+    /// can't split one call into several physical lines, which would break
+    /// `directive_ledger_embed`'s one-line-per-entry model) and neutralizes
+    /// `[`/`]` (so a line can never start with a forged `[loomux]` marker
+    /// once re-embedded verbatim in the post-compact notice). Low severity —
+    /// the ledger is self-authored and self-scoped, so an agent can only ever
+    /// spoof itself — but free to close the same way `channel_send` already
+    /// does. `replace` writes `text` verbatim, UNSANITIZED: it is the
+    /// curation path, expected to contain the agent's own prior (already-
+    /// sanitized) entries copied back in, not fresh untrusted input, and a
+    /// replacement without a trailing newline gets one added so a later
+    /// append can never land glued onto its last line.
+    ///
+    /// After either write, the STORED file is capped at
+    /// `DIRECTIVE_LEDGER_MAX_BYTES` (rev review N2) via `ledger_capped` —
+    /// oldest entries dropped first, never silently: a non-zero drop count is
+    /// audited (`ledger-trimmed`) and named in the response string, so a
+    /// human or the calling agent can see it happened. Curation via
+    /// `replace: true` is still the primary, deliberate mechanism; this is
+    /// only the backstop for a session that never uses it.
+    ///
     /// Audited like any other durable write (#240): the text itself is not
     /// duplicated into the audit log (the ledger file already holds it in
     /// full), only the fact and shape of the write.
@@ -9106,13 +9209,26 @@ impl OrchRegistry {
             }
             atomic_write(&path, body.as_bytes()).map_err(|e| e.to_string())?;
         } else {
-            append_ledger_line(&path, &format!("[{}] {text}", now_ms())).map_err(|e| e.to_string())?;
+            let sanitized = notify::sanitize_gh_text(text, DIRECTIVE_ENTRY_MAX_CHARS);
+            append_ledger_line(&path, &format!("[{}] {sanitized}", now_ms())).map_err(|e| e.to_string())?;
         }
         self.audit(&a.group, agent_id, "note-directive", json!({ "replace": replace, "bytes": text.len() }));
+
+        let mut cap_note = String::new();
+        if let Ok(current) = fs::read_to_string(&path) {
+            let (capped, dropped) = ledger_capped(&current, DIRECTIVE_LEDGER_MAX_BYTES);
+            if dropped > 0 {
+                atomic_write(&path, capped.as_bytes()).map_err(|e| e.to_string())?;
+                self.audit(&a.group, agent_id, "ledger-trimmed", json!({ "dropped": dropped }));
+                cap_note = format!(
+                    " ({dropped} older entries dropped — ledger exceeded {DIRECTIVE_LEDGER_MAX_BYTES} bytes; curate with replace to control this yourself)"
+                );
+            }
+        }
         Ok(if replace {
-            "ledger replaced".to_string()
+            format!("ledger replaced{cap_note}")
         } else {
-            "directive recorded".to_string()
+            format!("directive recorded{cap_note}")
         })
     }
 

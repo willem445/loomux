@@ -139,15 +139,18 @@ breaks main" into "CI is red." Three tests:
    (string search + bracket match, not a hand count) and diffs them against
    `command_manifest::APP_COMMANDS`. Fails if a command is registered in one
    list but not the other.
-2. **`app_commands_len_is_120`** — a drift tripwire against the count this
-   design and the #363 plan both cite.
-3. **`main_has_all_120_and_zero_permission_denies_dangerous_spread`** — the
+2. **`app_commands_len_is_126`** — a drift tripwire against the current count
+   (120 per the #363 plan's original audit, +1 for `orch_confirm_solo_
+   copilot_autopilot` in #364, +2 for `orch_set_advanced_orchestrator`/
+   `orch_workflow_status` added in #316, +3 for the pre-existing compact-nudge
+   setters wired into the manifest in #329's rebase).
+3. **`main_has_all_126_and_zero_permission_denies_dangerous_spread`** — the
    one that matters most. It builds a real (headless) `tauri::test` mock app
    — `tauri::test::mock_builder()` + `.build(tauri::generate_context!())` —
    using the app's **actual on-disk `capabilities/`/`permissions/`**, the
    same resolution `build.rs` feeds the shipped binary. This is not a
    reimplementation of ACL resolution; it exercises Tauri's real resolver.
-   It registers 120 stub commands sharing the real commands' bare names
+   It registers all 126 stub commands sharing the real commands' bare names
    (zero-arg no-ops — no PTYs, no git/gh calls, no orchestration side
    effects), invokes every one of them against the `main` window label and
    asserts none are denied, then invokes the plan's representative dangerous
@@ -184,7 +187,7 @@ non-main webview" case. It is a **partial** answer, deliberately:
   plugin/non-main webview can be confined to zero or a curated grant, and
   that confinement is genuinely enforced by Tauri's resolver — the hard
   prerequisite #360 Slice C needed.
-- **What it does not close:** `main` is still granted all 120 commands, and
+- **What it does not close:** `main` is still granted all 126 commands, and
   the app CSP (`tauri.conf.json`'s `app.security.csp`) is still `null`. A
   script injected *into main* — e.g. via the frontend's own XSS surface —
   still reaches every command exactly as before this change. And #189's core
