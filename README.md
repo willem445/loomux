@@ -204,6 +204,7 @@ src/
   filemenu.ts       pure context-menu model: what appears, what it acts on (target bound at menu-open) (DOM-free, unit-tested)
   contextmenu.ts    generic context-menu renderer, `MenuItem<A>`: placement, submenus, Esc/click-away (DOM wiring)
   panemenu.ts       pure pane-header connect-menu model (#271): Connect/directional-completion/Join-as-receiver/Cancel/Disconnect/Make-sender per pane + pending-arm state, standalone panes included (DOM-free, unit-tested)
+  pasteflow.ts      pure terminal copy/paste gesture decisions (#370): Ctrl+V/Ctrl+Shift+V key matching, right-click Copy/Paste menu shape (DOM-free, unit-tested)
   channel.ts        pure connect-gesture reducer (arm/complete/cancel/set-sender) + per-channel color/number/direction chip derivation (#271) (DOM-free, unit-tested)
   filehashmodel.ts  pure hashing policy: auto-hash threshold, digest cache keying (path+size+mtime), formatting (DOM-free, unit-tested)
   filemgr.ts        typed bridge to filemgr.rs + filehash.rs (per-feature wrapper, like fileapi.ts)

@@ -1,6 +1,6 @@
 # Design: reliable copy & paste
 
-Status: implemented (issue #65).
+Status: implemented (issue #65, extended by #370).
 
 ## Problem
 
@@ -104,3 +104,50 @@ spawn.
 The interactive halves (does the OS clipboard actually change; does a real
 paste into a bracketed-paste CLI land) are covered by the manual repro matrix
 in the PR.
+
+## #370: paste was Ctrl+Shift+V-only, and read failures were swallowed
+
+Two follow-on symptoms, both in the terminal's keydown handler (not the OSC 52
+path above, which was already sound):
+
+- **Plain `Ctrl+V` did nothing.** The handler matched only
+  `ctrlKey && shiftKey && KeyV` (Windows Terminal convention — plain `Ctrl+V`
+  is traditionally a shell's readline "quoted insert next char"). Muscle
+  memory reaches for plain `Ctrl+V` first; getting silence read as "paste is
+  broken here."
+- **A blocked clipboard read was silent.**
+  `navigator.clipboard.readText().then(...).catch(() => {})` — a rejected read
+  (focus loss, permission, non-secure context) looked identical to a keypress
+  that did nothing. The copy side already had a toast for this (#65); paste
+  didn't.
+
+### Fix
+
+`src/pasteflow.ts` (DOM-free, unit tested) decides the gestures: `isPasteKey`
+now matches plain `Ctrl+V` **and** `Ctrl+Shift+V` (quoted-insert is a readline
+corner few users ever reach for; every other terminal emulator in this app's
+target audience already binds plain `Ctrl+V`). `isCopyKey` is unchanged —
+`Ctrl+Shift+C` only, since plain `Ctrl+C` must stay SIGINT.
+
+`src/clipboard.ts` gained `readClipboard()`, the paste-side mirror of
+`writeClipboard`: async Clipboard API first, a hidden-`textarea` +
+`execCommand("paste")` fallback second, and an explicit `{ok: false}` only
+when *both* fail — never swallowed. `pane.ts`'s `pasteFromClipboard()` surfaces
+that with the same toast convention `copyToClipboard` already uses. An empty
+clipboard (`ok: true, text: ""`) is not a failure — it's a legitimate no-op.
+
+**Right-click paste**, which no other pane kind needed (a native `<textarea>`/
+`<input>` gets it from the browser for free) but the terminal — a canvas — did
+not: `pasteflow.ts`'s `buildTerminalMenu(hasSelection)` builds a small Copy/
+Paste menu, rendered through the existing generic `contextmenu.ts` (the same
+renderer panemenu.ts and filemenu.ts use). Copy is shown-but-disabled without
+a selection, the same "teach, don't hide" convention filemenu.ts uses for an
+inapplicable item.
+
+### Testing
+
+- `test/pasteflow.test.ts` — key matching (`Ctrl+V` and `Ctrl+Shift+V` both
+  paste, `Ctrl+C` alone never copies) and the menu shape (Copy disabled
+  without a selection, Paste always live).
+- DOM wiring (the keydown handler, the right-click menu, the toast) is hand-
+  validated — see the PR body for the manual steps.

@@ -26,7 +26,9 @@ import {
 import { voiceController, type VoiceTargetPane, type VoicePhase } from "./voicecontrol";
 import { pathTail, type ShellKind } from "./panesetup";
 import { invoke } from "@tauri-apps/api/core";
-import { parseOsc52, writeClipboard } from "./clipboard";
+import { parseOsc52, writeClipboard, readClipboard } from "./clipboard";
+import { isPasteKey, isCopyKey, buildTerminalMenu } from "./pasteflow";
+import { showContextMenu } from "./contextmenu";
 import {
   checkAttachment,
   attachRejectMessage,
@@ -752,23 +754,40 @@ export class Pane implements VoiceTargetPane {
     });
 
     // Let app-level shortcuts pass through xterm untouched; handle
-    // clipboard combos here (Windows Terminal conventions).
+    // clipboard combos here (Windows Terminal conventions — Ctrl+Shift+C/V —
+    // plus plain Ctrl+V, #370: most users reach for that first, and a shell's
+    // "quoted insert" use of it is a readline corner few ever touch).
     this.term.attachCustomKeyEventHandler((e) => {
       if (e.type !== "keydown") return true;
       if (isAppShortcut(e)) return false;
-      if (e.ctrlKey && e.shiftKey && e.code === "KeyC") {
+      if (isCopyKey(e)) {
         const sel = this.term.getSelection();
         if (sel) void this.copyToClipboard(sel);
         return false;
       }
-      if (e.ctrlKey && e.shiftKey && e.code === "KeyV") {
-        navigator.clipboard
-          .readText()
-          .then((t) => t && this.term.paste(t))
-          .catch(() => {});
+      if (isPasteKey(e)) {
+        void this.pasteFromClipboard();
         return false;
       }
       return true;
+    });
+
+    // Right-click copy/paste (#370): every other pane kind gets this for free
+    // from the browser's native textarea/input context menu; the terminal is
+    // a canvas, so it needs its own. Copy is offered-but-disabled without a
+    // selection rather than hidden, so the gesture teaches itself.
+    this.termEl.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const sel = this.term.getSelection();
+      const items = buildTerminalMenu(!!sel);
+      showContextMenu(e.clientX, e.clientY, items, (action) => {
+        if (action.kind === "copy") {
+          if (sel) void this.copyToClipboard(sel);
+        } else {
+          void this.pasteFromClipboard();
+        }
+      });
     });
 
     this.el.addEventListener("mousedown", () => {
@@ -2319,6 +2338,20 @@ export class Pane implements VoiceTargetPane {
   private async copyToClipboard(text: string): Promise<void> {
     const ok = await writeClipboard(text);
     if (!ok) showToast("Copy failed — click the pane and try again.");
+  }
+
+  /** Paste the system clipboard into the terminal (#370): Ctrl+V, Ctrl+Shift+V,
+   *  and the right-click menu all route here. Never fails silently — a genuine
+   *  read failure (readClipboard exhausts its own fallback) surfaces a toast
+   *  instead of the prior `.catch(() => {})`, which looked identical to a
+   *  keypress that simply did nothing. An empty clipboard is not a failure. */
+  private async pasteFromClipboard(): Promise<void> {
+    const res = await readClipboard();
+    if (!res.ok) {
+      showToast("Paste failed — clipboard access is blocked. Click the pane and try again.");
+      return;
+    }
+    if (res.text) this.term.paste(res.text);
   }
 
   /** Build the loomux steering strip and dock it under the terminal (#43,
