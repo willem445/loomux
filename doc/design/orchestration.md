@@ -1526,6 +1526,80 @@ survives it even when nothing warned anyone first.
   running), so the two are complementary rather than one blocking the other; #397 stays
   scoped to its own issue rather than folded in here.
 
+### Production incident: the reinjection loop, and why busy-then-quiet was never enough
+
+Live production evidence (a user demo, testbed group `loomux-testbed-cc077f09`) showed the
+mandatory reinjection firing on a REPEATING LOOP — the exact opposite of what compact-nudge
+exists to prevent, since every cycle only grows context instead of compacting it.
+
+**Reconstruction from `audit.jsonl` + `breadcrumbs.log`.** The human asked the orchestrator to
+test self-compaction (call `request_compact`, prove a directive survives via the ledger). Audit
+shows `request_compact` called, then — 4m33s later, with **no `compact-nudge` audit entry at
+all** (the heuristic/requested path never got a chance to paste `/compact`) — a `compact-
+reinjection` fires, followed by two more at ~2-minute intervals. `breadcrumbs.log`'s `delivery`
+lines confirm each reinjection was typed/confirmed successfully, and confirm `PtyManager::
+write_bytes` (what `deliver_prompt` uses) never touches `user_input_ms` — ruling out a
+theory that loomux's own paste was refreshing the manual-detection recency gate. The absence of
+any `compact-nudge` audit line means some OTHER detector armed `compact_pending` before the
+heuristic/requested check ever ran in that tick — and the repeating ~2-minute cadence (one
+response cycle per reinjection, with no dependency on the *original* human input's age) points
+at `auto_compact_banner_detected`: this is the loomux repo itself (dogfooding), the orchestrator
+was explicitly asked to discuss the compact-nudge feature it was testing, and both `mod.rs` and
+this very design doc contain the literal string `Compacting conversation` — exactly the mention
+the B1 fix's own documented residual risk describes (a mention that happens to land as a tick's
+last rendered line).
+
+**Why `!currently_quiet` (the B1 fix) didn't close this.** B1 closed the *stale-tail*
+false-positive (a banner sitting in unchanged scrollback). It does nothing for a detector that
+re-satisfies on **fresh, repeating** content — an agent that discusses the feature every
+response cycle produces NEW growth, NEW last-line matches, every time. Busy-then-quiet was
+never actually evidence a compaction ran; it was a proxy that happened to hold as long as the
+four trigger paths were themselves reliable. This incident proved at least one of them isn't.
+
+**The fix (D2 + D3): require confirmed evidence, and make resolution unconditionally one-shot.**
+
+- `compaction_confirmed(baseline, current)` — a new pure function — requires the agent's
+  context-token reading (`usage::latest_context_tokens`) to have dropped to at most 70% of the
+  baseline captured the moment `compact_pending` was set, for ANY of the four trigger paths.
+  Context tokens only grow across ordinary turns until a real compaction resets them, so this is
+  a strong, cheap-to-check signal — and it **fails closed**: no baseline, no current reading, or
+  no real drop all resolve to "not confirmed," never a guess. A missed reinjection is a missed
+  convenience; an unconfirmed one delivered anyway is the production incident.
+- The busy-then-quiet resolver in `compact_nudge_tick` now calls `compaction_confirmed` before
+  delivering reinjection, and **always** clears `compact_pending` / `compact_seen_busy` / the new
+  baseline field regardless of the outcome — confirmed or discarded, one resolution attempt per
+  arming. This is what makes the state machine structurally loop-proof: a detector that
+  re-satisfies every cycle can re-arm as many times as it wants, but each arming resolves to at
+  most one discarded, context-growth-free no-op. A repeating false positive becomes a repeating
+  silent discard (audited as `compact-pending-discarded` for visibility — this exact gap, no
+  record of which detector armed `compact_pending` or that a resolution had been discarded rather
+  than genuinely completed, is why this incident took real forensic work to root-cause), never a
+  repeating reinjection.
+- `agent_context_tokens` — a new impure reader — supplies the raw token count for EVERY Running
+  Claude-CLI agent with a resolvable session, not gated on the group's escalation threshold like
+  the older `agent_context_percents` (which exists purely for the opportunistic escalation
+  notice and can afford to skip the transcript read where nobody asked for it). The confirmation
+  signal has to hold for every agent that could ever enter `compact_pending`, not only ones
+  additionally opted into escalation — accepted cost: an escalation-enabled group's agents get
+  the transcript read twice per tick (once per function) rather than restructuring the older,
+  well-tested escalation path to share one read.
+
+**What was considered and NOT built: D1, synchronous paste confirmation.** The review's initial
+framing asked whether `deliver_prompt`'s result should gate `compact_pending`, since the
+heuristic/requested path sets it *before* attempting the `/compact` paste. Investigating showed
+this isn't the fix it first appears to be: `deliver_prompt` is fire-and-forget by design — it
+spawns a background thread to type/confirm and returns as soon as that thread is spawned, so its
+`Result` reflects whether the pty/app handle existed, never whether the paste actually landed
+(the real failure mode named in the review — a hold due to unsubmitted human input, silently
+aborted — happens entirely on that background thread, after this function has already returned).
+Gating `compact_pending` on that `Result` was tried and reverted: it also broke the test suite's
+existing, deliberate decoupling of the *fire decision* from delivery infrastructure (unit tests
+exercise `compact_nudge_tick` with no real pty/app handle at all, so `deliver_prompt` always
+errors synchronously in that environment — by design, not a gap to close). D2/D3 already cover
+the practical risk D1 was aimed at: whatever the reason a real compaction didn't happen — a
+silently held paste, a dead agent, or (this incident) a detector that was simply wrong — no
+context-token drop means no reinjection, unconditionally.
+
 ## Enforced merge gate (#83)
 
 Template guidance is not a security boundary. A live incident proved it: an orchestrator merged

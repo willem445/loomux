@@ -2364,6 +2364,46 @@ pub fn context_percent_used(context_tokens: u64, window_tokens: u64) -> u32 {
     ((context_tokens.min(window_tokens) * 100) / window_tokens) as u32
 }
 
+/// Production bug fix (PR #329 delta review): how much the context-token
+/// reading must drop, relative to the baseline captured when `compact_
+/// pending` was set, to count as `100`-scaled ratio evidence a REAL
+/// compaction happened. Context tokens only grow across ordinary turns (each
+/// turn's context recap includes everything before it) until a compaction
+/// resets it, so ANY drop below the baseline is already meaningful — but a
+/// generous margin (require the reading to fall to at most 70% of the
+/// baseline) tolerates cache-boundary noise in the raw number without being
+/// so loose that ordinary turn-to-turn fluctuation could pass for it; a real
+/// compact's actual reduction is typically far more dramatic than this
+/// (summarization commonly cuts what's sent to the model by 80-95%+).
+const COMPACTION_CONFIRMED_MAX_RATIO_PERCENT: u64 = 70;
+
+/// Production bug fix (PR #329 delta review — B2/D2): whether the observed
+/// token reading is convincing evidence a compaction actually ran, comparing
+/// `current` against the `baseline` captured the moment `compact_pending`
+/// was set (see `AgentEntry.compact_pending_baseline_tokens`).
+///
+/// **Why this exists.** A live production incident showed the prior design
+/// — treat ANY busy-then-quiet cycle while `compact_pending` as proof
+/// compaction ran — is not evidence, only a proxy that can be satisfied by an
+/// agent's ORDINARY turn: an orchestrator asked to discuss the compact-nudge
+/// feature produced output whose growth (busy) then silence (quiet)
+/// repeatedly matched the completion detector with no compaction ever
+/// running, delivering the mandatory re-injection on a loop that only grew
+/// context every cycle — the opposite of what the feature exists to prevent.
+///
+/// **Fails CLOSED, not open**: `None` for either reading (no baseline was
+/// captured, or no current reading is available) returns `false` — no
+/// evidence means no reinjection, never a guess. A missed reinjection is a
+/// missed convenience; a reinjection loop that only grows context is a
+/// production incident (the exact one this function exists to prevent). Pure
+/// so the ratio math is testable without a registry or a transcript file.
+pub fn compaction_confirmed(baseline: Option<u64>, current: Option<u64>) -> bool {
+    match (baseline, current) {
+        (Some(b), Some(c)) if b > 0 => c.saturating_mul(100) <= b.saturating_mul(COMPACTION_CONFIRMED_MAX_RATIO_PERCENT),
+        _ => false,
+    }
+}
+
 /// Compact-nudge (#328): whether context usage has crossed the group's
 /// escalation threshold and escalation hasn't already been latched for this
 /// window. `threshold_percent` 0 disables escalation entirely (purely
@@ -3416,6 +3456,21 @@ pub struct AgentEntry {
     /// finished" without parsing Claude's own completion text. Reset when the
     /// re-injection fires (or `compact_pending` clears).
     pub compact_seen_busy: bool,
+    /// Production bug fix (PR #329 delta review): the agent's context-token
+    /// reading (`usage::latest_context_tokens`, via `agent_context_tokens`)
+    /// captured the moment `compact_pending` most recently became `true`,
+    /// whichever of the four trigger paths set it. `None` when no reading was
+    /// available at that moment (no session yet). Live production evidence
+    /// showed busy-then-quiet ALONE is not proof a compaction ran — an
+    /// orchestrator asked to explain/discuss the compact-nudge feature itself
+    /// produced output whose growth-then-quiet cycle repeatedly satisfied the
+    /// detector with no real compaction ever happening, delivering the
+    /// reinjection notice on a loop that only grew context. This baseline
+    /// lets the resolver REQUIRE the token count to have actually dropped
+    /// before trusting that a real compaction occurred; see
+    /// `compaction_confirmed`. Always cleared the instant a pending state
+    /// resolves (confirmed or not) — never carried across trigger cycles.
+    pub compact_pending_baseline_tokens: Option<u64>,
     /// Compact-nudge (#328): Unix-ms this agent's `set_state` call was last
     /// observed (0 = never). Self-scoped, stamped by the `set_state` MCP
     /// handler on the CALLING agent's own entry — meaningful only for the
@@ -8334,6 +8389,7 @@ impl OrchRegistry {
             compact_requested: false,
             compact_pending: false,
             compact_seen_busy: false,
+            compact_pending_baseline_tokens: None,
             last_state_write_ms: 0,
             compact_escalation_notified: false,
             solo_cli: Some(cli.to_string()),
@@ -8450,6 +8506,7 @@ impl OrchRegistry {
             compact_requested: false,
             compact_pending: false,
             compact_seen_busy: false,
+            compact_pending_baseline_tokens: None,
             last_state_write_ms: 0,
             compact_escalation_notified: false,
             solo_cli: None, // unknown for an adopted pane; cli_for_agent falls back to "claude"
@@ -8769,6 +8826,7 @@ impl OrchRegistry {
         outputs: &HashMap<String, u64>,
         manual_signals: &HashMap<String, (String, u64)>,
         context_percents: &HashMap<String, u32>,
+        context_tokens: &HashMap<String, u64>,
     ) -> Vec<String> {
         let paused = self.paused.lock_safe().clone();
         // Snapshot per-group guardrails (Clone) rather than per-agent CLI
@@ -8785,6 +8843,12 @@ impl OrchRegistry {
         let mut to_fire: Vec<(String, String)> = Vec::new();
         let mut to_reinject: Vec<(String, String, PathBuf, PathBuf)> = Vec::new();
         let mut to_escalate: Vec<(String, String, u32)> = Vec::new();
+        // Production bug fix (D2/D3): a resolved-but-unconfirmed pending
+        // state — audited for visibility (this exact gap in observability is
+        // why the live incident took real forensic work to root-cause: no
+        // record existed of WHICH detector armed `compact_pending`, or that
+        // it had been discarded rather than genuinely resolved).
+        let mut to_discard: Vec<(String, String)> = Vec::new();
         {
             let mut agents = self.agents.lock_safe();
             for a in agents.values_mut() {
@@ -8818,16 +8882,44 @@ impl OrchRegistry {
                 // Compaction-completion: busy (compaction ran/rendered) then
                 // quiet again while pending — resolve regardless of pause
                 // state (a pause must not strand a pane mid-compact forever).
+                //
+                // Production bug fix (D2/D3, PR #329 delta review): busy-
+                // then-quiet is necessary but not SUFFICIENT — a live
+                // incident showed it can be satisfied by an agent's ordinary
+                // turn, with no compaction ever running. `compaction_
+                // confirmed` requires the context-token reading to have
+                // actually dropped since the baseline captured when `compact_
+                // pending` was set (whichever of the four paths set it)
+                // before the mandatory re-injection is trusted to fire.
+                // `compact_pending`/`compact_seen_busy`/the baseline are
+                // ALWAYS cleared here regardless of the outcome — one
+                // resolution attempt per arming, confirmed or not, so a
+                // repeatedly-false-positiving detector can re-arm the state
+                // machine as many times as it wants but can never cause more
+                // than one discarded, context-growth-free no-op per arming:
+                // structurally, a reinjection LOOP (the production incident)
+                // is no longer reachable, only (at worst) a repeatedly
+                // discarded false arm, which is silent to the agent and
+                // costs nothing but a breadcrumb.
                 if a.compact_pending && currently_quiet && a.compact_seen_busy {
+                    let confirmed = compaction_confirmed(
+                        a.compact_pending_baseline_tokens,
+                        context_tokens.get(&a.id).copied(),
+                    );
                     a.compact_pending = false;
                     a.compact_seen_busy = false;
-                    let instructions = self.group_dir(&a.group).join(
-                        g.block(&a.block)
-                            .map(|b| b.instructions_file())
-                            .unwrap_or_else(|| a.role.instructions_file().to_string()),
-                    );
-                    let ledger = self.ledger_path(&a.group, &a.id);
-                    to_reinject.push((a.id.clone(), a.group.clone(), instructions, ledger));
+                    a.compact_pending_baseline_tokens = None;
+                    if confirmed {
+                        let instructions = self.group_dir(&a.group).join(
+                            g.block(&a.block)
+                                .map(|b| b.instructions_file())
+                                .unwrap_or_else(|| a.role.instructions_file().to_string()),
+                        );
+                        let ledger = self.ledger_path(&a.group, &a.id);
+                        to_reinject.push((a.id.clone(), a.group.clone(), instructions, ledger));
+                    } else {
+                        to_discard.push((a.id.clone(), a.group.clone()));
+                    }
                 }
 
                 // A paused group's agents are deliberately quiet; never nudge,
@@ -8848,6 +8940,7 @@ impl OrchRegistry {
                         {
                             a.compact_pending = true;
                             a.compact_seen_busy = false;
+                            a.compact_pending_baseline_tokens = context_tokens.get(&a.id).copied();
                         }
                     }
                 }
@@ -8881,6 +8974,7 @@ impl OrchRegistry {
                         if auto_compact_banner_detected(g.cli_for(a.role), tail) {
                             a.compact_pending = true;
                             a.compact_seen_busy = true;
+                            a.compact_pending_baseline_tokens = context_tokens.get(&a.id).copied();
                         }
                     }
                 }
@@ -8962,6 +9056,7 @@ impl OrchRegistry {
                     a.compact_requested = false;
                     a.compact_pending = true;
                     a.compact_seen_busy = false;
+                    a.compact_pending_baseline_tokens = context_tokens.get(&a.id).copied();
                     to_fire.push((a.id.clone(), a.group.clone()));
                 }
             }
@@ -8978,6 +9073,9 @@ impl OrchRegistry {
             self.audit(&group, "loomux", "compact-nudge", json!({ "agent": id }));
             let _ = self.deliver_prompt(&id, "/compact", "loomux", Delivery::MidSession);
             nudged.push(id);
+        }
+        for (id, group) in to_discard {
+            self.audit(&group, "loomux", "compact-pending-discarded", json!({ "agent": id }));
         }
         for (id, group, percent) in to_escalate {
             self.audit(&group, "loomux", "compact-escalation", json!({ "agent": id, "percent": percent }));
@@ -9072,6 +9170,49 @@ impl OrchRegistry {
             .collect()
     }
 
+    /// Production bug fix (PR #329 delta review): raw context-token reading
+    /// per Running Claude-CLI agent with a resolvable session id — EVERY one,
+    /// not gated on the group's escalation threshold like `agent_context_
+    /// percents` (which exists purely for the opportunistic escalation
+    /// notice and skips the transcript read for groups that don't use it).
+    /// This reading is now load-bearing for CORRECTNESS, not just an
+    /// opportunistic notice: `compact_nudge_tick`'s busy-then-quiet resolver
+    /// needs a context-token baseline/current pair for every agent that
+    /// could ever enter `compact_pending`, regardless of whether that
+    /// agent's group happens to have escalation configured — the safety
+    /// property (`compaction_confirmed`) has to hold everywhere the feature
+    /// is used, not only where a human also opted into the separate
+    /// escalation notice. Accepts the resulting double transcript-read for
+    /// an escalation-enabled group's agents (once here, once in `agent_
+    /// context_percents`) as the honest cost of keeping this a small, low-
+    /// risk addition rather than restructuring the older, well-tested
+    /// escalation path. Impure (disk read); split from the decision so
+    /// `compaction_confirmed` stays synthetic-input testable.
+    fn agent_context_tokens(&self) -> HashMap<String, u64> {
+        let candidates: Vec<(String, String)> = self
+            .agents
+            .lock_safe()
+            .values()
+            .filter(|a| a.status == AgentStatus::Running)
+            .filter_map(|a| Some((a.id.clone(), a.session_id.clone()?)))
+            .collect();
+        if candidates.is_empty() {
+            return HashMap::new();
+        }
+        let Some(root) = self
+            .claude_projects_dir
+            .lock_safe()
+            .clone()
+            .or_else(crate::usage::default_claude_projects_root)
+        else {
+            return HashMap::new();
+        };
+        candidates
+            .into_iter()
+            .filter_map(|(id, sid)| Some((id, crate::usage::claude_context_tokens_in(&root, &sid)?)))
+            .collect()
+    }
+
     /// One full compact-nudge cycle: read pty counters, then tick. Called on a
     /// timer by `start_compact_nudge`; `now` injected so tests drive it
     /// deterministically.
@@ -9079,7 +9220,8 @@ impl OrchRegistry {
         let outputs = self.agent_output_totals();
         let manual_signals = self.agent_compact_signals();
         let context_percents = self.agent_context_percents();
-        self.compact_nudge_tick(now, &outputs, &manual_signals, &context_percents)
+        let context_tokens = self.agent_context_tokens();
+        self.compact_nudge_tick(now, &outputs, &manual_signals, &context_percents, &context_tokens)
     }
 
     /// Compact-nudge (#328): self-scoped agent request. Sets `compact_
@@ -13061,6 +13203,7 @@ impl OrchRegistry {
             compact_requested: false,
             compact_pending: false,
             compact_seen_busy: false,
+            compact_pending_baseline_tokens: None,
             last_state_write_ms: 0,
             compact_escalation_notified: false,
             solo_cli: None,
@@ -15007,6 +15150,7 @@ fn register_orchestrator_pane(
         compact_requested: false,
         compact_pending: false,
         compact_seen_busy: false,
+        compact_pending_baseline_tokens: None,
         last_state_write_ms: 0,
         compact_escalation_notified: false,
         solo_cli: None,

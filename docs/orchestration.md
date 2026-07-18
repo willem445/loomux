@@ -435,7 +435,9 @@ auto-compact banner in the pane and treats it the same as any other compact: whi
 one gets triggered — the timed nudge, a direct request, the threshold fallback, a human
 typing `/compact` by hand, or the CLI's own emergency auto-compact — once it's done, loomux
 re-grounds the pane in its full role instructions (not just a pointer to go re-read them)
-and prompts it to re-sync live state.
+and prompts it to re-sync live state. Before doing so, loomux checks that context actually
+shrank (a real signal a compaction ran, not just an ordinary quiet moment) — if it can't
+confirm that, it skips the re-grounding rather than risk delivering it on a loop.
 
 **Directive ledger.** Any agent can call `note_directive(text)` to jot down a one-line diary
 entry — a human directive, a scope decision, a piece of feedback — the moment it receives
