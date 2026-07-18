@@ -4738,3 +4738,53 @@ fn a_resumed_group_runs_the_intake_profile_it_was_launched_with_not_the_file_as_
         "the resumed group must keep the profile its human approved, not the file as it is now"
     );
 }
+
+#[test]
+fn intake_only_drift_is_audited_even_when_the_roster_is_unchanged() {
+    // rev-26 NB2. `audit_workflow_drift` used to compare only `g.blocks` — a
+    // repo that renamed its label vocabulary WITHOUT touching a single block
+    // produced no `workflow-changed-since-launch` audit, even though a
+    // roster change under identical circumstances would. Intake drifts
+    // independently, and the human-visible drift notice must say so.
+    let (reg, _d) = test_registry();
+    let yaml = "version: 1\nblocks:\n  - id: worker\n    kind: worker\n\
+                intake:\n  labels:\n    ready: launch-time-label\n";
+    let repo = Repo::new().workflow(yaml);
+    let launched = reg.create_group(&repo.path(), rails()).unwrap();
+    assert_eq!(launched.guardrails.intake.ready, "launch-time-label");
+    let launched_block_ids: Vec<&str> =
+        launched.guardrails.blocks.iter().map(|b| b.id.as_str()).collect();
+
+    // The repo edits ONLY the intake vocabulary — the roster is untouched.
+    fs::write(
+        Path::new(&repo.path()).join(".loomux").join("workflow.yml"),
+        "version: 1\nblocks:\n  - id: worker\n    kind: worker\n\
+         intake:\n  labels:\n    ready: post-launch-label\n",
+    )
+    .unwrap();
+
+    let (repo_path, persisted) = reg.load_group_file(&launched.id).expect("group.json");
+    let resumed =
+        reg.create_group_ex(&repo_path, persisted, Launch::Resume).expect("a resume must not fail");
+
+    // The roster itself did not move...
+    let resumed_block_ids: Vec<&str> =
+        resumed.guardrails.blocks.iter().map(|b| b.id.as_str()).collect();
+    assert_eq!(resumed_block_ids, launched_block_ids, "the roster is unchanged");
+
+    // ...but the intake-only edit must still be audited as drift — a
+    // blocks-only comparison would have stayed silent here, which is exactly
+    // the gap this test exists to close.
+    let drift: Value = audit_entries(&reg, &launched.id)
+        .into_iter()
+        .find(|v| v["action"] == "workflow-changed-since-launch")
+        .expect("an intake-only edit must be audited even though the roster didn't move");
+    assert_eq!(
+        drift["detail"]["intake_running"]["labels"]["ready"], "launch-time-label",
+        "the audit must say what's RUNNING"
+    );
+    assert_eq!(
+        drift["detail"]["intake_on_disk"]["labels"]["ready"], "post-launch-label",
+        "...and what the file now says"
+    );
+}
