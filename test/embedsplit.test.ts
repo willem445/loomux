@@ -10,6 +10,19 @@ import {
   EMBED_MIN_TERM_PX,
   EMBED_MIN_PANEL_PX,
 } from "../src/embedsplit.ts";
+import { TERM_RESERVE_H, OVERLAY_MIN_H } from "../src/overlaysize.ts";
+
+// embedsplit.ts deliberately duplicates these two numbers rather than
+// importing them (see the file's own top-of-file comment: tsc rejects a
+// `.ts` import extension, node --test can't resolve a bare one — no single
+// spelling satisfies both runners for an intra-src import). A test file is
+// under neither constraint (excluded from tsc's project; node --test
+// resolves `.ts`-suffixed specifiers directly), so THIS is where the two
+// copies are pinned equal — the guard the duplication itself can't provide.
+test("the duplicated floors stay equal to overlaysize.ts's originals (drift guard)", () => {
+  assert.equal(EMBED_MIN_TERM_PX, TERM_RESERVE_H, "terminal floor must mirror TERM_RESERVE_H");
+  assert.equal(EMBED_MIN_PANEL_PX, OVERLAY_MIN_H, "panel floor must mirror OVERLAY_MIN_H");
+});
 
 test("clampEmbedFrac holds a normal fraction unchanged", () => {
   assert.equal(clampEmbedFrac(0.4), 0.4);

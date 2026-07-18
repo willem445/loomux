@@ -62,6 +62,7 @@ import {
   agentResumeCommand,
   agentFreshCommand,
   shouldRespawnFresh,
+  findResumedPaneIndex,
   type RestoreAction,
   type SessionResumable,
 } from "./panerestore";
@@ -760,15 +761,20 @@ async function resumeDormantGroup(ws: Workspace): Promise<void> {
     }
     // resumeOrchSession only returns the group id — "the pane itself is located
     // later by scanning live panes" (orchestration.ts) — so this does the same,
-    // matching on the session id we just asked it to resume. MUST exclude
-    // dormant panes: the tab's own dormant ORCH placeholder for this same
-    // member carries the identical captured session id (that's the whole
-    // point of dormantRecord) and is still in the tree at this point — an
-    // unfiltered scan would find that stale placeholder first, silently
-    // no-op the embed restore (a dormant pane has no orchGroup), and never
-    // reach the pane that actually needs it.
-    const findResumedPane = (sessionId: string): Pane | undefined =>
-      ws.grid.allPanes().find((p) => !p.isDormant && p.capture()?.sessionId === sessionId);
+    // matching on the session id we just asked it to resume. The dormant-
+    // exclusion DECISION (a stale placeholder for this same member carries the
+    // identical captured session id and must never shadow the real match) is
+    // the pure, tested `findResumedPaneIndex` (panerestore.ts); only the live
+    // pane traversal itself is wiring, hand-validated like the rest of this
+    // function's grid access.
+    const findResumedPane = (sessionId: string): Pane | undefined => {
+      const panes = ws.grid.allPanes();
+      const idx = findResumedPaneIndex(
+        panes.map((p) => ({ isDormant: p.isDormant, sessionId: p.capture()?.sessionId ?? null })),
+        sessionId
+      );
+      return idx === -1 ? undefined : panes[idx];
+    };
     // Captured members with no resumable id (e.g. a copilot delegate — copilot
     // mints its own session id after boot, so there's nothing to --resume). They
     // can't be brought back, but they WERE live at close, so they're counted in the

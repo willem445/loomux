@@ -195,6 +195,20 @@ a plain `sessionId → value` map rather than folded into the resume plan
 itself (`planGroupResume`'s `GroupMember` intentionally stays
 `{sessionId, role}` — a scheduling/matching plan, not a preference bag).
 
+**Known gap: a respawn-fresh fallback loses the preference.** The match above
+is keyed on the CAPTURED session id — the one `resumeOrchSession` was asked
+to `--resume`. If that resume attempt fails at runtime (a deleted transcript,
+any other resume-time CLI failure) and `shouldRespawnFresh`
+(`panerestore.ts`) fires its one-shot fresh-in-place respawn, the pane ends
+up carrying a NEW session id that was never in `embedBySession`. The lookup
+then misses, `restoreTaskEmbed` is never called for that member, and its task
+board simply opens as the floating overlay next time — a silent fallback to
+the pre-#361 default, not a crash or a stuck state. Accepted for now: the
+member's *conversation* is already gone in this scenario (that is what
+triggered the respawn), so losing a UI layout preference alongside it is the
+smaller loss on the same bad path, and re-embedding after the fact is a
+single click.
+
 ## Manual validation (the human)
 
 The production app can't be launched from this session (#394) — these are
@@ -219,7 +233,14 @@ the steps for the human to run:
    close/reopen within the session).
 6. Quit and relaunch loomux with that group's tab still around: it should
    restore dormant (unchanged). Click **Resume**: the task board should
-   come back already embedded, at roughly the size it was left at.
+   come back already embedded, at roughly the size it was left at. Do this
+   on a group with at least one worker/reviewer pane open alongside the
+   orchestrator — the dormant-shadow exclusion `findResumedPaneIndex` guards
+   (a stale placeholder carrying the same captured session id as the pane
+   actually being resumed) is only unit-tested against synthetic candidates;
+   this is the one path that exercises it against the real grid/DOM, and
+   with more than one member in flight it's the scenario most likely to
+   surface an ordering assumption the synthetic test can't see.
 7. Confirm the floating overlay still works normally for git / issues /
    audit / group on the same pane, including while the task board is
    embedded — the two should coexist without fighting for space or

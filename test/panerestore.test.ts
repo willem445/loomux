@@ -11,6 +11,7 @@ import {
   agentFreshCommand,
   sessionIdFromCommand,
   shouldRespawnFresh,
+  findResumedPaneIndex,
   AUTO_RESUME_AGENTS,
   type RestoreAction,
   type RestoreOpenStep,
@@ -219,6 +220,36 @@ test("a captured task-embed preference (#361) rides the dormant placeholder", ()
     role: "orchestrator",
     taskEmbed: 0.4,
   });
+});
+
+// ---------- #361 whole-group resume: locating the resumed pane ----------
+
+test("findResumedPaneIndex matches a live pane by session id", () => {
+  const candidates = [
+    { isDormant: false, sessionId: "other" },
+    { isDormant: false, sessionId: "s1" },
+  ];
+  assert.equal(findResumedPaneIndex(candidates, "s1"), 1);
+});
+
+test("a dormant placeholder carrying the SAME session id never shadows the live match", () => {
+  // The exact bug this predicate exists to prevent: the tab's own dormant
+  // ORCH placeholder for this member is still in the tree when resume looks
+  // for it, and it carries the identical captured session id — that's the
+  // whole point of a captured record. Listed FIRST here on purpose: a naive
+  // `.find(p => p.sessionId === sessionId)` returns index 0 (the stale
+  // placeholder); only excluding dormant candidates reaches the live pane.
+  const candidates = [
+    { isDormant: true, sessionId: "s1" }, // the stale dormant placeholder
+    { isDormant: false, sessionId: "s1" }, // the freshly resumed live pane
+  ];
+  assert.equal(findResumedPaneIndex(candidates, "s1"), 1);
+});
+
+test("no live match at all (only a dormant one, or none) yields -1, not a false positive", () => {
+  assert.equal(findResumedPaneIndex([{ isDormant: true, sessionId: "s1" }], "s1"), -1);
+  assert.equal(findResumedPaneIndex([{ isDormant: false, sessionId: "other" }], "s1"), -1);
+  assert.equal(findResumedPaneIndex([], "s1"), -1);
 });
 
 test("AUTO_RESUME_AGENTS is the adopted default (the one-line all-dormant flip)", () => {

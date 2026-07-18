@@ -426,3 +426,36 @@ export function planLayoutRestore(
   expand(layout, 0);
   return steps;
 }
+
+// ---------- #361 whole-group resume: locating the resumed pane ----------
+
+/** Just enough of a live pane to decide whether it's the one a just-resumed
+ *  session id belongs to — a plain-data projection, not a live `Pane`, so the
+ *  decision below can be unit-tested without a DOM or a grid. */
+export interface ResumedPaneCandidate {
+  isDormant: boolean;
+  sessionId: string | null;
+}
+
+/** Pick which candidate a just-resumed session id actually belongs to, among
+ *  every pane currently in the tab (`main.ts`'s `resumeDormantGroup` maps
+ *  `ws.grid.allPanes()` to this shape and calls it, once `resumeOrchSession`
+ *  resolves — the pane itself isn't returned, only the group id, so it has to
+ *  be located by scanning afterward).
+ *
+ *  MUST exclude dormant candidates. The tab's own dormant ORCH placeholder
+ *  for this same member carries the IDENTICAL captured session id — that's
+ *  the whole point of a captured record (`planPaneRestore`'s `dormant-group`
+ *  case, above) — and it is still in the tree at the moment this runs (the
+ *  placeholder cleanup happens later, after every member has been resumed).
+ *  An unfiltered first-match would find that stale placeholder before the
+ *  real, freshly-resumed pane; returning `-1` in that case (rather than the
+ *  placeholder's index) is the one behavior this function exists to pin —
+ *  see `test/panerestore.test.ts`'s dormant-shadow case, which fails on a
+ *  version of this predicate that doesn't check `isDormant`. */
+export function findResumedPaneIndex(
+  candidates: readonly ResumedPaneCandidate[],
+  sessionId: string
+): number {
+  return candidates.findIndex((p) => !p.isDormant && p.sessionId === sessionId);
+}
