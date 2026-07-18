@@ -1957,6 +1957,16 @@ export class Pane implements VoiceTargetPane {
       this.embedDividerEl!.hidden = true;
       this.embedPanelEl!.hidden = true;
       this.termEl.style.flex = "";
+      // Return the view to its OWN overlay host (#361 rev-38 blocker): the
+      // shared embed panel must never retain a closed/evicted occupant's
+      // element. `openView`'s embedded branch below also self-enforces this
+      // with `replaceChildren` (belt and suspenders — the panel can never
+      // hold more than one child regardless of what called it), but parking
+      // the element back in its OWN overlay (rather than just detaching it)
+      // is what keeps it reachable and correctly `hidden` the next time
+      // THIS view opens as an overlay, exactly where a never-embedded view
+      // already lives between opens.
+      entry.overlayEl.insertBefore(entry.viewEl, entry.overlayEl.firstChild);
     } else {
       entry.overlayEl.hidden = true;
     }
@@ -1991,12 +2001,24 @@ export class Pane implements VoiceTargetPane {
     if (!entry) return;
     try {
       if (this.embedKind === kind) {
-        this.embedPanelEl!.appendChild(entry.viewEl);
+        // `replaceChildren`, not `appendChild` (#361 rev-38 blocker): the
+        // panel may only ever hold ONE occupant, and this makes that an
+        // invariant of the call itself rather than something every caller
+        // has to get right by first evicting whoever was there — even if a
+        // future code path forgot to, this can't leave two views stacked
+        // and both visible.
+        this.embedPanelEl!.replaceChildren(entry.viewEl);
         const grow = growFromFrac(this.embedFrac);
         this.termEl.style.flex = `${grow.growTerm} 1 0`;
         this.embedPanelEl!.style.flex = `${grow.growPanel} 1 0`;
         this.embedDividerEl!.hidden = false;
         this.embedPanelEl!.hidden = false;
+        // The share just applied may be stale (a restored preference
+        // captured under a smaller floor, or simply a floor that grew while
+        // closed) — reclamp against the CURRENT floor immediately, the same
+        // correction a content-driven floor growth applies while already
+        // open (#361 rev-38 NB3; see `reclampViewFloor`).
+        this.reclampViewFloor(kind);
       } else {
         this.closeOtherOverlays(kind);
         entry.overlayEl.insertBefore(entry.viewEl, entry.overlayEl.firstChild);
@@ -2012,6 +2034,7 @@ export class Pane implements VoiceTargetPane {
         this.embedDividerEl!.hidden = true;
         this.embedPanelEl!.hidden = true;
         this.termEl.style.flex = "";
+        entry.overlayEl.insertBefore(entry.viewEl, entry.overlayEl.firstChild);
       } else {
         entry.overlayEl.hidden = true;
       }
@@ -2174,6 +2197,11 @@ export class Pane implements VoiceTargetPane {
       overlayEl: this.groupOverlay,
       viewEl: this.groupView.el,
       show: () => this.groupView!.show(),
+      // Stops the poll timer `show()` starts (#361 rev-38 NB2) — without
+      // this, every close/eviction left it running, and swapping the embed
+      // slot turned what was a rare pre-existing leak into an easy one to
+      // hit on every reopen.
+      hide: () => this.groupView!.hide(),
       setPanelActive: (active) => this.groupView!.setPanelActive(active),
       floorPx: () => this.groupFloor(),
     });
