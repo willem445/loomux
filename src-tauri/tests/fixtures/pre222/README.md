@@ -126,6 +126,18 @@ so far:
   leaves Approve showing on work that is no longer ready. Pairs with the board itself now doing
   this automatically for the human's own **✎ Changes** action.
 
+- **#329 expansion, the directive ledger** — all four files. A new `note_directive(text,
+  replace?)` tool bullet, and a **Directive ledger** section (`orchestrator.md` folds it into
+  **Durability rules** instead, alongside the existing compact material): record a human
+  directive, scope decision, or piece of feedback via `note_directive` BEFORE acting on it —
+  a diary kept at receipt time, because the CLI's own emergency auto-compact gives no warning
+  turn to offload one first. Curate the ledger (`replace: true`) once a compact re-grounds an
+  agent in its own tail. `orchestrator.md`'s existing "Compact at lulls" text also gains one
+  sentence: loomux now recognizes the CLI's own emergency auto-compact when it happens (not
+  just the three loomux-initiated/human-typed paths #328 covered) and re-grounds the pane the
+  same way — but only durable state already offloaded comes back, which is what the ledger is
+  for.
+
 `the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was` renders
 **these** with the six pre-#222 template variables and asserts that a group launched
 with the advanced orchestrator **off** gets exactly that text. They are the

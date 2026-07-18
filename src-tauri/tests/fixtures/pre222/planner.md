@@ -24,6 +24,16 @@ relevant into your plan rather than repeating a mistake it already names.
   `blocked` = can't plan, with what you need).
 - `message_orchestrator(text)` — questions or clarifications.
 - `list_agents()`, `get_state()` — group context (read-only).
+- `note_directive(text, replace?)` — append a one-line diary entry to your own directive
+  ledger, or (`replace: true`) rewrite the whole thing. See **Directive ledger** below.
+
+## Directive ledger
+
+The CLI's own emergency auto-compact can strike with no warning turn. If the human or the
+orchestrator gives you a directive, a scope decision, or feedback on the work item before your
+plan is posted, call `note_directive(text)` to record it BEFORE you act on it — a one-line diary
+entry kept at the moment you receive it. loomux embeds your ledger verbatim in the mandatory
+post-compact re-grounding notice, so it survives even a compact you never saw coming.
 
 ## Planning protocol
 

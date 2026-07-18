@@ -32,9 +32,24 @@ skip anything in this file.
   **receiver**, `channel_send` is reply-only — it works once the sender has messaged you,
   and goes to the sender only, never another receiver. A peer may be **receive-only**
   (`channel_status` shows `can_send: false` for it) — it will never reply, by design.
+- `note_directive(text, replace?)` — append a one-line diary entry to your own directive
+  ledger, or (`replace: true`) rewrite the whole thing. See **Directive ledger** below.
 
 Report meaningfully but sparingly: on start (`progress`, one line restating the task),
 when blocked (what you need), and when done (PR URL + one-paragraph summary).
+
+## Directive ledger
+
+The CLI's own emergency auto-compact can strike with no warning turn — there is no moment to
+offload before it fires. Whenever the human (or the orchestrator) gives you a directive, a scope
+decision, or feedback, call `note_directive(text)` to record it BEFORE you act on it: a one-line
+diary entry kept at the moment you receive it, never reconstructed from memory afterward. loomux
+embeds your ledger verbatim in the mandatory post-compact re-grounding notice, so a directive
+survives even a compact you never saw coming.
+
+Once a compact re-grounds you and shows you your own ledger tail, curate it: call
+`note_directive(text, replace: true)` with that tail minus anything already done or no longer
+relevant, so it stays a living record instead of an ever-growing dump.
 
 ## Execute the plan step by step
 

@@ -106,6 +106,8 @@ memory of it — is the contract.
   **sender** (may send any time), everyone else is a **receiver** (may only reply once the
   sender messages them, and only to the sender). A peer may also be **receive-only**
   (`channel_status` shows `can_send: false`) — it will never reply, by design.
+- `note_directive(text, replace?)` — append a one-line diary entry to your own directive
+  ledger, or (`replace: true`) rewrite the whole thing. See **Durability rules**.
 
 Workers report back with `report(...)`; their reports and exit notices appear in your
 pane as `[loomux] ...` messages.
@@ -783,7 +785,24 @@ when the whole value is "the next orchestrator should just already know this."
   do not need to remember to do that part yourself. If you're ever notified your context is
   running high (`[loomux] context at NN% …`), that's loomux telling you it will request one on
   your behalf if you don't get to it first — better a planned compact than the CLI's own
-  emergency auto-compact mid-decision.
+  emergency auto-compact mid-decision. loomux also recognizes that emergency auto-compact itself
+  when it happens (there is no way to plan around one you never saw coming) and re-grounds you
+  the same way — but only the durable state you already offloaded comes back; a directive that
+  only ever lived in conversation does not, which is exactly what the directive ledger below is
+  for.
+- **Directive ledger.** The human's directives, scope decisions, and feedback are exactly the
+  kind of detail a compaction summary dilutes first — and the CLI's own emergency auto-compact
+  gives you no warning turn to offload one before it fires. So don't wait for a lull: the moment
+  the human (directly, or relayed through you to a delegate) gives you a directive, a scope
+  decision, or feedback, call `note_directive(text)` to record it BEFORE you act on it — a
+  one-line diary entry, kept at receipt time. loomux embeds your ledger verbatim in the mandatory
+  post-compact re-grounding notice (size-capped to the recent tail; it says so and points at the
+  full file if it had to cut anything), so a directive survives even a compact you never saw
+  coming. Once re-grounded and shown your own tail, curate: `note_directive(text, replace: true)`
+  with that tail minus anything already done or no longer relevant, so the ledger stays a living
+  record instead of an ever-growing dump. This is a diary for what the human told you, not a
+  replacement for the board or `set_state` — decisions with lasting consequence still belong
+  there too.
 
 ## Style
 
