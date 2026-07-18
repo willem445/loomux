@@ -5138,6 +5138,131 @@ fn a_higher_activity_floor_treats_bigger_growth_as_noise() {
         "a growth >= the floor (11 KB) is activity and re-arms the latch");
 }
 
+// ---------- idle-tick intake gate (#332): host-side, zero-token pre-check ----------
+
+/// An autonomous group with the intake gate ON: `intake_poll_minutes` nonzero (so
+/// `idle_tick_tick` consults `intake::idle_tick_gate` instead of firing
+/// unconditionally) and a caller-chosen `fallback_minutes`. Returns (reg, tempdir,
+/// group id, orchestrator id) — the same shape as `autonomous_setup`.
+fn autonomous_setup_with_gate(intake_poll_minutes: u32, fallback_minutes: u32) -> (OrchRegistry, tempfile::TempDir, String, String) {
+    let (reg, dir) = test_registry();
+    let g = reg
+        .create_group(
+            "C:/tmp/repo",
+            Guardrails { intake_poll_minutes, idle_tick_fallback_minutes: fallback_minutes, ..rails() },
+        )
+        .unwrap();
+    let o = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    reg.set_autonomous(&g.id, true).unwrap();
+    (reg, dir, g.id, o.id)
+}
+
+/// Whether `audit.jsonl` contains a line for `action` whose raw JSON also
+/// contains `needle` — a coarser version of `audit_count` that lets a test
+/// assert on the SHAPE of one entry (e.g. the skip reason, the intake summary
+/// folded into an `idle-tick` entry) without parsing full JSON.
+fn audit_line_contains(reg: &OrchRegistry, group: &str, action: &str, needle: &str) -> bool {
+    fs::read_to_string(reg.state_root().join(group).join("audit.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .any(|l| l.contains(&format!("\"{action}\"")) && l.contains(needle))
+}
+
+#[test]
+fn intake_gate_skips_a_quiet_tick_then_fires_once_a_signal_lands() {
+    // Gate ON, generous fallback (won't fire on its own inside this test).
+    let (reg, _d, gid, oid) = autonomous_setup_with_gate(5, 180);
+    let empty = HashMap::new();
+    // Establish a reference fire point so the fallback isn't trivially due against
+    // the unseeded (0) default — see `seed_idle_tick_last_fired`'s doc.
+    reg.seed_idle_tick_last_fired(&gid, FAR);
+
+    // Quiet window elapsed, nothing new, no other wake reason, fallback not due:
+    // the tick must be SKIPPED, not fired — and the skip is audited with a reason.
+    assert!(reg.idle_tick_tick(FAR + 15 * 60_000 + 1, &empty, &empty).is_empty(),
+        "nothing new + no other wake reason + fallback not due must SKIP, not fire");
+    assert_eq!(audit_count(&reg, &gid, "idle-tick"), 0, "a skip must never be counted as a fire");
+    assert!(audit_line_contains(&reg, &gid, "idle-tick-skipped", "fallback"),
+        "the skip must be audited with its reason, not silent");
+
+    // The host-side poller finds something: seed the pending summary a real
+    // `poll_intake` would have composed, then the NEXT quiet window must fire —
+    // and the notice must carry the summary (folded into the audited entry).
+    reg.seed_intake_pending(&gid, "issue #42 labeled agent-ready (\"Do the thing\")");
+    assert_eq!(reg.idle_tick_tick(FAR + 2 * (15 * 60_000 + 1), &empty, &empty), vec![oid.clone()],
+        "an intake signal must fire even though nothing else changed");
+    assert!(audit_line_contains(&reg, &gid, "idle-tick", "issue #42 labeled agent-ready"),
+        "the fired tick's audit entry must carry what the intake poll found");
+}
+
+#[test]
+fn intake_gate_fires_regardless_when_a_ci_watch_is_outstanding() {
+    // The lost-notification-degrades-to-poll-on-sweep invariant (orchestrator.md):
+    // an outstanding CI watch means the tick's fallback-sweep duty still has a job,
+    // even with zero label/PR news.
+    let (reg, _d, gid, oid) = autonomous_setup_with_gate(5, 180);
+    reg.seed_idle_tick_last_fired(&gid, FAR);
+    reg.register_notification(&gid, &oid, notify::Condition::PrChecks { pr: 7 }, "watch it".into(), 60).unwrap();
+
+    let empty = HashMap::new();
+    assert_eq!(reg.idle_tick_tick(FAR + 15 * 60_000 + 1, &empty, &empty), vec![oid.clone()],
+        "a pending notification must force a fire even with no intake signal");
+}
+
+#[test]
+fn intake_gate_fires_regardless_when_a_watchdog_stall_is_unresolved() {
+    let (reg, _d) = test_registry();
+    let g = reg
+        .create_group(
+            "C:/tmp/repo",
+            Guardrails { intake_poll_minutes: 5, idle_tick_fallback_minutes: 180, watchdog_stall_minutes: 10, ..rails() },
+        )
+        .unwrap();
+    let oid = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap().id;
+    reg.set_autonomous(&g.id, true).unwrap();
+    reg.seed_idle_tick_last_fired(&g.id, FAR);
+    // Drive a REAL watchdog stall on a worker in the same group — the gate reads
+    // `AgentEntry.watchdog_notified`, not a test-only backdoor.
+    reg.spawn_agent(&g.id, Role::Worker, "w", "do work", false, None).unwrap();
+    let watch_set = std::collections::HashSet::new();
+    let fired = reg.watchdog_tick(FAR, &HashMap::new(), &watch_set);
+    assert!(!fired.is_empty(), "sanity: the worker must actually be flagged stalled");
+
+    let empty = HashMap::new();
+    assert_eq!(reg.idle_tick_tick(FAR + 15 * 60_000 + 1, &empty, &empty), vec![oid.clone()],
+        "an unresolved watchdog stall must force a fire even with no intake signal");
+}
+
+#[test]
+fn intake_gate_fallback_fires_unconditionally_once_it_comes_due() {
+    // No intake signal, no pending notification, no watchdog stall — but enough
+    // real time has passed since the last fire that the bounded fallback covers it,
+    // so a poller bug (or a permanently-quiet group) can never silence the tick.
+    let (reg, _d, gid, oid) = autonomous_setup_with_gate(5, 30); // 30 min = the floor
+    reg.seed_idle_tick_last_fired(&gid, FAR);
+    let empty = HashMap::new();
+
+    // Just under the fallback: still skipped.
+    assert!(reg.idle_tick_tick(FAR + 15 * 60_000 + 1, &empty, &empty).is_empty());
+    // Past the fallback (30 min since the seeded last-fire): fires even with
+    // nothing new.
+    assert_eq!(reg.idle_tick_tick(FAR + 30 * 60_000 + 1, &empty, &empty), vec![oid.clone()],
+        "the bounded fallback must fire regardless once its own interval elapses");
+}
+
+#[test]
+fn intake_gate_off_fires_unconditionally_exactly_like_before_332() {
+    // intake_poll_minutes: 0 is the literal off switch — an upgraded group's
+    // group.json (no such key, decodes to 0) must reproduce today's behavior
+    // byte for byte, never silently start skipping ticks.
+    let (reg, _d, gid, oid) = autonomous_setup_with_gate(0, 30);
+    let empty = HashMap::new();
+    assert_eq!(reg.idle_tick_tick(FAR, &empty, &empty), vec![oid.clone()],
+        "gate OFF must fire unconditionally, matching pre-#332 behavior");
+    assert!(!audit_line_contains(&reg, &gid, "idle-tick-skipped", "fallback"),
+        "a disabled gate must never produce a skip");
+}
+
 #[test]
 fn idle_tick_status_is_honest_about_latch_and_cap() {
     // rev-59 LOW: eligible_in_secs must never render a lying 0 while a non-time gate

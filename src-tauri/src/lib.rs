@@ -67,6 +67,7 @@ pub fn run() {
             orchestration::start_compact_nudge(reg.clone());
             orchestration::start_disk_monitor(reg.clone());
             orchestration::start_notify_poller(reg.clone());
+            orchestration::start_intake_poller(reg.clone());
             std::thread::spawn(move || orchestration::mcp::serve(reg));
             Ok(())
         })

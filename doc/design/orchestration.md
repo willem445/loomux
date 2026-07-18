@@ -1271,6 +1271,90 @@ the two cost/safety controls the unattended-spend risk demands.
   Spawns a tick induces still count against `max_spawns_per_hour`. The human's pause/off-switch
   is instant.
 
+### Idle-tick intake gate (#332)
+
+The idle tick above fires on a **fixed quiet-window schedule**, regardless of whether anything
+has actually changed — the common case in a settled group is a full LLM turn against the
+orchestrator's (largest) context that ends "nothing new, going quiet." The intake gate makes the
+tick **conditional** on a host-side, zero-token pre-check for exactly the two things the tick's
+cadence exists to catch: new/changed `agent-ready`/`agent-investigation` labels, and open-PR
+check-state transitions.
+
+- **A second, independently-clocked poller.** `start_intake_poller` (`INTAKE_POLL_SCAN_INTERVAL`,
+  60s wake, the `start_notify_poller`/`start_idle_tick` shape) calls `poll_intake`, which — for
+  every **autonomous** group with `Guardrails.intake_poll_minutes` nonzero and due
+  (`intake::due_intake_polls`, the `notify::due_watches` per-group-interval idiom) — shells out
+  to `gh issue list --json number,title,labels` and `gh pr list --json
+  number,title,statusCheckRollup` (via the existing `gh_capture` helper `poll_watches` already
+  uses; no new subprocess plumbing) and diffs the result against that group's last-seen state
+  (`OrchRegistry.intake_seen`, in-memory only — the `watches`/`idle_tick_times` lifetime class).
+  Two calls per due group regardless of how many issues/PRs exist — the API-budget discipline
+  `notify.rs`'s round-robin/per-tick cap defends, applied here as "one list call, not one per
+  item."
+- **Pure diff + notice composition (`intake.rs`, mirrors `notify.rs` exactly).**
+  `label_deltas`/`pr_check_deltas` take the already-parsed `gh --json` output and the prior
+  poll's last-seen maps and return only what's NEW: a label present now that wasn't at the last
+  observation (covers both a brand-new labeled issue and a label added to a known one; a label
+  removed then re-added reads as new again, not a repeat), or a PR whose coarse check-state
+  (`PrCheckState::{Pending,Success,Failure}`, classified with the exact `check_is_pending`/
+  `check_is_failing` predicates `notify::pr_checks_result` already uses, so the two call sites
+  can never disagree about what "failing" means) reached a NEW terminal value. A restart empties
+  `intake_seen`, so the very next poll reads everything currently labeled/terminal as new exactly
+  once — the acceptance criterion ("harmless one-time re-fire, never a repeat") falls out of the
+  diff with no special-casing. `intake_wake_summary` composes the addendum text, sanitized with
+  `notify::sanitize_gh_text` exactly like every other GitHub-derived field reaching a `[loomux]`
+  notice (issue titles are third-party text — the #189 threat model applies here too), capped at
+  `MAX_SIGNALS_IN_SUMMARY` with a stated "+N more" rather than growing unboundedly.
+- **The gate itself (`intake::idle_tick_gate`).** Once `idle_tick_should_fire`'s quiet-window
+  threshold clears (unchanged from #83), a group with the gate ON consults **four** signals
+  before actually notifying: a pending intake signal from the poller above; an outstanding
+  `notify_when` CI watch for the group (the "a lost notification degrades to poll-on-sweep"
+  invariant already in `orchestrator.md` — an outstanding watch means the tick's fallback-sweep
+  duty still has a job even with zero label/PR news); an unresolved watchdog stall
+  (`AgentEntry.watchdog_notified` on any agent in the group); or the **bounded fallback**
+  (`intake::idle_tick_fallback_due`, `Guardrails.idle_tick_fallback_minutes`, default 180 = 3h,
+  the middle of the issue's suggested 2–4h range) having come due since the group's last actual
+  fire (`OrchRegistry.idle_tick_last_fired_ms`) — never since the gate was last merely
+  *evaluated*, which can happen every 60s scan while a group sits quiet. Any one of the four
+  fires the tick; none of them SKIPS it — audited (`idle-tick-skipped`, with the reason), never
+  silently. A skip re-arms the one-notice latch (`idle_tick_notified`) so the loop doesn't
+  busy-spin re-checking every scan, but with a NEW per-agent field
+  (`AgentEntry.idle_tick_skip_rearm_ms`) that auto-clears it once `intake_poll_minutes` could
+  actually have refreshed the poller's findings — unlike the #83 latch, which only clears on the
+  orchestrator producing real output, a *skip* means it produced none, so nothing else would ever
+  clear it.
+- **`intake_poll_minutes` is the one field in this whole guardrail struct where 0 means "off,"
+  literally** — every other minutes-guardrail in `Guardrails` (`idle_tick_minutes`,
+  `watchdog_stall_minutes`, …) treats 0 as "unset → coerce to a default." This field inverts that
+  convention on purpose: the gate is new, opt-in behavior layered on an existing tick, and an
+  upgraded group's `group.json` (written before this field existed, so it decodes to 0) must
+  reproduce today's unconditional-tick behavior byte for byte rather than silently start skipping
+  ticks the human never asked to have gated. `idle_tick_fallback_minutes`, by contrast, follows
+  the normal idiom (0 → default, then clamped `30..=10080` min) — it is the backstop *for* the
+  gate, so it must never be configurable to "off."
+- **When the tick DOES fire because of the gate**, the notice (`idle_tick_notice`, now taking an
+  `Option<&str>` intake summary) states what changed — issue numbers, PR state deltas — so the
+  orchestrator can act on it directly instead of re-polling the exact thing loomux already
+  checked for zero tokens. This is the same "don't make the recipient re-derive what the sender
+  already knows" principle behind #398's structured reports, applied to the opposite direction of
+  the same channel.
+- **Degrade, don't deny.** A `gh` failure on either call (auth, not installed, transient) simply
+  skips that half of the diff for the current scan; the poll attempt is still stamped (so a
+  persistently-failing `gh` isn't retried every 60s), and the bounded fallback covers the group
+  regardless — a poller outage can make the gate less useful, never silence the orchestrator past
+  the fallback's own interval.
+
+**Coexistence with compact-nudge (below):** the two mechanisms are fully decoupled — compact-nudge
+runs as its own background thread (`start_compact_nudge`/`run_compact_nudge`/`compact_nudge_tick`),
+never inside `idle_tick_tick`, with its own anti-nag latch (`compact_nudge_notified`) and its own
+output-total baseline (`compact_nudge_last_output_total`, kept deliberately separate from this
+gate's `last_output_total` — see that field's own doc for the rev-24 finding this avoids: two
+readers of one counter starving each other). The only state they share is the read of
+`AgentEntry.last_progress_ms`, the quiet clock `idle_tick_should_fire` gates on for both — and this
+gate never writes to it differently depending on whether it fires or skips (a skip is purely "don't
+delivered the notice"), so compact-nudge's own independent read of that clock is unaffected by
+whatever this gate decides for the same tick.
+
 ## Compact-nudge (#287)
 
 The orchestrator pane lives for the whole session and every turn re-reads its entire

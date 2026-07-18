@@ -148,6 +148,16 @@ so far:
   the orchestrator routes one line ("read the findings and revisit"), never the findings
   themselves — the worker reads them off the PR directly.
 
+- **#332, event-driven intake wake** — `orchestrator.md` only, landed in the same PR as #398
+  above (both attack the orchestrator's context from opposite ends: #398 shrinks inbound report
+  bloat, #332 eliminates empty idle-tick turns). The **Autonomous mode (idle-tick)** section gains
+  a paragraph naming the host-side gate: a zero-token poll checks for new intake-label/PR-check-
+  state signals before an idle tick fires, a tick with nothing new (and no other wake reason — a
+  pending CI watch, a watchdog stall) is skipped quietly and audited rather than spending a turn,
+  a bounded fallback still wakes the orchestrator unconditionally on a slow cadence regardless,
+  and a tick that DOES fire because of the gate names what changed so the orchestrator doesn't
+  re-poll it. `worker.md`/`reviewer.md`/`planner.md` are untouched by this one.
+
 `the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was` renders
 **these** with the six pre-#222 template variables and asserts that a group launched
 with the advanced orchestrator **off** gets exactly that text. They are the

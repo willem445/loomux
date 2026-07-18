@@ -14,6 +14,7 @@
 //! pane, and the audit log (`audit.jsonl`) records the full text.
 
 pub mod digest;
+pub mod intake;
 pub mod lessons;
 pub mod mcp;
 pub mod notify;
@@ -81,13 +82,24 @@ pub fn max_agents_notice(from: u32, to: u32) -> String {
 /// names the `[loomux] idle tick` wake source the template documents and tells it
 /// to run its monitoring/intake cadence. Kept in one place so the template's wake
 /// clause and the delivered text can't drift.
-pub fn idle_tick_notice() -> String {
-    "[loomux] idle tick: you have been idle and autonomous mode is on. Run your \
+///
+/// `intake_summary` is `Some` when the host-side intake gate (#332) is why this
+/// tick fired WITH something new to report — `intake::intake_wake_summary`'s
+/// already-sanitized text naming the issue/PR deltas it found. Appended so the
+/// orchestrator doesn't have to re-poll what loomux already knows; `None` for a
+/// gate-disabled group (today's text, unchanged) or a fallback fire with nothing
+/// new (the tick's OTHER duties — re-sync, PR sweep — still run either way).
+pub fn idle_tick_notice(intake_summary: Option<&str>) -> String {
+    let mut msg = "[loomux] idle tick: you have been idle and autonomous mode is on. Run your \
      monitoring cadence now — re-sync (list_tasks, list_agents, get_state), poll \
      for labeled intake (agent-ready / agent-investigate) and START that work, and \
      re-check your open PRs (CI + new comments). You will get this at most once per \
      idle window; producing any output resets the clock."
-        .to_string()
+        .to_string();
+    if let Some(s) = intake_summary.filter(|s| !s.is_empty()) {
+        msg.push_str(&format!(" The host-side intake poll already found: {s} — act on it directly instead of re-polling."));
+    }
+    msg
 }
 
 /// The three ways forward when a workflow merge gate refuses a merge (#316,
@@ -1070,6 +1082,12 @@ const MAX_WATCHDOG_STALL_MINUTES: u32 = 1440;
 /// gate is measured in minutes, not seconds — a 60s wake is cheap and precise
 /// enough. See `start_idle_tick` / `run_idle_tick`.
 const IDLE_TICK_INTERVAL: Duration = Duration::from_secs(60);
+/// Idle-tick intake gate (#332): how often the background poller scans for a
+/// group whose `intake_poll_minutes` interval has elapsed. Coarser polling
+/// than this would risk missing a group's own interval by a noticeable
+/// margin; finer buys nothing, since `intake::due_intake_polls` still gates
+/// the actual `gh` calls to each group's configured minutes.
+const INTAKE_POLL_SCAN_INTERVAL: Duration = Duration::from_secs(60);
 /// Autonomous mode (#83): default output-quiet window before an idle tick fires,
 /// when the group's `idle_tick_minutes` guardrail isn't set. Lowered from the
 /// original 15 to **5** after a live test: a human who turns autonomous mode on
@@ -1195,6 +1213,25 @@ const DIRECTIVE_LEDGER_MAX_BYTES: usize = 64 * 1024;
 /// closer to a message than to a terse notification field, hence this and
 /// not the smaller `notify::NOTICE_FIELD_CAP`).
 const DIRECTIVE_ENTRY_MAX_CHARS: usize = 2000;
+/// Idle-tick intake gate (#332): upper bound on `intake_poll_minutes` when a
+/// group opts in (nonzero) — mirrors `MAX_IDLE_TICK_MINUTES`. Unlike that
+/// field, `intake_poll_minutes` itself defaults to **0 (off)** — see
+/// `Guardrails::intake_poll_minutes`'s doc for why the semantics deliberately
+/// diverge from every other minutes-guardrail in this struct.
+const MAX_INTAKE_POLL_MINUTES: u32 = 1440;
+/// Idle-tick intake gate (#332): default bounded fallback — an idle tick fires
+/// unconditionally at least this often even with no intake signal, no pending
+/// notification and no watchdog stall, so a poller bug (or a group that is
+/// genuinely, permanently quiet) can never silence the orchestrator forever.
+/// 3h, the middle of the issue's suggested 2-4h range.
+const DEFAULT_IDLE_TICK_FALLBACK_MINUTES: u32 = 180;
+/// Floor on the fallback cadence (30 min): below this it starts competing with
+/// `idle_tick_minutes` itself rather than acting as a slow backstop.
+const MIN_IDLE_TICK_FALLBACK_MINUTES: u32 = 30;
+/// Ceiling on the fallback cadence (1 week): a bound that can be widened but
+/// never disabled — see `intake_poll_minutes`'s doc for why this field, unlike
+/// that one, is never allowed to mean "off".
+const MAX_IDLE_TICK_FALLBACK_MINUTES: u32 = 60 * 24 * 7;
 /// How often the attention scan recomputes which panes need the human
 /// (idle-with-prompt detection; report/gate signals are event-driven and
 /// picked up on the next tick).
@@ -1902,6 +1939,31 @@ pub struct Guardrails {
     /// editing group.json for an existing group — same precedent as
     /// `max_spawns_per_hour`, which is also create-time-only today).
     pub context_window_tokens_override: Option<u64>,
+    /// Idle-tick intake gate (#332): how often the host-side, zero-token
+    /// poller (`gh issue list` / `gh pr list`, no LLM turn) checks this
+    /// group's intake signals (new/changed `agent-ready`/`agent-investigation`
+    /// labels, open-PR check-state transitions) since it last looked. **`0`
+    /// means the gate is OFF, literally** — no poll, no gate, an idle tick
+    /// fires exactly as it did before this field existed. That's the opposite
+    /// convention from `idle_tick_minutes` (where 0 means "unset → default"):
+    /// this is a brand-new, opt-in gating behavior layered on TOP of an
+    /// existing tick, so an upgraded group's existing `group.json` (which has
+    /// no such key, hence decodes to 0) must reproduce today's behavior
+    /// byte-for-byte rather than silently start skipping ticks. Nonzero is
+    /// clamped to `1..=MAX_INTAKE_POLL_MINUTES`. See `idle_tick_gate` /
+    /// `OrchRegistry::poll_intake`.
+    pub intake_poll_minutes: u32,
+    /// Idle-tick intake gate (#332): the bounded unconditional fallback — an
+    /// idle tick fires regardless of the gate at least this often, so a
+    /// poller bug or a permanently-quiet group can never silence the
+    /// orchestrator past it. Only meaningful while `intake_poll_minutes > 0`;
+    /// normalized regardless, like `idle_tick_minutes`: `0` = unset →
+    /// `DEFAULT_IDLE_TICK_FALLBACK_MINUTES`, then clamped to
+    /// `MIN_IDLE_TICK_FALLBACK_MINUTES..=MAX_IDLE_TICK_FALLBACK_MINUTES` — this
+    /// field, unlike `intake_poll_minutes`, is never allowed to mean "off",
+    /// because it's the backstop *for* that gate. See
+    /// `intake::idle_tick_fallback_due`.
+    pub idle_tick_fallback_minutes: u32,
 }
 
 impl Guardrails {
@@ -1999,6 +2061,20 @@ impl Guardrails {
         // Compact-nudge (#328): 0 stays 0 (off) — only cap a too-large value.
         self.compact_context_threshold_percent =
             self.compact_context_threshold_percent.min(MAX_COMPACT_CONTEXT_THRESHOLD_PERCENT);
+        // #332: 0 is a real, deliberate value here (the gate is off) — unlike
+        // every other minutes-guardrail in this struct, it is NOT coerced to a
+        // default. Only a nonzero value gets clamped into range.
+        if self.intake_poll_minutes != 0 {
+            self.intake_poll_minutes = self.intake_poll_minutes.clamp(1, MAX_INTAKE_POLL_MINUTES);
+        }
+        // The fallback, by contrast, follows the idle_tick_minutes idiom
+        // exactly: 0 = unset → default, then clamped — this backstop must
+        // never be configurable to "never fire".
+        if self.idle_tick_fallback_minutes == 0 {
+            self.idle_tick_fallback_minutes = DEFAULT_IDLE_TICK_FALLBACK_MINUTES;
+        }
+        self.idle_tick_fallback_minutes =
+            self.idle_tick_fallback_minutes.clamp(MIN_IDLE_TICK_FALLBACK_MINUTES, MAX_IDLE_TICK_FALLBACK_MINUTES);
         self
     }
 
@@ -3782,6 +3858,16 @@ pub struct AgentEntry {
     /// window, cleared once context% drops back under the group's
     /// `compact_context_threshold_percent` (e.g. after a compact lands).
     pub compact_escalation_notified: bool,
+    /// Idle-tick intake gate (#332), meaningful only for the orchestrator:
+    /// when the gate SKIPPED a would-have-fired tick (nothing new, no other
+    /// wake reason, fallback not due), this is the Unix-ms the latch above
+    /// may be auto-cleared WITHOUT the orchestrator producing output — set to
+    /// `now + intake_poll_minutes` at skip time, so the gate is re-considered
+    /// no more often than the poller could actually have refreshed its
+    /// findings. `0` = no pending re-arm (the latch clears only on real
+    /// output, the pre-#332 behavior — the case when gating is off, or after
+    /// a genuine fire). See `idle_tick_tick`.
+    pub idle_tick_skip_rearm_ms: u64,
     /// The actual agent CLI a **solo** pane (`role == Role::Solo`) is
     /// running, e.g. `"codex"`/`"gemini"` — the group-guardrails CLI
     /// resolution (`Guardrails::cli_for`) that every orchestration-group
@@ -4368,6 +4454,28 @@ pub struct OrchRegistry {
     /// id this registry mints, so no `getrandom`-pulling crate is needed
     /// (CLAUDE.md constraint 2).
     notify_seq: AtomicU32,
+    /// Idle-tick intake gate (#332): per-group last-seen intake state (the
+    /// intake-labeled set per open issue, the coarse check-state per open PR)
+    /// the host-side poller diffs against. In-memory only, the same lifetime
+    /// class as `watches`/`idle_tick_times`: a restart re-fires once on
+    /// whatever is currently labeled/terminal (harmless — see
+    /// `intake::label_deltas`'s doc) rather than persisting across restarts.
+    intake_seen: Mutex<HashMap<String, intake::IntakeSeenState>>,
+    /// Idle-tick intake gate (#332): Unix-ms this group's poller last actually
+    /// called `gh` (not merely last considered) — `intake::due_intake_polls`'s
+    /// per-group interval floor.
+    intake_last_poll_ms: Mutex<HashMap<String, u64>>,
+    /// Idle-tick intake gate (#332): the composed wake summary from the most
+    /// recent poll that found something new, pending delivery on the next
+    /// idle tick that actually fires for this group. Cleared the moment a
+    /// tick consumes it — whether the fire was triggered BY this signal or a
+    /// later fallback fire swept it up alongside something else.
+    intake_pending: Mutex<HashMap<String, String>>,
+    /// Idle-tick intake gate (#332): Unix-ms this group's orchestrator was
+    /// last actually woken by an idle tick (a gated fire, a fallback fire, or
+    /// any fire while the gate is disabled) — `intake::idle_tick_fallback_due`'s
+    /// reference point.
+    idle_tick_last_fired_ms: Mutex<HashMap<String, u64>>,
     /// Notification backend (#243): per-group "we last saw this group as
     /// paused at tick-time T" bookkeeping, used by `notify_tick` to freeze
     /// the TTL clock across a pause. A group appears here only while
@@ -5781,6 +5889,10 @@ impl OrchRegistry {
             audit_skips_notified: Mutex::new(HashMap::new()),
             watches: Mutex::new(HashMap::new()),
             notify_seq: AtomicU32::new(0),
+            intake_seen: Mutex::new(HashMap::new()),
+            intake_last_poll_ms: Mutex::new(HashMap::new()),
+            intake_pending: Mutex::new(HashMap::new()),
+            idle_tick_last_fired_ms: Mutex::new(HashMap::new()),
             paused_watch_since: Mutex::new(HashMap::new()),
             channels: Mutex::new(HashMap::new()),
             agent_channel: Mutex::new(HashMap::new()),
@@ -6838,6 +6950,11 @@ impl OrchRegistry {
                 // defer entirely to the model-based guess, the conservative
                 // default for a group.json written before this field existed.
                 context_window_tokens_override: g["context_window_tokens_override"].as_u64(),
+                // Idle-tick intake gate (#332): absent → 0 → the gate stays OFF
+                // (not "→ default" — see the field's own doc for why).
+                intake_poll_minutes: g["intake_poll_minutes"].as_u64().unwrap_or(0) as u32,
+                // The fallback backstop: absent → 0 → clamped() maps to the default.
+                idle_tick_fallback_minutes: g["idle_tick_fallback_minutes"].as_u64().unwrap_or(0) as u32,
             },
         ))
     }
@@ -7164,6 +7281,8 @@ impl OrchRegistry {
                 "compact_nudge_roles": info.guardrails.compact_nudge_roles,
                 "compact_context_threshold_percent": info.guardrails.compact_context_threshold_percent,
                 "context_window_tokens_override": info.guardrails.context_window_tokens_override,
+                "intake_poll_minutes": info.guardrails.intake_poll_minutes,
+                "idle_tick_fallback_minutes": info.guardrails.idle_tick_fallback_minutes,
             },
         }))
         .unwrap();
@@ -7961,6 +8080,105 @@ impl OrchRegistry {
         self.notify_tick(now_ms(), &results)
     }
 
+    // ---------- idle-tick intake gate (#332): host-side, zero-token label/PR-check poll ----------
+
+    /// This scan's candidate groups for the intake poller: every AUTONOMOUS
+    /// group (a non-autonomous group never idle-ticks, so polling for it
+    /// would spend a `gh` round-trip nobody reads) with `intake_poll_minutes`
+    /// nonzero, paired with its repo path for the `gh` call.
+    fn intake_poll_config(&self) -> (HashMap<String, u32>, HashMap<String, String>) {
+        let autonomous = self.autonomous_groups.lock_safe().clone();
+        let mut minutes = HashMap::new();
+        let mut repos = HashMap::new();
+        for (id, g) in self.groups.lock_safe().iter() {
+            if !autonomous.contains(id) {
+                continue;
+            }
+            if g.guardrails.intake_poll_minutes > 0 {
+                minutes.insert(id.clone(), g.guardrails.intake_poll_minutes);
+                repos.insert(id.clone(), g.repo.clone());
+            }
+        }
+        (minutes, repos)
+    }
+
+    /// One intake-poll scan (#332): pick due groups via the pure
+    /// `intake::due_intake_polls` selection policy (the per-group interval
+    /// floor, mirroring `notify::due_watches`), shell out to `gh` twice per
+    /// due group (`gh issue list`, `gh pr list` — the only two calls this
+    /// adds, regardless of how many open PRs/issues exist, since both are
+    /// single list calls, not one per item), and fold any new label/PR-check
+    /// signal into that group's pending wake summary for `idle_tick_tick` to
+    /// pick up. Called on a timer by `start_intake_poller`.
+    ///
+    /// A `gh` failure for one call (auth, `gh` missing, rate-limited) simply
+    /// skips that half of the diff for this scan — it still stamps the poll
+    /// attempt (so a persistently-failing `gh` doesn't get retried every
+    /// scan) and never panics or blocks the tick; the bounded fallback in
+    /// `idle_tick_tick` still wakes the orchestrator regardless (#332
+    /// acceptance criterion 6: "poll failure ≠ tick death — degrade, don't
+    /// deny").
+    pub fn poll_intake(&self) {
+        let now = now_ms();
+        let (minutes, repos) = self.intake_poll_config();
+        if minutes.is_empty() {
+            return;
+        }
+        let last_poll = self.intake_last_poll_ms.lock_safe().clone();
+        let due = intake::due_intake_polls(now, &minutes, &last_poll);
+        for group in due {
+            let Some(repo) = repos.get(&group) else { continue };
+            let issues_raw =
+                self.gh_capture(repo, &["issue", "list", "--state", "open", "--json", "number,title,labels"]);
+            let prs_raw =
+                self.gh_capture(repo, &["pr", "list", "--state", "open", "--json", "number,title,statusCheckRollup"]);
+            self.intake_last_poll_ms.lock_safe().insert(group.clone(), now);
+
+            let (label_signals, pr_signals) = {
+                let mut seen = self.intake_seen.lock_safe();
+                let state = seen.entry(group.clone()).or_default();
+                let labels = issues_raw
+                    .as_deref()
+                    .ok()
+                    .and_then(intake::parse_issue_list)
+                    .map(|issues| intake::label_deltas(&mut state.labels, &issues))
+                    .unwrap_or_default();
+                let prs = prs_raw
+                    .as_deref()
+                    .ok()
+                    .and_then(intake::parse_pr_list)
+                    .map(|prs| intake::pr_check_deltas(&mut state.pr_checks, &prs))
+                    .unwrap_or_default();
+                (labels, prs)
+            };
+            if label_signals.is_empty() && pr_signals.is_empty() {
+                continue;
+            }
+            let summary = intake::intake_wake_summary(&label_signals, &pr_signals);
+            self.audit(&group, "loomux", "intake-signal", json!({ "summary": summary }));
+            // Fold into any not-yet-delivered pending summary rather than
+            // clobbering it — two poll scans can each find something new
+            // before the orchestrator's quiet window next elapses and the
+            // tick consumes (clears) it.
+            let mut pending = self.intake_pending.lock_safe();
+            let entry = pending.entry(group.clone()).or_default();
+            if !entry.is_empty() {
+                entry.push_str("; ");
+            }
+            entry.push_str(&summary);
+        }
+    }
+
+    #[doc(hidden)] // pub for integration tests: seed a pending intake signal without shelling to `gh`
+    pub fn seed_intake_pending(&self, group: &str, summary: &str) {
+        self.intake_pending.lock_safe().insert(group.to_string(), summary.to_string());
+    }
+
+    #[doc(hidden)] // pub for integration tests: control the fallback-due reference point precisely
+    pub fn seed_idle_tick_last_fired(&self, group: &str, ms: u64) {
+        self.idle_tick_last_fired_ms.lock_safe().insert(group.to_string(), ms);
+    }
+
     // ---------- cross-workspace channels (#271): human-connected agent-pane sessions ----------
     //
     // A "workspace" is a project tab, and each tab owns at most one
@@ -8732,6 +8950,7 @@ impl OrchRegistry {
             compact_inference_guard_until_ms: 0,
             last_state_write_ms: 0,
             compact_escalation_notified: false,
+            idle_tick_skip_rearm_ms: 0,
             solo_cli: Some(cli.to_string()),
             last_exit_tail: None,
         };
@@ -8859,6 +9078,7 @@ impl OrchRegistry {
             compact_inference_guard_until_ms: 0,
             last_state_write_ms: 0,
             compact_escalation_notified: false,
+            idle_tick_skip_rearm_ms: 0,
             solo_cli: None, // unknown for an adopted pane; cli_for_agent falls back to "claude"
             last_exit_tail: None,
         };
@@ -8902,13 +9122,21 @@ impl OrchRegistry {
     /// time: output growth (the orchestrator acting) resets the quiet clock and
     /// the one-notice latch; recent human input also defers the clock (never tick
     /// while the human steers — the belt-and-suspenders gate on top of
-    /// output-silence). An orchestrator output-quiet past `IDLE_TICK_MINUTES`,
-    /// not already latched, and under the per-hour cap earns exactly one audited
-    /// `[loomux] idle tick` notice telling it to run its monitoring/intake
-    /// cadence. Paused groups are skipped wholesale (delivery is suppressed there;
-    /// don't burn the latch). Returns the notified orchestrator ids. Split from
-    /// the pty read (`orchestrator_activity`) so the gate / latch / cap / pause
-    /// logic is testable with synthetic counters — the `watchdog_tick` shape.
+    /// output-silence). An orchestrator output-quiet past `IDLE_TICK_MINUTES` and
+    /// not already latched clears the quiet-window gate — but for a group with
+    /// the intake gate ON (`intake_poll_minutes > 0`, #332), clearing the quiet
+    /// window is necessary, not sufficient: `intake::idle_tick_gate` decides
+    /// whether there's actually anything to wake for (a host-side label/PR-check
+    /// signal, an outstanding CI watch this tick's sweep still owes, a watchdog
+    /// stall nobody resolved) or whether the bounded fallback has come due — and
+    /// a tick that clears neither is SKIPPED, audited with its reason, and
+    /// retried no sooner than the next intake-poll interval (never silently, and
+    /// never in a busy-loop). A group with the gate OFF fires exactly as it did
+    /// before #332. Paused groups are skipped wholesale (delivery is suppressed
+    /// there; don't burn the latch). Returns the notified orchestrator ids. Split
+    /// from the pty read (`orchestrator_activity`) so the gate / latch / cap /
+    /// pause logic is testable with synthetic counters — the `watchdog_tick`
+    /// shape.
     pub fn idle_tick_tick(
         &self,
         now: u64,
@@ -8923,16 +9151,40 @@ impl OrchRegistry {
         let tick_times = self.idle_tick_times.lock_safe().clone();
         // Per-group idle-tick window + activity floor (guardrails, live-adjustable).
         // Snapshot like `watchdog_tick` does its thresholds.
-        let cfg: HashMap<String, (u32, u64)> = self
+        let cfg: HashMap<String, (u32, u64, u32, u32)> = self
             .groups
             .lock_safe()
             .iter()
             .map(|(id, g)| {
-                (id.clone(), (g.guardrails.idle_tick_minutes, g.guardrails.idle_activity_floor_bytes))
+                (
+                    id.clone(),
+                    (
+                        g.guardrails.idle_tick_minutes,
+                        g.guardrails.idle_activity_floor_bytes,
+                        g.guardrails.intake_poll_minutes,
+                        g.guardrails.idle_tick_fallback_minutes,
+                    ),
+                )
             })
             .collect();
+        // #332: snapshots taken BEFORE the mutable `agents` borrow below, each on
+        // its own short-lived lock (a separate mutex for `watches`, a throwaway
+        // immutable pass over `agents` for the watchdog signal) — never held
+        // across the mutable loop, so there's no lock-ordering hazard.
+        let notification_pending_groups: HashSet<String> =
+            self.watches.lock_safe().values().map(|w| w.group.clone()).collect();
+        let watchdog_stall_groups: HashSet<String> = self
+            .agents
+            .lock_safe()
+            .values()
+            .filter(|a| a.watchdog_notified)
+            .map(|a| a.group.clone())
+            .collect();
+        let intake_pending = self.intake_pending.lock_safe().clone();
+        let last_fired = self.idle_tick_last_fired_ms.lock_safe().clone();
 
         let mut to_notify: Vec<(String, String)> = Vec::new();
+        let mut skipped: Vec<(String, String)> = Vec::new();
         {
             let mut agents = self.agents.lock_safe();
             for a in agents.values_mut() {
@@ -8948,16 +9200,19 @@ impl OrchRegistry {
                 // rebaselines the counter but does NOT reset the clock, so an
                 // occasional statusline/spinner frame can't starve the tick (the
                 // bug where any stray byte demanded another full quiet window).
-                let (threshold, floor) = cfg
-                    .get(&a.group)
-                    .copied()
-                    .unwrap_or((DEFAULT_IDLE_TICK_MINUTES, DEFAULT_IDLE_ACTIVITY_FLOOR_BYTES));
+                let (threshold, floor, intake_minutes, fallback_minutes) = cfg.get(&a.group).copied().unwrap_or((
+                    DEFAULT_IDLE_TICK_MINUTES,
+                    DEFAULT_IDLE_ACTIVITY_FLOOR_BYTES,
+                    0,
+                    DEFAULT_IDLE_TICK_FALLBACK_MINUTES,
+                ));
                 if let Some(&cur) = outputs.get(&a.id) {
                     let meaningful = idle_output_is_activity(a.last_output_total, cur, floor);
                     a.last_output_total = cur; // rebaseline every observation
                     if meaningful {
                         a.last_progress_ms = now;
                         a.idle_tick_notified = false;
+                        a.idle_tick_skip_rearm_ms = 0;
                         continue;
                     }
                 }
@@ -8976,6 +9231,16 @@ impl OrchRegistry {
                 if paused.contains(&a.group) {
                     continue;
                 }
+                // #332: a SKIPPED window latches the same as a fired one (so this
+                // loop doesn't busy-spin re-evaluating the gate every scan), but
+                // must still come back on its own — nothing else will clear it,
+                // since a skip means the orchestrator produced no output to clear
+                // it the normal way. Re-arm once the intake poller could actually
+                // have refreshed its findings, never sooner.
+                if a.idle_tick_notified && a.idle_tick_skip_rearm_ms != 0 && now >= a.idle_tick_skip_rearm_ms {
+                    a.idle_tick_notified = false;
+                    a.idle_tick_skip_rearm_ms = 0;
+                }
                 let times = tick_times.get(&a.group).map(Vec::as_slice).unwrap_or(&[]);
                 if idle_tick_should_fire(
                     a.last_progress_ms,
@@ -8985,10 +9250,36 @@ impl OrchRegistry {
                     times,
                     MAX_IDLE_TICKS_PER_HOUR,
                 ) {
-                    a.idle_tick_notified = true;
-                    to_notify.push((a.id.clone(), a.group.clone()));
+                    if intake_minutes == 0 {
+                        // The gate is off for this group: fire exactly as #332
+                        // never happened.
+                        a.idle_tick_notified = true;
+                        to_notify.push((a.id.clone(), a.group.clone()));
+                        continue;
+                    }
+                    let has_intake_signal = intake_pending.get(&a.group).is_some_and(|s| !s.is_empty());
+                    let has_pending_notification = notification_pending_groups.contains(&a.group);
+                    let has_watchdog_stall = watchdog_stall_groups.contains(&a.group);
+                    let group_last_fired = last_fired.get(&a.group).copied().unwrap_or(0);
+                    let fallback_due = intake::idle_tick_fallback_due(group_last_fired, now, fallback_minutes);
+                    if intake::idle_tick_gate(has_intake_signal, has_pending_notification, has_watchdog_stall, fallback_due) {
+                        a.idle_tick_notified = true;
+                        to_notify.push((a.id.clone(), a.group.clone()));
+                    } else {
+                        a.idle_tick_notified = true;
+                        a.idle_tick_skip_rearm_ms = now + intake_minutes as u64 * 60_000;
+                        let reason = format!(
+                            "no intake signal, no pending CI watch, no watchdog stall, fallback not yet due \
+                             (next re-check in ~{intake_minutes}m)"
+                        );
+                        skipped.push((a.group.clone(), reason));
+                    }
                 }
             }
+        }
+
+        for (group, reason) in skipped {
+            self.audit(&group, "loomux", "idle-tick-skipped", json!({ "reason": reason }));
         }
 
         let mut notified = Vec::new();
@@ -9005,8 +9296,18 @@ impl OrchRegistry {
                 v.push(now);
                 v.retain(|&t| now.saturating_sub(t) < SPAWN_RATE_WINDOW_MS);
             }
-            self.audit(&group, "loomux", "idle-tick", json!({ "orchestrator": id }));
-            let _ = self.deliver_to_orchestrator(&group, &idle_tick_notice(), "loomux");
+            // #332: this IS the fire the fallback measures from, gated or not —
+            // update it regardless so a group that later turns the gate on
+            // doesn't inherit a stale (or zero) reference point.
+            self.idle_tick_last_fired_ms.lock_safe().insert(group.clone(), now);
+            // The intake summary (if any) is consumed here — cleared whether
+            // THIS fire was caused by the signal or a later fallback fire swept
+            // it up alongside something else; either way the orchestrator is
+            // about to see it in the notice below.
+            let intake_summary = self.intake_pending.lock_safe().remove(&group);
+            self.audit(&group, "loomux", "idle-tick", json!({ "orchestrator": id, "intake_summary": intake_summary }));
+            let text = idle_tick_notice(intake_summary.as_deref());
+            let _ = self.deliver_to_orchestrator(&group, &text, "loomux");
             notified.push(id);
         }
         notified
@@ -13966,6 +14267,7 @@ impl OrchRegistry {
             compact_inference_guard_until_ms: 0,
             last_state_write_ms: 0,
             compact_escalation_notified: false,
+            idle_tick_skip_rearm_ms: 0,
             solo_cli: None,
             last_exit_tail: None,
         };
@@ -15130,6 +15432,21 @@ pub fn start_compact_nudge(reg: Arc<OrchRegistry>) {
     });
 }
 
+/// Background loop for the idle-tick intake gate (#332): every
+/// `INTAKE_POLL_SCAN_INTERVAL` it polls any autonomous group whose
+/// `intake_poll_minutes` guardrail is due (0 = the gate is off for that
+/// group — skipped entirely, no `gh` call, no gate) via `gh issue list` /
+/// `gh pr list`, and folds any new label/PR-check signal into that group's
+/// pending wake summary for `idle_tick_tick` to consume. Zero-token: this
+/// thread never talks to an LLM, only `gh`. Started once at app setup,
+/// beside `start_idle_tick`.
+pub fn start_intake_poller(reg: Arc<OrchRegistry>) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(INTAKE_POLL_SCAN_INTERVAL);
+        reg.poll_intake();
+    });
+}
+
 /// Free bytes on the disk that hosts `path`: the mounted volume whose mount
 /// point is the longest prefix of `path`. `None` if no volume matches (or the
 /// listing is empty), so the caller no-ops rather than guessing.
@@ -15263,6 +15580,12 @@ pub fn create_orchestration(
             // hand-editing group.json; `None` defers to the model-based
             // guess.
             context_window_tokens_override: None,
+            // #332: off by default even for a brand-new launch — the gate is a new
+            // behavior layered on an existing tick, not a bundled-in default; a
+            // human opts a group in via group.json.
+            intake_poll_minutes: 0,
+            // #332: 0 → clamped() applies DEFAULT_IDLE_TICK_FALLBACK_MINUTES.
+            idle_tick_fallback_minutes: 0,
         },
         None,
         None,
@@ -15937,6 +16260,7 @@ fn register_orchestrator_pane(
         compact_inference_guard_until_ms: 0,
         last_state_write_ms: 0,
         compact_escalation_notified: false,
+        idle_tick_skip_rearm_ms: 0,
         solo_cli: None,
         last_exit_tail: None,
     };
@@ -16820,5 +17144,33 @@ mod watchdog_stall_notice_tests {
             assert!(n.contains("45+ min"), "got: {n}");
             assert!(n.contains("get_output(\"w-9\")"), "got: {n}");
         }
+    }
+}
+
+/// #332: the idle-tick notice states what the host-side intake poll already
+/// found, so the orchestrator acts on it instead of re-polling.
+#[cfg(test)]
+mod idle_tick_notice_tests {
+    use super::*;
+
+    #[test]
+    fn without_an_intake_summary_reads_exactly_as_before_332() {
+        let n = idle_tick_notice(None);
+        assert!(n.starts_with("[loomux] idle tick: you have been idle"), "got: {n}");
+        assert!(!n.contains("host-side intake poll"), "must not claim a finding that doesn't exist: {n}");
+    }
+
+    #[test]
+    fn an_empty_summary_is_treated_like_none() {
+        let n = idle_tick_notice(Some(""));
+        assert!(!n.contains("host-side intake poll"), "an empty summary must not add a dangling clause: {n}");
+    }
+
+    #[test]
+    fn a_present_summary_is_appended_so_the_orchestrator_neednt_repoll_it() {
+        let n = idle_tick_notice(Some("issue #42 labeled agent-ready (\"Do the thing\")"));
+        assert!(n.contains("host-side intake poll already found"), "got: {n}");
+        assert!(n.contains("issue #42 labeled agent-ready"), "got: {n}");
+        assert!(n.contains("instead of re-polling"), "must tell the orchestrator not to redo the work: {n}");
     }
 }

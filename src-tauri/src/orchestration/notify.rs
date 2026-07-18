@@ -228,8 +228,11 @@ struct RawCheck {
 }
 
 /// `gh pr checks` states that mean "still running" — anything else (a
-/// non-empty array with none of these) is terminal.
-fn check_is_pending(state: &str) -> bool {
+/// non-empty array with none of these) is terminal. `pub(super)`: also used by
+/// `intake.rs`'s `gh pr list` rollup classification (#332), which needs the
+/// identical pending/failing vocabulary applied to a differently-shaped `gh`
+/// response — see that module's `rollup_entry_state`.
+pub(super) fn check_is_pending(state: &str) -> bool {
     matches!(state, "PENDING" | "QUEUED" | "IN_PROGRESS")
 }
 
@@ -244,7 +247,7 @@ fn check_is_pending(state: &str) -> bool {
 /// `CANCELLED`, `TIMED_OUT`, `ACTION_REQUIRED`, `STARTUP_FAILURE`, or a state
 /// `gh` hasn't documented yet — stays classified as failing: an unrecognized
 /// conclusion must never silently read as passing.
-fn check_is_failing(state: &str) -> bool {
+pub(super) fn check_is_failing(state: &str) -> bool {
     !matches!(state, "SUCCESS" | "SKIPPED" | "NEUTRAL")
 }
 
