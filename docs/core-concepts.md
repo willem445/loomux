@@ -288,6 +288,7 @@ this table mirrors it.
 | New project tab | `Ctrl+Shift+T` (or **+** in the tab strip) |
 | Close project tab | `Ctrl+Shift+K` (or the tab's ✕) |
 | Prev / next tab | `Ctrl+Shift+[` / `Ctrl+Shift+]` (or click a tab) |
+| Reorder tabs | `Ctrl+Alt+Shift+[` / `Ctrl+Alt+Shift+]` (or drag a tab) |
 | Rename pane | `F2`, or double-click its title |
 | Move focus | `Alt+←/→/↑/↓` (or click) |
 | Resize panes | drag the divider between them |

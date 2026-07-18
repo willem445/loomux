@@ -145,6 +145,13 @@ html, body {
   min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 
+/* Drag-to-reorder (#379): a thin accent line on whichever edge the drop would
+   land on, so the drop TARGET (not the dragged tab itself) shows where the
+   tab will land. box-shadow, not border, so it doesn't shift layout. */
+.tab.dragging { opacity: 0.5; }
+.tab.drag-before { box-shadow: -2px 0 0 var(--accent); }
+.tab.drag-after { box-shadow: 2px 0 0 var(--accent); }
+
 /* Live status chip (#63 phase 4): agent count + cost for a group-bound tab. */
 .tab-status {
   flex: none; font-size: 10.5px; color: var(--text-dim);
