@@ -1664,6 +1664,81 @@ mirror: a loomux-initiated fire with a FLAT token reading (no drop, no next turn
 deadlock scenario) still reinjects exactly once — verified red-before-green against a neutered
 trusted-bypass before this fix landed.
 
+### rev-42 delta, round 2: the re-demo that resolved but never notified
+
+The user re-demoed against the round-1 fix (`b8d9636`, testbed group `loomux-testbed-cc077f09`).
+Compaction itself now worked — a genuine `request_compact` → `/compact` paste → real "Compacted"
+output, context dropping to 38K/4%. But the mandatory re-grounding notice never arrived; the
+codeword only survived via the agent's OWN pre-compact summary, not the ledger reinjection —
+the feature under test did not demonstrably fire.
+
+**Forensics first.** `audit.jsonl` + `breadcrumbs.log` around the exact window of the confirmed
+`/compact` paste (`compact-nudge` audited, `prompt-typed` confirmed by breadcrumbs) show **no**
+`compact-reinjection` audit, **no** `compact-pending-discarded` audit — nothing — for over three
+minutes, while the agent was demonstrably back to normal work (a `get_state` tool-call at the tail
+of the log). Both terminal audit outcomes are emitted unconditionally by the resolver before any
+delivery is attempted, so their total absence means the busy-then-quiet resolver never even
+reached its confirm/discard branch — not a delivery that was held, skipped, or lost (the user's
+original H1 hypothesis), but a **precondition that was never satisfied** at all.
+
+**Root cause: `compact_seen_busy` depended entirely on output-byte growth clearing
+`idle_activity_floor_bytes`.** The loomux-initiated arm starts with `compact_seen_busy = false`
+and waits for a LATER tick to observe real terminal-output growth past the floor. This is
+fine for a compaction whose own rendering is substantial — but a real, genuine compaction can
+render little enough that no single inter-tick delta clears a floor tuned to filter ordinary
+repaint noise. Unlike the two INFERENCE arms (banner detection, manual typing), which set
+`compact_seen_busy = true` **immediately at arm time**, straight from the very evidence that
+armed them, the loomux-initiated arm has no such alternate evidence — it was purely waiting on a
+byte-growth observation that, this time, never came. `compact_pending` then stays `true` forever:
+stuck, silent, and (as a side effect) blocking every future compaction for that agent too, since
+`!a.compact_pending` gates every arm site.
+
+**Fix 1 — widen "seen busy" with the `compact_boundary` marker, for every arm.** A rise in
+`usage::compact_boundary_count` since the arming baseline is direct, floor-independent proof a
+compaction happened — Claude Code writes it the instant compaction completes, with no dependency
+on how much text it also rendered to the terminal. `compact_nudge_tick`'s resolver now treats
+`a.compact_seen_busy || marker_rose` as "seen busy" (still gated on `currently_quiet`, so the
+"never paste over a live stream" property is untouched — this only widens what counts as the busy
+half, never relaxes the quiet requirement). This applies uniformly to all three arms: the
+loomux-initiated arm no longer has a real compaction go unnoticed just because it rendered little
+text, and the manual-detection inference arm (which shares the same "wait for a later busy tick"
+shape) gets the same protection.
+
+**Fix 2 — the one-shot latch now waits for a CONFIRMED delivery, with bounded retry.** Independent
+of the round's actual root cause, the user's fix contract required this regardless: `deliver_prompt`
+is fire-and-forget (D1's finding, above) — its `Result` says only whether the paste *attempt*
+spawned, never whether it landed. The previous design cleared `compact_pending` the instant a
+reinjection was *decided*, with no feedback loop if that specific delivery was held, aborted
+(`PasteDecision::Abort`, box occupied with unsubmitted human text), or otherwise never confirmed.
+Now:
+- `AgentEntry.compact_reinject_attempted_ms: Option<u64>` — set the tick a reinjection is decided
+  (or retried), cleared only once its delivery confirms or the retry budget is spent.
+- `AgentEntry.compact_reinject_attempts: u32` — 1-indexed attempt count, bounded by
+  `MAX_REINJECT_ATTEMPTS` (3).
+- A new `DeliveryConfirmation` (mirroring the private `DeliveryOutcome` used for stranded-text
+  flush) is threaded into `compact_nudge_tick` as an ordinary input map — `agent_last_deliveries`
+  is the impure reader (resolves each agent's CURRENT `pty_id` against `self.last_delivery`) that
+  supplies it in production, keeping the resolver itself synthetic-input testable (unit tests have
+  no live pty/app handle to exercise `deliver_prompt` for real — same reasoning as D1's rejection).
+- Each tick, while a reinjection is in flight: if `delivery_confirmations` shows a delivery that
+  started at-or-after the attempt AND confirmed, the latch releases (`compact-reinjection-
+  confirmed`, audited). If `REINJECT_CONFIRM_TIMEOUT_MS` (5 minutes — comfortably past
+  `deliver_prompt`'s own worst-case hold chain) elapses with no confirmation, a bounded retry fires
+  (re-audited as `compact-reinjection` with an `attempt` field). After `MAX_REINJECT_ATTEMPTS`,
+  a still-unconfirmed reinjection is abandoned — audited (`compact-reinjection-abandoned`), latch
+  released anyway: a lost re-grounding is a real gap, but a permanently wedged agent (unable to
+  ever arm a future compaction) is worse.
+
+Regression coverage: `compact_nudge_tick_resolves_a_loomux_initiated_fire_via_the_boundary_marker_
+when_output_never_clears_the_busy_floor` pins the actual root cause (a flat output map, only the
+marker rising — verified red-before-green against a neutered marker check).
+`compact_nudge_tick_retries_a_reinjection_whose_delivery_never_confirms_then_delivers_exactly_once`
+and `compact_nudge_tick_abandons_a_stuck_reinjection_after_the_retry_budget_and_frees_the_latch`
+cover the confirmed-delivery contract (verified red-before-green against the previous
+clear-on-decision behavior). All prior reinjection tests were updated to supply a
+`DeliveryConfirmation` before asserting final resolution; `compact_nudge_tick_never_loops_when_
+the_false_signal_repeats_every_cycle` (D4) stays pinned at zero, unaffected.
+
 ## Enforced merge gate (#83)
 
 Template guidance is not a security boundary. A live incident proved it: an orchestrator merged

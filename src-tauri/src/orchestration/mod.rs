@@ -1113,6 +1113,17 @@ const MAX_COMPACT_NUDGE_MINUTES: u32 = 1440;
 /// `MAX_IDLE_TICKS_PER_HOUR` for the idle tick, reused via the same
 /// `idle_tick_should_fire` gate (see `compact_nudge_tick`).
 const MAX_COMPACT_NUDGES_PER_HOUR: u32 = 4;
+/// Production bug fix (rev-42 delta, round 2): how long a fired reinjection
+/// is given to confirm delivery before `compact_nudge_tick` treats it as
+/// stuck and retries. Generous enough to clear `deliver_prompt`'s own
+/// worst-case hold chain (two `USER_QUIET_MAX_HOLD` waits plus
+/// `SUBMIT_MAX_WAIT` and the echo/retry window — comfortably under this)
+/// without racing a delivery that is merely slow, not lost.
+const REINJECT_CONFIRM_TIMEOUT_MS: u64 = 5 * 60 * 1000;
+/// Production bug fix (rev-42 delta, round 2): bounded retry count for a
+/// reinjection stuck past `REINJECT_CONFIRM_TIMEOUT_MS` — see `AgentEntry::
+/// compact_reinject_attempts`'s doc for why this must never be unbounded.
+const MAX_REINJECT_ATTEMPTS: u32 = 3;
 /// Compact-nudge (#328): upper bound on `compact_context_threshold_percent`;
 /// 0 is "off" (see `Guardrails::clamped`), 100 = only at total exhaustion
 /// (effectively disabled in practice, since the CLI's own emergency
@@ -3545,6 +3556,28 @@ pub struct AgentEntry {
     /// baselines above; reset to `false` (its inert default) the instant a
     /// pending state resolves.
     pub compact_pending_trusted: bool,
+    /// Production bug fix (rev-42 delta, round 2): `Some(now)` from the tick a
+    /// reinjection was DECIDED (confirmed or trusted) and its delivery fired,
+    /// until that delivery is confirmed or the attempt budget is exhausted.
+    /// `None` while still deciding whether to reinject at all, and again once
+    /// the arm fully resolves. Live re-demo evidence (PR #329 round 5) showed
+    /// the one-shot latch being consumed at the DECISION rather than at
+    /// confirmed delivery is itself a gap: `deliver_prompt` is fire-and-
+    /// forget (D1's finding, see the design doc), so a decision to reinject
+    /// was previously treated as done the instant `deliver_prompt` was
+    /// *called*, with no feedback loop if that delivery never actually
+    /// landed. This field is what makes the latch wait for real evidence: see
+    /// `compact_nudge_tick`'s resolver for how it's consulted against
+    /// `delivery_confirmations`.
+    pub compact_reinject_attempted_ms: Option<u64>,
+    /// Production bug fix (rev-42 delta, round 2): 1-indexed count of
+    /// reinjection delivery attempts made for the CURRENT arm (1 = the first
+    /// fire, not yet a retry). Bounded by `MAX_REINJECT_ATTEMPTS` — a
+    /// reinjection that still hasn't confirmed after that many tries is
+    /// abandoned (audited, latch released) rather than wedging the state
+    /// machine so no future compaction can ever arm again for this agent.
+    /// Reset to `0` whenever no reinjection is in flight.
+    pub compact_reinject_attempts: u32,
     /// Compact-nudge (#328): Unix-ms this agent's `set_state` call was last
     /// observed (0 = never). Self-scoped, stamped by the `set_state` MCP
     /// handler on the CALLING agent's own entry — meaningful only for the
@@ -5009,6 +5042,23 @@ struct DeliveryOutcome {
     /// Unix-ms the final Enter was sent — the reference point for deciding
     /// whether a human has since typed into the pane.
     submit_sent_ms: u64,
+}
+
+/// Production bug fix (rev-42 delta, round 2): a per-agent snapshot of the
+/// most recent delivery to that agent's pane, in the shape `compact_nudge_
+/// tick`'s reinjection-confirmation resolver needs. Mirrors the private
+/// `DeliveryOutcome` above (same two fields, same meaning) but kept as its
+/// own `pub` type rather than making delivery-plumbing internals public: a
+/// synthetic-input test constructs one directly, with no live pty/app
+/// handle round trip — `deliver_prompt` is fire-and-forget and unit tests
+/// can't exercise it for real (D1's rejected precedent, see the design
+/// doc), so this is threaded through as an ordinary input map exactly like
+/// `context_tokens`/`context_boundary_counts`, with `agent_last_deliveries`
+/// as the impure reader that supplies it in production.
+#[derive(Clone, Copy, Debug)]
+pub struct DeliveryConfirmation {
+    pub submit_sent_ms: u64,
+    pub confirmed: bool,
 }
 
 /// Whether output growth after the submit Enter counts as the submit landing.
@@ -8466,6 +8516,8 @@ impl OrchRegistry {
             compact_pending_baseline_tokens: None,
             compact_pending_baseline_marker_count: None,
             compact_pending_trusted: false,
+            compact_reinject_attempted_ms: None,
+            compact_reinject_attempts: 0,
             last_state_write_ms: 0,
             compact_escalation_notified: false,
             solo_cli: Some(cli.to_string()),
@@ -8585,6 +8637,8 @@ impl OrchRegistry {
             compact_pending_baseline_tokens: None,
             compact_pending_baseline_marker_count: None,
             compact_pending_trusted: false,
+            compact_reinject_attempted_ms: None,
+            compact_reinject_attempts: 0,
             last_state_write_ms: 0,
             compact_escalation_notified: false,
             solo_cli: None, // unknown for an adopted pane; cli_for_agent falls back to "claude"
@@ -8906,6 +8960,7 @@ impl OrchRegistry {
         context_percents: &HashMap<String, u32>,
         context_tokens: &HashMap<String, u64>,
         context_boundary_counts: &HashMap<String, u64>,
+        delivery_confirmations: &HashMap<String, DeliveryConfirmation>,
     ) -> Vec<String> {
         let paused = self.paused.lock_safe().clone();
         // Snapshot per-group guardrails (Clone) rather than per-agent CLI
@@ -8920,7 +8975,10 @@ impl OrchRegistry {
         let tick_times = self.compact_nudge_times.lock_safe().clone();
 
         let mut to_fire: Vec<(String, String)> = Vec::new();
-        let mut to_reinject: Vec<(String, String, PathBuf, PathBuf)> = Vec::new();
+        // `u32` is the 1-indexed attempt number (see `AgentEntry::
+        // compact_reinject_attempts`) — carried through so the audit line
+        // distinguishes a first fire from a retry.
+        let mut to_reinject: Vec<(String, String, PathBuf, PathBuf, u32)> = Vec::new();
         let mut to_escalate: Vec<(String, String, u32)> = Vec::new();
         // Production bug fix (D2/D3): a resolved-but-unconfirmed pending
         // state — audited for visibility (this exact gap in observability is
@@ -8928,6 +8986,14 @@ impl OrchRegistry {
         // record existed of WHICH detector armed `compact_pending`, or that
         // it had been discarded rather than genuinely resolved).
         let mut to_discard: Vec<(String, String, Option<u64>, Option<u64>)> = Vec::new();
+        // rev-42 delta (round 2): a reinjection whose delivery just confirmed
+        // — audited for visibility, distinct from the initial fire above.
+        let mut to_reinject_confirmed: Vec<(String, String)> = Vec::new();
+        // rev-42 delta (round 2): a reinjection stuck past `MAX_REINJECT_
+        // ATTEMPTS` — the latch is released anyway (never wedge the state
+        // machine), but this must be visible: it's a genuinely lost
+        // re-grounding, not a harmless discard.
+        let mut to_abandon: Vec<(String, String, u32)> = Vec::new();
         {
             let mut agents = self.agents.lock_safe();
             for a in agents.values_mut() {
@@ -8958,80 +9024,176 @@ impl OrchRegistry {
                     }
                 }
 
-                // Compaction-completion: busy (compaction ran/rendered) then
-                // quiet again while pending — resolve regardless of pause
-                // state (a pause must not strand a pane mid-compact forever).
+                // rev-42 delta (round 2, PR #329 round-5 re-demo): while a
+                // decided reinjection is waiting on its delivery to confirm,
+                // skip straight to that check — do NOT re-run the busy/
+                // confirm decision below (already decided; `compact_pending`
+                // stays `true` throughout this phase so no other arm site can
+                // re-fire in the meantime).
                 //
-                // Production bug fix (D2/D3, PR #329 delta review): busy-
-                // then-quiet is necessary but not SUFFICIENT — a live
-                // incident showed it can be satisfied by an agent's ordinary
-                // turn, with no compaction ever running. `compaction_
-                // confirmed` requires the context-token reading to have
-                // actually dropped since the baseline captured when `compact_
-                // pending` was set before the mandatory re-injection is
-                // trusted to fire.
-                //
-                // rev-42 delta (deadlock fix): that gate is only sound for
-                // INFERENCE arms (manual `/compact` typing, the auto-compact
-                // banner) — paths where loomux merely *believes* a compact
-                // happened. It deadlocks the LOOMUX-INITIATED arm (heuristic
-                // fallback / `request_compact`, the one that actually types
-                // `/compact` itself, below): `usage::latest_context_tokens`'s
-                // drop is a NEXT-TURN phenomenon (proved against a real
-                // transcript in `usage::tests::
-                // real_transcript_proves_the_token_drop_is_a_next_turn_
-                // phenomenon_rev42_q1`) and the only next turn available is
-                // the reinjection this gate is supposed to authorize — a
-                // reading taken before that turn is always still-high, so a
-                // uniform gate silently discards genuine compactions on the
-                // primary path forever. `compact_pending_trusted` (set at
-                // each arm site below) is the fix: trusted arms skip
-                // confirmation entirely — loomux has positive knowledge it
-                // pasted `/compact` itself, so busy-then-quiet IS the
-                // signal, same as it always was before D2/D3 (this was never
-                // the false-positive path that motivated the gate).
-                // Inference arms keep the hard gate, now widened to
-                // `inferred_compaction_confirmed` (token-drop OR the
-                // `compact_boundary` transcript marker, which — unlike the
-                // token reading — appears on the completion turn itself, no
-                // next turn required).
-                //
-                // `compact_pending`/`compact_seen_busy`/both baselines/the
-                // trust flag are ALWAYS cleared here regardless of the
-                // outcome — one resolution attempt per arming, confirmed or
-                // not, so a repeatedly-false-positiving detector can re-arm
-                // the state machine as many times as it wants but can never
-                // cause more than one discarded, context-growth-free no-op
-                // per arming: structurally, a reinjection LOOP (the
-                // production incident) is no longer reachable, only (at
-                // worst) a repeatedly discarded false arm, which is audited
-                // (baseline/current tokens, Q3) and costs nothing but a
-                // breadcrumb.
-                if a.compact_pending && currently_quiet && a.compact_seen_busy {
-                    let baseline_tokens = a.compact_pending_baseline_tokens;
-                    let current_tokens = context_tokens.get(&a.id).copied();
-                    let confirmed = a.compact_pending_trusted
-                        || inferred_compaction_confirmed(
-                            baseline_tokens,
-                            current_tokens,
-                            a.compact_pending_baseline_marker_count,
-                            context_boundary_counts.get(&a.id).copied(),
-                        );
-                    a.compact_pending = false;
-                    a.compact_seen_busy = false;
-                    a.compact_pending_baseline_tokens = None;
-                    a.compact_pending_baseline_marker_count = None;
-                    a.compact_pending_trusted = false;
-                    if confirmed {
-                        let instructions = self.group_dir(&a.group).join(
-                            g.block(&a.block)
-                                .map(|b| b.instructions_file())
-                                .unwrap_or_else(|| a.role.instructions_file().to_string()),
-                        );
-                        let ledger = self.ledger_path(&a.group, &a.id);
-                        to_reinject.push((a.id.clone(), a.group.clone(), instructions, ledger));
-                    } else {
-                        to_discard.push((a.id.clone(), a.group.clone(), baseline_tokens, current_tokens));
+                // Live re-demo evidence (round 5) showed the previous design
+                // — clear the latch the INSTANT `deliver_prompt` is called,
+                // regardless of outcome — has a real gap: `deliver_prompt` is
+                // fire-and-forget (its `Result` reflects only whether the
+                // spawn succeeded, never whether the paste actually landed),
+                // so "decided to reinject" was being treated as "reinjected"
+                // with no feedback loop if that delivery never confirmed
+                // (held for a human typing, the input box never clearing,
+                // or any other silent failure). The forensic timeline for
+                // that re-demo actually showed something more fundamental —
+                // the busy-then-quiet PRECONDITION below never fired at all
+                // (see that comment) — but the confirmed-delivery gate is a
+                // real, separate gap in its own right and the fix contract
+                // requires it regardless of which mechanism this particular
+                // re-demo hit.
+                if let Some(attempted_ms) = a.compact_reinject_attempted_ms {
+                    let confirmed_delivery = delivery_confirmations
+                        .get(&a.id)
+                        .is_some_and(|d| d.submit_sent_ms >= attempted_ms && d.confirmed);
+                    if confirmed_delivery {
+                        a.compact_pending = false;
+                        a.compact_reinject_attempted_ms = None;
+                        a.compact_reinject_attempts = 0;
+                        to_reinject_confirmed.push((a.id.clone(), a.group.clone()));
+                    } else if now.saturating_sub(attempted_ms) >= REINJECT_CONFIRM_TIMEOUT_MS {
+                        if a.compact_reinject_attempts < MAX_REINJECT_ATTEMPTS {
+                            a.compact_reinject_attempts += 1;
+                            a.compact_reinject_attempted_ms = Some(now);
+                            let instructions = self.group_dir(&a.group).join(
+                                g.block(&a.block)
+                                    .map(|b| b.instructions_file())
+                                    .unwrap_or_else(|| a.role.instructions_file().to_string()),
+                            );
+                            let ledger = self.ledger_path(&a.group, &a.id);
+                            to_reinject.push((
+                                a.id.clone(), a.group.clone(), instructions, ledger,
+                                a.compact_reinject_attempts,
+                            ));
+                        } else {
+                            to_abandon.push((a.id.clone(), a.group.clone(), a.compact_reinject_attempts));
+                            a.compact_pending = false;
+                            a.compact_reinject_attempted_ms = None;
+                            a.compact_reinject_attempts = 0;
+                        }
+                    }
+                    // else: still within the timeout, a delivery may be
+                    // legitimately in flight (a long human-typing hold) —
+                    // wait, don't re-fire yet.
+                } else if a.compact_pending && currently_quiet {
+                    // Compaction-completion: busy (compaction ran/rendered)
+                    // then quiet again while pending — resolve regardless of
+                    // pause state (a pause must not strand a pane mid-compact
+                    // forever).
+                    //
+                    // Production bug fix (D2/D3, PR #329 delta review): busy-
+                    // then-quiet is necessary but not SUFFICIENT — a live
+                    // incident showed it can be satisfied by an agent's
+                    // ordinary turn, with no compaction ever running.
+                    // `compaction_confirmed` requires the context-token
+                    // reading to have actually dropped since the baseline
+                    // captured when `compact_pending` was set before the
+                    // mandatory re-injection is trusted to fire.
+                    //
+                    // rev-42 delta (deadlock fix): that gate is only sound
+                    // for INFERENCE arms (manual `/compact` typing, the
+                    // auto-compact banner) — paths where loomux merely
+                    // *believes* a compact happened. It deadlocks the
+                    // LOOMUX-INITIATED arm (heuristic fallback /
+                    // `request_compact`, the one that actually types
+                    // `/compact` itself, below): `usage::
+                    // latest_context_tokens`'s drop is a NEXT-TURN phenomenon
+                    // (proved against a real transcript in `usage::tests::
+                    // real_transcript_proves_the_token_drop_is_a_next_turn_
+                    // phenomenon_rev42_q1`) and the only next turn available
+                    // is the reinjection this gate is supposed to authorize —
+                    // a reading taken before that turn is always still-high,
+                    // so a uniform gate silently discards genuine
+                    // compactions on the primary path forever.
+                    // `compact_pending_trusted` (set at each arm site below)
+                    // is the fix: trusted arms skip confirmation entirely —
+                    // loomux has positive knowledge it pasted `/compact`
+                    // itself, so busy-then-quiet IS the signal, same as it
+                    // always was before D2/D3 (this was never the
+                    // false-positive path that motivated the gate).
+                    // Inference arms keep the hard gate, now widened to
+                    // `inferred_compaction_confirmed` (token-drop OR the
+                    // `compact_boundary` transcript marker).
+                    //
+                    // rev-42 delta (round 2, the round-5 re-demo's ACTUAL
+                    // root cause): "busy" used to mean ONLY real terminal-
+                    // output growth clearing `idle_activity_floor_bytes`
+                    // (`compact_seen_busy`, set by the rebaseline block
+                    // above). The re-demo's forensic timeline (audit.jsonl +
+                    // breadcrumbs.log around the genuine, confirmed `/compact`
+                    // paste) showed NO reinjection audit line, NO discard
+                    // audit line — nothing — for over three minutes while
+                    // the agent was demonstrably back to normal work; the
+                    // resolver never even reached this branch. The floor-
+                    // gated busy check depends on the compaction's OWN
+                    // terminal rendering being large enough to clear a
+                    // threshold tuned to filter ordinary repaint noise — a
+                    // real but small/fast compaction can fail to clear it,
+                    // and unlike the two INFERENCE arms (which set
+                    // `compact_seen_busy = true` immediately at arm time,
+                    // from the very evidence that armed them), the
+                    // LOOMUX-INITIATED arm has no such alternate evidence —
+                    // it waited PURELY on a later tick's byte-growth
+                    // observation, which may simply never come. A rise in
+                    // the `compact_boundary` marker is direct, floor-
+                    // independent proof the compaction actually happened
+                    // (same-turn, no next-turn dependency — same signal
+                    // `inferred_compaction_confirmed` already uses), so it
+                    // now counts as "seen busy" too, for every arm — closing
+                    // this gap without weakening the "don't paste while the
+                    // agent is visibly still busy" intent `currently_quiet`
+                    // protects (a marker rise only ever WIDENS what counts as
+                    // the busy half; the quiet requirement is untouched).
+                    //
+                    // `compact_pending`/`compact_seen_busy`/both baselines/
+                    // the trust flag are ALWAYS cleared on a DISCARD — one
+                    // resolution attempt per arming, so a repeatedly-false-
+                    // positiving detector can re-arm the state machine as
+                    // many times as it wants but can never cause more than
+                    // one discarded, context-growth-free no-op per arming
+                    // (audited with baseline/current tokens, Q3). A CONFIRM
+                    // instead moves into the delivery-confirmation phase
+                    // above rather than clearing immediately — see
+                    // `compact_reinject_attempted_ms`'s doc.
+                    let marker_baseline = a.compact_pending_baseline_marker_count;
+                    let marker_current = context_boundary_counts.get(&a.id).copied();
+                    let marker_rose = matches!((marker_baseline, marker_current), (Some(b), Some(c)) if c > b);
+                    if a.compact_seen_busy || marker_rose {
+                        let baseline_tokens = a.compact_pending_baseline_tokens;
+                        let current_tokens = context_tokens.get(&a.id).copied();
+                        let confirmed = a.compact_pending_trusted
+                            || inferred_compaction_confirmed(
+                                baseline_tokens,
+                                current_tokens,
+                                marker_baseline,
+                                marker_current,
+                            );
+                        if confirmed {
+                            a.compact_pending_baseline_tokens = None;
+                            a.compact_pending_baseline_marker_count = None;
+                            a.compact_pending_trusted = false;
+                            a.compact_seen_busy = false;
+                            a.compact_reinject_attempts = 1;
+                            a.compact_reinject_attempted_ms = Some(now);
+                            let instructions = self.group_dir(&a.group).join(
+                                g.block(&a.block)
+                                    .map(|b| b.instructions_file())
+                                    .unwrap_or_else(|| a.role.instructions_file().to_string()),
+                            );
+                            let ledger = self.ledger_path(&a.group, &a.id);
+                            to_reinject.push((a.id.clone(), a.group.clone(), instructions, ledger, 1));
+                        } else {
+                            a.compact_pending = false;
+                            a.compact_seen_busy = false;
+                            a.compact_pending_baseline_tokens = None;
+                            a.compact_pending_baseline_marker_count = None;
+                            a.compact_pending_trusted = false;
+                            to_discard.push((a.id.clone(), a.group.clone(), baseline_tokens, current_tokens));
+                        }
                     }
                 }
 
@@ -9221,7 +9383,7 @@ impl OrchRegistry {
             self.audit(&group, "loomux", "compact-escalation", json!({ "agent": id, "percent": percent }));
             let _ = self.deliver_prompt(&id, &compact_escalation_notice(percent), "loomux", Delivery::MidSession);
         }
-        for (id, group, instructions_path, ledger_path) in to_reinject {
+        for (id, group, instructions_path, ledger_path, attempt) in to_reinject {
             let text = fs::read_to_string(&instructions_path).unwrap_or_default();
             // Missing/empty ledger reads as "" and `directive_ledger_embed`
             // turns that into `None` — nothing embeds for a pane that never
@@ -9231,9 +9393,19 @@ impl OrchRegistry {
             let ledger_path_str = ledger_path.display().to_string();
             let ledger_embed = directive_ledger_embed(&ledger, DIRECTIVE_LEDGER_EMBED_CAP_BYTES, &ledger_path_str);
             self.audit(&group, "loomux", "compact-reinjection",
-                json!({ "agent": id, "ledger_embedded": ledger_embed.is_some() }));
+                json!({ "agent": id, "ledger_embedded": ledger_embed.is_some(), "attempt": attempt }));
             let notice = compact_reinjection_notice(&text, ledger_embed.as_deref());
             let _ = self.deliver_prompt(&id, &notice, "loomux", Delivery::MidSession);
+        }
+        // rev-42 delta (round 2): terminal-state audits for the confirmed-
+        // delivery gate — visibility for both outcomes the fix contract
+        // requires (exactly one delivered re-grounding, or a bounded, visible
+        // give-up), neither of which existed before this round.
+        for (id, group) in to_reinject_confirmed {
+            self.audit(&group, "loomux", "compact-reinjection-confirmed", json!({ "agent": id }));
+        }
+        for (id, group, attempts) in to_abandon {
+            self.audit(&group, "loomux", "compact-reinjection-abandoned", json!({ "agent": id, "attempts": attempts }));
         }
         nudged
     }
@@ -9338,6 +9510,34 @@ impl OrchRegistry {
             .collect()
     }
 
+    /// rev-42 delta (round 2): per-agent snapshot of the most recent delivery
+    /// to that agent's pane, resolved via its CURRENT `pty_id` — a fresh read
+    /// every tick, so a pane that was rebound (a new pty after a resume)
+    /// simply reads as "no delivery yet" rather than a stale one from a
+    /// now-dead pty. Impure (locks `self.last_delivery`); split from the
+    /// decision so `compact_nudge_tick`'s reinjection-confirmation resolver
+    /// stays synthetic-input testable — see `DeliveryConfirmation`'s doc for
+    /// why this can't just be read live off `deliver_prompt` itself.
+    fn agent_last_deliveries(&self) -> HashMap<String, DeliveryConfirmation> {
+        let pty_ids: Vec<(String, u32)> = self
+            .agents
+            .lock_safe()
+            .values()
+            .filter_map(|a| Some((a.id.clone(), a.pty_id?)))
+            .collect();
+        if pty_ids.is_empty() {
+            return HashMap::new();
+        }
+        let last_delivery = self.last_delivery.lock_safe();
+        pty_ids
+            .into_iter()
+            .filter_map(|(id, pty_id)| {
+                let outcome = last_delivery.get(&pty_id)?;
+                Some((id, DeliveryConfirmation { submit_sent_ms: outcome.submit_sent_ms, confirmed: outcome.confirmed }))
+            })
+            .collect()
+    }
+
     /// One full compact-nudge cycle: read pty counters, then tick. Called on a
     /// timer by `start_compact_nudge`; `now` injected so tests drive it
     /// deterministically.
@@ -9354,6 +9554,7 @@ impl OrchRegistry {
             .iter()
             .map(|(id, s)| (id.clone(), s.compact_boundary_count))
             .collect();
+        let delivery_confirmations = self.agent_last_deliveries();
         self.compact_nudge_tick(
             now,
             &outputs,
@@ -9361,6 +9562,7 @@ impl OrchRegistry {
             &context_percents,
             &context_tokens,
             &context_boundary_counts,
+            &delivery_confirmations,
         )
     }
 
@@ -13346,6 +13548,8 @@ impl OrchRegistry {
             compact_pending_baseline_tokens: None,
             compact_pending_baseline_marker_count: None,
             compact_pending_trusted: false,
+            compact_reinject_attempted_ms: None,
+            compact_reinject_attempts: 0,
             last_state_write_ms: 0,
             compact_escalation_notified: false,
             solo_cli: None,
@@ -15295,6 +15499,8 @@ fn register_orchestrator_pane(
         compact_pending_baseline_tokens: None,
         compact_pending_baseline_marker_count: None,
         compact_pending_trusted: false,
+        compact_reinject_attempted_ms: None,
+        compact_reinject_attempts: 0,
         last_state_write_ms: 0,
         compact_escalation_notified: false,
         solo_cli: None,
