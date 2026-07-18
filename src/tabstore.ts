@@ -101,6 +101,14 @@ export interface PersistedPane {
    *  on from the file browser). Null for every other kind, and absent from any snapshot
    *  written before #217. */
   file: string | null;
+  /** The task board's embed preference, for kind "orch" (#361): `null` means
+   *  it opens as the floating overlay (the pre-#361 default and every other
+   *  kind's only option); a number is the PERSISTED embedded-panel fraction —
+   *  the panel's share of the split, same units as a split node's own
+   *  `weight` below. Absent from any snapshot written before #361, which
+   *  decodes it as `null` (overlay mode), same as a pane that was simply
+   *  never embedded. */
+  taskEmbed: number | null;
 }
 
 /** A tab's pane layout: the split tree with PersistedPane leaves. Mirrors grid's
@@ -192,6 +200,7 @@ function decodePane(v: unknown): PersistedPane | null {
     sessionId: typeof r.sessionId === "string" ? r.sessionId : null,
     role: typeof r.role === "string" ? r.role : null,
     file: typeof r.file === "string" ? r.file : null,
+    taskEmbed: typeof r.taskEmbed === "number" && Number.isFinite(r.taskEmbed) ? r.taskEmbed : null,
   };
 }
 

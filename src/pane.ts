@@ -51,6 +51,13 @@ import { AuditView } from "./auditview";
 import { GroupView } from "./groupview";
 import { clampOverlayHeight, OVERLAY_MIN_H } from "./overlaysize";
 import {
+  embedDragGrow,
+  growFromFrac,
+  fracFromGrow,
+  clampEmbedFrac,
+  DEFAULT_EMBED_FRAC,
+} from "./embedsplit";
+import {
   exitDiagnosticLine,
   keepOpenOnExit,
   type ExitInfo,
@@ -354,6 +361,23 @@ export class Pane implements VoiceTargetPane {
   private tasksView: TasksView | null = null;
   private tasksOverlay: HTMLElement | null = null;
   private tasksBtn: HTMLButtonElement;
+  /** Embedded-panel mode for the task board (#361): a real flex sibling of
+   *  the terminal instead of a floating overlay, so both stay fully visible
+   *  at once. `null` = the view opens as the floating overlay (unchanged
+   *  default); a number is the PERSISTED preference — the panel's fraction
+   *  of the split — used both to lay it out and to remember the mode across
+   *  a close/reopen. See doc/design/embedded-panels.md for why this resizes
+   *  the PTY exactly the way a grid split does, and why that is not a
+   *  violation of the no-resize-for-chrome rule (CLAUDE.md constraint 1). */
+  private tasksEmbedFrac: number | null = null;
+  /** Lazily created wrapper that turns `termEl` into a flex sibling of the
+   *  embedded panel instead of the pane's direct flex:1 child. Created once,
+   *  on the first embed, and left in place afterward — an un-embed just
+   *  removes the panel, and `termEl` alone in a column flex box lays out
+   *  identically to being that box's direct child. */
+  private embedHostEl: HTMLElement | null = null;
+  private tasksEmbedPanelEl: HTMLElement | null = null;
+  private tasksEmbedDividerEl: HTMLElement | null = null;
   /** Audit-log viewer (any orchestration pane), same overlay mechanics. */
   private auditView: AuditView | null = null;
   private auditOverlay: HTMLElement | null = null;
@@ -1744,34 +1768,193 @@ export class Pane implements VoiceTargetPane {
     }
   }
 
-  /** Toggle the task board overlay (orchestrator panes). Same no-resize
-   *  overlay mechanics as the git view; only one overlay is open at a time. */
-  toggleTasksView(): void {
-    if (!this.orchGroup || this.tasksBtn.hidden) return;
-    if (!this.tasksView) {
-      this.tasksView = new TasksView(this.orchGroup, { onClose: () => this.toggleTasksView() });
-      this.tasksOverlay = document.createElement("div");
-      this.tasksOverlay.className = "git-overlay";
-      this.tasksOverlay.hidden = true;
-      this.tasksOverlay.append(this.tasksView.el, this.makeOverlayDivider(() => this.tasksOverlay!));
-      this.el.appendChild(this.tasksOverlay);
-    }
-    if (!this.tasksOverlay!.hidden) {
-      this.tasksOverlay!.hidden = true;
-      this.updateTermShift();
-      this.focus();
+  /** Lazily create the task board and both hosts it can live in — the
+   *  floating overlay (unchanged from before #361) and the embedded panel
+   *  (see `ensureEmbedHost`). Only one is ever populated with the view's
+   *  element at a time (`placeTasksViewInCurrentHost`); the other sits empty
+   *  and `hidden`. */
+  private ensureTasksView(): void {
+    if (this.tasksView) return;
+    this.tasksView = new TasksView(this.orchGroup!, {
+      onClose: () => this.toggleTasksView(),
+      onToggleEmbed: () => this.toggleTasksEmbedMode(),
+    });
+    this.tasksOverlay = document.createElement("div");
+    this.tasksOverlay.className = "git-overlay";
+    this.tasksOverlay.hidden = true;
+    this.tasksOverlay.append(this.makeOverlayDivider(() => this.tasksOverlay!));
+    this.el.appendChild(this.tasksOverlay);
+    this.ensureEmbedHost();
+    this.tasksView.setEmbedded(this.tasksEmbedFrac !== null);
+    this.placeTasksViewInCurrentHost();
+  }
+
+  /** Lazily promote `termEl` from being `.pane`'s own direct flex:1 child to
+   *  living inside a flex wrapper alongside the embedded task-board panel and
+   *  its divider — both created here but `hidden` until the first embed.
+   *  Created once and left in place afterward: with the panel/divider
+   *  `[hidden]` (`display: none !important`, styles.css), `termEl` alone in a
+   *  column flex box lays out identically to being `.pane`'s direct child, so
+   *  there is nothing to undo on un-embed. */
+  private ensureEmbedHost(): HTMLElement {
+    if (this.embedHostEl) return this.embedHostEl;
+    const host = document.createElement("div");
+    host.className = "pane-embed-host";
+    this.el.insertBefore(host, this.termEl);
+    host.appendChild(this.termEl);
+    this.tasksEmbedDividerEl = this.makeEmbedDivider();
+    this.tasksEmbedDividerEl.hidden = true;
+    this.tasksEmbedPanelEl = document.createElement("div");
+    this.tasksEmbedPanelEl.className = "pane-embed-panel";
+    this.tasksEmbedPanelEl.hidden = true;
+    host.append(this.tasksEmbedDividerEl, this.tasksEmbedPanelEl);
+    this.embedHostEl = host;
+    return host;
+  }
+
+  /** Move the task board's DOM element into whichever host matches the
+   *  current mode (overlay vs. embedded). `appendChild` detaches an element
+   *  from wherever it currently is, so this is safe any time the mode flips,
+   *  whether or not the board is visible. */
+  private placeTasksViewInCurrentHost(): void {
+    if (!this.tasksView) return;
+    if (this.tasksEmbedFrac !== null) {
+      this.tasksEmbedPanelEl!.appendChild(this.tasksView.el);
     } else {
-      if (this.issuesView?.visible) this.toggleIssuesView();
-      if (this.gitView?.visible) this.toggleGitView();
-      if (this.auditOverlay && !this.auditOverlay.hidden) this.toggleAuditView();
-      if (this.groupOverlay && !this.groupOverlay.hidden) this.toggleGroupView();
-      if (this.fileEditView?.visible) this.toggleFileEditView();
+      this.tasksOverlay!.insertBefore(this.tasksView.el, this.tasksOverlay!.firstChild);
+    }
+  }
+
+  /** Draggable divider between the terminal and the embedded task-board
+   *  panel. Mirrors grid.ts's own split-divider math exactly (embedsplit.ts)
+   *  — the terminal's box genuinely resizes here (a real flex layout, not an
+   *  absolutely-positioned overlay), so the SAME frame-debounced
+   *  ResizeObserver → applyFit() path a grid split's divider drag already
+   *  drives fires on every real size change. That is the discipline
+   *  doc/design/embedded-panels.md argues is the legitimate side of the
+   *  no-PTY-resize-for-chrome rule: identical to a grid split's own divider,
+   *  not a second one. */
+  private makeEmbedDivider(): HTMLElement {
+    const div = document.createElement("div");
+    div.className = "pane-embed-divider";
+    div.addEventListener("mousedown", (e) => {
+      e.preventDefault();
+      const startY = e.clientY;
+      const sizeTerm = this.termEl.offsetHeight;
+      const sizePanel = this.tasksEmbedPanelEl!.offsetHeight;
+      const growTerm = parseFloat(this.termEl.style.flexGrow || "1");
+      const growPanel = parseFloat(this.tasksEmbedPanelEl!.style.flexGrow || "1");
+      div.classList.add("dragging");
+      const move = (ev: MouseEvent) => {
+        const grow = embedDragGrow(sizeTerm, sizePanel, growTerm, growPanel, ev.clientY - startY);
+        this.termEl.style.flex = `${grow.growTerm} 1 0`;
+        this.tasksEmbedPanelEl!.style.flex = `${grow.growPanel} 1 0`;
+      };
+      const up = () => {
+        div.classList.remove("dragging");
+        window.removeEventListener("mousemove", move);
+        window.removeEventListener("mouseup", up);
+        // Terminal (one per drag, not per mousemove) — mirrors grid.ts's own
+        // split divider: persist the settled fraction so a restore
+        // reproduces THIS size, not the one before the drag.
+        this.tasksEmbedFrac = fracFromGrow(
+          parseFloat(this.termEl.style.flexGrow || "1"),
+          parseFloat(this.tasksEmbedPanelEl!.style.flexGrow || "1")
+        );
+        this.events.onRecordChanged(this);
+      };
+      window.addEventListener("mousemove", move);
+      window.addEventListener("mouseup", up);
+    });
+    return div;
+  }
+
+  /** Whether the task board is currently on screen, in either mode. */
+  private tasksVisible(): boolean {
+    if (!this.tasksView) return false;
+    return this.tasksEmbedFrac !== null ? !this.tasksEmbedPanelEl!.hidden : !this.tasksOverlay!.hidden;
+  }
+
+  /** Show the task board in whichever mode it's currently set to. Closes
+   *  every other overlay first — an embedded board doesn't collide with a
+   *  floating one, but the mutual exclusion predates #361 and there's no
+   *  reason two panels should compete for the human's attention regardless
+   *  of how either is hosted. */
+  private openTasksView(): void {
+    if (this.issuesView?.visible) this.toggleIssuesView();
+    if (this.gitView?.visible) this.toggleGitView();
+    if (this.auditOverlay && !this.auditOverlay.hidden) this.toggleAuditView();
+    if (this.groupOverlay && !this.groupOverlay.hidden) this.toggleGroupView();
+    if (this.fileEditView?.visible) this.toggleFileEditView();
+    if (this.tasksEmbedFrac !== null) {
+      const grow = growFromFrac(this.tasksEmbedFrac);
+      this.termEl.style.flex = `${grow.growTerm} 1 0`;
+      this.tasksEmbedPanelEl!.style.flex = `${grow.growPanel} 1 0`;
+      this.tasksEmbedDividerEl!.hidden = false;
+      this.tasksEmbedPanelEl!.hidden = false;
+    } else {
       const strip = Math.max(140, Math.round(this.el.clientHeight * 0.35));
       this.tasksOverlay!.style.height = `${this.overlayClamp(this.termEl.clientHeight - strip)}px`;
       this.tasksOverlay!.hidden = false;
-      this.tasksView.show();
-      this.updateTermShift();
     }
+    this.tasksView!.show();
+    this.updateTermShift();
+  }
+
+  private closeTasksView(): void {
+    if (this.tasksEmbedFrac !== null) {
+      this.tasksEmbedDividerEl!.hidden = true;
+      this.tasksEmbedPanelEl!.hidden = true;
+      this.termEl.style.flex = "";
+    } else {
+      this.tasksOverlay!.hidden = true;
+    }
+    this.updateTermShift();
+    this.focus();
+  }
+
+  /** Toggle the task board open/closed (`Alt+T`, and the board's own ✕) — in
+   *  EITHER mode. Which mode it opens in is a separate, persisted preference
+   *  (see `toggleTasksEmbedMode`); this never changes it. */
+  toggleTasksView(): void {
+    if (!this.orchGroup || this.tasksBtn.hidden) return;
+    this.ensureTasksView();
+    if (this.tasksVisible()) this.closeTasksView();
+    else this.openTasksView();
+  }
+
+  /** Switch the task board between a floating overlay and an embedded panel
+   *  beside the terminal (#361) — the board's own header toggle. Moves the
+   *  view without closing it if it's currently open; either way the mode is
+   *  a PERSISTED preference (tabs.json, via `onRecordChanged`), so the next
+   *  open honors it. A discrete, user-initiated layout change (see
+   *  doc/design/embedded-panels.md) — never fired from a resize or a
+   *  refresh. */
+  toggleTasksEmbedMode(): void {
+    if (!this.orchGroup || this.tasksBtn.hidden) return;
+    this.ensureTasksView();
+    const wasVisible = this.tasksVisible();
+    if (wasVisible) this.closeTasksView();
+    this.tasksEmbedFrac = this.tasksEmbedFrac !== null ? null : clampEmbedFrac(DEFAULT_EMBED_FRAC);
+    this.tasksView!.setEmbedded(this.tasksEmbedFrac !== null);
+    this.placeTasksViewInCurrentHost();
+    if (wasVisible) this.openTasksView();
+    this.events.onRecordChanged(this);
+  }
+
+  /** Reapply a persisted embed preference (#361) — called once, right after
+   *  a resumed/restored orch pane is wired up with its group, so a task
+   *  board that was embedded and open when the layout was captured comes
+   *  back the same way. A `null` preference (never embedded, or restore
+   *  doesn't carry it this far — see main.ts's `resumeDormantGroup`) leaves
+   *  the default (closed, overlay mode) alone. */
+  restoreTaskEmbed(frac: number | null): void {
+    if (frac === null || !this.orchGroup || this.tasksBtn.hidden) return;
+    this.ensureTasksView();
+    this.tasksEmbedFrac = clampEmbedFrac(frac);
+    this.tasksView!.setEmbedded(true);
+    this.placeTasksViewInCurrentHost();
+    this.openTasksView();
   }
 
   /** Toggle the audit-log viewer overlay (any orchestration pane). Same
@@ -2006,6 +2189,12 @@ export class Pane implements VoiceTargetPane {
           : kind === "workflow"
             ? this.workflowPaneView?.openPathRel ?? null
             : null,
+      // The task board's embed preference (#361): null = overlay mode (the
+      // default), a number = embedded at that fraction of the split. Mirrors
+      // how a split's own `weight` is already persisted as a flex-grow share
+      // rather than a pixel size — not new geometry-persistence territory, the
+      // same one grid.layoutSnapshot() already occupies.
+      taskEmbed: kind === "orch" ? this.tasksEmbedFrac : null,
     };
   }
 

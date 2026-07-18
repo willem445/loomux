@@ -44,6 +44,7 @@ test("docked panes round-trip (captured outside the layout tree, #194 P4)", () =
             sessionId: "abc",
             role: null,
             file: null,
+            taskEmbed: null,
           },
         ],
       },
@@ -161,6 +162,7 @@ const NESTED_LAYOUT: PersistedLayoutNode = {
         sessionId: null,
         role: null,
         file: null,
+        taskEmbed: null,
       },
     },
     {
@@ -181,6 +183,7 @@ const NESTED_LAYOUT: PersistedLayoutNode = {
             sessionId: "abc-123",
             role: null,
             file: null,
+            taskEmbed: null,
           },
         },
         {
@@ -196,6 +199,7 @@ const NESTED_LAYOUT: PersistedLayoutNode = {
             sessionId: "orch-sess-9",
             role: "orchestrator",
             file: null,
+            taskEmbed: null,
           },
         },
         {
@@ -213,6 +217,7 @@ const NESTED_LAYOUT: PersistedLayoutNode = {
             sessionId: null,
             role: null,
             file: null,
+            taskEmbed: null,
           },
         },
       ],
@@ -243,6 +248,7 @@ test("a files leaf round-trips its root — and needed NO new field or schema bu
     sessionId: null,
     role: null,
     file: null,
+    taskEmbed: null,
   };
   const state: PersistedTabs = {
     tabs: [
@@ -311,6 +317,7 @@ test("editor and git leaves round-trip their root — and the editor's open FILE
     sessionId: null,
     role: null,
     file,
+    taskEmbed: null,
   });
   const state: PersistedTabs = {
     tabs: [
@@ -426,6 +433,7 @@ test("malformed pane fields inside a valid leaf coerce to null, not a drop", () 
       sessionId: null,
       role: 99, // non-string → null
       file: 7, // non-string → null (#217)
+      taskEmbed: "0.4", // non-number → null (#361)
     },
   };
   const back = decodeTabs(
@@ -444,8 +452,59 @@ test("malformed pane fields inside a valid leaf coerce to null, not a drop", () 
       sessionId: null,
       role: null,
       file: null,
+      taskEmbed: null,
     },
   });
+});
+
+// ---------- #361 embedded task board ----------
+
+test("a task board's embed preference (fraction) round-trips through encode/decode", () => {
+  const orch: PersistedPane = {
+    paneKind: "orch",
+    name: "orchestrator",
+    cwd: "/repo",
+    command: null,
+    argv: null,
+    shellKind: null,
+    sessionId: "orch-1",
+    role: "orchestrator",
+    file: null,
+    taskEmbed: 0.42,
+  };
+  const state: PersistedTabs = {
+    tabs: [
+      { name: "t", color: null, groupId: "g", layout: { kind: "leaf", weight: 1, pane: orch } },
+    ],
+    activeIndex: 0,
+  };
+  const back = decodeTabs(encodeTabs(state));
+  const leaf = back?.tabs[0].layout;
+  assert.ok(leaf?.kind === "leaf");
+  assert.equal(leaf.pane.taskEmbed, 0.42);
+});
+
+test("an old snapshot with no taskEmbed key decodes it as null (overlay mode, unchanged)", () => {
+  // A pre-#361 file never wrote the key at all — additive, like `role` and the
+  // files root before it: no schema bump, no decoder branch needed.
+  const raw = JSON.stringify({
+    tabs: [
+      {
+        name: "t",
+        color: null,
+        groupId: null,
+        layout: {
+          kind: "leaf",
+          weight: 1,
+          pane: { paneKind: "orch", name: "orchestrator", role: "orchestrator" },
+        },
+      },
+    ],
+    activeIndex: 0,
+  });
+  const leaf = decodeTabs(raw)?.tabs[0].layout;
+  assert.ok(leaf?.kind === "leaf");
+  assert.equal(leaf.pane.taskEmbed, null);
 });
 
 test("restorePref and schemaVersion coerce unknown values to safe defaults", () => {
