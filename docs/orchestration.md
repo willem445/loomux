@@ -427,10 +427,28 @@ durable state (task board, `set_state`, relevant GitHub issues/PRs) — the tool
 never blocks, if that looks skipped. If a group sets a context-usage threshold (percent of
 the model's context window), crossing it delivers a `[loomux] context at NN% …` notice; if
 the agent still hasn't asked by the next check, loomux requests one on its behalf rather than
-letting the CLI hit its own emergency auto-compact with no offload. Whichever way a compact
-gets triggered — the timed nudge, a direct request, the threshold fallback, or the human
-typing `/compact` by hand — once it's done, loomux re-grounds the pane in its full role
-instructions (not just a pointer to go re-read them) and prompts it to re-sync live state.
+letting the CLI hit its own emergency auto-compact with no offload.
+
+**Loomux also catches that emergency auto-compact itself, when it happens anyway.** There's
+no way to plan around a compact nobody asked for, but loomux recognizes Claude Code's own
+auto-compact banner in the pane and treats it the same as any other compact: whichever way
+one gets triggered — the timed nudge, a direct request, the threshold fallback, a human
+typing `/compact` by hand, or the CLI's own emergency auto-compact — once it's done, loomux
+re-grounds the pane in its full role instructions (not just a pointer to go re-read them)
+and prompts it to re-sync live state.
+
+**Directive ledger.** Any agent can call `note_directive(text)` to jot down a one-line diary
+entry — a human directive, a scope decision, a piece of feedback — the moment it receives
+one, before acting on it. The point is timing: an emergency auto-compact strikes with no
+warning turn, so there's no "offload before it happens" moment to rely on for something that
+only ever lived in the conversation. Loomux embeds each agent's own ledger (its recent tail,
+size-capped, pointing at the full file if anything had to be cut) right alongside the role
+instructions in that same re-grounding notice, so a directive survives a compact even when
+nothing warned anyone first. `note_directive(text, replace: true)` rewrites the whole ledger
+in one shot — how an agent curates it after being shown its own tail, dropping anything
+already done or no longer relevant. The ledger lives at
+`<data dir>/loomux/orchestration/<group>/ledger-<agent-id>.log` — a plain, human-readable
+file, one entry per line, that a human can open directly.
 
 ## Persistence & restart
 
@@ -441,7 +459,8 @@ Each group keeps durable state under
   every change);
 - `audit.jsonl` — every tool call, prompt, spawn, and exit, one JSON line each;
 - `agents.json` — the roster (which sessions belonged to which role);
-- the rendered role instructions.
+- the rendered role instructions;
+- `ledger-<agent-id>.log` — each agent's own directive ledger (see **Compact-nudge** above).
 
 The group id is derived from the repo path, so relaunching an orchestrator on the
 same repo resumes its state; GitHub issues remain the source of truth for the

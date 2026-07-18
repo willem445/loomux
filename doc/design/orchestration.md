@@ -1399,6 +1399,93 @@ limit.
   purpose is being the less-recommended alternative wasn't worth the added config surface
   here. Revisit if a real need for the pointer mode shows up.
 
+### #329 expansion: the directive ledger and the fourth trigger path
+
+#328's re-injection fixes *role* identity: an agent that comes back from a compact is
+re-grounded in the contract it was kickoff'd with. It does nothing for *session-scoped*
+state — a live-only fact the human handed the agent mid-conversation (a scope decision, a
+directive, a piece of feedback) that never made it to the board or `set_state`. The
+incident that drove this: on v0.10.0 an orchestrator hit the CLI's own emergency
+auto-compact mid-task and came back a generic agent with every mid-session human directive
+gone — #328's three trigger paths (agent-requested, threshold-escalation fallback,
+human-typed `/compact`) all assume something ASKED for the compact and can offload first;
+the CLI deciding on its own, unprompted, is exactly the case none of them cover. This
+expansion adds a fourth trigger path for that case, and a durable diary so a directive
+survives it even when nothing warned anyone first.
+
+- **Directive ledger: a diary kept at receipt time, not a deathbed dump.** `note_directive
+  (text, replace?)` is a new MCP tool, in the identical shared tier as `request_compact` —
+  every non-solo role (orchestrator, worker, reviewer, planner), self-scoped to the CALLING
+  agent's own entry with no `group_id`-style path segment and no cross-pane power, the same
+  discipline held everywhere else in this file. The whole point is timing: an emergency
+  auto-compact gives no warning turn, so "offload what matters before it lands" (#328's
+  advice for the other three paths) doesn't work here — the agent has to have already
+  written down the directive the moment it received it, before doing anything else with it.
+  A plain call appends one timestamped line to a per-agent ledger file
+  (`<group-dir>/ledger-<agent-id>.log`, alongside `audit.jsonl` — human-inspectable the same
+  way, per the #240 precedent); `replace: true` rewrites the file wholesale, which is how an
+  agent CURATES it — typically right after a re-injection has just shown it its own tail,
+  dropping entries that are done or no longer relevant so the diary doesn't grow forever.
+  The append path (`append_ledger_line`) reuses `append_audit`'s one-buffer/one-`write_all`
+  atomicity rule but needs none of its `AUDIT_LOCK` rotation machinery: a ledger file has
+  exactly one writer (its own owning agent) and no rotation, so there is no rotate-vs-append
+  race to guard against in the first place.
+- **Embedded in the SAME re-injection notice, size-capped with a stated truncation.**
+  `compact_reinjection_notice` gained a second parameter — the ledger section, produced by
+  `directive_ledger_embed(ledger, cap_bytes, ledger_path)` — folded in after the
+  instructions and before the re-sync line. An empty or missing ledger embeds nothing (no
+  header with nothing under it) for every agent that has never called `note_directive`, so
+  this is a no-op change for a session that doesn't use the feature. `directive_ledger_embed`
+  keeps the TAIL when the ledger exceeds `DIRECTIVE_LEDGER_EMBED_CAP_BYTES` (2KB), cut on a
+  line boundary so a truncation never slices one entry in half, and always keeps at least
+  the single newest entry even if it alone exceeds the cap — a directive is never silently
+  dropped for being long, only ever declared truncated, with the count and the full file's
+  path named in the embed text (the repo's no-silent-caps rule for bounded-coverage
+  features). This is a diary for what the human said, not a replacement for the board or
+  `set_state` — durable decisions with lasting consequence still belong there too, and the
+  templates say so.
+- **The fourth trigger path: detecting the CLI's OWN auto-compact.** #328's three paths all
+  converge on the same `AgentEntry.compact_pending` flag, resolved by the shared
+  busy-then-quiet detector once compaction is observed to have finished. None of them ever
+  SET that flag for an auto-compact the CLI decides on its own — there is no
+  `request_compact` call, no heuristic timer fire, and no human typing `/compact` to detect.
+  Claude Code renders a spinner line while it auto-compacts, observed (1.0.x) as `✢
+  Compacting conversation… (esc to interrupt · 8s · ↓ 172 tokens)` — a stable `Compacting
+  conversation` core wrapped in a spinner glyph and a live elapsed-time/token-count suffix
+  that both change every repaint. `auto_compact_banner_detected(cli, tail)` matches only
+  that stable substring, via a per-CLI substring table
+  (`auto_compact_banner_substrings`, `SUPPORTED_CLIS`-shaped: keyed by CLI, empty for any
+  CLI with no known banner) rather than an `if cli == "claude"` inline in the generic
+  pipeline — this repo never bakes one CLI's quirks into product code, and a second CLI's
+  banner (should one ever need detecting) is a one-line table addition, not a pipeline
+  change. The exact string is a documented assumption, not a guarantee this repo controls:
+  if the detector stops firing, re-verifying it against a current Claude Code build is the
+  first thing to check.
+  **The recency gate is `!currently_quiet`, not a duration window, and that was a design
+  correction made during this same PR.** The first draft gated detection on a
+  `MANUAL_COMPACT_DETECT_WINDOW_MS`-style duration compared against
+  `AgentEntry.last_progress_ms`, mirroring `human_typed_compact_detected`'s guard against a
+  stale tail. That mirror doesn't hold: `last_progress_ms` is *rewritten to `now`* by this
+  same tick's own growth check whenever the pane is busy for ANY reason, so a window
+  compared against it reads as "fresh" on every busy tick regardless of why the tail
+  contains the banner text — it would have passed even for banner text left over from a
+  compact that resolved an hour ago, on the next unrelated busy tick. The fix: gate on
+  `!currently_quiet` — this tick's OWN observed growth, not a timestamp — so a banner is
+  only trusted the instant real new output is seen alongside it, never inferred from a
+  stale tail on a tick with no growth at all. Still best-effort and tolerant of the tail's
+  bounded ring, same as every other detector here: it cannot prove the fresh growth and the
+  banner text are the same event, only that something changed just now. `compact_seen_busy`
+  is set `true` at the same moment (not left for a later tick), since the banner match itself
+  IS the busy signal, caught mid-compaction rather than inferred after the fact.
+- **What this does not build.** #397 (filed as a follow-up, not built here) proposes a
+  claude-CLI-tier `PreCompact` hook that shapes Claude Code's OWN compaction summary so
+  directives survive *inside* it verbatim — a structurally different, more elegant fix than
+  a separate ledger file, but Claude-specific and dependent on a hook this repo doesn't use
+  anywhere else today. This expansion's ledger-plus-banner-detection approach works
+  independently of whether that hook ever lands (and independently of which CLI is
+  running), so the two are complementary rather than one blocking the other; #397 stays
+  scoped to its own issue rather than folded in here.
+
 ## Enforced merge gate (#83)
 
 Template guidance is not a security boundary. A live incident proved it: an orchestrator merged
