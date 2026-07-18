@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-orch-set-compact-nudge-minutes"
+description = "Enables the orch_set_compact_nudge_minutes command without any pre-configured scope."
+commands.allow = ["orch_set_compact_nudge_minutes"]
+
+[[permission]]
+identifier = "deny-orch-set-compact-nudge-minutes"
+description = "Denies the orch_set_compact_nudge_minutes command without any pre-configured scope."
+commands.deny = ["orch_set_compact_nudge_minutes"]
