@@ -1155,6 +1155,15 @@ const SET_STATE_RECENCY_WINDOW_MS: u64 = 15 * 60_000;
 /// handled. Generous relative to `IDLE_TICK_INTERVAL` (the tick cadence that
 /// reads it) so a slow-typed command is never missed.
 const MANUAL_COMPACT_DETECT_WINDOW_MS: u64 = 3 * 60_000; // 3x IDLE_TICK_INTERVAL's 60s
+/// Directive ledger (#329 expansion): max bytes of a pane's ledger tail
+/// embedded verbatim in its post-compact re-grounding notice. The file on
+/// disk is never truncated — only what gets PASTED into the pane is capped,
+/// the same relationship the reinjected instructions text already has to the
+/// (much larger) conversation it's re-grounding. Sized generously relative to
+/// a one-line diary entry so a normal session's ledger fits whole; the tail
+/// (most recent entries) survives a cut, never the head, because the newest
+/// directives are the ones most likely to still be live.
+const DIRECTIVE_LEDGER_EMBED_CAP_BYTES: usize = 2048;
 /// How often the attention scan recomputes which panes need the human
 /// (idle-with-prompt detection; report/gate signals are event-driven and
 /// picked up on the next tick).
@@ -2416,24 +2425,126 @@ pub fn human_typed_compact_detected(tail: &str) -> bool {
     tail.lines().any(|line| line.split_whitespace().any(|tok| tok == "/compact"))
 }
 
-/// The mandatory post-compact re-grounding prompt (#328), delivered once
-/// compaction is detected as finished, regardless of which of the three
-/// trigger paths (agent-requested, threshold-escalation fallback, or a human
-/// typing `/compact` manually) started it. `instructions` is the exact
-/// contract text the pane was kickoff'd with (read back from the durable
-/// instructions file loomux already writes at spawn — see
-/// `write_instruction_files`), embedded verbatim rather than pointing the
-/// agent at a file to go re-read: compaction preserves a summary of the
-/// CONVERSATION, but the operating rules can get diluted in that summary, and
-/// re-injecting the source text is the only way to guarantee the agent is
-/// grounded in what loomux actually seeded it with, not a paraphrase of a
-/// paraphrase. Always also tells it to re-sync live state, since the
-/// instructions file alone doesn't carry runtime facts (task board, group
-/// state, roster).
-pub fn compact_reinjection_notice(instructions: &str) -> String {
+/// Directive ledger (#329 expansion): per-CLI stable substrings that appear in
+/// a pane's own rendered output while IT (not a human, not loomux) is
+/// actively auto-compacting. Keyed the same way `compact_nudge_cli_supported`
+/// gates the rest of this feature to `SUPPORTED_CLIS`, so adding a CLI's
+/// banner is a one-line addition here, never a change to the generic
+/// detection/pipeline code that calls `auto_compact_banner_detected` — this
+/// repo is never allowed to bake one CLI's quirks into product code (see
+/// CLAUDE.md's toolchain-agnostic constraint; the analogous concern here is
+/// *agent-CLI*-agnostic, not toolchain, but the same rule: express it as
+/// per-CLI data, not an `if cli == "claude"` buried in the tick).
+///
+/// Claude Code's own emergency auto-compact renders a spinner line while it
+/// runs, observed (1.0.x) as `✢ Compacting conversation… (esc to interrupt ·
+/// 8s · ↓ 172 tokens)` — a leading spinner glyph and a trailing elapsed-
+/// time/token-count suffix that both change on every repaint, wrapped around
+/// a stable `Compacting conversation` core. Matching only that core substring
+/// is the documented assumption: it is expected to survive across CLI point
+/// releases even if the spinner or counters' exact formatting doesn't, but it
+/// is a string this repo does not control and could change in a future
+/// release without notice — if this detector stops firing, that is the first
+/// thing to re-verify against a current build. No other supported CLI has a
+/// known equivalent yet; an empty slice means "never detected for this CLI",
+/// not a build error.
+fn auto_compact_banner_substrings(cli: &str) -> &'static [&'static str] {
+    match cli {
+        "claude" => &["Compacting conversation"],
+        _ => &[],
+    }
+}
+
+/// Directive ledger (#329 expansion): whether `cli`'s pane output tail shows
+/// ITS OWN auto-compact running right now — the fourth trigger path, distinct
+/// from all three #328 covers (agent-requested, threshold-escalation
+/// fallback, human-typed `/compact`), because every one of those is loomux
+/// either pasting `/compact` itself or detecting someone else doing so. None
+/// of them see the CLI silently deciding on its own that context is full and
+/// compacting without asking anyone — the exact incident driving this
+/// expansion: an orchestrator came back from one as a generic agent with
+/// every mid-session human directive gone, because loomux never learned a
+/// compact had happened at all, so the mandatory post-compact re-injection
+/// (#328) never fired. Pure so the substring match is testable without a
+/// registry; the caller (`compact_nudge_tick`) applies the recency gate
+/// against the pane's own last-observed-growth timestamp, mirroring
+/// `human_typed_compact_detected`'s recency gate on human input.
+pub fn auto_compact_banner_detected(cli: &str, tail: &str) -> bool {
+    auto_compact_banner_substrings(cli).iter().any(|s| tail.contains(s))
+}
+
+/// Directive ledger (#329 expansion): the ledger section embedded verbatim in
+/// the post-compact re-grounding notice, or `None` for an empty/missing
+/// ledger — nothing is embedded rather than a header with nothing under it.
+/// Keeps the TAIL (most recent entries) when `ledger` exceeds `cap_bytes`,
+/// cut on a line boundary so truncation never slices one entry in half, and
+/// always includes at least the single newest entry even if it alone exceeds
+/// the cap — a directive is never silently dropped for being long, only ever
+/// declared truncated. States the truncation and points at `ledger_path` for
+/// the full file rather than a silent cap (this repo's no-silent-caps rule
+/// for every bounded-coverage feature).
+pub fn directive_ledger_embed(ledger: &str, cap_bytes: usize, ledger_path: &str) -> Option<String> {
+    let trimmed = ledger.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lines: Vec<&str> = trimmed.lines().collect();
+    let mut tail: Vec<&str> = Vec::new();
+    let mut used = 0usize;
+    for line in lines.iter().rev() {
+        let line_len = line.len() + 1; // +1 for the newline joining it back
+        if used + line_len > cap_bytes && !tail.is_empty() {
+            break;
+        }
+        used += line_len;
+        tail.push(line);
+    }
+    tail.reverse();
+    let truncated = tail.len() < lines.len();
+    let body = tail.join("\n");
+    Some(if truncated {
+        format!(
+            "Your directive ledger (most recent {} of {} entries — full history at {ledger_path}):\n{body}",
+            tail.len(),
+            lines.len()
+        )
+    } else {
+        format!("Your directive ledger:\n{body}")
+    })
+}
+
+/// The mandatory post-compact re-grounding prompt (#328, extended #329),
+/// delivered once compaction is detected as finished, regardless of which of
+/// the four trigger paths (agent-requested, threshold-escalation fallback, a
+/// human typing `/compact` manually, or the CLI's own auto-compact banner)
+/// started it. `instructions` is the exact contract text the pane was
+/// kickoff'd with (read back from the durable instructions file loomux
+/// already writes at spawn — see `write_instruction_files`), embedded
+/// verbatim rather than pointing the agent at a file to go re-read:
+/// compaction preserves a summary of the CONVERSATION, but the operating
+/// rules can get diluted in that summary, and re-injecting the source text is
+/// the only way to guarantee the agent is grounded in what loomux actually
+/// seeded it with, not a paraphrase of a paraphrase.
+///
+/// `ledger_embed` is `directive_ledger_embed`'s output — the pane's own
+/// diary of human directives/scope-decisions/feedback, folded in alongside
+/// the instructions for the same reason: a compaction summary can dilute a
+/// directive as easily as it dilutes a rule, and the CLI's own emergency
+/// auto-compact (trigger path four) gives no warning turn to re-state
+/// anything first. `None` embeds nothing — an agent whose ledger is empty
+/// sees exactly the #328 notice, unchanged.
+///
+/// Always also tells the agent to re-sync live state, since the instructions
+/// file (and the ledger) don't carry runtime facts (task board, group state,
+/// roster).
+pub fn compact_reinjection_notice(instructions: &str, ledger_embed: Option<&str>) -> String {
+    let ledger_section = match ledger_embed {
+        Some(l) => format!("\n\n{l}"),
+        None => String::new(),
+    };
     format!(
         "[loomux] Context was compacted. Re-grounding you in your role instructions before \
-         you act — the summary above may have diluted them:\n\n{instructions}\n\n\
+         you act — the summary above may have diluted them:\n\n{instructions}{ledger_section}\n\n\
          Now re-sync live state: list_tasks, get_state, list_agents."
     )
 }
@@ -4432,6 +4543,22 @@ fn append_audit(root: &Path, group: &str, actor: &str, action: &str, detail: Val
     }
 }
 
+/// Directive ledger (#329 expansion): append one line to a pane's ledger
+/// file. Same single-`write_all` rule as `append_audit` (rule 1 in its doc)
+/// is what makes the append atomic — but unlike `audit.jsonl`, a ledger file
+/// has exactly one writer (the owning agent, self-scoped via `note_directive`)
+/// and no rotation, so there is no second process or rotate-vs-append race to
+/// guard against and no need for `AUDIT_LOCK`-style serialization.
+fn append_ledger_line(path: &Path, line: &str) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let mut buf = line.to_string();
+    buf.push('\n');
+    let mut f = fs::OpenOptions::new().create(true).append(true).open(path)?;
+    f.write_all(&buf.into_bytes())
+}
+
 /// One parsed audit-log line, for the in-app timeline viewer. Mirrors the
 /// shape written by `append_audit`; `detail` stays an opaque JSON value so the
 /// frontend can render per-action without the backend knowing every schema.
@@ -5260,6 +5387,16 @@ impl OrchRegistry {
     /// on group end alongside the worktrees.
     fn attachments_dir(&self, group: &str) -> PathBuf {
         self.group_dir(group).join("attachments")
+    }
+
+    /// Directive ledger (#329 expansion): one pane's ledger file, directly in
+    /// the group dir alongside `audit.jsonl` — human-inspectable the same
+    /// way, per the #240 precedent. Keyed by agent id, not by role/block
+    /// (unlike the instructions files): a pane's own directives are its own
+    /// regardless of which block it's running, and a resume should still see
+    /// them. See `note_directive`, the sole writer.
+    fn ledger_path(&self, group: &str, agent_id: &str) -> PathBuf {
+        self.group_dir(group).join(format!("ledger-{agent_id}.log"))
     }
 
     /// The CLI the group's orchestrator runs (`claude`/`copilot`/…), resolving
@@ -8518,17 +8655,36 @@ impl OrchRegistry {
     /// Two more independent pieces of state ride the same per-agent pass
     /// (#328), each gated so the group's existing behavior is unchanged when
     /// unused:
-    /// - **Compaction-completion detection**, shared by all three trigger
-    ///   paths (a heuristic/requested fire below, or a human typing
-    ///   `/compact` manually, detected via `human_typed_compact_detected` on
-    ///   the pane's own output tail). `AgentEntry.compact_pending` tracks "a
+    /// - **Compaction-completion detection**, shared by all FOUR trigger
+    ///   paths (a heuristic/requested fire below; a human typing `/compact`
+    ///   manually, detected via `human_typed_compact_detected`; or the CLI's
+    ///   own auto-compact banner, detected via `auto_compact_banner_detected`
+    ///   — #329 expansion, see below). `AgentEntry.compact_pending` tracks "a
     ///   compact was initiated, not yet resolved"; `compact_seen_busy` is the
     ///   busy half of the busy-then-quiet edge that marks it finished — no
     ///   text-parsing of Claude's own completion output needed, since
     ///   `compact_nudge_tick` already has a busy/quiet detector for its own
     ///   idleness signal. Resolution delivers the MANDATORY
     ///   `compact_reinjection_notice` (the instructions file read back and
-    ///   embedded verbatim), superseding #287's optional post-fire notice.
+    ///   embedded verbatim, plus the pane's directive ledger — #329
+    ///   expansion), superseding #287's optional post-fire notice.
+    /// - **Auto-compact banner detection (#329 expansion)**: the CLI's own
+    ///   emergency auto-compact never goes through `request_compact`, a
+    ///   heuristic fire, or a human typing `/compact` — none of those three
+    ///   paths ever set `compact_pending`, so without this the mandatory
+    ///   re-injection above would simply never fire for it, which is the
+    ///   exact incident that motivated this expansion. Detected from the same
+    ///   output tail the manual-`/compact` detector already reads, gated on
+    ///   `!compact_pending` (nothing else already tracking this pane) and
+    ///   `!currently_quiet` — this tick's OWN fresh-growth signal, not a
+    ///   duration-based window: `last_progress_ms` gets rewritten to `now` by
+    ///   the growth check whenever the pane is busy for any reason, so a
+    ///   window compared against it would read as "fresh" on every busy tick
+    ///   regardless of why the tail holds the banner text. Requiring growth
+    ///   on the SAME tick the banner is read is the strongest signal actually
+    ///   available. Sets `compact_seen_busy` immediately (the banner IS the
+    ///   busy signal, caught mid-compaction rather than inferred after the
+    ///   fact from a separate growth observation).
     /// - **Context-usage escalation**: once `compact_context_threshold_percent`
     ///   is crossed (percent from `usage::latest_context_tokens`, an exact
     ///   transcript-recorded figure, not a byte proxy — see that fn's doc),
@@ -8556,7 +8712,7 @@ impl OrchRegistry {
         let tick_times = self.compact_nudge_times.lock_safe().clone();
 
         let mut to_fire: Vec<(String, String)> = Vec::new();
-        let mut to_reinject: Vec<(String, String, PathBuf)> = Vec::new();
+        let mut to_reinject: Vec<(String, String, PathBuf, PathBuf)> = Vec::new();
         let mut to_escalate: Vec<(String, String, u32)> = Vec::new();
         {
             let mut agents = self.agents.lock_safe();
@@ -8599,7 +8755,8 @@ impl OrchRegistry {
                             .map(|b| b.instructions_file())
                             .unwrap_or_else(|| a.role.instructions_file().to_string()),
                     );
-                    to_reinject.push((a.id.clone(), a.group.clone(), instructions));
+                    let ledger = self.ledger_path(&a.group, &a.id);
+                    to_reinject.push((a.id.clone(), a.group.clone(), instructions, ledger));
                 }
 
                 // A paused group's agents are deliberately quiet; never nudge,
@@ -8620,6 +8777,39 @@ impl OrchRegistry {
                         {
                             a.compact_pending = true;
                             a.compact_seen_busy = false;
+                        }
+                    }
+                }
+
+                // Auto-compact banner detection (#329 expansion, 4th trigger
+                // path): the CLI's OWN emergency auto-compact — no
+                // `request_compact` call, no heuristic fire, no human typing
+                // `/compact` — so none of the checks above ever see it start.
+                // Reuses the same tail already read for manual detection;
+                // gated on nothing already pending, plus `!currently_quiet`
+                // (computed above, from THIS tick's real output growth) —
+                // deliberately NOT a duration-based recency window like
+                // `MANUAL_COMPACT_DETECT_WINDOW_MS`: `last_progress_ms` gets
+                // rewritten to `now` by the growth check earlier in this same
+                // iteration whenever the pane is busy for ANY reason, so
+                // comparing "now" against it would trivially read as fresh on
+                // every busy tick regardless of why the tail contains the
+                // banner text — not a real recency signal at all. Requiring
+                // fresh growth on THIS exact tick is the strongest signal
+                // actually available: a banner sitting in the tail with NO
+                // new output since is definitely stale (an already-resolved
+                // compact, or scrollback that never left); still best-effort,
+                // same as `human_typed_compact_detected`, if unrelated fresh
+                // growth happens to land in the same observation window as
+                // old banner text still inside the tail's bounded ring.
+                // `compact_seen_busy` is set true immediately, not left for a
+                // later tick to observe — the banner match IS the busy
+                // signal, caught mid-compaction.
+                if !a.compact_pending && !currently_quiet {
+                    if let Some((tail, _)) = manual_signals.get(&a.id) {
+                        if auto_compact_banner_detected(g.cli_for(a.role), tail) {
+                            a.compact_pending = true;
+                            a.compact_seen_busy = true;
                         }
                     }
                 }
@@ -8722,10 +8912,19 @@ impl OrchRegistry {
             self.audit(&group, "loomux", "compact-escalation", json!({ "agent": id, "percent": percent }));
             let _ = self.deliver_prompt(&id, &compact_escalation_notice(percent), "loomux", Delivery::MidSession);
         }
-        for (id, group, instructions_path) in to_reinject {
+        for (id, group, instructions_path, ledger_path) in to_reinject {
             let text = fs::read_to_string(&instructions_path).unwrap_or_default();
-            self.audit(&group, "loomux", "compact-reinjection", json!({ "agent": id }));
-            let _ = self.deliver_prompt(&id, &compact_reinjection_notice(&text), "loomux", Delivery::MidSession);
+            // Missing/empty ledger reads as "" and `directive_ledger_embed`
+            // turns that into `None` — nothing embeds for a pane that never
+            // called `note_directive`, so this is a no-op for every session
+            // until the directive-ledger feature is actually used.
+            let ledger = fs::read_to_string(&ledger_path).unwrap_or_default();
+            let ledger_path_str = ledger_path.display().to_string();
+            let ledger_embed = directive_ledger_embed(&ledger, DIRECTIVE_LEDGER_EMBED_CAP_BYTES, &ledger_path_str);
+            self.audit(&group, "loomux", "compact-reinjection",
+                json!({ "agent": id, "ledger_embedded": ledger_embed.is_some() }));
+            let notice = compact_reinjection_notice(&text, ledger_embed.as_deref());
+            let _ = self.deliver_prompt(&id, &notice, "loomux", Delivery::MidSession);
         }
         nudged
     }
@@ -8865,6 +9064,56 @@ impl OrchRegistry {
         if let Some(a) = self.agents.lock_safe().get_mut(agent_id) {
             a.last_state_write_ms = now_ms();
         }
+    }
+
+    /// Directive ledger (#329 expansion): self-scoped append (default) or
+    /// full-rewrite (`replace: true`) of the CALLING agent's own ledger — the
+    /// diary a human directive, scope decision, or piece of feedback is
+    /// recorded into at RECEIPT time, precisely because the CLI's own
+    /// emergency auto-compact (see `auto_compact_banner_detected`) gives no
+    /// warning turn to backfill one from memory afterward. Mirrors
+    /// `request_compact`'s self-scoping: the token that resolves to
+    /// `agent_id` is the entire trust surface, so there is no `group_id`-style
+    /// path segment and no cross-pane power — an agent can only ever touch
+    /// its own ledger file (`ledger_path`).
+    ///
+    /// `replace: true` is how an agent CURATES the ledger — typically right
+    /// after the post-compact re-injection has just shown it its own tail
+    /// verbatim — dropping entries that are done or no longer relevant rather
+    /// than letting it grow forever; `text` in that mode is the whole
+    /// replacement ledger, not one more line. A plain append (the default)
+    /// never loses a prior entry to a curation mistake in this code, only
+    /// ever to the calling agent's own judgment on a later `replace`.
+    ///
+    /// Each append is stamped with `now_ms()` for a human skimming the file
+    /// directly (matching `audit.jsonl`'s `ts_ms` convention); `replace`
+    /// writes `text` verbatim; a replacement without a trailing newline gets
+    /// one added, so a later append can never land glued onto its last line.
+    /// Audited like any other durable write (#240): the text itself is not
+    /// duplicated into the audit log (the ledger file already holds it in
+    /// full), only the fact and shape of the write.
+    pub fn note_directive(&self, agent_id: &str, text: &str, replace: bool) -> Result<String, String> {
+        let a = self.agent(agent_id).ok_or("unknown agent")?;
+        let text = text.trim();
+        if text.is_empty() {
+            return Err("text must not be empty".into());
+        }
+        let path = self.ledger_path(&a.group, agent_id);
+        if replace {
+            let mut body = text.to_string();
+            if !body.ends_with('\n') {
+                body.push('\n');
+            }
+            atomic_write(&path, body.as_bytes()).map_err(|e| e.to_string())?;
+        } else {
+            append_ledger_line(&path, &format!("[{}] {text}", now_ms())).map_err(|e| e.to_string())?;
+        }
+        self.audit(&a.group, agent_id, "note-directive", json!({ "replace": replace, "bytes": text.len() }));
+        Ok(if replace {
+            "ledger replaced".to_string()
+        } else {
+            "directive recorded".to_string()
+        })
     }
 
     // ---------- attention routing: surface which pane needs the human ----------

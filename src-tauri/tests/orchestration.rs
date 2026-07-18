@@ -16,6 +16,7 @@ use loomux_lib::orchestration::{
     claude_permission_mode, cli_ready, compact_checklist_warning, compact_escalation_notice,
     compact_escalation_should_fire, compact_nudge_cli_supported, compact_nudge_role_allowed,
     compact_reinjection_notice, compact_request_should_fire, context_percent_used,
+    auto_compact_banner_detected, directive_ledger_embed,
     human_typed_compact_detected, copilot_autopilot_prompt_detected, create_orchestration_group,
     delivery_held_cleared_event, delivery_held_detail, delivery_held_event,
     exit_cause, exit_diagnostic, resolve_output_text,
@@ -5458,10 +5459,68 @@ fn human_typed_compact_detected_matches_standalone_tokens_only() {
 #[test]
 fn compact_reinjection_notice_embeds_the_instructions_verbatim() {
     let instructions = "You are the orchestrator...\nNever merge without a gate.";
-    let n = compact_reinjection_notice(instructions);
+    let n = compact_reinjection_notice(instructions, None);
     assert!(n.starts_with("[loomux]"));
     assert!(n.contains(instructions), "must embed the FULL instructions text, not a pointer to go read it");
     assert!(n.contains("list_tasks") && n.contains("get_state") && n.contains("list_agents"), "got: {n}");
+    assert!(!n.contains("directive ledger"), "None must embed nothing — no ledger header for an agent that never used it");
+}
+
+#[test]
+fn compact_reinjection_notice_folds_in_the_ledger_when_present() {
+    let instructions = "You are a worker...";
+    let n = compact_reinjection_notice(instructions, Some("Your directive ledger:\n[1] scope to auth only"));
+    assert!(n.contains(instructions), "instructions still embedded");
+    assert!(n.contains("scope to auth only"), "got: {n}");
+    // The ledger must land AFTER the instructions and BEFORE the re-sync
+    // line — re-grounding first, then the diary, then the live-state pointer.
+    let ins_pos = n.find(instructions).unwrap();
+    let ledger_pos = n.find("scope to auth only").unwrap();
+    let resync_pos = n.find("Now re-sync live state").unwrap();
+    assert!(ins_pos < ledger_pos && ledger_pos < resync_pos, "got: {n}");
+}
+
+#[test]
+fn directive_ledger_embed_is_none_for_empty_or_whitespace_only() {
+    assert!(directive_ledger_embed("", 2048, "C:/g/ledger-w-1.log").is_none());
+    assert!(directive_ledger_embed("   \n  \n", 2048, "C:/g/ledger-w-1.log").is_none());
+}
+
+#[test]
+fn directive_ledger_embed_keeps_the_tail_and_states_truncation() {
+    // Ten one-line entries, cap tight enough that only the last few fit.
+    let ledger: String = (1..=10).map(|i| format!("[{i}] entry number {i}\n")).collect();
+    let cap = 40; // enough for ~2 short lines, not all 10
+    let embed = directive_ledger_embed(&ledger, cap, "C:/g/ledger-w-1.log").unwrap();
+    assert!(embed.contains("entry number 10"), "must keep the NEWEST entry: {embed}");
+    assert!(!embed.contains("entry number 1\n"), "oldest entry must be the one dropped: {embed}");
+    assert!(embed.contains("full history at C:/g/ledger-w-1.log"), "truncation must name the file: {embed}");
+    assert!(embed.contains("most recent"), "truncation must be stated, not silent: {embed}");
+}
+
+#[test]
+fn directive_ledger_embed_never_drops_the_single_newest_entry_even_over_cap() {
+    let ledger = "a much longer single directive entry than the tiny cap below allows for";
+    let embed = directive_ledger_embed(ledger, 8, "C:/g/ledger-w-1.log").unwrap();
+    assert!(embed.contains(ledger), "the newest entry is never silently dropped for being long: {embed}");
+}
+
+#[test]
+fn directive_ledger_embed_omits_truncation_wording_when_everything_fits() {
+    let ledger = "[1] only one short entry";
+    let embed = directive_ledger_embed(ledger, 2048, "C:/g/ledger-w-1.log").unwrap();
+    assert!(embed.contains(ledger));
+    assert!(!embed.contains("most recent"), "no truncation language when nothing was cut: {embed}");
+    assert!(!embed.contains("full history at"), "no file pointer needed when nothing was cut: {embed}");
+}
+
+#[test]
+fn auto_compact_banner_detected_matches_claudes_stable_substring_only() {
+    assert!(auto_compact_banner_detected("claude", "✢ Compacting conversation… (esc to interrupt · 8s · ↓ 172 tokens)"));
+    assert!(auto_compact_banner_detected("claude", "Compacting conversation"));
+    assert!(!auto_compact_banner_detected("claude", "editing src/compact_nudge.rs"), "unrelated pane text must not match");
+    assert!(!auto_compact_banner_detected("claude", ""));
+    assert!(!auto_compact_banner_detected("copilot", "Compacting conversation"), "no known banner for copilot yet — never guessed");
 }
 
 #[test]
@@ -5474,6 +5533,73 @@ fn request_compact_is_self_scoped_and_cli_gated() {
     assert!(msg.contains("compact requested"), "got: {msg}");
     assert!(reg.agent(&o.id).unwrap().compact_requested, "flag set on the CALLING agent");
     assert!(!reg.agent(&w.id).unwrap().compact_requested, "never set on another pane in the same group");
+}
+
+#[test]
+fn note_directive_appends_are_self_scoped_and_isolated_per_agent() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let o = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "work", false, None).unwrap();
+
+    reg.note_directive(&o.id, "scope to auth only", false).unwrap();
+    reg.note_directive(&o.id, "second directive", false).unwrap();
+    reg.note_directive(&w.id, "worker-only note", false).unwrap();
+
+    let ledger_o = fs::read_to_string(reg.state_root().join(&g.id).join(format!("ledger-{}.log", o.id))).unwrap();
+    assert!(ledger_o.contains("scope to auth only") && ledger_o.contains("second directive"));
+    assert!(!ledger_o.contains("worker-only note"), "one agent must never see another's ledger");
+
+    let ledger_w = fs::read_to_string(reg.state_root().join(&g.id).join(format!("ledger-{}.log", w.id))).unwrap();
+    assert!(ledger_w.contains("worker-only note"));
+    assert!(!ledger_w.contains("scope to auth only"), "cross-pane isolation holds the other direction too");
+}
+
+#[test]
+fn note_directive_rejects_empty_text_and_unknown_agent() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let o = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    assert!(reg.note_directive(&o.id, "   ", false).is_err(), "whitespace-only text is not a directive");
+    assert!(reg.note_directive("no-such-agent", "text", false).is_err());
+}
+
+#[test]
+fn note_directive_replace_rewrites_the_whole_ledger() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let o = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    reg.note_directive(&o.id, "stale entry to be curated away", false).unwrap();
+    reg.note_directive(&o.id, "curated ledger — only this survives", true).unwrap();
+    let ledger = fs::read_to_string(reg.state_root().join(&g.id).join(format!("ledger-{}.log", o.id))).unwrap();
+    assert!(ledger.contains("curated ledger — only this survives"));
+    assert!(!ledger.contains("stale entry to be curated away"), "replace must not just append the curation on top");
+}
+
+#[test]
+fn mcp_note_directive_dispatch_is_self_scoped() {
+    let (reg, _d, co, cw) = setup_mcp();
+    let out = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "note_directive", "arguments": { "text": "human said: focus on #42" } })).unwrap();
+    assert_eq!(out["isError"], false);
+    let text = out["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("recorded"), "got: {text}");
+    let ledger_o = fs::read_to_string(reg.state_root().join(&co.group).join(format!("ledger-{}.log", co.agent_id))).unwrap();
+    assert!(ledger_o.contains("human said: focus on #42"));
+
+    // Self-scoped: the worker's own call must never land in the orchestrator's ledger.
+    dispatch(&reg, &cw, "tools/call",
+        &json!({ "name": "note_directive", "arguments": { "text": "worker-only note" } })).unwrap();
+    let ledger_o_after = fs::read_to_string(reg.state_root().join(&co.group).join(format!("ledger-{}.log", co.agent_id))).unwrap();
+    assert!(!ledger_o_after.contains("worker-only note"), "cross-pane leak via dispatch");
+}
+
+#[test]
+fn mcp_note_directive_requires_text() {
+    let (reg, _d, co, _cw) = setup_mcp();
+    let out = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "note_directive", "arguments": {} })).unwrap();
+    assert_eq!(out["isError"], true, "missing text must error, not silently no-op");
 }
 
 #[test]
@@ -5622,6 +5748,62 @@ fn compact_nudge_tick_detects_a_manually_typed_compact_and_reinjects_after_it_fi
     let _ = reg.compact_nudge_tick(700, &grew, &HashMap::new(), &HashMap::new());
     assert!(!reg.agent(&oid).unwrap().compact_pending, "resolved");
     assert_eq!(audit_count(&reg, &gid, "compact-reinjection"), 1);
+}
+
+#[test]
+fn compact_nudge_tick_detects_the_clis_own_auto_compact_banner_and_reinjects_after_it_finishes() {
+    let (reg, _d, gid, oid) = compact_nudge_setup(0); // heuristic off — isolate banner detection
+    let banner_tail: HashMap<String, (String, u64)> =
+        [(oid.clone(), ("✢ Compacting conversation… (esc to interrupt · 8s · ↓ 172 tokens)".to_string(), 0u64))]
+            .into_iter()
+            .collect();
+    // The banner appears WHILE the pane is busy — real output growth on the
+    // very same tick, exactly like the CLI actually rendering it.
+    let grew: HashMap<String, u64> = [(oid.clone(), 50_000u64)].into_iter().collect();
+    let nudged = reg.compact_nudge_tick(500, &grew, &banner_tail, &HashMap::new());
+    assert!(nudged.is_empty(), "loomux pastes nothing — the CLI is already compacting on its own");
+    assert!(reg.agent(&oid).unwrap().compact_pending, "the CLI's own auto-compact must start pending tracking");
+    assert_eq!(audit_count(&reg, &gid, "compact-nudge"), 0);
+    // Detected mid-compaction, so `compact_seen_busy` is already true — the
+    // very next quiet tick resolves, no separate busy tick needed first
+    // (unlike the manual-`/compact` path, which only starts pending and
+    // waits for a later busy observation).
+    let _ = reg.compact_nudge_tick(600, &grew, &HashMap::new(), &HashMap::new());
+    assert!(!reg.agent(&oid).unwrap().compact_pending, "resolved on the first quiet tick after detection");
+    assert_eq!(audit_count(&reg, &gid, "compact-reinjection"), 1);
+}
+
+#[test]
+fn compact_nudge_tick_ignores_an_auto_compact_banner_on_a_quiet_tick() {
+    // The tail holds the banner substring, but NO fresh growth landed this
+    // tick — the whole point of gating on `!currently_quiet` rather than a
+    // duration window (see the fn doc): a banner sitting in unchanged tail
+    // content is not news, however long it's been there.
+    let (reg, _d, gid, oid) = compact_nudge_setup(0);
+    let banner_tail: HashMap<String, (String, u64)> =
+        [(oid.clone(), ("Compacting conversation".to_string(), 0u64))].into_iter().collect();
+    let empty = HashMap::new();
+    let _ = reg.compact_nudge_tick(500, &empty, &banner_tail, &HashMap::new());
+    assert!(!reg.agent(&oid).unwrap().compact_pending, "no growth this tick — must not trigger on a quiet read");
+    assert_eq!(audit_count(&reg, &gid, "compact-reinjection"), 0);
+}
+
+#[test]
+fn compact_nudge_tick_never_reads_an_auto_compact_banner_for_an_unsupported_cli() {
+    // Belt-and-suspenders on the outer `compact_nudge_cli_supported` gate at
+    // the top of the per-agent loop: a non-Claude-CLI agent is skipped
+    // entirely before this code is ever reached, so a "Compacting
+    // conversation" string in ITS pane (coincidence, unrelated tooling)
+    // can never be misread as Claude's own auto-compact.
+    let (reg, _d) = test_registry();
+    let rails = Guardrails { agent_cli: "copilot".into(), ..compact_rails(0, &["orchestrator"]) };
+    let g = reg.create_group("C:/tmp/repo", rails).unwrap();
+    let o = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let banner_tail: HashMap<String, (String, u64)> =
+        [(o.id.clone(), ("Compacting conversation".to_string(), 0u64))].into_iter().collect();
+    let grew: HashMap<String, u64> = [(o.id.clone(), 50_000u64)].into_iter().collect();
+    let _ = reg.compact_nudge_tick(500, &grew, &banner_tail, &HashMap::new());
+    assert!(!reg.agent(&o.id).unwrap().compact_pending, "non-Claude CLI must never be read for Claude's banner");
 }
 
 #[test]
