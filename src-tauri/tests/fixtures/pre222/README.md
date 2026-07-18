@@ -178,6 +178,15 @@ so far:
   blocker's one-sentence mechanism) and explicitly never a findings summary. `planner.md` is
   untouched by this one.
 
+- **#332, event-driven intake wake** — `orchestrator.md` only. The **Autonomous mode (idle-tick)**
+  section gains a paragraph naming the host-side gate: a zero-token poll checks for new
+  intake-label/PR-check-state signals before an idle tick fires, a tick with nothing new (and no
+  other wake reason — a pending CI watch, a watchdog stall) is skipped quietly and audited rather
+  than spending a turn, a bounded fallback still wakes the orchestrator unconditionally on a slow
+  cadence regardless, and a tick that DOES fire because of the gate names what changed so the
+  orchestrator doesn't re-poll it. `worker.md`/`reviewer.md`/`planner.md` are untouched by this
+  one.
+
 `the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was` renders
 **these** with the six pre-#222 template variables and asserts that a group launched
 with the advanced orchestrator **off** gets exactly that text. They are the

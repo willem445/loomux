@@ -98,6 +98,18 @@ PRs) simply never runs. Autonomous mode adds the missing **tick source**.
 - **Pause still wins.** A [paused group](orchestration.html#group-lifecycle) is
   skipped entirely — no ticks, no deliveries — and your pause/off toggle is
   instant.
+- **The tick is gated, not unconditional.** By default, the idle window firing
+  is necessary but not sufficient: loomux runs a zero-token, host-side check
+  (`gh issue list` / `gh pr list`, no LLM turn) for the same signals the tick
+  exists to catch, and only wakes the orchestrator when there's something new —
+  or when something else needs it (an outstanding CI watch, an unresolved
+  stalled-worker notice). A tick with nothing to report is skipped quietly
+  (visible in the audit trail as `idle-tick-skipped`, with a reason), and a
+  bounded fallback (every few hours, tunable) still wakes the orchestrator
+  regardless, so a quiet stretch is never left unchecked forever. This is
+  configured per group (`intake_poll_minutes` in `group.json`; `0` keeps the
+  pre-gate behavior of ticking on the window alone) and isn't yet exposed as
+  its own panel control.
 
 Autonomous mode is generic: loomux's own orchestration group is just another
 group, so turning it on for the repo loomux itself is developed in would idle-tick
