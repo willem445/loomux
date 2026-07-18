@@ -41,20 +41,47 @@ terminal," exactly the sentence a split already answers. So:
   SAME way a grid split's own divider already does** — see *Divider
   mechanics* below for exactly what that means, because "one resize on
   release" turns out not to be it.
-- **The embedded panel's own internal changes never reach the PTY.** Once
-  open, refreshing a list, expanding a row, typing in a filter — all of it
-  repaints inside `.pane-embed-panel` only. Verified per view below, not
-  assumed.
+- **The embedded panel's own internal changes never reach the PTY — with one
+  narrow, bounded, and named exception.** For four of the five views (task
+  board, git, issues, audit), refreshing a list, expanding a row, typing in
+  a filter — none of it changes the panel's MINIMUM size, so none of it
+  touches `termEl`. Verified per view below, not assumed. **The group panel
+  is the one view whose own fixed chrome can genuinely grow after it opens**
+  (the suspended-budget banner appearing) — `reclampViewFloor`, generalized
+  from the pre-#361 `reclampGroupOverlay` that has always done the
+  equivalent for the overlay. When the group panel is EMBEDDED and its floor
+  grows, `reclampViewFloor` DOES write to `termEl.style.flex` to keep the
+  growing chrome from clipping — a real, content-triggered PTY resize, not a
+  click. This is an honest exception, not swept under "internal changes
+  never reach the PTY" — it survives scrutiny on three grounds, not by
+  definition: it is **rare** (one specific state transition, not every
+  render or refresh), it is **bounded** (only ever grows the panel to the
+  minimum ITS OWN fixed controls need, never runaway or unbounded), and it
+  drives the exact same `ResizeObserver` → debounced `applyFit()` →
+  same-size-skip path every other resize in this design already does — a
+  new TRIGGER for an existing, already-safe mechanism, not a second one. No
+  other view has an equivalent path today; if one needed it, the same
+  three-part bar (rare, bounded, same mechanism) is what it would have to
+  clear.
 - **The floating overlay is untouched and stays available, for every view.**
   Embedding is an alternative presentation the human opts into, not a
   replacement; every overlay's no-resize mechanics (`overlaysize.ts`,
   `Pane.overlayClamp`, `updateTermShift`) are byte-for-byte what they were
-  before this note.
+  before this note. (The overlay's OWN pre-#361 `reclampGroupOverlay`
+  equivalent never touched the PTY at all — only the overlay's own CSS
+  height — precisely because the overlay never shares real layout space
+  with the terminal in the first place. The embedded case above only exists
+  BECAUSE embedding is a real split with genuinely shared space; it has no
+  overlay-mode counterpart.)
 
-If a future embedded view ever needed continuous resizing driven by
-something OTHER than a direct drag or an explicit toggle, that would cross
+If a future embedded view ever needed CONTINUOUS resizing driven by
+something other than a direct drag or an explicit toggle, that would cross
 back onto the wrong side of the line above and this design would need
-revisiting — it has not come up for any of the five.
+revisiting. The group panel's floor-grow above does NOT cross that line —
+it is occasional and self-terminating, never continuous — but it is the one
+case today where "driven by something other than a direct drag or explicit
+toggle" is literally true, so it is named here rather than left for a
+reader to discover by tracing `onResize` themselves.
 
 ## Divider mechanics: matched to what splits actually do, not to a guess
 
@@ -222,6 +249,50 @@ so no other view wires `onResize` at all; the hook exists on the interface
 generically (any future view with variable chrome can use it) but the
 callback itself is optional and only `GroupView` supplies one.
 
+**The single-occupant invariant, enforced not just intended (#361 rev-38
+blocker).** Swapping the embed slot A→B is, as written above, "the previous
+occupant is closed outright, then the new one opens embedded" — two steps,
+and the first version of this PR got the first step half right: `closeView`
+hid the panel and cleared `termEl`'s flex, but never moved A's `viewEl` back
+out of the shared `embedPanelEl`, and `openView`'s embedded branch used
+`appendChild`, which ADDS a child rather than replacing one. The result: A's
+element and B's element both sat inside `embedPanelEl`, both visible, the
+moment `embedPanelEl.hidden` flipped back to `false` for B. A DOM
+simulation caught it (this repo's own convention is DOM wiring is
+hand-validated, not simulated in the permanent suite — see CLAUDE.md — so
+the reproduction lived in the review, not in `test/`). Two changes close it,
+deliberately redundant with each other:
+
+1. `closeView`'s embedded branch now explicitly returns the evicted view to
+   its OWN overlay host (`entry.overlayEl.insertBefore(entry.viewEl, …)`) —
+   parked and hidden, exactly where a never-embedded view already lives
+   between opens, rather than left as a stray child of the shared panel.
+2. `openView`'s embedded branch uses `embedPanelEl.replaceChildren(entry.viewEl)`,
+   not `appendChild` — the panel can hold at most one child BY CONSTRUCTION,
+   regardless of whether step 1 (or any future code path) forgot to clean up
+   first. This is the "assert the invariant, not just intend it" fix: a
+   `replaceChildren` call is the DOM's own single-occupant guarantee, not a
+   promise this code keeps by convention.
+
+Manual validation step 6 (below) now specifically exercises rapid A→B→A
+swaps — the fastest way to notice a stray second element, since the SAME
+view (A) reappearing after two swaps is exactly the scenario where a leftover
+DOM node from the first close would visibly collide with itself.
+
+**A restored (or merely stale) share is floor-clamped on open, not just on
+drift (#361 rev-38 NB3).** `reclampViewFloor` already corrected a floor that
+grew WHILE the panel was open (the case above). It did nothing for a floor
+that was ALREADY too big for the persisted `share` the moment the panel
+opened — the restore path (`Pane.restoreEmbed`) applies a `share` captured
+in some earlier session, against whatever the view's floor happens to be
+NOW, with no guarantee the two still agree. `openView`'s embedded branch now
+calls `this.reclampViewFloor(kind)` immediately after applying the initial
+`growFromFrac(this.embedFrac)` split, on every embedded open — restore
+included, since `restoreEmbed` opens through this same path. Cheap and
+idempotent (a no-op when the current share already clears the floor), so
+folding it into the general open path was simpler and more consistent than
+special-casing the restore call site alone.
+
 **Error recovery, generalized.** `toggleGitView` originally wrapped its
 whole "open" branch in a `try`/`catch` — a `refresh()` failure mid-open
 would otherwise leave the pane half-toggled (overlay showing, view not
@@ -281,11 +352,17 @@ internal state survives the move untouched. Verified per view, not assumed:
   in, and already stopped by `dispose()` regardless.
 - **`GroupView`** — see *Per-view floors* above for its one real piece of
   mode-aware logic (the floor). Its own poll timer (`pollTimer`, started in
-  `show()`) has a pre-existing quirk worth naming without conflating it with
-  this PR: `show()` is called on every open in EITHER mode (same call
-  frequency as before #361) but nothing clears `pollTimer` on close, only on
-  `dispose()` — a latent issue that predates this PR and isn't worsened by
-  it, so it's noted here rather than fixed here.
+  `show()`) had a pre-existing quirk, first noted rather than fixed in an
+  earlier revision of this PR: `show()` fires on every open in EITHER mode,
+  but nothing cleared `pollTimer` on close — only `dispose()` did. That was a
+  latent, rarely-hit issue before #361 (closing and reopening the overlay
+  repeatedly was the only way to trigger it); embedding makes swapping the
+  panel's occupant a ONE-CLICK, expected action, which turns "rarely hit"
+  into "hit on every swap back to the group panel." Fixed here (rev-38 NB2):
+  `GroupView.hide()` clears the timer, wired into the `group` `EmbedEntry`'s
+  `hide` callback so `closeView` stops it regardless of which mode it's
+  closing from; `show()` also defensively clears any stray timer before
+  arming a new one, rather than trusting `hide()` always ran first.
 
 The overlay host (`.git-overlay`, one per view — unchanged) and the pane's
 single embed host (`.pane-embed-host` / `.pane-embed-panel`) are both
@@ -407,7 +484,13 @@ lifecycle panel):**
    is still embedded — the first should close outright (not silently
    reappear as an overlay) and the second should take the slot. This is the
    swap semantics from *The generic engine*, above — it should never look
-   like two panels are fighting for the same space.
+   like two panels are fighting for the same space. Then swap BACK to the
+   first view (A→B→A) and repeat rapidly a few times: at every step exactly
+   one view's content should be visible in the panel — this is the scenario
+   that caught the rev-38 single-occupant bug (A's element left behind when
+   B took the slot, both rendering on top of each other) — and open the
+   browser devtools' Elements panel on `.pane-embed-panel` at least once
+   mid-sequence to confirm it never holds more than one child.
 
 **Coexistence and content panes:**
 
@@ -432,7 +515,11 @@ lifecycle panel):**
    being resumed) is only unit-tested against synthetic candidates; this is
    the one path that exercises it against the real grid/DOM, and with more
    than one member in flight it's the scenario most likely to surface an
-   ordering assumption the synthetic test can't see.
+   ordering assumption the synthetic test can't see. Also try it with the
+   group panel specifically resized very small before quitting (near its
+   floor) — on Resume it should come back at least as tall as the group
+   panel's CURRENT measured chrome, not clipped, even if that floor grew
+   between sessions (#361 rev-38 NB3).
 10. Embed git or issues on a plain terminal or agent pane, then quit and
     relaunch — confirm it comes back as the floating overlay (the
     documented, deliberate scope boundary above), not embedded and not

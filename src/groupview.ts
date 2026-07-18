@@ -552,7 +552,26 @@ export class GroupView {
   /** Called by the pane whenever the view is (re)opened, in either mode. */
   show(): void {
     void this.load();
+    // A stray leftover timer would double the poll cadence rather than
+    // merely restarting it — clear before arming (defensive: `hide()` below
+    // already clears on every close/eviction path, but `show()` itself
+    // shouldn't have to trust that it always ran first).
+    if (this.pollTimer !== undefined) clearInterval(this.pollTimer);
     this.pollTimer = window.setInterval(() => void this.load(), POLL_MS);
+  }
+
+  /** Called by the pane whenever the view is about to become hidden, in
+   *  either mode (#361 rev-38 NB2) — stops the poll timer. Without this,
+   *  every re-open (a close/reopen, or — now that embedding makes swapping
+   *  the panel's occupant a one-click action — every eviction and
+   *  re-embed) started a NEW `setInterval` on top of whichever one
+   *  `dispose()` was the only thing that ever cleared, stacking concurrent
+   *  polls against the backend. */
+  hide(): void {
+    if (this.pollTimer !== undefined) {
+      clearInterval(this.pollTimer);
+      this.pollTimer = undefined;
+    }
   }
 
   /** Reflect whether the pane currently has this view in its embed-panel
@@ -570,7 +589,7 @@ export class GroupView {
     clearTimeout(this.toastTimer);
     clearTimeout(this.endArmTimer);
     clearTimeout(this.releaseArmTimer);
-    if (this.pollTimer !== undefined) clearInterval(this.pollTimer);
+    this.hide();
     this.el.remove();
   }
 
