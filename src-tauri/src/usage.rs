@@ -211,6 +211,31 @@ pub fn parse_claude_transcript(text: &str) -> SessionUsage {
 /// `doc/design/orchestration.md`'s Compact-nudge section for why this beats
 /// inventing one.
 pub fn latest_context_tokens(text: &str) -> Option<u64> {
+    let v = latest_real_assistant_turn(text)?;
+    let usage = v.get("message")?.get("usage")?;
+    let input = u64_field(usage, "input_tokens");
+    let cache_creation = u64_field(usage, "cache_creation_input_tokens");
+    let cache_read = u64_field(usage, "cache_read_input_tokens");
+    Some(input + cache_creation + cache_read)
+}
+
+/// Production bug fix (PR #329 round 7): the model id the LATEST real turn
+/// ran on — the exact `"model"` field `latest_context_tokens` already reads
+/// past on its way to the token count, now also surfaced so a caller can
+/// derive the ACTUAL context-window size for this session
+/// (`claude_context_window_tokens`) instead of assuming a flat one. Shares
+/// `latest_real_assistant_turn`'s "which turn is latest" definition with
+/// `latest_context_tokens`, so the two can never disagree about which turn
+/// they're each reading.
+pub fn latest_context_model(text: &str) -> Option<String> {
+    let v = latest_real_assistant_turn(text)?;
+    v.get("message")?.get("model")?.as_str().map(str::to_string)
+}
+
+/// The LATEST real (non-synthetic, `usage`-bearing) assistant turn in a
+/// transcript, scanning newest-to-oldest — shared scan behind both `latest_
+/// context_tokens` and `latest_context_model`.
+fn latest_real_assistant_turn(text: &str) -> Option<Value> {
     for line in text.lines().rev() {
         let line = line.trim();
         if line.is_empty() {
@@ -221,17 +246,49 @@ pub fn latest_context_tokens(text: &str) -> Option<u64> {
             continue;
         }
         let Some(msg) = v.get("message") else { continue };
-        let Some(usage) = msg.get("usage") else { continue };
+        if msg.get("usage").is_none() {
+            continue;
+        }
         let model = msg.get("model").and_then(Value::as_str).unwrap_or("");
         if model.is_empty() || model == "<synthetic>" {
             continue; // not a real turn's context
         }
-        let input = u64_field(usage, "input_tokens");
-        let cache_creation = u64_field(usage, "cache_creation_input_tokens");
-        let cache_read = u64_field(usage, "cache_read_input_tokens");
-        return Some(input + cache_creation + cache_read);
+        return Some(v);
     }
     None
+}
+
+/// Production bug fix (PR #329 round 7): the standard Claude context window
+/// (tokens) — the conservative fallback `claude_context_window_tokens` uses
+/// for an absent/unrecognized model id. UNDER-estimating the window (reading
+/// a HIGHER percent than reality) nudges toward compacting SOONER, never
+/// later — the safe direction when genuinely unsure, since the alternative
+/// (silently assuming a bigger window than reality) risks the escalation
+/// threshold firing too LATE and letting the CLI's own emergency auto-
+/// compact land with no offload.
+pub const DEFAULT_CLAUDE_CONTEXT_WINDOW_TOKENS: u64 = 200_000;
+
+/// Context-window size (tokens) for a Claude model, matched the SAME way
+/// `price_for` matches (substring of the transcript's own model id) — real
+/// evidence (a live demo, PR #329 round 7) showed a flat 200K denominator
+/// reads badly wrong for a model actually running with a much larger window:
+/// the CLI's own `/context` reported ~5% for a token count loomux read as
+/// ~26% under the flat assumption. Opus is the one family with concrete,
+/// user-reported evidence of a 1M-token tier; everything else (and an
+/// absent/unrecognized model id) falls back to the documented default. This
+/// is a best-effort GUESS, not a guarantee — Claude's actual context tier is
+/// ultimately a per-request API setting this transcript field doesn't fully
+/// pin down — so callers needing certainty should prefer an explicit
+/// human-set override over this function's return value; see `doc/design/
+/// orchestration.md`'s Compact-nudge section.
+pub fn claude_context_window_tokens(model: Option<&str>) -> u64 {
+    let Some(model) = model else { return DEFAULT_CLAUDE_CONTEXT_WINDOW_TOKENS };
+    let m = model.to_ascii_lowercase();
+    if m.contains("opus") {
+        1_000_000
+    } else {
+        DEFAULT_CLAUDE_CONTEXT_WINDOW_TOKENS
+    }
 }
 
 /// Production bug fix (PR #329, rev-42 delta): count of `type: "system",
@@ -272,6 +329,11 @@ pub fn compact_boundary_count(text: &str) -> u64 {
 pub struct CompactionSignal {
     pub tokens: Option<u64>,
     pub compact_boundary_count: u64,
+    /// Production bug fix (PR #329 round 7): the model the latest real turn
+    /// ran on (`latest_context_model`) — lets a caller derive the ACTUAL
+    /// context-window size (`claude_context_window_tokens`) for the percent
+    /// this reading feeds, instead of assuming a flat one.
+    pub model: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -383,6 +445,7 @@ pub fn compaction_signal_in(root: &Path, session_id: &str) -> Option<CompactionS
     Some(CompactionSignal {
         tokens: latest_context_tokens(&text),
         compact_boundary_count: compact_boundary_count(&text),
+        model: latest_context_model(&text),
     })
 }
 
@@ -505,6 +568,53 @@ mod tests {
         assert_eq!(latest_context_tokens(&text), Some(100_000));
         let cumulative = parse_claude_transcript(&text);
         assert_eq!(cumulative.tokens.input_tokens, 130_000, "sanity: cumulative really does differ");
+    }
+
+    #[test]
+    fn latest_context_model_reads_the_same_latest_turn_tokens_does() {
+        // PR #329 round 7: the two must never disagree about which turn is
+        // "latest" — they share `latest_real_assistant_turn`.
+        let text = [
+            line("t1", "claude-sonnet-5", 50_000, 500, 0, 0),
+            line("t2", "claude-opus-4-8", 80_000, 500, 0, 20_000),
+        ]
+        .join("\n");
+        assert_eq!(latest_context_model(&text).as_deref(), Some("claude-opus-4-8"));
+    }
+
+    #[test]
+    fn latest_context_model_skips_synthetic_and_non_assistant_lines_same_as_tokens() {
+        let text = [
+            r#"{"type":"user","message":{"content":"hi"}}"#.to_string(),
+            line("synth", "<synthetic>", 1, 1, 0, 0),
+            line("real", "claude-opus-4-8", 10, 10, 0, 0),
+        ]
+        .join("\n");
+        assert_eq!(latest_context_model(&text).as_deref(), Some("claude-opus-4-8"));
+    }
+
+    #[test]
+    fn latest_context_model_none_when_no_real_turn_exists() {
+        assert_eq!(latest_context_model(""), None);
+        assert_eq!(latest_context_model("not json\n{\"type\":\"user\"}"), None);
+    }
+
+    #[test]
+    fn claude_context_window_tokens_defaults_conservative_and_widens_only_for_opus() {
+        // PR #329 round 7: live evidence — a hardcoded 200K flat assumption
+        // read a 1M-context Opus session's usage as ~5x too full (26% vs the
+        // CLI's own reported ~5%). Opus is the one family with concrete
+        // evidence of a larger tier; everything else, and an absent/
+        // unrecognized model, falls back to the documented conservative
+        // default (the safe direction when unsure: NEVER assume a bigger
+        // window than reality, which would delay a needed compaction).
+        assert_eq!(claude_context_window_tokens(Some("claude-opus-4-8")), 1_000_000);
+        assert_eq!(claude_context_window_tokens(Some("claude-opus-4-7")), 1_000_000, "matches by family, like price_for");
+        assert_eq!(claude_context_window_tokens(Some("claude-sonnet-5")), DEFAULT_CLAUDE_CONTEXT_WINDOW_TOKENS);
+        assert_eq!(claude_context_window_tokens(Some("claude-haiku-4-5")), DEFAULT_CLAUDE_CONTEXT_WINDOW_TOKENS);
+        assert_eq!(claude_context_window_tokens(Some("some-future-model-nobody-has-heard-of")), DEFAULT_CLAUDE_CONTEXT_WINDOW_TOKENS,
+            "an unrecognized model must never silently widen the window — conservative fallback, not a guess in the unsafe direction");
+        assert_eq!(claude_context_window_tokens(None), DEFAULT_CLAUDE_CONTEXT_WINDOW_TOKENS);
     }
 
     #[test]

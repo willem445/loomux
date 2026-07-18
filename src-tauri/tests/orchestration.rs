@@ -5147,9 +5147,13 @@ fn compact_rails(minutes: u32, roles: &[&str]) -> Guardrails {
 /// CONFIRMED delivery to `agent_id` at `submit_sent_ms` — what a real
 /// `deliver_prompt` background thread would eventually record, supplied
 /// directly since unit tests have no live pty/app handle to exercise it for
-/// real (see `DeliveryConfirmation`'s doc).
+/// real (see `DeliveryConfirmation`'s doc). `from: "loomux"` — every
+/// existing caller uses this to simulate loomux's OWN reinjection delivery
+/// confirming, never a human/other-agent message.
 fn confirmed_delivery(agent_id: &str, submit_sent_ms: u64) -> HashMap<String, DeliveryConfirmation> {
-    [(agent_id.to_string(), DeliveryConfirmation { submit_sent_ms, confirmed: true })].into_iter().collect()
+    [(agent_id.to_string(), DeliveryConfirmation { submit_sent_ms, confirmed: true, from: "loomux".to_string() })]
+        .into_iter()
+        .collect()
 }
 
 /// Group with a live (Running, headless) orchestrator and compact-nudge
@@ -6180,25 +6184,113 @@ fn compact_nudge_tick_never_loops_when_the_false_signal_repeats_every_cycle() {
     // unconfirmed signal and pins that context never grows via a reinjection:
     // `compact-reinjection` stays at 0 throughout, no matter how many times
     // the same false condition re-satisfies detection.
+    //
+    // rev-42 delta (round 7): each cycle now needs to clear `INFERENCE_ARM_
+    // COOLDOWN_MS` before the NEXT one can arm (the round-7 fix for exactly
+    // this repeating-false-signal shape re-arming instantly) — the gaps
+    // between cycles below account for that; the CORE invariant this test
+    // pins (zero reinjections, ever) is unaffected.
     let (reg, _d, gid, oid) = compact_nudge_setup(0);
     let banner_tail: HashMap<String, (String, u64)> =
         [(oid.clone(), ("Compacting conversation".to_string(), 0u64))].into_iter().collect();
     let unchanged: HashMap<String, u64> = [(oid.clone(), 100_000u64)].into_iter().collect();
+    let cooldown_ms = 3 * 60_000u64; // INFERENCE_ARM_COOLDOWN_MS
     let mut t = 500u64;
     for cycle in 0..3u32 {
         let grew: HashMap<String, u64> = [(oid.clone(), 50_000u64 * (cycle as u64 + 1))].into_iter().collect();
         // Arm: banner (mention) detected alongside fresh growth.
         let _ = reg.compact_nudge_tick(t, &grew, &banner_tail, &HashMap::new(), &unchanged, &HashMap::new(), &HashMap::new());
-        assert!(reg.agent(&oid).unwrap().compact_pending, "cycle {cycle}: arms every time, same as production");
+        assert!(reg.agent(&oid).unwrap().compact_pending, "cycle {cycle}: arms once the cooldown has cleared, same as production");
         t += 100;
         // Resolve: quiet again, same total — no confirmed drop.
         let _ = reg.compact_nudge_tick(t, &grew, &HashMap::new(), &HashMap::new(), &unchanged, &HashMap::new(), &HashMap::new());
         assert!(!reg.agent(&oid).unwrap().compact_pending, "cycle {cycle}: resolves (discarded), never stuck pending");
         assert_eq!(audit_count(&reg, &gid, "compact-reinjection"), 0,
             "cycle {cycle}: a reinjection loop must never start, however many times the false signal repeats");
-        t += 100;
+        t += cooldown_ms + 1;
     }
     assert_eq!(audit_count(&reg, &gid, "compact-pending-discarded"), 3, "every cycle's discard is individually visible");
+}
+
+#[test]
+fn compact_nudge_tick_suppresses_an_immediate_rearm_of_the_same_false_signal_within_the_cooldown() {
+    // rev-42 delta (round 7): the OTHER half of D4's fix — unlike the test
+    // above (which lets the cooldown clear between cycles), the identical
+    // false signal repeating BEFORE the cooldown clears must not even
+    // re-arm at all — this is what actually closes the live incident's
+    // "discard, then immediately re-arm" cycling that starved a queued
+    // request_compact (#410).
+    let (reg, _d, gid, oid) = compact_nudge_setup(0);
+    let banner_tail: HashMap<String, (String, u64)> =
+        [(oid.clone(), ("Compacting conversation".to_string(), 0u64))].into_iter().collect();
+    let unchanged: HashMap<String, u64> = [(oid.clone(), 100_000u64)].into_iter().collect();
+    let grew: HashMap<String, u64> = [(oid.clone(), 50_000u64)].into_iter().collect();
+    let _ = reg.compact_nudge_tick(500, &grew, &banner_tail, &HashMap::new(), &unchanged, &HashMap::new(), &HashMap::new());
+    assert!(reg.agent(&oid).unwrap().compact_pending);
+    let _ = reg.compact_nudge_tick(600, &grew, &HashMap::new(), &HashMap::new(), &unchanged, &HashMap::new(), &HashMap::new());
+    assert!(!reg.agent(&oid).unwrap().compact_pending, "resolved (discarded)");
+    assert_eq!(audit_count(&reg, &gid, "compact-pending-discarded"), 1);
+
+    // The identical banner mention recurs, WITH fresh real growth this tick
+    // (banner detection's own busy requirement genuinely satisfied) —
+    // still within the cooldown, so it must not re-arm.
+    let grew2: HashMap<String, u64> = [(oid.clone(), 100_000u64)].into_iter().collect();
+    let _ = reg.compact_nudge_tick(700, &grew2, &banner_tail, &HashMap::new(), &unchanged, &HashMap::new(), &HashMap::new());
+    assert!(!reg.agent(&oid).unwrap().compact_pending, "cooldown suppresses the immediate rearm");
+    assert_eq!(audit_count(&reg, &gid, "compact-pending-discarded"), 1, "no second discard — it never armed at all");
+
+    // A genuinely NEW banner mention, after the cooldown has cleared, still
+    // arms normally — the cooldown suppresses noise, it doesn't disable the
+    // detector.
+    let cooldown_ms = 3 * 60_000u64; // INFERENCE_ARM_COOLDOWN_MS
+    let grew3: HashMap<String, u64> = [(oid.clone(), 150_000u64)].into_iter().collect();
+    let _ = reg.compact_nudge_tick(600 + cooldown_ms + 1, &grew3, &banner_tail, &HashMap::new(), &unchanged, &HashMap::new(), &HashMap::new());
+    assert!(reg.agent(&oid).unwrap().compact_pending, "a genuinely new signal after the cooldown clears still arms");
+}
+
+#[test]
+fn compact_nudge_tick_never_reads_its_own_compact_paste_echo_as_a_manually_typed_one() {
+    // #410/round-7, the user's own disambiguating hypothesis: `human_typed_
+    // compact_detected` scans the WHOLE tail for a standalone `/compact`
+    // token, not just fresh growth — so loomux's OWN `/compact` paste from a
+    // genuine, already-resolved compaction can still be sitting in the
+    // bounded tail when the human later types something completely
+    // UNRELATED (satisfying manual detection's recency-of-ANY-keystroke
+    // gate) — misreading loomux's own stale echo as a freshly human-typed
+    // `/compact`. The provenance fix: a CONFIRMED delivery `from ==
+    // "loomux"` extends the inference-arm cooldown, independent of and in
+    // addition to the post-resolve cooldown above.
+    let (reg, _d, gid, oid) = compact_nudge_setup(5); // heuristic on — the loomux-initiated arm
+    let empty = HashMap::new();
+    // Loomux's own fire, busy-then-quiet resolve — a genuine, real compaction.
+    assert_eq!(
+        reg.compact_nudge_tick(FAR, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()),
+        vec![oid.clone()],
+        "the heuristic fire pastes /compact itself"
+    );
+    let grew: HashMap<String, u64> = [(oid.clone(), 50_000u64)].into_iter().collect();
+    let _ = reg.compact_nudge_tick(FAR + 1_000, &grew, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new());
+    let _ = reg.compact_nudge_tick(FAR + 2_000, &grew, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new());
+    let confirmed = confirmed_delivery(&oid, FAR + 2_000);
+    let _ = reg.compact_nudge_tick(FAR + 3_000, &grew, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &confirmed);
+    assert!(!reg.agent(&oid).unwrap().compact_pending, "resolved once the trusted arm's delivery confirms");
+
+    // Minutes later (past MANUAL_COMPACT_DETECT_WINDOW_MS's own recency gate
+    // if that were the only check), the human types something UNRELATED —
+    // the tail still contains loomux's OWN `/compact` paste from earlier in
+    // the SAME pane (it hasn't scrolled out of the bounded tail yet), and the
+    // human's fresh keystroke alone would satisfy the OLD recency-only check.
+    let stale_tail_with_our_own_paste: HashMap<String, (String, u64)> =
+        [(oid.clone(), ("some unrelated output\n> /compact\nmore unrelated output".to_string(), FAR + 5_000))]
+            .into_iter()
+            .collect();
+    let _ = reg.compact_nudge_tick(
+        FAR + 5_000, &grew, &stale_tail_with_our_own_paste, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new());
+    assert!(
+        !reg.agent(&oid).unwrap().compact_pending,
+        "loomux's own recently-confirmed paste must never satisfy its own manual detector"
+    );
+    assert_eq!(audit_count(&reg, &gid, "compact-nudge"), 1, "no second /compact typed — the arm never even started");
 }
 
 #[test]
@@ -9534,6 +9626,81 @@ fn group_summary_surfaces_live_compaction_state_and_cached_context_usage() {
     let s3 = reg.group_summary(&gid);
     let a3 = s3["agents"].as_array().unwrap().iter().find(|a| a["id"] == oid.as_str()).unwrap();
     assert_eq!(a3["compaction"]["status"], "none", "confirmed and resolved — no lingering state");
+}
+
+#[test]
+fn run_compact_nudge_reads_a_model_aware_window_from_the_real_transcript() {
+    // PR #329 round 7, live demo evidence: the lifecycle gauge showed 26%
+    // for a token count the CLI's own `/context` reported as ~5% — loomux
+    // was dividing by a flat 200K window while the agent ran Opus (1M-tier
+    // in the reporting deployment). This drives the REAL impure path
+    // (`run_compact_nudge`, a real fixture transcript) end to end: both
+    // `group_summary`'s displayed percent AND the escalation threshold that
+    // shares the same denominator.
+    let proj = tempfile::tempdir().unwrap();
+    let (reg, _d) = test_registry();
+    reg.set_claude_projects_dir(proj.path().to_path_buf());
+    // Escalation threshold at 50%: under the OLD flat-200K assumption,
+    // 150_000 tokens reads as 75% and would escalate immediately (wrongly
+    // early, by ~5x, for a real 1M-context session). Under the model-aware
+    // fix, 150_000 / 1_000_000 = 15% — nowhere near the threshold.
+    let rails = Guardrails { compact_context_threshold_percent: 50, ..compact_rails(0, &["orchestrator"]) };
+    let g = reg.create_group("C:/tmp/repo", rails).unwrap();
+    let o = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let sid = o.session_id.clone().unwrap();
+
+    let encoded = proj.path().join("C--tmp-repo");
+    fs::create_dir_all(&encoded).unwrap();
+    let transcript = format!(
+        "{}\n",
+        json!({"type":"assistant","message":{"id":"m1","model":"claude-opus-4-8",
+            "usage":{"input_tokens":150000,"output_tokens":500,
+                     "cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}),
+    );
+    fs::write(encoded.join(format!("{sid}.jsonl")), transcript).unwrap();
+
+    let _ = reg.run_compact_nudge(1);
+    assert_eq!(audit_count(&reg, &g.id, "compact-escalation"), 0,
+        "must NOT escalate — 15% of the real (1M-tier) window is nowhere near the 50% threshold");
+
+    let s = reg.group_summary(&g.id);
+    let a = s["agents"].as_array().unwrap().iter().find(|a| a["id"] == o.id.as_str()).unwrap();
+    assert_eq!(a["context"]["tokens"], 150_000);
+    assert_eq!(a["context"]["percent"], 15, "the lifecycle panel must show the SAME model-aware percent, not the old flat-200K ~75%");
+}
+
+#[test]
+fn run_compact_nudge_honors_an_explicit_context_window_override() {
+    // The escape hatch: an explicit human override wins outright over the
+    // model-based guess, for a deployment where the guess would be wrong.
+    let proj = tempfile::tempdir().unwrap();
+    let (reg, _d) = test_registry();
+    reg.set_claude_projects_dir(proj.path().to_path_buf());
+    let rails = Guardrails {
+        compact_context_threshold_percent: 50,
+        context_window_tokens_override: Some(200_000), // this deployment's Opus is NOT 1M-tier
+        ..compact_rails(0, &["orchestrator"])
+    };
+    let g = reg.create_group("C:/tmp/repo", rails).unwrap();
+    let o = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let sid = o.session_id.clone().unwrap();
+
+    let encoded = proj.path().join("C--tmp-repo");
+    fs::create_dir_all(&encoded).unwrap();
+    let transcript = format!(
+        "{}\n",
+        json!({"type":"assistant","message":{"id":"m1","model":"claude-opus-4-8",
+            "usage":{"input_tokens":150000,"output_tokens":500,
+                     "cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}),
+    );
+    fs::write(encoded.join(format!("{sid}.jsonl")), transcript).unwrap();
+
+    let _ = reg.run_compact_nudge(1);
+    assert_eq!(audit_count(&reg, &g.id, "compact-escalation"), 1,
+        "the override (200K) correctly reads 75% and escalates, overriding the model-based 1M guess");
+    let s = reg.group_summary(&g.id);
+    let a = s["agents"].as_array().unwrap().iter().find(|a| a["id"] == o.id.as_str()).unwrap();
+    assert_eq!(a["context"]["percent"], 75);
 }
 
 #[test]

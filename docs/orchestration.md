@@ -459,7 +459,9 @@ busy), awaiting evidence (busy observed, waiting on quiet to resolve), re-ground
 reinjection is in flight, with its attempt count), or a recent lost outcome (an arm or
 delivery that didn't resolve in time and was released rather than left stuck). An idle agent
 with nothing pending shows neither line — this narrates the same state machine described
-above, not a separate status.
+above, not a separate status. The percent is against the model's ACTUAL context window (Opus's
+larger tier reads correctly, not against a flat assumption) — a group can override the guess
+explicitly if it's ever wrong for a given deployment.
 
 ## Persistence & restart
 

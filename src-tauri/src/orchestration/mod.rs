@@ -1130,22 +1130,31 @@ const MAX_REINJECT_ATTEMPTS: u32 = 3;
 /// TIMEOUT_MS`'s bound on the delivery-confirmation phase. See `AgentEntry::
 /// compact_pending_armed_ms`'s doc for the live incident this closes.
 const ARM_PENDING_TIMEOUT_MS: u64 = 5 * 60 * 1000;
+/// Production bug fix (PR #329 round 7): how long INFERENCE arms (banner,
+/// manual detection) are suppressed after a loomux-authored delivery
+/// confirms, or after this agent's own compact_pending resolves — see
+/// `AgentEntry::compact_inference_guard_until_ms`'s doc. Matches `MANUAL_
+/// COMPACT_DETECT_WINDOW_MS`'s existing 3-minute scale: long enough to cover
+/// both a paste's echo settling into the pane AND the immediate post-
+/// compact conversation ABOUT the compact-nudge feature itself (exactly the
+/// live-demo scenario this closes), short enough that a genuinely NEW
+/// signal minutes later still arms normally. Loomux-initiated (trusted)
+/// arms are NEVER gated by this — they don't infer anything, so there is
+/// nothing for a stale echo to fool.
+const INFERENCE_ARM_COOLDOWN_MS: u64 = 3 * 60_000;
 /// Compact-nudge (#328): upper bound on `compact_context_threshold_percent`;
 /// 0 is "off" (see `Guardrails::clamped`), 100 = only at total exhaustion
 /// (effectively disabled in practice, since the CLI's own emergency
 /// auto-compact would already have fired by then).
 const MAX_COMPACT_CONTEXT_THRESHOLD_PERCENT: u32 = 100;
-/// Compact-nudge (#328): the context window assumed for `latest_context_
-/// tokens`-based percent calculations. Claude Code's default context window
-/// (Sonnet/Opus) is 200K tokens; a 1M-token beta tier exists but loomux has
-/// no signal for which tier a given session is on, so this is a documented
-/// assumption, not a measured fact — the honest tradeoff for using an EXACT
-/// transcript-recorded token count instead of an invented byte-proxy (see
-/// `usage::latest_context_tokens`'s doc and the design note). Erring toward
-/// the SMALLER window is the safe direction: a 1M-tier session would read as
-/// "closer to full" than it really is, which only makes the escalation nudge
-/// arrive a little early — never late, never silently skipped.
-const CLAUDE_CONTEXT_WINDOW_TOKENS: u64 = 200_000;
+// Compact-nudge (#328): the context window for `latest_context_tokens`-based
+// percent calculations used to be a single flat constant here
+// (`CLAUDE_CONTEXT_WINDOW_TOKENS`, 200K) — a documented assumption, not a
+// measured fact, and PROVEN wrong in a live demo (PR #329 round 7): an agent
+// actually running a much larger tier read as ~5x more full than the CLI's
+// own `/context` reported. Replaced by `effective_context_window_tokens`
+// (model-aware, with a human override and a conservative fallback) — see
+// its doc and `usage::claude_context_window_tokens`'s.
 /// Compact-nudge (#328): how recently the orchestrator's `set_state` call
 /// must land for `request_compact` to skip its offload-checklist warning.
 /// Not a hard gate (the issue is explicit: warn, never block) — a human-
@@ -1869,7 +1878,8 @@ pub struct Guardrails {
     /// group.json, live-settable via `set_compact_nudge_roles`.
     pub compact_nudge_roles: Vec<String>,
     /// Compact-nudge (#328): percent of the Claude context window
-    /// (`CLAUDE_CONTEXT_WINDOW_TOKENS`) an eligible agent's context must cross
+    /// (`effective_context_window_tokens`, round 7: model-aware, was a flat
+    /// constant) an eligible agent's context must cross
     /// before loomux escalates — delivering `compact_escalation_notice` and, if
     /// the agent doesn't self-request within the same pass, marking the compact
     /// requested on its behalf (better a loomux-timed compact with the
@@ -1878,6 +1888,19 @@ pub struct Guardrails {
     /// purely opportunistic, no escalation. Persisted in group.json,
     /// live-settable via `set_compact_context_threshold`.
     pub compact_context_threshold_percent: u32,
+    /// Production bug fix (PR #329 round 7): an explicit human override for
+    /// the context-window size (tokens) this group's escalation percent and
+    /// lifecycle-panel display are computed against — takes absolute
+    /// precedence over `usage::claude_context_window_tokens`'s model-based
+    /// guess (see `effective_context_window_tokens`). Live evidence showed
+    /// that guess can be wrong (Claude's actual context tier is ultimately a
+    /// per-request API setting the transcript doesn't fully pin down): this
+    /// is the escape hatch for a deployment where it is. `None` (the
+    /// conservative default) defers entirely to the guess. Persisted in
+    /// group.json; no live setter this round (set at launch, or by hand-
+    /// editing group.json for an existing group — same precedent as
+    /// `max_spawns_per_hour`, which is also create-time-only today).
+    pub context_window_tokens_override: Option<u64>,
 }
 
 impl Guardrails {
@@ -2379,6 +2402,22 @@ pub fn context_percent_used(context_tokens: u64, window_tokens: u64) -> u32 {
         return 0;
     }
     ((context_tokens.min(window_tokens) * 100) / window_tokens) as u32
+}
+
+/// Production bug fix (PR #329 round 7): the context-window size (tokens) to
+/// compute a percent against, for one agent — single shared derivation for
+/// BOTH the lifecycle-panel display and the `compact_context_threshold_
+/// percent` escalation. Before this fix each read a flat `CLAUDE_CONTEXT_
+/// WINDOW_TOKENS` (200K) independently, silently wrong (and the escalation
+/// threshold firing ~5x too early) for any agent actually running a model on
+/// a larger tier. An explicit human `override_tokens` (set on the group's
+/// guardrails) wins outright; otherwise the model recorded in the agent's
+/// OWN transcript (`usage::claude_context_window_tokens`) — this is the
+/// authoritative-when-available signal (reflects what's ACTUALLY running,
+/// immune to config drift), falling back to `usage::
+/// DEFAULT_CLAUDE_CONTEXT_WINDOW_TOKENS` when the model is unknown.
+pub fn effective_context_window_tokens(override_tokens: Option<u64>, model: Option<&str>) -> u64 {
+    override_tokens.unwrap_or_else(|| crate::usage::claude_context_window_tokens(model))
 }
 
 /// Production bug fix (PR #329 delta review): how much the context-token
@@ -3691,6 +3730,45 @@ pub struct AgentEntry {
     /// set (a transient read miss keeps the last-known value rather than
     /// blanking the display).
     pub last_context_tokens: Option<u64>,
+    /// Production bug fix (PR #329 round 7): the model the transcript
+    /// reading behind `last_context_tokens` came from — cached the same way
+    /// (from `run_compact_nudge`'s own `agent_context_signals` read, not a
+    /// per-poll re-read) so `group_summary` can derive the ACTUAL context-
+    /// window size (`effective_context_window_tokens`) instead of assuming a
+    /// flat one. `None` until the first reading; never cleared once set.
+    pub last_context_model: Option<String>,
+    /// Production bug fix (PR #329 round 7): INFERENCE arms (banner, manual
+    /// detection — never the loomux-initiated/trusted arm, which needs no
+    /// inference at all) may only arm while `now >= this`. Live demo
+    /// evidence: minutes after a REAL, confirmed compaction resolved, a
+    /// second inference arm formed and discarded — most likely loomux's OWN
+    /// `/compact` paste (or the reinjection notice that followed) still
+    /// sitting in the bounded output tail, re-satisfying `human_typed_
+    /// compact_detected`/`auto_compact_banner_detected`, possibly compounded
+    /// by the pane's own post-compact discussion of the test that just ran.
+    /// Not a reinjection LOOP (D4 held — every arm resolved to a correctly-
+    /// audited discard) but noisy and conceptually wrong: a detector
+    /// inferring a NEW compaction from an echo of loomux's own recent
+    /// activity, or from the immediate aftermath of one it already handled.
+    ///
+    /// `0` (never gates) until extended, in two places, to `X +
+    /// INFERENCE_ARM_COOLDOWN_MS`: (a) whenever a CONFIRMED delivery `from
+    /// == "loomux"` lands for this agent's pty (`X` = that delivery's
+    /// `submit_sent_ms` — the provenance principle: loomux's own paste's
+    /// echo must never satisfy loomux's own detectors, whether that paste
+    /// was a `/compact` command or a reinjection/escalation notice), and
+    /// (b) whenever `compact_pending` reaches a terminal resolution
+    /// (discard, arm-timeout, reinjection confirmed, reinjection abandoned;
+    /// `X` = `now`) — the immediate post-compact conversation window.
+    /// Deliberately NOT also seeded at construction/resume: live forensics
+    /// couldn't attribute the analogous "arms shortly after a restart"
+    /// incident to any delivery THIS agent's entry ever made (a fresh
+    /// `AgentEntry` has made none yet) — a construction-time grace period
+    /// would just be a blunt "distrust every fresh session" hack, not this
+    /// principle. Never gates the trusted arm: loomux has positive
+    /// knowledge it initiated that one itself, so there is no inference for
+    /// a stale echo to fool.
+    pub compact_inference_guard_until_ms: u64,
     /// Compact-nudge (#328): Unix-ms this agent's `set_state` call was last
     /// observed (0 = never). Self-scoped, stamped by the `set_state` MCP
     /// handler on the CALLING agent's own entry — meaningful only for the
@@ -5147,7 +5225,7 @@ pub fn submit_sequence(cli: &str) -> &'static [u8] {
 /// The outcome of the most recent delivery to a pane, kept in-memory per pty so
 /// the next delivery can detect a previous prompt still stranded in the input
 /// box (#81/#84).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct DeliveryOutcome {
     /// Whether that delivery's Enter was observed to submit (box cleared / turn
     /// started). `false` means the text may still be sitting unsubmitted.
@@ -5155,6 +5233,13 @@ struct DeliveryOutcome {
     /// Unix-ms the final Enter was sent — the reference point for deciding
     /// whether a human has since typed into the pane.
     submit_sent_ms: u64,
+    /// Production bug fix (PR #329 round 7): the delivery's `from` (the
+    /// `deliver_prompt` caller — `"loomux"` for every compact-nudge notice,
+    /// `"human"` for a message typed through loomux's UI, an agent id for a
+    /// forwarded `message_orchestrator`). See `AgentEntry::compact_
+    /// inference_guard_until_ms`'s doc for why this specific distinction
+    /// matters.
+    from: String,
 }
 
 /// Production bug fix (rev-42 delta, round 2): a per-agent snapshot of the
@@ -5168,10 +5253,12 @@ struct DeliveryOutcome {
 /// doc), so this is threaded through as an ordinary input map exactly like
 /// `context_tokens`/`context_boundary_counts`, with `agent_last_deliveries`
 /// as the impure reader that supplies it in production.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct DeliveryConfirmation {
     pub submit_sent_ms: u64,
     pub confirmed: bool,
+    /// See `DeliveryOutcome::from`'s doc — mirrored verbatim.
+    pub from: String,
 }
 
 /// Whether output growth after the submit Enter counts as the submit landing.
@@ -6746,6 +6833,10 @@ impl OrchRegistry {
                 // Compact-nudge context escalation (#328): absent → 0 → off.
                 compact_context_threshold_percent:
                     g["compact_context_threshold_percent"].as_u64().unwrap_or(0) as u32,
+                // Context-window override (PR #329 round 7): absent → None →
+                // defer entirely to the model-based guess, the conservative
+                // default for a group.json written before this field existed.
+                context_window_tokens_override: g["context_window_tokens_override"].as_u64(),
             },
         ))
     }
@@ -7071,6 +7162,7 @@ impl OrchRegistry {
                 "compact_nudge_minutes": info.guardrails.compact_nudge_minutes,
                 "compact_nudge_roles": info.guardrails.compact_nudge_roles,
                 "compact_context_threshold_percent": info.guardrails.compact_context_threshold_percent,
+                "context_window_tokens_override": info.guardrails.context_window_tokens_override,
             },
         }))
         .unwrap();
@@ -8635,6 +8727,8 @@ impl OrchRegistry {
             compact_last_lost_reason: None,
             compact_last_lost_ms: None,
             last_context_tokens: None,
+            last_context_model: None,
+            compact_inference_guard_until_ms: 0,
             last_state_write_ms: 0,
             compact_escalation_notified: false,
             solo_cli: Some(cli.to_string()),
@@ -8760,6 +8854,8 @@ impl OrchRegistry {
             compact_last_lost_reason: None,
             compact_last_lost_ms: None,
             last_context_tokens: None,
+            last_context_model: None,
+            compact_inference_guard_until_ms: 0,
             last_state_write_ms: 0,
             compact_escalation_notified: false,
             solo_cli: None, // unknown for an adopted pane; cli_for_agent falls back to "claude"
@@ -9139,6 +9235,23 @@ impl OrchRegistry {
                     a.last_context_tokens = Some(tokens);
                 }
 
+                // Production bug fix (PR #329 round 7): provenance — a
+                // CONFIRMED delivery `from == "loomux"` extends this agent's
+                // inference-arm cooldown, so loomux's OWN paste (a `/compact`
+                // command, a reinjection/escalation notice) can never have
+                // its own echo satisfy loomux's own banner/manual detectors.
+                // `from` distinguishes this from a human's own message or
+                // another agent's forwarded one reaching the same pane
+                // through the same delivery pipeline — neither of those
+                // should suppress detection. `.max` never SHORTENS an
+                // already-later guard (e.g. one just set by a resolve below).
+                if let Some(d) = delivery_confirmations.get(&a.id) {
+                    if d.confirmed && d.from == "loomux" {
+                        a.compact_inference_guard_until_ms =
+                            a.compact_inference_guard_until_ms.max(d.submit_sent_ms + INFERENCE_ARM_COOLDOWN_MS);
+                    }
+                }
+
                 // Rebaseline / meaningful-growth detection — own baseline
                 // (`compact_nudge_last_output_total`, not idle-tick's
                 // `last_output_total`) — see the fn doc for why sharing the
@@ -9191,6 +9304,10 @@ impl OrchRegistry {
                         a.compact_pending = false;
                         a.compact_reinject_attempted_ms = None;
                         a.compact_reinject_attempts = 0;
+                        // #410/round-7: the immediate post-compact discussion
+                        // is exactly the window an inference arm can misread
+                        // as a new compaction — cool down.
+                        a.compact_inference_guard_until_ms = now + INFERENCE_ARM_COOLDOWN_MS;
                         to_reinject_confirmed.push((a.id.clone(), a.group.clone()));
                     } else if now.saturating_sub(attempted_ms) >= REINJECT_CONFIRM_TIMEOUT_MS {
                         if a.compact_reinject_attempts < MAX_REINJECT_ATTEMPTS {
@@ -9213,6 +9330,7 @@ impl OrchRegistry {
                             a.compact_reinject_attempts = 0;
                             a.compact_last_lost_reason = Some("reinjection-abandoned".to_string());
                             a.compact_last_lost_ms = Some(now);
+                            a.compact_inference_guard_until_ms = now + INFERENCE_ARM_COOLDOWN_MS;
                         }
                     }
                     // else: still within the timeout, a delivery may be
@@ -9243,6 +9361,7 @@ impl OrchRegistry {
                         a.compact_pending_armed_ms = None;
                         a.compact_last_lost_reason = Some("arm-timeout".to_string());
                         a.compact_last_lost_ms = Some(now);
+                        a.compact_inference_guard_until_ms = now + INFERENCE_ARM_COOLDOWN_MS;
                     } else if currently_quiet {
                     // Compaction-completion: busy (compaction ran/rendered)
                     // then quiet again while pending — resolve regardless of
@@ -9358,6 +9477,13 @@ impl OrchRegistry {
                             a.compact_pending_baseline_marker_count = None;
                             a.compact_pending_trusted = false;
                             a.compact_pending_armed_ms = None;
+                            // #410/round-7: the same repeating-false-signal
+                            // shape D4 pins can otherwise re-arm on the very
+                            // next tick — a short cooldown after ANY discard
+                            // gives the state machine room to actually settle
+                            // rather than cycling discard-then-immediate-
+                            // rearm indefinitely.
+                            a.compact_inference_guard_until_ms = now + INFERENCE_ARM_COOLDOWN_MS;
                             to_discard.push((a.id.clone(), a.group.clone(), baseline_tokens, current_tokens));
                         }
                     }
@@ -9436,7 +9562,18 @@ impl OrchRegistry {
                 // pending, and only on a FRESH human write — see
                 // `MANUAL_COMPACT_DETECT_WINDOW_MS`'s doc for why the recency
                 // gate matters).
-                if !a.compact_pending {
+                //
+                // Production bug fix (PR #329 round 7): also gated on
+                // `compact_inference_guard_until_ms` — recency of the
+                // human's OWN last keystroke says nothing about whether the
+                // `/compact` TOKEN this scan matches is itself fresh; a live
+                // demo showed loomux's own earlier `/compact` paste (or the
+                // reinjection notice that followed it) can sit in the
+                // bounded tail for minutes, and an UNRELATED fresh keystroke
+                // nearby was enough to satisfy the old recency check alone
+                // and misread that stale echo as a new human-typed command.
+                // See `compact_inference_guard_until_ms`'s doc.
+                if !a.compact_pending && now >= a.compact_inference_guard_until_ms {
                     if let Some((tail, last_input_ms)) = manual_signals.get(&a.id) {
                         if now.saturating_sub(*last_input_ms) < MANUAL_COMPACT_DETECT_WINDOW_MS
                             && human_typed_compact_detected(tail)
@@ -9479,7 +9616,15 @@ impl OrchRegistry {
                 // `compact_seen_busy` is set true immediately, not left for a
                 // later tick to observe — the banner match IS the busy
                 // signal, caught mid-compaction.
-                if !a.compact_pending && !currently_quiet {
+                //
+                // Production bug fix (PR #329 round 7): also gated on
+                // `compact_inference_guard_until_ms`, same reasoning as the
+                // manual-detection gate above — the banner substring can
+                // appear in loomux's OWN reinjection notice (it quotes the
+                // role instructions verbatim, which may itself describe or
+                // mention this feature) or in the immediate post-compact
+                // discussion of the test that just ran.
+                if !a.compact_pending && !currently_quiet && now >= a.compact_inference_guard_until_ms {
                     if let Some((tail, _)) = manual_signals.get(&a.id) {
                         if auto_compact_banner_detected(g.cli_for(a.role), tail) {
                             // Inference arm (loomux only believes the CLI's
@@ -9687,12 +9832,19 @@ impl OrchRegistry {
         &self,
         signals: &HashMap<String, crate::usage::CompactionSignal>,
     ) -> HashMap<String, u32> {
-        let thresholds: HashMap<String, u32> = self
-            .groups
-            .lock_safe()
-            .iter()
-            .map(|(id, g)| (id.clone(), g.guardrails.compact_context_threshold_percent))
-            .collect();
+        // Production bug fix (PR #329 round 7): threshold AND the override
+        // both come from the same per-group guardrails snapshot, so the
+        // escalation percent below is computed against the SAME window the
+        // lifecycle panel shows (see `effective_context_window_tokens`) —
+        // no more flat 200K assumption that fires the escalation ~5x too
+        // early for a larger-context agent.
+        let (thresholds, overrides): (HashMap<String, u32>, HashMap<String, Option<u64>>) = {
+            let groups = self.groups.lock_safe();
+            (
+                groups.iter().map(|(id, g)| (id.clone(), g.guardrails.compact_context_threshold_percent)).collect(),
+                groups.iter().map(|(id, g)| (id.clone(), g.guardrails.context_window_tokens_override)).collect(),
+            )
+        };
         let agent_groups: HashMap<String, String> = self
             .agents
             .lock_safe()
@@ -9707,7 +9859,9 @@ impl OrchRegistry {
                     return None;
                 }
                 let tokens = sig.tokens?;
-                Some((id.clone(), context_percent_used(tokens, CLAUDE_CONTEXT_WINDOW_TOKENS)))
+                let override_tokens = overrides.get(group).copied().flatten();
+                let window = effective_context_window_tokens(override_tokens, sig.model.as_deref());
+                Some((id.clone(), context_percent_used(tokens, window)))
             })
             .collect()
     }
@@ -9735,7 +9889,11 @@ impl OrchRegistry {
             .into_iter()
             .filter_map(|(id, pty_id)| {
                 let outcome = last_delivery.get(&pty_id)?;
-                Some((id, DeliveryConfirmation { submit_sent_ms: outcome.submit_sent_ms, confirmed: outcome.confirmed }))
+                Some((id, DeliveryConfirmation {
+                    submit_sent_ms: outcome.submit_sent_ms,
+                    confirmed: outcome.confirmed,
+                    from: outcome.from.clone(),
+                }))
             })
             .collect()
     }
@@ -9757,6 +9915,24 @@ impl OrchRegistry {
             .map(|(id, s)| (id.clone(), s.compact_boundary_count))
             .collect();
         let delivery_confirmations = self.agent_last_deliveries();
+        // Production bug fix (PR #329 round 7): cache each agent's model
+        // from this SAME read (no extra transcript access) so `group_
+        // summary` can compute a model-aware percent on its own, much more
+        // frequent poll cadence — same "cache from the background tick,
+        // don't re-read per poll" shape as `last_context_tokens`. Not
+        // threaded through `compact_nudge_tick` itself: nothing in the
+        // decision logic needs it, so keeping it out of that pure function's
+        // parameter list means no churn to its ~50 existing test call sites.
+        {
+            let mut agents = self.agents.lock_safe();
+            for (id, sig) in &signals {
+                if let Some(model) = &sig.model {
+                    if let Some(a) = agents.get_mut(id) {
+                        a.last_context_model = Some(model.clone());
+                    }
+                }
+            }
+        }
         self.compact_nudge_tick(
             now,
             &outputs,
@@ -11768,6 +11944,10 @@ impl OrchRegistry {
             .collect();
         let (mut orch, mut worker, mut reviewer, mut planner) = (0u32, 0u32, 0u32, 0u32);
         let mut earliest: Option<u64> = None;
+        // Production bug fix (PR #329 round 7): same override this group's
+        // escalation threshold uses (`agent_context_percents`) — one shared
+        // denominator, never two independently-guessed ones.
+        let context_window_override = self.group(group).and_then(|g| g.guardrails.context_window_tokens_override);
         let mut list: Vec<Value> = live
             .iter()
             .map(|a| {
@@ -11809,8 +11989,13 @@ impl OrchRegistry {
                     ),
                     "context": {
                         "tokens": a.last_context_tokens,
-                        "percent": a.last_context_tokens
-                            .map(|t| context_percent_used(t, CLAUDE_CONTEXT_WINDOW_TOKENS)),
+                        // Production bug fix (PR #329 round 7): model-aware
+                        // window (`effective_context_window_tokens`) instead
+                        // of a flat 200K assumption — see its doc.
+                        "percent": a.last_context_tokens.map(|t| context_percent_used(
+                            t,
+                            effective_context_window_tokens(context_window_override, a.last_context_model.as_deref()),
+                        )),
                     },
                 })
             })
@@ -13776,6 +13961,8 @@ impl OrchRegistry {
             compact_last_lost_reason: None,
             compact_last_lost_ms: None,
             last_context_tokens: None,
+            last_context_model: None,
+            compact_inference_guard_until_ms: 0,
             last_state_write_ms: 0,
             compact_escalation_notified: false,
             solo_cli: None,
@@ -14178,6 +14365,13 @@ impl OrchRegistry {
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone();
         let (root, group, agent) = (self.root.clone(), a.group.clone(), a.id.clone());
+        // Production bug fix (PR #329 round 7): captured so the recorded
+        // `DeliveryOutcome` carries WHO this delivery is from — the
+        // provenance `compact_nudge_tick`'s inference-arm cooldown needs to
+        // recognize (and suppress detection on) loomux's own paste echo,
+        // as opposed to a human or another agent's message reaching this
+        // same pane through the same delivery pipeline.
+        let delivery_from = from.to_string();
         let last_delivery = self.last_delivery.clone();
         // Captured for the unconfirmed-delivery notice (#103): whether this
         // target is the orchestrator (a notice to it would loop, so it's
@@ -14266,11 +14460,12 @@ impl OrchRegistry {
             // only if no human has typed since that delivery (else the box may
             // hold a person's line, which must never be blind-submitted — the
             // pre-paste hold above already waited for them to go quiet).
-            let prev = last_delivery.lock_safe().get(&pty_id).copied();
+            let prev = last_delivery.lock_safe().get(&pty_id).cloned();
             let human_typed_since = prev
+                .as_ref()
                 .map(|o| ptys.last_user_input_ms(pty_id).unwrap_or(0) > o.submit_sent_ms)
                 .unwrap_or(false);
-            if should_flush_before_paste(prev.map(|o| o.confirmed), human_typed_since)
+            if should_flush_before_paste(prev.as_ref().map(|o| o.confirmed), human_typed_since)
                 && ptys.write_bytes(pty_id, submit).is_ok()
             {
                 append_audit(&root, &group, "loomux", "delivery-flush",
@@ -14463,7 +14658,7 @@ impl OrchRegistry {
             // prompt still stranded in the box (#81/#84).
             last_delivery
                 .lock_safe()
-                .insert(pty_id, DeliveryOutcome { confirmed, submit_sent_ms });
+                .insert(pty_id, DeliveryOutcome { confirmed, submit_sent_ms, from: delivery_from });
             append_audit(&root, &group, "loomux", "prompt-typed", json!({
                 "to": agent,
                 "cli": cli,
@@ -15061,6 +15256,12 @@ pub fn create_orchestration(
             compact_nudge_roles: Vec::new(),
             // #328: off at launch; live-settable via orch_set_compact_context_threshold.
             compact_context_threshold_percent: 0,
+            // Context-window override (PR #329 round 7): no launcher field
+            // yet (same precedent as max_spawns_per_hour) — a human who
+            // knows their deployment's actual context tier sets this by
+            // hand-editing group.json; `None` defers to the model-based
+            // guess.
+            context_window_tokens_override: None,
         },
         None,
         None,
@@ -15731,6 +15932,8 @@ fn register_orchestrator_pane(
         compact_last_lost_reason: None,
         compact_last_lost_ms: None,
         last_context_tokens: None,
+        last_context_model: None,
+        compact_inference_guard_until_ms: 0,
         last_state_write_ms: 0,
         compact_escalation_notified: false,
         solo_cli: None,

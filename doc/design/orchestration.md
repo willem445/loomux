@@ -1789,6 +1789,87 @@ cover the arm-pending-timeout contract (verified red-before-green against a neut
 check). Two pre-existing escalation tests were updated for the one-tick delay the reorder
 introduces.
 
+### Round 7: model-aware context window, and inference-arm self-echo/cooldown
+
+Demo round 4 succeeded on the core promise (real compact → unprompted re-grounding → ledger
+phrase survived → clean recovery), but surfaced two defects in the round-6 lifecycle-panel
+instrumentation.
+
+**(1) Wrong denominator for a large-context model.** The lifecycle gauge showed 26% (52,335
+tokens) while the CLI's own `/context` showed the same tokens as ~5% — the escalation percent and
+the panel's display both divided by a hardcoded 200K context window while the agent ran Opus,
+which (in the reporting deployment) runs a 1M-token tier. Investigated what's authoritative and
+cheaply available: the Claude transcript does NOT expose a context-limit field directly, but it
+DOES expose the model id per turn (`message.model` — already read by `usage::latest_context_
+tokens` on its way to the token count, and by `parse_claude_transcript` for cost pricing). This is
+more authoritative than block config for the purpose (it reflects what's ACTUALLY running,
+immune to config drift), but Claude's real context tier is ultimately a per-request API setting
+the transcript doesn't fully pin down — so the model id is a best-effort signal, not a guarantee.
+
+Fix, in one shared place:
+- `usage::claude_context_window_tokens(model: Option<&str>) -> u64` — matches by substring the
+  same way `price_for` matches for pricing. Opus is the one family with concrete, user-reported
+  evidence of a 1M-token tier; everything else, and an absent/unrecognized model, falls back to
+  `usage::DEFAULT_CLAUDE_CONTEXT_WINDOW_TOKENS` (200K, unchanged). Erring toward the SMALLER
+  window on an unrecognized model is the safe direction: reading a HIGHER percent than reality
+  nudges toward compacting SOONER, never later.
+- `Guardrails.context_window_tokens_override: Option<u64>` — an explicit human escape hatch that
+  wins outright over the model guess, for a deployment where it's wrong. Persisted in group.json;
+  no live setter or launcher field this round (same precedent as `max_spawns_per_hour`, which is
+  also create-time/hand-edit-only today) — set at launch or by editing an existing group's
+  group.json.
+- `effective_context_window_tokens(override, model) -> u64` — the single combining function BOTH
+  `agent_context_percents` (the escalation threshold) and `group_summary` (the lifecycle panel)
+  now call, closing the exact gap the user flagged: before this fix each read the flat constant
+  independently, so the escalation threshold was firing ~5x too early for any agent actually
+  running a larger-context tier, silently, with no visible symptom other than "unexpectedly early
+  escalation notices."
+- `usage::latest_context_model`/`CompactionSignal.model` — the transcript reading, sharing
+  `latest_context_tokens`' exact "which turn is latest" definition (`latest_real_assistant_turn`)
+  so the two can never disagree about which turn they're each reading. Cached on `AgentEntry.
+  last_context_model` from `run_compact_nudge`'s own read (not threaded through `compact_nudge_
+  tick` itself — nothing in the state-machine DECISION logic needs it, so keeping it out of that
+  function's parameter list avoided ~50 test-call-site edits for what is purely a display concern).
+
+**(2) Self-echo spurious inference arm.** Post-recovery, the panel showed a fresh inference arm
+"awaiting evidence (unconfirmed)" with no real compaction underway. Forensics (the user's own
+disambiguating hypothesis, confirmed as the general mechanism regardless of which detector):
+`human_typed_compact_detected` scans the WHOLE bounded output tail for a standalone `/compact`
+token, not just fresh growth, and `auto_compact_banner_detected` can match text loomux itself
+pasted (the reinjection notice quotes the role instructions verbatim, which may itself describe
+this feature). Either detector can misread an ECHO of loomux's own recent activity — a `/compact`
+paste or a reinjection notice still sitting in the tail — as fresh evidence, especially once an
+UNRELATED human keystroke satisfies the recency-only gate manual detection used to rely on. D4
+held both times (every arm resolved to a correctly-audited discard, never a loop) but the noise
+is conceptually wrong, and its repeated arm/discard cycling is the same shape #410 (above) closes
+separately.
+
+Fix: `AgentEntry.compact_inference_guard_until_ms` — INFERENCE arms (banner, manual detection;
+NEVER the trusted arm, which infers nothing) may only arm while `now >= this`. Extended (never
+seeded at construction — see the field's doc for why a "distrust every fresh session" grace period
+isn't this principle) in two places: (a) **provenance** — a CONFIRMED delivery `from == "loomux"`
+(a new field on the existing `DeliveryOutcome`/`DeliveryConfirmation`, captured from `deliver_
+prompt`'s own `from` parameter) extends the guard past that delivery's `submit_sent_ms` — loomux's
+own paste can never satisfy loomux's own detectors, whatever it pasted; (b) **post-resolve
+cooldown** — any terminal `compact_pending` resolution (discard, arm-timeout, reinjection
+confirmed, reinjection abandoned) extends the guard past `now` — the immediate post-compact
+conversation window. Both extend the SAME field (`.max`, never shortens), so the fix holds
+regardless of which mechanism a given false positive traces to.
+
+Regression coverage: `compact_nudge_tick_never_reads_its_own_compact_paste_echo_as_a_manually_
+typed_one` pins the user's own disambiguating scenario. `compact_nudge_tick_suppresses_an_
+immediate_rearm_of_the_same_false_signal_within_the_cooldown` (and its "a genuine new signal
+after the cooldown clears still arms" extension) plus `run_compact_nudge_reads_a_model_aware_
+window_from_the_real_transcript` / `..._honors_an_explicit_context_window_override` — all
+red-before-green verified. D4's own test (`..._never_loops_when_the_false_signal_repeats_every_
+cycle`) was updated to clear the cooldown between its three cycles (the core "zero reinjections,
+ever" invariant is unaffected).
+
+**Filed, not implemented this round:** the testbed agent observed that an orchestration-RESTORE
+kickoff doesn't embed the directive ledger the way a `/compact` reinjection does — filed as
+[#411](https://github.com/willem445/loomux/issues/411), a known scope boundary (a different code
+path, `spawn_agent_ex`'s resume branch, not `compact_nudge_tick`).
+
 ## Enforced merge gate (#83)
 
 Template guidance is not a security boundary. A live incident proved it: an orchestrator merged
