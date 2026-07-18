@@ -18,6 +18,7 @@ pub mod lessons;
 pub mod mcp;
 pub mod notify;
 pub mod profiles;
+pub mod report;
 pub mod workflow;
 
 use serde::{Deserialize, Serialize};

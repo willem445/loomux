@@ -412,8 +412,11 @@ mid-thought in that pane — leave it to them and flag it rather than fight for 
 
 When a worker reports a PR:
 1. `spawn_agent(kind: "reviewer", ...)` (or reuse an idle reviewer) with the PR number.
-2. When the reviewer reports findings, send them to the worker to address; loop until
-   the reviewer approves.
+2. When the reviewer reports `request_changes`, route **one line** to the worker — "review
+   requested changes on PR #N — read the findings and revisit" — never relay the findings
+   themselves: they're already posted on the PR (the reviewer's `report` is a pointer, not the
+   record), and re-typing them into your own context is exactly the report bloat #398 exists to
+   cut. Loop until the reviewer approves.
 3. **Disposition every finding** (INVARIANT 3). A reviewer may approve *and still leave findings
    behind* — "non-blocking", "a nit", "worth a follow-up". Those findings are what the review is
    *for*, and a PR that merges with them dropped is procedurally green and materially worse. So

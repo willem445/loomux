@@ -4080,6 +4080,78 @@ fn report_validates_status_and_role() {
     );
 }
 
+// ---------- decision-grade structured reports (#398) ----------
+
+#[test]
+fn report_rejects_an_unknown_outcome() {
+    let (reg, _d, _co, cw) = setup_mcp();
+    let bad = dispatch(&reg, &cw, "tools/call",
+        &json!({ "name": "report", "arguments": { "outcome": "shipped", "note": "x" } })).unwrap();
+    assert_eq!(bad["isError"], true, "an outcome outside the enum must be rejected, not guessed");
+}
+
+#[test]
+fn report_requires_status_or_outcome() {
+    let (reg, _d, _co, cw) = setup_mcp();
+    let bad = dispatch(&reg, &cw, "tools/call",
+        &json!({ "name": "report", "arguments": { "summary": "x" } })).unwrap();
+    assert_eq!(bad["isError"], true, "neither status nor outcome given must be rejected");
+}
+
+#[test]
+fn report_requires_summary_or_note() {
+    let (reg, _d, _co, cw) = setup_mcp();
+    let bad = dispatch(&reg, &cw, "tools/call",
+        &json!({ "name": "report", "arguments": { "outcome": "done" } })).unwrap();
+    assert_eq!(bad["isError"], true, "neither summary nor note given must be rejected");
+}
+
+#[test]
+fn report_outcome_alone_implies_status_for_idle_bookkeeping() {
+    // A reviewer reporting a structured `approved`/`request_changes` outcome never
+    // has to also pass legacy `status` — the tool derives it, and `approved` means
+    // "this agent's turn is over", exactly like a worker's `done`.
+    let (reg, _d, _co, cw) = setup_mcp();
+    let idle_of = || -> Value {
+        reg.list_agents(&cw.group).as_array().unwrap().iter()
+            .find(|a| a["id"] == cw.agent_id).unwrap()["idle_since_ms"].clone()
+    };
+    assert!(idle_of().is_null(), "the tasked agent from setup_mcp starts not idle");
+    let _ = dispatch(&reg, &cw, "tools/call",
+        &json!({ "name": "report", "arguments": { "outcome": "approved", "ref": "#412", "note": "clean" } }));
+    assert!(!idle_of().is_null(),
+        "outcome: approved (no status given) must still re-idle the agent, derived from the outcome");
+}
+
+#[test]
+fn report_outcome_progress_does_not_reidle() {
+    let (reg, _d, _co, cw) = setup_mcp();
+    let idle_of = || -> Value {
+        reg.list_agents(&cw.group).as_array().unwrap().iter()
+            .find(|a| a["id"] == cw.agent_id).unwrap()["idle_since_ms"].clone()
+    };
+    let _ = dispatch(&reg, &cw, "tools/call",
+        &json!({ "name": "report", "arguments": { "outcome": "progress", "note": "still working" } }));
+    assert!(idle_of().is_null(), "outcome: progress must not re-idle the agent");
+}
+
+#[test]
+fn report_note_over_the_cap_does_not_fail_validation() {
+    // The cap TRUNCATES (with a stated marker, see report::truncate_note's own
+    // tests) rather than rejecting the call — structural enforcement, not a
+    // guideline the caller could violate into an error.
+    let (reg, _d, _co, cw) = setup_mcp();
+    let long_note = "x".repeat(900);
+    let r = dispatch(&reg, &cw, "tools/call",
+        &json!({ "name": "report", "arguments": { "outcome": "done", "ref": "#1", "note": long_note } })).unwrap();
+    // Delivery still fails at the PTY in test mode (no pane) — but that failure
+    // must be the SAME "no terminal" error every other report gets, never a
+    // validation rejection over the note's length.
+    let text = r["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("terminal") || text.contains("reported"),
+        "an over-cap note must truncate, not fail validation, got: {text}");
+}
+
 #[test]
 fn planner_done_report_closes_pane_and_reports_before_exit() {
     // #203: a planner's contract is one plan → one report → exit. When it
