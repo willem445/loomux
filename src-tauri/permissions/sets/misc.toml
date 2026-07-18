@@ -1,6 +1,6 @@
 [[set]]
 identifier = "misc"
-description = "Ungrouped single-module commands: session listing, agent CLI probing, external editor launch, file hashing, startup notice, durable UI tab state, voice capture."
+description = "Ungrouped single-module commands: session listing, agent CLI probing, external editor launch, file hashing, startup notice, durable UI tab state, voice capture, opening/closing a plugin's isolated child webview."
 permissions = [
     "allow-list-sessions",
     "allow-probe-agent-cli",
@@ -12,4 +12,14 @@ permissions = [
     "allow-voice-start",
     "allow-voice-stop",
     "allow-voice-cancel",
+    # main-only (#360 Slice C/D): opens/closes a plugin's isolated child
+    # webview (Window::add_child). Never granted to a plugin-* webview itself
+    # — see permissions/sets/plugin-broker.toml.
+    "allow-plugin-open-window",
+    "allow-plugin-close-window",
+    # main-only (#391, folded into #380; renamed/extended by the #380
+    # sessions-occlusion fix): sets the plugin child webview's bounds and
+    # clips its own HWND to exclude whatever DOM overlay rects currently
+    # cover its pane, atomically. Never granted to a plugin-* webview itself.
+    "allow-plugin-set-frame",
 ]

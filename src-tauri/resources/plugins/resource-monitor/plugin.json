@@ -1,0 +1,9 @@
+{
+  "id": "resource-monitor",
+  "name": "Resource Monitor",
+  "version": "1.0.0",
+  "apiVersion": 1,
+  "entry": "index.html",
+  "capabilities": ["panel", "metrics.system", "storage"],
+  "rootless": true
+}

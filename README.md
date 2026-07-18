@@ -73,6 +73,7 @@ no global mode:
 | **File editor** | The file tree + code editor above, as a **pane** rather than an overlay, rooted at a folder you pick. |
 | **Git** | The git view — graph, status, diffs, staging, worktree switching — as a **pane**, over a repo you pick. |
 | **Workflow** | The repo's agent workflow — which blocks a run may use, the path between them, the gate that must pass before a merge — as an editable **pane** over `.loomux/workflow.yml`. |
+| **Plugin** | An installed pane plugin, picked from the ones on your machine and hosted in its own sandboxed, isolated webview embedded directly in the pane (no separate OS window) — no shell access, no filesystem beyond a jailed root it declares, no orchestration reach. See the [design note](doc/design/pane-plugins.md) for how the sandbox works, or the [authoring guide](https://willem445.github.io/loomux/features/pane-plugins) and [`templates/loomux-plugin/`](templates/loomux-plugin/) to write your own. |
 
 ## Install
 
@@ -107,7 +108,7 @@ Builds are unsigned for now — on macOS, if the app is reported as damaged, run
 - [Core concepts](https://willem445.github.io/loomux/core-concepts) — panes, the split grid, and the shortcut table
 - [Orchestration guide](https://willem445.github.io/loomux/orchestration) — agent groups, the task board, the label workflow, cross-workspace channels
 - [Autonomous & supervised modes](https://willem445.github.io/loomux/autonomous-mode) — idle-tick autonomy, token budget, auto-merge/release, dangerous mode
-- Feature pages — [git view](https://willem445.github.io/loomux/features/git-view), [GitHub issues](https://willem445.github.io/loomux/features/github-issues), [voice prompts](https://willem445.github.io/loomux/features/voice-prompts), [steering](https://willem445.github.io/loomux/features/steering)
+- Feature pages — [git view](https://willem445.github.io/loomux/features/git-view), [GitHub issues](https://willem445.github.io/loomux/features/github-issues), [voice prompts](https://willem445.github.io/loomux/features/voice-prompts), [steering](https://willem445.github.io/loomux/features/steering), [pane plugins](https://willem445.github.io/loomux/features/pane-plugins)
 - [Troubleshooting](https://willem445.github.io/loomux/troubleshooting) — whisper DLLs, `gh` auth, mic permission, disk
 
 The site is built from Markdown under [`docs/`](docs/) and published on each
@@ -166,10 +167,12 @@ src-tauri/src/
   fileedit.rs       file-editor overlay (#174): lazy tree, read/write (atomic + hash conflict), streaming gitignore-aware search/replace (#207) + path-only name enumeration (#214); server-side path safety
   filemgr.rs        file-MANAGER pane (#214): list, new file/folder, rename, delete-to-Recycle-Bin, open-with-default-app, open-with chooser, reveal-in-OS-file-manager; reuses fileedit's path choke point. Shell APIs come from the `windows` dep we already have (ShellExecuteW + SHFileOperationW)
   filehash.rs       file hashing (#214): SHA-256/512, SHA-1, CRC-32/16/8 — streamed off-thread on a worker (never the main thread), cancellable via the #207 registry
-  command_manifest.rs  single source of truth for the ACL manifest's 120 app-command names (#363) — shared by build.rs (include!, feeds the app manifest) and lib.rs (feeds tests/acl_manifest.rs, the coherence guard). See doc/design/acl-manifest.md
+  plugins.rs        pane-plugins backend host (#360 Slice B): plugin.json manifest parsing/validation against the closed contract in doc/design/pane-plugins.md (reject-with-reason, never a partial accept); local-folder discovery + install (copy-only, no build/fetch) under `<app-data>/loomux/plugins/<id>/`; the `plugin://` scheme handler, jailed per-plugin (never resolves outside a plugin's own folder) and carrying the design note's CSP header on every response. `list_plugins`/`install_plugin` commands; the sandboxed-frame broker (Slice C) and the `"plugin"` pane kind (Slice D) build on top of this
+  command_manifest.rs  single source of truth for the ACL manifest's app-command names (120 at #363's landing, 122 with #360 Slice B's plugins) — shared by build.rs (include!, feeds the app manifest) and lib.rs (feeds tests/acl_manifest.rs, the coherence guard). See doc/design/acl-manifest.md
   lib.rs            Tauri wiring
 src-tauri/
-  capabilities/     ACL grants (#363): default.json grants `main` every command via the `main-ui` permission set; plugin-zero-template.json is the zero-grant template a future #360 plugin webview binds to
+  resources/plugins/resource-monitor/  the bundled resource-monitor example plugin (#360 Slice F) — ships already installed, seeded into `<app-data>/loomux/plugins/` on first boot by `plugins::seed_bundled_example_plugin` (never overwrites an already-installed copy)
+  capabilities/     ACL grants (#363): default.json grants `main` every command via the `main-ui` permission set, scoped `webviews: ["main"]` (not `windows`) since #360 Slice D embeds a plugin as a child webview of the same window — see pluginbroker.rs's module doc comment for why `windows`-scoping would leak main's grant to it; plugin.json is the curated broker-only grant a plugin's child webview binds to (`webviews: ["plugin-*"]`); plugin-zero-template.json is the zero-grant template
   permissions/      hand-authored module/tier permission sets (permissions/sets/*.toml) + Tauri-generated per-command allow-/deny- pairs (permissions/autogenerated/*.toml, DO NOT EDIT)
 src/
   pty.ts            typed bridge to the backend (invoke + event bus)
@@ -204,6 +207,7 @@ src/
   channel.ts        pure connect-gesture reducer (arm/complete/cancel/set-sender) + per-channel color/number/direction chip derivation (#271) (DOM-free, unit-tested)
   filehashmodel.ts  pure hashing policy: auto-hash threshold, digest cache keying (path+size+mtime), formatting (DOM-free, unit-tested)
   filemgr.ts        typed bridge to filemgr.rs + filehash.rs (per-feature wrapper, like fileapi.ts)
+  pluginhost.ts     typed bridge to plugins.rs (#360 Slice B, per-feature wrapper like fileapi.ts): list installed plugins, install one from a local folder
   filematch.ts      pure file-NAME matching + ranking for "Go to file" (#214, DOM-free, unit-tested)
   modal.ts          the shared confirm/choice dialog (used by the editor and the file manager)
   filetreemodel.ts  pure lazy-tree model: sort/merge/flatten (DOM-free, unit-tested)

@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<!--
+  No CSP <meta> tag needed (or honored) here — every response the
+  `plugin://` scheme handler serves, this file included, already carries the
+  restrictive Content-Security-Policy header doc/design/pane-plugins.md
+  requires (connect-src 'none', script-src 'self' plugin:, ...). That's why
+  this page has no inline <script>/<style attr>/onclick — the CSP blocks
+  them, so main.js is a separate file and there's no inline JS below.
+-->
+<title>Hello world (loomux plugin template)</title>
+<!--
+  A linked stylesheet, not an inline <style> block: the plugin:// CSP is
+  `style-src 'self' plugin:` with no `unsafe-inline`, so an inline <style>
+  (or a style="..." attribute) is silently dropped by the browser — this is
+  the form that actually renders under that policy.
+-->
+<link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <h1>Hello from your plugin</h1>
+  <p id="status">Talking to the broker&hellip;</p>
+  <button id="bump" disabled>Bump the visit count</button>
+  <p>
+    Edit <code>main.js</code> and <code>index.html</code> to build your own
+    view. See <code>plugin.json</code> for the manifest and
+    <code>sdk/plugin-sdk.js</code> for the broker client. Full guide:
+    <code>docs/features/pane-plugins.md</code> in the loomux repo.
+  </p>
+  <script type="module" src="./main.js"></script>
+</body>
+</html>

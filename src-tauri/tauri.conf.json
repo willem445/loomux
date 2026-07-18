@@ -28,7 +28,8 @@
     "active": true,
     "targets": "all",
     "resources": {
-      "resources/conhost/*": "./"
+      "resources/conhost/*": "./",
+      "resources/plugins/resource-monitor/*": "plugins/resource-monitor"
     },
     "icon": [
       "icons/32x32.png",

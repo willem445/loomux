@@ -1,0 +1,7 @@
+[[set]]
+identifier = "plugin-broker"
+description = "The #360 pane-plugins trust core: the ONLY two commands a plugin's isolated child webview may ever invoke (capabilities/plugin.json, webviews: [\"plugin-*\"]). Deliberately excludes plugin_open_window/plugin_close_window (main-only, granted via \"misc\") and every other command — a plugin never gets a wider grant than this, by construction, not by convention. See doc/design/pane-plugins.md's broker contract and tests/acl_manifest.rs's plugin_capability_grants_only_broker_commands."
+permissions = [
+    "allow-plugin-broker-request",
+    "allow-plugin-broker-open-channel",
+]

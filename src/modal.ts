@@ -2,6 +2,14 @@
 // (the same look as editorConfigDialog). Lifted out of fileedit.ts when the file
 // manager (#214) needed the identical dialog — one copy, two callers, rather than
 // a second implementation that would drift.
+//
+// Both `modal()` and `promptModal()` register with the shared overlay registry
+// (overlaystate.ts) for their whole lifetime (#391, folded into #380) — a
+// plugin pane's native child webview swallows both paint and pointer events
+// under a DOM overlay, so a modal opened over one would otherwise be both
+// invisible and unclickable.
+
+import { overlayState } from "./overlaystate";
 
 export interface ModalButton<T> {
   label: string;
@@ -30,9 +38,11 @@ export interface ModalSpec<T> {
 export function modal<T>(build: (resolve: (v: T) => void) => ModalSpec<T>): Promise<T> {
   return new Promise<T>((resolve) => {
     let settled = false;
+    const closeOverlaySlot = overlayState.open(() => overlay.getBoundingClientRect());
     const done = (v: T) => {
       if (settled) return;
       settled = true;
+      closeOverlaySlot();
       overlay.remove();
       resolve(v);
     };
@@ -99,9 +109,11 @@ export function promptModal(spec: {
 }): Promise<string | null> {
   return new Promise<string | null>((resolve) => {
     let settled = false;
+    const closeOverlaySlot = overlayState.open(() => overlay.getBoundingClientRect());
     const done = (v: string | null) => {
       if (settled) return;
       settled = true;
+      closeOverlaySlot();
       overlay.remove();
       resolve(v);
     };

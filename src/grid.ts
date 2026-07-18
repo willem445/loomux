@@ -11,7 +11,14 @@
 
 import { Pane, type PaneEvents, type PaneOptions, type ContentPaneOptions } from "./pane";
 import type { PersistedPane } from "./tabstore";
-import { dropZoneFor, indicatorFor, zoneToPlacement, type DropZone } from "./layout";
+import {
+  dropZoneFor,
+  indicatorFor,
+  zoneToPlacement,
+  isPositionOnlyMove,
+  type DropZone,
+  type PaneBox,
+} from "./layout";
 import { dockChipAttention } from "./attention";
 import { planGroupMinimize } from "./group";
 import { shouldFocusNewPane, shouldRestoreFocus, shouldPreserveMaximize } from "./panefocus";
@@ -279,7 +286,11 @@ export class Grid {
         });
       }
     };
-    walk(this.root, weights);
+    // A saved divider position can happen to put a pane back at the exact
+    // pixel box it already occupied mid-rebuild (#380's backstop, same as
+    // every other tree mutation) — session restore is otherwise no different
+    // from a drag that lands a divider back where it started.
+    this.syncMovedPanes(() => walk(this.root!, weights));
   }
 
   /** Insert a freshly-constructed pane's leaf into the tree and settle focus.
@@ -304,10 +315,7 @@ export class Grid {
     const keepMaximized = shouldPreserveMaximize(!background, this.maximized !== null)
       ? this.maximized
       : null;
-    if (this.maximized && !keepMaximized) this.exitMaximize(); // a layout change exits fullscreen
     const leaf: LeafNode = { kind: "leaf", pane, parent: null };
-    this.leaves.set(pane, leaf);
-
     const target = relativeTo ?? this.active;
     const wasEmpty = !this.root || !target;
 
@@ -316,21 +324,31 @@ export class Grid {
     // would be left with no active terminal.
     const takeFocus = shouldFocusNewPane(!background, wasEmpty);
 
-    if (wasEmpty) {
-      this.root = leaf;
-      pane.el.style.flex = "1 1 0";
-      this.rootEl.appendChild(pane.el);
-    } else {
-      this.insertBeside(this.leaves.get(target)!, leaf, dir);
-    }
+    // Inserting a new leaf redistributes flex share across a split's OTHER
+    // children too, so wrap the whole placement in the same backstop every
+    // other tree mutation goes through (#380) — most of the time this is a
+    // genuine resize for them (their own ResizeObserver catches it), but this
+    // makes no assumption either way.
+    this.syncMovedPanes(() => {
+      if (this.maximized && !keepMaximized) this.exitMaximize(); // a layout change exits fullscreen
+      this.leaves.set(pane, leaf);
 
-    // Preserving fullscreen (#155): insertBeside re-seated the maximized pane's
-    // element into the now-hidden split, so lift it back to the top layer. We
-    // never removed `.has-maximized`/`.maximized`, so no pane repainted; the new
-    // pane sits in the hidden subtree (zero width → no fit → no PTY resize) and
-    // becomes visible when the human unmaximizes. Do this BEFORE restoreFocus so
-    // the re-lift's detach/reattach blur is the human's last focus event undone.
-    if (keepMaximized) this.rootEl.appendChild(keepMaximized.el);
+      if (wasEmpty) {
+        this.root = leaf;
+        pane.el.style.flex = "1 1 0";
+        this.rootEl.appendChild(pane.el);
+      } else {
+        this.insertBeside(this.leaves.get(target)!, leaf, dir);
+      }
+
+      // Preserving fullscreen (#155): insertBeside re-seated the maximized pane's
+      // element into the now-hidden split, so lift it back to the top layer. We
+      // never removed `.has-maximized`/`.maximized`, so no pane repainted; the new
+      // pane sits in the hidden subtree (zero width → no fit → no PTY resize) and
+      // becomes visible when the human unmaximizes. Do this BEFORE restoreFocus so
+      // the re-lift's detach/reattach blur is the human's last focus event undone.
+      if (keepMaximized) this.rootEl.appendChild(keepMaximized.el);
+    });
 
     if (takeFocus) this.setActive(pane);
     // Hand focus back synchronously, in the same tick as the relayout — JS is
@@ -401,23 +419,25 @@ export class Grid {
 
     const leaf = this.leaves.get(pane);
     if (!leaf) return;
-    if (this.maximized) this.exitMaximize(); // re-seat any lifted pane first
-    this.leaves.delete(pane);
-    this.removeFromTree(leaf);
-    pane.dispose(killBackend);
+    this.syncMovedPanes(() => {
+      if (this.maximized) this.exitMaximize(); // re-seat any lifted pane first
+      this.leaves.delete(pane);
+      this.removeFromTree(leaf);
+      pane.dispose(killBackend);
 
-    if (this.active === pane) {
-      this.active = null;
-      const next = this.panes()[0];
-      if (next) this.setActive(next);
-    }
-    if (!this.root) {
-      // Prefer bringing a parked pane back over spawning a fresh shell, so
-      // minimized work isn't stranded behind a brand-new pane.
-      const parked = this.minimizedPanes[this.minimizedPanes.length - 1];
-      if (parked) this.restore(parked);
-      else this.onEmpty();
-    }
+      if (this.active === pane) {
+        this.active = null;
+        const next = this.panes()[0];
+        if (next) this.setActive(next);
+      }
+      if (!this.root) {
+        // Prefer bringing a parked pane back over spawning a fresh shell, so
+        // minimized work isn't stranded behind a brand-new pane.
+        const parked = this.minimizedPanes[this.minimizedPanes.length - 1];
+        if (parked) this.restore(parked);
+        else this.onEmpty();
+      }
+    });
     this.onChange();
   }
 
@@ -525,17 +545,19 @@ export class Grid {
    *  intact; restoring just re-seats the element in its slot. */
   toggleMaximize(pane: Pane): void {
     if (!this.leaves.has(pane)) return; // parked/unknown panes can't maximize
-    if (this.maximized === pane) {
-      this.exitMaximize();
-    } else {
-      if (this.maximized) this.exitMaximize();
-      this.rootEl.classList.add("has-maximized");
-      this.rootEl.appendChild(pane.el); // lift out of the tree into the top layer
-      pane.setMaximized(true);
-      this.maximized = pane;
-      this.setActive(pane);
-      pane.focus();
-    }
+    this.syncMovedPanes(() => {
+      if (this.maximized === pane) {
+        this.exitMaximize();
+      } else {
+        if (this.maximized) this.exitMaximize();
+        this.rootEl.classList.add("has-maximized");
+        this.rootEl.appendChild(pane.el); // lift out of the tree into the top layer
+        pane.setMaximized(true);
+        this.maximized = pane;
+        this.setActive(pane);
+        pane.focus();
+      }
+    });
   }
 
   /** Drop the current fullscreen pane back into its slot. A no-op if nothing
@@ -563,18 +585,20 @@ export class Grid {
     const leaf = this.leaves.get(pane);
     if (!leaf) return;
     if (this.leaves.size <= 1) return;
-    if (this.maximized) this.exitMaximize();
-    this.leaves.delete(pane);
-    this.removeFromTree(leaf);
-    this.minimizedPanes.push(pane);
-    // While docked the pane's header is out of the DOM, so mirror any change
-    // the chip shows — attention (#6) or a rename (#95r) — onto its dock chip.
-    pane.setDockSyncListener(() => this.renderDock());
-    if (this.active === pane) {
-      this.active = null;
-      const next = this.panes()[0];
-      if (next) this.setActive(next);
-    }
+    this.syncMovedPanes(() => {
+      if (this.maximized) this.exitMaximize();
+      this.leaves.delete(pane);
+      this.removeFromTree(leaf);
+      this.minimizedPanes.push(pane);
+      // While docked the pane's header is out of the DOM, so mirror any change
+      // the chip shows — attention (#6) or a rename (#95r) — onto its dock chip.
+      pane.setDockSyncListener(() => this.renderDock());
+      if (this.active === pane) {
+        this.active = null;
+        const next = this.panes()[0];
+        if (next) this.setActive(next);
+      }
+    });
     this.renderDock();
     // Docking changed the tree AND which panes are captured (docked panes are
     // captured separately, #194 P4 MED-6) — persist + re-count.
@@ -587,27 +611,29 @@ export class Grid {
   restore(pane: Pane): void {
     const idx = this.minimizedPanes.indexOf(pane);
     if (idx < 0) return;
-    if (this.maximized) this.exitMaximize();
-    this.minimizedPanes.splice(idx, 1);
-    pane.setDockSyncListener(null);
-    // Restoring a docked pane is "turning to it" — clear a latched attention
-    // report the same way clicking a pane does; live reasons re-badge its
-    // header on the next scan.
-    pane.acknowledgeAttention();
-    const leaf: LeafNode = { kind: "leaf", pane, parent: null };
-    this.leaves.set(pane, leaf);
-    pane.el.style.flex = "1 1 0";
+    this.syncMovedPanes(() => {
+      if (this.maximized) this.exitMaximize();
+      this.minimizedPanes.splice(idx, 1);
+      pane.setDockSyncListener(null);
+      // Restoring a docked pane is "turning to it" — clear a latched attention
+      // report the same way clicking a pane does; live reasons re-badge its
+      // header on the next scan.
+      pane.acknowledgeAttention();
+      const leaf: LeafNode = { kind: "leaf", pane, parent: null };
+      this.leaves.set(pane, leaf);
+      pane.el.style.flex = "1 1 0";
 
-    const target = this.active;
-    const targetLeaf = target ? this.leaves.get(target) : undefined;
-    if (!this.root || !targetLeaf) {
-      this.root = leaf;
-      this.rootEl.replaceChildren(pane.el);
-    } else {
-      this.insertBeside(targetLeaf, leaf, "row");
-    }
-    this.setActive(pane);
-    pane.focus();
+      const target = this.active;
+      const targetLeaf = target ? this.leaves.get(target) : undefined;
+      if (!this.root || !targetLeaf) {
+        this.root = leaf;
+        this.rootEl.replaceChildren(pane.el);
+      } else {
+        this.insertBeside(targetLeaf, leaf, "row");
+      }
+      this.setActive(pane);
+      pane.focus();
+    });
     this.renderDock();
     this.onChange();
   }
@@ -621,25 +647,27 @@ export class Grid {
    *  like `minimize`, never empties the grid. Dock + active pane are refreshed
    *  once at the end. */
   minimizeMany(panes: Pane[]): void {
-    if (this.maximized) this.exitMaximize();
     let changed = false;
-    for (const pane of panes) {
-      const leaf = this.leaves.get(pane);
-      if (!leaf) continue; // not visible (already docked) or unknown
-      if (this.leaves.size <= 1) break; // keep at least one pane in the grid
-      this.leaves.delete(pane);
-      this.removeFromTree(leaf);
-      this.minimizedPanes.push(pane);
-      // Docked panes mirror attention onto their dock chip (see `minimize`).
-      pane.setDockSyncListener(() => this.renderDock());
-      if (this.active === pane) this.active = null;
-      changed = true;
-    }
+    this.syncMovedPanes(() => {
+      if (this.maximized) this.exitMaximize();
+      for (const pane of panes) {
+        const leaf = this.leaves.get(pane);
+        if (!leaf) continue; // not visible (already docked) or unknown
+        if (this.leaves.size <= 1) break; // keep at least one pane in the grid
+        this.leaves.delete(pane);
+        this.removeFromTree(leaf);
+        this.minimizedPanes.push(pane);
+        // Docked panes mirror attention onto their dock chip (see `minimize`).
+        pane.setDockSyncListener(() => this.renderDock());
+        if (this.active === pane) this.active = null;
+        changed = true;
+      }
+      if (changed && this.active === null) {
+        const next = this.panes()[0];
+        if (next) this.setActive(next);
+      }
+    });
     if (!changed) return;
-    if (this.active === null) {
-      const next = this.panes()[0];
-      if (next) this.setActive(next);
-    }
     this.renderDock();
     // A batch fold moved panes between the tree and the dock — capture the new
     // shape so a fold-then-quit restores them docked, not re-expanded (#194 P4).
@@ -651,32 +679,37 @@ export class Grid {
    *  group comes back as a coherent cluster; the single synchronous pass keeps
    *  the fits coalesced. Focus + dock settle once at the end. */
   restoreMany(panes: Pane[]): void {
-    if (this.maximized) this.exitMaximize();
-    let last: Pane | null = null;
-    for (const pane of panes) {
-      const idx = this.minimizedPanes.indexOf(pane);
-      if (idx < 0) continue; // not docked / unknown
-      this.minimizedPanes.splice(idx, 1);
-      pane.setDockSyncListener(null);
-      // Restoring is "turning to" the pane — clear a latched attention report,
-      // same as `restore`.
-      pane.acknowledgeAttention();
-      const leaf: LeafNode = { kind: "leaf", pane, parent: null };
-      this.leaves.set(pane, leaf);
-      pane.el.style.flex = "1 1 0";
+    // An object, not a bare `let`: TS's control-flow narrowing doesn't track a
+    // closure's assignment back into an outer local (it would otherwise narrow
+    // `last` to `null` here regardless of the loop below ever running).
+    const result: { last: Pane | null } = { last: null };
+    this.syncMovedPanes(() => {
+      if (this.maximized) this.exitMaximize();
+      for (const pane of panes) {
+        const idx = this.minimizedPanes.indexOf(pane);
+        if (idx < 0) continue; // not docked / unknown
+        this.minimizedPanes.splice(idx, 1);
+        pane.setDockSyncListener(null);
+        // Restoring is "turning to" the pane — clear a latched attention report,
+        // same as `restore`.
+        pane.acknowledgeAttention();
+        const leaf: LeafNode = { kind: "leaf", pane, parent: null };
+        this.leaves.set(pane, leaf);
+        pane.el.style.flex = "1 1 0";
 
-      const targetLeaf = this.active ? this.leaves.get(this.active) : undefined;
-      if (!this.root || !targetLeaf) {
-        this.root = leaf;
-        this.rootEl.replaceChildren(pane.el);
-      } else {
-        this.insertBeside(targetLeaf, leaf, "row");
+        const targetLeaf = this.active ? this.leaves.get(this.active) : undefined;
+        if (!this.root || !targetLeaf) {
+          this.root = leaf;
+          this.rootEl.replaceChildren(pane.el);
+        } else {
+          this.insertBeside(targetLeaf, leaf, "row");
+        }
+        // Seat the next restore beside this one, not back at the orchestrator.
+        this.setActive(pane);
+        result.last = pane;
       }
-      // Seat the next restore beside this one, not back at the orchestrator.
-      this.setActive(pane);
-      last = pane;
-    }
-    if (last) last.focus();
+    });
+    result.last?.focus();
     this.renderDock();
     this.onChange();
   }
@@ -886,6 +919,32 @@ export class Grid {
     indicator.dataset.zone = zone;
   }
 
+  /** Snapshot every visible leaf's on-screen box, run `mutate`, then call
+   *  `Pane.notifyMoved()` for any pane `layout.ts`'s `isPositionOnlyMove` says
+   *  ended up in a new screen position with the SAME size (#380) — the
+   *  general backstop instead of hand-deriving "does this specific mutation
+   *  resize" per call site. That hand-derivation is exactly what went wrong
+   *  once already: `moveToEdge`'s own doc comment assumed a "genuine
+   *  restructure" always resizes, but a 2-pane edge-drop reorder can leave
+   *  both panes at an identical 50/50 share — same size, swapped position,
+   *  the same gap `swap()` has by design. Wrapping every leaf-relocating
+   *  mutation here means a future one gets this for free instead of needing
+   *  its own bespoke notify call remembered and threaded in by hand.
+   *
+   *  A genuine resize is deliberately left alone: the moved pane's own
+   *  `ResizeObserver` already re-syncs it on the next frame, and calling
+   *  `notifyMoved` here too would just double that content view's IPC round
+   *  trip for the same event, for nothing. */
+  private syncMovedPanes(mutate: () => void): void {
+    const before = new Map<Pane, PaneBox>();
+    for (const pane of this.leaves.keys()) before.set(pane, pane.el.getBoundingClientRect());
+    mutate();
+    for (const [pane, prev] of before) {
+      if (!this.leaves.has(pane)) continue; // closed or docked mid-mutation
+      if (isPositionOnlyMove(prev, pane.el.getBoundingClientRect())) pane.notifyMoved();
+    }
+  }
+
   /** Swap two panes between their slots, preserving each slot's flex so equal
    *  slots keep identical pixel sizes — and therefore never resize a PTY
    *  (applyFit skips same-size fits). The split structure is untouched. */
@@ -895,35 +954,43 @@ export class Grid {
     const lb = this.leaves.get(b);
     if (!la || !lb) return;
 
-    const fa = a.el.style.flex;
-    const fb = b.el.style.flex;
-    a.el.style.flex = fb;
-    b.el.style.flex = fa;
+    this.syncMovedPanes(() => {
+      const fa = a.el.style.flex;
+      const fb = b.el.style.flex;
+      a.el.style.flex = fb;
+      b.el.style.flex = fa;
 
-    const marker = document.createComment("swap");
-    a.el.replaceWith(marker);
-    b.el.replaceWith(a.el);
-    marker.replaceWith(b.el);
+      const marker = document.createComment("swap");
+      a.el.replaceWith(marker);
+      b.el.replaceWith(a.el);
+      marker.replaceWith(b.el);
 
-    la.pane = b;
-    lb.pane = a;
-    this.leaves.set(a, lb);
-    this.leaves.set(b, la);
+      la.pane = b;
+      lb.pane = a;
+      this.leaves.set(a, lb);
+      this.leaves.set(b, la);
+    });
   }
 
   /** Move a pane out of its current slot and re-dock it to an edge of the
-   *  target, forming (or joining) a split in that direction. This is a genuine
-   *  restructure, so affected panes may resize once. */
+   *  target, forming (or joining) a split in that direction. Usually a
+   *  genuine restructure that resizes the affected panes once (their own
+   *  ResizeObserver picks it up) — but NOT always: reordering within an
+   *  existing 2-way split can land both panes back at an identical share,
+   *  same size, swapped position, so this goes through `syncMovedPanes`
+   *  too (#380) rather than assuming the resize always happens. */
   moveToEdge(source: Pane, target: Pane, dir: Dir, before: boolean): void {
     if (source === target || this.maximized) return;
     const leaf = this.leaves.get(source);
     const targetLeaf = this.leaves.get(target);
     if (!leaf || !targetLeaf) return;
-    this.removeFromTree(leaf);
-    source.el.style.flex = "1 1 0";
-    this.insertBeside(targetLeaf, leaf, dir, before);
-    this.setActive(source);
-    source.focus();
+    this.syncMovedPanes(() => {
+      this.removeFromTree(leaf);
+      source.el.style.flex = "1 1 0";
+      this.insertBeside(targetLeaf, leaf, dir, before);
+      this.setActive(source);
+      source.focus();
+    });
   }
 
   /** Move focus to the geometrically nearest pane in a direction. */

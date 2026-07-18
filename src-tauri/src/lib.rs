@@ -11,6 +11,10 @@ mod winpath;
 mod metrics;
 mod obs;
 pub mod orchestration; // pub: integration smoke test links through it
+pub mod pluginbroker; // pub: the #360 Slice C trust-core integration test links its pure fns
+mod pluginregion; // per-overlay occlusion for the plugin child webview (#391, folded into #380)
+mod procmetrics; // the metrics.system data source (#360 Slice E) — dispatched from pluginbroker only
+pub mod plugins; // pub: the pane-plugins integration test links its pure fns (#360 Slice B)
 pub mod pty; // pub: Job-Object integration test links `assign_kill_on_close_job`
 mod sessions;
 mod uistate; // durable UI state (project tabs, #63) — atomic tabs.json store
@@ -39,6 +43,14 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        // Pane plugins (#360 Slice B): serves each installed plugin's own
+        // assets, jailed to its folder, with the CSP header the design note
+        // requires on every response — see plugins::plugin_protocol_handler.
+        // Slice C's plugin_open_window points the plugin's child webview at
+        // the URLs this handler serves (plugin://localhost/<id>/...) rather
+        // than registering a second handler — Tauri allows exactly one per
+        // scheme.
+        .register_uri_scheme_protocol("plugin", plugins::plugin_protocol_handler)
         .manage(startup_notice)
         .manage(pty::PtyManager::default())
         .manage(voice::VoiceState::default())
@@ -48,6 +60,16 @@ pub fn run() {
             orchestration::OrchRegistry::default_root(),
         )))
         .setup(|app| {
+            // Seed the bundled resource-monitor example plugin (#360 Slice F)
+            // on first boot — ships already installed, per the design note's
+            // Open Decision #4, so the demo works with no manual install
+            // step. Best-effort: a resource dir that can't be resolved (e.g.
+            // `cargo test` without a bundle) just means the example doesn't
+            // pre-install, never a startup failure.
+            match app.path().resource_dir() {
+                Ok(resource_dir) => plugins::seed_bundled_example_plugin(&resource_dir, &plugins::plugins_root_dir()),
+                Err(e) => obs::breadcrumb("plugins", &format!("resource dir unavailable, skipping bundled plugin seed: {e}")),
+            }
             // Start streaming CPU/mem/GPU snapshots to the status bar.
             metrics::start(app.handle().clone());
             // Poll open panes' repos for external checkout/commit/stage (#36).
@@ -185,15 +207,26 @@ pub fn run() {
             filemgr::fm_open_with,
             filemgr::fm_reveal,
             filehash::fm_hash_start,
+            plugins::list_plugins,
+            plugins::install_plugin,
             obs::take_startup_notice,
             uistate::load_ui_tabs,
             uistate::save_ui_tabs,
             voice::voice_start,
             voice::voice_stop,
             voice::voice_cancel,
+            pluginbroker::plugin_open_window,
+            pluginbroker::plugin_close_window,
+            pluginbroker::plugin_broker_request,
+            pluginbroker::plugin_broker_open_channel,
+            pluginregion::plugin_set_frame,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {
+                // The only top-level window left is "main" itself (#360 Slice
+                // D: a plugin is a child webview of main, not its own window,
+                // and never fires this event — see pluginbroker's module doc
+                // comment; its cleanup runs from plugin_close_window instead).
                 obs::breadcrumb("shutdown", "window destroyed");
                 let state: tauri::State<pty::PtyManager> = window.app_handle().state();
                 state.kill_all();
