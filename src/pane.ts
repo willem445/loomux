@@ -1875,17 +1875,16 @@ export class Pane implements VoiceTargetPane {
     return this.tasksEmbedFrac !== null ? !this.tasksEmbedPanelEl!.hidden : !this.tasksOverlay!.hidden;
   }
 
-  /** Show the task board in whichever mode it's currently set to. Closes
-   *  every other overlay first — an embedded board doesn't collide with a
-   *  floating one, but the mutual exclusion predates #361 and there's no
-   *  reason two panels should compete for the human's attention regardless
-   *  of how either is hosted. */
+  /** Show the task board in whichever mode it's currently set to. The
+   *  floating overlays (git/issues/audit/group/file-edit) genuinely collide —
+   *  only one floating panel fits over the terminal — so opening the board
+   *  AS an overlay still closes them first, exactly as it always has. An
+   *  embedded board doesn't occupy that space at all, so it closes none of
+   *  them: the same asymmetry those overlays' own toggles already have
+   *  toward the board (they check `tasksOverlay.hidden` — an embedded board
+   *  never trips that guard and is left alone). Closing them anyway here
+   *  would defeat the coexistence the embed mode exists for. */
   private openTasksView(): void {
-    if (this.issuesView?.visible) this.toggleIssuesView();
-    if (this.gitView?.visible) this.toggleGitView();
-    if (this.auditOverlay && !this.auditOverlay.hidden) this.toggleAuditView();
-    if (this.groupOverlay && !this.groupOverlay.hidden) this.toggleGroupView();
-    if (this.fileEditView?.visible) this.toggleFileEditView();
     if (this.tasksEmbedFrac !== null) {
       const grow = growFromFrac(this.tasksEmbedFrac);
       this.termEl.style.flex = `${grow.growTerm} 1 0`;
@@ -1893,6 +1892,11 @@ export class Pane implements VoiceTargetPane {
       this.tasksEmbedDividerEl!.hidden = false;
       this.tasksEmbedPanelEl!.hidden = false;
     } else {
+      if (this.issuesView?.visible) this.toggleIssuesView();
+      if (this.gitView?.visible) this.toggleGitView();
+      if (this.auditOverlay && !this.auditOverlay.hidden) this.toggleAuditView();
+      if (this.groupOverlay && !this.groupOverlay.hidden) this.toggleGroupView();
+      if (this.fileEditView?.visible) this.toggleFileEditView();
       const strip = Math.max(140, Math.round(this.el.clientHeight * 0.35));
       this.tasksOverlay!.style.height = `${this.overlayClamp(this.termEl.clientHeight - strip)}px`;
       this.tasksOverlay!.hidden = false;
