@@ -529,6 +529,7 @@ async function openActionPane(
         sessionId: null,
         role: null,
         file: null,
+        taskEmbed: null,
       };
       let pane: Pane;
       const content = dormantCard(
@@ -645,6 +646,11 @@ async function openActionPane(
         sessionId: a.sessionId,
         role: a.role,
         file: null,
+        // The task board's embed preference (#361) rides along too, so
+        // re-capturing a still-dormant tab (Resume never clicked) reproduces it
+        // byte for byte, and resumeDormantGroup can reapply it once the pane
+        // it belongs to is actually resumed.
+        taskEmbed: a.taskEmbed,
       };
       const content = dormantCard(
         "Resume group",
@@ -744,6 +750,25 @@ async function resumeDormantGroup(ws: Workspace): Promise<void> {
     const captured = orchRecords
       .filter((r) => r.sessionId !== null)
       .map((r) => ({ sessionId: r.sessionId as string, role: r.role ?? "worker" }));
+    // The task board's embed preference (#361) isn't part of the resume plan
+    // itself (planGroupResume only orders/gates on session id + role) — it's a
+    // captured UI preference, reapplied below once each member's pane actually
+    // comes back, by matching sessionId the same way the plan itself does.
+    const embedBySession = new Map<string, number>();
+    for (const r of orchRecords) {
+      if (r.sessionId && r.taskEmbed !== null) embedBySession.set(r.sessionId, r.taskEmbed);
+    }
+    // resumeOrchSession only returns the group id — "the pane itself is located
+    // later by scanning live panes" (orchestration.ts) — so this does the same,
+    // matching on the session id we just asked it to resume. MUST exclude
+    // dormant panes: the tab's own dormant ORCH placeholder for this same
+    // member carries the identical captured session id (that's the whole
+    // point of dormantRecord) and is still in the tree at this point — an
+    // unfiltered scan would find that stale placeholder first, silently
+    // no-op the embed restore (a dormant pane has no orchGroup), and never
+    // reach the pane that actually needs it.
+    const findResumedPane = (sessionId: string): Pane | undefined =>
+      ws.grid.allPanes().find((p) => !p.isDormant && p.capture()?.sessionId === sessionId);
     // Captured members with no resumable id (e.g. a copilot delegate — copilot
     // mints its own session id after boot, so there's nothing to --resume). They
     // can't be brought back, but they WERE live at close, so they're counted in the
@@ -792,7 +817,11 @@ async function resumeDormantGroup(ws: Workspace): Promise<void> {
         group: groupId,
         role: "orchestrator",
       });
-      if (restored) tabs.bindGroup(restored.groupId, ws.id);
+      if (restored) {
+        tabs.bindGroup(restored.groupId, ws.id);
+        const frac = embedBySession.get(plan.orchestrator.sessionId);
+        if (frac !== undefined) findResumedPane(plan.orchestrator.sessionId)?.restoreTaskEmbed(frac);
+      }
     } catch (err) {
       // Recoverable (retry the button) — a toast, not the app-crash banner (MED-3).
       showToast(`Couldn't resume group: ${String(err)}`, "error");
@@ -807,6 +836,8 @@ async function resumeDormantGroup(ws: Workspace): Promise<void> {
           group: groupId,
           role: member.role,
         });
+        const frac = embedBySession.get(member.sessionId);
+        if (frac !== undefined) findResumedPane(member.sessionId)?.restoreTaskEmbed(frac);
       } catch (err) {
         showToast(`Couldn't rejoin a ${member.role}: ${String(err)}`, "info");
       }

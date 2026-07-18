@@ -30,6 +30,11 @@ Every rung is a complete tool on its own — climb when you're ready:
    to worker and reviewer panes. Every prompt visible, every action audited,
    guardrails host-enforced, no agent ever merges. Hard-won lessons persist
    across groups via a committed `.loomux/lessons.md`, not just this run.
+   The task board — its own keystroke away on any orchestration pane — can
+   float over the terminal like every other overlay, or **embed** beside it
+   (a header toggle) so the pane resizes and the full CLI plus the board
+   stay visible together; the mode you pick persists across a close/reopen
+   and a group resume.
 4. **Custom agent workflows** — commit `.loomux/workflow.yml` and your repo
    declares its own roster and merge gate: five focused reviewers, five
    prompts, five models — plus an on-demand advisor the orchestrator

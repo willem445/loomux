@@ -642,6 +642,37 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 }
 .pane-term .xterm { height: 100%; padding: 6px 2px 4px 10px; }
 
+/* ---------- embedded panels (#361) ---------- */
+/* A discrete, user-initiated alternative to a floating overlay: the task
+   board rendered as a REAL flex sibling of the terminal, so both stay fully
+   visible and the terminal's own box genuinely resizes — see
+   doc/design/embedded-panels.md for why that's the legitimate side of the
+   no-PTY-resize-for-chrome rule (CLAUDE.md constraint 1), not a violation of
+   it. `.pane-embed-host` takes over `.pane-term`'s old role as `.pane`'s
+   direct flex:1 child; with the divider/panel `[hidden]` it lays out
+   identically to `.pane-term` being that child directly (see
+   `Pane.ensureEmbedHost`), so there's nothing kind-specific to gate here. */
+.pane-embed-host {
+  display: flex; flex-direction: column; flex: 1; min-height: 0;
+}
+.pane-embed-panel {
+  flex: 1 1 0; min-height: 0; min-width: 0;
+  display: flex; flex-direction: column;
+  background: var(--bg-app);
+}
+.pane-embed-divider {
+  flex: none; height: 6px; cursor: row-resize;
+  background: transparent; border-radius: 3px;
+  transition: background 0.18s var(--ease);
+}
+.pane-embed-divider:hover, .pane-embed-divider.dragging { background: var(--accent-dim); }
+.pane-embed-divider.dragging { background: var(--accent); }
+
+/* The task board's embed toggle (in its own header) reads as pressed once
+   the panel is actually embedded — the same always-visible-once-relevant
+   treatment `.tasks-head .pane-btn` already gives every other board button. */
+.tasks-head .pane-btn.embed.active { color: var(--accent); }
+
 /* ---------- orchestrator steering strip (#43, option C) ---------- */
 /* Docked under the ORCHESTRATOR pane's terminal. Styled like the task board's
    "Add a task" field; the group accent on the top edge ties it to the pane.
