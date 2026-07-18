@@ -254,6 +254,11 @@ export class GitView {
   private selectedFile: FileSel | null = null;
   private limit = LOG_STEP;
   private firstOpen = true;
+  // Bumped on every renderCommitFiles call; a call whose token goes stale before
+  // its await resolves bails without appending (pre-existing double-append: a
+  // commit click and a refresh's renderBottom for the SAME hash could both pass
+  // the (kind, hash) staleness guard and both append a files column).
+  private commitFilesToken = 0;
 
   private refreshing = false;
   private refreshQueued = false;
@@ -1371,6 +1376,7 @@ export class GitView {
     this.changesEl.replaceChildren();
     if (!this.repoRoot) return;
     const commit = this.commits.find((c) => c.hash === hash);
+    const token = ++this.commitFilesToken;
 
     let files: FileEntry[] = [];
     try {
@@ -1378,7 +1384,12 @@ export class GitView {
     } catch (err) {
       this.toast(String(err));
     }
-    if (this.disposed || this.selection.kind !== "commit" || this.selection.hash !== hash) {
+    if (
+      this.disposed ||
+      this.selection.kind !== "commit" ||
+      this.selection.hash !== hash ||
+      token !== this.commitFilesToken
+    ) {
       return;
     }
 
