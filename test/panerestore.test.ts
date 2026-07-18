@@ -28,7 +28,7 @@ const pane = (over: Partial<PersistedPane>): PersistedPane => ({
   role: null,
   sessionId: null,
   file: null,
-  taskEmbed: null,
+  embed: null,
   ...over,
 });
 
@@ -190,7 +190,7 @@ test("an orchestration pane ALWAYS restores dormant — never auto-resumed", () 
     name: "orchestrator",
     sessionId: null,
     role: "orchestrator",
-    taskEmbed: null,
+    embed: null,
   });
 });
 
@@ -203,22 +203,28 @@ test("even with a session id, a group stays dormant (the rule is keyed on kind, 
     name: "worker-1",
     sessionId: "xyz-1",
     role: "worker",
-    taskEmbed: null,
+    embed: null,
   });
 });
 
-test("a captured task-embed preference (#361) rides the dormant placeholder", () => {
+test("a captured embed preference (#361) rides the dormant placeholder", () => {
   // Carried the same way role/sessionId are, so main.ts's resumeDormantGroup can
-  // match it back to the resumed pane and reapply it (Pane.restoreTaskEmbed).
+  // match it back to the resumed pane and reapply it (Pane.restoreEmbed).
   const action = planPaneRestore(
-    pane({ paneKind: "orch", name: "orchestrator", sessionId: "s1", role: "orchestrator", taskEmbed: 0.4 })
+    pane({
+      paneKind: "orch",
+      name: "orchestrator",
+      sessionId: "s1",
+      role: "orchestrator",
+      embed: { view: "group", share: 0.4 },
+    })
   );
   assert.deepEqual(action, {
     type: "dormant-group",
     name: "orchestrator",
     sessionId: "s1",
     role: "orchestrator",
-    taskEmbed: 0.4,
+    embed: { view: "group", share: 0.4 },
   });
 });
 

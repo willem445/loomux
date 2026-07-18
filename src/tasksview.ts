@@ -115,15 +115,15 @@ export class TasksView {
     this.deleteSelectedBtn.addEventListener("click", () => this.onDeleteSelected());
     head.append(this.deleteSelectedBtn);
 
-    // Embed toggle: switch between the floating overlay and a real flex
-    // sibling of the terminal that resizes the pane (#361) — a discrete,
-    // user-initiated layout change, like a split (see
-    // doc/design/embedded-panels.md). setEmbedded() below keeps the icon/
-    // tooltip in sync with which mode the pane is actually in.
+    // Embed toggle: switch between the floating overlay and the pane's
+    // embed-panel slot (#361) — a discrete, user-initiated layout change,
+    // like a split (see doc/design/embedded-panels.md). setPanelActive()
+    // below keeps the icon/tooltip in sync with which mode the pane is
+    // actually in.
     this.embedBtn = el("button", "pane-btn embed", "⬒") as HTMLButtonElement;
     this.embedBtn.addEventListener("click", () => opts.onToggleEmbed());
     head.append(this.embedBtn);
-    this.setEmbedded(false);
+    this.setPanelActive(false);
 
     const close = el("button", "pane-btn close", "✕") as HTMLButtonElement;
     close.title = "Close (Alt+T)";
@@ -173,11 +173,16 @@ export class TasksView {
   /** Reflect which mode the pane currently has this view mounted in —
    *  called on creation and on every embed/un-embed. Pure display state; the
    *  pane owns the actual toggle (it has to move the view between an overlay
-   *  host and a real flex sibling of the terminal). */
-  setEmbedded(embedded: boolean): void {
-    this.embedBtn.classList.toggle("active", embedded);
-    this.embedBtn.textContent = embedded ? "⬓" : "⬒";
-    this.embedBtn.title = embedded
+   *  host and the pane's single embed-panel slot). Named `setPanelActive`,
+   *  not `setEmbedded`, across every embeddable view (#361 generalization) —
+   *  `GitView` already has an unrelated ctor option called `embedded`
+   *  (#217: is this view hosted as a whole content PANE?), and reusing that
+   *  word for a same-named but different-meaning method on the same class
+   *  would read as the two being connected when they aren't. */
+  setPanelActive(active: boolean): void {
+    this.embedBtn.classList.toggle("active", active);
+    this.embedBtn.textContent = active ? "⬓" : "⬒";
+    this.embedBtn.title = active
       ? "Un-embed — back to a floating overlay"
       : "Embed beside the terminal (resizes this pane)";
   }

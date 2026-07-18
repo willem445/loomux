@@ -31,7 +31,7 @@
 // Flip AUTO_RESUME_AGENTS to false to make EVERY agent restore dormant instead —
 // the plan's promised one-line switch, kept literally one line here.
 
-import type { PersistedPane, PersistedLayoutNode } from "./tabstore";
+import type { PersistedPane, PersistedLayoutNode, PersistedEmbed } from "./tabstore";
 
 /** The adopted default (#194): auto-resume agent panes into their prior session.
  *  Set to false for the conservative all-dormant behavior (every agent gets a
@@ -81,12 +81,13 @@ export type RestoreAction =
       name: string;
       sessionId: string | null;
       role: string | null;
-      /** The task board's embed preference (#361), carried the same way role and
-       *  sessionId are: main.ts's resumeDormantGroup matches this back to the
-       *  member it belongs to (by sessionId) and re-applies it to the freshly
-       *  resumed pane via Pane.restoreTaskEmbed — the ONE place a captured UI
-       *  preference is threaded through a whole-group resume today. */
-      taskEmbed: number | null;
+      /** Which orchestration-family view (if any) was embedded, and its
+       *  share (#361) — carried the same way role and sessionId are:
+       *  main.ts's resumeDormantGroup matches this back to the member it
+       *  belongs to (by sessionId) and re-applies it to the freshly resumed
+       *  pane via Pane.restoreEmbed — the ONE place a captured UI preference
+       *  is threaded through a whole-group resume today. */
+      embed: PersistedEmbed | null;
     }
   | {
       // A file-explorer pane (#214), back at its recorded root. Nothing to spawn
@@ -161,13 +162,13 @@ export function planPaneRestore(pane: PersistedPane, resumable?: SessionResumabl
       // Never auto-resume a group — dormant, human-triggered Resume only. Carry
       // the captured session id + role so the placeholder knows which group member
       // it is (a whole-group resume reads these off the tab's placeholders), and
-      // the task-embed preference (#361) for the same reason.
+      // the embed preference (#361) for the same reason.
       return {
         type: "dormant-group",
         name: pane.name,
         sessionId: pane.sessionId,
         role: pane.role,
-        taskEmbed: pane.taskEmbed,
+        embed: pane.embed,
       };
     case "files":
       // Pure content: no process, no credits, no session — it just comes back at

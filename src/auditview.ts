@@ -76,6 +76,7 @@ export class AuditView {
   private searchInput: HTMLInputElement;
   private followBtn: HTMLButtonElement;
   private countEl: HTMLElement;
+  private embedBtn: HTMLButtonElement;
 
   private entries: AuditEntry[] = [];
   private filters: Filters = { actor: "", action: "", agent: "", search: "" };
@@ -93,7 +94,7 @@ export class AuditView {
 
   constructor(
     private groupId: string,
-    opts: { onClose: () => void }
+    opts: { onClose: () => void; onToggleEmbed?: () => void }
   ) {
     this.el = el("div", "audit-view");
 
@@ -112,6 +113,13 @@ export class AuditView {
     refresh.title = "Refresh";
     refresh.addEventListener("click", () => void this.load());
     head.append(refresh);
+
+    // Embed toggle (#361): switch between the floating overlay and the
+    // pane's embed-panel slot.
+    this.embedBtn = el("button", "pane-btn embed", "⬒") as HTMLButtonElement;
+    this.embedBtn.addEventListener("click", () => opts.onToggleEmbed?.());
+    head.append(this.embedBtn);
+    this.setPanelActive(false);
 
     const close = el("button", "pane-btn close", "✕") as HTMLButtonElement;
     close.title = "Close (Alt+A)";
@@ -151,9 +159,19 @@ export class AuditView {
     return sel;
   }
 
-  /** Called by the pane whenever the overlay is (re)opened. */
+  /** Called by the pane whenever the view is (re)opened, in either mode. */
   show(): void {
     void this.load();
+  }
+
+  /** Reflect whether the pane currently has this view in its embed-panel
+   *  slot (#361) — pure display state on the header's toggle button. */
+  setPanelActive(active: boolean): void {
+    this.embedBtn.classList.toggle("active", active);
+    this.embedBtn.textContent = active ? "⬓" : "⬒";
+    this.embedBtn.title = active
+      ? "Un-embed — back to a floating overlay"
+      : "Embed beside the terminal (resizes this pane)";
   }
 
   dispose(): void {

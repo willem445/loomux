@@ -101,14 +101,30 @@ export interface PersistedPane {
    *  on from the file browser). Null for every other kind, and absent from any snapshot
    *  written before #217. */
   file: string | null;
-  /** The task board's embed preference, for kind "orch" (#361): `null` means
-   *  it opens as the floating overlay (the pre-#361 default and every other
-   *  kind's only option); a number is the PERSISTED embedded-panel fraction —
-   *  the panel's share of the split, same units as a split node's own
-   *  `weight` below. Absent from any snapshot written before #361, which
-   *  decodes it as `null` (overlay mode), same as a pane that was simply
-   *  never embedded. */
-  taskEmbed: number | null;
+  /** Which of this "orch" pane's views (if any) is embedded beside the
+   *  terminal, and its share of the split — `null` means every view opens as
+   *  its floating overlay (the pre-#361 default). Only the orchestration-
+   *  family views are ever captured here (`PersistedEmbedView`); git/issues
+   *  are embeddable on every pane kind but have no restore hook to carry
+   *  them through (see doc/design/embedded-panels.md's persistence
+   *  section). Absent from any snapshot written before #361, which decodes
+   *  it as `null` — same as a pane that was simply never embedded. */
+  embed: PersistedEmbed | null;
+}
+
+/** The orchestration-family views a pane's embed preference can name (#361)
+ *  — a subset of `pane.ts`'s own `EmbedKind` (git/issues aren't restorable
+ *  today, so they're not representable here at all). Kept local rather than
+ *  imported from pane.ts: tabstore.ts is the pure persistence layer pane.ts
+ *  depends ON, not the reverse. */
+export type PersistedEmbedView = "tasks" | "audit" | "group";
+
+export interface PersistedEmbed {
+  view: PersistedEmbedView;
+  /** The embedded panel's share of the split — a flex-grow ratio, the same
+   *  units a split node's own `weight` below already persists (not a pixel
+   *  size). */
+  share: number;
 }
 
 /** A tab's pane layout: the split tree with PersistedPane leaves. Mirrors grid's
@@ -181,6 +197,32 @@ export function encodeTabs(state: PersistedTabs): string {
   });
 }
 
+const EMBED_VIEWS: readonly PersistedEmbedView[] = ["tasks", "audit", "group"];
+
+function isEmbedView(v: unknown): v is PersistedEmbedView {
+  return typeof v === "string" && (EMBED_VIEWS as readonly string[]).includes(v);
+}
+
+/** Decode the pane's embed preference (#361), tolerating the pre-rename
+ *  `taskEmbed: number | null` shape this replaced. Unreleased before #404
+ *  merged, so no file in the wild should carry the old key — but decode
+ *  stays lenient anyway: the cost of tolerating one more shape is a few
+ *  lines, the cost of not is a silently dropped preference on the next boot
+ *  after a stray hand-edited or pre-rebase tabs.json. The new `embed` key
+ *  wins if a decoded blob somehow carried both. */
+function decodeEmbed(v: unknown, legacyTaskEmbed: unknown): PersistedEmbed | null {
+  if (v && typeof v === "object") {
+    const r = v as Record<string, unknown>;
+    if (isEmbedView(r.view) && typeof r.share === "number" && Number.isFinite(r.share)) {
+      return { view: r.view, share: r.share };
+    }
+  }
+  if (typeof legacyTaskEmbed === "number" && Number.isFinite(legacyTaskEmbed)) {
+    return { view: "tasks", share: legacyTaskEmbed };
+  }
+  return null;
+}
+
 /** Validate one persisted pane leaf, returning null on any malformation so its
  *  whole layout tree degrades (see decodeLayout). */
 function decodePane(v: unknown): PersistedPane | null {
@@ -200,7 +242,7 @@ function decodePane(v: unknown): PersistedPane | null {
     sessionId: typeof r.sessionId === "string" ? r.sessionId : null,
     role: typeof r.role === "string" ? r.role : null,
     file: typeof r.file === "string" ? r.file : null,
-    taskEmbed: typeof r.taskEmbed === "number" && Number.isFinite(r.taskEmbed) ? r.taskEmbed : null,
+    embed: decodeEmbed(r.embed, r.taskEmbed),
   };
 }
 

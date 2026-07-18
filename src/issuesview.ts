@@ -51,6 +51,8 @@ export interface IssuesViewHost {
   getCwd(): string | null;
   /** Close the issues view and return to the terminal. */
   onClose(): void;
+  /** The view's own header "embed beside the terminal" toggle (#361). */
+  onToggleEmbed?: () => void;
 }
 
 function el<K extends keyof HTMLElementTagNameMap>(
@@ -139,6 +141,7 @@ export class IssuesView {
   private toastEl: HTMLElement;
   private createBtn: HTMLButtonElement;
   private refreshBtn: HTMLButtonElement;
+  private embedBtn: HTMLButtonElement;
   /** The open create-issue form, if any (kept to one at a time). */
   private formEl: HTMLElement | null = null;
   /** The open detail pane, if any (issue or PR). */
@@ -205,6 +208,12 @@ export class IssuesView {
     this.refreshBtn.title = "Refresh";
     this.refreshBtn.addEventListener("click", () => void this.refresh());
 
+    // Embed toggle (#361): switch between the floating overlay and the
+    // pane's embed-panel slot.
+    this.embedBtn = el("button", "pane-btn embed", "⬒") as HTMLButtonElement;
+    this.embedBtn.addEventListener("click", () => this.host.onToggleEmbed?.());
+    this.setPanelActive(false);
+
     const closeBtn = el("button", "pane-btn close", "✕");
     closeBtn.title = "Back to terminal (Esc)";
     closeBtn.addEventListener("click", () => this.host.onClose());
@@ -215,6 +224,7 @@ export class IssuesView {
       this.filterInput,
       this.createBtn,
       this.refreshBtn,
+      this.embedBtn,
       closeBtn
     );
 
@@ -241,6 +251,16 @@ export class IssuesView {
     this.closeForm();
     this.closeDetail();
     this.el.hidden = true;
+  }
+
+  /** Reflect whether the pane currently has this view in its embed-panel
+   *  slot (#361) — pure display state on the header's toggle button. */
+  setPanelActive(active: boolean): void {
+    this.embedBtn.classList.toggle("active", active);
+    this.embedBtn.textContent = active ? "⬓" : "⬒";
+    this.embedBtn.title = active
+      ? "Un-embed — back to a floating overlay"
+      : "Embed beside the terminal (resizes this pane)";
   }
 
   /** Switch between the issues and PR lists. No-op if already there; otherwise
