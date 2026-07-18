@@ -44,7 +44,7 @@ test("docked panes round-trip (captured outside the layout tree, #194 P4)", () =
             sessionId: "abc",
             role: null,
             file: null,
-            taskEmbed: null,
+            embed: null,
           },
         ],
       },
@@ -162,7 +162,7 @@ const NESTED_LAYOUT: PersistedLayoutNode = {
         sessionId: null,
         role: null,
         file: null,
-        taskEmbed: null,
+        embed: null,
       },
     },
     {
@@ -183,7 +183,7 @@ const NESTED_LAYOUT: PersistedLayoutNode = {
             sessionId: "abc-123",
             role: null,
             file: null,
-            taskEmbed: null,
+            embed: null,
           },
         },
         {
@@ -199,7 +199,7 @@ const NESTED_LAYOUT: PersistedLayoutNode = {
             sessionId: "orch-sess-9",
             role: "orchestrator",
             file: null,
-            taskEmbed: null,
+            embed: null,
           },
         },
         {
@@ -217,7 +217,7 @@ const NESTED_LAYOUT: PersistedLayoutNode = {
             sessionId: null,
             role: null,
             file: null,
-            taskEmbed: null,
+            embed: null,
           },
         },
       ],
@@ -248,7 +248,7 @@ test("a files leaf round-trips its root — and needed NO new field or schema bu
     sessionId: null,
     role: null,
     file: null,
-    taskEmbed: null,
+    embed: null,
   };
   const state: PersistedTabs = {
     tabs: [
@@ -317,7 +317,7 @@ test("editor and git leaves round-trip their root — and the editor's open FILE
     sessionId: null,
     role: null,
     file,
-    taskEmbed: null,
+    embed: null,
   });
   const state: PersistedTabs = {
     tabs: [
@@ -433,7 +433,7 @@ test("malformed pane fields inside a valid leaf coerce to null, not a drop", () 
       sessionId: null,
       role: 99, // non-string → null
       file: 7, // non-string → null (#217)
-      taskEmbed: "0.4", // non-number → null (#361)
+      embed: "0.4", // not an {view,share} object → null (#361)
     },
   };
   const back = decodeTabs(
@@ -452,14 +452,14 @@ test("malformed pane fields inside a valid leaf coerce to null, not a drop", () 
       sessionId: null,
       role: null,
       file: null,
-      taskEmbed: null,
+      embed: null,
     },
   });
 });
 
-// ---------- #361 embedded task board ----------
+// ---------- #361 embedded views ----------
 
-test("a task board's embed preference (fraction) round-trips through encode/decode", () => {
+test("an embed preference ({view, share}) round-trips through encode/decode", () => {
   const orch: PersistedPane = {
     paneKind: "orch",
     name: "orchestrator",
@@ -470,7 +470,7 @@ test("a task board's embed preference (fraction) round-trips through encode/deco
     sessionId: "orch-1",
     role: "orchestrator",
     file: null,
-    taskEmbed: 0.42,
+    embed: { view: "group", share: 0.42 },
   };
   const state: PersistedTabs = {
     tabs: [
@@ -481,10 +481,10 @@ test("a task board's embed preference (fraction) round-trips through encode/deco
   const back = decodeTabs(encodeTabs(state));
   const leaf = back?.tabs[0].layout;
   assert.ok(leaf?.kind === "leaf");
-  assert.equal(leaf.pane.taskEmbed, 0.42);
+  assert.deepEqual(leaf.pane.embed, { view: "group", share: 0.42 });
 });
 
-test("an old snapshot with no taskEmbed key decodes it as null (overlay mode, unchanged)", () => {
+test("an old snapshot with no embed key decodes it as null (overlay mode, unchanged)", () => {
   // A pre-#361 file never wrote the key at all — additive, like `role` and the
   // files root before it: no schema bump, no decoder branch needed.
   const raw = JSON.stringify({
@@ -504,7 +504,86 @@ test("an old snapshot with no taskEmbed key decodes it as null (overlay mode, un
   });
   const leaf = decodeTabs(raw)?.tabs[0].layout;
   assert.ok(leaf?.kind === "leaf");
-  assert.equal(leaf.pane.taskEmbed, null);
+  assert.equal(leaf.pane.embed, null);
+});
+
+test("a legacy taskEmbed:number (pre-generalization #361 shape) migrates to {view:'tasks', share}", () => {
+  // taskEmbed never shipped in a release (renamed within the same PR, #404
+  // rev-28 → this generalization) — but decode stays lenient regardless: the
+  // cost of tolerating one more shape is a few lines, the cost of not is a
+  // silently dropped preference on the next boot after a stray hand-edited
+  // or pre-rebase tabs.json.
+  const raw = JSON.stringify({
+    tabs: [
+      {
+        name: "t",
+        color: null,
+        groupId: null,
+        layout: {
+          kind: "leaf",
+          weight: 1,
+          pane: { paneKind: "orch", name: "orchestrator", role: "orchestrator", taskEmbed: 0.3 },
+        },
+      },
+    ],
+    activeIndex: 0,
+  });
+  const leaf = decodeTabs(raw)?.tabs[0].layout;
+  assert.ok(leaf?.kind === "leaf");
+  assert.deepEqual(leaf.pane.embed, { view: "tasks", share: 0.3 });
+});
+
+test("a new-shape embed key wins over a stray legacy taskEmbed on the same pane", () => {
+  const raw = JSON.stringify({
+    tabs: [
+      {
+        name: "t",
+        color: null,
+        groupId: null,
+        layout: {
+          kind: "leaf",
+          weight: 1,
+          pane: {
+            paneKind: "orch",
+            name: "orchestrator",
+            role: "orchestrator",
+            embed: { view: "audit", share: 0.5 },
+            taskEmbed: 0.9, // stale — must be ignored when `embed` is present
+          },
+        },
+      },
+    ],
+    activeIndex: 0,
+  });
+  const leaf = decodeTabs(raw)?.tabs[0].layout;
+  assert.ok(leaf?.kind === "leaf");
+  assert.deepEqual(leaf.pane.embed, { view: "audit", share: 0.5 });
+});
+
+test("an embed key naming an unknown view decodes to null, not a garbage view", () => {
+  const raw = JSON.stringify({
+    tabs: [
+      {
+        name: "t",
+        color: null,
+        groupId: null,
+        layout: {
+          kind: "leaf",
+          weight: 1,
+          pane: {
+            paneKind: "orch",
+            name: "orchestrator",
+            role: "orchestrator",
+            embed: { view: "git", share: 0.3 }, // not a RESTORABLE kind (#361)
+          },
+        },
+      },
+    ],
+    activeIndex: 0,
+  });
+  const leaf = decodeTabs(raw)?.tabs[0].layout;
+  assert.ok(leaf?.kind === "leaf");
+  assert.equal(leaf.pane.embed, null);
 });
 
 test("restorePref and schemaVersion coerce unknown values to safe defaults", () => {

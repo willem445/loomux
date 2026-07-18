@@ -204,6 +204,7 @@ export class GroupView {
    *  clamp and keep every control on-screen. */
   private onResize?: () => void;
   private getRepo?: () => string | null;
+  private embedBtn: HTMLButtonElement;
 
   constructor(
     private groupId: string,
@@ -216,6 +217,7 @@ export class GroupView {
        *  degrades that preview to a generic description — the toggle itself
        *  doesn't need it (the backend resolves the repo from the group). */
       getRepo?: () => string | null;
+      onToggleEmbed?: () => void;
     }
   ) {
     this.onResize = opts.onResize;
@@ -229,6 +231,12 @@ export class GroupView {
     refresh.title = "Refresh";
     refresh.addEventListener("click", () => void this.load());
     head.append(refresh);
+    // Embed toggle (#361): switch between the floating overlay and the
+    // pane's embed-panel slot.
+    this.embedBtn = el("button", "pane-btn embed", "⬒") as HTMLButtonElement;
+    this.embedBtn.addEventListener("click", () => opts.onToggleEmbed?.());
+    head.append(this.embedBtn);
+    this.setPanelActive(false);
     const close = el("button", "pane-btn close", "✕") as HTMLButtonElement;
     close.title = "Close (Alt+O)";
     close.addEventListener("click", opts.onClose);
@@ -541,10 +549,20 @@ export class GroupView {
     );
   }
 
-  /** Called by the pane whenever the overlay is (re)opened. */
+  /** Called by the pane whenever the view is (re)opened, in either mode. */
   show(): void {
     void this.load();
     this.pollTimer = window.setInterval(() => void this.load(), POLL_MS);
+  }
+
+  /** Reflect whether the pane currently has this view in its embed-panel
+   *  slot (#361) — pure display state on the header's toggle button. */
+  setPanelActive(active: boolean): void {
+    this.embedBtn.classList.toggle("active", active);
+    this.embedBtn.textContent = active ? "⬓" : "⬒";
+    this.embedBtn.title = active
+      ? "Un-embed — back to a floating overlay"
+      : "Embed beside the terminal (resizes this pane)";
   }
 
   dispose(): void {

@@ -56,6 +56,8 @@ import {
   fracFromGrow,
   clampEmbedFrac,
   DEFAULT_EMBED_FRAC,
+  EMBED_MIN_TERM_PX,
+  EMBED_MIN_PANEL_PX,
 } from "./embedsplit";
 import {
   exitDiagnosticLine,
@@ -329,6 +331,54 @@ export interface PaneEvents {
   onDisconnectChannel: (pane: Pane) => void;
 }
 
+/** Every view that can occupy a pane's embed-panel slot (#361) — a real flex
+ *  sibling of the terminal instead of a floating overlay. Deliberately
+ *  excludes the file-editor overlay: it already has a strictly better
+ *  embedding path (the editor CONTENT PANE, #217, a whole pane rather than a
+ *  same-pane sub-panel) — see doc/design/embedded-panels.md. */
+type EmbedKind = "tasks" | "git" | "issues" | "audit" | "group";
+
+const EMBED_KINDS: readonly EmbedKind[] = ["tasks", "git", "issues", "audit", "group"];
+
+/** The subset of `EmbedKind`s whose embed preference is captured for a whole-
+ *  session-restart restore (`Pane.capture()` / `Pane.restoreEmbed`) — the
+ *  orchestration-family views, which stay DORMANT across a restart and so
+ *  have a natural "captured, then reapplied once the real pane exists" hook
+ *  (`main.ts`'s `resumeDormantGroup`). git/issues are embeddable on every
+ *  pane kind but have no equivalent hook today — see
+ *  doc/design/embedded-panels.md. */
+const RESTORABLE_EMBED_KINDS: readonly EmbedKind[] = ["tasks", "audit", "group"];
+
+function isRestorableEmbedKind(kind: EmbedKind): kind is "tasks" | "audit" | "group" {
+  return (RESTORABLE_EMBED_KINDS as readonly string[]).includes(kind);
+}
+
+/** One embeddable view's plumbing, registered once that view is lazily
+ *  constructed. Lets the generic engine (`openView`/`closeView`/`toggleView`/
+ *  `toggleEmbedSlot`/`reclampViewFloor`) treat all five views uniformly
+ *  without hardcoding any one view's class. */
+interface EmbedEntry {
+  /** The view's own floating-overlay host (unchanged pre-#361 mechanics). */
+  overlayEl: HTMLElement;
+  /** The view's own root element — moved between `overlayEl` and the pane's
+   *  shared `embedPanelEl` as the mode changes. */
+  viewEl: HTMLElement;
+  /** Called every time the view becomes visible, in either mode. */
+  show: () => void;
+  /** Called every time the view is about to become hidden, in either mode —
+   *  extra per-view cleanup beyond hiding its host (e.g. `GitView.hide()`
+   *  dismisses an open context menu). Optional: most views need nothing
+   *  beyond the generic hide. */
+  hide?: () => void;
+  /** Reflect whether this view is the pane's current embed-panel occupant —
+   *  updates the view's own header toggle button. */
+  setPanelActive: (active: boolean) => void;
+  /** The live floor (px) for the embed panel / overlay height clamp. Most
+   *  views share the generic default (`EMBED_MIN_PANEL_PX`); the group panel
+   *  measures its own fixed chrome (`Pane.groupFloor`). */
+  floorPx: () => number;
+}
+
 export class Pane implements VoiceTargetPane {
   readonly el: HTMLElement;
   readonly term: Terminal;
@@ -348,7 +398,6 @@ export class Pane implements VoiceTargetPane {
   private watchedPath: string | null = null;
   /** Lazily created git view; null until the first toggle. */
   private gitView: GitView | null = null;
-  private gitDivider: HTMLElement | null = null;
   /** Floating container for the git view + divider. It overlays the top of
    *  the terminal instead of shrinking it: resizing the PTY makes ConPTY and
    *  full-screen TUIs repaint from scratch, flooding scrollback with
@@ -361,23 +410,6 @@ export class Pane implements VoiceTargetPane {
   private tasksView: TasksView | null = null;
   private tasksOverlay: HTMLElement | null = null;
   private tasksBtn: HTMLButtonElement;
-  /** Embedded-panel mode for the task board (#361): a real flex sibling of
-   *  the terminal instead of a floating overlay, so both stay fully visible
-   *  at once. `null` = the view opens as the floating overlay (unchanged
-   *  default); a number is the PERSISTED preference — the panel's fraction
-   *  of the split — used both to lay it out and to remember the mode across
-   *  a close/reopen. See doc/design/embedded-panels.md for why this resizes
-   *  the PTY exactly the way a grid split does, and why that is not a
-   *  violation of the no-resize-for-chrome rule (CLAUDE.md constraint 1). */
-  private tasksEmbedFrac: number | null = null;
-  /** Lazily created wrapper that turns `termEl` into a flex sibling of the
-   *  embedded panel instead of the pane's direct flex:1 child. Created once,
-   *  on the first embed, and left in place afterward — an un-embed just
-   *  removes the panel, and `termEl` alone in a column flex box lays out
-   *  identically to being that box's direct child. */
-  private embedHostEl: HTMLElement | null = null;
-  private tasksEmbedPanelEl: HTMLElement | null = null;
-  private tasksEmbedDividerEl: HTMLElement | null = null;
   /** Audit-log viewer (any orchestration pane), same overlay mechanics. */
   private auditView: AuditView | null = null;
   private auditOverlay: HTMLElement | null = null;
@@ -392,6 +424,31 @@ export class Pane implements VoiceTargetPane {
   private fileEditView: FileEditView | null = null;
   private fileEditOverlay: HTMLElement | null = null;
   private fileEditBtn: HTMLButtonElement;
+  /** Every view registered as embeddable so far (#361), keyed by kind. Built
+   *  lazily — one entry per view, added the first time that view's own
+   *  `ensureXView()` runs — so a pane that never opens (say) the group panel
+   *  never pays for its entry. The generic open/close/toggle engine below
+   *  (`openView`/`closeView`/`toggleView`/`toggleEmbedSlot`) treats every
+   *  kind uniformly through this registry instead of hardcoding any one
+   *  view's class — see doc/design/embedded-panels.md. */
+  private embedRegistry = new Map<EmbedKind, EmbedEntry>();
+  /** Which view (if any) currently occupies the pane's SINGLE embed-panel
+   *  slot, and the PERSISTED fraction of the split it (or the next embed)
+   *  gets. `null` = nothing embedded; every view opens as its floating
+   *  overlay by default (unchanged pre-#361 behavior). Only one view may be
+   *  embedded at a time — embedding a second kind SWAPS the slot's occupant
+   *  rather than stacking (`toggleEmbedSlot`). */
+  private embedKind: EmbedKind | null = null;
+  private embedFrac: number = DEFAULT_EMBED_FRAC;
+  /** Lazily created wrapper that turns `termEl` into a flex sibling of the
+   *  (single, shared) embed panel instead of the pane's direct flex:1 child.
+   *  Created once, on the first embed of ANY kind, and left in place
+   *  afterward — un-embedding just hides the panel, and `termEl` alone in a
+   *  column flex box lays out identically to being that box's direct
+   *  child. */
+  private embedHostEl: HTMLElement | null = null;
+  private embedPanelEl: HTMLElement | null = null;
+  private embedDividerEl: HTMLElement | null = null;
   /** Fold-group toggle (orchestrator panes only, #46): minimizes every
    *  worker/reviewer pane in the group to the dock, or restores them all. */
   private groupMinBtn: HTMLButtonElement;
@@ -1627,49 +1684,38 @@ export class Pane implements VoiceTargetPane {
       return;
     }
     if (this.refuseOverlay("The git view")) return;
-    if (!this.gitView) {
-      this.gitView = new GitView({
-        getCwd: () => this.cwdRaw,
-        onClose: () => this.toggleGitView(),
-        onRepoAction: () => {
-          if (this.cwdRaw) void this.refreshDir(this.cwdRaw);
-        },
-      });
-      this.gitDivider = this.makeOverlayDivider(() => this.gitOverlay!);
-      this.gitOverlay = document.createElement("div");
-      this.gitOverlay.className = "git-overlay";
-      this.gitOverlay.hidden = true;
-      this.gitOverlay.append(this.gitView.el, this.gitDivider);
-      this.el.appendChild(this.gitOverlay);
-    }
-    try {
-      if (this.gitView.visible) {
-        this.gitView.hide();
-        this.gitOverlay!.hidden = true;
-        this.updateTermShift();
-        this.focus();
-      } else {
-        if (this.issuesView?.visible) this.toggleIssuesView();
-        if (this.tasksOverlay && !this.tasksOverlay.hidden) this.toggleTasksView();
-        if (this.auditOverlay && !this.auditOverlay.hidden) this.toggleAuditView();
-        if (this.groupOverlay && !this.groupOverlay.hidden) this.toggleGroupView();
-        if (this.fileEditView?.visible) this.toggleFileEditView();
-        // Terminal keeps a fixed visible share at the bottom; the overlay
-        // covers the rest.
-        const strip = Math.max(140, Math.round(this.el.clientHeight * 0.35));
-        this.gitOverlay!.style.height = `${this.overlayClamp(this.termEl.clientHeight - strip)}px`;
-        this.gitOverlay!.hidden = false;
-        this.gitView.show();
-        this.updateTermShift();
-      }
-    } catch (err) {
-      // Never leave the pane half-toggled: retract the overlay fully, then
-      // let the error surface (global handler shows a banner).
-      this.gitView?.hide();
-      if (this.gitOverlay) this.gitOverlay.hidden = true;
-      this.termEl.style.transform = "";
-      throw err;
-    }
+    this.ensureGitView();
+    this.toggleView("git");
+  }
+
+  /** Lazily construct the git view and register it into `embedRegistry`
+   *  (#361) — the error-recovery `openView` wraps every `show()` in (never
+   *  leave the pane half-toggled) generalizes what was originally a
+   *  git-specific `try`/`catch` here, since a `refresh()` failure was the
+   *  one case any view's `show()` could throw synchronously. */
+  private ensureGitView(): void {
+    if (this.gitView) return;
+    this.gitView = new GitView({
+      getCwd: () => this.cwdRaw,
+      onClose: () => this.toggleGitView(),
+      onRepoAction: () => {
+        if (this.cwdRaw) void this.refreshDir(this.cwdRaw);
+      },
+      onToggleEmbed: () => this.toggleEmbedSlot("git"),
+    });
+    this.gitOverlay = document.createElement("div");
+    this.gitOverlay.className = "git-overlay";
+    this.gitOverlay.hidden = true;
+    this.gitOverlay.append(this.gitView.el, this.makeOverlayDivider(() => this.gitOverlay!));
+    this.el.appendChild(this.gitOverlay);
+    this.embedRegistry.set("git", {
+      overlayEl: this.gitOverlay,
+      viewEl: this.gitView.el,
+      show: () => this.gitView!.show(),
+      hide: () => this.gitView!.hide(),
+      setPanelActive: (active) => this.gitView!.setPanelActive(active),
+      floorPx: () => EMBED_MIN_PANEL_PX,
+    });
   }
 
   /** Keep the overlay tall enough that its bottom drag bar stays grabbable and
@@ -1689,17 +1735,39 @@ export class Pane implements VoiceTargetPane {
     return Math.max(OVERLAY_MIN_H, measured);
   }
 
-  /** Re-apply the height clamp to the open group overlay (its content height may
-   *  have changed since it was sized). Only touches the height when the clamp
-   *  actually moves it — typically a bump UP when the measured floor grew (the
-   *  suspended banner appeared) — so it never fights the user's chosen size. */
-  private reclampGroupOverlay(): void {
-    if (!this.groupOverlay || this.groupOverlay.hidden) return;
-    const cur = this.groupOverlay.offsetHeight;
-    const clamped = this.overlayClamp(cur, this.groupFloor());
-    if (clamped !== cur) {
-      this.groupOverlay.style.height = `${clamped}px`;
-      this.updateTermShift();
+  /** Re-apply `kind`'s floor to whichever host it's CURRENTLY shown in (#361
+   *  generalizes what was originally `reclampGroupOverlay`, the only view
+   *  whose floor can grow after it opens — the suspended banner appearing
+   *  inside the group panel, #83 rev-58). Only touches the host when the
+   *  floor actually moves it — typically a bump UP — so it never fights the
+   *  human's chosen size. In embed mode this nudges the divider's flex-grow
+   *  via `embedDragGrow` with a zero delta, which — because a size already
+   *  BELOW the new floor makes `sizePanel - minPanelPx` negative — still
+   *  produces exactly the corrective nudge; see embedsplit.ts. */
+  private reclampViewFloor(kind: EmbedKind): void {
+    const entry = this.embedRegistry.get(kind);
+    if (!entry) return;
+    if (this.embedKind === kind) {
+      if (!this.embedPanelEl || this.embedPanelEl.hidden) return;
+      const sizeTerm = this.termEl.offsetHeight;
+      const sizePanel = this.embedPanelEl.offsetHeight;
+      const growTerm = parseFloat(this.termEl.style.flexGrow || "1");
+      const growPanel = parseFloat(this.embedPanelEl.style.flexGrow || "1");
+      const grow = embedDragGrow(sizeTerm, sizePanel, growTerm, growPanel, 0, EMBED_MIN_TERM_PX, entry.floorPx());
+      if (grow.growPanel !== growPanel) {
+        this.termEl.style.flex = `${grow.growTerm} 1 0`;
+        this.embedPanelEl.style.flex = `${grow.growPanel} 1 0`;
+        this.embedFrac = fracFromGrow(grow.growTerm, grow.growPanel);
+        this.updateTermShift();
+      }
+    } else {
+      if (entry.overlayEl.hidden) return;
+      const cur = entry.overlayEl.offsetHeight;
+      const clamped = this.overlayClamp(cur, entry.floorPx());
+      if (clamped !== cur) {
+        entry.overlayEl.style.height = `${clamped}px`;
+        this.updateTermShift();
+      }
     }
   }
 
@@ -1735,105 +1803,108 @@ export class Pane implements VoiceTargetPane {
    *  the PTY; only one overlay is open at a time. */
   toggleIssuesView(): void {
     if (this.refuseOverlay("The issues view")) return;
-    if (!this.issuesView) {
-      this.issuesView = new IssuesView({
-        getCwd: () => this.cwdRaw,
-        onClose: () => this.toggleIssuesView(),
-      });
-      this.issuesOverlay = document.createElement("div");
-      this.issuesOverlay.className = "git-overlay";
-      this.issuesOverlay.hidden = true;
-      this.issuesOverlay.append(
-        this.issuesView.el,
-        this.makeOverlayDivider(() => this.issuesOverlay!)
-      );
-      this.el.appendChild(this.issuesOverlay);
-    }
-    if (this.issuesView.visible) {
-      this.issuesView.hide();
-      this.issuesOverlay!.hidden = true;
-      this.updateTermShift();
-      this.focus();
-    } else {
-      if (this.gitView?.visible) this.toggleGitView();
-      if (this.tasksOverlay && !this.tasksOverlay.hidden) this.toggleTasksView();
-      if (this.auditOverlay && !this.auditOverlay.hidden) this.toggleAuditView();
-      if (this.groupOverlay && !this.groupOverlay.hidden) this.toggleGroupView();
-      if (this.fileEditView?.visible) this.toggleFileEditView();
-      const strip = Math.max(140, Math.round(this.el.clientHeight * 0.35));
-      this.issuesOverlay!.style.height = `${this.overlayClamp(this.termEl.clientHeight - strip)}px`;
-      this.issuesOverlay!.hidden = false;
-      this.issuesView.show();
-      this.updateTermShift();
-    }
+    this.ensureIssuesView();
+    this.toggleView("issues");
   }
 
-  /** Lazily create the task board and both hosts it can live in — the
-   *  floating overlay (unchanged from before #361) and the embedded panel
-   *  (see `ensureEmbedHost`). Only one is ever populated with the view's
-   *  element at a time (`placeTasksViewInCurrentHost`); the other sits empty
-   *  and `hidden`. */
+  /** Lazily construct the issues view and register it into `embedRegistry`
+   *  (#361). */
+  private ensureIssuesView(): void {
+    if (this.issuesView) return;
+    this.issuesView = new IssuesView({
+      getCwd: () => this.cwdRaw,
+      onClose: () => this.toggleIssuesView(),
+      onToggleEmbed: () => this.toggleEmbedSlot("issues"),
+    });
+    this.issuesOverlay = document.createElement("div");
+    this.issuesOverlay.className = "git-overlay";
+    this.issuesOverlay.hidden = true;
+    this.issuesOverlay.append(
+      this.issuesView.el,
+      this.makeOverlayDivider(() => this.issuesOverlay!)
+    );
+    this.el.appendChild(this.issuesOverlay);
+    this.embedRegistry.set("issues", {
+      overlayEl: this.issuesOverlay,
+      viewEl: this.issuesView.el,
+      show: () => this.issuesView!.show(),
+      hide: () => this.issuesView!.hide(),
+      setPanelActive: (active) => this.issuesView!.setPanelActive(active),
+      floorPx: () => EMBED_MIN_PANEL_PX,
+    });
+  }
+
+  /** Toggle the task board open/closed (`Alt+T`, and the board's own ✕) — in
+   *  EITHER mode. Which mode it opens in is a separate, persisted preference
+   *  (see `toggleEmbedSlot`); this never changes it. */
+  toggleTasksView(): void {
+    if (!this.orchGroup || this.tasksBtn.hidden) return;
+    this.ensureTasksView();
+    this.toggleView("tasks");
+  }
+
+  /** Lazily construct the task board and register it into `embedRegistry`
+   *  (#361). */
   private ensureTasksView(): void {
     if (this.tasksView) return;
     this.tasksView = new TasksView(this.orchGroup!, {
       onClose: () => this.toggleTasksView(),
-      onToggleEmbed: () => this.toggleTasksEmbedMode(),
+      onToggleEmbed: () => this.toggleEmbedSlot("tasks"),
     });
     this.tasksOverlay = document.createElement("div");
     this.tasksOverlay.className = "git-overlay";
     this.tasksOverlay.hidden = true;
-    this.tasksOverlay.append(this.makeOverlayDivider(() => this.tasksOverlay!));
+    this.tasksOverlay.append(this.tasksView.el, this.makeOverlayDivider(() => this.tasksOverlay!));
     this.el.appendChild(this.tasksOverlay);
-    this.ensureEmbedHost();
-    this.tasksView.setEmbedded(this.tasksEmbedFrac !== null);
-    this.placeTasksViewInCurrentHost();
+    this.embedRegistry.set("tasks", {
+      overlayEl: this.tasksOverlay,
+      viewEl: this.tasksView.el,
+      show: () => this.tasksView!.show(),
+      setPanelActive: (active) => this.tasksView!.setPanelActive(active),
+      floorPx: () => EMBED_MIN_PANEL_PX,
+    });
   }
 
+  // ==================== #361: the generic embed engine ====================
+  // Shared by every EmbedKind (tasks/git/issues/audit/group) through
+  // `embedRegistry` — see doc/design/embedded-panels.md for the full design,
+  // including why this is the legitimate side of the no-PTY-resize-for-chrome
+  // rule (CLAUDE.md constraint 1) and why the file-editor overlay is
+  // deliberately NOT part of this set.
+
   /** Lazily promote `termEl` from being `.pane`'s own direct flex:1 child to
-   *  living inside a flex wrapper alongside the embedded task-board panel and
-   *  its divider — both created here but `hidden` until the first embed.
-   *  Created once and left in place afterward: with the panel/divider
-   *  `[hidden]` (`display: none !important`, styles.css), `termEl` alone in a
-   *  column flex box lays out identically to being `.pane`'s direct child, so
-   *  there is nothing to undo on un-embed. */
+   *  living inside a flex wrapper alongside the pane's SINGLE embed panel and
+   *  its divider — shared by every kind, since only one may be embedded at a
+   *  time. Created once, on the first embed of ANY kind, and left in place
+   *  afterward: with the panel/divider `[hidden]` (`display: none
+   *  !important`, styles.css), `termEl` alone in a column flex box lays out
+   *  identically to being `.pane`'s direct child, so there is nothing to
+   *  undo when nothing is embedded. */
   private ensureEmbedHost(): HTMLElement {
     if (this.embedHostEl) return this.embedHostEl;
     const host = document.createElement("div");
     host.className = "pane-embed-host";
     this.el.insertBefore(host, this.termEl);
     host.appendChild(this.termEl);
-    this.tasksEmbedDividerEl = this.makeEmbedDivider();
-    this.tasksEmbedDividerEl.hidden = true;
-    this.tasksEmbedPanelEl = document.createElement("div");
-    this.tasksEmbedPanelEl.className = "pane-embed-panel";
-    this.tasksEmbedPanelEl.hidden = true;
-    host.append(this.tasksEmbedDividerEl, this.tasksEmbedPanelEl);
+    this.embedDividerEl = this.makeEmbedDivider();
+    this.embedDividerEl.hidden = true;
+    this.embedPanelEl = document.createElement("div");
+    this.embedPanelEl.className = "pane-embed-panel";
+    this.embedPanelEl.hidden = true;
+    host.append(this.embedDividerEl, this.embedPanelEl);
     this.embedHostEl = host;
     return host;
   }
 
-  /** Move the task board's DOM element into whichever host matches the
-   *  current mode (overlay vs. embedded). `appendChild` detaches an element
-   *  from wherever it currently is, so this is safe any time the mode flips,
-   *  whether or not the board is visible. */
-  private placeTasksViewInCurrentHost(): void {
-    if (!this.tasksView) return;
-    if (this.tasksEmbedFrac !== null) {
-      this.tasksEmbedPanelEl!.appendChild(this.tasksView.el);
-    } else {
-      this.tasksOverlay!.insertBefore(this.tasksView.el, this.tasksOverlay!.firstChild);
-    }
-  }
-
-  /** Draggable divider between the terminal and the embedded task-board
-   *  panel. Mirrors grid.ts's own split-divider math exactly (embedsplit.ts)
-   *  — the terminal's box genuinely resizes here (a real flex layout, not an
+  /** Draggable divider between the terminal and the pane's embed panel.
+   *  Mirrors grid.ts's own split-divider math exactly (embedsplit.ts) — the
+   *  terminal's box genuinely resizes here (a real flex layout, not an
    *  absolutely-positioned overlay), so the SAME frame-debounced
    *  ResizeObserver → applyFit() path a grid split's divider drag already
-   *  drives fires on every real size change. That is the discipline
-   *  doc/design/embedded-panels.md argues is the legitimate side of the
-   *  no-PTY-resize-for-chrome rule: identical to a grid split's own divider,
-   *  not a second one. */
+   *  drives fires on every real size change. The floor comes from whichever
+   *  kind currently occupies the slot (`entry.floorPx()` — the group panel's
+   *  is its own measured chrome; every other kind shares the generic
+   *  default). */
   private makeEmbedDivider(): HTMLElement {
     const div = document.createElement("div");
     div.className = "pane-embed-divider";
@@ -1841,14 +1912,15 @@ export class Pane implements VoiceTargetPane {
       e.preventDefault();
       const startY = e.clientY;
       const sizeTerm = this.termEl.offsetHeight;
-      const sizePanel = this.tasksEmbedPanelEl!.offsetHeight;
+      const sizePanel = this.embedPanelEl!.offsetHeight;
       const growTerm = parseFloat(this.termEl.style.flexGrow || "1");
-      const growPanel = parseFloat(this.tasksEmbedPanelEl!.style.flexGrow || "1");
+      const growPanel = parseFloat(this.embedPanelEl!.style.flexGrow || "1");
       div.classList.add("dragging");
       const move = (ev: MouseEvent) => {
-        const grow = embedDragGrow(sizeTerm, sizePanel, growTerm, growPanel, ev.clientY - startY);
+        const floorPx = this.embedKind ? this.embedRegistry.get(this.embedKind)!.floorPx() : EMBED_MIN_PANEL_PX;
+        const grow = embedDragGrow(sizeTerm, sizePanel, growTerm, growPanel, ev.clientY - startY, EMBED_MIN_TERM_PX, floorPx);
         this.termEl.style.flex = `${grow.growTerm} 1 0`;
-        this.tasksEmbedPanelEl!.style.flex = `${grow.growPanel} 1 0`;
+        this.embedPanelEl!.style.flex = `${grow.growPanel} 1 0`;
       };
       const up = () => {
         div.classList.remove("dragging");
@@ -1857,9 +1929,9 @@ export class Pane implements VoiceTargetPane {
         // Terminal (one per drag, not per mousemove) — mirrors grid.ts's own
         // split divider: persist the settled fraction so a restore
         // reproduces THIS size, not the one before the drag.
-        this.tasksEmbedFrac = fracFromGrow(
+        this.embedFrac = fracFromGrow(
           parseFloat(this.termEl.style.flexGrow || "1"),
-          parseFloat(this.tasksEmbedPanelEl!.style.flexGrow || "1")
+          parseFloat(this.embedPanelEl!.style.flexGrow || "1")
         );
         this.events.onRecordChanged(this);
       };
@@ -1869,96 +1941,166 @@ export class Pane implements VoiceTargetPane {
     return div;
   }
 
-  /** Whether the task board is currently on screen, in either mode. */
-  private tasksVisible(): boolean {
-    if (!this.tasksView) return false;
-    return this.tasksEmbedFrac !== null ? !this.tasksEmbedPanelEl!.hidden : !this.tasksOverlay!.hidden;
+  /** Whether `kind`'s view is currently on screen, in EITHER mode. */
+  private isViewVisible(kind: EmbedKind): boolean {
+    const entry = this.embedRegistry.get(kind);
+    if (!entry) return false;
+    return this.embedKind === kind ? !this.embedPanelEl!.hidden : !entry.overlayEl.hidden;
   }
 
-  /** Show the task board in whichever mode it's currently set to. The
-   *  floating overlays (git/issues/audit/group/file-edit) genuinely collide —
-   *  only one floating panel fits over the terminal — so opening the board
-   *  AS an overlay still closes them first, exactly as it always has. An
-   *  embedded board doesn't occupy that space at all, so it closes none of
-   *  them: the same asymmetry those overlays' own toggles already have
-   *  toward the board (they check `tasksOverlay.hidden` — an embedded board
-   *  never trips that guard and is left alone). Closing them anyway here
-   *  would defeat the coexistence the embed mode exists for. */
-  private openTasksView(): void {
-    if (this.tasksEmbedFrac !== null) {
-      const grow = growFromFrac(this.tasksEmbedFrac);
-      this.termEl.style.flex = `${grow.growTerm} 1 0`;
-      this.tasksEmbedPanelEl!.style.flex = `${grow.growPanel} 1 0`;
-      this.tasksEmbedDividerEl!.hidden = false;
-      this.tasksEmbedPanelEl!.hidden = false;
-    } else {
-      if (this.issuesView?.visible) this.toggleIssuesView();
-      if (this.gitView?.visible) this.toggleGitView();
-      if (this.auditOverlay && !this.auditOverlay.hidden) this.toggleAuditView();
-      if (this.groupOverlay && !this.groupOverlay.hidden) this.toggleGroupView();
-      if (this.fileEditView?.visible) this.toggleFileEditView();
-      const strip = Math.max(140, Math.round(this.el.clientHeight * 0.35));
-      this.tasksOverlay!.style.height = `${this.overlayClamp(this.termEl.clientHeight - strip)}px`;
-      this.tasksOverlay!.hidden = false;
-    }
-    this.tasksView!.show();
-    this.updateTermShift();
-  }
-
-  private closeTasksView(): void {
-    if (this.tasksEmbedFrac !== null) {
-      this.tasksEmbedDividerEl!.hidden = true;
-      this.tasksEmbedPanelEl!.hidden = true;
+  /** Close `kind`'s view, in whichever mode it's currently shown. */
+  private closeView(kind: EmbedKind): void {
+    const entry = this.embedRegistry.get(kind);
+    if (!entry) return;
+    entry.hide?.();
+    if (this.embedKind === kind) {
+      this.embedDividerEl!.hidden = true;
+      this.embedPanelEl!.hidden = true;
       this.termEl.style.flex = "";
     } else {
-      this.tasksOverlay!.hidden = true;
+      entry.overlayEl.hidden = true;
     }
     this.updateTermShift();
     this.focus();
   }
 
-  /** Toggle the task board open/closed (`Alt+T`, and the board's own ✕) — in
-   *  EITHER mode. Which mode it opens in is a separate, persisted preference
-   *  (see `toggleTasksEmbedMode`); this never changes it. */
-  toggleTasksView(): void {
-    if (!this.orchGroup || this.tasksBtn.hidden) return;
-    this.ensureTasksView();
-    if (this.tasksVisible()) this.closeTasksView();
-    else this.openTasksView();
+  /** Close every OTHER floating overlay (embeddable or not — file-edit
+   *  included) before `kind` opens AS AN OVERLAY: they genuinely collide,
+   *  only one floating panel fits over the terminal. Never called for an
+   *  embed-mode open (see `openView`) — the whole point of embedding is that
+   *  it does NOT collide with a floating panel (#361 NB-4). An embedded
+   *  view is therefore left alone by this loop (`this.embedKind !== kind`
+   *  guards it, mirroring how it's never the one with an open overlay
+   *  anyway). */
+  private closeOtherOverlays(except?: EmbedKind): void {
+    for (const kind of EMBED_KINDS) {
+      if (kind === except) continue;
+      const entry = this.embedRegistry.get(kind);
+      if (entry && this.embedKind !== kind && !entry.overlayEl.hidden) this.closeView(kind);
+    }
+    if (this.fileEditView?.visible) this.toggleFileEditView();
   }
 
-  /** Switch the task board between a floating overlay and an embedded panel
-   *  beside the terminal (#361) — the board's own header toggle. Moves the
-   *  view without closing it if it's currently open; either way the mode is
-   *  a PERSISTED preference (tabs.json, via `onRecordChanged`), so the next
-   *  open honors it. A discrete, user-initiated layout change (see
+  /** Show `kind`'s view in whichever mode it's currently set to. Wraps the
+   *  view's own `show()` in the same never-leave-the-pane-half-toggled
+   *  recovery `toggleGitView` originally had for itself — generalized here
+   *  because any view's `show()` (a refresh that can throw) has the same
+   *  failure shape, not just git's. */
+  private openView(kind: EmbedKind): void {
+    const entry = this.embedRegistry.get(kind);
+    if (!entry) return;
+    try {
+      if (this.embedKind === kind) {
+        this.embedPanelEl!.appendChild(entry.viewEl);
+        const grow = growFromFrac(this.embedFrac);
+        this.termEl.style.flex = `${grow.growTerm} 1 0`;
+        this.embedPanelEl!.style.flex = `${grow.growPanel} 1 0`;
+        this.embedDividerEl!.hidden = false;
+        this.embedPanelEl!.hidden = false;
+      } else {
+        this.closeOtherOverlays(kind);
+        entry.overlayEl.insertBefore(entry.viewEl, entry.overlayEl.firstChild);
+        const strip = Math.max(140, Math.round(this.el.clientHeight * 0.35));
+        entry.overlayEl.style.height = `${this.overlayClamp(this.termEl.clientHeight - strip, entry.floorPx())}px`;
+        entry.overlayEl.hidden = false;
+      }
+      entry.show();
+      this.updateTermShift();
+    } catch (err) {
+      entry.hide?.();
+      if (this.embedKind === kind) {
+        this.embedDividerEl!.hidden = true;
+        this.embedPanelEl!.hidden = true;
+        this.termEl.style.flex = "";
+      } else {
+        entry.overlayEl.hidden = true;
+      }
+      this.termEl.style.transform = "";
+      throw err;
+    }
+  }
+
+  /** Toggle `kind`'s view open/closed, in whichever mode it's currently set
+   *  to. The shared entry point every embeddable view's public hotkey
+   *  method (`toggleTasksView`, `toggleGitView`, …) delegates to after its
+   *  own view-specific gating and lazy `ensureXView()`. */
+  private toggleView(kind: EmbedKind): void {
+    if (this.isViewVisible(kind)) this.closeView(kind);
+    else this.openView(kind);
+  }
+
+  /** Switch `kind`'s view between the floating overlay and the pane's
+   *  SINGLE embed-panel slot (#361) — the view's own header toggle. A second
+   *  kind's embed toggle SWAPS the slot: whichever kind was embedded is
+   *  CLOSED outright, not demoted back to an overlay (a silent reopen
+   *  elsewhere would be a more surprising UX than "the slot now shows what
+   *  you asked for, and the previous occupant is closed — the same one
+   *  click that opened it reopens it"). Moves a currently-open view without
+   *  closing it if `kind` itself isn't the one being evicted; either way the
+   *  slot's occupant + fraction are a PERSISTED preference (tabs.json, via
+   *  `onRecordChanged`). A discrete, user-initiated layout change (see
    *  doc/design/embedded-panels.md) — never fired from a resize or a
    *  refresh. */
-  toggleTasksEmbedMode(): void {
-    if (!this.orchGroup || this.tasksBtn.hidden) return;
-    this.ensureTasksView();
-    const wasVisible = this.tasksVisible();
-    if (wasVisible) this.closeTasksView();
-    this.tasksEmbedFrac = this.tasksEmbedFrac !== null ? null : clampEmbedFrac(DEFAULT_EMBED_FRAC);
-    this.tasksView!.setEmbedded(this.tasksEmbedFrac !== null);
-    this.placeTasksViewInCurrentHost();
-    if (wasVisible) this.openTasksView();
+  private toggleEmbedSlot(kind: EmbedKind): void {
+    const entry = this.embedRegistry.get(kind);
+    if (!entry) return;
+    this.ensureEmbedHost();
+    if (this.embedKind === kind) {
+      // Un-embed: back to the floating overlay, staying open if it was.
+      const wasVisible = this.isViewVisible(kind);
+      if (wasVisible) this.closeView(kind);
+      this.embedKind = null;
+      entry.setPanelActive(false);
+      if (wasVisible) this.openView(kind);
+    } else {
+      // Embed `kind`, evicting whichever kind (if any) was there.
+      const previous = this.embedKind;
+      if (previous !== null) {
+        this.embedRegistry.get(previous)?.setPanelActive(false);
+        this.closeView(previous);
+      }
+      const wasOverlayOpen = !entry.overlayEl.hidden;
+      if (wasOverlayOpen) entry.overlayEl.hidden = true; // it's about to move into the panel
+      this.embedKind = kind;
+      entry.setPanelActive(true);
+      this.openView(kind); // swapping in always shows it
+    }
+    this.embedFrac = clampEmbedFrac(this.embedFrac);
     this.events.onRecordChanged(this);
   }
 
   /** Reapply a persisted embed preference (#361) — called once, right after
-   *  a resumed/restored orch pane is wired up with its group, so a task
-   *  board that was embedded and open when the layout was captured comes
-   *  back the same way. A `null` preference (never embedded, or restore
-   *  doesn't carry it this far — see main.ts's `resumeDormantGroup`) leaves
-   *  the default (closed, overlay mode) alone. */
-  restoreTaskEmbed(frac: number | null): void {
-    if (frac === null || !this.orchGroup || this.tasksBtn.hidden) return;
-    this.ensureTasksView();
-    this.tasksEmbedFrac = clampEmbedFrac(frac);
-    this.tasksView!.setEmbedded(true);
-    this.placeTasksViewInCurrentHost();
-    this.openTasksView();
+   *  a resumed/restored orch pane is wired up with its group, so whichever
+   *  view was embedded and open when the layout was captured comes back the
+   *  same way. `kind === null` (never embedded, or restore doesn't carry it
+   *  this far — see main.ts's `resumeDormantGroup`) leaves the default
+   *  (closed, overlay mode) alone. Only orchestration-family kinds
+   *  (tasks/audit/group) are ever restored this way today — see
+   *  `PersistedPane.embed`'s decode. */
+  restoreEmbed(kind: EmbedKind | null, frac: number): void {
+    if (kind === null || !this.orchGroup) return;
+    switch (kind) {
+      case "tasks":
+        if (this.tasksBtn.hidden) return;
+        this.ensureTasksView();
+        break;
+      case "audit":
+        if (this.auditBtn.hidden) return;
+        this.ensureAuditView();
+        break;
+      case "group":
+        if (this.groupBtn.hidden) return;
+        this.ensureGroupView();
+        break;
+      default:
+        return; // git/issues aren't orch-gated the same way; not captured for restore today
+    }
+    this.ensureEmbedHost();
+    const entry = this.embedRegistry.get(kind)!;
+    this.embedKind = kind;
+    this.embedFrac = clampEmbedFrac(frac);
+    entry.setPanelActive(true);
+    this.openView(kind);
   }
 
   /** Toggle the audit-log viewer overlay (any orchestration pane). Same
@@ -1966,74 +2108,75 @@ export class Pane implements VoiceTargetPane {
    *  open at a time. */
   toggleAuditView(): void {
     if (!this.orchGroup || this.auditBtn.hidden) return;
-    if (!this.auditView) {
-      this.auditView = new AuditView(this.orchGroup, { onClose: () => this.toggleAuditView() });
-      this.auditOverlay = document.createElement("div");
-      this.auditOverlay.className = "git-overlay";
-      this.auditOverlay.hidden = true;
-      this.auditOverlay.append(this.auditView.el, this.makeOverlayDivider(() => this.auditOverlay!));
-      this.el.appendChild(this.auditOverlay);
-    }
-    if (!this.auditOverlay!.hidden) {
-      this.auditOverlay!.hidden = true;
-      this.updateTermShift();
-      this.focus();
-    } else {
-      if (this.issuesView?.visible) this.toggleIssuesView();
-      if (this.gitView?.visible) this.toggleGitView();
-      if (this.tasksOverlay && !this.tasksOverlay.hidden) this.toggleTasksView();
-      if (this.groupOverlay && !this.groupOverlay.hidden) this.toggleGroupView();
-      if (this.fileEditView?.visible) this.toggleFileEditView();
-      const strip = Math.max(140, Math.round(this.el.clientHeight * 0.35));
-      this.auditOverlay!.style.height = `${this.overlayClamp(this.termEl.clientHeight - strip)}px`;
-      this.auditOverlay!.hidden = false;
-      this.auditView.show();
-      this.updateTermShift();
-    }
+    this.ensureAuditView();
+    this.toggleView("audit");
+  }
+
+  /** Lazily construct the audit view and register it into `embedRegistry`
+   *  (#361). */
+  private ensureAuditView(): void {
+    if (this.auditView) return;
+    this.auditView = new AuditView(this.orchGroup!, {
+      onClose: () => this.toggleAuditView(),
+      onToggleEmbed: () => this.toggleEmbedSlot("audit"),
+    });
+    this.auditOverlay = document.createElement("div");
+    this.auditOverlay.className = "git-overlay";
+    this.auditOverlay.hidden = true;
+    this.auditOverlay.append(this.auditView.el, this.makeOverlayDivider(() => this.auditOverlay!));
+    this.el.appendChild(this.auditOverlay);
+    this.embedRegistry.set("audit", {
+      overlayEl: this.auditOverlay,
+      viewEl: this.auditView.el,
+      show: () => this.auditView!.show(),
+      setPanelActive: (active) => this.auditView!.setPanelActive(active),
+      floorPx: () => EMBED_MIN_PANEL_PX,
+    });
   }
 
   /** Toggle the group lifecycle panel overlay (orchestrator panes). Same
    *  no-resize overlay mechanics as the other views; only one is open. */
   toggleGroupView(): void {
     if (!this.orchGroup || this.groupBtn.hidden) return;
-    if (!this.groupView) {
-      this.groupView = new GroupView(this.orchGroup, {
-        onClose: () => this.toggleGroupView(),
-        // Mirror the header's fold-group toggle inside the lifecycle panel (#46).
-        onToggleMinimize: () => this.events.onToggleGroupMinimize(this),
-        // Content grew (e.g. the suspended banner appeared) — re-clamp so the
-        // footer never slides under overflow:hidden (#83 rev-58).
-        onResize: () => this.reclampGroupOverlay(),
-        // The orchestrator pane's cwd IS the group's repo (create_orchestration
-        // opens it there) — the workflow toggle's ON-confirm preview reads it
-        // live rather than snapshotting at open time (#316).
-        getRepo: () => this.cwdRaw,
-      });
-      this.groupOverlay = document.createElement("div");
-      this.groupOverlay.className = "git-overlay";
-      this.groupOverlay.hidden = true;
-      this.groupOverlay.append(
-        this.groupView.el,
-        this.makeOverlayDivider(() => this.groupOverlay!, () => this.groupFloor())
-      );
-      this.el.appendChild(this.groupOverlay);
-    }
-    if (!this.groupOverlay!.hidden) {
-      this.groupOverlay!.hidden = true;
-      this.updateTermShift();
-      this.focus();
-    } else {
-      if (this.issuesView?.visible) this.toggleIssuesView();
-      if (this.gitView?.visible) this.toggleGitView();
-      if (this.tasksOverlay && !this.tasksOverlay.hidden) this.toggleTasksView();
-      if (this.auditOverlay && !this.auditOverlay.hidden) this.toggleAuditView();
-      if (this.fileEditView?.visible) this.toggleFileEditView();
-      const strip = Math.max(140, Math.round(this.el.clientHeight * 0.35));
-      this.groupOverlay!.style.height = `${this.overlayClamp(this.termEl.clientHeight - strip, this.groupFloor())}px`;
-      this.groupOverlay!.hidden = false;
-      this.groupView.show();
-      this.updateTermShift();
-    }
+    this.ensureGroupView();
+    this.toggleView("group");
+  }
+
+  /** Lazily construct the group lifecycle view and register it into
+   *  `embedRegistry` (#361) — its floor is its own measured chrome
+   *  (`groupFloor`), not the generic default, so the footer/suspended
+   *  banner never clip in either hosting mode. */
+  private ensureGroupView(): void {
+    if (this.groupView) return;
+    this.groupView = new GroupView(this.orchGroup!, {
+      onClose: () => this.toggleGroupView(),
+      // Mirror the header's fold-group toggle inside the lifecycle panel (#46).
+      onToggleMinimize: () => this.events.onToggleGroupMinimize(this),
+      // Content grew (e.g. the suspended banner appeared) — re-clamp
+      // whichever host is currently active so the footer never slides under
+      // overflow:hidden (#83 rev-58; generalized to embed mode by #361).
+      onResize: () => this.reclampViewFloor("group"),
+      // The orchestrator pane's cwd IS the group's repo (create_orchestration
+      // opens it there) — the workflow toggle's ON-confirm preview reads it
+      // live rather than snapshotting at open time (#316).
+      getRepo: () => this.cwdRaw,
+      onToggleEmbed: () => this.toggleEmbedSlot("group"),
+    });
+    this.groupOverlay = document.createElement("div");
+    this.groupOverlay.className = "git-overlay";
+    this.groupOverlay.hidden = true;
+    this.groupOverlay.append(
+      this.groupView.el,
+      this.makeOverlayDivider(() => this.groupOverlay!, () => this.groupFloor())
+    );
+    this.el.appendChild(this.groupOverlay);
+    this.embedRegistry.set("group", {
+      overlayEl: this.groupOverlay,
+      viewEl: this.groupView.el,
+      show: () => this.groupView!.show(),
+      setPanelActive: (active) => this.groupView!.setPanelActive(active),
+      floorPx: () => this.groupFloor(),
+    });
   }
 
   /** Toggle the file-editor overlay (#174): file tree + code editor +
@@ -2072,11 +2215,11 @@ export class Pane implements VoiceTargetPane {
       this.updateTermShift();
       this.focus();
     } else {
-      if (this.issuesView?.visible) this.toggleIssuesView();
-      if (this.gitView?.visible) this.toggleGitView();
-      if (this.tasksOverlay && !this.tasksOverlay.hidden) this.toggleTasksView();
-      if (this.auditOverlay && !this.auditOverlay.hidden) this.toggleAuditView();
-      if (this.groupOverlay && !this.groupOverlay.hidden) this.toggleGroupView();
+      // The file editor is never embeddable (see doc/design/embedded-panels.md's
+      // "What's excluded" section), but it still collides with every OTHER
+      // floating overlay the same way they collide with each other — an
+      // EMBEDDED one is correctly left alone (#361 NB-4 coexistence).
+      this.closeOtherOverlays();
       const strip = Math.max(140, Math.round(this.el.clientHeight * 0.35));
       this.fileEditOverlay!.style.height = `${this.overlayClamp(this.termEl.clientHeight - strip)}px`;
       this.fileEditOverlay!.hidden = false;
@@ -2193,12 +2336,21 @@ export class Pane implements VoiceTargetPane {
           : kind === "workflow"
             ? this.workflowPaneView?.openPathRel ?? null
             : null,
-      // The task board's embed preference (#361): null = overlay mode (the
-      // default), a number = embedded at that fraction of the split. Mirrors
-      // how a split's own `weight` is already persisted as a flex-grow share
-      // rather than a pixel size — not new geometry-persistence territory, the
-      // same one grid.layoutSnapshot() already occupies.
-      taskEmbed: kind === "orch" ? this.tasksEmbedFrac : null,
+      // Which view (if any) is embedded, and at what share of the split
+      // (#361). `null` = nothing embedded — every view opens as its floating
+      // overlay (the default). Only the orchestration-family kinds
+      // (tasks/audit/group) are captured for restore: git/issues are
+      // available on every pane kind, but nothing short-lived like a plain
+      // terminal restore has the natural "captured, then reapplied once the
+      // real pane exists" hook orch panes get from staying dormant — see
+      // doc/design/embedded-panels.md's persistence section. The share
+      // mirrors how a split's own `weight` is already persisted as a
+      // flex-grow ratio rather than a pixel size — not new geometry-
+      // persistence territory, the same one grid.layoutSnapshot() occupies.
+      embed:
+        kind === "orch" && this.embedKind && isRestorableEmbedKind(this.embedKind)
+          ? { view: this.embedKind, share: this.embedFrac }
+          : null,
     };
   }
 
