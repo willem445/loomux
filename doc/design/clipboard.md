@@ -124,10 +124,14 @@ path above, which was already sound):
 ### Fix
 
 `src/pasteflow.ts` (DOM-free, unit tested) decides the gestures: `isPasteKey`
-now matches plain `Ctrl+V` **and** `Ctrl+Shift+V` (quoted-insert is a readline
-corner few users ever reach for; every other terminal emulator in this app's
-target audience already binds plain `Ctrl+V`). `isCopyKey` is unchanged —
-`Ctrl+Shift+C` only, since plain `Ctrl+C` must stay SIGINT.
+matches `Ctrl+Shift+V` unconditionally (the original binding, kept) and plain
+`Ctrl+V` **only when the `pasteOnPlainCtrlV` setting allows it** (default on
+— see "The plain-Ctrl+V tradeoff, and the setting" below). `isCopyKey` is
+unchanged — `Ctrl+Shift+C` only, since plain `Ctrl+C` must stay SIGINT.
+`isPasteKey` also refuses to match with Alt held (`e.altKey`), guarding
+against a keyboard-layout collision: on layouts where AltGr (= Ctrl+Alt) + V
+types a character, an unguarded plain-Ctrl+V match would eat `Ctrl+Alt+V` as
+a paste instead of letting that character reach the shell.
 
 `src/clipboard.ts` gained `readClipboard()`, the paste-side mirror of
 `writeClipboard`: async Clipboard API first, a hidden-`textarea` +
@@ -144,10 +148,59 @@ renderer panemenu.ts and filemenu.ts use). Copy is shown-but-disabled without
 a selection, the same "teach, don't hide" convention filemenu.ts uses for an
 inapplicable item.
 
+### The plain-Ctrl+V tradeoff, and the setting
+
+The first version of this fix bound plain `Ctrl+V` to paste **unconditionally**
+and named only readline's quoted-insert as the cost — understating it. Review
+caught the real casualty: **vim/nvim's `Ctrl+V` enters VISUAL BLOCK mode**, one
+of vim's everyday, signature motions, and vim/nvim users are exactly the kind
+of power user a terminal multiplexer's audience skews toward. The same holds
+for any other TUI or agent CLI running in the pane that binds plain `Ctrl+V`
+itself — readline's quoted-insert is the least of what an unconditional
+interception costs.
+
+The review also caught an overstated justification: "every terminal emulator
+already binds plain `Ctrl+V`" is not true. Windows Terminal does, by default —
+but gnome-terminal, iTerm2, kitty, and alacritty all default to
+`Ctrl+Shift+V` specifically to leave plain `Ctrl+V` free for whatever is
+running in the pane.
+
+This is the exact shape of tradeoff `shortcuts.ts` already made a call on for
+`Alt+V` (#155): loomux used to intercept it, discovered it was Claude Code's
+own paste-image binding, and **stopped intercepting** rather than keep
+stealing a key an agent pane needed. Plain `Ctrl+V` is the same failure mode —
+a multiplexer-level binding shadowing a key the program *inside* the pane
+wants — so it gets the same resolution in spirit: don't force the choice on
+everyone, offer it.
+
+**`src/settings.ts`** adds `pasteOnPlainCtrlV: boolean` (default `true`) as
+loomux's first durable app setting, persisted the same way the tab set already
+is — a sibling `settings.json` written through two new backend commands
+(`load_settings`/`save_settings`, `uistate.rs`) that reuse the *exact same*
+atomic-write + corrupt-quarantine primitives `load_ui_tabs`/`save_ui_tabs`
+already use, not a new storage mechanism. `main.ts` loads it once at boot;
+`pane.ts`'s keydown handler reads it synchronously via `settings.getSettings()`
+on every keystroke (a settings object can't be threaded through
+`attachCustomKeyEventHandler`'s synchronous callback any other way).
+
+There is **no Settings/Preferences UI anywhere in loomux today** — checked
+before choosing this shape, so this isn't a fallback taken to avoid building
+one. The setting is config-file-only: on first run (or after a corrupt file
+is quarantined) loomux seeds `settings.json` with the defaults, so the file
+exists to be found and hand-edited; there is no live reload, so a change takes
+effect on the next launch. `Ctrl+Shift+V` pastes unconditionally either way —
+turning the setting off only returns plain `Ctrl+V` to the pane, exactly the
+pre-#370 behavior for that one key.
+
 ### Testing
 
-- `test/pasteflow.test.ts` — key matching (`Ctrl+V` and `Ctrl+Shift+V` both
-  paste, `Ctrl+C` alone never copies) and the menu shape (Copy disabled
+- `test/pasteflow.test.ts` — key matching (`Ctrl+Shift+V` always pastes;
+  plain `Ctrl+V` pastes only when the setting says so; `Ctrl+Alt+V`/AltGr and
+  `Ctrl+C` alone are never a paste/copy) and the menu shape (Copy disabled
   without a selection, Paste always live).
-- DOM wiring (the keydown handler, the right-click menu, the toast) is hand-
-  validated — see the PR body for the manual steps.
+- `test/settings.test.ts` — `encodeSettings`/`decodeSettings` round-trip,
+  first-run/corrupt-file `null` handling, and per-key fallback so a partial or
+  future-versioned hand-edit degrades gracefully instead of losing the file.
+- DOM wiring (the keydown handler, the right-click menu, the toast) and the
+  settings load/seed-on-first-run are hand-validated — see the PR body for the
+  manual steps.

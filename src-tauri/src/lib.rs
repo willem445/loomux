@@ -194,6 +194,8 @@ pub fn run() {
             obs::take_startup_notice,
             uistate::load_ui_tabs,
             uistate::save_ui_tabs,
+            uistate::load_settings,
+            uistate::save_settings,
             voice::voice_start,
             voice::voice_stop,
             voice::voice_cancel,

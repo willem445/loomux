@@ -29,6 +29,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { parseOsc52, writeClipboard, readClipboard } from "./clipboard";
 import { isPasteKey, isCopyKey, buildTerminalMenu } from "./pasteflow";
 import { showContextMenu } from "./contextmenu";
+import { getSettings } from "./settings";
 import {
   checkAttachment,
   attachRejectMessage,
@@ -753,10 +754,12 @@ export class Pane implements VoiceTargetPane {
       return true;
     });
 
-    // Let app-level shortcuts pass through xterm untouched; handle
-    // clipboard combos here (Windows Terminal conventions — Ctrl+Shift+C/V —
-    // plus plain Ctrl+V, #370: most users reach for that first, and a shell's
-    // "quoted insert" use of it is a readline corner few ever touch).
+    // Let app-level shortcuts pass through xterm untouched; handle clipboard
+    // combos here (Windows Terminal conventions — Ctrl+Shift+C/V always work;
+    // plain Ctrl+V additionally pastes when the `pasteOnPlainCtrlV` setting
+    // (default on) allows it — #370's review found the unconditional version
+    // silently broke vim's VISUAL BLOCK mode and readline's quoted-insert, so
+    // it's an opt-out, not a forced default; see settings.ts).
     this.term.attachCustomKeyEventHandler((e) => {
       if (e.type !== "keydown") return true;
       if (isAppShortcut(e)) return false;
@@ -765,7 +768,7 @@ export class Pane implements VoiceTargetPane {
         if (sel) void this.copyToClipboard(sel);
         return false;
       }
-      if (isPasteKey(e)) {
+      if (isPasteKey(e, getSettings().pasteOnPlainCtrlV)) {
         void this.pasteFromClipboard();
         return false;
       }
@@ -2348,7 +2351,11 @@ export class Pane implements VoiceTargetPane {
   private async pasteFromClipboard(): Promise<void> {
     const res = await readClipboard();
     if (!res.ok) {
-      showToast("Paste failed — clipboard access is blocked. Click the pane and try again.");
+      // Wording deliberately doesn't assert "blocked" — readClipboard can also
+      // fail on a transient condition (a momentary focus loss) that a retry
+      // clears on its own, and claiming a permission block for that would be
+      // its own small lie (#370 review).
+      showToast("Paste failed — click the pane and try again.");
       return;
     }
     if (res.text) this.term.paste(res.text);

@@ -116,6 +116,14 @@ export const loadUiTabs = (): Promise<string | null> => invoke<string | null>("l
 export const saveUiTabs = (contents: string): Promise<void> =>
   invoke("save_ui_tabs", { contents });
 
+/** Load the persisted app-settings JSON (#370), or null on first run / after a
+ *  corrupt file was quarantined backend-side (the caller then seeds defaults). */
+export const loadSettings = (): Promise<string | null> => invoke<string | null>("load_settings");
+
+/** Persist app settings atomically. Best-effort — callers never block on it. */
+export const saveSettings = (contents: string): Promise<void> =>
+  invoke("save_settings", { contents });
+
 // ---------- window lifecycle (#219) ----------
 
 /** This build's version, as declared in `tauri.conf.json` / `package.json`.
