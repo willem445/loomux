@@ -132,17 +132,6 @@ pub fn workflow_mode_notice(on: bool, name: &str, gate: Option<&workflow::Gate>)
     )
 }
 
-/// The optional post-compact notice (#287): delivered right after loomux pastes
-/// `/compact` for an eligible pane, so a persona that predates (or diverges
-/// from) the built-in re-sync ritual still knows to re-ground itself. The
-/// orchestrator template already teaches `list_tasks` + `get_state` +
-/// `list_agents` after any compaction, so this is belt-and-suspenders, not
-/// load-bearing — kept in one place so the wording can't drift from what the
-/// template documents.
-pub fn compact_nudge_notice() -> &'static str {
-    "[loomux] context compacted — re-sync before acting (list_tasks, get_state, list_agents)"
-}
-
 /// One-line notice delivered to the orchestrator when the auto-merge gate is
 /// toggled mid-session (#83), so it learns the new merge policy without waiting to
 /// re-read its kickoff config.
