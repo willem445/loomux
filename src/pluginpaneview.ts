@@ -37,25 +37,47 @@
 // surface compositing above `main`'s web content within its own bounds, and
 // does not respect CSS z-index) — CLOSED on Windows by #391 (folded into this
 // slice, `src-tauri/src/pluginregion.rs`): every time this view repositions,
-// it also re-clips the plugin's own HWND (`setPluginOcclusion`, below) to
-// punch a hole for whatever DOM overlay rects currently cover this pane
+// it also re-clips the plugin's own HWND (`setPluginFrame`, below) to punch a
+// hole for whatever DOM overlay rects currently cover this pane
 // (`overlaystate.ts`'s live registry + `pluginocclusion.ts`'s pure
 // intersect/translate math), so `main`'s overlay renders over the plugin and
 // stays interactive there, while the plugin still shows through everywhere
 // else — not a global hide (the reverted PR #392's band-aid), a real
 // per-region clip. See `pluginregion.rs`'s module doc comment for why
-// WebView2 composition hosting was rejected as the mechanism and for the
+// WebView2 composition hosting was rejected as the mechanism, for the
 // residual macOS/Linux gap this fix does NOT close (documented there, not
-// silently dropped).
+// silently dropped), and for the #380 amendment folding bounds into the same
+// atomic call as the clip (`setPluginFrame` replaced the old separate
+// `Webview.setPosition`/`setSize` + `setPluginOcclusion` sequence, which
+// raced under the sessions sidebar's open animation).
 
 import { Webview } from "@tauri-apps/api/webview";
-import { LogicalPosition, LogicalSize } from "@tauri-apps/api/dpi";
 import { dataDir, join } from "@tauri-apps/api/path";
-import { openPluginWindow, closePluginWindow, setPluginOcclusion, type PluginCapability } from "./pluginbroker";
+import { openPluginWindow, closePluginWindow, setPluginFrame, type PluginCapability } from "./pluginbroker";
 import { pluginErrorCode, pluginErrorMessage, type PluginManifest } from "./pluginhost";
 import { pluginWebviewRect, pluginWindowShouldShow } from "./pluginwindow";
 import { computeExcludeRects } from "./pluginocclusion";
-import { overlayState } from "./overlaystate";
+import { overlayState, type OverlayChangeReason } from "./overlaystate";
+
+/** Terse trigger label for `reposition()`, threaded all the way to
+ *  `plugin_set_frame`'s breadcrumb (#380) — diagnostic only, never trusted
+ *  for anything. `"resize"` covers BOTH a `ResizeObserver` tick on this
+ *  pane's own element (a divider drag, a split, a maximize elsewhere) AND a
+ *  tab switch (which surfaces as the same kind of size change — a hidden
+ *  tab's pane going from `display:none`/zero-size to its real box — not a
+ *  separate code path of its own; there's no dedicated tab-switch hook to
+ *  distinguish it from any other resize). */
+type RepositionSource = "resize" | "move-notify" | "overlay-open" | "overlay-close" | "init";
+
+/** `overlayState.subscribe`'s edge -> the breadcrumb label for it. `"poke"`
+ *  (a covering overlay resizing/moving WHILE already open, without a fresh
+ *  open/close edge of its own) has no live caller yet (`overlaystate.ts`'s
+ *  own doc comment: reserved for an animated/expanding overlay) — mapped to
+ *  `"overlay-open"` rather than added as its own `RepositionSource` value,
+ *  since nothing currently distinguishes it from a fresh open in practice. */
+function overlayReasonToSource(reason: OverlayChangeReason): RepositionSource {
+  return reason === "close" ? "overlay-close" : "overlay-open";
+}
 
 /** What a plugin pane needs to open its window — the CURRENT manifest's fields
  *  `plugin_open_window` (Slice C) takes, resolved by the caller (the welcome form
@@ -167,11 +189,13 @@ export class PluginPaneView {
    *  (still opening) or any more (failed, or disposed mid-open). */
   private ready = false;
   /** Monotonic token so a `reposition()` call that's still awaiting the
-   *  backend (each `setPosition`/`setSize` is its own IPC round trip) can't
-   *  clobber a NEWER call's result if a rapid burst of resize events fires
-   *  before the first one finishes — a divider dragged fast enough would
-   *  otherwise flicker the webview back to a stale position after it had
-   *  already caught up. */
+   *  backend (`plugin_set_frame` is one IPC round trip, #380) can't clobber a
+   *  NEWER call's result if a rapid burst of resize events fires before the
+   *  first one finishes — a divider dragged fast enough would otherwise
+   *  flicker the webview back to a stale position after it had already
+   *  caught up. This only guards which call's `show()`/`hide()` follow-up
+   *  runs; it does NOT need to guard the frame IPC call itself; see
+   *  `reposition()`'s own doc comment for why that's no longer racy. */
   private repositionSeq = 0;
   /** Unsubscribe from the shared overlay registry (overlaystate.ts, #391) —
    *  set in `show()`, released in `dispose()`. Null before `show()` runs and
@@ -180,7 +204,7 @@ export class PluginPaneView {
   private overlayUnsub: (() => void) | null = null;
   /** Bound so `removeEventListener` in `dispose()` matches the exact function
    *  reference `addEventListener` in `show()` registered. */
-  private readonly onWindowResize = () => void this.reposition();
+  private readonly onWindowResize = () => void this.reposition("resize");
 
   constructor(host: PluginPaneHost) {
     this.manifest = host.manifest;
@@ -194,7 +218,7 @@ export class PluginPaneView {
     this.statusEl.className = "pane-plugin-status";
     this.statusEl.textContent = `Opening ${this.manifest.displayName}…`;
     this.el.appendChild(this.statusEl);
-    this.resizeObs = new ResizeObserver(() => this.reposition());
+    this.resizeObs = new ResizeObserver(() => this.reposition("resize"));
   }
 
   /** Open the plugin's child webview and start tracking this pane's box. Safe to
@@ -220,7 +244,7 @@ export class PluginPaneView {
     // edge of the shared registry, immediately, and again on every window
     // resize (see this method's own doc comment) to catch a docked overlay
     // moving without `el` itself resizing.
-    this.overlayUnsub = overlayState.subscribe(() => void this.reposition());
+    this.overlayUnsub = overlayState.subscribe((reason) => void this.reposition(overlayReasonToSource(reason)));
     window.addEventListener("resize", this.onWindowResize);
     void this.open();
   }
@@ -262,7 +286,7 @@ export class PluginPaneView {
       }
       this.ready = true;
       this.statusEl.hidden = true;
-      await this.reposition();
+      await this.reposition("init");
     } catch (err) {
       if (this.disposed) return;
       this.showError(err);
@@ -287,13 +311,31 @@ export class PluginPaneView {
    *  divider drag, a split, a tab switch, a maximize elsewhere — via the
    *  ResizeObserver registered in `show()`, plus every open/close edge of the
    *  shared overlay registry and every window resize (also wired in `show()`).
-   *  A no-op until `open()` has a webview to move (`ready`). No screen-
-   *  coordinate/scale-factor math: `el`'s `getBoundingClientRect()` is already
-   *  in the exact coordinate space `Webview.setPosition`/`setSize` expect
-   *  (relative to the main window's own client area — see pluginwindow.ts's
-   *  module doc comment), so this is strictly simpler than the overlay-window
-   *  design it replaces. */
-  private async reposition(): Promise<void> {
+   *  A no-op until `open()` has a webview to move (`ready`).
+   *
+   *  Bounds and occlusion are ONE atomic backend call (`setPluginFrame` ->
+   *  `plugin_set_frame`, #380) built from a SINGLE fresh `rect` read — not
+   *  the old three-call sequence (`Webview.setPosition`, `setSize`, then a
+   *  separate `plugin_set_occlusion`), which raced: those two built-in
+   *  webview commands are `async`-dispatched by Tauri and their handler is
+   *  fire-and-forget onto the main event loop (the awaited JS promise
+   *  resolves once the native call is *queued*, not once it's applied), so
+   *  the old `plugin_set_occlusion` — a plain, inline-executing command —
+   *  could run and read the webview's client rect BEFORE a "completed"
+   *  resize had actually landed, clipping against stale geometry (see
+   *  `pluginregion.rs`'s module doc comment for the full mechanism this was
+   *  proved against). Folding both into one command removes that gap AND the
+   *  matching one between concurrent `reposition()` calls: WebView2's IPC
+   *  dispatch processes single synchronous commands strictly in arrival
+   *  order, so a burst of `ResizeObserver` ticks (the sessions sidebar's
+   *  240ms open/close transition, `styles.css`'s `#sessions` `width`
+   *  transition, is the trigger that surfaced this live) can no longer let
+   *  an older call's now-orphaned write land after a newer one's. `seq`
+   *  below still guards `show()`/`hide()` follow-up against a stale call
+   *  finishing after a newer one already ran — that part remains genuinely
+   *  async (its own IPC round trip) and unordered relative to a newer
+   *  `reposition()`'s OWN frame call. */
+  private async reposition(source: RepositionSource): Promise<void> {
     if (!this.ready || !this.pluginWebview || this.disposed) return;
     const seq = ++this.repositionSeq;
     const rect = this.el.getBoundingClientRect();
@@ -305,23 +347,23 @@ export class PluginPaneView {
       return;
     }
     try {
-      const webviewRect = pluginWebviewRect(rect);
-      await this.pluginWebview.setPosition(new LogicalPosition(webviewRect.x, webviewRect.y));
-      if (seq !== this.repositionSeq || this.disposed || !this.pluginWebview) return;
-      await this.pluginWebview.setSize(new LogicalSize(webviewRect.width, webviewRect.height));
+      if (this.windowLabel) {
+        const webviewRect = pluginWebviewRect(rect);
+        const exclude = computeExcludeRects(rect, overlayState.currentRects());
+        await setPluginFrame(
+          this.windowLabel,
+          webviewRect.x,
+          webviewRect.y,
+          webviewRect.width,
+          webviewRect.height,
+          exclude,
+          source
+        ).catch(() => {});
+      }
       if (seq !== this.repositionSeq || this.disposed || !this.pluginWebview) return;
       if (!this.shown) {
         this.shown = true;
         await this.pluginWebview.show();
-      }
-      // #391 (folded into #380): punch holes in the plugin's own HWND for
-      // whatever DOM overlay currently covers this pane's freshly-read `rect`
-      // — see pluginregion.rs's module doc comment for the native mechanism.
-      // Best-effort, same posture as the position/size calls above: a stale
-      // or racing call is dropped by the seq check, not retried.
-      if (this.windowLabel && seq === this.repositionSeq && !this.disposed) {
-        const exclude = computeExcludeRects(rect, overlayState.currentRects());
-        await setPluginOcclusion(this.windowLabel, exclude).catch(() => {});
       }
     } catch {
       // Best-effort: a reposition racing pane teardown (webview already closing)
@@ -339,7 +381,7 @@ export class PluginPaneView {
    *  painted at its pre-swap screen position, over whatever pane is there
    *  now, while this pane's own box went blank. */
   notifyMoved(): void {
-    void this.reposition();
+    void this.reposition("move-notify");
   }
 
   dispose(): void {

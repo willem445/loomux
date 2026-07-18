@@ -6,7 +6,11 @@
 // (#391, folded into #380): this is the sidebar the human hit the plugin
 // z-order bug through live — opening it over a plugin pane used to leave the
 // plugin's native webview painted on top of it until an unrelated layout
-// recalc happened to hide it.
+// recalc happened to hide it. The #380 sessions-occlusion fix additionally
+// keeps the overlay slot open through the CLOSE side's own CSS transition
+// (`closeOverlayAfterTransition`, below) — closing it the instant `.hidden`
+// lands used to leave the plugin unclipped over the still-visually-shrinking
+// sidebar for the whole ~240ms `#sessions`'s `width` transition takes.
 
 import { listSessions, type SessionInfo } from "./pty";
 import type { SessionRoleInfo } from "./orchestration";
@@ -47,6 +51,13 @@ export class SessionBrowser {
    *  shows through everywhere except the sidebar's own rect, immediately, no
    *  lag. Null while hidden. */
   private overlayClose: (() => void) | null = null;
+  /** Cleanup for a pending "wait for the close animation" `transitionend`
+   *  listener (#380) — set while `#sessions`'s `width: 344px -> 0` CSS
+   *  transition (`styles.css`) is still collapsing the sidebar after a
+   *  close, cleared once it finishes (or is cancelled by a re-open before it
+   *  does). See `closeOverlayAfterTransition`'s doc comment for why the
+   *  overlay slot can't just close the instant the `.hidden` class lands. */
+  private pendingClose: (() => void) | null = null;
 
   constructor(
     private el: HTMLElement,
@@ -87,19 +98,67 @@ export class SessionBrowser {
   toggle(): void {
     this.el.classList.toggle("hidden");
     if (this.visible) {
-      this.overlayClose ??= overlayState.open(() => (this.visible ? this.el.getBoundingClientRect() : null));
+      // Re-opening while a close is still pending (a rapid toggle-toggle
+      // before the collapse animation finished) runs that pending close's
+      // `finish()` immediately — closing the old slot and clearing its
+      // listener/timeout — and then `??=` below opens a fresh one right
+      // away: a close-then-reopen churn (two registry edges), not a literal
+      // no-op, but the end state is what matters and is correct either way
+      // — exactly one slot open, matching the panel's real visibility, with
+      // no leftover listener from the interrupted close still armed.
+      this.pendingClose?.();
+      this.pendingClose = null;
+      this.overlayClose ??= overlayState.open(() => this.el.getBoundingClientRect());
       void this.refresh();
       this.searchEl.focus();
     } else {
-      this.overlayClose?.();
-      this.overlayClose = null;
+      this.closeOverlayAfterTransition();
     }
   }
 
   hide(): void {
     this.el.classList.add("hidden");
-    this.overlayClose?.();
-    this.overlayClose = null;
+    this.closeOverlayAfterTransition();
+  }
+
+  /** Releases the overlay registry slot once `#sessions`'s CSS `width`
+   *  transition (`styles.css`, 344px -> 0 on close) has actually finished,
+   *  not the instant the `.hidden` class lands (#380). Closing immediately
+   *  used to leave a plugin pane's occlusion hole gone for the whole ~240ms
+   *  the sidebar was still visually collapsing — the same class of bug as
+   *  the OPEN-side fix in `pluginpaneview.ts`'s `reposition()`, just on the
+   *  other edge, and exactly the "close panel" case this fix's own manual
+   *  validation steps call out. Idempotent against a rapid re-close (a
+   *  second call while one is already pending is a no-op: the existing
+   *  listener is left in place). Falls back to closing on a timeout matching
+   *  the transition duration in case `transitionend` never fires at all —
+   *  `styles.css` does NOT gate `#sessions`'s `width` transition behind
+   *  `prefers-reduced-motion` (it always runs, so `transitionend` fires
+   *  normally for every real user), so the only cases the fallback actually
+   *  covers are a non-browser test environment and any future style change
+   *  that removes the transition outright. */
+  private closeOverlayAfterTransition(): void {
+    if (this.pendingClose || !this.overlayClose) return;
+    const el = this.el;
+    let done = false;
+    const finish = (): void => {
+      if (done) return;
+      done = true;
+      el.removeEventListener("transitionend", onEnd);
+      clearTimeout(fallback);
+      this.pendingClose = null;
+      this.overlayClose?.();
+      this.overlayClose = null;
+    };
+    const onEnd = (e: TransitionEvent): void => {
+      if (e.target === el && e.propertyName === "width") finish();
+    };
+    el.addEventListener("transitionend", onEnd);
+    // `styles.css`'s `#sessions` transition duration, plus slack — a backstop
+    // only; `transitionend` is expected to fire first in the real browser
+    // this app ships in.
+    const fallback = setTimeout(finish, 400);
+    this.pendingClose = finish;
   }
 
   /** Orchestration identity for a session, merging the durable roster with

@@ -17,8 +17,9 @@ permissions = [
     # — see permissions/sets/plugin-broker.toml.
     "allow-plugin-open-window",
     "allow-plugin-close-window",
-    # main-only (#391, folded into #380): clips the plugin child webview's own
-    # HWND to exclude whatever DOM overlay rects currently cover its pane.
-    # Never granted to a plugin-* webview itself.
-    "allow-plugin-set-occlusion",
+    # main-only (#391, folded into #380; renamed/extended by the #380
+    # sessions-occlusion fix): sets the plugin child webview's bounds and
+    # clips its own HWND to exclude whatever DOM overlay rects currently
+    # cover its pane, atomically. Never granted to a plugin-* webview itself.
+    "allow-plugin-set-frame",
 ]

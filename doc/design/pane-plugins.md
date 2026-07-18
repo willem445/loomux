@@ -915,6 +915,67 @@ are stated, without drifting from what was actually agreed:
   ship unverified by construction. This is a documented gap, not a silent
   one — the pre-#391 bleed is unchanged there, not regressed, and is a
   candidate follow-up issue.
+- **#380 amendment: the #391 fix shipped, then broke live under the sessions
+  sidebar's own open animation.** Third live report on this surface: opening
+  the sessions sidebar (`#sessions`'s `width: 0 -> 344px` CSS transition,
+  `styles.css`) over a visible plugin pane let the plugin paint back over the
+  sidebar, sometimes correcting itself only after an unrelated later event.
+  Root cause, proved by reading the exact Tauri/wry versions this repo is
+  pinned to (`tauri` 2.11.5, `tauri-runtime-wry` 2.11.4, `tauri-macros`
+  2.6.3 — not guessed): `pluginpaneview.ts`'s old `reposition()` called
+  `Webview.setPosition`/`setSize` (Tauri's own BUILT-IN webview commands,
+  declared `async` — dispatched onto the async runtime's threadpool), then
+  separately called this module's `plugin_set_occlusion`. The built-in
+  position/size commands' handler (`Dispatch::set_bounds`) checks
+  `current_thread().id() == main_thread_id`; called from a threadpool worker
+  (not main), it takes the fire-and-forget branch —
+  `context.proxy.send_event(...)`, a post to the winit/tao event loop's
+  user-event queue — so the awaited JS promise resolved once that message was
+  *queued*, not once the window had actually moved/resized.
+  `plugin_set_occlusion`, by contrast, is a plain (non-`async`) command, which
+  Tauri's macro runs INLINE on whatever thread dispatched the IPC call — for a
+  call from `main`'s own webview, the WebView2 UI/main thread itself, via a
+  completely separate dispatch path with no ordering guarantee against
+  winit's queue. Net effect: occlusion could be computed and applied against
+  the OLD size/position while the frontend had already translated the DOM
+  overlay's rect into the NEW pane origin, and rapid `ResizeObserver` ticks
+  during the sidebar's 240ms transition could apply out of order relative to
+  each other, too.
+
+  **The fix: fold bounds into the same synchronous command as the clip.**
+  `plugin_set_occlusion` is replaced outright by `pluginregion::plugin_set_frame`
+  (renamed in place — the ACL command count stays 128, not a net addition;
+  its only caller is updated in the same change). Still a plain, non-`async`
+  command (so it still runs inline on the calling/main thread), it now ALSO
+  sets the webview's bounds itself via `tauri::Webview::set_bounds` — called
+  from this synchronous context, `send_user_message` takes the FAST inline
+  branch instead of the fire-and-forget one, so the resize is applied before
+  this same function goes on to read the client rect and build the occlusion
+  region a few lines later. One IPC round trip, one synchronous sequence, no
+  thread hop, no other command able to interleave — atomic by construction.
+  This also closes the concurrent-`reposition()`-calls race: a single
+  synchronous command is processed by WebView2's IPC dispatch strictly in
+  arrival order, so there is no longer a window for an older call's
+  now-orphaned write to land after a newer one's. `pluginpaneview.ts`'s
+  `reposition()` reads `el`'s rect exactly ONCE per call now (previously it
+  was read once but reused across two intervening `await`s, a second, smaller
+  staleness gap this also closes) and makes ONE `setPluginFrame` call.
+
+  **Telemetry.** Every `plugin_set_frame` application logs one breadcrumb
+  (`crate::obs::breadcrumb`, `"pluginregion"`) — the trigger source the
+  frontend passed through (`resize` | `move-notify` | `overlay-open` |
+  `overlay-close` | `init`, `pluginpaneview.ts`'s `RepositionSource`), the
+  bounds and exclude-rect count applied, and whether the native calls
+  succeeded — so a live occurrence leaves diagnostic evidence in
+  `breadcrumbs.log` even if this fix turns out to be incomplete.
+
+  **A second, smaller bug found investigating the same trigger.**
+  `sessions.ts`'s `SessionBrowser` closed its overlay registry slot the
+  instant the `.hidden` class landed on CLOSE, while `#sessions`'s own CSS
+  transition was still visually collapsing the sidebar for ~240ms after —
+  the mirror image of the open-side bug, on the close edge. Fixed by
+  `closeOverlayAfterTransition` (waits for the real `transitionend`, with a
+  timeout backstop).
 - **Slice E** (metrics — **done**, `procmetrics.rs`) exposes `sys_processes`
   -shaped data **only** through the `metrics.system` broker handler — never as
   a command a plugin (or any other webview script) could `invoke` directly.

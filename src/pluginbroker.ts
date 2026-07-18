@@ -70,16 +70,34 @@ export interface OcclusionRect {
   height: number;
 }
 
-/** Clips the plugin child webview's own HWND (`pluginregion::plugin_set_occlusion`
- *  — #391, folded into #380; see that command's module doc comment for the
- *  full native z-order mechanism) to exclude whatever DOM overlay rects
- *  currently cover this pane, so `main`'s own overlay renders over the
- *  plugin and stays interactive there while the plugin still shows through
- *  everywhere else. `pluginpaneview.ts` calls this every time the set of
- *  covering overlays could have changed. Fire-and-forget from the caller's
- *  side is fine (it's a best-effort visual sync, not app state), but this
- *  returns the promise so a caller that wants to sequence it (avoiding a
- *  stale reposition clobbering a newer one) still can. */
-export function setPluginOcclusion(label: string, exclude: OcclusionRect[]): Promise<void> {
-  return invoke<void>("plugin_set_occlusion", { label, exclude });
+/** Sets the plugin child webview's bounds AND its native occlusion clip in
+ *  ONE atomic command (`pluginregion::plugin_set_frame` — #391 folded into
+ *  #380, renamed/extended by the #380 sessions-occlusion fix; see that
+ *  command's module doc comment for the full root-cause writeup and native
+ *  mechanism). Replaces what used to be three separate calls —
+ *  `Webview.setPosition`/`setSize` (Tauri's own built-in, `async`-dispatched
+ *  webview commands) followed by a separate `plugin_set_occlusion` call —
+ *  which raced: the built-in position/size commands are fire-and-forget from
+ *  a worker thread (their awaited promise resolves once the native call is
+ *  *queued*, not once it's applied), so the old `plugin_set_occlusion` could
+ *  run and read the webview's client rect BEFORE a "completed" resize had
+ *  actually landed. Folding bounds into this same synchronous command means
+ *  both happen inline, in order, on one thread, with nothing able to
+ *  interleave. `source` is a terse trigger label (`pluginpaneview.ts`'s
+ *  `RepositionSource`) logged verbatim in `breadcrumbs.log` — diagnostic
+ *  only, never trusted for anything. `pluginpaneview.ts`'s `reposition()`
+ *  calls this every time this pane's box or the set of covering overlays
+ *  could have changed. Fire-and-forget from the caller's side is fine (it's
+ *  a best-effort visual sync, not app state), but this returns the promise
+ *  so a caller that wants to sequence it still can. */
+export function setPluginFrame(
+  label: string,
+  x: number,
+  y: number,
+  width: number,
+  height: number,
+  exclude: OcclusionRect[],
+  source: string
+): Promise<void> {
+  return invoke<void>("plugin_set_frame", { label, x, y, width, height, exclude, source });
 }

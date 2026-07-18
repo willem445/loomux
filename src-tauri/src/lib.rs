@@ -219,7 +219,7 @@ pub fn run() {
             pluginbroker::plugin_close_window,
             pluginbroker::plugin_broker_request,
             pluginbroker::plugin_broker_open_channel,
-            pluginregion::plugin_set_occlusion,
+            pluginregion::plugin_set_frame,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {

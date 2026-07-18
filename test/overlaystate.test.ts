@@ -92,6 +92,19 @@ test("poke() fires subscribers without an open/close edge", () => {
   assert.equal(calls, 1);
 });
 
+// #380: subscribers need to tell WHY they were notified (PluginPaneView's
+// breadcrumb trigger-source label distinguishes an overlay opening from one
+// closing) — open()/the closer/poke() each carry their own reason through.
+test("subscribe's callback receives the reason for each edge", () => {
+  const reg = new OverlayRegistry();
+  const reasons: string[] = [];
+  reg.subscribe((reason) => reasons.push(reason));
+  const close = reg.open(() => RECT_A);
+  reg.poke();
+  close();
+  assert.deepEqual(reasons, ["open", "poke", "close"]);
+});
+
 test("unsubscribe stops further notifications", () => {
   const reg = new OverlayRegistry();
   let calls = 0;
