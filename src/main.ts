@@ -1288,6 +1288,12 @@ document.addEventListener(
       case "prev-tab":
         tabs.prevTab();
         break;
+      case "move-tab-right":
+        tabs.moveActiveTab(1);
+        break;
+      case "move-tab-left":
+        tabs.moveActiveTab(-1);
+        break;
       case "toggle-sessions":
         sessions.toggle();
         break;
