@@ -5264,6 +5264,35 @@ fn intake_gate_off_fires_unconditionally_exactly_like_before_332() {
 }
 
 #[test]
+fn intake_gate_skip_for_one_group_never_starves_another_groups_tick_in_the_same_scan() {
+    // rev-31 finding 2 (#329 coexistence seam): `idle_tick_tick` scans every
+    // autonomous orchestrator in ONE pass, and any other per-tick mechanism
+    // that shares this loop in the future (#329's compact-nudge check, which
+    // — per its own design — hangs its own independent latch/quiet-window off
+    // `AgentEntry` and reuses the pure `idle_tick_should_fire`, not this
+    // gate's fields) needs a SKIP decision for one agent to have ZERO effect
+    // on any other agent processed in the same call. This PR can't reference
+    // #329's actual code (not in this tree), so it pins its own half of that
+    // contract directly: a gated-and-skipped group and a plain (gate-off)
+    // group, ticked in the SAME `idle_tick_tick` call, must each resolve
+    // independently — the skip must never short-circuit the scan. Whoever
+    // merges #329 second should re-run this alongside its own idle-tick
+    // suite and confirm a gated skip still lets a coexisting compact-nudge
+    // check fire on schedule (see the PR description's merge-order note).
+    let (reg, _d, gid_gated, _oid_gated) = autonomous_setup_with_gate(5, 180);
+    reg.seed_idle_tick_last_fired(&gid_gated, FAR);
+    let g2 = reg.create_group("C:/tmp/repo-plain", rails()).unwrap(); // gate OFF (default)
+    let oid_plain = reg.spawn_agent(&g2.id, Role::Orchestrator, "orch2", "", false, None).unwrap().id;
+    reg.set_autonomous(&g2.id, true).unwrap();
+
+    let empty = HashMap::new();
+    let fired = reg.idle_tick_tick(FAR + 15 * 60_000 + 1, &empty, &empty);
+    assert_eq!(fired, vec![oid_plain.clone()],
+        "the gated group must skip (nothing new) while the plain group in the SAME scan still \
+         fires unconditionally — one group's skip must never starve another's tick");
+}
+
+#[test]
 fn idle_tick_status_is_honest_about_latch_and_cap() {
     // rev-59 LOW: eligible_in_secs must never render a lying 0 while a non-time gate
     // (latch / per-hour cap) holds the tick. tick_status carries the honest reason.

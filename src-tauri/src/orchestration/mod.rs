@@ -9257,6 +9257,19 @@ impl OrchRegistry {
                         to_notify.push((a.id.clone(), a.group.clone()));
                         continue;
                     }
+                    // #329 coexistence note (rev-31 finding 2): this whole `if` is scoped to
+                    // ONE agent's iteration of the loop above — a skip below only records
+                    // `a` into `skipped` and falls through to the next loop iteration, never
+                    // an early `return`/`break` out of the scan. A future mechanism sharing
+                    // this loop (#329's compact-nudge check reuses the same pure
+                    // `idle_tick_should_fire` against its OWN latch field, not
+                    // `idle_tick_notified`) is therefore never starved by this gate skipping
+                    // for some other agent — see
+                    // `intake_gate_skip_for_one_group_never_starves_another_groups_tick_in_the_same_scan`.
+                    // Whoever merges #329 second: re-run both PRs' idle-tick suites together
+                    // and confirm a gated skip here still lets a compact nudge fire on
+                    // schedule for the SAME agent (the untested cross-feature case, since
+                    // #329 isn't in this tree).
                     let has_intake_signal = intake_pending.get(&a.group).is_some_and(|s| !s.is_empty());
                     let has_pending_notification = notification_pending_groups.contains(&a.group);
                     let has_watchdog_stall = watchdog_stall_groups.contains(&a.group);
