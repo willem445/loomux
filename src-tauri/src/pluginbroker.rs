@@ -709,8 +709,9 @@ pub async fn plugin_open_window(
 /// for `lib.rs` to hook cleanup onto the way a real top-level window closing
 /// would (see this module's doc comment), so this command IS that hook:
 /// closes the underlying webview AND releases the [`PluginSession`]/broker
-/// channel/procmetrics-poll-thread state [`on_plugin_webview_closed`] and
-/// `procmetrics::on_plugin_webview_closed` own. `label` is validated against
+/// channel/procmetrics-poll-thread/pluginregion-telemetry state
+/// [`on_plugin_webview_closed`], `procmetrics::on_plugin_webview_closed`, and
+/// `pluginregion::on_plugin_webview_closed` each own. `label` is validated against
 /// the `plugin-*` shape before touching anything — main is fully trusted
 /// already, so this isn't a security boundary, just a guard against a stray
 /// bug in main's own JS closing something that isn't a plugin webview (e.g.
@@ -725,6 +726,7 @@ pub fn plugin_close_window(app: tauri::AppHandle, label: String) -> Result<(), S
     }
     on_plugin_webview_closed(&label);
     crate::procmetrics::on_plugin_webview_closed(&label);
+    crate::pluginregion::on_plugin_webview_closed(&label);
     Ok(())
 }
 

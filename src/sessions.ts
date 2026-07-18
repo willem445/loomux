@@ -98,9 +98,14 @@ export class SessionBrowser {
   toggle(): void {
     this.el.classList.toggle("hidden");
     if (this.visible) {
-      // Re-opening cancels a still-pending close (a rapid toggle-toggle
-      // before the collapse animation finished) — the slot should simply
-      // stay open, not close later out from under the now-visible panel.
+      // Re-opening while a close is still pending (a rapid toggle-toggle
+      // before the collapse animation finished) runs that pending close's
+      // `finish()` immediately — closing the old slot and clearing its
+      // listener/timeout — and then `??=` below opens a fresh one right
+      // away: a close-then-reopen churn (two registry edges), not a literal
+      // no-op, but the end state is what matters and is correct either way
+      // — exactly one slot open, matching the panel's real visibility, with
+      // no leftover listener from the interrupted close still armed.
       this.pendingClose?.();
       this.pendingClose = null;
       this.overlayClose ??= overlayState.open(() => this.el.getBoundingClientRect());
@@ -125,11 +130,13 @@ export class SessionBrowser {
    *  other edge, and exactly the "close panel" case this fix's own manual
    *  validation steps call out. Idempotent against a rapid re-close (a
    *  second call while one is already pending is a no-op: the existing
-   *  listener is left in place) and safe if the element is swapped out from
-   *  under it (falls back to closing on a timeout matching the transition
-   *  duration, in case `transitionend` never fires — e.g. a test environment
-   *  or a browser that skips the transition entirely under
-   *  prefers-reduced-motion). */
+   *  listener is left in place). Falls back to closing on a timeout matching
+   *  the transition duration in case `transitionend` never fires at all —
+   *  `styles.css` does NOT gate `#sessions`'s `width` transition behind
+   *  `prefers-reduced-motion` (it always runs, so `transitionend` fires
+   *  normally for every real user), so the only cases the fallback actually
+   *  covers are a non-browser test environment and any future style change
+   *  that removes the transition outright. */
   private closeOverlayAfterTransition(): void {
     if (this.pendingClose || !this.overlayClose) return;
     const el = this.el;

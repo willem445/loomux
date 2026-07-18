@@ -151,14 +151,33 @@
 //! arrival order — there is no longer a window for an older call's
 //! now-orphaned position write to land after a newer call's.
 //!
-//! Every application logs one breadcrumb (`crate::obs::breadcrumb`,
+//! Every application CAN log a breadcrumb (`crate::obs::breadcrumb`,
 //! `"pluginregion"`) recording the trigger source the frontend passed
-//! through (`resize` | `move-notify` | `overlay-open` | `overlay-close`),
-//! the bounds and exclude-rect count applied, and whether the native calls
-//! succeeded — so the NEXT live occurrence leaves diagnostic evidence in
-//! `breadcrumbs.log` even if the fix above turns out to be incomplete.
+//! through, the bounds and exclude-rect count applied, and whether the
+//! native calls succeeded — but NOT every application DOES: `"resize"` is
+//! `pluginpaneview.ts`'s `ResizeObserver`/window-resize source, the actual
+//! high-frequency one (a divider drag or the sidebar's own 240ms transition
+//! fires a burst of these), and the common case for it is no overlay
+//! covering the pane at all — logging every one of those would mean
+//! per-frame synchronous file I/O on the main thread, in the exact hot path
+//! this fix exists to keep smooth, for a case (`exclude` unchanged, usually
+//! empty) that tells a reader nothing new. [`should_log_frame`] (pure,
+//! unit-tested below) gates on it: a `"resize"` call only breadcrumbs when
+//! the exclude set actually differs from the last one logged FOR THIS LABEL
+//! (`LAST_LOGGED_EXCLUDE`, cleared on `plugin_close_window` via
+//! [`on_plugin_webview_closed`]) or a native call failed; every other
+//! trigger (`overlay-open`/`overlay-close`/`move-notify`/`init`, and any
+//! future value) is comparatively rare and always logs — those edges ARE
+//! the diagnostic signal a live occurrence needs, not storm noise. The
+//! native calls themselves (bounds + region) always run regardless of
+//! whether this application gets logged — only the breadcrumb is gated.
+
+use std::collections::HashMap;
+use std::sync::Mutex;
 
 use serde::Deserialize;
+
+use crate::obs::LockExt;
 
 /// A DOM overlay's intersection with a plugin pane, already translated to the
 /// pane's own top-left origin — logical pixels, matching
@@ -186,6 +205,64 @@ fn validate_label(label: &str) -> Result<(), String> {
         return Err(format!("refusing to clip non-plugin webview label: {label}"));
     }
     Ok(())
+}
+
+/// The exclude set last BREADCRUMBED (not last applied — every application
+/// is still applied natively regardless of logging, see this module's doc
+/// comment) for each `plugin-*` label — [`should_log_frame`]'s state. Same
+/// poison-tolerant `Mutex<Option<HashMap<...>>>` shape `pluginbroker.rs`'s
+/// `PLUGIN_SESSIONS`/`PLUGIN_CHANNELS` use. Cleared on close
+/// ([`on_plugin_webview_closed`]) so a label reused after a plugin
+/// closes/reopens starts fresh rather than comparing against a stale
+/// session's geometry.
+static LAST_LOGGED_EXCLUDE: Mutex<Option<HashMap<String, Vec<OcclusionRect>>>> = Mutex::new(None);
+
+fn with_last_logged_exclude<R>(f: impl FnOnce(&mut HashMap<String, Vec<OcclusionRect>>) -> R) -> R {
+    let mut guard = LAST_LOGGED_EXCLUDE.lock_safe();
+    f(guard.get_or_insert_with(HashMap::new))
+}
+
+/// Releases `label`'s entry in [`LAST_LOGGED_EXCLUDE`] — called from
+/// `pluginbroker::plugin_close_window`, the same explicit-close hook that
+/// already releases the broker's own `PluginSession`/channel state and
+/// `procmetrics`'s poll thread (a child webview never fires
+/// `WindowEvent::Destroyed` for anything to clean up on its own — see that
+/// command's doc comment).
+pub fn on_plugin_webview_closed(label: &str) {
+    with_last_logged_exclude(|m| {
+        m.remove(label);
+    });
+}
+
+/// Whether THIS application's exclude set differs from the last one
+/// breadcrumbed for its label — the ONLY thing a `"resize"` source gates on
+/// (see [`should_log_frame`]): comparing bounds too would defeat the point,
+/// since a pane's own bounds change on nearly every tick of a genuine
+/// resize/drag regardless of whether any overlay covers it. Pure so it's
+/// unit-tested without a real label/webview.
+fn exclude_changed(last_logged: Option<&[OcclusionRect]>, current: &[OcclusionRect]) -> bool {
+    last_logged != Some(current)
+}
+
+/// Whether this `plugin_set_frame` application is worth a breadcrumb line
+/// (see this module's doc comment's "Telemetry" section for the full
+/// rationale). `native_ok` is false for ANY failure (bounds not applied,
+/// HWND/region lookup failed, `SetWindowRgn` itself failed) — always logged,
+/// regardless of source, since a failure is exactly what the next live
+/// occurrence needs evidence of. Otherwise: `"resize"` (the actual storm
+/// source — a divider drag or the sidebar's own CSS transition fires a
+/// burst of these) only logs when `exclude_changed`; every other source
+/// (`"overlay-open"`/`"overlay-close"`/`"move-notify"`/`"init"`, and
+/// anything not yet named) is a comparatively rare, discrete event and
+/// always logs. Pure so it's unit-tested without a real command/webview.
+fn should_log_frame(source: &str, exclude_changed: bool, native_ok: bool) -> bool {
+    if !native_ok {
+        return true;
+    }
+    if source != "resize" {
+        return true;
+    }
+    exclude_changed
 }
 
 /// Main-only (mirrors `plugin_open_window`/`plugin_close_window` — see
@@ -357,14 +434,22 @@ fn apply_frame(
         applied
     };
 
-    crate::obs::breadcrumb(
-        "pluginregion",
-        &format!(
-            "plugin_set_frame: label={label} src={source} bounds={bounds_label} moved={moved} exclude={} region_applied={}",
-            exclude.len(),
-            region_applied != 0
-        ),
-    );
+    let native_ok = moved && region_applied != 0;
+    let changed = with_last_logged_exclude(|m| {
+        let changed = exclude_changed(m.get(label).map(Vec::as_slice), exclude);
+        m.insert(label.to_string(), exclude.to_vec());
+        changed
+    });
+    if should_log_frame(source, changed, native_ok) {
+        crate::obs::breadcrumb(
+            "pluginregion",
+            &format!(
+                "plugin_set_frame: label={label} src={source} bounds={bounds_label} moved={moved} exclude={} region_applied={}",
+                exclude.len(),
+                region_applied != 0
+            ),
+        );
+    }
 }
 
 #[cfg(not(windows))]
@@ -382,14 +467,23 @@ fn apply_frame(
     // (CALayer masking / GDK shape regions), tracked as a follow-up rather
     // than shipped unverified. This is a no-op, not a regression: nothing
     // clipped the plugin webview on these platforms before this PR either.
-    // Still breadcrumbed, so a diagnostic trail exists on every platform.
-    crate::obs::breadcrumb(
-        "pluginregion",
-        &format!(
-            "plugin_set_frame: label={label} src={source} bounds=({x:.0},{y:.0},{width:.0}x{height:.0}) moved={moved} exclude={} skipped (non-windows, no-op)",
-            exclude.len()
-        ),
-    );
+    // Still breadcrumbed (gated the same way the Windows arm is — see
+    // `should_log_frame`), so a diagnostic trail exists on every platform
+    // without spamming a resize storm there either.
+    let changed = with_last_logged_exclude(|m| {
+        let changed = exclude_changed(m.get(label).map(Vec::as_slice), exclude);
+        m.insert(label.to_string(), exclude.to_vec());
+        changed
+    });
+    if should_log_frame(source, changed, moved) {
+        crate::obs::breadcrumb(
+            "pluginregion",
+            &format!(
+                "plugin_set_frame: label={label} src={source} bounds=({x:.0},{y:.0},{width:.0}x{height:.0}) moved={moved} exclude={} skipped (non-windows, no-op)",
+                exclude.len()
+            ),
+        );
+    }
 }
 
 #[cfg(test)]
@@ -407,6 +501,55 @@ mod tests {
         assert!(err.contains("main"));
         assert!(validate_label("").is_err());
         assert!(validate_label("untrusted-probe-0").is_err());
+    }
+
+    const RECT_A: OcclusionRect = OcclusionRect { x: 0.0, y: 0.0, width: 10.0, height: 10.0 };
+    const RECT_B: OcclusionRect = OcclusionRect { x: 5.0, y: 5.0, width: 20.0, height: 20.0 };
+
+    #[test]
+    fn exclude_changed_is_false_for_the_common_no_overlay_resize_storm() {
+        // The case NB-1 exists for: a divider drag with nothing covering the
+        // pane keeps `exclude` empty on every tick — must NOT read as changed.
+        assert!(!exclude_changed(Some(&[]), &[]));
+        assert!(!exclude_changed(Some(&[RECT_A]), &[RECT_A]));
+    }
+
+    #[test]
+    fn exclude_changed_is_true_the_first_time_a_label_is_seen() {
+        assert!(exclude_changed(None, &[]));
+        assert!(exclude_changed(None, &[RECT_A]));
+    }
+
+    #[test]
+    fn exclude_changed_is_true_when_the_set_or_a_rect_differs() {
+        assert!(exclude_changed(Some(&[RECT_A]), &[]));
+        assert!(exclude_changed(Some(&[]), &[RECT_A]));
+        assert!(exclude_changed(Some(&[RECT_A]), &[RECT_B]));
+        assert!(exclude_changed(Some(&[RECT_A]), &[RECT_A, RECT_B]));
+    }
+
+    #[test]
+    fn should_log_frame_always_logs_a_native_failure_regardless_of_source_or_change() {
+        assert!(should_log_frame("resize", false, false));
+        assert!(should_log_frame("overlay-open", false, false));
+    }
+
+    #[test]
+    fn should_log_frame_gates_resize_on_exclude_change_only() {
+        // The actual storm source: unchanged exclude (the common no-overlay
+        // case) is exactly what must NOT log, or NB-1 recurs.
+        assert!(!should_log_frame("resize", false, true));
+        assert!(should_log_frame("resize", true, true));
+    }
+
+    #[test]
+    fn should_log_frame_always_logs_discrete_sources_even_with_no_change() {
+        for source in ["overlay-open", "overlay-close", "move-notify", "init"] {
+            assert!(
+                should_log_frame(source, false, true),
+                "{source} should always log even with an unchanged exclude set"
+            );
+        }
     }
 
     #[test]
