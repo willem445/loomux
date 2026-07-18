@@ -1600,6 +1600,70 @@ the practical risk D1 was aimed at: whatever the reason a real compaction didn't
 silently held paste, a dead agent, or (this incident) a detector that was simply wrong — no
 context-token drop means no reinjection, unconditionally.
 
+### rev-42 delta: the D2 gate deadlocked the primary path, and how the fix splits by epistemic state
+
+Review of D2/D3 (above) found a NEW blocking defect the loop fix itself introduced: a uniform
+`compaction_confirmed` gate across all four trigger paths deadlocks the loomux-initiated path
+(heuristic fallback / `request_compact`) — the primary, happy-path way a compaction starts.
+
+**The deadlock.** `usage::latest_context_tokens` reads the LATEST assistant turn's token count
+from the transcript. On the loomux-initiated path, loomux pastes `/compact` itself and then waits
+for busy-then-quiet; no further turn occurs before the reinjection this gate exists to authorize
+— the reinjection notice IS the next turn. So the confirmation reading is always taken *before*
+any turn could show the drop, reads as still-high, and D2's fail-closed design (correctly, by its
+own logic) resolves to a discard. Proved empirically, not assumed: a real dogfood transcript
+(`usage::tests::real_transcript_proves_the_token_drop_is_a_next_turn_phenomenon_rev42_q1`) shows
+`latest_context_tokens` reading 516,593 (stale, pre-compact value) immediately after a real
+`compact_boundary` marker, and only dropping to 45,958 once a further turn is appended. A
+time-based confirm-wait cannot fix this — no turn is ever coming on this path. Left as D2 shipped
+it, this is silent, permanent identity loss on the path most compactions actually take — worse
+than the reinjection loop it replaced, which was at least visible (repeating reinjections), not
+silent.
+
+**The fix: split confirmation by what loomux actually knows, not one gate for all four paths.**
+
+- **Loomux-initiated arms** (the heuristic fallback and `request_compact` fire, i.e. exactly the
+  code that pastes `/compact` itself) set a new `compact_pending_trusted = true`. The resolver
+  skips `compaction_confirmed`/`inferred_compaction_confirmed` entirely for these — busy-then-quiet
+  IS the signal, same as before D2 ever existed, because loomux has positive knowledge the command
+  was submitted. This was never the false-positive path the incident occurred on (the incident's
+  own audit trail showed zero `compact-nudge` entries — see above).
+- **Inference arms** (manual-`/compact`-typing detection, auto-compact-banner detection) set
+  `compact_pending_trusted = false` and keep a hard gate — these are the paths that can still be
+  fooled by a mention or an ordinary turn, same failure mode the incident actually hit. The gate is
+  now `inferred_compaction_confirmed`, widened beyond the token-drop check alone.
+- **The widened signal: `compact_boundary`.** Claude Code writes a `type: "system", subtype:
+  "compact_boundary"` transcript line the moment compaction completes, carrying
+  `compactMetadata.preTokens`/`postTokens` — unlike the token reading, this is available
+  *immediately*, on the completion turn itself, with no next turn required. `usage::
+  compact_boundary_count` counts these; `inferred_compaction_confirmed` treats EITHER a confirmed
+  token drop OR a rise in this count (baseline vs. current) as sufficient. Verified against the
+  same real dogfood transcript (the marker is present, count 1, at the exact point the token
+  reading is still stale) rather than a synthetic fixture — a real transcript excerpt was the only
+  way to know what Claude Code's own transcript format actually contains here.
+- **`AgentEntry` gains two fields** alongside the existing `compact_pending_baseline_tokens`:
+  `compact_pending_baseline_marker_count` (the `compact_boundary_count` reading at arm time) and
+  `compact_pending_trusted` (which branch the resolver takes). All three — plus the pre-existing
+  token baseline — are unconditionally cleared on resolution, preserving D3's one-shot guarantee:
+  confirmed or not, trusted or not, one resolution attempt per arming.
+- **`agent_context_tokens` + `agent_context_percents`'s double transcript-read (Q4) is closed.**
+  A new `agent_context_signals` does ONE bounded tail-read per Running Claude agent via
+  `usage::compaction_signal_in`, returning both the token reading and the boundary-marker count;
+  `agent_context_percents` now derives its percents from that shared map instead of re-reading the
+  same transcripts itself.
+- **The discard audit is enriched (Q3).** `compact-pending-discarded` now carries a `reason` plus
+  the baseline/current token values, so an audit log alone can distinguish a harmless false-
+  positive discard from what would otherwise look identical to a lost real compaction — exactly
+  the ambiguity that made the original incident require real forensic work (breadcrumbs + audit
+  cross-referencing) rather than a single log line.
+
+Regression coverage: `compact_nudge_tick_never_loops_when_the_false_signal_repeats_every_cycle`
+(D4) stays pinned at zero reinjections — the inference-path fix is unchanged by this delta.
+`compact_nudge_tick_reinjects_a_loomux_initiated_fire_even_with_no_confirmed_token_drop` is the new
+mirror: a loomux-initiated fire with a FLAT token reading (no drop, no next turn, exactly the
+deadlock scenario) still reinjects exactly once — verified red-before-green against a neutered
+trusted-bypass before this fix landed.
+
 ## Enforced merge gate (#83)
 
 Template guidance is not a security boundary. A live incident proved it: an orchestrator merged

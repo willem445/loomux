@@ -234,6 +234,46 @@ pub fn latest_context_tokens(text: &str) -> Option<u64> {
     None
 }
 
+/// Production bug fix (PR #329, rev-42 delta): count of `type: "system",
+/// subtype: "compact_boundary"` lines in a Claude transcript — the CLI's own
+/// structural marker for "a compaction just completed here", written by the
+/// CLI the INSTANT compaction finishes, carrying the exact `preTokens`/
+/// `postTokens` it measured. Unlike `latest_context_tokens`'s drop, this
+/// needs no following turn to observe: real transcript evidence (a genuine
+/// dogfood session on this repo, `1aadeb3f-e8a1-4d29-88d4-7cf4b44ddf2a.jsonl`)
+/// shows the boundary line lands 20 lines before the next real assistant
+/// `usage` line — several non-assistant bookkeeping lines (a synthetic
+/// continuation summary, attachment deltas, a `last-prompt` marker) sit in
+/// between with no `type: "assistant"` at all. `latest_context_tokens`
+/// genuinely cannot see a compact happened until that next turn exists; this
+/// function can, immediately. Monotonically non-decreasing across a growing
+/// transcript (more compactions only ever ADD boundary lines), so comparing a
+/// later count against a baseline captured earlier is a clean "did a NEW
+/// compaction happen since then" signal — see `orchestration::
+/// inferred_compaction_confirmed`, its consumer.
+pub fn compact_boundary_count(text: &str) -> u64 {
+    text.lines()
+        .filter(|line| {
+            let line = line.trim();
+            if line.is_empty() {
+                return false;
+            }
+            let Ok(v) = serde_json::from_str::<Value>(line) else { return false };
+            v.get("type").and_then(Value::as_str) == Some("system")
+                && v.get("subtype").and_then(Value::as_str) == Some("compact_boundary")
+        })
+        .count() as u64
+}
+
+/// Both compaction-confirmation signals from a single transcript read
+/// (rev-42 Q4: the two separate whole-file reads `claude_context_tokens_in`
+/// and `agent_context_percents` each did are replaced by callers sharing
+/// this one bounded read).
+pub struct CompactionSignal {
+    pub tokens: Option<u64>,
+    pub compact_boundary_count: u64,
+}
+
 // ---------------------------------------------------------------------------
 // Transcript location
 // ---------------------------------------------------------------------------
@@ -288,19 +328,62 @@ pub fn claude_session_usage_in(root: &Path, session_id: &str) -> Option<SessionU
     Some(parse_claude_transcript(&text))
 }
 
+/// Bytes read from the END of a transcript file for the tail-based signals
+/// (rev-42 Q4 cost fix): `latest_context_tokens` and `compact_boundary_count`
+/// both only ever need RECENT lines — the current context reading and any
+/// compaction boundary relevant to the pane's current arm state — never the
+/// full session history, which can reach many MB over a long-lived
+/// orchestrator. Generous relative to a handful of transcript lines (even a
+/// large tool-output turn) so the bound essentially never bites for what
+/// these two functions actually look at.
+const TRANSCRIPT_TAIL_READ_BYTES: u64 = 256 * 1024;
+
+/// Read the last `TRANSCRIPT_TAIL_READ_BYTES` of `path`, discarding a
+/// possibly-truncated leading partial line (unless the read reached the true
+/// start of the file, in which case there's nothing to truncate). `None` on
+/// any I/O failure.
+fn read_transcript_tail(path: &Path) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let start = len.saturating_sub(TRANSCRIPT_TAIL_READ_BYTES);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf).ok()?;
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    if start == 0 {
+        return Some(text);
+    }
+    match text.find('\n') {
+        Some(idx) => Some(text[idx + 1..].to_string()),
+        None => Some(String::new()), // the whole read was one truncated line
+    }
+}
+
 /// Read a Claude session's CURRENT context-window usage (#328) — see
 /// `latest_context_tokens` — from a transcript under an explicit projects
 /// `root`. `None` when the transcript can't be found/opened or carries no
-/// real assistant turn yet.
+/// real assistant turn yet. A thin convenience wrapper over
+/// `compaction_signal_in` for callers that only need the token half.
 pub fn claude_context_tokens_in(root: &Path, session_id: &str) -> Option<u64> {
+    compaction_signal_in(root, session_id)?.tokens
+}
+
+/// Read BOTH compaction-confirmation signals (`latest_context_tokens` and
+/// `compact_boundary_count`) from a single bounded tail read of a Claude
+/// session's transcript. `None` when the transcript can't be found/opened;
+/// `tokens` is separately `None` within a `Some(CompactionSignal)` when no
+/// real assistant turn has landed in the tail window (matching `latest_
+/// context_tokens`'s own `None` case) — `compact_boundary_count` still
+/// reports 0 in that case rather than failing the whole read, since a
+/// boundary marker's absence is itself a meaningful, distinct fact.
+pub fn compaction_signal_in(root: &Path, session_id: &str) -> Option<CompactionSignal> {
     let path = claude_transcript_path(root, session_id)?;
-    let file = fs::File::open(&path).ok()?;
-    let mut text = String::new();
-    for line in BufReader::new(file).lines().map_while(Result::ok) {
-        text.push_str(&line);
-        text.push('\n');
-    }
-    latest_context_tokens(&text)
+    let text = read_transcript_tail(&path)?;
+    Some(CompactionSignal {
+        tokens: latest_context_tokens(&text),
+        compact_boundary_count: compact_boundary_count(&text),
+    })
 }
 
 #[cfg(test)]
@@ -434,6 +517,84 @@ mod tests {
         ]
         .join("\n");
         assert_eq!(latest_context_tokens(&text), Some(8_000));
+    }
+
+    /// A REAL (structurally trimmed, numbers untouched) excerpt from an actual
+    /// dogfood session on this repo — `1aadeb3f-e8a1-4d29-88d4-7cf4b44ddf2a.jsonl`,
+    /// `~/.claude/projects/C--Projects-loomux/`, 2026-07-15 — captured specifically
+    /// to settle the rev-42 delta review's Q1: does `latest_context_tokens` see a
+    /// compaction's drop before the next real assistant turn, or only after?
+    /// Synthetic injection can't answer this (it assumes the very timing in
+    /// question); this is the actual CLI's own transcript shape. Only the huge,
+    /// parser-irrelevant fields (`preservedSegment`/`preCompactDiscoveredTools`
+    /// arrays, the multi-paragraph summary prose) were elided for fixture size —
+    /// every field either `latest_context_tokens` or `compact_boundary_count`
+    /// reads is verbatim, including the exact token counts.
+    const REAL_DOGFOOD_COMPACT_EXCERPT_PRE: &str =
+        r#"{"type":"assistant","message":{"model":"claude-fable-5","usage":{"input_tokens":2,"output_tokens":1305,"cache_creation_input_tokens":48,"cache_read_input_tokens":516543}}}"#;
+    const REAL_DOGFOOD_COMPACT_EXCERPT_BOUNDARY: &str =
+        r#"{"type":"system","subtype":"compact_boundary","content":"Conversation compacted","level":"info","compactMetadata":{"trigger":"manual","preTokens":518258,"postTokens":7716,"cumulativeDroppedTokens":510542},"timestamp":"2026-07-15T01:46:54.839Z"}"#;
+    // Interstitial bookkeeping lines the REAL transcript has between the
+    // boundary and the next assistant turn — a synthetic continuation summary,
+    // then (in the real file) several attachment-delta lines omitted here as
+    // pure repetition, then a last-prompt marker. None are `type: "assistant"`.
+    const REAL_DOGFOOD_COMPACT_EXCERPT_SUMMARY: &str =
+        r#"{"type":"user","isCompactSummary":true,"message":{"role":"user","content":"[summary text elided for fixture size — real content is a multi-paragraph session recap]"}}"#;
+    const REAL_DOGFOOD_COMPACT_EXCERPT_LASTPROMPT: &str =
+        r#"{"type":"last-prompt","lastPrompt":"/compact"}"#;
+    const REAL_DOGFOOD_COMPACT_EXCERPT_POST: &str =
+        r#"{"type":"assistant","message":{"model":"claude-fable-5","usage":{"input_tokens":2,"output_tokens":1568,"cache_creation_input_tokens":15688,"cache_read_input_tokens":28268}}}"#;
+
+    #[test]
+    fn real_transcript_proves_the_token_drop_is_a_next_turn_phenomenon_rev42_q1() {
+        // The window `compact_nudge_tick`'s resolver actually reads at: a
+        // compact just completed (the boundary line exists), but the CLI
+        // hasn't produced a new real assistant turn yet — only the synthetic
+        // continuation summary and a last-prompt marker sit after it, exactly
+        // as the real transcript shows.
+        let before_next_turn = [
+            REAL_DOGFOOD_COMPACT_EXCERPT_PRE,
+            REAL_DOGFOOD_COMPACT_EXCERPT_BOUNDARY,
+            REAL_DOGFOOD_COMPACT_EXCERPT_SUMMARY,
+            REAL_DOGFOOD_COMPACT_EXCERPT_LASTPROMPT,
+        ]
+        .join("\n");
+        // Real pre-compact figure: 2 + 48 + 516_543 = 516_593. Confirms rev-42's
+        // Q1 empirically: `latest_context_tokens` is STILL pinned to the
+        // pre-compact peak here — it has no way to know a compaction happened.
+        assert_eq!(
+            latest_context_tokens(&before_next_turn),
+            Some(516_593),
+            "before any new assistant turn, the reading must still show the STALE pre-compact value — this is the deadlock"
+        );
+        // But the boundary marker is ALREADY visible — no next turn required.
+        assert_eq!(compact_boundary_count(&before_next_turn), 1,
+            "compact_boundary_count sees the compaction immediately, unlike the token reading");
+
+        // Now the next real assistant turn lands (the reinjection's own
+        // response, in production) — only THEN does the token reading correct.
+        let after_next_turn = format!("{before_next_turn}\n{REAL_DOGFOOD_COMPACT_EXCERPT_POST}");
+        assert_eq!(
+            latest_context_tokens(&after_next_turn),
+            Some(2 + 15_688 + 28_268),
+            "only once a new assistant turn exists does the drop become visible — confirms it's a next-turn phenomenon, not an at-compaction one"
+        );
+        assert_eq!(compact_boundary_count(&after_next_turn), 1, "still just the one real compaction");
+    }
+
+    #[test]
+    fn compact_boundary_count_is_zero_when_absent_and_counts_every_real_boundary() {
+        assert_eq!(compact_boundary_count(""), 0);
+        assert_eq!(compact_boundary_count("not json\n{\"type\":\"user\"}"), 0);
+        assert_eq!(compact_boundary_count(r#"{"type":"system","subtype":"other_thing"}"#), 0,
+            "a different system subtype must not be mistaken for a compaction");
+        let two_compactions = [
+            REAL_DOGFOOD_COMPACT_EXCERPT_BOUNDARY,
+            REAL_DOGFOOD_COMPACT_EXCERPT_POST,
+            REAL_DOGFOOD_COMPACT_EXCERPT_BOUNDARY,
+        ]
+        .join("\n");
+        assert_eq!(compact_boundary_count(&two_compactions), 2, "monotonically counts every boundary seen");
     }
 
     #[test]

@@ -2404,6 +2404,45 @@ pub fn compaction_confirmed(baseline: Option<u64>, current: Option<u64>) -> bool
     }
 }
 
+/// Production bug fix (rev-42 delta review): whether the observed signals
+/// are convincing evidence a compaction actually ran, for the two INFERENCE
+/// trigger paths (banner detection, human-typed `/compact` detection) — the
+/// only ones that can be WRONG about a compaction having happened at all.
+/// (The loomux-initiated paths — heuristic timer, `request_compact` — skip
+/// this check entirely; see `AgentEntry.compact_pending_trusted`'s doc for
+/// why applying it there deadlocks instead of protecting anything.)
+///
+/// Confirmed by EITHER signal:
+/// - `compaction_confirmed`'s token-ratio check (`token_baseline`/
+///   `token_current`) — solid once available, but a NEXT-TURN phenomenon
+///   (proven against a real transcript — see `usage::tests::
+///   real_transcript_proves_the_token_drop_is_a_next_turn_phenomenon_
+///   rev42_q1`): the compaction call itself still reports the PRE-compact
+///   token count, and the drop only appears on the turn after.
+/// - a NEW `usage::compact_boundary_count` since `marker_baseline` — the
+///   CLI's own structural "a compaction just completed" marker, observable
+///   the INSTANT compaction finishes, with no next-turn dependency at all.
+///   Preferred where available; kept alongside the token check (not a
+///   replacement for it) as defense-in-depth against either signal being
+///   unavailable or wrong in some future CLI build.
+///
+/// Fails CLOSED exactly like `compaction_confirmed`: no evidence in EITHER
+/// direction, on EITHER signal, is never a guess.
+pub fn inferred_compaction_confirmed(
+    token_baseline: Option<u64>,
+    token_current: Option<u64>,
+    marker_baseline: Option<u64>,
+    marker_current: Option<u64>,
+) -> bool {
+    if compaction_confirmed(token_baseline, token_current) {
+        return true;
+    }
+    match (marker_baseline, marker_current) {
+        (Some(b), Some(c)) => c > b,
+        _ => false,
+    }
+}
+
 /// Compact-nudge (#328): whether context usage has crossed the group's
 /// escalation threshold and escalation hasn't already been latched for this
 /// window. `threshold_percent` 0 disables escalation entirely (purely
@@ -3457,20 +3496,55 @@ pub struct AgentEntry {
     /// re-injection fires (or `compact_pending` clears).
     pub compact_seen_busy: bool,
     /// Production bug fix (PR #329 delta review): the agent's context-token
-    /// reading (`usage::latest_context_tokens`, via `agent_context_tokens`)
-    /// captured the moment `compact_pending` most recently became `true`,
-    /// whichever of the four trigger paths set it. `None` when no reading was
-    /// available at that moment (no session yet). Live production evidence
-    /// showed busy-then-quiet ALONE is not proof a compaction ran — an
-    /// orchestrator asked to explain/discuss the compact-nudge feature itself
-    /// produced output whose growth-then-quiet cycle repeatedly satisfied the
-    /// detector with no real compaction ever happening, delivering the
-    /// reinjection notice on a loop that only grew context. This baseline
-    /// lets the resolver REQUIRE the token count to have actually dropped
-    /// before trusting that a real compaction occurred; see
-    /// `compaction_confirmed`. Always cleared the instant a pending state
-    /// resolves (confirmed or not) — never carried across trigger cycles.
+    /// reading (`usage::latest_context_tokens`, via `agent_context_signals`)
+    /// captured the moment `compact_pending` most recently became `true` via
+    /// an INFERENCE trigger path (banner or manual detection — see
+    /// `compact_pending_trusted`). `None` when no reading was available at
+    /// that moment (no session yet). Live production evidence showed
+    /// busy-then-quiet ALONE is not proof a compaction ran for these two
+    /// paths — an orchestrator asked to explain/discuss the compact-nudge
+    /// feature itself produced output whose growth-then-quiet cycle
+    /// repeatedly satisfied the banner detector with no real compaction ever
+    /// happening, delivering the reinjection notice on a loop that only grew
+    /// context. This baseline lets the resolver REQUIRE evidence a real
+    /// compaction occurred before trusting an inference-path arm; see
+    /// `inferred_compaction_confirmed`. A SECOND live-evidence round (rev-42)
+    /// showed the naive fix (requiring this for every path uniformly) traded
+    /// that loop for a silent deadlock on the loomux-INITIATED path instead —
+    /// `usage::latest_context_tokens`'s drop is a next-turn phenomenon
+    /// (proven against a real transcript, see `usage::tests::
+    /// real_transcript_proves_the_token_drop_is_a_next_turn_phenomenon_
+    /// rev42_q1`), and on that path the only "next turn" is the reinjection
+    /// itself — gating it behind its own evidence is a deadlock, not a race.
+    /// So this baseline (and the marker-count baseline below) is only ever
+    /// CONSULTED when `compact_pending_trusted` is `false`; for a trusted arm
+    /// it's still captured (uniform arming code, cheap) but ignored at
+    /// resolution. Always cleared the instant a pending state resolves
+    /// (confirmed or not) — never carried across trigger cycles.
     pub compact_pending_baseline_tokens: Option<u64>,
+    /// Production bug fix (rev-42 delta): companion baseline to `compact_
+    /// pending_baseline_tokens`, using `usage::compact_boundary_count`
+    /// instead of a token reading — the CLI's own structural "a compaction
+    /// just completed" marker, observable the INSTANT compaction finishes,
+    /// with no next-turn dependency at all (unlike the token drop). Confirmed
+    /// via `inferred_compaction_confirmed` if a NEW boundary appears since
+    /// this baseline (`current > baseline`) — a strictly better, faster
+    /// signal than the token drop for the inference paths, kept alongside it
+    /// (OR'd together) as defense-in-depth rather than a full replacement.
+    pub compact_pending_baseline_marker_count: Option<u64>,
+    /// Production bug fix (rev-42 delta): `true` when the CURRENT `compact_
+    /// pending` arm came from a LOOMUX-INITIATED trigger (the heuristic timer
+    /// or an agent's own `request_compact`) — the path where loomux itself
+    /// decided to paste `/compact`, which was never the false-positive
+    /// source the production incident lived in (that was the banner
+    /// detector's mention-vs-real-event confusion). `false` for the two
+    /// INFERENCE paths (banner, manual `/compact` detection), which CAN be
+    /// wrong about a compaction having happened at all and therefore still
+    /// require `inferred_compaction_confirmed` before resolving to a
+    /// reinjection. Read only at resolution time, alongside the two
+    /// baselines above; reset to `false` (its inert default) the instant a
+    /// pending state resolves.
+    pub compact_pending_trusted: bool,
     /// Compact-nudge (#328): Unix-ms this agent's `set_state` call was last
     /// observed (0 = never). Self-scoped, stamped by the `set_state` MCP
     /// handler on the CALLING agent's own entry — meaningful only for the
@@ -8390,6 +8464,8 @@ impl OrchRegistry {
             compact_pending: false,
             compact_seen_busy: false,
             compact_pending_baseline_tokens: None,
+            compact_pending_baseline_marker_count: None,
+            compact_pending_trusted: false,
             last_state_write_ms: 0,
             compact_escalation_notified: false,
             solo_cli: Some(cli.to_string()),
@@ -8507,6 +8583,8 @@ impl OrchRegistry {
             compact_pending: false,
             compact_seen_busy: false,
             compact_pending_baseline_tokens: None,
+            compact_pending_baseline_marker_count: None,
+            compact_pending_trusted: false,
             last_state_write_ms: 0,
             compact_escalation_notified: false,
             solo_cli: None, // unknown for an adopted pane; cli_for_agent falls back to "claude"
@@ -8827,6 +8905,7 @@ impl OrchRegistry {
         manual_signals: &HashMap<String, (String, u64)>,
         context_percents: &HashMap<String, u32>,
         context_tokens: &HashMap<String, u64>,
+        context_boundary_counts: &HashMap<String, u64>,
     ) -> Vec<String> {
         let paused = self.paused.lock_safe().clone();
         // Snapshot per-group guardrails (Clone) rather than per-agent CLI
@@ -8848,7 +8927,7 @@ impl OrchRegistry {
         // why the live incident took real forensic work to root-cause: no
         // record existed of WHICH detector armed `compact_pending`, or that
         // it had been discarded rather than genuinely resolved).
-        let mut to_discard: Vec<(String, String)> = Vec::new();
+        let mut to_discard: Vec<(String, String, Option<u64>, Option<u64>)> = Vec::new();
         {
             let mut agents = self.agents.lock_safe();
             for a in agents.values_mut() {
@@ -8889,26 +8968,60 @@ impl OrchRegistry {
                 // turn, with no compaction ever running. `compaction_
                 // confirmed` requires the context-token reading to have
                 // actually dropped since the baseline captured when `compact_
-                // pending` was set (whichever of the four paths set it)
-                // before the mandatory re-injection is trusted to fire.
-                // `compact_pending`/`compact_seen_busy`/the baseline are
-                // ALWAYS cleared here regardless of the outcome — one
-                // resolution attempt per arming, confirmed or not, so a
-                // repeatedly-false-positiving detector can re-arm the state
-                // machine as many times as it wants but can never cause more
-                // than one discarded, context-growth-free no-op per arming:
-                // structurally, a reinjection LOOP (the production incident)
-                // is no longer reachable, only (at worst) a repeatedly
-                // discarded false arm, which is silent to the agent and
-                // costs nothing but a breadcrumb.
+                // pending` was set before the mandatory re-injection is
+                // trusted to fire.
+                //
+                // rev-42 delta (deadlock fix): that gate is only sound for
+                // INFERENCE arms (manual `/compact` typing, the auto-compact
+                // banner) — paths where loomux merely *believes* a compact
+                // happened. It deadlocks the LOOMUX-INITIATED arm (heuristic
+                // fallback / `request_compact`, the one that actually types
+                // `/compact` itself, below): `usage::latest_context_tokens`'s
+                // drop is a NEXT-TURN phenomenon (proved against a real
+                // transcript in `usage::tests::
+                // real_transcript_proves_the_token_drop_is_a_next_turn_
+                // phenomenon_rev42_q1`) and the only next turn available is
+                // the reinjection this gate is supposed to authorize — a
+                // reading taken before that turn is always still-high, so a
+                // uniform gate silently discards genuine compactions on the
+                // primary path forever. `compact_pending_trusted` (set at
+                // each arm site below) is the fix: trusted arms skip
+                // confirmation entirely — loomux has positive knowledge it
+                // pasted `/compact` itself, so busy-then-quiet IS the
+                // signal, same as it always was before D2/D3 (this was never
+                // the false-positive path that motivated the gate).
+                // Inference arms keep the hard gate, now widened to
+                // `inferred_compaction_confirmed` (token-drop OR the
+                // `compact_boundary` transcript marker, which — unlike the
+                // token reading — appears on the completion turn itself, no
+                // next turn required).
+                //
+                // `compact_pending`/`compact_seen_busy`/both baselines/the
+                // trust flag are ALWAYS cleared here regardless of the
+                // outcome — one resolution attempt per arming, confirmed or
+                // not, so a repeatedly-false-positiving detector can re-arm
+                // the state machine as many times as it wants but can never
+                // cause more than one discarded, context-growth-free no-op
+                // per arming: structurally, a reinjection LOOP (the
+                // production incident) is no longer reachable, only (at
+                // worst) a repeatedly discarded false arm, which is audited
+                // (baseline/current tokens, Q3) and costs nothing but a
+                // breadcrumb.
                 if a.compact_pending && currently_quiet && a.compact_seen_busy {
-                    let confirmed = compaction_confirmed(
-                        a.compact_pending_baseline_tokens,
-                        context_tokens.get(&a.id).copied(),
-                    );
+                    let baseline_tokens = a.compact_pending_baseline_tokens;
+                    let current_tokens = context_tokens.get(&a.id).copied();
+                    let confirmed = a.compact_pending_trusted
+                        || inferred_compaction_confirmed(
+                            baseline_tokens,
+                            current_tokens,
+                            a.compact_pending_baseline_marker_count,
+                            context_boundary_counts.get(&a.id).copied(),
+                        );
                     a.compact_pending = false;
                     a.compact_seen_busy = false;
                     a.compact_pending_baseline_tokens = None;
+                    a.compact_pending_baseline_marker_count = None;
+                    a.compact_pending_trusted = false;
                     if confirmed {
                         let instructions = self.group_dir(&a.group).join(
                             g.block(&a.block)
@@ -8918,7 +9031,7 @@ impl OrchRegistry {
                         let ledger = self.ledger_path(&a.group, &a.id);
                         to_reinject.push((a.id.clone(), a.group.clone(), instructions, ledger));
                     } else {
-                        to_discard.push((a.id.clone(), a.group.clone()));
+                        to_discard.push((a.id.clone(), a.group.clone(), baseline_tokens, current_tokens));
                     }
                 }
 
@@ -8938,9 +9051,15 @@ impl OrchRegistry {
                         if now.saturating_sub(*last_input_ms) < MANUAL_COMPACT_DETECT_WINDOW_MS
                             && human_typed_compact_detected(tail)
                         {
+                            // Inference arm (loomux only believes a human
+                            // typed `/compact`) — untrusted, keeps the hard
+                            // `inferred_compaction_confirmed` gate above.
                             a.compact_pending = true;
                             a.compact_seen_busy = false;
                             a.compact_pending_baseline_tokens = context_tokens.get(&a.id).copied();
+                            a.compact_pending_baseline_marker_count =
+                                context_boundary_counts.get(&a.id).copied();
+                            a.compact_pending_trusted = false;
                         }
                     }
                 }
@@ -8972,9 +9091,16 @@ impl OrchRegistry {
                 if !a.compact_pending && !currently_quiet {
                     if let Some((tail, _)) = manual_signals.get(&a.id) {
                         if auto_compact_banner_detected(g.cli_for(a.role), tail) {
+                            // Inference arm (loomux only believes the CLI's
+                            // own auto-compact banner appeared) — untrusted,
+                            // keeps the hard `inferred_compaction_confirmed`
+                            // gate above.
                             a.compact_pending = true;
                             a.compact_seen_busy = true;
                             a.compact_pending_baseline_tokens = context_tokens.get(&a.id).copied();
+                            a.compact_pending_baseline_marker_count =
+                                context_boundary_counts.get(&a.id).copied();
+                            a.compact_pending_trusted = false;
                         }
                     }
                 }
@@ -9057,6 +9183,15 @@ impl OrchRegistry {
                     a.compact_pending = true;
                     a.compact_seen_busy = false;
                     a.compact_pending_baseline_tokens = context_tokens.get(&a.id).copied();
+                    a.compact_pending_baseline_marker_count = context_boundary_counts.get(&a.id).copied();
+                    // Loomux-initiated arm (rev-42 delta): THIS is the arm
+                    // that pastes `/compact` itself below — loomux has
+                    // positive knowledge the command was submitted, so
+                    // busy-then-quiet is sufficient on its own; trusted arms
+                    // skip `inferred_compaction_confirmed` entirely (see the
+                    // resolver's doc for why a hard gate here deadlocks the
+                    // primary path).
+                    a.compact_pending_trusted = true;
                     to_fire.push((a.id.clone(), a.group.clone()));
                 }
             }
@@ -9074,8 +9209,13 @@ impl OrchRegistry {
             let _ = self.deliver_prompt(&id, "/compact", "loomux", Delivery::MidSession);
             nudged.push(id);
         }
-        for (id, group) in to_discard {
-            self.audit(&group, "loomux", "compact-pending-discarded", json!({ "agent": id }));
+        for (id, group, baseline_tokens, current_tokens) in to_discard {
+            self.audit(&group, "loomux", "compact-pending-discarded", json!({
+                "agent": id,
+                "reason": "quiet-after-busy without confirmed compaction (no token drop, no compact_boundary marker)",
+                "baseline_tokens": baseline_tokens,
+                "current_tokens": current_tokens,
+            }));
         }
         for (id, group, percent) in to_escalate {
             self.audit(&group, "loomux", "compact-escalation", json!({ "agent": id, "percent": percent }));
@@ -9122,73 +9262,22 @@ impl OrchRegistry {
             .collect()
     }
 
-    /// Compact-nudge (#328): current context-window usage percent per Claude
-    /// agent whose group has escalation enabled
-    /// (`compact_context_threshold_percent > 0`) — skips the transcript read
-    /// entirely for groups that don't use it, and for non-Claude agents
-    /// (`session_id` is only ever pre-assigned for Claude — see
-    /// `AgentEntry.session_id`'s doc — so a copilot agent has none and is
-    /// filtered out by construction). Reads via
-    /// `usage::claude_context_tokens_in` against
-    /// `CLAUDE_CONTEXT_WINDOW_TOKENS`. Impure (disk read); split from the
-    /// decision so `compact_escalation_should_fire` stays synthetic-input
-    /// testable.
-    fn agent_context_percents(&self) -> HashMap<String, u32> {
-        let thresholds: HashMap<String, u32> = self
-            .groups
-            .lock_safe()
-            .iter()
-            .map(|(id, g)| (id.clone(), g.guardrails.compact_context_threshold_percent))
-            .collect();
-        let candidates: Vec<(String, String)> = self
-            .agents
-            .lock_safe()
-            .values()
-            .filter(|a| {
-                a.status == AgentStatus::Running
-                    && thresholds.get(&a.group).copied().unwrap_or(0) > 0
-            })
-            .filter_map(|a| Some((a.id.clone(), a.session_id.clone()?)))
-            .collect();
-        if candidates.is_empty() {
-            return HashMap::new();
-        }
-        let Some(root) = self
-            .claude_projects_dir
-            .lock_safe()
-            .clone()
-            .or_else(crate::usage::default_claude_projects_root)
-        else {
-            return HashMap::new();
-        };
-        candidates
-            .into_iter()
-            .filter_map(|(id, sid)| {
-                let tokens = crate::usage::claude_context_tokens_in(&root, &sid)?;
-                Some((id, context_percent_used(tokens, CLAUDE_CONTEXT_WINDOW_TOKENS)))
-            })
-            .collect()
-    }
-
-    /// Production bug fix (PR #329 delta review): raw context-token reading
-    /// per Running Claude-CLI agent with a resolvable session id — EVERY one,
-    /// not gated on the group's escalation threshold like `agent_context_
-    /// percents` (which exists purely for the opportunistic escalation
-    /// notice and skips the transcript read for groups that don't use it).
-    /// This reading is now load-bearing for CORRECTNESS, not just an
-    /// opportunistic notice: `compact_nudge_tick`'s busy-then-quiet resolver
-    /// needs a context-token baseline/current pair for every agent that
-    /// could ever enter `compact_pending`, regardless of whether that
-    /// agent's group happens to have escalation configured — the safety
-    /// property (`compaction_confirmed`) has to hold everywhere the feature
-    /// is used, not only where a human also opted into the separate
-    /// escalation notice. Accepts the resulting double transcript-read for
-    /// an escalation-enabled group's agents (once here, once in `agent_
-    /// context_percents`) as the honest cost of keeping this a small, low-
-    /// risk addition rather than restructuring the older, well-tested
-    /// escalation path. Impure (disk read); split from the decision so
-    /// `compaction_confirmed` stays synthetic-input testable.
-    fn agent_context_tokens(&self) -> HashMap<String, u64> {
+    /// Production bug fix (PR #329 delta review, rev-42 Q4): ONE transcript
+    /// tail-read per Running Claude-CLI agent with a resolvable session id —
+    /// EVERY one, not gated on the group's escalation threshold, since the
+    /// reading is load-bearing for CORRECTNESS (the busy-then-quiet
+    /// resolver's confirmation gate), not just the opportunistic escalation
+    /// notice. Replaces the former `agent_context_percents` +
+    /// `agent_context_tokens` pair, which each did their own whole-file read
+    /// against the same transcripts — `agent_context_percents` now derives
+    /// its percents from this map instead of re-reading, closing that
+    /// double-read. Via `usage::compaction_signal_in` (bounded tail-read),
+    /// carrying both the context-token reading (percent/gating) and the
+    /// `compact_boundary` marker count (`inferred_compaction_confirmed`'s
+    /// no-next-turn-required signal). Impure (disk read); split from the
+    /// decision so `compaction_confirmed`/`inferred_compaction_confirmed`
+    /// stay synthetic-input testable.
+    fn agent_context_signals(&self) -> HashMap<String, crate::usage::CompactionSignal> {
         let candidates: Vec<(String, String)> = self
             .agents
             .lock_safe()
@@ -9209,7 +9298,43 @@ impl OrchRegistry {
         };
         candidates
             .into_iter()
-            .filter_map(|(id, sid)| Some((id, crate::usage::claude_context_tokens_in(&root, &sid)?)))
+            .filter_map(|(id, sid)| Some((id, crate::usage::compaction_signal_in(&root, &sid)?)))
+            .collect()
+    }
+
+    /// Compact-nudge (#328): current context-window usage percent per Claude
+    /// agent whose group has escalation enabled
+    /// (`compact_context_threshold_percent > 0`). Derived from `signals`
+    /// (already read once for every Running Claude agent by `agent_context_
+    /// signals`, rev-42 Q4) — no transcript read of its own. Split from the
+    /// decision so `compact_escalation_should_fire` stays synthetic-input
+    /// testable.
+    fn agent_context_percents(
+        &self,
+        signals: &HashMap<String, crate::usage::CompactionSignal>,
+    ) -> HashMap<String, u32> {
+        let thresholds: HashMap<String, u32> = self
+            .groups
+            .lock_safe()
+            .iter()
+            .map(|(id, g)| (id.clone(), g.guardrails.compact_context_threshold_percent))
+            .collect();
+        let agent_groups: HashMap<String, String> = self
+            .agents
+            .lock_safe()
+            .iter()
+            .map(|(id, a)| (id.clone(), a.group.clone()))
+            .collect();
+        signals
+            .iter()
+            .filter_map(|(id, sig)| {
+                let group = agent_groups.get(id)?;
+                if thresholds.get(group).copied().unwrap_or(0) == 0 {
+                    return None;
+                }
+                let tokens = sig.tokens?;
+                Some((id.clone(), context_percent_used(tokens, CLAUDE_CONTEXT_WINDOW_TOKENS)))
+            })
             .collect()
     }
 
@@ -9219,9 +9344,24 @@ impl OrchRegistry {
     pub fn run_compact_nudge(&self, now: u64) -> Vec<String> {
         let outputs = self.agent_output_totals();
         let manual_signals = self.agent_compact_signals();
-        let context_percents = self.agent_context_percents();
-        let context_tokens = self.agent_context_tokens();
-        self.compact_nudge_tick(now, &outputs, &manual_signals, &context_percents, &context_tokens)
+        let signals = self.agent_context_signals();
+        let context_percents = self.agent_context_percents(&signals);
+        let context_tokens: HashMap<String, u64> = signals
+            .iter()
+            .filter_map(|(id, s)| s.tokens.map(|t| (id.clone(), t)))
+            .collect();
+        let context_boundary_counts: HashMap<String, u64> = signals
+            .iter()
+            .map(|(id, s)| (id.clone(), s.compact_boundary_count))
+            .collect();
+        self.compact_nudge_tick(
+            now,
+            &outputs,
+            &manual_signals,
+            &context_percents,
+            &context_tokens,
+            &context_boundary_counts,
+        )
     }
 
     /// Compact-nudge (#328): self-scoped agent request. Sets `compact_
@@ -13204,6 +13344,8 @@ impl OrchRegistry {
             compact_pending: false,
             compact_seen_busy: false,
             compact_pending_baseline_tokens: None,
+            compact_pending_baseline_marker_count: None,
+            compact_pending_trusted: false,
             last_state_write_ms: 0,
             compact_escalation_notified: false,
             solo_cli: None,
@@ -15151,6 +15293,8 @@ fn register_orchestrator_pane(
         compact_pending: false,
         compact_seen_busy: false,
         compact_pending_baseline_tokens: None,
+        compact_pending_baseline_marker_count: None,
+        compact_pending_trusted: false,
         last_state_write_ms: 0,
         compact_escalation_notified: false,
         solo_cli: None,
