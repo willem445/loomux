@@ -129,7 +129,7 @@ pane stays open showing the status).
 | --- | --- | --- |
 | `spawn_agent(name, kind, task, worktree?, branch?, base?)` | ✓ (guardrailed) | ✗ |
 | `send_prompt(agent_id, text)` | ✓ | ✗ |
-| `report(status, summary)` / `message_orchestrator(text)` | ✗ | ✓ |
+| `report(status?, summary?, outcome?, ref?, detail_url?, note?)` / `message_orchestrator(text)` | ✗ | ✓ |
 | `list_agents()` | ✓ | ✓ |
 | `get_output(agent_id, lines)` | ✓ | ✗ |
 | `kill_agent(agent_id)` / `focus_agent(agent_id)` | ✓ | ✗ |
@@ -846,6 +846,52 @@ box clears) rather than making the orchestrator poll terminals by hand.
   delivery is suppressed there anyway, so we don't spend the notice). The template's
   Silent-agent recovery adds the human-facing half: on a repeat unconfirmed notice for the
   same agent, stop re-sending and flag the human.
+
+## Decision-grade structured reports (#398)
+
+Every worker/reviewer/planner `report(...)` lands in the orchestrator's context window, and for
+most of them the orchestrator is only ever a router whose next action depends on one bit plus a
+reference — "review done, changes requested, PR #N" or "CI green, ready for review, PR #N" — while
+the free-text `summary` had no shape and no cap, so a 300-word paraphrase of a review that was
+already posted to the PR was a normal report. Verbose inbound reports were the single biggest
+avoidable drain on the orchestrator's context, and every unneeded paragraph brings the next
+compaction closer (the same pressure #287/#328/#329's compact-nudge work manages from the other
+side).
+
+- **Structural enforcement over prose.** `report`'s legacy shape (`status: progress|done|blocked`,
+  free-text `summary`, no cap) still works — nothing that called it before this shipped breaks —
+  but is soft-deprecated: the role templates stop teaching it. The new shape is `outcome` (a
+  five-value enum: `done`, `blocked`, `progress`, plus `approved`/`request_changes` for a
+  reviewer's report — a superset of the legacy three, not a parallel vocabulary), `ref` (the
+  PR/issue, e.g. `"#123"`), `detail_url` (the GitHub comment/PR where the FULL detail already
+  lives), and `note` — hard-capped at `report::NOTE_CHAR_CAP` (500 **characters**, never split
+  mid-codepoint) by `report::truncate_note`, which always appends a stated `[…truncated, N chars
+  total — see detail_url]` marker rather than silently cutting text. A cap the tool enforces beats
+  a guideline the template merely asks for.
+- **`outcome` implies `status` when the caller omits it** (`report::status_for_outcome`): `done` →
+  `done`, `blocked` → `blocked`, `progress` → `progress`, and both `approved`/`request_changes` →
+  `done` — a reviewer's turn being over (idle-kill clock restarts, attention badge clears) is the
+  same event whichever way the review came out. This is what lets a fully-structured report never
+  need the legacy field at all; `mcp.rs`'s dispatch validates whichever of `status`/`outcome` is
+  given (rejecting an unrecognized value in either vocabulary, never defaulting one) and requires
+  at least one, and likewise requires at least one of `summary`/`note` for the text.
+- **Artifact-first is the assumption this rests on.** The report is a *notification*, not the
+  record — the role templates (all four) now say so explicitly in their tool-doc bullet: post the
+  full detail to GitHub FIRST (a worker's PR body/comment, a reviewer's review body, a planner's
+  issue comment — already close to universal practice via the existing `review_verdict`/PR flow),
+  then `report` the pointer. `report::structured_notice` composes the delivered `[loomux] <agent>
+  reports <outcome> (<ref>): <note> — see <detail_url>` line — decision-grade, and small enough
+  that even a batch of them doesn't threaten the next compaction.
+- **Cutting the review fix-loop's middle hop.** The mirror change, in `orchestrator.md` and
+  `worker.md`: on `request_changes`, the orchestrator routes **one line** to the worker ("review
+  requested changes on PR #N — read the findings and revisit") rather than relaying the findings
+  it never needed to hold in its own context — the findings are already on the PR (the reviewer
+  posted them there before calling `report`), so the worker reads them directly. The full review
+  never transits the orchestrator's context at all.
+- **Template lockstep.** All four role templates changed; the `tests/fixtures/pre222` goldens were
+  re-blessed in the same commit (see that directory's README for the diff-as-review-surface
+  convention) — a prose pin (`tests/prompts.rs`) audited clean, since none of #398's edits touched
+  a pinned region.
 
 ## Notification backend (#243)
 
