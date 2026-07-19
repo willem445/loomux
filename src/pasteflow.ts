@@ -66,6 +66,33 @@ export function isCopyKey(e: PasteKeyEvent): boolean {
   return e.ctrlKey && e.shiftKey && e.code === "KeyC";
 }
 
+/** What a terminal keydown resolves to — pinned as ONE enum, not two
+ *  independent booleans, because of a live-demo finding (#402 review): the
+ *  DOM layer originally called `isCopyKey`/`isPasteKey` and, on a match,
+ *  `return false` from xterm's `attachCustomKeyEventHandler` WITHOUT calling
+ *  `e.preventDefault()`. Per xterm's own contract, returning `false` means
+ *  only "don't let xterm itself process this key" — it does NOT suppress the
+ *  browser's native handling of the same key. For plain Ctrl+V specifically,
+ *  the browser's native paste accelerator then fired on xterm's own focused
+ *  textarea, which xterm ALSO listens to natively (`handlePasteEvent`,
+ *  bound to the DOM `"paste"` event) — so the clipboard text landed twice:
+ *  once from our own `pasteFromClipboard()`, once from xterm's untouched
+ *  native path. `"copy"`/`"paste"` are the two dispositions that MUST
+ *  preventDefault; `"pass"` is the only one that must not — collapsing to
+ *  one enum makes forgetting the preventDefault for one of the two, but not
+ *  the other, a one-branch typo instead of two independently-fixed call
+ *  sites. See pane.ts for the DOM wiring (the preventDefault calls
+ *  themselves, and the capture-phase native-`"paste"`-event kill switch that
+ *  backstops this for the right-click case, which no keydown disposition
+ *  covers at all). */
+export type TermKeyDisposition = "copy" | "paste" | "pass";
+
+export function keyDisposition(e: PasteKeyEvent, plainCtrlVPastes: boolean): TermKeyDisposition {
+  if (isCopyKey(e)) return "copy";
+  if (isPasteKey(e, plainCtrlVPastes)) return "paste";
+  return "pass";
+}
+
 export type TermMenuAction = { kind: "copy" } | { kind: "paste" };
 
 export type TermMenuItem = MenuItem<TermMenuAction>;

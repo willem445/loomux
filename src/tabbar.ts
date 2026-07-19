@@ -358,9 +358,23 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
       e.dataTransfer?.setData("text/plain", wsId);
       if (e.dataTransfer) e.dataTransfer.effectAllowed = "move";
     });
+    // `dragenter` must ALSO preventDefault, not just `dragover` — a live-demo
+    // finding (#402 review): without it the browser never arms this element
+    // as a drop target at all (not-allowed cursor, `drop` never fires),
+    // regardless of what `dragover` does once entered — that's the HTML5
+    // D&D spec's actual contract. Exactly the kind of gap the pure
+    // `dropTargetIndex` tests couldn't have caught (no DOM event dispatch to
+    // get wrong in a pure function) and that "DOM wiring is hand-validated"
+    // only catches if the hand-validation actually happens against a real
+    // browser before merge, not just read back from the diff.
+    tab.addEventListener("dragenter", (e) => {
+      if (!this.draggingId || this.draggingId === wsId) return;
+      e.preventDefault();
+    });
     tab.addEventListener("dragover", (e) => {
       if (!this.draggingId || this.draggingId === wsId) return;
       e.preventDefault(); // required for `drop` to fire at all
+      if (e.dataTransfer) e.dataTransfer.dropEffect = "move"; // matches effectAllowed — the "allowed" cursor
       const before = this.dropsBefore(tab, e.clientX);
       tab.classList.toggle("drag-before", before);
       tab.classList.toggle("drag-after", !before);
