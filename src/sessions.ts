@@ -2,29 +2,37 @@
 // sessions discovered by the backend; clicking one restores it into a
 // new pane.
 //
-// Registers with the shared overlay registry (overlaystate.ts) while open
-// (#391, folded into #380): this is the sidebar the human hit the plugin
-// z-order bug through live — opening it over a plugin pane used to leave the
-// plugin's native webview painted on top of it until an unrelated layout
-// recalc happened to hide it. The #380 sessions-occlusion fix additionally
-// keeps the overlay slot open through the CLOSE side's own CSS transition
-// (`closeOverlayAfterTransition`, below) — closing it the instant `.hidden`
-// lands used to leave the plugin unclipped over the still-visually-shrinking
-// sidebar for the whole ~240ms `#sessions`'s `width` transition takes.
+// #380 round 2 correction: earlier rounds (#391/#393/#400/#414) treated this
+// panel as a COVERING DOM overlay — the same class as a modal or context menu
+// — needing a registered exclude rect (`overlayState.open()`/`close()`) so a
+// plugin pane's native webview could clip a hole for it. That model is wrong
+// for THIS panel. `#sessions` (`styles.css`) is `flex: none; width: 344px;
+// transition: width`, a genuine flex SIBLING of `#grid-area` inside
+// `#workspace { display: flex }` (`index.html`) — not `position: absolute`/
+// `fixed`. Opening or closing it never paints over another pane's rect at any
+// point in its transition; it PUSHES `#grid-area`'s available width via
+// ordinary flexbox reflow, which changes every plugin pane's own BOUNDS, not
+// what covers them. So this file no longer registers `#sessions` as a
+// covering overlay at all — `overlayState.open()`/`close()` never contributed
+// a meaningful exclude rect for it (confirmed both by the intersection math
+// in `pluginocclusion.ts`, which can't produce a nonempty rect for two
+// regions that never overlap, and by live telemetry: `exclude` was 0 in every
+// state, every time).
 //
-// #380 residual (`panelResizeObs`, below): registering/releasing the overlay
-// slot on the open/close EDGE isn't enough by itself — a plugin pane's own
-// occlusion only refires on ITS OWN triggers (its own `ResizeObserver`, an
-// overlay open/close edge, a window resize), none of which fire on every
-// frame of THIS panel's own `width` transition. The single "open" edge fires
-// synchronously inside `toggle()`, a tick before the transition's first
-// frame, so it captures the sidebar at its PRE-expansion (still ~0) width —
-// after that, nothing forced a recompute until some unrelated later event
-// (another overlay's own open/close, a window resize) happened to trigger
-// one, which is exactly the "plugin bleeds for a few seconds, then corrects"
-// live report. `overlaystate.ts`'s `poke()` exists precisely for "an overlay
-// that moves/resizes while open" but had no production caller before this —
-// `panelResizeObs` is that caller, on both the open AND close transition.
+// What this panel still needs to do: every plugin pane's own generic
+// `ResizeObserver` (`pluginpaneview.ts`'s `"resize"` source) already re-fires
+// on every tick of this panel's `width` transition — confirmed empirically —
+// so bounds tracking DURING the transition is that mechanism's job, not this
+// file's (see `pluginpaneview.ts`'s `repositionGate` doc comment for the
+// actual fix to the "stale for several seconds" symptom: an unthrottled burst
+// of native IPC calls, one per animation frame, was the real bottleneck, not
+// a missing trigger). This file provides exactly ONE thing on top: an
+// authoritative SETTLE recompute once the transition has fully committed
+// (`transitionend` + `requestAnimationFrame`, below), via `overlayState`'s
+// generic `poke()` notify bus — used here purely as "something every
+// subscribed plugin pane should recompute against," never paired with an
+// `open()`/`close()` registration, since this panel never has a rect worth
+// registering.
 
 import { listSessions, type SessionInfo } from "./pty";
 import type { SessionRoleInfo } from "./orchestration";
@@ -60,27 +68,6 @@ export class SessionBrowser {
    *  exists to front-load, doubled. Same mechanism IssuesView uses for its
    *  refresh loop; reused rather than a second de-dup scheme. */
   private refreshGate = new RefreshGate();
-  /** Closer for the shared overlay registry (#391, folded into #380) — set
-   *  while the sidebar is visible, so any plugin pane it happens to cover
-   *  shows through everywhere except the sidebar's own rect, immediately, no
-   *  lag. Null while hidden. */
-  private overlayClose: (() => void) | null = null;
-  /** Cleanup for a pending "wait for the close animation" `transitionend`
-   *  listener (#380) — set while `#sessions`'s `width: 344px -> 0` CSS
-   *  transition (`styles.css`) is still collapsing the sidebar after a
-   *  close, cleared once it finishes (or is cancelled by a re-open before it
-   *  does). See `closeOverlayAfterTransition`'s doc comment for why the
-   *  overlay slot can't just close the instant the `.hidden` class lands. */
-  private pendingClose: (() => void) | null = null;
-  /** Forces every subscribed plugin pane to recompute occlusion on every
-   *  tick of `#sessions`'s own `width` transition (#380 residual, see this
-   *  file's header comment) — idle the rest of the time, since a
-   *  `ResizeObserver` only fires when the observed box's size actually
-   *  changes, which for this element only happens during that transition.
-   *  Lives for the component's whole lifetime (constructed once in
-   *  `main.ts`, never disposed) rather than being attached/detached per
-   *  open/close, since there's no ongoing cost to leaving it idle. */
-  private readonly panelResizeObs: ResizeObserver;
 
   constructor(
     private el: HTMLElement,
@@ -113,15 +100,20 @@ export class SessionBrowser {
     inner.append(head, this.searchEl, this.listEl);
     this.el.appendChild(inner);
 
-    // #380 residual: re-poke the overlay registry on every tick of `#sessions`'s
-    // own open/close transition (see `panelResizeObs`'s field doc comment), plus
-    // a `transitionend` backstop for the final frame in case a tick lands after
-    // the observer's last callback — the same belt-and-suspenders reasoning
-    // `closeOverlayAfterTransition` already uses for this exact transition.
-    this.panelResizeObs = new ResizeObserver(() => overlayState.poke());
-    this.panelResizeObs.observe(this.el);
+    // #380 round 2: the ONE authoritative recompute this file owes every
+    // subscribed plugin pane — once `#sessions`'s own `width` transition has
+    // fully committed, not on every tick of it (see this file's header
+    // comment for why "during" is `pluginpaneview.ts`'s job, not this file's).
+    // `requestAnimationFrame` after `transitionend` ensures the read a
+    // subscriber does in response lands after the settled frame has actually
+    // painted, not merely been requested. Lives for the component's whole
+    // lifetime (constructed once in `main.ts`, never disposed) rather than
+    // attached/detached per open/close — there's no ongoing cost to a listener
+    // that only ever fires on this element's own `width` transition ending.
     this.el.addEventListener("transitionend", (e) => {
-      if (e.target === this.el && e.propertyName === "width") overlayState.poke();
+      if (e.target === this.el && e.propertyName === "width") {
+        requestAnimationFrame(() => overlayState.poke());
+      }
     });
   }
 
@@ -132,67 +124,13 @@ export class SessionBrowser {
   toggle(): void {
     this.el.classList.toggle("hidden");
     if (this.visible) {
-      // Re-opening while a close is still pending (a rapid toggle-toggle
-      // before the collapse animation finished) runs that pending close's
-      // `finish()` immediately — closing the old slot and clearing its
-      // listener/timeout — and then `??=` below opens a fresh one right
-      // away: a close-then-reopen churn (two registry edges), not a literal
-      // no-op, but the end state is what matters and is correct either way
-      // — exactly one slot open, matching the panel's real visibility, with
-      // no leftover listener from the interrupted close still armed.
-      this.pendingClose?.();
-      this.pendingClose = null;
-      this.overlayClose ??= overlayState.open(() => this.el.getBoundingClientRect());
       void this.refresh();
       this.searchEl.focus();
-    } else {
-      this.closeOverlayAfterTransition();
     }
   }
 
   hide(): void {
     this.el.classList.add("hidden");
-    this.closeOverlayAfterTransition();
-  }
-
-  /** Releases the overlay registry slot once `#sessions`'s CSS `width`
-   *  transition (`styles.css`, 344px -> 0 on close) has actually finished,
-   *  not the instant the `.hidden` class lands (#380). Closing immediately
-   *  used to leave a plugin pane's occlusion hole gone for the whole ~240ms
-   *  the sidebar was still visually collapsing — the same class of bug as
-   *  the OPEN-side fix in `pluginpaneview.ts`'s `reposition()`, just on the
-   *  other edge, and exactly the "close panel" case this fix's own manual
-   *  validation steps call out. Idempotent against a rapid re-close (a
-   *  second call while one is already pending is a no-op: the existing
-   *  listener is left in place). Falls back to closing on a timeout matching
-   *  the transition duration in case `transitionend` never fires at all —
-   *  `styles.css` does NOT gate `#sessions`'s `width` transition behind
-   *  `prefers-reduced-motion` (it always runs, so `transitionend` fires
-   *  normally for every real user), so the only cases the fallback actually
-   *  covers are a non-browser test environment and any future style change
-   *  that removes the transition outright. */
-  private closeOverlayAfterTransition(): void {
-    if (this.pendingClose || !this.overlayClose) return;
-    const el = this.el;
-    let done = false;
-    const finish = (): void => {
-      if (done) return;
-      done = true;
-      el.removeEventListener("transitionend", onEnd);
-      clearTimeout(fallback);
-      this.pendingClose = null;
-      this.overlayClose?.();
-      this.overlayClose = null;
-    };
-    const onEnd = (e: TransitionEvent): void => {
-      if (e.target === el && e.propertyName === "width") finish();
-    };
-    el.addEventListener("transitionend", onEnd);
-    // `styles.css`'s `#sessions` transition duration, plus slack — a backstop
-    // only; `transitionend` is expected to fire first in the real browser
-    // this app ships in.
-    const fallback = setTimeout(finish, 400);
-    this.pendingClose = finish;
   }
 
   /** Orchestration identity for a session, merging the durable roster with
