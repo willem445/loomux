@@ -107,6 +107,7 @@ pub const APP_COMMANDS: &[&str] = &[
     "orch_set_idle_activity_floor",
     "orch_set_compact_nudge_minutes",
     "orch_set_compact_nudge_roles",
+    "orch_set_compact_nudge_min_context_percent",
     "orch_set_compact_context_threshold",
     "orch_autonomy",
     "orch_group_usage",

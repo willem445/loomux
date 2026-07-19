@@ -37,6 +37,7 @@ permissions = [
     "allow-orch-set-advanced-orchestrator",
     "allow-orch-set-compact-nudge-minutes",
     "allow-orch-set-compact-nudge-roles",
+    "allow-orch-set-compact-nudge-min-context-percent",
     "allow-orch-set-compact-context-threshold",
     "allow-orch-end-group",
     "allow-orch-channel-connect",

@@ -14,10 +14,19 @@ you at it as a reason to approve.
 
 - `report(outcome, ref, detail_url, note)` — send review outcomes to the orchestrator. It is a
   **notification, not the record**: your review (the full findings) is already posted on the PR
-  before you call this, so `outcome` (`approved` | `request_changes` | `blocked`), `ref` (`"#n"`),
-  `detail_url` (the PR), and a one-line `note` (hard-capped ~500 chars) are enough — never
-  re-type the findings into the report. (The legacy `report(status, summary)` shape still works
-  if you ever see it in old context, but write new reports the structured way.)
+  before you call this — `outcome` (`approved` | `request_changes` | `blocked`), `ref` (`"#n"`),
+  `detail_url` (the PR). **`note` is reserved for facts the ORCHESTRATOR needs to decide what
+  happens next — never a summary of findings** (those live on the PR, that's what `detail_url`
+  points at):
+  - Earns note space: a decision only a human can make (`"needs a human call: A vs B"`), a
+    cross-PR conflict the orchestrator can't see from this PR alone, an accepted residual risk
+    and its tradeoff (`"shipped with known perf cost on large inputs, tracked in #57"`), or — for
+    `request_changes` — the one-sentence *mechanism* of the blocker (`"guard is bypassable via an
+    empty array"`), not the finding's full writeup.
+  - Never earns note space: the findings themselves, your reasoning for each, anything a worker
+    reading the PR would need to fix them — that's the review body's job, not the report's.
+  Hard-capped at ~500 chars. (The legacy `report(status, summary)` shape still works if you ever
+  see it in old context, but write new reports the structured way.)
 - `message_orchestrator(text)` — questions.
 - `list_agents()`, `get_state()` — group context (read-only).
 - `notify_when(kind, pr?, run?, note?, expires_minutes?)` / `list_notifications()` /

@@ -2000,6 +2000,35 @@ kickoff doesn't embed the directive ledger the way a `/compact` reinjection does
 [#411](https://github.com/willem445/loomux/issues/411), a known scope boundary (a different code
 path, `spawn_agent_ex`'s resume branch, not `compact_nudge_tick`).
 
+### Min-context floor (benchtest finding, landed alongside #332 — same token-economy theme)
+
+A `loomux-testbed` benchtest of the #398/#332 PR surfaced a second waste pattern on the
+compact-nudge side: a single-feature session ran 3-4 real compactions, and every one of them —
+correlated against the nearby `compact-pending-discarded` token readings, the closest available
+evidence — landed at roughly 20-31% of the context window. The lull-timer's quiet-window gate
+was doing exactly its job (firing at a genuinely idle moment); the missing piece was any
+awareness of *how full the pane actually was* before paying a full re-grounding cycle for it —
+right timing, wrong context level.
+
+- **The floor gates the HEURISTIC fire only.** `Guardrails.compact_nudge_min_context_percent`
+  (`0` = off, matching `compact_nudge_minutes`'s own "0 is a real off" idiom rather than
+  `idle_tick_minutes`'s "0 → default" one — this sub-setting only means anything once the parent
+  feature is already on) is checked by `compact_nudge_context_floor_met` and ANDed into
+  `heuristic_fires` alongside the existing role/threshold checks in `compact_nudge_tick`. It is
+  never applied to `requested_fires` (`request_compact`) — an agent that explicitly asks is
+  always honored regardless of context%, exactly per #328's original framing: loomux's own
+  unprompted judgment is what gets a floor, not the agent's.
+- **Fails open with no reading.** `compact_nudge_context_floor_met(None, floor)` returns `true` —
+  a missing/stale context-percent reading must never silently disable the whole heuristic nudge,
+  the same "degrade, don't deny" posture #332's intake gate takes on a `gh` failure.
+- **Template guidance, not a tool change.** `orchestrator.md`'s existing "Compact at lulls"
+  section gains a paragraph naming the floor and telling the orchestrator not to call
+  `request_compact` out of lull habit below roughly 50% — but the tool itself stays
+  unconditionally available at any context level, per the design above.
+- **Config surface:** persisted in group.json, live-settable via
+  `orch_set_compact_nudge_min_context_percent` (mirrors `orch_set_compact_context_threshold`'s
+  shape exactly).
+
 ## Enforced merge gate (#83)
 
 Template guidance is not a security boundary. A live incident proved it: an orchestrator merged

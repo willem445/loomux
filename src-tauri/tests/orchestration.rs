@@ -14,7 +14,8 @@ use loomux_lib::orchestration::{
     channel_connected_event, channel_disconnected_event, channel_message_text,
     channel_updated_event, classify_human_input,
     claude_permission_mode, cli_ready, compact_checklist_warning, compact_escalation_notice,
-    compact_escalation_should_fire, compact_nudge_cli_supported, compact_nudge_role_allowed,
+    compact_escalation_should_fire, compact_nudge_cli_supported, compact_nudge_context_floor_met,
+    compact_nudge_role_allowed,
     compact_reinjection_notice, compact_request_should_fire, compaction_status, context_percent_used,
     CompactionStatus,
     auto_compact_banner_detected, compaction_confirmed, directive_ledger_embed, ledger_capped,
@@ -5750,6 +5751,101 @@ fn compact_escalation_notice_names_the_percent_and_the_recovery_move() {
     assert!(n.starts_with("[loomux]"));
     assert!(n.contains("87%"), "got: {n}");
     assert!(n.contains("request_compact"), "got: {n}");
+}
+
+// ---------- compact-nudge min-context floor (benchtest finding) ----------
+
+#[test]
+fn compact_nudge_context_floor_met_off_always_allows() {
+    assert!(compact_nudge_context_floor_met(Some(10), 0), "floor 0 = off, any reading passes");
+    assert!(compact_nudge_context_floor_met(None, 0));
+}
+
+#[test]
+fn compact_nudge_context_floor_met_gates_below_the_floor() {
+    assert!(!compact_nudge_context_floor_met(Some(30), 50), "below the floor must not allow the heuristic fire");
+    assert!(compact_nudge_context_floor_met(Some(50), 50), "exactly at the floor allows it");
+    assert!(compact_nudge_context_floor_met(Some(80), 50));
+}
+
+#[test]
+fn compact_nudge_context_floor_met_fails_open_with_no_reading() {
+    // A missing/stale context reading must never silently disable the whole
+    // heuristic nudge — degrade, don't deny (the same posture #332's intake
+    // gate takes on a `gh` failure).
+    assert!(compact_nudge_context_floor_met(None, 50));
+}
+
+#[test]
+fn compact_nudge_heuristic_fire_gated_by_min_context_percent() {
+    let (reg, _d) = test_registry();
+    let g = reg
+        .create_group(
+            "C:/tmp/repo",
+            Guardrails {
+                compact_nudge_minutes: 20,
+                compact_nudge_roles: vec!["orchestrator".to_string()],
+                compact_nudge_min_context_percent: 50,
+                ..rails()
+            },
+        )
+        .unwrap();
+    let o = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let empty = HashMap::new();
+
+    // Below the floor: the lull alone must not fire.
+    let low_context: HashMap<String, u32> = [(o.id.clone(), 30u32)].into_iter().collect();
+    assert!(
+        reg.compact_nudge_tick(FAR, &empty, &HashMap::new(), &low_context, &HashMap::new(), &HashMap::new(), &HashMap::new())
+            .is_empty(),
+        "context 30% is under the 50% floor — the heuristic nudge must not fire"
+    );
+    assert_eq!(audit_count(&reg, &g.id, "compact-nudge"), 0);
+
+    // Above the floor: fires normally, same as pre-floor behavior.
+    let high_context: HashMap<String, u32> = [(o.id.clone(), 60u32)].into_iter().collect();
+    assert_eq!(
+        reg.compact_nudge_tick(FAR, &empty, &HashMap::new(), &high_context, &HashMap::new(), &HashMap::new(), &HashMap::new()),
+        vec![o.id.clone()],
+        "context 60% clears the 50% floor — the heuristic nudge fires"
+    );
+}
+
+#[test]
+fn compact_nudge_request_compact_fires_below_the_floor_agent_judgment_wins() {
+    // The floor gates loomux's OWN unprompted (lull-timer) judgment only — an
+    // agent that explicitly asked via `request_compact` is always honored,
+    // regardless of context%.
+    let (reg, _d) = test_registry();
+    let g = reg
+        .create_group(
+            "C:/tmp/repo",
+            Guardrails {
+                compact_nudge_minutes: 20,
+                compact_nudge_roles: vec!["orchestrator".to_string()],
+                compact_nudge_min_context_percent: 50,
+                ..rails()
+            },
+        )
+        .unwrap();
+    let o = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    reg.request_compact(&o.id).unwrap();
+
+    let empty = HashMap::new();
+    let low_context: HashMap<String, u32> = [(o.id.clone(), 10u32)].into_iter().collect();
+    assert_eq!(
+        reg.compact_nudge_tick(FAR, &empty, &HashMap::new(), &low_context, &HashMap::new(), &HashMap::new(), &HashMap::new()),
+        vec![o.id.clone()],
+        "an agent-requested compact must fire even at 10% context — the floor never gates request_compact"
+    );
+}
+
+#[test]
+fn compact_nudge_min_context_percent_defaults_off_and_clamps() {
+    let g = Guardrails { compact_nudge_min_context_percent: 0, ..rails() }.clamped();
+    assert_eq!(g.compact_nudge_min_context_percent, 0, "off by default — no floor unless configured");
+    let g = Guardrails { compact_nudge_min_context_percent: 250, ..rails() }.clamped();
+    assert_eq!(g.compact_nudge_min_context_percent, 100, "clamps to the 100% ceiling");
 }
 
 #[test]

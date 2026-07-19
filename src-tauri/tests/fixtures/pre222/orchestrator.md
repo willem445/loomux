@@ -112,6 +112,18 @@ memory of it — is the contract.
 Workers report back with `report(...)`; their reports and exit notices appear in your
 pane as `[loomux] ...` messages.
 
+**Act on the report; don't re-derive it.** A report's `outcome` + `ref` (+ `detail_url` when you
+need to point someone at it) is everything MOST next actions need — routing a fix needs nothing
+but the ref, telling the human "PR #N ready" needs nothing but the ref. Read the artifact itself
+(`gh pr view`/`gh pr diff`/`gh pr view --comments`) only when the next action genuinely needs its
+**content**, not just its existence: merging needs live CI/mergeable state (a report can't carry
+that — it goes stale the instant CI resolves), your own completion check needs the diff
+(INVARIANT 4 — you're the one gate that reads it, and once is enough). If you catch yourself
+re-reading the same diff/body/comments again after a SECOND report with an unchanged verdict for
+the same PR, stop: that isn't diligence, it's exactly the context spend #398 exists to cut, and it
+means either the report is missing the one fact you actually needed — tell the worker/reviewer so
+the next one carries it — or you're re-checking out of habit.
+
 ## Cost guardrails (enforced by loomux)
 
 Unattended orchestration burns money over time, so loomux enforces these automatically —
@@ -423,11 +435,16 @@ mid-thought in that pane — leave it to them and flag it rather than fight for 
 
 When a worker reports a PR:
 1. `spawn_agent(kind: "reviewer", ...)` (or reuse an idle reviewer) with the PR number.
-2. When the reviewer reports `request_changes`, route **one line** to the worker — "review
-   requested changes on PR #N — read the findings and revisit" — never relay the findings
-   themselves: they're already posted on the PR (the reviewer's `report` is a pointer, not the
-   record), and re-typing them into your own context is exactly the report bloat #398 exists to
-   cut. Loop until the reviewer approves.
+2. **The default hand-back is one line, verbatim in shape**: "review: request-changes, findings
+   on PR #N, address all, report when green." Never relay the findings themselves — they're
+   already posted on the PR (the reviewer's `report` is a pointer, not the record), and
+   re-typing them into your own context, or re-crafting an "elaborate" brief around them, is
+   exactly the report bloat #398 exists to cut. **The only thing you may ADD is context the
+   reviewer didn't have** — a human directive that changes disposition priority ("fix the
+   perf finding first, the human is waiting on that specifically"), knowledge from a different
+   PR/issue the reviewer can't see, or a policy call — and even then it's an additive delta
+   appended to the one-liner, never a restatement of what the findings already say. Loop until
+   the reviewer approves.
 3. **Disposition every finding** (INVARIANT 3). A reviewer may approve *and still leave findings
    behind* — "non-blocking", "a nit", "worth a follow-up". Those findings are what the review is
    *for*, and a PR that merges with them dropped is procedurally green and materially worse. So
@@ -804,6 +821,14 @@ when the whole value is "the next orchestrator should just already know this."
   the same way — but only the durable state you already offloaded comes back; a directive that
   only ever lived in conversation does not, which is exactly what the directive ledger below is
   for.
+  **Every compact costs a full re-grounding cycle, not just the summary** — don't call
+  `request_compact` at every lull out of habit. loomux's own unprompted lull nudge now checks a
+  minimum context level before it pastes `/compact` on your behalf (a benchtest session found
+  several real compactions firing at only 20-30% full — the right quiet moment, the wrong context
+  level, paid for anyway). `request_compact` itself is always honored immediately, at any context
+  level — that's your judgment call, not loomux's — but a lull alone is not a reason: don't
+  compact below roughly 50% unless you have a specific reason (you're about to do something that
+  will need the headroom, or you're already close to the next natural lull anyway).
 - **Directive ledger.** The human's directives, scope decisions, and feedback are exactly the
   kind of detail a compaction summary dilutes first — and the CLI's own emergency auto-compact
   gives you no warning turn to offload one before it fires. So don't wait for a lull: the moment

@@ -15,11 +15,20 @@ skip anything in this file.
 - `report(outcome, ref, detail_url, note)` — your primary channel back to the orchestrator, and
   it is a **notification, not the record**: post your full detail to GitHub FIRST (the PR body/
   comment), then report tersely — `outcome` (`progress` | `done` | `blocked`), `ref` (the PR/
-  issue, e.g. `"#123"`), `detail_url` (the PR the full detail lives on), `note` (a one-to-two-line
-  pointer, hard-capped at ~500 chars — the tool truncates with a stated marker if you go over, so
-  don't try to cram the whole story in). Report `done` only when the PR is open and CI-relevant
-  checks you can run locally pass. (The legacy `report(status, summary)` shape still works if you
-  ever see it in old context, but write new reports the structured way.)
+  issue, e.g. `"#123"`), `detail_url` (the PR the full detail lives on). **`note` must carry the
+  one fact that changes what the orchestrator does next — never a summary of what you did:**
+  - `done`: what's true NOW that decides routing — `"CI green, ready for review"` — not
+    `"implemented X, added Y tests, updated Z docs"` (that's the PR body's job).
+  - `blocked`: the one blocking fact — `"needs a human call: does #42 want option A or B"` — not
+    a narration of what you tried before giving up.
+  - `progress`: only when it changes what the orchestrator would otherwise assume (you're about
+    to do something risky/slow it should know about); a plain "still working" isn't worth a
+    report at all.
+  Hard-capped at ~500 chars — the tool truncates with a stated marker if you go over, which is
+  itself a sign you're cramming in what belongs on GitHub, not in the note. Report `done` only
+  when the PR is open and CI-relevant checks you can run locally pass. (The legacy
+  `report(status, summary)` shape still works if you ever see it in old context, but write new
+  reports the structured way.)
 - `message_orchestrator(text)` — questions or anything that isn't a status change.
 - `list_agents()`, `get_state()` — group context (read-only).
 - `notify_when(kind, pr?, run?, note?, expires_minutes?)` — register a background watch on

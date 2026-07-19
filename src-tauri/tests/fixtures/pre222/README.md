@@ -158,6 +158,29 @@ so far:
   and a tick that DOES fire because of the gate names what changed so the orchestrator doesn't
   re-poll it. `worker.md`/`reviewer.md`/`planner.md` are untouched by this one.
 
+- **Benchtest findings on #398/#332 (rev-31's live testbed run), two more re-blessings in the same
+  PR:**
+  - **Terse reports still triggered reflexive `gh` re-reads.** The testbed's audit + transcript
+    forensics showed the orchestrator re-reading a PR's diff/body/comments/mergeable-state
+    repeatedly across consecutive same-verdict reports (25 `gh` calls across one PR's review
+    lifecycle, several of them exact repeats). `orchestrator.md` gains an **"act on the report,
+    don't re-derive it"** rule right where `report(...)` is first introduced (read the artifact
+    only when the next action needs its CONTENT — CI/mergeable state for a merge, nothing for a
+    routing hand-off) and step 2's worker-reports-a-PR hand-back is tightened to an explicit
+    one-line template with a named, bounded exception (an ADDITIVE delta only — context the
+    reviewer lacked — never a restatement). `worker.md`/`reviewer.md`'s `report(...)` bullets gain
+    mandatory per-outcome examples for what earns `note` space; `reviewer.md`'s is reserved for
+    orchestrator-decision-relevant facts (needs-human-decision, cross-PR conflict, accepted
+    residual+tradeoff, a blocker's one-sentence mechanism) and explicitly never a findings summary.
+  - **Compact-nudge min-context floor.** The same testbed run showed 3-4 real compactions, all at
+    ~20-31% context — the lull timer's quiet-window gate firing at the right moment but the wrong
+    context level. `orchestrator.md`'s existing **Compact at lulls** paragraph (#328/#329) gains a
+    sentence naming the new floor and telling the orchestrator not to call `request_compact` out
+    of lull habit below roughly 50% — the tool itself stays unconditionally available at any
+    context level (agent judgment always wins); only loomux's own unprompted heuristic nudge is
+    gated. `worker.md`/`reviewer.md`/`planner.md` are untouched by this one too (compact-nudge is
+    orchestrator-only by default).
+
 `the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was` renders
 **these** with the six pre-#222 template variables and asserts that a group launched
 with the advanced orchestrator **off** gets exactly that text. They are the
