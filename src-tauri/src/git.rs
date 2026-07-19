@@ -11,6 +11,27 @@ use serde::Serialize;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
+/// Run a git-backed computation off the webview main thread (issue #399).
+/// Tauri dispatches a *synchronous* `#[tauri::command]` by calling it directly
+/// on the main thread — the exact mechanism issue #207 already diagnosed for
+/// the file-editor search command ("Tauri runs sync commands on the main
+/// (webview) thread"). Every command on the git pane's open/refresh path shells
+/// out to `git` and can block for as long as a slow scan takes (a large working
+/// tree, a big history, a stalled network share), so each is a thin `async fn`
+/// wrapper that hands the real work — still a plain, directly unit-testable
+/// sync function — to a blocking-pool thread via
+/// `tauri::async_runtime::spawn_blocking` and awaits it here instead.
+async fn run_blocking<T, F>(f: F) -> Result<T, String>
+where
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+    T: Send + 'static,
+{
+    match tauri::async_runtime::spawn_blocking(f).await {
+        Ok(result) => result,
+        Err(e) => Err(format!("git task panicked: {e}")),
+    }
+}
+
 /// Run git in `repo` and capture stdout. Non-zero exit → Err(stderr).
 fn run_git(repo: &str, args: &[&str]) -> Result<String, String> {
     if !Path::new(repo).is_dir() {
@@ -91,13 +112,27 @@ pub struct GitStatus {
     pub staged: Vec<FileEntry>,
     pub unstaged: Vec<FileEntry>,
     pub untracked: Vec<String>,
+    /// True when `untracked` was cut off at `MAX_UNTRACKED` — a folder with an
+    /// unbounded (often un-gitignored) pile of loose files, e.g. a build output
+    /// dir or `node_modules`, must not hand the frontend an unbounded array to
+    /// render one DOM row per file for (#399). Never silently cut: the view
+    /// shows a note when this is set.
+    pub untracked_truncated: bool,
 }
+
+/// Ceiling on the untracked-file list `git_status` returns. `git status`
+/// itself is bounded (it stops walking once excludes apply), but a folder with
+/// nothing `.gitignore`d — a fresh checkout before the ignore file lands, a
+/// generated-output directory nobody excluded — can still hand back tens of
+/// thousands of paths; capping here keeps both the IPC payload and the
+/// frontend's one-row-per-file rendering bounded regardless of what the
+/// working tree looks like.
+const MAX_UNTRACKED: usize = 5_000;
 
 // ---------- commands ----------
 
 /// Resolve the repository root containing `cwd`, or None if not in a repo.
-#[tauri::command]
-pub fn git_repo_root(cwd: String) -> Result<Option<String>, String> {
+fn git_repo_root_sync(cwd: String) -> Result<Option<String>, String> {
     match run_git(&cwd, &["rev-parse", "--show-toplevel"]) {
         Ok(out) => Ok(Some(out.trim().replace('/', std::path::MAIN_SEPARATOR_STR))),
         Err(e) if e.contains("not a git repository") => Ok(None),
@@ -106,7 +141,11 @@ pub fn git_repo_root(cwd: String) -> Result<Option<String>, String> {
 }
 
 #[tauri::command]
-pub fn git_log(repo: String, limit: u32) -> Result<Vec<CommitInfo>, String> {
+pub async fn git_repo_root(cwd: String) -> Result<Option<String>, String> {
+    run_blocking(move || git_repo_root_sync(cwd)).await
+}
+
+fn git_log_sync(repo: String, limit: u32) -> Result<Vec<CommitInfo>, String> {
     let n = limit.to_string();
     let out = run_git(
         &repo,
@@ -140,7 +179,11 @@ pub fn git_log(repo: String, limit: u32) -> Result<Vec<CommitInfo>, String> {
 }
 
 #[tauri::command]
-pub fn git_status(repo: String) -> Result<GitStatus, String> {
+pub async fn git_log(repo: String, limit: u32) -> Result<Vec<CommitInfo>, String> {
+    run_blocking(move || git_log_sync(repo, limit)).await
+}
+
+fn git_status_sync(repo: String) -> Result<GitStatus, String> {
     let out = run_git(
         &repo,
         &[
@@ -155,10 +198,14 @@ pub fn git_status(repo: String) -> Result<GitStatus, String> {
     Ok(parse_status_v2(&out))
 }
 
+#[tauri::command]
+pub async fn git_status(repo: String) -> Result<GitStatus, String> {
+    run_blocking(move || git_status_sync(repo)).await
+}
+
 /// Unified diff for one file. `mode`: "worktree" | "staged" | "commit" |
 /// "untracked".
-#[tauri::command]
-pub fn git_diff(
+fn git_diff_sync(
     repo: String,
     path: String,
     mode: String,
@@ -199,9 +246,18 @@ pub fn git_diff(
     }
 }
 
-/// Files touched by a commit (first-parent diff for merges).
 #[tauri::command]
-pub fn git_commit_files(repo: String, hash: String) -> Result<Vec<FileEntry>, String> {
+pub async fn git_diff(
+    repo: String,
+    path: String,
+    mode: String,
+    hash: Option<String>,
+) -> Result<String, String> {
+    run_blocking(move || git_diff_sync(repo, path, mode, hash)).await
+}
+
+/// Files touched by a commit (first-parent diff for merges).
+fn git_commit_files_sync(repo: String, hash: String) -> Result<Vec<FileEntry>, String> {
     let out = run_git(
         &repo,
         &[
@@ -218,6 +274,11 @@ pub fn git_commit_files(repo: String, hash: String) -> Result<Vec<FileEntry>, St
         ],
     )?;
     Ok(parse_name_status_z(&out))
+}
+
+#[tauri::command]
+pub async fn git_commit_files(repo: String, hash: String) -> Result<Vec<FileEntry>, String> {
+    run_blocking(move || git_commit_files_sync(repo, hash)).await
 }
 
 #[tauri::command]
@@ -749,9 +810,13 @@ pub fn git_worktree_add(repo: String, name: String, base: Option<String>) -> Res
 /// frontend keeps that logic in one place with its tests. `repo` may be any
 /// worktree of the set; git reports the whole set (they share one object DB),
 /// with the main working tree listed first.
-#[tauri::command]
-pub fn git_worktree_list(repo: String) -> Result<String, String> {
+fn git_worktree_list_sync(repo: String) -> Result<String, String> {
     run_git(&repo, &["worktree", "list", "--porcelain"])
+}
+
+#[tauri::command]
+pub async fn git_worktree_list(repo: String) -> Result<String, String> {
+    run_blocking(move || git_worktree_list_sync(repo)).await
 }
 
 /// Remove an agent's worktree during group teardown. `--force` because the
@@ -854,6 +919,7 @@ fn parse_status_v2(out: &str) -> GitStatus {
         staged: Vec::new(),
         unstaged: Vec::new(),
         untracked: Vec::new(),
+        untracked_truncated: false,
     };
 
     let mut tokens = out.split('\0');
@@ -908,7 +974,11 @@ fn parse_status_v2(out: &str) -> GitStatus {
             }
             Some(b'?') => {
                 if let Some(path) = tok.strip_prefix("? ") {
-                    st.untracked.push(path.to_string());
+                    if st.untracked.len() >= MAX_UNTRACKED {
+                        st.untracked_truncated = true;
+                    } else {
+                        st.untracked.push(path.to_string());
+                    }
                 }
             }
             _ => {}
@@ -1078,6 +1148,23 @@ mod tests {
             vec!["a.txt", "c.txt"]
         );
         assert_eq!(st.untracked, vec!["new.txt"]);
+        assert!(!st.untracked_truncated);
+    }
+
+    #[test]
+    fn parse_status_untracked_caps_at_ceiling() {
+        // One more untracked entry than MAX_UNTRACKED allows through: the list
+        // stops exactly at the cap and the truncation flag is set rather than
+        // silently returning a partial list with no indication anything was cut
+        // (#399 — an unbounded untracked pile must never reach the frontend, or
+        // its render, unbounded).
+        let mut out = "# branch.head main\0".to_string();
+        for i in 0..MAX_UNTRACKED + 1 {
+            out.push_str(&format!("? file{i}.txt\0"));
+        }
+        let st = parse_status_v2(&out);
+        assert_eq!(st.untracked.len(), MAX_UNTRACKED);
+        assert!(st.untracked_truncated);
     }
 
     #[test]
@@ -1444,7 +1531,7 @@ mod tests {
         // HEAD explicitly so this doesn't depend on origin (no remote here).
         let wt = git_worktree_add(p(d), "feature/x".into(), Some("HEAD".into())).unwrap();
 
-        let porcelain = git_worktree_list(p(d)).unwrap();
+        let porcelain = git_worktree_list_sync(p(d)).unwrap();
         // The main tree is listed first, then the added one on its branch.
         let first_worktree = porcelain
             .lines()
@@ -1618,7 +1705,7 @@ mod tests {
 
         // No half-created worktree left behind.
         assert!(
-            !git_worktree_list(p(d)).unwrap().contains("agent/x"),
+            !git_worktree_list_sync(p(d)).unwrap().contains("agent/x"),
             "a rejected spawn must not leave a wrong-base worktree behind"
         );
     }
@@ -1652,7 +1739,7 @@ mod tests {
         let err = git_worktree_add(p(d), "agent-w".into(), Some("origin/nope".into())).unwrap_err();
         assert!(!err.is_empty());
         assert!(
-            !git_worktree_list(p(d)).unwrap().contains("agent-w"),
+            !git_worktree_list_sync(p(d)).unwrap().contains("agent-w"),
             "an unresolvable base must not leave a worktree behind"
         );
     }

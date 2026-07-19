@@ -254,6 +254,11 @@ export class GitView {
   private selectedFile: FileSel | null = null;
   private limit = LOG_STEP;
   private firstOpen = true;
+  // Bumped on every renderCommitFiles call; a call whose token goes stale before
+  // its await resolves bails without appending (pre-existing double-append: a
+  // commit click and a refresh's renderBottom for the SAME hash could both pass
+  // the (kind, hash) staleness guard and both append a files column).
+  private commitFilesToken = 0;
 
   private refreshing = false;
   private refreshQueued = false;
@@ -668,6 +673,16 @@ export class GitView {
     const s = this.status;
     if (!s) return 0;
     return s.staged.length + s.unstaged.length + s.untracked.length;
+  }
+
+  /** Display label for the working-row dirty badge: the exact count, or a
+   *  "N+" form when the untracked list was capped (#399) — the true count of
+   *  untracked files can be far higher than what `dirtyCount()` sums, so the
+   *  badge must say so rather than quietly showing a number that looks exact
+   *  but isn't. */
+  private dirtyCountLabel(): string {
+    const dirty = this.dirtyCount();
+    return this.status?.untracked_truncated ? `${dirty}+` : String(dirty);
   }
 
   /** Run a mutating git action, surface errors, refresh either way. */
@@ -1094,7 +1109,7 @@ export class GitView {
           : `Uncommitted changes`
       );
       row.append(dot, label);
-      if (dirty > 0) row.appendChild(el("span", "git-count", String(dirty)));
+      if (dirty > 0) row.appendChild(el("span", "git-count", this.dirtyCountLabel()));
       row.addEventListener("click", () => this.select({ kind: "working" }));
       this.graphListEl.appendChild(row);
     }
@@ -1223,11 +1238,24 @@ export class GitView {
       })
     );
 
+    if (s.untracked_truncated) {
+      // #399: an unbounded untracked pile (a build dir, node_modules before
+      // .gitignore catches it) is capped backend-side rather than rendered one
+      // DOM row per file — never silently, so this says so.
+      this.changesEl.appendChild(
+        el(
+          "div",
+          "git-changes-note",
+          `Showing the first ${s.untracked.length.toLocaleString()} untracked files — narrow with .gitignore to see the rest.`
+        )
+      );
+    }
+
     if (!rw) {
       this.changesEl.appendChild(
         el(
           "div",
-          "git-readonly-note",
+          "git-changes-note",
           "Read-only worktree — unlock (🔒 in the header) to stage, commit, or discard."
         )
       );
@@ -1348,6 +1376,7 @@ export class GitView {
     this.changesEl.replaceChildren();
     if (!this.repoRoot) return;
     const commit = this.commits.find((c) => c.hash === hash);
+    const token = ++this.commitFilesToken;
 
     let files: FileEntry[] = [];
     try {
@@ -1355,7 +1384,12 @@ export class GitView {
     } catch (err) {
       this.toast(String(err));
     }
-    if (this.disposed || this.selection.kind !== "commit" || this.selection.hash !== hash) {
+    if (
+      this.disposed ||
+      this.selection.kind !== "commit" ||
+      this.selection.hash !== hash ||
+      token !== this.commitFilesToken
+    ) {
       return;
     }
 
