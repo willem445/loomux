@@ -27,8 +27,7 @@ import { voiceController, type VoiceTargetPane, type VoicePhase } from "./voicec
 import { pathTail, type ShellKind } from "./panesetup";
 import { invoke } from "@tauri-apps/api/core";
 import { parseOsc52, writeClipboard, readClipboard } from "./clipboard";
-import { keyDisposition, buildTerminalMenu } from "./pasteflow";
-import { showContextMenu } from "./contextmenu";
+import { keyDisposition } from "./pasteflow";
 import { getSettings } from "./settings";
 import {
   checkAttachment,
@@ -790,17 +789,16 @@ export class Pane implements VoiceTargetPane {
 
     // xterm.js binds its OWN native "paste" DOM-event listener directly on
     // its internal textarea/root element (independent of our keydown
-    // handling above), so ANY browser-native paste — the Ctrl+V accelerator
-    // on a rare path this preventDefault doesn't reach, or whatever gesture
-    // WebView2 treats as "paste" on a right-click (#402 live-demo finding 2:
-    // right-click pasted AND opened our menu) — lands there too, double- or
-    // triple-pasting alongside our own explicit readClipboard()-driven paste.
-    // We own paste entirely now; xterm's native path is never wanted. Capture
-    // phase, so this runs BEFORE the event reaches xterm's own listener
-    // (bound to a descendant of termEl, in the bubble phase) no matter what
-    // triggered it. Our own paste calls are `this.term.paste(text)` — a
-    // direct method call that never dispatches a DOM "paste" event — so this
-    // can never block a paste WE intended.
+    // handling above), so ANY browser-native paste — e.g. the Ctrl+V
+    // accelerator on a path this preventDefault doesn't reach — lands there
+    // too, double-pasting alongside our own explicit readClipboard()-driven
+    // paste (#402 live-demo finding). We own paste entirely now; xterm's
+    // native path is never wanted. Capture phase, so this runs BEFORE the
+    // event reaches xterm's own listener (bound to a descendant of termEl,
+    // in the bubble phase) no matter what triggered it. Our own paste calls
+    // are `this.term.paste(text)` — a direct method call that never
+    // dispatches a DOM "paste" event — so this can never block a paste WE
+    // intended.
     this.termEl.addEventListener(
       "paste",
       (e) => {
@@ -810,23 +808,16 @@ export class Pane implements VoiceTargetPane {
       true
     );
 
-    // Right-click copy/paste (#370): every other pane kind gets this for free
-    // from the browser's native textarea/input context menu; the terminal is
-    // a canvas, so it needs its own. Copy is offered-but-disabled without a
-    // selection rather than hidden, so the gesture teaches itself.
-    this.termEl.addEventListener("contextmenu", (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      const sel = this.term.getSelection();
-      const items = buildTerminalMenu(!!sel);
-      showContextMenu(e.clientX, e.clientY, items, (action) => {
-        if (action.kind === "copy") {
-          if (sel) void this.copyToClipboard(sel);
-        } else {
-          void this.pasteFromClipboard();
-        }
-      });
-    });
+    // NOTE (#402 second live-demo round): a right-click Copy/Paste context
+    // menu briefly lived here. Removed — the menu's paste path was
+    // unreliable in practice and the human chose not to iterate on it rather
+    // than keep debugging a second right-click-specific native-event path.
+    // Right-click on a terminal is back to its pre-#370 behavior: nothing (a
+    // no-op past the global `.pane-term` contextmenu preventDefault in
+    // main.ts, which only suppresses the browser's own native menu and
+    // predates this PR). Copy still works via Ctrl+Shift+C above (selection
+    // → copyToClipboard) — see doc/design/clipboard.md's #370 section for
+    // the supported copy/paste surface.
 
     this.el.addEventListener("mousedown", () => {
       this.events.onFocus(this);

@@ -1,6 +1,11 @@
-// Pure copy/paste gesture decisions for terminal panes (#370). DOM-free so
-// node:test can pin the key matching and the right-click menu SHAPE without a
-// browser; contextmenu.ts renders the menu and pane.ts wires the keys/click.
+// Pure copy/paste keydown gesture decisions for terminal panes (#370).
+// DOM-free so node:test can pin the key matching without a browser; pane.ts
+// wires the actual keydown handler. (A right-click Copy/Paste context menu
+// lived here briefly — removed in the #402 second live-demo round: its paste
+// path was unreliable and the human chose not to iterate on a second
+// right-click-specific native-event interaction rather than keep debugging
+// it. Right-click on a terminal is back to doing nothing, its pre-#370
+// state; Ctrl+Shift+C — below — is the supported copy gesture.)
 //
 // THE BUG THIS EXISTS TO FIX. Terminal panes bound paste to Ctrl+Shift+V only
 // (Windows Terminal convention — plain Ctrl+V is a shell's rare "quoted
@@ -21,12 +26,6 @@
 // same call `Alt+V` made from the other direction (#155, shortcuts.ts) —
 // loomux stopped intercepting it once it was shown to steal a key an agent
 // pane needed; Ctrl+V gets the option instead of the same unconditional grab.
-
-// `import type` only — it erases at compile time, so node:test's strip-only
-// TS loader never has to resolve it as a module (a VALUE import of another
-// src file is what it can't do; see filemenu.ts's header for the same
-// discipline, and panemenu.ts for the identical `MenuItem<A>` reuse).
-import type { MenuItem } from "./contextmenu";
 
 /** The subset of a KeyboardEvent the gesture matchers need — kept minimal so
  *  tests build one as a plain object instead of a real DOM event. */
@@ -83,37 +82,11 @@ export function isCopyKey(e: PasteKeyEvent): boolean {
  *  the other, a one-branch typo instead of two independently-fixed call
  *  sites. See pane.ts for the DOM wiring (the preventDefault calls
  *  themselves, and the capture-phase native-`"paste"`-event kill switch that
- *  backstops this for the right-click case, which no keydown disposition
- *  covers at all). */
+ *  backstops this regardless of what triggers the browser's native paste). */
 export type TermKeyDisposition = "copy" | "paste" | "pass";
 
 export function keyDisposition(e: PasteKeyEvent, plainCtrlVPastes: boolean): TermKeyDisposition {
   if (isCopyKey(e)) return "copy";
   if (isPasteKey(e, plainCtrlVPastes)) return "paste";
   return "pass";
-}
-
-export type TermMenuAction = { kind: "copy" } | { kind: "paste" };
-
-export type TermMenuItem = MenuItem<TermMenuAction>;
-
-const NO_SELECTION_REASON = "Select text in the terminal first.";
-
-/** Build the terminal's right-click menu (#370: a discoverable Paste
- *  affordance every pane kind was missing). Copy is offered but disabled
- *  without a selection — visible-but-disabled, same convention filemenu.ts
- *  uses for an inapplicable-not-unsupported item, so right-clicking without a
- *  selection still teaches "Copy lives here" instead of hiding it. Paste is
- *  always offered: an empty clipboard is a harmless no-op (readClipboard),
- *  not a reason to grey the item out. */
-export function buildTerminalMenu(hasSelection: boolean): TermMenuItem[] {
-  return [
-    {
-      label: "Copy",
-      action: { kind: "copy" },
-      disabled: !hasSelection,
-      reason: hasSelection ? undefined : NO_SELECTION_REASON,
-    },
-    { label: "Paste", action: { kind: "paste" } },
-  ];
 }
