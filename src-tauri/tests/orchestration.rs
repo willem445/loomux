@@ -5265,20 +5265,15 @@ fn intake_gate_off_fires_unconditionally_exactly_like_before_332() {
 
 #[test]
 fn intake_gate_skip_for_one_group_never_starves_another_groups_tick_in_the_same_scan() {
-    // rev-31 finding 2 (#329 coexistence seam): `idle_tick_tick` scans every
-    // autonomous orchestrator in ONE pass, and any other per-tick mechanism
-    // that shares this loop in the future (#329's compact-nudge check, which
-    // — per its own design — hangs its own independent latch/quiet-window off
-    // `AgentEntry` and reuses the pure `idle_tick_should_fire`, not this
-    // gate's fields) needs a SKIP decision for one agent to have ZERO effect
-    // on any other agent processed in the same call. This PR can't reference
-    // #329's actual code (not in this tree), so it pins its own half of that
-    // contract directly: a gated-and-skipped group and a plain (gate-off)
-    // group, ticked in the SAME `idle_tick_tick` call, must each resolve
-    // independently — the skip must never short-circuit the scan. Whoever
-    // merges #329 second should re-run this alongside its own idle-tick
-    // suite and confirm a gated skip still lets a coexisting compact-nudge
-    // check fire on schedule (see the PR description's merge-order note).
+    // rev-31 finding 2 (#329 coexistence seam), written while #329 was still not
+    // in this tree: `idle_tick_tick` scans every autonomous orchestrator in ONE
+    // pass, and any other per-tick mechanism sharing this loop needs a SKIP
+    // decision for one agent to have ZERO effect on any other agent processed in
+    // the same call. A gated-and-skipped group and a plain (gate-off) group,
+    // ticked in the SAME `idle_tick_tick` call, must each resolve independently
+    // — the skip must never short-circuit the scan. See the test right below
+    // for the direct #329 cross-feature check, now that #329 has landed and
+    // `compact_nudge_tick` is real code in this tree, not a description of one.
     let (reg, _d, gid_gated, _oid_gated) = autonomous_setup_with_gate(5, 180);
     reg.seed_idle_tick_last_fired(&gid_gated, FAR);
     let g2 = reg.create_group("C:/tmp/repo-plain", rails()).unwrap(); // gate OFF (default)
@@ -5290,6 +5285,50 @@ fn intake_gate_skip_for_one_group_never_starves_another_groups_tick_in_the_same_
     assert_eq!(fired, vec![oid_plain.clone()],
         "the gated group must skip (nothing new) while the plain group in the SAME scan still \
          fires unconditionally — one group's skip must never starve another's tick");
+}
+
+#[test]
+fn intake_gate_skip_never_starves_a_coexisting_compact_nudge_for_the_same_agent() {
+    // rev-31 finding 2, re-verified against #329's ACTUAL final shape (now
+    // merged): compact-nudge is NOT woven into `idle_tick_tick` at all — it is
+    // its own background thread/function (`start_compact_nudge` /
+    // `run_compact_nudge` / `compact_nudge_tick`) with its own anti-nag latch
+    // (`compact_nudge_notified`) and its own output baseline
+    // (`compact_nudge_last_output_total`, deliberately separate from this
+    // gate's `last_output_total` — see that field's doc for the rev-24 finding
+    // this avoids). The only thing the two mechanisms share is a READ of
+    // `AgentEntry.last_progress_ms`, and this gate's skip path never writes to
+    // it differently depending on the gate's verdict. So the direct proof: the
+    // SAME agent, gated-and-skipped on `idle_tick_tick`, must still get a real
+    // `compact_nudge_tick` fire in the same tick window — the skip has zero
+    // effect on the coexisting mechanism.
+    let (reg, _d) = test_registry();
+    let g = reg
+        .create_group(
+            "C:/tmp/repo",
+            Guardrails {
+                intake_poll_minutes: 5,
+                idle_tick_fallback_minutes: 180,
+                compact_nudge_minutes: 20,
+                compact_nudge_roles: vec!["orchestrator".to_string()],
+                ..rails()
+            },
+        )
+        .unwrap();
+    let oid = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap().id;
+    reg.set_autonomous(&g.id, true).unwrap();
+    reg.seed_idle_tick_last_fired(&g.id, FAR);
+
+    let empty = HashMap::new();
+    let now = FAR + 15 * 60_000 + 1;
+    assert!(reg.idle_tick_tick(now, &empty, &empty).is_empty(),
+        "sanity: the intake gate must actually skip here (nothing new, fallback not due)");
+    assert_eq!(
+        reg.compact_nudge_tick(now, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()),
+        vec![oid.clone()],
+        "a gated idle-tick SKIP for this exact agent, at this exact tick, must not stop the \
+         coexisting compact-nudge check from firing for it — the two are fully independent"
+    );
 }
 
 #[test]
