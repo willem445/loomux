@@ -26,6 +26,8 @@
 // pane" contract is unit-tested without a live Tauri window —
 // test/pluginwindow.test.ts).
 
+import type { ExcludeRect } from "./pluginocclusion";
+
 /** A DOM rect in logical/CSS pixels — the shape `getBoundingClientRect()`
  *  returns, reduced to the four fields this module needs. Already in the
  *  SAME coordinate space `Webview.setPosition`/`setSize` expect (both are
@@ -61,6 +63,54 @@ export function pluginWebviewRect(rect: ElementRect): PluginWebviewRect {
     width: Math.max(1, Math.round(rect.width)),
     height: Math.max(1, Math.round(rect.height)),
   };
+}
+
+/** The full native state a single `plugin_set_frame` call applies (#380) —
+ *  bounds and the excluded rects together, since one atomic command sets
+ *  both. Kept here (not `pluginocclusion.ts`) because this module already
+ *  owns `PluginWebviewRect`/the "what to hand the webview" concern this
+ *  extends; `ExcludeRect` is imported type-only, so this doesn't create a
+ *  real runtime dependency cycle with `pluginocclusion.ts` (which already
+ *  imports `ElementRect` from here the same way). */
+export interface PluginFrame {
+  rect: PluginWebviewRect;
+  exclude: ExcludeRect[];
+}
+
+/** Whether `next` is exactly the frame last INTENDED to apply (`last`, null
+ *  before any call has ever succeeded) — rev-67's finding on #414: a
+ *  simultaneous window resize + sessions-panel transition can fire the
+ *  pane's own `window.resize` listener and the sidebar's `poke()`-driven
+ *  recompute (`overlaystate.ts`) for the SAME animation frame, computing the
+ *  identical (bounds, exclude) pair twice — without this check,
+ *  `pluginpaneview.ts`'s `reposition()` would issue two atomic
+ *  `plugin_set_frame` IPC round trips for a frame that changed nothing.
+ *  "Intended" rather than "actually applied and confirmed": `last` is
+ *  recorded synchronously the moment a caller DECIDES to call, before that
+ *  call's own IPC round trip resolves, so a second `reposition()` racing the
+ *  first one's still-pending promise sees the newer intent immediately
+ *  rather than a stale, already-superseded value. Compares by VALUE, not
+ *  reference: `rect`/`exclude` are freshly built plain objects/arrays on
+ *  every `reposition()` call, so `===` would never match even for identical
+ *  geometry. Pure so it's unit-tested without a real command/webview;
+ *  `pluginpaneview.ts` is responsible for clearing its cached `last` back to
+ *  `null` on a native-call failure (so a retry isn't suppressed) and for
+ *  bypassing this check entirely on `"init"` and `"overlay-close"` — the
+ *  first frame a fresh webview ever gets, and the edge that had its own
+ *  separate bug once (#380's close-side fix) and gets no dedupe
+ *  benefit-of-the-doubt as a result. */
+export function frameUnchanged(last: PluginFrame | null, next: PluginFrame): boolean {
+  if (!last) return false;
+  const a = last.rect;
+  const b = next.rect;
+  if (a.x !== b.x || a.y !== b.y || a.width !== b.width || a.height !== b.height) return false;
+  if (last.exclude.length !== next.exclude.length) return false;
+  for (let i = 0; i < last.exclude.length; i++) {
+    const e1 = last.exclude[i];
+    const e2 = next.exclude[i];
+    if (e1.x !== e2.x || e1.y !== e2.y || e1.width !== e2.width || e1.height !== e2.height) return false;
+  }
+  return true;
 }
 
 /** Whether the plugin webview should be shown at all right now. A content
