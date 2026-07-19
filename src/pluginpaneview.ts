@@ -67,16 +67,26 @@ import { overlayState, type OverlayChangeReason } from "./overlaystate";
  *  tab's pane going from `display:none`/zero-size to its real box — not a
  *  separate code path of its own; there's no dedicated tab-switch hook to
  *  distinguish it from any other resize). */
-type RepositionSource = "resize" | "move-notify" | "overlay-open" | "overlay-close" | "init";
+type RepositionSource = "resize" | "move-notify" | "overlay-open" | "overlay-close" | "overlay-poke" | "init";
 
 /** `overlayState.subscribe`'s edge -> the breadcrumb label for it. `"poke"`
  *  (a covering overlay resizing/moving WHILE already open, without a fresh
- *  open/close edge of its own) has no live caller yet (`overlaystate.ts`'s
- *  own doc comment: reserved for an animated/expanding overlay) — mapped to
- *  `"overlay-open"` rather than added as its own `RepositionSource` value,
- *  since nothing currently distinguishes it from a fresh open in practice. */
+ *  open/close edge of its own — `sessions.ts`'s `panelResizeObs` is its first
+ *  production caller, #380 follow-up) maps to its OWN `"overlay-poke"`
+ *  source rather than folding into `"overlay-open"`: an animated overlay's
+ *  poke is a PER-FRAME burst for as long as it's transitioning, the same
+ *  frequency class as a `"resize"` storm, not the rare discrete edge
+ *  `"overlay-open"`/`"overlay-close"` are — `pluginregion.rs`'s
+ *  `should_log_frame` gates `"overlay-poke"` identically to `"resize"`
+ *  (logs only on an actual exclude change or a native failure) for exactly
+ *  that reason; folding it into `"overlay-open"` would have reintroduced the
+ *  per-frame breadcrumb storm that source's own "always logs" gating is
+ *  built to avoid, just triggered by the overlay's geometry instead of the
+ *  pane's own. */
 function overlayReasonToSource(reason: OverlayChangeReason): RepositionSource {
-  return reason === "close" ? "overlay-close" : "overlay-open";
+  if (reason === "close") return "overlay-close";
+  if (reason === "poke") return "overlay-poke";
+  return "overlay-open";
 }
 
 /** What a plugin pane needs to open its window — the CURRENT manifest's fields

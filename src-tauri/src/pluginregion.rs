@@ -171,6 +171,19 @@
 //! the diagnostic signal a live occurrence needs, not storm noise. The
 //! native calls themselves (bounds + region) always run regardless of
 //! whether this application gets logged — only the breadcrumb is gated.
+//!
+//! **`"overlay-poke"` (#380 follow-up): a second high-frequency source, gated
+//! the same way as `"resize"`.** `overlaystate.ts`'s `poke()` lets a DOM
+//! overlay that keeps moving/resizing WHILE OPEN (the sessions sidebar's own
+//! `width` transition — see `sessions.ts`'s `panelResizeObs`) force every
+//! subscribed plugin pane to recompute, on every tick of THAT transition —
+//! the same per-frame frequency class as a `ResizeObserver` burst on the
+//! pane's own element, just driven by a covering overlay's geometry instead
+//! of the pane's own. Mapping it to `"overlay-open"` (an always-logs,
+//! "comparatively rare" source) would reintroduce the exact per-frame
+//! file-I/O storm `"resize"`'s gate exists to prevent, just from the other
+//! direction. `should_log_frame` therefore gates `"overlay-poke"` identically
+//! to `"resize"`: logs only when `exclude_changed` or a native call failed.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -249,9 +262,12 @@ fn exclude_changed(last_logged: Option<&[OcclusionRect]>, current: &[OcclusionRe
 /// rationale). `native_ok` is false for ANY failure (bounds not applied,
 /// HWND/region lookup failed, `SetWindowRgn` itself failed) — always logged,
 /// regardless of source, since a failure is exactly what the next live
-/// occurrence needs evidence of. Otherwise: `"resize"` (the actual storm
-/// source — a divider drag or the sidebar's own CSS transition fires a
-/// burst of these) only logs when `exclude_changed`; every other source
+/// occurrence needs evidence of. Otherwise: `"resize"` and `"overlay-poke"`
+/// (the two actual storm sources — a divider drag or the sidebar's own CSS
+/// transition fires a burst of the former from the pane's own
+/// `ResizeObserver`, the latter from `overlaystate.ts`'s `poke()` on that
+/// SAME transition, see this module's doc comment's `"overlay-poke"`
+/// section) only log when `exclude_changed`; every other source
 /// (`"overlay-open"`/`"overlay-close"`/`"move-notify"`/`"init"`, and
 /// anything not yet named) is a comparatively rare, discrete event and
 /// always logs. Pure so it's unit-tested without a real command/webview.
@@ -259,7 +275,7 @@ fn should_log_frame(source: &str, exclude_changed: bool, native_ok: bool) -> boo
     if !native_ok {
         return true;
     }
-    if source != "resize" {
+    if source != "resize" && source != "overlay-poke" {
         return true;
     }
     exclude_changed
@@ -273,8 +289,8 @@ fn should_log_frame(source: &str, exclude_changed: bool, native_ok: bool) -> boo
 /// setPosition`/`setSize` separately, as `pluginpaneview.ts` used to) is the
 /// actual fix, not a stylistic simplification. `source` is an opaque label
 /// the frontend passes through for the breadcrumb below (`resize` |
-/// `move-notify` | `overlay-open` | `overlay-close`, `pluginpaneview.ts`'s
-/// `RepositionSource`) — never validated against a closed enum, since it
+/// `move-notify` | `overlay-open` | `overlay-close` | `overlay-poke`,
+/// `pluginpaneview.ts`'s `RepositionSource`) — never validated against a closed enum, since it
 /// only ever ends up in a log line and main is fully trusted already (see
 /// `validate_label`). `pluginpaneview.ts`'s `reposition()` calls this every
 /// time this pane's box or the set of covering overlays could have changed.
@@ -532,6 +548,7 @@ mod tests {
     fn should_log_frame_always_logs_a_native_failure_regardless_of_source_or_change() {
         assert!(should_log_frame("resize", false, false));
         assert!(should_log_frame("overlay-open", false, false));
+        assert!(should_log_frame("overlay-poke", false, false));
     }
 
     #[test]
@@ -540,6 +557,18 @@ mod tests {
         // case) is exactly what must NOT log, or NB-1 recurs.
         assert!(!should_log_frame("resize", false, true));
         assert!(should_log_frame("resize", true, true));
+    }
+
+    #[test]
+    fn should_log_frame_gates_overlay_poke_the_same_as_resize() {
+        // #380 follow-up: `overlay-poke` (the sessions sidebar's own
+        // transition re-triggering every plugin pane, `sessions.ts`'s
+        // `panelResizeObs`) is the SECOND high-frequency source — it must be
+        // gated identically to `resize`, or wiring `poke()` into production
+        // reintroduces the exact per-frame log storm `resize`'s gate exists
+        // to prevent.
+        assert!(!should_log_frame("overlay-poke", false, true));
+        assert!(should_log_frame("overlay-poke", true, true));
     }
 
     #[test]

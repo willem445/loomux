@@ -11,6 +11,20 @@
 // (`closeOverlayAfterTransition`, below) — closing it the instant `.hidden`
 // lands used to leave the plugin unclipped over the still-visually-shrinking
 // sidebar for the whole ~240ms `#sessions`'s `width` transition takes.
+//
+// #380 residual (`panelResizeObs`, below): registering/releasing the overlay
+// slot on the open/close EDGE isn't enough by itself — a plugin pane's own
+// occlusion only refires on ITS OWN triggers (its own `ResizeObserver`, an
+// overlay open/close edge, a window resize), none of which fire on every
+// frame of THIS panel's own `width` transition. The single "open" edge fires
+// synchronously inside `toggle()`, a tick before the transition's first
+// frame, so it captures the sidebar at its PRE-expansion (still ~0) width —
+// after that, nothing forced a recompute until some unrelated later event
+// (another overlay's own open/close, a window resize) happened to trigger
+// one, which is exactly the "plugin bleeds for a few seconds, then corrects"
+// live report. `overlaystate.ts`'s `poke()` exists precisely for "an overlay
+// that moves/resizes while open" but had no production caller before this —
+// `panelResizeObs` is that caller, on both the open AND close transition.
 
 import { listSessions, type SessionInfo } from "./pty";
 import type { SessionRoleInfo } from "./orchestration";
@@ -58,6 +72,15 @@ export class SessionBrowser {
    *  does). See `closeOverlayAfterTransition`'s doc comment for why the
    *  overlay slot can't just close the instant the `.hidden` class lands. */
   private pendingClose: (() => void) | null = null;
+  /** Forces every subscribed plugin pane to recompute occlusion on every
+   *  tick of `#sessions`'s own `width` transition (#380 residual, see this
+   *  file's header comment) — idle the rest of the time, since a
+   *  `ResizeObserver` only fires when the observed box's size actually
+   *  changes, which for this element only happens during that transition.
+   *  Lives for the component's whole lifetime (constructed once in
+   *  `main.ts`, never disposed) rather than being attached/detached per
+   *  open/close, since there's no ongoing cost to leaving it idle. */
+  private readonly panelResizeObs: ResizeObserver;
 
   constructor(
     private el: HTMLElement,
@@ -89,6 +112,17 @@ export class SessionBrowser {
     inner.className = "sessions-inner";
     inner.append(head, this.searchEl, this.listEl);
     this.el.appendChild(inner);
+
+    // #380 residual: re-poke the overlay registry on every tick of `#sessions`'s
+    // own open/close transition (see `panelResizeObs`'s field doc comment), plus
+    // a `transitionend` backstop for the final frame in case a tick lands after
+    // the observer's last callback — the same belt-and-suspenders reasoning
+    // `closeOverlayAfterTransition` already uses for this exact transition.
+    this.panelResizeObs = new ResizeObserver(() => overlayState.poke());
+    this.panelResizeObs.observe(this.el);
+    this.el.addEventListener("transitionend", (e) => {
+      if (e.target === this.el && e.propertyName === "width") overlayState.poke();
+    });
   }
 
   get visible(): boolean {
