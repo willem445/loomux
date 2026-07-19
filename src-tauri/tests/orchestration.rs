@@ -5753,31 +5753,47 @@ fn compact_escalation_notice_names_the_percent_and_the_recovery_move() {
     assert!(n.contains("request_compact"), "got: {n}");
 }
 
-// ---------- compact-nudge min-context floor (benchtest finding) ----------
+// ---------- compact-nudge min-context floor (benchtest finding + smart default) ----------
 
 #[test]
-fn compact_nudge_context_floor_met_off_always_allows() {
-    assert!(compact_nudge_context_floor_met(Some(10), 0), "floor 0 = off, any reading passes");
-    assert!(compact_nudge_context_floor_met(None, 0));
+fn compact_nudge_context_floor_met_unset_applies_the_smart_default_only_when_nudge_is_on() {
+    // None (unset) + parent feature ON: the 50% smart default applies —
+    // zero config needed to get the fix a live benchtest showed was missing.
+    assert!(!compact_nudge_context_floor_met(Some(30), None, 20), "30% is under the smart default (50%)");
+    assert!(compact_nudge_context_floor_met(Some(60), None, 20), "60% clears the smart default (50%)");
+    // None (unset) + parent feature OFF: inert — there's nothing to gate
+    // either way (the heuristic itself never fires when compact_nudge_minutes
+    // is 0), but the function must still read as "met" on its own terms.
+    assert!(compact_nudge_context_floor_met(Some(5), None, 0));
 }
 
 #[test]
-fn compact_nudge_context_floor_met_gates_below_the_floor() {
-    assert!(!compact_nudge_context_floor_met(Some(30), 50), "below the floor must not allow the heuristic fire");
-    assert!(compact_nudge_context_floor_met(Some(50), 50), "exactly at the floor allows it");
-    assert!(compact_nudge_context_floor_met(Some(80), 50));
+fn compact_nudge_context_floor_met_explicit_zero_disables_regardless_of_parent() {
+    assert!(compact_nudge_context_floor_met(Some(1), Some(0), 20), "explicit Some(0) = disabled, any reading passes");
+    assert!(compact_nudge_context_floor_met(None, Some(0), 20));
+}
+
+#[test]
+fn compact_nudge_context_floor_met_explicit_value_gates_at_that_value() {
+    assert!(!compact_nudge_context_floor_met(Some(30), Some(70), 20), "below an explicit 70% floor");
+    assert!(compact_nudge_context_floor_met(Some(70), Some(70), 20), "exactly at an explicit floor allows it");
+    assert!(compact_nudge_context_floor_met(Some(80), Some(70), 20));
 }
 
 #[test]
 fn compact_nudge_context_floor_met_fails_open_with_no_reading() {
     // A missing/stale context reading must never silently disable the whole
     // heuristic nudge — degrade, don't deny (the same posture #332's intake
-    // gate takes on a `gh` failure).
-    assert!(compact_nudge_context_floor_met(None, 50));
+    // gate takes on a `gh` failure) — true under every floor state.
+    assert!(compact_nudge_context_floor_met(None, None, 20), "smart default, no reading");
+    assert!(compact_nudge_context_floor_met(None, Some(70), 20), "explicit floor, no reading");
 }
 
 #[test]
-fn compact_nudge_heuristic_fire_gated_by_min_context_percent() {
+fn compact_nudge_heuristic_fire_gated_by_the_smart_default_with_zero_config() {
+    // The whole point of the smart default: enabling ONLY compact_nudge_minutes
+    // (no min-context field touched at all — `..rails()`'s derived None) must
+    // already reproduce the fix the benchtest needed.
     let (reg, _d) = test_registry();
     let g = reg
         .create_group(
@@ -5785,37 +5801,65 @@ fn compact_nudge_heuristic_fire_gated_by_min_context_percent() {
             Guardrails {
                 compact_nudge_minutes: 20,
                 compact_nudge_roles: vec!["orchestrator".to_string()],
-                compact_nudge_min_context_percent: 50,
+                // compact_nudge_min_context_percent deliberately untouched — None.
+                ..rails()
+            },
+        )
+        .unwrap();
+    assert_eq!(reg.group(&g.id).unwrap().guardrails.compact_nudge_min_context_percent, None,
+        "sanity: nothing configured it — still unset after clamped()");
+    let o = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let empty = HashMap::new();
+
+    // Below the smart default (50%): the lull alone must not fire.
+    let low_context: HashMap<String, u32> = [(o.id.clone(), 30u32)].into_iter().collect();
+    assert!(
+        reg.compact_nudge_tick(FAR, &empty, &HashMap::new(), &low_context, &HashMap::new(), &HashMap::new(), &HashMap::new())
+            .is_empty(),
+        "context 30% is under the smart 50% default — the heuristic nudge must not fire, with NO config"
+    );
+    assert_eq!(audit_count(&reg, &g.id, "compact-nudge"), 0);
+
+    // Above the smart default: fires normally.
+    let high_context: HashMap<String, u32> = [(o.id.clone(), 60u32)].into_iter().collect();
+    assert_eq!(
+        reg.compact_nudge_tick(FAR, &empty, &HashMap::new(), &high_context, &HashMap::new(), &HashMap::new(), &HashMap::new()),
+        vec![o.id.clone()],
+        "context 60% clears the smart 50% default — the heuristic nudge fires"
+    );
+}
+
+#[test]
+fn compact_nudge_heuristic_fire_gated_by_an_explicit_min_context_percent() {
+    let (reg, _d) = test_registry();
+    let g = reg
+        .create_group(
+            "C:/tmp/repo",
+            Guardrails {
+                compact_nudge_minutes: 20,
+                compact_nudge_roles: vec!["orchestrator".to_string()],
+                compact_nudge_min_context_percent: Some(70),
                 ..rails()
             },
         )
         .unwrap();
     let o = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
     let empty = HashMap::new();
-
-    // Below the floor: the lull alone must not fire.
-    let low_context: HashMap<String, u32> = [(o.id.clone(), 30u32)].into_iter().collect();
+    let mid_context: HashMap<String, u32> = [(o.id.clone(), 60u32)].into_iter().collect();
     assert!(
-        reg.compact_nudge_tick(FAR, &empty, &HashMap::new(), &low_context, &HashMap::new(), &HashMap::new(), &HashMap::new())
+        reg.compact_nudge_tick(FAR, &empty, &HashMap::new(), &mid_context, &HashMap::new(), &HashMap::new(), &HashMap::new())
             .is_empty(),
-        "context 30% is under the 50% floor — the heuristic nudge must not fire"
+        "60% clears the smart default but not an explicit 70% floor"
     );
-    assert_eq!(audit_count(&reg, &g.id, "compact-nudge"), 0);
-
-    // Above the floor: fires normally, same as pre-floor behavior.
-    let high_context: HashMap<String, u32> = [(o.id.clone(), 60u32)].into_iter().collect();
+    let high_context: HashMap<String, u32> = [(o.id.clone(), 75u32)].into_iter().collect();
     assert_eq!(
         reg.compact_nudge_tick(FAR, &empty, &HashMap::new(), &high_context, &HashMap::new(), &HashMap::new(), &HashMap::new()),
-        vec![o.id.clone()],
-        "context 60% clears the 50% floor — the heuristic nudge fires"
+        vec![o.id.clone()]
     );
 }
 
 #[test]
-fn compact_nudge_request_compact_fires_below_the_floor_agent_judgment_wins() {
-    // The floor gates loomux's OWN unprompted (lull-timer) judgment only — an
-    // agent that explicitly asked via `request_compact` is always honored,
-    // regardless of context%.
+fn compact_nudge_heuristic_fire_not_gated_when_explicitly_disabled() {
     let (reg, _d) = test_registry();
     let g = reg
         .create_group(
@@ -5823,7 +5867,33 @@ fn compact_nudge_request_compact_fires_below_the_floor_agent_judgment_wins() {
             Guardrails {
                 compact_nudge_minutes: 20,
                 compact_nudge_roles: vec!["orchestrator".to_string()],
-                compact_nudge_min_context_percent: 50,
+                compact_nudge_min_context_percent: Some(0), // explicit opt-out
+                ..rails()
+            },
+        )
+        .unwrap();
+    let o = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let empty = HashMap::new();
+    let low_context: HashMap<String, u32> = [(o.id.clone(), 5u32)].into_iter().collect();
+    assert_eq!(
+        reg.compact_nudge_tick(FAR, &empty, &HashMap::new(), &low_context, &HashMap::new(), &HashMap::new(), &HashMap::new()),
+        vec![o.id.clone()],
+        "explicit Some(0) must restore the pre-smart-default behavior — fire on the lull alone"
+    );
+}
+
+#[test]
+fn compact_nudge_request_compact_fires_below_the_smart_default_agent_judgment_wins() {
+    // The floor gates loomux's OWN unprompted (lull-timer) judgment only — an
+    // agent that explicitly asked via `request_compact` is always honored,
+    // regardless of context%, even under the zero-config smart default.
+    let (reg, _d) = test_registry();
+    let g = reg
+        .create_group(
+            "C:/tmp/repo",
+            Guardrails {
+                compact_nudge_minutes: 20,
+                compact_nudge_roles: vec!["orchestrator".to_string()],
                 ..rails()
             },
         )
@@ -5841,11 +5911,22 @@ fn compact_nudge_request_compact_fires_below_the_floor_agent_judgment_wins() {
 }
 
 #[test]
-fn compact_nudge_min_context_percent_defaults_off_and_clamps() {
-    let g = Guardrails { compact_nudge_min_context_percent: 0, ..rails() }.clamped();
-    assert_eq!(g.compact_nudge_min_context_percent, 0, "off by default — no floor unless configured");
-    let g = Guardrails { compact_nudge_min_context_percent: 250, ..rails() }.clamped();
-    assert_eq!(g.compact_nudge_min_context_percent, 100, "clamps to the 100% ceiling");
+fn compact_nudge_min_context_percent_stays_unset_when_the_parent_heuristic_is_off() {
+    // None + compact_nudge_minutes == 0: nothing to gate, and clamped() must
+    // NOT resolve the smart default just because the field is unset — the
+    // resolution is deliberately deferred to gate-evaluation time.
+    let g = Guardrails { compact_nudge_minutes: 0, ..rails() }.clamped();
+    assert_eq!(g.compact_nudge_min_context_percent, None);
+}
+
+#[test]
+fn compact_nudge_min_context_percent_explicit_values_survive_clamping() {
+    let g = Guardrails { compact_nudge_min_context_percent: Some(0), ..rails() }.clamped();
+    assert_eq!(g.compact_nudge_min_context_percent, Some(0), "an explicit 0 (opt-out) must survive, not become None");
+    let g = Guardrails { compact_nudge_min_context_percent: Some(250), ..rails() }.clamped();
+    assert_eq!(g.compact_nudge_min_context_percent, Some(100), "clamps to the 100% ceiling");
+    let g = Guardrails { compact_nudge_min_context_percent: None, ..rails() }.clamped();
+    assert_eq!(g.compact_nudge_min_context_percent, None, "unset stays unset — clamped() never resolves it");
 }
 
 #[test]

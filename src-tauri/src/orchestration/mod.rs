@@ -1166,6 +1166,13 @@ const INFERENCE_ARM_COOLDOWN_MS: u64 = 3 * 60_000;
 /// (effectively disabled in practice, since the CLI's own emergency
 /// auto-compact would already have fired by then).
 const MAX_COMPACT_CONTEXT_THRESHOLD_PERCENT: u32 = 100;
+/// Compact-nudge min-context floor (benchtest finding, rev-65 smart-default
+/// round): the floor applied when `Guardrails.compact_nudge_min_context_percent`
+/// is `None` (unset) AND the parent heuristic is on (`compact_nudge_minutes >
+/// 0`) — see `compact_nudge_context_floor_met`. Chosen so enabling the
+/// quiet-window alone is enough to avoid the exact waste the live benchtest
+/// found (real compactions at 20-31% full) with zero additional config.
+const DEFAULT_COMPACT_NUDGE_MIN_CONTEXT_PERCENT: u32 = 50;
 // Compact-nudge (#328): the context window for `latest_context_tokens`-based
 // percent calculations used to be a single flat constant here
 // (`CLAUDE_CONTEXT_WINDOW_TOKENS`, 200K) — a documented assumption, not a
@@ -1915,20 +1922,33 @@ pub struct Guardrails {
     /// volume this feature exists to cut) is the sane default. Persisted in
     /// group.json, live-settable via `set_compact_nudge_roles`.
     pub compact_nudge_roles: Vec<String>,
-    /// Compact-nudge min-context floor (benchtest finding): the HEURISTIC
-    /// (lull-timer) fire additionally requires the agent's last context-
-    /// percent reading to be at/above this floor — see
-    /// `compact_nudge_context_floor_met`. Never applied to an agent's own
-    /// `request_compact` (always honored regardless of context%): this is a
-    /// floor on loomux's *unprompted* judgment, not the agent's. `0` = off
-    /// (today's behavior, fire on the lull alone) — like `compact_nudge_
-    /// minutes`, not like `idle_tick_minutes`: 0 is a real value here, not
-    /// "unset → default", because this sub-setting only matters once the
-    /// parent feature is already on and must not silently opt every group
-    /// that enables compact-nudge into a floor nobody configured. Nonzero is
-    /// clamped to `1..=100`. Persisted in group.json, live-settable via
-    /// `set_compact_nudge_min_context_percent`.
-    pub compact_nudge_min_context_percent: u32,
+    /// Compact-nudge min-context floor (benchtest finding, smart-default
+    /// round): the HEURISTIC (lull-timer) fire additionally requires the
+    /// agent's last context-percent reading to be at/above a floor — see
+    /// `compact_nudge_context_floor_met`, which is where all three states
+    /// below actually resolve (deliberately NOT resolved here in `clamped()`,
+    /// so a group that turns `compact_nudge_minutes` on LATER via a live
+    /// setter still gets the smart default immediately, with no re-launch).
+    /// Never applied to an agent's own `request_compact` (always honored
+    /// regardless of context%): this is a floor on loomux's *unprompted*
+    /// judgment, not the agent's. Tri-state, `Option<u32>` (the same "let a
+    /// real value distinguish from absence" idiom `context_window_tokens_
+    /// override` already uses in this struct):
+    /// - `None` (unset — absent from group.json, or never explicitly set):
+    ///   the **smart default** applies automatically — `DEFAULT_COMPACT_
+    ///   NUDGE_MIN_CONTEXT_PERCENT` (50) whenever `compact_nudge_minutes >
+    ///   0`, otherwise inert (the parent feature is off, so there is nothing
+    ///   to gate). Zero setup: a group that enables the quiet-window alone
+    ///   already gets the floor a live benchtest showed was needed.
+    /// - `Some(0)`: explicitly disabled — fire on the lull alone, no context
+    ///   check at all (today's pre-smart-default behavior, preserved as an
+    ///   explicit opt-out).
+    /// - `Some(n)`, `n > 0`: an explicit floor, clamped to `1..=100`.
+    /// Persisted in group.json (as `null`/absent for `None`, an integer
+    /// otherwise), live-settable via `set_compact_nudge_min_context_percent`
+    /// (which always sets an explicit `Some`, never restores `None` — once a
+    /// human has touched the control, that IS the explicit choice).
+    pub compact_nudge_min_context_percent: Option<u32>,
     /// Compact-nudge (#328): percent of the Claude context window
     /// (`effective_context_window_tokens`, round 7: model-aware, was a flat
     /// constant) an eligible agent's context must cross
@@ -2072,9 +2092,12 @@ impl Guardrails {
         // eligibility. See `canonicalize_compact_nudge_roles` for why survivors
         // are also case-normalized, not just filtered.
         self.compact_nudge_roles = canonicalize_compact_nudge_roles(self.compact_nudge_roles);
-        // Min-context floor: 0 stays 0 (off, mirroring compact_nudge_minutes'
-        // own convention) — only cap a too-large value.
-        self.compact_nudge_min_context_percent = self.compact_nudge_min_context_percent.min(100);
+        // Min-context floor: `None` (unset) is left untouched here on purpose
+        // — the smart default resolves at gate-evaluation time
+        // (`compact_nudge_context_floor_met`), not here, so a group that
+        // enables `compact_nudge_minutes` LATER via a live setter still gets
+        // it without a re-launch. Only an explicit `Some` gets capped.
+        self.compact_nudge_min_context_percent = self.compact_nudge_min_context_percent.map(|p| p.min(100));
         // Compact-nudge (#328): 0 stays 0 (off) — only cap a too-large value.
         self.compact_context_threshold_percent =
             self.compact_context_threshold_percent.min(MAX_COMPACT_CONTEXT_THRESHOLD_PERCENT);
@@ -2680,23 +2703,39 @@ pub fn compact_escalation_should_fire(
 /// wasn't actually full). Gates only the HEURISTIC (lull-timer) fire —
 /// `compact_nudge_tick`'s call site never applies this to `requested_fires`
 /// (an agent's own `request_compact` is always honored; this is a floor on
-/// loomux's own unprompted judgment, not on the agent's). `floor_percent == 0`
-/// is today's behavior (no floor — fire on the lull alone), matching
-/// `compact_nudge_minutes`'s own "0 means off" convention rather than
-/// `idle_tick_minutes`'s "0 means unset → default": this sub-setting only
-/// means anything once the parent feature is already on, so it inherits that
-/// feature's off-by-default posture rather than silently opting every group
-/// that enables compact-nudge into a floor nobody asked for. A reading not
-/// yet available (`percent: None`) fails OPEN — never let a missing/stale
-/// context reading silently disable the whole heuristic nudge, the same
+/// loomux's own unprompted judgment, not on the agent's).
+///
+/// **Smart default, resolved HERE rather than in `Guardrails::clamped()`**
+/// (rev-65 review round): resolving it at gate-evaluation time, from the
+/// live `compact_nudge_minutes` value every tick already reads, means a
+/// group that turns the heuristic on LATER via a live setter gets the floor
+/// immediately — no re-launch, no re-normalization pass needed. `floor_config`
+/// is the tri-state `Guardrails.compact_nudge_min_context_percent`:
+/// - `None` (unset): the floor is `DEFAULT_COMPACT_NUDGE_MIN_CONTEXT_PERCENT`
+///   (50) whenever the parent feature is on (`nudge_minutes > 0`) — zero
+///   config needed to get the fix a live benchtest showed was necessary —
+///   and inert (no floor) when the parent is off, since there is nothing to
+///   gate either way.
+/// - `Some(0)`: explicitly disabled — fire on the lull alone, matching the
+///   pre-smart-default behavior, preserved as an explicit opt-out.
+/// - `Some(n)`, `n > 0`: an explicit floor.
+///
+/// A reading not yet available (`percent: None`) fails OPEN regardless of
+/// which state the floor resolves to — never let a missing/stale context
+/// reading silently disable the whole heuristic nudge, the same
 /// "degrade, don't deny" posture every other opportunistic gate in this
 /// codebase takes.
-pub fn compact_nudge_context_floor_met(percent: Option<u32>, floor_percent: u32) -> bool {
-    if floor_percent == 0 {
+pub fn compact_nudge_context_floor_met(percent: Option<u32>, floor_config: Option<u32>, nudge_minutes: u32) -> bool {
+    let effective_floor = match floor_config {
+        None if nudge_minutes > 0 => DEFAULT_COMPACT_NUDGE_MIN_CONTEXT_PERCENT,
+        None => 0, // parent feature off — nothing to gate; the floor is moot either way
+        Some(explicit) => explicit,
+    };
+    if effective_floor == 0 {
         return true;
     }
     match percent {
-        Some(p) => p >= floor_percent,
+        Some(p) => p >= effective_floor,
         None => true,
     }
 }
@@ -6989,8 +7028,10 @@ impl OrchRegistry {
                     .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
                     .unwrap_or_default(),
                 // Min-context floor (benchtest finding): absent → 0 → off.
+                // Tri-state: absent/null → None (unset — the smart default
+                // resolves at gate-evaluation time, not here).
                 compact_nudge_min_context_percent:
-                    g["compact_nudge_min_context_percent"].as_u64().unwrap_or(0) as u32,
+                    g["compact_nudge_min_context_percent"].as_u64().map(|v| v as u32),
                 // Compact-nudge context escalation (#328): absent → 0 → off.
                 compact_context_threshold_percent:
                     g["compact_context_threshold_percent"].as_u64().unwrap_or(0) as u32,
@@ -7283,7 +7324,7 @@ impl OrchRegistry {
                 // raw disk read that never went through it).
                 guardrails.compact_nudge_roles = canonicalize_compact_nudge_roles(persisted.compact_nudge_roles);
                 guardrails.compact_nudge_min_context_percent =
-                    persisted.compact_nudge_min_context_percent.min(100);
+                    persisted.compact_nudge_min_context_percent.map(|p| p.min(100));
                 guardrails.compact_context_threshold_percent = persisted
                     .compact_context_threshold_percent
                     .min(MAX_COMPACT_CONTEXT_THRESHOLD_PERCENT);
@@ -9895,6 +9936,7 @@ impl OrchRegistry {
                     && compact_nudge_context_floor_met(
                         context_percents.get(&a.id).copied(),
                         g.compact_nudge_min_context_percent,
+                        g.compact_nudge_minutes,
                     );
                 // Agent-requested (via `request_compact`, or set on its
                 // behalf by escalation BELOW, one tick later than before this
@@ -11162,10 +11204,11 @@ impl OrchRegistry {
     }
 
     /// Set a live group's compact-nudge min-context floor on the fly
-    /// (benchtest finding). `0` disables the floor (heuristic fires on the
-    /// lull alone, today's behavior) — only capped at 100, never floored to a
-    /// default, the same "0 is a real off" shape `compact_nudge_minutes`/
-    /// `compact_context_threshold_percent` already use. Written to the
+    /// (benchtest finding). Always sets an EXPLICIT value (`Some`) — this
+    /// setter can never restore the tri-state's `None`/unset (the smart
+    /// default); once a human has touched the control, that IS the explicit
+    /// choice, including `0` (explicitly disabled — heuristic fires on the
+    /// lull alone, no context check). Only capped at 100. Written to the
     /// in-memory guardrail and persisted, then audited. Returns the applied
     /// (clamped) value. Never gates `request_compact` itself — see
     /// `compact_nudge_context_floor_met`'s doc.
@@ -11176,7 +11219,7 @@ impl OrchRegistry {
             .ok_or("unknown group")?
             .guardrails
             .compact_nudge_min_context_percent;
-        if applied == old {
+        if old == Some(applied) {
             return Ok(applied);
         }
         self.persist_guardrail_u64(group, "compact_nudge_min_context_percent", applied as u64)?;
@@ -11185,7 +11228,7 @@ impl OrchRegistry {
             .get_mut(group)
             .ok_or("unknown group")?
             .guardrails
-            .compact_nudge_min_context_percent = applied;
+            .compact_nudge_min_context_percent = Some(applied);
         self.audit(group, "human", "compact-nudge-min-context-percent-set",
             json!({ "from": old, "to": applied }));
         Ok(applied)
@@ -15673,9 +15716,12 @@ pub fn create_orchestration(
             // orch_set_compact_nudge_minutes/orch_set_compact_nudge_roles.
             compact_nudge_minutes: 0,
             compact_nudge_roles: Vec::new(),
-            // Min-context floor: off at launch; live-settable via
-            // orch_set_compact_nudge_min_context_percent.
-            compact_nudge_min_context_percent: 0,
+            // Min-context floor: unset at launch — the smart default (50%)
+            // applies automatically once compact_nudge_minutes is turned on
+            // (live or otherwise), with zero config. live-settable via
+            // orch_set_compact_nudge_min_context_percent (which always sets
+            // an explicit value, never restores this None).
+            compact_nudge_min_context_percent: None,
             // #328: off at launch; live-settable via orch_set_compact_context_threshold.
             compact_context_threshold_percent: 0,
             // Context-window override (PR #329 round 7): no launcher field

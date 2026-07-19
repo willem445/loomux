@@ -181,6 +181,18 @@ so far:
     gated. `worker.md`/`reviewer.md`/`planner.md` are untouched by this one too (compact-nudge is
     orchestrator-only by default).
 
+- **Smart-default re-blessing (rev-65's review of the min-context floor above)** —
+  `orchestrator.md` only. The floor as first shipped was a plain `u32` defaulting to `0`
+  (off) — a re-benchtest at default config would have reproduced the exact over-compaction
+  the floor exists to fix, since nothing turns it on without a manual setter call.
+  `compact_nudge_min_context_percent` is now tri-state (`Option<u32>`: unset → the 50%
+  smart default applies automatically the moment the quiet-window (`compact_nudge_minutes`)
+  is on; explicit `0` → floor disabled; explicit `N` → `N`), resolved fresh on every gate
+  check rather than baked in at group creation, so turning the quiet-window on later still
+  gets the default with no re-launch. `orchestrator.md`'s **Compact at lulls** paragraph is
+  reworded to say the floor is "automatic the moment the quiet-window is on, nothing to
+  configure" instead of describing a value the operator would otherwise have had to set.
+
 `the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was` renders
 **these** with the six pre-#222 template variables and asserts that a group launched
 with the advanced orchestrator **off** gets exactly that text. They are the

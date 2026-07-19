@@ -822,13 +822,14 @@ when the whole value is "the next orchestrator should just already know this."
   only ever lived in conversation does not, which is exactly what the directive ledger below is
   for.
   **Every compact costs a full re-grounding cycle, not just the summary** — don't call
-  `request_compact` at every lull out of habit. loomux's own unprompted lull nudge now checks a
-  minimum context level before it pastes `/compact` on your behalf (a benchtest session found
-  several real compactions firing at only 20-30% full — the right quiet moment, the wrong context
-  level, paid for anyway). `request_compact` itself is always honored immediately, at any context
-  level — that's your judgment call, not loomux's — but a lull alone is not a reason: don't
-  compact below roughly 50% unless you have a specific reason (you're about to do something that
-  will need the headroom, or you're already close to the next natural lull anyway).
+  `request_compact` at every lull out of habit. loomux's own unprompted lull nudge checks a
+  minimum context level (50% by default — automatic the moment the quiet-window is on, nothing to
+  configure) before it pastes `/compact` on your behalf (a benchtest session found several real
+  compactions firing at only 20-30% full — the right quiet moment, the wrong context level, paid
+  for anyway). `request_compact` itself is always honored immediately, at any context level —
+  that's your judgment call, not loomux's — but a lull alone is not a reason: don't compact below
+  that same 50% unless you have a specific reason (you're about to do something that will need the
+  headroom, or you're already close to the next natural lull anyway).
 - **Directive ledger.** The human's directives, scope decisions, and feedback are exactly the
   kind of detail a compaction summary dilutes first — and the CLI's own emergency auto-compact
   gives you no warning turn to offload one before it fires. So don't wait for a lull: the moment

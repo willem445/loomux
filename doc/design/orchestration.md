@@ -2010,24 +2010,47 @@ was doing exactly its job (firing at a genuinely idle moment); the missing piece
 awareness of *how full the pane actually was* before paying a full re-grounding cycle for it —
 right timing, wrong context level.
 
-- **The floor gates the HEURISTIC fire only.** `Guardrails.compact_nudge_min_context_percent`
-  (`0` = off, matching `compact_nudge_minutes`'s own "0 is a real off" idiom rather than
-  `idle_tick_minutes`'s "0 → default" one — this sub-setting only means anything once the parent
-  feature is already on) is checked by `compact_nudge_context_floor_met` and ANDed into
-  `heuristic_fires` alongside the existing role/threshold checks in `compact_nudge_tick`. It is
-  never applied to `requested_fires` (`request_compact`) — an agent that explicitly asks is
-  always honored regardless of context%, exactly per #328's original framing: loomux's own
-  unprompted judgment is what gets a floor, not the agent's.
-- **Fails open with no reading.** `compact_nudge_context_floor_met(None, floor)` returns `true` —
-  a missing/stale context-percent reading must never silently disable the whole heuristic nudge,
-  the same "degrade, don't deny" posture #332's intake gate takes on a `gh` failure.
+- **The floor gates the HEURISTIC fire only.** `Guardrails.compact_nudge_min_context_percent` is
+  checked by `compact_nudge_context_floor_met` and ANDed into `heuristic_fires` alongside the
+  existing role/threshold checks in `compact_nudge_tick`. It is never applied to `requested_fires`
+  (`request_compact`) — an agent that explicitly asks is always honored regardless of context%,
+  exactly per #328's original framing: loomux's own unprompted judgment is what gets a floor, not
+  the agent's.
+- **Smart default (rev-65 review round): tri-state `Option<u32>`, resolved at the GATE, not at
+  `clamped()`.** A first cut shipped this as a plain `u32` with "0 = off" — but that shape asked
+  the human to configure a percentage just to get a fix for a problem they didn't cause, and the
+  reviewer flagged that a re-benchtest at the (then) default config would reproduce the exact
+  over-compaction the finding was about. The fix: `None` (unset — what every group gets with zero
+  config) resolves to `DEFAULT_COMPACT_NUDGE_MIN_CONTEXT_PERCENT` (50) automatically **whenever
+  `compact_nudge_minutes > 0`** — enabling the quiet-window alone is enough, no second field to
+  touch. `Some(0)` is the explicit opt-out (today's pre-smart-default behavior, preserved
+  verbatim), `Some(n)` an explicit floor. The resolution deliberately lives in
+  `compact_nudge_context_floor_met` (reading the LIVE `compact_nudge_minutes` every tick already
+  has in hand) rather than in `Guardrails::clamped()` — a group that flips `compact_nudge_minutes`
+  on later via a live setter gets the smart default immediately, with no re-launch or
+  re-normalization pass needed to "catch up". `Option<u32>` mirrors the one other place this
+  struct already needed "let a real value distinguish from absence" —
+  `context_window_tokens_override`.
+- **Fails open with no reading**, in every one of the three states — a missing/stale
+  context-percent reading must never silently disable the whole heuristic nudge, the same
+  "degrade, don't deny" posture #332's intake gate takes on a `gh` failure.
 - **Template guidance, not a tool change.** `orchestrator.md`'s existing "Compact at lulls"
-  section gains a paragraph naming the floor and telling the orchestrator not to call
-  `request_compact` out of lull habit below roughly 50% — but the tool itself stays
-  unconditionally available at any context level, per the design above.
-- **Config surface:** persisted in group.json, live-settable via
-  `orch_set_compact_nudge_min_context_percent` (mirrors `orch_set_compact_context_threshold`'s
-  shape exactly).
+  section and `docs/orchestration.md`'s user-facing **Compact-nudge** section both name the smart
+  default and its number (50%) explicitly, so the template and the config never quote different
+  figures. The tool itself (`request_compact`) stays unconditionally available at any context
+  level, per the design above.
+- **Config surface:** persisted in group.json (`null`/absent for `None`, an integer for `Some`),
+  live-settable via `orch_set_compact_nudge_min_context_percent` — which always writes an explicit
+  `Some` and can never restore `None`, since touching the control at all is the explicit choice
+  (mirrors `orch_set_compact_context_threshold`'s shape otherwise).
+- **Interaction with the escalation threshold (`compact_context_threshold_percent`) is unchanged
+  by the smart default.** The two are independent knobs answering different questions — the floor
+  gates the TIME-based lull fire ("don't act on the timer alone below N%"), the threshold drives a
+  SEPARATE context-based escalation path ("act because you crossed N%") — and neither reads the
+  other's value. A group with both configured can end up with the escalation threshold LOWER than
+  the min-context floor (escalation fires before the lull-timer's floor would ever have let it
+  through); that is intentional, not a bug to reconcile — escalation is not the lull-timer, and
+  crossing its own threshold is authorization enough for a request_compact on the agent's behalf.
 
 ## Enforced merge gate (#83)
 
