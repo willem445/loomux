@@ -113,7 +113,16 @@ export function embedDragGrow(
   if (!(total > 0) || !(growTotal > 0)) return { growBefore, growAfter };
   const delta = Number.isFinite(deltaPx) ? deltaPx : 0;
   const clampedDelta = Math.max(minBeforePx - sizeBefore, Math.min(sizeAfter - minAfterPx, delta));
-  const newGrowBefore = ((sizeBefore + clampedDelta) / total) * growTotal;
+  // When a floor exceeds the pair's own total (a pane too small to honor
+  // every active floor at once — the same accepted degradation this
+  // module's own doc comment already names), `clampedDelta` alone can still
+  // push the raw ratio past [0, growTotal] — a NEGATIVE flex-grow, which CSS
+  // silently drops rather than rejecting (#361 rev-58 NB1). Clamp the
+  // OUTPUT, not just the delta: a too-small pane still degrades (one side
+  // ends up below its floor — unavoidable, per the doc comment above), but
+  // never past all-the-grow-to-one-side.
+  const rawGrowBefore = ((sizeBefore + clampedDelta) / total) * growTotal;
+  const newGrowBefore = Math.max(0, Math.min(growTotal, rawGrowBefore));
   return { growBefore: newGrowBefore, growAfter: growTotal - newGrowBefore };
 }
 

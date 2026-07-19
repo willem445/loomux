@@ -105,6 +105,38 @@ test("custom floors are honored", () => {
   assert.ok(impliedBeforePx >= 50 - 0.001);
 });
 
+// ---------- output clamp: a pane too small for its own floors must degrade,
+// never emit a NEGATIVE flex-grow (#361 rev-58 NB1 — CSS silently drops an
+// invalid grow value rather than rejecting it, so this fails silently at
+// render time instead of throwing) ----------
+
+test("a before-floor bigger than the whole region clamps growBefore at growTotal, never past it", () => {
+  // The pane itself (300px) is smaller than the "before" floor alone (400px)
+  // — impossible to honor, but the output must still be a valid, non-negative
+  // grow pair rather than overshooting past all-the-grow-to-one-side.
+  const result = embedDragGrow(150, 150, 1, 1, 9999, 400, 50);
+  assert.ok(result.growBefore >= 0 && result.growBefore <= 2, `growBefore in range: ${result.growBefore}`);
+  assert.ok(result.growAfter >= 0 && result.growAfter <= 2, `growAfter in range: ${result.growAfter}`);
+  assert.equal(result.growBefore + result.growAfter, 2, "growTotal still preserved");
+});
+
+test("an after-floor bigger than the whole region clamps growAfter at growTotal, never past it", () => {
+  const result = embedDragGrow(150, 150, 1, 1, -9999, 50, 400);
+  assert.ok(result.growBefore >= 0 && result.growBefore <= 2, `growBefore in range: ${result.growBefore}`);
+  assert.ok(result.growAfter >= 0 && result.growAfter <= 2, `growAfter in range: ${result.growAfter}`);
+  assert.equal(result.growBefore + result.growAfter, 2, "growTotal still preserved");
+});
+
+test("both floors together exceeding the region still yields a valid, non-negative grow pair", () => {
+  // Neither side's floor alone exceeds the total, but their SUM does — the
+  // reviewer's own reported failing cases (roughly -0.064 / -1.5 / -0.25)
+  // came from exactly this shape: a small region, two competing floors.
+  const result = embedDragGrow(60, 60, 1, 1, 30, 90, 90);
+  assert.ok(result.growBefore >= 0, `growBefore non-negative: ${result.growBefore}`);
+  assert.ok(result.growAfter >= 0, `growAfter non-negative: ${result.growAfter}`);
+  assert.equal(result.growBefore + result.growAfter, 2, "growTotal still preserved");
+});
+
 // ---------- multi-slot: embedSideFloors / embedCenterFloor (clamp precedence, #361) ----------
 
 test("EMBED_SIDES lists exactly left, right, bottom — no top", () => {
