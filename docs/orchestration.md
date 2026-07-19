@@ -418,6 +418,18 @@ are eligible — the orchestrator only, by default, since workers are short-live
 worth compacting. `/compact` is a Claude Code built-in, so the nudge only ever fires for
 Claude Code panes.
 
+**The timed nudge also checks context is actually full before it fires — a smart default, no
+setup needed.** A live benchtest found the timed nudge firing at the right *quiet* moment but
+the wrong *context level* — several real compactions at only 20-30% full, paying a full
+re-grounding cycle for a pane that wasn't actually running out of room. So once you enable the
+quiet-window (above), a minimum context floor is on **automatically** at a sensible default
+(50%) — nothing to configure. Three states, if you do want to tune it: leave it alone (the
+50% default applies as soon as the quiet-window is set); set it explicitly to a percentage of
+your own choosing; or set it to `0` to go back to firing on the quiet window alone, with no
+context check at all. This floor only ever governs loomux's own unprompted timing — **calling
+`request_compact()` yourself always fires immediately**, at any context level, because that's
+your judgment call, not loomux's.
+
 **The orchestrator can also ask for it directly.** `request_compact()` is the primary
 mechanism — the timed nudge above is the fallback for personas that never call it. The
 orchestrator (or any agent) calls it as the LAST action of a turn, at a natural lull; loomux
