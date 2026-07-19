@@ -58,6 +58,7 @@ import { pluginErrorCode, pluginErrorMessage, type PluginManifest } from "./plug
 import { pluginWebviewRect, pluginWindowShouldShow, frameUnchanged, type PluginFrame } from "./pluginwindow";
 import { computeExcludeRects } from "./pluginocclusion";
 import { overlayState, type OverlayChangeReason } from "./overlaystate";
+import { RefreshGate } from "./refreshgate";
 
 /** Terse trigger label for `reposition()`, threaded all the way to
  *  `plugin_set_frame`'s breadcrumb (#380) — diagnostic only, never trusted
@@ -219,6 +220,36 @@ export class PluginPaneView {
    *  retry after a real failure is never suppressed as a false "unchanged".
    *  See `pluginwindow.ts`'s `frameUnchanged` for the comparison itself. */
   private lastAppliedFrame: PluginFrame | null = null;
+  /** Single-flight + trailing-coalesce gate for `reposition()`'s native IPC
+   *  call (#380 round 2) — the SAME mechanism `sessions.ts`'s own `refresh()`
+   *  and `IssuesView`'s refresh loop already use for exactly this shape of
+   *  problem, reused rather than a second ad-hoc scheme. Root cause this
+   *  fixes: a genuine flex-layout reflow (a divider drag, or the sessions
+   *  sidebar's own `width` transition, `styles.css`) fires this pane's
+   *  `ResizeObserver` on nearly every animation frame — confirmed empirically
+   *  against a real Chromium/WebView2-family engine, ~15 ticks across one
+   *  240ms transition, each with correct, live geometry — but every tick used
+   *  to fire its OWN unthrottled `plugin_set_frame` IPC round trip
+   *  (`frameUnchanged` only skips a BYTE-IDENTICAL frame, never true during
+   *  continuous motion). A real native call (`SetWindowPos` + `SetWindowRgn`
+   *  plus the IPC bridge hop) is not free; a burst of ~15-20 of them crammed
+   *  into 240ms drains SLOWER than the observer produces them, so the
+   *  backlog kept applying stale, superseded frames well after the CSS
+   *  transition had already settled — the exact "corrects several seconds
+   *  later" symptom both #380 live reports independently described. Gating
+   *  every call through this gate caps a burst of N triggers at ONE in-flight
+   *  native call plus exactly one trailing call (which reads geometry FRESH
+   *  at the moment it actually runs, never a stale value from when it was
+   *  superseded) — so the visible lag can never exceed roughly one round
+   *  trip, regardless of how many ResizeObserver ticks, overlay edges, or
+   *  window resizes arrived while it was in flight. */
+  private readonly repositionGate = new RefreshGate();
+  /** The freshest trigger source still owed a run once the in-flight
+   *  `reposition()` call finishes — overwritten (never queued) by every call
+   *  the gate coalesces, so only the LATEST source label survives for the
+   *  trailing run's breadcrumb; the geometry itself is always re-read live,
+   *  independent of this field. */
+  private pendingSource: RepositionSource | null = null;
   /** Unsubscribe from the shared overlay registry (overlaystate.ts, #391) —
    *  set in `show()`, released in `dispose()`. Null before `show()` runs and
    *  after `dispose()` has (idempotency guard: `dispose()` can run more than
@@ -326,14 +357,39 @@ export class PluginPaneView {
     this.statusEl.textContent = `Couldn't open "${this.manifest.displayName}": ${pluginErrorMessage(err) || String(err)} (${pluginErrorCode(err)})`;
   }
 
+  /** Public entry point for every trigger (the `ResizeObserver` in `show()`, an
+   *  overlay registry edge, a window resize, `notifyMoved()`) — gates the
+   *  actual work (`repositionNow`, below) through `repositionGate` (#380
+   *  round 2, see that field's own doc comment for the IPC-flood this fixes):
+   *  the first call in a burst runs immediately; every call that arrives
+   *  while one is still in flight is coalesced into exactly one trailing
+   *  call, which reads geometry fresh at the moment IT runs rather than
+   *  whatever was current when it was queued. */
+  private async reposition(source: RepositionSource): Promise<void> {
+    if (!this.repositionGate.begin()) {
+      this.pendingSource = source;
+      return;
+    }
+    try {
+      await this.repositionNow(source);
+    } finally {
+      if (this.repositionGate.end()) {
+        const next = this.pendingSource ?? source;
+        this.pendingSource = null;
+        void this.reposition(next);
+      }
+    }
+  }
+
   /** Recompute this pane's on-screen box and move/resize/show/hide the plugin's
    *  child webview to match — and, since #391 (folded into #380), re-clip its
    *  native occlusion (below) so it stays correct across every one of the
-   *  same triggers. Called on every layout change that could move `el` — a
-   *  divider drag, a split, a tab switch, a maximize elsewhere — via the
-   *  ResizeObserver registered in `show()`, plus every open/close edge of the
-   *  shared overlay registry and every window resize (also wired in `show()`).
-   *  A no-op until `open()` has a webview to move (`ready`).
+   *  same triggers. Called (via `reposition()`'s gate, above) on every layout
+   *  change that could move `el` — a divider drag, a split, a tab switch, a
+   *  maximize elsewhere — via the ResizeObserver registered in `show()`, plus
+   *  every open/close edge of the shared overlay registry and every window
+   *  resize (also wired in `show()`). A no-op until `open()` has a webview to
+   *  move (`ready`).
    *
    *  Bounds and occlusion are ONE atomic backend call (`setPluginFrame` ->
    *  `plugin_set_frame`, #380) built from a SINGLE fresh `rect` read — not
@@ -346,27 +402,24 @@ export class PluginPaneView {
    *  could run and read the webview's client rect BEFORE a "completed"
    *  resize had actually landed, clipping against stale geometry (see
    *  `pluginregion.rs`'s module doc comment for the full mechanism this was
-   *  proved against). Folding both into one command removes that gap AND the
-   *  matching one between concurrent `reposition()` calls: WebView2's IPC
-   *  dispatch processes single synchronous commands strictly in arrival
-   *  order, so a burst of `ResizeObserver` ticks (the sessions sidebar's
-   *  240ms open/close transition, `styles.css`'s `#sessions` `width`
-   *  transition, is the trigger that surfaced this live) can no longer let
-   *  an older call's now-orphaned write land after a newer one's. `seq`
-   *  below still guards `show()`/`hide()` follow-up against a stale call
-   *  finishing after a newer one already ran — that part remains genuinely
-   *  async (its own IPC round trip) and unordered relative to a newer
-   *  `reposition()`'s OWN frame call.
+   *  proved against). Folding both into one command removes that gap.
    *
-   *  Same-geometry calls are skipped (rev-67, #414): a window resize and the
-   *  sessions panel's own `poke()`-driven recompute (`overlaystate.ts`) can
-   *  both fire for the same animation frame, computing the byte-identical
-   *  (bounds, exclude) pair twice — `frameUnchanged` (`pluginwindow.ts`)
-   *  compares this call's frame against `lastAppliedFrame` and skips the
-   *  native round trip when nothing actually changed, EXCEPT on `"init"` and
-   *  `"overlay-close"`, which always call through (see `lastAppliedFrame`'s
-   *  own field doc comment for why those two are exempt). */
-  private async reposition(source: RepositionSource): Promise<void> {
+   *  Called at most once at a time, ever (#380 round 2): `reposition()`'s
+   *  `repositionGate` guarantees this method never runs concurrently with
+   *  itself, so the "which of two in-flight calls wins" race this doc
+   *  comment used to describe can no longer occur by construction — `seq`
+   *  below will always still match `repositionSeq` (not a stale one) by the
+   *  time this resolves. Kept as a cheap, harmless defensive check rather
+   *  than removed, since the only way it could ever read false now is a bug
+   *  in the gate itself, not a legitimate race.
+   *
+   *  Same-geometry calls are skipped (rev-67, #414): `frameUnchanged`
+   *  (`pluginwindow.ts`) compares this call's frame against `lastAppliedFrame`
+   *  and skips the native round trip when nothing actually changed, EXCEPT on
+   *  `"init"` and `"overlay-close"`, which always call through (see
+   *  `lastAppliedFrame`'s own field doc comment for why those two are
+   *  exempt). */
+  private async repositionNow(source: RepositionSource): Promise<void> {
     if (!this.ready || !this.pluginWebview || this.disposed) return;
     const seq = ++this.repositionSeq;
     const rect = this.el.getBoundingClientRect();

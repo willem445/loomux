@@ -174,16 +174,39 @@
 //!
 //! **`"overlay-poke"` (#380 follow-up): a second high-frequency source, gated
 //! the same way as `"resize"`.** `overlaystate.ts`'s `poke()` lets a DOM
-//! overlay that keeps moving/resizing WHILE OPEN (the sessions sidebar's own
-//! `width` transition — see `sessions.ts`'s `panelResizeObs`) force every
-//! subscribed plugin pane to recompute, on every tick of THAT transition —
-//! the same per-frame frequency class as a `ResizeObserver` burst on the
-//! pane's own element, just driven by a covering overlay's geometry instead
-//! of the pane's own. Mapping it to `"overlay-open"` (an always-logs,
-//! "comparatively rare" source) would reintroduce the exact per-frame
-//! file-I/O storm `"resize"`'s gate exists to prevent, just from the other
-//! direction. `should_log_frame` therefore gates `"overlay-poke"` identically
-//! to `"resize"`: logs only when `exclude_changed` or a native call failed.
+//! overlay that keeps moving/resizing WHILE OPEN force every subscribed
+//! plugin pane to recompute — the same per-frame frequency class as a
+//! `ResizeObserver` burst on the pane's own element, just driven by a
+//! covering overlay's geometry instead of the pane's own. Mapping it to
+//! `"overlay-open"` (an always-logs, "comparatively rare" source) would
+//! reintroduce the exact per-frame file-I/O storm `"resize"`'s gate exists to
+//! prevent, just from the other direction. `should_log_frame` therefore gates
+//! `"overlay-poke"` identically to `"resize"`.
+//!
+//! **#380 round 2: the gate above was blind to a push-layout panel — fixed by
+//! also gating on a BOUNDS change, not exclude alone.** Live re-report,
+//! proved from `breadcrumbs.log` (not guessed): expanding the sessions
+//! sidebar still left a plugin pane's native content misaligned, and across
+//! several toggles the log showed ZERO `"overlay-poke"` lines and an
+//! `exclude` count of 0 in every state. Investigating `styles.css`/
+//! `index.html` (not the frontend's prior "covering overlay" assumption)
+//! shows `#sessions` is a flex SIBLING of `#grid-area` inside
+//! `#workspace { display: flex }` (`width: 344px` / `.hidden { width: 0 }`,
+//! `transition: width`, `flex: none`) — NOT a `position: absolute`/`fixed`
+//! layer painted over other content. Toggling it changes `#grid-area`'s
+//! available width via ordinary flexbox reflow — every plugin pane's own
+//! BOUNDS shift/shrink with it — but `#sessions` never occupies the same
+//! screen region as a pane it isn't covering, at any point in its
+//! transition, so `exclude` was always (correctly) empty. The frontend's
+//! `sessions.ts` no longer registers `#sessions` as a covering overlay at all
+//! (see that file's header comment) — but the diagnostic gap this module
+//! owns stands regardless of that: gating `"resize"`/`"overlay-poke"`
+//! breadcrumbs on `exclude_changed` ALONE means a push-layout panel's
+//! bounds-only changes were structurally invisible to `breadcrumbs.log` —
+//! not evidence the mechanism wasn't running, just proof the log could never
+//! have shown either way. [`should_log_frame`] now gates on
+//! `bounds_changed || exclude_changed`, so this class of trigger finally
+//! leaves evidence for the next live occurrence.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -235,14 +258,30 @@ fn with_last_logged_exclude<R>(f: impl FnOnce(&mut HashMap<String, Vec<Occlusion
     f(guard.get_or_insert_with(HashMap::new))
 }
 
-/// Releases `label`'s entry in [`LAST_LOGGED_EXCLUDE`] — called from
-/// `pluginbroker::plugin_close_window`, the same explicit-close hook that
-/// already releases the broker's own `PluginSession`/channel state and
-/// `procmetrics`'s poll thread (a child webview never fires
-/// `WindowEvent::Destroyed` for anything to clean up on its own — see that
-/// command's doc comment).
+/// The bounds last BREADCRUMBED (not last applied — see this module's doc
+/// comment) for each `plugin-*` label — [`should_log_frame`]'s other half of
+/// state, alongside `LAST_LOGGED_EXCLUDE` (#380 round 2). Rounded to whole
+/// logical pixels (matching `bounds_label`'s own `{:.0}` formatting) so a
+/// sub-pixel float jitter between two visually-identical frames doesn't read
+/// as "changed". Same poison-tolerant shape, same close-time cleanup.
+static LAST_LOGGED_BOUNDS: Mutex<Option<HashMap<String, (i64, i64, i64, i64)>>> = Mutex::new(None);
+
+fn with_last_logged_bounds<R>(f: impl FnOnce(&mut HashMap<String, (i64, i64, i64, i64)>) -> R) -> R {
+    let mut guard = LAST_LOGGED_BOUNDS.lock_safe();
+    f(guard.get_or_insert_with(HashMap::new))
+}
+
+/// Releases `label`'s entry in [`LAST_LOGGED_EXCLUDE`] and
+/// [`LAST_LOGGED_BOUNDS`] — called from `pluginbroker::plugin_close_window`,
+/// the same explicit-close hook that already releases the broker's own
+/// `PluginSession`/channel state and `procmetrics`'s poll thread (a child
+/// webview never fires `WindowEvent::Destroyed` for anything to clean up on
+/// its own — see that command's doc comment).
 pub fn on_plugin_webview_closed(label: &str) {
     with_last_logged_exclude(|m| {
+        m.remove(label);
+    });
+    with_last_logged_bounds(|m| {
         m.remove(label);
     });
 }
@@ -257,28 +296,41 @@ fn exclude_changed(last_logged: Option<&[OcclusionRect]>, current: &[OcclusionRe
     last_logged != Some(current)
 }
 
+/// Whether THIS application's bounds (rounded to whole logical pixels) differ
+/// from the last one breadcrumbed for its label — `should_log_frame`'s other
+/// half of the gate, alongside `exclude_changed` (#380 round 2). A
+/// push-layout sibling panel (the sessions sidebar) never contributes an
+/// exclude rect at all — see this module's doc comment's "#380 round 2"
+/// section — its own CSS transition changes THIS pane's bounds instead, via
+/// ordinary flexbox reflow, so gating solely on `exclude_changed` made every
+/// one of those frames invisible to telemetry regardless of whether they
+/// were actually applied. Pure so it's unit-tested without a real
+/// label/webview.
+fn bounds_changed(last_logged: Option<(i64, i64, i64, i64)>, current: (i64, i64, i64, i64)) -> bool {
+    last_logged != Some(current)
+}
+
 /// Whether this `plugin_set_frame` application is worth a breadcrumb line
 /// (see this module's doc comment's "Telemetry" section for the full
 /// rationale). `native_ok` is false for ANY failure (bounds not applied,
 /// HWND/region lookup failed, `SetWindowRgn` itself failed) — always logged,
 /// regardless of source, since a failure is exactly what the next live
 /// occurrence needs evidence of. Otherwise: `"resize"` and `"overlay-poke"`
-/// (the two actual storm sources — a divider drag or the sidebar's own CSS
-/// transition fires a burst of the former from the pane's own
-/// `ResizeObserver`, the latter from `overlaystate.ts`'s `poke()` on that
-/// SAME transition, see this module's doc comment's `"overlay-poke"`
-/// section) only log when `exclude_changed`; every other source
-/// (`"overlay-open"`/`"overlay-close"`/`"move-notify"`/`"init"`, and
+/// (the two actual storm sources — a divider drag, a window resize, or the
+/// sessions sidebar's own CSS transition fires a burst of either) only log
+/// when `bounds_changed || exclude_changed` (#380 round 2 — bounds alone used
+/// to be silently dropped, see this module's doc comment); every other
+/// source (`"overlay-open"`/`"overlay-close"`/`"move-notify"`/`"init"`, and
 /// anything not yet named) is a comparatively rare, discrete event and
 /// always logs. Pure so it's unit-tested without a real command/webview.
-fn should_log_frame(source: &str, exclude_changed: bool, native_ok: bool) -> bool {
+fn should_log_frame(source: &str, bounds_changed: bool, exclude_changed: bool, native_ok: bool) -> bool {
     if !native_ok {
         return true;
     }
     if source != "resize" && source != "overlay-poke" {
         return true;
     }
-    exclude_changed
+    bounds_changed || exclude_changed
 }
 
 /// Main-only (mirrors `plugin_open_window`/`plugin_close_window` — see
@@ -451,12 +503,18 @@ fn apply_frame(
     };
 
     let native_ok = moved && region_applied != 0;
-    let changed = with_last_logged_exclude(|m| {
+    let bounds_now = (x.round() as i64, y.round() as i64, width.round() as i64, height.round() as i64);
+    let bounds_changed_now = with_last_logged_bounds(|m| {
+        let changed = bounds_changed(m.get(label).copied(), bounds_now);
+        m.insert(label.to_string(), bounds_now);
+        changed
+    });
+    let exclude_changed_now = with_last_logged_exclude(|m| {
         let changed = exclude_changed(m.get(label).map(Vec::as_slice), exclude);
         m.insert(label.to_string(), exclude.to_vec());
         changed
     });
-    if should_log_frame(source, changed, native_ok) {
+    if should_log_frame(source, bounds_changed_now, exclude_changed_now, native_ok) {
         crate::obs::breadcrumb(
             "pluginregion",
             &format!(
@@ -486,12 +544,18 @@ fn apply_frame(
     // Still breadcrumbed (gated the same way the Windows arm is — see
     // `should_log_frame`), so a diagnostic trail exists on every platform
     // without spamming a resize storm there either.
-    let changed = with_last_logged_exclude(|m| {
+    let bounds_now = (x.round() as i64, y.round() as i64, width.round() as i64, height.round() as i64);
+    let bounds_changed_now = with_last_logged_bounds(|m| {
+        let changed = bounds_changed(m.get(label).copied(), bounds_now);
+        m.insert(label.to_string(), bounds_now);
+        changed
+    });
+    let exclude_changed_now = with_last_logged_exclude(|m| {
         let changed = exclude_changed(m.get(label).map(Vec::as_slice), exclude);
         m.insert(label.to_string(), exclude.to_vec());
         changed
     });
-    if should_log_frame(source, changed, moved) {
+    if should_log_frame(source, bounds_changed_now, exclude_changed_now, moved) {
         crate::obs::breadcrumb(
             "pluginregion",
             &format!(
@@ -544,39 +608,79 @@ mod tests {
         assert!(exclude_changed(Some(&[RECT_A]), &[RECT_A, RECT_B]));
     }
 
+    const BOUNDS_A: (i64, i64, i64, i64) = (10, 110, 1261, 629);
+    const BOUNDS_B: (i64, i64, i64, i64) = (354, 110, 917, 629);
+
     #[test]
-    fn should_log_frame_always_logs_a_native_failure_regardless_of_source_or_change() {
-        assert!(should_log_frame("resize", false, false));
-        assert!(should_log_frame("overlay-open", false, false));
-        assert!(should_log_frame("overlay-poke", false, false));
+    fn bounds_changed_is_false_for_the_common_no_move_resize_storm() {
+        // The push-layout counterpart of NB-1: a pane that's settled at a
+        // fixed size (no overlay involved at all) must not read as changed
+        // tick after tick.
+        assert!(!bounds_changed(Some(BOUNDS_A), BOUNDS_A));
     }
 
     #[test]
-    fn should_log_frame_gates_resize_on_exclude_change_only() {
-        // The actual storm source: unchanged exclude (the common no-overlay
-        // case) is exactly what must NOT log, or NB-1 recurs.
-        assert!(!should_log_frame("resize", false, true));
-        assert!(should_log_frame("resize", true, true));
+    fn bounds_changed_is_true_the_first_time_a_label_is_seen() {
+        assert!(bounds_changed(None, BOUNDS_A));
+    }
+
+    #[test]
+    fn bounds_changed_is_true_when_bounds_differ() {
+        assert!(bounds_changed(Some(BOUNDS_A), BOUNDS_B));
+    }
+
+    #[test]
+    fn should_log_frame_always_logs_a_native_failure_regardless_of_source_or_change() {
+        assert!(should_log_frame("resize", false, false, false));
+        assert!(should_log_frame("overlay-open", false, false, false));
+        assert!(should_log_frame("overlay-poke", false, false, false));
+    }
+
+    #[test]
+    fn should_log_frame_gates_resize_on_bounds_or_exclude_change() {
+        // The actual storm source: NEITHER bounds nor exclude changing (the
+        // common settled-pane case) is exactly what must NOT log, or NB-1
+        // recurs.
+        assert!(!should_log_frame("resize", false, false, true));
+        assert!(should_log_frame("resize", true, false, true));
+        assert!(should_log_frame("resize", false, true, true));
+    }
+
+    #[test]
+    fn should_log_frame_logs_a_bounds_only_change_even_with_an_unchanged_exclude() {
+        // #380 round 2, the actual regression this round fixes: the sessions
+        // sidebar is a push-layout flex sibling, never a covering overlay —
+        // toggling it changes a plugin pane's BOUNDS via ordinary flexbox
+        // reflow but never its `exclude` set (always empty, since sessions
+        // never overlaps the pane it's beside). Before this fix,
+        // `should_log_frame` only looked at `exclude_changed`, so this exact
+        // case — a genuine bounds change, unchanged (empty) exclude — was
+        // silently dropped for BOTH "resize" and "overlay-poke", leaving
+        // `breadcrumbs.log` structurally unable to show whether the sidebar
+        // toggle was tracked at all. Red against the pre-fix 2-arg gate
+        // (`should_log_frame(source, exclude_changed, native_ok)`, which had
+        // no way to see a bounds-only change and would have stayed silent
+        // here); green now that bounds are gated too.
+        assert!(should_log_frame("resize", true, false, true));
+        assert!(should_log_frame("overlay-poke", true, false, true));
     }
 
     #[test]
     fn should_log_frame_gates_overlay_poke_the_same_as_resize() {
-        // #380 follow-up: `overlay-poke` (the sessions sidebar's own
-        // transition re-triggering every plugin pane, `sessions.ts`'s
-        // `panelResizeObs`) is the SECOND high-frequency source — it must be
+        // `overlay-poke` is the second high-frequency source — it must be
         // gated identically to `resize`, or wiring `poke()` into production
         // reintroduces the exact per-frame log storm `resize`'s gate exists
         // to prevent.
-        assert!(!should_log_frame("overlay-poke", false, true));
-        assert!(should_log_frame("overlay-poke", true, true));
+        assert!(!should_log_frame("overlay-poke", false, false, true));
+        assert!(should_log_frame("overlay-poke", false, true, true));
     }
 
     #[test]
     fn should_log_frame_always_logs_discrete_sources_even_with_no_change() {
         for source in ["overlay-open", "overlay-close", "move-notify", "init"] {
             assert!(
-                should_log_frame(source, false, true),
-                "{source} should always log even with an unchanged exclude set"
+                should_log_frame(source, false, false, true),
+                "{source} should always log even with unchanged bounds and exclude"
             );
         }
     }

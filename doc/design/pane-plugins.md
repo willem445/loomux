@@ -1017,6 +1017,107 @@ are stated, without drifting from what was actually agreed:
   plugin pane recomputes its bounds+occlusion continuously across BOTH the
   open and close transition, not just at their edges, with telemetry staying
   state-change-gated exactly as before.
+- **#380 round 2: the `overlay-poke` fix above shipped, then proved INERT
+  under live re-test.** Fresh telemetry from `breadcrumbs.log` across
+  multiple sessions-sidebar toggles: (1) ZERO `overlay-poke` breadcrumbs,
+  ever; (2) `exclude` was 0 in EVERY logged state, open or closed; (3) the
+  plugin pane's logged bounds at the `overlay-open` edge and the
+  `overlay-close` edge were nearly identical ("full width" in both). Read
+  together with the human's own eyes ("the workspace visibly shifts/shrinks"
+  and the plugin "outgrows its pane" for a while before correcting), this
+  round treated the prior diagnosis as unproven rather than trusted it.
+
+  **Root cause 1 — wrong mental model, not a bug in the exclude math.**
+  `index.html`/`styles.css` show `#sessions` is `flex: none; width: 344px;
+  transition: width` — a genuine flex SIBLING of `#grid-area` inside
+  `#workspace { display: flex }`, not `position: absolute`/`fixed`. Toggling
+  it changes `#grid-area`'s available width via ordinary flexbox reflow; it
+  never occupies the same screen region as a pane it "covers" at any instant
+  of its transition (`pluginocclusion.ts`'s intersect math structurally
+  cannot produce a rect for two regions that never overlap). So `exclude`
+  being 0 in every state (finding 2) was never a bug — every round since
+  #391 mis-modeled this ONE panel as a covering DOM overlay (the same class
+  as a modal or context menu) when it's actually a push-layout sibling that
+  changes plugin panes' own BOUNDS, not what covers them. `sessions.ts` no
+  longer registers `#sessions` with `overlayState.open()`/`close()` at all —
+  see that file's header comment.
+
+  **Root cause 2 — the reason finding (1) tells you nothing either way.**
+  `pluginregion.rs`'s `should_log_frame` gated the two high-frequency
+  sources (`"resize"`, `"overlay-poke"`) on `exclude_changed` ALONE. A
+  push-layout panel's transition changes BOUNDS, never `exclude` — so every
+  one of those frames was structurally invisible to `breadcrumbs.log`
+  regardless of whether they were actually being applied. Finding (1) (zero
+  `overlay-poke` lines) is therefore NOT proof the mechanism never ran — it's
+  proof the log could never have shown it either way. Fixed: `should_log_frame`
+  now gates on `bounds_changed || exclude_changed` (`pluginregion.rs`), with a
+  red-before-green unit test (`should_log_frame_logs_a_bounds_only_change_
+  even_with_an_unchanged_exclude`) encoding exactly this case.
+
+  **Root cause 3 — the actual mechanism behind "corrects several seconds
+  later."** Confirmed empirically (a minimal repro of the exact `#sessions` /
+  `#grid-area` / `.grid-root` / `.pane` / `.pane-content` / `.pane-plugin`
+  flex structure, driven headless in a real Chromium/WebView2-family engine
+  via raw CDP — not the loomux app itself, no `tauri dev`): a plugin pane's
+  own generic `ResizeObserver` (`pluginpaneview.ts`'s `"resize"` source)
+  fires correctly on nearly every animation frame of the sidebar's 240ms
+  `width` transition — roughly 15 ticks, each converging to the exact
+  correct, live geometry; a `transitionend` + `requestAnimationFrame` read
+  lands on the identical final value. The DOM/observer chain was never the
+  defect. The defect: every one of those ~15 ticks (plus every other
+  trigger — a window resize, an overlay edge) independently fired its OWN
+  `plugin_set_frame` IPC round trip, completely unthrottled — `frameUnchanged`
+  only skips a call when the geometry is byte-identical to the last one
+  already INTENDED, which is never true during continuous motion. A real
+  native call (`Webview::set_bounds` + `SetWindowRgn` plus the IPC bridge
+  hop) is not free; a burst of ~15-20 of them crammed into a single 240ms
+  window drains SLOWER than the observer produces them, so the plugin kept
+  applying stale, already-superseded frames well after the CSS transition had
+  visually finished — the exact "several seconds" both this file's #380
+  entry above and the live #380 round-2 report independently describe.
+  `overlay-poke` (the previous fix) made this WORSE, not better: it queued
+  ANOTHER redundant per-frame trigger duplicating geometry the pane's own
+  `"resize"` observer was already producing, onto an already-overloaded
+  channel — which is also why it left no telemetry trace regardless of the
+  `should_log_frame` gate above.
+
+  **The fix.** `pluginpaneview.ts`'s `reposition()` is now a thin gate in
+  front of the real work (renamed `repositionNow`): it reuses `RefreshGate`
+  (`refreshgate.ts`, the SAME single-flight + trailing-coalesce primitive
+  `sessions.ts`'s own `refresh()` and `IssuesView`'s refresh loop already
+  use) so at most ONE native `plugin_set_frame` call is ever in flight; every
+  trigger that arrives while one is running collapses into exactly one
+  trailing call, which reads geometry FRESH at the moment it actually runs,
+  never a stale value from when it was superseded. A burst of N triggers now
+  costs at most 2 native round trips, not N — the visible lag can never
+  exceed roughly one round trip, regardless of how many `ResizeObserver`
+  ticks, overlay edges, or window resizes arrive while one is in flight.
+  `sessions.ts` additionally provides ONE authoritative settle-time recompute
+  (`transitionend` + `requestAnimationFrame` → `overlayState.poke()`) once
+  its own transition has fully committed, as a final guarantee on top —
+  replacing the per-tick `overlay-poke` observer outright (dead code once
+  the pane's own `"resize"` tracking already covers "during", per root cause
+  1 above) rather than leaving it in place unproven.
+
+  **Expected telemetry signature for the next live test.** A single sessions
+  toggle should now produce, in `breadcrumbs.log`, filtering to
+  `pluginregion`: an `overlay-open` or `overlay-close` line at the toggle
+  edge (always logged), then a small number of `resize`-sourced lines (now
+  visible under the bounds-changed gate) with PROGRESSIVELY changing
+  `bounds=` values converging toward the sidebar's final width, and finally
+  one `overlay-poke`-sourced line whose `bounds=` matches the fully-settled
+  layout (pane narrower and shifted right on open, back to full width on
+  close) — `exclude=0` throughout every line, which is correct for this
+  panel, not a bug. The total `resize`+`overlay-poke` line count for one
+  toggle should be small (at most a couple, thanks to the coalescing gate),
+  not the ~15-20 an unthrottled burst would have produced. If the user's next
+  test shows ONLY the settle (`overlay-poke`) line and no intermediate
+  `resize` lines, that means the coalescing gate is collapsing the entire
+  burst into its first and trailing calls (expected and fine); if it shows
+  NEITHER — silence all the way through, `exclude` aside — that would mean
+  `"resize"` truly isn't firing in the live app despite the empirical repro,
+  and is the next thing to re-investigate, stated honestly rather than
+  assumed away.
 - **Slice E** (metrics — **done**, `procmetrics.rs`) exposes `sys_processes`
   -shaped data **only** through the `metrics.system` broker handler — never as
   a command a plugin (or any other webview script) could `invoke` directly.

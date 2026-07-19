@@ -33,18 +33,31 @@
 // overlay) can check "is this one already covered?" without re-deriving the
 // reasoning from scratch.
 //
-// Wired: sessions.ts's SessionBrowser (the sidebar the #391 bug was reported
-// through), modal.ts's modal()/promptModal(), editor.ts's
-// editorConfigDialog, contextmenu.ts's showContextMenu, gitview.ts's own
-// hand-rolled menu, tabbar.ts's menu/preview/palette popovers, pane.ts's six
-// in-pane overlay toggles, and toast.ts's showToast — wired THIS time,
-// unlike the reverted global-hide PR, which deliberately excluded it: that
-// registry was a single global boolean, so wiring a toast would have hidden
-// EVERY plugin pane in the app for the toast's ~5s lifetime even where it
-// doesn't visually overlap one at all. This registry is per-rect (the whole
-// point of the #391 redo — see pluginregion.rs), so a toast now only ever
-// punches a hole the size of the toast itself; the cost that justified
-// excluding it no longer exists.
+// Wired: modal.ts's modal()/promptModal(), editor.ts's editorConfigDialog,
+// contextmenu.ts's showContextMenu, gitview.ts's own hand-rolled menu,
+// tabbar.ts's menu/preview/palette popovers, pane.ts's six in-pane overlay
+// toggles, and toast.ts's showToast — wired via `open()`/the returned closer,
+// exactly the "this rect currently covers a plugin pane" contract this
+// registry is for. Unlike the reverted global-hide PR (a single global
+// boolean, so wiring a toast would have hidden EVERY plugin pane in the app
+// for the toast's ~5s lifetime even where it doesn't visually overlap one at
+// all), this registry is per-rect (the whole point of the #391 redo — see
+// pluginregion.rs), so a toast only ever punches a hole the size of the toast
+// itself.
+//
+// Wired differently: sessions.ts's SessionBrowser calls `poke()` alone, NEVER
+// `open()`/the closer (#380 round 2). The sessions sidebar was originally
+// wired the same way every other entry on this list is (the bug #391 was
+// reported through), but `#sessions` (`styles.css`) turned out to be a flex
+// SIBLING of the pane grid, not a `position: absolute`/`fixed` covering
+// layer — it never overlaps a plugin pane's rect at any point in its own
+// `width` transition, so it never had a meaningful rect to register.
+// `poke()` still does exactly what its own doc comment says — "force
+// subscribers to recompute without an open/close edge" — it just doesn't
+// require a prior `open()` to make sense: any call site whose OWN geometry
+// change should prompt every plugin pane to recompute ITS OWN bounds (not
+// this call site's coverage) can call `poke()` on its own, registering
+// nothing. `sessions.ts`'s header comment has the full writeup.
 //
 // Deliberately excluded (carried over from the #391 rev-97 list — none of
 // these were excluded because of the "global hide is too broad" cost the
@@ -134,8 +147,14 @@ export class OverlayRegistry {
   }
 
   /** Force subscribers to recompute without an open/close edge — a call site
-   *  whose overlay can resize/move WHILE open (a `ResizeObserver` on its own
-   *  element, say) calls this instead of re-opening a new slot. */
+   *  whose OWN registered overlay can resize/move WHILE open (a
+   *  `ResizeObserver` on its own element, say) calls this instead of
+   *  re-opening a new slot. Does NOT require a matching `open()`, though (#380
+   *  round 2): a call site whose geometry change affects every plugin pane's
+   *  own BOUNDS rather than what covers them — never overlapping a pane, so
+   *  never a rect worth registering — can call `poke()` on its own, with no
+   *  `open()` at all. `sessions.ts`'s `SessionBrowser` is that case; see its
+   *  header comment. */
   poke(): void {
     this.notify("poke");
   }
