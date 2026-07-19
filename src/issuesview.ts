@@ -51,8 +51,9 @@ export interface IssuesViewHost {
   getCwd(): string | null;
   /** Close the issues view and return to the terminal. */
   onClose(): void;
-  /** The view's own header "embed beside the terminal" toggle (#361). */
-  onToggleEmbed?: () => void;
+  /** The view's own header embed button was clicked (#361) — `anchor` (the
+   *  button itself) is where the host positions its side-picker menu. */
+  onEmbedMenu?: (anchor: HTMLElement) => void;
 }
 
 function el<K extends keyof HTMLElementTagNameMap>(
@@ -211,7 +212,7 @@ export class IssuesView {
     // Embed toggle (#361): switch between the floating overlay and the
     // pane's embed-panel slot.
     this.embedBtn = el("button", "pane-btn embed", "⬒") as HTMLButtonElement;
-    this.embedBtn.addEventListener("click", () => this.host.onToggleEmbed?.());
+    this.embedBtn.addEventListener("click", () => this.host.onEmbedMenu?.(this.embedBtn));
     this.setPanelActive(false);
 
     const closeBtn = el("button", "pane-btn close", "✕");

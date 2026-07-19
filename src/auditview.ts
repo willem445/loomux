@@ -94,7 +94,7 @@ export class AuditView {
 
   constructor(
     private groupId: string,
-    opts: { onClose: () => void; onToggleEmbed?: () => void }
+    opts: { onClose: () => void; onEmbedMenu?: (anchor: HTMLElement) => void }
   ) {
     this.el = el("div", "audit-view");
 
@@ -114,10 +114,10 @@ export class AuditView {
     refresh.addEventListener("click", () => void this.load());
     head.append(refresh);
 
-    // Embed toggle (#361): switch between the floating overlay and the
-    // pane's embed-panel slot.
+    // Embed side-picker (#361): switch between the floating overlay and any
+    // of the pane's (up to three) embed slots.
     this.embedBtn = el("button", "pane-btn embed", "⬒") as HTMLButtonElement;
-    this.embedBtn.addEventListener("click", () => opts.onToggleEmbed?.());
+    this.embedBtn.addEventListener("click", () => opts.onEmbedMenu?.(this.embedBtn));
     head.append(this.embedBtn);
     this.setPanelActive(false);
 

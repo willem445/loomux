@@ -537,7 +537,7 @@ async function openActionPane(
         sessionId: null,
         role: null,
         file: null,
-        embed: null,
+        embeds: [],
       };
       let pane: Pane;
       const content = dormantCard(
@@ -654,11 +654,11 @@ async function openActionPane(
         sessionId: a.sessionId,
         role: a.role,
         file: null,
-        // The embed preference (#361) rides along too, so re-capturing a
-        // still-dormant tab (Resume never clicked) reproduces it byte for
-        // byte, and resumeDormantGroup can reapply it once the pane it
-        // belongs to is actually resumed.
-        embed: a.embed,
+        // The docked-view preferences (#361) ride along too, so re-capturing
+        // a still-dormant tab (Resume never clicked) reproduces them byte
+        // for byte, and resumeDormantGroup can reapply them once the pane
+        // they belong to is actually resumed.
+        embeds: a.embeds,
       };
       const content = dormantCard(
         "Resume group",
@@ -758,14 +758,14 @@ async function resumeDormantGroup(ws: Workspace): Promise<void> {
     const captured = orchRecords
       .filter((r) => r.sessionId !== null)
       .map((r) => ({ sessionId: r.sessionId as string, role: r.role ?? "worker" }));
-    // The embed preference (#361) isn't part of the resume plan itself
-    // (planGroupResume only orders/gates on session id + role) — it's a
-    // captured UI preference, reapplied below once each member's pane
-    // actually comes back, by matching sessionId the same way the plan
+    // The docked-view preferences (#361) aren't part of the resume plan
+    // itself (planGroupResume only orders/gates on session id + role) —
+    // they're captured UI preferences, reapplied below once each member's
+    // pane actually comes back, by matching sessionId the same way the plan
     // itself does.
-    const embedBySession = new Map<string, PersistedEmbed>();
+    const embedsBySession = new Map<string, PersistedEmbed[]>();
     for (const r of orchRecords) {
-      if (r.sessionId && r.embed !== null) embedBySession.set(r.sessionId, r.embed);
+      if (r.sessionId && r.embeds.length) embedsBySession.set(r.sessionId, r.embeds);
     }
     // resumeOrchSession only returns the group id — "the pane itself is located
     // later by scanning live panes" (orchestration.ts) — so this does the same,
@@ -833,8 +833,8 @@ async function resumeDormantGroup(ws: Workspace): Promise<void> {
       });
       if (restored) {
         tabs.bindGroup(restored.groupId, ws.id);
-        const embed = embedBySession.get(plan.orchestrator.sessionId);
-        if (embed) findResumedPane(plan.orchestrator.sessionId)?.restoreEmbed(embed.view, embed.share);
+        const embeds = embedsBySession.get(plan.orchestrator.sessionId);
+        if (embeds) findResumedPane(plan.orchestrator.sessionId)?.restoreEmbeds(embeds);
       }
     } catch (err) {
       // Recoverable (retry the button) — a toast, not the app-crash banner (MED-3).
@@ -850,8 +850,8 @@ async function resumeDormantGroup(ws: Workspace): Promise<void> {
           group: groupId,
           role: member.role,
         });
-        const embed = embedBySession.get(member.sessionId);
-        if (embed) findResumedPane(member.sessionId)?.restoreEmbed(embed.view, embed.share);
+        const embeds = embedsBySession.get(member.sessionId);
+        if (embeds) findResumedPane(member.sessionId)?.restoreEmbeds(embeds);
       } catch (err) {
         showToast(`Couldn't rejoin a ${member.role}: ${String(err)}`, "info");
       }

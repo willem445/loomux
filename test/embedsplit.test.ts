@@ -1,4 +1,5 @@
-// Unit tests for the embedded-panel divider math (#361). Run with `npm test`.
+// Unit tests for the embed-panel divider math (#361), including the
+// three-side (left/right/bottom) generalization. Run with `npm test`.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
@@ -6,9 +7,13 @@ import {
   growFromFrac,
   fracFromGrow,
   embedDragGrow,
+  embedSideFloors,
+  embedCenterFloor,
   DEFAULT_EMBED_FRAC,
   EMBED_MIN_TERM_PX,
   EMBED_MIN_PANEL_PX,
+  EMBED_DIVIDER_PX,
+  EMBED_SIDES,
 } from "../src/embedsplit.ts";
 import { TERM_RESERVE_H, OVERLAY_MIN_H } from "../src/overlaysize.ts";
 
@@ -43,8 +48,8 @@ test("clampEmbedFrac falls back to the default on a non-finite input", () => {
 test("growFromFrac / fracFromGrow round-trip", () => {
   for (const frac of [0.15, 0.25, 0.33, 0.5, 0.7]) {
     const grow = growFromFrac(frac);
-    assert.equal(grow.growTerm + grow.growPanel, 1);
-    assert.equal(fracFromGrow(grow.growTerm, grow.growPanel), clampEmbedFrac(frac));
+    assert.equal(grow.growBefore + grow.growAfter, 1);
+    assert.equal(fracFromGrow(grow.growBefore, grow.growAfter), clampEmbedFrac(frac));
   }
 });
 
@@ -54,48 +59,131 @@ test("fracFromGrow falls back to the default when the pair is degenerate", () =>
 });
 
 test("a drag within bounds redistributes grow proportionally, preserving the total", () => {
-  // 800px pane, even split (400/400), grow 1/1 → drag 100px toward the panel
-  // (growing the terminal) should move roughly a quarter of the total weight.
-  const before = embedDragGrow(400, 400, 1, 1, 100);
-  assert.ok(before.growTerm > 1, "terminal's share grew");
-  assert.ok(before.growPanel < 1, "panel's share shrank");
-  assert.equal(before.growTerm + before.growPanel, 2); // growTotal preserved
+  // 800px pane, even split (400/400), grow 1/1 → drag 100px toward "after"
+  // (growing "before") should move roughly a quarter of the total weight.
+  const result = embedDragGrow(400, 400, 1, 1, 100);
+  assert.ok(result.growBefore > 1, "before's share grew");
+  assert.ok(result.growAfter < 1, "after's share shrank");
+  assert.equal(result.growBefore + result.growAfter, 2); // growTotal preserved
 });
 
-test("a drag that would starve the terminal clamps at its floor", () => {
-  // Terminal already at exactly the reserve; any further push toward the panel
-  // must not shrink it past EMBED_MIN_TERM_PX worth of the total.
-  const sizeTerm = EMBED_MIN_TERM_PX;
-  const sizePanel = 600;
-  const result = embedDragGrow(sizeTerm, sizePanel, 1, 1, -9999); // drag hard toward the terminal
-  const total = sizeTerm + sizePanel;
-  const impliedTermPx = (result.growTerm / (result.growTerm + result.growPanel)) * total;
-  assert.ok(impliedTermPx >= EMBED_MIN_TERM_PX - 0.001, `terminal floor held: ${impliedTermPx}`);
+test("a drag that would starve the before side clamps at its floor", () => {
+  // Before side already at exactly its floor; any further push toward after
+  // must not shrink it past minBeforePx worth of the total.
+  const sizeBefore = EMBED_MIN_TERM_PX;
+  const sizeAfter = 600;
+  const result = embedDragGrow(sizeBefore, sizeAfter, 1, 1, -9999); // drag hard toward before
+  const total = sizeBefore + sizeAfter;
+  const impliedBeforePx = (result.growBefore / (result.growBefore + result.growAfter)) * total;
+  assert.ok(impliedBeforePx >= EMBED_MIN_TERM_PX - 0.001, `before floor held: ${impliedBeforePx}`);
 });
 
-test("a drag that would starve the panel clamps at its floor", () => {
-  const sizeTerm = 600;
-  const sizePanel = EMBED_MIN_PANEL_PX;
-  const result = embedDragGrow(sizeTerm, sizePanel, 1, 1, 9999); // drag hard toward the panel
-  const total = sizeTerm + sizePanel;
-  const impliedPanelPx = (result.growPanel / (result.growTerm + result.growPanel)) * total;
-  assert.ok(impliedPanelPx >= EMBED_MIN_PANEL_PX - 0.001, `panel floor held: ${impliedPanelPx}`);
+test("a drag that would starve the after side clamps at its floor", () => {
+  const sizeBefore = 600;
+  const sizeAfter = EMBED_MIN_PANEL_PX;
+  const result = embedDragGrow(sizeBefore, sizeAfter, 1, 1, 9999); // drag hard toward after
+  const total = sizeBefore + sizeAfter;
+  const impliedAfterPx = (result.growAfter / (result.growBefore + result.growAfter)) * total;
+  assert.ok(impliedAfterPx >= EMBED_MIN_PANEL_PX - 0.001, `after floor held: ${impliedAfterPx}`);
 });
 
 test("a non-finite delta is treated as zero (no NaN grow)", () => {
   const result = embedDragGrow(400, 400, 1, 1, NaN);
-  assert.equal(result.growTerm, 1);
-  assert.equal(result.growPanel, 1);
+  assert.equal(result.growBefore, 1);
+  assert.equal(result.growAfter, 1);
 });
 
 test("a degenerate size or grow pair passes through unchanged rather than dividing by zero", () => {
-  assert.deepEqual(embedDragGrow(0, 0, 1, 1, 50), { growTerm: 1, growPanel: 1 });
-  assert.deepEqual(embedDragGrow(400, 400, 0, 0, 50), { growTerm: 0, growPanel: 0 });
+  assert.deepEqual(embedDragGrow(0, 0, 1, 1, 50), { growBefore: 1, growAfter: 1 });
+  assert.deepEqual(embedDragGrow(400, 400, 0, 0, 50), { growBefore: 0, growAfter: 0 });
 });
 
 test("custom floors are honored", () => {
   const result = embedDragGrow(200, 200, 1, 1, -500, 50, 50);
   const total = 400;
-  const impliedTermPx = (result.growTerm / (result.growTerm + result.growPanel)) * total;
-  assert.ok(impliedTermPx >= 50 - 0.001);
+  const impliedBeforePx = (result.growBefore / (result.growBefore + result.growAfter)) * total;
+  assert.ok(impliedBeforePx >= 50 - 0.001);
+});
+
+// ---------- multi-slot: embedSideFloors / embedCenterFloor (clamp precedence, #361) ----------
+
+test("EMBED_SIDES lists exactly left, right, bottom — no top", () => {
+  assert.deepEqual(EMBED_SIDES, ["left", "right", "bottom"]);
+});
+
+test("right: the terminal's width floor is BEFORE, the panel is AFTER", () => {
+  const floors = embedSideFloors("right", 222);
+  assert.deepEqual(floors, { beforeFloorPx: EMBED_MIN_TERM_PX, afterFloorPx: 222 });
+});
+
+test("bottom: the row's height floor (the terminal's own) is BEFORE, the panel is AFTER", () => {
+  const floors = embedSideFloors("bottom", 222);
+  assert.deepEqual(floors, { beforeFloorPx: EMBED_MIN_TERM_PX, afterFloorPx: 222 });
+});
+
+test("precedence: the terminal's own floor is ALWAYS one side of right's and bottom's divider pair", () => {
+  // Whichever of these two a panel docks to, EMBED_MIN_TERM_PX (never the
+  // panel's own floor) is what guards the terminal — this is the "terminal
+  // floor wins" half of "terminal floor > panel floors > shares", pinned per
+  // side. (Left is covered separately below — its far side is the composite
+  // `embedCenterEl`, not the terminal directly; see `embedCenterFloor`.)
+  for (const side of ["right", "bottom"] as const) {
+    const floors = embedSideFloors(side, 999); // an oversized panel floor must not displace the term one
+    assert.ok(
+      floors.beforeFloorPx === EMBED_MIN_TERM_PX || floors.afterFloorPx === EMBED_MIN_TERM_PX,
+      `${side}'s divider must guard the terminal with EMBED_MIN_TERM_PX on one side`
+    );
+  }
+});
+
+test("a right-docked panel's divider clamps a hard drag at the terminal's floor, never past it", () => {
+  const { beforeFloorPx, afterFloorPx } = embedSideFloors("right", EMBED_MIN_PANEL_PX);
+  // Terminal (before) at exactly its floor; drag hard toward the terminal
+  // (negative delta shrinks "before") must not push it under the floor.
+  const result = embedDragGrow(EMBED_MIN_TERM_PX, 600, 1, 1, -9999, beforeFloorPx, afterFloorPx);
+  const total = EMBED_MIN_TERM_PX + 600;
+  const impliedTermPx = (result.growBefore / (result.growBefore + result.growAfter)) * total;
+  assert.ok(impliedTermPx >= EMBED_MIN_TERM_PX - 0.001);
+});
+
+test("a bottom-docked panel with a GROWN dynamic floor (e.g. the group panel) still can't push the row under the terminal's floor", () => {
+  const grownFloor = 420; // e.g. the group panel's measured chrome after the suspended banner appeared
+  const { beforeFloorPx, afterFloorPx } = embedSideFloors("bottom", grownFloor);
+  const result = embedDragGrow(EMBED_MIN_TERM_PX, 600, 1, 1, -9999, beforeFloorPx, afterFloorPx);
+  const total = EMBED_MIN_TERM_PX + 600;
+  const impliedRowPx = (result.growBefore / (result.growBefore + result.growAfter)) * total;
+  assert.ok(impliedRowPx >= EMBED_MIN_TERM_PX - 0.001, "the row (term) floor holds even against a much larger panel floor");
+});
+
+test("embedCenterFloor collapses to the plain terminal floor when right isn't occupied", () => {
+  assert.equal(embedCenterFloor(null), EMBED_MIN_TERM_PX);
+});
+
+test("embedCenterFloor composes the terminal floor + the right panel's floor + one divider width when right IS occupied", () => {
+  assert.equal(embedCenterFloor(EMBED_MIN_PANEL_PX), EMBED_MIN_TERM_PX + EMBED_MIN_PANEL_PX + EMBED_DIVIDER_PX);
+});
+
+test("a left-docked panel's divider clamps a hard drag at the panel's own floor, never past it (right unoccupied)", () => {
+  const beforeFloorPx = EMBED_MIN_PANEL_PX; // left slot's own floor
+  const afterFloorPx = embedCenterFloor(null); // center = term alone
+  // Panel (before) at exactly its floor; drag hard toward the panel (negative
+  // delta shrinks "before") must not push it under the floor.
+  const result = embedDragGrow(EMBED_MIN_PANEL_PX, 600, 1, 1, -9999, beforeFloorPx, afterFloorPx);
+  const total = EMBED_MIN_PANEL_PX + 600;
+  const impliedPanelPx = (result.growBefore / (result.growBefore + result.growAfter)) * total;
+  assert.ok(impliedPanelPx >= EMBED_MIN_PANEL_PX - 0.001);
+});
+
+test("a left-docked panel's divider, with right ALSO occupied, reserves room for both nested inside center", () => {
+  const beforeFloorPx = EMBED_MIN_PANEL_PX;
+  const afterFloorPx = embedCenterFloor(EMBED_MIN_PANEL_PX); // center = term + right divider + right slot
+  // Drag hard toward the left panel — center (containing term AND the
+  // occupied right slot) must never be squeezed below its composed floor.
+  const result = embedDragGrow(EMBED_MIN_PANEL_PX, 800, 1, 1, 9999, beforeFloorPx, afterFloorPx);
+  const total = EMBED_MIN_PANEL_PX + 800;
+  const impliedCenterPx = (result.growAfter / (result.growBefore + result.growAfter)) * total;
+  assert.ok(
+    impliedCenterPx >= afterFloorPx - 0.001,
+    `center (term + right) floor held: ${impliedCenterPx} >= ${afterFloorPx}`
+  );
 });

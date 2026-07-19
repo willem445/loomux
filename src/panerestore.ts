@@ -81,13 +81,13 @@ export type RestoreAction =
       name: string;
       sessionId: string | null;
       role: string | null;
-      /** Which orchestration-family view (if any) was embedded, and its
-       *  share (#361) — carried the same way role and sessionId are:
+      /** Every orchestration-family view docked to this pane (#361) — up to
+       *  three, one per edge — carried the same way role and sessionId are:
        *  main.ts's resumeDormantGroup matches this back to the member it
        *  belongs to (by sessionId) and re-applies it to the freshly resumed
-       *  pane via Pane.restoreEmbed — the ONE place a captured UI preference
-       *  is threaded through a whole-group resume today. */
-      embed: PersistedEmbed | null;
+       *  pane via Pane.restoreEmbeds — the ONE place a captured UI
+       *  preference is threaded through a whole-group resume today. */
+      embeds: PersistedEmbed[];
     }
   | {
       // A file-explorer pane (#214), back at its recorded root. Nothing to spawn
@@ -168,7 +168,7 @@ export function planPaneRestore(pane: PersistedPane, resumable?: SessionResumabl
         name: pane.name,
         sessionId: pane.sessionId,
         role: pane.role,
-        embed: pane.embed,
+        embeds: pane.embeds,
       };
     case "files":
       // Pure content: no process, no credits, no session — it just comes back at

@@ -217,7 +217,7 @@ export class GroupView {
        *  degrades that preview to a generic description — the toggle itself
        *  doesn't need it (the backend resolves the repo from the group). */
       getRepo?: () => string | null;
-      onToggleEmbed?: () => void;
+      onEmbedMenu?: (anchor: HTMLElement) => void;
     }
   ) {
     this.onResize = opts.onResize;
@@ -231,10 +231,10 @@ export class GroupView {
     refresh.title = "Refresh";
     refresh.addEventListener("click", () => void this.load());
     head.append(refresh);
-    // Embed toggle (#361): switch between the floating overlay and the
-    // pane's embed-panel slot.
+    // Embed side-picker (#361): switch between the floating overlay and any
+    // of the pane's (up to three) embed slots.
     this.embedBtn = el("button", "pane-btn embed", "⬒") as HTMLButtonElement;
-    this.embedBtn.addEventListener("click", () => opts.onToggleEmbed?.());
+    this.embedBtn.addEventListener("click", () => opts.onEmbedMenu?.(this.embedBtn));
     head.append(this.embedBtn);
     this.setPanelActive(false);
     const close = el("button", "pane-btn close", "✕") as HTMLButtonElement;
