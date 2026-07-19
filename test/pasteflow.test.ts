@@ -5,7 +5,7 @@
 // (Copy disabled without a selection, Paste always live).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { isPasteKey, isCopyKey, buildTerminalMenu, type PasteKeyEvent } from "../src/pasteflow.ts";
+import { isPasteKey, isCopyKey, keyDisposition, buildTerminalMenu, type PasteKeyEvent } from "../src/pasteflow.ts";
 
 const key = (overrides: Partial<PasteKeyEvent>): PasteKeyEvent => ({
   ctrlKey: false,
@@ -46,6 +46,34 @@ test("Ctrl+C alone is never a copy — it must stay SIGINT", () => {
 
 test("Ctrl+Shift+C is a copy", () => {
   assert.equal(isCopyKey(key({ ctrlKey: true, shiftKey: true, code: "KeyC" })), true);
+});
+
+// ---------- keyDisposition (#402 review: the DOM layer must preventDefault
+// on every disposition except "pass" — see pasteflow.ts's own doc comment
+// for the double-paste bug this collapsing-to-one-enum exists to prevent) ----------
+
+test("keyDisposition: Ctrl+Shift+C is 'copy'", () => {
+  assert.equal(keyDisposition(key({ ctrlKey: true, shiftKey: true, code: "KeyC" }), true), "copy");
+});
+
+test("keyDisposition: plain Ctrl+C is 'pass' (stays SIGINT)", () => {
+  assert.equal(keyDisposition(key({ ctrlKey: true, code: "KeyC" }), true), "pass");
+});
+
+test("keyDisposition: plain Ctrl+V is 'paste' when the setting allows it", () => {
+  assert.equal(keyDisposition(key({ ctrlKey: true, code: "KeyV" }), true), "paste");
+});
+
+test("keyDisposition: plain Ctrl+V is 'pass' when the setting is off", () => {
+  assert.equal(keyDisposition(key({ ctrlKey: true, code: "KeyV" }), false), "pass");
+});
+
+test("keyDisposition: Ctrl+Shift+V is 'paste' regardless of the setting", () => {
+  assert.equal(keyDisposition(key({ ctrlKey: true, shiftKey: true, code: "KeyV" }), false), "paste");
+});
+
+test("keyDisposition: an unrelated key is 'pass'", () => {
+  assert.equal(keyDisposition(key({ ctrlKey: true, code: "KeyA" }), true), "pass");
 });
 
 test("terminal menu: Copy is disabled with a reason when nothing is selected", () => {

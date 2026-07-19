@@ -27,7 +27,7 @@ import { voiceController, type VoiceTargetPane, type VoicePhase } from "./voicec
 import { pathTail, type ShellKind } from "./panesetup";
 import { invoke } from "@tauri-apps/api/core";
 import { parseOsc52, writeClipboard, readClipboard } from "./clipboard";
-import { isPasteKey, isCopyKey, buildTerminalMenu } from "./pasteflow";
+import { keyDisposition, buildTerminalMenu } from "./pasteflow";
 import { showContextMenu } from "./contextmenu";
 import { getSettings } from "./settings";
 import {
@@ -760,20 +760,55 @@ export class Pane implements VoiceTargetPane {
     // (default on) allows it — #370's review found the unconditional version
     // silently broke vim's VISUAL BLOCK mode and readline's quoted-insert, so
     // it's an opt-out, not a forced default; see settings.ts).
+    //
+    // preventDefault() on copy/paste is load-bearing, not decoration (#402
+    // live-demo finding): returning `false` from attachCustomKeyEventHandler
+    // only tells XTERM not to process the key — it does NOT suppress the
+    // browser's own native handling of it. Without preventDefault, plain
+    // Ctrl+V ALSO triggered the browser's native paste on xterm's focused
+    // textarea, which xterm itself listens for (its own "paste" DOM
+    // listener) and pastes AGAIN — the double-paste bug. See keyDisposition's
+    // own doc comment (pasteflow.ts) for the full mechanism.
     this.term.attachCustomKeyEventHandler((e) => {
       if (e.type !== "keydown") return true;
       if (isAppShortcut(e)) return false;
-      if (isCopyKey(e)) {
-        const sel = this.term.getSelection();
-        if (sel) void this.copyToClipboard(sel);
-        return false;
+      switch (keyDisposition(e, getSettings().pasteOnPlainCtrlV)) {
+        case "copy": {
+          e.preventDefault();
+          const sel = this.term.getSelection();
+          if (sel) void this.copyToClipboard(sel);
+          return false;
+        }
+        case "paste":
+          e.preventDefault();
+          void this.pasteFromClipboard();
+          return false;
+        case "pass":
+          return true;
       }
-      if (isPasteKey(e, getSettings().pasteOnPlainCtrlV)) {
-        void this.pasteFromClipboard();
-        return false;
-      }
-      return true;
     });
+
+    // xterm.js binds its OWN native "paste" DOM-event listener directly on
+    // its internal textarea/root element (independent of our keydown
+    // handling above), so ANY browser-native paste — the Ctrl+V accelerator
+    // on a rare path this preventDefault doesn't reach, or whatever gesture
+    // WebView2 treats as "paste" on a right-click (#402 live-demo finding 2:
+    // right-click pasted AND opened our menu) — lands there too, double- or
+    // triple-pasting alongside our own explicit readClipboard()-driven paste.
+    // We own paste entirely now; xterm's native path is never wanted. Capture
+    // phase, so this runs BEFORE the event reaches xterm's own listener
+    // (bound to a descendant of termEl, in the bubble phase) no matter what
+    // triggered it. Our own paste calls are `this.term.paste(text)` — a
+    // direct method call that never dispatches a DOM "paste" event — so this
+    // can never block a paste WE intended.
+    this.termEl.addEventListener(
+      "paste",
+      (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+      },
+      true
+    );
 
     // Right-click copy/paste (#370): every other pane kind gets this for free
     // from the browser's native textarea/input context menu; the terminal is
