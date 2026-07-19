@@ -976,6 +976,47 @@ are stated, without drifting from what was actually agreed:
   the mirror image of the open-side bug, on the close edge. Fixed by
   `closeOverlayAfterTransition` (waits for the real `transitionend`, with a
   timeout backstop).
+
+  **#380 residual: the bounds+occlusion fix above didn't fully close the
+  open-side bleed.** Live re-report after the atomic `plugin_set_frame` fix
+  shipped: expanding the sessions sidebar still left a visible plugin pane's
+  native content painted at its PRE-expansion footprint for several seconds
+  before correcting — far longer than the sidebar's own 240ms transition, the
+  discriminator that this wasn't an animation-timing gap but a genuinely
+  stuck state waiting on an unrelated later trigger. Confirmed against
+  `breadcrumbs.log`: an `overlay-open` frame is applied at the exact instant
+  `toggle()` flips the class (before the transition's first frame), so it
+  captures the sidebar at its still-collapsed width — after that single edge,
+  nothing re-fired until some unrelated later trigger (another overlay's own
+  open/close, a window resize) happened to force a fresh `reposition()`.
+  Root cause: registering/releasing the overlay slot on the open/close EDGE
+  was never enough by itself for an overlay that keeps moving/resizing WHILE
+  open — `overlaystate.ts`'s `poke()` exists precisely for that case
+  ("an overlay that moves/resizes while open") but had no production caller;
+  every DOM overlay in the app is a fixed-size popover/modal that doesn't
+  need it, except this one, an animated docked sidebar.
+
+  **The fix.** `sessions.ts`'s `SessionBrowser` now keeps a `ResizeObserver`
+  on `#sessions` itself for its whole lifetime, calling `overlayState.poke()`
+  on every tick of its own `width` transition (idle the rest of the time,
+  since the observer only fires when the box's size actually changes), plus
+  a `transitionend` listener as a final-frame backstop — the same
+  belt-and-suspenders reasoning `closeOverlayAfterTransition` already uses
+  for this same transition. `poke()` feeds the same
+  `overlayState.subscribe` → `reposition(...)` → `plugin_set_frame` path
+  every other trigger already uses, so no new command was needed — but a
+  poke is now its OWN `RepositionSource`, `"overlay-poke"`, rather than
+  folded into `"overlay-open"`: a poke during an animated overlay's
+  transition is a per-frame burst, the same frequency class as a `"resize"`
+  storm, not the rare discrete edge `"overlay-open"` is. Folding it into
+  `"overlay-open"` (an always-logs source) would have reintroduced, from the
+  overlay's side, the exact per-frame breadcrumb storm `"resize"`'s gate
+  exists to prevent from the pane's own side — so `pluginregion.rs`'s
+  `should_log_frame` gates `"overlay-poke"` identically to `"resize"` (logs
+  only on an actual exclude change or a native failure). Net effect: every
+  plugin pane recomputes its bounds+occlusion continuously across BOTH the
+  open and close transition, not just at their edges, with telemetry staying
+  state-change-gated exactly as before.
 - **Slice E** (metrics — **done**, `procmetrics.rs`) exposes `sys_processes`
   -shaped data **only** through the `metrics.system` broker handler — never as
   a command a plugin (or any other webview script) could `invoke` directly.

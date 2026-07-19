@@ -55,7 +55,7 @@ import { Webview } from "@tauri-apps/api/webview";
 import { dataDir, join } from "@tauri-apps/api/path";
 import { openPluginWindow, closePluginWindow, setPluginFrame, type PluginCapability } from "./pluginbroker";
 import { pluginErrorCode, pluginErrorMessage, type PluginManifest } from "./pluginhost";
-import { pluginWebviewRect, pluginWindowShouldShow } from "./pluginwindow";
+import { pluginWebviewRect, pluginWindowShouldShow, frameUnchanged, type PluginFrame } from "./pluginwindow";
 import { computeExcludeRects } from "./pluginocclusion";
 import { overlayState, type OverlayChangeReason } from "./overlaystate";
 
@@ -67,16 +67,26 @@ import { overlayState, type OverlayChangeReason } from "./overlaystate";
  *  tab's pane going from `display:none`/zero-size to its real box — not a
  *  separate code path of its own; there's no dedicated tab-switch hook to
  *  distinguish it from any other resize). */
-type RepositionSource = "resize" | "move-notify" | "overlay-open" | "overlay-close" | "init";
+type RepositionSource = "resize" | "move-notify" | "overlay-open" | "overlay-close" | "overlay-poke" | "init";
 
 /** `overlayState.subscribe`'s edge -> the breadcrumb label for it. `"poke"`
  *  (a covering overlay resizing/moving WHILE already open, without a fresh
- *  open/close edge of its own) has no live caller yet (`overlaystate.ts`'s
- *  own doc comment: reserved for an animated/expanding overlay) — mapped to
- *  `"overlay-open"` rather than added as its own `RepositionSource` value,
- *  since nothing currently distinguishes it from a fresh open in practice. */
+ *  open/close edge of its own — `sessions.ts`'s `panelResizeObs` is its first
+ *  production caller, #380 follow-up) maps to its OWN `"overlay-poke"`
+ *  source rather than folding into `"overlay-open"`: an animated overlay's
+ *  poke is a PER-FRAME burst for as long as it's transitioning, the same
+ *  frequency class as a `"resize"` storm, not the rare discrete edge
+ *  `"overlay-open"`/`"overlay-close"` are — `pluginregion.rs`'s
+ *  `should_log_frame` gates `"overlay-poke"` identically to `"resize"`
+ *  (logs only on an actual exclude change or a native failure) for exactly
+ *  that reason; folding it into `"overlay-open"` would have reintroduced the
+ *  per-frame breadcrumb storm that source's own "always logs" gating is
+ *  built to avoid, just triggered by the overlay's geometry instead of the
+ *  pane's own. */
 function overlayReasonToSource(reason: OverlayChangeReason): RepositionSource {
-  return reason === "close" ? "overlay-close" : "overlay-open";
+  if (reason === "close") return "overlay-close";
+  if (reason === "poke") return "overlay-poke";
+  return "overlay-open";
 }
 
 /** What a plugin pane needs to open its window — the CURRENT manifest's fields
@@ -197,6 +207,18 @@ export class PluginPaneView {
    *  runs; it does NOT need to guard the frame IPC call itself; see
    *  `reposition()`'s own doc comment for why that's no longer racy. */
   private repositionSeq = 0;
+  /** The (bounds, exclude) pair last INTENDED to apply — set synchronously
+   *  the moment `reposition()` decides to call `plugin_set_frame`, not after
+   *  that call resolves (rev-67 finding on #414): a concurrent window-resize
+   *  + sessions-panel-transition burst can fire two `reposition()` calls for
+   *  the same frame before either's IPC round trip returns, and the skip
+   *  decision needs to see the newer call's intent immediately, not wait on
+   *  a promise. Null before any call has ever succeeded, and cleared back to
+   *  null on a native-call failure (guarded by `repositionSeq`, so a stale
+   *  failure can't clobber a newer, already-succeeded call's cache) so a
+   *  retry after a real failure is never suppressed as a false "unchanged".
+   *  See `pluginwindow.ts`'s `frameUnchanged` for the comparison itself. */
+  private lastAppliedFrame: PluginFrame | null = null;
   /** Unsubscribe from the shared overlay registry (overlaystate.ts, #391) —
    *  set in `show()`, released in `dispose()`. Null before `show()` runs and
    *  after `dispose()` has (idempotency guard: `dispose()` can run more than
@@ -334,7 +356,16 @@ export class PluginPaneView {
    *  below still guards `show()`/`hide()` follow-up against a stale call
    *  finishing after a newer one already ran — that part remains genuinely
    *  async (its own IPC round trip) and unordered relative to a newer
-   *  `reposition()`'s OWN frame call. */
+   *  `reposition()`'s OWN frame call.
+   *
+   *  Same-geometry calls are skipped (rev-67, #414): a window resize and the
+   *  sessions panel's own `poke()`-driven recompute (`overlaystate.ts`) can
+   *  both fire for the same animation frame, computing the byte-identical
+   *  (bounds, exclude) pair twice — `frameUnchanged` (`pluginwindow.ts`)
+   *  compares this call's frame against `lastAppliedFrame` and skips the
+   *  native round trip when nothing actually changed, EXCEPT on `"init"` and
+   *  `"overlay-close"`, which always call through (see `lastAppliedFrame`'s
+   *  own field doc comment for why those two are exempt). */
   private async reposition(source: RepositionSource): Promise<void> {
     if (!this.ready || !this.pluginWebview || this.disposed) return;
     const seq = ++this.repositionSeq;
@@ -350,15 +381,31 @@ export class PluginPaneView {
       if (this.windowLabel) {
         const webviewRect = pluginWebviewRect(rect);
         const exclude = computeExcludeRects(rect, overlayState.currentRects());
-        await setPluginFrame(
-          this.windowLabel,
-          webviewRect.x,
-          webviewRect.y,
-          webviewRect.width,
-          webviewRect.height,
-          exclude,
-          source
-        ).catch(() => {});
+        const frame: PluginFrame = { rect: webviewRect, exclude };
+        // rev-67 (#414): "init" (the first frame a fresh webview ever gets)
+        // and "overlay-close" (the edge that had its own separate bug once,
+        // #380's close-side fix) always call through, never skip on the
+        // strength of a geometry match alone — every other source is
+        // deduped against the last INTENDED frame (see `lastAppliedFrame`'s
+        // own field doc comment for why "intended" rather than "resolved").
+        if (source === "init" || source === "overlay-close" || !frameUnchanged(this.lastAppliedFrame, frame)) {
+          this.lastAppliedFrame = frame;
+          let ok = true;
+          try {
+            await setPluginFrame(
+              this.windowLabel,
+              webviewRect.x,
+              webviewRect.y,
+              webviewRect.width,
+              webviewRect.height,
+              exclude,
+              source
+            );
+          } catch {
+            ok = false;
+          }
+          if (!ok && seq === this.repositionSeq) this.lastAppliedFrame = null;
+        }
       }
       if (seq !== this.repositionSeq || this.disposed || !this.pluginWebview) return;
       if (!this.shown) {
