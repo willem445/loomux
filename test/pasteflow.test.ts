@@ -1,11 +1,11 @@
-// Pure paste/copy gesture decisions for terminal panes (#370) — pasteflow.ts.
-// Pins the key matching (plain Ctrl+V pastes only when the pasteOnPlainCtrlV
-// setting allows it, Ctrl+Shift+V always pastes, Ctrl+C never copies, AltGr
-// (Ctrl+Alt+V) is never eaten as a paste) and the right-click menu shape
-// (Copy disabled without a selection, Paste always live).
+// Pure paste/copy keydown gesture decisions for terminal panes (#370) —
+// pasteflow.ts. Pins the key matching (plain Ctrl+V pastes only when the
+// pasteOnPlainCtrlV setting allows it, Ctrl+Shift+V always pastes, Ctrl+C
+// never copies, AltGr/Ctrl+Alt+V is never eaten as a paste) and the
+// keyDisposition enum that drives pane.ts's preventDefault() calls.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { isPasteKey, isCopyKey, keyDisposition, buildTerminalMenu, type PasteKeyEvent } from "../src/pasteflow.ts";
+import { isPasteKey, isCopyKey, keyDisposition, type PasteKeyEvent } from "../src/pasteflow.ts";
 
 const key = (overrides: Partial<PasteKeyEvent>): PasteKeyEvent => ({
   ctrlKey: false,
@@ -74,25 +74,4 @@ test("keyDisposition: Ctrl+Shift+V is 'paste' regardless of the setting", () => 
 
 test("keyDisposition: an unrelated key is 'pass'", () => {
   assert.equal(keyDisposition(key({ ctrlKey: true, code: "KeyA" }), true), "pass");
-});
-
-test("terminal menu: Copy is disabled with a reason when nothing is selected", () => {
-  const items = buildTerminalMenu(false);
-  const copy = items.find((i) => i.action?.kind === "copy")!;
-  assert.equal(copy.disabled, true);
-  assert.ok(copy.reason);
-});
-
-test("terminal menu: Copy is enabled once there is a selection", () => {
-  const items = buildTerminalMenu(true);
-  const copy = items.find((i) => i.action?.kind === "copy")!;
-  assert.equal(copy.disabled, false);
-});
-
-test("terminal menu: Paste is always offered and never disabled", () => {
-  for (const hasSelection of [false, true]) {
-    const paste = buildTerminalMenu(hasSelection).find((i) => i.action?.kind === "paste")!;
-    assert.ok(paste);
-    assert.ok(!paste.disabled);
-  }
 });

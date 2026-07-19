@@ -263,18 +263,16 @@ a restart — are on the **[Project tabs](features/project-tabs.html)** feature 
 
 ## Copy & paste
 
-- **Copy / paste** — `Ctrl+Shift+C` / `Ctrl+Shift+V`. Plain `Ctrl+V` also
-  pastes by default — turn that off if you use vim/nvim's `Ctrl+V` **VISUAL
-  BLOCK** mode, readline's quoted-insert, or run anything else in the pane
-  that wants the raw key: see [Settings](#settings) below. `Ctrl+Shift+V`
-  pastes either way.
-- **Right-click a terminal** for a Copy / Paste menu — Copy is greyed out until
-  you've selected text; Paste is always live. The same gesture other panes
-  (editor, git, file manager) already get for free from their native text
-  fields.
+- **Copy** — select text in a terminal, then `Ctrl+Shift+C`. There's no
+  right-click menu for this (one existed briefly; its paste path proved
+  unreliable and was removed rather than iterated on) and no copy-on-select —
+  `Ctrl+Shift+C` is the one supported gesture.
+- **Paste** — `Ctrl+Shift+V` always pastes. Plain `Ctrl+V` also pastes by
+  default — turn that off if you use vim/nvim's `Ctrl+V` **VISUAL BLOCK**
+  mode, readline's quoted-insert, or run anything else in the pane that wants
+  the raw key: see [Settings](#settings) below.
 - If the clipboard genuinely can't be read or written (a locked-down webview,
-  focus loss), paste and copy say so with a toast instead of quietly doing
-  nothing.
+  focus loss), paste says so with a toast instead of quietly doing nothing.
 - A CLI running in a pane (e.g. an agent that says "copied to clipboard") copies
   straight to your **system** clipboard too, via OSC 52 — no manual re-select
   needed.
