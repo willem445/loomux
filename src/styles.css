@@ -699,6 +699,21 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .pane-embed-divider:hover, .pane-embed-divider.dragging { background: var(--accent-dim); }
 .pane-embed-divider.dragging { background: var(--accent); }
 
+/* `reclampViewFloor`'s content-driven floor-grow protection (the group
+   panel's fixed chrome growing after it opens — a suspended-budget banner,
+   say) only ever resizes a divider for the BOTTOM slot and the floating
+   overlay: those two host modes route through the view's own `floorPx()`.
+   Left/right deliberately use a fixed WIDTH constant instead (#361's
+   left/right simplification — a view's floorPx() measures vertical chrome,
+   which doesn't transfer to "how narrow can this go"), so nothing widens a
+   left/right divider when the group panel's HEIGHT-wise content grows.
+   Scroll rather than clip when that happens (#361 rev-58 NB3) — a bounded
+   fix, not a second floor-grow mechanism for a width-only floor. */
+.pane-embed-panel.side-left .group-view,
+.pane-embed-panel.side-right .group-view {
+  overflow-y: auto;
+}
+
 /* Every embeddable view's own embed toggle (task board / git / issues /
    audit / group, each in its own header) reads as pressed once the pane's
    embed-panel slot is actually showing it — unscoped by header class since

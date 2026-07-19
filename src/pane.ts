@@ -1897,6 +1897,15 @@ export class Pane implements VoiceTargetPane {
     const counterpartGrow = parseFloat(this.counterpartEl(side).style.flexGrow || "1");
     slot.frac = fracFromGrow(counterpartGrow, panelGrow);
     this.updateTermShift();
+    // Left's counterpart IS `embedCenterEl`, which nests right's own
+    // divider pair (`termEl` | right's panel) — a change to left's split
+    // just changed embedCenterEl's own box size, and the term/right split
+    // inside it is a plain CSS flex-grow ratio that does NOT know about
+    // right's floor on its own. Re-run right's clamp against its new box so
+    // it can't end up below its floor just because left grew (#361 rev-58
+    // NB2) — a no-op (see the early-return above) when right isn't
+    // occupied or wasn't actually pushed under its floor.
+    if (side === "left") this.reclampSlotDivider("right");
   }
 
   /** Horizontal drag handle on an overlay's bottom edge. `floor` (optional) is a
@@ -2279,10 +2288,16 @@ export class Pane implements VoiceTargetPane {
       return;
     }
     // Leave whichever OTHER side this kind currently occupies, if any.
+    // `closeView` MUST run before the slot is nulled out (#361 rev-58
+    // blocking finding): it looks up `sideOf(kind)` itself to find which
+    // slot to hide, so nulling first makes it take the OVERLAY branch
+    // instead — the origin slot's now-empty panel+divider stay visible.
+    // Mirrors the order the target-eviction block below (and `unembedView`)
+    // already used correctly.
     if (currentSide !== null) {
       const wasVisible = this.isViewVisible(kind);
-      this.embedSlots![currentSide].kind = null;
       if (wasVisible) this.closeView(kind);
+      this.embedSlots![currentSide].kind = null;
     }
     // Evict whoever (if anyone) is currently on the TARGET side.
     const targetSlot = this.embedSlots![side];

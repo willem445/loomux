@@ -382,6 +382,27 @@ from the pre-multi-slot design. Left/right instead use the fixed
 explanation above of why a view's vertical-chrome floor doesn't transfer to
 a width concern.
 
+**Floor-GROW protection (`reclampViewFloor`, below) is bottom-only, by the
+same logic — a deliberate scope boundary, not a gap (#361 rev-58 NB3).** A
+view whose fixed chrome grows after it opens (today, only the group
+panel's suspended-budget banner) only ever gets a divider nudged to make
+room when it's hosted as the floating overlay or docked BOTTOM — both route
+through the view's own live `floorPx()`. Docked LEFT or RIGHT, the floor is
+the fixed width constant above, which has no HEIGHT component to grow at
+all — there is nothing for a height-wise content growth to widen. So a
+short pane with a lot of fixed-row chrome stacked in the group panel
+(header, summary, max-agents, workflow row, autonomy row, and then a
+banner) can still, in principle, overflow the box vertically while docked
+to a side. The fix is `overflow-y: auto` on `.group-view` when its ancestor
+is `.pane-embed-panel.side-left`/`.side-right` (styles.css) — scroll rather
+than clip. This is intentionally the SMALLER of two possible fixes: the
+alternative, growing a SECOND floor dimension (how much HEIGHT a left/right
+panel needs) and threading it through `dividerFloors`'s width-axis math,
+would need every left/right divider's clamp to reason about two axes for a
+case that, in practice, only the group panel's fixed chrome can even
+trigger. Scroll-not-clip is the honest, bounded answer until something
+actually needs the second axis.
+
 **Reclamping when a floor changes after a panel is already docked.**
 `Pane.reclampViewFloor(kind)` looks up which side `kind` occupies (if any)
 and delegates to `reclampSlotDivider(side)`, which re-applies that side's
@@ -392,7 +413,19 @@ the new floor makes the relevant `sizeX - minX` term negative in
 today: `GroupView.onResize` (its floor growing from content, unchanged
 concept from the single-slot design), and `embedViewAtSide`/`unembedView`
 explicitly reclamping LEFT whenever RIGHT's occupancy changes (per *Layout*
-above — left's composed far-side floor depends on it). No other view's
+above — left's composed far-side floor depends on it). **`reclampSlotDivider`
+itself cascades LEFT's own reclamp into a follow-up reclamp of RIGHT (#361
+rev-58 NB2):** left's counterpart element is the composite `embedCenterEl`,
+which nests right's own divider pair (`termEl` | right's panel) — resizing
+`embedCenterEl` changes the box that pair's flex-grow ratio divides, and
+that ratio has no floor awareness of its own. Without the cascade, growing
+left (e.g. its own view's floor demanding more room) could silently shrink
+`embedCenterEl` enough to push an occupied right slot below ITS floor with
+nothing correcting it, since nothing had directly touched right's divider.
+The cascade only ever runs right-ward from left (never the reverse: dragging
+right's own divider only trades space *inside* `embedCenterEl`, never
+resizing it, so it can't affect left) and is a no-op whenever right isn't
+occupied or wasn't actually pushed under its floor. No other view's
 floor changes after it opens, so no other view wires `onResize`; the hook
 stays optional on the interface for any future view that needs it.
 
@@ -608,12 +641,24 @@ lifecycle panel):**
    the group lifecycle panel specifically: trigger the suspended-budget
    banner (or any state that grows its fixed chrome) while docked bottom —
    the divider should nudge to make room on its own rather than letting the
-   footer clip.
+   footer clip. Now dock the group panel LEFT or RIGHT instead, shrink the
+   pane's overall height so the panel is short, and trigger the same banner
+   — floor-grow protection doesn't apply on a side dock (#361 rev-58 NB3,
+   deliberate scope boundary — see the design note), so the panel should
+   SCROLL to keep the footer reachable rather than clip it under
+   `overflow: hidden`.
 4. Reopen the embed menu — **Bottom** should now show a checkmark. Pick
    **Left** — the SAME view should move from bottom to the left edge in one
-   step (not close-then-reopen-visibly): the bottom slot should collapse
-   away and a left slot should appear, sized reasonably. Confirm dragging
-   the LEFT divider now resizes width, not height.
+   step (not close-then-reopen-visibly): **the bottom slot's panel AND its
+   divider must both fully disappear — not just go empty** (#361 rev-58's
+   blocking finding: the origin slot's `kind` was nulled out before the
+   close, so `closeView` couldn't find it and left an empty panel+divider
+   sitting there). Open devtools and confirm `.pane-embed-panel.side-bottom`
+   and `.pane-embed-divider.side-bottom` are both `[hidden]`, and a left
+   slot has appeared, sized reasonably. Confirm dragging the LEFT divider
+   now resizes width, not height. Repeat the same move in the OTHER
+   direction (left → right, right → bottom, etc.) — the bug was specific to
+   the move-source code path, not to any one pair of edges.
 5. Click **Un-embed** — the view should return to the floating overlay.
 6. Re-dock it, close it (its own hotkey or ✕) — it should close taking the
    slot with it; the terminal regains full size on that edge. Reopening the
@@ -636,6 +681,15 @@ lifecycle panel):**
    alone. This is the composed-floor case (`embedCenterFloor`) — open
    devtools and confirm `embedCenterEl`'s measured width never drops below
    roughly `EMBED_MIN_TERM_PX + 180 + 6`.
+8b. Same setup (left AND right both occupied) — this time drag the LEFT
+   divider hard AWAY from the terminal (growing the left panel, shrinking
+   `embedCenterEl`, which contains both the terminal AND the right panel).
+   The right panel must stay at or above its own floor — it should NOT be
+   silently squeezed just because nothing touched its own divider directly
+   (#361 rev-58 NB2: `embedCenterEl`'s own resize doesn't respect right's
+   floor on its own; `reclampSlotDivider` has to cascade from left into a
+   follow-up reclamp of right). Open devtools and confirm the right panel's
+   measured width never drops below ~180px through the whole drag.
 9. With a third view already docked to a FREE edge, embed a FOURTH view
    onto an OCCUPIED edge (say, bottom, currently holding git) — git should
    close outright (back to its own floating overlay's `hidden` state, not
