@@ -85,15 +85,17 @@ export interface GitViewHost {
   /** EMBEDDED mode: pane content, not an overlay. Drops the ✕ and the Esc-to-close
    *  binding — the PANE's ✕ is the close affordance. */
   embedded?: boolean;
-  /** The view's own header "embed beside the terminal" toggle (#361) — a
-   *  THIRD, unrelated sense of "embed" from the `embedded` flag above: that
-   *  one means "hosted as a whole content pane, no terminal at all"; this is
-   *  "share space with a terminal that's still right there," toggled at
-   *  runtime from a still-floating-or-panel git view. Never offered when
-   *  `embedded` is already true — a content pane has no terminal to share
-   *  space WITH. `setPanelActive` (not `setEmbedded`) is the runtime method
-   *  that reflects it, for the same disambiguation reason. */
-  onToggleEmbed?: () => void;
+  /** The view's own header embed button was clicked (#361) — a THIRD,
+   *  unrelated sense of "embed" from the `embedded` flag above: that one
+   *  means "hosted as a whole content pane, no terminal at all"; this is
+   *  "share space with a terminal that's still right there," picked at
+   *  runtime (which of up to three edges) from a still-floating-or-docked
+   *  git view. `anchor` is the button element, for the host to position its
+   *  side-picker menu against. Never offered when `embedded` is already
+   *  true — a content pane has no terminal to share space WITH.
+   *  `setPanelActive` (not `setEmbedded`) is the runtime method that
+   *  reflects the result, for the same disambiguation reason. */
+  onEmbedMenu?: (anchor: HTMLElement) => void;
 }
 
 type Selection = { kind: "working" } | { kind: "commit"; hash: string };
@@ -348,13 +350,13 @@ export class GitView {
     fetchBtn.addEventListener("click", () =>
       void this.runOp(fetchBtn, () => gitFetch(this.repoRoot!), "Fetched")
     );
-    // Embed toggle (#361): only offered when this view has a terminal to
-    // share space WITH at all — never on a content pane (`host.embedded`),
-    // which has none. See `GitViewHost.onToggleEmbed` above for the naming
+    // Embed side-picker (#361): only offered when this view has a terminal
+    // to share space WITH at all — never on a content pane (`host.embedded`),
+    // which has none. See `GitViewHost.onEmbedMenu` above for the naming
     // disambiguation from the unrelated `embedded` flag.
     this.embedBtn = el("button", "pane-btn embed", "⬒") as HTMLButtonElement;
     this.embedBtn.hidden = !!host.embedded;
-    this.embedBtn.addEventListener("click", () => this.host.onToggleEmbed?.());
+    this.embedBtn.addEventListener("click", () => this.host.onEmbedMenu?.(this.embedBtn));
     const closeBtn = el("button", "pane-btn close", "✕");
     closeBtn.title = "Back to terminal (Esc)";
     closeBtn.hidden = !!host.embedded; // pane content — the PANE's ✕ is the close affordance
@@ -438,10 +440,10 @@ export class GitView {
     this.el.hidden = true;
   }
 
-  /** Reflect whether the pane currently has this view in its embed-panel
+  /** Reflect whether the pane currently has this view docked to ANY embed
    *  slot (#361) — pure display state on the header's toggle button; the
    *  pane owns the actual move. `setPanelActive`, not `setEmbedded`: see
-   *  `GitViewHost.onToggleEmbed`'s comment for why the two must not share a
+   *  `GitViewHost.onEmbedMenu`'s comment for why the two must not share a
    *  name on this class. */
   setPanelActive(active: boolean): void {
     this.embedBtn.classList.toggle("active", active);

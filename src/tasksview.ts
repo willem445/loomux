@@ -89,7 +89,7 @@ export class TasksView {
 
   constructor(
     private groupId: string,
-    opts: { onClose: () => void; onToggleEmbed: () => void }
+    opts: { onClose: () => void; onEmbedMenu: (anchor: HTMLElement) => void }
   ) {
     this.el = el("div", "tasks-view");
 
@@ -115,13 +115,13 @@ export class TasksView {
     this.deleteSelectedBtn.addEventListener("click", () => this.onDeleteSelected());
     head.append(this.deleteSelectedBtn);
 
-    // Embed toggle: switch between the floating overlay and the pane's
-    // embed-panel slot (#361) — a discrete, user-initiated layout change,
-    // like a split (see doc/design/embedded-panels.md). setPanelActive()
-    // below keeps the icon/tooltip in sync with which mode the pane is
-    // actually in.
+    // Embed side-picker: switch between the floating overlay and any of the
+    // pane's (up to three) embed slots (#361) — a discrete, user-initiated
+    // layout change, like a split (see doc/design/embedded-panels.md).
+    // setPanelActive() below keeps the icon/tooltip in sync with whether the
+    // pane currently has this docked, regardless of which side.
     this.embedBtn = el("button", "pane-btn embed", "⬒") as HTMLButtonElement;
-    this.embedBtn.addEventListener("click", () => opts.onToggleEmbed());
+    this.embedBtn.addEventListener("click", () => opts.onEmbedMenu(this.embedBtn));
     head.append(this.embedBtn);
     this.setPanelActive(false);
 
